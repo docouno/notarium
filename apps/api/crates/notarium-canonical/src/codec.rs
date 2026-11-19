@@ -474,6 +474,8 @@ pub struct RankRevisionMetadata {
     pub placement_actor_id: PrincipalId,
     pub placement_run_id: Option<AgentRunId>,
     pub is_pma_normalization: bool,
+    #[serde(default)]
+    pub removed: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

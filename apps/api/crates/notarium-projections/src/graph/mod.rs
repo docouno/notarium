@@ -1,0 +1,568 @@
+use std::{
+    cmp::Reverse,
+    collections::{BTreeMap, BinaryHeap},
+};
+
+use croaring::Bitmap;
+use notarium_core::{
+    DomainError, DomainResult,
+    ids::{ClusterId, NoteId},
+    model::SnapshotCut,
+    ports::{GraphEdge, GraphNode, GraphNodeId, GraphResult, GraphTier},
+};
+
+use crate::index::{GraphSections, IndexView, PostingKey};
+
+mod leiden;
+pub(crate) use leiden::LeidenSnapshot;
+
+/// The same adjacency is read by graph queries and the background partitioner.
+/// Implementations borrow existing adjacency and never expand an entire CSR
+/// section just to answer a query.
+pub(crate) trait GraphAdjacency {
+    fn node_count(&self) -> u32;
+    fn lookup(&self, note: &NoteId) -> Option<u32>;
+    fn note_id(&self, node: u32) -> Option<&NoteId>;
+    fn outgoing(&self, node: u32) -> impl Iterator<Item = u32> + Send + '_;
+    fn incoming(&self, node: u32) -> impl Iterator<Item = u32> + Send + '_;
+    fn cluster(&self, node: u32) -> Option<ClusterId>;
+
+    fn cluster_members(&self, cluster: &ClusterId) -> DomainResult<Option<Bitmap>> {
+        let members = (0..self.node_count())
+            .filter(|&node| self.cluster(node).as_ref() == Some(cluster))
+            .collect::<Bitmap>();
+        Ok((!members.is_empty()).then_some(members))
+    }
+}
+
+impl GraphAdjacency for IndexView {
+    fn node_count(&self) -> u32 {
+        self.node_count()
+    }
+
+    fn lookup(&self, note: &NoteId) -> Option<u32> {
+        self.dense_id(note)
+    }
+
+    fn note_id(&self, node: u32) -> Option<&NoteId> {
+        self.note_id(self.dense(node)).ok()
+    }
+
+    fn outgoing(&self, node: u32) -> impl Iterator<Item = u32> + Send + '_ {
+        self.outgoing(node)
+    }
+
+    fn incoming(&self, node: u32) -> impl Iterator<Item = u32> + Send + '_ {
+        self.incoming(node)
+    }
+
+    fn cluster(&self, node: u32) -> Option<ClusterId> {
+        self.cluster(node)
+    }
+
+    fn cluster_members(&self, id: &ClusterId) -> DomainResult<Option<Bitmap>> {
+        let members = self
+            .posting(&PostingKey::ClusterMembers(id.clone()))
+            .map_err(|_| {
+                DomainError::validation(notarium_core::error::ValidationReason::InvalidState)
+            })?;
+        Ok((!members.is_empty()).then_some(members))
+    }
+}
+
+/// An oversized graph settlement is looked up from durable rows on demand.
+/// The graph's edges and note identities remain borrowed from the mmap.
+pub(crate) struct SettledGraph<'a> {
+    pub index: &'a IndexView,
+    pub settlement: Option<&'a LeidenSnapshot>,
+}
+
+impl GraphAdjacency for SettledGraph<'_> {
+    fn node_count(&self) -> u32 {
+        self.index.node_count()
+    }
+
+    fn lookup(&self, note: &NoteId) -> Option<u32> {
+        self.index.dense_id(note)
+    }
+
+    fn note_id(&self, node: u32) -> Option<&NoteId> {
+        GraphAdjacency::note_id(self.index, node)
+    }
+
+    fn outgoing(&self, node: u32) -> impl Iterator<Item = u32> + Send + '_ {
+        self.index.outgoing(node)
+    }
+
+    fn incoming(&self, node: u32) -> impl Iterator<Item = u32> + Send + '_ {
+        self.index.incoming(node)
+    }
+
+    fn cluster(&self, node: u32) -> Option<ClusterId> {
+        match self.settlement {
+            Some(settlement) => settlement.cluster(node).cloned(),
+            None => self.index.cluster(node),
+        }
+    }
+
+    fn cluster_members(&self, id: &ClusterId) -> DomainResult<Option<Bitmap>> {
+        match self.settlement {
+            Some(settlement) => Ok(settlement.members.get(id).cloned()),
+            None => GraphAdjacency::cluster_members(self.index, id),
+        }
+    }
+}
+
+/// In-memory adjacency for the background checkpoint builder. The request
+/// path uses `IndexView` directly.
+pub(crate) struct GraphBuild<'a> {
+    pub notes: &'a [Option<NoteId>],
+    pub sections: &'a GraphSections,
+}
+
+impl GraphAdjacency for GraphBuild<'_> {
+    fn node_count(&self) -> u32 {
+        self.notes.len() as u32
+    }
+
+    fn lookup(&self, note: &NoteId) -> Option<u32> {
+        self.notes
+            .iter()
+            .position(|entry| entry.as_ref() == Some(note))
+            .map(|index| index as u32)
+    }
+
+    fn note_id(&self, node: u32) -> Option<&NoteId> {
+        self.notes.get(node as usize).and_then(Option::as_ref)
+    }
+
+    fn outgoing(&self, node: u32) -> impl Iterator<Item = u32> + Send + '_ {
+        self.sections
+            .outgoing
+            .get(node as usize)
+            .into_iter()
+            .flatten()
+            .copied()
+    }
+
+    fn incoming(&self, node: u32) -> impl Iterator<Item = u32> + Send + '_ {
+        self.sections
+            .incoming
+            .get(node as usize)
+            .into_iter()
+            .flatten()
+            .copied()
+    }
+
+    fn cluster(&self, node: u32) -> Option<ClusterId> {
+        self.sections.clusters.get(node as usize).cloned().flatten()
+    }
+}
+
+const MAX_CLUSTERS: usize = 500;
+const MAX_NOTES: usize = 2_000;
+const MAX_LENS_EDGES: usize = 16_000;
+
+pub(crate) struct GraphPlan {
+    pub result: GraphResult,
+    /// (position in result.nodes, dense note ID), in presentation order.
+    pub hydration: Vec<(usize, u32)>,
+}
+
+/// Plan a response without reading card payloads. The caller computes current
+/// lifecycle/authorization and field filters and holds their publication guard
+/// through planning, hydration and delivery.
+pub(crate) fn plan_graph(
+    adjacency: &impl GraphAdjacency,
+    cut: SnapshotCut,
+    tier: &GraphTier,
+    effective: &Bitmap,
+    authorized_and_filtered: &Bitmap,
+    lens_scope: Option<&Bitmap>,
+) -> DomainResult<GraphPlan> {
+    let visible = if effective.and_cardinality(authorized_and_filtered)
+        == authorized_and_filtered.cardinality()
+    {
+        std::borrow::Cow::Borrowed(authorized_and_filtered)
+    } else {
+        std::borrow::Cow::Owned(effective.and(authorized_and_filtered))
+    };
+    let hidden = effective.cardinality() - visible.cardinality();
+    match tier {
+        GraphTier::Superclusters => superclusters(adjacency, cut, &visible, hidden),
+        GraphTier::Lens { cluster, .. } => {
+            let mut eligible = visible;
+            if let Some(scope) = lens_scope {
+                eligible.to_mut().and_inplace(scope);
+            }
+            if let Some(cluster) = cluster {
+                let members = adjacency
+                    .cluster_members(cluster)?
+                    .ok_or(DomainError::ResourceNotFound)?;
+                eligible.to_mut().and_inplace(&members);
+            }
+            lens(adjacency, cut, &eligible, hidden)
+        }
+        GraphTier::Neighborhood { note, hops } => {
+            neighborhood(adjacency, cut, note, *hops, &visible, hidden)
+        }
+    }
+}
+
+fn superclusters(
+    adjacency: &impl GraphAdjacency,
+    cut: SnapshotCut,
+    visible: &Bitmap,
+    hidden: u64,
+) -> DomainResult<GraphPlan> {
+    let mut members = BTreeMap::<ClusterId, Bitmap>::new();
+    for dense in visible.iter() {
+        if let Some(cluster) = adjacency.cluster(dense) {
+            members.entry(cluster).or_default().add(dense);
+        }
+    }
+    let mut counts: Vec<_> = members
+        .iter()
+        .map(|(id, nodes)| (id, nodes.cardinality()))
+        .collect();
+    counts.sort_unstable_by(|(left_id, left_count), (right_id, right_count)| {
+        right_count
+            .cmp(left_count)
+            .then_with(|| left_id.cmp(right_id))
+    });
+    let mut selected = Bitmap::new();
+    let mut cluster_by_note = BTreeMap::new();
+    for (index, (id, _)) in counts.iter().take(MAX_CLUSTERS).enumerate() {
+        for dense in members[*id].iter() {
+            selected.add(dense);
+            cluster_by_note.insert(dense, index);
+        }
+    }
+    let mut weights = BTreeMap::<(usize, usize), u64>::new();
+    for source in selected.iter() {
+        let from = cluster_by_note[&source];
+        for target in adjacency.outgoing(source) {
+            if let Some(&to) = cluster_by_note.get(&target)
+                && to != from
+            {
+                *weights.entry((from.min(to), from.max(to))).or_default() += 1;
+            }
+        }
+    }
+    let nodes = counts
+        .iter()
+        .take(MAX_CLUSTERS)
+        .map(|(id, count)| GraphNode {
+            id: GraphNodeId::Cluster((*id).clone()),
+            card: None,
+            member_count: *count,
+        })
+        .collect();
+    let edges = weights
+        .into_iter()
+        .map(|((source, target), weight)| GraphEdge {
+            source: GraphNodeId::Cluster(counts[source].0.clone()),
+            target: GraphNodeId::Cluster(counts[target].0.clone()),
+            weight: weight as f64,
+        })
+        .collect();
+    let capped: u64 = counts
+        .iter()
+        .skip(MAX_CLUSTERS)
+        .map(|(_, count)| *count)
+        .sum();
+    Ok(GraphPlan {
+        result: GraphResult {
+            nodes,
+            edges,
+            hidden_count: hidden + capped,
+            truncated: capped != 0,
+            cut,
+        },
+        hydration: Vec::new(),
+    })
+}
+
+fn lens(
+    adjacency: &impl GraphAdjacency,
+    cut: SnapshotCut,
+    eligible: &Bitmap,
+    hidden: u64,
+) -> DomainResult<GraphPlan> {
+    let mut best = BinaryHeap::with_capacity(MAX_NOTES + 1);
+    for node in eligible.iter() {
+        let degree = adjacency
+            .outgoing(node)
+            .chain(adjacency.incoming(node))
+            .filter(|&neighbor| neighbor != node && eligible.contains(neighbor))
+            .count();
+        best.push(Reverse((degree, Reverse(node))));
+        if best.len() > MAX_NOTES {
+            best.pop();
+        }
+    }
+    let ordered = best
+        .into_sorted_vec()
+        .into_iter()
+        .map(|Reverse((_, Reverse(node)))| node)
+        .collect::<Vec<_>>();
+    let capped = eligible.cardinality() - ordered.len() as u64;
+    note_plan(adjacency, cut, ordered, hidden, capped, MAX_LENS_EDGES)
+}
+
+fn neighborhood(
+    adjacency: &impl GraphAdjacency,
+    cut: SnapshotCut,
+    note: &NoteId,
+    hops: u8,
+    visible: &Bitmap,
+    hidden: u64,
+) -> DomainResult<GraphPlan> {
+    if !(1..=2).contains(&hops) {
+        return Err(DomainError::validation(
+            notarium_core::error::ValidationReason::InvalidLimit,
+        ));
+    }
+    let focal = adjacency
+        .lookup(note)
+        .filter(|&node| visible.contains(node))
+        .ok_or(DomainError::ResourceNotFound)?;
+    let first: Bitmap = adjacency
+        .outgoing(focal)
+        .chain(adjacency.incoming(focal))
+        .filter(|&node| node != focal && visible.contains(node))
+        .collect();
+    let mut second = Bitmap::new();
+    if hops == 2 {
+        for node in first.iter() {
+            for neighbor in adjacency.outgoing(node).chain(adjacency.incoming(node)) {
+                if neighbor != focal && visible.contains(neighbor) && !first.contains(neighbor) {
+                    second.add(neighbor);
+                }
+            }
+        }
+    }
+    let ordered = std::iter::once(focal)
+        .chain(first.iter())
+        .chain(second.iter())
+        .take(MAX_NOTES)
+        .collect::<Vec<_>>();
+    let capped = 1 + first.cardinality() + second.cardinality() - ordered.len() as u64;
+    // All induced edges are returned for the selected ego-graph.
+    note_plan(
+        adjacency,
+        cut,
+        ordered,
+        hidden,
+        capped,
+        MAX_NOTES * MAX_NOTES,
+    )
+}
+
+fn note_plan(
+    adjacency: &impl GraphAdjacency,
+    cut: SnapshotCut,
+    ordered: Vec<u32>,
+    hidden: u64,
+    capped: u64,
+    edge_limit: usize,
+) -> DomainResult<GraphPlan> {
+    let nodes = ordered
+        .iter()
+        .map(|&dense| {
+            let note = adjacency.note_id(dense).ok_or_else(|| {
+                DomainError::validation(notarium_core::error::ValidationReason::InvalidState)
+            })?;
+            Ok(GraphNode {
+                id: GraphNodeId::Note(note.clone()),
+                card: None,
+                member_count: 1,
+            })
+        })
+        .collect::<DomainResult<Vec<_>>>()?;
+    let positions: BTreeMap<_, _> = ordered
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(position, dense)| (dense, position))
+        .collect();
+    let mut edges = Vec::new();
+    let mut edge_capped = false;
+    'sources: for (position, &source) in ordered.iter().enumerate() {
+        for target in adjacency.outgoing(source) {
+            let Some(&target) = positions.get(&target) else {
+                continue;
+            };
+            if edges.len() == edge_limit {
+                edge_capped = true;
+                break 'sources;
+            }
+            edges.push(GraphEdge {
+                source: nodes[position].id.clone(),
+                target: nodes[target].id.clone(),
+                weight: 1.0,
+            });
+        }
+    }
+    Ok(GraphPlan {
+        result: GraphResult {
+            nodes,
+            edges,
+            hidden_count: hidden + capped,
+            truncated: capped != 0 || edge_capped,
+            cut,
+        },
+        hydration: ordered.into_iter().enumerate().collect(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use notarium_core::{
+        ids::{HistoryIncarnation, ProjectionGeneration, SpaceId, SpaceSeq},
+        model::HistoryScope,
+    };
+
+    use super::*;
+
+    fn cut() -> SnapshotCut {
+        SnapshotCut {
+            scope: HistoryScope {
+                space_id: SpaceId::from_bytes([5; 16]),
+                incarnation: HistoryIncarnation::from_bytes([15; 16]),
+            },
+            generation: ProjectionGeneration::new(1).unwrap(),
+            canonical_seq: SpaceSeq::new(3).unwrap(),
+            projected_seq: SpaceSeq::new(3).unwrap(),
+        }
+    }
+
+    fn fixture(count: usize, edges: &[(usize, usize)]) -> (Vec<Option<NoteId>>, GraphSections) {
+        let ids = (0..count)
+            .map(|dense| Some(NoteId::from_bytes((dense as u128).to_le_bytes())))
+            .collect();
+        let mut graph = GraphSections {
+            outgoing: vec![Vec::new(); count],
+            incoming: vec![Vec::new(); count],
+            clusters: vec![None; count],
+        };
+        for &(from, to) in edges {
+            graph.outgoing[from].push(to as u32);
+            graph.incoming[to].push(from as u32);
+        }
+        (ids, graph)
+    }
+
+    #[test]
+    fn neighborhood_uses_both_directions_and_never_crosses_an_invisible_node() {
+        let (notes, sections) =
+            fixture(7, &[(1, 0), (0, 2), (2, 1), (2, 3), (4, 1), (5, 0), (5, 6)]);
+        let graph = GraphBuild {
+            notes: &notes,
+            sections: &sections,
+        };
+        let effective: Bitmap = (0..7).collect();
+        let visible: Bitmap = [0, 1, 2, 3, 4, 6].into_iter().collect();
+        let tier = GraphTier::Neighborhood {
+            note: notes[0].clone().unwrap(),
+            hops: 2,
+        };
+        let plan = plan_graph(&graph, cut(), &tier, &effective, &visible, None).unwrap();
+        let order: Vec<_> = plan.hydration.iter().map(|&(_, dense)| dense).collect();
+        assert_eq!(order, [0, 1, 2, 3, 4]);
+        assert_eq!(plan.result.edges.len(), 5);
+        assert_eq!(plan.result.hidden_count, 1);
+        assert!(!plan.result.truncated);
+    }
+
+    #[test]
+    fn lens_ranks_visible_induced_degree_before_its_deterministic_tie_break() {
+        let (notes, sections) = fixture(6, &[(4, 2), (2, 3), (2, 5), (1, 0), (1, 5)]);
+        let graph = GraphBuild {
+            notes: &notes,
+            sections: &sections,
+        };
+        let effective: Bitmap = (0..6).collect();
+        let visible: Bitmap = (0..5).collect();
+        let tier = GraphTier::Lens {
+            project: None,
+            tags: Vec::new(),
+            cluster: None,
+        };
+        let plan = plan_graph(&graph, cut(), &tier, &effective, &visible, None).unwrap();
+        let order: Vec<_> = plan.hydration.iter().map(|&(_, dense)| dense).collect();
+        assert_eq!(order, [2, 0, 1, 3, 4]);
+        assert_eq!(plan.result.edges.len(), 3);
+        assert_eq!(plan.result.hidden_count, 1);
+    }
+
+    #[test]
+    fn leiden_keeps_connected_communities_and_reuses_ids_by_overlap() {
+        let edges = [
+            (0, 1),
+            (0, 2),
+            (0, 3),
+            (1, 2),
+            (1, 3),
+            (2, 3),
+            (4, 5),
+            (4, 6),
+            (4, 7),
+            (5, 6),
+            (5, 7),
+            (6, 7),
+        ];
+        let (notes, mut graph) = fixture(9, &edges);
+        let effective: Bitmap = (0..8).collect();
+        let first = LeidenSnapshot::compute(
+            &GraphBuild {
+                notes: &notes,
+                sections: &graph,
+            },
+            &cut().scope,
+            &effective,
+        )
+        .unwrap();
+        let left = first.cluster(0).unwrap().clone();
+        let right = first.cluster(4).unwrap().clone();
+        assert_ne!(left, right);
+        assert_eq!(first.members[&left].cardinality(), 4);
+        assert_eq!(first.members[&right].cardinality(), 4);
+        assert!(first.cluster(8).is_none());
+
+        graph.clusters = first.expanded();
+        graph.outgoing[3].push(4);
+        graph.incoming[4].push(3);
+        let next = LeidenSnapshot::compute(
+            &GraphBuild {
+                notes: &notes,
+                sections: &graph,
+            },
+            &cut().scope,
+            &effective,
+        )
+        .unwrap();
+        assert_eq!(next.cluster(0), Some(&left));
+        assert_eq!(next.cluster(4), Some(&right));
+        graph.clusters = next.expanded();
+        let view = GraphBuild {
+            notes: &notes,
+            sections: &graph,
+        };
+        let allowed: Bitmap = [0, 1, 2, 3, 4, 5, 6].into_iter().collect();
+        let response = plan_graph(
+            &view,
+            cut(),
+            &GraphTier::Superclusters,
+            &effective,
+            &allowed,
+            None,
+        )
+        .unwrap();
+        assert_eq!(response.result.nodes.len(), 2);
+        assert!(response.result.nodes.iter().all(|node| node.card.is_none()));
+        assert_eq!(response.result.edges.len(), 1);
+        assert_eq!(response.result.edges[0].weight, 1.0);
+        assert_eq!(response.result.hidden_count, 1);
+    }
+}

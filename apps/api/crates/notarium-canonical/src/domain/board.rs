@@ -4,7 +4,7 @@ use notarium_core::{
     DomainError,
     classes::{DocClass, authorize_field_key},
     error::{Diagnostic, PortError, ValidationReason},
-    ids::{AgentRunId, ContentDigest, NoteId, PrincipalId, RevisionId, SpaceId, SpaceSeq},
+    ids::{AgentRunId, ContentDigest, NoteId, PrincipalId, RevisionId, SpaceId, SpaceSeq, ViewKey},
     model::{HistoryScope, Lifecycle},
     ports::{
         BoardMoveFacts, BoardMoveResult, Committed, EvaluatedBoardRow, GroupKey,
@@ -57,6 +57,10 @@ pub const RANK_RADIX: u128 = 36;
 pub const RANK_SPACE: u128 = 4_738_381_338_321_616_896; // 36^12
 const BASE36_ALPHABET: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
 const MAX_PLANNER_RETRIES: usize = 4;
+
+pub(super) fn rank_entity_key(view: &NoteId, key: &ViewKey, target: &NoteId) -> String {
+    format!("{view}:{key}:{target}")
+}
 
 pub fn encode_rank_u128(mut value: u128) -> Result<String, PortError> {
     if value == 0 || value >= RANK_SPACE {
@@ -699,12 +703,7 @@ pub(crate) async fn upsert_overlay_and_rank_revision_tx(
         }
     }
 
-    let rank_entity_key = format!(
-        "{}:{}:{}",
-        view.note.as_str(),
-        view.key.as_str(),
-        target_note.as_str()
-    );
+    let rank_entity_key = rank_entity_key(&view.note, &view.key, target_note);
     let rank_meta =
         RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Rank(RankRevisionMetadata {
             view_note_id: view.note.clone(),
@@ -716,6 +715,7 @@ pub(crate) async fn upsert_overlay_and_rank_revision_tx(
             placement_actor_id: placement_actor_id.clone(),
             placement_run_id: placement_run_id.cloned(),
             is_pma_normalization,
+            removed: false,
         }))
         .encode()?;
 
@@ -843,12 +843,7 @@ pub(crate) async fn move_board_card_impl(
         return Ok(replayed.into_committed());
     }
 
-    let (board_authority, provider) = store
-        .inner
-        .board_provider
-        .get()
-        .ok_or_else(|| DomainError::validation(ValidationReason::NotReady))?
-        .clone();
+    let (board_authority, provider) = store.board_facts_provider()?;
 
     for attempt in 0..MAX_PLANNER_RETRIES {
         ctx.budget.remaining = deadline.remaining(&ctx.budget)?;

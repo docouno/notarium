@@ -1,5 +1,6 @@
 //! Schema upgrades run inside the bootstrap transaction. The incoming witness
 //! must identify the exact schema this migration understands.
+mod chat_refs;
 mod compactions;
 
 use super::{POSTGRES_BASELINE_DDL, SQLITE_BASELINE_DDL, split_sql_statements};
@@ -21,6 +22,7 @@ pub(crate) const V3_HASH: &str = "ca79d3e2db2eed95fb8b0e503340139b3fd166b51340e6
 pub(crate) const V4_HASH: &str = "23fda6322e7820fdb9b60bd67192098e3d472c074f655a9d0edceaa7e3fb66e0";
 
 pub(crate) const V5_HASH: &str = "e32b31f85aeb41b99c19c355bad2f9103eac552a0fe4b9c1ebb149892a7d9774";
+pub(crate) const V6_HASH: &str = "f91526e264d8000bf5d72a4efcb4e9701b350636c37da24d2b34bb19f50a8772";
 
 pub(crate) fn recognized_predecessor(version: i64, hash: &[u8]) -> bool {
     match version {
@@ -29,6 +31,7 @@ pub(crate) fn recognized_predecessor(version: i64, hash: &[u8]) -> bool {
         3 => hex::encode(hash) == V3_HASH,
         4 => hex::encode(hash) == V4_HASH,
         5 => hex::encode(hash) == V5_HASH,
+        6 => hex::encode(hash) == V6_HASH,
         _ => false,
     }
 }
@@ -89,6 +92,32 @@ fn create_new_table(ddl: &str, table: &str) -> Result<String, PortError> {
     let prefix = format!("CREATE TABLE IF NOT EXISTS {table} (");
     Ok(baseline_statement(ddl, &prefix)?.replacen("CREATE TABLE IF NOT EXISTS", "CREATE TABLE", 1))
 }
+
+const PROJECTION_RANK_DDL: [&str; 7] = [
+    "CREATE TABLE IF NOT EXISTS projection_rank_anchors (",
+    "CREATE TABLE IF NOT EXISTS projection_rank_anchor_rows (",
+    "CREATE INDEX IF NOT EXISTS idx_projection_rank_anchor_target",
+    "CREATE INDEX IF NOT EXISTS idx_revisions_projection_rank_key",
+    "CREATE INDEX IF NOT EXISTS idx_revisions_projection_rank_target",
+    "CREATE INDEX IF NOT EXISTS idx_folder_aliases_projection_seq",
+    "CREATE INDEX IF NOT EXISTS idx_note_aliases_projection_seq",
+];
+const COPY_RANK_ANCHOR_MARKERS: &str = "INSERT INTO projection_rank_anchors
+    (space_id, history_incarnation, anchor_seq)
+    SELECT space_id, history_incarnation, last_seq FROM spaces";
+const COPY_RANK_ANCHOR_ROWS: &str = "INSERT INTO projection_rank_anchor_rows
+    (space_id, view_note_id, view_key, target_note_id, group_key_msgpack, group_key_hex,
+     sort_rank_lexo, rank_rev_id, placement_revision, placement_actor_id, placement_run_id, updated_seq)
+    SELECT space_id, view_note_id, view_key, target_note_id, group_key_msgpack, group_key_hex,
+           sort_rank_lexo, rank_rev_id, placement_revision, placement_actor_id, placement_run_id, updated_seq
+    FROM view_rank_overlays";
+const CHECK_RANK_ANCHOR: &str = "SELECT
+    (SELECT COUNT(*) FROM projection_rank_anchors) = (SELECT COUNT(*) FROM spaces)
+    AND (SELECT COUNT(*) FROM projection_rank_anchor_rows) = (SELECT COUNT(*) FROM view_rank_overlays)
+    AND NOT EXISTS (
+        SELECT 1 FROM projection_rank_anchor_rows r JOIN projection_rank_anchors a USING (space_id)
+        WHERE r.updated_seq > a.anchor_seq
+    )";
 
 async fn upgrade_sqlite_catalog(conn: &mut SqliteConnection) -> Result<(), PortError> {
     let create = create_new_table(SQLITE_BASELINE_DDL, "blob_catalog")?;
@@ -240,13 +269,36 @@ macro_rules! upgrade {
             if version < 5 {
                 upgrade_owners_v5(&mut crate::sql_exec::BackendConn::$variant(conn)).await?;
             }
-            // Both global and per-Space pending checks can seek by status.
+            if version < 6 {
+                // Both global and per-Space pending checks can seek by status.
             let index = baseline_statement($ddl, "CREATE INDEX IF NOT EXISTS idx_blob_retirements_status")?;
             sqlx::query("DROP INDEX idx_blob_retirements_status")
                 .execute(&mut *conn).await
                 .map_err(|e| internal_not_committed("migration_v6_drop_retirement_index", e.to_string()))?;
             sqlx::query(sqlx::AssertSqlSafe(index)).execute(&mut *conn).await
                 .map_err(|e| internal_not_committed("migration_v6_retirement_index", e.to_string()))?;
+            }
+            let rank_error = |e: sqlx::Error| {
+                internal_not_committed("migration_v7_rank_anchor", e.to_string())
+            };
+            for prefix in PROJECTION_RANK_DDL {
+                let sql = baseline_statement($ddl, prefix)?;
+                sqlx::query(sqlx::AssertSqlSafe(sql)).execute(&mut *conn).await.map_err(rank_error)?;
+            }
+            // Capture actual overlays without advancing SpaceSeq or reviving a placement
+            // deleted before rank tombstones were available.
+            for sql in [COPY_RANK_ANCHOR_MARKERS, COPY_RANK_ANCHOR_ROWS] {
+                sqlx::query(sql).execute(&mut *conn).await.map_err(rank_error)?;
+            }
+            if !sqlx::query_scalar::<_, bool>(CHECK_RANK_ANCHOR)
+                .fetch_one(&mut *conn).await.map_err(rank_error)?
+            {
+                return Err(internal_not_committed(
+                    "migration_v7_rank_anchor",
+                    "the rank anchor does not capture all live view ranks at the Space command end",
+                ));
+            }
+            chat_refs::$name(&mut *conn).await?;
             let (sec, nsec) =
                 crate::codec::encode_timestamp_parts(crate::codec::now_utc_timestamp()?);
             sqlx::query(WRITE_WITNESS)

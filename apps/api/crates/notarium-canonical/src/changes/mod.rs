@@ -262,6 +262,9 @@ pub fn build_effect_payload_draft(
 
 #[derive(Clone, Debug)]
 pub(crate) enum BroadcastSignal {
+    CatalogChanged {
+        scope: HistoryScope,
+    },
     Committed {
         scope: HistoryScope,
         new_last_seq: SpaceSeq,
@@ -275,6 +278,28 @@ pub(crate) enum BroadcastSignal {
         new_scope: HistoryScope,
         ceiling: SpaceSeq,
     },
+}
+
+/// Wakeups for projection-space discovery. The catalog remains authoritative
+/// after a lagged notification or an incarnation change.
+pub struct ProjectionCatalogSubscription {
+    receiver: broadcast::Receiver<BroadcastSignal>,
+}
+
+impl ProjectionCatalogSubscription {
+    pub async fn next(&mut self) -> Option<Option<HistoryScope>> {
+        loop {
+            match self.receiver.recv().await {
+                Ok(BroadcastSignal::CatalogChanged { scope }) => return Some(Some(scope)),
+                Ok(BroadcastSignal::IncarnationChanged { new_scope, .. }) => {
+                    return Some(Some(new_scope));
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => return Some(None),
+                Err(broadcast::error::RecvError::Closed) => return None,
+                Ok(BroadcastSignal::Committed { .. } | BroadcastSignal::Purged { .. }) => {}
+            }
+        }
+    }
 }
 
 pub(crate) struct BroadcastHub {
@@ -462,6 +487,7 @@ impl ChangeSubscription for CanonicalChangeSubscription {
                     self.rx.recv().await
                 };
                 match signal {
+                    Ok(BroadcastSignal::CatalogChanged { .. }) => continue,
                     Ok(BroadcastSignal::IncarnationChanged { new_scope, ceiling }) => {
                         if new_scope.space_id == self.processed.scope.space_id {
                             self.delivered_complete_command_end = ceiling;
@@ -706,6 +732,16 @@ impl<'a> ChangeCaller<'a> {
 }
 
 impl CanonicalStore {
+    pub fn subscribe_projection_catalog(
+        &self,
+        ctx: &MaintenanceContext,
+    ) -> Result<ProjectionCatalogSubscription, PortError> {
+        ctx.authority.require(ServicePurpose::Projection)?;
+        Ok(ProjectionCatalogSubscription {
+            receiver: self.inner.broadcast_hub.subscribe_raw(),
+        })
+    }
+
     #[cfg(feature = "test-support")]
     pub fn reconfigure_broadcast_capacity_for_test(&self, capacity: usize) {
         self.inner.broadcast_hub.reconfigure_capacity(capacity);
@@ -739,73 +775,7 @@ impl CanonicalStore {
 
                 let mut out = Vec::with_capacity(relevant.len());
                 for token in relevant {
-                    let seq_i64 = token.seq().get() as i64;
-                    let cmd_row: Option<(String, Option<String>)> = match tx {
-                        BackendConn::Sqlite(conn) => {
-                            let r = sqlx::query(
-                                "SELECT command_kind, payload_id FROM change_commands
-                                 WHERE space_id = ? AND history_incarnation = ? AND last_seq = ?",
-                            )
-                            .bind(scope_cl.space_id.as_str())
-                            .bind(scope_cl.incarnation.as_bytes().as_slice())
-                            .bind(seq_i64)
-                            .fetch_optional(&mut **conn)
-                            .await
-                            .map_err(|err| {
-                                internal_not_committed("sqlite_resolve_rcpt_cmd", err.to_string())
-                            })?;
-                            r.map(|row| (row.get("command_kind"), row.get("payload_id")))
-                        }
-                        BackendConn::Postgres(conn) => {
-                            let r = sqlx::query(
-                                "SELECT command_kind, payload_id FROM change_commands
-                                 WHERE space_id = $1 AND history_incarnation = $2 AND last_seq = $3",
-                            )
-                            .bind(scope_cl.space_id.as_str())
-                            .bind(scope_cl.incarnation.as_bytes().as_slice())
-                            .bind(seq_i64)
-                            .fetch_optional(&mut **conn)
-                            .await
-                            .map_err(|err| {
-                                crate::runtime::pg_read_error("pg_resolve_rcpt_cmd", err)
-                            })?;
-                            r.map(|row| (row.get("command_kind"), row.get("payload_id")))
-                        }
-                    };
-
-                    let Some((command_kind, payload_id_opt)) = cmd_row else {
-                        out.push(TrustedMutationEffect {
-                            receipt: token,
-                            effect: MutationEffect::AwaitProjection {
-                                reason: AwaitReason::UnknownEffect,
-                            },
-                        });
-                        continue;
-                    };
-
-                    let effect = match payload_id_opt {
-                        None => default_effect_without_payload(&command_kind),
-                        Some(pid) => match load_decoded_effect_tx(tx, &scope_cl.space_id, &pid).await
-                        {
-                            Ok(eff) => verify_overlay_versions_retained_tx(
-                                tx,
-                                &scope_cl,
-                                token.seq(),
-                                &command_kind,
-                                eff,
-                            )
-                            .await?,
-                            Err(PortError::Domain(DomainError::ValidationFailed {
-                                diagnostic,
-                            })) if diagnostic.reason == ValidationReason::PurgeResync => {
-                                MutationEffect::AwaitProjection {
-                                    reason: AwaitReason::UnavailableVersion,
-                                }
-                            }
-                            Err(other) => return Err(other),
-                        },
-                    };
-
+                    let (_, effect) = resolve_receipt_effect_tx(tx, &scope_cl, token.seq()).await?;
                     out.push(TrustedMutationEffect {
                         receipt: token,
                         effect,
@@ -1043,7 +1013,7 @@ impl CanonicalStore {
                                 cached.clone()
                             } else {
                                 let loaded =
-                                    load_decoded_effect_tx(tx, &after.scope.space_id, pid).await?;
+                                    load_decoded_effect_tx(tx, &after.scope, pid, command_range, None).await?;
                                 payload_cache.insert(pid.clone(), loaded.clone());
                                 loaded
                             }
@@ -1638,9 +1608,12 @@ fn default_effect_without_payload(command_kind: &str) -> MutationEffect {
 
 async fn load_decoded_effect_tx(
     tx: &mut BackendConn<'_>,
-    space_id: &SpaceId,
+    scope: &HistoryScope,
     payload_id: &str,
+    command_range: CommandSeqRange,
+    command_kind: Option<&str>,
 ) -> Result<MutationEffect, PortError> {
+    let space_id = &scope.space_id;
     let raw: Option<(String, i32, Option<Vec<u8>>)> = match tx {
         BackendConn::Sqlite(conn) => {
             let r = sqlx::query(
@@ -1703,7 +1676,98 @@ async fn load_decoded_effect_tx(
     }
 
     let env = EffectEnvelopeV1::decode(&bytes)?;
+    // Restores rebind the enclosing journal to a new history without rewriting
+    // preserved immutable payloads. The command lookup already checks that history.
+    if env.scope.space_id != scope.space_id
+        || env.command_range != command_range
+        || command_kind.is_some_and(|kind| kind != env.command_kind)
+    {
+        return Err(internal_not_committed(
+            "corrupt_change_payload_scope",
+            "change effect does not match its command",
+        ));
+    }
     Ok(env.to_mutation_effect(bytes.len()))
+}
+
+pub(crate) async fn resolve_receipt_effect_tx(
+    tx: &mut BackendConn<'_>,
+    scope: &HistoryScope,
+    command_end: SpaceSeq,
+) -> Result<(Option<String>, MutationEffect), PortError> {
+    let seq_i64 = command_end.get() as i64;
+    let cmd_row: Option<(String, i64, Option<String>)> = match tx {
+        BackendConn::Sqlite(conn) => {
+            let r = sqlx::query(
+                "SELECT command_kind, first_seq, payload_id FROM change_commands
+                 WHERE space_id = ? AND history_incarnation = ? AND last_seq = ?",
+            )
+            .bind(scope.space_id.as_str())
+            .bind(scope.incarnation.as_bytes().as_slice())
+            .bind(seq_i64)
+            .fetch_optional(&mut **conn)
+            .await
+            .map_err(|err| internal_not_committed("sqlite_resolve_rcpt_cmd", err.to_string()))?;
+            r.map(|row| {
+                (
+                    row.get("command_kind"),
+                    row.get("first_seq"),
+                    row.get("payload_id"),
+                )
+            })
+        }
+        BackendConn::Postgres(conn) => {
+            let r = sqlx::query(
+                "SELECT command_kind, first_seq, payload_id FROM change_commands
+                 WHERE space_id = $1 AND history_incarnation = $2 AND last_seq = $3",
+            )
+            .bind(scope.space_id.as_str())
+            .bind(scope.incarnation.as_bytes().as_slice())
+            .bind(seq_i64)
+            .fetch_optional(&mut **conn)
+            .await
+            .map_err(|err| crate::runtime::pg_read_error("pg_resolve_rcpt_cmd", err))?;
+            r.map(|row| {
+                (
+                    row.get("command_kind"),
+                    row.get("first_seq"),
+                    row.get("payload_id"),
+                )
+            })
+        }
+    };
+
+    let Some((command_kind, first_seq, payload_id_opt)) = cmd_row else {
+        return Ok((
+            None,
+            MutationEffect::AwaitProjection {
+                reason: AwaitReason::UnknownEffect,
+            },
+        ));
+    };
+
+    let range = CommandSeqRange::new(i64_to_space_seq(first_seq)?, command_end)?;
+    let effect = match payload_id_opt {
+        None => default_effect_without_payload(&command_kind),
+        Some(pid) => {
+            match load_decoded_effect_tx(tx, scope, &pid, range, Some(&command_kind)).await {
+                Ok(eff) => {
+                    verify_overlay_versions_retained_tx(tx, scope, command_end, &command_kind, eff)
+                        .await?
+                }
+                Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
+                    if diagnostic.reason == ValidationReason::PurgeResync =>
+                {
+                    MutationEffect::AwaitProjection {
+                        reason: AwaitReason::UnavailableVersion,
+                    }
+                }
+                Err(other) => return Err(other),
+            }
+        }
+    };
+
+    Ok((Some(command_kind), effect))
 }
 
 async fn verify_overlay_versions_retained_tx(
@@ -1889,7 +1953,7 @@ async fn has_erased_change_payload_in_range_tx(
     Ok(found.is_some())
 }
 
-async fn has_post_cutoff_purge_of_prior_note_tx(
+pub(crate) async fn has_post_cutoff_purge_of_prior_note_tx(
     tx: &mut BackendConn<'_>,
     scope: &HistoryScope,
     valid_cutoff: SpaceSeq,
@@ -1960,7 +2024,7 @@ async fn list_note_keys_at_or_below_cutoff_tx(
     }
 }
 
-async fn list_thread_keys_at_or_below_cutoff_tx(
+pub(crate) async fn list_thread_keys_at_or_below_cutoff_tx(
     tx: &mut BackendConn<'_>,
     scope: &HistoryScope,
     cutoff: SpaceSeq,

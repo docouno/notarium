@@ -1,0 +1,1420 @@
+//! Current canonical visibility for retained and asynchronously built read cuts.
+
+mod seal;
+mod source;
+
+pub use seal::ProjectionCatalogSealEntry;
+#[cfg(feature = "test-support")]
+mod census;
+#[cfg(feature = "test-support")]
+pub use census::FenceCensusFixture;
+pub(crate) use source::ensure_postgres_owner_table;
+
+use std::{
+    collections::{BTreeMap, HashMap, VecDeque},
+    mem::size_of,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
+
+use notarium_core::{
+    DomainError,
+    auth::{ResourceFacts, Space, SpaceLifecycle},
+    classes::DocClass,
+    error::{PortError, ValidationReason},
+    ids::{
+        AbilityId, ChatThreadId, FolderId, LeaseEpoch, NoteId, ProjectionGeneration, SpaceId,
+        SpaceSeq, ThreadEntrySeq,
+    },
+    model::{HistoryScope, Lifecycle},
+    ports::{
+        CallBudget, Committed, MaintenanceContext, PortFuture, RedactedChat, ServicePurpose,
+        SpaceContext,
+    },
+};
+use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
+
+use crate::{
+    CanonicalStore,
+    domain::common::MAX_FOLDER_DEPTH,
+    runtime::{SpaceRecord, SqlDriverState},
+};
+
+use self::source::{FolderRow, NoteRow};
+
+const MAX_PRIVATE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_DELTA_NOTES: usize = 16_384;
+const MAX_TRACKED_CHANGES: usize = 4_096;
+const PAGE_ROWS: usize = 200;
+const NO_PARENT: u32 = u32::MAX;
+const SLOT_CHUNK: usize = 65_536;
+
+fn not_ready() -> PortError {
+    DomainError::validation(ValidationReason::NotReady).into()
+}
+
+/// The immutable note directory belonging to a trusted structural checkpoint.
+///
+/// A slot must map back to exactly its original identity for the lifetime of
+/// the directory. The lookup may use shared file-backed pages.
+pub trait LiveDenseLookup: Send + Sync {
+    fn slots(&self) -> u32;
+    fn dense_id(&self, note: &NoteId) -> Option<u32>;
+
+    /// Lookup replacements in a generation preserve all previously assigned
+    /// slots. Implementations without this guarantee omit the generation.
+    fn generation(&self) -> Option<ProjectionGeneration> {
+        None
+    }
+
+    fn published_seq(&self) -> Option<SpaceSeq> {
+        None
+    }
+}
+
+/// Current-resource metadata classification. This metadata check is untainted.
+/// Callers yielding content still use the appropriate authorizing read method.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum LiveNoteStatus {
+    PurgedOrAbsent,
+    HiddenByAuth {
+        is_active_plain: bool,
+    },
+    ActiveVisible(ResourceFacts),
+    EncryptedVisible {
+        facts: ResourceFacts,
+        effective_lifecycle: Lifecycle,
+    },
+    TrashedVisible(ResourceFacts),
+}
+
+/// Accounted private fence backing capacity and logical size of an admission.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct FenceMemoryUsage {
+    pub dense_slots: usize,
+    pub delta_notes: usize,
+    pub folders: usize,
+    pub private_bytes: usize,
+    pub peak_private_bytes: usize,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ProjectionRedactedEntry {
+    pub thread: ChatThreadId,
+    pub entry: ThreadEntrySeq,
+    pub redacted_at: SpaceSeq,
+}
+
+/// Durable erasures discovered in a canonical command window.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ProjectionErasures {
+    pub scope: HistoryScope,
+    pub through: SpaceSeq,
+    pub purged: Vec<NoteId>,
+    pub redacted: Vec<ProjectionRedactedEntry>,
+}
+
+/// Durable identity of the runtime whose admission must be revoked.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ProjectionOwnerIdentity {
+    scope: HistoryScope,
+    epoch: LeaseEpoch,
+    process: String,
+}
+
+impl ProjectionOwnerIdentity {
+    pub fn scope(&self) -> &HistoryScope {
+        &self.scope
+    }
+
+    pub fn epoch(&self) -> LeaseEpoch {
+        self.epoch
+    }
+
+    pub fn process(&self) -> &str {
+        &self.process
+    }
+}
+
+/// Trusted composition may attest that the named process cannot serve again.
+/// A disconnected database session or missing heartbeat cannot support this
+/// proof. The capability has no transport decoder.
+pub struct StoppedProjectionOwner(ProjectionOwnerIdentity);
+
+impl StoppedProjectionOwner {
+    pub fn attest(identity: ProjectionOwnerIdentity) -> Self {
+        Self(identity)
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct VisibilityWindow {
+    pub scope: HistoryScope,
+    pub after: SpaceSeq,
+    pub through: SpaceSeq,
+}
+
+/// Physically removes erasable derived data before a successful command reply.
+/// The callback is idempotent and may access canonical maintenance reads. It
+/// must not acquire final-delivery permits or enter a canonical writer.
+pub trait ProjectionVisibilityCleanup: Send + Sync {
+    fn erase_visibility<'a>(&'a self, erasures: &'a ProjectionErasures) -> PortFuture<'a, ()>;
+}
+
+struct LiveState {
+    record: SpaceRecord,
+    readable: bool,
+    lookup_retired: bool,
+    lookup: Option<Arc<dyn LiveDenseLookup>>,
+    lookup_generation: Option<ProjectionGeneration>,
+    dense: DenseSlots,
+    abilities: HashMap<u32, AbilityId>,
+    delta: HashMap<NoteId, NoteHead>,
+    folder_slots: HashMap<FolderId, u32>,
+    folders: Vec<FolderNode>,
+    changes_after: SpaceSeq,
+    note_changes: VecDeque<(SpaceSeq, NoteId)>,
+    peak_private_bytes: usize,
+}
+
+// Separate arrays keep each slot at five bytes. Chunks avoid reallocating the
+// whole fence when the checkpoint grows by an append-only suffix.
+struct DenseChunk {
+    parents: Vec<u32>,
+    flags: Vec<u8>,
+}
+
+#[derive(Default)]
+struct DenseSlots {
+    chunks: Vec<DenseChunk>,
+    len: usize,
+}
+
+impl DenseSlots {
+    fn extend_to(&mut self, total: usize) {
+        while self.len < total {
+            let local = self.len % SLOT_CHUNK;
+            if local == 0 {
+                self.chunks.push(DenseChunk {
+                    parents: Vec::new(),
+                    flags: Vec::new(),
+                });
+            }
+            let chunk = self.chunks.last_mut().expect("dense append chunk");
+            let additional = (total - self.len).min(SLOT_CHUNK - local);
+            chunk.parents.reserve_exact(additional);
+            chunk.flags.reserve_exact(additional);
+            chunk.parents.resize(local + additional, NO_PARENT);
+            chunk.flags.resize(local + additional, 0);
+            self.len += additional;
+        }
+    }
+
+    fn get(&self, index: u32) -> Option<(u32, u8)> {
+        let index = index as usize;
+        let chunk = self.chunks.get(index / SLOT_CHUNK)?;
+        let local = index % SLOT_CHUNK;
+        Some((*chunk.parents.get(local)?, *chunk.flags.get(local)?))
+    }
+
+    fn update(&mut self, index: u32, parent: u32, flags: u8) {
+        let index = index as usize;
+        let chunk = &mut self.chunks[index / SLOT_CHUNK];
+        let local = index % SLOT_CHUNK;
+        chunk.parents[local] = parent;
+        chunk.flags[local] = flags;
+    }
+
+    fn allocated_capacity(&self) -> usize {
+        self.chunks.capacity() * size_of::<DenseChunk>()
+            + self
+                .chunks
+                .iter()
+                .map(|chunk| chunk.parents.capacity() * size_of::<u32>() + chunk.flags.capacity())
+                .sum::<usize>()
+    }
+}
+
+struct NoteHead {
+    parent: u32,
+    class: DocClass,
+    lifecycle: Lifecycle,
+    ability: Option<AbilityId>,
+}
+
+struct FolderNode {
+    id: FolderId,
+    parent: Option<u32>,
+    lifecycle: Lifecycle,
+    write_locked: bool,
+}
+
+impl LiveState {
+    fn new(
+        record: SpaceRecord,
+        lookup: Option<Arc<dyn LiveDenseLookup>>,
+    ) -> Result<Self, PortError> {
+        let slots = lookup.as_ref().map_or(0, |lookup| lookup.slots()) as usize;
+        if slots > MAX_PRIVATE_BYTES / 5 {
+            return Err(not_ready());
+        }
+        let mut dense = DenseSlots::default();
+        dense.extend_to(slots);
+        let changes_after = record.last_seq;
+        let lookup_generation = lookup.as_ref().and_then(|lookup| lookup.generation());
+        let mut state = Self {
+            record,
+            readable: true,
+            lookup_retired: false,
+            lookup,
+            lookup_generation,
+            dense,
+            abilities: HashMap::new(),
+            delta: HashMap::new(),
+            folder_slots: HashMap::new(),
+            folders: Vec::new(),
+            changes_after,
+            note_changes: VecDeque::new(),
+            peak_private_bytes: 0,
+        };
+        state.peak_private_bytes = state.allocated_capacity();
+        Ok(state)
+    }
+
+    fn update_lookup(&mut self, lookup: Arc<dyn LiveDenseLookup>) -> Result<bool, PortError> {
+        let Some(generation) = lookup.generation() else {
+            return Ok(false);
+        };
+        if self.lookup.as_ref().and_then(|old| old.generation()) != Some(generation) {
+            return Ok(false);
+        }
+        let slots = lookup.slots() as usize;
+        if slots < self.dense.len || slots > MAX_PRIVATE_BYTES / 5 {
+            return Err(not_ready());
+        }
+        self.dense.extend_to(slots);
+        self.lookup = Some(lookup.clone());
+        self.delta.retain(|note, head| {
+            let Some(slot) = lookup.dense_id(note) else {
+                return true;
+            };
+            if (slot as usize) >= slots {
+                return true;
+            }
+            self.dense
+                .update(slot, head.parent, encode_flags(head.lifecycle, head.class));
+            if let Some(ability) = head.ability.take() {
+                self.abilities.insert(slot, ability);
+            }
+            false
+        });
+        self.delta.shrink_to_fit();
+        self.enforce_limit()?;
+        self.lookup_retired = false;
+        Ok(true)
+    }
+
+    fn retire_lookup_before(&mut self, seq: SpaceSeq) {
+        if self.lookup.as_ref().is_some_and(|lookup| {
+            lookup
+                .published_seq()
+                .is_none_or(|published| published < seq)
+        }) {
+            self.lookup_retired = true;
+            self.lookup = None;
+        }
+    }
+
+    fn change_notes(&mut self, head: SpaceSeq, notes: &[NoteRow], has_folder_changes: bool) {
+        if has_folder_changes {
+            self.changes_after = head;
+            self.note_changes.clear();
+            return;
+        }
+        for note in notes {
+            if self.note_changes.len() == MAX_TRACKED_CHANGES
+                && let Some((seq, _)) = self.note_changes.pop_front()
+            {
+                self.changes_after = self.changes_after.max(seq);
+            }
+            self.note_changes.push_back((head, note.id.clone()));
+        }
+    }
+
+    fn folder_slot(&mut self, id: FolderId) -> Result<u32, PortError> {
+        if let Some(slot) = self.folder_slots.get(&id) {
+            return Ok(*slot);
+        }
+        let slot = u32::try_from(self.folders.len()).map_err(|_| not_ready())?;
+        self.folder_slots.insert(id.clone(), slot);
+        self.folders.push(FolderNode {
+            id,
+            parent: None,
+            lifecycle: Lifecycle::Purged,
+            write_locked: false,
+        });
+        Ok(slot)
+    }
+
+    fn apply_folder(&mut self, row: FolderRow) -> Result<(), PortError> {
+        let index = self.folder_slot(row.id)?;
+        let parent = row
+            .parent
+            .map(|parent| self.folder_slot(parent))
+            .transpose()?;
+        self.folders[index as usize] = FolderNode {
+            id: self.folders[index as usize].id.clone(),
+            parent,
+            lifecycle: row.lifecycle,
+            write_locked: row.write_locked,
+        };
+        self.enforce_limit()
+    }
+
+    fn apply_note(&mut self, row: NoteRow) -> Result<(), PortError> {
+        let dense = self
+            .lookup
+            .as_ref()
+            .and_then(|lookup| lookup.dense_id(&row.id));
+        let present = row.lifecycle != Lifecycle::Purged;
+        if let Some(dense) = dense {
+            if dense as usize >= self.dense.len {
+                return Err(not_ready());
+            }
+            let parent = if present {
+                self.folder_slot(row.parent.ok_or_else(not_ready)?)?
+            } else {
+                NO_PARENT
+            };
+            self.dense
+                .update(dense, parent, encode_flags(row.lifecycle, row.class));
+            match row.ability.filter(|_| present) {
+                Some(ability) => self.abilities.insert(dense, ability),
+                None => self.abilities.remove(&dense),
+            };
+        } else if present {
+            let parent = self.folder_slot(row.parent.ok_or_else(not_ready)?)?;
+            self.delta.insert(
+                row.id,
+                NoteHead {
+                    parent,
+                    class: row.class,
+                    lifecycle: row.lifecycle,
+                    ability: row.ability,
+                },
+            );
+        } else {
+            self.delta.remove(&row.id);
+        }
+        self.enforce_limit()
+    }
+
+    fn note(&self, id: &NoteId) -> Option<(u32, DocClass, Lifecycle, Option<&AbilityId>)> {
+        if let Some(slot) = self.lookup.as_ref().and_then(|lookup| lookup.dense_id(id)) {
+            let (parent, flags) = self.dense.get(slot)?;
+            let (class, lifecycle) = decode_flags(flags)?;
+            Some((parent, class, lifecycle, self.abilities.get(&slot)))
+        } else {
+            let note = self.delta.get(id)?;
+            Some((
+                note.parent,
+                note.class,
+                note.lifecycle,
+                note.ability.as_ref(),
+            ))
+        }
+    }
+
+    fn ancestry(&self, start: u32) -> Option<(Vec<FolderId>, bool, bool)> {
+        let mut ancestors = Vec::new();
+        let mut slot = start;
+        let mut write_locked = false;
+        let mut trashed = false;
+        // A cycle cannot reach the permanent root. The depth bound also caps
+        // accumulation if an invalid folder topology reaches storage.
+        for _ in 0..=MAX_FOLDER_DEPTH {
+            let node = self.folders.get(slot as usize)?;
+            trashed |= node.lifecycle != Lifecycle::Active;
+            write_locked |= node.write_locked;
+            ancestors.push(node.id.clone());
+            match node.parent {
+                Some(parent) => slot = parent,
+                None if node.id == self.record.root_folder_id => {
+                    return Some((ancestors, write_locked, trashed));
+                }
+                None => return None,
+            }
+        }
+        None
+    }
+
+    fn enforce_limit(&mut self) -> Result<(), PortError> {
+        let bytes = self.allocated_capacity();
+        self.peak_private_bytes = self.peak_private_bytes.max(bytes);
+        if self.delta.len() > MAX_DELTA_NOTES || bytes > MAX_PRIVATE_BYTES {
+            return Err(not_ready());
+        }
+        Ok(())
+    }
+
+    fn memory_usage(&self) -> FenceMemoryUsage {
+        FenceMemoryUsage {
+            dense_slots: self.dense.len,
+            delta_notes: self.delta.len(),
+            folders: self.folders.len(),
+            private_bytes: self.allocated_capacity(),
+            peak_private_bytes: self.peak_private_bytes,
+        }
+    }
+
+    fn allocated_capacity(&self) -> usize {
+        // Hash tables reserve control bytes as well as entries. Their bucket
+        // count is conservatively rounded up from 7/8 usable capacity. IDs are
+        // owned strings, whose supported maximum encoded length is 40 bytes.
+        fn table<K, V>(map: &HashMap<K, V>, identifier_heaps: usize) -> usize {
+            let buckets = if map.capacity() == 0 {
+                0
+            } else {
+                map.capacity()
+                    .saturating_mul(8)
+                    .div_ceil(7)
+                    .next_power_of_two()
+            };
+            buckets.saturating_mul(size_of::<(K, V)>() + 1)
+                + map.len().saturating_mul(identifier_heaps)
+        }
+        self.dense.allocated_capacity()
+            + self.folders.capacity() * size_of::<FolderNode>()
+            + self.folders.len() * 40
+            + table(&self.folder_slots, 40)
+            + table(&self.abilities, 40)
+            + table(&self.delta, 80)
+            + self.note_changes.capacity() * size_of::<(SpaceSeq, NoteId)>()
+            + self.note_changes.len() * 40
+            + size_of::<Gate>()
+            + size_of::<LiveState>()
+            + 256
+    }
+}
+
+fn encode_flags(lifecycle: Lifecycle, class: DocClass) -> u8 {
+    let lifecycle_bits = match lifecycle {
+        Lifecycle::Purged => return 0,
+        Lifecycle::Active => 0x10,
+        Lifecycle::Trashed => 0x20,
+    };
+    let class_bits = match class {
+        DocClass::UserDoc => 0,
+        DocClass::EncryptedNote => 1,
+        DocClass::AgentMemory => 2,
+        DocClass::Skill => 3,
+        DocClass::Profile => 4,
+    };
+    lifecycle_bits | class_bits
+}
+
+fn decode_flags(flags: u8) -> Option<(DocClass, Lifecycle)> {
+    let lifecycle = match flags & 0xf0 {
+        0x10 => Lifecycle::Active,
+        0x20 => Lifecycle::Trashed,
+        _ => return None,
+    };
+    let class = match flags & 0x0f {
+        0 => DocClass::UserDoc,
+        1 => DocClass::EncryptedNote,
+        2 => DocClass::AgentMemory,
+        3 => DocClass::Skill,
+        4 => DocClass::Profile,
+        _ => return None,
+    };
+    Some((class, lifecycle))
+}
+
+enum GateData {
+    Empty,
+    Active(Box<LiveState>),
+    Revoked,
+}
+
+impl GateData {
+    fn state(&self) -> Option<&LiveState> {
+        match self {
+            Self::Active(state) => Some(state),
+            _ => None,
+        }
+    }
+
+    fn state_mut(&mut self) -> Option<&mut LiveState> {
+        match self {
+            Self::Active(state) => Some(state),
+            _ => None,
+        }
+    }
+}
+
+type Gate = Arc<RwLock<GateData>>;
+type Topology = BTreeMap<SpaceId, Gate>;
+
+#[derive(Clone)]
+pub struct LiveLifecycleFence {
+    topology: Arc<RwLock<Topology>>,
+    closed: Arc<AtomicBool>,
+    process: Arc<str>,
+    cleanup: Arc<std::sync::RwLock<Option<Arc<dyn ProjectionVisibilityCleanup>>>>,
+    cleanup_debt: Arc<std::sync::Mutex<HashMap<HistoryScope, (SpaceSeq, SpaceSeq)>>>,
+}
+
+impl LiveLifecycleFence {
+    pub(crate) fn new() -> Result<Self, PortError> {
+        Ok(Self {
+            topology: Arc::default(),
+            closed: Arc::default(),
+            process: crate::codec::new_prefixed_hex_id("owner_")?.into(),
+            cleanup: Arc::default(),
+            cleanup_debt: Arc::default(),
+        })
+    }
+
+    fn cleanup(&self) -> Option<Arc<dyn ProjectionVisibilityCleanup>> {
+        self.cleanup
+            .read()
+            .expect("projection cleanup registry")
+            .clone()
+    }
+
+    pub(crate) fn has_cleanup(&self) -> bool {
+        self.cleanup
+            .read()
+            .expect("projection cleanup registry")
+            .is_some()
+    }
+
+    /// Gets a handle for the current history at this runtime.
+    pub fn space(&self, scope: &HistoryScope) -> Result<LiveSpaceHandle, PortError> {
+        let topology = self.topology.try_read().map_err(|_| not_ready())?;
+        let gate = topology
+            .get(&scope.space_id)
+            .cloned()
+            .ok_or_else(not_ready)?;
+        let guard = gate.try_read().map_err(|_| not_ready())?;
+        let state = guard.state().ok_or_else(not_ready)?;
+        state.record.scope.check(scope)?;
+        if !state.readable || state.lookup_retired || self.closed.load(Ordering::Acquire) {
+            return Err(not_ready());
+        }
+        let epoch = state.record.active_epoch;
+        drop(guard);
+        Ok(self.bind(gate, scope, epoch))
+    }
+
+    fn bind(&self, gate: Gate, scope: &HistoryScope, epoch: LeaseEpoch) -> LiveSpaceHandle {
+        LiveSpaceHandle {
+            gate,
+            scope: scope.clone(),
+            epoch,
+            closed: Arc::clone(&self.closed),
+            process: Arc::clone(&self.process),
+        }
+    }
+
+    /// Acquires a short final-delivery permit, or fails closed during a writer.
+    pub fn try_read(&self, scope: &HistoryScope) -> Result<LiveReadPermit, PortError> {
+        self.space(scope)?.try_read()
+    }
+
+    pub(crate) async fn close_and_drain(&self) {
+        self.closed.store(true, Ordering::Release);
+        let mut topology = self.topology.write().await;
+        for gate in topology.values() {
+            *gate.write().await = GateData::Revoked;
+        }
+        topology.clear();
+    }
+
+    async fn gate_or_insert(
+        &self,
+        space: &SpaceId,
+        budget: &CallBudget,
+        deadline: tokio::time::Instant,
+    ) -> Result<Gate, PortError> {
+        let topology = budgeted(budget, deadline, self.topology.read()).await?;
+        if let Some(gate) = topology.get(space) {
+            return Ok(gate.clone());
+        }
+        drop(topology);
+        let mut topology = budgeted(budget, deadline, self.topology.write()).await?;
+        Ok(topology
+            .entry(space.clone())
+            .or_insert_with(|| Arc::new(RwLock::new(GateData::Empty)))
+            .clone())
+    }
+
+    pub(crate) async fn for_write(&self, mut spaces: Vec<SpaceId>) -> LiveWriteSet {
+        let topology = Arc::clone(&self.topology).read_owned().await;
+        spaces.sort_unstable();
+        spaces.dedup();
+        let gates: Vec<_> = spaces
+            .iter()
+            .filter_map(|space| topology.get(space).cloned())
+            .collect();
+        let mut guards = Vec::with_capacity(gates.len());
+        for gate in gates {
+            guards.push(gate.write_owned().await);
+        }
+        LiveWriteSet {
+            _topology: topology,
+            guards,
+            spaces,
+            preserve: true,
+        }
+    }
+}
+
+/// Capability bound to one admission of one history. A new admission creates
+/// a distinct gate after release, so an old handle can never bind to it.
+#[derive(Clone)]
+pub struct LiveSpaceHandle {
+    gate: Gate,
+    scope: HistoryScope,
+    epoch: LeaseEpoch,
+    closed: Arc<AtomicBool>,
+    process: Arc<str>,
+}
+
+impl LiveSpaceHandle {
+    pub fn try_read(&self) -> Result<LiveReadPermit, PortError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(not_ready());
+        }
+        let guard = Arc::clone(&self.gate)
+            .try_read_owned()
+            .map_err(|_| not_ready())?;
+        self.validate_permit(guard)
+    }
+
+    pub async fn read(&self, budget: &CallBudget) -> Result<LiveReadPermit, PortError> {
+        let deadline =
+            crate::runtime::deadline_after(tokio::time::Instant::now(), budget.remaining);
+        let guard = budgeted(budget, deadline, Arc::clone(&self.gate).read_owned()).await?;
+        self.validate_permit(guard)
+    }
+
+    fn validate_permit(
+        &self,
+        guard: OwnedRwLockReadGuard<GateData>,
+    ) -> Result<LiveReadPermit, PortError> {
+        let state = guard.state().ok_or_else(not_ready)?;
+        state.record.scope.check(&self.scope)?;
+        if !state.readable
+            || state.lookup_retired
+            || state.record.active_epoch != self.epoch
+            || self.closed.load(Ordering::Acquire)
+        {
+            return Err(not_ready());
+        }
+        Ok(LiveReadPermit {
+            guard,
+            process: Arc::clone(&self.process),
+        })
+    }
+}
+
+/// Keep this only through bounded validation and final delivery. Holding it
+/// while calling a canonical mutator would wait on the caller's own permit.
+pub struct LiveReadPermit {
+    guard: OwnedRwLockReadGuard<GateData>,
+    process: Arc<str>,
+}
+
+/// The confirmed Space owner, borrowed from a held final-delivery permit.
+pub struct ProjectionOwnerWitness<'a> {
+    permit: &'a LiveReadPermit,
+}
+
+impl ProjectionOwnerWitness<'_> {
+    pub fn scope(&self) -> &HistoryScope {
+        self.permit.scope()
+    }
+
+    pub fn epoch(&self) -> LeaseEpoch {
+        self.permit.state().record.active_epoch
+    }
+
+    pub fn process(&self) -> &str {
+        self.permit.process.as_ref()
+    }
+}
+
+impl LiveReadPermit {
+    fn state(&self) -> &LiveState {
+        self.guard.state().expect("active final read permit")
+    }
+
+    pub fn space(&self) -> &Space {
+        &self.state().record.space
+    }
+
+    pub fn scope(&self) -> &HistoryScope {
+        &self.state().record.scope
+    }
+
+    pub fn root_folder_id(&self) -> &FolderId {
+        &self.state().record.root_folder_id
+    }
+
+    pub fn head(&self) -> SpaceSeq {
+        self.state().record.last_seq
+    }
+
+    pub fn owner_witness(&self) -> ProjectionOwnerWitness<'_> {
+        ProjectionOwnerWitness { permit: self }
+    }
+
+    pub fn memory_usage(&self) -> FenceMemoryUsage {
+        self.state().memory_usage()
+    }
+
+    /// Identity changes may be used to tighten a projected bitmap when there
+    /// were no intervening folder cascades. A gap requires full verification.
+    pub fn note_changes_since(&self, cut: SpaceSeq) -> Option<impl Iterator<Item = &NoteId>> {
+        let state = self.state();
+        (state.changes_after <= cut && cut <= state.record.last_seq).then(|| {
+            state
+                .note_changes
+                .iter()
+                .filter(move |(seq, _)| *seq > cut)
+                .map(|(_, note)| note)
+        })
+    }
+
+    pub fn folder_facts(&self, folder: &FolderId) -> Option<ResourceFacts> {
+        self.active_folder_facts(folder, true)
+    }
+
+    pub fn active_folder_facts(
+        &self,
+        folder: &FolderId,
+        active_ancestors_only: bool,
+    ) -> Option<ResourceFacts> {
+        let state = self.state();
+        if state.record.space.lifecycle != SpaceLifecycle::Active {
+            return None;
+        }
+        let slot = *state.folder_slots.get(folder)?;
+        let (ancestor_folders, folder_write_locked, trashed) = state.ancestry(slot)?;
+        if active_ancestors_only && trashed {
+            return None;
+        }
+        Some(ResourceFacts {
+            space: state.record.space.clone(),
+            class: DocClass::UserDoc,
+            ancestor_folders,
+            folder_write_locked,
+            ability_package: None,
+        })
+    }
+
+    pub fn classify(
+        &self,
+        ctx: &SpaceContext,
+        note: &NoteId,
+        active_ancestors_only: bool,
+    ) -> Result<LiveNoteStatus, PortError> {
+        let state = self.state();
+        state.record.scope.check(ctx.scope())?;
+        if state.record.space.lifecycle != SpaceLifecycle::Active {
+            return Ok(LiveNoteStatus::PurgedOrAbsent);
+        }
+        let Some((parent, class, lifecycle, ability)) = state.note(note) else {
+            return Ok(LiveNoteStatus::PurgedOrAbsent);
+        };
+        let Some((ancestor_folders, folder_write_locked, trashed)) = state.ancestry(parent) else {
+            return Ok(LiveNoteStatus::PurgedOrAbsent);
+        };
+        if active_ancestors_only && trashed {
+            return Ok(LiveNoteStatus::PurgedOrAbsent);
+        }
+        let effective_lifecycle = if lifecycle == Lifecycle::Active && !trashed {
+            Lifecycle::Active
+        } else {
+            Lifecycle::Trashed
+        };
+        let facts = ResourceFacts {
+            space: state.record.space.clone(),
+            class,
+            ancestor_folders,
+            folder_write_locked,
+            ability_package: ability.cloned(),
+        };
+        if ctx.auth().can_view_resource(&facts).is_err() {
+            return Ok(LiveNoteStatus::HiddenByAuth {
+                is_active_plain: effective_lifecycle == Lifecycle::Active
+                    && class != DocClass::EncryptedNote,
+            });
+        }
+        Ok(match (class, effective_lifecycle) {
+            (DocClass::EncryptedNote, effective_lifecycle) => LiveNoteStatus::EncryptedVisible {
+                facts,
+                effective_lifecycle,
+            },
+            (_, Lifecycle::Active) => LiveNoteStatus::ActiveVisible(facts),
+            _ => LiveNoteStatus::TrashedVisible(facts),
+        })
+    }
+}
+
+/// Lock ordering is topology, ordered Space gates, then storage. An ambiguous
+/// SQL result invalidates acquired states. Known pre-commit failures preserve
+/// their prior states. Older snapshots must obtain a fresh delivery permit.
+pub(crate) struct LiveWriteSet {
+    _topology: OwnedRwLockReadGuard<Topology>,
+    guards: Vec<OwnedRwLockWriteGuard<GateData>>,
+    spaces: Vec<SpaceId>,
+    preserve: bool,
+}
+
+impl LiveWriteSet {
+    pub(crate) fn has_live_state(&self) -> bool {
+        self.guards.iter().any(|guard| guard.state().is_some())
+    }
+
+    pub(crate) fn committing(&mut self) {
+        self.preserve = false;
+    }
+
+    pub(crate) fn invalidate(mut self) {
+        self.committing();
+    }
+
+    pub(crate) fn aborted(mut self) {
+        self.preserve = true;
+    }
+
+    pub(crate) async fn published(
+        mut self,
+        store: &CanonicalStore,
+        windows: &[VisibilityWindow],
+    ) -> Result<(), PortError> {
+        let mut first_cleanup_error = None;
+        let mut active = Vec::with_capacity(self.guards.len());
+        for guard in &mut self.guards {
+            let Some(state) = guard.state_mut() else {
+                continue;
+            };
+            let budget = source::internal_budget();
+            active.push(state.record.scope.clone());
+            match source::refresh(store, state, &budget).await {
+                Ok(()) => state.readable = true,
+                Err(source::RefreshError::Cleanup(error)) => {
+                    state.readable = false;
+                    first_cleanup_error.get_or_insert(error);
+                }
+                Err(source::RefreshError::Visibility(error)) => {
+                    tracing::warn!(?error, "canonical visibility admission needs a fresh cut");
+                    state.readable = false;
+                }
+            }
+        }
+        if let Some(cleanup) = store.inner.live_visibility.cleanup() {
+            let mut debt = {
+                let mut pending = store
+                    .inner
+                    .live_visibility
+                    .cleanup_debt
+                    .lock()
+                    .expect("projection cleanup debt");
+                for window in windows {
+                    if !active.contains(&window.scope) {
+                        pending
+                            .entry(window.scope.clone())
+                            .and_modify(|(after, through)| {
+                                *after = (*after).min(window.after);
+                                *through = (*through).max(window.through);
+                            })
+                            .or_insert((window.after, window.through));
+                    }
+                }
+                pending
+                    .iter()
+                    .filter(|(scope, _)| self.spaces.binary_search(&scope.space_id).is_ok())
+                    .map(|(scope, &(after, through))| VisibilityWindow {
+                        scope: scope.clone(),
+                        after,
+                        through,
+                    })
+                    .collect::<Vec<_>>()
+            };
+            debt.sort_unstable_by(|left, right| left.scope.space_id.cmp(&right.scope.space_id));
+            for window in debt {
+                let result = source::erase_window(store, cleanup.as_ref(), &window).await;
+                match result {
+                    Err(error) => {
+                        for state in self.guards.iter_mut().filter_map(|guard| guard.state_mut()) {
+                            if state.record.scope == window.scope {
+                                state.readable = false;
+                            }
+                        }
+                        first_cleanup_error.get_or_insert(error);
+                    }
+                    Ok(purged) => {
+                        if purged {
+                            for state in
+                                self.guards.iter_mut().filter_map(|guard| guard.state_mut())
+                            {
+                                if state.record.scope == window.scope {
+                                    state.retire_lookup_before(window.through);
+                                }
+                            }
+                        }
+                        store
+                            .inner
+                            .live_visibility
+                            .cleanup_debt
+                            .lock()
+                            .expect("projection cleanup debt")
+                            .remove(&window.scope);
+                    }
+                }
+            }
+        }
+        self.preserve = true;
+        first_cleanup_error.map_or(Ok(()), Err)
+    }
+}
+
+impl Drop for LiveWriteSet {
+    fn drop(&mut self) {
+        if !self.preserve {
+            for state in &mut self.guards {
+                if let Some(state) = state.state_mut() {
+                    state.readable = false;
+                }
+            }
+        }
+    }
+}
+
+impl CanonicalStore {
+    pub fn live_visibility_fence(&self) -> LiveLifecycleFence {
+        self.inner.live_visibility.clone()
+    }
+
+    pub fn set_projection_visibility_cleanup(
+        &self,
+        ctx: &MaintenanceContext,
+        cleanup: Arc<dyn ProjectionVisibilityCleanup>,
+    ) -> Result<(), PortError> {
+        ctx.authority.require(ServicePurpose::Projection)?;
+        *self
+            .inner
+            .live_visibility
+            .cleanup
+            .write()
+            .expect("projection cleanup registry") = Some(cleanup);
+        Ok(())
+    }
+
+    /// A completed command receipt can be found before a retry reaches the
+    /// writer. Repair any local post-commit debt before returning that success.
+    pub(crate) async fn retry_projection_cleanup(
+        &self,
+        scope: &HistoryScope,
+        budget: &CallBudget,
+        confirmed_end: Option<SpaceSeq>,
+    ) -> Result<(), PortError> {
+        let fence = &self.inner.live_visibility;
+        if !fence.has_cleanup() {
+            return Ok(());
+        }
+        let deadline =
+            crate::runtime::deadline_after(tokio::time::Instant::now(), budget.remaining);
+        let visibility = budgeted(
+            budget,
+            deadline,
+            fence.for_write(vec![scope.space_id.clone()]),
+        )
+        .await
+        .map_err(|error| {
+            crate::codec::unknown_commit_outcome("projection_cleanup_retry", error.to_string())
+        })?;
+        let unreadable = visibility.guards.iter().any(|guard| {
+            guard
+                .state()
+                .is_some_and(|state| &state.record.scope == scope && !state.readable)
+        });
+        if let Some(end) = confirmed_end {
+            let window = source::receipt_window(self, scope, end, budget)
+                .await
+                .map_err(|error| {
+                    crate::codec::unknown_commit_outcome(
+                        "projection_receipt_window",
+                        error.to_string(),
+                    )
+                })?;
+            let mut pending = fence.cleanup_debt.lock().expect("projection cleanup debt");
+            pending
+                .entry(window.scope)
+                .and_modify(|(after, through)| {
+                    *after = (*after).min(window.after);
+                    *through = (*through).max(window.through);
+                })
+                .or_insert((window.after, window.through));
+        }
+        let has_debt = fence
+            .cleanup_debt
+            .lock()
+            .expect("projection cleanup debt")
+            .contains_key(scope);
+        if unreadable || has_debt {
+            visibility.published(self, &[]).await.map_err(|error| {
+                crate::codec::unknown_commit_outcome("projection_cleanup_retry", error.to_string())
+            })?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn retry_redacted_chat_cleanup(
+        &self,
+        committed: &Committed<RedactedChat>,
+        budget: &CallBudget,
+    ) -> Result<(), PortError> {
+        let fence = &self.inner.live_visibility;
+        let Some(callback) = fence.cleanup() else {
+            return Ok(());
+        };
+        let scope = committed.receipt.scope();
+        let deadline =
+            crate::runtime::deadline_after(tokio::time::Instant::now(), budget.remaining);
+        let mut visibility = budgeted(
+            budget,
+            deadline,
+            fence.for_write(vec![scope.space_id.clone()]),
+        )
+        .await
+        .map_err(|error| {
+            crate::codec::unknown_commit_outcome("projection_chat_cleanup_retry", error.to_string())
+        })?;
+        let through = committed.receipt.seq();
+        let value = &committed.value;
+        let redacted = std::iter::once(value.entry)
+            .chain(value.invalidated_contexts.iter().copied())
+            .map(|entry| ProjectionRedactedEntry {
+                thread: value.thread.clone(),
+                entry,
+                redacted_at: through,
+            })
+            .collect();
+        let erasures = ProjectionErasures {
+            scope: scope.clone(),
+            through,
+            purged: Vec::new(),
+            redacted,
+        };
+        // Receipts carry the original affected entries even when another
+        // committed redaction moved their current redacted-at markers.
+        visibility.committing();
+        callback
+            .erase_visibility(&erasures)
+            .await
+            .map_err(|error| {
+                crate::codec::unknown_commit_outcome(
+                    "projection_chat_cleanup_retry",
+                    error.to_string(),
+                )
+            })?;
+        visibility.published(self, &[]).await.map_err(|error| {
+            crate::codec::unknown_commit_outcome("projection_chat_cleanup_retry", error.to_string())
+        })
+    }
+
+    pub async fn projection_owner_identity(
+        &self,
+        ctx: &MaintenanceContext,
+        scope: &HistoryScope,
+    ) -> Result<Option<ProjectionOwnerIdentity>, PortError> {
+        ctx.authority.require(ServicePurpose::Revocation)?;
+        source::owner_identity(self, scope, &ctx.budget, false).await
+    }
+
+    /// Resolves an active owner for projection read dispatch. The endpoint
+    /// acquires a fresh read permit when the requested operation begins.
+    pub async fn projection_read_owner_identity(
+        &self,
+        ctx: &MaintenanceContext,
+        scope: &HistoryScope,
+    ) -> Result<Option<ProjectionOwnerIdentity>, PortError> {
+        ctx.authority.require(ServicePurpose::Projection)?;
+        source::owner_identity(self, scope, &ctx.budget, true).await
+    }
+
+    /// Records trusted termination proof for an exact former owner and epoch.
+    /// A stale attestation cannot authorize takeover of a replacement owner.
+    pub async fn confirm_projection_owner_stopped(
+        &self,
+        ctx: &MaintenanceContext,
+        proof: StoppedProjectionOwner,
+    ) -> Result<(), PortError> {
+        ctx.authority.require(ServicePurpose::Revocation)?;
+        self.ensure_open()?;
+        let identity = proof.0;
+        if self.inner.live_visibility.process.as_ref() == identity.process {
+            return Err(not_ready());
+        }
+        let deadline =
+            crate::runtime::deadline_after(tokio::time::Instant::now(), ctx.budget.remaining);
+        source::set_owner_phase(self, identity, "drained", &ctx.budget, deadline).await
+    }
+
+    pub async fn admit_projection_space(
+        &self,
+        ctx: &MaintenanceContext,
+        scope: &HistoryScope,
+    ) -> Result<LiveSpaceHandle, PortError> {
+        self.admit_live_space(ctx, scope, None).await
+    }
+
+    /// Rejects a worker without a locally held writer epoch before seeding.
+    /// Final projection admission still requires the canonical owner permit.
+    pub fn check_projection_writer_candidate(
+        &self,
+        ctx: &MaintenanceContext,
+        space: &SpaceId,
+    ) -> Result<(), PortError> {
+        ctx.authority.require(ServicePurpose::Projection)?;
+        self.ensure_open()?;
+        if self.is_postgres() {
+            self.inner.writer_epoch(space).map_err(|_| not_ready())?;
+        }
+        Ok(())
+    }
+
+    pub async fn admit_projection_space_with_lookup(
+        &self,
+        ctx: &MaintenanceContext,
+        scope: &HistoryScope,
+        lookup: Arc<dyn LiveDenseLookup>,
+    ) -> Result<LiveSpaceHandle, PortError> {
+        self.admit_live_space(ctx, scope, Some(lookup)).await
+    }
+
+    async fn admit_live_space(
+        &self,
+        ctx: &MaintenanceContext,
+        scope: &HistoryScope,
+        lookup: Option<Arc<dyn LiveDenseLookup>>,
+    ) -> Result<LiveSpaceHandle, PortError> {
+        ctx.authority.require(ServicePurpose::Projection)?;
+        self.ensure_open()?;
+        let fence = &self.inner.live_visibility;
+        if fence.closed.load(Ordering::Acquire) {
+            return Err(not_ready());
+        }
+        if self.is_postgres() && self.inner.writer_epoch(&scope.space_id).is_err() {
+            return Err(not_ready());
+        }
+        if lookup.is_none()
+            && let Ok(handle) = fence.space(scope)
+        {
+            return Ok(handle);
+        }
+        let started = tokio::time::Instant::now();
+        let deadline = crate::runtime::deadline_after(started, ctx.budget.remaining);
+        let gate = fence
+            .gate_or_insert(&scope.space_id, &ctx.budget, deadline)
+            .await?;
+        let mut old = budgeted(&ctx.budget, deadline, gate.write()).await?;
+        if matches!(*old, GateData::Revoked) {
+            return Err(not_ready());
+        }
+        if let (Some(state), Some(next_lookup)) = (old.state(), lookup.as_ref())
+            && &state.record.scope == scope
+            && self
+                .inner
+                .check_writer_epoch(&scope.space_id, state.record.active_epoch)
+                .is_ok()
+            && next_lookup.generation() < state.lookup_generation
+        {
+            // A publisher from before handoff can finish after the new lookup.
+            // Retirement clears the backing file, but keeps this generation.
+            return Err(not_ready());
+        }
+        if lookup.is_none()
+            && let Some(state) = old.state()
+            && state.readable
+            && !state.lookup_retired
+        {
+            state.record.scope.check(scope)?;
+            let epoch = state.record.active_epoch;
+            drop(old);
+            return Ok(fence.bind(gate, scope, epoch));
+        }
+        if lookup.is_none()
+            && let Some(state) = old.state()
+            && state.lookup_retired
+            && &state.record.scope == scope
+        {
+            // Once physical cleanup retired these slots, only a newly
+            // published byte directory can restore dense admission.
+            return Err(not_ready());
+        }
+        if let (Some(state), Some(next_lookup)) = (old.state_mut(), lookup.as_ref())
+            && state.readable
+            && &state.record.scope == scope
+        {
+            match state.update_lookup(next_lookup.clone()) {
+                Ok(true) => {
+                    let epoch = state.record.active_epoch;
+                    drop(old);
+                    return Ok(fence.bind(gate, scope, epoch));
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    state.readable = false;
+                    return Err(error);
+                }
+            }
+        }
+        let record =
+            source::owner_space_record(self, &fence.process, scope, &ctx.budget, deadline).await?;
+        let pending = fence
+            .cleanup_debt
+            .lock()
+            .expect("projection cleanup debt")
+            .get(scope)
+            .copied();
+        if let Some((after, through)) = pending
+            && let Some(callback) = fence.cleanup()
+        {
+            let window = VisibilityWindow {
+                scope: scope.clone(),
+                after,
+                through,
+            };
+            source::erase_window(self, callback.as_ref(), &window).await?;
+            fence
+                .cleanup_debt
+                .lock()
+                .expect("projection cleanup debt")
+                .remove(scope);
+        }
+        if let Some(old) = old.state_mut()
+            && !old.readable
+            && &old.record.scope == scope
+            && let Err(source::RefreshError::Cleanup(error)) =
+                source::refresh(self, old, &ctx.budget).await
+        {
+            return Err(error);
+        }
+        let mut state = LiveState::new(record, lookup)?;
+        source::seed(self, &mut state, &ctx.budget, deadline).await?;
+        if let Some(previous) = old.state() {
+            if previous.record.scope == state.record.scope
+                && previous.record.active_epoch == state.record.active_epoch
+            {
+                state.lookup_generation = state.lookup_generation.max(previous.lookup_generation);
+            }
+            state.peak_private_bytes = state
+                .peak_private_bytes
+                .saturating_add(previous.allocated_capacity())
+                .max(previous.peak_private_bytes);
+        }
+        let epoch = state.record.active_epoch;
+        *old = GateData::Active(Box::new(state));
+        drop(old);
+        Ok(fence.bind(gate, scope, epoch))
+    }
+
+    /// Releases private lookup and fence state for an idle space. In Cloud
+    /// the durable owner is unchanged and must still confirm a transfer.
+    pub async fn suspend_projection_space(
+        &self,
+        ctx: &MaintenanceContext,
+        scope: &HistoryScope,
+    ) -> Result<(), PortError> {
+        ctx.authority.require(ServicePurpose::Projection)?;
+        let fence = &self.inner.live_visibility;
+        let deadline =
+            crate::runtime::deadline_after(tokio::time::Instant::now(), ctx.budget.remaining);
+        let mut topology = budgeted(&ctx.budget, deadline, fence.topology.write()).await?;
+        if let Some(gate) = topology.get(&scope.space_id) {
+            let mut guard = budgeted(&ctx.budget, deadline, gate.write()).await?;
+            if let Some(state) = guard.state() {
+                state.record.scope.check(scope)?;
+            }
+            *guard = GateData::Revoked;
+        }
+        topology.remove(&scope.space_id);
+        Ok(())
+    }
+
+    /// Revokes this runtime's admission and confirms the drain durably. The
+    /// next writer epoch can then be acquired by another runtime. Reopening
+    /// admission under the drained epoch is forbidden.
+    pub async fn drain_projection_owner(
+        &self,
+        ctx: &MaintenanceContext,
+        scope: &HistoryScope,
+    ) -> Result<(), PortError> {
+        ctx.authority.require(ServicePurpose::Revocation)?;
+        self.ensure_open()?;
+        let fence = &self.inner.live_visibility;
+        let deadline =
+            crate::runtime::deadline_after(tokio::time::Instant::now(), ctx.budget.remaining);
+        let mut topology = budgeted(&ctx.budget, deadline, fence.topology.write()).await?;
+        if let Some(gate) = topology.get(&scope.space_id) {
+            let mut guard = budgeted(&ctx.budget, deadline, gate.write()).await?;
+            if let Some(state) = guard.state() {
+                state.record.scope.check(scope)?;
+            }
+            *guard = GateData::Revoked;
+        }
+        topology.remove(&scope.space_id);
+        if matches!(&self.inner.sql, SqlDriverState::Postgres { .. }) {
+            let identity = source::owner_identity(self, scope, &ctx.budget, false)
+                .await?
+                .ok_or_else(not_ready)?;
+            if identity.process != *fence.process {
+                return Err(not_ready());
+            }
+            source::set_owner_phase(self, identity.clone(), "draining", &ctx.budget, deadline)
+                .await?;
+            self.inner.revoke_writer_epoch(&scope.space_id);
+            source::set_owner_phase(self, identity, "drained", &ctx.budget, deadline).await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn check_projection_owner_advance(
+        &self,
+        tx: &mut crate::sql_exec::BackendConn<'_>,
+        scope: &HistoryScope,
+    ) -> Result<(), PortError> {
+        source::remove_drained(tx, scope).await
+    }
+
+    pub(crate) async fn bind_projection_owner_restore(
+        &self,
+        tx: &mut crate::sql_exec::BackendConn<'_>,
+        scope: &HistoryScope,
+        epoch: LeaseEpoch,
+    ) -> Result<(), PortError> {
+        source::restore(tx, &self.inner.live_visibility.process, scope, epoch).await
+    }
+}
+
+async fn budgeted<T>(
+    budget: &CallBudget,
+    deadline: tokio::time::Instant,
+    operation: impl Future<Output = T>,
+) -> Result<T, PortError> {
+    tokio::select! {
+        biased;
+        () = budget.cancellation.cancelled() => Err(crate::codec::cancelled_not_committed(
+            "live_visibility_cancelled", "visibility work cancelled")),
+        () = tokio::time::sleep_until(deadline) => Err(crate::codec::deadline_not_committed(
+            "live_visibility_deadline", "visibility work exceeded its budget")),
+        result = operation => Ok(result),
+    }
+}

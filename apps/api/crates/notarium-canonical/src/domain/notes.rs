@@ -6125,18 +6125,14 @@ pub(crate) async fn hydrate_cards_impl(
                         continue;
                     };
 
-                    let Some(hist_rev) = super::common::optional_read(
-                        read_immutable_revision_tx(tx, &scope, "note", nid.as_str(), valid_cut)
-                            .await,
+                    let Some(historical_note) = super::common::optional_read(
+                        crate::projection_read::note_at(tx, &scope, valid_cut, &nid).await,
                     )?
                     .flatten() else {
                         out.push(None);
                         continue;
                     };
-                    let RevisionMetadataPayload::Note(nm) = hist_rev.metadata.payload else {
-                        out.push(None);
-                        continue;
-                    };
+                    let nm = historical_note.metadata;
                     if nm.lifecycle != Lifecycle::Active || nm.doc_class == DocClass::EncryptedNote
                     {
                         out.push(None);
@@ -6176,7 +6172,7 @@ pub(crate) async fn hydrate_cards_impl(
                             space_id: scope.space_id.clone(),
                             note_id: nid.clone(),
                         },
-                        hist_rev.revision_id,
+                        historical_note.revision_id,
                         snap_facts,
                         Lifecycle::Active,
                         digest,

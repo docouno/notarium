@@ -63,7 +63,8 @@ use crate::{
         },
         rollback::{
             CandidateAction, RollbackRevision, build_rollback_direct_single_tx_exec,
-            decode_rollback_note, encode_rollback_note, rollback_fallback_board_present_err,
+            decode_rollback_note, encode_rollback_note, rank_removal,
+            rollback_fallback_board_present_err,
         },
     },
     runtime::{FolderHeadRow, SqlDriverState},
@@ -1966,6 +1967,7 @@ fn finalize_committed_batch(
     BatchExecOutcome::Committed {
         slots,
         space_effective_cuts,
+        visibility_windows: crate::writer::visibility_windows(store, space_states),
     }
 }
 
@@ -6106,7 +6108,14 @@ impl SqliteSyncItemPlan for RollbackDirectSqliteFastPlan {
                 )
             })
             .count() as u64;
-        let total_seqs = (trash_note_count + restore_note_count).max(1);
+        let rank_removals = if space_has_overlays {
+            rank_removal::plan_rusqlite(conn, &scope_cl.space_id, &eligible_notes)
+                .map_err(FastItemExecError::PreWrite)?
+        } else {
+            Vec::new()
+        };
+        let total_seqs =
+            (trash_note_count + restore_note_count + rank_removals.len() as u64).max(1);
         let (first_seq, visibility_seq) = item_ctx
             .preview_seq_range(total_seqs)
             .map_err(FastItemExecError::PreWrite)?;
@@ -6195,10 +6204,6 @@ impl SqliteSyncItemPlan for RollbackDirectSqliteFastPlan {
                     continue;
                 };
 
-                if space_has_overlays {
-                    delete_all_target_overlays_rusqlite(conn, &scope_cl.space_id, nid)
-                        .map_err(FastItemExecError::PostWrite)?;
-                }
                 owner_notes_for_receipt.insert(nid.clone());
 
                 if *current_lifecycle == Lifecycle::Trashed {
@@ -6402,11 +6407,6 @@ impl SqliteSyncItemPlan for RollbackDirectSqliteFastPlan {
 
                 sync_room(nid, &rrev).map_err(FastItemExecError::PostWrite)?;
 
-                if space_has_overlays && pre_meta.lifecycle != Lifecycle::Active {
-                    delete_all_target_overlays_rusqlite(conn, &scope_cl.space_id, nid)
-                        .map_err(FastItemExecError::PostWrite)?;
-                }
-
                 let meta = encode_rollback_note(
                     pre_meta,
                     original_metadata.remove(nid).map(Into::into),
@@ -6475,6 +6475,38 @@ impl SqliteSyncItemPlan for RollbackDirectSqliteFastPlan {
                     "closed rollback room was not updated",
                 )));
             }
+        }
+
+        for removal in rank_removals {
+            let seq = item_ctx
+                .alloc_next_seq()
+                .map_err(FastItemExecError::PostWrite)?;
+            let revision = next_fast_rev_id()?;
+            removal
+                .delete_rusqlite(conn, &scope_cl.space_id)
+                .map_err(FastItemExecError::PostWrite)?;
+            let metadata = removal
+                .revision_metadata()
+                .map_err(FastItemExecError::PostWrite)?;
+            insert_revision_row_rusqlite(
+                conn,
+                scope_cl,
+                &revision,
+                "rank",
+                &removal.entity_key(),
+                seq,
+                visibility_seq,
+                Some(&removal.previous),
+                None,
+                None,
+                &metadata,
+                auth.principal(),
+                None,
+                batch_now_ts,
+            )
+            .map_err(FastItemExecError::PostWrite)?;
+            owner_notes_for_receipt.extend(removal.owners().into_iter().cloned());
+            events.push(removal.event(seq, revision));
         }
 
         // 2c. Rebind existing active CAS blobs + append revision rows + bump `agent_run_heads`.
@@ -6955,19 +6987,4 @@ fn active_occupant_note_id_rusqlite(
         })?)),
         None => Ok(None),
     }
-}
-
-fn delete_all_target_overlays_rusqlite(
-    conn: &rusqlite::Connection,
-    space_id: &SpaceId,
-    target_note: &NoteId,
-) -> Result<(), PortError> {
-    let mut stmt = conn
-        .prepare_cached(
-            "DELETE FROM view_rank_overlays WHERE space_id = ?1 AND target_note_id = ?2",
-        )
-        .map_err(|err| internal_not_committed("sqlite_rb_del_all_overlays", err.to_string()))?;
-    stmt.execute(params![space_id.as_str(), target_note.as_str()])
-        .map_err(|err| internal_not_committed("sqlite_rb_del_all_overlays", err.to_string()))?;
-    Ok(())
 }

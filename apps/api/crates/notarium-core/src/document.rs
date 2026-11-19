@@ -5,6 +5,7 @@ use crate::{
     span::ByteSpan,
     value::YamlValue,
 };
+use serde::{Deserialize, Serialize};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ContainerKind {
     BlockQuote,
@@ -51,13 +52,13 @@ pub struct TagKey {
     pub key: String,
     pub source_spans: Vec<ByteSpan>,
 }
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ViewState {
     Pending,
     Invalid,
     Ready,
 }
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ViewBlock {
     pub span: ByteSpan,
     pub state: ViewState,

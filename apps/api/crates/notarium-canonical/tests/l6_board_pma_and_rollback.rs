@@ -8,6 +8,8 @@ mod board_deadline;
 mod historical_deadline;
 #[path = "l6_board_pma_and_rollback/pg_deadline.rs"]
 mod pg_deadline;
+#[path = "l6_board_pma_and_rollback/projection_rank_history.rs"]
+mod projection_rank_history;
 #[path = "l6_board_pma_and_rollback/rollback_deadline.rs"]
 mod rollback_deadline;
 mod support;
@@ -1662,6 +1664,72 @@ async fn run_rollback_agent_run_suite(store: &CanonicalStore) {
         !post_overlays.contains_key(&n_created),
         "trashed run-created note overlay must be deleted"
     );
+    let key = format!("{}:{}:{}", view.note, view.key, n_created);
+    let rank_tombstone = store
+        .read_entity_revision_at_cutoff(
+            &scope,
+            "rank",
+            &key,
+            Some(rollback_committed.receipt.seq()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        rank_tombstone.visibility_seq,
+        rollback_committed.receipt.seq()
+    );
+    assert_ne!(
+        rank_tombstone.revision_id,
+        cur_overlays[&n_created].rank_rev_id
+    );
+    let notarium_canonical::codec::RevisionMetadataPayload::Rank(removed) =
+        rank_tombstone.metadata.payload
+    else {
+        panic!("expected rank tombstone");
+    };
+    assert!(removed.removed);
+    assert_eq!(removed.view_note_id, view.note);
+    assert_eq!(removed.view_key, view.key);
+    assert_eq!(removed.target_note_id, n_created);
+    let old = store
+        .read_entity_revision_at_cutoff(
+            &scope,
+            "rank",
+            &key,
+            Some(cur_overlays[&n_created].updated_seq),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(old.revision_id, cur_overlays[&n_created].rank_rev_id);
+    assert!(matches!(
+        old.metadata.payload,
+        notarium_canonical::codec::RevisionMetadataPayload::Rank(rank) if !rank.removed
+    ));
+    let projection = support::maintenance_ctx(notarium_core::ports::ServicePurpose::Projection);
+    let ranked = store
+        .read_projection_overlays_page(
+            &projection,
+            &scope,
+            rollback_committed.receipt.seq(),
+            None,
+            notarium_core::ports::PageLimit::new(200).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        ranked
+            .rows
+            .iter()
+            .all(|row| row.metadata.target_note_id != n_created)
+    );
+    assert!(
+        ranked
+            .rows
+            .iter()
+            .any(|row| row.metadata.target_note_id == n_pre)
+    );
     assert_eq!(post_overlays[&n_pre].group, todo_grp);
     assert!(
         post_overlays[&n_pre].sort_rank_lexo < post_overlays[&n_anchor].sort_rank_lexo,
@@ -1786,6 +1854,15 @@ async fn run_rollback_agent_run_suite(store: &CanonicalStore) {
         seq_before_abort, seq_after_abort,
         "aborted RollbackAgentRun must leave last_seq untouched"
     );
+    projection_rank_history::check_board_exit_tombstones_rank(
+        store,
+        &scope,
+        &owner,
+        &planner,
+        &view,
+        view_c.value.revision,
+    )
+    .await;
     check_rollback_destination_authority(store, &scope, &owner).await;
 }
 

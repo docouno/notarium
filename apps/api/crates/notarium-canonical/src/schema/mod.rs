@@ -232,7 +232,9 @@ async fn bootstrap_postgres_inner(
     expected_installation: &InstallationId,
     expected_checksum: ContentDigest,
 ) -> Result<DatabaseWitness, PortError> {
-    sqlx::query("SELECT pg_advisory_xact_lock_shared(hashtextextended($1, 7311229))")
+    // Snapshot live ranks and change the chat writer's representation only after
+    // in-flight writers release the schema-wide writer fence.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 7311229))")
         .bind(schema_name)
         .execute(&mut *conn)
         .await
@@ -276,6 +278,7 @@ async fn bootstrap_postgres_inner(
         migrate::postgres(conn, expected_installation, expected_checksum).await?;
         let witness =
             inspect_postgres_schema_meta(conn, expected_installation, expected_checksum).await?;
+        crate::projection_fence::ensure_postgres_owner_table(conn).await?;
         verify_postgres_catalog(conn, schema_name).await?;
         ensure_postgres_helper_routines(conn).await?;
         return Ok(witness);
@@ -288,6 +291,7 @@ async fn bootstrap_postgres_inner(
             .await
             .map_err(|err| internal_not_committed("pg_ddl_exec", err.to_string()))?;
     }
+    crate::projection_fence::ensure_postgres_owner_table(conn).await?;
     ensure_postgres_helper_routines(conn).await?;
 
     sqlx::query(
@@ -1543,7 +1547,8 @@ pub async fn verify_postgres_catalog(
     .map_err(|err| internal_not_committed("pg_catalog_tables", err.to_string()))?;
 
     let observed_tables: BTreeSet<&str> = observed_tables_vec.iter().map(String::as_str).collect();
-    let expected_tables = expected_table_names();
+    let mut expected_tables = expected_table_names();
+    expected_tables.insert("projection_space_owners");
     if observed_tables != expected_tables {
         return Err(internal_not_committed(
             "pg_table_mismatch",

@@ -226,6 +226,11 @@ impl CanonicalStore {
     ) -> Result<bool, PortError> {
         if let SqlDriverState::Postgres { pool, .. } = &self.inner.sql {
             let _gate = self.inner.writer()?.acquire_commit_read_guard().await;
+            let mut visibility = self
+                .inner
+                .live_visibility
+                .for_write(vec![scope.space_id.clone()])
+                .await;
             let mut connection = pool.acquire().await.map_err(|e| {
                 unavailable_retryable("pg_acquire_lease", e.to_string(), Duration::from_millis(50))
             })?;
@@ -252,6 +257,7 @@ impl CanonicalStore {
                 )
                 .await?;
             if changed {
+                visibility.committing();
                 tx.commit().await.map_err(|e| {
                     crate::codec::unknown_commit_outcome("pg_commit_lease", e.to_string())
                 })?;
@@ -268,14 +274,19 @@ impl CanonicalStore {
             return Ok(changed);
         }
         let scope = scope.clone();
+        let space = scope.space_id.clone();
         let store = self.clone();
-        self.with_write_tx(move |tx| {
-            Box::pin(async move {
-                store
-                    .update_lease_rows(tx, &scope, new_epoch, &attempt)
-                    .await
-            })
-        })
+        self.with_visibility_write_tx(
+            Some(space),
+            move |tx| {
+                Box::pin(async move {
+                    store
+                        .update_lease_rows(tx, &scope, new_epoch, &attempt)
+                        .await
+                })
+            },
+            Ok,
+        )
         .await
     }
 
@@ -302,6 +313,7 @@ impl CanonicalStore {
         if new_epoch <= current.active_epoch {
             return Err(DomainError::validation(ValidationReason::InvalidState).into());
         }
+        self.check_projection_owner_advance(tx, scope).await?;
         let epoch_i64 = new_epoch.get() as i64;
         let affected = match tx {
                     BackendConn::Sqlite(conn) => sqlx::query(

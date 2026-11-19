@@ -210,6 +210,49 @@ pub fn analyze(
         plan: patch::plan(source, body, edits)?,
     })
 }
+/// Best-effort identity recovery in incomplete or malformed nota YAML.
+/// Only a unique top-level scalar identity is accepted, and this never
+/// certifies the rest of the authored block as parseable.
+pub fn recover_top_level_id(raw: &str) -> Option<ViewKey> {
+    let lines = || raw.split(['\r', '\n']);
+    let content_line = |line: &str| {
+        let content = line.trim_start_matches(' ');
+        !content.is_empty() && !content.starts_with('#') && !matches!(content, "---" | "...")
+    };
+    let first = lines().find(|line| content_line(line))?;
+    let first_node = first.trim_start_matches(' ');
+    if first_node.starts_with(['[', '{', '|', '>']) || first_node.starts_with("- ") {
+        return None;
+    }
+    let root = first.len() - first_node.len();
+    let mut found = None;
+    for line in lines().filter(|line| content_line(line)) {
+        let Some(line) = line.get(root..) else {
+            continue;
+        };
+        if line.starts_with(char::is_whitespace) {
+            continue;
+        }
+        let Some((key, _)) = line.split_once(':') else {
+            continue;
+        };
+        if !matches!(key.trim_end(), "id" | "\"id\"" | "'id'") {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        let YamlValue::Mapping(fields) = yaml::parse(line).ok()? else {
+            return None;
+        };
+        let YamlValue::String(value) = fields.get("id")? else {
+            return None;
+        };
+        found = Some(ViewKey::parse(value).ok()?);
+    }
+    found
+}
+
 fn map_insertion(
     fence: &FencedBlock,
     span: ByteSpan,

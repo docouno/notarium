@@ -2,7 +2,7 @@ use std::{collections::BTreeSet, sync::LazyLock};
 
 use notarium_core::ids::ContentDigest;
 
-pub const CANONICAL_SCHEMA_VERSION: u32 = 6;
+pub const CANONICAL_SCHEMA_VERSION: u32 = 7;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LogicalColKind {
@@ -123,7 +123,10 @@ pub const CANONICAL_TABLES: &[TableSpec] = &[
             col("target_folder_id", Text, false),
             col("created_seq", Int, false),
         ],
-        indexes: &["idx_folder_aliases_lookup"],
+        indexes: &[
+            "idx_folder_aliases_lookup",
+            "idx_folder_aliases_projection_seq",
+        ],
     },
     TableSpec {
         name: "note_heads",
@@ -179,6 +182,7 @@ pub const CANONICAL_TABLES: &[TableSpec] = &[
             "idx_note_aliases_slug_lookup",
             "idx_note_aliases_title_lookup",
             "idx_note_aliases_target",
+            "idx_note_aliases_projection_seq",
         ],
     },
     TableSpec {
@@ -229,6 +233,8 @@ pub const CANONICAL_TABLES: &[TableSpec] = &[
             "idx_revisions_entity_vis_seq",
             "idx_revisions_agent_run",
             "idx_revisions_parent_rev",
+            "idx_revisions_projection_rank_key",
+            "idx_revisions_projection_rank_target",
         ],
     },
     TableSpec {
@@ -287,6 +293,35 @@ pub const CANONICAL_TABLES: &[TableSpec] = &[
             "idx_view_rank_overlays_order",
             "idx_view_rank_overlays_target",
         ],
+    },
+    TableSpec {
+        name: "projection_rank_anchors",
+        primary_key: &["space_id"],
+        columns: &[
+            col("space_id", Text, false),
+            col("history_incarnation", Bytes, false),
+            col("anchor_seq", Int, false),
+        ],
+        indexes: &[],
+    },
+    TableSpec {
+        name: "projection_rank_anchor_rows",
+        primary_key: &["space_id", "view_note_id", "view_key", "target_note_id"],
+        columns: &[
+            col("space_id", Text, false),
+            col("view_note_id", Text, false),
+            col("view_key", Text, false),
+            col("target_note_id", Text, false),
+            col("group_key_msgpack", Bytes, false),
+            col("group_key_hex", Text, false),
+            col("sort_rank_lexo", Text, false),
+            col("rank_rev_id", Text, false),
+            col("placement_revision", Text, false),
+            col("placement_actor_id", Text, false),
+            col("placement_run_id", Text, true),
+            col("updated_seq", Int, false),
+        ],
+        indexes: &["idx_projection_rank_anchor_target"],
     },
     TableSpec {
         name: "blob_catalog",
@@ -612,7 +647,25 @@ pub const CANONICAL_TABLES: &[TableSpec] = &[
             col("redacted_at_seq", Int, true),
             col("checkpoint_stale", Int, false),
         ],
-        indexes: &["idx_chat_entries_parent", "idx_chat_entries_compaction"],
+        indexes: &[
+            "idx_chat_entries_parent",
+            "idx_chat_entries_compaction",
+            "idx_chat_entries_projection",
+            "idx_chat_entries_created_change",
+            "idx_chat_entries_redacted_change",
+        ],
+    },
+    TableSpec {
+        name: "chat_entry_ref_blocks",
+        primary_key: &["space_id", "thread_id", "entry_seq", "block_no"],
+        columns: &[
+            col("space_id", Text, false),
+            col("thread_id", Text, false),
+            col("entry_seq", Int, false),
+            col("block_no", Int, false),
+            col("payload", Bytes, false),
+        ],
+        indexes: &[],
     },
     TableSpec {
         name: "chat_pending_inputs",

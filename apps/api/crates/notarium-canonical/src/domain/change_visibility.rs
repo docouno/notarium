@@ -1,9 +1,9 @@
 //! Authority for log metadata and bounded overlay versions at one command boundary.
 use super::common::FolderAncestryCache;
 use crate::{
-    SpaceRecord,
+    CanonicalStore, SpaceRecord,
     codec::{RevisionMetadataEnvelope, RevisionMetadataPayload},
-    runtime::read_immutable_revision_tx,
+    runtime::{load_space_record, read_immutable_revision_tx, require_command_end_tx},
     sql_exec::BackendConn,
 };
 use notarium_core::{
@@ -12,7 +12,10 @@ use notarium_core::{
     classes::DocClass,
     error::{PortError, ValidationReason},
     ids::{JobId, NoteId, RevisionId, SpaceSeq},
-    ports::{Change, ChangeKind, ContentJobKind, EntityId},
+    ports::{
+        Change, ChangeKind, ChatThreadKind, ContentJobKind, EntityId, MaintenanceContext,
+        SpaceContext,
+    },
     receipt::{AwaitReason, MutationEffect},
 };
 use std::{collections::HashMap, sync::Arc};
@@ -223,12 +226,6 @@ impl<'a> ChangeVisibility<'a> {
                     .await?;
                 }
                 EntityId::Thread(id) => {
-                    let (project, tainted) =
-                        super::lookup_thread_visibility_tx(tx, &space.id, id.as_str())
-                            .await?
-                            .ok_or(DomainError::ResourceNotFound)?;
-                    self.auth
-                        .authorize_chat_read(space, project.as_ref(), tainted)?;
                     let old = read_immutable_revision_tx(
                         tx,
                         &self.space.scope,
@@ -241,6 +238,18 @@ impl<'a> ChangeVisibility<'a> {
                     let RevisionMetadataPayload::Thread(meta) = old.metadata.payload else {
                         return Err(DomainError::validation(ValidationReason::InvalidState).into());
                     };
+                    // Kind and owner are immutable for this thread identity.
+                    if meta.kind == ChatThreadKind::Personal
+                        && &meta.owner_id != self.auth.principal()
+                    {
+                        return Err(DomainError::ResourceNotFound.into());
+                    }
+                    let (project, tainted) =
+                        super::lookup_thread_visibility_tx(tx, &space.id, id.as_str())
+                            .await?
+                            .ok_or(DomainError::ResourceNotFound)?;
+                    self.auth
+                        .authorize_chat_read(space, project.as_ref(), tainted)?;
                     self.auth.authorize_chat_read(
                         space,
                         meta.project_folder_id.as_ref(),
@@ -279,6 +288,33 @@ impl<'a> ChangeVisibility<'a> {
             }
         }
         Ok(true)
+    }
+}
+
+impl CanonicalStore {
+    /// Applies canonical change visibility before a worker publishes an event
+    /// to one specific subscriber. The trusted projection context only bounds
+    /// the read. The subscriber's own authority decides the returned data.
+    pub async fn filter_projection_event_change(
+        &self,
+        projection: &MaintenanceContext,
+        subscriber: &SpaceContext,
+        mut change: Change,
+    ) -> Result<Option<Change>, PortError> {
+        change.cursor.check(subscriber.scope())?;
+        let auth = subscriber.auth().clone();
+        self.with_projection_read(projection, move |tx| {
+            Box::pin(async move {
+                let record = load_space_record(tx, &change.cursor.scope.space_id).await?;
+                change.cursor.check(&record.scope)?;
+                require_command_end_tx(tx, &record.scope, change.command_range.last_seq).await?;
+                let visible = ChangeVisibility::new(&record, &auth)
+                    .filter(tx, &mut change)
+                    .await?;
+                Ok(visible.then_some(change))
+            })
+        })
+        .await
     }
 }
 

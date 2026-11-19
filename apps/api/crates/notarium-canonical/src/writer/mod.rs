@@ -1262,6 +1262,23 @@ async fn flush_single_batch(
         inner: Arc::clone(inner),
     };
 
+    let mut visibility_spaces = Vec::with_capacity(batch.len());
+    for entry in &batch {
+        match entry {
+            QueuedWriteEntry::Single { intent, .. } => {
+                visibility_spaces.push(intent.scope.space_id.clone());
+            }
+            QueuedWriteEntry::Group {
+                space_id, intents, ..
+            } => {
+                visibility_spaces.push(space_id.clone());
+                visibility_spaces
+                    .extend(intents.iter().map(|intent| intent.scope.space_id.clone()));
+            }
+        }
+    }
+    let mut visibility = inner.live_visibility.for_write(visibility_spaces).await;
+
     let mut reserved_list = Vec::with_capacity(batch.len());
     let mut reply_targets = Vec::with_capacity(batch.len());
     let mut group_spaces = Vec::new();
@@ -1272,6 +1289,8 @@ async fn flush_single_batch(
     );
     let mut items: Vec<UnpackedBatchItem> = Vec::with_capacity(batch.len());
 
+    // Mailbox admission can precede a local owner drain. This guard keeps the
+    // execution-time lease check ordered with revocation through SQL commit.
     for entry in batch {
         match entry {
             QueuedWriteEntry::Single {
@@ -1281,6 +1300,12 @@ async fn flush_single_batch(
                 staged_bytes_reserved,
                 reply_tx,
             } => {
+                if let Err(error) =
+                    inner.check_writer_epoch(&intent.scope.space_id, intent.active_epoch)
+                {
+                    let _ = reply_tx.send(Err(error));
+                    continue;
+                }
                 reserved_list.push(staged_bytes_reserved);
                 reply_targets.push(ReplyTarget::Single { reply_tx });
                 items.push((intent, sqlite_fast_plan, pg_fast_plan));
@@ -1291,6 +1316,12 @@ async fn flush_single_batch(
                 staged_bytes_reserved,
                 reply_tx,
             } => {
+                if let Err(error) = group_intents.iter().try_for_each(|intent| {
+                    inner.check_writer_epoch(&intent.scope.space_id, intent.active_epoch)
+                }) {
+                    let _ = reply_tx.send(Err(error));
+                    continue;
+                }
                 let count = group_intents.len();
                 let all_idempotent = group_intents.iter().all(|it| it.idempotency.is_some());
                 reserved_list.push(staged_bytes_reserved);
@@ -1306,7 +1337,11 @@ async fn flush_single_batch(
         }
     }
 
-    let exec_result = match &inner.sql {
+    if reply_targets.is_empty() {
+        return;
+    }
+    visibility.committing();
+    let mut exec_result = match &inner.sql {
         SqlDriverState::Sqlite { writer, .. } => {
             let can_fast = group_spaces.is_empty()
                 && items.iter().all(|(_, fp, _)| fp.is_some())
@@ -1424,12 +1459,34 @@ async fn flush_single_batch(
         }
     };
 
+    match &exec_result {
+        BatchExecOutcome::Committed {
+            visibility_windows, ..
+        } => {
+            if visibility.has_live_state() || inner.live_visibility.has_cleanup() {
+                // A retained writer socket can be the pool's only slot.
+                drop(cached_pg_conn.take());
+            }
+            if let Err(error) = visibility.published(&store, visibility_windows).await {
+                let BatchExecOutcome::Committed { slots, .. } = exec_result else {
+                    unreachable!("checking a committed batch");
+                };
+                exec_result = BatchExecOutcome::UnknownCommit {
+                    slots,
+                    diag_reason: format!("projection erasure pending: {error:?}"),
+                };
+            }
+        }
+        BatchExecOutcome::AbortedBeforeCommit(_) => visibility.aborted(),
+        BatchExecOutcome::UnknownCommit { .. } => visibility.invalidate(),
+    }
     drop(reserved_list);
 
     match exec_result {
         BatchExecOutcome::Committed {
             slots,
             space_effective_cuts,
+            ..
         } => {
             let mut slot_iter = slots.into_iter();
             for target in reply_targets {
@@ -1559,12 +1616,40 @@ pub(crate) enum BatchExecOutcome {
     Committed {
         slots: Vec<ItemOutcomeSlot>,
         space_effective_cuts: BTreeMap<SpaceId, SpaceSeq>,
+        visibility_windows: Vec<crate::projection_fence::VisibilityWindow>,
     },
     UnknownCommit {
         slots: Vec<ItemOutcomeSlot>,
         diag_reason: String,
     },
     AbortedBeforeCommit(PortError),
+}
+
+pub(crate) fn visibility_windows(
+    store: &crate::CanonicalStore,
+    states: &BTreeMap<SpaceId, SpaceBatchEntry>,
+) -> Vec<crate::projection_fence::VisibilityWindow> {
+    if !store.inner.live_visibility.has_cleanup() {
+        return Vec::new();
+    }
+    states
+        .values()
+        .filter_map(|entry| match entry {
+            SpaceBatchEntry::Loaded {
+                record,
+                persisted_initial_seq,
+                effective_cut,
+                ..
+            } if persisted_initial_seq < effective_cut => {
+                Some(crate::projection_fence::VisibilityWindow {
+                    scope: record.scope.clone(),
+                    after: *persisted_initial_seq,
+                    through: *effective_cut,
+                })
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 async fn execute_batch_on_conn(
@@ -1717,6 +1802,7 @@ async fn execute_batch_on_conn(
                     return BatchExecOutcome::Committed {
                         slots: vec![ItemOutcomeSlot::Failed(item_err)],
                         space_effective_cuts,
+                        visibility_windows: Vec::new(),
                     };
                 }
                 // Rollback ONLY this item's savepoint; virtual `effective_cut` stays unchanged!
@@ -1846,6 +1932,7 @@ async fn execute_batch_on_conn(
             BatchExecOutcome::Committed {
                 slots,
                 space_effective_cuts,
+                visibility_windows: visibility_windows(store, &space_states),
             }
         }
         Err(commit_err) => {

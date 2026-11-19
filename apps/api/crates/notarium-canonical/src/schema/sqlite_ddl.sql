@@ -100,6 +100,9 @@ CREATE TABLE IF NOT EXISTS folder_aliases (
 CREATE INDEX IF NOT EXISTS idx_folder_aliases_lookup
     ON folder_aliases (space_id, old_parent_folder_id, old_slug_fold, created_seq DESC);
 
+CREATE INDEX IF NOT EXISTS idx_folder_aliases_projection_seq
+    ON folder_aliases (space_id, created_seq);
+
 CREATE TABLE IF NOT EXISTS note_heads (
     space_id TEXT NOT NULL,
     note_id TEXT NOT NULL,
@@ -163,6 +166,9 @@ CREATE INDEX IF NOT EXISTS idx_note_aliases_title_lookup
 CREATE INDEX IF NOT EXISTS idx_note_aliases_target
     ON note_aliases (space_id, target_note_id);
 
+CREATE INDEX IF NOT EXISTS idx_note_aliases_projection_seq
+    ON note_aliases (space_id, created_seq);
+
 CREATE TABLE IF NOT EXISTS space_field_schemas (
     space_id TEXT NOT NULL,
     schema_rev_id TEXT NOT NULL,
@@ -218,6 +224,20 @@ CREATE INDEX IF NOT EXISTS idx_revisions_agent_run
 CREATE INDEX IF NOT EXISTS idx_revisions_parent_rev
     ON revisions (space_id, parent_rev_id)
     WHERE parent_rev_id IS NOT NULL;
+
+-- A separator below every valid ID byte preserves tuple order in a scalar index.
+CREATE INDEX IF NOT EXISTS idx_revisions_projection_rank_key
+    ON revisions (space_id, history_incarnation,
+        replace(entity_key, ':', char(31)),
+        visibility_seq DESC, space_seq DESC)
+    WHERE entity_type = 'rank';
+
+CREATE INDEX IF NOT EXISTS idx_revisions_projection_rank_target
+    ON revisions (space_id, history_incarnation,
+        substr(entity_key, instr(entity_key, ':') + instr(substr(entity_key, instr(entity_key, ':') + 1), ':') + 1),
+        replace(entity_key, ':', char(31)),
+        visibility_seq DESC, space_seq DESC)
+    WHERE entity_type = 'rank';
 
 CREATE TABLE IF NOT EXISTS revision_purge_fences (
     space_id TEXT NOT NULL,
@@ -277,6 +297,36 @@ CREATE INDEX IF NOT EXISTS idx_view_rank_overlays_order
 
 CREATE INDEX IF NOT EXISTS idx_view_rank_overlays_target
     ON view_rank_overlays (space_id, target_note_id);
+
+-- A row marks the complete starting state even when the snapshot has no ranks.
+CREATE TABLE IF NOT EXISTS projection_rank_anchors (
+    space_id TEXT NOT NULL PRIMARY KEY,
+    history_incarnation BLOB NOT NULL CHECK (typeof(history_incarnation) = 'blob' AND length(history_incarnation) = 16),
+    anchor_seq INTEGER NOT NULL CHECK (anchor_seq >= 0),
+    FOREIGN KEY (space_id) REFERENCES spaces (space_id)
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS projection_rank_anchor_rows (
+    space_id TEXT NOT NULL,
+    view_note_id TEXT NOT NULL,
+    view_key TEXT NOT NULL,
+    target_note_id TEXT NOT NULL,
+    group_key_msgpack BLOB NOT NULL,
+    group_key_hex TEXT NOT NULL,
+    sort_rank_lexo TEXT NOT NULL CHECK (length(CAST(sort_rank_lexo AS BLOB)) BETWEEN 1 AND 16),
+    rank_rev_id TEXT NOT NULL,
+    placement_revision TEXT NOT NULL,
+    placement_actor_id TEXT NOT NULL,
+    placement_run_id TEXT,
+    updated_seq INTEGER NOT NULL CHECK (updated_seq >= 1),
+    PRIMARY KEY (space_id, view_note_id, view_key, target_note_id),
+    FOREIGN KEY (space_id) REFERENCES projection_rank_anchors (space_id),
+    FOREIGN KEY (space_id, view_note_id) REFERENCES note_heads (space_id, note_id),
+    FOREIGN KEY (space_id, target_note_id) REFERENCES note_heads (space_id, note_id)
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS idx_projection_rank_anchor_target
+    ON projection_rank_anchor_rows (space_id, target_note_id, view_note_id, view_key);
 
 CREATE TABLE IF NOT EXISTS blob_catalog (
     space_id TEXT NOT NULL,
@@ -620,6 +670,28 @@ CREATE INDEX IF NOT EXISTS idx_chat_entries_parent
 CREATE INDEX IF NOT EXISTS idx_chat_entries_compaction
     ON chat_entries (space_id, thread_id, entry_seq)
     WHERE kind = 'compaction';
+
+CREATE INDEX IF NOT EXISTS idx_chat_entries_projection
+    ON chat_entries (space_id, thread_id, entry_seq, revision_id, created_space_seq,
+                     redacted_at_seq, kind, checkpoint_stale);
+
+CREATE INDEX IF NOT EXISTS idx_chat_entries_created_change
+    ON chat_entries (space_id, created_space_seq, thread_id, entry_seq);
+
+CREATE INDEX IF NOT EXISTS idx_chat_entries_redacted_change
+    ON chat_entries (space_id, redacted_at_seq, thread_id, entry_seq)
+    WHERE redacted_at_seq IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS chat_entry_ref_blocks (
+    space_id TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    entry_seq INTEGER NOT NULL,
+    block_no INTEGER NOT NULL CHECK (block_no >= 0),
+    payload BLOB NOT NULL CHECK (typeof(payload) = 'blob' AND length(payload) BETWEEN 1 AND 4096),
+    PRIMARY KEY (space_id, thread_id, entry_seq, block_no),
+    FOREIGN KEY (space_id, thread_id, entry_seq)
+        REFERENCES chat_entries (space_id, thread_id, entry_seq) ON DELETE CASCADE
+) WITHOUT ROWID;
 
 CREATE TABLE IF NOT EXISTS chat_pending_inputs (
     space_id TEXT NOT NULL,

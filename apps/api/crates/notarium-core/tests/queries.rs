@@ -22,6 +22,46 @@ fn version(note: u8, revision: u8) -> OverlayRowVersion {
 }
 
 #[test]
+fn open_world_query_checks_declared_types_and_rejects_null_list_members() {
+    let predicate = |predicate| FieldFilterAstV1 {
+        version: 1,
+        predicate,
+    };
+    let fields = BTreeMap::from([(
+        "score".into(),
+        FieldSchema {
+            kind: FieldType::Scalar(ScalarType::Number),
+            nullable: false,
+        },
+    )]);
+    let tag = predicate(Predicate::Contains {
+        key: "topics".into(),
+        value: ScalarValue::String("rust".into()),
+    });
+    assert!(tag.validate_declared(&fields).is_ok());
+    assert!(tag.validate(&fields).is_err());
+    assert!(tag.predicate.matches(&BTreeMap::from([(
+        "topics".into(),
+        FieldObservation::Ok(FieldValue::List(vec![ScalarValue::String("rust".into())]))
+    )])));
+    for invalid in [
+        Predicate::Contains {
+            key: "topics".into(),
+            value: ScalarValue::Null,
+        },
+        Predicate::Eq {
+            key: "score".into(),
+            value: ScalarValue::String("2".into()),
+        },
+    ] {
+        assert_eq!(
+            predicate(invalid).validate_declared(&fields),
+            Err(DomainError::validation(ValidationReason::InvalidQuery))
+        );
+    }
+}
+
+#[test]
 fn exact_numbers_compare_represented_values_without_f64_rounding() {
     let a = ExactNumber::from(9_007_199_254_740_992_u64);
     let b = ExactNumber::from(9_007_199_254_740_993_u64);

@@ -94,10 +94,21 @@ recovers writes under its exclusive DataRoot owner lock.
 ## Dual-dialect schema and history model
 
 Both SQL dialects materialize the same ordinary B-tree tables in schema
-version `6` and verify live database catalogs (`sqlite_master` / `pg_catalog`)
+version `7` and verify live database catalogs (`sqlite_master` / `pg_catalog`)
 against a shared typed manifest checksum (`schema_meta`) on every startup.
 Unknown newer schema versions, mismatched manifest checksums or unfinished
 migration states fail closed.
+
+Schema version 7 records a rank anchor at each existing Space's committed head.
+The anchor preserves exactly the live view-rank overlays at upgrade. Rank
+revisions after that head include deletion tombstones, so a projection rebuild
+can distinguish an absent rank from an older live revision. The migration also
+builds a covering chat-entry lookup and breaks oversized reference arrays into
+bounded blocks. Projection readers page through those blocks and validate each
+source entry and target before projecting or returning its backlink.
+Stop the preceding-version writers before opening a PostgreSQL installation
+for this upgrade. Startup copies the live anchor rows and installs the schema
+under the migration fence in one transaction.
 
 The canonical store implements `ControlCatalogPort`. Account provisioning and
 lifecycle changes store a compact receipt keyed by owner, actor and command key
@@ -190,6 +201,10 @@ rule under their writer savepoints.
 - **Trailing large BLOBs:** `collab_sessions` places `yrs_snapshot_blob` as the
   final column so room-state and lease precondition checks read inline tuple
   headers without traversing overflow pages.
+
+Projection readers use purpose-scoped canonical pagination and the current
+Space owner's lifecycle fence. They maintain a separate derived database and
+checkpoint cache. See [structural projections](projections.md).
 
 ## Content-addressed storage and crash-safe purge
 
@@ -481,10 +496,12 @@ same example against an isolated prefix.
   volume, where lookup checks file size and BLAKE3 before returning the path.
   Startup reconciles abandoned holds and pending local artifacts.
   The offline `notarium_canonical::backup::decode_postgres_spool_v1_bounded`
-  API verifies the trailer and recognizes the exact manifests for schemas 1 through 6.
+  API verifies the trailer and recognizes the exact manifests for schemas 1 through 7.
   It returns typed rows in the original table and column order within the
   caller's byte budget. To materialize a historical spool, create an empty
-  target with `schema::POSTGRES_BASELINE_DDL`. For versions 1 and 2, drop
+  target with `schema::POSTGRES_BASELINE_DDL`. For versions 1 through 6, apply
+  `tests/fixtures/schema-v6-remove-projection.sql` from the canonical crate.
+  For versions 1 and 2, drop
   `collab_checkpoints` and `backup_holds.owner_generation`. For version 1,
   also drop `account_catalog_receipts` and `chat_pending_inputs.ext_space_tainted`.
   For versions 1 through 4, drop `idx_receipt_exception_pointer` and

@@ -1,7 +1,13 @@
 use super::{PortFuture, PortStream, context::*, types::*};
 use crate::{
-    DomainError, DomainResult, classes::ProviderPart, error::ValidationReason, ids::*, model::*,
-    patch::*, receipt::*, value::YamlValue,
+    DomainError, DomainResult,
+    classes::{DocClass, ProviderPart},
+    error::{Diagnostic, ValidationReason},
+    ids::*,
+    model::*,
+    patch::*,
+    receipt::*,
+    value::YamlValue,
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
@@ -102,7 +108,7 @@ pub trait EmbeddingProviderPort: Send + Sync {
     ) -> PortFuture<'_, EmbeddingResult>;
 }
 
-/// Trusted planner capability minted on single-registration by composition root.
+/// Trusted capability for the planner currently registered by the composition root.
 /// ```compile_fail
 /// use notarium_core::ports::BoardPlannerAuthority;
 /// let _: BoardPlannerAuthority = serde_json::from_str("{}").unwrap();
@@ -277,6 +283,11 @@ pub struct PlannedNoteRestoration {
     pub current_revision: RevisionId,
     pub restored_from_revision: Option<RevisionId>,
     pub planned_lifecycle: Lifecycle,
+    /// Exact placement prepared by the canonical rollback command.
+    pub planned_parent_folder: FolderId,
+    pub planned_class: DocClass,
+    pub planned_ability: Option<AbilityId>,
+    pub planned_header_diagnostic: Option<Diagnostic>,
     pub planned_carrier: Option<String>,
     pub planned_fields: BTreeMap<String, Option<YamlValue>>,
 }

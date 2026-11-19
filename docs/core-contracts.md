@@ -92,6 +92,10 @@ compressed sets may supply a boxed lazy iterator without materializing members.
 Each yielded `DenseNodeId` still rejects use in another generation. The iterator
 borrows its snapshot; current visibility remains a separate canonical fence, and
 async card hydration preserves requested ordering and absent entries.
+Projection admission uses the entry folder covered by the caller's Space grant.
+The current Space owner checks lifecycle and authority before delivery. A caller
+cannot use a retained handle to read through a revoked owner or a replaced
+history. Unconfirmed owner admission returns a typed `not_ready` reason.
 
 Protected package reads select an exact AbilityId, package revision and entrypoint
 or auxiliary manifest key through `NoteReadPort::read_ability_resource`. Auxiliary
@@ -149,6 +153,9 @@ A committed mutation always returns its receipt even if a client buffer is full.
 The trusted projection planner also checks the effect budget: at most eight
 distinct affected notes and a bounded payload with exact versions applicable to
 the chosen cut. Several receipts for one note must not double-count its groups.
+Each overlaid note uses the exact carrier and rank state selected by its trusted
+receipt at the command boundary. Later rank-only edits stay outside that read
+unless their receipt is selected or already part of the base cut.
 Bulk rollback, structural folder moves and unknown or unrepresentable effects
 use wait-only catch-up for the entire causal read. One receipt changing 100 notes
 cannot use a `LIMIT + 8` candidate window. The result is a caught-up snapshot or
@@ -170,6 +177,9 @@ job reads use JobId. Cold change seeds enumerate notes before chat threads with
 a typed `SeedPosition`. `ContinueSeed` retains the original history, cutoff and
 page limit, including when the snapshot contains only threads. Completion returns
 the cutoff from which durable change-log consumption resumes.
+Projector acknowledgements advance only through complete, durable applied
+commands within the current subscription's delivered ceiling. Interrupted pages
+resume from the last applied command boundary.
 
 ## Field ordering and errors
 

@@ -578,7 +578,8 @@ pub enum GroupKey {
 pub struct ViewQuery {
     pub view: ViewRef,
     pub filter: FieldFilterAstV1,
-    pub sort: SortSpec,
+    /// A client override. An absent value uses the view author's ordering.
+    pub sort: Option<SortSpec>,
     pub group_by: Option<String>,
     pub limit: PageLimit,
 }

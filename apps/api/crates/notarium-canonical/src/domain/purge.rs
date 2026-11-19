@@ -461,10 +461,21 @@ async fn purge_note_inner(
     {
         Ok(stored) => {
             let captured = step1_capture.lock().expect("step1 capture mutex").take();
+            let replayed = captured.is_none();
             if run_steps_2_and_3 && let Some(exec) = captured {
                 finish_committed_purge(store, &exec, &ctx.budget, &deadline).await?;
             }
-            Ok(stored.into_committed())
+            let committed = stored.into_committed();
+            if replayed {
+                finish_replayed_projection_cleanup(
+                    store,
+                    &committed.receipt,
+                    &ctx.budget,
+                    &deadline,
+                )
+                .await?;
+            }
+            Ok(committed)
         }
         Err(PortError::Unavailable(failure))
             if failure.effect() == notarium_core::error::CommitEffect::NotCommitted =>
@@ -480,7 +491,15 @@ async fn purge_note_inner(
                     rmp_serde::from_slice(&pending.sanitized_response_msgpack).map_err(|err| {
                         unknown_commit_outcome("decode_resumed_purge_resp", err.to_string())
                     })?;
-                return Ok(stored.into_committed());
+                let committed = stored.into_committed();
+                finish_replayed_projection_cleanup(
+                    store,
+                    &committed.receipt,
+                    &ctx.budget,
+                    &deadline,
+                )
+                .await?;
+                return Ok(committed);
             }
             Err(unavailable_retryable(
                 "purge_submit_unavailable",
@@ -659,7 +678,10 @@ pub(crate) async fn mint_and_purge_impl(
             .map_err(|err| {
             unknown_commit_outcome("decode_replayed_mint_purge", err.to_string())
         })?;
-        return Ok(stored.into_committed());
+        let committed = stored.into_committed();
+        finish_replayed_projection_cleanup(store, &committed.receipt, &ctx.budget, &deadline)
+            .await?;
+        return Ok(committed);
     }
     let staged_ticket = deadline
         .prepare(&ctx.budget, || {
@@ -1049,10 +1071,19 @@ pub(crate) async fn mint_and_purge_impl(
     {
         Ok(stored) => {
             let captured = step1_capture.lock().expect("step1 capture mutex").take();
+            let committed = stored.into_committed();
             if let Some(exec) = captured {
                 finish_committed_purge(store, &exec, &ctx.budget, &deadline).await?;
+            } else {
+                finish_replayed_projection_cleanup(
+                    store,
+                    &committed.receipt,
+                    &ctx.budget,
+                    &deadline,
+                )
+                .await?;
             }
-            Ok(stored.into_committed())
+            Ok(committed)
         }
         Err(PortError::Unavailable(failure))
             if failure.effect() == notarium_core::error::CommitEffect::NotCommitted =>
@@ -1068,7 +1099,15 @@ pub(crate) async fn mint_and_purge_impl(
                     rmp_serde::from_slice(&pending.sanitized_response_msgpack).map_err(|err| {
                         unknown_commit_outcome("decode_resumed_mint_purge_resp", err.to_string())
                     })?;
-                return Ok(stored.into_committed());
+                let committed = stored.into_committed();
+                finish_replayed_projection_cleanup(
+                    store,
+                    &committed.receipt,
+                    &ctx.budget,
+                    &deadline,
+                )
+                .await?;
+                return Ok(committed);
             }
             Err(unavailable_retryable(
                 "mint_and_purge_unavailable",
@@ -1082,12 +1121,32 @@ pub(crate) async fn mint_and_purge_impl(
 
 // Step 1 and its durable recovery record are already committed. A retry or startup
 // recovery resumes the same retirement if the caller leaves during steps 2 and 3.
+async fn finish_replayed_projection_cleanup(
+    store: &CanonicalStore,
+    receipt: &MutationReceiptToken,
+    budget: &notarium_core::ports::CallBudget,
+    deadline: &super::common::CommandDeadline,
+) -> Result<(), PortError> {
+    deadline
+        .wait(budget, || {
+            store.retry_projection_cleanup(receipt.scope(), budget, Some(receipt.seq()))
+        })
+        .await
+        .map_err(|error| unknown_commit_outcome("purge_projection_cleanup", error.to_string()))?
+}
+
 async fn finish_committed_purge(
     store: &CanonicalStore,
     pending: &PendingPurgeExecution,
     budget: &notarium_core::ports::CallBudget,
     deadline: &super::common::CommandDeadline,
 ) -> Result<(), PortError> {
+    deadline
+        .wait(budget, || {
+            store.retry_projection_cleanup(&pending.scope, budget, None)
+        })
+        .await
+        .map_err(|err| unknown_commit_outcome("purge_projection_cleanup", err.to_string()))??;
     deadline
         .wait(budget, || drive_pending_purge_steps_2_and_3(store, pending))
         .await
@@ -1218,6 +1277,10 @@ async fn execute_sql_erasure_for_old_note_tx(
     // 2. Clear cover_note_id, overlays, rank revisions, note aliases, observations, collab sessions/logs, and note revisions!
     let rank_prefix = format!("{old_id_str}:");
     let rank_suffix = format!(":{old_id_str}");
+    const DELETE_ANCHORED_RANKS: [&str; 2] = [
+        "DELETE FROM projection_rank_anchor_rows WHERE space_id = $1 AND target_note_id = $2",
+        "DELETE FROM projection_rank_anchor_rows WHERE space_id = $1 AND view_note_id = $2",
+    ];
     match tx {
         BackendConn::Sqlite(conn) => {
             sqlx::query(
@@ -1238,6 +1301,17 @@ async fn execute_sql_erasure_for_old_note_tx(
             .execute(&mut **conn)
             .await
             .map_err(|err| internal_not_committed("sqlite_purge_del_overlays", err.to_string()))?;
+
+            for sql in DELETE_ANCHORED_RANKS {
+                sqlx::query(sql)
+                    .bind(scope.space_id.as_str())
+                    .bind(old_id_str)
+                    .execute(&mut **conn)
+                    .await
+                    .map_err(|err| {
+                        internal_not_committed("sqlite_purge_rank_anchor", err.to_string())
+                    })?;
+            }
 
             sqlx::query(
                 "DELETE FROM revisions WHERE space_id = ? AND entity_type = 'rank' AND (substr(entity_key, 1, length(?2)) = ?2
@@ -1311,6 +1385,17 @@ async fn execute_sql_erasure_for_old_note_tx(
             .execute(&mut **conn)
             .await
             .map_err(|err| internal_not_committed("pg_purge_del_overlays", err.to_string()))?;
+
+            for sql in DELETE_ANCHORED_RANKS {
+                sqlx::query(sql)
+                    .bind(scope.space_id.as_str())
+                    .bind(old_id_str)
+                    .execute(&mut **conn)
+                    .await
+                    .map_err(|err| {
+                        internal_not_committed("pg_purge_rank_anchor", err.to_string())
+                    })?;
+            }
 
             sqlx::query(
                 "DELETE FROM revisions WHERE space_id = $1 AND entity_type = 'rank' AND (left(entity_key, length($2)) = $2

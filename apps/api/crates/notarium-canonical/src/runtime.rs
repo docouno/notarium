@@ -140,11 +140,13 @@ pub(crate) struct CanonicalInner {
     writer_leases: std::sync::Mutex<std::collections::HashMap<SpaceId, LeaseEpoch>>,
     pub writer_coord: OnceLock<Arc<WriteCoordinator>>,
     pub wal_coord: OnceLock<Arc<SqliteWalCoordinator>>,
+    #[cfg(feature = "test-support")]
+    pub(crate) projection_read_metrics: crate::projection_read::ProjectionReadMetrics,
     pub broadcast_hub: BroadcastHub,
-    pub board_provider: OnceLock<(
-        notarium_core::ports::BoardPlannerAuthority,
-        Arc<dyn notarium_core::ports::BoardMutationFactsProvider>,
-    )>,
+    pub live_visibility: crate::projection_fence::LiveLifecycleFence,
+    #[cfg(feature = "test-support")]
+    visibility_commit_pause: std::sync::Mutex<Option<auxiliary::VisibilityCommitPause>>,
+    pub board_provider: std::sync::RwLock<Option<crate::domain::BoardProviderBinding>>,
     pub collab_interceptor: OnceLock<Arc<dyn notarium_core::ports::LiveCollabInterceptor>>,
     pub room_fences: Arc<crate::domain::RoomFenceTable>,
     pub job_reads: crate::peers::JobReadRegistry,
@@ -190,6 +192,13 @@ impl CanonicalInner {
             .get(space)
             .copied()
             .ok_or_else(|| DomainError::validation(ValidationReason::InvalidAuthority).into())
+    }
+
+    pub(crate) fn revoke_writer_epoch(&self, space: &SpaceId) {
+        self.writer_leases
+            .lock()
+            .expect("writer leases")
+            .remove(space);
     }
 
     pub(crate) fn check_writer_epoch(
@@ -441,8 +450,13 @@ impl CanonicalRuntime {
             writer_leases: Default::default(),
             writer_coord: OnceLock::new(),
             wal_coord: OnceLock::new(),
+            #[cfg(feature = "test-support")]
+            projection_read_metrics: crate::projection_read::ProjectionReadMetrics::default(),
             broadcast_hub: BroadcastHub::new(DEFAULT_BROADCAST_CAPACITY),
-            board_provider: OnceLock::new(),
+            live_visibility: crate::projection_fence::LiveLifecycleFence::new()?,
+            #[cfg(feature = "test-support")]
+            visibility_commit_pause: Default::default(),
+            board_provider: std::sync::RwLock::new(None),
             collab_interceptor: OnceLock::new(),
             room_fences: Arc::new(crate::domain::RoomFenceTable::default()),
             job_reads: crate::peers::JobReadRegistry::default(),
@@ -535,6 +549,7 @@ impl CanonicalRuntime {
     }
 
     async fn drain_shutdown(self) -> Result<(), PortError> {
+        self.inner.live_visibility.close_and_drain().await;
         // Closing a backup phase can schedule a final join or artifact cleanup.
         // Admission already closed when shutdown was requested.
         loop {
@@ -784,20 +799,42 @@ impl CanonicalStore {
     where
         F: for<'c> FnOnce(&'c mut BackendConn<'_>) -> crate::BoxFuture<'c, Result<T, PortError>>,
     {
+        self.with_visibility_write_tx(None, op, Ok).await
+    }
+
+    pub(crate) async fn with_visibility_write_tx<F, T, R>(
+        &self,
+        space: Option<SpaceId>,
+        op: F,
+        after_commit: impl FnOnce(T) -> Result<R, PortError>,
+    ) -> Result<R, PortError>
+    where
+        F: for<'c> FnOnce(&'c mut BackendConn<'_>) -> crate::BoxFuture<'c, Result<T, PortError>>,
+    {
         self.ensure_open()?;
         let _commit_gate = if let Some(writer) = self.inner.writer_coord.get() {
             Some(writer.acquire_commit_read_guard().await)
         } else {
             None
         };
-        self.with_write_tx_unfenced(op).await
+        self.with_write_tx_unfenced(space.map(|space| vec![space]), op, after_commit)
+            .await
     }
 
-    pub(crate) async fn with_write_tx_unfenced<F, T>(&self, op: F) -> Result<T, PortError>
+    pub(crate) async fn with_write_tx_unfenced<F, T, R>(
+        &self,
+        spaces: Option<Vec<SpaceId>>,
+        op: F,
+        after_commit: impl FnOnce(T) -> Result<R, PortError>,
+    ) -> Result<R, PortError>
     where
         F: for<'c> FnOnce(&'c mut BackendConn<'_>) -> crate::BoxFuture<'c, Result<T, PortError>>,
     {
         self.ensure_open()?;
+        let mut visibility = match spaces {
+            Some(spaces) => Some(self.inner.live_visibility.for_write(spaces).await),
+            None => None,
+        };
         let value = match &self.inner.sql {
             SqlDriverState::Sqlite { writer, .. } => {
                 let mut guard = writer.lock().await;
@@ -811,6 +848,9 @@ impl CanonicalStore {
                 let mut conn = BackendConn::Sqlite(&mut pair.sqlx_conn);
                 let mut transaction = WriteTransaction::begin(&mut conn).await?;
                 let value = op(&mut transaction.conn()).await?;
+                if let Some(visibility) = visibility.as_mut() {
+                    visibility.committing();
+                }
                 transaction.commit().await?;
                 self.inner
                     .sqlite_writer_commit_gen
@@ -840,12 +880,33 @@ impl CanonicalStore {
                         return Err(err);
                     }
                 };
+                if let Some(visibility) = visibility.as_mut() {
+                    visibility.committing();
+                }
                 transaction.commit().await?;
                 lease.complete();
                 value
             }
         };
-        Ok(value)
+        #[cfg(feature = "test-support")]
+        if visibility.is_some() {
+            self.pause_after_visibility_commit_for_test().await;
+        }
+        let visibility_result = if let Some(visibility) = visibility {
+            visibility.published(self, &[]).await.map_err(|error| {
+                crate::codec::unknown_commit_non_idempotent(
+                    "projection_erase_after_commit",
+                    error.to_string(),
+                )
+            })
+        } else {
+            Ok(())
+        };
+        // A projection publication failure withholds a successful reply.
+        // The durable write still needs its local notification for repair.
+        let published = after_commit(value);
+        visibility_result?;
+        published
     }
 
     pub fn wal_telemetry(&self) -> Option<WalTelemetrySnapshot> {
@@ -1068,6 +1129,32 @@ impl CanonicalStore {
     where
         F: for<'c> FnOnce(&'c mut BackendConn<'_>) -> crate::BoxFuture<'c, Result<T, PortError>>,
     {
+        #[cfg(feature = "test-support")]
+        {
+            // Owner fence pages also use this transaction boundary.
+            let mut measurement = self.inner.projection_read_metrics.measure();
+            let result = self
+                .execute_read_transaction(budget, extra_pg_sql, op)
+                .await;
+            if let Some(measurement) = &mut measurement {
+                measurement.complete(result.is_ok());
+            }
+            result
+        }
+        #[cfg(not(feature = "test-support"))]
+        self.execute_read_transaction(budget, extra_pg_sql, op)
+            .await
+    }
+
+    async fn execute_read_transaction<F, T>(
+        &self,
+        budget: Option<&CallBudget>,
+        extra_pg_sql: Option<&'static str>,
+        op: F,
+    ) -> Result<T, PortError>
+    where
+        F: for<'c> FnOnce(&'c mut BackendConn<'_>) -> crate::BoxFuture<'c, Result<T, PortError>>,
+    {
         self.ensure_open()?;
         match &self.inner.sql {
             SqlDriverState::Sqlite { read_pool, .. } => {
@@ -1175,6 +1262,11 @@ impl CanonicalStore {
             None,
             move |record: SpaceRecord| {
                 inner.grant_writer_epoch(&record.space.id, record.active_epoch);
+                inner
+                    .broadcast_hub
+                    .publish(BroadcastSignal::CatalogChanged {
+                        scope: record.scope.clone(),
+                    });
                 Ok(record)
             },
             move |tx| Box::pin(create_space_tx(tx, spec)),
@@ -1213,14 +1305,26 @@ impl CanonicalStore {
         let rev_id = new_revision_id()?;
         let cmd_id = new_prefixed_hex_id("cmd_")?;
 
-        let out = self
-            .with_write_tx(|tx| {
-                let spec_cl = spec.clone();
-                let slug_fold_cl = slug_fold.clone();
-                let proj_fold_cl = project_slug_fold.clone();
-                let rev_cl = rev_id.clone();
-                let cmd_cl = cmd_id.clone();
-                Box::pin(async move {
+        let inner = Arc::clone(&self.inner);
+        let writer_owner = Arc::clone(&inner);
+        let broadcast_scope = spec.scope.clone();
+        self.with_auxiliary_visibility_command(
+            Some(spec.scope.space_id.clone()),
+            None,
+            move |out: (FolderRef, RevisionId, SpaceSeq)| {
+                inner.broadcast_hub.publish(BroadcastSignal::Committed {
+                    scope: broadcast_scope,
+                    new_last_seq: out.2,
+                });
+                Ok(out)
+            },
+            move |tx| Box::pin(async move {
+                let spec_cl = spec;
+                let slug_fold_cl = slug_fold;
+                let proj_fold_cl = project_slug_fold;
+                let rev_cl = rev_id;
+                let cmd_cl = cmd_id;
+                writer_owner.check_writer_epoch(&spec_cl.scope.space_id, spec_cl.active_epoch)?;
                 let space_rec = load_space_record(tx, &spec_cl.scope.space_id).await?;
                 space_rec.scope.check(&spec_cl.scope)?;
                 if space_rec.active_epoch != spec_cl.active_epoch {
@@ -1420,17 +1524,9 @@ impl CanonicalStore {
                     rev_cl,
                     next_seq,
                 ))
-            })
-        })
-        .await?;
-
-        self.inner
-            .broadcast_hub
-            .publish(BroadcastSignal::Committed {
-                scope: spec.scope,
-                new_last_seq: out.2,
-            });
-        Ok(out)
+            }),
+        )
+        .await
     }
 
     /// Sets a non-root folder's lifecycle (`Trash` or `Restore`), preserving active-sibling uniqueness.
@@ -1463,12 +1559,23 @@ impl CanonicalStore {
         let expected_cl = expected_revision.clone();
         let actor_cl = actor.clone();
 
+        let inner = Arc::clone(&self.inner);
+        let writer_owner = Arc::clone(&inner);
         let broadcast_scope = scope.clone();
-        let out = self
-            .with_write_tx(|tx| {
-                let new_rev_cl = new_rev.clone();
-                let cmd_cl_in = cmd_id.clone();
-                Box::pin(async move {
+        self.with_auxiliary_visibility_command(
+            Some(scope.space_id.clone()),
+            None,
+            move |out: (RevisionId, SpaceSeq)| {
+                inner.broadcast_hub.publish(BroadcastSignal::Committed {
+                    scope: broadcast_scope,
+                    new_last_seq: out.1,
+                });
+                Ok(out)
+            },
+            move |tx| Box::pin(async move {
+                let new_rev_cl = new_rev;
+                let cmd_cl_in = cmd_id;
+                writer_owner.check_writer_epoch(&scope_cl.space_id, active_epoch)?;
                 let space_rec = load_space_record(tx, &scope_cl.space_id).await?;
                 space_rec.scope.check(&scope_cl)?;
                 if space_rec.active_epoch != active_epoch {
@@ -1638,17 +1745,9 @@ impl CanonicalStore {
                 .await?;
 
                 Ok((new_rev_cl, next_seq))
-            })
-        })
-        .await?;
-
-        self.inner
-            .broadcast_hub
-            .publish(BroadcastSignal::Committed {
-                scope: broadcast_scope,
-                new_last_seq: out.1,
-            });
-        Ok(out)
+            }),
+        )
+        .await
     }
 
     /// Reads an entity's immutable revision snapshot at a validated command-end cutoff (`visibility_seq <= cutoff`).

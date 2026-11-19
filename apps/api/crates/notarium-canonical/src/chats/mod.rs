@@ -3135,7 +3135,14 @@ async fn insert_chat_entry_row_tx(
             .map_err(|err| internal_not_committed("pg_insert_chat_entry", err.to_string()))?;
         }
     }
-    Ok(())
+    crate::projection_chat::write_chat_ref_blocks_tx(
+        tx,
+        space_id.as_str(),
+        thread_id.as_str(),
+        e_i64,
+        refs_json.as_bytes(),
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4110,6 +4117,22 @@ async fn wait_for_redaction_gc(
     }
 }
 
+async fn finish_redacted_projection_replay(
+    store: &CanonicalStore,
+    committed: &Committed<RedactedChat>,
+    budget: &notarium_core::ports::CallBudget,
+    deadline: &crate::domain::common::CommandDeadline,
+) -> Result<(), PortError> {
+    deadline
+        .wait(budget, || {
+            store.retry_redacted_chat_cleanup(committed, budget)
+        })
+        .await
+        .map_err(|error| {
+            crate::codec::unknown_commit_outcome("redaction_projection_cleanup", error.to_string())
+        })?
+}
+
 async fn redact_chat_entry_impl(
     store: &CanonicalStore,
     ctx: SpaceContext,
@@ -4153,6 +4176,7 @@ async fn redact_chat_entry_impl(
         .await?
     {
         let (committed, zero_refs) = replayed.into_committed();
+        finish_redacted_projection_replay(store, &committed, &ctx.budget, &deadline).await?;
         if !zero_refs.is_empty() {
             // A receipt from an older writer can refer to bytes released before
             // it gained transactional GC. Reconciliation on open/lease also covers these.
@@ -4180,6 +4204,8 @@ async fn redact_chat_entry_impl(
 
     let cleanup_store = store.clone();
     let (attempted, first_attempt) = tokio::sync::oneshot::channel();
+    let committed_in_writer = Arc::new(AtomicBool::new(false));
+    let observe_commit = Arc::clone(&committed_in_writer);
     let intent = PreparedWriteIntent {
         scope: scope.clone(),
         active_epoch,
@@ -4295,7 +4321,15 @@ async fn redact_chat_entry_impl(
                     }
                 }
 
-                // Release CAS reference owned by this chat entry!
+                crate::projection_chat::clear_chat_ref_blocks_tx(
+                    tx,
+                    &scope.space_id,
+                    &input.thread,
+                    entry_i64,
+                )
+                .await?;
+
+                // Release the CAS reference owned by this chat entry.
                 let entry_owner = format!("{}:{}", input.thread.as_str(), input.entry.get());
                 let mut zero_ref_digests = release_owner_blob_refs_tx(
                     tx,
@@ -4454,6 +4488,7 @@ async fn redact_chat_entry_impl(
                     Vec::new(),
                 )?;
 
+                item_ctx.on_commit(move || observe_commit.store(true, Ordering::Release));
                 Ok(ItemCommitArtifacts {
                     command_id: cmd_id,
                     command_kind: "redact_chat_entry".to_owned(),
@@ -4478,6 +4513,9 @@ async fn redact_chat_entry_impl(
 
     let stored: StoredCommittedRedactedChatV1 = deadline.submit(store, &ctx.budget, intent).await?;
     let (committed, _) = stored.into_committed();
+    if !committed_in_writer.load(Ordering::Acquire) {
+        finish_redacted_projection_replay(store, &committed, &ctx.budget, &deadline).await?;
+    }
     wait_for_redaction_gc(
         &ctx.budget,
         started,
@@ -4721,6 +4759,7 @@ async fn mark_descendant_compactions_stale_tx(
                 })?
             }
         };
+        crate::projection_chat::clear_chat_ref_blocks_tx(tx, space_id, thread_id, raw).await?;
         let owner = format!("{}:{raw}", thread_id.as_str());
         zero_refs.extend(
             release_owner_blob_refs_tx(tx, space_id, BlobOwnerKind::ChatEntry, &owner).await?,

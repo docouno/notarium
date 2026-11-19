@@ -52,6 +52,7 @@ use crate::{
 };
 
 mod fingerprint;
+pub(crate) mod rank_removal;
 
 const MAX_PLANNER_RETRIES: usize = 4;
 
@@ -477,22 +478,27 @@ async fn execute_rollback(
         }
 
         let rb_facts_opt = if !affected_views_set.is_empty() {
-            let (board_authority, provider) = store
-                .inner
-                .board_provider
-                .get()
-                .ok_or_else(|| DomainError::validation(ValidationReason::NotReady))?
-                .clone();
+            let (board_authority, provider) = store.board_facts_provider()?;
 
             let mut planned_list = Vec::with_capacity(eligible_notes.len());
             for (nid, action) in &eligible_notes {
                 match action {
-                    CandidateAction::TrashCreated { current_rev, .. } => {
+                    CandidateAction::TrashCreated {
+                        current_rev,
+                        parent_folder_id,
+                        doc_class,
+                        ability_id,
+                        ..
+                    } => {
                         planned_list.push(PlannedNoteRestoration {
                             note: nid.clone(),
                             current_revision: current_rev.clone(),
                             restored_from_revision: None,
                             planned_lifecycle: Lifecycle::Trashed,
+                            planned_parent_folder: parent_folder_id.clone(),
+                            planned_class: *doc_class,
+                            planned_ability: ability_id.clone(),
+                            planned_header_diagnostic: None,
                             planned_carrier: None,
                             planned_fields: BTreeMap::new(),
                         });
@@ -515,6 +521,10 @@ async fn execute_rollback(
                             current_revision: current_rev.clone(),
                             restored_from_revision: Some(pre_rev_id.clone()),
                             planned_lifecycle: pre_meta.lifecycle,
+                            planned_parent_folder: pre_meta.parent_folder_id.clone(),
+                            planned_class: pre_meta.doc_class,
+                            planned_ability: pre_meta.ability_id.clone(),
+                            planned_header_diagnostic: pre_meta.diagnostics.first().cloned(),
                             planned_carrier: pre_carrier.clone(),
                             planned_fields: pfields,
                         });
@@ -1086,7 +1096,13 @@ pub(crate) fn build_rollback_direct_single_tx_exec(
                     )
                 })
                 .count() as u64;
-            let total_seqs = (trash_note_count + restore_note_count).max(1);
+            let rank_removals = if has_ov {
+                rank_removal::plan_tx(tx, &scope_cl.space_id, &final_eligible, &[]).await?
+            } else {
+                Vec::new()
+            };
+            let total_seqs =
+                (trash_note_count + restore_note_count + rank_removals.len() as u64).max(1);
             let (first_seq, visibility_seq) = item_ctx.preview_seq_range(total_seqs)?;
             let vis_i64 = visibility_seq.get() as i64;
             let now_ts = now_utc_timestamp()?;
@@ -1129,9 +1145,6 @@ pub(crate) fn build_rollback_direct_single_tx_exec(
                     continue;
                 };
 
-                if has_ov {
-                    delete_all_target_overlays_tx(tx, &scope_cl.space_id, nid).await?;
-                }
                 owner_notes_for_receipt.insert(nid.clone());
 
                 if *current_lifecycle == Lifecycle::Trashed {
@@ -1284,10 +1297,6 @@ pub(crate) fn build_rollback_direct_single_tx_exec(
                     .await?;
                 }
 
-                if has_ov && pre_meta.lifecycle != Lifecycle::Active {
-                    delete_all_target_overlays_tx(tx, &scope_cl.space_id, nid).await?;
-                }
-
                 let meta = encode_rollback_note(
                     pre_meta,
                     None,
@@ -1410,6 +1419,24 @@ pub(crate) fn build_rollback_direct_single_tx_exec(
                     nsec,
                 )
                 .await?;
+            }
+
+            for removal in rank_removals {
+                let seq = item_ctx.alloc_next_seq()?;
+                let revision = new_revision_id()?;
+                removal
+                    .write_tx(
+                        tx,
+                        &scope_cl,
+                        seq,
+                        visibility_seq,
+                        &revision,
+                        auth.principal(),
+                        now_ts,
+                    )
+                    .await?;
+                owner_notes_for_receipt.extend(removal.owners().into_iter().cloned());
+                events.push(removal.event(seq, revision));
             }
 
             if events.is_empty() {
@@ -1906,8 +1933,35 @@ fn build_rollback_execute_fn(
                     )
                 })
                 .count() as u64;
+            // A normalization must not recreate a rank whose view or card is being retired.
+            planned_neighbor_updates.retain(|update| {
+                !rank_removal::removes_view_or_target(
+                    &eligible_notes,
+                    &update.view,
+                    &update.neighbor_note,
+                )
+            });
+            planned_target_restores.retain(|restore| {
+                !rank_removal::removes_view_or_target(
+                    &eligible_notes,
+                    &restore.view,
+                    &restore.target_note,
+                )
+            });
+            let rank_removals = if has_any_overlays_in_space_tx(tx, &scope_cl.space_id).await? {
+                rank_removal::plan_tx(
+                    tx,
+                    &scope_cl.space_id,
+                    &eligible_notes,
+                    &planned_overlay_deletes,
+                )
+                .await?
+            } else {
+                Vec::new()
+            };
             let entity_event_seqs = trash_note_count
                 + restore_note_count
+                + (rank_removals.len() as u64)
                 + (planned_neighbor_updates.len() as u64)
                 + (planned_target_restores.len() as u64);
             let total_seqs = entity_event_seqs.max(1);
@@ -1916,7 +1970,6 @@ fn build_rollback_execute_fn(
             let now_ts = now_utc_timestamp()?;
             let (sec, nsec) = encode_timestamp_parts(now_ts);
             let current_schema = load_current_space_schema_tx(tx, &scope_cl.space_id).await?;
-            let space_has_overlays = has_any_overlays_in_space_tx(tx, &scope_cl.space_id).await?;
 
             let mut events = Vec::with_capacity(total_seqs as usize);
             let mut trashed_out = Vec::new();
@@ -1938,7 +1991,7 @@ fn build_rollback_execute_fn(
             let mut pending_trash_heads: Vec<(NoteId, RevisionId)> =
                 Vec::with_capacity(trash_note_count as usize);
 
-            // 6a. Trash run-created eligible notes FIRST & remove their overlays across ALL views.
+            // 6a. Trash run-created eligible notes first.
             for (nid, action) in &eligible_notes {
                 let CandidateAction::TrashCreated {
                     metadata,
@@ -1953,9 +2006,6 @@ fn build_rollback_execute_fn(
                     continue;
                 };
 
-                if space_has_overlays {
-                    delete_all_target_overlays_tx(tx, &scope_cl.space_id, nid).await?;
-                }
                 owner_notes_for_receipt.insert(nid.clone());
 
                 if *current_lifecycle == Lifecycle::Trashed {
@@ -2107,10 +2157,6 @@ fn build_rollback_execute_fn(
                     .await?;
                 }
 
-                if space_has_overlays && pre_meta.lifecycle != Lifecycle::Active {
-                    delete_all_target_overlays_tx(tx, &scope_cl.space_id, nid).await?;
-                }
-
                 let meta = encode_rollback_note(
                     pre_meta,
                     None,
@@ -2178,9 +2224,22 @@ fn build_rollback_execute_fn(
             }
 
             // 6c. Apply planned board overlay deletes, neighbor normalizations, and target restores.
-            for del in &planned_overlay_deletes {
-                delete_single_overlay_tx(tx, &scope_cl.space_id, &del.view, &del.target_note)
+            for removal in rank_removals {
+                let seq = item_ctx.alloc_next_seq()?;
+                let revision = new_revision_id()?;
+                removal
+                    .write_tx(
+                        tx,
+                        &scope_cl,
+                        seq,
+                        visibility_seq,
+                        &revision,
+                        auth.principal(),
+                        now_ts,
+                    )
                     .await?;
+                owner_notes_for_receipt.extend(removal.owners().into_iter().cloned());
+                events.push(removal.event(seq, revision));
             }
 
             for nbr in &planned_neighbor_updates {
@@ -3579,75 +3638,6 @@ async fn bump_closed_collab_session_lineage_tx(
     .await
 }
 
-async fn delete_all_target_overlays_tx(
-    tx: &mut BackendConn<'_>,
-    space_id: &SpaceId,
-    target_note: &NoteId,
-) -> Result<(), PortError> {
-    match tx {
-        BackendConn::Sqlite(conn) => {
-            sqlx::query("DELETE FROM view_rank_overlays WHERE space_id = ? AND target_note_id = ?")
-                .bind(space_id.as_str())
-                .bind(target_note.as_str())
-                .execute(&mut **conn)
-                .await
-                .map_err(|err| {
-                    internal_not_committed("sqlite_rb_del_all_overlays", err.to_string())
-                })?;
-        }
-        BackendConn::Postgres(conn) => {
-            sqlx::query(
-                "DELETE FROM view_rank_overlays WHERE space_id = $1 AND target_note_id = $2",
-            )
-            .bind(space_id.as_str())
-            .bind(target_note.as_str())
-            .execute(&mut **conn)
-            .await
-            .map_err(|err| internal_not_committed("pg_rb_del_all_overlays", err.to_string()))?;
-        }
-    }
-    Ok(())
-}
-
-async fn delete_single_overlay_tx(
-    tx: &mut BackendConn<'_>,
-    space_id: &SpaceId,
-    view: &ViewRef,
-    target_note: &NoteId,
-) -> Result<(), PortError> {
-    match tx {
-        BackendConn::Sqlite(conn) => {
-            sqlx::query(
-                "DELETE FROM view_rank_overlays
-                 WHERE space_id = ? AND view_note_id = ? AND view_key = ? AND target_note_id = ?",
-            )
-            .bind(space_id.as_str())
-            .bind(view.note.as_str())
-            .bind(view.key.as_str())
-            .bind(target_note.as_str())
-            .execute(&mut **conn)
-            .await
-            .map_err(|err| {
-                internal_not_committed("sqlite_rb_del_single_overlay", err.to_string())
-            })?;
-        }
-        BackendConn::Postgres(conn) => {
-            sqlx::query(
-                "DELETE FROM view_rank_overlays
-                 WHERE space_id = $1 AND view_note_id = $2 AND view_key = $3 AND target_note_id = $4",
-            )
-            .bind(space_id.as_str())
-            .bind(view.note.as_str())
-            .bind(view.key.as_str())
-            .bind(target_note.as_str())
-            .execute(&mut **conn)
-            .await
-            .map_err(|err| internal_not_committed("pg_rb_del_single_overlay", err.to_string()))?;
-        }
-    }
-    Ok(())
-}
-
 async fn verify_collisions_and_load_pg_rebind_pubs_tx(
     tx: &mut BackendConn<'_>,
     space_id: &SpaceId,
@@ -4125,6 +4115,7 @@ async fn execute_pg_fast_rollback_on_conn(
             PgSingleFastAttempt::Handled(BatchExecOutcome::Committed {
                 slots: vec![ItemOutcomeSlot::Failed(err)],
                 space_effective_cuts: cuts,
+                visibility_windows: Vec::new(),
             })
         }
         PgFastInnerResult::Committed {
@@ -4158,6 +4149,7 @@ async fn execute_pg_fast_rollback_on_conn(
                     has_idempotency: true,
                 }],
                 space_effective_cuts: cuts,
+                visibility_windows: Vec::new(),
             })
         }
         PgFastInnerResult::UnknownCommit {
@@ -4328,6 +4320,22 @@ async fn try_execute_pg_root_rollback(
             }
         }
     };
+    let visibility = store
+        .inner
+        .live_visibility
+        .for_write(vec![scope.space_id.clone()])
+        .await;
+    if let Err(error) = store
+        .inner
+        .check_writer_epoch(&scope.space_id, writer_epoch)
+    {
+        return Some(Err(error));
+    }
+    if visibility.has_live_state() {
+        // The shared actor updates visibility for the standard and optimized
+        // batch paths. Keep this direct fast path for unprojected Spaces.
+        return None;
+    }
 
     if !writer.is_accepting() || store.inner.shutting_down.load(Ordering::SeqCst) {
         return Some(Err(unavailable_retryable(
