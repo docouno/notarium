@@ -273,7 +273,7 @@ pub struct HeldPages {
     canonical: Arc<CanonicalStore>,
     from: AtomicU64,
     pub reached: Notify,
-    pub lagged: Arc<AtomicU64>,
+    pub lagged: Arc<Notify>,
     released: Notify,
 }
 
@@ -283,7 +283,7 @@ impl HeldPages {
             canonical,
             from: AtomicU64::new(u64::MAX),
             reached: Notify::new(),
-            lagged: Arc::new(AtomicU64::new(0)),
+            lagged: Arc::new(Notify::new()),
             released: Notify::new(),
         }
     }
@@ -339,7 +339,7 @@ impl ChangeBroadcast for HeldPages {
 
 struct Observed {
     inner: Box<dyn ChangeSubscription>,
-    lagged: Arc<AtomicU64>,
+    lagged: Arc<Notify>,
 }
 
 impl ChangeSubscription for Observed {
@@ -351,7 +351,7 @@ impl ChangeSubscription for Observed {
         Box::pin(async move {
             let notice = self.inner.next().await?;
             if matches!(notice, Some(ChangeNotice::Lagged { .. })) {
-                self.lagged.fetch_add(1, Ordering::SeqCst);
+                self.lagged.notify_one();
             }
             Ok(notice)
         })

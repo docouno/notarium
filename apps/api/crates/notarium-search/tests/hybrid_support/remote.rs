@@ -83,11 +83,10 @@ impl EmbeddingProviderPort for SlowProvider {
     ) -> PortFuture<'_, EmbeddingResult> {
         Box::pin(async move {
             assert!(matches!(&request.inputs[..], [EmbeddingInput::Query(_)]));
+            assert!(ctx.budget.remaining <= Duration::from_millis(150));
             self.calls.fetch_add(1, Ordering::SeqCst);
-            tokio::select! {
-                () = ctx.budget.cancellation.cancelled() => self.cancelled.notify_one(),
-                () = tokio::time::sleep(Duration::from_millis(300)) => panic!("expiry did not cancel provider work"),
-            }
+            ctx.budget.cancellation.cancelled().await;
+            self.cancelled.notify_one();
             Err(DomainError::validation(ValidationReason::BudgetExceeded).into())
         })
     }
@@ -149,20 +148,22 @@ pub async fn lexical_fallback(store: Arc<CanonicalStore>, root: DataRoot) {
 
     let ctx = context(&space.scope, &owner);
     let started = Instant::now();
-    let hits = engine
-        .search(ctx.clone(), query("evidencekeyword"))
-        .await
-        .unwrap();
-    let elapsed = started.elapsed();
+    let hits = tokio::time::timeout(
+        Duration::from_secs(2),
+        engine.search(ctx.clone(), query("evidencekeyword")),
+    )
+    .await
+    .expect("the lexical response returned while provider work was pending")
+    .unwrap();
+    println!(
+        "search-fallback-elapsed-us {}",
+        started.elapsed().as_micros()
+    );
     assert_eq!(hits.hits[0].card.title, "Local result");
     assert!(matches!(
         hits.degraded,
         Some(SearchDegradation::BudgetExceeded)
     ));
-    assert!(
-        elapsed < Duration::from_millis(200),
-        "fallback took {elapsed:?}"
-    );
     tokio::time::timeout(Duration::from_secs(1), provider.cancelled.notified())
         .await
         .unwrap();

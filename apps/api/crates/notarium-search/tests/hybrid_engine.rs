@@ -6,7 +6,7 @@ use hybrid_support::{HeldPages, Projection, View, context, mutation};
 use notarium_canonical::{
     CanonicalConfig, CanonicalRuntime, CanonicalStore, S3BucketModePolicy,
     blobs::s3::admin_ensure_bucket,
-    changes::SyntheticNoteSpec,
+    changes::{DEFAULT_BROADCAST_CAPACITY, SyntheticNoteSpec},
     runtime::{CreateFolderSpec, CreateSpaceSpec},
 };
 use notarium_core::{
@@ -40,7 +40,10 @@ use storage::{
     StorageTestFixtures, TempDataRoot, sample_folder_id, sample_incarnation,
     sample_installation_id, sample_note_id, sample_principal_id, sample_space_id,
 };
+use tokio::sync::Mutex;
 
+// Each scenario measures fallback latency against the same storage resources.
+static INTEGRATION_LOCK: Mutex<()> = Mutex::const_new(());
 const SECRET: &str = "rangedisclosureunique";
 const REDACTED: &str = "chatretirementunique";
 const ARMOR: &str = "-----BEGIN AGE ENCRYPTED FILE-----\n\
@@ -222,12 +225,39 @@ async fn run_scenario(store: Arc<CanonicalStore>, root: DataRoot, tag: u8) {
     let vector_mode = VectorMode::DeterministicTest { dimension: 64 };
     let engine = SearchEngine::start(SearchConfig::new(root.clone(), vector_mode.clone()), deps);
     engine.start_space(scope.clone()).unwrap();
-    assert!(
-        acknowledged(&store, &root, scope, seeded.last_seq)
+    let before_lag = acknowledged(&store, &root, scope, seeded.last_seq).await;
+    assert!(before_lag.active_model.is_some());
+    let vectors = root.search(&scope.space_id, SearchIndexKind::Vector);
+    let old_vectors = files(&vectors);
+
+    // Overflow the real ring before any query can prompt a catch-up itself.
+    // Durable folder commands require only a watermark advance.
+    let mut high = seeded.last_seq;
+    pages.hold(high);
+    high = high.checked_next().unwrap();
+    store
+        .fast_forward_space_to_seq_for_test(scope, lease, high)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), pages.reached.notified())
+        .await
+        .unwrap();
+    for _ in 0..=DEFAULT_BROADCAST_CAPACITY {
+        high = high.checked_next().unwrap();
+        store
+            .fast_forward_space_to_seq_for_test(scope, lease, high)
             .await
-            .active_model
-            .is_some()
-    );
+            .unwrap();
+    }
+    projection.snapshot.write().unwrap().advance(high);
+    pages.release();
+    tokio::time::timeout(Duration::from_secs(30), pages.lagged.notified())
+        .await
+        .expect("the search subscriber observed a broadcast overrun");
+    let after_lag = acknowledged(&store, &root, scope, high).await;
+    assert_eq!(after_lag.tantivy_commit, before_lag.tantivy_commit);
+    assert_eq!(old_vectors, files(&vectors));
+
     let initial = engine.search(ctx.clone(), query("needle")).await.unwrap();
     assert_eq!(initial.hits[0].card.title, "Install guide");
     assert!(initial.hits[0].chunks[0].text().contains("needle"));
@@ -241,7 +271,7 @@ async fn run_scenario(store: Arc<CanonicalStore>, root: DataRoot, tag: u8) {
         "Install guide"
     );
 
-    pages.hold(seeded.last_seq);
+    pages.hold(high);
     let (first, exact) = store
         .commit_synthetic_note_batch_for_test(
             scope,
@@ -332,7 +362,6 @@ async fn run_scenario(store: Arc<CanonicalStore>, root: DataRoot, tag: u8) {
     pages.release();
     let before_move = acknowledged(&store, &root, scope, range.last_seq).await;
     let tantivy = root.search(&scope.space_id, SearchIndexKind::Tantivy);
-    let vectors = root.search(&scope.space_id, SearchIndexKind::Vector);
     let old_vectors = files(&vectors);
     let moved = store
         .move_folder(
@@ -365,32 +394,6 @@ async fn run_scenario(store: Arc<CanonicalStore>, root: DataRoot, tag: u8) {
     let contained = engine.search(ctx.clone(), scoped).await.unwrap();
     assert_eq!(contained.hits.len(), 1);
     assert_eq!(contained.hits[0].card.title, "Latest version");
-
-    // Hold the log reader long enough to overflow the real broadcast queue.
-    // Durable folder commands require only a watermark advance.
-    let mut high = moved.receipt.seq();
-    pages.hold(high);
-    high = high.checked_next().unwrap();
-    store
-        .fast_forward_space_to_seq_for_test(scope, lease, high)
-        .await
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(3), pages.reached.notified())
-        .await
-        .unwrap();
-    for _ in 0..1025 {
-        high = high.checked_next().unwrap();
-        store
-            .fast_forward_space_to_seq_for_test(scope, lease, high)
-            .await
-            .unwrap();
-    }
-    projection.snapshot.write().unwrap().advance(high);
-    pages.release();
-    let after_lag = acknowledged(&store, &root, scope, high).await;
-    assert!(pages.lagged.load(std::sync::atomic::Ordering::SeqCst) > 0);
-    assert_eq!(after_lag.tantivy_commit, after_move.tantivy_commit);
-    assert_eq!(old_vectors, files(&vectors));
 
     let thread = ChatThreadId::from_bytes([tag; 16]);
     store
@@ -589,6 +592,7 @@ async fn run_scenario(store: Arc<CanonicalStore>, root: DataRoot, tag: u8) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sqlite_hybrid_seed_causal_boundaries_and_scrub() {
+    let _guard = INTEGRATION_LOCK.lock().await;
     let data = TempDataRoot::new("search-sqlite");
     let (store, runtime) = CanonicalRuntime::open(CanonicalConfig::local_default(
         sample_installation_id(0x42),
@@ -605,6 +609,7 @@ async fn sqlite_hybrid_seed_causal_boundaries_and_scrub() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn postgres_hybrid_seed_causal_boundaries_and_scrub() {
+    let _guard = INTEGRATION_LOCK.lock().await;
     let data = TempDataRoot::new("search-pg");
     let fixtures = StorageTestFixtures::load_required();
     let schema = fixtures.fresh_pg_schema();

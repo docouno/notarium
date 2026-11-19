@@ -82,6 +82,17 @@ the query uses lexical ranking and cancellation signals the active backend.
 PostgreSQL 16 with S3. The latter pair uses disposable fixtures reached over
 Unix sockets. Missing fixtures fail the relevant tests.
 
+The two-dialect integration checks the interactive provider budget, lexical
+fallback, and provider cancellation. To measure the full fallback response
+against the 200 ms target, run the scenarios sequentially on an idle runner.
+The command prints one `search-fallback-elapsed-us` sample per dialect.
+
+```sh
+sh docker/storage-fixtures/with-storage-fixtures.sh exec-custom \
+  sh .devkit/runtime/devkit.sh cli exec --component apps/api --network none -- \
+  cargo test --locked --offline --workspace --test hybrid_engine -- --nocapture --test-threads=1
+```
+
 ```sh
 mkdir -p .artifacts/search-scale
 make benchmark-search > .artifacts/search-scale/report.json

@@ -228,17 +228,25 @@ async fn consume(
     let mut ticker = interval(Duration::from_secs(1));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
-        let event = tokio::select! {
-            biased;
-            () = cx.handle.stop.cancelled() => return Ok(None),
-            notice = subscription.next() => match notice? {
-                Some(notice) => notice,
-                None => return Err(IndexError::Inconsistent),
-            },
-            () = cx.handle.wake.notified() => ChangeNotice::Lagged { resume: subscription.processed().clone() },
-            _ = ticker.tick() => {
-                if let Some(disk) = &mut disk { update::maintain_vectors(disk, publisher).await?; }
-                continue;
+        let event = {
+            let resume = subscription.processed().clone();
+            let next = subscription.next();
+            tokio::pin!(next);
+            loop {
+                break tokio::select! {
+                    biased;
+                    () = cx.handle.stop.cancelled() => return Ok(None),
+                    notice = &mut next => notice?.ok_or(IndexError::Inconsistent)?,
+                    () = cx.handle.wake.notified() => ChangeNotice::Lagged { resume },
+                    _ = ticker.tick() => {
+                        // Resolving a consumed ring signal can require a durable read.
+                        // Keep that read alive across idle vector maintenance.
+                        if let Some(disk) = &mut disk {
+                            update::maintain_vectors(disk, publisher).await?;
+                        }
+                        continue;
+                    }
+                };
             }
         };
         if let ChangeNotice::Resync { scope } = event {
