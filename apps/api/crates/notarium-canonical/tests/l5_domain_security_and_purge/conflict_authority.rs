@@ -33,6 +33,7 @@ pub(super) async fn check(
         slug: rename.slug.clone(),
     };
     let link = Link {
+        target_title: None,
         source: note.clone(),
         target: LinkTarget::Folder(project.clone()),
         relation: "related".into(),
@@ -78,6 +79,7 @@ pub(super) async fn check(
     assert_conflict(links.items.into_iter().next().unwrap().unwrap_err().into());
 
     let create = CreateNote {
+        folder_page: false,
         note: note.clone(),
         parent: None,
         slug: "collision".into(),

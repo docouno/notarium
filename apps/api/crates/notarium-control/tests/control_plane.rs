@@ -96,6 +96,7 @@ async fn run_concurrent_load_pool_isolation_and_untainted_metadata(pg: bool) {
     fixture.catalog.project_entries.lock().unwrap().insert(
         (project.space_id.clone(), project.folder_id.clone()),
         ProjectInfo {
+            project_slug: "project".into(),
             folder: project.clone(),
             name: "Shared project".into(),
         },
@@ -113,6 +114,7 @@ async fn run_concurrent_load_pool_isolation_and_untainted_metadata(pg: bool) {
             facts: ResourceFacts {
                 space: shared.space.clone(),
                 class: DocClass::UserDoc,
+                project: Some(project.folder_id.clone()),
                 ancestor_folders: vec![project.folder_id.clone()],
                 folder_write_locked: false,
                 ability_package: None,
@@ -142,6 +144,7 @@ async fn run_concurrent_load_pool_isolation_and_untainted_metadata(pg: bool) {
             facts: ResourceFacts {
                 space: personal_space.clone(),
                 class: DocClass::UserDoc,
+                project: None,
                 ancestor_folders: vec![],
                 folder_write_locked: false,
                 ability_package: None,
@@ -186,13 +189,16 @@ async fn run_concurrent_load_pool_isolation_and_untainted_metadata(pg: bool) {
         .lock()
         .unwrap()
         .push(AbilityDescriptor {
+            attached_skills: vec![],
+            promoted_from: None,
+            requires_explicit_binding: false,
             reference: ability_ref.clone(),
             kind: AbilityKind::Role,
             name: "shared-role".into(),
             enabled: true,
             healthy: true,
             lifecycle: Lifecycle::Active,
-            entrypoint: ability_note.clone(),
+            entrypoint: Some(ability_note.clone()),
             auxiliary_files: vec![],
         });
     fixture.catalog.note_entries.lock().unwrap().insert(
@@ -203,6 +209,7 @@ async fn run_concurrent_load_pool_isolation_and_untainted_metadata(pg: bool) {
             facts: ResourceFacts {
                 space: shared.space.clone(),
                 class: DocClass::Skill,
+                project: None,
                 ancestor_folders: vec![],
                 folder_write_locked: false,
                 ability_package: Some(ability_ref.id),
@@ -307,6 +314,7 @@ async fn run_concurrent_load_pool_isolation_and_untainted_metadata(pg: bool) {
     let personal_facts = ResourceFacts {
         space: personal_space,
         class: DocClass::UserDoc,
+        project: None,
         ancestor_folders: vec![],
         folder_write_locked: false,
         ability_package: None,
@@ -603,6 +611,29 @@ async fn run_concurrent_load_pool_isolation_and_untainted_metadata(pg: bool) {
         task.await.unwrap().expect(
             "concurrent identical client-ID inserts must be idempotent without transaction abort",
         );
+    }
+
+    let proposal_reader = plane
+        .revalidate_proposal_human(ctx.clone(), ProposalHumanAccess::ReadOnly)
+        .await
+        .unwrap();
+    proposal_reader.authorize_proposal_read().unwrap();
+    assert!(
+        plane
+            .revalidate_auth(AccountContext::new(proposal_reader, budget()))
+            .await
+            .is_err()
+    );
+    control
+        .logout(evidence(AuthEvidenceKind::Session, token.expose()))
+        .await
+        .unwrap();
+    for access in [ProposalHumanAccess::ReadOnly, ProposalHumanAccess::Write] {
+        let error = plane
+            .revalidate_proposal_human(ctx.clone(), access)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "authentication_failed");
     }
 
     drop(trusted);

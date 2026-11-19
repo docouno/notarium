@@ -14,7 +14,7 @@ use notarium_core::{
         PrincipalId, RevisionId, SpaceSeq, ThreadEntrySeq, ViewKey,
     },
     model::Lifecycle,
-    ports::{ChatThreadKind, GroupKey},
+    ports::{AbilityRef, ChatThreadKind, GroupKey},
     query::{FieldObservation, FieldSchema, FieldValue},
     value::{Timestamp, YamlValue},
 };
@@ -406,6 +406,8 @@ pub enum RevisionMetadataPayload {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct NoteRevisionMetadata {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub folder_page: bool,
     pub note_id: NoteId,
     pub parent_folder_id: FolderId,
     pub is_root_child: bool,
@@ -426,6 +428,9 @@ pub struct NoteRevisionMetadata {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FolderRevisionMetadata {
+    /// Only folder creations inside one confirmed proposal share this witness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmation: Option<ContentDigest>,
     pub folder_id: FolderId,
     pub parent_folder_id: Option<FolderId>,
     pub is_root: bool,
@@ -461,6 +466,12 @@ pub struct AbilityRevisionMetadata {
     pub lifecycle: Lifecycle,
     pub resources: BTreeMap<String, ContentDigest>,
     pub total_bytes: u64,
+    #[serde(default)]
+    pub attached_skills: Vec<AbilityRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promoted_from: Option<AbilityRef>,
+    #[serde(default)]
+    pub requires_explicit_binding: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

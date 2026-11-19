@@ -2,6 +2,7 @@
 #[allow(dead_code)]
 #[path = "../../notarium-control/tests/support/mod.rs"]
 mod support;
+use notarium_agents::abilities::{SystemAbilityCatalog, read_system_ability};
 use notarium_canonical::{
     CanonicalConfig, CanonicalRuntime, CanonicalStore, CreateFolderSpec, PgConnectConfig,
     PgTransport, SqlBackendConfig,
@@ -10,7 +11,7 @@ use notarium_control::service::{AuthenticationMode, ControlConfig, ControlServic
 use notarium_core::{
     DomainError,
     auth::*,
-    classes::{AbilityKind, DocClass},
+    classes::{AbilityKind, DocClass, ProviderCurrentContent, ProviderOrigin},
     epoch::DataRoot,
     error::PortError,
     ids::*,
@@ -152,10 +153,28 @@ async fn exercise(pg: bool) {
     let target = MemoryTarget::User {
         owner: owner.clone(),
     };
+    let absent = control
+        .inspect_memory_target(account.clone(), target.clone(), "architecture".into())
+        .await
+        .unwrap();
+    assert!(absent.revision.is_none());
+    assert!(matches!(
+        canonical
+            .note(account.clone(), absent.resolved.note.clone())
+            .await,
+        Err(PortError::Domain(DomainError::ResourceNotFound))
+    ));
     let memory = control
         .resolve_memory_target(account.clone(), target.clone(), "architecture".into())
         .await
         .unwrap();
+    let present = control
+        .inspect_memory_target(account.clone(), target.clone(), "architecture".into())
+        .await
+        .unwrap();
+    assert_eq!(absent.resolved.note, present.resolved.note);
+    assert_eq!(present.resolved.note, memory.note);
+    assert!(present.revision.is_some());
     assert_eq!(
         control
             .resolve_memory_target(account.clone(), target, "architecture".into())
@@ -173,7 +192,11 @@ async fn exercise(pg: bool) {
                 active_epoch: first.active_epoch,
                 folder_id: FolderId::from_bytes([tag; 16]),
                 parent: None,
-                slug: name.clone(),
+                slug: if tag == 1 {
+                    "physical-folder-one".into()
+                } else {
+                    name.clone()
+                },
                 display_name: name.clone(),
                 is_project: true,
                 project_slug: Some(name),
@@ -203,6 +226,44 @@ async fn exercise(pg: bool) {
         second.items[0].folder.folder_id,
         FolderId::from_bytes([2; 16])
     );
+    let named = canonical
+        .project_by_slug(scoped.clone(), "PROJECT-1".into())
+        .await
+        .unwrap();
+    assert_eq!(named.folder.folder_id, FolderId::from_bytes([1; 16]));
+    assert!(
+        canonical
+            .project_by_slug(scoped.clone(), "physical-folder-one".into())
+            .await
+            .is_err()
+    );
+    canonical
+        .rename_project(
+            scoped.clone(),
+            mutation(
+                &scoped,
+                209,
+                RenameProject {
+                    folder: FolderId::from_bytes([2; 16]),
+                    name: "renamed-project".into(),
+                    display_name: "Renamed project".into(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let alias = canonical
+        .project_by_slug(scoped.clone(), "project-2".into())
+        .await
+        .unwrap();
+    assert_eq!(alias.project_slug, "renamed-project");
+    assert_eq!(alias.folder.folder_id, FolderId::from_bytes([2; 16]));
+    let latest = canonical.read_space(&sid).await.unwrap();
+    let visible = control
+        .list_spaces(account.clone(), ControlPageRequest::new(1, None).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(visible.items[0].last_seq, latest.last_seq);
     let restricted = account
         .auth()
         .for_pat(std::collections::BTreeMap::from([(
@@ -215,6 +276,14 @@ async fn exercise(pg: bool) {
             },
         )]))
         .unwrap();
+    let limited_space =
+        SpaceContext::new(restricted.clone(), first.scope.clone(), budget()).unwrap();
+    assert!(matches!(
+        canonical
+            .project_by_slug(limited_space, "project-2".into())
+            .await,
+        Err(PortError::Domain(DomainError::ResourceNotFound))
+    ));
     let private = AccountContext::new(restricted, budget());
     assert!(matches!(
         canonical.note(private, memory.note.clone()).await,
@@ -229,6 +298,7 @@ async fn exercise(pg: bool) {
                 &scoped,
                 51,
                 CreateNote {
+                    folder_page: false,
                     note: entry.clone(),
                     parent: None,
                     slug: "my-skill".into(),
@@ -269,11 +339,14 @@ async fn exercise(pg: bool) {
                 &scoped,
                 52,
                 PublishAbilityPackage {
+                    attached_skills: vec![],
                     ability: ability.clone(),
                     kind: AbilityKind::Skill,
                     entrypoint: entry.clone(),
                     files,
                     expected_package_revision: None,
+                    expected_entrypoint_revision: None,
+                    requires_explicit_binding: false,
                 },
             ),
         )
@@ -298,6 +371,7 @@ async fn exercise(pg: bool) {
             .iter()
             .all(|name| name.len() == MAX_ABILITY_AUX_PATH_BYTES)
     );
+    builtins_after_owned_page(&canonical, &account, scoped.scope(), &value.reference).await;
     let project = notarium_core::model::FolderRef {
         space_id: sid.clone(),
         folder_id: FolderId::from_bytes([2; 16]),
@@ -324,6 +398,7 @@ async fn exercise(pg: bool) {
     assert_eq!(project_page.items.len(), 1);
     assert_eq!(project_page.items[0].folder, project);
     assert!(project_page.continuation.is_none());
+    empty_folder_disclosure(&canonical, &account, &scoped, &first, &project).await;
 
     // The tip still names the manifest published at the personal root.
     let move_entry = |key, parent| {
@@ -383,6 +458,7 @@ async fn exercise(pg: bool) {
                     &scoped,
                     60 + tag,
                     CreateNote {
+                        folder_page: false,
                         note: new_entry.clone(),
                         parent: Some(project.folder_id.clone()),
                         slug: format!("visible-{tag}"),
@@ -400,11 +476,14 @@ async fn exercise(pg: bool) {
                     &scoped,
                     80 + tag,
                     PublishAbilityPackage {
+                        attached_skills: vec![],
                         ability: AbilityId::from_bytes([tag; 16]),
                         kind: AbilityKind::Skill,
                         entrypoint: new_entry,
                         files: vec![],
                         expected_package_revision: None,
+                        expected_entrypoint_revision: None,
+                        requires_explicit_binding: false,
                     },
                 ),
             )
@@ -493,10 +572,13 @@ async fn exercise(pg: bool) {
                 53,
                 PublishAbilityPackage {
                     ability,
+                    attached_skills: vec![],
                     kind: AbilityKind::Skill,
                     entrypoint: entry,
                     files: Vec::new(),
                     expected_package_revision: Some(previous.revision.clone()),
+                    expected_entrypoint_revision: None,
+                    requires_explicit_binding: false,
                 },
             ),
         )
@@ -669,6 +751,216 @@ async fn exercise(pg: bool) {
     if pg {
         std::fs::remove_dir_all(path).unwrap();
     }
+}
+
+async fn empty_folder_disclosure(
+    canonical: &CanonicalStore,
+    account: &AccountContext,
+    scoped: &SpaceContext,
+    space: &notarium_canonical::SpaceRecord,
+    project: &notarium_core::model::FolderRef,
+) {
+    let folder = notarium_core::model::FolderRef {
+        space_id: project.space_id.clone(),
+        folder_id: FolderId::from_bytes([29; 16]),
+    };
+    canonical
+        .create_folder(CreateFolderSpec {
+            scope: space.scope.clone(),
+            active_epoch: space.active_epoch,
+            folder_id: folder.folder_id.clone(),
+            parent: Some(project.folder_id.clone()),
+            slug: "empty".into(),
+            display_name: "Empty folder".into(),
+            is_project: false,
+            project_slug: None,
+            actor: account.auth().principal().clone(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+    let metadata = canonical
+        .disclosure(account.clone(), CatalogDisclosure::Folder(folder.clone()))
+        .await
+        .unwrap();
+    let text =
+        notarium_core::classes::ClassEgressFence::mcp_metadata(&metadata, account.auth()).unwrap();
+    assert!(text.contains("Empty folder"));
+    let origin = metadata.current().origin();
+    let request = ProviderEgressRequest {
+        origins: vec![origin.clone()],
+        primary: space.scope.clone(),
+        project: Some(project.clone()),
+        secondary_projects: vec![],
+    };
+    let mut lease = canonical
+        .acquire_egress(account.clone(), request.clone(), Cancellation::default())
+        .await
+        .unwrap();
+    assert_eq!(lease.current()[0].origin(), origin);
+    assert!(lease.current()[0].in_project(project));
+    lease.mark_dispatched();
+    canonical
+        .rename_folder(
+            scoped.clone(),
+            mutation(
+                scoped,
+                96,
+                RenameFolder {
+                    folder: folder.folder_id,
+                    name: "renamed".into(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        canonical
+            .acquire_egress(account.clone(), request, Cancellation::default())
+            .await,
+        Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
+            if diagnostic.reason == notarium_core::error::ValidationReason::SourceMismatch
+    ));
+    lease.check().unwrap();
+}
+
+async fn builtins_after_owned_page(
+    canonical: &CanonicalStore,
+    account: &AccountContext,
+    space: &notarium_core::model::HistoryScope,
+    owned: &AbilityRef,
+) {
+    let catalog = SystemAbilityCatalog::new(Arc::new(canonical.clone()));
+    let query = |continuation| AbilityQuery {
+        page: ControlPageRequest::new(1, continuation).unwrap(),
+        project: None,
+        kind: None,
+        name: None,
+        authoring: false,
+    };
+    let page = catalog
+        .abilities(account.clone(), query(None))
+        .await
+        .unwrap();
+    assert_eq!(page.items[0].reference, *owned);
+    let cursor = page.continuation.unwrap();
+    assert!(cursor.len() <= 2048);
+    let mut changed = query(Some(cursor.clone()));
+    changed.kind = Some(AbilityKind::Role);
+    assert!(matches!(
+        catalog.abilities(account.clone(), changed).await,
+        Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
+            if diagnostic.reason == notarium_core::error::ValidationReason::CursorStale
+    ));
+
+    let mut names = Vec::new();
+    let mut next = Some(cursor);
+    let mut role = None;
+    while let Some(cursor) = next.take() {
+        let page = catalog
+            .abilities(account.clone(), query(Some(cursor)))
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 1);
+        let item = &page.items[0];
+        assert_eq!(item.reference.placement, AbilityPlacement::System);
+        assert!(item.entrypoint.is_none());
+        names.push(item.name.clone());
+        if item.name == "research" {
+            role = Some(item.clone());
+        }
+        assert!(names.len() <= 4);
+        next = page.continuation;
+    }
+    assert_eq!(
+        names,
+        [
+            "research",
+            "research-evidence",
+            "grooming",
+            "grooming-evidence"
+        ]
+    );
+    let role = role.unwrap();
+    let skill = role.attached_skills[0].clone();
+    let lease = catalog
+        .pin_schedule_abilities(
+            account.clone(),
+            vec![owned.clone(), role.reference.clone(), skill],
+        )
+        .await
+        .unwrap();
+    assert_eq!(lease.abilities().len(), 3);
+    drop(lease);
+
+    let body = read_system_ability(account, &role.reference).unwrap();
+    assert!(!body.text().is_empty());
+    let origin = body.origin();
+    let owned_body = canonical
+        .read_ability_resource(
+            SpaceContext::new(account.auth().clone(), space.clone(), budget()).unwrap(),
+            ReadAbilityResource {
+                ability: owned.id.clone(),
+                package_revision: owned.revision.clone(),
+                resource: notarium_core::model::AbilityResourceName::Entrypoint,
+            },
+        )
+        .await
+        .unwrap();
+    let origins = vec![origin.clone(), owned_body.origin()];
+    let request = |origins| ProviderEgressRequest {
+        primary: space.clone(),
+        origins,
+        project: None,
+        secondary_projects: vec![],
+    };
+    let lease = catalog
+        .acquire_egress(
+            account.clone(),
+            request(origins.clone()),
+            Cancellation::default(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        lease.current(),
+        [
+            ProviderCurrentContent::SystemAbility { .. },
+            ProviderCurrentContent::Ability { .. }
+        ]
+    ));
+    assert_eq!(
+        lease
+            .current()
+            .iter()
+            .map(ProviderCurrentContent::origin)
+            .collect::<Vec<_>>(),
+        origins
+    );
+    lease.check().unwrap();
+    drop(lease);
+
+    let ProviderOrigin::SystemAbility {
+        ability, revision, ..
+    } = origin
+    else {
+        panic!("built-in source");
+    };
+    let wrong_digest = ProviderOrigin::SystemAbility {
+        ability,
+        revision,
+        digest: ContentDigest::from_bytes([0; 32]),
+    };
+    assert!(matches!(
+        catalog
+            .acquire_egress(
+                account.clone(),
+                request(vec![wrong_digest]),
+                Cancellation::default()
+            )
+            .await,
+        Err(PortError::Domain(DomainError::ResourceNotFound))
+    ));
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sqlite_catalog_account_recovery() {

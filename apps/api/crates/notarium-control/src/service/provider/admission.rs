@@ -25,7 +25,7 @@ use notarium_core::{
     ports::*,
 };
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub(super) struct Snapshot {
     pub resource: ProviderResourcesRow,
@@ -47,6 +47,7 @@ pub(super) struct DispatchAuthority<'a> {
     pub ctx: &'a AccountContext,
     pub primary: Option<&'a CatalogSpace>,
     pub project: Option<&'a FolderRef>,
+    pub secondary_projects: &'a [FolderRef],
     pub parts: &'a [ProviderMessage],
     pub current: &'a [ProviderCurrentContent],
     pub keeper: Option<&'a crate::service::schedules::PrecheckedKeeper>,
@@ -122,6 +123,7 @@ impl ProviderService {
             ctx,
             primary,
             project,
+            secondary_projects,
             parts,
             current,
             keeper,
@@ -172,22 +174,48 @@ impl ProviderService {
         if let Some(primary) = primary {
             spaces.insert(primary.space.id.clone(), primary.space.clone());
         }
-        if current.len() > 4096 || parts.len() > 4096 {
+        if current.len() > MAX_PROVIDER_ORIGINS || parts.len() > MAX_PROVIDER_ORIGINS {
             return Err(invalid(ValidationReason::InvalidLimit));
         }
         let mut metadata = BTreeMap::new();
         for item in current {
+            if let ProviderCurrentContent::Ability {
+                reference,
+                provenance,
+                promoted_from,
+                requires_explicit_binding,
+                ..
+            } = item
+            {
+                let identity = AbilityIdentity {
+                    id: reference.ability.clone(),
+                    placement: provenance.current.placement.clone(),
+                };
+                if !self
+                    .control
+                    .promotion_is_committed(tx, promoted_from.as_ref(), &identity)
+                    .await?
+                {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+                if *requires_explicit_binding
+                    && !self.control.has_ability_binding(tx, &identity).await?
+                {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+            }
             let origin = json(&item.origin())?;
             if metadata.insert(origin, item).is_some() {
                 return Err(invalid(ValidationReason::SourceMismatch));
             }
-            if let Some(old) = spaces.insert(item.space().id.clone(), item.space().clone())
-                && old != *item.space()
+            if let Some(space) = item.space()
+                && let Some(old) = spaces.insert(space.id.clone(), space.clone())
+                && old != *space
             {
                 return Err(invalid(ValidationReason::SourceMismatch));
             }
         }
-        if spaces.len() > 64 {
+        if spaces.len() > MAX_PROVIDER_SOURCE_SPACES {
             return Err(invalid(ValidationReason::InvalidLimit));
         }
         if primary.is_none()
@@ -204,6 +232,26 @@ impl ProviderService {
                 return Err(DomainError::AccessDenied.into());
             }
         }
+        let mut project_by_space: BTreeMap<&SpaceId, Option<&FolderRef>> = BTreeMap::new();
+        for project in secondary_projects {
+            if !spaces.contains_key(&project.space_id)
+                || primary.is_some_and(|primary| primary.space.id == project.space_id)
+            {
+                return Err(invalid(ValidationReason::SourceMismatch));
+            }
+            project_by_space
+                .entry(&project.space_id)
+                .and_modify(|current| {
+                    if *current != Some(project) {
+                        // Distinct projects can be disclosed with Space-wide consent only.
+                        *current = None;
+                    }
+                })
+                .or_insert(Some(project));
+        }
+        if let Some(primary) = primary {
+            project_by_space.insert(&primary.space.id, project);
+        }
         let mut policies: BTreeMap<SpaceId, PolicyAdmission> = BTreeMap::new();
         let now = self.control.clock.now_ms()?;
         for space in spaces.values() {
@@ -215,23 +263,30 @@ impl ProviderService {
                     &resource,
                     credential_epoch,
                     space,
-                    project,
+                    project_by_space.get(&space.id).copied().flatten(),
                     now,
                     true,
                 )
                 .await?,
             );
         }
-        let mut used = std::collections::BTreeSet::new();
+        let policy_for = |source: &ProviderCurrentContent| {
+            let space = source
+                .space()
+                .or_else(|| primary.map(|value| &value.space))
+                .ok_or_else(selection::unavailable)?;
+            policies.get(&space.id).ok_or_else(selection::unavailable)
+        };
+        let mut used = BTreeSet::new();
+        let mut checked_dependencies = BTreeSet::new();
+        let mut dependencies = Vec::new();
         for part in parts {
             let origin = json(&part.origin())?;
             used.insert(origin.clone());
             let metadata = metadata
                 .get(&origin)
                 .ok_or_else(|| invalid(ValidationReason::SourceMismatch))?;
-            let admitted = policies
-                .get(&metadata.space().id)
-                .ok_or_else(selection::unavailable)?;
+            let admitted = policy_for(metadata)?;
             if admitted
                 .project_only
                 .as_ref()
@@ -240,39 +295,93 @@ impl ProviderService {
                 return Err(DomainError::AccessDenied.into());
             }
             ClassEgressFence::revalidate(part, &auth, &admitted.policy, metadata)?;
+            dependencies.push(*metadata);
+        }
+        while let Some(source) = dependencies.pop() {
+            if !checked_dependencies.insert(json(&source.origin())?) {
+                continue;
+            }
+            let Some(proof) = source.provenance() else {
+                continue;
+            };
+            for witnessed in &proof.projects {
+                if !secondary_projects.contains(witnessed) && Some(witnessed) != project {
+                    return Err(invalid(ValidationReason::SourceMismatch));
+                }
+            }
+            for origin in &proof.origins {
+                let key = json(origin)?;
+                let dependency = metadata
+                    .get(&key)
+                    .ok_or_else(|| invalid(ValidationReason::SourceMismatch))?;
+                let admitted = policy_for(dependency)?;
+                if admitted
+                    .project_only
+                    .as_ref()
+                    .is_some_and(|project| !dependency.in_project(project))
+                {
+                    return Err(DomainError::AccessDenied.into());
+                }
+                ClassEgressFence::revalidate_origin(&auth, &admitted.policy, dependency)?;
+                if used.insert(key) {
+                    dependencies.push(dependency);
+                }
+            }
         }
         if used.len() != metadata.len() {
             return Err(invalid(ValidationReason::SourceMismatch));
         }
-        let mut selectors = vec![
-            RevocationSelector::Principal(auth.principal().clone()),
-            RevocationSelector::Principal(PrincipalId::parse(&resource.owner_id)?),
-            RevocationSelector::Grant(auth.grant().clone()),
-            RevocationSelector::ProviderResource(ProviderResourceId::parse(&resource.id)?),
-        ];
-        if let Some(credential) = &snapshot.credential {
-            selectors.push(RevocationSelector::Credential(CredentialId::parse(
-                &credential.id,
-            )?));
+        if let Some(keeper) = keeper {
+            for approved in keeper.approved() {
+                if !parts.iter().any(|part| {
+                    let Ok(key) = json(&part.origin()) else {
+                        return false;
+                    };
+                    match metadata.get(&key).copied() {
+                        Some(ProviderCurrentContent::Ability {
+                            reference,
+                            provenance,
+                            ..
+                        }) => {
+                            reference.ability == approved.id
+                                && reference.package_revision == approved.revision
+                                && provenance.current.placement == approved.placement
+                                && matches!(
+                                    reference.resource,
+                                    notarium_core::model::AbilityResourceName::Entrypoint
+                                )
+                        }
+                        Some(ProviderCurrentContent::SystemAbility {
+                            ability, revision, ..
+                        }) => {
+                            approved.placement == AbilityPlacement::System
+                                && ability == &approved.id
+                                && revision == &approved.revision
+                        }
+                        _ => false,
+                    }
+                }) {
+                    return Err(invalid(ValidationReason::SourceMismatch));
+                }
+            }
         }
-        let expires_at_ms=match auth.credential().ok_or(DomainError::AuthenticationFailed)? {
-            AuthenticatedCredential::Session(id)=>{selectors.push(RevocationSelector::Session(id.clone()));Some(rows!(tx,(i64,),fetch_one,"SELECT expires_at FROM sessions WHERE session_id=$1","SELECT expires_at FROM v1_control.sessions WHERE session_id=$1";id.as_str())?.0)},
-            AuthenticatedCredential::Pat(id)=>rows!(tx,(Option<i64>,),fetch_one,"SELECT expires_at FROM pats WHERE token_id=$1","SELECT expires_at FROM v1_control.pats WHERE token_id=$1";id.as_str())?.0,
-            AuthenticatedCredential::OAuth{token,grant,family}=>{selectors.push(RevocationSelector::OAuthAccess(token.clone()));selectors.push(RevocationSelector::OAuthGrant(grant.clone()));if let Some(family)=family{selectors.push(RevocationSelector::OAuthFamily(family.clone()));}Some(rows!(tx,(i64,),fetch_one,"SELECT expires_at FROM oauth_access_tokens WHERE token_id=$1","SELECT expires_at FROM v1_control.oauth_access_tokens WHERE token_id=$1";token.as_str())?.0)},
-            AuthenticatedCredential::TrustedNone=>None,
-            AuthenticatedCredential::ScheduledRun{schedule,run,..}=>{
-                selectors.push(RevocationSelector::Schedule(schedule.clone()));
-                selectors.push(RevocationSelector::ScheduledRun(run.clone()));
-                Some(rows!(tx,(i64,),fetch_one,"SELECT expires_at FROM agent_schedule_runs WHERE run_id=$1","SELECT expires_at FROM v1_control.agent_schedule_runs WHERE run_id=$1";run.as_str())?.0)
-            },
+        let mut selectors = auth.selectors_for_revocation(spaces.keys())?;
+        let revocation_scope = ProviderRevocationScope {
+            owner: PrincipalId::parse(&resource.owner_id)?,
+            credential: snapshot
+                .credential
+                .as_ref()
+                .map(|row| CredentialId::parse(&row.id))
+                .transpose()?,
         };
-        for space in spaces.keys() {
-            selectors.push(RevocationSelector::Space(space.clone()));
-            selectors.push(RevocationSelector::Membership {
-                space: space.clone(),
-                principal: auth.principal().clone(),
-            });
-        }
+        selectors.extend(revocation_scope.selectors(&ProviderResourceId::parse(&resource.id)?));
+        let expires_at_ms=match auth.credential().ok_or(DomainError::AuthenticationFailed)? {
+            AuthenticatedCredential::Session(id)=>Some(rows!(tx,(i64,),fetch_one,"SELECT expires_at FROM sessions WHERE session_id=$1","SELECT expires_at FROM v1_control.sessions WHERE session_id=$1";id.as_str())?.0),
+            AuthenticatedCredential::Pat(id)=>rows!(tx,(Option<i64>,),fetch_one,"SELECT expires_at FROM pats WHERE token_id=$1","SELECT expires_at FROM v1_control.pats WHERE token_id=$1";id.as_str())?.0,
+            AuthenticatedCredential::OAuth{token,..}=>Some(rows!(tx,(i64,),fetch_one,"SELECT expires_at FROM oauth_access_tokens WHERE token_id=$1","SELECT expires_at FROM v1_control.oauth_access_tokens WHERE token_id=$1";token.as_str())?.0),
+            AuthenticatedCredential::TrustedNone=>None,
+            AuthenticatedCredential::ScheduledRun{run,..}=>Some(rows!(tx,(i64,),fetch_one,"SELECT expires_at FROM agent_schedule_runs WHERE run_id=$1","SELECT expires_at FROM v1_control.agent_schedule_runs WHERE run_id=$1";run.as_str())?.0),
+        };
         let expires_at_ms = policies
             .values()
             .filter_map(|policy| policy.expires_at_ms)
@@ -280,7 +389,7 @@ impl ProviderService {
             .min();
         Ok(Validated {
             auth,
-            selectors,
+            selectors: selectors.into_iter().collect(),
             spaces: spaces.into_keys().collect(),
             expires_at_ms,
         })

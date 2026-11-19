@@ -1,7 +1,41 @@
 use super::{PortFuture, SpaceContext, types::*};
 use crate::{ids::*, model::*, query::*};
+use std::collections::BTreeMap;
 
 pub trait NoteReadPort: Send + Sync {
+    fn resolve_folder_path(
+        &self,
+        ctx: SpaceContext,
+        base: Option<FolderId>,
+        path: String,
+    ) -> PortFuture<'_, Option<FolderSnapshot>>;
+    fn list_child_folders(
+        &self,
+        ctx: SpaceContext,
+        base: Option<FolderId>,
+        after: Option<FolderId>,
+        limit: PageLimit,
+    ) -> PortFuture<'_, ChildFolders>;
+    fn resolve_note_target(
+        &self,
+        ctx: SpaceContext,
+        parent: Option<FolderId>,
+        slug_title_or_id: String,
+    ) -> PortFuture<'_, Option<NoteRef>>;
+    fn space_schema(&self, ctx: SpaceContext) -> PortFuture<'_, BTreeMap<String, FieldSchema>>;
+    /// Aggregate only visible notes from the exact project and requested history.
+    /// Counts and the source cut use the caller's live class and project grants.
+    fn project_note_counts(
+        &self,
+        ctx: SpaceContext,
+        project: FolderRef,
+        causal: crate::receipt::CausalBasis,
+    ) -> PortFuture<'_, ProjectNoteCounts>;
+    fn prepare_agent_run_rollback(
+        &self,
+        ctx: SpaceContext,
+        run: AgentRunId,
+    ) -> PortFuture<'_, RollbackAgentRun>;
     /// Read exactly one committed protected package resource. The canonical owner
     /// checks Space/history, live package visibility and authorization before
     /// returning bytes; a missing revision/resource never falls back to latest.
@@ -28,6 +62,11 @@ pub trait NoteReadPort: Send + Sync {
     ) -> PortFuture<'_, ChangeReadResult>;
 }
 pub trait NoteWritePort: Send + Sync {
+    fn ensure_folder_path(
+        &self,
+        ctx: SpaceContext,
+        request: Mutation<EnsureFolderPath>,
+    ) -> PortFuture<'_, FolderRef>;
     fn create_note(
         &self,
         ctx: SpaceContext,
@@ -82,7 +121,7 @@ pub trait NoteWritePort: Send + Sync {
         &self,
         ctx: SpaceContext,
         request: Mutation<AppendMemory>,
-    ) -> PortFuture<'_, Committed<NoteRevision>>;
+    ) -> PortFuture<'_, Committed<MemoryAppendResult>>;
     fn link(&self, ctx: SpaceContext, request: Mutation<Link>) -> PortFuture<'_, Committed<Link>>;
     fn link_many(&self, ctx: SpaceContext, request: LinkBatch)
     -> PortFuture<'_, BatchResult<Link>>;
@@ -91,10 +130,22 @@ pub trait NoteWritePort: Send + Sync {
         ctx: SpaceContext,
         request: Mutation<PublishAbilityPackage>,
     ) -> PortFuture<'_, Committed<AbilityPackageRevision>>;
+    fn trash_ability_package(
+        &self,
+        ctx: SpaceContext,
+        request: Mutation<TrashAbilityPackage>,
+    ) -> PortFuture<'_, Committed<NoteRevision>>;
     fn rollback_agent_run(
         &self,
         ctx: SpaceContext,
         request: Mutation<RollbackAgentRun>,
+    ) -> PortFuture<'_, Committed<RollbackResult>>;
+    /// Resolve the current rollback plan internally. The durable command is
+    /// identified by the run, even after a successful rollback changes the plan.
+    fn rollback_agent_run_by_id(
+        &self,
+        ctx: SpaceContext,
+        request: Mutation<AgentRunId>,
     ) -> PortFuture<'_, Committed<RollbackResult>>;
     fn accept_external_observation(
         &self,
@@ -104,6 +155,26 @@ pub trait NoteWritePort: Send + Sync {
 }
 pub trait ChatPort: Send + Sync {
     fn read_chat(&self, ctx: SpaceContext, request: ChatRead) -> PortFuture<'_, ChatBranch>;
+    /// A bounded prompt window. A live prefix checkpoint is presented before
+    /// its retained original suffix, with its durable sequence unchanged.
+    fn read_chat_context(&self, ctx: SpaceContext, request: ChatRead)
+    -> PortFuture<'_, ChatBranch>;
+    fn read_chat_contents(
+        &self,
+        ctx: SpaceContext,
+        request: ChatContentRead,
+    ) -> PortFuture<'_, Vec<HydratedChatEntry>>;
+    fn read_chat_proposal(
+        &self,
+        ctx: SpaceContext,
+        request: ChatProposalRead,
+    ) -> PortFuture<'_, CanonicalChatProposal>;
+    fn stage_chat_blob(&self, ctx: SpaceContext, text: String) -> PortFuture<'_, StagedChatBlob>;
+    fn discard_staged_chat_blob(
+        &self,
+        ctx: SpaceContext,
+        staged: StagedChatBlob,
+    ) -> PortFuture<'_, ()>;
     fn create_chat(
         &self,
         ctx: SpaceContext,
@@ -119,6 +190,16 @@ pub trait ChatPort: Send + Sync {
         ctx: SpaceContext,
         request: Mutation<AppendChat>,
     ) -> PortFuture<'_, Committed<ChatEntry>>;
+    fn submit_user_chat_input(
+        &self,
+        ctx: SpaceContext,
+        request: SubmitUserChatInput,
+    ) -> PortFuture<'_, SubmitUserChatOutcome>;
+    fn lookup_user_chat_input(
+        &self,
+        ctx: SpaceContext,
+        request: &SubmitUserChatInput,
+    ) -> PortFuture<'_, Option<SubmitUserChatOutcome>>;
     fn queue_chat_input(
         &self,
         ctx: SpaceContext,
@@ -129,6 +210,31 @@ pub trait ChatPort: Send + Sync {
         ctx: SpaceContext,
         request: Mutation<ConsumePending>,
     ) -> PortFuture<'_, Committed<ConsumedPending>>;
+    fn list_pending_chat_inputs(
+        &self,
+        ctx: SpaceContext,
+        thread: ChatThreadId,
+    ) -> PortFuture<'_, Vec<QueuedChatInput>>;
+    fn dismiss_chat_input(
+        &self,
+        ctx: SpaceContext,
+        request: DismissPending,
+    ) -> PortFuture<'_, bool>;
+    fn claim_active_run(
+        &self,
+        ctx: SpaceContext,
+        request: ClaimChatRun,
+    ) -> PortFuture<'_, ClaimChatRunOutcome>;
+    fn finish_run_if_queue_empty(
+        &self,
+        ctx: SpaceContext,
+        request: ChatRunRequest,
+    ) -> PortFuture<'_, FinishChatRunOutcome>;
+    fn recover_active_run(
+        &self,
+        ctx: SpaceContext,
+        request: ChatRunRequest,
+    ) -> PortFuture<'_, FinishChatRunOutcome>;
     fn redact_chat_entry(
         &self,
         ctx: SpaceContext,

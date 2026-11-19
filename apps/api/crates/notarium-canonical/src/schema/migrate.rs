@@ -22,6 +22,10 @@ pub(crate) const V4_HASH: &str = "23fda6322e7820fdb9b60bd67192098e3d472c074f655a
 
 pub(crate) const V5_HASH: &str = "e32b31f85aeb41b99c19c355bad2f9103eac552a0fe4b9c1ebb149892a7d9774";
 
+pub(crate) const V6_HASH: &str = "f91526e264d8000bf5d72a4efcb4e9701b350636c37da24d2b34bb19f50a8772";
+
+pub(crate) const V7_HASH: &str = "244ce610feed9e389063805c0c36190633a082df2b743fbf340c40418797e2a0";
+
 pub(crate) fn recognized_predecessor(version: i64, hash: &[u8]) -> bool {
     match version {
         1 => hex::encode(hash) == V1_HASH,
@@ -29,6 +33,8 @@ pub(crate) fn recognized_predecessor(version: i64, hash: &[u8]) -> bool {
         3 => hex::encode(hash) == V3_HASH,
         4 => hex::encode(hash) == V4_HASH,
         5 => hex::encode(hash) == V5_HASH,
+        6 => hex::encode(hash) == V6_HASH,
+        7 => hex::encode(hash) == V7_HASH,
         _ => false,
     }
 }
@@ -53,6 +59,14 @@ const MIGRATE_PENDING_INPUTS: [&str; 3] = [
 
 const ADD_HOLD_GENERATION: &str =
     "ALTER TABLE backup_holds ADD COLUMN owner_generation TEXT NOT NULL DEFAULT ''";
+const MIGRATE_CHAT_HISTORY: [&str; 5] = [
+    "ALTER TABLE chat_threads ADD COLUMN active_run_generation TEXT",
+    "ALTER TABLE chat_entries ADD COLUMN human_origin INTEGER CHECK (human_origin IN (0, 1))",
+    "ALTER TABLE chat_entries ADD COLUMN body_format INTEGER NOT NULL DEFAULT 0 CHECK (body_format IN (0, 1, 2))",
+    "ALTER TABLE chat_entries ADD COLUMN provenance_json TEXT",
+    "UPDATE chat_entries SET human_origin = CASE WHEN kind = 'human' THEN 1 ELSE 0 END WHERE kind <> 'redacted'",
+];
+
 // A legacy snapshot covered an unknown prefix. Keep every delta and require a
 // newer lease to establish coverage. A room with only deltas has no snapshot.
 const BACKFILL_CHECKPOINTS: &str = "INSERT INTO collab_checkpoints
@@ -240,13 +254,45 @@ macro_rules! upgrade {
             if version < 5 {
                 upgrade_owners_v5(&mut crate::sql_exec::BackendConn::$variant(conn)).await?;
             }
-            // Both global and per-Space pending checks can seek by status.
-            let index = baseline_statement($ddl, "CREATE INDEX IF NOT EXISTS idx_blob_retirements_status")?;
-            sqlx::query("DROP INDEX idx_blob_retirements_status")
-                .execute(&mut *conn).await
-                .map_err(|e| internal_not_committed("migration_v6_drop_retirement_index", e.to_string()))?;
-            sqlx::query(sqlx::AssertSqlSafe(index)).execute(&mut *conn).await
-                .map_err(|e| internal_not_committed("migration_v6_retirement_index", e.to_string()))?;
+            if version < 6 {
+                // Both global and per-Space pending checks can seek by status.
+                let index = baseline_statement($ddl, "CREATE INDEX IF NOT EXISTS idx_blob_retirements_status")?;
+                sqlx::query("DROP INDEX idx_blob_retirements_status")
+                    .execute(&mut *conn).await
+                    .map_err(|e| internal_not_committed("migration_v6_drop_retirement_index", e.to_string()))?;
+                sqlx::query(sqlx::AssertSqlSafe(index)).execute(&mut *conn).await
+                    .map_err(|e| internal_not_committed("migration_v6_retirement_index", e.to_string()))?;
+            }
+            if version < 7 {
+                let add_epoch = if stringify!($variant) == "Sqlite" {
+                    "ALTER TABLE chat_threads ADD COLUMN active_run_epoch INTEGER CHECK (active_run_epoch IS NULL OR active_run_epoch >= 0)"
+                } else {
+                    "ALTER TABLE chat_threads ADD COLUMN active_run_epoch BIGINT CHECK (active_run_epoch IS NULL OR active_run_epoch >= 0)"
+                };
+                for sql in std::iter::once(add_epoch).chain(MIGRATE_CHAT_HISTORY) {
+                    sqlx::query(sql).execute(&mut *conn).await.map_err(|e| {
+                        internal_not_committed("migration_v7_chat_history", e.to_string())
+                    })?;
+                }
+                sqlx::query(sqlx::AssertSqlSafe(baseline_statement(
+                    $ddl,
+                    "CREATE INDEX IF NOT EXISTS idx_chat_pending_inputs_consumed",
+                )?))
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| internal_not_committed("migration_v7_chat_handoff_index", e.to_string()))?;
+            }
+            sqlx::query("DROP INDEX IF EXISTS uq_ability_packages_active_slug")
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| internal_not_committed("migration_v8_ability_slot_drop", e.to_string()))?;
+            sqlx::query(sqlx::AssertSqlSafe(baseline_statement(
+                $ddl,
+                "CREATE INDEX IF NOT EXISTS idx_ability_packages_active_slug",
+            )?))
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| internal_not_committed("migration_v8_ability_slot_index", e.to_string()))?;
             let (sec, nsec) =
                 crate::codec::encode_timestamp_parts(crate::codec::now_utc_timestamp()?);
             sqlx::query(WRITE_WITNESS)
@@ -283,6 +329,90 @@ mod tests {
     use crate::schema::bootstrap_sqlite_schema;
     use sqlx::{Connection, Row};
 
+    async fn restore_chat_schema_v6(db: &mut SqliteConnection) {
+        sqlx::raw_sql(include_str!("../../tests/fixtures/chat-schema-v6-only.sql"))
+            .execute(db)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn v7_upgrades_only_the_ability_slot_index() {
+        let mut db = SqliteConnection::connect(":memory:").await.unwrap();
+        let installation = InstallationId::from_bytes([7; 16]);
+        bootstrap_sqlite_schema(&mut db, &installation)
+            .await
+            .unwrap();
+        sqlx::raw_sql(
+            "DROP INDEX idx_ability_packages_active_slug;
+             CREATE UNIQUE INDEX uq_ability_packages_active_slug
+                ON ability_packages(space_id,slug_fold) WHERE lifecycle_state='active'",
+        )
+        .execute(&mut db)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE schema_meta SET schema_version=7, manifest_checksum=$1")
+            .bind(hex::decode(V7_HASH).unwrap())
+            .execute(&mut db)
+            .await
+            .unwrap();
+        bootstrap_sqlite_schema(&mut db, &installation)
+            .await
+            .unwrap();
+        let index_state: (i64, i64) = sqlx::query_as(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='uq_ability_packages_active_slug'),
+                    EXISTS(SELECT 1 FROM pragma_index_list('ability_packages')
+                           WHERE name='idx_ability_packages_active_slug' AND [unique]=0)",
+        ).fetch_one(&mut db).await.unwrap();
+        assert_eq!(index_state, (0, 1));
+        let version: i64 = sqlx::query_scalar("SELECT schema_version FROM schema_meta")
+            .fetch_one(&mut db)
+            .await
+            .unwrap();
+        assert_eq!(version, i64::from(CANONICAL_SCHEMA_VERSION));
+    }
+
+    #[tokio::test]
+    async fn v6_upgrade_backfills_live_authorship_without_guessing_tombstones() {
+        let mut db = SqliteConnection::connect(":memory:").await.unwrap();
+        let installation = InstallationId::from_bytes([6; 16]);
+        bootstrap_sqlite_schema(&mut db, &installation)
+            .await
+            .unwrap();
+        restore_chat_schema_v6(&mut db).await;
+        sqlx::query("UPDATE schema_meta SET schema_version=6, manifest_checksum=$1")
+            .bind(hex::decode(V6_HASH).unwrap())
+            .execute(&mut db)
+            .await
+            .unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO spaces VALUES('space',zeroblob(16),'root','home','home','personal','owner','active',1,4,'{}',0,0);
+             INSERT INTO chat_threads VALUES('space',zeroblob(16),'thread','personal','owner',NULL,'Chat',3,'rev',4,NULL,0,1,4,0,0,0,0);
+             INSERT INTO chat_entries(
+                 space_id, thread_id, entry_seq, parent_seq, revision_id, kind, author_id,
+                 inline_text, referenced_notes_json, ext_space_tainted, is_chain_node,
+                 branch_depth, created_space_seq, redacted_at_seq
+             ) VALUES
+                 ('space','thread',1,NULL,'a','human','owner','hello','[]',0,1,0,1,NULL),
+                 ('space','thread',2,1,'b','model','owner','answer','[]',0,1,1,2,NULL),
+                 ('space','thread',3,2,'c','redacted','owner',NULL,'[]',0,1,2,3,4);",
+        ).execute(&mut db).await.unwrap();
+        bootstrap_sqlite_schema(&mut db, &installation)
+            .await
+            .unwrap();
+        let entries: Vec<(String, Option<i32>, i32, Option<String>)> = sqlx::query_as(
+            "SELECT kind, human_origin, body_format, provenance_json FROM chat_entries ORDER BY entry_seq",
+        ).fetch_all(&mut db).await.unwrap();
+        assert_eq!(
+            entries,
+            [
+                ("human".into(), Some(1), 0, None),
+                ("model".into(), Some(0), 0, None),
+                ("redacted".into(), None, 0, None),
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn v5_retirement_upgrade_preserves_rows_and_indexes_global_pending_work() {
         let mut db = SqliteConnection::connect(":memory:").await.unwrap();
@@ -290,6 +420,7 @@ mod tests {
         bootstrap_sqlite_schema(&mut db, &installation)
             .await
             .unwrap();
+        restore_chat_schema_v6(&mut db).await;
         sqlx::raw_sql(
             "DROP INDEX idx_blob_retirements_status;
              CREATE INDEX idx_blob_retirements_status ON blob_retirements(space_id, status);
@@ -360,6 +491,7 @@ mod tests {
                 .await
                 .unwrap();
         }
+        restore_chat_schema_v6(&mut db).await;
         sqlx::query("INSERT INTO schema_meta VALUES(1,4,1,$1,'ready',$2,0,0,0,0)")
             .bind(installation.as_str())
             .bind(hex::decode(V4_HASH).unwrap())
@@ -417,6 +549,7 @@ mod tests {
                 .await
                 .unwrap();
         }
+        restore_chat_schema_v6(&mut db).await;
         sqlx::raw_sql(include_str!(
             "../../tests/fixtures/schema-v3-reference-index.sql"
         ))
@@ -529,6 +662,7 @@ mod tests {
                 .await
                 .unwrap();
         }
+        restore_chat_schema_v6(&mut db).await;
         let install = InstallationId::from_bytes([4; 16]);
         sqlx::query("INSERT INTO schema_meta VALUES(1,1,1,$1,'ready',$2,0,0,0,0)")
             .bind(install.as_str())

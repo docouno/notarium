@@ -29,6 +29,15 @@ pub struct MarkdownAnalysis {
     pub blocks: Vec<ByteSpan>,
 }
 
+impl MarkdownAnalysis {
+    pub fn leading_h1(&self, source: &str, body: ByteSpan) -> Option<&Heading> {
+        let heading = self.headings.first()?;
+        let prefix = source.get(body.start()..heading.heading_span.start())?;
+        (heading.level == 1 && heading.containers.is_empty() && prefix.trim().is_empty())
+            .then_some(heading)
+    }
+}
+
 pub fn analyze(source: &str, body: ByteSpan) -> DomainResult<MarkdownAnalysis> {
     let text = body.slice(source)?;
     let offset = body.start();

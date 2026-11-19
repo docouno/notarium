@@ -1,9 +1,12 @@
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 
-use notarium_core::{error::PortError, ports::CallBudget};
+use notarium_core::{
+    error::PortError,
+    ports::{CallBudget, CanonicalEffectAdmission, RevocationLease},
+};
 use tokio::task::JoinHandle;
 
 use crate::{
@@ -15,15 +18,17 @@ use crate::{
 
 // Caller cancellation and COMMIT contend for one permission. Once COMMIT owns
 // it, the storage executor owns both the SQL result and its local publication.
+// A guarded worker also owns rollback before it releases the active lease.
 struct PendingWrite<T> {
     permission: Arc<AtomicBool>,
     task: JoinHandle<Result<T, PortError>>,
+    abort_on_revoke: bool,
 }
 
 impl<T> PendingWrite<T> {
     fn revoke(&self) -> bool {
         let pending = self.permission.swap(false, Ordering::AcqRel);
-        if pending {
+        if pending && self.abort_on_revoke {
             self.task.abort();
         }
         pending
@@ -33,6 +38,40 @@ impl<T> PendingWrite<T> {
 impl<T> Drop for PendingWrite<T> {
     fn drop(&mut self) {
         self.revoke();
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct AuxiliaryEffect(Option<Arc<AuxiliaryRegistration>>);
+
+struct AuxiliaryRegistration {
+    admission: CanonicalEffectAdmission,
+    active: Mutex<Option<Box<dyn RevocationLease>>>,
+}
+
+impl AuxiliaryEffect {
+    pub(crate) async fn begin(&self) -> Result<(), PortError> {
+        if let Some(effect) = &self.0 {
+            let active = effect.admission.begin().await?;
+            *effect.active.lock().expect("auxiliary effect lock") = Some(active);
+        }
+        Ok(())
+    }
+
+    fn check(&self) -> Result<(), PortError> {
+        if let Some(effect) = &self.0 {
+            let active = effect.active.lock().expect("auxiliary effect lock");
+            active
+                .as_ref()
+                .ok_or_else(|| {
+                    internal_not_committed(
+                        "auxiliary_effect_missing",
+                        "the SQL effect did not enter",
+                    )
+                })?
+                .check()?;
+        }
+        Ok(())
     }
 }
 
@@ -50,6 +89,27 @@ impl CanonicalStore {
         T: Send + 'static,
         R: Send + 'static,
     {
+        self.with_guarded_auxiliary_command(timing, None, after_commit, move |tx, _| op(tx))
+            .await
+    }
+
+    pub(crate) async fn with_guarded_auxiliary_command<T, R, F>(
+        &self,
+        timing: Option<(&CallBudget, CommandDeadline)>,
+        registration: Option<CanonicalEffectAdmission>,
+        after_commit: impl FnOnce(T) -> Result<R, PortError> + Send + 'static,
+        op: F,
+    ) -> Result<R, PortError>
+    where
+        F: for<'c> FnOnce(
+                &'c mut BackendConn<'_>,
+                AuxiliaryEffect,
+            ) -> crate::BoxFuture<'c, Result<T, PortError>>
+            + Send
+            + 'static,
+        T: Send + 'static,
+        R: Send + 'static,
+    {
         let worker_timing = timing.map(|(budget, deadline)| (budget.clone(), deadline));
         let check = move || -> Result<(), PortError> {
             if let Some((budget, deadline)) = &worker_timing {
@@ -61,14 +121,31 @@ impl CanonicalStore {
         let store = self.clone();
         let permission = Arc::new(AtomicBool::new(true));
         let commit = Arc::clone(&permission);
+        let abort_on_revoke = registration.is_none();
+        let active = AuxiliaryEffect(registration.map(|admission| {
+            Arc::new(AuxiliaryRegistration {
+                admission,
+                active: Mutex::new(None),
+            })
+        }));
         let task = self.inner.backup_executor.spawn(async move {
             check()?;
+            // The owner keeps the active lease past a canceled waiter and
+            // while the connection acknowledges COMMIT or ROLLBACK.
+            let operation_effect = active.clone();
             let result = store
                 .with_write_tx(move |tx| {
-                    let body = op(tx);
                     Box::pin(async move {
-                        let result = body.await?;
                         check()?;
+                        if !commit.load(Ordering::Acquire) {
+                            return Err(cancelled_not_committed(
+                                "auxiliary_write_revoked",
+                                "caller left before SQL execution",
+                            ));
+                        }
+                        let result = op(tx, operation_effect.clone()).await?;
+                        check()?;
+                        operation_effect.check()?;
                         if !commit.swap(false, Ordering::AcqRel) {
                             return Err(cancelled_not_committed(
                                 "auxiliary_write_revoked",
@@ -79,9 +156,14 @@ impl CanonicalStore {
                     })
                 })
                 .await?;
+            drop(active);
             after_commit(result)
         });
-        let mut pending = PendingWrite { permission, task };
+        let mut pending = PendingWrite {
+            permission,
+            task,
+            abort_on_revoke,
+        };
         let joined = match timing {
             Some((budget, deadline)) => deadline.wait(budget, || &mut pending.task).await,
             None => Ok((&mut pending.task).await),

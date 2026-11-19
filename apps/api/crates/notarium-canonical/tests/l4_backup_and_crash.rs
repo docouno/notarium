@@ -18,10 +18,10 @@ use std::{
 };
 
 use notarium_canonical::{
-    BackupArtifactEncoding, BlobBackendConfig, CanonicalConfig, CanonicalRuntime, CanonicalStore,
-    CollabRoomState, CreateSpaceSpec, DataRootOwnerLock, OpenCollabSession, PostgresSpoolValue,
-    S3BucketModePolicy, SqlBackendConfig, WriterConfig, blobs::s3::admin_ensure_bucket,
-    decode_postgres_spool_v1, default_backup_budget,
+    BackupArtifactEncoding, BlobBackendConfig, CANONICAL_SCHEMA_VERSION, CanonicalConfig,
+    CanonicalRuntime, CanonicalStore, CollabRoomState, CreateSpaceSpec, DataRootOwnerLock,
+    OpenCollabSession, PostgresSpoolValue, S3BucketModePolicy, SqlBackendConfig, WriterConfig,
+    blobs::s3::admin_ensure_bucket, decode_postgres_spool_v1, default_backup_budget,
 };
 use notarium_core::{
     auth::{EngineAuthContext, SpaceGrant, SpaceKind, SpaceRole, VerifiedHuman},
@@ -29,16 +29,16 @@ use notarium_core::{
     epoch::DataRoot,
     error::{CommitEffect, OperationalFailure, PortError, RetryAdvice, ValidationReason},
     ids::{
-        ArtifactId, BackupId, CommandKey, ContentDigest, GrantId, InstallationId, LeaseEpoch,
-        NoteId, PrincipalId, RequestId, SpaceSeq,
+        ArtifactId, BackupId, ChatThreadId, CommandKey, ContentDigest, GrantId, InstallationId,
+        LeaseEpoch, NoteId, PrincipalId, RequestId, SpaceSeq, ThreadEntrySeq,
     },
     model::HistoryScope,
     ports::{
         BackupBudget, BackupHold, BackupParticipantPort, BackupSnapshot, BackupSpool,
-        BackupWitness, CallBudget, Cancellation, ChangeBroadcast, ChangeNotice, CreateNote,
-        DeleteDisposition, DeleteNote, GetNote, MaintenanceContext, Mutation, NoteWritePort,
-        PausedBackup, PortFuture, Preconditions, PreparedBackup, RenameNote, ServicePurpose,
-        SpaceContext,
+        BackupWitness, CallBudget, Cancellation, ChangeBroadcast, ChangeNotice, ChatBody,
+        ChatEntryKind, ChatPort, ChatRead, CreateNote, DeleteDisposition, DeleteNote, GetNote,
+        MaintenanceContext, Mutation, NoteWritePort, PageLimit, PausedBackup, PortFuture,
+        Preconditions, PreparedBackup, RenameNote, ServicePurpose, SpaceContext,
     },
     receipt::{CausalBasis, ChangeCursor, CommandIdentity, ReceiptSet},
 };
@@ -488,6 +488,22 @@ impl BackendCase {
                 .execute(&mut *tx)
                 .await
                 .unwrap();
+            if decoded.schema_version < 7 {
+                sqlx::raw_sql(include_str!("fixtures/chat-schema-v6-only.sql"))
+                    .execute(&mut *tx)
+                    .await
+                    .unwrap();
+            }
+            if decoded.schema_version < 8 {
+                sqlx::raw_sql(
+                    "DROP INDEX idx_ability_packages_active_slug;
+                     CREATE UNIQUE INDEX uq_ability_packages_active_slug
+                        ON ability_packages(space_id,slug_fold) WHERE lifecycle_state='active'",
+                )
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            }
             if decoded.schema_version <= 5 {
                 sqlx::raw_sql(
                     "DROP INDEX idx_blob_retirements_status;
@@ -1076,6 +1092,7 @@ async fn failed_temp_unlink_retains_its_recovery_marker() {
 #[tokio::test]
 async fn restores_historical_postgres_spools_and_rejects_invalid_headers() {
     // Each file came from its version's PostgreSQL participant with a single synthetic Space.
+    // The v6 archive also carries a chat from commit 0e943be5.
     let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
     let case = BackendCase::open_pg_s3().await;
     for (version, install, space_id, slug, table_count, queue_columns) in [
@@ -1084,6 +1101,7 @@ async fn restores_historical_postgres_spools_and_rejects_invalid_headers() {
         (3, 0x62, 0xB2, "backup-178", 36, 14),
         (4, 0x62, 0xB2, "backup-178", 36, 14),
         (5, 0x62, 0xB2, "backup-178", 36, 14),
+        (6, 0x62, 0xB2, "backup-178", 36, 14),
     ] {
         let fixture = directory.join(format!("schema-v{version}.pgspool"));
         let decoded = decode_postgres_spool_v1(&fixture).unwrap();
@@ -1178,6 +1196,62 @@ async fn restores_historical_postgres_spools_and_rejects_invalid_headers() {
             .await
             .unwrap();
             assert_eq!(key, ("status".to_owned(), "space_id".to_owned()));
+            if version == 6 {
+                sqlx::query(sqlx::AssertSqlSafe(format!("SET search_path TO {schema}")))
+                    .execute(&mut db)
+                    .await
+                    .unwrap();
+                let schema_version: i32 =
+                    sqlx::query_scalar("SELECT schema_version FROM schema_meta")
+                        .fetch_one(&mut db)
+                        .await
+                        .unwrap();
+                assert_eq!(
+                    u32::try_from(schema_version).unwrap(),
+                    CANONICAL_SCHEMA_VERSION
+                );
+                let entries: Vec<(i64, Option<i32>, i32, Option<String>)> = sqlx::query_as(
+                    "SELECT entry_seq, human_origin, body_format, provenance_json
+                     FROM chat_entries ORDER BY entry_seq",
+                )
+                .fetch_all(&mut db)
+                .await
+                .unwrap();
+                assert_eq!(
+                    entries,
+                    [
+                        (1, Some(1), 0, None),
+                        (2, None, 0, None),
+                        (3, Some(0), 0, None)
+                    ]
+                );
+                let branch = restored
+                    .read_chat(
+                        owner_ctx(&cut.scope, sample_principal_id(space_id)),
+                        ChatRead {
+                            thread: ChatThreadId::from_bytes([0xC6; 16]),
+                            leaf: ThreadEntrySeq::new(3).unwrap(),
+                            before: None,
+                            max_entries: PageLimit::new(3).unwrap(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(branch.thread.title, "Historical chat");
+                let bodies: Vec<_> = branch
+                    .entries
+                    .into_iter()
+                    .map(|entry| (entry.kind, entry.body))
+                    .collect();
+                assert_eq!(
+                    bodies,
+                    [
+                        (ChatEntryKind::Human, ChatBody::Inline("Question".into())),
+                        (ChatEntryKind::Redacted, ChatBody::Redacted),
+                        (ChatEntryKind::Model, ChatBody::Inline("Answer".into())),
+                    ]
+                );
+            }
         }
         if let Some((db, scopes, digest, raw)) = migrated_db.as_mut() {
             let result: i32 =
@@ -1678,6 +1752,7 @@ async fn l4_paired_backup_cut_holds_budgets_cleanup_and_restore_cursors_dual_dia
                         &scope,
                         &actor,
                         CreateNote {
+                            folder_page: false,
                             note: note_1,
                             parent: None,
                             slug: "note-select1-control".to_owned(),
@@ -1706,6 +1781,7 @@ async fn l4_paired_backup_cut_holds_budgets_cleanup_and_restore_cursors_dual_dia
                         &scope,
                         &actor,
                         CreateNote {
+                            folder_page: false,
                             note: note_1,
                             parent: None,
                             slug: "note-select1-control".to_owned(),
@@ -1785,6 +1861,7 @@ async fn l4_paired_backup_cut_holds_budgets_cleanup_and_restore_cursors_dual_dia
                     &scope,
                     &actor,
                     CreateNote {
+                        folder_page: false,
                         note: note_pre_pause.clone(),
                         parent: None,
                         slug: "note-pre-pause".to_owned(),
@@ -1822,6 +1899,7 @@ async fn l4_paired_backup_cut_holds_budgets_cleanup_and_restore_cursors_dual_dia
                         &scope_bg,
                         &actor_bg,
                         CreateNote {
+                            folder_page: false,
                             note: note_post_cl,
                             parent: None,
                             slug: "note-post-resume".to_owned(),
@@ -1910,6 +1988,7 @@ async fn l4_paired_backup_cut_holds_budgets_cleanup_and_restore_cursors_dual_dia
                             &scope,
                             &actor,
                             CreateNote {
+                                folder_page: false,
                                 note: nid,
                                 parent: None,
                                 slug: format!("wal-unpinned-probe-{idx}"),
@@ -2155,6 +2234,7 @@ async fn l4_paired_backup_cut_holds_budgets_cleanup_and_restore_cursors_dual_dia
                     &new_scope,
                     &actor,
                     CreateNote {
+                        folder_page: false,
                         note: NoteId::from_bytes([0x39; 16]),
                         parent: None,
                         slug: "new-incarnation-same-seq".to_owned(),
@@ -2270,6 +2350,7 @@ async fn l4_paired_backup_cut_holds_budgets_cleanup_and_restore_cursors_dual_dia
                     &scope,
                     &actor,
                     CreateNote {
+                        folder_page: false,
                         note: note_step1.clone(),
                         parent: None,
                         slug: "interrupted-purge-blocks-hold".to_owned(),
@@ -2352,6 +2433,7 @@ async fn l4_paired_backup_cut_holds_budgets_cleanup_and_restore_cursors_dual_dia
                     &scope,
                     &actor,
                     CreateNote {
+                        folder_page: false,
                         note: note_after_abort,
                         parent: None,
                         slug: "after-second-participant-abort".to_owned(),
@@ -2476,6 +2558,7 @@ async fn l4_paired_backup_cut_holds_budgets_cleanup_and_restore_cursors_dual_dia
                                 &scope_w,
                                 &actor_w,
                                 CreateNote {
+                                    folder_page: false,
                                     note: NoteId::from_bytes([0x90 + k; 16]),
                                     parent: None,
                                     slug: format!("wal-budget-grow-{k}"),
@@ -2548,6 +2631,7 @@ async fn l4_paired_backup_cut_holds_budgets_cleanup_and_restore_cursors_dual_dia
                     &scope,
                     &actor,
                     CreateNote {
+                        folder_page: false,
                         note: secret_note.clone(),
                         parent: None,
                         slug: format!("slug-{secret_token}").to_ascii_lowercase(),
@@ -3199,6 +3283,7 @@ async fn seed_64m_and_50_medium_rows(store: &CanonicalStore, expected_hex: &str)
                 &space.scope,
                 &actor,
                 CreateNote {
+                    folder_page: false,
                     note: note.clone(),
                     parent: None,
                     slug: "peer-64m-carrier".to_owned(),
@@ -3415,6 +3500,7 @@ async fn run_sigkill_victim_child() {
                 &space.scope,
                 &actor,
                 CreateNote {
+                    folder_page: false,
                     note: collab_note.clone(),
                     parent: None,
                     slug: "collab-victim-note".to_owned(),
@@ -3456,6 +3542,7 @@ async fn run_sigkill_victim_child() {
                 &space.scope,
                 &actor,
                 CreateNote {
+                    folder_page: false,
                     note: purge_note.clone(),
                     parent: None,
                     slug: "purge-victim-note".to_owned(),

@@ -39,6 +39,7 @@ async fn materialize_child_first_folders_and_recover_an_active_room() {
                     &space.scope,
                     &space.owner,
                     CreateNote {
+                        folder_page: false,
                         note: note.clone(),
                         parent: Some(child.clone()),
                         slug: "room".into(),
@@ -236,6 +237,7 @@ async fn restore_interruption_while_waiting_for_safe_point_preserves_history() {
                     &space.scope,
                     &space.owner,
                     CreateNote {
+                        folder_page: false,
                         note: sample_note_id(0x90),
                         parent: None,
                         slug: "receipt".into(),
@@ -428,6 +430,7 @@ async fn pg_restore_lock_and_commit_interruption_report_distinct_effects() {
                         &target.scope,
                         &space.owner,
                         CreateNote {
+                            folder_page: false,
                             note: sample_note_id(0x95),
                             parent: None,
                             slug: "granted".into(),

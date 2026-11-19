@@ -1,10 +1,10 @@
-//! Reserved for the agents subsystem. Domain behavior is added in later waves.
+//! In-process agent services for MCP, chats and scheduled maintenance.
 
-#[cfg(test)]
-mod tests {
-    // A compile smoke test for the initial scaffold, not domain certification.
-    #[test]
-    fn scaffold_has_the_expected_package_identity() {
-        assert_eq!(env!("CARGO_PKG_NAME"), "notarium-agents");
-    }
-}
+#![forbid(unsafe_code)]
+
+pub mod abilities;
+pub mod chats;
+mod completion;
+pub mod keepers;
+pub mod mcp;
+pub mod revocation;

@@ -13,6 +13,8 @@ use crate::{
 };
 use notarium_core::{
     DomainError,
+    auth::PrincipalKind,
+    classes::ProviderOrigin,
     error::{BudgetKind, CommitEffect, PortError, ValidationReason},
     ids::*,
     ports::{control::*, *},
@@ -204,8 +206,10 @@ impl ProviderService {
             response: None,
         };
         let mut result = self.perform(runtime, job, sender, &mut progress).await;
-        // Cancellation/drop only signals the transport. Keep every authority
-        // lease until its owned producer acknowledges actual network shutdown.
+        // Cancellation/drop only signals the transport. Before a response
+        // head, keep the source snapshot through actual network shutdown.
+        // Credential and consent registration remains active through shutdown
+        // even after the accepted upload releases the canonical snapshot.
         if let Some(response) = progress.response.take()
             && let Err(error) = response.close().await
         {
@@ -298,19 +302,48 @@ impl ProviderService {
             None
         };
         let parts = job.parts();
+        let mut secondary_projects = Vec::new();
         let current = if primary.is_some() {
+            if parts.len() > MAX_PROVIDER_ORIGINS {
+                return Err(invalid(ValidationReason::InvalidLimit));
+            }
+            let chat_origins = parts
+                .iter()
+                .filter_map(|part| {
+                    let origin = part.origin();
+                    matches!(origin, ProviderOrigin::Chat { .. }).then_some(origin)
+                })
+                .collect::<Vec<_>>();
+            let dependencies = if chat_origins.is_empty() {
+                ProviderEgressDependencies::default()
+            } else {
+                runtime
+                    .run(
+                        self.egress.chat_dependencies(
+                            AccountContext::new(job.ctx.auth().clone(), runtime.context()),
+                            chat_origins,
+                        ),
+                        CommitEffect::NotCommitted,
+                    )
+                    .await?
+            };
+            let egress = job.egress(&parts, dependencies)?;
+            secondary_projects.clone_from(&egress.secondary_projects);
             let lease = runtime
                 .run(
                     self.egress.acquire_egress(
                         AccountContext::new(job.ctx.auth().clone(), runtime.context()),
-                        job.egress(&parts)?,
+                        egress,
                         runtime.cancelled.clone(),
                     ),
                     CommitEffect::NotCommitted,
                 )
                 .await?;
             lease.check()?;
-            if lease.project() != job.project() || lease.current().len() > 4096 {
+            if lease.project() != job.project()
+                || lease.secondary_projects() != secondary_projects
+                || lease.current().len() > MAX_PROVIDER_ORIGINS
+            {
                 return Err(invalid(ValidationReason::SourceMismatch));
             }
             let current = lease.current().to_vec();
@@ -328,6 +361,7 @@ impl ProviderService {
             ctx: &job.ctx,
             primary: primary.as_ref(),
             project: job.project(),
+            secondary_projects: &secondary_projects,
             parts: &parts,
             current: &current,
             keeper: keeper.as_ref(),
@@ -348,7 +382,12 @@ impl ProviderService {
                         call_id: progress.call.to_string(),
                         owner_id: snapshot.resource.owner_id.clone(),
                         principal: validated.auth.principal().to_string(),
-                        run_id: None,
+                        run_id: match validated.auth.kind() {
+                            PrincipalKind::AgentRun(run) | PrincipalKind::Keeper(run) => {
+                                Some(run.to_string())
+                            }
+                            _ => None,
+                        },
                         scope_id: scope_key,
                         intent_key: job.intent().to_string(),
                         request_hash: hash.to_vec(),
@@ -488,6 +527,12 @@ impl ProviderService {
             401 | 403 => return Err(provider_error(ProviderErrorCode::UpstreamAuthentication)),
             429 => return Err(provider_error(ProviderErrorCode::UpstreamRateLimit)),
             _ => return Err(provider_error(ProviderErrorCode::Unavailable)),
+        }
+        // Reqwest exposes the final HTTP response head after request
+        // dispatch. The body was submitted under the pinned snapshot.
+        // Do not hold canonical writers during generation or consumer replay.
+        if let Some(lease) = &mut progress.leases.canonical {
+            lease.mark_dispatched();
         }
         responses::receive(runtime, job, &snapshot, progress, sender).await
     }

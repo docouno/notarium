@@ -103,6 +103,7 @@ pub struct Catalog {
     pub fail_after_lifecycle: AtomicBool,
     pub create_gate: CallbackGate,
     pub abilities_gate: CallbackGate,
+    pub ability_tip_gate: CallbackGate,
     pub abilities_calls: AtomicUsize,
     pub space_read_fault: AtomicU8,
     pub space_reads: AtomicUsize,
@@ -115,7 +116,27 @@ pub struct Catalog {
     pub folder_entries: Mutex<BTreeMap<(SpaceId, FolderId), CatalogFolder>>,
     pub memory_calls: AtomicUsize,
 }
+struct TestSchedulePin {
+    history: HistoryScope,
+    descriptors: Vec<AbilityDescriptor>,
+}
+impl ScheduleAbilityLease for TestSchedulePin {
+    fn history(&self) -> &HistoryScope {
+        &self.history
+    }
+    fn abilities(&self) -> &[AbilityDescriptor] {
+        &self.descriptors
+    }
+}
+
 impl ControlCatalogPort for Catalog {
+    fn disclosure(
+        &self,
+        _: AccountContext,
+        _: CatalogDisclosure,
+    ) -> PortFuture<'_, notarium_core::classes::CanonicalMetadataContent> {
+        Box::pin(async { Err(DomainError::ResourceNotFound.into()) })
+    }
     fn space(&self, _: CallBudget, id: SpaceId) -> PortFuture<'_, CatalogSpace> {
         Box::pin(async move {
             self.space_reads.fetch_add(1, Ordering::SeqCst);
@@ -152,6 +173,7 @@ impl ControlCatalogPort for Catalog {
     ) -> PortFuture<'_, CatalogSpace> {
         Box::pin(async move {
             let space = CatalogSpace {
+                slug: request.space.id.to_string(),
                 space: Space {
                     id: request.space.id.clone(),
                     kind: request.space.kind,
@@ -234,6 +256,7 @@ impl ControlCatalogPort for Catalog {
             ctx.auth().can_view_resource(&ResourceFacts {
                 space: space.space,
                 class: notarium_core::classes::DocClass::UserDoc,
+                project: Some(project.folder_id.clone()),
                 ancestor_folders: vec![project.folder_id.clone()],
                 folder_write_locked: false,
                 ability_package: None,
@@ -244,6 +267,22 @@ impl ControlCatalogPort for Catalog {
                 .get(&(project.space_id.clone(), project.folder_id.clone()))
                 .cloned()
                 .ok_or(DomainError::ResourceNotFound.into())
+        })
+    }
+    fn project_by_slug(&self, ctx: SpaceContext, slug: String) -> PortFuture<'_, ProjectInfo> {
+        Box::pin(async move {
+            let project = self
+                .project_entries
+                .lock()
+                .unwrap()
+                .values()
+                .find(|entry| {
+                    entry.folder.space_id == ctx.scope().space_id
+                        && entry.project_slug.eq_ignore_ascii_case(&slug)
+                })
+                .map(|entry| entry.folder.clone())
+                .ok_or(DomainError::ResourceNotFound)?;
+            self.project(ctx, project).await
         })
     }
     fn abilities(
@@ -303,6 +342,15 @@ impl ControlCatalogPort for Catalog {
         identity: AbilityIdentity,
     ) -> PortFuture<'_, AbilityDescriptor> {
         Box::pin(async move {
+            if self.ability_tip_gate.enabled.swap(false, Ordering::SeqCst) {
+                self.ability_tip_gate.entered.add_permits(1);
+                self.ability_tip_gate
+                    .release
+                    .acquire()
+                    .await
+                    .unwrap()
+                    .forget();
+            }
             self.ability_entries
                 .lock()
                 .unwrap()
@@ -311,6 +359,50 @@ impl ControlCatalogPort for Catalog {
                 .find(|value| value.reference.identity() == identity)
                 .cloned()
                 .ok_or(DomainError::ResourceNotFound.into())
+        })
+    }
+    fn pin_schedule_abilities(
+        &self,
+        ctx: AccountContext,
+        refs: Vec<AbilityRef>,
+    ) -> PortFuture<'_, Box<dyn ScheduleAbilityLease>> {
+        Box::pin(async move {
+            let (space, grant) = ctx
+                .auth()
+                .spaces()
+                .iter()
+                .next()
+                .ok_or(DomainError::ResourceNotFound)?;
+            let facts = self.space(ctx.budget.clone(), space.clone()).await?;
+            if let Some(folder_id) = &grant.project_root {
+                self.project(
+                    SpaceContext::new(
+                        ctx.auth().clone(),
+                        facts.history.clone(),
+                        ctx.budget.clone(),
+                    )?,
+                    FolderRef {
+                        space_id: space.clone(),
+                        folder_id: folder_id.clone(),
+                    },
+                )
+                .await?;
+            }
+            let entries = self.ability_entries.lock().unwrap();
+            let mut descriptors = Vec::with_capacity(refs.len());
+            for reference in refs {
+                let descriptor = entries
+                    .iter()
+                    .rev()
+                    .find(|entry| entry.reference.identity() == reference.identity())
+                    .filter(|entry| entry.reference == reference)
+                    .ok_or(DomainError::ResourceNotFound)?;
+                descriptors.push(descriptor.clone());
+            }
+            Ok(Box::new(TestSchedulePin {
+                history: facts.history,
+                descriptors,
+            }) as Box<dyn ScheduleAbilityLease>)
         })
     }
     fn note(&self, ctx: AccountContext, note: NoteRef) -> PortFuture<'_, CatalogNote> {
@@ -379,6 +471,14 @@ impl ControlCatalogPort for Catalog {
             Ok(result)
         })
     }
+    fn inspect_memory_target(
+        &self,
+        _: AccountContext,
+        _: MemoryTarget,
+        _: String,
+    ) -> PortFuture<'_, MemoryTargetSnapshot> {
+        Box::pin(async { Err(DomainError::ResourceNotFound.into()) })
+    }
     fn resolve_or_ensure_memory_target(
         &self,
         ctx: AccountContext,
@@ -417,6 +517,7 @@ impl ControlCatalogPort for Catalog {
             let facts = ResourceFacts {
                 space: space.clone(),
                 class: notarium_core::classes::DocClass::AgentMemory,
+                project: None,
                 ancestor_folders: ancestors,
                 folder_write_locked: false,
                 ability_package: None,
@@ -656,6 +757,43 @@ impl Observer {
             }
         }
     }
+    #[allow(
+        dead_code,
+        reason = "Used by the integrated Canonical revocation fixture"
+    )]
+    pub async fn seed_session(
+        &mut self,
+        account: &PrincipalId,
+        id: &AuthSessionId,
+        token: &notarium_control::auth::token::MintedToken,
+        now: i64,
+    ) {
+        let sql = "INSERT INTO sessions(session_id,token_hash,user_id,created_at,expires_at,last_used_at,auth_version)
+            SELECT $1,$2,user_id,$3,$4,$3,auth_version FROM users WHERE user_id=$5";
+        let query = sqlx::query(sql)
+            .bind(id.as_str())
+            .bind(token.digest.as_slice())
+            .bind(now)
+            .bind(now + 3_600_000)
+            .bind(account.as_str());
+        match self {
+            Self::Sqlite(conn) => {
+                query.execute(conn).await.unwrap();
+            }
+            Self::Postgres(conn) => {
+                sqlx::query(sql)
+                    .bind(id.as_str())
+                    .bind(token.digest.as_slice())
+                    .bind(now)
+                    .bind(now + 3_600_000)
+                    .bind(account.as_str())
+                    .execute(conn)
+                    .await
+                    .unwrap();
+            }
+        }
+    }
+
     pub async fn seed_oauth_access(
         &mut self,
         account: &PrincipalId,

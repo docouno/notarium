@@ -267,6 +267,7 @@ async fn execute_live_suite(
                 identity: fresh_identity(&space.scope, &actor),
                 preconditions: Preconditions::default(),
                 input: CreateNote {
+                    folder_page: false,
                     note: note_id.clone(),
                     parent: None,
                     slug: "live-s3-multipart".to_owned(),

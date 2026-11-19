@@ -297,14 +297,25 @@ fn encoded_requests_keep_base_paths_roles_tools_and_conservative_limits() {
         intent: CommandKey::from_bytes([1; 16]),
         selection: ProviderSelection {
             project: None,
+            project_only: None,
             provider: ProviderResourceId::from_bytes([1; 16]),
             model: model.id.clone(),
+            completion: Some(CompletionModelLimits {
+                max_input_tokens: model.max_input_tokens,
+                max_output_tokens: model.max_output_tokens,
+                supports_tools: model.tools,
+            }),
+            revocation_scope: ProviderRevocationScope {
+                owner: PrincipalId::from_bytes([1; 16]),
+                credential: None,
+            },
             policy: ProviderPolicy {
                 provider: ProviderResourceId::from_bytes([1; 16]),
                 audience: ProviderAudience::Personal { consented: true },
                 allowed_classes: DocClass::all(),
             },
         },
+        secondary_projects: vec![],
         messages: vec![CompletionMessage {
             role: CompletionRole::System,
             instruction: Some(

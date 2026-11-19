@@ -1461,6 +1461,7 @@ pub(crate) async fn move_board_card_impl(
                         }
                         let meta = RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Note(
                             NoteRevisionMetadata {
+                                folder_page: anc.cover_note.as_ref() == Some(&input.note),
                                 note_id: input.note.clone(),
                                 parent_folder_id: head.parent_folder_id.clone(),
                                 is_root_child: anc.is_root_child,

@@ -224,7 +224,7 @@ impl OAuthService {
             witness.verify(tx.inner_mut()).await?;
             let existing=rows!(tx.inner_mut(),(String,),fetch_optional,"SELECT grant_id FROM oauth_grants WHERE grant_id=$1","SELECT grant_id FROM v1_control.oauth_grants WHERE grant_id=$1";intent.grant.as_str())?;
             if existing.is_some() {return Err(invalid_grant());}
-            let grant=TargetRecord::from(OauthGrantsRow {grant_id:intent.grant.to_string(),user_id:user.user_id.clone(),client_id:intent.client_id.clone(),resource_uri:intent.resource.clone(),scope:validation::scope_name(intent.scope.access).into(),
+            let grant=TargetRecord::from(OauthGrantsRow {grant_id:intent.grant.to_string(),user_id:user.user_id.clone(),client_id:intent.client_id.clone(),resource_uri:intent.resource.clone(),scope:validation::scope_name(intent.scope.access).into(),ability_write:i64::from(intent.scope.ability_write),
                 selected_spaces:intent.spaces.as_ref().map(serde_json::to_string).transpose().map_err(|_|invalid_grant())?,revoked_at:None,revision:1,created_at:now});
             grant.validate()?; grant.insert(tx.inner_mut()).await?;
             let code=token::mint(TokenKind::AuthorizationCode)?;

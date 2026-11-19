@@ -62,12 +62,10 @@ async fn bump_owner(tx: &mut Transaction, owner: &UsersRow) -> Result<ControlRev
     execute!(tx,"UPDATE users SET revision=$1 WHERE user_id=$2","UPDATE v1_control.users SET revision=$1 WHERE user_id=$2";revision,&owner.user_id)?;
     Ok(ControlRevision::new(revision as u64)?)
 }
-type FollowedRoleChain = Result<(AbilityRef, Vec<AbilityPlacement>), PortError>;
-
 pub(in super::super) struct LoadedEpisodeDb {
     pub(in super::super) row: AgentEpisodesRow,
     pub(in super::super) ack_rows: Vec<(SpaceId, Vec<u8>, i64)>,
-    pub(in super::super) parsed_role: Option<(AbilityRef, FollowedRoleChain)>,
+    followed_role: Option<Result<AbilityRef, PortError>>,
 }
 enum LoadedStartedDb {
     New(LoadedEpisodeDb),
@@ -86,13 +84,10 @@ impl ControlService {
         if row.owner_id != ctx.auth().principal().as_str() {
             return Err(DomainError::ResourceNotFound.into());
         }
-        let parsed_role = if let Some(value) = &row.active_role {
+        let followed_role = if let Some(value) = &row.active_role {
             let reference: AbilityRef =
                 serde_json::from_str(value).map_err(|_| invalid(ValidationReason::InvalidState))?;
-            let followed = self
-                .follow_ability_chain_db(tx, ctx, reference.clone())
-                .await;
-            Some((reference, followed))
+            Some(self.follow_ability_db(tx, ctx, reference).await)
         } else {
             None
         };
@@ -100,7 +95,7 @@ impl ControlService {
         Ok(LoadedEpisodeDb {
             row,
             ack_rows,
-            parsed_role,
+            followed_role,
         })
     }
     pub(in super::super) async fn resolve_episode_catalog(
@@ -111,7 +106,7 @@ impl ControlService {
         let LoadedEpisodeDb {
             row,
             ack_rows,
-            parsed_role,
+            followed_role,
         } = loaded;
         if row.owner_id != ctx.auth().principal().as_str() {
             return Err(DomainError::ResourceNotFound.into());
@@ -135,12 +130,12 @@ impl ControlService {
             (None, None) => None,
             _ => return Err(invalid(ValidationReason::InvalidState)),
         };
-        let role_to_overlay = if let Some((reference, followed)) = parsed_role {
+        let role_to_overlay = if let Some(followed) = followed_role {
             match self
-                .check_active_role_catalog(ctx, &reference, followed, project_hint.as_ref())
+                .check_active_role_catalog(ctx, followed, project_hint.as_ref())
                 .await?
             {
-                Some(raw) => Some((reference, raw)),
+                Some(raw) => Some((raw.reference.clone(), raw)),
                 None => {
                     diagnostics.push(EpisodeDiagnostic::RoleUnavailable);
                     None

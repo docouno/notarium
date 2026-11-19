@@ -465,6 +465,11 @@ pub(crate) fn validate_mutation_identity(
     if identity.actor != *ctx.auth().principal() {
         return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
     }
+    if let Some(step) = ctx.confirmed_chat_step()
+        && step.identity() != identity
+    {
+        return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
+    }
     Ok(())
 }
 
@@ -500,7 +505,7 @@ pub(crate) fn derive_command_identity_spec(
     hasher.update(identity.hash.as_bytes());
     hasher.update(&[0]);
     hasher.update(canonical_payload_fingerprint);
-    crate::writer::replay::UnboundCommand(CommandIdentitySpec::new(
+    crate::writer::replay::UnboundCommand::new(CommandIdentitySpec::new(
         identity.actor.clone(),
         identity.key.clone(),
         ContentDigest::from_bytes(*hasher.finalize().as_bytes()),
@@ -1002,6 +1007,33 @@ pub(crate) struct FolderAncestryFacts {
     /// Whether a note placed directly in this folder is a logical root child.
     pub is_root_child: bool,
     pub folder_path: String,
+    pub project: Option<FolderId>,
+    pub cover_note: Option<NoteId>,
+}
+
+impl FolderAncestryFacts {
+    pub(crate) fn note_provenance(
+        &self,
+        note: &NoteId,
+        slug: &str,
+        title: String,
+        principal: PrincipalId,
+        modified_at: Timestamp,
+    ) -> notarium_core::ports::NoteProvenance {
+        let path = if self.folder_path.is_empty() {
+            format!("{slug}.md")
+        } else {
+            format!("{}/{slug}.md", self.folder_path)
+        };
+        notarium_core::ports::NoteProvenance {
+            title,
+            path,
+            project: self.project.clone(),
+            principal,
+            modified_at,
+            folder_page: self.cover_note.as_ref() == Some(note),
+        }
+    }
 }
 
 /// Transaction-scoped memoization cache for `folder_heads` rows and computed `FolderAncestryFacts`
@@ -1022,6 +1054,8 @@ struct AncestryRow {
     slug: String,
     write_locked: bool,
     lifecycle: Lifecycle,
+    is_project: bool,
+    cover_note: Option<NoteId>,
 }
 
 impl From<crate::runtime::FolderHeadRow> for AncestryRow {
@@ -1033,6 +1067,8 @@ impl From<crate::runtime::FolderHeadRow> for AncestryRow {
             slug: row.slug,
             write_locked: row.write_locked,
             lifecycle: row.lifecycle,
+            is_project: row.is_project,
+            cover_note: row.cover_note_id,
         }
     }
 }
@@ -1080,6 +1116,8 @@ impl FolderAncestryCache {
             slug: row.slug,
             write_locked: row.write_locked,
             lifecycle: row.lifecycle,
+            is_project: row.is_project,
+            cover_note: row.cover_note_id,
         })
     }
 
@@ -1133,6 +1171,8 @@ impl FolderAncestryCache {
                     write_locked: row.write_locked,
                     is_root_child: true,
                     folder_path: String::new(),
+                    project: None,
+                    cover_note: row.cover_note,
                 };
                 self.resolved.insert(
                     (row.folder_id.clone(), require_all_active),
@@ -1178,6 +1218,12 @@ impl FolderAncestryCache {
                 write_locked: next_locked,
                 is_root_child: false,
                 folder_path: next_path,
+                project: if child_row.is_project {
+                    Some(child_row.folder_id.clone())
+                } else {
+                    acc.project
+                },
+                cover_note: child_row.cover_note,
             };
             self.resolved
                 .insert((child_row.folder_id, require_all_active), acc.clone());
@@ -1232,6 +1278,7 @@ impl FolderAncestryCache {
         let facts = ResourceFacts {
             space: space.clone(),
             class,
+            project: anc.project.clone(),
             ancestor_folders: anc.ancestors.clone(),
             folder_write_locked: anc.write_locked,
             ability_package,
@@ -1253,6 +1300,8 @@ pub(crate) async fn load_folder_ancestry_tx(
     let mut visited = BTreeSet::new();
     let mut write_locked = false;
     let mut current = folder_id.clone();
+    let mut project = None;
+    let mut cover_note = None;
 
     for _depth in 0..=MAX_FOLDER_DEPTH {
         if !visited.insert(current.clone()) {
@@ -1268,6 +1317,12 @@ pub(crate) async fn load_folder_ancestry_tx(
         if row.write_locked {
             write_locked = true;
         }
+        if ancestors.is_empty() {
+            cover_note = row.cover_note_id;
+        }
+        if row.is_project && project.is_none() {
+            project = Some(row.folder_id.clone());
+        }
         ancestors.push(row.folder_id.clone());
         if row.is_root {
             segments_rev.reverse();
@@ -1282,6 +1337,8 @@ pub(crate) async fn load_folder_ancestry_tx(
                 write_locked,
                 is_root_child,
                 folder_path,
+                project,
+                cover_note,
             });
         }
         segments_rev.push(row.slug);
@@ -1312,6 +1369,7 @@ pub(crate) async fn build_resource_facts_tx(
     let facts = ResourceFacts {
         space: space.clone(),
         class,
+        project: anc.project.clone(),
         ancestor_folders: anc.ancestors.clone(),
         folder_write_locked: anc.write_locked,
         ability_package,
@@ -2005,6 +2063,8 @@ pub(crate) struct StoredCommittedLinkV1 {
     pub source: NoteId,
     pub target: StoredLinkTargetV1,
     pub relation: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_title: Option<String>,
     pub receipt: MutationReceiptToken,
 }
 
@@ -2014,6 +2074,7 @@ impl StoredCommittedLinkV1 {
             source: link.source.clone(),
             target: StoredLinkTargetV1::from(&link.target),
             relation: link.relation.clone(),
+            target_title: link.target_title.clone(),
             receipt,
         }
     }
@@ -2024,6 +2085,7 @@ impl StoredCommittedLinkV1 {
                 source: self.source,
                 target: self.target.into(),
                 relation: self.relation,
+                target_title: self.target_title,
             },
             receipt: self.receipt,
         }

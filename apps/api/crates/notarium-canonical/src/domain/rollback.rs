@@ -11,7 +11,7 @@ use notarium_core::{
     model::{HistoryScope, Lifecycle, PathTarget},
     ports::{
         AssociatedBoardExpectation, ClosedRoomReservation, Committed, GroupKey, Mutation,
-        NoteRevision, PlannedNoteRestoration, RestoredBoardRank, RollbackAgentRun,
+        NoteRevision, PlannedNoteRestoration, RankExpectation, RestoredBoardRank, RollbackAgentRun,
         RollbackBoardFactsRequest, RollbackReservation, RollbackResult, SpaceContext, ViewRef,
     },
     receipt::MutationReceiptToken,
@@ -164,6 +164,7 @@ pub(crate) enum CandidateAction {
         pre_carrier: Option<String>,
         needs_note_mutation: bool,
         head_unchanged_placement: bool,
+        current_cover_parent: Option<FolderId>,
     },
 }
 
@@ -198,8 +199,15 @@ pub(crate) fn rollback_fallback_board_present_err() -> PortError {
     )
 }
 
-fn is_fallback_board_present(err: &PortError) -> bool {
-    err == &rollback_fallback_board_present_err()
+pub(crate) fn rollback_fallback_cover_change_err() -> PortError {
+    internal_not_committed(
+        "rb_fallback_cover_change",
+        "folder cover change requires the general rollback planner",
+    )
+}
+
+fn requires_general_planner(err: &PortError) -> bool {
+    err == &rollback_fallback_board_present_err() || err == &rollback_fallback_cover_change_err()
 }
 
 pub(crate) async fn rollback_agent_run_impl(
@@ -210,28 +218,9 @@ pub(crate) async fn rollback_agent_run_impl(
     let deadline = super::common::CommandDeadline::start(&ctx.budget, "rollback").at;
     validate_mutation_identity(&ctx, &request.identity)?;
     crate::domain::common::require_empty_preconditions(&request.preconditions)?;
-    let idemp = fingerprint::current(&request)?.with_policy(
-        ctx.auth(),
-        crate::writer::replay::ReplayPolicy::Documents(
-            request
-                .input
-                .expected_entities
-                .iter()
-                .map(|entry| crate::writer::replay::ReplayResource::Write(entry.note.clone()))
-                .chain(
-                    request
-                        .input
-                        .associated_board_expectations
-                        .iter()
-                        .map(|entry| &entry.view.note)
-                        .collect::<BTreeSet<_>>()
-                        .into_iter()
-                        .cloned()
-                        .map(crate::writer::replay::ReplayResource::View),
-                )
-                .collect(),
-        ),
-    );
+    let idemp = fingerprint::current(&request)?
+        .with_canonical_effect(&ctx)
+        .with_policy(ctx.auth(), rollback_policy(&request.input));
 
     let result = execute_rollback(store, &mut ctx, &request, &idemp, deadline).await;
     if !matches!(
@@ -262,6 +251,48 @@ pub(crate) async fn rollback_agent_run_impl(
         .ok_or_else(|| DomainError::IdempotencyKeyReused.into())
 }
 
+pub(crate) async fn rollback_agent_run_by_id(
+    store: &CanonicalStore,
+    mut ctx: SpaceContext,
+    request: Mutation<AgentRunId>,
+) -> Result<Committed<RollbackResult>, PortError> {
+    let deadline = super::common::CommandDeadline::start(&ctx.budget, "rollback").at;
+    validate_mutation_identity(&ctx, &request.identity)?;
+    super::common::require_empty_preconditions(&request.preconditions)?;
+    let input = prepare_agent_run_rollback(store, ctx.clone(), request.input).await?;
+    let idemp = super::common::derive_command_identity_spec(
+        &request.identity,
+        "rollback_agent_run_by_id_v1",
+        input.run.as_str().as_bytes(),
+    )
+    .with_canonical_effect(&ctx)
+    .with_policy(ctx.auth(), rollback_policy(&input));
+    let prepared = Mutation {
+        identity: request.identity,
+        preconditions: request.preconditions,
+        input,
+    };
+    execute_rollback(store, &mut ctx, &prepared, &idemp, deadline).await
+}
+
+fn rollback_policy(input: &RollbackAgentRun) -> crate::writer::replay::ReplayPolicy {
+    use crate::writer::replay::{ReplayPolicy, ReplayResource};
+
+    let views = input
+        .associated_board_expectations
+        .iter()
+        .map(|entry| &entry.view.note)
+        .collect::<BTreeSet<_>>();
+    ReplayPolicy::Documents(
+        input
+            .expected_entities
+            .iter()
+            .map(|entry| ReplayResource::Write(entry.note.clone()))
+            .chain(views.into_iter().cloned().map(ReplayResource::View))
+            .collect(),
+    )
+}
+
 async fn execute_rollback(
     store: &CanonicalStore,
     ctx: &mut SpaceContext,
@@ -289,24 +320,29 @@ async fn execute_rollback(
             }
         };
         let mut try_pg_batch_plan = true;
-        if matches!(
-            store.inner.sql,
-            crate::runtime::SqlDriverState::Postgres { .. }
-        ) && let Some(outcome) = try_execute_pg_root_rollback(
-            store,
-            ctx,
-            idemp,
-            request,
-            writer_epoch,
-            &mut try_pg_batch_plan,
-            deadline,
-        )
-        .await
+        let standard_writer = idemp.requires_standard_writer();
+        if !standard_writer
+            && matches!(
+                store.inner.sql,
+                crate::runtime::SqlDriverState::Postgres { .. }
+            )
+            && let Some(outcome) = try_execute_pg_root_rollback(
+                store,
+                ctx,
+                idemp,
+                request,
+                writer_epoch,
+                &mut try_pg_batch_plan,
+                deadline,
+            )
+            .await
         {
             return outcome;
         }
         ctx.budget.remaining = rollback_time_left(&ctx.budget, deadline)?;
-        let single_res: Result<StoredCommittedRollbackV1, PortError> = if store.is_sqlite_local() {
+        let single_res: Result<StoredCommittedRollbackV1, PortError> = if store.is_sqlite_local()
+            && !standard_writer
+        {
             let (intent, fast_plan) = crate::sqlite_fast::build_rollback_direct_sqlite_fast_intent(
                 ctx.scope(),
                 writer_epoch,
@@ -327,7 +363,7 @@ async fn execute_rollback(
                 )
                 .await
         } else {
-            let pg_fast = try_pg_batch_plan.then(|| {
+            let pg_fast = (try_pg_batch_plan && !standard_writer).then(|| {
                 build_rollback_pg_single_item_fast(
                     ctx.scope().clone(),
                     idemp.clone(),
@@ -361,7 +397,7 @@ async fn execute_rollback(
 
         match single_res {
             Ok(decoded) => return Ok(decoded.into_committed()),
-            Err(err) if is_fallback_board_present(&err) => {
+            Err(err) if requires_general_planner(&err) => {
                 // Space contains board move history; delegate to general 2-phase planner path.
             }
             Err(err) => return Err(err),
@@ -851,6 +887,9 @@ pub(crate) fn build_rollback_direct_single_tx_exec(
 
             for nid in caller_notes.keys() {
                 let head = heads_map.get(nid).ok_or(DomainError::ResourceNotFound)?;
+                if head.slug_fold == super::folder_cover::SLUG {
+                    return Err(rollback_fallback_cover_change_err());
+                }
                 let (rfacts, _) = folder_cache
                     .build_resource_facts_tx(
                         tx,
@@ -926,6 +965,9 @@ pub(crate) fn build_rollback_direct_single_tx_exec(
                     },
                     Some((pre_rev_id, _, meta_bytes, _)) => {
                         let pre_meta = decode_rollback_note(meta_bytes, &nid)?;
+                        if pre_meta.slug_fold == super::folder_cover::SLUG {
+                            return Err(rollback_fallback_cover_change_err());
+                        }
                         let head_unchanged_placement = head.lifecycle == pre_meta.lifecycle
                             && head.parent_folder_id == pre_meta.parent_folder_id
                             && head.slug == pre_meta.slug
@@ -939,6 +981,7 @@ pub(crate) fn build_rollback_direct_single_tx_exec(
                             pre_carrier: None,
                             needs_note_mutation,
                             head_unchanged_placement,
+                            current_cover_parent: None,
                         }
                     }
                 };
@@ -2177,6 +2220,50 @@ fn build_rollback_execute_fn(
                 insert_revision_rows_batch_tx(tx, &scope_cl, &rev_items).await?;
             }
 
+            let mut cover_changes = BTreeMap::new();
+            let mut restored_covers = Vec::new();
+            for (note, action) in &eligible_notes {
+                match action {
+                    CandidateAction::TrashCreated {
+                        current_lifecycle: Lifecycle::Active,
+                        metadata,
+                        parent_folder_id,
+                        ..
+                    } if metadata.folder_page => {
+                        cover_changes.insert(parent_folder_id, None);
+                    }
+                    CandidateAction::RestorePreExisting {
+                        pre_meta,
+                        current_cover_parent,
+                        needs_note_mutation: true,
+                        ..
+                    } => {
+                        if let Some(folder) = current_cover_parent {
+                            cover_changes.insert(folder, None);
+                        }
+                        if pre_meta.folder_page && pre_meta.lifecycle == Lifecycle::Active {
+                            restored_covers.push((&pre_meta.parent_folder_id, Some(note)));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            cover_changes.extend(restored_covers);
+            for (folder, cover) in cover_changes {
+                super::folder_cover::assign(
+                    tx,
+                    &scope_cl,
+                    folder,
+                    cover,
+                    visibility_seq,
+                    visibility_seq,
+                    auth.principal(),
+                    None,
+                    now_ts,
+                )
+                .await?;
+            }
+
             // 6c. Apply planned board overlay deletes, neighbor normalizations, and target restores.
             for del in &planned_overlay_deletes {
                 delete_single_overlay_tx(tx, &scope_cl.space_id, &del.view, &del.target_note)
@@ -2369,6 +2456,17 @@ async fn authorize_rollback_destination_tx(
         )
         .await?;
     auth.authorize_direct_write(&after, &after)?;
+    if meta.lifecycle == Lifecycle::Active
+        && let Some(ability) = &meta.ability_id
+    {
+        super::packages::check_restored_ability_slot_tx(
+            tx,
+            &space.id,
+            ability,
+            anc.project.as_ref(),
+        )
+        .await?;
+    }
     Ok(anc)
 }
 
@@ -2471,12 +2569,29 @@ async fn discover_rollback_state_tx(
             .filter(|r| r.1 < first_run_seq)
             .max_by_key(|r| r.1);
 
+        let current_cover_parent = if head.slug_fold == super::folder_cover::SLUG
+            && crate::runtime::load_folder_head_row(
+                tx,
+                &srec.scope.space_id,
+                &head.parent_folder_id,
+            )
+            .await?
+            .cover_note_id
+            .as_ref()
+                == Some(&nid)
+        {
+            Some(head.parent_folder_id.clone())
+        } else {
+            None
+        };
         match pre_rev_opt {
             None => {
+                let mut metadata = current_rollback_metadata(&note_revs, &head.head_rev_id, &nid)?;
+                metadata.folder_page |= current_cover_parent.is_some();
                 candidates.insert(
                     nid.clone(),
                     CandidateAction::TrashCreated {
-                        metadata: current_rollback_metadata(&note_revs, &head.head_rev_id, &nid)?,
+                        metadata,
                         current_rev: head.head_rev_id,
                         current_lifecycle: head.lifecycle,
                         doc_class: head.doc_class,
@@ -2516,6 +2631,7 @@ async fn discover_rollback_state_tx(
                         pre_carrier: None,
                         needs_note_mutation,
                         head_unchanged_placement,
+                        current_cover_parent,
                     },
                 );
             }
@@ -2556,23 +2672,11 @@ pub(crate) fn verify_authorized_rollback_revisions<'a>(
     Ok(())
 }
 
-async fn verify_run_and_entity_preconditions_tx(
+async fn load_run_revision(
     tx: &mut BackendConn<'_>,
     scope: &HistoryScope,
-    space: &notarium_core::auth::Space,
-    auth: &notarium_core::auth::EngineAuthContext,
-    input: &RollbackAgentRun,
-    folder_cache: &mut FolderAncestryCache,
-) -> Result<(BTreeMap<NoteId, NoteHeadRow>, Vec<RunBoardMoveRow>), PortError> {
-    auth.authorize_space_write(space)?;
-    for view in input
-        .associated_board_expectations
-        .iter()
-        .map(|entry| &entry.view.note)
-        .collect::<BTreeSet<_>>()
-    {
-        super::board::authorized_view_head(tx, space, auth, view).await?;
-    }
+    run: &AgentRunId,
+) -> Result<RevisionId, PortError> {
     let run_row: Option<(Vec<u8>, String)> = match tx {
         BackendConn::Sqlite(conn) => {
             let row = sqlx::query(
@@ -2580,7 +2684,7 @@ async fn verify_run_and_entity_preconditions_tx(
                  WHERE space_id = ? AND run_id = ?",
             )
             .bind(scope.space_id.as_str())
-            .bind(input.run.as_str())
+            .bind(run.as_str())
             .fetch_optional(&mut **conn)
             .await
             .map_err(|err| internal_not_committed("sqlite_load_run_head", err.to_string()))?;
@@ -2592,7 +2696,7 @@ async fn verify_run_and_entity_preconditions_tx(
                  WHERE space_id = $1 AND run_id = $2",
             )
             .bind(scope.space_id.as_str())
-            .bind(input.run.as_str())
+            .bind(run.as_str())
             .fetch_optional(&mut **conn)
             .await
             .map_err(|err| crate::runtime::pg_read_error("pg_load_run_head", err))?;
@@ -2612,8 +2716,105 @@ async fn verify_run_and_entity_preconditions_tx(
     };
     scope.check(&run_scope)?;
 
-    let actual_run_rev = RevisionId::parse(&run_rev_raw)
-        .map_err(|_| internal_not_committed("corrupt_run_rev", "invalid run_revision"))?;
+    RevisionId::parse(&run_rev_raw)
+        .map_err(|_| internal_not_committed("corrupt_run_rev", "invalid run_revision"))
+}
+
+pub(super) async fn prepare_agent_run_rollback(
+    store: &CanonicalStore,
+    ctx: SpaceContext,
+    run: AgentRunId,
+) -> Result<RollbackAgentRun, PortError> {
+    let scope = ctx.scope().clone();
+    let auth = ctx.auth().clone();
+    store
+        .with_read_tx_budget(Some(&ctx.budget), |tx| {
+            Box::pin(async move {
+                let record = load_space_record(tx, &scope.space_id).await?;
+                record.scope.check(&scope)?;
+                auth.authorize_space_write(&record.space)?;
+                let expected_run_revision = load_run_revision(tx, &scope, &run).await?;
+                let notes = load_run_touched_notes_tx(tx, &scope.space_id, &run).await?;
+                let mut heads = load_note_heads_batch_tx(tx, &scope.space_id, &notes).await?;
+                let mut folders = FolderAncestryCache::default();
+                let mut expected_entities = Vec::with_capacity(notes.len());
+                for id in notes {
+                    let head = heads.remove(&id).ok_or(DomainError::ResourceNotFound)?;
+                    if crate::runtime::is_note_purge_fenced_tx(tx, &scope.space_id, id.as_str())
+                        .await?
+                    {
+                        return Err(DomainError::ResourceNotFound.into());
+                    }
+                    let (facts, _) = folders
+                        .build_resource_facts_tx(
+                            tx,
+                            &record.space,
+                            &head.parent_folder_id,
+                            head.doc_class,
+                            head.ability_id,
+                            false,
+                        )
+                        .await?;
+                    auth.authorize_direct_write(&facts, &facts)?;
+                    expected_entities.push(NoteRevision {
+                        note: id,
+                        revision: head.head_rev_id,
+                    });
+                }
+                let mut associated_board_expectations = Vec::new();
+                let moves = load_run_board_moves_tx(tx, &scope.space_id, &run).await?;
+                let pairs: BTreeSet<_> = moves
+                    .into_iter()
+                    .map(|m| (m.view, m.target_note_id))
+                    .collect();
+                for (view, note) in pairs {
+                    super::board::authorized_view_head(tx, &record.space, &auth, &view.note)
+                        .await?;
+                    let overlay =
+                        load_overlay_row_opt_tx(tx, &scope.space_id, &view, &note).await?;
+                    let (expected_rank, expected_placement_revision) = match overlay {
+                        Some(overlay) => (
+                            RankExpectation::Existing(overlay.rank_rev_id),
+                            overlay.placement_revision,
+                        ),
+                        None => (RankExpectation::Absent, expected_run_revision.clone()),
+                    };
+                    associated_board_expectations.push(AssociatedBoardExpectation {
+                        view,
+                        note,
+                        expected_rank,
+                        expected_placement_revision,
+                    });
+                }
+                Ok(RollbackAgentRun {
+                    run,
+                    expected_run_revision,
+                    expected_entities,
+                    associated_board_expectations,
+                })
+            })
+        })
+        .await
+}
+
+async fn verify_run_and_entity_preconditions_tx(
+    tx: &mut BackendConn<'_>,
+    scope: &HistoryScope,
+    space: &notarium_core::auth::Space,
+    auth: &notarium_core::auth::EngineAuthContext,
+    input: &RollbackAgentRun,
+    folder_cache: &mut FolderAncestryCache,
+) -> Result<(BTreeMap<NoteId, NoteHeadRow>, Vec<RunBoardMoveRow>), PortError> {
+    auth.authorize_space_write(space)?;
+    for view in input
+        .associated_board_expectations
+        .iter()
+        .map(|entry| &entry.view.note)
+        .collect::<BTreeSet<_>>()
+    {
+        super::board::authorized_view_head(tx, space, auth, view).await?;
+    }
+    let actual_run_rev = load_run_revision(tx, scope, &input.run).await?;
 
     // Discover full touched set of notes in `revisions` UNION `board_move_history`.
     let mut touched_set: BTreeSet<NoteId> = BTreeSet::new();
@@ -4122,9 +4323,11 @@ async fn execute_pg_fast_rollback_on_conn(
             if let Some(c) = effective_cut {
                 cuts.insert(scope_cl.space_id.clone(), c);
             }
+            let conn_clean = matches!(&err, PortError::Domain(_));
             PgSingleFastAttempt::Handled(BatchExecOutcome::Committed {
                 slots: vec![ItemOutcomeSlot::Failed(err)],
                 space_effective_cuts: cuts,
+                conn_clean,
             })
         }
         PgFastInnerResult::Committed {
@@ -4158,6 +4361,7 @@ async fn execute_pg_fast_rollback_on_conn(
                     has_idempotency: true,
                 }],
                 space_effective_cuts: cuts,
+                conn_clean: true,
             })
         }
         PgFastInnerResult::UnknownCommit {
@@ -4492,6 +4696,20 @@ async fn try_execute_pg_root_rollback(
         return None;
     };
 
+    if heads
+        .iter()
+        .any(|head| head.folded_slug == super::folder_cover::SLUG)
+        || revs.iter().any(|history| {
+            history
+                .metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.pre_meta.slug_fold == super::folder_cover::SLUG)
+        })
+    {
+        park_pg_rollback_connection(store, pooled);
+        return None;
+    }
+
     let root_facts = notarium_core::auth::ResourceFacts {
         space: Space {
             id: scope.space_id.clone(),
@@ -4499,6 +4717,7 @@ async fn try_execute_pg_root_rollback(
             kind: space_kind,
         },
         class: DocClass::UserDoc,
+        project: None,
         ancestor_folders: vec![root_folder_id.clone()],
         folder_write_locked: false,
         ability_package: None,
@@ -5607,6 +5826,12 @@ async fn execute_pg_fast_rollback_inner(
             let parent_raw: String = row.get::<String, usize>(2);
             let slug: String = row.get::<String, usize>(3);
             let slug_fold: String = row.get::<String, usize>(4);
+            if slug_fold == super::folder_cover::SLUG {
+                return PgFastInnerResult::Failed {
+                    err: rollback_fallback_cover_change_err(),
+                    effective_cut: Some(current_effective_cut),
+                };
+            }
             let title: String = row.get::<String, usize>(5);
             let dc_raw: String = row.get::<String, usize>(6);
             let ab_raw: Option<String> = row.get::<Option<String>, usize>(7);
@@ -5802,6 +6027,12 @@ async fn execute_pg_fast_rollback_inner(
                         };
                     }
                 };
+                if pre_meta.slug_fold == super::folder_cover::SLUG {
+                    return PgFastInnerResult::Failed {
+                        err: rollback_fallback_cover_change_err(),
+                        effective_cut: Some(current_effective_cut),
+                    };
+                }
                 let head_unchanged_placement = head.lifecycle == pre_meta.lifecycle
                     && head.parent_folder_id == pre_meta.parent_folder_id
                     && head.slug == pre_meta.slug
@@ -5815,6 +6046,7 @@ async fn execute_pg_fast_rollback_inner(
                     pre_carrier: None,
                     needs_note_mutation,
                     head_unchanged_placement,
+                    current_cover_parent: None,
                 }
             }
         };

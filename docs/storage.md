@@ -59,10 +59,24 @@ The store implements
 `NoteWritePort`, `ChatPort`, `ContentJobPort`,
 `ChangeBroadcast` and `BackupParticipantPort`, alongside canonical point reads
 (`get_note`, `hydrate_cards`, `read_ability_resource`, `read_changes`,
-`recent_activity`), `move_board_card`, `rollback_agent_run`,
+`recent_activity`, `resolve_note_target`, `resolve_folder_path`,
+`list_child_folders`, `space_schema`), `move_board_card`,
+`prepare_agent_run_rollback`, `rollback_agent_run`,
 `accept_external_observation`, and peer session/job persistence. Full query
 planning (`NoteReadPort::list_notes`), `ViewGraphPort` and `SearchPort` remain
 owned by downstream projection and search crates.
+
+Path creation admits an authorized parent and commits missing components
+together. Replaying a creation command returns its folder within the original
+base subject to current visibility. Reads resolve exact active paths before
+historical aliases and retain the current project boundary.
+
+The filename stem `index` is reserved for explicit folder pages. Creating,
+moving, trashing, restoring, purging or rolling back a folder page updates
+both the covering note and the relevant folder revisions at the same command
+boundary. Renaming its title keeps the reserved stem. Visible note snapshots
+and recent activity carry the title, path, project, actor and timestamp from
+the admitted revision and folder placement.
 
 In PostgreSQL, creating a Space grants its initial writer epoch to the
 provisioning runtime when storage receives the commit acknowledgement, even if
@@ -94,7 +108,7 @@ recovers writes under its exclusive DataRoot owner lock.
 ## Dual-dialect schema and history model
 
 Both SQL dialects materialize the same ordinary B-tree tables in schema
-version `6` and verify live database catalogs (`sqlite_master` / `pg_catalog`)
+version `8` and verify live database catalogs (`sqlite_master` / `pg_catalog`)
 against a shared typed manifest checksum (`schema_meta`) on every startup.
 Unknown newer schema versions, mismatched manifest checksums or unfinished
 migration states fail closed.
@@ -106,6 +120,15 @@ and resulting Space identity, history and cutoff, including after restart.
 The caller can replay a pending control operation after losing the canonical
 response. Reusing the key with a different payload is rejected. Rebinding a
 Space's history invalidates receipts issued for its earlier incarnation.
+
+Schema version 8 allows multiple canonical packages to share a folded name.
+Control binding policy selects the visible package and serializes live
+authoring operations. Canonical package identity and version remain exact.
+
+Schema version 7 stores the active chat run's writer generation, distinguishes
+human turns from derived turns after redaction, and records the source proof of
+derived turns. A legacy redaction with unknown origin counts as a peer
+intervention when its author differs from the queued sender.
 
 Schema version 6 orders the existing retirement index by status and then Space.
 Both the installation-wide and per-Space pending checks can seek directly to
@@ -138,6 +161,11 @@ run within the startup transaction and preserve the trailing snapshot BLOB.
 Catalog reads use current grants and canonical folder ancestry. Keyset cursors
 bind the catalog revision and filters. Account and project memory categories
 identify stable AgentMemory notes in the personal root or project folder.
+Inspecting a memory category returns its current revision or observed absence.
+Appending an observation can create the category and set its optional summary
+in the same canonical command. An append that omits the summary preserves it.
+The writer checks explicit revision or absence predicates and replays its
+receipt only while the memory slot remains authorized.
 Published ability manifests expose up to 256 auxiliary names of at most 1024
 UTF-8 bytes each. Access to an exact package revision requires visibility at
 publication and at its current location. Resource reads check both locations
@@ -451,6 +479,12 @@ same example against an isolated prefix.
   uploads even when a caller closes its executor. A lease takeover adopts
   older private uploads. Retrying the same lease leaves that generation's
   active uploads with their owners.
+  Tool proposals and model calls are stored as typed chat bodies. Proposal
+  application rechecks the matching model/tool records in the target writer
+  transaction. A queued input keeps its original author. If a peer intervened
+  on the selected branch, the transaction records that fact along with the
+  consumed entry. Log and seed listings apply live and historical thread
+  visibility, including owner and Keeper log checks.
   `redact_chat_entry` applies the same thread and taint checks on first execution
   and replay. It erases target entry content, preserves DAG ancestry and
   clears the stored bodies and CAS references of dependent `Compaction` entries.
@@ -461,7 +495,9 @@ same example against an isolated prefix.
   The committed receipt remains available within the caller's remaining budget.
   Retries share the same retirement worker for a given history, lease epoch and
   retirement ID. The store recovers outstanding work after restart or takeover.
-  Taint is monotonic.
+  The thread's audit mask records whether any branch has ever been tainted.
+  Reads and effects on a selected branch use that leaf's accumulated taint.
+  An explicit fork from a clean ancestor can start a fresh run.
 - **Paired backup (`BackupParticipantPort`).** Prepare both participants and acquire
   their holds before pausing control, then canonical. PostgreSQL uses a dedicated
   connection to fence writers across runtimes sharing the canonical schema. Pin
@@ -481,10 +517,18 @@ same example against an isolated prefix.
   volume, where lookup checks file size and BLAKE3 before returning the path.
   Startup reconciles abandoned holds and pending local artifacts.
   The offline `notarium_canonical::backup::decode_postgres_spool_v1_bounded`
-  API verifies the trailer and recognizes the exact manifests for schemas 1 through 6.
+  API verifies the trailer and recognizes the exact manifests for schemas 1 through 8.
   It returns typed rows in the original table and column order within the
   caller's byte budget. To materialize a historical spool, create an empty
-  target with `schema::POSTGRES_BASELINE_DDL`. For versions 1 and 2, drop
+  target with `schema::POSTGRES_BASELINE_DDL`. For versions 1 through 7,
+  replace `idx_ability_packages_active_slug` with the unique predecessor index
+  `uq_ability_packages_active_slug` on `(space_id, slug_fold)` where
+  `lifecycle_state = 'active'`. For versions 1 through 6,
+  remove the chat columns and index added in version 7 using
+  `tests/fixtures/chat-schema-v6-only.sql` in the canonical crate.
+  For versions 1 through 5, rebuild `idx_blob_retirements_status` on
+  `(space_id, status)`.
+  For versions 1 and 2, drop
   `collab_checkpoints` and `backup_holds.owner_generation`. For version 1,
   also drop `account_catalog_receipts` and `chat_pending_inputs.ext_space_tainted`.
   For versions 1 through 4, drop `idx_receipt_exception_pointer` and
@@ -498,8 +542,8 @@ same example against an isolated prefix.
   temporary table, then inserts the full set in one statement so foreign keys
   can resolve parents that appear later in the archive.
   Opening the target with the original installation ID applies the remaining
-  migrations through version 6. The canonical L4 backup suite exercises this
-  procedure with archives from all five predecessor versions.
+  migrations through version 8. The canonical L4 backup suite exercises this
+  procedure with archives from versions 1 through 6.
   Before serving the restored database, call `restore_cursors` with each
   original cutoff and a fresh history incarnation. The same transaction
   rotates the writer epoch and fences active rooms, retaining their snapshots,

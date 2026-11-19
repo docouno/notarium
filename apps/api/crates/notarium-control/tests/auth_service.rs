@@ -195,6 +195,7 @@ async fn lifecycle(pg: bool) {
         .create_pat(
             bob_actor.clone(),
             CreatePat {
+                ability_write: false,
                 name: "read client".into(),
                 scope: BearerScope::Read,
                 selected_spaces: None,
@@ -859,6 +860,7 @@ async fn bounds(pg: bool) {
         .create_pat(
             current.clone(),
             CreatePat {
+                ability_write: true,
                 name: "empty selection".into(),
                 scope: BearerScope::Write,
                 selected_spaces: Some(vec![]),
@@ -873,6 +875,7 @@ async fn bounds(pg: bool) {
         .await
         .unwrap();
     assert!(auth.spaces().is_empty());
+    assert_eq!(auth.bearer_scope(), Some(BearerScope::Write));
     assert!(!auth.has_cap(Cap::AbilityWrite));
     fixture.clock.0.fetch_add(1000, Ordering::SeqCst);
     denied(
@@ -895,6 +898,7 @@ async fn bounds(pg: bool) {
         .await
         .unwrap();
     assert!(matches!(oauth.kind(), PrincipalKind::OAuth { .. }));
+    assert_eq!(oauth.bearer_scope(), Some(BearerScope::Read));
     assert!(!oauth.has_cap(Cap::AbilityWrite));
     assert!(
         oauth
@@ -1533,6 +1537,7 @@ async fn interactive_management_and_account_guards(pg: bool) {
             .create_pat(
                 ambient_ctx.clone(),
                 CreatePat {
+                    ability_write: false,
                     name: "Blocked".into(),
                     scope: BearerScope::Read,
                     selected_spaces: None,
@@ -1579,6 +1584,7 @@ async fn interactive_management_and_account_guards(pg: bool) {
     fixture.catalog.project_entries.lock().unwrap().insert(
         (project_ok.space_id.clone(), project_ok.folder_id.clone()),
         ProjectInfo {
+            project_slug: "project".into(),
             folder: project_ok.clone(),
             name: "Allowed project".into(),
         },
@@ -1609,13 +1615,16 @@ async fn interactive_management_and_account_guards(pg: bool) {
         .lock()
         .unwrap()
         .push(AbilityDescriptor {
+            attached_skills: vec![],
+            promoted_from: None,
+            requires_explicit_binding: false,
             reference: ability_ref.clone(),
             kind: AbilityKind::Role,
             name: "selected-guide".into(),
             enabled: true,
             healthy: true,
             lifecycle: Lifecycle::Active,
-            entrypoint: ability_note.clone(),
+            entrypoint: Some(ability_note.clone()),
             auxiliary_files: vec![],
         });
     fixture.catalog.note_entries.lock().unwrap().insert(
@@ -1626,6 +1635,7 @@ async fn interactive_management_and_account_guards(pg: bool) {
             facts: ResourceFacts {
                 space: shared.space,
                 class: DocClass::Skill,
+                project: None,
                 ancestor_folders: vec![],
                 folder_write_locked: false,
                 ability_package: Some(ability_ref.id.clone()),

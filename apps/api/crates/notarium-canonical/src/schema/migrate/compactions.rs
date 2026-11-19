@@ -136,6 +136,12 @@ mod tests {
         bootstrap_sqlite_schema(&mut db, &installation)
             .await
             .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../../../tests/fixtures/chat-schema-v6-only.sql"
+        ))
+        .execute(&mut db)
+        .await
+        .unwrap();
         sqlx::query("UPDATE schema_meta SET schema_version=3,manifest_checksum=?1")
             .bind(hex::decode(V3_HASH).unwrap())
             .execute(&mut db)

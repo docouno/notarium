@@ -123,6 +123,7 @@ async fn execute(
                         return Ok((
                             CatalogSpace {
                                 space,
+                                slug: current.slug,
                                 history,
                                 last_seq,
                             },

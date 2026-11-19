@@ -62,6 +62,7 @@ async fn board_move_deadline_covers_planner_retry_room_and_writer_ack_on_both_ba
                         &scope,
                         &owner,
                         CreateNote {
+                            folder_page: false,
                             note: sample_note_id(id),
                             parent: None,
                             slug: slug.into(),
@@ -230,6 +231,7 @@ async fn edit_note_bounds_room_dispatch_on_both_backends() {
                     &scope,
                     &owner,
                     CreateNote {
+                        folder_page: false,
                         note: note.clone(),
                         parent: None,
                         slug: "report".into(),

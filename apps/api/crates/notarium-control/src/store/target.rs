@@ -15,6 +15,9 @@ pub const TARGET_SCHEMA_VERSION: u32 = 1;
 fn default_model_kind() -> String {
     "completion".into()
 }
+fn empty_ability_pins() -> String {
+    "[]".into()
+}
 
 fn text_bytes(value: &str) -> Result<usize, PortError> {
     if value.len() > 1048576 {
@@ -94,6 +97,7 @@ impl_parse_brand!(
     AgentRunId,
     AbilityId,
     NoteId,
+    ChatThreadId,
     ScheduleId,
     EpisodeId,
 );
@@ -570,7 +574,7 @@ target_tables! {
         })
     },
     Pats (PatsRow, "pats") {
-        cols("token_id,secret_hash,user_id,name,scope,selected_spaces,expires_at,last_used_at,revoked_at,created_at", "$1,$2,$3,$4,$5,$6,$7,$8,$9,$10"): [
+        cols("token_id,secret_hash,user_id,name,scope,selected_spaces,expires_at,last_used_at,revoked_at,created_at,ability_write", "$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11"): [
             token_id: String => hex12,
             secret_hash: Vec<u8> => blob,
             user_id: String => id(PrincipalId),
@@ -581,6 +585,8 @@ target_tables! {
             last_used_at: Option<i64> => num,
             revoked_at: Option<i64> => num,
             created_at: i64 => num,
+            #[serde(default)]
+            ability_write: i64 => num,
         ]
         pk(sqlite_order: "token_id", pg_order: "token_id COLLATE \"C\"", sqlite_gt: "token_id > $1", pg_gt: "token_id COLLATE \"C\" > $1", limit_param: "$2"): [
             token_id: String,
@@ -612,7 +618,7 @@ target_tables! {
         })
     },
     OauthGrants (OauthGrantsRow, "oauth_grants") {
-        cols("grant_id,user_id,client_id,resource_uri,scope,selected_spaces,revoked_at,revision,created_at", "$1,$2,$3,$4,$5,$6,$7,$8,$9"): [
+        cols("grant_id,user_id,client_id,resource_uri,scope,selected_spaces,revoked_at,revision,created_at,ability_write", "$1,$2,$3,$4,$5,$6,$7,$8,$9,$10"): [
             grant_id: String => id(OAuthGrantId),
             user_id: String => id(PrincipalId),
             client_id: String => text,
@@ -622,6 +628,8 @@ target_tables! {
             revoked_at: Option<i64> => num,
             revision: i64 => num,
             created_at: i64 => num,
+            #[serde(default)]
+            ability_write: i64 => num,
         ]
         pk(sqlite_order: "grant_id", pg_order: "grant_id COLLATE \"C\"", sqlite_gt: "grant_id > $1", pg_gt: "grant_id COLLATE \"C\" > $1", limit_param: "$2"): [
             grant_id: String,
@@ -693,7 +701,7 @@ target_tables! {
         })
     },
     OauthAccessTokens (OauthAccessTokensRow, "oauth_access_tokens") {
-        cols("token_id,token_hash,grant_id,family_id,refresh_id,resource_uri,scope,selected_spaces,issued_at,expires_at,revoked_at,last_used_at", "$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12"): [
+        cols("token_id,token_hash,grant_id,family_id,refresh_id,resource_uri,scope,selected_spaces,issued_at,expires_at,revoked_at,last_used_at,ability_write", "$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13"): [
             token_id: String => hex12,
             token_hash: Vec<u8> => blob,
             grant_id: String => id(OAuthGrantId),
@@ -706,6 +714,8 @@ target_tables! {
             expires_at: i64 => num,
             revoked_at: Option<i64> => num,
             last_used_at: Option<i64> => num,
+            #[serde(default)]
+            ability_write: i64 => num,
         ]
         pk(sqlite_order: "token_id", pg_order: "token_id COLLATE \"C\"", sqlite_gt: "token_id > $1", pg_gt: "token_id COLLATE \"C\" > $1", limit_param: "$2"): [
             token_id: String,
@@ -1291,7 +1301,7 @@ target_tables! {
         indexes(|r| { validate_index(r.owner.len() + r.actor.len() + r.request_key.len())?; })
     },
     AgentSchedules (AgentSchedulesRow, "agent_schedules") {
-        cols("schedule_id,owner_id,space_id,project_folder_id,title,init_prompt,config_revision,cron_expr,timezone,approved_role,paused_reason,write_class_mask,budgets,misfire_policy,next_slot_utc_ms,deleted_at,revision,created_at,updated_at", "$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19"): [
+        cols("schedule_id,owner_id,space_id,project_folder_id,title,init_prompt,config_revision,cron_expr,timezone,approved_role,approved_skills,paused_reason,write_class_mask,budgets,misfire_policy,next_slot_utc_ms,deleted_at,revision,created_at,updated_at", "$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20"): [
             schedule_id: String => id(ScheduleId),
             owner_id: String => id(PrincipalId),
             space_id: String => id(SpaceId),
@@ -1302,11 +1312,13 @@ target_tables! {
             cron_expr: String => text,
             timezone: String => text,
             approved_role: String => text,
+            #[serde(default = "empty_ability_pins")]
+            approved_skills: String => text,
             paused_reason: Option<String> => opt_text,
             write_class_mask: i64 => num,
             budgets: String => text,
             misfire_policy: String => text,
-            next_slot_utc_ms: i64 => num,
+            next_slot_utc_ms: Option<i64> => num,
             deleted_at: Option<i64> => num,
             revision: i64 => num,
             created_at: i64 => num,
@@ -1322,7 +1334,7 @@ target_tables! {
         })
     },
     AgentScheduleRuns (AgentScheduleRunsRow, "agent_schedule_runs") {
-        cols("run_id,schedule_id,slot_utc_ms,lease_epoch,claim_request_hash,owner_auth_version,config_revision,admission_epoch,history_scope,expires_at,claimed_schedule_revision,reserved_next_slot,status,started_at,finished_at,safe_result", "$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16"): [
+        cols("run_id,schedule_id,slot_utc_ms,lease_epoch,claim_request_hash,owner_auth_version,config_revision,admission_epoch,history_scope,expires_at,claimed_schedule_revision,reserved_next_slot,approved_skills,keeper_log_id,keeper_project_folder_id,status,started_at,finished_at,safe_result", "$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19"): [
             run_id: String => id(AgentRunId),
             schedule_id: String => id(ScheduleId),
             slot_utc_ms: i64 => num,
@@ -1334,7 +1346,11 @@ target_tables! {
             history_scope: String => text,
             expires_at: i64 => num,
             claimed_schedule_revision: i64 => num,
-            reserved_next_slot: i64 => num,
+            reserved_next_slot: Option<i64> => num,
+            #[serde(default = "empty_ability_pins")]
+            approved_skills: String => text,
+            keeper_log_id: Option<String> => opt_id(ChatThreadId),
+            keeper_project_folder_id: Option<String> => opt_id(FolderId),
             status: String => text,
             started_at: i64 => num,
             finished_at: Option<i64> => num,

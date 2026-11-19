@@ -879,6 +879,7 @@ async fn run_writer_benchmark_case(
                     &space.scope,
                     &actor,
                     CreateNote {
+                        folder_page: false,
                         note: nid.clone(),
                         parent: None,
                         slug: format!("writer-note-{w}"),
@@ -1201,6 +1202,7 @@ async fn seed_rollback_microfixture(store: &CanonicalStore) -> PreparedRollbackT
                     &space.scope,
                     &owner,
                     CreateNote {
+                        folder_page: false,
                         note: nid.clone(),
                         parent: None,
                         slug: format!("pre-note-{i}"),
@@ -1225,6 +1227,7 @@ async fn seed_rollback_microfixture(store: &CanonicalStore) -> PreparedRollbackT
                 &space.scope,
                 &owner,
                 CreateNote {
+                    folder_page: false,
                     note: deleted_nid.clone(),
                     parent: None,
                     slug: "colliding-target".to_owned(),
@@ -1348,6 +1351,7 @@ async fn seed_rollback_microfixture(store: &CanonicalStore) -> PreparedRollbackT
                     &space.scope,
                     &owner,
                     CreateNote {
+                        folder_page: false,
                         note: nid.clone(),
                         parent: None,
                         slug,
@@ -1753,6 +1757,9 @@ async fn seed_chat_windows(
                     scope,
                     owner,
                     AppendChat {
+                        tool_calls: Vec::new(),
+                        provenance: None,
+                        proposed_diff: None,
                         thread: thread.clone(),
                         parent,
                         kind: if turn % 2 == 0 {
@@ -2139,6 +2146,7 @@ async fn measure_board_moves(
                 &space.scope,
                 &owner,
                 CreateNote {
+                    folder_page: false,
                     note: view_nid.clone(),
                     parent: None,
                     slug: "kanban".to_owned(),
@@ -2171,6 +2179,7 @@ async fn measure_board_moves(
                     &space.scope,
                     &owner,
                     CreateNote {
+                        folder_page: false,
                         note: nid.clone(),
                         parent: None,
                         slug: slug.clone(),

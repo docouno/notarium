@@ -1,0 +1,116 @@
+use super::super::invalid;
+use notarium_core::{
+    error::{PortError, ValidationReason},
+    ids::{ContentDigest, FolderId},
+    model::{FolderRef, HistoryScope},
+    query::KeysetCursor,
+};
+use std::{
+    collections::VecDeque,
+    sync::Mutex,
+    time::{Duration, Instant},
+};
+
+const CURSOR_PREFIX: &str = "notes_";
+const CURSOR_TTL: Duration = Duration::from_secs(15 * 60);
+const MAX_CURSORS: usize = 512;
+
+/// A continuation can point past a row that was omitted by an egress fence.
+/// Keep both storage cursor positions server-side so their contents stay private.
+#[derive(Default)]
+pub(in super::super) struct NoteCursors {
+    entries: Mutex<VecDeque<CursorEntry>>,
+}
+
+struct CursorEntry {
+    id: u128,
+    opened: Instant,
+    cursor: NoteContinuation,
+}
+
+#[derive(Clone)]
+pub(super) struct NoteContinuation {
+    pub folder: FolderRef,
+    pub scope: HistoryScope,
+    pub fingerprint: ContentDigest,
+    pub notes: Option<KeysetCursor>,
+    pub folders: Option<FolderId>,
+    pub total: Option<u64>,
+}
+
+impl NoteCursors {
+    pub(super) fn insert(&self, cursor: NoteContinuation) -> Result<String, PortError> {
+        let mut bytes = [0_u8; 16];
+        getrandom::fill(&mut bytes).map_err(|_| invalid(ValidationReason::InvalidState))?;
+        let id = u128::from_be_bytes(bytes);
+        let mut entries = self.entries.lock().unwrap_or_else(|err| err.into_inner());
+        entries.retain(|entry| entry.opened.elapsed() < CURSOR_TTL);
+        if entries.iter().any(|entry| entry.id == id) {
+            return Err(invalid(ValidationReason::InvalidState));
+        }
+        if entries.len() == MAX_CURSORS {
+            entries.pop_front();
+        }
+        entries.push_back(CursorEntry {
+            id,
+            opened: Instant::now(),
+            cursor,
+        });
+        Ok(format!("{CURSOR_PREFIX}{id:032x}"))
+    }
+
+    pub(super) fn open(&self, token: &str) -> Result<NoteContinuation, PortError> {
+        let stale = || invalid(ValidationReason::CursorStale);
+        let key = token.strip_prefix(CURSOR_PREFIX).ok_or_else(stale)?;
+        if key.len() != 32 {
+            return Err(stale());
+        }
+        let id = u128::from_str_radix(key, 16).map_err(|_| stale())?;
+        let entries = self.entries.lock().unwrap_or_else(|err| err.into_inner());
+        entries
+            .iter()
+            .find(|entry| entry.id == id && entry.opened.elapsed() < CURSOR_TTL)
+            .map(|entry| entry.cursor.clone())
+            .ok_or_else(stale)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use notarium_core::ids::{HistoryIncarnation, SpaceId};
+
+    #[test]
+    fn continuation_replays_only_against_the_registering_instance() {
+        let cursors = NoteCursors::default();
+        let space_id = SpaceId::from_bytes([1; 16]);
+        let scope = HistoryScope {
+            space_id: space_id.clone(),
+            incarnation: HistoryIncarnation::from_bytes([2; 16]),
+        };
+        let folder = FolderRef {
+            space_id,
+            folder_id: FolderId::from_bytes([3; 16]),
+        };
+        let child = FolderId::from_bytes([4; 16]);
+        let token = cursors
+            .insert(NoteContinuation {
+                folder: folder.clone(),
+                scope,
+                fingerprint: ContentDigest::from_bytes([5; 32]),
+                notes: None,
+                folders: Some(child.clone()),
+                total: None,
+            })
+            .unwrap();
+
+        assert!(!token.contains(child.as_str()));
+        assert!(cursors.open(&format!("{token}0")).is_err());
+        assert!(NoteCursors::default().open(&token).is_err());
+        for _ in 0..2 {
+            let cursor = cursors.open(&token).unwrap();
+            assert_eq!(cursor.folder, folder);
+            assert_eq!(cursor.folders.as_ref(), Some(&child));
+        }
+    }
+}

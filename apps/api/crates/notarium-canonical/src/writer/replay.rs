@@ -4,9 +4,9 @@ use notarium_core::{
     auth::{EngineAuthContext, ResourceFacts, Space},
     classes::DocClass,
     error::PortError,
-    ids::{ChatThreadId, FolderId, JobId, NoteId},
+    ids::{ChatThreadId, FolderId, JobId, NoteId, ThreadEntrySeq},
     model::{HistoryScope, NoteRef},
-    ports::LinkTarget,
+    ports::{CanonicalEffectAdmission, LinkTarget, ResolvedMemoryTarget, SpaceContext},
 };
 
 use super::CommandIdentitySpec;
@@ -34,14 +34,34 @@ pub(crate) enum ReplayResource {
 pub(crate) enum ReplayPolicy {
     Documents(Vec<ReplayResource>),
     Schema(Vec<ReplayResource>),
-    Chat(ChatThreadId, Vec<NoteRef>, bool),
+    Memory(ResolvedMemoryTarget),
+    Chat(ChatThreadId, Option<ThreadEntrySeq>, Vec<NoteRef>, bool),
     Job(Option<JobId>, Vec<NoteId>),
 }
 
+#[derive(Debug)]
+pub(crate) struct ReplayAuthority {
+    pub(crate) auth: EngineAuthContext,
+    pub(crate) policy: ReplayPolicy,
+    pub(crate) canonical_effect: Option<CanonicalEffectAdmission>,
+}
+
 /// A domain fingerprint becomes usable by the writer only after binding a policy.
-pub(crate) struct UnboundCommand(pub(crate) CommandIdentitySpec);
+pub(crate) struct UnboundCommand(
+    pub(crate) CommandIdentitySpec,
+    Option<CanonicalEffectAdmission>,
+);
 
 impl UnboundCommand {
+    pub(crate) fn new(spec: CommandIdentitySpec) -> Self {
+        Self(spec, None)
+    }
+
+    pub(crate) fn with_canonical_effect(mut self, ctx: &SpaceContext) -> Self {
+        self.1 = ctx.canonical_effect().cloned();
+        self
+    }
+
     pub(crate) fn command_hash(&self) -> notarium_core::ids::ContentDigest {
         self.0.command_hash
     }
@@ -51,7 +71,11 @@ impl UnboundCommand {
         auth: &EngineAuthContext,
         policy: ReplayPolicy,
     ) -> CommandIdentitySpec {
-        self.0.authority = Some(std::sync::Arc::new((auth.clone(), policy)));
+        self.0.authority = Some(std::sync::Arc::new(ReplayAuthority {
+            auth: auth.clone(),
+            policy,
+            canonical_effect: self.1,
+        }));
         self.0
     }
 
@@ -106,7 +130,19 @@ impl UnboundCommand {
         thread: &ChatThreadId,
         reads: Vec<NoteRef>,
     ) -> CommandIdentitySpec {
-        self.with_policy(auth, ReplayPolicy::Chat(thread.clone(), reads, false))
+        self.with_policy(auth, ReplayPolicy::Chat(thread.clone(), None, reads, false))
+    }
+
+    pub(crate) fn for_chat_leaf(
+        self,
+        auth: &EngineAuthContext,
+        thread: &ChatThreadId,
+        leaf: ThreadEntrySeq,
+    ) -> CommandIdentitySpec {
+        self.with_policy(
+            auth,
+            ReplayPolicy::Chat(thread.clone(), Some(leaf), Vec::new(), false),
+        )
     }
 
     pub(crate) fn for_link(
@@ -129,23 +165,58 @@ impl UnboundCommand {
 }
 
 impl CommandIdentitySpec {
+    pub(crate) async fn authorize_confirmed_chat_step(
+        &self,
+        tx: &mut BackendConn<'_>,
+        scope: &HistoryScope,
+        committing: bool,
+    ) -> Result<(), PortError> {
+        let Some(super::fingerprint::CommandProof::Confirmed { step, kind }) =
+            self.fingerprint_proof.as_deref()
+        else {
+            return Ok(());
+        };
+        let Some(ReplayAuthority { auth, .. }) = self.authority.as_deref() else {
+            return Err(DomainError::validation(
+                notarium_core::error::ValidationReason::InvalidAuthority,
+            )
+            .into());
+        };
+        if step.identity().actor != self.actor || step.identity().key != self.command_key {
+            return Err(DomainError::validation(
+                notarium_core::error::ValidationReason::InvalidAuthority,
+            )
+            .into());
+        }
+        crate::chats::verify_confirmed_chat_step_tx(tx, auth, scope, step, kind, committing).await
+    }
+
     pub(crate) async fn authorize_replay(
         &self,
         tx: &mut BackendConn<'_>,
         scope: &HistoryScope,
     ) -> Result<(), PortError> {
-        let Some((auth, policy)) = self.authority.as_deref() else {
+        self.authorize_confirmed_chat_step(tx, scope, false).await?;
+        let Some(ReplayAuthority { auth, policy, .. }) = self.authority.as_deref() else {
             return Ok(());
         };
         let srec = load_space_record(tx, &scope.space_id).await?;
         srec.scope.check(scope)?;
         match policy {
-            ReplayPolicy::Chat(thread, reads, legacy_staged) => {
+            ReplayPolicy::Memory(target) => {
+                let (_, head) =
+                    crate::catalog::memory::authorized_slot(tx, auth, &srec, target).await?;
+                if head.is_none() {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+            }
+            ReplayPolicy::Chat(thread, leaf, reads, legacy_staged) => {
                 crate::chats::authorize_chat_replay_tx(
                     tx,
                     &srec.space,
                     auth,
                     thread,
+                    *leaf,
                     *legacy_staged,
                 )
                 .await?;

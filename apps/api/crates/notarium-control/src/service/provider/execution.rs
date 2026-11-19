@@ -100,7 +100,7 @@ impl Runtime {
     }
 }
 pub(super) enum Request {
-    Completion(CompletionRequest),
+    Completion(Box<CompletionRequest>),
     Embedding(EmbeddingRequest),
     Check(CheckProviderConnection),
 }
@@ -114,7 +114,7 @@ impl Job {
         Self {
             ctx: AccountContext::new(ctx.auth().clone(), ctx.budget.clone()),
             scope: Some(ctx.scope().clone()),
-            request: Request::Completion(request),
+            request: Request::Completion(Box::new(request)),
         }
     }
     pub fn embedding(ctx: SpaceContext, request: EmbeddingRequest) -> Self {
@@ -200,18 +200,87 @@ impl Job {
             Request::Check(_) => vec![],
         }
     }
-    pub fn egress(&self, parts: &[ProviderMessage]) -> Result<ProviderEgressRequest, PortError> {
+    pub fn egress(
+        &self,
+        parts: &[ProviderMessage],
+        dependencies: ProviderEgressDependencies,
+    ) -> Result<ProviderEgressRequest, PortError> {
+        if dependencies.origins.len() > MAX_PROVIDER_ORIGINS
+            || dependencies.projects.len() > MAX_PROVIDER_SECONDARY_PROJECTS + 1
+        {
+            return Err(invalid(ValidationReason::InvalidLimit));
+        }
         let mut origins = BTreeMap::new();
+        let mut projects = BTreeMap::new();
+        let primary = self
+            .scope
+            .clone()
+            .ok_or_else(|| invalid(ValidationReason::ScopeMismatch))?;
+        let mut add_project = |project: &FolderRef| {
+            if project.space_id != primary.space_id {
+                projects.insert(
+                    (project.space_id.clone(), project.folder_id.clone()),
+                    project.clone(),
+                );
+            }
+        };
+        if let Request::Completion(request) = &self.request {
+            if request.secondary_projects.len() > MAX_PROVIDER_SECONDARY_PROJECTS
+                || request
+                    .secondary_projects
+                    .iter()
+                    .any(|project| project.space_id == primary.space_id)
+            {
+                return Err(invalid(ValidationReason::InvalidLimit));
+            }
+            for project in &request.secondary_projects {
+                add_project(project);
+            }
+        }
         for part in parts {
             let origin = part.origin();
+            if let Some(project) = origin.owning_project() {
+                add_project(project);
+            }
             origins.insert(json(&origin)?, origin);
+            if let Some(proof) = part.provenance() {
+                if proof.origins.len() > MAX_PROVIDER_ORIGINS
+                    || proof.projects.len() > MAX_PROVIDER_SECONDARY_PROJECTS
+                {
+                    return Err(invalid(ValidationReason::InvalidLimit));
+                }
+                for origin in &proof.origins {
+                    if let Some(project) = origin.owning_project() {
+                        add_project(project);
+                    }
+                    origins.insert(json(origin)?, origin.clone());
+                    if origins.len() > MAX_PROVIDER_ORIGINS {
+                        return Err(invalid(ValidationReason::InvalidLimit));
+                    }
+                }
+                for project in &proof.projects {
+                    add_project(project);
+                }
+            }
         }
-        if origins.len() > 4096 {
+        for dependency in dependencies.origins {
+            if let Some(project) = dependency.owning_project() {
+                add_project(project);
+            }
+            origins.insert(json(&dependency)?, dependency);
+        }
+        for project in &dependencies.projects {
+            add_project(project);
+        }
+        if origins.len() > MAX_PROVIDER_ORIGINS || projects.len() > MAX_PROVIDER_SECONDARY_PROJECTS
+        {
             return Err(invalid(ValidationReason::InvalidLimit));
         }
         Ok(ProviderEgressRequest {
             origins: origins.into_values().collect(),
+            primary,
             project: self.project().cloned(),
+            secondary_projects: projects.into_values().collect(),
         })
     }
     pub fn encode(&self, snapshot: &Snapshot) -> Result<Vec<u8>, PortError> {

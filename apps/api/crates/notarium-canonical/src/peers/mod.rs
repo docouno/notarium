@@ -3637,6 +3637,7 @@ async fn settle_and_update_collab_session(
                         .await?;
                 let meta = RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Note(
                     NoteRevisionMetadata {
+                        folder_page: anc.cover_note.as_ref() == Some(&note),
                         note_id: note.clone(),
                         parent_folder_id: head.parent_folder_id.clone(),
                         is_root_child: anc.is_root_child,

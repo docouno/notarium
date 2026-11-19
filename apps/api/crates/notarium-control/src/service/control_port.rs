@@ -1,7 +1,7 @@
 //! One concrete adapter binds all control operations to one authority owner.
 use super::{ControlService, provider::ProviderService};
 use notarium_core::{
-    auth::EngineAuthContext,
+    auth::{EngineAuthContext, ProposalHumanAccess},
     ids::*,
     model::*,
     ports::{control::*, *},
@@ -33,6 +33,32 @@ impl ControlPlane {
 impl ControlPort for ControlPlane {
     fn resolve_auth(&self, ctx: PreAuthContext) -> PortFuture<'_, EngineAuthContext> {
         Box::pin(self.control.resolve(ctx))
+    }
+    fn revalidate_auth(&self, ctx: AccountContext) -> PortFuture<'_, EngineAuthContext> {
+        Box::pin(async move {
+            let budget = crate::store::lease::OperationBudget::new(ctx.budget.clone());
+            Ok(self
+                .control
+                .current_account(&ctx, &budget)
+                .await?
+                .auth()
+                .clone())
+        })
+    }
+    fn fence_canonical_effect(
+        &self,
+        authority: EngineAuthContext,
+        ctx: SpaceContext,
+        effect: CanonicalEffect,
+    ) -> PortFuture<'_, SpaceContext> {
+        Box::pin(self.control.fence_canonical_effect(authority, ctx, effect))
+    }
+    fn revalidate_proposal_human(
+        &self,
+        ctx: AccountContext,
+        access: ProposalHumanAccess,
+    ) -> PortFuture<'_, EngineAuthContext> {
+        Box::pin(self.control.revalidate_proposal_human(ctx, access))
     }
     fn whoami(&self, ctx: AccountContext) -> PortFuture<'_, PrincipalInfo> {
         Box::pin(self.control.whoami(ctx))
@@ -140,6 +166,13 @@ impl ControlPort for ControlPlane {
     ) -> PortFuture<'_, AbilityDescriptor> {
         Box::pin(self.control.get_ability(ctx, reference, project))
     }
+    fn inspect_ability(
+        &self,
+        ctx: AccountContext,
+        identity: AbilityIdentity,
+    ) -> PortFuture<'_, AbilityInspection> {
+        Box::pin(self.control.inspect_ability(ctx, identity))
+    }
     fn update_ability_binding(
         &self,
         ctx: AccountContext,
@@ -161,6 +194,30 @@ impl ControlPort for ControlPlane {
     ) -> PortFuture<'_, ControlCommit<AbilityTrailUpdate>> {
         Box::pin(self.control.set_ability_trail(ctx, request))
     }
+    fn compare_authored_ability_binding(
+        &self,
+        ctx: AccountContext,
+        request: AccountMutation<AbilityBindingChange>,
+    ) -> PortFuture<'_, ControlCommit<AbilityRef>> {
+        Box::pin(self.control.compare_authored_ability_binding(ctx, request))
+    }
+    fn compare_authored_ability_preference(
+        &self,
+        ctx: AccountContext,
+        request: AccountMutation<AbilityPreferenceChange>,
+    ) -> PortFuture<'_, ControlCommit<AbilityPreferenceUpdate>> {
+        Box::pin(
+            self.control
+                .compare_authored_ability_preference(ctx, request),
+        )
+    }
+    fn adopt_authored_ability_promotion(
+        &self,
+        ctx: AccountContext,
+        request: AccountMutation<AdoptAbilityPromotion>,
+    ) -> PortFuture<'_, ControlCommit<AbilityPromotionResult>> {
+        Box::pin(self.control.adopt_authored_ability_promotion(ctx, request))
+    }
     fn lookup_mcp_dedup(
         &self,
         ctx: AccountContext,
@@ -179,12 +236,27 @@ impl ControlPort for ControlPlane {
     ) -> PortFuture<'_, ResolvedMemoryTarget> {
         Box::pin(self.control.resolve_memory_target(ctx, target, category))
     }
+    fn inspect_memory_target(
+        &self,
+        ctx: AccountContext,
+        target: MemoryTarget,
+        category: String,
+    ) -> PortFuture<'_, MemoryTargetSnapshot> {
+        Box::pin(self.control.inspect_memory_target(ctx, target, category))
+    }
     fn create_schedule(
         &self,
         ctx: AccountContext,
         request: AccountMutation<CreateSchedule>,
     ) -> PortFuture<'_, ControlCommit<AgentSchedule>> {
         Box::pin(self.control.create_schedule(ctx, request))
+    }
+    fn schedule_ability_candidate(
+        &self,
+        ctx: AccountContext,
+        selection: ScheduleAbilitySelection,
+    ) -> PortFuture<'_, ScheduleAbilityCandidate> {
+        Box::pin(self.control.schedule_ability_candidate(ctx, selection))
     }
     fn get_schedule(
         &self,
@@ -221,6 +293,14 @@ impl ControlPort for ControlPlane {
         page: ControlPageRequest,
     ) -> PortFuture<'_, ControlPage<AgentSchedule>> {
         Box::pin(self.control.list_due_schedules(ctx, now, page))
+    }
+    fn list_expired_schedule_runs(
+        &self,
+        ctx: MaintenanceContext,
+        now: Timestamp,
+        page: ControlPageRequest,
+    ) -> PortFuture<'_, ControlPage<ScheduleRunReceipt>> {
+        Box::pin(self.control.list_expired_schedule_runs(ctx, now, page))
     }
     fn get_schedule_run(
         &self,

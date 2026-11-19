@@ -98,6 +98,7 @@ async fn lifecycle(pg: bool) {
         Some(CompletionEvent::Text(_))
     ));
     assert_eq!(setup.egress.active.load(Ordering::SeqCst), 1);
+    assert_eq!(setup.egress.admitted.load(Ordering::SeqCst), 2);
     drop(stream);
     wait_count(&closed, 2).await;
     settled(&mut setup, 2).await;

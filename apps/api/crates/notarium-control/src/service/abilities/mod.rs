@@ -68,6 +68,52 @@ struct Cursor {
     scope: ContentDigest,
     inner: String,
 }
+async fn ability_control_state(
+    tx: &mut Transaction,
+    owner: &PrincipalId,
+    key: &str,
+    id: &AbilityId,
+) -> Result<
+    (
+        Option<AbilityAvailabilityRow>,
+        Option<AbilityPreferencesRow>,
+    ),
+    PortError,
+> {
+    let binding = rows!(tx,AbilityAvailabilityRow,fetch_optional,
+        "SELECT * FROM ability_availability WHERE placement=$1 AND ability_id=$2",
+        "SELECT * FROM v1_control.ability_availability WHERE placement=$1 AND ability_id=$2";key,id.as_str())?;
+    let preference = ability_preference(tx, owner, key, id).await?;
+    Ok((binding, preference))
+}
+
+async fn ability_preference(
+    tx: &mut Transaction,
+    owner: &PrincipalId,
+    key: &str,
+    id: &AbilityId,
+) -> Result<Option<AbilityPreferencesRow>, PortError> {
+    rows!(tx,AbilityPreferencesRow,fetch_optional,
+        "SELECT * FROM ability_preferences WHERE owner_id=$1 AND placement=$2 AND ability_id=$3",
+        "SELECT * FROM v1_control.ability_preferences WHERE owner_id=$1 AND placement=$2 AND ability_id=$3";owner.as_str(),key,id.as_str())
+}
+
+fn overlay_state(
+    binding: Option<&AbilityAvailabilityRow>,
+    preference: Option<&AbilityPreferencesRow>,
+) -> Result<AbilityOverlayState, PortError> {
+    Ok(AbilityOverlayState {
+        binding_enabled: binding.is_none_or(|row| row.enabled == 1),
+        binding_revision: binding
+            .map(|row| ControlRevision::new(row.revision as u64))
+            .transpose()?,
+        preference_enabled: preference.is_none_or(|row| row.enabled == 1),
+        preference_revision: preference
+            .map(|row| ControlRevision::new(row.revision as u64))
+            .transpose()?,
+    })
+}
+
 impl ControlService {
     pub(super) async fn ability_placement(
         &self,
@@ -161,18 +207,22 @@ impl ControlService {
             return Err(DomainError::ResourceNotFound.into());
         }
         if identity.placement != AbilityPlacement::System {
-            let note = self.catalog_note(ctx, &value.entrypoint).await?;
+            let entrypoint = value
+                .entrypoint
+                .as_ref()
+                .ok_or_else(|| invalid(ValidationReason::InvalidState))?;
+            let note = self.catalog_note(ctx, entrypoint).await?;
             if note.facts.class != DocClass::Skill
                 || note.facts.ability_package.as_ref() != Some(&identity.id)
             {
                 return Err(invalid(ValidationReason::InvalidState));
             }
             match identity.placement {
-                AbilityPlacement::OwnedSpace(space) if space != value.entrypoint.space_id => {
+                AbilityPlacement::OwnedSpace(space) if space != entrypoint.space_id => {
                     return Err(invalid(ValidationReason::InvalidState));
                 }
                 AbilityPlacement::OwnedProject(project)
-                    if project.space_id != value.entrypoint.space_id
+                    if project.space_id != entrypoint.space_id
                         || !note.facts.ancestor_folders.contains(&project.folder_id) =>
                 {
                     return Err(invalid(ValidationReason::InvalidState));
@@ -184,6 +234,8 @@ impl ControlService {
                 }
                 _ => (),
             }
+        } else if value.entrypoint.is_some() {
+            return Err(invalid(ValidationReason::InvalidState));
         }
         Ok(value)
     }
@@ -217,14 +269,28 @@ impl ControlService {
         mut value: AbilityDescriptor,
         project: Option<&FolderRef>,
     ) -> Result<AbilityDescriptor, PortError> {
+        if !self
+            .promotion_is_committed(
+                tx,
+                value.promoted_from.as_ref(),
+                &value.reference.identity(),
+            )
+            .await?
+        {
+            value.enabled = false;
+        }
         let key = placement(&value.reference.placement)?;
-        let id = value.reference.id.as_str();
-        let availability = rows!(tx,AbilityAvailabilityRow,fetch_optional,"SELECT * FROM ability_availability WHERE placement=$1 AND ability_id=$2","SELECT * FROM v1_control.ability_availability WHERE placement=$1 AND ability_id=$2";&key,id)?;
+        let id = &value.reference.id;
+        let (availability, preference) =
+            ability_control_state(tx, ctx.auth().principal(), &key, id).await?;
+        if value.requires_explicit_binding && availability.is_none() {
+            value.enabled = false;
+        }
         if let Some(row) = availability {
             value.enabled &= row.enabled == 1;
             if row.mode == "selected-projects" {
                 let selected = if let Some(project) = project {
-                    rows!(tx,AbilityProjectBindingsRow,fetch_optional,"SELECT * FROM ability_project_bindings WHERE placement=$1 AND ability_id=$2 AND target_space=$3 AND project_id=$4","SELECT * FROM v1_control.ability_project_bindings WHERE placement=$1 AND ability_id=$2 AND target_space=$3 AND project_id=$4";&key,id,project.space_id.as_str(),project.folder_id.as_str())?.is_some()
+                    rows!(tx,AbilityProjectBindingsRow,fetch_optional,"SELECT * FROM ability_project_bindings WHERE placement=$1 AND ability_id=$2 AND target_space=$3 AND project_id=$4","SELECT * FROM v1_control.ability_project_bindings WHERE placement=$1 AND ability_id=$2 AND target_space=$3 AND project_id=$4";&key,id.as_str(),project.space_id.as_str(),project.folder_id.as_str())?.is_some()
                 } else {
                     false
                 };
@@ -233,11 +299,48 @@ impl ControlService {
                 return Err(invalid(ValidationReason::InvalidState));
             }
         }
-        let preference = rows!(tx,AbilityPreferencesRow,fetch_optional,"SELECT * FROM ability_preferences WHERE owner_id=$1 AND placement=$2 AND ability_id=$3","SELECT * FROM v1_control.ability_preferences WHERE owner_id=$1 AND placement=$2 AND ability_id=$3";ctx.auth().principal().as_str(),&key,id)?;
         if let Some(row) = preference {
             value.enabled &= row.enabled == 1;
         }
         Ok(value)
+    }
+
+    pub(super) async fn promotion_is_committed(
+        &self,
+        tx: &mut Transaction,
+        source: Option<&AbilityRef>,
+        destination: &AbilityIdentity,
+    ) -> Result<bool, PortError> {
+        let Some(source) = source else {
+            return Ok(true);
+        };
+        let key = placement(&source.placement)?;
+        let row = rows!(tx,AbilityPlacementTrailRow,fetch_optional,
+            "SELECT * FROM ability_placement_trail WHERE source_placement=$1 AND ability_id=$2",
+            "SELECT * FROM v1_control.ability_placement_trail WHERE source_placement=$1 AND ability_id=$2";&key,source.id.as_str())?;
+        let Some(row) = row else {
+            return Ok(false);
+        };
+        let trail: Trail = serde_json::from_str(&row.manifest_ref)
+            .map_err(|_| invalid(ValidationReason::InvalidState))?;
+        Ok(trail.source == *source
+            && trail.destination.identity() == *destination
+            && trail.destination.revision != source.revision
+            && row.destination_id == destination.id.as_str()
+            && row.destination_placement == placement(&destination.placement)?)
+    }
+
+    pub(super) async fn has_ability_binding(
+        &self,
+        tx: &mut Transaction,
+        identity: &AbilityIdentity,
+    ) -> Result<bool, PortError> {
+        let key = placement(&identity.placement)?;
+        let row = rows!(tx,(i64,),fetch_optional,
+            "SELECT CAST(1 AS BIGINT) FROM ability_availability WHERE placement=$1 AND ability_id=$2",
+            "SELECT CAST(1 AS BIGINT) FROM v1_control.ability_availability WHERE placement=$1 AND ability_id=$2";
+            &key,identity.id.as_str())?;
+        Ok(row.is_some())
     }
     async fn select_overlaid_winner(
         &self,
@@ -277,34 +380,28 @@ impl ControlService {
     pub(super) async fn check_active_role_catalog(
         &self,
         ctx: &AccountContext,
-        role: &AbilityRef,
-        followed: Result<(AbilityRef, Vec<AbilityPlacement>), PortError>,
+        followed: Result<AbilityRef, PortError>,
         project: Option<&FolderRef>,
     ) -> Result<Option<AbilityDescriptor>, PortError> {
-        if !role_placement_matches_project(&role.placement, project) {
-            return Ok(None);
-        }
-        let (final_ref, visited) = match followed {
-            Ok(pair) => pair,
+        let final_ref = match followed {
+            Ok(reference) => reference,
             Err(error) if hidden(&error) => return Ok(None),
             Err(error) => return Err(error),
         };
-        if final_ref != *role {
+        if !role_placement_matches_project(&final_ref.placement, project) {
             return Ok(None);
         }
-        for item in &visited {
-            match self.ability_placement(ctx, item).await {
-                Ok(()) => (),
-                Err(error) if hidden(&error) => return Ok(None),
-                Err(error) => return Err(error),
-            }
+        match self.ability_placement(ctx, &final_ref.placement).await {
+            Ok(()) => (),
+            Err(error) if hidden(&error) => return Ok(None),
+            Err(error) => return Err(error),
         }
-        let raw = match self.raw_ability(ctx, role.identity()).await {
+        let raw = match self.raw_ability(ctx, final_ref.identity()).await {
             Ok(raw) => raw,
             Err(error) if hidden(&error) => return Ok(None),
             Err(error) => return Err(error),
         };
-        if raw.reference != *role || raw.kind != AbilityKind::Role || !raw.healthy {
+        if raw.reference != final_ref || raw.kind != AbilityKind::Role || !raw.healthy {
             return Ok(None);
         }
         Ok(Some(raw))
@@ -595,6 +692,86 @@ impl ControlService {
             _ => Err(DomainError::ResourceNotFound.into()),
         }
     }
+    pub async fn inspect_ability(
+        &self,
+        ctx: AccountContext,
+        identity: AbilityIdentity,
+    ) -> Result<AbilityInspection, PortError> {
+        let budget = OperationBudget::new(ctx.budget.clone());
+        let current = self.current_account(&ctx, &budget).await?;
+        let mut descriptor = budget
+            .run(
+                self.raw_ability(&current, identity.clone()),
+                CommitEffect::NotCommitted,
+            )
+            .await?;
+        let key = placement(&identity.placement)?;
+        let mut rtx = self.store.read(budget.clone()).await?;
+        let state = budget.run(async {
+            let tx = rtx.inner_mut();
+            if !self.promotion_is_committed(tx, descriptor.promoted_from.as_ref(), &identity).await? {
+                return Err(DomainError::ResourceNotFound.into());
+            }
+            let (binding, preference) =
+                ability_control_state(tx, current.auth().principal(), &key, &identity.id).await?;
+            let selected = match binding.as_ref().map(|row| row.mode.as_str()) {
+                None | Some("all-projects") => None,
+                Some("selected-projects") => {
+                    let rows = rows!(tx,AbilityProjectBindingsRow,fetch_all,
+                        "SELECT * FROM ability_project_bindings WHERE placement=$1 AND ability_id=$2 ORDER BY target_space,project_id LIMIT 201",
+                        "SELECT * FROM v1_control.ability_project_bindings WHERE placement=$1 AND ability_id=$2 ORDER BY target_space,project_id LIMIT 201";&key,identity.id.as_str())?;
+                    if rows.len() > 200 {
+                        return Err(invalid(ValidationReason::BudgetExceeded));
+                    }
+                    Some(rows)
+                }
+                _ => return Err(invalid(ValidationReason::InvalidState)),
+            };
+            Ok((binding, preference, selected))
+        }, CommitEffect::NotCommitted).await;
+        budget.run(rtx.finish(), CommitEffect::NotCommitted).await?;
+        let (binding, preference, selected) = state?;
+        let binding_pending = descriptor.requires_explicit_binding && binding.is_none();
+        if binding_pending {
+            descriptor.enabled = false;
+        }
+        let availability = budget
+            .run(
+                async {
+                    let Some(selected) = selected else {
+                        return Ok(if binding_pending {
+                            AbilityProjects::Selected(Vec::new())
+                        } else {
+                            AbilityProjects::All
+                        });
+                    };
+                    let mut projects = Vec::new();
+                    for row in selected {
+                        let project = FolderRef {
+                            space_id: SpaceId::parse(&row.target_space)?,
+                            folder_id: FolderId::parse(&row.project_id)?,
+                        };
+                        match self.catalog_project(&current, &project).await {
+                            Ok(_) => projects.push(project),
+                            Err(error) if hidden(&error) => (),
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    Ok(AbilityProjects::Selected(projects))
+                },
+                CommitEffect::NotCommitted,
+            )
+            .await?;
+        let state = overlay_state(binding.as_ref(), preference.as_ref())?;
+        Ok(AbilityInspection {
+            descriptor,
+            availability,
+            binding_enabled: state.binding_enabled,
+            preference_enabled: state.preference_enabled,
+            binding_revision: state.binding_revision.unwrap_or(ControlRevision::ZERO),
+            overlays: state,
+        })
+    }
     async fn ability_scope(
         &self,
         tx: &mut Transaction,
@@ -634,10 +811,6 @@ impl ControlService {
         let (mut rtx, auth) = self
             .open_revalidated_read(&budget, &ctx.budget.request, ctx.auth())
             .await?;
-        if query.authoring && !auth.has_cap(Cap::AbilityWrite) {
-            let _ = rtx.finish().await;
-            return Err(DomainError::AbilityWriteForbidden.into());
-        }
         let current = AccountContext::new(auth, budget.context(ctx.budget.request.clone()));
         let scope_result = budget
             .run(
@@ -707,10 +880,12 @@ impl ControlService {
                         {
                             return Err(invalid(ValidationReason::InvalidState));
                         }
-                        if !role_placement_matches_project(
-                            &candidate.reference.placement,
-                            query.project.as_ref(),
-                        ) {
+                        if (!query.authoring || query.project.is_some())
+                            && !role_placement_matches_project(
+                                &candidate.reference.placement,
+                                query.project.as_ref(),
+                            )
+                        {
                             continue;
                         }
                         let Some(value) = self

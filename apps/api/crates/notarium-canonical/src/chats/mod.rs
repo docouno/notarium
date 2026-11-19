@@ -1,25 +1,32 @@
+mod compaction;
+mod content;
+mod queue;
 mod staging;
+mod submission;
 
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
 
+pub(crate) use content::{load_current_chat_for_egress_tx, verify_confirmed_chat_step_tx};
 use notarium_core::{
     DomainError,
-    auth::{EngineAuthContext, Space, SpaceKind, SpaceLifecycle},
+    auth::{EngineAuthContext, PrincipalKind, Space, SpaceKind, SpaceLifecycle},
     error::{PortError, ValidationReason},
     ids::{
-        AgentRunId, ChatThreadId, CommandKey, ContentDigest, FolderId, PendingInputId, PrincipalId,
-        RevisionId, SpaceId, SpaceSeq, ThreadEntrySeq,
+        AgentRunId, ChatThreadId, CommandKey, ContentDigest, FolderId, LeaseEpoch, PendingInputId,
+        PrincipalId, RevisionId, SpaceId, SpaceSeq, ThreadEntrySeq,
     },
     model::{HistoryScope, Lifecycle, NoteRef},
     ports::{
-        AppendChat, ChatBody, ChatBranch, ChatEntry, ChatEntryKind, ChatInputBody, ChatPort,
-        ChatRead, ChatThread, ChatThreadKind, Committed, ConsumePending, ConsumedPending,
-        CreateChat, ForkChat, Mutation, PendingChatInput, PortFuture, Preconditions,
-        QueueInputOutcome, QueuedInput, RedactChatEntry, RedactedChat, SpaceContext,
-        StagedChatBlob,
+        AppendChat, CanonicalChatProposal, ChatBody, ChatBranch, ChatContentRead, ChatEntry,
+        ChatEntryKind, ChatInputBody, ChatPort, ChatProposalRead, ChatRead, ChatRunRequest,
+        ChatThread, ChatThreadKind, ClaimChatRun, ClaimChatRunOutcome, Committed, ConsumePending,
+        ConsumedPending, CreateChat, DismissPending, FinishChatRunOutcome, ForkChat,
+        HydratedChatEntry, Mutation, PendingChatInput, PortFuture, Preconditions,
+        QueueInputOutcome, QueuedChatInput, QueuedInput, RedactChatEntry, RedactedChat,
+        SpaceContext, StagedChatBlob, SubmitUserChatInput, SubmitUserChatOutcome,
     },
     receipt::MutationReceiptToken,
 };
@@ -29,9 +36,9 @@ use sqlx::Row;
 use crate::{
     CanonicalStore,
     blobs::{
-        BlobOwnerKind, BlobReferenceClaim, PreparedBlobSource, RetirementReason,
-        activate_and_bind_blob_ref_tx, bind_existing_active_blob_ref_tx, count_reachable_refs_tx,
-        release_owner_blob_refs_tx,
+        BlobOwnerKind, BlobReferenceClaim, PreparedBlobSource, PublicationDiscard,
+        RetirementReason, StagedBlobTicket, activate_and_bind_blob_ref_tx,
+        bind_existing_active_blob_ref_tx, count_reachable_refs_tx, release_owner_blob_refs_tx,
     },
     changes::{EffectBodyV1, StoredAwaitReasonV1, build_effect_payload_draft},
     codec::{
@@ -42,8 +49,9 @@ use crate::{
     },
     domain::{
         common::{
-            FolderAncestryCache, derive_command_identity_spec, extract_agent_run_from_auth,
-            load_note_head_row_tx, upsert_agent_run_head_tx, validate_mutation_identity,
+            CommandDeadline, FolderAncestryCache, derive_command_identity_spec,
+            extract_agent_run_from_auth, load_note_head_row_tx, upsert_agent_run_head_tx,
+            validate_mutation_identity,
         },
         notes::{read_space_and_receipt, try_replay_completed_receipt},
     },
@@ -51,8 +59,9 @@ use crate::{
         insert_revision_row, is_note_purge_fenced_tx, load_folder_head_row, load_space_record,
     },
     sql_exec::BackendConn,
-    writer::{BatchEventDraft, ItemCommitArtifacts, PreparedWriteIntent},
+    writer::{BatchEventDraft, ItemCommitArtifacts, ItemExecCtx, PreparedWriteIntent},
 };
+use submission::{StoredQueuedChatMetadataV1, StoredUserChatSubmissionV1, UserInputReceipt};
 
 pub const PENDING_CHAT_QUEUE_LIMIT: u8 = 16;
 
@@ -66,6 +75,10 @@ struct StoredChatThreadV1 {
     head: ThreadEntrySeq,
     revision: RevisionId,
     tainted: bool,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    active_run: Option<AgentRunId>,
 }
 
 impl From<&ChatThread> for StoredChatThreadV1 {
@@ -79,6 +92,8 @@ impl From<&ChatThread> for StoredChatThreadV1 {
             head: t.head,
             revision: t.revision.clone(),
             tainted: t.tainted,
+            title: t.title.clone(),
+            active_run: t.active_run.clone(),
         }
     }
 }
@@ -94,6 +109,8 @@ impl From<StoredChatThreadV1> for ChatThread {
             head: s.head,
             revision: s.revision,
             tainted: s.tainted,
+            title: s.title,
+            active_run: s.active_run,
         }
     }
 }
@@ -295,6 +312,10 @@ enum StoredConsumedPendingV1 {
         queued: ThreadEntrySeq,
         current: ThreadEntrySeq,
     },
+    AppendedWithIntervention {
+        entry: StoredChatEntryV1,
+        intervening_human: bool,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -306,7 +327,17 @@ struct StoredCommittedConsumedPendingV1 {
 impl StoredCommittedConsumedPendingV1 {
     fn into_committed(self) -> Committed<ConsumedPending> {
         let val = match self.value {
-            StoredConsumedPendingV1::Appended(e) => ConsumedPending::Appended(e.into()),
+            StoredConsumedPendingV1::Appended(entry) => ConsumedPending::Appended {
+                entry: Box::new(entry.into()),
+                intervening_human: true,
+            },
+            StoredConsumedPendingV1::AppendedWithIntervention {
+                entry,
+                intervening_human,
+            } => ConsumedPending::Appended {
+                entry: Box::new(entry.into()),
+                intervening_human,
+            },
             StoredConsumedPendingV1::AlreadyConsumed => ConsumedPending::AlreadyConsumed,
             StoredConsumedPendingV1::BranchChanged { queued, current } => {
                 ConsumedPending::BranchChanged { queued, current }
@@ -320,14 +351,18 @@ impl StoredCommittedConsumedPendingV1 {
 
     fn sanitized_for_redaction(&self) -> Self {
         match &self.value {
-            StoredConsumedPendingV1::Appended(e) => {
+            StoredConsumedPendingV1::Appended(e)
+            | StoredConsumedPendingV1::AppendedWithIntervention { entry: e, .. } => {
                 let mut copy = e.clone();
                 copy.is_chain_node = true;
                 copy.kind = StoredChatEntryKindV1::Redacted;
                 copy.body = StoredChatBodyV1::Redacted;
                 copy.referenced_notes = Vec::new();
                 Self {
-                    value: StoredConsumedPendingV1::Appended(copy),
+                    value: StoredConsumedPendingV1::AppendedWithIntervention {
+                        entry: copy,
+                        intervening_human: true,
+                    },
                     receipt: self.receipt.clone(),
                 }
             }
@@ -385,6 +420,42 @@ impl ChatPort for CanonicalStore {
         })
     }
 
+    fn read_chat_context(
+        &self,
+        ctx: SpaceContext,
+        request: ChatRead,
+    ) -> PortFuture<'_, ChatBranch> {
+        Box::pin(compaction::context(self, ctx, request))
+    }
+
+    fn read_chat_contents(
+        &self,
+        ctx: SpaceContext,
+        request: ChatContentRead,
+    ) -> PortFuture<'_, Vec<HydratedChatEntry>> {
+        Box::pin(content::read_chat_contents(self, ctx, request))
+    }
+
+    fn read_chat_proposal(
+        &self,
+        ctx: SpaceContext,
+        request: ChatProposalRead,
+    ) -> PortFuture<'_, CanonicalChatProposal> {
+        Box::pin(content::read_chat_proposal(self, ctx, request))
+    }
+
+    fn stage_chat_blob(&self, ctx: SpaceContext, text: String) -> PortFuture<'_, StagedChatBlob> {
+        Box::pin(async move { CanonicalStore::stage_chat_blob(self, ctx, &text).await })
+    }
+
+    fn discard_staged_chat_blob(
+        &self,
+        ctx: SpaceContext,
+        staged: StagedChatBlob,
+    ) -> PortFuture<'_, ()> {
+        Box::pin(CanonicalStore::discard_staged_chat_blob(self, ctx, staged))
+    }
+
     fn create_chat(
         &self,
         ctx: SpaceContext,
@@ -412,6 +483,23 @@ impl ChatPort for CanonicalStore {
         Box::pin(async move { append_chat_impl(&store, ctx, request).await })
     }
 
+    fn submit_user_chat_input(
+        &self,
+        ctx: SpaceContext,
+        request: SubmitUserChatInput,
+    ) -> PortFuture<'_, SubmitUserChatOutcome> {
+        Box::pin(submission::submit(self, ctx, request))
+    }
+
+    fn lookup_user_chat_input(
+        &self,
+        ctx: SpaceContext,
+        request: &SubmitUserChatInput,
+    ) -> PortFuture<'_, Option<SubmitUserChatOutcome>> {
+        let idemp = submission::identity(&ctx, request);
+        Box::pin(async move { submission::lookup(self, ctx, idemp?).await })
+    }
+
     fn queue_chat_input(
         &self,
         ctx: SpaceContext,
@@ -428,6 +516,46 @@ impl ChatPort for CanonicalStore {
     ) -> PortFuture<'_, Committed<ConsumedPending>> {
         let store = self.clone();
         Box::pin(async move { consume_chat_input_impl(&store, ctx, request).await })
+    }
+
+    fn list_pending_chat_inputs(
+        &self,
+        ctx: SpaceContext,
+        thread: ChatThreadId,
+    ) -> PortFuture<'_, Vec<QueuedChatInput>> {
+        Box::pin(queue::list_pending(self, ctx, thread))
+    }
+
+    fn dismiss_chat_input(
+        &self,
+        ctx: SpaceContext,
+        request: DismissPending,
+    ) -> PortFuture<'_, bool> {
+        Box::pin(queue::dismiss_pending(self, ctx, request))
+    }
+
+    fn claim_active_run(
+        &self,
+        ctx: SpaceContext,
+        request: ClaimChatRun,
+    ) -> PortFuture<'_, ClaimChatRunOutcome> {
+        Box::pin(queue::claim(self, ctx, request))
+    }
+
+    fn finish_run_if_queue_empty(
+        &self,
+        ctx: SpaceContext,
+        request: ChatRunRequest,
+    ) -> PortFuture<'_, FinishChatRunOutcome> {
+        Box::pin(queue::finish(self, ctx, request, false))
+    }
+
+    fn recover_active_run(
+        &self,
+        ctx: SpaceContext,
+        request: ChatRunRequest,
+    ) -> PortFuture<'_, FinishChatRunOutcome> {
+        Box::pin(queue::finish(self, ctx, request, true))
     }
 
     fn redact_chat_entry(
@@ -537,10 +665,62 @@ impl CanonicalStore {
 
 fn authorize_chat_write_on_space(auth: &EngineAuthContext, space: &Space) -> Result<(), PortError> {
     auth.authorize_write_space_pin(space)?;
-    if auth.spaces()[&space.id].project_root.is_some() {
+    if auth.spaces()[&space.id].project_root.is_some() && auth.keeper_log().is_none() {
         return Err(DomainError::SpaceReadOnly.into());
     }
     Ok(())
+}
+
+fn forbid_keeper_chat_mutation(auth: &EngineAuthContext) -> Result<(), PortError> {
+    if matches!(auth.kind(), PrincipalKind::Keeper(_)) || auth.keeper_log().is_some() {
+        return Err(DomainError::SpaceReadOnly.into());
+    }
+    Ok(())
+}
+
+pub(crate) fn authorize_thread_read(
+    auth: &EngineAuthContext,
+    space: &Space,
+    thread: &ChatThreadId,
+    kind: ChatThreadKind,
+    owner: &PrincipalId,
+    project: Option<&FolderId>,
+    tainted: bool,
+) -> Result<(), PortError> {
+    if kind != ChatThreadKind::SpaceGroup && owner != auth.principal() {
+        return Err(DomainError::ResourceNotFound.into());
+    }
+    if (matches!(auth.kind(), PrincipalKind::Keeper(_)) || auth.keeper_log().is_some())
+        && (kind != ChatThreadKind::KeeperLog
+            || auth.keeper_log() != Some(thread)
+            || auth
+                .spaces()
+                .get(&space.id)
+                .and_then(|grant| grant.project_root.as_ref())
+                != project)
+    {
+        return Err(DomainError::ResourceNotFound.into());
+    }
+    Ok(auth.authorize_chat_read(space, project, tainted)?)
+}
+
+/// Change listings have no selected leaf, so use the live thread audit state.
+pub(crate) async fn authorize_live_thread_read_tx(
+    tx: &mut BackendConn<'_>,
+    space: &Space,
+    auth: &EngineAuthContext,
+    thread: &ChatThreadId,
+) -> Result<(), PortError> {
+    let head = load_thread_head_tx(tx, &space.id, thread).await?;
+    authorize_thread_read(
+        auth,
+        space,
+        thread,
+        head.kind,
+        &head.owner,
+        head.project_folder.as_ref(),
+        head.tainted_mask != 0,
+    )
 }
 
 pub(crate) async fn authorize_chat_replay_tx(
@@ -548,28 +728,66 @@ pub(crate) async fn authorize_chat_replay_tx(
     space: &Space,
     auth: &EngineAuthContext,
     thread: &ChatThreadId,
+    leaf: Option<ThreadEntrySeq>,
     legacy_staged: bool,
 ) -> Result<(), PortError> {
     authorize_chat_write_on_space(auth, space)?;
     let th = load_thread_head_opt_tx(tx, &space.id, thread)
         .await?
         .ok_or(DomainError::ResourceNotFound)?;
-    authorize_thread_mutation(auth, space, &th, legacy_staged)
+    let tainted = match leaf {
+        Some(leaf) => read_leaf_taint(tx, &space.id, thread, leaf).await?,
+        None => th.tainted_mask != 0,
+    };
+    authorize_thread_mutation(auth, space, &th, tainted || legacy_staged)
 }
 
 fn authorize_thread_mutation(
     auth: &EngineAuthContext,
     space: &Space,
     th: &ThreadHeadRow,
-    legacy_staged: bool,
+    tainted: bool,
 ) -> Result<(), PortError> {
-    let tainted = th.tainted_mask != 0 || legacy_staged;
+    if (matches!(auth.kind(), PrincipalKind::Keeper(_)) || auth.keeper_log().is_some())
+        && (th.kind != ChatThreadKind::KeeperLog
+            || auth.keeper_log() != Some(&th.thread_id)
+            || auth
+                .spaces()
+                .get(&space.id)
+                .and_then(|grant| grant.project_root.as_ref())
+                != th.project_folder.as_ref())
+    {
+        return Err(DomainError::SpaceReadOnly.into());
+    }
     if (auth.taint().is_tainted() || tainted)
         && (th.kind == ChatThreadKind::SpaceGroup || space.kind == SpaceKind::Shared)
     {
         return Err(DomainError::CrossSpaceTainted.into());
     }
-    Ok(auth.authorize_chat_read(space, th.project_folder.as_ref(), tainted)?)
+    authorize_thread_read(
+        auth,
+        space,
+        &th.thread_id,
+        th.kind,
+        &th.owner,
+        th.project_folder.as_ref(),
+        tainted,
+    )
+}
+
+async fn read_leaf_taint(
+    tx: &mut BackendConn<'_>,
+    space: &SpaceId,
+    thread: &ChatThreadId,
+    leaf: ThreadEntrySeq,
+) -> Result<bool, PortError> {
+    if leaf == ThreadEntrySeq::ZERO {
+        return Ok(false);
+    }
+    load_entry_depth_and_taint_tx(tx, space, thread, leaf)
+        .await?
+        .map(|(_, tainted)| tainted)
+        .ok_or_else(|| DomainError::ResourceNotFound.into())
 }
 
 #[derive(Clone, Debug)]
@@ -582,8 +800,9 @@ struct ThreadHeadRow {
     head_leaf_seq: ThreadEntrySeq,
     head_rev_id: RevisionId,
     next_entry_seq: ThreadEntrySeq,
-    #[allow(dead_code)]
     active_run_id: Option<AgentRunId>,
+    active_run_epoch: Option<LeaseEpoch>,
+    active_run_generation: Option<String>,
     tainted_mask: i64,
 }
 
@@ -603,11 +822,14 @@ async fn load_thread_head_opt_tx(
         i64,
         Option<String>,
         i64,
+        Option<i64>,
+        Option<String>,
     )> = match tx {
         BackendConn::Sqlite(conn) => {
             let r = sqlx::query(
                 "SELECT kind, owner_id, project_folder_id, title, head_leaf_seq,
-                        head_rev_id, next_entry_seq, active_run_id, ext_space_tainted_mask
+                        head_rev_id, next_entry_seq, active_run_id, ext_space_tainted_mask,
+                        active_run_epoch, active_run_generation
                  FROM chat_threads WHERE space_id = ? AND thread_id = ?",
             )
             .bind(space_id.as_str())
@@ -626,13 +848,16 @@ async fn load_thread_head_opt_tx(
                     row.get("next_entry_seq"),
                     row.get("active_run_id"),
                     row.get("ext_space_tainted_mask"),
+                    row.get("active_run_epoch"),
+                    row.get("active_run_generation"),
                 )
             })
         }
         BackendConn::Postgres(conn) => {
             let r = sqlx::query(
                 "SELECT kind, owner_id, project_folder_id, title, head_leaf_seq,
-                        head_rev_id, next_entry_seq, active_run_id, ext_space_tainted_mask::BIGINT AS tainted_mask
+                        head_rev_id, next_entry_seq, active_run_id, ext_space_tainted_mask::BIGINT AS tainted_mask,
+                        active_run_epoch, active_run_generation
                  FROM chat_threads WHERE space_id = $1 AND thread_id = $2",
             )
             .bind(space_id.as_str())
@@ -651,6 +876,8 @@ async fn load_thread_head_opt_tx(
                     row.get("next_entry_seq"),
                     row.get("active_run_id"),
                     row.get("tainted_mask"),
+                    row.get("active_run_epoch"),
+                    row.get("active_run_generation"),
                 )
             })
         }
@@ -666,6 +893,8 @@ async fn load_thread_head_opt_tx(
         next_entry_raw,
         run_opt,
         tainted_mask,
+        raw_epoch,
+        active_run_generation,
     )) = raw
     else {
         return Ok(None);
@@ -699,6 +928,10 @@ async fn load_thread_head_opt_tx(
         None => None,
     };
 
+    let active_run_epoch = raw_epoch
+        .map(|epoch| LeaseEpoch::new(epoch as u64))
+        .transpose()?;
+
     Ok(Some(ThreadHeadRow {
         thread_id: thread_id.clone(),
         kind,
@@ -709,6 +942,8 @@ async fn load_thread_head_opt_tx(
         head_rev_id,
         next_entry_seq,
         active_run_id,
+        active_run_epoch,
+        active_run_generation,
         tainted_mask,
     }))
 }
@@ -1189,8 +1424,11 @@ async fn read_chat_impl(
                 srec.scope.check(&scope)?;
 
                 let th = load_thread_head_tx(tx, &scope.space_id, &request.thread).await?;
-                let thread_tainted = th.tainted_mask != 0;
-                auth.authorize_chat_read(&srec.space, th.project_folder.as_ref(), thread_tainted)?;
+                authorize_thread_read(&auth, &srec.space, &request.thread, th.kind,
+                    &th.owner, th.project_folder.as_ref(), false)?;
+                let thread_tainted = read_leaf_taint(tx, &scope.space_id, &request.thread, request.leaf).await?;
+                authorize_thread_read(&auth, &srec.space, &request.thread, th.kind,
+                    &th.owner, th.project_folder.as_ref(), thread_tainted)?;
 
                 let thread_out = ChatThread {
                     id: th.thread_id.clone(),
@@ -1201,6 +1439,8 @@ async fn read_chat_impl(
                     head: th.head_leaf_seq,
                     revision: th.head_rev_id,
                     tainted: thread_tainted,
+                    title: th.title,
+                    active_run: th.active_run_id,
                 };
 
                 if request.leaf == ThreadEntrySeq::ZERO {
@@ -1559,7 +1799,9 @@ async fn read_chat_pg_single_query(
             w.is_chain_node,
             w.branch_depth,
             w.anc_16_seq,
-            w.anc_256_seq
+            w.anc_256_seq,
+            CASE WHEN COALESCE(w.n, 1) = 1 THEN ct.title ELSE NULL END,
+            CASE WHEN COALESCE(w.n, 1) = 1 THEN ct.active_run_id ELSE NULL END
          FROM spaces s
          LEFT JOIN chat_threads ct
            ON ct.space_id = s.space_id AND ct.thread_id = $2
@@ -1665,9 +1907,6 @@ async fn read_chat_pg_single_query(
     let ct_head_rev_raw: &str = hdr
         .get::<Option<&str>, usize>(8)
         .ok_or_else(|| internal_not_committed("corrupt_thread_rev", "missing head_rev_id"))?;
-    let ct_tainted_raw: i32 = hdr
-        .get::<Option<i32>, usize>(9)
-        .ok_or_else(|| internal_not_committed("corrupt_thread_taint", "missing tainted_mask"))?;
 
     let th_kind = chat_thread_kind_from_db(ct_kind_raw)?;
     let th_owner = PrincipalId::parse(ct_owner_raw)
@@ -1685,13 +1924,39 @@ async fn read_chat_pg_single_query(
     )?;
     let th_rev = RevisionId::parse(ct_head_rev_raw)
         .map_err(|_| internal_not_committed("corrupt_thread_rev", "invalid head_rev_id"))?;
-    let thread_tainted = ct_tainted_raw != 0;
-    auth.authorize_chat_read(&space, th_proj.as_ref(), thread_tainted)?;
+    authorize_thread_read(
+        auth,
+        &space,
+        &request.thread,
+        th_kind,
+        &th_owner,
+        th_proj.as_ref(),
+        false,
+    )?;
 
     let first_e_seq: Option<i64> = hdr.get::<Option<i64>, usize>(10);
     if first_e_seq != Some(tip_i64) {
         return Err(DomainError::ResourceNotFound.into());
     }
+
+    let thread_tainted = hdr.get::<i32, usize>(19) != 0;
+    authorize_thread_read(
+        auth,
+        &space,
+        &request.thread,
+        th_kind,
+        &th_owner,
+        th_proj.as_ref(),
+        thread_tainted,
+    )?;
+    let title = hdr
+        .get::<Option<String>, usize>(24)
+        .ok_or_else(|| internal_not_committed("corrupt_thread_title", "missing title"))?;
+    let active_run = hdr
+        .get::<Option<String>, usize>(25)
+        .as_deref()
+        .map(AgentRunId::parse)
+        .transpose()?;
 
     let thread_out = ChatThread {
         id: request.thread.clone(),
@@ -1702,6 +1967,8 @@ async fn read_chat_pg_single_query(
         head: th_head,
         revision: th_rev,
         tainted: thread_tainted,
+        title,
+        active_run,
     };
 
     let decode_entry_row = |r: &sqlx::postgres::PgRow,
@@ -1887,12 +2154,54 @@ fn read_chat_rusqlite(
                 head_rev_id,
                 next_entry_seq,
                 active_run_id,
+                active_run_epoch: None,
+                active_run_generation: None,
                 tainted_mask: raw.8,
             }
         };
 
-    let thread_tainted = th.tainted_mask != 0;
-    auth.authorize_chat_read(&srec.space, th.project_folder.as_ref(), thread_tainted)?;
+    authorize_thread_read(
+        auth,
+        &srec.space,
+        &request.thread,
+        th.kind,
+        &th.owner,
+        th.project_folder.as_ref(),
+        false,
+    )?;
+    let thread_tainted = if request.leaf == ThreadEntrySeq::ZERO {
+        false
+    } else {
+        conn.prepare_cached(
+            "SELECT ext_space_tainted FROM chat_entries
+                WHERE space_id = ?1 AND thread_id = ?2 AND entry_seq = ?3",
+        )
+        .and_then(|mut statement| {
+            statement.query_row(
+                params![
+                    scope.space_id.as_str(),
+                    request.thread.as_str(),
+                    request.leaf.get() as i64
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+        })
+        .optional()
+        .map_err(|err| {
+            crate::sqlite_fast::map_interrupt_or_internal(err, "sqlite_chat_leaf_taint")
+        })?
+        .ok_or(DomainError::ResourceNotFound)?
+            != 0
+    };
+    authorize_thread_read(
+        auth,
+        &srec.space,
+        &request.thread,
+        th.kind,
+        &th.owner,
+        th.project_folder.as_ref(),
+        thread_tainted,
+    )?;
 
     let thread_out = ChatThread {
         id: th.thread_id,
@@ -1903,6 +2212,8 @@ fn read_chat_rusqlite(
         head: th.head_leaf_seq,
         revision: th.head_rev_id,
         tainted: thread_tainted,
+        title: th.title,
+        active_run: th.active_run_id,
     };
 
     if request.leaf == ThreadEntrySeq::ZERO {
@@ -2193,7 +2504,7 @@ async fn create_chat_impl(
     if request.input.owner != *ctx.auth().principal() {
         return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
     }
-    if request.input.title.trim().is_empty() {
+    if request.input.title.trim().is_empty() || request.input.title.contains('\0') {
         return Err(DomainError::validation(ValidationReason::InvalidRange).into());
     }
 
@@ -2245,8 +2556,25 @@ async fn create_chat_impl(
                     return Err(DomainError::CrossSpaceTainted.into());
                 }
 
-                auth.authorize_chat_read(
+                let keeper =
+                    matches!(auth.kind(), PrincipalKind::Keeper(_)) || auth.keeper_log().is_some();
+                if (keeper || input.kind == ChatThreadKind::KeeperLog)
+                    && (input.kind != ChatThreadKind::KeeperLog
+                        || auth.keeper_log() != Some(&input.thread)
+                        || auth
+                            .spaces()
+                            .get(&scope.space_id)
+                            .and_then(|grant| grant.project_root.as_ref())
+                            != input.project_folder.as_ref())
+                {
+                    return Err(DomainError::SpaceReadOnly.into());
+                }
+                authorize_thread_read(
+                    &auth,
                     &live_space.space,
+                    &input.thread,
+                    input.kind,
+                    &input.owner,
                     input.project_folder.as_ref(),
                     tainted,
                 )?;
@@ -2370,6 +2698,8 @@ async fn create_chat_impl(
                     kind: input.kind,
                     owner: input.owner,
                     project_folder: input.project_folder,
+                    title: input.title,
+                    active_run: None,
                     head: ThreadEntrySeq::ZERO,
                     revision: rev_id.clone(),
                     tainted,
@@ -2427,6 +2757,7 @@ async fn fork_chat_impl(
 ) -> Result<Committed<ChatThread>, PortError> {
     let deadline = crate::domain::common::CommandDeadline::start(&ctx.budget, "fork_chat");
     validate_mutation_identity(&ctx, &request.identity)?;
+    forbid_keeper_chat_mutation(ctx.auth())?;
     crate::domain::common::require_revision_only(&request.preconditions)?;
     let space_rec = deadline
         .prepare(&ctx.budget, || {
@@ -2446,7 +2777,7 @@ async fn fork_chat_impl(
             "thread",
             request.input.thread.as_str(),
         )
-        .for_chat(ctx.auth(), &request.input.thread, Vec::new());
+        .for_chat_leaf(ctx.auth(), &request.input.thread, request.input.parent);
 
     let scope = space_rec.scope.clone();
     let active_epoch = space_rec.active_epoch;
@@ -2468,6 +2799,9 @@ async fn fork_chat_impl(
 
                 let th = load_thread_head_tx(tx, &scope.space_id, &input.thread).await?;
                 authorize_thread_mutation(&auth, &live_space.space, &th, false)?;
+                if th.active_run_id.is_some() || auth.taint().is_tainted() {
+                    return Err(DomainError::validation(ValidationReason::InvalidState).into());
+                }
                 let parent_tainted = if input.parent == ThreadEntrySeq::ZERO {
                     false
                 } else {
@@ -2484,8 +2818,8 @@ async fn fork_chat_impl(
                     pt
                 };
 
-                let new_tainted =
-                    (th.tainted_mask != 0) || auth.taint().is_tainted() || parent_tainted;
+                let new_tainted = parent_tainted;
+                let ever_tainted = th.tainted_mask != 0 || new_tainted;
                 if new_tainted
                     && (th.kind == ChatThreadKind::SpaceGroup
                         || live_space.space.kind == SpaceKind::Shared)
@@ -2509,7 +2843,7 @@ async fn fork_chat_impl(
                 let (sec, nsec) = encode_timestamp_parts(now_ts);
                 let seq_i64 = seq.get() as i64;
                 let leaf_i64 = input.parent.get() as i64;
-                let taint_mask: i64 = i64::from(u8::from(new_tainted));
+                let taint_mask: i64 = i64::from(u8::from(ever_tainted));
 
                 match tx {
                     BackendConn::Sqlite(conn) => {
@@ -2562,7 +2896,7 @@ async fn fork_chat_impl(
                         project_folder_id: th.project_folder.clone(),
                         title: th.title.clone(),
                         head_leaf_seq: input.parent,
-                        tainted: new_tainted,
+                        tainted: ever_tainted,
                     },
                 ))
                 .encode()?;
@@ -2592,6 +2926,8 @@ async fn fork_chat_impl(
                     kind: th.kind,
                     owner: th.owner,
                     project_folder: th.project_folder,
+                    title: th.title,
+                    active_run: th.active_run_id,
                     head: input.parent,
                     revision: new_rev.clone(),
                     tainted: new_tainted,
@@ -2645,7 +2981,7 @@ async fn fork_chat_impl(
 async fn append_chat_impl(
     store: &CanonicalStore,
     ctx: SpaceContext,
-    request: Mutation<AppendChat>,
+    mut request: Mutation<AppendChat>,
 ) -> Result<Committed<ChatEntry>, PortError> {
     let deadline = crate::domain::common::CommandDeadline::start(&ctx.budget, "append_chat");
     validate_mutation_identity(&ctx, &request.identity)?;
@@ -2654,9 +2990,26 @@ async fn append_chat_impl(
         return Err(DomainError::validation(ValidationReason::InvalidState).into());
     }
 
+    let is_run = matches!(
+        ctx.auth().kind(),
+        PrincipalKind::AgentRun(_) | PrincipalKind::Keeper(_)
+    );
+    if (!request.input.tool_calls.is_empty()
+        || request.input.provenance.is_some()
+        || request.input.proposed_diff.is_some())
+        && !is_run
+    {
+        return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
+    }
+    let format = content::prepare(&mut request.input)?;
+    let provenance_json = content::proof_json(request.input.provenance.as_ref())?;
     match &request.input.body {
         ChatInputBody::Text(s) => {
-            if (s.len() as u64) > StagedChatBlob::INLINE_MAX_BYTES {
+            if (s.len() as u64) > StagedChatBlob::INLINE_MAX_BYTES
+                && (!is_run
+                    || request.input.kind == ChatEntryKind::Human
+                    || s.len() > content::MAX_TURN_BYTES)
+            {
                 return Err(DomainError::validation(ValidationReason::InvalidRange).into());
             }
         }
@@ -2702,6 +3055,13 @@ async fn append_chat_impl(
         fp.update(r.note_id.as_str().as_bytes());
     }
     fp.update(&[u8::from(request.input.tainted)]);
+    if format != content::BodyFormat::Plain || provenance_json.is_some() {
+        fp.update(b"chat-derived-v1");
+        fp.update(&format.db().to_be_bytes());
+        if let Some(proof) = &provenance_json {
+            fp.update(proof.as_bytes());
+        }
+    }
     let legacy_staged =
         matches!(&request.input.body,ChatInputBody::Staged(st) if st.lease().is_none());
     let idemp =
@@ -2716,6 +3076,7 @@ async fn append_chat_impl(
                 ctx.auth(),
                 crate::writer::replay::ReplayPolicy::Chat(
                     request.input.thread.clone(),
+                    Some(request.input.parent),
                     request.input.referenced_notes.clone(),
                     legacy_staged,
                 ),
@@ -2756,282 +3117,63 @@ async fn append_chat_impl(
             }
         }
         replayed.value.tainted |= legacy_staged;
+        if replayed.value.tainted {
+            ctx.auth().taint().mark_external_read();
+        }
         return Ok(replayed.into_committed());
     }
 
+    deadline
+        .prepare(&ctx.budget, || {
+            compaction::verify_prefix(store, ctx.clone(), &request)
+        })
+        .await?;
+
+    let large_text = match &request.input.body {
+        ChatInputBody::Text(text) if text.len() as u64 > StagedChatBlob::INLINE_MAX_BYTES => {
+            let prepared = PreparedBlobSource::prepare(text.as_bytes(), store.blob_codec())?;
+            let ticket = deadline
+                .prepare(&ctx.budget, || {
+                    store.stage_blob_for_batch(&space_rec.scope, space_rec.active_epoch, &prepared)
+                })
+                .await?;
+            Some(ticket)
+        }
+        _ => None,
+    };
     let scope = space_rec.scope.clone();
     let active_epoch = space_rec.active_epoch;
     let auth = ctx.auth().clone();
     let preconditions: Preconditions = request.preconditions;
     let input = request.input;
+    let owner_store = store.clone();
 
     let intent = PreparedWriteIntent {
         scope: scope.clone(),
         active_epoch,
         idempotency: Some(idemp),
         source_note_ids: Vec::new(),
-        staged_bytes: 0,
+        staged_bytes: large_text
+            .as_ref()
+            .map_or(0, |ticket| ticket.compressed_size),
         required_semantic_cut: None,
         execute: Box::new(move |tx, item_ctx| {
             Box::pin(async move {
-                let live_space = load_space_record(tx, &scope.space_id).await?;
-                authorize_chat_write_on_space(&auth, &live_space.space)?;
-
-                let th = load_thread_head_tx(tx, &scope.space_id, &input.thread).await?;
-                authorize_thread_mutation(&auth, &live_space.space, &th, false)?;
-                let (parent_opt, depth, anc_16, anc_256, parent_tainted) =
-                    compute_skip_pointers_for_parent_tx(
-                        tx,
-                        &scope.space_id,
-                        &input.thread,
-                        input.parent,
-                    )
-                    .await?;
-
-                let mut effective_tainted =
-                    auth.taint().is_tainted() || input.tainted || parent_tainted;
-                let mut folder_cache = FolderAncestryCache::default();
-                let mut owner_notes = Vec::new();
-
-                for nref in &input.referenced_notes {
-                    if nref.space_id == scope.space_id {
-                        if is_note_purge_fenced_tx(tx, &scope.space_id, nref.note_id.as_str())
-                            .await?
-                        {
-                            return Err(DomainError::ResourceNotFound.into());
-                        }
-                        let nhead =
-                            load_note_head_row_tx(tx, &scope.space_id, &nref.note_id).await?;
-                        if nhead.lifecycle == Lifecycle::Purged {
-                            return Err(DomainError::ResourceNotFound.into());
-                        }
-                        let (facts, _) = folder_cache
-                            .build_resource_facts_tx(
-                                tx,
-                                &live_space.space,
-                                &nhead.parent_folder_id,
-                                nhead.doc_class,
-                                nhead.ability_id,
-                                false,
-                            )
-                            .await?;
-                        auth.authorize_read(&facts)?;
-                        owner_notes.push(nref.note_id.clone());
-                    } else {
-                        if !auth.spaces().contains_key(&nref.space_id) {
-                            return Err(DomainError::ResourceNotFound.into());
-                        }
-                        auth.taint().mark_external_read();
-                        effective_tainted = true;
-                    }
-                }
-                if auth.taint().is_tainted() {
-                    effective_tainted = true;
-                }
-
-                let staging_lease = if let ChatInputBody::Staged(staged) = &input.body {
-                    let lease = lookup_staged_chat_lease_tx(tx, &scope.space_id, staged).await?;
-                    // Legacy references carried no provenance. Only a verified v2 clean lease is clean.
-                    if !lease.starts_with("st2c_") {
-                        effective_tainted = true;
-                    }
-                    Some(lease)
-                } else {
-                    None
-                };
-
-                if effective_tainted
-                    && (th.kind == ChatThreadKind::SpaceGroup
-                        || live_space.space.kind == SpaceKind::Shared)
-                {
-                    return Err(DomainError::CrossSpaceTainted.into());
-                }
-
-                if let Some(expected_rev) = &preconditions.revision
-                    && *expected_rev != th.head_rev_id
-                {
-                    return Err(DomainError::RevisionConflict {
-                        current: th.head_rev_id,
-                        lineage: None,
-                    }
-                    .into());
-                }
-
-                if staging_lease.is_some() && effective_tainted {
-                    auth.taint().mark_external_read();
-                }
-                let entry_seq = th.next_entry_seq;
-                let next_entry_seq = entry_seq.checked_next()?;
-                let seq = item_ctx.alloc_next_seq()?;
-                let entry_rev = new_revision_id()?;
-                let new_thread_rev = new_revision_id()?;
-                let now_ts = now_utc_timestamp()?;
-                let (sec, nsec) = encode_timestamp_parts(now_ts);
-                let seq_i64 = seq.get() as i64;
-
-                let (inline_text, payload_digest, body_out) = match &input.body {
-                    ChatInputBody::Text(s) => (Some(s.clone()), None, ChatBody::Inline(s.clone())),
-                    ChatInputBody::Staged(staged) => {
-                        consume_one_staged_chat_ref_and_bind_entry_tx(
-                            tx,
-                            &scope.space_id,
-                            staged,
-                            staging_lease
-                                .as_deref()
-                                .ok_or(DomainError::ResourceNotFound)?,
-                            &input.thread,
-                            entry_seq,
-                            &entry_rev,
-                            seq,
-                        )
-                        .await?;
-                        (None, Some(staged.digest()), ChatBody::Blob(staged.digest()))
-                    }
-                };
-
-                let (kind_str, tool_call_opt) = entry_kind_to_db(&input.kind);
-                let refs_json = serde_json::to_string(&input.referenced_notes)
-                    .map_err(|err| internal_not_committed("encode_chat_refs", err.to_string()))?;
-                let run_opt = extract_agent_run_from_auth(&auth);
-
-                insert_chat_entry_row_tx(
+                append_chat_tx(
+                    &owner_store,
                     tx,
-                    &scope.space_id,
-                    &input.thread,
-                    entry_seq,
-                    parent_opt,
-                    &entry_rev,
-                    kind_str,
-                    tool_call_opt,
-                    auth.principal(),
-                    run_opt.as_ref(),
-                    inline_text.as_deref(),
-                    payload_digest,
-                    &refs_json,
-                    effective_tainted,
-                    depth,
-                    anc_16,
-                    anc_256,
-                    seq,
-                )
-                .await?;
-
-                let thread_tainted = (th.tainted_mask != 0) || effective_tainted;
-                let taint_mask: i64 = i64::from(u8::from(thread_tainted));
-
-                update_thread_after_append_tx(
-                    tx,
-                    &scope.space_id,
-                    &input.thread,
-                    entry_seq,
-                    &new_thread_rev,
-                    next_entry_seq,
-                    taint_mask,
-                    seq_i64,
-                    sec,
-                    nsec,
-                )
-                .await?;
-
-                let meta = RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Thread(
-                    ThreadRevisionMetadata {
-                        thread_id: th.thread_id.clone(),
-                        kind: th.kind,
-                        owner_id: th.owner.clone(),
-                        project_folder_id: th.project_folder.clone(),
-                        title: th.title.clone(),
-                        head_leaf_seq: entry_seq,
-                        tainted: thread_tainted,
+                    item_ctx,
+                    AppendChatWrite {
+                        auth,
+                        preconditions,
+                        input,
+                        format,
+                        provenance_json,
+                        staged: large_text,
+                        receipt_kind: UserInputReceipt::Standalone,
                     },
-                ))
-                .encode()?;
-
-                insert_revision_row(
-                    tx,
-                    &scope,
-                    &new_thread_rev,
-                    "thread",
-                    th.thread_id.as_str(),
-                    seq,
-                    seq,
-                    Some(&th.head_rev_id),
-                    None,
-                    None,
-                    &meta,
-                    auth.principal(),
-                    run_opt.as_ref(),
-                    now_ts,
                 )
-                .await?;
-
-                if let Some(run_id) = &run_opt {
-                    upsert_agent_run_head_tx(
-                        tx,
-                        &scope,
-                        run_id,
-                        auth.principal(),
-                        seq,
-                        seq,
-                        now_ts,
-                    )
-                    .await?;
-                }
-
-                let entry_val = ChatEntry {
-                    thread: input.thread.clone(),
-                    seq: entry_seq,
-                    parent: parent_opt,
-                    is_chain_node: true,
-                    depth,
-                    ancestors: build_ancestors_vec(anc_16, anc_256),
-                    author: auth.principal().clone(),
-                    run: run_opt,
-                    kind: input.kind,
-                    body: body_out,
-                    tainted: effective_tainted,
-                    referenced_notes: input.referenced_notes,
-                };
-                let receipt = MutationReceiptToken::new(scope.clone(), seq)?;
-                let stored_full = StoredCommittedChatEntryV1 {
-                    value: (&entry_val).into(),
-                    receipt,
-                };
-                let stored_sanitized = stored_full.sanitized_for_redaction();
-                let full_bytes = CanonicalStore::encode_command_outcome(&stored_full)?;
-                let sanitized_bytes = CanonicalStore::encode_command_outcome(&stored_sanitized)?;
-
-                let cmd_id = new_prefixed_hex_id("cmd_")?;
-                let payload_id = format!("eff:{cmd_id}");
-                let range = notarium_core::ports::CommandSeqRange::new(seq, seq)?;
-                let cp = build_effect_payload_draft(
-                    payload_id,
-                    scope.clone(),
-                    range,
-                    "append_chat",
-                    EffectBodyV1::AwaitProjection {
-                        reason: StoredAwaitReasonV1::UnknownEffect,
-                    },
-                    owner_notes.clone(),
-                )?;
-
-                Ok(ItemCommitArtifacts {
-                    command_id: cmd_id,
-                    command_kind: "append_chat".to_owned(),
-                    events: vec![BatchEventDraft {
-                        space_seq: seq,
-                        entity_type: "thread".to_owned(),
-                        entity_id: input.thread.as_str().to_owned(),
-                        op_kind: "edit".to_owned(),
-                        rev_id: new_thread_rev,
-                        lifecycle: Lifecycle::Active,
-                        doc_class: None,
-                    }],
-                    change_payload: Some(cp),
-                    receipt_detail_blob: Some(full_bytes.clone()),
-                    receipt_sanitized_blob: sanitized_bytes,
-                    receipt_owner_note_ids: owner_notes,
-                    response_bytes: full_bytes,
-                })
+                .await
             })
         }),
     };
@@ -3040,6 +3182,327 @@ async fn append_chat_impl(
         deadline.submit(store, &ctx.budget, intent).await?;
     stored.value.tainted |= legacy_staged;
     Ok(stored.into_committed())
+}
+
+struct AppendChatWrite {
+    auth: EngineAuthContext,
+    preconditions: Preconditions,
+    input: AppendChat,
+    format: content::BodyFormat,
+    provenance_json: Option<String>,
+    staged: Option<StagedBlobTicket>,
+    receipt_kind: UserInputReceipt,
+}
+
+async fn append_chat_tx(
+    store: &CanonicalStore,
+    tx: &mut BackendConn<'_>,
+    item_ctx: &mut ItemExecCtx,
+    write: AppendChatWrite,
+) -> Result<ItemCommitArtifacts, PortError> {
+    let AppendChatWrite {
+        auth,
+        preconditions,
+        input,
+        format,
+        provenance_json,
+        staged,
+        receipt_kind,
+    } = write;
+    let scope = item_ctx.scope.clone();
+    let active_epoch = item_ctx.active_epoch;
+    let live_space = load_space_record(tx, &scope.space_id).await?;
+    authorize_chat_write_on_space(&auth, &live_space.space)?;
+
+    let th = load_thread_head_tx(tx, &scope.space_id, &input.thread).await?;
+    authorize_thread_mutation(&auth, &live_space.space, &th, false)?;
+    if let PrincipalKind::AgentRun(run) = auth.kind() {
+        queue::authorize_run_claim(store, &live_space, &th, run)?;
+    }
+    if th.active_run_id.is_some() && input.parent != th.head_leaf_seq {
+        return Err(DomainError::RevisionConflict {
+            current: th.head_rev_id,
+            lineage: None,
+        }
+        .into());
+    }
+    if format == content::BodyFormat::Proposal
+        && (th.kind != ChatThreadKind::Personal
+            || live_space.space.kind != SpaceKind::Personal
+            || !matches!(auth.kind(), PrincipalKind::AgentRun(_)))
+    {
+        return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
+    }
+    let (parent_opt, depth, anc_16, anc_256, parent_tainted) =
+        compute_skip_pointers_for_parent_tx(tx, &scope.space_id, &input.thread, input.parent)
+            .await?;
+
+    let mut effective_tainted = auth.taint().is_tainted() || input.tainted || parent_tainted;
+    if let Some(proof) = &input.provenance {
+        content::authorize_recorded_sources(
+            &input.thread,
+            input.parent,
+            &scope.space_id,
+            &auth,
+            proof,
+        )?;
+        effective_tainted |= auth.taint().is_tainted();
+    }
+    let mut folder_cache = FolderAncestryCache::default();
+    let mut owner_notes = Vec::new();
+
+    for nref in &input.referenced_notes {
+        if nref.space_id == scope.space_id {
+            if is_note_purge_fenced_tx(tx, &scope.space_id, nref.note_id.as_str()).await? {
+                return Err(DomainError::ResourceNotFound.into());
+            }
+            let nhead = load_note_head_row_tx(tx, &scope.space_id, &nref.note_id).await?;
+            if nhead.lifecycle == Lifecycle::Purged {
+                return Err(DomainError::ResourceNotFound.into());
+            }
+            let (facts, _) = folder_cache
+                .build_resource_facts_tx(
+                    tx,
+                    &live_space.space,
+                    &nhead.parent_folder_id,
+                    nhead.doc_class,
+                    nhead.ability_id,
+                    false,
+                )
+                .await?;
+            auth.authorize_read(&facts)?;
+            owner_notes.push(nref.note_id.clone());
+        } else {
+            if !auth.spaces().contains_key(&nref.space_id) {
+                return Err(DomainError::ResourceNotFound.into());
+            }
+            auth.taint().mark_external_read();
+            effective_tainted = true;
+        }
+    }
+    if auth.taint().is_tainted() {
+        effective_tainted = true;
+    }
+
+    let staging_lease = if let ChatInputBody::Staged(staged) = &input.body {
+        let lease = lookup_staged_chat_lease_tx(tx, &scope.space_id, staged).await?;
+        // Legacy references carried no provenance. Only a verified v2 clean lease is clean.
+        if !lease.starts_with("st2c_") {
+            effective_tainted = true;
+        }
+        Some(lease)
+    } else {
+        None
+    };
+
+    if effective_tainted
+        && (th.kind == ChatThreadKind::SpaceGroup || live_space.space.kind == SpaceKind::Shared)
+    {
+        return Err(DomainError::CrossSpaceTainted.into());
+    }
+
+    if let Some(expected_rev) = &preconditions.revision
+        && *expected_rev != th.head_rev_id
+    {
+        return Err(DomainError::RevisionConflict {
+            current: th.head_rev_id,
+            lineage: None,
+        }
+        .into());
+    }
+
+    if effective_tainted {
+        auth.taint().mark_external_read();
+    }
+    let entry_seq = th.next_entry_seq;
+    let next_entry_seq = entry_seq.checked_next()?;
+    let seq = item_ctx.alloc_next_seq()?;
+    let entry_rev = new_revision_id()?;
+    let new_thread_rev = new_revision_id()?;
+    let now_ts = now_utc_timestamp()?;
+    let (sec, nsec) = encode_timestamp_parts(now_ts);
+    let seq_i64 = seq.get() as i64;
+
+    let (inline_text, payload_digest, body_out) = match (&input.body, staged) {
+        (ChatInputBody::Text(_), Some(ticket)) => {
+            let digest = ticket.digest;
+            item_ctx.record_staged_ticket(ticket.clone());
+            activate_and_bind_blob_ref_tx(
+                tx,
+                &scope,
+                active_epoch,
+                &BlobReferenceClaim {
+                    ticket,
+                    owner_kind: BlobOwnerKind::ChatEntry,
+                    owner_id: format!("{}:{}", input.thread.as_str(), entry_seq.get()),
+                    owner_rev_id: entry_rev.as_str().to_owned(),
+                    resource_key: "body".to_owned(),
+                },
+                seq,
+            )
+            .await?;
+            (None, Some(digest), ChatBody::Blob(digest))
+        }
+        (ChatInputBody::Text(s), None) => (Some(s.clone()), None, ChatBody::Inline(s.clone())),
+        (ChatInputBody::Staged(staged), _) => {
+            consume_one_staged_chat_ref_and_bind_entry_tx(
+                tx,
+                &scope.space_id,
+                staged,
+                staging_lease
+                    .as_deref()
+                    .ok_or(DomainError::ResourceNotFound)?,
+                &input.thread,
+                entry_seq,
+                &entry_rev,
+                seq,
+            )
+            .await?;
+            (None, Some(staged.digest()), ChatBody::Blob(staged.digest()))
+        }
+    };
+
+    let (kind_str, tool_call_opt) = entry_kind_to_db(&input.kind);
+    let refs_json = serde_json::to_string(&input.referenced_notes)
+        .map_err(|err| internal_not_committed("encode_chat_refs", err.to_string()))?;
+    let run_opt = extract_agent_run_from_auth(&auth);
+
+    insert_chat_entry_row_tx(
+        tx,
+        &scope.space_id,
+        &input.thread,
+        entry_seq,
+        parent_opt,
+        &entry_rev,
+        kind_str,
+        tool_call_opt,
+        auth.principal(),
+        run_opt.as_ref(),
+        inline_text.as_deref(),
+        payload_digest,
+        &refs_json,
+        format,
+        provenance_json.as_deref(),
+        effective_tainted,
+        depth,
+        anc_16,
+        anc_256,
+        seq,
+    )
+    .await?;
+
+    let thread_tainted = th.tainted_mask != 0 || effective_tainted;
+    let taint_mask: i64 = i64::from(u8::from(thread_tainted));
+
+    update_thread_after_append_tx(
+        tx,
+        &scope.space_id,
+        &input.thread,
+        entry_seq,
+        &new_thread_rev,
+        next_entry_seq,
+        taint_mask,
+        seq_i64,
+        sec,
+        nsec,
+    )
+    .await?;
+
+    let meta =
+        RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Thread(ThreadRevisionMetadata {
+            thread_id: th.thread_id.clone(),
+            kind: th.kind,
+            owner_id: th.owner.clone(),
+            project_folder_id: th.project_folder.clone(),
+            title: th.title.clone(),
+            head_leaf_seq: entry_seq,
+            tainted: thread_tainted,
+        }))
+        .encode()?;
+
+    insert_revision_row(
+        tx,
+        &scope,
+        &new_thread_rev,
+        "thread",
+        th.thread_id.as_str(),
+        seq,
+        seq,
+        Some(&th.head_rev_id),
+        None,
+        None,
+        &meta,
+        auth.principal(),
+        run_opt.as_ref(),
+        now_ts,
+    )
+    .await?;
+
+    if let Some(run_id) = &run_opt {
+        upsert_agent_run_head_tx(tx, &scope, run_id, auth.principal(), seq, seq, now_ts).await?;
+    }
+
+    let entry_val = ChatEntry {
+        thread: input.thread.clone(),
+        seq: entry_seq,
+        parent: parent_opt,
+        is_chain_node: true,
+        depth,
+        ancestors: build_ancestors_vec(anc_16, anc_256),
+        author: auth.principal().clone(),
+        run: run_opt,
+        kind: input.kind,
+        body: body_out,
+        tainted: effective_tainted,
+        referenced_notes: input.referenced_notes,
+    };
+    let receipt = MutationReceiptToken::new(scope.clone(), seq)?;
+    let stored_full = StoredCommittedChatEntryV1 {
+        value: (&entry_val).into(),
+        receipt,
+    };
+    let stored_sanitized = stored_full.sanitized_for_redaction();
+    let encode = |entry| match receipt_kind {
+        UserInputReceipt::Standalone => CanonicalStore::encode_command_outcome(&entry),
+        UserInputReceipt::Submission => {
+            CanonicalStore::encode_command_outcome(&StoredUserChatSubmissionV1::Appended(entry))
+        }
+    };
+    let full_bytes = encode(stored_full)?;
+    let sanitized_bytes = encode(stored_sanitized)?;
+
+    let cmd_id = new_prefixed_hex_id("cmd_")?;
+    let payload_id = format!("eff:{cmd_id}");
+    let range = notarium_core::ports::CommandSeqRange::new(seq, seq)?;
+    let cp = build_effect_payload_draft(
+        payload_id,
+        scope.clone(),
+        range,
+        "append_chat",
+        EffectBodyV1::AwaitProjection {
+            reason: StoredAwaitReasonV1::UnknownEffect,
+        },
+        owner_notes.clone(),
+    )?;
+
+    Ok(ItemCommitArtifacts {
+        command_id: cmd_id,
+        command_kind: "append_chat".to_owned(),
+        events: vec![BatchEventDraft {
+            space_seq: seq,
+            entity_type: "thread".to_owned(),
+            entity_id: input.thread.as_str().to_owned(),
+            op_kind: "edit".to_owned(),
+            rev_id: new_thread_rev,
+            lifecycle: Lifecycle::Active,
+            doc_class: None,
+        }],
+        change_payload: Some(cp),
+        receipt_detail_blob: Some(full_bytes.clone()),
+        receipt_sanitized_blob: sanitized_bytes,
+        receipt_owner_note_ids: owner_notes,
+        response_bytes: full_bytes,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3057,6 +3520,8 @@ async fn insert_chat_entry_row_tx(
     inline_text: Option<&str>,
     payload_digest: Option<ContentDigest>,
     refs_json: &str,
+    format: content::BodyFormat,
+    provenance_json: Option<&str>,
     tainted: bool,
     depth: u32,
     anc_16: Option<ThreadEntrySeq>,
@@ -3078,8 +3543,9 @@ async fn insert_chat_entry_row_tx(
                     space_id, thread_id, entry_seq, parent_seq, revision_id, kind,
                     tool_call_id, author_id, agent_run_id, inline_text, payload_blake3,
                     referenced_notes_json, ext_space_tainted, is_chain_node, branch_depth,
-                    anc_16_seq, anc_256_seq, created_space_seq, redacted_at_seq, checkpoint_stale
-                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, NULL, 0)",
+                    anc_16_seq, anc_256_seq, created_space_seq, redacted_at_seq, checkpoint_stale,
+                    human_origin, body_format, provenance_json
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, NULL, 0, ?, ?, ?)",
             )
             .bind(space_id.as_str())
             .bind(thread_id.as_str())
@@ -3098,6 +3564,9 @@ async fn insert_chat_entry_row_tx(
             .bind(a16_i64)
             .bind(a256_i64)
             .bind(cseq_i64)
+            .bind(i32::from(kind_str == "human"))
+            .bind(format.db())
+            .bind(provenance_json)
             .execute(&mut **conn)
             .await
             .map_err(|err| internal_not_committed("sqlite_insert_chat_entry", err.to_string()))?;
@@ -3108,8 +3577,9 @@ async fn insert_chat_entry_row_tx(
                     space_id, thread_id, entry_seq, parent_seq, revision_id, kind,
                     tool_call_id, author_id, agent_run_id, inline_text, payload_blake3,
                     referenced_notes_json, ext_space_tainted, is_chain_node, branch_depth,
-                    anc_16_seq, anc_256_seq, created_space_seq, redacted_at_seq, checkpoint_stale
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 1, $14, $15, $16, $17, NULL, 0)",
+                    anc_16_seq, anc_256_seq, created_space_seq, redacted_at_seq, checkpoint_stale,
+                    human_origin, body_format, provenance_json
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 1, $14, $15, $16, $17, NULL, 0, $18, $19, $20)",
             )
             .bind(space_id.as_str())
             .bind(thread_id.as_str())
@@ -3130,6 +3600,9 @@ async fn insert_chat_entry_row_tx(
             .bind(a16_i64)
             .bind(a256_i64)
             .bind(cseq_i64)
+            .bind(i32::from(kind_str == "human"))
+            .bind(format.db())
+            .bind(provenance_json)
             .execute(&mut **conn)
             .await
             .map_err(|err| internal_not_committed("pg_insert_chat_entry", err.to_string()))?;
@@ -3196,17 +3669,24 @@ async fn update_thread_after_append_tx(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn check_queue_admission_tx(
+    store: &CanonicalStore,
     tx: &mut BackendConn<'_>,
     scope: &HistoryScope,
     auth: &EngineAuthContext,
     thread: &ChatThreadId,
     id: &PendingInputId,
     base: ThreadEntrySeq,
-) -> Result<i64, PortError> {
+    expected_run: &AgentRunId,
+) -> Result<Option<i64>, PortError> {
     let live_space = load_space_record(tx, &scope.space_id).await?;
     live_space.scope.check(scope)?;
-    authorize_chat_replay_tx(tx, &live_space.space, auth, thread, false).await?;
+    authorize_chat_replay_tx(tx, &live_space.space, auth, thread, Some(base), false).await?;
+    let head = load_thread_head_tx(tx, &scope.space_id, thread).await?;
+    if queue::authorize_run_claim(store, &live_space, &head, expected_run).is_err() {
+        return Ok(None);
+    }
 
     if base != ThreadEntrySeq::ZERO
         && load_entry_depth_and_taint_tx(tx, &scope.space_id, thread, base)
@@ -3215,14 +3695,24 @@ async fn check_queue_admission_tx(
     {
         return Err(DomainError::ResourceNotFound.into());
     }
+    queue_admission_count_tx(tx, &scope.space_id, thread, id)
+        .await
+        .map(Some)
+}
 
+async fn queue_admission_count_tx(
+    tx: &mut BackendConn<'_>,
+    space: &SpaceId,
+    thread: &ChatThreadId,
+    id: &PendingInputId,
+) -> Result<i64, PortError> {
     const COUNTS: &str = "SELECT
         (SELECT COUNT(*) FROM chat_pending_inputs WHERE space_id=$1 AND thread_id=$2 AND input_id=$3),
         (SELECT COUNT(*) FROM chat_pending_inputs WHERE space_id=$1 AND thread_id=$2 AND status='pending')";
     let (duplicates, pending): (i64, i64) = match tx {
         BackendConn::Sqlite(conn) => {
             sqlx::query_as(COUNTS)
-                .bind(scope.space_id.as_str())
+                .bind(space.as_str())
                 .bind(thread.as_str())
                 .bind(id.as_str())
                 .fetch_one(&mut **conn)
@@ -3230,7 +3720,7 @@ async fn check_queue_admission_tx(
         }
         BackendConn::Postgres(conn) => {
             sqlx::query_as(COUNTS)
-                .bind(scope.space_id.as_str())
+                .bind(space.as_str())
                 .bind(thread.as_str())
                 .bind(id.as_str())
                 .fetch_one(&mut **conn)
@@ -3251,6 +3741,10 @@ async fn queue_chat_input_impl(
 ) -> Result<QueueInputOutcome, PortError> {
     let deadline = crate::domain::common::CommandDeadline::start(&ctx.budget, "queue_chat_input");
     validate_mutation_identity(&ctx, &request.identity)?;
+    forbid_keeper_chat_mutation(ctx.auth())?;
+    if request.input.body.contains('\0') || request.input.body.len() > content::MAX_TURN_BYTES {
+        return Err(DomainError::validation(ValidationReason::InvalidRange).into());
+    }
     if request.input.sender != *ctx.auth().principal() {
         return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
     }
@@ -3281,7 +3775,11 @@ async fn queue_chat_input_impl(
         "queue_chat_input",
         fp.finalize().as_bytes(),
     )
-    .for_chat(ctx.auth(), &request.input.thread, Vec::new());
+    .for_chat_leaf(
+        ctx.auth(),
+        &request.input.thread,
+        request.input.queued_base_leaf,
+    );
 
     // A concurrent retry can commit between these reads. Resolve its receipt before
     // returning a duplicate or full result from admission.
@@ -3290,17 +3788,21 @@ async fn queue_chat_input_impl(
     let check_thread = request.input.thread.clone();
     let check_id = request.input.id.clone();
     let base = request.input.queued_base_leaf;
+    let expected_run = request.input.in_flight_run.clone();
+    let precheck_store = store.clone();
     let admission = deadline
         .prepare(&ctx.budget, || {
             store.with_read_tx_budget(Some(&ctx.budget), |tx| {
                 Box::pin(async move {
                     check_queue_admission_tx(
+                        &precheck_store,
                         tx,
                         &check_scope,
                         &check_auth,
                         &check_thread,
                         &check_id,
                         base,
+                        &expected_run,
                     )
                     .await
                 })
@@ -3321,7 +3823,10 @@ async fn queue_chat_input_impl(
         return Ok(QueueInputOutcome::Queued(replayed.into_committed()));
     }
 
-    if admission? >= i64::from(PENDING_CHAT_QUEUE_LIMIT) {
+    let Some(admission) = admission? else {
+        return Ok(QueueInputOutcome::Changed);
+    };
+    if admission >= i64::from(PENDING_CHAT_QUEUE_LIMIT) {
         return Ok(QueueInputOutcome::Full {
             limit: PENDING_CHAT_QUEUE_LIMIT,
         });
@@ -3336,22 +3841,24 @@ async fn queue_chat_input_impl(
             () = tokio::time::sleep_until(deadline.at) => return Err(crate::codec::deadline_not_committed("queue_upload_deadline", "queue upload deadline before writer admission")),
             result = store.stage_blob_for_batch(&space_rec.scope, space_rec.active_epoch, &prepared) => result?,
         };
-        Some((prepared.digest, ticket))
+        Some(ticket)
     } else {
         None
     };
 
-    let discard = staged_opt.as_ref().and_then(|(_, ticket)| ticket.discard());
+    let discard = staged_opt.as_ref().and_then(StagedBlobTicket::discard);
     let queue_full_flag = Arc::new(AtomicBool::new(false));
     let flag_cl = Arc::clone(&queue_full_flag);
+    let queue_changed = Arc::new(AtomicBool::new(false));
+    let changed = Arc::clone(&queue_changed);
+    let owner_store = store.clone();
     let scope = space_rec.scope.clone();
     let active_epoch = space_rec.active_epoch;
     let auth = ctx.auth().clone();
     let input = request.input;
     let staged_bytes = staged_opt
         .as_ref()
-        .map(|(_, t)| t.compressed_size)
-        .unwrap_or(0);
+        .map_or(0, |ticket| ticket.compressed_size);
 
     let intent = PreparedWriteIntent {
         scope: scope.clone(),
@@ -3362,166 +3869,36 @@ async fn queue_chat_input_impl(
         required_semantic_cut: None,
         execute: Box::new(move |tx, item_ctx| {
             Box::pin(async move {
-                let active_pending = check_queue_admission_tx(
+                let Some(active_pending) = check_queue_admission_tx(
+                    &owner_store,
                     tx,
                     &scope,
                     &auth,
                     &input.thread,
                     &input.id,
                     input.queued_base_leaf,
+                    &input.in_flight_run,
                 )
-                .await?;
+                .await?
+                else {
+                    changed.store(true, Ordering::SeqCst);
+                    return Err(DomainError::validation(ValidationReason::InvalidState).into());
+                };
                 if active_pending >= i64::from(PENDING_CHAT_QUEUE_LIMIT) {
                     flag_cl.store(true, Ordering::SeqCst);
                     return Err(DomainError::validation(ValidationReason::InvalidLimit).into());
                 }
 
-                let next_ordinal: i64 = match tx {
-                    BackendConn::Sqlite(conn) => sqlx::query_scalar(
-                        "SELECT COALESCE(MAX(ordinal), 0) + 1 FROM chat_pending_inputs
-                         WHERE space_id = ? AND thread_id = ?",
-                    )
-                    .bind(scope.space_id.as_str())
-                    .bind(input.thread.as_str())
-                    .fetch_one(&mut **conn)
-                    .await
-                    .map_err(|err| {
-                        internal_not_committed("sqlite_next_ordinal", err.to_string())
-                    })?,
-                    BackendConn::Postgres(conn) => sqlx::query_scalar(
-                        "SELECT (COALESCE(MAX(ordinal), 0) + 1)::BIGINT FROM chat_pending_inputs
-                         WHERE space_id = $1 AND thread_id = $2",
-                    )
-                    .bind(scope.space_id.as_str())
-                    .bind(input.thread.as_str())
-                    .fetch_one(&mut **conn)
-                    .await
-                    .map_err(|err| internal_not_committed("pg_next_ordinal", err.to_string()))?,
-                };
-
-                let seq = item_ctx.alloc_next_seq()?;
-                let ev_rev = new_revision_id()?;
-                let seq_i64 = seq.get() as i64;
-                let position = u8::try_from(active_pending + 1).unwrap_or(PENDING_CHAT_QUEUE_LIMIT);
-
-                let (inline_opt, payload_opt) = match staged_opt {
-                    None => (Some(input.body.as_str()), None),
-                    Some((digest, ticket)) => {
-                        item_ctx.record_staged_ticket(ticket.clone());
-                        let owner_id = format!("{}:{}", input.thread.as_str(), input.id.as_str());
-                        activate_and_bind_blob_ref_tx(
-                            tx,
-                            &item_ctx.scope,
-                            item_ctx.active_epoch,
-                            &BlobReferenceClaim {
-                                ticket,
-                                owner_kind: BlobOwnerKind::ChatPendingInput,
-                                owner_id,
-                                owner_rev_id: ev_rev.as_str().to_owned(),
-                                resource_key: "body".to_owned(),
-                            },
-                            seq,
-                        )
-                        .await?;
-                        (None, Some(digest))
-                    }
-                };
-
-                let d_bytes = payload_opt.as_ref().map(|d| d.as_bytes().as_slice());
-                let mentions_i32 = i32::from(u8::from(input.mentions_agent));
-
-                match tx {
-                    BackendConn::Sqlite(conn) => {
-                        sqlx::query(
-                            "INSERT INTO chat_pending_inputs (
-                                space_id, thread_id, input_id, ordinal, author_id,
-                                inline_text, payload_blake3, queued_base_leaf_seq,
-                                in_flight_run_id, mentions_agent, status, enqueued_seq, consumed_entry_seq, ext_space_tainted
-                             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, NULL, ?)",
-                        )
-                        .bind(scope.space_id.as_str())
-                        .bind(input.thread.as_str())
-                        .bind(input.id.as_str())
-                        .bind(next_ordinal)
-                        .bind(input.sender.as_str())
-                        .bind(inline_opt)
-                        .bind(d_bytes)
-                        .bind(input.queued_base_leaf.get() as i64)
-                        .bind(input.in_flight_run.as_str())
-                        .bind(mentions_i32)
-                        .bind(seq_i64)
-                        .bind(i32::from(auth.taint().is_tainted()))
-                        .execute(&mut **conn)
-                        .await
-                        .map_err(|err| internal_not_committed("sqlite_ins_pending", err.to_string()))?;
-                    }
-                    BackendConn::Postgres(conn) => {
-                        sqlx::query(
-                            "INSERT INTO chat_pending_inputs (
-                                space_id, thread_id, input_id, ordinal, author_id,
-                                inline_text, payload_blake3, queued_base_leaf_seq,
-                                in_flight_run_id, mentions_agent, status, enqueued_seq, consumed_entry_seq, ext_space_tainted
-                             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pending', $11, NULL, $12)",
-                        )
-                        .bind(scope.space_id.as_str())
-                        .bind(input.thread.as_str())
-                        .bind(input.id.as_str())
-                        .bind(next_ordinal)
-                        .bind(input.sender.as_str())
-                        .bind(inline_opt)
-                        .bind(d_bytes)
-                        .bind(input.queued_base_leaf.get() as i64)
-                        .bind(input.in_flight_run.as_str())
-                        .bind(i16::try_from(mentions_i32).unwrap_or(0))
-                        .bind(seq_i64)
-                        .bind(i32::from(auth.taint().is_tainted()))
-                        .execute(&mut **conn)
-                        .await
-                        .map_err(|err| internal_not_committed("pg_ins_pending", err.to_string()))?;
-                    }
-                }
-
-                let receipt = MutationReceiptToken::new(scope.clone(), seq)?;
-                let stored_resp = StoredCommittedQueuedInputV1 {
-                    value: StoredQueuedInputV1 {
-                        input: input.id.clone(),
-                        position,
-                    },
-                    receipt,
-                };
-                let resp_bytes = CanonicalStore::encode_command_outcome(&stored_resp)?;
-                let cmd_id = new_prefixed_hex_id("cmd_")?;
-                let payload_id = format!("eff:{cmd_id}");
-                let range = notarium_core::ports::CommandSeqRange::new(seq, seq)?;
-                let cp = build_effect_payload_draft(
-                    payload_id,
-                    scope.clone(),
-                    range,
-                    "queue_chat_input",
-                    EffectBodyV1::AwaitProjection {
-                        reason: StoredAwaitReasonV1::UnknownEffect,
-                    },
-                    Vec::new(),
-                )?;
-
-                Ok(ItemCommitArtifacts {
-                    command_id: cmd_id,
-                    command_kind: "queue_chat_input".to_owned(),
-                    events: vec![BatchEventDraft {
-                        space_seq: seq,
-                        entity_type: "thread".to_owned(),
-                        entity_id: input.thread.as_str().to_owned(),
-                        op_kind: "edit".to_owned(),
-                        rev_id: ev_rev,
-                        lifecycle: Lifecycle::Active,
-                        doc_class: None,
-                    }],
-                    change_payload: Some(cp),
-                    receipt_detail_blob: None,
-                    receipt_sanitized_blob: resp_bytes.clone(),
-                    receipt_owner_note_ids: Vec::new(),
-                    response_bytes: resp_bytes,
-                })
+                enqueue_chat_tx(
+                    tx,
+                    item_ctx,
+                    input,
+                    auth.taint().is_tainted(),
+                    active_pending,
+                    staged_opt,
+                    UserInputReceipt::Standalone,
+                )
+                .await
             })
         }),
     };
@@ -3530,29 +3907,7 @@ async fn queue_chat_input_impl(
     let result = deadline
         .submit::<StoredCommittedQueuedInputV1>(store, &ctx.budget, intent)
         .await;
-    if let Some(discard) = discard {
-        // A pending writer may still commit after an ambiguous response. Its ticket
-        // retains cleanup ownership until the writer resolves its transaction.
-        let definitive = match &result {
-            Ok(_) | Err(PortError::Domain(_)) => true,
-            Err(
-                PortError::Cancelled(f)
-                | PortError::DeadlineExceeded(f)
-                | PortError::Unavailable(f)
-                | PortError::Internal(f),
-            ) => f.effect() == notarium_core::error::CommitEffect::NotCommitted,
-        };
-        if definitive {
-            let cleanup = deadline.wait(&ctx.budget, || discard.finish()).await;
-            // The accepted receipt is already durable. A failed cleanup of an unused
-            // private upload stays recorded for recovery.
-            if result.is_err()
-                && let Ok(cleanup) = cleanup
-            {
-                cleanup?;
-            }
-        }
-    }
+    settle_queue_upload(deadline, &ctx.budget, discard, &result).await?;
     match result {
         Ok(stored) => Ok(QueueInputOutcome::Queued(stored.into_committed())),
         Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
@@ -3563,8 +3918,214 @@ async fn queue_chat_input_impl(
                 limit: PENDING_CHAT_QUEUE_LIMIT,
             })
         }
+        Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
+            if diagnostic.reason == ValidationReason::InvalidState
+                && queue_changed.load(Ordering::SeqCst) =>
+        {
+            Ok(QueueInputOutcome::Changed)
+        }
         Err(other) => Err(other),
     }
+}
+
+async fn settle_queue_upload<T>(
+    deadline: CommandDeadline,
+    budget: &notarium_core::ports::CallBudget,
+    discard: Option<Arc<PublicationDiscard>>,
+    result: &Result<T, PortError>,
+) -> Result<(), PortError> {
+    if let Some(discard) = discard {
+        // A pending writer may still commit after an ambiguous response. Its ticket
+        // retains cleanup ownership until the writer resolves its transaction.
+        let definitive = match result {
+            Ok(_) | Err(PortError::Domain(_)) => true,
+            Err(
+                PortError::Cancelled(f)
+                | PortError::DeadlineExceeded(f)
+                | PortError::Unavailable(f)
+                | PortError::Internal(f),
+            ) => f.effect() == notarium_core::error::CommitEffect::NotCommitted,
+        };
+        if definitive {
+            let cleanup = deadline.wait(budget, || discard.finish()).await;
+            // The accepted receipt is already durable. A failed cleanup of an unused
+            // private upload stays recorded for recovery.
+            if result.is_err()
+                && let Ok(cleanup) = cleanup
+            {
+                cleanup?;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn enqueue_chat_tx(
+    tx: &mut BackendConn<'_>,
+    item_ctx: &mut ItemExecCtx,
+    input: PendingChatInput,
+    tainted: bool,
+    active_pending: i64,
+    staged: Option<StagedBlobTicket>,
+    receipt_kind: UserInputReceipt,
+) -> Result<ItemCommitArtifacts, PortError> {
+    let scope = item_ctx.scope.clone();
+    let next_ordinal: i64 = match tx {
+        BackendConn::Sqlite(conn) => sqlx::query_scalar(
+            "SELECT COALESCE(MAX(ordinal), 0) + 1 FROM chat_pending_inputs
+             WHERE space_id = ? AND thread_id = ?",
+        )
+        .bind(scope.space_id.as_str())
+        .bind(input.thread.as_str())
+        .fetch_one(&mut **conn)
+        .await
+        .map_err(|err| internal_not_committed("sqlite_next_ordinal", err.to_string()))?,
+        BackendConn::Postgres(conn) => sqlx::query_scalar(
+            "SELECT (COALESCE(MAX(ordinal), 0) + 1)::BIGINT FROM chat_pending_inputs
+             WHERE space_id = $1 AND thread_id = $2",
+        )
+        .bind(scope.space_id.as_str())
+        .bind(input.thread.as_str())
+        .fetch_one(&mut **conn)
+        .await
+        .map_err(|err| internal_not_committed("pg_next_ordinal", err.to_string()))?,
+    };
+
+    let seq = item_ctx.alloc_next_seq()?;
+    let ev_rev = new_revision_id()?;
+    let seq_i64 = seq.get() as i64;
+    let position = u8::try_from(active_pending + 1).unwrap_or(PENDING_CHAT_QUEUE_LIMIT);
+
+    let (inline_opt, payload_opt) = match staged {
+        None => (Some(input.body.as_str()), None),
+        Some(ticket) => {
+            let digest = ticket.digest;
+            item_ctx.record_staged_ticket(ticket.clone());
+            let owner_id = format!("{}:{}", input.thread.as_str(), input.id.as_str());
+            activate_and_bind_blob_ref_tx(
+                tx,
+                &item_ctx.scope,
+                item_ctx.active_epoch,
+                &BlobReferenceClaim {
+                    ticket,
+                    owner_kind: BlobOwnerKind::ChatPendingInput,
+                    owner_id,
+                    owner_rev_id: ev_rev.as_str().to_owned(),
+                    resource_key: "body".to_owned(),
+                },
+                seq,
+            )
+            .await?;
+            (None, Some(digest))
+        }
+    };
+
+    let d_bytes = payload_opt.as_ref().map(|d| d.as_bytes().as_slice());
+    let mentions_i32 = i32::from(u8::from(input.mentions_agent));
+
+    match tx {
+        BackendConn::Sqlite(conn) => {
+            sqlx::query(
+                "INSERT INTO chat_pending_inputs (
+                    space_id, thread_id, input_id, ordinal, author_id,
+                    inline_text, payload_blake3, queued_base_leaf_seq,
+                    in_flight_run_id, mentions_agent, status, enqueued_seq, consumed_entry_seq, ext_space_tainted
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, NULL, ?)",
+            )
+            .bind(scope.space_id.as_str())
+            .bind(input.thread.as_str())
+            .bind(input.id.as_str())
+            .bind(next_ordinal)
+            .bind(input.sender.as_str())
+            .bind(inline_opt)
+            .bind(d_bytes)
+            .bind(input.queued_base_leaf.get() as i64)
+            .bind(input.in_flight_run.as_str())
+            .bind(mentions_i32)
+            .bind(seq_i64)
+            .bind(i32::from(tainted))
+            .execute(&mut **conn)
+            .await
+            .map_err(|err| internal_not_committed("sqlite_ins_pending", err.to_string()))?;
+        }
+        BackendConn::Postgres(conn) => {
+            sqlx::query(
+                "INSERT INTO chat_pending_inputs (
+                    space_id, thread_id, input_id, ordinal, author_id,
+                    inline_text, payload_blake3, queued_base_leaf_seq,
+                    in_flight_run_id, mentions_agent, status, enqueued_seq, consumed_entry_seq, ext_space_tainted
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pending', $11, NULL, $12)",
+            )
+            .bind(scope.space_id.as_str())
+            .bind(input.thread.as_str())
+            .bind(input.id.as_str())
+            .bind(next_ordinal)
+            .bind(input.sender.as_str())
+            .bind(inline_opt)
+            .bind(d_bytes)
+            .bind(input.queued_base_leaf.get() as i64)
+            .bind(input.in_flight_run.as_str())
+            .bind(i16::try_from(mentions_i32).unwrap_or(0))
+            .bind(seq_i64)
+            .bind(i32::from(tainted))
+            .execute(&mut **conn)
+            .await
+            .map_err(|err| internal_not_committed("pg_ins_pending", err.to_string()))?;
+        }
+    }
+
+    let resp_bytes = match receipt_kind {
+        UserInputReceipt::Standalone => {
+            CanonicalStore::encode_command_outcome(&StoredCommittedQueuedInputV1 {
+                value: StoredQueuedInputV1 {
+                    input: input.id,
+                    position,
+                },
+                receipt: MutationReceiptToken::new(scope.clone(), seq)?,
+            })?
+        }
+        UserInputReceipt::Submission => CanonicalStore::encode_command_outcome(
+            &StoredUserChatSubmissionV1::Queued(StoredQueuedChatMetadataV1 {
+                id: input.id,
+                sender: input.sender,
+                queued_base_leaf: input.queued_base_leaf,
+                in_flight_run: input.in_flight_run,
+                mentions_agent: input.mentions_agent,
+            }),
+        )?,
+    };
+    let cmd_id = new_prefixed_hex_id("cmd_")?;
+    let payload_id = format!("eff:{cmd_id}");
+    let range = notarium_core::ports::CommandSeqRange::new(seq, seq)?;
+    let cp = build_effect_payload_draft(
+        payload_id,
+        scope.clone(),
+        range,
+        "queue_chat_input",
+        EffectBodyV1::AwaitProjection {
+            reason: StoredAwaitReasonV1::UnknownEffect,
+        },
+        Vec::new(),
+    )?;
+
+    Ok(ItemCommitArtifacts {
+        command_id: cmd_id,
+        command_kind: "queue_chat_input".to_owned(),
+        events: vec![BatchEventDraft {
+            space_seq: seq,
+            entity_type: "thread".to_owned(),
+            entity_id: input.thread.as_str().to_owned(),
+            op_kind: "edit".to_owned(),
+            rev_id: ev_rev,
+            lifecycle: Lifecycle::Active,
+            doc_class: None,
+        }],
+        change_payload: Some(cp),
+        receipt_detail_blob: None,
+        receipt_sanitized_blob: resp_bytes.clone(),
+        receipt_owner_note_ids: Vec::new(),
+        response_bytes: resp_bytes,
+    })
 }
 
 async fn consume_chat_input_impl(
@@ -3574,6 +4135,10 @@ async fn consume_chat_input_impl(
 ) -> Result<Committed<ConsumedPending>, PortError> {
     let deadline = crate::domain::common::CommandDeadline::start(&ctx.budget, "consume_chat_input");
     validate_mutation_identity(&ctx, &request.identity)?;
+    forbid_keeper_chat_mutation(ctx.auth())?;
+    if ctx.auth().kind() != &PrincipalKind::DirectHuman {
+        return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
+    }
     crate::domain::common::require_revision_only(&request.preconditions)?;
     let space_rec = deadline
         .prepare(&ctx.budget, || {
@@ -3582,21 +4147,30 @@ async fn consume_chat_input_impl(
         .await?;
     space_rec.scope.check(ctx.scope())?;
 
-    let fp = format!(
+    let mut fp = format!(
         "thread={};input={};run={};leaf={}",
         request.input.thread.as_str(),
         request.input.input.as_str(),
         request.input.expected_run.as_str(),
         request.input.current_leaf.get()
     );
+    if request.input.expected_active_run != request.input.expected_run {
+        fp.push_str(";active=");
+        fp.push_str(request.input.expected_active_run.as_str());
+    }
     let idemp =
         derive_command_identity_spec(&request.identity, "consume_chat_input", fp.as_bytes())
+            .with_canonical_effect(&ctx)
             .with_preconditions(
                 &request.preconditions,
                 "thread",
                 request.input.thread.as_str(),
             )
-            .for_chat(ctx.auth(), &request.input.thread, Vec::new());
+            .for_chat_leaf(
+                ctx.auth(),
+                &request.input.thread,
+                request.input.current_leaf,
+            );
 
     if let Some(replayed) = deadline
         .prepare(&ctx.budget, || {
@@ -3609,7 +4183,11 @@ async fn consume_chat_input_impl(
         })
         .await?
     {
-        return Ok(replayed.into_committed());
+        let committed = replayed.into_committed();
+        if matches!(&committed.value, ConsumedPending::Appended { entry, .. } if entry.tainted) {
+            ctx.auth().taint().mark_external_read();
+        }
+        return Ok(committed);
     }
 
     let scope = space_rec.scope.clone();
@@ -3617,6 +4195,7 @@ async fn consume_chat_input_impl(
     let auth = ctx.auth().clone();
     let preconditions = request.preconditions;
     let input = request.input;
+    let owner_store = store.clone();
 
     let intent = PreparedWriteIntent {
         scope: scope.clone(),
@@ -3632,6 +4211,12 @@ async fn consume_chat_input_impl(
 
                 let th = load_thread_head_tx(tx, &scope.space_id, &input.thread).await?;
                 authorize_thread_mutation(&auth, &live_space.space, &th, false)?;
+                queue::authorize_run_claim(
+                    &owner_store,
+                    &live_space,
+                    &th,
+                    &input.expected_active_run,
+                )?;
                 if let Some(expected_rev) = &preconditions.revision
                     && *expected_rev != th.head_rev_id
                 {
@@ -3721,6 +4306,9 @@ async fn consume_chat_input_impl(
                     return Err(DomainError::ResourceNotFound.into());
                 };
 
+                if author_raw != auth.principal().as_str() {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
                 if status == "consumed" {
                     let seq = item_ctx.alloc_next_seq()?;
                     let ev_rev = new_revision_id()?;
@@ -3756,6 +4344,15 @@ async fn consume_chat_input_impl(
                 if run_raw != input.expected_run.as_str() {
                     return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
                 }
+                if input.current_leaf != th.head_leaf_seq {
+                    return Err(DomainError::RevisionConflict {
+                        current: th.head_rev_id,
+                        lineage: None,
+                    }
+                    .into());
+                }
+                queue::require_oldest_pending(tx, &scope.space_id, &input.thread, &input.input)
+                    .await?;
 
                 let queued_leaf =
                     ThreadEntrySeq::new(u64::try_from(queued_raw).map_err(|_| {
@@ -3853,6 +4450,15 @@ async fn consume_chat_input_impl(
                     });
                 }
 
+                let intervening_human = queue::other_human_on_branch(
+                    tx,
+                    &scope.space_id,
+                    &input.thread,
+                    input.current_leaf,
+                    queued_leaf,
+                    &author_raw,
+                )
+                .await?;
                 let (parent_opt, depth, anc_16, anc_256, parent_tainted) =
                     compute_skip_pointers_for_parent_tx(
                         tx,
@@ -3934,10 +4540,12 @@ async fn consume_chat_input_impl(
                     "human",
                     None,
                     &author,
-                    Some(&input.expected_run),
+                    Some(&input.expected_active_run),
                     inline_for_entry.as_deref(),
                     digest_opt,
                     "[]",
+                    content::BodyFormat::Plain,
+                    None,
                     effective_tainted,
                     depth,
                     anc_16,
@@ -3981,7 +4589,7 @@ async fn consume_chat_input_impl(
                     }
                 }
 
-                let thread_tainted = (th.tainted_mask != 0) || effective_tainted;
+                let thread_tainted = th.tainted_mask != 0 || effective_tainted;
                 let taint_mask = i64::from(u8::from(thread_tainted));
                 update_thread_after_append_tx(
                     tx,
@@ -4023,7 +4631,7 @@ async fn consume_chat_input_impl(
                     None,
                     &meta,
                     auth.principal(),
-                    Some(&input.expected_run),
+                    Some(&input.expected_active_run),
                     now_ts,
                 )
                 .await?;
@@ -4036,7 +4644,7 @@ async fn consume_chat_input_impl(
                     depth,
                     ancestors: build_ancestors_vec(anc_16, anc_256),
                     author,
-                    run: Some(input.expected_run),
+                    run: Some(input.expected_active_run),
                     kind: ChatEntryKind::Human,
                     body: body_out,
                     tainted: effective_tainted,
@@ -4044,7 +4652,10 @@ async fn consume_chat_input_impl(
                 };
                 let receipt = MutationReceiptToken::new(scope.clone(), seq)?;
                 let stored_full = StoredCommittedConsumedPendingV1 {
-                    value: StoredConsumedPendingV1::Appended((&entry_val).into()),
+                    value: StoredConsumedPendingV1::AppendedWithIntervention {
+                        entry: (&entry_val).into(),
+                        intervening_human,
+                    },
                     receipt,
                 };
                 let stored_sanitized = stored_full.sanitized_for_redaction();
@@ -4118,6 +4729,7 @@ async fn redact_chat_entry_impl(
     let deadline = crate::domain::common::CommandDeadline::start(&ctx.budget, "redact_chat_entry");
     let started = tokio::time::Instant::now();
     validate_mutation_identity(&ctx, &request.identity)?;
+    forbid_keeper_chat_mutation(ctx.auth())?;
     crate::domain::common::require_revision_only(&request.preconditions)?;
     let space_rec = deadline
         .prepare(&ctx.budget, || {
@@ -4139,18 +4751,20 @@ async fn redact_chat_entry_impl(
             request.input.thread.as_str(),
         )
         .with_known_base(&request.input.expected_thread_revision)
+        .with_canonical_effect(&ctx)
         .for_chat(ctx.auth(), &request.input.thread, Vec::new());
 
-    if let Some(replayed) = deadline
-        .prepare(&ctx.budget, || {
-            try_replay_completed_receipt::<StoredCommittedRedactedChatV1>(
-                store,
-                &space_rec.scope,
-                &idemp,
-                Some(&ctx.budget),
-            )
-        })
-        .await?
+    if idemp.canonical_effect().is_none()
+        && let Some(replayed) = deadline
+            .prepare(&ctx.budget, || {
+                try_replay_completed_receipt::<StoredCommittedRedactedChatV1>(
+                    store,
+                    &space_rec.scope,
+                    &idemp,
+                    Some(&ctx.budget),
+                )
+            })
+            .await?
     {
         let (committed, zero_refs) = replayed.into_committed();
         if !zero_refs.is_empty() {
@@ -4262,6 +4876,7 @@ async fn redact_chat_entry_impl(
                             "UPDATE chat_entries
                              SET kind = 'redacted', tool_call_id = NULL, inline_text = NULL,
                                  payload_blake3 = NULL, referenced_notes_json = '[]',
+                                 provenance_json = NULL, body_format = 0,
                                  is_chain_node = 1, redacted_at_seq = ?
                              WHERE space_id = ? AND thread_id = ? AND entry_seq = ?",
                         )
@@ -4280,6 +4895,7 @@ async fn redact_chat_entry_impl(
                             "UPDATE chat_entries
                              SET kind = 'redacted', tool_call_id = NULL, inline_text = NULL,
                                  payload_blake3 = NULL, referenced_notes_json = '[]',
+                                 provenance_json = NULL, body_format = 0,
                                  is_chain_node = 1, redacted_at_seq = $1
                              WHERE space_id = $2 AND thread_id = $3 AND entry_seq = $4",
                         )
@@ -4477,7 +5093,21 @@ async fn redact_chat_entry_impl(
     };
 
     let stored: StoredCommittedRedactedChatV1 = deadline.submit(store, &ctx.budget, intent).await?;
-    let (committed, _) = stored.into_committed();
+    let (committed, zero_refs) = stored.into_committed();
+    if !zero_refs.is_empty() {
+        wait_for_redaction_gc(
+            &ctx.budget,
+            started,
+            store.retire_zero_ref_digests(
+                &space_rec.scope,
+                space_rec.active_epoch,
+                &zero_refs,
+                RetirementReason::Gc,
+                None,
+            ),
+        )
+        .await;
+    }
     wait_for_redaction_gc(
         &ctx.budget,
         started,
@@ -4691,7 +5321,7 @@ async fn mark_descendant_compactions_stale_tx(
             BackendConn::Sqlite(conn) => {
                 sqlx::query_scalar(
                     "UPDATE chat_entries SET checkpoint_stale = 1, kind='redacted', inline_text=NULL,
-                            payload_blake3=NULL, referenced_notes_json='[]', redacted_at_seq=?4
+                            payload_blake3=NULL, referenced_notes_json='[]', provenance_json=NULL, body_format=0, redacted_at_seq=?4
                      WHERE space_id = ?1 AND thread_id = ?2 AND entry_seq = ?3 RETURNING created_space_seq",
                 )
                 .bind(space_id.as_str())
@@ -4707,7 +5337,7 @@ async fn mark_descendant_compactions_stale_tx(
             BackendConn::Postgres(conn) => {
                 sqlx::query_scalar(
                     "UPDATE chat_entries SET checkpoint_stale = 1, kind='redacted', inline_text=NULL,
-                            payload_blake3=NULL, referenced_notes_json='[]', redacted_at_seq=$4
+                            payload_blake3=NULL, referenced_notes_json='[]', provenance_json=NULL, body_format=0, redacted_at_seq=$4
                      WHERE space_id = $1 AND thread_id = $2 AND entry_seq = $3 RETURNING created_space_seq",
                 )
                 .bind(space_id.as_str())

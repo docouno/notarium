@@ -1,0 +1,107 @@
+use super::super::{EgressTarget, ToolCallContext, session};
+use notarium_core::{
+    error::PortError,
+    ids::{EpisodeId, SpaceId, SpaceSeq},
+    model::{FolderRef, HistoryScope},
+};
+
+pub(super) struct ReadTarget {
+    pub scope: HistoryScope,
+    pub slug: String,
+    pub project: Option<FolderRef>,
+    pub last_seq: SpaceSeq,
+}
+
+pub(super) async fn targets(
+    call: &ToolCallContext<'_>,
+    project: Option<&str>,
+    episode: Option<&EpisodeId>,
+    all_spaces: bool,
+) -> Result<Vec<ReadTarget>, PortError> {
+    let episode_project = match episode {
+        Some(id) => {
+            call.registry
+                .control
+                .get_episode(call.account(), id.clone())
+                .await?
+                .project_hint
+        }
+        None => None,
+    };
+    let target = match project {
+        Some(handle) => Some(session::resolve_project(call, handle).await?.folder),
+        None => episode_project,
+    };
+    let target = match &call.target {
+        EgressTarget::InAppProvider {
+            primary_project, ..
+        } => target.or_else(|| primary_project.clone()),
+        EgressTarget::ExternalMcp => target,
+    };
+    if let Some(project) = target {
+        session::project_for_folder(call, &project).await?;
+        return Ok(vec![
+            one(call, &project.space_id, Some(project.clone())).await?,
+        ]);
+    }
+    if all_spaces {
+        Ok(session::readable_spaces(call)
+            .await?
+            .into_values()
+            .map(|space| {
+                let project = call
+                    .auth
+                    .spaces()
+                    .get(&space.space.id)
+                    .and_then(|grant| grant.project_root.as_ref())
+                    .map(|root| FolderRef {
+                        space_id: space.space.id,
+                        folder_id: root.clone(),
+                    });
+                ReadTarget {
+                    scope: space.history,
+                    slug: space.slug,
+                    project,
+                    last_seq: space.last_seq,
+                }
+            })
+            .collect())
+    } else {
+        let id = if let Some(id) = call.auth.pinned_write_space() {
+            Some(id.clone())
+        } else {
+            call.registry
+                .control
+                .whoami(call.account())
+                .await?
+                .personal_space
+        };
+        let Some(id) = id else {
+            return Ok(Vec::new());
+        };
+        let project = call
+            .auth
+            .spaces()
+            .get(&id)
+            .and_then(|grant| grant.project_root.as_ref())
+            .map(|root| FolderRef {
+                space_id: id.clone(),
+                folder_id: root.clone(),
+            });
+        Ok(vec![one(call, &id, project).await?])
+    }
+}
+
+async fn one(
+    call: &ToolCallContext<'_>,
+    id: &SpaceId,
+    project: Option<FolderRef>,
+) -> Result<ReadTarget, PortError> {
+    let space = session::readable_space(call, id).await?;
+    Ok(ReadTarget {
+        scope: space.history,
+        slug: space.slug,
+        project,
+        last_seq: space.last_seq,
+    })
+}

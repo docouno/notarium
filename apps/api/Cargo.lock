@@ -2834,10 +2834,15 @@ dependencies = [
 name = "notarium-agents"
 version = "1.0.0-dev.0"
 dependencies = [
+ "base64 0.22.1",
+ "blake3",
+ "getrandom 0.4.3",
  "notarium-control",
  "notarium-core",
  "notarium-syntax",
- "reqwest",
+ "proptest",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
 ]

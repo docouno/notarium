@@ -2,7 +2,7 @@ use std::{collections::BTreeSet, sync::LazyLock};
 
 use notarium_core::ids::ContentDigest;
 
-pub const CANONICAL_SCHEMA_VERSION: u32 = 6;
+pub const CANONICAL_SCHEMA_VERSION: u32 = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LogicalColKind {
@@ -262,7 +262,7 @@ pub const CANONICAL_TABLES: &[TableSpec] = &[
             col("updated_seq", Int, false),
         ],
         indexes: &[
-            "uq_ability_packages_active_slug",
+            "idx_ability_packages_active_slug",
             "idx_ability_packages_entrypoint",
         ],
     },
@@ -584,6 +584,8 @@ pub const CANONICAL_TABLES: &[TableSpec] = &[
             col("created_at_nsec", Int, false),
             col("updated_at_sec", Int, false),
             col("updated_at_nsec", Int, false),
+            col("active_run_epoch", Int, true),
+            col("active_run_generation", Text, true),
         ],
         indexes: &["idx_chat_threads_created_seq"],
     },
@@ -611,6 +613,9 @@ pub const CANONICAL_TABLES: &[TableSpec] = &[
             col("created_space_seq", Int, false),
             col("redacted_at_seq", Int, true),
             col("checkpoint_stale", Int, false),
+            col("human_origin", Int, true),
+            col("body_format", Int, false),
+            col("provenance_json", Text, true),
         ],
         indexes: &["idx_chat_entries_parent", "idx_chat_entries_compaction"],
     },
@@ -636,6 +641,7 @@ pub const CANONICAL_TABLES: &[TableSpec] = &[
         indexes: &[
             "uq_chat_pending_inputs_ordinal",
             "idx_chat_pending_inputs_active",
+            "idx_chat_pending_inputs_consumed",
         ],
     },
     TableSpec {

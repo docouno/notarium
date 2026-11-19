@@ -1,5 +1,8 @@
 //! Durable scheduling metadata. The ticker and agent loop belong to the caller.
-use super::{context::*, control::AbilityRef};
+use super::{
+    context::*,
+    control::{AbilityIdentity, AbilityRef},
+};
 use crate::{ids::*, model::FolderRef, value::Timestamp};
 use serde::{Deserialize, Serialize};
 
@@ -62,6 +65,9 @@ impl std::fmt::Debug for ScheduleDefinition {
 pub struct CreateSchedule {
     pub id: ScheduleId,
     pub definition: ScheduleDefinition,
+    /// The exact current dependencies reviewed by the owner.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub approved_skills: Vec<AbilityRef>,
     pub next_slot: Timestamp,
     pub paused: bool,
 }
@@ -71,8 +77,24 @@ pub struct UpdateSchedule {
     pub schedule: ScheduleId,
     pub expected: ControlRevision,
     pub definition: ScheduleDefinition,
-    pub next_slot: Timestamp,
+    /// Omit during ordinary edits to retain the existing approval. An explicit
+    /// empty set approves a role with no dependencies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approved_skills: Option<Vec<AbilityRef>>,
+    pub next_slot: Option<Timestamp>,
     pub paused: bool,
+}
+#[derive(Clone, Debug)]
+pub struct ScheduleAbilitySelection {
+    pub space: SpaceId,
+    pub project: Option<FolderRef>,
+    pub role: AbilityIdentity,
+}
+#[derive(Clone, Debug)]
+pub struct ScheduleAbilityCandidate {
+    pub account_revision: ControlRevision,
+    pub approved_role: AbilityRef,
+    pub approved_skills: Vec<AbilityRef>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -85,10 +107,11 @@ pub struct AgentSchedule {
     pub id: ScheduleId,
     pub owner: PrincipalId,
     pub definition: ScheduleDefinition,
+    pub approved_skills: Vec<AbilityRef>,
     pub paused_reason: Option<SchedulePauseReason>,
     pub revision: ControlRevision,
     pub config_revision: ControlRevision,
-    pub next_slot: Timestamp,
+    pub next_slot: Option<Timestamp>,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -106,8 +129,9 @@ pub struct ClaimSchedule {
     pub slot: Timestamp,
     pub current_role: AbilityRef,
     pub expected: ControlRevision,
-    /// Computed by the scheduler, strictly after the claimed slot.
-    pub next_slot: Timestamp,
+    /// Computed by the scheduler after the claimed slot and current time.
+    /// None denotes a finite calendar with no further occurrences.
+    pub next_slot: Option<Timestamp>,
 }
 #[derive(Clone, Debug)]
 pub enum ScheduleClaim {
@@ -120,6 +144,9 @@ pub enum ScheduleClaim {
         context: Box<SpaceContext>,
     },
     AlreadyClaimed(ScheduleRunReceipt),
+    /// A migrated due was the second UTC representation of an earlier
+    /// completed or claimed civil window. The schedule advanced without a run.
+    SkippedDuplicate(ScheduleRunReceipt),
     Paused(SchedulePauseReason),
 }
 #[derive(Clone, Debug)]
@@ -148,7 +175,9 @@ pub struct ScheduleRunReceipt {
     pub run: AgentRunId,
     pub lease: LeaseEpoch,
     pub slot: Timestamp,
-    pub reserved_next_slot: Timestamp,
+    pub reserved_next_slot: Option<Timestamp>,
+    /// Absent for historical runs predating schedule-scoped logs.
+    pub keeper_log: Option<ChatThreadId>,
     pub claimed_revision: ControlRevision,
     pub status: ScheduleRunStatus,
 }

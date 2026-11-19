@@ -36,6 +36,7 @@ fn metadata(row: PatsRow, max: u16) -> Result<PatInfo, PortError> {
             "write" => BearerScope::Write,
             _ => return Err(denied()),
         },
+        ability_write: row.ability_write == 1,
         selected_spaces: selected(row.selected_spaces.as_deref(), max)?
             .map(|s| s.into_iter().collect()),
         expires_at_ms: row.expires_at,
@@ -58,6 +59,9 @@ impl ControlService {
         ctx: AccountContext,
         request: CreatePat,
     ) -> Result<ControlCommit<IssuedPat>, PortError> {
+        if request.ability_write && request.scope != BearerScope::Write {
+            return Err(invalid(ValidationReason::InvalidAuthority));
+        }
         if request.name.is_empty()
             || request.name.len() > 256
             || request.name.contains('\0')
@@ -115,6 +119,7 @@ impl ControlService {
                         user_id: current.user_id.clone(),
                         name: request.name,
                         scope: scope(request.scope).into(),
+                        ability_write: i64::from(request.ability_write),
                         selected_spaces,
                         expires_at: request.expires_at_ms,
                         last_used_at: None,

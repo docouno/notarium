@@ -203,6 +203,10 @@ async fn l1_sqlite_bootstrap_witness_owner_lock_and_fail_closed_guards() {
 
     {
         let mut raw = temp.open_raw_sqlite().await;
+        sqlx::raw_sql(include_str!("fixtures/chat-schema-v6-only.sql"))
+            .execute(&mut raw)
+            .await
+            .unwrap();
         sqlx::raw_sql("DROP TABLE collab_checkpoints;
             ALTER TABLE backup_holds DROP COLUMN owner_generation;
             UPDATE schema_meta SET schema_version=2,
@@ -338,6 +342,10 @@ async fn l1_postgres_bootstrap_idempotence_and_fail_closed_guards() {
             .fetch_all(&mut raw)
             .await
             .unwrap();
+        sqlx::raw_sql(include_str!("fixtures/chat-schema-v6-only.sql"))
+            .execute(&mut raw)
+            .await
+            .unwrap();
         sqlx::raw_sql(
             "DROP TABLE collab_checkpoints; ALTER TABLE backup_holds DROP COLUMN owner_generation",
         )
@@ -372,6 +380,10 @@ async fn l1_postgres_bootstrap_idempotence_and_fail_closed_guards() {
     .execute(&mut raw)
     .await
     .unwrap();
+    sqlx::raw_sql(include_str!("fixtures/chat-schema-v6-only.sql"))
+        .execute(&mut raw)
+        .await
+        .unwrap();
     sqlx::raw_sql("DROP TABLE collab_checkpoints;
         ALTER TABLE backup_holds DROP COLUMN owner_generation;
         ALTER TABLE account_catalog_receipts DROP CONSTRAINT account_catalog_receipts_result_msgpack_check;

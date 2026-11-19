@@ -17,15 +17,19 @@ use notarium_control::{
 };
 use notarium_core::{
     DomainError,
-    auth::SecretString,
+    auth::{Cap, ResourceFacts, SecretString, Space},
+    classes::{AbilityKind, DocClass},
     error::{CommitEffect, PortError},
     ids::*,
+    model::{Lifecycle, NoteRef},
     ports::{control::*, *},
 };
 use provider::keyring;
 use std::{
+    future::Future,
     path::PathBuf,
     sync::{Arc, atomic::Ordering},
+    time::Duration,
 };
 use support::*;
 
@@ -186,6 +190,340 @@ async fn issue(
         .await
         .unwrap()
 }
+
+async fn issue_authoring(
+    oauth: &OAuthService,
+    actor: AccountContext,
+    client: &str,
+    space: SpaceId,
+) -> IssuedOAuthTokens {
+    let mut request = authorization(client, true);
+    request.scope = "write offline_access mcp:ability-write".into();
+    request.selected_spaces = Some(vec![space]);
+    let prepared = oauth
+        .prepare_authorization(actor.clone(), request)
+        .await
+        .unwrap();
+    assert!(prepared.scope.ability_write);
+    let code = oauth
+        .approve_authorization(
+            actor,
+            OAuthConsent::attest_checked(prepared.intent, secret(BROWSER)),
+        )
+        .await
+        .unwrap();
+    oauth
+        .exchange_code(budget(), exchange(client, code.code.expose()))
+        .await
+        .unwrap()
+}
+
+async fn oauth_authoring(pg: bool) {
+    let _serial = AUTH_TEST_LOCK.lock().await;
+    let mut fixture = Fixture::new(pg, "oauth_authoring").await;
+    let (control, oauth, session) = service(&mut fixture).await;
+    let actor = context(&control, session.token.expose()).await;
+    let client = oauth
+        .register_client(
+            budget(),
+            RegisterOAuthClient {
+                client_name: "Authoring client".into(),
+                redirect_uris: vec!["http://127.0.0.1:1234/callback".into()],
+            },
+        )
+        .await
+        .unwrap();
+    let id = &client.client_id;
+    let tokens = issue_authoring(
+        &oauth,
+        actor,
+        id,
+        session.account.personal_space.clone().unwrap(),
+    )
+    .await;
+    let rotated = oauth
+        .refresh(
+            budget(),
+            refresh(id, tokens.refresh_token.as_ref().unwrap().expose()),
+        )
+        .await
+        .unwrap();
+    for issued in [&tokens, &rotated] {
+        assert!(issued.scope.ability_write);
+        let auth = control
+            .resolve(evidence(
+                AuthEvidenceKind::OAuth,
+                issued.access_token.expose(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(auth.bearer_scope(), Some(BearerScope::Write));
+        assert!(auth.has_cap(Cap::AbilityWrite));
+        assert!(!auth.human_management());
+    }
+    fixture
+        .observer
+        .execute("UPDATE oauth_grants SET ability_write=0")
+        .await;
+    let auth = control
+        .resolve(evidence(
+            AuthEvidenceKind::OAuth,
+            rotated.access_token.expose(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(auth.bearer_scope(), Some(BearerScope::Write));
+    assert!(
+        !auth.has_cap(Cap::AbilityWrite),
+        "access token cannot outlive consent to author"
+    );
+    fixture
+        .observer
+        .execute("UPDATE oauth_refresh_families SET revoked_at=1")
+        .await;
+    assert!(matches!(
+        control
+            .resolve(evidence(
+                AuthEvidenceKind::OAuth,
+                rotated.access_token.expose()
+            ))
+            .await,
+        Err(PortError::Domain(DomainError::AuthenticationFailed))
+    ));
+    drop(oauth);
+    drop(control);
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn sqlite_oauth_opt_in_survives_refresh_and_respects_live_grant() {
+    oauth_authoring(false).await;
+}
+
+#[tokio::test]
+async fn postgres_oauth_opt_in_survives_refresh_and_respects_live_grant() {
+    oauth_authoring(true).await;
+}
+
+fn personal_ability(fixture: &Fixture, space: &Space, owner: &PrincipalId, tag: u8) -> AbilityRef {
+    let reference = AbilityRef {
+        id: AbilityId::from_bytes([tag; 16]),
+        placement: AbilityPlacement::OwnedPersonal(owner.clone()),
+        revision: RevisionId::from_bytes([tag; 16]),
+    };
+    let note = NoteRef {
+        space_id: space.id.clone(),
+        note_id: NoteId::from_bytes([tag; 16]),
+    };
+    fixture
+        .catalog
+        .ability_entries
+        .lock()
+        .unwrap()
+        .push(AbilityDescriptor {
+            reference: reference.clone(),
+            name: format!("guide-{tag}"),
+            kind: AbilityKind::Role,
+            enabled: true,
+            healthy: true,
+            lifecycle: Lifecycle::Active,
+            entrypoint: Some(note.clone()),
+            auxiliary_files: vec![],
+            attached_skills: vec![],
+            promoted_from: None,
+            requires_explicit_binding: false,
+        });
+    fixture.catalog.note_entries.lock().unwrap().insert(
+        (space.id.clone(), note.note_id.clone()),
+        CatalogNote {
+            reference: note,
+            lifecycle: Lifecycle::Active,
+            facts: ResourceFacts {
+                space: space.clone(),
+                class: DocClass::Skill,
+                project: None,
+                ancestor_folders: vec![],
+                folder_write_locked: false,
+                ability_package: Some(reference.id.clone()),
+            },
+        },
+    );
+    reference
+}
+
+async fn authoring_rows(observer: &mut Observer) -> [i64; 4] {
+    [
+        observer
+            .count("SELECT COUNT(*) FROM ability_availability")
+            .await,
+        observer
+            .count("SELECT COUNT(*) FROM ability_placement_trail")
+            .await,
+        observer
+            .count("SELECT COUNT(*) FROM control_commands")
+            .await,
+        observer.count("SELECT MAX(revision) FROM users").await,
+    ]
+}
+
+async fn revoke_between_authoring_checks<T>(
+    fixture: &mut Fixture,
+    oauth: &OAuthService,
+    client_id: &str,
+    refresh_token: &SecretString,
+    call: impl Future<Output = Result<T, PortError>>,
+) {
+    let gate = &fixture.catalog.ability_tip_gate;
+    let before = authoring_rows(&mut fixture.observer).await;
+    gate.enabled.store(true, Ordering::SeqCst);
+    tokio::pin!(call);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::select! {
+            permit = gate.entered.acquire() => permit.unwrap().forget(),
+            result = &mut call => panic!("authoring completed before catalog admission: {:?}", result.err()),
+        }
+    }).await.expect("authoring reached the tip lookup after the account precheck");
+    // The real token owner revokes the whole family while the mutation holds
+    // its prechecked account but has yet to acquire the final SQL writer.
+    oauth
+        .revoke(
+            budget(),
+            RevokeOAuthToken {
+                client_id: client_id.to_owned(),
+                token: secret(refresh_token.expose()),
+            },
+        )
+        .await
+        .unwrap();
+    gate.release.add_permits(1);
+    assert!(matches!(
+        call.await,
+        Err(PortError::Domain(DomainError::AuthenticationFailed))
+    ));
+    assert_eq!(authoring_rows(&mut fixture.observer).await, before);
+}
+
+async fn oauth_authoring_concurrent_family_revocation(pg: bool) {
+    let _serial = AUTH_TEST_LOCK.lock().await;
+    let mut fixture = Fixture::new(pg, "oauth_authoring_revocation").await;
+    let (control, oauth, session) = service(&mut fixture).await;
+    let actor = context(&control, session.token.expose()).await;
+    let owner = &session.account.id;
+    let space_id = session.account.personal_space.clone().unwrap();
+    let space = fixture.catalog.entries.lock().unwrap()[&space_id]
+        .2
+        .space
+        .clone();
+    let binding = personal_ability(&fixture, &space, owner, 70);
+    let source = personal_ability(&fixture, &space, owner, 71);
+    let destination = personal_ability(&fixture, &space, owner, 72);
+    let client = oauth
+        .register_client(
+            budget(),
+            RegisterOAuthClient {
+                client_name: "Authoring client".into(),
+                redirect_uris: vec!["http://127.0.0.1:54321/callback".into()],
+            },
+        )
+        .await
+        .unwrap();
+    let id = &client.client_id;
+    for (key, trail, replay) in [
+        (73, false, false),
+        (74, false, true),
+        (75, true, false),
+        (76, true, true),
+    ] {
+        let initial = issue_authoring(&oauth, actor.clone(), id, space_id.clone()).await;
+        let rotated = oauth
+            .refresh(
+                budget(),
+                refresh(id, initial.refresh_token.as_ref().unwrap().expose()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rotated.family, initial.family);
+        let auth = control
+            .resolve(evidence(
+                AuthEvidenceKind::OAuth,
+                rotated.access_token.expose(),
+            ))
+            .await
+            .unwrap();
+        assert!(auth.has_cap(Cap::AbilityWrite));
+        let account = AccountContext::new(auth, budget());
+        let revision = control
+            .whoami(actor.clone())
+            .await
+            .unwrap()
+            .account_revision;
+        let identity = command(owner, owner, key, revision);
+        let proof = rotated.refresh_token.as_ref().unwrap();
+        if trail {
+            let request = AccountMutation {
+                identity,
+                input: AbilityTrailUpdate {
+                    source: source.clone(),
+                    expected_destination: None,
+                    destination: Some(destination.clone()),
+                },
+            };
+            if replay {
+                control
+                    .set_ability_trail(account.clone(), request.clone())
+                    .await
+                    .unwrap();
+            }
+            revoke_between_authoring_checks(
+                &mut fixture,
+                &oauth,
+                id,
+                proof,
+                control.set_ability_trail(account, request),
+            )
+            .await;
+        } else {
+            let request = AccountMutation {
+                identity,
+                input: AbilityBindingUpdate {
+                    ability: binding.clone(),
+                    enabled: false,
+                    expected: ControlRevision::ZERO,
+                    projects: AbilityProjects::All,
+                },
+            };
+            if replay {
+                let saved = control
+                    .update_ability_binding(account.clone(), request.clone())
+                    .await
+                    .unwrap();
+                assert!(!saved.value.enabled);
+            }
+            revoke_between_authoring_checks(
+                &mut fixture,
+                &oauth,
+                id,
+                proof,
+                control.update_ability_binding(account, request),
+            )
+            .await;
+        }
+    }
+    drop(oauth);
+    drop(control);
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn sqlite_revoked_oauth_family_cannot_bind_or_publish_a_trail() {
+    oauth_authoring_concurrent_family_revocation(false).await;
+}
+
+#[tokio::test]
+async fn postgres_revoked_oauth_family_cannot_bind_or_publish_a_trail() {
+    oauth_authoring_concurrent_family_revocation(true).await;
+}
+
 async fn lifecycle(pg: bool) {
     let _serial = AUTH_TEST_LOCK.lock().await;
     let mut f = Fixture::new(pg, "oauth_lifecycle").await;
@@ -624,6 +962,7 @@ async fn both_databases_imported_native_tokens_keep_their_verifiers_and_expiry()
                 last_seen_at: Some(now),
             },
             TargetRecord::OauthGrants {
+                ability_write: 0,
                 grant_id: grant.clone(),
                 user_id: owner.account.id.to_string(),
                 client_id: "imported-client".into(),
@@ -653,6 +992,7 @@ async fn both_databases_imported_native_tokens_keep_their_verifiers_and_expiry()
                 rotated_to: None,
             },
             TargetRecord::OauthAccessTokens {
+                ability_write: 0,
                 token_id: id("access"),
                 token_hash: digest("access"),
                 grant_id: grant,

@@ -105,6 +105,9 @@ pub(crate) async fn move_folder_impl(
                     load_folder_ancestry_tx(tx, &scope.space_id, &input.folder, true).await?;
                 let dest_anc =
                     load_folder_ancestry_tx(tx, &scope.space_id, &dest_parent, true).await?;
+                let crosses_ability_scope =
+                    !folder_row.is_project && before_anc.project != dest_anc.project;
+                let destination_project = dest_anc.project.clone();
 
                 let would_cycle = dest_anc.ancestors.contains(&input.folder);
                 let old_depth = before_anc.ancestors.len() - 1;
@@ -112,6 +115,7 @@ pub(crate) async fn move_folder_impl(
                 let before_facts = notarium_core::auth::ResourceFacts {
                     space: live_space.space.clone(),
                     class: target_write_class,
+                    project: before_anc.project,
                     ancestor_folders: before_anc.ancestors,
                     folder_write_locked: before_anc.write_locked,
                     ability_package: None,
@@ -122,6 +126,11 @@ pub(crate) async fn move_folder_impl(
                 let after_facts = notarium_core::auth::ResourceFacts {
                     space: live_space.space.clone(),
                     class: target_write_class,
+                    project: if folder_row.is_project {
+                        Some(input.folder.clone())
+                    } else {
+                        destination_project.clone()
+                    },
                     ancestor_folders: after_ancestors,
                     folder_write_locked: folder_row.write_locked || dest_anc.write_locked,
                     ability_package: None,
@@ -239,6 +248,45 @@ pub(crate) async fn move_folder_impl(
                     }
                 }
 
+                if crosses_ability_scope {
+                    let sql = include_str!("moved_ability_slots.sql");
+                    let project = destination_project.as_ref().map_or("", FolderId::as_str);
+                    let state: i64 = match tx {
+                        BackendConn::Sqlite(conn) => {
+                            sqlx::query_scalar(sql)
+                                .bind(scope.space_id.as_str())
+                                .bind(input.folder.as_str())
+                                .bind(project)
+                                .fetch_one(&mut **conn)
+                                .await
+                        }
+                        BackendConn::Postgres(conn) => {
+                            sqlx::query_scalar(sql)
+                                .bind(scope.space_id.as_str())
+                                .bind(input.folder.as_str())
+                                .bind(project)
+                                .fetch_one(&mut **conn)
+                                .await
+                        }
+                    }
+                    .map_err(|err| {
+                        internal_not_committed("moved_ability_slots", err.to_string())
+                    })?;
+                    if state != 0 {
+                        auth.authorize_ability_mutation()?;
+                    }
+                    if state == 2 {
+                        return Err(DomainError::PathConflict {
+                            target: PathTarget {
+                                space_id: scope.space_id.clone(),
+                                parent: input.new_parent.clone(),
+                                component: folder_row.slug.clone(),
+                            },
+                        }
+                        .into());
+                    }
+                }
+
                 if dest_parent != old_parent {
                     insert_folder_alias_tx(
                         tx,
@@ -254,6 +302,7 @@ pub(crate) async fn move_folder_impl(
                 let run_opt = extract_agent_run_from_auth(&auth);
                 let meta = RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Folder(
                     FolderRevisionMetadata {
+                        confirmation: None,
                         folder_id: input.folder.clone(),
                         parent_folder_id: Some(dest_parent),
                         is_root: false,
@@ -411,6 +460,7 @@ pub(crate) async fn rename_folder_impl(
                 let facts = notarium_core::auth::ResourceFacts {
                     space: live_space.space.clone(),
                     class: target_write_class,
+                    project: anc.project,
                     ancestor_folders: anc.ancestors,
                     folder_write_locked: anc.write_locked,
                     ability_package: None,
@@ -520,6 +570,7 @@ pub(crate) async fn rename_folder_impl(
                 let run_opt = extract_agent_run_from_auth(&auth);
                 let meta = RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Folder(
                     FolderRevisionMetadata {
+                        confirmation: None,
                         folder_id: input.folder.clone(),
                         parent_folder_id: Some(parent_id),
                         is_root: false,
@@ -681,6 +732,7 @@ pub(crate) async fn rename_project_impl(
                 let facts = notarium_core::auth::ResourceFacts {
                     space: live_space.space.clone(),
                     class: target_write_class,
+                    project: anc.project,
                     ancestor_folders: anc.ancestors,
                     folder_write_locked: anc.write_locked,
                     ability_package: None,
@@ -813,6 +865,7 @@ pub(crate) async fn rename_project_impl(
                 let run_opt = extract_agent_run_from_auth(&auth);
                 let meta = RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Folder(
                     FolderRevisionMetadata {
+                        confirmation: None,
                         folder_id: input.folder.clone(),
                         parent_folder_id: Some(parent_id),
                         is_root: false,
@@ -931,114 +984,124 @@ pub(crate) async fn resolve_folder_alias_impl(
 
                 let parent_id = parent.unwrap_or_else(|| space_rec.root_folder_id.clone());
 
-                // 1. Exact active sibling takes priority over any historical alias!
-                let active_sibling: Option<String> = match tx {
-                    BackendConn::Sqlite(conn) => sqlx::query_scalar(
-                        "SELECT folder_id FROM folder_heads
-                         WHERE space_id = ? AND parent_folder_id = ? AND slug_fold = ?
-                           AND lifecycle_state = 'active' AND is_root = 0
-                         LIMIT 1",
-                    )
-                    .bind(scope.space_id.as_str())
-                    .bind(parent_id.as_str())
-                    .bind(&slug_fold)
-                    .fetch_optional(&mut **conn)
+                resolve_folder_component_tx(tx, &space_rec, &auth, &parent_id, &slug_fold, true)
                     .await
-                    .map_err(|err| {
-                        internal_not_committed("sqlite_resolve_folder_exact", err.to_string())
-                    })?,
-                    BackendConn::Postgres(conn) => sqlx::query_scalar(
-                        "SELECT folder_id FROM folder_heads
-                         WHERE space_id = $1 AND parent_folder_id = $2 AND slug_fold = $3
-                           AND lifecycle_state = 'active' AND is_root = 0
-                         LIMIT 1",
-                    )
-                    .bind(scope.space_id.as_str())
-                    .bind(parent_id.as_str())
-                    .bind(&slug_fold)
-                    .fetch_optional(&mut **conn)
-                    .await
-                    .map_err(|err| {
-                        crate::runtime::pg_read_error("pg_resolve_folder_exact", err)
-                    })?,
-                };
-
-                if let Some(fid_raw) = active_sibling {
-                    let fid = FolderId::parse(&fid_raw).map_err(|_| {
-                        internal_not_committed("corrupt_folder_id", "invalid folder_id")
-                    })?;
-                    if is_folder_readable_tx(tx, &space_rec.space, &auth, &fid).await? {
-                        return Ok(Some(FolderRef {
-                            space_id: scope.space_id,
-                            folder_id: fid,
-                        }));
-                    }
-                    return Ok(None);
-                }
-
-                // 2. Newest valid active alias target (with cycle/depth guard via ancestry check).
-                let candidates: Vec<String> = match tx {
-                    BackendConn::Sqlite(conn) => {
-                        let rows = sqlx::query(
-                            "SELECT target_folder_id FROM folder_aliases
-                             WHERE space_id = ? AND old_parent_folder_id = ? AND old_slug_fold = ?
-                             ORDER BY created_seq DESC
-                             LIMIT ?",
-                        )
-                        .bind(scope.space_id.as_str())
-                        .bind(parent_id.as_str())
-                        .bind(&slug_fold)
-                        .bind(MAX_FOLDER_DEPTH as i64)
-                        .fetch_all(&mut **conn)
-                        .await
-                        .map_err(|err| {
-                            internal_not_committed("sqlite_resolve_folder_alias", err.to_string())
-                        })?;
-                        rows.into_iter()
-                            .map(|r| r.get("target_folder_id"))
-                            .collect()
-                    }
-                    BackendConn::Postgres(conn) => {
-                        let rows = sqlx::query(
-                            "SELECT target_folder_id FROM folder_aliases
-                             WHERE space_id = $1 AND old_parent_folder_id = $2 AND old_slug_fold = $3
-                             ORDER BY created_seq DESC
-                             LIMIT $4",
-                        )
-                        .bind(scope.space_id.as_str())
-                        .bind(parent_id.as_str())
-                        .bind(&slug_fold)
-                        .bind(MAX_FOLDER_DEPTH as i64)
-                        .fetch_all(&mut **conn)
-                        .await
-                        .map_err(|err| {
-                            crate::runtime::pg_read_error("pg_resolve_folder_alias", err)
-                        })?;
-                        rows.into_iter()
-                            .map(|r| r.get("target_folder_id"))
-                            .collect()
-                    }
-                };
-
-                let mut seen = BTreeSet::new();
-                for cand_raw in candidates {
-                    if !seen.insert(cand_raw.clone()) {
-                        continue;
-                    }
-                    let fid = FolderId::parse(&cand_raw).map_err(|_| {
-                        internal_not_committed("corrupt_alias_folder_id", "invalid target_folder_id")
-                    })?;
-                    if is_folder_readable_tx(tx, &space_rec.space, &auth, &fid).await? {
-                        return Ok(Some(FolderRef {
-                            space_id: scope.space_id,
-                            folder_id: fid,
-                        }));
-                    }
-                }
-                Ok(None)
             })
         })
         .await
+}
+
+pub(super) async fn resolve_folder_component_tx(
+    tx: &mut BackendConn<'_>,
+    space_rec: &crate::SpaceRecord,
+    auth: &notarium_core::auth::EngineAuthContext,
+    parent_id: &FolderId,
+    slug_fold: &str,
+    aliases: bool,
+) -> Result<Option<FolderRef>, PortError> {
+    let scope = &space_rec.scope;
+    // 1. Exact active sibling takes priority over any historical alias!
+    let active_sibling: Option<String> = match tx {
+        BackendConn::Sqlite(conn) => sqlx::query_scalar(
+            "SELECT folder_id FROM folder_heads
+             WHERE space_id = ? AND parent_folder_id = ? AND slug_fold = ?
+               AND lifecycle_state = 'active' AND is_root = 0
+             LIMIT 1",
+        )
+        .bind(scope.space_id.as_str())
+        .bind(parent_id.as_str())
+        .bind(slug_fold)
+        .fetch_optional(&mut **conn)
+        .await
+        .map_err(|err| internal_not_committed("sqlite_resolve_folder_exact", err.to_string()))?,
+        BackendConn::Postgres(conn) => sqlx::query_scalar(
+            "SELECT folder_id FROM folder_heads
+             WHERE space_id = $1 AND parent_folder_id = $2 AND slug_fold = $3
+               AND lifecycle_state = 'active' AND is_root = 0
+             LIMIT 1",
+        )
+        .bind(scope.space_id.as_str())
+        .bind(parent_id.as_str())
+        .bind(slug_fold)
+        .fetch_optional(&mut **conn)
+        .await
+        .map_err(|err| crate::runtime::pg_read_error("pg_resolve_folder_exact", err))?,
+    };
+
+    if let Some(fid_raw) = active_sibling {
+        let fid = FolderId::parse(&fid_raw)
+            .map_err(|_| internal_not_committed("corrupt_folder_id", "invalid folder_id"))?;
+        if is_folder_readable_tx(tx, &space_rec.space, auth, &fid).await? {
+            return Ok(Some(FolderRef {
+                space_id: scope.space_id.clone(),
+                folder_id: fid,
+            }));
+        }
+        return Ok(None);
+    }
+
+    if !aliases {
+        return Ok(None);
+    }
+
+    // 2. Newest valid active alias target (with cycle/depth guard via ancestry check).
+    let candidates: Vec<String> = match tx {
+        BackendConn::Sqlite(conn) => {
+            let rows = sqlx::query(
+                "SELECT target_folder_id FROM folder_aliases
+                 WHERE space_id = ? AND old_parent_folder_id = ? AND old_slug_fold = ?
+                 ORDER BY created_seq DESC
+                 LIMIT ?",
+            )
+            .bind(scope.space_id.as_str())
+            .bind(parent_id.as_str())
+            .bind(slug_fold)
+            .bind(MAX_FOLDER_DEPTH as i64)
+            .fetch_all(&mut **conn)
+            .await
+            .map_err(|err| {
+                internal_not_committed("sqlite_resolve_folder_alias", err.to_string())
+            })?;
+            rows.into_iter()
+                .map(|r| r.get("target_folder_id"))
+                .collect()
+        }
+        BackendConn::Postgres(conn) => {
+            let rows = sqlx::query(
+                "SELECT target_folder_id FROM folder_aliases
+                 WHERE space_id = $1 AND old_parent_folder_id = $2 AND old_slug_fold = $3
+                 ORDER BY created_seq DESC
+                 LIMIT $4",
+            )
+            .bind(scope.space_id.as_str())
+            .bind(parent_id.as_str())
+            .bind(slug_fold)
+            .bind(MAX_FOLDER_DEPTH as i64)
+            .fetch_all(&mut **conn)
+            .await
+            .map_err(|err| crate::runtime::pg_read_error("pg_resolve_folder_alias", err))?;
+            rows.into_iter()
+                .map(|r| r.get("target_folder_id"))
+                .collect()
+        }
+    };
+
+    let mut seen = BTreeSet::new();
+    for cand_raw in candidates {
+        if !seen.insert(cand_raw.clone()) {
+            continue;
+        }
+        let fid = FolderId::parse(&cand_raw).map_err(|_| {
+            internal_not_committed("corrupt_alias_folder_id", "invalid target_folder_id")
+        })?;
+        if is_folder_readable_tx(tx, &space_rec.space, auth, &fid).await? {
+            return Ok(Some(FolderRef {
+                space_id: scope.space_id.clone(),
+                folder_id: fid,
+            }));
+        }
+    }
+    Ok(None)
 }
 
 pub(crate) async fn resolve_note_alias_impl(
@@ -1312,6 +1375,7 @@ pub(crate) async fn set_folder_write_lock_impl(
                 let check_facts = notarium_core::auth::ResourceFacts {
                     space: live_space.space.clone(),
                     class: target_write_class,
+                    project: anc.project,
                     ancestor_folders: anc.ancestors,
                     folder_write_locked: false,
                     ability_package: None,
@@ -1372,6 +1436,7 @@ pub(crate) async fn set_folder_write_lock_impl(
 
                 let meta = RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Folder(
                     FolderRevisionMetadata {
+                        confirmation: None,
                         folder_id: folder_cl.clone(),
                         parent_folder_id: folder_row.parent_folder_id,
                         is_root: folder_row.is_root,
@@ -1480,6 +1545,7 @@ async fn is_folder_readable_tx(
     let facts = notarium_core::auth::ResourceFacts {
         space: space.clone(),
         class: readable_class,
+        project: anc.project,
         ancestor_folders: anc.ancestors,
         folder_write_locked: anc.write_locked,
         ability_package: None,

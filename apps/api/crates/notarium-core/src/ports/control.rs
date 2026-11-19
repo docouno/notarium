@@ -42,17 +42,24 @@ pub struct PrincipalInfo {
     pub principal: PrincipalId,
     pub kind: PrincipalKind,
     pub grant: GrantId,
+    pub account_revision: ControlRevision,
+    pub personal_space: Option<SpaceId>,
+    pub has_completion_provider: bool,
 }
 #[derive(Clone, Debug)]
 pub struct AccessibleSpace {
     pub space: Space,
+    pub slug: String,
     pub role: SpaceRole,
     pub history: HistoryScope,
+    /// Upper cursor bound from a complete canonical command.
+    pub last_seq: SpaceSeq,
 }
 #[derive(Clone, Debug)]
 pub struct ProjectInfo {
     pub folder: FolderRef,
     pub name: String,
+    pub project_slug: String,
 }
 #[derive(Clone, Debug)]
 pub struct AccountMutation<T> {
@@ -129,6 +136,7 @@ impl AbilityRef {
 /// Maximum number of auxiliary resource names in a published ability descriptor.
 pub const MAX_ABILITY_AUX_FILES: usize = 256;
 pub const MAX_ABILITY_AUX_PATH_BYTES: usize = 1024;
+pub const MAX_ATTACHED_SKILLS: usize = 32;
 
 #[derive(Clone, Debug)]
 pub struct AbilityDescriptor {
@@ -138,8 +146,14 @@ pub struct AbilityDescriptor {
     pub enabled: bool,
     pub healthy: bool,
     pub lifecycle: Lifecycle,
-    pub entrypoint: NoteRef,
+    /// The canonical entrypoint of an owned package. Built-ins have no note.
+    pub entrypoint: Option<NoteRef>,
     pub auxiliary_files: Vec<String>,
+    pub attached_skills: Vec<AbilityRef>,
+    /// Scope of the old publication when an ability was promoted to its Space.
+    pub promoted_from: Option<AbilityRef>,
+    /// Activation requires a Control binding even before the first binding commit.
+    pub requires_explicit_binding: bool,
 }
 #[derive(Clone, Debug)]
 pub struct AbilityQuery {
@@ -176,6 +190,15 @@ pub enum AbilityProjects {
     All,
     Selected(Vec<FolderRef>),
 }
+#[derive(Clone, Debug)]
+pub struct AbilityInspection {
+    pub descriptor: AbilityDescriptor,
+    pub availability: AbilityProjects,
+    pub binding_enabled: bool,
+    pub preference_enabled: bool,
+    pub binding_revision: ControlRevision,
+    pub overlays: AbilityOverlayState,
+}
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct AbilityBindingUpdate {
     pub ability: AbilityRef,
@@ -184,15 +207,48 @@ pub struct AbilityBindingUpdate {
     pub projects: AbilityProjects,
 }
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct AbilityBindingChange {
+    pub ability: AbilityRef,
+    pub enabled: bool,
+    pub expected: Option<ControlRevision>,
+    pub projects: AbilityProjects,
+}
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct AbilityPreferenceUpdate {
     pub ability: AbilityRef,
     pub enabled: bool,
+}
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct AbilityPreferenceChange {
+    pub preference: AbilityPreferenceUpdate,
+    /// `None` requires the absence of a preference row for this owner.
+    pub expected: Option<ControlRevision>,
 }
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct AbilityTrailUpdate {
     pub source: AbilityRef,
     pub expected_destination: Option<AbilityRef>,
     pub destination: Option<AbilityRef>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct AdoptAbilityPromotion {
+    pub source: AbilityRef,
+    pub destination: AbilityRef,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct AbilityOverlayState {
+    pub binding_revision: Option<ControlRevision>,
+    pub binding_enabled: bool,
+    pub preference_revision: Option<ControlRevision>,
+    pub preference_enabled: bool,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct AbilityPromotionResult {
+    pub source: AbilityOverlayState,
+    pub destination: AbilityOverlayState,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -310,7 +366,10 @@ pub struct ProviderSelection {
     pub provider: ProviderResourceId,
     pub model: ModelProfileId,
     pub project: Option<FolderRef>,
+    pub project_only: Option<FolderRef>,
     pub policy: ProviderPolicy,
+    pub completion: Option<CompletionModelLimits>,
+    pub revocation_scope: ProviderRevocationScope,
 }
 #[derive(Clone, Debug)]
 pub struct CompletionBudget {
@@ -322,6 +381,8 @@ pub struct CompletionBudget {
 pub struct CompletionRequest {
     pub intent: CommandKey,
     pub selection: ProviderSelection,
+    /// Project context for sources outside the primary history.
+    pub secondary_projects: Vec<FolderRef>,
     pub messages: Vec<CompletionMessage>,
     pub tools: Vec<ProviderToolDefinition>,
     pub budget: CompletionBudget,
@@ -346,6 +407,28 @@ impl std::fmt::Debug for CompletionEvent {
 
 pub trait ControlPort: Send + Sync {
     fn resolve_auth(&self, ctx: PreAuthContext) -> PortFuture<'_, EngineAuthContext>;
+    /// Refreshes a previously verified credential and intersects its current
+    /// authority with the original delegation, project pin and branch taint.
+    fn revalidate_auth(&self, ctx: AccountContext) -> PortFuture<'_, EngineAuthContext>;
+    /// Register and revalidate short-lived authority for one canonical write or
+    /// its replay. The original grants also cover a proposal's source Space.
+    fn fence_canonical_effect(
+        &self,
+        _authority: EngineAuthContext,
+        _ctx: SpaceContext,
+        _effect: CanonicalEffect,
+    ) -> PortFuture<'_, SpaceContext> {
+        Box::pin(async { Err(crate::DomainError::AccessDenied.into()) })
+    }
+    /// Rebuilds independent authority from the same live interactive credential.
+    /// The read variant grants proposal admission without management or write authority.
+    fn revalidate_proposal_human(
+        &self,
+        _ctx: AccountContext,
+        _access: ProposalHumanAccess,
+    ) -> PortFuture<'_, EngineAuthContext> {
+        Box::pin(async { Err(crate::DomainError::AccessDenied.into()) })
+    }
     fn whoami(&self, ctx: AccountContext) -> PortFuture<'_, PrincipalInfo>;
     fn list_spaces(
         &self,
@@ -422,6 +505,11 @@ pub trait ControlPort: Send + Sync {
         reference: AbilityRef,
         project: Option<FolderRef>,
     ) -> PortFuture<'_, AbilityDescriptor>;
+    fn inspect_ability(
+        &self,
+        ctx: AccountContext,
+        identity: AbilityIdentity,
+    ) -> PortFuture<'_, AbilityInspection>;
     fn update_ability_binding(
         &self,
         ctx: AccountContext,
@@ -437,6 +525,23 @@ pub trait ControlPort: Send + Sync {
         ctx: AccountContext,
         request: AccountMutation<AbilityTrailUpdate>,
     ) -> PortFuture<'_, ControlCommit<AbilityTrailUpdate>>;
+    /// Authoring carries a stable command identity and exact overlay revision.
+    fn compare_authored_ability_binding(
+        &self,
+        ctx: AccountContext,
+        request: AccountMutation<AbilityBindingChange>,
+    ) -> PortFuture<'_, ControlCommit<AbilityRef>>;
+    fn compare_authored_ability_preference(
+        &self,
+        ctx: AccountContext,
+        request: AccountMutation<AbilityPreferenceChange>,
+    ) -> PortFuture<'_, ControlCommit<AbilityPreferenceUpdate>>;
+    /// Adopt an exact canonical project-to-Space promotion at an absent trail.
+    fn adopt_authored_ability_promotion(
+        &self,
+        ctx: AccountContext,
+        request: AccountMutation<AdoptAbilityPromotion>,
+    ) -> PortFuture<'_, ControlCommit<AbilityPromotionResult>>;
     fn lookup_mcp_dedup(
         &self,
         ctx: AccountContext,
@@ -449,11 +554,22 @@ pub trait ControlPort: Send + Sync {
         target: MemoryTarget,
         category: String,
     ) -> PortFuture<'_, ResolvedMemoryTarget>;
+    fn inspect_memory_target(
+        &self,
+        ctx: AccountContext,
+        target: MemoryTarget,
+        category: String,
+    ) -> PortFuture<'_, MemoryTargetSnapshot>;
     fn create_schedule(
         &self,
         ctx: AccountContext,
         request: AccountMutation<CreateSchedule>,
     ) -> PortFuture<'_, ControlCommit<AgentSchedule>>;
+    fn schedule_ability_candidate(
+        &self,
+        ctx: AccountContext,
+        selection: ScheduleAbilitySelection,
+    ) -> PortFuture<'_, ScheduleAbilityCandidate>;
     fn get_schedule(
         &self,
         ctx: SpaceContext,
@@ -480,6 +596,12 @@ pub trait ControlPort: Send + Sync {
         now: Timestamp,
         page: ControlPageRequest,
     ) -> PortFuture<'_, ControlPage<AgentSchedule>>;
+    fn list_expired_schedule_runs(
+        &self,
+        ctx: MaintenanceContext,
+        now: Timestamp,
+        page: ControlPageRequest,
+    ) -> PortFuture<'_, ControlPage<ScheduleRunReceipt>>;
     fn get_schedule_run(
         &self,
         ctx: ScheduleRunContext,

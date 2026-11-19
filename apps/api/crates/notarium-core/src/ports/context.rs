@@ -1,9 +1,11 @@
+use super::{CanonicalEffectRegistration, ChatProposalWitness, PortFuture, RevocationLease};
 use crate::{
     DomainError, DomainResult,
     auth::{EngineAuthContext, SecretString},
     error::ValidationReason,
     ids::*,
-    model::HistoryScope,
+    model::{FolderRef, HistoryScope},
+    receipt::CommandIdentity,
 };
 use std::{
     fmt,
@@ -217,6 +219,8 @@ impl AccountContext {
 pub struct SpaceContext {
     auth: EngineAuthContext,
     scope: HistoryScope,
+    confirmed_chat_step: Option<Arc<ConfirmedChatStep>>,
+    canonical_effect: Option<CanonicalEffectAdmission>,
     pub budget: CallBudget,
 }
 impl SpaceContext {
@@ -231,6 +235,8 @@ impl SpaceContext {
         Ok(Self {
             auth,
             scope,
+            confirmed_chat_step: None,
+            canonical_effect: None,
             budget,
         })
     }
@@ -240,9 +246,141 @@ impl SpaceContext {
     pub fn scope(&self) -> &HistoryScope {
         &self.scope
     }
+    /// Bind one explicitly confirmed step to this independently authenticated
+    /// write context. Cloning the proposal read context cannot clear its taint.
+    pub fn with_confirmed_chat_step(
+        mut self,
+        witness: ChatProposalWitness,
+        identity: &CommandIdentity,
+    ) -> DomainResult<Self> {
+        self.scope.check(&identity.scope)?;
+        witness.authorize_writer(&self.auth)?;
+        if identity.actor != *self.auth.principal() || self.confirmed_chat_step.is_some() {
+            return Err(DomainError::validation(ValidationReason::InvalidAuthority));
+        }
+        self.confirmed_chat_step = Some(Arc::new(ConfirmedChatStep {
+            witness,
+            identity: identity.clone(),
+            destination: None,
+        }));
+        Ok(self)
+    }
+    pub fn confirmed_chat_step(&self) -> Option<&Arc<ConfirmedChatStep>> {
+        self.confirmed_chat_step.as_ref()
+    }
+    pub fn with_confirmed_note_destination(
+        mut self,
+        destination: ConfirmedNoteDestination,
+    ) -> DomainResult<Self> {
+        if self.scope.space_id != destination.anchor.space_id {
+            return Err(DomainError::validation(ValidationReason::ScopeMismatch));
+        }
+        let step = self
+            .confirmed_chat_step
+            .as_mut()
+            .ok_or_else(|| DomainError::validation(ValidationReason::InvalidAuthority))?;
+        let step = Arc::make_mut(step);
+        if step.destination.is_some() {
+            return Err(DomainError::validation(ValidationReason::InvalidAuthority));
+        }
+        step.destination = Some(destination);
+        Ok(self)
+    }
+    /// Bind freshly revalidated Control authority for one bounded operation.
+    /// Canonical enters this registration under its own storage locks.
+    pub fn with_canonical_effect(
+        mut self,
+        current: &AccountContext,
+        registration: Arc<dyn CanonicalEffectRegistration>,
+    ) -> DomainResult<Self> {
+        if self.canonical_effect.is_some() {
+            return Err(DomainError::validation(ValidationReason::InvalidAuthority));
+        }
+        self.auth = self.auth.intersect_current(current.auth())?;
+        if !self.auth.spaces().contains_key(&self.scope.space_id) {
+            return Err(DomainError::ResourceNotFound);
+        }
+        self.budget = current.budget.clone();
+        self.canonical_effect = Some(CanonicalEffectAdmission(registration));
+        Ok(self)
+    }
+    pub fn canonical_effect(&self) -> Option<&CanonicalEffectAdmission> {
+        self.canonical_effect.as_ref()
+    }
+    pub fn restrict_to_project(mut self, project: &FolderRef) -> DomainResult<Self> {
+        if self.scope.space_id != project.space_id {
+            return Err(DomainError::validation(ValidationReason::ScopeMismatch));
+        }
+        self.auth = self.auth.restrict_to_project(project)?;
+        Ok(self)
+    }
     pub fn check_current(&self, current: &HistoryScope) -> DomainResult<()> {
         current.check(&self.scope)
     }
+}
+
+/// Carry the prepared registration to each Canonical storage boundary.
+#[derive(Clone)]
+pub struct CanonicalEffectAdmission(Arc<dyn CanonicalEffectRegistration>);
+
+impl CanonicalEffectAdmission {
+    /// Check queued authority without entering the protected SQL interval.
+    pub fn check(&self) -> Result<(), crate::error::PortError> {
+        self.0.check()
+    }
+
+    pub fn begin(&self) -> PortFuture<'_, Box<dyn RevocationLease>> {
+        self.0.clone().begin()
+    }
+}
+
+impl fmt::Debug for CanonicalEffectAdmission {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CanonicalEffectAdmission")
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CanonicalEffect {
+    AbilityAuthoring,
+    ConfirmedProposal,
+    ChatInput,
+    ChatClaim,
+    ChatRollback,
+    ChatRedaction,
+}
+
+/// The step identity and source witness travel together on the trusted writer
+/// context. Neither is accepted from transport payloads.
+#[derive(Clone, Debug)]
+pub struct ConfirmedChatStep {
+    witness: ChatProposalWitness,
+    identity: CommandIdentity,
+    destination: Option<ConfirmedNoteDestination>,
+}
+impl ConfirmedChatStep {
+    pub fn witness(&self) -> &ChatProposalWitness {
+        &self.witness
+    }
+    pub fn identity(&self) -> &CommandIdentity {
+        &self.identity
+    }
+    pub fn destination(&self) -> Option<&ConfirmedNoteDestination> {
+        self.destination.as_ref()
+    }
+}
+
+/// The exact approved folder anchor and the path components observed absent.
+/// A move also guards its source before any missing folders can be created.
+#[derive(Clone, Debug)]
+pub struct ConfirmedNoteDestination {
+    pub anchor: FolderRef,
+    pub anchor_revision: RevisionId,
+    pub anchor_path: String,
+    pub anchor_ancestors: Vec<FolderId>,
+    pub missing_suffix: String,
+    pub move_source: Option<(NoteId, RevisionId)>,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ServicePurpose {

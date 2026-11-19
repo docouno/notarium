@@ -33,6 +33,7 @@ async fn mutation_envelopes_validate_before_replay_on_both_drivers() {
             &scope,
             &owner,
             CreateNote {
+                folder_page: false,
                 note: sample_note_id(92),
                 parent: None,
                 slug: "draft".into(),
@@ -87,11 +88,14 @@ async fn mutation_envelopes_validate_before_replay_on_both_drivers() {
         invalid!(
             publish_ability_package,
             PublishAbilityPackage {
+                attached_skills: vec![],
                 ability: AbilityId::from_bytes([92; 16]),
                 kind: AbilityKind::Skill,
                 entrypoint: note.clone(),
                 files: vec![],
                 expected_package_revision: None,
+                expected_entrypoint_revision: None,
+                requires_explicit_binding: false,
             },
             pre
         );

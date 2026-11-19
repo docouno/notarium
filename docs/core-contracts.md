@@ -28,12 +28,13 @@ incompatible and damaged states. Missing, invalid and unreadable observations
 remain different; an I/O error cannot authorize initialization. `DataRoot` only
 constructs the shared layout from a supplied path.
 
-Verified authority enters through trusted owners, not deserialization of an auth
-context. Delegation intersects role, class and project grants. Interactive
-`human_management` attestation is separate from `Cap::AbilityWrite`:
-`human_management` does not grant `Cap::AbilityWrite`, while `Cap::AbilityWrite`
-additionally requires `human_management`; Agent, Keeper, OAuth and PAT contexts
-can obtain neither. Both old and new resource facts
+Trusted owners attest verified authority in process. Delegation intersects role,
+class and project grants. Interactive ability authoring requires a separate
+attestation alongside `human_management`. The authentication owner builds a PAT
+or OAuth context from live credential and membership evidence. A bearer can carry
+`Cap::AbilityWrite` when its write scope, durable opt-in and live write grant
+agree. Account management requires interactive human authority. Agent and Keeper
+contexts carry zero ability-authoring and human-management authority. Both old and new resource facts
 are checked on direct writes, including auxiliary ability files. A run pins its
 write Space; non-tainting metadata visibility checks (`can_view_resource`,
 `can_view_folder`) filter listings and references without tainting the branch,
@@ -41,8 +42,15 @@ whereas content-bearing `authorize_read` / `authorize_folder_read` taint
 already-existing clones before external content returns. Shared chat limits reads
 to its Space (and to matching project-scoped threads when a Keeper is pinned to a
 `project_root`) and excludes the sender's profile.
-Nested Keeper runs can retain or drop approved package read exceptions; they
-cannot add exceptions outside their parent's project authority.
+A scheduled credential also binds its own Keeper log. Nested Keeper runs can
+retain or drop approved package read exceptions within their parent's project
+authority.
+
+Explicit proposal confirmation uses two independently revalidated interactive
+contexts with fresh taint latches. The proposal reader has read authority and
+cannot derive a run or perform management or document writes. The write context
+retains the original credential, project and membership ceilings. A typed
+confirmation witness binds each approved mutation step to its source chat entry.
 
 Canonical owners create classified documents. `ClassEgressFence` creates private
 projection/search/provider wrappers only after read, lifecycle and class checks.
@@ -60,9 +68,12 @@ Provider dispatch uses `ProviderEgressCatalogPort` to pin current metadata for
 every origin and the selected active project. Its lease excludes changes to class,
 lifecycle, provenance and project ancestry until release, or cancels the call and
 waits for release. Chat origins include their canonical digest and optional project;
-current taint remains authoritative. `ClassEgressFence::revalidate` checks these
-fresh facts against the exact source and current provider disclosure. No document
-bodies or SQL handles cross the metadata port.
+current taint remains authoritative. Folder and Space metadata carry their
+own canonical revision or digest. A derived chat entry retains the transitive
+origins of each source used to produce it, including earlier tool results and
+summaries. `ClassEgressFence::revalidate` checks the exact source and current
+provider disclosure before dispatch. The metadata port carries identities,
+placement, lifecycle and proofs.
 
 Completion messages retain roles, classified parts and ordered tool-call/result
 associations. `ProviderInstruction` carries trusted orchestration text on `System`,
@@ -242,6 +253,10 @@ update that supplies a note revision requires an existing note. The expected
 package revision, queue base leaf, rollback run/entity/rank expectations and
 job cancellation lease belong to their typed inputs.
 
+`rollback_agent_run_by_id` resolves those rollback expectations inside the
+canonical owner. Its command identity binds the run independently of the
+derived plan, so a retry can reach the original receipt after revisions advance.
+
 ## Complete mutation intent across live rooms
 
 The live interceptor receives a typed mutation with the original authorization,
@@ -343,8 +358,8 @@ read/write access. Revocation callbacks receive the durable event request ID for
 idempotent delivery; a committed mutation cannot return success before their ACK.
 
 Schedule claims carry the next slot computed by the scheduler. A committed claim
-advances that slot atomically; repeated claims return an inspection receipt,
-without permission to dispatch again. Terminal run results are typed and do not
+advances the slot or records calendar exhaustion atomically. Repeated claims
+return an inspection receipt. A fresh winning claim authorizes dispatch. Terminal run results are typed and do not
 carry a next slot. Only a new winning claim returns a non-deserializable
 ScheduledRun/Keeper context. Scheduler maintenance authority owns claims and
 terminal audit; human schedule edits use account commands and configuration CAS.
@@ -364,7 +379,8 @@ account episodes, abilities, schedules and provider requests. The other boundari
 are structural snapshots, change broadcast, embedding, live interception, events,
 revocation and backup participants.
 
-The following 28 tool names are consumer coverage, not a tool registry in core:
+The [agent tool registry](agents.md#tool-registry) maps these 28 names to core
+ports.
 
 | Consumer tools | Typed operations |
 | --- | --- |
