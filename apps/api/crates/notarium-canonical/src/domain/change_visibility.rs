@@ -223,12 +223,7 @@ impl<'a> ChangeVisibility<'a> {
                     .await?;
                 }
                 EntityId::Thread(id) => {
-                    let (project, tainted) =
-                        super::lookup_thread_visibility_tx(tx, &space.id, id.as_str())
-                            .await?
-                            .ok_or(DomainError::ResourceNotFound)?;
-                    self.auth
-                        .authorize_chat_read(space, project.as_ref(), tainted)?;
+                    crate::chats::authorize_live_thread_read_tx(tx, space, self.auth, id).await?;
                     let old = read_immutable_revision_tx(
                         tx,
                         &self.space.scope,
@@ -241,8 +236,12 @@ impl<'a> ChangeVisibility<'a> {
                     let RevisionMetadataPayload::Thread(meta) = old.metadata.payload else {
                         return Err(DomainError::validation(ValidationReason::InvalidState).into());
                     };
-                    self.auth.authorize_chat_read(
+                    crate::chats::authorize_thread_read(
+                        self.auth,
                         space,
+                        id,
+                        meta.kind,
+                        &meta.owner_id,
                         meta.project_folder_id.as_ref(),
                         meta.tainted,
                     )?;

@@ -152,6 +152,23 @@ impl ProviderEgressLease for EgressLease {
 }
 
 impl ProviderEgressCatalogPort for CanonicalStore {
+    fn chat_dependencies(
+        &self,
+        ctx: AccountContext,
+        roots: Vec<ProviderOrigin>,
+    ) -> PortFuture<'_, ProviderEgressDependencies> {
+        Box::pin(async move {
+            if roots.len() > MAX_PROVIDER_ORIGINS {
+                return Err(DomainError::validation(ValidationReason::InvalidLimit).into());
+            }
+            let budget = ctx.budget.clone();
+            self.with_read_tx_budget(Some(&budget), move |tx| {
+                Box::pin(async move { discover_chat_dependencies(tx, &ctx, roots).await })
+            })
+            .await
+        })
+    }
+
     fn acquire_egress(
         &self,
         ctx: AccountContext,
@@ -217,6 +234,108 @@ impl ProviderEgressCatalogPort for CanonicalStore {
             }) as Box<dyn ProviderEgressLease>)
         })
     }
+}
+
+// The read snapshot identifies graph keys. The egress lease revalidates them after acquiring all
+// participating Space locks in order; no authority is derived here.
+async fn discover_chat_dependencies(
+    tx: &mut BackendConn<'_>,
+    ctx: &AccountContext,
+    roots: Vec<ProviderOrigin>,
+) -> Result<ProviderEgressDependencies, PortError> {
+    let mut work = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut spaces = BTreeSet::new();
+    let mut records = BTreeMap::new();
+    let mut projects = BTreeMap::new();
+    for root in roots {
+        if !matches!(root, ProviderOrigin::Chat { .. }) {
+            return Err(DomainError::validation(ValidationReason::SourceMismatch).into());
+        }
+        if seen.insert(origin_key(&root)?) {
+            work.push(root);
+        }
+    }
+    let mut origins = Vec::new();
+    while let Some(origin) = work.pop() {
+        let ProviderOrigin::Chat {
+            space,
+            thread,
+            entry,
+            ..
+        } = &origin
+        else {
+            return Err(DomainError::validation(ValidationReason::SourceMismatch).into());
+        };
+        spaces.insert(space.clone());
+        if spaces.len() > MAX_PROVIDER_SOURCE_SPACES {
+            return Err(DomainError::validation(ValidationReason::InvalidLimit).into());
+        }
+        let record = match records.entry(space.clone()) {
+            std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                if !ctx.auth().spaces().contains_key(space) {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+                entry.insert(load_space_record(tx, space).await?)
+            }
+        };
+        let current =
+            crate::chats::load_current_chat_for_egress_tx(tx, ctx.auth(), record, thread, *entry)
+                .await?;
+        if current.origin() != origin {
+            return Err(DomainError::validation(ValidationReason::SourceMismatch).into());
+        }
+        let Some(proof) = current.provenance() else {
+            continue;
+        };
+        for project in &proof.projects {
+            projects.insert(
+                (project.space_id.clone(), project.folder_id.clone()),
+                project.clone(),
+            );
+            // A recorded proof may also name the primary project.
+            if projects.len() > MAX_PROVIDER_SECONDARY_PROJECTS + 1 {
+                return Err(DomainError::validation(ValidationReason::InvalidLimit).into());
+            }
+        }
+        for dependency in &proof.origins {
+            if let ProviderOrigin::Chat {
+                space: child_space,
+                thread: child_thread,
+                entry: child_entry,
+                ..
+            } = dependency
+                && (child_space != space || child_thread != thread || child_entry >= entry)
+            {
+                return Err(DomainError::validation(ValidationReason::SourceMismatch).into());
+            }
+            if let Some(id) = dependency.space_id() {
+                spaces.insert(id.clone());
+                if spaces.len() > MAX_PROVIDER_SOURCE_SPACES {
+                    return Err(DomainError::validation(ValidationReason::InvalidLimit).into());
+                }
+            }
+            if seen.insert(origin_key(dependency)?) {
+                if seen.len() > MAX_PROVIDER_ORIGINS {
+                    return Err(DomainError::validation(ValidationReason::InvalidLimit).into());
+                }
+                origins.push(dependency.clone());
+                if matches!(dependency, ProviderOrigin::Chat { .. }) {
+                    work.push(dependency.clone());
+                }
+            }
+        }
+    }
+    Ok(ProviderEgressDependencies {
+        origins,
+        projects: projects.into_values().collect(),
+    })
+}
+
+fn origin_key(origin: &ProviderOrigin) -> Result<String, PortError> {
+    serde_json::to_string(origin)
+        .map_err(|_| DomainError::validation(ValidationReason::InvalidState).into())
 }
 
 async fn snapshot(

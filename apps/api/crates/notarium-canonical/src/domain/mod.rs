@@ -19,9 +19,7 @@ use notarium_core::{
     },
 };
 
-use crate::{
-    CanonicalStore, changes::ChangeCaller, codec::internal_not_committed, sql_exec::BackendConn,
-};
+use crate::{CanonicalStore, changes::ChangeCaller};
 
 pub mod board;
 pub(crate) mod change_visibility;
@@ -392,38 +390,4 @@ impl CanonicalStore {
     ) -> Result<Committed<BoardMoveResult>, PortError> {
         Box::pin(board::move_board_card_impl(self, ctx, request)).await
     }
-}
-
-pub(crate) async fn lookup_thread_visibility_tx(
-    tx: &mut BackendConn<'_>,
-    space_id: &notarium_core::ids::SpaceId,
-    thread_id: &str,
-) -> Result<Option<(Option<FolderId>, bool)>, PortError> {
-    let row: Option<(Option<String>, i64)> = match tx {
-        BackendConn::Sqlite(conn) => sqlx::query_as(
-            "SELECT project_folder_id, ext_space_tainted_mask FROM chat_threads WHERE space_id = ? AND thread_id = ?",
-        )
-        .bind(space_id.as_str())
-        .bind(thread_id)
-        .fetch_optional(&mut **conn)
-        .await
-        .map_err(|err| internal_not_committed("sqlite_lookup_thread_taint", err.to_string()))?,
-        BackendConn::Postgres(conn) => sqlx::query_as(
-            "SELECT project_folder_id, ext_space_tainted_mask::BIGINT FROM chat_threads WHERE space_id = $1 AND thread_id = $2",
-        )
-        .bind(space_id.as_str())
-        .bind(thread_id)
-        .fetch_optional(&mut **conn)
-        .await
-        .map_err(|err| crate::runtime::pg_read_error("pg_lookup_thread_taint", err))?,
-    };
-    row.map(|(project, mask)| {
-        let project = project
-            .as_deref()
-            .map(FolderId::parse)
-            .transpose()
-            .map_err(|_| internal_not_committed("corrupt_thread_proj", "invalid FolderId"))?;
-        Ok((project, mask != 0))
-    })
-    .transpose()
 }

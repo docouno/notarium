@@ -365,35 +365,23 @@ impl ProviderService {
                 }
             }
         }
-        let mut selectors = vec![
-            RevocationSelector::Principal(auth.principal().clone()),
-            RevocationSelector::Principal(PrincipalId::parse(&resource.owner_id)?),
-            RevocationSelector::Grant(auth.grant().clone()),
-            RevocationSelector::ProviderResource(ProviderResourceId::parse(&resource.id)?),
-        ];
-        if let Some(credential) = &snapshot.credential {
-            selectors.push(RevocationSelector::Credential(CredentialId::parse(
-                &credential.id,
-            )?));
-        }
-        let expires_at_ms=match auth.credential().ok_or(DomainError::AuthenticationFailed)? {
-            AuthenticatedCredential::Session(id)=>{selectors.push(RevocationSelector::Session(id.clone()));Some(rows!(tx,(i64,),fetch_one,"SELECT expires_at FROM sessions WHERE session_id=$1","SELECT expires_at FROM v1_control.sessions WHERE session_id=$1";id.as_str())?.0)},
-            AuthenticatedCredential::Pat(id)=>rows!(tx,(Option<i64>,),fetch_one,"SELECT expires_at FROM pats WHERE token_id=$1","SELECT expires_at FROM v1_control.pats WHERE token_id=$1";id.as_str())?.0,
-            AuthenticatedCredential::OAuth{token,grant,family}=>{selectors.push(RevocationSelector::OAuthAccess(token.clone()));selectors.push(RevocationSelector::OAuthGrant(grant.clone()));if let Some(family)=family{selectors.push(RevocationSelector::OAuthFamily(family.clone()));}Some(rows!(tx,(i64,),fetch_one,"SELECT expires_at FROM oauth_access_tokens WHERE token_id=$1","SELECT expires_at FROM v1_control.oauth_access_tokens WHERE token_id=$1";token.as_str())?.0)},
-            AuthenticatedCredential::TrustedNone=>None,
-            AuthenticatedCredential::ScheduledRun{schedule,run,..}=>{
-                selectors.push(RevocationSelector::Schedule(schedule.clone()));
-                selectors.push(RevocationSelector::ScheduledRun(run.clone()));
-                Some(rows!(tx,(i64,),fetch_one,"SELECT expires_at FROM agent_schedule_runs WHERE run_id=$1","SELECT expires_at FROM v1_control.agent_schedule_runs WHERE run_id=$1";run.as_str())?.0)
-            },
+        let mut selectors = auth.selectors_for_revocation(spaces.keys())?;
+        let revocation_scope = ProviderRevocationScope {
+            owner: PrincipalId::parse(&resource.owner_id)?,
+            credential: snapshot
+                .credential
+                .as_ref()
+                .map(|row| CredentialId::parse(&row.id))
+                .transpose()?,
         };
-        for space in spaces.keys() {
-            selectors.push(RevocationSelector::Space(space.clone()));
-            selectors.push(RevocationSelector::Membership {
-                space: space.clone(),
-                principal: auth.principal().clone(),
-            });
-        }
+        selectors.extend(revocation_scope.selectors(&ProviderResourceId::parse(&resource.id)?));
+        let expires_at_ms=match auth.credential().ok_or(DomainError::AuthenticationFailed)? {
+            AuthenticatedCredential::Session(id)=>Some(rows!(tx,(i64,),fetch_one,"SELECT expires_at FROM sessions WHERE session_id=$1","SELECT expires_at FROM v1_control.sessions WHERE session_id=$1";id.as_str())?.0),
+            AuthenticatedCredential::Pat(id)=>rows!(tx,(Option<i64>,),fetch_one,"SELECT expires_at FROM pats WHERE token_id=$1","SELECT expires_at FROM v1_control.pats WHERE token_id=$1";id.as_str())?.0,
+            AuthenticatedCredential::OAuth{token,..}=>Some(rows!(tx,(i64,),fetch_one,"SELECT expires_at FROM oauth_access_tokens WHERE token_id=$1","SELECT expires_at FROM v1_control.oauth_access_tokens WHERE token_id=$1";token.as_str())?.0),
+            AuthenticatedCredential::TrustedNone=>None,
+            AuthenticatedCredential::ScheduledRun{run,..}=>Some(rows!(tx,(i64,),fetch_one,"SELECT expires_at FROM agent_schedule_runs WHERE run_id=$1","SELECT expires_at FROM v1_control.agent_schedule_runs WHERE run_id=$1";run.as_str())?.0),
+        };
         let expires_at_ms = policies
             .values()
             .filter_map(|policy| policy.expires_at_ms)
@@ -401,7 +389,7 @@ impl ProviderService {
             .min();
         Ok(Validated {
             auth,
-            selectors,
+            selectors: selectors.into_iter().collect(),
             spaces: spaces.into_keys().collect(),
             expires_at_ms,
         })

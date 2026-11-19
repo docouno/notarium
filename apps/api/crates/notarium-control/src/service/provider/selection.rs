@@ -268,7 +268,24 @@ impl ProviderService {
                 return Err(unavailable());
             }
             let admission=policy(tx.inner_mut(),&auth,&resource,credential_epoch,&space.space,request.project.as_ref(),now,false).await?;
-            Ok(ProviderSelection{provider:id,model:model_id,project:request.project,project_only:admission.project_only,policy:admission.policy})
+            let completion = (loaded.model.kind == ProviderModelKind::Completion).then_some(CompletionModelLimits {
+                max_input_tokens: loaded.model.max_input_tokens,
+                max_output_tokens: loaded.model.max_output_tokens,
+                supports_tools: loaded.model.tools,
+            });
+            let revocation_scope = ProviderRevocationScope {
+                owner: PrincipalId::parse(&resource.owner_id)?,
+                credential: resource.credential_id.as_deref().map(CredentialId::parse).transpose()?,
+            };
+            Ok(ProviderSelection{
+                provider:id,
+                model:model_id,
+                project:request.project,
+                project_only:admission.project_only,
+                policy:admission.policy,
+                completion,
+                revocation_scope,
+            })
         },CommitEffect::NotCommitted).await?;
         budget
             .run(tx.rollback(), CommitEffect::NotCommitted)

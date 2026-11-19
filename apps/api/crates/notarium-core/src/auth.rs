@@ -1,8 +1,12 @@
 //! Pure authorization policy. Only control adapters may attest authentication facts.
 //! These types intentionally do not implement Deserialize.
 use crate::{
-    DomainError, DomainResult, classes::DocClass, error::ValidationReason, ids::*,
-    model::FolderRef, ports::BearerScope,
+    DomainError, DomainResult,
+    classes::DocClass,
+    error::ValidationReason,
+    ids::*,
+    model::FolderRef,
+    ports::{BearerScope, RevocationSelector},
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -567,6 +571,48 @@ impl EngineAuthContext {
     }
     pub fn spaces(&self) -> &BTreeMap<SpaceId, SpaceGrant> {
         &self.spaces
+    }
+    /// Scope a live actor's revocation identity to these admitted Spaces.
+    pub fn selectors_for_revocation<'a>(
+        &self,
+        spaces: impl IntoIterator<Item = &'a SpaceId>,
+    ) -> DomainResult<BTreeSet<RevocationSelector>> {
+        let mut selectors = BTreeSet::from([
+            RevocationSelector::Principal(self.principal.clone()),
+            RevocationSelector::Grant(self.grant.clone()),
+        ]);
+        match self.credential().ok_or(DomainError::AuthenticationFailed)? {
+            AuthenticatedCredential::Session(id) => {
+                selectors.insert(RevocationSelector::Session(id.clone()));
+            }
+            AuthenticatedCredential::OAuth {
+                token,
+                grant,
+                family,
+            } => {
+                selectors.insert(RevocationSelector::OAuthAccess(token.clone()));
+                selectors.insert(RevocationSelector::OAuthGrant(grant.clone()));
+                if let Some(family) = family {
+                    selectors.insert(RevocationSelector::OAuthFamily(family.clone()));
+                }
+            }
+            AuthenticatedCredential::ScheduledRun { schedule, run, .. } => {
+                selectors.insert(RevocationSelector::Schedule(schedule.clone()));
+                selectors.insert(RevocationSelector::ScheduledRun(run.clone()));
+            }
+            AuthenticatedCredential::Pat(_) | AuthenticatedCredential::TrustedNone => (),
+        }
+        for space in spaces {
+            if !self.spaces.contains_key(space) {
+                return Err(DomainError::ResourceNotFound);
+            }
+            selectors.insert(RevocationSelector::Space(space.clone()));
+            selectors.insert(RevocationSelector::Membership {
+                space: space.clone(),
+                principal: self.principal.clone(),
+            });
+        }
+        Ok(selectors)
     }
     pub fn pinned_write_space(&self) -> Option<&SpaceId> {
         self.write_space.as_ref()

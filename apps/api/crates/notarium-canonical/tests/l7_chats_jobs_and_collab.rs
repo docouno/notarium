@@ -43,11 +43,11 @@ use notarium_core::{
         AppendChat, CallBudget, CancelJob, Cancellation, ChangeKind, ChangeRead, ChangeReadResult,
         ChatBody, ChatEntryKind, ChatInputBody, ChatPort, ChatRead, ChatRunRequest, ChatThreadKind,
         ClaimChatRun, ClaimChatRunOutcome, ConsumePending, ConsumedPending, ContentJobKind,
-        ContentJobPort, CreateChat, CreateNote, DeleteDisposition, DeleteNote, EditNote, EntityId,
-        FilenamePin, FinishChatRunOutcome, ForkChat, GetNote, InterceptedMutation,
-        InterceptionResult, JobQuery, JobState, LiveCollabInterceptor, Mutation, NoteWritePort,
-        PageLimit, PendingChatInput, PortFuture, Preconditions, QueueInputOutcome, RedactChatEntry,
-        RollbackReservation, SpaceContext, StagedChatBlob,
+        ContentJobPort, CreateChat, CreateNote, DeleteDisposition, DeleteNote, DismissPending,
+        EditNote, EntityId, FilenamePin, FinishChatRunOutcome, ForkChat, GetNote,
+        InterceptedMutation, InterceptionResult, JobQuery, JobState, LiveCollabInterceptor,
+        Mutation, NoteWritePort, PageLimit, PendingChatInput, PortFuture, Preconditions,
+        QueueInputOutcome, RedactChatEntry, RollbackReservation, SpaceContext, StagedChatBlob,
     },
     query::ReadRequest,
     receipt::{CausalBasis, ChangeCursor, CommandIdentity, ReceiptSet},
@@ -938,7 +938,7 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
 
     // 3. Bounded 16-item pending input queue (`17` concurrent `queue_chat_input` -> `16` Queued + `1` Full, zero leaked CAS refs).
     let run_id = sample_run_id(0x55);
-    claim_run(
+    let queue_agent = claim_run(
         store,
         owner_ctx(&scope, owner.clone()),
         ChatAudience::Personal,
@@ -947,8 +947,88 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
         cur_a,
     )
     .await;
+    // Historical queue APIs can retain a base on a sibling branch. The current
+    // run cannot implicitly switch to it through append, or consume its input.
+    let sibling_input = PendingInputId::from_bytes([0x78; 16]);
+    let sibling_post = next_mutation(
+        &scope,
+        &owner,
+        AppendChat {
+            thread: thread.clone(),
+            parent: branch_b_tip,
+            kind: ChatEntryKind::Human,
+            body: ChatInputBody::Text("A post on a sibling branch".into()),
+            tool_calls: Vec::new(),
+            provenance: None,
+            proposed_diff: None,
+            referenced_notes: Vec::new(),
+            tainted: false,
+        },
+    );
+    assert!(matches!(
+        store
+            .append_chat(owner_ctx(&scope, owner.clone()), sibling_post)
+            .await,
+        Err(PortError::Domain(DomainError::RevisionConflict { .. }))
+    ));
+    let sibling = next_mutation(
+        &scope,
+        &owner,
+        PendingChatInput {
+            id: sibling_input.clone(),
+            thread: thread.clone(),
+            sender: owner.clone(),
+            body: "Queued before the branch change".into(),
+            queued_base_leaf: branch_b_tip,
+            in_flight_run: run_id.clone(),
+            mentions_agent: false,
+        },
+    );
+    assert!(matches!(
+        store
+            .queue_chat_input(owner_ctx(&scope, owner.clone()), sibling)
+            .await
+            .unwrap(),
+        QueueInputOutcome::Queued(_)
+    ));
+    let unchanged = store
+        .consume_chat_input(
+            owner_ctx(&scope, owner.clone()),
+            next_mutation(
+                &scope,
+                &owner,
+                ConsumePending {
+                    thread: thread.clone(),
+                    input: sibling_input.clone(),
+                    expected_active_run: run_id.clone(),
+                    expected_run: run_id.clone(),
+                    current_leaf: cur_a,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        unchanged.value,
+        ConsumedPending::BranchChanged { queued, current }
+            if queued == branch_b_tip && current == cur_a
+    ));
+    assert!(
+        store
+            .dismiss_chat_input(
+                queue_agent.clone(),
+                DismissPending {
+                    thread: thread.clone(),
+                    input: sibling_input
+                },
+            )
+            .await
+            .unwrap()
+    );
+
     let mut large_candidates = BTreeSet::new();
     let mut handles = Vec::new();
+    let mut queued_ids = Vec::new();
     for idx in 0..17u8 {
         let st = store.clone();
         let sc = scope.clone();
@@ -959,7 +1039,7 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
         if idx % 2 == 0 {
             large_candidates.insert(input_id.clone());
         }
-        handles.push(tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let body = if idx % 2 == 0 {
                 // >512B body exercises CAS staging and cleanup on queue overflow!
                 format!("large-pending-{idx}-{}", "x".repeat(600))
@@ -986,12 +1066,19 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
             )
             .await
             .expect("queue_chat_input call")
-        }));
+        });
+        if idx == 0 {
+            let QueueInputOutcome::Queued(first) = handle.await.unwrap() else {
+                panic!("the first input must occupy the first FIFO slot");
+            };
+            queued_ids.push(first.value.input);
+        } else {
+            handles.push(handle);
+        }
     }
 
-    let mut queued_ids = Vec::new();
     let mut full_count = 0usize;
-    for (idx, h) in handles.into_iter().enumerate() {
+    for (idx, h) in (1..).zip(handles) {
         match h.await.unwrap() {
             QueueInputOutcome::Queued(c) => {
                 assert!((1..=16).contains(&c.value.position));
@@ -1111,31 +1198,7 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
         .assert_discarded(store, &scope, &denied_body, true)
         .await;
 
-    // `BranchChanged` when `current_leaf != queued_base_leaf` preserves `'pending'` status!
-    let branch_changed = store
-        .consume_chat_input(
-            owner_ctx(&scope, owner.clone()),
-            next_mutation(
-                &scope,
-                &owner,
-                ConsumePending {
-                    thread: thread.clone(),
-                    input: target_pending.clone(),
-                    expected_run: run_id.clone(),
-                    current_leaf: branch_b_tip,
-                },
-            ),
-        )
-        .await
-        .expect("consume BranchChanged")
-        .value;
-    assert!(matches!(
-        branch_changed,
-        ConsumedPending::BranchChanged { queued, current }
-            if queued == cur_a && current == branch_b_tip
-    ));
-
-    // `Appended` when `current_leaf == cur_a` transfers CAS ref `ChatPendingInput -> ChatEntry`!
+    // Consuming the FIFO head transfers its CAS reference to the new entry.
     let consumer = owner_ctx(&scope, owner.clone());
     assert!(!consumer.auth().taint().is_tainted());
     let consumed_ok = store
@@ -1147,6 +1210,7 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
                 ConsumePending {
                     thread: thread.clone(),
                     input: target_pending.clone(),
+                    expected_active_run: run_id.clone(),
                     expected_run: run_id.clone(),
                     current_leaf: cur_a,
                 },
@@ -1251,6 +1315,7 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
                 ConsumePending {
                     thread: thread.clone(),
                     input: target_pending,
+                    expected_active_run: run_id.clone(),
                     expected_run: run_id.clone(),
                     current_leaf: cur_a,
                 },
@@ -1265,13 +1330,35 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
         .iter()
         .find(|id| !large_candidates.contains(*id))
         .unwrap();
+    for queued in store
+        .list_pending_chat_inputs(queue_agent.clone(), thread.clone())
+        .await
+        .unwrap()
+    {
+        if queued.id == *inline_pending {
+            break;
+        }
+        assert!(
+            store
+                .dismiss_chat_input(
+                    queue_agent.clone(),
+                    DismissPending {
+                        thread: thread.clone(),
+                        input: queued.id,
+                    }
+                )
+                .await
+                .unwrap()
+        );
+    }
     let inline_request = next_mutation(
         &scope,
         &owner,
         ConsumePending {
             thread: thread.clone(),
             input: inline_pending.clone(),
-            expected_run: run_id,
+            expected_active_run: run_id.clone(),
+            expected_run: run_id.clone(),
             current_leaf: cur_a,
         },
     );
@@ -1302,6 +1389,39 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
         "SELECT COUNT(*) FROM chat_pending_inputs WHERE status = 'consumed' AND (inline_text <> '' OR payload_blake3 IS NOT NULL)"
     ).await.unwrap();
     assert_eq!(retained, 0);
+
+    // Close the active run before setting up the sibling redaction cases.
+    for queued in store
+        .list_pending_chat_inputs(queue_agent.clone(), thread.clone())
+        .await
+        .unwrap()
+    {
+        assert!(
+            store
+                .dismiss_chat_input(
+                    queue_agent.clone(),
+                    DismissPending {
+                        thread: thread.clone(),
+                        input: queued.id,
+                    },
+                )
+                .await
+                .unwrap()
+        );
+    }
+    assert_eq!(
+        store
+            .finish_run_if_queue_empty(
+                queue_agent,
+                ChatRunRequest {
+                    thread: thread.clone(),
+                    expected_run: run_id,
+                },
+            )
+            .await
+            .unwrap(),
+        FinishChatRunOutcome::Cleared,
+    );
 
     // 4. Redaction (`redact_chat_entry`):
     // Append a Compaction entry on branch A (descendant of `e2`) AND a Compaction entry on sibling

@@ -19,8 +19,8 @@ use notarium_core::{
         },
         control::*,
         provider::{
-            MAX_PROVIDER_ORIGINS, ProviderEgressCatalogPort, ProviderEgressLease,
-            ProviderEgressRequest,
+            MAX_PROVIDER_ORIGINS, ProviderEgressCatalogPort, ProviderEgressDependencies,
+            ProviderEgressLease, ProviderEgressRequest,
         },
     },
 };
@@ -380,6 +380,14 @@ impl ProviderEgressLease for SystemEgressLease {
 }
 
 impl<C: ProviderEgressCatalogPort + ?Sized> ProviderEgressCatalogPort for SystemAbilityCatalog<C> {
+    fn chat_dependencies(
+        &self,
+        ctx: AccountContext,
+        roots: Vec<ProviderOrigin>,
+    ) -> PortFuture<'_, ProviderEgressDependencies> {
+        self.owned.chat_dependencies(ctx, roots)
+    }
+
     fn acquire_egress(
         &self,
         ctx: AccountContext,

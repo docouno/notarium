@@ -334,6 +334,8 @@ pub struct ProviderSelection {
     pub project: Option<FolderRef>,
     pub project_only: Option<FolderRef>,
     pub policy: ProviderPolicy,
+    pub completion: Option<CompletionModelLimits>,
+    pub revocation_scope: ProviderRevocationScope,
 }
 #[derive(Clone, Debug)]
 pub struct CompletionBudget {

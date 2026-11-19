@@ -157,6 +157,8 @@ impl ChatPort for RejectingPorts {
             ctx: SpaceContext,
             request: Mutation<AppendChat>,
         ) -> PortFuture<'_, Committed<ChatEntry>>;
+    fn submit_user_chat_input(&self, ctx: SpaceContext, request: SubmitUserChatInput) -> PortFuture<'_, SubmitUserChatOutcome>;
+    fn lookup_user_chat_input(&self, ctx: SpaceContext, request: &SubmitUserChatInput) -> PortFuture<'_, Option<SubmitUserChatOutcome>>;
     fn queue_chat_input(
             &self,
             ctx: SpaceContext,

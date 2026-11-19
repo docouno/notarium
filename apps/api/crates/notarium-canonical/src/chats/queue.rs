@@ -22,6 +22,22 @@ pub(super) fn authorize_run_claim(
     Ok(())
 }
 
+async fn authorize_current_leaf(
+    tx: &mut BackendConn<'_>,
+    auth: &EngineAuthContext,
+    space: &SpaceRecord,
+    thread: &ThreadHeadRow,
+) -> Result<(), PortError> {
+    let tainted = read_leaf_taint(
+        tx,
+        &space.scope.space_id,
+        &thread.thread_id,
+        thread.head_leaf_seq,
+    )
+    .await?;
+    authorize_thread_mutation(auth, &space.space, thread, tainted)
+}
+
 async fn lock_space(
     store: &CanonicalStore,
     tx: &mut BackendConn<'_>,
@@ -93,15 +109,11 @@ pub(super) async fn claim(
                 authorize_chat_write_on_space(ctx.auth(), &space.space)?;
                 let thread =
                     load_thread_head_tx(tx, &space.scope.space_id, &request.thread).await?;
-                authorize_thread_mutation(
-                    ctx.auth(),
-                    &space.space,
-                    &thread,
-                    thread.tainted_mask != 0,
-                )?;
+                authorize_thread_mutation(ctx.auth(), &space.space, &thread, false)?;
                 let current = thread.active_run_id.as_ref();
                 let valid_owner = use_current_claim(&thread, &owned, &space);
                 if current == Some(&request.run) && valid_owner {
+                    authorize_current_leaf(tx, ctx.auth(), &space, &thread).await?;
                     return Ok(ClaimChatRunOutcome::Claimed);
                 }
                 if let Some(current) = current
@@ -114,6 +126,7 @@ pub(super) async fn claim(
                 {
                     return Ok(ClaimChatRunOutcome::Changed);
                 }
+                authorize_current_leaf(tx, ctx.auth(), &space, &thread).await?;
                 if request.previous_run.is_some() {
                     let author = ctx.auth().principal();
                     let Some((base, mentions)) =
@@ -157,11 +170,16 @@ async fn queued_human_leaf(
     request: &ClaimChatRun,
     author: &PrincipalId,
 ) -> Result<Option<(i64, i32)>, PortError> {
+    let run = request
+        .previous_run
+        .as_ref()
+        .ok_or_else(|| DomainError::validation(ValidationReason::InvalidAuthority))?;
     const SELECT: &str = "SELECT p.queued_base_leaf_seq, CAST(p.mentions_agent AS INTEGER)
         FROM chat_pending_inputs p JOIN chat_entries e
            ON p.space_id = e.space_id AND p.thread_id = e.thread_id AND p.consumed_entry_seq = e.entry_seq
         WHERE e.space_id = $1 AND e.thread_id = $2 AND e.entry_seq = $3
-          AND e.author_id = $4 AND e.kind = 'human' AND p.status = 'consumed'";
+          AND e.author_id = $4 AND e.agent_run_id = $5
+          AND e.kind = 'human' AND p.status = 'consumed'";
     match tx {
         BackendConn::Sqlite(conn) => {
             sqlx::query_as(SELECT)
@@ -169,6 +187,7 @@ async fn queued_human_leaf(
                 .bind(request.thread.as_str())
                 .bind(request.expected_leaf.get() as i64)
                 .bind(author.as_str())
+                .bind(run.as_str())
                 .fetch_optional(&mut **conn)
                 .await
         }
@@ -178,6 +197,7 @@ async fn queued_human_leaf(
                 .bind(request.thread.as_str())
                 .bind(request.expected_leaf.get() as i64)
                 .bind(author.as_str())
+                .bind(run.as_str())
                 .fetch_optional(&mut **conn)
                 .await
         }
@@ -213,15 +233,22 @@ pub(super) async fn finish(
             move |tx| {
                 Box::pin(async move {
                     let space = lock_space(&owned, tx, &ctx).await?;
-                    authorize_chat_write_on_space(ctx.auth(), &space.space)?;
                     let thread =
                         load_thread_head_tx(tx, &space.scope.space_id, &request.thread).await?;
-                    authorize_thread_mutation(
-                        ctx.auth(),
-                        &space.space,
-                        &thread,
-                        thread.tainted_mask != 0,
-                    )?;
+                    let closing = !recover && space.space.lifecycle != SpaceLifecycle::Active;
+                    if closing {
+                        // The existing owner may cancel inputs and clear its own claim
+                        // after archival. No chat entry can be read or appended here.
+                        if ctx.auth().pinned_write_space() != Some(&space.space.id)
+                            || (thread.kind != ChatThreadKind::SpaceGroup
+                                && &thread.owner != ctx.auth().principal())
+                        {
+                            return Err(DomainError::ResourceNotFound.into());
+                        }
+                    } else {
+                        authorize_chat_write_on_space(ctx.auth(), &space.space)?;
+                        authorize_current_leaf(tx, ctx.auth(), &space, &thread).await?;
+                    }
                     if thread.active_run_id.is_none() {
                         return Ok((FinishChatRunOutcome::Cleared, None));
                     }
@@ -247,7 +274,7 @@ pub(super) async fn finish(
                         );
                     }
                     let rows = pending_rows(tx, &space.scope.space_id, &request.thread).await?;
-                    if !recover && !rows.is_empty() {
+                    if !recover && !closing && !rows.is_empty() {
                         return Ok((FinishChatRunOutcome::Pending, None));
                     }
                     let mut zero_refs = Vec::new();
@@ -295,13 +322,8 @@ pub(super) async fn list_pending(
                     .inner
                     .check_writer_epoch(&scope.space_id, space.active_epoch)?;
                 let thread = load_thread_head_tx(tx, &scope.space_id, &thread_id).await?;
-                authorize_thread_mutation(
-                    ctx.auth(),
-                    &space.space,
-                    &thread,
-                    thread.tainted_mask != 0,
-                )?;
                 authorize_run_claim(&owned, &space, &thread, &run)?;
+                authorize_current_leaf(tx, ctx.auth(), &space, &thread).await?;
                 pending_rows(tx, &scope.space_id, &thread_id).await
             })
         })
@@ -341,12 +363,7 @@ pub(super) async fn dismiss_pending(
                     authorize_chat_write_on_space(ctx.auth(), &space.space)?;
                     let thread =
                         load_thread_head_tx(tx, &space.scope.space_id, &request.thread).await?;
-                    authorize_thread_mutation(
-                        ctx.auth(),
-                        &space.space,
-                        &thread,
-                        thread.tainted_mask != 0,
-                    )?;
+                    authorize_current_leaf(tx, ctx.auth(), &space, &thread).await?;
                     let Some((_, author, _, run, _)) =
                         pending_rows(tx, &space.scope.space_id, &request.thread)
                             .await?
@@ -359,8 +376,7 @@ pub(super) async fn dismiss_pending(
                     let stale = active_id != Some(run.as_str());
                     let allowed = match ctx.auth().kind() {
                         PrincipalKind::AgentRun(id) => {
-                            (id.as_str() == run || stale)
-                                && active_id == Some(id.as_str())
+                            active_id == Some(id.as_str())
                                 && use_current_claim(&thread, &owned, &space)
                         }
                         _ => {
@@ -394,6 +410,38 @@ pub(super) async fn dismiss_pending(
         )
         .await
         .map_err(|error| crate::codec::retry_unknown_commit("dismiss_chat_input", error))
+}
+
+pub(super) async fn require_oldest_pending(
+    tx: &mut BackendConn<'_>,
+    space: &SpaceId,
+    thread: &ChatThreadId,
+    input: &PendingInputId,
+) -> Result<(), PortError> {
+    const SELECT: &str = "SELECT input_id FROM chat_pending_inputs
+        WHERE space_id = $1 AND thread_id = $2 AND status = 'pending'
+        ORDER BY ordinal LIMIT 1";
+    let head: Option<String> = match tx {
+        BackendConn::Sqlite(conn) => {
+            sqlx::query_scalar(SELECT)
+                .bind(space.as_str())
+                .bind(thread.as_str())
+                .fetch_optional(&mut **conn)
+                .await
+        }
+        BackendConn::Postgres(conn) => {
+            sqlx::query_scalar(SELECT)
+                .bind(space.as_str())
+                .bind(thread.as_str())
+                .fetch_optional(&mut **conn)
+                .await
+        }
+    }
+    .map_err(|error| crate::runtime::pg_read_error("chat_queue_oldest", error))?;
+    if head.as_deref() != Some(input.as_str()) {
+        return Err(DomainError::validation(ValidationReason::InvalidState).into());
+    }
+    Ok(())
 }
 
 async fn pending_rows(

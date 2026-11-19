@@ -648,6 +648,15 @@ impl CanonicalChatContent {
     pub fn digest(&self) -> ContentDigest {
         self.digest
     }
+    pub fn origin(&self) -> ProviderOrigin {
+        ProviderOrigin::Chat {
+            space: self.space.id.clone(),
+            thread: self.thread.clone(),
+            entry: self.entry,
+            digest: self.digest,
+            project: self.project.clone(),
+        }
+    }
     pub fn provenance(&self) -> Option<&ChatProvenance> {
         self.provenance.as_ref()
     }
@@ -906,13 +915,7 @@ impl ProviderMessage {
             Self::Document(value) => value.provenance().origin(),
             Self::Part(value) => value.provenance().origin(),
             Self::Ability(value) => value.resource.origin(),
-            Self::Chat(value) => ProviderOrigin::Chat {
-                space: value.entry.space.id.clone(),
-                thread: value.entry.thread.clone(),
-                entry: value.entry.entry,
-                digest: value.entry.digest,
-                project: value.entry.project.clone(),
-            },
+            Self::Chat(value) => value.entry.origin(),
             Self::SystemAbility(value) => value.content.origin(),
             Self::Metadata(value) => value.content.current.origin(),
         }

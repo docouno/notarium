@@ -2840,6 +2840,7 @@ dependencies = [
  "notarium-control",
  "notarium-core",
  "notarium-syntax",
+ "proptest",
  "serde",
  "serde_json",
  "tokio",

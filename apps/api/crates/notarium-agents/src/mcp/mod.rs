@@ -7,6 +7,7 @@ mod note_tools;
 mod organize;
 mod proposals;
 mod read_tools;
+pub mod runtime_abilities;
 mod schema;
 mod session;
 
@@ -174,6 +175,44 @@ pub struct ToolRegistry {
 }
 
 impl ToolRegistry {
+    pub(crate) fn control(&self) -> &dyn ControlPort {
+        self.control.as_ref()
+    }
+
+    pub(crate) fn engine(&self) -> &dyn EnginePort {
+        self.engine.as_ref()
+    }
+
+    pub(crate) fn validate_provider_call(
+        &self,
+        auth: &EngineAuthContext,
+        episode: Option<&EpisodeId>,
+        call: &mut ProviderToolCall,
+    ) -> Result<(), PortError> {
+        let tool = ToolName::parse(&call.name).ok_or(DomainError::ResourceNotFound)?;
+        if !allowed(auth, tool) {
+            return Err(DomainError::AccessDenied.into());
+        }
+        let mut arguments: serde_json::Map<String, Value> =
+            std::mem::take(&mut call.arguments).into_iter().collect();
+        if let Some(episode) = episode {
+            arguments.insert(
+                "session".into(),
+                serde_json::to_value(episode)
+                    .map_err(|_| invalid(ValidationReason::InvalidState))?,
+            );
+        } else {
+            arguments.remove("session");
+        }
+        let mut arguments = Value::Object(arguments);
+        tool.validate(&mut arguments)?;
+        let Value::Object(arguments) = arguments else {
+            return Err(invalid(ValidationReason::InvalidState));
+        };
+        call.arguments = arguments.into_iter().collect();
+        Ok(())
+    }
+
     pub fn new(
         control: Arc<dyn ControlPort>,
         catalog: Arc<dyn ControlCatalogPort>,
@@ -719,12 +758,12 @@ fn subcommand_key(request: &CommandKey, label: &str, ordinal: u16) -> CommandKey
     )
 }
 
-fn derive_key(context: &str, parts: &[&[u8]]) -> CommandKey {
+pub(crate) fn derive_key(context: &str, parts: &[&[u8]]) -> CommandKey {
     let digest = derive_digest(context, parts);
     CommandKey::from_bytes(digest.as_bytes()[..16].try_into().expect("fixed digest"))
 }
 
-fn derive_digest(context: &str, parts: &[&[u8]]) -> ContentDigest {
+pub(crate) fn derive_digest(context: &str, parts: &[&[u8]]) -> ContentDigest {
     let mut hash = blake3::Hasher::new_derive_key(context);
     for part in parts {
         hash.update(&(part.len() as u64).to_be_bytes());

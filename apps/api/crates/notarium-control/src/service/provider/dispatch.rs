@@ -13,6 +13,8 @@ use crate::{
 };
 use notarium_core::{
     DomainError,
+    auth::PrincipalKind,
+    classes::ProviderOrigin,
     error::{BudgetKind, CommitEffect, PortError, ValidationReason},
     ids::*,
     ports::{control::*, *},
@@ -302,7 +304,30 @@ impl ProviderService {
         let parts = job.parts();
         let mut secondary_projects = Vec::new();
         let current = if primary.is_some() {
-            let egress = job.egress(&parts)?;
+            if parts.len() > MAX_PROVIDER_ORIGINS {
+                return Err(invalid(ValidationReason::InvalidLimit));
+            }
+            let chat_origins = parts
+                .iter()
+                .filter_map(|part| {
+                    let origin = part.origin();
+                    matches!(origin, ProviderOrigin::Chat { .. }).then_some(origin)
+                })
+                .collect::<Vec<_>>();
+            let dependencies = if chat_origins.is_empty() {
+                ProviderEgressDependencies::default()
+            } else {
+                runtime
+                    .run(
+                        self.egress.chat_dependencies(
+                            AccountContext::new(job.ctx.auth().clone(), runtime.context()),
+                            chat_origins,
+                        ),
+                        CommitEffect::NotCommitted,
+                    )
+                    .await?
+            };
+            let egress = job.egress(&parts, dependencies)?;
             secondary_projects.clone_from(&egress.secondary_projects);
             let lease = runtime
                 .run(
@@ -357,7 +382,12 @@ impl ProviderService {
                         call_id: progress.call.to_string(),
                         owner_id: snapshot.resource.owner_id.clone(),
                         principal: validated.auth.principal().to_string(),
-                        run_id: None,
+                        run_id: match validated.auth.kind() {
+                            PrincipalKind::AgentRun(run) | PrincipalKind::Keeper(run) => {
+                                Some(run.to_string())
+                            }
+                            _ => None,
+                        },
                         scope_id: scope_key,
                         intent_key: job.intent().to_string(),
                         request_hash: hash.to_vec(),

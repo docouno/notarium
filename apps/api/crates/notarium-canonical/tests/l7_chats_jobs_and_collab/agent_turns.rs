@@ -1,13 +1,16 @@
 use super::*;
 use notarium_core::{
-    auth::{AuthenticatedCredential, ProposalHumanAccess},
+    auth::{AuthenticatedCredential, ProposalHumanAccess, SpaceLifecycle},
     classes::ClassEgressFence,
+    error::CommitEffect,
     model::FolderRef,
     ports::{
-        ChatContentRead, ChatProposalRead, ChatProvenance, DismissPending, ProviderToolCall,
-        ProviderToolCallId,
+        ChatContentRead, ChatProposalRead, ChatProvenance, ControlCatalogPort, DismissPending,
+        ProviderToolCall, ProviderToolCallId, SubmitUserChatInput, SubmitUserChatOutcome,
     },
+    receipt::AccountCommandIdentity,
 };
+use std::sync::atomic::Ordering;
 
 async fn setup(
     store: &CanonicalStore,
@@ -174,6 +177,7 @@ async fn original_human_classifier(store: &CanonicalStore) {
                 thread: thread.clone(),
                 input: item.id.clone(),
                 expected_run: run.clone(),
+                expected_active_run: run.clone(),
                 current_leaf: leaf,
             },
         )
@@ -365,6 +369,429 @@ async fn model_payloads(store: &CanonicalStore) {
             assert_eq!(item.tool_calls[0].id.as_str(), id.as_str());
         }
     }
+}
+
+async fn handoff_and_archive_fence(store: &CanonicalStore) {
+    let (scope, alice, thread) =
+        setup(store, 0xa6, SpaceKind::Shared, ChatThreadKind::SpaceGroup).await;
+    let bob = sample_principal_id(0xa7);
+    let initial = sample_run_id(0xa6);
+    let successor = sample_run_id(0xa7);
+    claim_run(
+        store,
+        owner_ctx(&scope, alice.clone()),
+        ChatAudience::Shared,
+        &thread,
+        &initial,
+        ThreadEntrySeq::ZERO,
+    )
+    .await;
+    let new_input = |sender: &PrincipalId, seed, run: &AgentRunId, base| PendingChatInput {
+        id: PendingInputId::from_bytes([seed; 16]),
+        thread: thread.clone(),
+        sender: sender.clone(),
+        body: "A queued message with a staged body. ".repeat(18),
+        queued_base_leaf: base,
+        in_flight_run: run.clone(),
+        mentions_agent: true,
+    };
+    let bob_queued = new_input(&bob, 0xa7, &initial, ThreadEntrySeq::ZERO);
+    let alice_queued = new_input(&alice, 0xa8, &initial, ThreadEntrySeq::ZERO);
+    for input in [&bob_queued, &alice_queued] {
+        assert!(matches!(
+            store
+                .queue_chat_input(
+                    owner_ctx(&scope, input.sender.clone()),
+                    next_mutation(&scope, &input.sender, input.clone()),
+                )
+                .await
+                .unwrap(),
+            QueueInputOutcome::Queued(_)
+        ));
+    }
+    let consume = |item: &PendingChatInput, active: &AgentRunId, leaf| {
+        next_mutation(
+            &scope,
+            &item.sender,
+            ConsumePending {
+                thread: thread.clone(),
+                input: item.id.clone(),
+                expected_run: item.in_flight_run.clone(),
+                expected_active_run: active.clone(),
+                current_leaf: leaf,
+            },
+        )
+    };
+    assert_validation_err(
+        &store
+            .consume_chat_input(
+                owner_ctx(&scope, alice.clone()),
+                consume(&alice_queued, &initial, ThreadEntrySeq::ZERO),
+            )
+            .await,
+        ValidationReason::InvalidState,
+    );
+    let accepted = store
+        .consume_chat_input(
+            owner_ctx(&scope, bob.clone()),
+            consume(&bob_queued, &initial, ThreadEntrySeq::ZERO),
+        )
+        .await
+        .unwrap()
+        .value;
+    let ConsumedPending::Appended {
+        entry,
+        intervening_human: false,
+    } = accepted
+    else {
+        panic!("oldest input should be eligible for the handoff")
+    };
+    let human = owner_ctx(&scope, bob.clone());
+    let narrowed = human
+        .auth()
+        .for_agent_run(
+            successor.clone(),
+            scope.space_id.clone(),
+            ChatAudience::Shared,
+            human.auth().spaces().clone(),
+        )
+        .unwrap();
+    let runner = SpaceContext::new(narrowed, scope.clone(), make_budget()).unwrap();
+    assert_eq!(
+        store
+            .claim_active_run(
+                runner.clone(),
+                ClaimChatRun {
+                    thread: thread.clone(),
+                    run: successor.clone(),
+                    expected_leaf: entry.seq,
+                    previous_run: Some(initial.clone()),
+                }
+            )
+            .await
+            .unwrap(),
+        ClaimChatRunOutcome::Claimed
+    );
+
+    assert_validation_err(
+        &store
+            .consume_chat_input(
+                owner_ctx(&scope, alice.clone()),
+                consume(&alice_queued, &initial, entry.seq),
+            )
+            .await,
+        ValidationReason::InvalidAuthority,
+    );
+    let accepted = store
+        .consume_chat_input(
+            owner_ctx(&scope, alice.clone()),
+            consume(&alice_queued, &successor, entry.seq),
+        )
+        .await
+        .unwrap()
+        .value;
+    let ConsumedPending::Appended {
+        entry,
+        intervening_human: true,
+    } = accepted
+    else {
+        panic!("the successor may drain an inherited item as a plain Human entry")
+    };
+    assert_eq!(entry.run.as_ref(), Some(&successor));
+
+    let abandoned = new_input(&bob, 0xa9, &successor, entry.seq);
+    assert!(matches!(
+        store
+            .queue_chat_input(
+                owner_ctx(&scope, bob.clone()),
+                next_mutation(&scope, &bob, abandoned),
+            )
+            .await
+            .unwrap(),
+        QueueInputOutcome::Queued(_)
+    ));
+    let stage = |key| AccountCommandIdentity {
+        owner: alice.clone(),
+        actor: alice.clone(),
+        key: CommandKey::from_bytes([key; 16]),
+        hash: ContentDigest::from_bytes([key; 32]),
+        expected: notarium_core::ids::ControlRevision::ZERO,
+    };
+    store
+        .change_lifecycle(
+            make_budget(),
+            stage(0xaa),
+            scope.clone(),
+            SpaceLifecycle::Archived,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .finish_run_if_queue_empty(
+                runner,
+                ChatRunRequest {
+                    thread: thread.clone(),
+                    expected_run: successor,
+                }
+            )
+            .await
+            .unwrap(),
+        FinishChatRunOutcome::Cleared
+    );
+    store
+        .change_lifecycle(
+            make_budget(),
+            stage(0xab),
+            scope.clone(),
+            SpaceLifecycle::Active,
+        )
+        .await
+        .unwrap();
+    let branch = store
+        .read_chat(
+            owner_ctx(&scope, alice),
+            ChatRead {
+                thread,
+                leaf: entry.seq,
+                before: None,
+                max_entries: PageLimit::new(1).unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(branch.thread.active_run, None);
+    assert_eq!(branch.thread.head, entry.seq);
+}
+
+async fn clean_leaf_retains_audit_taint(store: &CanonicalStore) {
+    let (scope, owner, thread) =
+        setup(store, 0xe6, SpaceKind::Personal, ChatThreadKind::Personal).await;
+    let post = |parent, tainted| {
+        next_mutation(
+            &scope,
+            &owner,
+            AppendChat {
+                thread: thread.clone(),
+                parent,
+                kind: ChatEntryKind::Human,
+                body: ChatInputBody::Text("A selected branch".into()),
+                tool_calls: Vec::new(),
+                provenance: None,
+                proposed_diff: None,
+                referenced_notes: Vec::new(),
+                tainted,
+            },
+        )
+    };
+    let old = store
+        .append_chat(
+            owner_ctx(&scope, owner.clone()),
+            post(ThreadEntrySeq::ZERO, true),
+        )
+        .await
+        .unwrap()
+        .value;
+    let forked = store
+        .fork_chat(
+            owner_ctx(&scope, owner.clone()),
+            next_mutation(
+                &scope,
+                &owner,
+                ForkChat {
+                    thread: thread.clone(),
+                    parent: ThreadEntrySeq::ZERO,
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .value;
+    assert!(!forked.tainted);
+    let active = claim_run(
+        store,
+        owner_ctx(&scope, owner.clone()),
+        ChatAudience::Personal,
+        &thread,
+        &sample_run_id(0xe6),
+        ThreadEntrySeq::ZERO,
+    )
+    .await;
+    assert!(!active.auth().taint().is_tainted());
+    let fresh = store
+        .append_chat(active.clone(), post(ThreadEntrySeq::ZERO, false))
+        .await
+        .unwrap()
+        .value;
+    assert!(!fresh.tainted);
+    assert_eq!(store.execute_diagnostic_read_sql_for_test(None, &format!(
+        "SELECT CAST(ext_space_tainted_mask AS BIGINT) FROM chat_threads WHERE space_id='{}' AND thread_id='{}'",
+        scope.space_id.as_str(), thread.as_str(),
+    )).await.unwrap(), 1);
+    let read = store
+        .read_chat(
+            owner_ctx(&scope, owner),
+            ChatRead {
+                thread,
+                leaf: old.seq,
+                before: None,
+                max_entries: PageLimit::new(1).unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(read.thread.tainted);
+    assert_eq!(read.thread.head, fresh.seq);
+}
+
+async fn submitted_input_replays_across_route_changes(store: &CanonicalStore) {
+    let (scope, owner, thread) =
+        setup(store, 0xe5, SpaceKind::Personal, ChatThreadKind::Personal).await;
+    let human = || owner_ctx(&scope, owner.clone());
+    let input = |seed, expected_leaf| SubmitUserChatInput {
+        identity: next_mutation(&scope, &owner, ()).identity,
+        id: PendingInputId::from_bytes([seed; 16]),
+        thread: thread.clone(),
+        expected_leaf,
+        body: "A human input with a staged body. ".repeat(25),
+        mentions_agent: true,
+    };
+    let lose_ack = || {
+        store
+            .writer_faults()
+            .unwrap()
+            .drop_commit_response_once
+            .store(true, Ordering::SeqCst);
+    };
+
+    let direct = input(0xe5, ThreadEntrySeq::ZERO);
+    lose_ack();
+    assert!(matches!(
+        store.submit_user_chat_input(human(), direct.clone()).await,
+        Err(PortError::Unavailable(failure)) if failure.effect() == CommitEffect::Unknown
+    ));
+    let Some(SubmitUserChatOutcome::Appended(appended)) = store
+        .lookup_user_chat_input(human(), &direct)
+        .await
+        .unwrap()
+    else {
+        panic!("the direct submission must have a durable append receipt")
+    };
+    assert!(matches!(appended.value.body, ChatBody::Blob(_)));
+
+    let run = sample_run_id(0xe5);
+    let agent = claim_run(
+        store,
+        human(),
+        ChatAudience::Personal,
+        &thread,
+        &run,
+        appended.value.seq,
+    )
+    .await;
+    let SubmitUserChatOutcome::Appended(replayed) = store
+        .submit_user_chat_input(human(), direct.clone())
+        .await
+        .unwrap()
+    else {
+        panic!("an append receipt cannot be rerouted into the active queue")
+    };
+    assert_eq!(replayed.value.seq, appended.value.seq);
+    assert!(
+        store
+            .list_pending_chat_inputs(agent.clone(), thread.clone())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let pending = input(0xe6, appended.value.seq);
+    lose_ack();
+    assert!(matches!(
+        store.submit_user_chat_input(human(), pending.clone()).await,
+        Err(PortError::Unavailable(failure)) if failure.effect() == CommitEffect::Unknown
+    ));
+    let Some(SubmitUserChatOutcome::Queued(queued)) = store
+        .lookup_user_chat_input(human(), &pending)
+        .await
+        .unwrap()
+    else {
+        panic!("the queued submission must have a durable receipt")
+    };
+    assert_eq!(queued.id, pending.id);
+    assert_eq!(queued.in_flight_run, run);
+    assert!(
+        store
+            .dismiss_chat_input(
+                agent.clone(),
+                DismissPending {
+                    thread: thread.clone(),
+                    input: pending.id.clone(),
+                }
+            )
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .finish_run_if_queue_empty(
+                agent,
+                ChatRunRequest {
+                    thread: thread.clone(),
+                    expected_run: run,
+                }
+            )
+            .await
+            .unwrap(),
+        FinishChatRunOutcome::Cleared
+    );
+    let current_cut = store.get_space(&scope.space_id).await.unwrap().last_seq;
+    assert!(matches!(
+        store.submit_user_chat_input(human(), pending).await.unwrap(),
+        SubmitUserChatOutcome::Queued(replayed) if replayed.id == queued.id
+    ));
+    assert_eq!(
+        store.get_space(&scope.space_id).await.unwrap().last_seq,
+        current_cut
+    );
+
+    let branch = store
+        .read_chat(
+            human(),
+            ChatRead {
+                thread: thread.clone(),
+                leaf: appended.value.seq,
+                before: None,
+                max_entries: PageLimit::new(1).unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+    store
+        .redact_chat_entry(
+            human(),
+            next_mutation(
+                &scope,
+                &owner,
+                RedactChatEntry {
+                    thread,
+                    entry: appended.value.seq,
+                    expected_thread_revision: branch.thread.revision,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        store.lookup_user_chat_input(human(), &direct).await.unwrap(),
+        Some(SubmitUserChatOutcome::Appended(replayed)) if matches!(replayed.value.body, ChatBody::Redacted)
+    ));
+    let mut forged = direct;
+    forged.body.push('!');
+    assert!(matches!(
+        store.lookup_user_chat_input(human(), &forged).await,
+        Err(PortError::Domain(DomainError::IdempotencyKeyReused))
+    ));
 }
 
 async fn confirmed_source_fence(store: &CanonicalStore) {
@@ -581,6 +1008,10 @@ async fn supervised_queue_and_hydration_match_across_dialects() {
     .unwrap();
     original_human_classifier(&store).await;
     model_payloads(&store).await;
+    nested_chat_egress_dependencies(&store).await;
+    handoff_and_archive_fence(&store).await;
+    clean_leaf_retains_audit_taint(&store).await;
+    submitted_input_replays_across_route_changes(&store).await;
     confirmed_source_fence(&store).await;
     runtime.shutdown().await.unwrap();
 
@@ -596,7 +1027,176 @@ async fn supervised_queue_and_hydration_match_across_dialects() {
     .unwrap();
     original_human_classifier(&store).await;
     model_payloads(&store).await;
+    nested_chat_egress_dependencies(&store).await;
+    handoff_and_archive_fence(&store).await;
+    clean_leaf_retains_audit_taint(&store).await;
+    submitted_input_replays_across_route_changes(&store).await;
     confirmed_source_fence(&store).await;
     runtime.shutdown().await.unwrap();
     fixtures.drop_pg_schema(&schema).await;
+}
+
+async fn nested_chat_egress_dependencies(store: &CanonicalStore) {
+    use notarium_core::ports::{
+        AccountContext, Cancellation, ProviderEgressCatalogPort, ProviderEgressRequest,
+    };
+
+    let (scope, owner, thread) =
+        setup(store, 0xba, SpaceKind::Personal, ChatThreadKind::Personal).await;
+    let human = owner_ctx(&scope, owner.clone());
+    let run = sample_run_id(0xba);
+    let agent = claim_run(
+        store,
+        human.clone(),
+        ChatAudience::Personal,
+        &thread,
+        &run,
+        ThreadEntrySeq::ZERO,
+    )
+    .await;
+
+    let append = |parent, kind, text: &str, provenance| {
+        next_mutation(
+            &scope,
+            &owner,
+            AppendChat {
+                thread: thread.clone(),
+                parent,
+                kind,
+                body: ChatInputBody::Text(text.into()),
+                provenance,
+                proposed_diff: None,
+                tool_calls: vec![],
+                referenced_notes: vec![],
+                tainted: false,
+            },
+        )
+    };
+    let source = store
+        .append_chat(
+            human.clone(),
+            append(
+                ThreadEntrySeq::ZERO,
+                ChatEntryKind::Human,
+                "Human source",
+                None,
+            ),
+        )
+        .await
+        .unwrap()
+        .value;
+    let read = |entry| ChatContentRead {
+        thread: thread.clone(),
+        leaf: entry,
+        entries: vec![entry],
+    };
+    let source_origin = store
+        .read_chat_contents(agent.clone(), read(source.seq))
+        .await
+        .unwrap()[0]
+        .content
+        .origin();
+    let model = store
+        .append_chat(
+            agent.clone(),
+            append(
+                source.seq,
+                ChatEntryKind::Model,
+                "Derived model",
+                Some(ChatProvenance {
+                    origins: vec![source_origin.clone()],
+                    projects: vec![],
+                }),
+            ),
+        )
+        .await
+        .unwrap()
+        .value;
+    let model_origin = store
+        .read_chat_contents(agent.clone(), read(model.seq))
+        .await
+        .unwrap()[0]
+        .content
+        .origin();
+    let compaction = store
+        .append_chat(
+            agent.clone(),
+            append(
+                model.seq,
+                ChatEntryKind::Compaction,
+                "Compacted model",
+                Some(ChatProvenance {
+                    origins: vec![model_origin.clone()],
+                    projects: vec![],
+                }),
+            ),
+        )
+        .await
+        .unwrap()
+        .value;
+    let compact_origin = store
+        .read_chat_contents(agent.clone(), read(compaction.seq))
+        .await
+        .unwrap()[0]
+        .content
+        .origin();
+    let account = || AccountContext::new(agent.auth().clone(), agent.budget.clone());
+    let proof = store
+        .chat_dependencies(account(), vec![compact_origin.clone()])
+        .await
+        .unwrap();
+    assert_eq!(proof.origins, vec![model_origin, source_origin]);
+    let request = ProviderEgressRequest {
+        origins: [vec![compact_origin], proof.origins].concat(),
+        primary: scope.clone(),
+        project: None,
+        secondary_projects: proof.projects,
+    };
+    let first = store
+        .acquire_egress(account(), request.clone(), Cancellation::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        first
+            .current()
+            .iter()
+            .map(|value| value.origin())
+            .collect::<Vec<_>>(),
+        request.origins
+    );
+    drop(first);
+
+    let branch = store
+        .read_chat(
+            human.clone(),
+            ChatRead {
+                thread: thread.clone(),
+                leaf: compaction.seq,
+                before: None,
+                max_entries: PageLimit::new(4).unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+    store
+        .redact_chat_entry(
+            human,
+            next_mutation(
+                &scope,
+                &owner,
+                RedactChatEntry {
+                    thread: thread.clone(),
+                    entry: source.seq,
+                    expected_thread_revision: branch.thread.revision,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .acquire_egress(account(), request, Cancellation::default())
+            .await
+            .is_err()
+    );
 }

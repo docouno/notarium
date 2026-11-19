@@ -27,6 +27,7 @@ use std::{
 #[derive(Default)]
 struct Egress {
     current: Mutex<Vec<ProviderCurrentContent>>,
+    dependencies: Mutex<ProviderEgressDependencies>,
     deny: AtomicBool,
     active: Arc<AtomicUsize>,
     admitted: Arc<AtomicUsize>,
@@ -69,6 +70,14 @@ impl ProviderEgressLease for EgressLease {
     }
 }
 impl ProviderEgressCatalogPort for Egress {
+    fn chat_dependencies(
+        &self,
+        _: AccountContext,
+        _: Vec<ProviderOrigin>,
+    ) -> PortFuture<'_, ProviderEgressDependencies> {
+        Box::pin(async move { Ok(self.dependencies.lock().unwrap().clone()) })
+    }
+
     fn acquire_egress(
         &self,
         _: AccountContext,
@@ -483,6 +492,70 @@ async fn complete(
     }
     Ok(events)
 }
+
+async fn compacted_history_dispatches_only_with_its_transitive_proof(setup: &Setup) {
+    let note = ProviderCurrentContent::Note(setup.document.metadata());
+    let space = note.space().unwrap().clone();
+    let thread = ChatThreadId::from_bytes([11; 16]);
+    let entry = |seq, text: &str, dependency| {
+        let seq = ThreadEntrySeq::new(seq).unwrap();
+        let digest = ContentDigest::from_bytes(*blake3::hash(text.as_bytes()).as_bytes());
+        let proof = ChatProvenance {
+            origins: vec![dependency],
+            projects: vec![],
+        };
+        let current = ProviderCurrentContent::Chat {
+            space: space.clone(),
+            thread: thread.clone(),
+            entry: seq,
+            digest,
+            project: None,
+            lifecycle: Lifecycle::Active,
+            tainted: false,
+            group_author: None,
+            provenance: Some(proof.clone()),
+        };
+        let content = CanonicalChatContent::from_canonical(
+            space.clone(),
+            thread.clone(),
+            seq,
+            false,
+            text.into(),
+            digest,
+            None,
+        )
+        .with_provenance(Some(proof));
+        (current, content)
+    };
+    let (model, _) = entry(1, "Earlier model", note.origin());
+    let (compaction, summary) = entry(2, "Current summary", model.origin());
+    setup
+        .egress
+        .current
+        .lock()
+        .unwrap()
+        .extend([model, compaction]);
+    let request = |key| {
+        let mut request = setup.completion(key);
+        request.messages[0].parts = vec![ProviderMessage::Chat(
+            ClassEgressFence::chat(summary.clone(), setup.ctx.auth(), &setup.selection.policy)
+                .unwrap(),
+        )];
+        request
+    };
+    assert!(
+        complete(&setup.provider, setup.space.clone(), request(31))
+            .await
+            .is_err()
+    );
+    setup.egress.dependencies.lock().unwrap().origins = vec![note.origin()];
+    assert!(
+        complete(&setup.provider, setup.space.clone(), request(32))
+            .await
+            .is_ok()
+    );
+}
+
 fn completion_reply(kind: ProviderWireKind, mode: u8) -> Reply {
     let input = if mode == 2 { 8193 } else { 7 };
     let output = if mode == 2 { 0 } else { 2 };
@@ -718,6 +791,9 @@ async fn gateway(pg: bool, kind: ProviderWireKind, label: &str) {
             .is_ok(),
         "budget_mismatch records audit spend without cross-user 60s DoS lockout"
     );
+    let before_history = requests.lock().unwrap().len();
+    compacted_history_dispatches_only_with_its_transitive_proof(&setup).await;
+    assert_eq!(requests.lock().unwrap().len(), before_history + 1);
     let count = requests.lock().unwrap().len();
     // A retry still resolves the old intent after mutable configuration changes.
     let changed = setup

@@ -86,6 +86,8 @@ canonical_port!(NoteWritePort;
 );
 
 canonical_port!(ChatPort;
+    submit_user_chat_input(SubmitUserChatInput) -> SubmitUserChatOutcome,
+    lookup_user_chat_input(&SubmitUserChatInput) -> Option<SubmitUserChatOutcome>,
     read_chat(ChatRead) -> ChatBranch,
     read_chat_context(ChatRead) -> ChatBranch,
     read_chat_contents(ChatContentRead) -> Vec<HydratedChatEntry>,

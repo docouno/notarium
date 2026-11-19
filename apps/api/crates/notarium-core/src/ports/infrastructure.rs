@@ -538,7 +538,7 @@ pub trait EventBusPort: Send + Sync {
         after: ChangeCursor,
     ) -> PortFuture<'_, Box<dyn PortStream<SpaceEvent>>>;
 }
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", content = "target", rename_all = "snake_case")]
 pub enum RevocationSelector {
     Principal(PrincipalId),

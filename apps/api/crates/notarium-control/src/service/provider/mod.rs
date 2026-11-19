@@ -32,6 +32,12 @@ use serde::{Serialize, de::DeserializeOwned};
 use std::{collections::BTreeMap, sync::Arc};
 use tokio::sync::Semaphore;
 
+/// Estimate the request with the same bounded codec used by admission and
+/// provider accounting. This helper performs no authority or network work.
+pub fn completion_input_estimate(request: &CompletionRequest) -> Result<u32, PortError> {
+    wire::estimate_completion_input_tokens(request)
+}
+
 pub const DEFAULT_MAX_ACTIVE_CALLS: usize = 64;
 const MAX_ACTIVE_CALLS_CAP: usize = 1024;
 

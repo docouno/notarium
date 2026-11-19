@@ -1,7 +1,7 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use notarium_core::{
     DomainError,
-    classes::{AbilityKind, ClassEgressFence, DocClass, ProviderOrigin},
+    classes::{AbilityKind, ClassEgressFence, ClassifiedAbilityResource, DocClass, ProviderOrigin},
     error::{PortError, ValidationReason},
     ids::*,
     model::{AbilityResourceName, FolderRef},
@@ -12,7 +12,7 @@ use notarium_syntax::frontmatter;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 
-use super::{EgressTarget, ToolCallContext, ToolName, decode, invalid, session};
+use super::{EgressTarget, ToolCallContext, ToolName, ToolRegistry, decode, invalid, session};
 use crate::abilities::read_system_ability;
 
 mod author;
@@ -396,26 +396,7 @@ async fn read_owned_resource(
         .ok_or(DomainError::ResourceNotFound)?;
     let scope = session::space(call, &entry.space_id).await?;
     let project = requested_project(call, reference, &entry.space_id, hint);
-    let body = call
-        .registry
-        .engine
-        .read_ability_resource(
-            scope.clone(),
-            ReadAbilityResource {
-                ability: reference.id.clone(),
-                package_revision: reference.revision.clone(),
-                resource: resource.clone(),
-            },
-        )
-        .await?;
-    if body.reference().space != entry.space_id
-        || body.reference().ability != reference.id
-        || body.reference().package_revision != reference.revision
-        || body.reference().resource != resource
-        || body.placement() != &reference.placement
-    {
-        return Err(invalid(ValidationReason::SourceMismatch));
-    }
+    let body = read_exact_resource(call.registry, &scope, descriptor, resource).await?;
     let origin = body.origin();
     let text = match call.provider_selection(&scope, project.clone()).await? {
         Some(selection) => {
@@ -436,6 +417,42 @@ async fn read_owned_resource(
         origin,
         project,
     })
+}
+
+pub(super) async fn read_exact_resource(
+    registry: &ToolRegistry,
+    scope: &SpaceContext,
+    descriptor: &AbilityDescriptor,
+    resource: AbilityResourceName,
+) -> Result<ClassifiedAbilityResource, PortError> {
+    let reference = &descriptor.reference;
+    let entry = descriptor
+        .entrypoint
+        .as_ref()
+        .ok_or(DomainError::ResourceNotFound)?;
+    if entry.space_id != scope.scope().space_id {
+        return Err(invalid(ValidationReason::ScopeMismatch));
+    }
+    let body = registry
+        .engine
+        .read_ability_resource(
+            scope.clone(),
+            ReadAbilityResource {
+                ability: reference.id.clone(),
+                package_revision: reference.revision.clone(),
+                resource: resource.clone(),
+            },
+        )
+        .await?;
+    if body.reference().space != entry.space_id
+        || body.reference().ability != reference.id
+        || body.reference().package_revision != reference.revision
+        || body.reference().resource != resource
+        || body.placement() != &reference.placement
+    {
+        return Err(invalid(ValidationReason::SourceMismatch));
+    }
+    Ok(body)
 }
 
 fn availability(value: &AbilityProjects) -> Value {

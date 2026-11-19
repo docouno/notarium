@@ -200,7 +200,16 @@ impl Job {
             Request::Check(_) => vec![],
         }
     }
-    pub fn egress(&self, parts: &[ProviderMessage]) -> Result<ProviderEgressRequest, PortError> {
+    pub fn egress(
+        &self,
+        parts: &[ProviderMessage],
+        dependencies: ProviderEgressDependencies,
+    ) -> Result<ProviderEgressRequest, PortError> {
+        if dependencies.origins.len() > MAX_PROVIDER_ORIGINS
+            || dependencies.projects.len() > MAX_PROVIDER_SECONDARY_PROJECTS + 1
+        {
+            return Err(invalid(ValidationReason::InvalidLimit));
+        }
         let mut origins = BTreeMap::new();
         let mut projects = BTreeMap::new();
         let primary = self
@@ -253,6 +262,15 @@ impl Job {
                     add_project(project);
                 }
             }
+        }
+        for dependency in dependencies.origins {
+            if let Some(project) = dependency.owning_project() {
+                add_project(project);
+            }
+            origins.insert(json(&dependency)?, dependency);
+        }
+        for project in &dependencies.projects {
+            add_project(project);
         }
         if origins.len() > MAX_PROVIDER_ORIGINS || projects.len() > MAX_PROVIDER_SECONDARY_PROJECTS
         {

@@ -1562,14 +1562,13 @@ impl CanonicalStore {
                 }
                 if let Some(auth) = &space_auth {
                     for thread in &thread_items {
-                        let (project, tainted) = crate::domain::lookup_thread_visibility_tx(
+                        crate::chats::authorize_live_thread_read_tx(
                             tx,
-                            &space.space.id,
-                            thread.id.as_str(),
+                            &space.space,
+                            auth,
+                            &thread.id,
                         )
-                        .await?
-                        .ok_or(DomainError::ResourceNotFound)?;
-                        auth.authorize_chat_read(&space.space, project.as_ref(), tainted)?;
+                        .await?;
                     }
                 }
                 Ok(ChangeSeed {

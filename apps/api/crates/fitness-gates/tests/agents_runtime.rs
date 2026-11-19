@@ -9,6 +9,10 @@ mod engine;
 mod proposal_cases;
 #[path = "agents_runtime/proposal_notes.rs"]
 mod proposal_note_cases;
+#[path = "agents_runtime/runtime_abilities.rs"]
+mod runtime_ability_cases;
+#[path = "agents_runtime/supervised_chat.rs"]
+mod supervised_chat_cases;
 #[allow(dead_code)]
 #[path = "../../notarium-control/tests/support/mod.rs"]
 mod support;
@@ -17,6 +21,7 @@ use engine::{ProjectionFixtures, TestEngine};
 use notarium_agents::{
     abilities::SystemAbilityCatalog,
     mcp::{EgressTarget, McpInvocationContext, McpToolResult, ToolRegistry},
+    revocation::RevocationHub,
 };
 use notarium_canonical::{
     CanonicalConfig, CanonicalRuntime, CanonicalStore, PgConnectConfig, PgTransport,
@@ -48,7 +53,8 @@ struct RuntimeFixture {
     canonical: CanonicalStore,
     runtime: CanonicalRuntime,
     control: Arc<ControlService>,
-    registry: ToolRegistry,
+    revocations: Arc<RevocationHub>,
+    registry: Arc<ToolRegistry>,
     projections: Arc<ProjectionFixtures>,
     human: AccountContext,
     temporary_blob_root: Option<PathBuf>,
@@ -92,11 +98,12 @@ impl RuntimeFixture {
         let (canonical, runtime) = CanonicalRuntime::open(config).await.unwrap();
         let catalog = Arc::new(SystemAbilityCatalog::new(Arc::new(canonical.clone())));
         let owner = PrincipalId::from_bytes([4; 16]);
+        let revocations = Arc::new(RevocationHub::new_local());
         let control = Arc::new(
             ControlService::open(
                 storage.store.clone(),
                 catalog.clone(),
-                storage.revoker.clone(),
+                revocations.clone(),
                 storage.clock.clone(),
                 ControlConfig {
                     authentication: AuthenticationMode::TrustedNone { owner },
@@ -143,17 +150,18 @@ impl RuntimeFixture {
         )
         .unwrap();
         let projections = Arc::new(ProjectionFixtures::default());
-        let registry = ToolRegistry::new(
+        let registry = Arc::new(ToolRegistry::new(
             Arc::new(ControlPlane::new(provider)),
             catalog,
             Arc::new(TestEngine(canonical.clone(), projections.clone())),
             control.clone(),
-        );
+        ));
         Self {
             storage,
             canonical,
             runtime,
             control,
+            revocations,
             registry,
             projections,
             human,
@@ -394,6 +402,9 @@ async fn external_registry_and_memory(pg: bool) {
     content_cases::edit_folder_cover_and_view(&fixture, &scoped).await;
     proposal_cases::explicit_confirmation_applies_once(&fixture, &scoped).await;
     proposal_note_cases::confirmed_notes_use_fixed_destinations_and_revisions(&fixture, &scoped)
+        .await;
+    runtime_ability_cases::secondary_project_abilities_reach_the_wire(&fixture, &scoped).await;
+    supervised_chat_cases::supervised_turn_survives_disconnect_and_stops_cleanly(&fixture, &scoped)
         .await;
     fixture.close().await;
 }

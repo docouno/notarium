@@ -676,11 +676,31 @@ pub struct QueuedInput {
     pub input: PendingInputId,
     pub position: u8,
 }
+/// A human input whose durable receipt covers both direct append and FIFO admission.
+#[derive(Clone, Debug)]
+pub struct SubmitUserChatInput {
+    pub identity: CommandIdentity,
+    pub id: PendingInputId,
+    pub thread: ChatThreadId,
+    pub expected_leaf: ThreadEntrySeq,
+    pub body: String,
+    pub mentions_agent: bool,
+}
+#[derive(Clone, Debug)]
+pub enum SubmitUserChatOutcome {
+    Appended(Committed<ChatEntry>),
+    Queued(QueuedChatInput),
+    Full { limit: u8 },
+    Changed,
+}
 #[derive(Clone, Debug)]
 pub struct ConsumePending {
     pub thread: ChatThreadId,
     pub input: PendingInputId,
+    /// The run that was active when the input was queued.
     pub expected_run: AgentRunId,
+    /// The current claim owned by the drainer. It may have advanced since enqueue.
+    pub expected_active_run: AgentRunId,
     pub current_leaf: ThreadEntrySeq,
 }
 #[derive(Clone, Debug)]
