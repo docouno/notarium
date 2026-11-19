@@ -5,9 +5,8 @@ use super::{
     QuantizedVector, SearchBudget, SegmentBuilder, Tombstones, VectorChunk, VectorError,
     format::class_number,
     hnsw::{self, ExactNeighbor, Similarity},
-    model_hash,
 };
-use crate::layout::{EpochManifest, SearchLayout};
+use crate::layout::{EpochManifest, SearchLayout, VectorModel};
 use croaring::Bitmap;
 use notarium_core::{
     classes::DocClass,
@@ -125,7 +124,7 @@ impl VectorSnapshot {
         force_exact: bool,
     ) -> Result<VectorResults, VectorError> {
         budget.check()?;
-        query.validate(self.epoch.dimension as usize)?;
+        query.validate(self.epoch.model.dimension as usize)?;
         let limit = limit.min(4096);
         if limit == 0 {
             return Ok(VectorResults {
@@ -307,24 +306,29 @@ impl VectorEpoch {
         model: ModelProfileId,
         dimension: usize,
     ) -> Result<Self, VectorError> {
+        let dimension = u32::try_from(dimension).map_err(|_| VectorError::InvalidDimension)?;
+        Self::open_model(layout, VectorModel::local(model, dimension))
+    }
+
+    pub(crate) fn open_model(
+        layout: Arc<SearchLayout>,
+        model: VectorModel,
+    ) -> Result<Self, VectorError> {
+        let dimension = model.dimension as usize;
         let path = layout.model_epoch(&model)?;
         let manifest = layout
             .epoch_manifest(&model)?
             .unwrap_or_else(|| EpochManifest {
                 scope: layout.scope().clone(),
-                model_id: model.clone(),
-                dimension: dimension.try_into().unwrap_or(u32::MAX),
+                model: model.clone(),
                 vector_seq: SpaceSeq::ZERO,
                 active_segments: Vec::new(),
                 complete_backfill: false,
             });
-        if dimension != manifest.dimension as usize {
-            return Err(VectorError::InvalidDimension);
-        }
         let mutable = MutableBuffer::open(&path, dimension)?;
         let mut segments = Vec::with_capacity(manifest.active_segments.len());
         for &id in &manifest.active_segments {
-            let data = MmapSegment::open(&segment_path(&path, id), &model_hash(&model))?;
+            let data = MmapSegment::open(&segment_path(&path, id), &model.hash())?;
             if data.dimension() != dimension {
                 return Err(VectorError::InvalidDimension);
             }
@@ -445,8 +449,33 @@ impl VectorEpoch {
         self.manifest.vector_seq == seq && self.mutable.last_seq() <= seq
     }
 
-    pub(crate) fn matches_profile(&self, model: &ModelProfileId, dimension: usize) -> bool {
-        &self.manifest.model_id == model && self.manifest.dimension as usize == dimension
+    pub(crate) fn matches_model(&self, model: &VectorModel) -> bool {
+        &self.manifest.model == model
+    }
+
+    pub(crate) fn matches_note_chunks(&self, note: &NoteId, chunks: &[VectorChunk]) -> bool {
+        let mut metadata = Vec::new();
+        if let Some(rows) = self.mutable.chunks_for_note(note) {
+            metadata.extend(rows.iter().map(|row| row.metadata.clone()));
+        } else {
+            for segment in &self.segments {
+                if let Some(slots) = segment.index.notes.get(note) {
+                    metadata.extend(slots.iter().filter_map(|&slot| {
+                        (!segment.tombstones.bitmap().contains(slot))
+                            .then(|| segment.index.data.metadata(slot))
+                            .flatten()
+                    }));
+                }
+            }
+        }
+        if metadata.len() != chunks.len() {
+            return false;
+        }
+        let key = |meta: &ChunkMetadata| (meta.spans[0].start(), meta.key);
+        let mut expected: Vec<_> = chunks.iter().map(|chunk| &chunk.metadata).collect();
+        metadata.sort_unstable_by_key(key);
+        expected.sort_unstable_by_key(|meta| key(meta));
+        metadata.iter().eq(expected)
     }
 
     pub fn should_compact(&self) -> bool {
@@ -521,14 +550,14 @@ impl VectorEpoch {
     }
 
     fn builder(&self) -> Result<SegmentBuilder, VectorError> {
-        SegmentBuilder::new(&self.manifest.model_id, self.manifest.dimension as usize)
+        SegmentBuilder::for_model(&self.manifest.model)
     }
 
     fn seal(&mut self, builder: SegmentBuilder) -> Result<Option<Segment>, VectorError> {
         if builder.is_empty() {
             return Ok(None);
         }
-        if !builder.matches(&self.manifest.model_id, self.manifest.dimension as usize) {
+        if !builder.matches(&self.manifest.model) {
             return Err(VectorError::InvalidDimension);
         }
         let id = self.next_segment;

@@ -16,6 +16,7 @@ use notarium_search::{
     fuse_search_candidates,
     layout::{FolderDictionary, SearchLayout, SearchManifest, index_name},
     lexical::{LexicalFilter, LexicalIndex, TOKENIZER_VERSION, Update, WriterPool},
+    ports::{EmbeddingBackendTarget, ResolvedEmbeddingTarget},
     vector::{
         ChunkMetadata, EXACT_SCAN_LIMIT, QuantizedVector, SearchBudget, SegmentBuilder,
         VectorChunk, VectorEpoch, VectorFilter,
@@ -195,7 +196,12 @@ fn build(fixture: &Fixture, count: u32) -> Result<(LexicalIndex, VectorEpoch), B
         tantivy_commit: index.commit_id()?,
         active_index_dir: index_name(1),
         tokenizer_version: TOKENIZER_VERSION,
-        active_model: Some(fixture.model.clone()),
+        active_model: Some(ResolvedEmbeddingTarget {
+            model: fixture.model.clone(),
+            dimension: DIMENSION as u32,
+            max_input_tokens: 512,
+            backend: EmbeddingBackendTarget::LocalOnnx,
+        }),
         vector_seq: Some(fixture.projection.cut.projected_seq),
         embeddings_pending: false,
     })?;

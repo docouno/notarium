@@ -5,33 +5,29 @@ use crate::{
         RemoteEmbedder, bounded_batches, deterministic_embedding,
     },
     engine::Services,
-    ports::{EmbeddingBackendTarget, ResolvedEmbeddingTarget, SearchIndexedNote},
-    vector::{
-        ChunkMetadata, MAX_DIMENSION, MIN_DIMENSION, QuantizedVector, VectorChunk, VectorEpoch,
+    ports::{
+        EmbeddingBackendTarget, RemoteIndexingGrant, ResolvedEmbeddingTarget, SearchIndexedNote,
     },
+    vector::{ChunkMetadata, MAX_DIMENSION, MIN_DIMENSION, QuantizedVector, VectorChunk},
 };
 use notarium_core::{
     DomainError,
     classes::{ClassEgressFence, ClassifiedDocument, ContentPart, DocClass, SearchContent},
     document::{ChunkDescriptor, ChunkPlan},
     error::ValidationReason,
-    ids::{FolderId, ModelProfileId},
+    ids::{ContentDigest, FolderId, ModelProfileId},
     model::{FolderRef, HistoryScope},
     ports::{CallBudget, EmbeddingQueryInput, SpaceContext},
 };
 use notarium_syntax::chunk::TokenizerBudget;
-use std::{collections::BTreeSet, sync::Arc};
+use std::{
+    collections::{BTreeSet, HashMap},
+    sync::{Arc, Weak},
+};
 use tokio::sync::Mutex;
 
 #[derive(Default)]
-pub(super) struct LocalModels(Mutex<Option<InstalledModel>>);
-
-struct InstalledModel {
-    profile: ModelProfileId,
-    dimension: u32,
-    max_input_tokens: u32,
-    model: Arc<OrtModel>,
-}
+pub(super) struct LocalModels(Mutex<HashMap<crate::layout::VectorModel, Weak<OrtModel>>>);
 
 pub(super) struct Embedder {
     pub target: ResolvedEmbeddingTarget,
@@ -81,14 +77,14 @@ impl Services {
             {
                 Ok(Some(target))
             }
-            _ => Err(EmbeddingError::ModelUnavailable),
+            None => Ok(None),
+            Some(_) => Err(EmbeddingError::ModelUnavailable),
         }
     }
 
     pub async fn embedder(
         &self,
         target: ResolvedEmbeddingTarget,
-        load_local: bool,
     ) -> Result<Embedder, EmbeddingError> {
         let conservative = || {
             Arc::new(RemoteConservativeTokenizerBudget::new(
@@ -129,21 +125,11 @@ impl Services {
                     },
                     EmbeddingBackendTarget::LocalOnnx,
                 ) => {
-                    let mut installed = if load_local {
-                        self.models.0.lock().await
+                    let mut installed = self.models.0.lock().await;
+                    let key = target.vector_model();
+                    let model = if let Some(model) = installed.get(&key).and_then(Weak::upgrade) {
+                        model
                     } else {
-                        self.models
-                            .0
-                            .try_lock()
-                            .map_err(|_| EmbeddingError::ModelUnavailable)?
-                    };
-                    let model = if let Some(model) = installed.as_ref().filter(|model| {
-                        model.profile == target.model
-                            && model.dimension == target.dimension
-                            && model.max_input_tokens == target.max_input_tokens
-                    }) {
-                        model.model.clone()
-                    } else if load_local {
                         let library = dylib_path.clone();
                         let root = model_dir.clone();
                         let selected = target.clone();
@@ -153,15 +139,9 @@ impl Services {
                         .await
                         .map_err(|_| EmbeddingError::ModelUnavailable)??;
                         let model = Arc::new(model);
-                        *installed = Some(InstalledModel {
-                            profile: target.model.clone(),
-                            dimension: target.dimension,
-                            max_input_tokens: target.max_input_tokens,
-                            model: model.clone(),
-                        });
+                        installed.retain(|_, model| model.strong_count() != 0);
+                        installed.insert(key, Arc::downgrade(&model));
                         model
-                    } else {
-                        return Err(EmbeddingError::ModelUnavailable);
                     };
                     let tokenizer = model.tokenizer();
                     (Backend::Onnx(model), tokenizer)
@@ -292,32 +272,60 @@ impl Embedder {
         let document = Arc::new(note.document.clone());
         let content =
             ClassEgressFence::index_for_search(note.document.clone(), &services.authority)?;
-        let chunks = chunks_for(&content, self.tokenizer())?;
-        let mut missing = Vec::new();
+        let Ok(chunks) = chunks_for(&content, self.tokenizer()) else {
+            return Ok((Vec::new(), true));
+        };
+        if chunks.is_empty() {
+            return Ok((Vec::new(), false));
+        }
+        let remote = if let Backend::Remote(backend) = &self.backend {
+            let Some((grant, project)) = self
+                .indexing_grant(services, scope, note, budget.clone())
+                .await
+            else {
+                return Ok((Vec::new(), true));
+            };
+            Some((backend, grant, project))
+        } else {
+            None
+        };
+        let mut missing: Vec<Vec<ChunkDescriptor>> = Vec::new();
+        let mut group_by_key = HashMap::new();
         let mut vectors = Vec::new();
         for descriptor in chunks {
-            if let Some(vector) = existing.and_then(|epoch| epoch.find_vector(descriptor.key)) {
+            if let Some(vector) = existing(descriptor.key) {
                 vectors.push(vector_chunk(&document, folder, descriptor, vector));
             } else {
-                missing.push(descriptor);
+                let group = *group_by_key.entry(descriptor.key).or_insert_with(|| {
+                    missing.push(Vec::new());
+                    missing.len() - 1
+                });
+                missing[group].push(descriptor);
             }
         }
         let mut pending = false;
         let cap = self.target.max_input_tokens;
-        let Some(batches) = bounded_batches(missing, |chunk| chunk.tokens, cap).ok() else {
+        let Ok(batches) = bounded_batches(missing, |group| group[0].tokens, cap) else {
             return Ok((vectors, true));
         };
         for batch in batches {
-            let rows = if let Backend::Remote(backend) = &self.backend {
+            let rows = if let Some((backend, grant, project)) = &remote {
                 self.remote_index(
-                    services, scope, note, &document, backend, &batch, &budget, priority,
+                    services,
+                    &document,
+                    backend,
+                    grant.clone(),
+                    project.clone(),
+                    &batch,
+                    &budget,
+                    priority,
                 )
                 .await
             } else {
                 self.local(
                     services,
                     priority,
-                    batch.iter().map(|chunk| chunk.text.clone()).collect(),
+                    batch.iter().map(|group| group[0].text.clone()).collect(),
                     budget.clone(),
                 )
                 .await
@@ -326,9 +334,11 @@ impl Embedder {
                 pending = true;
                 continue;
             };
-            for (descriptor, row) in batch.into_iter().zip(rows) {
+            for (group, row) in batch.into_iter().zip(rows) {
                 if let Some(vector) = row.and_then(|row| QuantizedVector::quantize(&row).ok()) {
-                    vectors.push(vector_chunk(&document, folder, descriptor, vector));
+                    for descriptor in group {
+                        vectors.push(vector_chunk(&document, folder, descriptor, vector.clone()));
+                    }
                 } else {
                     pending = true;
                 }
@@ -337,25 +347,16 @@ impl Embedder {
         Ok((vectors, pending))
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn remote_index(
+    async fn indexing_grant(
         &self,
         services: &Services,
         scope: &HistoryScope,
         note: &SearchIndexedNote,
-        document: &Arc<ClassifiedDocument>,
-        backend: &Arc<RemoteEmbedder>,
-        batch: &[ChunkDescriptor],
-        budget: &CallBudget,
-        priority: Priority,
-    ) -> Result<Vec<Option<Vec<f32>>>, EmbeddingError> {
-        let resolver = services
-            .deps
-            .model_resolver
-            .clone()
-            .ok_or(EmbeddingError::ProviderUnavailable)?;
-        let EmbeddingBackendTarget::Remote { project, .. } = &self.target.backend else {
-            return Err(EmbeddingError::ProviderUnavailable);
+        budget: CallBudget,
+    ) -> Option<(RemoteIndexingGrant, Option<FolderRef>)> {
+        let resolver = services.deps.model_resolver.as_ref()?;
+        let EmbeddingBackendTarget::Remote { project, provider } = &self.target.backend else {
+            return None;
         };
         let actual_project = note.enclosing_project.clone().map(|folder_id| FolderRef {
             space_id: scope.space_id.clone(),
@@ -365,37 +366,51 @@ impl Embedder {
             .as_ref()
             .is_some_and(|project| Some(project) != actual_project.as_ref())
         {
-            return Ok(vec![None; batch.len()]);
+            return None;
         }
+        let grant = resolver
+            .acquire_remote_indexing_grant(
+                &services.authority,
+                scope,
+                &note.revision_actor,
+                provider,
+                actual_project.as_ref(),
+                budget,
+            )
+            .await
+            .ok()??;
+        if &grant.policy.provider != provider
+            || ClassEgressFence::provider(note.document.clone(), grant.ctx.auth(), &grant.policy)
+                .is_err()
+        {
+            return None;
+        }
+        Some((grant, actual_project))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn remote_index(
+        &self,
+        services: &Services,
+        document: &Arc<ClassifiedDocument>,
+        backend: &Arc<RemoteEmbedder>,
+        mut grant: RemoteIndexingGrant,
+        project: Option<FolderRef>,
+        batch: &[Vec<ChunkDescriptor>],
+        budget: &CallBudget,
+        priority: Priority,
+    ) -> Result<Vec<Option<Vec<f32>>>, EmbeddingError> {
         let parts = batch
             .iter()
-            .cloned()
-            .map(|chunk| ContentPart::from_chunk(document.clone(), chunk))
+            .map(|group| ContentPart::from_chunk(document.clone(), group[0].clone()))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_| EmbeddingError::InvalidModel)?;
         let backend = backend.clone();
-        let authority = services.authority.clone();
-        let scope = scope.clone();
-        let actor = note.revision_actor.clone();
         services
             .scheduler
             .submit(priority, budget.clone(), move |budget| async move {
-                let grant = resolver
-                    .acquire_remote_indexing_grant(
-                        &authority,
-                        &scope,
-                        &actor,
-                        &backend.provider,
-                        actual_project.as_ref(),
-                        budget.clone(),
-                    )
-                    .await
-                    .map_err(|_| EmbeddingError::ProviderUnavailable)?;
-                let Some(mut grant) = grant else {
-                    return Ok(vec![None; parts.len()]);
-                };
                 grant.ctx.budget = budget;
-                backend.parts(grant, actual_project, parts).await
+                backend.parts(grant, project, parts).await
             })
             .await
     }
@@ -408,7 +423,7 @@ pub(super) struct IndexNote<'a> {
     pub folder: u32,
     pub budget: CallBudget,
     pub priority: Priority,
-    pub existing: Option<&'a VectorEpoch>,
+    pub existing: &'a (dyn Fn(ContentDigest) -> Option<QuantizedVector> + Sync),
 }
 
 pub(super) fn chunks_for(

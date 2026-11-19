@@ -12,13 +12,13 @@ use notarium_core::{
     classes::{DocClass, SearchContent},
     ids::{ChatThreadId, NoteId, ThreadEntrySeq},
     model::Lifecycle,
-    ports::{Change, ChangeKind, EntityId},
+    ports::{Change, ChangeKind, EntityId, PageLimit},
     receipt::ChangeCursor,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 pub(super) fn requires_scrub(disk: &Disk, changes: &[Change]) -> Result<bool, IndexError> {
@@ -137,17 +137,21 @@ pub(super) async fn apply(
         disk.manifest.tantivy_commit = lexical.commit_id()?;
     }
     if disk.epoch.is_some() && (!updated_notes.is_empty() || !deleted.is_empty()) {
-        let target = cx
-            .services
-            .model_target(&cutoff.scope, None, disk.manifest.active_model.as_ref())
-            .await
-            .ok()
-            .flatten();
-        let embedder = match target {
-            Some(target) => cx.services.embedder(target, true).await.ok(),
-            None => None,
-        };
-        apply_vectors(cx, disk, &cutoff, updated_notes, deleted, embedder.as_ref()).await?;
+        if disk.embedder.is_none()
+            && let Some(target) = disk.manifest.active_model.clone()
+        {
+            disk.embedder = cx.services.embedder(target).await.ok().map(Arc::new);
+        }
+        let embedder = disk.embedder.clone();
+        apply_vectors(
+            cx,
+            disk,
+            &cutoff,
+            updated_notes,
+            deleted,
+            embedder.as_deref(),
+        )
+        .await?;
     }
     disk.manifest.tantivy_seq = cutoff.after;
     if !chat.removed.is_empty() {
@@ -187,13 +191,16 @@ async fn apply_vectors(
                         folder: note.folder.get(),
                         budget: cx.budget(),
                         priority: Priority::LiveNoteEdit,
-                        existing: Some(epoch),
+                        existing: &|key| epoch.find_vector(key),
                     })
                     .await?
             }
             None => (Vec::new(), true),
         };
         disk.manifest.embeddings_pending |= pending;
+        if pending {
+            disk.embedding_failures = disk.embedding_failures.wrapping_add(1);
+        }
         epoch.apply(
             cutoff.after,
             MutableOperation::Upsert {
@@ -205,6 +212,124 @@ async fn apply_vectors(
     epoch.checkpoint(cutoff.after)?;
     disk.manifest.vector_seq = Some(cutoff.after);
     Ok(())
+}
+
+pub(super) struct EmbeddingRepair {
+    after: Option<NoteId>,
+    pending: bool,
+    started_failures: u64,
+    next: tokio::time::Instant,
+    backoff: Duration,
+}
+
+impl Default for EmbeddingRepair {
+    fn default() -> Self {
+        let backoff = Duration::from_secs(1);
+        Self {
+            after: None,
+            pending: false,
+            started_failures: 0,
+            next: tokio::time::Instant::now() + backoff,
+            backoff,
+        }
+    }
+}
+
+impl EmbeddingRepair {
+    pub(super) fn next(&self) -> tokio::time::Instant {
+        self.next
+    }
+
+    fn defer(&mut self) {
+        self.next = tokio::time::Instant::now() + self.backoff;
+        self.backoff = (self.backoff * 2).min(Duration::from_secs(300));
+    }
+
+    /// Use the durable pending bit to resume a bounded pass after restart.
+    /// A failed live edit during a pass leaves the next pass armed.
+    pub(super) async fn page(
+        &mut self,
+        cx: &Context<'_>,
+        disk: &mut Disk,
+        publisher: &mut Publisher<'_>,
+    ) -> Result<(), IndexError> {
+        if disk.embedder.is_none()
+            && let Some(target) = disk.manifest.active_model.clone()
+        {
+            disk.embedder = cx.services.embedder(target).await.ok().map(Arc::new);
+        }
+        let Some(embedder) = disk.embedder.as_deref() else {
+            self.defer();
+            return Ok(());
+        };
+        if self.after.is_none() {
+            self.pending = false;
+            self.started_failures = disk.embedding_failures;
+        }
+        let cutoff = disk.cursor();
+        let page = cx
+            .services
+            .deps
+            .carriers
+            .read_searchable_notes_seed_page(
+                cx.services.authority.clone(),
+                cx.budget(),
+                cutoff.scope.clone(),
+                Some(cutoff.after),
+                self.after.clone(),
+                PageLimit::new(16)?,
+            )
+            .await?;
+        if page.cutoff != cutoff {
+            return Err(IndexError::Inconsistent);
+        }
+        let epoch = disk.epoch.as_mut().ok_or(IndexError::Inconsistent)?;
+        let mut changed = false;
+        for note in page.notes {
+            let folder = disk
+                .folders
+                .get(&note.parent_folder_id)
+                .ok_or(IndexError::Inconsistent)?;
+            let (chunks, pending) = embedder
+                .index_note(IndexNote {
+                    services: cx.services,
+                    scope: &cutoff.scope,
+                    note: &note,
+                    folder: folder.get(),
+                    budget: cx.budget(),
+                    priority: Priority::BulkImportBackfill,
+                    existing: &|key| epoch.find_vector(key),
+                })
+                .await?;
+            self.pending |= pending;
+            if !epoch.matches_note_chunks(&note.note_id, &chunks) {
+                epoch.apply(
+                    cutoff.after,
+                    MutableOperation::Upsert {
+                        note: note.note_id,
+                        chunks,
+                    },
+                )?;
+                changed = true;
+            }
+        }
+        self.after = page.next_after;
+        if self.after.is_none() {
+            let pending = self.pending || self.started_failures != disk.embedding_failures;
+            changed |= pending != disk.manifest.embeddings_pending;
+            disk.manifest.embeddings_pending = pending;
+            self.defer();
+        } else {
+            self.next = tokio::time::Instant::now() + Duration::from_millis(25);
+        }
+        if changed {
+            epoch.checkpoint(cutoff.after)?;
+            disk.manifest.vector_seq = Some(cutoff.after);
+            disk.layout.publish_search(&disk.manifest)?;
+            publisher.publish(disk);
+        }
+        Ok(())
+    }
 }
 
 pub(super) async fn maintain_vectors(

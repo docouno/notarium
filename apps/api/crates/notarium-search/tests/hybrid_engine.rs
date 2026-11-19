@@ -741,6 +741,7 @@ async fn sqlite_hybrid_seed_causal_boundaries_and_scrub() {
     hybrid_support::remote::lexical_fallback(store.clone(), data.data_root()).await;
     chat_candidate_visibility(store.clone(), data.data_root()).await;
     reader_capacity(store.clone(), data.data_root()).await;
+    hybrid_support::remote::model_epochs_and_repair(store.clone(), data.data_root()).await;
     purge_and_rebind(store, data.data_root()).await;
     runtime.shutdown().await.unwrap();
 }

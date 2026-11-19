@@ -1,5 +1,5 @@
 use super::*;
-use crate::layout::SearchLayout;
+use crate::layout::{SearchLayout, VectorModel};
 use croaring::Bitmap;
 use notarium_core::{
     auth::{ResourceFacts, Space, SpaceKind, SpaceLifecycle},
@@ -430,7 +430,9 @@ fn exact_ties_survive_compaction_and_the_epoch_rejects_mixed_dimensions() {
         incarnation: HistoryIncarnation::from_bytes([1; 16]),
     };
     let layout = Arc::new(SearchLayout::open(&DataRoot::new(&scratch.0), scope).unwrap());
-    let directory = layout.model_epoch(&model()).unwrap();
+    let directory = layout
+        .model_epoch(&VectorModel::local(model(), 64))
+        .unwrap();
     let mut epoch = VectorEpoch::open(layout.clone(), model(), 64).unwrap();
     let first = fixture(1, 64);
     let mut second = fixture(2, 64);
@@ -496,7 +498,9 @@ fn epoch_restarts_compacts_and_scrubs_obsolete_carriers() {
         incarnation: HistoryIncarnation::from_bytes([1; 16]),
     };
     let layout = Arc::new(SearchLayout::open(&DataRoot::new(&scratch.0), scope).unwrap());
-    let epoch_path = layout.model_epoch(&model()).unwrap();
+    let epoch_path = layout
+        .model_epoch(&VectorModel::local(model(), 100))
+        .unwrap();
     let mut epoch = VectorEpoch::open(layout.clone(), model(), 100).unwrap();
     let seq = |seq| SpaceSeq::new(seq).unwrap();
     let mut builder = SegmentBuilder::new(&model(), 100).unwrap();

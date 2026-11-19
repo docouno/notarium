@@ -1,5 +1,6 @@
 //! Read and model-selection contracts for the search engine.
 
+use crate::layout::VectorModel;
 pub use notarium_canonical::changes::search::{
     SearchDocumentTarget, SearchIndexedNote, SearchNotesSeedPage, SearchOverlayNote,
 };
@@ -13,9 +14,10 @@ use notarium_core::{
     model::{FolderRef, HistoryScope},
     ports::{CallBudget, PageLimit, PortFuture, ServiceAuthority, SpaceContext},
 };
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-#[derive(Clone)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ResolvedEmbeddingTarget {
     pub model: ModelProfileId,
     pub dimension: u32,
@@ -23,7 +25,21 @@ pub struct ResolvedEmbeddingTarget {
     pub backend: EmbeddingBackendTarget,
 }
 
-#[derive(Clone)]
+impl ResolvedEmbeddingTarget {
+    pub(crate) fn vector_model(&self) -> VectorModel {
+        VectorModel {
+            profile: self.model.clone(),
+            provider: match &self.backend {
+                EmbeddingBackendTarget::LocalOnnx => None,
+                EmbeddingBackendTarget::Remote { provider, .. } => Some(provider.clone()),
+            },
+            dimension: self.dimension,
+            max_input_tokens: self.max_input_tokens,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum EmbeddingBackendTarget {
     LocalOnnx,
     Remote {
@@ -32,6 +48,7 @@ pub enum EmbeddingBackendTarget {
     },
 }
 
+#[derive(Clone)]
 pub struct RemoteIndexingGrant {
     pub ctx: SpaceContext,
     pub policy: ProviderPolicy,

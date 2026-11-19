@@ -1,11 +1,11 @@
 use super::{Context, Disk, IndexError, Publisher};
 use crate::{
     embed::Priority,
-    layout::{FolderDictionary, FolderOrd, SearchLayout, SearchManifest, index_name},
+    layout::{FolderDictionary, FolderOrd, SearchLayout, SearchManifest, VectorModel, index_name},
     lexical::{LexicalIndex, TOKENIZER_VERSION, Update},
     model::{Embedder, IndexNote},
-    ports::{ResolvedEmbeddingTarget, SearchIndexedNote},
-    vector::{SegmentBuilder, VectorEpoch},
+    ports::SearchIndexedNote,
+    vector::{SegmentBuilder, VectorChunk, VectorEpoch},
 };
 use notarium_canonical::chats::search::HydratedChatHit;
 use notarium_core::{
@@ -15,35 +15,37 @@ use notarium_core::{
     ports::PageLimit,
     receipt::ChangeCursor,
 };
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
+
+pub(super) async fn scrub(
+    cx: &Context<'_>,
+    publisher: &mut Publisher<'_>,
+    layout: &SearchLayout,
+) -> Result<(), IndexError> {
+    publisher.replace(None);
+    publisher.drain().await;
+    // An absent manifest forces cleanup before reopening either index.
+    layout.invalidate_search()?;
+    layout.remove_vector_epochs(None)?;
+    for previous in layout.index_generations()? {
+        remove_generation(cx, layout, previous)?;
+    }
+    Ok(())
+}
 
 pub(super) async fn seed(
     cx: &Context<'_>,
-    publisher: &mut Publisher<'_>,
     layout: Arc<SearchLayout>,
     cutoff: &ChangeCursor,
-    scrub: bool,
-    mut reusable: Option<VectorEpoch>,
+    prior: Option<&Disk>,
 ) -> Result<Disk, IndexError> {
-    let mut generations = layout.index_generations()?;
+    let generations = layout.index_generations()?;
     let generation = generations
         .last()
         .copied()
         .unwrap_or(0)
         .checked_add(1)
         .ok_or(IndexError::Inconsistent)?;
-    if scrub {
-        drop(reusable.take());
-        publisher.replace(None);
-        publisher.drain().await;
-        // On restart a missing manifest forces cleanup before reopening either index.
-        layout.invalidate_search()?;
-        layout.remove_vector_epochs(None)?;
-        for previous in generations.drain(..) {
-            remove_generation(cx, &layout, previous)?;
-        }
-    }
-
     let space = cx
         .services
         .deps
@@ -56,50 +58,50 @@ pub(super) async fn seed(
     folders.insert(space.root_folder_id)?;
     save_new_folders(&layout, &folders, before)?;
 
-    let target = cx
-        .services
-        .model_target(&cutoff.scope, None, None)
-        .await
-        .ok()
-        .flatten();
+    let target = match cx.services.model_target(&cutoff.scope, None, None).await {
+        Ok(target) => target,
+        Err(error) if prior.is_some() => return Err(error.into()),
+        Err(_) => None,
+    };
+    let model = target.as_ref().map(|target| target.vector_model());
+    if let Some(model) = &model
+        && prior
+            .and_then(|disk| disk.epoch.as_ref())
+            .is_some_and(|epoch| epoch.matches_model(model))
+    {
+        // The selection changed back before staging began.
+        return Err(IndexError::Inconsistent);
+    }
+    let embedder = match &target {
+        Some(target) => match cx.services.embedder(target.clone()).await {
+            Ok(embedder) => Some(Arc::new(embedder)),
+            Err(error) if prior.and_then(|disk| disk.epoch.as_ref()).is_some() => {
+                return Err(error.into());
+            }
+            Err(_) => None,
+        },
+        None => None,
+    };
     let path = layout.create_index_generation(generation)?;
     let result = async {
         let lexical = cx.services.readers.create(&path)?;
-        let embedder = match &target {
-            Some(target) => cx.services.embedder(target.clone(), true).await.ok(),
-            None => None,
-        };
-        let active = target.as_ref().map(|target| &target.model);
-        if active.is_some() && !scrub {
-            // A clean lexical generation is still being built. Keep the last
-            // BM25 cut readable, and drain every generation pin before unlinking
-            // any epoch that could have been referenced by it.
-            publisher.without_vectors().await;
-        }
-        let mut vectors = match &embedder {
-            Some(embedder) => Some(SeedVectors::new(&embedder.target, reusable)?),
-            None => {
-                drop(reusable);
-                None
-            }
-        };
+        let mut vectors = embedder
+            .as_ref()
+            .zip(model.as_ref())
+            .map(|(_, model)| SeedVectors::new(model.clone()))
+            .transpose()?;
         seed_notes(
             cx,
             &layout,
             &lexical,
             &mut folders,
             cutoff,
-            embedder.as_ref().zip(vectors.as_mut()),
+            embedder.as_deref().zip(vectors.as_mut()),
         )
         .await?;
         seed_chats(cx, &layout, &lexical, &mut folders, cutoff).await?;
         lexical.commit_seed(&cx.services.writers)?;
-        // Only the current canonical carriers contribute rows to the new
-        // generation. Release old mappings before removing their directories.
-        if let Some(vectors) = &mut vectors {
-            drop(vectors.reusable.take());
-        }
-        if let Some(model) = active {
+        if let Some(model) = &model {
             layout.remove_model_epoch(model)?;
         }
         let (epoch, pending) = match vectors {
@@ -107,7 +109,7 @@ pub(super) async fn seed(
                 let (epoch, pending) = vectors.finish(layout.clone(), cutoff.after).await?;
                 (Some(epoch), pending)
             }
-            None => (None, active.is_some()),
+            None => (None, target.is_some()),
         };
         let manifest = SearchManifest {
             scope: cutoff.scope.clone(),
@@ -115,7 +117,7 @@ pub(super) async fn seed(
             tantivy_commit: lexical.commit_id()?,
             active_index_dir: index_name(generation),
             tokenizer_version: TOKENIZER_VERSION,
-            active_model: active.cloned(),
+            active_model: target,
             vector_seq: epoch.as_ref().map(|_| cutoff.after),
             embeddings_pending: pending,
         };
@@ -125,6 +127,8 @@ pub(super) async fn seed(
             folders: Arc::new(folders),
             lexical: Some(lexical),
             epoch,
+            embedder,
+            embedding_failures: 0,
         })
     }
     .await;
@@ -136,19 +140,38 @@ pub(super) async fn seed(
                 return Err(IndexError::Inconsistent);
             }
             layout.remove_index_generation(generation)?;
+            if let Some(model) = &model {
+                layout.remove_model_epoch(model)?;
+            }
             return Err(error);
         }
     };
     // A crash before this point can only cause a new seed. After publishing,
     // startup removes all unreferenced generations before exposing the cut.
     disk.layout.publish_search(&disk.manifest)?;
-    publisher.publish(&disk);
-    publisher.drain().await;
-    for previous in generations {
-        remove_generation(cx, &layout, previous)?;
-    }
-    layout.remove_vector_epochs(disk.manifest.active_model.as_ref())?;
     Ok(disk)
+}
+
+pub(super) async fn publish_seed(
+    cx: &Context<'_>,
+    publisher: &mut Publisher<'_>,
+    disk: &Disk,
+) -> Result<(), IndexError> {
+    publisher.publish(disk);
+    publisher.drain().await;
+    let active = disk.manifest.generation()?;
+    for previous in disk.layout.index_generations()? {
+        if previous != active {
+            remove_generation(cx, &disk.layout, previous)?;
+        }
+    }
+    let model = disk
+        .manifest
+        .active_model
+        .as_ref()
+        .map(|target| target.vector_model());
+    disk.layout.remove_vector_epochs(model.as_ref())?;
+    Ok(())
 }
 
 async fn seed_notes(
@@ -179,10 +202,17 @@ async fn seed_notes(
         }
         let before = folders.len();
         let mut prepared = Vec::new();
-        let mut pending_vectors = Vec::new();
+        let mut pending_vectors: Vec<VectorChunk> = Vec::new();
+        let mut page_keys = HashMap::<_, usize>::new();
         for note in page.notes {
             if let Some((content, folder)) = prepare_note(cx, folders, &note)? {
                 if let Some((embedder, builder)) = vectors.as_mut() {
+                    let existing = |key| {
+                        page_keys
+                            .get(&key)
+                            .map(|&slot| pending_vectors[slot].vector.clone())
+                            .or_else(|| builder.builder.as_ref()?.find_vector(key).cloned())
+                    };
                     let (for_note, pending) = embedder
                         .index_note(IndexNote {
                             services: cx.services,
@@ -191,10 +221,15 @@ async fn seed_notes(
                             folder: folder.get(),
                             budget: cx.budget(),
                             priority: Priority::BulkImportBackfill,
-                            existing: builder.reusable.as_ref(),
+                            existing: &existing,
                         })
                         .await?;
                     builder.pending |= pending;
+                    for (position, chunk) in for_note.iter().enumerate() {
+                        page_keys
+                            .entry(chunk.metadata.key)
+                            .or_insert(pending_vectors.len() + position);
+                    }
                     pending_vectors.extend(for_note);
                 }
                 prepared.push((content, note.title, folder));
@@ -361,24 +396,16 @@ pub(super) fn remove_generation(
 }
 
 struct SeedVectors {
-    model: notarium_core::ids::ModelProfileId,
-    dimension: usize,
+    model: VectorModel,
     builder: Option<SegmentBuilder>,
-    reusable: Option<VectorEpoch>,
     pending: bool,
 }
 
 impl SeedVectors {
-    fn new(
-        target: &ResolvedEmbeddingTarget,
-        reusable: Option<VectorEpoch>,
-    ) -> Result<Self, IndexError> {
-        let dimension = target.dimension as usize;
+    fn new(model: VectorModel) -> Result<Self, IndexError> {
         Ok(Self {
-            model: target.model.clone(),
-            dimension,
-            builder: Some(SegmentBuilder::new(&target.model, dimension)?),
-            reusable: reusable.filter(|epoch| epoch.matches_profile(&target.model, dimension)),
+            builder: Some(SegmentBuilder::for_model(&model)?),
+            model,
             pending: false,
         })
     }
@@ -407,7 +434,7 @@ impl SeedVectors {
         seq: SpaceSeq,
     ) -> Result<(VectorEpoch, bool), IndexError> {
         tokio::task::spawn_blocking(move || {
-            let mut epoch = VectorEpoch::open(layout, self.model, self.dimension)?;
+            let mut epoch = VectorEpoch::open_model(layout, self.model)?;
             epoch.seed(self.builder.ok_or(IndexError::Inconsistent)?, seq)?;
             Ok((epoch, self.pending))
         })

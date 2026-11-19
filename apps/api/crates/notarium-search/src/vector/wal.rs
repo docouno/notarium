@@ -118,6 +118,11 @@ impl MutableBuffer {
     pub fn supersedes(&self, note: &NoteId) -> bool {
         self.entries.contains_key(note)
     }
+    pub(super) fn chunks_for_note(&self, note: &NoteId) -> Option<&[VectorChunk]> {
+        self.entries
+            .get(note)
+            .map(|record| record.chunks.as_slice())
+    }
     pub fn notes(&self) -> impl Iterator<Item = &NoteId> {
         self.entries.keys()
     }

@@ -177,7 +177,7 @@ impl SearchEngine {
         let fallback = RemoteConservativeTokenizerBudget::lexical_fallback();
         let tokenizer = vectors
             .embedder
-            .as_ref()
+            .as_deref()
             .map(Embedder::tokenizer)
             .unwrap_or(&fallback);
         let (hits, notes_truncated) = self
@@ -237,7 +237,7 @@ impl SearchEngine {
             .remaining
             .min(self.services.config.query_embedding_budget);
         let (embedder, vector) = match tokio::time::timeout(max, async {
-            let target = self
+            let requested = self
                 .services
                 .model_target(
                     ctx.scope(),
@@ -246,6 +246,22 @@ impl SearchEngine {
                 )
                 .await?
                 .ok_or(EmbeddingError::ModelUnavailable)?;
+            let Some(indexed) = &state.vectors else {
+                handle.wake.notify_one();
+                return Ok(None);
+            };
+            let target = if indexed.manifest().model == requested.vector_model() {
+                &requested
+            } else {
+                handle.wake.notify_one();
+                if query.model.is_some() {
+                    return Ok(None);
+                }
+                state
+                    .active_model
+                    .as_ref()
+                    .ok_or(EmbeddingError::ModelUnavailable)?
+            };
             if let EmbeddingBackendTarget::Remote { project, .. } = &target.backend
                 && (ctx.auth().taint().is_tainted()
                     || project
@@ -254,20 +270,10 @@ impl SearchEngine {
             {
                 return Err(EmbeddingError::ProviderUnavailable);
             }
-            // The indexing side owns native session initialization, so
-            // timed-out queries cannot start duplicate blocking loads.
-            let embedder = self
-                .services
-                .embedder(target.clone(), false)
-                .await
-                .inspect_err(|_| handle.wake.notify_one())?;
-            if !state.vectors.as_ref().is_some_and(|vectors| {
-                let indexed = vectors.manifest();
-                indexed.model_id == target.model && indexed.dimension == target.dimension
-            }) {
+            let Some(embedder) = state.embedder.clone() else {
                 handle.wake.notify_one();
-                return Ok(None);
-            }
+                return Err(EmbeddingError::ModelUnavailable);
+            };
             let input = query.text.clone();
             let mut context = ctx.clone();
             context.budget = clock
@@ -364,7 +370,7 @@ struct VectorRequest<'a> {
 #[derive(Default)]
 struct VectorCandidates {
     hits: Vec<VectorHit>,
-    embedder: Option<Embedder>,
+    embedder: Option<Arc<Embedder>>,
     degraded: Option<SearchDegradation>,
 }
 

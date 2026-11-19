@@ -1,5 +1,6 @@
 //! Space-local search generations and stable folder ordinals.
 
+use crate::ports::ResolvedEmbeddingTarget;
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt, OpenOptionsMaybeDirExt};
 use cap_std::{
     ambient_authority,
@@ -7,7 +8,7 @@ use cap_std::{
 };
 use notarium_core::{
     epoch::{DataRoot, SearchIndexKind},
-    ids::{FolderId, ModelProfileId, SpaceSeq},
+    ids::{FolderId, ModelProfileId, ProviderResourceId, SpaceSeq},
     model::HistoryScope,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -142,7 +143,7 @@ pub struct SearchManifest {
     pub tantivy_commit: u64,
     pub active_index_dir: String,
     pub tokenizer_version: u32,
-    pub active_model: Option<ModelProfileId>,
+    pub active_model: Option<ResolvedEmbeddingTarget>,
     pub vector_seq: Option<SpaceSeq>,
     pub embeddings_pending: bool,
 }
@@ -152,19 +153,52 @@ impl SearchManifest {
     }
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub struct VectorModel {
+    pub profile: ModelProfileId,
+    pub provider: Option<ProviderResourceId>,
+    pub dimension: u32,
+    pub max_input_tokens: u32,
+}
+
+impl VectorModel {
+    pub fn local(profile: ModelProfileId, dimension: u32) -> Self {
+        Self {
+            profile,
+            provider: None,
+            dimension,
+            max_input_tokens: 512,
+        }
+    }
+
+    pub(crate) fn hash(&self) -> [u8; 32] {
+        match &self.provider {
+            None => crate::vector::model_hash(&self.profile),
+            Some(provider) => {
+                let mut hash =
+                    blake3::Hasher::new_derive_key("notarium/search/remote-vector-model/v1");
+                hash.update(provider.as_str().as_bytes());
+                hash.update(&[0]);
+                hash.update(self.profile.as_str().as_bytes());
+                *hash.finalize().as_bytes()
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EpochManifest {
     pub scope: HistoryScope,
-    pub model_id: ModelProfileId,
-    pub dimension: u32,
+    pub model: VectorModel,
     pub vector_seq: SpaceSeq,
     pub active_segments: Vec<u64>,
     pub complete_backfill: bool,
 }
 impl EpochManifest {
     fn validate(&self) -> Result<(), LayoutError> {
-        if !(64..=4096).contains(&self.dimension)
+        if !(64..=4096).contains(&self.model.dimension)
+            || self.model.max_input_tokens == 0
             || self.active_segments.first() == Some(&0)
             || self
                 .active_segments
@@ -239,10 +273,7 @@ impl SearchLayout {
 
     /// Clear all derived copies when a purge has an erased or unknown identity.
     /// The indexing owner drains any published mmap snapshots first.
-    pub fn remove_vector_epochs(
-        &self,
-        preserve: Option<&ModelProfileId>,
-    ) -> Result<(), LayoutError> {
+    pub fn remove_vector_epochs(&self, preserve: Option<&VectorModel>) -> Result<(), LayoutError> {
         let preserve = preserve.map(model_epoch_name);
         for entry in self.vector.entries()? {
             let entry = entry?;
@@ -264,7 +295,7 @@ impl SearchLayout {
         Ok(())
     }
 
-    pub fn remove_model_epoch(&self, model: &ModelProfileId) -> Result<(), LayoutError> {
+    pub fn remove_model_epoch(&self, model: &VectorModel) -> Result<(), LayoutError> {
         let name = model_epoch_name(model);
         match self.vector.open_dir_nofollow(&name) {
             Ok(_) => self.vector.remove_dir_all(&name)?,
@@ -330,7 +361,7 @@ impl SearchLayout {
         atomic_file(&self.tantivy, FOLDER_DICTIONARY, &dict.encode()?)
     }
 
-    pub fn model_epoch(&self, model: &ModelProfileId) -> Result<PathBuf, LayoutError> {
+    pub fn model_epoch(&self, model: &VectorModel) -> Result<PathBuf, LayoutError> {
         let name = model_epoch_name(model);
         check_regular_entries(&open_or_create(&self.vector, &name)?)?;
         Ok(self.vector_path.join(name))
@@ -338,7 +369,7 @@ impl SearchLayout {
 
     pub fn epoch_manifest(
         &self,
-        model: &ModelProfileId,
+        model: &VectorModel,
     ) -> Result<Option<EpochManifest>, LayoutError> {
         let dir = match self.vector.open_dir_nofollow(model_epoch_name(model)) {
             Ok(dir) => dir,
@@ -350,7 +381,7 @@ impl SearchLayout {
             return Ok(None);
         };
         self.check_scope(&manifest.scope)?;
-        if &manifest.model_id != model {
+        if &manifest.model != model {
             return Err(LayoutError::Corrupt);
         }
         manifest.validate()?;
@@ -361,7 +392,7 @@ impl SearchLayout {
     pub fn publish_epoch(&self, manifest: &EpochManifest) -> Result<(), LayoutError> {
         self.check_scope(&manifest.scope)?;
         manifest.validate()?;
-        let dir = open_or_create(&self.vector, &model_epoch_name(&manifest.model_id))?;
+        let dir = open_or_create(&self.vector, &model_epoch_name(&manifest.model))?;
         check_regular_entries(&dir)?;
         write_manifest(&dir, EPOCH_MANIFEST, manifest)
     }
@@ -387,8 +418,12 @@ fn parse_index_name(name: &str) -> Result<u64, LayoutError> {
     Ok(generation)
 }
 
-pub fn model_epoch_name(model: &ModelProfileId) -> String {
-    blake3::hash(model.as_str().as_bytes()).to_hex()[..16].to_owned()
+pub fn model_epoch_name(model: &VectorModel) -> String {
+    let mut hash = blake3::Hasher::new_derive_key("notarium/search/vector-epoch/v1");
+    hash.update(&model.hash());
+    hash.update(&model.dimension.to_le_bytes());
+    hash.update(&model.max_input_tokens.to_le_bytes());
+    hash.finalize().to_hex()[..16].to_owned()
 }
 
 fn check_regular_entries(dir: &Dir) -> Result<(), LayoutError> {
@@ -570,25 +605,24 @@ mod tests {
         let root = DataRoot::new(&scratch.0);
         let scope = scope();
         let layout = SearchLayout::open(&root, scope.clone()).unwrap();
-        let model_id = ModelProfileId::from_bytes([1; 16]);
+        let model = VectorModel::local(ModelProfileId::from_bytes([1; 16]), 384);
         let manifest = EpochManifest {
             scope: scope.clone(),
-            model_id: model_id.clone(),
-            dimension: 384,
+            model: model.clone(),
             vector_seq: SpaceSeq::new(3).unwrap(),
             active_segments: vec![1, 3],
             complete_backfill: true,
         };
-        let epoch = layout.model_epoch(&model_id).unwrap();
+        let epoch = layout.model_epoch(&model).unwrap();
         layout.publish_epoch(&manifest).unwrap();
-        assert_eq!(layout.epoch_manifest(&model_id).unwrap(), Some(manifest));
+        assert_eq!(layout.epoch_manifest(&model).unwrap(), Some(manifest));
         let file = epoch.join(EPOCH_MANIFEST);
         let mut bytes = fs::read(&file).unwrap();
         let pos = bytes.windows(3).position(|word| word == b"384").unwrap();
         bytes[pos] = b'2';
         fs::write(file, bytes).unwrap();
         assert!(matches!(
-            layout.epoch_manifest(&model_id),
+            layout.epoch_manifest(&model),
             Err(LayoutError::Corrupt)
         ));
 

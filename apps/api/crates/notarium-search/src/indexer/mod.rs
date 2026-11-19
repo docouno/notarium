@@ -22,7 +22,7 @@ use std::{
         Arc, Weak,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::time::{MissedTickBehavior, interval, sleep};
 
@@ -38,6 +38,8 @@ enum IndexError {
     Lexical(#[from] LexicalError),
     #[error("vector update failed")]
     Vector(#[from] VectorError),
+    #[error("embedding model unavailable")]
+    Embedding(#[from] crate::embed::EmbeddingError),
     #[error("index checkpoints disagree")]
     Inconsistent,
 }
@@ -96,6 +98,8 @@ struct Disk {
     folders: Arc<FolderDictionary>,
     lexical: Option<Arc<LexicalIndex>>,
     epoch: Option<VectorEpoch>,
+    embedder: Option<Arc<crate::model::Embedder>>,
+    embedding_failures: u64,
 }
 
 impl Disk {
@@ -104,6 +108,10 @@ impl Disk {
             scope: self.manifest.scope.clone(),
             after: self.manifest.tantivy_seq,
         }
+    }
+
+    fn needs_embedding_repair(&self) -> bool {
+        self.epoch.is_some() && self.manifest.embeddings_pending
     }
 
     fn resume_reader(&mut self, cx: &Context<'_>) -> Result<bool, IndexError> {
@@ -144,28 +152,10 @@ impl Publisher<'_> {
             searcher: lexical.searcher(),
             folders: disk.folders.clone(),
             vectors: disk.epoch.as_ref().map(|epoch| Arc::new(epoch.snapshot())),
+            active_model: disk.manifest.active_model.clone(),
+            embedder: disk.embedder.clone(),
             embeddings_pending: disk.manifest.embeddings_pending,
         })));
-    }
-
-    async fn without_vectors(&mut self) {
-        if let Some(active) = self
-            .handle
-            .published
-            .load_full()
-            .filter(|active| active.vectors.is_some())
-        {
-            self.replace(Some(Arc::new(Published {
-                scope: active.scope.clone(),
-                seq: active.seq,
-                lexical: active.lexical.clone(),
-                searcher: active.searcher.clone(),
-                folders: active.folders.clone(),
-                vectors: None,
-                embeddings_pending: true,
-            })));
-        }
-        self.drain().await;
     }
 
     async fn drain(&mut self) {
@@ -243,6 +233,8 @@ async fn consume(
     }
     let mut ticker = interval(Duration::from_secs(1));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut next_model_check = Instant::now();
+    let mut repair = update::EmbeddingRepair::default();
     loop {
         let event = {
             let resume = subscription.processed().clone();
@@ -254,6 +246,12 @@ async fn consume(
                     () = cx.handle.stop.cancelled() => return Ok(None),
                     notice = &mut next => notice?.ok_or(IndexError::Inconsistent)?,
                     () = cx.handle.wake.notified() => ChangeNotice::Lagged { resume },
+                    _ = tokio::time::sleep_until(repair.next()), if disk.as_ref().is_some_and(Disk::needs_embedding_repair) => {
+                        if let Some(current) = &mut disk {
+                            repair.page(cx, current, publisher).await?;
+                        }
+                        continue;
+                    }
                     _ = ticker.tick() => {
                         // Resolving a consumed ring signal can require a durable read.
                         // Keep that read alive across idle vector maintenance.
@@ -315,38 +313,51 @@ async fn consume(
             }
         }
         if seed_at.is_none()
-            && let Some(current) = &disk
+            && Instant::now() >= next_model_check
+            && let Some(current) = &mut disk
             && let Ok(selected) = cx.services.model_target(&scope, None, None).await
         {
-            let selection_changed = current.manifest.active_model.as_ref()
-                != selected.as_ref().map(|target| &target.model);
+            if current.epoch.is_some()
+                && current.embedder.is_none()
+                && let Some(active) = current.manifest.active_model.clone()
+            {
+                current.embedder = cx.services.embedder(active).await.ok().map(Arc::new);
+                publisher.publish(current);
+            }
+            let selection_changed = current
+                .manifest
+                .active_model
+                .as_ref()
+                .map(|target| target.vector_model())
+                != selected.as_ref().map(|target| target.vector_model());
             let backfill = if !selection_changed
                 && current.epoch.is_none()
-                && let Some(target) = selected
+                && let Some(target) = selected.as_ref()
             {
-                cx.services.embedder(target, true).await.is_ok()
+                cx.services.embedder(target.clone()).await.is_ok()
             } else {
                 false
             };
             if selection_changed || backfill {
                 seed_at = Some(target.clone());
+            } else if current.manifest.active_model != selected {
+                current.manifest.active_model = selected;
+                current.layout.publish_search(&current.manifest)?;
+                publisher.publish(current);
             }
         }
         if let Some(mut cutoff) = seed_at {
-            let mut reusable = disk.take().and_then(|prior| prior.epoch);
             loop {
-                match build::seed(
-                    cx,
-                    publisher,
-                    layout.clone(),
-                    &cutoff,
-                    scrub,
-                    reusable.take(),
-                )
-                .await
-                {
+                if scrub {
+                    drop(disk.take());
+                    build::scrub(cx, publisher, &layout).await?;
+                }
+                match build::seed(cx, layout.clone(), &cutoff, disk.as_ref()).await {
                     Ok(seeded) => {
-                        disk = Some(seeded);
+                        drop(disk.replace(seeded));
+                        repair = update::EmbeddingRepair::default();
+                        build::publish_seed(cx, publisher, disk.as_ref().expect("seed installed"))
+                            .await?;
                         break;
                     }
                     Err(error) if error.requires_reseed() => {
@@ -360,6 +371,11 @@ async fn consume(
                         cutoff = latest;
                         rebind = true;
                         scrub = true;
+                    }
+                    Err(error) if disk.is_some() => {
+                        tracing::warn!(kind = %error, "search model replacement will retry");
+                        next_model_check = Instant::now() + Duration::from_secs(1);
+                        break;
                     }
                     Err(error) => return Err(error),
                 }
@@ -394,11 +410,11 @@ fn open_disk(cx: &Context<'_>, layout: Arc<SearchLayout>) -> Result<Option<Disk>
         }
         let epoch = match (&manifest.active_model, manifest.vector_seq) {
             (Some(model), Some(seq)) if seq <= manifest.tantivy_seq => {
+                let model = model.vector_model();
                 let epoch = layout
-                    .epoch_manifest(model)?
+                    .epoch_manifest(&model)?
                     .ok_or(IndexError::Inconsistent)?;
-                let opened =
-                    VectorEpoch::open(layout.clone(), model.clone(), epoch.dimension as usize)?;
+                let opened = VectorEpoch::open_model(layout.clone(), model)?;
                 if !opened.is_checkpointed(seq) || !epoch.complete_backfill {
                     return Err(IndexError::Inconsistent);
                 }
@@ -415,6 +431,8 @@ fn open_disk(cx: &Context<'_>, layout: Arc<SearchLayout>) -> Result<Option<Disk>
             folders,
             lexical: Some(lexical),
             epoch,
+            embedder: None,
+            embedding_failures: 0,
         }))
     })();
     let disk = match opened {

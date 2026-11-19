@@ -84,6 +84,8 @@ pub(super) struct Published {
     pub searcher: tantivy::Searcher,
     pub folders: Arc<FolderDictionary>,
     pub vectors: Option<Arc<VectorSnapshot>>,
+    pub active_model: Option<crate::ports::ResolvedEmbeddingTarget>,
+    pub embedder: Option<Arc<crate::model::Embedder>>,
     pub embeddings_pending: bool,
 }
 

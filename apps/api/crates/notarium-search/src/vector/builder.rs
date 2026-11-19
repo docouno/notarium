@@ -3,8 +3,9 @@
 
 use super::{
     M, M0, MAX_DIMENSION, MIN_DIMENSION, MmapSegment, QuantizedVector, VectorChunk, VectorError,
-    format::*, hnsw::BuilderGraph, model_hash,
+    format::*, hnsw::BuilderGraph,
 };
+use crate::layout::VectorModel;
 use cap_fs_ext::OpenOptionsMaybeDirExt;
 use cap_std::{
     ambient_authority,
@@ -30,13 +31,19 @@ pub struct SegmentBuilder {
 
 impl SegmentBuilder {
     pub fn new(model: &ModelProfileId, dimension: usize) -> Result<Self, VectorError> {
+        let dimension = u32::try_from(dimension).map_err(|_| VectorError::InvalidDimension)?;
+        Self::for_model(&VectorModel::local(model.clone(), dimension))
+    }
+
+    pub(crate) fn for_model(model: &VectorModel) -> Result<Self, VectorError> {
+        let dimension = model.dimension as usize;
         if !(MIN_DIMENSION..=MAX_DIMENSION).contains(&dimension) {
             return Err(VectorError::InvalidDimension);
         }
         Ok(Self {
             graph: BuilderGraph::new(),
             dimension,
-            hash: model_hash(model),
+            hash: model.hash(),
             keys: HashMap::new(),
         })
     }
@@ -83,8 +90,8 @@ impl SegmentBuilder {
         Some(&self.graph.nodes[slot].chunk.vector)
     }
 
-    pub(super) fn matches(&self, model: &ModelProfileId, dimension: usize) -> bool {
-        self.dimension == dimension && self.hash == model_hash(model)
+    pub(super) fn matches(&self, model: &VectorModel) -> bool {
+        self.dimension == model.dimension as usize && self.hash == model.hash()
     }
 
     pub fn len(&self) -> usize {
