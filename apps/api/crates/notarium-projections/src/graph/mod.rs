@@ -1,6 +1,6 @@
 use std::{
     cmp::Reverse,
-    collections::{BTreeMap, BinaryHeap},
+    collections::{BTreeMap, BinaryHeap, HashMap},
 };
 
 use croaring::Bitmap;
@@ -22,7 +22,8 @@ pub(crate) use leiden::LeidenSnapshot;
 pub(crate) trait GraphAdjacency {
     fn node_count(&self) -> u32;
     fn lookup(&self, note: &NoteId) -> Option<u32>;
-    fn note_id(&self, node: u32) -> Option<&NoteId>;
+    fn note_id(&self, node: u32) -> Option<NoteId>;
+    fn note_id_str(&self, node: u32) -> Option<&str>;
     fn outgoing(&self, node: u32) -> impl Iterator<Item = u32> + Send + '_;
     fn incoming(&self, node: u32) -> impl Iterator<Item = u32> + Send + '_;
     fn cluster(&self, node: u32) -> Option<ClusterId>;
@@ -44,8 +45,12 @@ impl GraphAdjacency for IndexView {
         self.dense_id(note)
     }
 
-    fn note_id(&self, node: u32) -> Option<&NoteId> {
+    fn note_id(&self, node: u32) -> Option<NoteId> {
         self.note_id(self.dense(node)).ok()
+    }
+
+    fn note_id_str(&self, node: u32) -> Option<&str> {
+        self.note_id_str(node)
     }
 
     fn outgoing(&self, node: u32) -> impl Iterator<Item = u32> + Send + '_ {
@@ -86,8 +91,12 @@ impl GraphAdjacency for SettledGraph<'_> {
         self.index.dense_id(note)
     }
 
-    fn note_id(&self, node: u32) -> Option<&NoteId> {
+    fn note_id(&self, node: u32) -> Option<NoteId> {
         GraphAdjacency::note_id(self.index, node)
+    }
+
+    fn note_id_str(&self, node: u32) -> Option<&str> {
+        self.index.note_id_str(node)
     }
 
     fn outgoing(&self, node: u32) -> impl Iterator<Item = u32> + Send + '_ {
@@ -132,8 +141,14 @@ impl GraphAdjacency for GraphBuild<'_> {
             .map(|index| index as u32)
     }
 
-    fn note_id(&self, node: u32) -> Option<&NoteId> {
-        self.notes.get(node as usize).and_then(Option::as_ref)
+    fn note_id(&self, node: u32) -> Option<NoteId> {
+        self.notes.get(node as usize).and_then(Clone::clone)
+    }
+
+    fn note_id_str(&self, node: u32) -> Option<&str> {
+        self.notes
+            .get(node as usize)
+            .and_then(|entry| entry.as_ref().map(NoteId::as_str))
     }
 
     fn outgoing(&self, node: u32) -> impl Iterator<Item = u32> + Send + '_ {
@@ -169,27 +184,26 @@ pub(crate) struct GraphPlan {
     pub hydration: Vec<(usize, u32)>,
 }
 
-/// Plan a response without reading card payloads. The caller computes current
-/// lifecycle/authorization and field filters and holds their publication guard
-/// through planning, hydration and delivery.
+/// Plan a response without reading card payloads. `authorized` contains ONLY
+/// active plain notes authorized for the caller (excluding `HiddenByAuth` so
+/// `hidden_count` never leaks cardinality of unauthorized projects/classes).
+/// `filtered` is the subset of `authorized` matching `query.filter`.
 pub(crate) fn plan_graph(
     adjacency: &impl GraphAdjacency,
     cut: SnapshotCut,
     tier: &GraphTier,
-    effective: &Bitmap,
-    authorized_and_filtered: &Bitmap,
+    authorized: &Bitmap,
+    filtered: &Bitmap,
     lens_scope: Option<&Bitmap>,
 ) -> DomainResult<GraphPlan> {
-    let visible = if effective.and_cardinality(authorized_and_filtered)
-        == authorized_and_filtered.cardinality()
-    {
-        std::borrow::Cow::Borrowed(authorized_and_filtered)
+    let visible = if authorized.and_cardinality(filtered) == filtered.cardinality() {
+        std::borrow::Cow::Borrowed(filtered)
     } else {
-        std::borrow::Cow::Owned(effective.and(authorized_and_filtered))
+        std::borrow::Cow::Owned(authorized.and(filtered))
     };
-    let hidden = effective.cardinality() - visible.cardinality();
+    let filtered_out = authorized.cardinality() - visible.cardinality();
     match tier {
-        GraphTier::Superclusters => superclusters(adjacency, cut, &visible, hidden),
+        GraphTier::Superclusters => superclusters(adjacency, cut, &visible, filtered_out),
         GraphTier::Lens { cluster, .. } => {
             let mut eligible = visible;
             if let Some(scope) = lens_scope {
@@ -199,12 +213,18 @@ pub(crate) fn plan_graph(
                 let members = adjacency
                     .cluster_members(cluster)?
                     .ok_or(DomainError::ResourceNotFound)?;
+                // Require at least one authorized note in the cluster so callers
+                // cannot probe existence of unauthorized clusters.
+                if authorized.and_cardinality(&members) == 0 {
+                    return Err(DomainError::ResourceNotFound);
+                }
                 eligible.to_mut().and_inplace(&members);
             }
+            let hidden = authorized.cardinality() - eligible.cardinality();
             lens(adjacency, cut, &eligible, hidden)
         }
         GraphTier::Neighborhood { note, hops } => {
-            neighborhood(adjacency, cut, note, *hops, &visible, hidden)
+            neighborhood(adjacency, cut, note, *hops, &visible, filtered_out)
         }
     }
 }
@@ -215,67 +235,85 @@ fn superclusters(
     visible: &Bitmap,
     hidden: u64,
 ) -> DomainResult<GraphPlan> {
-    let mut members = BTreeMap::<ClusterId, Bitmap>::new();
+    let mut cluster_slots = HashMap::<ClusterId, usize>::new();
+    let mut clusters: Vec<(ClusterId, Bitmap)> = Vec::new();
+    let mut unclustered = 0u64;
     for dense in visible.iter() {
         if let Some(cluster) = adjacency.cluster(dense) {
-            members.entry(cluster).or_default().add(dense);
+            let slot = if let Some(&slot) = cluster_slots.get(&cluster) {
+                slot
+            } else {
+                let slot = clusters.len();
+                cluster_slots.insert(cluster.clone(), slot);
+                clusters.push((cluster, Bitmap::new()));
+                slot
+            };
+            clusters[slot].1.add(dense);
+        } else {
+            unclustered += 1;
         }
     }
-    let mut counts: Vec<_> = members
+    let mut order: Vec<(usize, u64)> = clusters
         .iter()
-        .map(|(id, nodes)| (id, nodes.cardinality()))
+        .enumerate()
+        .map(|(slot, (_, nodes))| (slot, nodes.cardinality()))
         .collect();
-    counts.sort_unstable_by(|(left_id, left_count), (right_id, right_count)| {
+    order.sort_unstable_by(|&(left_slot, left_count), &(right_slot, right_count)| {
         right_count
-            .cmp(left_count)
-            .then_with(|| left_id.cmp(right_id))
+            .cmp(&left_count)
+            .then_with(|| clusters[left_slot].0.cmp(&clusters[right_slot].0))
     });
+    let selected_count = order.len().min(MAX_CLUSTERS);
     let mut selected = Bitmap::new();
-    let mut cluster_by_note = BTreeMap::new();
-    for (index, (id, _)) in counts.iter().take(MAX_CLUSTERS).enumerate() {
-        for dense in members[*id].iter() {
+    let mut cluster_by_note = vec![u16::MAX; adjacency.node_count() as usize];
+    for (rank, &(slot, _)) in order.iter().take(selected_count).enumerate() {
+        let rank_u16 = rank as u16;
+        for dense in clusters[slot].1.iter() {
             selected.add(dense);
-            cluster_by_note.insert(dense, index);
+            if let Some(cell) = cluster_by_note.get_mut(dense as usize) {
+                *cell = rank_u16;
+            }
         }
     }
-    let mut weights = BTreeMap::<(usize, usize), u64>::new();
+    let mut weights = BTreeMap::<(u16, u16), u64>::new();
     for source in selected.iter() {
-        let from = cluster_by_note[&source];
+        let from = cluster_by_note[source as usize];
         for target in adjacency.outgoing(source) {
-            if let Some(&to) = cluster_by_note.get(&target)
-                && to != from
-            {
+            let Some(&to) = cluster_by_note.get(target as usize) else {
+                continue;
+            };
+            if to != u16::MAX && to != from {
                 *weights.entry((from.min(to), from.max(to))).or_default() += 1;
             }
         }
     }
-    let nodes = counts
+    let nodes = order
         .iter()
-        .take(MAX_CLUSTERS)
-        .map(|(id, count)| GraphNode {
-            id: GraphNodeId::Cluster((*id).clone()),
+        .take(selected_count)
+        .map(|&(slot, count)| GraphNode {
+            id: GraphNodeId::Cluster(clusters[slot].0.clone()),
             card: None,
-            member_count: *count,
+            member_count: count,
         })
         .collect();
     let edges = weights
         .into_iter()
         .map(|((source, target), weight)| GraphEdge {
-            source: GraphNodeId::Cluster(counts[source].0.clone()),
-            target: GraphNodeId::Cluster(counts[target].0.clone()),
+            source: GraphNodeId::Cluster(clusters[order[source as usize].0].0.clone()),
+            target: GraphNodeId::Cluster(clusters[order[target as usize].0].0.clone()),
             weight: weight as f64,
         })
         .collect();
-    let capped: u64 = counts
+    let capped: u64 = order
         .iter()
-        .skip(MAX_CLUSTERS)
-        .map(|(_, count)| *count)
+        .skip(selected_count)
+        .map(|&(_, count)| count)
         .sum();
     Ok(GraphPlan {
         result: GraphResult {
             nodes,
             edges,
-            hidden_count: hidden + capped,
+            hidden_count: hidden + capped + unclustered,
             truncated: capped != 0,
             cut,
         },
@@ -333,11 +371,27 @@ fn neighborhood(
         .filter(|&node| node != focal && visible.contains(node))
         .collect();
     let mut second = Bitmap::new();
+    let mut second_truncated = false;
     if hops == 2 {
-        for node in first.iter() {
-            for neighbor in adjacency.outgoing(node).chain(adjacency.incoming(node)) {
-                if neighbor != focal && visible.contains(neighbor) && !first.contains(neighbor) {
-                    second.add(neighbor);
+        if 1 + first.cardinality() >= MAX_NOTES as u64 {
+            // Skip O(deg^2) 2-hop expansion once 1-hop already fills MAX_NOTES;
+            // still record truncation if any 2-hop neighbor exists.
+            'check: for node in first.iter() {
+                for neighbor in adjacency.outgoing(node).chain(adjacency.incoming(node)) {
+                    if neighbor != focal && visible.contains(neighbor) && !first.contains(neighbor)
+                    {
+                        second_truncated = true;
+                        break 'check;
+                    }
+                }
+            }
+        } else {
+            for node in first.iter() {
+                for neighbor in adjacency.outgoing(node).chain(adjacency.incoming(node)) {
+                    if neighbor != focal && visible.contains(neighbor) && !first.contains(neighbor)
+                    {
+                        second.add(neighbor);
+                    }
                 }
             }
         }
@@ -348,15 +402,11 @@ fn neighborhood(
         .take(MAX_NOTES)
         .collect::<Vec<_>>();
     let capped = 1 + first.cardinality() + second.cardinality() - ordered.len() as u64;
-    // All induced edges are returned for the selected ego-graph.
-    note_plan(
-        adjacency,
-        cut,
-        ordered,
-        hidden,
-        capped,
-        MAX_NOTES * MAX_NOTES,
-    )
+    let mut plan = note_plan(adjacency, cut, ordered, hidden, capped, MAX_LENS_EDGES)?;
+    if second_truncated {
+        plan.result.truncated = true;
+    }
+    Ok(plan)
 }
 
 fn note_plan(
@@ -374,13 +424,13 @@ fn note_plan(
                 DomainError::validation(notarium_core::error::ValidationReason::InvalidState)
             })?;
             Ok(GraphNode {
-                id: GraphNodeId::Note(note.clone()),
+                id: GraphNodeId::Note(note),
                 card: None,
                 member_count: 1,
             })
         })
         .collect::<DomainResult<Vec<_>>>()?;
-    let positions: BTreeMap<_, _> = ordered
+    let positions: HashMap<u32, usize> = ordered
         .iter()
         .copied()
         .enumerate()
@@ -421,6 +471,7 @@ mod tests {
     use notarium_core::{
         ids::{HistoryIncarnation, ProjectionGeneration, SpaceId, SpaceSeq},
         model::HistoryScope,
+        ports::Cancellation,
     };
 
     use super::*;
@@ -461,13 +512,13 @@ mod tests {
             notes: &notes,
             sections: &sections,
         };
-        let effective: Bitmap = (0..7).collect();
-        let visible: Bitmap = [0, 1, 2, 3, 4, 6].into_iter().collect();
+        let authorized: Bitmap = (0..7).collect();
+        let filtered: Bitmap = [0, 1, 2, 3, 4, 6].into_iter().collect();
         let tier = GraphTier::Neighborhood {
             note: notes[0].clone().unwrap(),
             hops: 2,
         };
-        let plan = plan_graph(&graph, cut(), &tier, &effective, &visible, None).unwrap();
+        let plan = plan_graph(&graph, cut(), &tier, &authorized, &filtered, None).unwrap();
         let order: Vec<_> = plan.hydration.iter().map(|&(_, dense)| dense).collect();
         assert_eq!(order, [0, 1, 2, 3, 4]);
         assert_eq!(plan.result.edges.len(), 5);
@@ -482,14 +533,14 @@ mod tests {
             notes: &notes,
             sections: &sections,
         };
-        let effective: Bitmap = (0..6).collect();
-        let visible: Bitmap = (0..5).collect();
+        let authorized: Bitmap = (0..6).collect();
+        let filtered: Bitmap = (0..5).collect();
         let tier = GraphTier::Lens {
             project: None,
             tags: Vec::new(),
             cluster: None,
         };
-        let plan = plan_graph(&graph, cut(), &tier, &effective, &visible, None).unwrap();
+        let plan = plan_graph(&graph, cut(), &tier, &authorized, &filtered, None).unwrap();
         let order: Vec<_> = plan.hydration.iter().map(|&(_, dense)| dense).collect();
         assert_eq!(order, [2, 0, 1, 3, 4]);
         assert_eq!(plan.result.edges.len(), 3);
@@ -514,6 +565,7 @@ mod tests {
         ];
         let (notes, mut graph) = fixture(9, &edges);
         let effective: Bitmap = (0..8).collect();
+        let cancel = Cancellation::default();
         let first = LeidenSnapshot::compute(
             &GraphBuild {
                 notes: &notes,
@@ -521,6 +573,7 @@ mod tests {
             },
             &cut().scope,
             &effective,
+            &cancel,
         )
         .unwrap();
         let left = first.cluster(0).unwrap().clone();
@@ -540,6 +593,7 @@ mod tests {
             },
             &cut().scope,
             &effective,
+            &cancel,
         )
         .unwrap();
         assert_eq!(next.cluster(0), Some(&left));
@@ -549,13 +603,14 @@ mod tests {
             notes: &notes,
             sections: &graph,
         };
-        let allowed: Bitmap = [0, 1, 2, 3, 4, 5, 6].into_iter().collect();
+        let authorized: Bitmap = (0..8).collect();
+        let filtered: Bitmap = [0, 1, 2, 3, 4, 5, 6].into_iter().collect();
         let response = plan_graph(
             &view,
             cut(),
             &GraphTier::Superclusters,
-            &effective,
-            &allowed,
+            &authorized,
+            &filtered,
             None,
         )
         .unwrap();
@@ -564,5 +619,21 @@ mod tests {
         assert_eq!(response.result.edges.len(), 1);
         assert_eq!(response.result.edges[0].weight, 1.0);
         assert_eq!(response.result.hidden_count, 1);
+
+        // Unauthorized cluster must return ResourceNotFound instead of empty nodes.
+        let left_only: Bitmap = (0..4).collect();
+        let err = plan_graph(
+            &view,
+            cut(),
+            &GraphTier::Lens {
+                project: None,
+                tags: Vec::new(),
+                cluster: Some(right),
+            },
+            &left_only,
+            &left_only,
+            None,
+        );
+        assert!(matches!(err, Err(DomainError::ResourceNotFound)));
     }
 }

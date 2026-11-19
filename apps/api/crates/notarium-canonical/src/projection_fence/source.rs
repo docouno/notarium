@@ -330,6 +330,7 @@ pub(super) async fn receipt_window(
                     scope,
                     after,
                     through,
+                    changes: crate::projection_fence::VisibilityChanges::all(),
                 })
             })
         })
@@ -351,10 +352,13 @@ pub(super) async fn refresh(
     store: &CanonicalStore,
     state: &mut LiveState,
     budget: &CallBudget,
+    changes: crate::projection_fence::VisibilityChanges,
 ) -> Result<(), RefreshError> {
     let previous = state.record.clone();
     let cleanup = store.inner.live_visibility.cleanup();
-    let read_erasures = cleanup.is_some();
+    let read_erasures = cleanup.is_some() && changes.erasures;
+    let read_folders = changes.folders;
+    let read_notes = changes.notes;
     let patch = store
         .with_read_tx_budget(Some(budget), move |tx| {
             Box::pin(async move {
@@ -418,8 +422,12 @@ pub(super) async fn refresh(
                     .await?;
                 }
                 if patch.can_refresh {
-                    patch.folders = rows!(FOLDERS_DELTA)?;
-                    patch.notes = rows!(NOTES_DELTA)?;
+                    if read_folders {
+                        patch.folders = rows!(FOLDERS_DELTA)?;
+                    }
+                    if read_notes {
+                        patch.notes = rows!(NOTES_DELTA)?;
+                    }
                 }
                 Ok(Some(patch))
             })
@@ -433,6 +441,11 @@ pub(super) async fn refresh(
             }
         })?
         .ok_or_else(|| RefreshError::Visibility(not_ready()))?;
+    if !patch.erasures.purged.is_empty() {
+        // Retire the dense lookup handle BEFORE running physical file erasure
+        // so the checkpoint file is no longer pinned by LiveState.
+        state.retire_lookup_before(patch.erasures.through);
+    }
     if let Some(cleanup) = cleanup
         && (!patch.erasures.purged.is_empty() || !patch.erasures.redacted.is_empty())
     {
@@ -440,9 +453,6 @@ pub(super) async fn refresh(
             .erase_visibility(&patch.erasures)
             .await
             .map_err(RefreshError::Cleanup)?;
-        if !patch.erasures.purged.is_empty() {
-            state.retire_lookup_before(patch.erasures.through);
-        }
     }
     if !patch.can_refresh {
         return Err(RefreshError::Visibility(not_ready()));

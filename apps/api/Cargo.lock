@@ -3016,6 +3016,7 @@ dependencies = [
  "memmap2",
  "notarium-canonical",
  "notarium-core",
+ "notarium-projections",
  "notarium-syntax",
  "proptest",
  "rmp-serde",

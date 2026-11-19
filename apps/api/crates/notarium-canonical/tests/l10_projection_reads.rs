@@ -265,6 +265,7 @@ async fn run_projection_reads(store: &CanonicalStore) {
         })
         .await
         .unwrap();
+    let after_keeper_folder = store.read_space(&scope.space_id).await.unwrap().last_seq;
     let skill = sample_note_id(12);
     let skill_create = store
         .create_note(
@@ -363,8 +364,26 @@ async fn run_projection_reads(store: &CanonicalStore) {
             version: versions[0].clone(),
             receipt: effect.receipt,
         };
+        // Intervening folder creation before after_keeper_folder must reject the overlay shortcut.
+        assert!(
+            store
+                .read_projection_overlay_notes(
+                    &projection,
+                    scope,
+                    SpaceSeq::ZERO,
+                    std::slice::from_ref(&chosen),
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
         let exact = store
-            .read_projection_overlay_notes(&projection, scope, std::slice::from_ref(&chosen))
+            .read_projection_overlay_notes(
+                &projection,
+                scope,
+                after_keeper_folder,
+                std::slice::from_ref(&chosen),
+            )
             .await
             .unwrap()
             .unwrap();
@@ -379,7 +398,7 @@ async fn run_projection_reads(store: &CanonicalStore) {
         mismatch.version.rank_version = ContentDigest::from_bytes([1; 32]);
         assert!(
             store
-                .read_projection_overlay_notes(&projection, scope, &[mismatch])
+                .read_projection_overlay_notes(&projection, scope, after_keeper_folder, &[mismatch])
                 .await
                 .unwrap()
                 .is_none()
@@ -422,7 +441,7 @@ async fn run_projection_reads(store: &CanonicalStore) {
         })
         .collect::<Vec<_>>();
     let exact = store
-        .read_projection_overlay_notes(&projection, scope, &selected)
+        .read_projection_overlay_notes(&projection, scope, after_keeper_folder, &selected)
         .await
         .unwrap()
         .unwrap();
@@ -439,7 +458,7 @@ async fn run_projection_reads(store: &CanonicalStore) {
     )]);
     let schema = store
         .update_space_schema(
-            human,
+            human.clone(),
             Mutation {
                 identity: identity(5),
                 preconditions: Preconditions::default(),
@@ -455,6 +474,64 @@ async fn run_projection_reads(store: &CanonicalStore) {
         )
         .await
         .unwrap();
+    // An intervening schema change between base_seq and the receipt cutoff must
+    // reject the overlay shortcut so the caller falls back to full projection catch-up.
+    let after_schema = store
+        .create_note(
+            human.clone(),
+            Mutation {
+                identity: identity(6),
+                preconditions: Preconditions::default(),
+                input: CreateNote {
+                    note: sample_note_id(15),
+                    parent: None,
+                    slug: "after-schema".into(),
+                    class: DocClass::UserDoc,
+                    carrier: "# After Schema".into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let after_schema_effects = store
+        .resolve_projection_receipt_effects(
+            &projection,
+            scope,
+            &ReceiptSet::new([after_schema.receipt.clone()]).unwrap(),
+        )
+        .await
+        .unwrap();
+    let MutationEffect::Notes { versions, .. } = &after_schema_effects[0].effect else {
+        panic!("expected note effect");
+    };
+    let after_schema_selection = ProjectionOverlaySelection {
+        version: versions[0].clone(),
+        receipt: after_schema.receipt.clone(),
+    };
+    assert!(
+        store
+            .read_projection_overlay_notes(
+                &projection,
+                scope,
+                later.receipt.seq(),
+                std::slice::from_ref(&after_schema_selection),
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .read_projection_overlay_notes(
+                &projection,
+                scope,
+                schema.receipt.seq(),
+                std::slice::from_ref(&after_schema_selection),
+            )
+            .await
+            .unwrap()
+            .is_some()
+    );
     let before_schema = store
         .read_projection_space_header(&projection, &scope.space_id, Some(later.receipt.seq()))
         .await
@@ -515,6 +592,36 @@ async fn run_projection_reads(store: &CanonicalStore) {
         .unwrap();
     assert_eq!(fences.rows[0].note_id, clear);
     assert_eq!(fences.rows[0].purge_seq, purged);
+
+    // Purging a published ability entrypoint note must not wedge delta batches
+    // that cross both the ability publication and the later purge.
+    let skill_purged = store
+        .commit_synthetic_note_purge_for_test(scope, epoch, &skill)
+        .await
+        .unwrap();
+    let delta_across_purged_ability = store
+        .read_projection_delta_batch(
+            &projection,
+            scope,
+            skill_create.receipt.seq(),
+            skill_purged,
+            None,
+            PageLimit::new(64).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        delta_across_purged_ability
+            .rows
+            .iter()
+            .any(|row| matches!(row, ProjectionDelta::Purge(id) if *id == skill))
+    );
+    assert!(
+        delta_across_purged_ability
+            .rows
+            .iter()
+            .any(|row| matches!(row, ProjectionDelta::Ability(ability) if ability.note.is_none()))
+    );
 }
 
 #[tokio::test]

@@ -110,11 +110,7 @@ async fn collect(
     cutoff: SpaceSeq,
     expected_count: usize,
 ) -> Vec<ProjectionChatRef> {
-    // The lexicographically first entry contains no refs. A one-header budget
-    // must return an empty page and advance, including when later refs exist.
-    let entries = PageLimit::new(1).unwrap();
-    let refs = PageLimit::new(101).unwrap();
-    let limits = ProjectionChatRefLimits::new(entries, refs, 4096).unwrap();
+    let limits = ProjectionChatRefLimits::new(PageLimit::new(101).unwrap()).unwrap();
     let mut position = None;
     let mut collected = Vec::new();
     let mut pages = 0;
@@ -123,12 +119,7 @@ async fn collect(
             .read_projection_chat_refs_page(&projection(), scope, cutoff, position, limits)
             .await
             .unwrap();
-        assert!(page.payload_bytes_read <= 4096);
-        assert!(page.entries_examined <= 1);
-        if pages == 0 {
-            assert!(page.refs.is_empty());
-            assert!(page.next.is_some());
-        }
+        assert!(page.refs.len() <= 101);
         pages += 1;
         assert!(pages < 20, "continuation did not advance");
         collected.extend(page.refs);
@@ -165,38 +156,47 @@ async fn exercise(store: &CanonicalStore) -> (HistoryScope, ProjectionChatEntryK
     .unwrap();
     let _empty = append_in_new_thread(store, &ctx, sample_thread_id(1), Vec::new()).await;
     let first_cut = store.read_space(&source.space_id).await.unwrap().last_seq;
-    let refs: Vec<_> = (0..160)
-        .map(|n| {
-            if n % 2 == 0 {
-                local_note.clone()
-            } else {
-                foreign_note.clone()
-            }
-        })
+    let mut extra_local = Vec::new();
+    for seed in 0x97..0xA5 {
+        extra_local.push(create_note_in(store, &source, &owner, seed).await);
+    }
+    let mut refs = Vec::new();
+    refs.push(local_note.clone());
+    refs.push(foreign_note.clone());
+    refs.push(local_note.clone()); // duplicate target must deduplicate to first ordinal
+    for note in &extra_local {
+        refs.push(note.clone());
+    }
+    let expected_unique: Vec<_> = std::iter::once(local_note.clone())
+        .chain(std::iter::once(foreign_note.clone()))
+        .chain(extra_local.iter().cloned())
         .collect();
-    let entry = append_in_new_thread(store, &ctx, sample_thread_id(2), refs.clone()).await;
+    let entry = append_in_new_thread(store, &ctx, sample_thread_id(2), refs).await;
     let cutoff = store.read_space(&source.space_id).await.unwrap().last_seq;
-    let outer = collect(store, &source, cutoff, refs.len()).await;
+    let outer = collect(store, &source, cutoff, expected_unique.len()).await;
     assert_eq!(
         outer.iter().map(|r| r.target.clone()).collect::<Vec<_>>(),
-        refs
+        expected_unique
     );
-    assert!(outer.iter().enumerate().all(|(index, r)| {
-        r.locator.source == source
-            && r.locator.entry == entry
-            && r.locator.ref_ordinal as usize == index
-    }));
-    let crossing = outer
+    assert_eq!(outer[0].locator.ref_ordinal, 0);
+    assert_eq!(outer[1].locator.ref_ordinal, 1);
+    assert_eq!(outer[2].locator.ref_ordinal, 3);
+    assert!(
+        outer
+            .iter()
+            .all(|r| r.locator.source == source && r.locator.entry == entry)
+    );
+    let sample_local = outer
         .iter()
-        .find(|r| r.target == local_note && r.locator.start / 4096 != (r.locator.end - 1) / 4096)
-        .expect("fixture includes a local NoteRef crossing a block boundary");
+        .find(|r| r.target == local_note)
+        .expect("fixture includes a local NoteRef");
     assert!(
         store
-            .verify_projection_chat_ref(&projection(), crossing)
+            .verify_projection_chat_ref(&projection(), sample_local)
             .await
             .unwrap()
     );
-    let mut wrong_note = crossing.clone();
+    let mut wrong_note = sample_local.clone();
     wrong_note.target = foreign_note.clone();
     wrong_note.target_scope = foreign.clone();
     assert!(
@@ -205,7 +205,7 @@ async fn exercise(store: &CanonicalStore) -> (HistoryScope, ProjectionChatEntryK
             .await
             .unwrap()
     );
-    let mut wrong_history = crossing.clone();
+    let mut wrong_history = sample_local.clone();
     wrong_history.target_scope.incarnation = sample_incarnation(0x92);
     assert!(
         !store
@@ -213,11 +213,11 @@ async fn exercise(store: &CanonicalStore) -> (HistoryScope, ProjectionChatEntryK
             .await
             .unwrap()
     );
-    let mut corrupt = crossing.clone();
-    corrupt.locator.start += 1;
+    let mut wrong_ordinal = sample_local.clone();
+    wrong_ordinal.locator.ref_ordinal += 1;
     assert!(
         !store
-            .verify_projection_chat_ref(&projection(), &corrupt)
+            .verify_projection_chat_ref(&projection(), &wrong_ordinal)
             .await
             .unwrap()
     );
@@ -250,15 +250,33 @@ async fn exercise(store: &CanonicalStore) -> (HistoryScope, ProjectionChatEntryK
     assert_eq!(changes.changes.len(), 1);
     assert_eq!(changes.changes[0].entry, entry);
     assert!(!changes.changes[0].removed);
-    let limits =
-        ProjectionChatRefLimits::new(PageLimit::new(1).unwrap(), PageLimit::new(9).unwrap(), 4096)
-            .unwrap();
+    let limits = ProjectionChatRefLimits::new(PageLimit::new(9).unwrap()).unwrap();
     let partial = store
         .read_projection_chat_entry_refs_page(&projection(), &source, cutoff, &entry, None, limits)
         .await
         .unwrap();
     assert_eq!(partial.refs.len(), 9);
     assert!(partial.next.is_some());
+
+    // Target-indexed lookup should return only references pointing to local_note's space.
+    let targeted = store
+        .read_projection_incoming_chat_refs_page(
+            &projection(),
+            &source,
+            cutoff,
+            &source,
+            None,
+            ProjectionChatRefLimits::new(PageLimit::new(200).unwrap()).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(targeted.refs.len(), 1 + extra_local.len());
+    assert!(
+        targeted
+            .refs
+            .iter()
+            .all(|r| r.target.space_id == source.space_id)
+    );
 
     store
         .delete_note(
@@ -274,12 +292,8 @@ async fn exercise(store: &CanonicalStore) -> (HistoryScope, ProjectionChatEntryK
         )
         .await
         .unwrap();
-    let clean = collect(store, &source, cutoff, refs.len() / 2).await;
-    assert!(
-        clean
-            .iter()
-            .all(|r| r.target == local_note && r.target_scope == source)
-    );
+    let clean = collect(store, &source, cutoff, 1 + extra_local.len()).await;
+    assert!(clean.iter().all(|r| r.target_scope == source));
     let removed = &outer[1];
     assert!(
         !store
@@ -295,7 +309,7 @@ async fn exercise(store: &CanonicalStore) -> (HistoryScope, ProjectionChatEntryK
         .unwrap();
     store
         .redact_chat_entry(
-            ctx,
+            ctx.clone(),
             next_mutation(
                 &source,
                 &owner,
@@ -323,11 +337,33 @@ async fn exercise(store: &CanonicalStore) -> (HistoryScope, ProjectionChatEntryK
     );
     assert!(
         !store
-            .verify_projection_chat_ref(&projection(), crossing)
+            .verify_projection_chat_ref(&projection(), sample_local)
             .await
             .unwrap()
     );
     let redacted = store.read_space(&source.space_id).await.unwrap().last_seq;
+    // A second redaction must preserve the earliest redacted_at_seq so
+    // incremental windows between cutoff and the first redaction never lose it.
+    let head_after_first = store
+        .read_projection_chat_head(&projection(), &source, None, &entry.thread)
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .redact_chat_entry(
+            ctx,
+            next_mutation(
+                &source,
+                &owner,
+                RedactChatEntry {
+                    thread: entry.thread.clone(),
+                    entry: entry.seq,
+                    expected_thread_revision: head_after_first.thread.revision,
+                },
+            ),
+        )
+        .await
+        .unwrap();
     assert!(collect(store, &source, redacted, 0).await.is_empty());
     let changes = store
         .read_projection_chat_changes_page(
@@ -416,7 +452,7 @@ macro_rules! write_v6_chats {
     };
 }
 
-async fn covers_v6_references(store: &CanonicalStore, fixture: &V6Chat) -> [usize; 3] {
+async fn covers_v6_references(store: &CanonicalStore, fixture: &V6Chat) -> usize {
     let V6Chat {
         scope,
         entry,
@@ -425,14 +461,10 @@ async fn covers_v6_references(store: &CanonicalStore, fixture: &V6Chat) -> [usiz
         count,
     } = fixture;
     let cutoff = store.read_space(&scope.space_id).await.unwrap().last_seq;
-    let limit = PageLimit::new(101).unwrap();
-    let limits = ProjectionChatRefLimits::new(limit, limit, 4096).unwrap();
+    let limits = ProjectionChatRefLimits::new(PageLimit::new(1).unwrap()).unwrap();
     let mut position = None;
-    let mut position_count = 0;
-    let mut payload_bytes = 0;
-    let mut samples = [0; 3];
-    let mut tail_reference = None;
-    let midpoint = *count / 2;
+    let mut collected = Vec::new();
+    let mut pages = 0;
     loop {
         let page = store
             .read_projection_chat_entry_refs_page(
@@ -445,46 +477,28 @@ async fn covers_v6_references(store: &CanonicalStore, fixture: &V6Chat) -> [usiz
             )
             .await
             .unwrap();
-        assert_eq!(page.inline_values_read, 0);
-        assert_eq!(page.payload_blocks_read, 1);
-        assert_eq!(page.entries_examined, 1);
-        assert!(page.payload_bytes_read <= 4096);
-        payload_bytes += page.payload_bytes_read;
-        if position_count == 0 {
-            samples[0] = page.payload_bytes_read;
-        }
-        if position_count <= midpoint && position_count + page.refs.len() > midpoint {
-            samples[1] = page.payload_bytes_read;
-        }
-        for reference in page.refs {
-            assert_eq!(reference.locator.entry, *entry);
-            assert_eq!(reference.locator.ref_ordinal as usize, position_count);
-            position_count += 1;
-            if position_count == *count {
-                assert_eq!(reference.target, *tail);
-                tail_reference = Some(reference);
-            } else {
-                assert_eq!(reference.target, *repeated);
-            }
-        }
+        assert!(page.refs.len() <= 1);
+        pages += 1;
+        collected.extend(page.refs);
         if let Some(next) = page.next {
             position = Some(next);
         } else {
-            samples[2] = page.payload_bytes_read;
             break;
         }
     }
-    assert_eq!(position_count, *count);
-    let object_bytes = serde_json::to_string(repeated).unwrap().len() + 1;
-    let tail_bytes = serde_json::to_string(tail).unwrap().len() + 2;
-    assert_eq!(payload_bytes, (*count - 1) * object_bytes + tail_bytes);
+    // Duplicate targets in legacy JSON deduplicate to first-occurrence ordinals.
+    assert_eq!(collected.len(), 2);
+    assert_eq!(collected[0].target, *repeated);
+    assert_eq!(collected[0].locator.ref_ordinal, 0);
+    assert_eq!(collected[1].target, *tail);
+    assert_eq!(collected[1].locator.ref_ordinal as usize, *count - 1);
     assert!(
         store
-            .verify_projection_chat_ref(&projection(), &tail_reference.unwrap())
+            .verify_projection_chat_ref(&projection(), &collected[1])
             .await
             .unwrap()
     );
-    samples
+    pages
 }
 
 #[tokio::test]
@@ -509,15 +523,12 @@ async fn l7_projection_refs_sqlite_covering_pages_and_erasure() {
 
     let (store, runtime) = CanonicalRuntime::open(config).await.unwrap();
     let legacy_space = legacy[0].scope.space_id.clone();
-    let first = covers_v6_references(&store, &legacy[0]).await;
-    let second = covers_v6_references(&store, &legacy[1]).await;
-    assert_eq!(first[..2], [4096, 4096]);
-    assert_eq!(second[..2], first[..2]);
-    assert!(first[2] > 0 && first[2] <= 4096 && second[2] > 0 && second[2] <= 4096);
+    assert_eq!(covers_v6_references(&store, &legacy[0]).await, 2);
+    assert_eq!(covers_v6_references(&store, &legacy[1]).await, 2);
     let (scope, entry) = exercise(&store).await;
     let mut db = temp.open_raw_sqlite().await;
-    let payload_rows: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM chat_entry_ref_blocks WHERE space_id=$1 AND thread_id=$2 AND entry_seq=$3",
+    let ref_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM chat_entry_note_refs WHERE space_id=$1 AND thread_id=$2 AND entry_seq=$3",
     )
     .bind(scope.space_id.as_str())
     .bind(entry.thread.as_str())
@@ -525,7 +536,7 @@ async fn l7_projection_refs_sqlite_covering_pages_and_erasure() {
     .fetch_one(&mut db)
     .await
     .unwrap();
-    assert_eq!(payload_rows, 0);
+    assert_eq!(ref_rows, 0);
 
     let sql = format!(
         "SELECT {COVERED_COLUMNS} FROM chat_entries INDEXED BY idx_chat_entries_projection
@@ -596,14 +607,11 @@ async fn l7_projection_refs_postgres_bounded_pages_and_erasure() {
     write_v6_chats!(db, legacy);
     let (store, runtime) = CanonicalRuntime::open(config).await.unwrap();
     let legacy_space = legacy[0].scope.space_id.clone();
-    let first = covers_v6_references(&store, &legacy[0]).await;
-    let second = covers_v6_references(&store, &legacy[1]).await;
-    assert_eq!(first[..2], [4096, 4096]);
-    assert_eq!(second[..2], first[..2]);
-    assert!(first[2] > 0 && first[2] <= 4096 && second[2] > 0 && second[2] <= 4096);
+    assert_eq!(covers_v6_references(&store, &legacy[0]).await, 2);
+    assert_eq!(covers_v6_references(&store, &legacy[1]).await, 2);
     let (scope, entry) = exercise(&store).await;
-    let payload_rows: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM chat_entry_ref_blocks WHERE space_id=$1 AND thread_id=$2 AND entry_seq=$3",
+    let ref_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM chat_entry_note_refs WHERE space_id=$1 AND thread_id=$2 AND entry_seq=$3",
     )
     .bind(scope.space_id.as_str())
     .bind(entry.thread.as_str())
@@ -611,7 +619,7 @@ async fn l7_projection_refs_postgres_bounded_pages_and_erasure() {
     .fetch_one(&mut db)
     .await
     .unwrap();
-    assert_eq!(payload_rows, 0);
+    assert_eq!(ref_rows, 0);
 
     let indexdef: String = sqlx::query_scalar(
         "SELECT indexdef FROM pg_indexes WHERE schemaname=$1 AND indexname='idx_chat_entries_projection'",
@@ -644,27 +652,43 @@ async fn l7_projection_refs_postgres_bounded_pages_and_erasure() {
             .any(|line| line.contains("Index") && line.contains("chat_entries"))
     );
     let legacy_entry = &legacy[1].entry;
-    let block_plan: Vec<String> = sqlx::query_scalar(
-        "EXPLAIN (ANALYZE, BUFFERS, VERBOSE) SELECT payload FROM chat_entry_ref_blocks
-         WHERE space_id=$1 AND thread_id=$2 AND entry_seq=$3 AND block_no=$4",
+    let ref_plan: Vec<String> = sqlx::query_scalar(
+        "EXPLAIN (ANALYZE, BUFFERS, VERBOSE) SELECT ref_ordinal, target_space_id, target_note_id
+         FROM chat_entry_note_refs
+         WHERE space_id=$1 AND thread_id=$2 AND entry_seq=$3 AND ref_ordinal=$4",
     )
     .bind(legacy_space.as_str())
     .bind(legacy_entry.thread.as_str())
     .bind(legacy_entry.seq.get() as i64)
-    .bind(500_i64)
+    .bind(0_i64)
     .fetch_all(&mut db)
     .await
     .unwrap();
-    assert!(block_plan.iter().any(|line| {
-        line.contains("chat_entry_ref_blocks_pkey")
+    assert!(ref_plan.iter().any(|line| {
+        line.contains("chat_entry_note_refs_pkey")
             && line.contains("actual time")
             && line.contains("rows=1 loops=1")
     }));
     assert!(
-        block_plan
+        ref_plan
             .iter()
             .all(|line| !line.contains("referenced_notes_json"))
     );
+    let target_plan: Vec<String> = sqlx::query_scalar(
+        "EXPLAIN (ANALYZE, BUFFERS, VERBOSE) SELECT thread_id, entry_seq, ref_ordinal
+         FROM chat_entry_note_refs
+         WHERE space_id=$1 AND target_space_id=$2 AND target_note_id=$3
+         ORDER BY thread_id, entry_seq, ref_ordinal LIMIT 10",
+    )
+    .bind(legacy_space.as_str())
+    .bind(legacy[1].tail.space_id.as_str())
+    .bind(legacy[1].tail.note_id.as_str())
+    .fetch_all(&mut db)
+    .await
+    .unwrap();
+    assert!(target_plan.iter().any(|line| {
+        line.contains("idx_chat_entry_note_refs_target") && line.contains("actual time")
+    }));
     drop(db);
     runtime.shutdown().await.unwrap();
     fixtures.drop_pg_schema(&schema).await;

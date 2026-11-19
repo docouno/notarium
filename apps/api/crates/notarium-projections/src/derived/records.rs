@@ -15,8 +15,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use super::sql::{Column, SqlColumn, SqlRecord, SqlValue};
 
 macro_rules! record {
-    ($(#[$attrs:meta])* $vis:vis struct $name:ident = $table:literal
-        $(, temporal = $temporal:literal)?; key($($key:ident),+) {
+    ($(#[$attrs:meta])* $vis:vis struct $name:ident = $table:literal; key($($key:ident),+) {
         $($(#[$field_attrs:meta])* $field:ident: $ty:ty),+ $(,)?
     }) => {
         $(#[$attrs])*
@@ -32,7 +31,6 @@ macro_rules! record {
                 nullable: <$ty>::NULLABLE,
             }),+];
             const KEY: &'static [&'static str] = &[$(stringify!($key)),+];
-            $(const TEMPORAL: bool = $temporal;)?
             fn values(&self) -> Vec<SqlValue> {
                 vec![$(self.$field.value()),+]
             }
@@ -86,7 +84,6 @@ record! {
         schema_msgpack: Option<Vec<u8>>,
         seed_in_progress: bool,
         updated_at_ms: i64,
-        retained_floor_seq: SpaceSeq,
     }
 }
 
@@ -122,7 +119,7 @@ impl WatermarkRecord {
         })
     }
 
-    pub(super) fn from_watermark(row: &ProjectionWatermark, retained_floor_seq: SpaceSeq) -> Self {
+    pub(super) fn from_watermark(row: &ProjectionWatermark) -> Self {
         Self {
             space_id: row.scope.space_id.clone(),
             history_incarnation: row.scope.incarnation,
@@ -140,23 +137,12 @@ impl WatermarkRecord {
                 .map(|schema| schema.fields_msgpack.clone()),
             seed_in_progress: row.seed_in_progress,
             updated_at_ms: row.updated_at_ms,
-            retained_floor_seq,
         }
     }
 }
 
 record! {
-    pub(super) struct SchemaRecord = "projected_space_schemas", temporal = true;
-    key(space_id) {
-        space_id: SpaceId,
-        revision: RevisionId,
-        fingerprint: ContentDigest,
-        fields_msgpack: Vec<u8>,
-    }
-}
-
-record! {
-    pub struct ProjectedNote = "projected_notes", temporal = true;
+    pub struct ProjectedNote = "projected_notes";
     key(space_id, dense_id) {
         space_id: SpaceId,
         dense_id: u32,
@@ -215,10 +201,10 @@ impl ProjectedNote {
     }
 }
 
-// Read-only projection of the same table and temporal history. Query fallback
-// never fetches titles, previews, raw frontmatter or authored view blocks.
+// Read-only projection of projected_notes. Query fallback never fetches titles,
+// previews, raw frontmatter, or authored view blocks.
 record! {
-    pub struct ProjectedQueryRow = "projected_notes", temporal = true;
+    pub struct ProjectedQueryRow = "projected_notes";
     key(space_id, dense_id) {
         space_id: SpaceId,
         dense_id: u32,
@@ -242,7 +228,7 @@ impl ProjectedQueryRow {
 }
 
 record! {
-    pub struct ProjectedFolder = "projected_folders", temporal = true;
+    pub struct ProjectedFolder = "projected_folders";
     key(space_id, folder_id) {
         space_id: SpaceId,
         folder_id: FolderId,
@@ -251,7 +237,7 @@ record! {
         slug: String,
         slug_fold: String,
         display_name: String,
-        norm_path_prefix: String,
+        norm_path_prefix: Option<String>,
         display_path_prefix: String,
         is_project: bool,
         project_slug: Option<String>,
@@ -265,7 +251,7 @@ record! {
 }
 
 record! {
-    pub struct ProjectedFolderAlias = "projected_folder_aliases", temporal = true;
+    pub struct ProjectedFolderAlias = "projected_folder_aliases";
     key(space_id, old_parent_folder_id, old_slug_fold, created_seq, target_folder_id) {
         space_id: SpaceId,
         old_parent_folder_id: FolderId,
@@ -276,7 +262,7 @@ record! {
 }
 
 record! {
-    pub struct ProjectedNoteAlias = "projected_note_aliases", temporal = true;
+    pub struct ProjectedNoteAlias = "projected_note_aliases";
     key(space_id, old_parent_folder_id, old_slug_fold, created_seq, target_note_id) {
         space_id: SpaceId,
         old_parent_folder_id: FolderId,
@@ -288,7 +274,7 @@ record! {
 }
 
 record! {
-    pub struct ProjectedViewDescriptor = "projected_view_descriptors", temporal = true;
+    pub struct ProjectedViewDescriptor = "projected_view_descriptors";
     key(space_id, view_note_id, view_key) {
         space_id: SpaceId,
         view_note_id: NoteId,
@@ -305,7 +291,7 @@ record! {
 }
 
 record! {
-    pub struct ProjectedViewRank = "projected_view_ranks", temporal = true;
+    pub struct ProjectedViewRank = "projected_view_ranks";
     key(space_id, view_note_id, view_key, target_note_id) {
         space_id: SpaceId,
         view_note_id: NoteId,
@@ -341,7 +327,7 @@ record! {
 }
 
 record! {
-    pub struct ProjectedLink = "projected_note_links", temporal = true;
+    pub struct ProjectedLink = "projected_note_links";
     key(space_id, src_dense_id, link_ord) {
         space_id: SpaceId,
         src_dense_id: u32,
@@ -372,7 +358,7 @@ record! {
 
 record! {
     pub struct ProjectedChatRef = "chat_note_refs";
-    key(target_space_id, target_note_id, thread_space_id, thread_id, entry_seq, ref_ordinal) {
+    key(target_space_id, target_note_id, thread_space_id, thread_id, entry_seq) {
         target_space_id: SpaceId,
         target_note_id: NoteId,
         thread_space_id: SpaceId,
@@ -382,8 +368,6 @@ record! {
         target_incarnation: HistoryIncarnation,
         source_revision: RevisionId,
         ref_ordinal: u64,
-        start_byte: u64,
-        end_byte: u64,
     }
 }
 

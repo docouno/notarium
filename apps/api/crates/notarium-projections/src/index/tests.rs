@@ -155,7 +155,7 @@ fn mmap_slots_header_precision_graph_and_file_lifetime() {
     assert_eq!(view.folder_lifecycle(0), Some(Lifecycle::Active));
     assert_eq!(view.dense_folder_id(&folder), Some(0));
     assert_eq!(view.dense_id(&note(2)), Some(2));
-    assert_eq!(view.note_id(view.dense(2)).unwrap(), &note(2));
+    assert_eq!(view.note_id(view.dense(2)).unwrap(), note(2));
     assert!(view.note_id(view.dense(1)).is_err());
     assert_eq!(view.note_id_str(1), None);
     assert_eq!(view.note_header(1), None);

@@ -342,13 +342,21 @@ pub(crate) async fn run(path: &Path) -> Microprofile {
     let root = DataRoot::new(path);
     let base = fixture.checkpoint(&root, initial_seq(), MICROPROFILE_NOTES);
     let checkpoint_bytes = std::fs::metadata(base.path()).unwrap().len();
+    let cold_checkpoint_open = measure_cold_open(&base);
+    eprintln!(
+        "projection benchmark million-note cold checkpoint open: {} samples, p50={} ns, p95={} ns, p99={} ns",
+        cold_checkpoint_open.samples,
+        cold_checkpoint_open.p50_ns,
+        cold_checkpoint_open.p95_ns,
+        cold_checkpoint_open.p99_ns
+    );
     let index = IndexView::new(
         base.open(&fixture.pool).unwrap(),
         Arc::new(L0Delta::default()),
     );
     let indexed_notes = index.node_count() as usize;
     assert_eq!(indexed_notes, MICROPROFILE_NOTES);
-    let warm_board = measure_board(&fixture, &root, &index).await;
+    let (warm_board, hydration_table_rows) = measure_board(&fixture, &root, &index).await;
     drop(index);
 
     let mut fence = fixture.census(base.clone());
@@ -395,11 +403,34 @@ pub(crate) async fn run(path: &Path) -> Microprofile {
     let evicted = census_sample(&fence, FencePhase::Evicted, 0, 0);
 
     Microprofile {
+        scope: super::report::MICROPROFILE_SCOPE.to_owned(),
         indexed_notes,
+        hydration_table_rows,
         checkpoint_bytes,
+        cold_checkpoint_open,
         warm_board,
         fence: [hydrated, lagged, compacted, evicted],
     }
+}
+
+fn measure_cold_open(base: &BaseIndexHandle) -> Timing {
+    let mut samples = Vec::with_capacity(MINIMUM_SAMPLES);
+    for _ in 0..MINIMUM_SAMPLES {
+        let file = std::fs::File::open(base.path()).expect("open 1M checkpoint for cold advice");
+        file.sync_all().expect("flush 1M checkpoint");
+        #[cfg(target_os = "linux")]
+        rustix::fs::fadvise(&file, 0, None, rustix::fs::Advice::DontNeed)
+            .expect("POSIX_FADV_DONTNEED for 1M checkpoint");
+        #[cfg(not(target_os = "linux"))]
+        panic!("projection cold-cache benchmark requires Linux");
+        drop(file);
+        let pool = MmapPool::new(NonZeroUsize::MIN);
+        let started = Instant::now();
+        let mapped = base.open(&pool).expect("cold open 1M trusted checkpoint");
+        samples.push(u64::try_from(started.elapsed().as_nanos()).unwrap());
+        drop(mapped);
+    }
+    Timing::from_samples(samples)
 }
 
 fn census_sample(
@@ -419,7 +450,7 @@ fn census_sample(
     }
 }
 
-async fn measure_board(fixture: &Fixture, root: &DataRoot, index: &IndexView) -> Timing {
+async fn measure_board(fixture: &Fixture, root: &DataRoot, index: &IndexView) -> (Timing, usize) {
     let store = DerivedStore::open_sqlite(root, fixture.generation)
         .await
         .unwrap();
@@ -554,5 +585,5 @@ async fn measure_board(fixture: &Fixture, root: &DataRoot, index: &IndexView) ->
                 .eq(expected.iter().cloned())
         );
     }
-    Timing::from_samples(samples)
+    (Timing::from_samples(samples), top.len())
 }

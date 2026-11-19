@@ -281,8 +281,24 @@ fn compile_ready(
             .unwrap_or_else(|| Predicate::All(Vec::new())),
     };
     filter.validate_declared(schema)?;
-    let group_by = optional_string(fields, "group_by")?.map(str::to_owned);
-    let date_field = optional_string(fields, "date_field")?.map(str::to_owned);
+    let group_by = optional_string(fields, "group_by")?
+        .map(|name| {
+            if name.is_empty() || name == "__proto__" {
+                Err(invalid_view())
+            } else {
+                Ok(name.to_owned())
+            }
+        })
+        .transpose()?;
+    let date_field = optional_string(fields, "date_field")?
+        .map(|name| {
+            if name.is_empty() || name == "__proto__" {
+                Err(invalid_view())
+            } else {
+                Ok(name.to_owned())
+            }
+        })
+        .transpose()?;
     if kind == ViewKind::Calendar {
         let field = date_field
             .as_deref()
@@ -297,10 +313,14 @@ fn compile_ready(
             return Err(invalid_view());
         }
     }
-    let columns = parse_columns(
-        fields.get("options"),
-        group_by.as_deref().and_then(|key| schema.get(key)),
-    )?;
+    let columns = if group_by.is_some() || kind == ViewKind::Board {
+        parse_columns(
+            fields.get("options"),
+            group_by.as_deref().and_then(|key| schema.get(key)),
+        )?
+    } else {
+        Vec::new()
+    };
     let descriptor = NotaDescriptor {
         kind,
         source: fields
@@ -382,8 +402,9 @@ fn parse_source(value: &YamlValue) -> DomainResult<ViewSource> {
         .transpose()?;
     let scope = match optional_string(fields, "scope")? {
         None if folder.is_some() => SourceScope::Folder,
-        None | Some("space") => SourceScope::Space,
-        Some("project") => SourceScope::Project,
+        None => SourceScope::Space,
+        Some("space") if folder.is_none() => SourceScope::Space,
+        Some("project") if folder.is_none() => SourceScope::Project,
         Some("folder") if folder.is_some() => SourceScope::Folder,
         _ => return Err(invalid_view()),
     };
@@ -459,6 +480,9 @@ fn parse_sort(value: &YamlValue, schema: &BTreeMap<String, FieldSchema>) -> Doma
     for key in keys {
         let key = mapping(key)?;
         let name = optional_string(key, "field")?.ok_or_else(invalid_view)?;
+        if name.is_empty() || name == "__proto__" {
+            return Err(invalid_view());
+        }
         let direction = match optional_string(key, "direction")? {
             None | Some("asc") => Direction::Asc,
             Some("desc") => Direction::Desc,
@@ -513,6 +537,8 @@ fn parse_scalar_type(value: &str) -> DomainResult<ScalarType> {
     }
 }
 
+const MAX_VIEW_COLUMNS: usize = 256;
+
 fn parse_columns(
     value: Option<&YamlValue>,
     schema: Option<&FieldSchema>,
@@ -523,11 +549,15 @@ fn parse_columns(
     let Some(YamlValue::Sequence(columns)) = options.get("columns") else {
         return Ok(Vec::new());
     };
+    if columns.len() > MAX_VIEW_COLUMNS {
+        return Err(DomainError::validation(ValidationReason::InvalidLimit));
+    }
     let kind = schema.and_then(|schema| match schema.kind {
         FieldType::Scalar(kind) => Some(kind),
         _ => None,
     });
-    let mut result = Vec::new();
+    let mut result = Vec::with_capacity(columns.len());
+    let mut seen = BTreeSet::new();
     for column in columns {
         let group = match column {
             YamlValue::Mapping(fields) => {
@@ -536,7 +566,14 @@ fn parse_columns(
             }
             value => GroupKey::Value(scalar(value, kind, true)?),
         };
-        if !result.contains(&group) {
+        let group = match group {
+            GroupKey::Value(ScalarValue::Number(number)) => {
+                GroupKey::Value(ScalarValue::Number(number.canonicalize()))
+            }
+            other => other,
+        };
+        let encoded = rmp_serde::to_vec_named(&group).map_err(|_| invalid_view())?;
+        if seen.insert(encoded) {
             result.push(group);
         }
     }
@@ -884,6 +921,76 @@ mod tests {
             ),
         ]);
         for (config, expected) in cases {
+            let source = format!("```nota\nid: {id}\n{config}\n```\n");
+            assert_eq!(
+                compile_views(&blocks(&source), &schema).get(&id),
+                Err(DomainError::validation(expected)),
+                "{config}",
+            );
+        }
+    }
+
+    #[test]
+    fn options_columns_limits_table_config_proto_and_contradictory_source_scope() {
+        let id = ViewKey::from_bytes([5; 16]);
+        let schema = BTreeMap::new();
+
+        // Table/list views ignore UI column presentation objects in options.columns.
+        let table = format!(
+            "```nota\nid: {id}\ntype: table\noptions:\n  columns:\n    - {{field: status, width: 120}}\n```\n"
+        );
+        let compiled = compile_views(&blocks(&table), &schema);
+        let compiled_table = compiled.get(&id).unwrap();
+        assert_eq!(compiled_table.kind, ViewKind::Table);
+        assert!(compiled_table.columns.is_empty());
+
+        // Board options.columns caps at 256 items to prevent quadratic CPU DoS.
+        let mut many = String::from("type: board\ngroup_by: status\noptions:\n  columns: [");
+        for i in 0..=256 {
+            if i > 0 {
+                many.push_str(", ");
+            }
+            many.push_str(&format!("col{i}"));
+        }
+        many.push(']');
+        let too_many = format!("```nota\nid: {id}\n{many}\n```\n");
+        assert_eq!(
+            compile_views(&blocks(&too_many), &schema).get(&id),
+            Err(DomainError::validation(ValidationReason::InvalidLimit)),
+        );
+
+        // Reject __proto__, empty keys, and contradictory scope: space|project with folder.
+        for (config, expected) in [
+            (
+                "type: board\ngroup_by: __proto__",
+                ValidationReason::InvalidView,
+            ),
+            ("type: board\ngroup_by: ''", ValidationReason::InvalidView),
+            (
+                "type: calendar\ndate_field: __proto__",
+                ValidationReason::InvalidView,
+            ),
+            (
+                "type: table\nsort: [{field: __proto__, type: string}]",
+                ValidationReason::InvalidView,
+            ),
+            (
+                "type: list\nfilter: {exists: __proto__}",
+                ValidationReason::InvalidQuery,
+            ),
+            (
+                "type: list\nfilter: {eq: {key: '', value: x}}",
+                ValidationReason::InvalidQuery,
+            ),
+            (
+                "type: table\nsource: {scope: space, folder: /work}",
+                ValidationReason::InvalidView,
+            ),
+            (
+                "type: table\nsource: {scope: project, folder: /work}",
+                ValidationReason::InvalidView,
+            ),
+        ] {
             let source = format!("```nota\nid: {id}\n{config}\n```\n");
             assert_eq!(
                 compile_views(&blocks(&source), &schema).get(&id),

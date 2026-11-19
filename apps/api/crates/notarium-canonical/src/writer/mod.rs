@@ -917,6 +917,7 @@ impl crate::CanonicalStore {
 
     /// Submits a typed idempotent or non-idempotent canonical mutation through `WriteBatchActor`,
     /// automatically handling MessagePack receipt serialization and replay.
+    #[cfg(feature = "test-support")]
     pub(crate) async fn submit_write_command<R>(
         &self,
         budget: &CallBudget,
@@ -1228,6 +1229,7 @@ pub(crate) enum SpaceBatchEntry {
         persisted_initial_seq: SpaceSeq,
         effective_cut: SpaceSeq,
         max_purge_seq: Option<SpaceSeq>,
+        changes: crate::projection_fence::VisibilityChanges,
     },
 }
 
@@ -1463,7 +1465,15 @@ async fn flush_single_batch(
         BatchExecOutcome::Committed {
             visibility_windows, ..
         } => {
-            if visibility.has_live_state() || inner.live_visibility.has_cleanup() {
+            let needs_pg_read = visibility.has_unreadable_state()
+                || visibility_windows.iter().any(|w| {
+                    w.changes.erasures
+                        || (visibility.has_live_state() && (w.changes.notes || w.changes.folders))
+                });
+            if needs_pg_read
+                && let SqlDriverState::Postgres { pool, .. } = &inner.sql
+                && pool.max_connections() <= 1
+            {
                 // A retained writer socket can be the pool's only slot.
                 drop(cached_pg_conn.take());
             }
@@ -1626,12 +1636,9 @@ pub(crate) enum BatchExecOutcome {
 }
 
 pub(crate) fn visibility_windows(
-    store: &crate::CanonicalStore,
+    _store: &crate::CanonicalStore,
     states: &BTreeMap<SpaceId, SpaceBatchEntry>,
 ) -> Vec<crate::projection_fence::VisibilityWindow> {
-    if !store.inner.live_visibility.has_cleanup() {
-        return Vec::new();
-    }
     states
         .values()
         .filter_map(|entry| match entry {
@@ -1639,12 +1646,14 @@ pub(crate) fn visibility_windows(
                 record,
                 persisted_initial_seq,
                 effective_cut,
+                changes,
                 ..
             } if persisted_initial_seq < effective_cut => {
                 Some(crate::projection_fence::VisibilityWindow {
                     scope: record.scope.clone(),
                     after: *persisted_initial_seq,
                     through: *effective_cut,
+                    changes: *changes,
                 })
             }
             _ => None,
@@ -1696,6 +1705,7 @@ async fn execute_batch_on_conn(
                             persisted_initial_seq: init_seq,
                             effective_cut: init_seq,
                             max_purge_seq: None,
+                            changes: crate::projection_fence::VisibilityChanges::default(),
                         },
                     );
                 }
@@ -1728,6 +1738,7 @@ async fn execute_batch_on_conn(
                             persisted_initial_seq: init_seq,
                             effective_cut: init_seq,
                             max_purge_seq: None,
+                            changes: crate::projection_fence::VisibilityChanges::default(),
                         },
                     );
                 }
@@ -1761,6 +1772,7 @@ async fn execute_batch_on_conn(
                 response_bytes,
                 new_effective_cut,
                 item_purge_seq,
+                item_changes,
                 dir_syncs,
                 retained_tickets,
                 retained_guards,
@@ -1773,6 +1785,7 @@ async fn execute_batch_on_conn(
                 if let Some(SpaceBatchEntry::Loaded {
                     effective_cut,
                     max_purge_seq,
+                    changes,
                     ..
                 }) = space_states.get_mut(&space_id)
                 {
@@ -1780,6 +1793,7 @@ async fn execute_batch_on_conn(
                     if let Some(pseq) = item_purge_seq {
                         *max_purge_seq = Some(max_purge_seq.map_or(pseq, |prev| prev.max(pseq)));
                     }
+                    changes.merge(item_changes);
                 }
                 batch_dir_syncs.merge(&dir_syncs);
                 batch_retained_tickets.extend(retained_tickets);
@@ -1898,6 +1912,7 @@ async fn execute_batch_on_conn(
                     persisted_initial_seq,
                     effective_cut,
                     max_purge_seq,
+                    ..
                 } = entry
                 {
                     space_effective_cuts.insert(sid.clone(), *effective_cut);
@@ -1950,6 +1965,7 @@ struct SingleItemSuccess {
     response_bytes: Vec<u8>,
     new_effective_cut: SpaceSeq,
     item_purge_seq: Option<SpaceSeq>,
+    item_changes: crate::projection_fence::VisibilityChanges,
     dir_syncs: PendingDirSyncs,
     retained_tickets: Vec<StagedBlobTicket>,
     retained_guards: Vec<Box<dyn Send>>,
@@ -1997,6 +2013,7 @@ async fn execute_single_item_in_savepoint(
                 retained_tickets: Vec::new(),
                 retained_guards: Vec::new(),
                 after_commit: None,
+                item_changes: crate::projection_fence::VisibilityChanges::default(),
             }),
             _ => Err(unavailable_retryable(
                 "command_receipt_pending",
@@ -2109,11 +2126,13 @@ async fn execute_single_item_in_savepoint(
         .filter(|ev| ev.op_kind == "purge")
         .map(|ev| ev.space_seq)
         .max();
+    let item_changes = crate::projection_fence::VisibilityChanges::from_events(&artifacts.events);
 
     Ok(SingleItemSuccess {
         response_bytes: artifacts.response_bytes,
         new_effective_cut: last_seq,
         item_purge_seq,
+        item_changes,
         dir_syncs: item_ctx.pending_dir_syncs,
         retained_tickets: item_ctx.retained_tickets,
         retained_guards: item_ctx.retained_guards,

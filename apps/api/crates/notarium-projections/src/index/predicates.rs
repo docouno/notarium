@@ -59,7 +59,7 @@ impl IndexView {
         predicate: &Predicate,
         universe: &Bitmap,
     ) -> Result<FilterCandidates, IndexError> {
-        let posting = |key: &PostingKey| self.posting(key).map(|set| set.and(universe));
+        let posting = |key: &PostingKey| self.posting_in(key, universe);
         let exact = match predicate {
             Predicate::All(terms) => {
                 let mut conjunction = FilterCandidates::exact(universe.clone());
@@ -149,11 +149,11 @@ impl IndexView {
         let prefix = field_prefix(namespace, field);
         if !self.base.has_posting(&bucket_marker(&prefix), false) {
             return Ok(FilterCandidates::exact(
-                self.ordinary_posting(&direct_key)?.and(universe),
+                self.ordinary_posting_in(&direct_key, universe)?,
             ));
         }
         let slot = bucket_key(&prefix, &direct_key[prefix.len()..]);
-        let mut possible = self.base_posting(&slot, false)?.and(universe);
+        let mut possible = self.base_posting_in(&slot, false, universe)?;
         let definite = self
             .l0
             .postings
@@ -196,9 +196,7 @@ impl IndexView {
         comparison: Comparison<'_>,
     ) -> Result<Bitmap, IndexError> {
         let domain = kind.prefix(field);
-        let mut selected = self
-            .base_posting(&bsi_entry(&domain, BSI_EXISTS), true)?
-            .and(universe);
+        let mut selected = self.base_posting_in(&bsi_entry(&domain, BSI_EXISTS), true, universe)?;
         match comparison {
             Comparison::Equal(value) => {
                 let (_, equal) = self.compare_base(&domain, kind, selected, value)?;
@@ -224,7 +222,7 @@ impl IndexView {
             }
         }
         if let Some(live) = self.l0.bsi_live.get(&domain) {
-            for (dense, value) in live {
+            for (dense, value) in live.iter() {
                 if universe.contains(*dense) && comparison.matches(value) {
                     selected.add(*dense);
                 }
@@ -242,11 +240,14 @@ impl IndexView {
     ) -> Result<(Bitmap, Bitmap), IndexError> {
         let key = BsiKind::key(bound).ok_or(IndexError::InvalidInput("invalid range boundary"))?;
         let mut less = Bitmap::new();
+        let mut plane_key = Vec::with_capacity(domain.len() + 1);
+        plane_key.extend_from_slice(domain);
+        plane_key.push(0);
         for bit in (0..kind.width()).rev() {
             if equal.is_empty() {
                 break;
             }
-            let plane_key = bsi_entry(domain, BSI_FIRST_PLANE + bit);
+            *plane_key.last_mut().expect("plane key tag") = BSI_FIRST_PLANE + bit;
             let plane = self.base.bitmap_view(&plane_key, true)?;
             if key & (1u128 << bit) != 0 {
                 if let Some(plane) = plane {

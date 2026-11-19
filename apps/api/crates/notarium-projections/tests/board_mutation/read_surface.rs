@@ -5,7 +5,7 @@ use notarium_core::{
     DomainError,
     auth::{EngineAuthContext, SpaceRole, VerifiedHuman},
     classes::DocClass,
-    error::PortError,
+    error::{PortError, ValidationReason},
     ids::{FolderId, GrantId, LeaseEpoch, NoteId, PrincipalId, ViewKey},
     patch::CarrierEditOrigin,
     ports::{
@@ -118,8 +118,8 @@ pub(super) async fn exercise(store: &CanonicalStore, runtime: &ProjectorRuntime)
             ReadRequest::Open {
                 query: ViewQuery {
                     view: ViewRef {
-                        note: view.note,
-                        key: view_key,
+                        note: view.note.clone(),
+                        key: view_key.clone(),
                     },
                     filter: filter(),
                     sort: None,
@@ -151,23 +151,64 @@ pub(super) async fn exercise(store: &CanonicalStore, runtime: &ProjectorRuntime)
     sync(store, runtime, &scope).await;
     assert!(renamed.receipt.seq() > old_cut);
 
+    // Without 40-table temporal MVCC, advancing derived past the cursor cut
+    // cleanly returns CursorStale so callers reopen on the current cut.
+    assert!(matches!(
+        engine
+            .query_view(
+                owner.clone(),
+                ReadRequest::Continue {
+                    cursor: first_token,
+                },
+            )
+            .await,
+        Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
+            if diagnostic.reason == ValidationReason::CursorStale
+    ));
+
+    let view_query = ViewQuery {
+        view: ViewRef {
+            note: view.note,
+            key: view_key,
+        },
+        filter: filter(),
+        sort: None,
+        group_by: None,
+        limit: PageLimit::new(1).unwrap(),
+    };
+    let reopened = engine
+        .query_view(
+            owner.clone(),
+            ReadRequest::Open {
+                query: view_query,
+                causal: CausalBasis::Await(AwaitWatermarks::default()),
+            },
+        )
+        .await
+        .expect("reopen the view on the updated cut");
+    assert_eq!(reopened.rows.projected_seq, renamed.receipt.seq());
+    assert_eq!(note_id(&reopened.rows.items[0]), &alpha.note);
+    let reopened_token = reopened.rows.next.expect("first continuation on new cut");
+
     let second = engine
         .query_view(
             owner.clone(),
             ReadRequest::Continue {
-                cursor: first_token,
+                cursor: reopened_token,
             },
         )
         .await
-        .expect("continue the retained read after rename");
-    assert_eq!(second.rows.projected_seq, old_cut);
+        .expect("continue on an unchanged cut");
+    assert_eq!(second.rows.projected_seq, renamed.receipt.seq());
     assert_eq!(second.rows.items.len(), 1);
-    let prior = &second.rows.items[0];
-    assert_eq!(note_id(prior), &beta.note);
-    assert_eq!(prior.card.document.provenance().revision(), &beta.revision);
-    assert_eq!(prior.card.title, "Beta before rename");
-    assert!(prior.card.path.contains("beta"));
-    assert!(!prior.card.path.contains("beta-renamed"));
+    let current_beta = &second.rows.items[0];
+    assert_eq!(note_id(current_beta), &beta.note);
+    assert_eq!(
+        current_beta.card.document.provenance().revision(),
+        &renamed.value.revision
+    );
+    assert_eq!(current_beta.card.title, "Beta after rename");
+    assert!(current_beta.card.path.contains("beta-renamed"));
     let second_token = second.rows.next.expect("second continuation");
 
     let snapshot = engine
@@ -183,6 +224,9 @@ pub(super) async fn exercise(store: &CanonicalStore, runtime: &ProjectorRuntime)
         .outgoing(focal)
         .expect("start traversing before trash");
 
+    // Hold derived on the current cut while canonical trashes gamma so we
+    // verify the live tombstone fence independently of cursor staleness.
+    let _hold_projection = engine.pause_before_projection_for_test(&scope, 1).unwrap();
     let mut trash = mutation(
         &owner,
         DeleteNote {
@@ -269,10 +313,32 @@ async fn scoped_graph(store: &CanonicalStore, runtime: &ProjectorRuntime) {
             .collect::<BTreeSet<_>>(),
         allowed
     );
-    assert_eq!(result.hidden_count, 1);
+    assert_eq!(
+        result.hidden_count, 0,
+        "unauthorized notes outside the project grant must never leak via hidden_count"
+    );
     assert_eq!(result.edges.len(), 1);
     assert_eq!(result.edges[0].source, GraphNodeId::Note(source.clone()));
     assert_eq!(result.edges[0].target, GraphNodeId::Note(focal.clone()));
+
+    let filtered_neighborhood = engine
+        .query_graph(
+            scoped.clone(),
+            GraphQuery {
+                tier: GraphTier::Neighborhood {
+                    note: focal.clone(),
+                    hops: 2,
+                },
+                filter: FieldFilterAstV1 {
+                    version: 1,
+                    predicate: Predicate::IsAbsent { key: "tags".into() },
+                },
+            },
+        )
+        .await
+        .expect("user filter hides authorized neighbors via hidden_count");
+    assert_eq!(filtered_neighborhood.nodes.len(), 1);
+    assert_eq!(filtered_neighborhood.hidden_count, 1);
 
     let lens = engine
         .query_graph(
@@ -356,7 +422,10 @@ async fn scoped_graph(store: &CanonicalStore, runtime: &ProjectorRuntime) {
     .await
     .expect("the graph settles without another canonical edit");
     assert!(settled.nodes.iter().all(|node| node.card.is_none()));
-    assert_eq!(settled.hidden_count, 1);
+    assert_eq!(
+        settled.hidden_count, 0,
+        "supercluster hidden_count must exclude unauthorized notes"
+    );
 
     let mut trash = mutation(
         &owner,

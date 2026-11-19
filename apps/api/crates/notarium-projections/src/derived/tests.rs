@@ -21,14 +21,12 @@ use sqlx::{
 
 use super::{
     CandidateLookupKey, DerivedMutation, DerivedStore, GenerationControl, GenerationDescriptor,
-    LinkAddress, LinkPosition, LinkScratch, ProjectedChatRef, ProjectedFolder, ProjectedLink,
-    ProjectedNote, ProjectedNoteAlias, ProjectionWatermark, ScratchSource, SpaceApply, StageKey,
-    TrustedCheckpoint,
+    LinkAddress, LinkPosition, ProjectedChatRef, ProjectedFolder, ProjectedLink, ProjectedNote,
+    ProjectedNoteAlias, ProjectionWatermark, SpaceApply, StageKey, TrustedCheckpoint,
     records::encode,
-    sql::{Kind, value},
-    write::prune_history_budget,
+    sql::{Kind, validate_schema_prefix, value},
 };
-use crate::links::{AliasKey, CandidateQuery, ResolutionIndex};
+use crate::links::{CandidateQuery, ResolutionIndex};
 
 struct Scratch(PathBuf);
 
@@ -94,145 +92,6 @@ fn water(scope: &HistoryScope, cut: SpaceSeq) -> ProjectionWatermark {
     }
 }
 
-async fn page_pin_regression(store: &DerivedStore) {
-    let history = scope(0xd0, 0xd1);
-    let publish = |expected, seq_no, title| SpaceApply {
-        expected,
-        watermark: water(&history, seq(seq_no)),
-        mutations: vec![DerivedMutation::UpsertNote(Box::new(note(
-            &history,
-            title,
-            seq_no as u8,
-        )))],
-    };
-    store
-        .apply(&publish(None, 10, "Chosen but unpinned"))
-        .await
-        .unwrap();
-    store
-        .apply(&publish(Some(seq(10)), 11, "Fresh published cut"))
-        .await
-        .unwrap();
-    let budget = Duration::from_secs(5);
-    let gap = store
-        .pin_open(&history, seq(10), Duration::from_secs(30), budget)
-        .await;
-    assert!(matches!(
-        gap,
-        Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
-            if diagnostic.reason == ValidationReason::CursorStale
-    ));
-    let (cursor, page) = store
-        .pin_open(&history, seq(11), Duration::from_secs(30), budget)
-        .await
-        .unwrap();
-    store
-        .apply(&publish(Some(seq(11)), 12, "Routine promotion"))
-        .await
-        .unwrap();
-
-    let pinned = history.clone();
-    let admission = store.page_admission.clone();
-    let pressure = store
-        .database
-        .write(false, move |mut tx| {
-            Box::pin(async move {
-                let (guard, _) =
-                    super::schema::lock_space_guard_with_origin(&mut tx, &pinned).await?;
-                assert_eq!(guard.incarnation, pinned.incarnation);
-                prune_history_budget(&mut tx, &pinned, seq(13), seq(11), 0, &admission).await
-            })
-        })
-        .await;
-    assert!(matches!(pressure, Err(PortError::Unavailable(_))));
-    assert!(matches!(
-        store.pin_cut(&history, seq(12), budget).await,
-        Err(PortError::Unavailable(_)),
-    ));
-    cursor
-        .check()
-        .await
-        .expect("pressure rolls back the failed promotion");
-
-    let expired = history.space_id.clone();
-    store
-        .database
-        .write(false, move |mut tx| {
-            Box::pin(async move {
-                tx.execute(
-                    "UPDATE projection_cut_leases SET expires_at_ms = 0 WHERE space_id = ?",
-                    vec![value(&expired)],
-                )
-                .await?;
-                Ok(())
-            })
-        })
-        .await
-        .unwrap();
-    assert!(
-        cursor.pin_page(budget).await.is_err(),
-        "an expired cursor cannot start another page"
-    );
-    store
-        .apply(&publish(
-            Some(seq(12)),
-            13,
-            "Promote with only the page pinned",
-        ))
-        .await
-        .unwrap();
-    drop(
-        store
-            .pin_cut(&history, seq(13), budget)
-            .await
-            .expect("promotion reopens admission"),
-    );
-    let retained = page
-        .run(store.note_by_id(&history, seq(11), &note_id()))
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(retained.title, "Fresh published cut");
-
-    let space = history.space_id.clone();
-    drop(page);
-    tokio::time::timeout(Duration::from_secs(1), async {
-        loop {
-            let space = space.clone();
-            let pins = store
-                .database
-                .read(move |mut tx| {
-                    Box::pin(async move {
-                        tx.select(
-                            "SELECT CAST(1 AS BIGINT) FROM projection_page_pins WHERE space_id = ? LIMIT 1",
-                            vec![value(&space)],
-                            &[Kind::Integer],
-                        )
-                        .await
-                    })
-                })
-                .await
-                .unwrap();
-            if pins.is_empty() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("completed page releases its protection");
-    store
-        .apply(&publish(Some(seq(13)), 14, "Prune after release"))
-        .await
-        .unwrap();
-    assert!(
-        store
-            .note_by_id(&history, seq(11), &note_id())
-            .await
-            .is_err()
-    );
-}
-
 fn folder(scope: &HistoryScope, cover: Option<NoteId>) -> ProjectedFolder {
     ProjectedFolder {
         space_id: scope.space_id.clone(),
@@ -242,7 +101,7 @@ fn folder(scope: &HistoryScope, cover: Option<NoteId>) -> ProjectedFolder {
         slug: String::new(),
         slug_fold: String::new(),
         display_name: "Root".to_owned(),
-        norm_path_prefix: String::new(),
+        norm_path_prefix: Some(String::new()),
         display_path_prefix: String::new(),
         is_project: false,
         project_slug: None,
@@ -300,8 +159,6 @@ fn chat_ref(source: &HistoryScope, target: &HistoryScope, ordinal: u64) -> Proje
         target_incarnation: target.incarnation,
         source_revision: rev(11),
         ref_ordinal: ordinal,
-        start_byte: ordinal * 10,
-        end_byte: ordinal * 10 + 10,
     }
 }
 
@@ -342,8 +199,17 @@ async fn test_replay_publication(store: &DerivedStore) {
             .is_empty()
     );
 
+    // Direct single-tx apply_with_replay publishes watermark and replay slots
+    // without touching projection_apply_pages.
     store
-        .publish_staged_with_replay(&key, 0, &next, Some(seq(5)), Some(slots.clone()))
+        .apply_with_replay(
+            &SpaceApply {
+                expected: Some(seq(5)),
+                watermark: next.clone(),
+                mutations: Vec::new(),
+            },
+            Some(slots.clone()),
+        )
         .await
         .unwrap();
     let entries = store.replay_page(&next, seq(5)).await.unwrap().unwrap();
@@ -351,6 +217,7 @@ async fn test_replay_publication(store: &DerivedStore) {
     assert_eq!(entries[0].after, seq(5));
     assert_eq!(entries[0].through, seq(6));
     assert_eq!(entries[0].slots, slots);
+
     next.snapshot_seq = seq(6);
     store
         .apply(&SpaceApply {
@@ -368,6 +235,56 @@ async fn test_replay_publication(store: &DerivedStore) {
             .unwrap()
             .is_empty()
     );
+}
+
+async fn test_trashed_and_active_folder_path_uniqueness(store: &DerivedStore) {
+    let history = scope(0xd2, 0xd3);
+    let trashed_id = FolderId::from_bytes([0x10; 16]);
+    let active_id = FolderId::from_bytes([0x11; 16]);
+    let trashed_folder = ProjectedFolder {
+        folder_id: trashed_id.clone(),
+        dense_folder_id: 1,
+        parent_folder_id: Some(root_folder()),
+        slug: "docs".to_owned(),
+        slug_fold: "docs".to_owned(),
+        display_name: "Docs (trashed)".to_owned(),
+        norm_path_prefix: None,
+        display_path_prefix: "Docs".to_owned(),
+        lifecycle: Lifecycle::Trashed,
+        ..folder(&history, None)
+    };
+    let active_folder = ProjectedFolder {
+        folder_id: active_id.clone(),
+        dense_folder_id: 2,
+        parent_folder_id: Some(root_folder()),
+        slug: "docs".to_owned(),
+        slug_fold: "docs".to_owned(),
+        display_name: "Docs".to_owned(),
+        norm_path_prefix: Some("docs".to_owned()),
+        display_path_prefix: "Docs".to_owned(),
+        lifecycle: Lifecycle::Active,
+        ..folder(&history, None)
+    };
+    let mut wm = water(&history, seq(1));
+    wm.next_dense_folder_id = 3;
+    store
+        .apply(&SpaceApply {
+            expected: None,
+            watermark: wm,
+            mutations: vec![
+                DerivedMutation::UpsertFolder(folder(&history, None)),
+                DerivedMutation::UpsertFolder(trashed_folder),
+                DerivedMutation::UpsertFolder(active_folder.clone()),
+            ],
+        })
+        .await
+        .expect("trashed sibling and active folder with the same slug coexist");
+    let found = store
+        .folder_by_path(&history, seq(1), "docs")
+        .await
+        .unwrap()
+        .expect("active folder resolves by path");
+    assert_eq!(found.folder_id, active_id);
 }
 
 async fn test_storage(store: &DerivedStore) {
@@ -490,41 +407,6 @@ async fn test_storage(store: &DerivedStore) {
         second.iter().map(|row| row.link_ord).collect::<Vec<_>>(),
         [3]
     );
-    let scratch_key = StageKey {
-        scope: local.clone(),
-        first: seq(11),
-        last: seq(11),
-    };
-    let scratch = LinkScratch::open(store, &scratch_key, seq(10))
-        .await
-        .unwrap();
-    assert!(scratch.first_note(&note_id()).await.unwrap());
-    assert!(!scratch.first_note(&note_id()).await.unwrap());
-    scratch
-        .record_source(ScratchSource {
-            dense: 1,
-            note: note_id(),
-            parent: Some(root_folder()),
-            visible: true,
-            raw_count: Some(1),
-            replace_candidates: true,
-            replace_slot: true,
-            slot: Some((root_folder(), "later-name".into())),
-        })
-        .await
-        .unwrap();
-    scratch
-        .record_raw(1, 0, &["staged-body".into()])
-        .await
-        .unwrap();
-    let later = CandidateLookupKey {
-        leaf_norm_key: "later-name".into(),
-        ..candidate.clone()
-    };
-    scratch
-        .record_candidates(std::slice::from_ref(&later))
-        .await
-        .unwrap();
     let lookup = CandidateQuery {
         space: &local.space_id,
         folder: -1,
@@ -537,50 +419,6 @@ async fn test_storage(store: &DerivedStore) {
         store.candidates(lookup, None, 1).await.unwrap(),
         [candidate]
     );
-    assert!(
-        scratch
-            .candidates(lookup, None, 1)
-            .await
-            .unwrap()
-            .is_empty()
-    );
-    let revised = CandidateQuery {
-        leaf: "later-name",
-        ..lookup
-    };
-    assert_eq!(scratch.candidates(revised, None, 1).await.unwrap(), [later]);
-    assert_eq!(
-        scratch
-            .slot_occupant(&local.space_id, &root_folder(), "later-name")
-            .await
-            .unwrap(),
-        Some(note_id())
-    );
-    let alias = ProjectedNoteAlias {
-        space_id: local.space_id.clone(),
-        old_parent_folder_id: root_folder(),
-        old_slug_fold: "earlier-name".into(),
-        old_title_norm: "earlier title".into(),
-        created_seq: seq(11),
-        target_note_id: note_id(),
-    };
-    scratch.record_alias(&alias).await.unwrap();
-    assert_eq!(
-        scratch
-            .aliases(&local.space_id, AliasKey::Title, "earlier title", None, 20)
-            .await
-            .unwrap(),
-        [alias]
-    );
-    assert_eq!(
-        scratch.raw(1, 0).await.unwrap(),
-        [(0, "staged-body".into())]
-    );
-    scratch.record_watch(&first).await.unwrap();
-    scratch.record_watch(&first).await.unwrap();
-    assert!(scratch.watched(None).await.unwrap().is_empty());
-    store.discard_staging(&local).await.unwrap();
-    assert!(scratch.raw(1, 0).await.is_err());
     let checkpoint = TrustedCheckpoint {
         space_id: local.space_id.clone(),
         history_incarnation: local.incarnation,
@@ -601,10 +439,6 @@ async fn test_storage(store: &DerivedStore) {
         Some(checkpoint.clone())
     );
 
-    let lease = store
-        .retain_cut(&local, seq(10), Duration::from_secs(10))
-        .await
-        .unwrap();
     store
         .apply(&SpaceApply {
             expected: Some(seq(10)),
@@ -612,14 +446,11 @@ async fn test_storage(store: &DerivedStore) {
             mutations: vec![
                 DerivedMutation::UpsertNote(Box::new(note(&local, "Second", 11))),
                 DerivedMutation::UpsertFolder(folder(&local, None)),
-                // Before-images capture the command entry once, even for one key
-                // updated more than once within a command.
                 DerivedMutation::UpsertNote(Box::new(note(&local, "Third", 11))),
             ],
         })
         .await
         .expect("publish update");
-    lease.check().await.unwrap();
     assert!(
         store
             .hydrate_current_cards(&local, seq(10), &[1])
@@ -627,14 +458,11 @@ async fn test_storage(store: &DerivedStore) {
             .unwrap()
             .is_none()
     );
+    // Lock-free current-cut reads return CursorStale when derived has moved past
+    // the requested cut.
     assert_eq!(
-        store
-            .note_by_id(&local, seq(10), &note_id())
-            .await
-            .unwrap()
-            .unwrap()
-            .title,
-        "First"
+        store.note_by_id(&local, seq(10), &note_id()).await,
+        Err(super::stale())
     );
     assert_eq!(
         store
@@ -645,14 +473,14 @@ async fn test_storage(store: &DerivedStore) {
             .title,
         "Third"
     );
-    assert_eq!(
+    assert!(
         store
-            .folder_by_id(&local, seq(10), &root_folder())
+            .folder_by_id(&local, seq(11), &root_folder())
             .await
             .unwrap()
             .unwrap()
-            .cover_note_id,
-        Some(note_id())
+            .cover_note_id
+            .is_none()
     );
 
     let encrypted = ProjectedNote {
@@ -782,7 +610,6 @@ async fn test_storage(store: &DerivedStore) {
             .await,
         Err(super::stale()),
     );
-    assert_eq!(lease.check().await, Err(super::stale()));
     assert!(
         store
             .note_by_id(&local, seq(11), &note_id())
@@ -877,7 +704,7 @@ async fn test_storage(store: &DerivedStore) {
     );
 }
 
-async fn test_control(control: &GenerationControl, peer: Option<&GenerationControl>) {
+async fn test_control(control: &GenerationControl) {
     let first = GenerationDescriptor {
         generation: ProjectionGeneration::new(1).unwrap(),
         publication_epoch: 1,
@@ -895,6 +722,12 @@ async fn test_control(control: &GenerationControl, peer: Option<&GenerationContr
     };
     assert!(control.active().await.unwrap().is_none());
     assert!(control.compare_and_swap(None, &first).await.unwrap());
+    assert!(
+        !control
+            .generation_reclaimable(first.generation)
+            .await
+            .unwrap()
+    );
     let (a, b) = tokio::join!(
         control.reserve_candidate(Some(&first), &next),
         control.reserve_candidate(Some(&first), &alternate),
@@ -902,232 +735,26 @@ async fn test_control(control: &GenerationControl, peer: Option<&GenerationContr
     assert_ne!(a.unwrap(), b.unwrap());
     assert_eq!(control.active().await.unwrap(), Some(first.clone()));
     let candidate = control.candidate().await.unwrap().unwrap();
-    if let Some(peer) = peer {
-        test_peer_handoff(control, peer, &first, &candidate).await;
-    } else {
-        assert!(
-            control
-                .compare_and_swap(Some(&first), &candidate)
-                .await
-                .unwrap()
-        );
-    }
-    assert_eq!(control.active().await.unwrap(), Some(candidate));
-    assert!(control.candidate().await.unwrap().is_none());
-}
-
-async fn test_peer_handoff(
-    control: &GenerationControl,
-    peer: &GenerationControl,
-    first: &GenerationDescriptor,
-    next: &GenerationDescriptor,
-) {
-    use super::SpaceGenerationWitness;
-
-    let old = control
-        .admit_generation_read(first.generation, "owner-a")
-        .await
-        .unwrap();
-    let attempt = peer.peer_candidate().await.unwrap().unwrap();
-    let a = SpaceGenerationWitness {
-        scope: scope(1, 10),
-        through: seq(4),
-        owner_epoch: LeaseEpoch::new(1).unwrap(),
-        participant: "owner-a".to_owned(),
-        checkpoint_digest: ContentDigest::from_bytes([30; 32]),
-    };
-    let b = SpaceGenerationWitness {
-        scope: scope(2, 10),
-        through: seq(7),
-        owner_epoch: LeaseEpoch::new(2).unwrap(),
-        participant: "owner-b".to_owned(),
-        checkpoint_digest: ContentDigest::from_bytes([31; 32]),
-    };
-    control
-        .record_peer_readiness(&attempt, std::slice::from_ref(&a))
-        .await
-        .unwrap();
-    peer.record_peer_readiness(&attempt, std::slice::from_ref(&b))
-        .await
-        .unwrap();
-    let ready = peer.peer_readiness(&attempt).await.unwrap();
-    assert_eq!(ready.len(), 2);
-    let proposal = control
-        .propose_peer_cutover(&attempt, ready, Duration::from_millis(500))
-        .await
-        .unwrap()
-        .expect("both peers are ready");
-    let _a_ack = control
-        .acknowledge_peer_cutover(&proposal, &[a])
-        .await
-        .unwrap()
-        .expect("first peer frozen");
     assert!(
         !control
-            .commit_peer_cutover(first, next, &proposal)
+            .generation_reclaimable(candidate.generation)
             .await
             .unwrap()
     );
-    assert_eq!(peer.active().await.unwrap().as_ref(), Some(first));
-    let b_ack = peer
-        .acknowledge_peer_cutover(&proposal, std::slice::from_ref(&b))
-        .await
-        .unwrap()
-        .expect("second peer frozen");
-    assert!(control.all_peers_acknowledged(&proposal).await.unwrap());
-    b_ack.release().await.unwrap();
-    assert!(
-        !control
-            .commit_peer_cutover(first, next, &proposal)
-            .await
-            .unwrap()
-    );
-    let _b_ack = peer
-        .acknowledge_peer_cutover(&proposal, &[b])
-        .await
-        .unwrap()
-        .expect("second peer refrozen");
     assert!(
         control
-            .commit_peer_cutover(first, next, &proposal)
+            .compare_and_swap(Some(&first), &candidate)
             .await
             .unwrap()
     );
-    assert!(!peer.generation_reclaimable(first.generation).await.unwrap());
+    assert_eq!(control.active().await.unwrap(), Some(candidate));
+    assert!(control.candidate().await.unwrap().is_none());
     assert!(
-        matches!(peer.admit_generation_read(first.generation, "owner-b").await,
-        Err(error) if error == super::stale())
-    );
-    drop(old);
-    let deadline = Instant::now() + Duration::from_secs(1);
-    while !peer.generation_reclaimable(first.generation).await.unwrap() {
-        assert!(
-            Instant::now() < deadline,
-            "retained generation lease released"
-        );
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-}
-
-async fn test_oversized_staging(store: &DerivedStore) {
-    use super::staging::MAX_STAGE_BYTES;
-
-    let local = scope(0xc3, 0xc4);
-    let initial = water(&local, seq(10));
-    store
-        .apply(&SpaceApply {
-            expected: None,
-            watermark: initial.clone(),
-            mutations: vec![DerivedMutation::UpsertFolder(folder(&local, None))],
-        })
-        .await
-        .unwrap();
-    let key = StageKey {
-        scope: local.clone(),
-        first: seq(11),
-        last: seq(11),
-    };
-    let mut row = note(&local, "Fragmented", 11);
-    row.view_blocks_msgpack = vec![0xe7; MAX_STAGE_BYTES + 41];
-    let large = [DerivedMutation::UpsertNote(Box::new(row.clone()))];
-    store.stage_page(&key, 0, &large).await.unwrap();
-    store.stage_page(&key, 0, &large).await.unwrap();
-    assert_eq!(fragment_sizes(store, &local).await.len(), 2);
-
-    let scope = local.clone();
-    store
-        .database
-        .write(false, move |mut tx| {
-            Box::pin(async move {
-                tx.execute(
-                    "DELETE FROM projection_apply_page_fragments
-                  WHERE space_id = ? AND fragment_no = 1",
-                    vec![value(&scope.space_id)],
-                )
-                .await?;
-                Ok(())
-            })
-        })
-        .await
-        .unwrap();
-    let next = water(&local, seq(11));
-    assert!(
-        store
-            .publish_staged(&key, 1, &next, Some(seq(10)))
-            .await
-            .is_err(),
-        "a page witness without its final fragment must not publish"
-    );
-    assert_eq!(
-        store.watermarks(&local.space_id).await.unwrap(),
-        Some(initial)
-    );
-    assert!(
-        store
-            .note_by_id(&local, seq(10), &row.note_id)
+        control
+            .generation_reclaimable(first.generation)
             .await
             .unwrap()
-            .is_none()
     );
-
-    store.discard_staging(&local).await.unwrap();
-    assert!(fragment_sizes(store, &local).await.is_empty());
-    store.stage_page(&key, 0, &large).await.unwrap();
-    let sizes = fragment_sizes(store, &local).await;
-    assert_eq!(sizes[0], MAX_STAGE_BYTES as u64);
-    assert!(sizes[1] > 41 && sizes[1] < MAX_STAGE_BYTES as u64);
-    store
-        .publish_staged(&key, 1, &next, Some(seq(10)))
-        .await
-        .unwrap();
-    assert_eq!(
-        store
-            .note_by_id(&local, seq(11), &row.note_id)
-            .await
-            .unwrap(),
-        Some(row)
-    );
-    assert!(fragment_sizes(store, &local).await.is_empty());
-
-    let obsolete = StageKey {
-        scope: local.clone(),
-        first: seq(12),
-        last: seq(12),
-    };
-    store.stage_page(&obsolete, 0, &large).await.unwrap();
-    store
-        .erase_visibility(&local, seq(13), &[note_id()], &[])
-        .await
-        .unwrap();
-    assert!(fragment_sizes(store, &local).await.is_empty());
-    assert_eq!(
-        store.stage_page(&obsolete, 0, &large).await,
-        Err(super::stale())
-    );
-}
-
-async fn fragment_sizes(store: &DerivedStore, scope: &HistoryScope) -> Vec<u64> {
-    let space = scope.space_id.clone();
-    store
-        .database
-        .read(move |mut tx| {
-            Box::pin(async move {
-                tx.select(
-                    "SELECT CAST(length(payload) AS BIGINT)
-                   FROM projection_apply_page_fragments WHERE space_id = ? ORDER BY fragment_no",
-                    vec![value(&space)],
-                    &[Kind::Integer],
-                )
-                .await?
-                .into_iter()
-                .map(|mut row| {
-                    <u64 as super::sql::SqlColumn>::read(row.pop().ok_or_else(super::invalid_row)?)
-                })
-                .collect()
-            })
-        })
-        .await
-        .unwrap()
 }
 
 async fn test_short_reads(store: &DerivedStore) {
@@ -1159,6 +786,14 @@ async fn test_short_reads(store: &DerivedStore) {
     );
 }
 
+#[test]
+fn schema_prefix_respects_postgres_identifier_budget() {
+    assert!(validate_schema_prefix(&"a".repeat(42)).is_ok());
+    assert!(validate_schema_prefix(&"a".repeat(43)).is_err());
+    assert!(validate_schema_prefix("").is_err());
+    assert!(validate_schema_prefix("bad-prefix").is_err());
+}
+
 #[tokio::test]
 async fn sqlite_projection_state_and_short_reads() {
     let scratch = Scratch::new();
@@ -1167,14 +802,13 @@ async fn sqlite_projection_state_and_short_reads() {
         .await
         .unwrap();
     test_storage(&store).await;
-    test_oversized_staging(&store).await;
-    page_pin_regression(&store).await;
+    test_trashed_and_active_folder_path_uniqueness(&store).await;
     test_replay_publication(&store).await;
     test_short_reads(&store).await;
     let control = GenerationControl::open_sqlite(&scratch.data())
         .await
         .unwrap();
-    test_control(&control, None).await;
+    test_control(&control).await;
     let reopened = GenerationControl::open_sqlite(&scratch.data())
         .await
         .unwrap();
@@ -1246,19 +880,47 @@ async fn postgres_projection_state_and_short_reads() {
             .await
             .unwrap();
     test_storage(&store).await;
+    test_trashed_and_active_folder_path_uniqueness(&store).await;
     test_postgres_seed_batches(&store).await;
-    test_oversized_staging(&store).await;
-    page_pin_regression(&store).await;
     test_replay_publication(&store).await;
     test_short_reads(&store).await;
     let control = GenerationControl::open_postgres(pool.clone(), &prefix)
         .await
         .unwrap();
-    let peer_pool = postgres_fixture().await;
-    let peer = GenerationControl::open_postgres(peer_pool.clone(), &prefix)
+    test_control(&control).await;
+    drop(store);
+    // Recreating a dropped generation schema on the same pooled connection must
+    // remain readable (no stale sqlx prepared statement failures across DDL).
+    let recreate = format!("DROP SCHEMA \"{prefix}_g1\" CASCADE;");
+    sqlx::raw_sql(AssertSqlSafe(recreate.as_str()))
+        .execute(&pool)
+        .await
+        .expect("drop g1 before rebuild on same pool");
+    let rebuilt =
+        DerivedStore::open_postgres(pool.clone(), &prefix, ProjectionGeneration::new(1).unwrap())
+            .await
+            .unwrap();
+    let h = scope(0xe1, 0xe2);
+    rebuilt
+        .apply(&SpaceApply {
+            expected: None,
+            watermark: water(&h, seq(1)),
+            mutations: vec![
+                DerivedMutation::UpsertFolder(folder(&h, None)),
+                DerivedMutation::UpsertNote(Box::new(note(&h, "Rebuilt", 1))),
+            ],
+        })
         .await
         .unwrap();
-    test_control(&control, Some(&peer)).await;
+    assert_eq!(rebuilt.hydrate(&h, seq(1), &[1]).await.unwrap().len(), 1);
+    assert!(
+        rebuilt
+            .folder_by_path(&h, seq(1), "")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    drop(rebuilt);
     let cleanup =
         format!("DROP SCHEMA \"{prefix}_g1\" CASCADE; DROP SCHEMA \"{prefix}_ctrl\" CASCADE;");
     sqlx::raw_sql(AssertSqlSafe(cleanup.as_str()))
@@ -1266,7 +928,6 @@ async fn postgres_projection_state_and_short_reads() {
         .await
         .expect("drop derived fixture schemas");
     pool.close().await;
-    peer_pool.close().await;
 }
 
 async fn test_postgres_seed_batches(store: &DerivedStore) {
@@ -1397,162 +1058,4 @@ async fn test_postgres_seed_batches(store: &DerivedStore) {
         .await
         .unwrap();
     assert_eq!(links, [resolved]);
-}
-
-#[tokio::test]
-async fn postgres_abandoned_admission_and_off_thread_release_retry() {
-    const COMMIT_BLOCKER: i64 = 1_760_020;
-    let pool = postgres_fixture().await;
-    let prefix = format!("t_{}_lease", random_label());
-    let schema = format!("{prefix}_ctrl");
-    let control = GenerationControl::open_postgres(pool.clone(), &prefix)
-        .await
-        .unwrap();
-    let active = GenerationDescriptor {
-        generation: ProjectionGeneration::new(1).unwrap(),
-        publication_epoch: 1,
-        cut_fingerprint: ContentDigest::from_bytes([35; 32]),
-    };
-    assert!(control.compare_and_swap(None, &active).await.unwrap());
-
-    let fixtures = format!(
-        r#"
-        CREATE TABLE "{schema}".lease_commit_witness (id BYTEA PRIMARY KEY);
-        CREATE FUNCTION "{schema}".observe_lease_commit() RETURNS trigger
-        LANGUAGE plpgsql AS $function$
-        BEGIN
-            IF NEW.participant = 'abandoned-open' THEN
-                PERFORM pg_advisory_xact_lock({COMMIT_BLOCKER});
-                INSERT INTO "{schema}".lease_commit_witness VALUES (NEW.lease_id);
-            END IF;
-            RETURN NULL;
-        END;
-        $function$;
-        CREATE CONSTRAINT TRIGGER observe_lease_commit
-          AFTER INSERT ON "{schema}".projection_generation_read_leases
-          DEFERRABLE INITIALLY DEFERRED FOR EACH ROW
-          EXECUTE FUNCTION "{schema}".observe_lease_commit();
-        CREATE SEQUENCE "{schema}".lease_release_attempt;
-        CREATE FUNCTION "{schema}".retry_lease_release() RETURNS trigger
-        LANGUAGE plpgsql AS $function$
-        BEGIN
-            IF OLD.participant = 'off-thread-release' THEN
-                IF nextval('"{schema}".lease_release_attempt') = 1 THEN
-                    RAISE EXCEPTION USING ERRCODE = '55P03', MESSAGE = 'fixture transient release failure';
-                END IF;
-            END IF;
-            RETURN OLD;
-        END;
-        $function$;
-        CREATE TRIGGER retry_lease_release
-          BEFORE DELETE ON "{schema}".projection_generation_read_leases
-          FOR EACH ROW EXECUTE FUNCTION "{schema}".retry_lease_release();
-        "#
-    );
-    sqlx::raw_sql(AssertSqlSafe(fixtures.as_str()))
-        .execute(&pool)
-        .await
-        .unwrap();
-
-    let mut blocker = pool.acquire().await.unwrap();
-    blocker.close_on_drop();
-    sqlx::query("SELECT pg_advisory_lock($1)")
-        .bind(COMMIT_BLOCKER)
-        .execute(&mut *blocker)
-        .await
-        .unwrap();
-    let request_control = control.clone();
-    let generation = active.generation;
-    let request = tokio::spawn(async move {
-        request_control
-            .admit_generation_read(generation, "abandoned-open")
-            .await
-    });
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let waiting: bool = sqlx::query_scalar(
-                "SELECT EXISTS (SELECT 1 FROM pg_locks
-                   WHERE locktype = 'advisory' AND classid = 0 AND objid = CAST($1 AS BIGINT)::oid
-                     AND objsubid = 1 AND NOT granted)",
-            )
-            .bind(COMMIT_BLOCKER)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-            if waiting {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("registration reached its deferred COMMIT trigger");
-    request.abort();
-    assert!(matches!(request.await, Err(error) if error.is_cancelled()));
-    let unlocked: bool = sqlx::query_scalar("SELECT pg_advisory_unlock($1)")
-        .bind(COMMIT_BLOCKER)
-        .fetch_one(&mut *blocker)
-        .await
-        .unwrap();
-    assert!(unlocked);
-    drop(blocker);
-
-    let committed = format!(r#"SELECT EXISTS (SELECT 1 FROM "{schema}".lease_commit_witness)"#);
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let committed: bool = sqlx::query_scalar(AssertSqlSafe(committed.as_str()))
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-            if committed && !lease_row_exists(&pool, &schema, "abandoned-open").await {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("the abandoned registration committed and was then released");
-
-    let held = control
-        .admit_generation_read(generation, "off-thread-release")
-        .await
-        .unwrap();
-    assert!(lease_row_exists(&pool, &schema, "off-thread-release").await);
-    let outside_owner = held.clone();
-    std::thread::spawn(move || drop(held)).join().unwrap();
-    assert!(lease_row_exists(&pool, &schema, "off-thread-release").await);
-    std::thread::spawn(move || drop(outside_owner))
-        .join()
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while lease_row_exists(&pool, &schema, "off-thread-release").await {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("release retried after a real transient PostgreSQL failure");
-    let sequence = format!(r#"SELECT last_value FROM "{schema}".lease_release_attempt"#);
-    let attempts: i64 = sqlx::query_scalar(AssertSqlSafe(sequence.as_str()))
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert!(attempts >= 2);
-
-    let ddl = format!(r#"DROP SCHEMA "{schema}" CASCADE"#);
-    sqlx::raw_sql(AssertSqlSafe(ddl.as_str()))
-        .execute(&pool)
-        .await
-        .unwrap();
-    pool.close().await;
-}
-
-async fn lease_row_exists(pool: &PgPool, schema: &str, participant: &str) -> bool {
-    let sql = format!(
-        r#"SELECT EXISTS (SELECT 1 FROM "{schema}".projection_generation_read_leases WHERE participant = $1)"#
-    );
-    sqlx::query_scalar(AssertSqlSafe(sql.as_str()))
-        .bind(participant)
-        .fetch_one(pool)
-        .await
-        .unwrap()
 }

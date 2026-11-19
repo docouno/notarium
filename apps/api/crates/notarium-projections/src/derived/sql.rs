@@ -33,6 +33,8 @@ const READ_LIMIT: Duration = Duration::from_millis(240);
 const PG_READ_LIMIT: Duration = Duration::from_millis(225);
 const READERS: usize = 8;
 const WAL_LIMIT: u64 = 64 * 1024 * 1024;
+// PostgreSQL identifier limit (NAMEDATALEN - 1 = 63) minus "_g" and max u64 digits (19).
+const MAX_SCHEMA_PREFIX_LEN: usize = 42;
 
 #[derive(Clone, Copy)]
 pub(super) enum Kind {
@@ -88,6 +90,8 @@ pub(super) enum SqlValue {
     Integer(Option<i64>),
     Text(Option<String>),
     Bytes(Option<Vec<u8>>),
+    IntArray(Vec<i64>),
+    TextArray(Vec<String>),
     OutOfRange,
 }
 
@@ -98,6 +102,7 @@ impl ToSql for SqlValue {
             Self::Text(Some(value)) => ValueRef::Text(value.as_bytes()),
             Self::Bytes(Some(value)) => ValueRef::Blob(value),
             Self::Integer(None) | Self::Text(None) | Self::Bytes(None) => ValueRef::Null,
+            Self::IntArray(_) | Self::TextArray(_) => return Err(rusqlite::Error::InvalidQuery),
             Self::OutOfRange => return Err(rusqlite::Error::IntegralValueOutOfRange(0, i64::MAX)),
         }))
     }
@@ -289,7 +294,6 @@ pub(super) trait SqlRecord: Sized {
     const TABLE: &'static str;
     const COLUMNS: &'static [Column];
     const KEY: &'static [&'static str];
-    const TEMPORAL: bool = false;
 
     fn values(&self) -> Vec<SqlValue>;
     fn key(&self) -> Vec<SqlValue>;
@@ -305,10 +309,6 @@ pub(super) trait SqlRecord: Sized {
 
     fn kinds() -> Vec<Kind> {
         Self::COLUMNS.iter().map(|column| column.kind).collect()
-    }
-
-    fn history_table() -> String {
-        format!("{}_history", Self::TABLE)
     }
 }
 
@@ -327,10 +327,11 @@ pub(super) fn key_filter<R: SqlRecord>() -> String {
 }
 
 struct SqliteDatabase {
+    path: PathBuf,
     writer: Mutex<Connection>,
     readers: Mutex<Vec<Connection>>,
     permits: Arc<Semaphore>,
-    checkpoint: CheckpointGate,
+    checkpoint: Arc<CheckpointGate>,
     wal: PathBuf,
 }
 
@@ -347,12 +348,19 @@ struct CheckpointState {
 }
 
 impl CheckpointGate {
-    fn admit(&self, deadline_at: Instant) -> Result<CheckpointLease<'_>, PortError> {
+    fn admit(
+        &self,
+        deadline_at: Instant,
+        aborted: &AtomicBool,
+    ) -> Result<CheckpointLease<'_>, PortError> {
         let mut state = self
             .state
             .lock()
             .map_err(|_| internal("projection_checkpoint_gate"))?;
         while state.draining {
+            if aborted.load(Ordering::Acquire) {
+                return Err(deadline());
+            }
             let remaining = deadline_at
                 .checked_duration_since(Instant::now())
                 .ok_or_else(deadline)?;
@@ -360,7 +368,7 @@ impl CheckpointGate {
                 .changed
                 .wait_timeout(state, remaining)
                 .map_err(|_| internal("projection_checkpoint_gate"))?;
-            if wait.timed_out() {
+            if wait.timed_out() || aborted.load(Ordering::Acquire) {
                 return Err(deadline());
             }
             state = updated;
@@ -370,6 +378,12 @@ impl CheckpointGate {
             gate: self,
             writer: false,
         })
+    }
+
+    fn wake_all(&self) {
+        if let Ok(_state) = self.state.lock() {
+            self.changed.notify_all();
+        }
     }
 
     /// Only the single derived writer calls this method. It closes admission
@@ -414,6 +428,33 @@ impl Drop for CheckpointLease<'_> {
     }
 }
 
+struct ReaderGuard<'a> {
+    sqlite: &'a SqliteDatabase,
+    reader: Option<Connection>,
+}
+
+impl Drop for ReaderGuard<'_> {
+    fn drop(&mut self) {
+        let Some(reader) = self.reader.take() else {
+            return;
+        };
+        let _ = reader.progress_handler(0, None::<fn() -> bool>);
+        if !reader.is_autocommit() && reader.execute_batch("ROLLBACK").is_err() {
+            // Drop the tainted connection and replace it with a clean reader.
+            drop(reader);
+            if let Ok(replacement) = open_reader(&self.sqlite.path)
+                && let Ok(mut pool) = self.sqlite.readers.lock()
+            {
+                pool.push(replacement);
+            }
+            return;
+        }
+        if let Ok(mut pool) = self.sqlite.readers.lock() {
+            pool.push(reader);
+        }
+    }
+}
+
 enum Backend {
     Sqlite(Box<SqliteDatabase>),
     Postgres { pool: PgPool, schema: String },
@@ -436,6 +477,11 @@ impl Database {
             let directory = path.parent().ok_or_else(invalid_row)?;
             std::fs::create_dir_all(directory)
                 .map_err(|_| internal("projection_sqlite_directory"))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700));
+            }
             #[cfg(target_os = "linux")]
             suppress_access_times(directory);
             let writer = Connection::open_with_flags(
@@ -445,6 +491,11 @@ impl Database {
                     | OpenFlags::SQLITE_OPEN_NO_MUTEX,
             )
             .map_err(sqlite_error)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            }
             writer
                 .busy_timeout(Duration::from_secs(5))
                 .map_err(sqlite_error)?;
@@ -473,13 +524,14 @@ impl Database {
             for _ in 0..READERS {
                 readers.push(open_reader(&path)?);
             }
-            let mut wal = path.into_os_string();
+            let mut wal = path.as_os_str().to_os_string();
             wal.push("-wal");
             Ok(Self(Backend::Sqlite(Box::new(SqliteDatabase {
+                path,
                 writer: Mutex::new(writer),
                 readers: Mutex::new(readers),
                 permits: Arc::new(Semaphore::new(READERS)),
-                checkpoint: CheckpointGate::default(),
+                checkpoint: Arc::new(CheckpointGate::default()),
                 wal: PathBuf::from(wal),
             }))))
         })
@@ -524,6 +576,12 @@ impl Database {
             .map_err(postgres_error)?;
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 251850))")
             .bind(schema)
+            .execute(&mut *tx)
+            .await
+            .map_err(postgres_error)?;
+        // Once the generation lifecycle lock is held, reset lock_timeout so
+        // physical erasure rows do not fail prematurely under concurrent writes.
+        sqlx::query("SET LOCAL lock_timeout = DEFAULT")
             .execute(&mut *tx)
             .await
             .map_err(postgres_error)?;
@@ -589,7 +647,14 @@ impl Database {
                     let result = match result {
                         Ok(value) => match writer.execute_batch("COMMIT") {
                             Ok(()) => Ok(value),
-                            Err(_) => Err(unknown_commit()),
+                            Err(error) => {
+                                tracing::warn!(
+                                    error_code = ?error.sqlite_error_code(),
+                                    extended_code = sqlite_extended_code(&error),
+                                    "derived SQLite COMMIT failed"
+                                );
+                                Err(unknown_commit())
+                            }
                         },
                         Err(err) => Err(err),
                     };
@@ -600,24 +665,49 @@ impl Database {
                     let over_limit = !scrub_wal
                         && std::fs::metadata(&sqlite.wal)
                             .is_ok_and(|metadata| metadata.len() > WAL_LIMIT);
-                    if over_limit {
-                        // Backfill ordinary WAL pressure while bounded readers
-                        // can still enter. The exclusive step resets the WAL.
-                        writer
-                            .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()))
-                            .map_err(|_| unknown_commit())?;
-                    }
                     if scrub_wal || over_limit {
-                        let _checkpoint = sqlite
-                            .checkpoint
-                            .checkpoint()
-                            .map_err(|_| unknown_commit())?;
-                        let busy = writer
-                            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+                        // Backfill WAL frames while readers can still run so
+                        // the exclusive TRUNCATE step does minimal I/O.
+                        if let Err(error) =
+                            writer.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()))
+                        {
+                            tracing::warn!(
+                                scrub_wal,
+                                error_code = ?error.sqlite_error_code(),
+                                extended_code = sqlite_extended_code(&error),
+                                "derived SQLite PASSIVE checkpoint failed"
+                            );
+                            if scrub_wal {
+                                return Err(unknown_commit());
+                            }
+                        } else if let Ok(_checkpoint) = sqlite.checkpoint.checkpoint() {
+                            match writer.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
                                 r.get::<_, i64>(0)
-                            })
-                            .map_err(|_| unknown_commit())?;
-                        if busy != 0 {
+                            }) {
+                                Ok(0) => {}
+                                Ok(busy) => {
+                                    tracing::warn!(
+                                        scrub_wal,
+                                        busy,
+                                        "derived SQLite TRUNCATE checkpoint busy"
+                                    );
+                                    if scrub_wal {
+                                        return Err(unknown_commit());
+                                    }
+                                }
+                                Err(error) => {
+                                    tracing::warn!(
+                                        scrub_wal,
+                                        error_code = ?error.sqlite_error_code(),
+                                        extended_code = sqlite_extended_code(&error),
+                                        "derived SQLite TRUNCATE checkpoint failed"
+                                    );
+                                    if scrub_wal {
+                                        return Err(unknown_commit());
+                                    }
+                                }
+                            }
+                        } else if scrub_wal {
                             return Err(unknown_commit());
                         }
                     }
@@ -639,23 +729,36 @@ impl Database {
         match &self.0 {
             Backend::Postgres { pool, schema } => {
                 // On PostgreSQL 16 statement_timeout is per statement. An
-                // interrupted transaction also loses its connection so a
-                // query started near the overall deadline cannot pin MVCC.
+                // interrupted or timed-out transaction drops its connection so
+                // an in-flight query cannot pin MVCC, whereas clean domain
+                // errors roll back and return the connection to the pool.
                 let budget = tokio::time::Instant::from_std(cutoff - (READ_LIMIT - PG_READ_LIMIT));
                 tokio::time::timeout_at(budget, async {
                     let mut lease = PgReadConnection {
                         connection: pool.acquire().await.map_err(postgres_error)?,
                         finished: false,
                     };
-                    let result = {
-                        let mut tx = lease.connection.begin().await.map_err(postgres_error)?;
-                        configure_postgres(&mut tx, schema, true).await?;
-                        let result = operation(SqlTransaction::Postgres(&mut tx)).await?;
-                        tx.commit().await.map_err(postgres_error)?;
-                        result
-                    };
-                    lease.finished = true;
-                    Ok(result)
+                    let mut tx = lease.connection.begin().await.map_err(postgres_error)?;
+                    configure_postgres(&mut tx, schema, true).await?;
+                    match operation(SqlTransaction::Postgres(&mut tx)).await {
+                        Ok(result) => {
+                            tx.commit().await.map_err(postgres_error)?;
+                            lease.finished = true;
+                            Ok(result)
+                        }
+                        Err(err) => {
+                            let clean_domain = !matches!(
+                                err,
+                                PortError::Internal(_)
+                                    | PortError::DeadlineExceeded(_)
+                                    | PortError::Cancelled(_)
+                            );
+                            if clean_domain && tx.rollback().await.is_ok() {
+                                lease.finished = true;
+                            }
+                            Err(err)
+                        }
+                    }
                 })
                 .await
                 .map_err(|_| deadline())?
@@ -668,31 +771,37 @@ impl Database {
                         .map_err(|_| internal("projection_reader_pool"))?;
                 let database = Arc::clone(self);
                 let runtime = Handle::current();
-                let abort = ReadAbort(Arc::new(AtomicBool::new(false)));
-                let abort_worker = Arc::clone(&abort.0);
+                let abort = ReadAbort {
+                    flag: Arc::new(AtomicBool::new(false)),
+                    gate: Arc::clone(&sqlite.checkpoint),
+                };
+                let abort_worker = Arc::clone(&abort.flag);
                 let task = tokio::task::spawn_blocking(move || {
                     let _permit = permit;
                     let Backend::Sqlite(sqlite) = &database.0 else {
                         unreachable!();
                     };
-                    let _checkpoint = sqlite.checkpoint.admit(cutoff)?;
+                    let _checkpoint = sqlite.checkpoint.admit(cutoff, &abort_worker)?;
                     if Instant::now() >= cutoff || abort_worker.load(Ordering::Acquire) {
                         return Err(deadline());
                     }
-                    let mut reader = sqlite
+                    let reader = sqlite
                         .readers
                         .lock()
                         .map_err(|_| internal("projection_reader_lock"))?
                         .pop()
                         .ok_or_else(|| internal("projection_reader_pool"))?;
-                    let result =
-                        run_sqlite_read(&mut reader, cutoff, abort_worker, runtime, operation);
-                    sqlite
-                        .readers
-                        .lock()
-                        .map_err(|_| internal("projection_reader_lock"))?
-                        .push(reader);
-                    result
+                    let mut guard = ReaderGuard {
+                        sqlite,
+                        reader: Some(reader),
+                    };
+                    run_sqlite_read(
+                        guard.reader.as_mut().expect("reader present"),
+                        cutoff,
+                        abort_worker,
+                        runtime,
+                        operation,
+                    )
                 });
                 let result = tokio::time::timeout_at(budget, task)
                     .await
@@ -717,11 +826,15 @@ impl Drop for PgReadConnection {
     }
 }
 
-struct ReadAbort(Arc<AtomicBool>);
+struct ReadAbort {
+    flag: Arc<AtomicBool>,
+    gate: Arc<CheckpointGate>,
+}
 
 impl Drop for ReadAbort {
     fn drop(&mut self) {
-        self.0.store(true, Ordering::Release);
+        self.flag.store(true, Ordering::Release);
+        self.gate.wake_all();
     }
 }
 
@@ -810,6 +923,17 @@ async fn configure_postgres(
     Ok(())
 }
 
+pub(super) fn validate_schema_prefix(value: &str) -> Result<&str, PortError> {
+    let validated = validate_identifier(value)?;
+    if validated.len() > MAX_SCHEMA_PREFIX_LEN {
+        return Err(notarium_core::DomainError::validation(
+            notarium_core::error::ValidationReason::InvalidId,
+        )
+        .into());
+    }
+    Ok(validated)
+}
+
 pub(super) fn validate_identifier(value: &str) -> Result<&str, PortError> {
     if !value.is_empty()
         && value.len() <= 63
@@ -855,10 +979,31 @@ impl SqlTransaction<'_> {
         params: Vec<SqlValue>,
     ) -> Result<u64, PortError> {
         match self {
-            Self::Sqlite(conn) => sqlite_execute(conn, sql, &params),
+            Self::Sqlite(conn) => sqlite_execute(conn, sql, &params, true),
             Self::Postgres(conn) => {
                 let sql = postgres_parameters(sql);
                 let query = bind_postgres(&sql, params)?;
+                Ok(query
+                    .execute(&mut **conn)
+                    .await
+                    .map_err(postgres_error)?
+                    .rows_affected())
+            }
+        }
+    }
+
+    /// Executes a dynamically shaped statement (such as a multi-row `VALUES`
+    /// batch) without polluting the prepared statement cache.
+    pub(super) async fn execute_uncached(
+        &mut self,
+        sql: &str,
+        params: Vec<SqlValue>,
+    ) -> Result<u64, PortError> {
+        match self {
+            Self::Sqlite(conn) => sqlite_execute(conn, sql, &params, false),
+            Self::Postgres(conn) => {
+                let sql = postgres_parameters(sql);
+                let query = bind_postgres(&sql, params)?.persistent(false);
                 Ok(query
                     .execute(&mut **conn)
                     .await
@@ -909,11 +1054,23 @@ impl SqlTransaction<'_> {
     }
 }
 
-fn sqlite_execute(conn: &Connection, sql: &str, params: &[SqlValue]) -> Result<u64, PortError> {
-    let mut statement = conn.prepare_cached(sql).map_err(sqlite_error)?;
-    let count = statement
-        .execute(rusqlite::params_from_iter(params))
-        .map_err(sqlite_error)?;
+fn sqlite_execute(
+    conn: &Connection,
+    sql: &str,
+    params: &[SqlValue],
+    cached: bool,
+) -> Result<u64, PortError> {
+    let count = if cached {
+        let mut statement = conn.prepare_cached(sql).map_err(sqlite_error)?;
+        statement
+            .execute(rusqlite::params_from_iter(params))
+            .map_err(sqlite_error)?
+    } else {
+        let mut statement = conn.prepare(sql).map_err(sqlite_error)?;
+        statement
+            .execute(rusqlite::params_from_iter(params))
+            .map_err(sqlite_error)?
+    };
     Ok(count as u64)
 }
 
@@ -939,11 +1096,28 @@ fn sqlite_select(
 fn postgres_parameters(sql: &str) -> String {
     use std::fmt::Write;
     let mut result = String::with_capacity(sql.len() + 16);
-    for (index, fragment) in sql.split('?').enumerate() {
-        if index != 0 {
+    let mut index = 0usize;
+    let mut in_single = false;
+    let mut chars = sql.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if in_single {
+            result.push(ch);
+            if ch == '\'' {
+                if chars.peek() == Some(&'\'') {
+                    result.push(chars.next().expect("peeked quote"));
+                } else {
+                    in_single = false;
+                }
+            }
+        } else if ch == '\'' {
+            in_single = true;
+            result.push(ch);
+        } else if ch == '?' {
+            index += 1;
             write!(result, "${index}").expect("writing to a String");
+        } else {
+            result.push(ch);
         }
-        result.push_str(fragment);
     }
     result
 }
@@ -958,10 +1132,19 @@ fn bind_postgres(
             SqlValue::Integer(value) => query.bind(value),
             SqlValue::Text(value) => query.bind(value),
             SqlValue::Bytes(value) => query.bind(value),
+            SqlValue::IntArray(values) => query.bind(values),
+            SqlValue::TextArray(values) => query.bind(values),
             SqlValue::OutOfRange => return Err(invalid_row()),
         };
     }
     Ok(query)
+}
+
+fn sqlite_extended_code(error: &rusqlite::Error) -> Option<i32> {
+    match error {
+        rusqlite::Error::SqliteFailure(ffi, _) => Some(ffi.extended_code),
+        _ => None,
+    }
 }
 
 fn sqlite_error(error: rusqlite::Error) -> PortError {
@@ -971,18 +1154,46 @@ fn sqlite_error(error: rusqlite::Error) -> PortError {
     ) {
         return deadline();
     }
-    tracing::debug!(error_code = ?error.sqlite_error_code(), "derived SQLite operation failed");
+    tracing::warn!(
+        error_code = ?error.sqlite_error_code(),
+        extended_code = sqlite_extended_code(&error),
+        "derived SQLite operation failed"
+    );
     internal("projection_sqlite_operation")
 }
 
 fn postgres_error(error: sqlx::Error) -> PortError {
+    if matches!(error, sqlx::Error::PoolTimedOut) {
+        return deadline();
+    }
     let code = error
         .as_database_error()
         .and_then(sqlx::error::DatabaseError::code);
-    if code.as_deref() == Some("57014") {
-        return deadline();
+    match code.as_deref() {
+        Some("57014" | "25P03") => return deadline(),
+        Some("40P01" | "55P03") => {
+            return notarium_canonical::codec::unavailable_retryable(
+                "projection_postgres_lock_contention",
+                "derived PostgreSQL lock conflict or deadlock",
+                Duration::from_millis(20),
+            );
+        }
+        _ => {}
     }
-    tracing::debug!(error_code = ?code, "derived PostgreSQL operation failed");
+    let kind = match &error {
+        sqlx::Error::Database(_) => "database",
+        sqlx::Error::Io(_) => "io",
+        sqlx::Error::Protocol(_) => "protocol",
+        sqlx::Error::PoolClosed => "pool_closed",
+        sqlx::Error::WorkerCrashed => "worker_crashed",
+        sqlx::Error::Decode(_) => "decode",
+        _ => "other",
+    };
+    tracing::warn!(
+        error_code = ?code,
+        error_kind = kind,
+        "derived PostgreSQL operation failed"
+    );
     internal("projection_postgres_operation")
 }
 

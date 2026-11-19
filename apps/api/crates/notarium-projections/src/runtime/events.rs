@@ -1,7 +1,6 @@
 use std::{
     collections::BTreeSet,
     sync::{Arc, Weak, atomic::Ordering},
-    time::Duration,
 };
 
 use notarium_canonical::{
@@ -11,6 +10,7 @@ use notarium_canonical::{
 };
 use notarium_core::{
     DomainError,
+    auth::{SpaceKind, SpaceLifecycle},
     classes::DocClass,
     error::{PortError, ValidationReason},
     ids::{NoteId, ProjectionGeneration, SpaceSeq},
@@ -24,12 +24,14 @@ use notarium_core::{
 };
 use tokio::sync::{RwLockReadGuard, broadcast, watch};
 
-use crate::{derived::GenerationLease, query::entry_folder};
+use crate::query::entry_folder;
 
 use super::{
     ProjectionEngine, PublishedCut, SpaceSlot, apply,
-    board_events::{BoardAudience, BoardNotice, MAX_BOARD_EVENT_ITEMS},
+    board_events::{BoardAudience, BoardNotice, MAX_BOARD_EVENT_ITEMS, ScrubbableBoardDelta},
 };
+
+const MAX_HEAD_RETRIES: usize = 4;
 
 #[derive(Clone)]
 pub(super) enum QueuedEvent {
@@ -96,14 +98,15 @@ impl ProjectionEngine {
         };
         debug_assert!(valid_envelope(&event).is_ok());
         debug_assert!(!matches!(event.kind, SpaceEventKind::Board(_)));
-        let _ = self.events.send(QueuedEvent::Space { event, generation });
+        self.send_space_event(&scope.space_id, QueuedEvent::Space { event, generation });
     }
 
     pub(super) fn emit_board(&self, notice: BoardNotice) {
         // Freeze excludes delivery. Queuing an immutable old-generation
         // notice is safe, and the receiver checks the generation on rebind.
         if self.generation.load().store.generation() == notice.generation {
-            let _ = self.events.send(QueuedEvent::Board(notice));
+            let space = notice.scope.space_id.clone();
+            self.send_space_event(&space, QueuedEvent::Board(notice));
         }
     }
 
@@ -115,12 +118,15 @@ impl ProjectionEngine {
         generation: ProjectionGeneration,
     ) {
         if self.generation.load().store.generation() == generation {
-            let _ = self.events.send(QueuedEvent::RecoveryReady {
-                scope: scope.clone(),
-                through,
-                repeat_at_cut,
-                generation,
-            });
+            self.send_space_event(
+                &scope.space_id,
+                QueuedEvent::RecoveryReady {
+                    scope: scope.clone(),
+                    through,
+                    repeat_at_cut,
+                    generation,
+                },
+            );
         }
     }
 
@@ -132,12 +138,15 @@ impl ProjectionEngine {
         allow_unrestricted: bool,
     ) {
         if self.generation.load().store.generation() == generation {
-            let _ = self.events.send(QueuedEvent::CommandRefresh {
-                scope: scope.clone(),
-                range,
-                generation,
-                allow_unrestricted,
-            });
+            self.send_space_event(
+                &scope.space_id,
+                QueuedEvent::CommandRefresh {
+                    scope: scope.clone(),
+                    range,
+                    generation,
+                    allow_unrestricted,
+                },
+            );
         }
     }
 }
@@ -207,17 +216,11 @@ impl EventBusPort for SpaceEventBus {
             }
             let engine = self.running()?;
             let seq = after.check(ctx.scope())?;
-            // Register first so an event published during admission is queued.
-            let recv = engine.events.subscribe();
-            let activation = engine.activation.subscribe();
             let scope = ctx.scope();
-            {
-                let permit = engine.live_handle(scope)?.try_read()?;
-                authorize_subscription(&ctx, &permit, seq)?;
-            }
+            // Register first so an event published during admission is queued.
+            let recv = engine.subscribe_space_events(&scope.space_id);
+            let activation = engine.activation.subscribe();
             let generation = engine.generation.load().store.generation();
-            let generation_lease =
-                event_admission(&ctx, engine.admit_generation_read(scope, generation)).await?;
             let _admission = engine.current_admission(generation)?;
             let slot = engine
                 .generation
@@ -226,6 +229,7 @@ impl EventBusPort for SpaceEventBus {
                 .ok_or_else(|| DomainError::validation(ValidationReason::NotReady))?;
             let permit = engine.live_handle(scope)?.try_read()?;
             authorize_subscription(&ctx, &permit, seq)?;
+            let space_kind = permit.space().kind;
             let initial = admitted_seq(&engine, scope);
             let pending = match initial {
                 Some(projected) if projected > seq => Some(PendingEvent::Initial(projected)),
@@ -242,7 +246,7 @@ impl EventBusPort for SpaceEventBus {
                 history_ended: slot.history_ended.clone(),
                 terminal: false,
                 generation,
-                _generation_lease: generation_lease,
+                space_kind,
                 floor: initial.unwrap_or(seq).max(seq),
                 delivered: seq,
                 pending,
@@ -259,7 +263,7 @@ struct EventStream {
     history_ended: Cancellation,
     terminal: bool,
     generation: ProjectionGeneration,
-    _generation_lease: Option<GenerationLease>,
+    space_kind: SpaceKind,
     floor: SpaceSeq,
     delivered: SpaceSeq,
     pending: Option<PendingEvent>,
@@ -273,7 +277,6 @@ impl PortStream<SpaceEvent> for EventStream {
                 result => result,
             };
             if matches!(result, Ok(None) | Err(PortError::Cancelled(_))) {
-                self._generation_lease = None;
                 self.pending = None;
             }
             result
@@ -404,11 +407,17 @@ impl EventStream {
                         continue;
                     }
                     // History reset may repeat the last sequence. Graph
-                    // settlement can follow an earlier structural refresh at the same cut.
+                    // settlement, content job notices and Space lifecycle
+                    // transitions can arrive at the current floor sequence.
+                    let same_seq_allowed = matches!(
+                        event.kind,
+                        SpaceEventKind::GraphSettled { .. }
+                            | SpaceEventKind::Job(_)
+                            | SpaceEventKind::Lifecycle(_)
+                    );
                     if !matches!(event.kind, SpaceEventKind::ResyncRequired)
                         && (event.seq < self.delivered
-                            || (event.seq <= self.floor
-                                && !matches!(event.kind, SpaceEventKind::GraphSettled { .. }))
+                            || (event.seq <= self.floor && !same_seq_allowed)
                             || matches!(event.kind, SpaceEventKind::GraphSettled { generation } if generation != self.generation))
                     {
                         continue;
@@ -446,7 +455,10 @@ impl EventStream {
                     generation,
                     allow_unrestricted,
                 }) => {
-                    let direct = has_full_space_access(&self.ctx);
+                    // Shared Spaces can host private Personal chat threads that
+                    // even full-Space owners of another principal must not see.
+                    let direct =
+                        self.space_kind == SpaceKind::Personal && has_full_space_access(&self.ctx);
                     if command_scope != *scope
                         || generation != self.generation
                         || range.last_seq < self.delivered
@@ -543,35 +555,7 @@ impl EventStream {
         if cut.cut.generation != generation || !still_admitted() {
             return Ok(None);
         }
-        let participant = {
-            let Some(owner) = rebind_permit(&cut, budget, activation, &mut progress).await? else {
-                return Ok(None);
-            };
-            owner.owner_witness().process().to_owned()
-        };
-        let lease = event_admission(
-            &self.ctx,
-            engine.admit_generation_read_for_participant(generation, &participant),
-        )
-        .await;
-        if engine.generation.load().store.generation() != generation {
-            return Ok(None);
-        }
-        let lease = match lease {
-            Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
-                if diagnostic.reason == ValidationReason::CursorStale =>
-            {
-                // The durable control row can move before this process
-                // observes activation of the next generation.
-                activation
-                    .changed()
-                    .await
-                    .map_err(|_| DomainError::validation(ValidationReason::NotReady))?;
-                return Ok(None);
-            }
-            result => result?,
-        };
-        #[cfg(all(test, feature = "test-support"))]
+        #[cfg(test)]
         slot.benchmark_pause
             .pause_at(
                 super::benchmark::PausePoint::BeforeRebindAdmission,
@@ -584,12 +568,11 @@ impl EventStream {
         };
         let Ok(_admission) = engine.current_admission(generation) else {
             drop(permit);
-            drop(lease);
             wait_event_publication(engine, generation).await?;
             return Ok(None);
         };
         authorize_entry(&self.ctx, &permit)?;
-        // The lease lookup can race with withdrawal of a failed mmap.
+        // Rebind can race with withdrawal of a failed mmap.
         // A live owner permit alone does not prove this cut can serve reads.
         if !still_admitted() {
             return Ok(None);
@@ -597,7 +580,6 @@ impl EventStream {
         let seq = cut.cut.projected_seq;
         self.generation = generation;
         self.history_ended = slot.history_ended.clone();
-        self._generation_lease = lease;
         self.floor = seq;
         self.delivered = seq;
         Ok(Some(self.resync(seq)))
@@ -605,7 +587,6 @@ impl EventStream {
 
     fn finish_history(&mut self) -> SpaceEvent {
         self.pending = None;
-        self._generation_lease = None;
         self.terminal = true;
         self.resync(self.delivered)
     }
@@ -669,22 +650,6 @@ async fn rebind_permit(
     }
 }
 
-async fn event_admission<T>(
-    ctx: &SpaceContext,
-    operation: impl Future<Output = Result<T, PortError>>,
-) -> Result<T, PortError> {
-    let budget = ctx.budget.remaining.min(Duration::from_millis(240));
-    tokio::select! {
-        biased;
-        _ = ctx.budget.cancellation.cancelled() => {
-            Err(cancelled_not_committed("space_events_subscribe", "subscriber cancelled"))
-        }
-        result = tokio::time::timeout(budget, operation) => {
-            result.map_err(|_| deadline_not_committed("space_events_subscribe", "generation lease admission exceeded deadline"))?
-        }
-    }
-}
-
 fn authorize_subscription(
     ctx: &SpaceContext,
     permit: &LiveReadPermit,
@@ -713,24 +678,78 @@ pub(super) fn authorize_entry(
     )
 }
 
-fn visible_note(
+/// Read-only entry check that never mutates shared branch taint.
+fn can_view_entry(ctx: &SpaceContext, permit: &LiveReadPermit) -> Result<(), PortError> {
+    ctx.check_current(permit.scope())?;
+    let grant = ctx
+        .auth()
+        .spaces()
+        .get(&ctx.scope().space_id)
+        .ok_or(DomainError::ResourceNotFound)?;
+    let folder = entry_folder(grant, permit.root_folder_id(), None);
+    let facts = permit
+        .folder_facts(folder)
+        .ok_or(DomainError::ResourceNotFound)?;
+    ctx.auth()
+        .can_view_folder(permit.space(), folder, &facts.ancestor_folders)?;
+    Ok(())
+}
+
+/// Lifecycle closing/archiving notices must remain deliverable even after
+/// the Space transitions out of `SpaceLifecycle::Active`.
+fn can_view_lifecycle_entry(ctx: &SpaceContext, permit: &LiveReadPermit) -> Result<(), PortError> {
+    ctx.check_current(permit.scope())?;
+    let grant = ctx
+        .auth()
+        .spaces()
+        .get(&ctx.scope().space_id)
+        .ok_or(DomainError::ResourceNotFound)?;
+    if grant.read_classes.is_empty() {
+        return Err(DomainError::ResourceNotFound.into());
+    }
+    if let Some(root) = &grant.project_root {
+        let facts = permit
+            .folder_facts(root)
+            .ok_or(DomainError::ResourceNotFound)?;
+        if !facts.ancestor_folders.contains(root) {
+            return Err(DomainError::ResourceNotFound.into());
+        }
+    }
+    Ok(())
+}
+
+/// Read-only note visibility check that never mutates shared branch taint.
+fn can_view_note(
     ctx: &SpaceContext,
     permit: &LiveReadPermit,
     note: &NoteId,
 ) -> Result<bool, PortError> {
     match permit.classify(ctx, note, true)? {
-        LiveNoteStatus::ActiveVisible(facts) => {
-            ctx.auth().authorize_read(&facts)?;
-            Ok(true)
-        }
+        LiveNoteStatus::ActiveVisible(facts) => Ok(ctx.auth().can_view_resource(&facts).is_ok()),
         LiveNoteStatus::EncryptedVisible {
             facts,
             effective_lifecycle: Lifecycle::Active,
-        } => {
-            ctx.auth().authorize_read(&facts)?;
-            Ok(true)
-        }
+        } => Ok(ctx.auth().can_view_resource(&facts).is_ok()),
         _ => Ok(false),
+    }
+}
+
+fn can_confirm_change_at_current_head(
+    ctx: &SpaceContext,
+    permit: &LiveReadPermit,
+    change: &Change,
+) -> Result<bool, PortError> {
+    if has_full_space_access(ctx) && !matches!(change.entity, EntityId::Thread(_)) {
+        return Ok(true);
+    }
+    match &change.entity {
+        EntityId::Note(note) => can_view_note(ctx, permit, note),
+        EntityId::Folder(folder) => Ok(permit.folder_facts(folder).is_some_and(|facts| {
+            ctx.auth()
+                .can_view_folder(permit.space(), folder, &facts.ancestor_folders)
+                .is_ok()
+        })),
+        EntityId::Ability(_) | EntityId::Thread(_) | EntityId::Job(_) => Ok(false),
     }
 }
 
@@ -761,7 +780,7 @@ async fn publish_board(
             source: Arc::new(definition.source),
             affected: Arc::from([]),
             delta: (delta.groups.len() + delta.ranks.len() < MAX_BOARD_EVENT_ITEMS)
-                .then(|| Arc::new(delta)),
+                .then(|| ScrubbableBoardDelta::new(delta)),
         });
     }
     Ok(())
@@ -920,34 +939,64 @@ async fn space_delivery<'engine>(
     if matches!(event.kind, SpaceEventKind::GraphSettled { .. }) && !has_full_space_access(ctx) {
         return Ok(None);
     }
+    let lifecycle_closing = matches!(
+        event.kind,
+        SpaceEventKind::Lifecycle(SpaceLifecycle::Closing | SpaceLifecycle::Archived)
+    );
+    let mut head_retries = 0usize;
     while wait_event_publication(engine, generation).await? {
         let live = engine.live_handle(ctx.scope())?;
         let mut permit = live.read(&ctx.budget).await?;
-        authorize_entry(ctx, &permit)?;
+        if lifecycle_closing {
+            can_view_lifecycle_entry(ctx, &permit)?;
+        } else {
+            can_view_entry(ctx, &permit)?;
+        }
         if event.seq > permit.head() {
             return Ok(None);
         }
 
         let kind = if let SpaceEventKind::Changed(change) = &event.kind {
-            let head = permit.head();
-            drop(permit);
-            let visible = engine
-                .canonical()
-                .filter_projection_event_change(
-                    &engine.projection_context_for(ctx),
-                    ctx,
-                    change.clone(),
-                )
-                .await?;
-            permit = live.read(&ctx.budget).await?;
-            if permit.head() != head {
-                continue;
+            if has_full_space_access(ctx)
+                && matches!(change.entity, EntityId::Note(_) | EntityId::Folder(_))
+            {
+                // Full-Space grants see all note and folder metadata changes
+                // without modifying MutationEffect; skip the canonical DB trip.
+                SpaceEventKind::Changed(change.clone())
+            } else {
+                let head = permit.head();
+                drop(permit);
+                let visible = engine
+                    .canonical()
+                    .filter_projection_event_change(
+                        &engine.projection_context_for(ctx),
+                        ctx,
+                        change.clone(),
+                    )
+                    .await?;
+                permit = live.read(&ctx.budget).await?;
+                can_view_entry(ctx, &permit)?;
+                let Some(change) = visible else {
+                    if permit.head() != head && head_retries < MAX_HEAD_RETRIES {
+                        head_retries += 1;
+                        continue;
+                    }
+                    return Ok(None);
+                };
+                if permit.head() != head {
+                    head_retries += 1;
+                    if head_retries < MAX_HEAD_RETRIES {
+                        continue;
+                    }
+                    if can_confirm_change_at_current_head(ctx, &permit, &change)? {
+                        SpaceEventKind::ResyncRequired
+                    } else {
+                        return Ok(None);
+                    }
+                } else {
+                    SpaceEventKind::Changed(change)
+                }
             }
-            authorize_entry(ctx, &permit)?;
-            let Some(change) = visible else {
-                return Ok(None);
-            };
-            SpaceEventKind::Changed(change)
         } else {
             if let SpaceEventKind::Job(job) = &event.kind {
                 let Some(grant) = ctx.auth().spaces().get(&event.scope.space_id) else {
@@ -958,7 +1007,7 @@ async fn space_delivery<'engine>(
                 }
                 if let ContentJobKind::Export { notes, .. } = &job.kind {
                     for note in notes {
-                        if !visible_note(ctx, &permit, note)? {
+                        if !can_view_note(ctx, &permit, note)? {
                             return Ok(None);
                         }
                     }
@@ -969,6 +1018,16 @@ async fn space_delivery<'engine>(
         let Ok(admission) = engine.current_admission(generation) else {
             continue;
         };
+        // Only record cross-space branch taint once the full event is admitted.
+        if lifecycle_closing {
+            if permit.space().lifecycle == SpaceLifecycle::Active {
+                authorize_entry(ctx, &permit)?;
+            } else {
+                can_view_lifecycle_entry(ctx, &permit)?;
+            }
+        } else {
+            authorize_entry(ctx, &permit)?;
+        }
         return Ok(Some(EventDelivery {
             seq: event.seq,
             kind,
@@ -1067,12 +1126,13 @@ async fn command_refresh<'engine>(
     generation: ProjectionGeneration,
     command: &mut PendingCommandRefresh,
 ) -> Result<Option<EventDelivery<'engine>>, PortError> {
+    let mut head_retries = 0usize;
     while wait_event_publication(engine, generation).await? {
         if let Some(proof) = &command.proof {
             let live = engine.live_handle(ctx.scope())?;
             let head = {
                 let permit = live.read(&ctx.budget).await?;
-                authorize_entry(ctx, &permit)?;
+                can_view_entry(ctx, &permit)?;
                 if command.range.last_seq > permit.head() {
                     return Ok(None);
                 }
@@ -1087,17 +1147,29 @@ async fn command_refresh<'engine>(
                 )
                 .await?;
             let permit = live.read(&ctx.budget).await?;
-            if permit.head() != head {
-                continue;
-            }
+            can_view_entry(ctx, &permit)?;
             if visible.is_none() {
+                if permit.head() != head && head_retries < MAX_HEAD_RETRIES {
+                    head_retries += 1;
+                    continue;
+                }
                 command.proof = None;
                 continue;
             }
-            authorize_entry(ctx, &permit)?;
+            if permit.head() != head {
+                head_retries += 1;
+                if head_retries < MAX_HEAD_RETRIES {
+                    continue;
+                }
+                if !can_confirm_change_at_current_head(ctx, &permit, proof)? {
+                    command.proof = None;
+                    return Ok(None);
+                }
+            }
             let Ok(admission) = engine.current_admission(generation) else {
                 continue;
             };
+            authorize_entry(ctx, &permit)?;
             return Ok(Some(EventDelivery {
                 seq: command.range.last_seq,
                 kind: SpaceEventKind::ResyncRequired,
@@ -1210,6 +1282,7 @@ async fn board_delivery<'engine>(
     ctx: &SpaceContext,
     notice: &mut BoardNotice,
 ) -> Result<Option<EventDelivery<'engine>>, PortError> {
+    let mut head_retries = 0usize;
     loop {
         if !wait_event_publication(engine, notice.generation).await? {
             return Ok(None);
@@ -1217,7 +1290,7 @@ async fn board_delivery<'engine>(
         let live = engine.live_handle(&notice.scope)?;
         let head = {
             let permit = live.read(&ctx.budget).await?;
-            authorize_entry(ctx, &permit)?;
+            can_view_entry(ctx, &permit)?;
             if notice.seq > permit.head() {
                 return Ok(None);
             }
@@ -1233,15 +1306,19 @@ async fn board_delivery<'engine>(
                 let Ok(admission) = engine.current_admission(notice.generation) else {
                     continue;
                 };
-                let kind = match (audience, notice.delta.take()) {
+                let kind = match (
+                    audience,
+                    notice.delta.take().and_then(|slot| slot.clone_payload()),
+                ) {
                     (BoardAudience::Full, Some(delta)) => {
                         if !board_ranks_visible(ctx, &permit, &delta)? {
                             return Ok(None);
                         }
-                        SpaceEventKind::Board(Arc::unwrap_or_clone(delta))
+                        SpaceEventKind::Board(delta)
                     }
                     _ => SpaceEventKind::ResyncRequired,
                 };
+                authorize_entry(ctx, &permit)?;
                 return Ok(Some(EventDelivery {
                     seq: notice.seq,
                     kind,
@@ -1265,8 +1342,9 @@ async fn board_delivery<'engine>(
             .board_definition(&cut, cut.cut.projected_seq, &notice.view)
             .await;
         let permit = live.read(&ctx.budget).await?;
-        authorize_entry(ctx, &permit)?;
-        if permit.head() != cut.cut.projected_seq {
+        can_view_entry(ctx, &permit)?;
+        if permit.head() != cut.cut.projected_seq && head_retries < MAX_HEAD_RETRIES {
+            head_retries += 1;
             continue;
         }
 
@@ -1290,6 +1368,7 @@ async fn board_delivery<'engine>(
         let Ok(admission) = engine.current_admission(notice.generation) else {
             continue;
         };
+        authorize_entry(ctx, &permit)?;
         return Ok(Some(EventDelivery {
             seq: notice.seq,
             kind: SpaceEventKind::ResyncRequired,
@@ -1308,11 +1387,10 @@ fn board_audience_now(
     else {
         return Ok(None);
     };
-    let Some(audience) = notice.source.audience(ctx, permit) else {
+    if ctx.auth().can_view_resource(&facts).is_err() {
         return Ok(None);
-    };
-    ctx.auth().authorize_read(&facts)?;
-    Ok(Some(audience))
+    }
+    Ok(notice.source.audience(ctx, permit))
 }
 
 fn board_ranks_visible(
@@ -1321,7 +1399,7 @@ fn board_ranks_visible(
     delta: &BoardDelta,
 ) -> Result<bool, PortError> {
     for (note, _) in &delta.ranks {
-        if !visible_note(ctx, permit, note)? {
+        if !can_view_note(ctx, permit, note)? {
             return Ok(false);
         }
     }

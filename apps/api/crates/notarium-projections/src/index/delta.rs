@@ -43,24 +43,24 @@ impl SubtreeOverlay {
 }
 
 /// Private mutable command delta. A cut retains it through an Arc before the
-/// next command changes it. Every replacement masks the previous base image
-/// and supplies all current postings for the touched dense slot.
+/// next command changes it. Heavy values and rarely-mutated side maps use
+/// copy-on-write Arc sharing so sequential edits only clone touched keys.
 #[derive(Clone, Default)]
 pub struct L0Delta {
-    pub(super) notes: BTreeMap<u32, ChangedNote>,
+    pub(super) notes: BTreeMap<u32, Arc<ChangedNote>>,
     pub(super) note_lookup: BTreeMap<NoteId, u32>,
     pub(super) replaced: Bitmap,
     pub(super) deleted: Bitmap,
-    pub(super) folders: BTreeMap<u32, (FolderId, Lifecycle)>,
-    pub(super) folder_lookup: BTreeMap<FolderId, u32>,
-    pub(super) subtree_overrides: BTreeMap<u32, SubtreeOverlay>,
-    pub(super) postings: BTreeMap<Vec<u8>, Bitmap>,
-    pub(super) bsi_live: BTreeMap<Vec<u8>, BTreeMap<u32, ScalarValue>>,
-    pub(super) outgoing: BTreeMap<u32, Vec<u32>>,
-    pub(super) incoming: BTreeMap<u32, Vec<u32>>,
-    pub(super) cluster_delta: BTreeMap<u32, Option<ClusterId>>,
+    pub(super) folders: Arc<BTreeMap<u32, (FolderId, Lifecycle)>>,
+    pub(super) folder_lookup: Arc<BTreeMap<FolderId, u32>>,
+    pub(super) subtree_overrides: Arc<BTreeMap<u32, Arc<SubtreeOverlay>>>,
+    pub(super) postings: BTreeMap<Vec<u8>, Arc<Bitmap>>,
+    pub(super) bsi_live: BTreeMap<Vec<u8>, Arc<BTreeMap<u32, ScalarValue>>>,
+    pub(super) outgoing: Arc<BTreeMap<u32, Arc<Vec<u32>>>>,
+    pub(super) incoming: Arc<BTreeMap<u32, Arc<Vec<u32>>>>,
+    pub(super) cluster_delta: Arc<BTreeMap<u32, Option<ClusterId>>>,
     pub(super) cluster_dirty: Bitmap,
-    pub(super) clusters: BTreeMap<ClusterId, Bitmap>,
+    pub(super) clusters: Arc<BTreeMap<ClusterId, Arc<Bitmap>>>,
     pub(super) cluster_overlay: Option<ClusterOverlay>,
     pub(super) node_count: u32,
     pub(super) folder_count: u32,
@@ -80,30 +80,24 @@ impl L0Delta {
         let mut keys = Vec::with_capacity(ordinary.len());
         let mut domains = Vec::with_capacity(scalars.len());
         for key in ordinary {
-            self.postings
-                .entry(key.clone())
-                .or_default()
-                .add(note.dense);
+            Arc::make_mut(self.postings.entry(key.clone()).or_default()).add(note.dense);
             bytes = bytes.saturating_add(192 + 2 * key.capacity());
             keys.push(key);
         }
         for (key, (_, scalar)) in scalars {
-            self.bsi_live
-                .entry(key.clone())
-                .or_default()
-                .insert(note.dense, scalar);
+            Arc::make_mut(self.bsi_live.entry(key.clone()).or_default()).insert(note.dense, scalar);
             bytes = bytes.saturating_add(192 + 2 * key.capacity());
             domains.push(key);
         }
         self.notes.insert(
             note.dense,
-            ChangedNote {
+            Arc::new(ChangedNote {
                 id: note.id.clone(),
                 header: note.header,
                 postings: keys,
                 domains,
                 bytes,
-            },
+            }),
         );
         self.node_count = self.node_count.max(note.dense + 1);
         self.approx_bytes = self.approx_bytes.saturating_add(bytes);
@@ -125,22 +119,30 @@ impl L0Delta {
     fn remove_replacement(&mut self, dense: u32) {
         // The new note image carries its current ancestry. A previous subtree
         // move must not override the membership of this replacement.
-        let mut bytes = self.approx_bytes;
-        self.subtree_overrides.retain(|_, overlay| {
-            if !overlay.added.contains(dense) && !overlay.removed.contains(dense) {
-                return true;
-            }
-            bytes = bytes.saturating_sub(overlay.bytes());
-            overlay.added.remove(dense);
-            overlay.removed.remove(dense);
-            if overlay.is_empty() {
-                false
-            } else {
-                bytes = bytes.saturating_add(overlay.bytes());
-                true
-            }
-        });
-        self.approx_bytes = bytes;
+        if !self.subtree_overrides.is_empty()
+            && self
+                .subtree_overrides
+                .values()
+                .any(|o| o.added.contains(dense) || o.removed.contains(dense))
+        {
+            let mut bytes = self.approx_bytes;
+            Arc::make_mut(&mut self.subtree_overrides).retain(|_, overlay_arc| {
+                if !overlay_arc.added.contains(dense) && !overlay_arc.removed.contains(dense) {
+                    return true;
+                }
+                let overlay = Arc::make_mut(overlay_arc);
+                bytes = bytes.saturating_sub(overlay.bytes());
+                overlay.added.remove(dense);
+                overlay.removed.remove(dense);
+                if overlay.is_empty() {
+                    false
+                } else {
+                    bytes = bytes.saturating_add(overlay.bytes());
+                    true
+                }
+            });
+            self.approx_bytes = bytes;
+        }
 
         if self.deleted.remove_checked(dense) {
             self.approx_bytes = self.approx_bytes.saturating_sub(64);
@@ -150,19 +152,21 @@ impl L0Delta {
         };
         self.note_lookup.remove(&old.id);
         self.approx_bytes = self.approx_bytes.saturating_sub(old.bytes);
-        for key in old.postings {
-            if let Some(bitmap) = self.postings.get_mut(&key) {
+        for key in &old.postings {
+            if let Some(bitmap_arc) = self.postings.get_mut(key) {
+                let bitmap = Arc::make_mut(bitmap_arc);
                 bitmap.remove(dense);
                 if bitmap.is_empty() {
-                    self.postings.remove(&key);
+                    self.postings.remove(key);
                 }
             }
         }
-        for key in old.domains {
-            if let Some(values) = self.bsi_live.get_mut(&key) {
+        for key in &old.domains {
+            if let Some(values_arc) = self.bsi_live.get_mut(key) {
+                let values = Arc::make_mut(values_arc);
                 values.remove(&dense);
                 if values.is_empty() {
-                    self.bsi_live.remove(&key);
+                    self.bsi_live.remove(key);
                 }
             }
         }
@@ -178,13 +182,15 @@ impl L0Delta {
             .checked_add(1)
             .ok_or(IndexError::InvalidInput("folder slot overflow"))?;
         let cost = 192 + 2 * id.as_str().len();
-        if let Some((old, _)) = self.folders.insert(dense, (id.clone(), lifecycle)) {
-            self.folder_lookup.remove(&old);
+        if let Some((old, _)) =
+            Arc::make_mut(&mut self.folders).insert(dense, (id.clone(), lifecycle))
+        {
+            Arc::make_mut(&mut self.folder_lookup).remove(&old);
             self.approx_bytes = self
                 .approx_bytes
                 .saturating_sub(192 + 2 * old.as_str().len());
         }
-        self.folder_lookup.insert(id.clone(), dense);
+        Arc::make_mut(&mut self.folder_lookup).insert(id.clone(), dense);
         self.folder_count = self.folder_count.max(next);
         self.approx_bytes = self.approx_bytes.saturating_add(cost);
         self.last_change = Some(Instant::now());
@@ -197,7 +203,11 @@ impl L0Delta {
         if rows.is_empty() {
             return;
         }
-        let overlay = self.subtree_overrides.entry(ancestor).or_default();
+        let overlay = Arc::make_mut(
+            Arc::make_mut(&mut self.subtree_overrides)
+                .entry(ancestor)
+                .or_default(),
+        );
         let old_bytes = if overlay.is_empty() {
             0
         } else {
@@ -233,7 +243,7 @@ impl L0Delta {
                 edges.sort_unstable();
                 edges.dedup();
                 let bytes = 64 + edges.capacity() * size_of::<u32>();
-                if let Some(previous) = old.insert(node, edges) {
+                if let Some(previous) = Arc::make_mut(old).insert(node, Arc::new(edges)) {
                     self.approx_bytes = self
                         .approx_bytes
                         .saturating_sub(64 + previous.capacity() * size_of::<u32>());
@@ -245,19 +255,23 @@ impl L0Delta {
     }
 
     pub fn replace_cluster(&mut self, node: u32, cluster: Option<ClusterId>) {
-        if let Some(Some(old)) = self.cluster_delta.insert(node, cluster.clone())
-            && let Some(bitmap) = self.clusters.get_mut(&old)
+        if let Some(Some(old)) =
+            Arc::make_mut(&mut self.cluster_delta).insert(node, cluster.clone())
         {
-            bitmap.remove(node);
-            if bitmap.is_empty() {
-                self.clusters.remove(&old);
+            let clusters = Arc::make_mut(&mut self.clusters);
+            if let Some(bitmap_arc) = clusters.get_mut(&old) {
+                let bitmap = Arc::make_mut(bitmap_arc);
+                bitmap.remove(node);
+                if bitmap.is_empty() {
+                    clusters.remove(&old);
+                }
             }
         }
         if self.cluster_dirty.add_checked(node) {
             self.approx_bytes = self.approx_bytes.saturating_add(256);
         }
         if let Some(id) = cluster {
-            self.clusters.entry(id).or_default().add(node);
+            Arc::make_mut(Arc::make_mut(&mut self.clusters).entry(id).or_default()).add(node);
         }
         self.last_change = Some(Instant::now());
     }
@@ -270,9 +284,13 @@ impl L0Delta {
         if let Some(ClusterOverlay::Resident(_, old_bytes)) = self.cluster_overlay.take() {
             self.approx_bytes = self.approx_bytes.saturating_sub(old_bytes);
         }
-        self.cluster_delta.clear();
+        if !self.cluster_delta.is_empty() {
+            self.cluster_delta = Arc::default();
+        }
         self.cluster_dirty.clear();
-        self.clusters.clear();
+        if !self.clusters.is_empty() {
+            self.clusters = Arc::default();
+        }
         self.cluster_overlay = if self.approx_bytes.saturating_add(bytes) <= L0_BYTE_LIMIT {
             self.approx_bytes += bytes;
             Some(ClusterOverlay::Resident(Arc::new(snapshot), bytes))

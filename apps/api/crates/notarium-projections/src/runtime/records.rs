@@ -115,7 +115,7 @@ impl FolderCatalog {
                 slug: m.slug,
                 slug_fold: m.slug_fold,
                 display_name: m.display_name,
-                norm_path_prefix: String::new(),
+                norm_path_prefix: None,
                 display_path_prefix: String::new(),
                 is_project: m.is_project,
                 project_slug: m.project_slug,
@@ -139,7 +139,7 @@ impl FolderCatalog {
         for (id, location) in locations {
             if let Some(row) = self.rows.get_mut(&id) {
                 row.display_path_prefix = location.display_path;
-                row.norm_path_prefix = location.norm_path;
+                row.norm_path_prefix = (!location.trashed).then_some(location.norm_path);
                 row.project_folder_id = location.project;
             }
         }

@@ -142,7 +142,6 @@ async fn exercise(store: &CanonicalStore, derived: DerivedStore, root: &DataRoot
             )
             .await
             .unwrap();
-        #[cfg(feature = "test-support")]
         let mut hold = engine.pause_before_recovery_for_test(&scope).unwrap();
         let retained = engine
             .acquire_snapshot(owner.clone(), CausalBasis::Await(Default::default()))
@@ -183,7 +182,6 @@ async fn exercise(store: &CanonicalStore, derived: DerivedStore, root: &DataRoot
             ),
             "an unusable published checkpoint must close new reads"
         );
-        #[cfg(feature = "test-support")]
         let mut restricted = {
             tokio::time::timeout(
                 Duration::from_secs(5),
@@ -245,7 +243,6 @@ async fn exercise(store: &CanonicalStore, derived: DerivedStore, root: &DataRoot
             .await
             .expect("the existing initial refresh follows the repaired cut");
         assert_eq!(first.seq, seq);
-        #[cfg(feature = "test-support")]
         {
             let first =
                 tokio::time::timeout(Duration::from_secs(8), next_resync(restricted.as_mut()))

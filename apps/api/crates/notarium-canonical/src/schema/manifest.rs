@@ -656,16 +656,17 @@ pub const CANONICAL_TABLES: &[TableSpec] = &[
         ],
     },
     TableSpec {
-        name: "chat_entry_ref_blocks",
-        primary_key: &["space_id", "thread_id", "entry_seq", "block_no"],
+        name: "chat_entry_note_refs",
+        primary_key: &["space_id", "thread_id", "entry_seq", "ref_ordinal"],
         columns: &[
             col("space_id", Text, false),
             col("thread_id", Text, false),
             col("entry_seq", Int, false),
-            col("block_no", Int, false),
-            col("payload", Bytes, false),
+            col("ref_ordinal", Int, false),
+            col("target_space_id", Text, false),
+            col("target_note_id", Text, false),
         ],
-        indexes: &[],
+        indexes: &["idx_chat_entry_note_refs_target"],
     },
     TableSpec {
         name: "chat_pending_inputs",

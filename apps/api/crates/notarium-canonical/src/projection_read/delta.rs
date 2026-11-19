@@ -188,6 +188,27 @@ async fn effect_from_change(
         }
         "ability" => {
             let Some(bytes) = metadata else {
+                const ABILITY_PURGED: &str = "SELECT EXISTS(
+                    SELECT 1 FROM ability_packages
+                    WHERE space_id = $1 AND ability_id = $2
+                      AND (lifecycle_state = 'purged' OR EXISTS(
+                          SELECT 1 FROM revision_purge_fences p
+                          WHERE p.space_id = ability_packages.space_id
+                            AND p.note_id = ability_packages.entrypoint_note_id
+                      ))
+                )";
+                let (purged,) = read_rows!(
+                    tx,
+                    fetch_one,
+                    "projection_ability_purged",
+                    (bool,),
+                    ABILITY_PURGED,
+                    scope.space_id.as_str(),
+                    id.as_str(),
+                )?;
+                if purged {
+                    return Ok(None);
+                }
                 return Err(stale());
             };
             let RevisionMetadataPayload::Ability(ability) =

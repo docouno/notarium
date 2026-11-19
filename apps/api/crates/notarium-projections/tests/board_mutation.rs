@@ -501,9 +501,7 @@ async fn exercise(
     blocker.release().await;
     let mut offline = offline_erasure::OfflineErasures::prepare(&store, &runtime, &derived).await;
     runtime.shutdown().await.unwrap();
-    if postgres.is_some() {
-        offline_erasure::disable_cleanup(&store);
-    }
+    offline_erasure::disable_cleanup(&store);
     offline.mutate_offline(&store, &derived, &root).await;
 
     // Restart on the same canonical store to exercise planner registration and

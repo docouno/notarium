@@ -129,11 +129,6 @@ impl BoardCut {
             Some(cut) => cut,
             None => engine.published_cut(ctx.scope())?,
         };
-        let projected = published.cut.projected_seq.min(header.cutoff);
-        if header.cutoff.get() - projected.get() > MAX_REPLAY_EVENTS {
-            return Err(stale());
-        }
-
         let mut cut = Self {
             scope: header.scope,
             cutoff: header.cutoff,
@@ -144,6 +139,53 @@ impl BoardCut {
             notes: BTreeMap::new(),
             ranks: BTreeMap::new(),
         };
+        let view_notes: BTreeSet<_> = views.iter().map(|view| &view.note).collect();
+        let additional: BTreeSet<_> = additional_notes.into_iter().cloned().collect();
+        if published.cut.projected_seq <= cut.cutoff
+            && cut.cutoff.get() - published.cut.projected_seq.get() <= MAX_REPLAY_EVENTS
+        {
+            match cut
+                .try_load_from_derived(
+                    engine,
+                    ctx,
+                    &published,
+                    &views,
+                    &view_notes,
+                    &additional,
+                    deadline,
+                )
+                .await
+            {
+                Ok(()) => return Ok(cut),
+                Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
+                    if diagnostic.reason == ValidationReason::CursorStale =>
+                {
+                    // Derived advanced ahead of this cut while loading; fall back
+                    // to canonical reads at the exact requested cutoff.
+                    cut.folders.clear();
+                    cut.notes.clear();
+                    cut.ranks.clear();
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        cut.load_from_canonical(engine, ctx, &views, &view_notes, deadline)
+            .await?;
+        Ok(cut)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn try_load_from_derived(
+        &mut self,
+        engine: &ProjectionEngine,
+        ctx: &SpaceContext,
+        published: &PublishedCut,
+        views: &BTreeSet<ViewRef>,
+        view_notes: &BTreeSet<&NoteId>,
+        additional: &BTreeSet<NoteId>,
+        deadline: &PlannerDeadline,
+    ) -> Result<(), PortError> {
+        let projected = published.cut.projected_seq;
         let limit = PageLimit::new(200)?;
         let mut after_folder = None;
         loop {
@@ -151,50 +193,43 @@ impl BoardCut {
                 .wait(
                     published
                         .store
-                        .folders_page(&cut.scope, projected, after_folder, limit),
+                        .folders_page(&self.scope, projected, after_folder, limit),
                 )
                 .await?;
             after_folder = rows.last().map(|folder| folder.dense_folder_id);
             let complete = rows.len() < usize::from(limit.get());
             for folder in rows {
-                cut.insert_folder(folder);
+                self.insert_folder(folder);
             }
             if complete {
                 break;
             }
         }
 
-        let view_notes: BTreeSet<_> = views.iter().map(|view| &view.note).collect();
-        let use_index = published.cut.projected_seq <= cut.cutoff;
-        if use_index {
-            let needed: BTreeSet<_> = view_notes
-                .iter()
-                .copied()
-                .cloned()
-                .chain(additional_notes.into_iter().cloned())
-                .collect();
-            for id in needed {
-                if let Some(note) = deadline
-                    .wait(published.store.note_by_id(&cut.scope, projected, &id))
-                    .await?
-                {
-                    let read_views = view_notes.contains(&id);
-                    cut.notes
-                        .insert(id, BoardNote::from_derived(note, read_views)?);
-                }
+        let needed: BTreeSet<_> = view_notes
+            .iter()
+            .copied()
+            .cloned()
+            .chain(additional.iter().cloned())
+            .collect();
+        for id in needed {
+            if let Some(note) = deadline
+                .wait(published.store.note_by_id(&self.scope, projected, &id))
+                .await?
+            {
+                let read_views = view_notes.contains(&id);
+                self.notes
+                    .insert(id, BoardNote::from_derived(note, read_views)?);
             }
-        } else {
-            cut.hydrate_temporal_notes(&published, projected, &view_notes, limit, deadline)
-                .await?;
         }
 
-        for view in &views {
+        for view in views {
             let mut after_rank = None;
             let mut ranks = BTreeMap::new();
             loop {
                 let rows = deadline
                     .wait(published.store.view_rank_page(
-                        &cut.scope,
+                        &self.scope,
                         projected,
                         view,
                         after_rank.as_ref(),
@@ -211,20 +246,125 @@ impl BoardCut {
                     break;
                 }
             }
-            cut.ranks.insert(view.clone(), ranks);
+            self.ranks.insert(view.clone(), ranks);
         }
 
-        let replayed = if projected < cut.cutoff {
-            cut.replay(engine, ctx, &published, &views, &view_notes, deadline)
+        let replayed = if projected < self.cutoff {
+            self.replay(engine, ctx, published, views, view_notes, deadline)
                 .await?
         } else {
             ReplayedChanges::default()
         };
-        if use_index {
-            cut.hydrate_candidates(engine, ctx, &published, &views, &replayed, deadline)
+        self.hydrate_candidates(engine, ctx, published, views, &replayed, deadline)
+            .await
+    }
+
+    async fn load_from_canonical(
+        &mut self,
+        engine: &ProjectionEngine,
+        ctx: &SpaceContext,
+        views: &BTreeSet<ViewRef>,
+        view_notes: &BTreeSet<&NoteId>,
+        deadline: &PlannerDeadline,
+    ) -> Result<(), PortError> {
+        let canonical = engine.canonical();
+        let mut projection = engine.projection_context_for(ctx);
+        let limit = PageLimit::new(200)?;
+
+        let mut after_folder = None;
+        loop {
+            projection.budget.remaining = deadline.remaining()?;
+            let page = deadline
+                .wait(canonical.read_projection_folders_page(
+                    &projection,
+                    &self.scope,
+                    self.cutoff,
+                    after_folder,
+                    limit,
+                ))
                 .await?;
+            for folder in page.rows {
+                let folder = folder.metadata;
+                self.folders.insert(
+                    folder.folder_id,
+                    BoardFolder {
+                        parent: folder.parent_folder_id,
+                        slug_fold: folder.slug_fold,
+                        lifecycle: folder.lifecycle,
+                        locked: folder.write_locked,
+                        is_project: folder.is_project,
+                    },
+                );
+            }
+            after_folder = page.next;
+            if after_folder.is_none() {
+                break;
+            }
         }
-        Ok(cut)
+
+        let schema = self.schema.as_ref().map(|schema| &schema.fields);
+        let mut after_note = None;
+        loop {
+            projection.budget.remaining = deadline.remaining()?;
+            let page = deadline
+                .wait(canonical.read_projection_notes_page(
+                    &projection,
+                    &self.scope,
+                    self.cutoff,
+                    after_note,
+                    limit,
+                ))
+                .await?;
+            for note in page.rows {
+                let id = note.metadata.note_id.clone();
+                let read_views = view_notes.contains(&id);
+                let (inline_tags, parsed_views) =
+                    if note.metadata.doc_class == DocClass::EncryptedNote {
+                        (Vec::new(), Vec::new())
+                    } else {
+                        projection.budget.remaining = deadline.remaining()?;
+                        let carrier = deadline
+                            .wait(canonical.read_projection_note_carrier(
+                                &projection,
+                                &self.scope,
+                                self.cutoff,
+                                &note,
+                            ))
+                            .await?;
+                        parse_structure(carrier.as_deref(), &note, read_views)?
+                    };
+                self.notes.insert(
+                    id,
+                    BoardNote::from_canonical(note, schema, inline_tags, parsed_views),
+                );
+            }
+            after_note = page.next;
+            if after_note.is_none() {
+                break;
+            }
+        }
+
+        let mut after_rank = None;
+        loop {
+            projection.budget.remaining = deadline.remaining()?;
+            let page = deadline
+                .wait(canonical.read_projection_overlays_page(
+                    &projection,
+                    &self.scope,
+                    self.cutoff,
+                    after_rank,
+                    limit,
+                ))
+                .await?;
+            for rank in page.rows {
+                self.apply_rank(views, rank)?;
+            }
+            after_rank = page.next;
+            if after_rank.is_none() {
+                break;
+            }
+        }
+        Ok(())
     }
 
     async fn hydrate_candidates(
@@ -300,37 +440,6 @@ impl BoardCut {
             }
         }
         Ok(())
-    }
-
-    async fn hydrate_temporal_notes(
-        &mut self,
-        published: &PublishedCut,
-        projected: SpaceSeq,
-        view_notes: &BTreeSet<&NoteId>,
-        limit: PageLimit,
-        deadline: &PlannerDeadline,
-    ) -> Result<(), PortError> {
-        let mut after = None;
-        loop {
-            let rows = deadline
-                .wait(
-                    published
-                        .store
-                        .notes_page(&self.scope, projected, after, limit),
-                )
-                .await?;
-            after = rows.last().map(|note| note.dense_id);
-            let complete = rows.len() < usize::from(limit.get());
-            for note in rows {
-                let id = note.note_id.clone();
-                let read_views = view_notes.contains(&id);
-                self.notes
-                    .insert(id, BoardNote::from_derived(note, read_views)?);
-            }
-            if complete {
-                return Ok(());
-            }
-        }
     }
 
     async fn replay(
@@ -609,6 +718,36 @@ impl BoardCut {
             .authorize_folder_read(&self.space, entry, &ancestry.ids)?)
     }
 
+    pub(super) fn authorize_board_source(
+        &self,
+        ctx: &SpaceContext,
+        source: &ViewSource,
+        source_folder: Option<&FolderId>,
+    ) -> Result<(), PortError> {
+        let grant = ctx
+            .auth()
+            .spaces()
+            .get(&self.scope.space_id)
+            .ok_or(DomainError::ResourceNotFound)?;
+        if !source
+            .classes
+            .iter()
+            .all(|class| grant.read_classes.contains(class))
+        {
+            return Err(DomainError::ResourceNotFound.into());
+        }
+        if let Some(project_root) = grant.project_root.as_ref() {
+            let Some(folder) = source_folder else {
+                return Err(DomainError::ResourceNotFound.into());
+            };
+            let ancestry = self.ancestry(folder)?;
+            if !ancestry.active || !ancestry.ids.contains(project_root) {
+                return Err(DomainError::ResourceNotFound.into());
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn authorize_placement(
         &self,
         ctx: &SpaceContext,
@@ -655,6 +794,7 @@ impl BoardCut {
         Ok(note)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn check_live<'a>(
         &self,
         engine: &ProjectionEngine,
@@ -662,6 +802,8 @@ impl BoardCut {
         requested: Option<SpaceSeq>,
         views: impl IntoIterator<Item = (&'a ViewRef, &'a [notarium_core::ports::EvaluatedBoardGroup])>,
         additional: impl IntoIterator<Item = &'a NoteId>,
+        auth_folders: impl IntoIterator<Item = &'a FolderId>,
+        restorations: impl IntoIterator<Item = &'a notarium_core::ports::PlannedNoteRestoration>,
         deadline: &PlannerDeadline,
     ) -> Result<LiveReadPermit, PortError> {
         deadline.check()?;
@@ -679,22 +821,45 @@ impl BoardCut {
             return Err(stale());
         }
 
-        // Explicit exact past cuts may use retained rows, but never past access.
-        let check = |id: &NoteId| -> Result<(), PortError> {
+        // Explicit exact past cuts may use historical facts, but never past access.
+        let check_note = |id: &NoteId| -> Result<(), PortError> {
             deadline.check()?;
             let LiveNoteStatus::ActiveVisible(facts) = permit.classify(ctx, id, true)? else {
                 return Err(DomainError::ResourceNotFound.into());
             };
             Ok(ctx.auth().authorize_read(&facts)?)
         };
+        let check_folder = |folder: &FolderId| -> Result<(), PortError> {
+            deadline.check()?;
+            let facts = permit
+                .folder_facts(folder)
+                .ok_or(DomainError::ResourceNotFound)?;
+            Ok(ctx
+                .auth()
+                .authorize_folder_read(&facts.space, folder, &facts.ancestor_folders)?)
+        };
+        for folder in auth_folders {
+            check_folder(folder)?;
+        }
         for (view, groups) in views {
-            check(&view.note)?;
+            check_note(&view.note)?;
             for row in groups.iter().flat_map(|group| &group.rows) {
-                check(&row.note)?;
+                check_note(&row.note)?;
             }
         }
         for id in additional {
-            check(id)?;
+            check_note(id)?;
+        }
+        for restoration in restorations {
+            deadline.check()?;
+            if restoration.planned_lifecycle == Lifecycle::Active {
+                check_folder(&restoration.planned_parent_folder)?;
+            }
+            if let LiveNoteStatus::ActiveVisible(facts) =
+                permit.classify(ctx, &restoration.note, true)?
+            {
+                ctx.auth().authorize_read(&facts)?;
+            }
         }
         Ok(permit)
     }
@@ -1068,7 +1233,7 @@ mod tests {
                 ),
             ]),
         );
-        let facts = evaluate_move(
+        let (facts, _) = evaluate_move(
             &cut,
             &ctx,
             &intent(view, target.clone()),
@@ -1114,6 +1279,7 @@ mod tests {
         assert!(
             !evaluate_move(&cut, &ctx, &move_card, &deadline)
                 .unwrap()
+                .0
                 .after_eligible_in_group
         );
         move_card.fields.insert(
@@ -1123,6 +1289,7 @@ mod tests {
         assert!(
             evaluate_move(&cut, &ctx, &move_card, &deadline)
                 .unwrap()
+                .0
                 .after_eligible_in_group
         );
     }
@@ -1163,7 +1330,7 @@ mod tests {
         };
         cut.notes.insert(target.clone(), note);
         let deadline = PlannerDeadline::start(&ctx);
-        let facts = evaluate_rollback(&cut, &ctx, &request, &deadline).unwrap();
+        let (facts, _) = evaluate_rollback(&cut, &ctx, &request, &deadline).unwrap();
         assert_eq!(
             facts[&view].post_restore_membership[&target],
             Some(group("todo"))
@@ -1181,7 +1348,7 @@ mod tests {
         cut.folders.insert(
             child.clone(),
             BoardFolder {
-                parent: Some(restored_parent),
+                parent: Some(restored_parent.clone()),
                 slug_fold: "child".to_owned(),
                 lifecycle: Lifecycle::Trashed,
                 locked: false,
@@ -1190,7 +1357,72 @@ mod tests {
         );
         let mut request = request;
         request.eligible_notes[0].planned_parent_folder = child;
-        let facts = evaluate_rollback(&cut, &ctx, &request, &deadline).unwrap();
+        let (facts, auth_folders) = evaluate_rollback(&cut, &ctx, &request, &deadline).unwrap();
         assert_eq!(facts[&view].post_restore_membership[&target], None);
+        assert!(auth_folders.contains(&restored_parent));
+    }
+
+    #[test]
+    fn static_source_auth_rejects_oracle_even_when_filter_matches_no_notes() {
+        // Class oracle: source includes profile, caller only has UserDoc, and
+        // filter matches ZERO notes — must still reject statically before filter evaluation.
+        let (mut cut, ctx, view) = fixture(
+            "source: {classes: [user-doc, profile]}\nfilter: {eq: {key: secret, value: miss}}\n",
+        );
+        let (target, card) = note(20, &cut.root, DocClass::UserDoc, Some("todo"), "");
+        cut.notes.insert(target.clone(), card);
+        assert!(matches!(
+            evaluate_move(
+                &cut,
+                &ctx,
+                &intent(view, target),
+                &PlannerDeadline::start(&ctx)
+            ),
+            Err(PortError::Domain(DomainError::ResourceNotFound)),
+        ));
+
+        // Project-root oracle: caller pinned to a project cannot evaluate a
+        // space-wide board even when no out-of-project notes match the filter.
+        let (mut cut, mut ctx, view) =
+            fixture("source: {scope: space}\nfilter: {eq: {key: secret, value: miss}}\n");
+        let project = FolderId::from_bytes([21; 16]);
+        cut.folders.insert(
+            project.clone(),
+            BoardFolder {
+                parent: Some(cut.root.clone()),
+                slug_fold: "proj".to_owned(),
+                lifecycle: Lifecycle::Active,
+                locked: false,
+                is_project: true,
+            },
+        );
+        // Move the view carrier inside the caller's project so only the board source escapes.
+        cut.notes.get_mut(&view.note).unwrap().parent_folder = project.clone();
+        let (target, card) = note(22, &project, DocClass::UserDoc, Some("todo"), "");
+        cut.notes.insert(target.clone(), card);
+        let scoped_auth = EngineAuthContext::for_human(VerifiedHuman::attest(
+            PrincipalId::from_bytes([4; 16]),
+            GrantId::from_bytes([5; 16]),
+            BTreeMap::from([(
+                cut.scope.space_id.clone(),
+                SpaceGrant {
+                    role: SpaceRole::Owner,
+                    read_classes: BTreeSet::from([DocClass::UserDoc]),
+                    write_classes: BTreeSet::from([DocClass::UserDoc]),
+                    project_root: Some(project),
+                },
+            )]),
+            false,
+        ));
+        ctx = SpaceContext::new(scoped_auth, cut.scope.clone(), ctx.budget.clone()).unwrap();
+        assert!(matches!(
+            evaluate_move(
+                &cut,
+                &ctx,
+                &intent(view, target),
+                &PlannerDeadline::start(&ctx)
+            ),
+            Err(PortError::Domain(DomainError::ResourceNotFound)),
+        ));
     }
 }

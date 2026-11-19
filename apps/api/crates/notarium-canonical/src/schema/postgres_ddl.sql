@@ -682,16 +682,20 @@ CREATE INDEX IF NOT EXISTS idx_chat_entries_redacted_change
     ON chat_entries (space_id, redacted_at_seq, thread_id, entry_seq)
     WHERE redacted_at_seq IS NOT NULL;
 
-CREATE TABLE IF NOT EXISTS chat_entry_ref_blocks (
+CREATE TABLE IF NOT EXISTS chat_entry_note_refs (
     space_id TEXT NOT NULL,
     thread_id TEXT NOT NULL,
     entry_seq BIGINT NOT NULL,
-    block_no BIGINT NOT NULL CHECK (block_no >= 0),
-    payload BYTEA NOT NULL CHECK (octet_length(payload) BETWEEN 1 AND 4096),
-    PRIMARY KEY (space_id, thread_id, entry_seq, block_no),
+    ref_ordinal BIGINT NOT NULL CHECK (ref_ordinal >= 0),
+    target_space_id TEXT NOT NULL,
+    target_note_id TEXT NOT NULL,
+    PRIMARY KEY (space_id, thread_id, entry_seq, ref_ordinal),
     FOREIGN KEY (space_id, thread_id, entry_seq)
         REFERENCES chat_entries (space_id, thread_id, entry_seq) ON DELETE CASCADE
 );
+
+CREATE INDEX IF NOT EXISTS idx_chat_entry_note_refs_target
+    ON chat_entry_note_refs (space_id, target_space_id, target_note_id, thread_id, entry_seq, ref_ordinal);
 
 CREATE TABLE IF NOT EXISTS chat_pending_inputs (
     space_id TEXT NOT NULL,

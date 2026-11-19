@@ -9,9 +9,14 @@ use notarium_core::{
     DomainError,
     error::{PortError, ValidationReason},
     ids::NoteId,
-    model::{LifecycleMask, SnapshotCut},
-    ports::{CallBudget, GraphQuery, GraphResult, GraphTier, PageLimit, SpaceContext},
+    model::LifecycleMask,
+    ports::{
+        CallBudget, ChatBacklink, ChatBacklinkCursor, ChatBacklinkPage, GraphQuery, GraphResult,
+        GraphTier, LinkReadPort, NoteLink, NoteLinkCursor, NoteLinkDirection, NoteLinkPage,
+        PageLimit, PortFuture, SpaceContext,
+    },
     query::Predicate,
+    receipt::CausalBasis,
 };
 use notarium_syntax::unicode::lookup_key;
 
@@ -29,37 +34,46 @@ use super::{
 
 const MAX_ROWS: usize = 200;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum NoteLinkDirection {
-    Outgoing,
-    Incoming,
-}
+impl LinkReadPort for ProjectionEngine {
+    fn note_links(
+        &self,
+        ctx: SpaceContext,
+        note: NoteId,
+        direction: NoteLinkDirection,
+        after: Option<NoteLinkCursor>,
+        limit: PageLimit,
+    ) -> PortFuture<'_, NoteLinkPage> {
+        Box::pin(async move {
+            ProjectionEngine::note_links(self, ctx, &note, direction, after.as_ref(), limit).await
+        })
+    }
 
-/// Outgoing authored links include unresolved targets. Incoming links are
-/// emitted only when the source and focal target both pass recorded and
-/// current admission.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct NoteLink {
-    pub source: NoteId,
-    pub ordinal: u32,
-    pub raw_target: String,
-    pub target: Option<NoteId>,
-    pub resolved_tier: Option<u32>,
-}
+    fn chat_backlinks(
+        &self,
+        ctx: SpaceContext,
+        note: NoteId,
+        causal: CausalBasis,
+    ) -> PortFuture<'_, Vec<ChatBacklink>> {
+        Box::pin(async move {
+            Ok(ProjectionEngine::chat_backlinks(self, ctx, &note, causal)
+                .await?
+                .links)
+        })
+    }
 
-#[derive(Clone, Debug)]
-pub struct NoteLinkCursor {
-    cut: SnapshotCut,
-    note: NoteId,
-    direction: NoteLinkDirection,
-    position: LinkPosition,
-}
-
-#[derive(Clone, Debug)]
-pub struct NoteLinkPage {
-    pub cut: SnapshotCut,
-    pub links: Vec<NoteLink>,
-    pub next: Option<NoteLinkCursor>,
+    fn chat_backlinks_page(
+        &self,
+        ctx: SpaceContext,
+        note: NoteId,
+        causal: CausalBasis,
+        after: Option<ChatBacklinkCursor>,
+        limit: PageLimit,
+    ) -> PortFuture<'_, ChatBacklinkPage> {
+        Box::pin(async move {
+            ProjectionEngine::chat_backlinks_page(self, ctx, &note, causal, after.as_ref(), limit)
+                .await
+        })
+    }
 }
 
 impl ProjectionEngine {
@@ -85,15 +99,11 @@ impl ProjectionEngine {
         query: &GraphQuery,
     ) -> Result<GraphResult, PortError> {
         let cut = self.published_cut(ctx.scope())?;
-        let _generation_lease = self
-            .admit_generation_read(ctx.scope(), cut.cut.generation)
-            .await?;
         query.filter.validate_declared(&cut.fields)?;
-        let index = self.open_index(&cut)?;
-        let (head, effective, authorized, lens) = {
+        let index = self.open_index_async(&cut).await?;
+        let (head, authorized, lens) = {
             let permit = cut.live.try_read()?;
             authorize_graph_entry(&permit, ctx, &cut)?;
-            let effective = current_effective(&index, &cut, ctx, &permit)?;
             let authorized = current_bitmap(
                 &index,
                 &cut,
@@ -104,7 +114,7 @@ impl ProjectionEngine {
                 true,
             )?;
             let lens = lens_scope(&index, ctx, &permit, &query.tier, &authorized)?;
-            (permit.head(), effective, authorized, lens)
+            (permit.head(), authorized, lens)
         };
         let matched = exact_filter(&index, &cut, &query.filter.predicate, &authorized).await?;
         let mut issued_cut = cut.cut.clone();
@@ -138,18 +148,42 @@ impl ProjectionEngine {
             ),
             _ => None,
         };
-        let graph = SettledGraph {
-            index: &index,
-            settlement: durable_clusters.as_ref(),
+        // Offload broad graph planning (Superclusters / Lens) off Tokio workers.
+        let mut plan = if matches!(
+            query.tier,
+            GraphTier::Superclusters | GraphTier::Lens { .. }
+        ) {
+            let tier = query.tier.clone();
+            tokio::task::spawn_blocking(move || {
+                let graph = SettledGraph {
+                    index: &index,
+                    settlement: durable_clusters.as_ref(),
+                };
+                plan_graph(
+                    &graph,
+                    issued_cut,
+                    &tier,
+                    &authorized,
+                    &matched,
+                    lens.as_ref(),
+                )
+            })
+            .await
+            .map_err(checkpoint_error)??
+        } else {
+            let graph = SettledGraph {
+                index: &index,
+                settlement: durable_clusters.as_ref(),
+            };
+            plan_graph(
+                &graph,
+                issued_cut,
+                &query.tier,
+                &authorized,
+                &matched,
+                lens.as_ref(),
+            )?
         };
-        let mut plan = plan_graph(
-            &graph,
-            issued_cut,
-            &query.tier,
-            &effective,
-            &matched,
-            lens.as_ref(),
-        )?;
         let overlay = BTreeMap::new();
         for page in plan.hydration.chunks(MAX_ROWS) {
             let dense: Vec<_> = page.iter().map(|&(_, dense)| dense).collect();
@@ -173,7 +207,6 @@ impl ProjectionEngine {
     }
 
     /// A keyset page of authored links or backlinks on the current graph cut.
-    /// A page consumed by source authorization may be empty with continuation.
     pub async fn note_links(
         &self,
         ctx: SpaceContext,
@@ -198,20 +231,19 @@ impl ProjectionEngine {
         limit: PageLimit,
     ) -> Result<NoteLinkPage, PortError> {
         let cut = self.published_cut(ctx.scope())?;
-        let _generation_lease = self
-            .admit_generation_read(ctx.scope(), cut.cut.generation)
-            .await?;
-        let index = self.open_index(&cut)?;
-        let dense = index.dense_id(note).ok_or(DomainError::ResourceNotFound)?;
-        let (head, recorded_visible) = {
+        let index = self.open_index_async(&cut).await?;
+        // Authorize Space entry BEFORE looking up dense_id so cross-space
+        // probing triggers BranchTaint even when the note ID is absent.
+        let (head, dense, recorded_visible) = {
             let permit = cut.live.try_read()?;
             authorize_graph_entry(&permit, ctx, &cut)?;
+            let dense = index.dense_id(note).ok_or(DomainError::ResourceNotFound)?;
             let recorded_visible = structural_universe(&index, permit.space(), ctx.auth())?;
             if !recorded_visible.contains(dense) {
                 return Err(DomainError::ResourceNotFound.into());
             }
             authorize_plain_note(&permit, ctx, note)?;
-            (permit.head(), recorded_visible)
+            (permit.head(), dense, recorded_visible)
         };
         let mut issued_cut = cut.cut.clone();
         issued_cut.canonical_seq = head;
@@ -224,54 +256,83 @@ impl ProjectionEngine {
             NoteLinkDirection::Outgoing => LinkAddress::Source(dense),
             NoteLinkDirection::Incoming => LinkAddress::Target(dense),
         };
-        let rows = cut
-            .store
-            .link_page_at(
-                ctx.scope(),
-                cut.cut.projected_seq,
-                address,
-                after.map(|cursor| &cursor.position),
-                limit,
-            )
-            .await?;
-        let next = (rows.len() == usize::from(limit.get()))
-            .then(|| rows.last().map(LinkPosition::from))
-            .flatten()
-            .map(|position| NoteLinkCursor {
+        let capacity = usize::from(limit.get());
+        let mut cursor_pos = after.map(|c| LinkPosition::from_key(c.src_dense_id, c.link_ord));
+        let mut links = Vec::with_capacity(capacity);
+        let mut last_returned_key: Option<(u32, u32)> = None;
+        let mut more_available = false;
+
+        loop {
+            let rows = cut
+                .store
+                .link_page_at(
+                    ctx.scope(),
+                    cut.cut.projected_seq,
+                    address,
+                    cursor_pos.as_ref(),
+                    limit,
+                )
+                .await?;
+            let page_exhausted = rows.len() < capacity;
+            let last_scanned = rows.last().map(LinkPosition::from);
+
+            let permit = cut.live.try_read()?;
+            authorize_graph_entry(&permit, ctx, &cut)?;
+            authorize_plain_note(&permit, ctx, note)?;
+            if permit.head() != head {
+                return Err(stale());
+            }
+            for row in rows {
+                let Some(source) =
+                    visible_note_id(&index, &recorded_visible, &permit, ctx, row.src_dense_id)?
+                else {
+                    continue;
+                };
+                let target = match row.resolved_dense_id {
+                    Some(dense) => visible_note_id(&index, &recorded_visible, &permit, ctx, dense)?,
+                    None => None,
+                };
+                if direction == NoteLinkDirection::Incoming && target.is_none() {
+                    continue;
+                }
+                if links.len() == capacity {
+                    more_available = true;
+                    break;
+                }
+                last_returned_key = Some((row.src_dense_id, row.link_ord));
+                links.push(NoteLink {
+                    source,
+                    ordinal: row.link_ord,
+                    raw_target: row.raw_target,
+                    resolved_tier: target.as_ref().and(row.resolved_tier),
+                    target,
+                });
+            }
+            drop(permit);
+
+            if more_available || page_exhausted {
+                break;
+            }
+            if links.len() == capacity {
+                // Probe whether another authorized row exists beyond this page
+                // on the next loop iteration (bounded by request budget).
+                cursor_pos = last_scanned;
+                continue;
+            }
+            cursor_pos = last_scanned;
+        }
+
+        let next = if more_available {
+            last_returned_key.map(|(src_dense_id, link_ord)| NoteLinkCursor {
                 cut: issued_cut.clone(),
                 note: note.clone(),
                 direction,
-                position,
-            });
-
-        let permit = cut.live.try_read()?;
-        authorize_graph_entry(&permit, ctx, &cut)?;
-        authorize_plain_note(&permit, ctx, note)?;
-        if permit.head() != head {
-            return Err(stale());
-        }
-        let mut links = Vec::with_capacity(rows.len());
-        for row in rows {
-            let Some(source) =
-                visible_note_id(&index, &recorded_visible, &permit, ctx, row.src_dense_id)?
-            else {
-                continue;
-            };
-            let target = match row.resolved_dense_id {
-                Some(dense) => visible_note_id(&index, &recorded_visible, &permit, ctx, dense)?,
-                None => None,
-            };
-            if direction == NoteLinkDirection::Incoming && target.is_none() {
-                continue;
-            }
-            links.push(NoteLink {
-                source,
-                ordinal: row.link_ord,
-                raw_target: row.raw_target,
-                resolved_tier: target.as_ref().and(row.resolved_tier),
-                target,
-            });
-        }
+                src_dense_id,
+                link_ord,
+            })
+        } else {
+            None
+        };
         let _admission = self.current_admission(cut.cut.generation)?;
         Ok(NoteLinkPage {
             cut: issued_cut,
@@ -330,51 +391,6 @@ fn lens_scope(
     Ok(Some(scope))
 }
 
-fn current_effective(
-    index: &IndexView,
-    cut: &PublishedCut,
-    ctx: &SpaceContext,
-    permit: &LiveReadPermit,
-) -> Result<Bitmap, PortError> {
-    let mut effective = graph_settle::active_plain(index)?;
-    if permit.head() == cut.cut.projected_seq {
-        return Ok(effective);
-    }
-    if let Some(changes) = permit.note_changes_since(cut.cut.projected_seq) {
-        for note in changes {
-            if let Some(dense) = index.dense_id(note)
-                && effective.contains(dense)
-                && !effective_now(permit, ctx, note)?
-            {
-                effective.remove(dense);
-            }
-        }
-        return Ok(effective);
-    }
-    let mut live = Bitmap::new();
-    for dense in effective.iter() {
-        let note = index.note_id(index.dense(dense))?;
-        if effective_now(permit, ctx, note)? {
-            live.add(dense);
-        }
-    }
-    Ok(live)
-}
-
-fn effective_now(
-    permit: &LiveReadPermit,
-    ctx: &SpaceContext,
-    note: &NoteId,
-) -> Result<bool, PortError> {
-    Ok(matches!(
-        permit.classify(ctx, note, true)?,
-        LiveNoteStatus::ActiveVisible(_)
-            | LiveNoteStatus::HiddenByAuth {
-                is_active_plain: true
-            },
-    ))
-}
-
 fn authorize_plain_note(
     permit: &LiveReadPermit,
     ctx: &SpaceContext,
@@ -401,8 +417,8 @@ fn visible_note_id(
         Err(DomainError::ResourceNotFound) => return Ok(None),
         Err(error) => return Err(error.into()),
     };
-    match authorize_plain_note(permit, ctx, note) {
-        Ok(()) => Ok(Some(note.clone())),
+    match authorize_plain_note(permit, ctx, &note) {
+        Ok(()) => Ok(Some(note)),
         Err(PortError::Domain(DomainError::ResourceNotFound)) => Ok(None),
         Err(error) => Err(error),
     }

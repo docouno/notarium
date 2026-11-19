@@ -249,7 +249,10 @@ pub(super) fn decode(
     digest: &[u8; 32],
 ) -> Result<Directory, IndexError> {
     let invalid = || IndexError::Untrusted("invalid checkpoint identity or layout");
-    if bytes.len() as u64 != size || !matches_header(bytes, identity, size) {
+    if bytes.as_ptr().align_offset(ALIGN) != 0
+        || bytes.len() as u64 != size
+        || !matches_header(bytes, identity, size)
+    {
         return Err(invalid());
     }
 
@@ -320,7 +323,23 @@ pub(super) fn encode(
     if sections.len() != SECTION_COUNT {
         return Err(IndexError::InvalidInput("incomplete sections"));
     }
-    let mut out = vec![0; HEADER_SIZE + SECTION_COUNT * ENTRY_SIZE];
+    let mut predicted = HEADER_SIZE + SECTION_COUNT * ENTRY_SIZE;
+    for (index, section) in sections.iter().enumerate() {
+        predicted = predicted
+            .checked_next_multiple_of(ALIGN)
+            .and_then(|start| start.checked_add(section.bytes.len()))
+            .and_then(|end| {
+                if section.bytes.is_empty() && index + 1 != SECTION_COUNT {
+                    end.checked_add(1)
+                } else {
+                    Some(end)
+                }
+            })
+            .ok_or_else(size_error)?;
+    }
+    let predicted_total = predicted.checked_add(DIGEST_SIZE).ok_or_else(size_error)?;
+    let mut out = Vec::with_capacity(predicted_total);
+    out.resize(HEADER_SIZE + SECTION_COUNT * ENTRY_SIZE, 0);
     out[..8].copy_from_slice(&MAGIC);
     out[8..10].copy_from_slice(&ENDIAN.to_le_bytes());
     out[10..12].copy_from_slice(&FORMAT_VERSION.to_le_bytes());

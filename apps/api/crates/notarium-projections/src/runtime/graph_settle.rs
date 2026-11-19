@@ -5,9 +5,9 @@ use notarium_canonical::codec::encode_msgpack;
 use notarium_core::{
     DomainError,
     error::{PortError, ValidationReason},
-    ids::{ClusterId, SpaceSeq},
+    ids::{ClusterId, NoteId, SpaceSeq},
     model::HistoryScope,
-    ports::PageLimit,
+    ports::{Cancellation, PageLimit},
 };
 
 use crate::{
@@ -21,8 +21,9 @@ use super::{ProjectionEngine, PublishedCut, checkpoint_error};
 pub(super) async fn settle_mapped_cut(
     engine: &ProjectionEngine,
     current: &PublishedCut,
+    stop: &Cancellation,
 ) -> Result<Arc<PublishedCut>, PortError> {
-    let index = engine.open_index(current)?;
+    let index = engine.open_index_async(current).await?;
     let scope = current.cut.scope.clone();
     let cutoff = current.cut.projected_seq;
     let previous = match index.deferred_clusters() {
@@ -31,13 +32,14 @@ pub(super) async fn settle_mapped_cut(
         }
         None => None,
     };
+    let cancel = stop.clone();
     let (settled, mutations) = tokio::task::spawn_blocking(move || {
         let effective = active_plain(&index)?;
         let graph = SettledGraph {
             index: &index,
             settlement: previous.as_ref(),
         };
-        let settled = LeidenSnapshot::compute(&graph, &scope, &effective)?;
+        let settled = LeidenSnapshot::compute(&graph, &scope, &effective, &cancel)?;
         let mutations = cluster_mutations(&settled, &graph, &scope, cutoff)?;
         Ok::<_, PortError>((settled, mutations))
     })
@@ -142,13 +144,11 @@ pub(super) fn cluster_mutations(
     let mut mutations = Vec::with_capacity(snapshot.members.len() + 1);
     mutations.push(DerivedMutation::DeleteClusters);
     for (cluster, members) in &snapshot.members {
-        let mut anchor = None;
+        let mut anchor: Option<&str> = None;
         let mut edges = BTreeMap::<&ClusterId, u64>::new();
         for dense in members.iter() {
-            let note = graph.note_id(dense).ok_or_else(invalid_cluster)?;
-            anchor = Some(anchor.map_or(note, |current: &notarium_core::ids::NoteId| {
-                current.min(note)
-            }));
+            let note = graph.note_id_str(dense).ok_or_else(invalid_cluster)?;
+            anchor = Some(anchor.map_or(note, |current| current.min(note)));
             for target in graph.outgoing(dense) {
                 if let Some(other) = snapshot.cluster(target)
                     && other != cluster
@@ -157,11 +157,12 @@ pub(super) fn cluster_mutations(
                 }
             }
         }
+        let anchor_note_id = NoteId::parse(anchor.ok_or_else(invalid_cluster)?)?;
         mutations.push(DerivedMutation::UpsertCluster(ProjectedCluster {
             space_id: scope.space_id.clone(),
             cluster_id: cluster.clone(),
             member_count: members.cardinality(),
-            anchor_note_id: anchor.ok_or_else(invalid_cluster)?.clone(),
+            anchor_note_id,
             members_roaring: members.serialize::<Portable>(),
             inter_edges_msgpack: encode_msgpack(&edges)?,
             updated_seq: seq,

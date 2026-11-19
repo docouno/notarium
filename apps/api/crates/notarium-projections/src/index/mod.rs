@@ -86,14 +86,14 @@ impl IndexView {
         })
     }
 
-    pub fn note_id(&self, note: DenseNodeId) -> DomainResult<&NoteId> {
+    pub fn note_id(&self, note: DenseNodeId) -> DomainResult<NoteId> {
         let index = note.index(self.generation())?;
         if self.l0.replaced.contains(index) {
             return self
                 .l0
                 .notes
                 .get(&index)
-                .map(|row| &row.id)
+                .map(|row| row.id.clone())
                 .ok_or(DomainError::ResourceNotFound);
         }
         self.base.note_id(index)
@@ -180,10 +180,36 @@ impl IndexView {
         Ok(posting)
     }
 
+    pub(super) fn posting_in(
+        &self,
+        key: &PostingKey,
+        universe: &Bitmap,
+    ) -> Result<Bitmap, IndexError> {
+        if matches!(
+            key,
+            PostingKey::ClusterMembers(_) | PostingKey::FolderSubtree(_)
+        ) {
+            return self.posting(key).map(|set| set.and(universe));
+        }
+        self.ordinary_posting_in(&key.encode(), universe)
+    }
+
     fn ordinary_posting(&self, key: &[u8]) -> Result<Bitmap, IndexError> {
         let mut posting = self.base_posting(key, false)?;
         if let Some(override_set) = self.l0.postings.get(key) {
             posting.or_inplace(override_set);
+        }
+        Ok(posting)
+    }
+
+    pub(super) fn ordinary_posting_in(
+        &self,
+        key: &[u8],
+        universe: &Bitmap,
+    ) -> Result<Bitmap, IndexError> {
+        let mut posting = self.base_posting_in(key, false, universe)?;
+        if let Some(override_set) = self.l0.postings.get(key) {
+            posting.or_inplace(&override_set.and(universe));
         }
         Ok(posting)
     }
@@ -198,6 +224,24 @@ impl IndexView {
                 } else {
                     view.andnot(&self.l0.replaced)
                 }
+            }))
+    }
+
+    pub(super) fn base_posting_in(
+        &self,
+        key: &[u8],
+        bsi: bool,
+        universe: &Bitmap,
+    ) -> Result<Bitmap, IndexError> {
+        Ok(self
+            .base
+            .bitmap_view(key, bsi)?
+            .map_or_else(Bitmap::new, |view| {
+                let mut result = view.and(universe);
+                if !self.l0.replaced.is_empty() {
+                    result.andnot_inplace(&self.l0.replaced);
+                }
+                result
             }))
     }
 
@@ -281,7 +325,7 @@ impl IndexView {
         };
         overlay
             .into_iter()
-            .flatten()
+            .flat_map(|vec| vec.iter())
             .copied()
             .chain(base.iter().copied().map(u32::from_le_bytes))
     }

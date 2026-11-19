@@ -54,15 +54,12 @@ impl ProjectorRuntime {
         candidate: DerivedStore,
         budget: &CallBudget,
     ) -> Result<(), PortError> {
-        if self.control.is_distributed() {
-            return self.rotate_peers(candidate.generation(), budget).await;
-        }
         if self.local_rotation.is_some() {
             let previous = self.finish_local_rotation().await;
             if self.descriptor.generation == candidate.generation() {
                 // Rejoining after a dropped request is idempotent once active.
                 if previous.as_ref().is_err_and(commit_unknown) {
-                    return self.confirm_local_activation().await;
+                    return self.confirm_activation().await;
                 }
                 return previous;
             }
@@ -74,7 +71,7 @@ impl ProjectorRuntime {
             return Err(not_ready());
         }
         if candidate.generation() == self.descriptor.generation {
-            return self.confirm_local_activation().await;
+            return self.confirm_activation().await;
         }
         if candidate.generation() != self.descriptor.generation.checked_next()? {
             return Err(DomainError::validation(ValidationReason::GenerationMismatch).into());
@@ -132,7 +129,14 @@ impl ProjectorRuntime {
         reply
     }
 
-    async fn confirm_local_activation(&self) -> Result<(), PortError> {
+    async fn confirm_activation(&self) -> Result<(), PortError> {
+        if self.control.is_postgres() {
+            let active = self.control.active().await.map_err(|_| unknown_switch())?;
+            if active.as_ref() != Some(&self.descriptor) {
+                return Err(unknown_switch());
+            }
+            return Ok(());
+        }
         let observed = self
             .control
             .local_rotation_witness()
@@ -232,6 +236,12 @@ async fn rotate_local(
         }
         Err(error) => {
             worker.stop().await;
+            engine
+                .known_generations
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&reservation.generation);
+            drop(candidate);
             if let Err(error) = engine.control.cancel_candidate(&reservation).await {
                 // A failed cleanup is resumable at retry or at owner restart.
                 tracing::warn!(
@@ -239,6 +249,9 @@ async fn rotate_local(
                     "projection reservation cleanup deferred"
                 );
             }
+            engine
+                .activation
+                .send_modify(|revision| *revision = revision.wrapping_add(1));
             LocalOutcome {
                 worker: previous,
                 descriptor: old,
@@ -255,6 +268,7 @@ async fn prepare_local(
     stop: Cancellation,
     local_owner: Option<Arc<std::fs::File>>,
 ) -> Result<(Arc<Generation>, GenerationDescriptor, LocalWorker), PortError> {
+    let store = store.with_cache_lease(&engine.cache_root).await?;
     let catalog = engine
         .canonical
         .subscribe_projection_catalog(&engine.projection_context)?;
@@ -283,11 +297,19 @@ async fn prepare_local(
                 Ok(true) => {}
                 Ok(false) => return Err(not_ready()),
                 Err(error) => {
-                    let observed = engine.control.local_rotation_witness().await?;
-                    if observed.active.as_ref() != Some(old)
-                        || observed.candidate.as_ref() != Some(&planned)
-                    {
-                        return Err(error);
+                    if engine.control.is_postgres() {
+                        if engine.control.active().await?.as_ref() != Some(old)
+                            || engine.control.candidate().await?.as_ref() != Some(&planned)
+                        {
+                            return Err(error);
+                        }
+                    } else {
+                        let observed = engine.control.local_rotation_witness().await?;
+                        if observed.active.as_ref() != Some(old)
+                            || observed.candidate.as_ref() != Some(&planned)
+                        {
+                            return Err(error);
+                        }
                     }
                 }
             }
@@ -367,7 +389,7 @@ async fn wait_for_handoff(
                 }
                 let mut next = reservation.clone();
                 next.cut_fingerprint = exact;
-                let reply = commit_local(engine, old, &next, stop).await?;
+                let reply = commit_rotation(engine, old, &next, stop).await?;
                 drop(permits);
                 apply::activate_generation(engine, candidate);
                 drop(publication);
@@ -391,7 +413,7 @@ async fn wait_for_handoff(
     }
 }
 
-pub(super) async fn commit_local(
+pub(super) async fn commit_rotation(
     engine: &ProjectionEngine,
     old: &GenerationDescriptor,
     next: &GenerationDescriptor,
@@ -404,30 +426,41 @@ pub(super) async fn commit_local(
         Err(error) => return Err(error),
     };
     loop {
-        match engine.control.local_rotation_witness().await {
-            Ok(observed) if observed.active.as_ref() == Some(next) => {
-                // Match the local pointer to the installed file even if the
-                // directory still cannot confirm durable acknowledgement.
-                return Ok(if observed.durable {
-                    Ok(())
-                } else {
-                    Err(unknown_switch())
-                });
+        if engine.control.is_postgres() {
+            match engine.control.active().await {
+                Ok(active) if active.as_ref() == Some(next) => return Ok(Ok(())),
+                Ok(active) if active.as_ref() == Some(old) => return Err(uncertain),
+                Ok(_) => {
+                    engine.publication_closed.store(true, Ordering::Release);
+                    return Err(unknown_switch());
+                }
+                Err(_) => {}
             }
-            Ok(observed) if observed.active.as_ref() == Some(old) => return Err(uncertain),
-            Ok(_) => {
+        } else {
+            match engine.control.local_rotation_witness().await {
+                Ok(observed) if observed.active.as_ref() == Some(next) => {
+                    // Match the local pointer to the installed file even if the
+                    // directory still cannot confirm durable acknowledgement.
+                    return Ok(if observed.durable {
+                        Ok(())
+                    } else {
+                        Err(unknown_switch())
+                    });
+                }
+                Ok(observed) if observed.active.as_ref() == Some(old) => return Err(uncertain),
+                Ok(_) => {
+                    engine.publication_closed.store(true, Ordering::Release);
+                    return Err(unknown_switch());
+                }
+                Err(_) => {}
+            }
+        }
+        tokio::select! {
+            _ = stop.cancelled() => {
                 engine.publication_closed.store(true, Ordering::Release);
                 return Err(unknown_switch());
             }
-            Err(_) => {
-                tokio::select! {
-                    _ = stop.cancelled() => {
-                        engine.publication_closed.store(true, Ordering::Release);
-                        return Err(unknown_switch());
-                    }
-                    _ = tokio::time::sleep(Duration::from_millis(50)) => {}
-                }
-            }
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
         }
     }
 }

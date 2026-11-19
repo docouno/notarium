@@ -174,19 +174,20 @@ pub(crate) async fn backend_profile(
     let cold_checkpoint_open = Timing::from_samples(cold_checkpoint_samples);
     report_timing(backend, "cold checkpoint open", &cold_checkpoint_open);
 
+    let warm_board = warm_board(&engine, &fixture, &reference).await;
+    report_timing(backend, "warm board", &warm_board);
+    let neighborhood = timed_neighborhood(&engine, &fixture).await;
+    report_timing(backend, "two-hop neighborhood", &neighborhood);
+
     let mut cold_board_samples = Vec::with_capacity(SAMPLE_COUNT);
     for _ in 0..SAMPLE_COUNT {
-        evict_checkpoint(&engine, &fixture, checkpoint.path());
+        evict_cold_board(&engine, &fixture, checkpoint.path(), backend, &cache);
         let (frame, elapsed) = open_board(&engine, &fixture, None, no_receipts()).await;
         reference.verify(&frame);
         cold_board_samples.push(elapsed);
     }
     let cold_board = Timing::from_samples(cold_board_samples);
     report_timing(backend, "cold board", &cold_board);
-    let warm_board = warm_board(&engine, &fixture, &reference).await;
-    report_timing(backend, "warm board", &warm_board);
-    let neighborhood = timed_neighborhood(&engine, &fixture).await;
-    report_timing(backend, "two-hop neighborhood", &neighborhood);
 
     watched.watch_folder_move().await;
     let mut folder_move = fixture.command(MoveFolder {
@@ -259,14 +260,14 @@ pub(crate) async fn backend_profile(
         .posting(&PostingKey::Tag(REPLAY_TAG.into()))
         .unwrap()
         .iter()
-        .map(|dense| recovered.note_id(recovered.dense(dense)).unwrap().clone())
+        .map(|dense| recovered.note_id(recovered.dense(dense)).unwrap())
         .collect::<BTreeSet<_>>();
     let expected: BTreeSet<_> = (first_tail_note..final_notes).map(card_id).collect();
     assert_eq!(tagged, expected, "read the entire replayed posting");
     let source = recovered.dense_id(&card_id(first_tail_note)).unwrap();
     let outgoing = recovered
         .outgoing(source)
-        .map(|dense| recovered.note_id(recovered.dense(dense)).unwrap().clone())
+        .map(|dense| recovered.note_id(recovered.dense(dense)).unwrap())
         .collect::<BTreeSet<_>>();
     let expected_neighbors: BTreeSet<_> = (1..=LINKS_PER_NOTE)
         .map(|offset| card_id((first_tail_note + offset * 37) % CORPUS_NOTES))
@@ -557,18 +558,40 @@ async fn timed_neighborhood(engine: &ProjectionEngine, fixture: &Corpus) -> Timi
     Timing::from_samples(samples)
 }
 
+fn evict_file_cache(path: &Path) {
+    let file = File::open(path).expect("open benchmark file for cold cache advice");
+    file.sync_all()
+        .expect("flush benchmark file before advising cold cache");
+    #[cfg(target_os = "linux")]
+    rustix::fs::fadvise(&file, 0, None, rustix::fs::Advice::DontNeed)
+        .expect("POSIX_FADV_DONTNEED for benchmark file");
+    #[cfg(not(target_os = "linux"))]
+    panic!("projection cold-cache benchmark requires Linux");
+}
+
 fn evict_checkpoint(engine: &ProjectionEngine, fixture: &Corpus, path: &Path) {
     engine
         .evict_projection_for_test(&fixture.space.scope)
         .expect("release all resident benchmark mmap readers");
-    let file = File::open(path).expect("open checkpoint for cold cache advice");
-    file.sync_all()
-        .expect("flush checkpoint before advising cold cache");
-    #[cfg(target_os = "linux")]
-    rustix::fs::fadvise(&file, 0, None, rustix::fs::Advice::DontNeed)
-        .expect("POSIX_FADV_DONTNEED for the checkpoint");
-    #[cfg(not(target_os = "linux"))]
-    panic!("projection cold-cache benchmark requires Linux");
+    evict_file_cache(path);
+}
+
+fn evict_cold_board(
+    engine: &ProjectionEngine,
+    fixture: &Corpus,
+    checkpoint: &Path,
+    backend: Backend,
+    cache: &DataRoot,
+) {
+    evict_checkpoint(engine, fixture, checkpoint);
+    if backend == Backend::Sqlite {
+        let db = cache.derived(generation());
+        evict_file_cache(&db);
+        let wal = Path::new(&format!("{}-wal", db.display())).to_path_buf();
+        if wal.is_file() {
+            evict_file_cache(&wal);
+        }
+    }
 }
 
 async fn race(

@@ -315,9 +315,15 @@ fn registered_purge_unlinks_after_both_reopened_file_leases_end() {
     .unwrap();
     assert!(old.open(&previous_pool).is_err());
     assert!(reopened.open(&new_pool).is_err());
+    // On Unix, purge unlinks the directory entry immediately while existing
+    // mappings remain valid until dropped. On non-Unix platforms, unlink waits
+    // for all open leases to release the file.
+    #[cfg(unix)]
+    assert!(!path.exists());
     drop(old);
     drop(reopened);
     drop(latest);
+    #[cfg(not(unix))]
     assert!(path.is_file());
     drop(retained);
     assert!(!path.exists());

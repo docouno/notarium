@@ -19,9 +19,7 @@ use notarium_core::{
 };
 use sqlx::PgPool;
 
-use crate::derived::{
-    DerivedStore, GenerationControl, GenerationDescriptor, GenerationFiles, PeerCandidate,
-};
+use crate::derived::{DerivedStore, GenerationControl, GenerationDescriptor, GenerationFiles};
 
 use super::{ProjectionEngine, rotation};
 
@@ -76,12 +74,7 @@ impl Source {
 pub(super) struct Selection {
     pub(super) old: GenerationDescriptor,
     pub(super) store: DerivedStore,
-    pub(super) recovery: Option<Recovery>,
-}
-
-pub(super) enum Recovery {
-    Local(GenerationDescriptor),
-    Postgres(PeerCandidate),
+    pub(super) recovery: Option<GenerationDescriptor>,
 }
 
 pub(super) async fn select(
@@ -101,15 +94,14 @@ pub(super) async fn select(
             (descriptor, store)
         }
     };
-    // A concurrent founder may have published while this process was
-    // probing the old format or joining the same shared reservation.
+    // A concurrent starter may have published while probing the old format.
     for _ in 0..3 {
         let probe = match opened.take() {
             Some(store) => Some(store),
             None => source.open(root, old.generation).await?,
         };
         if let Some(store) = probe {
-            if !control.is_distributed() || control.active().await?.as_ref() == Some(&old) {
+            if !control.is_postgres() || control.active().await?.as_ref() == Some(&old) {
                 return Ok(Selection {
                     old,
                     store,
@@ -125,32 +117,21 @@ pub(super) async fn select(
                     .ok_or_else(|| DomainError::validation(ValidationReason::SequenceOverflow))?,
                 cut_fingerprint: rotation::fingerprint(catalog)?,
             };
-            let recovery = if control.is_distributed() {
-                control
-                    .reserve_format_recovery(&old, &planned)
-                    .await?
-                    .map(Recovery::Postgres)
+            let candidate = reserve_candidate(control, &old, &planned).await?;
+            let store = if let Some(store) = source.open(root, candidate.generation).await? {
+                store
             } else {
-                Some(Recovery::Local(
-                    reserve_local(control, &old, &planned).await?,
-                ))
+                reset_obsolete_candidate(root, control, &old, &candidate).await?;
+                source
+                    .open(root, candidate.generation)
+                    .await?
+                    .ok_or_else(not_ready)?
             };
-            if let Some(recovery) = recovery {
-                let store = if let Some(store) = source.open(root, planned.generation).await? {
-                    store
-                } else {
-                    reset_obsolete_candidate(root, control, &old, &recovery).await?;
-                    source
-                        .open(root, planned.generation)
-                        .await?
-                        .ok_or_else(not_ready)?
-                };
-                return Ok(Selection {
-                    old,
-                    store,
-                    recovery: Some(recovery),
-                });
-            }
+            return Ok(Selection {
+                old,
+                store,
+                recovery: Some(candidate),
+            });
         }
         let active = control.active().await?.ok_or_else(not_ready)?;
         if active == old {
@@ -165,29 +146,29 @@ async fn reset_obsolete_candidate(
     root: &DataRoot,
     control: &GenerationControl,
     old: &GenerationDescriptor,
-    recovery: &Recovery,
+    candidate: &GenerationDescriptor,
 ) -> Result<(), PortError> {
-    match recovery {
-        Recovery::Local(candidate) => {
-            // Startup owns this cache root exclusively. Standalone store
-            // handles also hold the per-generation file lease.
-            let lease = GenerationFiles::for_reclamation(root, candidate.generation)
-                .await?
-                .ok_or_else(not_ready)?;
-            let witness = control.local_rotation_witness().await?;
-            if !witness.durable
-                || witness.active.as_ref() != Some(old)
-                || witness.candidate.as_ref() != Some(candidate)
-            {
-                return Err(not_ready());
-            }
-            GenerationFiles::remove_obsolete_sqlite(root, candidate.generation, lease).await
-        }
-        Recovery::Postgres(candidate) => control.reset_obsolete_candidate(old, candidate).await,
+    if control.is_postgres() {
+        return control
+            .reset_obsolete_postgres_candidate(old, candidate)
+            .await;
     }
+    // Startup owns this cache root exclusively. Standalone store
+    // handles also hold the per-generation file lease.
+    let lease = GenerationFiles::for_reclamation(root, candidate.generation)
+        .await?
+        .ok_or_else(not_ready)?;
+    let witness = control.local_rotation_witness().await?;
+    if !witness.durable
+        || witness.active.as_ref() != Some(old)
+        || witness.candidate.as_ref() != Some(candidate)
+    {
+        return Err(not_ready());
+    }
+    GenerationFiles::remove_obsolete_sqlite(root, candidate.generation, lease).await
 }
 
-async fn reserve_local(
+async fn reserve_candidate(
     control: &GenerationControl,
     old: &GenerationDescriptor,
     planned: &GenerationDescriptor,
@@ -207,7 +188,7 @@ async fn reserve_local(
 
 /// During startup the replacement worker can seed eagerly, while the caller
 /// still has no reader handle and the old descriptor remains durable.
-pub(super) async fn recover_local(
+pub(super) async fn recover_generation(
     engine: &ProjectionEngine,
     old: &GenerationDescriptor,
     candidate: &GenerationDescriptor,
@@ -233,7 +214,7 @@ pub(super) async fn recover_local(
             .canonical
             .list_spaces(&engine.projection_context)
             .await?;
-        if let Some(_permits) = ready(engine, &catalog) {
+        if let Some(_permits) = ready(engine, &catalog).await {
             let mut next = candidate.clone();
             next.cut_fingerprint = rotation::fingerprint(&catalog)?;
             let _admission = tokio::select! {
@@ -252,7 +233,7 @@ pub(super) async fn recover_local(
                     .list_spaces(&engine.projection_context)
                     .await?;
                 if rotation::fingerprint(&current)? == next.cut_fingerprint {
-                    rotation::commit_local(engine, old, &next, stop).await??;
+                    rotation::commit_rotation(engine, old, &next, stop).await??;
                     return Ok(next);
                 }
             }
@@ -266,7 +247,7 @@ pub(super) async fn recover_local(
     }
 }
 
-fn ready(engine: &ProjectionEngine, catalog: &Catalog) -> Option<Vec<LiveReadPermit>> {
+async fn ready(engine: &ProjectionEngine, catalog: &Catalog) -> Option<Vec<LiveReadPermit>> {
     let candidate = engine.generation.load();
     let mut permits = Vec::with_capacity(catalog.len());
     for (_, scope, _, seq) in catalog {
@@ -275,7 +256,7 @@ fn ready(engine: &ProjectionEngine, catalog: &Catalog) -> Option<Vec<LiveReadPer
         if cut.cut.scope != *scope || cut.cut.projected_seq != *seq {
             return None;
         }
-        if cut.base.open(&engine.pool).is_err() {
+        if engine.open_index_async(&cut).await.is_err() {
             slot.checkpoint.notify_one();
             return None;
         }
@@ -312,36 +293,43 @@ pub(super) async fn supervise(engine: Arc<ProjectionEngine>, stop: Cancellation)
 async fn collect(engine: &ProjectionEngine) -> Result<bool, PortError> {
     let _maintenance = engine.generation_cleanup.lock().await;
     engine.reads.expire();
+    engine.prune_event_channels();
     let active = engine.generation.load_full();
     let Some(durable) = engine.control.active().await? else {
         return Ok(false);
     };
+    let reserved = engine.control.candidate().await?;
     let ceiling = active.store.generation().min(durable.generation);
-    {
+    let kept: BTreeSet<_> = {
         let mut resident = engine
             .known_generations
             .write()
             .unwrap_or_else(|error| error.into_inner());
         resident.retain(|generation, _| *generation >= ceiling);
-    }
-    let mut old: BTreeSet<_> = GenerationFiles::inventory(&engine.cache_root)
+        let mut kept: BTreeSet<_> = resident.keys().copied().collect();
+        kept.insert(active.store.generation());
+        kept.insert(durable.generation);
+        if let Some(candidate) = &reserved {
+            kept.insert(candidate.generation);
+        }
+        kept
+    };
+    let mut disposable: BTreeSet<_> = GenerationFiles::inventory(&engine.cache_root)
         .await?
         .into_iter()
-        .filter(|generation| *generation < ceiling)
+        .filter(|generation| !kept.contains(generation))
         .collect();
-    old.extend(
+    disposable.extend(
         active
             .store
             .related_generations(&engine.cache_root)
             .await?
             .into_iter()
-            .filter(|generation| *generation < ceiling),
+            .filter(|generation| !kept.contains(generation)),
     );
     let mut pending = false;
-    for generation in old {
-        if engine.control.is_distributed()
-            && !engine.control.generation_reclaimable(generation).await?
-        {
+    for generation in disposable {
+        if !engine.control.generation_reclaimable(generation).await? {
             pending = true;
             continue;
         }
@@ -358,7 +346,7 @@ async fn collect(engine: &ProjectionEngine) -> Result<bool, PortError> {
         GenerationFiles::remove(
             &engine.cache_root,
             generation,
-            engine.control.is_distributed(),
+            engine.control.is_postgres(),
             lease,
         )
         .await?;

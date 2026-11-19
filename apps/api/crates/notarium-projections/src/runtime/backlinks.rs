@@ -15,35 +15,16 @@ use notarium_core::{
     error::{PortError, ValidationReason},
     ids::{ChatThreadId, NoteId, ProjectionGeneration, SpaceId, SpaceSeq, ThreadEntrySeq},
     model::{HistoryScope, NoteRef, SnapshotCut},
-    ports::{CallBudget, ChatThread, ChatThreadKind, MaintenanceContext, PageLimit, SpaceContext},
+    ports::{
+        CallBudget, ChatBacklink, ChatBacklinkCursor, ChatBacklinkPage, ChatThreadKind,
+        MaintenanceContext, PageLimit, SpaceContext,
+    },
     receipt::CausalBasis,
 };
 
 use crate::derived::ProjectedChatRef;
 
 use super::{ProjectionEngine, PublishedCut, events::authorize_entry};
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ChatBacklink {
-    pub thread: ChatThread,
-    pub title: String,
-    pub entry: ThreadEntrySeq,
-}
-
-#[derive(Clone, Debug)]
-pub struct ChatBacklinkPage {
-    pub links: Vec<ChatBacklink>,
-    /// A continuation can refer only to a visible occurrence already returned.
-    pub next: Option<ChatBacklinkCursor>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ChatBacklinkCursor {
-    scope: HistoryScope,
-    generation: ProjectionGeneration,
-    note: NoteId,
-    after: (SpaceId, ChatThreadId, ThreadEntrySeq),
-}
 
 /// Resolves a canonical owner to a local endpoint supplied by trusted composition.
 pub trait BacklinkOwnerResolver: Send + Sync {
@@ -220,7 +201,6 @@ impl ProjectionEngine {
                 Err(cancelled_not_committed("chat_backlinks", "caller cancelled"))
             }
             result = tokio::time::timeout(remaining, async {
-                let _generation_lease = self.admit_generation_read(scope, generation).await?;
                 let verified = self.visible_backlinks(&ctx, note, &target_cut, after, limit).await?;
                 let _admission = after.is_none().then(|| self.current_admission(generation)).transpose()?;
                 Ok(visible_page(scope, generation, note, usize::from(limit.get()), verified))
@@ -256,19 +236,34 @@ impl ProjectionEngine {
             }
             let room = capacity - pending.len();
             let VerifiedBacklinks { visible, _permits } = verified;
-            pending.extend(
-                visible
-                    .into_iter()
-                    .map(|(candidate, _)| candidate)
-                    .take(room),
-            );
+            let truncated = visible.len() > room;
+            let mut last_consumed = None;
+            for (candidate, _) in visible.into_iter().take(room) {
+                last_consumed = Some(backlink_position(&candidate));
+                pending.push(candidate);
+            }
             drop(_permits);
-            if complete || pending.len() == capacity {
+            let exhausted = complete && !truncated;
+            if exhausted || pending.len() == capacity {
                 // Earlier pages released their permits. Verify the full
                 // result under current owners again before returning it.
-                return self.verify_chat_backlinks(ctx, note, &pending).await;
+                let reverified = self.verify_chat_backlinks(ctx, note, &pending).await?;
+                if exhausted || reverified.visible.len() == capacity {
+                    return Ok(reverified);
+                }
+                // Concurrent redaction or revocation shrank the batch; keep
+                // surviving entries and continue scanning instead of truncating.
+                pending = reverified
+                    .visible
+                    .into_iter()
+                    .map(|(candidate, _)| candidate)
+                    .collect();
             }
-            position = candidates.last().map(backlink_position);
+            position = if truncated {
+                last_consumed
+            } else {
+                candidates.last().map(backlink_position)
+            };
         }
     }
 
@@ -451,8 +446,6 @@ impl ProjectionEngine {
                             "invalid derived reference ordinal",
                         )
                     })?,
-                    start: row.start_byte,
-                    end: row.end_byte,
                 },
                 target: NoteRef {
                     space_id: scope.space_id.clone(),

@@ -31,7 +31,6 @@ use notarium_core::{
     },
     receipt::{ChangeCursor, CommandIdentity},
 };
-use sqlx::Connection;
 use tokio::sync::Notify;
 
 use support::{
@@ -360,62 +359,35 @@ async fn a_late_lookup_cannot_replace_a_promoted_or_retired_generation() {
     assert!(serving.try_read().is_err());
     assert_validation_err(&bind(1).await.map(|_| ()), ValidationReason::NotReady);
     assert!(serving.try_read().is_err());
-    runtime.shutdown().await.unwrap();
-}
 
-async fn assert_catalog_seal(
-    store: &CanonicalStore,
-    fixtures: &StorageTestFixtures,
-    schema: &str,
-    space: &SpaceRecord,
-) {
-    let observed_record = store.get_space(&space.space.id).await.unwrap();
-    let observed_owner = store
-        .projection_owner_identity(&maintenance_ctx(ServicePurpose::Revocation), &space.scope)
-        .await
-        .unwrap()
-        .unwrap();
-    let owner = store.clone();
-    let (ready, acquired) = tokio::sync::oneshot::channel();
-    let (release, done) = tokio::sync::oneshot::channel();
-    let sealing = tokio::spawn(async move {
-        owner
-            .with_projection_catalog_seal(
-                &maintenance_ctx(ServicePurpose::Projection),
-                move |entries| async move {
-                    assert_eq!(entries.len(), 1);
-                    assert_eq!(entries[0].scope, observed_record.scope);
-                    assert_eq!(entries[0].head, observed_record.last_seq);
-                    assert_eq!(entries[0].owner.as_ref(), Some(&observed_owner));
-                    ready.send(()).unwrap();
-                    done.await.unwrap();
-                    Ok(())
-                },
+    // Pre-purge snapshots must not be re-admitted once purge retired the fence.
+    struct StaleSeqLookup(NoteId);
+    impl LiveDenseLookup for StaleSeqLookup {
+        fn generation(&self) -> Option<ProjectionGeneration> {
+            Some(ProjectionGeneration::new(2).unwrap())
+        }
+        fn published_seq(&self) -> Option<SpaceSeq> {
+            Some(SpaceSeq::ZERO)
+        }
+        fn slots(&self) -> u32 {
+            1
+        }
+        fn dense_id(&self, note: &NoteId) -> Option<u32> {
+            (*note == self.0).then_some(0)
+        }
+    }
+    assert_validation_err(
+        &store
+            .admit_projection_space_with_lookup(
+                &projection,
+                &space.scope,
+                Arc::new(StaleSeqLookup(note.clone())),
             )
             .await
-    });
-    tokio::time::timeout(Duration::from_secs(3), acquired)
-        .await
-        .unwrap()
-        .unwrap();
-    let mut raw = fixtures.open_raw_pg().await;
-    let mut tx = raw.begin().await.unwrap();
-    let search_path = sqlx::AssertSqlSafe(format!("SET LOCAL search_path TO {schema}"));
-    sqlx::query(search_path).execute(&mut *tx).await.unwrap();
-    let conflict = sqlx::query("LOCK TABLE spaces IN ROW EXCLUSIVE MODE NOWAIT")
-        .execute(&mut *tx)
-        .await
-        .unwrap_err();
-    assert_eq!(
-        conflict
-            .as_database_error()
-            .and_then(|e| e.code())
-            .as_deref(),
-        Some("55P03"),
+            .map(|_| ()),
+        ValidationReason::NotReady,
     );
-    tx.rollback().await.unwrap();
-    release.send(()).unwrap();
-    sealing.await.unwrap().unwrap();
+    runtime.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -587,7 +559,6 @@ async fn postgres_next_epoch_requires_the_previous_runtime_to_drain() {
         .await
         .unwrap()
         .unwrap();
-    assert_catalog_seal(&first, &fixtures, &schema, &space).await;
 
     let denied = second
         .admit_projection_space(&projection, &space.scope)

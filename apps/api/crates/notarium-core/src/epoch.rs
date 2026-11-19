@@ -40,12 +40,6 @@ impl DataRoot {
             .join(format!("derived_gen_{}", generation.get()))
             .join("derived.sqlite")
     }
-    pub fn fast_index(&self, generation: ProjectionGeneration, seq: SpaceSeq) -> PathBuf {
-        self.0
-            .join("v1")
-            .join(format!("derived_gen_{}", generation.get()))
-            .join(format!("fast_index_{}.mmap", seq.get()))
-    }
     pub fn space_fast_index_dir(
         &self,
         generation: ProjectionGeneration,

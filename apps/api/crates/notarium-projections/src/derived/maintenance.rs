@@ -14,6 +14,39 @@ use super::{
     sql::{Database, Kind, SqlColumn, SqlTransaction, validate_identifier, value},
 };
 
+/// In-process pin preventing `reclaim_postgres_schema` from dropping a
+/// PostgreSQL generation schema while a live `DerivedStore` handle holds it.
+#[derive(Debug)]
+pub(super) struct PostgresSchemaLease;
+
+static OPEN_POSTGRES_SCHEMAS: Mutex<BTreeMap<String, Weak<PostgresSchemaLease>>> =
+    Mutex::new(BTreeMap::new());
+
+impl PostgresSchemaLease {
+    pub(super) fn acquire(schema: &str) -> Arc<Self> {
+        let mut schemas = OPEN_POSTGRES_SCHEMAS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(existing) = schemas.get(schema).and_then(Weak::upgrade) {
+            return existing;
+        }
+        schemas.retain(|_, value| value.strong_count() != 0);
+        let lease = Arc::new(Self);
+        schemas.insert(schema.to_owned(), Arc::downgrade(&lease));
+        lease
+    }
+
+    pub(super) fn is_held(schema: &str) -> bool {
+        let mut schemas = OPEN_POSTGRES_SCHEMAS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        schemas.retain(|_, value| value.strong_count() != 0);
+        schemas
+            .get(schema)
+            .is_some_and(|weak| weak.strong_count() > 0)
+    }
+}
+
 pub(crate) struct GenerationFiles;
 
 /// The root lease covers file mutations that can outlive a runtime or SQL
@@ -299,7 +332,7 @@ fn open_lock(path: &Path) -> Result<File, PortError> {
     if fs::symlink_metadata(path).is_ok_and(|metadata| !metadata.is_file()) {
         return Err(error());
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     let file = {
         use rustix::fs::{Mode, OFlags, open};
         File::from(
@@ -311,7 +344,7 @@ fn open_lock(path: &Path) -> Result<File, PortError> {
             .map_err(|_| error())?,
         )
     };
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(unix))]
     let file = {
         let mut options = fs::OpenOptions::new();
         options.read(true).write(true).create(true).truncate(false);
@@ -327,7 +360,7 @@ fn open_lock(path: &Path) -> Result<File, PortError> {
     if !metadata.is_file() {
         return Err(error());
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
         if metadata.uid() != rustix::process::geteuid().as_raw() {
@@ -414,6 +447,9 @@ pub(super) async fn reclaim_postgres_schema(
 ) -> Result<bool, PortError> {
     let schema = format!("{prefix}_g{}", generation.get());
     let schema = validate_identifier(&schema)?;
+    if PostgresSchemaLease::is_held(schema) {
+        return Ok(false);
+    }
     let error = |_| internal("projection_generation_remove_schema");
     let mut tx = pool.begin().await.map_err(error)?;
     let taken: bool =
@@ -447,12 +483,26 @@ pub(super) async fn reclaim_postgres_schema(
         .execute(&mut *tx)
         .await
         .map_err(error)?;
-    drop_postgres_tables(&mut SqlTransaction::Postgres(&mut tx), schema).await?;
+    match drop_postgres_tables(&mut SqlTransaction::Postgres(&mut tx), schema).await {
+        Ok(()) => {}
+        Err(PortError::Unavailable(_)) => return Ok(false),
+        Err(err) => return Err(err),
+    }
     let drop_schema = format!("DROP SCHEMA \"{schema}\" RESTRICT");
-    sqlx::query(AssertSqlSafe(drop_schema.as_str()))
+    if let Err(err) = sqlx::query(AssertSqlSafe(drop_schema.as_str()))
         .execute(&mut *tx)
         .await
-        .map_err(error)?;
+    {
+        if err
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::code)
+            .as_deref()
+            == Some("55P03")
+        {
+            return Ok(false);
+        }
+        return Err(error(err));
+    }
     tx.commit().await.map_err(error)?;
     Ok(true)
 }

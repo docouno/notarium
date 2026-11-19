@@ -685,6 +685,54 @@ pub struct GraphResult {
     pub truncated: bool,
     pub cut: SnapshotCut,
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NoteLinkDirection {
+    Outgoing,
+    Incoming,
+}
+/// Outgoing authored links include unresolved targets. Incoming links are
+/// emitted only when the source and focal target both pass visibility checks.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NoteLink {
+    pub source: NoteId,
+    pub ordinal: u32,
+    pub raw_target: String,
+    pub target: Option<NoteId>,
+    pub resolved_tier: Option<u32>,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NoteLinkCursor {
+    pub cut: SnapshotCut,
+    pub note: NoteId,
+    pub direction: NoteLinkDirection,
+    pub src_dense_id: u32,
+    pub link_ord: u32,
+}
+#[derive(Clone, Debug)]
+pub struct NoteLinkPage {
+    pub cut: SnapshotCut,
+    pub links: Vec<NoteLink>,
+    pub next: Option<NoteLinkCursor>,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChatBacklink {
+    pub thread: ChatThread,
+    pub title: String,
+    pub entry: ThreadEntrySeq,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChatBacklinkCursor {
+    pub scope: HistoryScope,
+    pub generation: ProjectionGeneration,
+    pub note: NoteId,
+    pub after: (SpaceId, ChatThreadId, ThreadEntrySeq),
+}
+#[derive(Clone, Debug)]
+pub struct ChatBacklinkPage {
+    pub links: Vec<ChatBacklink>,
+    /// A continuation refers only to a visible occurrence already returned.
+    pub next: Option<ChatBacklinkCursor>,
+}
 #[derive(Clone, Debug)]
 pub struct SearchQuery {
     pub text: String,

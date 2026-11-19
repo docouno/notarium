@@ -1932,6 +1932,7 @@ fn finalize_committed_batch(
             persisted_initial_seq,
             effective_cut,
             max_purge_seq,
+            ..
         } = entry
         {
             space_effective_cuts.insert(sid.clone(), *effective_cut);
@@ -2105,6 +2106,7 @@ fn try_run_optimistic_fast_sql_stage(
                             persisted_initial_seq: init_seq,
                             effective_cut: init_seq,
                             max_purge_seq: None,
+                            changes: crate::projection_fence::VisibilityChanges::default(),
                         },
                     );
                 }
@@ -2137,6 +2139,7 @@ fn try_run_optimistic_fast_sql_stage(
                 response_bytes,
                 new_effective_cut,
                 item_purge_seq,
+                item_changes,
                 dir_syncs,
                 retained_tickets,
                 retained_guards,
@@ -2144,6 +2147,7 @@ fn try_run_optimistic_fast_sql_stage(
                 if let Some(SpaceBatchEntry::Loaded {
                     effective_cut,
                     max_purge_seq,
+                    changes,
                     ..
                 }) = space_states.get_mut(&space_id)
                 {
@@ -2151,6 +2155,7 @@ fn try_run_optimistic_fast_sql_stage(
                     if let Some(pseq) = item_purge_seq {
                         *max_purge_seq = Some(max_purge_seq.map_or(pseq, |prev| prev.max(pseq)));
                     }
+                    changes.merge(item_changes);
                 }
                 batch_dir_syncs.merge(&dir_syncs);
                 batch_retained_tickets.extend(retained_tickets);
@@ -2249,6 +2254,7 @@ fn run_savepoint_fallback_sql_stage(
                             persisted_initial_seq: init_seq,
                             effective_cut: init_seq,
                             max_purge_seq: None,
+                            changes: crate::projection_fence::VisibilityChanges::default(),
                         },
                     );
                 }
@@ -2292,6 +2298,7 @@ fn run_savepoint_fallback_sql_stage(
                 response_bytes,
                 new_effective_cut,
                 item_purge_seq,
+                item_changes,
                 dir_syncs,
                 retained_tickets,
                 retained_guards,
@@ -2309,6 +2316,7 @@ fn run_savepoint_fallback_sql_stage(
                 if let Some(SpaceBatchEntry::Loaded {
                     effective_cut,
                     max_purge_seq,
+                    changes,
                     ..
                 }) = space_states.get_mut(&space_id)
                 {
@@ -2316,6 +2324,7 @@ fn run_savepoint_fallback_sql_stage(
                     if let Some(pseq) = item_purge_seq {
                         *max_purge_seq = Some(max_purge_seq.map_or(pseq, |prev| prev.max(pseq)));
                     }
+                    changes.merge(item_changes);
                 }
                 batch_dir_syncs.merge(&dir_syncs);
                 batch_retained_tickets.extend(retained_tickets);
@@ -2446,6 +2455,7 @@ struct FastSingleItemSuccess {
     response_bytes: Vec<u8>,
     new_effective_cut: SpaceSeq,
     item_purge_seq: Option<SpaceSeq>,
+    item_changes: crate::projection_fence::VisibilityChanges,
     dir_syncs: PendingDirSyncs,
     retained_tickets: Vec<StagedBlobTicket>,
     retained_guards: Vec<Box<dyn Send>>,
@@ -2523,6 +2533,7 @@ fn execute_single_fast_item(
                     dir_syncs: PendingDirSyncs::default(),
                     retained_tickets: Vec::new(),
                     retained_guards: Vec::new(),
+                    item_changes: crate::projection_fence::VisibilityChanges::default(),
                 }),
                 _ => Err(FastItemExecError::PreWrite(unavailable_retryable(
                     "command_receipt_pending",
@@ -2647,6 +2658,8 @@ fn execute_single_fast_item(
             .filter(|ev| ev.op_kind == "purge")
             .map(|ev| ev.space_seq)
             .max();
+        let item_changes =
+            crate::projection_fence::VisibilityChanges::from_events(&artifacts.events);
 
         for ev in artifacts.events {
             buf.change_log.push(DeferredChangeLogRow {
@@ -2739,6 +2752,7 @@ fn execute_single_fast_item(
             response_bytes: artifacts.response_bytes,
             new_effective_cut: last_seq,
             item_purge_seq,
+            item_changes,
             dir_syncs,
             retained_tickets,
             retained_guards,
@@ -2789,11 +2803,13 @@ fn execute_single_fast_item(
         .filter(|ev| ev.op_kind == "purge")
         .map(|ev| ev.space_seq)
         .max();
+    let item_changes = crate::projection_fence::VisibilityChanges::from_events(&artifacts.events);
 
     Ok(FastSingleItemSuccess {
         response_bytes: artifacts.response_bytes,
         new_effective_cut: last_seq,
         item_purge_seq,
+        item_changes,
         dir_syncs,
         retained_tickets,
         retained_guards,

@@ -33,16 +33,12 @@ pub(super) async fn exercise(store: &CanonicalStore, runtime: &ProjectorRuntime)
     hidden_board_overflow(store, runtime).await;
     graph_settlement_requires_full_space_access(store, runtime).await;
     scoped_board_refresh(store, runtime).await;
-    #[cfg(feature = "test-support")]
-    {
-        ack_retry_delivers_the_published_change(store, runtime).await;
-        reopened_feed_refreshes_the_published_command(store, runtime).await;
-        first_change_racing_projection_subscription_is_delivered(store, runtime).await;
-        purge_reseed_refreshes_only_after_readiness(store, runtime).await;
-    }
+    ack_retry_delivers_the_published_change(store, runtime).await;
+    reopened_feed_refreshes_the_published_command(store, runtime).await;
+    first_change_racing_projection_subscription_is_delivered(store, runtime).await;
+    purge_reseed_refreshes_only_after_readiness(store, runtime).await;
 }
 
-#[cfg(feature = "test-support")]
 async fn ack_retry_delivers_the_published_change(
     store: &CanonicalStore,
     runtime: &ProjectorRuntime,
@@ -88,7 +84,6 @@ async fn ack_retry_delivers_the_published_change(
     .expect("retrying ACK delivers the existing change without another write");
 }
 
-#[cfg(feature = "test-support")]
 async fn reopened_feed_refreshes_the_published_command(
     store: &CanonicalStore,
     runtime: &ProjectorRuntime,
@@ -177,7 +172,6 @@ async fn reopened_feed_refreshes_the_published_command(
     .expect("the reopened feed delivers later authorized changes");
 }
 
-#[cfg(feature = "test-support")]
 async fn first_change_racing_projection_subscription_is_delivered(
     store: &CanonicalStore,
     runtime: &ProjectorRuntime,
@@ -233,7 +227,6 @@ async fn first_change_racing_projection_subscription_is_delivered(
     .expect("the first change reaches the existing subscriber without a later write");
 }
 
-#[cfg(feature = "test-support")]
 async fn purge_reseed_refreshes_only_after_readiness(
     store: &CanonicalStore,
     runtime: &ProjectorRuntime,
@@ -335,7 +328,7 @@ async fn implicit_root_source(store: &CanonicalStore, runtime: &ProjectorRuntime
         &project,
         "explicit-root",
         "table",
-        r#"{scope: space, folder: "/", recursive: false}"#,
+        r#"{scope: folder, folder: "/", recursive: false}"#,
         "filter: {exists: probe}\n",
     )
     .await;
@@ -442,7 +435,6 @@ async fn stale_board_aggregate(store: &CanonicalStore, runtime: &ProjectorRuntim
     // Capture event authority while the old cut is current.
     let old = store.read_space(&scope.space_id).await.unwrap().last_seq;
     assert!(old > after);
-    #[cfg(feature = "test-support")]
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let event = events.next().await.unwrap().unwrap();
@@ -473,7 +465,6 @@ async fn stale_board_aggregate(store: &CanonicalStore, runtime: &ProjectorRuntim
     .await
     .unwrap();
 
-    #[cfg(feature = "test-support")]
     let mut pause = engine.pause_before_projection_for_test(&scope, 1).unwrap();
     let mut request = mutation(
         &owner,
@@ -486,7 +477,6 @@ async fn stale_board_aggregate(store: &CanonicalStore, runtime: &ProjectorRuntim
     request.preconditions.revision = Some(card.revision);
     let moved = store.move_note(owner.clone(), request).await.unwrap();
     assert!(!engine.is_live_visible(&subscriber, &card.note).unwrap());
-    #[cfg(feature = "test-support")]
     {
         let held = tokio::time::timeout(Duration::from_secs(5), pause.reached())
             .await

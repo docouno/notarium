@@ -5,27 +5,28 @@ use notarium_core::{
     DomainError,
     classes::DocClass,
     error::{PortError, ValidationReason},
-    ids::{FolderId, NoteId, SpaceSeq},
+    ids::{FolderId, NoteId, SpaceId, SpaceSeq},
     model::{HistoryScope, Lifecycle},
     ports::{Cancellation, PageLimit},
 };
 
 use crate::{
     derived::{
-        DerivedMutation, DerivedStore, LinkAddress, LinkPosition, LinkScratch,
+        CandidateLookupKey, DerivedMutation, DerivedStore, LinkAddress, LinkPosition,
         ProjectedFolderAlias, ProjectedLink, ProjectedNote, ProjectedNoteAlias,
-        ProjectionWatermark, ScratchSource, StageKey,
+        ProjectionWatermark,
     },
     graph::{GraphBuild, LeidenSnapshot},
     index::{GraphSections, IndexView, L0_BYTE_LIMIT, L0Delta},
     links::{
-        FolderTopology, LinkFolder, LinkNote, MemoryResolutionIndex, NoteAliasPosition,
-        candidate_keys, link_row, resolve_link, source_link_row,
+        AliasKey, CandidatePosition, CandidateQuery, FolderTopology, LinkFolder, LinkNote,
+        MemoryResolutionIndex, NoteAliasPosition, ResolutionIndex, candidate_keys, link_row,
+        resolve_link, source_link_row,
     },
 };
 
 use super::{
-    apply::{Stage, check_stop},
+    apply::{CommandSink, check_stop},
     checkpoint_error, graph_settle,
     records::{FolderCatalog, NoteProjection, note_raw_fields},
 };
@@ -136,9 +137,173 @@ fn checked_ordinal(ordinal: usize) -> Result<u32, PortError> {
         .map_err(|_| DomainError::validation(ValidationReason::InvalidLimit).into())
 }
 
+struct ScratchSource {
+    parent: Option<FolderId>,
+    visible: bool,
+    raw_links: Option<Vec<String>>,
+    replace_candidates: bool,
+    replacement_candidates: Vec<CandidateLookupKey>,
+}
+
+/// In-memory overlay over `DerivedStore` for resolving incremental wikilink
+/// updates within a single command without temporary SQL scratch tables.
+struct MemoryLinkScratch<'a> {
+    store: &'a DerivedStore,
+    added: MemoryResolutionIndex,
+    replaced_candidate_notes: BTreeSet<u32>,
+    replaced_slot_notes: BTreeSet<NoteId>,
+    added_slots: BTreeMap<(FolderId, String), NoteId>,
+    sources: BTreeMap<u32, ScratchSource>,
+    leaves: BTreeSet<String>,
+    watched: BTreeMap<(u32, u32), ProjectedLink>,
+    seen_notes: BTreeSet<NoteId>,
+}
+
+impl<'a> MemoryLinkScratch<'a> {
+    fn new(store: &'a DerivedStore) -> Self {
+        Self {
+            store,
+            added: MemoryResolutionIndex::default(),
+            replaced_candidate_notes: BTreeSet::new(),
+            replaced_slot_notes: BTreeSet::new(),
+            added_slots: BTreeMap::new(),
+            sources: BTreeMap::new(),
+            leaves: BTreeSet::new(),
+            watched: BTreeMap::new(),
+            seen_notes: BTreeSet::new(),
+        }
+    }
+
+    fn first_note(&mut self, note: &NoteId) -> bool {
+        self.seen_notes.insert(note.clone())
+    }
+
+    fn record_alias(&mut self, alias: &ProjectedNoteAlias) {
+        self.leaves.insert(alias.old_slug_fold.clone());
+        self.leaves.insert(alias.old_title_norm.clone());
+        self.added.put_alias(alias.clone());
+    }
+
+    fn record_leaves(&mut self, leaves: impl IntoIterator<Item = String>) {
+        self.leaves.extend(leaves);
+    }
+
+    fn record_watch(&mut self, links: Vec<ProjectedLink>) {
+        for link in links {
+            if !self.sources.contains_key(&link.src_dense_id) {
+                self.watched
+                    .entry((link.src_dense_id, link.link_ord))
+                    .or_insert(link);
+            }
+        }
+    }
+}
+
+impl ResolutionIndex for MemoryLinkScratch<'_> {
+    async fn candidates(
+        &self,
+        query: CandidateQuery<'_>,
+        after: Option<&CandidatePosition>,
+        limit: u16,
+    ) -> Result<Vec<CandidateLookupKey>, PortError> {
+        let want = usize::from(limit);
+        let mem = self.added.candidates(query, after, limit).await?;
+        let mut db = Vec::with_capacity(want);
+        let mut cursor = after.cloned();
+        let fetch_limit = limit.clamp(32, PAGE);
+        while db.len() < want {
+            let page = self
+                .store
+                .candidates(query, cursor.as_ref(), fetch_limit)
+                .await?;
+            let count = page.len();
+            cursor = page.last().map(CandidatePosition::from);
+            for row in page {
+                if !self.replaced_candidate_notes.contains(&row.target_dense_id) {
+                    db.push(row);
+                    if db.len() == want {
+                        break;
+                    }
+                }
+            }
+            if count < usize::from(fetch_limit) {
+                break;
+            }
+        }
+        Ok(merge_sorted(mem, db, want, |row| {
+            CandidatePosition::from(row)
+        }))
+    }
+
+    async fn aliases(
+        &self,
+        space: &SpaceId,
+        selector: AliasKey,
+        leaf: &str,
+        after: Option<&NoteAliasPosition>,
+        limit: u16,
+    ) -> Result<Vec<ProjectedNoteAlias>, PortError> {
+        let want = usize::from(limit);
+        let mem = self
+            .added
+            .aliases(space, selector, leaf, after, limit)
+            .await?;
+        let db = self
+            .store
+            .aliases(space, selector, leaf, after, limit)
+            .await?;
+        Ok(merge_sorted(mem, db, want, |row| {
+            NoteAliasPosition::from(row)
+        }))
+    }
+
+    async fn slot_occupant(
+        &self,
+        space: &SpaceId,
+        parent: &FolderId,
+        slug: &str,
+    ) -> Result<Option<NoteId>, PortError> {
+        if let Some(note) = self.added_slots.get(&(parent.clone(), slug.to_owned())) {
+            return Ok(Some(note.clone()));
+        }
+        Ok(self
+            .store
+            .slot_occupant(space, parent, slug)
+            .await?
+            .filter(|note| !self.replaced_slot_notes.contains(note)))
+    }
+}
+
+fn merge_sorted<T, K: Ord>(
+    left: Vec<T>,
+    right: Vec<T>,
+    limit: usize,
+    key: impl Fn(&T) -> K,
+) -> Vec<T> {
+    let mut left = left.into_iter().peekable();
+    let mut right = right.into_iter().peekable();
+    let mut merged = Vec::with_capacity(limit);
+    while merged.len() < limit {
+        match (left.peek(), right.peek()) {
+            (Some(l), Some(r)) => match key(l).cmp(&key(r)) {
+                std::cmp::Ordering::Less => merged.push(left.next().unwrap()),
+                std::cmp::Ordering::Greater => merged.push(right.next().unwrap()),
+                std::cmp::Ordering::Equal => {
+                    merged.push(left.next().unwrap());
+                    let _ = right.next();
+                }
+            },
+            (Some(_), None) => merged.push(left.next().unwrap()),
+            (None, Some(_)) => merged.push(right.next().unwrap()),
+            (None, None) => break,
+        }
+    }
+    merged
+}
+
 pub(super) struct LinkStage<'a> {
     store: &'a DerivedStore,
-    scratch: LinkScratch,
+    scratch: MemoryLinkScratch<'a>,
     scope: HistoryScope,
     before: &'a FolderTopology,
     folders: &'a FolderTopology,
@@ -183,29 +348,28 @@ impl LinkApply {
 }
 
 impl<'a> LinkStage<'a> {
-    pub(super) async fn new(
+    pub(super) fn new(
         store: &'a DerivedStore,
-        key: &StageKey,
-        before: SpaceSeq,
+        scope: HistoryScope,
         old_topology: &'a FolderTopology,
         topology: &'a FolderTopology,
-    ) -> Result<Self, PortError> {
-        Ok(Self {
+    ) -> Self {
+        Self {
             store,
-            scratch: LinkScratch::open(store, key, before).await?,
-            scope: key.scope.clone(),
+            scratch: MemoryLinkScratch::new(store),
+            scope,
             before: old_topology,
             folders: topology,
             changes: LinkApply::default(),
-        })
+        }
     }
 
-    pub(super) async fn first_note(&self, note: &NoteId) -> Result<bool, PortError> {
-        self.scratch.first_note(note).await
+    pub(super) fn first_note(&mut self, note: &NoteId) -> bool {
+        self.scratch.first_note(note)
     }
 
-    pub(super) async fn record_alias(&self, alias: &ProjectedNoteAlias) -> Result<(), PortError> {
-        self.scratch.record_alias(alias).await
+    pub(super) fn record_alias(&mut self, alias: &ProjectedNoteAlias) {
+        self.scratch.record_alias(alias);
     }
 
     pub(super) async fn record_change(
@@ -253,40 +417,55 @@ impl<'a> LinkStage<'a> {
                 row.doc_class != DocClass::EncryptedNote && row.lifecycle != Lifecycle::Purged
             })
             .map(|row| row.parent_folder_id.clone());
-        let raw_count = if parent.is_some() {
-            raw_links
-                .map(|raw| checked_ordinal(raw.len()))
-                .transpose()?
+        let raw_links = if parent.is_some() {
+            if let Some(raw) = raw_links {
+                checked_ordinal(raw.len())?;
+                Some(raw.to_vec())
+            } else {
+                None
+            }
         } else {
-            Some(0)
+            Some(Vec::new())
         };
-        self.scratch
-            .record_source(ScratchSource {
-                dense: identity.dense_id,
-                note: identity.note_id.clone(),
+        if replace_candidates {
+            self.scratch
+                .replaced_candidate_notes
+                .insert(identity.dense_id);
+            self.scratch.record_leaves(
+                old_keys
+                    .iter()
+                    .chain(&new_keys)
+                    .map(|key| key.leaf_norm_key.clone()),
+            );
+            for key in &new_keys {
+                self.scratch.added.put_candidate(key.clone());
+            }
+        }
+        if replace_slot {
+            self.scratch
+                .replaced_slot_notes
+                .insert(identity.note_id.clone());
+            if let Some((folder, slug, note)) = new_slot {
+                self.scratch
+                    .added_slots
+                    .insert((folder.clone(), slug.to_owned()), note.clone());
+            }
+        }
+        self.scratch.sources.insert(
+            identity.dense_id,
+            ScratchSource {
                 parent,
                 visible: active_after,
-                raw_count,
+                raw_links,
                 replace_candidates,
-                replace_slot,
-                slot: new_slot
-                    .filter(|_| replace_slot)
-                    .map(|(folder, slug, _)| (folder.clone(), slug.to_owned())),
-            })
-            .await?;
-        if raw_count.is_some_and(|count| count != 0)
-            && let Some(raw) = raw_links
-        {
-            self.scratch.record_raw(identity.dense_id, 0, raw).await?;
-        }
+                replacement_candidates: if replace_candidates {
+                    new_keys
+                } else {
+                    Vec::new()
+                },
+            },
+        );
         if replace_candidates {
-            let leaves = old_keys
-                .iter()
-                .chain(&new_keys)
-                .map(|key| key.leaf_norm_key.clone())
-                .collect::<Vec<_>>();
-            self.scratch.record_leaves(&leaves).await?;
-            self.scratch.record_candidates(&new_keys).await?;
             self.alias_leaves(AliasDependencies::Note(&identity.note_id))
                 .await?;
         }
@@ -299,7 +478,7 @@ impl<'a> LinkStage<'a> {
         Ok(())
     }
 
-    async fn alias_leaves(&self, dependencies: AliasDependencies<'_>) -> Result<(), PortError> {
+    async fn alias_leaves(&mut self, dependencies: AliasDependencies<'_>) -> Result<(), PortError> {
         let space = &self.scope.space_id;
         let mut after = None;
         loop {
@@ -315,11 +494,10 @@ impl<'a> LinkStage<'a> {
                         .await?
                 }
             };
-            let leaves = rows
-                .iter()
-                .flat_map(|alias| [alias.old_slug_fold.clone(), alias.old_title_norm.clone()])
-                .collect::<Vec<_>>();
-            self.scratch.record_leaves(&leaves).await?;
+            self.scratch.record_leaves(
+                rows.iter()
+                    .flat_map(|alias| [alias.old_slug_fold.clone(), alias.old_title_norm.clone()]),
+            );
             if rows.len() < usize::from(PAGE) {
                 return Ok(());
             }
@@ -329,68 +507,51 @@ impl<'a> LinkStage<'a> {
 
     pub(super) async fn finish(
         mut self,
-        stage: &mut Stage<'_>,
+        sink: &mut CommandSink<'_>,
         aliases: &[ProjectedNoteAlias],
         stop: &Cancellation,
     ) -> Result<LinkApply, PortError> {
         for alias in aliases {
             check_stop(stop)?;
-            self.record_alias(alias).await?;
+            self.record_alias(alias);
         }
-        let mut after = None;
-        loop {
+        let source_ids: Vec<u32> = self.scratch.sources.keys().copied().collect();
+        for dense in source_ids {
             check_stop(stop)?;
-            let sources = self.scratch.sources(after).await?;
-            let total = sources.len();
-            after = sources.last().map(|source| source.dense);
-            for source in sources {
-                check_stop(stop)?;
-                if source.replace_candidates {
-                    stage
-                        .push(vec![DerivedMutation::DeleteNoteCandidates(source.dense)])
-                        .await?;
-                    let mut after = None;
-                    loop {
-                        check_stop(stop)?;
-                        let candidates = self
-                            .scratch
-                            .replacement_candidates(source.dense, after.as_ref())
-                            .await?;
-                        let count = candidates.len();
-                        after = candidates.last().cloned();
-                        stage
-                            .push(
-                                candidates
-                                    .into_iter()
-                                    .map(DerivedMutation::UpsertCandidate)
-                                    .collect(),
-                            )
-                            .await?;
-                        if count < usize::from(PAGE) {
-                            break;
-                        }
-                    }
-                    self.watch(LinkAddress::Target(source.dense), stop).await?;
+            let replace_candidates = self.scratch.sources[&dense].replace_candidates;
+            if replace_candidates {
+                sink.push(vec![DerivedMutation::DeleteNoteCandidates(dense)])
+                    .await?;
+                let candidates = std::mem::take(
+                    &mut self
+                        .scratch
+                        .sources
+                        .get_mut(&dense)
+                        .expect("source exists")
+                        .replacement_candidates,
+                );
+                for batch in candidates.chunks(usize::from(PAGE)) {
+                    check_stop(stop)?;
+                    sink.push(
+                        batch
+                            .iter()
+                            .cloned()
+                            .map(DerivedMutation::UpsertCandidate)
+                            .collect(),
+                    )
+                    .await?;
                 }
-                self.apply_source(&source, stage, stop).await?;
+                self.watch(LinkAddress::Target(dense), stop).await?;
             }
-            if total < usize::from(PAGE) {
-                break;
-            }
+            self.apply_source(dense, sink, stop).await?;
         }
 
-        let mut after_leaf = None;
-        loop {
+        let leaves: Vec<String> = std::mem::take(&mut self.scratch.leaves)
+            .into_iter()
+            .collect();
+        for leaf in leaves {
             check_stop(stop)?;
-            let leaves = self.scratch.leaves(after_leaf.as_deref()).await?;
-            let total = leaves.len();
-            after_leaf = leaves.last().cloned();
-            for leaf in leaves {
-                self.watch(LinkAddress::Leaf(&leaf), stop).await?;
-            }
-            if total < usize::from(PAGE) {
-                break;
-            }
+            self.watch(LinkAddress::Leaf(&leaf), stop).await?;
         }
         let addresses = self.before.changed_addresses(self.folders);
         for prefix in &addresses.prefixes {
@@ -401,41 +562,48 @@ impl<'a> LinkStage<'a> {
                 .await?;
         }
 
-        let mut after = None;
-        loop {
+        let watched = std::mem::take(&mut self.scratch.watched);
+        let mut active = BTreeMap::new();
+        for old in watched.into_values() {
             check_stop(stop)?;
-            let page = self.scratch.watched(after).await?;
-            let count = page.len();
-            after = page.last().map(|row| (row.src_dense_id, row.link_ord));
-            let mut active = BTreeMap::new();
-            for old in page {
-                let may_emit = if let Some(&may_emit) = active.get(&old.src_dense_id) {
-                    may_emit
-                } else {
-                    let may_emit = self
-                        .store
-                        .is_link_source_active(&self.scope.space_id, old.src_dense_id)
-                        .await?;
-                    active.insert(old.src_dense_id, may_emit);
-                    may_emit
-                };
-                if may_emit {
-                    let mut new = old.clone();
-                    resolve_link(&mut new, self.folders, &self.scratch).await?;
-                    if let Some(mutation) = self.changes.put(Some(&old), new) {
-                        stage.push(vec![mutation]).await?;
-                    }
-                }
-            }
-            if count < usize::from(PAGE) {
-                break;
+            let may_emit = if let Some(&may_emit) = active.get(&old.src_dense_id) {
+                may_emit
+            } else {
+                let may_emit = self
+                    .store
+                    .is_link_source_active(&self.scope.space_id, old.src_dense_id)
+                    .await?;
+                active.insert(old.src_dense_id, may_emit);
+                may_emit
+            };
+            let new = if may_emit {
+                let mut row = old.clone();
+                resolve_link(&mut row, self.folders, &self.scratch).await?;
+                row
+            } else {
+                // Keep source path metadata consistent with ColdLinks even when
+                // a trashed note cannot emit resolved edges.
+                source_link_row(
+                    &self.scope.space_id,
+                    old.src_dense_id,
+                    &old.src_folder_id,
+                    old.link_ord,
+                    old.raw_target.clone(),
+                    self.folders,
+                )
+            };
+            if let Some(mutation) = self.changes.put(Some(&old), new) {
+                sink.push(vec![mutation]).await?;
             }
         }
-        self.scratch.clear().await?;
         Ok(self.changes)
     }
 
-    async fn watch(&self, address: LinkAddress<'_>, stop: &Cancellation) -> Result<(), PortError> {
+    async fn watch(
+        &mut self,
+        address: LinkAddress<'_>,
+        stop: &Cancellation,
+    ) -> Result<(), PortError> {
         let mut after = None;
         loop {
             check_stop(stop)?;
@@ -443,25 +611,37 @@ impl<'a> LinkStage<'a> {
                 .store
                 .link_page(&self.scope.space_id, address, after.as_ref(), page())
                 .await?;
-            self.scratch.record_watch(&links).await?;
-            if links.len() < usize::from(PAGE) {
+            let count = links.len();
+            after = links.last().map(LinkPosition::from);
+            self.scratch.record_watch(links);
+            if count < usize::from(PAGE) {
                 return Ok(());
             }
-            after = links.last().map(LinkPosition::from);
         }
     }
 
     async fn apply_source(
         &mut self,
-        source: &ScratchSource,
-        stage: &mut Stage<'_>,
+        dense: u32,
+        sink: &mut CommandSink<'_>,
         stop: &Cancellation,
     ) -> Result<(), PortError> {
+        let parent = self.scratch.sources[&dense].parent.clone();
+        let visible = self.scratch.sources[&dense].visible;
+        let raw_links = std::mem::take(
+            &mut self
+                .scratch
+                .sources
+                .get_mut(&dense)
+                .expect("source exists")
+                .raw_links,
+        );
         let mut old = VecDeque::<ProjectedLink>::new();
         let mut old_after = None;
         let mut old_done = false;
-        let mut raw = VecDeque::<(u32, String)>::new();
-        let mut raw_from = 0;
+        let mut raw_iter = raw_links
+            .as_ref()
+            .map(|rows| rows.iter().enumerate().peekable());
         loop {
             check_stop(stop)?;
             if old.is_empty() && !old_done {
@@ -469,7 +649,7 @@ impl<'a> LinkStage<'a> {
                     .store
                     .link_page(
                         &self.scope.space_id,
-                        LinkAddress::Source(source.dense),
+                        LinkAddress::Source(dense),
                         old_after.as_ref(),
                         page(),
                     )
@@ -478,71 +658,75 @@ impl<'a> LinkStage<'a> {
                 old_after = rows.last().map(LinkPosition::from);
                 old = rows.into();
             }
-            if let Some(total) = source.raw_count {
-                if raw.is_empty() && raw_from < total {
-                    let rows = self.scratch.raw(source.dense, raw_from).await?;
-                    raw_from = rows
-                        .last()
-                        .ok_or_else(invalid_edge)?
-                        .0
-                        .checked_add(1)
-                        .ok_or_else(invalid_edge)?;
-                    raw = rows.into();
-                }
-                if let Some((ordinal, _)) = raw.front()
-                    && old.front().is_none_or(|old| old.link_ord >= *ordinal)
-                {
-                    let (ordinal, raw_target) = raw.pop_front().ok_or_else(invalid_edge)?;
+            if let Some(iter) = raw_iter.as_mut()
+                && let Some(&(ordinal, _)) = iter.peek()
+            {
+                let ordinal = checked_ordinal(ordinal)?;
+                if old.front().is_none_or(|old| old.link_ord >= ordinal) {
+                    let (_, raw_target) = iter.next().ok_or_else(invalid_edge)?;
                     let previous = old
                         .front()
                         .is_some_and(|row| row.link_ord == ordinal)
                         .then(|| old.pop_front())
                         .flatten();
-                    self.apply_raw(source, stage, previous.as_ref(), ordinal, raw_target)
-                        .await?;
+                    self.apply_raw(
+                        dense,
+                        parent.as_ref(),
+                        visible,
+                        sink,
+                        previous.as_ref(),
+                        ordinal,
+                        raw_target.clone(),
+                    )
+                    .await?;
                     continue;
                 }
             }
             let Some(previous) = old.pop_front() else {
                 return Ok(());
             };
-            if source.raw_count.is_none() && source.parent.is_some() {
+            if raw_links.is_none() && parent.is_some() {
                 self.apply_raw(
-                    source,
-                    stage,
+                    dense,
+                    parent.as_ref(),
+                    visible,
+                    sink,
                     Some(&previous),
                     previous.link_ord,
                     previous.raw_target.clone(),
                 )
                 .await?;
             } else {
-                stage.push(vec![self.changes.remove(previous)]).await?;
+                sink.push(vec![self.changes.remove(previous)]).await?;
             }
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn apply_raw(
         &mut self,
-        source: &ScratchSource,
-        stage: &mut Stage<'_>,
+        dense: u32,
+        parent: Option<&FolderId>,
+        visible: bool,
+        sink: &mut CommandSink<'_>,
         previous: Option<&ProjectedLink>,
         ordinal: u32,
         raw: String,
     ) -> Result<(), PortError> {
-        let parent = source.parent.as_ref().ok_or_else(invalid_edge)?;
+        let parent = parent.ok_or_else(invalid_edge)?;
         let mut row = source_link_row(
             &self.scope.space_id,
-            source.dense,
+            dense,
             parent,
             ordinal,
             raw,
             self.folders,
         );
-        if source.visible {
+        if visible {
             resolve_link(&mut row, self.folders, &self.scratch).await?;
         }
         if let Some(mutation) = self.changes.put(previous, row) {
-            stage.push(vec![mutation]).await?;
+            sink.push(vec![mutation]).await?;
         }
         Ok(())
     }
@@ -574,6 +758,7 @@ pub(super) async fn collect_graph_sections(
     effective: Bitmap,
     previous: Option<&IndexView>,
     settle: bool,
+    stop: &Cancellation,
 ) -> Result<CheckpointGraph, PortError> {
     let scope = &watermark.scope;
     let cut = watermark.projected_seq;
@@ -586,6 +771,7 @@ pub(super) async fn collect_graph_sections(
     };
     let mut after = None;
     loop {
+        check_stop(stop)?;
         let rows = store
             .graph_edges_page(scope, cut, None, after, page())
             .await?;
@@ -625,12 +811,13 @@ pub(super) async fn collect_graph_sections(
     }
     if settle {
         let scope = scope.clone();
+        let cancel = stop.clone();
         return tokio::task::spawn_blocking(move || {
             let build = GraphBuild {
                 notes: &notes,
                 sections: &graph,
             };
-            let snapshot = LeidenSnapshot::compute(&build, &scope, &effective)?;
+            let snapshot = LeidenSnapshot::compute(&build, &scope, &effective, &cancel)?;
             let mutations = graph_settle::cluster_mutations(&snapshot, &build, &scope, cut)?;
             graph.clusters = snapshot.expanded();
             Ok(CheckpointGraph {

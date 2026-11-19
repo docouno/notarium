@@ -1,5 +1,5 @@
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::Arc,
@@ -14,16 +14,10 @@ use notarium_core::{
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
-mod peers;
-
-pub use peers::{
-    GenerationLease, PeerAcknowledgement, PeerCandidate, PeerProposal, SpaceGenerationWitness,
-};
-
 use super::{
     internal, invalid_row,
     records::{decode, encode},
-    sql::{Database, Kind, SqlColumn, SqlTransaction, value},
+    sql::{Database, Kind, SqlColumn, SqlTransaction, validate_schema_prefix, value},
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -42,11 +36,15 @@ struct DescriptorState {
 
 enum ControlBackend {
     Local(PathBuf),
-    Postgres(Arc<Database>),
+    Postgres {
+        database: Arc<Database>,
+        schema_prefix: String,
+    },
 }
 
-/// Serializes candidate selection and durable activation independently from
-/// databases and checkpoint files that belong to individual generations.
+/// Serializes single-owner candidate selection and durable activation
+/// independently from databases and checkpoint files belonging to individual
+/// generations.
 #[derive(Clone)]
 pub struct GenerationControl(Arc<ControlBackend>);
 
@@ -55,7 +53,13 @@ impl GenerationControl {
         let path = root.active_projection_generation();
         let directory = path.parent().ok_or_else(invalid_row)?.to_owned();
         tokio::task::spawn_blocking(move || {
-            fs::create_dir_all(&directory).map_err(|_| internal("projection_control_directory"))
+            fs::create_dir_all(&directory).map_err(|_| internal("projection_control_directory"))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(&directory, fs::Permissions::from_mode(0o700));
+            }
+            Ok::<_, PortError>(())
         })
         .await
         .map_err(|_| internal("projection_control_worker"))??;
@@ -65,6 +69,7 @@ impl GenerationControl {
     }
 
     pub async fn open_postgres(pool: PgPool, schema_prefix: &str) -> Result<Self, PortError> {
+        let schema_prefix = validate_schema_prefix(schema_prefix)?.to_owned();
         let schema = format!("{schema_prefix}_ctrl");
         let database = Arc::new(Database::open_postgres(pool, &schema).await?);
         database
@@ -72,34 +77,32 @@ impl GenerationControl {
                 Box::pin(async move {
                     tx.batch(
                         "SELECT pg_advisory_xact_lock(hashtextextended(current_schema(), 272014));
-                 CREATE TABLE IF NOT EXISTS projection_generation_control (
-                     row_id BIGINT PRIMARY KEY CHECK (row_id = 1),
-                     descriptor BYTEA NOT NULL
-                 );
-                 CREATE TABLE IF NOT EXISTS projection_generation_peer_handoff (
-                     row_id BIGINT PRIMARY KEY CHECK (row_id = 1),
-                     state BYTEA NOT NULL
-                 );
-                 CREATE TABLE IF NOT EXISTS projection_generation_read_leases (
-                     generation BIGINT NOT NULL,
-                     lease_id BYTEA NOT NULL,
-                     participant TEXT NOT NULL,
-                     PRIMARY KEY (generation, lease_id)
-                 );",
+                         CREATE TABLE IF NOT EXISTS projection_generation_control (
+                             row_id BIGINT PRIMARY KEY CHECK (row_id = 1),
+                             descriptor BYTEA NOT NULL
+                         );",
                     )
                     .await?;
                     tx.execute(
-                "INSERT INTO projection_generation_control (row_id, descriptor) VALUES (1, ?)
-                 ON CONFLICT (row_id) DO NOTHING",
-                vec![value(&encode(&DescriptorState::default())?)],
-            ).await?;
+                        "INSERT INTO projection_generation_control (row_id, descriptor) VALUES (1, ?)
+                         ON CONFLICT (row_id) DO NOTHING",
+                        vec![value(&encode(&DescriptorState::default())?)],
+                    )
+                    .await?;
                     Ok(())
                 })
             })
             .await?;
-        let control = Self(Arc::new(ControlBackend::Postgres(database)));
+        let control = Self(Arc::new(ControlBackend::Postgres {
+            database,
+            schema_prefix,
+        }));
         control.active().await?;
         Ok(control)
+    }
+
+    pub(crate) fn is_postgres(&self) -> bool {
+        matches!(&*self.0, ControlBackend::Postgres { .. })
     }
 
     pub async fn active(&self) -> Result<Option<GenerationDescriptor>, PortError> {
@@ -110,25 +113,75 @@ impl GenerationControl {
         Ok(self.read().await?.candidate)
     }
 
-    /// Called after admission to the sole local cache owner. A process that
-    /// failed before the swap leaves a disposable reservation and candidate.
-    pub(crate) async fn clear_interrupted_local_rotation(&self) -> Result<(), PortError> {
-        if self.is_distributed() {
-            return Ok(());
-        }
+    /// Returns true if `generation` is neither the active generation nor a
+    /// reserved rotation candidate and may be safely reclaimed.
+    pub(crate) async fn generation_reclaimable(
+        &self,
+        generation: ProjectionGeneration,
+    ) -> Result<bool, PortError> {
+        let state = self.read().await?;
+        Ok(
+            state.active.as_ref().map(|d| d.generation) != Some(generation)
+                && state.candidate.as_ref().map(|d| d.generation) != Some(generation),
+        )
+    }
+
+    /// Called after admission to the sole cache owner. A process that failed
+    /// before the swap leaves a disposable reservation and candidate.
+    pub(crate) async fn clear_interrupted_rotation(&self) -> Result<(), PortError> {
         let Some(candidate) = self.candidate().await? else {
             return Ok(());
         };
         match self.cancel_candidate(&candidate).await {
             Ok(_) => Ok(()),
             Err(error) => {
-                if self.local_rotation_witness().await?.candidate.is_none() {
+                if !self.is_postgres() && self.local_rotation_witness().await?.candidate.is_none() {
                     Ok(())
                 } else {
                     Err(error)
                 }
             }
         }
+    }
+
+    /// Resets an obsolete candidate PostgreSQL generation schema while holding
+    /// the control row lock so no concurrent rotation can observe half-dropped
+    /// tables.
+    pub(crate) async fn reset_obsolete_postgres_candidate(
+        &self,
+        expected: &GenerationDescriptor,
+        candidate: &GenerationDescriptor,
+    ) -> Result<(), PortError> {
+        let ControlBackend::Postgres {
+            database,
+            schema_prefix,
+        } = &*self.0
+        else {
+            return Err(invalid_row());
+        };
+        let expected = expected.clone();
+        let candidate = candidate.clone();
+        let schema = format!("{schema_prefix}_g{}", candidate.generation.get());
+        database
+            .write(false, move |mut tx| {
+                Box::pin(async move {
+                    let state = read_postgres(&mut tx, true).await?;
+                    if state.active.as_ref() != Some(&expected)
+                        || state.candidate.as_ref() != Some(&candidate)
+                    {
+                        return Err(
+                            DomainError::validation(ValidationReason::GenerationMismatch).into(),
+                        );
+                    }
+                    super::maintenance::reset_obsolete_postgres(
+                        &mut tx,
+                        &schema,
+                        candidate.generation,
+                    )
+                    .await
+                })
+            })
+            .await
     }
 
     /// A CAS whose rename may have succeeded is inspected after taking the
@@ -181,9 +234,6 @@ impl GenerationControl {
         expected: Option<&GenerationDescriptor>,
         next: &GenerationDescriptor,
     ) -> Result<bool, PortError> {
-        if self.is_distributed() && expected.is_some() {
-            return Err(DomainError::validation(ValidationReason::InvalidState).into());
-        }
         validate_transition(expected, next)?;
         let expected = expected.cloned();
         let next = next.clone();
@@ -226,7 +276,7 @@ impl GenerationControl {
                     .await
                     .map_err(|_| internal("projection_control_worker"))?
             }
-            ControlBackend::Postgres(database) => {
+            ControlBackend::Postgres { database, .. } => {
                 database
                     .read(|mut tx| Box::pin(async move { read_postgres(&mut tx, false).await }))
                     .await
@@ -253,26 +303,19 @@ impl GenerationControl {
                 .await
                 .map_err(|_| internal("projection_control_worker"))?
             }
-            ControlBackend::Postgres(database) => {
+            ControlBackend::Postgres { database, .. } => {
                 database
                     .write(false, move |mut tx| {
                         Box::pin(async move {
                             let mut state = read_postgres(&mut tx, true).await?;
-                            let candidate = state.candidate.clone();
                             if !operation(&mut state) {
                                 return Ok(false);
                             }
-                            if candidate != state.candidate {
-                                if let Some(next) = &state.candidate {
-                                    peers::begin_attempt(&mut tx, next).await?;
-                                } else {
-                                    peers::clear_attempt(&mut tx).await?;
-                                }
-                            }
                             tx.execute(
-                        "UPDATE projection_generation_control SET descriptor = ? WHERE row_id = 1",
-                        vec![value(&encode(&state)?)],
-                    ).await?;
+                                "UPDATE projection_generation_control SET descriptor = ? WHERE row_id = 1",
+                                vec![value(&encode(&state)?)],
+                            )
+                            .await?;
                             Ok(true)
                         })
                     })
@@ -320,7 +363,7 @@ fn validate_state(state: DescriptorState) -> Result<DescriptorState, PortError> 
 }
 
 fn read_local(path: &Path) -> Result<DescriptorState, PortError> {
-    let file = match File::open(path) {
+    let file = match open_local_readonly(path) {
         Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             return Ok(DescriptorState::default());
@@ -337,13 +380,63 @@ fn read_local(path: &Path) -> Result<DescriptorState, PortError> {
     validate_state(serde_json::from_slice(&bytes).map_err(|_| invalid_row())?)
 }
 
+fn open_local_readonly(path: &Path) -> std::io::Result<File> {
+    #[cfg(unix)]
+    {
+        use rustix::fs::{Mode, OFlags, open};
+        use std::os::unix::fs::MetadataExt;
+        let file = File::from(
+            open(
+                path,
+                OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                Mode::empty(),
+            )
+            .map_err(std::io::Error::from)?,
+        );
+        let meta = file.metadata()?;
+        if !meta.is_file() || meta.uid() != rustix::process::geteuid().as_raw() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "invalid control descriptor file",
+            ));
+        }
+        Ok(file)
+    }
+    #[cfg(not(unix))]
+    {
+        File::open(path)
+    }
+}
+
 fn lock_local(path: &Path) -> Result<File, PortError> {
-    let file = OpenOptions::new()
+    let lock_path = path.with_extension("lock");
+    #[cfg(unix)]
+    let file = {
+        use rustix::fs::{Mode, OFlags, open};
+        use std::os::unix::fs::MetadataExt;
+        let file = File::from(
+            open(
+                &lock_path,
+                OFlags::RDWR | OFlags::CREATE | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                Mode::RUSR | Mode::WUSR,
+            )
+            .map_err(|_| internal("projection_control_lock_open"))?,
+        );
+        let meta = file
+            .metadata()
+            .map_err(|_| internal("projection_control_lock_open"))?;
+        if !meta.is_file() || meta.uid() != rustix::process::geteuid().as_raw() {
+            return Err(internal("projection_control_lock_open"));
+        }
+        file
+    };
+    #[cfg(not(unix))]
+    let file = fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(path.with_extension("lock"))
+        .open(&lock_path)
         .map_err(|_| internal("projection_control_lock_open"))?;
     file.lock()
         .map_err(|_| internal("projection_control_lock"))?;
@@ -355,7 +448,24 @@ fn write_local(path: &Path, state: &DescriptorState) -> Result<(), PortError> {
     getrandom::fill(&mut nonce).map_err(|_| internal("projection_control_entropy"))?;
     let temporary = path.with_extension(format!("{:032x}.tmp", u128::from_le_bytes(nonce)));
     let result = (|| {
-        let mut file = OpenOptions::new()
+        #[cfg(unix)]
+        let mut file = {
+            use rustix::fs::{Mode, OFlags, open};
+            File::from(
+                open(
+                    &temporary,
+                    OFlags::WRONLY
+                        | OFlags::CREATE
+                        | OFlags::EXCL
+                        | OFlags::CLOEXEC
+                        | OFlags::NOFOLLOW,
+                    Mode::RUSR | Mode::WUSR,
+                )
+                .map_err(|_| internal("projection_control_temp"))?,
+            )
+        };
+        #[cfg(not(unix))]
+        let mut file = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&temporary)
@@ -400,20 +510,6 @@ async fn read_postgres(
     };
     let bytes = tx
         .select(sql, Vec::new(), &[Kind::Bytes])
-        .await?
-        .pop()
-        .and_then(|mut row| row.pop())
-        .ok_or_else(invalid_row)?;
-    validate_state(decode(&Vec::<u8>::read(bytes)?)?)
-}
-
-async fn read_postgres_shared(tx: &mut SqlTransaction<'_>) -> Result<DescriptorState, PortError> {
-    let bytes = tx
-        .select(
-            "SELECT descriptor FROM projection_generation_control WHERE row_id = 1 FOR SHARE",
-            Vec::new(),
-            &[Kind::Bytes],
-        )
         .await?
         .pop()
         .and_then(|mut row| row.pop())

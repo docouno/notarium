@@ -130,6 +130,16 @@ pub(crate) struct LinkPosition {
     ordinal: u32,
 }
 
+impl LinkPosition {
+    pub(crate) fn from_key(source: u32, ordinal: u32) -> Self {
+        Self {
+            prefix: String::new(),
+            source,
+            ordinal,
+        }
+    }
+}
+
 impl From<&ProjectedLink> for LinkPosition {
     fn from(link: &ProjectedLink) -> Self {
         Self {
@@ -227,7 +237,7 @@ impl DerivedStore {
             params.extend([value(&after.source), value(&after.ordinal)]);
         }
         params.push(value(&limit.get()));
-        self.temporal(
+        self.at_cut(
             scope,
             cut,
             filter,

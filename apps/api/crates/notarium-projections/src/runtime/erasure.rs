@@ -11,7 +11,9 @@ use notarium_core::{
 };
 
 use crate::{
-    derived::{DerivedStore, GenerationFiles, PostgresCacheOwner, PostgresEraser},
+    derived::{
+        DerivedStore, GenerationControl, GenerationFiles, PostgresCacheOwner, PostgresEraser,
+    },
     mmap::{BaseIndexHandle, IndexIdentity, discard_abandoned_temp},
 };
 
@@ -49,8 +51,8 @@ impl ProjectionVisibilityCleanup for Eraser {
                     .erase_committed_visibility(self.postgres.as_ref(), erasures)
                     .await;
             }
+            let _maintenance = self.generation_cleanup.lock().await;
             if let Some(postgres) = &self.postgres {
-                let _maintenance = self.generation_cleanup.lock().await;
                 return erase_postgres_visibility(
                     postgres,
                     &self.root,
@@ -59,7 +61,7 @@ impl ProjectionVisibilityCleanup for Eraser {
                 )
                 .await;
             }
-            Ok(())
+            erase_offline_sqlite(&self.root, erasures).await
         })
     }
 }
@@ -153,7 +155,24 @@ impl ProjectionEngine {
             }
         }
         if purging {
+            let generations = self
+                .known_generations
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            for generation in generations.values() {
+                if let Some(slot) = generation.slot(&erasures.scope.space_id)
+                    && let Some(cut) = slot.cut.load_full()
+                    && cut.cut.scope == erasures.scope
+                    && (cut.cut.projected_seq < erasures.through || cut.base.repair_pending())
+                {
+                    slot.clear_if_current(&cut);
+                    self.pool.evict(&cut.base);
+                    slot.repair.notify_one();
+                }
+            }
             self.reads.invalidate_history(&erasures.scope);
+            self.scrub_space_events(&erasures.scope.space_id);
         }
         Ok(())
     }
@@ -204,6 +223,47 @@ async fn erase_postgres_visibility(
     Ok(())
 }
 
+async fn erase_offline_sqlite(
+    root: &DataRoot,
+    erasures: &ProjectionErasures,
+) -> Result<(), PortError> {
+    let purging = !erasures.purged.is_empty();
+    let control = GenerationControl::open_sqlite(root).await?;
+    for id in GenerationFiles::inventory(root).await? {
+        if !root.derived(id).exists() {
+            if purging {
+                erase_closed_checkpoints(root, id, &erasures.scope, erasures.through).await?;
+            }
+            continue;
+        }
+        let store = DerivedStore::open_sqlite_for_runtime(root, id).await?;
+        let Some(store) = store else {
+            if control
+                .active()
+                .await?
+                .is_none_or(|active| active.generation <= id)
+                || control
+                    .candidate()
+                    .await?
+                    .is_some_and(|candidate| candidate.generation == id)
+            {
+                return Err(not_ready());
+            }
+            let lease = GenerationFiles::for_reclamation(root, id)
+                .await?
+                .ok_or_else(not_ready)?;
+            GenerationFiles::remove(root, id, false, lease).await?;
+            continue;
+        };
+        let (scope, through) = store.erase_committed_visibility(erasures).await?;
+        drop(store);
+        if purging {
+            erase_closed_checkpoints(root, id, &scope, through).await?;
+        }
+    }
+    Ok(())
+}
+
 async fn erase_scoped_checkpoints(
     root: &DataRoot,
     generation: ProjectionGeneration,
@@ -212,9 +272,6 @@ async fn erase_scoped_checkpoints(
     cache_owner: Option<&Arc<PostgresCacheOwner>>,
     sweep: bool,
 ) -> Result<(), PortError> {
-    if !sweep {
-        return retire_registered(root, generation, scope, through);
-    }
     let root = root.clone();
     let scope = scope.clone();
     let cache_owner = cache_owner.cloned();
@@ -222,7 +279,10 @@ async fn erase_scoped_checkpoints(
         // This operation can continue after its caller is cancelled.
         let _cache_owner = cache_owner;
         retire_registered(&root, generation, &scope, through)?;
-        erase_checkpoint_files(&root, generation, &scope, through)
+        if sweep {
+            erase_checkpoint_files(&root, generation, &scope, through)?;
+        }
+        Ok(())
     })
     .await
     .map_err(checkpoint_error)?
@@ -234,7 +294,13 @@ async fn erase_closed_checkpoints(
     scope: &HistoryScope,
     through: SpaceSeq,
 ) -> Result<(), PortError> {
-    retire_registered(root, generation, scope, through)?;
+    let retire_root = root.clone();
+    let retire_scope = scope.clone();
+    tokio::task::spawn_blocking(move || {
+        retire_registered(&retire_root, generation, &retire_scope, through)
+    })
+    .await
+    .map_err(checkpoint_error)??;
     let cache = root.clone();
     let erased_scope = scope.clone();
     GenerationFiles::with_exclusive_reclamation(root, generation, move || {

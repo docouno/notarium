@@ -501,6 +501,8 @@ same example against an isolated prefix.
   caller's byte budget. To materialize a historical spool, create an empty
   target with `schema::POSTGRES_BASELINE_DDL`. For versions 1 through 6, apply
   `tests/fixtures/schema-v6-remove-projection.sql` from the canonical crate.
+  For versions 1 through 5, drop `idx_blob_retirements_status` and recreate it
+  on `(space_id, status)`.
   For versions 1 and 2, drop
   `collab_checkpoints` and `backup_holds.owner_generation`. For version 1,
   also drop `account_catalog_receipts` and `chat_pending_inputs.ext_space_tainted`.
@@ -515,8 +517,8 @@ same example against an isolated prefix.
   temporary table, then inserts the full set in one statement so foreign keys
   can resolve parents that appear later in the archive.
   Opening the target with the original installation ID applies the remaining
-  migrations through version 6. The canonical L4 backup suite exercises this
-  procedure with archives from all five predecessor versions.
+  migrations through version 7. The canonical L4 backup suite exercises this
+  procedure with archives from all six predecessor versions.
   Before serving the restored database, call `restore_cursors` with each
   original cutoff and a fresh history incarnation. The same transaction
   rotates the writer epoch and fences active rooms, retaining their snapshots,

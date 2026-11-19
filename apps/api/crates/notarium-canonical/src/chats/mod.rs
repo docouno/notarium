@@ -3135,12 +3135,12 @@ async fn insert_chat_entry_row_tx(
             .map_err(|err| internal_not_committed("pg_insert_chat_entry", err.to_string()))?;
         }
     }
-    crate::projection_chat::write_chat_ref_blocks_tx(
+    crate::projection_chat::write_chat_note_refs_json_tx(
         tx,
         space_id.as_str(),
         thread_id.as_str(),
         e_i64,
-        refs_json.as_bytes(),
+        refs_json,
     )
     .await
 }
@@ -4288,7 +4288,7 @@ async fn redact_chat_entry_impl(
                             "UPDATE chat_entries
                              SET kind = 'redacted', tool_call_id = NULL, inline_text = NULL,
                                  payload_blake3 = NULL, referenced_notes_json = '[]',
-                                 is_chain_node = 1, redacted_at_seq = ?
+                                 is_chain_node = 1, redacted_at_seq = COALESCE(redacted_at_seq, ?)
                              WHERE space_id = ? AND thread_id = ? AND entry_seq = ?",
                         )
                         .bind(seq_i64)
@@ -4306,7 +4306,7 @@ async fn redact_chat_entry_impl(
                             "UPDATE chat_entries
                              SET kind = 'redacted', tool_call_id = NULL, inline_text = NULL,
                                  payload_blake3 = NULL, referenced_notes_json = '[]',
-                                 is_chain_node = 1, redacted_at_seq = $1
+                                 is_chain_node = 1, redacted_at_seq = COALESCE(redacted_at_seq, $1)
                              WHERE space_id = $2 AND thread_id = $3 AND entry_seq = $4",
                         )
                         .bind(seq_i64)
@@ -4321,7 +4321,7 @@ async fn redact_chat_entry_impl(
                     }
                 }
 
-                crate::projection_chat::clear_chat_ref_blocks_tx(
+                crate::projection_chat::clear_chat_note_refs_tx(
                     tx,
                     &scope.space_id,
                     &input.thread,
@@ -4729,7 +4729,7 @@ async fn mark_descendant_compactions_stale_tx(
             BackendConn::Sqlite(conn) => {
                 sqlx::query_scalar(
                     "UPDATE chat_entries SET checkpoint_stale = 1, kind='redacted', inline_text=NULL,
-                            payload_blake3=NULL, referenced_notes_json='[]', redacted_at_seq=?4
+                            payload_blake3=NULL, referenced_notes_json='[]', redacted_at_seq=COALESCE(redacted_at_seq, ?4)
                      WHERE space_id = ?1 AND thread_id = ?2 AND entry_seq = ?3 RETURNING created_space_seq",
                 )
                 .bind(space_id.as_str())
@@ -4745,7 +4745,7 @@ async fn mark_descendant_compactions_stale_tx(
             BackendConn::Postgres(conn) => {
                 sqlx::query_scalar(
                     "UPDATE chat_entries SET checkpoint_stale = 1, kind='redacted', inline_text=NULL,
-                            payload_blake3=NULL, referenced_notes_json='[]', redacted_at_seq=$4
+                            payload_blake3=NULL, referenced_notes_json='[]', redacted_at_seq=COALESCE(redacted_at_seq, $4)
                      WHERE space_id = $1 AND thread_id = $2 AND entry_seq = $3 RETURNING created_space_seq",
                 )
                 .bind(space_id.as_str())
@@ -4759,7 +4759,7 @@ async fn mark_descendant_compactions_stale_tx(
                 })?
             }
         };
-        crate::projection_chat::clear_chat_ref_blocks_tx(tx, space_id, thread_id, raw).await?;
+        crate::projection_chat::clear_chat_note_refs_tx(tx, space_id, thread_id, raw).await?;
         let owner = format!("{}:{raw}", thread_id.as_str());
         zero_refs.extend(
             release_owner_blob_refs_tx(tx, space_id, BlobOwnerKind::ChatEntry, &owner).await?,

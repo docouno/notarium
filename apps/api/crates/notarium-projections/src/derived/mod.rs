@@ -18,7 +18,6 @@ use sqlx::PgPool;
 mod card;
 mod control;
 mod erasure;
-mod link_stage;
 mod lookup;
 mod maintenance;
 mod read;
@@ -29,12 +28,8 @@ mod sql;
 mod staging;
 mod write;
 
-pub use control::{
-    GenerationControl, GenerationDescriptor, GenerationLease, PeerAcknowledgement, PeerCandidate,
-    PeerProposal, SpaceGenerationWitness,
-};
+pub use control::{GenerationControl, GenerationDescriptor};
 pub(crate) use erasure::PostgresEraser;
-pub(crate) use link_stage::{LinkScratch, ScratchSource};
 pub(crate) use lookup::{LinkAddress, LinkPosition};
 pub(crate) use maintenance::{GenerationFiles, PostgresCacheOwner};
 pub(crate) use records::decode as decode_payload;
@@ -45,8 +40,6 @@ pub use records::{
     TrustedCheckpoint,
 };
 pub(crate) use staging::StageBuffer;
-pub use write::CutLease;
-pub(crate) use write::PagePin;
 
 use sql::Database;
 
@@ -57,7 +50,7 @@ pub struct DerivedStore {
     database: Arc<Database>,
     generation: ProjectionGeneration,
     cache_lease: Option<Arc<std::fs::File>>,
-    page_admission: Arc<write::PageAdmission>,
+    _schema_lease: Option<Arc<maintenance::PostgresSchemaLease>>,
 }
 
 impl DerivedStore {
@@ -86,7 +79,7 @@ impl DerivedStore {
     ) -> Result<Option<Self>, PortError> {
         let lease = GenerationFiles::hold(root, generation).await?;
         let database = Database::open_sqlite(root.derived(generation)).await?;
-        Self::init(database, generation, Some(lease)).await
+        Self::init(database, generation, Some(lease), None).await
     }
 
     pub(crate) async fn open_postgres_for_runtime(
@@ -94,15 +87,18 @@ impl DerivedStore {
         schema_prefix: &str,
         generation: ProjectionGeneration,
     ) -> Result<Option<Self>, PortError> {
+        sql::validate_schema_prefix(schema_prefix)?;
         let schema = format!("{schema_prefix}_g{}", generation.get());
+        let schema_lease = maintenance::PostgresSchemaLease::acquire(&schema);
         let database = Database::open_postgres(pool, &schema).await?;
-        Self::init(database, generation, None).await
+        Self::init(database, generation, None, Some(schema_lease)).await
     }
 
     async fn init(
         database: Database,
         generation: ProjectionGeneration,
         cache_lease: Option<Arc<std::fs::File>>,
+        schema_lease: Option<Arc<maintenance::PostgresSchemaLease>>,
     ) -> Result<Option<Self>, PortError> {
         let database = Arc::new(database);
         let compatible = database
@@ -114,7 +110,7 @@ impl DerivedStore {
             database,
             generation,
             cache_lease,
-            page_admission: Arc::default(),
+            _schema_lease: schema_lease,
         }))
     }
 
@@ -223,8 +219,9 @@ pub struct SpaceApply {
     pub mutations: Vec<DerivedMutation>,
 }
 
-/// Logical command key. Neither staging these pages nor replaying a page changes
-/// the visible watermark.
+/// Logical command key for bounded multi-page staging (used by Cold Seed and
+/// very large batches). Neither staging pages nor replaying a page changes the
+/// visible watermark.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StageKey {
     pub scope: HistoryScope,

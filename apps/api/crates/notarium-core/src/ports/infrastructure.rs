@@ -15,7 +15,7 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 pub trait StructuralSnapshot: Send + Sync {
     fn cut(&self) -> &SnapshotCut;
     fn lookup(&self, note: &NoteId) -> Option<DenseNodeId>;
-    fn note_id(&self, node: DenseNodeId) -> DomainResult<&NoteId>;
+    fn note_id(&self, node: DenseNodeId) -> DomainResult<NoteId>;
     fn folder_subtree(&self, folder: &FolderId) -> DomainResult<DenseNodeIter<'_>>;
     fn outgoing(&self, node: DenseNodeId) -> DomainResult<DenseNodeIter<'_>>;
     fn incoming(&self, node: DenseNodeId) -> DomainResult<DenseNodeIter<'_>>;

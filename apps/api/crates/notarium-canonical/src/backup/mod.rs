@@ -2022,7 +2022,7 @@ fn spool_tables(schema_version: u32) -> impl Iterator<Item = TableSpec> + Clone 
                 match table.name {
                     "projection_rank_anchors"
                     | "projection_rank_anchor_rows"
-                    | "chat_entry_ref_blocks" => return None,
+                    | "chat_entry_note_refs" => return None,
                     "folder_aliases" => table.indexes = &["idx_folder_aliases_lookup"],
                     "note_aliases" => {
                         table.indexes = &[

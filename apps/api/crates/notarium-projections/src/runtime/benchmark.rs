@@ -239,7 +239,11 @@ impl ProjectionEngine {
         &self,
         scope: &HistoryScope,
     ) -> Result<ProjectionPause, PortError> {
-        self.pause_projection_at(scope, PausePoint::BeforeRecovery, 0)
+        self.generation
+            .load()
+            .ensure_slot(&scope.space_id)
+            .benchmark_pause
+            .arm(PausePoint::BeforeRecovery, 0)
     }
 
     #[cfg(test)]

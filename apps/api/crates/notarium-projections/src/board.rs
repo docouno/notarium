@@ -87,13 +87,15 @@ impl BoardMutationFactsProvider for ProjectionBoardPlanner {
                 &deadline,
             )
             .await?;
-            let spec = evaluate_move(&cut, &ctx, &intent, &deadline)?;
+            let (spec, auth_folder) = evaluate_move(&cut, &ctx, &intent, &deadline)?;
             let _permit = cut.check_live(
                 &engine,
                 &ctx,
                 cutoff,
                 [(&spec.view, spec.groups.as_slice())],
                 std::iter::once(&intent.note),
+                auth_folder.iter(),
+                std::iter::empty(),
                 &deadline,
             )?;
             Ok(BoardMoveFacts::attest(authority, spec))
@@ -118,7 +120,7 @@ impl BoardMutationFactsProvider for ProjectionBoardPlanner {
                 &deadline,
             )
             .await?;
-            let views = evaluate_rollback(&cut, &ctx, &request, &deadline)?;
+            let (views, auth_folders) = evaluate_rollback(&cut, &ctx, &request, &deadline)?;
             let _permit = cut.check_live(
                 &engine,
                 &ctx,
@@ -127,6 +129,8 @@ impl BoardMutationFactsProvider for ProjectionBoardPlanner {
                     .iter()
                     .map(|(view, facts)| (view, facts.groups.as_slice())),
                 std::iter::empty(),
+                auth_folders.iter(),
+                request.eligible_notes.iter(),
                 &deadline,
             )?;
             Ok(RollbackBoardFacts::attest(
@@ -149,8 +153,10 @@ fn evaluate_move(
     ctx: &SpaceContext,
     intent: &MoveBoardCard,
     deadline: &PlannerDeadline,
-) -> Result<BoardMoveFactsSpec, PortError> {
+) -> Result<(BoardMoveFactsSpec, Option<FolderId>), PortError> {
     let plan = board_plan(cut, ctx, &intent.view)?;
+    let auth_folder =
+        view_authorization_folder(&plan.descriptor.source, plan.source_folder.as_ref()).cloned();
     let target = cut.active_note(ctx, &intent.note)?;
     let mut groups = plan.groups(cut, ctx, &intent.view, deadline)?;
     if !groups.iter().any(|group| group.group == intent.group) {
@@ -198,20 +204,23 @@ fn evaluate_move(
         ),
         &groups,
     )?;
-    Ok(BoardMoveFactsSpec {
-        scope: cut.scope.clone(),
-        cutoff: cut.cutoff,
-        view: intent.view.clone(),
-        view_revision: plan.view_revision,
-        schema_revision: cut.schema_revision(),
-        descriptor_fingerprint: cut.schema_fingerprint(),
-        group_field: plan.group_field,
-        group_field_kind: plan.group_field_kind,
-        groups,
-        before_placement,
-        base_order_binding,
-        after_eligible_in_group,
-    })
+    Ok((
+        BoardMoveFactsSpec {
+            scope: cut.scope.clone(),
+            cutoff: cut.cutoff,
+            view: intent.view.clone(),
+            view_revision: plan.view_revision,
+            schema_revision: cut.schema_revision(),
+            descriptor_fingerprint: cut.schema_fingerprint(),
+            group_field: plan.group_field,
+            group_field_kind: plan.group_field_kind,
+            groups,
+            before_placement,
+            base_order_binding,
+            after_eligible_in_group,
+        },
+        auth_folder,
+    ))
 }
 
 fn evaluate_rollback(
@@ -219,11 +228,23 @@ fn evaluate_rollback(
     ctx: &SpaceContext,
     request: &RollbackBoardFactsRequest,
     deadline: &PlannerDeadline,
-) -> Result<BTreeMap<ViewRef, BoardViewRollbackFacts>, PortError> {
+) -> Result<
+    (
+        BTreeMap<ViewRef, BoardViewRollbackFacts>,
+        BTreeSet<FolderId>,
+    ),
+    PortError,
+> {
     let mut views = BTreeMap::new();
+    let mut auth_folders = BTreeSet::new();
     for view in &request.views {
         deadline.check()?;
         let plan = board_plan(cut, ctx, view)?;
+        if let Some(folder) =
+            view_authorization_folder(&plan.descriptor.source, plan.source_folder.as_ref())
+        {
+            auth_folders.insert(folder.clone());
+        }
         let groups = plan.groups(cut, ctx, view, deadline)?;
         let mut post_restore_membership = BTreeMap::new();
         for restoration in &request.eligible_notes {
@@ -245,7 +266,7 @@ fn evaluate_rollback(
             },
         );
     }
-    Ok(views)
+    Ok((views, auth_folders))
 }
 
 struct BoardPlan<'a> {
@@ -278,6 +299,10 @@ fn board_plan<'a>(
         ctx,
         view_authorization_folder(&descriptor.source, source_folder.as_ref()),
     )?;
+    // Statically authorize the board's declared source scope (classes and
+    // project boundary) before evaluating any note filters so a constrained
+    // actor cannot probe unauthorized notes as an existence/filter oracle.
+    cut.authorize_board_source(ctx, &descriptor.source, source_folder.as_ref())?;
     Ok(BoardPlan {
         view_revision: note.revision.clone(),
         descriptor: descriptor.clone(),

@@ -2,10 +2,10 @@ use notarium_core::{
     classes::DocClass,
     ids::{NoteId, ProjectionGeneration, SpaceSeq, ViewKey},
     ports::{
-        BoardDelta, ChatPort, DeleteDisposition, DeleteNote, EntityId, EventBusPort,
-        MaintenanceContext, NoteWritePort, PageLimit, PortStream, RedactChatEntry, RenameNote,
-        ServiceAuthority, ServicePurpose, SpaceContext, SpaceEvent, SpaceEventKind,
-        StructuralReadPort, ViewGraphPort, ViewQuery, ViewRef,
+        ChatPort, DeleteDisposition, DeleteNote, EntityId, EventBusPort, MaintenanceContext,
+        NoteWritePort, PageLimit, PortStream, RedactChatEntry, RenameNote, ServiceAuthority,
+        ServicePurpose, SpaceContext, SpaceEvent, SpaceEventKind, StructuralReadPort,
+        ViewGraphPort, ViewQuery, ViewRef,
     },
     query::{FieldFilterAstV1, Predicate, ReadRequest},
     receipt::{AwaitWatermarks, CausalBasis, ChangeCursor},
@@ -137,8 +137,94 @@ async fn sqlite_promotes_lookup_before_reclaiming_the_old_checkpoint() {
 }
 
 #[tokio::test]
-async fn postgres_rotation_requires_both_space_owners() {
-    use std::time::{Duration, Instant};
+async fn postgres_single_owner_rotation() {
+    use std::time::Duration;
+
+    use super::{
+        BlobBackendConfig, CanonicalConfig, CanonicalRuntime, InstallationId, PgFixture,
+        PgPoolOptions, ProjectionConfig, Scratch, SqlBackendConfig, WriterConfig,
+        default_postgres_backup_budget, projection_context, random_bytes,
+    };
+
+    let fixture = PgFixture::required();
+    let blobs = Scratch::new();
+    let cache = Scratch::new();
+    let id = hex::encode(&random_bytes()[..6]);
+    let canonical_schema = format!("test_pg_rot_{id}");
+    let derived_schema = format!("test_pg_rot_{id}_d");
+    let cfg = CanonicalConfig {
+        installation_id: InstallationId::from_bytes(random_bytes()),
+        sql: SqlBackendConfig::postgres_default(fixture.canonical(), &canonical_schema),
+        blobs: BlobBackendConfig::Local {
+            data_root: blobs.root(),
+        },
+        writer: WriterConfig::default(),
+        snapshot_retention: Duration::from_secs(60),
+        default_backup_budget: default_postgres_backup_budget(),
+    };
+    let (store, canonical) = CanonicalRuntime::open(cfg).await.unwrap();
+    let pool = PgPoolOptions::new()
+        .max_connections(8)
+        .connect_with(fixture.pool_options())
+        .await
+        .unwrap();
+    let initial = ProjectionGeneration::new(1).unwrap();
+    let next = initial.checked_next().unwrap();
+    let mut runtime = ProjectorRuntime::start_postgres(
+        store.clone(),
+        projection_context(),
+        pool.clone(),
+        &derived_schema,
+        cache.root(),
+        initial,
+        ProjectionConfig {
+            retained_read_lifetime: Duration::from_secs(3),
+            ..ProjectionConfig::default()
+        },
+    )
+    .await
+    .unwrap();
+    let candidate = DerivedStore::open_postgres(pool.clone(), &derived_schema, next)
+        .await
+        .unwrap();
+    exercise(&store, &mut runtime, candidate).await;
+    let old_schema = format!("{derived_schema}_g1");
+    let old_files = cache.root().derived(initial).with_file_name("spaces");
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let old_exists: bool = sqlx::query_scalar("SELECT to_regnamespace($1) IS NOT NULL")
+                .bind(&old_schema)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            if !old_exists && !old_files.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("single-owner PostgreSQL rotation reclaims the retired schema and cache files");
+    runtime.shutdown().await.unwrap();
+    canonical.shutdown().await.unwrap();
+    for schema in [
+        canonical_schema,
+        format!("{derived_schema}_g1"),
+        format!("{derived_schema}_g2"),
+        format!("{derived_schema}_ctrl"),
+    ] {
+        let ddl = format!("DROP SCHEMA IF EXISTS {schema} CASCADE");
+        sqlx::query(sqlx::AssertSqlSafe(ddl))
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn postgres_split_owners_backlinks_and_detached_erasure() {
+    use std::time::Duration;
 
     use super::{
         BlobBackendConfig, CanonicalConfig, CanonicalRuntime, InstallationId, PgFixture,
@@ -159,8 +245,8 @@ async fn postgres_rotation_requires_both_space_owners() {
             .unwrap()
     };
     let id = hex::encode(&random_bytes()[..6]);
-    let canonical_schema = format!("test_peer_{id}");
-    let derived_schema = format!("test_peer_{id}_d");
+    let canonical_schema = format!("test_split_{id}");
+    let derived_schema = format!("test_split_{id}_d");
     let cfg = CanonicalConfig {
         installation_id: InstallationId::from_bytes(random_bytes()),
         sql: SqlBackendConfig::postgres_default(fixture.canonical(), &canonical_schema),
@@ -182,13 +268,12 @@ async fn postgres_rotation_requires_both_space_owners() {
     .unwrap();
     let (scope_a, owner_a) = open_space(&a).await;
     let (scope_b, owner_b) = open_space(&b).await;
-    let board_key = ViewKey::from_bytes([18; 16]);
     let ca = note(
         &a,
         &owner_a,
         "first-owner",
         DocClass::UserDoc,
-        format!("First\n\n```nota\nid: {board_key}\ntype: board\ngroup_by: status\n```\n"),
+        "First".into(),
     )
     .await;
     let cb = note(
@@ -216,9 +301,8 @@ async fn postgres_rotation_requires_both_space_owners() {
     let derived_b = DerivedStore::open_postgres(pool_b.clone(), &derived_schema, initial)
         .await
         .unwrap();
-    let control = derived_a.generation_control(&cache_a.root()).await.unwrap();
 
-    let mut runtime_a = ProjectorRuntime::start(
+    let runtime_a = ProjectorRuntime::start(
         a.clone(),
         projection_context(),
         derived_a,
@@ -227,7 +311,7 @@ async fn postgres_rotation_requires_both_space_owners() {
     )
     .await
     .unwrap();
-    let mut runtime_b = ProjectorRuntime::start(
+    let runtime_b = ProjectorRuntime::start(
         b.clone(),
         projection_context(),
         derived_b,
@@ -254,290 +338,8 @@ async fn postgres_rotation_requires_both_space_owners() {
     let engine_a = runtime_a.engine();
     let engine_b = runtime_b.engine();
     let causal = CausalBasis::Await(AwaitWatermarks::default());
-    let old = engine_a
-        .acquire_snapshot(owner_a.clone(), causal.clone())
-        .await
-        .unwrap();
-    let board_events = engine_a.event_bus();
-    let after = a.read_space(&scope_a.space_id).await.unwrap().last_seq;
-    let mut board_stream = board_events
-        .subscribe(
-            owner_a.clone(),
-            ChangeCursor {
-                scope: scope_a.clone(),
-                after,
-            },
-        )
-        .await
-        .unwrap();
-    let mut ordinary_stream = board_events
-        .subscribe(
-            owner_a.clone(),
-            ChangeCursor {
-                scope: scope_a.clone(),
-                after,
-            },
-        )
-        .await
-        .unwrap();
-    let ordinary_note = note(
-        &a,
-        &owner_a,
-        "queued-board-card",
-        DocClass::UserDoc,
-        "Card".into(),
-    )
-    .await;
-    sync(&a, &runtime_a, &scope_a).await;
-    let board_seq = a.read_space(&scope_a.space_id).await.unwrap().last_seq;
-    let mut initial_stream = board_events
-        .subscribe(
-            owner_a.clone(),
-            ChangeCursor {
-                scope: scope_a.clone(),
-                after,
-            },
-        )
-        .await
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let event = board_stream.next().await.unwrap().unwrap();
-            if event.seq == board_seq && matches!(event.kind, SpaceEventKind::Changed(_)) {
-                break;
-            }
-        }
-    })
-    .await
-    .expect("receive the change before queuing the board event");
-    let board = ViewRef {
-        note: ca.note.clone(),
-        key: board_key,
-    };
-    board_events
-        .publish(
-            MaintenanceContext {
-                authority: ServiceAuthority::admit(ServicePurpose::EventPublication),
-                budget: budget(),
-            },
-            SpaceEvent {
-                scope: scope_a.clone(),
-                seq: board_seq,
-                kind: SpaceEventKind::Board(BoardDelta {
-                    scope: scope_a.clone(),
-                    seq: board_seq,
-                    view: board.clone(),
-                    groups: Vec::new(),
-                    ranks: Vec::new(),
-                }),
-            },
-        )
-        .await
-        .unwrap();
 
-    #[cfg(feature = "test-support")]
-    let (mut producer_stream, producer_pause, producer_seq, producer_note) = {
-        let bus = engine_b.event_bus();
-        let after = b.read_space(&scope_b.space_id).await.unwrap().last_seq;
-        let stream = bus
-            .subscribe(
-                owner_b.clone(),
-                ChangeCursor {
-                    scope: scope_b.clone(),
-                    after,
-                },
-            )
-            .await
-            .unwrap();
-        let mut pause = engine_b
-            .pause_after_projection_ack_for_test(&scope_b)
-            .unwrap();
-        let created = note(
-            &b,
-            &owner_b,
-            "queued-after-ack",
-            DocClass::UserDoc,
-            "Durable before the freeze".into(),
-        )
-        .await;
-        let range = tokio::time::timeout(Duration::from_secs(5), pause.reached())
-            .await
-            .expect("the ordinary command was projected and acknowledged")
-            .unwrap();
-        (stream, pause, range.last_seq, created.note)
-    };
-
-    let next = initial.checked_next().unwrap();
-    let candidate = DerivedStore::open_postgres(pool_a.clone(), &derived_schema, next)
-        .await
-        .unwrap();
-
-    let active = control.active().await.unwrap().unwrap();
-    let reservation = notarium_projections::derived::GenerationDescriptor {
-        generation: next,
-        publication_epoch: active.publication_epoch + 1,
-        cut_fingerprint: active.cut_fingerprint,
-    };
-    assert!(
-        control
-            .reserve_candidate(Some(&active), &reservation)
-            .await
-            .unwrap()
-    );
-    let attempt = control.peer_candidate().await.unwrap().unwrap();
-    let ready = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let ready = control.peer_readiness(&attempt).await.unwrap();
-            if ready.len() == 2 {
-                break ready;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("both local checkpoint witnesses are ready");
-    let proposal = control
-        .propose_peer_cutover(&attempt, ready, Duration::from_millis(500))
-        .await
-        .unwrap()
-        .unwrap();
-    tokio::time::timeout(Duration::from_millis(350), async {
-        while !control.all_peers_acknowledged(&proposal).await.unwrap() {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("both processes closed active publication before acknowledging");
-    assert_eq!(control.active().await.unwrap(), Some(active));
-    let mut pending = board_stream.next();
-    let mut pending_initial = initial_stream.next();
-    let mut pending_ordinary = Box::pin(wait_for_note_change(
-        &mut *ordinary_stream,
-        board_seq,
-        &ordinary_note.note,
-    ));
-    #[cfg(feature = "test-support")]
-    tokio::time::timeout(Duration::from_millis(25), producer_pause.resume_for_test())
-        .await
-        .expect("the active worker resumes enqueueing while publication is frozen")
-        .unwrap();
-    #[cfg(feature = "test-support")]
-    let mut pending_producer = Box::pin(wait_for_note_change(
-        &mut *producer_stream,
-        producer_seq,
-        &producer_note,
-    ));
-    let (open_a, open_b, frozen_event, frozen_initial, frozen_ordinary, frozen_producer) = tokio::join!(
-        tokio::time::timeout(
-            Duration::from_millis(25),
-            engine_a.acquire_snapshot(owner_a.clone(), causal.clone()),
-        ),
-        tokio::time::timeout(
-            Duration::from_millis(25),
-            engine_b.acquire_snapshot(owner_b.clone(), causal.clone()),
-        ),
-        tokio::time::timeout(Duration::from_millis(25), &mut pending),
-        tokio::time::timeout(Duration::from_millis(25), &mut pending_initial),
-        tokio::time::timeout(Duration::from_millis(25), &mut pending_ordinary),
-        async {
-            #[cfg(feature = "test-support")]
-            let waited = tokio::time::timeout(Duration::from_millis(25), &mut pending_producer)
-                .await
-                .is_err();
-            #[cfg(not(feature = "test-support"))]
-            let waited = true;
-            waited
-        },
-    );
-    assert!(!matches!(open_a, Ok(Ok(_))));
-    assert!(!matches!(open_b, Ok(Ok(_))));
-    assert!(old.lookup(&ca.note).is_some());
-    assert!(
-        frozen_event.is_err(),
-        "board delivery waits while publication is frozen"
-    );
-    assert!(
-        frozen_initial.is_err(),
-        "an initial refresh waits while publication is frozen"
-    );
-    assert!(
-        frozen_ordinary.is_err() && frozen_producer,
-        "ordinary changes wait while publication is frozen"
-    );
-    assert!(control.cancel_peer_proposal(&proposal).await.unwrap());
-    tokio::time::timeout(Duration::from_secs(3), pending_ordinary)
-        .await
-        .expect("the queued ordinary change survives the aborted handoff");
-    drop(ordinary_stream);
-    #[cfg(feature = "test-support")]
-    {
-        tokio::time::timeout(Duration::from_secs(3), pending_producer)
-            .await
-            .expect("the change enqueued after ACK survives the aborted handoff");
-        drop(producer_stream);
-    }
-    let initial_event = tokio::time::timeout(Duration::from_secs(3), pending_initial)
-        .await
-        .expect("an aborted handoff releases the initial refresh")
-        .unwrap()
-        .unwrap();
-    assert_eq!(initial_event.seq, board_seq);
-    assert!(matches!(initial_event.kind, SpaceEventKind::ResyncRequired));
-    drop(initial_stream);
-    let resumed = tokio::time::timeout(Duration::from_secs(3), pending)
-        .await
-        .expect("an aborted handoff releases the pending board event")
-        .unwrap()
-        .unwrap();
-    assert_eq!(resumed.seq, board_seq);
-    assert!(matches!(resumed.kind, SpaceEventKind::Board(delta) if delta.view == board));
-    drop(board_stream);
-
-    runtime_a.rotate(candidate, &budget()).await.unwrap();
-    assert_eq!(control.active().await.unwrap().unwrap().generation, next);
-    assert!(!control.generation_reclaimable(initial).await.unwrap());
-    assert_eq!(old.cut().generation, initial);
-
-    let deadline = Instant::now() + Duration::from_secs(3);
-    loop {
-        let current = tokio::join!(
-            engine_a.acquire_snapshot(owner_a.clone(), causal.clone()),
-            engine_b.acquire_snapshot(owner_b.clone(), causal.clone()),
-        );
-        if let (Ok(a), Ok(b)) = current
-            && a.cut().generation == next
-            && b.cut().generation == next
-        {
-            assert!(a.lookup(&ca.note).is_some());
-            assert!(b.lookup(&cb.note).is_some());
-            assert!(old.lookup(&ca.note).is_some());
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "both owning runtimes opened the new generation"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    let old_schema = format!("{derived_schema}_g1");
-    let old_files = cache_a.root().derived(initial).with_file_name("spaces");
-    let old_exists = || {
-        sqlx::query_scalar::<_, bool>("SELECT to_regnamespace($1) IS NOT NULL")
-            .bind(&old_schema)
-            .fetch_one(&pool_a)
-    };
-    assert!(old_exists().await.unwrap());
-    assert!(old_files.is_dir());
-    drop(old);
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while old_exists().await.unwrap() || old_files.exists() {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("retired SQL schema and local files are reclaimed");
-
-    let serving = DerivedStore::open_postgres(pool_b.clone(), &derived_schema, next)
+    let serving = DerivedStore::open_postgres(pool_b.clone(), &derived_schema, initial)
         .await
         .unwrap();
     let limit = PageLimit::new(2).unwrap();
@@ -555,17 +357,14 @@ async fn postgres_rotation_requires_both_space_owners() {
         .snapshot_seq;
     let orphan_file = cache_a
         .root()
-        .space_fast_index(next, &scope_a.space_id, earlier);
+        .space_fast_index(initial, &scope_a.space_id, earlier);
     let orphan_bytes = std::fs::read(&orphan_file).unwrap();
-    let detached_victim = note(
+    let _detached_victim = note(
         &a,
         &owner_a,
         "detached-cache-only",
         DocClass::UserDoc,
-        format!(
-            "# Remains in the reclaimed generation's local file\n\n[[{}]]\n",
-            ca.note
-        ),
+        format!("# Remains in local cache\n\n[[{}]]\n", ca.note),
     )
     .await;
     sync(&a, &runtime_a, &scope_a).await;
@@ -588,13 +387,13 @@ async fn postgres_rotation_requires_both_space_owners() {
         .acquire_snapshot(owner_a.clone(), causal.clone())
         .await
         .unwrap();
-    assert_eq!(held.cut().generation, next);
+    assert_eq!(held.cut().generation, initial);
     assert!(held.lookup(&ca.note).is_some());
     assert_eq!(held.cut().projected_seq, source_checkpoint.snapshot_seq);
     let source_file =
         cache_a
             .root()
-            .space_fast_index(next, &scope_a.space_id, source_checkpoint.snapshot_seq);
+            .space_fast_index(initial, &scope_a.space_id, source_checkpoint.snapshot_seq);
     assert!(source_file.is_file());
 
     let stopped = std::sync::Arc::downgrade(&engine_a);
@@ -609,7 +408,7 @@ async fn postgres_rotation_requires_both_space_owners() {
         .acquire_snapshot(owner_b.clone(), causal.clone())
         .await
         .unwrap();
-    assert_eq!(peer.cut().generation, next);
+    assert_eq!(peer.cut().generation, initial);
     a.redact_chat_entry(
         chat_writer.clone(),
         mutation(&chat_writer, detached_redaction),
@@ -622,10 +421,6 @@ async fn postgres_rotation_requires_both_space_owners() {
             .await
             .unwrap()
             .is_empty()
-    );
-    assert!(
-        !old_exists().await.unwrap(),
-        "detached cleanup never recreates retired SQL"
     );
     let abandoned_in_serving_generation =
         source_file.with_file_name(".fast-index-abcdef0123456789abcdef0123456789.tmp");
@@ -659,7 +454,11 @@ async fn postgres_rotation_requires_both_space_owners() {
             .unwrap()
             .is_some()
     );
-    assert!(source_file.is_file(), "the held reader pins the old file");
+    #[cfg(unix)]
+    assert!(
+        !source_file.exists(),
+        "on Unix, purge unlinks registered checkpoint files immediately even while a snapshot is held"
+    );
     drop(held);
     tokio::time::timeout(Duration::from_secs(2), async {
         while source_file.exists() {
@@ -667,7 +466,7 @@ async fn postgres_rotation_requires_both_space_owners() {
         }
     })
     .await
-    .expect("the detached purge unlinks the file after the final reader releases it");
+    .expect("the detached purge removes the checkpoint file");
     assert!(
         matches!(
             open_cache_lock(&cache_a).try_lock(),
@@ -675,96 +474,6 @@ async fn postgres_rotation_requires_both_space_owners() {
         ),
         "the detached canonical eraser holds the cache without a snapshot"
     );
-    assert!(peer.lookup(&cb.note).is_some());
-    drop(peer);
-
-    // Keep A's canonical lookup on G2 while B switches to G3. The lookup
-    // pins its local file, but takes no PostgreSQL generation lease.
-    let mut short_projection = projection_context();
-    short_projection.budget.remaining = Duration::from_secs(1);
-    let runtime_a = ProjectorRuntime::start_postgres(
-        a.clone(),
-        short_projection,
-        pool_a.clone(),
-        &derived_schema,
-        cache_a.root(),
-        next,
-        ProjectionConfig::default(),
-    )
-    .await
-    .unwrap();
-    sync(&a, &runtime_a, &scope_a).await;
-    let watermark_a = serving
-        .watermarks(&scope_a.space_id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(watermark_a.projected_seq, watermark_a.snapshot_seq);
-    let cache_only =
-        cache_a
-            .root()
-            .space_fast_index(next, &scope_a.space_id, watermark_a.snapshot_seq);
-    assert!(cache_only.is_file());
-
-    let held_lookup = live_a.try_read().unwrap();
-    let newest = next.checked_next().unwrap();
-    let replacement = DerivedStore::open_postgres(pool_b.clone(), &derived_schema, newest)
-        .await
-        .unwrap();
-    runtime_b.rotate(replacement, &budget()).await.unwrap();
-    let no_engine = std::sync::Arc::downgrade(&runtime_a.engine());
-    runtime_a.shutdown().await.unwrap();
-    assert!(no_engine.upgrade().is_none());
-
-    let retired_schema = format!("{derived_schema}_g2");
-    let retired_exists = || {
-        sqlx::query_scalar::<_, bool>("SELECT to_regnamespace($1) IS NOT NULL")
-            .bind(&retired_schema)
-            .fetch_one(&pool_b)
-    };
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while retired_exists().await.unwrap() {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("B reclaims the shared schema while A still has its local file");
-    assert!(cache_only.is_file());
-    let abandoned_temp =
-        cache_only.with_file_name(".fast-index-0123456789abcdef0123456789abcdef.tmp");
-    std::fs::copy(&cache_only, &abandoned_temp).unwrap();
-    assert!(abandoned_temp.is_file());
-    assert!(matches!(
-        held_lookup
-            .classify(&owner_a, &detached_victim.note, true)
-            .unwrap(),
-        notarium_canonical::LiveNoteStatus::ActiveVisible(_)
-    ));
-    drop(held_lookup);
-
-    a.delete_note(
-        owner_a.clone(),
-        mutation(
-            &owner_a,
-            DeleteNote {
-                note: detached_victim.note,
-                disposition: DeleteDisposition::Purge,
-            },
-        ),
-    )
-    .await
-    .unwrap();
-    assert!(
-        !cache_only.exists(),
-        "purge retires A's file without a SQL namespace"
-    );
-    assert!(
-        !abandoned_temp.exists(),
-        "purge scrubs an abandoned temp even while A's lookup pins the generation"
-    );
-    assert!(!retired_exists().await.unwrap());
-    let peer = engine_b.acquire_snapshot(owner_b, causal).await.unwrap();
-    assert_eq!(peer.cut().generation, newest);
     assert!(peer.lookup(&cb.note).is_some());
 
     let independent = open_cache_lock(&cache_b);
@@ -788,8 +497,6 @@ async fn postgres_rotation_requires_both_space_owners() {
     for schema in [
         canonical_schema,
         format!("{derived_schema}_g1"),
-        format!("{derived_schema}_g2"),
-        format!("{derived_schema}_g3"),
         format!("{derived_schema}_ctrl"),
     ] {
         let ddl = format!("DROP SCHEMA IF EXISTS {schema} CASCADE");
@@ -896,9 +603,9 @@ pub(super) async fn exercise(
             .note_id,
         first.note
     );
-    let token = old.rows.next.expect("retain an old generation cursor");
+    let stale_token = old.rows.next.expect("retain an old generation cursor");
     let old_generation = ProjectionGeneration::new(1).unwrap();
-    assert_eq!(token.generation, old_generation);
+    assert_eq!(stale_token.generation, old_generation);
 
     let mut rename = mutation(
         &owner,
@@ -914,6 +621,40 @@ pub(super) async fn exercise(
         .await
         .expect("advance the live cut");
     sync(store, runtime, &scope).await;
+
+    // A cursor opened before a write in the same generation cleanly reports
+    // CursorStale once derived advances past its cut.
+    assert!(matches!(
+        engine
+            .query_view(
+                owner.clone(),
+                ReadRequest::Continue {
+                    cursor: stale_token
+                },
+            )
+            .await,
+        Err(notarium_core::error::PortError::Domain(
+            notarium_core::DomainError::ValidationFailed { diagnostic }
+        )) if diagnostic.reason == notarium_core::error::ValidationReason::CursorStale
+    ));
+
+    // A cursor opened at the final cut of generation 1 stays readable across
+    // Blue-Green rotation while generation 1 remains pinned by ReadState.
+    let at_handoff = engine
+        .query_view(
+            owner.clone(),
+            ReadRequest::Open {
+                query: request,
+                causal: causal.clone(),
+            },
+        )
+        .await
+        .expect("open a view at the final cut before rotation");
+    let token = at_handoff
+        .rows
+        .next
+        .expect("retain a cursor at the rotation boundary");
+    assert_eq!(token.generation, old_generation);
 
     let generation = candidate.generation();
     let bus = engine.event_bus();
@@ -931,7 +672,6 @@ pub(super) async fn exercise(
         .rotate(candidate, &budget())
         .await
         .expect("activate a caught-up generation");
-    #[cfg(feature = "test-support")]
     let (tail_pause, tail_note, tail_seq) = {
         let mut pause = engine.pause_before_projection_for_test(&scope, 1).unwrap();
         let note = note(
@@ -956,7 +696,6 @@ pub(super) async fn exercise(
         .unwrap();
     assert!(matches!(switched.kind, SpaceEventKind::ResyncRequired));
     assert_eq!(switched.seq, renamed.receipt.seq());
-    #[cfg(feature = "test-support")]
     {
         bus.publish(
             MaintenanceContext {
@@ -1025,21 +764,23 @@ pub(super) async fn exercise(
     let continued = engine
         .query_view(owner, ReadRequest::Continue { cursor: token })
         .await
-        .expect("continue against the pinned old generation");
-    assert_eq!(continued.effective_read, old.effective_read);
-    assert_eq!(continued.rows.projected_seq, old.rows.projected_seq);
+        .expect("continue against the frozen final cut of the previous generation");
+    assert_eq!(continued.effective_read, at_handoff.effective_read);
+    assert_eq!(continued.rows.projected_seq, at_handoff.rows.projected_seq);
     let visible = &continued.rows.items[0].card;
     assert_eq!(
         visible.document.provenance().reference().note_id,
         second.note
     );
-    assert_eq!(visible.document.provenance().revision(), &second.revision);
-    assert_eq!(visible.title, "Second before rotation");
+    assert_eq!(
+        visible.document.provenance().revision(),
+        &renamed.value.revision
+    );
+    assert_eq!(visible.title, "Second after rotation");
     assert_eq!(
         continued.rows.next.expect("one more old row").generation,
         old_generation
     );
-    #[cfg(feature = "test-support")]
     {
         drop(tail_pause);
         tokio::time::timeout(
@@ -1190,7 +931,6 @@ async fn exercise_split_backlinks(
     assert_eq!(page.links[0].title, "Cross-owner source");
     assert!(page.next.is_none());
 
-    #[cfg(feature = "test-support")]
     {
         let mut pause = a
             .pause_before_projection_for_test(source_owner.scope(), 1)

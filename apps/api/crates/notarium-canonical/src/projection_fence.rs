@@ -1,9 +1,7 @@
 //! Current canonical visibility for retained and asynchronously built read cuts.
 
-mod seal;
 mod source;
 
-pub use seal::ProjectionCatalogSealEntry;
 #[cfg(feature = "test-support")]
 mod census;
 #[cfg(feature = "test-support")]
@@ -149,11 +147,50 @@ impl StoppedProjectionOwner {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct VisibilityChanges {
+    pub notes: bool,
+    pub folders: bool,
+    pub erasures: bool,
+}
+
+impl VisibilityChanges {
+    pub(crate) const fn all() -> Self {
+        Self {
+            notes: true,
+            folders: true,
+            erasures: true,
+        }
+    }
+
+    pub(crate) fn from_events(events: &[crate::writer::BatchEventDraft]) -> Self {
+        let mut out = Self::default();
+        for ev in events {
+            match ev.entity_type.as_str() {
+                "note" | "ability" => out.notes = true,
+                "folder" => out.folders = true,
+                _ => {}
+            }
+            if ev.op_kind == "purge" || ev.op_kind == "redact" {
+                out.erasures = true;
+            }
+        }
+        out
+    }
+
+    pub(crate) fn merge(&mut self, other: Self) {
+        self.notes |= other.notes;
+        self.folders |= other.folders;
+        self.erasures |= other.erasures;
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct VisibilityWindow {
     pub scope: HistoryScope,
     pub after: SpaceSeq,
     pub through: SpaceSeq,
+    pub changes: VisibilityChanges,
 }
 
 /// Physically removes erasable derived data before a successful command reply.
@@ -167,6 +204,7 @@ struct LiveState {
     record: SpaceRecord,
     readable: bool,
     lookup_retired: bool,
+    retired_before: Option<SpaceSeq>,
     lookup: Option<Arc<dyn LiveDenseLookup>>,
     lookup_generation: Option<ProjectionGeneration>,
     dense: DenseSlots,
@@ -268,6 +306,7 @@ impl LiveState {
             record,
             readable: true,
             lookup_retired: false,
+            retired_before: None,
             lookup,
             lookup_generation,
             dense,
@@ -317,6 +356,7 @@ impl LiveState {
     }
 
     fn retire_lookup_before(&mut self, seq: SpaceSeq) {
+        self.retired_before = Some(self.retired_before.map_or(seq, |prev| prev.max(seq)));
         if self.lookup.as_ref().is_some_and(|lookup| {
             lookup
                 .published_seq()
@@ -559,7 +599,7 @@ type Topology = BTreeMap<SpaceId, Gate>;
 
 #[derive(Clone)]
 pub struct LiveLifecycleFence {
-    topology: Arc<RwLock<Topology>>,
+    topology: Arc<std::sync::RwLock<Topology>>,
     closed: Arc<AtomicBool>,
     process: Arc<str>,
     cleanup: Arc<std::sync::RwLock<Option<Arc<dyn ProjectionVisibilityCleanup>>>>,
@@ -593,8 +633,10 @@ impl LiveLifecycleFence {
 
     /// Gets a handle for the current history at this runtime.
     pub fn space(&self, scope: &HistoryScope) -> Result<LiveSpaceHandle, PortError> {
-        let topology = self.topology.try_read().map_err(|_| not_ready())?;
-        let gate = topology
+        let gate = self
+            .topology
+            .read()
+            .expect("projection topology")
             .get(&scope.space_id)
             .cloned()
             .ok_or_else(not_ready)?;
@@ -626,45 +668,57 @@ impl LiveLifecycleFence {
 
     pub(crate) async fn close_and_drain(&self) {
         self.closed.store(true, Ordering::Release);
-        let mut topology = self.topology.write().await;
-        for gate in topology.values() {
+        let gates: Vec<Gate> = {
+            let mut topology = self.topology.write().expect("projection topology");
+            std::mem::take(&mut *topology).into_values().collect()
+        };
+        for gate in gates {
             *gate.write().await = GateData::Revoked;
         }
-        topology.clear();
     }
 
-    async fn gate_or_insert(
-        &self,
-        space: &SpaceId,
-        budget: &CallBudget,
-        deadline: tokio::time::Instant,
-    ) -> Result<Gate, PortError> {
-        let topology = budgeted(budget, deadline, self.topology.read()).await?;
-        if let Some(gate) = topology.get(space) {
-            return Ok(gate.clone());
+    fn gate_or_insert(&self, space: &SpaceId) -> Gate {
+        if let Some(gate) = self
+            .topology
+            .read()
+            .expect("projection topology")
+            .get(space)
+            .cloned()
+        {
+            return gate;
         }
-        drop(topology);
-        let mut topology = budgeted(budget, deadline, self.topology.write()).await?;
-        Ok(topology
+        self.topology
+            .write()
+            .expect("projection topology")
             .entry(space.clone())
             .or_insert_with(|| Arc::new(RwLock::new(GateData::Empty)))
-            .clone())
+            .clone()
+    }
+
+    fn remove_gate_if_same(&self, space: &SpaceId, gate: &Gate) {
+        let mut topology = self.topology.write().expect("projection topology");
+        if topology
+            .get(space)
+            .is_some_and(|existing| Arc::ptr_eq(existing, gate))
+        {
+            topology.remove(space);
+        }
     }
 
     pub(crate) async fn for_write(&self, mut spaces: Vec<SpaceId>) -> LiveWriteSet {
-        let topology = Arc::clone(&self.topology).read_owned().await;
         spaces.sort_unstable();
         spaces.dedup();
-        let gates: Vec<_> = spaces
+        let gates: Vec<(SpaceId, Gate)> = spaces
             .iter()
-            .filter_map(|space| topology.get(space).cloned())
+            .map(|space| (space.clone(), self.gate_or_insert(space)))
             .collect();
         let mut guards = Vec::with_capacity(gates.len());
-        for gate in gates {
-            guards.push(gate.write_owned().await);
+        for (_, gate) in &gates {
+            guards.push(Arc::clone(gate).write_owned().await);
         }
         LiveWriteSet {
-            _topology: topology,
+            topology: Arc::clone(&self.topology),
+            gates,
             guards,
             spaces,
             preserve: true,
@@ -865,11 +919,11 @@ impl LiveReadPermit {
     }
 }
 
-/// Lock ordering is topology, ordered Space gates, then storage. An ambiguous
-/// SQL result invalidates acquired states. Known pre-commit failures preserve
-/// their prior states. Older snapshots must obtain a fresh delivery permit.
+/// Lock ordering is ordered per-Space gates, then storage. Topology is never
+/// held across `.await`. An ambiguous SQL result invalidates acquired states.
 pub(crate) struct LiveWriteSet {
-    _topology: OwnedRwLockReadGuard<Topology>,
+    topology: Arc<std::sync::RwLock<Topology>>,
+    gates: Vec<(SpaceId, Gate)>,
     guards: Vec<OwnedRwLockWriteGuard<GateData>>,
     spaces: Vec<SpaceId>,
     preserve: bool,
@@ -878,6 +932,12 @@ pub(crate) struct LiveWriteSet {
 impl LiveWriteSet {
     pub(crate) fn has_live_state(&self) -> bool {
         self.guards.iter().any(|guard| guard.state().is_some())
+    }
+
+    pub(crate) fn has_unreadable_state(&self) -> bool {
+        self.guards
+            .iter()
+            .any(|guard| guard.state().is_some_and(|state| !state.readable))
     }
 
     pub(crate) fn committing(&mut self) {
@@ -903,9 +963,28 @@ impl LiveWriteSet {
             let Some(state) = guard.state_mut() else {
                 continue;
             };
-            let budget = source::internal_budget();
             active.push(state.record.scope.clone());
-            match source::refresh(store, state, &budget).await {
+            let matching = windows
+                .iter()
+                .find(|window| window.scope == state.record.scope);
+            let changes = match matching {
+                Some(window)
+                    if state.readable
+                        && state.record.last_seq == window.after
+                        && !window.changes.notes
+                        && !window.changes.folders
+                        && !window.changes.erasures =>
+                {
+                    state.record.last_seq = window.through;
+                    continue;
+                }
+                Some(window) if state.readable && state.record.last_seq == window.after => {
+                    window.changes
+                }
+                _ => VisibilityChanges::all(),
+            };
+            let budget = source::internal_budget();
+            match source::refresh(store, state, &budget, changes).await {
                 Ok(()) => state.readable = true,
                 Err(source::RefreshError::Cleanup(error)) => {
                     state.readable = false;
@@ -926,7 +1005,7 @@ impl LiveWriteSet {
                     .lock()
                     .expect("projection cleanup debt");
                 for window in windows {
-                    if !active.contains(&window.scope) {
+                    if window.changes.erasures && !active.contains(&window.scope) {
                         pending
                             .entry(window.scope.clone())
                             .and_modify(|(after, through)| {
@@ -943,6 +1022,7 @@ impl LiveWriteSet {
                         scope: scope.clone(),
                         after,
                         through,
+                        changes: VisibilityChanges::all(),
                     })
                     .collect::<Vec<_>>()
             };
@@ -986,10 +1066,29 @@ impl LiveWriteSet {
 
 impl Drop for LiveWriteSet {
     fn drop(&mut self) {
-        if !self.preserve {
-            for state in &mut self.guards {
-                if let Some(state) = state.state_mut() {
-                    state.readable = false;
+        let mut empty_spaces = Vec::new();
+        for ((space, _), guard) in self.gates.iter().zip(&mut self.guards) {
+            if !self.preserve
+                && let Some(state) = guard.state_mut()
+            {
+                state.readable = false;
+            }
+            if matches!(**guard, GateData::Empty) {
+                empty_spaces.push(space.clone());
+            }
+        }
+        self.guards.clear();
+        if !empty_spaces.is_empty()
+            && let Ok(mut topology) = self.topology.write()
+        {
+            for (space, gate) in &self.gates {
+                if empty_spaces.contains(space)
+                    && Arc::strong_count(gate) == 2
+                    && topology
+                        .get(space)
+                        .is_some_and(|existing| Arc::ptr_eq(existing, gate))
+                {
+                    topology.remove(space);
                 }
             }
         }
@@ -1221,11 +1320,10 @@ impl CanonicalStore {
         }
         let started = tokio::time::Instant::now();
         let deadline = crate::runtime::deadline_after(started, ctx.budget.remaining);
-        let gate = fence
-            .gate_or_insert(&scope.space_id, &ctx.budget, deadline)
-            .await?;
+        let gate = fence.gate_or_insert(&scope.space_id);
         let mut old = budgeted(&ctx.budget, deadline, gate.write()).await?;
         if matches!(*old, GateData::Revoked) {
+            fence.remove_gate_if_same(&scope.space_id, &gate);
             return Err(not_ready());
         }
         if let (Some(state), Some(next_lookup)) = (old.state(), lookup.as_ref())
@@ -1234,11 +1332,20 @@ impl CanonicalStore {
                 .inner
                 .check_writer_epoch(&scope.space_id, state.record.active_epoch)
                 .is_ok()
-            && next_lookup.generation() < state.lookup_generation
         {
-            // A publisher from before handoff can finish after the new lookup.
-            // Retirement clears the backing file, but keeps this generation.
-            return Err(not_ready());
+            if next_lookup.generation() < state.lookup_generation {
+                // A publisher from before handoff can finish after the new lookup.
+                // Retirement clears the backing file, but keeps this generation.
+                return Err(not_ready());
+            }
+            if let Some(floor) = state.retired_before
+                && next_lookup
+                    .published_seq()
+                    .is_none_or(|published| published < floor)
+            {
+                // Never re-admit a pre-purge checkpoint directory of the same generation.
+                return Err(not_ready());
+            }
         }
         if lookup.is_none()
             && let Some(state) = old.state()
@@ -1291,6 +1398,7 @@ impl CanonicalStore {
                 scope: scope.clone(),
                 after,
                 through,
+                changes: VisibilityChanges::all(),
             };
             source::erase_window(self, callback.as_ref(), &window).await?;
             fence
@@ -1303,7 +1411,7 @@ impl CanonicalStore {
             && !old.readable
             && &old.record.scope == scope
             && let Err(source::RefreshError::Cleanup(error)) =
-                source::refresh(self, old, &ctx.budget).await
+                source::refresh(self, old, &ctx.budget, VisibilityChanges::all()).await
         {
             return Err(error);
         }
@@ -1314,6 +1422,10 @@ impl CanonicalStore {
                 && previous.record.active_epoch == state.record.active_epoch
             {
                 state.lookup_generation = state.lookup_generation.max(previous.lookup_generation);
+                state.retired_before = match (state.retired_before, previous.retired_before) {
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    (a, b) => a.or(b),
+                };
             }
             state.peak_private_bytes = state
                 .peak_private_bytes
@@ -1337,15 +1449,21 @@ impl CanonicalStore {
         let fence = &self.inner.live_visibility;
         let deadline =
             crate::runtime::deadline_after(tokio::time::Instant::now(), ctx.budget.remaining);
-        let mut topology = budgeted(&ctx.budget, deadline, fence.topology.write()).await?;
-        if let Some(gate) = topology.get(&scope.space_id) {
+        let gate = fence
+            .topology
+            .read()
+            .expect("projection topology")
+            .get(&scope.space_id)
+            .cloned();
+        if let Some(gate) = gate {
             let mut guard = budgeted(&ctx.budget, deadline, gate.write()).await?;
             if let Some(state) = guard.state() {
                 state.record.scope.check(scope)?;
             }
             *guard = GateData::Revoked;
+            drop(guard);
+            fence.remove_gate_if_same(&scope.space_id, &gate);
         }
-        topology.remove(&scope.space_id);
         Ok(())
     }
 
@@ -1362,15 +1480,21 @@ impl CanonicalStore {
         let fence = &self.inner.live_visibility;
         let deadline =
             crate::runtime::deadline_after(tokio::time::Instant::now(), ctx.budget.remaining);
-        let mut topology = budgeted(&ctx.budget, deadline, fence.topology.write()).await?;
-        if let Some(gate) = topology.get(&scope.space_id) {
+        let gate = fence
+            .topology
+            .read()
+            .expect("projection topology")
+            .get(&scope.space_id)
+            .cloned();
+        if let Some(gate) = gate {
             let mut guard = budgeted(&ctx.budget, deadline, gate.write()).await?;
             if let Some(state) = guard.state() {
                 state.record.scope.check(scope)?;
             }
             *guard = GateData::Revoked;
+            drop(guard);
+            fence.remove_gate_if_same(&scope.space_id, &gate);
         }
-        topology.remove(&scope.space_id);
         if matches!(&self.inner.sql, SqlDriverState::Postgres { .. }) {
             let identity = source::owner_identity(self, scope, &ctx.budget, false)
                 .await?

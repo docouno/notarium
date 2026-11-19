@@ -608,9 +608,14 @@ macro_rules! note_snapshot_sql {
             ORDER BY x.visibility_seq DESC, x.space_seq DESC LIMIT 1
          )
          LEFT JOIN revisions b ON b.space_id = h.space_id AND b.rev_id = (
-            SELECT x.rev_id FROM revisions x
-            WHERE x.space_id = h.space_id AND x.entity_type = 'ability'
-              AND x.entity_key = h.ability_id AND x.visibility_seq <= $3 AND x.history_incarnation = $2
+            SELECT x.rev_id FROM ability_packages ap
+            CROSS JOIN revisions x
+            WHERE ap.space_id = h.space_id
+              AND ap.entrypoint_note_id = h.note_id
+              AND ap.lifecycle_state <> 'purged'
+              AND x.space_id = ap.space_id AND x.entity_type = 'ability'
+              AND x.entity_key = ap.ability_id
+              AND x.visibility_seq <= $3 AND x.history_incarnation = $2
             ORDER BY x.visibility_seq DESC, x.space_seq DESC LIMIT 1
          )
          WHERE h.space_id = $1 AND h.created_seq <= $3 AND NOT EXISTS (

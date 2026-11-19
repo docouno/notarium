@@ -2,7 +2,9 @@ use std::io;
 
 use serde::{Deserialize, Serialize};
 
-pub(crate) const REPORT_VERSION: u8 = 2;
+pub(crate) const REPORT_VERSION: u8 = 3;
+pub(crate) const MICROPROFILE_SCOPE: &str =
+    "synthetic_checkpoint_planner_and_50_row_sqlite_hydration";
 pub(crate) const CORPUS_NOTES: usize = 100_000;
 pub(crate) const LINKS_PER_NOTE: usize = 5;
 pub(crate) const FIELDS_PER_NOTE: usize = 5;
@@ -114,8 +116,11 @@ pub(crate) enum Backend {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Microprofile {
+    pub scope: String,
     pub indexed_notes: usize,
+    pub hydration_table_rows: usize,
     pub checkpoint_bytes: u64,
+    pub cold_checkpoint_open: Timing,
     pub warm_board: Timing,
     pub fence: [FenceSample; 4],
 }
@@ -313,13 +318,13 @@ impl BackendMeasurements {
             ),
         );
         expect(
-            self.rebuild_ns > 0
+            (1..=120_000 * MS).contains(&self.rebuild_ns)
                 && (1..250 * MS).contains(&self.max_rebuild_read_ns)
                 && self.rebuild_sqlite_busy == 0
                 && self.identical_rebuild,
             failures,
             format!(
-                "{label} rebuild: {} ns elapsed, {} ns maximum read, {} busy, equivalent={}",
+                "{label} rebuild: {} ns elapsed (budget <= 120s), {} ns maximum read, {} busy, equivalent={}",
                 self.rebuild_ns,
                 self.max_rebuild_read_ns,
                 self.rebuild_sqlite_busy,
@@ -348,6 +353,14 @@ impl BackendMeasurements {
 impl Microprofile {
     fn check(&self, failures: &mut Vec<String>) {
         expect(
+            self.scope == MICROPROFILE_SCOPE && self.hydration_table_rows == 50,
+            failures,
+            format!(
+                "million-note microprofile metadata mismatch: scope={}, hydration_table_rows={}",
+                self.scope, self.hydration_table_rows
+            ),
+        );
+        expect(
             self.indexed_notes == MICROPROFILE_NOTES
                 && (150 * MIB..=180 * MIB).contains(&self.checkpoint_bytes),
             failures,
@@ -355,6 +368,12 @@ impl Microprofile {
                 "million-note checkpoint: {} notes, {} bytes (expected 150–180 MiB)",
                 self.indexed_notes, self.checkpoint_bytes
             ),
+        );
+        self.cold_checkpoint_open.check(
+            "million-note cold checkpoint open",
+            500 * MS,
+            true,
+            failures,
         );
         self.warm_board
             .check("million-note warm board", 5 * MS, false, failures);

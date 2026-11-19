@@ -76,7 +76,7 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls-no-p
 tonic = { version = "0.14", default-features = false, features = ["transport", "tls-ring", "router", "codegen"] }
 tonic-prost = "0.14"
 prost = "0.14"
-croaring = "2"
+croaring = "=2.9.0"
 memmap2 = "0.9"
 arc-swap = "1"
 tantivy = "0.27"

@@ -1027,7 +1027,7 @@ BEGIN
             AND NOT EXISTS(SELECT 1 FROM board_move_history WHERE space_id = p_space_id AND agent_run_id = p_run_id)
             AND NOT EXISTS(SELECT 1 FROM board_move_history WHERE space_id = p_space_id AND target_note_id = ANY(p_all_nids))
             AND NOT EXISTS(SELECT 1 FROM revision_purge_fences WHERE space_id = p_space_id AND note_id = ANY(p_all_nids))
-            AND NOT EXISTS(SELECT 1 FROM view_rank_overlays WHERE space_id = p_space_id AND target_note_id = ANY(p_all_nids))
+            AND NOT EXISTS(SELECT 1 FROM view_rank_overlays WHERE space_id = p_space_id AND (target_note_id = ANY(p_all_nids) OR view_note_id = ANY(p_all_nids)))
             AND NOT EXISTS(SELECT 1 FROM space_field_schemas WHERE space_id = p_space_id AND is_current = 1)
             AND EXISTS(SELECT 1 FROM folder_heads WHERE space_id = p_space_id AND folder_id = p_root_folder_id
                 AND is_root = 1 AND lifecycle_state = 'active' AND write_lock_json IS NULL)

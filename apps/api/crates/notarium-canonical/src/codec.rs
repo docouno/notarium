@@ -257,7 +257,15 @@ pub fn decode_msgpack_bounded<T: DeserializeOwned>(
 }
 
 pub fn group_key_hex(group: &GroupKey) -> Result<(Vec<u8>, String), PortError> {
-    let encoded = encode_msgpack(group)?;
+    let canonical = match group {
+        GroupKey::Value(notarium_core::value::ScalarValue::Number(number)) => {
+            std::borrow::Cow::Owned(GroupKey::Value(notarium_core::value::ScalarValue::Number(
+                number.canonicalize(),
+            )))
+        }
+        other => std::borrow::Cow::Borrowed(other),
+    };
+    let encoded = encode_msgpack(canonical.as_ref())?;
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"notarium-group-key-v1:");
     hasher.update(&encoded);

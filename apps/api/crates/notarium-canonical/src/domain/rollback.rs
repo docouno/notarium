@@ -4320,11 +4320,19 @@ async fn try_execute_pg_root_rollback(
             }
         }
     };
-    let visibility = store
-        .inner
-        .live_visibility
-        .for_write(vec![scope.space_id.clone()])
-        .await;
+    let visibility = match rollback_wait(
+        &ctx.budget,
+        deadline,
+        store
+            .inner
+            .live_visibility
+            .for_write(vec![scope.space_id.clone()]),
+    )
+    .await
+    {
+        Ok(visibility) => visibility,
+        Err(err) => return Some(Err(err)),
+    };
     if let Err(error) = store
         .inner
         .check_writer_epoch(&scope.space_id, writer_epoch)

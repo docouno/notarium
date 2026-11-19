@@ -33,22 +33,6 @@ impl DerivedStore {
             .await
     }
 
-    pub async fn schema_at(
-        &self,
-        scope: &HistoryScope,
-        cut: SpaceSeq,
-    ) -> Result<Option<ProjectionSchema>, PortError> {
-        Ok(self
-            .temporal::<SchemaRecord>(scope, cut, "1 = 1", Vec::new(), "")
-            .await?
-            .pop()
-            .map(|row| ProjectionSchema {
-                revision: row.revision,
-                fingerprint: row.fingerprint,
-                fields_msgpack: row.fields_msgpack,
-            }))
-    }
-
     pub async fn hydrate(
         &self,
         scope: &HistoryScope,
@@ -60,15 +44,8 @@ impl DerivedStore {
             return Ok(Vec::new());
         }
         check_batch(dense_ids.len())?;
-        let filter = format!("dense_id IN ({})", placeholders(dense_ids.len()));
         let rows = self
-            .temporal::<ProjectedNote>(
-                scope,
-                cut,
-                filter,
-                dense_ids.iter().map(value).collect(),
-                "",
-            )
+            .at_cut_in_u32::<ProjectedNote>(scope, cut, "dense_id", dense_ids)
             .await?;
         Ok(in_request_order(dense_ids, rows, |row| row.dense_id))
     }
@@ -84,15 +61,9 @@ impl DerivedStore {
             return Ok(BTreeMap::new());
         }
         check_batch(folder_ids.len())?;
-        let filter = format!("folder_id IN ({})", placeholders(folder_ids.len()));
+        let keys: Vec<String> = folder_ids.iter().map(|id| id.as_str().to_owned()).collect();
         Ok(self
-            .temporal::<ProjectedFolder>(
-                scope,
-                cut,
-                filter,
-                folder_ids.iter().map(value).collect(),
-                "",
-            )
+            .at_cut_in_text::<ProjectedFolder>(scope, cut, "folder_id", keys)
             .await?
             .into_iter()
             .map(|row| (row.folder_id.clone(), row))
@@ -143,7 +114,7 @@ impl DerivedStore {
             "1 = 1"
         };
         args.push(value(&limit.get()));
-        self.temporal(
+        self.at_cut(
             scope,
             cut,
             filter,
@@ -164,7 +135,7 @@ impl DerivedStore {
         let filter = format!("{id} > ?");
         let suffix = format!("ORDER BY {id} ASC LIMIT ?");
         let after = after.map_or(-1, i64::from);
-        self.temporal(
+        self.at_cut(
             scope,
             cut,
             filter,
@@ -181,7 +152,7 @@ impl DerivedStore {
         note: &NoteId,
     ) -> Result<Option<ProjectedNote>, PortError> {
         Ok(self
-            .temporal(scope, cut, "note_id = ?", vec![value(note)], "")
+            .at_cut(scope, cut, "note_id = ?", vec![value(note)], "")
             .await?
             .pop())
     }
@@ -193,7 +164,7 @@ impl DerivedStore {
         folder: &FolderId,
     ) -> Result<Option<ProjectedFolder>, PortError> {
         Ok(self
-            .temporal(scope, cut, "folder_id = ?", vec![value(folder)], "")
+            .at_cut(scope, cut, "folder_id = ?", vec![value(folder)], "")
             .await?
             .pop())
     }
@@ -205,7 +176,7 @@ impl DerivedStore {
         view: &ViewRef,
     ) -> Result<Option<ProjectedViewDescriptor>, PortError> {
         Ok(self
-            .temporal(
+            .at_cut(
                 scope,
                 cut,
                 "view_note_id = ? AND view_key = ?",
@@ -232,7 +203,7 @@ impl DerivedStore {
             "view_note_id = ? AND view_key = ?"
         };
         params.push(value(&limit.get()));
-        self.temporal(
+        self.at_cut(
             scope,
             cut,
             filter,
@@ -381,7 +352,7 @@ impl DerivedStore {
             .await
     }
 
-    pub(super) async fn temporal<R: SqlRecord + Send + 'static>(
+    pub(super) async fn at_cut<R: SqlRecord + Send + 'static>(
         &self,
         scope: &HistoryScope,
         cut: SpaceSeq,
@@ -392,32 +363,101 @@ impl DerivedStore {
         let scope = scope.clone();
         let filter = filter.into();
         let suffix = suffix.into();
-        self.database.read(move |mut tx| Box::pin(async move {
-            let row = watermark(&mut tx, &scope.space_id).await?.ok_or_else(not_ready)?;
-            assert_cut(&row, &scope, cut)?;
-            let cols = R::columns();
-            let table = R::TABLE;
-            let mut args = vec![value(&scope.space_id)];
-            if cut == row.projected_seq {
-                args.extend(params);
-                let sql = format!("SELECT {cols} FROM {table} WHERE space_id = ? AND ({filter}) {suffix}");
-                return tx.records(&sql, args).await;
-            }
-            if !R::TEMPORAL {
-                return Err(stale());
-            }
-            let history = R::history_table();
-            let sql = format!(
-                "SELECT {cols} FROM (
-                     SELECT {cols} FROM {table} WHERE space_id = ? AND begin_seq <= ?
-                     UNION ALL
-                     SELECT {cols} FROM {history} WHERE space_id = ? AND begin_seq <= ? AND end_seq > ?
-                 ) AS visible_rows WHERE ({filter}) {suffix}"
-            );
-            args.extend([value(&cut), value(&scope.space_id), value(&cut), value(&cut)]);
-            args.extend(params);
-            tx.records(&sql, args).await
-        })).await
+        self.database
+            .read(move |mut tx| {
+                Box::pin(async move {
+                    let row = watermark(&mut tx, &scope.space_id)
+                        .await?
+                        .ok_or_else(not_ready)?;
+                    assert_cut(&row, &scope, cut)?;
+                    let cols = R::columns();
+                    let table = R::TABLE;
+                    let mut args = vec![value(&scope.space_id)];
+                    args.extend(params);
+                    let sql = format!(
+                        "SELECT {cols} FROM {table} WHERE space_id = ? AND ({filter}) {suffix}"
+                    );
+                    tx.records(&sql, args).await
+                })
+            })
+            .await
+    }
+
+    async fn at_cut_in_u32<R: SqlRecord + Send + 'static>(
+        &self,
+        scope: &HistoryScope,
+        cut: SpaceSeq,
+        column: &'static str,
+        ids: &[u32],
+    ) -> Result<Vec<R>, PortError> {
+        let scope = scope.clone();
+        let ids: Vec<i64> = ids.iter().map(|id| i64::from(*id)).collect();
+        self.database
+            .read(move |mut tx| {
+                Box::pin(async move {
+                    let row = watermark(&mut tx, &scope.space_id)
+                        .await?
+                        .ok_or_else(not_ready)?;
+                    assert_cut(&row, &scope, cut)?;
+                    let cols = R::columns();
+                    let table = R::TABLE;
+                    if tx.postgres() {
+                        let sql = format!(
+                            "SELECT {cols} FROM {table} WHERE space_id = ? AND {column} = ANY(?)"
+                        );
+                        tx.records(&sql, vec![value(&scope.space_id), SqlValue::IntArray(ids)])
+                            .await
+                    } else {
+                        let mut args = Vec::with_capacity(1 + ids.len());
+                        args.push(value(&scope.space_id));
+                        args.extend(ids.iter().map(value));
+                        let sql = format!(
+                            "SELECT {cols} FROM {table} WHERE space_id = ? AND {column} IN ({})",
+                            placeholders(ids.len())
+                        );
+                        tx.records(&sql, args).await
+                    }
+                })
+            })
+            .await
+    }
+
+    async fn at_cut_in_text<R: SqlRecord + Send + 'static>(
+        &self,
+        scope: &HistoryScope,
+        cut: SpaceSeq,
+        column: &'static str,
+        ids: Vec<String>,
+    ) -> Result<Vec<R>, PortError> {
+        let scope = scope.clone();
+        self.database
+            .read(move |mut tx| {
+                Box::pin(async move {
+                    let row = watermark(&mut tx, &scope.space_id)
+                        .await?
+                        .ok_or_else(not_ready)?;
+                    assert_cut(&row, &scope, cut)?;
+                    let cols = R::columns();
+                    let table = R::TABLE;
+                    if tx.postgres() {
+                        let sql = format!(
+                            "SELECT {cols} FROM {table} WHERE space_id = ? AND {column} = ANY(?)"
+                        );
+                        tx.records(&sql, vec![value(&scope.space_id), SqlValue::TextArray(ids)])
+                            .await
+                    } else {
+                        let mut args = Vec::with_capacity(1 + ids.len());
+                        args.push(value(&scope.space_id));
+                        args.extend(ids.iter().map(value));
+                        let sql = format!(
+                            "SELECT {cols} FROM {table} WHERE space_id = ? AND {column} IN ({})",
+                            placeholders(ids.len())
+                        );
+                        tx.records(&sql, args).await
+                    }
+                })
+            })
+            .await
     }
 }
 
@@ -446,7 +486,7 @@ pub(super) fn assert_cut(
     if row.seed_in_progress || cut > row.projected_seq {
         return Err(not_ready());
     }
-    if cut < row.retained_floor_seq {
+    if cut < row.projected_seq {
         return Err(stale());
     }
     Ok(())
@@ -468,7 +508,7 @@ impl DerivedStore {
         normalized_path: &str,
     ) -> Result<Option<ProjectedFolder>, PortError> {
         let mut rows = self
-            .temporal::<ProjectedFolder>(
+            .at_cut::<ProjectedFolder>(
                 scope,
                 cut,
                 "norm_path_prefix = ?",
@@ -482,7 +522,7 @@ impl DerivedStore {
         Ok(rows.pop())
     }
 
-    /// Reads only the metadata needed to compare candidates at a retained cut.
+    /// Reads only the metadata needed to compare candidates at the current cut.
     pub async fn hydrate_query_rows(
         &self,
         scope: &HistoryScope,
@@ -494,15 +534,8 @@ impl DerivedStore {
             return Ok(Vec::new());
         }
         check_batch(dense_ids.len())?;
-        let filter = format!("dense_id IN ({})", placeholders(dense_ids.len()));
         let rows = self
-            .temporal::<ProjectedQueryRow>(
-                scope,
-                cut,
-                filter,
-                dense_ids.iter().map(value).collect(),
-                "",
-            )
+            .at_cut_in_u32::<ProjectedQueryRow>(scope, cut, "dense_id", dense_ids)
             .await?;
         Ok(in_request_order(dense_ids, rows, |row| row.dense_id))
     }

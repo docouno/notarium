@@ -626,7 +626,6 @@ async fn unpublished_checkpoint_replays_and_compacts_on_postgres() {
     }
 }
 
-#[cfg(feature = "test-support")]
 #[tokio::test]
 async fn a_late_old_history_worker_cannot_withdraw_the_restored_cut() {
     use std::sync::Arc;
@@ -751,7 +750,6 @@ async fn a_late_old_history_worker_cannot_withdraw_the_restored_cut() {
     canonical_runtime.shutdown().await.unwrap();
 }
 
-#[cfg(feature = "test-support")]
 #[tokio::test]
 async fn rebind_waits_for_a_cut_withdrawn_during_admission() {
     use notarium_core::{

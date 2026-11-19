@@ -185,7 +185,7 @@ impl DerivedStore {
             return Ok(Vec::new());
         }
         PageLimit::new(u16::try_from(dense_ids.len()).unwrap_or(u16::MAX))?;
-        self.temporal(
+        self.at_cut(
             scope,
             cutoff,
             format!("dense_folder_id IN ({})", placeholders(dense_ids.len())),

@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::Arc,
+    sync::{Arc, Mutex, Weak},
     time::Duration,
 };
 
@@ -174,6 +174,26 @@ pub(super) struct AffectedCardAtCut {
 }
 
 #[derive(Clone)]
+pub(super) struct ScrubbableBoardDelta(Arc<Mutex<Option<BoardDelta>>>);
+
+impl ScrubbableBoardDelta {
+    pub(super) fn new(delta: BoardDelta) -> Self {
+        Self(Arc::new(Mutex::new(Some(delta))))
+    }
+
+    pub(super) fn downgrade(&self) -> Weak<Mutex<Option<BoardDelta>>> {
+        Arc::downgrade(&self.0)
+    }
+
+    pub(super) fn clone_payload(&self) -> Option<BoardDelta> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+#[derive(Clone)]
 pub(super) struct BoardNotice {
     pub(super) scope: HistoryScope,
     pub(super) seq: SpaceSeq,
@@ -181,7 +201,7 @@ pub(super) struct BoardNotice {
     pub(super) view: ViewRef,
     pub(super) source: Arc<BoardSourceFacts>,
     pub(super) affected: Arc<[AffectedCardAtCut]>,
-    pub(super) delta: Option<Arc<BoardDelta>>,
+    pub(super) delta: Option<ScrubbableBoardDelta>,
 }
 
 impl BoardNotice {
@@ -198,8 +218,8 @@ impl BoardNotice {
             if let LiveNoteStatus::ActiveVisible(current) =
                 permit.classify(ctx, &card.note, true)?
                 && current_source.contains(&current)
+                && ctx.auth().can_view_resource(&current).is_ok()
             {
-                ctx.auth().authorize_read(&current)?;
                 return Ok(true);
             }
         }
@@ -343,9 +363,9 @@ impl ProjectionEngine {
             prepared.push((view, definition, affected));
         }
 
-        let index =
-            (!prepared.is_empty() && !boards.fanout() && Instant::now() < deadline).then(|| {
-                self.open_index(cut).and_then(|index| {
+        let index = if !prepared.is_empty() && !boards.fanout() && Instant::now() < deadline {
+            Some(match self.open_index_async(cut).await {
+                Ok(index) => (|| -> Result<_, PortError> {
                     let mut active = index.posting(&PostingKey::Active).map_err(index_error)?;
                     active.andnot_inplace(
                         &index
@@ -353,8 +373,12 @@ impl ProjectionEngine {
                             .map_err(index_error)?,
                     );
                     Ok((index, active))
-                })
-            });
+                })(),
+                Err(error) => Err(error),
+            })
+        } else {
+            None
+        };
         let mut items = MAX_BOARD_EVENT_ITEMS;
         let mut notices = Vec::with_capacity(prepared.len());
         for (view, definition, affected) in prepared {
@@ -388,7 +412,7 @@ impl ProjectionEngine {
                 view: view.clone(),
                 source: Arc::new(definition.source),
                 affected: affected.into(),
-                delta: delta.map(Arc::new),
+                delta: delta.map(ScrubbableBoardDelta::new),
             });
         }
         BoardAssembly {

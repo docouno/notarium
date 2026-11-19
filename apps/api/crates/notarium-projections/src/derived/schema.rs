@@ -64,7 +64,6 @@ pub(super) async fn initialize(
     let postgres = tx.postgres();
     let mut ddl = String::new();
     define::<WatermarkRecord>(&mut ddl, postgres, "");
-    define::<SchemaRecord>(&mut ddl, postgres, "");
     define::<ProjectedFolder>(&mut ddl, postgres, ", UNIQUE (space_id, dense_folder_id)");
     define::<ProjectedFolderAlias>(&mut ddl, postgres, "");
     define::<ProjectedNote>(&mut ddl, postgres, ", UNIQUE (space_id, note_id)");
@@ -74,29 +73,18 @@ pub(super) async fn initialize(
     define::<ProjectedLink>(&mut ddl, postgres, "");
     define::<ProjectedNoteAlias>(&mut ddl, postgres, "");
     define::<ProjectedChatThread>(&mut ddl, postgres, "");
-    define::<ProjectedChatRef>(
-        &mut ddl,
-        postgres,
-        ", UNIQUE (target_space_id, target_note_id, thread_space_id, thread_id, entry_seq)",
-    );
+    define::<ProjectedChatRef>(&mut ddl, postgres, "");
     define::<ProjectedCluster>(&mut ddl, postgres, "");
     define::<TrustedCheckpoint>(&mut ddl, postgres, "");
     ddl.push_str(INDEXES);
     let guard = if postgres {
-        GUARDS.replace(" BLOB", " BYTEA")
+        GUARDS
+            .replace(" BLOB", " BYTEA")
+            .replace(" TEXT", " TEXT COLLATE \"C\"")
     } else {
         GUARDS.to_owned()
     };
     ddl.push_str(&guard);
-    if postgres {
-        ddl.push_str(
-            &super::link_stage::DDL
-                .replace(" BLOB", " BYTEA")
-                .replace(" TEXT", " TEXT COLLATE \"C\""),
-        );
-    } else {
-        ddl.push_str(super::link_stage::DDL);
-    }
     tx.batch(&ddl).await?;
     Ok(true)
 }
@@ -204,41 +192,29 @@ fn define<R: SqlRecord>(ddl: &mut String, postgres: bool, extra: &str) {
         .collect::<Vec<_>>()
         .join(", ");
     let key = R::KEY.join(", ");
-    let begin = if R::TEMPORAL {
-        ", begin_seq BIGINT NOT NULL"
-    } else {
-        ""
-    };
     let without_rowid = if postgres || R::TABLE != ProjectedNote::TABLE {
         ""
     } else {
         " WITHOUT ROWID"
     };
     writeln!(
-        ddl, "CREATE TABLE IF NOT EXISTS {} ({columns}{begin}, PRIMARY KEY ({key}){extra}){without_rowid};", R::TABLE
-    ).expect("writing a String");
-
-    if R::TEMPORAL {
-        let table = R::history_table();
-        writeln!(
-            ddl,
-            "CREATE TABLE IF NOT EXISTS {table} (
-                {columns}, begin_seq BIGINT NOT NULL, end_seq BIGINT NOT NULL, retained_bytes BIGINT NOT NULL,
-                PRIMARY KEY ({key}, begin_seq), CHECK (begin_seq < end_seq)
-             );
-             CREATE INDEX IF NOT EXISTS {table}_end ON {table} (space_id, end_seq);"
-        ).expect("writing a String");
-    }
+        ddl,
+        "CREATE TABLE IF NOT EXISTS {} ({columns}, PRIMARY KEY ({key}){extra}){without_rowid};",
+        R::TABLE
+    )
+    .expect("writing a String");
 }
 
 const INDEXES: &str = "
-    CREATE INDEX IF NOT EXISTS projected_folder_paths ON projected_folders (space_id, norm_path_prefix);
-    CREATE INDEX IF NOT EXISTS projected_folder_history_dense ON projected_folders_history (space_id, dense_folder_id, begin_seq, end_seq);
+    CREATE INDEX IF NOT EXISTS projected_folder_paths ON projected_folders (space_id, norm_path_prefix)
+        WHERE norm_path_prefix IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS projected_folder_cover ON projected_folders (space_id, cover_note_id)
+        WHERE cover_note_id IS NOT NULL;
     CREATE INDEX IF NOT EXISTS projected_folder_alias_target ON projected_folder_aliases (space_id, target_folder_id);
     CREATE INDEX IF NOT EXISTS projected_note_parents ON projected_notes (space_id, parent_folder_id, slug_fold, lifecycle);
-    CREATE INDEX IF NOT EXISTS projected_note_history_id ON projected_notes_history (space_id, note_id, begin_seq, end_seq);
     CREATE INDEX IF NOT EXISTS projected_view_group_order ON projected_view_ranks
         (space_id, view_note_id, view_key, group_key_hex, sort_rank_lexo, target_note_id);
+    CREATE INDEX IF NOT EXISTS projected_view_rank_target ON projected_view_ranks (space_id, target_note_id);
     CREATE INDEX IF NOT EXISTS candidate_scope_leaf_tier ON candidate_lookup_keys
         (space_id, scope_folder_dense_id, leaf_norm_key, tier, created_at_sec, created_at_nsec, target_note_id);
     CREATE INDEX IF NOT EXISTS candidate_target_dense ON candidate_lookup_keys (space_id, target_dense_id);
@@ -281,19 +257,6 @@ const GUARDS: &str = "
         payload BLOB NOT NULL,
         PRIMARY KEY (space_id, history_incarnation, first_seq, last_seq, page_no)
     );
-    CREATE TABLE IF NOT EXISTS projection_apply_page_fragments (
-        space_id TEXT NOT NULL,
-        history_incarnation BLOB NOT NULL,
-        first_seq BIGINT NOT NULL,
-        last_seq BIGINT NOT NULL,
-        page_no BIGINT NOT NULL,
-        fragment_no BIGINT NOT NULL CHECK (fragment_no >= 0),
-        payload BLOB NOT NULL CHECK (length(payload) BETWEEN 1 AND 16777216),
-        PRIMARY KEY (space_id, history_incarnation, first_seq, last_seq, page_no, fragment_no),
-        FOREIGN KEY (space_id, history_incarnation, first_seq, last_seq, page_no)
-            REFERENCES projection_apply_pages (space_id, history_incarnation, first_seq, last_seq, page_no)
-            ON DELETE CASCADE
-    );
     CREATE TABLE IF NOT EXISTS projection_apply_chat_refs (
         space_id TEXT NOT NULL,
         history_incarnation BLOB NOT NULL,
@@ -325,24 +288,6 @@ const GUARDS: &str = "
         digest BLOB NOT NULL CHECK (length(digest) = 32),
         PRIMARY KEY (space_id, history_incarnation, through_seq)
     );
-    CREATE TABLE IF NOT EXISTS projection_cut_leases (
-        space_id TEXT NOT NULL,
-        history_incarnation BLOB NOT NULL,
-        lease_id BLOB NOT NULL,
-        cut BIGINT NOT NULL,
-        expires_at_ms BIGINT NOT NULL,
-        PRIMARY KEY (space_id, history_incarnation, lease_id)
-    );
-    CREATE INDEX IF NOT EXISTS projection_cut_lease_cut ON projection_cut_leases (space_id, history_incarnation, cut);
-    CREATE TABLE IF NOT EXISTS projection_page_pins (
-        space_id TEXT NOT NULL,
-        history_incarnation BLOB NOT NULL,
-        lease_id BLOB NOT NULL,
-        cut BIGINT NOT NULL,
-        expires_at_ms BIGINT NOT NULL,
-        PRIMARY KEY (space_id, history_incarnation, lease_id)
-    );
-    CREATE INDEX IF NOT EXISTS projection_page_pin_cut ON projection_page_pins (space_id, history_incarnation, cut);
 ";
 
 pub(super) fn now_ms() -> i64 {

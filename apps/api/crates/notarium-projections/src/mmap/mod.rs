@@ -4,13 +4,13 @@ mod format;
 mod raw;
 
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     num::NonZeroUsize,
     path::{Component, Path, PathBuf},
     sync::{
-        Arc, Mutex, OnceLock, Weak,
+        Arc, Condvar, Mutex, Weak,
         atomic::{AtomicU8, AtomicUsize, Ordering},
     },
 };
@@ -35,7 +35,6 @@ use crate::{
     index::{IndexError, NoteSortHeader},
 };
 
-const NOTE_ID_PAGE_SIZE: usize = 1_024;
 const PENDING: u8 = 0;
 const LIVE: u8 = 1;
 const RETIRED: u8 = 2;
@@ -286,7 +285,26 @@ impl BaseIndexHandle {
                 } else {
                     lease.state.fetch_max(PURGED, Ordering::AcqRel);
                     if let Some(pool) = pool.upgrade() {
-                        MmapPool(pool).evict(&Self(lease));
+                        MmapPool(pool).evict(&Self(Arc::clone(&lease)));
+                    }
+                    // On Unix, unlinking an already-mapped file is safe and immediately
+                    // removes purged bytes from the directory namespace before purge returns.
+                    #[cfg(unix)]
+                    {
+                        let _mutation = file_mutations();
+                        if lease.state.load(Ordering::Acquire) != UNLINKED {
+                            lease.unlink_original()?;
+                            lease.state.store(UNLINKED, Ordering::Release);
+                        }
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        let _mutation = file_mutations();
+                        if lease.state.load(Ordering::Acquire) != UNLINKED
+                            && lease.unlink_original().is_ok()
+                        {
+                            lease.state.store(UNLINKED, Ordering::Release);
+                        }
                     }
                 }
             }
@@ -358,10 +376,6 @@ impl BaseIndexHandle {
         &self.0.identity
     }
 
-    pub(crate) fn trusted_digest(&self) -> [u8; 32] {
-        self.0.record.digest
-    }
-
     pub fn path(&self) -> &Path {
         &self.0.path
     }
@@ -390,6 +404,14 @@ impl BaseIndexHandle {
         let map = pool.open(self)?;
         self.check_open()?;
         Ok(map)
+    }
+
+    pub(crate) fn try_open_resident(
+        &self,
+        pool: &MmapPool,
+    ) -> Result<Option<Arc<MappedFastIndex>>, IndexError> {
+        self.check_open()?;
+        Ok(pool.try_get_resident(self))
     }
 
     fn check_open(&self) -> Result<(), IndexError> {
@@ -806,7 +828,7 @@ fn absolute(path: &Path) -> Result<PathBuf, IndexError> {
     Ok(path)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn open_readonly(path: &Path) -> io::Result<File> {
     use rustix::fs::{Mode, OFlags, open};
 
@@ -833,7 +855,7 @@ fn open_readonly(path: &Path) -> io::Result<File> {
         .open(path)
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(not(any(unix, windows)))]
 fn open_readonly(path: &Path) -> io::Result<File> {
     File::open(path)
 }
@@ -865,18 +887,14 @@ fn check_private_directory(path: &Path) -> Result<(), IndexError> {
             }
         }
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
         if metadata.uid() != rustix::process::geteuid().as_raw() {
             return Err(IndexError::Untrusted(
                 "checkpoint directory has a different owner",
             ));
         }
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
         if fs::canonicalize(path)? != path {
             return Err(IndexError::Untrusted("checkpoint directory is aliased"));
         }
@@ -908,6 +926,16 @@ fn remove_readonly(path: &Path) -> io::Result<()> {
             permissions.set_readonly(false);
             fs::set_permissions(path, permissions)?;
         }
+        // Rename out of the canonical filename first so FILE_SHARE_DELETE
+        // readers do not keep the target filename in delete-pending state.
+        if let Some(parent) = path.parent() {
+            let mut nonce = [0u8; 8];
+            let _ = getrandom::fill(&mut nonce);
+            let tombstone = parent.join(format!(".deleted-{}", hex::encode(nonce)));
+            if fs::rename(path, &tombstone).is_ok() {
+                return fs::remove_file(&tombstone);
+            }
+        }
     }
     fs::remove_file(path)
 }
@@ -922,9 +950,15 @@ pub(crate) fn id_hash(id: &str) -> u32 {
 #[derive(Clone)]
 pub struct MmapPool(Arc<MmapPoolInner>);
 
+struct OpenFlight {
+    done: Mutex<bool>,
+    ready: Condvar,
+}
+
 struct MmapPoolInner {
     capacity: NonZeroUsize,
     maps: Mutex<VecDeque<Arc<MappedFastIndex>>>,
+    opening: Mutex<HashMap<usize, Arc<OpenFlight>>>,
     live: Arc<AtomicUsize>,
 }
 
@@ -933,6 +967,7 @@ impl MmapPool {
         Self(Arc::new(MmapPoolInner {
             capacity,
             maps: Mutex::new(VecDeque::new()),
+            opening: Mutex::new(HashMap::new()),
             live: Arc::new(AtomicUsize::new(0)),
         }))
     }
@@ -943,46 +978,137 @@ impl MmapPool {
     }
 
     pub fn evict(&self, handle: &BaseIndexHandle) {
-        let mut maps = self.lock_maps();
-        if let Some(position) = maps
-            .iter()
-            .position(|index| Arc::ptr_eq(&index.lease, &handle.0))
-        {
-            maps.remove(position);
-        }
+        let evicted = {
+            let mut maps = self.lock_maps();
+            maps.iter()
+                .position(|index| Arc::ptr_eq(&index.lease, &handle.0))
+                .and_then(|position| maps.remove(position))
+        };
+        drop(evicted);
     }
 
     pub(crate) fn evict_generation(&self, generation: ProjectionGeneration) {
-        self.lock_maps()
-            .retain(|index| index.identity().generation != generation);
+        let evicted: Vec<_> = {
+            let mut maps = self.lock_maps();
+            let mut removed = Vec::new();
+            let mut idx = 0;
+            while idx < maps.len() {
+                if maps[idx].identity().generation == generation {
+                    if let Some(item) = maps.remove(idx) {
+                        removed.push(item);
+                    }
+                } else {
+                    idx += 1;
+                }
+            }
+            removed
+        };
+        drop(evicted);
+    }
+
+    pub(crate) fn try_get_resident(
+        &self,
+        handle: &BaseIndexHandle,
+    ) -> Option<Arc<MappedFastIndex>> {
+        take_resident(&mut self.lock_maps(), handle)
     }
 
     fn open(&self, handle: &BaseIndexHandle) -> Result<Arc<MappedFastIndex>, IndexError> {
-        if let Some(resident) = take_resident(&mut self.lock_maps(), handle) {
-            return Ok(resident);
-        }
-
-        // Authentication faults in checkpoint pages. Keep that I/O out of the
-        // shared LRU lock so a cold Space does not delay unrelated hot Spaces.
-        let index = Arc::new(MappedFastIndex::open(
-            Arc::clone(&handle.0),
-            Arc::clone(&self.0.live),
-        )?);
-        let mut maps = self.lock_maps();
-        if let Some(resident) = take_resident(&mut maps, handle) {
-            return Ok(resident);
-        }
-        if handle.0.state.load(Ordering::Acquire) == LIVE {
-            if let Some(position) = maps.iter().position(|older| {
-                older.identity().scope.space_id == index.identity().scope.space_id
-            }) {
-                maps.remove(position);
-            } else if maps.len() == self.0.capacity.get() {
-                maps.pop_front();
+        let key = Arc::as_ptr(&handle.0) as usize;
+        loop {
+            if let Some(resident) = take_resident(&mut self.lock_maps(), handle) {
+                return Ok(resident);
             }
-            maps.push_back(Arc::clone(&index));
+            // Single-flight deduplication: concurrent cold readers for the same
+            // handle wait for the first opener instead of hashing simultaneously.
+            let existing = {
+                let mut opening = self
+                    .0
+                    .opening
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(flight) = opening.get(&key) {
+                    Some(Arc::clone(flight))
+                } else {
+                    opening.insert(
+                        key,
+                        Arc::new(OpenFlight {
+                            done: Mutex::new(false),
+                            ready: Condvar::new(),
+                        }),
+                    );
+                    None
+                }
+            };
+            if let Some(flight) = existing {
+                let mut done = flight
+                    .done
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                while !*done {
+                    done = flight
+                        .ready
+                        .wait(done)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                }
+                if let Some(resident) = take_resident(&mut self.lock_maps(), handle) {
+                    return Ok(resident);
+                }
+                // First opener failed or handle was no longer LIVE; fall through to retry.
+                continue;
+            }
+
+            struct FlightGuard<'a> {
+                pool: &'a MmapPoolInner,
+                key: usize,
+            }
+            impl Drop for FlightGuard<'_> {
+                fn drop(&mut self) {
+                    let flight = self
+                        .pool
+                        .opening
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .remove(&self.key);
+                    if let Some(flight) = flight {
+                        let mut done = flight
+                            .done
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        *done = true;
+                        flight.ready.notify_all();
+                    }
+                }
+            }
+            let _guard = FlightGuard { pool: &self.0, key };
+
+            // Authentication faults in checkpoint pages. Keep that I/O out of the
+            // shared LRU lock so a cold Space does not delay unrelated hot Spaces.
+            let index = Arc::new(MappedFastIndex::open(
+                Arc::clone(&handle.0),
+                Arc::clone(&self.0.live),
+            )?);
+            let evicted = {
+                let mut maps = self.lock_maps();
+                if let Some(resident) = take_resident(&mut maps, handle) {
+                    return Ok(resident);
+                }
+                let mut evicted = None;
+                if handle.0.state.load(Ordering::Acquire) == LIVE {
+                    if let Some(position) = maps.iter().position(|older| {
+                        older.identity().scope.space_id == index.identity().scope.space_id
+                    }) {
+                        evicted = maps.remove(position);
+                    } else if maps.len() == self.0.capacity.get() {
+                        evicted = maps.pop_front();
+                    }
+                    maps.push_back(Arc::clone(&index));
+                }
+                evicted
+            };
+            drop(evicted);
+            return Ok(index);
         }
-        Ok(index)
     }
 
     fn lock_maps(&self) -> std::sync::MutexGuard<'_, VecDeque<Arc<MappedFastIndex>>> {
@@ -1005,8 +1131,6 @@ fn take_resident(
     Some(index)
 }
 
-type NoteIdPage = [OnceLock<NoteId>; NOTE_ID_PAGE_SIZE];
-
 pub struct MappedFastIndex {
     // Drop the map before releasing the file lease, including on Windows.
     map: Mmap,
@@ -1014,7 +1138,6 @@ pub struct MappedFastIndex {
     #[cfg(windows)]
     _immutable_file: File,
     directory: Directory,
-    notes: Vec<OnceLock<Box<NoteIdPage>>>,
     live: Arc<AtomicUsize>,
     lease: Arc<FileLease>,
 }
@@ -1057,10 +1180,6 @@ impl MappedFastIndex {
                     "checkpoint file changed during opening",
                 ));
             }
-        }
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::unix::fs::MetadataExt;
             if meta.uid() != rustix::process::geteuid().as_raw() {
                 return Err(IndexError::Untrusted(
                     "checkpoint file has a different owner",
@@ -1074,15 +1193,12 @@ impl MappedFastIndex {
             lease.record.size,
             &lease.record.digest,
         )?;
-        let pages = (directory.node_count as usize).div_ceil(NOTE_ID_PAGE_SIZE);
-        let notes = (0..pages).map(|_| OnceLock::new()).collect();
         live.fetch_add(1, Ordering::AcqRel);
         Ok(Self {
             map,
             #[cfg(windows)]
             _immutable_file: file,
             directory,
-            notes,
             live,
             lease,
         })
@@ -1114,23 +1230,11 @@ impl MappedFastIndex {
             .map(|(id, _)| id)
     }
 
-    pub fn note_id(&self, index: u32) -> DomainResult<&NoteId> {
-        let slot = index as usize;
-        let page_cell = self
-            .notes
-            .get(slot / NOTE_ID_PAGE_SIZE)
-            .ok_or(DomainError::ResourceNotFound)?;
-        let offset = slot % NOTE_ID_PAGE_SIZE;
-        if let Some(id) = page_cell.get().and_then(|page| page[offset].get()) {
-            return Ok(id);
-        }
+    pub fn note_id(&self, index: u32) -> DomainResult<NoteId> {
         let stored = self
             .note_id_str(index)
             .ok_or(DomainError::ResourceNotFound)?;
-        let parsed = NoteId::parse(stored)?;
-        let page =
-            page_cell.get_or_init(|| Box::new([const { OnceLock::new() }; NOTE_ID_PAGE_SIZE]));
-        Ok(page[offset].get_or_init(|| parsed))
+        NoteId::parse(stored)
     }
 
     pub fn folder_id_str(&self, index: u32) -> Option<&str> {

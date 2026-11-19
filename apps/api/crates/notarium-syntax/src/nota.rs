@@ -227,6 +227,13 @@ pub fn recover_top_level_id(raw: &str) -> Option<ViewKey> {
     let root = first.len() - first_node.len();
     let mut found = None;
     for line in lines().filter(|line| content_line(line)) {
+        if !line
+            .as_bytes()
+            .get(..root)
+            .is_some_and(|prefix| prefix.iter().all(|&byte| byte == b' '))
+        {
+            continue;
+        }
         let Some(line) = line.get(root..) else {
             continue;
         };
@@ -301,4 +308,20 @@ fn map_insertion(
         .map(|line| format!("{}{line}", fence.continuation_prefix))
         .collect();
     Ok((ByteSpan::new(offset, offset)?, replacement))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::recover_top_level_id;
+    use notarium_core::ids::ViewKey;
+
+    #[test]
+    fn recover_top_level_id_requires_leading_spaces_only() {
+        let key = ViewKey::from_bytes([1; 16]);
+        let valid = format!("  kind: list\n  id: {}\n  bad: [", key.as_str());
+        assert_eq!(recover_top_level_id(&valid), Some(key.clone()));
+
+        let non_space_prefix = format!("  kind: list\nabid: {}\n  bad: [", key.as_str());
+        assert_eq!(recover_top_level_id(&non_space_prefix), None);
+    }
 }

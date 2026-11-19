@@ -328,11 +328,8 @@ pub(crate) fn number_from_key(key: u128) -> f64 {
 }
 
 pub(crate) fn date_key(date: Date) -> u32 {
-    // The domain's ten-character YYYY-MM-DD representation is canonical.
-    String::from(date)
-        .bytes()
-        .filter(u8::is_ascii_digit)
-        .fold(0, |number, digit| number * 10 + u32::from(digit - b'0'))
+    let (year, month, day) = date.ymd();
+    (year as u32) * 10_000 + u32::from(month) * 100 + u32::from(day)
 }
 
 pub(crate) fn timestamp_key(timestamp: Timestamp) -> u128 {

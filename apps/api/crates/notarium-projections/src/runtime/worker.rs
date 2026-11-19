@@ -31,8 +31,8 @@ pub(super) async fn supervise(
     mut catalog: ProjectionCatalogSubscription,
     stop: Cancellation,
 ) -> Result<(), PortError> {
-    let mut workers = JoinSet::new();
-    let mut known = BTreeMap::<SpaceId, (HistoryScope, Cancellation)>::new();
+    let mut workers = JoinSet::<SpaceId>::new();
+    let mut known = BTreeMap::<SpaceId, (HistoryScope, Cancellation, tokio::task::Id)>::new();
     let seed_slots = Arc::new(Semaphore::new(4));
 
     refresh_workers(
@@ -52,11 +52,34 @@ pub(super) async fn supervise(
                 None => break,
             },
             _ = engine.discovery.notified() => true,
-            result = workers.join_next(), if !workers.is_empty() => {
-                if let Some(Err(error)) = result {
-                    tracing::error!(error = %error, "projection worker terminated");
+            result = workers.join_next_with_id(), if !workers.is_empty() => {
+                match result {
+                    Some(Err(error)) => {
+                        let failed_id = error.id();
+                        tracing::error!(error = %error, "projection worker panicked; scheduling restart");
+                        let crashed = known
+                            .iter()
+                            .find_map(|(space, (_, _, id))| (*id == failed_id).then(|| space.clone()));
+                        if let Some(space) = crashed {
+                            known.remove(&space);
+                        }
+                        tokio::select! {
+                            _ = stop.cancelled() => break,
+                            _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+                        }
+                        true
+                    }
+                    Some(Ok((finished_id, space)))
+                        if known
+                            .get(&space)
+                            .is_some_and(|(_, _, id)| *id == finished_id) =>
+                    {
+                        known.remove(&space);
+                        !stop.is_cancelled()
+                    }
+                    Some(Ok(_)) => false,
+                    None => false,
                 }
-                false
             }
         };
         if refresh {
@@ -83,7 +106,7 @@ pub(super) async fn supervise(
             }
         }
     }
-    for (_, worker) in known.values() {
+    for (_, worker, _) in known.values() {
         worker.cancel();
     }
     while workers.join_next().await.is_some() {}
@@ -93,8 +116,8 @@ pub(super) async fn supervise(
 fn refresh_workers(
     engine: &Arc<ProjectionEngine>,
     generation: &Arc<Generation>,
-    workers: &mut JoinSet<()>,
-    known: &mut BTreeMap<SpaceId, (HistoryScope, Cancellation)>,
+    workers: &mut JoinSet<SpaceId>,
+    known: &mut BTreeMap<SpaceId, (HistoryScope, Cancellation, tokio::task::Id)>,
     seed_slots: &Arc<Semaphore>,
     spaces: Vec<(Space, HistoryScope, FolderId, SpaceSeq)>,
 ) {
@@ -102,7 +125,7 @@ fn refresh_workers(
         .into_iter()
         .map(|(_, scope, _, _)| (scope.space_id.clone(), scope))
         .collect();
-    known.retain(|id, (scope, cancellation)| {
+    known.retain(|id, (scope, cancellation, _)| {
         if current.get(id) == Some(scope) {
             return true;
         }
@@ -126,15 +149,26 @@ fn refresh_workers(
     for (id, scope) in current {
         known.entry(id.clone()).or_insert_with(|| {
             let stop = Cancellation::default();
-            workers.spawn(run_space(
-                Arc::clone(engine),
-                Arc::clone(generation),
-                generation.ensure_slot(&id),
-                scope.clone(),
-                Arc::clone(seed_slots),
-                stop.clone(),
-            ));
-            (scope, stop)
+            let engine = Arc::clone(engine);
+            let generation_clone = Arc::clone(generation);
+            let slot = generation.ensure_slot(&id);
+            let scope_clone = scope.clone();
+            let seed_slots = Arc::clone(seed_slots);
+            let worker_stop = stop.clone();
+            let space_id = id.clone();
+            let handle = workers.spawn(async move {
+                run_space(
+                    engine,
+                    generation_clone,
+                    slot,
+                    scope_clone,
+                    seed_slots,
+                    worker_stop,
+                )
+                .await;
+                space_id
+            });
+            (scope, stop, handle.id())
         });
     }
 }
@@ -149,7 +183,31 @@ async fn run_space(
 ) {
     let mut delay = Duration::from_millis(50);
     let mut pending_delivery = None;
+    let mut last_cut_seq = None;
+    let mut waiting_for_owner = false;
     while !stop.is_cancelled() {
+        if engine.control.is_postgres() && check_writer(&engine, &scope).is_err() {
+            if !waiting_for_owner {
+                waiting_for_owner = true;
+                delay = Duration::from_millis(100);
+                tracing::debug!(
+                    generation = generation.store.generation().get(),
+                    space = %scope.space_id,
+                    "projection worker waiting for PostgreSQL space ownership"
+                );
+            }
+            tokio::select! {
+                _ = stop.cancelled() => break,
+                _ = tokio::time::sleep(delay) => {}
+            }
+            delay = (delay * 2).min(Duration::from_secs(2));
+            continue;
+        }
+        if waiting_for_owner {
+            waiting_for_owner = false;
+            delay = Duration::from_millis(50);
+        }
+        let mut made_progress = false;
         let run = run_feed(
             &engine,
             &generation,
@@ -158,10 +216,15 @@ async fn run_space(
             &seed_slots,
             &stop,
             &mut pending_delivery,
+            &mut last_cut_seq,
+            &mut made_progress,
         )
         .await;
         if slot.is_detached() {
             break;
+        }
+        if made_progress {
+            delay = Duration::from_millis(50);
         }
         match run {
             Ok(()) => break,
@@ -170,10 +233,14 @@ async fn run_space(
                 // Catalog discovery owns history replacement and wakes
                 // old subscriptions even when this worker is cancelled.
                 if !apply::is_history_mismatch(&error) {
-                    if let Some(cut) = slot.cut.load_full()
-                        && cut.cut.scope == scope
-                    {
-                        arm_recovery(&mut pending_delivery, cut.cut.projected_seq, true);
+                    let seq = slot
+                        .cut
+                        .load_full()
+                        .filter(|cut| cut.cut.scope == scope)
+                        .map(|cut| cut.cut.projected_seq)
+                        .or(last_cut_seq);
+                    if let Some(seq) = seq {
+                        arm_recovery(&mut pending_delivery, seq, true);
                     }
                     slot.replace(None);
                     if engine.generation.load().store.generation() == generation.store.generation()
@@ -184,6 +251,11 @@ async fn run_space(
                 engine.discovery.notify_one();
             }
             Err(error) => {
+                if engine.control.is_postgres() && check_writer(&engine, &scope).is_err() {
+                    waiting_for_owner = true;
+                    delay = Duration::from_millis(100);
+                    continue;
+                }
                 let (reason, diagnostic_ref) = match &error {
                     PortError::Domain(DomainError::ValidationFailed { diagnostic }) => {
                         (Some(diagnostic.reason), None)
@@ -211,6 +283,7 @@ async fn run_space(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_feed(
     engine: &ProjectionEngine,
     generation: &Generation,
@@ -219,11 +292,13 @@ async fn run_feed(
     seed_slots: &Semaphore,
     stop: &Cancellation,
     pending_delivery: &mut Option<PendingDelivery>,
+    last_cut_seq: &mut Option<SpaceSeq>,
+    made_progress: &mut bool,
 ) -> Result<(), PortError> {
     // Subscribe before opening a private cut. A promotion concurrent with
     // that open still owes this worker a Space-local lookup rebind.
     let mut activation = engine.activation.subscribe();
-    if engine.control.is_distributed() {
+    if engine.control.is_postgres() {
         engine
             .canonical
             .check_projection_writer_candidate(&engine.projection_context, &scope.space_id)?;
@@ -274,7 +349,7 @@ async fn run_feed(
         }
         Some(cut) => cut,
         None => {
-            #[cfg(feature = "test-support")]
+            #[cfg(any(test, feature = "test-support"))]
             if matches!(
                 *pending_delivery,
                 Some(PendingDelivery::AfterRecovery { .. })
@@ -300,6 +375,7 @@ async fn run_feed(
                 return Ok(());
             }
             slot.replace(Some(Arc::clone(&cut)));
+            *made_progress = true;
             let previous_seq = stored
                 .as_ref()
                 .filter(|row| row.scope == *scope)
@@ -311,7 +387,8 @@ async fn run_feed(
             cut
         }
     };
-    #[cfg(feature = "test-support")]
+    *last_cut_seq = Some(cut.cut.projected_seq);
+    #[cfg(any(test, feature = "test-support"))]
     if cut.cut.projected_seq == SpaceSeq::ZERO {
         slot.benchmark_pause
             .pause_at(super::benchmark::PausePoint::BeforeSubscribe, None, stop)
@@ -366,12 +443,16 @@ async fn run_feed(
             biased;
             _ = stop.cancelled() => {
                 if !cut.delta.is_empty() && check_writer(engine, scope).is_ok() {
-                    let _ = apply::checkpoint(engine, &cut, false).await;
+                    let _ = apply::checkpoint(engine, &cut, false, &Cancellation::default()).await;
                 }
                 return Ok(());
             }
             _ = slot.repair.notified() => {
-                if cut.base.repair_pending() || needs_binding() {
+                if cut.base.repair_pending() || slot.cut.load().is_none() {
+                    arm_recovery(feed.pending_delivery, cut.cut.projected_seq, true);
+                    return Err(not_ready());
+                }
+                if needs_binding() {
                     return Err(not_ready());
                 }
             }
@@ -380,28 +461,32 @@ async fn run_feed(
                 if needs_binding() {
                     cut = apply::bind_prefetched_cut(engine, slot, &cut).await?;
                     slot.replace(Some(Arc::clone(&cut)));
+                    *made_progress = true;
                 }
             }
             _ = slot.checkpoint.notified() => {
                 check_writer(engine, scope)?;
-                cut = apply::checkpoint(engine, &cut, false).await?;
+                cut = apply::checkpoint(engine, &cut, false, stop).await?;
                 last_change = None;
                 slot.replace(Some(Arc::clone(&cut)));
+                *made_progress = true;
             }
             _ = timer(graph_schedule.due) => {
                 check_writer(engine, scope)?;
                 let settled = cut.watermark.graph_settled_seq;
-                cut = apply::checkpoint(engine, &cut, true).await?;
+                cut = apply::checkpoint(engine, &cut, true, stop).await?;
                 graph_schedule = GraphSchedule::default();
                 last_change = None;
                 slot.replace(Some(Arc::clone(&cut)));
+                *made_progress = true;
                 emit_graph_settlement(engine, generation, scope, settled, &cut);
             }
             _ = timer(checkpoint_due) => {
                 check_writer(engine, scope)?;
-                cut = apply::checkpoint(engine, &cut, false).await?;
+                cut = apply::checkpoint(engine, &cut, false, stop).await?;
                 last_change = None;
                 slot.replace(Some(Arc::clone(&cut)));
+                *made_progress = true;
             }
             notice = feed.subscription.next() => match notice? {
                 // Recovery already seeded the published cut, including an empty
@@ -413,10 +498,12 @@ async fn run_feed(
                     let through = ceiling.after;
                     match consume(engine, generation, slot, &mut cut, &mut feed, ceiling, stop).await {
                         Ok(outcome) => {
+                            *last_cut_seq = Some(cut.cut.projected_seq);
+                            *made_progress = true;
                             graph_schedule.advance(outcome, Instant::now());
                             last_change = (!cut.delta.is_empty()).then(Instant::now);
                             if cut.delta.should_checkpoint(std::time::Instant::now()) {
-                                cut = apply::checkpoint(engine, &cut, false).await?;
+                                cut = apply::checkpoint(engine, &cut, false, stop).await?;
                                 last_change = None;
                                 slot.replace(Some(Arc::clone(&cut)));
                             }
@@ -601,7 +688,7 @@ async fn consume(
     let mut outcome = AppliedFeed::default();
     while after.after < ceiling.after && !stop.is_cancelled() {
         check_writer(engine, &ceiling.scope)?;
-        #[cfg(feature = "test-support")]
+        #[cfg(any(test, feature = "test-support"))]
         slot.benchmark_pause
             .pause_at(super::benchmark::PausePoint::BeforeCatchUp, None, stop)
             .await;
@@ -641,7 +728,7 @@ async fn consume(
             if command.range.first_seq != cut.cut.projected_seq.checked_next()? {
                 return Err(invalid_cut());
             }
-            #[cfg(feature = "test-support")]
+            #[cfg(any(test, feature = "test-support"))]
             {
                 slot.benchmark_pause
                     .pause_at(
@@ -670,7 +757,7 @@ async fn consume(
             }
             slot.replace(Some(Arc::clone(cut)));
             if !acknowledge_applied(
-                #[cfg(feature = "test-support")]
+                #[cfg(any(test, feature = "test-support"))]
                 slot,
                 feed.subscription.as_mut(),
                 ChangeCursor {
@@ -683,7 +770,7 @@ async fn consume(
             {
                 return Ok(outcome);
             }
-            #[cfg(feature = "test-support")]
+            #[cfg(any(test, feature = "test-support"))]
             slot.benchmark_pause
                 .pause_at(
                     super::benchmark::PausePoint::AfterAck,
@@ -691,40 +778,42 @@ async fn consume(
                     stop,
                 )
                 .await;
-            if !command.overflow {
-                for change in command.changes {
-                    emit_active(
-                        engine,
-                        generation,
-                        &ceiling.scope,
-                        change.cursor.after,
-                        SpaceEventKind::Changed(change),
-                    );
-                }
-            }
-            if (command.overflow || !applied.boards.is_empty())
-                && engine.generation.load().store.generation() == cut.cut.generation
-            {
-                let unrestricted = applied.boards.fanout() || command.overflow;
-                let mut proof_incomplete = false;
-                if !applied.boards.is_empty() {
-                    let assembly = engine.board_events(cut, &applied.boards).await;
-                    for board in assembly.notices {
-                        engine.emit_board(board);
+            if engine.has_event_subscribers(&ceiling.scope.space_id) {
+                if !command.overflow {
+                    for change in command.changes {
+                        emit_active(
+                            engine,
+                            generation,
+                            &ceiling.scope,
+                            change.cursor.after,
+                            SpaceEventKind::Changed(change),
+                        );
                     }
-                    proof_incomplete = assembly.proof_incomplete;
                 }
-                if unrestricted || proof_incomplete {
-                    engine.emit_command_refresh(
-                        &ceiling.scope,
-                        command.range,
-                        cut.cut.generation,
-                        unrestricted,
-                    );
+                if (command.overflow || !applied.boards.is_empty())
+                    && engine.generation.load().store.generation() == cut.cut.generation
+                {
+                    let unrestricted = applied.boards.fanout() || command.overflow;
+                    let mut proof_incomplete = false;
+                    if !applied.boards.is_empty() {
+                        let assembly = engine.board_events(cut, &applied.boards).await;
+                        for board in assembly.notices {
+                            engine.emit_board(board);
+                        }
+                        proof_incomplete = assembly.proof_incomplete;
+                    }
+                    if unrestricted || proof_incomplete {
+                        engine.emit_command_refresh(
+                            &ceiling.scope,
+                            command.range,
+                            cut.cut.generation,
+                            unrestricted,
+                        );
+                    }
                 }
-            }
-            for event in applied.events {
-                emit_active(engine, generation, &ceiling.scope, seq, event);
+                for event in applied.events {
+                    emit_active(engine, generation, &ceiling.scope, seq, event);
+                }
             }
             *feed.pending_delivery = None;
         }
@@ -740,7 +829,7 @@ async fn consume(
 }
 
 async fn acknowledge_applied(
-    #[cfg(feature = "test-support")] slot: &SpaceSlot,
+    #[cfg(any(test, feature = "test-support"))] slot: &SpaceSlot,
     subscription: &mut dyn ChangeSubscription,
     cursor: ChangeCursor,
     stop: &Cancellation,
@@ -748,7 +837,7 @@ async fn acknowledge_applied(
     let mut delay = Duration::from_millis(50);
     loop {
         let acknowledge = async {
-            #[cfg(feature = "test-support")]
+            #[cfg(any(test, feature = "test-support"))]
             if let Some(error) = slot
                 .benchmark_pause
                 .inject_failure(super::benchmark::FailurePoint::Ack, cursor.after)
