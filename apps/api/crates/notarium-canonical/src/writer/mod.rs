@@ -116,6 +116,7 @@ pub struct ItemExecCtx {
     pending_dir_syncs: PendingDirSyncs,
     retained_tickets: Vec<StagedBlobTicket>,
     retained_guards: Vec<Box<dyn Send>>,
+    archive_commit: Option<(crate::peers::archive_import::ArchiveCommitAuthority, i64)>,
     after_commit: Option<Box<dyn FnOnce() + Send>>,
 }
 
@@ -176,6 +177,14 @@ impl ItemExecCtx {
         self.retained_guards.push(Box::new(guard));
     }
 
+    pub(crate) fn guard_archive_commit(
+        &mut self,
+        authority: crate::peers::archive_import::ArchiveCommitAuthority,
+        expires: i64,
+    ) {
+        self.archive_commit = Some((authority, expires));
+    }
+
     pub(crate) fn on_commit(&mut self, action: impl FnOnce() + Send + 'static) {
         self.after_commit = Some(Box::new(action));
     }
@@ -199,6 +208,7 @@ impl ItemExecCtx {
             pending_dir_syncs: PendingDirSyncs::default(),
             retained_tickets: Vec::new(),
             retained_guards: Vec::new(),
+            archive_commit: None,
             after_commit: None,
         }
     }
@@ -212,7 +222,7 @@ impl ItemExecCtx {
         Vec<Box<dyn Send>>,
     ) {
         debug_assert!(
-            self.after_commit.is_none(),
+            self.after_commit.is_none() && self.archive_commit.is_none(),
             "native items have no post-commit side effects"
         );
         (
@@ -280,6 +290,49 @@ enum QueuedWriteEntry {
 pub struct WriterFaultState {
     pub drop_commit_response_once: AtomicBool,
     pub pre_commit_space_delays: Mutex<HashMap<SpaceId, Duration>>,
+    #[cfg(feature = "test-support")]
+    pub archive_ack: Mutex<Option<Arc<ArchiveAckGate>>>,
+}
+
+/// Test-only rendezvous after SQL durability and before the caller's reply.
+#[cfg(feature = "test-support")]
+pub struct ArchiveAckGate {
+    remaining: std::sync::atomic::AtomicUsize,
+    durable: Notify,
+    resume: Notify,
+}
+
+#[cfg(feature = "test-support")]
+impl ArchiveAckGate {
+    pub fn new(items: usize) -> Self {
+        assert!(items > 0);
+        Self {
+            remaining: std::sync::atomic::AtomicUsize::new(items),
+            durable: Notify::new(),
+            resume: Notify::new(),
+        }
+    }
+
+    pub async fn wait_until_durable(&self) {
+        self.durable.notified().await;
+    }
+
+    pub fn resume(&self) {
+        self.resume.notify_one();
+    }
+
+    async fn after_batch(&self, items: usize) {
+        let before = self
+            .remaining
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                Some(remaining.saturating_sub(items))
+            })
+            .expect("the update always succeeds");
+        if before > 0 && before <= items {
+            self.durable.notify_one();
+            self.resume.notified().await;
+        }
+    }
 }
 
 /// Opt-in Phase-2 batch commit latency recorder (`(duration_ns, logical_items)`).
@@ -1587,6 +1640,7 @@ async fn execute_batch_on_conn(
     // Retain all StagedBlobTickets and runtime lock guards until AFTER outer COMMIT/ROLLBACK!
     let mut batch_retained_tickets: Vec<StagedBlobTicket> = Vec::new();
     let mut batch_retained_guards: Vec<Box<dyn Send>> = Vec::new();
+    let mut archive_commits = Vec::new();
     let mut slots: Vec<ItemOutcomeSlot> = Vec::with_capacity(intents.len());
 
     let committed_at_ms = match now_unix_ms() {
@@ -1679,6 +1733,7 @@ async fn execute_batch_on_conn(
                 dir_syncs,
                 retained_tickets,
                 retained_guards,
+                archive_commit,
                 after_commit: item_after_commit,
             }) => {
                 if use_savepoints && let Err(err) = tx.release_savepoint(idx).await {
@@ -1699,6 +1754,7 @@ async fn execute_batch_on_conn(
                 batch_dir_syncs.merge(&dir_syncs);
                 batch_retained_tickets.extend(retained_tickets);
                 batch_retained_guards.extend(retained_guards);
+                archive_commits.extend(archive_commit);
                 after_commit.extend(item_after_commit);
                 slots.push(ItemOutcomeSlot::Succeeded {
                     response_bytes,
@@ -1793,9 +1849,31 @@ async fn execute_batch_on_conn(
         return BatchExecOutcome::AbortedBeforeCommit(sync_err);
     }
 
+    if !archive_commits.is_empty() {
+        let settled = async {
+            let now = crate::peers::archive_import::archive_commit_clock(tx).await?;
+            for (authority, until) in &archive_commits {
+                authority.check_expiry(now, *until)?;
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(err) = settled {
+            transaction.rollback().await;
+            return BatchExecOutcome::AbortedBeforeCommit(err);
+        }
+    }
+
     // Commit outer SQL transaction!
     match transaction.commit().await {
         Ok(()) => {
+            #[cfg(feature = "test-support")]
+            if !archive_commits.is_empty() {
+                let gate = faults.archive_ack.lock().await.clone();
+                if let Some(gate) = gate {
+                    gate.after_batch(archive_commits.len()).await;
+                }
+            }
             for action in after_commit {
                 action();
             }
@@ -1866,6 +1944,7 @@ struct SingleItemSuccess {
     dir_syncs: PendingDirSyncs,
     retained_tickets: Vec<StagedBlobTicket>,
     retained_guards: Vec<Box<dyn Send>>,
+    archive_commit: Option<(crate::peers::archive_import::ArchiveCommitAuthority, i64)>,
     after_commit: Option<Box<dyn FnOnce() + Send>>,
 }
 
@@ -1909,6 +1988,7 @@ async fn execute_single_item_in_savepoint(
                 dir_syncs: PendingDirSyncs::default(),
                 retained_tickets: Vec::new(),
                 retained_guards: Vec::new(),
+                archive_commit: None,
                 after_commit: None,
             }),
             _ => Err(unavailable_retryable(
@@ -1951,6 +2031,7 @@ async fn execute_single_item_in_savepoint(
         pending_dir_syncs: PendingDirSyncs::default(),
         retained_tickets: Vec::new(),
         retained_guards: Vec::new(),
+        archive_commit: None,
         after_commit: None,
     };
 
@@ -2030,6 +2111,7 @@ async fn execute_single_item_in_savepoint(
         dir_syncs: item_ctx.pending_dir_syncs,
         retained_tickets: item_ctx.retained_tickets,
         retained_guards: item_ctx.retained_guards,
+        archive_commit: item_ctx.archive_commit,
         after_commit: item_ctx.after_commit,
     })
 }

@@ -19,29 +19,11 @@ pub(super) async fn capture_under_load(
         assert_eq!(captures, 1000);
     }
 
-    let thread = ChatThreadId::from_bytes(codec::ordered_id_16().unwrap());
-    canonical
-        .create_chat(
-            auth(scope, owner),
-            command(
-                scope,
-                owner,
-                CreateChat {
-                    thread: thread.clone(),
-                    kind: ChatThreadKind::Personal,
-                    owner: owner.clone(),
-                    project_folder: None,
-                    title: "Foreground backup workload".into(),
-                },
-            ),
-        )
-        .await
-        .unwrap();
-    let mut leaf = ThreadEntrySeq::ZERO;
+    let mut targets = vec![write_target(canonical, scope.clone(), owner).await];
     for spaces in [1, 64] {
         if spaces > 1 {
             for ordinal in 1..spaces {
-                canonical
+                let space = canonical
                     .create_space(CreateSpaceSpec {
                         space_id: SpaceId::from_bytes(codec::ordered_id_16().unwrap()),
                         incarnation: HistoryIncarnation::from_bytes(
@@ -57,15 +39,14 @@ pub(super) async fn capture_under_load(
                     })
                     .await
                     .unwrap();
+                targets.push(write_target(canonical, space.scope, owner).await);
             }
         }
         let stop = Cancellation::default();
         let load = tokio::spawn(foreground(
             canonical.clone(),
-            scope.clone(),
             owner.clone(),
-            thread.clone(),
-            leaf,
+            targets,
             stop.clone(),
         ));
         let mut confirmed = Vec::with_capacity(captures);
@@ -96,9 +77,16 @@ pub(super) async fn capture_under_load(
             fs::remove_file(path).unwrap();
         }
         stop.cancel();
-        let (last, writes) = load.await.unwrap();
-        leaf = last;
+        let (updated_targets, writes) = load.await.unwrap();
+        targets = updated_targets;
         assert!(writes > 0);
+        if tier != "unrated" {
+            assert!(
+                targets
+                    .iter()
+                    .all(|target| target.leaf > ThreadEntrySeq::ZERO)
+            );
+        }
         let confirmed = percentiles(confirmed);
         eprintln!(
             "{}",
@@ -121,21 +109,22 @@ pub(super) async fn capture_under_load(
 
 async fn foreground(
     canonical: CanonicalStore,
-    scope: HistoryScope,
     owner: PrincipalId,
-    thread: ChatThreadId,
-    mut leaf: ThreadEntrySeq,
+    mut targets: Vec<WriteTarget>,
     stop: Cancellation,
-) -> (ThreadEntrySeq, u64) {
-    let mut writes = 0_u64;
+) -> (Vec<WriteTarget>, usize) {
+    let mut pairs = 0;
     while !stop.is_cancelled() {
+        let index = pairs % targets.len();
+        let target = &mut targets[index];
+        let scope = &target.scope;
         let note = NoteId::from_bytes(codec::ordered_id_16().unwrap());
-        let slug = format!("load-{writes}-{}", note.as_str());
+        let slug = format!("load-{pairs}-{}", note.as_str());
         canonical
             .create_note(
-                auth(&scope, &owner),
+                auth(scope, &owner),
                 command(
-                    &scope,
+                    scope,
                     &owner,
                     CreateNote {
                         note,
@@ -150,13 +139,13 @@ async fn foreground(
             .unwrap();
         let appended = canonical
             .append_chat(
-                auth(&scope, &owner),
+                auth(scope, &owner),
                 command(
-                    &scope,
+                    scope,
                     &owner,
                     AppendChat {
-                        thread: thread.clone(),
-                        parent: leaf,
+                        thread: target.thread.clone(),
+                        parent: target.leaf,
                         kind: ChatEntryKind::Human,
                         body: ChatInputBody::Text("Foreground append".into()),
                         referenced_notes: Vec::new(),
@@ -166,11 +155,47 @@ async fn foreground(
             )
             .await
             .unwrap();
-        leaf = appended.value.seq;
-        writes += 2;
+        target.leaf = appended.value.seq;
+        pairs += 1;
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    (leaf, writes)
+    (targets, pairs * 2)
+}
+
+struct WriteTarget {
+    scope: HistoryScope,
+    thread: ChatThreadId,
+    leaf: ThreadEntrySeq,
+}
+
+async fn write_target(
+    canonical: &CanonicalStore,
+    scope: HistoryScope,
+    owner: &PrincipalId,
+) -> WriteTarget {
+    let thread = ChatThreadId::from_bytes(codec::ordered_id_16().unwrap());
+    canonical
+        .create_chat(
+            auth(&scope, owner),
+            command(
+                &scope,
+                owner,
+                CreateChat {
+                    thread: thread.clone(),
+                    kind: ChatThreadKind::Personal,
+                    owner: owner.clone(),
+                    project_folder: None,
+                    title: "Foreground backup workload".into(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    WriteTarget {
+        scope,
+        thread,
+        leaf: ThreadEntrySeq::ZERO,
+    }
 }
 
 fn command<T>(scope: &HistoryScope, owner: &PrincipalId, input: T) -> Mutation<T> {

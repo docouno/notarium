@@ -14,16 +14,20 @@ pub(crate) struct RangeSource<R> {
 impl<R: Seek> RangeSource<R> {
     pub(crate) fn new(mut inner: R) -> io::Result<Self> {
         let length = inner.seek(SeekFrom::End(0))?;
-        Ok(Self {
-            inner: Arc::new(Mutex::new(inner)),
-            start: 0,
-            length,
-            position: 0,
-        })
+        Ok(Self::with_length(inner, length))
     }
 }
 
 impl<R> RangeSource<R> {
+    pub(crate) fn with_length(inner: R, length: u64) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(inner)),
+            start: 0,
+            length,
+            position: 0,
+        }
+    }
+
     pub(crate) fn view(&self, start: u64, length: u64) -> io::Result<Self> {
         if start
             .checked_add(length)

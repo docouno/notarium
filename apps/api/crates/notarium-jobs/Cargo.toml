@@ -28,3 +28,6 @@ bytes.workspace = true
 http.workspace = true
 libsqlite3-sys.workspace = true
 sqlx.workspace = true
+
+[dev-dependencies]
+notarium-canonical = { workspace = true, features = ["test-support"] }

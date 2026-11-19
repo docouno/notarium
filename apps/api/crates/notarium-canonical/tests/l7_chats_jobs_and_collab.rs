@@ -4122,6 +4122,48 @@ async fn paged_archive_export_keeps_chat_appends_out_of_the_cut() {
         );
         cut.release().await.unwrap();
 
+        let delete_schema = async |disposition| {
+            store
+                .delete_note(
+                    ctx(),
+                    next_mutation(
+                        &scope,
+                        &owner,
+                        notarium_core::ports::DeleteNote {
+                            note: sample_note_id(0xbd),
+                            disposition,
+                        },
+                    ),
+                )
+                .await
+                .unwrap();
+        };
+        delete_schema(notarium_core::ports::DeleteDisposition::Trash).await;
+        let with_schema = store.capture_archive_export(&ctx(), &claim).await.unwrap();
+        assert!(
+            with_schema
+                .entries
+                .iter()
+                .any(|entry| entry.path == ".notarium/fields/schema.yaml")
+        );
+        let generation = with_schema.generation;
+        with_schema.release().await.unwrap();
+        delete_schema(notarium_core::ports::DeleteDisposition::Purge).await;
+        assert!(
+            store
+                .check_export_generation(&make_budget(), &scope, generation)
+                .await
+                .is_err()
+        );
+        let after_purge = store.capture_archive_export(&ctx(), &claim).await.unwrap();
+        assert!(
+            after_purge
+                .entries
+                .iter()
+                .all(|entry| entry.path != ".notarium/fields/schema.yaml")
+        );
+        after_purge.release().await.unwrap();
+
         use notarium_canonical::peers::archive_import::ArchiveCommitAuthority;
         use notarium_canonical::{ArchiveJobClass, JobCompletionOutcome};
         use notarium_core::{

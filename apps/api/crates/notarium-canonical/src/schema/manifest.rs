@@ -734,6 +734,7 @@ pub const CANONICAL_TABLES: &[TableSpec] = &[
             col("privacy_generation", Int, false),
             col("expires_at_ms", Int, false),
             col("object_msgpack", Bytes, false),
+            col("object_namespace", Bytes, false),
         ],
         indexes: &["idx_archive_artifacts_expiry"],
     },

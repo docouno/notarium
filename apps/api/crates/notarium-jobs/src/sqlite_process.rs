@@ -107,6 +107,7 @@ pub(crate) fn verify_sqlite(
             while !done.load(Ordering::Acquire) {
                 if cancellation.is_cancelled() {
                     kill(&process);
+                    let _ = process.lock().expect("verifier process lock").wait();
                     break;
                 }
                 std::thread::park_timeout(Duration::from_millis(10));

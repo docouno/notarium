@@ -735,6 +735,42 @@ async fn cloud_archive_verification_and_restore_to_an_independent_namespace() {
         )
         .await
         .unwrap();
+    let wrong_count = scratch.0.join("wrong-ref-count.zip");
+    sqlx::query("UPDATE v1_canonical.blob_catalog SET ref_count=2 WHERE space_id=$1")
+        .bind(scope.space_id.as_str())
+        .execute(&mut src_sql)
+        .await
+        .unwrap();
+    assert!(
+        run_fsck(
+            authority(ServicePurpose::Fsck),
+            FsckInput::Live {
+                canonical: &store,
+                control: &adapter
+            },
+            &root.keyring(),
+            BackupOptions::default(),
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        run_backup(
+            authority(ServicePurpose::Backup),
+            &store,
+            &adapter,
+            &wrong_count,
+            BackupOptions::default(),
+        )
+        .await
+        .is_err()
+    );
+    assert!(!wrong_count.exists());
+    sqlx::query("UPDATE v1_canonical.blob_catalog SET ref_count=1 WHERE space_id=$1")
+        .bind(scope.space_id.as_str())
+        .execute(&mut src_sql)
+        .await
+        .unwrap();
     let export = held_export(&store, &scope, &owner).await;
     sqlx::query("INSERT INTO v1_canonical.archive_export_cuts(backup_id,space_id,cutoff_seq) VALUES($1,$2,$3)")
         .bind(export.hold_id.as_str()).bind(scope.space_id.as_str()).bind(export.seq.get() as i64)

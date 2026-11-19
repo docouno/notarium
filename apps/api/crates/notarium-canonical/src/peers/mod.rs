@@ -296,6 +296,17 @@ pub enum ArchiveJobClass {
     Export,
 }
 
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct ArchiveCleanupCursor(i64, String, String);
+
+impl ArchiveCleanupCursor {
+    fn after(cursor: Option<&Self>) -> Self {
+        cursor
+            .cloned()
+            .unwrap_or_else(|| Self(i64::MIN, String::new(), String::new()))
+    }
+}
+
 impl ArchiveJobClass {
     fn as_db(self) -> &'static str {
         match self {
@@ -487,11 +498,37 @@ impl CanonicalStore {
         after: Option<&SpaceId>,
         limit: PageLimit,
     ) -> Result<Vec<HistoryScope>, PortError> {
+        self.archive_scopes(budget, after, limit, true).await
+    }
+
+    /// Archived and closing Spaces can still own outstanding physical
+    /// retirement work. They are ineligible for new archive jobs.
+    pub async fn archive_gc_scopes(
+        &self,
+        budget: &CallBudget,
+        after: Option<&SpaceId>,
+        limit: PageLimit,
+    ) -> Result<Vec<HistoryScope>, PortError> {
+        self.archive_scopes(budget, after, limit, false).await
+    }
+
+    async fn archive_scopes(
+        &self,
+        budget: &CallBudget,
+        after: Option<&SpaceId>,
+        limit: PageLimit,
+        active_only: bool,
+    ) -> Result<Vec<HistoryScope>, PortError> {
         let after = after.map_or("", SpaceId::as_str).to_owned();
         self.with_read_tx_budget(Some(budget), |tx| {
             Box::pin(async move {
-                let sql = "SELECT space_id, history_incarnation FROM spaces
-                    WHERE lifecycle_state = 'active' AND space_id > $1 ORDER BY space_id LIMIT $2";
+                let sql = if active_only {
+                    "SELECT space_id, history_incarnation FROM spaces
+                     WHERE lifecycle_state='active' AND space_id>$1 ORDER BY space_id LIMIT $2"
+                } else {
+                    "SELECT space_id, history_incarnation FROM spaces
+                     WHERE space_id>$1 ORDER BY space_id LIMIT $2"
+                };
                 let rows: Vec<(String, Vec<u8>)> = match tx {
                     BackendConn::Sqlite(conn) => sqlx::query_as(sql)
                         .bind(after)
@@ -621,7 +658,7 @@ impl CanonicalStore {
             Box::pin(async move {
                 let space = load_space_record(tx, &scope.space_id).await?;
                 space.scope.check(&scope)?;
-                let (_, _, erased) =
+                let (_, _, erased, _) =
                     require_active_job_lease_tx(tx, &scope, &id, &owner, epoch).await?;
                 if erased || space.space.lifecycle != SpaceLifecycle::Active {
                     return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
@@ -655,6 +692,32 @@ impl CanonicalStore {
             lease_duration,
             completed_units,
             total_units,
+            None,
+        )
+        .await
+    }
+
+    /// Archive renewals retain the delegated registration through settlement.
+    pub async fn heartbeat_archive_job(
+        &self,
+        budget: &CallBudget,
+        scope: &HistoryScope,
+        claim: &ClaimedContentJob,
+        lease_duration: Duration,
+        progress: (u64, Option<u64>),
+        authority: archive_import::ArchiveCommitAuthority,
+    ) -> Result<ContentJob, PortError> {
+        heartbeat_job_lease_impl(
+            self,
+            budget,
+            scope,
+            &claim.job.id,
+            &claim.lease_owner,
+            claim.job.lease,
+            lease_duration,
+            progress.0,
+            progress.1,
+            Some(authority),
         )
         .await
     }
@@ -2255,7 +2318,7 @@ async fn require_active_job_lease_tx(
     id: &JobId,
     owner: &str,
     epoch: LeaseEpoch,
-) -> Result<(ContentJob, i64, bool), PortError> {
+) -> Result<(ContentJob, i64, bool, i64), PortError> {
     let (job, current_owner, until, _, erased, _) = load_job_row_opt_tx(tx, &scope.space_id, id)
         .await?
         .ok_or(DomainError::ResourceNotFound)?;
@@ -2263,10 +2326,10 @@ async fn require_active_job_lease_tx(
         return Err(DomainError::validation(ValidationReason::InvalidState).into());
     }
     let now = job_clock_ms(tx).await?;
-    if job.lease != epoch
-        || current_owner.as_deref() != Some(owner)
-        || until.is_none_or(|until| until <= now)
-    {
+    let until = until
+        .filter(|until| *until > now)
+        .ok_or_else(|| DomainError::validation(ValidationReason::InvalidAuthority))?;
+    if job.lease != epoch || current_owner.as_deref() != Some(owner) {
         return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
     }
     const LIVE_SPACE: &str = "SELECT EXISTS(
@@ -2290,7 +2353,7 @@ async fn require_active_job_lease_tx(
     if !same_space_epoch {
         return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
     }
-    Ok((job, now, erased))
+    Ok((job, now, erased, until))
 }
 
 async fn claim_next_job_impl(
@@ -2476,6 +2539,7 @@ async fn heartbeat_job_lease_impl(
     lease_duration: Duration,
     completed_units: u64,
     total_units: Option<u64>,
+    authority: Option<archive_import::ArchiveCommitAuthority>,
 ) -> Result<ContentJob, PortError> {
     let deadline = crate::domain::common::CommandDeadline::start(budget, "heartbeat_job_lease");
     let scope_cl = scope.clone();
@@ -2490,12 +2554,19 @@ async fn heartbeat_job_lease_impl(
         .map_err(|_| DomainError::validation(ValidationReason::InvalidRange))?;
 
     let inner = std::sync::Arc::clone(&store.inner);
+    let retained = authority.clone();
     store
-        .with_auxiliary_command(Some((budget, deadline)), Ok, move |tx| {
+        .with_auxiliary_command(Some((budget, deadline)), move |job| {
+            drop(retained);
+            Ok(job)
+        }, move |tx| {
             Box::pin(async move {
                 lock_peer_space(tx, &inner, &scope_cl).await?;
+                if let Some(authority) = &authority {
+                    authority.check()?;
+                }
 
-                let (mut cur_job, now, erased) =
+                let (mut cur_job, now, erased, until) =
                     require_active_job_lease_tx(tx, &scope_cl, &jid, &worker_owned, expected_lease)
                         .await?;
                 if erased {
@@ -2552,6 +2623,9 @@ async fn heartbeat_job_lease_impl(
 
                 cur_job.completed_units = cur_job.completed_units.max(completed_units);
                 cur_job.total_units = total_units.or(cur_job.total_units);
+                if let Some(authority) = authority {
+                    authority.check_before_commit(tx, until).await?;
+                }
                 Ok(cur_job)
             })
         })
@@ -2580,6 +2654,7 @@ async fn complete_job_impl(
     let worker_owned = worker_id.to_owned();
     let installation = store.installation_id().clone();
 
+    let archive_commit = authority.is_some();
     let intent = PreparedWriteIntent {
         scope: scope_cl.clone(),
         active_epoch: space_rec.active_epoch,
@@ -2589,15 +2664,16 @@ async fn complete_job_impl(
         required_semantic_cut: None,
         execute: Box::new(move |tx, item_ctx| {
             Box::pin(async move {
-                if let Some(authority) = authority {
-                    authority.check()?;
-                    item_ctx.retain_until_batch_commit(authority);
-                } else if matches!(outcome, JobCompletionOutcome::Exported(_)) {
+                if authority.is_none() && matches!(outcome, JobCompletionOutcome::Exported(_)) {
                     return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
                 }
-                let (mut cur_job, now, erased) =
+                let (mut cur_job, now, erased, until) =
                     require_active_job_lease_tx(tx, &scope_cl, &jid, &worker_owned, expected_lease)
                         .await?;
+                if let Some(authority) = authority {
+                    authority.check()?;
+                    item_ctx.guard_archive_commit(authority, until);
+                }
 
                 let new_lease = cur_job.lease.checked_next()?;
                 let seq = item_ctx.alloc_next_seq()?;
@@ -2792,7 +2868,18 @@ async fn complete_job_impl(
         }),
     };
 
-    let stored: StoredCommittedJobV1 = deadline.submit(store, budget, intent).await?;
+    let stored: StoredCommittedJobV1 = if archive_commit {
+        let mut budget = budget.clone();
+        budget.remaining = deadline.remaining(&budget)?;
+        let (mut outcome, _) = store
+            .submit_write_batch(&budget, &scope.space_id, vec![intent])
+            .await?;
+        outcome.pop().ok_or_else(|| {
+            internal_not_committed("complete_archive_job", "missing writer outcome")
+        })??
+    } else {
+        deadline.submit(store, budget, intent).await?
+    };
     Ok(stored.into_committed())
 }
 

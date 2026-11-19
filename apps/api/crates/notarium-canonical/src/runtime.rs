@@ -816,6 +816,48 @@ impl CanonicalStore {
         .await
     }
 
+    /// Seed the immediate-cleanup obligation that migration creates for an
+    /// unowned active publication persisted by the pre-quarantine runtime.
+    #[cfg(feature = "test-support")]
+    pub async fn mark_legacy_blob_cleanup(
+        &self,
+        scope: &HistoryScope,
+        epoch: LeaseEpoch,
+        digest: ContentDigest,
+    ) -> Result<(), PortError> {
+        let scope = scope.clone();
+        self.with_write_tx(|tx| {
+            Box::pin(async move {
+                crate::blobs::lock_and_check_space_tx(tx, &scope, epoch).await?;
+                let sql = "UPDATE blob_catalog SET legacy_cleanup=1 WHERE space_id=$1
+                           AND content_blake3=$2 AND ref_count=0 AND blob_state='active'
+                           AND admission_state='open'";
+                let affected = match tx {
+                    BackendConn::Sqlite(conn) => sqlx::query(sql)
+                        .bind(scope.space_id.as_str())
+                        .bind(digest.as_bytes().as_slice())
+                        .execute(&mut **conn)
+                        .await
+                        .map(|result| result.rows_affected()),
+                    BackendConn::Postgres(conn) => sqlx::query(sql)
+                        .bind(scope.space_id.as_str())
+                        .bind(digest.as_bytes().as_slice())
+                        .execute(&mut **conn)
+                        .await
+                        .map(|result| result.rows_affected()),
+                }
+                .map_err(|err| {
+                    internal_not_committed("seed_legacy_blob_cleanup", err.to_string())
+                })?;
+                if affected != 1 {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+                Ok(())
+            })
+        })
+        .await
+    }
+
     pub(crate) fn ensure_open(&self) -> Result<(), PortError> {
         if self.inner.shutting_down.load(Ordering::SeqCst) {
             return Err(unavailable_retryable(
@@ -1314,9 +1356,10 @@ impl CanonicalStore {
                 if space_rec.active_epoch != spec_cl.active_epoch {
                     return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
                 }
-                if let Some(guard) = import_guard {
-                    guard.check_tx(tx, &space_rec).await?;
-                }
+                let guarded_expiry = match &import_guard {
+                    Some(guard) => Some(guard.check_tx(tx, &space_rec).await?),
+                    None => None,
+                };
 
                 // Checked sequence bump BEFORE any effect!
                 let next_seq = space_rec.last_seq.checked_next()?;
@@ -1503,6 +1546,9 @@ impl CanonicalStore {
                 )
                 .await?;
 
+                if let (Some(guard), Some(until)) = (import_guard, guarded_expiry) {
+                    guard.authority.check_before_commit(tx, until).await?;
+                }
                 Ok((
                     FolderRef {
                         space_id: spec_cl.scope.space_id,

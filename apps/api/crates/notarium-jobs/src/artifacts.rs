@@ -2,9 +2,11 @@ use std::{fs, io::ErrorKind, path::PathBuf, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
+#[cfg(unix)]
+use cap_std::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use cap_std::{
     ambient_authority,
-    fs::{Dir, OpenOptions},
+    fs::{Dir, DirBuilder, OpenOptions},
 };
 use http::Method;
 use notarium_canonical::{
@@ -79,6 +81,8 @@ impl ScratchDirectory {
             .write(true)
             .create_new(true)
             .follow(FollowSymlinks::No);
+        #[cfg(unix)]
+        options.mode(0o600);
         self.dir
             .open_with(name, &options)
             .map(|file| file.into_std())
@@ -140,7 +144,10 @@ impl ArchiveStorage {
 
     pub(crate) fn scratch(&self) -> Result<ScratchDirectory, PortError> {
         let name = codec::new_prefixed_hex_id("attempt_")?;
-        self.local.work.create_dir(&name).map_err(storage_io)?;
+        self.local
+            .work
+            .create_dir_with(&name, &archive_dir_builder())
+            .map_err(storage_io)?;
         let dir = self
             .local
             .work
@@ -598,6 +605,12 @@ impl ArchiveStorage {
     ) -> Result<(), PortError> {
         let file = open_file(&scratch.dir, name)?;
         let mut permissions = file.metadata().map_err(storage_io)?.permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            permissions.set_mode(0o400);
+        }
+        #[cfg(not(unix))]
         permissions.set_readonly(true);
         file.set_permissions(permissions).map_err(storage_io)?;
         file.sync_all().map_err(storage_io)?;
@@ -620,16 +633,18 @@ fn scratch_lock(dir: &Dir, create: bool) -> std::io::Result<fs::File> {
         .write(true)
         .create_new(create)
         .follow(FollowSymlinks::No);
+    #[cfg(unix)]
+    options.mode(0o600);
     dir.open_with(SCRATCH_LOCK, &options)
         .map(|file| file.into_std())
 }
 
 fn open_local(root: &DataRoot) -> Result<LocalArchiveStorage, PortError> {
     let root_dir = Dir::open_ambient_dir(root.root(), ambient_authority()).map_err(storage_io)?;
-    let staging = child_dir(&root_dir, "staging")?;
-    let archives = child_dir(&staging, "archives")?;
-    let work = child_dir(&archives, "work")?;
-    let objects = child_dir(&archives, "objects")?;
+    let staging = child_dir(&root_dir, "staging", false)?;
+    let archives = child_dir(&staging, "archives", true)?;
+    let work = child_dir(&archives, "work", true)?;
+    let objects = child_dir(&archives, "objects", true)?;
     Ok(LocalArchiveStorage {
         work,
         objects,
@@ -637,8 +652,24 @@ fn open_local(root: &DataRoot) -> Result<LocalArchiveStorage, PortError> {
     })
 }
 
-fn child_dir(parent: &Dir, name: &str) -> Result<Dir, PortError> {
-    match parent.create_dir(name) {
+fn archive_dir_builder() -> DirBuilder {
+    let builder = DirBuilder::new();
+    #[cfg(unix)]
+    let builder = {
+        let mut builder = builder;
+        builder.mode(0o700);
+        builder
+    };
+    builder
+}
+
+fn child_dir(parent: &Dir, name: &str, private: bool) -> Result<Dir, PortError> {
+    let builder = if private {
+        archive_dir_builder()
+    } else {
+        DirBuilder::new()
+    };
+    match parent.create_dir_with(name, &builder) {
         Ok(()) => {
             parent
                 .open(".")
@@ -648,7 +679,12 @@ fn child_dir(parent: &Dir, name: &str) -> Result<Dir, PortError> {
         Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
         Err(error) => return Err(storage_io(error)),
     }
-    parent.open_dir_nofollow(name).map_err(storage_io)
+    let dir = parent.open_dir_nofollow(name).map_err(storage_io)?;
+    #[cfg(unix)]
+    if private && dir.dir_metadata().map_err(storage_io)?.permissions().mode() & 0o077 != 0 {
+        return Err(invalid(ValidationReason::InvalidAuthority));
+    }
+    Ok(dir)
 }
 
 fn open_file(parent: &Dir, name: &str) -> Result<fs::File, PortError> {
@@ -658,7 +694,12 @@ fn open_file(parent: &Dir, name: &str) -> Result<fs::File, PortError> {
         return Err(invalid(ValidationReason::InvalidAuthority));
     }
     let file = parent.open_with(name, &options).map_err(storage_io)?;
-    if !file.metadata().map_err(storage_io)?.is_file() {
+    let metadata = file.metadata().map_err(storage_io)?;
+    if !metadata.is_file() {
+        return Err(invalid(ValidationReason::InvalidAuthority));
+    }
+    #[cfg(unix)]
+    if metadata.permissions().mode() & 0o077 != 0 {
         return Err(invalid(ValidationReason::InvalidAuthority));
     }
     Ok(file.into_std())

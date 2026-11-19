@@ -178,8 +178,13 @@ fn create_plan(
     job: &JobId,
     digest: ContentDigest,
 ) -> Result<Connection, PortError> {
-    OpenOptions::new()
-        .write(true)
+    let mut file = OpenOptions::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        file.mode(0o600);
+    }
+    file.write(true)
         .create_new(true)
         .open(path)
         .map_err(io_error)?;

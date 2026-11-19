@@ -83,42 +83,65 @@ impl ArchiveJobs {
         {
             hold = after;
         }
-        let expired = self
-            .store
-            .expired_export_objects(&command_budget(shutdown)?)
-            .await?;
         let mut cleanup_error = None;
-        for object in expired {
-            let cleanup = async {
-                self.artifacts.retire_export(&object, shutdown).await?;
-                self.store
-                    .forget_expired_export(&command_budget(shutdown)?, &object)
-                    .await
-            };
-            if let Err(err) = cleanup.await {
-                cleanup_error = Some(err);
+        let mut after = None;
+        loop {
+            let expired = self
+                .store
+                .expired_export_objects(
+                    &command_budget(shutdown)?,
+                    self.artifacts.namespace,
+                    after.as_ref(),
+                )
+                .await?;
+            if expired.is_empty() {
+                break;
+            }
+            for (cursor, object) in expired {
+                after = Some(cursor);
+                let cleanup = async {
+                    self.artifacts.retire_export(&object, shutdown).await?;
+                    self.store
+                        .forget_expired_export(&command_budget(shutdown)?, &object)
+                        .await
+                };
+                if let Err(err) = cleanup.await {
+                    cleanup_error = Some(err);
+                }
             }
         }
-        for upload in self
-            .store
-            .take_abandoned_archive_uploads(&command_budget(shutdown)?, self.artifacts.namespace)
-            .await?
-        {
-            let cleanup = async {
-                self.artifacts.retire_abandoned(&upload, shutdown).await?;
-                self.store
-                    .finish_archive_upload_cleanup(&command_budget(shutdown)?, upload)
-                    .await
-            };
-            if let Err(err) = cleanup.await {
-                cleanup_error = Some(err);
+        let mut after = None;
+        loop {
+            let mut abandoned = self
+                .store
+                .take_abandoned_archive_uploads(
+                    &command_budget(shutdown)?,
+                    self.artifacts.namespace,
+                    after.as_ref(),
+                )
+                .await?;
+            if abandoned.is_empty() {
+                break;
+            }
+            abandoned.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            for (cursor, upload) in abandoned {
+                after = Some(cursor);
+                let cleanup = async {
+                    self.artifacts.retire_abandoned(&upload, shutdown).await?;
+                    self.store
+                        .finish_archive_upload_cleanup(&command_budget(shutdown)?, upload)
+                        .await
+                };
+                if let Err(err) = cleanup.await {
+                    cleanup_error = Some(err);
+                }
             }
         }
         let mut after = None;
         loop {
             let scopes = self
                 .store
-                .archive_job_scopes(
+                .archive_gc_scopes(
                     &command_budget(shutdown)?,
                     after.as_ref(),
                     PageLimit::new(64)?,

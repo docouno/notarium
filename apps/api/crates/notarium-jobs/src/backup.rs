@@ -453,6 +453,12 @@ fn snapshot_references(
         BackupArtifactKind::SqliteSnapshotV1 => {
             let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
                 .map_err(sqlite_error)?;
+            let interrupted = cancellation.clone();
+            db.progress_handler(4096, Some(move || interrupted.is_cancelled()))
+                .map_err(sqlite_error)?;
+            let verified = crate::fsck::verify_sqlite_references(&db, None);
+            check_cancelled(cancellation)?;
+            verified?;
             let mut query = db
                 .prepare(
                     "SELECT DISTINCT space_id,content_blake3 FROM blob_references
@@ -467,6 +473,21 @@ fn snapshot_references(
             }
         }
         BackupArtifactKind::PostgresSpoolV1 => {
+            let mut checks = crate::db_integrity::PgRowChecks::new(true)?;
+            crate::db_integrity::Relations::new(true)?.verify(cancellation, |keys| {
+                scan_postgres_spool_v1(
+                    File::open(path).map_err(io_error)?,
+                    bytes,
+                    options.max_archive_bytes,
+                    options.max_pg_row_bytes,
+                    |table, row| {
+                        check_cancelled(cancellation)?;
+                        checks.check(table, row, Some(keys))?;
+                        keys.canonical(table, row)
+                    },
+                )?;
+                Ok(())
+            })?;
             scan_postgres_spool_v1(
                 file,
                 bytes,
@@ -474,6 +495,7 @@ fn snapshot_references(
                 options.max_pg_row_bytes,
                 |table, row| {
                     check_cancelled(cancellation)?;
+                    checks.check(table, row, None)?;
                     if table.name == "blob_catalog" {
                         let [
                             PostgresSpoolValue::Text(space),
@@ -524,6 +546,7 @@ fn write_cas(
     index.write_all(CAS_INDEX_MAGIC).map_err(io_error)?;
     index.write_all(&0_u64.to_be_bytes()).map_err(io_error)?;
     let mut entries = 0_u64;
+    let mut raw_left = crate::backup_format::raw_cas_limit(options.max_archive_bytes);
     let mut previous = None;
     while let Some(mut item) = input.blocking_recv() {
         check_cancelled(cancellation)?;
@@ -535,7 +558,8 @@ fn write_cas(
             return Err(invalid(ValidationReason::BudgetExceeded));
         }
         let offset = data.stream_position().map_err(io_error)?;
-        let (raw, hash) = compress_blob(&mut data, &mut item.bytes, cancellation)?;
+        let (raw, hash) = compress_blob(&mut data, &mut item.bytes, raw_left, cancellation)?;
+        raw_left -= raw;
         if hash != item.digest {
             return Err(invalid(ValidationReason::InvalidDigest));
         }
@@ -573,6 +597,7 @@ fn write_cas(
 fn compress_blob(
     output: &mut impl Write,
     bytes: &mut mpsc::Receiver<Bytes>,
+    limit: u64,
     cancellation: &Cancellation,
 ) -> Result<(u64, ContentDigest), PortError> {
     let mut writer = zstd::stream::write::Encoder::new(output, 3).map_err(io_error)?;
@@ -580,8 +605,11 @@ fn compress_blob(
     let mut hash = blake3::Hasher::new();
     while let Some(chunk) = bytes.blocking_recv() {
         check_cancelled(cancellation)?;
+        raw = raw
+            .checked_add(chunk.len() as u64)
+            .filter(|size| *size <= limit)
+            .ok_or_else(|| invalid(ValidationReason::BudgetExceeded))?;
         hash.update(&chunk);
-        raw += chunk.len() as u64;
         writer.write_all(&chunk).map_err(io_error)?;
     }
     writer.finish().map_err(io_error)?;

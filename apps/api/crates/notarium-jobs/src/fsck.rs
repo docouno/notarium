@@ -47,7 +47,6 @@ use crate::{
 
 const MAX_DB_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 const MAX_HISTORIES: usize = 65_536;
-const MAX_INDEX_COUNTER_BYTES: u64 = 32 * 1024 * 1024;
 
 pub(crate) trait SeekRead: Read + Seek + Send {}
 impl<T: Read + Seek + Send> SeekRead for T {}
@@ -65,6 +64,14 @@ impl ArchiveInput {
         Ok(Self {
             source: RangeSource::new(source).map_err(io_error)?,
         })
+    }
+
+    /// Build without I/O using the exact size of the pinned source version.
+    pub fn with_length(source: impl Read + Seek + Send + 'static, bytes: u64) -> Self {
+        let source: Box<dyn SeekRead> = Box::new(source);
+        Self {
+            source: RangeSource::with_length(source, bytes),
+        }
     }
 }
 
@@ -151,11 +158,11 @@ async fn run_fsck_inner(
     match input {
         FsckInput::Archive(input) => {
             let keys = external_keyring.to_owned();
-            let verified = tokio::task::spawn_blocking(move || {
+            let cancellation = ctx.budget.cancellation.clone();
+            let verified = crate::maintenance::read_source(&cancellation, move || {
                 verify_archive(input, &keys, &ctx.budget, options)
             })
-            .await
-            .map_err(join_error)??;
+            .await?;
             Ok(verified.report)
         }
         FsckInput::Live { canonical, control } => {
@@ -487,10 +494,25 @@ fn check_integrity(db: &Connection) -> Result<(), PortError> {
     Ok(())
 }
 
-fn verify_sqlite_references(
+pub(crate) fn verify_sqlite_references(
     db: &Connection,
     mut index: Option<&mut CasIndex>,
 ) -> Result<(), PortError> {
+    let missing_root: bool = db
+        .query_row(
+            "SELECT EXISTS (
+            SELECT 1 FROM spaces s
+            LEFT JOIN folder_heads f ON f.space_id=s.space_id AND f.folder_id=s.root_folder_id
+            WHERE f.folder_id IS NULL OR f.is_root<>1
+               OR f.parent_folder_id IS NOT NULL OR f.lifecycle_state<>'active'
+        )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)?;
+    if missing_root {
+        return Err(invalid(ValidationReason::InvalidState));
+    }
     check_sqlite_blob_owners(db)?;
     let lost: bool = db.query_row(
         "SELECT EXISTS (SELECT 1 FROM blob_references r
@@ -548,9 +570,12 @@ fn verify_control_spool(
         return Err(invalid(ValidationReason::InvalidState));
     }
     let mut keys = Vec::new();
+    let mut key_bytes = 0;
     let mut found_installation = false;
+    let mut checks = PgRowChecks::new(false)?;
     while let Some(row) = reader.next_record()? {
         check_cancelled(&budget.cancellation)?;
+        checks.check_control(&row, None)?;
         match row {
             TargetRecord::V1StorageEpoch {
                 installation_id,
@@ -576,6 +601,13 @@ fn verify_control_spool(
                 retired_at: None,
                 ..
             } => {
+                if canary.len() > 1024 {
+                    return Err(invalid(ValidationReason::InvalidArchive));
+                }
+                key_bytes += key_id.len() + key_hash.len() + state.len() + canary.len();
+                if keys.len() >= 4096 || key_bytes > 1024 * 1024 {
+                    return Err(invalid(ValidationReason::BudgetExceeded));
+                }
                 keys.push(BackupKeyRow {
                     key_id,
                     key_hash,
@@ -583,9 +615,6 @@ fn verify_control_spool(
                     state,
                     canary,
                 });
-                if keys.len() > 4096 {
-                    return Err(invalid(ValidationReason::BudgetExceeded));
-                }
             }
             TargetRecord::McpDeltaOwnerCursors { space_id, .. }
             | TargetRecord::McpDeltaSessionCursors { space_id, .. } => {
@@ -610,6 +639,7 @@ fn verify_control_spool(
         let mut scan = SpoolReader::open(input.clone())?;
         while let Some(record) = scan.next_record()? {
             check_cancelled(&budget.cancellation)?;
+            checks.check_control(&record, Some(keys))?;
             keys.control(&record)?;
         }
         Ok(())
@@ -646,13 +676,8 @@ fn verify_canonical_spool(
     let (mut index, data) = cas.unzip();
     let mut histories = Vec::new();
     let mut schema_version = 0;
-    let count = index.as_ref().map_or(0, |index| index.count);
-    if count.saturating_mul(4) > MAX_INDEX_COUNTER_BYTES {
-        return Err(invalid(ValidationReason::BudgetExceeded));
-    }
-    let mut expected_references = vec![0_u32; count as usize];
     let mut ordinal = 0;
-    let mut checks = PgRowChecks::new()?;
+    let mut checks = PgRowChecks::new(true)?;
     let witness = scan_postgres_spool_v1(
         canonical.clone(),
         manifest.canonical.bytes,
@@ -696,20 +721,7 @@ fn verify_canonical_spool(
                         && let Some(index) = index.as_deref_mut()
                     {
                         index.expect(ordinal, space, digest, *raw)?;
-                        expected_references[ordinal as usize] = u32::try_from(*refs)
-                            .map_err(|_| invalid(ValidationReason::BudgetExceeded))?;
                         ordinal += 1;
-                    }
-                }
-                ("blob_references", [Text(space), _, _, _, _, Bytes(digest), ..]) => {
-                    if let Some(index) = index.as_deref_mut() {
-                        let position = index
-                            .find(space, digest)?
-                            .ok_or_else(|| invalid(ValidationReason::InvalidDigest))?;
-                        expected_references[position as usize] = expected_references
-                            [position as usize]
-                            .checked_sub(1)
-                            .ok_or_else(|| invalid(ValidationReason::InvalidState))?;
                     }
                 }
                 _ => {}
@@ -723,9 +735,6 @@ fn verify_canonical_spool(
         || !witness.canaries.is_empty()
         || histories != witness.histories
         || index.as_ref().is_some_and(|index| index.count != ordinal)
-        || expected_references
-            .into_iter()
-            .any(|references| references != 0)
     {
         return Err(invalid(ValidationReason::InvalidState));
     }
@@ -907,15 +916,15 @@ fn check_index_and_data(
         {
             return Err(invalid(ValidationReason::InvalidArchive));
         }
+        total_raw = total_raw
+            .checked_add(record.raw)
+            .filter(|size| *size <= crate::backup_format::raw_cas_limit(options.max_archive_bytes))
+            .ok_or_else(|| invalid(ValidationReason::BudgetExceeded))?;
         let slice = data
             .view(record.offset, record.compressed)
             .map_err(io_error)?;
         verify_frame(slice, &record, budget)?;
         offset += record.compressed;
-        total_raw = total_raw
-            .checked_add(record.raw)
-            .filter(|size| *size <= options.max_archive_bytes.saturating_mul(8))
-            .ok_or_else(|| invalid(ValidationReason::BudgetExceeded))?;
         previous = Some(key);
     }
     if offset != data.len() {
@@ -1053,4 +1062,36 @@ fn live_inputs(
 
 fn join_error(error: tokio::task::JoinError) -> PortError {
     codec::internal_not_committed("fsck_worker", error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sqlite_empty_space_requires_its_root() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(notarium_canonical::schema::SQLITE_BASELINE_DDL)
+            .unwrap();
+        db.execute(
+            "INSERT INTO spaces VALUES(
+                'test-space',zeroblob(16),'missing-root','test','test','shared',
+                'owner','active',1,0,'{}',0,0
+            )",
+            [],
+        )
+        .unwrap();
+        let pragma: String = db
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(pragma, "ok");
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            0,
+        );
+        assert!(verify_sqlite_references(&db, None).is_err());
+    }
 }

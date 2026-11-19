@@ -104,12 +104,12 @@ async fn run_restore_inner(
         RestoreTarget::Cloud(target) => target.external_keyring.clone(),
     };
     let budget = ctx.budget.clone();
-    let verified = tokio::task::spawn_blocking({
+    let verified = crate::maintenance::read_source(&ctx.budget.cancellation, {
         let options = options.clone();
         move || verify_archive(input, &verification_keys, &budget, options)
     })
-    .await
-    .map_err(join_error)??;
+    .await?;
+    check_cancelled(&ctx.budget.cancellation)?;
     match target {
         RestoreTarget::Local { root, keyring }
             if verified.manifest.backend == BackupArtifactKind::SqliteSnapshotV1 =>
@@ -251,19 +251,18 @@ async fn restore_local(
         let keys = keyring.clone();
         let budget = ctx.budget.clone();
         let worker_lock = lock.try_clone().map_err(io_error)?;
-        tokio::task::spawn_blocking(move || {
+        crate::maintenance::read_source(&ctx.budget.cancellation, move || {
             let _lock = worker_lock;
             materialize_local(&verified, &work, &keys, &budget)
         })
-        .await
-        .map_err(join_error)??;
+        .await?;
         rebind_local(&stage, &journal, &keyring, &ctx).await?;
         write_new(&stage.manifest(), &epoch_manifest(&journal.installation)?)?;
         if journal.existing.is_some() {
             write_new(&stage.restore_guard(), journal.digest.to_hex().as_bytes())?;
         }
         sync_dir(stage.root())?;
-        verify_installed(&stage, &journal)?;
+        verify_installed(&stage, &journal, true)?;
         journal.phase = Phase::Install {
             directory: identity,
             components: ["v1", "blobs", "secret-keyring"]
@@ -280,10 +279,14 @@ async fn restore_local(
     }
     check_cancelled(&ctx.budget.cancellation)?;
     install_local(&parent, &root, &journal)?;
-    verify_installed(&root, &journal)?;
-    fs::remove_file(&journal_path).map_err(io_error)?;
-    sync_dir(&parent)?;
-    if let Phase::Install { directory, .. } = &journal.phase {
+    verify_installed(&root, &journal, false).map_err(after_local_publication)?;
+    // The ready directory is durable now. A leftover journal permits the
+    // same operation to validate and finish cleanup on retry.
+    let removed = fs::remove_file(&journal_path).is_ok();
+    if removed {
+        let _ = sync_dir(&parent);
+    }
+    if removed && let Phase::Install { directory, .. } = &journal.phase {
         let stage = parent.join(&journal.stage);
         if journal.existing.is_some()
             && directory_identity(&stage).ok().flatten() == Some(*directory)
@@ -583,11 +586,11 @@ fn install_local(parent: &Path, root: &DataRoot, journal: &Journal) -> Result<()
             fs::hard_link(stage.join(LOCAL_MANIFEST), root.manifest()).map_err(io_error)?;
             sync_dir(root.root())?;
         }
-        verify_installed(root, journal)?;
         if exists(&root.restore_guard())? {
+            verify_installed(root, journal, true)?;
             verify_guard(root, journal.digest)?;
             fs::remove_file(root.restore_guard()).map_err(io_error)?;
-            sync_dir(root.root())?;
+            sync_dir(root.root()).map_err(after_local_publication)?;
         }
     } else if directory_identity(root.root())? != Some(*directory) {
         require_empty_target(root, None)?;
@@ -596,7 +599,11 @@ fn install_local(parent: &Path, root: &DataRoot, journal: &Journal) -> Result<()
         }
         rename_noreplace(&stage, root.root())?;
     }
-    sync_dir(parent)
+    sync_dir(parent).map_err(after_local_publication)
+}
+
+fn after_local_publication(error: PortError) -> PortError {
+    codec::unknown_commit_outcome("restore_local_publication", error.to_string())
 }
 
 fn validate_components(
@@ -630,7 +637,11 @@ fn validate_components(
     Ok(())
 }
 
-fn verify_installed(root: &DataRoot, journal: &Journal) -> Result<(), PortError> {
+fn verify_installed(
+    root: &DataRoot,
+    journal: &Journal,
+    require_cut: bool,
+) -> Result<(), PortError> {
     let mut marker = String::new();
     File::open(root.manifest())
         .map_err(io_error)?
@@ -664,7 +675,11 @@ fn verify_installed(root: &DataRoot, journal: &Journal) -> Result<(), PortError>
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .map_err(sql_error)?;
-        if history != cursor.scope.incarnation.as_bytes() || seq != cursor.after.get() as i64 {
+        let cutoff = cursor.after.get() as i64;
+        if history != cursor.scope.incarnation.as_bytes()
+            || seq < cutoff
+            || (require_cut && seq != cutoff)
+        {
             return Err(invalid(ValidationReason::HistoryIncarnationMismatch));
         }
         for table in ["mcp_delta_owner_cursors", "mcp_delta_session_cursors"] {
@@ -869,5 +884,6 @@ fn sync_dir(path: &Path) -> Result<(), PortError> {
 fn join_error(error: tokio::task::JoinError) -> PortError {
     codec::internal_not_committed("offline_restore_worker", error.to_string())
 }
+
 mod cloud;
 pub use cloud::CloudRestoreTarget;

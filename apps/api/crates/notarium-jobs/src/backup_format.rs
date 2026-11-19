@@ -27,6 +27,10 @@ pub(crate) const CAS_HEADER_BYTES: u64 = 16;
 const SPACE_BYTES: usize = 35;
 pub(crate) const CAS_RECORD_BYTES: u64 = (SPACE_BYTES + 32 + 3 * 8) as u64;
 
+pub(crate) fn raw_cas_limit(max_archive_bytes: u64) -> u64 {
+    max_archive_bytes.saturating_mul(8)
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Manifest {

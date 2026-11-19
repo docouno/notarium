@@ -30,6 +30,7 @@ use crate::{
 };
 
 use super::{
+    ArchiveCleanupCursor,
     archive_import::{ArchiveObject, ArchiveObjectKind},
     authorize_export_notes_tx, authorize_full_space_export, authorize_job_payload_tx,
     authorize_job_read_on_space, job_clock_ms, load_job_row_opt_tx, require_active_job_lease_tx,
@@ -124,17 +125,33 @@ impl CanonicalStore {
     pub async fn expired_export_objects(
         &self,
         budget: &CallBudget,
-    ) -> Result<Vec<ArchiveObject>, PortError> {
+        namespace: ContentDigest,
+        after: Option<&ArchiveCleanupCursor>,
+    ) -> Result<Vec<(ArchiveCleanupCursor, ArchiveObject)>, PortError> {
+        let ArchiveCleanupCursor(created, space, artifact) = ArchiveCleanupCursor::after(after);
         self.with_read_tx_budget(Some(budget), |tx| {
             Box::pin(async move {
                 let now = job_clock_ms(tx).await?;
-                let sql = "SELECT object_msgpack FROM archive_artifacts
-                    WHERE expires_at_ms <= $1 ORDER BY expires_at_ms, space_id, artifact_id LIMIT 16";
-                let rows: Vec<Vec<u8>> = match tx {
-                    BackendConn::Sqlite(conn) => sqlx::query_scalar(sql).bind(now).fetch_all(&mut **conn).await,
-                    BackendConn::Postgres(conn) => sqlx::query_scalar(sql).bind(now).fetch_all(&mut **conn).await,
+                let sql = "SELECT expires_at_ms,space_id,artifact_id,object_msgpack FROM archive_artifacts
+                    WHERE object_namespace=$2 AND expires_at_ms <= $1
+                    AND (expires_at_ms,space_id,artifact_id)>($3,$4,$5)
+                    ORDER BY expires_at_ms,space_id,artifact_id LIMIT 16";
+                macro_rules! get {
+                    ($conn:expr) => {
+                        sqlx::query_as(sql).bind(now).bind(namespace.as_bytes().as_slice())
+                            .bind(created).bind(&space).bind(&artifact).fetch_all(&mut **$conn).await
+                    };
+                }
+                let rows: Vec<(i64, String, String, Vec<u8>)> = match tx {
+                    BackendConn::Sqlite(conn) => get!(conn),
+                    BackendConn::Postgres(conn) => get!(conn),
                 }.map_err(sql_error)?;
-                rows.iter().map(|row| decode_msgpack_bounded(row, MAX_MSGPACK_DECODE_BYTES)).collect()
+                rows.into_iter().map(|(expires, space, id, bytes)| {
+                    Ok((
+                        ArchiveCleanupCursor(expires, space, id),
+                        decode_msgpack_bounded(&bytes, MAX_MSGPACK_DECODE_BYTES)?,
+                    ))
+                }).collect()
             })
         }).await
     }
@@ -315,7 +332,7 @@ impl CanonicalStore {
                     let space = load_space_record(tx, &scoped.space_id).await?;
                     space.scope.check(&scoped)?;
                     authorize_job_write_for_export(&auth, &space)?;
-                    let (job, _, erased) = require_active_job_lease_tx(
+                    let (job, _, erased, _) = require_active_job_lease_tx(
                         tx,
                         &scoped,
                         &claimant.job.id,
@@ -622,8 +639,8 @@ pub(super) async fn insert_export_pointer_tx(
     let expires_at = now
         .checked_add(EXPORT_TTL_MS)
         .ok_or_else(|| invalid(ValidationReason::InvalidTimestamp))?;
-    const SQL: &str = "INSERT INTO archive_artifacts(space_id, artifact_id, job_id, privacy_generation, expires_at_ms, object_msgpack)
-        VALUES($1,$2,$3,$4,$5,$6)";
+    const SQL: &str = "INSERT INTO archive_artifacts(space_id, artifact_id, job_id, privacy_generation, expires_at_ms, object_msgpack, object_namespace)
+        VALUES($1,$2,$3,$4,$5,$6,$7)";
     match tx {
         BackendConn::Sqlite(conn) => sqlx::query(SQL)
             .bind(scope.space_id.as_str())
@@ -632,6 +649,7 @@ pub(super) async fn insert_export_pointer_tx(
             .bind(publication.privacy_generation as i64)
             .bind(expires_at)
             .bind(&encoded)
+            .bind(publication.object.namespace.as_bytes().as_slice())
             .execute(&mut **conn)
             .await
             .map(|_| ()),
@@ -642,6 +660,7 @@ pub(super) async fn insert_export_pointer_tx(
             .bind(publication.privacy_generation as i64)
             .bind(expires_at)
             .bind(&encoded)
+            .bind(publication.object.namespace.as_bytes().as_slice())
             .execute(&mut **conn)
             .await
             .map(|_| ()),

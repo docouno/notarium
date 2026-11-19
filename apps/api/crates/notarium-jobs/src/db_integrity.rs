@@ -12,13 +12,16 @@ use notarium_canonical::{
         sqlite_archive_privacy_ddl, sqlite_archive_versions_ddl,
     },
 };
-use notarium_control::store::{SQLITE_TARGET_DDL, TargetRecord};
+use notarium_control::store::{SQLITE_TARGET_DDL, TargetRecord, TargetValue};
 use notarium_core::{
     error::{PortError, ValidationReason},
     ids::ContentDigest,
     ports::Cancellation,
 };
-use rusqlite::{Connection, OptionalExtension, ToSql, params, params_from_iter, types::Null};
+use rusqlite::{
+    Connection, OptionalExtension, params, params_from_iter,
+    types::{ToSqlOutput, ValueRef},
+};
 
 use crate::{backup_format::invalid, import::check_cancelled, sqlite_range::sql_error};
 
@@ -216,17 +219,21 @@ pub(crate) fn check_sqlite_canonical(db: &Connection, version: u32) -> Result<()
 }
 
 fn normalize_ddl(sql: &str) -> String {
-    let mut quoted = false;
+    let mut quote = None;
     sql.chars()
-        .filter_map(|ch| match ch {
-            '\'' => {
-                quoted = !quoted;
+        .filter_map(|ch| match quote {
+            Some(end) => {
+                if ch == end {
+                    quote = None;
+                }
                 Some(ch)
             }
-            ch if quoted => Some(ch),
-            '"' => None,
-            ch if ch.is_ascii_whitespace() => None,
-            ch => Some(ch.to_ascii_lowercase()),
+            None if matches!(ch, '\'' | '"' | '`' | '[') => {
+                quote = Some(if ch == '[' { ']' } else { ch });
+                Some(ch)
+            }
+            None if ch.is_ascii_whitespace() => None,
+            None => Some(ch.to_ascii_lowercase()),
         })
         .collect()
 }
@@ -317,58 +324,39 @@ fn matching_paren(sql: &str) -> Result<usize, PortError> {
 pub(crate) struct PgRowChecks {
     db: Connection,
     sqlite: BTreeMap<String, String>,
-    statements: BTreeMap<&'static str, String>,
-    narrow: BTreeMap<&'static str, Vec<usize>>,
-    unique_indexes: BTreeMap<String, Vec<UniqueIndex>>,
+    rules: BTreeMap<&'static str, RowRule>,
 }
 
-struct UniqueIndex {
-    name: String,
+struct RowRule {
     columns: Vec<String>,
+    statement: String,
+    narrow_integers: BTreeSet<usize>,
+    indexes: Vec<IndexRule>,
+}
+
+struct IndexRule {
+    name: String,
+    columns: Vec<usize>,
+    unique: bool,
     predicate: String,
 }
 
+// An index entry's uncompressed fields must fit on both sides of a portable
+// PostgreSQL backup. Allow room for tuple and per-column overhead.
+const MAX_INDEX_KEY_BYTES: usize = 2048;
+
 impl PgRowChecks {
-    pub(crate) fn new() -> Result<Self, PortError> {
-        let db = trusted(SQLITE_BASELINE_DDL)?;
+    pub(crate) fn new(canonical: bool) -> Result<Self, PortError> {
+        let db = trusted(if canonical {
+            SQLITE_BASELINE_DDL
+        } else {
+            SQLITE_TARGET_DDL
+        })?;
         let sqlite = definitions(&db, "table")?;
-        let mut unique_indexes: BTreeMap<String, Vec<UniqueIndex>> = BTreeMap::new();
-        for (name, definition) in definitions(&db, "index")? {
-            if !definition.starts_with("CREATE UNIQUE INDEX ") {
-                continue;
-            }
-            let (_, target) = definition
-                .split_once(" ON ")
-                .or_else(|| definition.split_once("    ON "))
-                .ok_or_else(|| invalid(ValidationReason::InvalidState))?;
-            let start = target
-                .find('(')
-                .ok_or_else(|| invalid(ValidationReason::InvalidState))?;
-            let end = start + matching_paren(&target[start..])?;
-            let columns = target[start + 1..end]
-                .split(',')
-                .map(|column| column.trim().to_owned())
-                .collect();
-            let predicate = target[end + 1..]
-                .trim()
-                .strip_prefix("WHERE ")
-                .unwrap_or("1")
-                .to_owned();
-            unique_indexes
-                .entry(target[..start].trim().to_owned())
-                .or_default()
-                .push(UniqueIndex {
-                    name,
-                    columns,
-                    predicate,
-                });
-        }
         Ok(Self {
             db,
             sqlite,
-            statements: BTreeMap::new(),
-            narrow: BTreeMap::new(),
-            unique_indexes,
+            rules: BTreeMap::new(),
         })
     }
 
@@ -378,63 +366,12 @@ impl PgRowChecks {
         row: &[PostgresSpoolValue],
         partition: Option<&mut Partition<'_>>,
     ) -> Result<(), PortError> {
-        if partition.is_some() && !self.unique_indexes.contains_key(table.name) {
-            return Ok(());
-        }
-        if !self.statements.contains_key(table.name) {
-            let mut input = self
-                .sqlite
-                .get(table.name)
-                .ok_or_else(|| invalid(ValidationReason::InvalidState))?
-                .as_str();
-            let mut checks = Vec::new();
-            while let Some(start) = input.find("CHECK") {
-                let expression = input[start + "CHECK".len()..].trim_start();
-                let tail = matching_paren(expression)?;
-                checks.push(format!("COALESCE({},1)", &expression[..=tail]));
-                input = &expression[tail + 1..];
-            }
-            let mut parameters = table
+        if !self.rules.contains_key(table.name) {
+            let columns = table
                 .columns
                 .iter()
-                .enumerate()
-                .map(|(index, column)| format!("?{} AS \"{}\"", index + 1, column.name))
-                .collect::<Vec<_>>();
-            let mut defaults = self
-                .db
-                .prepare("SELECT name, dflt_value FROM pragma_table_info(?1)")
-                .map_err(sql_error)?;
-            for column in defaults
-                .query_map([table.name], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-                })
-                .map_err(sql_error)?
-            {
-                let (name, default) = column.map_err(sql_error)?;
-                if !table.columns.iter().any(|column| column.name == name) {
-                    parameters.push(format!(
-                        "{} AS \"{name}\"",
-                        default.as_deref().unwrap_or("NULL")
-                    ));
-                }
-            }
-            let predicate = if checks.is_empty() {
-                "1".to_owned()
-            } else {
-                checks.join(" AND ")
-            };
-            let mut selected = vec![predicate];
-            for index in self.unique_indexes.get(table.name).into_iter().flatten() {
-                selected.push(format!("COALESCE(({}),0)", index.predicate));
-            }
-            self.statements.insert(
-                table.name,
-                format!(
-                    "SELECT {} FROM (SELECT {})",
-                    selected.join(","),
-                    parameters.join(",")
-                ),
-            );
+                .map(|column| column.name.to_owned())
+                .collect();
             let pg_start = format!("CREATE TABLE IF NOT EXISTS {} (", table.name);
             let (_, rest) = POSTGRES_BASELINE_DDL
                 .split_once(&pg_start)
@@ -445,43 +382,185 @@ impl PgRowChecks {
             let integers = body
                 .lines()
                 .filter_map(|line| {
-                    let mut words = line.trim().split_ascii_whitespace();
+                    let mut words = line.split_ascii_whitespace();
                     let name = words.next()?;
                     (words.next()?.trim_end_matches(',') == "INTEGER").then_some(name)
                 })
                 .collect::<BTreeSet<_>>();
-            self.narrow.insert(
-                table.name,
-                table
-                    .columns
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, col)| integers.contains(col.name).then_some(index))
-                    .collect(),
-            );
+            let rule = self.rule(table.name, columns, &integers)?;
+            self.rules.insert(table.name, rule);
         }
-        let narrow = &self.narrow[table.name];
-        for (index, value) in row.iter().enumerate() {
-            if matches!(value, PostgresSpoolValue::Text(value) if value.contains('\0'))
-                || (narrow.contains(&index)
-                    && matches!(value, PostgresSpoolValue::Int(value) if i32::try_from(*value).is_err()))
-            {
-                return Err(invalid(ValidationReason::InvalidArchive));
+        let values = row
+            .iter()
+            .map(|value| match value {
+                PostgresSpoolValue::Null => ValueRef::Null,
+                PostgresSpoolValue::Int(value) => ValueRef::Integer(*value),
+                PostgresSpoolValue::Text(value) => ValueRef::Text(value.as_bytes()),
+                PostgresSpoolValue::Bytes(value) => ValueRef::Blob(value),
+            })
+            .collect::<Vec<_>>();
+        self.evaluate(&self.rules[table.name], &values, partition)
+    }
+
+    pub(crate) fn check_control(
+        &mut self,
+        row: &TargetRecord,
+        partition: Option<&mut Partition<'_>>,
+    ) -> Result<(), PortError> {
+        let table = row.table().name();
+        if !self.rules.contains_key(table) {
+            let columns = self
+                .db
+                .prepare("SELECT name FROM pragma_table_info(?1) ORDER BY cid")
+                .map_err(sql_error)?
+                .query_map([table], |row| row.get(0))
+                .map_err(sql_error)?
+                .collect::<Result<Vec<String>, _>>()
+                .map_err(sql_error)?;
+            let rule = self.rule(table, columns, &BTreeSet::new())?;
+            self.rules.insert(table, rule);
+        }
+        let rule = &self.rules[table];
+        let values = rule
+            .columns
+            .iter()
+            .map(|column| row.relational_value(column).map(target_value))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.evaluate(rule, &values, partition)
+    }
+
+    fn rule(
+        &self,
+        table: &str,
+        columns: Vec<String>,
+        integers: &BTreeSet<&str>,
+    ) -> Result<RowRule, PortError> {
+        let mut input = self
+            .sqlite
+            .get(table)
+            .ok_or_else(|| invalid(ValidationReason::InvalidState))?
+            .as_str();
+        let mut checks = vec!["1".to_owned()];
+        while let Some(start) = input.find("CHECK") {
+            let expression = input[start + "CHECK".len()..].trim_start();
+            let tail = matching_paren(expression)?;
+            checks.push(format!("COALESCE({},1)", &expression[..=tail]));
+            input = &expression[tail + 1..];
+        }
+        let narrow_integers = columns
+            .iter()
+            .enumerate()
+            .filter_map(|(index, column)| integers.contains(column.as_str()).then_some(index))
+            .collect();
+        let mut parameters = columns
+            .iter()
+            .enumerate()
+            .map(|(index, name)| format!("?{} AS \"{name}\"", index + 1))
+            .collect::<Vec<_>>();
+        let mut defaults = self
+            .db
+            .prepare("SELECT name,dflt_value FROM pragma_table_info(?1)")
+            .map_err(sql_error)?;
+        for column in defaults
+            .query_map([table], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })
+            .map_err(sql_error)?
+        {
+            let (name, default) = column.map_err(sql_error)?;
+            if !columns.contains(&name) {
+                parameters.push(format!(
+                    "{} AS \"{name}\"",
+                    default.as_deref().unwrap_or("NULL")
+                ));
             }
         }
-        let mut query = self
+        let indexes = self.indexes(table, &columns)?;
+        let mut selected = vec![checks.join(" AND ")];
+        for index in &indexes {
+            selected.push(format!("COALESCE(({}),0)", index.predicate));
+        }
+        Ok(RowRule {
+            columns,
+            statement: format!(
+                "SELECT {} FROM (SELECT {})",
+                selected.join(","),
+                parameters.join(",")
+            ),
+            narrow_integers,
+            indexes,
+        })
+    }
+
+    fn indexes(&self, table: &str, columns: &[String]) -> Result<Vec<IndexRule>, PortError> {
+        let mut indexes = self
             .db
-            .prepare_cached(&self.statements[table.name])
+            .prepare(
+                "SELECT l.name,l.\"unique\",l.partial,s.sql FROM pragma_index_list(?1) l
+             LEFT JOIN sqlite_schema s ON s.name=l.name AND s.type='index' ORDER BY l.name",
+            )
             .map_err(sql_error)?;
+        let mut keys = self
+            .db
+            .prepare("SELECT name FROM pragma_index_info(?1) ORDER BY seqno")
+            .map_err(sql_error)?;
+        let mut rules = Vec::new();
+        let mut entries = indexes.query([table]).map_err(sql_error)?;
+        while let Some(index) = entries.next().map_err(sql_error)? {
+            let name: String = index.get(0).map_err(sql_error)?;
+            let unique = index.get(1).map_err(sql_error)?;
+            let partial: bool = index.get(2).map_err(sql_error)?;
+            let definition: Option<String> = index.get(3).map_err(sql_error)?;
+            let predicate = if partial {
+                definition
+                    .as_deref()
+                    .and_then(|sql| sql.split_once("WHERE ").map(|(_, predicate)| predicate))
+                    .ok_or_else(|| invalid(ValidationReason::InvalidState))?
+            } else {
+                "1"
+            };
+            let indexed = keys
+                .query_map([&name], |row| row.get::<_, String>(0))
+                .map_err(sql_error)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(sql_error)?;
+            let positions = indexed
+                .iter()
+                .map(|name| columns.iter().position(|column| column == name))
+                .collect::<Option<Vec<_>>>();
+            if let Some(columns) = positions {
+                rules.push(IndexRule {
+                    name,
+                    columns,
+                    unique,
+                    predicate: predicate.to_owned(),
+                });
+            }
+        }
+        Ok(rules)
+    }
+
+    fn evaluate(
+        &self,
+        rule: &RowRule,
+        values: &[ValueRef<'_>],
+        mut partition: Option<&mut Partition<'_>>,
+    ) -> Result<(), PortError> {
+        if partition.is_some() && !rule.indexes.iter().any(|index| index.unique) {
+            return Ok(());
+        }
+        if partition.is_none() && values.iter().enumerate().any(|(index, value)| {
+            matches!(value, ValueRef::Text(value) if value.contains(&0))
+                || (rule.narrow_integers.contains(&index)
+                    && matches!(value, ValueRef::Integer(value) if i32::try_from(*value).is_err()))
+        }) {
+            return Err(invalid(ValidationReason::InvalidArchive));
+        }
+        let mut query = self.db.prepare_cached(&rule.statement).map_err(sql_error)?;
         let mut evaluated = query
-            .query(params_from_iter(row.iter().map(|value| -> &dyn ToSql {
-                match value {
-                    PostgresSpoolValue::Null => &Null,
-                    PostgresSpoolValue::Text(v) => v,
-                    PostgresSpoolValue::Bytes(v) => v,
-                    PostgresSpoolValue::Int(v) => v,
-                }
-            })))
+            .query(params_from_iter(
+                values.iter().copied().map(ToSqlOutput::Borrowed),
+            ))
             .map_err(sql_error)?;
         let fields = evaluated
             .next()
@@ -490,20 +569,40 @@ impl PgRowChecks {
         if !fields.get::<_, bool>(0).map_err(sql_error)? {
             return Err(invalid(ValidationReason::InvalidArchive));
         }
-        if let Some(partition) = partition {
-            for (offset, index) in self
-                .unique_indexes
-                .get(table.name)
-                .into_iter()
-                .flatten()
-                .enumerate()
-            {
-                if fields.get::<_, bool>(offset + 1).map_err(sql_error)? {
-                    partition.note_unique(index, table, row)?;
+        for (offset, index) in rule.indexes.iter().enumerate() {
+            if !fields.get::<_, bool>(offset + 1).map_err(sql_error)? {
+                continue;
+            }
+            if let Some(partition) = partition.as_deref_mut() {
+                if index.unique {
+                    partition.note_unique(index, values);
+                }
+            } else {
+                let bytes: usize = index
+                    .columns
+                    .iter()
+                    .map(|position| match values[*position] {
+                        ValueRef::Null => 0,
+                        ValueRef::Integer(_) | ValueRef::Real(_) => 8,
+                        ValueRef::Text(bytes) | ValueRef::Blob(bytes) => bytes.len(),
+                    })
+                    .sum();
+                if bytes > MAX_INDEX_KEY_BYTES {
+                    return Err(invalid(ValidationReason::InvalidArchive));
                 }
             }
         }
         Ok(())
+    }
+}
+
+fn target_value(value: TargetValue<'_>) -> ValueRef<'_> {
+    match value {
+        TargetValue::Null => ValueRef::Null,
+        TargetValue::Integer(value) => ValueRef::Integer(value),
+        TargetValue::Real(value) => ValueRef::Real(value),
+        TargetValue::Text(value) => ValueRef::Text(value.as_bytes()),
+        TargetValue::Bytes(value) => ValueRef::Blob(value),
     }
 }
 
@@ -691,8 +790,7 @@ impl Relations {
             }
         }
         if canonical {
-            // Logical CAS references and the Space's root are validated even
-            // where storage uses owner checks in place of a SQL constraint.
+            // Logical CAS references use owner checks in place of a SQL constraint.
             for (table, target, columns, target_columns) in [
                 (
                     "blob_references",
@@ -705,12 +803,6 @@ impl Relations {
                     "blob_publications",
                     ["space_id", "current_publication_id"],
                     ["space_id", "publication_id"],
-                ),
-                (
-                    "spaces",
-                    "folder_heads",
-                    ["space_id", "root_folder_id"],
-                    ["space_id", "folder_id"],
                 ),
             ] {
                 add(
@@ -739,6 +831,7 @@ impl Relations {
                 bits,
                 prefix,
                 keys: BTreeMap::new(),
+                references: BTreeMap::new(),
                 full: false,
                 parts: None,
             };
@@ -753,7 +846,8 @@ impl Relations {
                 flags & DUPLICATE != 0
                     || (flags & REQUIRED != 0 && flags & PRESENT == 0)
                     || (flags & EXACT != 0 && flags & REQUIRED == 0)
-            }) {
+            }) || partition.references.values().any(|delta| *delta != 0)
+            {
                 return Err(invalid(ValidationReason::InvalidArchive));
             }
         }
@@ -766,6 +860,7 @@ pub(crate) struct Partition<'a> {
     bits: u8,
     prefix: u16,
     keys: BTreeMap<[u8; 32], u8>,
+    references: BTreeMap<[u8; 32], i64>,
     full: bool,
     parts: Option<PublicationParts>,
 }
@@ -781,25 +876,15 @@ struct PublicationParts {
 }
 
 impl Partition<'_> {
-    fn note_unique(
-        &mut self,
-        index: &UniqueIndex,
-        table: TableSpec,
-        row: &[PostgresSpoolValue],
-    ) -> Result<(), PortError> {
+    fn note_unique(&mut self, index: &IndexRule, values: &[ValueRef<'_>]) {
         if self.full {
-            return Ok(());
+            return;
         }
         let mut hasher = blake3::Hasher::new();
         scalar(&mut hasher, b'u', index.name.as_bytes());
-        for name in &index.columns {
-            let position = table
-                .columns
-                .iter()
-                .position(|column| column.name == name)
-                .ok_or_else(|| invalid(ValidationReason::InvalidArchive))?;
-            if !canonical_scalar(&row[position], &mut hasher) {
-                return Ok(());
+        for &position in &index.columns {
+            if !value_key(values[position], &mut hasher) {
+                return;
             }
         }
         self.full = Self::record_key(
@@ -808,8 +893,7 @@ impl Partition<'_> {
             self.prefix,
             *hasher.finalize().as_bytes(),
             UNIQUE,
-        );
-        Ok(())
+        ) || self.keys.len() + self.references.len() > MAX_KEYS_PER_PARTITION;
     }
 
     pub(crate) fn canonical(
@@ -838,6 +922,14 @@ impl Partition<'_> {
     ) -> Result<(), PortError> {
         use PostgresSpoolValue::{Bytes, Int, Null, Text};
         match (table, row) {
+            ("spaces", [Text(space), _, Text(root), ..]) => {
+                self.domain_key("space_root", &[space, root], &[], REQUIRED);
+            }
+            ("folder_heads", [Text(space), Text(folder), Null, Int(1), ..]) => {
+                if matches!(&row[13], Text(lifecycle) if lifecycle == "active") {
+                    self.domain_key("space_root", &[space, folder], &[], PRESENT);
+                }
+            }
             ("revisions", [Text(space), _, Text(rev), Text(kind), Text(owner), ..])
                 if kind == "note" =>
             {
@@ -905,6 +997,7 @@ impl Partition<'_> {
                     Int(seq),
                 ],
             ) => {
+                self.count_reference(space, hash, -1)?;
                 match kind.as_str() {
                     "note_revision" | "ability_resource" | "chat_entry" => {
                         self.domain_key(kind, &[space, owner, rev, resource], hash, 6);
@@ -1004,6 +1097,7 @@ impl Partition<'_> {
                     ..,
                 ],
             ) if *count > 0 => {
+                self.count_reference(space, hash, *count)?;
                 let Text(publication) = publication else {
                     return Err(invalid(ValidationReason::InvalidDigest));
                 };
@@ -1016,6 +1110,25 @@ impl Partition<'_> {
                 self.domain_key("current_publication", &[space, publication], hash, 2);
             }
             _ => {}
+        }
+        Ok(())
+    }
+
+    fn count_reference(&mut self, space: &str, hash: &[u8], change: i64) -> Result<(), PortError> {
+        if self.full {
+            return Ok(());
+        }
+        let mut key = blake3::Hasher::new();
+        scalar(&mut key, b's', space.as_bytes());
+        scalar(&mut key, b'b', hash);
+        let key = *key.finalize().as_bytes();
+        let top = u16::from_be_bytes([key[0], key[1]]);
+        if self.bits == 0 || top >> (16 - self.bits) == self.prefix {
+            let delta = self.references.entry(key).or_default();
+            *delta = delta
+                .checked_add(change)
+                .ok_or_else(|| invalid(ValidationReason::InvalidState))?;
+            self.full = self.keys.len() + self.references.len() > MAX_KEYS_PER_PARTITION;
         }
         Ok(())
     }
@@ -1056,7 +1169,7 @@ impl Partition<'_> {
             0,
             *key.finalize().as_bytes(),
             if required { REQUIRED } else { PRESENT },
-        );
+        ) || self.keys.len() + self.references.len() > MAX_KEYS_PER_PARTITION;
     }
 
     fn finish_parts(&mut self) {
@@ -1113,24 +1226,12 @@ impl Partition<'_> {
             self.prefix,
             *hasher.finalize().as_bytes(),
             flag,
-        );
+        ) || self.keys.len() + self.references.len() > MAX_KEYS_PER_PARTITION;
     }
 
     pub(crate) fn control(&mut self, row: &TargetRecord) -> Result<(), PortError> {
         self.record(row.table().name(), |name, digest| {
-            Ok(match row.relational_value(name)? {
-                serde_json::Value::Null => false,
-                serde_json::Value::String(value) => scalar(digest, b't', value.as_bytes()),
-                serde_json::Value::Number(value) => scalar(
-                    digest,
-                    b'i',
-                    &value
-                        .as_i64()
-                        .ok_or_else(|| invalid(ValidationReason::InvalidArchive))?
-                        .to_be_bytes(),
-                ),
-                _ => return Err(invalid(ValidationReason::InvalidArchive)),
-            })
+            Ok(value_key(target_value(row.relational_value(name)?), digest))
         })
     }
 
@@ -1165,7 +1266,7 @@ impl Partition<'_> {
                     self.prefix,
                     *hasher.finalize().as_bytes(),
                     flag,
-                );
+                ) || self.keys.len() + self.references.len() > MAX_KEYS_PER_PARTITION;
             }
         }
         Ok(())
@@ -1195,6 +1296,19 @@ fn scalar(digest: &mut blake3::Hasher, kind: u8, bytes: &[u8]) -> bool {
     digest.update(&(bytes.len() as u64).to_be_bytes());
     digest.update(bytes);
     true
+}
+
+fn value_key(value: ValueRef<'_>, digest: &mut blake3::Hasher) -> bool {
+    match value {
+        ValueRef::Null => false,
+        ValueRef::Text(value) => scalar(digest, b't', value),
+        ValueRef::Blob(value) => scalar(digest, b'b', value),
+        ValueRef::Integer(value) => scalar(digest, b'i', &value.to_be_bytes()),
+        ValueRef::Real(value) => {
+            let value = if value == 0.0 { 0.0 } else { value };
+            scalar(digest, b'r', &value.to_bits().to_be_bytes())
+        }
+    }
 }
 
 fn canonical_scalar(value: &PostgresSpoolValue, digest: &mut blake3::Hasher) -> bool {
@@ -1234,5 +1348,47 @@ mod tests {
         )
         .unwrap();
         assert!(check_sqlite_canonical(&db, 6).is_err());
+    }
+
+    #[test]
+    fn quoted_identifier_keeps_its_significant_whitespace() {
+        assert_ne!(
+            normalize_ddl(r#"CREATE UNIQUE INDEX slug ON spaces("slug_fold ")"#),
+            normalize_ddl("CREATE UNIQUE INDEX slug ON spaces(slug_fold)"),
+        );
+    }
+
+    #[test]
+    fn control_preflight_checks_row_values_and_secondary_uniqueness() {
+        let provider = |id: &str, revision| TargetRecord::ProviderResources {
+            id: id.into(),
+            owner_id: notarium_core::ids::PrincipalId::from_bytes([3; 16]).to_string(),
+            name: "shared name".into(),
+            wire: "openai".into(),
+            base_url: "https://provider.example".into(),
+            headers: "{}".into(),
+            credential_id: None,
+            consent_epoch: 0,
+            runtime_epoch: 0,
+            default_model: None,
+            timeouts: "{}".into(),
+            rpm: None,
+            tpm: None,
+            disabled_at: None,
+            revision,
+        };
+        let mut checks = PgRowChecks::new(false).unwrap();
+        checks.check_control(&provider("one", 0), None).unwrap();
+        assert!(checks.check_control(&provider("one", -1), None).is_err());
+        let uniqueness = |keys: &mut Partition<'_>| {
+            checks.check_control(&provider("one", 0), Some(keys))?;
+            checks.check_control(&provider("two", 0), Some(keys))
+        };
+        assert!(
+            Relations::new(false)
+                .unwrap()
+                .verify(&Cancellation::default(), uniqueness)
+                .is_err()
+        );
     }
 }

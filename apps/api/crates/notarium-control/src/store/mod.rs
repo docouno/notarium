@@ -23,7 +23,9 @@ use sqlx::{
     sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteSynchronous},
 };
 use std::{path::PathBuf, sync::Arc, time::Duration};
-pub use target::{TARGET_SCHEMA_VERSION, TargetPage, TargetPosition, TargetRecord, TargetTable};
+pub use target::{
+    TARGET_SCHEMA_VERSION, TargetPage, TargetPosition, TargetRecord, TargetTable, TargetValue,
+};
 
 /// The trusted offline schema used to verify a control snapshot's catalog.
 pub const SQLITE_TARGET_DDL: &str = include_str!("../../migrations/sqlite/0001_control.sql");

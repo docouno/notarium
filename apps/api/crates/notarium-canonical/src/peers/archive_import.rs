@@ -122,6 +122,37 @@ impl ArchiveCommitAuthority {
     pub fn check(&self) -> Result<(), PortError> {
         self.0.lock().unwrap_or_else(|err| err.into_inner()).check()
     }
+
+    pub(crate) async fn check_before_commit(
+        &self,
+        tx: &mut BackendConn<'_>,
+        lease_until: i64,
+    ) -> Result<(), PortError> {
+        let now = archive_commit_clock(tx).await?;
+        self.check_expiry(now, lease_until)
+    }
+
+    pub(crate) fn check_expiry(&self, now: i64, lease_until: i64) -> Result<(), PortError> {
+        self.check()?;
+        if lease_until <= now {
+            return Err(invalid(ValidationReason::InvalidAuthority));
+        }
+        Ok(())
+    }
+}
+
+pub(crate) async fn archive_commit_clock(tx: &mut BackendConn<'_>) -> Result<i64, PortError> {
+    match tx {
+        BackendConn::Sqlite(_) => super::job_clock_ms(tx).await,
+        BackendConn::Postgres(conn) => sqlx::query_scalar(
+            "WITH settlement AS MATERIALIZED (SELECT pg_advisory_xact_lock_shared($1))
+                 SELECT floor(extract(epoch from clock_timestamp())*1000)::BIGINT FROM settlement",
+        )
+        .bind(notarium_core::ports::ARCHIVE_REVOCATION_FENCE)
+        .fetch_one(&mut **conn)
+        .await
+        .map_err(|err| internal_not_committed("archive_commit_fence", err.to_string())),
+    }
 }
 
 #[derive(Clone)]
@@ -129,6 +160,7 @@ pub(crate) struct ImportFolderCommit {
     pub(crate) fence: ImportFence,
     pub(crate) ordinal: u64,
     pub(crate) parent: ImportParent,
+    pub(crate) slug: String,
     pub(crate) auth: notarium_core::auth::EngineAuthContext,
     pub(crate) authority: ArchiveCommitAuthority,
 }
@@ -138,7 +170,7 @@ impl ImportFolderCommit {
         &self,
         tx: &mut BackendConn<'_>,
         space: &crate::SpaceRecord,
-    ) -> Result<(), PortError> {
+    ) -> Result<i64, PortError> {
         self.authority.check()?;
         validate_import_parent_tx(tx, &self.fence.scope, &space.root_folder_id, &self.parent)
             .await?;
@@ -152,6 +184,15 @@ impl ImportFolderCommit {
         )
         .await?;
         self.auth.authorize_direct_write(&facts, &facts)?;
+        check_portable_sibling_tx(
+            tx,
+            &self.fence.scope,
+            self.parent.folder(),
+            &self.slug,
+            &normalize_slug_key(&self.slug)?,
+            false,
+        )
+        .await?;
         self.fence.check_and_apply(tx, self.ordinal).await
     }
 }
@@ -184,7 +225,7 @@ impl ImportFence {
         &self,
         tx: &mut BackendConn<'_>,
         ordinal: u64,
-    ) -> Result<(), PortError> {
+    ) -> Result<i64, PortError> {
         let ordinal =
             i64::try_from(ordinal).map_err(|_| invalid(ValidationReason::InvalidRange))?;
         let mut tag = PLAN_TAG.to_vec();
@@ -197,41 +238,38 @@ impl ImportFence {
                       AND substr(result_msgpack,1,37)=$6 AND completed_units=$1-1
                       AND state='running' AND job_kind='import' AND payload_erased_by_purge=0
                       AND claim_space_epoch=(SELECT active_epoch FROM spaces WHERE space_id=$2)
-                      AND total_units >= $1 AND lease_until_ms>", $clock,
+                      AND total_units >= $1 AND lease_until_ms>", $clock, " RETURNING lease_until_ms",
                 )
             };
         }
         let rows = match tx {
             BackendConn::Sqlite(conn) => {
-                sqlx::query(advance!("CAST(unixepoch('subsec')*1000 AS INTEGER)"))
+                sqlx::query_scalar(advance!("CAST(unixepoch('subsec')*1000 AS INTEGER)"))
                     .bind(ordinal)
                     .bind(self.scope.space_id.as_str())
                     .bind(self.job.as_str())
                     .bind(&self.owner)
                     .bind(self.epoch.get() as i64)
                     .bind(&tag)
-                    .execute(&mut **conn)
+                    .fetch_optional(&mut **conn)
                     .await
-                    .map(|result| result.rows_affected())
             }
-            BackendConn::Postgres(conn) => sqlx::query(advance!(
-                "floor(extract(epoch from clock_timestamp())*1000)::BIGINT"
-            ))
-            .bind(ordinal)
-            .bind(self.scope.space_id.as_str())
-            .bind(self.job.as_str())
-            .bind(&self.owner)
-            .bind(self.epoch.get() as i64)
-            .bind(&tag)
-            .execute(&mut **conn)
-            .await
-            .map(|result| result.rows_affected()),
+            BackendConn::Postgres(conn) => {
+                sqlx::query_scalar(advance!(
+                    "floor(extract(epoch from clock_timestamp())*1000)::BIGINT"
+                ))
+                .bind(ordinal)
+                .bind(self.scope.space_id.as_str())
+                .bind(self.job.as_str())
+                .bind(&self.owner)
+                .bind(self.epoch.get() as i64)
+                .bind(&tag)
+                .fetch_optional(&mut **conn)
+                .await
+            }
         }
         .map_err(|err| internal_not_committed("import_progress", err.to_string()))?;
-        if rows == 0 {
-            return Err(invalid(ValidationReason::InvalidAuthority));
-        }
-        Ok(())
+        rows.ok_or_else(|| invalid(ValidationReason::InvalidAuthority))
     }
 }
 
@@ -258,7 +296,7 @@ impl CanonicalStore {
                     .await?
                     .scope
                     .check(&scope)?;
-                let (job, _, erased) = require_active_job_lease_tx(
+                let (job, _, erased, _) = require_active_job_lease_tx(
                     tx,
                     &scope,
                     &claim.job.id,
@@ -307,6 +345,7 @@ impl CanonicalStore {
                     claim.job.lease,
                 )
                 .await
+                .map(|(progress, _)| progress)
             })
         })
         .await
@@ -350,7 +389,7 @@ impl CanonicalStore {
                     lock_and_check_space_tx(tx, &scope, space.active_epoch).await?;
                     let live = load_space_record(tx, &scope.space_id).await?;
                     auth.authorize_space_write(&live.space)?;
-                    let progress = check_import_tx(
+                    let (progress, expires) = check_import_tx(
                         tx,
                         &scope,
                         &claimant.job.id,
@@ -407,6 +446,7 @@ impl CanonicalStore {
                     .map_err(|err| {
                         internal_not_committed("install_import_plan", err.to_string())
                     })?;
+                    authority.check_before_commit(tx, expires).await?;
                     Ok(ImportProgress {
                         plan: Some(plan),
                         applied: 0,
@@ -434,6 +474,7 @@ impl CanonicalStore {
             fence: ImportFence::new(&scope, claim, plan),
             ordinal: folder.ordinal,
             parent: folder.parent,
+            slug: folder.slug.clone(),
             auth: ctx.auth().clone(),
             authority,
         };
@@ -452,7 +493,7 @@ impl CanonicalStore {
                         Box::pin(async move {
                             lock_and_check_space_tx(tx, &scope, space.active_epoch).await?;
                             let live = load_space_record(tx, &scope.space_id).await?;
-                            guard.check_tx(tx, &live).await?;
+                            let expires = guard.check_tx(tx, &live).await?;
                             let actual =
                                 folder_at_tx(tx, &scope, guard.parent.folder(), &slug_fold).await?;
                             if actual.as_ref() != Some(&folder.id) {
@@ -462,6 +503,7 @@ impl CanonicalStore {
                                     &folder.slug,
                                 ));
                             }
+                            guard.authority.check_before_commit(tx, expires).await?;
                             Ok(())
                         })
                     },
@@ -517,6 +559,15 @@ impl CanonicalStore {
                 )
                 .await?;
                 auth.authorize_direct_write(&facts, &facts)?;
+                check_portable_sibling_tx(
+                    tx,
+                    &scope,
+                    parent.folder(),
+                    &slug,
+                    &fold,
+                    class.is_some(),
+                )
+                .await?;
                 if class.is_some() {
                     if active_note_sibling_exists_tx(
                         tx,
@@ -540,7 +591,7 @@ impl CanonicalStore {
 
     /// Upper bound on a physical writer group.
     pub fn import_write_group_limit(&self) -> usize {
-        IMPORT_BATCH_LIMIT.min(self.inner.config.writer.max_batch_items)
+        IMPORT_BATCH_LIMIT.min(self.inner.config.writer.max_batch_items.max(1))
     }
 
     /// Each item and its increasing plan ordinal commit in the same writer
@@ -596,13 +647,14 @@ impl CanonicalStore {
                     self.stage_blob_for_batch(&space.scope, space.active_epoch, &info.prepared_blob)
                 })
                 .await?;
+            let slug = note.slug.clone();
             let mut intent = build_create_note_intent(
                 &space.scope,
                 space.active_epoch,
                 None,
                 ctx.auth().clone(),
                 note,
-                slug_fold,
+                slug_fold.clone(),
                 info,
                 ticket,
             );
@@ -612,10 +664,19 @@ impl CanonicalStore {
             intent.execute = Box::new(move |tx, item| {
                 Box::pin(async move {
                     authority.check()?;
-                    item.retain_until_batch_commit(authority);
                     validate_import_parent_tx(tx, &fence.scope, &item.root_folder_id, &parent)
                         .await?;
-                    fence.check_and_apply(tx, ordinal).await?;
+                    check_portable_sibling_tx(
+                        tx,
+                        &fence.scope,
+                        parent.folder(),
+                        &slug,
+                        &slug_fold,
+                        true,
+                    )
+                    .await?;
+                    let expires = fence.check_and_apply(tx, ordinal).await?;
+                    item.guard_archive_commit(authority, expires);
                     execute(tx, item).await
                 })
             });
@@ -663,8 +724,9 @@ async fn check_import_tx(
     job_id: &JobId,
     owner: &str,
     epoch: LeaseEpoch,
-) -> Result<ImportProgress, PortError> {
-    let (job, _, erased) = require_active_job_lease_tx(tx, scope, job_id, owner, epoch).await?;
+) -> Result<(ImportProgress, i64), PortError> {
+    let (job, _, erased, expires) =
+        require_active_job_lease_tx(tx, scope, job_id, owner, epoch).await?;
     if erased || !matches!(job.kind, ContentJobKind::Import { .. }) {
         return Err(invalid(ValidationReason::InvalidAuthority));
     }
@@ -701,10 +763,13 @@ async fn check_import_tx(
             Ok(plan)
         })
         .transpose()?;
-    Ok(ImportProgress {
-        plan,
-        applied: job.completed_units,
-    })
+    Ok((
+        ImportProgress {
+            plan,
+            applied: job.completed_units,
+        },
+        expires,
+    ))
 }
 
 pub(crate) async fn validate_import_parent_tx(
@@ -766,6 +831,29 @@ fn path_conflict(scope: &HistoryScope, parent: &FolderId, slug: &str) -> PortErr
         },
     }
     .into()
+}
+
+async fn check_portable_sibling_tx(
+    tx: &mut BackendConn<'_>,
+    scope: &HistoryScope,
+    parent: &FolderId,
+    slug: &str,
+    fold: &str,
+    note: bool,
+) -> Result<(), PortError> {
+    let conflict = if note {
+        folder_at_tx(tx, scope, parent, &format!("{fold}.md"))
+            .await?
+            .is_some()
+    } else if let Some(note_fold) = fold.strip_suffix(".md") {
+        active_note_sibling_exists_tx(tx, &scope.space_id, parent, note_fold, None).await?
+    } else {
+        false
+    };
+    if conflict {
+        return Err(path_conflict(scope, parent, slug));
+    }
+    Ok(())
 }
 
 fn invalid(reason: ValidationReason) -> PortError {

@@ -1627,6 +1627,25 @@ async fn execute_sql_erasure_for_old_note_tx(
         }
     }
 
+    // A trashed schema note can still own the current descriptor. Remove its
+    // descriptors along with the immutable revisions that supplied them.
+    let delete_schema = "DELETE FROM space_field_schemas WHERE space_id=$1 AND schema_note_id=$2";
+    match tx {
+        BackendConn::Sqlite(conn) => sqlx::query(delete_schema)
+            .bind(scope.space_id.as_str())
+            .bind(old_id_str)
+            .execute(&mut **conn)
+            .await
+            .map(|_| ()),
+        BackendConn::Postgres(conn) => sqlx::query(delete_schema)
+            .bind(scope.space_id.as_str())
+            .bind(old_id_str)
+            .execute(&mut **conn)
+            .await
+            .map(|_| ()),
+    }
+    .map_err(|err| internal_not_committed("purge_owned_schema", err.to_string()))?;
+
     // 5. Tombstone `note_heads` row (`content_blake3 = NULL, byte_size = 0, lifecycle_state = 'purged'`, zero plaintext!).
     let purged_slug = format!("purged-{old_id_str}");
     match tx {

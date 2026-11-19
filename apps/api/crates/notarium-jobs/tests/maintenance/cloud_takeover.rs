@@ -3,6 +3,7 @@ use std::{
     sync::Arc,
 };
 
+use notarium_canonical::writer::ArchiveAckGate;
 use notarium_control::{
     service::{AuthenticationMode, ControlConfig, ControlService, SystemClock},
     store::PostgresConfig,
@@ -88,6 +89,7 @@ struct Worker {
     owner: PrincipalId,
     space: SpaceId,
     epoch: u64,
+    pause_ack: bool,
 }
 
 struct WorkerProcess(Child);
@@ -154,9 +156,18 @@ async fn worker_child() {
     )
     .await
     .unwrap();
+    if config.pause_ack {
+        let gate = Arc::new(ArchiveAckGate::new(200));
+        *canonical.writer_faults().unwrap().archive_ack.lock().await = Some(gate.clone());
+        let witness = root.root().join("durable-before-ack");
+        tokio::spawn(async move {
+            gate.wait_until_durable().await;
+            fs::write(witness, b"durable").unwrap();
+        });
+    }
     Arc::new(ArchiveJobs::new(canonical, control, storage, ImportLimits::default()).unwrap())
         .runner(JobWorkerConfig {
-            exports: 0,
+            exports: usize::from(!config.pause_ack),
             idle_poll: Duration::from_millis(25),
             ..Default::default()
         })
@@ -218,8 +229,17 @@ pub(super) async fn exercise(
     )
     .await
     .unwrap();
-    let jobs =
-        ArchiveJobs::new(canonical.clone(), control, staged, ImportLimits::default()).unwrap();
+    let jobs = Arc::new(
+        ArchiveJobs::new(
+            canonical.clone(),
+            control.clone(),
+            staged,
+            ImportLimits::default(),
+        )
+        .unwrap(),
+    );
+    let exported_note = NoteId::from_bytes(codec::ordered_id_16().unwrap());
+    let export_bytes = "# Opened from a separate node\n";
     let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
     for index in 0..entries {
         zip.start_file(
@@ -256,26 +276,112 @@ pub(super) async fn exercise(
         .await
         .unwrap()
         .value;
+    canonical
+        .create_note(
+            ctx.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: scope.clone(),
+                    actor: owner.clone(),
+                    key: CommandKey::from_bytes(codec::ordered_id_16().unwrap()),
+                    hash: ContentDigest::from_bytes([0; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: CreateNote {
+                    note: exported_note.clone(),
+                    parent: None,
+                    slug: "cross-node".into(),
+                    class: DocClass::UserDoc,
+                    carrier: export_bytes.into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let export_job = jobs
+        .enqueue(
+            ctx.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: scope.clone(),
+                    actor: owner.clone(),
+                    key: CommandKey::from_bytes(codec::ordered_id_16().unwrap()),
+                    hash: ContentDigest::from_bytes([0; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: ContentJobKind::Export {
+                    notes: vec![exported_note],
+                    encrypted: false,
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
 
     let mut backstop =
         PgConnection::connect_with(&notarium_canonical::build_pg_connect_options(source))
             .await
             .unwrap();
-    sqlx::query("SELECT pg_advisory_lock(6292502014)")
-        .execute(&mut backstop)
+    let event = RequestId::from_bytes(codec::ordered_id_16().unwrap());
+    let selector = serde_json::json!({
+        "version": 1,
+        "selector": RevocationSelector::Principal(owner.clone()),
+    });
+    sqlx::query(
+        "INSERT INTO v1_control.revocation_events
+            (event_id,selector,reason,authority_version,committed_at,attempts)
+         VALUES($1,$2,'permission_changed',1,1,0)",
+    )
+    .bind(event.as_str())
+    .bind(selector.to_string())
+    .execute(&mut backstop)
+    .await
+    .unwrap();
+    let mut effect = backstop.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock_shared($1)")
+        .bind(ARCHIVE_REVOCATION_FENCE)
+        .execute(&mut *effect)
         .await
         .unwrap();
-    sqlx::raw_sql(
-        "CREATE FUNCTION v1_canonical.fixture_stop_archive_at_201() RETURNS trigger LANGUAGE plpgsql AS $$
-         BEGIN
-         IF NEW.completed_units>201 AND NEW.job_kind='import' THEN
-             PERFORM pg_advisory_xact_lock(6292502014);
-         END IF;
-         RETURN NEW;
-         END $$;
-         CREATE TRIGGER fixture_stop_archive_at_201 BEFORE UPDATE OF completed_units
-         ON v1_canonical.content_jobs FOR EACH ROW EXECUTE FUNCTION v1_canonical.fixture_stop_archive_at_201();",
-    ).execute(&mut backstop).await.unwrap();
+    let mut delivery = tokio::spawn(async move {
+        control
+            .drain_revocations(authority(ServicePurpose::Revocation), 1)
+            .await
+    });
+    let mut observer =
+        PgConnection::connect_with(&notarium_canonical::build_pg_connect_options(source))
+            .await
+            .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let waiting: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM pg_locks
+                   WHERE locktype='advisory' AND NOT granted
+                     AND classid=$1::bigint::oid AND objid=$2::bigint::oid)",
+            )
+            .bind(ARCHIVE_REVOCATION_FENCE >> 32)
+            .bind(ARCHIVE_REVOCATION_FENCE & 0xffff_ffff)
+            .fetch_one(&mut observer)
+            .await
+            .unwrap();
+            if waiting {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("revocation waits for the database effect to settle");
+    assert!(!delivery.is_finished());
+    effect.commit().await.unwrap();
+    let settled = tokio::time::timeout(Duration::from_secs(5), &mut delivery)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(settled.delivered, 1);
+    observer.close().await.unwrap();
     let first = Worker {
         root: root.join("archive-worker-a"),
         database: source.database.clone(),
@@ -284,13 +390,22 @@ pub(super) async fn exercise(
         owner,
         space: space.clone(),
         epoch: 2,
+        pause_ack: true,
     };
     let mut a = WorkerProcess::start(&first);
     let first_job = wait_for(&mut backstop, &space, &job.id, 201, false).await;
     assert_eq!(first_job, ("running".into(), 201));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !first.root.join("durable-before-ack").exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the first process paused before the commit reply");
     let read_notes = async |db: &mut PgConnection| -> Vec<(String, String)> {
         sqlx::query_as(
-            "SELECT slug,note_id FROM v1_canonical.note_heads WHERE space_id=$1 ORDER BY slug",
+            "SELECT slug,note_id FROM v1_canonical.note_heads
+             WHERE space_id=$1 AND slug LIKE 'entry-%' ORDER BY slug",
         )
         .bind(space.as_str())
         .fetch_all(db)
@@ -301,48 +416,10 @@ pub(super) async fn exercise(
     assert_eq!(committed.len(), 200);
     a.kill();
     fs::remove_dir_all(&first.root).unwrap();
-    // A server may still be inside the statement when its client dies.
-    // Roll that transaction back before making the test barrier available.
-    sqlx::query(
-        "SELECT pg_cancel_backend(pid) FROM pg_stat_activity
-         WHERE datname=current_database() AND wait_event='advisory'
-            AND query LIKE '%UPDATE content_jobs SET completed_units%'",
-    )
-    .execute(&mut backstop)
-    .await
-    .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let waiting: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM pg_stat_activity
-                   WHERE datname=current_database() AND wait_event='advisory'
-                     AND query LIKE '%UPDATE content_jobs SET completed_units%')",
-            )
-            .fetch_one(&mut backstop)
-            .await
-            .unwrap();
-            if !waiting {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .unwrap();
-    sqlx::query("SELECT pg_advisory_unlock(6292502014)")
-        .execute(&mut backstop)
-        .await
-        .unwrap();
-    sqlx::raw_sql(
-        "DROP TRIGGER fixture_stop_archive_at_201 ON v1_canonical.content_jobs;
-         DROP FUNCTION v1_canonical.fixture_stop_archive_at_201();",
-    )
-    .execute(&mut backstop)
-    .await
-    .unwrap();
     let second = Worker {
         root: root.join("archive-worker-b"),
         epoch: 3,
+        pause_ack: false,
         ..first
     };
     assert!(!second.root.exists());
@@ -354,7 +431,46 @@ pub(super) async fn exercise(
     let all = read_notes(&mut backstop).await;
     assert_eq!(all.len(), entries);
     assert_eq!(&all[..200], committed.as_slice());
+    for index in [0, 199, entries - 1] {
+        let digest: Vec<u8> = sqlx::query_scalar(
+            "SELECT content_blake3 FROM v1_canonical.note_heads WHERE space_id=$1 AND note_id=$2",
+        )
+        .bind(space.as_str())
+        .bind(&all[index].1)
+        .fetch_one(&mut backstop)
+        .await
+        .unwrap();
+        let digest = ContentDigest::from_bytes(digest.try_into().unwrap());
+        let carrier = canonical.read_verified_blob(&scope, digest).await.unwrap();
+        let target = &all[(index + 1) % entries].1;
+        assert!(
+            std::str::from_utf8(&carrier)
+                .unwrap()
+                .contains(&format!("[[{target}]]"))
+        );
+    }
+    assert_eq!(
+        wait_for(&mut backstop, &space, &export_job.id, 1, true)
+            .await
+            .0,
+        "succeeded",
+    );
+    let export = canonical.get_job(ctx.clone(), export_job.id).await.unwrap();
     b.kill();
+    fs::remove_dir_all(&second.root).unwrap();
+    let output = jobs
+        .open_export(ctx.clone(), &export.artifacts[0])
+        .await
+        .unwrap();
+    let bytes = output.read_chunk(budget(), 0, 64 * 1024).await.unwrap();
+    assert_eq!(bytes.len() as u64, output.metadata().bytes);
+    let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+    let mut read = String::new();
+    zip.by_name("cross-node.md")
+        .unwrap()
+        .read_to_string(&mut read)
+        .unwrap();
+    assert_eq!(read, export_bytes);
     backstop.close().await.unwrap();
     eprintln!(
         "Cloud takeover retained {} committed note IDs through loss of worker storage and finished {entries} linked notes",

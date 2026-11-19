@@ -9,7 +9,7 @@ use notarium_core::{
 };
 
 use super::archive_import::{ArchiveObject, ArchiveObjectKind};
-use super::{job_clock_ms, lock_peer_space, require_active_job_lease_tx};
+use super::{ArchiveCleanupCursor, job_clock_ms, lock_peer_space, require_active_job_lease_tx};
 use crate::{
     CanonicalStore, ClaimedContentJob,
     codec::{MAX_MSGPACK_DECODE_BYTES, encode_msgpack, internal_not_committed},
@@ -129,7 +129,7 @@ impl CanonicalStore {
             Box::pin(async move {
                 let space = lock_peer_space(tx, &inner, &scope).await?;
                 super::authorize_job_write_on_space(&auth, &space.space)?;
-                let (job, now, erased) = require_active_job_lease_tx(tx, &scope, &claim.job.id, &claim.lease_owner, claim.job.lease).await?;
+                let (job, now, erased, _) = require_active_job_lease_tx(tx, &scope, &claim.job.id, &claim.lease_owner, claim.job.lease).await?;
                 let compatible = matches!((&job.kind, kind), (ContentJobKind::Import { .. }, "plan")
                     | (ContentJobKind::Export { .. } | ContentJobKind::ExportSpace { .. }, "export"));
                 if erased || !compatible { return Err(invalid(ValidationReason::InvalidAuthority)); }
@@ -151,8 +151,10 @@ impl CanonicalStore {
         &self,
         budget: &CallBudget,
         namespace: ContentDigest,
-    ) -> Result<Vec<AbandonedArchiveUpload>, PortError> {
+        after: Option<&ArchiveCleanupCursor>,
+    ) -> Result<Vec<(ArchiveCleanupCursor, AbandonedArchiveUpload)>, PortError> {
         let deadline = CommandDeadline::start(budget, "claim_archive_storage_cleanup");
+        let ArchiveCleanupCursor(created, space, artifact) = ArchiveCleanupCursor::after(after);
         self.with_auxiliary_command(Some((budget, deadline)), Ok, move |tx| {
             Box::pin(async move {
                 let now = job_clock_ms(tx).await?;
@@ -160,7 +162,8 @@ impl CanonicalStore {
                     WHERE (space_id,artifact_id) IN (SELECT a.space_id,a.artifact_id FROM archive_uploads a
                        LEFT JOIN content_jobs j ON j.space_id=a.space_id AND j.job_id=a.job_id
                        JOIN spaces s ON s.space_id=a.space_id
-                       WHERE a.object_namespace=$2 AND (a.state='retiring' OR a.history_incarnation<>s.history_incarnation
+                       WHERE a.object_namespace=$2 AND (a.created_at_ms,a.space_id,a.artifact_id)>($3,$4,$5)
+                       AND (a.state='retiring' OR a.history_incarnation<>s.history_incarnation
                            OR (a.source_deadline_ms<=$1 AND NOT EXISTS(SELECT 1 FROM archive_import_sources r
                                JOIN content_jobs u ON u.space_id=r.space_id AND u.job_id=r.job_id
                                WHERE r.space_id=a.space_id AND r.artifact_id=a.artifact_id AND u.state IN ('queued','running')))
@@ -176,13 +179,19 @@ impl CanonicalStore {
                          (j.state IN ('failed','succeeded','cancelled') OR retiring.history_incarnation<>s.history_incarnation
                           OR (retiring.state='pending' AND (j.state<>'running' OR j.lease_epoch<>retiring.lease_epoch OR j.lease_until_ms<=$1
                             OR j.claim_space_epoch IS DISTINCT FROM s.active_epoch)))))
-                    RETURNING space_id,history_incarnation,artifact_id,object_kind,object_bytes,object_namespace";
-                type Row = (String, Vec<u8>, String, String, i64, Vec<u8>);
+                    RETURNING space_id,history_incarnation,artifact_id,object_kind,object_bytes,created_at_ms";
+                type Row = (String, Vec<u8>, String, String, i64, i64);
+                macro_rules! take {
+                    ($conn:expr) => {
+                        sqlx::query_as(TAKE).bind(now).bind(namespace.as_bytes().as_slice())
+                            .bind(created).bind(&space).bind(&artifact).fetch_all(&mut **$conn).await
+                    };
+                }
                 let rows: Vec<Row> = match tx {
-                    BackendConn::Sqlite(conn) => sqlx::query_as(TAKE).bind(now).bind(namespace.as_bytes().as_slice()).fetch_all(&mut **conn).await,
-                    BackendConn::Postgres(conn) => sqlx::query_as(TAKE).bind(now).bind(namespace.as_bytes().as_slice()).fetch_all(&mut **conn).await,
+                    BackendConn::Sqlite(conn) => take!(conn),
+                    BackendConn::Postgres(conn) => take!(conn),
                 }.map_err(sql_error)?;
-                rows.into_iter().map(|(space, history, id, kind, bytes, namespace)| {
+                rows.into_iter().map(|(space, history, id, kind, bytes, created)| {
                     let scope = notarium_core::model::HistoryScope {
                         space_id: notarium_core::ids::SpaceId::parse(&space)?,
                         incarnation: HistoryIncarnation::from_bytes(history.try_into().map_err(|_| invalid(ValidationReason::InvalidState))?),
@@ -195,8 +204,9 @@ impl CanonicalStore {
                     };
                     let bytes = u64::try_from(bytes).map_err(|_| invalid(ValidationReason::InvalidState))?;
                     if !(1..=MAX_BYTES).contains(&bytes) { return Err(invalid(ValidationReason::InvalidLimit)); }
-                    let namespace = ContentDigest::from_bytes(namespace.try_into().map_err(|_| invalid(ValidationReason::InvalidDigest))?);
-                    Ok(AbandonedArchiveUpload { scope, id: ArtifactId::parse(&id)?, kind, bytes, namespace })
+                    let parsed = ArtifactId::parse(&id)?;
+                    Ok((ArchiveCleanupCursor(created, space, id),
+                        AbandonedArchiveUpload { scope, id: parsed, kind, bytes, namespace }))
                 }).collect()
             })
         }).await

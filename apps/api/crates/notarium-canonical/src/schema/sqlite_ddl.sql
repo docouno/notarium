@@ -743,12 +743,13 @@ CREATE TABLE IF NOT EXISTS archive_artifacts (
     privacy_generation INTEGER NOT NULL CHECK (privacy_generation >= 0),
     expires_at_ms INTEGER NOT NULL,
     object_msgpack BLOB NOT NULL,
+    object_namespace BLOB NOT NULL CHECK (length(object_namespace) = 32),
     PRIMARY KEY (space_id, artifact_id),
     FOREIGN KEY (space_id, job_id) REFERENCES content_jobs (space_id, job_id)
 ) WITHOUT ROWID;
 
 CREATE INDEX IF NOT EXISTS idx_archive_artifacts_expiry
-    ON archive_artifacts (expires_at_ms, space_id, artifact_id);
+    ON archive_artifacts (object_namespace, expires_at_ms, space_id, artifact_id);
 
 CREATE TABLE IF NOT EXISTS archive_import_sources (
     space_id TEXT NOT NULL,
@@ -785,7 +786,7 @@ CREATE TABLE IF NOT EXISTS archive_uploads (
 );
 
 CREATE INDEX IF NOT EXISTS idx_archive_uploads_created
-    ON archive_uploads (created_at_ms, space_id, artifact_id);
+    ON archive_uploads (object_namespace, created_at_ms, space_id, artifact_id);
 
 CREATE TABLE IF NOT EXISTS materialized_observations (
     space_id TEXT NOT NULL,

@@ -278,7 +278,12 @@ async fn exercise_local_archive_worker(entries: usize) {
         .unwrap()
         .scope;
     let auth = control_service
-        .trusted_none(PerimeterAttestation::attest_checked(), budget())
+        .trusted_none(
+            PerimeterAttestation::attest_checked()
+                .with_human_management()
+                .with_ability_write(),
+            budget(),
+        )
         .await
         .unwrap();
     let ctx = SpaceContext::new(auth, scope.clone(), budget()).unwrap();
@@ -416,6 +421,11 @@ async fn exercise_local_archive_worker(entries: usize) {
     }
     assert_eq!(note_count(root, &scope), entries as i64);
 
+    let archive_chat = if entries == 10_000 {
+        Some(seed_archive_sections(&store, &ctx).await)
+    } else {
+        None
+    };
     let started = std::time::Instant::now();
     let artifact = jobs
         .enqueue(
@@ -455,12 +465,53 @@ async fn exercise_local_archive_worker(entries: usize) {
         .unwrap();
     assert!(carrier.contains("[["));
     assert!(!carrier.contains("[[entry-00001]]"));
-    assert_eq!(archive.len(), entries);
+    if let Some((thread, retained_body)) = archive_chat {
+        let read_entry = |archive: &mut zip::ZipArchive<Cursor<Vec<u8>>>, name| {
+            let mut result = String::new();
+            archive
+                .by_name(name)
+                .unwrap()
+                .read_to_string(&mut result)
+                .unwrap();
+            result
+        };
+        assert_eq!(
+            read_entry(&mut archive, ".notarium/fields/schema.yaml"),
+            "# Archived field schema\n",
+        );
+        assert_eq!(
+            read_entry(
+                &mut archive,
+                ".notarium/abilities/archive-skill/scripts/helper.txt"
+            ),
+            "packaged resource\n",
+        );
+        let chat = read_entry(&mut archive, &format!("chats/{thread}.jsonl"));
+        let rows = chat
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(rows[1]["body"], retained_body);
+        assert_eq!(rows[2]["parent_seq"], rows[1]["entry_seq"]);
+        assert_eq!(rows[2]["kind"], "redacted");
+        assert_eq!(rows[2]["body"], serde_json::Value::Null);
+        assert_eq!(rows[3]["parent_seq"], rows[1]["entry_seq"]);
+        assert_eq!(rows[3]["body"], "alternate branch");
+        assert_eq!(
+            archive
+                .file_names()
+                .filter(|name| name.as_ref().unwrap().starts_with("documents/entry-"))
+                .count(),
+            entries
+        );
+    } else {
+        assert_eq!(archive.len(), entries);
+    }
 
     let db = rusqlite::Connection::open(root.canonical()).unwrap();
     let note = db
         .query_row(
-            "SELECT note_id FROM note_heads WHERE space_id=?1 LIMIT 1",
+            "SELECT note_id FROM note_heads WHERE space_id=?1 AND slug LIKE 'entry-%' LIMIT 1",
             [scope.space_id.as_str()],
             |row| row.get::<_, String>(0),
         )
@@ -596,7 +647,13 @@ async fn probe_slow_cut(
     let capture = began.elapsed();
     let snapshot = cut.snapshot_elapsed;
     assert!(snapshot < Duration::from_millis(50));
-    assert_eq!(cut.entries.len(), 10_000);
+    assert_eq!(
+        cut.entries
+            .iter()
+            .filter(|entry| entry.path.starts_with("documents/entry-"))
+            .count(),
+        9_999,
+    );
     assert!(cut.entries.iter().any(|entry| {
         entry.path == "slow-sink.md"
             && matches!(entry.data, ExportData::Blob(hash) if hash == digest)
@@ -664,4 +721,188 @@ async fn probe_slow_cut(
     eprintln!(
         "10k export capture complete {capture:?}, SQL {snapshot:?}, WAL passive {passive:?}, restart {restart:?}"
     );
+}
+
+async fn seed_archive_sections(
+    store: &CanonicalStore,
+    ctx: &SpaceContext,
+) -> (ChatThreadId, String) {
+    use notarium_canonical::{CreateFolderSpec, UpdateSpaceSchema};
+    use notarium_core::classes::{AbilityKind, DocClass};
+
+    let owner = ctx.auth().principal().clone();
+    let space = &ctx.scope().space_id;
+    let project = FolderId::from_bytes(codec::ordered_id_16().unwrap());
+    let entrypoint = NoteId::from_bytes(codec::ordered_id_16().unwrap());
+    store
+        .update_space_schema(
+            ctx.clone(),
+            mutation(
+                ctx,
+                UpdateSpaceSchema {
+                    schema_note: NoteId::from_bytes(codec::ordered_id_16().unwrap()),
+                    parent: None,
+                    slug: "export-schema".into(),
+                    carrier: "# Archived field schema\n".into(),
+                    schema: Default::default(),
+                    expected_schema_revision: None,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    store
+        .create_folder(CreateFolderSpec {
+            scope: ctx.scope().clone(),
+            active_epoch: store.read_space(space).await.unwrap().active_epoch,
+            folder_id: project.clone(),
+            parent: None,
+            slug: "archive-project".into(),
+            display_name: "Archive project".into(),
+            is_project: true,
+            project_slug: Some("archive-project".into()),
+            actor: owner.clone(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+    store
+        .create_note(
+            ctx.clone(),
+            mutation(
+                ctx,
+                CreateNote {
+                    note: entrypoint.clone(),
+                    parent: Some(project),
+                    class: DocClass::Skill,
+                    slug: "archive-skill".into(),
+                    carrier: "---\nclass: skill\n---\n# Archive skill\n".into(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let resource = "packaged resource\n";
+    store
+        .publish_ability_package(
+            ctx.clone(),
+            mutation(
+                ctx,
+                PublishAbilityPackage {
+                    ability: AbilityId::from_bytes(codec::ordered_id_16().unwrap()),
+                    kind: AbilityKind::Skill,
+                    entrypoint,
+                    files: vec![AbilityFile {
+                        path: "scripts/helper.txt".into(),
+                        content: resource.into(),
+                        digest: notarium_syntax::content_digest(resource),
+                    }],
+                    expected_package_revision: None,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+
+    let thread = ChatThreadId::from_bytes(codec::ordered_id_16().unwrap());
+    store
+        .create_chat(
+            ctx.clone(),
+            mutation(
+                ctx,
+                CreateChat {
+                    thread: thread.clone(),
+                    kind: ChatThreadKind::Personal,
+                    owner,
+                    project_folder: None,
+                    title: "Exported conversation".into(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let retained = "A staged chat body with a quote \" and a newline.\n".repeat(20);
+    let staged = store.stage_chat_blob(ctx.clone(), &retained).await.unwrap();
+    let append = |parent, body| {
+        mutation(
+            ctx,
+            AppendChat {
+                thread: thread.clone(),
+                parent,
+                kind: ChatEntryKind::Human,
+                body,
+                referenced_notes: Vec::new(),
+                tainted: false,
+            },
+        )
+    };
+    let parent = store
+        .append_chat(
+            ctx.clone(),
+            append(ThreadEntrySeq::ZERO, ChatInputBody::Staged(staged)),
+        )
+        .await
+        .unwrap()
+        .value
+        .seq;
+    let removed = store
+        .append_chat(
+            ctx.clone(),
+            append(parent, ChatInputBody::Text("removed body".into())),
+        )
+        .await
+        .unwrap()
+        .value
+        .seq;
+    store
+        .fork_chat(
+            ctx.clone(),
+            mutation(
+                ctx,
+                ForkChat {
+                    thread: thread.clone(),
+                    parent,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let alternate = store
+        .append_chat(
+            ctx.clone(),
+            append(parent, ChatInputBody::Text("alternate branch".into())),
+        )
+        .await
+        .unwrap()
+        .value
+        .seq;
+    let head = store
+        .read_chat(
+            ctx.clone(),
+            ChatRead {
+                thread: thread.clone(),
+                leaf: alternate,
+                before: None,
+                max_entries: PageLimit::new(1).unwrap(),
+            },
+        )
+        .await
+        .unwrap()
+        .thread
+        .revision;
+    store
+        .redact_chat_entry(
+            ctx.clone(),
+            mutation(
+                ctx,
+                RedactChatEntry {
+                    thread: thread.clone(),
+                    entry: removed,
+                    expected_thread_revision: head,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    (thread, retained)
 }

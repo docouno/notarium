@@ -14,7 +14,10 @@ credential and Space grant at claim and during execution. The default runner
 admits one import and one export on its own runtime with a bounded blocking pool.
 The canonical writer fences job progress and terminal results by lease owner,
 both the job and Space epochs, and lease expiry. It retains the authority
-registration until an admitted write commits or rolls back. Shut down the
+registration until an admitted write commits or rolls back. In Cloud, the
+control and canonical schemas must share the same primary PostgreSQL database.
+Their transaction lock keeps revocation delivery ordered with archive writes
+even when a worker loses its commit response. Shut down the
 runner by cancelling its token and awaiting it.
 
 Import validates ZIP layout, portable paths, size and compression limits, and
@@ -34,7 +37,9 @@ metadata before reading CAS. Explicit selections use the selected notes'
 paths.
 Larger whole-Space exports register a cut and read keyset pages. The writer
 preserves a row's first pre-image while the cut is active. Large chat threads
-can be read a page at a time while the archive is written.
+can be read a page at a time while the archive is written. Trashing the current
+schema carrier preserves the installed schema. Purging the carrier clears its
+descriptor and invalidates exports that captured it.
 An encrypted note requires explicit ciphertext opt-in. Exports use an owned CAS
 hold and bounded buffers. A privacy mutation invalidates the export generation
 while paired installation backups protect their captured cut. The final ZIP
@@ -53,14 +58,16 @@ expires seven days after publication. The maintenance loop retires its sealed
 storage generation and then removes the pointer.
 
 Local content job inputs, plans and outputs use the installation's private
-`staging/archives/` area. Cloud uses private, create-only object generations
+`staging/archives/` area. On Unix, opening an existing archive directory
+requires owner-only permissions. Cloud uses private, create-only object generations
 and saves exact S3 version IDs when versioning is enabled. Configure an archive
 bucket or prefix disjoint from content CAS. Each Cloud worker uses its own
 local scratch directory. No client supplies bucket names or object keys.
 
 ## CAS maintenance
 
-The runner scans zero-reference catalog entries in indexed pages. The first
+The runner scans zero-reference catalog entries in indexed pages, including
+outstanding work in archived Spaces. The first
 pass stamps the current publication's quarantine age. The second can schedule
 retirement after 24 hours and 5 minutes. The canonical transaction checks the
 publication identity, active writer epoch, staged tickets, references and holds
@@ -73,10 +80,14 @@ workers own the physical operation and recover durable work after interruption.
   paused. It resumes writes before materializing the database spools and CAS
   bytes. The ZIP64 archive contains `manifest.json`, `db/control`, `db/canonical`,
   `cas/index` and `cas/data`. Keep the external keyring separately. The archive
-  contains encrypted canary witnesses and credential envelopes.
+  contains encrypted canary witnesses and credential envelopes. Before publishing,
+  backup checks that retained CAS counts match actual owners and that the decoded
+  CAS fits the verifier's total size budget. PostgreSQL archive index keys are
+  limited to 2 KiB of uncompressed fields.
 - `run_fsck` accepts a live installation or an owned, immutable `Read + Seek +
   Send` archive source. A remote adapter must pin the object version before
-  opening the source. Archive verification checks ZIP metadata and digests,
+  opening the source. Use `ArchiveInput::with_length` when the pinned version
+  already supplies the exact byte count. Archive verification checks ZIP metadata and digests,
   database structure and references, decoded CAS bytes, and external keyring
   readability. SQLite verification reads the stored database slices through a
   read-only range VFS in a separate process. The default worker caps SQLite's

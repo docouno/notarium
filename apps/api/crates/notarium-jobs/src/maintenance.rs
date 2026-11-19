@@ -5,11 +5,41 @@ use notarium_core::{
     error::{CommitEffect, PortError, ValidationReason},
     ports::{Cancellation, MaintenanceContext},
 };
-use tokio::time::Instant;
+use tokio::{sync::Semaphore, time::Instant};
 
 use crate::{backup_format::invalid, import::check_cancelled};
 
 struct CancelOnDrop(Cancellation);
+
+// A caller-provided Read can stay inside blocking I/O after cancellation.
+// The worker retains its slot until that call actually returns.
+static SOURCE_WORKERS: Semaphore = Semaphore::const_new(2);
+
+pub(crate) async fn read_source<T: Send + 'static>(
+    cancellation: &Cancellation,
+    work: impl FnOnce() -> Result<T, PortError> + Send + 'static,
+) -> Result<T, PortError> {
+    let permit = tokio::select! {
+        biased;
+        () = cancellation.cancelled() => return Err(source_cancelled()),
+        permit = SOURCE_WORKERS.acquire() => permit.expect("source worker limit is never closed"),
+    };
+    let worker = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    });
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => Err(source_cancelled()),
+        result = worker => result.map_err(|err| {
+            codec::internal_not_committed("read_archive_source", err.to_string())
+        })?,
+    }
+}
+
+fn source_cancelled() -> PortError {
+    codec::cancelled_not_committed("read_archive_source", "archive source read cancelled")
+}
 
 impl Drop for CancelOnDrop {
     fn drop(&mut self) {
@@ -59,5 +89,36 @@ pub(crate) async fn bounded<T, F: Future<Output = Result<T, PortError>>>(
                 other => other,
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn caller_can_cancel_before_a_blocking_source_returns() {
+        let cancelled = Cancellation::default();
+        let worker_cancel = cancelled.clone();
+        let (started, observed) = tokio::sync::oneshot::channel();
+        let (release, gate) = std::sync::mpsc::channel();
+        let waiter = tokio::spawn(async move {
+            read_source(&worker_cancel, move || {
+                started.send(()).unwrap();
+                let _ = gate.recv();
+                Ok(())
+            })
+            .await
+        });
+        observed.await.unwrap();
+        cancelled.cancel();
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+                .await
+                .expect("caller stopped waiting")
+                .unwrap(),
+            Err(PortError::Cancelled(failure)) if failure.effect() == CommitEffect::NotCommitted
+        ));
+        release.send(()).unwrap();
     }
 }

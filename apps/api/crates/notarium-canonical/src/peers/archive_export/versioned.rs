@@ -85,7 +85,7 @@ async fn register(
     let space = lock_and_check_space_tx(tx, &scope, epoch).await?;
     authorize_job_write_for_export(auth, &space)?;
     authorize_full_space_export(auth, &space.space)?;
-    let (job, _, erased) = require_active_job_lease_tx(
+    let (job, _, erased, _) = require_active_job_lease_tx(
         tx,
         &scope,
         &claim.job.id,

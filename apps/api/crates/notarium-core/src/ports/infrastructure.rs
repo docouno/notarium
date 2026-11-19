@@ -567,6 +567,10 @@ pub enum RevocationReason {
     SpaceClosed,
     CredentialRemoved,
 }
+/// Transaction lock shared by canonical archive effects and Control delivery.
+/// Both Cloud participants use the same primary PostgreSQL database.
+pub const ARCHIVE_REVOCATION_FENCE: i64 = 0x4e54_4152_435f_5631;
+
 pub trait SessionRevocationPort: Send + Sync {
     /// Register only after locking and revalidating all selected database
     /// authorities. Keep the lease until the socket is closed; release it BEFORE

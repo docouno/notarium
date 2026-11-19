@@ -428,15 +428,13 @@ impl ArchiveRunner {
         let ctx = job.authorize().await?;
         let (completed, total) = *job.progress.lock().unwrap_or_else(|e| e.into_inner());
         self.store
-            .heartbeat_job_lease(
+            .heartbeat_archive_job(
                 &ctx.budget,
                 ctx.scope(),
-                &job.claim.job.id,
-                &job.claim.lease_owner,
-                job.claim.job.lease,
+                &job.claim,
                 self.config.lease,
-                completed,
-                total,
+                (completed, total),
+                job.commit_authority(),
             )
             .await
             .map(drop)

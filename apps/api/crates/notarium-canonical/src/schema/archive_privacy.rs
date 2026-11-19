@@ -10,9 +10,10 @@ const GATES: &[(&str, &str, &str)] = &[
     (
         "note_heads",
         "lifecycle_state, doc_class, visibility_mask",
-        "OLD.lifecycle_state = 'active' AND
+        "(OLD.lifecycle_state <> 'purged' AND NEW.lifecycle_state = 'purged') OR
+         (OLD.lifecycle_state = 'active' AND
             (NEW.lifecycle_state <> 'active' OR OLD.doc_class <> NEW.doc_class
-                OR OLD.visibility_mask <> NEW.visibility_mask)",
+                OR OLD.visibility_mask <> NEW.visibility_mask))",
     ),
     (
         "folder_heads",
