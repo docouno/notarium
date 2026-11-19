@@ -1,3 +1,4 @@
+mod compaction;
 mod content;
 mod queue;
 mod staging;
@@ -424,18 +425,7 @@ impl ChatPort for CanonicalStore {
         ctx: SpaceContext,
         request: ChatRead,
     ) -> PortFuture<'_, ChatBranch> {
-        Box::pin(async move {
-            let mut branch = self.read_chat(ctx, request).await?;
-            if let Some(checkpoint) = branch
-                .entries
-                .iter()
-                .rposition(|e| e.kind == ChatEntryKind::Compaction)
-            {
-                branch.entries.drain(..checkpoint);
-                branch.next_ancestor = None;
-            }
-            Ok(branch)
-        })
+        Box::pin(compaction::context(self, ctx, request))
     }
 
     fn read_chat_contents(
@@ -3133,6 +3123,12 @@ async fn append_chat_impl(
         return Ok(replayed.into_committed());
     }
 
+    deadline
+        .prepare(&ctx.budget, || {
+            compaction::verify_prefix(store, ctx.clone(), &request)
+        })
+        .await?;
+
     let large_text = match &request.input.body {
         ChatInputBody::Text(text) if text.len() as u64 > StagedChatBlob::INLINE_MAX_BYTES => {
             let prepared = PreparedBlobSource::prepare(text.as_bytes(), store.blob_codec())?;
@@ -4164,6 +4160,7 @@ async fn consume_chat_input_impl(
     }
     let idemp =
         derive_command_identity_spec(&request.identity, "consume_chat_input", fp.as_bytes())
+            .with_canonical_effect(&ctx)
             .with_preconditions(
                 &request.preconditions,
                 "thread",

@@ -91,6 +91,7 @@ pub(super) async fn assign(
     }
     let payload =
         RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Folder(FolderRevisionMetadata {
+            confirmation: None,
             folder_id: folder.clone(),
             parent_folder_id: row.parent_folder_id,
             is_root: row.is_root,

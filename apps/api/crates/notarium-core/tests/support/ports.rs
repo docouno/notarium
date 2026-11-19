@@ -122,6 +122,11 @@ impl NoteWritePort for RejectingPorts {
             ctx: SpaceContext,
             request: Mutation<RollbackAgentRun>,
         ) -> PortFuture<'_, Committed<RollbackResult>>;
+    fn rollback_agent_run_by_id(
+            &self,
+            ctx: SpaceContext,
+            request: Mutation<AgentRunId>,
+        ) -> PortFuture<'_, Committed<RollbackResult>>;
     fn accept_external_observation(
             &self,
             ctx: SpaceContext,

@@ -376,6 +376,16 @@ pub trait ControlPort: Send + Sync {
     /// Refreshes a previously verified credential and intersects its current
     /// authority with the original delegation, project pin and branch taint.
     fn revalidate_auth(&self, ctx: AccountContext) -> PortFuture<'_, EngineAuthContext>;
+    /// Register and revalidate short-lived authority for one canonical write or
+    /// its replay. The original grants also cover a proposal's source Space.
+    fn fence_canonical_effect(
+        &self,
+        _authority: EngineAuthContext,
+        _ctx: SpaceContext,
+        _effect: CanonicalEffect,
+    ) -> PortFuture<'_, SpaceContext> {
+        Box::pin(async { Err(crate::DomainError::AccessDenied.into()) })
+    }
     /// Rebuilds independent authority from the same live interactive credential.
     /// The read variant grants proposal admission without management or write authority.
     fn revalidate_proposal_human(

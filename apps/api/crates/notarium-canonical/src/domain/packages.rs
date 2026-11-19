@@ -404,6 +404,7 @@ pub(crate) async fn publish_ability_package_impl(
         "publish_ability_package",
         fp_hasher.finalize().as_bytes(),
     )
+    .with_canonical_effect(&ctx)
     .for_note(ctx.auth(), &request.input.entrypoint);
 
     let auth = ctx.auth().clone();

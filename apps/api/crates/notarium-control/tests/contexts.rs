@@ -52,6 +52,7 @@ fn note(fixture: &Fixture, space: &Space, id: u8, project: Option<FolderId>) -> 
             facts: ResourceFacts {
                 space: space.clone(),
                 class: DocClass::UserDoc,
+                project: project.clone(),
                 ancestor_folders: project.into_iter().collect(),
                 folder_write_locked: false,
                 ability_package: None,

@@ -19,6 +19,18 @@ use serde_json::{Value, json};
 const RULES_VERSION: u8 = 1;
 pub(super) const MAX_DISPLAY_BYTES: usize = 32 * 1024;
 
+impl ToolCallContext<'_> {
+    pub(super) async fn fence_confirmed_effect(
+        &self,
+        scope: SpaceContext,
+    ) -> Result<SpaceContext, PortError> {
+        self.registry
+            .control
+            .fence_canonical_effect(self.auth.clone(), scope, CanonicalEffect::ConfirmedProposal)
+            .await
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct PersonalToolInvocation {
     pub source: HistoryScope,
@@ -522,6 +534,7 @@ async fn commit_memory(
         MemoryWriteMode::RequireAbsent
     };
     let mutation = input.into_mutation(current.resolved, identity, mode)?;
+    let scope = owner.fence_confirmed_effect(scope).await?;
     let committed = owner.registry.engine.append_memory(scope, mutation).await?;
     Ok(json!({
         "outcome": "applied",

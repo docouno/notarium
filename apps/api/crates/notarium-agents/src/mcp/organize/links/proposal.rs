@@ -248,6 +248,7 @@ pub(in crate::mcp) async fn apply_links(
                     .ok_or_else(|| invalid(ValidationReason::InvalidState))?
                     .clone(),
             );
+            let pinned = call.fence_confirmed_effect(pinned).await?;
             let persisted = call.registry.engine.link(pinned, mutation).await?;
             if persisted.value.source != plan.source {
                 return Err(unknown(invalid(ValidationReason::SourceMismatch)));

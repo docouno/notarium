@@ -145,6 +145,8 @@ struct State {
     transient: Option<TransientStep>,
     last_step: Option<u32>,
     terminal: Option<RunTerminal>,
+    redaction_pending: bool,
+    visibility_floor: u64,
 }
 
 impl State {
@@ -165,6 +167,14 @@ impl State {
 
     fn valid_boundary(&self, offset: u64) -> bool {
         offset == self.end || self.frames.iter().any(|frame| frame.start_offset == offset)
+    }
+
+    fn reset_visibility(&mut self) {
+        self.frames.clear();
+        self.retained = 0;
+        self.transient = None;
+        self.end = self.end.saturating_add(1);
+        self.visibility_floor = self.end;
     }
 
     fn frame(&self, payload: Vec<u8>) -> DomainResult<StreamFrame> {
@@ -230,6 +240,8 @@ impl StepStreamBuffer {
                 transient: None,
                 last_step: None,
                 terminal: None,
+                redaction_pending: false,
+                visibility_floor: 0,
             })),
             changed,
         }
@@ -237,6 +249,9 @@ impl StepStreamBuffer {
 
     pub fn begin_step(&self, step: u32) -> DomainResult<()> {
         let mut state = lock(&self.state);
+        if state.visibility_floor != 0 {
+            return Ok(());
+        }
         state.require_open()?;
         if state.transient.is_some() || state.last_step.is_some_and(|previous| step <= previous) {
             return Err(invalid_state());
@@ -305,13 +320,21 @@ impl StepStreamBuffer {
     /// peer's earlier commit notification was missed, the canonical snapshot
     /// covers the gap before ordinary live replay resumes.
     pub fn committed(&self, entry: &ChatEntry, step: Option<u32>) -> DomainResult<bool> {
-        let mut state = lock(&self.state);
         if entry.thread != self.thread || !entry.is_chain_node {
             return Err(invalid_state());
         }
+        let mut state = lock(&self.state);
+        if state.visibility_floor != 0 {
+            if entry.seq > state.committed_leaf {
+                state.committed_leaf = entry.seq;
+                state.reset_visibility();
+                self.changed.send_replace(state.end);
+            }
+            return Ok(false);
+        }
         // A peer may finish a durable submission while this run is closing.
         // Its receipt still succeeds after the stream stops accepting frames.
-        if state.terminal.is_some() && step.is_none() && entry.kind == ChatEntryKind::Human {
+        if state.terminal.is_some() && step.is_none() {
             return Ok(false);
         }
         state.require_open()?;
@@ -421,9 +444,20 @@ impl StepStreamBuffer {
         }
     }
 
+    pub(super) fn pause_for_redaction(self: &Arc<Self>) -> StreamRedaction {
+        lock(&self.state).redaction_pending = true;
+        StreamRedaction {
+            buffer: self.clone(),
+            discard: true,
+        }
+    }
+
     fn append_step(&self, step: u32, event: AgentRunEvent<'_>) -> DomainResult<()> {
         let payload = self.encode(event)?;
         let mut state = lock(&self.state);
+        if state.visibility_floor != 0 {
+            return Ok(());
+        }
         state.require_step(step)?;
         let frame = state.frame(payload)?;
         self.insert(&mut state, frame);
@@ -437,6 +471,9 @@ impl StepStreamBuffer {
     ) -> DomainResult<()> {
         let payload = self.encode(event)?;
         let mut state = lock(&self.state);
+        if state.visibility_floor != 0 {
+            return Ok(());
+        }
         state.require_committed(entry)?;
         let frame = state.frame(payload)?;
         self.insert(&mut state, frame);
@@ -496,6 +533,30 @@ impl StepStreamBuffer {
     }
 }
 
+pub(super) struct StreamRedaction {
+    buffer: Arc<StepStreamBuffer>,
+    discard: bool,
+}
+
+impl StreamRedaction {
+    pub(super) fn keep_history(&mut self) {
+        self.discard = false;
+    }
+}
+
+impl Drop for StreamRedaction {
+    fn drop(&mut self) {
+        let mut state = lock(&self.buffer.state);
+        if self.discard {
+            // Watch notifications and all consumers use this same lock.
+            // Invalidate old tail cursors as well as cursors into erased frames.
+            state.reset_visibility();
+        }
+        state.redaction_pending = false;
+        self.buffer.changed.send_replace(state.end);
+    }
+}
+
 pub struct StepSubscription {
     state: Arc<Mutex<State>>,
     run: AgentRunId,
@@ -506,30 +567,42 @@ pub struct StepSubscription {
 
 impl StepSubscription {
     pub async fn next(&mut self) -> StreamRead {
-        if let Some(checkpoint) = self.checkpoint.take() {
-            return StreamRead::CatchUpRequired(checkpoint);
-        }
         loop {
             {
                 let state = lock(&self.state);
-                if self.next_offset != state.end {
-                    return match state
-                        .frames
-                        .iter()
-                        .find(|frame| frame.start_offset == self.next_offset)
+                if !state.redaction_pending {
+                    if self.next_offset < state.visibility_floor
+                        || self
+                            .checkpoint
+                            .as_ref()
+                            .is_some_and(|saved| saved.cursor.byte_offset < state.visibility_floor)
                     {
-                        Some(frame) => {
-                            self.next_offset = frame.end_offset;
-                            StreamRead::Frame(frame.clone())
-                        }
-                        None => {
-                            self.next_offset = state.end;
-                            StreamRead::CatchUpRequired(state.checkpoint(&self.run))
-                        }
-                    };
-                }
-                if state.terminal.is_some() {
-                    return StreamRead::Closed;
+                        self.checkpoint = None;
+                        self.next_offset = state.end;
+                        return StreamRead::CatchUpRequired(state.checkpoint(&self.run));
+                    }
+                    if let Some(checkpoint) = self.checkpoint.take() {
+                        return StreamRead::CatchUpRequired(checkpoint);
+                    }
+                    if self.next_offset != state.end {
+                        return match state
+                            .frames
+                            .iter()
+                            .find(|frame| frame.start_offset == self.next_offset)
+                        {
+                            Some(frame) => {
+                                self.next_offset = frame.end_offset;
+                                StreamRead::Frame(frame.clone())
+                            }
+                            None => {
+                                self.next_offset = state.end;
+                                StreamRead::CatchUpRequired(state.checkpoint(&self.run))
+                            }
+                        };
+                    }
+                    if state.terminal.is_some() {
+                        return StreamRead::Closed;
+                    }
                 }
                 // Publication holds this same lock while notifying watch.
                 // Seeing the current tail and marking it seen is atomic.

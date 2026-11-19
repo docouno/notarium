@@ -87,19 +87,25 @@ pub(super) async fn overrides_and_promotion(fixture: &RuntimeFixture) {
             "kind":"role","name":name,"description":"Test guide", "instructions":instructions,"placement":placement,
         })
     };
-    call(
+    let initial = layout(
+        "override-guide",
+        "Space instructions",
+        json!({"home":"space","space":shared.slug}),
+    );
+    let created_space = Box::pin(authoring_authority_cases::bump_account_after_publication(
         fixture,
-        &human,
-        89,
-        "create_ability",
-        layout(
-            "override-guide",
-            "Space instructions",
-            json!({"home":"space","space":shared.slug}),
-        ),
-    )
+        call(fixture, &human, 89, "create_ability", initial.clone()),
+    ))
     .await
     .unwrap();
+    fixture.pat(BearerScope::Read, false).await;
+    let replayed_space = call(fixture, &human, 89, "create_ability", initial)
+        .await
+        .unwrap();
+    assert_eq!(
+        created_space.structured_content,
+        replayed_space.structured_content
+    );
     call(
         fixture,
         &human,
@@ -186,18 +192,16 @@ pub(super) async fn overrides_and_promotion(fixture: &RuntimeFixture) {
     )
     .await
     .unwrap();
-    let promoted = call(
+    let promotion = json!({
+        "ref":reference,
+        "versionToken":created.structured_content["versionToken"],
+        "home":{"home":"space"},
+        "instructions":"After promotion",
+    });
+    let promoted = Box::pin(authoring_authority_cases::bump_account_after_publication(
         fixture,
-        &human,
-        96,
-        "edit_ability",
-        json!({
-            "ref":reference,
-            "versionToken":created.structured_content["versionToken"],
-            "home":{"home":"space"},
-            "instructions":"After promotion",
-        }),
-    )
+        call(fixture, &human, 96, "edit_ability", promotion.clone()),
+    ))
     .await
     .unwrap();
     assert_eq!(
@@ -215,6 +219,14 @@ pub(super) async fn overrides_and_promotion(fixture: &RuntimeFixture) {
         "selected-projects"
     );
     assert_eq!(promoted.structured_content["enabled"], false);
+    fixture.pat(BearerScope::Read, false).await;
+    let replayed_promotion = call(fixture, &human, 96, "edit_ability", promotion)
+        .await
+        .unwrap();
+    assert_eq!(
+        promoted.structured_content,
+        replayed_promotion.structured_content
+    );
     let destination = promoted.structured_content["ref"].as_str().unwrap();
     call(
         fixture,

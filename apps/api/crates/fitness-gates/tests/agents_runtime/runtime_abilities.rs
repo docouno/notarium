@@ -280,6 +280,27 @@ pub(super) async fn loopback_provider_with_output(
     tools: bool,
     max_output_tokens: u32,
 ) -> LoopbackProvider {
+    loopback_provider_with_limits(
+        fixture,
+        human,
+        listener,
+        tag,
+        tools,
+        65_536,
+        max_output_tokens,
+    )
+    .await
+}
+
+pub(super) async fn loopback_provider_with_limits(
+    fixture: &RuntimeFixture,
+    human: &AccountContext,
+    listener: &TcpListener,
+    tag: u8,
+    tools: bool,
+    max_input_tokens: u32,
+    max_output_tokens: u32,
+) -> LoopbackProvider {
     let origin = format!("http://{}", listener.local_addr().unwrap());
     let resource = ProviderResourceId::from_bytes([tag; 16]);
     let model = ModelProfileId::from_bytes([tag; 16]);
@@ -346,7 +367,7 @@ pub(super) async fn loopback_provider_with_output(
                         wire_name: MODEL.into(),
                         kind: ProviderModelKind::Completion,
                         accounting: TokenAccountingProfile::ConservativeModelCapV1,
-                        max_input_tokens: 65_536,
+                        max_input_tokens,
                         max_output_tokens,
                         tools,
                     },

@@ -38,6 +38,11 @@ pub fn completion_input_estimate(request: &CompletionRequest) -> Result<u32, Por
     wire::estimate_completion_input_tokens(request)
 }
 
+/// Price generated text when it becomes input to a later completion.
+pub fn completion_text_estimate(text: &str) -> u64 {
+    wire::text_tokens(text)
+}
+
 pub const DEFAULT_MAX_ACTIVE_CALLS: usize = 64;
 const MAX_ACTIVE_CALLS_CAP: usize = 1024;
 

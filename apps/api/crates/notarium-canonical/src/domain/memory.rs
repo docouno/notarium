@@ -109,6 +109,7 @@ pub(super) async fn append(
     let idempotency =
         derive_command_identity_spec(&request.identity, "append_memory", &fingerprint)
             .with_preconditions(&request.preconditions, "note", note.as_str())
+            .with_canonical_effect(&ctx)
             .with_confirmed_chat_step(&ctx, "append_memory")
             .with_policy(ctx.auth(), ReplayPolicy::Memory(target.clone()));
     if let Some(replayed) = deadline

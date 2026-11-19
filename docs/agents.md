@@ -23,7 +23,17 @@ content-free plan and use canonical receipts for individual effects. Tool
 telemetry records typed operations, references and counters. Each result
 includes self-contained Markdown in `content[0].text` and machine-readable
 fields in `structuredContent`. The text contains the revision and continuation
-values needed for the next call and escapes untrusted control tags.
+values needed for the next call and escapes untrusted control tags. Explicit
+role and skill activation preserves the selected instruction bodies.
+Ability binding and promotion retries preserve the package and binding
+preconditions when an unrelated account change advances the account revision.
+
+`create_note` requires an unused destination and accepts the legacy optional
+`versionToken`. `create_notes` commits each item independently and returns
+outcomes in input order. A `toTitle` link becomes a stable ID when exactly one
+committed item matches the title. Otherwise, the link remains authored by
+title. A `linkError` on a successful item reports an unconfirmed link upgrade.
+Confirmed creation proposals persist the title links shown during review.
 
 `start_session` opens an episode by starting, resuming or forking it. Pass the
 returned `session.id` on subsequent calls. Follow `delta.nextAction` to
@@ -62,7 +72,11 @@ the credential independently for read and write, so reading the tainted
 branch cannot taint the write context. Canonical storage checks the exact
 proposal and its model turn before applying each step. The observed revision
 or absence guards the effect and a repeated confirmation returns its receipt.
-Applying a proposal requires no provider call.
+The canonical writer retains the live authorization lease until the step
+settles. Applying a proposal requires no provider call.
+Each approved write or replay holds a live authority lease through canonical
+settlement. Revocation covers the credential and both the proposal source and
+destination Spaces.
 
 A SpaceGroup run is confined to its shared Space. The queue admits up to 16
 pending inputs per thread. Enqueue and run completion serialize on the current
@@ -77,10 +91,15 @@ canonical author and an untrusted-content marker.
 Provider dispatch rechecks every canonical source used by the prompt, including
 the dependencies of prior Tool, Model and Compaction entries. Admission uses
 current membership, document classes, source projects and the selected
-provider's consent. If admission fails, choose an authorized provider or an
-earlier clean branch. Redaction invalidates dependent summaries. Run rollback
-uses canonical mutation provenance to undo eligible note effects while
-preserving later manual edits.
+provider's consent. A note disclosure binds the note class and nearest project
+at disclosure. Moving a note can invalidate its prior disclosures even when its
+revision and bytes stay the same. If admission fails, choose an authorized
+provider or an earlier clean branch. Redaction invalidates dependent summaries.
+Automatic compaction records the covered prefix and keeps newer turns in the
+next prompt. The full parent chain remains available through `read_chat`.
+Run rollback uses canonical mutation provenance to undo eligible note effects
+while preserving later manual edits. Retrying the same run and command key
+returns the original rollback receipt under current authorization.
 
 ## Stream replay and runtime ownership
 
@@ -104,10 +123,11 @@ Space writer. Enroll each serving instance's local hub in the shared
 revocation authority, and use that authority for control's provider fences.
 `RunOwnershipRequest.transition` distinguishes `Vacant` admission from
 `Handoff` to a successor under the current writer and `Recover` after the
-predecessor is fenced. Losing the writer lease cancels the run.
-`ClusterRunAuthority::admit_input` checks live run ownership or the idle Space
-writer route before publishing new durable input. Losing the route cancels
-the command. Lookup of an existing receipt can precede route admission.
+predecessor is fenced. Losing the writer lease cancels the run and closes the
+writer's viewer subscriptions. `ClusterRunAuthority::admit_chat_write` checks
+the active run owner or the idle Space writer before a durable chat write.
+Losing the route cancels the command. Lookup of an existing input receipt can
+precede route admission.
 
 ## Scheduled Keepers
 

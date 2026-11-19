@@ -294,6 +294,53 @@ async fn late_model_ack_clears_its_step_without_rewinding_peer_watermark() {
     buffer.begin_step(1).unwrap();
 }
 
+#[tokio::test]
+async fn redaction_invalidates_all_retained_viewers_and_cached_checkpoints() {
+    let buffer = Arc::new(stream());
+    let origin = cursor(&buffer, 0);
+    buffer.begin_step(0).unwrap();
+    buffer.text_delta(0, "erased text").unwrap();
+    buffer
+        .committed(&entry(&buffer, 1, 2, ChatEntryKind::Model), Some(0))
+        .unwrap();
+    let call = CommandKey::from_bytes([3; 16]);
+    buffer
+        .tool_result(0, &call, seq(2), "erased preview")
+        .unwrap();
+    let mut old = buffer.subscribe(Some(&origin));
+    let mut unopened = buffer.subscribe(None);
+    let old_tail = checkpoint(&mut buffer.subscribe(None)).await.cursor;
+    let mut at_tail = buffer.subscribe(Some(&old_tail));
+    let hold = buffer.pause_for_redaction();
+    let mut suspended = Box::pin(old.next());
+    std::future::poll_fn(|cx| {
+        std::task::Poll::Ready(std::future::Future::poll(suspended.as_mut(), cx).is_pending())
+    })
+    .await
+    .then_some(())
+    .expect("redaction must suspend delivery before the transaction settles");
+    drop(suspended);
+    buffer
+        .tool_result(0, &call, seq(2), "late erased preview")
+        .unwrap();
+    drop(hold);
+
+    for subscription in [&mut old, &mut unopened, &mut at_tail] {
+        let reset = checkpoint(subscription).await;
+        assert!(reset.cursor.byte_offset > old_tail.byte_offset);
+        assert_eq!(reset.committed_leaf, seq(2));
+        assert_eq!(reset.incomplete_step, None);
+    }
+    buffer
+        .tool_result(0, &call, seq(2), "delayed erased preview")
+        .unwrap();
+    buffer.fail(RunFailure::Cancelled).unwrap();
+    for subscription in [&mut old, &mut unopened, &mut at_tail] {
+        assert_eq!(encoded(&frame(subscription).await)["type"], "run_failed");
+        assert!(matches!(subscription.next().await, StreamRead::Closed));
+    }
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(32))]
 

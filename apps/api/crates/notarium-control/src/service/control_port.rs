@@ -45,6 +45,14 @@ impl ControlPort for ControlPlane {
                 .clone())
         })
     }
+    fn fence_canonical_effect(
+        &self,
+        authority: EngineAuthContext,
+        ctx: SpaceContext,
+        effect: CanonicalEffect,
+    ) -> PortFuture<'_, SpaceContext> {
+        Box::pin(self.control.fence_canonical_effect(authority, ctx, effect))
+    }
     fn revalidate_proposal_human(
         &self,
         ctx: AccountContext,

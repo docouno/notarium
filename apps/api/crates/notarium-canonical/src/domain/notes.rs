@@ -308,6 +308,7 @@ fn create_note_identity(
         hash.update(b"folder-page");
     }
     derive_command_identity_spec(identity, "create_note", hash.finalize().as_bytes())
+        .with_canonical_effect(ctx)
         .with_confirmed_chat_step(ctx, "create_note")
         .for_create(ctx.auth(), &input.note, input.parent.as_ref(), input.class)
 }
@@ -323,6 +324,7 @@ fn edit_note_identity(
     hash_carrier_plan(&mut hash, &input.plan);
     hash_preconditions(&mut hash, preconditions);
     derive_command_identity_spec(identity, "edit_note", hash.finalize().as_bytes())
+        .with_canonical_effect(ctx)
         .with_confirmed_chat_step(ctx, "edit_note")
         .for_note(ctx.auth(), &input.note)
 }
@@ -428,6 +430,14 @@ pub(crate) async fn create_note_impl(
     let active_op_guard = store.enter_write_op(&ctx.scope().space_id)?;
     validate_mutation_identity(&ctx, &request.identity)?;
     crate::domain::common::require_empty_preconditions(&request.preconditions)?;
+    if let Some(step) = ctx.confirmed_chat_step()
+        && (request.input.class != DocClass::UserDoc
+            || step
+                .destination()
+                .is_none_or(|destination| destination.move_source.is_some()))
+    {
+        return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
+    }
     let slug_fold = super::folder_cover::validate_create(&request.input)?;
     if request.input.class == DocClass::Skill {
         ctx.auth().authorize_ability_mutation()?;
@@ -475,7 +485,10 @@ pub(crate) async fn create_note_impl(
         &space_rec.root_folder_id,
         info.prepared_blob.digest,
     );
-    let (intent, fast_plan) = if store.is_sqlite_local() && !request.input.folder_page {
+    let (intent, fast_plan) = if store.is_sqlite_local()
+        && !request.input.folder_page
+        && !idemp.requires_standard_writer()
+    {
         let (intent, plan) = crate::sqlite_fast::build_create_note_fast_intent(
             &space_rec.scope,
             space_rec.active_epoch,
@@ -545,6 +558,11 @@ pub(crate) fn build_create_note_intent(
     let scope_cl = scope.clone();
     let staged_bytes = ticket.compressed_size;
     let source_note = input.note.clone();
+    let confirmed = idemp
+        .as_ref()
+        .and_then(|id| id.confirmed_chat_step())
+        .filter(|step| matches!(step.witness().tool_name(), "create_note" | "create_notes"))
+        .cloned();
 
     PreparedWriteIntent {
         scope: scope.clone(),
@@ -560,6 +578,16 @@ pub(crate) fn build_create_note_intent(
                     .parent
                     .clone()
                     .unwrap_or_else(|| item_ctx.root_folder_id.clone());
+                if let Some(step) = &confirmed {
+                    super::folder_paths::check_confirmed_note_destination_tx(
+                        tx,
+                        &live_space,
+                        &auth,
+                        step,
+                        &parent_id,
+                    )
+                    .await?;
+                }
 
                 let (facts, anc) = build_resource_facts_tx(
                     tx,
@@ -865,7 +893,7 @@ pub(crate) async fn edit_note_impl(
     );
 
     ctx.budget.remaining = deadline.remaining(&budget)?;
-    let phase1 = if store.is_sqlite_local() && !idemp.has_confirmed_chat_step() {
+    let phase1 = if store.is_sqlite_local() && !idemp.requires_standard_writer() {
         deadline
             .prepare_read(&budget, || {
                 crate::sqlite_fast::edit_note_phase1_sqlite_local(
@@ -1056,12 +1084,11 @@ pub(crate) async fn edit_note_impl(
 
     let mut reservation_opt = None;
     if let Some(interceptor) = store.inner.collab_interceptor.get()
-        && idemp.has_confirmed_chat_step()
+        && idemp.requires_standard_writer()
         && base_head.doc_class != DocClass::EncryptedNote
     {
-        // An Applied interceptor reply means its own mutation happened before
-        // the chat source can be fenced. A closed-room reservation lets this
-        // approved edit run through the ordinary canonical transaction.
+        // An Applied interceptor reply bypasses the guarded writer. A reservation
+        // lets this edit retain authority until the canonical transaction settles.
         ctx.budget.remaining = deadline.remaining(&budget)?;
         let reserve = deadline
             .wait(&budget, || {
@@ -1182,7 +1209,7 @@ pub(crate) async fn edit_note_impl(
         })
         .await??;
 
-    if store.is_sqlite_local() && reservation_opt.is_none() && !idemp.has_confirmed_chat_step() {
+    if store.is_sqlite_local() && reservation_opt.is_none() && !idemp.requires_standard_writer() {
         let phase1_cached = base_anc.map(|anc| (base_head.clone(), anc));
         let (intent, fast_plan) = crate::sqlite_fast::build_carrier_replacement_fast_intent(
             store,
@@ -1796,6 +1823,7 @@ async fn delete_impl(
     };
     let idemp = derive_command_identity_spec(&request.identity, disp_tag, fp.as_bytes())
         .with_preconditions(&request.preconditions, "note", note.as_str())
+        .with_canonical_effect(&ctx)
         .with_confirmed_chat_step(&ctx, disp_tag)
         .for_note(ctx.auth(), note);
 
@@ -2250,6 +2278,7 @@ fn move_note_identity(
     );
     derive_command_identity_spec(identity, "move_note", fp.as_bytes())
         .with_preconditions(preconditions, "note", input.note.as_str())
+        .with_canonical_effect(ctx)
         .with_confirmed_chat_step(ctx, "move_note")
         .for_move(ctx.auth(), &input.note, input.parent.as_ref())
 }
@@ -2276,6 +2305,16 @@ pub(crate) async fn move_note_impl(
 ) -> Result<Committed<NoteRevision>, PortError> {
     let deadline = super::common::CommandDeadline::start(&ctx.budget, "move_note");
     validate_mutation_identity(&ctx, &request.identity)?;
+    if let Some(step) = ctx.confirmed_chat_step() {
+        let source = step
+            .destination()
+            .and_then(|destination| destination.move_source.as_ref());
+        if !source.is_some_and(|(note, revision)| {
+            note == &request.input.note && request.preconditions.revision.as_ref() == Some(revision)
+        }) {
+            return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
+        }
+    }
     let new_slug_fold = normalize_slug_key(&request.input.slug)?;
 
     let idemp = move_note_identity(
@@ -2394,6 +2433,13 @@ fn build_move_note_intent(
     pin: Result<MovePin, PortError>,
 ) -> PreparedWriteIntent {
     let scope_cl = scope.clone();
+    let confirmed = if matches!(&change, MetadataChange::Move(_)) {
+        idemp
+            .as_ref()
+            .and_then(|id| id.confirmed_chat_step().cloned())
+    } else {
+        None
+    };
     let note_id = match &change {
         MetadataChange::Move(mv) => &mv.note,
         MetadataChange::Rename(rename) => &rename.note,
@@ -2440,6 +2486,16 @@ fn build_move_note_intent(
                         lineage: None,
                     }
                     .into());
+                }
+                if let Some(step) = &confirmed {
+                    super::folder_paths::check_confirmed_note_destination_tx(
+                        tx,
+                        &live_space,
+                        &auth,
+                        step,
+                        &dest_parent,
+                    )
+                    .await?;
                 }
                 check_collab_preconditions_tx(tx, &scope_cl.space_id, &note_id, &preconditions)
                     .await?;
@@ -2783,6 +2839,7 @@ pub(crate) async fn rename_note_impl(
     let idemp = derive_command_identity_spec(&request.identity, "rename_note", fp.as_bytes())
         .with_preconditions(&request.preconditions, "note", request.input.note.as_str())
         .with_rename_title(request.input.title.as_deref())
+        .with_canonical_effect(&ctx)
         .with_confirmed_chat_step(&ctx, "rename_note")
         .for_note(ctx.auth(), &request.input.note);
 
@@ -3823,6 +3880,7 @@ fn link_identity(
     }
     hash_preconditions(&mut hash, &item.preconditions);
     derive_command_identity_spec(&item.identity, "link", hash.finalize().as_bytes())
+        .with_canonical_effect(ctx)
         .with_confirmed_chat_step(ctx, "link")
         .for_link(ctx.auth(), &item.input.source, &item.input.target)
 }
@@ -3916,6 +3974,7 @@ async fn authorize_link_target_tx(
             let tfacts = notarium_core::auth::ResourceFacts {
                 space: space.space.clone(),
                 class: source_class,
+                project: fanc.project,
                 ancestor_folders: fanc.ancestors,
                 folder_write_locked: fanc.write_locked,
                 ability_package: None,
@@ -6081,7 +6140,9 @@ pub(super) async fn get_note_impl(
     let (current, live_lifecycle) = recheck_note_read(store, &ctx, &request.note, false)
         .await
         .map_err(|err| record_failure("current_authorization", err))?;
-    if request.revision.is_none() && current.class != live_facts.class {
+    if request.revision.is_none()
+        && (current.class != live_facts.class || current.project != live_facts.project)
+    {
         return Err(DomainError::ResourceNotFound.into());
     }
 
@@ -6379,7 +6440,7 @@ enum NoteMutationAccess {
     Link(LinkTarget),
 }
 
-async fn authorize_note_placement_tx(
+pub(super) async fn authorize_note_placement_tx(
     tx: &mut BackendConn<'_>,
     space: &crate::SpaceRecord,
     auth: &notarium_core::auth::EngineAuthContext,

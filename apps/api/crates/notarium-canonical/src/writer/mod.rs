@@ -16,7 +16,7 @@ use notarium_core::{
         SpaceSeq,
     },
     model::{HistoryScope, Lifecycle},
-    ports::CallBudget,
+    ports::{CallBudget, CanonicalEffectLease, ConfirmedChatStep},
 };
 use serde::{Serialize, de::DeserializeOwned};
 use sqlx::Row;
@@ -51,8 +51,7 @@ pub struct CommandIdentitySpec {
     pub command_hash: ContentDigest,
     fingerprint_proof: Option<Arc<fingerprint::CommandProof>>,
     pub(crate) require_receipt_detail: bool,
-    pub(crate) authority:
-        Option<Arc<(notarium_core::auth::EngineAuthContext, replay::ReplayPolicy)>>,
+    pub(crate) authority: Option<Arc<replay::ReplayAuthority>>,
 }
 impl CommandIdentitySpec {
     pub fn new(actor: PrincipalId, command_key: CommandKey, command_hash: ContentDigest) -> Self {
@@ -66,10 +65,29 @@ impl CommandIdentitySpec {
         }
     }
     pub(crate) fn has_confirmed_chat_step(&self) -> bool {
-        matches!(
-            self.fingerprint_proof.as_deref(),
-            Some(fingerprint::CommandProof::Confirmed { .. })
-        )
+        self.confirmed_chat_step().is_some()
+    }
+
+    pub(crate) fn confirmed_chat_step(&self) -> Option<&Arc<ConfirmedChatStep>> {
+        match self.fingerprint_proof.as_deref() {
+            Some(fingerprint::CommandProof::Confirmed { step, .. }) => Some(step),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn requires_standard_writer(&self) -> bool {
+        self.has_confirmed_chat_step() || self.canonical_effect().is_some()
+    }
+
+    fn canonical_effect(&self) -> Option<&CanonicalEffectLease> {
+        self.authority.as_deref()?.canonical_effect.as_ref()
+    }
+
+    pub(crate) fn check_canonical_effect(&self) -> Result<(), PortError> {
+        if let Some(lease) = self.canonical_effect() {
+            lease.check()?;
+        }
+        Ok(())
     }
 }
 
@@ -687,7 +705,7 @@ impl WriteCoordinator {
         let (sqlite_fast_plan, pg_fast_plan) = if intent
             .idempotency
             .as_ref()
-            .is_some_and(CommandIdentitySpec::has_confirmed_chat_step)
+            .is_some_and(CommandIdentitySpec::requires_standard_writer)
         {
             if let Some(plan) = sqlite_fast_plan {
                 intent.execute = plan.into_async_exec();
@@ -1605,6 +1623,16 @@ async fn execute_batch_on_conn(
     // Retain all StagedBlobTickets and runtime lock guards until AFTER outer COMMIT/ROLLBACK!
     let mut batch_retained_tickets: Vec<StagedBlobTicket> = Vec::new();
     let mut batch_retained_guards: Vec<Box<dyn Send>> = Vec::new();
+    // A dropped caller does not stop an admitted write. Keep each live effect
+    // registration through the actual SQL settlement of this batch.
+    batch_retained_guards.extend(intents.iter().filter_map(|intent| {
+        intent
+            .idempotency
+            .as_ref()?
+            .canonical_effect()
+            .cloned()
+            .map(|lease| Box::new(lease) as Box<dyn Send>)
+    }));
     let mut slots: Vec<ItemOutcomeSlot> = Vec::with_capacity(intents.len());
 
     let committed_at_ms = match now_unix_ms() {
@@ -1911,6 +1939,7 @@ async fn execute_single_item_in_savepoint(
     let effective_epoch = intent.active_epoch;
 
     if let Some(idemp) = &intent.idempotency {
+        idemp.check_canonical_effect()?;
         idemp
             .authorize_confirmed_chat_step(tx, &intent.scope, true)
             .await?;

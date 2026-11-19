@@ -1,5 +1,8 @@
 use super::*;
-use notarium_agents::{chats::ExclusiveDataRoot, keepers::KeeperScheduler};
+use notarium_agents::{
+    chats::{AgentRunSupervisor, ExclusiveDataRoot},
+    keepers::KeeperScheduler,
+};
 use notarium_canonical::CreateFolderSpec;
 use notarium_core::{
     auth::SpaceKind,
@@ -379,7 +382,17 @@ async fn keeper_turn_reconsent(fixture: &RuntimeFixture) {
                 .unwrap()
                 .contains(r#""outcome": "appended""#))
             .count(),
-        9
+        9,
+        "unexpected memory tool results (ordinal, response): {:?}",
+        tool_results
+            .iter()
+            .enumerate()
+            .skip(3)
+            .filter_map(|(index, message)| {
+                let response = message["content"].as_str().unwrap();
+                (!response.contains(r#""outcome": "appended""#)).then_some((index, response))
+            })
+            .collect::<Vec<_>>()
     );
     let saved_text = "Recorded the planned observation. ".repeat(20);
     send_ollama(
@@ -474,11 +487,46 @@ async fn keeper_turn_reconsent(fixture: &RuntimeFixture) {
         "postgres"
     };
     eprintln!(
-        "Keeper rollback sample ({backend}): {} µs for nine exact memory restorations",
+        "Keeper rollback sample ({backend}): {} µs for nine canonical restorations",
         latency.as_micros()
     );
     assert_eq!(restored.value.restored.len(), 9);
     assert!(restored.value.trashed.is_empty());
+
+    let supervisor = AgentRunSupervisor::new_local(
+        fixture.registry.clone(),
+        fixture.revocations.clone(),
+        ExclusiveDataRoot::attest_open_writer(),
+    );
+    let rollback_key = command(206).key;
+    let undo = || {
+        supervisor.rollback_run(
+            human.clone(),
+            scope.scope().clone(),
+            first_run.run.clone(),
+            rollback_key.clone(),
+        )
+    };
+    let prepared_revision = || async {
+        fixture
+            .canonical
+            .prepare_agent_run_rollback(scope.clone(), first_run.run.clone())
+            .await
+            .unwrap()
+            .expected_run_revision
+    };
+    let before = prepared_revision().await;
+    let resolved = undo().await.unwrap();
+    assert_ne!(prepared_revision().await, before);
+    let replayed = undo().await.unwrap();
+    assert_eq!(replayed.receipt, resolved.receipt);
+    assert_eq!(replayed.value, resolved.value);
+    let after = fixture
+        .canonical
+        .read_space(&scope.scope().space_id)
+        .await
+        .unwrap();
+    assert_eq!(after.last_seq, resolved.receipt.seq());
     for (id, digest) in original_memories {
         assert_eq!(
             get_note(fixture, &scope, id).await.document.digest(),

@@ -1,5 +1,3 @@
-use std::collections::{BTreeMap, BTreeSet};
-
 use notarium_core::{
     classes::DocClass,
     error::{PortError, ValidationReason},
@@ -7,7 +5,6 @@ use notarium_core::{
     model::HistoryScope,
     ports::{CreateNote, Mutation, Preconditions},
 };
-use notarium_syntax::unicode::lookup_key;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -31,7 +28,7 @@ pub(in crate::mcp) struct ProposedCreates {
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
 enum CreateStep {
-    Ready(ProposedDraft),
+    Ready(Box<ProposedDraft>),
     Invalid { code: String },
 }
 
@@ -97,9 +94,6 @@ pub(in crate::mcp::note_tools) async fn prepare(
     let (project, drafts, batch, folder_page) = match tool {
         ToolName::CreateNote => {
             let input: CreateInput = decode(args)?;
-            if input.version_token.is_some() {
-                return Err(invalid(ValidationReason::InvalidQuery));
-            }
             (
                 input.project,
                 vec![Ok(input.draft)],
@@ -120,7 +114,6 @@ pub(in crate::mcp::note_tools) async fn prepare(
     };
     let project = observe_project(owner, &project).await?;
     let place = project_placement(owner, project).await?;
-    let mut titles: BTreeMap<String, BTreeSet<NoteId>> = BTreeMap::new();
     let mut draft_plans = Vec::with_capacity(drafts.len());
     for (index, draft) in drafts.into_iter().enumerate() {
         let plan = async {
@@ -134,10 +127,6 @@ pub(in crate::mcp::note_tools) async fn prepare(
                 DocClass::UserDoc,
             )
             .await?;
-            titles
-                .entry(lookup_key(&draft.title))
-                .or_default()
-                .insert(draft.note.clone());
             Ok::<_, PortError>((draft, destination))
         }
         .await;
@@ -147,7 +136,9 @@ pub(in crate::mcp::note_tools) async fn prepare(
     for plan in draft_plans {
         let proposed = async {
             let (draft, destination) = plan?;
-            let carrier = prepare_carrier(owner, &place.read_scope, &draft, &titles).await?;
+            // Approval governs these exact create bytes. A title reference
+            // stays authored until the target is known to exist.
+            let carrier = prepare_carrier(owner, &place.read_scope, &draft).await?;
             Ok::<_, PortError>(ProposedDraft {
                 note: draft.note,
                 destination,
@@ -160,7 +151,7 @@ pub(in crate::mcp::note_tools) async fn prepare(
         }
         .await;
         steps.push(match proposed {
-            Ok(draft) => CreateStep::Ready(draft),
+            Ok(draft) => CreateStep::Ready(Box::new(draft)),
             Err(error) if batch => CreateStep::Invalid {
                 code: error.code().to_owned(),
             },
@@ -191,21 +182,18 @@ async fn apply_one(
     let folder_scope = folder_ctx.restrict_to_project(&project.reference)?;
     let parent = draft
         .destination
-        .apply(
-            owner,
-            folder_scope,
-            folder_identity,
-            DocClass::UserDoc,
-            None,
-        )
+        .apply(owner, folder_scope, folder_identity, None)
         .await?;
     let (write_ctx, identity) = step(&project.scope, "create_note", index)?;
     let scope = write_ctx.restrict_to_project(&project.reference)?;
+    let leased = owner
+        .fence_confirmed_effect(draft.destination.bind(scope.clone(), None)?)
+        .await?;
     let committed = owner
         .registry
         .engine
         .create_note(
-            scope.clone(),
+            leased,
             Mutation {
                 identity,
                 preconditions: Preconditions::default(),
@@ -245,13 +233,13 @@ pub(in crate::mcp::note_tools) async fn apply(
         else {
             return Err(invalid(ValidationReason::InvalidState));
         };
-        return apply_one(owner, &plan.project, draft, step, 0).await;
+        return apply_one(owner, &plan.project, *draft, step, 0).await;
     }
     let mut results = Vec::with_capacity(plan.steps.len());
     for (index, row) in plan.steps.into_iter().enumerate() {
         let result = match row {
             CreateStep::Ready(draft) => {
-                apply_one(owner, &plan.project, draft, step, index as u16).await
+                apply_one(owner, &plan.project, *draft, step, index as u16).await
             }
             CreateStep::Invalid { code } => {
                 results.push(json!({"index":index, "ok":false, "error":code}));

@@ -271,6 +271,7 @@ async fn check_noop(
     let resource = ResourceFacts {
         space: facts.space,
         class,
+        project: None,
         ancestor_folders: facts.ancestor_folders,
         folder_write_locked: facts.write_locked,
         ability_package: None,

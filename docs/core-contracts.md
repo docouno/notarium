@@ -253,6 +253,10 @@ update that supplies a note revision requires an existing note. The expected
 package revision, queue base leaf, rollback run/entity/rank expectations and
 job cancellation lease belong to their typed inputs.
 
+`rollback_agent_run_by_id` resolves those rollback expectations inside the
+canonical owner. Its command identity binds the run independently of the
+derived plan, so a retry can reach the original receipt after revisions advance.
+
 ## Complete mutation intent across live rooms
 
 The live interceptor receives a typed mutation with the original authorization,

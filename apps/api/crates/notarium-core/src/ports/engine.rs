@@ -140,6 +140,13 @@ pub trait NoteWritePort: Send + Sync {
         ctx: SpaceContext,
         request: Mutation<RollbackAgentRun>,
     ) -> PortFuture<'_, Committed<RollbackResult>>;
+    /// Resolve the current rollback plan internally. The durable command is
+    /// identified by the run, even after a successful rollback changes the plan.
+    fn rollback_agent_run_by_id(
+        &self,
+        ctx: SpaceContext,
+        request: Mutation<AgentRunId>,
+    ) -> PortFuture<'_, Committed<RollbackResult>>;
     fn accept_external_observation(
         &self,
         ctx: SpaceContext,
@@ -148,6 +155,8 @@ pub trait NoteWritePort: Send + Sync {
 }
 pub trait ChatPort: Send + Sync {
     fn read_chat(&self, ctx: SpaceContext, request: ChatRead) -> PortFuture<'_, ChatBranch>;
+    /// A bounded prompt window. A live prefix checkpoint is presented before
+    /// its retained original suffix, with its durable sequence unchanged.
     fn read_chat_context(&self, ctx: SpaceContext, request: ChatRead)
     -> PortFuture<'_, ChatBranch>;
     fn read_chat_contents(

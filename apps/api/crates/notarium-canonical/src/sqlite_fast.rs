@@ -950,7 +950,7 @@ pub(crate) async fn get_note_sqlite_local_fast(
     ctx.budget.remaining = caller_deadline.saturating_duration_since(tokio::time::Instant::now());
     let (live_facts, live_lifecycle) =
         crate::domain::notes::recheck_note_read(store, &ctx, &request.note, false).await?;
-    if live_facts.class != initial_facts.class {
+    if live_facts.class != initial_facts.class || live_facts.project != initial_facts.project {
         return Err(DomainError::ResourceNotFound.into());
     }
 
@@ -3958,7 +3958,9 @@ fn authorize_replay_rusqlite(
     idemp: &CommandIdentitySpec,
 ) -> Result<(), PortError> {
     use crate::writer::replay::{ReplayPolicy, ReplayResource, authorize_head, destination};
-    let Some((auth, policy)) = idemp.authority.as_deref() else {
+    let Some(crate::writer::replay::ReplayAuthority { auth, policy, .. }) =
+        idemp.authority.as_deref()
+    else {
         return Ok(());
     };
     let srec = load_space_record_rusqlite(conn, &scope.space_id)?;
@@ -4463,6 +4465,7 @@ pub(crate) fn build_resource_facts_rusqlite(
     let facts = ResourceFacts {
         space: space.clone(),
         class,
+        project: anc.project.clone(),
         ancestor_folders: anc.ancestors.clone(),
         folder_write_locked: anc.write_locked,
         ability_package,
@@ -4499,6 +4502,7 @@ fn build_resource_facts_cached(
     let facts = ResourceFacts {
         space: space.clone(),
         class,
+        project: anc.project.clone(),
         ancestor_folders: anc.ancestors.clone(),
         folder_write_locked: anc.write_locked,
         ability_package,

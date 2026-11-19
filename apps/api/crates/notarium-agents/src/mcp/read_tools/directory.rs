@@ -382,6 +382,7 @@ async fn folder_page(
         let resource = ResourceFacts {
             space: facts.space,
             class: DocClass::UserDoc,
+            project: None,
             ancestor_folders: facts.ancestor_folders,
             folder_write_locked: facts.write_locked,
             ability_package: None,

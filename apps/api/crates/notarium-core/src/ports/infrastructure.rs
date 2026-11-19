@@ -579,11 +579,22 @@ pub trait SessionRevocationPort: Send + Sync {
         selectors: Vec<RevocationSelector>,
         cancellation: Cancellation,
     ) -> PortFuture<'_, Box<dyn RevocationLease>>;
-    /// Close matching admissions, cancel active calls, and wait for their leases
-    /// to drop. The caller already holds database authority locks and retains
+    /// Register before a short read-only credential check. An exclusive
+    /// revocation fence drains this lease through the canonical write or replay.
+    /// The holder must never wait for a Control write, model call or run completion.
+    fn register_canonical_effect(
+        &self,
+        _ctx: MaintenanceContext,
+        _selectors: Vec<RevocationSelector>,
+        _cancellation: Cancellation,
+    ) -> PortFuture<'_, Box<dyn RevocationLease>> {
+        Box::pin(async { Err(crate::DomainError::AccessDenied.into()) })
+    }
+    /// Close matching admissions, cancel provider calls and canonical effects,
+    /// and wait for their leases to drop. The caller holds Control authority locks and retains
     /// this fence through COMMIT/ROLLBACK, including cancellation of its waiter.
     /// Selector batches are acquired atomically; implementations must not wait
-    /// for database settlement while draining registrations.
+    /// for Control database settlement while draining registrations.
     fn fence_provider(
         &self,
         ctx: MaintenanceContext,

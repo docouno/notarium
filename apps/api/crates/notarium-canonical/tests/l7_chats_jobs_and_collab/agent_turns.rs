@@ -929,12 +929,30 @@ async fn confirmed_source_fence(store: &CanonicalStore) {
         )
     };
     let write = SpaceContext::new(write_auth, target.clone(), make_budget()).unwrap();
+    let anchor = store
+        .resolve_folder_path(
+            write.clone(),
+            Some(project.folder_id.clone()),
+            String::new(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
     let request = make_request(0xc4);
     let stale = make_request(0xc5);
     let approved = |identity: &CommandIdentity| {
         write
             .clone()
             .with_confirmed_chat_step(proposal.witness().clone(), identity)
+            .unwrap()
+            .with_confirmed_note_destination(notarium_core::ports::ConfirmedNoteDestination {
+                anchor: anchor.reference.clone(),
+                anchor_revision: anchor.revision.clone(),
+                anchor_path: anchor.path.clone(),
+                anchor_ancestors: anchor.ancestor_folders.clone(),
+                missing_suffix: String::new(),
+                move_source: None,
+            })
             .unwrap()
             .restrict_to_project(&project)
             .unwrap()
@@ -1106,6 +1124,7 @@ async fn nested_chat_egress_dependencies(store: &CanonicalStore) {
                 Some(ChatProvenance {
                     origins: vec![source_origin.clone()],
                     projects: vec![],
+                    compacts_through: None,
                 }),
             ),
         )
@@ -1128,6 +1147,7 @@ async fn nested_chat_egress_dependencies(store: &CanonicalStore) {
                 Some(ChatProvenance {
                     origins: vec![model_origin.clone()],
                     projects: vec![],
+                    compacts_through: None,
                 }),
             ),
         )

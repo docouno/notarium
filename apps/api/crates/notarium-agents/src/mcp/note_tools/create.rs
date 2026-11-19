@@ -5,10 +5,15 @@ use notarium_core::{
     auth::ResourceFacts,
     classes::DocClass,
     error::{PortError, ValidationReason},
-    ids::{CommandKey, ContentDigest, NoteId, RevisionId},
+    ids::{CommandKey, ContentDigest, FolderId, NoteId},
     model::{FolderRef, HistoryScope, Lifecycle},
-    ports::{CreateNote, LinkTarget, Mutation, Preconditions, SpaceContext},
+    patch::CarrierEditOrigin,
+    ports::{
+        Committed, CreateNote, EditNote, LinkTarget, Mutation, NoteRevision, Preconditions,
+        SpaceContext,
+    },
     receipt::CommandIdentity,
+    span::ByteSpan,
     value::{Timestamp, YamlValue},
 };
 use notarium_syntax::{
@@ -36,7 +41,9 @@ struct CreateInput {
     draft: NoteDraft,
     #[serde(default)]
     folder_page: bool,
-    version_token: Option<RevisionId>,
+    // Accepted for legacy callers. A create always requires an unused destination.
+    #[serde(rename = "versionToken")]
+    _version_token: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -135,6 +142,7 @@ async fn project_placement(
     let facts = ResourceFacts {
         space: folder.space,
         class: DocClass::UserDoc,
+        project: Some(project.reference.folder_id.clone()),
         ancestor_folders: folder.ancestor_folders,
         folder_write_locked: folder.write_locked,
         ability_package: None,
@@ -306,32 +314,58 @@ fn fields(draft: &NoteDraft, title: &str) -> Vec<FieldEdit> {
     edits
 }
 
-async fn prepare_carrier(
+struct PreparedLink {
+    relation: String,
+    target: LinkTarget,
+}
+
+async fn prepare_links(
     call: &ToolCallContext<'_>,
     scope: &SpaceContext,
     draft: &PreparedDraft,
-    titles: &BTreeMap<String, BTreeSet<NoteId>>,
-) -> Result<String, PortError> {
-    let mut lines = String::new();
+) -> Result<Vec<PreparedLink>, PortError> {
+    let mut links = Vec::with_capacity(draft.draft.links.len());
     for link in &draft.draft.links {
         let (target, _) =
             organize::resolve_target(call, scope, link.to.as_deref(), link.to_title.as_deref())
                 .await?;
-        let (target, label) = match &target {
-            LinkTarget::AuthoredName(title) => match titles.get(&lookup_key(title)) {
-                Some(ids) if ids.len() == 1 => (
-                    LinkTarget::Note(ids.first().expect("one batch target").clone()),
-                    Some(title.as_str()),
-                ),
-                _ => (target.clone(), None),
-            },
-            _ => (target.clone(), None),
-        };
-        lines.push_str(&organize::format_link_line(&link.relation, &target, label)?);
+        links.push(PreparedLink {
+            relation: link.relation.clone(),
+            target,
+        });
     }
-    let carrier = &draft.carrier;
+    Ok(links)
+}
+
+fn link_lines(
+    links: &[PreparedLink],
+    titles: Option<&BTreeMap<String, BTreeSet<NoteId>>>,
+) -> Result<String, PortError> {
+    let mut lines = String::new();
+    for PreparedLink { relation, target } in links {
+        if let LinkTarget::AuthoredName(title) = target
+            && let Some(ids) = titles.and_then(|titles| titles.get(&lookup_key(title)))
+            && ids.len() == 1
+        {
+            let note = ids.first().expect("one batch target").clone();
+            lines.push_str(&organize::format_link_line(
+                relation,
+                &LinkTarget::Note(note),
+                Some(title),
+            )?);
+        } else {
+            lines.push_str(&organize::format_link_line(relation, target, None)?);
+        }
+    }
+    Ok(lines)
+}
+
+fn carrier_with_links(
+    carrier: &str,
+    lines: String,
+) -> Result<(String, Option<ByteSpan>), PortError> {
     if lines.is_empty() {
-        return Ok(carrier.clone());
+        return Ok((carrier.to_owned(), None));
     }
     let header = notarium_syntax::carrier::Carrier::scan(carrier)?;
     let analysis = markdown::analyze(carrier, header.body)?;
@@ -353,51 +387,79 @@ async fn prepare_carrier(
     } else {
         lines
     };
-    Ok(format!("{before}{separator}{lines}{eol}{after}"))
+    let start = at + separator.len();
+    let block = ByteSpan::new(start, start + lines.len())?;
+    Ok((
+        format!("{before}{separator}{lines}{eol}{after}"),
+        Some(block),
+    ))
+}
+
+async fn prepare_carrier(
+    call: &ToolCallContext<'_>,
+    scope: &SpaceContext,
+    draft: &PreparedDraft,
+) -> Result<String, PortError> {
+    let links = prepare_links(call, scope, draft).await?;
+    let (carrier, _) = carrier_with_links(&draft.carrier, link_lines(&links, None)?)?;
+    Ok(carrier)
 }
 
 async fn execute(
-    call: &mut ToolCallContext<'_>,
+    call: &ToolCallContext<'_>,
     placement: &CreatePlacement,
-    prepared: PreparedDraft,
+    prepared: &PreparedDraft,
     carrier: String,
-) -> Result<Value, PortError> {
+) -> Result<(Committed<NoteRevision>, FolderId), PortError> {
     let scope = placement.write_scope.clone();
     let parent = super::ensure_destination(
         call,
         &scope,
         Some(placement.project.reference.folder_id.clone()),
-        prepared.relative_path,
+        prepared.relative_path.clone(),
         &prepared.command,
         "create_destination",
         None,
     )
     .await?;
-    let note = prepared.note.clone();
     let write = Mutation {
-        identity: prepared.command,
+        identity: prepared.command.clone(),
         preconditions: Preconditions::default(),
         input: CreateNote {
-            note: prepared.note,
+            note: prepared.note.clone(),
             parent: Some(parent.folder_id.clone()),
-            slug: prepared.slug,
+            slug: prepared.slug.clone(),
             class: DocClass::UserDoc,
             carrier,
             folder_page: prepared.folder_page,
         },
     };
-    let committed = call
-        .registry
-        .engine
-        .create_note(scope.clone(), write)
-        .await?;
-    let mut result = receipt_result(call, scope, &note, committed, "created").await?;
+    let committed = call.registry.engine.create_note(scope, write).await?;
+    Ok((committed, parent.folder_id))
+}
+
+async fn result(
+    call: &mut ToolCallContext<'_>,
+    placement: &CreatePlacement,
+    prepared: &PreparedDraft,
+    committed: Committed<NoteRevision>,
+    parent: FolderId,
+) -> Result<Value, PortError> {
+    let note = &prepared.note;
+    let mut result = receipt_result(
+        call,
+        placement.write_scope.clone(),
+        note,
+        committed,
+        "created",
+    )
+    .await?;
     if result.get("noteId").is_some() {
         result["bodyBytes"] = json!(prepared.draft.body.len());
         result["bodyHash"] = json!(notarium_syntax::content_digest(&prepared.draft.body));
         if prepared.folder_page && matches!(call.target, EgressTarget::ExternalMcp) {
             result["folderPage"] =
-                json!({ "status": "present", "folderId": parent.folder_id, "noteId": note });
+                json!({ "status": "present", "folderId": parent, "noteId": note });
         }
     }
     Ok(result)
@@ -408,13 +470,104 @@ pub(super) async fn create_one(
     raw: Value,
 ) -> Result<Value, PortError> {
     let input: CreateInput = decode(raw)?;
-    if input.version_token.is_some() {
-        return Err(invalid(ValidationReason::InvalidQuery));
-    }
     let placement = placement(call, &input.project).await?;
     let prepared = PreparedDraft::new(call, &placement, input.draft, input.folder_page, 0, None)?;
-    let carrier = prepare_carrier(call, &placement.read_scope, &prepared, &BTreeMap::new()).await?;
-    execute(call, &placement, prepared, carrier).await
+    let carrier = prepare_carrier(call, &placement.read_scope, &prepared).await?;
+    let (committed, parent) = execute(call, &placement, &prepared, carrier).await?;
+    result(call, &placement, &prepared, committed, parent).await
+}
+
+struct CreatedDraft {
+    prepared: PreparedDraft,
+    carrier: String,
+    links: Vec<PreparedLink>,
+    link_block: Option<ByteSpan>,
+    committed: Committed<NoteRevision>,
+    parent: FolderId,
+}
+
+async fn create_draft(
+    call: &ToolCallContext<'_>,
+    placement: &CreatePlacement,
+    index: u16,
+    raw: Value,
+) -> Result<CreatedDraft, PortError> {
+    let bytes = serde_json::to_vec(&raw).map_err(|_| invalid(ValidationReason::InvalidQuery))?;
+    let hash = derive_digest("notarium.mcp.create-note-item-arguments.v1", &[&bytes]);
+    let prepared = PreparedDraft::new(call, placement, decode(raw)?, false, index, Some(hash))?;
+    let links = prepare_links(call, &placement.read_scope, &prepared).await?;
+    let (carrier, link_block) = carrier_with_links(&prepared.carrier, link_lines(&links, None)?)?;
+    let (committed, parent) = execute(call, placement, &prepared, carrier.clone()).await?;
+    placement
+        .write_scope
+        .scope()
+        .check(committed.receipt.scope())?;
+    if committed.value.note != prepared.note {
+        return Err(invalid(ValidationReason::SourceMismatch));
+    }
+    Ok(CreatedDraft {
+        prepared,
+        carrier,
+        links,
+        link_block,
+        committed,
+        parent,
+    })
+}
+
+async fn resolve_batch_links(
+    call: &ToolCallContext<'_>,
+    placement: &CreatePlacement,
+    draft: &CreatedDraft,
+    titles: &BTreeMap<String, BTreeSet<NoteId>>,
+) -> Result<Option<Committed<NoteRevision>>, PortError> {
+    let Some(block) = draft.link_block else {
+        return Ok(None);
+    };
+    let header = notarium_syntax::carrier::Carrier::scan(&draft.carrier)?;
+    let resolved = link_lines(&draft.links, Some(titles))?;
+    let resolved = if header.eol == "\r\n" {
+        resolved.replace('\n', header.eol)
+    } else {
+        resolved
+    };
+    if resolved == block.slice(&draft.carrier)? {
+        return Ok(None);
+    }
+    let mut identity = draft.prepared.command.clone();
+    identity.key = derive_key(
+        "notarium.mcp.create-note-link-resolution.v1",
+        &[
+            identity.key.as_str().as_bytes(),
+            notarium_syntax::content_digest(&resolved).as_bytes(),
+        ],
+    );
+    let plan = patch::plan(
+        &draft.carrier,
+        header.body,
+        vec![(CarrierEditOrigin::Body, block, resolved)],
+    )?;
+    let scope = call
+        .space(placement.project.scope.clone())?
+        .restrict_to_project(&placement.project.reference)?;
+    call.registry
+        .engine
+        .edit_note(
+            scope,
+            Mutation {
+                identity,
+                preconditions: Preconditions {
+                    revision: Some(draft.committed.value.revision.clone()),
+                    ..Preconditions::default()
+                },
+                input: EditNote {
+                    note: draft.prepared.note.clone(),
+                    plan,
+                },
+            },
+        )
+        .await
+        .map(Some)
 }
 
 pub(super) async fn create_many(
@@ -424,33 +577,37 @@ pub(super) async fn create_many(
     let input: BatchInput = decode(raw)?;
     let placement = placement(call, &input.project).await?;
     let mut titles: BTreeMap<String, BTreeSet<NoteId>> = BTreeMap::new();
-    let prepared = input
-        .notes
-        .into_iter()
-        .enumerate()
-        .map(|(index, raw)| {
-            let bytes =
-                serde_json::to_vec(&raw).map_err(|_| invalid(ValidationReason::InvalidQuery))?;
-            let hash = derive_digest("notarium.mcp.create-note-item-arguments.v1", &[&bytes]);
-            let draft: NoteDraft = decode(raw)?;
-            let item =
-                PreparedDraft::new(call, &placement, draft, false, index as u16, Some(hash))?;
+    let mut created = Vec::with_capacity(input.notes.len());
+    // Commit independently before treating any generated ID as a valid target.
+    for (index, raw) in input.notes.into_iter().enumerate() {
+        let row = create_draft(call, &placement, index as u16, raw).await;
+        if let Ok(item) = &row {
             titles
-                .entry(lookup_key(&item.title))
+                .entry(lookup_key(&item.prepared.title))
                 .or_default()
-                .insert(item.note.clone());
-            Ok(item)
-        })
-        .collect::<Vec<Result<PreparedDraft, PortError>>>();
-    let mut results = Vec::with_capacity(prepared.len());
-    for (index, prepared) in prepared.into_iter().enumerate() {
-        let result = async {
-            let prepared = prepared?;
-            let carrier = prepare_carrier(call, &placement.read_scope, &prepared, &titles).await?;
-            execute(call, &placement, prepared, carrier).await
+                .insert(item.prepared.note.clone());
+        }
+        created.push(row);
+    }
+    let mut results = Vec::with_capacity(created.len());
+    for (index, row) in created.into_iter().enumerate() {
+        let outcome = async {
+            let draft = row?;
+            let (committed, link_error) =
+                match resolve_batch_links(call, &placement, &draft, &titles).await {
+                    Ok(Some(committed)) => (committed, None),
+                    Ok(None) => (draft.committed, None),
+                    Err(error) => (draft.committed, Some(error.code())),
+                };
+            let mut value =
+                result(call, &placement, &draft.prepared, committed, draft.parent).await?;
+            if let Some(error) = link_error {
+                value["linkError"] = json!(error);
+            }
+            Ok::<_, PortError>(value)
         }
         .await;
-        results.push(match result {
+        results.push(match outcome {
             Ok(mut value) => {
                 value["index"] = json!(index);
                 value["ok"] = json!(true);

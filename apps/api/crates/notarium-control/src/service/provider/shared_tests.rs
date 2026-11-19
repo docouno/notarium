@@ -60,6 +60,7 @@ async fn shared(pg: bool, wire: ProviderWireKind) {
         ResourceFacts {
             space: catalog.space.clone(),
             class: DocClass::UserDoc,
+            project: None,
             ancestor_folders: vec![],
             folder_write_locked: false,
             ability_package: None,

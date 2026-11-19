@@ -3,7 +3,7 @@ use notarium_core::{
     DomainError,
     classes::{ClassEgressFence, ClassifiedAbilityResource, ContentPart},
     document::ChunkDescriptor,
-    error::{PortError, ValidationReason},
+    error::{CommitEffect, OperationalFailure, PortError, RetryAdvice, ValidationReason},
     ids::*,
     model::{FolderRef, Lifecycle, NoteRef, SnapshotCut},
     ports::*,
@@ -16,6 +16,7 @@ use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
 };
+use tokio::sync::oneshot;
 
 pub struct TestEngine(pub CanonicalStore, pub Arc<ProjectionFixtures>);
 
@@ -23,6 +24,48 @@ pub struct TestEngine(pub CanonicalStore, pub Arc<ProjectionFixtures>);
 pub struct ProjectionFixtures {
     seed: Mutex<Option<ProjectionFixture>>,
     directory: Mutex<BTreeMap<EffectiveReadId, NoteQuery>>,
+    before_ability_trash: Mutex<Option<MutationPause>>,
+    after_ability_publication: Mutex<Option<MutationPause>>,
+    before_memory_append: Mutex<Option<MutationPause>>,
+    before_chat_consume: Mutex<Option<MutationPause>>,
+    chat_consume: Mutex<ChatConsumeFixture>,
+    before_chat_submit: Mutex<Option<MutationPause>>,
+    before_chat_claim: Mutex<Option<MutationPause>>,
+}
+
+#[derive(Default)]
+struct ChatConsumeFixture {
+    attempts: Option<Vec<Mutation<ConsumePending>>>,
+    lose_ack_once: bool,
+}
+
+struct MutationPause {
+    entered: oneshot::Sender<Cancellation>,
+    release: oneshot::Receiver<()>,
+}
+
+impl MutationPause {
+    fn install(
+        slot: &Mutex<Option<Self>>,
+    ) -> (oneshot::Receiver<Cancellation>, oneshot::Sender<()>) {
+        let (entered, observed) = oneshot::channel();
+        let (resume, release) = oneshot::channel();
+        assert!(
+            slot.lock()
+                .unwrap()
+                .replace(Self { entered, release })
+                .is_none()
+        );
+        (observed, resume)
+    }
+
+    async fn enter(slot: &Mutex<Option<Self>>, cancellation: Cancellation) {
+        let pause = slot.lock().unwrap().take();
+        if let Some(pause) = pause {
+            let _ = pause.entered.send(cancellation);
+            let _ = pause.release.await;
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -32,6 +75,42 @@ pub struct ProjectionFixture {
 }
 
 impl ProjectionFixtures {
+    pub fn pause_ability_trash(&self) -> (oneshot::Receiver<Cancellation>, oneshot::Sender<()>) {
+        MutationPause::install(&self.before_ability_trash)
+    }
+
+    pub fn pause_ability_publication(
+        &self,
+    ) -> (oneshot::Receiver<Cancellation>, oneshot::Sender<()>) {
+        MutationPause::install(&self.after_ability_publication)
+    }
+
+    pub fn pause_memory_append(&self) -> (oneshot::Receiver<Cancellation>, oneshot::Sender<()>) {
+        MutationPause::install(&self.before_memory_append)
+    }
+
+    pub fn pause_chat_consume(&self) -> (oneshot::Receiver<Cancellation>, oneshot::Sender<()>) {
+        MutationPause::install(&self.before_chat_consume)
+    }
+
+    pub fn trace_chat_consume_with_lost_ack(&self) {
+        let mut fixture = self.chat_consume.lock().unwrap();
+        assert!(fixture.attempts.replace(Vec::new()).is_none());
+        fixture.lose_ack_once = true;
+    }
+
+    pub fn chat_consume_attempts(&self) -> Vec<Mutation<ConsumePending>> {
+        self.chat_consume.lock().unwrap().attempts.take().unwrap()
+    }
+
+    pub fn pause_chat_submit(&self) -> (oneshot::Receiver<Cancellation>, oneshot::Sender<()>) {
+        MutationPause::install(&self.before_chat_submit)
+    }
+
+    pub fn pause_chat_claim(&self) -> (oneshot::Receiver<Cancellation>, oneshot::Sender<()>) {
+        MutationPause::install(&self.before_chat_claim)
+    }
+
     pub fn install(&self, fixture: ProjectionFixture) {
         *self.seed.lock().unwrap() = Some(fixture);
     }
@@ -53,13 +132,14 @@ impl ProjectionFixtures {
 }
 
 macro_rules! canonical_port {
-    ($port:ident; $($method:ident($request:ty) -> $output:ty),+ $(,)?) => {
+    ($port:ident; $($method:ident($request:ty) -> $output:ty),+ $(,)? $(; $($custom:item)*)?) => {
         impl $port for TestEngine {
             $(
                 fn $method(&self, ctx: SpaceContext, request: $request) -> PortFuture<'_, $output> {
                     $port::$method(&self.0, ctx, request)
                 }
             )+
+            $($($custom)*)?
         }
     };
 }
@@ -76,17 +156,35 @@ canonical_port!(NoteWritePort;
     rename_folder(Mutation<RenameFolder>) -> Committed<FolderRef>,
     rename_project(Mutation<RenameProject>) -> Committed<FolderRef>,
     accept_batch(AcceptBatch) -> BatchResult<NoteRevision>,
-    append_memory(Mutation<AppendMemory>) -> Committed<MemoryAppendResult>,
     link(Mutation<Link>) -> Committed<Link>,
     link_many(LinkBatch) -> BatchResult<Link>,
-    publish_ability_package(Mutation<PublishAbilityPackage>) -> Committed<AbilityPackageRevision>,
-    trash_ability_package(Mutation<TrashAbilityPackage>) -> Committed<NoteRevision>,
     rollback_agent_run(Mutation<RollbackAgentRun>) -> Committed<RollbackResult>,
-    accept_external_observation(Mutation<ExternalObservation>) -> ExternalObservationResult,
+    rollback_agent_run_by_id(Mutation<AgentRunId>) -> Committed<RollbackResult>,
+    accept_external_observation(Mutation<ExternalObservation>) -> ExternalObservationResult;
+
+    fn append_memory(&self, ctx: SpaceContext, request: Mutation<AppendMemory>) -> PortFuture<'_, Committed<MemoryAppendResult>> {
+        Box::pin(async move {
+            MutationPause::enter(&self.1.before_memory_append, ctx.budget.cancellation.clone()).await;
+            NoteWritePort::append_memory(&self.0, ctx, request).await
+        })
+    }
+    fn publish_ability_package(&self, ctx: SpaceContext, request: Mutation<PublishAbilityPackage>) -> PortFuture<'_, Committed<AbilityPackageRevision>> {
+        Box::pin(async move {
+            let cancellation = ctx.budget.cancellation.clone();
+            let result = NoteWritePort::publish_ability_package(&self.0, ctx, request).await?;
+            MutationPause::enter(&self.1.after_ability_publication, cancellation).await;
+            Ok(result)
+        })
+    }
+    fn trash_ability_package(&self, ctx: SpaceContext, request: Mutation<TrashAbilityPackage>) -> PortFuture<'_, Committed<NoteRevision>> {
+        Box::pin(async move {
+            MutationPause::enter(&self.1.before_ability_trash, ctx.budget.cancellation.clone()).await;
+            NoteWritePort::trash_ability_package(&self.0, ctx, request).await
+        })
+    }
 );
 
 canonical_port!(ChatPort;
-    submit_user_chat_input(SubmitUserChatInput) -> SubmitUserChatOutcome,
     lookup_user_chat_input(&SubmitUserChatInput) -> Option<SubmitUserChatOutcome>,
     read_chat(ChatRead) -> ChatBranch,
     read_chat_context(ChatRead) -> ChatBranch,
@@ -98,13 +196,43 @@ canonical_port!(ChatPort;
     fork_chat(Mutation<ForkChat>) -> Committed<ChatThread>,
     append_chat(Mutation<AppendChat>) -> Committed<ChatEntry>,
     queue_chat_input(Mutation<PendingChatInput>) -> QueueInputOutcome,
-    consume_chat_input(Mutation<ConsumePending>) -> Committed<ConsumedPending>,
     list_pending_chat_inputs(ChatThreadId) -> Vec<QueuedChatInput>,
     dismiss_chat_input(DismissPending) -> bool,
-    claim_active_run(ClaimChatRun) -> ClaimChatRunOutcome,
     finish_run_if_queue_empty(ChatRunRequest) -> FinishChatRunOutcome,
     recover_active_run(ChatRunRequest) -> FinishChatRunOutcome,
-    redact_chat_entry(Mutation<RedactChatEntry>) -> Committed<RedactedChat>,
+    redact_chat_entry(Mutation<RedactChatEntry>) -> Committed<RedactedChat>;
+    fn submit_user_chat_input(&self, ctx: SpaceContext, request: SubmitUserChatInput) -> PortFuture<'_, SubmitUserChatOutcome> {
+        Box::pin(async move {
+            MutationPause::enter(&self.1.before_chat_submit, ctx.budget.cancellation.clone()).await;
+            ChatPort::submit_user_chat_input(&self.0, ctx, request).await
+        })
+    }
+    fn consume_chat_input(&self, ctx: SpaceContext, request: Mutation<ConsumePending>) -> PortFuture<'_, Committed<ConsumedPending>> {
+        Box::pin(async move {
+            if let Some(attempts) = &mut self.1.chat_consume.lock().unwrap().attempts {
+                attempts.push(request.clone());
+            }
+            MutationPause::enter(&self.1.before_chat_consume, ctx.budget.cancellation.clone()).await;
+            let committed = ChatPort::consume_chat_input(&self.0, ctx, request).await?;
+            if matches!(&committed.value, ConsumedPending::Appended { .. })
+                && std::mem::take(&mut self.1.chat_consume.lock().unwrap().lose_ack_once)
+            {
+                return Err(PortError::Unavailable(OperationalFailure::new(
+                    ContentDigest::from_bytes([0xad; 32]),
+                    CommitEffect::Unknown,
+                    RetryAdvice::RetrySameCommand,
+                    true,
+                ).unwrap()));
+            }
+            Ok(committed)
+        })
+    }
+    fn claim_active_run(&self, ctx: SpaceContext, request: ClaimChatRun) -> PortFuture<'_, ClaimChatRunOutcome> {
+        Box::pin(async move {
+            MutationPause::enter(&self.1.before_chat_claim, ctx.budget.cancellation.clone()).await;
+            ChatPort::claim_active_run(&self.0, ctx, request).await
+        })
+    }
 );
 
 canonical_port!(ContentJobPort;

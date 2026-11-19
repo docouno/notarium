@@ -71,6 +71,7 @@ pub(super) fn identity(
         COMMAND,
         fingerprint.finalize().as_bytes(),
     )
+    .with_canonical_effect(ctx)
     .for_chat_leaf(ctx.auth(), &request.thread, request.expected_leaf))
 }
 

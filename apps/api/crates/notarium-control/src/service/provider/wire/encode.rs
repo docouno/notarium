@@ -372,7 +372,7 @@ fn text_token_twelfths(value: &str) -> u64 {
     }
     twelfths
 }
-fn text_tokens(value: &str) -> u64 {
+pub(in crate::service::provider) fn text_tokens(value: &str) -> u64 {
     text_token_twelfths(value).div_ceil(12)
 }
 pub(in crate::service::provider) fn estimate_completion_input_tokens(

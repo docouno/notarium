@@ -218,28 +218,8 @@ pub(crate) async fn rollback_agent_run_impl(
     let deadline = super::common::CommandDeadline::start(&ctx.budget, "rollback").at;
     validate_mutation_identity(&ctx, &request.identity)?;
     crate::domain::common::require_empty_preconditions(&request.preconditions)?;
-    let idemp = fingerprint::current(&request)?.with_policy(
-        ctx.auth(),
-        crate::writer::replay::ReplayPolicy::Documents(
-            request
-                .input
-                .expected_entities
-                .iter()
-                .map(|entry| crate::writer::replay::ReplayResource::Write(entry.note.clone()))
-                .chain(
-                    request
-                        .input
-                        .associated_board_expectations
-                        .iter()
-                        .map(|entry| &entry.view.note)
-                        .collect::<BTreeSet<_>>()
-                        .into_iter()
-                        .cloned()
-                        .map(crate::writer::replay::ReplayResource::View),
-                )
-                .collect(),
-        ),
-    );
+    let idemp =
+        fingerprint::current(&request)?.with_policy(ctx.auth(), rollback_policy(&request.input));
 
     let result = execute_rollback(store, &mut ctx, &request, &idemp, deadline).await;
     if !matches!(
@@ -268,6 +248,47 @@ pub(crate) async fn rollback_agent_run_impl(
     saved
         .map(StoredCommittedRollbackV1::into_committed)
         .ok_or_else(|| DomainError::IdempotencyKeyReused.into())
+}
+
+pub(crate) async fn rollback_agent_run_by_id(
+    store: &CanonicalStore,
+    mut ctx: SpaceContext,
+    request: Mutation<AgentRunId>,
+) -> Result<Committed<RollbackResult>, PortError> {
+    let deadline = super::common::CommandDeadline::start(&ctx.budget, "rollback").at;
+    validate_mutation_identity(&ctx, &request.identity)?;
+    super::common::require_empty_preconditions(&request.preconditions)?;
+    let input = prepare_agent_run_rollback(store, ctx.clone(), request.input).await?;
+    let idemp = super::common::derive_command_identity_spec(
+        &request.identity,
+        "rollback_agent_run_by_id_v1",
+        input.run.as_str().as_bytes(),
+    )
+    .with_policy(ctx.auth(), rollback_policy(&input));
+    let prepared = Mutation {
+        identity: request.identity,
+        preconditions: request.preconditions,
+        input,
+    };
+    execute_rollback(store, &mut ctx, &prepared, &idemp, deadline).await
+}
+
+fn rollback_policy(input: &RollbackAgentRun) -> crate::writer::replay::ReplayPolicy {
+    use crate::writer::replay::{ReplayPolicy, ReplayResource};
+
+    let views = input
+        .associated_board_expectations
+        .iter()
+        .map(|entry| &entry.view.note)
+        .collect::<BTreeSet<_>>();
+    ReplayPolicy::Documents(
+        input
+            .expected_entities
+            .iter()
+            .map(|entry| ReplayResource::Write(entry.note.clone()))
+            .chain(views.into_iter().cloned().map(ReplayResource::View))
+            .collect(),
+    )
 }
 
 async fn execute_rollback(
@@ -4686,6 +4707,7 @@ async fn try_execute_pg_root_rollback(
             kind: space_kind,
         },
         class: DocClass::UserDoc,
+        project: None,
         ancestor_folders: vec![root_folder_id.clone()],
         folder_write_locked: false,
         ability_package: None,

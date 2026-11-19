@@ -235,6 +235,9 @@ pub enum ChatAudience {
 pub struct ResourceFacts {
     pub space: Space,
     pub class: DocClass,
+    /// Nearest enclosing canonical project, if any. Scoped authorization
+    /// still checks the complete ancestry below.
+    pub project: Option<FolderId>,
     pub ancestor_folders: Vec<FolderId>,
     pub folder_write_locked: bool,
     pub ability_package: Option<AbilityId>,

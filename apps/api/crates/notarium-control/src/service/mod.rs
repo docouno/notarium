@@ -3,6 +3,7 @@ mod abilities;
 mod accounts;
 mod auth_port;
 mod authority;
+mod canonical_effects;
 mod commands;
 mod context_state;
 mod control_port;

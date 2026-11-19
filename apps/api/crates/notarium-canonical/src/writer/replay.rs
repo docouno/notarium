@@ -6,7 +6,7 @@ use notarium_core::{
     error::PortError,
     ids::{ChatThreadId, FolderId, JobId, NoteId, ThreadEntrySeq},
     model::{HistoryScope, NoteRef},
-    ports::{LinkTarget, ResolvedMemoryTarget},
+    ports::{CanonicalEffectLease, LinkTarget, ResolvedMemoryTarget, SpaceContext},
 };
 
 use super::CommandIdentitySpec;
@@ -39,10 +39,26 @@ pub(crate) enum ReplayPolicy {
     Job(Option<JobId>, Vec<NoteId>),
 }
 
+#[derive(Debug)]
+pub(crate) struct ReplayAuthority {
+    pub(crate) auth: EngineAuthContext,
+    pub(crate) policy: ReplayPolicy,
+    pub(crate) canonical_effect: Option<CanonicalEffectLease>,
+}
+
 /// A domain fingerprint becomes usable by the writer only after binding a policy.
-pub(crate) struct UnboundCommand(pub(crate) CommandIdentitySpec);
+pub(crate) struct UnboundCommand(pub(crate) CommandIdentitySpec, Option<CanonicalEffectLease>);
 
 impl UnboundCommand {
+    pub(crate) fn new(spec: CommandIdentitySpec) -> Self {
+        Self(spec, None)
+    }
+
+    pub(crate) fn with_canonical_effect(mut self, ctx: &SpaceContext) -> Self {
+        self.1 = ctx.canonical_effect().cloned();
+        self
+    }
+
     pub(crate) fn command_hash(&self) -> notarium_core::ids::ContentDigest {
         self.0.command_hash
     }
@@ -52,7 +68,11 @@ impl UnboundCommand {
         auth: &EngineAuthContext,
         policy: ReplayPolicy,
     ) -> CommandIdentitySpec {
-        self.0.authority = Some(std::sync::Arc::new((auth.clone(), policy)));
+        self.0.authority = Some(std::sync::Arc::new(ReplayAuthority {
+            auth: auth.clone(),
+            policy,
+            canonical_effect: self.1,
+        }));
         self.0
     }
 
@@ -153,7 +173,7 @@ impl CommandIdentitySpec {
         else {
             return Ok(());
         };
-        let Some((auth, _)) = self.authority.as_deref() else {
+        let Some(ReplayAuthority { auth, .. }) = self.authority.as_deref() else {
             return Err(DomainError::validation(
                 notarium_core::error::ValidationReason::InvalidAuthority,
             )
@@ -173,8 +193,9 @@ impl CommandIdentitySpec {
         tx: &mut BackendConn<'_>,
         scope: &HistoryScope,
     ) -> Result<(), PortError> {
+        self.check_canonical_effect()?;
         self.authorize_confirmed_chat_step(tx, scope, false).await?;
-        let Some((auth, policy)) = self.authority.as_deref() else {
+        let Some(ReplayAuthority { auth, policy, .. }) = self.authority.as_deref() else {
             return Ok(());
         };
         let srec = load_space_record(tx, &scope.space_id).await?;

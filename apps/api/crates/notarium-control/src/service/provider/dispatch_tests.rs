@@ -348,6 +348,7 @@ impl Setup {
             ResourceFacts {
                 space: catalog.space,
                 class: DocClass::UserDoc,
+                project: None,
                 ancestor_folders: vec![],
                 folder_write_locked: false,
                 ability_package: None,
@@ -503,6 +504,7 @@ async fn compacted_history_dispatches_only_with_its_transitive_proof(setup: &Set
         let proof = ChatProvenance {
             origins: vec![dependency],
             projects: vec![],
+            compacts_through: None,
         };
         let current = ProviderCurrentContent::Chat {
             space: space.clone(),

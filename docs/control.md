@@ -202,15 +202,17 @@ final admission state. Failures retain the fence. Explicit owner management
 admission can inspect the history of an archived Space and request reactivation;
 its context has no content read/write classes while the Space is inactive.
 
-Authority mutations acquire SQL locks, then an exclusive provider registration
-fence before committing their revocation events. The fence cancels matching calls
-and waits for their network shutdown. Its SQL owner retains it until COMMIT or
-ROLLBACK acknowledgement, including after caller cancellation. Dispatch takes
+Authority mutations acquire SQL locks, then an exclusive registration fence
+before committing their revocation events. The fence cancels matching provider
+calls and guarded canonical operations. It waits for socket shutdown and
+canonical command settlement, including when a caller disconnects. The SQL
+owner retains the fence until COMMIT or ROLLBACK acknowledgement. Dispatch uses
 the same SQL-then-registry order and releases registrations before settling its
-audit in SQL. The registry must coordinate every serving instance and fail closed
-when a lease is lost; a process-local map cannot implement this Cloud contract.
-The public
-mutation returns success only after the injected `SessionRevocationPort` confirms
+audit. A guarded canonical write registers before a read-only authority check
+and holds the guard through settlement. It releases the guard before any
+subsequent Control mutation. The registry coordinates every serving instance
+and fails closed when a lease is lost. A public mutation returns success
+after the injected `SessionRevocationPort` confirms
 that admitted registrations and run callbacks have been invalidated. Delivery
 uses a stable event request ID across retries. Failed delivery returns an unknown
 commit outcome while fresh admissions already see the durable denial. Logout

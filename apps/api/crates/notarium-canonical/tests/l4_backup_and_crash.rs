@@ -18,10 +18,10 @@ use std::{
 };
 
 use notarium_canonical::{
-    BackupArtifactEncoding, BlobBackendConfig, CanonicalConfig, CanonicalRuntime, CanonicalStore,
-    CollabRoomState, CreateSpaceSpec, DataRootOwnerLock, OpenCollabSession, PostgresSpoolValue,
-    S3BucketModePolicy, SqlBackendConfig, WriterConfig, blobs::s3::admin_ensure_bucket,
-    decode_postgres_spool_v1, default_backup_budget,
+    BackupArtifactEncoding, BlobBackendConfig, CANONICAL_SCHEMA_VERSION, CanonicalConfig,
+    CanonicalRuntime, CanonicalStore, CollabRoomState, CreateSpaceSpec, DataRootOwnerLock,
+    OpenCollabSession, PostgresSpoolValue, S3BucketModePolicy, SqlBackendConfig, WriterConfig,
+    blobs::s3::admin_ensure_bucket, decode_postgres_spool_v1, default_backup_budget,
 };
 use notarium_core::{
     auth::{EngineAuthContext, SpaceGrant, SpaceKind, SpaceRole, VerifiedHuman},
@@ -29,16 +29,16 @@ use notarium_core::{
     epoch::DataRoot,
     error::{CommitEffect, OperationalFailure, PortError, RetryAdvice, ValidationReason},
     ids::{
-        ArtifactId, BackupId, CommandKey, ContentDigest, GrantId, InstallationId, LeaseEpoch,
-        NoteId, PrincipalId, RequestId, SpaceSeq,
+        ArtifactId, BackupId, ChatThreadId, CommandKey, ContentDigest, GrantId, InstallationId,
+        LeaseEpoch, NoteId, PrincipalId, RequestId, SpaceSeq, ThreadEntrySeq,
     },
     model::HistoryScope,
     ports::{
         BackupBudget, BackupHold, BackupParticipantPort, BackupSnapshot, BackupSpool,
-        BackupWitness, CallBudget, Cancellation, ChangeBroadcast, ChangeNotice, CreateNote,
-        DeleteDisposition, DeleteNote, GetNote, MaintenanceContext, Mutation, NoteWritePort,
-        PausedBackup, PortFuture, Preconditions, PreparedBackup, RenameNote, ServicePurpose,
-        SpaceContext,
+        BackupWitness, CallBudget, Cancellation, ChangeBroadcast, ChangeNotice, ChatBody,
+        ChatEntryKind, ChatPort, ChatRead, CreateNote, DeleteDisposition, DeleteNote, GetNote,
+        MaintenanceContext, Mutation, NoteWritePort, PageLimit, PausedBackup, PortFuture,
+        Preconditions, PreparedBackup, RenameNote, ServicePurpose, SpaceContext,
     },
     receipt::{CausalBasis, ChangeCursor, CommandIdentity, ReceiptSet},
 };
@@ -1092,6 +1092,7 @@ async fn failed_temp_unlink_retains_its_recovery_marker() {
 #[tokio::test]
 async fn restores_historical_postgres_spools_and_rejects_invalid_headers() {
     // Each file came from its version's PostgreSQL participant with a single synthetic Space.
+    // The v6 archive also carries a chat from commit 0e943be5.
     let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
     let case = BackendCase::open_pg_s3().await;
     for (version, install, space_id, slug, table_count, queue_columns) in [
@@ -1100,6 +1101,7 @@ async fn restores_historical_postgres_spools_and_rejects_invalid_headers() {
         (3, 0x62, 0xB2, "backup-178", 36, 14),
         (4, 0x62, 0xB2, "backup-178", 36, 14),
         (5, 0x62, 0xB2, "backup-178", 36, 14),
+        (6, 0x62, 0xB2, "backup-178", 36, 14),
     ] {
         let fixture = directory.join(format!("schema-v{version}.pgspool"));
         let decoded = decode_postgres_spool_v1(&fixture).unwrap();
@@ -1194,6 +1196,62 @@ async fn restores_historical_postgres_spools_and_rejects_invalid_headers() {
             .await
             .unwrap();
             assert_eq!(key, ("status".to_owned(), "space_id".to_owned()));
+            if version == 6 {
+                sqlx::query(sqlx::AssertSqlSafe(format!("SET search_path TO {schema}")))
+                    .execute(&mut db)
+                    .await
+                    .unwrap();
+                let schema_version: i32 =
+                    sqlx::query_scalar("SELECT schema_version FROM schema_meta")
+                        .fetch_one(&mut db)
+                        .await
+                        .unwrap();
+                assert_eq!(
+                    u32::try_from(schema_version).unwrap(),
+                    CANONICAL_SCHEMA_VERSION
+                );
+                let entries: Vec<(i64, Option<i32>, i32, Option<String>)> = sqlx::query_as(
+                    "SELECT entry_seq, human_origin, body_format, provenance_json
+                     FROM chat_entries ORDER BY entry_seq",
+                )
+                .fetch_all(&mut db)
+                .await
+                .unwrap();
+                assert_eq!(
+                    entries,
+                    [
+                        (1, Some(1), 0, None),
+                        (2, None, 0, None),
+                        (3, Some(0), 0, None)
+                    ]
+                );
+                let branch = restored
+                    .read_chat(
+                        owner_ctx(&cut.scope, sample_principal_id(space_id)),
+                        ChatRead {
+                            thread: ChatThreadId::from_bytes([0xC6; 16]),
+                            leaf: ThreadEntrySeq::new(3).unwrap(),
+                            before: None,
+                            max_entries: PageLimit::new(3).unwrap(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(branch.thread.title, "Historical chat");
+                let bodies: Vec<_> = branch
+                    .entries
+                    .into_iter()
+                    .map(|entry| (entry.kind, entry.body))
+                    .collect();
+                assert_eq!(
+                    bodies,
+                    [
+                        (ChatEntryKind::Human, ChatBody::Inline("Question".into())),
+                        (ChatEntryKind::Redacted, ChatBody::Redacted),
+                        (ChatEntryKind::Model, ChatBody::Inline("Answer".into())),
+                    ]
+                );
+            }
         }
         if let Some((db, scopes, digest, raw)) = migrated_db.as_mut() {
             let result: i32 =

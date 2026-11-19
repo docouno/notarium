@@ -102,64 +102,78 @@ pub(super) async fn claim(
     let deadline = crate::domain::common::CommandDeadline::start(&ctx.budget, "claim_chat_run");
     let budget = ctx.budget.clone();
     let owned = store.clone();
+    let effect = ctx.canonical_effect().cloned();
     store
-        .with_auxiliary_command(Some((&budget, deadline)), Ok, move |tx| {
-            Box::pin(async move {
-                let space = lock_space(&owned, tx, &ctx).await?;
-                authorize_chat_write_on_space(ctx.auth(), &space.space)?;
-                let thread =
-                    load_thread_head_tx(tx, &space.scope.space_id, &request.thread).await?;
-                authorize_thread_mutation(ctx.auth(), &space.space, &thread, false)?;
-                let current = thread.active_run_id.as_ref();
-                let valid_owner = use_current_claim(&thread, &owned, &space);
-                if current == Some(&request.run) && valid_owner {
-                    authorize_current_leaf(tx, ctx.auth(), &space, &thread).await?;
-                    return Ok(ClaimChatRunOutcome::Claimed);
-                }
-                if let Some(current) = current
-                    && (Some(current) != request.previous_run.as_ref() || !valid_owner)
-                {
-                    return Ok(ClaimChatRunOutcome::Busy(current.clone()));
-                }
-                if current != request.previous_run.as_ref()
-                    || thread.head_leaf_seq != request.expected_leaf
-                {
-                    return Ok(ClaimChatRunOutcome::Changed);
-                }
-                authorize_current_leaf(tx, ctx.auth(), &space, &thread).await?;
-                if request.previous_run.is_some() {
-                    let author = ctx.auth().principal();
-                    let Some((base, mentions)) =
-                        queued_human_leaf(tx, &space, &request, author).await?
-                    else {
-                        return Ok(ClaimChatRunOutcome::Changed);
-                    };
-                    if thread.kind == ChatThreadKind::SpaceGroup
-                        && (mentions == 0
-                            || other_human_on_branch(
-                                tx,
-                                &space.scope.space_id,
-                                &request.thread,
-                                request.expected_leaf,
-                                seq_from_db(base)?,
-                                author.as_str(),
-                            )
-                            .await?)
+        .with_auxiliary_command(
+            Some((&budget, deadline)),
+            move |result| {
+                drop(effect);
+                Ok(result)
+            },
+            move |tx| {
+                Box::pin(async move {
+                    let space = lock_space(&owned, tx, &ctx).await?;
+                    if let Some(effect) = ctx.canonical_effect() {
+                        effect.check()?;
+                    }
+                    authorize_chat_write_on_space(ctx.auth(), &space.space)?;
+                    let thread =
+                        load_thread_head_tx(tx, &space.scope.space_id, &request.thread).await?;
+                    authorize_thread_mutation(ctx.auth(), &space.space, &thread, false)?;
+                    let current = thread.active_run_id.as_ref();
+                    let valid_owner = use_current_claim(&thread, &owned, &space);
+                    if current == Some(&request.run) && valid_owner {
+                        authorize_current_leaf(tx, ctx.auth(), &space, &thread).await?;
+                        return Ok(ClaimChatRunOutcome::Claimed);
+                    }
+                    if let Some(current) = current
+                        && (Some(current) != request.previous_run.as_ref() || !valid_owner)
+                    {
+                        return Ok(ClaimChatRunOutcome::Busy(current.clone()));
+                    }
+                    if current != request.previous_run.as_ref()
+                        || thread.head_leaf_seq != request.expected_leaf
                     {
                         return Ok(ClaimChatRunOutcome::Changed);
                     }
-                }
-                set_active(
-                    tx,
-                    &space,
-                    &request.thread,
-                    Some(&request.run),
-                    &owned.inner.chat_run_generation,
-                )
-                .await?;
-                Ok(ClaimChatRunOutcome::Claimed)
-            })
-        })
+                    authorize_current_leaf(tx, ctx.auth(), &space, &thread).await?;
+                    if request.previous_run.is_some() {
+                        let author = ctx.auth().principal();
+                        let Some((base, mentions)) =
+                            queued_human_leaf(tx, &space, &request, author).await?
+                        else {
+                            return Ok(ClaimChatRunOutcome::Changed);
+                        };
+                        if thread.kind == ChatThreadKind::SpaceGroup
+                            && (mentions == 0
+                                || other_human_on_branch(
+                                    tx,
+                                    &space.scope.space_id,
+                                    &request.thread,
+                                    request.expected_leaf,
+                                    seq_from_db(base)?,
+                                    author.as_str(),
+                                )
+                                .await?)
+                        {
+                            return Ok(ClaimChatRunOutcome::Changed);
+                        }
+                    }
+                    if let Some(effect) = ctx.canonical_effect() {
+                        effect.check()?;
+                    }
+                    set_active(
+                        tx,
+                        &space,
+                        &request.thread,
+                        Some(&request.run),
+                        &owned.inner.chat_run_generation,
+                    )
+                    .await?;
+                    Ok(ClaimChatRunOutcome::Claimed)
+                })
+            },
+        )
         .await
         .map_err(|error| crate::codec::retry_unknown_commit("claim_chat_run", error))
 }
@@ -223,16 +237,21 @@ pub(super) async fn finish(
     let deadline = crate::domain::common::CommandDeadline::start(&ctx.budget, "finish_chat_run");
     let budget = ctx.budget.clone();
     let owned = store.clone();
+    let effect = ctx.canonical_effect().cloned();
     store
         .with_auxiliary_command(
             Some((&budget, deadline)),
-            |(outcome, cleanup)| {
+            move |(outcome, cleanup)| {
+                drop(effect);
                 drop(cleanup);
                 Ok(outcome)
             },
             move |tx| {
                 Box::pin(async move {
                     let space = lock_space(&owned, tx, &ctx).await?;
+                    if let Some(effect) = ctx.canonical_effect() {
+                        effect.check()?;
+                    }
                     let thread =
                         load_thread_head_tx(tx, &space.scope.space_id, &request.thread).await?;
                     let closing = !recover && space.space.lifecycle != SpaceLifecycle::Active;

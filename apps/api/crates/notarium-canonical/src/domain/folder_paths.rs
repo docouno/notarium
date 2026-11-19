@@ -3,12 +3,13 @@ use std::collections::BTreeMap;
 use notarium_core::{
     DomainError,
     auth::{EngineAuthContext, SpaceLifecycle},
+    classes::DocClass,
     error::{PortError, ValidationReason},
-    ids::{FolderId, NoteId, SpaceSeq},
+    ids::{ContentDigest, FolderId, NoteId, RevisionId, SpaceSeq},
     model::{FolderRef, Lifecycle, NoteRef, PathTarget},
     ports::{
-        ChildFolders, CommandSeqRange, EnsureFolderPath, FolderSnapshot, Mutation, PageLimit,
-        SpaceContext,
+        ChildFolders, CommandSeqRange, ConfirmedChatStep, EnsureFolderPath, FolderSnapshot,
+        Mutation, PageLimit, SpaceContext,
     },
     query::FieldSchema,
     receipt::MutationReceiptToken,
@@ -23,7 +24,9 @@ use crate::{
         encode_timestamp_parts, internal_not_committed, new_prefixed_hex_id, new_revision_id,
         normalize_slug_key, now_utc_timestamp, ordered_id_16,
     },
-    runtime::{insert_revision_row, load_folder_head_row, load_space_record},
+    runtime::{
+        insert_revision_row, load_folder_head_row, load_space_record, read_immutable_revision_tx,
+    },
     sql_exec::BackendConn,
     writer::{
         BatchEventDraft, ItemCommitArtifacts, PreparedWriteIntent,
@@ -206,6 +209,7 @@ async fn snapshot(
         history: space.scope.clone(),
         revision: row.head_rev_id,
         path: ancestry.folder_path,
+        ancestor_folders: ancestry.ancestors,
         name: row.display_name,
         parent: row.parent_folder_id,
         project: ancestry.project,
@@ -305,9 +309,21 @@ pub(super) async fn ensure(
         .input
         .base
         .unwrap_or_else(|| space.root_folder_id.clone());
+    let confirmed = ctx.confirmed_chat_step().cloned();
+    if let Some(step) = &confirmed {
+        let approved = step.destination().ok_or_else(invalid_destination)?;
+        if approved.anchor.folder_id != base
+            || approved.missing_suffix != request.input.path
+            || parts.is_empty()
+            || (step.witness().tool_name() == "move_note") != approved.move_source.is_some()
+        {
+            return Err(invalid_destination());
+        }
+    }
     let hash = format!("{}\0{}", base.as_str(), request.input.path);
     let idemp =
         derive_command_identity_spec(&request.identity, "ensure_folder_path", hash.as_bytes())
+            .with_canonical_effect(&ctx)
             .with_confirmed_chat_step(&ctx, "ensure_folder_path")
             .with_policy(
                 ctx.auth(),
@@ -325,11 +341,18 @@ pub(super) async fn ensure(
         .await?;
     if let Some(replay) = replay {
         ctx.budget.remaining = deadline.remaining(&budget)?;
-        return verify_ensured_folder(store, &ctx, base, replay.into_committed().value).await;
+        return verify_ensured_folder(
+            store,
+            &ctx,
+            confirmed.is_none().then_some(base),
+            replay.into_committed().value,
+        )
+        .await;
     }
     ctx.budget.remaining = deadline.remaining(&budget)?;
-    if let Some(found) =
-        resolve_with_components(store, &ctx, Some(base.clone()), parts.clone(), false).await?
+    if confirmed.is_none()
+        && let Some(found) =
+            resolve_with_components(store, &ctx, Some(base.clone()), parts.clone(), false).await?
     {
         return Ok(found.reference);
     }
@@ -340,11 +363,15 @@ pub(super) async fn ensure(
         let auth = ctx.auth().clone();
         let base = base.clone();
         let parts = parts.clone();
+        let confirmed = confirmed.clone();
+        let move_source = confirmed
+            .as_ref()
+            .and_then(|step| step.destination()?.move_source.clone());
         PreparedWriteIntent {
             scope: space.scope.clone(),
             active_epoch: space.active_epoch,
             idempotency: Some(idemp),
-            source_note_ids: Vec::new(),
+            source_note_ids: move_source.iter().map(|(note, _)| note.clone()).collect(),
             staged_bytes: 0,
             required_semantic_cut: None,
             execute: Box::new(move |tx, item| {
@@ -354,18 +381,11 @@ pub(super) async fn ensure(
                     if live.space.lifecycle != SpaceLifecycle::Active {
                         return Err(DomainError::ResourceNotFound.into());
                     }
-                    let mut folder = base.clone();
-                    let mut existing_count = 0;
-                    for (_, folded) in &parts {
-                        let Some(found) =
-                            resolve_folder_component_tx(tx, &live, &auth, &folder, folded, false)
-                                .await?
-                        else {
-                            break;
-                        };
-                        folder = found.folder_id;
-                        existing_count += 1;
-                    }
+                    let (mut folder, existing_count) = if let Some(step) = &confirmed {
+                        confirmed_prefix_tx(tx, &live, &auth, step, &parts).await?
+                    } else {
+                        existing_prefix_tx(tx, &live, &auth, base.clone(), &parts, None).await?
+                    };
                     let missing = &parts[existing_count..];
                     if missing.is_empty() {
                         return Err(DomainError::PathConflict {
@@ -377,9 +397,15 @@ pub(super) async fn ensure(
                         }
                         .into());
                     }
-                    let class = folder_mutation_class(&auth, &scope.space_id)?;
-                    let mut cache = FolderAncestryCache::default();
-                    let (facts, ancestry) = cache
+                    let class = if confirmed.is_some() && move_source.is_none() {
+                        DocClass::UserDoc
+                    } else {
+                        folder_mutation_class(&auth, &scope.space_id)?
+                    };
+                    if let Some(source) = &move_source {
+                        check_move_source_tx(tx, &live, &auth, source).await?;
+                    }
+                    let (facts, ancestry) = FolderAncestryCache::default()
                         .build_resource_facts_tx(tx, &live.space, &folder, class, None, true)
                         .await?;
                     auth.authorize_direct_write(&facts, &facts)?;
@@ -395,12 +421,23 @@ pub(super) async fn ensure(
                     let mut events = Vec::with_capacity(missing.len());
                     let now = now_utc_timestamp()?;
                     let run = extract_agent_run_from_auth(&auth);
+                    let confirmation = confirmed.as_deref().map(confirmation_marker);
                     for (slug, folded) in missing {
                         let id = FolderId::from_bytes(ordered_id_16()?);
                         let seq = item.alloc_next_seq()?;
                         events.push(
                             insert_child(
-                                tx, &live, &auth, &folder, &id, slug, folded, seq, last, now,
+                                tx,
+                                &live,
+                                &auth,
+                                &folder,
+                                &id,
+                                slug,
+                                folded,
+                                seq,
+                                last,
+                                now,
+                                confirmation,
                             )
                             .await?,
                         );
@@ -458,6 +495,9 @@ pub(super) async fn ensure(
         Ok(result) => Ok(result.into_committed().value),
         Err(PortError::Domain(DomainError::PathConflict { .. })) => {
             ctx.budget.remaining = deadline.remaining(&budget)?;
+            if let Some(step) = confirmed {
+                return confirmed_existing(store, &ctx, step.as_ref(), &parts).await;
+            }
             resolve_with_components(store, &ctx, Some(base), parts, false)
                 .await?
                 .map(|found| found.reference)
@@ -470,7 +510,7 @@ pub(super) async fn ensure(
 async fn verify_ensured_folder(
     store: &CanonicalStore,
     ctx: &SpaceContext,
-    base: FolderId,
+    base: Option<FolderId>,
     reference: FolderRef,
 ) -> Result<FolderRef, PortError> {
     let scope = ctx.scope().clone();
@@ -502,13 +542,177 @@ async fn verify_ensured_folder(
                     &auth,
                     &mut folders,
                     &reference.folder_id,
-                    Some(&base),
+                    base.as_ref(),
                 )
                 .await?;
                 Ok(reference)
             })
         })
         .await
+}
+
+fn invalid_destination() -> PortError {
+    DomainError::validation(ValidationReason::InvalidAuthority).into()
+}
+
+fn confirmation_marker(step: &ConfirmedChatStep) -> ContentDigest {
+    let tool = step.witness().tool();
+    let mut hash = blake3::Hasher::new_derive_key("notarium confirmed folder creation v1");
+    hash.update(tool.revision.as_str().as_bytes());
+    hash.update(tool.digest.as_bytes());
+    ContentDigest::from_bytes(*hash.finalize().as_bytes())
+}
+
+async fn existing_prefix_tx(
+    tx: &mut BackendConn<'_>,
+    space: &SpaceRecord,
+    auth: &EngineAuthContext,
+    mut parent: FolderId,
+    parts: &[(String, String)],
+    confirmation: Option<ContentDigest>,
+) -> Result<(FolderId, usize), PortError> {
+    for (index, (_, folded)) in parts.iter().enumerate() {
+        let Some(found) =
+            resolve_folder_component_tx(tx, space, auth, &parent, folded, false).await?
+        else {
+            return Ok((parent, index));
+        };
+        if let Some(confirmation) = confirmation {
+            let head = load_folder_head_row(tx, &space.scope.space_id, &found.folder_id).await?;
+            let revision = read_immutable_revision_tx(
+                tx,
+                &space.scope,
+                "folder",
+                found.folder_id.as_str(),
+                SpaceSeq::MAX,
+            )
+            .await?;
+            if !revision.is_some_and(|revision| {
+                revision.revision_id == head.head_rev_id
+                    && matches!(revision.metadata.payload, RevisionMetadataPayload::Folder(folder)
+                        if folder.confirmation == Some(confirmation))
+            }) {
+                return Err(DomainError::RevisionConflict {
+                    current: head.head_rev_id,
+                    lineage: None,
+                }
+                .into());
+            }
+        }
+        parent = found.folder_id;
+    }
+    Ok((parent, parts.len()))
+}
+
+async fn confirmed_prefix_tx(
+    tx: &mut BackendConn<'_>,
+    space: &SpaceRecord,
+    auth: &EngineAuthContext,
+    step: &ConfirmedChatStep,
+    parts: &[(String, String)],
+) -> Result<(FolderId, usize), PortError> {
+    let approved = step.destination().ok_or_else(invalid_destination)?;
+    let id = &approved.anchor.folder_id;
+    let ancestry = FolderAncestryCache::default()
+        .load_ancestry_tx(tx, &space.scope.space_id, id, true)
+        .await?;
+    auth.authorize_folder_read(&space.space, id, &ancestry.ancestors)?;
+    let anchor = load_folder_head_row(tx, &space.scope.space_id, id).await?;
+    if anchor.head_rev_id != approved.anchor_revision
+        || ancestry.folder_path != approved.anchor_path
+        || ancestry.ancestors != approved.anchor_ancestors
+    {
+        return Err(DomainError::RevisionConflict {
+            current: anchor.head_rev_id,
+            lineage: None,
+        }
+        .into());
+    }
+    existing_prefix_tx(
+        tx,
+        space,
+        auth,
+        id.clone(),
+        parts,
+        Some(confirmation_marker(step)),
+    )
+    .await
+}
+
+async fn confirmed_existing(
+    store: &CanonicalStore,
+    ctx: &SpaceContext,
+    step: &ConfirmedChatStep,
+    parts: &[(String, String)],
+) -> Result<FolderRef, PortError> {
+    let scope = ctx.scope().clone();
+    let auth = ctx.auth().clone();
+    let step = step.clone();
+    let parts = parts.to_vec();
+    store
+        .with_read_tx_budget(Some(&ctx.budget), |tx| {
+            Box::pin(async move {
+                let space = load_space_record(tx, &scope.space_id).await?;
+                space.scope.check(&scope)?;
+                crate::chats::verify_confirmed_chat_step_tx(
+                    tx,
+                    &auth,
+                    &scope,
+                    &step,
+                    "ensure_folder_path",
+                    false,
+                )
+                .await?;
+                let (folder_id, matched) =
+                    confirmed_prefix_tx(tx, &space, &auth, &step, &parts).await?;
+                if matched != parts.len() {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+                Ok(FolderRef {
+                    space_id: scope.space_id,
+                    folder_id,
+                })
+            })
+        })
+        .await
+}
+
+pub(super) async fn check_confirmed_note_destination_tx(
+    tx: &mut BackendConn<'_>,
+    space: &SpaceRecord,
+    auth: &EngineAuthContext,
+    step: &ConfirmedChatStep,
+    destination: &FolderId,
+) -> Result<(), PortError> {
+    let approved = step.destination().ok_or_else(invalid_destination)?;
+    let parts = components(&approved.missing_suffix)?;
+    let (folder, matched) = confirmed_prefix_tx(tx, space, auth, step, &parts).await?;
+    if matched != parts.len() || &folder != destination {
+        return Err(DomainError::ResourceNotFound.into());
+    }
+    Ok(())
+}
+
+async fn check_move_source_tx(
+    tx: &mut BackendConn<'_>,
+    space: &SpaceRecord,
+    auth: &EngineAuthContext,
+    (note, revision): &(NoteId, RevisionId),
+) -> Result<(), PortError> {
+    let head = load_note_head_row_tx(tx, &space.scope.space_id, note).await?;
+    if head.lifecycle != Lifecycle::Active {
+        return Err(DomainError::ResourceNotFound.into());
+    }
+    super::notes::authorize_note_placement_tx(tx, space, auth, &head, &head.parent_folder_id)
+        .await?;
+    if &head.head_rev_id != revision {
+        return Err(DomainError::RevisionConflict {
+            current: head.head_rev_id,
+            lineage: None,
+        }
+        .into());
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -523,6 +727,7 @@ async fn insert_child(
     seq: SpaceSeq,
     visibility: SpaceSeq,
     now: Timestamp,
+    confirmation: Option<ContentDigest>,
 ) -> Result<BatchEventDraft, PortError> {
     let revision = new_revision_id()?;
     let (sec, nsec) = encode_timestamp_parts(now);
@@ -559,6 +764,7 @@ async fn insert_child(
     }
     let metadata =
         RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Folder(FolderRevisionMetadata {
+            confirmation,
             folder_id: id.clone(),
             parent_folder_id: Some(parent.clone()),
             is_root: false,

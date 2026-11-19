@@ -1296,6 +1296,7 @@ impl CanonicalStore {
 
                 let meta_bytes = RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Folder(
                     FolderRevisionMetadata {
+                        confirmation: None,
                         folder_id: spec_cl.folder_id.clone(),
                         parent_folder_id: Some(parent_id.clone()),
                         is_root: false,
@@ -1590,6 +1591,7 @@ impl CanonicalStore {
 
                 let meta_bytes = RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Folder(
                     FolderRevisionMetadata {
+                        confirmation: None,
                         folder_id: folder_cl.clone(),
                         parent_folder_id: Some(parent_id),
                         is_root: false,
@@ -1808,6 +1810,7 @@ pub(crate) async fn create_space_tx(
     let root_rev_id = new_revision_id()?;
     let root_meta =
         RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Folder(FolderRevisionMetadata {
+            confirmation: None,
             folder_id: spec.root_folder_id.clone(),
             parent_folder_id: None,
             is_root: true,

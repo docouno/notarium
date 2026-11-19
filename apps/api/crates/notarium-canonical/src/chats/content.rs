@@ -51,7 +51,8 @@ pub(super) fn prepare(input: &mut AppendChat) -> Result<BodyFormat, PortError> {
         if !matches!(
             input.kind,
             ChatEntryKind::Model | ChatEntryKind::Tool { .. } | ChatEntryKind::Compaction
-        ) {
+        ) || (proof.compacts_through.is_some() && input.kind != ChatEntryKind::Compaction)
+        {
             return Err(DomainError::validation(ValidationReason::InvalidState).into());
         }
     }
@@ -232,6 +233,47 @@ impl PayloadRow {
     fn is_redacted(&self) -> bool {
         self.kind == "redacted"
     }
+}
+
+pub(super) async fn checkpoint_boundary(
+    store: &CanonicalStore,
+    ctx: &SpaceContext,
+    thread: &ChatThread,
+    checkpoint: ThreadEntrySeq,
+) -> Result<Option<ThreadEntrySeq>, PortError> {
+    let budget = ctx.budget.clone();
+    let ctx = ctx.clone();
+    let thread = thread.clone();
+    store
+        .with_read_tx_budget(Some(&budget), move |tx| {
+            Box::pin(async move {
+                let space = load_space_record(tx, &ctx.scope().space_id).await?;
+                ctx.check_current(&space.scope)?;
+                let head = load_thread_head_tx(tx, &space.scope.space_id, &thread.id).await?;
+                if head.head_rev_id != thread.revision {
+                    return Err(DomainError::RevisionConflict {
+                        current: head.head_rev_id,
+                        lineage: None,
+                    }
+                    .into());
+                }
+                let row = load_payload(tx, &space.scope.space_id, &thread.id, checkpoint).await?;
+                if row.kind != "compaction" {
+                    return Err(DomainError::validation(ValidationReason::SourceMismatch).into());
+                }
+                authorize_thread_read(
+                    ctx.auth(),
+                    &space.space,
+                    &thread.id,
+                    head.kind,
+                    &head.owner,
+                    head.project_folder.as_ref(),
+                    row.ext_space_tainted != 0,
+                )?;
+                Ok(row.provenance()?.and_then(|proof| proof.compacts_through))
+            })
+        })
+        .await
 }
 
 fn transcript(

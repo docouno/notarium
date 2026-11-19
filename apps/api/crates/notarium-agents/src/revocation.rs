@@ -1,6 +1,6 @@
 //! In-process revocation authority for the exclusive local DataRoot owner.
-//! All registry transitions are synchronous. Only provider socket leases drain
-//! while the Control writer is fenced.
+//! All registry transitions are synchronous. Provider sockets and bounded
+//! canonical effects drain while the Control writer is fenced.
 use notarium_core::{
     DomainError,
     auth::{EngineAuthContext, PrincipalKind},
@@ -521,6 +521,15 @@ impl Drop for RegistryLease {
 }
 
 impl SessionRevocationPort for RevocationHub {
+    fn register_canonical_effect(
+        &self,
+        ctx: MaintenanceContext,
+        selectors: Vec<RevocationSelector>,
+        cancellation: Cancellation,
+    ) -> PortFuture<'_, Box<dyn RevocationLease>> {
+        self.register_provider(ctx, selectors, cancellation)
+    }
+
     fn register_provider(
         &self,
         ctx: MaintenanceContext,

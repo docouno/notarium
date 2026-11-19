@@ -96,6 +96,7 @@ fn add(
             facts: ResourceFacts {
                 space: space.clone(),
                 class: DocClass::Skill,
+                project: None,
                 ancestor_folders: ancestors,
                 folder_write_locked: false,
                 ability_package: Some(reference.id.clone()),
@@ -1219,6 +1220,7 @@ async fn selected_project_bindings_and_paged_bulk_discovery(pg: bool) {
                 facts: ResourceFacts {
                     space: shared.space.clone(),
                     class: DocClass::Skill,
+                    project: None,
                     ancestor_folders: vec![],
                     folder_write_locked: false,
                     ability_package: Some(reference.id),

@@ -68,6 +68,7 @@ async fn payloads(pg: bool) {
             facts: ResourceFacts {
                 space: catalog.space,
                 class: DocClass::UserDoc,
+                project: None,
                 ancestor_folders: vec![],
                 folder_write_locked: false,
                 ability_package: None,

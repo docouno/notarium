@@ -256,6 +256,7 @@ impl ControlCatalogPort for Catalog {
             ctx.auth().can_view_resource(&ResourceFacts {
                 space: space.space,
                 class: notarium_core::classes::DocClass::UserDoc,
+                project: Some(project.folder_id.clone()),
                 ancestor_folders: vec![project.folder_id.clone()],
                 folder_write_locked: false,
                 ability_package: None,
@@ -516,6 +517,7 @@ impl ControlCatalogPort for Catalog {
             let facts = ResourceFacts {
                 space: space.clone(),
                 class: notarium_core::classes::DocClass::AgentMemory,
+                project: None,
                 ancestor_folders: ancestors,
                 folder_write_locked: false,
                 ability_package: None,
@@ -755,6 +757,43 @@ impl Observer {
             }
         }
     }
+    #[allow(
+        dead_code,
+        reason = "Used by the integrated Canonical revocation fixture"
+    )]
+    pub async fn seed_session(
+        &mut self,
+        account: &PrincipalId,
+        id: &AuthSessionId,
+        token: &notarium_control::auth::token::MintedToken,
+        now: i64,
+    ) {
+        let sql = "INSERT INTO sessions(session_id,token_hash,user_id,created_at,expires_at,last_used_at,auth_version)
+            SELECT $1,$2,user_id,$3,$4,$3,auth_version FROM users WHERE user_id=$5";
+        let query = sqlx::query(sql)
+            .bind(id.as_str())
+            .bind(token.digest.as_slice())
+            .bind(now)
+            .bind(now + 3_600_000)
+            .bind(account.as_str());
+        match self {
+            Self::Sqlite(conn) => {
+                query.execute(conn).await.unwrap();
+            }
+            Self::Postgres(conn) => {
+                sqlx::query(sql)
+                    .bind(id.as_str())
+                    .bind(token.digest.as_slice())
+                    .bind(now)
+                    .bind(now + 3_600_000)
+                    .bind(account.as_str())
+                    .execute(conn)
+                    .await
+                    .unwrap();
+            }
+        }
+    }
+
     pub async fn seed_oauth_access(
         &mut self,
         account: &PrincipalId,

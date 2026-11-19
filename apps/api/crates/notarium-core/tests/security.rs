@@ -1,4 +1,7 @@
-use notarium_core::{DomainError, auth::*, classes::*, ids::*, model::*, ports::AbilityPlacement};
+use notarium_core::{
+    DomainError, auth::*, classes::*, error::ValidationReason, ids::*, model::*,
+    ports::AbilityPlacement,
+};
 use std::collections::{BTreeMap, BTreeSet};
 
 fn grants(role: SpaceRole) -> BTreeMap<SpaceId, SpaceGrant> {
@@ -190,6 +193,7 @@ fn facts(space: u8, class: DocClass) -> ResourceFacts {
             kind: SpaceKind::Shared,
         },
         class,
+        project: None,
         ancestor_folders: vec![FolderId::from_bytes([3; 16])],
         folder_write_locked: false,
         ability_package: None,
@@ -271,6 +275,12 @@ fn provider_wrappers_are_rechecked_against_current_class_lifecycle_and_provenanc
     );
     let current = ProviderCurrentContent::Note(original.metadata());
     ClassEgressFence::revalidate(&admitted, &auth, &policy, &current).unwrap();
+    let reclassified =
+        ProviderCurrentContent::Note(doc(facts(1, DocClass::AgentMemory)).metadata());
+    assert_eq!(
+        ClassEgressFence::revalidate(&admitted, &auth, &policy, &reclassified),
+        Err(DomainError::validation(ValidationReason::SourceMismatch)),
+    );
     let encrypted = ProviderCurrentContent::Note(doc(facts(1, DocClass::EncryptedNote)).metadata());
     assert!(ClassEgressFence::revalidate(&admitted, &auth, &policy, &encrypted).is_err());
     assert!(ClassEgressFence::mcp_note(&doc(facts(1, DocClass::EncryptedNote)), &auth).is_err());
@@ -418,8 +428,9 @@ fn project_consent_covers_its_own_ability_and_the_spaces_ability() {
             digest,
         )
         .unwrap();
-        let part =
-            ProviderMessage::Ability(ClassEgressFence::ability(resource, &auth, &policy).unwrap());
+        let part = ProviderMessage::Ability(Box::new(
+            ClassEgressFence::ability(resource, &auth, &policy).unwrap(),
+        ));
         let current = ProviderCurrentContent::Ability {
             reference: reference.clone(),
             digest,

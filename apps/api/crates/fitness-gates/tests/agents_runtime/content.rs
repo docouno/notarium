@@ -199,18 +199,32 @@ pub(super) async fn edit_folder_cover_and_view(fixture: &RuntimeFixture, space: 
             .ends_with("/index.md")
     );
 
-    let batch = call(fixture, account, 148, "create_notes", json!({
+    let batch_input = json!({
         "project":project,
         "notes":[
-            {"title":"Source","body":"Source body.","links":[{"relation":"related","toTitle":"Destination"}]},
-            {"title":"Destination","body":"Destination body."},
+            {"title":"Source","body":"Source body.","links":[
+                {"relation":"related","toTitle":"Destination"},
+                {"relation":"blocked","toTitle":"Blocked"},
+            ]},
+            {"title":"Destination","fileName":"batch-target","body":"Destination body.",
+                "links":[{"relation":"back","toTitle":"Source"}]},
+            {"title":"Blocked","fileName":"batch-target","body":"Conflicting destination."},
             {"title":"Index","body":"Reserved ordinary name."}
         ],
-    })).await.unwrap();
+    });
+    let batch = call(fixture, account, 148, "create_notes", batch_input.clone())
+        .await
+        .unwrap();
+    let replay = call(fixture, account, 148, "create_notes", batch_input)
+        .await
+        .unwrap();
+    assert_eq!(batch.structured_content, replay.structured_content);
     let results = batch.structured_content["results"].as_array().unwrap();
     assert_eq!(results[0]["ok"], true);
     assert_eq!(results[1]["ok"], true);
     assert_eq!(results[2]["ok"], false);
+    assert_eq!(results[2]["error"], "path_conflict");
+    assert_eq!(results[3]["ok"], false);
     let source = results[0]["noteId"].as_str().unwrap();
     let target = results[1]["noteId"].as_str().unwrap();
     fixture.projections.include_notes([
@@ -244,11 +258,21 @@ pub(super) async fn edit_folder_cover_and_view(fixture: &RuntimeFixture, space: 
     let minted = call(fixture, account, 149, "get_note", json!({"ref":source}))
         .await
         .unwrap();
+    let carrier = minted.structured_content["content"].as_str().unwrap();
+    assert!(carrier.contains(&format!("- related: [[{target}|Destination]]")));
+    assert!(carrier.contains("- blocked: [[Blocked]]"));
+    assert_eq!(
+        minted.structured_content["versionToken"],
+        results[0]["versionToken"]
+    );
+    let destination = call(fixture, account, 166, "get_note", json!({"ref":target}))
+        .await
+        .unwrap();
     assert!(
-        minted.structured_content["content"]
+        destination.structured_content["content"]
             .as_str()
             .unwrap()
-            .contains(target)
+            .contains(&format!("- back: [[{source}|Source]]"))
     );
     let link_input = json!({"from":source,"to":target,"relation":"depends_on"});
     for _ in 0..2 {
@@ -296,9 +320,38 @@ pub(super) async fn edit_folder_cover_and_view(fixture: &RuntimeFixture, space: 
         "validation_failed"
     );
 
-    call(fixture, account, 161, "create_note", json!({
+    let legacy_create = call(fixture, account, 161, "create_note", json!({
         "project":project,"path":"archive","title":"Archived note","body":"Existing destination",
+        "versionToken":"v3:legacy-read-token",
     })).await.unwrap();
+    let archived = &legacy_create.structured_content["noteId"];
+    let conflict = call(
+        fixture,
+        account,
+        167,
+        "create_note",
+        json!({
+            "project":project,"path":"archive","title":"Archived note","body":"Would overwrite",
+            "versionToken":legacy_create.structured_content["versionToken"],
+        }),
+    )
+    .await
+    .err()
+    .unwrap();
+    assert_eq!(conflict.code(), "path_conflict");
+    let original = call(fixture, account, 168, "get_note", json!({"ref":archived}))
+        .await
+        .unwrap();
+    assert_eq!(
+        original.structured_content["versionToken"],
+        legacy_create.structured_content["versionToken"]
+    );
+    assert!(
+        original.structured_content["content"]
+            .as_str()
+            .unwrap()
+            .contains("Existing destination")
+    );
     call(
         fixture,
         account,

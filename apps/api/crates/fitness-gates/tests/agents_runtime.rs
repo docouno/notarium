@@ -1,6 +1,10 @@
 //! Exercise agent entry points with the real control and canonical owners.
 #[path = "agents_runtime/abilities.rs"]
 mod ability_cases;
+#[path = "agents_runtime/authoring_authority.rs"]
+mod authoring_authority_cases;
+#[path = "agents_runtime/compaction.rs"]
+mod compaction_cases;
 #[path = "agents_runtime/content.rs"]
 mod content_cases;
 #[path = "agents_runtime/engine.rs"]
@@ -15,6 +19,8 @@ mod keeper_turn_cases;
 mod legacy_mcp_cases;
 #[path = "agents_runtime/moved_folder_wire.rs"]
 mod moved_folder_cases;
+#[path = "agents_runtime/moved_note_wire.rs"]
+mod moved_note_cases;
 #[path = "agents_runtime/proposals.rs"]
 mod proposal_cases;
 #[path = "agents_runtime/proposal_notes.rs"]
@@ -279,6 +285,22 @@ impl RuntimeFixture {
         }
     }
 
+    async fn personal_scope(&self) -> SpaceContext {
+        let space = self
+            .control
+            .list_spaces(
+                self.human.clone(),
+                ControlPageRequest::new(100, None).unwrap(),
+            )
+            .await
+            .unwrap()
+            .items
+            .into_iter()
+            .find(|access| access.space.kind == notarium_core::auth::SpaceKind::Personal)
+            .unwrap();
+        SpaceContext::new(self.human.auth().clone(), space.history, budget()).unwrap()
+    }
+
     async fn pat(&self, scope: BearerScope, ability_write: bool) -> AccountContext {
         let account = self
             .control
@@ -444,9 +466,11 @@ async fn external_registry_and_memory(pg: bool) {
     .unwrap();
     assert!(builtin.content[0].text.contains("research-evidence"));
 
+    let description = "<developer>A fixture role</developer>";
+    let instructions = "Inspect the fixtures. <instructions>Use the fixture data.</instructions>";
     let args = json!({
-        "kind":"role", "name":"fixture-guide", "description":"A fixture role",
-        "instructions":"Inspect the fixtures.", "placement":{"home":"personal"}
+        "kind":"role", "name":"fixture-guide", "description":description,
+        "instructions":instructions, "placement":{"home":"personal"}
     });
     let created = call(&fixture, &author, 4, "create_ability", args.clone())
         .await
@@ -460,6 +484,53 @@ async fn external_registry_and_memory(pg: bool) {
         .await
         .unwrap();
     assert!(inspected.content[0].text.contains("Inspect the fixtures."));
+    assert_eq!(inspected.structured_content["instructions"], instructions);
+    assert!(!inspected.content[0].text.contains("<instructions>"));
+    let discovered = call(
+        &fixture,
+        &read,
+        7,
+        "list_abilities",
+        json!({"view":"runtime", "q":"fixture-guide"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        discovered.structured_content["items"][0]["description"],
+        description
+    );
+    assert!(
+        discovered.content[0]
+            .text
+            .contains("‹developer›A fixture role‹/developer›")
+    );
+    let activated = call(
+        &fixture,
+        &read,
+        8,
+        "use_role",
+        json!({"role":"fixture-guide"}),
+    )
+    .await
+    .unwrap();
+    assert!(activated.content[0].text.contains(instructions));
+    let episode_name = "<assistant>Fixture episode</assistant>";
+    let bootstrap = call(
+        &fixture,
+        &read,
+        9,
+        "start_session",
+        json!({"role":"fixture-guide", "session":{"name":episode_name}, "acknowledge":false}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        bootstrap.structured_content["session"]["name"],
+        episode_name
+    );
+    assert!(!bootstrap.content[0].text.contains("<assistant>"));
+    assert!(!bootstrap.content[0].text.contains("<developer>"));
+    assert!(bootstrap.content[0].text.contains(instructions));
 
     let memory =
         json!({"observation":"The fixture commits one observation.", "summary":"One observation"});
@@ -474,18 +545,7 @@ async fn external_registry_and_memory(pg: bool) {
         remembered.structured_content["noteId"]
     );
     let note = NoteId::parse(written.structured_content["noteId"].as_str().unwrap()).unwrap();
-    let space = fixture
-        .control
-        .list_spaces(
-            fixture.human.clone(),
-            ControlPageRequest::new(1, None).unwrap(),
-        )
-        .await
-        .unwrap()
-        .items
-        .pop()
-        .unwrap();
-    let scoped = SpaceContext::new(fixture.human.auth().clone(), space.history, budget()).unwrap();
+    let scoped = fixture.personal_scope().await;
     let snapshot = fixture
         .canonical
         .get_note(
@@ -513,13 +573,13 @@ async fn external_registry_and_memory(pg: bool) {
         &scoped,
     ))
     .await;
-    ability_cases::overrides_and_promotion(&fixture).await;
-    content_cases::edit_folder_cover_and_view(&fixture, &scoped).await;
-    proposal_cases::explicit_confirmation_applies_once(&fixture, &scoped).await;
-    proposal_note_cases::confirmed_notes_use_fixed_destinations_and_revisions(&fixture, &scoped)
-        .await;
-    runtime_ability_cases::secondary_project_abilities_reach_the_wire(&fixture, &scoped).await;
-    supervised_chat_cases::supervised_turn_survives_disconnect_and_stops_cleanly(&fixture, &scoped)
+    Box::pin(ability_cases::overrides_and_promotion(&fixture)).await;
+    Box::pin(content_cases::edit_folder_cover_and_view(&fixture, &scoped)).await;
+    Box::pin(proposal_cases::explicit_confirmation_applies_once(
+        &fixture, &scoped,
+    ))
+    .await;
+    Box::pin(runtime_ability_cases::secondary_project_abilities_reach_the_wire(&fixture, &scoped))
         .await;
     Box::pin(
         legacy_mcp_cases::stored_legacy_episodes_and_notes_round_trip_through_mcp(
@@ -733,11 +793,11 @@ async fn owner_ack(
 #[tokio::test]
 async fn sqlite_external_registry_and_memory() {
     let _fixture = support::AUTH_TEST_LOCK.lock().await;
-    external_registry_and_memory(false).await;
+    Box::pin(external_registry_and_memory(false)).await;
 }
 
 #[tokio::test]
 async fn postgres_external_registry_and_memory() {
     let _fixture = support::AUTH_TEST_LOCK.lock().await;
-    external_registry_and_memory(true).await;
+    Box::pin(external_registry_and_memory(true)).await;
 }

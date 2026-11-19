@@ -428,6 +428,9 @@ pub struct NoteRevisionMetadata {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FolderRevisionMetadata {
+    /// Only folder creations inside one confirmed proposal share this witness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmation: Option<ContentDigest>,
     pub folder_id: FolderId,
     pub parent_folder_id: Option<FolderId>,
     pub is_root: bool,

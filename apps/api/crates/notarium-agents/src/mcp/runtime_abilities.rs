@@ -336,11 +336,11 @@ impl<'a> Reader<'a> {
                 {
                     return Err(DomainError::AccessDenied.into());
                 }
-                ProviderMessage::Ability(ClassEgressFence::ability(
+                ProviderMessage::Ability(Box::new(ClassEgressFence::ability(
                     body,
                     source.auth(),
                     &selection.policy,
-                )?)
+                )?))
             } else {
                 let builtin = read_system_ability(&self.account(), &descriptor.reference)?;
                 ProviderMessage::SystemAbility(ClassEgressFence::system_ability(

@@ -517,10 +517,13 @@ same example against an isolated prefix.
   volume, where lookup checks file size and BLAKE3 before returning the path.
   Startup reconciles abandoned holds and pending local artifacts.
   The offline `notarium_canonical::backup::decode_postgres_spool_v1_bounded`
-  API verifies the trailer and recognizes the exact manifests for schemas 1 through 7.
+  API verifies the trailer and recognizes the exact manifests for schemas 1 through 8.
   It returns typed rows in the original table and column order within the
   caller's byte budget. To materialize a historical spool, create an empty
-  target with `schema::POSTGRES_BASELINE_DDL`. For versions 1 through 6,
+  target with `schema::POSTGRES_BASELINE_DDL`. For versions 1 through 7,
+  replace `idx_ability_packages_active_slug` with the unique predecessor index
+  `uq_ability_packages_active_slug` on `(space_id, slug_fold)` where
+  `lifecycle_state = 'active'`. For versions 1 through 6,
   remove the chat columns and index added in version 7 using
   `tests/fixtures/chat-schema-v6-only.sql` in the canonical crate.
   For versions 1 through 5, rebuild `idx_blob_retirements_status` on
@@ -539,8 +542,8 @@ same example against an isolated prefix.
   temporary table, then inserts the full set in one statement so foreign keys
   can resolve parents that appear later in the archive.
   Opening the target with the original installation ID applies the remaining
-  migrations through version 7. The canonical L4 backup suite exercises this
-  procedure with archives from versions 1 through 5.
+  migrations through version 8. The canonical L4 backup suite exercises this
+  procedure with archives from versions 1 through 6.
   Before serving the restored database, call `restore_cursors` with each
   original cutoff and a fresh history incarnation. The same transaction
   rotates the writer epoch and fences active rooms, retaining their snapshots,

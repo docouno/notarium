@@ -341,6 +341,7 @@ fn personal_ability(fixture: &Fixture, space: &Space, owner: &PrincipalId, tag: 
             facts: ResourceFacts {
                 space: space.clone(),
                 class: DocClass::Skill,
+                project: None,
                 ancestor_folders: vec![],
                 folder_write_locked: false,
                 ability_package: Some(reference.id.clone()),

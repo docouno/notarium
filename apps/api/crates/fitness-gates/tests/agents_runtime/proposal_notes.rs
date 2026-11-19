@@ -6,7 +6,29 @@ use notarium_core::{
     ports::provider::{ProviderToolCall, ProviderToolCallId},
 };
 
-pub(super) async fn confirmed_notes_use_fixed_destinations_and_revisions(
+#[tokio::test]
+async fn sqlite_confirmed_notes_use_fixed_destinations_and_revisions() {
+    let _fixture = support::AUTH_TEST_LOCK.lock().await;
+    Box::pin(exercise(false)).await;
+}
+
+#[tokio::test]
+async fn postgres_confirmed_notes_use_fixed_destinations_and_revisions() {
+    let _fixture = support::AUTH_TEST_LOCK.lock().await;
+    Box::pin(exercise(true)).await;
+}
+
+async fn exercise(pg: bool) {
+    let fixture = Box::pin(RuntimeFixture::open_named(pg, "agents_proposal_notes")).await;
+    let personal = fixture.personal_scope().await;
+    Box::pin(confirmed_notes_use_fixed_destinations_and_revisions(
+        &fixture, &personal,
+    ))
+    .await;
+    Box::pin(fixture.close()).await;
+}
+
+async fn confirmed_notes_use_fixed_destinations_and_revisions(
     fixture: &RuntimeFixture,
     personal: &SpaceContext,
 ) {
@@ -52,8 +74,11 @@ pub(super) async fn confirmed_notes_use_fixed_destinations_and_revisions(
     let (create, _) = pending_note_action(fixture, personal, 178, "create_notes", json!({
         "project": project,
         "notes": [
-            {"title":"Approved draft", "body":"# Approved draft\n\nOriginal paragraph.", "path":path},
+            {"title":"Approved draft", "body":"# Approved draft\n\nOriginal paragraph.", "path":path,
+                "links":[{"relation":"related", "toTitle":"Conflicting draft"}]},
             {"title":"Conflicting draft", "fileName":"approved-draft", "body":"Conflicting content.", "path":path},
+            {"title":"Sibling draft", "body":"Shares a newly materialized prefix.", "path":"drafts/sibling"},
+            {"title":"Companion draft", "body":"Shares the full destination.", "path":path},
         ],
     })).await;
     assert!(destination().await.unwrap().is_none());
@@ -89,6 +114,8 @@ pub(super) async fn confirmed_notes_use_fixed_destinations_and_revisions(
     assert_eq!(results[0]["ok"], true);
     assert_eq!(results[1]["ok"], false);
     assert_eq!(results[1]["error"], "path_conflict");
+    assert_eq!(results[2]["ok"], true);
+    assert_eq!(results[3]["ok"], true);
     let note = NoteId::parse(results[0]["noteId"].as_str().unwrap()).unwrap();
     let folder = destination().await.unwrap().unwrap();
     let snapshot = fixture
@@ -104,12 +131,117 @@ pub(super) async fn confirmed_notes_use_fixed_destinations_and_revisions(
         .await
         .unwrap();
     assert_eq!(snapshot.parent, Some(folder.reference.folder_id));
+    let carrier = snapshot.document.explicit_read(owner.auth()).unwrap();
+    assert!(carrier.contains("Original paragraph."));
+    assert!(carrier.contains("- related: [[Conflicting draft]]"));
+
+    let (additive, _) = pending_note_action(
+        fixture,
+        personal,
+        181,
+        "create_note",
+        json!({
+            "project":project, "path":path, "title":"Additive draft", "body":"Additive content.",
+            "versionToken":"v3:legacy-read-token",
+        }),
+    )
+    .await;
+    let additive = fixture
+        .registry
+        .apply_proposed_diff(owner.clone(), additive)
+        .await
+        .unwrap();
+    assert_eq!(additive["outcome"], "created");
+
+    let (occupied, _) = pending_note_action(
+        fixture,
+        personal,
+        46,
+        "create_note",
+        json!({
+            "project":project, "path":"occupied/missing-child", "title":"Pending draft",
+            "body":"Do not reuse an independently created prefix.",
+        }),
+    )
+    .await;
+    call(fixture, owner, 49, "create_note", json!({
+        "project":project, "path":"occupied", "title":"Independent draft", "body":"Creates the prefix.",
+    })).await.unwrap();
+    assert_eq!(
+        fixture
+            .registry
+            .apply_proposed_diff(owner.clone(), occupied)
+            .await
+            .unwrap_err()
+            .code(),
+        "revision_conflict",
+    );
     assert!(
-        snapshot
-            .document
-            .explicit_read(owner.auth())
+        fixture
+            .canonical
+            .resolve_folder_path(
+                personal.clone(),
+                Some(project_folder.clone()),
+                "occupied/missing-child".into(),
+            )
+            .await
             .unwrap()
-            .contains("Original paragraph.")
+            .is_none()
+    );
+
+    let (displaced, _) = pending_note_action(
+        fixture,
+        personal,
+        50,
+        "create_note",
+        json!({
+            "project":project, "path":path, "title":"Displaced draft",
+            "body":"Commit only at the exact approved path.",
+        }),
+    )
+    .await;
+    let former = destination().await.unwrap().unwrap();
+    call(
+        fixture,
+        owner,
+        53,
+        "rename_folder",
+        json!({
+            "project":project, "folder":"drafts", "name":"relocated-drafts",
+        }),
+    )
+    .await
+    .unwrap();
+    let relocated = fixture
+        .canonical
+        .resolve_folder_path(
+            personal.clone(),
+            Some(project_folder.clone()),
+            "relocated-drafts/nested".into(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(former.reference, relocated.reference);
+    assert_eq!(former.revision, relocated.revision);
+    assert_ne!(former.path, relocated.path);
+    assert_eq!(
+        fixture
+            .registry
+            .preview_proposed_diff(owner.clone(), displaced.clone())
+            .await
+            .unwrap_err()
+            .code(),
+        "revision_conflict",
+    );
+    assert_eq!(
+        fixture
+            .registry
+            .apply_proposed_diff(owner.clone(), displaced)
+            .await
+            .unwrap_err()
+            .code(),
+        "revision_conflict",
     );
 
     let (edit, display) = pending_note_action(
@@ -132,6 +264,15 @@ pub(super) async fn confirmed_notes_use_fixed_destinations_and_revisions(
     let unified = preview["unifiedPreview"].as_str().unwrap();
     assert!(unified.contains("Original paragraph."));
     assert!(unified.contains("+Only if the approved revision is current."));
+    let missing_move_path = "proposal-corpus/stale-move/nested";
+    let (stale_move, _) = pending_note_action(
+        fixture,
+        personal,
+        54,
+        "move_note",
+        json!({"ref":note, "toFolder":missing_move_path}),
+    )
+    .await;
     let concurrent = call(
         fixture,
         owner,
@@ -152,6 +293,27 @@ pub(super) async fn confirmed_notes_use_fixed_destinations_and_revisions(
     assert!(
         matches!(conflict, PortError::Domain(DomainError::RevisionConflict { current, .. })
         if current.as_str() == concurrent.structured_content["versionToken"].as_str().unwrap())
+    );
+    assert_eq!(
+        fixture
+            .registry
+            .apply_proposed_diff(owner.clone(), stale_move)
+            .await
+            .unwrap_err()
+            .code(),
+        "revision_conflict",
+    );
+    assert!(
+        fixture
+            .canonical
+            .resolve_folder_path(
+                personal.clone(),
+                Some(project_folder.clone()),
+                "stale-move".into(),
+            )
+            .await
+            .unwrap()
+            .is_none()
     );
     let snapshot = fixture
         .canonical

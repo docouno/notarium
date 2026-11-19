@@ -1,4 +1,4 @@
-use super::ChatProposalWitness;
+use super::{ChatProposalWitness, RevocationLease};
 use crate::{
     DomainError, DomainResult,
     auth::{EngineAuthContext, SecretString},
@@ -220,6 +220,7 @@ pub struct SpaceContext {
     auth: EngineAuthContext,
     scope: HistoryScope,
     confirmed_chat_step: Option<Arc<ConfirmedChatStep>>,
+    canonical_effect: Option<CanonicalEffectLease>,
     pub budget: CallBudget,
 }
 impl SpaceContext {
@@ -235,6 +236,7 @@ impl SpaceContext {
             auth,
             scope,
             confirmed_chat_step: None,
+            canonical_effect: None,
             budget,
         })
     }
@@ -259,11 +261,51 @@ impl SpaceContext {
         self.confirmed_chat_step = Some(Arc::new(ConfirmedChatStep {
             witness,
             identity: identity.clone(),
+            destination: None,
         }));
         Ok(self)
     }
     pub fn confirmed_chat_step(&self) -> Option<&Arc<ConfirmedChatStep>> {
         self.confirmed_chat_step.as_ref()
+    }
+    pub fn with_confirmed_note_destination(
+        mut self,
+        destination: ConfirmedNoteDestination,
+    ) -> DomainResult<Self> {
+        if self.scope.space_id != destination.anchor.space_id {
+            return Err(DomainError::validation(ValidationReason::ScopeMismatch));
+        }
+        let step = self
+            .confirmed_chat_step
+            .as_mut()
+            .ok_or_else(|| DomainError::validation(ValidationReason::InvalidAuthority))?;
+        let step = Arc::make_mut(step);
+        if step.destination.is_some() {
+            return Err(DomainError::validation(ValidationReason::InvalidAuthority));
+        }
+        step.destination = Some(destination);
+        Ok(self)
+    }
+    /// Bind freshly revalidated Control authority for one bounded canonical
+    /// operation. Its owned writer may retain the lease past the caller's wait.
+    pub fn with_canonical_effect(
+        mut self,
+        current: &AccountContext,
+        lease: Box<dyn RevocationLease>,
+    ) -> DomainResult<Self> {
+        if self.canonical_effect.is_some() {
+            return Err(DomainError::validation(ValidationReason::InvalidAuthority));
+        }
+        self.auth = self.auth.intersect_current(current.auth())?;
+        if !self.auth.spaces().contains_key(&self.scope.space_id) {
+            return Err(DomainError::ResourceNotFound);
+        }
+        self.budget = current.budget.clone();
+        self.canonical_effect = Some(CanonicalEffectLease(Arc::new(Mutex::new(lease))));
+        Ok(self)
+    }
+    pub fn canonical_effect(&self) -> Option<&CanonicalEffectLease> {
+        self.canonical_effect.as_ref()
     }
     pub fn restrict_to_project(mut self, project: &FolderRef) -> DomainResult<Self> {
         if self.scope.space_id != project.space_id {
@@ -277,12 +319,41 @@ impl SpaceContext {
     }
 }
 
+/// Shared lifetime of a revocable canonical operation and its writer settlement.
+#[derive(Clone)]
+pub struct CanonicalEffectLease(Arc<Mutex<Box<dyn RevocationLease>>>);
+
+impl CanonicalEffectLease {
+    pub fn check(&self) -> Result<(), crate::error::PortError> {
+        self.0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .check()
+    }
+}
+
+impl fmt::Debug for CanonicalEffectLease {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CanonicalEffectLease")
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CanonicalEffect {
+    AbilityAuthoring,
+    ConfirmedProposal,
+    ChatInput,
+    ChatClaim,
+}
+
 /// The step identity and source witness travel together on the trusted writer
 /// context. Neither is accepted from transport payloads.
 #[derive(Clone, Debug)]
 pub struct ConfirmedChatStep {
     witness: ChatProposalWitness,
     identity: CommandIdentity,
+    destination: Option<ConfirmedNoteDestination>,
 }
 impl ConfirmedChatStep {
     pub fn witness(&self) -> &ChatProposalWitness {
@@ -291,6 +362,21 @@ impl ConfirmedChatStep {
     pub fn identity(&self) -> &CommandIdentity {
         &self.identity
     }
+    pub fn destination(&self) -> Option<&ConfirmedNoteDestination> {
+        self.destination.as_ref()
+    }
+}
+
+/// The exact approved folder anchor and the path components observed absent.
+/// A move also guards its source before any missing folders can be created.
+#[derive(Clone, Debug)]
+pub struct ConfirmedNoteDestination {
+    pub anchor: FolderRef,
+    pub anchor_revision: RevisionId,
+    pub anchor_path: String,
+    pub anchor_ancestors: Vec<FolderId>,
+    pub missing_suffix: String,
+    pub move_source: Option<(NoteId, RevisionId)>,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ServicePurpose {

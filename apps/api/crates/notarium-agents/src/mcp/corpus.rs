@@ -131,23 +131,7 @@ async fn note_policy(
     if matches!(call.target, EgressTarget::ExternalMcp) {
         return Ok(None);
     }
-    let parent = current
-        .facts
-        .ancestor_folders
-        .first()
-        .cloned()
-        .ok_or_else(|| invalid(ValidationReason::InvalidState))?;
-    let folder = call
-        .registry
-        .engine
-        .resolve_folder_path(scope.clone(), Some(parent.clone()), String::new())
-        .await?
-        .ok_or(DomainError::ResourceNotFound)?;
-    scope.scope().check(&folder.history)?;
-    if folder.reference.folder_id != parent || folder.reference.space_id != scope.scope().space_id {
-        return Err(invalid(ValidationReason::SourceMismatch));
-    }
-    let project = folder.project.map(|folder_id| FolderRef {
+    let project = current.facts.project.clone().map(|folder_id| FolderRef {
         space_id: scope.scope().space_id.clone(),
         folder_id,
     });
@@ -374,5 +358,21 @@ pub(super) fn sanitize_display(display: &mut Value) {
         Value::Array(items) => items.iter_mut().for_each(sanitize_display),
         Value::Object(fields) => fields.values_mut().for_each(sanitize_display),
         _ => (),
+    }
+}
+
+pub(super) fn sanitize_activation(display: &mut Value) {
+    let Some(fields) = display.as_object_mut() else {
+        sanitize_display(display);
+        return;
+    };
+    // Activation is the explicit instruction channel. Its metadata has the
+    // same display rules as metadata returned by discovery.
+    for (key, value) in fields {
+        match (key.as_str(), value) {
+            ("instructions", Value::String(_)) => (),
+            ("skills", Value::Array(skills)) => skills.iter_mut().for_each(sanitize_activation),
+            (_, value) => sanitize_display(value),
+        }
     }
 }

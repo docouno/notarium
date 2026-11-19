@@ -59,6 +59,27 @@ impl DocumentFacts {
         std::iter::once(&self.recorded).chain(self.current.as_deref().map(|(facts, _)| facts))
     }
 
+    fn note_origin(
+        &self,
+        reference: &NoteRef,
+        revision: &RevisionId,
+        digest: ContentDigest,
+    ) -> ProviderOrigin {
+        let current = self
+            .current
+            .as_deref()
+            .map_or(&self.recorded, |(facts, _)| facts);
+        ProviderOrigin::Note {
+            reference: reference.clone(),
+            revision: revision.clone(),
+            digest,
+            placement: Some(NoteDisclosurePlacement {
+                class: current.class,
+                project: current.project.clone(),
+            }),
+        }
+    }
+
     fn bind_current(
         &mut self,
         recorded_lifecycle: Lifecycle,
@@ -176,11 +197,8 @@ impl ClassifiedMetadata {
         self.digest
     }
     pub fn origin(&self) -> ProviderOrigin {
-        ProviderOrigin::Note {
-            reference: self.reference.clone(),
-            revision: self.revision.clone(),
-            digest: self.digest,
-        }
+        self.facts
+            .note_origin(&self.reference, &self.revision, self.digest)
     }
     pub fn in_project(&self, project: &FolderRef) -> bool {
         self.facts.in_project(project)
@@ -283,11 +301,8 @@ impl ClassifiedDocument {
         self.digest
     }
     pub fn origin(&self) -> ProviderOrigin {
-        ProviderOrigin::Note {
-            reference: self.reference.clone(),
-            revision: self.revision.clone(),
-            digest: self.digest,
-        }
+        self.facts
+            .note_origin(&self.reference, &self.revision, self.digest)
     }
     pub fn in_project(&self, project: &FolderRef) -> bool {
         self.facts.in_project(project)
@@ -694,10 +709,17 @@ pub enum ProviderMessage {
     Document(ProviderContent),
     Part(ProviderPart),
     Chat(ProviderChatContent),
-    Ability(ProviderAbilityContent),
+    Ability(Box<ProviderAbilityContent>),
     SystemAbility(ProviderSystemAbilityContent),
     Metadata(ProviderMetadataContent),
 }
+/// The class and nearest project at the time a note was read for disclosure.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NoteDisclosurePlacement {
+    pub class: DocClass,
+    pub project: Option<FolderId>,
+}
+
 /// A metadata-only identity for acquiring current canonical egress authority.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ProviderOrigin {
@@ -705,6 +727,10 @@ pub enum ProviderOrigin {
         reference: NoteRef,
         revision: RevisionId,
         digest: ContentDigest,
+        /// Old stored origins can still be read, but cannot match a fresh
+        /// canonical disclosure witness without this placement.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        placement: Option<NoteDisclosurePlacement>,
     },
     Ability {
         reference: AbilityResourceRef,

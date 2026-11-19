@@ -54,6 +54,10 @@ impl CompletionRunBudget {
         self.deadline.saturating_duration_since(Instant::now())
     }
 
+    pub(crate) fn input_ceiling(&self) -> u32 {
+        u32::try_from(self.remaining_tokens.saturating_sub(1)).unwrap_or(u32::MAX)
+    }
+
     fn reserve(
         &mut self,
         request: &mut CompletionRequest,

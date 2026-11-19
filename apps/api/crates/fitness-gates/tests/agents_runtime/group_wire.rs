@@ -1,6 +1,6 @@
 use super::*;
 use notarium_agents::chats::{
-    AgentRunSupervisor, ChatRunOptions, ChatSubscription, ExclusiveDataRoot,
+    AgentRunSupervisor, ChatRunOptions, ChatSubscription, ExclusiveDataRoot, StartChatRun,
     stream::{StreamCheckpoint, StreamRead},
 };
 use notarium_core::{
@@ -209,6 +209,11 @@ async fn group_turn(
         fixture.revocations.clone(),
         ExclusiveDataRoot::attest_open_writer(),
     );
+    let options = ChatRunOptions {
+        provider: Some(local.resource.id),
+        model: Some(local.model),
+        ..ChatRunOptions::default()
+    };
     let submission = supervisor
         .enqueue_input(
             human.clone(),
@@ -220,11 +225,7 @@ async fn group_turn(
                 body: OWNER_TEXT.into(),
                 mentions_agent: true,
             },
-            ChatRunOptions {
-                provider: Some(local.resource.id),
-                model: Some(local.model),
-                ..ChatRunOptions::default()
-            },
+            options.clone(),
         )
         .await
         .unwrap();
@@ -330,7 +331,7 @@ async fn group_turn(
         .read_chat_contents(
             scope.clone(),
             ChatContentRead {
-                thread,
+                thread: thread.clone(),
                 leaf: committed,
                 entries: vec![committed],
             },
@@ -341,6 +342,101 @@ async fn group_turn(
         ClassEgressFence::chat_transcript(&transcript[0].content, human.auth()).unwrap(),
         expected,
     );
+
+    fixture
+        .canonical
+        .fork_chat(
+            scope.clone(),
+            Mutation {
+                identity: command(scope, 4),
+                preconditions: Preconditions::default(),
+                input: ForkChat {
+                    thread: thread.clone(),
+                    parent: sender.value.seq,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    supervisor
+        .start(
+            human.clone(),
+            StartChatRun {
+                scope: scope.scope().clone(),
+                thread: thread.clone(),
+                expected_leaf: sender.value.seq,
+                options,
+            },
+        )
+        .await
+        .unwrap();
+    let (mut wire, _) = timeout(WIRE_DEADLINE, read_request(&listener))
+        .await
+        .unwrap();
+    let mut observer = supervisor
+        .subscribe(human.clone(), scope.scope().clone(), thread.clone(), None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        checkpoint(&mut observer).await.committed_leaf,
+        sender.value.seq
+    );
+    let tail = start_ollama(&mut wire, "The model will lose its parent revision.").await;
+    let accepted_peer = fixture
+        .canonical
+        .append_chat(
+            peer.clone(),
+            Mutation {
+                identity: command(peer, 5),
+                preconditions: Preconditions::default(),
+                input: AppendChat {
+                    thread: thread.clone(),
+                    parent: sender.value.seq,
+                    kind: ChatEntryKind::Human,
+                    body: ChatInputBody::Text("A new peer message.".into()),
+                    tool_calls: Vec::new(),
+                    provenance: None,
+                    proposed_diff: None,
+                    referenced_notes: Vec::new(),
+                    tainted: false,
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    wire.get_mut().write_all(tail.as_bytes()).await.unwrap();
+    timeout(WIRE_DEADLINE, async {
+        let mut saw_peer = false;
+        loop {
+            match observer.next().await {
+                StreamRead::Frame(frame) => {
+                    let event: Value = serde_json::from_slice(frame.payload()).unwrap();
+                    match event["type"].as_str().unwrap() {
+                        "committed" => {
+                            assert_eq!(event["entrySeq"], accepted_peer.seq.get());
+                            saw_peer = true;
+                        }
+                        "run_failed" => break,
+                        "run_finished" => panic!("the stale Model cannot commit"),
+                        _ => (),
+                    }
+                }
+                StreamRead::CatchUpRequired(cut) => {
+                    saw_peer |= cut.committed_leaf == accepted_peer.seq;
+                }
+                StreamRead::Closed => panic!("stream closed before the failed CAS report"),
+            }
+        }
+        assert!(
+            saw_peer,
+            "live viewer must see the new peer watermark before failure"
+        );
+    })
+    .await
+    .unwrap();
+    supervisor.shutdown();
 }
 
 async fn checkpoint(subscription: &mut ChatSubscription) -> StreamCheckpoint {

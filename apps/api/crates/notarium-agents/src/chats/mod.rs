@@ -62,6 +62,7 @@ pub struct ChatSubscription {
     stream: StepSubscription,
     cancellation: Cancellation,
     _revocation: ViewerRevocationLease,
+    _buffer: Arc<StepStreamBuffer>,
 }
 
 impl ChatSubscription {
@@ -109,12 +110,13 @@ pub enum RunOwnershipTransition {
 /// authority. Each serving instance's hub participates in the same revocation
 /// fences for runs, pending senders, and viewers. A handoff may temporarily
 /// register both turns under the current writer. Recovery requires a fenced
-/// predecessor. Loss of writer ownership cancels the supplied token.
+/// predecessor. Loss of writer ownership cancels the supplied token and closes
+/// the old writer's viewer streams, including retained completed runs.
 pub trait ClusterRunAuthority: SessionRevocationPort {
-    /// Admit a new input on the serving instance that owns the thread's run,
+    /// Admit a durable chat write on the instance that owns the thread's run,
     /// or on the Space writer when the thread is idle. Cancel the command if
     /// this route loses ownership. An existing receipt can be read separately.
-    fn admit_input(
+    fn admit_chat_write(
         &self,
         ctx: MaintenanceContext,
         scope: HistoryScope,
@@ -167,6 +169,7 @@ pub struct AgentRunSupervisor {
 }
 
 type ThreadKey = (SpaceId, ChatThreadId);
+type ScopedThreadKey = (HistoryScope, ChatThreadId);
 
 struct SupervisorState {
     registry: Arc<ToolRegistry>,
@@ -180,6 +183,7 @@ struct SupervisorState {
 struct ThreadRuns {
     gates: BTreeMap<ThreadKey, Weak<AsyncMutex<()>>>,
     active: BTreeMap<ThreadKey, Arc<ActiveRun>>,
+    streams: BTreeMap<ScopedThreadKey, Vec<Weak<StepStreamBuffer>>>,
 }
 
 struct ActiveRun {
@@ -193,7 +197,7 @@ struct ActiveRun {
     request: RequestId,
     options: ChatRunOptions,
     started: Instant,
-    stream: StepStreamBuffer,
+    stream: Arc<StepStreamBuffer>,
     cancellation: Cancellation,
     lease: RunRevocationLease,
     owner: OwnerLease,
@@ -306,6 +310,7 @@ impl AgentRunSupervisor {
                 stream: run.stream.subscribe(cursor),
                 cancellation,
                 _revocation: revocation,
+                _buffer: run.stream.clone(),
             }))
         } else {
             Ok(None)
@@ -355,16 +360,10 @@ impl AgentRunSupervisor {
             scope.clone(),
             account.budget.clone(),
         )?;
-        let input = self
-            .inner
-            .registry
-            .engine()
-            .prepare_agent_run_rollback(ctx.clone(), run.clone())
-            .await?;
         self.inner
             .registry
             .engine()
-            .rollback_agent_run(
+            .rollback_agent_run_by_id(
                 ctx,
                 Mutation {
                     identity: CommandIdentity {
@@ -377,7 +376,7 @@ impl AgentRunSupervisor {
                         ),
                     },
                     preconditions: Preconditions::default(),
-                    input,
+                    input: run,
                 },
             )
             .await
@@ -389,20 +388,58 @@ impl AgentRunSupervisor {
         account: AccountContext,
         request: Mutation<RedactChatEntry>,
     ) -> Result<Committed<RedactedChat>, PortError> {
-        let account = self.live_account(account).await?;
-        let scope = request.identity.scope.clone();
-        let thread = request.input.thread.clone();
-        let ctx = SpaceContext::new(account.auth().clone(), scope.clone(), account.budget)?;
-        let redacted = self
-            .inner
-            .registry
-            .engine()
-            .redact_chat_entry(ctx, request)
-            .await?;
-        if let Some(active) = self.active(&scope, &thread) {
-            active.cancellation.cancel();
-        }
-        Ok(redacted)
+        let service = self.clone();
+        detached(async move {
+            let scope = request.identity.scope.clone();
+            let thread = request.input.thread.clone();
+            let gate = service.thread_gate(&scope, &thread);
+            let _admission = gate.lock().await;
+            let mut account = service.live_account(account).await?;
+            if matches!(&service.inner.coordination, Coordination::Clustered(_)) {
+                account.budget.cancellation = Cancellation::default();
+            }
+            let route = service
+                .admit_chat_route(&scope, &thread, &account.budget)
+                .await?;
+            let ctx = SpaceContext::new(account.auth().clone(), scope.clone(), account.budget)?;
+            let mut holds = service
+                .inner
+                .threads
+                .lock()
+                .expect("thread registry lock")
+                .streams
+                .get(&(scope.clone(), thread.clone()))
+                .into_iter()
+                .flatten()
+                .filter_map(Weak::upgrade)
+                .map(|stream| stream.pause_for_redaction())
+                .collect::<Vec<_>>();
+            let result = match route.as_ref().map_or(Ok(()), |lease| lease.check()) {
+                Ok(()) => {
+                    service
+                        .inner
+                        .registry
+                        .engine()
+                        .redact_chat_entry(ctx, request)
+                        .await
+                }
+                Err(error) => Err(error),
+            };
+            if result.is_ok() || result.as_ref().is_err_and(queue::unknown_commit) {
+                if let Some(active) = service.active(&scope, &thread)
+                    && active.scope == scope
+                {
+                    active.cancellation.cancel();
+                }
+            } else {
+                for hold in &mut holds {
+                    hold.keep_history();
+                }
+            }
+            drop(holds);
+            result
+        })
+        .await
     }
 
     pub fn shutdown(&self) {
@@ -427,6 +464,27 @@ impl AgentRunSupervisor {
             return Err(DomainError::AccessDenied.into());
         }
         Ok(AccountContext::new(auth, account.budget))
+    }
+
+    async fn admit_chat_route(
+        &self,
+        scope: &HistoryScope,
+        thread: &ChatThreadId,
+        budget: &CallBudget,
+    ) -> Result<Option<Box<dyn RevocationLease>>, PortError> {
+        let Coordination::Clustered(authority) = &self.inner.coordination else {
+            return Ok(None);
+        };
+        let lease = authority
+            .admit_chat_write(
+                maintenance(budget.clone()),
+                scope.clone(),
+                thread.clone(),
+                budget.cancellation.clone(),
+            )
+            .await?;
+        lease.check()?;
+        Ok(Some(lease))
     }
 
     async fn thread_at(
@@ -466,19 +524,41 @@ impl AgentRunSupervisor {
         }
         let branch = self.thread_at(ctx, &run.thread, head).await?;
         if branch.thread.head == head
-            && let Some(entry) = branch
-                .entries
-                .iter()
-                .find(|entry| entry.seq == head && entry.kind == ChatEntryKind::Human)
+            && let Some(entry) = branch.entries.iter().find(|entry| {
+                entry.seq == head
+                    && matches!(entry.kind, ChatEntryKind::Human | ChatEntryKind::Redacted)
+            })
         {
             run.stream.committed(entry, None)?;
         }
         Ok(())
     }
 
+    async fn refresh_current_peer_head(&self, run: &ActiveRun) -> Result<(), PortError> {
+        if run.kind != ChatThreadKind::SpaceGroup {
+            return Ok(());
+        }
+        run.owner.check()?;
+        let account = self
+            .live_account(AccountContext::new(
+                run.owner_auth.clone(),
+                cleanup_budget(&run.request),
+            ))
+            .await?;
+        let ctx = SpaceContext::new(account.auth().clone(), run.scope.clone(), account.budget)?;
+        let branch = self
+            .thread_at(ctx.clone(), &run.thread, ThreadEntrySeq::ZERO)
+            .await?;
+        self.refresh_peer_head(run, ctx, branch.thread.head).await
+    }
+
     fn thread_gate(&self, scope: &HistoryScope, thread: &ChatThreadId) -> Arc<AsyncMutex<()>> {
         let mut state = self.inner.threads.lock().expect("thread registry lock");
         state.gates.retain(|_, gate| gate.strong_count() != 0);
+        state.streams.retain(|_, streams| {
+            streams.retain(|stream| stream.strong_count() != 0);
+            !streams.is_empty()
+        });
         let key = (scope.space_id.clone(), thread.clone());
         if let Some(gate) = state.gates.get(&key).and_then(Weak::upgrade) {
             return gate;
@@ -575,7 +655,13 @@ impl AgentRunSupervisor {
             None,
             cancellation.clone(),
         )?;
-        let ctx = SpaceContext::new(auth.clone(), request.scope.clone(), admission.clone())?;
+        let account = self
+            .live_account(AccountContext::new(
+                account.auth().clone(),
+                admission.clone(),
+            ))
+            .await?;
+        let mut ctx = SpaceContext::new(auth, request.scope.clone(), account.budget.clone())?;
         let leaf = self
             .thread_at(ctx.clone(), &request.thread, request.expected_leaf)
             .await?;
@@ -588,11 +674,20 @@ impl AgentRunSupervisor {
                 return Err(owner_unavailable());
             }
             let engine = self.inner.registry.engine();
-            let human = SpaceContext::new(
-                account.auth().clone(),
-                request.scope.clone(),
-                admission.clone(),
-            )?;
+            let human = self
+                .inner
+                .registry
+                .control()
+                .fence_canonical_effect(
+                    account.auth().clone(),
+                    SpaceContext::new(
+                        account.auth().clone(),
+                        request.scope.clone(),
+                        account.budget.clone(),
+                    )?,
+                    CanonicalEffect::ChatInput,
+                )
+                .await?;
             let recovery = ChatRunRequest {
                 thread: request.thread.clone(),
                 expected_run: previous.clone(),
@@ -603,6 +698,9 @@ impl AgentRunSupervisor {
             if recovered.as_ref().is_err_and(queue::unknown_commit) {
                 owner.check()?;
                 lease.check()?;
+                if let Some(effect) = human.canonical_effect() {
+                    effect.check()?;
+                }
                 recovered = engine.recover_active_run(human, recovery).await;
             }
             if recovered? != FinishChatRunOutcome::Cleared {
@@ -614,6 +712,14 @@ impl AgentRunSupervisor {
             owner.check()?;
             lease.check()?;
         }
+        ctx = self
+            .inner
+            .registry
+            .control()
+            .fence_canonical_effect(account.auth().clone(), ctx, CanonicalEffect::ChatClaim)
+            .await?;
+        owner.check()?;
+        lease.check()?;
         let key = (request.scope.space_id.clone(), request.thread.clone());
         let state = Arc::new(ActiveRun {
             id: run.clone(),
@@ -624,28 +730,30 @@ impl AgentRunSupervisor {
                 folder_id,
             }),
             kind: thread.kind,
-            auth,
+            auth: ctx.auth().clone(),
             owner_auth: account.auth().clone(),
             request: admission.request.clone(),
             options: request.options,
             started: Instant::now(),
-            stream: StepStreamBuffer::new(
+            stream: Arc::new(StepStreamBuffer::new(
                 run.clone(),
                 request.thread.clone(),
                 request.expected_leaf,
-            ),
+            )),
             cancellation,
             lease,
             owner,
             admitted: AtomicBool::new(false),
         });
-        let previous = self
-            .inner
-            .threads
-            .lock()
-            .expect("thread registry lock")
-            .active
-            .insert(key.clone(), state.clone());
+        let previous = {
+            let mut threads = self.inner.threads.lock().expect("thread registry lock");
+            threads
+                .streams
+                .entry((request.scope.clone(), request.thread.clone()))
+                .or_default()
+                .push(Arc::downgrade(&state.stream));
+            threads.active.insert(key.clone(), state.clone())
+        };
         let claim_request = ClaimChatRun {
             thread: request.thread,
             run: run.clone(),
@@ -656,18 +764,23 @@ impl AgentRunSupervisor {
             .inner
             .registry
             .engine()
-            .claim_active_run(ctx, claim_request.clone())
+            .claim_active_run(ctx.clone(), claim_request.clone())
             .await;
         if claim.as_ref().is_err_and(queue::unknown_commit)
-            && let Ok(context) = state.cleanup_context()
+            && state.owner.check().is_ok()
+            && state.lease.check().is_ok()
+            && ctx
+                .canonical_effect()
+                .is_none_or(|effect| effect.check().is_ok())
         {
             claim = self
                 .inner
                 .registry
                 .engine()
-                .claim_active_run(context, claim_request)
+                .claim_active_run(ctx.clone(), claim_request)
                 .await;
         }
+        drop(ctx);
         if !matches!(&claim, Ok(ClaimChatRunOutcome::Claimed)) {
             let mut threads = self.inner.threads.lock().expect("thread registry lock");
             if let Some(previous) = previous {
@@ -677,12 +790,13 @@ impl AgentRunSupervisor {
             }
             return Err(claim.err().unwrap_or_else(owner_unavailable));
         }
-        state.admitted.store(true, Ordering::Release);
+        let publish = state.owner.check().and_then(|_| state.lease.check());
+        state.admitted.store(publish.is_ok(), Ordering::Release);
         let worker = self.clone();
         tokio::spawn(async move {
             worker.run_task(state, request.expected_leaf).await;
         });
-        Ok(run)
+        publish.map(|_| run)
     }
 
     fn remove_run(&self, run: &ActiveRun) {

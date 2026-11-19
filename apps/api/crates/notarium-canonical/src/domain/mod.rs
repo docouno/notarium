@@ -190,6 +190,15 @@ impl NoteWritePort for CanonicalStore {
         Box::pin(async move { rollback::rollback_agent_run_impl(&store, ctx, request).await })
     }
 
+    fn rollback_agent_run_by_id(
+        &self,
+        ctx: SpaceContext,
+        request: Mutation<AgentRunId>,
+    ) -> PortFuture<'_, Committed<RollbackResult>> {
+        let store = self.clone();
+        Box::pin(async move { rollback::rollback_agent_run_by_id(&store, ctx, request).await })
+    }
+
     fn accept_external_observation(
         &self,
         ctx: SpaceContext,

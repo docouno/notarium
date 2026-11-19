@@ -72,6 +72,7 @@ pub struct FolderSnapshot {
     pub history: HistoryScope,
     pub revision: RevisionId,
     pub path: String,
+    pub ancestor_folders: Vec<FolderId>,
     pub name: String,
     pub parent: Option<FolderId>,
     pub project: Option<FolderId>,
@@ -612,6 +613,10 @@ pub struct HydratedChatEntry {
 pub struct ChatProvenance {
     pub origins: Vec<ProviderOrigin>,
     pub projects: Vec<FolderRef>,
+    /// A prefix summary replaces history through this ancestor, inclusive.
+    /// Older compactions without a boundary replace their entire prior context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compacts_through: Option<ThreadEntrySeq>,
 }
 impl ChatProvenance {
     pub const MAX_ORIGINS: usize = 256;

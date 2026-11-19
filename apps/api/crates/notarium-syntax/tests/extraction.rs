@@ -583,6 +583,7 @@ fn selected_chunks_reach_embedding_and_recall_with_original_provenance() {
                         kind: SpaceKind::Personal,
                     },
                     class,
+                    project: None,
                     ancestor_folders: vec![],
                     folder_write_locked: false,
                     ability_package: None,

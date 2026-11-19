@@ -2,6 +2,12 @@ use super::*;
 use crate::revocation::{PendingCredential, PendingCredentialKey};
 use notarium_core::auth::{SpaceLifecycle, SpaceRole};
 
+pub(super) struct ConsumeAttempt {
+    item: QueuedChatInput,
+    key: PendingCredentialKey,
+    command: Mutation<ConsumePending>,
+}
+
 impl AgentRunSupervisor {
     pub(super) async fn submit(
         &self,
@@ -17,6 +23,7 @@ impl AgentRunSupervisor {
         let thread = input.thread.clone();
         let gate = self.thread_gate(&scope, &thread);
         let _admission = gate.lock().await;
+        account = self.live_account(account).await?;
         let ownership_lost = Cancellation::default();
         account.budget = bounded(&account.budget, MAINTENANCE_BUDGET, ownership_lost.clone());
         let ctx = SpaceContext::new(
@@ -42,21 +49,9 @@ impl AgentRunSupervisor {
         if latest.thread.kind == ChatThreadKind::KeeperLog {
             return Err(DomainError::SpaceReadOnly.into());
         }
-        let route = match &self.inner.coordination {
-            Coordination::Local => None,
-            Coordination::Clustered(authority) => {
-                let route = authority
-                    .admit_input(
-                        maintenance(account.budget.clone()),
-                        scope.clone(),
-                        thread.clone(),
-                        ownership_lost.clone(),
-                    )
-                    .await?;
-                route.check()?;
-                Some(route)
-            }
-        };
+        let mut route = self
+            .admit_chat_route(&scope, &thread, &account.budget)
+            .await?;
         let pending = self.inner.revocations.register_pending(
             maintenance(account.budget.clone()),
             key,
@@ -65,14 +60,14 @@ impl AgentRunSupervisor {
             options.clone(),
         )?;
         let mentions_agent = input.mentions_agent;
-        let mut submitted = engine
-            .submit_user_chat_input(ctx.clone(), input.clone())
+        let mut submitted = self
+            .publish_input(ctx.clone(), input.clone(), &mut route)
             .await;
         if submitted.as_ref().is_err_and(unknown_commit)
             && !ownership_lost.is_cancelled()
             && route.as_ref().is_none_or(|lease| lease.check().is_ok())
         {
-            submitted = engine.submit_user_chat_input(ctx.clone(), input).await;
+            submitted = self.publish_input(ctx.clone(), input, &mut route).await;
         }
         drop(route);
         let outcome = match submitted {
@@ -108,48 +103,107 @@ impl AgentRunSupervisor {
         Ok(ChatSubmission { outcome, run })
     }
 
-    pub(super) async fn drain(&self, run: &ActiveRun) -> Result<(), PortError> {
+    async fn publish_input(
+        &self,
+        ctx: SpaceContext,
+        input: SubmitUserChatInput,
+        route: &mut Option<Box<dyn RevocationLease>>,
+    ) -> Result<SubmitUserChatOutcome, PortError> {
+        let writer = self
+            .inner
+            .registry
+            .control()
+            .fence_canonical_effect(ctx.auth().clone(), ctx, CanonicalEffect::ChatInput)
+            .await?;
+        if let Some(lease) = route {
+            lease.check()?;
+        }
+        self.inner
+            .registry
+            .engine()
+            .submit_user_chat_input(writer, input)
+            .await
+    }
+
+    pub(super) async fn drain(
+        &self,
+        run: &ActiveRun,
+        unsettled: &mut Option<ConsumeAttempt>,
+    ) -> Result<(), PortError> {
         let gate = self.thread_gate(&run.scope, &run.thread);
         let _admission = gate.lock().await;
         let engine = self.inner.registry.engine();
-        let active = || ChatRunRequest {
-            thread: run.thread.clone(),
-            expected_run: run.id.clone(),
-        };
         for _ in 0..32 {
-            match engine
-                .finish_run_if_queue_empty(run.cleanup_context()?, active())
-                .await?
-            {
-                FinishChatRunOutcome::Cleared => {
-                    self.inner
-                        .revocations
-                        .finish_thread_pending(&run.scope, &run.thread);
+            if unsettled.is_none() {
+                match engine
+                    .finish_run_if_queue_empty(
+                        run.cleanup_context()?,
+                        ChatRunRequest {
+                            thread: run.thread.clone(),
+                            expected_run: run.id.clone(),
+                        },
+                    )
+                    .await?
+                {
+                    FinishChatRunOutcome::Cleared => {
+                        self.inner
+                            .revocations
+                            .finish_thread_pending(&run.scope, &run.thread);
+                        return Ok(());
+                    }
+                    FinishChatRunOutcome::Changed => return Ok(()),
+                    FinishChatRunOutcome::Pending => (),
+                }
+                let queue = engine
+                    .list_pending_chat_inputs(run.cleanup_context()?, run.thread.clone())
+                    .await?;
+                let Some(item) = queue.into_iter().next() else {
+                    continue;
+                };
+                let current = self
+                    .thread_at(run.cleanup_context()?, &run.thread, ThreadEntrySeq::ZERO)
+                    .await?;
+                if current.thread.active_run.as_ref() != Some(&run.id) {
                     return Ok(());
                 }
-                FinishChatRunOutcome::Changed => return Ok(()),
-                FinishChatRunOutcome::Pending => (),
+                let parts = [run.id.as_str().as_bytes(), item.id.as_str().as_bytes()];
+                let command = Mutation {
+                    identity: CommandIdentity {
+                        scope: run.scope.clone(),
+                        actor: item.sender.clone(),
+                        key: derive_key("notarium.chats.consume-key.v1", &parts),
+                        hash: derive_digest("notarium.chats.consume-hash.v1", &parts),
+                    },
+                    preconditions: Preconditions::default(),
+                    input: ConsumePending {
+                        thread: run.thread.clone(),
+                        input: item.id.clone(),
+                        current_leaf: current.thread.head,
+                        expected_run: item.in_flight_run.clone(),
+                        expected_active_run: run.id.clone(),
+                    },
+                };
+                let key = PendingCredentialKey {
+                    scope: run.scope.clone(),
+                    thread: run.thread.clone(),
+                    input: item.id.clone(),
+                };
+                *unsettled = Some(ConsumeAttempt { item, key, command });
             }
-            let queue = engine
-                .list_pending_chat_inputs(run.cleanup_context()?, run.thread.clone())
-                .await?;
-            let Some(item) = queue.into_iter().next() else {
-                continue;
-            };
-            let key = PendingCredentialKey {
-                scope: run.scope.clone(),
-                thread: run.thread.clone(),
-                input: item.id.clone(),
-            };
-            let pending = self.inner.revocations.pending(&key);
+
+            // An admitted consume can commit before the caller receives its reply.
+            // Resolve that same command before consulting the now-shorter FIFO.
+            let attempt = unsettled.as_ref().expect("an input was selected");
+            let pending = self.inner.revocations.pending(&attempt.key);
             let account =
                 if let Some(credential) = pending.filter(|_| !self.inner.shutdown.is_cancelled()) {
-                    self.live_pending(run, &item, credential).await?
+                    self.live_pending(run, &attempt.item, credential).await?
                 } else {
                     None
                 };
             let Some((account, options)) = account else {
-                self.dismiss(run, &key).await?;
+                self.dismiss(run, &attempt.key).await?;
+                *unsettled = None;
                 continue;
             };
             let writer = SpaceContext::new(
@@ -157,54 +211,70 @@ impl AgentRunSupervisor {
                 run.scope.clone(),
                 account.budget.clone(),
             )?;
-            let current = self
-                .thread_at(run.cleanup_context()?, &run.thread, ThreadEntrySeq::ZERO)
-                .await?;
-            if current.thread.active_run.as_ref() != Some(&run.id) {
-                return Ok(());
-            }
+            let writer = match self
+                .inner
+                .registry
+                .control()
+                .fence_canonical_effect(account.auth().clone(), writer, CanonicalEffect::ChatInput)
+                .await
+            {
+                Ok(writer) => writer,
+                Err(error) if no_authority(&error) => {
+                    self.dismiss(run, &attempt.key).await?;
+                    *unsettled = None;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             run.owner.check()?;
-            let parts = [run.id.as_str().as_bytes(), item.id.as_str().as_bytes()];
-            let content = engine
-                .consume_chat_input(
-                    writer,
-                    Mutation {
-                        identity: CommandIdentity {
-                            scope: run.scope.clone(),
-                            actor: account.auth().principal().clone(),
-                            key: derive_key("notarium.chats.consume-key.v1", &parts),
-                            hash: derive_digest("notarium.chats.consume-hash.v1", &parts),
-                        },
-                        preconditions: Preconditions::default(),
-                        input: ConsumePending {
-                            thread: run.thread.clone(),
-                            input: item.id.clone(),
-                            current_leaf: current.thread.head,
-                            expected_run: item.in_flight_run.clone(),
-                            expected_active_run: run.id.clone(),
-                        },
-                    },
-                )
-                .await;
-            let status = match content {
+            let status = match engine
+                .consume_chat_input(writer, attempt.command.clone())
+                .await
+            {
                 Ok(content) => content.value,
+                Err(error) if unknown_commit(&error) => return Err(error),
+                Err(PortError::Domain(DomainError::RevisionConflict { .. })) => {
+                    *unsettled = None;
+                    continue;
+                }
                 Err(PortError::Cancelled(_)) => {
-                    self.dismiss(run, &key).await?;
+                    self.dismiss(run, &attempt.key).await?;
+                    *unsettled = None;
+                    continue;
+                }
+                Err(error) if queue_row_changed(&error) => {
+                    let remaining = engine
+                        .list_pending_chat_inputs(run.cleanup_context()?, run.thread.clone())
+                        .await?;
+                    if remaining
+                        .first()
+                        .is_some_and(|item| item.id == attempt.item.id)
+                    {
+                        return Err(error);
+                    }
+                    if remaining.iter().all(|item| item.id != attempt.item.id) {
+                        self.inner.revocations.finish_pending(&attempt.key);
+                    }
+                    *unsettled = None;
                     continue;
                 }
                 Err(error) => return Err(error),
             };
             match status {
-                ConsumedPending::BranchChanged { .. } => self.dismiss(run, &key).await?,
-                ConsumedPending::AlreadyConsumed => self.inner.revocations.finish_pending(&key),
+                ConsumedPending::BranchChanged { .. } => {
+                    self.dismiss(run, &attempt.key).await?;
+                }
+                ConsumedPending::AlreadyConsumed => {
+                    self.inner.revocations.finish_pending(&attempt.key);
+                }
                 ConsumedPending::Appended {
                     entry,
                     intervening_human,
                 } => {
-                    self.inner.revocations.finish_pending(&key);
+                    let mentions_agent = attempt.item.mentions_agent;
                     run.stream.committed(&entry, None)?;
                     if !intervening_human
-                        && (run.kind == ChatThreadKind::Personal || item.mentions_agent)
+                        && (run.kind == ChatThreadKind::Personal || mentions_agent)
                     {
                         let next = StartChatRun {
                             scope: run.scope.clone(),
@@ -221,19 +291,29 @@ impl AgentRunSupervisor {
                             run.scope.clone(),
                             follow.budget.clone(),
                         )?;
-                        let branch = self.thread_at(next_context, &run.thread, entry.seq).await?;
-                        if self
-                            .launch(follow, next, branch.thread, Some(&run.id))
-                            .await
-                            .is_ok()
-                        {
-                            return Ok(());
+                        match self.thread_at(next_context, &run.thread, entry.seq).await {
+                            Ok(branch) => {
+                                if self
+                                    .launch(follow, next, branch.thread, Some(&run.id))
+                                    .await
+                                    .is_ok()
+                                {
+                                    self.inner.revocations.finish_pending(&attempt.key);
+                                    *unsettled = None;
+                                    return Ok(());
+                                }
+                            }
+                            Err(error) if no_authority(&error) => (),
+                            Err(error) => return Err(error),
                         }
                     }
+                    self.inner.revocations.finish_pending(&attempt.key);
                 }
             }
+            *unsettled = None;
         }
-        Err(invalid(ValidationReason::BudgetExceeded))
+        // Release the gate and try again under a fresh cleanup budget.
+        Err(owner_unavailable())
     }
 
     async fn dismiss(&self, run: &ActiveRun, key: &PendingCredentialKey) -> Result<(), PortError> {
@@ -311,6 +391,12 @@ impl AgentRunSupervisor {
         }
         Err(invalid(ValidationReason::BudgetExceeded))
     }
+}
+
+fn queue_row_changed(error: &PortError) -> bool {
+    matches!(error, PortError::Domain(DomainError::ResourceNotFound))
+        || matches!(error, PortError::Domain(DomainError::ValidationFailed { diagnostic })
+            if diagnostic.reason == ValidationReason::InvalidState)
 }
 
 fn no_authority(error: &PortError) -> bool {

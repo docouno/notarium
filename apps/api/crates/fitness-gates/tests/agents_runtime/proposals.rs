@@ -1,19 +1,23 @@
 use super::*;
 use notarium_agents::mcp::{ConfirmProposedDiff, PersonalToolInvocation};
+use notarium_control::auth::token::{TokenKind, mint};
 use notarium_core::{
     auth::ChatAudience,
     ports::provider::{ProviderToolCall, ProviderToolCallId},
 };
+use std::sync::atomic::Ordering;
 
-pub(super) async fn explicit_confirmation_applies_once(
+async fn record_memory_proposal(
     fixture: &RuntimeFixture,
     personal: &SpaceContext,
-) {
-    let owner = &fixture.human;
+    owner: &AccountContext,
+    tag: u8,
+    category: &str,
+) -> ConfirmProposedDiff {
     let scope = personal.scope();
     let actor = owner.auth().principal();
-    let thread = ChatThreadId::from_bytes([170; 16]);
-    let run = AgentRunId::from_bytes([170; 16]);
+    let thread = ChatThreadId::from_bytes([tag; 16]);
+    let run = AgentRunId::from_bytes([tag; 16]);
     let mutation = |tag| CommandIdentity {
         scope: scope.clone(),
         actor: actor.clone(),
@@ -25,7 +29,7 @@ pub(super) async fn explicit_confirmation_applies_once(
         .create_chat(
             personal.clone(),
             Mutation {
-                identity: mutation(170),
+                identity: mutation(tag),
                 preconditions: Preconditions::default(),
                 input: CreateChat {
                     thread: thread.clone(),
@@ -64,15 +68,14 @@ pub(super) async fn explicit_confirmation_applies_once(
             .unwrap(),
         ClaimChatRunOutcome::Claimed
     );
-    let key = CommandKey::from_bytes([171; 16]);
-    let args =
-        json!({"category":"proposal-fixture", "observation":"Apply only after explicit approval."});
+    let key = CommandKey::from_bytes([tag + 1; 16]);
+    let args = json!({"category":category, "observation":"Apply only after explicit approval."});
     let model = fixture
         .canonical
         .append_chat(
             run_scope.clone(),
             Mutation {
-                identity: mutation(171),
+                identity: mutation(tag + 1),
                 preconditions: Preconditions::default(),
                 input: AppendChat {
                     thread: thread.clone(),
@@ -118,17 +121,6 @@ pub(super) async fn explicit_confirmation_applies_once(
         .await
         .unwrap();
     assert_eq!(result.structured_content["outcome"], "approvalRequired");
-    let target = MemoryTarget::User {
-        owner: owner.auth().principal().clone(),
-    };
-    let inspect = || {
-        fixture.control.inspect_memory_target(
-            owner.clone(),
-            target.clone(),
-            "proposal-fixture".into(),
-        )
-    };
-    assert_eq!(inspect().await.unwrap().revision, None);
     let proposal = result
         .proposal()
         .expect("trusted run receives the typed proposal");
@@ -137,7 +129,7 @@ pub(super) async fn explicit_confirmation_applies_once(
         .append_chat(
             run_scope.clone(),
             Mutation {
-                identity: mutation(172),
+                identity: mutation(tag + 2),
                 preconditions: Preconditions::default(),
                 input: AppendChat {
                     thread: thread.clone(),
@@ -154,12 +146,31 @@ pub(super) async fn explicit_confirmation_applies_once(
         )
         .await
         .unwrap();
-    let confirm = ConfirmProposedDiff {
+    ConfirmProposedDiff {
         source: scope.clone(),
         thread,
         entry: entry.value.seq,
         proposal: proposal.id(),
+    }
+}
+
+pub(super) async fn explicit_confirmation_applies_once(
+    fixture: &RuntimeFixture,
+    personal: &SpaceContext,
+) {
+    let owner = &fixture.human;
+    let confirm = record_memory_proposal(fixture, personal, owner, 170, "proposal-fixture").await;
+    let target = MemoryTarget::User {
+        owner: owner.auth().principal().clone(),
     };
+    let inspect = || {
+        fixture.control.inspect_memory_target(
+            owner.clone(),
+            target.clone(),
+            "proposal-fixture".into(),
+        )
+    };
+    assert_eq!(inspect().await.unwrap().revision, None);
     let preview = fixture
         .registry
         .preview_proposed_diff(owner.clone(), confirm.clone())
@@ -212,4 +223,82 @@ pub(super) async fn explicit_confirmation_applies_once(
             .count(),
         1
     );
+}
+
+pub(super) async fn revoked_session_cannot_apply_or_replay(fixture: &mut RuntimeFixture) {
+    let principal = fixture.human.auth().principal().clone();
+    let space = fixture
+        .control
+        .whoami(fixture.human.clone())
+        .await
+        .unwrap()
+        .personal_space
+        .unwrap();
+    let scope = fixture.canonical.read_space(&space).await.unwrap().scope;
+    let personal = SpaceContext::new(fixture.human.auth().clone(), scope, budget()).unwrap();
+    for (tag, replay) in [(190, false), (193, true)] {
+        let token = mint(TokenKind::Session).unwrap();
+        fixture
+            .storage
+            .observer
+            .seed_session(
+                &principal,
+                &AuthSessionId::from_bytes([tag; 16]),
+                &token,
+                fixture.storage.clock.0.load(Ordering::SeqCst),
+            )
+            .await;
+        let auth = fixture
+            .control
+            .resolve(support::evidence(
+                AuthEvidenceKind::Session,
+                token.secret.expose(),
+            ))
+            .await
+            .unwrap();
+        let owner = AccountContext::new(auth, budget());
+        let category = format!("proposal-revocation-{tag}");
+        let confirm = record_memory_proposal(fixture, &personal, &owner, tag, &category).await;
+        if replay {
+            fixture
+                .registry
+                .apply_proposed_diff(owner.clone(), confirm.clone())
+                .await
+                .unwrap();
+        }
+        let inspect = || {
+            fixture.control.inspect_memory_target(
+                fixture.human.clone(),
+                MemoryTarget::User {
+                    owner: principal.clone(),
+                },
+                category.clone(),
+            )
+        };
+        let before = inspect().await.unwrap().revision;
+        assert_eq!(before.is_some(), replay);
+        let denied = authoring_authority_cases::revoke_at_effect(
+            fixture.projections.pause_memory_append(),
+            fixture
+                .registry
+                .apply_proposed_diff(owner.clone(), confirm.clone()),
+            fixture.control.logout(support::evidence(
+                AuthEvidenceKind::Session,
+                token.secret.expose(),
+            )),
+        )
+        .await;
+        assert!(matches!(denied, PortError::Cancelled(_)), "{denied:?}");
+        assert_eq!(inspect().await.unwrap().revision, before);
+        let stale_owner = AccountContext::new(owner.auth().clone(), budget());
+        let denied = fixture
+            .registry
+            .apply_proposed_diff(stale_owner, confirm)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(denied, PortError::Domain(DomainError::AuthenticationFailed)),
+            "{denied:?}"
+        );
+    }
 }

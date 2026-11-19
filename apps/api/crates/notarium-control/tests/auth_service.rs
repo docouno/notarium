@@ -1635,6 +1635,7 @@ async fn interactive_management_and_account_guards(pg: bool) {
             facts: ResourceFacts {
                 space: shared.space,
                 class: DocClass::Skill,
+                project: None,
                 ancestor_folders: vec![],
                 folder_write_locked: false,
                 ability_package: Some(ability_ref.id.clone()),

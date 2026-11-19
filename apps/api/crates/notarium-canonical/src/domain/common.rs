@@ -505,7 +505,7 @@ pub(crate) fn derive_command_identity_spec(
     hasher.update(identity.hash.as_bytes());
     hasher.update(&[0]);
     hasher.update(canonical_payload_fingerprint);
-    crate::writer::replay::UnboundCommand(CommandIdentitySpec::new(
+    crate::writer::replay::UnboundCommand::new(CommandIdentitySpec::new(
         identity.actor.clone(),
         identity.key.clone(),
         ContentDigest::from_bytes(*hasher.finalize().as_bytes()),
@@ -1278,6 +1278,7 @@ impl FolderAncestryCache {
         let facts = ResourceFacts {
             space: space.clone(),
             class,
+            project: anc.project.clone(),
             ancestor_folders: anc.ancestors.clone(),
             folder_write_locked: anc.write_locked,
             ability_package,
@@ -1368,6 +1369,7 @@ pub(crate) async fn build_resource_facts_tx(
     let facts = ResourceFacts {
         space: space.clone(),
         class,
+        project: anc.project.clone(),
         ancestor_folders: anc.ancestors.clone(),
         folder_write_locked: anc.write_locked,
         ability_package,

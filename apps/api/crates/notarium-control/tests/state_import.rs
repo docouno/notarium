@@ -77,6 +77,7 @@ async fn state_import(pg: bool) {
             facts: ResourceFacts {
                 space: space_info,
                 class: DocClass::UserDoc,
+                project: Some(project.folder_id.clone()),
                 ancestor_folders: vec![project.folder_id.clone()],
                 folder_write_locked: false,
                 ability_package: None,

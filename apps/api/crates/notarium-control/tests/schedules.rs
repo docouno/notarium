@@ -1034,6 +1034,7 @@ async fn role_placement_scope_and_run_inspection_access(pg: bool) {
                 facts: ResourceFacts {
                     space: space.clone(),
                     class: DocClass::Skill,
+                    project: None,
                     ancestor_folders: ancestors,
                     folder_write_locked: false,
                     ability_package: Some(reference.id.clone()),

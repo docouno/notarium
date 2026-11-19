@@ -57,6 +57,7 @@ impl SharedAuthority {
         for token in cancelled {
             token.cancel();
         }
+        self.hub.close();
     }
 
     fn observed(&self, transition: &RunOwnershipTransition) -> bool {
@@ -90,7 +91,7 @@ impl RevocationLease for SharedAuthority {
 }
 
 impl ClusterRunAuthority for SharedAuthority {
-    fn admit_input(
+    fn admit_chat_write(
         &self,
         _ctx: MaintenanceContext,
         _scope: HistoryScope,
@@ -128,6 +129,16 @@ impl ClusterRunAuthority for SharedAuthority {
 }
 
 impl SessionRevocationPort for SharedAuthority {
+    fn register_canonical_effect(
+        &self,
+        ctx: MaintenanceContext,
+        selectors: Vec<RevocationSelector>,
+        cancellation: Cancellation,
+    ) -> PortFuture<'_, Box<dyn RevocationLease>> {
+        self.hub
+            .register_canonical_effect(ctx, selectors, cancellation)
+    }
+
     fn register_provider(
         &self,
         ctx: MaintenanceContext,
@@ -322,6 +333,16 @@ async fn fenced_ownership_recovers_pending_inputs(
     let (mut blocked, _) = timeout(Duration::from_secs(15), read_request(&listener))
         .await
         .unwrap();
+    let mut retained = primary
+        .subscribe(
+            fixture.human.clone(),
+            scope.clone(),
+            thread_id.clone(),
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
     assert!(matches!(
         peer.start(
             fixture.human.clone(),
@@ -405,6 +426,10 @@ async fn fenced_ownership_recovers_pending_inputs(
     old_authority.fence_writer();
     assert_socket_closed(&mut blocked).await;
     assert!(matches!(
+        retained.next().await,
+        notarium_agents::chats::stream::StreamRead::Closed
+    ));
+    assert!(matches!(
         primary
             .enqueue_input(
                 fixture.human.clone(),
@@ -421,6 +446,24 @@ async fn fenced_ownership_recovers_pending_inputs(
             .as_ref(),
         Some(&abandoned)
     );
+    let stale = thread(&fixture, reader, &thread_id).await;
+    assert!(matches!(
+        primary
+            .redact_chat_entry(
+                fixture.human.clone(),
+                Mutation {
+                    identity: identity(20),
+                    preconditions: Preconditions::default(),
+                    input: RedactChatEntry {
+                        thread: thread_id.clone(),
+                        entry: first_post.value.seq,
+                        expected_thread_revision: stale.revision,
+                    },
+                }
+            )
+            .await,
+        Err(PortError::Domain(DomainError::SpaceReadOnly))
+    ));
     drop(primary);
     drop(peer);
     drop(local);

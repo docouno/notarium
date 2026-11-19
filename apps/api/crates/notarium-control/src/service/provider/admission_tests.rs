@@ -29,6 +29,7 @@ async fn admissions(pg: bool) {
         ResourceFacts {
             space: catalog.space,
             class: DocClass::EncryptedNote,
+            project: None,
             ancestor_folders: vec![],
             folder_write_locked: false,
             ability_package: None,

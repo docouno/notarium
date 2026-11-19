@@ -114,6 +114,7 @@ async fn run_concurrent_load_pool_isolation_and_untainted_metadata(pg: bool) {
             facts: ResourceFacts {
                 space: shared.space.clone(),
                 class: DocClass::UserDoc,
+                project: Some(project.folder_id.clone()),
                 ancestor_folders: vec![project.folder_id.clone()],
                 folder_write_locked: false,
                 ability_package: None,
@@ -143,6 +144,7 @@ async fn run_concurrent_load_pool_isolation_and_untainted_metadata(pg: bool) {
             facts: ResourceFacts {
                 space: personal_space.clone(),
                 class: DocClass::UserDoc,
+                project: None,
                 ancestor_folders: vec![],
                 folder_write_locked: false,
                 ability_package: None,
@@ -207,6 +209,7 @@ async fn run_concurrent_load_pool_isolation_and_untainted_metadata(pg: bool) {
             facts: ResourceFacts {
                 space: shared.space.clone(),
                 class: DocClass::Skill,
+                project: None,
                 ancestor_folders: vec![],
                 folder_write_locked: false,
                 ability_package: Some(ability_ref.id),
@@ -311,6 +314,7 @@ async fn run_concurrent_load_pool_isolation_and_untainted_metadata(pg: bool) {
     let personal_facts = ResourceFacts {
         space: personal_space,
         class: DocClass::UserDoc,
+        project: None,
         ancestor_folders: vec![],
         folder_write_locked: false,
         ability_package: None,

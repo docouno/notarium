@@ -1,9 +1,10 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, future::Future};
 
 use notarium_core::{
     auth::{SpaceKind, SpaceRole},
     model::{HistoryScope, NoteRef},
     patch::{CarrierEditOrigin, CarrierPatchPlan},
+    ports::{AccountContext, CanonicalEffect, ControlCommit},
     receipt::{CausalBasis, ReceiptSet},
 };
 use notarium_syntax::{carrier::Carrier, frontmatter::FieldEdit, patch, unicode};
@@ -140,13 +141,59 @@ async fn writer(
     call: &ToolCallContext<'_>,
     history: &HistoryScope,
 ) -> Result<SpaceContext, PortError> {
-    let auth = call
-        .registry
+    call.registry
         .control
-        .revalidate_auth(call.account())
-        .await?;
-    require_skill_write(&auth, &history.space_id)?;
-    Ok(SpaceContext::new(auth, history.clone(), call.budget())?)
+        .fence_canonical_effect(
+            call.auth.clone(),
+            call.space(history.clone())?,
+            CanonicalEffect::AbilityAuthoring,
+        )
+        .await
+}
+
+async fn terminal_authoring<T: Clone, R, Fut>(
+    call: &ToolCallContext<'_>,
+    label: &str,
+    mut expected: ControlRevision,
+    input: T,
+    write: impl Fn(AccountContext, AccountMutation<T>) -> Fut,
+) -> Result<ControlCommit<R>, PortError>
+where
+    Fut: Future<Output = Result<ControlCommit<R>, PortError>>,
+{
+    const MAX_ACCOUNT_RETRIES: u16 = 8;
+    for ordinal in 0..=MAX_ACCOUNT_RETRIES {
+        let attempt = write(
+            call.account(),
+            AccountMutation {
+                identity: call.account_identity(expected, label, ordinal),
+                input: input.clone(),
+            },
+        )
+        .await;
+        let Err(error @ PortError::Domain(DomainError::ControlRevisionConflict { .. })) = attempt
+        else {
+            return attempt;
+        };
+        if ordinal == MAX_ACCOUNT_RETRIES {
+            return Err(error);
+        }
+        let latest = call
+            .registry
+            .control
+            .whoami(call.account())
+            .await?
+            .account_revision;
+        if latest == expected {
+            return Err(error);
+        }
+        // A definitive conflict saved no effect for this key. Keep the
+        // object-level CAS unchanged and persist the next attempt identity
+        // before writing anything. Unknown replies still replay the same key.
+        let next = format!("{label}-account-retry-{}", ordinal + 1);
+        expected = call.journal(&next, || async { Ok(latest) }).await?;
+    }
+    Err(invalid(ValidationReason::InvalidState))
 }
 
 async fn select_projects(
@@ -490,25 +537,19 @@ pub(super) async fn create(
         placement: plan.home.placement,
         revision: created.value.revision,
     };
-    call.registry
-        .control
-        .update_ability_binding(
-            call.account(),
-            AccountMutation {
-                identity: call.account_identity(
-                    plan.account_revision,
-                    "initial-ability-binding",
-                    0,
-                ),
-                input: AbilityBindingUpdate {
-                    ability: reference.clone(),
-                    enabled: true,
-                    projects: plan.availability,
-                    expected: ControlRevision::ZERO,
-                },
-            },
-        )
-        .await?;
+    terminal_authoring(
+        call,
+        "initial-ability-binding",
+        plan.account_revision,
+        AbilityBindingUpdate {
+            ability: reference.clone(),
+            enabled: true,
+            projects: plan.availability,
+            expected: ControlRevision::ZERO,
+        },
+        |ctx, request| call.registry.control.update_ability_binding(ctx, request),
+    )
+    .await?;
     write_response(&bound_ability(call, &reference).await?, "created")
 }
 
@@ -852,25 +893,18 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
                 ..reference.clone()
             };
             reference = destination.clone();
-            let result = call
-                .registry
-                .control
-                .set_ability_trail(
-                    call.account(),
-                    AccountMutation {
-                        identity: call.account_identity(
-                            account_revision,
-                            "adopt-promoted-ability",
-                            0,
-                        ),
-                        input: AbilityTrailUpdate {
-                            source: plan.original.clone(),
-                            expected_destination: None,
-                            destination: Some(destination.clone()),
-                        },
-                    },
-                )
-                .await?;
+            let result = terminal_authoring(
+                call,
+                "adopt-promoted-ability",
+                account_revision,
+                AbilityTrailUpdate {
+                    source: plan.original.clone(),
+                    expected_destination: None,
+                    destination: Some(destination.clone()),
+                },
+                |ctx, request| call.registry.control.set_ability_trail(ctx, request),
+            )
+            .await?;
             account_revision = result.revision;
             moved = true;
         }
@@ -923,22 +957,19 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
             )
         };
     if let Some(availability) = plan.requested_availability {
-        match call
-            .registry
-            .control
-            .update_ability_binding(
-                call.account(),
-                AccountMutation {
-                    identity: call.account_identity(account_revision, "edit-ability-binding", 0),
-                    input: AbilityBindingUpdate {
-                        ability: reference.clone(),
-                        enabled: binding_enabled,
-                        projects: availability,
-                        expected: binding_revision,
-                    },
-                },
-            )
-            .await
+        match terminal_authoring(
+            call,
+            "edit-ability-binding",
+            account_revision,
+            AbilityBindingUpdate {
+                ability: reference.clone(),
+                enabled: binding_enabled,
+                projects: availability,
+                expected: binding_revision,
+            },
+            |ctx, request| call.registry.control.update_ability_binding(ctx, request),
+        )
+        .await
         {
             Ok(result) => {
                 account_revision = result.revision;

@@ -9,8 +9,8 @@ use notarium_core::{
     ids::{FolderId, NoteId, RevisionId},
     model::{FolderRef, HistoryScope, Lifecycle, NoteRef},
     ports::{
-        DeleteDisposition, DeleteNote, EditNote, EnsureFolderPath, FolderSnapshot, MoveNote,
-        Mutation, Preconditions, RenameNote, SpaceContext,
+        ConfirmedNoteDestination, DeleteDisposition, DeleteNote, EditNote, EnsureFolderPath,
+        FolderSnapshot, MoveNote, Mutation, Preconditions, RenameNote, SpaceContext,
     },
     receipt::{CausalBasis, CommandIdentity},
 };
@@ -59,6 +59,8 @@ pub(in crate::mcp) struct Destination {
     anchor: FolderRef,
     revision: RevisionId,
     tail: String,
+    path: String,
+    ancestors: Vec<FolderId>,
 }
 
 impl PreparedNoteAction {
@@ -268,6 +270,7 @@ async fn authorize_folder(
     let facts = ResourceFacts {
         space: live.space,
         class,
+        project: None,
         ancestor_folders: live.ancestor_folders,
         folder_write_locked: live.write_locked,
         ability_package: None,
@@ -323,6 +326,8 @@ pub(super) async fn observe_destination(
         anchor: anchor.reference,
         revision: anchor.revision,
         tail,
+        path: anchor.path,
+        ancestors: anchor.ancestor_folders,
     })
 }
 
@@ -341,14 +346,17 @@ impl Destination {
         if current.reference != self.anchor {
             return Err(invalid(ValidationReason::ScopeMismatch));
         }
-        if current.revision != self.revision {
+        authorize_folder(call, scope, &self.anchor, class).await?;
+        if current.revision != self.revision
+            || current.path != self.path
+            || current.ancestor_folders != self.ancestors
+        {
             return Err(DomainError::RevisionConflict {
                 current: current.revision,
                 lineage: None,
             }
             .into());
         }
-        authorize_folder(call, scope, &self.anchor, class).await?;
         Ok(current)
     }
 
@@ -360,10 +368,10 @@ impl Destination {
     ) -> Result<Value, PortError> {
         let anchor = self.checked_anchor(reviewer, scope, class).await?;
         let visible = corpus::folder_metadata(reviewer, scope, &anchor).await?;
-        let prefix = visible["path"]
-            .as_str()
-            .ok_or_else(|| invalid(ValidationReason::SourceMismatch))?;
-        let path = [prefix, &self.tail]
+        if visible["path"].as_str() != Some(self.path.as_str()) {
+            return Err(invalid(ValidationReason::SourceMismatch));
+        }
+        let path = [self.path.as_str(), &self.tail]
             .into_iter()
             .filter(|component| !component.is_empty())
             .collect::<Vec<_>>()
@@ -371,27 +379,22 @@ impl Destination {
         Ok(json!({ "folderPath":path, "folderId":self.exact().map(|folder| &folder.folder_id) }))
     }
 
-    async fn resolve_existing(
+    pub(super) fn bind(
         &self,
-        call: &ToolCallContext<'_>,
-        scope: &SpaceContext,
-    ) -> Result<Option<FolderRef>, PortError> {
-        let found = call
-            .registry
-            .engine
-            .resolve_folder_path(
-                scope.clone(),
-                Some(self.anchor.folder_id.clone()),
-                self.tail.clone(),
-            )
-            .await?;
-        if let Some(found) = &found {
-            scope.scope().check(&found.history)?;
-            if found.reference.space_id != scope.scope().space_id {
-                return Err(invalid(ValidationReason::ScopeMismatch));
-            }
-        }
-        Ok(found.map(|folder| folder.reference))
+        scope: SpaceContext,
+        expected_source: Option<&NoteRoute>,
+    ) -> Result<SpaceContext, PortError> {
+        Ok(
+            scope.with_confirmed_note_destination(ConfirmedNoteDestination {
+                anchor: self.anchor.clone(),
+                anchor_revision: self.revision.clone(),
+                anchor_path: self.path.clone(),
+                anchor_ancestors: self.ancestors.clone(),
+                missing_suffix: self.tail.clone(),
+                move_source: expected_source
+                    .map(|route| (route.note.clone(), route.revision.clone())),
+            })?,
+        )
     }
 
     pub(super) async fn apply(
@@ -399,62 +402,38 @@ impl Destination {
         call: &ToolCallContext<'_>,
         scope: SpaceContext,
         identity: CommandIdentity,
-        class: DocClass,
         expected_source: Option<&NoteRoute>,
     ) -> Result<FolderRef, PortError> {
-        let destination: FolderRef = call
-            .journal_with_key(
-                "confirmed_destination",
-                &identity.key,
-                identity.hash,
-                || async {
-                    self.checked_anchor(call, &scope, class).await?;
-                    if let Some(exact) = self.exact() {
-                        return Ok(exact.clone());
-                    }
-                    if let Some(route) = expected_source {
-                        let current = snapshot(
-                            call,
-                            &scope,
-                            &route.note,
-                            None,
-                            CausalBasis::Await(Default::default()),
-                        )
-                        .await?;
-                        if current.document.revision() != &route.revision {
-                            // A stale source may reach replay using an existing destination,
-                            // but cannot create a folder before its note CAS fails.
-                            return self.resolve_existing(call, &scope).await?.ok_or_else(|| {
-                                DomainError::RevisionConflict {
-                                    current: current.document.revision().clone(),
-                                    lineage: None,
-                                }
-                                .into()
-                            });
-                        }
-                    }
-                    call.registry
-                        .engine
-                        .ensure_folder_path(
-                            scope.clone(),
-                            Mutation {
-                                identity: identity.clone(),
-                                preconditions: Preconditions::default(),
-                                input: EnsureFolderPath {
-                                    base: Some(self.anchor.folder_id.clone()),
-                                    path: self.tail.clone(),
-                                },
-                            },
-                        )
-                        .await
-                },
-            )
-            .await?;
-        if destination.space_id != scope.scope().space_id {
-            return Err(invalid(ValidationReason::ScopeMismatch));
+        if let Some(exact) = self.exact() {
+            return Ok(exact.clone());
         }
-        authorize_folder(call, &scope, &destination, class).await?;
-        Ok(destination)
+        // Record the resolved identity for replay even when a sibling step
+        // created the whole suffix. The subsequent note write rechecks it.
+        call.journal_with_key(
+            "confirmed_destination",
+            &identity.key,
+            identity.hash,
+            || async {
+                let scope = call
+                    .fence_confirmed_effect(self.bind(scope, expected_source)?)
+                    .await?;
+                call.registry
+                    .engine
+                    .ensure_folder_path(
+                        scope,
+                        Mutation {
+                            identity: identity.clone(),
+                            preconditions: Preconditions::default(),
+                            input: EnsureFolderPath {
+                                base: Some(self.anchor.folder_id.clone()),
+                                path: self.tail.clone(),
+                            },
+                        },
+                    )
+                    .await
+            },
+        )
+        .await
     }
 }
 
@@ -607,7 +586,7 @@ pub(in crate::mcp) async fn apply_proposal(
                 .registry
                 .engine
                 .edit_note(
-                    scope.clone(),
+                    owner.fence_confirmed_effect(scope.clone()).await?,
                     Mutation {
                         identity,
                         preconditions: preconditions(&route),
@@ -626,7 +605,7 @@ pub(in crate::mcp) async fn apply_proposal(
                 .registry
                 .engine
                 .delete_note(
-                    scope.clone(),
+                    owner.fence_confirmed_effect(scope.clone()).await?,
                     Mutation {
                         identity,
                         preconditions: preconditions(&route),
@@ -643,18 +622,21 @@ pub(in crate::mcp) async fn apply_proposal(
             route,
             destination,
             slug,
-            class,
+            ..
         } => {
             let (scope, identity) = step(&route.scope, "move_note", 0)?;
             let (folder_scope, folder_identity) = step(&route.scope, "move_destination", 0)?;
             let parent = destination
-                .apply(owner, folder_scope, folder_identity, class, Some(&route))
+                .apply(owner, folder_scope, folder_identity, Some(&route))
+                .await?;
+            let leased = owner
+                .fence_confirmed_effect(destination.bind(scope.clone(), Some(&route))?)
                 .await?;
             let result = owner
                 .registry
                 .engine
                 .move_note(
-                    scope.clone(),
+                    leased,
                     Mutation {
                         identity,
                         preconditions: preconditions(&route),
@@ -674,7 +656,7 @@ pub(in crate::mcp) async fn apply_proposal(
                 .registry
                 .engine
                 .rename_note(
-                    scope.clone(),
+                    owner.fence_confirmed_effect(scope.clone()).await?,
                     Mutation {
                         identity,
                         preconditions: preconditions(&route),

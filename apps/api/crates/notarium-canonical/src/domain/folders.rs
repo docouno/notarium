@@ -115,6 +115,7 @@ pub(crate) async fn move_folder_impl(
                 let before_facts = notarium_core::auth::ResourceFacts {
                     space: live_space.space.clone(),
                     class: target_write_class,
+                    project: before_anc.project,
                     ancestor_folders: before_anc.ancestors,
                     folder_write_locked: before_anc.write_locked,
                     ability_package: None,
@@ -125,6 +126,11 @@ pub(crate) async fn move_folder_impl(
                 let after_facts = notarium_core::auth::ResourceFacts {
                     space: live_space.space.clone(),
                     class: target_write_class,
+                    project: if folder_row.is_project {
+                        Some(input.folder.clone())
+                    } else {
+                        destination_project.clone()
+                    },
                     ancestor_folders: after_ancestors,
                     folder_write_locked: folder_row.write_locked || dest_anc.write_locked,
                     ability_package: None,
@@ -296,6 +302,7 @@ pub(crate) async fn move_folder_impl(
                 let run_opt = extract_agent_run_from_auth(&auth);
                 let meta = RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Folder(
                     FolderRevisionMetadata {
+                        confirmation: None,
                         folder_id: input.folder.clone(),
                         parent_folder_id: Some(dest_parent),
                         is_root: false,
@@ -453,6 +460,7 @@ pub(crate) async fn rename_folder_impl(
                 let facts = notarium_core::auth::ResourceFacts {
                     space: live_space.space.clone(),
                     class: target_write_class,
+                    project: anc.project,
                     ancestor_folders: anc.ancestors,
                     folder_write_locked: anc.write_locked,
                     ability_package: None,
@@ -562,6 +570,7 @@ pub(crate) async fn rename_folder_impl(
                 let run_opt = extract_agent_run_from_auth(&auth);
                 let meta = RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Folder(
                     FolderRevisionMetadata {
+                        confirmation: None,
                         folder_id: input.folder.clone(),
                         parent_folder_id: Some(parent_id),
                         is_root: false,
@@ -723,6 +732,7 @@ pub(crate) async fn rename_project_impl(
                 let facts = notarium_core::auth::ResourceFacts {
                     space: live_space.space.clone(),
                     class: target_write_class,
+                    project: anc.project,
                     ancestor_folders: anc.ancestors,
                     folder_write_locked: anc.write_locked,
                     ability_package: None,
@@ -855,6 +865,7 @@ pub(crate) async fn rename_project_impl(
                 let run_opt = extract_agent_run_from_auth(&auth);
                 let meta = RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Folder(
                     FolderRevisionMetadata {
+                        confirmation: None,
                         folder_id: input.folder.clone(),
                         parent_folder_id: Some(parent_id),
                         is_root: false,
@@ -1364,6 +1375,7 @@ pub(crate) async fn set_folder_write_lock_impl(
                 let check_facts = notarium_core::auth::ResourceFacts {
                     space: live_space.space.clone(),
                     class: target_write_class,
+                    project: anc.project,
                     ancestor_folders: anc.ancestors,
                     folder_write_locked: false,
                     ability_package: None,
@@ -1424,6 +1436,7 @@ pub(crate) async fn set_folder_write_lock_impl(
 
                 let meta = RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Folder(
                     FolderRevisionMetadata {
+                        confirmation: None,
                         folder_id: folder_cl.clone(),
                         parent_folder_id: folder_row.parent_folder_id,
                         is_root: folder_row.is_root,
@@ -1532,6 +1545,7 @@ async fn is_folder_readable_tx(
     let facts = notarium_core::auth::ResourceFacts {
         space: space.clone(),
         class: readable_class,
+        project: anc.project,
         ancestor_folders: anc.ancestors,
         folder_write_locked: anc.write_locked,
         ability_package: None,
