@@ -812,6 +812,11 @@ async fn sqlite_hybrid_seed_causal_boundaries_and_scrub() {
     chat_candidate_visibility(store.clone(), data.data_root()).await;
     reader_capacity(store.clone(), data.data_root()).await;
     hybrid_support::remote::model_epochs_and_repair(store.clone(), data.data_root()).await;
+    hybrid_support::remote::scoped_backfill_recovers_and_rechecks_selection(
+        store.clone(),
+        data.data_root(),
+    )
+    .await;
     hybrid_support::ort::search_with_dynamic_models(store.clone(), data.data_root()).await;
     purge_and_rebind(store, data.data_root()).await;
     runtime.shutdown().await.unwrap();
@@ -832,6 +837,12 @@ async fn postgres_hybrid_seed_causal_boundaries_and_scrub() {
     run_scenario(store.clone(), data.data_root(), 0x43).await;
     hybrid_support::remote::lexical_fallback(store.clone(), data.data_root()).await;
     chat_candidate_visibility(store.clone(), data.data_root()).await;
+    reader_capacity(store.clone(), data.data_root()).await;
+    hybrid_support::remote::scoped_backfill_recovers_and_rechecks_selection(
+        store.clone(),
+        data.data_root(),
+    )
+    .await;
     purge_and_rebind(store, data.data_root()).await;
     runtime.shutdown().await.unwrap();
     fixtures.drop_pg_schema(&schema).await;
@@ -902,7 +913,65 @@ async fn reader_capacity(store: Arc<CanonicalStore>, root: DataRoot) {
     };
     let engine = start();
     engine.start_space(first.clone()).unwrap();
-    acknowledged(&store, &root, &first, first_seq).await;
+    let note_manifest = acknowledged(&store, &root, &first, first_seq).await;
+    let note_layout = SearchLayout::open(&root, first.clone()).unwrap();
+    let note_index = note_layout.index_dir(&note_manifest).unwrap();
+    let chat_tag = tag + 33;
+    let (chat_scope, _, _) = seed(&store, chat_tag).await;
+    let chat_layout = SearchLayout::open(&root, chat_scope.clone()).unwrap();
+    let chat_owner = sample_principal_id(chat_tag);
+    let chat_ctx = context(&chat_scope, &chat_owner);
+    let thread = ChatThreadId::from_bytes([chat_tag; 16]);
+    store
+        .create_chat(
+            chat_ctx.clone(),
+            mutation(
+                &chat_ctx,
+                CreateChat {
+                    thread: thread.clone(),
+                    kind: ChatThreadKind::Personal,
+                    owner: chat_owner,
+                    project_folder: None,
+                    title: "Reader capacity chat".into(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let appended = store
+        .append_chat(
+            chat_ctx.clone(),
+            mutation(
+                &chat_ctx,
+                AppendChat {
+                    thread: thread.clone(),
+                    parent: ThreadEntrySeq::ZERO,
+                    kind: ChatEntryKind::Human,
+                    body: ChatInputBody::Text(REDACTED.into()),
+                    referenced_notes: vec![],
+                    tainted: false,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let expected_thread_revision = store
+        .read_chat(
+            chat_ctx.clone(),
+            ChatRead {
+                thread: thread.clone(),
+                leaf: appended.value.seq,
+                before: None,
+                max_entries: PageLimit::new(1).unwrap(),
+            },
+        )
+        .await
+        .unwrap()
+        .thread
+        .revision;
+    engine.start_space(chat_scope.clone()).unwrap();
+    let chat_manifest = acknowledged(&store, &root, &chat_scope, appended.receipt.seq()).await;
+    let chat_index = chat_layout.index_dir(&chat_manifest).unwrap();
     let mut other_spaces = Vec::new();
     for tag in (tag + 1)..=(tag + 32) {
         let (scope, seq, _) = seed(&store, tag).await;
@@ -916,6 +985,20 @@ async fn reader_capacity(store: Arc<CanonicalStore>, root: DataRoot) {
         .await
         .unwrap();
     assert_eq!(hits.hits[0].card.title, "Capacity receipt");
+    let mut chat_view = View::new(chat_scope.clone(), sample_folder_id(chat_tag));
+    chat_view.advance(appended.receipt.seq());
+    *projection.snapshot.write().unwrap() = chat_view;
+    let mut chat_query = query(REDACTED);
+    chat_query.include_chats = true;
+    assert_eq!(
+        engine
+            .search(chat_ctx.clone(), chat_query)
+            .await
+            .unwrap()
+            .chat_hits[0]
+            .snippet,
+        REDACTED,
+    );
     engine.shutdown().await;
     let vectors = root.search(&first.space_id, SearchIndexKind::Vector);
     assert!(
@@ -933,6 +1016,20 @@ async fn reader_capacity(store: Arc<CanonicalStore>, root: DataRoot) {
     purge.preconditions.revision = Some(revision);
     let purged = store.delete_note(ctx, purge).await.unwrap();
     projection.live.write().unwrap().remove(&note);
+    let redacted = store
+        .redact_chat_entry(
+            chat_ctx.clone(),
+            mutation(
+                &chat_ctx,
+                RedactChatEntry {
+                    thread,
+                    entry: appended.value.seq,
+                    expected_thread_revision,
+                },
+            ),
+        )
+        .await
+        .unwrap();
 
     let engine = Arc::new(start());
     let mut held = tokio::task::JoinSet::new();
@@ -958,9 +1055,12 @@ async fn reader_capacity(store: Arc<CanonicalStore>, root: DataRoot) {
             .unwrap();
     }
     engine.start_space(first.clone()).unwrap();
-    let layout = SearchLayout::open(&root, first.clone()).unwrap();
+    engine.start_space(chat_scope.clone()).unwrap();
     tokio::time::timeout(Duration::from_secs(3), async {
-        while layout.search_manifest().unwrap().is_some()
+        while note_layout.search_manifest().unwrap().is_some()
+            || note_index.exists()
+            || chat_layout.search_manifest().unwrap().is_some()
+            || chat_index.exists()
             || files(&vectors)
                 .values()
                 .any(|bytes| contains(bytes, note.as_str()))
@@ -979,12 +1079,22 @@ async fn reader_capacity(store: Arc<CanonicalStore>, root: DataRoot) {
             .min_consumer_watermark(&first.space_id, &first.incarnation)
             .is_none_or(|seq| seq < purged.receipt.seq())
     );
+    assert!(
+        store
+            .min_consumer_watermark(&chat_scope.space_id, &chat_scope.incarnation)
+            .is_none_or(|seq| seq < redacted.receipt.seq())
+    );
     held.shutdown().await;
     carriers.hold_note_reads.store(false, Ordering::SeqCst);
     acknowledged(&store, &root, &first, purged.receipt.seq()).await;
+    acknowledged(&store, &root, &chat_scope, redacted.receipt.seq()).await;
     assert_absent(
         &root.search(&first.space_id, SearchIndexKind::Tantivy),
         "readercapacitykeyword",
+    );
+    assert_absent(
+        &root.search(&chat_scope.space_id, SearchIndexKind::Tantivy),
+        REDACTED,
     );
     Arc::try_unwrap(engine).ok().unwrap().shutdown().await;
 }

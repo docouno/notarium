@@ -8,10 +8,10 @@ use notarium_core::{
     model::FolderRef,
     ports::{
         EmbeddingProviderPort, EmbeddingQueryInput, EmbeddingRequest, ProviderErrorCode,
-        SpaceContext,
+        ProviderRuntimeEpochs, SpaceContext,
     },
 };
-use std::{num::NonZeroU64, sync::Arc, time::Instant};
+use std::{sync::Arc, time::Instant};
 
 pub struct RemoteEmbedder {
     port: Arc<dyn EmbeddingProviderPort>,
@@ -19,7 +19,7 @@ pub struct RemoteEmbedder {
     pub provider: ProviderResourceId,
     pub dimension: u32,
     pub max_input_tokens: u32,
-    runtime_epoch: NonZeroU64,
+    runtime_epochs: ProviderRuntimeEpochs,
 }
 
 impl RemoteEmbedder {
@@ -29,7 +29,7 @@ impl RemoteEmbedder {
         provider: ProviderResourceId,
         dimension: u32,
         max_input_tokens: u32,
-        runtime_epoch: NonZeroU64,
+        runtime_epochs: ProviderRuntimeEpochs,
     ) -> Self {
         Self {
             port,
@@ -37,7 +37,7 @@ impl RemoteEmbedder {
             provider,
             dimension,
             max_input_tokens,
-            runtime_epoch,
+            runtime_epochs,
         }
     }
 
@@ -160,7 +160,7 @@ impl RemoteEmbedder {
         if ctx.budget.cancellation.is_cancelled() {
             return Err(EmbeddingError::Cancelled);
         }
-        let request = request.with_runtime_epoch(self.runtime_epoch);
+        let request = request.with_runtime_epochs(self.runtime_epochs);
         request.validate().map_err(provider_error)?;
         let count = request.inputs.len();
         let result = self.port.embed(ctx, request).await.map_err(port_error)?;
@@ -192,7 +192,15 @@ impl RemoteEmbedder {
         hash_field(&mut hash, ctx.budget.request.as_str().as_bytes());
         hash_field(&mut hash, self.model.as_str().as_bytes());
         hash_field(&mut hash, self.provider.as_str().as_bytes());
-        hash_field(&mut hash, &self.runtime_epoch.get().to_le_bytes());
+        hash_field(&mut hash, &self.runtime_epochs.resource.get().to_le_bytes());
+        hash_field(
+            &mut hash,
+            &self
+                .runtime_epochs
+                .credential
+                .map_or(0, |epoch| epoch.get())
+                .to_le_bytes(),
+        );
         if let Some(project) = project {
             hash_field(&mut hash, project.space_id.as_str().as_bytes());
             hash_field(&mut hash, project.folder_id.as_str().as_bytes());

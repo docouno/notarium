@@ -12,10 +12,12 @@ use notarium_core::{
         RevisionId, SpaceSeq, ThreadEntrySeq,
     },
     model::{FolderRef, HistoryScope},
-    ports::{CallBudget, PageLimit, PortFuture, ServiceAuthority, SpaceContext},
+    ports::{
+        CallBudget, PageLimit, PortFuture, ProviderRuntimeEpochs, ServiceAuthority, SpaceContext,
+    },
 };
 use serde::{Deserialize, Serialize};
-use std::{num::NonZeroU64, sync::Arc};
+use std::sync::Arc;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ResolvedEmbeddingTarget {
@@ -33,11 +35,11 @@ impl ResolvedEmbeddingTarget {
                 EmbeddingBackendTarget::LocalOnnx => None,
                 EmbeddingBackendTarget::Remote {
                     provider,
-                    runtime_epoch,
+                    runtime_epochs,
                     project,
                 } => Some(RemoteVectorModel {
                     provider: provider.clone(),
-                    runtime_epoch: *runtime_epoch,
+                    runtime_epochs: *runtime_epochs,
                     project: project.clone(),
                 }),
             },
@@ -52,7 +54,7 @@ pub enum EmbeddingBackendTarget {
     LocalOnnx,
     Remote {
         provider: ProviderResourceId,
-        runtime_epoch: NonZeroU64,
+        runtime_epochs: ProviderRuntimeEpochs,
         project: Option<FolderRef>,
     },
 }

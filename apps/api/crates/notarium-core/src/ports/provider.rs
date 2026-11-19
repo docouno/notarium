@@ -12,7 +12,15 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
+    num::NonZeroU64,
 };
+
+/// The configurations that can change the output of a provider model.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub struct ProviderRuntimeEpochs {
+    pub resource: NonZeroU64,
+    pub credential: Option<NonZeroU64>,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]

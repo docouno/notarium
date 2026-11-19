@@ -493,14 +493,15 @@ async fn open_disk(
     latest: SpaceSeq,
 ) -> Result<Option<Disk>, IndexError> {
     let manifest = layout.search_manifest();
-    if let Ok(Some(manifest)) = &manifest
-        && manifest.tantivy_seq < latest
-        && cx
-            .requires_scrub(ChangeCursor {
-                scope: manifest.scope.clone(),
-                after: manifest.tantivy_seq,
-            })
-            .await?
+    let unapplied = manifest.as_ref().ok().and_then(|manifest| {
+        let manifest = manifest.as_ref()?;
+        (manifest.tantivy_seq < latest).then(|| ChangeCursor {
+            scope: manifest.scope.clone(),
+            after: manifest.tantivy_seq,
+        })
+    });
+    if let Some(cursor) = &unapplied
+        && cx.requires_scrub(cursor.clone()).await?
     {
         build::scrub(cx, publisher, &layout).await?;
         return Ok(None);
@@ -539,7 +540,20 @@ async fn open_disk(
             layout.clear_lexical_manifests()?;
             None
         }
-        Err(error @ IndexError::Lexical(LexicalError::ReaderUnavailable)) => return Err(error),
+        Err(error @ IndexError::Lexical(LexicalError::ReaderUnavailable)) => {
+            if let Some(cursor) = unapplied
+                && cx
+                    .services
+                    .deps
+                    .canonical
+                    .has_search_redaction_after(&cx.services.authority, cx.budget(), cursor)
+                    .await?
+            {
+                build::scrub(cx, publisher, &layout).await?;
+                return Ok(None);
+            }
+            return Err(error);
+        }
         Err(_) => None,
     };
     let preserve = disk

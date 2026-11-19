@@ -1,4 +1,4 @@
-use super::{PortFuture, PortStream, context::*, types::*};
+use super::{PortFuture, PortStream, context::*, provider::ProviderRuntimeEpochs, types::*};
 use crate::{
     DomainError, DomainResult,
     classes::{DocClass, ProviderPart},
@@ -13,7 +13,6 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    num::NonZeroU64,
     sync::Arc,
     time::Duration,
 };
@@ -114,7 +113,7 @@ pub struct EmbeddingRequest {
     pub project: Option<FolderRef>,
     pub inputs: Vec<EmbeddingInput>,
     pub declared_tokens: u32,
-    runtime_epoch: Option<NonZeroU64>,
+    runtime_epochs: Option<ProviderRuntimeEpochs>,
 }
 impl EmbeddingRequest {
     pub fn parts(
@@ -132,7 +131,7 @@ impl EmbeddingRequest {
             project,
             inputs: chunks.into_iter().map(EmbeddingInput::Part).collect(),
             declared_tokens,
-            runtime_epoch: None,
+            runtime_epochs: None,
         }
     }
 
@@ -149,18 +148,18 @@ impl EmbeddingRequest {
             project: input.project_scope.clone(),
             declared_tokens: input.tokens,
             inputs: vec![EmbeddingInput::Query(input)],
-            runtime_epoch: None,
+            runtime_epochs: None,
         }
     }
 
     /// Bind an indexed vector's input to the resolved provider configuration.
-    pub fn with_runtime_epoch(mut self, epoch: NonZeroU64) -> Self {
-        self.runtime_epoch = Some(epoch);
+    pub fn with_runtime_epochs(mut self, epochs: ProviderRuntimeEpochs) -> Self {
+        self.runtime_epochs = Some(epochs);
         self
     }
 
-    pub fn runtime_epoch(&self) -> Option<NonZeroU64> {
-        self.runtime_epoch
+    pub fn runtime_epochs(&self) -> Option<ProviderRuntimeEpochs> {
+        self.runtime_epochs
     }
 
     /// Provider owners check this before dispatch, then enforce their real model

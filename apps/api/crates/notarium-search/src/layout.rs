@@ -10,12 +10,13 @@ use notarium_core::{
     epoch::{DataRoot, SearchIndexKind},
     ids::{FolderId, ModelProfileId, ProviderResourceId, SpaceSeq},
     model::{FolderRef, HistoryScope},
+    ports::ProviderRuntimeEpochs,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
     collections::HashMap,
     io::{self, Read, Write},
-    num::{NonZeroU32, NonZeroU64},
+    num::NonZeroU32,
     path::PathBuf,
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -165,7 +166,7 @@ pub struct VectorModel {
 #[serde(deny_unknown_fields)]
 pub struct RemoteVectorModel {
     pub provider: ProviderResourceId,
-    pub runtime_epoch: NonZeroU64,
+    pub runtime_epochs: ProviderRuntimeEpochs,
     pub project: Option<FolderRef>,
 }
 
@@ -188,7 +189,14 @@ impl VectorModel {
                 hash.update(remote.provider.as_str().as_bytes());
                 hash.update(&[0]);
                 hash.update(self.profile.as_str().as_bytes());
-                hash.update(&remote.runtime_epoch.get().to_le_bytes());
+                hash.update(&remote.runtime_epochs.resource.get().to_le_bytes());
+                hash.update(
+                    &remote
+                        .runtime_epochs
+                        .credential
+                        .map_or(0, |epoch| epoch.get())
+                        .to_le_bytes(),
+                );
                 if let Some(project) = &remote.project {
                     hash.update(project.space_id.as_str().as_bytes());
                     hash.update(&[0]);

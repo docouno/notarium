@@ -577,12 +577,9 @@ async fn gateway(pg: bool, kind: ProviderWireKind, label: &str) {
     let mode = Arc::new(AtomicU8::new(0));
     let response_mode = mode.clone();
     let server = HttpsFixture::start(move |request| {
-        assert!(
-            request
-                .headers
-                .to_lowercase()
-                .contains("authorization: bearer fixture-secret")
-        );
+        let headers = request.headers.to_lowercase();
+        let rotated = headers.contains("authorization: bearer replacement");
+        assert!(rotated || headers.contains("authorization: bearer fixture-secret"));
         assert!(
             request
                 .headers
@@ -590,12 +587,13 @@ async fn gateway(pg: bool, kind: ProviderWireKind, label: &str) {
                 .contains("x-tenant-key: fixture-tenant")
         );
         let reply = if request.path.ends_with("embeddings") || request.path.ends_with("api/embed") {
+            let vector = if rotated { [0.5, 0.25] } else { [0.25, -0.5] };
             Reply::json(match kind {
                 ProviderWireKind::OpenaiCompatible => {
-                    json!({"model":"fixture-embedding","data":[{"index":0,"embedding":[0.25,-0.5]}],"usage":{"prompt_tokens":3,"total_tokens":3}})
+                    json!({"model":"fixture-embedding","data":[{"index":0,"embedding":vector}],"usage":{"prompt_tokens":3,"total_tokens":3}})
                 }
                 ProviderWireKind::Ollama => {
-                    json!({"model":"fixture-embedding","embeddings":[[0.25,-0.5]],"prompt_eval_count":3})
+                    json!({"model":"fixture-embedding","embeddings":[vector],"prompt_eval_count":3})
                 }
             })
         } else if request.method == "GET" {
@@ -789,7 +787,7 @@ async fn gateway(pg: bool, kind: ProviderWireKind, label: &str) {
         .provider
         .embed(
             setup.space.clone(),
-            query(100, DocClass::UserDoc).with_runtime_epoch(setup.selection.runtime_epoch),
+            query(100, DocClass::UserDoc).with_runtime_epochs(setup.selection.runtime_epochs),
         )
         .await
         .unwrap();
@@ -825,15 +823,18 @@ async fn gateway(pg: bool, kind: ProviderWireKind, label: &str) {
             .is_ok()
     );
     let count = requests.lock().unwrap().len();
-    let stale_epoch = (setup.selection.runtime_epoch.get() + 1)
-        .try_into()
-        .unwrap();
+    let stale_epochs = ProviderRuntimeEpochs {
+        resource: (setup.selection.runtime_epochs.resource.get() + 1)
+            .try_into()
+            .unwrap(),
+        ..setup.selection.runtime_epochs
+    };
     assert!(
         setup
             .provider
             .embed(
                 setup.space.clone(),
-                query(106, DocClass::UserDoc).with_runtime_epoch(stale_epoch),
+                query(106, DocClass::UserDoc).with_runtime_epochs(stale_epochs),
             )
             .await
             .is_err()
@@ -911,6 +912,48 @@ async fn gateway(pg: bool, kind: ProviderWireKind, label: &str) {
         .await
         .unwrap();
     setup.revision = changed.revision;
+    let rotated = setup
+        .provider
+        .select_provider(
+            setup.space.clone(),
+            SelectProvider {
+                kind: PreferenceModelKind::Embedding,
+                resource: Some(setup.selection.provider.clone()),
+                model: Some(ModelProfileId::from_bytes([4; 16])),
+                project: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rotated.runtime_epochs.resource,
+        setup.selection.runtime_epochs.resource
+    );
+    assert_ne!(
+        rotated.runtime_epochs.credential,
+        setup.selection.runtime_epochs.credential
+    );
+    assert!(
+        setup
+            .provider
+            .embed(
+                setup.space.clone(),
+                query(107, DocClass::UserDoc).with_runtime_epochs(setup.selection.runtime_epochs),
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(requests.lock().unwrap().len(), count);
+    let fresh = setup
+        .provider
+        .embed(
+            setup.space.clone(),
+            query(108, DocClass::UserDoc).with_runtime_epochs(rotated.runtime_epochs),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fresh.vectors, vec![Ok(vec![0.5, 0.25])]);
+    assert_eq!(requests.lock().unwrap().len(), count + 1);
     assert!(matches!(
         complete(&setup.provider, setup.space.clone(), setup.completion(10)).await,
         Err(PortError::Domain(DomainError::ProviderCallAlreadyStarted {
@@ -924,7 +967,7 @@ async fn gateway(pg: bool, kind: ProviderWireKind, label: &str) {
         complete(&setup.provider, setup.space.clone(), modified).await,
         Err(PortError::Domain(DomainError::IdempotencyKeyReused))
     ));
-    assert_eq!(requests.lock().unwrap().len(), count);
+    assert_eq!(requests.lock().unwrap().len(), count + 1);
     assert_eq!(setup.egress.active.load(Ordering::SeqCst), 0);
     setup.close().await;
 }

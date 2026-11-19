@@ -128,7 +128,24 @@ impl Normalizer {
 }
 
 fn strip_accents(text: &str) -> String {
-    text.nfd().filter(|&c| !is_combining_mark(c)).collect()
+    let decomposed: String = text.nfd().collect();
+    let mut output = String::with_capacity(decomposed.len());
+    let mut tokenizer = NONSPACING_MARKS.clone();
+    let mut marks = tokenizer.token_stream(&decomposed);
+    let mut start = 0;
+    while marks.advance() {
+        let mark = marks.token();
+        output.push_str(&decomposed[start..mark.offset_from]);
+        start = mark.offset_to;
+    }
+    output.push_str(&decomposed[start..]);
+    output
+}
+
+pub(super) fn is_word_character(c: char) -> bool {
+    let mut buffer = [0; 4];
+    let mut tokenizer = WORD_CHARACTER.clone();
+    tokenizer.token_stream(c.encode_utf8(&mut buffer)).advance()
 }
 
 fn is_cjk(c: char) -> bool {
@@ -192,6 +209,10 @@ pub(super) enum PreTokenizer {
 
 static WORD_RUNS: LazyLock<RegexTokenizer> =
     LazyLock::new(|| RegexTokenizer::new(r"\w+|[^\w\s]+").expect("static word boundary pattern"));
+static WORD_CHARACTER: LazyLock<RegexTokenizer> =
+    LazyLock::new(|| RegexTokenizer::new(r"\w").expect("static Unicode word pattern"));
+static NONSPACING_MARKS: LazyLock<RegexTokenizer> =
+    LazyLock::new(|| RegexTokenizer::new(r"\p{Mn}+").expect("static nonspacing mark pattern"));
 static BERT_DISCARDED: LazyLock<RegexTokenizer> = LazyLock::new(|| {
     RegexTokenizer::new(r"[\p{C}&&[^\t\n\r]]|\u{fffd}")
         .expect("static BERT control character pattern")

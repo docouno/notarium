@@ -1,6 +1,6 @@
 use super::{
     EmbeddingError,
-    preprocess::{Normalizer, PreTokenizer, Pretokenized},
+    preprocess::{Normalizer, PreTokenizer, Pretokenized, is_word_character},
     tokenizer_model::{Model, ModelInput},
 };
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
@@ -348,9 +348,11 @@ fn split_added<'a>(text: &'a str, tokens: &HashMap<char, Vec<AddedToken>>) -> Ve
 }
 
 fn at_word_boundary(text: &str, start: usize, end: usize) -> bool {
-    let alphanumeric = |c: char| c.is_alphanumeric() || c == '_';
-    !text[..start].chars().next_back().is_some_and(alphanumeric)
-        && !text[end..].chars().next().is_some_and(alphanumeric)
+    !text[..start]
+        .chars()
+        .next_back()
+        .is_some_and(is_word_character)
+        && !text[end..].chars().next().is_some_and(is_word_character)
 }
 
 impl TokenizerBudget for LocalTokenizerBudget {

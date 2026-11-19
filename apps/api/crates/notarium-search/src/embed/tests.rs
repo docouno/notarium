@@ -9,7 +9,8 @@ use notarium_core::{
     model::{FolderRef, HistoryScope},
     ports::{
         CallBudget, Cancellation, EmbeddingInput, EmbeddingProviderPort, EmbeddingQueryInput,
-        EmbeddingRequest, EmbeddingResult, PortFuture, ProviderUsage, SpaceContext,
+        EmbeddingRequest, EmbeddingResult, PortFuture, ProviderRuntimeEpochs, ProviderUsage,
+        SpaceContext,
     },
 };
 use notarium_syntax::chunk::TokenizerBudget;
@@ -165,6 +166,29 @@ fn tokenizer_matches_reference_on_fallback_controls_and_whitespace() {
         assert_eq!(tokenizer.encode(text).unwrap().ids, expected, "{text:?}");
         assert_eq!(tokenizer.count(text).unwrap() as usize, expected.len());
     }
+}
+
+#[test]
+fn tokenizer_preserves_bert_spacing_marks_and_uses_unicode_word_boundaries() {
+    let input = r###"{
+        "normalizer":{"type":"BertNormalizer","lowercase":true},
+        "model":{"type":"WordPiece","vocab":{"[UNK]":0,"क":1,"##ा":2,"a":3},
+        "unk_token":"[UNK]","continuing_subword_prefix":"##","max_input_chars_per_word":100}
+    }"###;
+    let tokenizer = LocalTokenizerBudget::from_json(input.as_bytes(), profile(), 512).unwrap();
+    assert_eq!(tokenizer.encode("का").unwrap().ids, [1, 2]);
+    assert_eq!(tokenizer.count("का").unwrap(), 2);
+    assert_eq!(tokenizer.encode("á").unwrap().ids, [3]);
+
+    let added = r###"{
+        "added_tokens":[{"id":9,"content":"a","single_word":true,"normalized":false}],
+        "model":{"type":"WordPiece","vocab":{"[UNK]":0,"a":1,"##́":2},
+        "unk_token":"[UNK]","continuing_subword_prefix":"##","max_input_chars_per_word":100}
+    }"###;
+    let tokenizer = LocalTokenizerBudget::from_json(added.as_bytes(), profile(), 512).unwrap();
+    assert_eq!(tokenizer.encode("a").unwrap().ids, [9]);
+    assert_eq!(tokenizer.encode("a\u{0301}").unwrap().ids, [1, 2]);
+    assert_eq!(tokenizer.count("a\u{0301}").unwrap(), 2);
 }
 
 #[test]
@@ -340,7 +364,10 @@ async fn remote_queries_are_typed_and_tainted_or_oversize_input_never_dispatches
         ProviderResourceId::from_bytes([9; 16]),
         64,
         16,
-        std::num::NonZeroU64::MIN,
+        ProviderRuntimeEpochs {
+            resource: std::num::NonZeroU64::MIN,
+            credential: None,
+        },
     );
     let input = EmbeddingQueryInput {
         text: "literal query".to_owned(),

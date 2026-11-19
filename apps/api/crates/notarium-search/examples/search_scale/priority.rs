@@ -10,8 +10,8 @@ use notarium_core::{
     model::{FolderRef, HistoryScope, Lifecycle, SnapshotCut},
     ports::{
         CallBudget, Cancellation, EmbeddingInput, EmbeddingProviderPort, EmbeddingRequest,
-        EmbeddingResult, PageLimit, PortFuture, ProviderUsage, SearchPort, SearchQuery,
-        ServiceAuthority, SpaceContext,
+        EmbeddingResult, PageLimit, PortFuture, ProviderRuntimeEpochs, ProviderUsage, SearchPort,
+        SearchQuery, ServiceAuthority, SpaceContext,
     },
     query::{FieldFilterAstV1, Predicate},
     receipt::CausalBasis,
@@ -64,7 +64,10 @@ impl SearchModelResolverPort for Probe {
                 max_input_tokens: 1024,
                 backend: EmbeddingBackendTarget::Remote {
                     provider: ProviderResourceId::from_bytes([0x19; 16]),
-                    runtime_epoch: std::num::NonZeroU64::MIN,
+                    runtime_epochs: ProviderRuntimeEpochs {
+                        resource: std::num::NonZeroU64::MIN,
+                        credential: None,
+                    },
                     project: None,
                 },
             }))

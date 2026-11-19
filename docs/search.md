@@ -48,9 +48,10 @@ segments. The segment contains normalized, per-vector i8 embeddings and a
 CSR-HNSW graph built in Rust. An individual upsert that exceeds the journal
 capacity writes a replacement segment directly. SIMD scans serve selective
 filters up to 16,384 eligible slots per segment. Epoch identity includes the
-profile, dimension and input token cap. Remote epochs also bind the resource,
-its runtime generation and the selected project. The previous compatible
-epoch remains available while the replacement embeds its eligible corpus.
+profile, dimension and input token cap. Remote epochs also bind the provider,
+its resource and credential runtime generations, and the selected project.
+The previous compatible epoch remains available while the replacement embeds
+its eligible corpus.
 Publication switches both together.
 
 Encrypted notes are excluded. A purge invalidates the affected search cut and
@@ -58,7 +59,9 @@ removes its retired disk copies before building a clean generation. On restart
 the canonical purge fence is checked before the reader pool can delay cleanup.
 Chat redaction commits and merges affected Tantivy segments, waits for pinned
 readers, and publishes and acknowledges the new cut once obsolete files are
-removed. The worker discards abandoned epochs and rebuilds invalid cuts.
+removed. If the reader pool blocks that merge, the worker retires the old
+generation on disk before waiting for a reader to rebuild it. The worker
+discards abandoned epochs and rebuilds invalid cuts.
 Search checks live note visibility after asynchronous hydration and before
 returning results.
 
@@ -79,11 +82,12 @@ model formats produce lexical degradation.
 
 `VectorMode::RemoteOnly` uses `SearchModelResolverPort` and the typed provider
 port. Background indexing obtains a current disclosure grant for the revision
-actor before reusing a vector or sending a part. Interactive requests require
+actor before reusing a vector or sending a part. Each scheduled part batch
+rechecks the selected target before dispatch. Interactive requests require
 an untainted context, a matching project scope, and a nonempty intersection
 of search classes and provider disclosure. Provider admission rechecks current
-access and token limits. Dispatch compares the resolved provider runtime
-generation and checks the shared taint. Chat text stays in the lexical index.
+access and token limits. Dispatch compares both resolved runtime generations
+and checks the shared taint. Chat text stays in the lexical index.
 
 The embedding worker runs one bounded batch at a time. It checks interactive
 requests first, then live edits, then import and backfill. Batches contain at

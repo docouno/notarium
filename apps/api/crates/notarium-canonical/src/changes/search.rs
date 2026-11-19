@@ -276,6 +276,46 @@ impl CanonicalStore {
         .await
     }
 
+    /// Detect chat redactions that a search cut has not applied when its
+    /// reader cannot be opened to merge away the old postings.
+    pub async fn has_search_redaction_after(
+        &self,
+        authority: &ServiceAuthority,
+        budget: CallBudget,
+        cursor: ChangeCursor,
+    ) -> Result<bool, PortError> {
+        authority.require(ServicePurpose::Search)?;
+        self.with_read_tx_budget(Some(&budget), |tx| {
+            Box::pin(async move {
+                let space = active_space(tx, &cursor.scope).await?;
+                if cursor.after >= space.last_seq {
+                    return Ok(false);
+                }
+                const SQL: &str = "SELECT EXISTS (SELECT 1 FROM change_log WHERE space_id=$1
+                    AND history_incarnation=$2 AND space_seq>$3 AND entity_type='thread' AND op_kind='redact')";
+                let scope = &space.scope;
+                let cutoff = cursor.after.get() as i64;
+                match tx {
+                    BackendConn::Sqlite(conn) => sqlx::query_scalar(SQL)
+                        .bind(scope.space_id.as_str())
+                        .bind(scope.incarnation.as_bytes().as_slice())
+                        .bind(cutoff)
+                        .fetch_one(&mut **conn)
+                        .await
+                        .map_err(|err| internal_not_committed("sqlite_search_redaction", err.to_string()).into()),
+                    BackendConn::Postgres(conn) => sqlx::query_scalar(SQL)
+                        .bind(scope.space_id.as_str())
+                        .bind(scope.incarnation.as_bytes().as_slice())
+                        .bind(cutoff)
+                        .fetch_one(&mut **conn)
+                        .await
+                        .map_err(|err| pg_read_error("pg_search_redaction", err).into()),
+                }
+            })
+        })
+        .await
+    }
+
     pub async fn read_searchable_notes_seed_page(
         &self,
         authority: &ServiceAuthority,

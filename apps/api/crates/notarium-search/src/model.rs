@@ -7,6 +7,7 @@ use crate::{
     engine::Services,
     ports::{
         EmbeddingBackendTarget, RemoteIndexingGrant, ResolvedEmbeddingTarget, SearchIndexedNote,
+        SearchModelResolverPort,
     },
     vector::{ChunkMetadata, MAX_DIMENSION, MIN_DIMENSION, QuantizedVector, VectorChunk},
 };
@@ -107,7 +108,7 @@ impl Services {
                     _,
                     EmbeddingBackendTarget::Remote {
                         provider,
-                        runtime_epoch,
+                        runtime_epochs,
                         ..
                     },
                 ) => {
@@ -122,7 +123,7 @@ impl Services {
                         provider.clone(),
                         target.dimension,
                         target.max_input_tokens,
-                        *runtime_epoch,
+                        *runtime_epochs,
                     );
                     (Backend::Remote(Arc::new(backend)), conservative())
                 }
@@ -273,6 +274,21 @@ impl Embedder {
             priority,
             existing,
         } = input;
+        let remote = if let Backend::Remote(backend) = &self.backend {
+            let Some(resolver) = &services.deps.model_resolver else {
+                return Ok((Vec::new(), true));
+            };
+            match self
+                .indexing_grant(services, resolver.as_ref(), scope, note, budget.clone())
+                .await
+            {
+                Ok(Some((grant, project))) => Some((backend, resolver, grant, project)),
+                Ok(None) => return Ok((Vec::new(), false)),
+                Err(_) => return Ok((Vec::new(), true)),
+            }
+        } else {
+            None
+        };
         let document = Arc::new(note.document.clone());
         let content =
             ClassEgressFence::index_for_search(note.document.clone(), &services.authority)?;
@@ -282,18 +298,6 @@ impl Embedder {
         if chunks.is_empty() {
             return Ok((Vec::new(), false));
         }
-        let remote = if let Backend::Remote(backend) = &self.backend {
-            match self
-                .indexing_grant(services, scope, note, budget.clone())
-                .await
-            {
-                Ok(Some((grant, project))) => Some((backend, grant, project)),
-                Ok(None) => return Ok((Vec::new(), false)),
-                Err(_) => return Ok((Vec::new(), true)),
-            }
-        } else {
-            None
-        };
         let mut missing: Vec<Vec<ChunkDescriptor>> = Vec::new();
         let mut group_by_key = HashMap::new();
         let mut vectors = Vec::new();
@@ -314,11 +318,12 @@ impl Embedder {
             return Ok((vectors, true));
         };
         for batch in batches {
-            let rows = if let Some((backend, grant, project)) = &remote {
+            let rows = if let Some((backend, resolver, grant, project)) = &remote {
                 self.remote_index(
                     services,
                     &document,
                     backend,
+                    Arc::clone(resolver),
                     grant.clone(),
                     project.clone(),
                     &batch,
@@ -355,13 +360,11 @@ impl Embedder {
     async fn indexing_grant(
         &self,
         services: &Services,
+        resolver: &dyn SearchModelResolverPort,
         scope: &HistoryScope,
         note: &SearchIndexedNote,
         budget: CallBudget,
     ) -> Result<Option<(RemoteIndexingGrant, Option<FolderRef>)>, PortError> {
-        let Some(resolver) = services.deps.model_resolver.as_ref() else {
-            return Ok(None);
-        };
         let EmbeddingBackendTarget::Remote {
             project, provider, ..
         } = &self.target.backend
@@ -406,6 +409,7 @@ impl Embedder {
         services: &Services,
         document: &Arc<ClassifiedDocument>,
         backend: &Arc<RemoteEmbedder>,
+        resolver: Arc<dyn SearchModelResolverPort>,
         mut grant: RemoteIndexingGrant,
         project: Option<FolderRef>,
         batch: &[Vec<ChunkDescriptor>],
@@ -418,10 +422,32 @@ impl Embedder {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_| EmbeddingError::InvalidModel)?;
         let backend = backend.clone();
+        let target = self.target.clone();
         services
             .scheduler
             .submit(priority, budget.clone(), move |budget| async move {
+                // Resolve at the scheduled boundary. A queued batch must not
+                // inherit the project selection from the start of a backfill.
+                let started = std::time::Instant::now();
+                let selected = tokio::select! {
+                    biased;
+                    () = budget.cancellation.cancelled() => return Err(EmbeddingError::Cancelled),
+                    result = tokio::time::timeout(
+                        budget.remaining,
+                        resolver.resolve_model(grant.ctx.scope(), None, None),
+                    ) => result
+                        .map_err(|_| EmbeddingError::BudgetExceeded)?
+                        .map_err(|_| EmbeddingError::ModelUnavailable)?,
+                };
+                if selected.as_ref() != Some(&target) {
+                    return Err(EmbeddingError::ModelUnavailable);
+                }
                 grant.ctx.budget = budget;
+                grant.ctx.budget.remaining =
+                    grant.ctx.budget.remaining.saturating_sub(started.elapsed());
+                if grant.ctx.budget.remaining.is_zero() {
+                    return Err(EmbeddingError::BudgetExceeded);
+                }
                 backend.parts(grant, project, parts).await
             })
             .await

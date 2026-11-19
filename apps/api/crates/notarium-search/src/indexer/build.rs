@@ -62,10 +62,11 @@ pub(super) async fn seed(
     folders.insert(space.root_folder_id)?;
     save_new_folders(&layout, &folders, before)?;
 
-    let target = match cx.services.model_target(&cutoff.scope, None, None).await {
-        Ok(target) => target,
+    let (target, retry_resolution) = match cx.services.model_target(&cutoff.scope, None, None).await
+    {
+        Ok(target) => (target, false),
         Err(error) if prior.is_some() => return Err(error.into()),
-        Err(_) => None,
+        Err(_) => (None, true),
     };
     let model = target.as_ref().map(|target| target.vector_model());
     if let Some(model) = &model
@@ -125,10 +126,12 @@ pub(super) async fn seed(
                 let (epoch, pending) = vectors.finish(layout.clone(), cutoff.after).await?;
                 (Some(epoch), pending)
             }
-            None => (None, target.is_some()),
+            None => (None, target.is_some() || retry_resolution),
         };
-        if prior.is_some() && cx.services.model_target(&cutoff.scope, None, None).await? != target {
-            return Err(IndexError::Inconsistent);
+        if !retry_resolution && cx.services.model_target(&cutoff.scope, None, None).await? != target
+        {
+            // A backfill can outlive its selection. Retry with the live target.
+            return Err(crate::embed::EmbeddingError::ModelUnavailable.into());
         }
         let manifest = SearchManifest {
             scope: cutoff.scope.clone(),
@@ -180,7 +183,7 @@ pub(super) async fn refresh_model(
     let cutoff = disk.cursor();
     let selected = cx.services.model_target(&cutoff.scope, None, None).await?;
     if disk.manifest.active_model == selected
-        && (selected.is_none() || disk.manifest.vector_seq.is_some())
+        && (!disk.manifest.embeddings_pending || disk.manifest.vector_seq.is_some())
     {
         return Ok(None);
     }

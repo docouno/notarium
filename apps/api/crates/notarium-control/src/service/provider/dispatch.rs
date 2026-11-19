@@ -288,9 +288,8 @@ impl ProviderService {
             )
             .await?;
         if let Request::Embedding(request) = &job.request
-            && request
-                .runtime_epoch()
-                .is_some_and(|epoch| epoch.get() != snapshot.resource.runtime_epoch as u64)
+            && let Some(expected) = request.runtime_epochs()
+            && runtime_epochs(&snapshot.resource, snapshot.credential.as_ref())? != expected
         {
             return Err(selection::unavailable());
         }

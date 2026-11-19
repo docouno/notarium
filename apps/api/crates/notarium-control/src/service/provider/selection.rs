@@ -1,7 +1,7 @@
 use super::super::{commands::Command, spaces::require_owner};
 use super::{
     ProviderService,
-    attachments::{check_member, epochs, epochs_read},
+    attachments::{check_member, credential_for_selection, epochs},
     records::*,
 };
 use crate::{
@@ -232,7 +232,9 @@ impl ProviderService {
             .run(
                 async {
                     let resource = resource_read(tx.inner_mut(), provider.as_str()).await?;
-                    let epoch = epochs_read(tx.inner_mut(), &resource).await?;
+                    let epoch = credential_for_selection(tx.inner_mut(), &resource)
+                        .await?
+                        .map(|credential| credential.consent_epoch);
                     policy(
                         tx.inner_mut(),
                         &auth,
@@ -325,18 +327,16 @@ impl ProviderService {
             if owner_active != 1 {
                 return Err(unavailable());
             }
-            let credential_epoch=epochs_read(tx.inner_mut(),&resource).await.map_err(|_| unavailable())?;
+            let credential=credential_for_selection(tx.inner_mut(),&resource).await.map_err(|_| unavailable())?;
+            let credential_epoch=credential.as_ref().map(|row| row.consent_epoch);
             let model_id=model_id.or_else(||resource.default_model.as_deref().and_then(|value|ModelProfileId::parse(value).ok())).ok_or_else(unavailable)?;
             let loaded=model_info(&model_read(tx.inner_mut(),&resource.id,model_id.as_str()).await.map_err(|_| unavailable())?)?;
             if !matches_preference_kind(&loaded.model.kind, request.kind) {
                 return Err(unavailable());
             }
             let admission=policy(tx.inner_mut(),&auth,&resource,credential_epoch,&space.space,request.project.as_ref(),now,false).await?;
-            let runtime_epoch = u64::try_from(resource.runtime_epoch)
-                .ok()
-                .and_then(std::num::NonZeroU64::new)
-                .ok_or_else(unavailable)?;
-            Ok(ProviderSelection{provider:id,model:model_id,runtime_epoch,project:request.project,policy:admission.policy})
+            let runtime_epochs=runtime_epochs(&resource,credential.as_ref())?;
+            Ok(ProviderSelection{provider:id,model:model_id,runtime_epochs,project:request.project,policy:admission.policy})
         },CommitEffect::NotCommitted).await?;
         budget
             .run(tx.rollback(), CommitEffect::NotCommitted)
