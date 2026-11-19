@@ -22,9 +22,10 @@ before shutting down canonical storage.
 - Wait watermarks require a caught-up search cut. A bounded set of exact
   receipts can score the named canonical revisions while the indexes catch up.
   The overlay applies predicates to the receipt revisions' evaluated fields
-  and masks their older indexed hits. Other note carriers match the base
-  indexed cut. The response reports its cut, truncation, and any embedding
-  degradation.
+  and masks their older indexed hits. Base postings, structural filters and
+  note carriers share a projected cut. When the indexes and projection have
+  different cuts, search waits within the call budget. The response reports
+  its cut, truncation, and any embedding degradation.
 
 ## Storage
 
@@ -93,9 +94,10 @@ PostgreSQL 16 with S3. The latter pair uses disposable fixtures reached over
 Unix sockets. Missing fixtures fail the relevant tests.
 
 The two-dialect integration checks the interactive provider budget, lexical
-fallback, and provider cancellation. To measure the full fallback response
-against the 200 ms target, run the scenarios sequentially on an idle runner.
-The command prints one `search-fallback-elapsed-us` sample per dialect.
+fallback, and provider cancellation. To measure full fallback responses against
+the 200 ms target, run the scenarios sequentially on an idle runner. The command
+prints a `search-fallback-elapsed-us` sample per dialect and a
+`search-onnx-fallback-elapsed-us` sample for the local runtime.
 
 ```sh
 sh docker/storage-fixtures/with-storage-fixtures.sh exec-custom \

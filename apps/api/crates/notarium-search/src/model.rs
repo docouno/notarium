@@ -170,11 +170,11 @@ impl Embedder {
         text: String,
         classes: BTreeSet<DocClass>,
         project_scope: Option<FolderRef>,
-    ) -> Result<Option<QuantizedVector>, EmbeddingError> {
+    ) -> Result<QuantizedVector, EmbeddingError> {
         ctx.budget.remaining = ctx
             .budget
             .remaining
-            .min(services.config.query_embedding_budget);
+            .min(services.config.interactive_budget());
         let mut row = match &self.backend {
             Backend::Remote(remote) => {
                 if ctx.auth().taint().is_tainted() {
@@ -217,12 +217,8 @@ impl Embedder {
                 .await?
             }
         };
-        row.pop()
-            .flatten()
-            .map(|vector| {
-                QuantizedVector::quantize(&vector).map_err(|_| EmbeddingError::InvalidModel)
-            })
-            .transpose()
+        let vector = row.pop().flatten().ok_or(EmbeddingError::InvalidModel)?;
+        QuantizedVector::quantize(&vector).map_err(|_| EmbeddingError::InvalidModel)
     }
 
     async fn local(

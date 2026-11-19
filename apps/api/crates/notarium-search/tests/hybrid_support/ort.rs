@@ -34,7 +34,7 @@ use notarium_search::{
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{Arc, RwLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 struct LocalResolver(BTreeMap<SpaceId, ModelProfileId>);
@@ -47,6 +47,9 @@ impl SearchModelResolverPort for LocalResolver {
         explicit: Option<&'a ModelProfileId>,
     ) -> PortFuture<'a, Option<ResolvedEmbeddingTarget>> {
         Box::pin(async move {
+            if explicit.is_some() {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
             Ok(self
                 .0
                 .get(&scope.space_id)
@@ -144,7 +147,7 @@ async fn seed(
 
 pub async fn search_with_dynamic_models(store: Arc<CanonicalStore>, root: DataRoot) {
     let (fast, fast_seq, fast_projection) =
-        seed(store.clone(), 0x70, "Warm palette", "reddish").await;
+        seed(store.clone(), 0x70, "Warm palette", "reddish zero").await;
     let (slow, slow_seq, slow_projection) = seed(store.clone(), 0x71, "Cool palette", "blue").await;
     let fast_model = ModelProfileId::from_bytes([0x70; 16]);
     let slow_model = ModelProfileId::from_bytes([0x71; 16]);
@@ -159,7 +162,9 @@ pub async fn search_with_dynamic_models(store: Arc<CanonicalStore>, root: DataRo
     let start = |mode| {
         let mut deps = SearchDependencies::new(store.clone(), projection.clone());
         deps.model_resolver = Some(resolver.clone());
-        SearchEngine::start(SearchConfig::new(root.clone(), mode), deps)
+        let mut config = SearchConfig::new(root.clone(), mode);
+        config.query_embedding_budget = Duration::from_millis(500);
+        SearchEngine::start(config, deps)
     };
     let models = ModelFiles::new();
     let disabled = start(VectorMode::Disabled);
@@ -220,11 +225,30 @@ pub async fn search_with_dynamic_models(store: Arc<CanonicalStore>, root: DataRo
     .await
     .unwrap();
     acknowledged(&store, &root, fast.scope(), fast_seq).await;
+    let zero = engine.search(fast.clone(), query("zero")).await.unwrap();
+    assert_eq!(zero.hits[0].card.title, "Warm palette");
+    assert!(matches!(
+        zero.degraded,
+        Some(SearchDegradation::ModelUnavailable)
+    ));
+    let mut delayed_model = query("reddish");
+    delayed_model.model = Some(fast_model.clone());
+    let delayed = engine.search(fast.clone(), delayed_model).await.unwrap();
+    assert_eq!(delayed.hits[0].card.title, "Warm palette");
+    assert!(matches!(
+        delayed.degraded,
+        Some(SearchDegradation::BudgetExceeded)
+    ));
     engine.start_space(slow.scope().clone()).unwrap();
     let slow_cut = acknowledged(&store, &root, slow.scope(), slow_seq).await;
     assert!(slow_cut.vector_seq.is_some());
     assert!(!slow_cut.embeddings_pending);
+    let started = Instant::now();
     let timed = engine.search(slow, query("blue")).await.unwrap();
+    eprintln!(
+        "search-onnx-fallback-elapsed-us {}",
+        started.elapsed().as_micros()
+    );
     assert_eq!(timed.hits[0].card.title, "Cool palette");
     assert!(matches!(
         timed.degraded,

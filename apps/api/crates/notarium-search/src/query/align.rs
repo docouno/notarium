@@ -40,11 +40,15 @@ impl SearchEngine {
                 .max()
                 .unwrap_or_default(),
         };
-        let mut snapshot = self.projection(ctx, causal.clone(), clock).await?;
+        // Search owns its receipt overlay. The structural owner returns the
+        // projection base before any receipt-specific state is applied here.
+        let structural_causal = match causal {
+            CausalBasis::Await(_) => causal.clone(),
+            CausalBasis::Exact(_) => CausalBasis::Exact(Default::default()),
+        };
+        let mut snapshot = self.projection(ctx, structural_causal, clock).await?;
         let mut state = current(handle, ctx.scope());
         let target = snapshot.cut().projected_seq.max(required);
-        let mut overlay = Overlay::new();
-        let mut used_overlay = false;
         if state.as_ref().is_none_or(|state| state.seq < target) {
             handle.wake.notify_one();
             drop(state.take());
@@ -57,88 +61,110 @@ impl SearchEngine {
             state = wait(handle, ctx.scope(), target, Instant::now() + grace)
                 .await?
                 .or_else(|| current(handle, ctx.scope()));
-            let base = state.as_ref().map_or(SpaceSeq::ZERO, |state| state.seq);
-            if base < required
-                && let CausalBasis::Exact(receipts) = causal
-            {
-                let canonical = &self.services.deps.canonical;
-                let effects = canonical
-                    .resolve_receipt_effects(ctx.scope(), receipts)
-                    .await?;
-                if let OverlayDecision::Bounded { versions } = plan_overlay(
-                    ctx.scope(),
-                    base,
-                    receipts,
-                    &effects,
-                    EFFECT_PAYLOAD_BUDGET_BYTES,
-                )? {
-                    let targets = versions
-                        .into_iter()
-                        .map(|version| (version.note_id, version.revision))
-                        .collect::<Vec<_>>();
-                    // Preserve every receipt identity in the mask, including a
-                    // revision which left the searchable set or was purged.
-                    overlay.extend(targets.iter().map(|(note, _)| (note.clone(), None)));
-                    overlay.extend(
-                        self.services
-                            .deps
-                            .carriers
-                            .read_note_revisions_for_overlay(
-                                self.services.authority.clone(),
-                                clock.remaining()?,
-                                ctx.scope().clone(),
-                                targets,
-                            )
-                            .await?,
-                    );
-                    used_overlay = true;
-                }
-            }
-            if !used_overlay && (state.is_none() || base < required) {
-                drop(state.take());
-                state = Some(
-                    wait(handle, ctx.scope(), required, clock.deadline)
-                        .await?
-                        .ok_or_else(deadline_error)?,
-                );
-            }
         }
-        if let Some(state) = &state
-            && state.seq > snapshot.cut().projected_seq
-        {
-            let watermark = MutationReceiptToken::new(ctx.scope().clone(), state.seq)?;
-            let mut waiting = vec![watermark];
-            if let CausalBasis::Await(watermarks) = causal {
-                for (scope, seq) in watermarks.scopes() {
-                    if *seq != SpaceSeq::ZERO {
-                        waiting.push(MutationReceiptToken::new(scope.clone(), *seq)?);
+        let overlay = loop {
+            let indexed = state.as_ref().map_or(SpaceSeq::ZERO, |state| state.seq);
+            let projected = snapshot.cut().projected_seq;
+            if indexed > projected {
+                let mut waiting = vec![MutationReceiptToken::new(ctx.scope().clone(), indexed)?];
+                if let CausalBasis::Await(watermarks) = causal {
+                    for (scope, seq) in watermarks.scopes() {
+                        if *seq != SpaceSeq::ZERO {
+                            waiting.push(MutationReceiptToken::new(scope.clone(), *seq)?);
+                        }
                     }
                 }
+                let cause = CausalBasis::Await(AwaitWatermarks::from_receipts(waiting));
+                snapshot = self.projection(ctx, cause, clock).await?;
+                if snapshot.cut().projected_seq < indexed {
+                    return Err(unavailable("projection_behind_search"));
+                }
+                continue;
             }
-            let cause = CausalBasis::Await(AwaitWatermarks::from_receipts(waiting));
-            snapshot = self.projection(ctx, cause, clock).await?;
-            if matches!(causal, CausalBasis::Exact(_)) {
-                snapshot = self.projection(ctx, causal.clone(), clock).await?;
+            if indexed == projected {
+                if state.is_some() && indexed >= required {
+                    break Overlay::new();
+                }
+                if indexed < required
+                    && let CausalBasis::Exact(receipts) = causal
+                    && let Some(overlay) =
+                        self.receipt_overlay(ctx, clock, indexed, receipts).await?
+                {
+                    break overlay;
+                }
             }
-            if snapshot.cut().projected_seq < state.seq {
-                return Err(unavailable("projection_behind_search"));
-            }
-        }
-        let mut base_cut = snapshot.cut().clone();
-        base_cut.projected_seq = base_cut
-            .projected_seq
-            .min(state.as_ref().map_or(SpaceSeq::ZERO, |state| state.seq));
-        Ok(Aligned {
-            cut: if used_overlay {
-                snapshot.cut().clone()
+            // A newer projection cannot filter or expand an older index.
+            // Hold its cut while the subscriber catches up, then compare again.
+            let target = if indexed < projected {
+                projected
             } else {
-                base_cut.clone()
-            },
+                required
+            };
+            drop(state.take());
+            handle.wake.notify_one();
+            state = Some(
+                wait(handle, ctx.scope(), target, clock.deadline)
+                    .await?
+                    .ok_or_else(deadline_error)?,
+            );
+        };
+        let cut = snapshot.cut().clone();
+        let mut base_cut = cut.clone();
+        base_cut.canonical_seq = cut.projected_seq;
+        Ok(Aligned {
+            cut,
             snapshot,
             state,
             base_cut,
             overlay,
         })
+    }
+
+    async fn receipt_overlay(
+        &self,
+        ctx: &SpaceContext,
+        clock: &Clock,
+        base: SpaceSeq,
+        receipts: &notarium_core::receipt::ReceiptSet,
+    ) -> Result<Option<Overlay>, PortError> {
+        let effects = self
+            .services
+            .deps
+            .canonical
+            .resolve_receipt_effects(ctx.scope(), receipts)
+            .await?;
+        let OverlayDecision::Bounded { versions } = plan_overlay(
+            ctx.scope(),
+            base,
+            receipts,
+            &effects,
+            EFFECT_PAYLOAD_BUDGET_BYTES,
+        )?
+        else {
+            return Ok(None);
+        };
+        let targets = versions
+            .into_iter()
+            .map(|version| (version.note_id, version.revision))
+            .collect::<Vec<_>>();
+        // Keep the mask for a receipt whose revision left the searchable set.
+        let mut overlay: Overlay = targets
+            .iter()
+            .map(|(note, _)| (note.clone(), None))
+            .collect();
+        overlay.extend(
+            self.services
+                .deps
+                .carriers
+                .read_note_revisions_for_overlay(
+                    self.services.authority.clone(),
+                    clock.remaining()?,
+                    ctx.scope().clone(),
+                    targets,
+                )
+                .await?,
+        );
+        Ok(Some(overlay))
     }
 
     pub(super) async fn projection(

@@ -44,11 +44,8 @@ enum Event {
 struct Probe {
     bulk: SpaceId,
     query: SpaceId,
-    competing: SpaceId,
     first: AtomicBool,
     bulk_started: Notify,
-    competing_ready: Notify,
-    interactive_resolved: Notify,
     release_bulk: Notify,
     events: Mutex<Vec<Event>>,
 }
@@ -56,14 +53,11 @@ struct Probe {
 impl SearchModelResolverPort for Probe {
     fn resolve_model<'a>(
         &'a self,
-        scope: &'a HistoryScope,
+        _: &'a HistoryScope,
         _: Option<&'a FolderId>,
-        explicit: Option<&'a ModelProfileId>,
+        _: Option<&'a ModelProfileId>,
     ) -> PortFuture<'a, Option<ResolvedEmbeddingTarget>> {
         Box::pin(async move {
-            if scope.space_id == self.query && explicit.is_some() {
-                self.interactive_resolved.notify_one();
-            }
             Ok(Some(ResolvedEmbeddingTarget {
                 model: ModelProfileId::from_bytes([0x19; 16]),
                 dimension: 64,
@@ -87,9 +81,6 @@ impl SearchModelResolverPort for Probe {
     ) -> PortFuture<'a, Option<RemoteIndexingGrant>> {
         Box::pin(async move {
             let ctx = context(actor, scope, budget)?;
-            if scope.space_id == self.competing {
-                self.competing_ready.notify_one();
-            }
             Ok(Some(RemoteIndexingGrant {
                 ctx,
                 policy: ProviderPolicy {
@@ -215,18 +206,15 @@ async fn small_space(fixture: &Fixture, tag: u8, body: &str) -> Result<Projectio
     })
 }
 
-pub async fn measure(fixture: &Fixture) -> Result<usize, Box<dyn Error>> {
+pub async fn measure(fixture: &Fixture) -> Result<(usize, [usize; 3]), Box<dyn Error>> {
     let query_view = small_space(fixture, 0x40, "interactive retrieval").await?;
     let competing_view = small_space(fixture, 0x41, "independent bulk import").await?;
     let bulk = &fixture.projection.cut.scope;
     let probe = Arc::new(Probe {
         bulk: bulk.space_id.clone(),
         query: query_view.cut.scope.space_id.clone(),
-        competing: competing_view.cut.scope.space_id.clone(),
         first: AtomicBool::new(true),
         bulk_started: Notify::new(),
-        competing_ready: Notify::new(),
-        interactive_resolved: Notify::new(),
         release_bulk: Notify::new(),
         events: Mutex::new(Vec::new()),
     });
@@ -254,9 +242,7 @@ pub async fn measure(fixture: &Fixture) -> Result<usize, Box<dyn Error>> {
         }).await?;
         tokio::time::timeout(Duration::from_secs(30), probe.bulk_started.notified()).await?;
         engine.start_space(competing_view.cut.scope.clone())?;
-        tokio::time::timeout(Duration::from_secs(5), probe.competing_ready.notified()).await?;
-        // The competing producer has passed its grant lookup. Let it submit while the first quantum is held.
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        wait_for_queued(&engine, 2).await?;
         let query = engine.search(context(&fixture.owner, &query_view.cut.scope, CallBudget {
             request: RequestId::from_bytes([0x40; 16]), cancellation: Cancellation::default(), remaining: Duration::from_secs(5),
         })?, SearchQuery {
@@ -265,27 +251,45 @@ pub async fn measure(fixture: &Fixture) -> Result<usize, Box<dyn Error>> {
             include_chats: false, top_k: PageLimit::new(1)?, model: Some(ModelProfileId::from_bytes([0x19; 16])),
         });
         let release = async {
-            tokio::time::timeout(Duration::from_secs(5), probe.interactive_resolved.notified()).await?;
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            let depths = wait_for_queued(&engine, 0).await?;
+            if depths != [1, 0, 1] {
+                return Err("expected one queued request in each competing lane".into());
+            }
             probe.release_bulk.notify_one();
-            Ok::<_, tokio::time::error::Elapsed>(())
+            Ok::<_, Box<dyn Error>>(depths)
         };
         tokio::pin!(query);
-        let response = tokio::select! {
+        let (response, depths) = tokio::select! {
             _ = &mut query => return Err("interactive embedding completed before the active quantum was released".into()),
             released = release => {
-                released?;
-                query.await?
+                let depths = released?;
+                (query.await?, depths)
             }
         };
         if response.degraded.is_some() { return Err("interactive embedding degraded during bounded backfill".into()); }
         let events = probe.events.lock().unwrap();
         match events.as_slice() {
-            [Event::Background(count), Event::Query, ..] => Ok(*count),
+            [Event::Background(count), Event::Query, ..] => Ok((*count, depths)),
             _ => Err("interactive work did not start after the active background quantum".into()),
         }
     }.await;
     probe.release_bulk.notify_one();
     engine.shutdown().await;
     run
+}
+
+async fn wait_for_queued(
+    engine: &SearchEngine,
+    lane: usize,
+) -> Result<[usize; 3], tokio::time::error::Elapsed> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let depths = engine.queued_embeddings();
+            if depths[lane] > 0 {
+                return depths;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
 }

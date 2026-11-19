@@ -70,7 +70,7 @@ impl ModelFiles {
             profile.join("tokenizer.json"),
             r###"{
             "pre_tokenizer":{"type":"WhitespaceSplit"},
-            "model":{"type":"WordPiece","vocab":{"[UNK]":0,"red":1,"blue":2,"[PAD]":3,"##dish":4},
+            "model":{"type":"WordPiece","vocab":{"[UNK]":0,"red":1,"blue":2,"[PAD]":3,"##dish":4,"zero":64},
             "unk_token":"[UNK]","continuing_subword_prefix":"##","max_input_chars_per_word":100}
         }"###,
         )

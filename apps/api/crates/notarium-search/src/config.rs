@@ -1,6 +1,8 @@
 use notarium_core::epoch::DataRoot;
 use std::{path::PathBuf, time::Duration};
 
+pub(crate) const MAX_QUERY_EMBEDDING_BUDGET: Duration = Duration::from_millis(150);
+
 #[derive(Clone, Debug)]
 pub enum VectorMode {
     Disabled,
@@ -27,8 +29,12 @@ impl SearchConfig {
         Self {
             data_root,
             vector_mode,
-            query_embedding_budget: Duration::from_millis(150),
+            query_embedding_budget: MAX_QUERY_EMBEDDING_BUDGET,
             causal_wait_budget: Duration::from_millis(15),
         }
+    }
+
+    pub(crate) fn interactive_budget(&self) -> Duration {
+        self.query_embedding_budget.min(MAX_QUERY_EMBEDDING_BUDGET)
     }
 }

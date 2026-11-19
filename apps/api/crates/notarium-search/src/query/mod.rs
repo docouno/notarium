@@ -39,8 +39,11 @@ impl SearchPort for SearchEngine {
 
     fn recall(&self, ctx: SpaceContext, request: RecallQuery) -> PortFuture<'_, SearchResult> {
         Box::pin(async move {
-            if request.graph_depth > 2 || request.token_budget == 0 {
+            if request.graph_depth > 2 {
                 return Err(invalid(ValidationReason::InvalidLimit));
+            }
+            if !(1..=131_072).contains(&request.token_budget) {
+                return Err(invalid(ValidationReason::TokenBudgetExceeded));
             }
             self.run_query(
                 ctx,
@@ -235,7 +238,7 @@ impl SearchEngine {
         let max = clock
             .remaining()?
             .remaining
-            .min(self.services.config.query_embedding_budget);
+            .min(self.services.config.interactive_budget());
         let (embedder, vector) = match tokio::time::timeout(max, async {
             let requested = self
                 .services
@@ -316,13 +319,6 @@ impl SearchEngine {
         let pending = state
             .embeddings_pending
             .then_some(SearchDegradation::EmbeddingsPending);
-        let Some(vector) = vector else {
-            return Ok(VectorCandidates {
-                hits: Vec::new(),
-                embedder: Some(embedder),
-                degraded: pending,
-            });
-        };
         let budget = clock.remaining()?;
         let deadline = clock.deadline.into_std();
         let vectors = tokio::task::spawn_blocking(move || {

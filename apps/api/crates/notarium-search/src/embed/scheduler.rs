@@ -2,6 +2,7 @@
 //! interactive lane between every batch.
 
 use super::EmbeddingError;
+use crate::config::MAX_QUERY_EMBEDDING_BUDGET;
 use notarium_core::ports::{CallBudget, Cancellation};
 use std::{
     collections::VecDeque,
@@ -11,7 +12,6 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
-    time::Duration,
 };
 use tokio::{
     sync::{Notify, oneshot},
@@ -19,7 +19,6 @@ use tokio::{
     time::{Instant, sleep_until},
 };
 
-const INTERACTIVE_LIMIT: Duration = Duration::from_millis(150);
 const QUANTUM: usize = 16;
 const CAPACITY: [usize; 3] = [64, 64, 8];
 
@@ -76,6 +75,15 @@ impl EmbeddingScheduler {
         (Self { shared }, worker)
     }
 
+    pub(crate) fn queue_depths(&self) -> [usize; 3] {
+        let state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.jobs.each_ref().map(VecDeque::len)
+    }
+
     pub async fn submit<F, R>(
         &self,
         priority: Priority,
@@ -90,7 +98,7 @@ impl EmbeddingScheduler {
             return Err(EmbeddingError::Cancelled);
         }
         if priority == Priority::InteractiveSearchQuery {
-            budget.remaining = budget.remaining.min(INTERACTIVE_LIMIT);
+            budget.remaining = budget.remaining.min(MAX_QUERY_EMBEDDING_BUDGET);
         }
         if budget.remaining.is_zero() {
             return Err(EmbeddingError::BudgetExceeded);

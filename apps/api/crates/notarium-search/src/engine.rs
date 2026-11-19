@@ -135,6 +135,12 @@ struct Worker {
 }
 
 impl SearchEngine {
+    /// Observe the scheduler queues in priority order for the release gate.
+    #[doc(hidden)]
+    pub fn queued_embeddings(&self) -> [usize; 3] {
+        self.services.scheduler.queue_depths()
+    }
+
     pub fn start(config: SearchConfig, deps: SearchDependencies) -> Self {
         let (scheduler, embedding_worker) = EmbeddingScheduler::start();
         let services = Arc::new(Services {

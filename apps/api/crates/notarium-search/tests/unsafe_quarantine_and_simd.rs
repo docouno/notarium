@@ -39,13 +39,19 @@ fn simd_matches_scalar_bit_for_bit() {
 #[test]
 fn search_unsafe_is_limited_to_audited_leaves() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut directories = vec![root.join("src"), root.join("tests"), root.join("examples")];
+    let mut directories = vec![root.to_path_buf()];
     let permitted = ["src/vector/mmap_segment.rs", "src/vector/simd.rs"];
     let keyword = ["un", "safe"].concat();
-    let function = ["un", "safe fn"].concat();
     let lint = ["un", "safe_code"].concat();
     assert!(has_word(&format!("#[allow(unused,\n{lint})]"), &lint));
     assert!(has_word(&format!("{keyword}\n{{}}"), &keyword));
+    assert_eq!(
+        unsafe_block_count(
+            &format!("{keyword} fn f() {{ {keyword} {{ inner() }} }}"),
+            &keyword
+        ),
+        1
+    );
     while let Some(dir) = directories.pop() {
         for entry in fs::read_dir(dir).unwrap() {
             let entry = entry.unwrap();
@@ -72,15 +78,28 @@ fn search_unsafe_is_limited_to_audited_leaves() {
                     proof = !safety.trim().is_empty();
                 } else if trimmed.starts_with("//") {
                     continue;
-                } else if has_word(trimmed, &keyword) && !trimmed.contains(&function) {
-                    assert!(proof, "{relative}: {line}");
-                    proof = false;
                 } else {
+                    let blocks = unsafe_block_count(trimmed, &keyword);
+                    assert!(blocks == 0 || (blocks == 1 && proof), "{relative}: {line}");
                     proof = false;
                 }
             }
         }
     }
+}
+
+fn unsafe_block_count(text: &str, keyword: &str) -> usize {
+    let mut words = text
+        .split(|character: char| character != '_' && !character.is_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .peekable();
+    let mut count = 0;
+    while let Some(word) = words.next() {
+        if word == keyword && words.peek() != Some(&"fn") {
+            count += 1;
+        }
+    }
+    count
 }
 
 fn has_word(text: &str, word: &str) -> bool {

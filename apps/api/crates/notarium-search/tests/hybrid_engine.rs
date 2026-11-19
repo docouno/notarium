@@ -200,6 +200,13 @@ async fn run_scenario(store: Arc<CanonicalStore>, root: DataRoot, tag: u8) {
         "A repository setup manual. needle.",
     );
     install.fields = status_field("todo");
+    let mut glossary = note(
+        &b,
+        &folder,
+        "Glossary",
+        "Orbits, satellites, and observatories.",
+    );
+    glossary.fields = status_field("todo");
     let (seeded, _) = store
         .commit_synthetic_note_batch_for_test(
             scope,
@@ -207,12 +214,7 @@ async fn run_scenario(store: Arc<CanonicalStore>, root: DataRoot, tag: u8) {
             &owner,
             vec![
                 install,
-                note(
-                    &b,
-                    &folder,
-                    "Glossary",
-                    "Orbits, satellites, and observatories.",
-                ),
+                glossary,
                 note(&vault, &folder, "Retired carrier", SECRET),
             ],
         )
@@ -224,6 +226,7 @@ async fn run_scenario(store: Arc<CanonicalStore>, root: DataRoot, tag: u8) {
     view.index(a.clone(), docs.clone());
     view.set_status(a.clone(), "todo");
     view.index(b.clone(), folder.clone());
+    view.set_status(b.clone(), "todo");
     view.index(vault.clone(), folder.clone());
     view.link(0, 1);
     view.advance(seeded.last_seq);
@@ -296,6 +299,8 @@ async fn run_scenario(store: Arc<CanonicalStore>, root: DataRoot, tag: u8) {
         .commit_synthetic_note_batch_for_test(scope, lease, &owner, vec![updated, with_fields])
         .await
         .unwrap();
+    let mut later_glossary = note(&b, &folder, "Glossary", "Meteorology and climate.");
+    later_glossary.fields = status_field("done");
     let (newer, _) = store
         .commit_synthetic_note_batch_for_test(
             scope,
@@ -303,7 +308,7 @@ async fn run_scenario(store: Arc<CanonicalStore>, root: DataRoot, tag: u8) {
             &owner,
             vec![
                 note(&a, &docs, "Latest version", "laterrevisiontoken"),
-                note(&b, &folder, "Glossary", "Meteorology and climate."),
+                later_glossary,
             ],
         )
         .await
@@ -371,33 +376,46 @@ async fn run_scenario(store: Arc<CanonicalStore>, root: DataRoot, tag: u8) {
         let mut snapshot = projection.snapshot.write().unwrap();
         snapshot.index(created.clone(), folder.clone());
         snapshot.set_status(created, "done");
+        snapshot.set_status(b.clone(), "done");
         snapshot.advance(newer.last_seq);
     }
-    let mut untouched = query("satellites");
-    untouched.causal = CausalBasis::Exact(
+    let mut mismatched = query("satellites");
+    mismatched.causal = CausalBasis::Exact(
         ReceiptSet::new([MutationReceiptToken::new(scope.clone(), first.last_seq).unwrap()])
             .unwrap(),
     );
-    let old_glossary = engine.search(ctx.clone(), untouched).await.unwrap();
-    let old_glossary = old_glossary
+    for status in ["done", "todo"] {
+        mismatched.filter.predicate = Predicate::Eq {
+            key: "status".to_owned(),
+            value: ScalarValue::String(status.to_owned()),
+        };
+        let mut short = ctx.clone();
+        short.budget.remaining = Duration::from_millis(60);
+        assert!(matches!(
+            engine.search(short, mismatched.clone()).await,
+            Err(PortError::DeadlineExceeded(_))
+        ));
+    }
+    pages.release();
+    acknowledged(&store, &root, scope, newer.last_seq).await;
+    mismatched.text = "meteorology".to_owned();
+    mismatched.filter.predicate = Predicate::Eq {
+        key: "status".to_owned(),
+        value: ScalarValue::String("done".to_owned()),
+    };
+    let aligned = engine.search(ctx.clone(), mismatched).await.unwrap();
+    let glossary = aligned
         .hits
         .iter()
         .find(|hit| hit.card.document.provenance().reference().note_id == b)
         .unwrap();
     assert!(
-        old_glossary
+        glossary
             .chunks
             .iter()
-            .any(|chunk| chunk.text().contains("satellites"))
+            .any(|chunk| chunk.text().contains("Meteorology"))
     );
-    assert!(
-        old_glossary
-            .chunks
-            .iter()
-            .all(|chunk| !chunk.text().contains("Meteorology"))
-    );
-    pages.release();
-    acknowledged(&store, &root, scope, newer.last_seq).await;
+    assert_eq!(aligned.cut.projected_seq, newer.last_seq);
     assert_eq!(
         engine
             .search(ctx.clone(), query("laterrevisiontoken"))
@@ -752,6 +770,17 @@ async fn run_scenario(store: Arc<CanonicalStore>, root: DataRoot, tag: u8) {
             <= 64
     );
     assert!(rec.degraded.is_none());
+    for token_budget in [0, 131_073] {
+        assert!(matches!(
+            engine.recall(ctx.clone(), RecallQuery {
+                query: query("laterrevisiontoken"),
+                graph_depth: 0,
+                token_budget,
+            }).await,
+            Err(PortError::Domain(notarium_core::DomainError::ValidationFailed { diagnostic }))
+                if diagnostic.reason == notarium_core::error::ValidationReason::TokenBudgetExceeded
+        ));
+    }
     let exhausted = engine
         .recall(
             ctx,

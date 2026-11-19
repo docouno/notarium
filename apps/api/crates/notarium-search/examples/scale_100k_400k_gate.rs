@@ -71,7 +71,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     drop((epoch, index));
     let movement = fixture.move_folder().await?;
     let peak_bytes = peak.finish();
-    let foreground = priority::measure(&fixture).await?;
+    let (foreground, queued_on_release) = priority::measure(&fixture).await?;
     fixture.shutdown().await?;
 
     let ok = metrics.lexical.p95() < 40.0
@@ -99,6 +99,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "recall_reference": "independent RRF over exhaustive quantized cosine, and an independent scalar crossover reference",
         "move_folder": { "canonical_descendants": count, "tantivy_docs_written": movement.0, "vector_slots_mutated": movement.1 },
         "lane_2_chunks_before_lane_0": foreground,
+        "embedding_queue_depths_on_release": queued_on_release,
         "thresholds_passed": ok,
     });
     println!("{}", serde_json::to_string_pretty(&report)?);
