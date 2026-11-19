@@ -1,5 +1,6 @@
 use notarium_canonical::{
     CanonicalConfig, CanonicalRuntime, CanonicalStore, CreateFolderSpec, CreateSpaceSpec,
+    changes::SyntheticNoteSpec,
 };
 use notarium_core::{
     DomainError, DomainResult,
@@ -9,15 +10,16 @@ use notarium_core::{
     error::ValidationReason,
     ids::{
         CommandKey, ContentDigest, FolderId, GrantId, HistoryIncarnation, InstallationId,
-        LeaseEpoch, ModelProfileId, NoteId, PrincipalId, ProjectionGeneration, RequestId, SpaceId,
-        SpaceSeq,
+        LeaseEpoch, ModelProfileId, NoteId, PrincipalId, ProjectionGeneration, RequestId,
+        RevisionId, SpaceId, SpaceSeq,
     },
-    model::{DenseNodeId, DenseNodeIter, SnapshotCut},
+    model::{DenseNodeId, DenseNodeIter, Lifecycle, SnapshotCut},
     ports::{
-        CallBudget, Cancellation, MoveFolder, Mutation, NoteCard, NoteWritePort, PortFuture,
-        SpaceContext, StructuralReadPort, StructuralSnapshot,
+        CallBudget, Cancellation, MoveFolder, Mutation, NoteCard, NoteWritePort, PageLimit,
+        PortFuture, ServiceAuthority, ServicePurpose, SpaceContext, StructuralReadPort,
+        StructuralSnapshot,
     },
-    query::FieldFilterAstV1,
+    query::{FieldFilterAstV1, Predicate},
     receipt::{CausalBasis, CommandIdentity},
 };
 use notarium_search::{
@@ -35,7 +37,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread::JoinHandle,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 pub struct Scratch(DataRoot);
@@ -69,11 +71,12 @@ pub struct Fixture {
     pub broad: FolderId,
     pub space: Space,
     pub model: ModelProfileId,
-    store: Arc<CanonicalStore>,
+    pub revisions: Vec<RevisionId>,
+    pub store: Arc<CanonicalStore>,
     runtime: CanonicalRuntime,
     corpus: FolderId,
     destination: FolderId,
-    owner: PrincipalId,
+    pub owner: PrincipalId,
 }
 
 impl Fixture {
@@ -116,12 +119,47 @@ impl Fixture {
                     parent,
                     slug: slug.to_owned(),
                     display_name: slug.to_owned(),
-                    is_project: false,
-                    project_slug: None,
+                    is_project: folder == &destination,
+                    project_slug: (folder == &destination).then(|| slug.to_owned()),
                     actor: owner.clone(),
                     timestamp: None,
                 })
                 .await?;
+        }
+        let notes: Vec<_> = (1..=count)
+            .map(|index| NoteId::from_bytes(u128::from(index).to_be_bytes()))
+            .collect();
+        let mut revisions = Vec::with_capacity(notes.len());
+        for (page, group) in notes.chunks(150).enumerate() {
+            let mut writes = Vec::with_capacity(group.len());
+            for (slot, note_id) in group.iter().enumerate() {
+                let ordinal = (page * 150 + slot) as u32;
+                let (title, carrier, _) = super::source_note(ordinal)?;
+                let parent = if u64::from(ordinal * super::CHUNKS)
+                    < notarium_search::vector::EXACT_SCAN_LIMIT
+                {
+                    &selective
+                } else {
+                    &broad
+                };
+                writes.push(SyntheticNoteSpec {
+                    note_id: note_id.clone(),
+                    parent_folder: Some(parent.clone()),
+                    slug: format!("scale-{ordinal}"),
+                    title,
+                    doc_class: DocClass::UserDoc,
+                    lifecycle: Lifecycle::Active,
+                    carrier,
+                    fields: BTreeMap::new(),
+                });
+            }
+            let (_, committed) = store
+                .commit_synthetic_note_batch_for_test(&space.scope, lease, &owner, writes)
+                .await?;
+            if !committed.iter().map(|(note, _)| note).eq(group.iter()) {
+                return Err("canonical corpus identities disagree with the search fixture".into());
+            }
+            revisions.extend(committed.into_iter().map(|(_, revision)| revision));
         }
         let current = store.read_space(&space.scope.space_id).await?;
         let projection = Arc::new(Projection {
@@ -131,9 +169,7 @@ impl Fixture {
                 canonical_seq: current.last_seq,
                 projected_seq: current.last_seq,
             },
-            notes: (1..=count)
-                .map(|index| NoteId::from_bytes(u128::from(index).to_be_bytes()))
-                .collect(),
+            notes,
         });
         let model = ModelProfileId::from_bytes(*b"deterministic-v1");
         Ok(Self {
@@ -144,6 +180,7 @@ impl Fixture {
             broad,
             space: space.space,
             model,
+            revisions,
             store,
             runtime,
             corpus,
@@ -156,8 +193,10 @@ impl Fixture {
         let scope = &self.projection.cut.scope;
         let layout = SearchLayout::open(&self.root, scope.clone())?;
         let initial = layout.search_manifest()?.ok_or("missing search manifest")?;
+        let tantivy = layout.index_dir(&initial)?;
         let vectors = self.root.search(&scope.space_id, SearchIndexKind::Vector);
         let before = contents(&vectors)?;
+        let lexical_before = contents(&tantivy)?;
         let engine = SearchEngine::start(
             SearchConfig::new(
                 self.root.clone(),
@@ -184,10 +223,12 @@ impl Fixture {
             remaining: Duration::from_secs(30),
         };
         let context = SpaceContext::new(auth, scope.clone(), budget)?;
+        self.verify_canonical_corpus(&context, initial.tantivy_seq, None)
+            .await?;
         let changed = self
             .store
             .move_folder(
-                context,
+                context.clone(),
                 Mutation {
                     identity: CommandIdentity {
                         scope: scope.clone(),
@@ -220,13 +261,63 @@ impl Fixture {
         })
         .await??;
         engine.shutdown().await;
+        self.verify_canonical_corpus(&context, end, Some(&self.destination))
+            .await?;
         if initial.tantivy_commit != after.tantivy_commit
             || initial.active_index_dir != after.active_index_dir
+            || lexical_before != contents(&tantivy)?
             || before != contents(&vectors)?
         {
             return Err("folder movement rewrote search data".into());
         }
         Ok((0, 0))
+    }
+
+    async fn verify_canonical_corpus(
+        &self,
+        ctx: &SpaceContext,
+        cutoff: SpaceSeq,
+        project: Option<&FolderId>,
+    ) -> Result<(), Box<dyn Error>> {
+        let authority = ServiceAuthority::admit(ServicePurpose::Search);
+        let mut after = None;
+        let mut seen = 0;
+        loop {
+            let page = self
+                .store
+                .read_searchable_notes_seed_page(
+                    &authority,
+                    ctx.budget.clone(),
+                    ctx.scope().clone(),
+                    Some(cutoff),
+                    after,
+                    PageLimit::new(200)?,
+                )
+                .await?;
+            for carrier in page.notes {
+                let expected = self
+                    .projection
+                    .notes
+                    .get(seen)
+                    .ok_or("unexpected canonical corpus note")?;
+                if &carrier.note_id != expected
+                    || (carrier.parent_folder_id != self.selective
+                        && carrier.parent_folder_id != self.broad)
+                    || carrier.enclosing_project.as_ref() != project
+                {
+                    return Err(
+                        "canonical corpus membership disagrees with the search fixture".into(),
+                    );
+                }
+                seen += 1;
+            }
+            let Some(next) = page.next_after else { break };
+            after = Some(next);
+        }
+        if seen != self.projection.notes.len() {
+            return Err("canonical corpus has an unexpected number of notes".into());
+        }
+        Ok(())
     }
 
     pub async fn shutdown(self) -> Result<(), Box<dyn Error>> {
@@ -235,6 +326,7 @@ impl Fixture {
     }
 }
 
+#[derive(Clone)]
 pub struct Projection {
     pub cut: SnapshotCut,
     pub notes: Vec<NoteId>,
@@ -275,8 +367,12 @@ impl StructuralSnapshot for Projection {
     fn enclosing_project(&self, _: &FolderId) -> DomainResult<Option<FolderId>> {
         Err(unavailable())
     }
-    fn filter_notes(&self, _: &FieldFilterAstV1) -> DomainResult<Option<DenseNodeIter<'_>>> {
-        Err(unavailable())
+    fn filter_notes(&self, filter: &FieldFilterAstV1) -> DomainResult<Option<DenseNodeIter<'_>>> {
+        if matches!(&filter.predicate, Predicate::All(items) if items.is_empty()) {
+            Ok(None)
+        } else {
+            Err(unavailable())
+        }
     }
     fn outgoing(&self, _: DenseNodeId) -> DomainResult<DenseNodeIter<'_>> {
         Err(unavailable())
@@ -289,21 +385,24 @@ impl StructuralSnapshot for Projection {
 impl StructuralReadPort for Projection {
     fn acquire_snapshot(
         &self,
-        _: SpaceContext,
+        ctx: SpaceContext,
         _: CausalBasis,
     ) -> PortFuture<'_, Box<dyn StructuralSnapshot>> {
-        Box::pin(async { Err(unavailable().into()) })
+        Box::pin(async move {
+            ctx.check_current(&self.cut.scope)?;
+            Ok(Box::new(self.clone()) as Box<dyn StructuralSnapshot>)
+        })
     }
-    fn is_live_visible(&self, _: &SpaceContext, _: &NoteId) -> DomainResult<bool> {
-        Err(unavailable())
+    fn is_live_visible(&self, _: &SpaceContext, note: &NoteId) -> DomainResult<bool> {
+        Ok(self.lookup(note).is_some())
     }
     fn hydrate(
         &self,
         _: SpaceContext,
         _: SnapshotCut,
-        _: Vec<NoteId>,
+        notes: Vec<NoteId>,
     ) -> PortFuture<'_, Vec<Option<NoteCard>>> {
-        Box::pin(async { Err(unavailable().into()) })
+        Box::pin(async move { Ok(notes.into_iter().map(|_| None).collect()) })
     }
 }
 
@@ -311,15 +410,44 @@ fn unavailable() -> DomainError {
     DomainError::validation(ValidationReason::NotReady)
 }
 
-fn contents(root: &Path) -> io::Result<BTreeMap<PathBuf, blake3::Hash>> {
+#[derive(Eq, PartialEq)]
+struct FileWitness {
+    digest: blake3::Hash,
+    modified: SystemTime,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+fn contents(root: &Path) -> io::Result<BTreeMap<PathBuf, FileWitness>> {
     let mut hashes = BTreeMap::new();
-    for folder in fs::read_dir(root)? {
-        for entry in fs::read_dir(folder?.path())? {
-            let path = entry?.path();
+    let mut directories = vec![root.to_path_buf()];
+    while let Some(directory) = directories.pop() {
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let path = entry.path();
+            if entry.file_type()?.is_dir() {
+                directories.push(path);
+                continue;
+            }
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "lock")
+            {
+                continue;
+            }
             let mut input = fs::File::open(&path)?;
+            let metadata = input.metadata()?;
             let mut hash = blake3::Hasher::new();
             io::copy(&mut input, &mut hash)?;
-            hashes.insert(path, hash.finalize());
+            hashes.insert(
+                path,
+                FileWitness {
+                    digest: hash.finalize(),
+                    modified: metadata.modified()?,
+                    #[cfg(unix)]
+                    inode: std::os::unix::fs::MetadataExt::ino(&metadata),
+                },
+            );
         }
     }
     Ok(hashes)
@@ -333,6 +461,7 @@ pub struct PeakDisk {
 }
 
 impl PeakDisk {
+    pub const INTERVAL_MS: u64 = 100;
     pub fn start(root: &Path) -> Self {
         let root = root.join("v1/search");
         let peak = Arc::new(AtomicU64::new(0));
@@ -342,7 +471,7 @@ impl PeakDisk {
             move || {
                 while !stop.load(Ordering::Acquire) {
                     peak.fetch_max(size(&root, &mut Default::default()), Ordering::Relaxed);
-                    std::thread::sleep(Duration::from_millis(100));
+                    std::thread::sleep(Duration::from_millis(Self::INTERVAL_MS));
                 }
             }
         });

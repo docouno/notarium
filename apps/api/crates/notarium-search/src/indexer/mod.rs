@@ -9,7 +9,7 @@ use crate::{
 };
 use notarium_core::{
     DomainError,
-    error::PortError,
+    error::{PortError, ValidationReason},
     ids::{RequestId, SpaceSeq},
     model::HistoryScope,
     ports::{
@@ -50,6 +50,12 @@ impl IndexError {
             Self::Port(PortError::Domain(error)) | Self::Domain(error) => error.requires_resync(),
             _ => false,
         }
+    }
+
+    fn requires_scrub(&self) -> bool {
+        matches!(self, Self::Port(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
+            | Self::Domain(DomainError::ValidationFailed { diagnostic })
+            if matches!(diagnostic.reason, ValidationReason::CursorStale | ValidationReason::PurgeResync))
     }
 }
 
@@ -218,6 +224,9 @@ async fn consume(
         &cx.services.config.data_root,
         scope.clone(),
     )?);
+    if scope != starting_scope {
+        layout.clear_lexical_manifests()?;
+    }
     let mut disk = open_disk(cx, layout.clone())?;
     let start = disk
         .as_ref()
@@ -301,13 +310,19 @@ async fn consume(
                     scrub = true;
                 }
                 Err(error) if error.requires_reseed() => {
+                    let retired = error.requires_scrub();
+                    if retired {
+                        drop(disk.take());
+                        build::scrub(cx, publisher, &layout).await?;
+                    }
                     let latest = cx.latest(&scope).await?;
                     if latest.scope != scope {
+                        layout.clear_lexical_manifests()?;
                         return Ok(Some(latest.scope));
                     }
                     rebind |= latest.after != target.after;
                     seed_at = Some(latest);
-                    scrub = true;
+                    scrub = !retired;
                 }
                 Err(error) => return Err(error),
             }
@@ -361,8 +376,14 @@ async fn consume(
                         break;
                     }
                     Err(error) if error.requires_reseed() => {
+                        let retired = error.requires_scrub();
+                        if retired {
+                            drop(disk.take());
+                            build::scrub(cx, publisher, &layout).await?;
+                        }
                         let latest = cx.latest(&scope).await?;
                         if latest.scope != scope {
+                            layout.clear_lexical_manifests()?;
                             return Ok(Some(latest.scope));
                         }
                         if latest.after <= cutoff.after {
@@ -370,7 +391,7 @@ async fn consume(
                         }
                         cutoff = latest;
                         rebind = true;
-                        scrub = true;
+                        scrub = !retired;
                     }
                     Err(error) if disk.is_some() => {
                         tracing::warn!(kind = %error, "search model replacement will retry");

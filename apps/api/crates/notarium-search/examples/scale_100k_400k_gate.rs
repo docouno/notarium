@@ -1,5 +1,7 @@
 //! Offline release gate for the search index and retrieval kernels.
 
+#[path = "search_scale/priority.rs"]
+mod priority;
 #[path = "search_scale/support.rs"]
 mod support;
 
@@ -7,7 +9,7 @@ use croaring::Bitmap;
 use notarium_core::{
     auth::ResourceFacts,
     classes::{ClassEgressFence, ClassifiedDocument, DocClass},
-    ids::{ContentDigest, RevisionId},
+    ids::{ContentDigest, NoteId},
     model::{Lifecycle, NoteRef},
     ports::{Cancellation, ServiceAuthority, ServicePurpose},
     span::ByteSpan,
@@ -15,17 +17,19 @@ use notarium_core::{
 use notarium_search::{
     fuse_search_candidates,
     layout::{FolderDictionary, SearchLayout, SearchManifest, index_name},
-    lexical::{LexicalFilter, LexicalIndex, TOKENIZER_VERSION, Update, WriterPool},
+    lexical::{
+        HitKey, LexicalFilter, LexicalHit, LexicalIndex, TOKENIZER_VERSION, Update, WriterPool,
+    },
     ports::{EmbeddingBackendTarget, ResolvedEmbeddingTarget},
     vector::{
         ChunkMetadata, EXACT_SCAN_LIMIT, QuantizedVector, SearchBudget, SegmentBuilder,
-        VectorChunk, VectorEpoch, VectorFilter,
+        VectorChunk, VectorEpoch, VectorFilter, VectorHit,
         simd::{Kernel, dot_i8_scalar},
     },
 };
 use serde_json::json;
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     error::Error,
     fs,
     sync::Arc,
@@ -66,8 +70,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let metrics = run_samples(&fixture, &index, &epoch, samples)?;
     drop((epoch, index));
     let movement = fixture.move_folder().await?;
-    fixture.shutdown().await?;
     let peak_bytes = peak.finish();
+    let foreground = priority::measure(&fixture).await?;
+    fixture.shutdown().await?;
 
     let ok = metrics.lexical.p95() < 40.0
         && metrics.hybrid.p95() < 95.0
@@ -75,12 +80,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
         && metrics.hybrid_recall >= 0.95
         && (metrics.selective_recall - 1.0).abs() < f64::EPSILON
         && movement == (0, 0)
+        && (1..=16).contains(&foreground)
         && peak_bytes < DISK_LIMIT;
     let report = json!({
         "profile": if smoke { "smoke" } else { "full" },
         "tree": tree, "notes": count, "chunks": count * CHUNKS,
         "sample_count": samples, "dimension": DIMENSION, "top_k": TOP_K,
+        "lexical_candidates": CANDIDATES,
         "build_ms": build_ms, "peak_index_bytes": peak_bytes,
+        "disk_sample_interval_ms": PeakDisk::INTERVAL_MS,
         "workspace_cpu_quota": argument("--host-cpu"), "workspace_memory_quota_bytes": argument("--host-memory"),
         "runner_cpu_quota": cgroup("cpu.max"), "runner_memory_quota_bytes": cgroup("memory.max"),
         "simd": format!("{:?}", Kernel::detect()),
@@ -88,8 +96,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "selective_ms": metrics.selective.report(), "selective_chunks": EXACT_SCAN_LIMIT,
         "hybrid_recall_at_10": metrics.hybrid_recall,
         "ann_recall_at_10": metrics.ann_recall, "selective_recall_at_10": metrics.selective_recall,
-        "recall_reference": "exhaustive quantized cosine and an independent scalar crossover reference",
-        "move_folder": { "tantivy_docs_written": movement.0, "vector_slots_mutated": movement.1 },
+        "recall_reference": "independent RRF over exhaustive quantized cosine, and an independent scalar crossover reference",
+        "move_folder": { "canonical_descendants": count, "tantivy_docs_written": movement.0, "vector_slots_mutated": movement.1 },
+        "lane_2_chunks_before_lane_0": foreground,
         "thresholds_passed": ok,
     });
     println!("{}", serde_json::to_string_pretty(&report)?);
@@ -113,15 +122,7 @@ fn build(fixture: &Fixture, count: u32) -> Result<(LexicalIndex, VectorEpoch), B
     let mut builder = SegmentBuilder::new(&fixture.model, DIMENSION)?;
     let mut staged = Vec::with_capacity(PAGE as usize);
     for ordinal in 0..count {
-        let topic = ordinal % TOPICS;
-        let title = format!("Workspace brief for facet{topic:04}");
-        let mut carrier = format!("# {title}\n\n");
-        let mut spans = Vec::new();
-        for part in 0..CHUNKS {
-            let start = carrier.len();
-            carrier.push_str(&chunk_line(ordinal, part));
-            spans.push(ByteSpan::new(start, carrier.len())?);
-        }
+        let (title, carrier, spans) = source_note(ordinal)?;
         let source = notarium_syntax::content_digest(&carrier);
         let note = fixture.projection.notes[ordinal as usize].clone();
         let (ordinal_folder, folder_id) = if u64::from(ordinal * CHUNKS) < EXACT_SCAN_LIMIT {
@@ -134,7 +135,7 @@ fn build(fixture: &Fixture, count: u32) -> Result<(LexicalIndex, VectorEpoch), B
                 space_id: scope.space_id.clone(),
                 note_id: note.clone(),
             },
-            RevisionId::from_bytes(u128::from(ordinal + 1).to_be_bytes()),
+            fixture.revisions[ordinal as usize].clone(),
             ResourceFacts {
                 space: fixture.space.clone(),
                 class: DocClass::UserDoc,
@@ -206,6 +207,19 @@ fn build(fixture: &Fixture, count: u32) -> Result<(LexicalIndex, VectorEpoch), B
         embeddings_pending: false,
     })?;
     Ok((index, epoch))
+}
+
+fn source_note(ordinal: u32) -> Result<(String, String, Vec<ByteSpan>), Box<dyn Error>> {
+    let topic = ordinal % TOPICS;
+    let title = format!("Workspace brief for facet{topic:04}");
+    let mut carrier = format!("# {title}\n\n");
+    let mut spans = Vec::new();
+    for part in 0..CHUNKS {
+        let start = carrier.len();
+        carrier.push_str(&chunk_line(ordinal, part));
+        spans.push(ByteSpan::new(start, carrier.len())?);
+    }
+    Ok((title, carrier, spans))
 }
 
 fn embedding(
@@ -313,20 +327,25 @@ fn run_samples(
         let text = format!("facet{:04}", note % TOPICS);
         let query = embedding(note, sample % CHUNKS)?;
         let started = Instant::now();
-        let lexical = index.search(&text, &filter, TOP_K, false)?;
+        let lexical = index.search(&text, &filter, CANDIDATES, false)?;
         let lexical_time = started.elapsed();
         assert!(!lexical.is_empty());
 
-        let started = Instant::now();
-        let lexical = index.search(&text, &filter, CANDIDATES, false)?;
         let approx = snapshot.search(&query, &open, CANDIDATES, budget())?;
         let fused = fuse_search_candidates(lexical.clone(), approx.hits.clone(), false);
         let hybrid_time = started.elapsed();
         assert!(approx.hnsw_hops > 0);
+        let approximate_reference = reference_fusion(&lexical, &approx.hits);
+        assert!(
+            fused
+                .iter()
+                .map(|row| (&row.note, row.score))
+                .eq(approximate_reference)
+        );
         let exact = snapshot
             .search_exact(&query, &open, CANDIDATES, budget())?
             .hits;
-        let reference = fuse_search_candidates(lexical, exact.clone(), false);
+        let reference = reference_fusion(&lexical, &exact);
 
         let local_query = embedding(note % (EXACT_SCAN_LIMIT as u32 / CHUNKS), sample % CHUNKS)?;
         let started = Instant::now();
@@ -339,7 +358,7 @@ fn run_samples(
             metrics.selective.push(selective_time);
             metrics.hybrid_recall += overlap(
                 fused.iter().map(|hit| &hit.note),
-                reference.iter().map(|hit| &hit.note),
+                reference.into_iter().map(|(note, _)| note),
             );
             metrics.ann_recall += overlap(
                 approx.hits.iter().map(|hit| hit.metadata.key),
@@ -354,6 +373,52 @@ fn run_samples(
     metrics.ann_recall /= f64::from(samples);
     metrics.selective_recall /= f64::from(samples);
     Ok(metrics)
+}
+
+fn reference_fusion<'a>(
+    lexical: &'a [LexicalHit],
+    vectors: &'a [VectorHit],
+) -> Vec<(&'a NoteId, f64)> {
+    let lexical: BTreeMap<_, _> = lexical
+        .iter()
+        .enumerate()
+        .filter_map(|(index, hit)| match &hit.key {
+            HitKey::Note(note) => Some((note, index + 1)),
+            _ => None,
+        })
+        .collect();
+    let mut vector_ranks = BTreeMap::new();
+    for hit in vectors {
+        let rank = vector_ranks.len() + 1;
+        vector_ranks.entry(&hit.metadata.note).or_insert(rank);
+    }
+    let members: BTreeSet<_> = lexical.keys().chain(vector_ranks.keys()).copied().collect();
+    let weighted = |rank: Option<&usize>| rank.map_or(0.0, |rank| 1.0 / (60.0 + *rank as f64));
+    let mut scored: Vec<_> = members
+        .into_iter()
+        .map(|note| {
+            let lex = lexical.get(note);
+            let vector = vector_ranks.get(note);
+            let score = weighted(lex) + weighted(vector);
+            let best_rank = *lex
+                .into_iter()
+                .chain(vector)
+                .min()
+                .expect("union of ranked notes");
+            (note, score, best_rank)
+        })
+        .collect();
+    scored.sort_unstable_by(|left, right| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| left.2.cmp(&right.2))
+            .then_with(|| left.0.cmp(right.0))
+    });
+    scored
+        .into_iter()
+        .map(|(note, score, _)| (note, score))
+        .collect()
 }
 
 fn overlap<T: Ord>(result: impl Iterator<Item = T>, reference: impl Iterator<Item = T>) -> f64 {

@@ -1,3 +1,4 @@
+pub mod ort;
 pub mod remote;
 
 use notarium_canonical::{CanonicalStore, chats::search::HydratedChatHit};

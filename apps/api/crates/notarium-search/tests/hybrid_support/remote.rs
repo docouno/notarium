@@ -180,9 +180,9 @@ pub async fn model_epochs_and_repair(store: Arc<CanonicalStore>, root: DataRoot)
     });
     let provider = Arc::new(ModelProvider::default());
     let carriers = Arc::new(ControlledCarriers::new(store.clone()));
-    let start = || {
+    let start = |resolver: Arc<SwitchingResolver>| {
         let mut deps = SearchDependencies::new(store.clone(), projection.clone());
-        deps.model_resolver = Some(resolver.clone());
+        deps.model_resolver = Some(resolver);
         deps.providers = Some(provider.clone());
         deps.carriers = carriers.clone();
         SearchEngine::start(
@@ -191,7 +191,7 @@ pub async fn model_epochs_and_repair(store: Arc<CanonicalStore>, root: DataRoot)
         )
     };
     let ctx = context(&space.scope, &owner);
-    let engine = start();
+    let engine = start(resolver.clone());
     engine.start_space(space.scope.clone()).unwrap();
     let seeded = acknowledged(&store, &root, &space.scope, seeded.last_seq).await;
     assert!(!seeded.embeddings_pending);
@@ -285,7 +285,7 @@ pub async fn model_epochs_and_repair(store: Arc<CanonicalStore>, root: DataRoot)
     assert!(before_restart.embeddings_pending);
     engine.shutdown().await;
     provider.fail_indexing.store(false, Ordering::SeqCst);
-    let engine = start();
+    let engine = start(resolver);
     engine.start_space(space.scope.clone()).unwrap();
     tokio::time::timeout(Duration::from_secs(8), async {
         while layout
@@ -304,10 +304,39 @@ pub async fn model_epochs_and_repair(store: Arc<CanonicalStore>, root: DataRoot)
         key: "status".to_owned(),
         value: notarium_core::value::ScalarValue::String("done".to_owned()),
     };
-    let recovered = engine.search(ctx, recovered_query).await.unwrap();
+    let recovered = engine.search(ctx.clone(), recovered_query).await.unwrap();
     assert!(recovered.degraded.is_none());
     assert_eq!(recovered.hits[0].card.title, "Recoverable note");
     engine.shutdown().await;
+
+    let undersized = start(Arc::new(SwitchingResolver {
+        provider: AtomicU8::new(6),
+        cap: 8,
+    }));
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let result = undersized
+                .search(ctx.clone(), query("durable retry content"))
+                .await
+                .unwrap();
+            assert!(
+                result
+                    .hits
+                    .iter()
+                    .any(|hit| hit.card.title == "Recoverable note")
+            );
+            if let Some(manifest) = layout.search_manifest().unwrap()
+                && manifest.active_model == Some(remote_target(6, 8))
+            {
+                assert!(manifest.embeddings_pending);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+    })
+    .await
+    .unwrap();
+    undersized.shutdown().await;
 }
 
 struct Resolver {

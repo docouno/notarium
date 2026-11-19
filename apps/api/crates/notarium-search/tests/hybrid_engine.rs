@@ -1,4 +1,5 @@
 mod hybrid_support;
+mod onnx_support;
 #[path = "../../notarium-canonical/tests/support/mod.rs"]
 mod storage;
 
@@ -742,6 +743,7 @@ async fn sqlite_hybrid_seed_causal_boundaries_and_scrub() {
     chat_candidate_visibility(store.clone(), data.data_root()).await;
     reader_capacity(store.clone(), data.data_root()).await;
     hybrid_support::remote::model_epochs_and_repair(store.clone(), data.data_root()).await;
+    hybrid_support::ort::search_with_dynamic_models(store.clone(), data.data_root()).await;
     purge_and_rebind(store, data.data_root()).await;
     runtime.shutdown().await.unwrap();
 }

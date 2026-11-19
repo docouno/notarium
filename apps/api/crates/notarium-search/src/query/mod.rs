@@ -248,6 +248,14 @@ impl SearchEngine {
                 .ok_or(EmbeddingError::ModelUnavailable)?;
             let Some(indexed) = &state.vectors else {
                 handle.wake.notify_one();
+                if state
+                    .active_model
+                    .as_ref()
+                    .is_some_and(|active| active.vector_model() == requested.vector_model())
+                    && state.embedder.is_none()
+                {
+                    return Err(EmbeddingError::ModelUnavailable);
+                }
                 return Ok(None);
             };
             let target = if indexed.manifest().model == requested.vector_model() {

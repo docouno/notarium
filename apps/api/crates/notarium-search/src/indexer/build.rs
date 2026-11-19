@@ -26,11 +26,14 @@ pub(super) async fn scrub(
     publisher.drain().await;
     // An absent manifest forces cleanup before reopening either index.
     layout.invalidate_search()?;
-    layout.remove_vector_epochs(None)?;
-    for previous in layout.index_generations()? {
-        remove_generation(cx, layout, previous)?;
-    }
-    Ok(())
+    let vectors = layout.remove_vector_epochs(None);
+    let lexical = layout
+        .index_generations()?
+        .into_iter()
+        .map(|generation| remove_generation(cx, layout, generation))
+        .fold(Ok(()), |result, next| result.and(next));
+    vectors?;
+    lexical
 }
 
 pub(super) async fn seed(

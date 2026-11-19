@@ -191,6 +191,81 @@ fn lexical_queries_use_morphology_code_and_exact_phrase_positions() {
 }
 
 #[test]
+fn failed_obsolete_file_deletion_prevents_a_cleanup_certificate() {
+    use std::{
+        io,
+        sync::atomic::{AtomicBool, Ordering},
+    };
+    use tantivy::directory::{
+        Directory, FileHandle, RamDirectory, WatchCallback, WatchHandle, WritePtr,
+        error::{DeleteError, OpenReadError, OpenWriteError},
+    };
+    const OBSOLETE: &str = "unused-postings.fixture";
+
+    #[derive(Clone, Debug)]
+    struct DirectoryWithFailedDeletion {
+        inner: RamDirectory,
+        blocked: Arc<AtomicBool>,
+    }
+    impl Directory for DirectoryWithFailedDeletion {
+        fn get_file_handle(&self, path: &Path) -> Result<Arc<dyn FileHandle>, OpenReadError> {
+            self.inner.get_file_handle(path)
+        }
+        fn delete(&self, path: &Path) -> Result<(), DeleteError> {
+            if path == Path::new(OBSOLETE) && self.blocked.load(Ordering::SeqCst) {
+                return Err(DeleteError::IoError {
+                    io_error: Arc::new(io::ErrorKind::PermissionDenied.into()),
+                    filepath: path.to_owned(),
+                });
+            }
+            self.inner.delete(path)
+        }
+        fn exists(&self, path: &Path) -> Result<bool, OpenReadError> {
+            self.inner.exists(path)
+        }
+        fn open_write(&self, path: &Path) -> Result<WritePtr, OpenWriteError> {
+            self.inner.open_write(path)
+        }
+        fn atomic_read(&self, path: &Path) -> Result<Vec<u8>, OpenReadError> {
+            self.inner.atomic_read(path)
+        }
+        fn atomic_write(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
+            self.inner.atomic_write(path, bytes)
+        }
+        fn sync_directory(&self) -> io::Result<()> {
+            self.inner.sync_directory()
+        }
+        fn watch(&self, callback: WatchCallback) -> tantivy::Result<WatchHandle> {
+            self.inner.watch(callback)
+        }
+    }
+
+    let blocked = Arc::new(AtomicBool::new(true));
+    let directory = DirectoryWithFailedDeletion {
+        inner: RamDirectory::create(),
+        blocked: blocked.clone(),
+    };
+    let fields = schema::Fields::new();
+    let index = Index::create(directory, fields.schema.clone(), Default::default()).unwrap();
+    let lexical = LexicalIndex::from_index(PathBuf::new(), index, fields).unwrap();
+    let writers = WriterPool::default();
+    let obsolete = Path::new(OBSOLETE);
+    lexical
+        .index
+        .directory()
+        .atomic_write(obsolete, b"retired postings")
+        .unwrap();
+    assert!(matches!(
+        lexical.collect_obsolete(&writers),
+        Err(LexicalError::IncompleteCleanup)
+    ));
+    assert!(lexical.index.directory().exists(obsolete).unwrap());
+    blocked.store(false, Ordering::SeqCst);
+    lexical.collect_obsolete(&writers).unwrap();
+    assert!(!lexical.index.directory().exists(obsolete).unwrap());
+}
+
+#[test]
 fn temporary_overlay_writers_share_disk_admission() {
     fn hold_overlay_slots(pool: &WriterPool, remaining: usize) -> Result<(), LexicalError> {
         let index = Index::create_in_ram(schema::Fields::new().schema);

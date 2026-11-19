@@ -230,11 +230,7 @@ impl LexicalIndex {
                 writer.merge(&segments).wait()?;
             }
             self.reader.reload()?;
-            let result = writer.garbage_collect_files().wait()?;
-            if !result.failed_to_delete_files.is_empty() {
-                return Err(LexicalError::IncompleteCleanup);
-            }
-            Ok(())
+            check_garbage_collection(writer)
         })
     }
 
@@ -257,8 +253,7 @@ impl LexicalIndex {
 
     pub fn collect_obsolete(&self, pool: &WriterPool) -> Result<(), LexicalError> {
         pool.with_writer(&self.path, &self.index, false, |writer| {
-            writer.garbage_collect_files().wait()?;
-            Ok(())
+            check_garbage_collection(writer)
         })
     }
 
@@ -454,6 +449,14 @@ fn has_live_posting(segment: &tantivy::SegmentReader, mut postings: impl DocSet)
         doc = postings.advance();
     }
     false
+}
+
+fn check_garbage_collection(writer: &tantivy::IndexWriter) -> Result<(), LexicalError> {
+    let result = writer.garbage_collect_files().wait()?;
+    if !result.failed_to_delete_files.is_empty() {
+        return Err(LexicalError::IncompleteCleanup);
+    }
+    Ok(())
 }
 
 impl<'a> LexicalFilter<'a> {
