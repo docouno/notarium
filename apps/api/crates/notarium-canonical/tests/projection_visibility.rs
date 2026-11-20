@@ -957,9 +957,7 @@ async fn postgres_drain_blocks_concurrent_re_admission_and_single_conn_pool_neve
         .expect("subsequent write draining cleanup_debt on pool_size=1 must not self-deadlock");
     assert!(cleanup.calls.load(Ordering::SeqCst) >= 2);
 
-    // 4. Immediately after a write (within the 50ms worker idle window) on pool_size = 1,
-    //    race admit_projection_space + create_note concurrently: must never AB-BA deadlock
-    //    between WriteBatchActor's cached_pg_conn and gate.write().
+    // 4. Re-admit the suspended space concurrently with another write on pool_size = 1.
     drop(handle);
     let note_c = sample_note_id(37);
     let (admit_live, write_c) = tokio::join!(
@@ -1044,6 +1042,25 @@ async fn postgres_multi_space_pool_size_two_concurrent_purges_never_self_deadloc
     }
     let (store, runtime) = CanonicalRuntime::open(config).await.unwrap();
     let projection = maintenance_ctx(ServicePurpose::Projection);
+
+    struct CountingCleanup {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl ProjectionVisibilityCleanup for CountingCleanup {
+        fn erase_visibility<'a>(&'a self, _erasures: &'a ProjectionErasures) -> PortFuture<'a, ()> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        }
+    }
+    let cleanup = Arc::new(CountingCleanup {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    store
+        .set_projection_visibility_cleanup(&projection, cleanup.clone())
+        .unwrap();
+
     let space_a = create_space(&store, 38).await;
     let space_b = create_space(&store, 39).await;
     let _handle_a = store
@@ -1165,20 +1182,193 @@ async fn postgres_multi_space_pool_size_two_concurrent_purges_never_self_deadloc
         );
         pa.expect("concurrent purge on space A with pool_size=2 must not self-deadlock");
         pb.expect("concurrent purge on space B with pool_size=2 must not self-deadlock");
+        assert!(
+            store
+                .live_visibility_fence()
+                .try_read(&space_a.scope)
+                .is_ok(),
+            "space A fence dropped readable after round {round}"
+        );
+        assert!(
+            store
+                .live_visibility_fence()
+                .try_read(&space_b.scope)
+                .is_ok(),
+            "space B fence dropped readable after round {round}"
+        );
     }
 
     assert!(
-        store
-            .live_visibility_fence()
-            .try_read(&space_a.scope)
-            .is_ok()
+        cleanup.calls.load(Ordering::SeqCst) >= 12,
+        "expected cleanup hook to run on all 6 rounds x 2 spaces, got {}",
+        cleanup.calls.load(Ordering::SeqCst)
     );
-    assert!(
-        store
-            .live_visibility_fence()
-            .try_read(&space_b.scope)
-            .is_ok()
-    );
+    runtime.shutdown().await.unwrap();
+    fixtures.drop_pg_schema(&schema).await;
+}
+
+#[tokio::test]
+async fn postgres_pool_size_one_back_to_back_writes_racing_admit_never_abba_deadlock() {
+    let fixtures = StorageTestFixtures::load_required();
+    let schema = fixtures.fresh_pg_schema();
+    let dir = TempDataRoot::new("projection-pg-pool-one-abba");
+    let mut config = fixtures.pg_local_config(sample_installation_id(42), &schema, dir.data_root());
+    if let notarium_canonical::SqlBackendConfig::Postgres {
+        ref mut pool_size, ..
+    } = config.sql
+    {
+        *pool_size = 1;
+    }
+    // max_batch_items = 1 with zero flush window guarantees back-to-back writes
+    // enter flush_single_batch with !rx.is_empty() and cached_pg_conn = Some(...).
+    config.writer.max_batch_items = 1;
+    config.writer.batch_flush_window = Duration::ZERO;
+
+    let (store, runtime) = CanonicalRuntime::open(config).await.unwrap();
+    let projection = maintenance_ctx(ServicePurpose::Projection);
+
+    for round in 0u8..4 {
+        let space = create_space(&store, 50 + round).await;
+
+        // Queue 6 direct WriteBatchActor commands alongside admit_projection_space on a
+        // non-admitted space (needs_storage_read == false, zero pre-enqueue pool reads).
+        // Batch #1 retains cached_pg_conn across the non-empty queue while admit acquires
+        // gate.write() and awaits pool.acquire().
+        let outcome = tokio::time::timeout(Duration::from_secs(3), async {
+            let mut writers = Vec::with_capacity(6);
+            for _ in 0..6 {
+                let store = store.clone();
+                let budget = projection.budget.clone();
+                let space_rec = space.clone();
+                writers.push(tokio::spawn(async move {
+                    store
+                        .submit_fixture_write_command::<u64>(
+                            &budget,
+                            queued_owner_write(&space_rec),
+                        )
+                        .await
+                }));
+            }
+            tokio::task::yield_now().await;
+            let admit = store
+                .admit_projection_space(&projection, &space.scope)
+                .await;
+            let mut results = Vec::with_capacity(6);
+            for w in writers {
+                results.push(w.await.unwrap());
+            }
+            (admit, results)
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!("round {round} AB-BA deadlocked between cached_pg_conn and admit")
+        });
+
+        let handle = outcome
+            .0
+            .expect("admit racing back-to-back writes on pool_size=1 must succeed");
+        for (idx, res) in outcome.1.into_iter().enumerate() {
+            res.unwrap_or_else(|err| {
+                panic!("round {round} write {idx} racing admit on pool_size=1 failed: {err:?}")
+            });
+        }
+        assert!(handle.try_read().is_ok());
+    }
+
+    runtime.shutdown().await.unwrap();
+    fixtures.drop_pg_schema(&schema).await;
+}
+
+#[tokio::test]
+async fn postgres_multi_space_trickle_writes_never_starve_admit() {
+    let fixtures = StorageTestFixtures::load_required();
+    let schema = fixtures.fresh_pg_schema();
+    let dir = TempDataRoot::new("projection-pg-pool-three-trickle");
+    let mut config = fixtures.pg_local_config(sample_installation_id(60), &schema, dir.data_root());
+    if let notarium_canonical::SqlBackendConfig::Postgres {
+        ref mut pool_size, ..
+    } = config.sql
+    {
+        // pool_size = 3 (> 2): 3 per-Space WriteBatchActor workers = 100% of the pool if
+        // idle workers retain cached_pg_conn across the 50ms idle receive timeout.
+        *pool_size = 3;
+    }
+    let (store, runtime) = CanonicalRuntime::open(config).await.unwrap();
+    let projection = maintenance_ctx(ServicePurpose::Projection);
+    let revocation = maintenance_ctx(ServicePurpose::Revocation);
+
+    let trickle_spaces = [
+        create_space(&store, 61).await,
+        create_space(&store, 62).await,
+        create_space(&store, 63).await,
+    ];
+    let target_spaces = [
+        create_space(&store, 64).await,
+        create_space(&store, 65).await,
+        create_space(&store, 66).await,
+    ];
+
+    // Start 3 trickle writers (one per space, every 15ms < 50ms idle worker timeout) using
+    // direct WriteBatchActor submissions (no pre-enqueue pool read). If idle workers retained
+    // cached_pg_conn on pool_size >= 3, all 3 sockets would remain pinned indefinitely and
+    // starve admit/drain on target_spaces past the 1s timeout.
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ready = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut handles = Vec::new();
+    for (idx, space) in trickle_spaces.iter().enumerate() {
+        let space_rec = space.clone();
+        let store = store.clone();
+        let budget = projection.budget.clone();
+        let stop = Arc::clone(&stop);
+        let ready = Arc::clone(&ready);
+        handles.push(tokio::spawn(async move {
+            let mut seq = 0u32;
+            while !stop.load(Ordering::Acquire) {
+                seq += 1;
+                store
+                    .submit_fixture_write_command::<u64>(&budget, queued_owner_write(&space_rec))
+                    .await
+                    .unwrap_or_else(|err| panic!("trickle writer {idx} seq {seq} failed: {err:?}"));
+                if seq == 1 {
+                    ready.fetch_add(1, Ordering::Release);
+                }
+                tokio::time::sleep(Duration::from_millis(15)).await;
+            }
+        }));
+    }
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while ready.load(Ordering::Acquire) < 3 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("all 3 trickle workers must complete initial commit");
+
+    for (idx, target) in target_spaces.iter().enumerate() {
+        let handle = tokio::time::timeout(
+            Duration::from_secs(1),
+            store.admit_projection_space(&projection, &target.scope),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("target {idx} admit starved under pool_size=3 trickle writes"))
+        .expect("admit must succeed under pool_size=3 trickle writes");
+        assert!(handle.try_read().is_ok());
+        drop(handle);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            store.drain_projection_owner(&revocation, &target.scope),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("target {idx} drain starved under pool_size=3 trickle writes"))
+        .expect("drain must succeed under pool_size=3 trickle writes");
+    }
+
+    stop.store(true, Ordering::Release);
+    for h in handles {
+        h.await.unwrap();
+    }
+
     runtime.shutdown().await.unwrap();
     fixtures.drop_pg_schema(&schema).await;
 }

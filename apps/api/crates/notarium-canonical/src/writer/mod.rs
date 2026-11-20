@@ -1087,15 +1087,7 @@ async fn run_batch_worker_loop(
 
     loop {
         let next = if let Some((id, registry)) = &pg_space {
-            if rx.is_empty()
-                && cached_pg_conn.is_some()
-                && inner_weak.upgrade().is_none_or(|inner| {
-                    matches!(
-                        &inner.sql,
-                        SqlDriverState::Postgres { pool, .. } if pool.max_connections() <= 2
-                    )
-                })
-            {
+            if rx.is_empty() {
                 cached_pg_conn = None;
             }
             match tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
@@ -1175,6 +1167,7 @@ async fn run_batch_worker_loop(
                     break;
                 }
 
+                cached_pg_conn = None;
                 tokio::select! {
                     biased;
                     maybe_entry = rx.recv() => {
@@ -1227,6 +1220,7 @@ async fn run_batch_worker_loop(
         }
         drop(_commit_read_guard);
         if rx.is_empty() {
+            cached_pg_conn = None;
             tokio::task::yield_now().await;
         }
     }

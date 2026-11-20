@@ -247,7 +247,6 @@ pub enum DerivedMutation {
     DeleteLink(u32, u32),
     DeleteDescriptors(NoteId),
     DeleteRank(NoteId, ViewKey, NoteId),
-    DeleteThreadRefs(ChatThreadId),
     DeleteClusters,
     PurgeNote(NoteId),
     RedactChatEntry(ChatThreadId, ThreadEntrySeq),

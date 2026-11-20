@@ -115,7 +115,6 @@ fn approx_mutation_bytes(mutation: &DerivedMutation) -> usize {
         | DerivedMutation::DeleteLink(..)
         | DerivedMutation::DeleteDescriptors(_)
         | DerivedMutation::DeleteRank(..)
-        | DerivedMutation::DeleteThreadRefs(_)
         | DerivedMutation::DeleteClusters
         | DerivedMutation::PurgeNote(_)
         | DerivedMutation::RedactChatEntry(..) => OVERHEAD,

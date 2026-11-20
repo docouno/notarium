@@ -50,10 +50,6 @@ impl StorePgPool {
         self.pool.options().get_acquire_timeout()
     }
 
-    pub(crate) fn max_connections(&self) -> u32 {
-        self.pool.options().get_max_connections()
-    }
-
     pub(crate) async fn acquire(&self) -> Result<StorePgConnection, sqlx::Error> {
         if tokio::runtime::Handle::current().id() == self.executor.id() {
             return Ok(StorePgConnection {

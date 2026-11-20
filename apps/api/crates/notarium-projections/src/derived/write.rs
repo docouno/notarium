@@ -371,6 +371,7 @@ impl DerivedStore {
                             &purged,
                             &redacted,
                             None,
+                            None,
                         )
                         .await?;
                     }
@@ -594,6 +595,7 @@ impl DerivedStore {
                                 &purged,
                                 &redacted,
                                 Some(&key),
+                                None,
                             )
                             .await?;
                         } else {
@@ -632,6 +634,7 @@ impl DerivedStore {
                                 &purged,
                                 &redacted,
                                 None,
+                                Some(&key),
                             )
                             .await?;
                         }
@@ -1289,30 +1292,19 @@ async fn apply_mutations(
                         )
                         .await?;
                     }
-                    DeleteThreadRefs(thread) => {
-                        delete_chat_refs_ordered(
-                            tx,
-                            ChatRefDeleteSpec {
-                                threads: Some((space, std::slice::from_ref(thread))),
-                                ..ChatRefDeleteSpec::default()
-                            },
-                        )
-                        .await?;
-                    }
                     DeleteClusters => {
                         remove::<ProjectedCluster>(tx, "space_id = ?", vec![value(space)]).await?;
                     }
                     PurgeNote(note) => {
                         if !pre_erased {
-                            raise_checkpoint_floor(tx, &next.scope, seq).await?;
-                            purge_target(tx, &next.scope, note).await?;
+                            return Err(invalid_row());
                         }
                         cached_floor = None;
                         purge_note_rows(tx, &next.scope, note, seq).await?;
                     }
-                    RedactChatEntry(thread, entry) => {
+                    RedactChatEntry(_, _) => {
                         if !pre_erased {
-                            redact_entry(tx, &next.scope, thread, *entry).await?;
+                            return Err(invalid_row());
                         }
                     }
                     UpsertNote(_)
@@ -1653,6 +1645,7 @@ struct ApplyPageDeleteSpec<'a> {
     own_scope: Option<&'a HistoryScope>,
     own_before: Option<(&'a HistoryScope, SpaceSeq)>,
     own_stage_key: Option<&'a StageKey>,
+    exclude_stage_key: Option<&'a StageKey>,
     incoming_all_space: Option<&'a SpaceId>,
     purged: Option<(&'a HistoryScope, &'a [NoteId])>,
     redacted: Option<(&'a HistoryScope, &'a [(ChatThreadId, ThreadEntrySeq)])>,
@@ -1663,7 +1656,6 @@ struct ChatRefDeleteSpec<'a> {
     all_for_space: Option<&'a SpaceId>,
     purged: Option<(&'a HistoryScope, &'a [NoteId])>,
     redacted: Option<(&'a HistoryScope, &'a [(ChatThreadId, ThreadEntrySeq)])>,
-    threads: Option<(&'a SpaceId, &'a [ChatThreadId])>,
 }
 
 fn collect_destructive_targets(
@@ -1690,6 +1682,7 @@ async fn pre_erase_destructive_mutations(
     purged: &[NoteId],
     redacted: &[(ChatThreadId, ThreadEntrySeq)],
     own_stage_key: Option<&StageKey>,
+    exclude_stage_key: Option<&StageKey>,
 ) -> Result<(), PortError> {
     let mut sorted_purged = purged.to_vec();
     sorted_purged.sort_unstable();
@@ -1713,6 +1706,7 @@ async fn pre_erase_destructive_mutations(
         tx,
         ApplyPageDeleteSpec {
             own_stage_key,
+            exclude_stage_key,
             purged: (!sorted_purged.is_empty()).then_some((scope, sorted_purged.as_slice())),
             redacted: (!sorted_redacted.is_empty()).then_some((scope, sorted_redacted.as_slice())),
             ..ApplyPageDeleteSpec::default()
@@ -1822,11 +1816,18 @@ async fn delete_apply_pages_ordered(
         if clauses.is_empty() {
             return Ok(0);
         }
+        let mut where_sql = format!("({})", clauses.join(" OR "));
+        if let Some(excluded) = spec.exclude_stage_key {
+            where_sql.push_str(
+                " AND NOT (space_id = ? AND history_incarnation = ? AND first_seq = ? AND last_seq = ?)",
+            );
+            args.extend(stage_values(excluded));
+        }
         let sql = format!(
             "WITH locked AS MATERIALIZED (
                  SELECT space_id, history_incarnation, first_seq, last_seq, page_no
                  FROM projection_apply_pages
-                 WHERE {}
+                 WHERE {where_sql}
                  ORDER BY space_id, history_incarnation, first_seq, last_seq, page_no
                  FOR UPDATE
              )
@@ -1837,91 +1838,126 @@ async fn delete_apply_pages_ordered(
                AND p.first_seq = l.first_seq
                AND p.last_seq = l.last_seq
                AND p.page_no = l.page_no",
-            clauses.join(" OR ")
         );
         return tx.execute(&sql, args).await;
     }
 
     let mut total = 0u64;
+    let exclude_clause = if spec.exclude_stage_key.is_some() {
+        " AND NOT (space_id = ? AND history_incarnation = ? AND first_seq = ? AND last_seq = ?)"
+    } else {
+        ""
+    };
+    let push_excluded = |args: &mut Vec<SqlValue>| {
+        if let Some(excluded) = spec.exclude_stage_key {
+            args.extend(stage_values(excluded));
+        }
+    };
     if let Some(space) = spec.own_all_space {
+        let mut args = vec![value(space)];
+        push_excluded(&mut args);
         total += tx
             .execute(
-                "DELETE FROM projection_apply_pages WHERE space_id = ?",
-                vec![value(space)],
+                &format!("DELETE FROM projection_apply_pages WHERE space_id = ?{exclude_clause}"),
+                args,
             )
             .await?;
     }
     if let Some(scope) = spec.own_scope {
+        let mut args = vec![value(&scope.space_id), value(&scope.incarnation)];
+        push_excluded(&mut args);
         total += tx
             .execute(
-                "DELETE FROM projection_apply_pages WHERE space_id = ? AND history_incarnation = ?",
-                vec![value(&scope.space_id), value(&scope.incarnation)],
+                &format!(
+                    "DELETE FROM projection_apply_pages WHERE space_id = ? AND history_incarnation = ?{exclude_clause}"
+                ),
+                args,
             )
             .await?;
     }
     if let Some((scope, through)) = spec.own_before {
+        let mut args = vec![
+            value(&scope.space_id),
+            value(&scope.incarnation),
+            value(&through),
+        ];
+        push_excluded(&mut args);
         total += tx
             .execute(
-                "DELETE FROM projection_apply_pages WHERE space_id = ? AND history_incarnation = ? AND first_seq < ?",
-                vec![
-                    value(&scope.space_id),
-                    value(&scope.incarnation),
-                    value(&through),
-                ],
+                &format!(
+                    "DELETE FROM projection_apply_pages WHERE space_id = ? AND history_incarnation = ? AND first_seq < ?{exclude_clause}"
+                ),
+                args,
             )
             .await?;
     }
     if let Some(key) = spec.own_stage_key {
+        let mut args = stage_values(key);
+        push_excluded(&mut args);
         total += tx
             .execute(
-                "DELETE FROM projection_apply_pages WHERE space_id = ? AND history_incarnation = ? AND first_seq = ? AND last_seq = ?",
-                stage_values(key),
+                &format!(
+                    "DELETE FROM projection_apply_pages WHERE space_id = ? AND history_incarnation = ? AND first_seq = ? AND last_seq = ?{exclude_clause}"
+                ),
+                args,
             )
             .await?;
     }
     if let Some(space) = spec.incoming_all_space {
+        let mut args = vec![value(space)];
+        push_excluded(&mut args);
         total += tx
             .execute(
-                "DELETE FROM projection_apply_pages
-                 WHERE (space_id, history_incarnation, first_seq, last_seq, page_no) IN (
-                     SELECT space_id, history_incarnation, first_seq, last_seq, page_no
-                     FROM projection_apply_chat_refs
-                     WHERE target_space_id = ?
-                 )",
-                vec![value(space)],
+                &format!(
+                    "DELETE FROM projection_apply_pages
+                     WHERE (space_id, history_incarnation, first_seq, last_seq, page_no) IN (
+                         SELECT space_id, history_incarnation, first_seq, last_seq, page_no
+                         FROM projection_apply_chat_refs
+                         WHERE target_space_id = ?
+                     ){exclude_clause}"
+                ),
+                args,
             )
             .await?;
     }
     if let Some((scope, notes)) = spec.purged {
         for note in notes {
+            let mut args = vec![
+                value(&scope.space_id),
+                value(&scope.incarnation),
+                value(note),
+            ];
+            push_excluded(&mut args);
             total += tx
                 .execute(
-                    "DELETE FROM projection_apply_pages
-                     WHERE (space_id, history_incarnation, first_seq, last_seq, page_no) IN (
-                         SELECT space_id, history_incarnation, first_seq, last_seq, page_no
-                         FROM projection_apply_chat_refs
-                         WHERE target_space_id = ? AND target_incarnation = ? AND target_note_id = ?
-                     )",
-                    vec![
-                        value(&scope.space_id),
-                        value(&scope.incarnation),
-                        value(note),
-                    ],
+                    &format!(
+                        "DELETE FROM projection_apply_pages
+                         WHERE (space_id, history_incarnation, first_seq, last_seq, page_no) IN (
+                             SELECT space_id, history_incarnation, first_seq, last_seq, page_no
+                             FROM projection_apply_chat_refs
+                             WHERE target_space_id = ? AND target_incarnation = ? AND target_note_id = ?
+                         ){exclude_clause}"
+                    ),
+                    args,
                 )
                 .await?;
         }
     }
     if let Some((scope, entries)) = spec.redacted {
         for (thread, entry) in entries {
+            let mut args = redaction_args(scope, thread, *entry);
+            push_excluded(&mut args);
             total += tx
                 .execute(
-                    "DELETE FROM projection_apply_pages
-                     WHERE (space_id, history_incarnation, first_seq, last_seq, page_no) IN (
-                         SELECT space_id, history_incarnation, first_seq, last_seq, page_no
-                         FROM projection_apply_chat_refs
-                         WHERE space_id = ? AND history_incarnation = ? AND thread_id = ? AND entry_seq = ?
-                     )",
-                    redaction_args(scope, thread, *entry),
+                    &format!(
+                        "DELETE FROM projection_apply_pages
+                         WHERE (space_id, history_incarnation, first_seq, last_seq, page_no) IN (
+                             SELECT space_id, history_incarnation, first_seq, last_seq, page_no
+                             FROM projection_apply_chat_refs
+                             WHERE space_id = ? AND history_incarnation = ? AND thread_id = ? AND entry_seq = ?
+                         ){exclude_clause}"
+                    ),
+                    args,
                 )
                 .await?;
         }
@@ -1966,15 +2002,6 @@ async fn delete_chat_refs_ordered(
                 value(&scope.incarnation),
                 threads,
                 seqs,
-            ]);
-        }
-        if let Some((space, threads)) = spec.threads
-            && !threads.is_empty()
-        {
-            clauses.push("(thread_space_id = ? AND thread_id = ANY(?))");
-            args.extend([
-                value(space),
-                SqlValue::TextArray(threads.iter().map(|t| t.as_str().to_owned()).collect()),
             ]);
         }
         if clauses.is_empty() {
@@ -2026,15 +2053,6 @@ async fn delete_chat_refs_ordered(
             tx.execute(
                 "DELETE FROM chat_note_refs WHERE thread_space_id = ? AND source_incarnation = ? AND thread_id = ? AND entry_seq = ?",
                 redaction_args(scope, thread, *entry),
-            )
-            .await?;
-        }
-    }
-    if let Some((space, threads)) = spec.threads {
-        for thread in threads {
-            tx.execute(
-                "DELETE FROM chat_note_refs WHERE thread_space_id = ? AND thread_id = ?",
-                vec![value(space), value(thread)],
             )
             .await?;
         }
@@ -2179,34 +2197,6 @@ async fn insert_redaction_marker(
         "INSERT INTO projected_redaction_markers (space_id, history_incarnation, thread_id, entry_seq) VALUES (?, ?, ?, ?)
          ON CONFLICT DO NOTHING",
         redaction_args(scope, thread, entry),
-    )
-    .await?;
-    Ok(())
-}
-
-async fn redact_entry(
-    tx: &mut SqlTransaction<'_>,
-    scope: &HistoryScope,
-    thread: &ChatThreadId,
-    entry: ThreadEntrySeq,
-) -> Result<(), PortError> {
-    // Canonical lock order: markers -> projection_apply_pages (PK order) -> chat_note_refs (PK order).
-    let pair = [(thread.clone(), entry)];
-    insert_redaction_marker(tx, scope, thread, entry).await?;
-    delete_apply_pages_ordered(
-        tx,
-        ApplyPageDeleteSpec {
-            redacted: Some((scope, &pair)),
-            ..ApplyPageDeleteSpec::default()
-        },
-    )
-    .await?;
-    delete_chat_refs_ordered(
-        tx,
-        ChatRefDeleteSpec {
-            redacted: Some((scope, &pair)),
-            ..ChatRefDeleteSpec::default()
-        },
     )
     .await?;
     Ok(())

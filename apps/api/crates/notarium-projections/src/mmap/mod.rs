@@ -938,6 +938,13 @@ fn remove_readonly(path: &Path) -> io::Result<()> {
     {
         let metadata = fs::symlink_metadata(path)?;
         let was_readonly = metadata.is_file() && metadata.permissions().readonly();
+        let restore_readonly = || {
+            if was_readonly {
+                let mut permissions = metadata.permissions();
+                permissions.set_readonly(true);
+                let _ = fs::set_permissions(path, permissions);
+            }
+        };
         if was_readonly {
             let mut permissions = metadata.permissions();
             permissions.set_readonly(false);
@@ -952,18 +959,22 @@ fn remove_readonly(path: &Path) -> io::Result<()> {
             if fs::rename(path, &tombstone).is_ok() {
                 if let Err(err) = fs::remove_file(&tombstone) {
                     let _ = fs::rename(&tombstone, path);
-                    if was_readonly {
-                        let mut permissions = metadata.permissions();
-                        permissions.set_readonly(true);
-                        let _ = fs::set_permissions(path, permissions);
-                    }
+                    restore_readonly();
                     return Err(err);
                 }
                 return Ok(());
             }
         }
+        let result = fs::remove_file(path);
+        if result.is_err() {
+            restore_readonly();
+        }
+        return result;
     }
-    fs::remove_file(path)
+    #[cfg(not(windows))]
+    {
+        fs::remove_file(path)
+    }
 }
 
 pub(crate) fn id_hash(id: &str) -> u32 {

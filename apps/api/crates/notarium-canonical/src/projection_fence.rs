@@ -1855,13 +1855,59 @@ mod fence_concurrency_tests {
         assert!(!fence.topology.read().unwrap().contains_key(&space));
     }
 
-    #[test]
-    fn cleanup_empty_gate_removes_orphaned_empty_slot_on_error_without_evicting_active() {
+    #[tokio::test]
+    async fn cleanup_empty_gate_removes_orphaned_empty_slot_on_error_without_evicting_active() {
         let fence = LiveLifecycleFence::new().unwrap();
         let space = SpaceId::from_bytes([0xA2; 16]);
         let gate = fence.gate_or_insert(&space);
         assert!(fence.topology.read().unwrap().contains_key(&space));
+
+        // Extra Arc holder (strong_count > 2): must NOT evict.
+        let extra = Arc::clone(&gate);
+        fence.cleanup_empty_gate(&space, &gate);
+        assert!(fence.topology.read().unwrap().contains_key(&space));
+        drop(extra);
+
+        // Held exclusive write guard (try_read fails): must NOT evict.
+        let write_guard = gate.write().await;
+        fence.cleanup_empty_gate(&space, &gate);
+        assert!(fence.topology.read().unwrap().contains_key(&space));
+        drop(write_guard);
+
+        // Orphaned unlocked GateData::Empty with strong_count == 2: MUST evict.
         fence.cleanup_empty_gate(&space, &gate);
         assert!(!fence.topology.read().unwrap().contains_key(&space));
+        drop(gate);
+
+        // Active gate with strong_count == 2: must NOT evict.
+        let active_gate = fence.gate_or_insert(&space);
+        let record = SpaceRecord {
+            space: Space {
+                id: space.clone(),
+                kind: notarium_core::auth::SpaceKind::Shared,
+                lifecycle: SpaceLifecycle::Active,
+            },
+            scope: HistoryScope {
+                space_id: space.clone(),
+                incarnation: notarium_core::ids::HistoryIncarnation::from_bytes([0xA3; 16]),
+            },
+            root_folder_id: FolderId::from_bytes([0xA4; 16]),
+            slug: "active-cleanup-test".into(),
+            owner: notarium_core::ids::PrincipalId::from_bytes([0xA5; 16]),
+            active_epoch: LeaseEpoch::new(1).unwrap(),
+            last_seq: SpaceSeq::ZERO,
+            created_at: notarium_core::value::Timestamp::from_unix_parts(1, 0).unwrap(),
+        };
+        *active_gate.write().await =
+            GateData::Active(Box::new(LiveState::new(record, None).unwrap()));
+        fence.cleanup_empty_gate(&space, &active_gate);
+        assert!(
+            fence
+                .topology
+                .read()
+                .unwrap()
+                .get(&space)
+                .is_some_and(|existing| Arc::ptr_eq(existing, &active_gate))
+        );
     }
 }
