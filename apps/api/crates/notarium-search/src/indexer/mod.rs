@@ -28,6 +28,7 @@ use std::{
 };
 use tokio::time::{MissedTickBehavior, interval, sleep};
 
+const MAINTENANCE_TICK: Duration = Duration::from_secs(1);
 const VECTOR_IDLE: Duration = Duration::from_secs(60);
 
 #[derive(Debug, thiserror::Error)]
@@ -164,7 +165,18 @@ impl Disk {
         Ok(true)
     }
 
-    async fn resume_vectors(&mut self) -> Result<(), IndexError> {
+    async fn ensure_embedder(&mut self, cx: &Context<'_>) -> bool {
+        if self.epoch.is_some()
+            && self.embedder.is_none()
+            && let Some(active) = self.manifest.active_model.clone()
+        {
+            self.embedder = cx.services.embedder(active).await.ok().map(Arc::new);
+            return self.embedder.is_some();
+        }
+        false
+    }
+
+    async fn resume_epoch(&mut self) -> Result<bool, IndexError> {
         self.vector_last_use = Instant::now();
         if self.epoch.is_none() && self.manifest.vector_seq.is_some() {
             let layout = self.layout.clone();
@@ -172,12 +184,19 @@ impl Disk {
             self.epoch = tokio::task::spawn_blocking(move || open_vector_epoch(layout, &manifest))
                 .await
                 .map_err(|_| IndexError::Inconsistent)??;
+            return Ok(self.epoch.is_some());
         }
-        Ok(())
+        Ok(false)
     }
 
-    fn release_idle_vectors(&mut self, now: Instant) {
-        if now.saturating_duration_since(self.vector_last_use) >= VECTOR_IDLE {
+    async fn resume_vectors(&mut self, cx: &Context<'_>) -> Result<bool, IndexError> {
+        let epoch = self.resume_epoch().await?;
+        let embedder = self.ensure_embedder(cx).await;
+        Ok(epoch || embedder)
+    }
+
+    fn release_idle_vectors(&mut self, now: Instant, idle: Duration) {
+        if now.saturating_duration_since(self.vector_last_use) >= idle {
             self.epoch.take();
             self.embedder.take();
         }
@@ -266,6 +285,16 @@ async fn consume(
     publisher: &mut Publisher<'_>,
     starting_scope: HistoryScope,
 ) -> Result<Option<HistoryScope>, IndexError> {
+    consume_with_schedule(cx, publisher, starting_scope, MAINTENANCE_TICK, VECTOR_IDLE).await
+}
+
+async fn consume_with_schedule(
+    cx: &Context<'_>,
+    publisher: &mut Publisher<'_>,
+    starting_scope: HistoryScope,
+    tick_interval: Duration,
+    vector_idle: Duration,
+) -> Result<Option<HistoryScope>, IndexError> {
     let latest = cx.latest(&starting_scope).await?;
     let scope = latest.scope;
     let layout = Arc::new(SearchLayout::open(
@@ -288,7 +317,7 @@ async fn consume(
     if let Some(disk) = &disk {
         publisher.publish(disk);
     }
-    let mut ticker = interval(Duration::from_secs(1));
+    let mut ticker = interval(tick_interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut next_model_check = Instant::now();
     let mut retry_model = false;
@@ -307,7 +336,9 @@ async fn consume(
                     () = cx.handle.wake.notified() => ChangeNotice::Lagged { resume },
                     _ = tokio::time::sleep_until(repair.next()), if disk.as_ref().is_some_and(Disk::needs_embedding_repair) => {
                         if let Some(current) = &mut disk {
-                            current.resume_vectors().await?;
+                            if current.resume_vectors(cx).await? {
+                                publisher.publish(current);
+                            }
                             repair.page(cx, current, publisher).await?;
                         }
                         continue;
@@ -352,7 +383,7 @@ async fn consume(
                                 if disk.lexical.take().is_some() {
                                     publisher.replace(None);
                                 }
-                                disk.release_idle_vectors(Instant::now());
+                                disk.release_idle_vectors(Instant::now(), vector_idle);
                             } else {
                                 disk.vector_last_use = Instant::now();
                             }
@@ -391,8 +422,8 @@ async fn consume(
         if !force_seed && let Some(current) = &mut disk {
             let resumed = match current.resume_reader(cx) {
                 Ok(reopened) => {
-                    current.resume_vectors().await?;
-                    if reopened {
+                    let vectors = current.resume_vectors(cx).await?;
+                    if reopened || vectors {
                         publisher.publish(current);
                     }
                     true
@@ -444,13 +475,6 @@ async fn consume(
             && let Some(current) = &mut disk
             && let Ok(selected) = cx.services.model_target(&scope, None, None).await
         {
-            if current.epoch.is_some()
-                && current.embedder.is_none()
-                && let Some(active) = current.manifest.active_model.clone()
-            {
-                current.embedder = cx.services.embedder(active).await.ok().map(Arc::new);
-                publisher.publish(current);
-            }
             let selection_changed = current.manifest.active_model != selected;
             let backfill = current.manifest.vector_seq.is_none() && selected.is_some();
             if selection_changed || backfill {
@@ -560,7 +584,7 @@ async fn open_disk(
             vector_last_use: Instant::now(),
         }))
     })();
-    let disk = match opened {
+    let mut disk = match opened {
         Ok(disk) => disk,
         Err(IndexError::Layout(LayoutError::WrongHistory)) => {
             layout.clear_lexical_manifests()?;
@@ -591,7 +615,9 @@ async fn open_disk(
         .and_then(|disk| disk.epoch.as_ref().and(disk.manifest.active_model.as_ref()))
         .map(crate::ports::ResolvedEmbeddingTarget::vector_model);
     layout.remove_vector_epochs(vector_model.as_ref())?;
-    if disk.is_none() {
+    if let Some(disk) = &mut disk {
+        disk.ensure_embedder(cx).await;
+    } else {
         // A corrupt dictionary cannot be used with an empty replacement index.
         if layout.folder_dictionary().is_err() {
             layout.clear_lexical_manifests()?;

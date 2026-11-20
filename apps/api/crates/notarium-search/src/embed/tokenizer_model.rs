@@ -282,6 +282,14 @@ impl Bpe {
         let mut chars = text.chars().peekable();
         let mut first = true;
         let mut unknown = false;
+        let flush_unknown = |symbols: &mut Vec<Symbol>, unknown: &mut bool| {
+            if std::mem::take(unknown) {
+                push_symbol(
+                    symbols,
+                    self.unknown.as_ref().expect("pending unknown").clone(),
+                );
+            }
+        };
         while let Some(c) = chars.next() {
             let mut value = String::new();
             if !first {
@@ -293,17 +301,12 @@ impl Bpe {
                 value.push_str(&self.suffix);
             }
             if self.vocab.contains_key(&value) {
-                if unknown {
-                    push_symbol(
-                        &mut symbols,
-                        self.unknown.as_ref().expect("pending unknown").clone(),
-                    );
-                    unknown = false;
-                }
+                flush_unknown(&mut symbols, &mut unknown);
                 push_symbol(&mut symbols, value);
             } else if self.byte_fallback
                 && let Some(tokens) = byte_tokens(&self.vocab, &value)
             {
+                flush_unknown(&mut symbols, &mut unknown);
                 for symbol in tokens {
                     push_symbol(&mut symbols, symbol);
                 }
@@ -314,12 +317,7 @@ impl Bpe {
                 unknown = true;
             }
         }
-        if unknown {
-            push_symbol(
-                &mut symbols,
-                self.unknown.as_ref().expect("pending unknown").clone(),
-            );
-        }
+        flush_unknown(&mut symbols, &mut unknown);
         let mut queue = MergeQueue::new();
         for (left, symbol) in symbols.iter().enumerate() {
             if symbol.next.is_some() {

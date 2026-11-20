@@ -133,6 +133,27 @@ fn tokenizer_matches_reference_on_fallback_controls_and_whitespace() {
             &[3][..],
         ),
         (
+            r#"{"model":{"type":"BPE","byte_fallback":true,"unk_token":"<unk>",
+            "vocab":{"<unk>":0,"<0xC3>":1,"<0xA9>":2,"a":3},
+            "merges":[]}}"#,
+            "!éa",
+            &[0, 1, 2, 3],
+        ),
+        (
+            r#"{"model":{"type":"BPE","byte_fallback":true,"unk_token":"<unk>","fuse_unk":false,
+            "vocab":{"<unk>":0,"<0xC3>":1,"<0xA9>":2},
+            "merges":[]}}"#,
+            "!!é",
+            &[0, 0, 1, 2],
+        ),
+        (
+            r#"{"model":{"type":"BPE","byte_fallback":true,"unk_token":"<unk>","fuse_unk":true,
+            "vocab":{"<unk>":0,"<0xC3>":1,"<0xA9>":2},
+            "merges":[]}}"#,
+            "!!é",
+            &[0, 1, 2],
+        ),
+        (
             r#"{"model":{"type":"Unigram","byte_fallback":true,"unk_id":0,
             "vocab":[["<unk>",0],["<0xC3>",-1],["<0xA9>",-1]]}}"#,
             "é🙂",

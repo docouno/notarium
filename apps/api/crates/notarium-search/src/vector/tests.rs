@@ -530,6 +530,95 @@ fn direct_segment_upsert_preserves_unrelated_pending_chunks_on_reopen() {
 }
 
 #[test]
+fn large_upsert_is_crash_safe_before_and_after_publish() {
+    use notarium_core::{epoch::DataRoot, ids::HistoryIncarnation, model::HistoryScope};
+    use std::collections::BTreeSet;
+
+    let scratch = Scratch::new();
+    let scope = HistoryScope {
+        space_id: SpaceId::from_bytes([1; 16]),
+        incarnation: HistoryIncarnation::from_bytes([1; 16]),
+    };
+    let layout = Arc::new(SearchLayout::open(&DataRoot::new(&scratch.0), scope).unwrap());
+    let epoch_dir = layout
+        .model_epoch(&VectorModel::local(model(), 64))
+        .unwrap();
+    let seq = |seq| SpaceSeq::new(seq).unwrap();
+    let mut epoch = VectorEpoch::open(layout.clone(), model(), 64).unwrap();
+    let old = fixture(1, 64);
+    let note = old.metadata.note.clone();
+    let mut builder = SegmentBuilder::new(&model(), 64).unwrap();
+    builder.push(old.clone()).unwrap();
+    epoch.seed(builder, seq(1)).unwrap();
+    let seg1_tomb = epoch_dir.join("seg_0000000000000001.tomb");
+    assert!(!seg1_tomb.exists());
+
+    let mut first = fixture(2, 64);
+    let mut second = fixture(3, 64);
+    first.metadata.note = note.clone();
+    second.metadata.note = note.clone();
+    let replacement = [first, second];
+
+    // Window 1: publishing fails before epoch_manifest.json rotates.
+    // Prior segment tombstones must remain untouched on disk.
+    let blocker = epoch_dir.join("block_publish");
+    fs::create_dir(&blocker).unwrap();
+    assert!(
+        epoch
+            .apply_large_upsert(seq(2), note.clone(), replacement.to_vec())
+            .is_err()
+    );
+    assert!(
+        !seg1_tomb.exists(),
+        "failed pre-publish large upsert must not tombstone old segments"
+    );
+    drop(epoch);
+    fs::remove_dir(&blocker).unwrap();
+
+    let mut epoch = VectorEpoch::open(layout.clone(), model(), 64).unwrap();
+    assert!(epoch.is_checkpointed(seq(1)));
+    assert!(epoch.matches_note_chunks(&note, std::slice::from_ref(&old)));
+    epoch.collect_obsolete().unwrap();
+    assert!(!epoch_dir.join("seg_0000000000000002.seg").exists());
+
+    // Window 2: crash after epoch_manifest.json publishes, before old .tomb persists.
+    // Reopening must reconcile superseded segments and persist the missing tombstone.
+    epoch
+        .apply_large_upsert(seq(2), note.clone(), replacement.to_vec())
+        .unwrap();
+    assert!(seg1_tomb.exists());
+    drop(epoch);
+    fs::remove_file(&seg1_tomb).unwrap();
+
+    let epoch = VectorEpoch::open(layout, model(), 64).unwrap();
+    assert!(
+        seg1_tomb.exists(),
+        "reopen must persist tombstones for superseded segments"
+    );
+    assert!(epoch.is_checkpointed(seq(2)));
+    assert!(epoch.matches_note_chunks(&note, &replacement));
+    let cancellation = Cancellation::default();
+    let classes = BTreeSet::from([DocClass::UserDoc]);
+    let filter = VectorFilter {
+        classes: &classes,
+        folders: None,
+        notes: None,
+        excluded: None,
+    };
+    let budget = SearchBudget {
+        cancellation: &cancellation,
+        deadline: Instant::now() + Duration::from_secs(1),
+    };
+    let hits = epoch
+        .snapshot()
+        .search(&old.vector, &filter, 10, budget)
+        .unwrap()
+        .hits;
+    assert_eq!(hits.len(), 2);
+    assert!(hits.iter().all(|hit| hit.metadata != old.metadata));
+}
+
+#[test]
 fn epoch_restarts_compacts_and_scrubs_obsolete_carriers() {
     use notarium_core::{epoch::DataRoot, ids::HistoryIncarnation, model::HistoryScope};
     use std::collections::BTreeSet;

@@ -13,7 +13,7 @@ use notarium_core::{
     ids::{ContentDigest, ModelProfileId, NoteId, SpaceSeq},
 };
 use std::{
-    collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap},
+    collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet},
     fs, io,
     path::{Path, PathBuf},
     sync::Arc,
@@ -339,6 +339,7 @@ impl VectorEpoch {
                 tombstones,
             });
         }
+        reconcile_superseded_tombstones(&path, &mut segments)?;
         let next_segment = disk_generations(&path)?
             .into_iter()
             .max()
@@ -407,6 +408,9 @@ impl VectorEpoch {
         note: NoteId,
         chunks: Vec<VectorChunk>,
     ) -> Result<(), VectorError> {
+        if chunks.is_empty() {
+            return Err(VectorError::InvalidChunk);
+        }
         let mut builder = self.builder()?;
         for chunk in chunks {
             if chunk.metadata.note != note {
@@ -415,7 +419,7 @@ impl VectorEpoch {
             builder.push(chunk)?;
         }
         self.flush()?;
-        self.append_replacement(builder, seq, &[note])
+        self.append_replacement(builder, seq, &[note], false)
     }
 
     pub fn should_flush(&self, now: Instant) -> bool {
@@ -431,7 +435,7 @@ impl VectorEpoch {
             builder.push(chunk.clone())?;
         }
         let replaced: Vec<_> = self.mutable.notes().cloned().collect();
-        self.append_replacement(builder, self.mutable.last_seq(), &replaced)?;
+        self.append_replacement(builder, self.mutable.last_seq(), &replaced, true)?;
         self.mutable.reset_after_flush()
     }
 
@@ -440,10 +444,12 @@ impl VectorEpoch {
         builder: SegmentBuilder,
         seq: SpaceSeq,
         replaced: &[NoteId],
+        persist_tombstones_before_publish: bool,
     ) -> Result<(), VectorError> {
         let added = self.seal(builder)?;
         let mut segments = self.segments.clone();
-        for segment in &mut segments {
+        let mut dirty = Vec::new();
+        for (index, segment) in segments.iter_mut().enumerate() {
             let before = segment.tombstones.bitmap().cardinality();
             for note in replaced {
                 if let Some(slots) = segment.index.notes.get(note) {
@@ -453,13 +459,27 @@ impl VectorEpoch {
                 }
             }
             if segment.tombstones.bitmap().cardinality() != before {
-                segment
-                    .tombstones
-                    .persist(&tombstone_path(&self.path, segment.id))?;
+                if persist_tombstones_before_publish {
+                    segment
+                        .tombstones
+                        .persist(&tombstone_path(&self.path, segment.id))?;
+                } else {
+                    dirty.push(index);
+                }
             }
         }
         segments.extend(added);
-        self.publish(segments, seq, self.manifest.complete_backfill)
+        self.publish(segments, seq, self.manifest.complete_backfill)?;
+        // Direct large upserts have no WAL backing; publish the replacement segment
+        // first so a pre-publish crash leaves prior tombstones intact, and reopen
+        // reconciles any post-publish crash before these tombstones reach disk.
+        for index in dirty {
+            let segment = &self.segments[index];
+            segment
+                .tombstones
+                .persist(&tombstone_path(&self.path, segment.id))?;
+        }
+        Ok(())
     }
 
     pub fn seed(&mut self, builder: SegmentBuilder, seq: SpaceSeq) -> Result<(), VectorError> {
@@ -618,6 +638,33 @@ impl VectorEpoch {
         self.segments = segments;
         Ok(())
     }
+}
+
+fn reconcile_superseded_tombstones(
+    path: &Path,
+    segments: &mut [Segment],
+) -> Result<(), VectorError> {
+    if segments.len() < 2 {
+        return Ok(());
+    }
+    let mut seen = HashSet::new();
+    for segment in segments.iter_mut().rev() {
+        let before = segment.tombstones.bitmap().cardinality();
+        for (note, slots) in &segment.index.notes {
+            if seen.contains(note) {
+                for &slot in slots {
+                    segment.tombstones.mark(slot);
+                }
+            }
+        }
+        if segment.tombstones.bitmap().cardinality() != before {
+            segment
+                .tombstones
+                .persist(&tombstone_path(path, segment.id))?;
+        }
+        seen.extend(segment.index.notes.keys().cloned());
+    }
+    Ok(())
 }
 
 fn append_live(

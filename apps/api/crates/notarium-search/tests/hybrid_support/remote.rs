@@ -343,6 +343,15 @@ pub async fn model_epochs_and_repair(store: Arc<CanonicalStore>, root: DataRoot)
     );
     assert_eq!(provider.parts.load(Ordering::SeqCst), attempts + 1);
 
+    // Clean restart with no pending writes or repair must publish the active
+    // embedder immediately so the first semantic query does not degrade.
+    engine.shutdown().await;
+    let engine = start(resolver.clone());
+    engine.start_space(space.scope.clone()).unwrap();
+    let restarted = engine.search(ctx.clone(), semantic.clone()).await.unwrap();
+    assert!(restarted.degraded.is_none());
+    assert_eq!(restarted.hits[0].card.title, "Repeated note");
+
     provider.fail_indexing.store(true, Ordering::SeqCst);
     let edited = sample_note_id(0x6b);
     let mut recovered_note = note(

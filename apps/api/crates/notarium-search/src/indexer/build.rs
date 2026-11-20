@@ -187,14 +187,9 @@ pub(super) async fn refresh_model(
     {
         return Ok(None);
     }
-    disk.resume_vectors().await?;
-    if disk.resume_reader(cx)? {
-        if disk.embedder.is_none()
-            && let Some(active) = disk.manifest.active_model.clone()
-            && disk.epoch.is_some()
-        {
-            disk.embedder = cx.services.embedder(active).await.ok().map(Arc::new);
-        }
+    let reader = disk.resume_reader(cx)?;
+    let vectors = disk.resume_vectors(cx).await?;
+    if reader || vectors {
         publisher.publish(disk);
     }
     seed(cx, disk.layout.clone(), &cutoff, Some(disk))

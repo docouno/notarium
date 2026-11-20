@@ -137,11 +137,7 @@ pub(super) async fn apply(
         disk.manifest.tantivy_commit = lexical.commit_id()?;
     }
     if disk.epoch.is_some() && (!updated_notes.is_empty() || !deleted.is_empty()) {
-        if disk.embedder.is_none()
-            && let Some(target) = disk.manifest.active_model.clone()
-        {
-            disk.embedder = cx.services.embedder(target).await.ok().map(Arc::new);
-        }
+        disk.ensure_embedder(cx).await;
         let embedder = disk.embedder.clone();
         apply_vectors(
             cx,
@@ -264,10 +260,8 @@ impl EmbeddingRepair {
             self.defer();
             return Ok(());
         }
-        if disk.embedder.is_none()
-            && let Some(target) = disk.manifest.active_model.clone()
-        {
-            disk.embedder = cx.services.embedder(target).await.ok().map(Arc::new);
+        if disk.ensure_embedder(cx).await {
+            publisher.publish(disk);
         }
         let Some(embedder) = disk.embedder.as_deref() else {
             self.defer();
