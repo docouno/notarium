@@ -63,8 +63,13 @@ type RawLookupPendingPurgeRow = (String, Vec<u8>, String, String, Vec<u8>, i64);
 pub(crate) enum RetirementRecovery {
     /// The exclusive DataRoot lock was obtained before accepting any requests.
     Startup,
-    Lease,
-    RestoredGc,
+    Online,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RetirementSelection {
+    All,
+    GcOnly,
 }
 
 pub(crate) async fn resume_pending_purges_on_startup(
@@ -130,13 +135,14 @@ impl CanonicalStore {
             // Registration restarts the drain. Standalone stores can finish purge retirements.
             if self.projection_cleanup_missing(&budget).await? {
                 return self
-                    .resume_blob_retirements(scope, epoch, RetirementRecovery::RestoredGc)
+                    .resume_blob_retirements(scope, epoch, recovery, RetirementSelection::GcOnly)
                     .await;
             }
             self.drain_pending_purges(scope, epoch, through, &budget)
                 .await?;
         }
-        self.resume_blob_retirements(scope, epoch, recovery).await
+        self.resume_blob_retirements(scope, epoch, recovery, RetirementSelection::All)
+            .await
     }
 
     async fn drain_pending_purges(
@@ -229,11 +235,12 @@ impl CanonicalStore {
         scope: &HistoryScope,
         epoch: LeaseEpoch,
         recovery: RetirementRecovery,
+        selection: RetirementSelection,
     ) -> Result<(), PortError> {
         let mut after = String::new();
         let mut permanent_failure = None;
-        let restored_gc = recovery == RetirementRecovery::RestoredGc;
-        let online_epoch = (recovery != RetirementRecovery::Startup).then_some(epoch.get() as i64);
+        let gc_only = selection == RetirementSelection::GcOnly;
+        let online_epoch = (recovery == RetirementRecovery::Online).then_some(epoch.get() as i64);
         // The retirement owner can change when a recovery adopts it. The publication's
         // creation epoch stays immutable, including across unsuccessful recovery attempts.
         const PAGE: &str = "SELECT r.retirement_id FROM blob_retirements r
@@ -259,7 +266,7 @@ impl CanonicalStore {
                                     .bind(inc)
                                     .bind(page_after)
                                     .bind(online_epoch)
-                                    .bind(restored_gc)
+                                    .bind(gc_only)
                                     .fetch_all(&mut **conn)
                                     .await
                             }
@@ -269,7 +276,7 @@ impl CanonicalStore {
                                     .bind(inc)
                                     .bind(page_after)
                                     .bind(online_epoch)
-                                    .bind(restored_gc)
+                                    .bind(gc_only)
                                     .fetch_all(&mut **conn)
                                     .await
                             }
@@ -288,11 +295,11 @@ impl CanonicalStore {
                 if let Err(error) = crate::blobs::retirement_worker::outcome(&mut attempts[0]).await
                     && error != crate::blobs::held_retirement()
                 {
-                    if !restored_gc {
+                    if !gc_only {
                         return Err(error);
                     }
                     // A retryable ID keeps its existing worker. It can wait for the
-                    // filesystem or object store without occupying a restore scan slot.
+                    // filesystem or object store while the GC scan continues.
                     if crate::blobs::retirement_worker::retry_after(&error).is_none() {
                         permanent_failure.get_or_insert(error);
                     }

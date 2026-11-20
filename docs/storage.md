@@ -37,6 +37,9 @@ local storage is used, verifies or bootstraps the schema transactionally and
 reconciles interrupted collaboration room fences. SQLite resumes pending blob
 retirements on open. If the installation has used projections, a purge that
 still requires derived cleanup stays pending until its handler is available.
+While the exclusive SQLite opener waits for that handler, it can still reclaim
+unbound S3 uploads left by the previous process, including uploads from the
+current lease epoch. Online recovery protects uploads owned by a live writer.
 If recovery fails, opening cancels its workers and releases local ownership
 before returning the error. Dropping an opening future schedules the same
 shutdown on its Tokio runtime. The DataRoot stays locked until the workers and

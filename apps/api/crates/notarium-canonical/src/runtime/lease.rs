@@ -221,7 +221,7 @@ impl CanonicalStore {
                         self.resume_pending_storage_for_space(
                             &space.scope,
                             space.active_epoch,
-                            RetirementRecovery::Lease,
+                            RetirementRecovery::Online,
                         )
                         .await?;
                     }
@@ -280,7 +280,7 @@ impl CanonicalStore {
         let mut backoff = Duration::from_millis(50);
         loop {
             let Err(error) = self
-                .resume_pending_storage_for_space(scope, epoch, RetirementRecovery::Lease)
+                .resume_pending_storage_for_space(scope, epoch, RetirementRecovery::Online)
                 .await
             else {
                 return Ok(());

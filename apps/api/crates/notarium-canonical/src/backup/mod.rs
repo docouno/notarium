@@ -3437,6 +3437,7 @@ impl BackupParticipantPort for CanonicalStore {
 // ============================================================================
 
 async fn recover_restored_gc(store: CanonicalStore, spaces: Vec<(HistoryScope, LeaseEpoch)>) {
+    use crate::domain::purge::{RetirementRecovery, RetirementSelection};
     use futures_util::StreamExt;
     futures_util::stream::iter(spaces)
         .for_each_concurrent(4, |(scope, epoch)| {
@@ -3448,7 +3449,8 @@ async fn recover_restored_gc(store: CanonicalStore, spaces: Vec<(HistoryScope, L
                         .resume_blob_retirements(
                             &scope,
                             epoch,
-                            crate::domain::purge::RetirementRecovery::RestoredGc,
+                            RetirementRecovery::Online,
+                            RetirementSelection::GcOnly,
                         )
                         .await
                     {
