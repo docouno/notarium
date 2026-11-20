@@ -213,6 +213,12 @@ async fn detached_postgres_purge_retries_missing_and_reset_generations() {
     // Restore retains the victim and its identifier in the replacement history.
     let ctx = restore(&canonical, &ctx).await;
     let scope = ctx.scope();
+    // The stopped projector left its H1 admission behind. Rebind the canonical
+    // owner in H2 before handing this epoch to the reopened writer.
+    canonical
+        .admit_projection_space(&projection_context(), scope)
+        .await
+        .unwrap();
     // The active namespace can also be absent from the SQL inventory.
     ddl(&pool, format!("DROP SCHEMA {g1} CASCADE")).await;
     let mutation = purge(&ctx, &victim.value.note);
