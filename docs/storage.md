@@ -114,6 +114,10 @@ SQLite streams the old on-disk table into the indexed destination. PostgreSQL
 backfills the new column in place, preserving the existing foreign key and
 avoiding a pending trigger event for every reference.
 Earlier versions populate the sequence while normalizing the legacy arrays.
+When opening a local database, including a restored SQLite snapshot, the runtime
+uses file-backed temporary storage during schema bootstrap. This allows large
+index-build sorts to spill to disk. After bootstrap commits, the serving writer
+returns to in-memory temporary storage.
 Stop preceding-version PostgreSQL writers before upgrading. Bootstrap installs
 the data, indexes and schema witness in one transaction.
 
@@ -126,6 +130,8 @@ a time and stores one indexed row per distinct target and entry, retaining
 the first occurrence's ordinal. Projection readers page through those keys
 and validate each source entry and target before returning its backlink.
 Startup copies the live anchor rows under the migration fence in one transaction.
+PostgreSQL copies Space markers and placements in primary-key pages of 1,024
+rows so foreign-key trigger memory stays bounded during the upgrade.
 
 The canonical store implements `ControlCatalogPort`. Account provisioning and
 lifecycle changes store a compact receipt keyed by owner, actor and command key

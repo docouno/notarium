@@ -642,6 +642,15 @@ async fn l7_projection_refs_sqlite_covering_pages_and_erasure() {
         .await
         .unwrap();
     write_v6_chats!(old, legacy);
+    // Observe the connection that upgrades the file through CanonicalRuntime::open.
+    sqlx::raw_sql(
+        "CREATE TRIGGER check_v6_sort_mode BEFORE UPDATE OF schema_version ON schema_meta
+         WHEN OLD.schema_version=6 AND (SELECT temp_store FROM pragma_temp_store) <> 1
+         BEGIN SELECT RAISE(ABORT,'expected file-backed bootstrap sorts'); END",
+    )
+    .execute(&mut old)
+    .await
+    .unwrap();
     drop(old);
 
     let (store, runtime) = CanonicalRuntime::open(config.clone()).await.unwrap();
@@ -673,13 +682,21 @@ async fn l7_projection_refs_sqlite_covering_pages_and_erasure() {
     .execute(&mut old)
     .await
     .unwrap();
-    sqlx::raw_sql("PRAGMA temp_store=MEMORY; PRAGMA temp.max_page_count=8")
+    sqlx::raw_sql("PRAGMA temp_store=MEMORY; PRAGMA temp.max_page_count=8;
+                   CREATE TEMP TABLE caller_state(value INTEGER); INSERT INTO caller_state VALUES(7)")
         .execute(&mut old)
         .await
         .unwrap();
     notarium_canonical::schema::bootstrap_sqlite_schema(&mut old, &sample_installation_id(0x93))
         .await
         .unwrap();
+    let caller_state: (i64, i64) = sqlx::query_as(
+        "SELECT value,(SELECT temp_store FROM pragma_temp_store) FROM temp.caller_state",
+    )
+    .fetch_one(&mut old)
+    .await
+    .unwrap();
+    assert_eq!(caller_state, (7, 2));
     let copies: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM chat_entry_note_refs r JOIN chat_entries e
             USING (space_id,thread_id,entry_seq,created_space_seq)

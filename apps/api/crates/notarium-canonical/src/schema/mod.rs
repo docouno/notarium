@@ -66,7 +66,11 @@ pub fn split_sql_statements(script: &str) -> Vec<String> {
     statements
 }
 
-/// Initializes or validates the SQLite canonical baseline schema inside an exclusive transaction.
+/// Initializes or validates the SQLite canonical baseline schema inside a write transaction.
+///
+/// The caller owns the connection's temporary storage mode and TEMP objects.
+/// To let large index sorts spill to disk, set `PRAGMA temp_store = FILE` on a
+/// fresh connection before creating any TEMP objects or starting a transaction.
 pub async fn bootstrap_sqlite_schema(
     conn: &mut SqliteConnection,
     expected_installation: &InstallationId,

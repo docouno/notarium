@@ -443,6 +443,18 @@ async fn l6_v6_rank_anchor_is_atomic_survives_restore_and_is_erased_by_purge() {
                 .execute(&mut db)
                 .await
                 .unwrap();
+            // Span multiple source-key pages. The original view sorts first.
+            sqlx::query(
+                "INSERT INTO view_rank_overlays
+                 SELECT space_id,view_note_id,'v_f'||lpad(to_hex(i),31,'0'),target_note_id,
+                        group_key_msgpack,group_key_hex,sort_rank_lexo,rank_rev_id,
+                        placement_revision,placement_actor_id,placement_run_id,updated_seq
+                 FROM view_rank_overlays CROSS JOIN generate_series(1,2048) i WHERE space_id=$1",
+            )
+            .bind(scope.space_id.as_str())
+            .execute(&mut db)
+            .await
+            .unwrap();
             set_height!(db, invalid_height);
             assert!(CanonicalRuntime::open(config.clone()).await.is_err());
             assert!(
@@ -507,7 +519,18 @@ async fn l6_v6_rank_anchor_is_atomic_survives_restore_and_is_erased_by_purge() {
             .read_projection_overlays_page(&projection, &scope, height, None, page)
             .await
             .unwrap();
-        assert_eq!(snapshot.rows.len(), 1);
+        let expected_placements = if postgres { 2049 } else { 1 };
+        assert_eq!(snapshot.rows.len(), expected_placements.min(10));
+        assert_eq!(
+            store
+                .execute_diagnostic_read_sql_for_test(
+                    None,
+                    "SELECT COUNT(*) FROM projection_rank_anchor_rows",
+                )
+                .await
+                .unwrap(),
+            expected_placements as i64
+        );
         assert_eq!(snapshot.rows[0].metadata.target_note_id, surviving);
         assert_eq!(Some(&snapshot.rows[0].revision_id), retained_rank.as_ref());
         assert_eq!(store.execute_diagnostic_read_sql_for_test(None, &format!(

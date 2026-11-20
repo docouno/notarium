@@ -2,6 +2,7 @@
 //! must identify the exact schema this migration understands.
 mod chat_refs;
 mod compactions;
+mod rank_anchors;
 
 use super::{POSTGRES_BASELINE_DDL, SQLITE_BASELINE_DDL, split_sql_statements};
 use crate::codec::internal_not_committed;
@@ -105,15 +106,6 @@ const PROJECTION_RANK_DDL: [&str; 7] = [
     "CREATE INDEX IF NOT EXISTS idx_folder_aliases_projection_seq",
     "CREATE INDEX IF NOT EXISTS idx_note_aliases_projection_seq",
 ];
-const COPY_RANK_ANCHOR_MARKERS: &str = "INSERT INTO projection_rank_anchors
-    (space_id, history_incarnation, anchor_seq)
-    SELECT space_id, history_incarnation, last_seq FROM spaces";
-const COPY_RANK_ANCHOR_ROWS: &str = "INSERT INTO projection_rank_anchor_rows
-    (space_id, view_note_id, view_key, target_note_id, group_key_msgpack, group_key_hex,
-     sort_rank_lexo, rank_rev_id, placement_revision, placement_actor_id, placement_run_id, updated_seq)
-    SELECT space_id, view_note_id, view_key, target_note_id, group_key_msgpack, group_key_hex,
-           sort_rank_lexo, rank_rev_id, placement_revision, placement_actor_id, placement_run_id, updated_seq
-    FROM view_rank_overlays";
 const CHECK_RANK_ANCHOR: &str = "SELECT
     (SELECT COUNT(*) FROM projection_rank_anchors) = (SELECT COUNT(*) FROM spaces)
     AND (SELECT COUNT(*) FROM projection_rank_anchor_rows) = (SELECT COUNT(*) FROM view_rank_overlays)
@@ -291,9 +283,8 @@ macro_rules! upgrade {
                 }
                 // Capture actual overlays without advancing SpaceSeq or reviving a placement
                 // deleted before rank tombstones were available.
-                for sql in [COPY_RANK_ANCHOR_MARKERS, COPY_RANK_ANCHOR_ROWS] {
-                    sqlx::query(sql).execute(&mut *conn).await.map_err(rank_error)?;
-                }
+                rank_anchors::copy(&mut crate::sql_exec::BackendConn::$variant(conn))
+                    .await.map_err(rank_error)?;
                 if !sqlx::query_scalar::<_, bool>(CHECK_RANK_ANCHOR)
                     .fetch_one(&mut *conn).await.map_err(rank_error)?
                 {
