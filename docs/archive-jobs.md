@@ -78,10 +78,12 @@ workers own the physical operation and recover durable work after interruption.
 ## Backup, verification and restore
 
 - `run_backup` takes the paired canonical and control cut while both writers are
-  paused. It resumes writes before materializing the database spools and CAS
-  bytes. Each phase owner confirms resource cleanup on close, including during
-  shutdown. A missing PostgreSQL rollback acknowledgement ends the operation
-  with an error. The ZIP64 archive contains `manifest.json`, `db/control`, `db/canonical`,
+  paused. The Canonical preparation task coordinates both pins and resumes with
+  the Control worker. Both writers acknowledge resume before materialization
+  of the database spools and CAS bytes. Each owner confirms resource cleanup on
+  close, including during shutdown. A missing PostgreSQL rollback acknowledgement
+  ends the operation with an error. The ZIP64 archive contains `manifest.json`,
+  `db/control`, `db/canonical`,
   `cas/index` and `cas/data`. Keep the external keyring separately. The archive
   contains encrypted canary witnesses and credential envelopes. Before publishing,
   backup checks that retained CAS counts match actual owners and that the decoded
@@ -141,7 +143,8 @@ rotated across the participating Spaces.
 It reports the wait before pausing, confirmed pause, pause including drain, and
 complete backup latency for 1 and 64 Spaces. The confirmed timer starts when
 Control acknowledges its safe point. The inclusive pause timer starts with the
-first pause request. Select `NOTARIUM_ARCHIVE_BENCH_TIER=high` or `medium` on the
+first pause request. Both stop after the two resume acknowledgements. Select
+`NOTARIUM_ARCHIVE_BENCH_TIER=high` or `medium` on the
 matching hardware from [Storage performance](storage-performance.md) to apply
 the corresponding p95 threshold.
 

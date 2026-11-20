@@ -3,13 +3,14 @@
 
 use super::{
     BackupBudget, BackupHold, BackupSnapshot, BackupSpool, BackupWitness, Cancellation,
-    CanonicalInner, CanonicalStore, PausedBackup, PortError, PortFuture, PreparedBackup,
-    cancelled_not_committed,
+    CanonicalInner, CanonicalPreparedBackup, CanonicalStore, PausedBackup, PortError, PortFuture,
+    PreparedBackup, cancelled_not_committed,
 };
-use notarium_core::ports::TemporaryBackupSpool;
+use notarium_core::ports::{CallBudget, TemporaryBackupSpool};
 use std::{
     future::Future,
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -111,12 +112,183 @@ where
     Ok(())
 }
 
+/// Prepared Canonical participant for a paired cut. The store executor owns the
+/// preparation and settles any admitted capture after the caller drops it.
+pub struct BackupPreparation(Phase<CanonicalPreparedBackup>);
+
+#[derive(Clone, Copy, Debug)]
+pub struct PairedPause {
+    /// From the Control safe-point acknowledgement through both resume acknowledgements.
+    pub confirmed: Duration,
+    /// From the first pause request through both resume acknowledgements.
+    pub including_drain: Duration,
+    /// Time spent checking for a gap in Canonical writes before the first pause request.
+    pub writer_wait: Duration,
+}
+
+/// Both snapshots are pinned and both writer resumes have been acknowledged.
+pub struct PairedBackupCut {
+    pub control: Box<dyn BackupSnapshot>,
+    pub canonical: Box<dyn BackupSnapshot>,
+    pub pause: PairedPause,
+}
+
+impl PairedBackupCut {
+    async fn close(self) -> Result<(), PortError> {
+        let (control, canonical) = tokio::join!(self.control.close(), self.canonical.close());
+        control.and(canonical)
+    }
+}
+
+impl BackupPreparation {
+    pub fn acquire_hold(&mut self) -> PortFuture<'_, Box<dyn BackupHold>> {
+        self.0.acquire_hold()
+    }
+
+    pub fn abort(self) -> PortFuture<'static, ()> {
+        self.0.finish()
+    }
+
+    pub(super) fn into_port(self) -> Box<dyn PreparedBackup> {
+        Box::new(self.0)
+    }
+
+    /// Capture with the prepared Control participant after both holds are acquired.
+    /// The two participants and this call share the operation's cancellation budget.
+    pub fn capture_paired(
+        &mut self,
+        control: Box<dyn PreparedBackup>,
+        mut budget: CallBudget,
+    ) -> PortFuture<'_, PairedBackupCut> {
+        let requested = Instant::now();
+        let pending = Arc::new(Mutex::new(Some(control)));
+        let offered = pending.clone();
+        let capture = self.0.with(
+            move |canonical| {
+                let control = offered
+                    .lock()
+                    .expect("backup handoff")
+                    .take()
+                    .expect("Control preparation");
+                budget.remaining = budget.remaining.saturating_sub(requested.elapsed());
+                Box::pin(capture_on_owner(canonical, control, budget))
+            },
+            PairedBackupCut::close,
+        );
+        Box::pin(async move {
+            let result = capture.await;
+            if result.is_err() {
+                // A closed queue can reject the capture before the owner takes Control.
+                let unadmitted = pending.lock().expect("backup handoff").take();
+                if let Some(control) = unadmitted {
+                    let _ = control.abort().await;
+                }
+            }
+            result
+        })
+    }
+}
+
+async fn capture_on_owner(
+    canonical: &mut CanonicalPreparedBackup,
+    mut control: Box<dyn PreparedBackup>,
+    budget: CallBudget,
+) -> Result<PairedBackupCut, PortError> {
+    let cancel = canonical.caller_cancel.token.clone();
+    let shutdown = canonical.store.inner.backup_shutdown.clone();
+    let cancelled = async {
+        tokio::select! {
+            () = cancel.cancelled() => {},
+            () = shutdown.cancelled() => {},
+        }
+    };
+    let result = {
+        let capture = pin_pair(canonical, &mut *control, &budget);
+        tokio::pin!(capture);
+        tokio::select! {
+            biased;
+            () = cancelled => {
+                budget.cancellation.cancel();
+                capture.await
+            }
+            result = &mut capture => result,
+        }
+    };
+    if result.is_err() {
+        let _ = control.abort().await;
+    }
+    result
+}
+
+async fn pin_pair(
+    canonical: &mut CanonicalPreparedBackup,
+    control: &mut dyn PreparedBackup,
+    budget: &CallBudget,
+) -> Result<PairedBackupCut, PortError> {
+    let wait_started = Instant::now();
+    canonical.store.wait_for_backup_write_gap(budget).await?;
+    let first_pause = Instant::now();
+    let mut control_paused = control.pause_writes().await?;
+    let confirmed = Instant::now();
+    let mut canonical_paused = match canonical.pause_owned().await {
+        Ok(paused) => Box::new(paused),
+        Err(error) => {
+            let _ = control_paused.resume().await;
+            return Err(error);
+        }
+    };
+    let (control, canonical) = tokio::join!(
+        pin_cut(&mut *control_paused, &budget.cancellation),
+        pin_cut(&mut *canonical_paused, &budget.cancellation),
+    );
+    let (control_resume, canonical_resume) =
+        tokio::join!(control_paused.resume(), canonical_paused.resume());
+    let resumed = Instant::now();
+    let pause = PairedPause {
+        confirmed: resumed.duration_since(confirmed),
+        including_drain: resumed.duration_since(first_pause),
+        writer_wait: first_pause.duration_since(wait_started),
+    };
+    let cuts = match (control, canonical) {
+        (Ok(control), Ok(canonical)) => PairedBackupCut {
+            control,
+            canonical,
+            pause,
+        },
+        (Err(error), Ok(canonical)) => {
+            let _ = canonical.close().await;
+            return Err(error);
+        }
+        (Ok(control), Err(error)) => {
+            let _ = control.close().await;
+            return Err(error);
+        }
+        (Err(PortError::Cancelled(_)), Err(error)) | (Err(error), Err(_)) => return Err(error),
+    };
+    if let Err(error) = control_resume.and(canonical_resume) {
+        let _ = cuts.close().await;
+        return Err(error);
+    }
+    Ok(cuts)
+}
+
+async fn pin_cut(
+    paused: &mut dyn PausedBackup,
+    cancellation: &Cancellation,
+) -> Result<Box<dyn BackupSnapshot>, PortError> {
+    let result = paused.open_cut().await;
+    if result.is_err() {
+        cancellation.cancel();
+    }
+    result
+}
+
 pub(super) fn prepare(
     store: CanonicalStore,
     mut ctx: super::MaintenanceContext,
     backup: super::BackupId,
     budget: BackupBudget,
-) -> PortFuture<'static, Box<dyn PreparedBackup>> {
+) -> PortFuture<'static, BackupPreparation> {
     Box::pin(async move {
         let (mut reply, result) = oneshot::channel();
         let inner = store.inner.clone();
@@ -137,13 +309,18 @@ pub(super) fn prepare(
                 },
             };
             let handle = match prepared {
-                Ok(raw) => Phase::new(&store.inner, raw, cancellation, PreparedBackup::abort)
-                    .await
-                    .map(|phase| Box::new(phase) as Box<dyn PreparedBackup>),
+                Ok(raw) => Phase::new(
+                    &store.inner,
+                    raw,
+                    cancellation,
+                    CanonicalPreparedBackup::abort,
+                )
+                .await
+                .map(BackupPreparation),
                 Err(error) => Err(error),
             };
             let shutdown = &store.inner.backup_shutdown;
-            let _ = deliver(reply, handle, shutdown, |phase| phase.abort()).await;
+            let _ = deliver(reply, handle, shutdown, BackupPreparation::abort).await;
         })
         .map_err(|()| closed())?;
         result.await.map_err(|_| closed())??.claim()
@@ -243,17 +420,29 @@ impl<T: Send + 'static> Phase<T> {
     }
 }
 
-impl PreparedBackup for Phase<super::CanonicalPreparedBackup> {
+impl PreparedBackup for Phase<CanonicalPreparedBackup> {
     fn abort(self: Box<Self>) -> PortFuture<'static, ()> {
         self.finish()
     }
 
     fn acquire_hold(&mut self) -> PortFuture<'_, Box<dyn BackupHold>> {
-        self.with(PreparedBackup::acquire_hold, |hold| hold.release())
+        self.with(CanonicalPreparedBackup::acquire_hold, |hold| hold.release())
     }
 
     fn pause_writes(&mut self) -> PortFuture<'_, Box<dyn PausedBackup>> {
-        self.with(PreparedBackup::pause_writes, |pause| pause.resume())
+        self.with(
+            |prepared| {
+                Box::pin(async {
+                    let paused = prepared.pause_owned().await?;
+                    let inner = paused.store.inner.clone();
+                    let cancellation = paused.caller_cancel.token.clone();
+                    Phase::new(&inner, paused, cancellation, PausedBackup::resume)
+                        .await
+                        .map(|phase| Box::new(phase) as Box<dyn PausedBackup>)
+                })
+            },
+            |pause| pause.resume(),
+        )
     }
 }
 
@@ -326,6 +515,61 @@ impl BackupSnapshot for Snapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use notarium_core::ids::RequestId;
+
+    struct ControlPreparation {
+        started: oneshot::Sender<()>,
+        release: oneshot::Receiver<()>,
+    }
+
+    impl PreparedBackup for ControlPreparation {
+        fn acquire_hold(&mut self) -> PortFuture<'_, Box<dyn BackupHold>> {
+            unreachable!("the Control hold was already acquired")
+        }
+
+        fn pause_writes(&mut self) -> PortFuture<'_, Box<dyn PausedBackup>> {
+            unreachable!("the closed Canonical queue rejects the capture")
+        }
+
+        fn abort(self: Box<Self>) -> PortFuture<'static, ()> {
+            Box::pin(async move {
+                self.started.send(()).unwrap();
+                self.release.await.unwrap();
+                Ok(())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_pair_waits_for_control_preparation_cleanup() {
+        let (commands, receiver) = mpsc::channel(1);
+        drop(receiver);
+        let (_done, finished) = oneshot::channel();
+        let mut prepared = BackupPreparation(Phase {
+            commands,
+            finished,
+            cancellation: Cancellation::default(),
+            shutdown: Cancellation::default(),
+        });
+        let (started, observed) = oneshot::channel();
+        let (release, wait) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let control = Box::new(ControlPreparation {
+                started,
+                release: wait,
+            });
+            let budget = CallBudget {
+                request: RequestId::from_bytes([1; 16]),
+                remaining: Duration::from_secs(1),
+                cancellation: Cancellation::default(),
+            };
+            prepared.capture_paired(control, budget).await.err()
+        });
+        observed.await.unwrap();
+        assert!(!task.is_finished());
+        release.send(()).unwrap();
+        assert_eq!(task.await.unwrap(), Some(closed()));
+    }
 
     #[tokio::test]
     async fn an_unclaimed_reply_waits_for_resource_disposal() {

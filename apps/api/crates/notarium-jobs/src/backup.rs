@@ -4,13 +4,14 @@ use std::{
     io::{BufWriter, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use bytes::Bytes;
+pub use notarium_canonical::backup::PairedPause;
 use notarium_canonical::{
     CanonicalStore,
-    backup::{PostgresSpoolValue, scan_postgres_spool_v1},
+    backup::{BackupPreparation, PairedBackupCut, PostgresSpoolValue, scan_postgres_spool_v1},
     codec,
 };
 use notarium_control::backup::ControlBackup;
@@ -71,13 +72,6 @@ impl BackupOptions {
         }
         Ok(())
     }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct PairedPause {
-    pub confirmed: Duration,
-    pub including_drain: Duration,
-    pub writer_wait: Duration,
 }
 
 #[derive(Clone, Debug)]
@@ -320,7 +314,7 @@ pub(crate) async fn capture_pair(
     let preparations = join_phases(
         &cancel,
         control.prepare(ctx.clone(), id.clone(), cb),
-        canonical.prepare(ctx.clone(), id.clone(), nb),
+        canonical.prepare_paired_backup(ctx.clone(), id.clone(), nb),
     )
     .await;
     let (mut ctrl, mut canon) =
@@ -340,16 +334,8 @@ pub(crate) async fn capture_pair(
         .min(nb.deadline)
         .saturating_sub(started.elapsed());
     let captured = async {
-        let (control_spool, canonical_spool, pause) = capture_spools(
-            &ctx,
-            canonical,
-            &mut *ctrl,
-            &mut *canon,
-            held_histories,
-            cb,
-            nb,
-        )
-        .await?;
+        let (control_spool, canonical_spool, pause) =
+            capture_spools(&ctx, canonical, ctrl, &mut canon, held_histories, cb, nb).await?;
         if control_spool.receipt().kind != canonical_spool.receipt().kind
             || control_spool.receipt().witness.installation
                 != canonical_spool.receipt().witness.installation
@@ -377,7 +363,6 @@ pub(crate) async fn capture_pair(
         Ok(pair) => pair,
         Err(error) => {
             let _ = tokio::join!(
-                ctrl.abort(),
                 canon.abort(),
                 control_hold.release(),
                 canonical_hold.release(),
@@ -466,42 +451,18 @@ where
 async fn capture_spools(
     ctx: &MaintenanceContext,
     canonical: &CanonicalStore,
-    ctrl: &mut dyn PreparedBackup,
-    canon: &mut dyn PreparedBackup,
+    ctrl: Box<dyn PreparedBackup>,
+    canon: &mut BackupPreparation,
     held_histories: &[ChangeCursor],
     cb: notarium_core::ports::BackupBudget,
     nb: notarium_core::ports::BackupBudget,
 ) -> Result<(TemporaryBackupSpool, TemporaryBackupSpool, PairedPause), PortError> {
-    let wait_started = Instant::now();
-    canonical.wait_for_backup_write_gap(&ctx.budget).await?;
-    let inclusive = Instant::now();
-    let mut control_paused = ctrl.pause_writes().await?;
-    let confirmed = Instant::now();
-    let mut canonical_paused = match canon.pause_writes().await {
-        Ok(paused) => paused,
-        Err(error) => {
-            let _ = control_paused.resume().await;
-            return Err(error);
-        }
-    };
-    let cuts = join_phases(
-        &ctx.budget.cancellation,
-        control_paused.open_cut(),
-        canonical_paused.open_cut(),
-    )
-    .await;
-    let (control_resume, canonical_resume) =
-        tokio::join!(control_paused.resume(), canonical_paused.resume(),);
-    let pause = PairedPause {
-        confirmed: confirmed.elapsed(),
-        including_drain: inclusive.elapsed(),
-        writer_wait: inclusive.duration_since(wait_started),
-    };
-    let (mut control_cut, mut canonical_cut) =
-        acknowledge_pair(cuts, |cut| cut.close(), |cut| cut.close()).await?;
+    let PairedBackupCut {
+        control: mut control_cut,
+        canonical: mut canonical_cut,
+        pause,
+    } = canon.capture_paired(ctrl, ctx.budget.clone()).await?;
     let result = async {
-        control_resume?;
-        canonical_resume?;
         if control_cut.witness().installation != *canonical.installation_id()
             || canonical_cut.witness().installation != *canonical.installation_id()
             || !control_cut.witness().histories.is_empty()
@@ -847,6 +808,7 @@ fn sqlite_error(error: rusqlite::Error) -> PortError {
 #[cfg(test)]
 mod phase_tests {
     use super::*;
+    use std::time::Duration;
 
     #[tokio::test]
     async fn a_cancelled_waiter_leaves_capacity_and_the_lease_with_its_worker() {

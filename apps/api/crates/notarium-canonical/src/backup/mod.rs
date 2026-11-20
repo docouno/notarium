@@ -4,6 +4,7 @@ mod ownership;
 mod phase;
 mod restore;
 use ownership::{ArtifactLease, HoldOwnership, HoldWriteBudget};
+pub use phase::{BackupPreparation, PairedBackupCut, PairedPause};
 
 use std::{
     fs::{self, File, OpenOptions},
@@ -3363,7 +3364,7 @@ impl CanonicalStore {
     }
 }
 
-impl PreparedBackup for CanonicalPreparedBackup {
+impl CanonicalPreparedBackup {
     fn abort(mut self: Box<Self>) -> PortFuture<'static, ()> {
         Box::pin(async move {
             let source = match self.driver.take() {
@@ -3399,7 +3400,7 @@ impl PreparedBackup for CanonicalPreparedBackup {
         })
     }
 
-    fn pause_writes(&mut self) -> PortFuture<'_, Box<dyn PausedBackup>> {
+    fn pause_owned(&mut self) -> PortFuture<'_, CanonicalPausedBackup> {
         Box::pin(async move {
             let (hold, _) = self
                 .held_histories
@@ -3488,7 +3489,7 @@ impl PreparedBackup for CanonicalPreparedBackup {
                 }
                 Ok(())
             });
-            let paused = CanonicalPausedBackup {
+            Ok(CanonicalPausedBackup {
                 store: self.store.clone(),
                 backup_id: self.backup_id.clone(),
                 artifact_id: self.artifact_id.clone(),
@@ -3502,15 +3503,7 @@ impl PreparedBackup for CanonicalPreparedBackup {
                 held_histories: self.held_histories.take(),
                 unpinned_driver: Some(drv),
                 cleanup_failure: None,
-            };
-            let phase = phase::Phase::new(
-                &self.store.inner,
-                paused,
-                self.caller_cancel.token.clone(),
-                PausedBackup::resume,
-            )
-            .await?;
-            Ok(Box::new(phase) as Box<dyn PausedBackup>)
+            })
         })
     }
 }
@@ -3698,6 +3691,18 @@ impl CanonicalStore {
     }
 }
 
+impl CanonicalStore {
+    /// Prepare the Canonical participant for a paired Control and Canonical capture.
+    pub fn prepare_paired_backup(
+        &self,
+        ctx: MaintenanceContext,
+        backup: BackupId,
+        budget: BackupBudget,
+    ) -> PortFuture<'static, BackupPreparation> {
+        phase::prepare(self.clone(), ctx, backup, budget)
+    }
+}
+
 impl BackupParticipantPort for CanonicalStore {
     fn prepare(
         &self,
@@ -3705,7 +3710,8 @@ impl BackupParticipantPort for CanonicalStore {
         backup: BackupId,
         budget: BackupBudget,
     ) -> PortFuture<'_, Box<dyn PreparedBackup>> {
-        phase::prepare(self.clone(), ctx, backup, budget)
+        let prepared = self.prepare_paired_backup(ctx, backup, budget);
+        Box::pin(async move { prepared.await.map(BackupPreparation::into_port) })
     }
 
     fn restore_cursors(
