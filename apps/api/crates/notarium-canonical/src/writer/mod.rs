@@ -1140,7 +1140,6 @@ impl crate::CanonicalStore {
         Ok(self.inner.writer()?.has_active_sqlite_ops())
     }
 
-    #[cfg(feature = "test-support")]
     /// Observes admitted writes for up to 20 ms while both writer gates remain open.
     /// This is a scheduling hint. The paired pause still acquires both safe points.
     pub async fn wait_for_backup_write_gap(&self, budget: &CallBudget) -> Result<(), PortError> {
@@ -1164,6 +1163,7 @@ impl crate::CanonicalStore {
         Ok(())
     }
 
+    #[cfg(feature = "test-support")]
     pub async fn acquire_writer_safe_point(&self) -> Result<WriterSafePointGuard, PortError> {
         Ok(self.inner.writer()?.acquire_safe_point().await)
     }
