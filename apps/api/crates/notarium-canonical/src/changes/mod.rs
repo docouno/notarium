@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap},
     sync::{
-        Mutex as StdMutex,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -260,11 +260,78 @@ pub fn build_effect_payload_draft(
     })
 }
 
+/// Scope of note-level visibility affected by a committed batch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CommittedTargets {
+    /// Only the listed notes changed, with no folder, Space, or ACL changes.
+    Notes(Arc<[NoteId]>),
+    /// Folder hierarchy, Space lifecycle, or a large batch changed.
+    All,
+}
+
+impl CommittedTargets {
+    pub fn affects(&self, note: &NoteId) -> bool {
+        match self {
+            Self::All => true,
+            Self::Notes(notes) => notes.iter().any(|n| n == note),
+        }
+    }
+}
+
+/// Accumulates note-only targets for one Space within a write batch, upgrading
+/// conservatively to `CommittedTargets::All` on any non-note event or >16 notes.
 #[derive(Clone, Debug)]
-pub(crate) enum BroadcastSignal {
+pub(crate) enum CommittedTargetAcc {
+    Notes(Vec<NoteId>),
+    All,
+}
+
+impl Default for CommittedTargetAcc {
+    fn default() -> Self {
+        Self::Notes(Vec::new())
+    }
+}
+
+impl CommittedTargetAcc {
+    pub(crate) fn record_events(&mut self, events: &[crate::writer::BatchEventDraft]) {
+        const MAX_INLINE_NOTES: usize = 16;
+        for event in events {
+            let Self::Notes(notes) = self else { return };
+            if event.entity_type != "note" {
+                *self = Self::All;
+                return;
+            }
+            let Ok(note_id) = NoteId::parse(&event.entity_id) else {
+                *self = Self::All;
+                return;
+            };
+            if !notes.contains(&note_id) {
+                if notes.len() >= MAX_INLINE_NOTES {
+                    *self = Self::All;
+                    return;
+                }
+                notes.push(note_id);
+            }
+        }
+    }
+
+    pub(crate) fn to_targets(&self) -> CommittedTargets {
+        match self {
+            Self::All => CommittedTargets::All,
+            Self::Notes(notes) if notes.is_empty() => CommittedTargets::All,
+            Self::Notes(notes) => CommittedTargets::Notes(Arc::from(notes.as_slice())),
+        }
+    }
+}
+
+/// In-process notification to refresh canonical Space state. Consumers read
+/// current authority and metadata from the store after receiving a signal.
+#[derive(Clone, Debug)]
+pub enum BroadcastSignal {
     Committed {
         scope: HistoryScope,
         new_last_seq: SpaceSeq,
+        targets: CommittedTargets,
     },
     Purged {
         scope: HistoryScope,
@@ -275,6 +342,16 @@ pub(crate) enum BroadcastSignal {
         new_scope: HistoryScope,
         ceiling: SpaceSeq,
     },
+    WriterLeaseChanged {
+        scope: HistoryScope,
+    },
+}
+
+impl CanonicalStore {
+    /// Observes canonical Space changes without registering a change-feed cursor.
+    pub fn subscribe_space_signals(&self) -> broadcast::Receiver<BroadcastSignal> {
+        self.inner.broadcast_hub.subscribe_raw()
+    }
 }
 
 pub(crate) struct BroadcastHub {
@@ -493,6 +570,7 @@ impl ChangeSubscription for CanonicalChangeSubscription {
                     Ok(BroadcastSignal::Committed {
                         scope,
                         new_last_seq,
+                        ..
                     }) => {
                         if scope.space_id != self.processed.scope.space_id {
                             continue;
@@ -508,6 +586,7 @@ impl ChangeSubscription for CanonicalChangeSubscription {
                             })));
                         }
                     }
+                    Ok(BroadcastSignal::WriterLeaseChanged { .. }) => {}
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         return self.durable_notice(true).await;
                     }

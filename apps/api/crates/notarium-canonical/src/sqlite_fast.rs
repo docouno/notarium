@@ -19,8 +19,8 @@ use notarium_core::{
     },
     model::{HistoryScope, Lifecycle, NoteRef, PathTarget},
     ports::{
-        CallBudget, CommandSeqRange, CreateNote, GetNote, NoteRevision, NoteSnapshot,
-        Preconditions, RollbackAgentRun, SpaceContext,
+        CallBudget, ClosedRoomReservation, CommandSeqRange, CreateNote, GetNote, NoteRevision,
+        NoteSnapshot, Preconditions, RollbackAgentRun, SpaceContext,
     },
     query::{FieldObservation, FieldSchema, FieldValue},
     receipt::{CausalBasis, CommandIdentity, MutationReceiptToken},
@@ -489,7 +489,7 @@ pub(crate) async fn edit_note_phase1_sqlite_local(
     let prec = preconditions.clone();
     let idemp_cl = idemp.clone();
     let wal_for_err = Arc::clone(wal);
-    let writer_gen_before = store.inner.sqlite_writer_commit_gen.load(Ordering::Acquire);
+    let writer_gen_before = store.sqlite_commit_generation();
     let has_any_purge_fences = store
         .inner
         .sqlite_has_any_purge_fences
@@ -585,7 +585,7 @@ pub(crate) async fn edit_note_phase1_sqlite_local(
                 base_anc: Some(anc),
                 base_digest,
                 base_read,
-                phase1_receipt_checked_gen: Some(writer_gen_before),
+                phase1_receipt_checked_gen: writer_gen_before,
             })
         })
         .await?;
@@ -989,6 +989,7 @@ pub(crate) enum FastItemExecError {
 #[derive(Default)]
 pub(crate) struct FastBatchSqlCache {
     current_writer_gen: u64,
+    batch_committed: Arc<AtomicBool>,
     folder_ancestry: HashMap<(SpaceId, FolderId, bool), FolderAncestryFacts>,
     space_schemas: HashMap<SpaceId, Option<Arc<CurrentSpaceSchema>>>,
     space_has_purge_fences: HashMap<SpaceId, bool>,
@@ -1530,6 +1531,14 @@ pub(crate) trait SqliteSyncItemPlan: Send {
         false
     }
 
+    fn is_unsequenced_room_wal(&self) -> bool {
+        false
+    }
+
+    fn replay_safe(&self) -> bool {
+        false
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn execute_sqlite_sync(
         &self,
@@ -1557,6 +1566,7 @@ struct FastBatchPendingWaves {
     batch_dir_syncs: PendingDirSyncs,
     batch_retained_tickets: Vec<StagedBlobTicket>,
     batch_retained_guards: Vec<Box<dyn Send>>,
+    batch_committed: Arc<AtomicBool>,
     slots: Vec<ItemOutcomeSlot>,
 }
 
@@ -1633,6 +1643,7 @@ pub(crate) async fn execute_sqlite_fast_batch(
 
     let has_external_stagings = !extracted_stagings.is_empty();
     let wal_stage1 = wal_opt.clone();
+    let inner_stage1 = Arc::clone(&store.inner);
     let current_writer_gen = store.inner.sqlite_writer_commit_gen.load(Ordering::Acquire);
 
     let (wave_approval_tx, wave_approval_rx) = tokio::sync::oneshot::channel::<EarlyWaveApproval>();
@@ -1644,6 +1655,7 @@ pub(crate) async fn execute_sqlite_fast_batch(
             fast_items,
             cfg,
             wal_stage1.as_deref(),
+            &inner_stage1,
             has_external_stagings,
             current_writer_gen,
             &mut approval_tx_opt,
@@ -1755,10 +1767,6 @@ pub(crate) async fn execute_sqlite_fast_batch(
             store
                 .cleanup_unretained_local_files_async(cleanup_all_published(local_cas_res))
                 .await;
-            store
-                .inner
-                .sqlite_writer_commit_gen
-                .fetch_add(1, Ordering::Release);
             restore_writer_rconn(pair, rconn);
             BatchExecOutcome::UnknownCommit { slots, diag_reason }
         }
@@ -1768,10 +1776,6 @@ pub(crate) async fn execute_sqlite_fast_batch(
             wal_frames,
         } => {
             drop(local_cas_res);
-            store
-                .inner
-                .sqlite_writer_commit_gen
-                .fetch_add(1, Ordering::Release);
             if let Some(w) = wal_opt.as_deref() {
                 w.note_writer_commit_with_frames(wal_frames);
             }
@@ -1840,16 +1844,19 @@ pub(crate) async fn execute_sqlite_fast_batch(
                     store
                         .inner
                         .sqlite_writer_commit_gen
-                        .fetch_add(1, Ordering::Release);
+                        .fetch_add(2, Ordering::Release);
                     drop(pending.batch_retained_tickets);
                     drop(pending.batch_retained_guards);
                     BatchExecOutcome::AbortedBeforeCommit(io_err)
                 }
                 Ok(()) => {
                     let wal_stage2 = wal_opt.clone();
+                    let inner_stage2 = Arc::clone(&store.inner);
                     let commit_join = tokio::task::spawn_blocking(move || {
                         let _ = crate::wal::take_last_wal_commit_frames();
+                        let commit_seq = crate::runtime::SqliteCommitSeqGuard::begin(&inner_stage2);
                         let res = rconn.execute_batch("COMMIT");
+                        commit_seq.finish();
                         let frames = crate::wal::take_last_wal_commit_frames();
                         if let Err(ref err) = res
                             && let Some(w) = wal_stage2.as_deref()
@@ -1867,6 +1874,16 @@ pub(crate) async fn execute_sqlite_fast_batch(
                             (res.map_err(|e| format!("{e:?}")), frames)
                         }
                         Err(join_err) => {
+                            if !store
+                                .inner
+                                .sqlite_commit_drain_needed
+                                .load(Ordering::Acquire)
+                            {
+                                store
+                                    .inner
+                                    .sqlite_writer_commit_gen
+                                    .fetch_add(2, Ordering::Release);
+                            }
                             if let Ok(reopened) = open_rusqlite_writer_connection(&pair.db_path) {
                                 pair.rusqlite_conn = Some(reopened);
                             }
@@ -1874,10 +1891,9 @@ pub(crate) async fn execute_sqlite_fast_batch(
                         }
                     };
 
-                    store
-                        .inner
-                        .sqlite_writer_commit_gen
-                        .fetch_add(1, Ordering::Release);
+                    if commit_res.is_ok() {
+                        pending.batch_committed.store(true, Ordering::Release);
+                    }
                     drop(pending.batch_retained_tickets);
                     drop(pending.batch_retained_guards);
 
@@ -1931,6 +1947,7 @@ fn finalize_committed_batch(
             persisted_initial_seq,
             effective_cut,
             max_purge_seq,
+            targets,
         } = entry
         {
             space_effective_cuts.insert(sid.clone(), *effective_cut);
@@ -1948,6 +1965,7 @@ fn finalize_committed_batch(
                     .publish(BroadcastSignal::Committed {
                         scope: record.scope.clone(),
                         new_last_seq: *effective_cut,
+                        targets: targets.to_targets(),
                     });
             }
         }
@@ -1969,21 +1987,24 @@ fn finalize_committed_batch(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_sqlite_fast_sql_stage(
     conn: &rusqlite::Connection,
     items: Vec<(FastIntentMeta, Box<dyn SqliteSyncItemPlan>)>,
     cfg: WriterConfig,
     wal: Option<&SqliteWalCoordinator>,
+    inner: &crate::runtime::CanonicalInner,
     has_external_stagings: bool,
     current_writer_gen: u64,
     approval_tx_opt: &mut Option<tokio::sync::oneshot::Sender<EarlyWaveApproval>>,
 ) -> FastSqlStageResult {
-    if items.len() > 1 && items.iter().any(|(_, p)| p.requires_savepoint_isolation()) {
+    if items.iter().any(|(_, p)| p.requires_savepoint_isolation()) {
         return run_savepoint_fallback_sql_stage(
             conn,
             &items,
             cfg,
             wal,
+            inner,
             has_external_stagings,
             current_writer_gen,
         );
@@ -1993,6 +2014,7 @@ fn run_sqlite_fast_sql_stage(
         &items,
         cfg,
         wal,
+        inner,
         has_external_stagings,
         current_writer_gen,
         approval_tx_opt,
@@ -2006,6 +2028,7 @@ fn run_sqlite_fast_sql_stage(
                 &items,
                 cfg,
                 wal,
+                inner,
                 has_external_stagings,
                 current_writer_gen,
             )
@@ -2026,11 +2049,13 @@ fn has_any_pending_blob_retirement_rusqlite(
     Ok(found.is_some())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn try_run_optimistic_fast_sql_stage(
     conn: &rusqlite::Connection,
     items: &[(FastIntentMeta, Box<dyn SqliteSyncItemPlan>)],
     cfg: WriterConfig,
     wal: Option<&SqliteWalCoordinator>,
+    inner: &crate::runtime::CanonicalInner,
     has_external_stagings: bool,
     current_writer_gen: u64,
     approval_tx_opt: &mut Option<tokio::sync::oneshot::Sender<EarlyWaveApproval>>,
@@ -2103,6 +2128,7 @@ fn try_run_optimistic_fast_sql_stage(
                             persisted_initial_seq: init_seq,
                             effective_cut: init_seq,
                             max_purge_seq: None,
+                            targets: crate::changes::CommittedTargetAcc::default(),
                         },
                     );
                 }
@@ -2116,7 +2142,7 @@ fn try_run_optimistic_fast_sql_stage(
             }
         }
 
-        let has_idemp = meta.idempotency.is_some();
+        let has_idemp = meta.idempotency.is_some() || plan.replay_safe();
         let item_res = execute_single_fast_item(
             conn,
             space_states.get(&space_id).expect("space entry populated"),
@@ -2135,6 +2161,7 @@ fn try_run_optimistic_fast_sql_stage(
                 response_bytes,
                 new_effective_cut,
                 item_purge_seq,
+                committed_events,
                 dir_syncs,
                 retained_tickets,
                 retained_guards,
@@ -2142,6 +2169,7 @@ fn try_run_optimistic_fast_sql_stage(
                 if let Some(SpaceBatchEntry::Loaded {
                     effective_cut,
                     max_purge_seq,
+                    targets,
                     ..
                 }) = space_states.get_mut(&space_id)
                 {
@@ -2149,6 +2177,7 @@ fn try_run_optimistic_fast_sql_stage(
                     if let Some(pseq) = item_purge_seq {
                         *max_purge_seq = Some(max_purge_seq.map_or(pseq, |prev| prev.max(pseq)));
                     }
+                    targets.record_events(&committed_events);
                 }
                 batch_dir_syncs.merge(&dir_syncs);
                 batch_retained_tickets.extend(retained_tickets);
@@ -2181,8 +2210,10 @@ fn try_run_optimistic_fast_sql_stage(
         batch_dir_syncs,
         batch_retained_tickets,
         batch_retained_guards,
+        cache.batch_committed,
         slots,
         wal,
+        inner,
         has_external_stagings,
     ))
 }
@@ -2192,6 +2223,7 @@ fn run_savepoint_fallback_sql_stage(
     items: &[(FastIntentMeta, Box<dyn SqliteSyncItemPlan>)],
     cfg: WriterConfig,
     wal: Option<&SqliteWalCoordinator>,
+    inner: &crate::runtime::CanonicalInner,
     has_external_stagings: bool,
     current_writer_gen: u64,
 ) -> FastSqlStageResult {
@@ -2247,6 +2279,7 @@ fn run_savepoint_fallback_sql_stage(
                             persisted_initial_seq: init_seq,
                             effective_cut: init_seq,
                             max_purge_seq: None,
+                            targets: crate::changes::CommittedTargetAcc::default(),
                         },
                     );
                 }
@@ -2271,7 +2304,7 @@ fn run_savepoint_fallback_sql_stage(
             ));
         }
 
-        let has_idemp = meta.idempotency.is_some();
+        let has_idemp = meta.idempotency.is_some() || plan.replay_safe();
         let item_res = execute_single_fast_item(
             conn,
             space_states.get(&space_id).expect("space entry populated"),
@@ -2290,6 +2323,7 @@ fn run_savepoint_fallback_sql_stage(
                 response_bytes,
                 new_effective_cut,
                 item_purge_seq,
+                committed_events,
                 dir_syncs,
                 retained_tickets,
                 retained_guards,
@@ -2307,6 +2341,7 @@ fn run_savepoint_fallback_sql_stage(
                 if let Some(SpaceBatchEntry::Loaded {
                     effective_cut,
                     max_purge_seq,
+                    targets,
                     ..
                 }) = space_states.get_mut(&space_id)
                 {
@@ -2314,6 +2349,7 @@ fn run_savepoint_fallback_sql_stage(
                     if let Some(pseq) = item_purge_seq {
                         *max_purge_seq = Some(max_purge_seq.map_or(pseq, |prev| prev.max(pseq)));
                     }
+                    targets.record_events(&committed_events);
                 }
                 batch_dir_syncs.merge(&dir_syncs);
                 batch_retained_tickets.extend(retained_tickets);
@@ -2357,8 +2393,10 @@ fn run_savepoint_fallback_sql_stage(
         batch_dir_syncs,
         batch_retained_tickets,
         batch_retained_guards,
+        cache.batch_committed,
         slots,
         wal,
+        inner,
         has_external_stagings,
     )
 }
@@ -2370,8 +2408,10 @@ fn finish_fast_sql_stage(
     batch_dir_syncs: PendingDirSyncs,
     batch_retained_tickets: Vec<StagedBlobTicket>,
     batch_retained_guards: Vec<Box<dyn Send>>,
+    batch_committed: Arc<AtomicBool>,
     slots: Vec<ItemOutcomeSlot>,
     wal: Option<&SqliteWalCoordinator>,
+    inner: &crate::runtime::CanonicalInner,
     has_external_stagings: bool,
 ) -> FastSqlStageResult {
     for entry in space_states.values() {
@@ -2406,9 +2446,16 @@ fn finish_fast_sql_stage(
 
     if !has_external_stagings && !has_deferred_publish && !has_dir_syncs {
         let _ = crate::wal::take_last_wal_commit_frames();
-        match conn.execute_batch("COMMIT") {
+        // Bracket SQLite COMMIT with the seqlock generation (even->odd before
+        // COMMIT, odd->even immediately after COMMIT and strictly BEFORE
+        // dropping fence guards or waking readers).
+        let commit_seq = crate::runtime::SqliteCommitSeqGuard::begin(inner);
+        let commit_res = conn.execute_batch("COMMIT");
+        commit_seq.finish();
+        match commit_res {
             Ok(()) => {
                 let wal_frames = crate::wal::take_last_wal_commit_frames();
+                batch_committed.store(true, Ordering::Release);
                 drop(batch_retained_tickets);
                 drop(batch_retained_guards);
                 FastSqlStageResult::CommittedDirectly {
@@ -2435,6 +2482,7 @@ fn finish_fast_sql_stage(
             batch_dir_syncs,
             batch_retained_tickets,
             batch_retained_guards,
+            batch_committed,
             slots,
         })
     }
@@ -2444,6 +2492,7 @@ struct FastSingleItemSuccess {
     response_bytes: Vec<u8>,
     new_effective_cut: SpaceSeq,
     item_purge_seq: Option<SpaceSeq>,
+    committed_events: Vec<BatchEventDraft>,
     dir_syncs: PendingDirSyncs,
     retained_tickets: Vec<StagedBlobTicket>,
     retained_guards: Vec<Box<dyn Send>>,
@@ -2479,12 +2528,12 @@ fn execute_single_fast_item(
         .scope
         .check(&meta.scope)
         .map_err(|e| FastItemExecError::PreWrite(e.into()))?;
-    if space_rec.active_epoch != meta.active_epoch {
+    if !plan.is_unsequenced_room_wal() && space_rec.active_epoch != meta.active_epoch {
         return Err(FastItemExecError::PreWrite(
             DomainError::validation(ValidationReason::InvalidAuthority).into(),
         ));
     }
-    let effective_epoch = meta.active_epoch;
+    let effective_epoch = space_rec.active_epoch;
 
     if let Some(idemp) = &meta.idempotency {
         let rcpt_key = (
@@ -2518,6 +2567,7 @@ fn execute_single_fast_item(
                     response_bytes: existing.response_blob,
                     new_effective_cut: current_effective_cut,
                     item_purge_seq: None,
+                    committed_events: Vec::new(),
                     dir_syncs: PendingDirSyncs::default(),
                     retained_tickets: Vec::new(),
                     retained_guards: Vec::new(),
@@ -2567,6 +2617,28 @@ fn execute_single_fast_item(
     )?;
 
     let allocated_count = item_ctx.allocated_count();
+    if plan.is_unsequenced_room_wal() {
+        if allocated_count != 0
+            || !artifacts.events.is_empty()
+            || artifacts.change_payload.is_some()
+            || meta.idempotency.is_some()
+        {
+            return Err(FastItemExecError::PostWrite(internal_not_committed(
+                "writer_unsequenced_item_effects",
+                "room WAL item cannot allocate sequence numbers or publish change events",
+            )));
+        }
+        let (_, dir_syncs, retained_tickets, retained_guards) = item_ctx.into_batch_parts();
+        return Ok(FastSingleItemSuccess {
+            response_bytes: artifacts.response_bytes,
+            new_effective_cut: current_effective_cut,
+            item_purge_seq: None,
+            committed_events: Vec::new(),
+            dir_syncs,
+            retained_tickets,
+            retained_guards,
+        });
+    }
     if allocated_count == 0 || artifacts.events.is_empty() {
         return Err(FastItemExecError::PostWrite(internal_not_committed(
             "writer_item_zero_events",
@@ -2646,7 +2718,7 @@ fn execute_single_fast_item(
             .map(|ev| ev.space_seq)
             .max();
 
-        for ev in artifacts.events {
+        for ev in &artifacts.events {
             buf.change_log.push(DeferredChangeLogRow {
                 space_id: meta.scope.space_id.as_str().to_owned(),
                 space_seq: ev.space_seq.get() as i64,
@@ -2654,9 +2726,9 @@ fn execute_single_fast_item(
                 command_id: artifacts.command_id.clone(),
                 command_first_seq: first_seq.get() as i64,
                 command_last_seq: last_seq.get() as i64,
-                entity_type: ev.entity_type,
-                entity_id: ev.entity_id,
-                op_kind: ev.op_kind,
+                entity_type: ev.entity_type.clone(),
+                entity_id: ev.entity_id.clone(),
+                op_kind: ev.op_kind.clone(),
                 rev_id: ev.rev_id.as_str().to_owned(),
                 lifecycle_state: lifecycle_to_db(ev.lifecycle),
                 doc_class: ev.doc_class.map(doc_class_to_db),
@@ -2737,6 +2809,7 @@ fn execute_single_fast_item(
             response_bytes: artifacts.response_bytes,
             new_effective_cut: last_seq,
             item_purge_seq,
+            committed_events: artifacts.events,
             dir_syncs,
             retained_tickets,
             retained_guards,
@@ -2792,6 +2865,7 @@ fn execute_single_fast_item(
         response_bytes: artifacts.response_bytes,
         new_effective_cut: last_seq,
         item_purge_seq,
+        committed_events: artifacts.events,
         dir_syncs,
         retained_tickets,
         retained_guards,
@@ -3217,6 +3291,7 @@ struct CarrierReplacementFastPlan {
     explicit_slug_override: Option<(String, String)>,
     info: PreparedCarrierInfo,
     ticket: StagedBlobTicket,
+    closed_reservation: Option<Arc<StdMutex<Option<ClosedRoomReservation>>>>,
     prealloc_rev_id: RevisionId,
     prealloc_cmd_id: String,
     precomputed_rank_version: ContentDigest,
@@ -3240,6 +3315,7 @@ pub(crate) fn build_carrier_replacement_fast_intent(
     explicit_slug_override: Option<(String, String)>,
     info: PreparedCarrierInfo,
     ticket: StagedBlobTicket,
+    closed_reservation: Option<ClosedRoomReservation>,
     phase1_receipt_checked_gen: Option<u64>,
     phase1_cached: Option<(NoteHeadRow, FolderAncestryFacts)>,
 ) -> Result<(PreparedWriteIntent, Box<dyn SqliteSyncItemPlan>), PortError> {
@@ -3313,6 +3389,7 @@ pub(crate) fn build_carrier_replacement_fast_intent(
         explicit_slug_override,
         info,
         ticket,
+        closed_reservation: closed_reservation.map(|res| Arc::new(StdMutex::new(Some(res)))),
         prealloc_rev_id,
         prealloc_cmd_id,
         precomputed_rank_version,
@@ -3324,6 +3401,10 @@ pub(crate) fn build_carrier_replacement_fast_intent(
 }
 
 impl SqliteSyncItemPlan for CarrierReplacementFastPlan {
+    fn requires_savepoint_isolation(&self) -> bool {
+        self.closed_reservation.is_some()
+    }
+
     fn take_deferred_local_staging(&self) -> Option<DeferredLocalStaging> {
         self.ticket.take_deferred_local_staging()
     }
@@ -3334,6 +3415,12 @@ impl SqliteSyncItemPlan for CarrierReplacementFastPlan {
 
     fn into_async_exec(self: Box<Self>) -> ItemExecuteFn {
         let me = *self;
+        let room = me.closed_reservation.and_then(|slot| {
+            slot.lock()
+                .expect("closed reservation slot")
+                .take()
+                .map(crate::domain::notes::CarrierRoomWrite::Reserved)
+        });
         build_carrier_replacement_intent(
             &me.store,
             &me.scope,
@@ -3348,7 +3435,7 @@ impl SqliteSyncItemPlan for CarrierReplacementFastPlan {
             me.explicit_slug_override,
             me.info,
             me.ticket,
-            None,
+            room,
         )
         .execute
     }
@@ -3403,6 +3490,41 @@ impl SqliteSyncItemPlan for CarrierReplacementFastPlan {
             .map_err(FastItemExecError::PreWrite)?;
             auth.authorize_direct_write(&facts, &facts)
                 .map_err(|e| FastItemExecError::PreWrite(e.into()))?;
+            (false, head, anc)
+        };
+
+        let has_closed_collab_session = if let Some(slot) = &self.closed_reservation {
+            let res = slot
+                .lock()
+                .expect("closed reservation slot")
+                .take()
+                .ok_or_else(|| {
+                    FastItemExecError::PreWrite(
+                        DomainError::validation(ValidationReason::SourceMismatch).into(),
+                    )
+                })?;
+            let guard = room_fences
+                .consume_reservation_blocking(scope_cl, note_id, res, &self.identity)
+                .map_err(FastItemExecError::PreWrite)?;
+            item_ctx.retain_until_batch_commit(guard);
+            let durable = if !space_has_any_collab_session_cached(conn, cache, &scope_cl.space_id)
+                .map_err(FastItemExecError::PreWrite)?
+            {
+                NoteRoomDirectWriteState::NoSessionRow
+            } else {
+                durable_note_room_state_rusqlite(conn, &scope_cl.space_id, note_id)
+                    .map_err(FastItemExecError::PreWrite)?
+            };
+            durable
+                .require_writable()
+                .map_err(FastItemExecError::PreWrite)?
+        } else {
+            check_note_room_direct_write_cached(conn, cache, room_fences, scope_cl, note_id)
+                .and_then(NoteRoomDirectWriteState::require_writable)
+                .map_err(FastItemExecError::PreWrite)?
+        };
+
+        if !used_phase1_cache {
             if &head.head_rev_id != expected_base_rev {
                 return Err(FastItemExecError::PreWrite(
                     DomainError::RevisionConflict {
@@ -3431,14 +3553,7 @@ impl SqliteSyncItemPlan for CarrierReplacementFastPlan {
                 preconditions,
             )
             .map_err(FastItemExecError::PreWrite)?;
-
-            (false, head, anc)
-        };
-
-        let has_closed_collab_session =
-            check_note_room_direct_write_cached(conn, cache, room_fences, scope_cl, note_id)
-                .and_then(NoteRoomDirectWriteState::require_writable)
-                .map_err(FastItemExecError::PreWrite)?;
+        }
 
         let (final_slug, final_slug_fold) = match explicit_slug_override {
             Some((s, sf)) => {
@@ -4275,7 +4390,7 @@ fn load_note_head_row_opt_rusqlite(
     }))
 }
 
-fn load_note_head_row_rusqlite(
+pub(crate) fn load_note_head_row_rusqlite(
     conn: &rusqlite::Connection,
     space_id: &SpaceId,
     note_id: &NoteId,
@@ -4447,7 +4562,7 @@ pub(crate) fn build_resource_facts_rusqlite(
     Ok((facts, anc))
 }
 
-fn build_resource_facts_cached(
+pub(crate) fn build_resource_facts_cached(
     conn: &rusqlite::Connection,
     cache: &mut FastBatchSqlCache,
     space: &Space,

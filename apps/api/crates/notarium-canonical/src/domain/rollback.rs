@@ -270,9 +270,17 @@ async fn execute_rollback(
     deadline: Instant,
 ) -> Result<Committed<RollbackResult>, PortError> {
     ctx.budget.remaining = rollback_time_left(&ctx.budget, deadline)?;
-    if request.input.associated_board_expectations.is_empty()
-        && store.inner.collab_interceptor.get().is_none()
-    {
+    let no_live_or_fenced_rooms = match store.inner.collab_interceptor.get() {
+        None => true,
+        Some(interceptor) => {
+            !interceptor.space_has_live_rooms(&ctx.scope().space_id)
+                && !store
+                    .inner
+                    .room_fences
+                    .has_any_fenced_in_space(&ctx.scope().space_id)
+        }
+    };
+    if request.input.associated_board_expectations.is_empty() && no_live_or_fenced_rooms {
         let active_op_guard = store.enter_write_op(&ctx.scope().space_id)?;
         let writer_epoch = match &store.inner.sql {
             crate::runtime::SqlDriverState::Postgres { .. } => {
@@ -384,11 +392,14 @@ async fn execute_rollback(
         return Ok(replayed.into_committed());
     }
 
-    for attempt in 0..MAX_PLANNER_RETRIES {
+    let mut effective_input = request.input.clone();
+    let mut attempt = 0;
+    let mut replanned_after_recovery = false;
+    while attempt < MAX_PLANNER_RETRIES {
         // Step 1 & 2: Read run head, touched set, caller expectations, and classify `skipped_manual_edits`.
         ctx.budget.remaining = rollback_time_left(&ctx.budget, deadline)?;
         let ctx_read = ctx.clone();
-        let input_read = request.input.clone();
+        let input_read = effective_input.clone();
         let (space_rec, skipped_manual_edits, candidates, durable_active_rooms, run_board_moves) =
             rollback_wait(
                 &ctx.budget,
@@ -436,15 +447,30 @@ async fn execute_rollback(
         let mut skipped_room_active = Vec::new();
         let mut eligible_notes: BTreeMap<NoteId, CandidateAction> = BTreeMap::new();
         let mut eligible_reservations: BTreeMap<NoteId, ClosedRoomReservation> = BTreeMap::new();
+        let mut recovered_revisions = BTreeMap::new();
+        let interceptor = store.inner.collab_interceptor.get();
+        let fences = &store.inner.room_fences;
+        let space_id = ctx.scope().space_id.clone();
 
         for (nid, action) in candidates_with_carriers {
-            if durable_active_rooms.contains(&nid) {
+            let current = match &action {
+                CandidateAction::TrashCreated { current_rev, .. }
+                | CandidateAction::RestorePreExisting { current_rev, .. } => current_rev,
+            };
+            let was_blocked = durable_active_rooms.contains(&nid);
+            if was_blocked
+                && (interceptor.is_none()
+                    || (!fences.is_room_fenced(&space_id, &nid)
+                        && fences
+                            .fenced_recovery_revision(&space_id, &nid, current)
+                            .is_none()))
+            {
                 skipped_room_active.push(nid);
                 continue;
             }
             ctx.budget.remaining = rollback_time_left(&ctx.budget, deadline)?;
             let reservation = rollback_wait(&ctx.budget, deadline, async {
-                if let Some(interceptor) = store.inner.collab_interceptor.get() {
+                if let Some(interceptor) = interceptor {
                     interceptor
                         .reserve_rollback(ctx.clone(), nid.clone(), request.identity.clone())
                         .await
@@ -462,10 +488,36 @@ async fn execute_rollback(
                     skipped_room_active.push(nid);
                 }
                 RollbackReservation::Closed(closed_res) => {
+                    if was_blocked
+                        && let Some(recovered) =
+                            fences.fenced_recovery_revision(&space_id, &nid, current)
+                    {
+                        recovered_revisions.insert(nid, recovered);
+                        continue;
+                    }
                     eligible_reservations.insert(nid.clone(), closed_res);
                     eligible_notes.insert(nid, action);
                 }
             }
+        }
+        if !recovered_revisions.is_empty() {
+            if replanned_after_recovery {
+                return Err(unavailable_retryable(
+                    "rollback_room_revision_contention",
+                    "additional rooms recovered while planning the rollback",
+                    std::time::Duration::from_millis(10),
+                ));
+            }
+            // Only substitute a recovery of the exact, already-authorized revision.
+            // The next discovery detects concurrent changes and counts recovered
+            // human edits as foreign to the rolled-back agent run.
+            for expected in &mut effective_input.expected_entities {
+                if let Some(revision) = recovered_revisions.remove(&expected.note) {
+                    expected.revision = revision;
+                }
+            }
+            replanned_after_recovery = true;
+            continue;
         }
 
         // Step 4: If eligible notes have board moves in `input.run`, evaluate rollback board facts.
@@ -565,7 +617,7 @@ async fn execute_rollback(
                 space_rec.scope.clone(),
                 ctx.auth().clone(),
                 request.identity.clone(),
-                request.input.clone(),
+                effective_input.clone(),
                 store.inner.room_fences.clone(),
                 eligible_notes,
                 eligible_reservations,
@@ -599,6 +651,7 @@ async fn execute_rollback(
                         ..
                     },
             })) if attempt + 1 < MAX_PLANNER_RETRIES => {
+                attempt += 1;
                 continue;
             }
             Err(err) => return Err(err),
@@ -4137,6 +4190,7 @@ async fn execute_pg_fast_rollback_on_conn(
                 .publish(crate::changes::BroadcastSignal::Committed {
                     scope: scope_cl.clone(),
                     new_last_seq: new_effective_cut,
+                    targets: crate::changes::CommittedTargets::All,
                 });
             if faults
                 .drop_commit_response_once
@@ -5245,6 +5299,7 @@ async fn try_execute_pg_root_rollback(
             .publish(crate::changes::BroadcastSignal::Committed {
                 scope: scope.clone(),
                 new_last_seq: visibility_seq,
+                targets: crate::changes::CommittedTargets::All,
             });
 
         if writer

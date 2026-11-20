@@ -2603,6 +2603,7 @@ async fn l4_paired_backup_cut_holds_budgets_cleanup_and_restore_cursors_dual_dia
             .close_collab_session(
                 &make_budget(),
                 notarium_canonical::CloseCollabSession {
+                    unchanged_carrier_digest: None,
                     scope: scope.clone(),
                     note: secret_note.clone(),
                     owner_id: Some("collab-sec".to_owned()),

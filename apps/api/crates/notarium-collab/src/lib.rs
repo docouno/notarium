@@ -1,10 +1,17 @@
-//! Reserved for the collab subsystem. Domain behavior is added in later waves.
+//! Durable, transport-independent collaboration on canonical Markdown notes.
+#![forbid(unsafe_code)]
 
-#[cfg(test)]
-mod tests {
-    // A compile smoke test for the initial scaffold, not domain certification.
-    #[test]
-    fn scaffold_has_the_expected_package_identity() {
-        assert_eq!(env!("CARGO_PKG_NAME"), "notarium-collab");
-    }
-}
+mod carrier;
+mod crdt;
+mod hub;
+mod interceptor;
+mod presence;
+mod room;
+mod session;
+pub mod wire;
+
+pub use hub::{CollabConfig, CollabHub};
+pub use session::{
+    CollabPeerReceiver, CollabPeerSender, CollabPeerSession, CollabSessionAuth, SessionClose,
+    SessionClosed, SessionEvent,
+};

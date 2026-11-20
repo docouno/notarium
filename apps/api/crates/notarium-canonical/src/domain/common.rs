@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::{Arc, Mutex as StdMutex},
 };
 
@@ -155,17 +155,136 @@ pub(crate) fn persisted_room_fence(
     Ok(state)
 }
 
-type RoomFenceMap = HashMap<(SpaceId, NoteId), Arc<Mutex<RoomFenceState>>>;
+const MAX_IDLE_CLOSED_FENCES: usize = 2048;
+const MAX_DEFERRED_IDLE_CLOSED_FENCES: usize = 4096;
+const TARGET_IDLE_CLOSED_FENCES: usize = 1024;
+const MAX_RECOVERY_ENTRIES: usize = 4096;
+
+struct RoomFenceEntry {
+    state: Arc<Mutex<RoomFenceState>>,
+    /// Eviction pin carrying this slot's creation `eviction_gen`.
+    pin: Arc<u64>,
+    touched: u64,
+}
+
+struct RoomFenceMapState {
+    entries: HashMap<(SpaceId, NoteId), RoomFenceEntry>,
+    touch_seq: u64,
+    /// Monotonic eviction generation incremented whenever idle closed entries
+    /// are pruned, preventing pre-eviction untracked reservations from matching
+    /// a recreated zero-epoch slot without distorting durable `LeaseEpoch`.
+    eviction_gen: u64,
+    /// Shared pin (storing current `eviction_gen`) held by in-flight
+    /// reservations minted for notes not yet in `entries`; allows deferring
+    /// eviction while an untracked reservation is briefly in flight.
+    untracked_pin: Arc<u64>,
+}
+
+impl Default for RoomFenceMapState {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+            touch_seq: 0,
+            eviction_gen: 0,
+            untracked_pin: Arc::new(0),
+        }
+    }
+}
+
+impl RoomFenceMapState {
+    fn next_touch(&mut self) -> u64 {
+        self.touch_seq = self.touch_seq.wrapping_add(1);
+        self.touch_seq
+    }
+
+    fn advance_eviction_gen(&mut self) {
+        self.eviction_gen = self.eviction_gen.saturating_add(1);
+        self.untracked_pin = Arc::new(self.eviction_gen);
+    }
+
+    fn prune_idle_closed(&mut self, recovery: &StdMutex<RoomRecoveryFences>) {
+        let cap = if Arc::strong_count(&self.untracked_pin) > 1 {
+            MAX_DEFERRED_IDLE_CLOSED_FENCES
+        } else {
+            MAX_IDLE_CLOSED_FENCES
+        };
+        if self.entries.len() <= cap {
+            return;
+        }
+        let fenced = &recovery
+            .lock()
+            .expect("room recovery fence table mutex")
+            .fenced;
+        let mut evictable: Vec<(u64, (SpaceId, NoteId))> = self
+            .entries
+            .iter()
+            .filter_map(|(key, entry)| {
+                if Arc::strong_count(&entry.state) != 1
+                    || Arc::strong_count(&entry.pin) != 1
+                    || fenced.contains(key)
+                {
+                    return None;
+                }
+                let guard = entry.state.try_lock().ok()?;
+                (!guard.is_active()).then(|| (entry.touched, key.clone()))
+            })
+            .collect();
+        if evictable.len() <= TARGET_IDLE_CLOSED_FENCES {
+            return;
+        }
+        let remove_count = evictable.len() - TARGET_IDLE_CLOSED_FENCES;
+        evictable.select_nth_unstable_by_key(remove_count, |(touched, _)| *touched);
+        for (_, key) in evictable.into_iter().take(remove_count) {
+            self.entries.remove(&key);
+        }
+        self.advance_eviction_gen();
+    }
+}
+
+#[derive(Default)]
+struct RoomRecoveryFences {
+    fenced: HashSet<(SpaceId, NoteId)>,
+    recovered: HashMap<(SpaceId, NoteId), (RevisionId, RevisionId, u64)>,
+    recovery_seq: u64,
+}
+
+impl RoomRecoveryFences {
+    fn record_recovery(
+        &mut self,
+        space_id: SpaceId,
+        note: NoteId,
+        previous: RevisionId,
+        revision: RevisionId,
+    ) {
+        self.recovery_seq = self.recovery_seq.wrapping_add(1);
+        let seq = self.recovery_seq;
+        self.recovered
+            .insert((space_id, note), (previous, revision, seq));
+        if self.recovered.len() > MAX_RECOVERY_ENTRIES {
+            let mut order: Vec<(u64, (SpaceId, NoteId))> = self
+                .recovered
+                .iter()
+                .map(|(k, (_, _, touched))| (*touched, k.clone()))
+                .collect();
+            let remove_count = order.len() - (MAX_RECOVERY_ENTRIES / 2);
+            order.select_nth_unstable_by_key(remove_count, |(touched, _)| *touched);
+            for (_, key) in order.into_iter().take(remove_count) {
+                self.recovered.remove(&key);
+            }
+        }
+    }
+}
 
 /// Runtime-owned table of per-`(SpaceId, NoteId)` room fences (`tokio::sync::Mutex<RoomFenceState>`).
 #[derive(Default)]
 pub struct RoomFenceTable {
-    fences: StdMutex<RoomFenceMap>,
+    fences: StdMutex<RoomFenceMapState>,
+    recovery: StdMutex<RoomRecoveryFences>,
 }
 
 impl std::fmt::Debug for RoomFenceTable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let len = self.fences.lock().map(|m| m.len()).unwrap_or(0);
+        let len = self.fences.lock().map(|m| m.entries.len()).unwrap_or(0);
         f.debug_struct("RoomFenceTable")
             .field("entry_count", &len)
             .finish()
@@ -173,18 +292,185 @@ impl std::fmt::Debug for RoomFenceTable {
 }
 
 impl RoomFenceTable {
+    pub fn is_room_fenced(&self, space_id: &SpaceId, note: &NoteId) -> bool {
+        self.recovery
+            .lock()
+            .expect("room recovery fence table mutex")
+            .fenced
+            .contains(&(space_id.clone(), note.clone()))
+    }
+
+    pub fn has_any_fenced_in_space(&self, space_id: &SpaceId) -> bool {
+        self.recovery
+            .lock()
+            .expect("room recovery fence table mutex")
+            .fenced
+            .iter()
+            .any(|(sid, _)| sid == space_id)
+    }
+
+    pub(crate) fn set_room_fenced(&self, space_id: &SpaceId, note: &NoteId, fenced: bool) {
+        let mut recovery = self
+            .recovery
+            .lock()
+            .expect("room recovery fence table mutex");
+        let key = (space_id.clone(), note.clone());
+        if fenced {
+            recovery.fenced.insert(key);
+        } else {
+            recovery.fenced.remove(&key);
+        }
+    }
+
+    pub(crate) fn publish_persisted_transition(
+        &self,
+        scope: &HistoryScope,
+        note: &NoteId,
+        guard: &mut tokio::sync::OwnedMutexGuard<RoomFenceState>,
+        next: RoomFenceState,
+        fenced: bool,
+        recovered: Option<(RevisionId, RevisionId)>,
+    ) -> bool {
+        let key = (scope.space_id.clone(), note.clone());
+        let mut map = self.fences.lock().expect("room fence table mutex");
+        let current = tokio::sync::OwnedMutexGuard::mutex(guard);
+        // A restore replaces the slot. A new room on the same slot advances
+        // its epoch. Late publication must preserve both kinds of progress.
+        if guard.epoch() > next.epoch()
+            || !map
+                .entries
+                .get(&key)
+                .is_some_and(|slot| Arc::ptr_eq(&slot.state, current))
+        {
+            return false;
+        }
+        let touched = map.next_touch();
+        if let Some(slot) = map.entries.get_mut(&key) {
+            slot.touched = touched;
+        }
+        let mut recovery = self
+            .recovery
+            .lock()
+            .expect("room recovery fence table mutex");
+        if let Some((previous, revision)) = recovered {
+            recovery.record_recovery(scope.space_id.clone(), note.clone(), previous, revision);
+        } else {
+            recovery.recovered.remove(&key);
+        }
+        if fenced {
+            recovery.fenced.insert(key);
+        } else {
+            recovery.fenced.remove(&key);
+        }
+        **guard = next;
+        true
+    }
+
+    pub(crate) fn fenced_recovery_revision(
+        &self,
+        space_id: &SpaceId,
+        note: &NoteId,
+        previous: &RevisionId,
+    ) -> Option<RevisionId> {
+        self.recovery
+            .lock()
+            .expect("room recovery fence table mutex")
+            .recovered
+            .get(&(space_id.clone(), note.clone()))
+            .and_then(|(prev, rev, _)| (prev == previous).then(|| rev.clone()))
+    }
+
+    pub(crate) fn existing_fence(
+        &self,
+        scope: &HistoryScope,
+        note: &NoteId,
+    ) -> Option<Arc<Mutex<RoomFenceState>>> {
+        let mut map = self.fences.lock().expect("room fence table mutex");
+        let touched = map.next_touch();
+        let entry = map
+            .entries
+            .get_mut(&(scope.space_id.clone(), note.clone()))?;
+        entry.touched = touched;
+        Some(Arc::clone(&entry.state))
+    }
+
+    pub(crate) async fn observed_epoch(&self, scope: &HistoryScope, note: &NoteId) -> LeaseEpoch {
+        let Some(lock) = self.existing_fence(scope, note) else {
+            return LeaseEpoch::ZERO;
+        };
+        lock.lock().await.epoch()
+    }
+
     pub fn get_or_init(&self, scope: &HistoryScope, note: &NoteId) -> Arc<Mutex<RoomFenceState>> {
         let mut map = self.fences.lock().expect("room fence table mutex");
-        Arc::clone(
-            map.entry((scope.space_id.clone(), note.clone()))
-                .or_insert_with(|| {
-                    Arc::new(Mutex::new(RoomFenceState::new(
-                        note.clone(),
-                        scope.clone(),
-                        LeaseEpoch::ZERO,
-                    )))
-                }),
-        )
+        let touched = map.next_touch();
+        let key = (scope.space_id.clone(), note.clone());
+        if let Some(entry) = map.entries.get_mut(&key) {
+            entry.touched = touched;
+            return Arc::clone(&entry.state);
+        }
+        map.prune_idle_closed(&self.recovery);
+        let pin = Arc::new(map.eviction_gen);
+        let state = Arc::new(Mutex::new(RoomFenceState::new(
+            note.clone(),
+            scope.clone(),
+            LeaseEpoch::ZERO,
+        )));
+        map.entries.insert(
+            key,
+            RoomFenceEntry {
+                state: Arc::clone(&state),
+                pin,
+                touched,
+            },
+        );
+        state
+    }
+
+    /// Non-blocking closed-room reservation without allocating a persistent map
+    /// entry for never-opened notes. Returns `None` if active, fenced, or contended.
+    pub fn try_reserve_if_closed(
+        &self,
+        scope: &HistoryScope,
+        note: &NoteId,
+        identity: CommandIdentity,
+    ) -> Option<ClosedRoomReservation> {
+        if self.is_room_fenced(&scope.space_id, note) {
+            return None;
+        }
+        let lookup = {
+            let mut map = self.fences.lock().expect("room fence table mutex");
+            let touched = map.next_touch();
+            if let Some(entry) = map.entries.get_mut(&(scope.space_id.clone(), note.clone())) {
+                entry.touched = touched;
+                Ok((Arc::clone(&entry.state), Arc::clone(&entry.pin)))
+            } else {
+                Err(Arc::clone(&map.untracked_pin))
+            }
+        };
+        match lookup {
+            Err(pin) => {
+                match RoomFenceState::new(note.clone(), scope.clone(), LeaseEpoch::ZERO)
+                    .reserve(identity)
+                {
+                    Ok(RollbackReservation::Closed(mut res)) => {
+                        res.attach_table_pin(pin);
+                        Some(res)
+                    }
+                    _ => None,
+                }
+            }
+            Ok((lock, pin)) => {
+                let guard = lock.try_lock().ok()?;
+                match guard.reserve(identity) {
+                    Ok(RollbackReservation::Closed(mut res)) => {
+                        res.attach_table_pin(pin);
+                        Some(res)
+                    }
+                    _ => None,
+                }
+            }
+        }
     }
 
     pub async fn open_room(&self, scope: &HistoryScope, note: &NoteId) -> Result<(), PortError> {
@@ -205,9 +491,34 @@ impl RoomFenceTable {
         note: &NoteId,
         identity: CommandIdentity,
     ) -> Result<RollbackReservation, PortError> {
-        let lock = self.get_or_init(scope, note);
-        let guard = lock.lock().await;
-        guard.reserve(identity).map_err(PortError::from)
+        let lookup = {
+            let mut map = self.fences.lock().expect("room fence table mutex");
+            let touched = map.next_touch();
+            if let Some(entry) = map.entries.get_mut(&(scope.space_id.clone(), note.clone())) {
+                entry.touched = touched;
+                Ok((Arc::clone(&entry.state), Arc::clone(&entry.pin)))
+            } else {
+                Err(Arc::clone(&map.untracked_pin))
+            }
+        };
+        match lookup {
+            Ok((lock, pin)) => {
+                let guard = lock.lock().await;
+                let mut res = guard.reserve(identity)?;
+                if let RollbackReservation::Closed(ref mut closed) = res {
+                    closed.attach_table_pin(pin);
+                }
+                Ok(res)
+            }
+            Err(pin) => {
+                let mut res = RoomFenceState::new(note.clone(), scope.clone(), LeaseEpoch::ZERO)
+                    .reserve(identity)?;
+                if let RollbackReservation::Closed(ref mut closed) = res {
+                    closed.attach_table_pin(pin);
+                }
+                Ok(res)
+            }
+        }
     }
 
     pub async fn is_room_active(
@@ -215,14 +526,7 @@ impl RoomFenceTable {
         scope: &HistoryScope,
         note: &NoteId,
     ) -> Result<bool, PortError> {
-        let mut map_opt = None;
-        {
-            let map = self.fences.lock().expect("room fence table mutex");
-            if let Some(existing) = map.get(&(scope.space_id.clone(), note.clone())) {
-                map_opt = Some(Arc::clone(existing));
-            }
-        }
-        let Some(lock) = map_opt else {
+        let Some(lock) = self.existing_fence(scope, note) else {
             return Ok(false);
         };
         let probe_id = CommandIdentity {
@@ -245,11 +549,7 @@ impl RoomFenceTable {
         scope: &HistoryScope,
         note: &NoteId,
     ) -> Result<bool, PortError> {
-        let map_opt = {
-            let map = self.fences.lock().expect("room fence table mutex");
-            map.get(&(scope.space_id.clone(), note.clone())).cloned()
-        };
-        let Some(lock) = map_opt else {
+        let Some(lock) = self.existing_fence(scope, note) else {
             return Ok(false);
         };
         let probe_id = CommandIdentity {
@@ -268,12 +568,25 @@ impl RoomFenceTable {
 
     pub fn remove_note(&self, space_id: &SpaceId, note: &NoteId) {
         let mut map = self.fences.lock().expect("room fence table mutex");
-        map.remove(&(space_id.clone(), note.clone()));
+        let key = (space_id.clone(), note.clone());
+        map.entries.remove(&key);
+        let mut recovery = self
+            .recovery
+            .lock()
+            .expect("room recovery fence table mutex");
+        recovery.fenced.remove(&key);
+        recovery.recovered.remove(&key);
     }
 
     pub fn remove_space(&self, space_id: &SpaceId) {
         let mut map = self.fences.lock().expect("room fence table mutex");
-        map.retain(|(sid, _), _| sid != space_id);
+        map.entries.retain(|(sid, _), _| sid != space_id);
+        let mut recovery = self
+            .recovery
+            .lock()
+            .expect("room recovery fence table mutex");
+        recovery.fenced.retain(|(sid, _)| sid != space_id);
+        recovery.recovered.retain(|(sid, _), _| sid != space_id);
     }
 
     pub(crate) fn replace_restored_spaces(
@@ -282,12 +595,38 @@ impl RoomFenceTable {
         restored: RoomFenceTable,
     ) {
         let mut fences = self.fences.lock().expect("room fence table mutex");
-        fences.retain(|(id, _), _| !spaces.contains(id));
-        fences.extend(
+        fences.entries.retain(|(id, _), _| !spaces.contains(id));
+        let slot_gen = fences.eviction_gen;
+        for (key, entry) in restored
+            .fences
+            .into_inner()
+            .expect("restored room fence table")
+            .entries
+        {
+            let touched = fences.next_touch();
+            fences.entries.insert(
+                key,
+                RoomFenceEntry {
+                    state: entry.state,
+                    pin: Arc::new(slot_gen),
+                    touched,
+                },
+            );
+        }
+        let mut recovery = self
+            .recovery
+            .lock()
+            .expect("room recovery fence table mutex");
+        recovery.fenced.retain(|(sid, _)| !spaces.contains(sid));
+        recovery
+            .recovered
+            .retain(|(sid, _), _| !spaces.contains(sid));
+        recovery.fenced.extend(
             restored
-                .fences
+                .recovery
                 .into_inner()
-                .expect("restored room fence table"),
+                .expect("restored room recovery fence table")
+                .fenced,
         );
     }
 
@@ -311,14 +650,80 @@ impl RoomFenceTable {
         )
     }
 
+    fn lock_for_consume(
+        &self,
+        scope: &HistoryScope,
+        note: &NoteId,
+        reservation: &mut ClosedRoomReservation,
+    ) -> Result<tokio::sync::OwnedMutexGuard<RoomFenceState>, PortError> {
+        let res_gen = reservation.table_gen();
+        let lock = {
+            let mut map = self.fences.lock().expect("room fence table mutex");
+            let touched = map.next_touch();
+            let key = (scope.space_id.clone(), note.clone());
+            if let Some(entry) = map.entries.get_mut(&key) {
+                let expected_gen = *entry.pin;
+                if res_gen != expected_gen {
+                    reservation.release_pin();
+                    return Err(DomainError::validation(ValidationReason::SourceMismatch).into());
+                }
+                entry.touched = touched;
+                let state = Arc::clone(&entry.state);
+                reservation.release_pin();
+                state
+            } else {
+                let current_gen = map.eviction_gen;
+                if res_gen != current_gen {
+                    reservation.release_pin();
+                    return Err(DomainError::validation(ValidationReason::SourceMismatch).into());
+                }
+                reservation.release_pin();
+                let state = Arc::new(Mutex::new(RoomFenceState::new(
+                    note.clone(),
+                    scope.clone(),
+                    LeaseEpoch::ZERO,
+                )));
+                map.entries.insert(
+                    key,
+                    RoomFenceEntry {
+                        state: Arc::clone(&state),
+                        pin: Arc::new(current_gen),
+                        touched,
+                    },
+                );
+                map.prune_idle_closed(&self.recovery);
+                state
+            }
+        };
+        lock.try_lock_owned().map_err(|_| {
+            crate::codec::unavailable_retryable(
+                "collab_room_fence_busy",
+                "room fence lock is held by an in-flight writer commit",
+                std::time::Duration::from_millis(5),
+            )
+        })
+    }
+
     pub async fn consume_reservation(
         &self,
         scope: &HistoryScope,
         note: &NoteId,
-        reservation: ClosedRoomReservation,
+        mut reservation: ClosedRoomReservation,
         identity: &CommandIdentity,
     ) -> Result<tokio::sync::OwnedMutexGuard<RoomFenceState>, PortError> {
-        let mut guard = self.lock_for_write(scope, note)?;
+        let mut guard = self.lock_for_consume(scope, note, &mut reservation)?;
+        guard.consume(reservation, identity)?;
+        Ok(guard)
+    }
+
+    pub fn consume_reservation_blocking(
+        &self,
+        scope: &HistoryScope,
+        note: &NoteId,
+        mut reservation: ClosedRoomReservation,
+        identity: &CommandIdentity,
+    ) -> Result<tokio::sync::OwnedMutexGuard<RoomFenceState>, PortError> {
+        let mut guard = self.lock_for_consume(scope, note, &mut reservation)?;
         guard.consume(reservation, identity)?;
         Ok(guard)
     }
@@ -386,17 +791,30 @@ impl RoomFenceTable {
         let mut locks = Vec::with_capacity(sorted_notes.len());
         {
             let mut map = self.fences.lock().expect("room fence table mutex");
+            map.prune_idle_closed(&self.recovery);
             for &note in sorted_notes {
-                let arc = Arc::clone(
-                    map.entry((scope.space_id.clone(), note.clone()))
-                        .or_insert_with(|| {
-                            Arc::new(Mutex::new(RoomFenceState::new(
-                                note.clone(),
-                                scope.clone(),
-                                LeaseEpoch::ZERO,
-                            )))
-                        }),
-                );
+                let touched = map.next_touch();
+                let key = (scope.space_id.clone(), note.clone());
+                let arc = if let Some(entry) = map.entries.get_mut(&key) {
+                    entry.touched = touched;
+                    Arc::clone(&entry.state)
+                } else {
+                    let pin = Arc::new(map.eviction_gen);
+                    let state = Arc::new(Mutex::new(RoomFenceState::new(
+                        note.clone(),
+                        scope.clone(),
+                        LeaseEpoch::ZERO,
+                    )));
+                    map.entries.insert(
+                        key,
+                        RoomFenceEntry {
+                            state: Arc::clone(&state),
+                            pin,
+                            touched,
+                        },
+                    );
+                    state
+                };
                 locks.push(arc);
             }
         }
@@ -424,10 +842,19 @@ impl RoomFenceTable {
         let state = persisted_room_fence(note.clone(), scope.clone(), epoch, active)?;
         let existing = {
             let mut map = self.fences.lock().expect("room fence table mutex");
-            match map.entry((scope.space_id.clone(), note.clone())) {
-                std::collections::hash_map::Entry::Occupied(entry) => Arc::clone(entry.get()),
+            let touched = map.next_touch();
+            let slot_gen = map.eviction_gen;
+            match map.entries.entry((scope.space_id.clone(), note.clone())) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    entry.get_mut().touched = touched;
+                    Arc::clone(&entry.get().state)
+                }
                 std::collections::hash_map::Entry::Vacant(entry) => {
-                    entry.insert(Arc::new(Mutex::new(state)));
+                    entry.insert(RoomFenceEntry {
+                        state: Arc::new(Mutex::new(state)),
+                        pin: Arc::new(slot_gen),
+                        touched,
+                    });
                     return Ok(());
                 }
             }
@@ -2149,4 +2576,169 @@ pub(crate) enum StoredExternalObsOutcomeV1 {
     Conflict {
         current: RevisionId,
     },
+}
+
+#[cfg(test)]
+mod room_fence_bounds_tests {
+    use super::*;
+    use notarium_core::ids::{CommandKey, HistoryIncarnation};
+
+    #[tokio::test]
+    async fn room_fence_table_bounds_idle_closed_and_recovery_entries() {
+        let table = RoomFenceTable::default();
+        let scope = HistoryScope {
+            space_id: SpaceId::from_bytes([1; 16]),
+            incarnation: HistoryIncarnation::from_bytes([2; 16]),
+        };
+        let actor = PrincipalId::from_bytes([3; 16]);
+        let lease = LeaseEpoch::new(1).unwrap();
+
+        // Opening and closing >2048 distinct notes evicts idle closed entries.
+        for i in 0..2500u32 {
+            let mut bytes = [0u8; 16];
+            bytes[..4].copy_from_slice(&i.to_le_bytes());
+            let note = NoteId::from_bytes(bytes);
+            table.open_room(&scope, &note).await.unwrap();
+            table.close_room(&scope, &note).await.unwrap();
+        }
+        assert!(
+            table.fences.lock().unwrap().entries.len() <= 2048,
+            "idle closed room fences must be bounded"
+        );
+
+        // Closed-note reservations on never-opened notes do not insert entries.
+        let before = table.fences.lock().unwrap().entries.len();
+        for i in 5000..5200u32 {
+            let mut bytes = [0u8; 16];
+            bytes[..4].copy_from_slice(&i.to_le_bytes());
+            let note = NoteId::from_bytes(bytes);
+            let id = CommandIdentity {
+                scope: scope.clone(),
+                actor: actor.clone(),
+                key: CommandKey::from_bytes(bytes),
+                hash: ContentDigest::from_bytes([9; 32]),
+            };
+            let _res = table.try_reserve_if_closed(&scope, &note, id).unwrap();
+        }
+        assert_eq!(table.fences.lock().unwrap().entries.len(), before);
+
+        // Writer-side consumption of >2048 never-opened notes stays bounded.
+        for i in 6000..8500u32 {
+            let mut bytes = [0u8; 16];
+            bytes[..4].copy_from_slice(&i.to_le_bytes());
+            let note = NoteId::from_bytes(bytes);
+            let id = CommandIdentity {
+                scope: scope.clone(),
+                actor: actor.clone(),
+                key: CommandKey::from_bytes(bytes),
+                hash: ContentDigest::from_bytes([9; 32]),
+            };
+            let res = table
+                .try_reserve_if_closed(&scope, &note, id.clone())
+                .unwrap();
+            assert!(
+                table
+                    .consume_reservation_blocking(&scope, &note, res, &id)
+                    .is_ok()
+            );
+        }
+        assert!(table.fences.lock().unwrap().entries.len() <= 2048);
+
+        // Tracked reservation pinned against eviction survives >2500 idle churn.
+        let pinned_note = NoteId::from_bytes([0xaa; 16]);
+        table.open_room(&scope, &pinned_note).await.unwrap();
+        table.close_room(&scope, &pinned_note).await.unwrap();
+        let pinned_id = CommandIdentity {
+            scope: scope.clone(),
+            actor: actor.clone(),
+            key: CommandKey::from_bytes([0xaa; 16]),
+            hash: ContentDigest::from_bytes([7; 32]),
+        };
+        let pinned_res = table
+            .try_reserve_if_closed(&scope, &pinned_note, pinned_id.clone())
+            .unwrap();
+        for i in 10_000..12_600u32 {
+            let mut bytes = [0u8; 16];
+            bytes[..4].copy_from_slice(&i.to_le_bytes());
+            let note = NoteId::from_bytes(bytes);
+            table.open_room(&scope, &note).await.unwrap();
+            table.close_room(&scope, &note).await.unwrap();
+        }
+        assert!(
+            table
+                .consume_reservation_blocking(&scope, &pinned_note, pinned_res, &pinned_id)
+                .is_ok(),
+            "pinned in-flight reservation must not suffer spurious SourceMismatch on eviction"
+        );
+
+        // Stale reservation captured before open+close+eviction MUST be rejected
+        // (eviction_gen prevents matching a recreated zero-epoch slot).
+        let stale_table = RoomFenceTable::default();
+        let victim = NoteId::from_bytes([0xbb; 16]);
+        let victim_id = CommandIdentity {
+            scope: scope.clone(),
+            actor: actor.clone(),
+            key: CommandKey::from_bytes([0xbb; 16]),
+            hash: ContentDigest::from_bytes([8; 32]),
+        };
+        let stale_res = stale_table
+            .try_reserve_if_closed(&scope, &victim, victim_id.clone())
+            .unwrap();
+        stale_table.open_room(&scope, &victim).await.unwrap();
+        stale_table.close_room(&scope, &victim).await.unwrap();
+        // Force eviction past deferred cap while stale_res is held.
+        for i in 20_000..24_500u32 {
+            let mut bytes = [0u8; 16];
+            bytes[..4].copy_from_slice(&i.to_le_bytes());
+            let note = NoteId::from_bytes(bytes);
+            stale_table.open_room(&scope, &note).await.unwrap();
+            stale_table.close_room(&scope, &note).await.unwrap();
+        }
+        assert!(
+            !stale_table
+                .fences
+                .lock()
+                .unwrap()
+                .entries
+                .contains_key(&(scope.space_id.clone(), victim.clone())),
+            "victim entry should have been evicted"
+        );
+        let stale_err = stale_table
+            .consume_reservation_blocking(&scope, &victim, stale_res, &victim_id)
+            .unwrap_err();
+        assert!(
+            matches!(
+                &stale_err,
+                PortError::Domain(DomainError::ValidationFailed { diagnostic })
+                    if diagnostic.reason == ValidationReason::SourceMismatch
+            ),
+            "stale pre-eviction reservation must be rejected, got {stale_err:?}"
+        );
+
+        // Recovery cache stays bounded even across >4096 fenced recoveries.
+        for i in 0..4300u32 {
+            let mut bytes = [0u8; 16];
+            bytes[..4].copy_from_slice(&i.to_le_bytes());
+            let note = NoteId::from_bytes(bytes);
+            let lock = table.get_or_init(&scope, &note);
+            let mut guard = lock.lock_owned().await;
+            let prev = RevisionId::from_bytes(bytes);
+            let mut next_bytes = bytes;
+            next_bytes[15] = 1;
+            let rev = RevisionId::from_bytes(next_bytes);
+            let next_state = RoomFenceState::new(note.clone(), scope.clone(), lease);
+            assert!(table.publish_persisted_transition(
+                &scope,
+                &note,
+                &mut guard,
+                next_state,
+                false,
+                Some((prev, rev)),
+            ));
+        }
+        assert!(
+            table.recovery.lock().unwrap().recovered.len() <= 4096,
+            "recovered fence cache must stay bounded"
+        );
+    }
 }

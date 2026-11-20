@@ -952,6 +952,7 @@ impl CanonicalStore {
             .publish(crate::changes::BroadcastSignal::Committed {
                 scope: scope.clone(),
                 new_last_seq: target_seq,
+                targets: crate::changes::CommittedTargets::All,
             });
         Ok(())
     }

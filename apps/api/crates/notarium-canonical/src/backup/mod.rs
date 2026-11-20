@@ -4066,6 +4066,7 @@ async fn load_restored_room_fences(
         fences
             .seed_persisted_room(scope, &note, epoch, state == "active")
             .await?;
+        fences.set_room_fenced(&scope.space_id, &note, state == "fenced");
     }
     Ok(())
 }
