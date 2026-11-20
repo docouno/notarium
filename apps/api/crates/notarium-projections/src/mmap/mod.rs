@@ -597,10 +597,21 @@ pub(crate) fn discard_abandoned_temp(
     // A cancelled sweep can outlive the runtime maintenance guard. The
     // durable floor rejects a publisher for this history below `through`.
     // Other histories and later cuts cannot satisfy the header witness.
-    discard_matching_header(&path, |header, _| {
+    match discard_matching_header(&path, |header, _| {
         format::matches_temp_header(header, generation, scope, through)
-    })?;
-    Ok(())
+    }) {
+        Ok(_) => Ok(()),
+        // On Windows NTFS, a `.deleted-*` tombstone unlinked by `remove_readonly`
+        // remains visible in `read_dir` with `STATUS_DELETE_PENDING` (mapped to
+        // `PermissionDenied`) until all open reader handles drop.
+        #[cfg(windows)]
+        Err(IndexError::Io(error))
+            if is_deleted && error.kind() == io::ErrorKind::PermissionDenied =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
 }
 
 // Callers serialize immutable name mutations while checking and unlinking.
@@ -926,7 +937,8 @@ fn remove_readonly(path: &Path) -> io::Result<()> {
     #[cfg(windows)]
     {
         let metadata = fs::symlink_metadata(path)?;
-        if metadata.is_file() && metadata.permissions().readonly() {
+        let was_readonly = metadata.is_file() && metadata.permissions().readonly();
+        if was_readonly {
             let mut permissions = metadata.permissions();
             permissions.set_readonly(false);
             fs::set_permissions(path, permissions)?;
@@ -940,6 +952,11 @@ fn remove_readonly(path: &Path) -> io::Result<()> {
             if fs::rename(path, &tombstone).is_ok() {
                 if let Err(err) = fs::remove_file(&tombstone) {
                     let _ = fs::rename(&tombstone, path);
+                    if was_readonly {
+                        let mut permissions = metadata.permissions();
+                        permissions.set_readonly(true);
+                        let _ = fs::set_permissions(path, permissions);
+                    }
                     return Err(err);
                 }
                 return Ok(());

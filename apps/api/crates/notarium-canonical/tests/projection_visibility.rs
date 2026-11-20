@@ -957,13 +957,39 @@ async fn postgres_drain_blocks_concurrent_re_admission_and_single_conn_pool_neve
         .expect("subsequent write draining cleanup_debt on pool_size=1 must not self-deadlock");
     assert!(cleanup.calls.load(Ordering::SeqCst) >= 2);
 
-    // 4. Re-admit and verify concurrent admit_projection_space racing with drain_projection_owner
-    //    never reopens live admission under the drained epoch.
+    // 4. Immediately after a write (within the 50ms worker idle window) on pool_size = 1,
+    //    race admit_projection_space + create_note concurrently: must never AB-BA deadlock
+    //    between WriteBatchActor's cached_pg_conn and gate.write().
     drop(handle);
-    let live_handle = store
-        .admit_projection_space(&projection, &space.scope)
-        .await
-        .unwrap();
+    let note_c = sample_note_id(37);
+    let (admit_live, write_c) = tokio::join!(
+        store.admit_projection_space(&projection, &space.scope),
+        store.create_note(
+            owner.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: space.scope.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([37; 16]),
+                    hash: ContentDigest::from_bytes([37; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: notarium_core::ports::CreateNote {
+                    note: note_c,
+                    parent: None,
+                    slug: "pool-one-c".into(),
+                    class: DocClass::UserDoc,
+                    carrier: "# Pool One C\n".into(),
+                },
+            },
+        ),
+    );
+    let live_handle =
+        admit_live.expect("admit racing write on pool_size=1 must not AB-BA deadlock");
+    write_c.expect("write racing admit on pool_size=1 must not AB-BA deadlock");
+
+    // 5. Race fresh admit_projection_space attempts across the entire drain_projection_owner
+    //    window (including after gate revocation while set_owner_phase("draining") runs).
     let permit = live_handle.try_read().unwrap();
     let mut drain = pin!(store.drain_projection_owner(&revocation, &space.scope));
     poll_fn(|cx| {
@@ -971,21 +997,188 @@ async fn postgres_drain_blocks_concurrent_re_admission_and_single_conn_pool_neve
         Poll::Ready(())
     })
     .await;
-    let mut racing_admit = pin!(store.admit_projection_space(&projection, &space.scope));
-    poll_fn(|cx| {
-        let _ = racing_admit.as_mut().poll(cx);
-        Poll::Ready(())
-    })
-    .await;
     drop(permit);
-    let (drain_res, admit_res) = tokio::join!(drain, racing_admit);
-    drain_res.unwrap();
+    let store_admit = store.clone();
+    let scope_admit = space.scope.clone();
+    let proj_admit = projection.clone();
+    let drain_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let drain_done_bg = Arc::clone(&drain_done);
+    let racer = tokio::spawn(async move {
+        let mut reopened = false;
+        while !drain_done_bg.load(Ordering::Acquire) {
+            if store_admit
+                .admit_projection_space(&proj_admit, &scope_admit)
+                .await
+                .is_ok()
+            {
+                reopened = true;
+            }
+            tokio::task::yield_now().await;
+        }
+        reopened
+    });
+    drain.await.unwrap();
+    drain_done.store(true, Ordering::Release);
+    let reopened = racer.await.unwrap();
     assert!(
-        admit_res.is_err(),
-        "concurrent admit_projection_space must never succeed against a draining owner"
+        !reopened,
+        "concurrent admit_projection_space must never reopen admission during drain_projection_owner"
     );
     assert!(store.live_visibility_fence().space(&space.scope).is_err());
 
+    runtime.shutdown().await.unwrap();
+    fixtures.drop_pg_schema(&schema).await;
+}
+
+#[tokio::test]
+async fn postgres_multi_space_pool_size_two_concurrent_purges_never_self_deadlock() {
+    let fixtures = StorageTestFixtures::load_required();
+    let schema = fixtures.fresh_pg_schema();
+    let dir = TempDataRoot::new("projection-pg-pool-two");
+    let mut config = fixtures.pg_local_config(sample_installation_id(38), &schema, dir.data_root());
+    if let notarium_canonical::SqlBackendConfig::Postgres {
+        ref mut pool_size, ..
+    } = config.sql
+    {
+        *pool_size = 2;
+    }
+    let (store, runtime) = CanonicalRuntime::open(config).await.unwrap();
+    let projection = maintenance_ctx(ServicePurpose::Projection);
+    let space_a = create_space(&store, 38).await;
+    let space_b = create_space(&store, 39).await;
+    let _handle_a = store
+        .admit_projection_space(&projection, &space_a.scope)
+        .await
+        .unwrap();
+    let _handle_b = store
+        .admit_projection_space(&projection, &space_b.scope)
+        .await
+        .unwrap();
+
+    let make_owner = |space: &SpaceRecord, seed: u8| {
+        let actor = sample_principal_id(seed);
+        (
+            actor.clone(),
+            SpaceContext::new(
+                EngineAuthContext::for_human(VerifiedHuman::attest(
+                    actor,
+                    GrantId::from_bytes([seed; 16]),
+                    BTreeMap::from([(
+                        space.space.id.clone(),
+                        SpaceGrant {
+                            role: SpaceRole::Owner,
+                            read_classes: DocClass::all(),
+                            write_classes: DocClass::all(),
+                            project_root: None,
+                        },
+                    )]),
+                    true,
+                )),
+                space.scope.clone(),
+                projection.budget.clone(),
+            )
+            .unwrap(),
+        )
+    };
+    let (actor_a, owner_a) = make_owner(&space_a, 38);
+    let (actor_b, owner_b) = make_owner(&space_b, 39);
+
+    for round in 0u8..6 {
+        let note_a = sample_note_id(100 + round);
+        let note_b = sample_note_id(150 + round);
+        let (ca, cb) = tokio::join!(
+            store.create_note(
+                owner_a.clone(),
+                Mutation {
+                    identity: CommandIdentity {
+                        scope: space_a.scope.clone(),
+                        actor: actor_a.clone(),
+                        key: CommandKey::from_bytes([100 + round; 16]),
+                        hash: ContentDigest::from_bytes([100 + round; 32]),
+                    },
+                    preconditions: Preconditions::default(),
+                    input: notarium_core::ports::CreateNote {
+                        note: note_a.clone(),
+                        parent: None,
+                        slug: format!("p2-a-{round}"),
+                        class: DocClass::UserDoc,
+                        carrier: "# A\n".into(),
+                    },
+                },
+            ),
+            store.create_note(
+                owner_b.clone(),
+                Mutation {
+                    identity: CommandIdentity {
+                        scope: space_b.scope.clone(),
+                        actor: actor_b.clone(),
+                        key: CommandKey::from_bytes([150 + round; 16]),
+                        hash: ContentDigest::from_bytes([150 + round; 32]),
+                    },
+                    preconditions: Preconditions::default(),
+                    input: notarium_core::ports::CreateNote {
+                        note: note_b.clone(),
+                        parent: None,
+                        slug: format!("p2-b-{round}"),
+                        class: DocClass::UserDoc,
+                        carrier: "# B\n".into(),
+                    },
+                },
+            ),
+        );
+        ca.expect("concurrent create on space A with pool_size=2 must succeed");
+        cb.expect("concurrent create on space B with pool_size=2 must succeed");
+
+        let (pa, pb) = tokio::join!(
+            store.delete_note(
+                owner_a.clone(),
+                Mutation {
+                    identity: CommandIdentity {
+                        scope: space_a.scope.clone(),
+                        actor: actor_a.clone(),
+                        key: CommandKey::from_bytes([200 + round; 16]),
+                        hash: ContentDigest::from_bytes([200 + round; 32]),
+                    },
+                    preconditions: Preconditions::default(),
+                    input: DeleteNote {
+                        note: note_a,
+                        disposition: DeleteDisposition::Purge,
+                    },
+                },
+            ),
+            store.delete_note(
+                owner_b.clone(),
+                Mutation {
+                    identity: CommandIdentity {
+                        scope: space_b.scope.clone(),
+                        actor: actor_b.clone(),
+                        key: CommandKey::from_bytes([220 + round; 16]),
+                        hash: ContentDigest::from_bytes([220 + round; 32]),
+                    },
+                    preconditions: Preconditions::default(),
+                    input: DeleteNote {
+                        note: note_b,
+                        disposition: DeleteDisposition::Purge,
+                    },
+                },
+            ),
+        );
+        pa.expect("concurrent purge on space A with pool_size=2 must not self-deadlock");
+        pb.expect("concurrent purge on space B with pool_size=2 must not self-deadlock");
+    }
+
+    assert!(
+        store
+            .live_visibility_fence()
+            .try_read(&space_a.scope)
+            .is_ok()
+    );
+    assert!(
+        store
+            .live_visibility_fence()
+            .try_read(&space_b.scope)
+            .is_ok()
+    );
     runtime.shutdown().await.unwrap();
     fixtures.drop_pg_schema(&schema).await;
 }

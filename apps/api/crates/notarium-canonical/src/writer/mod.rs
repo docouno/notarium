@@ -1087,6 +1087,17 @@ async fn run_batch_worker_loop(
 
     loop {
         let next = if let Some((id, registry)) = &pg_space {
+            if rx.is_empty()
+                && cached_pg_conn.is_some()
+                && inner_weak.upgrade().is_none_or(|inner| {
+                    matches!(
+                        &inner.sql,
+                        SqlDriverState::Postgres { pool, .. } if pool.max_connections() <= 2
+                    )
+                })
+            {
+                cached_pg_conn = None;
+            }
             match tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
                 Ok(entry) => entry,
                 Err(_) => {
@@ -1279,7 +1290,18 @@ async fn flush_single_batch(
             }
         }
     }
-    let mut visibility = inner.live_visibility.for_write(visibility_spaces).await;
+    let mut visibility = match inner
+        .live_visibility
+        .try_for_write(visibility_spaces.clone())
+    {
+        Some(v) => v,
+        None => {
+            // Release any retained PG socket before awaiting gate locks so a
+            // gate holder waiting on pool.acquire() cannot AB-BA deadlock.
+            drop(cached_pg_conn.take());
+            inner.live_visibility.for_write(visibility_spaces).await
+        }
+    };
 
     let mut reserved_list = Vec::with_capacity(batch.len());
     let mut reply_targets = Vec::with_capacity(batch.len());
@@ -1465,11 +1487,9 @@ async fn flush_single_batch(
         BatchExecOutcome::Committed {
             visibility_windows, ..
         } => {
-            if visibility.needs_storage_read(&store, visibility_windows)
-                && let SqlDriverState::Postgres { pool, .. } = &inner.sql
-                && pool.max_connections() <= 1
-            {
-                // A retained writer socket can be the pool's only slot.
+            if visibility.needs_storage_read(&store, visibility_windows) {
+                // Release any retained writer socket before visibility refreshes
+                // so concurrent per-Space workers cannot exhaust the PG pool.
                 drop(cached_pg_conn.take());
             }
             if let Err(error) = visibility.published(&store, visibility_windows).await {

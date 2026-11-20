@@ -705,6 +705,38 @@ impl LiveLifecycleFence {
         }
     }
 
+    fn cleanup_empty_gate(&self, space: &SpaceId, gate: &Gate) {
+        if Arc::strong_count(gate) == 2
+            && let Ok(mut topology) = self.topology.write()
+            && Arc::strong_count(gate) == 2
+            && topology
+                .get(space)
+                .is_some_and(|existing| Arc::ptr_eq(existing, gate))
+            && gate
+                .try_read()
+                .is_ok_and(|data| matches!(*data, GateData::Empty))
+        {
+            topology.remove(space);
+        }
+    }
+
+    fn cleanup_empty_gates(&self, gates: &[(SpaceId, Gate)]) {
+        if let Ok(mut topology) = self.topology.write() {
+            for (space, gate) in gates {
+                if Arc::strong_count(gate) == 2
+                    && topology
+                        .get(space)
+                        .is_some_and(|existing| Arc::ptr_eq(existing, gate))
+                    && gate
+                        .try_read()
+                        .is_ok_and(|data| matches!(*data, GateData::Empty))
+                {
+                    topology.remove(space);
+                }
+            }
+        }
+    }
+
     async fn lock_current_gate(
         &self,
         space: &SpaceId,
@@ -728,6 +760,46 @@ impl LiveLifecycleFence {
                 return Ok((gate, guard));
             }
             drop(guard);
+        }
+    }
+
+    pub(crate) fn try_for_write(&self, mut spaces: Vec<SpaceId>) -> Option<LiveWriteSet> {
+        spaces.sort_unstable();
+        spaces.dedup();
+        let gates: Vec<(SpaceId, Gate)> = spaces
+            .iter()
+            .map(|space| (space.clone(), self.gate_or_insert(space)))
+            .collect();
+        let mut guards = Vec::with_capacity(gates.len());
+        for (_, gate) in &gates {
+            let Ok(guard) = Arc::clone(gate).try_write_owned() else {
+                drop(guards);
+                self.cleanup_empty_gates(&gates);
+                return None;
+            };
+            guards.push(guard);
+        }
+        let current = {
+            let topology = self.topology.read().expect("projection topology");
+            gates.iter().zip(&guards).all(|((space, gate), guard)| {
+                !matches!(**guard, GateData::Revoked)
+                    && topology
+                        .get(space)
+                        .is_some_and(|existing| Arc::ptr_eq(existing, gate))
+            })
+        };
+        if current || self.closed.load(Ordering::Acquire) {
+            Some(LiveWriteSet {
+                topology: Arc::clone(&self.topology),
+                gates,
+                guards,
+                spaces,
+                preserve: true,
+            })
+        } else {
+            drop(guards);
+            self.cleanup_empty_gates(&gates);
+            None
         }
     }
 
@@ -1422,12 +1494,29 @@ impl CanonicalStore {
         {
             return Ok(handle);
         }
+        struct CleanupEmptyGateOnDrop<'a> {
+            fence: &'a LiveLifecycleFence,
+            space: &'a SpaceId,
+            gate: Gate,
+        }
+
+        impl Drop for CleanupEmptyGateOnDrop<'_> {
+            fn drop(&mut self) {
+                self.fence.cleanup_empty_gate(self.space, &self.gate);
+            }
+        }
+
         let started = tokio::time::Instant::now();
         let deadline = crate::runtime::deadline_after(started, ctx.budget.remaining);
-        let gate = fence.gate_or_insert(&scope.space_id);
+        let gate_slot = CleanupEmptyGateOnDrop {
+            fence,
+            space: &scope.space_id,
+            gate: fence.gate_or_insert(&scope.space_id),
+        };
+        let gate = &gate_slot.gate;
         let mut old = budgeted(&ctx.budget, deadline, gate.write()).await?;
         if matches!(*old, GateData::Revoked) {
-            fence.remove_gate_if_same(&scope.space_id, &gate);
+            fence.remove_gate_if_same(&scope.space_id, gate);
             return Err(not_ready());
         }
         if let (Some(state), Some(next_lookup)) = (old.state(), lookup.as_ref())
@@ -1468,12 +1557,12 @@ impl CanonicalStore {
                     .read()
                     .expect("projection topology")
                     .get(&scope.space_id)
-                    .is_some_and(|existing| Arc::ptr_eq(existing, &gate))
+                    .is_some_and(|existing| Arc::ptr_eq(existing, gate))
             {
                 return Err(not_ready());
             }
             drop(old);
-            return Ok(fence.bind(gate, scope, epoch));
+            return Ok(fence.bind(Arc::clone(gate), scope, epoch));
         }
         if lookup.is_none()
             && let Some(state) = old.state()
@@ -1499,14 +1588,14 @@ impl CanonicalStore {
                     .read()
                     .expect("projection topology")
                     .get(&scope.space_id)
-                    .is_some_and(|existing| Arc::ptr_eq(existing, &gate))
+                    .is_some_and(|existing| Arc::ptr_eq(existing, gate))
             {
                 return Err(not_ready());
             }
             match state.update_lookup(next_lookup.clone()) {
                 Ok(true) => {
                     drop(old);
-                    return Ok(fence.bind(gate, scope, epoch));
+                    return Ok(fence.bind(Arc::clone(gate), scope, epoch));
                 }
                 Ok(false) => {}
                 Err(error) => {
@@ -1575,13 +1664,13 @@ impl CanonicalStore {
                 .read()
                 .expect("projection topology")
                 .get(&scope.space_id)
-                .is_some_and(|existing| Arc::ptr_eq(existing, &gate))
+                .is_some_and(|existing| Arc::ptr_eq(existing, gate))
         {
             return Err(not_ready());
         }
         *old = GateData::Active(Box::new(state));
         drop(old);
-        Ok(fence.bind(gate, scope, epoch))
+        Ok(fence.bind(Arc::clone(gate), scope, epoch))
     }
 
     /// Releases private lookup and fence state for an idle space. In Cloud
@@ -1705,5 +1794,74 @@ async fn budgeted<T>(
         () = tokio::time::sleep_until(deadline) => Err(crate::codec::deadline_not_committed(
             "live_visibility_deadline", "visibility work exceeded its budget")),
         result = operation => Ok(result),
+    }
+}
+
+#[cfg(test)]
+mod fence_concurrency_tests {
+    use std::{future::poll_fn, pin::pin, task::Poll};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn for_write_retries_onto_fresh_gate_after_concurrent_revocation() {
+        let fence = LiveLifecycleFence::new().unwrap();
+        let space = SpaceId::from_bytes([0xA1; 16]);
+        let gate1 = fence.gate_or_insert(&space);
+        let read_guard = Arc::clone(&gate1).read_owned().await;
+
+        // Queue revocation on gate1 (simulating suspend/drain), then queue for_write behind it
+        // on the EXACT same gate1 before releasing the reader.
+        let fence_rev = fence.clone();
+        let space_rev = space.clone();
+        let gate1_rev = Arc::clone(&gate1);
+        let mut revoke = pin!(async move {
+            let mut guard = gate1_rev.write().await;
+            *guard = GateData::Revoked;
+            fence_rev.remove_gate_if_same(&space_rev, &gate1_rev);
+        });
+        poll_fn(|cx| {
+            assert!(revoke.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+
+        let mut writer = pin!(fence.for_write(vec![space.clone()]));
+        poll_fn(|cx| {
+            assert!(writer.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+
+        // While gate1 is contended, try_for_write must immediately fail without blocking.
+        assert!(fence.try_for_write(vec![space.clone()]).is_none());
+
+        drop(read_guard);
+        revoke.await;
+        let write_set = writer.await;
+
+        // for_write must NOT have proceeded on revoked gate1; it must hold the new live gate2.
+        assert!(!Arc::ptr_eq(&write_set.gates[0].1, &gate1));
+        assert!(!matches!(*write_set.guards[0], GateData::Revoked));
+        {
+            let topology = fence.topology.read().unwrap();
+            assert!(
+                topology
+                    .get(&space)
+                    .is_some_and(|live| Arc::ptr_eq(live, &write_set.gates[0].1))
+            );
+        }
+        drop(write_set);
+        assert!(!fence.topology.read().unwrap().contains_key(&space));
+    }
+
+    #[test]
+    fn cleanup_empty_gate_removes_orphaned_empty_slot_on_error_without_evicting_active() {
+        let fence = LiveLifecycleFence::new().unwrap();
+        let space = SpaceId::from_bytes([0xA2; 16]);
+        let gate = fence.gate_or_insert(&space);
+        assert!(fence.topology.read().unwrap().contains_key(&space));
+        fence.cleanup_empty_gate(&space, &gate);
+        assert!(!fence.topology.read().unwrap().contains_key(&space));
     }
 }

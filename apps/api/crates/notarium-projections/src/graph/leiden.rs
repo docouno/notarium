@@ -105,15 +105,13 @@ impl LeidenSnapshot {
         }
 
         let mut assignments = vec![NO_COMMUNITY; adjacency.node_count() as usize];
-        let mut members = BTreeMap::<_, Bitmap>::new();
+        let mut members_by_slot = vec![Bitmap::new(); ids.len()];
         for (dense, community) in originals.into_iter().zip(partition) {
             let slot = id_slots[&community];
             assignments[dense as usize] = slot;
-            members
-                .entry(ids[slot as usize].clone())
-                .or_default()
-                .add(dense);
+            members_by_slot[slot as usize].add(dense);
         }
+        let members = ids.iter().cloned().zip(members_by_slot).collect();
         Ok(Self {
             assignments,
             members,
