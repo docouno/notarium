@@ -795,13 +795,12 @@ async fn l7_projection_refs_postgres_bounded_pages_and_erasure() {
         &ref_plan,
         &[".space_id", ".thread_id", ".entry_seq", ".ref_ordinal"],
     );
-    let target_plan: Vec<String> = sqlx::query_scalar(
-        "EXPLAIN (ANALYZE, BUFFERS, VERBOSE) SELECT thread_id, entry_seq, ref_ordinal
-         FROM chat_entry_note_refs
-         WHERE space_id=$1 AND target_space_id=$2 AND created_space_seq<=$3
-           AND (created_space_seq,thread_id,entry_seq,ref_ordinal)>($4,$5,$6,$7)
-         ORDER BY created_space_seq, thread_id, entry_seq, ref_ordinal LIMIT 10",
-    )
+    let target_plan: Vec<String> = sqlx::query_scalar(concat!(
+        "EXPLAIN (ANALYZE, BUFFERS, VERBOSE)
+         SELECT r.thread_id, r.entry_seq, r.ref_ordinal
+         FROM chat_entry_note_refs r WHERE r.space_id=$1 AND ",
+        include_str!("../../src/projection_chat/target_ref_range.sql")
+    ))
     .bind(legacy_space.as_str())
     .bind(fixture.tail.space_id.as_str())
     .bind(created)
@@ -809,6 +808,7 @@ async fn l7_projection_refs_postgres_bounded_pages_and_erasure() {
     .bind(fixture.entry.thread.as_str())
     .bind(fixture.entry.seq.get() as i64)
     .bind(0_i64)
+    .bind(10_i64)
     .fetch_all(&mut *probe)
     .await
     .unwrap();

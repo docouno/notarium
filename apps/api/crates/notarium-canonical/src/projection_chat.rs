@@ -652,9 +652,12 @@ macro_rules! ref_pages {
         const $all: &str = concat!(ref_columns!($index),
             "r.created_space_seq<=$2 AND (r.created_space_seq,r.thread_id,r.entry_seq,r.ref_ordinal)>($3,$4,$5,$6)
              ORDER BY r.created_space_seq,r.thread_id,r.entry_seq,r.ref_ordinal LIMIT $7");
-        const $target: &str = concat!(ref_columns!($index),
-            "r.target_space_id=$2 AND r.created_space_seq<=$3 AND (r.created_space_seq,r.thread_id,r.entry_seq,r.ref_ordinal)>($4,$5,$6,$7)
-             ORDER BY r.created_space_seq,r.thread_id,r.entry_seq,r.ref_ordinal LIMIT $8");
+        // Both bounds share a target. Order by the complete target index so a
+        // deep continuation can seek past neighbors in other target Spaces.
+        const $target: &str = concat!(
+            ref_columns!($index),
+            include_str!("projection_chat/target_ref_range.sql")
+        );
     };
 }
 ref_pages!(
