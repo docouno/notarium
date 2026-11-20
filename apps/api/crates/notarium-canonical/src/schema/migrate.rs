@@ -24,6 +24,8 @@ pub(crate) const V4_HASH: &str = "23fda6322e7820fdb9b60bd67192098e3d472c074f655a
 pub(crate) const V5_HASH: &str = "e32b31f85aeb41b99c19c355bad2f9103eac552a0fe4b9c1ebb149892a7d9774";
 pub(crate) const V6_HASH: &str = "f91526e264d8000bf5d72a4efcb4e9701b350636c37da24d2b34bb19f50a8772";
 
+pub(crate) const V7_HASH: &str = "1a3cfcfe1c2d78948310fb1dafb04dba99e243ea821626e2de4d7009c3aa22b9";
+
 pub(crate) fn recognized_predecessor(version: i64, hash: &[u8]) -> bool {
     match version {
         1 => hex::encode(hash) == V1_HASH,
@@ -32,6 +34,7 @@ pub(crate) fn recognized_predecessor(version: i64, hash: &[u8]) -> bool {
         4 => hex::encode(hash) == V4_HASH,
         5 => hex::encode(hash) == V5_HASH,
         6 => hex::encode(hash) == V6_HASH,
+        7 => hex::encode(hash) == V7_HASH,
         _ => false,
     }
 }
@@ -278,27 +281,29 @@ macro_rules! upgrade {
             sqlx::query(sqlx::AssertSqlSafe(index)).execute(&mut *conn).await
                 .map_err(|e| internal_not_committed("migration_v6_retirement_index", e.to_string()))?;
             }
-            let rank_error = |e: sqlx::Error| {
-                internal_not_committed("migration_v7_rank_anchor", e.to_string())
-            };
-            for prefix in PROJECTION_RANK_DDL {
-                let sql = baseline_statement($ddl, prefix)?;
-                sqlx::query(sqlx::AssertSqlSafe(sql)).execute(&mut *conn).await.map_err(rank_error)?;
+            if version < 7 {
+                let rank_error = |e: sqlx::Error| {
+                    internal_not_committed("migration_v7_rank_anchor", e.to_string())
+                };
+                for prefix in PROJECTION_RANK_DDL {
+                    let sql = baseline_statement($ddl, prefix)?;
+                    sqlx::query(sqlx::AssertSqlSafe(sql)).execute(&mut *conn).await.map_err(rank_error)?;
+                }
+                // Capture actual overlays without advancing SpaceSeq or reviving a placement
+                // deleted before rank tombstones were available.
+                for sql in [COPY_RANK_ANCHOR_MARKERS, COPY_RANK_ANCHOR_ROWS] {
+                    sqlx::query(sql).execute(&mut *conn).await.map_err(rank_error)?;
+                }
+                if !sqlx::query_scalar::<_, bool>(CHECK_RANK_ANCHOR)
+                    .fetch_one(&mut *conn).await.map_err(rank_error)?
+                {
+                    return Err(internal_not_committed(
+                        "migration_v7_rank_anchor",
+                        "the rank anchor does not capture all live view ranks at the Space command end",
+                    ));
+                }
             }
-            // Capture actual overlays without advancing SpaceSeq or reviving a placement
-            // deleted before rank tombstones were available.
-            for sql in [COPY_RANK_ANCHOR_MARKERS, COPY_RANK_ANCHOR_ROWS] {
-                sqlx::query(sql).execute(&mut *conn).await.map_err(rank_error)?;
-            }
-            if !sqlx::query_scalar::<_, bool>(CHECK_RANK_ANCHOR)
-                .fetch_one(&mut *conn).await.map_err(rank_error)?
-            {
-                return Err(internal_not_committed(
-                    "migration_v7_rank_anchor",
-                    "the rank anchor does not capture all live view ranks at the Space command end",
-                ));
-            }
-            chat_refs::$name(&mut *conn).await?;
+            chat_refs::$name(&mut *conn, version).await?;
             let (sec, nsec) =
                 crate::codec::encode_timestamp_parts(crate::codec::now_utc_timestamp()?);
             sqlx::query(WRITE_WITNESS)

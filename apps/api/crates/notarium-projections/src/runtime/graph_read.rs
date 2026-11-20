@@ -148,42 +148,27 @@ impl ProjectionEngine {
             ),
             _ => None,
         };
-        // Offload broad graph planning (Superclusters / Lens) off Tokio workers.
-        let mut plan = if matches!(
-            query.tier,
-            GraphTier::Superclusters | GraphTier::Lens { .. }
-        ) {
-            let tier = query.tier.clone();
-            tokio::task::spawn_blocking(move || {
-                let graph = SettledGraph {
-                    index: &index,
-                    settlement: durable_clusters.as_ref(),
-                };
-                plan_graph(
-                    &graph,
-                    issued_cut,
-                    &tier,
-                    &authorized,
-                    &matched,
-                    lens.as_ref(),
-                )
-            })
-            .await
-            .map_err(checkpoint_error)??
-        } else {
+        // A two-hop neighborhood can scan a whole component even when its
+        // output is capped. Dropping the receiver also stops an abandoned scan.
+        let tier = query.tier.clone();
+        let (reply, result) = tokio::sync::oneshot::channel();
+        tokio::task::spawn_blocking(move || {
             let graph = SettledGraph {
                 index: &index,
                 settlement: durable_clusters.as_ref(),
             };
-            plan_graph(
+            let plan = plan_graph(
                 &graph,
                 issued_cut,
-                &query.tier,
+                &tier,
                 &authorized,
                 &matched,
                 lens.as_ref(),
-            )?
-        };
+                || reply.is_closed(),
+            );
+            let _ = reply.send(plan);
+        });
+        let mut plan = result.await.map_err(checkpoint_error)??;
         let overlay = BTreeMap::new();
         for page in plan.hydration.chunks(MAX_ROWS) {
             let dense: Vec<_> = page.iter().map(|&(_, dense)| dense).collect();

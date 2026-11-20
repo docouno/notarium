@@ -521,6 +521,36 @@ impl SpaceSlot {
     }
 }
 
+/// Schema declarations shared by publications until a schema edit or recovery.
+pub(crate) struct PublishedFields {
+    declarations: BTreeMap<String, FieldSchema>,
+    retained_bytes: usize,
+}
+
+impl PublishedFields {
+    fn new(declarations: BTreeMap<String, FieldSchema>) -> Self {
+        // Include a conservative allowance for the map's partially occupied
+        // nodes and their child pointers, as well as each owned field name.
+        let retained_bytes = 512
+            + declarations
+                .keys()
+                .map(|key| 128 + key.capacity())
+                .sum::<usize>();
+        Self {
+            declarations,
+            retained_bytes,
+        }
+    }
+}
+
+impl std::ops::Deref for PublishedFields {
+    type Target = BTreeMap<String, FieldSchema>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.declarations
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct PublishedCut {
     /// Serving cut whose complete graph partition this private cut has adopted.
@@ -530,7 +560,7 @@ pub(crate) struct PublishedCut {
     pub(crate) watermark: ProjectionWatermark,
     pub(crate) root_folder_id: FolderId,
     pub(crate) store: DerivedStore,
-    pub(crate) fields: Arc<BTreeMap<String, FieldSchema>>,
+    pub(crate) fields: Arc<PublishedFields>,
     pub(crate) live: LiveSpaceHandle,
     pub(crate) base: BaseIndexHandle,
     pub(crate) delta: Arc<L0Delta>,

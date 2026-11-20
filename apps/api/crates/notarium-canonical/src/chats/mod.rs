@@ -3140,6 +3140,7 @@ async fn insert_chat_entry_row_tx(
         space_id.as_str(),
         thread_id.as_str(),
         e_i64,
+        cseq_i64,
         refs_json,
     )
     .await

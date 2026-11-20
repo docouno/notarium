@@ -851,6 +851,23 @@ async fn ranked_header_window(
     if rows.len() < capacity {
         let unranked = if same_group.is_none() {
             ids.andnot(&ranked)
+        } else if ranks.is_empty()
+            && input
+                .store
+                .group_rank_page(
+                    input.scope,
+                    input.cut,
+                    view,
+                    &group_hex,
+                    None,
+                    PageLimit::new(1)?,
+                )
+                .await?
+                .is_empty()
+        {
+            // No persisted rank precedes or follows this cursor. This also
+            // covers a ranked cursor originating entirely from the exact overlay.
+            return header_window(&local, ids, group, capacity);
         } else {
             // A continuation sought past earlier ranked rows. Anti-join just
             // the eligible dense IDs, without retrieving their previous ranks.

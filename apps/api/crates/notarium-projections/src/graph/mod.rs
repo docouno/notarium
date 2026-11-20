@@ -4,8 +4,10 @@ use std::{
 };
 
 use croaring::Bitmap;
+use notarium_canonical::codec::cancelled_not_committed;
 use notarium_core::{
     DomainError, DomainResult,
+    error::PortError,
     ids::{ClusterId, NoteId},
     model::SnapshotCut,
     ports::{GraphEdge, GraphNode, GraphNodeId, GraphResult, GraphTier},
@@ -181,6 +183,35 @@ impl GraphAdjacency for GraphBuild<'_> {
 const MAX_CLUSTERS: usize = 500;
 const MAX_NOTES: usize = 2_000;
 const MAX_LENS_EDGES: usize = 16_000;
+const SCAN_CHECK_INTERVAL: usize = 1_024;
+
+/// A dropped graph request releases its blocking worker after a bounded scan,
+/// including rows whose edges are all filtered out or have already been seen.
+struct GraphScan<'a> {
+    abandoned: &'a mut dyn FnMut() -> bool,
+    remaining: usize,
+}
+
+impl GraphScan<'_> {
+    fn check(&mut self) -> Result<(), PortError> {
+        if (self.abandoned)() {
+            return Err(cancelled_not_committed(
+                "projection_graph",
+                "read abandoned",
+            ));
+        }
+        Ok(())
+    }
+
+    fn visit(&mut self) -> Result<(), PortError> {
+        self.remaining -= 1;
+        if self.remaining == 0 {
+            self.remaining = SCAN_CHECK_INTERVAL;
+            self.check()?;
+        }
+        Ok(())
+    }
+}
 
 pub(crate) struct GraphPlan {
     pub result: GraphResult,
@@ -199,7 +230,13 @@ pub(crate) fn plan_graph(
     authorized: &Bitmap,
     filtered: &Bitmap,
     lens_scope: Option<&Bitmap>,
-) -> DomainResult<GraphPlan> {
+    mut abandoned: impl FnMut() -> bool,
+) -> Result<GraphPlan, PortError> {
+    let mut scan = GraphScan {
+        abandoned: &mut abandoned,
+        remaining: SCAN_CHECK_INTERVAL,
+    };
+    scan.check()?;
     let visible = if authorized.and_cardinality(filtered) == filtered.cardinality() {
         std::borrow::Cow::Borrowed(filtered)
     } else {
@@ -207,7 +244,9 @@ pub(crate) fn plan_graph(
     };
     let filtered_out = authorized.cardinality() - visible.cardinality();
     match tier {
-        GraphTier::Superclusters => superclusters(adjacency, cut, &visible, filtered_out),
+        GraphTier::Superclusters => {
+            superclusters(adjacency, cut, &visible, filtered_out, &mut scan)
+        }
         GraphTier::Lens { cluster, .. } => {
             let mut eligible = visible;
             if let Some(scope) = lens_scope {
@@ -220,16 +259,22 @@ pub(crate) fn plan_graph(
                 // Require at least one authorized note in the cluster so callers
                 // cannot probe existence of unauthorized clusters.
                 if authorized.and_cardinality(&members) == 0 {
-                    return Err(DomainError::ResourceNotFound);
+                    return Err(DomainError::ResourceNotFound.into());
                 }
                 eligible.to_mut().and_inplace(&members);
             }
             let hidden = authorized.cardinality() - eligible.cardinality();
-            lens(adjacency, cut, &eligible, hidden)
+            lens(adjacency, cut, &eligible, hidden, &mut scan)
         }
-        GraphTier::Neighborhood { note, hops } => {
-            neighborhood(adjacency, cut, note, *hops, &visible, filtered_out)
-        }
+        GraphTier::Neighborhood { note, hops } => neighborhood(
+            adjacency,
+            cut,
+            note,
+            *hops,
+            &visible,
+            filtered_out,
+            &mut scan,
+        ),
     }
 }
 
@@ -238,11 +283,13 @@ fn superclusters(
     cut: SnapshotCut,
     visible: &Bitmap,
     hidden: u64,
-) -> DomainResult<GraphPlan> {
+    scan: &mut GraphScan<'_>,
+) -> Result<GraphPlan, PortError> {
     let mut cluster_slots = HashMap::<ClusterKey<'_>, usize>::new();
     let mut clusters: Vec<(ClusterId, Bitmap)> = Vec::new();
     let mut unclustered = 0u64;
     for dense in visible.iter() {
+        scan.visit()?;
         if let Some(key) = adjacency.cluster_key(dense) {
             let slot = if let Some(&slot) = cluster_slots.get(&key) {
                 slot
@@ -273,6 +320,7 @@ fn superclusters(
     for (rank, &(slot, _)) in order.iter().take(selected_count).enumerate() {
         let rank_u16 = rank as u16;
         for dense in clusters[slot].1.iter() {
+            scan.visit()?;
             selected.add(dense);
             if let Some(cell) = cluster_by_note.get_mut(dense as usize) {
                 *cell = rank_u16;
@@ -281,8 +329,10 @@ fn superclusters(
     }
     let mut weights = BTreeMap::<(u16, u16), u64>::new();
     for source in selected.iter() {
+        scan.visit()?;
         let from = cluster_by_note[source as usize];
         for target in adjacency.outgoing(source) {
+            scan.visit()?;
             let Some(&to) = cluster_by_note.get(target as usize) else {
                 continue;
             };
@@ -330,14 +380,18 @@ fn lens(
     cut: SnapshotCut,
     eligible: &Bitmap,
     hidden: u64,
-) -> DomainResult<GraphPlan> {
+    scan: &mut GraphScan<'_>,
+) -> Result<GraphPlan, PortError> {
     let mut best = BinaryHeap::with_capacity(MAX_NOTES + 1);
     for node in eligible.iter() {
-        let degree = adjacency
-            .outgoing(node)
-            .chain(adjacency.incoming(node))
-            .filter(|&neighbor| neighbor != node && eligible.contains(neighbor))
-            .count();
+        scan.visit()?;
+        let mut degree = 0usize;
+        for neighbor in adjacency.outgoing(node).chain(adjacency.incoming(node)) {
+            scan.visit()?;
+            if neighbor != node && eligible.contains(neighbor) {
+                degree += 1;
+            }
+        }
         best.push(Reverse((degree, Reverse(node))));
         if best.len() > MAX_NOTES {
             best.pop();
@@ -349,7 +403,7 @@ fn lens(
         .map(|Reverse((_, Reverse(node)))| node)
         .collect::<Vec<_>>();
     let capped = eligible.cardinality() - ordered.len() as u64;
-    note_plan(adjacency, cut, ordered, hidden, capped, MAX_LENS_EDGES)
+    note_plan(adjacency, cut, ordered, hidden, capped, scan)
 }
 
 fn neighborhood(
@@ -359,26 +413,30 @@ fn neighborhood(
     hops: u8,
     visible: &Bitmap,
     hidden: u64,
-) -> DomainResult<GraphPlan> {
+    scan: &mut GraphScan<'_>,
+) -> Result<GraphPlan, PortError> {
     if !(1..=2).contains(&hops) {
-        return Err(DomainError::validation(
-            notarium_core::error::ValidationReason::InvalidLimit,
-        ));
+        return Err(
+            DomainError::validation(notarium_core::error::ValidationReason::InvalidLimit).into(),
+        );
     }
     let focal = adjacency
         .lookup(note)
         .filter(|&node| visible.contains(node))
         .ok_or(DomainError::ResourceNotFound)?;
-    let first: Bitmap = adjacency
-        .outgoing(focal)
-        .chain(adjacency.incoming(focal))
-        .filter(|&node| node != focal && visible.contains(node))
-        .collect();
+    let mut first = Bitmap::new();
+    for node in adjacency.outgoing(focal).chain(adjacency.incoming(focal)) {
+        scan.visit()?;
+        if node != focal && visible.contains(node) {
+            first.add(node);
+        }
+    }
     let mut second = Bitmap::new();
     let mut remaining = visible.cardinality() - 1 - first.cardinality();
     if hops == 2 && remaining > 0 {
         'expand: for node in first.iter() {
             for neighbor in adjacency.outgoing(node).chain(adjacency.incoming(node)) {
+                scan.visit()?;
                 if neighbor != focal
                     && visible.contains(neighbor)
                     && !first.contains(neighbor)
@@ -398,7 +456,7 @@ fn neighborhood(
         .take(MAX_NOTES)
         .collect::<Vec<_>>();
     let capped = 1 + first.cardinality() + second.cardinality() - ordered.len() as u64;
-    note_plan(adjacency, cut, ordered, hidden, capped, MAX_LENS_EDGES)
+    note_plan(adjacency, cut, ordered, hidden, capped, scan)
 }
 
 fn note_plan(
@@ -407,8 +465,8 @@ fn note_plan(
     ordered: Vec<u32>,
     hidden: u64,
     capped: u64,
-    edge_limit: usize,
-) -> DomainResult<GraphPlan> {
+    scan: &mut GraphScan<'_>,
+) -> Result<GraphPlan, PortError> {
     let nodes = ordered
         .iter()
         .map(|&dense| {
@@ -432,10 +490,11 @@ fn note_plan(
     let mut edge_capped = false;
     'sources: for (position, &source) in ordered.iter().enumerate() {
         for target in adjacency.outgoing(source) {
+            scan.visit()?;
             let Some(&target) = positions.get(&target) else {
                 continue;
             };
-            if edges.len() == edge_limit {
+            if edges.len() == MAX_LENS_EDGES {
                 edge_capped = true;
                 break 'sources;
             }
@@ -510,7 +569,8 @@ mod tests {
             note: notes[0].clone().unwrap(),
             hops: 2,
         };
-        let plan = plan_graph(&graph, cut(), &tier, &authorized, &filtered, None).unwrap();
+        let plan =
+            plan_graph(&graph, cut(), &tier, &authorized, &filtered, None, || false).unwrap();
         let order: Vec<_> = plan.hydration.iter().map(|&(_, dense)| dense).collect();
         assert_eq!(order, [0, 1, 2, 3, 4]);
         assert_eq!(plan.result.edges.len(), 5);
@@ -534,12 +594,54 @@ mod tests {
                 note: notes[0].clone().unwrap(),
                 hops: 2,
             };
-            let plan = plan_graph(&graph, cut(), &tier, &visible, &visible, None).unwrap();
+            let plan =
+                plan_graph(&graph, cut(), &tier, &visible, &visible, None, || false).unwrap();
             let omitted = degree + 2 - MAX_NOTES;
             assert_eq!(plan.result.nodes.len(), MAX_NOTES);
             assert_eq!(plan.result.hidden_count, omitted as u64);
             assert_eq!(plan.result.truncated, omitted > 0);
         }
+    }
+
+    #[test]
+    fn abandoned_neighborhood_stops_during_wide_second_hop() {
+        let degree = 2_000;
+        let mut edges: Vec<_> = (1..=degree).map(|node| (0, node)).collect();
+        for node in 1..=degree {
+            for offset in 1..=100 {
+                edges.push((node, 1 + (node - 1 + offset) % degree));
+            }
+        }
+        // The isolated visible note forces an exhaustive second hop, even
+        // though the first hop has already filled the presentation window.
+        let (notes, sections) = fixture(degree + 2, &edges);
+        let visible: Bitmap = (0..notes.len() as u32).collect();
+        let graph = GraphBuild {
+            notes: &notes,
+            sections: &sections,
+        };
+        let tier = GraphTier::Neighborhood {
+            note: notes[0].clone().unwrap(),
+            hops: 2,
+        };
+        let (reply, mut request) = tokio::sync::oneshot::channel::<()>();
+        let mut checks = 0;
+        let result = plan_graph(&graph, cut(), &tier, &visible, &visible, None, || {
+            checks += 1;
+            // Beyond both the 2k first hop and the 16k induced edge cap.
+            if checks == 64 {
+                request.close();
+            }
+            reply.is_closed()
+        });
+        assert!(matches!(result, Err(PortError::Cancelled(_))));
+        assert_eq!(checks, 64);
+
+        let plan = plan_graph(&graph, cut(), &tier, &visible, &visible, None, || false).unwrap();
+        assert_eq!(plan.result.nodes.len(), MAX_NOTES);
+        assert_eq!(plan.result.hidden_count, 1);
+        assert_eq!(plan.result.edges.len(), MAX_LENS_EDGES);
+        assert!(plan.result.truncated);
     }
 
     #[test]
@@ -556,7 +658,8 @@ mod tests {
             tags: Vec::new(),
             cluster: None,
         };
-        let plan = plan_graph(&graph, cut(), &tier, &authorized, &filtered, None).unwrap();
+        let plan =
+            plan_graph(&graph, cut(), &tier, &authorized, &filtered, None, || false).unwrap();
         let order: Vec<_> = plan.hydration.iter().map(|&(_, dense)| dense).collect();
         assert_eq!(order, [2, 0, 1, 3, 4]);
         assert_eq!(plan.result.edges.len(), 3);
@@ -628,6 +731,7 @@ mod tests {
             &authorized,
             &filtered,
             None,
+            || false,
         )
         .unwrap();
         assert_eq!(response.result.nodes.len(), 2);
@@ -649,7 +753,11 @@ mod tests {
             &left_only,
             &left_only,
             None,
+            || false,
         );
-        assert!(matches!(err, Err(DomainError::ResourceNotFound)));
+        assert!(matches!(
+            err,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ));
     }
 }

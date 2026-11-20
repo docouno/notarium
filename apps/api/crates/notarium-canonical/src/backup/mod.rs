@@ -2005,12 +2005,14 @@ async fn sleep_async_interruptible(
 
 #[cfg(test)]
 #[test]
-fn v6_spool_shape_matches_the_published_manifest() {
-    let observed = checksum_tables(6, spool_tables(6));
-    assert!(crate::schema::migrate::recognized_predecessor(
-        6,
-        observed.as_bytes()
-    ));
+fn historical_spool_shapes_match_their_published_manifests() {
+    for version in [6, 7] {
+        let observed = checksum_tables(version, spool_tables(version));
+        assert!(crate::schema::migrate::recognized_predecessor(
+            i64::from(version),
+            observed.as_bytes()
+        ));
+    }
 }
 
 fn spool_tables(schema_version: u32) -> impl Iterator<Item = TableSpec> + Clone {
@@ -2018,6 +2020,10 @@ fn spool_tables(schema_version: u32) -> impl Iterator<Item = TableSpec> + Clone 
         .iter()
         .copied()
         .filter_map(move |mut table| {
+            if schema_version == 7 && table.name == "chat_entry_note_refs" {
+                table.columns = &table.columns[..6];
+                table.indexes = &["idx_chat_entry_note_refs_target"];
+            }
             if schema_version < 7 {
                 match table.name {
                     "projection_rank_anchors"
@@ -2147,7 +2153,7 @@ pub fn decode_postgres_spool_v1_bounded(
     let expected_tables = spool_tables(schema_version);
     let expected_checksum = match schema_version {
         CANONICAL_SCHEMA_VERSION => manifest_checksum(),
-        1..=6 => {
+        1..=7 => {
             let digest = checksum_tables(schema_version, expected_tables.clone());
             if !crate::schema::migrate::recognized_predecessor(
                 i64::from(schema_version),

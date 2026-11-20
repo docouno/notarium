@@ -689,13 +689,17 @@ CREATE TABLE IF NOT EXISTS chat_entry_note_refs (
     ref_ordinal BIGINT NOT NULL CHECK (ref_ordinal >= 0),
     target_space_id TEXT NOT NULL,
     target_note_id TEXT NOT NULL,
+    created_space_seq BIGINT NOT NULL CHECK (created_space_seq >= 1),
     PRIMARY KEY (space_id, thread_id, entry_seq, ref_ordinal),
     FOREIGN KEY (space_id, thread_id, entry_seq)
         REFERENCES chat_entries (space_id, thread_id, entry_seq) ON DELETE CASCADE
 );
 
+CREATE INDEX IF NOT EXISTS idx_chat_entry_note_refs_created
+    ON chat_entry_note_refs (space_id, created_space_seq, thread_id, entry_seq, ref_ordinal);
+
 CREATE INDEX IF NOT EXISTS idx_chat_entry_note_refs_target
-    ON chat_entry_note_refs (space_id, target_space_id, target_note_id, thread_id, entry_seq, ref_ordinal);
+    ON chat_entry_note_refs (space_id, target_space_id, created_space_seq, thread_id, entry_seq, ref_ordinal);
 
 CREATE TABLE IF NOT EXISTS chat_pending_inputs (
     space_id TEXT NOT NULL,

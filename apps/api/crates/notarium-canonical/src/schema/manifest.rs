@@ -2,7 +2,7 @@ use std::{collections::BTreeSet, sync::LazyLock};
 
 use notarium_core::ids::ContentDigest;
 
-pub const CANONICAL_SCHEMA_VERSION: u32 = 7;
+pub const CANONICAL_SCHEMA_VERSION: u32 = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LogicalColKind {
@@ -665,8 +665,12 @@ pub const CANONICAL_TABLES: &[TableSpec] = &[
             col("ref_ordinal", Int, false),
             col("target_space_id", Text, false),
             col("target_note_id", Text, false),
+            col("created_space_seq", Int, false),
         ],
-        indexes: &["idx_chat_entry_note_refs_target"],
+        indexes: &[
+            "idx_chat_entry_note_refs_created",
+            "idx_chat_entry_note_refs_target",
+        ],
     },
     TableSpec {
         name: "chat_pending_inputs",

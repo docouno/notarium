@@ -488,6 +488,12 @@ impl BackendCase {
                 .execute(&mut *tx)
                 .await
                 .unwrap();
+            if decoded.schema_version == 7 {
+                sqlx::raw_sql(include_str!("fixtures/schema-v7-chat-refs.sql"))
+                    .execute(&mut *tx)
+                    .await
+                    .unwrap();
+            }
             if decoded.schema_version <= 6 {
                 sqlx::raw_sql(include_str!("fixtures/schema-v6-remove-projection.sql"))
                     .execute(&mut *tx)
@@ -1091,6 +1097,7 @@ async fn restores_historical_postgres_spools_and_rejects_invalid_headers() {
         (4, 0x62, 0xB2, "backup-178", 36, 14),
         (5, 0x62, 0xB2, "backup-178", 36, 14),
         (6, 0x62, 0xB2, "backup-178", 36, 14),
+        (7, 0x62, 0xB2, "backup-178", 39, 14),
     ] {
         let fixture = directory.join(format!("schema-v{version}.pgspool"));
         let decoded = decode_postgres_spool_v1(&fixture).unwrap();

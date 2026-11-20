@@ -1,4 +1,6 @@
 mod link_invalidation;
+mod postgres_erasure;
+mod retained_schema;
 
 use std::{
     path::{Path, PathBuf},
@@ -786,8 +788,7 @@ struct PgFixture {
     pg_database: String,
 }
 
-#[tokio::test]
-async fn unpublished_checkpoint_replays_and_compacts_on_postgres() {
+async fn postgres_fixture(root: &DataRoot) -> (CanonicalConfig, sqlx::PgPool, String, String) {
     let manifest = std::env::var_os("NOTARIUM_STORAGE_FIXTURES_MANIFEST")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
@@ -821,11 +822,9 @@ async fn unpublished_checkpoint_replays_and_compacts_on_postgres() {
         )
         .await
         .unwrap();
-    let scratch = Scratch::new();
-    let root = scratch.root();
     let canonical_schema = format!("test_checkpoint_{}", hex::encode(&entropy()[..6]));
     let prefix = format!("{canonical_schema}_d");
-    let (canonical, runtime) = CanonicalRuntime::open(CanonicalConfig {
+    let config = CanonicalConfig {
         installation_id: InstallationId::from_bytes(entropy()),
         sql: SqlBackendConfig::postgres_default(
             PgConnectConfig {
@@ -845,9 +844,16 @@ async fn unpublished_checkpoint_replays_and_compacts_on_postgres() {
         writer: WriterConfig::default(),
         snapshot_retention: Duration::from_secs(60),
         default_backup_budget: default_postgres_backup_budget(),
-    })
-    .await
-    .unwrap();
+    };
+    (config, pool, canonical_schema, prefix)
+}
+
+#[tokio::test]
+async fn unpublished_checkpoint_replays_and_compacts_on_postgres() {
+    let scratch = Scratch::new();
+    let root = scratch.root();
+    let (config, pool, canonical_schema, prefix) = postgres_fixture(&root).await;
+    let (canonical, runtime) = CanonicalRuntime::open(config).await.unwrap();
     let derived = DerivedStore::open_postgres(
         pool.clone(),
         &prefix,

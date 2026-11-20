@@ -572,4 +572,62 @@ async fn retained_board_pages_match_ordered_sql_ranks_and_exact_overlay() {
             after = page.rows.into_iter().last().map(|row| row.tuple);
         }
     }
+
+    // No stored ranks for this group, while other groups have 150. The first
+    // row carries an exact-overlay rank; the subsequent cursor is unranked.
+    let mode = SortSpec::default();
+    let all = Predicate::All(Vec::new());
+    let candidates = Bitmap::from_range(0..512);
+    let current_group = GroupKey::Value(ScalarValue::Bool(true));
+    let overlay_rank = BTreeMap::from([(
+        0,
+        BoardRank {
+            group: current_group.clone(),
+            rank: "first".into(),
+        },
+    )]);
+    let mut cursor = None;
+    for (page, max_transactions) in [1, 2, 1].into_iter().enumerate() {
+        store.take_sqlite_read_work();
+        let result = select_view_window(
+            WindowInput {
+                index: &index,
+                store: &store,
+                scope: &scope,
+                cut,
+                candidates: &candidates,
+                filter: &all,
+                sort: &mode,
+                group_by: Some("phase"),
+                columns: std::slice::from_ref(&current_group),
+                board: true,
+                ranks: &overlay_rank,
+                overlay: &overlay,
+                after: cursor.as_ref(),
+                limit: PageLimit::new(1).unwrap(),
+            },
+            Some(&view),
+        )
+        .await
+        .unwrap();
+        let (transactions, progress) = store.take_sqlite_read_work();
+        assert!(
+            (1..=max_transactions).contains(&transactions),
+            "page {page} took {transactions} transactions"
+        );
+        assert!(
+            progress < 8,
+            "page {page} used at least {} SQLite VM steps",
+            progress * 128
+        );
+        let row = result.rows.first().unwrap();
+        assert_eq!(row.rank.is_some(), page == 0);
+        if let Some(previous) = &cursor {
+            assert_eq!(
+                compare_view_cursor_tuple(&mode, previous, &row.tuple).unwrap(),
+                Ordering::Less
+            );
+        }
+        cursor = Some(row.tuple.clone());
+    }
 }

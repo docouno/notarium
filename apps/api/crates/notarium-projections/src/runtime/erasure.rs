@@ -14,7 +14,7 @@ use crate::{
     derived::{
         DerivedStore, GenerationControl, GenerationFiles, PostgresCacheOwner, PostgresEraser,
     },
-    mmap::{BaseIndexHandle, IndexIdentity, discard_abandoned_temp},
+    mmap::{BaseIndexHandle, IndexIdentity, discard_abandoned_temp, has_unreconciled_checkpoint},
 };
 
 use super::{GenerationCleanup, ProjectionEngine, PublishedCut, checkpoint_error};
@@ -248,6 +248,21 @@ async fn erase_postgres_visibility(
     for (generation, scope, through) in affected.reconciled.into_iter().chain(retired) {
         erase_scoped_checkpoints(root, generation, &scope, through, cache_owner, true).await?;
     }
+    if !affected.unreconciled.is_empty() {
+        // Reset can leave an active or reserved generation without a SQL
+        // floor. Keep its physical obligation until retry can reconcile it.
+        let root = root.clone();
+        let scope = erasures.scope.clone();
+        let through = erasures.through;
+        tokio::task::spawn_blocking(move || {
+            for generation in affected.unreconciled {
+                sweep_checkpoint_files(&root, generation, &scope, through, Sweep::Unreconciled)?;
+            }
+            Ok::<_, PortError>(())
+        })
+        .await
+        .map_err(checkpoint_error)??;
+    }
     Ok(())
 }
 
@@ -354,6 +369,7 @@ fn retire_registered(
 enum Sweep {
     Superseded,
     Purged,
+    Unreconciled,
 }
 
 fn sweep_checkpoint_files(
@@ -378,23 +394,35 @@ fn sweep_checkpoint_files(
             .and_then(|name| name.strip_suffix(".mmap"))
             .and_then(|seq| seq.parse::<u64>().ok())
             .and_then(|seq| SpaceSeq::new(seq).ok());
-        if let Some(seq) = seq.filter(|&seq| seq < through) {
-            let identity = IndexIdentity {
-                generation,
-                scope: scope.clone(),
-                seq,
-            };
-            match sweep {
-                Sweep::Superseded => {
-                    BaseIndexHandle::discard_unleased_matching(&entry.path(), &identity)
-                        .map_err(checkpoint_error)?;
+        if seq.is_some_and(|seq| seq >= through) {
+            continue;
+        }
+        let identity = seq.map(|seq| IndexIdentity {
+            generation,
+            scope: scope.clone(),
+            seq,
+        });
+        let path = entry.path();
+        match (&sweep, identity.as_ref()) {
+            (Sweep::Unreconciled, identity) => {
+                if has_unreconciled_checkpoint(&path, generation, scope, through, identity)
+                    .map_err(checkpoint_error)?
+                {
+                    return Err(not_ready());
                 }
-                Sweep::Purged => BaseIndexHandle::discard_erased_matching(&entry.path(), &identity)
-                    .map_err(checkpoint_error)?,
             }
-        } else {
-            discard_abandoned_temp(&entry.path(), generation, scope, through)
-                .map_err(checkpoint_error)?;
+            (Sweep::Superseded, Some(identity)) => {
+                BaseIndexHandle::discard_unleased_matching(&path, identity)
+                    .map_err(checkpoint_error)?;
+            }
+            (Sweep::Purged, Some(identity)) => {
+                BaseIndexHandle::discard_erased_matching(&path, identity)
+                    .map_err(checkpoint_error)?;
+            }
+            (_, None) => {
+                discard_abandoned_temp(&path, generation, scope, through)
+                    .map_err(checkpoint_error)?;
+            }
         }
     }
     Ok(())

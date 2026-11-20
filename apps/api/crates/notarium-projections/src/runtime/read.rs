@@ -59,7 +59,13 @@ impl RetainedReads {
         let mut entries = self.by_id.lock().unwrap_or_else(|error| error.into_inner());
         entries.retain(|_, entry| entry.expires > Instant::now());
         entries.insert(state.read.id.clone(), state);
-        while entries.len() > self.limit || retained_bytes(&entries) > 64 * 1024 * 1024 {
+        while entries.len() > self.limit
+            || retained_bytes(
+                entries
+                    .values()
+                    .map(|entry| (&entry.cut, entry.owned_bytes)),
+            ) > 64 * 1024 * 1024
+        {
             let next = entries
                 .values()
                 .min_by_key(|entry| entry.expires)
@@ -127,18 +133,34 @@ impl RetainedReads {
     }
 }
 
-fn retained_bytes(entries: &BTreeMap<EffectiveReadId, Arc<ReadState>>) -> usize {
-    let mut accounted = BTreeSet::new();
-    entries.values().fold(0usize, |bytes, read| {
-        let delta = &read.cut.delta;
-        let shared = if accounted.insert(Arc::as_ptr(delta) as usize) {
-            delta.approx_bytes()
-        } else {
-            0
-        };
+pub(super) fn retained_bytes<'a>(
+    reads: impl IntoIterator<Item = (&'a Arc<PublishedCut>, usize)>,
+) -> usize {
+    let mut cuts = BTreeSet::new();
+    let mut fields = BTreeSet::new();
+    let mut deltas = BTreeSet::new();
+    reads.into_iter().fold(0usize, |bytes, (cut, owned)| {
+        let mut bytes = bytes.saturating_add(owned);
+        // Cursors on the same publication share its entire cut, including
+        // its serialized watermark, parsed schema and in-memory delta.
+        if !cuts.insert(Arc::as_ptr(cut)) {
+            return bytes;
+        }
+        bytes = bytes
+            .saturating_add(std::mem::size_of::<PublishedCut>())
+            .saturating_add(
+                cut.watermark
+                    .schema
+                    .as_ref()
+                    .map_or(0, |schema| schema.fields_msgpack.capacity()),
+            );
+        if fields.insert(Arc::as_ptr(&cut.fields)) {
+            bytes = bytes.saturating_add(cut.fields.retained_bytes);
+        }
+        if deltas.insert(Arc::as_ptr(&cut.delta)) {
+            bytes = bytes.saturating_add(cut.delta.approx_bytes());
+        }
         bytes
-            .saturating_add(shared)
-            .saturating_add(read.owned_bytes)
     })
 }
 

@@ -326,7 +326,16 @@ pub(super) fn key_filter<R: SqlRecord>() -> String {
         .join(" AND ")
 }
 
+#[cfg(test)]
+#[derive(Default)]
+struct ReadWork {
+    transactions: std::sync::atomic::AtomicUsize,
+    progress_calls: std::sync::atomic::AtomicUsize,
+}
+
 struct SqliteDatabase {
+    #[cfg(test)]
+    read_work: Arc<ReadWork>,
     path: PathBuf,
     writer: Mutex<Connection>,
     readers: Mutex<Vec<Connection>>,
@@ -465,6 +474,17 @@ pub(super) struct Database(Backend);
 pub(super) type SqlFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, PortError>> + Send + 'a>>;
 
 impl Database {
+    #[cfg(test)]
+    pub(super) fn sqlite_read_work(&self) -> (usize, usize) {
+        let Backend::Sqlite(sqlite) = &self.0 else {
+            panic!("expected SQLite fixture")
+        };
+        (
+            sqlite.read_work.transactions.swap(0, Ordering::Relaxed),
+            sqlite.read_work.progress_calls.swap(0, Ordering::Relaxed),
+        )
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub(super) fn sqlite_path(&self) -> Option<&Path> {
         match &self.0 {
@@ -535,6 +555,8 @@ impl Database {
             let mut wal = path.as_os_str().to_os_string();
             wal.push("-wal");
             Ok(Self(Backend::Sqlite(Box::new(SqliteDatabase {
+                #[cfg(test)]
+                read_work: Arc::default(),
                 path,
                 writer: Mutex::new(writer),
                 readers: Mutex::new(readers),
@@ -803,6 +825,8 @@ impl Database {
                     };
                     run_sqlite_read(
                         guard.reader.as_mut().expect("reader present"),
+                        #[cfg(test)]
+                        Arc::clone(&sqlite.read_work),
                         cutoff,
                         abort_worker,
                         runtime,
@@ -846,6 +870,7 @@ impl Drop for ReadAbort {
 
 fn run_sqlite_read<T, F>(
     reader: &mut Connection,
+    #[cfg(test)] work: Arc<ReadWork>,
     limit: Instant,
     aborted: Arc<AtomicBool>,
     runtime: Handle,
@@ -855,10 +880,16 @@ where
     F: for<'a> FnOnce(SqlTransaction<'a>) -> SqlFuture<'a, T> + Send + 'static,
 {
     let stop = Arc::clone(&aborted);
+    #[cfg(test)]
+    work.transactions.fetch_add(1, Ordering::Relaxed);
     reader
         .progress_handler(
             128,
-            Some(move || Instant::now() >= limit || stop.load(Ordering::Acquire)),
+            Some(move || {
+                #[cfg(test)]
+                work.progress_calls.fetch_add(1, Ordering::Relaxed);
+                Instant::now() >= limit || stop.load(Ordering::Acquire)
+            }),
         )
         .map_err(sqlite_error)?;
     let result = (|| {

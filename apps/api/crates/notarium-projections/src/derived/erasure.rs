@@ -31,6 +31,7 @@ pub(crate) struct PostgresEraser {
 pub(crate) struct CheckpointErasures {
     pub(crate) reconciled: Vec<(ProjectionGeneration, HistoryScope, SpaceSeq)>,
     pub(crate) retired: Vec<ProjectionGeneration>,
+    pub(crate) unreconciled: Vec<ProjectionGeneration>,
 }
 
 impl DerivedStore {
@@ -89,10 +90,13 @@ impl PostgresEraser {
             // A peer can reclaim shared SQL while this owner still has
             // file-only lookup leases. The local inventory is independent.
             for generation in GenerationFiles::inventory(root).await? {
-                if !reconciled.contains(&generation)
-                    && self.control.generation_reclaimable(generation).await?
-                {
+                if reconciled.contains(&generation) {
+                    continue;
+                }
+                if self.control.generation_reclaimable(generation).await? {
                     affected.retired.push(generation);
+                } else {
+                    affected.unreconciled.push(generation);
                 }
             }
         }

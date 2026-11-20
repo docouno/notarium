@@ -94,10 +94,25 @@ recovers writes under its exclusive DataRoot owner lock.
 ## Dual-dialect schema and history model
 
 Both SQL dialects materialize the same ordinary B-tree tables in schema
-version `7` and verify live database catalogs (`sqlite_master` / `pg_catalog`)
+version `8` and verify live database catalogs (`sqlite_master` / `pg_catalog`)
 against a shared typed manifest checksum (`schema_meta`) on every startup.
 Unknown newer schema versions, mismatched manifest checksums or unfinished
 migration states fail closed.
+
+Schema version 8 records each chat reference's immutable source entry creation
+sequence in the same transaction as the entry. One index orders occurrences by
+source Space and creation sequence. The incoming-reference index first selects
+the source and target Spaces, then orders by the same sequence. Both continue
+by thread, entry and ordinal within a sequence. A fixed-cut scan can seek past
+its last occurrence and stop at the cutoff even while writers append. Readers
+check current entry visibility and purge fences before returning references.
+Redaction and stale-summary cleanup remove the indexed occurrences atomically.
+
+The upgrade from version 7 copies the surviving normalized references and their
+original ordinals, looking up the creation sequence on each parent entry.
+Earlier versions populate the sequence while normalizing the legacy arrays.
+Stop preceding-version PostgreSQL writers before upgrading. Bootstrap installs
+the data, indexes and schema witness in one transaction.
 
 Schema version 7 records a rank anchor at each existing Space's committed head.
 The anchor preserves exactly the live view-rank overlays at upgrade. Rank
@@ -107,9 +122,7 @@ builds a covering chat-entry lookup. It reads one legacy reference array at
 a time and stores one indexed row per distinct target and entry, retaining
 the first occurrence's ordinal. Projection readers page through those keys
 and validate each source entry and target before returning its backlink.
-Stop the preceding-version writers before opening a PostgreSQL installation
-for this upgrade. Startup copies the live anchor rows and installs the schema
-under the migration fence in one transaction.
+Startup copies the live anchor rows under the migration fence in one transaction.
 
 The canonical store implements `ControlCatalogPort`. Account provisioning and
 lifecycle changes store a compact receipt keyed by owner, actor and command key
@@ -497,10 +510,12 @@ same example against an isolated prefix.
   volume, where lookup checks file size and BLAKE3 before returning the path.
   Startup reconciles abandoned holds and pending local artifacts.
   The offline `notarium_canonical::backup::decode_postgres_spool_v1_bounded`
-  API verifies the trailer and recognizes the exact manifests for schemas 1 through 7.
+  API verifies the trailer and recognizes the exact manifests for schemas 1 through 8.
   It returns typed rows in the original table and column order within the
   caller's byte budget. To materialize a historical spool, create an empty
-  target with `schema::POSTGRES_BASELINE_DDL`. For versions 1 through 6, apply
+  target with `schema::POSTGRES_BASELINE_DDL`. For version 7, apply
+  `tests/fixtures/schema-v7-chat-refs.sql` to restore the original six-column
+  occurrence table and its target index. For versions 1 through 6, apply
   `tests/fixtures/schema-v6-remove-projection.sql` from the canonical crate.
   For versions 1 through 5, drop `idx_blob_retirements_status` and recreate it
   on `(space_id, status)`.
@@ -518,8 +533,8 @@ same example against an isolated prefix.
   temporary table, then inserts the full set in one statement so foreign keys
   can resolve parents that appear later in the archive.
   Opening the target with the original installation ID applies the remaining
-  migrations through version 7. The canonical L4 backup suite exercises this
-  procedure with archives from all six predecessor versions.
+  migrations through version 8. The canonical L4 backup suite exercises this
+  procedure with archives from all seven predecessor versions.
   Before serving the restored database, call `restore_cursors` with each
   original cutoff and a fresh history incarnation. The same transaction
   rotates the writer epoch and fences active rooms, retaining their snapshots,

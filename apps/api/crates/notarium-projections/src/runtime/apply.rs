@@ -660,12 +660,12 @@ pub(super) async fn command_with_folders(
             let old_folders_ref = old_folders.as_ref();
             let fields = if let Some(schema) = &schema_change {
                 watermark.schema = schema.as_ref().map(persisted_schema).transpose()?;
-                Arc::new(
+                Arc::new(super::PublishedFields::new(
                     schema
                         .as_ref()
                         .map(|schema| schema.fields.clone())
                         .unwrap_or_default(),
-                )
+                ))
             } else {
                 Arc::clone(&current.fields)
             };
@@ -1879,7 +1879,7 @@ async fn publish_cut(
         root_folder_id: watermark.root_folder_id.clone(),
         watermark,
         store: store.clone(),
-        fields: Arc::new(fields),
+        fields: Arc::new(super::PublishedFields::new(fields)),
         live,
         base,
         delta: Arc::new(delta),

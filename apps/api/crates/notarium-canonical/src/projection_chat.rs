@@ -140,7 +140,7 @@ enum RefSelection {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct RefCursorKey {
-    target_note: String,
+    created_space_seq: i64,
     thread: String,
     entry_seq: i64,
     ref_ordinal: i64,
@@ -511,11 +511,9 @@ impl CanonicalStore {
                 {
                     return Ok(false);
                 }
-                const CHECK_REF: &str = "SELECT EXISTS(
-                    SELECT 1 FROM chat_entry_note_refs
-                    WHERE space_id=$1 AND thread_id=$2 AND entry_seq=$3
-                      AND ref_ordinal=$4 AND target_space_id=$5 AND target_note_id=$6
-                )";
+                // Every occurrence index can seek to a single key when the source
+                // creation sequence from the verified parent is also constrained.
+                const CHECK_REF: &str = include_str!("projection_chat/verify_ref.sql");
                 let exists: bool = chat_fetch_scalar!(
                     tx,
                     CHECK_REF,
@@ -525,6 +523,7 @@ impl CanonicalStore {
                     i64::from(locator.ref_ordinal),
                     target.space_id.as_str(),
                     target.note_id.as_str(),
+                    head.created_seq.get() as i64,
                 );
                 Ok(exists)
             })
@@ -633,18 +632,16 @@ async fn exact_entry(
     }))
 }
 
-// Determine visibility by one exact probe per visited occurrence. Keeping the
-// predicate in the scalar projection preserves raw keys for the continuation.
+// The range on the immutable creation sequence bounds both ends of a fixed-cut
+// traversal. Check current visibility with one parent lookup per visited key.
 macro_rules! ref_columns {
-    ($index:literal, $cut:literal) => {
+    ($index:literal) => {
         concat!(
             "SELECT r.thread_id, r.entry_seq, r.ref_ordinal, r.target_space_id, r.target_note_id,
-            (SELECT e.revision_id FROM chat_entries e",
+            r.created_space_seq, (SELECT e.revision_id FROM chat_entries e",
             $index,
             " WHERE e.space_id=r.space_id AND e.thread_id=r.thread_id AND e.entry_seq=r.entry_seq
-              AND e.created_space_seq<=",
-            $cut,
-            " AND e.kind <> 'redacted' AND e.redacted_at_seq IS NULL AND e.checkpoint_stale=0)
+              AND e.kind <> 'redacted' AND e.redacted_at_seq IS NULL AND e.checkpoint_stale=0)
             FROM chat_entry_note_refs r WHERE r.space_id=$1 AND "
         )
     };
@@ -652,12 +649,12 @@ macro_rules! ref_columns {
 
 macro_rules! ref_pages {
     ($all:ident, $target:ident, $index:literal) => {
-        const $all: &str = concat!(ref_columns!($index, "$2"),
-            "(r.thread_id,r.entry_seq,r.ref_ordinal)>($3,$4,$5)
-             ORDER BY r.thread_id,r.entry_seq,r.ref_ordinal LIMIT $6");
-        const $target: &str = concat!(ref_columns!($index, "$3"),
-            "r.target_space_id=$2 AND (r.target_note_id,r.thread_id,r.entry_seq,r.ref_ordinal)>($4,$5,$6,$7)
-             ORDER BY r.target_note_id,r.thread_id,r.entry_seq,r.ref_ordinal LIMIT $8");
+        const $all: &str = concat!(ref_columns!($index),
+            "r.created_space_seq<=$2 AND (r.created_space_seq,r.thread_id,r.entry_seq,r.ref_ordinal)>($3,$4,$5,$6)
+             ORDER BY r.created_space_seq,r.thread_id,r.entry_seq,r.ref_ordinal LIMIT $7");
+        const $target: &str = concat!(ref_columns!($index),
+            "r.target_space_id=$2 AND r.created_space_seq<=$3 AND (r.created_space_seq,r.thread_id,r.entry_seq,r.ref_ordinal)>($4,$5,$6,$7)
+             ORDER BY r.created_space_seq,r.thread_id,r.entry_seq,r.ref_ordinal LIMIT $8");
     };
 }
 ref_pages!(
@@ -666,6 +663,9 @@ ref_pages!(
     " INDEXED BY idx_chat_entries_projection"
 );
 ref_pages!(PG_ALL_REFS, PG_TARGET_REFS, "");
+
+// Ordered columns shared by the all-occurrence, target and single-entry reads.
+type RawOccurrence = (String, i64, i64, String, String, i64, Option<String>);
 
 async fn read_page(
     tx: &mut BackendConn<'_>,
@@ -681,86 +681,78 @@ async fn read_page(
         BackendConn::Sqlite(_) => (SQLITE_ALL_REFS, SQLITE_TARGET_REFS),
         BackendConn::Postgres(_) => (PG_ALL_REFS, PG_TARGET_REFS),
     };
-    // Keep ineligible keys in the raw page. Each call examines at most
-    // limit + 1 occurrences even when every entry was created after the cut.
-    let raw_rows: Vec<(String, i64, i64, String, String, Option<String>)> =
-        match &position.selection {
-            RefSelection::All => {
-                let (after_thread, after_entry, after_ord) =
-                    position.after.as_ref().map_or(("", 0_i64, -1_i64), |c| {
-                        (c.thread.as_str(), c.entry_seq, c.ref_ordinal)
-                    });
-                chat_fetch_all!(
-                    tx,
-                    all_refs,
-                    space,
-                    cut,
-                    after_thread,
-                    after_entry,
-                    after_ord,
-                    fetch_limit
-                )
+    let (after_created, after_thread, after_entry, after_ord) =
+        position.after.as_ref().map_or((0, "", 0, -1), |key| {
+            (
+                key.created_space_seq,
+                key.thread.as_str(),
+                key.entry_seq,
+                key.ref_ordinal,
+            )
+        });
+    let raw_rows: Vec<RawOccurrence> = match &position.selection {
+        RefSelection::All => {
+            chat_fetch_all!(
+                tx,
+                all_refs,
+                space,
+                cut,
+                after_created,
+                after_thread,
+                after_entry,
+                after_ord,
+                fetch_limit
+            )
+        }
+        RefSelection::Entry(entry) => {
+            let Some(head) = exact_entry(tx, &position.scope.space_id, entry).await? else {
+                return Ok(ProjectionChatPage {
+                    refs: Vec::new(),
+                    next: None,
+                });
+            };
+            if !head.visible_at(position.cutoff)? {
+                return Ok(ProjectionChatPage {
+                    refs: Vec::new(),
+                    next: None,
+                });
             }
-            RefSelection::Entry(entry) => {
-                let Some(head) = exact_entry(tx, &position.scope.space_id, entry).await? else {
-                    return Ok(ProjectionChatPage {
-                        refs: Vec::new(),
-                        next: None,
-                    });
-                };
-                if !head.visible_at(position.cutoff)? {
-                    return Ok(ProjectionChatPage {
-                        refs: Vec::new(),
-                        next: None,
-                    });
-                }
-                let after_ord = position.after.as_ref().map_or(-1_i64, |c| c.ref_ordinal);
-                const ENTRY_REFS: &str = "SELECT thread_id, entry_seq, ref_ordinal,
+            const ENTRY_REFS: &str = "SELECT thread_id, entry_seq, ref_ordinal,
                     target_space_id, target_note_id
                 FROM chat_entry_note_refs
                 WHERE space_id=$1 AND thread_id=$2 AND entry_seq=$3 AND ref_ordinal>$4
                 ORDER BY ref_ordinal
                 LIMIT $5";
-                let rows: Vec<(String, i64, i64, String, String)> = chat_fetch_all!(
-                    tx,
-                    ENTRY_REFS,
-                    space,
-                    entry.thread.as_str(),
-                    entry.seq.get() as i64,
-                    after_ord,
-                    fetch_limit
-                );
-                let rev = head.revision.as_str().to_owned();
-                rows.into_iter()
-                    .map(|(t, s, o, ts, tn)| (t, s, o, ts, tn, Some(rev.clone())))
-                    .collect()
-            }
-            RefSelection::Target(target) => {
-                let (after_note, after_thread, after_entry, after_ord) = position
-                    .after
-                    .as_ref()
-                    .map_or(("", "", 0_i64, -1_i64), |c| {
-                        (
-                            c.target_note.as_str(),
-                            c.thread.as_str(),
-                            c.entry_seq,
-                            c.ref_ordinal,
-                        )
-                    });
-                chat_fetch_all!(
-                    tx,
-                    target_refs,
-                    space,
-                    target.space_id.as_str(),
-                    cut,
-                    after_note,
-                    after_thread,
-                    after_entry,
-                    after_ord,
-                    fetch_limit
-                )
-            }
-        };
+            let rows: Vec<(String, i64, i64, String, String)> = chat_fetch_all!(
+                tx,
+                ENTRY_REFS,
+                space,
+                entry.thread.as_str(),
+                entry.seq.get() as i64,
+                after_ord,
+                fetch_limit
+            );
+            let rev = head.revision.as_str().to_owned();
+            let created = head.created_seq.get() as i64;
+            rows.into_iter()
+                .map(|(t, s, o, ts, tn)| (t, s, o, ts, tn, created, Some(rev.clone())))
+                .collect()
+        }
+        RefSelection::Target(target) => {
+            chat_fetch_all!(
+                tx,
+                target_refs,
+                space,
+                target.space_id.as_str(),
+                cut,
+                after_created,
+                after_thread,
+                after_entry,
+                after_ord,
+                fetch_limit
+            )
+        }
+    };
 
     let has_more = raw_rows.len() > limit;
     let mut rows = raw_rows;
@@ -768,8 +760,8 @@ async fn read_page(
 
     let last_cursor = rows
         .last()
-        .map(|(thread, seq, ord, _, target_note, _)| RefCursorKey {
-            target_note: target_note.clone(),
+        .map(|(thread, seq, ord, _, _, created, _)| RefCursorKey {
+            created_space_seq: *created,
             thread: thread.clone(),
             entry_seq: *seq,
             ref_ordinal: *ord,
@@ -785,7 +777,7 @@ async fn read_page(
     }
 
     let mut refs = Vec::with_capacity(rows.len());
-    for (thread, seq, ord, target_space_raw, target_note_raw, revision) in rows {
+    for (thread, seq, ord, target_space_raw, target_note_raw, _, revision) in rows {
         let Some(revision) = revision else { continue };
         let target_space_id = SpaceId::parse(&target_space_raw)?;
         let target_note_id = NoteId::parse(&target_note_raw)?;
@@ -949,6 +941,7 @@ pub(crate) async fn write_chat_note_refs_json_tx(
     space_id: &str,
     thread_id: &str,
     entry_seq: i64,
+    created_space_seq: i64,
     refs_json: &str,
 ) -> Result<(), PortError> {
     if refs_json == "[]" {
@@ -956,7 +949,7 @@ pub(crate) async fn write_chat_note_refs_json_tx(
     }
     let refs: Vec<NoteRef> = serde_json::from_str(refs_json)
         .map_err(|error| internal_not_committed("parse_chat_note_refs", error.to_string()))?;
-    write_chat_note_refs_tx(tx, space_id, thread_id, entry_seq, &refs).await
+    write_chat_note_refs_tx(tx, space_id, thread_id, entry_seq, created_space_seq, &refs).await
 }
 
 pub(crate) async fn write_chat_note_refs_tx(
@@ -964,6 +957,7 @@ pub(crate) async fn write_chat_note_refs_tx(
     space_id: &str,
     thread_id: &str,
     entry_seq: i64,
+    created_space_seq: i64,
     refs: &[NoteRef],
 ) -> Result<(), PortError> {
     if refs.is_empty() {
@@ -981,7 +975,7 @@ pub(crate) async fn write_chat_note_refs_tx(
     for chunk in unique.chunks(REF_INSERT_CHUNK) {
         let mut sql = String::from(
             "INSERT INTO chat_entry_note_refs \
-             (space_id, thread_id, entry_seq, ref_ordinal, target_space_id, target_note_id) VALUES ",
+             (space_id, thread_id, entry_seq, ref_ordinal, target_space_id, target_note_id, created_space_seq) VALUES ",
         );
         let postgres = matches!(tx, BackendConn::Postgres(_));
         for (idx, _) in chunk.iter().enumerate() {
@@ -989,20 +983,21 @@ pub(crate) async fn write_chat_note_refs_tx(
                 sql.push_str(", ");
             }
             if postgres {
-                let base = idx * 6;
+                let base = idx * 7;
                 use std::fmt::Write;
                 let _ = write!(
                     sql,
-                    "(${}, ${}, ${}, ${}, ${}, ${})",
+                    "(${}, ${}, ${}, ${}, ${}, ${}, ${})",
                     base + 1,
                     base + 2,
                     base + 3,
                     base + 4,
                     base + 5,
-                    base + 6
+                    base + 6,
+                    base + 7
                 );
             } else {
-                sql.push_str("(?, ?, ?, ?, ?, ?)");
+                sql.push_str("(?, ?, ?, ?, ?, ?, ?)");
             }
         }
         match tx {
@@ -1015,7 +1010,8 @@ pub(crate) async fn write_chat_note_refs_tx(
                         .bind(entry_seq)
                         .bind(*ordinal)
                         .bind(item.space_id.as_str())
-                        .bind(item.note_id.as_str());
+                        .bind(item.note_id.as_str())
+                        .bind(created_space_seq);
                 }
                 query.execute(&mut **conn).await.map_err(|err| {
                     internal_not_committed("write_chat_note_refs", err.to_string())
@@ -1030,7 +1026,8 @@ pub(crate) async fn write_chat_note_refs_tx(
                         .bind(entry_seq)
                         .bind(*ordinal)
                         .bind(item.space_id.as_str())
-                        .bind(item.note_id.as_str());
+                        .bind(item.note_id.as_str())
+                        .bind(created_space_seq);
                 }
                 query.execute(&mut **conn).await.map_err(|err| {
                     internal_not_committed("write_chat_note_refs", err.to_string())
@@ -1110,7 +1107,7 @@ mod sqlite_access_tests {
             db.execute(
                 &format!(
                     "{range} INSERT INTO chat_entry_note_refs
-                SELECT 's','t',i,0,'s','n' FROM seq"
+                SELECT 's','t',i,0,CASE WHEN i=?2 THEN 's' ELSE 'other' END,'n',i+2 FROM seq"
                 ),
                 params![previous, size],
             )
@@ -1120,25 +1117,44 @@ mod sqlite_access_tests {
             for (query, args) in [
                 (
                     SQLITE_ALL_REFS,
-                    named_params! {"$1":"s", "$2":2, "$3":"", "$4":0, "$5":-1, "$6":2},
+                    named_params! {"$1":"s", "$2":2, "$3":0, "$4":"", "$5":0, "$6":-1, "$7":2},
                 ),
                 (
                     SQLITE_TARGET_REFS,
-                    named_params! {"$1":"s", "$2":"s", "$3":2, "$4":"", "$5":"", "$6":0, "$7":-1, "$8":2},
+                    named_params! {"$1":"s", "$2":"s", "$3":2, "$4":0, "$5":"", "$6":0, "$7":-1, "$8":2},
                 ),
             ] {
                 let mut stmt = db.prepare(query).unwrap();
                 let revisions = stmt
-                    .query_map(args, |row| row.get::<_, Option<String>>(5))
+                    .query_map(args, |row| row.get::<_, Option<String>>(6))
                     .unwrap()
                     .collect::<rusqlite::Result<Vec<_>>>()
                     .unwrap();
-                assert_eq!(revisions, [None, None]);
+                assert!(revisions.is_empty());
                 assert!(
                     stmt.get_status(StatementStatus::VmStep) < 250,
                     "{size} later entries"
                 );
             }
+            // Only the last entry in this interval addresses s. Seeking by the
+            // target and cursor must bypass all eligible unrelated occurrences.
+            let mut target = db.prepare(SQLITE_TARGET_REFS).unwrap();
+            let matched = target
+                .query_map(
+                    named_params! {
+                        "$1":"s", "$2":"s", "$3":size+2, "$4":size/2+2,
+                        "$5":"t", "$6":size/2, "$7":0, "$8":2
+                    },
+                    |row| row.get::<_, i64>(1),
+                )
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(matched, [size]);
+            assert!(
+                target.get_status(StatementStatus::VmStep) < 250,
+                "{size} entries"
+            );
         }
     }
 

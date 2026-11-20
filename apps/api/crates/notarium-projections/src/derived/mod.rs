@@ -58,6 +58,12 @@ pub struct DerivedStore {
 }
 
 impl DerivedStore {
+    /// Take the number of real SQLite read transactions and 128-step VM progress callbacks.
+    #[cfg(test)]
+    pub(crate) fn take_sqlite_read_work(&self) -> (usize, usize) {
+        self.database.sqlite_read_work()
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub async fn open_sqlite(
         root: &DataRoot,

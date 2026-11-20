@@ -610,12 +610,7 @@ fn is_lower_hex(value: &str, len: usize) -> bool {
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
-pub(crate) fn discard_abandoned_temp(
-    path: &Path,
-    generation: ProjectionGeneration,
-    scope: &HistoryScope,
-    through: SpaceSeq,
-) -> Result<(), IndexError> {
+fn abandoned_checkpoint_name(path: &Path) -> bool {
     let name = path.file_name().and_then(|name| name.to_str());
     let is_temp = name
         .and_then(|name| name.strip_prefix(".fast-index-"))
@@ -624,7 +619,36 @@ pub(crate) fn discard_abandoned_temp(
     let is_deleted = name
         .and_then(|name| name.strip_prefix(".deleted-"))
         .is_some_and(|nonce| is_lower_hex(nonce, 16));
-    if !is_temp && !is_deleted {
+    is_temp || is_deleted
+}
+
+pub(crate) fn has_unreconciled_checkpoint(
+    path: &Path,
+    generation: ProjectionGeneration,
+    scope: &HistoryScope,
+    through: SpaceSeq,
+    identity: Option<&IndexIdentity>,
+) -> Result<bool, IndexError> {
+    if identity.is_none() && !abandoned_checkpoint_name(path) {
+        return Ok(false);
+    }
+    let _mutation = file_mutations();
+    Ok(matches!(
+        match_file_header(&absolute(path)?, |header| match identity {
+            Some(identity) => format::matches_header(header, identity),
+            None => format::matches_temp_header(header, generation, scope, through),
+        })?,
+        HeaderMatch::Matching
+    ))
+}
+
+pub(crate) fn discard_abandoned_temp(
+    path: &Path,
+    generation: ProjectionGeneration,
+    scope: &HistoryScope,
+    through: SpaceSeq,
+) -> Result<(), IndexError> {
+    if !abandoned_checkpoint_name(path) {
         return Ok(());
     }
     let _mutation = file_mutations();
@@ -640,7 +664,11 @@ pub(crate) fn discard_abandoned_temp(
         // `PermissionDenied`) until all open reader handles drop.
         #[cfg(windows)]
         Err(IndexError::Io(error))
-            if is_deleted && error.kind() == io::ErrorKind::PermissionDenied =>
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(".deleted-"))
+                && error.kind() == io::ErrorKind::PermissionDenied =>
         {
             Ok(())
         }
@@ -653,49 +681,72 @@ fn discard_matching_header(
     path: &Path,
     belongs_to_cut: impl FnOnce(&[u8; format::HEADER_SIZE]) -> bool,
 ) -> Result<bool, IndexError> {
+    match match_file_header(path, belongs_to_cut)? {
+        HeaderMatch::Missing => Ok(true),
+        HeaderMatch::Other => Ok(false),
+        HeaderMatch::Matching => {
+            discard_path(path)?;
+            Ok(true)
+        }
+    }
+}
+
+enum HeaderMatch {
+    Missing,
+    Other,
+    Matching,
+}
+
+fn match_file_header(
+    path: &Path,
+    belongs_to_cut: impl FnOnce(&[u8; format::HEADER_SIZE]) -> bool,
+) -> Result<HeaderMatch, IndexError> {
     let directory = path
         .parent()
         .ok_or(IndexError::Untrusted("missing checkpoint directory"))?;
     match check_private_directory(directory) {
         Ok(()) => {}
-        Err(IndexError::Io(error)) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
+        Err(IndexError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(HeaderMatch::Missing);
+        }
         Err(error) => return Err(error),
     }
     let original = match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.is_file() => FileWitness::from_metadata(&metadata),
-        Ok(_) => return Ok(false),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
+        Ok(_) => return Ok(HeaderMatch::Other),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(HeaderMatch::Missing),
         Err(error) => return Err(error.into()),
     };
     let mut file = match open_readonly(path) {
         Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(HeaderMatch::Missing),
         Err(error) => return Err(error.into()),
     };
     let metadata = file.metadata()?;
     if !metadata.is_file() || FileWitness::from_metadata(&metadata) != original {
-        return Ok(false);
+        return Ok(HeaderMatch::Other);
     }
     let mut header = [0; format::HEADER_SIZE];
     match file.read_exact(&mut header) {
         Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
+            return Ok(HeaderMatch::Other);
+        }
         Err(error) => return Err(error.into()),
     }
     drop(file);
     if !belongs_to_cut(&header) {
-        return Ok(false);
+        return Ok(HeaderMatch::Other);
     }
     let current = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(HeaderMatch::Missing),
         Err(error) => return Err(error.into()),
     };
     if current.is_file() && FileWitness::from_metadata(&current) == original {
-        discard_path(path)?;
-        return Ok(true);
+        return Ok(HeaderMatch::Matching);
     }
-    Ok(false)
+    Ok(HeaderMatch::Other)
 }
 
 fn registered_leases(directory: &Path) -> Vec<(Arc<FileLease>, Weak<MmapPoolInner>)> {
