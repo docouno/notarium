@@ -329,7 +329,29 @@ impl CanonicalRuntime {
         config: CanonicalConfig,
         custom_s3_transport: Option<Arc<dyn S3Transport>>,
     ) -> Result<(CanonicalStore, Self), PortError> {
+        Self::open_internal(config, custom_s3_transport, false).await
+    }
+
+    pub async fn open_for_restore(
+        config: CanonicalConfig,
+        authority: &notarium_core::ports::ServiceAuthority,
+    ) -> Result<(CanonicalStore, Self), PortError> {
+        authority.require(notarium_core::ports::ServicePurpose::Restore)?;
+        Self::open_internal(config, None, true).await
+    }
+
+    async fn open_internal(
+        config: CanonicalConfig,
+        custom_s3_transport: Option<Arc<dyn S3Transport>>,
+        restoring: bool,
+    ) -> Result<(CanonicalStore, Self), PortError> {
         config.validate_timer_intervals()?;
+        if let SqlBackendConfig::Sqlite { data_root, .. } = &config.sql {
+            match std::fs::symlink_metadata(data_root.restore_guard()) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                _ => return Err(DomainError::MigrationInProgress.into()),
+            }
+        }
         let mut locks = Vec::new();
         match (&config.sql, &config.blobs) {
             (
@@ -409,11 +431,19 @@ impl CanonicalRuntime {
                     pool_size,
                     statement_timeout,
                 } => {
+                    let namespace = match &config.blobs {
+                        BlobBackendConfig::S3(remote) => {
+                            Some(crate::blobs::s3::namespace_fingerprint(remote)?)
+                        }
+                        BlobBackendConfig::Local { .. } => None,
+                    };
                     let (pool, witness, validated_schema) = open_and_bootstrap_postgres(
                         connect,
                         schema,
                         &config.installation_id,
+                        namespace,
                         *pool_size,
+                        restoring,
                     )
                     .await?;
                     (
@@ -609,6 +639,23 @@ impl CanonicalRuntime {
 }
 
 impl CanonicalStore {
+    pub fn uses_cloud_blobs(&self) -> bool {
+        matches!(self.inner.config.blobs, BlobBackendConfig::S3(_))
+    }
+
+    pub fn accepts_archive_namespace(
+        &self,
+        archives: Option<&crate::blobs::s3::S3BlobStore>,
+    ) -> bool {
+        match (&self.inner.blobs, archives) {
+            (BlobBackendDriver::Local(_), None) => true,
+            (BlobBackendDriver::S3(content), Some(archives)) => {
+                !content.overlaps_namespace(archives)
+            }
+            _ => false,
+        }
+    }
+
     pub fn installation_id(&self) -> &InstallationId {
         &self.inner.config.installation_id
     }
@@ -769,6 +816,48 @@ impl CanonicalStore {
         .await
     }
 
+    /// Seed the immediate-cleanup obligation that migration creates for an
+    /// unowned active publication persisted by the pre-quarantine runtime.
+    #[cfg(feature = "test-support")]
+    pub async fn mark_legacy_blob_cleanup(
+        &self,
+        scope: &HistoryScope,
+        epoch: LeaseEpoch,
+        digest: ContentDigest,
+    ) -> Result<(), PortError> {
+        let scope = scope.clone();
+        self.with_write_tx(|tx| {
+            Box::pin(async move {
+                crate::blobs::lock_and_check_space_tx(tx, &scope, epoch).await?;
+                let sql = "UPDATE blob_catalog SET legacy_cleanup=1 WHERE space_id=$1
+                           AND content_blake3=$2 AND ref_count=0 AND blob_state='active'
+                           AND admission_state='open'";
+                let affected = match tx {
+                    BackendConn::Sqlite(conn) => sqlx::query(sql)
+                        .bind(scope.space_id.as_str())
+                        .bind(digest.as_bytes().as_slice())
+                        .execute(&mut **conn)
+                        .await
+                        .map(|result| result.rows_affected()),
+                    BackendConn::Postgres(conn) => sqlx::query(sql)
+                        .bind(scope.space_id.as_str())
+                        .bind(digest.as_bytes().as_slice())
+                        .execute(&mut **conn)
+                        .await
+                        .map(|result| result.rows_affected()),
+                }
+                .map_err(|err| {
+                    internal_not_committed("seed_legacy_blob_cleanup", err.to_string())
+                })?;
+                if affected != 1 {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+                Ok(())
+            })
+        })
+        .await
+    }
+
     pub(crate) fn ensure_open(&self) -> Result<(), PortError> {
         if self.inner.shutting_down.load(Ordering::SeqCst) {
             return Err(unavailable_retryable(
@@ -808,17 +897,8 @@ impl CanonicalStore {
                         Duration::from_millis(100),
                     )
                 })?;
-                let mut conn = BackendConn::Sqlite(&mut pair.sqlx_conn);
-                let mut transaction = WriteTransaction::begin(&mut conn).await?;
-                let value = op(&mut transaction.conn()).await?;
-                transaction.commit().await?;
-                self.inner
-                    .sqlite_writer_commit_gen
-                    .fetch_add(1, Ordering::Release);
-                if let Some(wal) = self.inner.wal_coord.get() {
-                    wal.note_writer_commit();
-                }
-                value
+                self.write_sqlite_transaction(&mut pair.sqlx_conn, op, || Ok(()))
+                    .await?
             }
             SqlDriverState::Postgres { pool, .. } => {
                 let mut pooled = pool.acquire().await.map_err(|err| {
@@ -845,6 +925,37 @@ impl CanonicalStore {
                 value
             }
         };
+        Ok(value)
+    }
+
+    pub(crate) async fn write_sqlite_transaction<F, T>(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        op: F,
+        authorize_commit: impl FnOnce() -> Result<(), PortError>,
+    ) -> Result<T, PortError>
+    where
+        F: for<'c> FnOnce(&'c mut BackendConn<'_>) -> crate::BoxFuture<'c, Result<T, PortError>>,
+    {
+        let mut conn = BackendConn::Sqlite(connection);
+        let mut transaction = WriteTransaction::begin(&mut conn).await?;
+        let value = op(&mut transaction.conn()).await?;
+        if let Err(error) = authorize_commit() {
+            if !transaction.rollback().await {
+                return Err(internal_not_committed(
+                    "sqlite_write_rollback",
+                    "SQLite rollback was not acknowledged",
+                ));
+            }
+            return Err(error);
+        }
+        transaction.commit().await?;
+        self.inner
+            .sqlite_writer_commit_gen
+            .fetch_add(1, Ordering::Release);
+        if let Some(wal) = self.inner.wal_coord.get() {
+            wal.note_writer_commit();
+        }
         Ok(value)
     }
 
@@ -1196,6 +1307,26 @@ impl CanonicalStore {
         &self,
         spec: CreateFolderSpec,
     ) -> Result<(FolderRef, RevisionId, SpaceSeq), PortError> {
+        self.create_folder_inner(spec, None).await
+    }
+
+    pub(crate) async fn create_folder_import(
+        &self,
+        spec: CreateFolderSpec,
+        budget: &CallBudget,
+        guard: crate::peers::archive_import::ImportFolderCommit,
+    ) -> Result<(FolderRef, RevisionId, SpaceSeq), PortError> {
+        self.create_folder_inner(spec, Some((budget, guard))).await
+    }
+
+    async fn create_folder_inner(
+        &self,
+        spec: CreateFolderSpec,
+        import: Option<(
+            &CallBudget,
+            crate::peers::archive_import::ImportFolderCommit,
+        )>,
+    ) -> Result<(FolderRef, RevisionId, SpaceSeq), PortError> {
         self.inner
             .check_writer_epoch(&spec.scope.space_id, spec.active_epoch)?;
         let slug_fold = normalize_slug_key(&spec.slug)?;
@@ -1212,20 +1343,45 @@ impl CanonicalStore {
         let now_ms = now_unix_ms()?;
         let rev_id = new_revision_id()?;
         let cmd_id = new_prefixed_hex_id("cmd_")?;
+        let (timing, import_guard) = match import {
+            Some((budget, guard)) => (
+                Some((
+                    budget,
+                    crate::domain::common::CommandDeadline::start(budget, "create_import_folder"),
+                )),
+                Some(guard),
+            ),
+            None => (None, None),
+        };
+        let committed_scope = spec.scope.clone();
+        let retained_authority = import_guard.as_ref().map(|guard| guard.authority.clone());
 
         let out = self
-            .with_write_tx(|tx| {
-                let spec_cl = spec.clone();
-                let slug_fold_cl = slug_fold.clone();
-                let proj_fold_cl = project_slug_fold.clone();
-                let rev_cl = rev_id.clone();
-                let cmd_cl = cmd_id.clone();
+            .with_auxiliary_command(timing, move |out| {
+                drop(retained_authority);
+                Ok(out)
+            }, move |tx| {
+                let spec_cl = spec;
+                let slug_fold_cl = slug_fold;
+                let proj_fold_cl = project_slug_fold;
+                let rev_cl = rev_id;
+                let cmd_cl = cmd_id;
                 Box::pin(async move {
+                if let Some(guard) = &import_guard {
+                    guard.fence.scope.check(&spec_cl.scope)?;
+                    crate::blobs::lock_and_check_space_tx(
+                        tx, &spec_cl.scope, spec_cl.active_epoch,
+                    ).await?;
+                }
                 let space_rec = load_space_record(tx, &spec_cl.scope.space_id).await?;
                 space_rec.scope.check(&spec_cl.scope)?;
                 if space_rec.active_epoch != spec_cl.active_epoch {
                     return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
                 }
+                let guarded_expiry = match &import_guard {
+                    Some(guard) => Some(guard.check_tx(tx, &space_rec).await?),
+                    None => None,
+                };
 
                 // Checked sequence bump BEFORE any effect!
                 let next_seq = space_rec.last_seq.checked_next()?;
@@ -1412,6 +1568,9 @@ impl CanonicalStore {
                 )
                 .await?;
 
+                if let (Some(guard), Some(until)) = (import_guard, guarded_expiry) {
+                    guard.authority.check_before_commit(tx, until).await?;
+                }
                 Ok((
                     FolderRef {
                         space_id: spec_cl.scope.space_id,
@@ -1427,7 +1586,7 @@ impl CanonicalStore {
         self.inner
             .broadcast_hub
             .publish(BroadcastSignal::Committed {
-                scope: spec.scope,
+                scope: committed_scope,
                 new_last_seq: out.2,
             });
         Ok(out)

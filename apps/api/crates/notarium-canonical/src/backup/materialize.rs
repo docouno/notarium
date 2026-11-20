@@ -9,6 +9,157 @@ use notarium_core::{
 };
 use sqlx::{Acquire, Postgres, QueryBuilder, Transaction};
 
+/// Materialize a validated archive inside the coordinator's unpublished target
+/// transaction. Decode one bounded row at a time and keep SQL identifiers tied
+/// to the canonical schema registry.
+pub async fn import_postgres_spool(
+    input: impl std::io::Read + Send + 'static,
+    bytes: u64,
+    row_limit: u64,
+    cancellation: notarium_core::ports::Cancellation,
+    target: &mut Transaction<'_, Postgres>,
+) -> Result<BackupWitness, PortError> {
+    use crate::schema::manifest::TableSpec;
+    use tokio::sync::mpsc;
+    type Row = (TableSpec, Vec<PostgresSpoolValue>);
+    let (sender, mut rows) = mpsc::channel::<Row>(1);
+    let parser_cancel = cancellation.clone();
+    let parser = tokio::task::spawn_blocking(move || {
+        super::scan_postgres_spool_v1(input, bytes, bytes, row_limit, |table, row| {
+            if parser_cancel.is_cancelled() {
+                return Err(crate::codec::cancelled_not_committed(
+                    "pg_spool_import",
+                    "restore cancelled",
+                ));
+            }
+            if matches!(
+                table.name,
+                "archive_artifacts"
+                    | "archive_export_cuts"
+                    | "archive_export_shadows"
+                    | "archive_uploads"
+                    | "archive_import_sources"
+                    | "backup_artifacts"
+                    | "backup_holds"
+                    | "blob_retirements"
+                    | "blob_retirement_targets"
+                    | "pending_purges"
+            ) {
+                return Ok(());
+            }
+            sender.blocking_send((table, row.to_vec())).map_err(|_| {
+                crate::codec::cancelled_not_committed("pg_spool_import", "restore receiver closed")
+            })
+        })
+    });
+    let insert_rows = async {
+        let mut current: Option<TableSpec> = None;
+        let mut columns = String::new();
+        let mut statement = String::new();
+        while let Some((table, row)) = rows.recv().await {
+            if current.is_none_or(|previous| previous.name != table.name) {
+                if let Some(previous) = current {
+                    finish_staged_table(target, previous.name, &columns).await?;
+                }
+                current = Some(table);
+                columns = table
+                    .columns
+                    .iter()
+                    .map(|col| col.name)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let dest = if self_referencing(table.name) {
+                    let create = format!(
+                        "CREATE TEMP TABLE notarium_restore_rows ON COMMIT DROP AS SELECT {columns}
+                         FROM {} WITH NO DATA",
+                        table.name,
+                    );
+                    sqlx::raw_sql(sqlx::AssertSqlSafe(create))
+                        .execute(&mut **target)
+                        .await
+                        .map_err(import_error)?;
+                    "pg_temp.notarium_restore_rows"
+                } else {
+                    table.name
+                };
+                statement = format!("INSERT INTO {dest} ({columns}) ");
+            }
+            insert_row(target, &statement, row).await?;
+        }
+        if let Some(table) = current {
+            finish_staged_table(target, table.name, &columns).await?;
+        }
+        Ok::<_, PortError>(())
+    };
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => Err(crate::codec::cancelled_not_committed(
+            "pg_spool_import",
+            "restore cancelled",
+        )),
+        result = async {
+            insert_rows.await?;
+            parser.await.map_err(|err| {
+                internal_not_committed("pg_restore_spool_worker", err.to_string())
+            })?
+        } => result,
+    }
+}
+
+fn self_referencing(table: &str) -> bool {
+    matches!(table, "folder_heads" | "chat_entries")
+}
+
+async fn finish_staged_table(
+    tx: &mut Transaction<'_, Postgres>,
+    table: &str,
+    columns: &str,
+) -> Result<(), PortError> {
+    if self_referencing(table) {
+        let apply = format!(
+            "INSERT INTO {table} ({columns}) SELECT {columns} FROM pg_temp.notarium_restore_rows;
+             DROP TABLE pg_temp.notarium_restore_rows"
+        );
+        sqlx::raw_sql(sqlx::AssertSqlSafe(apply))
+            .execute(&mut **tx)
+            .await
+            .map_err(import_error)?;
+    }
+    Ok(())
+}
+
+async fn insert_row(
+    target: &mut Transaction<'_, Postgres>,
+    statement: &str,
+    row: Vec<PostgresSpoolValue>,
+) -> Result<(), PortError> {
+    let mut query = QueryBuilder::<Postgres>::new(statement.to_owned());
+    query.push_values([row], |mut args, row| {
+        for value in row {
+            match value {
+                PostgresSpoolValue::Null => {
+                    args.push("NULL");
+                }
+                PostgresSpoolValue::Int(v) => {
+                    args.push_bind(v);
+                }
+                PostgresSpoolValue::Text(v) => {
+                    args.push_bind(v);
+                }
+                PostgresSpoolValue::Bytes(v) => {
+                    args.push_bind(v);
+                }
+            }
+        }
+    });
+    query
+        .build()
+        .execute(&mut **target)
+        .await
+        .map_err(import_error)?;
+    Ok(())
+}
+
 impl DecodedPostgresSpoolV1 {
     /// Import a verified spool into the transaction's empty, version-matched schema.
     /// A failed constraint rolls the import back to its savepoint.

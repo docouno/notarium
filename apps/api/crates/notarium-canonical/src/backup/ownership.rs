@@ -9,25 +9,91 @@ use std::{
 use notarium_core::{
     DomainError,
     error::{PortError, ValidationReason},
-    ids::{ArtifactId, BackupId, ContentDigest},
+    ids::{ArtifactId, BackupId, ContentDigest, RequestId},
+    ports::{CallBudget, Cancellation},
 };
 use sqlx::{PgConnection, Row};
 
 use super::{
-    BackendConn, BackupArtifactEncoding, CanonicalInner, CanonicalStore, SqlDriverState,
-    create_private_tmp_file, fsync_parent_dir, internal_not_committed, mint_artifact_id,
-    open_backup_connection, register_cleanup_task, remove_tmp_artifacts, resolve_spool_dir,
+    BACKUP_CLEANUP_GRACE, BackendConn, BackupArtifactEncoding, CanonicalInner, CanonicalStore,
+    SqlDriverState, cancelled_not_committed, create_private_tmp_file, deadline_not_committed,
+    fsync_parent_dir, internal_not_committed, mint_artifact_id, open_backup_connection,
+    register_cleanup_task, remove_tmp_artifacts, resolve_spool_dir, rollback_backup_connection,
     unavailable_retryable,
 };
 
 const HOLD_LOCK_SQL: &str = "SELECT pg_try_advisory_lock(hashtextextended(current_schema() || ':' || $1, 7311230)), set_config('application_name', $2, false), pg_backend_pid(), set_config('statement_timeout', $3, false)";
 
+pub(super) async fn fence_artifact_publication(
+    conn: &mut PgConnection,
+    id: &ArtifactId,
+) -> Result<(), PortError> {
+    let acquired: bool = sqlx::query_scalar(
+        "SELECT pg_try_advisory_xact_lock(hashtextextended(current_schema() || ':' || $1, 7311233))",
+    )
+    .bind(id.as_str())
+    .fetch_one(conn)
+    .await
+    .map_err(|err| internal_not_committed("pg_backup_artifact_fence", err.to_string()))?;
+    if !acquired {
+        return Err(unavailable_retryable(
+            "backup_artifact_publication_pending",
+            "artifact publication transaction is still active",
+            Duration::from_millis(50),
+        ));
+    }
+    Ok(())
+}
+
 pub(super) enum HoldOwnership {
     Local(Weak<CanonicalInner>, BackupId),
     Postgres {
-        connection: Box<PgConnection>,
+        connection: Option<Box<PgConnection>>,
         pid: i32,
     },
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct HoldWriteBudget<'a> {
+    pub(super) deadline: tokio::time::Instant,
+    pub(super) cancellation: Option<&'a Cancellation>,
+}
+
+impl HoldWriteBudget<'_> {
+    fn cancelled() -> PortError {
+        cancelled_not_committed("backup_owner_write", "backup SQL cancelled before COMMIT")
+    }
+
+    fn expired() -> PortError {
+        deadline_not_committed("backup_owner_write", "backup SQL deadline expired")
+    }
+
+    fn check(self) -> Result<(), PortError> {
+        if self.cancellation.is_some_and(Cancellation::is_cancelled) {
+            return Err(Self::cancelled());
+        }
+        if tokio::time::Instant::now() >= self.deadline {
+            return Err(Self::expired());
+        }
+        Ok(())
+    }
+
+    pub(super) async fn admit<T>(self, action: impl Future<Output = T>) -> Result<T, PortError> {
+        self.check()?;
+        let wait = tokio::time::timeout_at(self.deadline, action);
+        let result = if let Some(cancellation) = self.cancellation {
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => return Err(Self::cancelled()),
+                result = wait => result,
+            }
+        } else {
+            wait.await
+        };
+        let result = result.map_err(|_| Self::expired())?;
+        self.check()?;
+        Ok(result)
+    }
 }
 
 impl HoldOwnership {
@@ -65,7 +131,7 @@ impl HoldOwnership {
                     .map_err(|err| internal_not_committed("pg_backup_owner", err.to_string()))?;
                 if row.get::<bool, _>(0) {
                     return Ok(Self::Postgres {
-                        connection: Box::new(conn),
+                        connection: Some(Box::new(conn)),
                         pid: row.get(2),
                     });
                 }
@@ -96,26 +162,71 @@ impl HoldOwnership {
     pub(super) async fn with_write_tx<F, T>(
         &mut self,
         store: &CanonicalStore,
+        budget: HoldWriteBudget<'_>,
         op: F,
     ) -> Result<T, PortError>
     where
         F: for<'c> FnOnce(&'c mut BackendConn<'_>) -> crate::BoxFuture<'c, Result<T, PortError>>,
     {
+        store.ensure_open()?;
+        let _gate = budget
+            .admit(store.inner.writer()?.acquire_commit_read_guard())
+            .await?;
         let Self::Postgres { connection, .. } = self else {
-            return store.with_write_tx(op).await;
+            let SqlDriverState::Sqlite { writer, .. } = &store.inner.sql else {
+                unreachable!("local hold on PostgreSQL")
+            };
+            let mut guard = budget.admit(writer.lock()).await?;
+            let pair = guard.as_mut().ok_or_else(hold_connection_closed)?;
+            // Once SQLite admits BEGIN the writer owns the transaction through
+            // rollback or COMMIT. Only the reversible waits above may be abandoned.
+            return store
+                .write_sqlite_transaction(&mut pair.sqlx_conn, op, || budget.check())
+                .await;
         };
-        let _gate = store.inner.writer()?.acquire_commit_read_guard().await;
-        let mut backend = BackendConn::Postgres(connection);
-        let mut transaction = crate::sql_exec::WriteTransaction::begin(&mut backend).await?;
-        let value = op(&mut transaction.conn()).await?;
-        transaction.commit().await?;
-        Ok(value)
+        let conn = connection.as_mut().ok_or_else(hold_connection_closed)?;
+        let unknown = || {
+            crate::codec::unknown_commit_non_idempotent(
+                "backup_owner_commit",
+                "backup transaction commit was not acknowledged",
+            )
+        };
+        let mut committing = false;
+        let write = async {
+            let mut backend = BackendConn::Postgres(conn);
+            let mut transaction = crate::sql_exec::WriteTransaction::begin(&mut backend).await?;
+            let value = op(&mut transaction.conn()).await?;
+            budget.check()?;
+            committing = true;
+            tokio::time::timeout(BACKUP_CLEANUP_GRACE, transaction.commit())
+                .await
+                .map_err(|_| unknown())??;
+            Ok(value)
+        };
+        let result = tokio::time::timeout_at(budget.deadline, write)
+            .await
+            .unwrap_or_else(|_| {
+                Err(if committing {
+                    unknown()
+                } else {
+                    HoldWriteBudget::expired()
+                })
+            });
+        if result.is_err()
+            && rollback_backup_connection(conn, "backup_owner_rollback")
+                .await
+                .is_err()
+        {
+            drop(connection.take());
+        }
+        result
     }
 
     pub(super) async fn verify(&mut self) -> Result<(), PortError> {
         if let Self::Postgres { connection, .. } = self {
+            let conn = connection.as_mut().ok_or_else(hold_connection_closed)?;
             sqlx::raw_sql("SELECT 1")
-                .execute(&mut **connection)
+                .execute(&mut **conn)
                 .await
                 .map_err(|err| {
                     unavailable_retryable(
@@ -127,6 +238,14 @@ impl HoldOwnership {
         }
         Ok(())
     }
+}
+
+fn hold_connection_closed() -> PortError {
+    unavailable_retryable(
+        "pg_backup_hold_lost",
+        "backup hold connection closed",
+        Duration::from_millis(50),
+    )
 }
 
 pub(super) async fn interrupt_pg_session(
@@ -182,6 +301,33 @@ pub(super) async fn recover_holds(store: &CanonicalStore) -> Result<(), PortErro
         }
         Ok(())
     })).await
+}
+
+pub(super) async fn reap_abandoned_holds(
+    store: &CanonicalStore,
+    budget: &notarium_core::ports::CallBudget,
+    after: String,
+) -> Result<Option<String>, PortError> {
+    let deadline = crate::domain::common::CommandDeadline::start(budget, "reap_archive_holds");
+    store.with_auxiliary_command(Some((budget, deadline)), Ok, move |tx| {
+        Box::pin(async move {
+            let BackendConn::Postgres(conn) = tx else {
+                return Ok(None);
+            };
+            let error = |e: sqlx::Error| internal_not_committed("reap_archive_holds", e.to_string());
+            let ids: Vec<String> = sqlx::query_scalar(
+                "SELECT DISTINCT backup_id FROM backup_holds
+                 WHERE backup_id>$1 ORDER BY backup_id LIMIT 16",
+            ).bind(after).fetch_all(&mut **conn).await.map_err(error)?;
+            for id in &ids {
+                sqlx::query(
+                    "DELETE FROM backup_holds WHERE backup_id=$1 AND
+                     pg_try_advisory_xact_lock(hashtextextended(current_schema() || ':' || $1, 7311230))",
+                ).bind(id).execute(&mut **conn).await.map_err(error)?;
+            }
+            Ok(ids.into_iter().last())
+        })
+    }).await
 }
 
 fn fs_error(err: std::io::Error) -> PortError {
@@ -260,6 +406,27 @@ impl ArtifactLease {
         if !marker.try_exists().map_err(fs_error)? {
             return Err(DomainError::validation(ValidationReason::InvalidState).into());
         }
+        // A fresh pending lock grants ownership only if this ID has no
+        // previously staged or accepted file in the volume.
+        for suffix in [
+            "sqlite",
+            "pgspool",
+            "unclaimed",
+            "tmp",
+            "tmp-journal",
+            "tmp-wal",
+            "tmp-shm",
+        ] {
+            let existing = dir.join(format!("{}.{suffix}", id.as_str()));
+            match existing.symlink_metadata() {
+                Ok(_) => {
+                    remove_if_present(&marker)?;
+                    return Err(DomainError::validation(ValidationReason::InvalidState).into());
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(fs_error(error)),
+            }
+        }
         lock.write_all(registry_identity(store).as_bytes())
             .map_err(fs_error)?;
         lock.sync_all().map_err(fs_error)?;
@@ -281,6 +448,16 @@ impl ArtifactLease {
     pub(super) fn begin_publication(&mut self) {
         self.publishing = true;
     }
+    pub(super) fn offer_durable(&self) -> Result<(), PortError> {
+        let offer = self
+            .directory
+            .join(format!("{}.unclaimed", self.id.as_str()));
+        create_private_tmp_file(&offer)?
+            .sync_all()
+            .map_err(fs_error)?;
+        fsync_parent_dir(&offer)
+    }
+
     pub(super) async fn reconcile_pending(&self) -> Result<(), PortError> {
         let marker = self.directory.join(format!("{}.pending", self.id.as_str()));
         if marker.try_exists().map_err(fs_error)?
@@ -298,11 +475,26 @@ impl ArtifactLease {
     }
 
     pub(super) fn accepted(&self) -> Result<(), PortError> {
+        let offer = self
+            .directory
+            .join(format!("{}.unclaimed", self.id.as_str()));
         let marker = self.directory.join(format!("{}.pending", self.id.as_str()));
         remove_tmp_artifacts(&self.directory.join(format!("{}.tmp", self.id.as_str())))?;
-        fsync_parent_dir(&marker)?;
-        remove_if_present(&marker)?;
-        fsync_parent_dir(&marker)
+        // Until receipt acceptance, an unclaimed registry row is disposable.
+        remove_if_present(&offer)?;
+        fsync_parent_dir(&offer).map_err(|err| {
+            crate::codec::unknown_commit_non_idempotent("backup_spool_acceptance", err.to_string())
+        })?;
+        // The durable receipt already owns the file. Recovery may finish
+        // removing a pending marker if the cleanup fails.
+        if let Err(error) = remove_if_present(&marker).and_then(|()| fsync_parent_dir(&marker)) {
+            tracing::warn!(?error, "accepted backup spool has a pending marker");
+        }
+        Ok(())
+    }
+
+    pub(super) fn remove_temporary(&self) -> Result<(), PortError> {
+        finish_recovery(&self.directory, &self.id, false)
     }
 }
 
@@ -349,16 +541,81 @@ async fn reconcile(
     _lock: File,
 ) -> Result<(), PortError> {
     let lookup = id.clone();
-    let ready: bool = store.with_read_tx(|tx| Box::pin(async move {
+    // Use a fresh PostgreSQL snapshot after the fence. An unresolved COMMIT
+    // can still publish the pointer after the publishing client disconnects.
+    let ready: Option<String> = store.with_read_tx_budget_pg_local_sql(
+        None,
+        Some("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"),
+        |tx| Box::pin(async move {
         match tx {
-            BackendConn::Sqlite(conn) => sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM backup_artifacts WHERE artifact_id = ? AND state = 'ready')")
-                .bind(lookup.as_str()).fetch_one(&mut **conn).await.map_err(|e|internal_not_committed("recover_sqlite_artifact", e.to_string())),
-            BackendConn::Postgres(conn) => sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM backup_artifacts WHERE artifact_id = $1 AND state = 'ready')")
-                .bind(lookup.as_str()).fetch_one(&mut **conn).await.map_err(|e|crate::runtime::pg_read_error("recover_pg_artifact", e)),
+            BackendConn::Sqlite(conn) => sqlx::query_scalar("SELECT artifact_rel_path FROM backup_artifacts WHERE artifact_id = ? AND state = 'ready'")
+                .bind(lookup.as_str()).fetch_optional(&mut **conn).await.map_err(|e|internal_not_committed("recover_sqlite_artifact", e.to_string())),
+            BackendConn::Postgres(conn) => {
+                fence_artifact_publication(conn, &lookup).await?;
+                sqlx::query_scalar("SELECT artifact_rel_path FROM backup_artifacts WHERE artifact_id = $1 AND state = 'ready'")
+                    .bind(lookup.as_str()).fetch_optional(&mut **conn).await.map_err(|e|crate::runtime::pg_read_error("recover_pg_artifact", e))
+            }
         }
     })).await?;
+    let mut keep = false;
+    if let Some(key) = ready {
+        let (volume, filename) = key
+            .split_once('/')
+            .map_or((None, key.as_str()), |(volume, name)| (Some(volume), name));
+        let matches_file = [
+            BackupArtifactEncoding::SqliteSnapshotV1,
+            BackupArtifactEncoding::PostgresSpoolV1,
+        ]
+        .into_iter()
+        .any(|kind| filename == format!("{}.{}", id.as_str(), kind.extension()));
+        if matches_file {
+            if let Some(volume) = volume {
+                if volume == namespace(dir)?.as_str() {
+                    let offer = dir.join(format!("{}.unclaimed", id.as_str()));
+                    if offer.try_exists().map_err(fs_error)? {
+                        forget_unclaimed_artifact(store, id.clone(), key).await?;
+                    } else {
+                        keep = true;
+                    }
+                }
+            } else {
+                // Legacy registry entries have no spool volume in the key.
+                keep = true;
+            }
+        }
+    }
+    finish_recovery(dir, id, keep)
+}
+
+async fn forget_unclaimed_artifact(
+    store: &CanonicalStore,
+    id: ArtifactId,
+    key: String,
+) -> Result<(), PortError> {
+    let budget = CallBudget {
+        request: RequestId::from_bytes(crate::codec::ordered_id_16()?),
+        cancellation: Cancellation::default(),
+        remaining: BACKUP_CLEANUP_GRACE,
+    };
+    let deadline =
+        crate::domain::common::CommandDeadline::start(&budget, "forget_unclaimed_backup");
+    store.with_auxiliary_command(Some((&budget, deadline)), Ok, |tx| Box::pin(async move {
+        let delete = "DELETE FROM backup_artifacts WHERE artifact_id = $1 AND artifact_rel_path = $2";
+        let result = match tx {
+            BackendConn::Sqlite(conn) => sqlx::query(delete)
+                .bind(id.as_str()).bind(&key).execute(&mut **conn).await.map(drop),
+            BackendConn::Postgres(conn) => {
+                fence_artifact_publication(conn, &id).await?;
+                sqlx::query(delete).bind(id.as_str()).bind(&key).execute(&mut **conn).await.map(drop)
+            }
+        };
+        result.map_err(|err| internal_not_committed("forget_unclaimed_backup", err.to_string()))
+    })).await
+}
+
+fn finish_recovery(dir: &Path, id: &ArtifactId, keep: bool) -> Result<(), PortError> {
     remove_tmp_artifacts(&dir.join(format!("{}.tmp", id.as_str())))?;
-    if !ready {
+    if !keep {
         for kind in [
             BackupArtifactEncoding::SqliteSnapshotV1,
             BackupArtifactEncoding::PostgresSpoolV1,
@@ -368,6 +625,7 @@ async fn reconcile(
     }
     let marker = dir.join(format!("{}.pending", id.as_str()));
     fsync_parent_dir(&marker)?;
+    remove_if_present(&dir.join(format!("{}.unclaimed", id.as_str())))?;
     remove_if_present(&marker)?;
     fsync_parent_dir(&marker)
 }

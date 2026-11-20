@@ -2226,13 +2226,30 @@ async fn run_jobs_and_collab_lifecycle_suite(store: &CanonicalStore, sqlite: boo
         .await
         .expect("create Export job")
         .value;
-    let job_backup = store
+    let source = ArtifactId::from_bytes([0xB2; 16]);
+    for maintenance in [
+        ContentJobKind::Backup,
+        ContentJobKind::Restore {
+            artifact: source.clone(),
+        },
+    ] {
+        assert!(matches!(
+            store
+                .create_job(
+                    owner_ctx(&scope, owner.clone()),
+                    next_mutation(&scope, &owner, maintenance),
+                )
+                .await,
+            Err(PortError::Domain(DomainError::AccessDenied))
+        ));
+    }
+    let job_import = store
         .create_job(
             owner_ctx(&scope, owner.clone()),
-            next_mutation(&scope, &owner, ContentJobKind::Backup),
+            next_mutation(&scope, &owner, ContentJobKind::Import { artifact: source }),
         )
         .await
-        .expect("create Backup job")
+        .expect("create Import job")
         .value;
     let job_reindex = store
         .create_job(
@@ -2314,7 +2331,7 @@ async fn run_jobs_and_collab_lifecycle_suite(store: &CanonicalStore, sqlite: boo
         listed_ids,
         BTreeSet::from([
             job_export.id.clone(),
-            job_backup.id.clone(),
+            job_import.id.clone(),
             job_reindex.id.clone()
         ])
     );
@@ -2340,7 +2357,7 @@ async fn run_jobs_and_collab_lifecycle_suite(store: &CanonicalStore, sqlite: boo
 
     tokio::time::sleep(Duration::from_millis(10)).await;
 
-    // Note: queued jobs come before expired-running or ordered by created_seq! Let's cancel `job_backup`
+    // Note: queued jobs come before expired-running or ordered by created_seq! Let's cancel `job_import`
     // and `job_reindex` first so `job_export` (expired running) is stolen cleanly by `worker-2`!
     // First test `cancel_job` with WRONG lease fails closed:
     let bad_cancel = store
@@ -2350,7 +2367,7 @@ async fn run_jobs_and_collab_lifecycle_suite(store: &CanonicalStore, sqlite: boo
                 &scope,
                 &owner,
                 CancelJob {
-                    job: job_backup.id.clone(),
+                    job: job_import.id.clone(),
                     expected_lease: LeaseEpoch::new(99).unwrap(),
                 },
             ),
@@ -2365,8 +2382,8 @@ async fn run_jobs_and_collab_lifecycle_suite(store: &CanonicalStore, sqlite: boo
                 &scope,
                 &owner,
                 CancelJob {
-                    job: job_backup.id.clone(),
-                    expected_lease: job_backup.lease,
+                    job: job_import.id.clone(),
+                    expected_lease: job_import.lease,
                 },
             ),
         )
@@ -2389,6 +2406,38 @@ async fn run_jobs_and_collab_lifecycle_suite(store: &CanonicalStore, sqlite: boo
         )
         .await
         .expect("cancel reindex job");
+
+    // Expiration alone fences effects, even before the next worker claims it.
+    tokio::time::sleep(Duration::from_millis(2)).await;
+    let expired_heartbeat = store
+        .heartbeat_job_lease(
+            &make_budget(),
+            &scope,
+            &claim1.job.id,
+            "worker-1",
+            claim1.job.lease,
+            Duration::from_secs(30),
+            0,
+            None,
+        )
+        .await;
+    assert_validation_err(&expired_heartbeat, ValidationReason::InvalidAuthority);
+    let expired_completion = store
+        .complete_job(
+            &make_budget(),
+            &scope,
+            &claim1.job.id,
+            "worker-1",
+            claim1.job.lease,
+            JobCompletionOutcome::Succeeded {
+                completed_units: 1,
+                total_units: Some(1),
+                artifacts: vec![ArtifactId::from_bytes([0xEE; 16])],
+                result_msgpack: None,
+            },
+        )
+        .await;
+    assert_validation_err(&expired_completion, ValidationReason::InvalidAuthority);
 
     // Now `worker-2` steals expired `job_export` (`attempts == 2`, `lease_epoch` incremented)!
     let claim2 = store
@@ -3764,6 +3813,536 @@ async fn chat_receipts_preserve_body_and_reference_boundaries() {
                 appended.receipt.seq()
             );
         }
+        runtime.shutdown().await.unwrap();
+    }
+    fixtures.drop_pg_schema(&schema).await;
+}
+
+#[tokio::test]
+async fn paged_archive_export_keeps_chat_appends_out_of_the_cut() {
+    use notarium_canonical::UpdateSpaceSchema;
+    use notarium_canonical::peers::{
+        archive_export::{CommittedExport, ExportChatBody, ExportData},
+        archive_import::{ArchiveObject, ArchiveObjectKind},
+    };
+    let local = TempDataRoot::new("paged-archive-export");
+    let fixtures = StorageTestFixtures::load_required();
+    let pg_root = TempDataRoot::new("paged-export-postgres");
+    let schema = fixtures.fresh_pg_schema();
+    let pg = fixtures.pg_local_config(sample_installation_id(0xb9), &schema, pg_root.data_root());
+    let sqlite = CanonicalConfig::local_default(sample_installation_id(0xb8), local.data_root());
+    for config in [sqlite, pg] {
+        let (store, runtime) = CanonicalRuntime::open(config).await.unwrap();
+        let owner = sample_principal_id(0xb7);
+        let scope = store
+            .create_space(CreateSpaceSpec {
+                space_id: sample_space_id(0xb7),
+                incarnation: sample_incarnation(0xb7),
+                root_folder_id: sample_folder_id(0xb7),
+                slug: "paged-export".into(),
+                kind: SpaceKind::Personal,
+                owner: owner.clone(),
+                active_epoch: LeaseEpoch::new(1).unwrap(),
+                initial_last_seq: SpaceSeq::ZERO,
+                created_at: None,
+            })
+            .await
+            .unwrap()
+            .scope;
+        let ctx = || owner_ctx(&scope, owner.clone());
+        let original_schema = "# Schema at the cut\n";
+        let schema_note = sample_note_id(0xbe);
+        let schema = store
+            .update_space_schema(
+                ctx(),
+                next_mutation(
+                    &scope,
+                    &owner,
+                    UpdateSpaceSchema {
+                        schema_note: schema_note.clone(),
+                        parent: None,
+                        slug: "original-schema".into(),
+                        carrier: original_schema.into(),
+                        schema: BTreeMap::new(),
+                        expected_schema_revision: None,
+                    },
+                ),
+            )
+            .await
+            .unwrap()
+            .value;
+        store
+            .delete_note(
+                ctx(),
+                next_mutation(
+                    &scope,
+                    &owner,
+                    notarium_core::ports::DeleteNote {
+                        note: schema_note,
+                        disposition: notarium_core::ports::DeleteDisposition::Trash,
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        let first = sample_note_id(0xb7);
+        store
+            .create_note(
+                ctx(),
+                next_mutation(
+                    &scope,
+                    &owner,
+                    CreateNote {
+                        note: first.clone(),
+                        parent: None,
+                        slug: "before".into(),
+                        class: DocClass::UserDoc,
+                        carrier: "# Before\n\nKeep this cut.\n".into(),
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        let thread = sample_thread_id(0xb7);
+        store
+            .create_chat(
+                ctx(),
+                next_mutation(
+                    &scope,
+                    &owner,
+                    CreateChat {
+                        thread: thread.clone(),
+                        kind: ChatThreadKind::Personal,
+                        owner: owner.clone(),
+                        project_folder: None,
+                        title: "Versioned chat".into(),
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        let append = |parent, text: &str| {
+            next_mutation(
+                &scope,
+                &owner,
+                AppendChat {
+                    thread: thread.clone(),
+                    parent,
+                    kind: ChatEntryKind::Human,
+                    body: ChatInputBody::Text(text.into()),
+                    referenced_notes: Vec::new(),
+                    tainted: false,
+                },
+            )
+        };
+        let entry = store
+            .append_chat(ctx(), append(ThreadEntrySeq::ZERO, "visible at the cut"))
+            .await
+            .unwrap()
+            .value;
+        let job = store
+            .create_job(
+                ctx(),
+                next_mutation(
+                    &scope,
+                    &owner,
+                    ContentJobKind::ExportSpace { encrypted: false },
+                ),
+            )
+            .await
+            .unwrap()
+            .value;
+        let claim = store
+            .claim_next_job(
+                &make_budget(),
+                &scope,
+                "export-probe",
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.job.id, job.id);
+        let check_schema =
+            |entries: &[notarium_canonical::peers::archive_export::ExportEntry]| {
+                let entry = entries
+                    .iter()
+                    .find(|entry| entry.path == ".notarium/fields/schema.yaml")
+                    .unwrap();
+                assert!(
+                    matches!(entry.data, ExportData::Blob(hash) if hash == notarium_syntax::content_digest(original_schema))
+                );
+                assert!(
+                    !entries
+                        .iter()
+                        .any(|entry| entry.path == "original-schema.md")
+                );
+            };
+        let compact = store.capture_archive_export(&ctx(), &claim).await.unwrap();
+        check_schema(&compact.entries);
+        compact.release().await.unwrap();
+        let mut latest_leaf = None;
+        let cut = store
+            .capture_archive_export_paged(&ctx(), &claim, async {
+                store
+                    .update_space_schema(
+                        ctx(),
+                        next_mutation(
+                            &scope,
+                            &owner,
+                            UpdateSpaceSchema {
+                                schema_note: sample_note_id(0xbd),
+                                parent: None,
+                                slug: "new-schema".into(),
+                                carrier: "# After the cut\n".into(),
+                                schema: BTreeMap::new(),
+                                expected_schema_revision: Some(schema.schema_revision),
+                            },
+                        ),
+                    )
+                    .await?;
+                latest_leaf = Some(
+                    store
+                        .append_chat(ctx(), append(entry.seq, "written after the cut"))
+                        .await?
+                        .value
+                        .seq,
+                );
+                store
+                    .rename_note(
+                        ctx(),
+                        next_mutation(
+                            &scope,
+                            &owner,
+                            notarium_core::ports::RenameNote {
+                                note: first,
+                                slug: "after".into(),
+                                title: None,
+                            },
+                        ),
+                    )
+                    .await?;
+                store
+                    .create_note(
+                        ctx(),
+                        next_mutation(
+                            &scope,
+                            &owner,
+                            CreateNote {
+                                note: sample_note_id(0xbc),
+                                parent: None,
+                                slug: "new-after-cut".into(),
+                                class: DocClass::UserDoc,
+                                carrier: "# New\n\nNot in the retained snapshot.\n".into(),
+                            },
+                        ),
+                    )
+                    .await?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        eprintln!("versioned export registration: {:?}", cut.snapshot_elapsed);
+        assert!(cut.snapshot_elapsed < Duration::from_millis(50));
+        assert_eq!(cut.entries.len(), 3);
+        check_schema(&cut.entries);
+        assert!(cut.entries.iter().any(|entry| entry.path == "before.md"));
+        let (header, chat) = cut
+            .entries
+            .iter()
+            .find_map(|entry| {
+                if let ExportData::PagedChat(header, chat) = &entry.data {
+                    Some((header, chat))
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        assert_eq!(header.head, entry.seq.get());
+        let contents = chat.page(&store, &make_budget(), 0).await.unwrap();
+        assert_eq!(contents.len(), 1);
+        assert!(
+            matches!(&contents[0].body, ExportChatBody::Inline(text) if text == "visible at the cut")
+        );
+        assert!(
+            chat.page(&store, &make_budget(), contents[0].seq)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let latest_revision = store
+            .read_chat(
+                ctx(),
+                ChatRead {
+                    thread: thread.clone(),
+                    leaf: latest_leaf.unwrap(),
+                    before: None,
+                    max_entries: PageLimit::new(1).unwrap(),
+                },
+            )
+            .await
+            .unwrap()
+            .thread
+            .revision;
+        store
+            .redact_chat_entry(
+                ctx(),
+                next_mutation(
+                    &scope,
+                    &owner,
+                    RedactChatEntry {
+                        thread: thread.clone(),
+                        entry: entry.seq,
+                        expected_thread_revision: latest_revision,
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(chat.page(&store, &make_budget(), 0).await.is_err());
+        let shadows = format!(
+            "UPDATE archive_export_shadows SET payload=payload WHERE backup_id='{}'",
+            cut.hold_id.as_str(),
+        );
+        assert_eq!(
+            store
+                .execute_diagnostic_write_sql_for_test(&shadows)
+                .await
+                .unwrap(),
+            0
+        );
+        cut.release().await.unwrap();
+        let purge_cut = store
+            .capture_archive_export_paged(&ctx(), &claim, async { Ok(()) })
+            .await
+            .unwrap();
+        store
+            .delete_note(
+                ctx(),
+                next_mutation(
+                    &scope,
+                    &owner,
+                    notarium_core::ports::DeleteNote {
+                        note: sample_note_id(0xb7),
+                        disposition: notarium_core::ports::DeleteDisposition::Purge,
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .read_verified_blob(
+                    &scope,
+                    notarium_syntax::content_digest("# Before\n\nKeep this cut.\n"),
+                )
+                .await
+                .is_err()
+        );
+        let shadows = format!(
+            "UPDATE archive_export_shadows SET payload=payload WHERE backup_id='{}'",
+            purge_cut.hold_id.as_str(),
+        );
+        assert_eq!(
+            store
+                .execute_diagnostic_write_sql_for_test(&shadows)
+                .await
+                .unwrap(),
+            0
+        );
+        purge_cut.release().await.unwrap();
+
+        let delete_schema = async |disposition| {
+            store
+                .delete_note(
+                    ctx(),
+                    next_mutation(
+                        &scope,
+                        &owner,
+                        notarium_core::ports::DeleteNote {
+                            note: sample_note_id(0xbd),
+                            disposition,
+                        },
+                    ),
+                )
+                .await
+                .unwrap();
+        };
+        delete_schema(notarium_core::ports::DeleteDisposition::Trash).await;
+        let with_schema = store.capture_archive_export(&ctx(), &claim).await.unwrap();
+        assert!(
+            with_schema
+                .entries
+                .iter()
+                .any(|entry| entry.path == ".notarium/fields/schema.yaml")
+        );
+        let generation = with_schema.generation;
+        with_schema.release().await.unwrap();
+        delete_schema(notarium_core::ports::DeleteDisposition::Purge).await;
+        assert!(
+            store
+                .check_export_generation(&make_budget(), &scope, generation)
+                .await
+                .is_err()
+        );
+        let after_purge = store.capture_archive_export(&ctx(), &claim).await.unwrap();
+        assert!(
+            after_purge
+                .entries
+                .iter()
+                .all(|entry| entry.path != ".notarium/fields/schema.yaml")
+        );
+        let pointer = CommittedExport {
+            object: ArchiveObject {
+                installation: store.installation_id().clone(),
+                namespace: ContentDigest::from_bytes([1; 32]),
+                scope: scope.clone(),
+                id: notarium_core::ids::ArtifactId::from_bytes([1; 16]),
+                kind: ArchiveObjectKind::Export,
+                digest: ContentDigest::from_bytes([2; 32]),
+                bytes: 1,
+                segments: Vec::new(),
+            },
+            job: claim.job.id.clone(),
+            privacy_generation: after_purge.generation,
+            expires_at_ms: i64::MAX,
+        };
+        let (send, mut queue) = tokio::sync::mpsc::channel(1);
+        let slot = send.reserve_owned().await.unwrap();
+        let transfer = make_budget();
+        let cancel = transfer.cancellation.clone();
+        store
+            .handoff_export_chunk(&transfer, &scope, &pointer, move || {
+                slot.send(b'x');
+                cancel.cancel();
+                Ok(())
+            })
+            .await
+            .expect("an enqueued chunk has a committed receipt");
+        assert_eq!(queue.try_recv().unwrap(), b'x');
+        after_purge.release().await.unwrap();
+
+        use notarium_canonical::peers::archive_import::ArchiveCommitAuthority;
+        use notarium_canonical::{ArchiveJobClass, JobCompletionOutcome};
+        use notarium_core::{
+            error::{CommitEffect, PortError},
+            ports::{MaintenanceContext, RevocationLease, ServiceAuthority, ServicePurpose},
+        };
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        store
+            .advance_space_lease(
+                &MaintenanceContext {
+                    authority: ServiceAuthority::admit(ServicePurpose::Revocation),
+                    budget: make_budget(),
+                },
+                &scope,
+                LeaseEpoch::new(2).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .heartbeat_job_lease(
+                    &make_budget(),
+                    &scope,
+                    &job.id,
+                    &claim.lease_owner,
+                    claim.job.lease,
+                    Duration::from_secs(30),
+                    0,
+                    None,
+                )
+                .await
+                .is_err()
+        );
+        let new_claim = store
+            .claim_next_archive_job(
+                &make_budget(),
+                &scope,
+                "second-export-probe",
+                Duration::from_secs(30),
+                ArchiveJobClass::Export,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(new_claim.job.id, job.id);
+        assert!(new_claim.job.lease > claim.job.lease);
+
+        struct Registration {
+            entered: Arc<AtomicBool>,
+            released: Arc<AtomicBool>,
+        }
+        impl RevocationLease for Registration {
+            fn check(&self) -> Result<(), PortError> {
+                self.entered.store(true, Ordering::Release);
+                Ok(())
+            }
+        }
+        impl Drop for Registration {
+            fn drop(&mut self) {
+                self.released.store(true, Ordering::Release);
+            }
+        }
+        let entered = Arc::new(AtomicBool::new(false));
+        let released = Arc::new(AtomicBool::new(false));
+        let authority = ArchiveCommitAuthority::new(Box::new(Registration {
+            entered: entered.clone(),
+            released: released.clone(),
+        }));
+        let fault = store.writer_faults().unwrap();
+        fault
+            .pre_commit_space_delays
+            .lock()
+            .await
+            .insert(scope.space_id.clone(), Duration::from_millis(350));
+        let mut budget = make_budget();
+        budget.remaining = Duration::from_secs(5);
+        let cancelled = budget.cancellation.clone();
+        let writer = store.clone();
+        let writing_scope = scope.clone();
+        let waiter = tokio::spawn(async move {
+            writer
+                .complete_archive_job(
+                    &budget,
+                    &writing_scope,
+                    &new_claim,
+                    JobCompletionOutcome::Failed {
+                        completed_units: 0,
+                        total_units: None,
+                        error_ref: notarium_core::ids::ContentDigest::from_bytes([0; 32]),
+                    },
+                    authority,
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !entered.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        cancelled.cancel();
+        assert!(
+            matches!(waiter.await.unwrap(), Err(PortError::Internal(failure)) if failure.effect() == CommitEffect::Unknown)
+        );
+        assert!(!released.load(Ordering::Acquire));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !released.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            store.get_job(ctx(), job.id).await.unwrap().state,
+            notarium_core::ports::JobState::Failed
+        );
         runtime.shutdown().await.unwrap();
     }
     fixtures.drop_pg_schema(&schema).await;

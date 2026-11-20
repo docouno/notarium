@@ -95,6 +95,19 @@ impl S3RawResponse {
 /// while executing real SigV4 requests against MinIO CE / S3 endpoints.
 pub trait S3Transport: Send + Sync + std::fmt::Debug {
     fn send<'a>(&'a self, req: S3RawRequest) -> BoxFuture<'a, Result<S3RawResponse, PortError>>;
+    fn send_bounded<'a>(
+        &'a self,
+        req: S3RawRequest,
+        limit: usize,
+    ) -> BoxFuture<'a, Result<S3RawResponse, PortError>> {
+        Box::pin(async move {
+            let response = self.send(req).await?;
+            if response.body.len() > limit {
+                return Err(DomainError::validation(ValidationReason::BudgetExceeded).into());
+            }
+            Ok(response)
+        })
+    }
 }
 
 /// Pure-Rust `reqwest` + `rustls` (`ring`) + AWS SigV4 S3 transport.
@@ -168,6 +181,14 @@ impl ReqwestS3Transport {
 
 impl S3Transport for ReqwestS3Transport {
     fn send<'a>(&'a self, req: S3RawRequest) -> BoxFuture<'a, Result<S3RawResponse, PortError>> {
+        self.send_bounded(req, usize::MAX)
+    }
+
+    fn send_bounded<'a>(
+        &'a self,
+        req: S3RawRequest,
+        limit: usize,
+    ) -> BoxFuture<'a, Result<S3RawResponse, PortError>> {
         Box::pin(async move {
             forbid_multipart_and_copy(&req)?;
 
@@ -225,7 +246,7 @@ impl S3Transport for ReqwestS3Transport {
                 rb = rb.body(req.body);
             }
 
-            let resp = rb.send().await.map_err(|err| {
+            let mut resp = rb.send().await.map_err(|err| {
                 unavailable_retryable(
                     "s3_http_send_failed",
                     err.to_string(),
@@ -252,16 +273,30 @@ impl S3Transport for ReqwestS3Transport {
                     .is_some_and(|(directory, _)| {
                         directory.rsplit('/').next() == Some(PROBE_DIRECTORY)
                     });
+            let read_error = |err: reqwest::Error| {
+                unavailable_retryable(
+                    "s3_http_read_body",
+                    err.to_string(),
+                    Duration::from_millis(50),
+                )
+            };
             let body = if rejected_probe {
                 Bytes::new()
+            } else if limit != usize::MAX {
+                let exceeded = || DomainError::validation(ValidationReason::BudgetExceeded);
+                if resp.content_length().is_some_and(|len| len > limit as u64) {
+                    return Err(exceeded().into());
+                }
+                let mut bytes = bytes::BytesMut::new();
+                while let Some(chunk) = resp.chunk().await.map_err(read_error)? {
+                    if chunk.len() > limit.saturating_sub(bytes.len()) {
+                        return Err(exceeded().into());
+                    }
+                    bytes.extend_from_slice(&chunk);
+                }
+                bytes.freeze()
             } else {
-                resp.bytes().await.map_err(|err| {
-                    unavailable_retryable(
-                        "s3_http_read_body",
-                        err.to_string(),
-                        Duration::from_millis(50),
-                    )
-                })?
+                resp.bytes().await.map_err(read_error)?
             };
 
             Ok(S3RawResponse {
@@ -337,6 +372,14 @@ impl S3BlobStore {
 
     pub fn application_prefix(&self) -> &str {
         &self.normalized_prefix
+    }
+
+    pub fn overlaps_namespace(&self, other: &Self) -> bool {
+        // Compare bucket names independently of endpoint aliases. An empty
+        // prefix covers the entire bucket, and prefixes end at a boundary.
+        self.config.bucket == other.config.bucket
+            && (self.normalized_prefix.starts_with(&other.normalized_prefix)
+                || other.normalized_prefix.starts_with(&self.normalized_prefix))
     }
 
     pub fn bucket_mode(&self) -> S3BucketMode {
@@ -710,6 +753,7 @@ impl S3BlobStore {
         // Re-verify Space epoch & zero backup holds before issuing S3 retirement I/O.
         let scope_pre = scope.clone();
         let private_upload = retirement_id == target.publication_id;
+        let reason = marker.reason;
         store
             .with_read_tx(|tx| {
                 Box::pin(async move {
@@ -721,7 +765,7 @@ impl S3BlobStore {
                         );
                     }
                     if !private_upload {
-                        ensure_no_backup_holds_tx(tx, &scope_pre.space_id).await?;
+                        ensure_no_backup_holds_tx(tx, &scope_pre.space_id, reason).await?;
                     }
                     Ok(())
                 })
@@ -1134,6 +1178,23 @@ pub async fn admin_set_bucket_versioning(config: &S3Config, status: &str) -> Res
         ));
     }
     Ok(())
+}
+
+/// Durable, non-secret identity used by the Cloud restore readiness gate.
+pub fn namespace_fingerprint(
+    config: &S3Config,
+) -> Result<notarium_core::ids::ContentDigest, PortError> {
+    let prefix = normalize_app_prefix(&config.application_prefix)?;
+    let identity = format!(
+        "{}\n{}\n{}\n{}",
+        config.endpoint,
+        config.region,
+        config.bucket,
+        prefix.trim_end_matches('/')
+    );
+    Ok(notarium_core::ids::ContentDigest::from_bytes(
+        *blake3::hash(identity.as_bytes()).as_bytes(),
+    ))
 }
 
 fn normalize_app_prefix(raw: &str) -> Result<String, PortError> {

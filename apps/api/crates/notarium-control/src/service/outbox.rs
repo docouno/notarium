@@ -216,6 +216,25 @@ impl ControlService {
             .map_err(|_| unavailable("control revocation delivery", CommitEffect::Unknown))?;
         let mut tx = self.store.write(budget.clone()).await?;
         let now = self.clock.now_ms()?;
+        if let Transaction::Postgres(conn) = tx.inner_mut() {
+            // A canonical COMMIT can reach the server after the client loses
+            // its registry lease. Its database lock lasts through settlement.
+            budget
+                .run(
+                    async {
+                        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                            .bind(ARCHIVE_REVOCATION_FENCE)
+                            .execute(&mut **conn)
+                            .await
+                            .map_err(|_| {
+                                unavailable("archive revocation settlement", CommitEffect::Unknown)
+                            })?;
+                        Ok(())
+                    },
+                    CommitEffect::Unknown,
+                )
+                .await?;
+        }
         budget.run(async {execute!(tx.inner_mut(),
             "UPDATE revocation_events SET delivered_at=$1 WHERE event_id=$2 AND delivered_at IS NULL",
             "UPDATE v1_control.revocation_events SET delivered_at=$1 WHERE event_id=$2 AND delivered_at IS NULL"; now,&event.event_id)

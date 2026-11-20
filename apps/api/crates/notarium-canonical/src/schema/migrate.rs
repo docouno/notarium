@@ -29,6 +29,7 @@ pub(crate) fn recognized_predecessor(version: i64, hash: &[u8]) -> bool {
         3 => hex::encode(hash) == V3_HASH,
         4 => hex::encode(hash) == V4_HASH,
         5 => hex::encode(hash) == V5_HASH,
+        6 => super::manifest::checksum_tables(6, crate::backup::spool_tables(6)).as_bytes() == hash,
         _ => false,
     }
 }
@@ -171,6 +172,62 @@ async fn upgrade_owners_v5(conn: &mut crate::sql_exec::BackendConn<'_>) -> Resul
     Ok(())
 }
 
+async fn upgrade_archive_state_v7(
+    conn: &mut crate::sql_exec::BackendConn<'_>,
+) -> Result<(), PortError> {
+    use crate::sql_exec::BackendConn;
+    let error =
+        |err: sqlx::Error| internal_not_committed("migration_v7_archive_state", err.to_string());
+    match conn {
+        BackendConn::Sqlite(c) => {
+            let has_claim_epoch: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('content_jobs') WHERE name='claim_space_epoch')",
+            ).fetch_one(&mut **c).await.map_err(error)?;
+            if !has_claim_epoch {
+                sqlx::query("ALTER TABLE content_jobs ADD COLUMN claim_space_epoch INTEGER CHECK (claim_space_epoch >= 1)")
+                    .execute(&mut **c).await.map_err(error)?;
+            }
+            let has_scoped_export: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('backup_holds') WHERE name='scoped_export')",
+            ).fetch_one(&mut **c).await.map_err(error)?;
+            if !has_scoped_export {
+                sqlx::query("ALTER TABLE backup_holds ADD COLUMN scoped_export INTEGER NOT NULL DEFAULT 0 CHECK (scoped_export IN (0,1))")
+                    .execute(&mut **c).await.map_err(error)?;
+            }
+            // The earlier SQLite migration may rebuild the catalog from this
+            // release's table declaration in the same transaction.
+            let columns: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pragma_table_info('blob_catalog') WHERE name='quarantined_at_ms'",
+            ).fetch_one(&mut **c).await.map_err(error)?;
+            if columns == 0 {
+                sqlx::raw_sql(
+                    "ALTER TABLE blob_catalog ADD COLUMN quarantined_at_ms INTEGER;
+                     ALTER TABLE blob_catalog ADD COLUMN legacy_cleanup INTEGER NOT NULL DEFAULT 0 CHECK(legacy_cleanup IN (0,1));",
+                ).execute(&mut **c).await.map_err(error)?;
+            }
+        }
+        BackendConn::Postgres(c) => {
+            sqlx::raw_sql(
+                "ALTER TABLE blob_catalog ADD COLUMN IF NOT EXISTS quarantined_at_ms BIGINT;
+                 ALTER TABLE blob_catalog ADD COLUMN IF NOT EXISTS legacy_cleanup INTEGER NOT NULL DEFAULT 0 CHECK(legacy_cleanup IN (0,1));",
+            ).execute(&mut **c).await.map_err(error)?;
+            sqlx::query("ALTER TABLE content_jobs ADD COLUMN IF NOT EXISTS claim_space_epoch BIGINT CHECK (claim_space_epoch >= 1)")
+                .execute(&mut **c).await.map_err(error)?;
+            sqlx::query("ALTER TABLE backup_holds ADD COLUMN IF NOT EXISTS scoped_export INTEGER NOT NULL DEFAULT 0 CHECK (scoped_export IN (0,1))")
+                .execute(&mut **c).await.map_err(error)?;
+        }
+    }
+    const BACKFILL: &str = "UPDATE blob_catalog SET legacy_cleanup=1
+        WHERE ref_count=0 AND admission_state='open' AND blob_state='active'
+          AND NOT EXISTS (SELECT 1 FROM blob_references r
+             WHERE r.space_id=blob_catalog.space_id AND r.content_blake3=blob_catalog.content_blake3)";
+    match conn {
+        BackendConn::Sqlite(c) => sqlx::query(BACKFILL).execute(&mut **c).await.map(|_| ()),
+        BackendConn::Postgres(c) => sqlx::query(BACKFILL).execute(&mut **c).await.map(|_| ()),
+    }
+    .map_err(error)
+}
+
 macro_rules! upgrade {
     ($name:ident, $connection:ty, $variant:ident, $ddl:ident, $pg_v2:expr $(, $catalog:ident)?) => {
         pub(super) async fn $name(
@@ -240,13 +297,33 @@ macro_rules! upgrade {
             if version < 5 {
                 upgrade_owners_v5(&mut crate::sql_exec::BackendConn::$variant(conn)).await?;
             }
-            // Both global and per-Space pending checks can seek by status.
-            let index = baseline_statement($ddl, "CREATE INDEX IF NOT EXISTS idx_blob_retirements_status")?;
-            sqlx::query("DROP INDEX idx_blob_retirements_status")
-                .execute(&mut *conn).await
-                .map_err(|e| internal_not_committed("migration_v6_drop_retirement_index", e.to_string()))?;
-            sqlx::query(sqlx::AssertSqlSafe(index)).execute(&mut *conn).await
-                .map_err(|e| internal_not_committed("migration_v6_retirement_index", e.to_string()))?;
+            if version < 6 {
+                // Both global and per-Space pending checks can seek by status.
+                let index = baseline_statement($ddl, "CREATE INDEX IF NOT EXISTS idx_blob_retirements_status")?;
+                sqlx::query("DROP INDEX idx_blob_retirements_status")
+                    .execute(&mut *conn).await
+                    .map_err(|e| internal_not_committed("migration_v6_drop_retirement_index", e.to_string()))?;
+                sqlx::query(sqlx::AssertSqlSafe(index)).execute(&mut *conn).await
+                    .map_err(|e| internal_not_committed("migration_v6_retirement_index", e.to_string()))?;
+            }
+            upgrade_archive_state_v7(&mut crate::sql_exec::BackendConn::$variant(conn)).await?;
+            for prefix in [
+                "CREATE TABLE IF NOT EXISTS archive_privacy (",
+                "CREATE INDEX IF NOT EXISTS idx_blob_catalog_gc",
+                "CREATE TABLE IF NOT EXISTS archive_artifacts (",
+                "CREATE INDEX IF NOT EXISTS idx_archive_artifacts_expiry",
+                "CREATE TABLE IF NOT EXISTS archive_export_cuts (",
+                "CREATE INDEX IF NOT EXISTS idx_archive_export_cuts_space",
+                "CREATE TABLE IF NOT EXISTS archive_export_shadows (",
+                "CREATE TABLE IF NOT EXISTS archive_uploads (",
+                "CREATE TABLE IF NOT EXISTS archive_import_sources (",
+                "CREATE INDEX IF NOT EXISTS idx_archive_import_sources_artifact",
+                "CREATE INDEX IF NOT EXISTS idx_archive_uploads_created",
+            ] {
+                let sql = baseline_statement($ddl, prefix)?;
+                sqlx::query(sqlx::AssertSqlSafe(sql)).execute(&mut *conn).await
+                    .map_err(|e| internal_not_committed("migration_v7_archive_schema", e.to_string()))?;
+            }
             let (sec, nsec) =
                 crate::codec::encode_timestamp_parts(crate::codec::now_utc_timestamp()?);
             sqlx::query(WRITE_WITNESS)
@@ -429,7 +506,8 @@ mod tests {
             .execute(&mut db)
             .await
             .unwrap();
-        sqlx::raw_sql("INSERT INTO blob_catalog VALUES
+        sqlx::raw_sql("INSERT INTO blob_catalog (space_id,content_blake3,raw_size,compressed_size,
+            ref_count,current_publication_id,admission_state,blob_state,touched_at_ms) VALUES
             ('s',zeroblob(32),1024,63,2,'pub','open','active',391),
             ('t',zeroblob(32),1024,63,0,NULL,'retiring','quarantined',492);
             INSERT INTO blob_references VALUES
@@ -511,6 +589,9 @@ mod tests {
         for sql in split_sql_statements(SQLITE_BASELINE_DDL) {
             if sql.starts_with("CREATE TABLE IF NOT EXISTS account_catalog_receipts")
                 || sql.starts_with("CREATE TABLE IF NOT EXISTS collab_checkpoints")
+                || sql.starts_with("CREATE TABLE IF NOT EXISTS archive_")
+                || sql.starts_with("CREATE INDEX IF NOT EXISTS idx_archive_")
+                || sql.starts_with("CREATE INDEX IF NOT EXISTS idx_blob_catalog_gc")
             {
                 continue;
             }
@@ -518,7 +599,11 @@ mod tests {
                 || sql.starts_with("CREATE TABLE IF NOT EXISTS backup_holds")
             {
                 sql.lines()
-                    .filter(|l| !l.contains("ext_space_tainted") && !l.contains("owner_generation"))
+                    .filter(|l| {
+                        !l.contains("ext_space_tainted")
+                            && !l.contains("owner_generation")
+                            && !l.contains("scoped_export")
+                    })
                     .collect::<Vec<_>>()
                     .join("\n")
             } else {

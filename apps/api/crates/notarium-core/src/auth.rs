@@ -11,6 +11,9 @@ use std::{
     },
 };
 
+mod job_delegation;
+pub use job_delegation::JobDelegation;
+
 /// Secrets cross typed service boundaries without Debug or serialization leaks.
 pub struct SecretString(zeroize::Zeroizing<String>);
 impl SecretString {

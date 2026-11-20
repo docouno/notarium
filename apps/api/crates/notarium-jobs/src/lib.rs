@@ -1,10 +1,29 @@
-//! Reserved for the jobs subsystem. Domain behavior is added in later waves.
+//! Background archive jobs and installation maintenance.
 
-#[cfg(test)]
-mod tests {
-    // A compile smoke test for the initial scaffold, not domain certification.
-    #[test]
-    fn scaffold_has_the_expected_package_identity() {
-        assert_eq!(env!("CARGO_PKG_NAME"), "notarium-jobs");
-    }
-}
+mod archive_jobs;
+mod artifacts;
+mod backup;
+mod backup_format;
+mod db_integrity;
+mod download;
+mod export;
+mod fsck;
+mod import;
+mod maintenance;
+mod range_source;
+mod restore;
+mod sqlite_process;
+#[allow(unsafe_code)]
+mod sqlite_range;
+mod worker;
+mod zip_layout;
+
+pub use archive_jobs::ArchiveJobs;
+pub use artifacts::ArchiveStorage;
+pub use backup::{BackupArchive, BackupOptions, PairedPause, run_backup};
+pub use download::{ArchiveDownload, ArchiveDownloadMetadata};
+pub use fsck::{ArchiveInput, FsckInput, FsckReport, run_fsck};
+pub use import::ImportLimits;
+pub use restore::{CloudRestoreTarget, RestoreKeyring, RestoreReport, RestoreTarget, run_restore};
+pub use sqlite_process::{SQLITE_VERIFIER_ARGUMENT, SqliteVerifier, run_sqlite_verifier};
+pub use worker::{ArchiveOperation, ArchiveRunner, JobExecution, JobWorkerConfig};

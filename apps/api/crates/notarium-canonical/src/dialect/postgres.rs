@@ -132,7 +132,9 @@ pub(crate) async fn open_and_bootstrap_postgres(
     connect: &PgConnectConfig,
     schema: &str,
     installation_id: &InstallationId,
+    object_namespace: Option<notarium_core::ids::ContentDigest>,
     pool_size: u32,
+    restoring: bool,
 ) -> Result<(StorePgPool, DatabaseWitness, String), PortError> {
     let validated_schema = validate_pg_schema_name(schema)?.to_owned();
     let options = build_pg_connect_options(connect);
@@ -140,6 +142,30 @@ pub(crate) async fn open_and_bootstrap_postgres(
     let mut bootstrap_conn = PgConnection::connect_with(&options)
         .await
         .map_err(|err| internal_not_committed("pg_bootstrap_connect", err.to_string()))?;
+
+    if !restoring {
+        let gate: bool =
+            sqlx::query_scalar("SELECT to_regclass('notarium_restore.readiness') IS NOT NULL")
+                .fetch_one(&mut bootstrap_conn)
+                .await
+                .map_err(|err| internal_not_committed("pg_restore_gate", err.to_string()))?;
+        if gate {
+            let ready: Option<(String, Vec<u8>)> = sqlx::query_as(
+                "SELECT installation_id,object_namespace FROM notarium_restore.readiness
+                 WHERE singleton=1 AND canonical_loaded AND phase='ready'",
+            )
+            .fetch_optional(&mut bootstrap_conn)
+            .await
+            .map_err(|err| internal_not_committed("pg_restore_gate", err.to_string()))?;
+            if !ready.is_some_and(|(id, namespace)| {
+                id == installation_id.as_str()
+                    && object_namespace
+                        .is_some_and(|configured| configured.as_bytes() == namespace.as_slice())
+            }) {
+                return Err(notarium_core::DomainError::MigrationInProgress.into());
+            }
+        }
+    }
 
     sqlx::query("SET synchronous_commit = on")
         .execute(&mut bootstrap_conn)

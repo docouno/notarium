@@ -94,7 +94,7 @@ recovers writes under its exclusive DataRoot owner lock.
 ## Dual-dialect schema and history model
 
 Both SQL dialects materialize the same ordinary B-tree tables in schema
-version `6` and verify live database catalogs (`sqlite_master` / `pg_catalog`)
+version `7` and verify live database catalogs (`sqlite_master` / `pg_catalog`)
 against a shared typed manifest checksum (`schema_meta`) on every startup.
 Unknown newer schema versions, mismatched manifest checksums or unfinished
 migration states fail closed.
@@ -106,6 +106,12 @@ and resulting Space identity, history and cutoff, including after restart.
 The caller can replay a pending control operation after losing the canonical
 response. Reusing the key with a different payload is rejected. Rebinding a
 Space's history invalidates receipts issued for its earlier incarnation.
+
+Schema version 7 adds the CAS quarantine stamp and its partial index. It also
+adds the archive artifact registry and the Space privacy generation. Previously
+unowned entries retain their pending cleanup obligations across the upgrade.
+New ordinary orphans go through quarantine, with a grace period of 24 hours
+and 5 minutes. Explicit redaction and purge use the durable retirement protocol.
 
 Schema version 6 orders the existing retirement index by status and then Space.
 Both the installation-wide and per-Space pending checks can seek directly to
@@ -479,9 +485,15 @@ same example against an isolated prefix.
   rows in slices of up to 64 KiB. Both participants release their source after
   durable spool or abort. A canonical artifact ID resolves on its original spool
   volume, where lookup checks file size and BLAKE3 before returning the path.
-  Startup reconciles abandoned holds and pending local artifacts.
+  The registry keeps a durable spool after the caller claims its receipt. An
+  unclaimed spool remains eligible for recovery and exact registry cleanup.
+  Startup reconciles abandoned holds and pending local artifacts. PostgreSQL
+  maintenance also reaps holds whose ownership lock was lost. An unacknowledged
+  hold commit is reconciled using its exact generation once the old session ends.
+  A Local hold whose release timed out waiting for a writer retains ownership
+  while the runtime retries cleanup of its exact generation.
   The offline `notarium_canonical::backup::decode_postgres_spool_v1_bounded`
-  API verifies the trailer and recognizes the exact manifests for schemas 1 through 6.
+  API verifies the trailer and recognizes the exact manifests for schemas 1 through 7.
   It returns typed rows in the original table and column order within the
   caller's byte budget. To materialize a historical spool, create an empty
   target with `schema::POSTGRES_BASELINE_DDL`. For versions 1 and 2, drop
@@ -498,8 +510,10 @@ same example against an isolated prefix.
   temporary table, then inserts the full set in one statement so foreign keys
   can resolve parents that appear later in the archive.
   Opening the target with the original installation ID applies the remaining
-  migrations through version 6. The canonical L4 backup suite exercises this
-  procedure with archives from all five predecessor versions.
+  migrations through version 7. The canonical L4 backup suite exercises the
+  historical row importer and the schema migration path. The streaming
+  `notarium-jobs` restore handles installation cutover and repository-level
+  verification. See [archive jobs and recovery](archive-jobs.md).
   Before serving the restored database, call `restore_cursors` with each
   original cutoff and a fresh history incarnation. The same transaction
   rotates the writer epoch and fences active rooms, retaining their snapshots,

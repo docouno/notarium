@@ -157,6 +157,49 @@ pub struct TargetPage {
     pub continuation: Option<TargetPosition>,
 }
 
+pub enum TargetValue<'a> {
+    Null,
+    Integer(i64),
+    Real(f64),
+    Text(&'a str),
+    Bytes(&'a [u8]),
+}
+
+trait AsTargetValue {
+    fn target_value(&self) -> TargetValue<'_>;
+}
+
+impl AsTargetValue for i64 {
+    fn target_value(&self) -> TargetValue<'_> {
+        TargetValue::Integer(*self)
+    }
+}
+
+impl AsTargetValue for f64 {
+    fn target_value(&self) -> TargetValue<'_> {
+        TargetValue::Real(*self)
+    }
+}
+
+impl AsTargetValue for String {
+    fn target_value(&self) -> TargetValue<'_> {
+        TargetValue::Text(self)
+    }
+}
+
+impl AsTargetValue for Vec<u8> {
+    fn target_value(&self) -> TargetValue<'_> {
+        TargetValue::Bytes(self)
+    }
+}
+
+impl<T: AsTargetValue> AsTargetValue for Option<T> {
+    fn target_value(&self) -> TargetValue<'_> {
+        self.as_ref()
+            .map_or(TargetValue::Null, AsTargetValue::target_value)
+    }
+}
+
 macro_rules! target_tables {
     ($(
         $variant:ident ($row_ty:ident, $table_str:literal) {
@@ -245,6 +288,16 @@ macro_rules! target_tables {
             pub fn table(&self) -> TargetTable {
                 match self {
                     $(Self::$variant { .. } => TargetTable::$variant,)+
+                }
+            }
+
+            /// One named logical column for offline relational validation.
+            pub fn relational_value(&self, name: &str) -> Result<TargetValue<'_>, PortError> {
+                match self {
+                    $(Self::$variant { $($col,)+ } => match name {
+                        $(stringify!($col) => Ok($col.target_value()),)+
+                        _ => Err(invalid(ValidationReason::InvalidState)),
+                    },)+
                 }
             }
 

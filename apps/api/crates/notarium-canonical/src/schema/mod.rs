@@ -1,3 +1,7 @@
+mod archive_privacy;
+pub(crate) mod archive_versions;
+pub use archive_privacy::sqlite_statements as sqlite_archive_privacy_ddl;
+pub use archive_versions::sqlite_statements as sqlite_archive_versions_ddl;
 pub mod manifest;
 pub(crate) mod migrate;
 
@@ -121,6 +125,8 @@ async fn bootstrap_sqlite_inner(
         let witness =
             inspect_sqlite_schema_meta(conn, expected_installation, expected_checksum).await?;
         verify_sqlite_catalog(conn).await?;
+        archive_privacy::sqlite(conn).await?;
+        archive_versions::sqlite(conn).await?;
         return Ok(witness);
     }
 
@@ -152,6 +158,8 @@ async fn bootstrap_sqlite_inner(
     .map_err(|err| internal_not_committed("sqlite_insert_schema_meta", err.to_string()))?;
 
     verify_sqlite_catalog(conn).await?;
+    archive_privacy::sqlite(conn).await?;
+    archive_versions::sqlite(conn).await?;
 
     sqlx::query("UPDATE schema_meta SET migration_state = 'ready' WHERE singleton_id = 1")
         .execute(&mut *conn)
@@ -278,6 +286,8 @@ async fn bootstrap_postgres_inner(
             inspect_postgres_schema_meta(conn, expected_installation, expected_checksum).await?;
         verify_postgres_catalog(conn, schema_name).await?;
         ensure_postgres_helper_routines(conn).await?;
+        archive_privacy::postgres(conn).await?;
+        archive_versions::postgres(conn).await?;
         return Ok(witness);
     }
 
@@ -289,6 +299,8 @@ async fn bootstrap_postgres_inner(
             .map_err(|err| internal_not_committed("pg_ddl_exec", err.to_string()))?;
     }
     ensure_postgres_helper_routines(conn).await?;
+    archive_privacy::postgres(conn).await?;
+    archive_versions::postgres(conn).await?;
 
     sqlx::query(
         "INSERT INTO schema_meta (
@@ -652,7 +664,7 @@ BEGIN
     ),
     w_cat AS (
         UPDATE blob_catalog AS bc
-        SET ref_count = bc.ref_count + u.delta,
+        SET ref_count = bc.ref_count + u.delta, quarantined_at_ms = NULL, legacy_cleanup = 0,
             touched_at_ms = p_now_ms
         FROM UNNEST(p_cat_digests, p_cat_deltas) AS u(digest, delta)
         WHERE bc.space_id = p_space_id
@@ -1159,7 +1171,7 @@ BEGIN
     -- Phase B: Execute pre-sliced UPDATEs last.
     IF COALESCE(cardinality(p_cat_digs), 0) > 0 THEN
         UPDATE blob_catalog AS bc
-        SET ref_count = bc.ref_count + u.delta,
+        SET ref_count = bc.ref_count + u.delta, quarantined_at_ms = NULL, legacy_cleanup = 0,
             touched_at_ms = p_now_ms
         FROM UNNEST(p_cat_digs, p_cat_deltas, p_cat_pubs) AS u(dig, delta, pub)
         WHERE bc.space_id = p_space_id

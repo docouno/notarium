@@ -446,15 +446,9 @@ pub fn analyze(source: &str, expected: DocClass) -> DomainResult<HeaderAnalysis>
         diagnostic,
     })
 }
-fn check_class(value: Option<&YamlValue>, expected: DocClass) -> DomainResult<()> {
+fn class_value(value: Option<&YamlValue>) -> DomainResult<Option<DocClass>> {
     let declared = match value {
-        None => {
-            return if expected == DocClass::EncryptedNote {
-                Err(failure(ValidationReason::ClassMismatch))
-            } else {
-                Ok(())
-            };
-        }
+        None => return Ok(None),
         Some(YamlValue::String(name)) => match name.as_str() {
             "user-doc" => DocClass::UserDoc,
             "encrypted-note" => DocClass::EncryptedNote,
@@ -465,7 +459,24 @@ fn check_class(value: Option<&YamlValue>, expected: DocClass) -> DomainResult<()
         },
         _ => return Err(failure(ValidationReason::AmbiguousClass)),
     };
-    if declared == expected {
+    Ok(Some(declared))
+}
+
+/// Read the declared class of an untrusted archive carrier using the same
+/// class evidence as normal frontmatter validation.
+pub fn declared_class(source: &str) -> DomainResult<DocClass> {
+    let carrier = Carrier::scan(source)?;
+    let Some(range) = carrier.yaml else {
+        return Ok(DocClass::UserDoc);
+    };
+    let declared = yaml::class_declaration(range.slice(source)?)?;
+    Ok(class_value(declared.as_ref())?.unwrap_or(DocClass::UserDoc))
+}
+
+fn check_class(value: Option<&YamlValue>, expected: DocClass) -> DomainResult<()> {
+    if class_value(value)?.map_or(expected != DocClass::EncryptedNote, |class| {
+        class == expected
+    }) {
         Ok(())
     } else {
         Err(failure(ValidationReason::ClassMismatch))

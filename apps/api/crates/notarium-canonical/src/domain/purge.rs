@@ -118,7 +118,7 @@ impl CanonicalStore {
         self.with_write_tx(|tx| {
             Box::pin(async move {
                 crate::blobs::lock_and_check_space_tx(tx, &current, epoch).await?;
-                crate::blobs::plan_unowned_active_blobs_tx(tx, &current, epoch).await
+                crate::blobs::gc::reconcile_unowned_tx(tx, &current, epoch).await
             })
         })
         .await?;
@@ -1627,6 +1627,25 @@ async fn execute_sql_erasure_for_old_note_tx(
         }
     }
 
+    // A trashed schema note can still own the current descriptor. Remove its
+    // descriptors along with the immutable revisions that supplied them.
+    let delete_schema = "DELETE FROM space_field_schemas WHERE space_id=$1 AND schema_note_id=$2";
+    match tx {
+        BackendConn::Sqlite(conn) => sqlx::query(delete_schema)
+            .bind(scope.space_id.as_str())
+            .bind(old_id_str)
+            .execute(&mut **conn)
+            .await
+            .map(|_| ()),
+        BackendConn::Postgres(conn) => sqlx::query(delete_schema)
+            .bind(scope.space_id.as_str())
+            .bind(old_id_str)
+            .execute(&mut **conn)
+            .await
+            .map(|_| ()),
+    }
+    .map_err(|err| internal_not_committed("purge_owned_schema", err.to_string()))?;
+
     // 5. Tombstone `note_heads` row (`content_blake3 = NULL, byte_size = 0, lifecycle_state = 'purged'`, zero plaintext!).
     let purged_slug = format!("purged-{old_id_str}");
     match tx {
@@ -1719,22 +1738,20 @@ async fn ensure_no_active_backup_holds_for_purge_tx(
     space_id: &SpaceId,
 ) -> Result<(), PortError> {
     let hold_exists: Option<i64> = match tx {
-        BackendConn::Sqlite(conn) => {
-            sqlx::query_scalar("SELECT 1 FROM backup_holds WHERE space_id = ? LIMIT 1")
-                .bind(space_id.as_str())
-                .fetch_optional(&mut **conn)
-                .await
-                .map_err(|err| {
-                    internal_not_committed("sqlite_purge_check_holds", err.to_string())
-                })?
-        }
-        BackendConn::Postgres(conn) => {
-            sqlx::query_scalar("SELECT 1::BIGINT FROM backup_holds WHERE space_id = $1 LIMIT 1")
-                .bind(space_id.as_str())
-                .fetch_optional(&mut **conn)
-                .await
-                .map_err(|err| crate::runtime::pg_read_error("pg_purge_check_holds", err))?
-        }
+        BackendConn::Sqlite(conn) => sqlx::query_scalar(
+            "SELECT 1 FROM backup_holds WHERE space_id = ? AND scoped_export=0 LIMIT 1",
+        )
+        .bind(space_id.as_str())
+        .fetch_optional(&mut **conn)
+        .await
+        .map_err(|err| internal_not_committed("sqlite_purge_check_holds", err.to_string()))?,
+        BackendConn::Postgres(conn) => sqlx::query_scalar(
+            "SELECT 1::BIGINT FROM backup_holds WHERE space_id = $1 AND scoped_export=0 LIMIT 1",
+        )
+        .bind(space_id.as_str())
+        .fetch_optional(&mut **conn)
+        .await
+        .map_err(|err| crate::runtime::pg_read_error("pg_purge_check_holds", err))?,
     };
     if hold_exists.is_some() {
         return Err(unavailable_retryable(

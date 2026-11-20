@@ -23,7 +23,12 @@ use sqlx::{
     sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteSynchronous},
 };
 use std::{path::PathBuf, sync::Arc, time::Duration};
-pub use target::{TARGET_SCHEMA_VERSION, TargetPage, TargetPosition, TargetRecord, TargetTable};
+pub use target::{
+    TARGET_SCHEMA_VERSION, TargetPage, TargetPosition, TargetRecord, TargetTable, TargetValue,
+};
+
+/// The trusted offline schema used to verify a control snapshot's catalog.
+pub const SQLITE_TARGET_DDL: &str = include_str!("../../migrations/sqlite/0001_control.sql");
 use tokio::sync::{OwnedRwLockReadGuard, OwnedSemaphorePermit, RwLock, Semaphore, oneshot};
 
 static SQLITE_MIGRATIONS: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/sqlite");
@@ -66,6 +71,10 @@ pub struct PostgresConfig {
     options: PgConnectOptions,
 }
 impl PostgresConfig {
+    pub fn from_connect_options(options: PgConnectOptions) -> Self {
+        Self { options }
+    }
+
     pub fn parse(url: &str) -> Result<Self, PortError> {
         let options = url
             .parse()
@@ -87,6 +96,10 @@ impl ControlStore {
     /// The composition owner must classify the data root before opening it.
     /// Missing parent directories are deliberately not created by this adapter.
     pub async fn sqlite(root: &DataRoot) -> Result<Self, PortError> {
+        match std::fs::symlink_metadata(root.restore_guard()) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            _ => return Err(notarium_core::DomainError::MigrationInProgress.into()),
+        }
         let path = root.control();
         // The bootstrap owner survives cancellation of this caller. Its file
         // fence covers native initialization and the migration driver's ACK.
@@ -201,14 +214,26 @@ impl ControlStore {
     }
 
     pub async fn postgres(config: PostgresConfig) -> Result<Self, PortError> {
-        tokio::spawn(Self::postgres_owned(config))
+        Self::open_postgres(config, false).await
+    }
+
+    pub async fn postgres_for_restore(
+        config: PostgresConfig,
+        authority: &notarium_core::ports::ServiceAuthority,
+    ) -> Result<Self, PortError> {
+        authority.require(notarium_core::ports::ServicePurpose::Restore)?;
+        Self::open_postgres(config, true).await
+    }
+
+    async fn open_postgres(config: PostgresConfig, restoring: bool) -> Result<Self, PortError> {
+        tokio::spawn(Self::postgres_owned(config, restoring))
             .await
             .map_err(|_| {
                 unavailable("control PostgreSQL bootstrap worker", CommitEffect::Unknown)
             })?
     }
 
-    async fn postgres_owned(config: PostgresConfig) -> Result<Self, PortError> {
+    async fn postgres_owned(config: PostgresConfig, restoring: bool) -> Result<Self, PortError> {
         let options = config.options.disable_statement_logging();
         let pool = PgPoolOptions::new()
             .max_connections((POSTGRES_MAX_ACTIVE_WRITERS + 2) as u32)
@@ -232,6 +257,26 @@ impl ControlStore {
             .connect_with(options.clone())
             .await
             .map_err(database)?;
+        if !restoring {
+            let exists: bool =
+                sqlx::query_scalar("SELECT to_regclass('notarium_restore.readiness') IS NOT NULL")
+                    .fetch_one(&pool)
+                    .await
+                    .map_err(database)?;
+            if exists {
+                let ready: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM notarium_restore.readiness r
+                       JOIN v1_control.v1_storage_epoch e ON e.installation_id=r.installation_id
+                       WHERE r.singleton=1 AND r.phase='ready' AND e.state='ready')",
+                )
+                .fetch_one(&pool)
+                .await
+                .map_err(database)?;
+                if !ready {
+                    return Err(notarium_core::DomainError::MigrationInProgress.into());
+                }
+            }
+        }
         if let Err(error) = Self::postgres_migrate(&pool).await {
             pool.close().await;
             return Err(error);
@@ -667,6 +712,24 @@ impl ReadTransaction {
     }
     pub(crate) async fn rollback(self) -> Result<(), PortError> {
         self.finish().await
+    }
+    pub(crate) async fn finish_with_budget(
+        self,
+        budget: &lease::OperationBudget,
+    ) -> Result<(), PortError> {
+        // The cleanup holds the read permit until the database acknowledges
+        // rollback, even if the caller's budget expires while waiting.
+        let cleanup = tokio::spawn(self.finish());
+        budget
+            .run(
+                async {
+                    cleanup.await.map_err(|_| {
+                        unavailable("control read cleanup", CommitEffect::NotCommitted)
+                    })?
+                },
+                CommitEffect::NotCommitted,
+            )
+            .await
     }
 }
 impl Drop for ReadTransaction {

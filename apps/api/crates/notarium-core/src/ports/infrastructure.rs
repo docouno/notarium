@@ -4,7 +4,12 @@ use crate::{
     patch::*, receipt::*, value::YamlValue,
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 pub trait StructuralSnapshot: Send + Sync {
     fn cut(&self) -> &SnapshotCut;
@@ -567,6 +572,10 @@ pub enum RevocationReason {
     SpaceClosed,
     CredentialRemoved,
 }
+/// Transaction lock shared by canonical archive effects and Control delivery.
+/// Both Cloud participants use the same primary PostgreSQL database.
+pub const ARCHIVE_REVOCATION_FENCE: i64 = 0x4e54_4152_435f_5631;
+
 pub trait SessionRevocationPort: Send + Sync {
     /// Register only after locking and revalidating all selected database
     /// authorities. Keep the lease until the socket is closed; release it BEFORE
@@ -579,6 +588,16 @@ pub trait SessionRevocationPort: Send + Sync {
         selectors: Vec<RevocationSelector>,
         cancellation: Cancellation,
     ) -> PortFuture<'_, Box<dyn RevocationLease>>;
+    /// Deferred archive work participates in the same distributed fences as
+    /// active provider calls for account, credential and membership revocation.
+    fn register_content_job(
+        &self,
+        ctx: MaintenanceContext,
+        selectors: Vec<RevocationSelector>,
+        cancellation: Cancellation,
+    ) -> PortFuture<'_, Box<dyn RevocationLease>> {
+        self.register_provider(ctx, selectors, cancellation)
+    }
     /// Close matching admissions, cancel active calls, and wait for their leases
     /// to drop. The caller already holds database authority locks and retains
     /// this fence through COMMIT/ROLLBACK, including cancellation of its waiter.
@@ -692,6 +711,39 @@ pub struct BackupSpool {
     pub witness: BackupWitness,
 }
 
+/// Private working file for an in-process backup consumer. Keep a lease alive
+/// for every reader. The participant reclaims its file after the last lease.
+#[derive(Clone)]
+pub struct TemporaryBackupSpool {
+    inner: Arc<TemporaryBackupFile>,
+}
+
+struct TemporaryBackupFile {
+    receipt: BackupSpool,
+    path: PathBuf,
+    _owner: Box<dyn Send + Sync>,
+}
+
+impl TemporaryBackupSpool {
+    pub fn new(receipt: BackupSpool, path: PathBuf, owner: impl Send + Sync + 'static) -> Self {
+        Self {
+            inner: Arc::new(TemporaryBackupFile {
+                receipt,
+                path,
+                _owner: Box::new(owner),
+            }),
+        }
+    }
+
+    pub fn receipt(&self) -> &BackupSpool {
+        &self.inner.receipt
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.inner.path
+    }
+}
+
 /// Dropping any phase must abort and release the resources it owns. Implementations
 /// retain source snapshots until stable spool or abort, and CAS holds through copy.
 pub trait BackupParticipantPort: Send + Sync {
@@ -713,6 +765,8 @@ pub trait BackupParticipantPort: Send + Sync {
 pub trait PreparedBackup: Send {
     fn acquire_hold(&mut self) -> PortFuture<'_, Box<dyn BackupHold>>;
     fn pause_writes(&mut self) -> PortFuture<'_, Box<dyn PausedBackup>>;
+    /// Acknowledge the cleanup of resources still owned by this phase.
+    fn abort(self: Box<Self>) -> PortFuture<'static, ()>;
 }
 pub trait BackupHold: Send {
     fn witness(&self) -> &BackupWitness;
@@ -733,5 +787,12 @@ pub trait BackupSnapshot: Send {
         budget: BackupBudget,
         cancellation: Cancellation,
     ) -> PortFuture<'_, BackupSpool>;
+    fn spool_temporary(
+        &mut self,
+        _budget: BackupBudget,
+        _cancellation: Cancellation,
+    ) -> PortFuture<'_, TemporaryBackupSpool> {
+        Box::pin(async { Err(DomainError::validation(ValidationReason::InvalidState).into()) })
+    }
     fn close(self: Box<Self>) -> PortFuture<'static, ()>;
 }

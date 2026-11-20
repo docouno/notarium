@@ -632,6 +632,20 @@ impl LocalBlobStore {
         LocalExclusiveGuard { _guard: guard }
     }
 
+    pub(crate) fn try_acquire_exclusive_guard(
+        &self,
+        space_id: &SpaceId,
+        digest: ContentDigest,
+    ) -> Option<LocalExclusiveGuard> {
+        let lock = {
+            let mut map = self.guard_shard(digest).try_lock().ok()?;
+            Self::digest_lock(&mut map, space_id, digest)
+        };
+        Some(LocalExclusiveGuard {
+            _guard: lock.try_write_owned().ok()?,
+        })
+    }
+
     pub fn has_physical_file(
         &self,
         space_id: &SpaceId,
@@ -825,16 +839,30 @@ impl LocalBlobStore {
         space_id: &SpaceId,
         digest: ContentDigest,
     ) -> Result<Vec<u8>, PortError> {
+        let mut file = self.open_compressed(space_id, digest)?;
+        Self::read_open_file(&mut file)
+    }
+
+    pub(crate) fn open_compressed(
+        &self,
+        space_id: &SpaceId,
+        digest: ContentDigest,
+    ) -> Result<cap_std::fs::File, PortError> {
         validate_safe_component(space_id.as_str())?;
         let hex = digest.to_hex();
         let shard_rel = format!("blobs/{}/{}", space_id.as_str(), &hex[..2]);
         let file_name = format!("{hex}.zst");
 
         let shard = self.resolve_dir(&shard_rel, false)?;
-        self.read_from_dir(&shard, &file_name)
+        self.open_from_dir(&shard, &file_name)
     }
 
     fn read_from_dir(&self, shard: &PinnedDir, name: &str) -> Result<Vec<u8>, PortError> {
+        let mut file = self.open_from_dir(shard, name)?;
+        Self::read_open_file(&mut file)
+    }
+
+    fn open_from_dir(&self, shard: &PinnedDir, name: &str) -> Result<cap_std::fs::File, PortError> {
         let options = &mut OpenOptions::new();
         options.read(true).follow(FollowSymlinks::No).nonblock(true);
         // Reject non-regular files before open (in particular FIFOs), then verify
@@ -850,7 +878,7 @@ impl LocalBlobStore {
                 name,
             ));
         }
-        let mut file = match shard.dir.open_with(name, options) {
+        let file = match shard.dir.open_with(name, options) {
             Err(e) if is_fd_exhausted_io_err(&e) => {
                 self.evict_some_cached_dirs(64);
                 shard.dir.open_with(name, options)
@@ -867,6 +895,13 @@ impl LocalBlobStore {
                 name,
             ));
         }
+        Ok(file)
+    }
+
+    fn read_open_file(file: &mut cap_std::fs::File) -> Result<Vec<u8>, PortError> {
+        let meta = file
+            .metadata()
+            .map_err(|e| internal_not_committed("local_cas_read_stat", e.to_string()))?;
         let len = usize::try_from(meta.len()).map_err(|_| {
             internal_not_committed("local_cas_read_too_large", "blob exceeds usize")
         })?;

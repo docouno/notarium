@@ -270,6 +270,10 @@ async fn redaction_with_backup_hold_preserves_shared_owners_and_reclaims_after_r
             .await
             .unwrap();
         assert_eq!(released, vec![saved.digest()]);
+        store
+            .mark_legacy_blob_cleanup(&legacy, LeaseEpoch::new(1).unwrap(), saved.digest())
+            .await
+            .unwrap();
         assert!(matches!(
             store.read_verified_blob(&legacy, saved.digest()).await,
             Err(PortError::Domain(DomainError::ResourceNotFound))
@@ -618,6 +622,10 @@ async fn lease_turnover_respects_budget_and_recovers_beyond_a_local_pin() {
                 .await
                 .unwrap();
             assert_eq!(released, vec![prepared.digest()]);
+            store
+                .mark_legacy_blob_cleanup(&scope, old, prepared.digest())
+                .await
+                .unwrap();
             let mut ctx = support::maintenance_ctx(ServicePurpose::Revocation);
             ctx.budget.remaining = if cancel {
                 Duration::from_secs(5)
@@ -961,6 +969,10 @@ async fn restored_retirements_release_terminal_workers_and_serve_other_spaces() 
                 .await
                 .unwrap();
             assert_eq!(released, vec![digest]);
+            store
+                .mark_legacy_blob_cleanup(&scope, old, digest)
+                .await
+                .unwrap();
             let path = root.data_root().blob(&scope.space_id, digest);
             assert!(path.is_file());
             let head = store.read_space(&scope.space_id).await.unwrap().last_seq;
@@ -1098,6 +1110,10 @@ async fn seed_startup_retirement(config: &CanonicalConfig) -> (HistoryScope, Con
         .await
         .unwrap();
     assert_eq!(released, vec![digest]);
+    store
+        .mark_legacy_blob_cleanup(&scope, LeaseEpoch::new(1).unwrap(), digest)
+        .await
+        .unwrap();
     runtime.shutdown().await.unwrap();
     (scope, digest)
 }

@@ -38,14 +38,13 @@ pub use config::{
     S3BucketMode, S3BucketModePolicy, S3Config, S3Credentials, SqlBackendConfig, WriterConfig,
     default_backup_budget, validate_pg_schema_name,
 };
-#[cfg(feature = "test-support")]
 pub use dialect::postgres::build_pg_connect_options;
 pub use dialect::{DataRootOwnerLock, sqlite::observe_sqlite_canonical_witness};
 pub use domain::{RoomFenceTable, SpaceSchemaRevision, UpdateSpaceSchema};
 pub use peers::{
-    AppendCollabUpdate, CheckpointCollabSession, ClaimedContentJob, CloseCollabSession,
-    CollabCarrierSettlement, CollabRoomState, CollabSessionRecord, CollabSessionSnapshot,
-    CollabUpdateEntry, JobCompletionOutcome, OpenCollabSession,
+    AppendCollabUpdate, ArchiveJobClass, CheckpointCollabSession, ClaimedContentJob,
+    CloseCollabSession, CollabCarrierSettlement, CollabRoomState, CollabSessionRecord,
+    CollabSessionSnapshot, CollabUpdateEntry, JobCompletionOutcome, OpenCollabSession,
 };
 pub use runtime::{
     CanonicalRuntime, CanonicalStore, CreateFolderSpec, CreateSpaceSpec, SpaceRecord,

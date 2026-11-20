@@ -82,6 +82,58 @@ fn incomplete(data: &DataRoot) -> usize {
         })
         .count()
 }
+
+#[tokio::test]
+async fn temporary_spool_outlives_its_worker_and_is_reclaimed_by_the_last_reader() {
+    let _guard = crate::TEST_RESOURCE_LOCK.lock().await;
+    for pg in [false, true] {
+        let (fixture, participant, data) = fixture(pg, "backup_temporary_lease").await;
+        let limits = participant.default_budget();
+        let mut prepared = participant
+            .prepare(
+                context(ServicePurpose::Backup),
+                BackupId::from_bytes([61; 16]),
+                limits,
+            )
+            .await
+            .unwrap();
+        let hold = prepared.acquire_hold().await.unwrap();
+        let mut pause = prepared.pause_writes().await.unwrap();
+        let mut snapshot = pause.open_cut().await.unwrap();
+        pause.resume().await.unwrap();
+        let spool = snapshot
+            .spool_temporary(limits, Cancellation::default())
+            .await
+            .unwrap();
+        snapshot.close().await.unwrap();
+        hold.release().await.unwrap();
+        idle(&participant).await;
+        let reader = spool.clone();
+        let path = spool.path().to_owned();
+        drop(spool);
+
+        let next = participant
+            .prepare(
+                context(ServicePurpose::Backup),
+                BackupId::from_bytes([62; 16]),
+                limits,
+            )
+            .await
+            .unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().len(), reader.receipt().bytes);
+        assert!(!path.with_extension("ready").exists());
+        next.abort().await.unwrap();
+        drop(reader);
+        assert!(!path.exists());
+        assert_eq!(incomplete(&data), 0);
+        drop(participant);
+        fixture.close().await;
+        if pg {
+            fs::remove_dir_all(data.root()).unwrap();
+        }
+    }
+}
+
 async fn exercise(pg: bool) {
     let (mut fixture, participant, data) = fixture(
         pg,

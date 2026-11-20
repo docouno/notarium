@@ -2,7 +2,7 @@ use std::{collections::BTreeSet, sync::LazyLock};
 
 use notarium_core::ids::ContentDigest;
 
-pub const CANONICAL_SCHEMA_VERSION: u32 = 6;
+pub const CANONICAL_SCHEMA_VERSION: u32 = 7;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LogicalColKind {
@@ -73,6 +73,12 @@ pub const CANONICAL_TABLES: &[TableSpec] = &[
             col("created_at_nsec", Int, false),
         ],
         indexes: &["uq_spaces_slug_fold"],
+    },
+    TableSpec {
+        name: "archive_privacy",
+        primary_key: &["space_id"],
+        columns: &[col("space_id", Text, false), col("generation", Int, false)],
+        indexes: &[],
     },
     TableSpec {
         name: "folder_heads",
@@ -301,8 +307,10 @@ pub const CANONICAL_TABLES: &[TableSpec] = &[
             col("admission_state", Text, false),
             col("blob_state", Text, false),
             col("touched_at_ms", Int, false),
+            col("quarantined_at_ms", Int, true),
+            col("legacy_cleanup", Int, false),
         ],
-        indexes: &["idx_blob_catalog_zero_ref"],
+        indexes: &["idx_blob_catalog_zero_ref", "idx_blob_catalog_gc"],
     },
     TableSpec {
         name: "blob_publications",
@@ -410,8 +418,31 @@ pub const CANONICAL_TABLES: &[TableSpec] = &[
             col("witness_json", Text, false),
             col("created_at_ms", Int, false),
             col("owner_generation", Text, false),
+            col("scoped_export", Int, false),
         ],
         indexes: &["idx_backup_holds_space"],
+    },
+    TableSpec {
+        name: "archive_export_cuts",
+        primary_key: &["backup_id", "space_id"],
+        columns: &[
+            col("backup_id", Text, false),
+            col("space_id", Text, false),
+            col("cutoff_seq", Int, false),
+        ],
+        indexes: &["idx_archive_export_cuts_space"],
+    },
+    TableSpec {
+        name: "archive_export_shadows",
+        primary_key: &["backup_id", "space_id", "entity_kind", "entity_id"],
+        columns: &[
+            col("backup_id", Text, false),
+            col("space_id", Text, false),
+            col("entity_kind", Text, false),
+            col("entity_id", Text, false),
+            col("payload", Text, false),
+        ],
+        indexes: &[],
     },
     TableSpec {
         name: "backup_artifacts",
@@ -689,8 +720,54 @@ pub const CANONICAL_TABLES: &[TableSpec] = &[
             col("error_ref", Bytes, true),
             col("created_seq", Int, false),
             col("updated_seq", Int, false),
+            col("claim_space_epoch", Int, true),
         ],
         indexes: &["idx_content_jobs_claim"],
+    },
+    TableSpec {
+        name: "archive_artifacts",
+        primary_key: &["space_id", "artifact_id"],
+        columns: &[
+            col("space_id", Text, false),
+            col("artifact_id", Text, false),
+            col("job_id", Text, false),
+            col("privacy_generation", Int, false),
+            col("expires_at_ms", Int, false),
+            col("object_msgpack", Bytes, false),
+            col("object_namespace", Bytes, false),
+        ],
+        indexes: &["idx_archive_artifacts_expiry"],
+    },
+    TableSpec {
+        name: "archive_import_sources",
+        primary_key: &["space_id", "job_id"],
+        columns: &[
+            col("space_id", Text, false),
+            col("job_id", Text, false),
+            col("artifact_id", Text, false),
+            col("object_msgpack", Bytes, false),
+        ],
+        indexes: &["idx_archive_import_sources_artifact"],
+    },
+    TableSpec {
+        name: "archive_uploads",
+        primary_key: &["space_id", "artifact_id"],
+        columns: &[
+            col("space_id", Text, false),
+            col("artifact_id", Text, false),
+            col("job_id", Text, true),
+            col("history_incarnation", Bytes, false),
+            col("lease_epoch", Int, true),
+            col("object_kind", Text, false),
+            col("object_bytes", Int, false),
+            col("state", Text, false),
+            col("created_at_ms", Int, false),
+            col("object_namespace", Bytes, false),
+            col("source_deadline_ms", Int, true),
+            col("source_owner", Text, true),
+            col("source_object", Bytes, true),
+        ],
+        indexes: &["idx_archive_uploads_created"],
     },
     TableSpec {
         name: "materialized_observations",

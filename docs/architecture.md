@@ -18,7 +18,9 @@ authority/egress checks, typed ports, history-scoped receipts, exact comparisons
 byte-preserving edits, SQLite/PostgreSQL control storage, authentication, OAuth/OIDC,
 the native keyring, guarded outbound HTTP, the AI provider gateway and the
 [control backup participant](control-backup.md). [Canonical storage](storage.md) provides SQLite and PostgreSQL persistence, CAS,
-chat history and a backup participant. Projections,
+chat history and a backup participant. [Archive jobs](archive-jobs.md) provide
+background ZIP import and export, CAS quarantine, paired backup, verification
+and offline restore. Projections,
 search, collaboration and HTTP/MCP transport integration remain separate work.
 
 ## Internal dependency allowlist
@@ -77,8 +79,9 @@ and embedding calls, and durable spending reservations. `ControlPlane` composes 
 its matching account-state service. Episodes, reference contexts, ability overlays,
 schedule claims and content-free telemetry are implemented without a tool loop
 or ticker. `ControlBackup` implements the control participant's writer fence,
-pinned snapshots, stable artifacts and cursor rebinding. A paired canonical/control
-backup and archive coordinator remains a separate integration. See
+pinned snapshots, stable artifacts and cursor rebinding. `notarium-jobs` uses
+that participant and its canonical counterpart to coordinate installation backup
+and restore. See
 [control services](control.md).
 
 ## Client and delivery boundaries

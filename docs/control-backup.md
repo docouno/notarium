@@ -1,5 +1,9 @@
 # Control backup participant
 
+The installation coordinator uses the control participant alongside canonical
+storage. See [archive jobs and recovery](archive-jobs.md) for the paired archive,
+external keyring verification and offline restore entry points.
+
 `ControlBackup::new` composes an existing `ControlStore`, validated `Keyring`,
 `DataRoot` and explicit `BackupConfig`. It implements the core
 `BackupParticipantPort` for trusted Backup/Restore maintenance authority. It does
@@ -43,6 +47,8 @@ in-flight operation signals cancellation independently of the bounded command
 queue. Stale completed phase handles cannot cancel their successor. An unread
 spool reply remains participant-owned: receipt acceptance and abort race through
 one atomic ownership transition.
+The owner reports the cleanup result after closing native resources and its
+runtime, using the session's completion signal.
 
 A background task on the owner runtime monitors event-driven cancellation,
 deadlines and retention even while the caller is idle, tracking PostgreSQL spool
@@ -91,6 +97,11 @@ complete-file digest. `open_artifact` resolves only this owned namespace, verifi
 the complete digest and returns a file positioned at the start. Callers cannot
 supply arbitrary paths. The packaging consumer owns accepted artifacts and their
 eventual retention/deletion policy.
+
+The paired backup coordinator uses private working spools. Each reader keeps
+a lease on the file after the database worker finishes. The last reader
+releases the file, and the pending marker lets recovery remove it after a
+process exits with readers still active.
 
 `SqliteSnapshotV1` is a standalone SQLite database produced with the safe native
 backup API in bounded page steps. Destination close and integrity checking occur

@@ -4,7 +4,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use notarium_core::{
@@ -116,6 +116,7 @@ pub struct ItemExecCtx {
     pending_dir_syncs: PendingDirSyncs,
     retained_tickets: Vec<StagedBlobTicket>,
     retained_guards: Vec<Box<dyn Send>>,
+    archive_commit: Option<(crate::peers::archive_import::ArchiveCommitAuthority, i64)>,
     after_commit: Option<Box<dyn FnOnce() + Send>>,
 }
 
@@ -176,6 +177,14 @@ impl ItemExecCtx {
         self.retained_guards.push(Box::new(guard));
     }
 
+    pub(crate) fn guard_archive_commit(
+        &mut self,
+        authority: crate::peers::archive_import::ArchiveCommitAuthority,
+        expires: i64,
+    ) {
+        self.archive_commit = Some((authority, expires));
+    }
+
     pub(crate) fn on_commit(&mut self, action: impl FnOnce() + Send + 'static) {
         self.after_commit = Some(Box::new(action));
     }
@@ -199,6 +208,7 @@ impl ItemExecCtx {
             pending_dir_syncs: PendingDirSyncs::default(),
             retained_tickets: Vec::new(),
             retained_guards: Vec::new(),
+            archive_commit: None,
             after_commit: None,
         }
     }
@@ -212,7 +222,7 @@ impl ItemExecCtx {
         Vec<Box<dyn Send>>,
     ) {
         debug_assert!(
-            self.after_commit.is_none(),
+            self.after_commit.is_none() && self.archive_commit.is_none(),
             "native items have no post-commit side effects"
         );
         (
@@ -270,6 +280,7 @@ enum QueuedWriteEntry {
     Group {
         space_id: SpaceId,
         intents: Vec<PreparedWriteIntent>,
+        isolated: bool,
         staged_bytes_reserved: StagedByteReservation,
         reply_tx: oneshot::Sender<BatchGroupReply>,
     },
@@ -280,6 +291,49 @@ enum QueuedWriteEntry {
 pub struct WriterFaultState {
     pub drop_commit_response_once: AtomicBool,
     pub pre_commit_space_delays: Mutex<HashMap<SpaceId, Duration>>,
+    #[cfg(feature = "test-support")]
+    pub archive_ack: Mutex<Option<Arc<ArchiveAckGate>>>,
+}
+
+/// Test-only rendezvous after SQL durability and before the caller's reply.
+#[cfg(feature = "test-support")]
+pub struct ArchiveAckGate {
+    remaining: std::sync::atomic::AtomicUsize,
+    durable: Notify,
+    resume: Notify,
+}
+
+#[cfg(feature = "test-support")]
+impl ArchiveAckGate {
+    pub fn new(items: usize) -> Self {
+        assert!(items > 0);
+        Self {
+            remaining: std::sync::atomic::AtomicUsize::new(items),
+            durable: Notify::new(),
+            resume: Notify::new(),
+        }
+    }
+
+    pub async fn wait_until_durable(&self) {
+        self.durable.notified().await;
+    }
+
+    pub fn resume(&self) {
+        self.resume.notify_one();
+    }
+
+    async fn after_batch(&self, items: usize) {
+        let before = self
+            .remaining
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                Some(remaining.saturating_sub(items))
+            })
+            .expect("the update always succeeds");
+        if before > 0 && before <= items {
+            self.durable.notify_one();
+            self.resume.notified().await;
+        }
+    }
 }
 
 /// Opt-in Phase-2 batch commit latency recorder (`(duration_ns, logical_items)`).
@@ -632,6 +686,32 @@ impl WriteCoordinator {
         self.batch_telemetry.record(duration_ns, items);
     }
 
+    async fn wait_for_idle_write_ops(&self) {
+        loop {
+            let active = |tracker: &&Arc<ActiveWriteOpTracker>| {
+                tracker.active_ops.load(Ordering::Acquire) > 0
+            };
+            let tracker = match &self.mode {
+                CoordinatorMode::Sqlite { tracker, .. } => Some(tracker).filter(active).cloned(),
+                CoordinatorMode::Postgres { spaces } => spaces
+                    .lock()
+                    .expect("pg spaces")
+                    .values()
+                    .map(|space| &space.tracker)
+                    .find(active)
+                    .cloned(),
+            };
+            let Some(tracker) = tracker else { return };
+            let notified = tracker.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if tracker.active_ops.load(Ordering::Acquire) != 0 {
+                notified.await;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
     /// Acquires an exclusive writer safe point between Phase-2 batch commits without dropping queued items.
     pub async fn acquire_safe_point(&self) -> WriterSafePointGuard {
         let guard = Arc::clone(&self.commit_gate).write_owned().await;
@@ -729,6 +809,7 @@ impl WriteCoordinator {
         budget: &CallBudget,
         space_id: &SpaceId,
         intents: Vec<PreparedWriteIntent>,
+        isolated: bool,
     ) -> Result<(Vec<Result<Vec<u8>, PortError>>, SpaceSeq), PortError> {
         let wait = WriterWait::from_budget(budget);
         for intent in &intents {
@@ -746,6 +827,7 @@ impl WriteCoordinator {
         permit.send(QueuedWriteEntry::Group {
             space_id: space_id.clone(),
             intents,
+            isolated,
             staged_bytes_reserved: reserved_bytes,
             reply_tx,
         });
@@ -917,6 +999,7 @@ impl crate::CanonicalStore {
 
     /// Submits a typed idempotent or non-idempotent canonical mutation through `WriteBatchActor`,
     /// automatically handling MessagePack receipt serialization and replay.
+    #[cfg(feature = "test-support")]
     pub(crate) async fn submit_write_command<R>(
         &self,
         budget: &CallBudget,
@@ -987,9 +1070,36 @@ impl crate::CanonicalStore {
     where
         R: Serialize + DeserializeOwned + Send + 'static,
     {
+        self.submit_write_group(budget, space_id, intents, false)
+            .await
+    }
+
+    pub(crate) async fn submit_archive_write_batch<R>(
+        &self,
+        budget: &CallBudget,
+        space_id: &SpaceId,
+        intents: Vec<PreparedWriteIntent>,
+    ) -> Result<(Vec<Result<R, PortError>>, SpaceSeq), PortError>
+    where
+        R: Serialize + DeserializeOwned + Send + 'static,
+    {
+        self.submit_write_group(budget, space_id, intents, true)
+            .await
+    }
+
+    async fn submit_write_group<R>(
+        &self,
+        budget: &CallBudget,
+        space_id: &SpaceId,
+        intents: Vec<PreparedWriteIntent>,
+        isolated: bool,
+    ) -> Result<(Vec<Result<R, PortError>>, SpaceSeq), PortError>
+    where
+        R: Serialize + DeserializeOwned + Send + 'static,
+    {
         let writer = self.inner.writer()?;
         let (raw_items, effective_cut) = writer
-            .submit_batch_raw(&self.inner, budget, space_id, intents)
+            .submit_batch_raw(&self.inner, budget, space_id, intents, isolated)
             .await?;
         let mut decoded = Vec::with_capacity(raw_items.len());
         for raw_res in raw_items {
@@ -1028,6 +1138,29 @@ impl crate::CanonicalStore {
     #[cfg(feature = "test-support")]
     pub fn has_active_sqlite_writes_for_test(&self) -> Result<bool, PortError> {
         Ok(self.inner.writer()?.has_active_sqlite_ops())
+    }
+
+    /// Observes admitted writes for up to 20 ms while both writer gates remain open.
+    /// This is a scheduling hint. The paired pause still acquires both safe points.
+    pub async fn wait_for_backup_write_gap(&self, budget: &CallBudget) -> Result<(), PortError> {
+        let started = Instant::now();
+        let writer = self.inner.writer()?;
+        let wait = Duration::from_millis(20).min(budget.remaining);
+        tokio::select! {
+            biased;
+            () = budget.cancellation.cancelled() => {
+                return Err(cancelled_not_committed("backup_writer_wait", "backup stopped before pausing"));
+            }
+            () = writer.wait_for_idle_write_ops() => {}
+            () = tokio::time::sleep(wait) => {}
+        }
+        if started.elapsed() >= budget.remaining {
+            return Err(deadline_not_committed(
+                "backup_writer_wait",
+                "backup deadline elapsed before pausing",
+            ));
+        }
+        Ok(())
     }
 
     #[cfg(feature = "test-support")]
@@ -1069,6 +1202,10 @@ fn compute_pipelined_batch_target(active_ops: usize, max_items: usize) -> usize 
     active_ops.clamp(1, max_items)
 }
 
+fn is_isolated(entry: &QueuedWriteEntry) -> bool {
+    matches!(entry, QueuedWriteEntry::Group { isolated: true, .. })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_batch_worker_loop(
     inner_weak: std::sync::Weak<CanonicalInner>,
@@ -1083,9 +1220,12 @@ async fn run_batch_worker_loop(
     let max_items = cfg.max_batch_items.max(1);
     let flush_window = cfg.batch_flush_window;
     let mut cached_pg_conn: Option<crate::dialect::postgres::StorePgConnection> = None;
+    let mut deferred = None;
 
     loop {
-        let next = if let Some((id, registry)) = &pg_space {
+        let next = if deferred.is_some() {
+            deferred.take()
+        } else if let Some((id, registry)) = &pg_space {
             match tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
                 Ok(entry) => entry,
                 Err(_) => {
@@ -1121,66 +1261,91 @@ async fn run_batch_worker_loop(
 
         let mut item_count = entry_logical_len(&first);
         let mut batch = Vec::with_capacity(max_items.min(64));
+        let isolated = is_isolated(&first);
         batch.push(first);
 
-        let initial_target =
-            compute_pipelined_batch_target(tracker.active_ops.load(Ordering::Acquire), max_items);
-
-        // Drain up to `initial_target` so high-concurrency writer cohorts naturally split into
-        // two double-buffered platoons (zero idle gap between Phase 2 and Phase 1!).
-        while item_count < initial_target {
-            match rx.try_recv() {
-                Ok(entry) => {
-                    item_count += entry_logical_len(&entry);
-                    batch.push(entry);
-                }
-                Err(_) => break,
+        // Archive effects have a later whole-transaction fence. Keep ordinary
+        // saves outside that rollback boundary, preserving mailbox order.
+        'gather: {
+            if isolated {
+                break 'gather;
             }
-        }
+            let initial_target = compute_pipelined_batch_target(
+                tracker.active_ops.load(Ordering::Acquire),
+                max_items,
+            );
 
-        if item_count < initial_target && !flush_window.is_zero() {
-            let deadline =
-                crate::runtime::deadline_after(tokio::time::Instant::now(), flush_window);
-            while item_count < max_items {
-                let notified = tracker.notify.notified();
-                tokio::pin!(notified);
-                notified.as_mut().enable();
+            let mut add = |entry: QueuedWriteEntry, item_count: &mut usize| {
+                if is_isolated(&entry) {
+                    deferred = Some(entry);
+                    false
+                } else {
+                    *item_count += entry_logical_len(&entry);
+                    batch.push(entry);
+                    true
+                }
+            };
 
-                let active_target = compute_pipelined_batch_target(
-                    tracker.active_ops.load(Ordering::Acquire),
-                    max_items,
-                );
-                while item_count < active_target {
-                    match rx.try_recv() {
-                        Ok(entry) => {
-                            item_count += entry_logical_len(&entry);
-                            batch.push(entry);
+            // Drain up to `initial_target` so high-concurrency writer cohorts naturally split into
+            // two double-buffered platoons (zero idle gap between Phase 2 and Phase 1!).
+            while item_count < initial_target {
+                match rx.try_recv() {
+                    Ok(entry) => {
+                        if !add(entry, &mut item_count) {
+                            break 'gather;
                         }
-                        Err(_) => break,
                     }
+                    Err(_) => break,
                 }
-                if item_count >= active_target {
-                    break;
-                }
+            }
 
-                tokio::select! {
-                    biased;
-                    maybe_entry = rx.recv() => {
-                        match maybe_entry {
-                            Some(entry) => {
-                                item_count += entry_logical_len(&entry);
-                                batch.push(entry);
+            if item_count < initial_target && !flush_window.is_zero() {
+                let deadline =
+                    crate::runtime::deadline_after(tokio::time::Instant::now(), flush_window);
+                while item_count < max_items {
+                    let notified = tracker.notify.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+
+                    let active_target = compute_pipelined_batch_target(
+                        tracker.active_ops.load(Ordering::Acquire),
+                        max_items,
+                    );
+                    while item_count < active_target {
+                        match rx.try_recv() {
+                            Ok(entry) => {
+                                if !add(entry, &mut item_count) {
+                                    break 'gather;
+                                }
                             }
-                            None => break,
+                            Err(_) => break,
                         }
                     }
-                    _ = notified => {}
-                    _ = tokio::time::sleep_until(deadline) => break,
+                    if item_count >= active_target {
+                        break;
+                    }
+
+                    tokio::select! {
+                        biased;
+                        maybe_entry = rx.recv() => {
+                            match maybe_entry {
+                                Some(entry) => {
+                                    if !add(entry, &mut item_count) {
+                                        break 'gather;
+                                    }
+                                }
+                                None => break,
+                            }
+                        }
+                        _ = notified => {}
+                        _ = tokio::time::sleep_until(deadline) => break,
+                    }
                 }
             }
         }
 
         let Some(inner) = inner_weak.upgrade() else {
+            batch.extend(deferred.take());
             for entry in batch {
                 reject_queued_entry(
                     entry,
@@ -1290,6 +1455,7 @@ async fn flush_single_batch(
                 intents: group_intents,
                 staged_bytes_reserved,
                 reply_tx,
+                ..
             } => {
                 let count = group_intents.len();
                 let all_idempotent = group_intents.iter().all(|it| it.idempotency.is_some());
@@ -1587,6 +1753,7 @@ async fn execute_batch_on_conn(
     // Retain all StagedBlobTickets and runtime lock guards until AFTER outer COMMIT/ROLLBACK!
     let mut batch_retained_tickets: Vec<StagedBlobTicket> = Vec::new();
     let mut batch_retained_guards: Vec<Box<dyn Send>> = Vec::new();
+    let mut archive_commits = Vec::new();
     let mut slots: Vec<ItemOutcomeSlot> = Vec::with_capacity(intents.len());
 
     let committed_at_ms = match now_unix_ms() {
@@ -1679,6 +1846,7 @@ async fn execute_batch_on_conn(
                 dir_syncs,
                 retained_tickets,
                 retained_guards,
+                archive_commit,
                 after_commit: item_after_commit,
             }) => {
                 if use_savepoints && let Err(err) = tx.release_savepoint(idx).await {
@@ -1699,6 +1867,7 @@ async fn execute_batch_on_conn(
                 batch_dir_syncs.merge(&dir_syncs);
                 batch_retained_tickets.extend(retained_tickets);
                 batch_retained_guards.extend(retained_guards);
+                archive_commits.extend(archive_commit);
                 after_commit.extend(item_after_commit);
                 slots.push(ItemOutcomeSlot::Succeeded {
                     response_bytes,
@@ -1793,9 +1962,31 @@ async fn execute_batch_on_conn(
         return BatchExecOutcome::AbortedBeforeCommit(sync_err);
     }
 
+    if !archive_commits.is_empty() {
+        let settled = async {
+            let now = crate::peers::archive_import::archive_commit_clock(tx).await?;
+            for (authority, until) in &archive_commits {
+                authority.check_expiry(now, *until)?;
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(err) = settled {
+            transaction.rollback().await;
+            return BatchExecOutcome::AbortedBeforeCommit(err);
+        }
+    }
+
     // Commit outer SQL transaction!
     match transaction.commit().await {
         Ok(()) => {
+            #[cfg(feature = "test-support")]
+            if !archive_commits.is_empty() {
+                let gate = faults.archive_ack.lock().await.clone();
+                if let Some(gate) = gate {
+                    gate.after_batch(archive_commits.len()).await;
+                }
+            }
             for action in after_commit {
                 action();
             }
@@ -1866,6 +2057,7 @@ struct SingleItemSuccess {
     dir_syncs: PendingDirSyncs,
     retained_tickets: Vec<StagedBlobTicket>,
     retained_guards: Vec<Box<dyn Send>>,
+    archive_commit: Option<(crate::peers::archive_import::ArchiveCommitAuthority, i64)>,
     after_commit: Option<Box<dyn FnOnce() + Send>>,
 }
 
@@ -1909,6 +2101,7 @@ async fn execute_single_item_in_savepoint(
                 dir_syncs: PendingDirSyncs::default(),
                 retained_tickets: Vec::new(),
                 retained_guards: Vec::new(),
+                archive_commit: None,
                 after_commit: None,
             }),
             _ => Err(unavailable_retryable(
@@ -1951,6 +2144,7 @@ async fn execute_single_item_in_savepoint(
         pending_dir_syncs: PendingDirSyncs::default(),
         retained_tickets: Vec::new(),
         retained_guards: Vec::new(),
+        archive_commit: None,
         after_commit: None,
     };
 
@@ -2030,6 +2224,7 @@ async fn execute_single_item_in_savepoint(
         dir_syncs: item_ctx.pending_dir_syncs,
         retained_tickets: item_ctx.retained_tickets,
         retained_guards: item_ctx.retained_guards,
+        archive_commit: item_ctx.archive_commit,
         after_commit: item_ctx.after_commit,
     })
 }
@@ -2634,6 +2829,50 @@ mod tests {
     };
 
     #[tokio::test]
+    async fn backup_write_wait_keeps_admission_open_and_observes_release() {
+        let root = std::env::temp_dir()
+            .join(crate::codec::new_prefixed_hex_id("backup-writers-test-").unwrap());
+        std::fs::create_dir_all(&root).unwrap();
+        let config = CanonicalConfig::local_default(
+            InstallationId::from_bytes([1; 16]),
+            DataRoot::new(&root),
+        );
+        let (store, runtime) = CanonicalRuntime::open(config).await.unwrap();
+        let writer = store.inner.writer().unwrap();
+        let space = SpaceId::from_bytes([2; 16]);
+        let budget = CallBudget {
+            request: RequestId::from_bytes([3; 16]),
+            remaining: Duration::from_secs(5),
+            cancellation: Cancellation::default(),
+        };
+
+        let write = writer.enter_write_op(&space, 1);
+        let mut wait = Box::pin(store.wait_for_backup_write_gap(&budget));
+        assert!(futures_util::poll!(&mut wait).is_pending());
+        assert!(writer.commit_gate.try_write().is_ok());
+        drop(write);
+        wait.await.unwrap();
+
+        let write = writer.enter_write_op(&space, 1);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            store.wait_for_backup_write_gap(&budget),
+        )
+        .await
+        .expect("continuous activity must not prevent a backup attempt")
+        .unwrap();
+
+        let mut wait = Box::pin(store.wait_for_backup_write_gap(&budget));
+        assert!(futures_util::poll!(&mut wait).is_pending());
+        budget.cancellation.cancel();
+        assert!(matches!(wait.await, Err(PortError::Cancelled(_))));
+        drop(write);
+        drop(store);
+        runtime.shutdown().await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn abandoned_admission_and_auxiliary_transactions_release_their_resources() {
         let root =
             std::env::temp_dir().join(crate::codec::new_prefixed_hex_id("writer-test-").unwrap());
@@ -2682,6 +2921,7 @@ mod tests {
                 &budget,
                 &scope.space_id,
                 vec![intent()],
+                false,
             ));
             assert!(futures_util::poll!(&mut group).is_pending());
             assert_eq!(writer.byte_limiter.in_flight.load(Ordering::Acquire), 1024);

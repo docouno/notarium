@@ -723,6 +723,7 @@ pub enum SearchDegradation {
 pub enum ContentJobKind {
     Import { artifact: ArtifactId },
     Export { notes: Vec<NoteId>, encrypted: bool },
+    ExportSpace { encrypted: bool },
     Backup,
     Restore { artifact: ArtifactId },
     Reindex,
