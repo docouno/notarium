@@ -61,11 +61,8 @@ impl Room {
         if self.first_dirty.is_some() {
             self.settle(budget, false).await?;
         }
-        if let (Some(hub), Some(watermark)) = (self.hub.upgrade(), revoke_watermark) {
-            let key = (self.lease.scope.space_id.clone(), self.lease.note.clone());
-            hub.prune_settled_revocations(&key, watermark, |peer_id| {
-                !self.peers.contains_key(&peer_id)
-            });
+        if let Some(watermark) = revoke_watermark {
+            self.prune_settled_revocations(watermark);
         }
         Ok(())
     }

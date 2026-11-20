@@ -1166,8 +1166,8 @@ async fn room_error_exit_drains_buffered_intercept_and_shutdown_reports_stop_tim
     );
     drop(c1);
 
-    // 2. `CollabHub::shutdown` surfaces `DeadlineExceeded` when a busy room
-    //    cannot settle and stop within the shutdown budget.
+    // 2. `CollabHub::shutdown` surfaces `DeadlineExceeded(collab_hub_shutdown)`
+    //    when a busy room cannot service shutdown within the shutdown budget.
     let n2 = create_note(&store, &owner, 43, "Busy.\n", None).await;
     let (c2, _) = synced_client(&hub, &owner, &n2.note, 812).await;
     let (entered2, release2) = pause_wal_admission(&store);
@@ -1177,10 +1177,20 @@ async fn room_error_exit_drains_buffered_intercept_and_shutdown_reports_stop_tim
     let mut short_budget = budget();
     short_budget.remaining = Duration::from_millis(50);
     let shutdown_err = hub.shutdown(&short_budget).await.unwrap_err();
-    assert!(
-        matches!(shutdown_err, PortError::DeadlineExceeded(_)),
-        "expected DeadlineExceeded from hub.shutdown on blocked room, got {shutdown_err:?}"
-    );
+    match shutdown_err {
+        PortError::DeadlineExceeded(failure) => {
+            assert_eq!(
+                failure.diagnostic_ref(),
+                notarium_core::ids::ContentDigest::from_bytes(
+                    *blake3::hash(b"collab_hub_shutdown").as_bytes()
+                ),
+                "expected collab_hub_shutdown diagnostic ref"
+            );
+        }
+        other => {
+            panic!("expected DeadlineExceeded from hub.shutdown on blocked room, got {other:?}")
+        }
+    }
     let _ = release2.send(());
     drop((c2, hub));
     runtime.shutdown().await.unwrap();

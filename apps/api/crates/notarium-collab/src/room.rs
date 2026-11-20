@@ -190,6 +190,29 @@ impl RoomHandle {
             )),
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn detached_for_test(scope: HistoryScope, note: NoteId, owner: Arc<str>) -> Self {
+        let lease = Arc::new(RoomLease {
+            scope,
+            note,
+            epoch: LeaseEpoch::new(1).expect("non-zero lease epoch"),
+            lineage: LineageEpoch::ZERO,
+            owner,
+        });
+        let (commands, receiver) = mpsc::channel(1);
+        drop(receiver);
+        let (_tx, slug) = watch::channel(String::new());
+        Self {
+            lease,
+            commands,
+            stopped: Cancellation::default(),
+            slug,
+            peers_changed: Arc::new(Notify::new()),
+            storage_changed: Arc::new(Notify::new()),
+            last_self_seq: Arc::new(AtomicU64::new(0)),
+        }
+    }
 }
 
 struct RoomLease {
@@ -405,10 +428,16 @@ impl Room {
                         continue;
                     }
                     () = handle.peers_changed.notified() => {
+                        let revoke_watermark =
+                            self.hub.upgrade().map(|hub| hub.current_revoke_seq());
                         if self.reap_peers() {
                             self.carrier.last_writer_auth = None;
                             self.carrier.last_writer_peer = None;
                             self.checkpoint(&self.budget()).await?;
+                        } else if self.first_dirty.is_none()
+                            && let Some(watermark) = revoke_watermark
+                        {
+                            self.prune_settled_revocations(watermark);
                         }
                         continue;
                     }
@@ -662,6 +691,15 @@ impl Room {
         Ok(())
     }
 
+    fn prune_settled_revocations(&self, watermark: u64) {
+        if let Some(hub) = self.hub.upgrade() {
+            let key = (self.lease.scope.space_id.clone(), self.lease.note.clone());
+            hub.prune_settled_revocations(&key, watermark, |peer_id| {
+                !self.peers.contains_key(&peer_id)
+            });
+        }
+    }
+
     fn has_writers(&self) -> bool {
         self.peers
             .values()
@@ -773,6 +811,9 @@ impl Room {
                         bytes = 0;
                     }
                     if let Some(staged) = self.stage(id, update, batch).await? {
+                        if batch.is_empty() {
+                            bytes = 0;
+                        }
                         bytes += staged.original.len() + staged.staged.len();
                         batch.push(staged);
                     } else if batch.is_empty() {

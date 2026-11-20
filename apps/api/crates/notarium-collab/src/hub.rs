@@ -220,27 +220,29 @@ impl CollabHub {
             .ok_or_else(|| DomainError::validation(ValidationReason::InvalidRange))?;
 
         // Close any peers still waiting on initial handshake or connected.
-        let guards: Vec<_> = self
-            .0
-            .peers
-            .lock()
-            .expect("peer registry")
-            .values()
-            .filter_map(|peer| peer.guard.upgrade())
-            .collect();
+        let guards: Vec<_> = {
+            self.0
+                .peers
+                .lock()
+                .expect("peer registry")
+                .values()
+                .filter_map(|peer| peer.guard.upgrade())
+                .collect()
+        };
         for guard in guards {
             guard.close(SessionClose::GOING_AWAY);
         }
 
         // Wait for any in-flight room opens to register their handles.
-        let slots: Vec<_> = self
-            .0
-            .slots
-            .lock()
-            .expect("room registry")
-            .values()
-            .filter_map(Weak::upgrade)
-            .collect();
+        let slots: Vec<_> = {
+            self.0
+                .slots
+                .lock()
+                .expect("room registry")
+                .values()
+                .filter_map(Weak::upgrade)
+                .collect()
+        };
         for slot in slots {
             let mut slot_budget = budget.clone();
             slot_budget.remaining = deadline.saturating_duration_since(Instant::now());
@@ -393,15 +395,16 @@ impl CollabHub {
             // The registration fence already cancelled all eligible peers.
             // Wait for in-flight durable opens to reach their room actor before
             // taking the final snapshot of rooms to close.
-            let slots: Vec<_> = self
-                .0
-                .slots
-                .lock()
-                .expect("room registry")
-                .iter()
-                .filter(|((id, _), _)| id == space)
-                .filter_map(|(_, slot)| slot.upgrade())
-                .collect();
+            let slots: Vec<_> = {
+                self.0
+                    .slots
+                    .lock()
+                    .expect("room registry")
+                    .iter()
+                    .filter(|((id, _), _)| id == space)
+                    .filter_map(|(_, slot)| slot.upgrade())
+                    .collect()
+            };
             for slot in slots {
                 let mut budget = ctx.budget.clone();
                 budget.remaining = deadline.saturating_duration_since(Instant::now());
@@ -645,12 +648,13 @@ impl HubInner {
 
     pub fn has_live_slot(&self, scope: &HistoryScope, note: &NoteId) -> bool {
         let key = (scope.space_id.clone(), note.clone());
+        // Check strong_count without upgrading so `RoomSlot::drop` can never
+        // execute while `self.slots` is locked.
         self.slots
             .lock()
             .expect("room registry")
             .get(&key)
-            .and_then(Weak::upgrade)
-            .is_some()
+            .is_some_and(|slot| slot.strong_count() > 0)
     }
 
     pub fn space_has_live_rooms(&self, space: &SpaceId) -> bool {
@@ -663,11 +667,13 @@ impl HubInner {
         {
             return true;
         }
+        // Check strong_count without upgrading so `RoomSlot::drop` can never
+        // execute while `self.slots` is locked.
         self.slots
             .lock()
             .expect("room registry")
             .iter()
-            .any(|((s, _), slot)| s == space && slot.upgrade().is_some())
+            .any(|((s, _), slot)| s == space && slot.strong_count() > 0)
     }
 
     pub fn budget(&self) -> CallBudget {
@@ -1619,6 +1625,117 @@ mod tests {
         assert!(admitted.is_none());
         let ev = sess_b.recv().await;
         assert_eq!(ev, Some(SessionEvent::Close(SessionClose::GOING_AWAY)));
+
+        drop(hub);
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn live_slot_queries_do_not_deadlock_under_concurrent_slot_drop() {
+        let dir = TestDir::new("hub-slots-race");
+        let (store, runtime) = CanonicalRuntime::open(CanonicalConfig::local_default(
+            InstallationId::from_bytes([90; 16]),
+            notarium_core::epoch::DataRoot::new(&dir.0),
+        ))
+        .await
+        .unwrap();
+        let hub = CollabHub::new(store, CollabConfig::default()).unwrap();
+        let scope = HistoryScope {
+            space_id: SpaceId::from_bytes([13; 16]),
+            incarnation: HistoryIncarnation::from_bytes([14; 16]),
+        };
+        let note_a = NoteId::from_bytes([23; 16]);
+        let note_b = NoteId::from_bytes([24; 16]);
+
+        assert!(!hub.0.has_live_slot(&scope, &note_a));
+        assert!(!hub.0.space_has_live_rooms(&scope.space_id));
+        let held = hub.0.slot(&scope, &note_a);
+        assert!(hub.0.has_live_slot(&scope, &note_a));
+        assert!(hub.0.space_has_live_rooms(&scope.space_id));
+        drop(held);
+        assert!(!hub.0.has_live_slot(&scope, &note_a));
+        assert!(!hub.0.space_has_live_rooms(&scope.space_id));
+
+        // Stress concurrent slot drop against `has_live_slot` and
+        // `space_has_live_rooms` on separate OS threads; upgrading `Weak` under
+        // `HubInner::slots` would self-deadlock in `RoomSlot::drop`.
+        let inner = Arc::clone(&hub.0);
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let scope_r = scope.clone();
+        let note_a_r = note_a.clone();
+        let note_b_r = note_b.clone();
+        let inner_r = Arc::clone(&inner);
+        let done_r = Arc::clone(&done);
+        let reader = std::thread::spawn(move || {
+            let mut spins = 0u64;
+            while !done_r.load(Ordering::Acquire) {
+                let _ = inner_r.has_live_slot(&scope_r, &note_a_r);
+                let _ = inner_r.has_live_slot(&scope_r, &note_b_r);
+                let _ = inner_r.space_has_live_rooms(&scope_r.space_id);
+                spins = spins.wrapping_add(1);
+            }
+            spins
+        });
+        for i in 0..4_000u32 {
+            let note = if i & 1 == 0 { &note_a } else { &note_b };
+            let slot = inner.slot(&scope, note);
+            std::hint::black_box(&slot);
+            drop(slot);
+        }
+        done.store(true, Ordering::Release);
+        let _ = reader.join().expect("reader thread must not panic");
+
+        assert!(!hub.0.has_live_slot(&scope, &note_a));
+        assert!(!hub.0.has_live_slot(&scope, &note_b));
+        assert!(!hub.0.space_has_live_rooms(&scope.space_id));
+        drop(inner);
+        drop(hub);
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_reports_stop_timeout_when_closing_room_does_not_finish_stopping() {
+        let dir = TestDir::new("hub-shutdown-stop");
+        let (store, runtime) = CanonicalRuntime::open(CanonicalConfig::local_default(
+            InstallationId::from_bytes([91; 16]),
+            notarium_core::epoch::DataRoot::new(&dir.0),
+        ))
+        .await
+        .unwrap();
+        let hub = CollabHub::new(store, CollabConfig::default()).unwrap();
+        let scope = HistoryScope {
+            space_id: SpaceId::from_bytes([15; 16]),
+            incarnation: HistoryIncarnation::from_bytes([16; 16]),
+        };
+        let note = NoteId::from_bytes([25; 16]);
+
+        // Mailbox is already closed (`room.shutdown()` immediately returns
+        // `Ok(false)`), while `room.stopped()` stays pending. `CollabHub::shutdown`
+        // must surface `collab_hub_shutdown_stop` rather than returning `Ok(())`.
+        let detached = RoomHandle::detached_for_test(scope, note, Arc::clone(&hub.0.owner));
+        hub.0.room_started(&detached);
+
+        let mut short_budget = hub.0.budget();
+        short_budget.remaining = Duration::from_millis(25);
+        let err = hub.shutdown(&short_budget).await.unwrap_err();
+        match err {
+            PortError::DeadlineExceeded(failure) => {
+                assert_eq!(
+                    failure.diagnostic_ref(),
+                    ContentDigest::from_bytes(
+                        *blake3::hash(b"collab_hub_shutdown_stop").as_bytes()
+                    ),
+                    "expected collab_hub_shutdown_stop diagnostic ref"
+                );
+            }
+            other => panic!("expected DeadlineExceeded(collab_hub_shutdown_stop), got {other:?}"),
+        }
+
+        // Once the closing room cancels `stopped`, shutdown completes cleanly.
+        detached.stopped().cancel();
+        let mut ok_budget = hub.0.budget();
+        ok_budget.remaining = Duration::from_millis(200);
+        hub.shutdown(&ok_budget).await.unwrap();
 
         drop(hub);
         runtime.shutdown().await.unwrap();

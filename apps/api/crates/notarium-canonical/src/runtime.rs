@@ -193,7 +193,7 @@ impl<'a> SqliteCommitSeqGuard<'a> {
     pub(crate) fn begin(inner: &'a CanonicalInner) -> Self {
         let prev = inner
             .sqlite_writer_commit_gen
-            .fetch_add(1, Ordering::Release);
+            .fetch_add(1, Ordering::AcqRel);
         debug_assert_eq!(prev & 1, 0, "nested SQLite commit seqlock");
         Self {
             inner,
