@@ -1,3 +1,5 @@
+mod retention;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     num::NonZeroUsize,
@@ -14,7 +16,7 @@ use notarium_canonical::{
 };
 use notarium_core::{
     DomainError, DomainResult,
-    auth::{AuthenticatedCredential, PrincipalKind, ResourceFacts},
+    auth::{AuthenticatedCredential, PrincipalKind, ResourceFacts, SpaceLifecycle},
     classes::{ClassEgressFence, ClassifiedMetadata, DocClass},
     error::{Diagnostic, PortError, ValidationReason},
     ids::*,
@@ -34,10 +36,11 @@ use crate::{
     query::{self, BoardRank, WindowInput},
 };
 
-use super::{ProjectionEngine, PublishedCut, records, worker::page_limit};
+use super::{ProjectionEngine, PublishedCut, records};
 
 pub(super) struct RetainedReads {
     by_id: Mutex<BTreeMap<EffectiveReadId, Arc<ReadState>>>,
+    inserted: tokio::sync::Notify,
     limit: usize,
     lifetime: Duration,
 }
@@ -46,6 +49,7 @@ impl RetainedReads {
     pub(super) fn new(limit: NonZeroUsize, lifetime: Duration) -> Self {
         Self {
             by_id: Mutex::default(),
+            inserted: tokio::sync::Notify::new(),
             limit: limit.get(),
             lifetime,
         }
@@ -64,6 +68,7 @@ impl RetainedReads {
                 entries.remove(&id);
             }
         }
+        self.inserted.notify_one();
     }
 
     fn get(&self, cursor: &KeysetCursor, ctx: &SpaceContext) -> Result<Arc<ReadState>, PortError> {
@@ -91,12 +96,27 @@ impl RetainedReads {
             .retain(|_, read| &read.read.cut.scope != scope);
     }
 
-    pub(super) fn expire(&self) {
-        let now = Instant::now();
-        self.by_id
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .retain(|_, read| read.expires > now);
+    pub(super) async fn expire_on_deadline(&self) {
+        loop {
+            let deadline = {
+                let mut reads = self.by_id.lock().unwrap_or_else(|error| error.into_inner());
+                let now = Instant::now();
+                let previous = reads.len();
+                reads.retain(|_, read| read.expires > now);
+                if reads.len() < previous {
+                    return;
+                }
+                reads.values().map(|read| read.expires).min()
+            };
+            if let Some(deadline) = deadline {
+                tokio::select! {
+                    _ = tokio::time::sleep_until(deadline.into()) => {},
+                    _ = self.inserted.notified() => {},
+                }
+            } else {
+                self.inserted.notified().await;
+            }
+        }
     }
 
     pub(super) fn clear(&self) {
@@ -116,21 +136,9 @@ fn retained_bytes(entries: &BTreeMap<EffectiveReadId, Arc<ReadState>>) -> usize 
         } else {
             0
         };
-        let exact = read.overlay.values().fold(0usize, |bytes, row| {
-            let note = &row.note;
-            bytes
-                .saturating_add(note.view_blocks_msgpack.len())
-                .saturating_add(note.raw_fields_msgpack.len())
-                .saturating_add(note.evaluated_fields_msgpack.len())
-                .saturating_add(note.preview.len())
-                .saturating_add(
-                    row.ranks
-                        .iter()
-                        .map(|rank| rank.group_key_msgpack.len() + rank.sort_rank_lexo.len())
-                        .sum::<usize>(),
-                )
-        });
-        bytes.saturating_add(shared).saturating_add(exact)
+        bytes
+            .saturating_add(shared)
+            .saturating_add(read.owned_bytes)
     })
 }
 
@@ -151,10 +159,13 @@ struct ReadState {
     incomplete: bool,
     expires: Instant,
     prepared_view: Option<PreparedView>,
+    owned_bytes: usize,
 }
 
 struct PreparedView {
-    descriptor: NotaDescriptor,
+    source: ViewSource,
+    columns: Vec<GroupKey>,
+    board: bool,
     plan: query::ViewPlan,
     folder: Option<FolderId>,
 }
@@ -223,10 +234,10 @@ impl ProjectionEngine {
         &self,
         ctx: &SpaceContext,
         causal: &CausalBasis,
-        allow_overlay: bool,
+        query: Option<&RetainedQuery>,
     ) -> Result<ChosenRead, PortError> {
         let scope = ctx.scope();
-        let mut apply_overlay = allow_overlay;
+        let mut apply_overlay = query.is_some();
         loop {
             let base = match self.published_cut(scope) {
                 Ok(cut) => cut,
@@ -299,6 +310,15 @@ impl ProjectionEngine {
                 }
             };
             let (selections, overlay) = if let Some(receipts) = pending {
+                if let Some(query) = query {
+                    let permit = cut.live.try_read()?;
+                    match query {
+                        RetainedQuery::Notes(notes) => {
+                            authorize_notes(&permit, ctx, &cut.root_folder_id, notes)?;
+                        }
+                        RetainedQuery::View(view) => ensure_active(&permit, ctx, &view.view.note)?,
+                    }
+                }
                 match self.try_exact(ctx, &cut, receipts).await {
                     Ok(Some(overlay)) => overlay,
                     Ok(None) => {
@@ -441,13 +461,17 @@ impl ProjectionEngine {
             incomplete,
             selections,
             overlay,
-        } = self.choose_read(ctx, causal, true).await?;
+        } = self.choose_read(ctx, causal, Some(&query)).await?;
         let schema_revision = cut.watermark.schema.as_ref().map(|schema| &schema.revision);
         let (fingerprint, prepared_view) = match &query {
-            RetainedQuery::Notes(query) => (
-                query::plan_notes(query, schema_revision, &cut.fields)?,
-                None,
-            ),
+            RetainedQuery::Notes(query) => {
+                let permit = cut.live.try_read()?;
+                authorize_notes(&permit, ctx, &cut.root_folder_id, query)?;
+                (
+                    query::plan_notes(query, schema_revision, &cut.fields)?,
+                    None,
+                )
+            }
             RetainedQuery::View(query) => {
                 let (row, descriptor) = self.load_view(ctx, &cut, &query.view, &overlay).await?;
                 let plan = query::plan_view(
@@ -463,13 +487,16 @@ impl ProjectionEngine {
                 (
                     plan.fingerprint,
                     Some(PreparedView {
-                        descriptor,
+                        source: descriptor.source,
+                        board: descriptor.kind == ViewKind::Board,
+                        columns: descriptor.columns,
                         plan,
                         folder,
                     }),
                 )
             }
         };
+        let owned_bytes = retention::page_bytes(&query, prepared_view.as_ref(), &overlay);
         let mut snapshot = cut.cut.clone();
         snapshot.canonical_seq = cut.live.try_read()?.head();
         Ok(Arc::new(ReadState {
@@ -494,6 +521,7 @@ impl ProjectionEngine {
             incomplete,
             credential: ctx.auth().credential().cloned(),
             prepared_view,
+            owned_bytes,
             expires: Instant::now()
                 .checked_add(self.reads.lifetime)
                 .ok_or_else(not_ready)?,
@@ -622,7 +650,9 @@ impl ProjectionEngine {
     ) -> Result<ViewResult, PortError> {
         let cut = &state.cut;
         let PreparedView {
-            descriptor,
+            source,
+            columns,
+            board,
             plan,
             folder,
         } = state.prepared_view.as_ref().ok_or_else(stale)?;
@@ -632,15 +662,11 @@ impl ProjectionEngine {
             .map_err(|error| if after.is_some() { stale() } else { error })?;
         let (mut candidates, head) = {
             let permit = cut.live.try_read()?;
-            let entry = query::view_authorization_folder(&descriptor.source, folder.as_ref());
+            let entry = query::view_authorization_folder(source, folder.as_ref());
             authorize_query(&permit, ctx, &cut.root_folder_id, entry, true)?;
             let universe = query::structural_universe(&index, permit.space(), ctx.auth())?;
-            let candidates = query::view_source_candidates(
-                &index,
-                &descriptor.source,
-                folder.as_ref(),
-                universe,
-            )?;
+            let candidates =
+                query::view_source_candidates(&index, source, folder.as_ref(), universe)?;
             (
                 current_bitmap(
                     &index,
@@ -665,7 +691,7 @@ impl ProjectionEngine {
                 .into_iter()
                 .collect();
             let source = query::source_matches(
-                &descriptor.source,
+                source,
                 folder.as_ref(),
                 &row.note.parent_folder_id,
                 &location.ids,
@@ -689,42 +715,8 @@ impl ProjectionEngine {
             exact.insert(*id, row.note.clone());
         }
         let mut ranks = BTreeMap::new();
-        if descriptor.kind == ViewKind::Board && !candidates.is_empty() {
-            let limit = page_limit();
-            let mut after = None;
-            loop {
-                let page = cut
-                    .store
-                    .view_rank_page(
-                        ctx.scope(),
-                        cut.cut.projected_seq,
-                        &request.view,
-                        after.as_ref(),
-                        limit,
-                    )
-                    .await?;
-                let complete = page.len() < usize::from(limit.get());
-                after = page.last().map(|rank| rank.target_note_id.clone());
-                for rank in page {
-                    if let Some(dense) = index
-                        .dense_id(&rank.target_note_id)
-                        .filter(|dense| candidates.contains(*dense))
-                    {
-                        ranks.insert(
-                            dense,
-                            BoardRank {
-                                group: rank.group_key()?,
-                                rank: rank.sort_rank_lexo,
-                            },
-                        );
-                    }
-                }
-                if complete {
-                    break;
-                }
-            }
+        if *board && !candidates.is_empty() {
             for (id, row) in &state.overlay {
-                ranks.remove(id);
                 if let Some(rank) = row.ranks.iter().find(|rank| {
                     rank.view_note_id == request.view.note && rank.view_key == request.view.key
                 }) {
@@ -738,22 +730,25 @@ impl ProjectionEngine {
                 }
             }
         }
-        let selection = query::select_window(WindowInput {
-            index: &index,
-            store: &cut.store,
-            scope: ctx.scope(),
-            cut: cut.cut.projected_seq,
-            candidates: &candidates,
-            filter: &plan.filter,
-            sort: &plan.sort,
-            group_by: plan.group_by.as_deref(),
-            columns: &descriptor.columns,
-            board: descriptor.kind == ViewKind::Board,
-            ranks: &ranks,
-            overlay: &exact,
-            after: after.map(|cursor| &cursor.last),
-            limit: request.limit,
-        })
+        let selection = query::select_view_window(
+            WindowInput {
+                index: &index,
+                store: &cut.store,
+                scope: ctx.scope(),
+                cut: cut.cut.projected_seq,
+                candidates: &candidates,
+                filter: &plan.filter,
+                sort: &plan.sort,
+                group_by: plan.group_by.as_deref(),
+                columns,
+                board: *board,
+                ranks: &ranks,
+                overlay: &exact,
+                after: after.map(|cursor| &cursor.last),
+                limit: request.limit,
+            },
+            (*board).then_some(&request.view),
+        )
         .await?;
         let ids = selection
             .rows
@@ -763,7 +758,7 @@ impl ProjectionEngine {
         let cards = self.hydrate_cards_at(ctx, cut, &ids, &exact, head).await?;
         let next = next_cursor(state, selection.has_more, &selection.rows);
         let permit = cut.live.try_read()?;
-        ensure_head(&permit, head)?;
+        ensure_active_head(&permit, head)?;
         ensure_active(&permit, ctx, &request.view.note)?;
         let rows = cards
             .into_iter()
@@ -797,13 +792,7 @@ impl ProjectionEngine {
             .map_err(|error| if after.is_some() { stale() } else { error })?;
         let (mut candidates, head, entry) = {
             let permit = cut.live.try_read()?;
-            let entry = authorize_query(
-                &permit,
-                ctx,
-                &cut.root_folder_id,
-                query.folder.as_ref(),
-                matches!(query.lifecycle, LifecycleMask::Active),
-            )?;
+            let entry = authorize_notes(&permit, ctx, &cut.root_folder_id, query)?;
             let universe =
                 query::note_universe(&index, permit.space(), ctx.auth(), query.lifecycle)?;
             let candidates = query::note_source_candidates(&index, query, universe)?;
@@ -920,8 +909,12 @@ impl ProjectionEngine {
             None
         };
         let next = next_cursor(state, selection.has_more, &selection.rows);
+        #[cfg(any(test, feature = "test-support"))]
+        if page.is_some() {
+            pause_after_read_payload(cut, ctx).await;
+        }
         let permit = cut.live.try_read()?;
-        ensure_head(&permit, head)?;
+        ensure_active_head(&permit, head)?;
         let mut rows = Vec::new();
         for planned in planned.into_iter().flatten() {
             if let Some((metadata, path, row)) =
@@ -965,7 +958,7 @@ impl ProjectionEngine {
             .flatten()
             .map(|row| row.parent_folder_id.clone())
             .collect::<BTreeSet<_>>();
-        for _ in 0..256 {
+        for _ in 0..=MAX_FOLDER_DEPTH {
             if pending.is_empty() {
                 break;
             }
@@ -1018,7 +1011,7 @@ impl ProjectionEngine {
                 .await?
         {
             let permit = cut.live.try_read()?;
-            ensure_head(&permit, expected_head)?;
+            ensure_active_head(&permit, expected_head)?;
             return cards
                 .into_iter()
                 .map(|card| {
@@ -1056,7 +1049,7 @@ impl ProjectionEngine {
         }
         let planned = self.hydration_plan(ctx, cut, ids, overlay).await?;
         let permit = cut.live.try_read()?;
-        ensure_head(&permit, expected_head)?;
+        ensure_active_head(&permit, expected_head)?;
         planned
             .into_iter()
             .map(|plan| {
@@ -1084,6 +1077,19 @@ impl ProjectionEngine {
 struct CardPlan {
     row: ProjectedNote,
     location: records::FolderLocation,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+async fn pause_after_read_payload(cut: &PublishedCut, ctx: &SpaceContext) {
+    if let Some(slot) = cut.slot.upgrade() {
+        slot.benchmark_pause
+            .pause_at(
+                super::benchmark::PausePoint::AfterReadPayload,
+                None,
+                &ctx.budget.cancellation,
+            )
+            .await;
+    }
 }
 
 impl CardPlan {
@@ -1223,7 +1229,26 @@ pub(super) fn ensure_active(
     Ok(())
 }
 
-pub(super) fn ensure_head(permit: &LiveReadPermit, head: SpaceSeq) -> Result<(), PortError> {
+fn authorize_notes(
+    permit: &LiveReadPermit,
+    ctx: &SpaceContext,
+    root: &FolderId,
+    query: &NoteQuery,
+) -> Result<FolderId, PortError> {
+    authorize_query(
+        permit,
+        ctx,
+        root,
+        query.folder.as_ref(),
+        matches!(query.lifecycle, LifecycleMask::Active),
+    )
+}
+
+fn ensure_active_head(permit: &LiveReadPermit, head: SpaceSeq) -> Result<(), PortError> {
+    // Catalog lifecycle transitions preserve the command sequence.
+    if permit.space().lifecycle != SpaceLifecycle::Active {
+        return Err(DomainError::ResourceNotFound.into());
+    }
     if permit.head() != head {
         return Err(not_ready());
     }
@@ -1302,32 +1327,24 @@ impl ViewGraphPort for ProjectionEngine {
                 match request {
                     ReadRequest::Open { query, causal } => {
                         for attempt in 0..3 {
-                            let attempt_result: Result<(Arc<ReadState>, ViewResult), PortError> =
-                                async {
-                                    let state = self
-                                        .open_read(
-                                            &ctx,
-                                            RetainedQuery::View(query.clone()),
-                                            &causal,
-                                        )
-                                        .await?;
-                                    let result = self.view_page(&ctx, &state, &query, None).await?;
-                                    let _admission =
-                                        self.current_admission(state.read.cut.generation)?;
-                                    let _live = state.cut.live.try_read()?;
-                                    ensure_head(&_live, result.rows.canonical_seq)?;
-                                    Ok((state, result))
+                            let attempt_result: Result<ViewResult, PortError> = async {
+                                let state = self
+                                    .open_read(&ctx, RetainedQuery::View(query.clone()), &causal)
+                                    .await?;
+                                let result = self.view_page(&ctx, &state, &query, None).await?;
+                                let _admission =
+                                    self.current_admission(state.read.cut.generation)?;
+                                let _live = state.cut.live.try_read()?;
+                                ensure_active_head(&_live, result.rows.canonical_seq)?;
+                                if result.rows.next.is_some() {
+                                    self.reads.insert(state);
                                 }
-                                .await;
+                                Ok(result)
+                            }
+                            .await;
                             match attempt_result {
-                                Ok((state, result)) => {
-                                    if result.rows.next.is_some() {
-                                        self.reads.insert(state);
-                                    }
-                                    return Ok(result);
-                                }
                                 Err(error) if attempt < 2 && registration_gap(&error) => continue,
-                                Err(error) => return Err(error),
+                                result => return result,
                             }
                         }
                         Err(stale())
@@ -1339,7 +1356,7 @@ impl ViewGraphPort for ProjectionEngine {
                         };
                         let result = self.view_page(&ctx, &state, query, Some(&cursor)).await?;
                         let _live = state.cut.live.try_read()?;
-                        ensure_head(&_live, result.rows.canonical_seq)?;
+                        ensure_active_head(&_live, result.rows.canonical_seq)?;
                         Ok(result)
                     }
                 }
@@ -1372,33 +1389,24 @@ impl ProjectionEngine {
                 match request {
                     ReadRequest::Open { query, causal } => {
                         for attempt in 0..3 {
-                            let attempt_result: Result<(Arc<ReadState>, FolderPage), PortError> =
-                                async {
-                                    let state = self
-                                        .open_read(
-                                            &ctx,
-                                            RetainedQuery::Notes(query.clone()),
-                                            &causal,
-                                        )
-                                        .await?;
-                                    let result =
-                                        self.notes_page(&ctx, &state, &query, None).await?;
-                                    let _admission =
-                                        self.current_admission(state.read.cut.generation)?;
-                                    let _live = state.cut.live.try_read()?;
-                                    ensure_head(&_live, result.children.canonical_seq)?;
-                                    Ok((state, result))
+                            let attempt_result: Result<FolderPage, PortError> = async {
+                                let state = self
+                                    .open_read(&ctx, RetainedQuery::Notes(query.clone()), &causal)
+                                    .await?;
+                                let result = self.notes_page(&ctx, &state, &query, None).await?;
+                                let _admission =
+                                    self.current_admission(state.read.cut.generation)?;
+                                let _live = state.cut.live.try_read()?;
+                                ensure_active_head(&_live, result.children.canonical_seq)?;
+                                if result.children.next.is_some() {
+                                    self.reads.insert(state);
                                 }
-                                .await;
+                                Ok(result)
+                            }
+                            .await;
                             match attempt_result {
-                                Ok((state, result)) => {
-                                    if result.children.next.is_some() {
-                                        self.reads.insert(state);
-                                    }
-                                    return Ok(result);
-                                }
                                 Err(error) if attempt < 2 && registration_gap(&error) => continue,
-                                Err(error) => return Err(error),
+                                result => return result,
                             }
                         }
                         Err(stale())
@@ -1410,7 +1418,7 @@ impl ProjectionEngine {
                         };
                         let result = self.notes_page(&ctx, &state, query, Some(&cursor)).await?;
                         let _live = state.cut.live.try_read()?;
-                        ensure_head(&_live, result.children.canonical_seq)?;
+                        ensure_active_head(&_live, result.children.canonical_seq)?;
                         Ok(result)
                     }
                 }
@@ -1497,6 +1505,30 @@ impl Snapshot {
     }
 }
 
+/// Own the compressed posting while the consumer is suspended. Re-seek once
+/// per small batch so that abandoning an iterator never expands its tail.
+fn bitmap_ids(rows: Bitmap) -> impl Iterator<Item = u32> + Send {
+    let mut next = Some(0);
+    let mut buffer = [0; 64];
+    let mut offset = 0;
+    let mut count = 0;
+    std::iter::from_fn(move || {
+        if offset == count {
+            let mut iter = rows.iter();
+            iter.reset_at_or_after(next?);
+            count = iter.next_many(&mut buffer);
+            if count == 0 {
+                return None;
+            }
+            offset = 0;
+            next = buffer[count - 1].checked_add(1);
+        }
+        let id = buffer[offset];
+        offset += 1;
+        Some(id)
+    })
+}
+
 impl StructuralSnapshot for Snapshot {
     fn cut(&self) -> &SnapshotCut {
         &self.cut
@@ -1532,17 +1564,13 @@ impl StructuralSnapshot for Snapshot {
         rows.and_inplace(&self.visible);
         drop(permit);
         let folder = folder.clone();
-        let ids = rows
-            .iter()
-            .collect::<Vec<u32>>()
-            .into_iter()
-            .filter(move |id| {
-                self.live.try_read().is_ok_and(|permit| {
-                    (permit.head() == initial_head
-                        || authorize_entry(&permit, &self.ctx, &folder).is_ok())
-                        && self.visible_under(&permit, *id)
-                })
-            });
+        let ids = bitmap_ids(rows).filter(move |id| {
+            self.live.try_read().is_ok_and(|permit| {
+                (permit.head() == initial_head
+                    || authorize_entry(&permit, &self.ctx, &folder).is_ok())
+                    && self.visible_under(&permit, *id)
+            })
+        });
         Ok(DenseNodeIter::from_iter(self.cut.generation, ids))
     }
 
@@ -1581,7 +1609,7 @@ impl StructuralReadPort for ProjectionEngine {
     ) -> PortFuture<'_, Box<dyn StructuralSnapshot>> {
         Box::pin(async move {
             within_budget(&ctx, async {
-                let cut = self.choose_read(&ctx, &causal, false).await?.cut;
+                let cut = self.choose_read(&ctx, &causal, None).await?.cut;
                 let index = self.open_index_async(&cut).await?;
                 let permit = cut.live.try_read()?;
                 authorize_query(&permit, &ctx, &cut.root_folder_id, None, true)?;
@@ -1687,6 +1715,10 @@ impl StructuralReadPort for ProjectionEngine {
                                 )
                                 .await?,
                             );
+                            #[cfg(any(test, feature = "test-support"))]
+                            if cards.len() < keys.len() {
+                                pause_after_read_payload(&current, &ctx).await;
+                            }
                         }
                         let mut cards = cards.into_iter();
                         let result: Vec<Option<NoteCard>> = slots
@@ -1694,7 +1726,8 @@ impl StructuralReadPort for ProjectionEngine {
                             .map(|slot| slot.and_then(|_| cards.next().flatten()))
                             .collect();
                         let _admission = self.current_admission(current.cut.generation)?;
-                        ensure_head(&live.try_read()?, head)?;
+                        let permit = live.try_read()?;
+                        ensure_active_head(&permit, head)?;
                         Ok::<_, PortError>(result)
                     }
                     .await;
@@ -1719,7 +1752,7 @@ impl StructuralReadPort for ProjectionEngine {
                 }
                 let _admission = self.current_admission(self.active_generation())?;
                 let permit = live.try_read()?;
-                ensure_head(&permit, head)?;
+                ensure_active_head(&permit, head)?;
                 for (card, id) in cards.iter_mut().zip(notes) {
                     if card.is_some() && ensure_active(&permit, &ctx, &id).is_err() {
                         *card = None;
@@ -1729,5 +1762,28 @@ impl StructuralReadPort for ProjectionEngine {
             })
             .await
         })
+    }
+}
+
+#[cfg(test)]
+mod subtree_tests {
+    use super::*;
+
+    #[test]
+    fn owned_subtree_iterator_starts_with_a_bounded_batch_and_crosses_batch_boundaries() {
+        let mut bitmap = Bitmap::new();
+        bitmap.add_range(0..1_000_000);
+        bitmap.add(u32::MAX);
+        let mut early = bitmap_ids(bitmap.clone());
+        assert_eq!(early.next(), Some(0));
+        drop(early);
+        let mut sparse = Bitmap::new();
+        sparse.add_range(5..69);
+        sparse.add_range(10_000..10_069);
+        sparse.add(u32::MAX);
+        assert_eq!(
+            bitmap_ids(sparse.clone()).collect::<Vec<_>>(),
+            sparse.to_vec()
+        );
     }
 }

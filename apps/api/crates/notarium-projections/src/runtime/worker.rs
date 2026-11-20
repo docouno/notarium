@@ -400,6 +400,7 @@ async fn run_feed(
     let mut feed = FeedSession {
         subscription: subscribe(engine, scope, cut.cut.projected_seq).await?,
         pending_delivery,
+        folders: None,
     };
     let mut graph_schedule = GraphSchedule::default();
     if cut.watermark.graph_settled_seq < cut.cut.projected_seq {
@@ -462,6 +463,24 @@ async fn run_feed(
                     cut = apply::bind_prefetched_cut(engine, slot, &cut).await?;
                     slot.replace(Some(Arc::clone(&cut)));
                     *made_progress = true;
+                }
+            }
+            _ = slot.align_graph.notified() => {
+                if engine.active_generation() == generation.store.generation() {
+                    if cut.watermark.graph_settled_seq < cut.cut.projected_seq {
+                        graph_schedule.due = Some(Instant::now());
+                    }
+                } else {
+                    let serving = engine.published_cut(scope)?;
+                    if cut.handoff_graph_source.as_ptr() != Arc::as_ptr(&serving)
+                        && serving.watermark.graph_settled_seq == cut.cut.projected_seq
+                        && serving.cut.projected_seq == cut.cut.projected_seq
+                    {
+                        check_writer(engine, scope)?;
+                        cut = super::graph_settle::align_for_handoff(engine, &cut, &serving, stop).await?;
+                        slot.replace(Some(Arc::clone(&cut)));
+                        *made_progress = true;
+                    }
                 }
             }
             _ = slot.checkpoint.notified() => {
@@ -614,6 +633,7 @@ fn arm_recovery(pending: &mut Option<PendingDelivery>, through: SpaceSeq, mut re
 }
 
 struct FeedSession<'a> {
+    folders: Option<apply::CommandFolders>,
     subscription: Box<dyn ChangeSubscription>,
     pending_delivery: &'a mut Option<PendingDelivery>,
 }
@@ -744,7 +764,9 @@ async fn consume(
             // Stage publication may commit before apply or ACK fails. Keep
             // this range across reopen until the next cut proves the outcome.
             *feed.pending_delivery = Some(PendingDelivery::Command(command.range));
-            let applied = apply::command(engine, cut, command.range, stop).await?;
+            let applied =
+                apply::command_with_folders(engine, cut, command.range, stop, &mut feed.folders)
+                    .await?;
             if applied.cut.watermark.graph_settled_seq > cut.watermark.graph_settled_seq {
                 outcome.graph_settled = true;
                 outcome.graph_changes = 0;

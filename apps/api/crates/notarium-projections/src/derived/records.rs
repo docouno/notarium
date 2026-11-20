@@ -308,6 +308,15 @@ record! {
     }
 }
 
+// A group-order scan needs only the two trailing columns of the existing index.
+record! {
+    pub(crate) struct GroupRankPosition = "projected_view_ranks";
+    key(target_note_id) {
+        sort_rank_lexo: String,
+        target_note_id: NoteId,
+    }
+}
+
 impl ProjectedViewRank {
     pub fn group_key(&self) -> Result<GroupKey, PortError> {
         decode(&self.group_key_msgpack)

@@ -505,7 +505,7 @@ mod tests {
         let generation = ProjectionGeneration::new(1).unwrap();
         let store = DerivedStore::open_sqlite(&root, generation).await.unwrap();
         let start = || {
-            ProjectorRuntime::start(
+            ProjectorRuntime::start_for_test(
                 canonical.clone(),
                 context.clone(),
                 store.clone(),

@@ -585,3 +585,211 @@ async fn l6_v6_rank_anchor_is_atomic_survives_restore_and_is_erased_by_purge() {
     }
     fixtures.drop_pg_schema(&schema).await;
 }
+
+// Reproduce the v6 fingerprint of this fixture's move (no neighbors, fields,
+// or outer preconditions) independently of the current writer implementation.
+fn v6_move_hash(request: &Mutation<MoveBoardCard>, group_bytes: &[u8]) -> Vec<u8> {
+    let card = &request.input;
+    let mut input = blake3::Hasher::new();
+    for component in [
+        card.view.note.as_str(),
+        card.view.key.as_str(),
+        card.note.as_str(),
+    ] {
+        input.update(component.as_bytes());
+        input.update(&[0]);
+    }
+    input.update(group_bytes);
+    input.update(&[0]);
+    input.update(
+        &serde_json::to_vec(&(
+            (),
+            (),
+            &card.fields,
+            &card.expected_note,
+            &card.expected_view,
+            &card.expected_rank,
+        ))
+        .unwrap(),
+    );
+    let mut command = blake3::Hasher::new();
+    command.update(b"notarium-cmd-v1:move_board_card\0");
+    command.update(request.identity.hash.as_bytes());
+    command.update(&[0]);
+    command.update(input.finalize().as_bytes());
+    let mut predicates = blake3::Hasher::new_derive_key("notarium command predicates v2");
+    predicates.update(command.finalize().as_bytes());
+    for value in [&[][..], &u64::MAX.to_be_bytes(), &u64::MAX.to_be_bytes()] {
+        predicates.update(&(value.len() as u64).to_be_bytes());
+        predicates.update(value);
+    }
+    predicates.finalize().as_bytes().to_vec()
+}
+
+#[tokio::test]
+async fn l6_numeric_move_replays_v6_receipt_and_preserves_mixed_neighbor_ranks() {
+    let fixtures = StorageTestFixtures::load_required();
+    let schema = fixtures.fresh_pg_schema();
+    for postgres in [false, true] {
+        let temp = TempDataRoot::new("numeric-board-upgrade");
+        let installation = sample_installation_id(86);
+        let config = if postgres {
+            fixtures.pg_local_config(installation, &schema, temp.data_root())
+        } else {
+            CanonicalConfig::local_default(installation, temp.data_root())
+        };
+        let (store, runtime) = CanonicalRuntime::open(config.clone()).await.unwrap();
+        let owner = sample_principal_id(86);
+        let (scope, _) = seed_space(
+            &store,
+            sample_space_id(86),
+            sample_incarnation(86),
+            owner.clone(),
+        )
+        .await;
+        let ctx = owner_ctx(&scope, owner.clone());
+        let mut created = Vec::new();
+        for (i, status) in ["1", "1.0", "1", "1"].into_iter().enumerate() {
+            let note = sample_note_id(86 + i as u8);
+            created.push(
+                store
+                    .create_note(
+                        ctx.clone(),
+                        next_mutation(
+                            &scope,
+                            &owner,
+                            CreateNote {
+                                note,
+                                parent: None,
+                                slug: format!("numeric-{i}"),
+                                class: DocClass::UserDoc,
+                                carrier: format!("---\nstatus: {status}\n---\nbody"),
+                            },
+                        ),
+                    )
+                    .await
+                    .unwrap()
+                    .value,
+            );
+        }
+        let view = ViewRef {
+            note: created[0].note.clone(),
+            key: ViewKey::from_bytes([86; 16]),
+        };
+        let provider = CanonicalTestBoardPlanner::new(
+            store.clone(),
+            [created[1].note.clone(), created[2].note.clone()],
+        );
+        let binding = store.register_board_facts_provider(provider).unwrap();
+        let group = GroupKey::Value(ScalarValue::Number(
+            notarium_core::value::ExactNumber::from_f64(1.0).unwrap(),
+        ));
+        let request = next_mutation(
+            &scope,
+            &owner,
+            MoveBoardCard {
+                view: view.clone(),
+                note: created[1].note.clone(),
+                group: group.clone(),
+                before: None,
+                after: None,
+                fields: BTreeMap::new(),
+                expected_note: created[1].revision.clone(),
+                expected_view: created[0].revision.clone(),
+                expected_rank: RankExpectation::Absent,
+            },
+        );
+        let original = store
+            .move_board_card(ctx.clone(), request.clone())
+            .await
+            .unwrap();
+        let ranks = store
+            .inspect_view_overlays_for_test(&scope.space_id, &view)
+            .await
+            .unwrap();
+        assert_eq!(ranks.len(), 2);
+        assert!(store.unregister_board_facts_provider(&binding));
+        runtime.shutdown().await.unwrap();
+        drop(store);
+
+        let v6_bytes = rmp_serde::to_vec_named(&group).unwrap();
+        let receipt_hash = v6_move_hash(&request, &v6_bytes);
+        let mut grouped = blake3::Hasher::new();
+        grouped.update(b"notarium-group-key-v1:");
+        grouped.update(&v6_bytes);
+        let v6_group = grouped.finalize().to_hex().to_string();
+        macro_rules! downgrade {
+            ($db:expr) => {{
+                sqlx::raw_sql(include_str!("../fixtures/schema-v6-remove-projection.sql")).execute(&mut $db).await.unwrap();
+                sqlx::query("UPDATE schema_meta SET schema_version=6,manifest_checksum=$1")
+                    .bind(hex::decode(support::CANONICAL_V6_HASH).unwrap()).execute(&mut $db).await.unwrap();
+                let rows = sqlx::query("UPDATE command_receipts SET command_hash=$1 WHERE idempotency_key=$2 AND command_hash<>$1")
+                    .bind(&receipt_hash).bind(request.identity.key.as_str()).execute(&mut $db).await.unwrap();
+                assert_eq!(rows.rows_affected(), 1);
+                // One historic row was written as a float, the other as an integer.
+                let rows = sqlx::query("UPDATE view_rank_overlays SET group_key_msgpack=$1,group_key_hex=$2 WHERE target_note_id=$3")
+                    .bind(&v6_bytes).bind(&v6_group).bind(created[1].note.as_str()).execute(&mut $db).await.unwrap();
+                assert_eq!(rows.rows_affected(), 1);
+            }};
+        }
+        if postgres {
+            let mut db = fixtures.open_raw_pg().await;
+            sqlx::raw_sql(sqlx::AssertSqlSafe(format!("SET search_path TO {schema}")))
+                .execute(&mut db)
+                .await
+                .unwrap();
+            downgrade!(db);
+        } else {
+            let mut db = temp.open_raw_sqlite().await;
+            downgrade!(db);
+        }
+        let (store, runtime) = CanonicalRuntime::open(config).await.unwrap();
+        store
+            .advance_space_lease(
+                &support::maintenance_ctx(notarium_core::ports::ServicePurpose::Revocation),
+                &scope,
+                LeaseEpoch::new(2).unwrap(),
+            )
+            .await
+            .unwrap();
+        let replay = store
+            .move_board_card(ctx.clone(), request.clone())
+            .await
+            .unwrap();
+        assert_eq!(replay.receipt, original.receipt);
+        assert_eq!(replay.value.rank_revision, original.value.rank_revision);
+        let mut changed = request.clone();
+        changed.preconditions.revision = Some(created[0].revision.clone());
+        assert!(matches!(
+            store.move_board_card(ctx.clone(), changed).await,
+            Err(PortError::Domain(DomainError::IdempotencyKeyReused))
+        ));
+        let binding = store
+            .register_board_facts_provider(CanonicalTestBoardPlanner::new(
+                store.clone(),
+                created[1..].iter().map(|note| note.note.clone()),
+            ))
+            .unwrap();
+        let mut next = request.input;
+        next.note = created[3].note.clone();
+        next.expected_note = created[3].revision.clone();
+        next.group = GroupKey::Value(ScalarValue::Number(1u64.into()));
+        store
+            .move_board_card(ctx, next_mutation(&scope, &owner, next))
+            .await
+            .unwrap();
+        let latest = store
+            .inspect_view_overlays_for_test(&scope.space_id, &view)
+            .await
+            .unwrap();
+        for neighbor in &created[1..3] {
+            let before = &ranks[&neighbor.note];
+            let after = &latest[&neighbor.note];
+            assert_eq!(after.rank_rev_id, before.rank_rev_id);
+            assert_eq!(after.sort_rank_lexo, before.sort_rank_lexo);
+        }
+        assert!(store.unregister_board_facts_provider(&binding));
+        runtime.shutdown().await.unwrap();
+    }
+    fixtures.drop_pg_schema(&schema).await;
+}

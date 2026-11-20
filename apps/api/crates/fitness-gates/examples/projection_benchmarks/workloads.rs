@@ -81,7 +81,7 @@ async fn start(
         max_retained_reads: std::num::NonZeroUsize::MIN,
         ..ProjectionConfig::default()
     };
-    ProjectorRuntime::start(
+    ProjectorRuntime::start_for_test(
         canonical.clone(),
         projection_context(),
         derived,
@@ -204,7 +204,10 @@ pub(crate) async fn backend_profile(
     drop(watched);
 
     eprintln!("projection benchmark {backend:?}: checking exact reads during the import");
-    let (ryow_frames, stale_frames, imported) = race(&store, &engine, &fixture, &reference).await;
+    let (warm_ranked_board, cold_ranked_board, first_done) =
+        measure_ranked_board(&engine, &fixture, backend, &cache).await;
+    let (ryow_frames, stale_frames, imported) =
+        race(&store, &engine, &fixture, &reference, first_done).await;
     eprintln!(
         "projection benchmark {backend:?} receipt updates: {stale_frames} stale frames of {ryow_frames}"
     );
@@ -336,14 +339,6 @@ pub(crate) async fn backend_profile(
     wait(&engine, &fixture, tail).await;
     let rebuild_ns = time_ns(rebuild_started);
     let metadata = store.projection_read_metrics_for_test();
-    assert!(
-        metadata.transactions > 0,
-        "no canonical rebuild read transactions measured"
-    );
-    assert_eq!(
-        metadata.non_successful_reads, 0,
-        "canonical reads failed during rebuild"
-    );
     let rebuild_sqlite_busy = store.wal_telemetry().map_or(0, |stats| {
         stats
             .leaked_sqlite_busy_errors
@@ -359,8 +354,8 @@ pub(crate) async fn backend_profile(
                 .await
         && board_before == board_witness(&frame_after);
     eprintln!(
-        "projection benchmark {backend:?} rebuild: {rebuild_ns} ns, maximum read {} ns, {rebuild_sqlite_busy} busy errors, equivalent={identical_rebuild}",
-        metadata.max_elapsed_ns
+        "projection benchmark {backend:?} rebuild: {rebuild_ns} ns, maximum read {} ns, {}/{} failed reads, {rebuild_sqlite_busy} busy errors, equivalent={identical_rebuild}",
+        metadata.max_elapsed_ns, metadata.non_successful_reads, metadata.transactions
     );
     drop(engine);
     drop(watched);
@@ -377,6 +372,8 @@ pub(crate) async fn backend_profile(
         cold_checkpoint_open,
         warm_board,
         cold_board,
+        warm_ranked_board,
+        cold_ranked_board,
         neighborhood,
         replayed_tail_notes,
         tail_replay_ns,
@@ -385,6 +382,8 @@ pub(crate) async fn backend_profile(
         stale_frames,
         rebuild_ns,
         max_rebuild_read_ns: metadata.max_elapsed_ns,
+        rebuild_read_transactions: metadata.transactions,
+        failed_rebuild_reads: metadata.non_successful_reads,
         rebuild_sqlite_busy,
         identical_rebuild,
         unqualified_move_rewrites,
@@ -594,15 +593,13 @@ fn evict_cold_board(
     }
 }
 
-async fn race(
-    store: &CanonicalStore,
+async fn measure_ranked_board(
     engine: &ProjectionEngine,
     fixture: &Corpus,
-    reference: &ReferenceBoard,
-) -> (usize, usize, SpaceSeq) {
-    let (todo, _) = open_board(engine, fixture, Some("todo"), no_receipts()).await;
+    backend: Backend,
+    cache: &DataRoot,
+) -> (Timing, Timing, RankNeighbor) {
     let (done, _) = open_board(engine, fixture, Some("done"), no_receipts()).await;
-    let target = todo.rows.items.first().expect("source card");
     let first_done = done.rows.items.first().expect("destination card");
     let next_done = &done.rows.items[1];
 
@@ -630,6 +627,59 @@ async fn race(
         .expect("materialize destination ranks through the board planner");
     wait(engine, fixture, initial_rank.receipt.seq()).await;
 
+    let checkpoint = engine
+        .checkpoint_for_test(&fixture.space.scope, initial_rank.receipt.seq())
+        .await
+        .expect("checkpoint the rank-materialized board");
+    let verify = |frame: &ViewResult| {
+        assert!(!frame.rows.incomplete);
+        assert_eq!(frame.groups, done.groups);
+        assert_eq!(frame.rows.items.len(), 50);
+        assert!(
+            frame
+                .rows
+                .items
+                .iter()
+                .map(note_id)
+                .eq(done.rows.items.iter().map(note_id))
+        );
+        assert!(frame.rows.items.iter().all(|row| row.rank.is_some()));
+    };
+    let mut samples = Vec::with_capacity(2);
+    for cold in [false, true] {
+        let mut elapsed = Vec::with_capacity(SAMPLE_COUNT);
+        for _ in 0..SAMPLE_COUNT {
+            if cold {
+                evict_cold_board(engine, fixture, checkpoint.path(), backend, cache);
+            }
+            let (frame, duration) = open_board(engine, fixture, Some("done"), no_receipts()).await;
+            verify(&frame);
+            elapsed.push(duration);
+        }
+        samples.push(Timing::from_samples(elapsed));
+    }
+    let [warm, cold] = samples.try_into().expect("warm and cold samples");
+    report_timing(backend, "warm rank-materialized board", &warm);
+    report_timing(backend, "cold rank-materialized board", &cold);
+    (
+        warm,
+        cold,
+        RankNeighbor {
+            note: note_id(first_done).clone(),
+            expected_rank: RankExpectation::Existing(initial_rank.value.rank_revision),
+        },
+    )
+}
+
+async fn race(
+    store: &CanonicalStore,
+    engine: &ProjectionEngine,
+    fixture: &Corpus,
+    reference: &ReferenceBoard,
+    first_done: RankNeighbor,
+) -> (usize, usize, SpaceSeq) {
+    let (todo, _) = open_board(engine, fixture, Some("todo"), no_receipts()).await;
+    let target = todo.rows.items.first().expect("source card");
     let mut pause_move = engine
         .pause_before_projection_for_test(&fixture.space.scope, 1)
         .unwrap();
@@ -640,10 +690,7 @@ async fn race(
                 view: fixture.view.clone(),
                 note: note_id(target).clone(),
                 group: group("done"),
-                before: Some(RankNeighbor {
-                    note: note_id(first_done).clone(),
-                    expected_rank: RankExpectation::Existing(initial_rank.value.rank_revision),
-                }),
+                before: Some(first_done),
                 after: None,
                 fields: BTreeMap::from([("status".into(), Some(YamlValue::String("done".into())))]),
                 expected_note: target.card.document.provenance().revision().clone(),

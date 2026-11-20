@@ -1132,12 +1132,15 @@ impl CanonicalStore {
         #[cfg(feature = "test-support")]
         {
             // Owner fence pages also use this transaction boundary.
-            let mut measurement = self.inner.projection_read_metrics.measure();
+            let mut measurement = self
+                .inner
+                .projection_read_metrics
+                .measure(std::any::type_name::<F>());
             let result = self
                 .execute_read_transaction(budget, extra_pg_sql, op)
                 .await;
             if let Some(measurement) = &mut measurement {
-                measurement.complete(result.is_ok());
+                measurement.complete(result.as_ref().err().map(PortError::code));
             }
             result
         }

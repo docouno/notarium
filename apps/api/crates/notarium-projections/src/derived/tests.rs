@@ -722,6 +722,7 @@ async fn test_control(control: &GenerationControl) {
     };
     assert!(control.active().await.unwrap().is_none());
     assert!(control.compare_and_swap(None, &first).await.unwrap());
+    assert!(!control.compare_and_swap(Some(&first), &next).await.unwrap());
     assert!(
         !control
             .generation_reclaimable(first.generation)

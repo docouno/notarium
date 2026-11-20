@@ -229,7 +229,7 @@ proptest! {
 }
 
 #[tokio::test]
-async fn retained_board_pages_count_and_reorder_exact_rows_without_sql_fallback() {
+async fn retained_board_pages_match_ordered_sql_ranks_and_exact_overlay() {
     use std::{fs, num::NonZeroUsize, path::PathBuf, sync::Arc};
 
     use notarium_core::{
@@ -265,8 +265,8 @@ async fn retained_board_pages_count_and_reorder_exact_rows_without_sql_fallback(
     let folder = FolderId::from_bytes([2; 16]);
     let focus = FolderId::from_bytes([3; 16]);
 
-    // Deliberately leave this store without a published cut or any card rows.
-    // The test exercises selectors over mmap and one bounded replacement.
+    // Compare the in-memory and indexed SQL rank paths against the same exact
+    // reference, including a bounded replacement and ranks from an old group.
     let store = DerivedStore::open_sqlite(&layout, generation)
         .await
         .unwrap();
@@ -386,14 +386,14 @@ async fn retained_board_pages_count_and_reorder_exact_rows_without_sql_fallback(
         string_group("done"),
         string_group("waiting"),
     ];
-    let ranks: BTreeMap<_, _> = [(0, "a"), (1, "a"), (2, "a"), (3, "a"), (5, "b")]
-        .into_iter()
-        .map(|(dense, rank)| {
+    let ranks: BTreeMap<_, _> = (0_u32..150)
+        .map(|dense| {
+            let rank = format!("{:03}", dense / 5);
             (
                 dense,
                 BoardRank {
                     group: string_group("done"),
-                    rank: rank.into(),
+                    rank,
                 },
             )
         })
@@ -429,6 +429,55 @@ async fn retained_board_pages_count_and_reorder_exact_rows_without_sql_fallback(
         has_pending_nota: false,
         has_invalid_nota: false,
     };
+    use crate::derived::{DerivedMutation, ProjectedViewRank, ProjectionWatermark, SpaceApply};
+    let view = ViewRef {
+        note: id(9999),
+        key: ViewKey::from_bytes([9; 16]),
+    };
+    let mut mutations = Vec::new();
+    for dense in 0..512 {
+        let note = id(ordinal(dense));
+        let mut row = replacement.clone();
+        row.dense_id = dense;
+        row.note_id = note.clone();
+        row.slug = format!("card-{dense}");
+        row.slug_fold = row.slug.clone();
+        mutations.push(DerivedMutation::UpsertNote(Box::new(row)));
+        if let Some(rank) = ranks.get(&dense) {
+            let (group_key_msgpack, group_key_hex) = group_key_hex(&rank.group).unwrap();
+            mutations.push(DerivedMutation::UpsertViewRank(ProjectedViewRank {
+                space_id: scope.space_id.clone(),
+                view_note_id: view.note.clone(),
+                view_key: view.key.clone(),
+                target_note_id: note,
+                rank_rev_id: replacement.rev_id.clone(),
+                placement_revision: replacement.rev_id.clone(),
+                group_key_msgpack,
+                group_key_hex,
+                sort_rank_lexo: rank.rank.clone(),
+                updated_seq: cut,
+            }));
+        }
+    }
+    store
+        .apply(&SpaceApply {
+            expected: None,
+            watermark: ProjectionWatermark {
+                scope: scope.clone(),
+                root_folder_id: folder,
+                next_dense_id: 512,
+                next_dense_folder_id: 2,
+                projected_seq: cut,
+                snapshot_seq: cut,
+                graph_settled_seq: cut,
+                schema: None,
+                seed_in_progress: false,
+                updated_at_ms: 0,
+            },
+            mutations,
+        })
+        .await
+        .unwrap();
     let overlay = BTreeMap::from([(0, replacement)]);
     let matches: Vec<_> = (0_u32..512)
         .filter(|n| n % 7 != 6 && n % 11 != 10 && n % 13 != 12 && n % 17 != 16)
@@ -472,7 +521,7 @@ async fn retained_board_pages_count_and_reorder_exact_rows_without_sql_fallback(
         let size = usize::from(limit.get());
         let mut after = None;
         for (page_index, window) in expected.chunks(size).enumerate() {
-            let page = select_window(WindowInput {
+            let input = WindowInput {
                 index: &index,
                 store: &store,
                 scope: &scope,
@@ -487,9 +536,27 @@ async fn retained_board_pages_count_and_reorder_exact_rows_without_sql_fallback(
                 overlay: &overlay,
                 after: after.as_ref(),
                 limit,
-            })
+            };
+            let page = select_window(input).await.unwrap();
+            let exact_ranks = BTreeMap::from([(0, ranks[&0].clone())]);
+            let from_sql = select_view_window(
+                WindowInput {
+                    ranks: &exact_ranks,
+                    ..input
+                },
+                Some(&view),
+            )
             .await
             .unwrap();
+            assert_eq!(from_sql.groups, page.groups);
+            assert_eq!(from_sql.has_more, page.has_more);
+            assert!(
+                from_sql
+                    .rows
+                    .iter()
+                    .map(|r| (r.dense_id, &r.tuple, &r.rank))
+                    .eq(page.rows.iter().map(|r| (r.dense_id, &r.tuple, &r.rank)))
+            );
             assert_eq!(
                 page.groups
                     .iter()

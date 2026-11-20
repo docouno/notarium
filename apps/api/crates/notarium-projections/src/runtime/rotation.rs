@@ -18,9 +18,9 @@ use notarium_core::{
     ports::{CallBudget, Cancellation, SpaceEventKind},
 };
 
-use crate::derived::{DerivedStore, GenerationControl, GenerationDescriptor};
+use crate::derived::{GenerationControl, GenerationDescriptor};
 
-use super::{Generation, ProjectionEngine, ProjectorRuntime, apply, worker};
+use super::{Generation, ProjectionEngine, ProjectorRuntime, PublishedCut, apply, worker};
 
 type Catalog = [(Space, HistoryScope, FolderId, SpaceSeq)];
 
@@ -51,12 +51,12 @@ impl ProjectorRuntime {
     /// Builds the candidate while the active generation serves readers.
     pub async fn rotate(
         &mut self,
-        candidate: DerivedStore,
+        candidate: ProjectionGeneration,
         budget: &CallBudget,
     ) -> Result<(), PortError> {
         if self.local_rotation.is_some() {
             let previous = self.finish_local_rotation().await;
-            if self.descriptor.generation == candidate.generation() {
+            if self.descriptor.generation == candidate {
                 // Rejoining after a dropped request is idempotent once active.
                 if previous.as_ref().is_err_and(commit_unknown) {
                     return self.confirm_activation().await;
@@ -70,10 +70,10 @@ impl ProjectorRuntime {
         if self.engine.publication_closed.load(Ordering::Acquire) {
             return Err(not_ready());
         }
-        if candidate.generation() == self.descriptor.generation {
+        if candidate == self.descriptor.generation {
             return self.confirm_activation().await;
         }
-        if candidate.generation() != self.descriptor.generation.checked_next()? {
+        if candidate != self.descriptor.generation.checked_next()? {
             return Err(DomainError::validation(ValidationReason::GenerationMismatch).into());
         }
         let stop = Cancellation::default();
@@ -209,12 +209,35 @@ async fn rotate_local(
     engine: Arc<ProjectionEngine>,
     previous: LocalWorker,
     old: GenerationDescriptor,
-    candidate: DerivedStore,
-    budget: CallBudget,
+    candidate: ProjectionGeneration,
+    mut budget: CallBudget,
     stop: Cancellation,
     local_owner: Option<Arc<std::fs::File>>,
 ) -> LocalOutcome {
-    let result = prepare_local(&engine, &old, candidate, stop.clone(), local_owner.clone()).await;
+    let started = Instant::now();
+    let coordinator =
+        match before_activation(&budget, &stop, engine.control.acquire_coordinator()).await {
+            Ok(coordinator) => coordinator,
+            Err(error) => {
+                return LocalOutcome {
+                    worker: previous,
+                    descriptor: old,
+                    reply: Err(error),
+                };
+            }
+        };
+    budget.remaining = budget.remaining.saturating_sub(started.elapsed());
+    let started = Instant::now();
+    let result = prepare_local(
+        &engine,
+        &coordinator,
+        &old,
+        candidate,
+        &budget,
+        stop.clone(),
+        local_owner,
+    )
+    .await;
     let (candidate, reservation, worker) = match result {
         Ok(prepared) => prepared,
         Err(error) => {
@@ -225,7 +248,18 @@ async fn rotate_local(
             };
         }
     };
-    match wait_for_handoff(&engine, &old, &candidate, &reservation, &budget, &stop).await {
+    budget.remaining = budget.remaining.saturating_sub(started.elapsed());
+    match wait_for_handoff(
+        &engine,
+        &coordinator,
+        &old,
+        &candidate,
+        &reservation,
+        &budget,
+        &stop,
+    )
+    .await
+    {
         Ok(active) => {
             previous.stop().await;
             LocalOutcome {
@@ -242,7 +276,7 @@ async fn rotate_local(
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .remove(&reservation.generation);
             drop(candidate);
-            if let Err(error) = engine.control.cancel_candidate(&reservation).await {
+            if let Err(error) = coordinator.cancel_candidate(&reservation).await {
                 // A failed cleanup is resumable at retry or at owner restart.
                 tracing::warn!(
                     error = error.code(),
@@ -263,12 +297,14 @@ async fn rotate_local(
 
 async fn prepare_local(
     engine: &Arc<ProjectionEngine>,
+    coordinator: &GenerationControl,
     old: &GenerationDescriptor,
-    store: DerivedStore,
+    generation: ProjectionGeneration,
+    budget: &CallBudget,
     stop: Cancellation,
     local_owner: Option<Arc<std::fs::File>>,
 ) -> Result<(Arc<Generation>, GenerationDescriptor, LocalWorker), PortError> {
-    let store = store.with_cache_lease(&engine.cache_root).await?;
+    let started = Instant::now();
     let catalog = engine
         .canonical
         .subscribe_projection_catalog(&engine.projection_context)?;
@@ -277,7 +313,7 @@ async fn prepare_local(
         .list_spaces(&engine.projection_context)
         .await?;
     let planned = GenerationDescriptor {
-        generation: store.generation(),
+        generation,
         publication_epoch: old
             .publication_epoch
             .checked_add(1)
@@ -293,7 +329,7 @@ async fn prepare_local(
         }
         Some(_) => return Err(not_ready()),
         None => {
-            match engine.control.reserve_candidate(Some(old), &planned).await {
+            match coordinator.reserve_candidate(Some(old), &planned).await {
                 Ok(true) => {}
                 Ok(false) => return Err(not_ready()),
                 Err(error) => {
@@ -314,6 +350,25 @@ async fn prepare_local(
                 }
             }
             planned
+        }
+    };
+    // Reserve before creating files or a schema so reclamation sees the candidate.
+    let active = engine.generation.load_full();
+    let mut opening = budget.clone();
+    opening.remaining = opening.remaining.saturating_sub(started.elapsed());
+    let store = match before_activation(
+        &opening,
+        &stop,
+        active
+            .store
+            .related_generation(&engine.cache_root, generation),
+    )
+    .await
+    {
+        Ok(store) => store,
+        Err(error) => {
+            coordinator.cancel_candidate(&reservation).await?;
+            return Err(error);
         }
     };
     let candidate = Arc::new(Generation::new(store));
@@ -346,8 +401,25 @@ async fn prepare_local(
     ))
 }
 
+async fn before_activation<T>(
+    budget: &CallBudget,
+    stop: &Cancellation,
+    operation: impl std::future::Future<Output = Result<T, PortError>>,
+) -> Result<T, PortError> {
+    if budget.remaining.is_zero() {
+        return Err(handoff_deadline());
+    }
+    tokio::select! {
+        biased;
+        _ = stop.cancelled() => Err(handoff_cancelled()),
+        _ = budget.cancellation.cancelled() => Err(handoff_cancelled()),
+        result = tokio::time::timeout(budget.remaining, operation) => result.map_err(|_| handoff_deadline())?,
+    }
+}
+
 async fn wait_for_handoff(
     engine: &ProjectionEngine,
+    coordinator: &GenerationControl,
     old: &GenerationDescriptor,
     candidate: &Arc<Generation>,
     reservation: &GenerationDescriptor,
@@ -368,7 +440,7 @@ async fn wait_for_handoff(
             .canonical
             .list_spaces(&engine.projection_context)
             .await?;
-        if let Some(permits) = matching_cuts(&active, candidate, &catalog) {
+        if matching_cuts(&active, candidate, &catalog).is_some() {
             let publication = tokio::select! {
                 _ = stop.cancelled() => return Err(handoff_cancelled()),
                 _ = budget.cancellation.cancelled() => return Err(handoff_cancelled()),
@@ -380,7 +452,10 @@ async fn wait_for_handoff(
                 .list_spaces(&engine.projection_context)
                 .await?;
             let exact = fingerprint(&catalog)?;
-            if fingerprint(&current)? == exact {
+            if fingerprint(&current)? == exact
+                && let Some(cuts) = matching_cuts(&active, candidate, &current)
+                && let Some(permits) = cuts.iter().map(handoff_permit).collect::<Option<Vec<_>>>()
+            {
                 if stop.is_cancelled() || budget.cancellation.is_cancelled() {
                     return Err(handoff_cancelled());
                 }
@@ -389,7 +464,7 @@ async fn wait_for_handoff(
                 }
                 let mut next = reservation.clone();
                 next.cut_fingerprint = exact;
-                let reply = commit_rotation(engine, old, &next, stop).await?;
+                let reply = commit_rotation(engine, coordinator, old, &next, stop).await?;
                 drop(permits);
                 apply::activate_generation(engine, candidate);
                 drop(publication);
@@ -415,11 +490,12 @@ async fn wait_for_handoff(
 
 pub(super) async fn commit_rotation(
     engine: &ProjectionEngine,
+    coordinator: &GenerationControl,
     old: &GenerationDescriptor,
     next: &GenerationDescriptor,
     stop: &Cancellation,
 ) -> Result<Result<(), PortError>, PortError> {
-    let uncertain = match engine.control.compare_and_swap(Some(old), next).await {
+    let uncertain = match coordinator.compare_and_swap(Some(old), next).await {
         Ok(true) => return Ok(Ok(())),
         Ok(false) => not_ready(),
         Err(error) if commit_unknown(&error) => error,
@@ -492,11 +568,14 @@ fn matching_cuts(
     active: &Generation,
     candidate: &Generation,
     catalog: &Catalog,
-) -> Option<Vec<LiveReadPermit>> {
-    let mut permits = Vec::with_capacity(catalog.len());
+) -> Option<Vec<Arc<PublishedCut>>> {
+    let mut ready = true;
+    let mut cuts = Vec::with_capacity(catalog.len());
     for (_, scope, _, seq) in catalog {
-        let active = active.slot(&scope.space_id)?.admitted_cut()?;
-        let candidate = candidate.slot(&scope.space_id)?.cut.load_full()?;
+        let active_slot = active.slot(&scope.space_id)?;
+        let candidate_slot = candidate.slot(&scope.space_id)?;
+        let active = active_slot.admitted_cut()?;
+        let candidate = candidate_slot.cut.load_full()?;
         if active.cut.scope != *scope
             || candidate.cut.scope != *scope
             || active.cut.projected_seq != *seq
@@ -504,13 +583,25 @@ fn matching_cuts(
         {
             return None;
         }
-        let permit = active.live.try_read().ok()?;
-        if permit.head() != *seq || permit.scope() != scope {
-            return None;
+        if active.watermark.graph_settled_seq != *seq {
+            active_slot.align_graph.notify_one();
+            ready = false;
+            continue;
         }
-        permits.push(permit);
+        if *seq != SpaceSeq::ZERO && candidate.handoff_graph_source.as_ptr() != Arc::as_ptr(&active)
+        {
+            candidate_slot.align_graph.notify_one();
+            ready = false;
+            continue;
+        }
+        cuts.push(active);
     }
-    Some(permits)
+    ready.then_some(cuts)
+}
+
+fn handoff_permit(cut: &Arc<PublishedCut>) -> Option<LiveReadPermit> {
+    let permit = cut.live.try_read().ok()?;
+    (permit.head() == cut.cut.projected_seq && permit.scope() == &cut.cut.scope).then_some(permit)
 }
 
 pub(super) fn fingerprint(catalog: &Catalog) -> Result<ContentDigest, PortError> {

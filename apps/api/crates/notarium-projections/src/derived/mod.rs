@@ -39,7 +39,7 @@ pub use records::{
     ProjectedViewDescriptor, ProjectedViewRank, ProjectionSchema, ProjectionWatermark,
     TrustedCheckpoint,
 };
-pub(crate) use staging::StageBuffer;
+pub(crate) use staging::{MAX_STAGE_BYTES, StageBuffer, approx_mutation_bytes};
 
 use sql::Database;
 
@@ -47,6 +47,10 @@ use sql::Database;
 /// private staging are never attached to a reader's connection.
 #[derive(Clone)]
 pub struct DerivedStore {
+    #[cfg(test)]
+    pub(crate) folder_page_reads: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    pub(crate) reverse_link_reads: Arc<std::sync::atomic::AtomicUsize>,
     database: Arc<Database>,
     generation: ProjectionGeneration,
     cache_lease: Option<Arc<std::fs::File>>,
@@ -54,6 +58,7 @@ pub struct DerivedStore {
 }
 
 impl DerivedStore {
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn open_sqlite(
         root: &DataRoot,
         generation: ProjectionGeneration,
@@ -63,6 +68,7 @@ impl DerivedStore {
             .ok_or_else(schema::generation_mismatch)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn open_postgres(
         pool: PgPool,
         schema_prefix: &str,
@@ -107,6 +113,10 @@ impl DerivedStore {
             })
             .await?;
         Ok(compatible.then_some(Self {
+            #[cfg(test)]
+            folder_page_reads: Default::default(),
+            #[cfg(test)]
+            reverse_link_reads: Default::default(),
             database,
             generation,
             cache_lease,
@@ -114,6 +124,7 @@ impl DerivedStore {
         }))
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn generation_control(
         &self,
         cache_root: &DataRoot,
@@ -124,6 +135,16 @@ impl DerivedStore {
                 return Err(invalid_row());
             }
             return GenerationControl::open_postgres(pool, prefix).await;
+        }
+        let actual = self.database.sqlite_path().ok_or_else(invalid_row)?;
+        let expected = cache_root.derived(self.generation);
+        let (actual, expected) = tokio::try_join!(
+            tokio::fs::canonicalize(actual),
+            tokio::fs::canonicalize(expected),
+        )
+        .map_err(|_| schema::generation_mismatch())?;
+        if actual != expected {
+            return Err(schema::generation_mismatch());
         }
         GenerationControl::open_sqlite(cache_root).await
     }
@@ -250,6 +271,7 @@ pub enum DerivedMutation {
     DeleteClusters,
     PurgeNote(NoteId),
     RedactChatEntry(ChatThreadId, ThreadEntrySeq),
+    InvalidateCheckpointClusters,
 }
 
 fn parse_generation(prefix: &str, value: &str) -> Option<ProjectionGeneration> {

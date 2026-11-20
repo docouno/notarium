@@ -375,26 +375,18 @@ fn neighborhood(
         .filter(|&node| node != focal && visible.contains(node))
         .collect();
     let mut second = Bitmap::new();
-    let mut second_truncated = false;
-    if hops == 2 {
-        if 1 + first.cardinality() >= MAX_NOTES as u64 {
-            // Skip O(deg^2) 2-hop expansion once 1-hop already fills MAX_NOTES;
-            // still record truncation if any 2-hop neighbor exists.
-            'check: for node in first.iter() {
-                for neighbor in adjacency.outgoing(node).chain(adjacency.incoming(node)) {
-                    if neighbor != focal && visible.contains(neighbor) && !first.contains(neighbor)
-                    {
-                        second_truncated = true;
-                        break 'check;
-                    }
-                }
-            }
-        } else {
-            for node in first.iter() {
-                for neighbor in adjacency.outgoing(node).chain(adjacency.incoming(node)) {
-                    if neighbor != focal && visible.contains(neighbor) && !first.contains(neighbor)
-                    {
-                        second.add(neighbor);
+    let mut remaining = visible.cardinality() - 1 - first.cardinality();
+    if hops == 2 && remaining > 0 {
+        'expand: for node in first.iter() {
+            for neighbor in adjacency.outgoing(node).chain(adjacency.incoming(node)) {
+                if neighbor != focal
+                    && visible.contains(neighbor)
+                    && !first.contains(neighbor)
+                    && second.add_checked(neighbor)
+                {
+                    remaining -= 1;
+                    if remaining == 0 {
+                        break 'expand;
                     }
                 }
             }
@@ -406,11 +398,7 @@ fn neighborhood(
         .take(MAX_NOTES)
         .collect::<Vec<_>>();
     let capped = 1 + first.cardinality() + second.cardinality() - ordered.len() as u64;
-    let mut plan = note_plan(adjacency, cut, ordered, hidden, capped, MAX_LENS_EDGES)?;
-    if second_truncated {
-        plan.result.truncated = true;
-    }
-    Ok(plan)
+    note_plan(adjacency, cut, ordered, hidden, capped, MAX_LENS_EDGES)
 }
 
 fn note_plan(
@@ -528,6 +516,30 @@ mod tests {
         assert_eq!(plan.result.edges.len(), 5);
         assert_eq!(plan.result.hidden_count, 1);
         assert!(!plan.result.truncated);
+    }
+
+    #[test]
+    fn saturated_first_hop_counts_distinct_authorized_second_hop_nodes() {
+        for degree in [1_998, 1_999, 2_000] {
+            let mut edges: Vec<_> = (1..=degree).map(|node| (0, node)).collect();
+            let tail = degree + 1;
+            edges.extend([(1, tail), (tail, 2), (2, tail + 1)]);
+            let (notes, sections) = fixture(degree + 3, &edges);
+            let graph = GraphBuild {
+                notes: &notes,
+                sections: &sections,
+            };
+            let visible = (0..=tail as u32).collect();
+            let tier = GraphTier::Neighborhood {
+                note: notes[0].clone().unwrap(),
+                hops: 2,
+            };
+            let plan = plan_graph(&graph, cut(), &tier, &visible, &visible, None).unwrap();
+            let omitted = degree + 2 - MAX_NOTES;
+            assert_eq!(plan.result.nodes.len(), MAX_NOTES);
+            assert_eq!(plan.result.hidden_count, omitted as u64);
+            assert_eq!(plan.result.truncated, omitted > 0);
+        }
     }
 
     #[test]

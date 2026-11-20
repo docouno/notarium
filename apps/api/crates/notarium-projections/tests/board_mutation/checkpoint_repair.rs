@@ -88,7 +88,7 @@ async fn exercise(store: &CanonicalStore, derived: DerivedStore, root: &DataRoot
     )
     .await;
     let seq = store.read_space(&scope.space_id).await.unwrap().last_seq;
-    let runtime = ProjectorRuntime::start(
+    let runtime = ProjectorRuntime::start_for_test(
         store.clone(),
         projection_context(),
         derived,

@@ -37,6 +37,7 @@ pub(super) enum PausePoint {
     BeforeCatchUp,
     BeforeApply,
     AfterAck,
+    AfterReadPayload,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -277,6 +278,14 @@ impl ProjectionEngine {
         scope: &HistoryScope,
     ) -> Result<ProjectionPause, PortError> {
         self.pause_projection_at(scope, PausePoint::AfterAck, 1)
+    }
+
+    #[doc(hidden)]
+    pub fn pause_after_read_payload_for_test(
+        &self,
+        scope: &HistoryScope,
+    ) -> Result<ProjectionPause, PortError> {
+        self.pause_projection_at(scope, PausePoint::AfterReadPayload, 0)
     }
 
     #[doc(hidden)]

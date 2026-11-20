@@ -26,7 +26,7 @@ use crate::{
     codec::{
         MAX_MSGPACK_DECODE_BYTES, NoteRevisionMetadata, RevisionMetadataEnvelope,
         RevisionMetadataPayload, decode_msgpack_bounded, doc_class_to_db, encode_msgpack,
-        encode_timestamp_parts, evaluate_fields_with_schema, group_key_hex, i64_to_space_seq,
+        encode_timestamp_parts, evaluate_fields_with_schema, i64_to_space_seq,
         internal_not_committed, lifecycle_from_db, lifecycle_to_db, new_prefixed_hex_id,
         new_revision_id, normalize_title_key, now_unix_ms, now_utc_timestamp,
         unavailable_retryable,
@@ -1668,7 +1668,6 @@ fn build_rollback_execute_fn(
                         BTreeMap::new();
 
                     for eg in &view_facts.groups {
-                        let (_, gk_hex) = group_key_hex(&eg.group)?;
                         let kept_notes: Vec<NoteId> = eg
                             .rows
                             .iter()
@@ -1679,9 +1678,9 @@ fn build_rollback_execute_fn(
                             working_groups.push((eg.group.clone(), Vec::new()));
                             continue;
                         }
-                        let all_unranked = kept_notes.iter().all(|nid| {
-                            overlays.get(nid).map(|o| &o.group_key_hex) != Some(&gk_hex)
-                        });
+                        let all_unranked = kept_notes
+                            .iter()
+                            .all(|nid| overlays.get(nid).map(|o| &o.group) != Some(&eg.group));
                         let mut items = Vec::with_capacity(kept_notes.len());
                         if all_unranked {
                             let init = evenly_spaced_ranks(kept_notes.len())?;
@@ -1700,7 +1699,7 @@ fn build_rollback_execute_fn(
                                 .iter()
                                 .filter_map(|nid| {
                                     let o = overlays.get(nid)?;
-                                    if o.group_key_hex == gk_hex {
+                                    if o.group == eg.group {
                                         Some(ExistingRankedItem {
                                             note_id: nid.clone(),
                                             rank: o.sort_rank_lexo.clone(),
@@ -1717,7 +1716,7 @@ fn build_rollback_execute_fn(
                             for nid in &kept_notes {
                                 let in_grp = overlays
                                     .get(nid)
-                                    .map(|o| o.group_key_hex == gk_hex)
+                                    .map(|o| o.group == eg.group)
                                     .unwrap_or(false);
                                 if !in_grp {
                                     let tail = compute_rank_placement(&items, nid, items.len())?;

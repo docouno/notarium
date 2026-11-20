@@ -199,9 +199,10 @@ impl Directory {
     }
 }
 
-pub(super) fn matches_header(bytes: &[u8], identity: &IndexIdentity, size: u64) -> bool {
+/// A complete writer header identifies an obsolete file even if its body was truncated.
+pub(super) fn matches_header(bytes: &[u8], identity: &IndexIdentity) -> bool {
     bytes.len() >= HEADER_SIZE
-        && size >= (HEADER_SIZE + DIGEST_SIZE) as u64
+        && u64_at(bytes, 96).is_some_and(|size| size >= (HEADER_SIZE + DIGEST_SIZE) as u64)
         && bytes[..8] == MAGIC
         && u16_at(bytes, 8) == Some(ENDIAN)
         && u16_at(bytes, 10) == Some(FORMAT_VERSION)
@@ -211,7 +212,6 @@ pub(super) fn matches_header(bytes: &[u8], identity: &IndexIdentity, size: u64) 
         && u32_at(bytes, 56) == Some(SECTION_COUNT as u32)
         && u32_at(bytes, 60) == Some(0)
         && &bytes[64..96] == blake3::hash(identity.scope.space_id.as_str().as_bytes()).as_bytes()
-        && u64_at(bytes, 96) == Some(size)
         && u64_at(bytes, 104) == Some(HEADER_SIZE as u64)
         && bytes[112..128] == [0; 16]
 }
@@ -225,9 +225,6 @@ pub(super) fn matches_temp_header(
     let Some(seq) = u64_at(bytes, 20).and_then(|seq| SpaceSeq::new(seq).ok()) else {
         return false;
     };
-    let Some(declared_size) = u64_at(bytes, 96) else {
-        return false;
-    };
     // The prefix witnesses ownership even if the writer never finished
     // appending the body. This header is used only to unlink a temp name.
     seq < through
@@ -238,7 +235,6 @@ pub(super) fn matches_temp_header(
                 scope: scope.clone(),
                 seq,
             },
-            declared_size,
         )
 }
 
@@ -251,7 +247,8 @@ pub(super) fn decode(
     let invalid = || IndexError::Untrusted("invalid checkpoint identity or layout");
     if bytes.as_ptr().align_offset(ALIGN) != 0
         || bytes.len() as u64 != size
-        || !matches_header(bytes, identity, size)
+        || !matches_header(bytes, identity)
+        || u64_at(bytes, 96) != Some(size)
     {
         return Err(invalid());
     }

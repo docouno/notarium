@@ -33,11 +33,13 @@ until released.
 The projector consumes complete canonical commands and advances durable
 watermarks at command boundaries. Ordinary incremental commands apply directly
 in a single write transaction; unusually large commands spill to bounded staging
-pages before atomic publication. An in-memory delta carries changes since the
+pages before atomic publication. Large link-resolution commands and cold seeds
+can spill their lookup keys to a temporary SQLite file on the serving node.
+An in-memory delta carries changes since the
 last checkpoint, and a durable slot journal reopens that delta from derived rows.
 Missing or corrupt mmap files can be rebuilt from valid derived rows. Recovery
-also clears a checkpoint file left by an interrupted publication before the next
-compaction. Missing derived state is seeded from bounded canonical keysets at a
+also retires obsolete local checkpoints left by an interrupted publication.
+Missing derived state is seeded from bounded canonical keysets at a
 fixed cut, then caught up from the durable change stream. Recovery applies
 canonical purge and chat redaction markers before publishing a cut. When erasure
 requires a reseed or a checkpoint requires repair, existing subscriptions receive
@@ -46,14 +48,19 @@ subscriber's last delivered cursor. A retained cursor identifies its original
 history, generation and cut; when derived state advances past a cursor's cut in
 the same generation, continuation returns `CursorStale` so callers reopen on the
 current cut, while `StructuralReadPort::hydrate` can fall back to canonical
-storage at the requested cut. A restored history gets a new identity and requires
-clients to reopen their reads. Canonical storage and CAS are the authoritative
-recovery inputs. See [canonical storage](storage.md).
+storage at the requested cut. Cursor expiry releases the retained checkpoint
+even when the Space receives no further reads or changes. A restored history gets
+a new identity and requires clients to reopen their reads. Canonical storage
+and CAS are the authoritative recovery inputs. See [canonical storage](storage.md).
 
 The active generation serves reads while its successor catches up under
-single-owner Blue-Green rotation. SQLite publishes a durable local descriptor;
-PostgreSQL uses a control schema for single-owner candidate reservation and
-atomic activation. Each Space binds its visibility lookup independently before
+single-owner Blue-Green rotation. Pass the next generation number to
+`ProjectorRuntime::rotate`. The runtime opens the candidate in the active
+installation. SQLite publishes a durable local descriptor. PostgreSQL scopes
+the rotation lock to the installation's control schema and holds it through
+candidate recovery or activation. A concurrent PostgreSQL startup or rotation
+that needs the same lock returns `NotReady` and can be retried after the first
+operation completes. Each Space binds its visibility lookup independently before
 admitting new reads in the new generation. The prior lookup keeps its local
 file available until that Space rebinds. Previously opened cursors at the final
 cut of the retired generation remain readable across rotation while checking the
@@ -99,7 +106,10 @@ can keep an incomplete block while the author repairs it. Declared field schema
 changes trigger recompilation.
 
 Board reads return column counts and bounded card pages from one read cut.
-Canonical rank overlays order cards within a column. `options.columns` applies
+Canonical rank overlays order cards within a column. Timestamp-ordered boards
+seek eligible ranked cards by column, rank and note ID. Sparse selections and
+custom field sorts can fetch placements for candidate notes. The query keeps its
+exact receipt replacements separate until the final window is merged. `options.columns` applies
 to grouped and board views (up to 256 columns) without interfering with
 table/list presentation options, and contradictory `scope: space` or
 `scope: project` sources with an explicit `folder` are rejected. An exact read
@@ -143,9 +153,11 @@ edges around one note for one or two hops (capped at the same edge bound).
 `GraphResult.hidden_count` counts active non-encrypted notes hidden by query
 filters or node caps and excludes unauthorized (`HiddenByAuth`) notes so
 cross-project or cross-class cardinality is never disclosed. Cluster identities
-are preserved by matching successive community memberships. If adjacency is
-already on disk when clustering finishes, durable memberships advance
-independently of the immutable checkpoint. `LinkReadPort` exposes note link
+are preserved by matching successive community memberships. During rotation the
+candidate adopts the serving partition at the shared cut, matching members by
+note ID across the two dense indexes. If adjacency is already on disk when
+clustering finishes, durable memberships advance independently of the immutable
+checkpoint. `LinkReadPort` exposes note link
 pages (authored targets and resolved backlinks) and chat backlink pages after
 checking visibility at the projected cut and at delivery.
 Graph settlement events go to subscribers with whole-Space access to all
@@ -185,7 +197,9 @@ cached pages before opening or querying; for SQLite cold board queries the
 benchmark also advises `POSIX_FADV_DONTNEED` on the derived SQLite database and
 WAL files. SQL hydration uses an established pool. The PostgreSQL profile uses a
 local Unix socket and local CAS. Its results describe the storage and projection
-workload under that setup.
+workload under that setup. Both drivers also measure the warm and cold 50-row
+read after a canonical drag materializes the destination column. Every sample
+checks column counts, note order and the presence of physical ranks.
 
 The report records p50, p95 and p99 for the read workloads, plus durable tail
 replay, board receipt and import observations, and cold rebuild. The replay

@@ -1157,19 +1157,7 @@ impl CanonicalStore {
                                 break 'notes_scan;
                             }
 
-                            for (idx, note_key) in candidates.iter().enumerate() {
-                                // Check if we already filled `max_items`: if at least one more eligible note
-                                // or thread remains, emit `NotesAfter(last_emitted_note)`!
-                                if collected_notes.len() == max_items {
-                                    let last_id = collected_notes
-                                        .last()
-                                        .expect("non-empty notes")
-                                        .note_id
-                                        .clone();
-                                    next_seed_pos = Some(SeedPosition::NotesAfter(last_id));
-                                    break 'notes_scan;
-                                }
-
+                            for note_key in &candidates {
                                 note_cursor_after = Some(note_key.clone());
 
                                 // Skip notes already purged at or before `valid_cutoff`.
@@ -1246,6 +1234,16 @@ impl CanonicalStore {
                                     continue;
                                 }
 
+                                if collected_notes.len() == max_items {
+                                    let last_id = collected_notes
+                                        .last()
+                                        .expect("non-empty notes")
+                                        .note_id
+                                        .clone();
+                                    next_seed_pos = Some(SeedPosition::NotesAfter(last_id));
+                                    break 'notes_scan;
+                                }
+
                                 let digest = note_meta
                                     .content_digest
                                     .or(rev_rec.content_digest)
@@ -1263,66 +1261,17 @@ impl CanonicalStore {
                                     meta: note_meta,
                                     digest,
                                 });
-
-                                // If we just hit `max_items` and there are uninspected candidates in this batch,
-                                // check whether more notes or threads exist before deciding `next_seed_pos`.
-                                if collected_notes.len() == max_items
-                                    && idx + 1 == candidates.len()
-                                    && (candidates.len() as i64) < batch_size
-                                {
-                                    // Exhausted ALL note candidates right at `max_items`!
-                                    // Check if any thread exists at `valid_cutoff`:
-                                    let any_threads = !list_thread_keys_at_or_below_cutoff_tx(
-                                        tx,
-                                        &scope_in,
-                                        valid_cutoff,
-                                        None,
-                                        1,
-                                    )
-                                    .await?
-                                    .is_empty();
-                                    if any_threads {
-                                        let last_id = collected_notes
-                                            .last()
-                                            .expect("non-empty notes")
-                                            .note_id
-                                            .clone();
-                                        next_seed_pos = Some(SeedPosition::NotesAfter(last_id));
-                                    }
-                                    break 'notes_scan;
-                                }
                             }
-
                             if (candidates.len() as i64) < batch_size {
-                                // All notes scanned! If `collected_notes.len() == max_items`, check if threads exist.
-                                if collected_notes.len() == max_items && next_seed_pos.is_none() {
-                                    let any_threads = !list_thread_keys_at_or_below_cutoff_tx(
-                                        tx,
-                                        &scope_in,
-                                        valid_cutoff,
-                                        None,
-                                        1,
-                                    )
-                                    .await?
-                                    .is_empty();
-                                    if any_threads {
-                                        let last_id = collected_notes
-                                            .last()
-                                            .expect("non-empty notes")
-                                            .note_id
-                                            .clone();
-                                        next_seed_pos = Some(SeedPosition::NotesAfter(last_id));
-                                    }
-                                }
                                 break 'notes_scan;
                             }
                         }
                     }
 
-                    // Transition seamlessly to Threads phase when remaining page capacity > 0
-                    // (including when Notes phase had 0 notes — NO fabricated NoteId needed!).
-                    let remaining_slots = max_items.saturating_sub(collected_notes.len());
-                    if next_seed_pos.is_none() && remaining_slots > 0 {
+                    // Only an authorized next row warrants a continuation, including
+                    // at the boundary between the note and thread phases.
+                    let remaining_slots = max_items - collected_notes.len();
+                    if next_seed_pos.is_none() {
                         let batch_size = (remaining_slots + 16) as i64;
                         'threads_scan: loop {
                             let candidates = list_thread_keys_at_or_below_cutoff_tx(
@@ -1338,16 +1287,6 @@ impl CanonicalStore {
                             }
 
                             for thread_key in &candidates {
-                                if collected_threads.len() == remaining_slots {
-                                    let last_tid = collected_threads
-                                        .last()
-                                        .expect("non-empty threads")
-                                        .id
-                                        .clone();
-                                    next_seed_pos = Some(SeedPosition::ThreadsAfter(last_tid));
-                                    break 'threads_scan;
-                                }
-
                                 thread_cursor_after = Some(thread_key.clone());
 
                                 let Some(rev_rec) = read_immutable_revision_tx(
@@ -1382,17 +1321,32 @@ impl CanonicalStore {
                                 };
 
                                 if let Some(auth) = &auth_in
-                                    && auth
-                                        .authorize_chat_read(
-                                            &space_rec.space,
-                                            project_folder_id.as_ref(),
-                                            tainted,
-                                        )
-                                        .is_err()
+                                    && (crate::domain::change_visibility::authorize_thread_owner(
+                                        auth, kind, &owner_id,
+                                    )
+                                    .is_err()
+                                        || auth
+                                            .authorize_chat_read(
+                                                &space_rec.space,
+                                                project_folder_id.as_ref(),
+                                                tainted,
+                                            )
+                                            .is_err())
                                 {
                                     continue;
                                 }
 
+                                if collected_threads.len() == remaining_slots {
+                                    next_seed_pos = collected_threads
+                                        .last()
+                                        .map(|thread| SeedPosition::ThreadsAfter(thread.id.clone()))
+                                        .or_else(|| {
+                                            collected_notes.last().map(|note| {
+                                                SeedPosition::NotesAfter(note.note_id.clone())
+                                            })
+                                        });
+                                    break 'threads_scan;
+                                }
                                 collected_threads.push(ChatThread {
                                     id: thread_id,
                                     space: scope_in.space_id.clone(),

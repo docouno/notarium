@@ -7,11 +7,11 @@ use crate::{
     sql_exec::BackendConn,
 };
 use notarium_core::{
-    DomainError,
+    DomainError, DomainResult,
     auth::EngineAuthContext,
     classes::DocClass,
     error::{PortError, ValidationReason},
-    ids::{JobId, NoteId, RevisionId, SpaceSeq},
+    ids::{JobId, NoteId, PrincipalId, RevisionId, SpaceSeq},
     ports::{
         Change, ChangeKind, ChatThreadKind, ContentJobKind, EntityId, MaintenanceContext,
         SpaceContext,
@@ -19,6 +19,17 @@ use notarium_core::{
     receipt::{AwaitReason, MutationEffect},
 };
 use std::{collections::HashMap, sync::Arc};
+
+pub(crate) fn authorize_thread_owner(
+    auth: &EngineAuthContext,
+    kind: ChatThreadKind,
+    owner: &PrincipalId,
+) -> DomainResult<()> {
+    if kind == ChatThreadKind::Personal && owner != auth.principal() {
+        return Err(DomainError::ResourceNotFound);
+    }
+    Ok(())
+}
 
 pub(crate) struct ChangeVisibility<'a> {
     space: &'a SpaceRecord,
@@ -239,11 +250,7 @@ impl<'a> ChangeVisibility<'a> {
                         return Err(DomainError::validation(ValidationReason::InvalidState).into());
                     };
                     // Kind and owner are immutable for this thread identity.
-                    if meta.kind == ChatThreadKind::Personal
-                        && &meta.owner_id != self.auth.principal()
-                    {
-                        return Err(DomainError::ResourceNotFound.into());
-                    }
+                    authorize_thread_owner(self.auth, meta.kind, &meta.owner_id)?;
                     let (project, tainted) =
                         super::lookup_thread_visibility_tx(tx, &space.id, id.as_str())
                             .await?

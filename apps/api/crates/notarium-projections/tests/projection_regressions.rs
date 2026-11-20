@@ -219,6 +219,29 @@ fn empty_filter() -> FieldFilterAstV1 {
     }
 }
 
+async fn set_space_lifecycle(
+    store: &CanonicalStore,
+    owner: &SpaceContext,
+    lifecycle: SpaceLifecycle,
+) {
+    use notarium_core::{ports::ControlCatalogPort, receipt::AccountCommandIdentity};
+    store
+        .change_lifecycle(
+            budget(),
+            AccountCommandIdentity {
+                owner: owner.auth().principal().clone(),
+                actor: owner.auth().principal().clone(),
+                key: CommandKey::from_bytes(rand16()),
+                hash: ContentDigest::from_bytes(*blake3::hash(&rand16()).as_bytes()),
+                expected: ControlRevision::ZERO,
+            },
+            owner.scope().clone(),
+            lifecycle,
+        )
+        .await
+        .unwrap();
+}
+
 #[tokio::test]
 async fn offline_sqlite_purge_cleans_derived_db_and_mmap_checkpoint() {
     let scratch = Scratch::new();
@@ -416,6 +439,106 @@ async fn is_live_visible_hydrate_and_note_links_enforce_cross_space_taint_and_au
         "note_links must taint cross-space branches before dense_id lookup"
     );
 
+    // Both planners must authorize the target before interpreting a declared field.
+    use notarium_core::{
+        error::ValidationReason,
+        ports::{GraphQuery, GraphTier},
+    };
+    store
+        .update_space_schema(
+            owner_b.clone(),
+            mutation(
+                &owner_b,
+                UpdateSpaceSchema {
+                    schema_note: NoteId::from_bytes(rand16()),
+                    parent: None,
+                    slug: "schema".into(),
+                    carrier: "---\ntitle: Schema\n---\n".into(),
+                    schema: BTreeMap::from([(
+                        "weight".into(),
+                        FieldSchema {
+                            kind: FieldType::Scalar(ScalarType::Number),
+                            nullable: false,
+                        },
+                    )]),
+                    expected_schema_revision: None,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    sync(&store, &runtime, &scope_b).await;
+    for notes in [false, true] {
+        for (key, allowed) in [("weight", false), ("undeclared", false), ("weight", true)] {
+            let mut requested = grants.clone();
+            if !allowed {
+                requested
+                    .get_mut(&scope_b.space_id)
+                    .unwrap()
+                    .read_classes
+                    .clear();
+            }
+            let auth = human
+                .for_agent_run(
+                    AgentRunId::from_bytes(rand16()),
+                    scope_a.space_id.clone(),
+                    ChatAudience::Personal,
+                    requested,
+                )
+                .unwrap();
+            let ctx = SpaceContext::new(auth, scope_b.clone(), budget()).unwrap();
+            let filter = FieldFilterAstV1 {
+                version: 1,
+                predicate: Predicate::Eq {
+                    key: key.into(),
+                    value: ScalarValue::String("high".into()),
+                },
+            };
+            let error = if notes {
+                engine
+                    .list_notes(
+                        ctx.clone(),
+                        ReadRequest::Open {
+                            query: NoteQuery {
+                                folder: None,
+                                recursive: true,
+                                classes: DocClass::all(),
+                                lifecycle: LifecycleMask::Active,
+                                filter,
+                                sort: SortSpec::new(vec![SortKey {
+                                    column: SortColumn::UpdatedAt,
+                                    direction: Direction::Desc,
+                                }])
+                                .unwrap(),
+                                limit: PageLimit::new(10).unwrap(),
+                            },
+                            causal: CausalBasis::Await(AwaitWatermarks::default()),
+                        },
+                    )
+                    .await
+                    .unwrap_err()
+            } else {
+                engine
+                    .query_graph(
+                        ctx.clone(),
+                        GraphQuery {
+                            tier: GraphTier::Superclusters,
+                            filter,
+                        },
+                    )
+                    .await
+                    .unwrap_err()
+            };
+            let expected = if allowed {
+                DomainError::validation(ValidationReason::InvalidQuery)
+            } else {
+                DomainError::ResourceNotFound
+            };
+            assert_eq!(error, PortError::Domain(expected));
+            assert_eq!(ctx.auth().taint().is_tainted(), allowed);
+        }
+    }
+
     runtime.shutdown().await.unwrap();
     canonical.shutdown().await.unwrap();
 }
@@ -571,6 +694,31 @@ async fn folder_by_path_ignores_trashed_collision_and_list_notes_hydrates_cover_
         .page
         .expect("visible folder cover note must be hydrated in FolderPage.page");
     assert_eq!(cover_snapshot.document.reference().note_id, cover.note);
+
+    let mut pause = engine.pause_after_read_payload_for_test(&scope).unwrap();
+    let request = read_port.list_notes(
+        owner.clone(),
+        ReadRequest::Open {
+            query: query.clone(),
+            causal: CausalBasis::Await(AwaitWatermarks::default()),
+        },
+    );
+    let (archived, ()) = tokio::join!(request, async {
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            pause.reached_feed_boundary_for_test(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        set_space_lifecycle(&store, &owner, SpaceLifecycle::Archived).await;
+        pause.resume_for_test().await.unwrap();
+    });
+    assert!(matches!(
+        archived,
+        Err(PortError::Domain(DomainError::ResourceNotFound))
+    ));
+    set_space_lifecycle(&store, &owner, SpaceLifecycle::Active).await;
 
     // An unauthorized cover note (Profile for a Shared agent) must yield page = None.
     let secret_cover = create_note(
@@ -1273,7 +1421,7 @@ async fn shared_space_personal_chat_does_not_leak_and_exact_number_board_parity(
             mutation(
                 &owner_a,
                 AppendChat {
-                    thread,
+                    thread: thread.clone(),
                     parent: ThreadEntrySeq::ZERO,
                     kind: ChatEntryKind::Human,
                     body: ChatInputBody::Text("Private message".into()),
@@ -1294,6 +1442,53 @@ async fn shared_space_personal_chat_does_not_leak_and_exact_number_board_parity(
             .is_err(),
         "Shared Space full-Space owner B must receive zero events for owner A's Personal chat thread"
     );
+
+    use notarium_core::ports::{ChangeBroadcast, ChangeRead, ChangeReadResult, EntityId};
+    let read_port = ProjectedNoteReadPort::new(engine.clone());
+    let through = store.read_space(&scope.space_id).await.unwrap().last_seq;
+    let seed = ChangeRead::Seed {
+        scope: scope.clone(),
+        cutoff: Some(through),
+        limit: PageLimit::new(50).unwrap(),
+    };
+    for (reader, visible) in [(&owner_a, true), (&owner_b, false)] {
+        let ChangeReadResult::Seed(page) = read_port
+            .read_changes(reader.clone(), seed.clone())
+            .await
+            .unwrap()
+        else {
+            panic!("expected seed page")
+        };
+        assert_eq!(page.threads.iter().any(|row| row.id == thread), visible);
+        let ChangeReadResult::Log(page) = read_port
+            .recent_activity(
+                reader.clone(),
+                ChangeRead::Log {
+                    after: ChangeCursor {
+                        scope: scope.clone(),
+                        after: head,
+                    },
+                    through,
+                    limit: PageLimit::new(50).unwrap(),
+                },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected log page")
+        };
+        assert_eq!(
+            page.changes
+                .iter()
+                .any(|row| row.entity == EntityId::Thread(thread.clone())),
+            visible
+        );
+    }
+    let ChangeReadResult::Seed(service) = store.catch_up(projection_ctx(), seed).await.unwrap()
+    else {
+        panic!("expected service seed page")
+    };
+    assert!(service.threads.iter().any(|row| row.id == thread));
 
     // 4. Trashing a folder containing a view carrier must reject query_view even for project_root: None.
     store
@@ -1338,9 +1533,7 @@ async fn shared_space_personal_chat_does_not_leak_and_exact_number_board_parity(
 
 #[tokio::test]
 async fn security_admission_and_lifecycle_regressions() {
-    use notarium_core::{
-        error::ValidationReason, ports::ControlCatalogPort, receipt::AccountCommandIdentity,
-    };
+    use notarium_core::error::ValidationReason;
 
     let scratch = Scratch::new();
     let root = scratch.root();
@@ -1414,21 +1607,31 @@ async fn security_admission_and_lifecycle_regressions() {
         )
         .await
         .unwrap();
-    store
-        .change_lifecycle(
-            budget(),
-            AccountCommandIdentity {
-                owner: owner_a.auth().principal().clone(),
-                actor: owner_a.auth().principal().clone(),
-                key: CommandKey::from_bytes(rand16()),
-                hash: ContentDigest::from_bytes([1; 32]),
-                expected: ControlRevision::ZERO,
-            },
-            scope.clone(),
-            SpaceLifecycle::Archived,
+    let mut pause = engine.pause_after_read_payload_for_test(&scope).unwrap();
+    let hydrate = engine.hydrate(
+        owner_a.clone(),
+        cut_before_shutdown.clone(),
+        vec![card.note.clone(); 201],
+    );
+    let (archived, ()) = tokio::join!(hydrate, async {
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            pause.reached_feed_boundary_for_test(),
         )
         .await
+        .unwrap()
         .unwrap();
+        set_space_lifecycle(&store, &owner_a, SpaceLifecycle::Archived).await;
+        assert_eq!(
+            store.read_space(&scope.space_id).await.unwrap().last_seq,
+            head_before_archive
+        );
+        pause.resume_for_test().await.unwrap();
+    });
+    assert!(matches!(
+        archived,
+        Err(PortError::Domain(DomainError::ResourceNotFound))
+    ));
     bus.publish(
         event_pub_ctx(),
         SpaceEvent {
@@ -1453,25 +1656,18 @@ async fn security_admission_and_lifecycle_regressions() {
     );
 
     // Restore Space to Active so shutdown admission checks are isolated from archive state.
-    store
-        .change_lifecycle(
-            budget(),
-            AccountCommandIdentity {
-                owner: owner_a.auth().principal().clone(),
-                actor: owner_a.auth().principal().clone(),
-                key: CommandKey::from_bytes(rand16()),
-                hash: ContentDigest::from_bytes([2; 32]),
-                expected: ControlRevision::ZERO,
-            },
-            scope.clone(),
-            SpaceLifecycle::Active,
-        )
-        .await
-        .unwrap();
+    set_space_lifecycle(&store, &owner_a, SpaceLifecycle::Active).await;
 
     // 2. After projector shutdown (`publication_closed == true`), StructuralReadPort::hydrate
     //    must fail closed with NotReady instead of serving canonical fallback.
     runtime.shutdown().await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), project_stream.next())
+            .await
+            .expect("idle subscription must end at runtime shutdown")
+            .unwrap()
+            .is_none()
+    );
     let hydrated_after_shutdown = StructuralReadPort::hydrate(
         engine.as_ref(),
         owner_a,
@@ -1490,3 +1686,6 @@ async fn security_admission_and_lifecycle_regressions() {
 
     canonical.shutdown().await.unwrap();
 }
+
+#[path = "projection_regressions/read_windows.rs"]
+mod read_windows;

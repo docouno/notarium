@@ -1,4 +1,8 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+mod spill;
+
+use serde::{Deserialize, Serialize};
+use spill::{Key, Scratch};
+use std::collections::{BTreeSet, VecDeque};
 
 use croaring::Bitmap;
 use notarium_core::{
@@ -20,8 +24,7 @@ use crate::{
     index::{GraphSections, IndexView, L0_BYTE_LIMIT, L0Delta},
     links::{
         AliasKey, CandidatePosition, CandidateQuery, FolderTopology, LinkFolder, LinkNote,
-        MemoryResolutionIndex, NoteAliasPosition, ResolutionIndex, candidate_keys, link_row,
-        resolve_link, source_link_row,
+        NoteAliasPosition, ResolutionIndex, candidate_keys, resolve_link, source_link_row,
     },
 };
 
@@ -72,8 +75,8 @@ fn convert_note(row: &ProjectedNote) -> Result<LinkNote, PortError> {
 /// staged. The runtime then drains resolved rows in bounded write pages.
 #[derive(Default)]
 pub(super) struct ColdLinks {
-    index: MemoryResolutionIndex,
-    pending: VecDeque<(bool, ProjectedLink)>,
+    index: Scratch,
+    after: Option<Key>,
 }
 
 impl ColdLinks {
@@ -85,44 +88,48 @@ impl ColdLinks {
         let row = &projected.row;
         let note = convert_note(row)?;
         if row.lifecycle == Lifecycle::Active {
-            self.index
-                .put_slot(note.parent.clone(), note.slug_fold.clone(), note.id.clone());
+            self.index.slot(&note.parent, &note.slug_fold, &note.id)?;
         }
         let mut mutations = Vec::new();
         for key in candidate_keys(&row.space_id, &note, folders) {
-            self.index.put_candidate(key.clone());
+            self.index.candidate(&key)?;
             mutations.push(DerivedMutation::UpsertCandidate(key));
         }
         if row.doc_class != DocClass::EncryptedNote && row.lifecycle != Lifecycle::Purged {
             for (ordinal, raw) in projected.links.iter().enumerate() {
-                self.pending.push_back((
-                    note.visible,
-                    link_row(
-                        &row.space_id,
-                        &note,
-                        checked_ordinal(ordinal)?,
-                        raw.clone(),
-                        folders,
-                    ),
-                ));
+                let ordinal = checked_ordinal(ordinal)?;
+                self.index.put(
+                    Key::new(spill::COLD_LINK)
+                        .number(note.dense_id)
+                        .number(ordinal),
+                    &(note.dense_id, &note.parent, note.visible, ordinal, raw),
+                )?;
             }
         }
         Ok(mutations)
     }
 
-    pub fn add_note_alias(&mut self, alias: ProjectedNoteAlias) {
-        self.index.put_alias(alias);
+    pub fn add_note_alias(&mut self, alias: &ProjectedNoteAlias) -> Result<(), PortError> {
+        self.index.alias(alias)
     }
 
     pub async fn resolve_page(
         &mut self,
+        space: &SpaceId,
         folders: &FolderTopology,
     ) -> Result<Vec<DerivedMutation>, PortError> {
-        let mut mutations = Vec::with_capacity(usize::from(PAGE).min(self.pending.len()));
-        for _ in 0..PAGE {
-            let Some((visible, mut row)) = self.pending.pop_front() else {
-                break;
-            };
+        let rows = self.index.page::<(u32, FolderId, bool, u32, String)>(
+            Key::new(spill::COLD_LINK),
+            self.after.as_ref(),
+            PAGE,
+        )?;
+        let Some((last, _)) = rows.last() else {
+            return Ok(Vec::new());
+        };
+        self.after = Some(last.clone());
+        let mut mutations = Vec::with_capacity(rows.len());
+        for (_, (dense, parent, visible, ordinal, raw)) in rows {
+            let mut row = source_link_row(space, dense, &parent, ordinal, raw, folders);
             if visible {
                 resolve_link(&mut row, folders, &self.index).await?;
             }
@@ -137,69 +144,30 @@ fn checked_ordinal(ordinal: usize) -> Result<u32, PortError> {
         .map_err(|_| DomainError::validation(ValidationReason::InvalidLimit).into())
 }
 
+#[derive(Serialize, Deserialize)]
 struct ScratchSource {
+    dense: u32,
     parent: Option<FolderId>,
     visible: bool,
-    raw_links: Option<Vec<String>>,
+    replace_links: bool,
     replace_candidates: bool,
-    replacement_candidates: Vec<CandidateLookupKey>,
 }
 
-/// In-memory overlay over `DerivedStore` for resolving incremental wikilink
-/// updates within a single command without temporary SQL scratch tables.
-struct MemoryLinkScratch<'a> {
+struct CommandIndex<'a> {
     store: &'a DerivedStore,
-    added: MemoryResolutionIndex,
-    replaced_candidate_notes: BTreeSet<u32>,
-    replaced_slot_notes: BTreeSet<NoteId>,
-    added_slots: BTreeMap<(FolderId, String), NoteId>,
-    sources: BTreeMap<u32, ScratchSource>,
-    leaves: BTreeSet<String>,
-    watched: BTreeMap<(u32, u32), ProjectedLink>,
-    seen_notes: BTreeSet<NoteId>,
+    added: Scratch,
 }
 
-impl<'a> MemoryLinkScratch<'a> {
-    fn new(store: &'a DerivedStore) -> Self {
-        Self {
-            store,
-            added: MemoryResolutionIndex::default(),
-            replaced_candidate_notes: BTreeSet::new(),
-            replaced_slot_notes: BTreeSet::new(),
-            added_slots: BTreeMap::new(),
-            sources: BTreeMap::new(),
-            leaves: BTreeSet::new(),
-            watched: BTreeMap::new(),
-            seen_notes: BTreeSet::new(),
+impl CommandIndex<'_> {
+    fn record_leaves(&mut self, leaves: impl IntoIterator<Item = String>) -> Result<(), PortError> {
+        for leaf in leaves {
+            self.added.put(Key::new(spill::LEAF).text(&leaf), &leaf)?;
         }
-    }
-
-    fn first_note(&mut self, note: &NoteId) -> bool {
-        self.seen_notes.insert(note.clone())
-    }
-
-    fn record_alias(&mut self, alias: &ProjectedNoteAlias) {
-        self.leaves.insert(alias.old_slug_fold.clone());
-        self.leaves.insert(alias.old_title_norm.clone());
-        self.added.put_alias(alias.clone());
-    }
-
-    fn record_leaves(&mut self, leaves: impl IntoIterator<Item = String>) {
-        self.leaves.extend(leaves);
-    }
-
-    fn record_watch(&mut self, links: Vec<ProjectedLink>) {
-        for link in links {
-            if !self.sources.contains_key(&link.src_dense_id) {
-                self.watched
-                    .entry((link.src_dense_id, link.link_ord))
-                    .or_insert(link);
-            }
-        }
+        Ok(())
     }
 }
 
-impl ResolutionIndex for MemoryLinkScratch<'_> {
+impl ResolutionIndex for CommandIndex<'_> {
     async fn candidates(
         &self,
         query: CandidateQuery<'_>,
@@ -219,7 +187,10 @@ impl ResolutionIndex for MemoryLinkScratch<'_> {
             let count = page.len();
             cursor = page.last().map(CandidatePosition::from);
             for row in page {
-                if !self.replaced_candidate_notes.contains(&row.target_dense_id) {
+                if !self
+                    .added
+                    .contains(Key::new(spill::CANDIDATES_REPLACED).number(row.target_dense_id))?
+                {
                     db.push(row);
                     if db.len() == want {
                         break;
@@ -263,14 +234,16 @@ impl ResolutionIndex for MemoryLinkScratch<'_> {
         parent: &FolderId,
         slug: &str,
     ) -> Result<Option<NoteId>, PortError> {
-        if let Some(note) = self.added_slots.get(&(parent.clone(), slug.to_owned())) {
-            return Ok(Some(note.clone()));
+        if let Some(note) = self.added.slot_occupant(space, parent, slug).await? {
+            return Ok(Some(note));
         }
-        Ok(self
-            .store
-            .slot_occupant(space, parent, slug)
-            .await?
-            .filter(|note| !self.replaced_slot_notes.contains(note)))
+        let Some(note) = self.store.slot_occupant(space, parent, slug).await? else {
+            return Ok(None);
+        };
+        Ok((!self
+            .added
+            .contains(Key::new(spill::SLOTS_REPLACED).text(note.as_str()))?)
+        .then_some(note))
     }
 }
 
@@ -303,7 +276,7 @@ fn merge_sorted<T, K: Ord>(
 
 pub(super) struct LinkStage<'a> {
     store: &'a DerivedStore,
-    scratch: MemoryLinkScratch<'a>,
+    scratch: CommandIndex<'a>,
     scope: HistoryScope,
     before: &'a FolderTopology,
     folders: &'a FolderTopology,
@@ -356,7 +329,10 @@ impl<'a> LinkStage<'a> {
     ) -> Self {
         Self {
             store,
-            scratch: MemoryLinkScratch::new(store),
+            scratch: CommandIndex {
+                store,
+                added: Scratch::default(),
+            },
             scope,
             before: old_topology,
             folders: topology,
@@ -364,12 +340,16 @@ impl<'a> LinkStage<'a> {
         }
     }
 
-    pub(super) fn first_note(&mut self, note: &NoteId) -> bool {
-        self.scratch.first_note(note)
+    pub(super) fn first_note(&mut self, note: &NoteId) -> Result<bool, PortError> {
+        self.scratch
+            .added
+            .insert_marker(Key::new(spill::SEEN).text(note.as_str()))
     }
 
-    pub(super) fn record_alias(&mut self, alias: &ProjectedNoteAlias) {
-        self.scratch.record_alias(alias);
+    pub(super) fn record_alias(&mut self, alias: &ProjectedNoteAlias) -> Result<(), PortError> {
+        self.scratch
+            .record_leaves([alias.old_slug_fold.clone(), alias.old_title_norm.clone()])?;
+        self.scratch.added.alias(alias)
     }
 
     pub(super) async fn record_change(
@@ -417,55 +397,68 @@ impl<'a> LinkStage<'a> {
                 row.doc_class != DocClass::EncryptedNote && row.lifecycle != Lifecycle::Purged
             })
             .map(|row| row.parent_folder_id.clone());
-        let raw_links = if parent.is_some() {
-            if let Some(raw) = raw_links {
-                checked_ordinal(raw.len())?;
-                Some(raw.to_vec())
-            } else {
-                None
+        let replace_links = raw_links.is_some() || parent.is_none();
+        if let Some(raw) = raw_links.filter(|_| parent.is_some()) {
+            for (ordinal, target) in raw.iter().enumerate() {
+                let ordinal = checked_ordinal(ordinal)?;
+                self.scratch.added.put(
+                    Key::new(spill::RAW)
+                        .number(identity.dense_id)
+                        .number(ordinal),
+                    &(ordinal, target),
+                )?;
             }
-        } else {
-            Some(Vec::new())
-        };
+        }
         if replace_candidates {
-            self.scratch
-                .replaced_candidate_notes
-                .insert(identity.dense_id);
+            self.scratch.added.put(
+                Key::new(spill::CANDIDATES_REPLACED).number(identity.dense_id),
+                &(),
+            )?;
+            // Candidate identity, tier, folder and normalized spelling determine
+            // these dependencies. Stable-ID references survive a title-only edit.
+            let old_leaves: BTreeSet<_> = old_keys
+                .iter()
+                .map(|k| (k.tier, k.scope_folder_dense_id, &k.leaf_norm_key))
+                .collect();
+            let new_leaves: BTreeSet<_> = new_keys
+                .iter()
+                .map(|k| (k.tier, k.scope_folder_dense_id, &k.leaf_norm_key))
+                .collect();
             self.scratch.record_leaves(
-                old_keys
-                    .iter()
-                    .chain(&new_keys)
-                    .map(|key| key.leaf_norm_key.clone()),
-            );
-            for key in &new_keys {
-                self.scratch.added.put_candidate(key.clone());
+                old_leaves
+                    .symmetric_difference(&new_leaves)
+                    .map(|(_, _, leaf)| (*leaf).clone()),
+            )?;
+            for (ordinal, key) in new_keys.iter().enumerate() {
+                self.scratch.added.candidate(key)?;
+                self.scratch.added.put(
+                    Key::new(spill::SOURCE_CANDIDATE)
+                        .number(identity.dense_id)
+                        .number(checked_ordinal(ordinal)?),
+                    key,
+                )?;
             }
         }
         if replace_slot {
-            self.scratch
-                .replaced_slot_notes
-                .insert(identity.note_id.clone());
+            self.scratch.added.put(
+                Key::new(spill::SLOTS_REPLACED).text(identity.note_id.as_str()),
+                &(),
+            )?;
             if let Some((folder, slug, note)) = new_slot {
-                self.scratch
-                    .added_slots
-                    .insert((folder.clone(), slug.to_owned()), note.clone());
+                self.scratch.added.slot(folder, slug, note)?;
             }
         }
-        self.scratch.sources.insert(
-            identity.dense_id,
-            ScratchSource {
+        self.scratch.added.put(
+            Key::new(spill::SOURCE).number(identity.dense_id),
+            &ScratchSource {
+                dense: identity.dense_id,
                 parent,
                 visible: active_after,
-                raw_links,
+                replace_links,
                 replace_candidates,
-                replacement_candidates: if replace_candidates {
-                    new_keys
-                } else {
-                    Vec::new()
-                },
             },
-        );
-        if replace_candidates {
+        )?;
+        if active_before != active_after {
             self.alias_leaves(AliasDependencies::Note(&identity.note_id))
                 .await?;
         }
@@ -494,10 +487,10 @@ impl<'a> LinkStage<'a> {
                         .await?
                 }
             };
-            self.scratch.record_leaves(
-                rows.iter()
-                    .flat_map(|alias| [alias.old_slug_fold.clone(), alias.old_title_norm.clone()]),
-            );
+            self.scratch
+                .record_leaves(rows.iter().flat_map(|alias| {
+                    [alias.old_slug_fold.clone(), alias.old_title_norm.clone()]
+                }))?;
             if rows.len() < usize::from(PAGE) {
                 return Ok(());
             }
@@ -508,100 +501,82 @@ impl<'a> LinkStage<'a> {
     pub(super) async fn finish(
         mut self,
         sink: &mut CommandSink<'_>,
-        aliases: &[ProjectedNoteAlias],
         stop: &Cancellation,
     ) -> Result<LinkApply, PortError> {
-        for alias in aliases {
-            check_stop(stop)?;
-            self.record_alias(alias);
-        }
-        let source_ids: Vec<u32> = self.scratch.sources.keys().copied().collect();
-        for dense in source_ids {
-            check_stop(stop)?;
-            let replace_candidates = self.scratch.sources[&dense].replace_candidates;
-            if replace_candidates {
-                sink.push(vec![DerivedMutation::DeleteNoteCandidates(dense)])
-                    .await?;
-                let candidates = std::mem::take(
-                    &mut self
-                        .scratch
-                        .sources
-                        .get_mut(&dense)
-                        .expect("source exists")
-                        .replacement_candidates,
-                );
-                for batch in candidates.chunks(usize::from(PAGE)) {
-                    check_stop(stop)?;
-                    sink.push(
-                        batch
-                            .iter()
-                            .cloned()
-                            .map(DerivedMutation::UpsertCandidate)
-                            .collect(),
-                    )
-                    .await?;
+        let mut after = None;
+        loop {
+            let sources = self.scratch.added.page::<ScratchSource>(
+                Key::new(spill::SOURCE),
+                after.as_ref(),
+                PAGE,
+            )?;
+            let Some((key, _)) = sources.last() else {
+                break;
+            };
+            after = Some(key.clone());
+            for (_, source) in sources {
+                check_stop(stop)?;
+                if source.replace_candidates {
+                    sink.push(vec![DerivedMutation::DeleteNoteCandidates(source.dense)])
+                        .await?;
+                    let mut cursor = None;
+                    loop {
+                        check_stop(stop)?;
+                        let rows = self.scratch.added.page::<CandidateLookupKey>(
+                            Key::new(spill::SOURCE_CANDIDATE).number(source.dense),
+                            cursor.as_ref(),
+                            PAGE,
+                        )?;
+                        let done = rows.len() < usize::from(PAGE);
+                        cursor = rows.last().map(|(key, _)| key.clone());
+                        sink.push(
+                            rows.into_iter()
+                                .map(|(_, row)| DerivedMutation::UpsertCandidate(row))
+                                .collect(),
+                        )
+                        .await?;
+                        if done {
+                            break;
+                        }
+                    }
                 }
-                self.watch(LinkAddress::Target(dense), stop).await?;
+                self.apply_source(source, sink, stop).await?;
             }
-            self.apply_source(dense, sink, stop).await?;
         }
-
-        let leaves: Vec<String> = std::mem::take(&mut self.scratch.leaves)
-            .into_iter()
-            .collect();
-        for leaf in leaves {
-            check_stop(stop)?;
-            self.watch(LinkAddress::Leaf(&leaf), stop).await?;
+        let mut after = None;
+        loop {
+            let leaves =
+                self.scratch
+                    .added
+                    .page::<String>(Key::new(spill::LEAF), after.as_ref(), PAGE)?;
+            let Some((last, _)) = leaves.last() else {
+                break;
+            };
+            after = Some(last.clone());
+            for (_, leaf) in leaves {
+                self.watch(LinkAddress::Leaf(&leaf), sink, stop).await?;
+            }
         }
-        let addresses = self.before.changed_addresses(self.folders);
+        let addresses = if std::ptr::eq(self.before, self.folders) {
+            Default::default()
+        } else {
+            self.before.changed_addresses(self.folders)
+        };
         for prefix in &addresses.prefixes {
-            self.watch(LinkAddress::Prefix(prefix), stop).await?;
+            self.watch(LinkAddress::Prefix(prefix), sink, stop).await?;
         }
         for folder in &addresses.sources {
-            self.watch(LinkAddress::RelativeSource(folder), stop)
+            self.watch(LinkAddress::RelativeSource(folder), sink, stop)
                 .await?;
         }
 
-        let watched = std::mem::take(&mut self.scratch.watched);
-        let mut active = BTreeMap::new();
-        for old in watched.into_values() {
-            check_stop(stop)?;
-            let may_emit = if let Some(&may_emit) = active.get(&old.src_dense_id) {
-                may_emit
-            } else {
-                let may_emit = self
-                    .store
-                    .is_link_source_active(&self.scope.space_id, old.src_dense_id)
-                    .await?;
-                active.insert(old.src_dense_id, may_emit);
-                may_emit
-            };
-            let new = if may_emit {
-                let mut row = old.clone();
-                resolve_link(&mut row, self.folders, &self.scratch).await?;
-                row
-            } else {
-                // Keep source path metadata consistent with ColdLinks even when
-                // a trashed note cannot emit resolved edges.
-                source_link_row(
-                    &self.scope.space_id,
-                    old.src_dense_id,
-                    &old.src_folder_id,
-                    old.link_ord,
-                    old.raw_target.clone(),
-                    self.folders,
-                )
-            };
-            if let Some(mutation) = self.changes.put(Some(&old), new) {
-                sink.push(vec![mutation]).await?;
-            }
-        }
         Ok(self.changes)
     }
 
     async fn watch(
         &mut self,
         address: LinkAddress<'_>,
+        sink: &mut CommandSink<'_>,
         stop: &Cancellation,
     ) -> Result<(), PortError> {
         let mut after = None;
@@ -613,7 +588,49 @@ impl<'a> LinkStage<'a> {
                 .await?;
             let count = links.len();
             after = links.last().map(LinkPosition::from);
-            self.scratch.record_watch(links);
+            let mut previous = None;
+            for old in links {
+                if self
+                    .scratch
+                    .added
+                    .contains(Key::new(spill::SOURCE).number(old.src_dense_id))?
+                    || !self.scratch.added.insert_marker(
+                        Key::new(spill::WATCHED)
+                            .number(old.src_dense_id)
+                            .number(old.link_ord),
+                    )?
+                {
+                    continue;
+                }
+                let may_emit = match previous {
+                    Some((dense, active)) if dense == old.src_dense_id => active,
+                    _ => {
+                        self.store
+                            .is_link_source_active(&self.scope.space_id, old.src_dense_id)
+                            .await?
+                    }
+                };
+                previous = Some((old.src_dense_id, may_emit));
+                let new = if may_emit {
+                    let mut row = old.clone();
+                    resolve_link(&mut row, self.folders, &self.scratch).await?;
+                    row
+                } else {
+                    // Keep source path metadata consistent with ColdLinks even when
+                    // a trashed note cannot emit resolved edges.
+                    source_link_row(
+                        &self.scope.space_id,
+                        old.src_dense_id,
+                        &old.src_folder_id,
+                        old.link_ord,
+                        old.raw_target.clone(),
+                        self.folders,
+                    )
+                };
+                if let Some(mutation) = self.changes.put(Some(&old), new) {
+                    sink.push(vec![mutation]).await?;
+                }
+            }
             if count < usize::from(PAGE) {
                 return Ok(());
             }
@@ -622,28 +639,36 @@ impl<'a> LinkStage<'a> {
 
     async fn apply_source(
         &mut self,
-        dense: u32,
+        source: ScratchSource,
         sink: &mut CommandSink<'_>,
         stop: &Cancellation,
     ) -> Result<(), PortError> {
-        let parent = self.scratch.sources[&dense].parent.clone();
-        let visible = self.scratch.sources[&dense].visible;
-        let raw_links = std::mem::take(
-            &mut self
-                .scratch
-                .sources
-                .get_mut(&dense)
-                .expect("source exists")
-                .raw_links,
-        );
+        let ScratchSource {
+            dense,
+            parent,
+            visible,
+            replace_links,
+            ..
+        } = source;
+        let raw_prefix = Key::new(spill::RAW).number(dense);
+        let mut raw_after = None;
+        let mut raw = VecDeque::new();
+        let mut raw_done = !replace_links;
         let mut old = VecDeque::<ProjectedLink>::new();
         let mut old_after = None;
         let mut old_done = false;
-        let mut raw_iter = raw_links
-            .as_ref()
-            .map(|rows| rows.iter().enumerate().peekable());
         loop {
             check_stop(stop)?;
+            if raw.is_empty() && !raw_done {
+                let rows = self.scratch.added.page::<(u32, String)>(
+                    raw_prefix.clone(),
+                    raw_after.as_ref(),
+                    PAGE,
+                )?;
+                raw_done = rows.is_empty();
+                raw_after = rows.last().map(|(key, _)| key.clone());
+                raw.extend(rows.into_iter().map(|(_, value)| value));
+            }
             if old.is_empty() && !old_done {
                 let rows = self
                     .store
@@ -658,12 +683,10 @@ impl<'a> LinkStage<'a> {
                 old_after = rows.last().map(LinkPosition::from);
                 old = rows.into();
             }
-            if let Some(iter) = raw_iter.as_mut()
-                && let Some(&(ordinal, _)) = iter.peek()
-            {
-                let ordinal = checked_ordinal(ordinal)?;
+            if let Some((ordinal, _)) = raw.front() {
+                let ordinal = *ordinal;
                 if old.front().is_none_or(|old| old.link_ord >= ordinal) {
-                    let (_, raw_target) = iter.next().ok_or_else(invalid_edge)?;
+                    let (_, raw_target) = raw.pop_front().ok_or_else(invalid_edge)?;
                     let previous = old
                         .front()
                         .is_some_and(|row| row.link_ord == ordinal)
@@ -676,7 +699,7 @@ impl<'a> LinkStage<'a> {
                         sink,
                         previous.as_ref(),
                         ordinal,
-                        raw_target.clone(),
+                        raw_target,
                     )
                     .await?;
                     continue;
@@ -685,7 +708,7 @@ impl<'a> LinkStage<'a> {
             let Some(previous) = old.pop_front() else {
                 return Ok(());
             };
-            if raw_links.is_none() && parent.is_some() {
+            if !replace_links && parent.is_some() {
                 self.apply_raw(
                     dense,
                     parent.as_ref(),

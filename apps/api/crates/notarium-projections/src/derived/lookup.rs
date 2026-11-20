@@ -340,7 +340,13 @@ impl DerivedStore {
         }
         filter.push_str(" ORDER BY src_dense_id, link_ord LIMIT ?");
         params.push(value(&i64::from(limit.get())));
-        self.select_current(filter, params).await
+        let rows = self.select_current(filter, params).await?;
+        #[cfg(test)]
+        if matches!(address, LinkAddress::Leaf(_) | LinkAddress::Target(_)) {
+            self.reverse_link_reads
+                .fetch_add(rows.len(), std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(rows)
     }
 
     async fn prefix_link_page(

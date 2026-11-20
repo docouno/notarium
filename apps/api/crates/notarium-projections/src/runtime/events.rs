@@ -244,6 +244,7 @@ impl EventBusPort for SpaceEventBus {
                 recv,
                 activation,
                 history_ended: slot.history_ended.clone(),
+                stopped: engine.stopped.clone(),
                 terminal: false,
                 generation,
                 space_kind,
@@ -261,6 +262,7 @@ struct EventStream {
     recv: broadcast::Receiver<QueuedEvent>,
     activation: watch::Receiver<u64>,
     history_ended: Cancellation,
+    stopped: Cancellation,
     terminal: bool,
     generation: ProjectionGeneration,
     space_kind: SpaceKind,
@@ -272,7 +274,13 @@ struct EventStream {
 impl PortStream<SpaceEvent> for EventStream {
     fn next(&mut self) -> PortFuture<'_, Option<SpaceEvent>> {
         Box::pin(async move {
-            let result = match self.next_event().await {
+            let stopped = self.stopped.clone();
+            let event = tokio::select! {
+                biased;
+                _ = stopped.cancelled() => Ok(None),
+                event = self.next_event() => event,
+            };
+            let result = match event {
                 Err(error) if apply::is_history_mismatch(&error) => Ok(Some(self.finish_history())),
                 result => result,
             };

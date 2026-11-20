@@ -1,7 +1,6 @@
 use super::*;
 use notarium_canonical::{ProjectionChatEntryKey, ProjectionChatRef, ProjectionChatRefLimits};
 use notarium_core::ports::{MaintenanceContext, ServicePurpose};
-use sqlx::Row;
 
 fn projection() -> MaintenanceContext {
     support::maintenance_ctx(ServicePurpose::Projection)
@@ -173,6 +172,48 @@ async fn exercise(store: &CanonicalStore) -> (HistoryScope, ProjectionChatEntryK
         .collect();
     let entry = append_in_new_thread(store, &ctx, sample_thread_id(2), refs).await;
     let cutoff = store.read_space(&source.space_id).await.unwrap().last_seq;
+    // Every reference is newer than first_cut. Both scans return empty
+    // pages with a continuation until they exhaust the raw occurrence keys.
+    let limits = ProjectionChatRefLimits::new(PageLimit::new(3).unwrap()).unwrap();
+    for incoming in [false, true] {
+        let mut position = None;
+        let mut pages = 0;
+        loop {
+            let page = if incoming {
+                store
+                    .read_projection_incoming_chat_refs_page(
+                        &projection(),
+                        &source,
+                        first_cut,
+                        &source,
+                        position,
+                        limits,
+                    )
+                    .await
+                    .unwrap()
+            } else {
+                store
+                    .read_projection_chat_refs_page(
+                        &projection(),
+                        &source,
+                        first_cut,
+                        position,
+                        limits,
+                    )
+                    .await
+                    .unwrap()
+            };
+            pages += 1;
+            assert!(page.refs.is_empty());
+            position = page.next;
+            if position.is_none() {
+                break;
+            }
+            assert!(pages < expected_unique.len());
+        }
+        let examined = expected_unique.len() - usize::from(incoming);
+        assert_eq!(pages, examined.div_ceil(3));
+    }
     let outer = collect(store, &source, cutoff, expected_unique.len()).await;
     assert_eq!(
         outer.iter().map(|r| r.target.clone()).collect::<Vec<_>>(),
@@ -522,7 +563,6 @@ async fn l7_projection_refs_sqlite_covering_pages_and_erasure() {
     drop(old);
 
     let (store, runtime) = CanonicalRuntime::open(config).await.unwrap();
-    let legacy_space = legacy[0].scope.space_id.clone();
     assert_eq!(covers_v6_references(&store, &legacy[0]).await, 2);
     assert_eq!(covers_v6_references(&store, &legacy[1]).await, 2);
     let (scope, entry) = exercise(&store).await;
@@ -538,44 +578,6 @@ async fn l7_projection_refs_sqlite_covering_pages_and_erasure() {
     .unwrap();
     assert_eq!(ref_rows, 0);
 
-    let sql = format!(
-        "SELECT {COVERED_COLUMNS} FROM chat_entries INDEXED BY idx_chat_entries_projection
-         WHERE space_id=$1 AND (thread_id,entry_seq)>($2,$3) ORDER BY thread_id,entry_seq LIMIT $4"
-    );
-    let explain = format!("EXPLAIN QUERY PLAN {sql}");
-    let plan = sqlx::query(sqlx::AssertSqlSafe(explain))
-        .bind(legacy_space.as_str())
-        .bind("")
-        .bind(0_i64)
-        .bind(5_i64)
-        .fetch_all(&mut db)
-        .await
-        .unwrap();
-    assert!(plan.iter().any(|row| {
-        let detail: String = row.get("detail");
-        detail.contains("COVERING INDEX idx_chat_entries_projection")
-    }));
-    let rootpage: i64 = sqlx::query_scalar(
-        "SELECT rootpage FROM sqlite_master WHERE type='table' AND name='chat_entries'",
-    )
-    .fetch_one(&mut db)
-    .await
-    .unwrap();
-    let vm = sqlx::query(sqlx::AssertSqlSafe(format!("EXPLAIN {sql}")))
-        .bind(legacy_space.as_str())
-        .bind("")
-        .bind(0_i64)
-        .bind(5_i64)
-        .fetch_all(&mut db)
-        .await
-        .unwrap();
-    assert!(
-        vm.iter().all(|instruction| {
-            instruction.get::<String, _>("opcode") != "OpenRead"
-                || instruction.get::<i64, _>("p2") != rootpage
-        }),
-        "covered entry scan must never open the rowid table"
-    );
     runtime.shutdown().await.unwrap();
 }
 

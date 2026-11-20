@@ -1190,7 +1190,6 @@ pub(crate) async fn move_board_card_impl(
                     // Build ordered list of existing members in `input.group` excluding `input.note`.
                     // Unranked members from `eval_group_rows` are materialized deterministically in planner order
                     // after any already-ranked members (or evenly spaced if none are ranked yet).
-                    let (_, target_gk_hex) = group_key_hex(&input.group)?;
                     let mut group_members: Vec<NoteId> = Vec::new();
                     for row in eval_group_rows {
                         if row.note != input.note {
@@ -1200,9 +1199,9 @@ pub(crate) async fn move_board_card_impl(
 
                     // Separate already-ranked in target group vs unranked in target group.
                     let mut newly_materialized: Vec<(NoteId, String)> = Vec::new();
-                    let all_unranked = group_members.iter().all(|nid| {
-                        overlays.get(nid).map(|o| &o.group_key_hex) != Some(&target_gk_hex)
-                    });
+                    let all_unranked = group_members
+                        .iter()
+                        .all(|nid| overlays.get(nid).map(|o| &o.group) != Some(&input.group));
 
                     let existing_ranked: Vec<ExistingRankedItem> = if group_members.is_empty() {
                         Vec::new()
@@ -1227,7 +1226,7 @@ pub(crate) async fn move_board_card_impl(
                             .iter()
                             .filter_map(|nid| {
                                 let o = overlays.get(nid)?;
-                                if o.group_key_hex == target_gk_hex {
+                                if o.group == input.group {
                                     Some(ExistingRankedItem {
                                         note_id: nid.clone(),
                                         rank: o.sort_rank_lexo.clone(),
@@ -1245,7 +1244,7 @@ pub(crate) async fn move_board_card_impl(
                         for nid in &group_members {
                             let in_group = overlays
                                 .get(nid)
-                                .map(|o| o.group_key_hex == target_gk_hex)
+                                .map(|o| o.group == input.group)
                                 .unwrap_or(false);
                             if !in_group {
                                 let tail = compute_rank_placement(&items, nid, items.len())?;
@@ -1322,7 +1321,7 @@ pub(crate) async fn move_board_card_impl(
                     for (nid, r) in newly_materialized {
                         let was_already_overlay = overlays
                             .get(&nid)
-                            .map(|o| o.group_key_hex == target_gk_hex)
+                            .map(|o| o.group == input.group)
                             .unwrap_or(false);
                         neighbor_final_ranks.insert(nid, (r, was_already_overlay));
                     }
@@ -1838,6 +1837,25 @@ pub(crate) async fn authorized_view_head(
 fn build_move_board_card_identity_spec(
     request: &Mutation<MoveBoardCard>,
 ) -> Result<crate::writer::replay::UnboundCommand, PortError> {
+    let (group, _) = group_key_hex(&request.input.group)?;
+    let current = move_identity_for_group(request, &group)?;
+    if matches!(
+        request.input.group,
+        GroupKey::Value(notarium_core::value::ScalarValue::Number(_))
+    ) {
+        // v6 persisted the caller's original MessagePack number representation.
+        let original = crate::codec::encode_msgpack(&request.input.group)?;
+        if original != group {
+            return Ok(current.with_previous_encoding(move_identity_for_group(request, &original)?));
+        }
+    }
+    Ok(current)
+}
+
+fn move_identity_for_group(
+    request: &Mutation<MoveBoardCard>,
+    group: &[u8],
+) -> Result<crate::writer::replay::UnboundCommand, PortError> {
     let mut fp = blake3::Hasher::new();
     fp.update(request.input.view.note.as_str().as_bytes());
     fp.update(&[0]);
@@ -1845,8 +1863,7 @@ fn build_move_board_card_identity_spec(
     fp.update(&[0]);
     fp.update(request.input.note.as_str().as_bytes());
     fp.update(&[0]);
-    let (gk_bytes, _) = group_key_hex(&request.input.group)?;
-    fp.update(&gk_bytes);
+    fp.update(group);
     fp.update(&[0]);
     let before_fp = request
         .input

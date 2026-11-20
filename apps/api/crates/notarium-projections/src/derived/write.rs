@@ -353,7 +353,9 @@ impl DerivedStore {
                         && change.mutations.iter().any(|mutation| {
                             !matches!(
                                 mutation,
-                                DerivedMutation::UpsertCluster(_) | DerivedMutation::DeleteClusters
+                                DerivedMutation::UpsertCluster(_)
+                                    | DerivedMutation::DeleteClusters
+                                    | DerivedMutation::InvalidateCheckpointClusters
                             )
                         })
                     {
@@ -1291,6 +1293,14 @@ async fn apply_mutations(
                             vec![value(space), value(view), value(key), value(target)],
                         )
                         .await?;
+                    }
+                    InvalidateCheckpointClusters => {
+                        // Same-sequence handoff can replace the partition carried
+                        // in a valid mmap. Recovery must overlay its durable rows.
+                        tx.execute(
+                            "UPDATE projection_checkpoints SET graph_seq = 0 WHERE space_id = ? AND history_incarnation = ? AND graph_seq = ?",
+                            vec![value(space), value(&next.scope.incarnation), value(&next.graph_settled_seq)],
+                        ).await?;
                     }
                     DeleteClusters => {
                         remove::<ProjectedCluster>(tx, "space_id = ?", vec![value(space)]).await?;

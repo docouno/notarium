@@ -1,3 +1,5 @@
+mod link_invalidation;
+
 use std::{
     path::{Path, PathBuf},
     time::Duration,
@@ -85,7 +87,7 @@ async fn start(
     derived: &DerivedStore,
     root: &DataRoot,
 ) -> ProjectorRuntime {
-    ProjectorRuntime::start(
+    ProjectorRuntime::start_for_test(
         canonical.clone(),
         projection_context(),
         derived.clone(),
@@ -136,6 +138,16 @@ async fn create(
     slug: &str,
     carrier: String,
 ) -> Committed<NoteRevision> {
+    create_with_id(canonical, ctx, NoteId::from_bytes(entropy()), slug, carrier).await
+}
+
+async fn create_with_id(
+    canonical: &CanonicalStore,
+    ctx: &SpaceContext,
+    note: NoteId,
+    slug: &str,
+    carrier: String,
+) -> Committed<NoteRevision> {
     canonical
         .create_note(
             ctx.clone(),
@@ -143,7 +155,7 @@ async fn create(
                 identity: command_identity(ctx),
                 preconditions: Preconditions::default(),
                 input: CreateNote {
-                    note: NoteId::from_bytes(entropy()),
+                    note,
                     parent: None,
                     slug: slug.to_owned(),
                     class: DocClass::UserDoc,
@@ -162,6 +174,171 @@ fn command_identity(ctx: &SpaceContext) -> CommandIdentity {
         key: CommandKey::from_bytes(entropy()),
         hash: ContentDigest::from_bytes(*blake3::hash(&entropy()).as_bytes()),
     }
+}
+
+#[tokio::test]
+async fn cluster_lens_survives_forced_compaction_and_generation_rotation() {
+    use std::{collections::BTreeSet, sync::Arc};
+
+    use notarium_core::{
+        ports::{GraphNodeId, GraphQuery, GraphTier, ViewGraphPort},
+        query::{FieldFilterAstV1, Predicate},
+    };
+
+    let scratch = Scratch::new();
+    let root = scratch.root();
+    let (canonical, canonical_runtime) = CanonicalRuntime::open(CanonicalConfig::local_default(
+        InstallationId::from_bytes(entropy()),
+        root.clone(),
+    ))
+    .await
+    .unwrap();
+    let ctx = owner(&canonical).await;
+    let scope = ctx.scope();
+    let generation = ProjectionGeneration::new(GENERATION).unwrap();
+    let derived = DerivedStore::open_sqlite(&root, generation).await.unwrap();
+    let [a, b, c, d] = [1, 2, 3, 4].map(|value| NoteId::from_bytes([value; 16]));
+    create_with_id(&canonical, &ctx, b.clone(), "b", format!("[[{c}]]")).await;
+    create_with_id(&canonical, &ctx, c.clone(), "c", "C".into()).await;
+    let isolated = create_with_id(&canonical, &ctx, d.clone(), "d", "D".into()).await;
+    let stop = Cancellation::default();
+    let (stable, isolated_id, latest) = {
+        let runtime = start(&canonical, &derived, &root).await;
+        let engine = runtime.engine();
+        engine
+            .wait_for_projected(scope, isolated.receipt.seq(), &budget())
+            .await
+            .unwrap();
+        let previous = engine.published_cut(scope).unwrap();
+        let index = engine.open_index(&previous).unwrap();
+        let cluster = |id: &NoteId| index.cluster(index.dense_id(id).unwrap()).unwrap();
+        let stable = cluster(&b);
+        assert_eq!(cluster(&c), stable);
+        let isolated_id = cluster(&d);
+        assert_ne!(isolated_id, stable);
+        runtime.shutdown().await.unwrap();
+
+        // Install the adjacency first, then settle at the same sequence. Only
+        // the durable memberships and settlement overlay know A joined B and C.
+        let added =
+            create_with_id(&canonical, &ctx, a.clone(), "a", format!("[[{b}]] [[{c}]]")).await;
+        let q = added.receipt.seq();
+        let command = apply::command(
+            &engine,
+            &previous,
+            CommandSeqRange::new(q, q).unwrap(),
+            &stop,
+        )
+        .await
+        .unwrap();
+        let compacted = apply::checkpoint(&engine, &command.cut, false, &stop)
+            .await
+            .unwrap();
+        let index = engine.open_index(&compacted).unwrap();
+        let a_dense = index.dense_id(&a).unwrap();
+        assert_eq!(index.cluster(a_dense), None);
+        let mut settled = apply::checkpoint(&engine, &compacted, true, &stop)
+            .await
+            .unwrap();
+        assert_eq!(
+            engine.open_index(&settled).unwrap().cluster(a_dense),
+            Some(stable.clone())
+        );
+
+        // Count an empty CSR row's reserved capacity against L0. The next
+        // ordinary command must discard that delta and checkpoint immediately.
+        let delta = &mut Arc::get_mut(&mut settled).unwrap().delta;
+        Arc::make_mut(delta).replace_adjacency(
+            index.dense_id(&d).unwrap(),
+            Some(Vec::with_capacity(
+                crate::index::L0_BYTE_LIMIT / size_of::<u32>(),
+            )),
+            None,
+        );
+        let added = create(&canonical, &ctx, "e", "E".into()).await;
+        let r = added.receipt.seq();
+        let forced = apply::command(
+            &engine,
+            &settled,
+            CommandSeqRange::new(r, r).unwrap(),
+            &stop,
+        )
+        .await
+        .unwrap();
+        assert_eq!(forced.cut.watermark.snapshot_seq, r);
+        assert_eq!(forced.cut.watermark.graph_settled_seq, q);
+        assert_eq!(
+            engine.open_index(&forced.cut).unwrap().cluster(a_dense),
+            Some(stable.clone())
+        );
+        (stable, isolated_id, r)
+    };
+
+    // The candidate seeds in NoteId order, so A is now the first dense slot.
+    let mut runtime = start(&canonical, &derived, &root).await;
+    let engine = runtime.engine();
+    engine
+        .wait_for_projected(scope, latest, &budget())
+        .await
+        .unwrap();
+    runtime
+        .rotate(generation.checked_next().unwrap(), &budget())
+        .await
+        .unwrap();
+    engine
+        .wait_for_projected(scope, latest, &budget())
+        .await
+        .unwrap();
+    let lenses = [(stable, vec![a, b, c]), (isolated_id, vec![d])];
+    let check_lenses = async |engine: &super::ProjectionEngine| {
+        for (id, expected) in &lenses {
+            let result = engine
+                .query_graph(
+                    ctx.clone(),
+                    GraphQuery {
+                        tier: GraphTier::Lens {
+                            cluster: Some(id.clone()),
+                            project: None,
+                            tags: Vec::new(),
+                        },
+                        filter: FieldFilterAstV1 {
+                            version: 1,
+                            predicate: Predicate::All(Vec::new()),
+                        },
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                result
+                    .nodes
+                    .into_iter()
+                    .map(|node| node.id)
+                    .collect::<BTreeSet<_>>(),
+                expected.iter().cloned().map(GraphNodeId::Note).collect(),
+            );
+        }
+    };
+    check_lenses(&engine).await;
+    runtime.shutdown().await.unwrap();
+    drop(engine);
+    let reopened = ProjectorRuntime::start_sqlite(
+        canonical.clone(),
+        projection_context(),
+        root.clone(),
+        generation,
+        ProjectionConfig::default(),
+    )
+    .await
+    .unwrap();
+    let engine = reopened.engine();
+    engine
+        .wait_for_projected(scope, latest, &budget())
+        .await
+        .unwrap();
+    check_lenses(&engine).await;
+    reopened.shutdown().await.unwrap();
+    canonical_runtime.shutdown().await.unwrap();
 }
 
 #[derive(Clone, Copy)]
@@ -322,7 +499,7 @@ async fn exercise(
     );
 
     let snapshot = engine
-        .acquire_snapshot(ctx, CausalBasis::Await(Default::default()))
+        .acquire_snapshot(ctx.clone(), CausalBasis::Await(Default::default()))
         .await
         .unwrap();
     let source = snapshot.lookup(&second.value.note).unwrap();
@@ -336,6 +513,8 @@ async fn exercise(
         [source]
     );
     assert!(path_p.is_file());
+    let crash_image =
+        matches!(orphan, Orphan::Unregistered).then(|| std::fs::read(&path_p).unwrap());
     drop(retained);
     assert!(
         !path_p.exists(),
@@ -344,6 +523,73 @@ async fn exercise(
     assert!(path_q.is_file());
     drop(snapshot);
     restarted.shutdown().await.unwrap();
+    drop(engine);
+
+    if let Some(bytes) = crash_image {
+        // Model a process exiting after durable Q while a reader still held P.
+        // Restore that exact writer image without any surviving file leases.
+        std::fs::write(&path_p, &bytes).unwrap();
+        std::fs::set_permissions(&path_p, std::fs::metadata(&path_q).unwrap().permissions())
+            .unwrap();
+        let neighbor = owner(canonical).await;
+        let survivor = create(canonical, &neighbor, "neighbor", "# Neighbor".into()).await;
+        let runtime = start(canonical, derived, root).await;
+        let engine = runtime.engine();
+        engine
+            .wait_for_projected(scope, q, &budget())
+            .await
+            .unwrap();
+        assert!(!path_p.exists(), "restart must reclaim the unleased P");
+        assert!(path_q.is_file());
+        engine
+            .wait_for_projected(neighbor.scope(), survivor.receipt.seq(), &budget())
+            .await
+            .unwrap();
+        let held = engine
+            .acquire_snapshot(neighbor, CausalBasis::Await(Default::default()))
+            .await
+            .unwrap();
+        runtime.shutdown().await.unwrap();
+        drop(engine);
+
+        // Both names still contain the purged note. The truncated named
+        // checkpoint retains its complete ownership header.
+        assert!(
+            bytes
+                .windows(first.value.note.as_str().len())
+                .any(|chunk| chunk == first.value.note.as_str().as_bytes())
+        );
+        let abandoned =
+            path_p.with_file_name(format!(".fast-index-{}.tmp", hex::encode(entropy())));
+        std::fs::write(&path_p, &bytes[..bytes.len() - 1]).unwrap();
+        std::fs::write(&abandoned, &bytes).unwrap();
+        canonical
+            .delete_note(
+                ctx.clone(),
+                Mutation {
+                    identity: command_identity(&ctx),
+                    preconditions: Preconditions {
+                        revision: Some(first.value.revision),
+                        ..Preconditions::default()
+                    },
+                    input: DeleteNote {
+                        note: first.value.note,
+                        disposition: DeleteDisposition::Purge,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            !path_p.exists(),
+            "offline purge must reclaim a truncated named checkpoint"
+        );
+        assert!(
+            !abandoned.exists(),
+            "offline purge must finish its filesystem sweep"
+        );
+        assert!(held.lookup(&survivor.value.note).is_some());
+    }
 }
 
 async fn exercise_purge_publication(
@@ -790,10 +1036,7 @@ async fn rebind_waits_for_a_cut_withdrawn_during_admission() {
         .unwrap();
 
     let next_generation = generation.checked_next().unwrap();
-    let candidate = DerivedStore::open_sqlite(&root, next_generation)
-        .await
-        .unwrap();
-    runtime.rotate(candidate, &budget()).await.unwrap();
+    runtime.rotate(next_generation, &budget()).await.unwrap();
     engine
         .wait_for_projected(scope, seq, &budget())
         .await

@@ -49,7 +49,7 @@ pub struct CommandIdentitySpec {
     pub actor: PrincipalId,
     pub command_key: CommandKey,
     pub command_hash: ContentDigest,
-    legacy: Option<Arc<fingerprint::LegacyFingerprint>>,
+    stored_fingerprints: Option<Arc<fingerprint::StoredFingerprints>>,
     pub(crate) require_receipt_detail: bool,
     pub(crate) authority:
         Option<Arc<(notarium_core::auth::EngineAuthContext, replay::ReplayPolicy)>>,
@@ -61,7 +61,7 @@ impl CommandIdentitySpec {
             command_key,
             command_hash,
             authority: None,
-            legacy: None,
+            stored_fingerprints: None,
             require_receipt_detail: false,
         }
     }

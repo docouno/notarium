@@ -69,6 +69,25 @@ async fn reservation(control: &GenerationControl) -> GenerationDescriptor {
     .expect("rotation durably reserved a candidate")
 }
 
+#[tokio::test]
+async fn sqlite_fixture_store_must_belong_to_its_cache_root() {
+    let installation = Scratch::new();
+    let other = Scratch::new();
+    let generation = ProjectionGeneration::new(1).unwrap();
+    let store = crate::derived::DerivedStore::open_sqlite(&installation.root(), generation)
+        .await
+        .unwrap();
+    let _other_store = crate::derived::DerivedStore::open_sqlite(&other.root(), generation)
+        .await
+        .unwrap();
+    assert!(matches!(
+        store.generation_control(&other.root()).await,
+        Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
+            if diagnostic.reason == ValidationReason::GenerationMismatch
+    ));
+    assert!(!other.root().active_projection_generation().exists());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dropped_rotation_finishes_a_file_swap_waiting_on_its_lock() {
     let scratch = Scratch::new();
@@ -82,13 +101,11 @@ async fn dropped_rotation_finishes_a_file_swap_waiting_on_its_lock() {
     let mut runtime = start(store, &root).await;
     let control = runtime.control.clone();
     let initial = control.active().await.unwrap().unwrap();
-    let candidate = DerivedStore::open_sqlite(&root, initial.generation.checked_next().unwrap())
-        .await
-        .unwrap();
+    let candidate = initial.generation.checked_next().unwrap();
     let engine = runtime.engine();
     let read_gate = Arc::clone(&engine.publication).read_owned().await;
     let request_budget = budget();
-    let mut request = Box::pin(runtime.rotate(candidate.clone(), &request_budget));
+    let mut request = Box::pin(runtime.rotate(candidate, &request_budget));
     let pending = tokio::select! {
         outcome = &mut request => panic!("rotation ended before the publication gate opened: {outcome:?}"),
         pending = reservation(&control) => pending,
@@ -140,9 +157,7 @@ async fn rotation_reconciles_an_installed_descriptor_and_restart_clears_orphan()
     let mut runtime = start(store.clone(), &root).await;
     let control = runtime.control.clone();
     let initial = control.active().await.unwrap().unwrap();
-    let candidate = DerivedStore::open_sqlite(&root, initial.generation.checked_next().unwrap())
-        .await
-        .unwrap();
+    let candidate = initial.generation.checked_next().unwrap();
     let engine = runtime.engine();
     let read_gate = Arc::clone(&engine.publication).read_owned().await;
     let request_budget = budget();

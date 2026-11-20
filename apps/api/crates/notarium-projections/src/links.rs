@@ -416,7 +416,8 @@ pub(crate) fn candidate_keys(
         .collect()
 }
 
-pub(crate) fn link_row(
+#[cfg(test)]
+fn link_row(
     space: &SpaceId,
     note: &LinkNote,
     ordinal: u32,
@@ -710,8 +711,8 @@ fn invalid_state() -> DomainError {
     DomainError::validation(ValidationReason::InvalidState)
 }
 
-/// Private index used during zero-watermark seed and for a command's staged
-/// replacements. It is dropped before the immutable cut is published.
+/// In-memory oracle for the link resolution tests.
+#[cfg(test)]
 #[derive(Default)]
 pub(crate) struct MemoryResolutionIndex {
     candidates: BTreeMap<i64, BTreeMap<String, BTreeMap<CandidatePosition, CandidateLookupKey>>>,
@@ -720,6 +721,7 @@ pub(crate) struct MemoryResolutionIndex {
     slots: BTreeMap<FolderId, BTreeMap<String, NoteId>>,
 }
 
+#[cfg(test)]
 impl MemoryResolutionIndex {
     pub fn put_candidate(&mut self, candidate: CandidateLookupKey) {
         self.candidates
@@ -747,6 +749,7 @@ impl MemoryResolutionIndex {
     }
 }
 
+#[cfg(test)]
 impl ResolutionIndex for MemoryResolutionIndex {
     async fn candidates(
         &self,

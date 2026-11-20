@@ -26,14 +26,19 @@ use super::{ProjectionEngine, rotation};
 type Catalog = [(Space, HistoryScope, FolderId, SpaceSeq)];
 
 pub(super) enum Source {
+    #[cfg(any(test, feature = "test-support"))]
     Open(DerivedStore),
     Sqlite,
-    Postgres { pool: PgPool, schema_prefix: String },
+    Postgres {
+        pool: PgPool,
+        schema_prefix: String,
+    },
 }
 
 impl Source {
     pub(super) async fn control(&self, root: &DataRoot) -> Result<GenerationControl, PortError> {
         match self {
+            #[cfg(any(test, feature = "test-support"))]
             Self::Open(store) => store.generation_control(root).await,
             Self::Sqlite => GenerationControl::open_sqlite(root).await,
             Self::Postgres {
@@ -49,7 +54,9 @@ impl Source {
         generation: ProjectionGeneration,
     ) -> Result<Option<DerivedStore>, PortError> {
         let store = match self {
+            #[cfg(any(test, feature = "test-support"))]
             Self::Open(store) if store.generation() == generation => Some(store.clone()),
+            #[cfg(any(test, feature = "test-support"))]
             Self::Open(store) => {
                 store
                     .related_generation_for_runtime(root, generation)
@@ -118,14 +125,22 @@ pub(super) async fn select(
                 cut_fingerprint: rotation::fingerprint(catalog)?,
             };
             let candidate = reserve_candidate(control, &old, &planned).await?;
-            let store = if let Some(store) = source.open(root, candidate.generation).await? {
-                store
-            } else {
+            let open_candidate = async {
+                if let Some(store) = source.open(root, candidate.generation).await? {
+                    return Ok(store);
+                }
                 reset_obsolete_candidate(root, control, &old, &candidate).await?;
                 source
                     .open(root, candidate.generation)
                     .await?
-                    .ok_or_else(not_ready)?
+                    .ok_or_else(not_ready)
+            };
+            let store = match open_candidate.await {
+                Ok(store) => store,
+                Err(error) => {
+                    control.cancel_candidate(&candidate).await?;
+                    return Err(error);
+                }
             };
             return Ok(Selection {
                 old,
@@ -190,6 +205,7 @@ async fn reserve_candidate(
 /// still has no reader handle and the old descriptor remains durable.
 pub(super) async fn recover_generation(
     engine: &ProjectionEngine,
+    coordinator: &GenerationControl,
     old: &GenerationDescriptor,
     candidate: &GenerationDescriptor,
     budget: &CallBudget,
@@ -233,7 +249,7 @@ pub(super) async fn recover_generation(
                     .list_spaces(&engine.projection_context)
                     .await?;
                 if rotation::fingerprint(&current)? == next.cut_fingerprint {
-                    rotation::commit_rotation(engine, old, &next, stop).await??;
+                    rotation::commit_rotation(engine, coordinator, old, &next, stop).await??;
                     return Ok(next);
                 }
             }
@@ -285,6 +301,7 @@ pub(super) async fn supervise(engine: Arc<ProjectionEngine>, stop: Cancellation)
         tokio::select! {
             _ = stop.cancelled() => break,
             _ = activation.changed() => {},
+            _ = engine.reads.expire_on_deadline() => {},
             _ = tokio::time::sleep(Duration::from_secs(1)), if pending => {},
         }
     }
@@ -292,7 +309,6 @@ pub(super) async fn supervise(engine: Arc<ProjectionEngine>, stop: Cancellation)
 
 async fn collect(engine: &ProjectionEngine) -> Result<bool, PortError> {
     let _maintenance = engine.generation_cleanup.lock().await;
-    engine.reads.expire();
     engine.prune_event_channels();
     let active = engine.generation.load_full();
     let Some(durable) = engine.control.active().await? else {

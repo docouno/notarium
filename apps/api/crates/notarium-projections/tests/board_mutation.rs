@@ -471,14 +471,13 @@ impl LiveCollabInterceptor for Interceptor {
 async fn exercise(
     store: CanonicalStore,
     derived: DerivedStore,
-    candidate: DerivedStore,
     root: DataRoot,
     postgres: Option<(&PgPool, &str)>,
 ) {
     let depth_boundary = board_authority::prepare_depth(&store).await;
     let oversized = oversized_views::fixture(&store).await;
     let overflow = board_authority::prepare_overflow(&store).await;
-    let runtime = ProjectorRuntime::start(
+    let runtime = ProjectorRuntime::start_for_test(
         store.clone(),
         projection_context(),
         derived.clone(),
@@ -506,7 +505,7 @@ async fn exercise(
 
     // Restart on the same canonical store to exercise planner registration and
     // reacquire the durable projection. The old planner must release its binding.
-    let mut runtime = ProjectorRuntime::start(
+    let mut runtime = ProjectorRuntime::start_for_test(
         store.clone(),
         projection_context(),
         derived.clone(),
@@ -526,7 +525,12 @@ async fn exercise(
     )
     .await;
     sync(&store, &runtime, owner.scope()).await;
-    rotation::exercise(&store, &mut runtime, candidate).await;
+    rotation::exercise(
+        &store,
+        &mut runtime,
+        derived.generation().checked_next().unwrap(),
+    )
+    .await;
 
     let interceptor = Arc::new(Interceptor::default());
     store
@@ -612,10 +616,7 @@ async fn board_move_and_rollback_sqlite() {
     let derived = DerivedStore::open_sqlite(&root, ProjectionGeneration::new(1).unwrap())
         .await
         .unwrap();
-    let candidate = DerivedStore::open_sqlite(&root, ProjectionGeneration::new(2).unwrap())
-        .await
-        .unwrap();
-    exercise(store, derived, candidate, root, None).await;
+    exercise(store, derived, root, None).await;
     canonical.shutdown().await.unwrap();
 }
 
@@ -651,21 +652,7 @@ async fn board_move_and_rollback_postgres() {
     )
     .await
     .unwrap();
-    let candidate = DerivedStore::open_postgres(
-        pool.clone(),
-        &derived_schema,
-        ProjectionGeneration::new(2).unwrap(),
-    )
-    .await
-    .unwrap();
-    exercise(
-        store,
-        derived,
-        candidate,
-        root,
-        Some((&pool, &derived_schema)),
-    )
-    .await;
+    exercise(store, derived, root, Some((&pool, &derived_schema))).await;
     canonical.shutdown().await.unwrap();
     for schema in [
         canonical_schema,

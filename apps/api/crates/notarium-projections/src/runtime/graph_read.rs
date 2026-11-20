@@ -99,11 +99,11 @@ impl ProjectionEngine {
         query: &GraphQuery,
     ) -> Result<GraphResult, PortError> {
         let cut = self.published_cut(ctx.scope())?;
-        query.filter.validate_declared(&cut.fields)?;
         let index = self.open_index_async(&cut).await?;
         let (head, authorized, lens) = {
             let permit = cut.live.try_read()?;
             authorize_graph_entry(&permit, ctx, &cut)?;
+            query.filter.validate_declared(&cut.fields)?;
             let authorized = current_bitmap(
                 &index,
                 &cut,
@@ -262,7 +262,7 @@ impl ProjectionEngine {
         let mut last_returned_key: Option<(u32, u32)> = None;
         let mut more_available = false;
 
-        loop {
+        let _delivery_permit = loop {
             let rows = cut
                 .store
                 .link_page_at(
@@ -308,19 +308,11 @@ impl ProjectionEngine {
                     target,
                 });
             }
-            drop(permit);
-
             if more_available || page_exhausted {
-                break;
-            }
-            if links.len() == capacity {
-                // Probe whether another authorized row exists beyond this page
-                // on the next loop iteration (bounded by request budget).
-                cursor_pos = last_scanned;
-                continue;
+                break permit;
             }
             cursor_pos = last_scanned;
-        }
+        };
 
         let next = if more_available {
             last_returned_key.map(|(src_dense_id, link_ord)| NoteLinkCursor {

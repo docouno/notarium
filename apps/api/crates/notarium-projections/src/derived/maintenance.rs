@@ -452,6 +452,15 @@ pub(super) async fn reclaim_postgres_schema(
     }
     let error = |_| internal("projection_generation_remove_schema");
     let mut tx = pool.begin().await.map_err(error)?;
+    if !super::control::lock_reclaimable_postgres(
+        &mut SqlTransaction::Postgres(&mut tx),
+        prefix,
+        generation,
+    )
+    .await?
+    {
+        return Ok(false);
+    }
     let taken: bool =
         sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtextextended($1, 251850))")
             .bind(schema)

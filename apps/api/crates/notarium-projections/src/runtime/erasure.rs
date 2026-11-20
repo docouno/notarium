@@ -17,7 +17,7 @@ use crate::{
     mmap::{BaseIndexHandle, IndexIdentity, discard_abandoned_temp},
 };
 
-use super::{GenerationCleanup, ProjectionEngine, checkpoint_error};
+use super::{GenerationCleanup, ProjectionEngine, PublishedCut, checkpoint_error};
 
 pub(super) struct Eraser {
     engine: Weak<ProjectionEngine>,
@@ -67,6 +67,39 @@ impl ProjectionVisibilityCleanup for Eraser {
 }
 
 impl ProjectionEngine {
+    pub(super) async fn reclaim_superseded_checkpoints(
+        &self,
+        current: &PublishedCut,
+    ) -> Result<(), PortError> {
+        let identity = current.base.identity().clone();
+        if identity.seq == SpaceSeq::ZERO {
+            return Ok(());
+        }
+        let maintenance = Arc::clone(&self.generation_cleanup).lock_owned().await;
+        let root = self.cache_root.clone();
+        let pool = self.pool.clone();
+        let cache_owner = self.postgres_cache_owner.clone();
+        let generation_lease = current.store.cache_lease()?;
+        tokio::task::spawn_blocking(move || {
+            let _maintenance = maintenance;
+            let _cache_owner = cache_owner;
+            let _generation_lease = generation_lease;
+            let directory =
+                root.space_fast_index_dir(identity.generation, &identity.scope.space_id);
+            BaseIndexHandle::retire_superseded(&directory, &identity, &pool)
+                .map_err(checkpoint_error)?;
+            sweep_checkpoint_files(
+                &root,
+                identity.generation,
+                &identity.scope,
+                identity.seq,
+                Sweep::Superseded,
+            )
+        })
+        .await
+        .map_err(checkpoint_error)?
+    }
+
     /// Recover the markers for the exact generation and history being built.
     pub(super) async fn hydrate_erasure(
         &self,
@@ -143,14 +176,9 @@ impl ProjectionEngine {
                     continue;
                 };
                 let (scope, through) = store.erase_committed_visibility(erasures).await?;
-                drop(store);
                 if purging {
-                    if resident.is_some() {
-                        erase_scoped_checkpoints(&self.cache_root, id, &scope, through, None, true)
-                            .await?;
-                    } else {
-                        erase_closed_checkpoints(&self.cache_root, id, &scope, through).await?;
-                    }
+                    erase_scoped_checkpoints(&self.cache_root, id, &scope, through, None, true)
+                        .await?;
                 }
             }
         }
@@ -256,9 +284,10 @@ async fn erase_offline_sqlite(
             continue;
         };
         let (scope, through) = store.erase_committed_visibility(erasures).await?;
-        drop(store);
         if purging {
-            erase_closed_checkpoints(root, id, &scope, through).await?;
+            // The committed floor excludes old writers. A reader in any Space
+            // can still hold the shared generation lease during this sweep.
+            erase_scoped_checkpoints(root, id, &scope, through, None, true).await?;
         }
     }
     Ok(())
@@ -280,7 +309,7 @@ async fn erase_scoped_checkpoints(
         let _cache_owner = cache_owner;
         retire_registered(&root, generation, &scope, through)?;
         if sweep {
-            erase_checkpoint_files(&root, generation, &scope, through)?;
+            sweep_checkpoint_files(&root, generation, &scope, through, Sweep::Purged)?;
         }
         Ok(())
     })
@@ -304,9 +333,10 @@ async fn erase_closed_checkpoints(
     let cache = root.clone();
     let erased_scope = scope.clone();
     GenerationFiles::with_exclusive_reclamation(root, generation, move || {
-        erase_checkpoint_files(&cache, generation, &erased_scope, through)
+        sweep_checkpoint_files(&cache, generation, &erased_scope, through, Sweep::Purged)
     })
-    .await?;
+    .await?
+    .ok_or_else(not_ready)?;
     Ok(())
 }
 
@@ -321,11 +351,17 @@ fn retire_registered(
         .map_err(checkpoint_error)
 }
 
-fn erase_checkpoint_files(
+enum Sweep {
+    Superseded,
+    Purged,
+}
+
+fn sweep_checkpoint_files(
     root: &DataRoot,
     generation: ProjectionGeneration,
     scope: &HistoryScope,
     through: SpaceSeq,
+    sweep: Sweep,
 ) -> Result<(), PortError> {
     let directory = root.space_fast_index_dir(generation, &scope.space_id);
     let paths = match std::fs::read_dir(directory) {
@@ -348,8 +384,14 @@ fn erase_checkpoint_files(
                 scope: scope.clone(),
                 seq,
             };
-            BaseIndexHandle::discard_unleased_matching(&entry.path(), &identity)
-                .map_err(checkpoint_error)?;
+            match sweep {
+                Sweep::Superseded => {
+                    BaseIndexHandle::discard_unleased_matching(&entry.path(), &identity)
+                        .map_err(checkpoint_error)?;
+                }
+                Sweep::Purged => BaseIndexHandle::discard_erased_matching(&entry.path(), &identity)
+                    .map_err(checkpoint_error)?,
+            }
         } else {
             discard_abandoned_temp(&entry.path(), generation, scope, through)
                 .map_err(checkpoint_error)?;

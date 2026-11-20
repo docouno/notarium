@@ -105,7 +105,9 @@ pub struct ProjectorRuntime {
 impl ProjectorRuntime {
     /// Opens the reactor against an already opened derived generation. Reads stay
     /// closed while the initial canonical scope has no admitted published cut.
-    pub async fn start(
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub async fn start_for_test(
         canonical: CanonicalStore,
         projection_context: MaintenanceContext,
         derived: DerivedStore,
@@ -202,19 +204,20 @@ impl ProjectorRuntime {
             .await
             .map_err(checkpoint_error)??;
         let generation_cleanup = cache_cleanup(&cache_root);
-        control.clear_interrupted_rotation().await?;
+        let coordinator = control.acquire_coordinator().await?;
+        coordinator.clear_interrupted_rotation().await?;
         let maintenance::Selection {
             old: descriptor,
             store: derived,
             recovery,
-        } = maintenance::select(&source, &cache_root, &control, initial, &spaces).await?;
+        } = maintenance::select(&source, &cache_root, &coordinator, initial, &spaces).await?;
         drop(source);
         for (_, scope, _, _) in &spaces {
             let previous = match derived.watermarks(&scope.space_id).await {
                 Ok(previous) => previous,
                 Err(error) => {
                     if let Some(candidate) = &recovery {
-                        let _ = control.cancel_candidate(candidate).await;
+                        let _ = coordinator.cancel_candidate(candidate).await;
                     }
                     return Err(error);
                 }
@@ -224,7 +227,7 @@ impl ProjectorRuntime {
                 && !(previous.is_none() && apply::is_history_mismatch(&error))
             {
                 if let Some(candidate) = &recovery {
-                    let _ = control.cancel_candidate(candidate).await;
+                    let _ = coordinator.cancel_candidate(candidate).await;
                 }
                 return Err(error);
             }
@@ -246,6 +249,7 @@ impl ProjectorRuntime {
             generation_cleanup,
             publication: Arc::new(tokio::sync::RwLock::new(())),
             publication_closed: AtomicBool::new(recovery.is_some()),
+            stopped: Cancellation::default(),
             activation: watch::channel(0).0,
             discovery: Notify::new(),
             backlink_owners: OnceLock::new(),
@@ -259,7 +263,7 @@ impl ProjectorRuntime {
             Ok(provider) => provider,
             Err(error) => {
                 if let Some(candidate) = &recovery {
-                    let _ = control.cancel_candidate(candidate).await;
+                    let _ = coordinator.cancel_candidate(candidate).await;
                 }
                 return Err(error);
             }
@@ -268,7 +272,7 @@ impl ProjectorRuntime {
             Ok(eraser) => eraser,
             Err(error) => {
                 if let Some(candidate) = &recovery {
-                    let _ = control.cancel_candidate(candidate).await;
+                    let _ = coordinator.cancel_candidate(candidate).await;
                 }
                 return Err(error);
             }
@@ -278,7 +282,7 @@ impl ProjectorRuntime {
             .set_projection_visibility_cleanup(&engine.projection_context, Arc::new(eraser))
         {
             if let Some(candidate) = &recovery {
-                let _ = control.cancel_candidate(candidate).await;
+                let _ = coordinator.cancel_candidate(candidate).await;
             }
             return Err(error);
         }
@@ -305,6 +309,7 @@ impl ProjectorRuntime {
             budget.remaining = budget.remaining.saturating_sub(started.elapsed());
             let recovered = match maintenance::recover_generation(
                 &runtime.engine,
+                &coordinator,
                 &runtime.descriptor,
                 &candidate,
                 &budget,
@@ -314,9 +319,8 @@ impl ProjectorRuntime {
             {
                 Ok(recovered) => recovered,
                 Err(error) => {
-                    let recovery_control = runtime.control.clone();
                     let _ = runtime.shutdown().await;
-                    let _ = recovery_control.cancel_candidate(&candidate).await;
+                    let _ = coordinator.cancel_candidate(&candidate).await;
                     return Err(error);
                 }
             };
@@ -394,6 +398,7 @@ pub struct ProjectionEngine {
     generation_cleanup: Arc<GenerationCleanup>,
     publication: Arc<tokio::sync::RwLock<()>>,
     publication_closed: AtomicBool,
+    stopped: Cancellation,
     activation: watch::Sender<u64>,
     discovery: Notify,
     backlink_owners: OnceLock<Arc<dyn BacklinkOwnerResolver>>,
@@ -453,6 +458,7 @@ struct SpaceSlot {
     ever_published: AtomicBool,
     progress: watch::Sender<u64>,
     checkpoint: Notify,
+    align_graph: Notify,
     repair: Notify,
     #[cfg(any(test, feature = "test-support"))]
     benchmark_pause: benchmark::PauseSlot,
@@ -515,7 +521,10 @@ impl SpaceSlot {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct PublishedCut {
+    /// Serving cut whose complete graph partition this private cut has adopted.
+    handoff_graph_source: Weak<PublishedCut>,
     slot: Weak<SpaceSlot>,
     pub(crate) cut: SnapshotCut,
     pub(crate) watermark: ProjectionWatermark,
@@ -597,6 +606,7 @@ impl SpaceEventChannel {
 impl ProjectionEngine {
     fn close_admissions(&self) {
         self.publication_closed.store(true, Ordering::Release);
+        self.stopped.cancel();
         self.reads.clear();
     }
 

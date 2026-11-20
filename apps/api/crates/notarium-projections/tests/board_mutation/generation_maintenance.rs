@@ -503,6 +503,7 @@ async fn postgres_recovers_obsolete_format_and_resets_obsolete_candidate() {
         .await
         .unwrap();
     assert_eq!(version, 999);
+    assert!(control.candidate().await.unwrap().is_none());
 
     // An obsolete candidate schema is safely reset and rebuilt from canonical.
     sqlx::query(sqlx::AssertSqlSafe(stamp_candidate))
@@ -510,14 +511,49 @@ async fn postgres_recovers_obsolete_format_and_resets_obsolete_candidate() {
         .execute(&pool)
         .await
         .unwrap();
-    let runtime = start(
+    let mut barrier = pool.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 251850))")
+        .bind(&new_schema)
+        .execute(&mut *barrier)
+        .await
+        .unwrap();
+    let recovery = tokio::spawn(start(
         store.clone(),
         pool.clone(),
         derived_schema.clone(),
         cache.root(),
+    ));
+    let reservation = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(reservation) = control.candidate().await.unwrap() {
+                break reservation;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the founder reserved the candidate before opening its schema");
+    let other_cache = Scratch::new();
+    let competing = tokio::time::timeout(
+        Duration::from_secs(3),
+        start(
+            store.clone(),
+            pool.clone(),
+            derived_schema.clone(),
+            other_cache.root(),
+        ),
     )
     .await
-    .expect("single-owner PostgreSQL format recovery succeeds");
+    .expect("the second starter reports the active coordinator");
+    let error = competing.err().expect("another founder owns recovery");
+    assert!(incompatible(&error, ValidationReason::NotReady));
+    assert_eq!(control.candidate().await.unwrap(), Some(reservation));
+    assert_eq!(control.active().await.unwrap(), Some(previous.clone()));
+    barrier.rollback().await.unwrap();
+    let runtime = recovery
+        .await
+        .unwrap()
+        .expect("the first founder completes recovery");
     let active = control.active().await.unwrap().unwrap();
     assert_eq!(active.generation, next);
     assert_eq!(active.publication_epoch, previous.publication_epoch + 1);

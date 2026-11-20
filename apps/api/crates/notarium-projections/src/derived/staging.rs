@@ -12,7 +12,7 @@ use super::{
     write::encrypted_payload_empty,
 };
 
-pub(super) const MAX_STAGE_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_STAGE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_STAGE_ROWS: usize = 8_192;
 
 /// Accumulates up to one bounded page of derived mutations for multi-page
@@ -58,7 +58,7 @@ impl StageBuffer {
     }
 }
 
-fn approx_mutation_bytes(mutation: &DerivedMutation) -> usize {
+pub(crate) fn approx_mutation_bytes(mutation: &DerivedMutation) -> usize {
     const OVERHEAD: usize = 160;
     match mutation {
         DerivedMutation::UpsertNote(row) => {
@@ -116,6 +116,7 @@ fn approx_mutation_bytes(mutation: &DerivedMutation) -> usize {
         | DerivedMutation::DeleteDescriptors(_)
         | DerivedMutation::DeleteRank(..)
         | DerivedMutation::DeleteClusters
+        | DerivedMutation::InvalidateCheckpointClusters
         | DerivedMutation::PurgeNote(_)
         | DerivedMutation::RedactChatEntry(..) => OVERHEAD,
     }

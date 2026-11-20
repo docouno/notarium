@@ -587,22 +587,38 @@ impl EntryHead {
     }
 }
 
+macro_rules! exact_entry_query {
+    ($index:literal) => {
+        concat!(
+            "SELECT revision_id, created_space_seq, redacted_at_seq, kind,
+            CAST(checkpoint_stale AS BIGINT) FROM chat_entries",
+            $index,
+            " WHERE space_id=$1 AND thread_id=$2 AND entry_seq=$3"
+        )
+    };
+}
+const SQLITE_EXACT_ENTRY: &str = exact_entry_query!(" INDEXED BY idx_chat_entries_projection");
+const PG_EXACT_ENTRY: &str = exact_entry_query!("");
+
 async fn exact_entry(
     tx: &mut BackendConn<'_>,
     space: &SpaceId,
     key: &ProjectionChatEntryKey,
 ) -> Result<Option<EntryHead>, PortError> {
-    const QUERY: &str = "SELECT revision_id, created_space_seq, redacted_at_seq, kind,
-        CAST(checkpoint_stale AS BIGINT)
-        FROM chat_entries
-        WHERE space_id=$1 AND thread_id=$2 AND entry_seq=$3";
-    let row: Option<(String, i64, Option<i64>, String, i64)> = chat_fetch_optional!(
-        tx,
-        QUERY,
-        space.as_str(),
-        key.thread.as_str(),
-        key.seq.get() as i64
-    );
+    macro_rules! fetch {
+        ($conn:expr, $query:ident) => {
+            sqlx::query_as($query)
+                .bind(space.as_str())
+                .bind(key.thread.as_str())
+                .bind(key.seq.get() as i64)
+                .fetch_optional(&mut **$conn)
+                .await
+        };
+    }
+    let row: Option<(String, i64, Option<i64>, String, i64)> = match tx {
+        BackendConn::Sqlite(conn) => fetch!(conn, SQLITE_EXACT_ENTRY).map_err(sqlite_read_error)?,
+        BackendConn::Postgres(conn) => fetch!(conn, PG_EXACT_ENTRY).map_err(pg_chat_read_error)?,
+    };
     let Some((revision, created, redacted, kind, stale_flag)) = row else {
         return Ok(None);
     };
@@ -617,6 +633,40 @@ async fn exact_entry(
     }))
 }
 
+// Determine visibility by one exact probe per visited occurrence. Keeping the
+// predicate in the scalar projection preserves raw keys for the continuation.
+macro_rules! ref_columns {
+    ($index:literal, $cut:literal) => {
+        concat!(
+            "SELECT r.thread_id, r.entry_seq, r.ref_ordinal, r.target_space_id, r.target_note_id,
+            (SELECT e.revision_id FROM chat_entries e",
+            $index,
+            " WHERE e.space_id=r.space_id AND e.thread_id=r.thread_id AND e.entry_seq=r.entry_seq
+              AND e.created_space_seq<=",
+            $cut,
+            " AND e.kind <> 'redacted' AND e.redacted_at_seq IS NULL AND e.checkpoint_stale=0)
+            FROM chat_entry_note_refs r WHERE r.space_id=$1 AND "
+        )
+    };
+}
+
+macro_rules! ref_pages {
+    ($all:ident, $target:ident, $index:literal) => {
+        const $all: &str = concat!(ref_columns!($index, "$2"),
+            "(r.thread_id,r.entry_seq,r.ref_ordinal)>($3,$4,$5)
+             ORDER BY r.thread_id,r.entry_seq,r.ref_ordinal LIMIT $6");
+        const $target: &str = concat!(ref_columns!($index, "$3"),
+            "r.target_space_id=$2 AND (r.target_note_id,r.thread_id,r.entry_seq,r.ref_ordinal)>($4,$5,$6,$7)
+             ORDER BY r.target_note_id,r.thread_id,r.entry_seq,r.ref_ordinal LIMIT $8");
+    };
+}
+ref_pages!(
+    SQLITE_ALL_REFS,
+    SQLITE_TARGET_REFS,
+    " INDEXED BY idx_chat_entries_projection"
+);
+ref_pages!(PG_ALL_REFS, PG_TARGET_REFS, "");
+
 async fn read_page(
     tx: &mut BackendConn<'_>,
     position: ProjectionChatPosition,
@@ -627,105 +677,90 @@ async fn read_page(
     let cut = position.cutoff.get() as i64;
     let space = position.scope.space_id.as_str();
 
-    let raw_rows: Vec<(String, i64, i64, String, String, String)> = match &position.selection {
-        RefSelection::All => {
-            let (after_thread, after_entry, after_ord) =
-                position.after.as_ref().map_or(("", 0_i64, -1_i64), |c| {
-                    (c.thread.as_str(), c.entry_seq, c.ref_ordinal)
-                });
-            const ALL_REFS: &str = "SELECT r.thread_id, r.entry_seq, r.ref_ordinal,
-                    r.target_space_id, r.target_note_id, e.revision_id
-                FROM chat_entry_note_refs r
-                JOIN chat_entries e
-                  ON e.space_id=r.space_id AND e.thread_id=r.thread_id AND e.entry_seq=r.entry_seq
-                WHERE r.space_id=$1
-                  AND e.created_space_seq<=$2
-                  AND e.kind <> 'redacted' AND e.redacted_at_seq IS NULL AND e.checkpoint_stale=0
-                  AND (r.thread_id, r.entry_seq, r.ref_ordinal)>($3, $4, $5)
-                ORDER BY r.thread_id, r.entry_seq, r.ref_ordinal
-                LIMIT $6";
-            chat_fetch_all!(
-                tx,
-                ALL_REFS,
-                space,
-                cut,
-                after_thread,
-                after_entry,
-                after_ord,
-                fetch_limit
-            )
-        }
-        RefSelection::Entry(entry) => {
-            let Some(head) = exact_entry(tx, &position.scope.space_id, entry).await? else {
-                return Ok(ProjectionChatPage {
-                    refs: Vec::new(),
-                    next: None,
-                });
-            };
-            if !head.visible_at(position.cutoff)? {
-                return Ok(ProjectionChatPage {
-                    refs: Vec::new(),
-                    next: None,
-                });
+    let (all_refs, target_refs) = match tx {
+        BackendConn::Sqlite(_) => (SQLITE_ALL_REFS, SQLITE_TARGET_REFS),
+        BackendConn::Postgres(_) => (PG_ALL_REFS, PG_TARGET_REFS),
+    };
+    // Keep ineligible keys in the raw page. Each call examines at most
+    // limit + 1 occurrences even when every entry was created after the cut.
+    let raw_rows: Vec<(String, i64, i64, String, String, Option<String>)> =
+        match &position.selection {
+            RefSelection::All => {
+                let (after_thread, after_entry, after_ord) =
+                    position.after.as_ref().map_or(("", 0_i64, -1_i64), |c| {
+                        (c.thread.as_str(), c.entry_seq, c.ref_ordinal)
+                    });
+                chat_fetch_all!(
+                    tx,
+                    all_refs,
+                    space,
+                    cut,
+                    after_thread,
+                    after_entry,
+                    after_ord,
+                    fetch_limit
+                )
             }
-            let after_ord = position.after.as_ref().map_or(-1_i64, |c| c.ref_ordinal);
-            const ENTRY_REFS: &str = "SELECT thread_id, entry_seq, ref_ordinal,
+            RefSelection::Entry(entry) => {
+                let Some(head) = exact_entry(tx, &position.scope.space_id, entry).await? else {
+                    return Ok(ProjectionChatPage {
+                        refs: Vec::new(),
+                        next: None,
+                    });
+                };
+                if !head.visible_at(position.cutoff)? {
+                    return Ok(ProjectionChatPage {
+                        refs: Vec::new(),
+                        next: None,
+                    });
+                }
+                let after_ord = position.after.as_ref().map_or(-1_i64, |c| c.ref_ordinal);
+                const ENTRY_REFS: &str = "SELECT thread_id, entry_seq, ref_ordinal,
                     target_space_id, target_note_id
                 FROM chat_entry_note_refs
                 WHERE space_id=$1 AND thread_id=$2 AND entry_seq=$3 AND ref_ordinal>$4
                 ORDER BY ref_ordinal
                 LIMIT $5";
-            let rows: Vec<(String, i64, i64, String, String)> = chat_fetch_all!(
-                tx,
-                ENTRY_REFS,
-                space,
-                entry.thread.as_str(),
-                entry.seq.get() as i64,
-                after_ord,
-                fetch_limit
-            );
-            let rev = head.revision.as_str().to_owned();
-            rows.into_iter()
-                .map(|(t, s, o, ts, tn)| (t, s, o, ts, tn, rev.clone()))
-                .collect()
-        }
-        RefSelection::Target(target) => {
-            let (after_note, after_thread, after_entry, after_ord) = position
-                .after
-                .as_ref()
-                .map_or(("", "", 0_i64, -1_i64), |c| {
-                    (
-                        c.target_note.as_str(),
-                        c.thread.as_str(),
-                        c.entry_seq,
-                        c.ref_ordinal,
-                    )
-                });
-            const TARGET_REFS: &str = "SELECT r.thread_id, r.entry_seq, r.ref_ordinal,
-                    r.target_space_id, r.target_note_id, e.revision_id
-                FROM chat_entry_note_refs r
-                JOIN chat_entries e
-                  ON e.space_id=r.space_id AND e.thread_id=r.thread_id AND e.entry_seq=r.entry_seq
-                WHERE r.space_id=$1 AND r.target_space_id=$2
-                  AND e.created_space_seq<=$3
-                  AND e.kind <> 'redacted' AND e.redacted_at_seq IS NULL AND e.checkpoint_stale=0
-                  AND (r.target_note_id, r.thread_id, r.entry_seq, r.ref_ordinal)>($4, $5, $6, $7)
-                ORDER BY r.target_note_id, r.thread_id, r.entry_seq, r.ref_ordinal
-                LIMIT $8";
-            chat_fetch_all!(
-                tx,
-                TARGET_REFS,
-                space,
-                target.space_id.as_str(),
-                cut,
-                after_note,
-                after_thread,
-                after_entry,
-                after_ord,
-                fetch_limit
-            )
-        }
-    };
+                let rows: Vec<(String, i64, i64, String, String)> = chat_fetch_all!(
+                    tx,
+                    ENTRY_REFS,
+                    space,
+                    entry.thread.as_str(),
+                    entry.seq.get() as i64,
+                    after_ord,
+                    fetch_limit
+                );
+                let rev = head.revision.as_str().to_owned();
+                rows.into_iter()
+                    .map(|(t, s, o, ts, tn)| (t, s, o, ts, tn, Some(rev.clone())))
+                    .collect()
+            }
+            RefSelection::Target(target) => {
+                let (after_note, after_thread, after_entry, after_ord) = position
+                    .after
+                    .as_ref()
+                    .map_or(("", "", 0_i64, -1_i64), |c| {
+                        (
+                            c.target_note.as_str(),
+                            c.thread.as_str(),
+                            c.entry_seq,
+                            c.ref_ordinal,
+                        )
+                    });
+                chat_fetch_all!(
+                    tx,
+                    target_refs,
+                    space,
+                    target.space_id.as_str(),
+                    cut,
+                    after_note,
+                    after_thread,
+                    after_entry,
+                    after_ord,
+                    fetch_limit
+                )
+            }
+        };
 
     let has_more = raw_rows.len() > limit;
     let mut rows = raw_rows;
@@ -751,6 +786,7 @@ async fn read_page(
 
     let mut refs = Vec::with_capacity(rows.len());
     for (thread, seq, ord, target_space_raw, target_note_raw, revision) in rows {
+        let Some(revision) = revision else { continue };
         let target_space_id = SpaceId::parse(&target_space_raw)?;
         let target_note_id = NoteId::parse(&target_note_raw)?;
         let resolved_scope = if let Some(cached) = scopes.get(&target_space_id) {
@@ -915,7 +951,7 @@ pub(crate) async fn write_chat_note_refs_json_tx(
     entry_seq: i64,
     refs_json: &str,
 ) -> Result<(), PortError> {
-    if refs_json == "[]" || refs_json.trim().is_empty() {
+    if refs_json == "[]" {
         return Ok(());
     }
     let refs: Vec<NoteRef> = serde_json::from_str(refs_json)
@@ -1050,4 +1086,86 @@ fn sqlite_read_error(error: sqlx::Error) -> PortError {
 
 fn pg_chat_read_error(error: sqlx::Error) -> PortError {
     pg_read_error("pg_projection_chat_read", error)
+}
+
+#[cfg(test)]
+mod sqlite_access_tests {
+    use super::{SQLITE_ALL_REFS, SQLITE_EXACT_ENTRY, SQLITE_TARGET_REFS};
+    use rusqlite::{Connection, StatementStatus, named_params, params};
+
+    #[test]
+    fn chat_ref_pages_bound_examined_keys_at_an_old_cut() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(crate::schema::SQLITE_BASELINE_DDL)
+            .unwrap();
+        db.pragma_update(None, "foreign_keys", false).unwrap();
+        let mut previous = 0;
+        for size in [64, 2048, 20_000] {
+            let range =
+                "WITH RECURSIVE seq(i) AS (SELECT ?1+1 UNION ALL SELECT i+1 FROM seq WHERE i<?2)";
+            db.execute(&format!("{range} INSERT INTO chat_entries
+                (space_id, thread_id, entry_seq, revision_id, kind, author_id, inline_text, referenced_notes_json,
+                 ext_space_tainted, is_chain_node, branch_depth, created_space_seq)
+                SELECT 's','t',i,'r','human','a','hi','[]',0,1,0,i+2 FROM seq"), params![previous, size]).unwrap();
+            db.execute(
+                &format!(
+                    "{range} INSERT INTO chat_entry_note_refs
+                SELECT 's','t',i,0,'s','n' FROM seq"
+                ),
+                params![previous, size],
+            )
+            .unwrap();
+            previous = size;
+            db.execute_batch("ANALYZE").unwrap();
+            for (query, args) in [
+                (
+                    SQLITE_ALL_REFS,
+                    named_params! {"$1":"s", "$2":2, "$3":"", "$4":0, "$5":-1, "$6":2},
+                ),
+                (
+                    SQLITE_TARGET_REFS,
+                    named_params! {"$1":"s", "$2":"s", "$3":2, "$4":"", "$5":"", "$6":0, "$7":-1, "$8":2},
+                ),
+            ] {
+                let mut stmt = db.prepare(query).unwrap();
+                let revisions = stmt
+                    .query_map(args, |row| row.get::<_, Option<String>>(5))
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                assert_eq!(revisions, [None, None]);
+                assert!(
+                    stmt.get_status(StatementStatus::VmStep) < 250,
+                    "{size} later entries"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn exact_entry_reads_only_its_covering_index() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(crate::schema::SQLITE_BASELINE_DDL)
+            .unwrap();
+        let root: i64 = db.query_row(
+            "SELECT rootpage FROM sqlite_schema WHERE type='index' AND name='idx_chat_entries_projection'",
+            [], |row| row.get(0)).unwrap();
+        let opened = db
+            .prepare(&format!("EXPLAIN {SQLITE_EXACT_ENTRY}"))
+            .unwrap()
+            .query_map(params!["s", "t", 1], |row| {
+                Ok((row.get::<_, String>(1)?, row.get::<_, i64>(3)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .into_iter()
+            .filter_map(|(opcode, page)| (opcode == "OpenRead").then_some(page))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            opened,
+            [root],
+            "the exact entry probe must never open the overflow-bearing table"
+        );
+    }
 }

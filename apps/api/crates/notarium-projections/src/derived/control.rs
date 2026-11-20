@@ -12,12 +12,15 @@ use notarium_core::{
     ids::{ContentDigest, ProjectionGeneration},
 };
 use serde::{Deserialize, Serialize};
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 
 use super::{
     internal, invalid_row,
     records::{decode, encode},
-    sql::{Database, Kind, SqlColumn, SqlTransaction, validate_schema_prefix, value},
+    sql::{
+        Database, Kind, SqlColumn, SqlFuture, SqlTransaction, validate_schema_prefix, value,
+        write_postgres_on,
+    },
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -34,12 +37,36 @@ struct DescriptorState {
     candidate: Option<GenerationDescriptor>,
 }
 
+impl DescriptorState {
+    fn reclaimable(&self, generation: ProjectionGeneration) -> bool {
+        self.active.as_ref().map(|d| d.generation) != Some(generation)
+            && self.candidate.as_ref().map(|d| d.generation) != Some(generation)
+    }
+}
+
 enum ControlBackend {
     Local(PathBuf),
-    Postgres {
-        database: Arc<Database>,
-        schema_prefix: String,
-    },
+    Postgres(PostgresControl),
+}
+
+struct PostgresControl {
+    database: Arc<Database>,
+    schema_prefix: String,
+    coordinator: Option<tokio::sync::Mutex<PgConnection>>,
+}
+
+impl PostgresControl {
+    async fn write<T: Send + 'static>(
+        &self,
+        operation: impl for<'a> FnOnce(SqlTransaction<'a>) -> SqlFuture<'a, T> + Send + 'static,
+    ) -> Result<T, PortError> {
+        if let Some(session) = &self.coordinator {
+            let (_, schema) = self.database.postgres_config().ok_or_else(invalid_row)?;
+            let mut session = session.lock().await;
+            return write_postgres_on(&mut session, schema, operation).await;
+        }
+        self.database.write(false, operation).await
+    }
 }
 
 /// Serializes single-owner candidate selection and durable activation
@@ -49,6 +76,36 @@ enum ControlBackend {
 pub struct GenerationControl(Arc<ControlBackend>);
 
 impl GenerationControl {
+    /// A fresh PostgreSQL backend holds the coordinator lock across the separate
+    /// transactions that build and publish a candidate. Closing that backend
+    /// releases the lock even if the coordinator is cancelled or its host dies.
+    /// SQLite already holds the installation's runtime file lock.
+    pub(crate) async fn acquire_coordinator(&self) -> Result<Self, PortError> {
+        let ControlBackend::Postgres(pg) = self.0.as_ref() else {
+            return Ok(self.clone());
+        };
+        let (pool, schema) = pg.database.postgres_config().ok_or_else(invalid_row)?;
+        let mut session = pool
+            .acquire()
+            .await
+            .map_err(|_| internal("projection_coordinator_connection"))?
+            .detach();
+        let acquired: bool =
+            sqlx::query_scalar("SELECT pg_try_advisory_lock(hashtextextended($1, 251851))")
+                .bind(schema)
+                .fetch_one(&mut session)
+                .await
+                .map_err(|_| internal("projection_coordinator_lock"))?;
+        if !acquired {
+            return Err(super::not_ready());
+        }
+        Ok(Self(Arc::new(ControlBackend::Postgres(PostgresControl {
+            database: Arc::clone(&pg.database),
+            schema_prefix: pg.schema_prefix.clone(),
+            coordinator: Some(tokio::sync::Mutex::new(session)),
+        }))))
+    }
+
     pub async fn open_sqlite(root: &DataRoot) -> Result<Self, PortError> {
         let path = root.active_projection_generation();
         let directory = path.parent().ok_or_else(invalid_row)?.to_owned();
@@ -93,16 +150,17 @@ impl GenerationControl {
                 })
             })
             .await?;
-        let control = Self(Arc::new(ControlBackend::Postgres {
+        let control = Self(Arc::new(ControlBackend::Postgres(PostgresControl {
             database,
             schema_prefix,
-        }));
+            coordinator: None,
+        })));
         control.active().await?;
         Ok(control)
     }
 
     pub(crate) fn is_postgres(&self) -> bool {
-        matches!(&*self.0, ControlBackend::Postgres { .. })
+        matches!(&*self.0, ControlBackend::Postgres(_))
     }
 
     pub async fn active(&self) -> Result<Option<GenerationDescriptor>, PortError> {
@@ -119,11 +177,7 @@ impl GenerationControl {
         &self,
         generation: ProjectionGeneration,
     ) -> Result<bool, PortError> {
-        let state = self.read().await?;
-        Ok(
-            state.active.as_ref().map(|d| d.generation) != Some(generation)
-                && state.candidate.as_ref().map(|d| d.generation) != Some(generation),
-        )
+        Ok(self.read().await?.reclaimable(generation))
     }
 
     /// Called after admission to the sole cache owner. A process that failed
@@ -152,36 +206,27 @@ impl GenerationControl {
         expected: &GenerationDescriptor,
         candidate: &GenerationDescriptor,
     ) -> Result<(), PortError> {
-        let ControlBackend::Postgres {
-            database,
-            schema_prefix,
-        } = &*self.0
-        else {
+        let ControlBackend::Postgres(pg) = &*self.0 else {
             return Err(invalid_row());
         };
         let expected = expected.clone();
         let candidate = candidate.clone();
-        let schema = format!("{schema_prefix}_g{}", candidate.generation.get());
-        database
-            .write(false, move |mut tx| {
-                Box::pin(async move {
-                    let state = read_postgres(&mut tx, true).await?;
-                    if state.active.as_ref() != Some(&expected)
-                        || state.candidate.as_ref() != Some(&candidate)
-                    {
-                        return Err(
-                            DomainError::validation(ValidationReason::GenerationMismatch).into(),
-                        );
-                    }
-                    super::maintenance::reset_obsolete_postgres(
-                        &mut tx,
-                        &schema,
-                        candidate.generation,
-                    )
+        let schema = format!("{}_g{}", pg.schema_prefix, candidate.generation.get());
+        pg.write(move |mut tx| {
+            Box::pin(async move {
+                let state = read_postgres(&mut tx, true).await?;
+                if state.active.as_ref() != Some(&expected)
+                    || state.candidate.as_ref() != Some(&candidate)
+                {
+                    return Err(
+                        DomainError::validation(ValidationReason::GenerationMismatch).into(),
+                    );
+                }
+                super::maintenance::reset_obsolete_postgres(&mut tx, &schema, candidate.generation)
                     .await
-                })
             })
-            .await
+        })
+        .await
     }
 
     /// A CAS whose rename may have succeeded is inspected after taking the
@@ -239,6 +284,7 @@ impl GenerationControl {
         let next = next.clone();
         self.update(move |state| {
             if state.active != expected
+                || (expected.is_some() && state.candidate.is_none())
                 || state.candidate.as_ref().is_some_and(|candidate| {
                     candidate.generation != next.generation
                         || candidate.publication_epoch != next.publication_epoch
@@ -276,8 +322,8 @@ impl GenerationControl {
                     .await
                     .map_err(|_| internal("projection_control_worker"))?
             }
-            ControlBackend::Postgres { database, .. } => {
-                database
+            ControlBackend::Postgres(pg) => {
+                pg.database
                     .read(|mut tx| Box::pin(async move { read_postgres(&mut tx, false).await }))
                     .await
             }
@@ -303,9 +349,8 @@ impl GenerationControl {
                 .await
                 .map_err(|_| internal("projection_control_worker"))?
             }
-            ControlBackend::Postgres { database, .. } => {
-                database
-                    .write(false, move |mut tx| {
+            ControlBackend::Postgres(pg) => {
+                pg.write( move |mut tx| {
                         Box::pin(async move {
                             let mut state = read_postgres(&mut tx, true).await?;
                             if !operation(&mut state) {
@@ -323,6 +368,21 @@ impl GenerationControl {
             }
         }
     }
+}
+
+/// Recheck eligibility in the DROP transaction. A coordinator cannot reserve
+/// or promote this generation between this read and removal of its schema.
+pub(super) async fn lock_reclaimable_postgres(
+    tx: &mut SqlTransaction<'_>,
+    prefix: &str,
+    generation: ProjectionGeneration,
+) -> Result<bool, PortError> {
+    let prefix = validate_schema_prefix(prefix)?;
+    tx.batch(&format!(
+        "SET LOCAL search_path TO \"{prefix}_ctrl\", pg_catalog"
+    ))
+    .await?;
+    Ok(read_postgres(tx, true).await?.reclaimable(generation))
 }
 
 pub(crate) struct LocalRotationWitness {

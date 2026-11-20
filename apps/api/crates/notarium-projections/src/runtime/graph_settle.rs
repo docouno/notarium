@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Weak},
+};
 
 use croaring::{Bitmap, Portable};
 use notarium_canonical::codec::encode_msgpack;
@@ -26,12 +29,7 @@ pub(super) async fn settle_mapped_cut(
     let index = engine.open_index_async(current).await?;
     let scope = current.cut.scope.clone();
     let cutoff = current.cut.projected_seq;
-    let previous = match index.deferred_clusters() {
-        Some(settled) => {
-            Some(load_clusters(&current.store, &scope, settled, index.node_count(), None).await?)
-        }
-        None => None,
-    };
+    let previous = deferred_snapshot(current, &index).await?;
     let cancel = stop.clone();
     let (settled, mutations) = tokio::task::spawn_blocking(move || {
         let effective = active_plain(&index)?;
@@ -45,6 +43,16 @@ pub(super) async fn settle_mapped_cut(
     })
     .await
     .map_err(checkpoint_error)??;
+    publish_settlement(current, settled, mutations, Weak::new()).await
+}
+
+async fn publish_settlement(
+    current: &PublishedCut,
+    settled: LeidenSnapshot,
+    mutations: Vec<DerivedMutation>,
+    handoff_graph_source: Weak<PublishedCut>,
+) -> Result<Arc<PublishedCut>, PortError> {
+    let cutoff = current.cut.projected_seq;
     let mut watermark = current.watermark.clone();
     watermark.graph_settled_seq = cutoff;
     current
@@ -58,16 +66,107 @@ pub(super) async fn settle_mapped_cut(
     let mut delta = (*current.delta).clone();
     delta.settle_clusters(settled, cutoff);
     Ok(Arc::new(PublishedCut {
-        slot: current.slot.clone(),
-        cut: current.cut.clone(),
+        handoff_graph_source,
         watermark,
-        root_folder_id: current.root_folder_id.clone(),
-        store: current.store.clone(),
-        fields: Arc::clone(&current.fields),
-        live: current.live.clone(),
-        base: current.base.clone(),
         delta: Arc::new(delta),
+        ..current.clone()
     }))
+}
+
+/// Both cuts describe the same canonical graph. Copy the serving partition
+/// by NoteId even if independent intermediate settlements or dense allocation
+/// gave the private generation different cluster identities.
+pub(super) async fn align_for_handoff(
+    engine: &ProjectionEngine,
+    candidate: &PublishedCut,
+    serving: &Arc<PublishedCut>,
+    stop: &Cancellation,
+) -> Result<Arc<PublishedCut>, PortError> {
+    let cutoff = candidate.cut.projected_seq;
+    let scope = &candidate.cut.scope;
+    scope.check(&serving.cut.scope)?;
+    if serving.watermark.graph_settled_seq != cutoff || serving.cut.projected_seq != cutoff {
+        return Err(DomainError::validation(ValidationReason::CursorStale).into());
+    }
+    let source = engine.open_index_async(serving).await?;
+    let target = engine.open_index_async(candidate).await?;
+    let source_deferred = deferred_snapshot(serving, &source).await?;
+    let target_deferred = deferred_snapshot(candidate, &target).await?;
+    let previously_settled = candidate.watermark.graph_settled_seq == cutoff;
+    let scope = scope.clone();
+    let cancel = stop.clone();
+    let update = tokio::task::spawn_blocking(move || {
+        let source = SettledGraph {
+            index: &source,
+            settlement: source_deferred.as_ref(),
+        };
+        let graph = SettledGraph {
+            index: &target,
+            settlement: target_deferred.as_ref(),
+        };
+        let active = active_plain(&target)?;
+        let inherited = |dense| {
+            let note = graph.note_id(dense).ok_or_else(invalid_cluster)?;
+            source
+                .lookup(&note)
+                .and_then(|old| source.cluster_key(old))
+                .ok_or_else(invalid_cluster)
+        };
+        if previously_settled {
+            let mut identical = true;
+            for (n, dense) in active.iter().enumerate() {
+                if n % 1024 == 0 {
+                    super::apply::check_stop(&cancel)?;
+                }
+                if graph.cluster_key(dense) != Some(inherited(dense)?) {
+                    identical = false;
+                    break;
+                }
+            }
+            if identical {
+                return Ok(None);
+            }
+        }
+        let mut members = std::collections::HashMap::<_, Bitmap>::new();
+        for (n, dense) in active.iter().enumerate() {
+            if n % 1024 == 0 {
+                super::apply::check_stop(&cancel)?;
+            }
+            members.entry(inherited(dense)?).or_default().add(dense);
+        }
+        let members = members
+            .into_iter()
+            .map(|(key, nodes)| (key.into_cluster_id(), nodes))
+            .collect();
+        let settled = LeidenSnapshot::from_members(target.node_count(), members)?;
+        let mut mutations = cluster_mutations(&settled, &graph, &scope, cutoff)?;
+        mutations.push(DerivedMutation::InvalidateCheckpointClusters);
+        Ok::<_, PortError>(Some((settled, mutations)))
+    })
+    .await
+    .map_err(checkpoint_error)??;
+    let source = Arc::downgrade(serving);
+    match update {
+        Some((settled, mutations)) => {
+            publish_settlement(candidate, settled, mutations, source).await
+        }
+        None => Ok(Arc::new(PublishedCut {
+            handoff_graph_source: source,
+            ..candidate.clone()
+        })),
+    }
+}
+
+async fn deferred_snapshot(
+    cut: &PublishedCut,
+    index: &IndexView,
+) -> Result<Option<LeidenSnapshot>, PortError> {
+    match index.deferred_clusters() {
+        Some(seq) => Ok(Some(
+            load_clusters(&cut.store, &cut.cut.scope, seq, index.node_count(), None).await?,
+        )),
+        None => Ok(None),
+    }
 }
 
 pub(super) async fn restore_settlement(

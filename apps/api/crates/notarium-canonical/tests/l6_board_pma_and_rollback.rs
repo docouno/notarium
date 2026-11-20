@@ -258,13 +258,15 @@ impl BoardMutationFactsProvider for CanonicalTestBoardPlanner {
                 if nid == intent.note {
                     target_slug = slug.clone();
                 }
-                let status_opt = match snap.fields.get("status") {
+                let grp_opt = match snap.fields.get("status") {
                     Some(FieldObservation::Ok(FieldValue::Scalar(ScalarValue::String(s)))) => {
-                        Some(s.as_str())
+                        Self::group_from_status_str(Some(s))
                     }
-                    _ => None,
+                    Some(FieldObservation::Ok(FieldValue::Scalar(
+                        number @ ScalarValue::Number(_),
+                    ))) => Some(GroupKey::Value(number.clone())),
+                    _ => Self::group_from_status_str(None),
                 };
-                let grp_opt = Self::group_from_status_str(status_opt);
                 if nid == intent.note {
                     target_cur_group = grp_opt.clone();
                 }
@@ -362,7 +364,14 @@ impl BoardMutationFactsProvider for CanonicalTestBoardPlanner {
                     schema_revision: None,
                     descriptor_fingerprint: ContentDigest::from_bytes([0u8; 32]),
                     group_field: "status".to_owned(),
-                    group_field_kind: BoardGroupFieldKind::String,
+                    group_field_kind: if matches!(
+                        intent.group,
+                        GroupKey::Value(ScalarValue::Number(_))
+                    ) {
+                        BoardGroupFieldKind::Number
+                    } else {
+                        BoardGroupFieldKind::String
+                    },
                     groups,
                     before_placement,
                     base_order_binding: Self::binding_for(&target_slug, &intent.note),

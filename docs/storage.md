@@ -103,9 +103,10 @@ Schema version 7 records a rank anchor at each existing Space's committed head.
 The anchor preserves exactly the live view-rank overlays at upgrade. Rank
 revisions after that head include deletion tombstones, so a projection rebuild
 can distinguish an absent rank from an older live revision. The migration also
-builds a covering chat-entry lookup and breaks oversized reference arrays into
-bounded blocks. Projection readers page through those blocks and validate each
-source entry and target before projecting or returning its backlink.
+builds a covering chat-entry lookup. It reads one legacy reference array at
+a time and stores one indexed row per distinct target and entry, retaining
+the first occurrence's ordinal. Projection readers page through those keys
+and validate each source entry and target before returning its backlink.
 Stop the preceding-version writers before opening a PostgreSQL installation
 for this upgrade. Startup copies the live anchor rows and installs the schema
 under the migration fence in one transaction.

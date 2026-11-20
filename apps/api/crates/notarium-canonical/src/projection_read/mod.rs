@@ -86,13 +86,14 @@ mod metrics {
     }
 
     impl ProjectionReadMetrics {
-        pub(crate) fn measure(&self) -> Option<ReadMeasurement<'_>> {
+        pub(crate) fn measure(&self, operation: &'static str) -> Option<ReadMeasurement<'_>> {
             self.enabled
                 .load(Ordering::Acquire)
                 .then(|| ReadMeasurement {
                     metrics: self,
                     started: Instant::now(),
-                    success: false,
+                    operation,
+                    error: Some("abandoned"),
                 })
         }
 
@@ -126,18 +127,28 @@ mod metrics {
     pub(crate) struct ReadMeasurement<'a> {
         metrics: &'a ProjectionReadMetrics,
         started: Instant,
-        success: bool,
+        operation: &'static str,
+        error: Option<&'static str>,
     }
 
     impl ReadMeasurement<'_> {
-        pub(crate) fn complete(&mut self, success: bool) {
-            self.success = success;
+        pub(crate) fn complete(&mut self, error: Option<&'static str>) {
+            self.error = error;
         }
     }
 
     impl Drop for ReadMeasurement<'_> {
         fn drop(&mut self) {
-            self.metrics.record(self.started.elapsed(), self.success);
+            let elapsed = self.started.elapsed();
+            self.metrics.record(elapsed, self.error.is_none());
+            if let Some(code) = self.error {
+                tracing::warn!(
+                    read = self.operation,
+                    elapsed_ms = elapsed.as_secs_f64() * 1000.0,
+                    code,
+                    "measured canonical read did not complete successfully"
+                );
+            }
         }
     }
 }

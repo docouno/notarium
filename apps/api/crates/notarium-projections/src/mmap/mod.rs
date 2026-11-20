@@ -454,6 +454,22 @@ impl BaseIndexHandle {
         }
     }
 
+    pub(crate) fn retire_superseded(
+        directory: &Path,
+        current: &IndexIdentity,
+        pool: &MmapPool,
+    ) -> Result<(), IndexError> {
+        for (lease, _) in registered_leases(&absolute(directory)?) {
+            if lease.identity.generation == current.generation
+                && lease.identity.scope == current.scope
+                && lease.identity.seq < current.seq
+            {
+                Self(lease).retire(pool);
+            }
+        }
+        Ok(())
+    }
+
     /// Revoke an erased or history-replaced checkpoint before reusing its name.
     /// Outstanding readers must independently honor the canonical revocation.
     /// A failed unlink leaves admissions closed and can be retried by the writer.
@@ -549,22 +565,41 @@ impl BaseIndexHandle {
         let checkpoints = CHECKPOINTS
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let witness = match fs::symlink_metadata(&path) {
+            Ok(meta) if meta.is_file() => FileWitness::from_metadata(&meta),
+            Ok(_) => return Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
+            Err(error) => return Err(error.into()),
+        };
         if path
             .parent()
             .and_then(|directory| checkpoints.get(directory))
             .is_some_and(|entries| {
-                entries
-                    .iter()
-                    .any(|entry| entry.identity == *identity && entry.lease.strong_count() != 0)
+                entries.iter().any(|entry| {
+                    entry.identity == *identity
+                        && entry.witness.as_ref() == Some(&witness)
+                        && entry.lease.strong_count() != 0
+                })
             })
         {
             // A previous runtime may still have a snapshot on this cache.
             // Its marked lease, rather than this sweep, owns the unlink.
             return Ok(false);
         }
-        discard_matching_header(&path, |header, size| {
-            format::matches_header(header, identity, size)
-        })
+        discard_matching_header(&path, |header| format::matches_header(header, identity))
+    }
+
+    /// The erasure barrier revoked matching leases before the directory sweep.
+    /// A matching file must now be unlinked, or the error returned for retry.
+    pub(crate) fn discard_erased_matching(
+        path: &Path,
+        identity: &IndexIdentity,
+    ) -> Result<(), IndexError> {
+        let _mutation = file_mutations();
+        discard_matching_header(&absolute(path)?, |header| {
+            format::matches_header(header, identity)
+        })?;
+        Ok(())
     }
 }
 
@@ -594,10 +629,9 @@ pub(crate) fn discard_abandoned_temp(
     }
     let _mutation = file_mutations();
     let path = absolute(path)?;
-    // A cancelled sweep can outlive the runtime maintenance guard. The
-    // durable floor rejects a publisher for this history below `through`.
-    // Other histories and later cuts cannot satisfy the header witness.
-    match discard_matching_header(&path, |header, _| {
+    // A committed erasure floor or a newer published checkpoint supersedes
+    // this writer. Other histories and later cuts fail the header check.
+    match discard_matching_header(&path, |header| {
         format::matches_temp_header(header, generation, scope, through)
     }) {
         Ok(_) => Ok(()),
@@ -617,7 +651,7 @@ pub(crate) fn discard_abandoned_temp(
 // Callers serialize immutable name mutations while checking and unlinking.
 fn discard_matching_header(
     path: &Path,
-    belongs_to_cut: impl FnOnce(&[u8; format::HEADER_SIZE], u64) -> bool,
+    belongs_to_cut: impl FnOnce(&[u8; format::HEADER_SIZE]) -> bool,
 ) -> Result<bool, IndexError> {
     let directory = path
         .parent()
@@ -649,7 +683,7 @@ fn discard_matching_header(
         Err(error) => return Err(error.into()),
     }
     drop(file);
-    if !belongs_to_cut(&header, metadata.len()) {
+    if !belongs_to_cut(&header) {
         return Ok(false);
     }
     let current = match fs::symlink_metadata(path) {

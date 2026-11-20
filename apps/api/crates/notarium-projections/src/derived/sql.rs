@@ -462,9 +462,17 @@ enum Backend {
 
 pub(super) struct Database(Backend);
 
-type SqlFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, PortError>> + Send + 'a>>;
+pub(super) type SqlFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, PortError>> + Send + 'a>>;
 
 impl Database {
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) fn sqlite_path(&self) -> Option<&Path> {
+        match &self.0 {
+            Backend::Sqlite(sqlite) => Some(&sqlite.path),
+            Backend::Postgres { .. } => None,
+        }
+    }
+
     pub(super) fn postgres_config(&self) -> Option<(PgPool, &str)> {
         match &self.0 {
             Backend::Postgres { pool, schema } => Some((pool.clone(), schema)),
@@ -623,10 +631,8 @@ impl Database {
     {
         match &self.0 {
             Backend::Postgres { pool, schema } => {
-                let mut tx = pool.begin().await.map_err(postgres_error)?;
-                configure_postgres(&mut tx, schema, false).await?;
-                let (result, _) = operation(SqlTransaction::Postgres(&mut tx)).await?;
-                tx.commit().await.map_err(commit_error)?;
+                let mut connection = pool.acquire().await.map_err(postgres_error)?;
+                let (result, _) = write_postgres_on(&mut connection, schema, operation).await?;
                 Ok(result)
             }
             Backend::Sqlite(_) => {
@@ -900,6 +906,18 @@ fn suppress_access_times(directory: &Path) {
     {
         let _ = ioctl_setflags(&dir, flags | IFlags::NOATIME);
     }
+}
+
+pub(super) async fn write_postgres_on<T>(
+    connection: &mut PgConnection,
+    schema: &str,
+    operation: impl for<'a> FnOnce(SqlTransaction<'a>) -> SqlFuture<'a, T>,
+) -> Result<T, PortError> {
+    let mut tx = connection.begin().await.map_err(postgres_error)?;
+    configure_postgres(&mut tx, schema, false).await?;
+    let result = operation(SqlTransaction::Postgres(&mut tx)).await?;
+    tx.commit().await.map_err(commit_error)?;
+    Ok(result)
 }
 
 async fn configure_postgres(

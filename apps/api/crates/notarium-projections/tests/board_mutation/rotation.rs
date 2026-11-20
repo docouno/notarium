@@ -16,6 +16,98 @@ use super::{
 };
 
 #[tokio::test]
+async fn quiet_space_releases_a_superseded_checkpoint_at_cursor_expiry() {
+    use std::time::Duration;
+
+    use notarium_core::{
+        model::LifecycleMask,
+        ports::{NoteQuery, NoteReadPort},
+        query::{Direction, SortColumn, SortKey, SortSpec},
+    };
+    use notarium_projections::ProjectedNoteReadPort;
+
+    use super::{
+        CanonicalConfig, CanonicalRuntime, InstallationId, ProjectionConfig, Scratch,
+        projection_context, random_bytes,
+    };
+
+    let scratch = Scratch::new();
+    let root = scratch.root();
+    let (store, canonical) = CanonicalRuntime::open(CanonicalConfig::local_default(
+        InstallationId::from_bytes(random_bytes()),
+        root.clone(),
+    ))
+    .await
+    .unwrap();
+    let (scope, owner) = open_space(&store).await;
+    for slug in ["first", "second"] {
+        note(&store, &owner, slug, DocClass::UserDoc, slug.into()).await;
+    }
+    let generation = ProjectionGeneration::new(1).unwrap();
+    let runtime = ProjectorRuntime::start_sqlite(
+        store.clone(),
+        projection_context(),
+        root.clone(),
+        generation,
+        ProjectionConfig {
+            retained_read_lifetime: Duration::from_secs(2),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    sync(&store, &runtime, &scope).await;
+    let engine = runtime.engine();
+    let head = store.read_space(&scope.space_id).await.unwrap().last_seq;
+    let path = engine
+        .checkpoint_for_test(&scope, head)
+        .await
+        .unwrap()
+        .path()
+        .to_owned();
+    let page = ProjectedNoteReadPort::new(engine.clone())
+        .list_notes(
+            owner.clone(),
+            ReadRequest::Open {
+                query: NoteQuery {
+                    folder: None,
+                    recursive: false,
+                    classes: DocClass::all(),
+                    lifecycle: LifecycleMask::Active,
+                    filter: FieldFilterAstV1 {
+                        version: 1,
+                        predicate: Predicate::All(Vec::new()),
+                    },
+                    sort: SortSpec::new(vec![SortKey {
+                        column: SortColumn::UpdatedAt,
+                        direction: Direction::Desc,
+                    }])
+                    .unwrap(),
+                    limit: PageLimit::new(1).unwrap(),
+                },
+                causal: CausalBasis::Await(AwaitWatermarks::default()),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(page.children.next.is_some());
+    note(&store, &owner, "third", DocClass::UserDoc, "third".into()).await;
+    let next = store.read_space(&scope.space_id).await.unwrap().last_seq;
+    sync(&store, &runtime, &scope).await;
+    engine.checkpoint_for_test(&scope, next).await.unwrap();
+    assert!(path.is_file(), "the retained cursor pins its checkpoint");
+    tokio::time::timeout(Duration::from_secs(6), async {
+        while path.exists() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("expiry releases the old file without any new projection reads");
+    runtime.shutdown().await.unwrap();
+    canonical.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn sqlite_promotes_lookup_before_reclaiming_the_old_checkpoint() {
     use std::time::Duration;
 
@@ -79,8 +171,7 @@ async fn sqlite_promotes_lookup_before_reclaiming_the_old_checkpoint() {
         .unwrap()
         .try_read()
         .unwrap();
-    let candidate = DerivedStore::open_sqlite(&root, next).await.unwrap();
-    tokio::time::timeout(Duration::from_secs(3), runtime.rotate(candidate, &budget()))
+    tokio::time::timeout(Duration::from_secs(3), runtime.rotate(next, &budget()))
         .await
         .unwrap()
         .unwrap();
@@ -184,10 +275,7 @@ async fn postgres_single_owner_rotation() {
     )
     .await
     .unwrap();
-    let candidate = DerivedStore::open_postgres(pool.clone(), &derived_schema, next)
-        .await
-        .unwrap();
-    exercise(&store, &mut runtime, candidate).await;
+    exercise(&store, &mut runtime, next).await;
     let old_schema = format!("{derived_schema}_g1");
     let old_files = cache.root().derived(initial).with_file_name("spaces");
     tokio::time::timeout(Duration::from_secs(8), async {
@@ -302,7 +390,7 @@ async fn postgres_split_owners_backlinks_and_detached_erasure() {
         .await
         .unwrap();
 
-    let runtime_a = ProjectorRuntime::start(
+    let runtime_a = ProjectorRuntime::start_for_test(
         a.clone(),
         projection_context(),
         derived_a,
@@ -311,7 +399,7 @@ async fn postgres_split_owners_backlinks_and_detached_erasure() {
     )
     .await
     .unwrap();
-    let runtime_b = ProjectorRuntime::start(
+    let runtime_b = ProjectorRuntime::start_for_test(
         b.clone(),
         projection_context(),
         derived_b,
@@ -528,7 +616,7 @@ async fn wait_for_note_change(
 pub(super) async fn exercise(
     store: &CanonicalStore,
     runtime: &mut ProjectorRuntime,
-    candidate: DerivedStore,
+    generation: ProjectionGeneration,
 ) {
     let (scope, owner) = open_space(store).await;
     let view_key = ViewKey::from_bytes([31; 16]);
@@ -656,7 +744,6 @@ pub(super) async fn exercise(
         .expect("retain a cursor at the rotation boundary");
     assert_eq!(token.generation, old_generation);
 
-    let generation = candidate.generation();
     let bus = engine.event_bus();
     let mut stream = bus
         .subscribe(
@@ -669,7 +756,7 @@ pub(super) async fn exercise(
         .await
         .expect("subscribe in the old generation");
     runtime
-        .rotate(candidate, &budget())
+        .rotate(generation, &budget())
         .await
         .expect("activate a caught-up generation");
     let (tail_pause, tail_note, tail_seq) = {

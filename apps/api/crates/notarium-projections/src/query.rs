@@ -15,7 +15,7 @@ use notarium_core::{
     error::{PortError, ValidationReason},
     ids::{ContentDigest, FolderId, NoteId, RevisionId, SpaceSeq},
     model::{HistoryScope, LifecycleMask},
-    ports::{GroupCount, GroupKey, NoteQuery, PageLimit, ViewQuery},
+    ports::{GroupCount, GroupKey, NoteQuery, PageLimit, ViewQuery, ViewRef},
     query::{
         Direction, FieldObservation, FieldSchema, FieldValue, Predicate, SortCell, SortColumn,
         SortSpec, SortTuple,
@@ -549,6 +549,7 @@ pub struct BoardRank {
     pub rank: String,
 }
 
+#[derive(Clone, Copy)]
 pub struct WindowInput<'a> {
     pub index: &'a IndexView,
     pub store: &'a DerivedStore,
@@ -584,6 +585,13 @@ pub struct Selection {
 }
 
 pub async fn select_window(input: WindowInput<'_>) -> Result<Selection, PortError> {
+    select_view_window(input, None).await
+}
+
+pub(crate) async fn select_view_window(
+    input: WindowInput<'_>,
+    rank_view: Option<&ViewRef>,
+) -> Result<Selection, PortError> {
     if input.board && input.group_by.is_none() {
         return Err(invalid_query().into());
     }
@@ -625,17 +633,25 @@ pub async fn select_window(input: WindowInput<'_>) -> Result<Selection, PortErro
             Some(field) => group_partitions(&input, &matching, field)?,
         };
         if let Some(partitions) = partitions {
-            return select_header_window(&input, grouped, &partitions);
+            return select_header_window(&input, grouped, &partitions, rank_view).await;
         }
     }
 
     let mut counts = GroupCounts::new(input.columns);
     let mut window = RowWindow::new(&input, grouped);
     for page in dense_pages(&matching) {
+        let ranks = match rank_view {
+            Some(view) => Some(candidate_ranks(&input, view, &page).await?),
+            None => None,
+        };
+        let base = WindowInput {
+            ranks: ranks.as_ref().unwrap_or(input.ranks),
+            ..input
+        };
         for note in query_rows(&input, &page).await? {
             let fields = note.evaluated_fields()?;
             collect_row(
-                &input,
+                &base,
                 &mut window,
                 &mut counts,
                 note.dense_id,
@@ -655,10 +671,11 @@ pub async fn select_window(input: WindowInput<'_>) -> Result<Selection, PortErro
     Ok(finish_window(rows, groups, input.limit))
 }
 
-fn select_header_window(
+async fn select_header_window(
     input: &WindowInput<'_>,
     grouped: bool,
     partitions: &[(GroupKey, Bitmap)],
+    rank_view: Option<&ViewRef>,
 ) -> Result<Selection, PortError> {
     let mut counts = GroupCounts::new(input.columns);
     let capacity = usize::from(input.limit.get()) + 1;
@@ -668,8 +685,12 @@ fn select_header_window(
             counts.increment(group, ids.cardinality());
         }
         let remaining = capacity - rows.len();
-        if remaining > 0 {
-            rows.extend(header_window(input, ids, group, remaining)?);
+        if remaining > 0 && !ids.is_empty() {
+            rows.extend(if let Some(view) = rank_view {
+                ranked_header_window(input, view, ids, group, remaining).await?
+            } else {
+                header_window(input, ids, group, remaining)?
+            });
         }
     }
     if !input.overlay.is_empty() {
@@ -686,6 +707,177 @@ fn select_header_window(
         Vec::new()
     };
     Ok(finish_window(rows, groups, input.limit))
+}
+
+async fn candidate_ranks(
+    input: &WindowInput<'_>,
+    view: &ViewRef,
+    dense: &[u32],
+) -> Result<BTreeMap<u32, BoardRank>, PortError> {
+    let ids = dense
+        .iter()
+        .map(|&id| input.index.note_id(input.index.dense(id)))
+        .collect::<DomainResult<Vec<_>>>()?;
+    let rows = input
+        .store
+        .candidate_ranks(input.scope, input.cut, view, &ids)
+        .await?;
+    rows.into_iter()
+        .map(|row| {
+            let dense = input
+                .index
+                .dense_id(&row.target_note_id)
+                .ok_or_else(stale_cut)?;
+            Ok((
+                dense,
+                BoardRank {
+                    group: row.group_key()?,
+                    rank: row.sort_rank_lexo,
+                },
+            ))
+        })
+        .collect()
+}
+
+/// Take ranked rows in the group's SQL index order. Read only the rank keys
+/// needed for this page. Exact replacement rows are merged separately.
+async fn ranked_header_window(
+    input: &WindowInput<'_>,
+    view: &ViewRef,
+    ids: &Bitmap,
+    group: &GroupKey,
+    capacity: usize,
+) -> Result<Vec<SelectedRow>, PortError> {
+    let prefix = cursor_prefix(input.columns, group, None);
+    let mut same_group = None;
+    if let Some(after) = input.after {
+        match compare_group_prefix(&prefix, &after.cells)? {
+            Ordering::Less => return Ok(Vec::new()),
+            Ordering::Equal => same_group = Some(after),
+            Ordering::Greater => {}
+        }
+    }
+    // Small selections can address the target primary keys directly even when
+    // the board has many ranks belonging to other filters or grants.
+    if ids.cardinality() <= capacity as u64 && ids.cardinality() <= 200 {
+        let ranks = candidate_ranks(input, view, &ids.to_vec()).await?;
+        return header_window(
+            &WindowInput {
+                ranks: &ranks,
+                ..*input
+            },
+            ids,
+            group,
+            capacity,
+        );
+    }
+    let group_hex = group_key_hex(group)?.1;
+    let mut ranks = BTreeMap::new();
+    let mut ranked = Bitmap::new();
+    let mut start = match same_group {
+        Some(cursor) => {
+            cursor_rank(&cursor.cells)?.map(|rank| (rank.to_owned(), cursor.entity_id.clone()))
+        }
+        None => None,
+    };
+    if same_group.is_none() || start.is_some() {
+        let mut scanned = 0u64;
+        loop {
+            let limit = PageLimit::new(capacity.clamp(1, 200) as u16)?;
+            let page = input
+                .store
+                .group_rank_page(
+                    input.scope,
+                    input.cut,
+                    view,
+                    &group_hex,
+                    start.as_ref().map(|(r, id)| (r.as_str(), id)),
+                    limit,
+                )
+                .await?;
+            scanned += page.len() as u64;
+            let end = page.len() < usize::from(limit.get());
+            start = page
+                .last()
+                .map(|r| (r.sort_rank_lexo.clone(), r.target_note_id.clone()));
+            for r in page {
+                if ranks.len() < capacity
+                    && let Some(dense) = input
+                        .index
+                        .dense_id(&r.target_note_id)
+                        .filter(|id| ids.contains(*id))
+                {
+                    ranked.add(dense);
+                    ranks.insert(
+                        dense,
+                        BoardRank {
+                            group: group.clone(),
+                            rank: r.sort_rank_lexo,
+                        },
+                    );
+                }
+            }
+            if ranks.len() == capacity || end {
+                break;
+            }
+            if scanned >= ids.cardinality() {
+                // Beyond this point, seeking the already-filtered candidates
+                // by target is cheaper than walking unrelated placements.
+                let mut best = BoundedHeap::new(capacity);
+                for page in dense_pages(ids) {
+                    let ranks = candidate_ranks(input, view, &page).await?;
+                    let local = WindowInput {
+                        ranks: &ranks,
+                        ..*input
+                    };
+                    let subset = Bitmap::from(&page[..]);
+                    for row in header_window(&local, &subset, group, capacity)? {
+                        best.push(row, |a, b| {
+                            compare_view_cursor_tuple(input.sort, &a.tuple, &b.tuple)
+                        })?;
+                    }
+                }
+                return Ok(
+                    best.finish(|a, b| compare_view_cursor_tuple(input.sort, &a.tuple, &b.tuple))?
+                );
+            }
+        }
+    }
+    let local = WindowInput {
+        ranks: &ranks,
+        ..*input
+    };
+    let mut rows = header_window(&local, &ranked, group, capacity)?;
+    if rows.len() < capacity {
+        let unranked = if same_group.is_none() {
+            ids.andnot(&ranked)
+        } else {
+            // A continuation sought past earlier ranked rows. Anti-join just
+            // the eligible dense IDs, without retrieving their previous ranks.
+            let mut unranked = Bitmap::new();
+            let mut iter = ids.iter();
+            let mut batch = [0; 2048];
+            loop {
+                let n = iter.next_many(&mut batch);
+                if n == 0 {
+                    break;
+                }
+                let found = input
+                    .store
+                    .unranked_candidates(input.scope, input.cut, view, &group_hex, &batch[..n])
+                    .await?;
+                unranked.add_many(&found);
+            }
+            unranked
+        };
+        rows.extend(header_window(
+            &local,
+            &unranked,
+            group,
+            capacity - rows.len(),
+        )?);
+    }
+    Ok(rows)
 }
 
 fn overlay_window(

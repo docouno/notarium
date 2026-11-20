@@ -11,7 +11,7 @@ use notarium_core::{
 use super::{
     DerivedStore, invalid_row, mismatch, not_ready,
     records::*,
-    sql::{SqlRecord, SqlTransaction, SqlValue, placeholders, value},
+    sql::{Kind, SqlColumn, SqlRecord, SqlTransaction, SqlValue, placeholders, value},
     stale,
 };
 
@@ -87,6 +87,9 @@ impl DerivedStore {
         after: Option<u32>,
         limit: PageLimit,
     ) -> Result<Vec<ProjectedFolder>, PortError> {
+        #[cfg(test)]
+        self.folder_page_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.dense_page(scope, cut, "dense_folder_id", after, limit)
             .await
     }
@@ -98,6 +101,9 @@ impl DerivedStore {
         after: Option<&ProjectedFolderAlias>,
         limit: PageLimit,
     ) -> Result<Vec<ProjectedFolderAlias>, PortError> {
+        #[cfg(test)]
+        self.folder_page_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut args = Vec::new();
         let filter = if let Some(alias) = after {
             if alias.space_id != scope.space_id {
@@ -211,6 +217,108 @@ impl DerivedStore {
             "ORDER BY target_note_id ASC LIMIT ?",
         )
         .await
+    }
+
+    pub(crate) async fn candidate_ranks(
+        &self,
+        scope: &HistoryScope,
+        cut: SpaceSeq,
+        view: &ViewRef,
+        targets: &[NoteId],
+    ) -> Result<Vec<ProjectedViewRank>, PortError> {
+        check_batch(targets.len())?;
+        let mut params = vec![value(&view.note), value(&view.key)];
+        params.extend(targets.iter().map(value));
+        self.at_cut(
+            scope,
+            cut,
+            format!(
+                "view_note_id = ? AND view_key = ? AND target_note_id IN ({})",
+                placeholders(targets.len())
+            ),
+            params,
+            "",
+        )
+        .await
+    }
+
+    pub(crate) async fn group_rank_page(
+        &self,
+        scope: &HistoryScope,
+        cut: SpaceSeq,
+        view: &ViewRef,
+        group: &str,
+        after: Option<(&str, &NoteId)>,
+        limit: PageLimit,
+    ) -> Result<Vec<GroupRankPosition>, PortError> {
+        let mut filter = String::from("view_note_id = ? AND view_key = ? AND group_key_hex = ?");
+        let mut params = vec![
+            value(&view.note),
+            value(&view.key),
+            value(&group.to_owned()),
+        ];
+        if let Some((rank, note)) = after {
+            filter.push_str(" AND (sort_rank_lexo, target_note_id) > (?, ?)");
+            params.extend([value(&rank.to_owned()), value(note)]);
+        }
+        params.push(value(&limit.get()));
+        self.at_cut(
+            scope,
+            cut,
+            filter,
+            params,
+            "ORDER BY sort_rank_lexo, target_note_id LIMIT ?",
+        )
+        .await
+    }
+
+    pub(crate) async fn unranked_candidates(
+        &self,
+        scope: &HistoryScope,
+        cut: SpaceSeq,
+        view: &ViewRef,
+        group: &str,
+        candidates: &[u32],
+    ) -> Result<Vec<u32>, PortError> {
+        let scope = scope.clone();
+        let view = view.clone();
+        let group = group.to_owned();
+        let ids = candidates
+            .iter()
+            .map(|&id| i64::from(id))
+            .collect::<Vec<_>>();
+        self.database
+            .read(move |mut tx| {
+                Box::pin(async move {
+                    let row = watermark(&mut tx, &scope.space_id)
+                        .await?
+                        .ok_or_else(not_ready)?;
+                    assert_cut(&row, &scope, cut)?;
+                    let mut params = vec![value(&scope.space_id)];
+                    let predicate = if tx.postgres() {
+                        params.push(SqlValue::IntArray(ids));
+                        "n.dense_id = ANY(?)".to_owned()
+                    } else {
+                        let marks = placeholders(ids.len());
+                        params.extend(ids.iter().map(value));
+                        format!("n.dense_id IN ({marks})")
+                    };
+                    params.extend([value(&view.note), value(&view.key), value(&group)]);
+                    let sql = format!(
+                        "SELECT n.dense_id FROM projected_notes n
+                WHERE n.space_id = ? AND {predicate} AND NOT EXISTS (
+                SELECT 1 FROM projected_view_ranks r WHERE r.space_id = n.space_id
+                AND r.view_note_id = ? AND r.view_key = ? AND r.group_key_hex = ?
+                AND r.target_note_id = n.note_id)"
+                    );
+                    tx.select(&sql, params, &[Kind::Integer])
+                        .await?
+                        .into_iter()
+                        .map(|mut row| u32::read(row.pop().ok_or_else(invalid_row)?))
+                        .collect()
+                })
+            })
+            .await
     }
 
     pub async fn chat_ref_page(

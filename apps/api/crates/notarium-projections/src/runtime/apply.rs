@@ -55,6 +55,18 @@ pub(super) async fn recover(
     slot: &Arc<SpaceSlot>,
     stop: &Cancellation,
 ) -> Result<Arc<PublishedCut>, PortError> {
+    let current = recover_cut(engine, store, scope, slot, stop).await?;
+    engine.reclaim_superseded_checkpoints(&current).await?;
+    Ok(current)
+}
+
+async fn recover_cut(
+    engine: &ProjectionEngine,
+    store: &DerivedStore,
+    scope: &HistoryScope,
+    slot: &Arc<SpaceSlot>,
+    stop: &Cancellation,
+) -> Result<Arc<PublishedCut>, PortError> {
     slot.check_attached()?;
     let stored = store.watermarks(&scope.space_id).await?;
     if stored.as_ref().is_none_or(|row| row.scope == *scope)
@@ -247,7 +259,7 @@ async fn seed_once(
                 aliases.push(row.clone());
             }
             if let DerivedMutation::UpsertNoteAlias(row) = &mutation {
-                links.add_note_alias(row.clone());
+                links.add_note_alias(row)?;
             }
             mutations.push(mutation);
         }
@@ -327,12 +339,13 @@ async fn seed_once(
     }
     loop {
         check_stop(stop)?;
-        let batch = links.resolve_page(&topology).await?;
+        let batch = links.resolve_page(&scope.space_id, &topology).await?;
         if batch.is_empty() {
             break;
         }
         stage.push(batch).await?;
     }
+    drop(links);
     // Revalidate the exact history before publishing a slow seed. The page call
     // also detects a purge of a pre-existing note after the originally held cut.
     canonical
@@ -431,11 +444,46 @@ fn visibility_cursor_stale() -> PortError {
     DomainError::validation(ValidationReason::CursorStale).into()
 }
 
+/// Private to one serialized feed. A failed command discards this cache with its feed.
+pub(super) struct CommandFolders {
+    rows: FolderCatalog,
+    topology: crate::links::FolderTopology,
+}
+
+async fn load_folder_aliases(
+    store: &DerivedStore,
+    scope: &HistoryScope,
+    seq: SpaceSeq,
+) -> Result<Vec<ProjectedFolderAlias>, PortError> {
+    let mut aliases = Vec::new();
+    let mut after = None;
+    loop {
+        let page = store
+            .folder_alias_page(scope, seq, after.as_ref(), page_limit())
+            .await?;
+        let Some(last) = page.last() else { break };
+        after = Some(last.clone());
+        aliases.extend(page);
+    }
+    Ok(aliases)
+}
+
+#[cfg(test)]
 pub(super) async fn command(
     engine: &ProjectionEngine,
     current: &Arc<PublishedCut>,
     range: CommandSeqRange,
     stop: &Cancellation,
+) -> Result<Applied, PortError> {
+    command_with_folders(engine, current, range, stop, &mut None).await
+}
+
+pub(super) async fn command_with_folders(
+    engine: &ProjectionEngine,
+    current: &Arc<PublishedCut>,
+    range: CommandSeqRange,
+    stop: &Cancellation,
+    cached: &mut Option<CommandFolders>,
 ) -> Result<Applied, PortError> {
     const BUFFERED_NOTE_LIMIT: usize = 200;
 
@@ -554,163 +602,119 @@ pub(super) async fn command(
         || !folder_aliases.is_empty()
         || schema_change.is_some();
 
-    let (fields, mut delta, mut replay, bulk_folder_move, links) = if !structural_change {
-        // Pure chat / board-rank commands leave folders, notes, links and L0
-        // postings unchanged; skip topology loading and mmap opening.
-        (
-            Arc::clone(&current.fields),
-            Some((*current.delta).clone()),
-            replay::ChangedSlots::default(),
-            false,
-            link_apply::LinkApply::default(),
-        )
-    } else {
-        let changed_folders = folder_updates.keys().cloned().collect::<Vec<_>>();
-        let mut folders = load_folders(store, scope, after_seq).await?;
-        let mut next_folder_aliases = Vec::new();
-        let mut after = None;
-        loop {
-            let page = store
-                .folder_alias_page(scope, after_seq, after.as_ref(), page_limit())
-                .await?;
-            if page.is_empty() {
-                break;
-            }
-            after = page.last().cloned();
-            next_folder_aliases.extend(page);
-        }
-        let topology_changed = !folder_updates.is_empty() || !folder_aliases.is_empty();
-        let old_topology = link_apply::build_topology(
-            &watermark.root_folder_id,
-            &folders,
-            next_folder_aliases.iter().cloned(),
-        )?;
-        let old_folders = FolderCatalog {
-            rows: folders.rows.clone(),
-        };
-        let new_topology = if topology_changed {
-            next_folder_aliases.extend(folder_aliases);
-            for folder in folder_updates.into_values() {
-                folders.put(scope, folder, &mut watermark.next_dense_folder_id, None)?;
-            }
-            folders.refresh_paths()?;
-            Some(link_apply::build_topology(
-                &watermark.root_folder_id,
-                &folders,
-                next_folder_aliases,
-            )?)
-        } else {
-            None
-        };
-        let topology = new_topology.as_ref().unwrap_or(&old_topology);
-        let old_folders_ref = &old_folders;
-        let fields = if let Some(schema) = &schema_change {
-            watermark.schema = schema.as_ref().map(persisted_schema).transpose()?;
-            Arc::new(
-                schema
-                    .as_ref()
-                    .map(|schema| schema.fields.clone())
-                    .unwrap_or_default(),
+    let (fields, mut delta, mut replay, bulk_folder_move, links) =
+        if !structural_change {
+            // Pure chat / board-rank commands leave folders, notes, links and L0
+            // postings unchanged; skip topology loading and mmap opening.
+            (
+                Arc::clone(&current.fields),
+                Some((*current.delta).clone()),
+                replay::ChangedSlots::default(),
+                false,
+                link_apply::LinkApply::default(),
             )
         } else {
-            Arc::clone(&current.fields)
-        };
-        let mut delta = Some((*current.delta).clone());
-        let mut replay = replay::ChangedSlots::default();
-        let index = engine.open_index_async(current).await?;
-        let mut link_stage =
-            link_apply::LinkStage::new(store, scope.clone(), &old_topology, topology);
-        let mut pending = croaring::Bitmap::new();
-        for note_id in &purged {
-            let old = store.note_by_id(scope, after_seq, note_id).await?;
-            if old.is_none() && index.dense_id(note_id).is_some() {
-                // The synchronous erasure barrier already deleted the source data.
-                // Rebuild from the new complete cut rather than guessing old keys.
-                return Err(DomainError::validation(ValidationReason::PurgeResync).into());
-            }
-            if let Some(row) = &old {
-                pending.add(row.dense_id);
-                count_note_with_location(
-                    &mut folders,
-                    row,
-                    &old_folders_ref.location(&row.parent_folder_id)?,
-                    false,
-                )?;
-            }
-            if let Some(dense) = index.dense_id(note_id)
-                && let Some(delta) = &mut delta
-            {
-                delta.remove_note(dense);
-            }
-            for folder in folders.rows.values_mut() {
-                if folder.cover_note_id.as_ref() == Some(note_id) {
-                    folder.cover_note_id = None;
-                }
-            }
-            link_stage.record_change(old.as_ref(), None, None).await?;
-            sink.push(vec![DerivedMutation::PurgeNote(note_id.clone())])
-                .await?;
-        }
-
-        if has_notes || has_note_aliases {
-            if !notes_spilled {
-                for alias in &buffered_note_aliases {
-                    link_stage.record_alias(alias);
-                }
-                for note in buffered_notes {
-                    check_stop(stop)?;
-                    apply_command_note(
-                        engine,
-                        store,
-                        scope,
-                        after_seq,
-                        cutoff,
-                        *note,
-                        &purged,
-                        old_folders_ref,
-                        &mut folders,
-                        &fields,
-                        &mut watermark,
-                        &mut delta,
-                        &mut replay,
-                        &mut pending,
-                        &mut link_stage,
-                        &mut sink,
-                    )
-                    .await?;
-                }
+            let changed_folders = folder_updates.keys().cloned().collect::<Vec<_>>();
+            let topology_changed = !folder_updates.is_empty() || !folder_aliases.is_empty();
+            let mut aliases = if cached.is_none() || topology_changed {
+                load_folder_aliases(store, scope, after_seq).await?
             } else {
-                let mut page_after = None;
-                loop {
-                    check_stop(stop)?;
-                    let page = engine
-                        .canonical
-                        .read_projection_delta_batch(
-                            &ctx,
-                            scope,
-                            after_seq,
-                            cutoff,
-                            page_after,
-                            page_limit(),
-                        )
-                        .await?;
-                    for item in page.rows {
-                        let note = match item {
-                            ProjectionDelta::Note(note) => note,
-                            ProjectionDelta::Ability(ability) => match ability.note {
-                                Some(note) => note,
-                                None => continue,
-                            },
-                            ProjectionDelta::Alias(alias @ ProjectionAlias::Note(_)) => {
-                                if let DerivedMutation::UpsertNoteAlias(row) =
-                                    alias_mutation(scope, alias)
-                                {
-                                    link_stage.record_alias(&row);
-                                }
-                                continue;
-                            }
-                            _ => continue,
-                        };
+                Vec::new()
+            };
+            let CommandFolders {
+                rows: mut folders,
+                topology: old_topology,
+            } = match cached.take() {
+                Some(known) => known,
+                None => {
+                    let rows = load_folders(store, scope, after_seq).await?;
+                    let topology = link_apply::build_topology(
+                        &watermark.root_folder_id,
+                        &rows,
+                        aliases.iter().cloned(),
+                    )?;
+                    CommandFolders { rows, topology }
+                }
+            };
+            // Ordinary note edits change counts only on their old and new ancestors.
+            let mut previous_counts = BTreeMap::new();
+            let old_folders = (topology_changed || schema_change.is_some() || !purged.is_empty())
+                .then(|| FolderCatalog {
+                    rows: folders.rows.clone(),
+                });
+            let new_topology = if topology_changed {
+                aliases.extend(folder_aliases);
+                for folder in folder_updates.into_values() {
+                    folders.put(scope, folder, &mut watermark.next_dense_folder_id, None)?;
+                }
+                folders.refresh_paths()?;
+                Some(link_apply::build_topology(
+                    &watermark.root_folder_id,
+                    &folders,
+                    aliases,
+                )?)
+            } else {
+                None
+            };
+            let topology = new_topology.as_ref().unwrap_or(&old_topology);
+            let old_folders_ref = old_folders.as_ref();
+            let fields = if let Some(schema) = &schema_change {
+                watermark.schema = schema.as_ref().map(persisted_schema).transpose()?;
+                Arc::new(
+                    schema
+                        .as_ref()
+                        .map(|schema| schema.fields.clone())
+                        .unwrap_or_default(),
+                )
+            } else {
+                Arc::clone(&current.fields)
+            };
+            let mut delta = Some((*current.delta).clone());
+            let mut replay = replay::ChangedSlots::default();
+            let index = engine.open_index_async(current).await?;
+            let mut link_stage =
+                link_apply::LinkStage::new(store, scope.clone(), &old_topology, topology);
+            let mut pending = croaring::Bitmap::new();
+            for note_id in &purged {
+                let old = store.note_by_id(scope, after_seq, note_id).await?;
+                if old.is_none() && index.dense_id(note_id).is_some() {
+                    // The synchronous erasure barrier already deleted the source data.
+                    // Rebuild from the new complete cut rather than guessing old keys.
+                    return Err(DomainError::validation(ValidationReason::PurgeResync).into());
+                }
+                if let Some(row) = &old {
+                    pending.add(row.dense_id);
+                    count_note_with_location(
+                        &mut folders,
+                        row,
+                        &old_folders_ref
+                            .expect("purge saved old folders")
+                            .location(&row.parent_folder_id)?,
+                        false,
+                    )?;
+                }
+                if let Some(dense) = index.dense_id(note_id)
+                    && let Some(delta) = &mut delta
+                {
+                    delta.remove_note(dense);
+                }
+                for folder in folders.rows.values_mut() {
+                    if folder.cover_note_id.as_ref() == Some(note_id) {
+                        folder.cover_note_id = None;
+                    }
+                }
+                link_stage.record_change(old.as_ref(), None, None).await?;
+                sink.push(vec![DerivedMutation::PurgeNote(note_id.clone())])
+                    .await?;
+            }
+
+            if has_notes || has_note_aliases {
+                if !notes_spilled {
+                    for alias in &buffered_note_aliases {
+                        link_stage.record_alias(alias)?;
+                    }
+                    for note in buffered_notes {
+                        check_stop(stop)?;
                         apply_command_note(
                             engine,
                             store,
@@ -720,6 +724,7 @@ pub(super) async fn command(
                             *note,
                             &purged,
                             old_folders_ref,
+                            &mut previous_counts,
                             &mut folders,
                             &fields,
                             &mut watermark,
@@ -731,127 +736,199 @@ pub(super) async fn command(
                         )
                         .await?;
                     }
-                    page_after = page.next;
-                    if page_after.is_none() {
-                        break;
-                    }
-                }
-            }
-        }
-
-        let mut bulk_folder_move = false;
-        if schema_change.is_none()
-            && !has_notes
-            && purged.is_empty()
-            && boards.is_empty()
-            && !has_note_aliases
-            && !thread_changed
-            && let Some(delta) = &mut delta
-        {
-            bulk_folder_move = folder_move::apply_active_move(
-                old_folders_ref,
-                &mut folders,
-                &changed_folders,
-                &index,
-                delta,
-            )?;
-        }
-        if !bulk_folder_move && (schema_change.is_some() || !changed_folders.is_empty()) {
-            let mut affected = croaring::Bitmap::new();
-            if schema_change.is_none() {
-                for folder in changed_folders {
-                    let Some(old) = old_folders_ref.rows.get(&folder) else {
-                        continue;
-                    };
-                    let Some(new) = folders.rows.get(&folder) else {
-                        continue;
-                    };
-                    if old.parent_folder_id != new.parent_folder_id
-                        || old.lifecycle != new.lifecycle
-                    {
-                        affected.or_inplace(
-                            &index
-                                .posting(&PostingKey::FolderSubtree(old.dense_folder_id))
-                                .map_err(checkpoint_error)?,
-                        );
-                    }
-                }
-            }
-            let mut rows = affected.iter();
-            let mut after = None;
-            loop {
-                check_stop(stop)?;
-                let page = if schema_change.is_some() {
-                    store
-                        .notes_page(scope, after_seq, after, page_limit())
-                        .await?
                 } else {
-                    let mut keys = rows.by_ref().take(200).collect::<Vec<_>>();
-                    if keys.is_empty() {
-                        break;
-                    }
-                    keys.retain(|dense| !pending.contains(*dense));
-                    if keys.is_empty() {
-                        continue;
-                    }
-                    store
-                        .hydrate(scope, after_seq, &keys)
-                        .await?
-                        .into_iter()
-                        .flatten()
-                        .collect()
-                };
-                if page.is_empty() {
-                    break;
-                }
-                after = page.last().map(|row| row.dense_id);
-                for mut row in page
-                    .into_iter()
-                    .filter(|row| !pending.contains(row.dense_id))
-                {
-                    let old = old_folders_ref.location(&row.parent_folder_id)?;
-                    let current = folders.location(&row.parent_folder_id)?;
-                    if old.trashed != current.trashed || old.ids != current.ids {
-                        count_note_with_location(&mut folders, &row, &old, false)?;
-                        count_note_with_location(&mut folders, &row, &current, true)?;
-                    }
-                    if old.trashed != current.trashed {
-                        link_stage
-                            .record_change(Some(&row), Some(&row), None)
+                    let mut page_after = None;
+                    loop {
+                        check_stop(stop)?;
+                        let page = engine
+                            .canonical
+                            .read_projection_delta_batch(
+                                &ctx,
+                                scope,
+                                after_seq,
+                                cutoff,
+                                page_after,
+                                page_limit(),
+                            )
                             .await?;
-                    }
-                    let views = schema_change
-                        .is_some()
-                        .then(|| reevaluate(&mut row, &fields))
-                        .transpose()?;
-                    if let Some(active) = &mut delta
-                        && (views.is_some()
-                            || old.dense != current.dense
-                            || old.trashed != current.trashed)
-                    {
-                        index_note(&row, &current, |note| active.replace_note(note))?;
-                        replay.note(row.dense_id);
-                    }
-                    enforce_l0_budget(&mut delta);
-                    if let Some(views) = views {
-                        sink.push(note_mutations(
-                            NoteProjection {
-                                row,
-                                views,
-                                links: Vec::new(),
-                            },
-                            watermark.schema.as_ref(),
-                        )?)
-                        .await?;
+                        for item in page.rows {
+                            let note = match item {
+                                ProjectionDelta::Note(note) => note,
+                                ProjectionDelta::Ability(ability) => match ability.note {
+                                    Some(note) => note,
+                                    None => continue,
+                                },
+                                ProjectionDelta::Alias(alias @ ProjectionAlias::Note(_)) => {
+                                    if let DerivedMutation::UpsertNoteAlias(row) =
+                                        alias_mutation(scope, alias)
+                                    {
+                                        link_stage.record_alias(&row)?;
+                                    }
+                                    continue;
+                                }
+                                _ => continue,
+                            };
+                            apply_command_note(
+                                engine,
+                                store,
+                                scope,
+                                after_seq,
+                                cutoff,
+                                *note,
+                                &purged,
+                                old_folders_ref,
+                                &mut previous_counts,
+                                &mut folders,
+                                &fields,
+                                &mut watermark,
+                                &mut delta,
+                                &mut replay,
+                                &mut pending,
+                                &mut link_stage,
+                                &mut sink,
+                            )
+                            .await?;
+                        }
+                        page_after = page.next;
+                        if page_after.is_none() {
+                            break;
+                        }
                     }
                 }
             }
-        }
-        for (id, folder) in &folders.rows {
-            if old_folders.rows.get(id) != Some(folder) {
+
+            let mut bulk_folder_move = false;
+            if schema_change.is_none()
+                && !has_notes
+                && purged.is_empty()
+                && boards.is_empty()
+                && !has_note_aliases
+                && !thread_changed
+                && let Some(delta) = &mut delta
+                && let Some(old_folders_ref) = old_folders_ref
+            {
+                bulk_folder_move = folder_move::apply_active_move(
+                    old_folders_ref,
+                    &mut folders,
+                    &changed_folders,
+                    &index,
+                    delta,
+                )?;
+            }
+            if !bulk_folder_move && (schema_change.is_some() || !changed_folders.is_empty()) {
+                let old_folders_ref =
+                    old_folders_ref.expect("folder or schema changes saved old folders");
+                let mut affected = croaring::Bitmap::new();
+                if schema_change.is_none() {
+                    for folder in changed_folders {
+                        let Some(old) = old_folders_ref.rows.get(&folder) else {
+                            continue;
+                        };
+                        let Some(new) = folders.rows.get(&folder) else {
+                            continue;
+                        };
+                        if old.parent_folder_id != new.parent_folder_id
+                            || old.lifecycle != new.lifecycle
+                        {
+                            affected.or_inplace(
+                                &index
+                                    .posting(&PostingKey::FolderSubtree(old.dense_folder_id))
+                                    .map_err(checkpoint_error)?,
+                            );
+                        }
+                    }
+                }
+                let mut rows = affected.iter();
+                let mut after = None;
+                loop {
+                    check_stop(stop)?;
+                    let page = if schema_change.is_some() {
+                        store
+                            .notes_page(scope, after_seq, after, page_limit())
+                            .await?
+                    } else {
+                        let mut keys = rows.by_ref().take(200).collect::<Vec<_>>();
+                        if keys.is_empty() {
+                            break;
+                        }
+                        keys.retain(|dense| !pending.contains(*dense));
+                        if keys.is_empty() {
+                            continue;
+                        }
+                        store
+                            .hydrate(scope, after_seq, &keys)
+                            .await?
+                            .into_iter()
+                            .flatten()
+                            .collect()
+                    };
+                    if page.is_empty() {
+                        break;
+                    }
+                    after = page.last().map(|row| row.dense_id);
+                    for mut row in page
+                        .into_iter()
+                        .filter(|row| !pending.contains(row.dense_id))
+                    {
+                        let old = old_folders_ref.location(&row.parent_folder_id)?;
+                        let current = folders.location(&row.parent_folder_id)?;
+                        if old.trashed != current.trashed || old.ids != current.ids {
+                            count_note_with_location(&mut folders, &row, &old, false)?;
+                            count_note_with_location(&mut folders, &row, &current, true)?;
+                        }
+                        if old.trashed != current.trashed {
+                            link_stage
+                                .record_change(Some(&row), Some(&row), None)
+                                .await?;
+                        }
+                        let views = schema_change
+                            .is_some()
+                            .then(|| reevaluate(&mut row, &fields))
+                            .transpose()?;
+                        if let Some(active) = &mut delta
+                            && (views.is_some()
+                                || old.dense != current.dense
+                                || old.trashed != current.trashed)
+                        {
+                            index_note(&row, &current, |note| active.replace_note(note))?;
+                            replay.note(row.dense_id);
+                        }
+                        enforce_l0_budget(&mut delta);
+                        if let Some(views) = views {
+                            sink.push(note_mutations(
+                                NoteProjection {
+                                    row,
+                                    views,
+                                    links: Vec::new(),
+                                },
+                                watermark.schema.as_ref(),
+                            )?)
+                            .await?;
+                        }
+                    }
+                }
+            }
+            let changed_rows: Vec<_> = if let Some(old) = old_folders {
+                folders
+                    .rows
+                    .iter()
+                    .filter_map(|(id, row)| (old.rows.get(id) != Some(row)).then_some(row))
+                    .collect()
+            } else {
+                previous_counts
+                    .iter()
+                    .filter_map(|(id, count)| {
+                        folders
+                            .rows
+                            .get(id)
+                            .filter(|row| row.active_note_count != *count)
+                    })
+                    .collect()
+            };
+            for folder in changed_rows {
                 if let Some(active) = &mut delta {
                     active
-                        .replace_folder(folder.dense_folder_id, id, folder.lifecycle)
+                        .replace_folder(folder.dense_folder_id, &folder.folder_id, folder.lifecycle)
                         .map_err(checkpoint_error)?;
                     replay.folder(folder.dense_folder_id);
                 }
@@ -859,10 +936,13 @@ pub(super) async fn command(
                 sink.push(vec![DerivedMutation::UpsertFolder(folder.clone())])
                     .await?;
             }
-        }
-        let links = link_stage.finish(&mut sink, &[], stop).await?;
-        (fields, delta, replay, bulk_folder_move, links)
-    };
+            let links = link_stage.finish(&mut sink, stop).await?;
+            *cached = Some(CommandFolders {
+                rows: folders,
+                topology: new_topology.unwrap_or(old_topology),
+            });
+            (fields, delta, replay, bulk_folder_move, links)
+        };
     delta_chats(engine, scope, after_seq, cutoff, &mut sink, stop).await?;
     check_stop(stop)?;
     // Large bitmap-wide moves and erasures rebuild from current derived rows.
@@ -896,6 +976,7 @@ pub(super) async fn command(
     enforce_l0_budget(&mut delta);
     let force_checkpoint = delta.is_none();
     let mut cut = Arc::new(PublishedCut {
+        handoff_graph_source: Weak::new(),
         slot: current.slot.clone(),
         cut: SnapshotCut {
             scope: scope.clone(),
@@ -943,7 +1024,8 @@ async fn apply_command_note(
     cutoff: SpaceSeq,
     note: ProjectionNote,
     purged: &BTreeSet<NoteId>,
-    old_folders: &FolderCatalog,
+    old_folders: Option<&FolderCatalog>,
+    previous_counts: &mut BTreeMap<FolderId, u64>,
     folders: &mut FolderCatalog,
     fields: &BTreeMap<String, notarium_core::query::FieldSchema>,
     watermark: &mut ProjectionWatermark,
@@ -954,24 +1036,24 @@ async fn apply_command_note(
     sink: &mut CommandSink<'_>,
 ) -> Result<(), PortError> {
     let id = &note.metadata.note_id;
-    if purged.contains(id) || !link_stage.first_note(id) {
+    if purged.contains(id) || !link_stage.first_note(id)? {
         return Ok(());
     }
     let old = store.note_by_id(scope, after_seq, id).await?;
     let dense = match &old {
         Some(old) => {
-            count_note_with_location(
-                folders,
-                old,
-                &old_folders.location(&old.parent_folder_id)?,
-                false,
-            )?;
+            let location = old_folders
+                .unwrap_or(folders)
+                .location(&old.parent_folder_id)?;
+            remember_counts(folders, &location, previous_counts);
+            count_note_with_location(folders, old, &location, false)?;
             old.dense_id
         }
         None => allocate_dense(&mut watermark.next_dense_id)?,
     };
     let outcome = prepare_note(engine, scope, cutoff, note, dense, folders, fields).await?;
     let location = folders.location(&outcome.row.parent_folder_id)?;
+    remember_counts(folders, &location, previous_counts);
     count_note_with_location(folders, &outcome.row, &location, true)?;
     if let Some(active) = delta {
         index_note(&outcome.row, &location, |note| active.replace_note(note))?;
@@ -1010,6 +1092,18 @@ async fn prepare_note(
         .read_projection_note_carrier(&engine.projection_context(), scope, cutoff, &note)
         .await?;
     project_note(scope, note, dense, &location, source.as_deref(), fields)
+}
+
+fn remember_counts(
+    folders: &FolderCatalog,
+    location: &super::records::FolderLocation,
+    before: &mut BTreeMap<FolderId, u64>,
+) {
+    for id in &location.ids {
+        if let Some(row) = folders.rows.get(id) {
+            before.entry(id.clone()).or_insert(row.active_note_count);
+        }
+    }
 }
 
 fn count_note(
@@ -1328,6 +1422,7 @@ pub(super) enum CommandSink<'a> {
         store: &'a DerivedStore,
         key: StageKey,
         mutations: Vec<DerivedMutation>,
+        bytes: usize,
     },
     Staged(Stage<'a>),
 }
@@ -1342,6 +1437,7 @@ impl<'a> CommandSink<'a> {
                 last,
             },
             mutations: Vec::new(),
+            bytes: 0,
         }
     }
 
@@ -1354,18 +1450,25 @@ impl<'a> CommandSink<'a> {
                 store,
                 key,
                 mutations: pending,
+                bytes,
             } => {
-                if pending.len().saturating_add(mutations.len()) <= DIRECT_MUTATION_LIMIT {
+                let size = mutations.iter().fold(*bytes, |sum, row| {
+                    sum.saturating_add(crate::derived::approx_mutation_bytes(row))
+                });
+                if pending.len().saturating_add(mutations.len()) <= DIRECT_MUTATION_LIMIT
+                    && size <= crate::derived::MAX_STAGE_BYTES
+                {
+                    *bytes = size;
                     pending.extend(mutations);
                     return Ok(());
                 }
                 let store = *store;
                 let key = key.clone();
-                let mut existing = std::mem::take(pending);
-                existing.extend(mutations);
+                let existing = std::mem::take(pending);
                 store.discard_staging(&key.scope).await?;
                 let mut stage = Stage::new(store, &key.scope, key.first, key.last);
                 stage.push(existing).await?;
+                stage.push(mutations).await?;
                 *self = Self::Staged(stage);
                 Ok(())
             }
@@ -1480,12 +1583,18 @@ pub(super) async fn checkpoint(
     if !reclaim_unpublished_head(engine, &current.store, &watermark).await? {
         return Err(DomainError::validation(ValidationReason::NotReady).into());
     }
-    let old_index = engine.open_index_async(current).await.ok();
+    // A forced compaction has discarded L0, including any settlement newer
+    // than the mmap. Use durable memberships when no complete overlay remains.
+    let previous = if current.delta.is_empty() {
+        None
+    } else {
+        engine.open_index_async(current).await.ok()
+    };
     let base = write_checkpoint(
         engine,
         &current.store,
         &mut watermark,
-        old_index.as_ref(),
+        previous.as_ref(),
         settle,
         stop,
     )
@@ -1759,6 +1868,7 @@ async fn publish_cut(
         slot.lookup_bound.store(true, Ordering::Release);
     }
     Ok(Arc::new(PublishedCut {
+        handoff_graph_source: Weak::new(),
         slot: Arc::downgrade(slot),
         cut: SnapshotCut {
             scope: scope.clone(),
@@ -1817,6 +1927,7 @@ pub(super) async fn bind_prefetched_cut(
     cut.canonical_seq = live.try_read()?.head();
     slot.lookup_bound.store(true, Ordering::Release);
     Ok(Arc::new(PublishedCut {
+        handoff_graph_source: Weak::new(),
         slot: Arc::downgrade(slot),
         cut,
         watermark: prefetched.watermark.clone(),

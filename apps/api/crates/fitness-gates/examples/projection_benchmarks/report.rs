@@ -2,7 +2,7 @@ use std::io;
 
 use serde::{Deserialize, Serialize};
 
-pub(crate) const REPORT_VERSION: u8 = 3;
+pub(crate) const REPORT_VERSION: u8 = 4;
 pub(crate) const MICROPROFILE_SCOPE: &str =
     "synthetic_checkpoint_planner_and_50_row_sqlite_hydration";
 pub(crate) const CORPUS_NOTES: usize = 100_000;
@@ -92,6 +92,8 @@ pub(crate) struct BackendMeasurements {
     pub cold_checkpoint_open: Timing,
     pub warm_board: Timing,
     pub cold_board: Timing,
+    pub warm_ranked_board: Timing,
+    pub cold_ranked_board: Timing,
     pub neighborhood: Timing,
     pub replayed_tail_notes: usize,
     pub tail_replay_ns: u64,
@@ -100,6 +102,8 @@ pub(crate) struct BackendMeasurements {
     pub stale_frames: usize,
     pub rebuild_ns: u64,
     pub max_rebuild_read_ns: u64,
+    pub rebuild_read_transactions: u64,
+    pub failed_rebuild_reads: u64,
     pub rebuild_sqlite_busy: u64,
     pub identical_rebuild: bool,
     pub unqualified_move_rewrites: usize,
@@ -295,6 +299,18 @@ impl BackendMeasurements {
             ),
             ("warm board", &self.warm_board, 5 * MS, false),
             ("cold board", &self.cold_board, 15 * MS, true),
+            (
+                "warm rank-materialized board",
+                &self.warm_ranked_board,
+                5 * MS,
+                false,
+            ),
+            (
+                "cold rank-materialized board",
+                &self.cold_ranked_board,
+                15 * MS,
+                true,
+            ),
             ("two-hop neighborhood", &self.neighborhood, MS, false),
         ] {
             timing.check(&format!("{label} {operation}"), limit, inclusive, failures);
@@ -320,13 +336,17 @@ impl BackendMeasurements {
         expect(
             (1..=120_000 * MS).contains(&self.rebuild_ns)
                 && (1..250 * MS).contains(&self.max_rebuild_read_ns)
+                && self.rebuild_read_transactions > 0
+                && self.failed_rebuild_reads == 0
                 && self.rebuild_sqlite_busy == 0
                 && self.identical_rebuild,
             failures,
             format!(
-                "{label} rebuild: {} ns elapsed (budget <= 120s), {} ns maximum read, {} busy, equivalent={}",
+                "{label} rebuild: {} ns elapsed (budget <= 120s), {} ns maximum read, {}/{} failed reads, {} busy, equivalent={}",
                 self.rebuild_ns,
                 self.max_rebuild_read_ns,
+                self.failed_rebuild_reads,
+                self.rebuild_read_transactions,
                 self.rebuild_sqlite_busy,
                 self.identical_rebuild
             ),
