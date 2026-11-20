@@ -283,7 +283,7 @@ pub(super) async fn erase_window(
     };
     let purged = !erasures.purged.is_empty();
     if purged || !erasures.redacted.is_empty() {
-        cleanup.erase_visibility(&erasures).await?;
+        cleanup.erase_visibility(store, &erasures).await?;
     }
     Ok(purged)
 }
@@ -450,7 +450,7 @@ pub(super) async fn refresh(
         && (!patch.erasures.purged.is_empty() || !patch.erasures.redacted.is_empty())
     {
         cleanup
-            .erase_visibility(&patch.erasures)
+            .erase_visibility(store, &patch.erasures)
             .await
             .map_err(RefreshError::Cleanup)?;
     }

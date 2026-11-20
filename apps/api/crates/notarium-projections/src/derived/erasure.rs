@@ -1,12 +1,7 @@
 use std::collections::BTreeSet;
 
-use notarium_canonical::ProjectionErasures;
-use notarium_core::{
-    epoch::DataRoot,
-    error::PortError,
-    ids::{ProjectionGeneration, SpaceSeq},
-    model::HistoryScope,
-};
+use notarium_canonical::{CanonicalStore, ProjectionErasures};
+use notarium_core::{epoch::DataRoot, error::PortError, ids::ProjectionGeneration};
 use sqlx::PgPool;
 
 use super::{
@@ -29,7 +24,7 @@ pub(crate) struct PostgresEraser {
 
 #[derive(Default)]
 pub(crate) struct CheckpointErasures {
-    pub(crate) reconciled: Vec<(ProjectionGeneration, HistoryScope, SpaceSeq)>,
+    pub(crate) reconciled: Vec<ProjectionGeneration>,
     pub(crate) retired: Vec<ProjectionGeneration>,
     pub(crate) unreconciled: Vec<ProjectionGeneration>,
 }
@@ -55,18 +50,20 @@ impl PostgresEraser {
     pub(crate) async fn erase(
         &self,
         root: &DataRoot,
+        canonical: &CanonicalStore,
         erasures: &ProjectionErasures,
     ) -> Result<CheckpointErasures, PortError> {
         let mut affected = CheckpointErasures::default();
         for generation in postgres_generation_inventory(&self.pool, &self.prefix).await? {
             let schema = format!("{}_g{}", self.prefix, generation.get());
             let erasures = erasures.clone();
+            let canonical = canonical.clone();
             let outcome = Database::write_existing_postgres(&self.pool, &schema, move |mut tx| {
                 Box::pin(async move {
                     match erasure_layout(&mut tx, generation).await? {
                         Some(SCHEMA_VERSION) => {
-                            let (scope, through) = erase_committed(&mut tx, &erasures).await?;
-                            Ok(ErasureOutcome::Reconciled(scope, through))
+                            erase_committed(&mut tx, &canonical, &erasures).await?;
+                            Ok(ErasureOutcome::Reconciled)
                         }
                         Some(_) => Ok(ErasureOutcome::Obsolete),
                         None => Ok(ErasureOutcome::Empty),
@@ -75,8 +72,8 @@ impl PostgresEraser {
             })
             .await?;
             match outcome {
-                Some(ErasureOutcome::Reconciled(scope, through)) => {
-                    affected.reconciled.push((generation, scope, through));
+                Some(ErasureOutcome::Reconciled) => {
+                    affected.reconciled.push(generation);
                 }
                 Some(ErasureOutcome::Obsolete) => {
                     self.remove_closed_generation(root, generation).await?;
@@ -85,8 +82,7 @@ impl PostgresEraser {
             }
         }
         if !erasures.purged.is_empty() {
-            let reconciled: BTreeSet<_> =
-                affected.reconciled.iter().map(|(id, _, _)| *id).collect();
+            let reconciled: BTreeSet<_> = affected.reconciled.iter().copied().collect();
             // A peer can reclaim shared SQL while this owner still has
             // file-only lookup leases. The local inventory is independent.
             for generation in GenerationFiles::inventory(root).await? {
@@ -123,7 +119,7 @@ impl PostgresEraser {
 
 enum ErasureOutcome {
     Empty,
-    Reconciled(HistoryScope, SpaceSeq),
+    Reconciled,
     Obsolete,
 }
 

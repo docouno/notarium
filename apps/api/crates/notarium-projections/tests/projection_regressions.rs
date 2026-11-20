@@ -790,6 +790,126 @@ async fn folder_by_path_ignores_trashed_collision_and_list_notes_hydrates_cover_
 }
 
 #[tokio::test]
+async fn lagged_folder_visibility_yields_to_writers_and_rejects_a_mixed_head() {
+    use std::{future::poll_fn, task::Poll};
+
+    use notarium_core::{
+        error::ValidationReason,
+        ports::{GraphQuery, GraphTier},
+    };
+
+    let scratch = Scratch::new();
+    let root = scratch.root();
+    let (store, canonical) = CanonicalRuntime::open(CanonicalConfig::local_default(
+        InstallationId::from_bytes(rand16()),
+        root.clone(),
+    ))
+    .await
+    .unwrap();
+    let (scope, owner) = open_space(&store, SpaceKind::Personal).await;
+    let (project, _) = create_folder(&store, &owner, None, "project", true).await;
+    let (sub, sub_rev) = create_folder(&store, &owner, Some(project.clone()), "sub", false).await;
+    for i in 0..40 {
+        create_note(
+            &store,
+            &owner,
+            Some(sub.clone()),
+            &format!("card-{i}"),
+            DocClass::UserDoc,
+            "Card".into(),
+        )
+        .await;
+    }
+    let mut grants = owner.auth().spaces().clone();
+    grants.get_mut(&scope.space_id).unwrap().project_root = Some(project.clone());
+    let auth = EngineAuthContext::for_human(VerifiedHuman::attest(
+        owner.auth().principal().clone(),
+        GrantId::from_bytes(rand16()),
+        grants,
+        false,
+    ));
+    let reader = SpaceContext::new(auth, scope.clone(), budget()).unwrap();
+    let runtime = ProjectorRuntime::start_sqlite(
+        store.clone(),
+        projection_ctx(),
+        root,
+        ProjectionGeneration::new(1).unwrap(),
+        ProjectionConfig::default(),
+    )
+    .await
+    .unwrap();
+    sync(&store, &runtime, &scope).await;
+    let engine = runtime.engine();
+    let causal = CausalBasis::Await(AwaitWatermarks::default());
+    let warm = engine
+        .acquire_snapshot(reader.clone(), causal.clone())
+        .await
+        .unwrap();
+    assert_eq!(warm.folder_subtree(&project).unwrap().count(), 40);
+
+    let mut projection = engine.pause_before_projection_for_test(&scope, 1).unwrap();
+    let mut mv = mutation(
+        &owner,
+        MoveFolder {
+            folder: sub,
+            new_parent: None,
+        },
+    );
+    mv.preconditions.revision = Some(sub_rev);
+    store.move_folder(owner.clone(), mv).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), projection.reached())
+        .await
+        .expect("projector must stop before publishing the folder move")
+        .unwrap();
+
+    // The warm index is resident and the causal cut is already available.
+    // The first poll must yield during live filtering after the folder move.
+    let mut pending = engine.acquire_snapshot(reader.clone(), causal);
+    poll_fn(|cx| {
+        assert!(pending.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        create_folder(&store, &owner, None, "writer-progress", false),
+    )
+    .await
+    .expect("the canonical writer must commit while the bitmap scan is suspended");
+    assert!(matches!(
+        pending.await,
+        Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
+            if diagnostic.reason == ValidationReason::CursorStale
+    ));
+
+    let graph = GraphQuery {
+        tier: GraphTier::Superclusters,
+        filter: empty_filter(),
+    };
+    let cancelled = SpaceContext::new(reader.auth().clone(), scope.clone(), budget()).unwrap();
+    let mut pending = engine.query_graph(cancelled.clone(), graph.clone());
+    poll_fn(|cx| {
+        assert!(pending.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    cancelled.budget.cancellation.cancel();
+    assert!(matches!(pending.await, Err(PortError::Cancelled(_))));
+
+    let result = engine.query_graph(reader, graph).await.unwrap();
+    assert!(result.nodes.is_empty());
+    assert_eq!(result.hidden_count, 0);
+    assert_eq!(result.cut.projected_seq, warm.cut().projected_seq);
+    assert_eq!(
+        result.cut.canonical_seq,
+        store.read_space(&scope.space_id).await.unwrap().last_seq
+    );
+    drop(projection);
+    runtime.shutdown().await.unwrap();
+    canonical.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn ryow_exact_falls_back_to_wait_on_intervening_schema_or_folder_mutation() {
     let scratch = Scratch::new();
     let root = scratch.root();

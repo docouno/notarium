@@ -20,7 +20,11 @@ pub(super) fn disable_cleanup(store: &CanonicalStore) {
     struct NoProjector;
 
     impl ProjectionVisibilityCleanup for NoProjector {
-        fn erase_visibility<'a>(&'a self, _: &'a ProjectionErasures) -> PortFuture<'a, ()> {
+        fn erase_visibility<'a>(
+            &'a self,
+            _canonical: &'a CanonicalStore,
+            _: &'a ProjectionErasures,
+        ) -> PortFuture<'a, ()> {
             Box::pin(async { Ok(()) })
         }
     }

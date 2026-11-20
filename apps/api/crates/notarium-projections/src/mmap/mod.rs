@@ -72,6 +72,41 @@ pub struct IndexIdentity {
     pub seq: SpaceSeq,
 }
 
+/// A committed purge in the canonical history also revokes earlier histories
+/// of the same Space. Worker recovery only has authority over its exact history.
+#[derive(Clone)]
+pub(crate) struct CheckpointRange {
+    pub(crate) scope: HistoryScope,
+    pub(crate) through: SpaceSeq,
+    pub(crate) include_replaced: bool,
+}
+
+impl CheckpointRange {
+    pub(crate) fn exact(scope: &HistoryScope, through: SpaceSeq) -> Self {
+        Self {
+            scope: scope.clone(),
+            through,
+            include_replaced: false,
+        }
+    }
+
+    pub(crate) fn current(scope: &HistoryScope, through: SpaceSeq) -> Self {
+        Self {
+            scope: scope.clone(),
+            through,
+            include_replaced: true,
+        }
+    }
+
+    fn includes(&self, history: &[u8], seq: SpaceSeq) -> bool {
+        if history == self.scope.incarnation.as_bytes() {
+            seq < self.through
+        } else {
+            self.include_replaced
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TrustedCheckpoint {
     pub size: u64,
@@ -260,14 +295,16 @@ impl BaseIndexHandle {
     pub(crate) fn purge_registered(
         directory: &Path,
         generation: ProjectionGeneration,
-        scope: &HistoryScope,
-        through: SpaceSeq,
+        range: &CheckpointRange,
     ) -> Result<(), IndexError> {
         let directory = absolute(directory)?;
         for (lease, pool) in registered_leases(&directory) {
             if lease.identity.generation == generation
-                && lease.identity.scope == *scope
-                && lease.identity.seq < through
+                && lease.identity.scope.space_id == range.scope.space_id
+                && range.includes(
+                    lease.identity.scope.incarnation.as_bytes(),
+                    lease.identity.seq,
+                )
             {
                 let pending = lease.state.compare_exchange(
                     PENDING,
@@ -588,19 +625,6 @@ impl BaseIndexHandle {
         }
         discard_matching_header(&path, |header| format::matches_header(header, identity))
     }
-
-    /// The erasure barrier revoked matching leases before the directory sweep.
-    /// A matching file must now be unlinked, or the error returned for retry.
-    pub(crate) fn discard_erased_matching(
-        path: &Path,
-        identity: &IndexIdentity,
-    ) -> Result<(), IndexError> {
-        let _mutation = file_mutations();
-        discard_matching_header(&absolute(path)?, |header| {
-            format::matches_header(header, identity)
-        })?;
-        Ok(())
-    }
 }
 
 fn is_lower_hex(value: &str, len: usize) -> bool {
@@ -622,43 +646,31 @@ fn abandoned_checkpoint_name(path: &Path) -> bool {
     is_temp || is_deleted
 }
 
-pub(crate) fn has_unreconciled_checkpoint(
+/// Check named files against their sequence and temporary files against the
+/// private writer naming convention. Both must carry a complete matching header.
+pub(crate) fn sweep_erased_checkpoint(
     path: &Path,
     generation: ProjectionGeneration,
-    scope: &HistoryScope,
-    through: SpaceSeq,
-    identity: Option<&IndexIdentity>,
+    range: &CheckpointRange,
+    named_seq: Option<SpaceSeq>,
+    probe: bool,
 ) -> Result<bool, IndexError> {
-    if identity.is_none() && !abandoned_checkpoint_name(path) {
+    if named_seq.is_none() && !abandoned_checkpoint_name(path) {
         return Ok(false);
     }
     let _mutation = file_mutations();
-    Ok(matches!(
-        match_file_header(&absolute(path)?, |header| match identity {
-            Some(identity) => format::matches_header(header, identity),
-            None => format::matches_temp_header(header, generation, scope, through),
-        })?,
-        HeaderMatch::Matching
-    ))
-}
-
-pub(crate) fn discard_abandoned_temp(
-    path: &Path,
-    generation: ProjectionGeneration,
-    scope: &HistoryScope,
-    through: SpaceSeq,
-) -> Result<(), IndexError> {
-    if !abandoned_checkpoint_name(path) {
-        return Ok(());
-    }
-    let _mutation = file_mutations();
     let path = absolute(path)?;
-    // A committed erasure floor or a newer published checkpoint supersedes
-    // this writer. Other histories and later cuts fail the header check.
-    match discard_matching_header(&path, |header| {
-        format::matches_temp_header(header, generation, scope, through)
-    }) {
-        Ok(_) => Ok(()),
+    let matches = |header: &[u8; format::HEADER_SIZE]| {
+        format::matches_range(header, generation, range, named_seq)
+    };
+    if probe {
+        return Ok(matches!(
+            match_file_header(&path, matches)?,
+            HeaderMatch::Matching
+        ));
+    }
+    match discard_matching_header(&path, matches) {
+        Ok(matched) => Ok(matched),
         // On Windows NTFS, a `.deleted-*` tombstone unlinked by `remove_readonly`
         // remains visible in `read_dir` with `STATUS_DELETE_PENDING` (mapped to
         // `PermissionDenied`) until all open reader handles drop.
@@ -670,7 +682,7 @@ pub(crate) fn discard_abandoned_temp(
                 .is_some_and(|name| name.starts_with(".deleted-"))
                 && error.kind() == io::ErrorKind::PermissionDenied =>
         {
-            Ok(())
+            Ok(false)
         }
         Err(error) => Err(error),
     }

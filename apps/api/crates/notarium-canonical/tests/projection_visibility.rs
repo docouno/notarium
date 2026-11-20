@@ -49,7 +49,11 @@ struct HeldCleanup {
 }
 
 impl ProjectionVisibilityCleanup for HeldCleanup {
-    fn erase_visibility<'a>(&'a self, erasures: &'a ProjectionErasures) -> PortFuture<'a, ()> {
+    fn erase_visibility<'a>(
+        &'a self,
+        _canonical: &'a CanonicalStore,
+        erasures: &'a ProjectionErasures,
+    ) -> PortFuture<'a, ()> {
         Box::pin(async move {
             self.purged
                 .lock()
@@ -821,7 +825,11 @@ async fn postgres_drain_blocks_concurrent_re_admission_and_single_conn_pool_neve
         calls: std::sync::atomic::AtomicUsize,
     }
     impl ProjectionVisibilityCleanup for FailOnceCleanup {
-        fn erase_visibility<'a>(&'a self, _erasures: &'a ProjectionErasures) -> PortFuture<'a, ()> {
+        fn erase_visibility<'a>(
+            &'a self,
+            _canonical: &'a CanonicalStore,
+            _erasures: &'a ProjectionErasures,
+        ) -> PortFuture<'a, ()> {
             Box::pin(async move {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 if !self.failed_once.swap(true, Ordering::SeqCst) {
@@ -1047,7 +1055,11 @@ async fn postgres_multi_space_pool_size_two_concurrent_purges_never_self_deadloc
         calls: std::sync::atomic::AtomicUsize,
     }
     impl ProjectionVisibilityCleanup for CountingCleanup {
-        fn erase_visibility<'a>(&'a self, _erasures: &'a ProjectionErasures) -> PortFuture<'a, ()> {
+        fn erase_visibility<'a>(
+            &'a self,
+            _canonical: &'a CanonicalStore,
+            _erasures: &'a ProjectionErasures,
+        ) -> PortFuture<'a, ()> {
             Box::pin(async move {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 Ok(())

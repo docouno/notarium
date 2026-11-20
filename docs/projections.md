@@ -108,7 +108,9 @@ changes trigger recompilation.
 Board reads return column counts and bounded card pages from one read cut.
 Canonical rank overlays order cards within a column. Timestamp-ordered boards
 seek eligible ranked cards by column, rank and note ID. Sparse selections and
-custom field sorts can fetch placements for candidate notes. The query keeps its
+custom field sorts can fetch placements for candidate notes. When only a few
+cards in a column have ranks, continuation reads those placements through the
+column index and selects the unranked page from the checkpoint. The query keeps its
 exact receipt replacements separate until the final window is merged. `options.columns` applies
 to grouped and board views (up to 256 columns) without interfering with
 table/list presentation options, and contradictory `scope: space` or
@@ -166,14 +168,22 @@ document classes. Restricted subscribers still receive authorized entity changes
 Listings can return authorized encrypted note identities as metadata. Encrypted
 carriers, fields and edges are excluded from views and graph reads. An active
 Space owner checks lifecycle and authorization when returning data, including
-after a concurrent purge or owner handoff. For chat backlinks across owners,
+after a concurrent purge or owner handoff. If a folder move invalidates the
+visibility change journal, readers verify the old cut in short batches and
+release the Space read lock between them. A change to the canonical head
+invalidates that scan. For chat backlinks across owners,
 applications can register a `BacklinkOwnerResolver` with in-process owner
 endpoints. The read holds the source and target owner permits through
 verification and response assembly. Redaction removes source references and
 invalidated context entries from eligible results. Both SQLite and PostgreSQL
 erasure hooks remain active on the canonical writer after the local projector
 stops so offline purges and redactions still clean derived databases and local
-checkpoint files.
+checkpoint files. A purge verifies the current canonical history while holding
+the same cache lock used for checkpoint publication. For that Space it removes
+checkpoints below the purge sequence in the current history and checkpoints
+from previous histories at any sequence. A missing PostgreSQL generation floor
+keeps matching files pending until the generation is initialized or retired.
+Worker recovery uses only the exact history being built.
 
 ## Verification
 

@@ -1,12 +1,9 @@
 use std::{array, ops::Range};
 
 use croaring::Frozen;
-use notarium_core::{
-    ids::{ProjectionGeneration, SpaceSeq},
-    model::HistoryScope,
-};
+use notarium_core::ids::{ProjectionGeneration, SpaceId, SpaceSeq};
 
-use super::{IndexError, IndexIdentity};
+use super::{CheckpointRange, IndexError, IndexIdentity};
 use crate::index::NoteSortHeader;
 
 const MAGIC: [u8; 8] = *b"NTRMFI01";
@@ -201,41 +198,46 @@ impl Directory {
 
 /// A complete writer header identifies an obsolete file even if its body was truncated.
 pub(super) fn matches_header(bytes: &[u8], identity: &IndexIdentity) -> bool {
+    matches_layout(
+        bytes,
+        identity.generation,
+        &identity.scope.space_id,
+        identity.seq,
+    ) && &bytes[28..44] == identity.scope.incarnation.as_bytes()
+}
+
+fn matches_layout(
+    bytes: &[u8],
+    generation: ProjectionGeneration,
+    space: &SpaceId,
+    seq: SpaceSeq,
+) -> bool {
     bytes.len() >= HEADER_SIZE
         && u64_at(bytes, 96).is_some_and(|size| size >= (HEADER_SIZE + DIGEST_SIZE) as u64)
         && bytes[..8] == MAGIC
         && u16_at(bytes, 8) == Some(ENDIAN)
         && u16_at(bytes, 10) == Some(FORMAT_VERSION)
-        && u64_at(bytes, 12) == Some(identity.generation.get())
-        && u64_at(bytes, 20) == Some(identity.seq.get())
-        && &bytes[28..44] == identity.scope.incarnation.as_bytes()
+        && u64_at(bytes, 12) == Some(generation.get())
+        && u64_at(bytes, 20) == Some(seq.get())
         && u32_at(bytes, 56) == Some(SECTION_COUNT as u32)
         && u32_at(bytes, 60) == Some(0)
-        && &bytes[64..96] == blake3::hash(identity.scope.space_id.as_str().as_bytes()).as_bytes()
+        && &bytes[64..96] == blake3::hash(space.as_str().as_bytes()).as_bytes()
         && u64_at(bytes, 104) == Some(HEADER_SIZE as u64)
         && bytes[112..128] == [0; 16]
 }
 
-pub(super) fn matches_temp_header(
+pub(super) fn matches_range(
     bytes: &[u8; HEADER_SIZE],
     generation: ProjectionGeneration,
-    scope: &HistoryScope,
-    through: SpaceSeq,
+    range: &CheckpointRange,
+    named_seq: Option<SpaceSeq>,
 ) -> bool {
     let Some(seq) = u64_at(bytes, 20).and_then(|seq| SpaceSeq::new(seq).ok()) else {
         return false;
     };
-    // The prefix witnesses ownership even if the writer never finished
-    // appending the body. This header is used only to unlink a temp name.
-    seq < through
-        && matches_header(
-            bytes,
-            &IndexIdentity {
-                generation,
-                scope: scope.clone(),
-                seq,
-            },
-        )
+    named_seq.is_none_or(|named| named == seq)
+        && range.includes(&bytes[28..44], seq)
+        && matches_layout(bytes, generation, &range.scope.space_id, seq)
 }
 
 pub(super) fn decode(

@@ -104,15 +104,17 @@ impl ProjectionEngine {
             let permit = cut.live.try_read()?;
             authorize_graph_entry(&permit, ctx, &cut)?;
             query.filter.validate_declared(&cut.fields)?;
-            let authorized = current_bitmap(
+            let universe = structural_universe(&index, permit.space(), ctx.auth())?;
+            let (authorized, permit) = current_bitmap(
                 &index,
                 &cut,
                 ctx,
-                &permit,
-                structural_universe(&index, permit.space(), ctx.auth())?,
+                permit,
+                universe,
                 LifecycleMask::Active,
                 true,
-            )?;
+            )
+            .await?;
             let lens = lens_scope(&index, ctx, &permit, &query.tier, &authorized)?;
             (permit.head(), authorized, lens)
         };

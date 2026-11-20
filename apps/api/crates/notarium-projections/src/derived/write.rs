@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashSet};
 
-use notarium_canonical::ProjectionErasures;
+use notarium_canonical::{CanonicalStore, ProjectionErasures};
 use notarium_core::{
     DomainError,
     classes::DocClass,
@@ -313,12 +313,14 @@ impl DerivedStore {
     /// Removes committed data from the actual history of this generation.
     pub(crate) async fn erase_committed_visibility(
         &self,
+        canonical: &CanonicalStore,
         erasures: &ProjectionErasures,
-    ) -> Result<(HistoryScope, SpaceSeq), PortError> {
+    ) -> Result<(), PortError> {
+        let canonical = canonical.clone();
         let erasures = erasures.clone();
         self.database
             .write(true, move |mut tx| {
-                Box::pin(async move { erase_committed(&mut tx, &erasures).await })
+                Box::pin(async move { erase_committed(&mut tx, &canonical, &erasures).await })
             })
             .await
     }
@@ -1626,11 +1628,19 @@ async fn chat_reference_current(
 
 pub(super) async fn erase_committed(
     tx: &mut SqlTransaction<'_>,
+    canonical: &CanonicalStore,
     erasures: &ProjectionErasures,
-) -> Result<(HistoryScope, SpaceSeq), PortError> {
+) -> Result<(), PortError> {
     // An erasure or cross-Space staging can register the guard before the
     // first watermark. Choose the history under the same lock as deletion.
-    let (guard, _) = lock_space_guard_with_origin(tx, &erasures.scope).await?;
+    let (guard, inserted) = lock_space_guard_with_origin(tx, &erasures.scope).await?;
+    if (inserted || guard.incarnation != erasures.scope.incarnation)
+        && canonical.read_space(&erasures.scope.space_id).await?.scope != erasures.scope
+    {
+        // A different owner can restore shared PostgreSQL while this transaction
+        // waits for the guard. Roll back before binding a history or raising its floor.
+        return Err(super::not_ready());
+    }
     let scope = HistoryScope {
         space_id: erasures.scope.space_id.clone(),
         incarnation: guard.incarnation,
@@ -1645,8 +1655,7 @@ pub(super) async fn erase_committed(
         .iter()
         .map(|row| (row.thread.clone(), row.entry))
         .collect::<Vec<_>>();
-    erase_guarded(tx, &scope, through, &erasures.purged, &redacted).await?;
-    Ok((scope, through))
+    erase_guarded(tx, &scope, through, &erasures.purged, &redacted).await
 }
 
 #[derive(Default)]

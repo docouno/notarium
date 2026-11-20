@@ -434,6 +434,53 @@ async fn retained_board_pages_match_ordered_sql_ranks_and_exact_overlay() {
         note: id(9999),
         key: ViewKey::from_bytes([9; 16]),
     };
+    let current_group = GroupKey::Value(ScalarValue::Bool(true));
+    let mut newest: Vec<_> = (1..512).filter(|dense| dense % 13 != 12).collect();
+    newest.sort_by_key(|&dense| {
+        (
+            std::cmp::Reverse(index.updated_at(dense).unwrap()),
+            id(ordinal(dense)),
+        )
+    });
+    // The prefix probe can return at most five positions. The dense fixture
+    // leaves just one ordinary card ahead of a long run of physical ranks in
+    // timestamp order, forcing the bulk path on its next ordinary cursor.
+    let phase_views: Vec<_> = [0, 1, 4, 5, 6, 30]
+        .into_iter()
+        .map(|count: usize| {
+            let targets: Vec<_> = if count == 30 {
+                newest
+                    .iter()
+                    .rev()
+                    .take(5)
+                    .chain(newest.iter().skip(1).take(25))
+                    .copied()
+                    .collect()
+            } else {
+                newest.iter().take(count).copied().collect()
+            };
+            let placements = targets
+                .into_iter()
+                .enumerate()
+                .map(|(i, dense)| {
+                    (
+                        dense,
+                        BoardRank {
+                            group: current_group.clone(),
+                            rank: format!("{i:03}"),
+                        },
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            (
+                ViewRef {
+                    note: view.note.clone(),
+                    key: ViewKey::from_bytes([count as u8; 16]),
+                },
+                placements,
+            )
+        })
+        .collect();
     let mut mutations = Vec::new();
     for dense in 0..512 {
         let note = id(ordinal(dense));
@@ -443,13 +490,20 @@ async fn retained_board_pages_match_ordered_sql_ranks_and_exact_overlay() {
         row.slug = format!("card-{dense}");
         row.slug_fold = row.slug.clone();
         mutations.push(DerivedMutation::UpsertNote(Box::new(row)));
-        if let Some(rank) = ranks.get(&dense) {
+        for (rank_view, placements) in std::iter::once((&view, &ranks)).chain(
+            phase_views
+                .iter()
+                .map(|(view, placements)| (view, placements)),
+        ) {
+            let Some(rank) = placements.get(&dense) else {
+                continue;
+            };
             let (group_key_msgpack, group_key_hex) = group_key_hex(&rank.group).unwrap();
             mutations.push(DerivedMutation::UpsertViewRank(ProjectedViewRank {
                 space_id: scope.space_id.clone(),
-                view_note_id: view.note.clone(),
-                view_key: view.key.clone(),
-                target_note_id: note,
+                view_note_id: rank_view.note.clone(),
+                view_key: rank_view.key.clone(),
+                target_note_id: note.clone(),
                 rank_rev_id: replacement.rev_id.clone(),
                 placement_revision: replacement.rev_id.clone(),
                 group_key_msgpack,
@@ -573,61 +627,96 @@ async fn retained_board_pages_match_ordered_sql_ranks_and_exact_overlay() {
         }
     }
 
-    // No stored ranks for this group, while other groups have 150. The first
-    // row carries an exact-overlay rank; the subsequent cursor is unranked.
-    let mode = SortSpec::default();
-    let all = Predicate::All(Vec::new());
     let candidates = Bitmap::from_range(0..512);
-    let current_group = GroupKey::Value(ScalarValue::Bool(true));
+    let all = Predicate::All(Vec::new());
     let overlay_rank = BTreeMap::from([(
         0,
         BoardRank {
             group: current_group.clone(),
-            rank: "first".into(),
+            rank: "0".into(),
         },
     )]);
-    let mut cursor = None;
-    for (page, max_transactions) in [1, 2, 1].into_iter().enumerate() {
-        store.take_sqlite_read_work();
-        let result = select_view_window(
-            WindowInput {
-                index: &index,
-                store: &store,
-                scope: &scope,
-                cut,
-                candidates: &candidates,
-                filter: &all,
-                sort: &mode,
-                group_by: Some("phase"),
-                columns: std::slice::from_ref(&current_group),
-                board: true,
-                ranks: &overlay_rank,
-                overlay: &overlay,
-                after: cursor.as_ref(),
-                limit: PageLimit::new(1).unwrap(),
-            },
-            Some(&view),
-        )
-        .await
-        .unwrap();
-        let (transactions, progress) = store.take_sqlite_read_work();
-        assert!(
-            (1..=max_transactions).contains(&transactions),
-            "page {page} took {transactions} transactions"
-        );
-        assert!(
-            progress < 8,
-            "page {page} used at least {} SQLite VM steps",
-            progress * 128
-        );
-        let row = result.rows.first().unwrap();
-        assert_eq!(row.rank.is_some(), page == 0);
-        if let Some(previous) = &cursor {
-            assert_eq!(
-                compare_view_cursor_tuple(&mode, previous, &row.tuple).unwrap(),
-                Ordering::Less
-            );
+    let mut saw_dense_fallback = false;
+    for (rank_view, placements) in phase_views {
+        let page_size = if placements.is_empty() { 1 } else { 4 };
+        let mut all_ranks = placements.clone();
+        all_ranks.extend(overlay_rank.clone());
+        for direction in [Direction::Asc, Direction::Desc] {
+            let sort = SortSpec::new(vec![SortKey {
+                column: SortColumn::UpdatedAt,
+                direction,
+            }])
+            .unwrap();
+            let mut cursor = None;
+            let mut saw_ordinary_continue = false;
+            for _ in 0..placements.len().div_ceil(page_size) + 4 {
+                let input = WindowInput {
+                    index: &index,
+                    store: &store,
+                    scope: &scope,
+                    cut,
+                    candidates: &candidates,
+                    filter: &all,
+                    sort: &sort,
+                    group_by: Some("phase"),
+                    columns: std::slice::from_ref(&current_group),
+                    board: true,
+                    ranks: &all_ranks,
+                    overlay: &overlay,
+                    after: cursor.as_ref(),
+                    limit: PageLimit::new(page_size as u16).unwrap(),
+                };
+                let expected = select_window(input).await.unwrap();
+                store.take_sqlite_read_work();
+                let result = select_view_window(
+                    WindowInput {
+                        ranks: &overlay_rank,
+                        ..input
+                    },
+                    Some(&rank_view),
+                )
+                .await
+                .unwrap();
+                let (transactions, progress) = store.take_sqlite_read_work();
+                assert_eq!(result.groups, expected.groups);
+                assert_eq!(result.has_more, expected.has_more);
+                assert_eq!(result.rows.len(), page_size);
+                assert!(
+                    result
+                        .rows
+                        .iter()
+                        .map(|r| (&r.tuple, &r.rank))
+                        .eq(expected.rows.iter().map(|r| (&r.tuple, &r.rank)))
+                );
+                if cursor.is_none() {
+                    assert_eq!(transactions, 1, "open took an extra SQL transaction");
+                }
+                if cursor
+                    .as_ref()
+                    .is_some_and(|c| cursor_rank(&c.cells).unwrap().is_none())
+                {
+                    saw_ordinary_continue = true;
+                    if placements.len() <= 6 {
+                        let max_transactions = if placements.len() < 5 { 1 } else { 2 };
+                        assert!(
+                            transactions <= max_transactions,
+                            "{} ranks, {transactions} SQL transactions",
+                            placements.len()
+                        );
+                        assert!(
+                            progress < 8,
+                            "{} ranks, at least {} VM steps",
+                            placements.len(),
+                            progress * 128
+                        );
+                    } else if transactions > 2 && progress >= 8 {
+                        saw_dense_fallback = true;
+                    }
+                }
+                cursor = result.rows.last().map(|row| row.tuple.clone());
+            }
+            assert!(saw_ordinary_continue);
         }
-        cursor = Some(row.tuple.clone());
     }
+    assert!(saw_dense_fallback);
 }

@@ -293,6 +293,27 @@ fn unpublished_reclamation_defers_to_the_identity_and_live_lease() {
 }
 
 #[test]
+fn worker_cleanup_preserves_another_history_at_the_same_space_and_sequence() {
+    let scratch = Fixture::new();
+    let (base, _) = scratch.publish();
+    let path = base.path().to_owned();
+    let actual = base.identity().clone();
+    let mut worker = actual.scope.clone();
+    worker.incarnation = HistoryIncarnation::from_bytes([9; 16]);
+    let through = actual.seq.checked_next().unwrap();
+    let pool = MmapPool::new(NonZeroUsize::new(1).unwrap());
+    base.register_for_erasure(&pool);
+    let range = CheckpointRange::exact(&worker, through);
+    BaseIndexHandle::purge_registered(path.parent().unwrap(), actual.generation, &range).unwrap();
+    assert!(
+        !sweep_erased_checkpoint(&path, actual.generation, &range, Some(actual.seq), false)
+            .unwrap()
+    );
+    assert!(path.is_file());
+    assert!(base.open(&pool).is_ok());
+}
+
+#[test]
 fn registered_purge_unlinks_after_both_reopened_file_leases_end() {
     let scratch = Fixture::new();
     let (old, trusted) = scratch.publish();
@@ -309,8 +330,7 @@ fn registered_purge_unlinks_after_both_reopened_file_leases_end() {
     BaseIndexHandle::purge_registered(
         path.parent().unwrap(),
         identity.generation,
-        &identity.scope,
-        identity.seq.checked_next().unwrap(),
+        &CheckpointRange::exact(&identity.scope, identity.seq.checked_next().unwrap()),
     )
     .unwrap();
     assert!(old.open(&previous_pool).is_err());

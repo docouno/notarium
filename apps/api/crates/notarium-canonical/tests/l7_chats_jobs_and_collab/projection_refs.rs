@@ -647,9 +647,49 @@ async fn l7_projection_refs_sqlite_covering_pages_and_erasure() {
     let (store, runtime) = CanonicalRuntime::open(config.clone()).await.unwrap();
     assert_eq!(covers_v6_references(&store, &legacy[0]).await, 2);
     assert_eq!(covers_v6_references(&store, &legacy[1]).await, 2);
+    let owner = sample_principal_id(0xa1);
+    let extra = create_space(&store, &owner, 0xa1).await;
+    let parent = append_in_new_thread(
+        &store,
+        &owner_ctx(&extra, owner),
+        sample_thread_id(0xa1),
+        Vec::new(),
+    )
+    .await;
     runtime.shutdown().await.unwrap();
     let mut old = temp.open_raw_sqlite().await;
     downgrade_chat_refs_v7!(old, legacy);
+    // The old occurrence catalog exceeds the temporary database's 32 KiB
+    // allowance. Bootstrap must stream directly into the destination indexes.
+    sqlx::query(
+        "WITH RECURSIVE ord(i) AS (VALUES(0) UNION ALL SELECT i+1 FROM ord WHERE i<4095)
+         INSERT INTO chat_entry_note_refs
+           (space_id,thread_id,entry_seq,ref_ordinal,target_space_id,target_note_id)
+         SELECT $1,$2,$3,i,$1,printf('nt_%032x',i) FROM ord",
+    )
+    .bind(extra.space_id.as_str())
+    .bind(parent.thread.as_str())
+    .bind(parent.seq.get() as i64)
+    .execute(&mut old)
+    .await
+    .unwrap();
+    sqlx::raw_sql("PRAGMA temp_store=MEMORY; PRAGMA temp.max_page_count=8")
+        .execute(&mut old)
+        .await
+        .unwrap();
+    notarium_canonical::schema::bootstrap_sqlite_schema(&mut old, &sample_installation_id(0x93))
+        .await
+        .unwrap();
+    let copies: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM chat_entry_note_refs r JOIN chat_entries e
+            USING (space_id,thread_id,entry_seq,created_space_seq)
+         WHERE r.space_id=$1",
+    )
+    .bind(extra.space_id.as_str())
+    .fetch_one(&mut old)
+    .await
+    .unwrap();
+    assert_eq!(copies, 4096);
     drop(old);
     let (store, runtime) = CanonicalRuntime::open(config).await.unwrap();
     covers_v7_references(&store, &legacy).await;

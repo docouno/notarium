@@ -689,18 +689,17 @@ impl ProjectionEngine {
             let universe = query::structural_universe(&index, permit.space(), ctx.auth())?;
             let candidates =
                 query::view_source_candidates(&index, source, folder.as_ref(), universe)?;
-            (
-                current_bitmap(
-                    &index,
-                    cut,
-                    ctx,
-                    &permit,
-                    candidates,
-                    LifecycleMask::Active,
-                    true,
-                )?,
-                permit.head(),
+            let (candidates, permit) = current_bitmap(
+                &index,
+                cut,
+                ctx,
+                permit,
+                candidates,
+                LifecycleMask::Active,
+                true,
             )
+            .await?;
+            (candidates, permit.head())
         };
         let mut exact = BTreeMap::new();
         for (id, row) in &state.overlay {
@@ -818,19 +817,10 @@ impl ProjectionEngine {
             let universe =
                 query::note_universe(&index, permit.space(), ctx.auth(), query.lifecycle)?;
             let candidates = query::note_source_candidates(&index, query, universe)?;
-            (
-                current_bitmap(
-                    &index,
-                    cut,
-                    ctx,
-                    &permit,
-                    candidates,
-                    query.lifecycle,
-                    false,
-                )?,
-                permit.head(),
-                entry,
-            )
+            let (candidates, permit) =
+                current_bitmap(&index, cut, ctx, permit, candidates, query.lifecycle, false)
+                    .await?;
+            (candidates, permit.head(), entry)
         };
         let mut exact = BTreeMap::new();
         for (id, row) in &state.overlay {
@@ -1277,36 +1267,81 @@ fn ensure_active_head(permit: &LiveReadPermit, head: SpaceSeq) -> Result<(), Por
     Ok(())
 }
 
-pub(super) fn current_bitmap(
+const VISIBILITY_BATCH: usize = 32;
+
+pub(super) async fn current_bitmap(
     index: &IndexView,
     cut: &PublishedCut,
     ctx: &SpaceContext,
-    permit: &LiveReadPermit,
+    mut permit: LiveReadPermit,
     mut bitmap: Bitmap,
     lifecycle: LifecycleMask,
     plain_only: bool,
-) -> Result<Bitmap, PortError> {
-    if permit.head() == cut.cut.projected_seq {
-        return Ok(bitmap);
+) -> Result<(Bitmap, LiveReadPermit), PortError> {
+    let head = permit.head();
+    if head == cut.cut.projected_seq {
+        return Ok((bitmap, permit));
     }
-    if let Some(changes) = permit.note_changes_since(cut.cut.projected_seq) {
-        for note in changes {
-            if let Some(dense) = index.dense_id(note).filter(|id| bitmap.contains(*id))
-                && current_facts(permit, ctx, note, lifecycle, plain_only)?.is_none()
-            {
-                bitmap.remove(dense);
+    // Re-seek the bounded journal on each permit. Its range iterator skips
+    // the already checked prefix without cloning identities or visiting it.
+    let mut offset = 0;
+    loop {
+        let remaining = {
+            let Some(changes) = permit.note_changes_since(cut.cut.projected_seq) else {
+                break;
+            };
+            let remaining = changes.len().saturating_sub(offset);
+            for note in changes.skip(offset).take(VISIBILITY_BATCH) {
+                if let Some(dense) = index.dense_id(note).filter(|id| bitmap.contains(*id))
+                    && current_facts(&permit, ctx, note, lifecycle, plain_only)?.is_none()
+                {
+                    bitmap.remove(dense);
+                }
             }
+            remaining
+        };
+        if remaining <= VISIBILITY_BATCH {
+            return Ok((bitmap, permit));
         }
-        return Ok(bitmap);
+        offset += VISIBILITY_BATCH;
+        drop(permit);
+        permit = next_visibility_batch(cut, ctx, head).await?;
     }
     let mut allowed = Bitmap::new();
-    for dense in bitmap.iter() {
-        let note = index.note_id(index.dense(dense))?;
-        if current_facts(permit, ctx, &note, lifecycle, plain_only)?.is_some() {
-            allowed.add(dense);
+    let mut ids = bitmap_ids(bitmap).peekable();
+    loop {
+        for dense in ids.by_ref().take(VISIBILITY_BATCH) {
+            let note = index.note_id(index.dense(dense))?;
+            if current_facts(&permit, ctx, &note, lifecycle, plain_only)?.is_some() {
+                allowed.add(dense);
+            }
         }
+        if ids.peek().is_none() {
+            return Ok((allowed, permit));
+        }
+        drop(permit);
+        permit = next_visibility_batch(cut, ctx, head).await?;
     }
-    Ok(allowed)
+}
+
+// Materializing live ancestry is bounded by folder depth per note. No permit
+// or borrowed journal iterator remains held while a reader yields to a writer.
+async fn next_visibility_batch(
+    cut: &PublishedCut,
+    ctx: &SpaceContext,
+    head: SpaceSeq,
+) -> Result<LiveReadPermit, PortError> {
+    tokio::task::yield_now().await;
+    // The same handle validates its history and lease epoch on each acquisition.
+    let permit = cut.live.try_read()?;
+    ctx.check_current(permit.scope())?;
+    if permit.space().lifecycle != SpaceLifecycle::Active {
+        return Err(DomainError::ResourceNotFound.into());
+    }
+    if permit.head() != head {
+        return Err(stale());
+    }
+    Ok(permit)
 }
 
 fn cursor_page<T>(
@@ -1536,13 +1571,14 @@ fn bitmap_ids(rows: Bitmap) -> impl Iterator<Item = u32> + Send {
     let mut count = 0;
     std::iter::from_fn(move || {
         if offset == count {
+            let start = next.take()?;
             let mut iter = rows.iter();
-            iter.reset_at_or_after(next?);
+            iter.reset_at_or_after(start);
+            offset = 0;
             count = iter.next_many(&mut buffer);
             if count == 0 {
                 return None;
             }
-            offset = 0;
             next = buffer[count - 1].checked_add(1);
         }
         let id = buffer[offset];
@@ -1636,15 +1672,16 @@ impl StructuralReadPort for ProjectionEngine {
                 let permit = cut.live.try_read()?;
                 authorize_query(&permit, &ctx, &cut.root_folder_id, None, true)?;
                 let universe = query::structural_universe(&index, permit.space(), ctx.auth())?;
-                let visible = current_bitmap(
+                let (visible, permit) = current_bitmap(
                     &index,
                     &cut,
                     &ctx,
-                    &permit,
+                    permit,
                     universe,
                     LifecycleMask::Active,
                     true,
-                )?;
+                )
+                .await?;
                 let _admission = self.current_admission(cut.cut.generation)?;
                 let mut snapshot_cut = cut.cut.clone();
                 snapshot_cut.canonical_seq = permit.head();
@@ -1790,6 +1827,24 @@ impl StructuralReadPort for ProjectionEngine {
 #[cfg(test)]
 mod subtree_tests {
     use super::*;
+
+    #[test]
+    fn owned_bitmap_iterator_stays_exhausted_after_any_final_batch() {
+        for len in [0, 1, 40, 64, 65, 128] {
+            for last_is_max in [false, true] {
+                let mut rows = Bitmap::new();
+                rows.add_range(0..len);
+                if last_is_max {
+                    rows.add(u32::MAX);
+                }
+                let expected = rows.to_vec();
+                let mut ids = bitmap_ids(rows);
+                assert_eq!(ids.by_ref().collect::<Vec<_>>(), expected);
+                assert_eq!(ids.next(), None);
+                assert_eq!(ids.next(), None);
+            }
+        }
+    }
 
     #[test]
     fn owned_subtree_iterator_starts_with_a_bounded_batch_and_crosses_batch_boundaries() {

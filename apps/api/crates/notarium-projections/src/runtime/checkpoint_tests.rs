@@ -694,7 +694,7 @@ async fn exercise_purge_publication(
             &foreign,
             IndexIdentity {
                 scope: HistoryScope {
-                    incarnation: HistoryIncarnation::from_bytes(entropy()),
+                    space_id: SpaceId::from_bytes(entropy()),
                     ..scope.clone()
                 },
                 ..identity.clone()

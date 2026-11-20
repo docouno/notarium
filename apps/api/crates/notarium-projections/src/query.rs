@@ -849,52 +849,105 @@ async fn ranked_header_window(
     };
     let mut rows = header_window(&local, &ranked, group, capacity)?;
     if rows.len() < capacity {
-        let unranked = if same_group.is_none() {
-            ids.andnot(&ranked)
-        } else if ranks.is_empty()
-            && input
-                .store
-                .group_rank_page(
-                    input.scope,
-                    input.cut,
-                    view,
-                    &group_hex,
-                    None,
-                    PageLimit::new(1)?,
-                )
-                .await?
-                .is_empty()
-        {
-            // No persisted rank precedes or follows this cursor. This also
-            // covers a ranked cursor originating entirely from the exact overlay.
-            return header_window(&local, ids, group, capacity);
+        let remaining = capacity - rows.len();
+        // The rank scan has exhausted the eligible suffix. When it started at
+        // the beginning of the group, all remaining IDs are already unranked.
+        let remaining_ids = ids.andnot(&ranked);
+        rows.extend(if let Some(cursor) = same_group {
+            continued_unranked_window(
+                &local,
+                view,
+                group,
+                &group_hex,
+                remaining_ids,
+                cursor,
+                remaining,
+            )
+            .await?
         } else {
-            // A continuation sought past earlier ranked rows. Anti-join just
-            // the eligible dense IDs, without retrieving their previous ranks.
-            let mut unranked = Bitmap::new();
-            let mut iter = ids.iter();
-            let mut batch = [0; 2048];
-            loop {
-                let n = iter.next_many(&mut batch);
-                if n == 0 {
-                    break;
-                }
-                let found = input
-                    .store
-                    .unranked_candidates(input.scope, input.cut, view, &group_hex, &batch[..n])
-                    .await?;
-                unranked.add_many(&found);
-            }
-            unranked
-        };
-        rows.extend(header_window(
-            &local,
-            &unranked,
-            group,
-            capacity - rows.len(),
-        )?);
+            header_window(&local, &remaining_ids, group, remaining)?
+        });
     }
     Ok(rows)
+}
+
+/// A continuation may have passed physical placements. Exclude a sparse group
+/// using its covering index before considering SQL work over candidate notes.
+async fn continued_unranked_window(
+    input: &WindowInput<'_>,
+    view: &ViewRef,
+    group: &GroupKey,
+    group_hex: &str,
+    mut candidates: Bitmap,
+    cursor: &SortTuple,
+    capacity: usize,
+) -> Result<Vec<SelectedRow>, PortError> {
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let probe = PageLimit::new((input.limit.get() + 1).min(200))?;
+    let prefix = input
+        .store
+        .group_rank_page(input.scope, input.cut, view, group_hex, None, probe)
+        .await?;
+    let cursor_position = cursor_rank(&cursor.cells)?.map(|rank| (rank, &cursor.entity_id));
+    let covered = prefix.len() < usize::from(probe.get())
+        || prefix
+            .last()
+            .zip(cursor_position)
+            .is_some_and(|(last, position)| {
+                (last.sort_rank_lexo.as_str(), &last.target_note_id) >= position
+            });
+    for placement in prefix {
+        if let Some(dense) = input.index.dense_id(&placement.target_note_id) {
+            candidates.remove(dense);
+        }
+    }
+    if covered {
+        // Either every rank was read or the prefix meets the exhausted suffix.
+        return header_window(input, &candidates, group, capacity);
+    }
+
+    // A full prefix need not mean a dense group. Verify the leading mmap
+    // candidates in one SQL batch, allowing for some intervening placements.
+    let preview_limit = (2 * capacity).min(201);
+    let preview = header_window(input, &candidates, group, preview_limit)?;
+    if preview.is_empty() {
+        return Ok(preview);
+    }
+    let exhausted = preview.len() < preview_limit;
+    let ids = preview.iter().map(|r| r.dense_id).collect::<Vec<_>>();
+    let ordinary = input
+        .store
+        .unranked_candidates(input.scope, input.cut, view, group_hex, &ids)
+        .await?;
+    let ordinary = Bitmap::from(ordinary.as_slice());
+    let window: Vec<_> = preview
+        .into_iter()
+        .filter(|r| ordinary.contains(r.dense_id))
+        .take(capacity)
+        .collect();
+    if window.len() == capacity || exhausted {
+        return Ok(window);
+    }
+
+    // Many leading candidates were ranks, so check the remaining candidate
+    // set in bulk instead of repeatedly opening small windows.
+    let mut unranked = Bitmap::new();
+    let mut iter = candidates.iter();
+    let mut batch = [0; 2048];
+    loop {
+        let n = iter.next_many(&mut batch);
+        if n == 0 {
+            break;
+        }
+        let found = input
+            .store
+            .unranked_candidates(input.scope, input.cut, view, group_hex, &batch[..n])
+            .await?;
+        unranked.add_many(&found);
+    }
+    header_window(input, &unranked, group, capacity)
 }
 
 fn overlay_window(

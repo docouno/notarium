@@ -195,9 +195,14 @@ pub(crate) struct VisibilityWindow {
 
 /// Physically removes erasable derived data before a successful command reply.
 /// The callback is idempotent and may access canonical maintenance reads. It
-/// must not acquire final-delivery permits or enter a canonical writer.
+/// must not acquire final-delivery permits or enter a canonical writer. The
+/// calling store supplies current history even after a writer is reopened.
 pub trait ProjectionVisibilityCleanup: Send + Sync {
-    fn erase_visibility<'a>(&'a self, erasures: &'a ProjectionErasures) -> PortFuture<'a, ()>;
+    fn erase_visibility<'a>(
+        &'a self,
+        canonical: &'a CanonicalStore,
+        erasures: &'a ProjectionErasures,
+    ) -> PortFuture<'a, ()>;
 }
 
 struct LiveState {
@@ -945,14 +950,14 @@ impl LiveReadPermit {
 
     /// Identity changes may be used to tighten a projected bitmap when there
     /// were no intervening folder cascades. A gap requires full verification.
-    pub fn note_changes_since(&self, cut: SpaceSeq) -> Option<impl Iterator<Item = &NoteId>> {
+    pub fn note_changes_since(
+        &self,
+        cut: SpaceSeq,
+    ) -> Option<impl ExactSizeIterator<Item = &NoteId>> {
         let state = self.state();
         (state.changes_after <= cut && cut <= state.record.last_seq).then(|| {
-            state
-                .note_changes
-                .iter()
-                .filter(move |(seq, _)| *seq > cut)
-                .map(|(_, note)| note)
+            let first = state.note_changes.partition_point(|(seq, _)| *seq <= cut);
+            state.note_changes.range(first..).map(|(_, note)| note)
         })
     }
 
@@ -1391,7 +1396,7 @@ impl CanonicalStore {
         // committed redaction moved their current redacted-at markers.
         visibility.committing();
         callback
-            .erase_visibility(&erasures)
+            .erase_visibility(self, &erasures)
             .await
             .map_err(|error| {
                 crate::codec::unknown_commit_outcome(
