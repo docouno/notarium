@@ -689,7 +689,7 @@ impl ProjectionEngine {
             exact.insert(*id, row.note.clone());
         }
         let mut ranks = BTreeMap::new();
-        if descriptor.kind == ViewKind::Board {
+        if descriptor.kind == ViewKind::Board && !candidates.is_empty() {
             let limit = page_limit();
             let mut after = None;
             loop {
@@ -886,7 +886,13 @@ impl ProjectionEngine {
                         .await?
                 }
             };
-            if let Some(row) = cover_row.filter(|row| row.lifecycle == Lifecycle::Active) {
+            let cover_live_active = {
+                let permit = cut.live.try_read()?;
+                current_facts(&permit, ctx, &cover_id, LifecycleMask::Active, false)?.is_some()
+            };
+            if cover_live_active
+                && let Some(row) = cover_row.filter(|row| row.lifecycle == Lifecycle::Active)
+            {
                 match self
                     .canonical
                     .get_note(
@@ -1649,6 +1655,7 @@ impl StructuralReadPort for ProjectionEngine {
         Box::pin(async move {
             within_budget(&ctx, async {
                 ctx.check_current(&snapshot.scope)?;
+                drop(self.current_admission(self.active_generation())?);
                 // A retained cut can use canonical hydration while this
                 // Space is still binding the newly selected generation.
                 let live = self.canonical.live_visibility_fence().space(ctx.scope())?;
@@ -1686,6 +1693,7 @@ impl StructuralReadPort for ProjectionEngine {
                             .into_iter()
                             .map(|slot| slot.and_then(|_| cards.next().flatten()))
                             .collect();
+                        let _admission = self.current_admission(current.cut.generation)?;
                         ensure_head(&live.try_read()?, head)?;
                         Ok::<_, PortError>(result)
                     }
@@ -1709,6 +1717,7 @@ impl StructuralReadPort for ProjectionEngine {
                             .await?,
                     );
                 }
+                let _admission = self.current_admission(self.active_generation())?;
                 let permit = live.try_read()?;
                 ensure_head(&permit, head)?;
                 for (card, id) in cards.iter_mut().zip(notes) {

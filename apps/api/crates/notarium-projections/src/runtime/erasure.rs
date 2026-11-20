@@ -172,7 +172,7 @@ impl ProjectionEngine {
                 }
             }
             self.reads.invalidate_history(&erasures.scope);
-            self.scrub_space_events(&erasures.scope.space_id);
+            self.scrub_space_events(&erasures.scope, erasures.through);
         }
         Ok(())
     }

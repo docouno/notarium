@@ -461,6 +461,9 @@ pub(super) async fn reclaim_postgres_schema(
     if !taken {
         return Ok(false);
     }
+    if PostgresSchemaLease::is_held(schema) {
+        return Ok(false);
+    }
     let exists: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname = $1)",
     )

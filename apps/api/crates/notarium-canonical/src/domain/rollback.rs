@@ -4068,6 +4068,7 @@ enum PgFastInnerResult {
     },
     Committed {
         response_bytes: Vec<u8>,
+        initial_cut: SpaceSeq,
         new_effective_cut: SpaceSeq,
     },
     UnknownCommit {
@@ -4109,17 +4110,25 @@ async fn execute_pg_fast_rollback_on_conn(
         PgFastInnerResult::FallbackToStandard => PgSingleFastAttempt::FallbackToStandard,
         PgFastInnerResult::Failed { err, effective_cut } => {
             let mut cuts = BTreeMap::new();
+            let mut windows = Vec::new();
             if let Some(c) = effective_cut {
                 cuts.insert(scope_cl.space_id.clone(), c);
+                windows.push(crate::projection_fence::VisibilityWindow {
+                    scope: scope_cl.clone(),
+                    after: c,
+                    through: c,
+                    changes: crate::projection_fence::VisibilityChanges::default(),
+                });
             }
             PgSingleFastAttempt::Handled(BatchExecOutcome::Committed {
                 slots: vec![ItemOutcomeSlot::Failed(err)],
                 space_effective_cuts: cuts,
-                visibility_windows: Vec::new(),
+                visibility_windows: windows,
             })
         }
         PgFastInnerResult::Committed {
             response_bytes,
+            initial_cut,
             new_effective_cut,
         } => {
             store
@@ -4149,7 +4158,16 @@ async fn execute_pg_fast_rollback_on_conn(
                     has_idempotency: true,
                 }],
                 space_effective_cuts: cuts,
-                visibility_windows: Vec::new(),
+                visibility_windows: vec![crate::projection_fence::VisibilityWindow {
+                    scope: scope_cl.clone(),
+                    after: initial_cut,
+                    through: new_effective_cut,
+                    changes: crate::projection_fence::VisibilityChanges {
+                        notes: true,
+                        folders: true,
+                        erasures: false,
+                    },
+                }],
             })
         }
         PgFastInnerResult::UnknownCommit {
@@ -6428,6 +6446,7 @@ async fn execute_pg_fast_rollback_inner(
             }
             PgFastInnerResult::Committed {
                 response_bytes,
+                initial_cut: current_effective_cut,
                 new_effective_cut,
             }
         }

@@ -528,7 +528,14 @@ pub(crate) struct PublishedCut {
 }
 
 type BoardDeltaSlot = Mutex<Option<notarium_core::ports::BoardDelta>>;
-type BoardDeltaRegistry = Arc<Mutex<Vec<Weak<BoardDeltaSlot>>>>;
+
+#[derive(Default)]
+struct BoardDeltaState {
+    deltas: Vec<Weak<BoardDeltaSlot>>,
+    scrub_floors: BTreeMap<HistoryIncarnation, SpaceSeq>,
+}
+
+type BoardDeltaRegistry = Arc<Mutex<BoardDeltaState>>;
 
 struct SpaceEventChannel {
     sender: broadcast::Sender<events::QueuedEvent>,
@@ -539,7 +546,50 @@ impl SpaceEventChannel {
     fn new() -> Self {
         Self {
             sender: broadcast::channel(256).0,
-            board_deltas: Arc::new(Mutex::new(Vec::new())),
+            board_deltas: Arc::new(Mutex::new(BoardDeltaState::default())),
+        }
+    }
+
+    fn track_board_delta(
+        board_deltas: &BoardDeltaRegistry,
+        scope: &HistoryScope,
+        seq: SpaceSeq,
+        delta: &board_events::ScrubbableBoardDelta,
+    ) {
+        let mut state = board_deltas
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state
+            .scrub_floors
+            .get(&scope.incarnation)
+            .is_some_and(|&floor| seq <= floor)
+        {
+            delta.clear();
+        } else {
+            state.deltas.retain(|weak| weak.strong_count() > 0);
+            state.deltas.push(delta.downgrade());
+        }
+    }
+
+    fn scrub_board_deltas(
+        board_deltas: &BoardDeltaRegistry,
+        scope: &HistoryScope,
+        through: SpaceSeq,
+    ) {
+        let mut state = board_deltas
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state
+            .scrub_floors
+            .entry(scope.incarnation)
+            .and_modify(|floor| *floor = (*floor).max(through))
+            .or_insert(through);
+        for weak in state.deltas.drain(..) {
+            if let Some(slot) = weak.upgrade() {
+                *slot
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            }
         }
     }
 }
@@ -593,35 +643,40 @@ impl ProjectionEngine {
             if let events::QueuedEvent::Board(notice) = &event
                 && let Some(delta) = &notice.delta
             {
-                let mut entries = board_deltas
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                entries.retain(|weak| weak.strong_count() > 0);
-                entries.push(delta.downgrade());
+                SpaceEventChannel::track_board_delta(
+                    &board_deltas,
+                    &notice.scope,
+                    notice.seq,
+                    delta,
+                );
             }
             let _ = sender.send(event);
         }
     }
 
-    pub(super) fn scrub_space_events(&self, space: &SpaceId) {
-        let board_deltas = self
-            .space_events
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(space)
-            .map(|channel| Arc::clone(&channel.board_deltas));
-        if let Some(board_deltas) = board_deltas {
-            let mut entries = board_deltas
-                .lock()
+    pub(super) fn scrub_space_events(&self, scope: &HistoryScope, through: SpaceSeq) {
+        let board_deltas = {
+            let channels = self
+                .space_events
+                .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            for weak in entries.drain(..) {
-                if let Some(slot) = weak.upgrade() {
-                    *slot
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-                }
-            }
+            channels
+                .get(&scope.space_id)
+                .map(|channel| Arc::clone(&channel.board_deltas))
         }
+        .unwrap_or_else(|| {
+            let mut channels = self
+                .space_events
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            Arc::clone(
+                &channels
+                    .entry(scope.space_id.clone())
+                    .or_insert_with(SpaceEventChannel::new)
+                    .board_deltas,
+            )
+        });
+        SpaceEventChannel::scrub_board_deltas(&board_deltas, scope, through);
     }
 
     fn prune_event_channels(&self) {
@@ -742,7 +797,11 @@ impl ProjectionEngine {
         generation.slot(space)
     }
 
-    fn current_admission(
+    pub(crate) fn active_generation(&self) -> ProjectionGeneration {
+        self.generation.load().store.generation()
+    }
+
+    pub(crate) fn current_admission(
         &self,
         generation: ProjectionGeneration,
     ) -> Result<tokio::sync::RwLockReadGuard<'_, ()>, PortError> {
@@ -969,4 +1028,74 @@ fn cache_identity(root: &DataRoot) -> Result<String, PortError> {
     let _ = fs::remove_file(staging);
     result.map_err(checkpoint_error)?;
     read()
+}
+
+#[cfg(test)]
+mod event_scrub_tests {
+    use super::*;
+    use notarium_core::ports::{BoardDelta, GroupCount, GroupKey, ViewRef};
+    use notarium_core::value::ScalarValue;
+
+    #[test]
+    fn scrub_space_events_clears_queued_and_late_board_deltas_in_ram() {
+        let scope = HistoryScope {
+            space_id: SpaceId::from_bytes([7; 16]),
+            incarnation: HistoryIncarnation::from_bytes([8; 16]),
+        };
+        let channel = SpaceEventChannel::new();
+        let make_delta = |seq: u64| {
+            board_events::ScrubbableBoardDelta::new(BoardDelta {
+                scope: scope.clone(),
+                seq: SpaceSeq::new(seq).unwrap(),
+                view: ViewRef {
+                    note: NoteId::from_bytes([1; 16]),
+                    key: ViewKey::from_bytes([2; 16]),
+                },
+                groups: vec![GroupCount {
+                    group: GroupKey::Value(ScalarValue::String("todo".into())),
+                    count: 1,
+                }],
+                ranks: vec![(NoteId::from_bytes([3; 16]), "000001".into())],
+            })
+        };
+
+        let queued_delta = make_delta(5);
+        SpaceEventChannel::track_board_delta(
+            &channel.board_deltas,
+            &scope,
+            SpaceSeq::new(5).unwrap(),
+            &queued_delta,
+        );
+        assert!(queued_delta.clone_payload().is_some());
+
+        // Purge at seq 10 must immediately clear queued BoardDelta in RAM before
+        // any subscriber polls, and record scrub_floor = 10 for late notices.
+        SpaceEventChannel::scrub_board_deltas(
+            &channel.board_deltas,
+            &scope,
+            SpaceSeq::new(10).unwrap(),
+        );
+        assert!(
+            queued_delta.clone_payload().is_none(),
+            "queued BoardDelta payload must be scrubbed in RAM immediately on purge"
+        );
+
+        // Late notice at seq 9 <= floor 10 must be cleared on enqueue; newer seq 11 must survive.
+        let late_delta = make_delta(9);
+        SpaceEventChannel::track_board_delta(
+            &channel.board_deltas,
+            &scope,
+            SpaceSeq::new(9).unwrap(),
+            &late_delta,
+        );
+        let newer_delta = make_delta(11);
+        SpaceEventChannel::track_board_delta(
+            &channel.board_deltas,
+            &scope,
+            SpaceSeq::new(11).unwrap(),
+            &newer_delta,
+        );
+        assert!(late_delta.clone_payload().is_none());
+        assert!(newer_delta.clone_payload().is_some());
+    }
 }

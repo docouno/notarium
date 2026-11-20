@@ -329,20 +329,70 @@ impl IndexView {
             .copied()
             .chain(base.iter().copied().map(u32::from_le_bytes))
     }
+}
 
-    pub fn cluster(&self, index: u32) -> Option<ClusterId> {
+/// Zero-allocation cluster key unifying 16-byte mmap cluster IDs and borrowed
+/// in-memory `ClusterId` values without heap allocation per node.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub(crate) enum ClusterKey<'a> {
+    Bytes([u8; 16]),
+    Borrowed(&'a ClusterId),
+}
+
+impl<'a> ClusterKey<'a> {
+    pub(crate) fn from_borrowed(id: &'a ClusterId) -> Self {
+        if let Some(bytes) = decode_v1_cluster_bytes(id) {
+            Self::Bytes(bytes)
+        } else {
+            Self::Borrowed(id)
+        }
+    }
+
+    pub(crate) fn into_cluster_id(self) -> ClusterId {
+        match self {
+            Self::Bytes(bytes) => ClusterId::from_bytes(bytes),
+            Self::Borrowed(id) => id.clone(),
+        }
+    }
+}
+
+fn decode_v1_cluster_bytes(id: &ClusterId) -> Option<[u8; 16]> {
+    let hex_str = id.as_str().strip_prefix(ClusterId::PREFIX)?;
+    let raw = hex_str.as_bytes();
+    if raw.len() != 32 {
+        return None;
+    }
+    let nibble = |byte: u8| match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    };
+    let mut out = [0u8; 16];
+    for (slot, pair) in out.iter_mut().zip(raw.as_chunks::<2>().0) {
+        *slot = (nibble(pair[0])? << 4) | nibble(pair[1])?;
+    }
+    Some(out)
+}
+
+impl IndexView {
+    pub(crate) fn cluster_key(&self, index: u32) -> Option<ClusterKey<'_>> {
         if self.l0.deleted.contains(index) {
             return None;
         }
-        self.l0
-            .cluster_delta
-            .get(&index)
-            .cloned()
-            .unwrap_or_else(|| match &self.l0.cluster_overlay {
-                Some(ClusterOverlay::Resident(snapshot, _)) => snapshot.cluster(index).cloned(),
-                Some(ClusterOverlay::Deferred(_)) => None,
-                None => self.base.cluster(index),
-            })
+        if let Some(overridden) = self.l0.cluster_delta.get(&index) {
+            return overridden.as_ref().map(ClusterKey::from_borrowed);
+        }
+        match &self.l0.cluster_overlay {
+            Some(ClusterOverlay::Resident(snapshot, _)) => {
+                snapshot.cluster(index).map(ClusterKey::from_borrowed)
+            }
+            Some(ClusterOverlay::Deferred(_)) => None,
+            None => self.base.cluster_bytes(index).map(ClusterKey::Bytes),
+        }
+    }
+
+    pub fn cluster(&self, index: u32) -> Option<ClusterId> {
+        self.cluster_key(index).map(ClusterKey::into_cluster_id)
     }
 
     pub(crate) fn deferred_clusters(&self) -> Option<notarium_core::ids::SpaceSeq> {

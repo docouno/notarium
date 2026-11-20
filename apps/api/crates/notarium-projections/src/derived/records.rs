@@ -286,6 +286,7 @@ record! {
         view_fingerprint: Option<ContentDigest>,
         #[serde(with = "msgpack_bytes::optional")]
         compiled_msgpack: Option<Vec<u8>>,
+        #[serde(with = "msgpack_bytes")]
         diagnostics_msgpack: Vec<u8>,
     }
 }
@@ -298,6 +299,7 @@ record! {
         view_key: ViewKey,
         target_note_id: NoteId,
         group_key_hex: String,
+        #[serde(with = "msgpack_bytes")]
         group_key_msgpack: Vec<u8>,
         sort_rank_lexo: String,
         rank_rev_id: RevisionId,
@@ -378,7 +380,9 @@ record! {
         cluster_id: ClusterId,
         member_count: u64,
         anchor_note_id: NoteId,
+        #[serde(with = "msgpack_bytes")]
         members_roaring: Vec<u8>,
+        #[serde(with = "msgpack_bytes")]
         inter_edges_msgpack: Vec<u8>,
         updated_seq: SpaceSeq,
     }

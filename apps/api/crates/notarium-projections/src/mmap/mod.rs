@@ -21,7 +21,7 @@ use memmap2::Mmap;
 use notarium_core::model::Lifecycle;
 use notarium_core::{
     DomainError, DomainResult,
-    ids::{ClusterId, FolderId, NoteId, ProjectionGeneration, SpaceSeq},
+    ids::{FolderId, NoteId, ProjectionGeneration, SpaceSeq},
     model::HistoryScope,
 };
 
@@ -568,23 +568,28 @@ impl BaseIndexHandle {
     }
 }
 
+fn is_lower_hex(value: &str, len: usize) -> bool {
+    value.len() == len
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
 pub(crate) fn discard_abandoned_temp(
     path: &Path,
     generation: ProjectionGeneration,
     scope: &HistoryScope,
     through: SpaceSeq,
 ) -> Result<(), IndexError> {
-    let nonce = path
-        .file_name()
-        .and_then(|name| name.to_str())
+    let name = path.file_name().and_then(|name| name.to_str());
+    let is_temp = name
         .and_then(|name| name.strip_prefix(".fast-index-"))
-        .and_then(|name| name.strip_suffix(".tmp"));
-    if !nonce.is_some_and(|nonce| {
-        nonce.len() == 32
-            && nonce
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-    }) {
+        .and_then(|name| name.strip_suffix(".tmp"))
+        .is_some_and(|nonce| is_lower_hex(nonce, 32));
+    let is_deleted = name
+        .and_then(|name| name.strip_prefix(".deleted-"))
+        .is_some_and(|nonce| is_lower_hex(nonce, 16));
+    if !is_temp && !is_deleted {
         return Ok(());
     }
     let _mutation = file_mutations();
@@ -933,7 +938,11 @@ fn remove_readonly(path: &Path) -> io::Result<()> {
             let _ = getrandom::fill(&mut nonce);
             let tombstone = parent.join(format!(".deleted-{}", hex::encode(nonce)));
             if fs::rename(path, &tombstone).is_ok() {
-                return fs::remove_file(&tombstone);
+                if let Err(err) = fs::remove_file(&tombstone) {
+                    let _ = fs::rename(&tombstone, path);
+                    return Err(err);
+                }
+                return Ok(());
             }
         }
     }
@@ -1408,13 +1417,12 @@ impl MappedFastIndex {
             .unwrap_or_default()
     }
 
-    pub fn cluster(&self, node: u32) -> Option<ClusterId> {
+    pub fn cluster_bytes(&self, node: u32) -> Option<[u8; 16]> {
         let (assignments, ids) = self
             .section(SectionKind::Clusters)
             .split_at(self.node_count() as usize * 4);
         let slot = u32_at(assignments, (node as usize).checked_mul(4)?)?;
-        let bytes = *ids.as_chunks::<16>().0.get(slot as usize)?;
-        Some(ClusterId::from_bytes(bytes))
+        ids.as_chunks::<16>().0.get(slot as usize).copied()
     }
 }
 

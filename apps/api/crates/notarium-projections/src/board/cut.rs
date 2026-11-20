@@ -105,6 +105,7 @@ impl BoardCut {
         additional_notes: impl IntoIterator<Item = &'a NoteId>,
         deadline: &PlannerDeadline,
     ) -> Result<Self, PortError> {
+        let _ = engine.current_admission(engine.active_generation())?;
         let views: BTreeSet<_> = views.into_iter().cloned().collect();
         let canonical = engine.canonical();
         let mut projection = engine.projection_context_for(ctx);
@@ -807,6 +808,7 @@ impl BoardCut {
         deadline: &PlannerDeadline,
     ) -> Result<LiveReadPermit, PortError> {
         deadline.check()?;
+        let _admission = engine.current_admission(engine.active_generation())?;
         let permit = engine.live_handle(&self.scope)?.try_read()?;
         if permit.space().lifecycle != SpaceLifecycle::Active {
             return Err(DomainError::ResourceNotFound.into());
@@ -855,10 +857,15 @@ impl BoardCut {
             if restoration.planned_lifecycle == Lifecycle::Active {
                 check_folder(&restoration.planned_parent_folder)?;
             }
-            if let LiveNoteStatus::ActiveVisible(facts) =
-                permit.classify(ctx, &restoration.note, true)?
-            {
-                ctx.auth().authorize_read(&facts)?;
+            match permit.classify(ctx, &restoration.note, false)? {
+                LiveNoteStatus::ActiveVisible(facts)
+                | LiveNoteStatus::TrashedVisible(facts)
+                | LiveNoteStatus::EncryptedVisible { facts, .. } => {
+                    ctx.auth().authorize_read(&facts)?;
+                }
+                LiveNoteStatus::HiddenByAuth { .. } | LiveNoteStatus::PurgedOrAbsent => {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
             }
         }
         Ok(permit)
@@ -1424,5 +1431,339 @@ mod tests {
             ),
             Err(PortError::Domain(DomainError::ResourceNotFound)),
         ));
+    }
+
+    #[tokio::test]
+    async fn check_live_rejects_hidden_or_purged_restorations_and_closed_admission() {
+        use crate::{ProjectionConfig, ProjectorRuntime};
+        use notarium_canonical::{
+            CanonicalConfig, CanonicalRuntime, CreateFolderSpec, CreateSpaceSpec,
+        };
+        use notarium_core::{
+            epoch::DataRoot,
+            ids::{CommandKey, InstallationId, LeaseEpoch, ProjectionGeneration},
+            ports::{
+                CreateNote, DeleteDisposition, DeleteNote, MaintenanceContext, MoveNote, Mutation,
+                NoteWritePort, Preconditions, ServiceAuthority, ServicePurpose,
+            },
+            receipt::CommandIdentity,
+        };
+
+        let dir = std::env::temp_dir().join(format!(
+            "notarium-board-cut-{}",
+            hex::encode(notarium_canonical::codec::csprng_16().unwrap())
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = DataRoot::new(dir.clone());
+        let (store, canonical) = CanonicalRuntime::open(CanonicalConfig::local_default(
+            InstallationId::from_bytes([1; 16]),
+            root.clone(),
+        ))
+        .await
+        .unwrap();
+        let actor = PrincipalId::from_bytes([2; 16]);
+        let space = store
+            .create_space(CreateSpaceSpec {
+                space_id: SpaceId::from_bytes([3; 16]),
+                incarnation: HistoryIncarnation::from_bytes([4; 16]),
+                root_folder_id: FolderId::from_bytes([5; 16]),
+                slug: "board-cut-live".into(),
+                kind: SpaceKind::Shared,
+                owner: actor.clone(),
+                active_epoch: LeaseEpoch::new(1).unwrap(),
+                initial_last_seq: SpaceSeq::ZERO,
+                created_at: None,
+            })
+            .await
+            .unwrap();
+        let scope = space.scope.clone();
+        let project_a = FolderId::from_bytes([6; 16]);
+        let project_b = FolderId::from_bytes([7; 16]);
+        for (folder_id, slug) in [(&project_a, "proj-a"), (&project_b, "proj-b")] {
+            store
+                .create_folder(CreateFolderSpec {
+                    scope: scope.clone(),
+                    active_epoch: space.active_epoch,
+                    folder_id: folder_id.clone(),
+                    parent: None,
+                    slug: slug.into(),
+                    display_name: slug.into(),
+                    is_project: true,
+                    project_slug: Some(slug.into()),
+                    actor: actor.clone(),
+                    timestamp: None,
+                })
+                .await
+                .unwrap();
+        }
+        let budget = CallBudget {
+            request: RequestId::from_bytes([8; 16]),
+            cancellation: Default::default(),
+            remaining: Duration::from_secs(5),
+        };
+        let owner = SpaceContext::new(
+            EngineAuthContext::for_human(VerifiedHuman::attest(
+                actor.clone(),
+                GrantId::from_bytes([9; 16]),
+                BTreeMap::from([(
+                    scope.space_id.clone(),
+                    SpaceGrant {
+                        role: SpaceRole::Owner,
+                        read_classes: DocClass::all(),
+                        write_classes: DocClass::all(),
+                        project_root: None,
+                    },
+                )]),
+                true,
+            )),
+            scope.clone(),
+            budget.clone(),
+        )
+        .unwrap();
+        let scoped = SpaceContext::new(
+            EngineAuthContext::for_human(VerifiedHuman::attest(
+                PrincipalId::from_bytes([10; 16]),
+                GrantId::from_bytes([11; 16]),
+                BTreeMap::from([(
+                    scope.space_id.clone(),
+                    SpaceGrant {
+                        role: SpaceRole::Editor,
+                        read_classes: DocClass::all(),
+                        write_classes: DocClass::all(),
+                        project_root: Some(project_a.clone()),
+                    },
+                )]),
+                false,
+            )),
+            scope.clone(),
+            budget.clone(),
+        )
+        .unwrap();
+        let proj_ctx = MaintenanceContext {
+            authority: ServiceAuthority::admit(ServicePurpose::Projection),
+            budget: budget.clone(),
+        };
+        let runtime = ProjectorRuntime::start_sqlite(
+            store.clone(),
+            proj_ctx,
+            root,
+            ProjectionGeneration::new(1).unwrap(),
+            ProjectionConfig::default(),
+        )
+        .await
+        .unwrap();
+        let engine = runtime.engine();
+
+        let view_key = ViewKey::from_bytes([12; 16]);
+        let board_id = NoteId::from_bytes([13; 16]);
+        let moved_id = NoteId::from_bytes([14; 16]);
+        let purged_id = NoteId::from_bytes([15; 16]);
+        let make_cmd = |seed: u8| CommandIdentity {
+            scope: scope.clone(),
+            actor: actor.clone(),
+            key: CommandKey::from_bytes([seed; 16]),
+            hash: ContentDigest::from_bytes([seed; 32]),
+        };
+        store
+            .create_note(
+                owner.clone(),
+                Mutation {
+                    identity: make_cmd(20),
+                    preconditions: Preconditions::default(),
+                    input: CreateNote {
+                        note: board_id.clone(),
+                        parent: Some(project_a.clone()),
+                        slug: "board".into(),
+                        class: DocClass::UserDoc,
+                        carrier: format!(
+                            "```nota\nid: {view_key}\ntype: board\nsource: {{scope: folder, folder: {project_a}}}\ngroup_by: status\n```\n"
+                        ),
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        let moved_created = store
+            .create_note(
+                owner.clone(),
+                Mutation {
+                    identity: make_cmd(21),
+                    preconditions: Preconditions::default(),
+                    input: CreateNote {
+                        note: moved_id.clone(),
+                        parent: Some(project_a.clone()),
+                        slug: "moved".into(),
+                        class: DocClass::UserDoc,
+                        carrier: "---\nstatus: todo\n---\n".into(),
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        let purged_created = store
+            .create_note(
+                owner.clone(),
+                Mutation {
+                    identity: make_cmd(22),
+                    preconditions: Preconditions::default(),
+                    input: CreateNote {
+                        note: purged_id.clone(),
+                        parent: Some(project_a.clone()),
+                        slug: "purged".into(),
+                        class: DocClass::UserDoc,
+                        carrier: "---\nstatus: todo\n---\n".into(),
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        let past_cutoff = purged_created.receipt.seq();
+        engine
+            .wait_for_projected(&scope, past_cutoff, &budget)
+            .await
+            .unwrap();
+
+        // 1. Move moved_id out of project_a -> project_b (no purge fence yet), load BoardCut
+        //    at past_cutoff, and prove check_live rejects the HiddenByAuth restoration.
+        let moved_receipt = store
+            .move_note(
+                owner.clone(),
+                Mutation {
+                    identity: make_cmd(23),
+                    preconditions: Preconditions::default(),
+                    input: MoveNote {
+                        note: moved_id.clone(),
+                        parent: Some(project_b.clone()),
+                        slug: "moved".into(),
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        engine
+            .wait_for_projected(&scope, moved_receipt.receipt.seq(), &budget)
+            .await
+            .unwrap();
+
+        let view_ref = ViewRef {
+            note: board_id.clone(),
+            key: view_key,
+        };
+        let deadline = PlannerDeadline::start(&scoped);
+        let cut = BoardCut::load(
+            &engine,
+            &scoped,
+            Some(past_cutoff),
+            [&view_ref],
+            [&moved_id, &purged_id],
+            &deadline,
+        )
+        .await
+        .unwrap();
+        let hidden_restoration = PlannedNoteRestoration {
+            note: moved_id,
+            current_revision: moved_created.value.revision,
+            restored_from_revision: None,
+            planned_lifecycle: Lifecycle::Active,
+            planned_parent_folder: project_a.clone(),
+            planned_class: DocClass::UserDoc,
+            planned_ability: None,
+            planned_fields: BTreeMap::new(),
+            planned_header_diagnostic: None,
+            planned_carrier: None,
+        };
+        assert!(matches!(
+            cut.check_live(
+                &engine,
+                &scoped,
+                Some(past_cutoff),
+                std::iter::empty(),
+                std::iter::empty(),
+                std::iter::empty(),
+                std::iter::once(&hidden_restoration),
+                &deadline,
+            ),
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ));
+
+        // 2. Now purge purged_id concurrently after BoardCut::load and prove check_live
+        //    rejects the PurgedOrAbsent restoration instead of silently skipping it.
+        let purged_receipt = store
+            .delete_note(
+                owner.clone(),
+                Mutation {
+                    identity: make_cmd(24),
+                    preconditions: Preconditions::default(),
+                    input: DeleteNote {
+                        note: purged_id.clone(),
+                        disposition: DeleteDisposition::Purge,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        engine
+            .wait_for_projected(&scope, purged_receipt.receipt.seq(), &budget)
+            .await
+            .unwrap();
+        let purged_restoration = PlannedNoteRestoration {
+            note: purged_id,
+            current_revision: purged_created.value.revision,
+            restored_from_revision: None,
+            planned_lifecycle: Lifecycle::Active,
+            planned_parent_folder: project_a,
+            planned_class: DocClass::UserDoc,
+            planned_ability: None,
+            planned_fields: BTreeMap::new(),
+            planned_header_diagnostic: None,
+            planned_carrier: None,
+        };
+        assert!(matches!(
+            cut.check_live(
+                &engine,
+                &scoped,
+                Some(past_cutoff),
+                std::iter::empty(),
+                std::iter::empty(),
+                std::iter::empty(),
+                std::iter::once(&purged_restoration),
+                &deadline,
+            ),
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ));
+
+        // After shutdown (`publication_closed == true`), both BoardCut::check_live and BoardCut::load
+        // must fail closed with NotReady.
+        runtime.shutdown().await.unwrap();
+        assert!(matches!(
+            cut.check_live(
+                &engine,
+                &owner,
+                Some(past_cutoff),
+                std::iter::empty(),
+                std::iter::empty(),
+                std::iter::empty(),
+                std::iter::empty(),
+                &deadline,
+            ),
+            Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
+                if diagnostic.reason == ValidationReason::NotReady
+        ));
+        assert!(matches!(
+            BoardCut::load(
+                &engine,
+                &owner,
+                Some(past_cutoff),
+                [&view_ref],
+                std::iter::empty(),
+                &deadline,
+            )
+            .await,
+            Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
+                if diagnostic.reason == ValidationReason::NotReady
+        ));
+
+        canonical.shutdown().await.unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

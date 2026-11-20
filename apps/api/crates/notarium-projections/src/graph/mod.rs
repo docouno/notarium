@@ -11,7 +11,7 @@ use notarium_core::{
     ports::{GraphEdge, GraphNode, GraphNodeId, GraphResult, GraphTier},
 };
 
-use crate::index::{GraphSections, IndexView, PostingKey};
+use crate::index::{ClusterKey, GraphSections, IndexView, PostingKey};
 
 mod leiden;
 pub(crate) use leiden::LeidenSnapshot;
@@ -26,11 +26,12 @@ pub(crate) trait GraphAdjacency {
     fn note_id_str(&self, node: u32) -> Option<&str>;
     fn outgoing(&self, node: u32) -> impl Iterator<Item = u32> + Send + '_;
     fn incoming(&self, node: u32) -> impl Iterator<Item = u32> + Send + '_;
-    fn cluster(&self, node: u32) -> Option<ClusterId>;
+    fn cluster_key(&self, node: u32) -> Option<ClusterKey<'_>>;
 
     fn cluster_members(&self, cluster: &ClusterId) -> DomainResult<Option<Bitmap>> {
+        let target = ClusterKey::from_borrowed(cluster);
         let members = (0..self.node_count())
-            .filter(|&node| self.cluster(node).as_ref() == Some(cluster))
+            .filter(|&node| self.cluster_key(node) == Some(target))
             .collect::<Bitmap>();
         Ok((!members.is_empty()).then_some(members))
     }
@@ -61,8 +62,8 @@ impl GraphAdjacency for IndexView {
         self.incoming(node)
     }
 
-    fn cluster(&self, node: u32) -> Option<ClusterId> {
-        self.cluster(node)
+    fn cluster_key(&self, node: u32) -> Option<ClusterKey<'_>> {
+        self.cluster_key(node)
     }
 
     fn cluster_members(&self, id: &ClusterId) -> DomainResult<Option<Bitmap>> {
@@ -107,10 +108,10 @@ impl GraphAdjacency for SettledGraph<'_> {
         self.index.incoming(node)
     }
 
-    fn cluster(&self, node: u32) -> Option<ClusterId> {
+    fn cluster_key(&self, node: u32) -> Option<ClusterKey<'_>> {
         match self.settlement {
-            Some(settlement) => settlement.cluster(node).cloned(),
-            None => self.index.cluster(node),
+            Some(settlement) => settlement.cluster(node).map(ClusterKey::from_borrowed),
+            None => self.index.cluster_key(node),
         }
     }
 
@@ -169,8 +170,11 @@ impl GraphAdjacency for GraphBuild<'_> {
             .copied()
     }
 
-    fn cluster(&self, node: u32) -> Option<ClusterId> {
-        self.sections.clusters.get(node as usize).cloned().flatten()
+    fn cluster_key(&self, node: u32) -> Option<ClusterKey<'_>> {
+        self.sections
+            .clusters
+            .get(node as usize)
+            .and_then(|entry| entry.as_ref().map(ClusterKey::from_borrowed))
     }
 }
 
@@ -235,17 +239,17 @@ fn superclusters(
     visible: &Bitmap,
     hidden: u64,
 ) -> DomainResult<GraphPlan> {
-    let mut cluster_slots = HashMap::<ClusterId, usize>::new();
+    let mut cluster_slots = HashMap::<ClusterKey<'_>, usize>::new();
     let mut clusters: Vec<(ClusterId, Bitmap)> = Vec::new();
     let mut unclustered = 0u64;
     for dense in visible.iter() {
-        if let Some(cluster) = adjacency.cluster(dense) {
-            let slot = if let Some(&slot) = cluster_slots.get(&cluster) {
+        if let Some(key) = adjacency.cluster_key(dense) {
+            let slot = if let Some(&slot) = cluster_slots.get(&key) {
                 slot
             } else {
                 let slot = clusters.len();
-                cluster_slots.insert(cluster.clone(), slot);
-                clusters.push((cluster, Bitmap::new()));
+                cluster_slots.insert(key, slot);
+                clusters.push((key.into_cluster_id(), Bitmap::new()));
                 slot
             };
             clusters[slot].1.add(dense);

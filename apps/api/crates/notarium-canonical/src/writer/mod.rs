@@ -1465,12 +1465,7 @@ async fn flush_single_batch(
         BatchExecOutcome::Committed {
             visibility_windows, ..
         } => {
-            let needs_pg_read = visibility.has_unreadable_state()
-                || visibility_windows.iter().any(|w| {
-                    w.changes.erasures
-                        || (visibility.has_live_state() && (w.changes.notes || w.changes.folders))
-                });
-            if needs_pg_read
+            if visibility.needs_storage_read(&store, visibility_windows)
                 && let SqlDriverState::Postgres { pool, .. } = &inner.sql
                 && pool.max_connections() <= 1
             {
@@ -1648,14 +1643,16 @@ pub(crate) fn visibility_windows(
                 effective_cut,
                 changes,
                 ..
-            } if persisted_initial_seq < effective_cut => {
-                Some(crate::projection_fence::VisibilityWindow {
-                    scope: record.scope.clone(),
-                    after: *persisted_initial_seq,
-                    through: *effective_cut,
-                    changes: *changes,
-                })
-            }
+            } => Some(crate::projection_fence::VisibilityWindow {
+                scope: record.scope.clone(),
+                after: *persisted_initial_seq,
+                through: *effective_cut,
+                changes: if persisted_initial_seq < effective_cut {
+                    *changes
+                } else {
+                    crate::projection_fence::VisibilityChanges::default()
+                },
+            }),
             _ => None,
         })
         .collect()
@@ -1816,7 +1813,7 @@ async fn execute_batch_on_conn(
                     return BatchExecOutcome::Committed {
                         slots: vec![ItemOutcomeSlot::Failed(item_err)],
                         space_effective_cuts,
-                        visibility_windows: Vec::new(),
+                        visibility_windows: visibility_windows(store, &space_states),
                     };
                 }
                 // Rollback ONLY this item's savepoint; virtual `effective_cut` stays unchanged!

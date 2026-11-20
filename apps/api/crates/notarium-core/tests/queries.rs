@@ -565,3 +565,64 @@ fn every_domain_error_has_a_unique_serialized_code_and_safe_typed_details() {
     }
     assert_eq!(codes.len(), 12);
 }
+
+#[test]
+fn filter_validation_rejects_empty_and_proto_field_keys() {
+    let schema = BTreeMap::new();
+    for bad_key in ["", "__proto__"] {
+        let predicates = [
+            Predicate::Eq {
+                key: bad_key.into(),
+                value: ScalarValue::String("x".into()),
+            },
+            Predicate::Contains {
+                key: bad_key.into(),
+                value: ScalarValue::String("x".into()),
+            },
+            Predicate::NumberRange {
+                key: bad_key.into(),
+                range: ValueRange {
+                    lower: None,
+                    upper: None,
+                },
+            },
+            Predicate::DateRange {
+                key: bad_key.into(),
+                range: ValueRange {
+                    lower: None,
+                    upper: None,
+                },
+            },
+            Predicate::TimestampRange {
+                key: bad_key.into(),
+                range: ValueRange {
+                    lower: None,
+                    upper: None,
+                },
+            },
+            Predicate::Exists {
+                key: bad_key.into(),
+            },
+            Predicate::IsBad {
+                key: bad_key.into(),
+            },
+            Predicate::IsAbsent {
+                key: bad_key.into(),
+            },
+        ];
+        for predicate in predicates {
+            let filter = FieldFilterAstV1 {
+                version: 1,
+                predicate,
+            };
+            assert!(
+                filter.validate(&schema).is_err(),
+                "expected invalid filter for key {bad_key:?}"
+            );
+            assert!(
+                filter.validate_declared(&schema).is_err(),
+                "expected strict invalid filter for key {bad_key:?}"
+            );
+        }
+    }
+}

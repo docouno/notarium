@@ -560,20 +560,40 @@ impl DerivedStore {
                     if seed {
                         clear_space(&mut tx, &next.scope.space_id).await?;
                     }
-                    for page in 0..page_count {
-                        let encoded = get_staging_page(&mut tx, &key, page)
+                    if page_count == 1 {
+                        let encoded = get_staging_page(&mut tx, &key, 0)
                             .await?
                             .ok_or_else(stale)?;
                         let mutations: Vec<DerivedMutation> = decode(&encoded)?;
                         drop(encoded);
+                        tx.execute(
+                            "DELETE FROM projection_apply_pages WHERE space_id = ? AND history_incarnation = ?
+                             AND first_seq = ? AND last_seq = ?",
+                            stage_values(&key),
+                        )
+                        .await?;
                         apply_mutations(&mut tx, &next, &mutations).await?;
+                    } else {
+                        // Stream multi-page stages without holding all decoded pages in RAM.
+                        // `lock_scopes` already locked `projection_space_guard FOR UPDATE` for
+                        // `key.scope` and every target Space in `deps` in sorted SpaceId order,
+                        // serializing all overlapping `projection_apply_pages` and `chat_note_refs`
+                        // mutations across Spaces.
+                        for page in 0..page_count {
+                            let encoded = get_staging_page(&mut tx, &key, page)
+                                .await?
+                                .ok_or_else(stale)?;
+                            let mutations: Vec<DerivedMutation> = decode(&encoded)?;
+                            drop(encoded);
+                            apply_mutations(&mut tx, &next, &mutations).await?;
+                        }
+                        tx.execute(
+                            "DELETE FROM projection_apply_pages WHERE space_id = ? AND history_incarnation = ?
+                             AND first_seq = ? AND last_seq = ?",
+                            stage_values(&key),
+                        )
+                        .await?;
                     }
-                    tx.execute(
-                        "DELETE FROM projection_apply_pages WHERE space_id = ? AND history_incarnation = ?
-                         AND first_seq = ? AND last_seq = ?",
-                        stage_values(&key),
-                    )
-                    .await?;
                     if destructive {
                         check_apply_floor(
                             &next,
@@ -765,13 +785,22 @@ impl DerivedStore {
         entries: &[(ChatThreadId, ThreadEntrySeq)],
     ) -> Result<(), PortError> {
         let scope = scope.clone();
-        let entries = entries.to_vec();
+        let mut entries = entries.to_vec();
+        entries.sort_unstable();
+        entries.dedup();
         self.database
             .write(true, move |mut tx| {
                 Box::pin(async move {
                     check_guard(&mut tx, &scope).await?;
-                    for (thread, entry) in entries {
-                        redact_entry(&mut tx, &scope, &thread, entry).await?;
+                    // Canonical lock order: markers -> projection_apply_pages -> chat_note_refs.
+                    for (thread, entry) in &entries {
+                        insert_redaction_marker(&mut tx, &scope, thread, *entry).await?;
+                    }
+                    for (thread, entry) in &entries {
+                        discard_redacted_staging(&mut tx, &scope, thread, *entry).await?;
+                    }
+                    for (thread, entry) in &entries {
+                        delete_redacted_chat_refs(&mut tx, &scope, thread, *entry).await?;
                     }
                     Ok(())
                 })
@@ -1542,9 +1571,28 @@ async fn erase_guarded(
     purged: &[NoteId],
     redacted: &[(ChatThreadId, ThreadEntrySeq)],
 ) -> Result<(), PortError> {
-    if !purged.is_empty() {
+    let mut sorted_purged = purged.to_vec();
+    sorted_purged.sort_unstable();
+    sorted_purged.dedup();
+    let mut sorted_redacted = redacted.to_vec();
+    sorted_redacted.sort_unstable();
+    sorted_redacted.dedup();
+
+    if !sorted_purged.is_empty() {
         raise_checkpoint_floor(tx, scope, through).await?;
         replay::prune_before(tx, scope, through).await?;
+    }
+    // Canonical lock order across all items in this transaction:
+    //   1) projected_purge_markers -> projected_redaction_markers
+    //   2) projection_apply_pages (own + incoming + redacted)
+    //   3) chat_note_refs + remaining per-note row cleanup
+    for note in &sorted_purged {
+        insert_purge_marker(tx, scope, note).await?;
+    }
+    for (thread, entry) in &sorted_redacted {
+        insert_redaction_marker(tx, scope, thread, *entry).await?;
+    }
+    if !sorted_purged.is_empty() {
         tx.execute(
             "DELETE FROM projection_apply_pages WHERE space_id = ? AND history_incarnation = ?
                     AND first_seq < ?",
@@ -1556,17 +1604,24 @@ async fn erase_guarded(
         )
         .await?;
     }
-    for note in purged {
-        purge_note(tx, scope, note, through).await?;
+    for note in &sorted_purged {
+        discard_incoming_staging(tx, &scope.space_id, Some((scope.incarnation, note))).await?;
     }
-    for (thread, entry) in redacted {
-        redact_entry(tx, scope, thread, *entry).await?;
+    for (thread, entry) in &sorted_redacted {
+        discard_redacted_staging(tx, scope, thread, *entry).await?;
+    }
+    for note in &sorted_purged {
+        delete_target_chat_refs(tx, scope, note).await?;
+        purge_note_rows(tx, scope, note, through).await?;
+    }
+    for (thread, entry) in &sorted_redacted {
+        delete_redacted_chat_refs(tx, scope, thread, *entry).await?;
     }
     if let Some(current) = watermark(tx, &scope.space_id).await? {
         if current.history_incarnation != scope.incarnation {
             return Err(mismatch());
         }
-        if !purged.is_empty() {
+        if !sorted_purged.is_empty() {
             tx.execute(
                 "UPDATE space_projection_watermarks SET
                     snapshot_seq = CASE WHEN snapshot_seq < ? THEN 0 ELSE snapshot_seq END,
@@ -1585,24 +1640,42 @@ async fn erase_guarded(
     Ok(())
 }
 
-async fn purge_target(
+async fn insert_purge_marker(
     tx: &mut SqlTransaction<'_>,
     scope: &HistoryScope,
     note: &NoteId,
 ) -> Result<(), PortError> {
-    // Canonical lock order: markers -> projection_apply_pages -> chat_note_refs.
     tx.execute(
         "INSERT INTO projected_purge_markers (space_id, history_incarnation, note_id) VALUES (?, ?, ?)
          ON CONFLICT DO NOTHING",
         vec![value(&scope.space_id), value(&scope.incarnation), value(note)],
     )
     .await?;
-    discard_incoming_staging(tx, &scope.space_id, Some((scope.incarnation, note))).await?;
+    Ok(())
+}
+
+async fn delete_target_chat_refs(
+    tx: &mut SqlTransaction<'_>,
+    scope: &HistoryScope,
+    note: &NoteId,
+) -> Result<(), PortError> {
     tx.execute(
         "DELETE FROM chat_note_refs WHERE target_space_id = ? AND target_incarnation = ? AND target_note_id = ?",
         vec![value(&scope.space_id), value(&scope.incarnation), value(note)],
     )
     .await?;
+    Ok(())
+}
+
+async fn purge_target(
+    tx: &mut SqlTransaction<'_>,
+    scope: &HistoryScope,
+    note: &NoteId,
+) -> Result<(), PortError> {
+    // Canonical lock order: markers -> projection_apply_pages -> chat_note_refs.
+    insert_purge_marker(tx, scope, note).await?;
+    discard_incoming_staging(tx, &scope.space_id, Some((scope.incarnation, note))).await?;
+    delete_target_chat_refs(tx, scope, note).await?;
     Ok(())
 }
 
@@ -1630,25 +1703,40 @@ async fn discard_incoming_staging(
     Ok(())
 }
 
-async fn redact_entry(
+fn redaction_args(
+    scope: &HistoryScope,
+    thread: &ChatThreadId,
+    entry: ThreadEntrySeq,
+) -> Vec<SqlValue> {
+    vec![
+        value(&scope.space_id),
+        value(&scope.incarnation),
+        value(thread),
+        value(&entry),
+    ]
+}
+
+async fn insert_redaction_marker(
     tx: &mut SqlTransaction<'_>,
     scope: &HistoryScope,
     thread: &ChatThreadId,
     entry: ThreadEntrySeq,
 ) -> Result<(), PortError> {
-    // Canonical lock order: markers -> projection_apply_pages -> chat_note_refs.
-    let args = vec![
-        value(&scope.space_id),
-        value(&scope.incarnation),
-        value(thread),
-        value(&entry),
-    ];
     tx.execute(
         "INSERT INTO projected_redaction_markers (space_id, history_incarnation, thread_id, entry_seq) VALUES (?, ?, ?, ?)
          ON CONFLICT DO NOTHING",
-        args.clone(),
+        redaction_args(scope, thread, entry),
     )
     .await?;
+    Ok(())
+}
+
+async fn discard_redacted_staging(
+    tx: &mut SqlTransaction<'_>,
+    scope: &HistoryScope,
+    thread: &ChatThreadId,
+    entry: ThreadEntrySeq,
+) -> Result<(), PortError> {
     tx.execute(
         "DELETE FROM projection_apply_pages
          WHERE (space_id, history_incarnation, first_seq, last_seq, page_no) IN (
@@ -1656,15 +1744,37 @@ async fn redact_entry(
              FROM projection_apply_chat_refs
              WHERE space_id = ? AND history_incarnation = ? AND thread_id = ? AND entry_seq = ?
          )",
-        args.clone(),
+        redaction_args(scope, thread, entry),
     )
     .await?;
+    Ok(())
+}
+
+async fn delete_redacted_chat_refs(
+    tx: &mut SqlTransaction<'_>,
+    scope: &HistoryScope,
+    thread: &ChatThreadId,
+    entry: ThreadEntrySeq,
+) -> Result<(), PortError> {
     tx.execute(
         "DELETE FROM chat_note_refs WHERE thread_space_id = ? AND source_incarnation = ?
             AND thread_id = ? AND entry_seq = ?",
-        args,
+        redaction_args(scope, thread, entry),
     )
     .await?;
+    Ok(())
+}
+
+async fn redact_entry(
+    tx: &mut SqlTransaction<'_>,
+    scope: &HistoryScope,
+    thread: &ChatThreadId,
+    entry: ThreadEntrySeq,
+) -> Result<(), PortError> {
+    // Canonical lock order: markers -> projection_apply_pages -> chat_note_refs.
+    insert_redaction_marker(tx, scope, thread, entry).await?;
+    discard_redacted_staging(tx, scope, thread, entry).await?;
+    delete_redacted_chat_refs(tx, scope, thread, entry).await?;
     Ok(())
 }
 
@@ -1675,6 +1785,15 @@ async fn purge_note(
     through: SpaceSeq,
 ) -> Result<(), PortError> {
     purge_target(tx, scope, note).await?;
+    purge_note_rows(tx, scope, note, through).await
+}
+
+async fn purge_note_rows(
+    tx: &mut SqlTransaction<'_>,
+    scope: &HistoryScope,
+    note: &NoteId,
+    through: SpaceSeq,
+) -> Result<(), PortError> {
     let space = &scope.space_id;
     let args = vec![value(space), value(note)];
     let dense = tx

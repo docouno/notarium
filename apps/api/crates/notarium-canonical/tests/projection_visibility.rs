@@ -664,3 +664,328 @@ async fn postgres_next_epoch_requires_the_previous_runtime_to_drain() {
     first_runtime.shutdown().await.unwrap();
     fixtures.drop_pg_schema(&schema).await;
 }
+
+#[tokio::test]
+async fn suspend_revokes_queued_writer_gate_and_re_admission_observes_post_write_state() {
+    let dir = TempDataRoot::new("projection-suspend-race");
+    let config = CanonicalConfig::local_default(sample_installation_id(31), dir.data_root());
+    let (store, runtime) = CanonicalRuntime::open(config).await.unwrap();
+    let space = create_space(&store, 31).await;
+    let projection = maintenance_ctx(ServicePurpose::Projection);
+    let handle = store
+        .admit_projection_space(&projection, &space.scope)
+        .await
+        .unwrap();
+    let actor = sample_principal_id(31);
+    let owner = SpaceContext::new(
+        EngineAuthContext::for_human(VerifiedHuman::attest(
+            actor.clone(),
+            GrantId::from_bytes([31; 16]),
+            BTreeMap::from([(
+                space.space.id.clone(),
+                SpaceGrant {
+                    role: SpaceRole::Owner,
+                    read_classes: DocClass::all(),
+                    write_classes: DocClass::all(),
+                    project_root: None,
+                },
+            )]),
+            true,
+        )),
+        space.scope.clone(),
+        projection.budget.clone(),
+    )
+    .unwrap();
+    let note = sample_note_id(31);
+    store
+        .create_note(
+            owner.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: space.scope.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([30; 16]),
+                    hash: ContentDigest::from_bytes([30; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: notarium_core::ports::CreateNote {
+                    note: note.clone(),
+                    parent: None,
+                    slug: "race-note".into(),
+                    class: DocClass::UserDoc,
+                    carrier: "# Race Note\n".into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+    // Hold a live read permit so suspend_projection_space queues on the old gate,
+    // then submit a purge that queues behind suspend on that same gate.
+    let permit = handle.try_read().unwrap();
+    let mut suspend = pin!(store.suspend_projection_space(&projection, &space.scope));
+    poll_fn(|cx| {
+        assert!(suspend.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+
+    let mut purge = pin!(store.delete_note(
+        owner.clone(),
+        Mutation {
+            identity: CommandIdentity {
+                scope: space.scope.clone(),
+                actor: actor.clone(),
+                key: CommandKey::from_bytes([31; 16]),
+                hash: ContentDigest::from_bytes([31; 32]),
+            },
+            preconditions: Preconditions::default(),
+            input: DeleteNote {
+                note: note.clone(),
+                disposition: DeleteDisposition::Purge,
+            },
+        },
+    ));
+    poll_fn(|cx| {
+        let _ = purge.as_mut().poll(cx);
+        Poll::Ready(())
+    })
+    .await;
+
+    drop(permit);
+    tokio::time::timeout(Duration::from_secs(3), suspend)
+        .await
+        .unwrap()
+        .unwrap();
+    let purged = tokio::time::timeout(Duration::from_secs(3), purge)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Re-admitting after suspend + purge must observe the purged state, never stale pre-purge state.
+    let fresh = store
+        .admit_projection_space(&projection, &space.scope)
+        .await
+        .unwrap();
+    let fresh_permit = fresh.try_read().unwrap();
+    assert!(fresh_permit.head() >= purged.receipt.seq());
+    assert!(matches!(
+        fresh_permit.classify(&owner, &note, false).unwrap(),
+        LiveNoteStatus::PurgedOrAbsent
+    ));
+    drop(fresh_permit);
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn postgres_drain_blocks_concurrent_re_admission_and_single_conn_pool_never_deadlocks() {
+    let fixtures = StorageTestFixtures::load_required();
+    let schema = fixtures.fresh_pg_schema();
+    let dir = TempDataRoot::new("projection-pg-single-conn");
+    let mut config = fixtures.pg_local_config(sample_installation_id(32), &schema, dir.data_root());
+    if let notarium_canonical::SqlBackendConfig::Postgres {
+        ref mut pool_size, ..
+    } = config.sql
+    {
+        *pool_size = 1;
+    }
+    let (store, runtime) = CanonicalRuntime::open(config).await.unwrap();
+    let space = create_space(&store, 32).await;
+    let projection = maintenance_ctx(ServicePurpose::Projection);
+    let revocation = maintenance_ctx(ServicePurpose::Revocation);
+    let actor = sample_principal_id(32);
+    let owner = SpaceContext::new(
+        EngineAuthContext::for_human(VerifiedHuman::attest(
+            actor.clone(),
+            GrantId::from_bytes([32; 16]),
+            BTreeMap::from([(
+                space.space.id.clone(),
+                SpaceGrant {
+                    role: SpaceRole::Owner,
+                    read_classes: DocClass::all(),
+                    write_classes: DocClass::all(),
+                    project_root: None,
+                },
+            )]),
+            true,
+        )),
+        space.scope.clone(),
+        projection.budget.clone(),
+    )
+    .unwrap();
+
+    // Cleanup hook that fails once on the first purge while space is suspended (creating
+    // cleanup_debt), then succeeds on the subsequent write on a 1-connection pool.
+    struct FailOnceCleanup {
+        failed_once: std::sync::atomic::AtomicBool,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl ProjectionVisibilityCleanup for FailOnceCleanup {
+        fn erase_visibility<'a>(&'a self, _erasures: &'a ProjectionErasures) -> PortFuture<'a, ()> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                if !self.failed_once.swap(true, Ordering::SeqCst) {
+                    return Err(PortError::Domain(DomainError::validation(
+                        ValidationReason::NotReady,
+                    )));
+                }
+                Ok(())
+            })
+        }
+    }
+    let cleanup = Arc::new(FailOnceCleanup {
+        failed_once: std::sync::atomic::AtomicBool::new(false),
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    store
+        .set_projection_visibility_cleanup(&projection, cleanup.clone())
+        .unwrap();
+
+    let handle = store
+        .admit_projection_space(&projection, &space.scope)
+        .await
+        .unwrap();
+
+    // 1. Failing single-item write on pool_size = 1 must return ResourceNotFound, never UnknownCommit.
+    let missing = sample_note_id(99);
+    let err = store
+        .delete_note(
+            owner.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: space.scope.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([33; 16]),
+                    hash: ContentDigest::from_bytes([33; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: DeleteNote {
+                    note: missing,
+                    disposition: DeleteDisposition::Trash,
+                },
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, PortError::Domain(DomainError::ResourceNotFound)),
+        "expected ResourceNotFound on pool_size=1 failed write, got {err:?}"
+    );
+
+    // 2. Idempotent replay on pool_size = 1 must succeed cleanly without UnknownCommit.
+    let note_a = sample_note_id(34);
+    let create_cmd = Mutation {
+        identity: CommandIdentity {
+            scope: space.scope.clone(),
+            actor: actor.clone(),
+            key: CommandKey::from_bytes([34; 16]),
+            hash: ContentDigest::from_bytes([34; 32]),
+        },
+        preconditions: Preconditions::default(),
+        input: notarium_core::ports::CreateNote {
+            note: note_a.clone(),
+            parent: None,
+            slug: "pool-one-a".into(),
+            class: DocClass::UserDoc,
+            carrier: "# Pool One A\n".into(),
+        },
+    };
+    let created = store
+        .create_note(owner.clone(), create_cmd.clone())
+        .await
+        .unwrap();
+    let replayed = store.create_note(owner.clone(), create_cmd).await.unwrap();
+    assert_eq!(created.receipt.seq(), replayed.receipt.seq());
+
+    // 3. Suspend space, purge note_a (cleanup fails once -> records cleanup_debt), then commit
+    //    note_b on pool_size = 1: writer must drop cached_pg_conn before draining cleanup_debt
+    //    and return Ok (not UnknownCommit).
+    store
+        .suspend_projection_space(&projection, &space.scope)
+        .await
+        .unwrap();
+    let purge_err = store
+        .delete_note(
+            owner.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: space.scope.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([35; 16]),
+                    hash: ContentDigest::from_bytes([35; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: DeleteNote {
+                    note: note_a,
+                    disposition: DeleteDisposition::Purge,
+                },
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            purge_err,
+            PortError::Unavailable(ref failure) if failure.effect() == CommitEffect::Unknown
+        ),
+        "expected UnknownCommit when cleanup hook fails once, got {purge_err:?}"
+    );
+    assert_eq!(cleanup.calls.load(Ordering::SeqCst), 1);
+
+    let note_b = sample_note_id(36);
+    store
+        .create_note(
+            owner.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: space.scope.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([36; 16]),
+                    hash: ContentDigest::from_bytes([36; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: notarium_core::ports::CreateNote {
+                    note: note_b,
+                    parent: None,
+                    slug: "pool-one-b".into(),
+                    class: DocClass::UserDoc,
+                    carrier: "# Pool One B\n".into(),
+                },
+            },
+        )
+        .await
+        .expect("subsequent write draining cleanup_debt on pool_size=1 must not self-deadlock");
+    assert!(cleanup.calls.load(Ordering::SeqCst) >= 2);
+
+    // 4. Re-admit and verify concurrent admit_projection_space racing with drain_projection_owner
+    //    never reopens live admission under the drained epoch.
+    drop(handle);
+    let live_handle = store
+        .admit_projection_space(&projection, &space.scope)
+        .await
+        .unwrap();
+    let permit = live_handle.try_read().unwrap();
+    let mut drain = pin!(store.drain_projection_owner(&revocation, &space.scope));
+    poll_fn(|cx| {
+        assert!(drain.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    let mut racing_admit = pin!(store.admit_projection_space(&projection, &space.scope));
+    poll_fn(|cx| {
+        let _ = racing_admit.as_mut().poll(cx);
+        Poll::Ready(())
+    })
+    .await;
+    drop(permit);
+    let (drain_res, admit_res) = tokio::join!(drain, racing_admit);
+    drain_res.unwrap();
+    assert!(
+        admit_res.is_err(),
+        "concurrent admit_projection_space must never succeed against a draining owner"
+    );
+    assert!(store.live_visibility_fence().space(&space.scope).is_err());
+
+    runtime.shutdown().await.unwrap();
+    fixtures.drop_pg_schema(&schema).await;
+}

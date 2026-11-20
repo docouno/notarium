@@ -977,7 +977,7 @@ async fn per_space_event_channels_isolate_bursts_and_purge_scrubs_board_deltas()
             owner_b.clone(),
             ChangeCursor {
                 scope: scope_b.clone(),
-                after: head_b,
+                after: after_seq,
             },
         )
         .await
@@ -1333,5 +1333,160 @@ async fn shared_space_personal_chat_does_not_leak_and_exact_number_board_parity(
     );
 
     runtime.shutdown().await.unwrap();
+    canonical.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn security_admission_and_lifecycle_regressions() {
+    use notarium_core::{
+        error::ValidationReason, ports::ControlCatalogPort, receipt::AccountCommandIdentity,
+    };
+
+    let scratch = Scratch::new();
+    let root = scratch.root();
+    let (store, canonical) = CanonicalRuntime::open(CanonicalConfig::local_default(
+        InstallationId::from_bytes(rand16()),
+        root.clone(),
+    ))
+    .await
+    .unwrap();
+    let (scope, owner_a) = open_space(&store, SpaceKind::Shared).await;
+    let (project_a, _) = create_folder(&store, &owner_a, None, "project-a", true).await;
+
+    let runtime = ProjectorRuntime::start_sqlite(
+        store.clone(),
+        projection_ctx(),
+        root,
+        ProjectionGeneration::new(1).unwrap(),
+        ProjectionConfig::default(),
+    )
+    .await
+    .unwrap();
+    let engine = runtime.engine();
+
+    let scoped_grants = BTreeMap::from([(
+        scope.space_id.clone(),
+        SpaceGrant {
+            role: SpaceRole::Editor,
+            read_classes: DocClass::all(),
+            write_classes: DocClass::all(),
+            project_root: Some(project_a.clone()),
+        },
+    )]);
+    let scoped_ctx = SpaceContext::new(
+        EngineAuthContext::for_human(VerifiedHuman::attest(
+            PrincipalId::from_bytes(rand16()),
+            GrantId::from_bytes(rand16()),
+            scoped_grants,
+            false,
+        )),
+        scope.clone(),
+        budget(),
+    )
+    .unwrap();
+
+    let card = create_note(
+        &store,
+        &owner_a,
+        Some(project_a.clone()),
+        "card-a",
+        DocClass::UserDoc,
+        "---\nstatus: todo\n---\n# Card A\n".into(),
+    )
+    .await;
+    sync(&store, &runtime, &scope).await;
+    let head_before_archive = store.read_space(&scope.space_id).await.unwrap().last_seq;
+    let cut_before_shutdown = engine
+        .wait_for_projected(&scope, head_before_archive, &budget())
+        .await
+        .unwrap();
+
+    // 1. Project-scoped subscriber must receive Lifecycle(Closing) even after the Space
+    //    transitions out of SpaceLifecycle::Active.
+    let bus = engine.event_bus();
+    let mut project_stream = bus
+        .subscribe(
+            scoped_ctx.clone(),
+            ChangeCursor {
+                scope: scope.clone(),
+                after: head_before_archive,
+            },
+        )
+        .await
+        .unwrap();
+    store
+        .change_lifecycle(
+            budget(),
+            AccountCommandIdentity {
+                owner: owner_a.auth().principal().clone(),
+                actor: owner_a.auth().principal().clone(),
+                key: CommandKey::from_bytes(rand16()),
+                hash: ContentDigest::from_bytes([1; 32]),
+                expected: ControlRevision::ZERO,
+            },
+            scope.clone(),
+            SpaceLifecycle::Archived,
+        )
+        .await
+        .unwrap();
+    bus.publish(
+        event_pub_ctx(),
+        SpaceEvent {
+            scope: scope.clone(),
+            seq: head_before_archive,
+            kind: SpaceEventKind::Lifecycle(SpaceLifecycle::Closing),
+        },
+    )
+    .await
+    .unwrap();
+    let received = tokio::time::timeout(Duration::from_secs(3), project_stream.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(
+            received.kind,
+            SpaceEventKind::Lifecycle(SpaceLifecycle::Closing)
+        ),
+        "project-scoped subscriber must receive Lifecycle(Closing) when Space is non-active"
+    );
+
+    // Restore Space to Active so shutdown admission checks are isolated from archive state.
+    store
+        .change_lifecycle(
+            budget(),
+            AccountCommandIdentity {
+                owner: owner_a.auth().principal().clone(),
+                actor: owner_a.auth().principal().clone(),
+                key: CommandKey::from_bytes(rand16()),
+                hash: ContentDigest::from_bytes([2; 32]),
+                expected: ControlRevision::ZERO,
+            },
+            scope.clone(),
+            SpaceLifecycle::Active,
+        )
+        .await
+        .unwrap();
+
+    // 2. After projector shutdown (`publication_closed == true`), StructuralReadPort::hydrate
+    //    must fail closed with NotReady instead of serving canonical fallback.
+    runtime.shutdown().await.unwrap();
+    let hydrated_after_shutdown = StructuralReadPort::hydrate(
+        engine.as_ref(),
+        owner_a,
+        cut_before_shutdown,
+        vec![card.note],
+    )
+    .await;
+    assert!(
+        matches!(
+            hydrated_after_shutdown,
+            Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
+                if diagnostic.reason == ValidationReason::NotReady
+        ),
+        "StructuralReadPort::hydrate must fail closed with NotReady after shutdown, got {hydrated_after_shutdown:?}"
+    );
+
     canonical.shutdown().await.unwrap();
 }

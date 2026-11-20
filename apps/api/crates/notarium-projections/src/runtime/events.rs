@@ -709,7 +709,7 @@ fn can_view_lifecycle_entry(ctx: &SpaceContext, permit: &LiveReadPermit) -> Resu
     }
     if let Some(root) = &grant.project_root {
         let facts = permit
-            .folder_facts(root)
+            .folder_facts_any_space_lifecycle(root, true)
             .ok_or(DomainError::ResourceNotFound)?;
         if !facts.ancestor_folders.contains(root) {
             return Err(DomainError::ResourceNotFound.into());

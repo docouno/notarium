@@ -45,21 +45,6 @@ impl DerivedStore {
         let ids = ids.to_vec();
         let space = scope.space_id.clone();
         let incarnation = scope.incarnation;
-        let sql = format!(
-            "SELECT w.history_incarnation, w.projected_seq, w.seed_in_progress,
-                    n.dense_id, n.note_id, n.rev_id, n.doc_class, n.lifecycle, n.content_digest,
-                    n.title, n.slug, n.preview, f.display_path_prefix
-             FROM space_projection_watermarks AS w
-             LEFT JOIN projected_notes AS n ON n.space_id = w.space_id AND n.dense_id IN ({})
-             LEFT JOIN projected_folders AS f ON f.space_id = n.space_id AND f.folder_id = n.parent_folder_id
-             WHERE w.space_id = ?",
-            placeholders(ids.len()),
-        );
-        let params = ids
-            .iter()
-            .map(value)
-            .chain(std::iter::once(value(&space)))
-            .collect();
         let kinds = [
             Kind::Bytes,
             Kind::Integer,
@@ -78,7 +63,35 @@ impl DerivedStore {
         self.database
             .read(move |mut tx| {
                 Box::pin(async move {
-                    let rows = tx.select(&sql, params, &kinds).await?;
+                    let rows = if tx.postgres() {
+                        let sql = "SELECT w.history_incarnation, w.projected_seq, w.seed_in_progress,
+                                    n.dense_id, n.note_id, n.rev_id, n.doc_class, n.lifecycle, n.content_digest,
+                                    n.title, n.slug, n.preview, f.display_path_prefix
+                             FROM space_projection_watermarks AS w
+                             LEFT JOIN projected_notes AS n ON n.space_id = w.space_id AND n.dense_id = ANY(?)
+                             LEFT JOIN projected_folders AS f ON f.space_id = n.space_id AND f.folder_id = n.parent_folder_id
+                             WHERE w.space_id = ?";
+                        let pg_ids = ids.iter().map(|&id| i64::from(id)).collect();
+                        tx.select(sql, vec![SqlValue::IntArray(pg_ids), value(&space)], &kinds)
+                            .await?
+                    } else {
+                        let sql = format!(
+                            "SELECT w.history_incarnation, w.projected_seq, w.seed_in_progress,
+                                    n.dense_id, n.note_id, n.rev_id, n.doc_class, n.lifecycle, n.content_digest,
+                                    n.title, n.slug, n.preview, f.display_path_prefix
+                             FROM space_projection_watermarks AS w
+                             LEFT JOIN projected_notes AS n ON n.space_id = w.space_id AND n.dense_id IN ({})
+                             LEFT JOIN projected_folders AS f ON f.space_id = n.space_id AND f.folder_id = n.parent_folder_id
+                             WHERE w.space_id = ?",
+                            placeholders(ids.len()),
+                        );
+                        let params = ids
+                            .iter()
+                            .map(value)
+                            .chain(std::iter::once(value(&space)))
+                            .collect();
+                        tx.select(&sql, params, &kinds).await?
+                    };
                     if rows.is_empty() {
                         return Err(not_ready());
                     }

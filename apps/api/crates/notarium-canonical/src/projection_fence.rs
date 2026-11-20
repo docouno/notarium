@@ -705,23 +705,64 @@ impl LiveLifecycleFence {
         }
     }
 
+    async fn lock_current_gate(
+        &self,
+        space: &SpaceId,
+        budget: &CallBudget,
+        deadline: tokio::time::Instant,
+    ) -> Result<(Gate, OwnedRwLockWriteGuard<GateData>), PortError> {
+        loop {
+            if self.closed.load(Ordering::Acquire) {
+                return Err(not_ready());
+            }
+            let gate = self.gate_or_insert(space);
+            let guard = budgeted(budget, deadline, Arc::clone(&gate).write_owned()).await?;
+            let current = {
+                let topology = self.topology.read().expect("projection topology");
+                !matches!(*guard, GateData::Revoked)
+                    && topology
+                        .get(space)
+                        .is_some_and(|existing| Arc::ptr_eq(existing, &gate))
+            };
+            if current {
+                return Ok((gate, guard));
+            }
+            drop(guard);
+        }
+    }
+
     pub(crate) async fn for_write(&self, mut spaces: Vec<SpaceId>) -> LiveWriteSet {
         spaces.sort_unstable();
         spaces.dedup();
-        let gates: Vec<(SpaceId, Gate)> = spaces
-            .iter()
-            .map(|space| (space.clone(), self.gate_or_insert(space)))
-            .collect();
-        let mut guards = Vec::with_capacity(gates.len());
-        for (_, gate) in &gates {
-            guards.push(Arc::clone(gate).write_owned().await);
-        }
-        LiveWriteSet {
-            topology: Arc::clone(&self.topology),
-            gates,
-            guards,
-            spaces,
-            preserve: true,
+        loop {
+            let gates: Vec<(SpaceId, Gate)> = spaces
+                .iter()
+                .map(|space| (space.clone(), self.gate_or_insert(space)))
+                .collect();
+            let mut guards = Vec::with_capacity(gates.len());
+            for (_, gate) in &gates {
+                guards.push(Arc::clone(gate).write_owned().await);
+            }
+            let current = {
+                let topology = self.topology.read().expect("projection topology");
+                gates.iter().zip(&guards).all(|((space, gate), guard)| {
+                    !matches!(**guard, GateData::Revoked)
+                        && topology
+                            .get(space)
+                            .is_some_and(|existing| Arc::ptr_eq(existing, gate))
+                })
+            };
+            if current || self.closed.load(Ordering::Acquire) {
+                return LiveWriteSet {
+                    topology: Arc::clone(&self.topology),
+                    gates,
+                    guards,
+                    spaces,
+                    preserve: true,
+                };
+            }
+            drop(guards);
+            drop(gates);
         }
     }
 }
@@ -856,6 +897,26 @@ impl LiveReadPermit {
         if state.record.space.lifecycle != SpaceLifecycle::Active {
             return None;
         }
+        self.folder_facts_in_space(state, folder, active_ancestors_only)
+    }
+
+    /// Resolves folder ancestry even when the Space itself is `Closing` or
+    /// `Archived`, so project-scoped lifecycle subscribers can authorize
+    /// non-active Space transitions while still validating active folder roots.
+    pub fn folder_facts_any_space_lifecycle(
+        &self,
+        folder: &FolderId,
+        active_ancestors_only: bool,
+    ) -> Option<ResourceFacts> {
+        self.folder_facts_in_space(self.state(), folder, active_ancestors_only)
+    }
+
+    fn folder_facts_in_space(
+        &self,
+        state: &LiveState,
+        folder: &FolderId,
+        active_ancestors_only: bool,
+    ) -> Option<ResourceFacts> {
         let slot = *state.folder_slots.get(folder)?;
         let (ancestor_folders, folder_write_locked, trashed) = state.ancestry(slot)?;
         if active_ancestors_only && trashed {
@@ -934,10 +995,60 @@ impl LiveWriteSet {
         self.guards.iter().any(|guard| guard.state().is_some())
     }
 
-    pub(crate) fn has_unreadable_state(&self) -> bool {
-        self.guards
+    fn guard_refresh_changes(
+        state: &LiveState,
+        windows: &[VisibilityWindow],
+    ) -> Option<(VisibilityChanges, Option<SpaceSeq>)> {
+        let matching = windows
             .iter()
-            .any(|guard| guard.state().is_some_and(|state| !state.readable))
+            .find(|window| window.scope == state.record.scope);
+        match matching {
+            Some(window)
+                if state.readable
+                    && state.record.last_seq == window.after
+                    && !window.changes.notes
+                    && !window.changes.folders
+                    && !window.changes.erasures =>
+            {
+                None
+            }
+            Some(window) if state.readable && state.record.last_seq == window.after => {
+                Some((window.changes, Some(window.through)))
+            }
+            _ => Some((VisibilityChanges::all(), None)),
+        }
+    }
+
+    pub(crate) fn needs_storage_read(
+        &self,
+        store: &CanonicalStore,
+        windows: &[VisibilityWindow],
+    ) -> bool {
+        let mut active = Vec::with_capacity(self.guards.len());
+        for guard in &self.guards {
+            let Some(state) = guard.state() else {
+                continue;
+            };
+            active.push(&state.record.scope);
+            if Self::guard_refresh_changes(state, windows).is_some() {
+                return true;
+            }
+        }
+        if windows
+            .iter()
+            .any(|window| window.changes.erasures && !active.contains(&&window.scope))
+        {
+            return true;
+        }
+        let pending = store
+            .inner
+            .live_visibility
+            .cleanup_debt
+            .lock()
+            .expect("projection cleanup debt");
+        pending
+            .keys()
+            .any(|scope| self.spaces.binary_search(&scope.space_id).is_ok())
     }
 
     pub(crate) fn committing(&mut self) {
@@ -964,24 +1075,14 @@ impl LiveWriteSet {
                 continue;
             };
             active.push(state.record.scope.clone());
-            let matching = windows
-                .iter()
-                .find(|window| window.scope == state.record.scope);
-            let changes = match matching {
-                Some(window)
-                    if state.readable
-                        && state.record.last_seq == window.after
-                        && !window.changes.notes
-                        && !window.changes.folders
-                        && !window.changes.erasures =>
+            let Some((changes, _)) = Self::guard_refresh_changes(state, windows) else {
+                if let Some(window) = windows
+                    .iter()
+                    .find(|window| window.scope == state.record.scope)
                 {
                     state.record.last_seq = window.through;
-                    continue;
                 }
-                Some(window) if state.readable && state.record.last_seq == window.after => {
-                    window.changes
-                }
-                _ => VisibilityChanges::all(),
+                continue;
             };
             let budget = source::internal_budget();
             match source::refresh(store, state, &budget, changes).await {
@@ -1087,6 +1188,9 @@ impl Drop for LiveWriteSet {
                     && topology
                         .get(space)
                         .is_some_and(|existing| Arc::ptr_eq(existing, gate))
+                    && gate
+                        .try_read()
+                        .is_ok_and(|data| matches!(*data, GateData::Empty))
                 {
                     topology.remove(space);
                 }
@@ -1354,6 +1458,20 @@ impl CanonicalStore {
         {
             state.record.scope.check(scope)?;
             let epoch = state.record.active_epoch;
+            if fence.closed.load(Ordering::Acquire)
+                || self
+                    .inner
+                    .check_writer_epoch(&scope.space_id, epoch)
+                    .is_err()
+                || !fence
+                    .topology
+                    .read()
+                    .expect("projection topology")
+                    .get(&scope.space_id)
+                    .is_some_and(|existing| Arc::ptr_eq(existing, &gate))
+            {
+                return Err(not_ready());
+            }
             drop(old);
             return Ok(fence.bind(gate, scope, epoch));
         }
@@ -1370,9 +1488,23 @@ impl CanonicalStore {
             && state.readable
             && &state.record.scope == scope
         {
+            let epoch = state.record.active_epoch;
+            if fence.closed.load(Ordering::Acquire)
+                || self
+                    .inner
+                    .check_writer_epoch(&scope.space_id, epoch)
+                    .is_err()
+                || !fence
+                    .topology
+                    .read()
+                    .expect("projection topology")
+                    .get(&scope.space_id)
+                    .is_some_and(|existing| Arc::ptr_eq(existing, &gate))
+            {
+                return Err(not_ready());
+            }
             match state.update_lookup(next_lookup.clone()) {
                 Ok(true) => {
-                    let epoch = state.record.active_epoch;
                     drop(old);
                     return Ok(fence.bind(gate, scope, epoch));
                 }
@@ -1433,6 +1565,20 @@ impl CanonicalStore {
                 .max(previous.peak_private_bytes);
         }
         let epoch = state.record.active_epoch;
+        if fence.closed.load(Ordering::Acquire)
+            || self
+                .inner
+                .check_writer_epoch(&scope.space_id, epoch)
+                .is_err()
+            || !fence
+                .topology
+                .read()
+                .expect("projection topology")
+                .get(&scope.space_id)
+                .is_some_and(|existing| Arc::ptr_eq(existing, &gate))
+        {
+            return Err(not_ready());
+        }
         *old = GateData::Active(Box::new(state));
         drop(old);
         Ok(fence.bind(gate, scope, epoch))
@@ -1461,8 +1607,8 @@ impl CanonicalStore {
                 state.record.scope.check(scope)?;
             }
             *guard = GateData::Revoked;
-            drop(guard);
             fence.remove_gate_if_same(&scope.space_id, &gate);
+            drop(guard);
         }
         Ok(())
     }
@@ -1475,27 +1621,39 @@ impl CanonicalStore {
         ctx: &MaintenanceContext,
         scope: &HistoryScope,
     ) -> Result<(), PortError> {
+        struct RemoveGateOnDrop<'a> {
+            fence: &'a LiveLifecycleFence,
+            space: &'a SpaceId,
+            gate: &'a Gate,
+        }
+
+        impl Drop for RemoveGateOnDrop<'_> {
+            fn drop(&mut self) {
+                self.fence.remove_gate_if_same(self.space, self.gate);
+            }
+        }
+
         ctx.authority.require(ServicePurpose::Revocation)?;
         self.ensure_open()?;
         let fence = &self.inner.live_visibility;
         let deadline =
             crate::runtime::deadline_after(tokio::time::Instant::now(), ctx.budget.remaining);
-        let gate = fence
-            .topology
-            .read()
-            .expect("projection topology")
-            .get(&scope.space_id)
-            .cloned();
-        if let Some(gate) = gate {
-            let mut guard = budgeted(&ctx.budget, deadline, gate.write()).await?;
-            if let Some(state) = guard.state() {
-                state.record.scope.check(scope)?;
-            }
-            *guard = GateData::Revoked;
-            drop(guard);
-            fence.remove_gate_if_same(&scope.space_id, &gate);
+        let (gate, mut guard) = fence
+            .lock_current_gate(&scope.space_id, &ctx.budget, deadline)
+            .await?;
+        if let Some(state) = guard.state() {
+            state.record.scope.check(scope)?;
         }
-        if matches!(&self.inner.sql, SqlDriverState::Postgres { .. }) {
+        *guard = GateData::Revoked;
+        // Remove the revoked gate from topology while still holding its write lock
+        // (including on cancellation/error) so concurrent writers/admissions cannot
+        // spin on a dead gate or reopen admission before epoch revocation finishes.
+        let remove_gate = RemoveGateOnDrop {
+            fence,
+            space: &scope.space_id,
+            gate: &gate,
+        };
+        let drained_identity = if matches!(&self.inner.sql, SqlDriverState::Postgres { .. }) {
             let identity = source::owner_identity(self, scope, &ctx.budget, false)
                 .await?
                 .ok_or_else(not_ready)?;
@@ -1505,6 +1663,13 @@ impl CanonicalStore {
             source::set_owner_phase(self, identity.clone(), "draining", &ctx.budget, deadline)
                 .await?;
             self.inner.revoke_writer_epoch(&scope.space_id);
+            Some(identity)
+        } else {
+            None
+        };
+        drop(remove_gate);
+        drop(guard);
+        if let Some(identity) = drained_identity {
             source::set_owner_phase(self, identity, "drained", &ctx.budget, deadline).await?;
         }
         Ok(())

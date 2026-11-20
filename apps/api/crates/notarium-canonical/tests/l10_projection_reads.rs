@@ -20,8 +20,8 @@ use notarium_core::{
     },
     model::{Lifecycle, SnapshotCut},
     ports::{
-        CreateNote, Mutation, NoteWritePort, PageLimit, Preconditions, PublishAbilityPackage,
-        RenameNote, ServicePurpose, SpaceContext,
+        CreateNote, DeleteDisposition, DeleteNote, Mutation, NoteWritePort, PageLimit,
+        Preconditions, PublishAbilityPackage, RenameNote, ServicePurpose, SpaceContext,
     },
     query::{FieldObservation, FieldSchema, FieldType, FieldValue, ScalarType},
     receipt::{CommandIdentity, MutationEffect, ReceiptSet},
@@ -593,12 +593,26 @@ async fn run_projection_reads(store: &CanonicalStore) {
     assert_eq!(fences.rows[0].note_id, clear);
     assert_eq!(fences.rows[0].purge_seq, purged);
 
-    // Purging a published ability entrypoint note must not wedge delta batches
-    // that cross both the ability publication and the later purge.
+    // Purging a published ability entrypoint note via real `delete_note(Purge)`
+    // clears ability revision metadata and marks `ability_packages` purged;
+    // delta batches crossing both publication and purge must not wedge on
+    // `CursorStale` when the ability revision metadata is NULL.
     let skill_purged = store
-        .commit_synthetic_note_purge_for_test(scope, epoch, &skill)
+        .delete_note(
+            human.clone(),
+            Mutation {
+                identity: identity(99),
+                preconditions: Preconditions::default(),
+                input: DeleteNote {
+                    note: skill.clone(),
+                    disposition: DeleteDisposition::Purge,
+                },
+            },
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .receipt
+        .seq();
     let delta_across_purged_ability = store
         .read_projection_delta_batch(
             &projection,
@@ -617,10 +631,11 @@ async fn run_projection_reads(store: &CanonicalStore) {
             .any(|row| matches!(row, ProjectionDelta::Purge(id) if *id == skill))
     );
     assert!(
-        delta_across_purged_ability
+        !delta_across_purged_ability
             .rows
             .iter()
-            .any(|row| matches!(row, ProjectionDelta::Ability(ability) if ability.note.is_none()))
+            .any(|row| matches!(row, ProjectionDelta::Ability(ability) if ability.note.is_some())),
+        "purged ability delta must not surface a hydrated note snapshot"
     );
 }
 

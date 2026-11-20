@@ -138,7 +138,7 @@ impl BoardSourceFacts {
                 let current = permit.folder_facts(folder)?;
                 auth.can_view_folder(space, folder, ancestors).is_ok()
                     && auth
-                        .authorize_folder_read(space, folder, &current.ancestor_folders)
+                        .can_view_folder(space, folder, &current.ancestor_folders)
                         .is_ok()
             }
             None => grant.project_root.is_none(),
@@ -183,6 +183,13 @@ impl ScrubbableBoardDelta {
 
     pub(super) fn downgrade(&self) -> Weak<Mutex<Option<BoardDelta>>> {
         Arc::downgrade(&self.0)
+    }
+
+    pub(super) fn clear(&self) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 
     pub(super) fn clone_payload(&self) -> Option<BoardDelta> {
@@ -548,6 +555,9 @@ async fn board_ranks(
         .filter_candidates(&descriptor.filter.predicate, candidates)
         .map_err(index_error)?
         .possible;
+    if possible.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
     let limit = PageLimit::new(200)?;
     let mut ranks = Vec::new();
     let mut after = None;

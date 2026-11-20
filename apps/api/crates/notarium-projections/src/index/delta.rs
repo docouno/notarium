@@ -48,7 +48,7 @@ impl SubtreeOverlay {
 #[derive(Clone, Default)]
 pub struct L0Delta {
     pub(super) notes: BTreeMap<u32, Arc<ChangedNote>>,
-    pub(super) note_lookup: BTreeMap<NoteId, u32>,
+    pub(super) note_lookup: Arc<BTreeMap<NoteId, u32>>,
     pub(super) replaced: Bitmap,
     pub(super) deleted: Bitmap,
     pub(super) folders: Arc<BTreeMap<u32, (FolderId, Lifecycle)>>,
@@ -75,7 +75,7 @@ impl L0Delta {
         self.remove_replacement(note.dense);
         self.replaced.add(note.dense);
         self.deleted.remove(note.dense);
-        self.note_lookup.insert(note.id.clone(), note.dense);
+        Arc::make_mut(&mut self.note_lookup).insert(note.id.clone(), note.dense);
         let mut bytes = 256 + 2 * note.id.as_str().len();
         let mut keys = Vec::with_capacity(ordinary.len());
         let mut domains = Vec::with_capacity(scalars.len());
@@ -150,7 +150,7 @@ impl L0Delta {
         let Some(old) = self.notes.remove(&dense) else {
             return;
         };
-        self.note_lookup.remove(&old.id);
+        Arc::make_mut(&mut self.note_lookup).remove(&old.id);
         self.approx_bytes = self.approx_bytes.saturating_sub(old.bytes);
         for key in &old.postings {
             if let Some(bitmap_arc) = self.postings.get_mut(key) {

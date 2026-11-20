@@ -169,7 +169,10 @@ impl Predicate {
             return Err(DomainError::validation(ValidationReason::InvalidQuery));
         }
         let invalid = || DomainError::validation(ValidationReason::InvalidQuery);
-        let check_field = |compatible: Option<bool>| {
+        let check_field = |key: &str, compatible: Option<bool>| {
+            if key.is_empty() || key == "__proto__" {
+                return Err(invalid());
+            }
             compatible
                 .unwrap_or(allow_undeclared)
                 .then_some(())
@@ -183,15 +186,19 @@ impl Predicate {
             }
             Self::Not(item) => item.validate(schema, allow_undeclared, depth + 1, count)?,
             Self::Eq { key, value } => {
-                check_field(schema.get(key).map(|f| {
-                    matches!(f.kind, FieldType::Scalar(t) if t.accepts(value) || (f.nullable && *value == ScalarValue::Null))
-                }))?;
+                check_field(
+                    key,
+                    schema.get(key).map(|f| {
+                        matches!(f.kind, FieldType::Scalar(t) if t.accepts(value) || (f.nullable && *value == ScalarValue::Null))
+                    }),
+                )?;
             }
             Self::Contains { key, value } => {
                 if *value == ScalarValue::Null {
                     return Err(invalid());
                 }
                 check_field(
+                    key,
                     schema
                         .get(key)
                         .map(|f| matches!(f.kind, FieldType::List(t) if t.accepts(value))),
@@ -199,6 +206,7 @@ impl Predicate {
             }
             Self::NumberRange { key, range } => {
                 check_field(
+                    key,
                     schema
                         .get(key)
                         .map(|f| f.kind == FieldType::Scalar(ScalarType::Number)),
@@ -207,6 +215,7 @@ impl Predicate {
             }
             Self::DateRange { key, range } => {
                 check_field(
+                    key,
                     schema
                         .get(key)
                         .map(|f| f.kind == FieldType::Scalar(ScalarType::Date)),
@@ -215,6 +224,7 @@ impl Predicate {
             }
             Self::TimestampRange { key, range } => {
                 check_field(
+                    key,
                     schema
                         .get(key)
                         .map(|f| f.kind == FieldType::Scalar(ScalarType::Timestamp)),
@@ -222,7 +232,7 @@ impl Predicate {
                 range.validate()?;
             }
             Self::Exists { key } | Self::IsBad { key } | Self::IsAbsent { key } => {
-                check_field(schema.get(key).map(|_| true))?;
+                check_field(key, schema.get(key).map(|_| true))?;
             }
         }
         Ok(())

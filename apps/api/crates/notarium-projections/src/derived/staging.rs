@@ -105,9 +105,11 @@ fn approx_mutation_bytes(mutation: &DerivedMutation) -> usize {
         DerivedMutation::UpsertLink(row) => {
             OVERHEAD + row.raw_target.len() + row.dir_norm_prefix.len() + row.leaf_norm_key.len()
         }
+        DerivedMutation::UpsertCluster(row) => {
+            OVERHEAD + row.members_roaring.len() + row.inter_edges_msgpack.len()
+        }
         DerivedMutation::UpsertChatThread(_)
         | DerivedMutation::UpsertChatRef(_)
-        | DerivedMutation::UpsertCluster(_)
         | DerivedMutation::DeleteNoteCandidates(_)
         | DerivedMutation::DeleteNoteLinks(_)
         | DerivedMutation::DeleteLink(..)

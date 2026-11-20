@@ -67,8 +67,9 @@ impl LeidenSnapshot {
         check_cancel(cancel)?;
 
         let mut anchors = BTreeMap::<usize, &str>::new();
-        let mut overlaps = BTreeMap::new();
-        let mut previously_used = BTreeSet::new();
+        let mut prev_keys = std::collections::HashMap::<crate::index::ClusterKey<'_>, usize>::new();
+        let mut prev_ids = Vec::<ClusterId>::new();
+        let mut raw_overlaps = std::collections::HashMap::<(usize, usize), u32>::new();
         for (idx, (&dense, &community)) in originals.iter().zip(&partition).enumerate() {
             if idx & (CANCEL_CHECK_STRIDE - 1) == 0 {
                 check_cancel(cancel)?;
@@ -78,11 +79,23 @@ impl LeidenSnapshot {
                 .ok_or_else(|| DomainError::validation(ValidationReason::InvalidState))?;
             let anchor = anchors.entry(community).or_insert(note);
             *anchor = (*anchor).min(note);
-            if let Some(previous) = adjacency.cluster(dense) {
-                previously_used.insert(previous.clone());
-                *overlaps.entry((community, previous)).or_insert(0u32) += 1;
+            if let Some(previous) = adjacency.cluster_key(dense) {
+                let prev_slot = if let Some(&slot) = prev_keys.get(&previous) {
+                    slot
+                } else {
+                    let slot = prev_ids.len();
+                    prev_keys.insert(previous, slot);
+                    prev_ids.push(previous.into_cluster_id());
+                    slot
+                };
+                *raw_overlaps.entry((community, prev_slot)).or_insert(0u32) += 1;
             }
         }
+        let previously_used: BTreeSet<ClusterId> = prev_ids.iter().cloned().collect();
+        let overlaps: BTreeMap<(usize, ClusterId), u32> = raw_overlaps
+            .into_iter()
+            .map(|((community, slot), count)| ((community, prev_ids[slot].clone()), count))
+            .collect();
         let ids_by_community = stable_ids(scope, &anchors, overlaps, previously_used);
         let mut ids = Vec::with_capacity(ids_by_community.len());
         let mut id_slots = BTreeMap::new();
