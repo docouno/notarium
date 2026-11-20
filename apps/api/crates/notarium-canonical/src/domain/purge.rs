@@ -55,7 +55,6 @@ struct PendingPurgeExecution {
     old_note_id: NoteId,
     canonical_seq: SpaceSeq,
     retirement_ids: Vec<String>,
-    sanitized_response_msgpack: Vec<u8>,
 }
 
 type RawLookupPendingPurgeRow = (String, Vec<u8>, String, String, Vec<u8>, i64);
@@ -116,77 +115,113 @@ impl CanonicalStore {
     ) -> Result<(), PortError> {
         self.inner.check_writer_epoch(&scope.space_id, epoch)?;
         let current = scope.clone();
-        self.with_write_tx(|tx| {
-            Box::pin(async move {
-                crate::blobs::lock_and_check_space_tx(tx, &current, epoch).await?;
-                crate::blobs::plan_unowned_active_blobs_tx(tx, &current, epoch).await
-            })
-        })
-        .await?;
-        const PURGES: &str = "SELECT purge_id, actor_id, idempotency_key, old_note_id, retirement_ids_json, sanitized_response_msgpack, canonical_seq
-            FROM pending_purges WHERE space_id = $1 AND history_incarnation = $2 AND phase <> 'completed' ORDER BY created_at_ms";
-        type PendingPurge = (String, String, String, String, String, Vec<u8>, i64);
-        let current = scope.clone();
-        let purges: Vec<PendingPurge> = self
-            .with_read_tx(|tx| {
+        let (through, has_purges) = self
+            .with_write_tx(|tx| {
                 Box::pin(async move {
-                    let sid = current.space_id.as_str();
-                    let inc = current.incarnation.as_bytes().as_slice();
-                    match tx {
-                        BackendConn::Sqlite(conn) => {
-                            sqlx::query_as(PURGES)
-                                .bind(sid)
-                                .bind(inc)
-                                .fetch_all(&mut **conn)
-                                .await
-                        }
-                        BackendConn::Postgres(conn) => {
-                            sqlx::query_as(PURGES)
-                                .bind(sid)
-                                .bind(inc)
-                                .fetch_all(&mut **conn)
-                                .await
-                        }
-                    }
-                    .map_err(|err| crate::runtime::pg_read_error("scan_pending_purges", err))
+                    let space = crate::blobs::lock_and_check_space_tx(tx, &current, epoch).await?;
+                    crate::blobs::plan_unowned_active_blobs_tx(tx, &current, epoch).await?;
+                    let pending = has_incomplete_pending_purges_tx(tx, &current.space_id).await?;
+                    Ok((space.last_seq, pending))
                 })
             })
             .await?;
-        let budget = crate::projection_fence::internal_budget();
-        // Startup and lease takeover can precede the projector. Registration reschedules these rows.
-        if !purges.is_empty() && self.projection_cleanup_missing(&budget).await? {
-            return self
-                .resume_blob_retirements(scope, epoch, RetirementRecovery::RestoredGc)
-                .await;
-        }
-        for (
-            purge_id,
-            actor_id,
-            idempotency_key,
-            old_note,
-            ret_json,
-            sanitized_response_msgpack,
-            seq,
-        ) in purges
-        {
-            let exec = PendingPurgeExecution {
-                purge_id,
-                actor_id,
-                idempotency_key,
-                old_note_id: NoteId::parse(&old_note)?,
-                canonical_seq: crate::codec::i64_to_space_seq(seq)?,
-                scope: scope.clone(),
-                active_epoch: epoch,
-                retirement_ids: serde_json::from_str(&ret_json).map_err(|err| {
-                    internal_not_committed("corrupt_purge_ret_ids", err.to_string())
-                })?,
-                sanitized_response_msgpack,
-            };
-            self.retry_purged_note_cleanup(scope, exec.canonical_seq, &exec.old_note_id, &budget)
+        if has_purges {
+            let budget = crate::projection_fence::internal_budget();
+            // Registration restarts the drain. Standalone stores can finish purge retirements.
+            if self.projection_cleanup_missing(&budget).await? {
+                return self
+                    .resume_blob_retirements(scope, epoch, RetirementRecovery::RestoredGc)
+                    .await;
+            }
+            self.drain_pending_purges(scope, epoch, through, &budget)
                 .await?;
-            drive_pending_purge_steps_2_and_3(self, &exec).await?;
         }
         self.resume_blob_retirements(scope, epoch, recovery).await
+    }
+
+    async fn drain_pending_purges(
+        &self,
+        scope: &HistoryScope,
+        epoch: LeaseEpoch,
+        through: SpaceSeq,
+        budget: &notarium_core::ports::CallBudget,
+    ) -> Result<(), PortError> {
+        // Completion removes each item from the phase index range. The fixed head
+        // keeps concurrent commands from extending this recovery indefinitely.
+        macro_rules! page {
+            ($range:literal) => {
+                concat!(
+                    "SELECT purge_id, actor_id, idempotency_key, old_note_id, retirement_ids_json, canonical_seq
+                     FROM pending_purges WHERE space_id=$1 AND phase ", $range,
+                    " 'completed' AND history_incarnation=$2 AND canonical_seq<=$3
+                     ORDER BY phase LIMIT 32"
+                )
+            };
+        }
+        type PurgeRow = (String, String, String, String, String, i64);
+        // Each half can seek past completed rows on both PostgreSQL and SQLite.
+        for query in [page!(">"), page!("<")] {
+            loop {
+                self.inner.check_writer_epoch(&scope.space_id, epoch)?;
+                let current = scope.clone();
+                let rows: Vec<PurgeRow> = self
+                    .with_read_tx(|tx| {
+                        Box::pin(async move {
+                            let id = current.space_id.as_str();
+                            let incarnation = current.incarnation.as_bytes().as_slice();
+                            let head = through.get() as i64;
+                            match tx {
+                                BackendConn::Sqlite(conn) => {
+                                    sqlx::query_as(query)
+                                        .bind(id)
+                                        .bind(incarnation)
+                                        .bind(head)
+                                        .fetch_all(&mut **conn)
+                                        .await
+                                }
+                                BackendConn::Postgres(conn) => {
+                                    sqlx::query_as(query)
+                                        .bind(id)
+                                        .bind(incarnation)
+                                        .bind(head)
+                                        .fetch_all(&mut **conn)
+                                        .await
+                                }
+                            }
+                            .map_err(|err| {
+                                crate::runtime::pg_read_error("scan_pending_purges", err)
+                            })
+                        })
+                    })
+                    .await?;
+                if rows.is_empty() {
+                    break;
+                }
+                for (purge_id, actor_id, idempotency_key, old_note, retirements, seq) in rows {
+                    let exec = PendingPurgeExecution {
+                        purge_id,
+                        actor_id,
+                        idempotency_key,
+                        old_note_id: NoteId::parse(&old_note)?,
+                        canonical_seq: crate::codec::i64_to_space_seq(seq)?,
+                        scope: scope.clone(),
+                        active_epoch: epoch,
+                        retirement_ids: serde_json::from_str(&retirements).map_err(|err| {
+                            internal_not_committed("corrupt_purge_ret_ids", err.to_string())
+                        })?,
+                    };
+                    self.retry_purged_note_cleanup(
+                        scope,
+                        exec.canonical_seq,
+                        &exec.old_note_id,
+                        budget,
+                    )
+                    .await?;
+                    drive_pending_purge_steps_2_and_3(self, &exec).await?;
+                }
+            }
+        }
+        Ok(())
     }
 
     pub(crate) async fn resume_blob_retirements(
@@ -447,7 +482,6 @@ async fn purge_note_inner(
                         old_note_id: old_note.clone(),
                         canonical_seq: purge_seq,
                         retirement_ids,
-                        sanitized_response_msgpack: sanitized_bytes.clone(),
                     });
 
                 let cmd_id = new_prefixed_hex_id("cmd_")?;
@@ -499,7 +533,7 @@ async fn purge_note_inner(
         Err(PortError::Unavailable(failure))
             if failure.effect() == notarium_core::error::CommitEffect::NotCommitted =>
         {
-            if let Some(pending) = deadline
+            if let Some((pending, response)) = deadline
                 .prepare(&ctx.budget, || {
                     load_pending_purge_for_idempotency(store, &space_rec.scope, &idemp)
                 })
@@ -507,7 +541,7 @@ async fn purge_note_inner(
             {
                 finish_committed_purge(store, &pending, &ctx.budget, &deadline, true).await?;
                 let stored: StoredCommittedNoteRevV1 =
-                    rmp_serde::from_slice(&pending.sanitized_response_msgpack).map_err(|err| {
+                    rmp_serde::from_slice(&response).map_err(|err| {
                         unknown_commit_outcome("decode_resumed_purge_resp", err.to_string())
                     })?;
                 return Ok(stored.into_committed());
@@ -1049,7 +1083,6 @@ pub(crate) async fn mint_and_purge_impl(
                         old_note_id: input.old_note.clone(),
                         canonical_seq: create_seq,
                         retirement_ids,
-                        sanitized_response_msgpack: sanitized_bytes.clone(),
                     });
 
                 Ok(ItemCommitArtifacts {
@@ -1109,15 +1142,15 @@ pub(crate) async fn mint_and_purge_impl(
         Err(PortError::Unavailable(failure))
             if failure.effect() == notarium_core::error::CommitEffect::NotCommitted =>
         {
-            if let Some(pending) = deadline
+            if let Some((pending, response)) = deadline
                 .prepare(&ctx.budget, || {
                     load_pending_purge_for_idempotency(store, &space_rec.scope, &idemp)
                 })
                 .await?
             {
                 finish_committed_purge(store, &pending, &ctx.budget, &deadline, true).await?;
-                let stored: StoredCommittedMintAndPurgeV1 =
-                    rmp_serde::from_slice(&pending.sanitized_response_msgpack).map_err(|err| {
+                let stored: StoredCommittedMintAndPurgeV1 = rmp_serde::from_slice(&response)
+                    .map_err(|err| {
                         unknown_commit_outcome("decode_resumed_mint_purge_resp", err.to_string())
                     })?;
                 return Ok(stored.into_committed());
@@ -1935,7 +1968,7 @@ async fn load_pending_purge_for_idempotency(
     store: &CanonicalStore,
     scope: &HistoryScope,
     idemp: &CommandIdentitySpec,
-) -> Result<Option<PendingPurgeExecution>, PortError> {
+) -> Result<Option<(PendingPurgeExecution, Vec<u8>)>, PortError> {
     let scope_cl = scope.clone();
     let idemp_cl = idemp.clone();
     let space_rec = store.read_space(&scope.space_id).await?;
@@ -2018,7 +2051,7 @@ async fn load_pending_purge_for_idempotency(
                         internal_not_committed("corrupt_pending_purge_ret", err.to_string())
                     })?;
 
-                Ok(Some(PendingPurgeExecution {
+                Ok(Some((PendingPurgeExecution {
                     purge_id,
                     scope: scope_cl,
                     active_epoch: space_rec.active_epoch,
@@ -2027,8 +2060,7 @@ async fn load_pending_purge_for_idempotency(
                     old_note_id,
                     canonical_seq: crate::codec::i64_to_space_seq(seq)?,
                     retirement_ids,
-                    sanitized_response_msgpack: resp_msgpack,
-                }))
+                }, resp_msgpack)))
             })
         })
         .await
@@ -2227,26 +2259,27 @@ async fn record_pending_purge_safe_error(
         .await
 }
 
-#[allow(dead_code)]
 pub(crate) async fn has_incomplete_pending_purges_tx(
     tx: &mut BackendConn<'_>,
     space_id: &SpaceId,
 ) -> Result<bool, PortError> {
-    let found: Option<i64> = match tx {
-        BackendConn::Sqlite(conn) => sqlx::query_scalar(
-            "SELECT 1 FROM pending_purges WHERE space_id = ? AND phase <> 'completed' LIMIT 1",
-        )
-        .bind(space_id.as_str())
-        .fetch_optional(&mut **conn)
-        .await
-        .map_err(|err| internal_not_committed("sqlite_check_incomplete_purges", err.to_string()))?,
-        BackendConn::Postgres(conn) => sqlx::query_scalar(
-            "SELECT 1::BIGINT FROM pending_purges WHERE space_id = $1 AND phase <> 'completed' LIMIT 1",
-        )
-        .bind(space_id.as_str())
-        .fetch_optional(&mut **conn)
-        .await
-        .map_err(|err| internal_not_committed("pg_check_incomplete_purges", err.to_string()))?,
-    };
-    Ok(found.is_some())
+    const PENDING: &str = concat!(
+        "SELECT ",
+        include_str!("purge/has_pending.sql"),
+        " FROM (SELECT CAST($1 AS TEXT) AS space_id) s"
+    );
+    match tx {
+        BackendConn::Sqlite(conn) => sqlx::query_scalar(PENDING)
+            .bind(space_id.as_str())
+            .fetch_one(&mut **conn)
+            .await
+            .map_err(|err| {
+                internal_not_committed("sqlite_check_incomplete_purges", err.to_string())
+            }),
+        BackendConn::Postgres(conn) => sqlx::query_scalar(PENDING)
+            .bind(space_id.as_str())
+            .fetch_one(&mut **conn)
+            .await
+            .map_err(|err| internal_not_committed("pg_check_incomplete_purges", err.to_string())),
+    }
 }

@@ -28,6 +28,7 @@ pub(super) struct Eraser {
     engine: Weak<ProjectionEngine>,
     postgres: Option<PostgresEraser>,
     root: DataRoot,
+    cache_identity: String,
     control: GenerationControl,
     generation_cleanup: Arc<GenerationCleanup>,
     postgres_cache_owner: Option<Arc<PostgresCacheOwner>>,
@@ -43,10 +44,22 @@ impl Eraser {
                 .store
                 .postgres_eraser(&engine.control)?,
             root: engine.cache_root.clone(),
+            cache_identity: engine.cache_identity.clone(),
             control: engine.control.clone(),
             generation_cleanup: Arc::clone(&engine.generation_cleanup),
             postgres_cache_owner: engine.postgres_cache_owner.clone(),
         })
+    }
+
+    async fn verify_target(&self) -> Result<(), PortError> {
+        let root = self.root.clone();
+        let current = tokio::task::spawn_blocking(move || super::read_cache_identity(&root))
+            .await
+            .map_err(checkpoint_error)??;
+        if current != self.cache_identity {
+            return Err(not_ready());
+        }
+        self.control.verify_cleanup_identity().await
     }
 }
 
@@ -63,6 +76,7 @@ impl ProjectionVisibilityCleanup for Eraser {
             if canonical.read_space(&erasures.scope.space_id).await?.scope != erasures.scope {
                 return Ok(());
             }
+            self.verify_target().await?;
             let engine = self.engine.upgrade();
             if let Some(postgres) = &self.postgres {
                 erase_postgres_visibility(
@@ -78,6 +92,9 @@ impl ProjectionVisibilityCleanup for Eraser {
                 self.erase_sqlite_visibility(engine.as_deref(), canonical, erasures, &maintenance)
                     .await?;
             }
+            // The local volume or the shared control schema may have changed
+            // while asynchronous SQL and checkpoint cleanup were running.
+            self.verify_target().await?;
             if !erasures.purged.is_empty()
                 && let Some(engine) = engine
             {

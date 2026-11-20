@@ -320,7 +320,9 @@ Irreversible erasure executes as a crash-recoverable 3-phase protocol:
    existing PostgreSQL Space, the incoming writer must acquire a higher epoch
    with `advance_space_lease`. An installation with projections completes a
    pending purge after its registered handler has erased the derived data.
-   A caller that loses the acknowledgement can retry with the original key.
+   Recovery reads pending commands in bounded batches and checks out a new
+   read transaction for each batch. A caller that loses the acknowledgement
+   can retry with the original key.
 
 Shared blobs that remain referenced by independent live notes or chat entries
 retain their active references, and historical external backups created prior to

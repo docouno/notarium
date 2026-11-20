@@ -150,11 +150,7 @@ impl GenerationControl {
                         vec![value(&encode(&DescriptorState::default())?)],
                     )
                     .await?;
-                    let identity = tx.select(
-                        "SELECT replace(cleanup_identity::text, '-', '') FROM projection_generation_control WHERE row_id=1",
-                        Vec::new(), &[Kind::Text],
-                    ).await?.pop().and_then(|mut row| row.pop()).ok_or_else(invalid_row)?;
-                    String::read(identity)
+                    read_cleanup_identity(&mut tx).await
                 })
             })
             .await?;
@@ -174,6 +170,19 @@ impl GenerationControl {
             ControlBackend::Postgres(pg) => &pg.cleanup_identity,
             ControlBackend::Local(_) => cache_identity,
         }
+    }
+
+    pub(crate) async fn verify_cleanup_identity(&self) -> Result<(), PortError> {
+        if let ControlBackend::Postgres(pg) = &*self.0 {
+            let current = pg
+                .database
+                .read(|mut tx| Box::pin(async move { read_cleanup_identity(&mut tx).await }))
+                .await?;
+            if current != pg.cleanup_identity {
+                return Err(super::not_ready());
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn is_postgres(&self) -> bool {
@@ -587,6 +596,14 @@ fn sync_descriptor_directory(path: &Path) -> Result<(), PortError> {
         })?;
     let _ = path;
     Ok(())
+}
+
+async fn read_cleanup_identity(tx: &mut SqlTransaction<'_>) -> Result<String, PortError> {
+    let identity = tx.select(
+        "SELECT replace(cleanup_identity::text, '-', '') FROM projection_generation_control WHERE row_id=1",
+        Vec::new(), &[Kind::Text],
+    ).await?.pop().and_then(|mut row| row.pop()).ok_or_else(invalid_row)?;
+    String::read(identity)
 }
 
 async fn read_postgres(

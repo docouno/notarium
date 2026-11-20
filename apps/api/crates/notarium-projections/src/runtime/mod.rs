@@ -203,9 +203,12 @@ impl ProjectorRuntime {
             (DataRoot::new(path), None)
         };
         let identity_root = cache_root.clone();
-        let cache_identity = tokio::task::spawn_blocking(move || cache_identity(&identity_root))
-            .await
-            .map_err(checkpoint_error)??;
+        let identity_owner = postgres_cache_owner.clone();
+        let cache_identity = tokio::task::spawn_blocking(move || {
+            cache_identity(&identity_root, identity_owner.as_deref())
+        })
+        .await
+        .map_err(checkpoint_error)??;
         let cleanup_registration = canonical
             .prepare_projection_visibility_cleanup(
                 &projection_context,
@@ -987,7 +990,24 @@ fn cache_cleanup(cache_root: &DataRoot) -> Arc<GenerationCleanup> {
 
 // The shared PostgreSQL checkpoint registry distinguishes each cache directory.
 // Publish the identity once so a restart can attest its own immutable files.
-fn cache_identity(root: &DataRoot) -> Result<String, PortError> {
+fn cache_identity(
+    root: &DataRoot,
+    owner: Option<&PostgresCacheOwner>,
+) -> Result<String, PortError> {
+    let id = if owner.is_some_and(|owner| owner.cache_identity.get().is_some()) {
+        read_cache_identity(root)?
+    } else {
+        initialize_cache_identity(root)?
+    };
+    if let Some(owner) = owner
+        && owner.cache_identity.get_or_init(|| id.clone()) != &id
+    {
+        return Err(DomainError::validation(ValidationReason::NotReady).into());
+    }
+    Ok(id)
+}
+
+fn initialize_cache_identity(root: &DataRoot) -> Result<String, PortError> {
     use std::{fs, io::Write};
     let directory = root.root().join("v1");
     fs::create_dir_all(&directory).map_err(checkpoint_error)?;
@@ -997,40 +1017,8 @@ fn cache_identity(root: &DataRoot) -> Result<String, PortError> {
         let _ = fs::set_permissions(&directory, fs::Permissions::from_mode(0o700));
     }
     let path = directory.join("projection_cache_id");
-    let read = || -> Result<String, PortError> {
-        #[cfg(unix)]
-        let file = {
-            use rustix::fs::{Mode, OFlags, open};
-            use std::os::unix::fs::MetadataExt;
-            let file = fs::File::from(
-                open(
-                    &path,
-                    OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-                    Mode::empty(),
-                )
-                .map_err(std::io::Error::from)
-                .map_err(checkpoint_error)?,
-            );
-            let meta = file.metadata().map_err(checkpoint_error)?;
-            if !meta.is_file() || meta.uid() != rustix::process::geteuid().as_raw() {
-                return Err(DomainError::validation(ValidationReason::InvalidState).into());
-            }
-            file
-        };
-        #[cfg(not(unix))]
-        let file = fs::File::open(&path).map_err(checkpoint_error)?;
-        let mut value = String::new();
-        use std::io::Read;
-        file.take(33)
-            .read_to_string(&mut value)
-            .map_err(checkpoint_error)?;
-        if value.len() != 32 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            return Err(DomainError::validation(ValidationReason::InvalidState).into());
-        }
-        Ok(value)
-    };
     if path.try_exists().map_err(checkpoint_error)? {
-        return read();
+        return read_cache_identity(root);
     }
     let value = hex::encode(notarium_canonical::codec::csprng_16()?);
     let staging = directory.join(format!(".projection-cache-{value}"));
@@ -1068,7 +1056,67 @@ fn cache_identity(root: &DataRoot) -> Result<String, PortError> {
     drop(file);
     let _ = fs::remove_file(staging);
     result.map_err(checkpoint_error)?;
-    read()
+    read_cache_identity(root)
+}
+
+// Erasure must inspect the mounted cache without creating a new identity.
+fn read_cache_identity(root: &DataRoot) -> Result<String, PortError> {
+    use std::{fs, io::Read};
+
+    let path = root.root().join("v1/projection_cache_id");
+    #[cfg(unix)]
+    let file = {
+        use rustix::fs::{Mode, OFlags, open};
+        fs::File::from(
+            open(
+                &path,
+                OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+                Mode::empty(),
+            )
+            .map_err(std::io::Error::from)
+            .map_err(checkpoint_error)?,
+        )
+    };
+    #[cfg(not(unix))]
+    let file = {
+        let mut options = fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+            options.custom_flags(OPEN_REPARSE_POINT);
+        }
+        options.open(&path).map_err(checkpoint_error)?
+    };
+    let meta = file.metadata().map_err(checkpoint_error)?;
+    let invalid = || DomainError::validation(ValidationReason::InvalidState);
+    if !meta.is_file() || meta.len() != 32 {
+        return Err(invalid().into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.uid() != rustix::process::geteuid().as_raw() {
+            return Err(invalid().into());
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const REPARSE_POINT: u32 = 0x400;
+        if meta.file_attributes() & REPARSE_POINT != 0 {
+            return Err(invalid().into());
+        }
+    }
+    let mut value = String::new();
+    file.take(33)
+        .read_to_string(&mut value)
+        .map_err(checkpoint_error)?;
+    if value.len() != 32 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(invalid().into());
+    }
+    Ok(value)
 }
 
 #[cfg(test)]

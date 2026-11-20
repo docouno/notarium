@@ -132,6 +132,11 @@ the stream checks the original and current source before sending a resync
 signal. Group counts and ranks come from events at the current cut. When a
 command exceeds the notification budget, a restricted subscription receives a
 resync only after a paginated canonical read confirms a visible change.
+
+After an uncertain board move, retry the same command key and payload.
+If another invocation commits the move while this one is checking its card or
+view, the writer can return the recorded result within the original deadline.
+Replay checks the caller's current permissions on the card and view.
 See [history and causal reads](core-contracts.md#history-and-causal-reads).
 
 ## Links and graph
@@ -189,7 +194,9 @@ installation binds the cache identity even when the projection cache and
 canonical database use different directories. PostgreSQL binds the identity
 of the shared generation control schema, so each serving node can keep its own
 local cache. Portable backups carry canonical data and exclude these
-installation bindings.
+installation bindings. The cleanup handler verifies its own cache volume when
+it erases data. If that volume is offline or the shared PostgreSQL control
+schema has changed identity, restore the original target and retry the command.
 
 A purge verifies the current canonical history while holding
 the same cache lock used for checkpoint publication. For that Space it removes
@@ -203,8 +210,8 @@ Startup also preserves these files. Stop all users of that derived cache, then
 restore the matching SQLite database and journal set or discard the affected
 disposable projection generation offline. Restart and retry the original command.
 Canonical databases and blob storage are outside this recovery operation.
-SQLite checkpoint writers verify the
-generation descriptor and the floor in the current database before publication.
+SQLite checkpoint writers verify the generation descriptor and the floor in
+the current database before publication.
 Worker recovery uses only the exact history being built.
 
 ## Verification

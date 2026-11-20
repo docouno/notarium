@@ -293,10 +293,9 @@ pub(super) enum RefreshError {
     Cleanup(PortError),
 }
 
-impl From<PortError> for RefreshError {
-    fn from(error: PortError) -> Self {
-        Self::Visibility(error)
-    }
+pub(super) struct CheckedRefresh {
+    pub(super) through: SpaceSeq,
+    pub(super) visibility: Result<(), PortError>,
 }
 
 pub(super) async fn refresh(
@@ -304,7 +303,7 @@ pub(super) async fn refresh(
     state: &mut LiveState,
     budget: &CallBudget,
     changes: crate::projection_fence::VisibilityChanges,
-) -> Result<(), RefreshError> {
+) -> Result<CheckedRefresh, RefreshError> {
     let previous = state.record.clone();
     let cleanup = store.inner.live_visibility.cleanup();
     let read_erasures = cleanup.is_some() && changes.erasures;
@@ -405,8 +404,16 @@ pub(super) async fn refresh(
             .await
             .map_err(RefreshError::Cleanup)?;
     }
+    // Erasure is complete even when the visibility delta is too large to apply.
+    Ok(CheckedRefresh {
+        through: patch.record.last_seq,
+        visibility: apply_visibility_patch(state, patch),
+    })
+}
+
+fn apply_visibility_patch(state: &mut LiveState, patch: Patch) -> Result<(), PortError> {
     if !patch.can_refresh {
-        return Err(RefreshError::Visibility(not_ready()));
+        return Err(not_ready());
     }
     let notes = patch
         .notes

@@ -495,3 +495,103 @@ async fn postgres_writer_takeover_requires_registered_eraser_after_reopen() {
     }
     pool.close().await;
 }
+
+#[tokio::test]
+async fn offline_pg_cache_substitution_needs_exact_volume_to_finish_purge() {
+    let scratch = Scratch::new();
+    let root = scratch.root();
+    let projection = Scratch::new();
+    let cache = DataRoot::new(projection.0.join("mounted"));
+    let (config, pool, canonical_schema, prefix) = postgres_fixture(&root).await;
+    let (canonical, writer) = CanonicalRuntime::open(config).await.unwrap();
+    let ctx = owner(&canonical).await;
+    let victim = create(&canonical, &ctx, "offline-victim", "old-cache".into()).await;
+    let initial = ProjectionGeneration::new(GENERATION).unwrap();
+    let start = || {
+        ProjectorRuntime::start_postgres(
+            canonical.clone(),
+            projection_context(),
+            pool.clone(),
+            &prefix,
+            cache.clone(),
+            initial,
+            ProjectionConfig::default(),
+        )
+    };
+    let projector = start().await.unwrap();
+    projector
+        .engine()
+        .wait_for_projected(ctx.scope(), victim.receipt.seq(), &budget())
+        .await
+        .unwrap();
+    projector.shutdown().await.unwrap();
+    let file = cache.space_fast_index(initial, &ctx.scope().space_id, victim.receipt.seq());
+    assert!(file.is_file());
+    let detached = projection.0.join("previous");
+    let previous_file = detached.join(file.strip_prefix(cache.root()).unwrap());
+    std::fs::rename(cache.root(), &detached).unwrap();
+    std::fs::create_dir_all(cache.root().join("v1")).unwrap();
+    assert!(start().await.is_err());
+    let request = purge(&ctx, &victim.value.note);
+    expect_unconfirmed(&canonical, &ctx, &request).await;
+    assert!(previous_file.is_file());
+    assert!(!cache.root().join("v1/projection_cache_id").exists());
+    std::fs::remove_dir_all(cache.root()).unwrap();
+    std::fs::rename(&detached, cache.root()).unwrap();
+
+    // Remounting just v1 can preserve the root directory's file identity.
+    // A reused lease must check its immutable marker without minting another.
+    let marker = cache.root().join("v1/projection_cache_id");
+    let original_id = std::fs::read(&marker).unwrap();
+    std::fs::remove_file(&marker).unwrap();
+    assert!(start().await.is_err() && !marker.exists());
+    let mut other_id = original_id.clone();
+    other_id[0] = if other_id[0] == b'0' { b'1' } else { b'0' };
+    std::fs::write(&marker, other_id).unwrap();
+    assert!(start().await.is_err());
+    expect_unconfirmed(&canonical, &ctx, &request).await;
+    std::fs::write(&marker, original_id).unwrap();
+
+    // G1 is still accessible by name while the original control is offline.
+    let control = format!("{prefix}_ctrl");
+    let offline_control = format!("{prefix}_offline_ctrl");
+    ddl(
+        &pool,
+        format!("ALTER SCHEMA {control} RENAME TO {offline_control}"),
+    )
+    .await;
+    expect_unconfirmed(&canonical, &ctx, &request).await;
+    drop(
+        GenerationControl::open_postgres(pool.clone(), &prefix)
+            .await
+            .unwrap(),
+    );
+    expect_unconfirmed(&canonical, &ctx, &request).await;
+    let row = async || {
+        sqlx::query_scalar::<_, bool>(sqlx::AssertSqlSafe(format!(
+            "SELECT EXISTS (SELECT 1 FROM {prefix}_g1.projected_notes WHERE note_id=$1)"
+        )))
+        .bind(victim.value.note.as_str())
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+    };
+    assert!(file.is_file() && row().await);
+    ddl(&pool, format!("DROP SCHEMA {control} CASCADE")).await;
+    ddl(
+        &pool,
+        format!("ALTER SCHEMA {offline_control} RENAME TO {control}"),
+    )
+    .await;
+    canonical.delete_note(ctx, request).await.unwrap();
+    assert!(!file.exists() && !row().await);
+    writer.shutdown().await.unwrap();
+    for name in [
+        canonical_schema,
+        format!("{prefix}_g1"),
+        format!("{prefix}_ctrl"),
+    ] {
+        ddl(&pool, format!("DROP SCHEMA IF EXISTS {name} CASCADE")).await;
+    }
+    pool.close().await;
+}

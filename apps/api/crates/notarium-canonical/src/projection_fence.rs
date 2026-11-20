@@ -1156,12 +1156,15 @@ impl LiveWriteSet {
             store.inner.live_visibility.cleanup()
         };
         let mut first_cleanup_error = None;
-        let mut active = Vec::with_capacity(self.guards.len());
+        let mut uncovered: Vec<_> = windows
+            .iter()
+            .filter(|window| window.changes.erasures)
+            .collect();
+        let mut failed_scopes = Vec::new();
         for guard in &mut self.guards {
             let Some(state) = guard.state_mut() else {
                 continue;
             };
-            active.push(state.record.scope.clone());
             let Some((changes, _)) = Self::guard_refresh_changes(state, windows) else {
                 if let Some(window) = windows
                     .iter()
@@ -1172,16 +1175,29 @@ impl LiveWriteSet {
                 continue;
             };
             let budget = source::internal_budget();
-            match source::refresh(store, state, &budget, changes).await {
-                Ok(()) => state.readable = true,
+            let after = state.record.last_seq;
+            let visibility = match source::refresh(store, state, &budget, changes).await {
+                Ok(checked) => {
+                    if changes.erasures {
+                        uncovered.retain(|window| {
+                            window.scope != state.record.scope
+                                || window.after < after
+                                || window.through > checked.through
+                        });
+                    }
+                    checked.visibility
+                }
                 Err(source::RefreshError::Cleanup(error)) => {
                     state.readable = false;
+                    failed_scopes.push(state.record.scope.clone());
                     first_cleanup_error.get_or_insert(error);
+                    continue;
                 }
-                Err(source::RefreshError::Visibility(error)) => {
-                    tracing::warn!(?error, "canonical visibility admission needs a fresh cut");
-                    state.readable = false;
-                }
+                Err(source::RefreshError::Visibility(error)) => Err(error),
+            };
+            state.readable = visibility.is_ok();
+            if let Err(error) = visibility {
+                tracing::warn!(?error, "canonical visibility admission needs a fresh cut");
             }
         }
         if let Some(cleanup) = cleanup {
@@ -1192,20 +1208,23 @@ impl LiveWriteSet {
                     .cleanup_debt
                     .lock()
                     .expect("projection cleanup debt");
-                for window in windows {
-                    if window.changes.erasures && !active.contains(&window.scope) {
-                        pending
-                            .entry(window.scope.clone())
-                            .and_modify(|(after, through)| {
-                                *after = (*after).min(window.after);
-                                *through = (*through).max(window.through);
-                            })
-                            .or_insert((window.after, window.through));
-                    }
+                // A retained admission can belong to the old writer epoch. Its failed
+                // refresh cannot acknowledge physical erasure in the committed window.
+                for window in uncovered {
+                    pending
+                        .entry(window.scope.clone())
+                        .and_modify(|(after, through)| {
+                            *after = (*after).min(window.after);
+                            *through = (*through).max(window.through);
+                        })
+                        .or_insert((window.after, window.through));
                 }
                 pending
                     .iter()
-                    .filter(|(scope, _)| self.spaces.binary_search(&scope.space_id).is_ok())
+                    .filter(|(scope, _)| {
+                        self.spaces.binary_search(&scope.space_id).is_ok()
+                            && !failed_scopes.contains(scope)
+                    })
                     .map(|(scope, &(after, through))| VisibilityWindow {
                         scope: scope.clone(),
                         after,

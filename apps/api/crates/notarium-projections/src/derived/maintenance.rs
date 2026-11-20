@@ -2,7 +2,7 @@ use std::{
     collections::BTreeMap,
     fs::{self, File, TryLockError},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, Weak},
+    sync::{Arc, Mutex, OnceLock, Weak},
 };
 
 use notarium_core::{epoch::DataRoot, error::PortError, ids::ProjectionGeneration};
@@ -55,6 +55,7 @@ pub(crate) struct GenerationFiles;
 /// generation, including the final unlink from a retained checkpoint.
 #[derive(Debug)]
 pub(crate) struct PostgresCacheOwner {
+    pub(crate) cache_identity: OnceLock<String>,
     root: DataRoot,
     _lease: File,
 }
@@ -83,13 +84,23 @@ impl PostgresCacheOwner {
             let mut owners = OWNERS
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            owners.retain(|_, owner| owner.strong_count() != 0);
+            // A detached callback still owns the original volume at this path.
+            if owners.iter().any(|(pinned, owner)| {
+                pinned != &key
+                    && owner
+                        .upgrade()
+                        .is_some_and(|owner| owner.root.root() == path)
+            }) {
+                return Err(not_ready());
+            }
             if let Some(owner) = owners.get(&key).and_then(Weak::upgrade) {
                 return Ok(owner);
             }
-            owners.retain(|_, owner| owner.strong_count() != 0);
             let lease = try_exclusive(&path.join("v1/projection_checkpoint.lock"))?
                 .ok_or_else(not_ready)?;
             let owner = Arc::new(Self {
+                cache_identity: OnceLock::new(),
                 root: DataRoot::new(path),
                 _lease: lease,
             });

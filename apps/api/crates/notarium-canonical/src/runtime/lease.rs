@@ -176,27 +176,26 @@ impl CanonicalStore {
     }
 
     async fn recover_deferred_projection_purges(&self) -> Result<Option<Duration>, PortError> {
-        const PAGE: &str = "SELECT DISTINCT space_id FROM pending_purges
-            WHERE phase <> 'completed' AND space_id > $1 ORDER BY space_id LIMIT 64";
+        // Walk the Space primary key even across clean pages. A phase-index lookup
+        // per Space avoids traversing its completed purge history on registration.
+        const PAGE: &str = concat!(
+            "SELECT s.space_id, ",
+            include_str!("../domain/purge/has_pending.sql"),
+            " FROM spaces s WHERE s.space_id>$1 ORDER BY s.space_id LIMIT 64"
+        );
         let mut after = String::new();
         let mut retry = None;
         loop {
             let cursor = after.clone();
-            let page: Vec<String> = self
+            let page: Vec<(String, bool)> = self
                 .with_read_tx(move |tx| {
                     Box::pin(async move {
                         match tx {
                             BackendConn::Sqlite(c) => {
-                                sqlx::query_scalar(PAGE)
-                                    .bind(cursor)
-                                    .fetch_all(&mut **c)
-                                    .await
+                                sqlx::query_as(PAGE).bind(cursor).fetch_all(&mut **c).await
                             }
                             BackendConn::Postgres(c) => {
-                                sqlx::query_scalar(PAGE)
-                                    .bind(cursor)
-                                    .fetch_all(&mut **c)
-                                    .await
+                                sqlx::query_as(PAGE).bind(cursor).fetch_all(&mut **c).await
                             }
                         }
                         .map_err(|error| pg_read_error("projection_pending_purges", error))
@@ -206,9 +205,13 @@ impl CanonicalStore {
             if page.is_empty() {
                 return Ok(retry);
             }
-            for id in page {
+            for (id, has_purges) in page {
+                after = id;
+                if !has_purges {
+                    continue;
+                }
                 let result = async {
-                    let space = self.read_space(&SpaceId::parse(&id)?).await?;
+                    let space = self.read_space(&SpaceId::parse(&after)?).await?;
                     if self
                         .inner
                         .check_writer_epoch(&space.scope.space_id, space.active_epoch)
@@ -226,12 +229,11 @@ impl CanonicalStore {
                 }
                 .await;
                 if let Err(error) = result {
-                    tracing::warn!(?error, space_id=%id, "projection purge recovery remains pending");
+                    tracing::warn!(?error, space_id=%after, "projection purge recovery remains pending");
                     if let Some(minimum) = crate::blobs::retirement_worker::retry_after(&error) {
                         retry = Some(retry.unwrap_or_default().max(minimum));
                     }
                 }
-                after = id;
             }
         }
     }
