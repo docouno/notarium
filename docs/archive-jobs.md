@@ -118,6 +118,10 @@ workers. The scanner and writer can run together even when the caller's
 blocking pool is occupied. On cancellation the coordinator drops its channels
 before releasing the holds. Each worker retains its capacity and temporary
 files until its work returns.
+Before requesting either writer pause, the coordinator can wait up to 20 ms
+within the backup deadline for active canonical writes. Both writers remain
+available during this wait. Sustained write traffic falls through to ordinary
+safe-point acquisition after the wait budget expires.
 
 Restore assigns a new incarnation to every Space and clamps control cursors to
 its recorded cutoff. Both stores must agree before the target is published.
@@ -134,8 +138,10 @@ The maintenance integration test can run the full paired backup under
 foreground note and chat writes with `NOTARIUM_PAIRED_ARCHIVE_CAPTURES=1000`.
 Each capture runs alongside four note/chat write pairs, spaced at 10 ms and
 rotated across the participating Spaces.
-It reports confirmed pause, pause including drain, and complete backup latency
-for 1 and 64 Spaces. Select `NOTARIUM_ARCHIVE_BENCH_TIER=high` or `medium` on the
+It reports the wait before pausing, confirmed pause, pause including drain, and
+complete backup latency for 1 and 64 Spaces. The confirmed timer starts when
+Control acknowledges its safe point. The inclusive pause timer starts with the
+first pause request. Select `NOTARIUM_ARCHIVE_BENCH_TIER=high` or `medium` on the
 matching hardware from [Storage performance](storage-performance.md) to apply
 the corresponding p95 threshold.
 

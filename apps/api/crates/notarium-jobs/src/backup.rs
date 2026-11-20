@@ -77,6 +77,7 @@ impl BackupOptions {
 pub struct PairedPause {
     pub confirmed: Duration,
     pub including_drain: Duration,
+    pub writer_wait: Duration,
 }
 
 #[derive(Clone, Debug)]
@@ -303,10 +304,11 @@ async fn run_backup_inner(
 }
 
 pub(crate) async fn capture_pair(
-    ctx: MaintenanceContext,
+    mut ctx: MaintenanceContext,
     canonical: &CanonicalStore,
     control: &ControlBackup,
 ) -> Result<Pair, PortError> {
+    let started = Instant::now();
     check_cancelled(&ctx.budget.cancellation)?;
     let workers = BackupWorkers::reserve()?;
     let id = BackupId::from_bytes(codec::ordered_id_16()?);
@@ -333,6 +335,10 @@ pub(crate) async fn capture_pair(
             }
         };
     let held_histories = &canonical_hold.witness().histories;
+    ctx.budget.remaining = cb
+        .deadline
+        .min(nb.deadline)
+        .saturating_sub(started.elapsed());
     let captured = async {
         let (control_spool, canonical_spool, pause) = capture_spools(
             &ctx,
@@ -466,6 +472,8 @@ async fn capture_spools(
     cb: notarium_core::ports::BackupBudget,
     nb: notarium_core::ports::BackupBudget,
 ) -> Result<(TemporaryBackupSpool, TemporaryBackupSpool, PairedPause), PortError> {
+    let wait_started = Instant::now();
+    canonical.wait_for_backup_write_gap(&ctx.budget).await?;
     let inclusive = Instant::now();
     let mut control_paused = ctrl.pause_writes().await?;
     let confirmed = Instant::now();
@@ -487,6 +495,7 @@ async fn capture_spools(
     let pause = PairedPause {
         confirmed: confirmed.elapsed(),
         including_drain: inclusive.elapsed(),
+        writer_wait: inclusive.duration_since(wait_started),
     };
     let (mut control_cut, mut canonical_cut) =
         acknowledge_pair(cuts, |cut| cut.close(), |cut| cut.close()).await?;

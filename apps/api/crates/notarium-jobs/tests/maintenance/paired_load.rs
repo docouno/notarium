@@ -92,6 +92,7 @@ pub(super) async fn capture_under_load(
         }
         let mut confirmed = Vec::with_capacity(captures);
         let mut drained = Vec::with_capacity(captures);
+        let mut writer_wait = Vec::with_capacity(captures);
         let mut total = Vec::with_capacity(captures);
         for iteration in 0..=captures {
             let path = data
@@ -122,6 +123,7 @@ pub(super) async fn capture_under_load(
             if iteration > 0 {
                 confirmed.push(backup.pause.confirmed.as_nanos() as u64);
                 drained.push(backup.pause.including_drain.as_nanos() as u64);
+                writer_wait.push(backup.pause.writer_wait.as_nanos() as u64);
                 total.push(elapsed.as_nanos() as u64);
             }
             fs::remove_file(path).unwrap();
@@ -141,7 +143,8 @@ pub(super) async fn capture_under_load(
             serde_json::json!({
                 "backend": backend, "tier": tier, "spaces": spaces, "captures": captures,
                 "foreground_writes": (captures + 1) * FOREGROUND_PAIRS * 2, "confirmed_ns": confirmed,
-                "including_drain_ns": percentiles(drained), "full_backup_ns": percentiles(total),
+                "including_drain_ns": percentiles(drained), "writer_wait_ns": percentiles(writer_wait),
+                "full_backup_ns": percentiles(total),
             })
         );
         if tier != "unrated" {

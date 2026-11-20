@@ -4,7 +4,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use notarium_core::{
@@ -686,6 +686,32 @@ impl WriteCoordinator {
         self.batch_telemetry.record(duration_ns, items);
     }
 
+    async fn wait_for_idle_write_ops(&self) {
+        loop {
+            let active = |tracker: &&Arc<ActiveWriteOpTracker>| {
+                tracker.active_ops.load(Ordering::Acquire) > 0
+            };
+            let tracker = match &self.mode {
+                CoordinatorMode::Sqlite { tracker, .. } => Some(tracker).filter(active).cloned(),
+                CoordinatorMode::Postgres { spaces } => spaces
+                    .lock()
+                    .expect("pg spaces")
+                    .values()
+                    .map(|space| &space.tracker)
+                    .find(active)
+                    .cloned(),
+            };
+            let Some(tracker) = tracker else { return };
+            let notified = tracker.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if tracker.active_ops.load(Ordering::Acquire) != 0 {
+                notified.await;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
     /// Acquires an exclusive writer safe point between Phase-2 batch commits without dropping queued items.
     pub async fn acquire_safe_point(&self) -> WriterSafePointGuard {
         let guard = Arc::clone(&self.commit_gate).write_owned().await;
@@ -1115,6 +1141,29 @@ impl crate::CanonicalStore {
     }
 
     #[cfg(feature = "test-support")]
+    /// Observes admitted writes for up to 20 ms while both writer gates remain open.
+    /// This is a scheduling hint. The paired pause still acquires both safe points.
+    pub async fn wait_for_backup_write_gap(&self, budget: &CallBudget) -> Result<(), PortError> {
+        let started = Instant::now();
+        let writer = self.inner.writer()?;
+        let wait = Duration::from_millis(20).min(budget.remaining);
+        tokio::select! {
+            biased;
+            () = budget.cancellation.cancelled() => {
+                return Err(cancelled_not_committed("backup_writer_wait", "backup stopped before pausing"));
+            }
+            () = writer.wait_for_idle_write_ops() => {}
+            () = tokio::time::sleep(wait) => {}
+        }
+        if started.elapsed() >= budget.remaining {
+            return Err(deadline_not_committed(
+                "backup_writer_wait",
+                "backup deadline elapsed before pausing",
+            ));
+        }
+        Ok(())
+    }
+
     pub async fn acquire_writer_safe_point(&self) -> Result<WriterSafePointGuard, PortError> {
         Ok(self.inner.writer()?.acquire_safe_point().await)
     }
@@ -2778,6 +2827,50 @@ mod tests {
         ids::{HistoryIncarnation, InstallationId, RequestId},
         ports::Cancellation,
     };
+
+    #[tokio::test]
+    async fn backup_write_wait_keeps_admission_open_and_observes_release() {
+        let root = std::env::temp_dir()
+            .join(crate::codec::new_prefixed_hex_id("backup-writers-test-").unwrap());
+        std::fs::create_dir_all(&root).unwrap();
+        let config = CanonicalConfig::local_default(
+            InstallationId::from_bytes([1; 16]),
+            DataRoot::new(&root),
+        );
+        let (store, runtime) = CanonicalRuntime::open(config).await.unwrap();
+        let writer = store.inner.writer().unwrap();
+        let space = SpaceId::from_bytes([2; 16]);
+        let budget = CallBudget {
+            request: RequestId::from_bytes([3; 16]),
+            remaining: Duration::from_secs(5),
+            cancellation: Cancellation::default(),
+        };
+
+        let write = writer.enter_write_op(&space, 1);
+        let mut wait = Box::pin(store.wait_for_backup_write_gap(&budget));
+        assert!(futures_util::poll!(&mut wait).is_pending());
+        assert!(writer.commit_gate.try_write().is_ok());
+        drop(write);
+        wait.await.unwrap();
+
+        let write = writer.enter_write_op(&space, 1);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            store.wait_for_backup_write_gap(&budget),
+        )
+        .await
+        .expect("continuous activity must not prevent a backup attempt")
+        .unwrap();
+
+        let mut wait = Box::pin(store.wait_for_backup_write_gap(&budget));
+        assert!(futures_util::poll!(&mut wait).is_pending());
+        budget.cancellation.cancel();
+        assert!(matches!(wait.await, Err(PortError::Cancelled(_))));
+        drop(write);
+        drop(store);
+        runtime.shutdown().await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[tokio::test]
     async fn abandoned_admission_and_auxiliary_transactions_release_their_resources() {
