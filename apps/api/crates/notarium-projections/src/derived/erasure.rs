@@ -9,7 +9,7 @@ use super::{
     maintenance::reclaim_postgres_schema,
     not_ready, parse_generation,
     schema::{MetadataState, SCHEMA_VERSION, metadata_state},
-    sql::{Database, Kind, SqlColumn, SqlTransaction},
+    sql::{Database, Kind, SqlColumn, SqlTransaction, sqlite_main_present},
     write::erase_committed,
 };
 
@@ -41,20 +41,12 @@ impl DerivedStore {
         erasures: &ProjectionErasures,
     ) -> Result<ErasureOutcome, PortError> {
         let path = root.derived(generation);
-        match tokio::fs::symlink_metadata(&path).await {
-            Ok(meta) if meta.is_file() => {}
-            Ok(_) => return Err(invalid_row()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(ErasureOutcome::Empty);
-            }
-            Err(_) => return Err(internal("projection_generation_inventory")),
-        }
-        if !tokio::fs::symlink_metadata(path.parent().ok_or_else(invalid_row)?)
+        let probe = path.clone();
+        if !tokio::task::spawn_blocking(move || sqlite_main_present(&probe))
             .await
-            .map_err(|_| invalid_row())?
-            .is_dir()
+            .map_err(|_| internal("projection_generation_inventory"))??
         {
-            return Err(invalid_row());
+            return Ok(ErasureOutcome::Empty);
         }
         let lease = GenerationFiles::hold(root, generation).await?;
         let db = match resident {

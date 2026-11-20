@@ -186,8 +186,14 @@ the same cache lock used for checkpoint publication. For that Space it removes
 checkpoints below the purge sequence in the current history and checkpoints
 from previous histories at any sequence. When an active or reserved generation
 has no SQL floor, its matching files keep the purge pending. A retired SQLite
-generation with a missing database can release the matching files while readers
-of other Spaces keep their shared leases. SQLite checkpoint writers verify the
+generation containing only checkpoints can release matching files while readers
+of other Spaces keep their shared leases. If `derived.sqlite` is missing or empty
+and its WAL or rollback journal remains, purges and chat redactions stay pending.
+Startup also preserves these files. Stop all users of that derived cache, then
+restore the matching SQLite database and journal set or discard the affected
+disposable projection generation offline. Restart and retry the original command.
+Canonical databases and blob storage are outside this recovery operation.
+SQLite checkpoint writers verify the
 generation descriptor and the floor in the current database before publication.
 Worker recovery uses only the exact history being built.
 

@@ -11,7 +11,9 @@ use sqlx::{AssertSqlSafe, PgPool};
 use super::{
     DerivedStore, internal, invalid_row, not_ready, parse_generation,
     schema::{MetadataState, generation_mismatch, metadata_state},
-    sql::{Database, Kind, SqlColumn, SqlTransaction, validate_identifier, value},
+    sql::{
+        Database, Kind, SqlColumn, SqlTransaction, sqlite_main_present, validate_identifier, value,
+    },
 };
 
 /// In-process pin preventing `reclaim_postgres_schema` from dropping a
@@ -384,7 +386,7 @@ fn inside_cache(path: &Path) -> Result<bool, PortError> {
 
 fn check_sqlite_witness(path: &Path, generation: ProjectionGeneration) -> Result<(), PortError> {
     let error = |_| internal("projection_generation_file_witness");
-    if !fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file()) {
+    if !sqlite_main_present(path)? {
         return Err(invalid_row());
     }
     let db =

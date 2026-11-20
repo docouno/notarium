@@ -340,6 +340,45 @@ fn sqlite_file_id(path: &Path) -> Option<(u64, u64)> {
     file.is_file().then(|| (file.dev(), file.ino()))
 }
 
+fn sqlite_metadata(path: &Path) -> Result<Option<std::fs::Metadata>, PortError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => Ok(Some(meta)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(internal("projection_generation_inventory")),
+    }
+}
+
+fn sqlite_sidecar(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    name.into()
+}
+
+/// A WAL can contain committed rows and a rollback journal can contain their
+/// before-images. Even an empty journal can already belong to a live writer.
+pub(super) fn sqlite_main_present(path: &Path) -> Result<bool, PortError> {
+    let directory = path.parent().ok_or_else(invalid_row)?;
+    if sqlite_metadata(directory)?.is_some_and(|meta| !meta.is_dir()) {
+        return Err(invalid_row());
+    }
+    let present = match sqlite_metadata(path)? {
+        Some(meta) if !meta.is_file() => return Err(invalid_row()),
+        Some(meta) => meta.len() != 0,
+        None => false,
+    };
+    for suffix in ["-wal", "-journal", "-shm"] {
+        if let Some(meta) = sqlite_metadata(&sqlite_sidecar(path, suffix))? {
+            if !meta.is_file() {
+                return Err(invalid_row());
+            }
+            if !present && suffix != "-shm" {
+                return Err(super::not_ready());
+            }
+        }
+    }
+    Ok(present)
+}
+
 struct SqliteDatabase {
     #[cfg(unix)]
     file_id: (u64, u64),
@@ -541,6 +580,9 @@ impl Database {
 
     async fn open_sqlite_file(path: PathBuf, create: bool) -> Result<Self, PortError> {
         tokio::task::spawn_blocking(move || {
+            if !sqlite_main_present(&path)? && !create {
+                return Err(super::not_ready());
+            }
             let directory = path.parent().ok_or_else(invalid_row)?;
             if create {
                 std::fs::create_dir_all(directory)
@@ -595,8 +637,7 @@ impl Database {
             for _ in 0..reader_count {
                 readers.push(open_reader(&path)?);
             }
-            let mut wal = path.as_os_str().to_os_string();
-            wal.push("-wal");
+            let wal = sqlite_sidecar(&path, "-wal");
             Ok(Self(Backend::Sqlite(Box::new(SqliteDatabase {
                 #[cfg(unix)]
                 file_id: {
@@ -613,7 +654,7 @@ impl Database {
                 readers: Mutex::new(readers),
                 permits: Arc::new(Semaphore::new(READERS)),
                 checkpoint: Arc::new(CheckpointGate::default()),
-                wal: PathBuf::from(wal),
+                wal,
             }))))
         })
         .await
@@ -729,7 +770,13 @@ impl Database {
                     writer
                         .execute_batch("BEGIN IMMEDIATE")
                         .map_err(sqlite_error)?;
-                    let result = runtime.block_on(operation(SqlTransaction::Sqlite(&mut writer)));
+                    // BEGIN owns the write lock and opens the WAL. A displaced
+                    // connection must roll back before writing old rows.
+                    let result = if database.owns_sqlite_file(&sqlite.path) {
+                        runtime.block_on(operation(SqlTransaction::Sqlite(&mut writer)))
+                    } else {
+                        Err(super::stale())
+                    };
                     let result = match result {
                         Ok(value) => match writer.execute_batch("COMMIT") {
                             Ok(()) => Ok(value),
@@ -796,6 +843,14 @@ impl Database {
                         } else if scrub_wal {
                             return Err(unknown_commit());
                         }
+                    }
+                    // WAL checkpointing cannot scrub a cold rollback journal
+                    // left beside a restored WAL-mode main database.
+                    if scrub_wal
+                        && sqlite_metadata(&sqlite_sidecar(&sqlite.path, "-journal"))?
+                            .is_some_and(|meta| !meta.is_file() || meta.len() != 0)
+                    {
+                        return Err(unknown_commit());
                     }
                     Ok(result)
                 })
