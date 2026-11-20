@@ -36,6 +36,7 @@ impl DerivedStore {
         root: &DataRoot,
         generation: ProjectionGeneration,
         resident: Option<&Self>,
+        maintenance: Arc<tokio::sync::OwnedMutexGuard<()>>,
         canonical: &CanonicalStore,
         erasures: &ProjectionErasures,
     ) -> Result<ErasureOutcome, PortError> {
@@ -62,10 +63,10 @@ impl DerivedStore {
         };
         let canonical = canonical.clone();
         let erasures = erasures.clone();
-        db.write(true, move |mut tx| {
+        db.write_adaptive((lease, maintenance), move |mut tx| {
             Box::pin(async move {
-                let _lease = lease;
-                erase_generation(&mut tx, generation, &canonical, &erasures).await
+                let outcome = erase_generation(&mut tx, generation, &canonical, &erasures).await?;
+                Ok((outcome, true))
             })
         })
         .await

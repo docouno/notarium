@@ -324,7 +324,7 @@ impl DerivedStore {
         let change = change.clone();
         let scrub = needs_scrub(&change.mutations);
         self.database
-            .write_adaptive(move |mut tx| {
+            .write_adaptive((), move |mut tx| {
                 Box::pin(async move {
                     let scopes = mutation_scopes(&change.watermark.scope, &change.mutations)?;
                     let floor = lock_scopes(&mut tx, &change.watermark.scope, scopes).await?;
@@ -524,7 +524,7 @@ impl DerivedStore {
         let key = key.clone();
         let next = next.clone();
         self.database
-            .write_adaptive(move |mut tx| {
+            .write_adaptive((), move |mut tx| {
                 Box::pin(async move {
                     let dep_sql = "SELECT DISTINCT target_space_id, target_incarnation
                            FROM projection_apply_chat_refs WHERE space_id = ? AND history_incarnation = ?
@@ -666,7 +666,7 @@ impl DerivedStore {
     pub async fn discard_staging(&self, scope: &HistoryScope) -> Result<(), PortError> {
         let scope = scope.clone();
         self.database
-            .write_adaptive(move |mut tx| {
+            .write_adaptive((), move |mut tx| {
                 Box::pin(async move {
                     check_guard(&mut tx, &scope).await?;
                     let deleted = delete_apply_pages_ordered(

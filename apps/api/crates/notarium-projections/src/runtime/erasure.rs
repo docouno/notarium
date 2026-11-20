@@ -246,6 +246,7 @@ impl Eraser {
                 &self.root,
                 id,
                 resident.get(&id).map(|generation| &generation.store),
+                Arc::clone(maintenance),
                 canonical,
                 erasures,
             )

@@ -691,13 +691,17 @@ impl Database {
         F: for<'a> FnOnce(SqlTransaction<'a>) -> SqlFuture<'a, T> + Send + 'static,
         T: Send + 'static,
     {
-        self.write_adaptive(move |tx| {
+        self.write_adaptive((), move |tx| {
             Box::pin(async move { operation(tx).await.map(|value| (value, scrub_wal)) })
         })
         .await
     }
 
-    pub(super) async fn write_adaptive<T, F>(self: &Arc<Self>, operation: F) -> Result<T, PortError>
+    pub(super) async fn write_adaptive<T, F>(
+        self: &Arc<Self>,
+        hold: impl Send + 'static,
+        operation: F,
+    ) -> Result<T, PortError>
     where
         F: for<'a> FnOnce(SqlTransaction<'a>) -> SqlFuture<'a, (T, bool)> + Send + 'static,
         T: Send + 'static,
@@ -712,6 +716,9 @@ impl Database {
                 let database = Arc::clone(self);
                 let runtime = Handle::current();
                 tokio::task::spawn_blocking(move || {
+                    // The blocking worker may outlive its caller or Tokio runtime.
+                    // Keep erasure permits through rollback, COMMIT and WAL truncation.
+                    let _hold = hold;
                     let Backend::Sqlite(sqlite) = &database.0 else {
                         unreachable!();
                     };
