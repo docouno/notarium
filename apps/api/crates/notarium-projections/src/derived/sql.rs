@@ -337,7 +337,7 @@ struct ReadWork {
 fn sqlite_file_id(path: &Path) -> Option<(u64, u64)> {
     use std::os::unix::fs::MetadataExt;
     let file = std::fs::symlink_metadata(path).ok()?;
-    file.is_file().then(|| (file.dev(), file.ino()))
+    (file.is_file() && file.len() != 0).then(|| (file.dev(), file.ino()))
 }
 
 fn sqlite_metadata(path: &Path) -> Result<Option<std::fs::Metadata>, PortError> {
@@ -560,7 +560,7 @@ impl Database {
         }
         #[cfg(windows)]
         {
-            std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file())
+            std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file() && meta.len() != 0)
                 && same_file::Handle::from_path(path).is_ok_and(|current| current == sqlite.file_id)
         }
         #[cfg(not(any(unix, windows)))]

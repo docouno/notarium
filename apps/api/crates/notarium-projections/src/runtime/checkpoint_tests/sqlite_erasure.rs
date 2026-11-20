@@ -321,6 +321,11 @@ async fn sqlite_file_only_candidate_retries_and_reused_number_rejects_old_writer
     assert!(!db.exists());
     let fresh = DerivedStore::open_sqlite(&root, next).await.unwrap();
     fresh.register_scope(ctx.scope()).await.unwrap();
+    let error = old.register_scope(ctx.scope()).await.unwrap_err();
+    assert!(
+        matches!(error, PortError::Domain(DomainError::ValidationFailed {diagnostic})
+        if diagnostic.reason == ValidationReason::CursorStale)
+    );
     let error = apply::publish_checkpoint_file(&engine, &old, prepare())
         .await
         .unwrap_err();
@@ -506,10 +511,9 @@ async fn exercise_orphan_journal(redact: bool) {
         "derived.sqlite-wal"
     });
     let sql = Connection::open(&db).unwrap();
-    let marker: String;
-    if redact {
+    let marker = if redact {
         sql.execute_batch("PRAGMA journal_mode=PERSIST").unwrap();
-        marker = sql
+        let marker: String = sql
             .query_row(
                 "SELECT source_revision FROM chat_note_refs WHERE thread_id = ?",
                 [thread.as_str()],
@@ -524,10 +528,11 @@ async fn exercise_orphan_journal(redact: bool) {
             .unwrap(),
             1
         );
+        marker
     } else {
         sql.execute_batch("PRAGMA wal_autocheckpoint=0; PRAGMA wal_checkpoint(TRUNCATE)")
             .unwrap();
-        marker = format!("private-preview-{}", hex::encode(entropy()));
+        let marker = format!("private-preview-{}", hex::encode(entropy()));
         assert_eq!(
             sql.execute(
                 "UPDATE projected_notes SET preview = ? WHERE note_id = ?",
@@ -536,7 +541,8 @@ async fn exercise_orphan_journal(redact: bool) {
             .unwrap(),
             1
         );
-    }
+        marker
+    };
     let matching_main = std::fs::read(&db).unwrap();
     let pages = std::fs::read(&sidecar).unwrap();
     assert!(
