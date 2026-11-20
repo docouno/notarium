@@ -181,7 +181,17 @@ verification and response assembly. Redaction removes source references and
 invalidated context entries from eligible results. Both SQLite and PostgreSQL
 erasure hooks remain active on the canonical writer after the local projector
 stops so offline purges and redactions still clean derived databases and local
-checkpoint files. A purge verifies the current canonical history while holding
+checkpoint files. After a full process restart, start the projector with its
+existing cache. The canonical writer remembers that this installation uses
+projections and requires the cleanup handler before acknowledging a purge or
+chat redaction, including retries with the original command key. A SQLite
+installation binds the cache identity even when the projection cache and
+canonical database use different directories. PostgreSQL binds the identity
+of the shared generation control schema, so each serving node can keep its own
+local cache. Portable backups carry canonical data and exclude these
+installation bindings.
+
+A purge verifies the current canonical history while holding
 the same cache lock used for checkpoint publication. For that Space it removes
 checkpoints below the purge sequence in the current history and checkpoints
 from previous histories at any sequence. When an active or reserved generation

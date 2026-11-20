@@ -1,12 +1,15 @@
 //! Current canonical visibility for retained and asynchronously built read cuts.
 
+mod registration;
 mod source;
+
+pub use registration::ProjectionCleanupRegistration;
 
 #[cfg(feature = "test-support")]
 mod census;
 #[cfg(feature = "test-support")]
 pub use census::FenceCensusFixture;
-pub(crate) use source::ensure_postgres_owner_table;
+pub(crate) use source::{ensure_postgres_owner_table, internal_budget};
 
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
@@ -1145,6 +1148,13 @@ impl LiveWriteSet {
         store: &CanonicalStore,
         windows: &[VisibilityWindow],
     ) -> Result<(), PortError> {
+        let cleanup = if windows.iter().any(|window| window.changes.erasures) {
+            store
+                .projection_cleanup_for_erasure(&source::internal_budget())
+                .await?
+        } else {
+            store.inner.live_visibility.cleanup()
+        };
         let mut first_cleanup_error = None;
         let mut active = Vec::with_capacity(self.guards.len());
         for guard in &mut self.guards {
@@ -1174,7 +1184,7 @@ impl LiveWriteSet {
                 }
             }
         }
-        if let Some(cleanup) = store.inner.live_visibility.cleanup() {
+        if let Some(cleanup) = cleanup {
             let mut debt = {
                 let mut pending = store
                     .inner
@@ -1281,6 +1291,7 @@ impl CanonicalStore {
         self.inner.live_visibility.clone()
     }
 
+    #[cfg(feature = "test-support")]
     pub fn set_projection_visibility_cleanup(
         &self,
         ctx: &MaintenanceContext,
@@ -1296,63 +1307,23 @@ impl CanonicalStore {
         Ok(())
     }
 
-    /// A completed command receipt can be found before a retry reaches the
-    /// writer. Repair any local post-commit debt before returning that success.
-    pub(crate) async fn retry_projection_cleanup(
+    pub(crate) async fn retry_purged_note_cleanup(
         &self,
         scope: &HistoryScope,
+        through: SpaceSeq,
+        note: &NoteId,
         budget: &CallBudget,
-        confirmed_end: Option<SpaceSeq>,
     ) -> Result<(), PortError> {
-        let fence = &self.inner.live_visibility;
-        if !fence.has_cleanup() {
-            return Ok(());
-        }
-        let deadline =
-            crate::runtime::deadline_after(tokio::time::Instant::now(), budget.remaining);
-        let visibility = budgeted(
+        self.replay_projection_erasure(
+            ProjectionErasures {
+                scope: scope.clone(),
+                through,
+                purged: vec![note.clone()],
+                redacted: Vec::new(),
+            },
             budget,
-            deadline,
-            fence.for_write(vec![scope.space_id.clone()]),
         )
         .await
-        .map_err(|error| {
-            crate::codec::unknown_commit_outcome("projection_cleanup_retry", error.to_string())
-        })?;
-        let unreadable = visibility.guards.iter().any(|guard| {
-            guard
-                .state()
-                .is_some_and(|state| &state.record.scope == scope && !state.readable)
-        });
-        if let Some(end) = confirmed_end {
-            let window = source::receipt_window(self, scope, end, budget)
-                .await
-                .map_err(|error| {
-                    crate::codec::unknown_commit_outcome(
-                        "projection_receipt_window",
-                        error.to_string(),
-                    )
-                })?;
-            let mut pending = fence.cleanup_debt.lock().expect("projection cleanup debt");
-            pending
-                .entry(window.scope)
-                .and_modify(|(after, through)| {
-                    *after = (*after).min(window.after);
-                    *through = (*through).max(window.through);
-                })
-                .or_insert((window.after, window.through));
-        }
-        let has_debt = fence
-            .cleanup_debt
-            .lock()
-            .expect("projection cleanup debt")
-            .contains_key(scope);
-        if unreadable || has_debt {
-            visibility.published(self, &[]).await.map_err(|error| {
-                crate::codec::unknown_commit_outcome("projection_cleanup_retry", error.to_string())
-            })?;
-        }
-        Ok(())
     }
 
     pub(crate) async fn retry_redacted_chat_cleanup(
@@ -1360,24 +1331,9 @@ impl CanonicalStore {
         committed: &Committed<RedactedChat>,
         budget: &CallBudget,
     ) -> Result<(), PortError> {
-        let fence = &self.inner.live_visibility;
-        let Some(callback) = fence.cleanup() else {
-            return Ok(());
-        };
-        let scope = committed.receipt.scope();
-        let deadline =
-            crate::runtime::deadline_after(tokio::time::Instant::now(), budget.remaining);
-        let mut visibility = budgeted(
-            budget,
-            deadline,
-            fence.for_write(vec![scope.space_id.clone()]),
-        )
-        .await
-        .map_err(|error| {
-            crate::codec::unknown_commit_outcome("projection_chat_cleanup_retry", error.to_string())
-        })?;
         let through = committed.receipt.seq();
         let value = &committed.value;
+        // Receipts preserve the affected entries even if another command moved a redacted-at marker.
         let redacted = std::iter::once(value.entry)
             .chain(value.invalidated_contexts.iter().copied())
             .map(|entry| ProjectionRedactedEntry {
@@ -1386,27 +1342,57 @@ impl CanonicalStore {
                 redacted_at: through,
             })
             .collect();
-        let erasures = ProjectionErasures {
-            scope: scope.clone(),
-            through,
-            purged: Vec::new(),
-            redacted,
+        self.replay_projection_erasure(
+            ProjectionErasures {
+                scope: committed.receipt.scope().clone(),
+                through,
+                purged: Vec::new(),
+                redacted,
+            },
+            budget,
+        )
+        .await
+    }
+
+    async fn replay_projection_erasure(
+        &self,
+        erasures: ProjectionErasures,
+        budget: &CallBudget,
+    ) -> Result<(), PortError> {
+        let Some(callback) = self.projection_cleanup_for_erasure(budget).await? else {
+            return Ok(());
         };
-        // Receipts carry the original affected entries even when another
-        // committed redaction moved their current redacted-at markers.
+        let retry = |error: PortError| {
+            crate::codec::unknown_commit_outcome("projection_cleanup_retry", error.to_string())
+        };
+        let deadline =
+            crate::runtime::deadline_after(tokio::time::Instant::now(), budget.remaining);
+        let mut visibility = budgeted(
+            budget,
+            deadline,
+            self.inner
+                .live_visibility
+                .for_write(vec![erasures.scope.space_id.clone()]),
+        )
+        .await
+        .map_err(retry)?;
         visibility.committing();
+        if !erasures.purged.is_empty() {
+            for state in visibility
+                .guards
+                .iter_mut()
+                .filter_map(|guard| guard.state_mut())
+            {
+                if state.record.scope == erasures.scope {
+                    state.retire_lookup_before(erasures.through);
+                }
+            }
+        }
         callback
             .erase_visibility(self, &erasures)
             .await
-            .map_err(|error| {
-                crate::codec::unknown_commit_outcome(
-                    "projection_chat_cleanup_retry",
-                    error.to_string(),
-                )
-            })?;
-        visibility.published(self, &[]).await.map_err(|error| {
-            crate::codec::unknown_commit_outcome("projection_chat_cleanup_retry", error.to_string())
-        })
+            .map_err(retry)?;
+        visibility.published(self, &[]).await.map_err(retry)
     }
 
     pub async fn projection_owner_identity(

@@ -33,9 +33,10 @@ same behavioral parity suites:
   issuer. Local PostgreSQL fixtures connect through a Unix socket.
 
 `CanonicalRuntime::open` acquires lifetime `DataRootOwnerLock` guards where
-local storage is used, verifies or bootstraps the schema transactionally,
-reconciles interrupted collaboration room fences and resumes any interrupted
-purge closure before returning `(CanonicalStore, CanonicalRuntime)`.
+local storage is used, verifies or bootstraps the schema transactionally and
+reconciles interrupted collaboration room fences. SQLite resumes pending blob
+retirements on open. If the installation has used projections, a purge that
+still requires derived cleanup stays pending until its handler is available.
 If recovery fails, opening cancels its workers and releases local ownership
 before returning the error. Dropping an opening future schedules the same
 shutdown on its Tokio runtime. The DataRoot stays locked until the workers and
@@ -317,7 +318,9 @@ Irreversible erasure executes as a crash-recoverable 3-phase protocol:
    enforced ahead of historical reads, cold seeds and card hydration). SQLite
    startup resumes pending purges and standalone blob retirements. For an
    existing PostgreSQL Space, the incoming writer must acquire a higher epoch
-   with `advance_space_lease`. The caller waits for recovery within its budget.
+   with `advance_space_lease`. An installation with projections completes a
+   pending purge after its registered handler has erased the derived data.
+   A caller that loses the acknowledgement can retry with the original key.
 
 Shared blobs that remain referenced by independent live notes or chat entries
 retain their active references, and historical external backups created prior to

@@ -15,7 +15,7 @@ use super::*;
 
 const CARRIER: &str = "# Doomed while offline\n";
 
-/// Model a canonical process that has not registered a projector.
+/// Inject a missed physical cleanup to exercise recovery of stale derived data.
 pub(super) fn disable_cleanup(store: &CanonicalStore) {
     struct NoProjector;
 

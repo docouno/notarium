@@ -38,5 +38,6 @@ rustix = { workspace = true, features = ["process"] }
 same-file = { workspace = true }
 
 [dev-dependencies]
+notarium-canonical = { workspace = true, features = ["test-support"] }
 notarium-projections = { workspace = true, features = ["test-support"] }
 proptest = { workspace = true }

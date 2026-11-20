@@ -288,55 +288,6 @@ pub(super) async fn erase_window(
     Ok(purged)
 }
 
-pub(super) async fn receipt_window(
-    store: &CanonicalStore,
-    scope: &HistoryScope,
-    through: SpaceSeq,
-    budget: &CallBudget,
-) -> Result<VisibilityWindow, PortError> {
-    let scope = scope.clone();
-    store
-        .with_read_tx_budget(Some(budget), move |tx| {
-            Box::pin(async move {
-                let record = load_space_record(tx, &scope.space_id).await?;
-                record.scope.check(&scope)?;
-                const SQL: &str = "SELECT first_seq FROM change_commands
-                    WHERE space_id=$1 AND history_incarnation=$2 AND last_seq=$3";
-                let space = scope.space_id.as_str();
-                let history = scope.incarnation.as_bytes().as_slice();
-                let end = through.get() as i64;
-                let first: Option<i64> = match tx {
-                    BackendConn::Sqlite(conn) => sqlx::query_scalar(SQL)
-                        .bind(space)
-                        .bind(history)
-                        .bind(end)
-                        .fetch_optional(&mut **conn)
-                        .await
-                        .map_err(|error| {
-                            internal_not_committed("sqlite_erasure_receipt", error.to_string())
-                        })?,
-                    BackendConn::Postgres(conn) => sqlx::query_scalar(SQL)
-                        .bind(space)
-                        .bind(history)
-                        .bind(end)
-                        .fetch_optional(&mut **conn)
-                        .await
-                        .map_err(|error| pg_read_error("pg_erasure_receipt", error))?,
-                };
-                let first = first.ok_or_else(not_ready)?;
-                let after =
-                    crate::codec::i64_to_space_seq(first.checked_sub(1).ok_or_else(not_ready)?)?;
-                Ok(VisibilityWindow {
-                    scope,
-                    after,
-                    through,
-                    changes: crate::projection_fence::VisibilityChanges::all(),
-                })
-            })
-        })
-        .await
-}
-
 pub(super) enum RefreshError {
     Visibility(PortError),
     Cleanup(PortError),
@@ -484,9 +435,16 @@ pub(crate) async fn ensure_postgres_owner_table(conn: &mut PgConnection) -> Resu
             phase TEXT NOT NULL CHECK(phase IN ('active','draining','drained'))
         )",
     )
-    .execute(conn)
+    .execute(&mut *conn)
     .await
     .map_err(|err| internal_not_committed("pg_projection_owner_registry", err.to_string()))?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS projection_cleanup_registration (
+        singleton BOOLEAN PRIMARY KEY CHECK(singleton), deployment_id TEXT NOT NULL)",
+    )
+    .execute(conn)
+    .await
+    .map_err(|err| internal_not_committed("pg_projection_cleanup_registry", err.to_string()))?;
     Ok(())
 }
 
@@ -740,7 +698,7 @@ pub(super) async fn restore(
     Ok(())
 }
 
-pub(super) fn internal_budget() -> CallBudget {
+pub(crate) fn internal_budget() -> CallBudget {
     CallBudget {
         request: RequestId::from_bytes([0; 16]),
         cancellation: Default::default(),

@@ -59,8 +59,9 @@ pub use peers::{
 pub use projection_fence::FenceCensusFixture;
 pub use projection_fence::{
     FenceMemoryUsage, LiveDenseLookup, LiveLifecycleFence, LiveNoteStatus, LiveReadPermit,
-    LiveSpaceHandle, ProjectionErasures, ProjectionOwnerIdentity, ProjectionOwnerWitness,
-    ProjectionRedactedEntry, ProjectionVisibilityCleanup, StoppedProjectionOwner,
+    LiveSpaceHandle, ProjectionCleanupRegistration, ProjectionErasures, ProjectionOwnerIdentity,
+    ProjectionOwnerWitness, ProjectionRedactedEntry, ProjectionVisibilityCleanup,
+    StoppedProjectionOwner,
 };
 pub use runtime::{
     CanonicalRuntime, CanonicalStore, CreateFolderSpec, CreateSpaceSpec, SpaceRecord,

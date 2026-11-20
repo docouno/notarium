@@ -1553,6 +1553,7 @@ pub async fn verify_postgres_catalog(
     let observed_tables: BTreeSet<&str> = observed_tables_vec.iter().map(String::as_str).collect();
     let mut expected_tables = expected_table_names();
     expected_tables.insert("projection_space_owners");
+    expected_tables.insert("projection_cleanup_registration");
     if observed_tables != expected_tables {
         return Err(internal_not_committed(
             "pg_table_mismatch",

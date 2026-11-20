@@ -52,6 +52,7 @@ enum ControlBackend {
 struct PostgresControl {
     database: Arc<Database>,
     schema_prefix: String,
+    cleanup_identity: String,
     coordinator: Option<tokio::sync::Mutex<PgConnection>>,
 }
 
@@ -102,6 +103,7 @@ impl GenerationControl {
         Ok(Self(Arc::new(ControlBackend::Postgres(PostgresControl {
             database: Arc::clone(&pg.database),
             schema_prefix: pg.schema_prefix.clone(),
+            cleanup_identity: pg.cleanup_identity.clone(),
             coordinator: Some(tokio::sync::Mutex::new(session)),
         }))))
     }
@@ -129,7 +131,7 @@ impl GenerationControl {
         let schema_prefix = validate_schema_prefix(schema_prefix)?.to_owned();
         let schema = format!("{schema_prefix}_ctrl");
         let database = Arc::new(Database::open_postgres(pool, &schema).await?);
-        database
+        let cleanup_identity = database
             .write(false, |mut tx| {
                 Box::pin(async move {
                     tx.batch(
@@ -137,7 +139,9 @@ impl GenerationControl {
                          CREATE TABLE IF NOT EXISTS projection_generation_control (
                              row_id BIGINT PRIMARY KEY CHECK (row_id = 1),
                              descriptor BYTEA NOT NULL
-                         );",
+                         );
+                         ALTER TABLE projection_generation_control ADD COLUMN IF NOT EXISTS
+                             cleanup_identity UUID NOT NULL DEFAULT gen_random_uuid();",
                     )
                     .await?;
                     tx.execute(
@@ -146,17 +150,30 @@ impl GenerationControl {
                         vec![value(&encode(&DescriptorState::default())?)],
                     )
                     .await?;
-                    Ok(())
+                    let identity = tx.select(
+                        "SELECT replace(cleanup_identity::text, '-', '') FROM projection_generation_control WHERE row_id=1",
+                        Vec::new(), &[Kind::Text],
+                    ).await?.pop().and_then(|mut row| row.pop()).ok_or_else(invalid_row)?;
+                    String::read(identity)
                 })
             })
             .await?;
         let control = Self(Arc::new(ControlBackend::Postgres(PostgresControl {
             database,
             schema_prefix,
+            cleanup_identity,
             coordinator: None,
         })));
         control.active().await?;
         Ok(control)
+    }
+
+    /// PostgreSQL peers share a derived installation while each owns a local mmap cache.
+    pub(crate) fn cleanup_identity<'a>(&'a self, cache_identity: &'a str) -> &'a str {
+        match &*self.0 {
+            ControlBackend::Postgres(pg) => &pg.cleanup_identity,
+            ControlBackend::Local(_) => cache_identity,
+        }
     }
 
     pub(crate) fn is_postgres(&self) -> bool {

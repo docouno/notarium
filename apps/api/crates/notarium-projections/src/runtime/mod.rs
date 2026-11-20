@@ -206,6 +206,12 @@ impl ProjectorRuntime {
         let cache_identity = tokio::task::spawn_blocking(move || cache_identity(&identity_root))
             .await
             .map_err(checkpoint_error)??;
+        let cleanup_registration = canonical
+            .prepare_projection_visibility_cleanup(
+                &projection_context,
+                control.cleanup_identity(&cache_identity),
+            )
+            .await?;
         let generation_cleanup = cache_cleanup(&cache_root);
         let coordinator = control.acquire_coordinator().await?;
         coordinator.clear_interrupted_rotation().await?;
@@ -280,15 +286,7 @@ impl ProjectorRuntime {
                 return Err(error);
             }
         };
-        if let Err(error) = engine
-            .canonical
-            .set_projection_visibility_cleanup(&engine.projection_context, Arc::new(eraser))
-        {
-            if let Some(candidate) = &recovery {
-                let _ = coordinator.cancel_candidate(candidate).await;
-            }
-            return Err(error);
-        }
+        cleanup_registration.attach(Arc::new(eraser));
         let worker_engine = Arc::clone(&engine);
         let worker_stop = shutdown.clone();
         let worker_owner = local_owner.clone();

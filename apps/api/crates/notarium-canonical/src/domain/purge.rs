@@ -53,6 +53,7 @@ struct PendingPurgeExecution {
     actor_id: String,
     idempotency_key: String,
     old_note_id: NoteId,
+    canonical_seq: SpaceSeq,
     retirement_ids: Vec<String>,
     sanitized_response_msgpack: Vec<u8>,
 }
@@ -122,9 +123,9 @@ impl CanonicalStore {
             })
         })
         .await?;
-        const PURGES: &str = "SELECT purge_id, actor_id, idempotency_key, old_note_id, retirement_ids_json, sanitized_response_msgpack
+        const PURGES: &str = "SELECT purge_id, actor_id, idempotency_key, old_note_id, retirement_ids_json, sanitized_response_msgpack, canonical_seq
             FROM pending_purges WHERE space_id = $1 AND history_incarnation = $2 AND phase <> 'completed' ORDER BY created_at_ms";
-        type PendingPurge = (String, String, String, String, String, Vec<u8>);
+        type PendingPurge = (String, String, String, String, String, Vec<u8>, i64);
         let current = scope.clone();
         let purges: Vec<PendingPurge> = self
             .with_read_tx(|tx| {
@@ -151,15 +152,29 @@ impl CanonicalStore {
                 })
             })
             .await?;
-        self.resume_blob_retirements(scope, epoch, recovery).await?;
-        for (purge_id, actor_id, idempotency_key, old_note, ret_json, sanitized_response_msgpack) in
-            purges
+        let budget = crate::projection_fence::internal_budget();
+        // Startup and lease takeover can precede the projector. Registration reschedules these rows.
+        if !purges.is_empty() && self.projection_cleanup_missing(&budget).await? {
+            return self
+                .resume_blob_retirements(scope, epoch, RetirementRecovery::RestoredGc)
+                .await;
+        }
+        for (
+            purge_id,
+            actor_id,
+            idempotency_key,
+            old_note,
+            ret_json,
+            sanitized_response_msgpack,
+            seq,
+        ) in purges
         {
             let exec = PendingPurgeExecution {
                 purge_id,
                 actor_id,
                 idempotency_key,
                 old_note_id: NoteId::parse(&old_note)?,
+                canonical_seq: crate::codec::i64_to_space_seq(seq)?,
                 scope: scope.clone(),
                 active_epoch: epoch,
                 retirement_ids: serde_json::from_str(&ret_json).map_err(|err| {
@@ -167,9 +182,11 @@ impl CanonicalStore {
                 })?,
                 sanitized_response_msgpack,
             };
+            self.retry_purged_note_cleanup(scope, exec.canonical_seq, &exec.old_note_id, &budget)
+                .await?;
             drive_pending_purge_steps_2_and_3(self, &exec).await?;
         }
-        Ok(())
+        self.resume_blob_retirements(scope, epoch, recovery).await
     }
 
     pub(crate) async fn resume_blob_retirements(
@@ -428,6 +445,7 @@ async fn purge_note_inner(
                         actor_id: idemp_cl.actor.as_str().to_owned(),
                         idempotency_key: idemp_cl.command_key.as_str().to_owned(),
                         old_note_id: old_note.clone(),
+                        canonical_seq: purge_seq,
                         retirement_ids,
                         sanitized_response_msgpack: sanitized_bytes.clone(),
                     });
@@ -463,13 +481,14 @@ async fn purge_note_inner(
             let captured = step1_capture.lock().expect("step1 capture mutex").take();
             let replayed = captured.is_none();
             if run_steps_2_and_3 && let Some(exec) = captured {
-                finish_committed_purge(store, &exec, &ctx.budget, &deadline).await?;
+                finish_committed_purge(store, &exec, &ctx.budget, &deadline, false).await?;
             }
             let committed = stored.into_committed();
             if replayed {
                 finish_replayed_projection_cleanup(
                     store,
                     &committed.receipt,
+                    &committed.value.note,
                     &ctx.budget,
                     &deadline,
                 )
@@ -486,20 +505,12 @@ async fn purge_note_inner(
                 })
                 .await?
             {
-                finish_committed_purge(store, &pending, &ctx.budget, &deadline).await?;
+                finish_committed_purge(store, &pending, &ctx.budget, &deadline, true).await?;
                 let stored: StoredCommittedNoteRevV1 =
                     rmp_serde::from_slice(&pending.sanitized_response_msgpack).map_err(|err| {
                         unknown_commit_outcome("decode_resumed_purge_resp", err.to_string())
                     })?;
-                let committed = stored.into_committed();
-                finish_replayed_projection_cleanup(
-                    store,
-                    &committed.receipt,
-                    &ctx.budget,
-                    &deadline,
-                )
-                .await?;
-                return Ok(committed);
+                return Ok(stored.into_committed());
             }
             Err(unavailable_retryable(
                 "purge_submit_unavailable",
@@ -672,15 +683,23 @@ pub(crate) async fn mint_and_purge_impl(
                         "unfinished receipt missing purge state",
                     )
                 })?;
-            finish_committed_purge(store, &pending, &ctx.budget, &deadline).await?;
+            finish_committed_purge(store, &pending, &ctx.budget, &deadline, true).await?;
         }
         let stored: StoredCommittedMintAndPurgeV1 = rmp_serde::from_slice(&receipt.response_blob)
             .map_err(|err| {
             unknown_commit_outcome("decode_replayed_mint_purge", err.to_string())
         })?;
         let committed = stored.into_committed();
-        finish_replayed_projection_cleanup(store, &committed.receipt, &ctx.budget, &deadline)
+        if receipt.status == "completed" {
+            finish_replayed_projection_cleanup(
+                store,
+                &committed.receipt,
+                &committed.value.old_note,
+                &ctx.budget,
+                &deadline,
+            )
             .await?;
+        }
         return Ok(committed);
     }
     let staged_ticket = deadline
@@ -1028,6 +1047,7 @@ pub(crate) async fn mint_and_purge_impl(
                         actor_id: idemp_cl.actor.as_str().to_owned(),
                         idempotency_key: idemp_cl.command_key.as_str().to_owned(),
                         old_note_id: input.old_note.clone(),
+                        canonical_seq: create_seq,
                         retirement_ids,
                         sanitized_response_msgpack: sanitized_bytes.clone(),
                     });
@@ -1073,11 +1093,12 @@ pub(crate) async fn mint_and_purge_impl(
             let captured = step1_capture.lock().expect("step1 capture mutex").take();
             let committed = stored.into_committed();
             if let Some(exec) = captured {
-                finish_committed_purge(store, &exec, &ctx.budget, &deadline).await?;
+                finish_committed_purge(store, &exec, &ctx.budget, &deadline, false).await?;
             } else {
                 finish_replayed_projection_cleanup(
                     store,
                     &committed.receipt,
+                    &committed.value.old_note,
                     &ctx.budget,
                     &deadline,
                 )
@@ -1094,20 +1115,12 @@ pub(crate) async fn mint_and_purge_impl(
                 })
                 .await?
             {
-                finish_committed_purge(store, &pending, &ctx.budget, &deadline).await?;
+                finish_committed_purge(store, &pending, &ctx.budget, &deadline, true).await?;
                 let stored: StoredCommittedMintAndPurgeV1 =
                     rmp_serde::from_slice(&pending.sanitized_response_msgpack).map_err(|err| {
                         unknown_commit_outcome("decode_resumed_mint_purge_resp", err.to_string())
                     })?;
-                let committed = stored.into_committed();
-                finish_replayed_projection_cleanup(
-                    store,
-                    &committed.receipt,
-                    &ctx.budget,
-                    &deadline,
-                )
-                .await?;
-                return Ok(committed);
+                return Ok(stored.into_committed());
             }
             Err(unavailable_retryable(
                 "mint_and_purge_unavailable",
@@ -1124,12 +1137,13 @@ pub(crate) async fn mint_and_purge_impl(
 async fn finish_replayed_projection_cleanup(
     store: &CanonicalStore,
     receipt: &MutationReceiptToken,
+    note: &NoteId,
     budget: &notarium_core::ports::CallBudget,
     deadline: &super::common::CommandDeadline,
 ) -> Result<(), PortError> {
     deadline
         .wait(budget, || {
-            store.retry_projection_cleanup(receipt.scope(), budget, Some(receipt.seq()))
+            store.retry_purged_note_cleanup(receipt.scope(), receipt.seq(), note, budget)
         })
         .await
         .map_err(|error| unknown_commit_outcome("purge_projection_cleanup", error.to_string()))?
@@ -1140,13 +1154,21 @@ async fn finish_committed_purge(
     pending: &PendingPurgeExecution,
     budget: &notarium_core::ports::CallBudget,
     deadline: &super::common::CommandDeadline,
+    recovered: bool,
 ) -> Result<(), PortError> {
-    deadline
-        .wait(budget, || {
-            store.retry_projection_cleanup(&pending.scope, budget, None)
-        })
-        .await
-        .map_err(|err| unknown_commit_outcome("purge_projection_cleanup", err.to_string()))??;
+    if recovered {
+        deadline
+            .wait(budget, || {
+                store.retry_purged_note_cleanup(
+                    &pending.scope,
+                    pending.canonical_seq,
+                    &pending.old_note_id,
+                    budget,
+                )
+            })
+            .await
+            .map_err(|err| unknown_commit_outcome("purge_projection_cleanup", err.to_string()))??;
+    }
     deadline
         .wait(budget, || drive_pending_purge_steps_2_and_3(store, pending))
         .await
@@ -2003,6 +2025,7 @@ async fn load_pending_purge_for_idempotency(
                     actor_id: idemp_cl.actor.as_str().to_owned(),
                     idempotency_key: idemp_cl.command_key.as_str().to_owned(),
                     old_note_id,
+                    canonical_seq: crate::codec::i64_to_space_seq(seq)?,
                     retirement_ids,
                     sanitized_response_msgpack: resp_msgpack,
                 }))

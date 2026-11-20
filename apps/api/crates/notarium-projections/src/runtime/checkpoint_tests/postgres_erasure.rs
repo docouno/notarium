@@ -378,3 +378,120 @@ async fn detached_postgres_purge_retries_missing_and_reset_generations() {
     }
     pool.close().await;
 }
+
+#[tokio::test]
+async fn postgres_writer_takeover_requires_registered_eraser_after_reopen() {
+    let scratch = Scratch::new();
+    let root = scratch.root();
+    let successor_scratch = Scratch::new();
+    let successor_root = successor_scratch.root();
+    let (config, pool, canonical_schema, prefix) = postgres_fixture(&root).await;
+    let mut successor_config = config.clone();
+    successor_config.blobs = BlobBackendConfig::Local {
+        data_root: successor_root.clone(),
+    };
+    let (original, writer) = CanonicalRuntime::open(config).await.unwrap();
+    // This process has already booted before the first projector registers.
+    let (successor, next_writer) = CanonicalRuntime::open(successor_config.clone())
+        .await
+        .unwrap();
+    let ctx = owner(&original).await;
+    let scope = ctx.scope();
+    let control = create(&original, &ctx, "canonical-only", "control".into()).await;
+    original
+        .delete_note(ctx.clone(), purge(&ctx, &control.value.note))
+        .await
+        .unwrap();
+    let victim = create(&original, &ctx, "victim", "private".into()).await;
+    let request = purge(&ctx, &victim.value.note);
+    let initial = ProjectionGeneration::new(GENERATION).unwrap();
+    let start = async |canonical: &CanonicalStore, schema_prefix: &str| {
+        ProjectorRuntime::start_postgres(
+            canonical.clone(),
+            projection_context(),
+            pool.clone(),
+            schema_prefix,
+            root.clone(),
+            initial,
+            ProjectionConfig::default(),
+        )
+        .await
+    };
+    let runtime = start(&original, &prefix).await.unwrap();
+    runtime
+        .engine()
+        .wait_for_projected(scope, victim.receipt.seq(), &budget())
+        .await
+        .unwrap();
+    let cached = async || {
+        sqlx::query_scalar::<_, bool>(sqlx::AssertSqlSafe(format!(
+            "SELECT EXISTS (SELECT 1 FROM {prefix}_g1.projected_notes WHERE space_id=$1 AND note_id=$2)"
+        ))).bind(scope.space_id.as_str()).bind(victim.value.note.as_str()).fetch_one(&pool).await.unwrap()
+    };
+    let file = root.space_fast_index(initial, &scope.space_id, victim.receipt.seq());
+    assert!(file.is_file() && cached().await);
+    runtime.shutdown().await.unwrap();
+    let revocation = MaintenanceContext {
+        authority: ServiceAuthority::admit(ServicePurpose::Revocation),
+        budget: budget(),
+    };
+    original
+        .drain_projection_owner(&revocation, scope)
+        .await
+        .unwrap();
+    writer.shutdown().await.unwrap();
+    drop(original);
+
+    // The PG fixture gives each process an exclusively owned local CAS.
+    // Hand off the Space's carriers with its writer authority.
+    let space_blobs = Path::new("blobs").join(scope.space_id.as_str());
+    std::fs::rename(
+        root.root().join(&space_blobs),
+        successor_root.root().join(space_blobs),
+    )
+    .unwrap();
+    successor
+        .advance_space_lease(&revocation, scope, LeaseEpoch::new(2).unwrap())
+        .await
+        .unwrap();
+    expect_unconfirmed(&successor, &ctx, &request).await;
+    let committed = successor
+        .read_space(&scope.space_id)
+        .await
+        .unwrap()
+        .last_seq;
+    assert!(committed > victim.receipt.seq());
+    assert!(file.is_file() && cached().await);
+    next_writer.shutdown().await.unwrap();
+    drop(successor);
+
+    // An idempotent replay on a fresh writer has no in-memory cleanup debt.
+    let (successor, next_writer) = CanonicalRuntime::open(successor_config).await.unwrap();
+    successor
+        .advance_space_lease(&revocation, scope, LeaseEpoch::new(3).unwrap())
+        .await
+        .unwrap();
+    expect_unconfirmed(&successor, &ctx, &request).await;
+    assert!(file.is_file() && cached().await);
+    let other_prefix = format!("{prefix}_other");
+    assert!(start(&successor, &other_prefix).await.is_err());
+    expect_unconfirmed(&successor, &ctx, &request).await;
+    assert!(file.is_file() && cached().await);
+
+    let runtime = start(&successor, &prefix).await.unwrap();
+    let replay = successor.delete_note(ctx.clone(), request).await.unwrap();
+    assert_eq!(replay.receipt.seq(), committed);
+    assert!(!file.exists() && !cached().await);
+    runtime.shutdown().await.unwrap();
+    next_writer.shutdown().await.unwrap();
+    for schema in [
+        canonical_schema,
+        format!("{prefix}_g1"),
+        format!("{prefix}_ctrl"),
+        format!("{other_prefix}_g1"),
+        format!("{other_prefix}_ctrl"),
+    ] {
+        ddl(&pool, format!("DROP SCHEMA IF EXISTS {schema} CASCADE")).await;
+    }
+    pool.close().await;
+}

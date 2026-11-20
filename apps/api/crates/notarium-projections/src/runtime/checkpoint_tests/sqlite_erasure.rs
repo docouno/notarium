@@ -355,19 +355,227 @@ impl ErasureCommand {
         &self,
         canonical: &CanonicalStore,
         ctx: &SpaceContext,
-    ) -> Result<(), PortError> {
+    ) -> Result<SpaceSeq, PortError> {
         use notarium_core::ports::ChatPort;
         match self {
             Self::Purge(request) => canonical
                 .delete_note(ctx.clone(), request.clone())
                 .await
-                .map(|_| ()),
+                .map(|outcome| outcome.receipt.seq()),
             Self::Redact(request) => canonical
                 .redact_chat_entry(ctx.clone(), request.clone())
                 .await
-                .map(|_| ()),
+                .map(|outcome| outcome.receipt.seq()),
         }
     }
+}
+
+async fn prepare_redaction(
+    canonical: &CanonicalStore,
+    ctx: &SpaceContext,
+    thread: &ChatThreadId,
+    note: &NoteId,
+) -> (Mutation<notarium_core::ports::RedactChatEntry>, SpaceSeq) {
+    use notarium_core::{
+        model::NoteRef,
+        ports::{
+            AppendChat, ChatEntryKind, ChatInputBody, ChatPort, ChatThreadKind, CreateChat,
+            RedactChatEntry,
+        },
+    };
+    canonical
+        .create_chat(
+            ctx.clone(),
+            mutation(
+                ctx,
+                CreateChat {
+                    thread: thread.clone(),
+                    kind: ChatThreadKind::Personal,
+                    owner: ctx.auth().principal().clone(),
+                    project_folder: None,
+                    title: "Erasure".into(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let appended = canonical
+        .append_chat(
+            ctx.clone(),
+            mutation(
+                ctx,
+                AppendChat {
+                    thread: thread.clone(),
+                    parent: ThreadEntrySeq::ZERO,
+                    kind: ChatEntryKind::Human,
+                    body: ChatInputBody::Text("Link".into()),
+                    referenced_notes: vec![NoteRef {
+                        space_id: ctx.scope().space_id.clone(),
+                        note_id: note.clone(),
+                    }],
+                    tainted: false,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let head = canonical
+        .read_projection_chat_head(&projection_context(), ctx.scope(), None, thread)
+        .await
+        .unwrap()
+        .unwrap();
+    (
+        mutation(
+            ctx,
+            RedactChatEntry {
+                thread: thread.clone(),
+                entry: appended.value.seq,
+                expected_thread_revision: head.thread.revision,
+            },
+        ),
+        appended.receipt.seq(),
+    )
+}
+
+async fn start_checkpoint_projector(
+    canonical: &CanonicalStore,
+    root: &DataRoot,
+) -> ProjectorRuntime {
+    ProjectorRuntime::start_sqlite(
+        canonical.clone(),
+        projection_context(),
+        root.clone(),
+        ProjectionGeneration::new(1).unwrap(),
+        ProjectionConfig::default(),
+    )
+    .await
+    .unwrap()
+}
+
+fn expect_cleanup_unavailable(error: PortError) {
+    use notarium_core::error::CommitEffect;
+    assert!(
+        matches!(&error, PortError::Domain(DomainError::ValidationFailed { diagnostic })
+            if diagnostic.reason == ValidationReason::NotReady)
+            || matches!(&error, PortError::Internal(f) | PortError::Unavailable(f)
+                if f.effect() == CommitEffect::Unknown),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn sqlite_restart_requires_cleanup_before_acknowledging_purge_and_redaction() {
+    use rusqlite::{Connection, OpenFlags};
+
+    let storage = Scratch::new();
+    let cache = Scratch::new();
+    let root = cache.root();
+    let config =
+        CanonicalConfig::local_default(InstallationId::from_bytes(entropy()), storage.root());
+    let (canonical, writer) = CanonicalRuntime::open(config.clone()).await.unwrap();
+    let owner_ctx = owner(&canonical).await;
+    let neighbor = owner(&canonical).await;
+    let victim = create(&canonical, &owner_ctx, "victim", "private".into()).await;
+    let survivor = create(&canonical, &neighbor, "survivor", "keep".into()).await;
+    let thread = ChatThreadId::from_bytes(entropy());
+    let (redact, chat_seq) =
+        prepare_redaction(&canonical, &neighbor, &thread, &survivor.value.note).await;
+    let purge = mutation(
+        &owner_ctx,
+        DeleteNote {
+            note: victim.value.note.clone(),
+            disposition: DeleteDisposition::Purge,
+        },
+    );
+    let requests = [
+        (ErasureCommand::Purge(purge), &owner_ctx),
+        (ErasureCommand::Redact(redact), &neighbor),
+    ];
+    let first = ProjectionGeneration::new(1).unwrap();
+    let file = root.space_fast_index(first, &owner_ctx.scope().space_id, victim.receipt.seq());
+
+    let projector = start_checkpoint_projector(&canonical, &root).await;
+    projector
+        .engine()
+        .wait_for_projected(owner_ctx.scope(), victim.receipt.seq(), &budget())
+        .await
+        .unwrap();
+    projector
+        .engine()
+        .wait_for_projected(neighbor.scope(), chat_seq, &budget())
+        .await
+        .unwrap();
+    projector.shutdown().await.unwrap();
+    writer.shutdown().await.unwrap();
+    drop(canonical);
+    let rows = || {
+        let db = Connection::open_with_flags(root.derived(first), OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+        db.query_row(
+            "SELECT (SELECT count(*) FROM projected_notes WHERE note_id = ?1),
+                    (SELECT count(*) FROM chat_note_refs WHERE thread_id = ?2),
+                    (SELECT count(*) FROM projected_notes WHERE note_id = ?3)",
+            [
+                victim.value.note.as_str(),
+                thread.as_str(),
+                survivor.value.note.as_str(),
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .unwrap()
+    };
+    assert_eq!(rows(), (1, 1, 1));
+    assert!(file.is_file());
+
+    // The new writer cannot discover this separate cache by scanning its own data root.
+    let (canonical, writer) = CanonicalRuntime::open(config).await.unwrap();
+    for _ in 0..2 {
+        for (command, ctx) in &requests {
+            expect_cleanup_unavailable(command.execute(&canonical, ctx).await.unwrap_err());
+        }
+        assert_eq!(rows(), (1, 1, 1));
+        assert!(file.is_file());
+    }
+    let empty = Scratch::new();
+    assert!(
+        ProjectorRuntime::start_sqlite(
+            canonical.clone(),
+            projection_context(),
+            empty.root(),
+            first,
+            ProjectionConfig::default(),
+        )
+        .await
+        .is_err()
+    );
+    for (command, ctx) in &requests {
+        expect_cleanup_unavailable(command.execute(&canonical, ctx).await.unwrap_err());
+    }
+    assert_eq!(rows(), (1, 1, 1));
+    assert!(file.is_file());
+    let projector = start_checkpoint_projector(&canonical, &root).await;
+    for (command, ctx) in requests {
+        let seq = command.execute(&canonical, ctx).await.unwrap();
+        assert_eq!(command.execute(&canonical, ctx).await.unwrap(), seq);
+        assert_eq!(
+            canonical
+                .read_space(&ctx.scope().space_id)
+                .await
+                .unwrap()
+                .last_seq,
+            seq
+        );
+    }
+    assert_eq!(rows(), (0, 0, 1));
+    assert!(!file.exists());
+    projector.shutdown().await.unwrap();
+    writer.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -381,24 +589,14 @@ async fn sqlite_orphan_rollback_journal_keeps_redaction_pending_until_database_i
 }
 
 async fn exercise_orphan_journal(redact: bool) {
-    use notarium_core::{
-        error::CommitEffect,
-        model::NoteRef,
-        ports::{
-            AppendChat, ChatEntryKind, ChatInputBody, ChatPort, ChatThreadKind, CreateChat,
-            RedactChatEntry,
-        },
-    };
+    use notarium_core::error::CommitEffect;
     use rusqlite::Connection;
 
     let scratch = Scratch::new();
     let root = scratch.root();
-    let (canonical, writer) = CanonicalRuntime::open(CanonicalConfig::local_default(
-        InstallationId::from_bytes(entropy()),
-        root.clone(),
-    ))
-    .await
-    .unwrap();
+    let config =
+        CanonicalConfig::local_default(InstallationId::from_bytes(entropy()), root.clone());
+    let (canonical, writer) = CanonicalRuntime::open(config.clone()).await.unwrap();
     let ctx = owner(&canonical).await;
     let neighbor = owner(&canonical).await;
     let victim = create(&canonical, &ctx, "victim", "private".into()).await;
@@ -406,58 +604,8 @@ async fn exercise_orphan_journal(redact: bool) {
     let note = &victim.value.note;
     let thread = ChatThreadId::from_bytes(entropy());
     let (command, seq) = if redact {
-        canonical
-            .create_chat(
-                ctx.clone(),
-                mutation(
-                    &ctx,
-                    CreateChat {
-                        thread: thread.clone(),
-                        kind: ChatThreadKind::Personal,
-                        owner: ctx.auth().principal().clone(),
-                        project_folder: None,
-                        title: "Erasure".into(),
-                    },
-                ),
-            )
-            .await
-            .unwrap();
-        let appended = canonical
-            .append_chat(
-                ctx.clone(),
-                mutation(
-                    &ctx,
-                    AppendChat {
-                        thread: thread.clone(),
-                        parent: ThreadEntrySeq::ZERO,
-                        kind: ChatEntryKind::Human,
-                        body: ChatInputBody::Text("Link".into()),
-                        referenced_notes: vec![NoteRef {
-                            space_id: ctx.scope().space_id.clone(),
-                            note_id: note.clone(),
-                        }],
-                        tainted: false,
-                    },
-                ),
-            )
-            .await
-            .unwrap();
-        let head = canonical
-            .read_projection_chat_head(&projection_context(), ctx.scope(), None, &thread)
-            .await
-            .unwrap()
-            .unwrap();
-        (
-            ErasureCommand::Redact(mutation(
-                &ctx,
-                RedactChatEntry {
-                    thread: thread.clone(),
-                    entry: appended.value.seq,
-                    expected_thread_revision: head.thread.revision,
-                },
-            )),
-            appended.receipt.seq(),
-        )
+        let (request, seq) = prepare_redaction(&canonical, &ctx, &thread, note).await;
+        (ErasureCommand::Redact(request), seq)
     } else {
         (
             ErasureCommand::Purge(mutation(
@@ -471,16 +619,7 @@ async fn exercise_orphan_journal(redact: bool) {
         )
     };
     let first = ProjectionGeneration::new(1).unwrap();
-    let start = || {
-        ProjectorRuntime::start_sqlite(
-            canonical.clone(),
-            projection_context(),
-            root.clone(),
-            first,
-            ProjectionConfig::default(),
-        )
-    };
-    let mut projector = start().await.unwrap();
+    let mut projector = start_checkpoint_projector(&canonical, &root).await;
     let engine = projector.engine();
     engine
         .wait_for_projected(ctx.scope(), seq, &budget())
@@ -573,7 +712,7 @@ async fn exercise_orphan_journal(redact: bool) {
     let projector = if redact {
         None
     } else {
-        Some(start().await.unwrap())
+        Some(start_checkpoint_projector(&canonical, &root).await)
     };
     let pending = |err: PortError| {
         assert!(matches!(err,
@@ -599,10 +738,57 @@ async fn exercise_orphan_journal(redact: bool) {
         std::fs::write(&sidecar, &pages).unwrap();
     }
 
-    // Restore the matching main beside its original journal and retry the
-    // canonical receipt. SQLite can now recover and scrub the actual rows.
-    std::fs::write(&db, matching_main).unwrap();
-    command.execute(&canonical, &ctx).await.unwrap();
+    // SQLite startup drives pending purges before the reopened projector registers.
+    // Its receipt and the WAL preimage must both survive that unattended recovery.
+    let (canonical, writer, projector) = if let Some(projector) = projector {
+        projector.shutdown().await.unwrap();
+        writer.shutdown().await.unwrap();
+        drop(canonical);
+        let (canonical, writer) = CanonicalRuntime::open(config).await.unwrap();
+        let receipt_state = || {
+            let sql = Connection::open_with_flags(
+                root.canonical(),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            sql.query_row(
+                "SELECT p.phase, r.status FROM pending_purges p
+                 JOIN command_receipts r USING (space_id, history_incarnation, actor_id, idempotency_key)
+                 WHERE p.space_id = ? AND p.old_note_id = ?",
+                [ctx.scope().space_id.as_str(), note.as_str()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            ).unwrap()
+        };
+        let assert_pending_receipt = || {
+            let (phase, status) = receipt_state();
+            assert_ne!(phase, "completed");
+            assert_eq!(status, "pending_purge");
+        };
+        assert_pending_receipt();
+        expect_cleanup_unavailable(command.execute(&canonical, &ctx).await.unwrap_err());
+        assert_pending_receipt();
+        assert_eq!(std::fs::read(&sidecar).unwrap(), pages);
+        // The real handler can now recover the retired generation's original WAL.
+        std::fs::write(&db, matching_main).unwrap();
+        let projector = start_checkpoint_projector(&canonical, &root).await;
+        tokio::time::timeout(budget().remaining, async {
+            loop {
+                let (phase, status) = receipt_state();
+                if phase == "completed" {
+                    assert_eq!(status, "completed");
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("registration must resume the pending purge without another client request");
+        (canonical, writer, Some(projector))
+    } else {
+        std::fs::write(&db, matching_main).unwrap();
+        command.execute(&canonical, &ctx).await.unwrap();
+        (canonical, writer, None)
+    };
     assert!(!sidecar.exists() || std::fs::metadata(&sidecar).unwrap().len() == 0);
     let sql = Connection::open(&db).unwrap();
     let count: i64 = if redact {
@@ -621,8 +807,24 @@ async fn exercise_orphan_journal(redact: bool) {
         .unwrap()
     };
     assert_eq!(count, 0);
+    drop(sql);
     assert!(neighbor_index.dense_id(&survivor.value.note).is_some());
     if let Some(projector) = projector {
+        let bytes = std::fs::read(&db).unwrap();
+        assert!(
+            !bytes
+                .windows(marker.len())
+                .any(|chunk| chunk == marker.as_bytes())
+        );
+        let seq = command.execute(&canonical, &ctx).await.unwrap();
+        assert_eq!(
+            canonical
+                .read_space(&ctx.scope().space_id)
+                .await
+                .unwrap()
+                .last_seq,
+            seq
+        );
         projector.shutdown().await.unwrap();
     }
     writer.shutdown().await.unwrap();
