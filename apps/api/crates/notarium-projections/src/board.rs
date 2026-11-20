@@ -88,6 +88,8 @@ impl BoardMutationFactsProvider for ProjectionBoardPlanner {
             )
             .await?;
             let (spec, auth_folder) = evaluate_move(&cut, &ctx, &intent, &deadline)?;
+            #[cfg(any(test, feature = "test-support"))]
+            engine.after_board_facts_for_test(&ctx).await;
             let _permit = cut.check_live(
                 &engine,
                 &ctx,

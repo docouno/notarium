@@ -38,6 +38,7 @@ pub(super) enum PausePoint {
     BeforeApply,
     AfterAck,
     AfterReadPayload,
+    AfterBoardFacts,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -286,6 +287,26 @@ impl ProjectionEngine {
         scope: &HistoryScope,
     ) -> Result<ProjectionPause, PortError> {
         self.pause_projection_at(scope, PausePoint::AfterReadPayload, 0)
+    }
+
+    #[doc(hidden)]
+    pub fn pause_after_board_facts_for_test(
+        &self,
+        scope: &HistoryScope,
+    ) -> Result<ProjectionPause, PortError> {
+        self.pause_projection_at(scope, PausePoint::AfterBoardFacts, 0)
+    }
+
+    pub(crate) async fn after_board_facts_for_test(
+        &self,
+        ctx: &notarium_core::ports::SpaceContext,
+    ) {
+        let slot = self.generation.load().slot(&ctx.scope().space_id);
+        if let Some(slot) = slot {
+            slot.benchmark_pause
+                .pause_at(PausePoint::AfterBoardFacts, None, &ctx.budget.cancellation)
+                .await;
+        }
     }
 
     #[doc(hidden)]

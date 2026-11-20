@@ -235,7 +235,7 @@ impl BoardMutationFactsProvider for CanonicalTestBoardPlanner {
             let mut target_cur_group: Option<GroupKey> = None;
 
             for nid in tracked {
-                let Ok(snap) = self
+                let snap = match self
                     .store
                     .get_note(
                         ctx.clone(),
@@ -246,8 +246,12 @@ impl BoardMutationFactsProvider for CanonicalTestBoardPlanner {
                         },
                     )
                     .await
-                else {
-                    continue;
+                {
+                    Ok(snap) => snap,
+                    Err(PortError::Domain(
+                        DomainError::ResourceNotFound | DomainError::AccessDenied,
+                    )) => continue,
+                    Err(error) => return Err(error),
                 };
                 let listing = snap.document.listing(ctx.auth())?;
                 if listing.lifecycle() != Lifecycle::Active {
@@ -444,7 +448,7 @@ impl BoardMutationFactsProvider for CanonicalTestBoardPlanner {
                 }
 
                 for nid in &tracked {
-                    let Ok(snap) = self
+                    let snap = match self
                         .store
                         .get_note(
                             ctx.clone(),
@@ -455,8 +459,12 @@ impl BoardMutationFactsProvider for CanonicalTestBoardPlanner {
                             },
                         )
                         .await
-                    else {
-                        continue;
+                    {
+                        Ok(snap) => snap,
+                        Err(PortError::Domain(
+                            DomainError::ResourceNotFound | DomainError::AccessDenied,
+                        )) => continue,
+                        Err(error) => return Err(error),
                     };
                     let listing = snap.document.listing(ctx.auth())?;
                     if listing.lifecycle() != Lifecycle::Active {

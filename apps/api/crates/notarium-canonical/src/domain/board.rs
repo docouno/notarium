@@ -828,20 +828,45 @@ pub(crate) async fn move_board_card_impl(
         ]),
     );
     idemp.require_receipt_detail = true;
-    ctx.budget.remaining = deadline.remaining(&ctx.budget)?;
-    if let Some(replayed) = deadline
-        .wait(&ctx.budget, || {
-            try_replay_completed_receipt::<StoredCommittedBoardMoveV1>(
-                store,
-                ctx.scope(),
-                &idemp,
-                Some(&ctx.budget),
-            )
-        })
-        .await??
-    {
+    let completed_receipt = async |ctx: &SpaceContext| {
+        let mut budget = ctx.budget.clone();
+        budget.remaining = deadline.remaining(&budget)?;
+        deadline
+            .prepare(&budget, || {
+                try_replay_completed_receipt::<StoredCommittedBoardMoveV1>(
+                    store,
+                    ctx.scope(),
+                    &idemp,
+                    Some(&budget),
+                )
+            })
+            .await
+    };
+    if let Some(replayed) = completed_receipt(&ctx).await? {
         return Ok(replayed.into_committed());
     }
+
+    // A concurrent copy can commit after the initial miss and invalidate its own plan.
+    let replay_planning_conflict = async |ctx: &SpaceContext, error: PortError| {
+        if matches!(
+            error,
+            PortError::Domain(
+                DomainError::RevisionConflict { .. }
+                    | DomainError::ValidationFailed {
+                        diagnostic: Diagnostic {
+                            reason: ValidationReason::CursorStale | ValidationReason::InvalidState,
+                            ..
+                        }
+                    }
+            )
+        ) {
+            return completed_receipt(ctx)
+                .await?
+                .map(StoredCommittedBoardMoveV1::into_committed)
+                .ok_or(error);
+        }
+        Err(error)
+    };
 
     let (board_authority, provider) = store.board_facts_provider()?;
 
@@ -852,7 +877,7 @@ pub(crate) async fn move_board_card_impl(
         let target_id = request.input.note.clone();
         let view_id = request.input.view.note.clone();
         let prec_read = request.preconditions.clone();
-        let (space_rec, base_head) = store
+        let head = store
             .with_read_tx_budget(Some(&ctx.budget), |tx| {
                 Box::pin(async move {
                     let srec = load_space_record(tx, &ctx_read.scope().space_id).await?;
@@ -892,39 +917,53 @@ pub(crate) async fn move_board_card_impl(
                     Ok((srec, head))
                 })
             })
-            .await?;
+            .await;
+        let (space_rec, base_head) = match head {
+            Ok(head) => head,
+            Err(error) => return replay_planning_conflict(&ctx, error).await,
+        };
 
         if base_head.doc_class == DocClass::EncryptedNote {
             return Err(DomainError::UnsafePlaintextOutsideAgeFence.into());
         }
 
         ctx.budget.remaining = deadline.remaining(&ctx.budget)?;
-        let facts = deadline
+        let facts = match deadline
             .wait(&ctx.budget, || {
                 provider.evaluate_move(&board_authority, ctx.clone(), None, request.input.clone())
             })
-            .await??;
+            .await?
+        {
+            Ok(facts) => facts,
+            Err(error) => return replay_planning_conflict(&ctx, error).await,
+        };
         facts.verify_authority(&board_authority)?;
         ctx.scope().check(facts.scope())?;
         if facts.view() != &request.input.view {
             return Err(DomainError::validation(ValidationReason::SourceMismatch).into());
         }
         if *facts.view_revision() != request.input.expected_view {
-            return Err(DomainError::RevisionConflict {
+            let conflict = DomainError::RevisionConflict {
                 current: facts.view_revision().clone(),
                 lineage: None,
-            }
-            .into());
+            };
+            return replay_planning_conflict(&ctx, conflict.into()).await;
         }
         if !facts.after_eligible_in_group() {
-            return Err(DomainError::validation(ValidationReason::InvalidState).into());
+            return replay_planning_conflict(
+                &ctx,
+                DomainError::validation(ValidationReason::InvalidState).into(),
+            )
+            .await;
         }
 
         // Live-room interception (if registered) BEFORE checking closed-room `head_rev_id == expected_note`
         // or staging closed-room CAS blobs.
         let mut reservation_opt = None;
         if let Some(interceptor) = store.inner.collab_interceptor.get() {
-            destination_group_rows(&facts, &request.input)?;
+            if let Err(error) = destination_group_rows(&facts, &request.input) {
+                return replay_planning_conflict(&ctx, error.into()).await;
+            }
             ctx.budget.remaining = deadline.remaining(&ctx.budget)?;
             let mut dispatched = false;
             let response = deadline
@@ -980,11 +1019,11 @@ pub(crate) async fn move_board_card_impl(
         }
 
         if base_head.head_rev_id != request.input.expected_note {
-            return Err(DomainError::RevisionConflict {
+            let conflict = DomainError::RevisionConflict {
                 current: base_head.head_rev_id,
                 lineage: None,
-            }
-            .into());
+            };
+            return replay_planning_conflict(&ctx, conflict.into()).await;
         }
 
         let base_digest = base_head.content_digest.ok_or_else(|| {

@@ -604,6 +604,123 @@ impl ProjectionWriteBlock {
 }
 
 #[tokio::test]
+async fn board_retry_after_unknown_recovers_committed_move_across_planner_cut() {
+    use notarium_core::error::{CommitEffect, RetryAdvice};
+    use std::future::poll_fn;
+
+    let scratch = Scratch::new();
+    let root = scratch.root();
+    let (store, canonical) = CanonicalRuntime::open(CanonicalConfig::local_default(
+        InstallationId::from_bytes(random_bytes()),
+        root.clone(),
+    ))
+    .await
+    .unwrap();
+    let (scope, owner) = open_space(&store).await;
+    let key = ViewKey::from_bytes(random_bytes());
+    let view = note(
+        &store,
+        &owner,
+        "board",
+        DocClass::UserDoc,
+        format!(
+            "```nota\nid: {key}\ntype: board\ngroup_by: status\nfilter: {{exists: status}}\n```\n"
+        ),
+    )
+    .await;
+    let card = note(
+        &store,
+        &owner,
+        "card",
+        DocClass::UserDoc,
+        "---\nstatus: todo\n---\nCard\n".into(),
+    )
+    .await;
+    let runtime = ProjectorRuntime::start_sqlite(
+        store.clone(),
+        projection_context(),
+        root,
+        ProjectionGeneration::new(1).unwrap(),
+        ProjectionConfig::default(),
+    )
+    .await
+    .unwrap();
+    sync(&store, &runtime, &scope).await;
+    let before = store.read_space(&scope.space_id).await.unwrap().last_seq;
+    let command = mutation(&owner, move_card(&card, &view, key));
+
+    let hold = store.acquire_writer_safe_point().await.unwrap();
+    let mut first_ctx = owner.clone();
+    first_ctx.budget.cancellation = Cancellation::default();
+    let cancel = first_ctx.budget.cancellation.clone();
+    let mut first = std::pin::pin!(store.move_board_card(first_ctx, command.clone()));
+    // The queue and staging budget are free. Once the call yields with its
+    // writer active, it is waiting for acknowledgement behind the safe point.
+    let first = poll_fn(|cx| {
+        let result = first.as_mut().poll(cx);
+        if result.is_pending() && store.has_active_sqlite_writes_for_test().unwrap() {
+            cancel.cancel();
+        }
+        result
+    })
+    .await;
+    assert!(matches!(first, Err(PortError::Unavailable(failure))
+        if failure.effect() == CommitEffect::Unknown && failure.retry() == RetryAdvice::RetrySameCommand));
+
+    let engine = runtime.engine();
+    let mut pause = engine.pause_after_board_facts_for_test(&scope).unwrap();
+    let retry = store.move_board_card(owner.clone(), command.clone());
+    let (retried, saved) = tokio::time::timeout(Duration::from_secs(15), async {
+        tokio::join!(retry, async {
+            pause.reached_feed_boundary_for_test().await.unwrap();
+            drop(hold);
+            let cut = engine
+                .wait_for_projected(&scope, before.checked_next().unwrap(), &budget())
+                .await
+                .unwrap();
+            // Only the admitted original can have advanced the cut. Recover its
+            // typed outcome while the retry is still validating the old board.
+            let saved = store
+                .move_board_card(owner.clone(), command.clone())
+                .await
+                .unwrap();
+            assert_eq!(saved.receipt.seq(), cut.projected_seq);
+            assert_ne!(saved.value.revision.revision, card.revision);
+            assert_eq!(saved.value.group, group("doing"));
+            pause.resume_for_test().await.unwrap();
+            saved
+        })
+    })
+    .await
+    .expect("release the board planner after the original commit");
+    let retried = retried.expect("same command must recover its durable outcome");
+    assert_eq!(retried.receipt, saved.receipt);
+    assert_eq!(retried.value.revision, saved.value.revision);
+    assert_eq!(retried.value.rank_revision, saved.value.rank_revision);
+    assert_eq!(retried.value.rank, saved.value.rank);
+    assert_eq!(retried.value.group, saved.value.group);
+
+    let mut grants = owner.auth().spaces().clone();
+    grants.get_mut(&scope.space_id).unwrap().role = SpaceRole::Viewer;
+    let viewer = SpaceContext::new(
+        owner.auth().for_pat(grants).unwrap(),
+        scope.clone(),
+        budget(),
+    )
+    .unwrap();
+    assert!(matches!(
+        store.move_board_card(viewer, command).await,
+        Err(PortError::Domain(DomainError::SpaceReadOnly))
+    ));
+    assert_eq!(
+        store.read_space(&scope.space_id).await.unwrap().last_seq,
+        saved.receipt.seq()
+    );
+    runtime.shutdown().await.unwrap();
+    canonical.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn board_move_and_rollback_sqlite() {
     let scratch = Scratch::new();
     let root = scratch.root();
