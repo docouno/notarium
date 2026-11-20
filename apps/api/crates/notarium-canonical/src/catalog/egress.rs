@@ -20,7 +20,10 @@ use crate::{
 };
 
 enum DisclosureConnection {
-    Sqlite(OwnedMutexGuard<Option<SqliteWriterPair>>),
+    Sqlite {
+        snapshot: Option<OwnedMutexGuard<Option<SqliteWriterPair>>>,
+        _pin: crate::runtime::disclosure::DisclosurePin,
+    },
     Postgres(StorePgConnection),
 }
 
@@ -33,10 +36,21 @@ pub(crate) struct CanonicalDisclosureGuard {
 impl CanonicalDisclosureGuard {
     pub(crate) fn connection(&mut self) -> BackendConn<'_> {
         match &mut self.connection {
-            DisclosureConnection::Sqlite(writer) => BackendConn::Sqlite(
-                &mut writer.as_mut().expect("pinned canonical writer").sqlx_conn,
+            DisclosureConnection::Sqlite { snapshot, .. } => BackendConn::Sqlite(
+                &mut snapshot
+                    .as_mut()
+                    .expect("open snapshot")
+                    .as_mut()
+                    .expect("pinned canonical writer")
+                    .sqlx_conn,
             ),
             DisclosureConnection::Postgres(conn) => BackendConn::Postgres(conn),
+        }
+    }
+
+    pub(super) fn finish_snapshot(&mut self) {
+        if let DisclosureConnection::Sqlite { snapshot, .. } = &mut self.connection {
+            drop(snapshot.take());
         }
     }
 
@@ -67,13 +81,20 @@ impl CanonicalStore {
         let deadline = Instant::now() + budget.remaining;
         let acquire = async {
             let connection = match &self.inner.sql {
-                SqlDriverState::Sqlite { writer, .. } => {
-                    // All SQLite canonical writes share this connection pair.
+                SqlDriverState::Sqlite {
+                    writer,
+                    disclosures,
+                    ..
+                } => {
+                    let pin = disclosures.pin(spaces).await;
                     let writer = writer.clone().lock_owned().await;
                     if writer.is_none() {
                         return Err(DomainError::ResourceNotFound.into());
                     }
-                    DisclosureConnection::Sqlite(writer)
+                    DisclosureConnection::Sqlite {
+                        snapshot: Some(writer),
+                        _pin: pin,
+                    }
                 }
                 SqlDriverState::Postgres { pool, .. } => {
                     let mut conn = pool
@@ -161,11 +182,7 @@ impl ProviderEgressCatalogPort for CanonicalStore {
             if roots.len() > MAX_PROVIDER_ORIGINS {
                 return Err(DomainError::validation(ValidationReason::InvalidLimit).into());
             }
-            let budget = ctx.budget.clone();
-            self.with_read_tx_budget(Some(&budget), move |tx| {
-                Box::pin(async move { discover_chat_dependencies(tx, &ctx, roots).await })
-            })
-            .await
+            discover_chat_dependencies(self, &ctx, roots).await
         })
     }
 
@@ -225,6 +242,7 @@ impl ProviderEgressCatalogPort for CanonicalStore {
                 _ = tokio::time::sleep_until(deadline) => return Err(expired()),
                 rows = snapshot(&mut connection, &ctx, &request, spaces) => rows?,
             };
+            guard.finish_snapshot();
             Ok(Box::new(EgressLease {
                 guard: Some(guard),
                 cancellation,
@@ -236,17 +254,17 @@ impl ProviderEgressCatalogPort for CanonicalStore {
     }
 }
 
-// The read snapshot identifies graph keys. The egress lease revalidates them after acquiring all
-// participating Space locks in order; no authority is derived here.
+// Discovery identifies graph keys. The egress lease revalidates them after
+// acquiring all participating Space locks. No authority is derived here.
 async fn discover_chat_dependencies(
-    tx: &mut BackendConn<'_>,
+    store: &CanonicalStore,
     ctx: &AccountContext,
     roots: Vec<ProviderOrigin>,
 ) -> Result<ProviderEgressDependencies, PortError> {
     let mut work = Vec::new();
     let mut seen = BTreeSet::new();
     let mut spaces = BTreeSet::new();
-    let mut records = BTreeMap::new();
+    let deadline = crate::domain::common::CommandDeadline::start(&ctx.budget, "chat_dependencies");
     let mut projects = BTreeMap::new();
     for root in roots {
         if !matches!(root, ProviderOrigin::Chat { .. }) {
@@ -257,76 +275,108 @@ async fn discover_chat_dependencies(
         }
     }
     let mut origins = Vec::new();
-    while let Some(origin) = work.pop() {
-        let ProviderOrigin::Chat {
-            space,
-            thread,
-            entry,
-            ..
-        } = &origin
-        else {
-            return Err(DomainError::validation(ValidationReason::SourceMismatch).into());
-        };
-        spaces.insert(space.clone());
-        if spaces.len() > MAX_PROVIDER_SOURCE_SPACES {
-            return Err(DomainError::validation(ValidationReason::InvalidLimit).into());
-        }
-        let record = match records.entry(space.clone()) {
-            std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                if !ctx.auth().spaces().contains_key(space) {
-                    return Err(DomainError::ResourceNotFound.into());
-                }
-                entry.insert(load_space_record(tx, space).await?)
-            }
-        };
-        let current =
-            crate::chats::load_current_chat_for_egress_tx(tx, ctx.auth(), record, thread, *entry)
-                .await?;
-        if current.origin() != origin {
-            return Err(DomainError::validation(ValidationReason::SourceMismatch).into());
-        }
-        let Some(proof) = current.provenance() else {
-            continue;
-        };
-        for project in &proof.projects {
-            projects.insert(
-                (project.space_id.clone(), project.folder_id.clone()),
-                project.clone(),
-            );
-            // A recorded proof may also name the primary project.
-            if projects.len() > MAX_PROVIDER_SECONDARY_PROJECTS + 1 {
+    while !work.is_empty() {
+        let batch = work.split_off(work.len().saturating_sub(16));
+        let auth = ctx.auth().clone();
+        let mut budget = ctx.budget.clone();
+        budget.remaining = deadline.remaining(&ctx.budget)?;
+        let sources = store
+            .with_read_tx_budget(Some(&budget), move |tx| {
+                Box::pin(async move {
+                    let mut records = BTreeMap::new();
+                    let mut sources = Vec::with_capacity(batch.len());
+                    for origin in batch {
+                        let ProviderOrigin::Chat {
+                            space,
+                            thread,
+                            entry,
+                            ..
+                        } = &origin
+                        else {
+                            return Err(
+                                DomainError::validation(ValidationReason::SourceMismatch).into()
+                            );
+                        };
+                        if !auth.spaces().contains_key(space) {
+                            return Err(DomainError::ResourceNotFound.into());
+                        }
+                        let record = match records.entry(space.clone()) {
+                            std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                            std::collections::btree_map::Entry::Vacant(entry) => {
+                                entry.insert(load_space_record(tx, space).await?)
+                            }
+                        };
+                        let source =
+                            crate::chats::chat_source_tx(tx, &auth, record, thread, *entry).await?;
+                        sources.push((origin, source));
+                    }
+                    Ok(sources)
+                })
+            })
+            .await?;
+        for (origin, source) in sources {
+            let ProviderOrigin::Chat {
+                space,
+                thread,
+                entry,
+                ..
+            } = &origin
+            else {
+                unreachable!()
+            };
+            spaces.insert(space.clone());
+            if spaces.len() > MAX_PROVIDER_SOURCE_SPACES {
                 return Err(DomainError::validation(ValidationReason::InvalidLimit).into());
             }
-        }
-        for dependency in &proof.origins {
-            if let ProviderOrigin::Chat {
-                space: child_space,
-                thread: child_thread,
-                entry: child_entry,
-                ..
-            } = dependency
-                && (child_space != space || child_thread != thread || child_entry >= entry)
-            {
+            let current = source
+                .discover(store, ctx.auth(), &ctx.budget, deadline)
+                .await?;
+            if current.origin() != origin {
                 return Err(DomainError::validation(ValidationReason::SourceMismatch).into());
             }
-            if let Some(id) = dependency.space_id() {
-                spaces.insert(id.clone());
-                if spaces.len() > MAX_PROVIDER_SOURCE_SPACES {
+            let Some(proof) = current.provenance() else {
+                continue;
+            };
+            for project in &proof.projects {
+                projects.insert(
+                    (project.space_id.clone(), project.folder_id.clone()),
+                    project.clone(),
+                );
+                // A recorded proof may also name the primary project.
+                if projects.len() > MAX_PROVIDER_SECONDARY_PROJECTS + 1 {
                     return Err(DomainError::validation(ValidationReason::InvalidLimit).into());
                 }
             }
-            if seen.insert(origin_key(dependency)?) {
-                if seen.len() > MAX_PROVIDER_ORIGINS {
-                    return Err(DomainError::validation(ValidationReason::InvalidLimit).into());
+            for dependency in &proof.origins {
+                if let ProviderOrigin::Chat {
+                    space: child_space,
+                    thread: child_thread,
+                    entry: child_entry,
+                    ..
+                } = dependency
+                    && (child_space != space || child_thread != thread || child_entry >= entry)
+                {
+                    return Err(DomainError::validation(ValidationReason::SourceMismatch).into());
                 }
-                origins.push(dependency.clone());
-                if matches!(dependency, ProviderOrigin::Chat { .. }) {
-                    work.push(dependency.clone());
+                if let Some(id) = dependency.space_id() {
+                    spaces.insert(id.clone());
+                    if spaces.len() > MAX_PROVIDER_SOURCE_SPACES {
+                        return Err(DomainError::validation(ValidationReason::InvalidLimit).into());
+                    }
+                }
+                if seen.insert(origin_key(dependency)?) {
+                    if seen.len() > MAX_PROVIDER_ORIGINS {
+                        return Err(DomainError::validation(ValidationReason::InvalidLimit).into());
+                    }
+                    origins.push(dependency.clone());
+                    if matches!(dependency, ProviderOrigin::Chat { .. }) {
+                        work.push(dependency.clone());
+                    }
                 }
             }
         }
     }
+    deadline.remaining(&ctx.budget)?;
     Ok(ProviderEgressDependencies {
         origins,
         projects: projects.into_values().collect(),

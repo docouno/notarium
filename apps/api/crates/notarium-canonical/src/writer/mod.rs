@@ -128,6 +128,21 @@ pub struct ItemCommitArtifacts {
     pub response_bytes: Vec<u8>,
 }
 
+pub(crate) enum CommitAction {
+    Confirmed(Box<dyn FnOnce() + Send>),
+    ConfirmedOrUnknown(Box<dyn FnOnce() + Send>),
+}
+
+impl CommitAction {
+    pub(crate) fn settle(self, confirmed: bool) {
+        match self {
+            Self::Confirmed(action) if confirmed => action(),
+            Self::ConfirmedOrUnknown(action) => action(),
+            Self::Confirmed(_) => {}
+        }
+    }
+}
+
 pub struct ItemExecCtx {
     pub scope: HistoryScope,
     pub space: notarium_core::auth::Space,
@@ -140,7 +155,7 @@ pub struct ItemExecCtx {
     pending_dir_syncs: PendingDirSyncs,
     retained_tickets: Vec<StagedBlobTicket>,
     retained_guards: Vec<Box<dyn Send>>,
-    after_commit: Option<Box<dyn FnOnce() + Send>>,
+    after_commit: Option<CommitAction>,
 }
 
 impl ItemExecCtx {
@@ -201,7 +216,7 @@ impl ItemExecCtx {
     }
 
     pub(crate) fn on_commit(&mut self, action: impl FnOnce() + Send + 'static) {
-        self.after_commit = Some(Box::new(action));
+        self.after_commit = Some(CommitAction::Confirmed(Box::new(action)));
     }
 
     pub(crate) fn new_for_batch(
@@ -227,6 +242,14 @@ impl ItemExecCtx {
         }
     }
 
+    pub(crate) fn on_commit_or_unknown(&mut self, action: impl FnOnce() + Send + 'static) {
+        self.after_commit = Some(CommitAction::ConfirmedOrUnknown(Box::new(action)));
+    }
+
+    pub(crate) fn take_after_commit(&mut self) -> Option<CommitAction> {
+        self.after_commit.take()
+    }
+
     pub(crate) fn into_batch_parts(
         self,
     ) -> (
@@ -237,7 +260,7 @@ impl ItemExecCtx {
     ) {
         debug_assert!(
             self.after_commit.is_none(),
-            "native items have no post-commit side effects"
+            "native post-commit actions must be transferred to the batch"
         );
         (
             self.receipt_status,
@@ -288,13 +311,13 @@ enum QueuedWriteEntry {
         intent: PreparedWriteIntent,
         sqlite_fast_plan: Option<Box<dyn crate::sqlite_fast::SqliteSyncItemPlan>>,
         pg_fast_plan: Option<PgSingleItemFastFn>,
-        staged_bytes_reserved: StagedByteReservation,
+        reservation: QueueReservation,
         reply_tx: oneshot::Sender<Result<Vec<u8>, PortError>>,
     },
     Group {
         space_id: SpaceId,
         intents: Vec<PreparedWriteIntent>,
-        staged_bytes_reserved: StagedByteReservation,
+        reservation: QueueReservation,
         reply_tx: oneshot::Sender<BatchGroupReply>,
     },
 }
@@ -339,6 +362,11 @@ struct StagedByteLimiter {
     max_bytes: u64,
     in_flight: AtomicU64,
     notify: Notify,
+}
+
+struct QueueReservation {
+    _bytes: StagedByteReservation,
+    _space: Option<crate::runtime::disclosure::SpaceMutation>,
 }
 
 struct StagedByteReservation {
@@ -702,17 +730,27 @@ impl WriteCoordinator {
         pretracked_guard: Option<ActiveWriteOpGuard>,
     ) -> Result<Vec<u8>, PortError> {
         inner.check_writer_epoch(&intent.scope.space_id, intent.active_epoch)?;
-        let (sqlite_fast_plan, pg_fast_plan) = if intent
+        let confirmed_step = intent
             .idempotency
             .as_ref()
-            .is_some_and(CommandIdentitySpec::requires_standard_writer)
-        {
-            if let Some(plan) = sqlite_fast_plan {
+            .is_some_and(CommandIdentitySpec::has_confirmed_chat_step);
+        let guarded = intent
+            .idempotency
+            .as_ref()
+            .and_then(CommandIdentitySpec::canonical_effect)
+            .is_some();
+        let sqlite_fast_plan = sqlite_fast_plan.and_then(|plan| {
+            if confirmed_step || (guarded && !plan.supports_canonical_effect()) {
                 intent.execute = plan.into_async_exec();
+                None
+            } else {
+                Some(plan)
             }
-            (None, None)
+        });
+        let pg_fast_plan = if confirmed_step || guarded {
+            None
         } else {
-            (sqlite_fast_plan, pg_fast_plan)
+            pg_fast_plan
         };
         let _active_guard = match pretracked_guard {
             Some(g) => g,
@@ -735,7 +773,7 @@ impl WriteCoordinator {
             intent,
             sqlite_fast_plan,
             pg_fast_plan,
-            staged_bytes_reserved: reserved_bytes,
+            reservation: reserved_bytes,
             reply_tx,
         });
 
@@ -782,7 +820,7 @@ impl WriteCoordinator {
         permit.send(QueuedWriteEntry::Group {
             space_id: space_id.clone(),
             intents,
-            staged_bytes_reserved: reserved_bytes,
+            reservation: reserved_bytes,
             reply_tx,
         });
 
@@ -811,7 +849,7 @@ impl WriteCoordinator {
         budget: &CallBudget,
         deadline: tokio::time::Instant,
         bytes: u64,
-    ) -> Result<(mpsc::OwnedPermit<QueuedWriteEntry>, StagedByteReservation), PortError> {
+    ) -> Result<(mpsc::OwnedPermit<QueuedWriteEntry>, QueueReservation), PortError> {
         if !self.accepting.load(Ordering::Acquire) || inner.shutting_down.load(Ordering::Acquire) {
             return Err(unavailable_retryable(
                 "writer_shutting_down",
@@ -819,6 +857,17 @@ impl WriteCoordinator {
                 Duration::from_millis(100),
             ));
         }
+        // Admission precedes mailbox and byte reservations. Waiting on a pinned
+        // Space must leave both available to commands for unrelated Spaces.
+        let space_guard = match &inner.sql {
+            SqlDriverState::Sqlite { disclosures, .. } => tokio::select! {
+                biased;
+                _ = budget.cancellation.cancelled() => return Err(cancelled_not_committed("writer_cancelled_pre_enqueue", "write cancelled before disclosure admission")),
+                _ = tokio::time::sleep_until(deadline) => return Err(deadline_not_committed("writer_disclosure_deadline", "deadline waiting for disclosure admission")),
+                guard = disclosures.mutation(space) => Some(guard),
+            },
+            SqlDriverState::Postgres { .. } => None,
+        };
         let bytes = self.byte_limiter.acquire(bytes, budget, deadline).await?;
         let sender = self.sender_for_space(inner, space)?;
         let closed = || {
@@ -849,7 +898,13 @@ impl WriteCoordinator {
                 "deadline before mailbox admission",
             ));
         }
-        Ok((permit, bytes))
+        Ok((
+            permit,
+            QueueReservation {
+                _bytes: bytes,
+                _space: space_guard,
+            },
+        ))
     }
 
     fn sender_for_space(
@@ -1315,22 +1370,22 @@ async fn flush_single_batch(
                 intent,
                 sqlite_fast_plan,
                 pg_fast_plan,
-                staged_bytes_reserved,
+                reservation,
                 reply_tx,
             } => {
-                reserved_list.push(staged_bytes_reserved);
+                reserved_list.push(reservation);
                 reply_targets.push(ReplyTarget::Single { reply_tx });
                 items.push((intent, sqlite_fast_plan, pg_fast_plan));
             }
             QueuedWriteEntry::Group {
                 space_id,
                 intents: group_intents,
-                staged_bytes_reserved,
+                reservation,
                 reply_tx,
             } => {
                 let count = group_intents.len();
                 let all_idempotent = group_intents.iter().all(|it| it.idempotency.is_some());
-                reserved_list.push(staged_bytes_reserved);
+                reserved_list.push(reservation);
                 group_spaces.push(space_id.clone());
                 reply_targets.push(ReplyTarget::Group {
                     space_id,
@@ -1345,7 +1400,18 @@ async fn flush_single_batch(
 
     let exec_result = match &inner.sql {
         SqlDriverState::Sqlite { writer, .. } => {
+            // The native guarded rollback owns one transaction. Preserve the ordinary
+            // per-item admission and rollback protocol in a mixed batch.
+            let standalone_or_unguarded = items.len() == 1
+                || items.iter().all(|(intent, _, _)| {
+                    intent
+                        .idempotency
+                        .as_ref()
+                        .and_then(CommandIdentitySpec::canonical_effect)
+                        .is_none()
+                });
             let can_fast = group_spaces.is_empty()
+                && standalone_or_unguarded
                 && items.iter().all(|(_, fp, _)| fp.is_some())
                 && faults.pre_commit_space_delays.lock().await.is_empty();
             let mut guard = writer.lock().await;
@@ -1915,7 +1981,7 @@ async fn execute_batch_on_conn(
     match committed {
         Ok(()) => {
             for action in after_commit {
-                action();
+                action.settle(true);
             }
             if let Some(wal) = store.inner.wal_coord.get() {
                 wal.note_writer_commit();
@@ -1968,6 +2034,9 @@ async fn execute_batch_on_conn(
             }
         }
         Err(commit_err) => {
+            for action in after_commit {
+                action.settle(false);
+            }
             drop(batch_retained_tickets);
             drop(batch_retained_guards);
             BatchExecOutcome::UnknownCommit {
@@ -1985,7 +2054,7 @@ struct SingleItemSuccess {
     dir_syncs: PendingDirSyncs,
     retained_tickets: Vec<StagedBlobTicket>,
     retained_guards: Vec<Box<dyn Send>>,
-    after_commit: Option<Box<dyn FnOnce() + Send>>,
+    after_commit: Option<CommitAction>,
 }
 
 async fn execute_single_item_in_savepoint(
@@ -2303,7 +2372,7 @@ async fn lookup_active_command_receipt_tx(
         sanitized_blob
     };
 
-    Ok(Some(StoredReceiptRow {
+    let receipt = StoredReceiptRow {
         command_hash: if idemp.matches_legacy_detail(&arr, &effective_blob) {
             hash
         } else {
@@ -2311,7 +2380,11 @@ async fn lookup_active_command_receipt_tx(
         },
         status,
         response_blob: effective_blob,
-    }))
+    };
+    idemp
+        .authorize_rollback_disclosures(tx, scope, &receipt)
+        .await?;
+    Ok(Some(receipt))
 }
 
 #[allow(clippy::too_many_arguments)]

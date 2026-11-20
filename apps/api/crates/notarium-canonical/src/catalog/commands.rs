@@ -69,11 +69,17 @@ async fn execute(
     let deadline = CommandDeadline::start(&budget, "catalog_write");
     deadline.remaining(&budget)?;
     let hash = command.fingerprint(&id)?;
+    let space_id = match &command {
+        Command::Provision { space, .. } => &space.id,
+        Command::Lifecycle { scope, .. } => &scope.space_id,
+    }
+    .clone();
     let inner = store.inner.clone();
     let grants = store.inner.clone();
     let work_budget = budget.clone();
     store
         .with_auxiliary_command(
+            space_id,
             Some((&budget, deadline)),
             move |(result, grant)| {
                 if let Some((space, epoch)) = grant {

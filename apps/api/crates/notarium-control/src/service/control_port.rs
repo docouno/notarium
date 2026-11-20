@@ -45,6 +45,12 @@ impl ControlPort for ControlPlane {
                 .clone())
         })
     }
+    fn revalidate_chat_viewer(
+        &self,
+        ctx: AccountContext,
+    ) -> PortFuture<'_, (EngineAuthContext, Option<std::time::Instant>)> {
+        Box::pin(self.control.revalidate_chat_viewer(ctx))
+    }
     fn fence_canonical_effect(
         &self,
         authority: EngineAuthContext,
@@ -113,6 +119,17 @@ impl ControlPort for ControlPlane {
     ) -> PortFuture<'_, ControlCommit<EpisodeStartResult>> {
         Box::pin(self.control.start_or_resume_episode(ctx, request))
     }
+    fn start_agent_episode(
+        &self,
+        ctx: AccountContext,
+        request: AccountMutation<StartEpisode>,
+    ) -> PortFuture<'_, ControlCommit<EpisodeStartResult>> {
+        Box::pin(self.control.start_or_resume_episode_under_guard(
+            ctx,
+            request,
+            super::episodes::EpisodeGuard::Target,
+        ))
+    }
     fn get_episode(&self, ctx: AccountContext, episode: EpisodeId) -> PortFuture<'_, AgentEpisode> {
         Box::pin(self.control.get_episode(ctx, episode))
     }
@@ -122,6 +139,17 @@ impl ControlPort for ControlPlane {
         request: AccountMutation<EpisodeUpdate>,
     ) -> PortFuture<'_, ControlCommit<AgentEpisode>> {
         Box::pin(self.control.update_episode(ctx, request))
+    }
+    fn bind_episode_role(
+        &self,
+        ctx: AccountContext,
+        request: AccountMutation<EpisodeUpdate>,
+    ) -> PortFuture<'_, ControlCommit<AgentEpisode>> {
+        Box::pin(self.control.update_episode_under_guard(
+            ctx,
+            request,
+            super::episodes::EpisodeGuard::Target,
+        ))
     }
     fn touch_episode(&self, ctx: AccountContext, episode: EpisodeId) -> PortFuture<'_, ()> {
         Box::pin(self.control.touch_episode(ctx, episode))

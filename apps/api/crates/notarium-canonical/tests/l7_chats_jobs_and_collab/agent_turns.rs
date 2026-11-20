@@ -132,6 +132,7 @@ async fn original_human_classifier(store: &CanonicalStore) {
                     body: ChatInputBody::Text("A model answer".into()),
                     tool_calls: Vec::new(),
                     provenance: Some(ChatProvenance::default()),
+                    interruption: None,
                     proposed_diff: None,
                     referenced_notes: Vec::new(),
                     tainted: false,
@@ -330,6 +331,7 @@ async fn model_payloads(store: &CanonicalStore) {
                         body: ChatInputBody::Text(text.clone()),
                         tool_calls,
                         provenance: Some(ChatProvenance::default()),
+                        interruption: None,
                         proposed_diff: None,
                         referenced_notes: Vec::new(),
                         tainted: false,
@@ -578,6 +580,7 @@ async fn clean_leaf_retains_audit_taint(store: &CanonicalStore) {
                 body: ChatInputBody::Text("A selected branch".into()),
                 tool_calls: Vec::new(),
                 provenance: None,
+                interruption: None,
                 proposed_diff: None,
                 referenced_notes: Vec::new(),
                 tainted,
@@ -845,6 +848,7 @@ async fn confirmed_source_fence(store: &CanonicalStore) {
                         arguments: BTreeMap::new(),
                     }],
                     provenance: Some(ChatProvenance::default()),
+                    interruption: None,
                     proposed_diff: None,
                     referenced_notes: Vec::new(),
                     tainted: false,
@@ -867,6 +871,7 @@ async fn confirmed_source_fence(store: &CanonicalStore) {
                     body: ChatInputBody::Text("Confirmation is required".into()),
                     tool_calls: Vec::new(),
                     provenance: Some(ChatProvenance::default()),
+                    interruption: None,
                     proposed_diff: Some("Opaque confirmed action".into()),
                     referenced_notes: Vec::new(),
                     tainted: true,
@@ -1054,6 +1059,63 @@ async fn supervised_queue_and_hydration_match_across_dialects() {
     fixtures.drop_pg_schema(&schema).await;
 }
 
+/// Both contenders miss the receipt. Pause them during preparation, commit
+/// their competitor, then check replay and CAS through the public port.
+async fn race_prepared_append(
+    store: &CanonicalStore,
+    agent: &SpaceContext,
+    request: &mut Mutation<AppendChat>,
+) -> notarium_core::ports::ChatEntry {
+    use notarium_canonical::chats::preparation_test::pause_once;
+    use tokio::sync::Barrier;
+
+    let head = |leaf| {
+        store.read_chat(
+            agent.clone(),
+            ChatRead {
+                thread: request.input.thread.clone(),
+                leaf,
+                before: None,
+                max_entries: PageLimit::new(1).unwrap(),
+            },
+        )
+    };
+    request.preconditions.revision =
+        Some(head(request.input.parent).await.unwrap().thread.revision);
+    let mut competing = request.clone();
+    competing.identity.key = CommandKey::from_bytes(random_bytes_16());
+    let barrier = Arc::new(Barrier::new(3));
+    let (duplicate, competing, winner) = tokio::time::timeout(Duration::from_secs(15), async {
+        tokio::join!(
+            pause_once(
+                barrier.clone(),
+                store.append_chat(agent.clone(), request.clone())
+            ),
+            pause_once(barrier.clone(), store.append_chat(agent.clone(), competing)),
+            async {
+                barrier.wait().await;
+                let winner = store.append_chat(agent.clone(), request.clone()).await;
+                barrier.wait().await;
+                winner
+            },
+        )
+    })
+    .await
+    .expect("both contenders must reach write preparation");
+    let winner = winner.unwrap();
+    let duplicate = duplicate.unwrap();
+    assert_eq!(duplicate.receipt, winner.receipt);
+    assert_eq!(duplicate.value, winner.value);
+    let current = head(winner.value.seq).await.unwrap().thread;
+    assert_eq!(current.head, winner.value.seq);
+    assert!(
+        matches!(competing, Err(PortError::Domain(DomainError::RevisionConflict {
+        current: revision, ..
+    })) if revision == current.revision)
+    );
+    winner.value
+}
+
 async fn nested_chat_egress_dependencies(store: &CanonicalStore) {
     use notarium_core::ports::{
         AccountContext, Cancellation, ProviderEgressCatalogPort, ProviderEgressRequest,
@@ -1083,6 +1145,7 @@ async fn nested_chat_egress_dependencies(store: &CanonicalStore) {
                 kind,
                 body: ChatInputBody::Text(text.into()),
                 provenance,
+                interruption: None,
                 proposed_diff: None,
                 tool_calls: vec![],
                 referenced_notes: vec![],
@@ -1114,34 +1177,49 @@ async fn nested_chat_egress_dependencies(store: &CanonicalStore) {
         .unwrap()[0]
         .content
         .origin();
-    let model = store
-        .append_chat(
-            agent.clone(),
-            append(
-                source.seq,
-                ChatEntryKind::Model,
-                "Derived model",
-                Some(ChatProvenance {
-                    origins: vec![source_origin.clone()],
-                    projects: vec![],
-                    compacts_through: None,
-                }),
-            ),
+    let account = || AccountContext::new(agent.auth().clone(), agent.budget.clone());
+    let metadata = store
+        .disclosure(
+            account(),
+            notarium_core::ports::CatalogDisclosure::Space(scope.clone()),
         )
         .await
         .unwrap()
-        .value;
+        .current()
+        .origin();
+    let mut model_request = append(
+        source.seq,
+        ChatEntryKind::Model,
+        "Derived model",
+        Some(ChatProvenance {
+            origins: vec![source_origin.clone(), metadata.clone()],
+            projects: vec![],
+            compacts_through: None,
+        }),
+    );
+    let model = race_prepared_append(store, &agent, &mut model_request).await;
     let model_origin = store
         .read_chat_contents(agent.clone(), read(model.seq))
         .await
         .unwrap()[0]
         .content
         .origin();
+    let mut checkpoint_request = append(
+        model.seq,
+        ChatEntryKind::Compaction,
+        "First human input",
+        Some(ChatProvenance {
+            origins: vec![source_origin],
+            projects: vec![],
+            compacts_through: Some(source.seq),
+        }),
+    );
+    let checkpoint = race_prepared_append(store, &agent, &mut checkpoint_request).await;
     let compaction = store
         .append_chat(
             agent.clone(),
             append(
-                model.seq,
+                checkpoint.seq,
                 ChatEntryKind::Compaction,
                 "Compacted model",
                 Some(ChatProvenance {
@@ -1160,12 +1238,21 @@ async fn nested_chat_egress_dependencies(store: &CanonicalStore) {
         .unwrap()[0]
         .content
         .origin();
-    let account = || AccountContext::new(agent.auth().clone(), agent.budget.clone());
     let proof = store
         .chat_dependencies(account(), vec![compact_origin.clone()])
         .await
         .unwrap();
-    assert_eq!(proof.origins, vec![model_origin, source_origin]);
+    assert_eq!(proof.origins, vec![metadata.clone()]);
+    assert_eq!(
+        store
+            .append_chat(agent.clone(), model_request)
+            .await
+            .unwrap()
+            .value
+            .seq,
+        model.seq
+    );
+    legacy_proof_chain(store, &agent, &model_origin, &metadata).await;
     let request = ProviderEgressRequest {
         origins: [vec![compact_origin], proof.origins].concat(),
         primary: scope.clone(),
@@ -1214,9 +1301,97 @@ async fn nested_chat_egress_dependencies(store: &CanonicalStore) {
         .await
         .unwrap();
     assert!(
+        matches!(
+            store.chat_dependencies(account(), vec![model_origin]).await,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ),
+        "redacting the original source invalidates the stored model proof"
+    );
+    assert!(
         store
             .acquire_egress(account(), request, Cancellation::default())
             .await
             .is_err()
+    );
+}
+
+/// Older entries carried only their direct proof. Seed a long chain in one
+/// insert, then use normal discovery and admission on its tail.
+async fn legacy_proof_chain(
+    store: &CanonicalStore,
+    ctx: &SpaceContext,
+    model: &notarium_core::classes::ProviderOrigin,
+    metadata: &notarium_core::classes::ProviderOrigin,
+) {
+    use notarium_core::{
+        classes::ProviderOrigin,
+        ports::{
+            AccountContext, Cancellation, MAX_PROVIDER_ORIGINS, ProviderEgressCatalogPort,
+            ProviderEgressRequest,
+        },
+    };
+    let ProviderOrigin::Chat {
+        space,
+        thread,
+        entry,
+        ..
+    } = model
+    else {
+        unreachable!()
+    };
+    let mut edge = model.clone();
+    let ProviderOrigin::Chat { entry: prior, .. } = &mut edge else {
+        unreachable!()
+    };
+    *prior = ThreadEntrySeq::MAX;
+    let proof = serde_json::to_string(&ChatProvenance {
+        origins: vec![edge],
+        ..Default::default()
+    })
+    .unwrap();
+    let (prefix, suffix) = proof
+        .split_once(&ThreadEntrySeq::MAX.get().to_string())
+        .unwrap();
+    let start = 100;
+    let end = start + MAX_PROVIDER_ORIGINS;
+    let first_parent = entry.get();
+    let count = store.execute_diagnostic_write_sql_for_test(&format!(
+        "WITH RECURSIVE chain(n) AS (SELECT {start} UNION ALL SELECT n+1 FROM chain WHERE n<{end})
+         INSERT INTO chat_entries(space_id,thread_id,entry_seq,parent_seq,revision_id,kind,author_id,
+             agent_run_id,inline_text,referenced_notes_json,ext_space_tainted,is_chain_node,branch_depth,
+             created_space_seq,body_format,provenance_json)
+         SELECT space_id,thread_id,n,CASE WHEN n={start} THEN {first_parent} ELSE n-1 END,
+             revision_id,kind,author_id,agent_run_id,inline_text,referenced_notes_json,0,1,
+             n-{start}+branch_depth+1,created_space_seq,body_format,
+             '{prefix}' || CAST(CASE WHEN n={start} THEN {first_parent} ELSE n-1 END AS TEXT) || '{suffix}'
+         FROM chain CROSS JOIN chat_entries WHERE space_id='{space}' AND thread_id='{thread}'
+             AND entry_seq={first_parent}"
+    )).await.unwrap();
+    assert_eq!(count, (end - start + 1) as u64);
+    let mut tail = model.clone();
+    let ProviderOrigin::Chat { entry, .. } = &mut tail else {
+        unreachable!()
+    };
+    *entry = ThreadEntrySeq::new(end as u64).unwrap();
+    let account = || AccountContext::new(ctx.auth().clone(), ctx.budget.clone());
+    let deps = store
+        .chat_dependencies(account(), vec![tail.clone()])
+        .await
+        .unwrap();
+    assert_eq!(deps.origins.as_slice(), std::slice::from_ref(metadata));
+    let request = ProviderEgressRequest {
+        origins: vec![tail, metadata.clone()],
+        primary: ctx.scope().clone(),
+        project: None,
+        secondary_projects: vec![],
+    };
+    assert_eq!(
+        store
+            .acquire_egress(account(), request, Cancellation::default())
+            .await
+            .unwrap()
+            .current()
+            .len(),
+        2
     );
 }

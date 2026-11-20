@@ -127,6 +127,14 @@ impl ControlService {
                         }
                         let unchanged_due = calendar_unchanged && input.next_slot == previous.next_slot;
                         validate(&input.definition,input.next_slot,self.config.schedule_limits,unchanged_due)?;
+                        if input.next_slot != previous.next_slot && let Some(slot) = input.next_slot {
+                            let slot = ms(slot)?;
+                            // Run receipts have finite retention. Only the existing due
+                            // can be kept for catch-up once its UTC instant has passed.
+                            if slot < now || runs::slot_receipt(tx.inner_mut(), &input.schedule, slot).await?.is_some() {
+                                return Err(invalid(ValidationReason::InvalidTimestamp));
+                            }
+                        }
                         let descriptors = approved.map_err(Clone::clone)?
                             .ok_or_else(|| invalid(ValidationReason::InvalidState))?;
                         if !self.verify_schedule_approval_db(tx.inner_mut(),&current,scope,descriptors).await? {

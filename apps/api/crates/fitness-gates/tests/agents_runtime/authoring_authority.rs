@@ -1085,7 +1085,7 @@ async fn revoked_root_userdoc_rollback(fixture: &mut RuntimeFixture, personal: &
     let initial = fixture
         .canonical
         .get_note(
-            owner_scope,
+            owner_scope.clone(),
             GetNote {
                 note: note_id.clone(),
                 revision: None,
@@ -1094,44 +1094,66 @@ async fn revoked_root_userdoc_rollback(fixture: &mut RuntimeFixture, personal: &
         )
         .await
         .unwrap();
-    let body = initial.document.explicit_read(owner.auth()).unwrap();
-    let pos = body.find("Original root body.").unwrap();
-    fixture
-        .canonical
-        .edit_note(
-            run_scope,
-            Mutation {
-                identity: CommandIdentity {
-                    scope: personal.clone(),
-                    actor: principal,
-                    key: CommandKey::from_bytes([212; 16]),
-                    hash: ContentDigest::from_bytes([212; 32]),
+    let mut body = initial
+        .document
+        .explicit_read(owner.auth())
+        .unwrap()
+        .to_owned();
+    let mut revision = created.value.revision;
+    let mut previous = "Original root body.".to_owned();
+    let mut expected = String::new();
+    for version in 1..=18 {
+        // Roll back both run edits to the last of sixteen earlier human edits.
+        let is_run = version > 16;
+        let replacement = format!("Revision {version}.");
+        let start = body.find(&previous).unwrap();
+        let end = start + previous.len();
+        let mut key = [212; 16];
+        key[15] = version;
+        revision = fixture
+            .canonical
+            .edit_note(
+                if is_run {
+                    run_scope.clone()
+                } else {
+                    owner_scope.clone()
                 },
-                preconditions: Preconditions {
-                    revision: Some(created.value.revision),
-                    ..Default::default()
+                Mutation {
+                    identity: CommandIdentity {
+                        scope: personal.clone(),
+                        actor: principal.clone(),
+                        key: CommandKey::from_bytes(key),
+                        hash: ContentDigest::from_bytes([version; 32]),
+                    },
+                    preconditions: Preconditions {
+                        revision: Some(revision),
+                        ..Default::default()
+                    },
+                    input: EditNote {
+                        note: note_id.clone(),
+                        plan: notarium_syntax::patch::plan(
+                            &body,
+                            notarium_core::span::ByteSpan::new(0, body.len()).unwrap(),
+                            vec![(
+                                notarium_core::patch::CarrierEditOrigin::Body,
+                                notarium_core::span::ByteSpan::new(start, end).unwrap(),
+                                replacement.clone(),
+                            )],
+                        )
+                        .unwrap(),
+                    },
                 },
-                input: EditNote {
-                    note: note_id,
-                    plan: notarium_syntax::patch::plan(
-                        body,
-                        notarium_core::span::ByteSpan::new(0, body.len()).unwrap(),
-                        vec![(
-                            notarium_core::patch::CarrierEditOrigin::Body,
-                            notarium_core::span::ByteSpan::new(
-                                pos,
-                                pos + "Original root body.".len(),
-                            )
-                            .unwrap(),
-                            "Modified by agent run.".into(),
-                        )],
-                    )
-                    .unwrap(),
-                },
-            },
-        )
-        .await
-        .unwrap();
+            )
+            .await
+            .unwrap()
+            .value
+            .revision;
+        body.replace_range(start..end, &replacement);
+        previous = replacement;
+        if version == 16 {
+            expected = body.clone();
+        }
+    }
     let supervisor = AgentRunSupervisor::new_local(
         fixture.registry.clone(),
         fixture.revocations.clone(),
@@ -1146,12 +1168,57 @@ async fn revoked_root_userdoc_rollback(fixture: &mut RuntimeFixture, personal: &
         &replay_key,
     ))
     .await;
-    // Commit one rollback and verify replay after commit also fails closed
-    // both pre-SQL and during active SQL receipt replay.
-    supervisor
+    // A lost reply after COMMIT is resolved by the same command and receipt.
+    fixture
+        .canonical
+        .writer_faults()
+        .unwrap()
+        .drop_commit_response_once
+        .store(true, std::sync::atomic::Ordering::Release);
+    let lost = supervisor
+        .rollback_run(
+            owner.clone(),
+            personal.clone(),
+            run.clone(),
+            replay_key.clone(),
+        )
+        .await;
+    assert!(
+        matches!(lost, Err(PortError::Unavailable(ref error))
+        if error.effect() == notarium_core::error::CommitEffect::Unknown),
+        "{lost:?}"
+    );
+    let settled = fixture
+        .canonical
+        .read_space(&personal.space_id)
+        .await
+        .unwrap()
+        .last_seq;
+    let replay = supervisor
         .rollback_run(owner, personal.clone(), run.clone(), replay_key.clone())
         .await
         .unwrap();
+    assert_eq!(replay.receipt.seq(), settled);
+    assert_eq!(replay.value.restored.len(), 1);
+    let restored = fixture
+        .canonical
+        .get_note(
+            owner_scope,
+            GetNote {
+                note: note_id,
+                revision: None,
+                causal: CausalBasis::Await(Default::default()),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        restored
+            .document
+            .explicit_read(fixture.human.auth())
+            .unwrap(),
+        expected
+    );
     Box::pin(revoked_rollback(
         fixture,
         &supervisor,

@@ -40,35 +40,22 @@ impl AgentRunSupervisor {
                     {
                         drop(admission);
                     }
-                    Err(error)
-                        if drain_only
-                            || run.owner.check().is_err()
-                            || matches!(
-                                &error,
-                                PortError::Domain(
-                                    DomainError::SpaceReadOnly | DomainError::ResourceNotFound
-                                )
-                            ) =>
-                    {
-                        match self.settle_unpublished_claim(&run).await {
-                            ClaimSettlement::Pending
-                                if queue::retry_cleanup(&error)
-                                    && run.owner.check().is_ok()
-                                    && !self.inner.shutdown.is_cancelled() =>
-                            {
-                                drop(admission);
-                            }
-                            _ => {
-                                let _ = self.refresh_current_peer_head(&run).await;
-                                self.finish_and_remove_run(&run, result.err().or(Some(error)));
-                                drop(admission);
-                                return;
-                            }
+                    // A failed drain can leave this exact claim in storage. Recheck
+                    // it before releasing ownership, even after a known rollback.
+                    Err(error) => match self.settle_unpublished_claim(&run).await {
+                        ClaimSettlement::Pending => {
+                            drop(admission);
                         }
-                    }
-                    cleanup => {
+                        _ => {
+                            let _ = self.refresh_current_peer_head(&run).await;
+                            self.finish_and_remove_run(&run, result.err().or(Some(error)));
+                            drop(admission);
+                            return;
+                        }
+                    },
+                    Ok(()) => {
                         let _ = self.refresh_current_peer_head(&run).await;
-                        self.finish_and_remove_run(&run, result.err().or_else(|| cleanup.err()));
+                        self.finish_and_remove_run(&run, result.err());
                         drop(admission);
                         return;
                     }
@@ -205,6 +192,7 @@ impl AgentRunSupervisor {
                             body: ChatInputBody::Text(settled.text),
                             tool_calls: vec![],
                             provenance: Some(proof),
+                            interruption: None,
                             proposed_diff: None,
                             referenced_notes: vec![],
                             tainted: run.auth.taint().is_tainted(),
@@ -247,6 +235,7 @@ impl AgentRunSupervisor {
                         body: ChatInputBody::Text(settled.text),
                         tool_calls: settled.calls.clone(),
                         provenance: Some(proof),
+                        interruption: settled.finish.interruption(),
                         proposed_diff: None,
                         referenced_notes: vec![],
                         tainted: run.auth.taint().is_tainted(),
@@ -256,7 +245,7 @@ impl AgentRunSupervisor {
             leaf = model_entry.seq;
             run.stream.committed(&model_entry, Some(step))?;
             if settled.calls.is_empty() {
-                return Ok(());
+                return crate::completion::terminal_outcome(settled.finish);
             }
             for call in settled.calls {
                 let call_id = call_key(&call)?;
@@ -291,6 +280,7 @@ impl AgentRunSupervisor {
                             body: ChatInputBody::Text(result.display.clone()),
                             tool_calls: vec![],
                             provenance: Some(result.proof),
+                            interruption: None,
                             proposed_diff: envelope,
                             referenced_notes: vec![],
                             tainted: run.auth.taint().is_tainted(),

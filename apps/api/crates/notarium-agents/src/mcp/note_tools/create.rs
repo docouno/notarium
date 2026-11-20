@@ -432,7 +432,11 @@ async fn execute(
             folder_page: prepared.folder_page,
         },
     };
-    let committed = call.registry.engine.create_note(scope, write).await?;
+    let committed = call
+        .registry
+        .engine
+        .create_note(call.corpus_writer(scope).await?, write)
+        .await?;
     Ok((committed, parent.folder_id))
 }
 
@@ -586,7 +590,7 @@ async fn resolve_batch_links(
     call.registry
         .engine
         .edit_note(
-            scope,
+            call.corpus_writer(scope).await?,
             Mutation {
                 identity,
                 preconditions: Preconditions {

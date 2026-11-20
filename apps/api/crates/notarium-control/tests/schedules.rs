@@ -1553,8 +1553,11 @@ async fn postgres_role_placement_scope_and_run_inspection_access() {
 async fn terminal_slots_and_migrated_folds(pg: bool) {
     let _serial = AUTH_TEST_LOCK.lock().await;
     let mut fixture = Fixture::new(pg, "schedule_civil_windows").await;
-    let service = fixture.service(AuthenticationMode::Password).await.unwrap();
-    let issued = service
+    let mode = AuthenticationMode::TrustedNone {
+        owner: PrincipalId::from_bytes([177; 16]),
+    };
+    let service = fixture.service(mode.clone()).await.unwrap();
+    service
         .bootstrap(
             empty(),
             budget(),
@@ -1562,15 +1565,17 @@ async fn terminal_slots_and_migrated_folds(pg: bool) {
                 username: "owner".into(),
                 email: None,
                 display_name: "Owner".into(),
-                password: Some(SecretString::new("calendar scenario password".into())),
+                password: None,
             },
         )
         .await
         .unwrap();
-    let token = issued.session.unwrap().token;
     let ctx = AccountContext::new(
         service
-            .resolve(evidence(AuthEvidenceKind::Session, token.expose()))
+            .trusted_none(
+                PerimeterAttestation::attest_checked().with_human_management(),
+                budget(),
+            )
             .await
             .unwrap(),
         budget(),
@@ -1626,6 +1631,30 @@ async fn terminal_slots_and_migrated_folds(pg: bool) {
             first,
         ),
         ("Finite UTC calendar", "0 0 12 1 12 * 2026", "UTC", terminal),
+        (
+            "Retained fold",
+            "0 30 1 * * Sun *",
+            "America/New_York",
+            first,
+        ),
+        (
+            "Expired history",
+            "0 30 1 * * Sun *",
+            "America/New_York",
+            first,
+        ),
+        (
+            "Complete history",
+            "0 30 1 * * Sun *",
+            "America/New_York",
+            parse("2026-10-25T05:30:00Z"),
+        ),
+        (
+            "Reconfigured fold",
+            "0 30 1 * * Sun *",
+            "America/New_York",
+            first,
+        ),
     ];
     let mut schedules = Vec::new();
     for (key, (title, cron, timezone, slot)) in (81..).zip(calendars) {
@@ -1681,11 +1710,39 @@ async fn terminal_slots_and_migrated_folds(pg: bool) {
     else {
         panic!("early civil occurrence was not retained");
     };
+    for schedule in &schedules[3..] {
+        let due = schedule.next_slot.unwrap();
+        let claim = service
+            .claim_schedule(scheduler(), make_claim(schedule, due, Some(next)))
+            .await
+            .unwrap();
+        let ScheduleClaim::Claimed { run, lease, .. } = claim else {
+            panic!("expected the initial slot to run");
+        };
+        if due == first {
+            service
+                .record_schedule_result(
+                    scheduler(),
+                    ScheduleResult {
+                        schedule: schedule.id.clone(),
+                        run,
+                        lease,
+                        outcome: ScheduleOutcome::Succeeded,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+    }
     // Earlier schedule rows could retain both UTC representations in persisted
     // schedules. Simulate that old state after an early-slot receipt and with
     // an unclaimed schedule.
     fixture.observer.execute(
-        "UPDATE agent_schedules SET next_slot_utc_ms=1793514600000 WHERE title IN ('Repeated local hour','Unclaimed local hour')"
+        "UPDATE agent_schedules SET next_slot_utc_ms=1793514600000 WHERE title IN ('Repeated local hour','Unclaimed local hour','Retained fold','Complete history')"
+    ).await;
+    // A legacy edit could also store the late cursor under a new configuration.
+    fixture.observer.execute(
+        "UPDATE agent_schedules SET next_slot_utc_ms=1793514600000,config_revision=config_revision+1,revision=revision+1 WHERE title='Reconfigured fold'"
     ).await;
     assert_eq!(1793514600000, late_time);
     fixture.clock.0.store(late_time, Ordering::SeqCst);
@@ -1717,13 +1774,13 @@ async fn terminal_slots_and_migrated_folds(pg: bool) {
         run,
         context,
         schedule,
-        ..
+        lease,
     } = last
     else {
         panic!("finite calendar lost its final due");
     };
     assert!(schedule.next_slot.is_none());
-    let restarted = fixture.service(AuthenticationMode::Password).await.unwrap();
+    let restarted = fixture.service(mode).await.unwrap();
     restarted
         .whoami(AccountContext::new(context.auth().clone(), budget()))
         .await
@@ -1732,6 +1789,117 @@ async fn terminal_slots_and_migrated_folds(pg: bool) {
         restarted.claim_schedule(scheduler(), final_claim).await.unwrap(),
         ScheduleClaim::AlreadyClaimed(previous) if previous.run == run && previous.reserved_next_slot.is_none()
     ));
+    restarted
+        .record_schedule_result(
+            scheduler(),
+            ScheduleResult {
+                schedule: schedule.id.clone(),
+                run: run.clone(),
+                lease,
+                outcome: ScheduleOutcome::Succeeded,
+            },
+        )
+        .await
+        .unwrap();
+    // A persisted update from an older build may point at the exact issued slot.
+    assert_eq!(terminal.unix_seconds(), 1_796_126_400);
+    fixture.observer.execute(
+        "UPDATE agent_schedules SET next_slot_utc_ms=1796126400000 WHERE title='Finite UTC calendar'",
+    ).await;
+    fixture.clock.0.fetch_add(91 * 86_400_000, Ordering::SeqCst);
+    let maintenance = || MaintenanceContext {
+        authority: ServiceAuthority::admit(ServicePurpose::Telemetry),
+        budget: budget(),
+    };
+    let receipts = "SELECT COUNT(*) FROM agent_schedule_runs WHERE slot_utc_ms=1796126400000";
+    restarted
+        .cleanup_telemetry(maintenance(), 200)
+        .await
+        .unwrap();
+    assert_eq!(fixture.observer.count(receipts).await, 1);
+
+    let owner_scope =
+        SpaceContext::new(ctx.auth().clone(), context.scope().clone(), budget()).unwrap();
+    // One old installation kept its late-fold cursor through cleanup. Another
+    // restores the same legacy cursor after its original receipt has expired.
+    assert_eq!(fixture.observer.count(
+        "SELECT COUNT(*) FROM agent_schedule_runs r JOIN agent_schedules s ON s.schedule_id=r.schedule_id WHERE s.title='Retained fold'"
+    ).await, 1);
+    assert_eq!(fixture.observer.count(
+        "SELECT COUNT(*) FROM agent_schedule_runs r JOIN agent_schedules s ON s.schedule_id=r.schedule_id WHERE s.title='Expired history'"
+    ).await, 0);
+    assert_eq!(fixture.observer.count(
+        "SELECT COUNT(*) FROM agent_schedule_runs r JOIN agent_schedules s ON s.schedule_id=r.schedule_id WHERE s.title='Reconfigured fold' AND s.config_revision>r.config_revision"
+    ).await, 1);
+    fixture.observer.execute("UPDATE agent_schedules SET next_slot_utc_ms=1793514600000 WHERE title='Expired history'").await;
+    let resumed_at = tick(fixture.clock.0.load(Ordering::SeqCst));
+    let after_fold = notarium_control::service::compute_next_slot(
+        &advanced.definition.cron,
+        &advanced.definition.timezone,
+        late,
+        resumed_at,
+    )
+    .unwrap()
+    .unwrap();
+    for schedule in &schedules[3..] {
+        let due = restarted
+            .get_schedule(owner_scope.clone(), schedule.id.clone())
+            .await
+            .unwrap();
+        let claim = make_claim(&due, late, Some(after_fold));
+        for attempt in 0..2 {
+            let result = restarted
+                .claim_schedule(scheduler(), claim.clone())
+                .await
+                .unwrap();
+            match schedule.definition.title.as_str() {
+                "Retained fold" => assert!(
+                    matches!(result, ScheduleClaim::SkippedDuplicate(previous) if previous.slot == first)
+                ),
+                "Expired history" => {
+                    assert!(matches!(result, ScheduleClaim::SkippedUnverifiedFold))
+                }
+                "Complete history" | "Reconfigured fold" if attempt == 0 => {
+                    assert!(matches!(result, ScheduleClaim::Claimed { .. }))
+                }
+                "Complete history" | "Reconfigured fold" => {
+                    assert!(matches!(result, ScheduleClaim::AlreadyClaimed(_)))
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+    let due = restarted
+        .get_schedule(owner_scope.clone(), schedule.id.clone())
+        .await
+        .unwrap();
+    let mut renamed = due.definition;
+    renamed.title = "Renamed overdue schedule".into();
+    let updated = restarted
+        .update_schedule(
+            ctx.clone(),
+            AccountMutation {
+                identity: identity(&restarted, &ctx, 91).await,
+                input: UpdateSchedule {
+                    schedule: due.id,
+                    expected: due.revision,
+                    definition: renamed,
+                    approved_skills: None,
+                    next_slot: due.next_slot,
+                    paused: false,
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    let repair = make_claim(&updated, terminal, None);
+    for _ in 0..2 {
+        assert!(matches!(
+            restarted.claim_schedule(scheduler(), repair.clone()).await.unwrap(),
+            ScheduleClaim::SkippedDuplicate(previous) if previous.run == run
+        ));
+    }
     let page = restarted
         .list_due_schedules(
             scheduler(),
@@ -1741,6 +1909,62 @@ async fn terminal_slots_and_migrated_folds(pg: bool) {
         .await
         .unwrap();
     assert!(!page.items.iter().any(|item| item.id == schedule.id));
+    restarted
+        .cleanup_telemetry(maintenance(), 200)
+        .await
+        .unwrap();
+    assert_eq!(fixture.observer.count(receipts).await, 0);
+
+    let current = restarted
+        .get_schedule(owner_scope, schedule.id.clone())
+        .await
+        .unwrap();
+    let rewind = restarted
+        .update_schedule(
+            ctx.clone(),
+            AccountMutation {
+                identity: identity(&restarted, &ctx, 90).await,
+                input: UpdateSchedule {
+                    schedule: current.id,
+                    expected: current.revision,
+                    definition: current.definition,
+                    approved_skills: None,
+                    next_slot: Some(terminal),
+                    paused: false,
+                },
+            },
+        )
+        .await;
+    assert!(
+        matches!(rewind, Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
+        if diagnostic.reason == ValidationReason::InvalidTimestamp)
+    );
+    fixture
+        .clock
+        .0
+        .store(after_fold.unix_seconds() * 1000, Ordering::SeqCst);
+    let repaired = restarted
+        .get_schedule(
+            SpaceContext::new(ctx.auth().clone(), context.scope().clone(), budget()).unwrap(),
+            schedules[4].id.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(repaired.next_slot, Some(after_fold));
+    let subsequent = notarium_control::service::compute_next_slot(
+        &repaired.definition.cron,
+        &repaired.definition.timezone,
+        after_fold,
+        after_fold,
+    )
+    .unwrap();
+    assert!(matches!(
+        restarted
+            .claim_schedule(scheduler(), make_claim(&repaired, after_fold, subsequent))
+            .await
+            .unwrap(),
+        ScheduleClaim::Claimed { .. }
+    ));
     drop(restarted);
     drop(service);
     fixture.close().await;

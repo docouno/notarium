@@ -391,6 +391,14 @@ pub enum CompletionFinish {
     ToolCalls,
     ContentFilter,
 }
+impl CompletionFinish {
+    pub fn interruption(self) -> Option<Self> {
+        match self {
+            Self::Length | Self::ContentFilter => Some(self),
+            Self::Stop | Self::ToolCalls => None,
+        }
+    }
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ProviderDeliveryState {
     Intent,

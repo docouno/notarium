@@ -19,7 +19,10 @@ impl ControlService {
             if let Some(existing)=existing {
                 if existing.owner_id!=auth.principal().as_str() || existing.fingerprint!=fingerprint.as_bytes(){return Err(DomainError::IdempotencyKeyReused.into());}return Ok(());
             }
-            if let Some(id)=&request.episode {super::super::episodes::episode(tx.inner_mut(),auth.principal(),id).await?;}
+            let episode = match &request.episode {
+                Some(id) => Some(super::super::episodes::episode(tx.inner_mut(), auth.principal(), id).await?),
+                None => None,
+            };
             let agent=match auth.kind(){PrincipalKind::AgentRun(run)|PrincipalKind::Keeper(run)=>Some(run.to_string()),_=>None};
             let raw_row = AgentCallsRow {
                 call_id: request.call.to_string(),
@@ -90,6 +93,8 @@ impl ControlService {
                 {
                     return Err(DomainError::IdempotencyKeyReused.into());
                 }
+            } else if let Some(episode) = episode && matches!(request.transport, AgentTransport::Mcp) {
+                super::super::episodes::touch_active(tx.inner_mut(), &episode, raw_row.started_at).await?;
             }
             Ok(())
         },CommitEffect::NotCommitted).await?;

@@ -76,6 +76,7 @@ pub struct TickSummary {
     pub unknown: usize,
     pub paused: usize,
     pub skipped_duplicate: usize,
+    pub skipped_unverified_fold: usize,
     pub raced: usize,
     pub deferred: usize,
     pub errors: usize,
@@ -144,6 +145,7 @@ enum SlotAttempt {
     Deferred,
     Raced,
     Duplicate,
+    UnverifiedFold,
     Paused,
     Claimed(Result<ScheduleOutcome, PortError>),
 }
@@ -189,7 +191,17 @@ impl KeeperScheduler {
     /// Complete the schedules that were due at this cut, at most one slot per
     /// schedule. Durable Control CAS chooses the winner across pollers.
     pub async fn tick(&self, now: Timestamp) -> Result<TickSummary, PortError> {
-        self.tick_until(now, None, &Cancellation::default()).await
+        let mut jobs = JoinSet::new();
+        let mut summary = TickSummary::default();
+        let pages = self
+            .enqueue_due(now, None, &Cancellation::default(), &mut jobs, &mut summary)
+            .await;
+        // Drain admitted work even if a later list page failed.
+        while let Some(result) = jobs.join_next().await {
+            summarize_attempt(&mut summary, result);
+        }
+        pages?;
+        Ok(summary)
     }
 
     pub async fn reconcile(&self, now: Timestamp) -> Result<ReconcileSummary, PortError> {
@@ -221,12 +233,17 @@ impl KeeperScheduler {
         let due = async {
             let mut interval = tokio::time::interval(poll_interval);
             interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            let mut jobs = JoinSet::new();
             while wait_tick(&mut interval, &cancellation).await {
+                let mut summary = TickSummary::default();
+                while let Some(result) = jobs.try_join_next() {
+                    summarize_attempt(&mut summary, result);
+                }
                 let result = match clock_now(clock.as_ref()) {
-                    Ok(now) => self
-                        .tick_until(now, Some(&clock), &cancellation)
-                        .await
-                        .map(|_| ()),
+                    Ok(now) => {
+                        self.enqueue_due(now, Some(&clock), &cancellation, &mut jobs, &mut summary)
+                            .await
+                    }
                     Err(error) => Err(error),
                 };
                 if let Err(error) = result
@@ -234,6 +251,10 @@ impl KeeperScheduler {
                 {
                     tracing::warn!(code = error.code(), "keeper polling failed");
                 }
+            }
+            let mut summary = TickSummary::default();
+            while let Some(result) = jobs.join_next().await {
+                summarize_attempt(&mut summary, result);
             }
         };
         let expired = async {
@@ -254,25 +275,6 @@ impl KeeperScheduler {
         };
         tokio::join!(due, expired);
         Ok(())
-    }
-
-    async fn tick_until(
-        &self,
-        now: Timestamp,
-        clock: Option<&Arc<dyn ControlClock>>,
-        cancellation: &Cancellation,
-    ) -> Result<TickSummary, PortError> {
-        let mut jobs = JoinSet::new();
-        let mut summary = TickSummary::default();
-        let pages = self
-            .enqueue_due(now, clock, cancellation, &mut jobs, &mut summary)
-            .await;
-        // Drain already admitted work even if the next list page failed.
-        while let Some(result) = jobs.join_next().await {
-            summarize_attempt(&mut summary, result);
-        }
-        pages?;
-        Ok(summary)
     }
 
     async fn enqueue_due(
@@ -480,6 +482,7 @@ impl KeeperScheduler {
             }
             Ok(ScheduleClaim::AlreadyClaimed(_)) => Ok(SlotAttempt::Raced),
             Ok(ScheduleClaim::SkippedDuplicate(_)) => Ok(SlotAttempt::Duplicate),
+            Ok(ScheduleClaim::SkippedUnverifiedFold) => Ok(SlotAttempt::UnverifiedFold),
             Ok(ScheduleClaim::Paused(_)) => Ok(SlotAttempt::Paused),
             Err(error) if claim_raced(&error) => Ok(SlotAttempt::Raced),
             Err(error) => Err(error),
@@ -695,6 +698,7 @@ fn summarize_attempt(
         Ok(Ok(SlotAttempt::Deferred)) => summary.deferred += 1,
         Ok(Ok(SlotAttempt::Raced)) => summary.raced += 1,
         Ok(Ok(SlotAttempt::Duplicate)) => summary.skipped_duplicate += 1,
+        Ok(Ok(SlotAttempt::UnverifiedFold)) => summary.skipped_unverified_fold += 1,
         Ok(Ok(SlotAttempt::Paused)) => summary.paused += 1,
         Ok(Ok(SlotAttempt::Claimed(outcome))) => {
             summary.claimed += 1;

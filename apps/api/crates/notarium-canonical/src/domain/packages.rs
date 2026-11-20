@@ -937,34 +937,15 @@ pub(super) async fn check_restored_ability_slot_tx(
     tx: &mut BackendConn<'_>,
     space: &notarium_core::ids::SpaceId,
     ability: &AbilityId,
+    slug: &str,
     project: Option<&notarium_core::ids::FolderId>,
 ) -> Result<(), PortError> {
-    let sql = "SELECT slug_fold FROM ability_packages WHERE space_id=$1 AND ability_id=$2 AND lifecycle_state='active'";
-    let slug: Option<String> = match tx {
-        BackendConn::Sqlite(conn) => {
-            sqlx::query_scalar(sql)
-                .bind(space.as_str())
-                .bind(ability.as_str())
-                .fetch_optional(&mut **conn)
-                .await
-        }
-        BackendConn::Postgres(conn) => {
-            sqlx::query_scalar(sql)
-                .bind(space.as_str())
-                .bind(ability.as_str())
-                .fetch_optional(&mut **conn)
-                .await
-        }
-    }
-    .map_err(|err| internal_not_committed("restored_ability_slot", err.to_string()))?;
-    if let Some(slug) = slug
-        && active_ability_slug_conflict_tx(tx, space, &slug, ability, project).await?
-    {
+    if active_ability_slug_conflict_tx(tx, space, slug, ability, project).await? {
         return Err(DomainError::PathConflict {
             target: PathTarget {
                 space_id: space.clone(),
                 parent: project.cloned(),
-                component: slug,
+                component: slug.to_owned(),
             },
         }
         .into());

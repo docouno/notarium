@@ -50,6 +50,7 @@ pub enum RunFailure {
     AuthorityRevoked,
     HistoryUnavailable,
     ProviderUnavailable,
+    ContentFiltered,
     BudgetExceeded,
     Internal,
 }

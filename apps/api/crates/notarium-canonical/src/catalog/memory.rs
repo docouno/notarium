@@ -96,13 +96,36 @@ pub(crate) async fn authorized_slot(
     }
     let head =
         crate::domain::common::load_note_head_row_opt_tx(tx, &rec.scope.space_id, note).await?;
-    if let Some(head) = &head
-        && (head.parent_folder_id != parent
+    if let Some(head) = &head {
+        if head.parent_folder_id != parent
             || head.doc_class != DocClass::AgentMemory
             || head.ability_id.is_some()
-            || head.lifecycle != Lifecycle::Active)
-    {
-        return Err(DomainError::ResourceNotFound.into());
+        {
+            return Err(DomainError::ResourceNotFound.into());
+        }
+        if head.lifecycle != Lifecycle::Active {
+            // A rollback that undoes creation writes a tombstone in the same atomic cut as
+            // the creator run's revision. A manual trash has no such witness. Repeated
+            // rollbacks may restore this same tombstone through restored_from_rev_id.
+            let sql = "WITH RECURSIVE source(rev_id, parent_rev_id, restored_from_rev_id, visibility_seq, agent_run_id) AS (
+                SELECT rev_id, parent_rev_id, restored_from_rev_id, visibility_seq, agent_run_id
+                FROM revisions WHERE space_id=$1 AND rev_id=$2 AND entity_type='note' AND entity_key=$3
+                UNION
+                SELECT r.rev_id, r.parent_rev_id, r.restored_from_rev_id, r.visibility_seq, r.agent_run_id
+                FROM source JOIN revisions r ON r.space_id=$1 AND r.rev_id=source.restored_from_rev_id
+                WHERE r.entity_type='note' AND r.entity_key=$3
+            )
+            SELECT CAST(1 AS BIGINT) FROM source
+            JOIN revisions parent ON parent.space_id=$1 AND parent.rev_id=source.parent_rev_id
+            JOIN revisions run ON run.space_id=$1 AND run.entity_type='agent_run'
+                AND run.entity_key=parent.agent_run_id AND run.visibility_seq=source.visibility_seq
+            WHERE source.restored_from_rev_id IS NULL AND source.agent_run_id IS NULL LIMIT 1";
+            let undone: Option<i64> = db!(read tx, sqlx::query_scalar(sql), fetch_optional,
+                rec.scope.space_id.as_str(), head.head_rev_id.as_str(), note.as_str())?;
+            if head.lifecycle != Lifecycle::Trashed || undone.is_none() {
+                return Err(DomainError::ResourceNotFound.into());
+            }
+        }
     }
     Ok((parent, head))
 }
@@ -112,6 +135,7 @@ pub(super) async fn inspect(
     ctx: &AccountContext,
     target: MemoryTarget,
     category: String,
+    for_append: bool,
 ) -> Result<MemoryTargetSnapshot, PortError> {
     let note_id = fixed_note_id(&target, &category)?;
     let auth = ctx.auth().clone();
@@ -132,11 +156,20 @@ pub(super) async fn inspect(
                     category,
                 };
                 let (parent, head) = authorized_slot(tx, &auth, &rec, &resolved).await?;
+                if !for_append
+                    && head
+                        .as_ref()
+                        .is_some_and(|head| head.lifecycle == Lifecycle::Trashed)
+                {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
                 Ok(MemoryTargetSnapshot {
                     resolved,
                     scope: rec.scope,
                     parent,
-                    revision: head.map(|head| head.head_rev_id),
+                    revision: head
+                        .filter(|head| head.lifecycle == Lifecycle::Active)
+                        .map(|head| head.head_rev_id),
                 })
             })
         })
@@ -154,7 +187,7 @@ pub(super) async fn resolve(
         scope,
         parent,
         revision,
-    } = inspect(store, &ctx, target, category).await?;
+    } = inspect(store, &ctx, target, category, false).await?;
     if revision.is_none() {
         let reference = &resolved.note;
         let category = &resolved.category;

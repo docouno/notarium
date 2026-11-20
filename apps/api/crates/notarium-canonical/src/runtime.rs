@@ -1,4 +1,5 @@
 mod auxiliary;
+pub(crate) mod disclosure;
 mod lease;
 
 use std::{
@@ -116,6 +117,7 @@ use notarium_core::{ids::RequestId, ports::Cancellation};
 pub(crate) enum SqlDriverState {
     Sqlite {
         writer: Arc<Mutex<Option<crate::sqlite_fast::SqliteWriterPair>>>,
+        disclosures: disclosure::DisclosureLocks,
         fast_read_pool: crate::sqlite_fast::SqliteFastReadPool,
         read_pool: SqlitePool,
         #[allow(dead_code)]
@@ -386,6 +388,7 @@ impl CanonicalRuntime {
                     let db_path = data_root.canonical();
                     (
                         SqlDriverState::Sqlite {
+                            disclosures: Default::default(),
                             writer: Arc::new(Mutex::new(Some(
                                 crate::sqlite_fast::SqliteWriterPair {
                                     sqlx_conn: writer,
@@ -569,8 +572,12 @@ impl CanonicalRuntime {
                 writer,
                 fast_read_pool,
                 read_pool,
+                disclosures,
                 ..
             } => {
+                // The next owner may reopen this data root as soon as shutdown
+                // returns. Settle existing disclosures before releasing ownership.
+                let _disclosures = disclosures.unscoped_mutation().await;
                 fast_read_pool.close_all().await;
                 read_pool.close().await;
                 let mut guard = writer.lock().await;
@@ -788,7 +795,28 @@ impl CanonicalStore {
     where
         F: for<'c> FnOnce(&'c mut BackendConn<'_>) -> crate::BoxFuture<'c, Result<T, PortError>>,
     {
+        self.with_write_tx_for_space(None, op).await
+    }
+
+    pub(crate) async fn with_write_tx_for_space<F, T>(
+        &self,
+        space: Option<SpaceId>,
+        op: F,
+    ) -> Result<T, PortError>
+    where
+        F: for<'c> FnOnce(&'c mut BackendConn<'_>) -> crate::BoxFuture<'c, Result<T, PortError>>,
+    {
         self.ensure_open()?;
+        // Never hold the writer safe point or a database connection while waiting
+        // for a provider that has already pinned this Space.
+        let _space;
+        let _unscoped;
+        if let SqlDriverState::Sqlite { disclosures, .. } = &self.inner.sql {
+            match space {
+                Some(id) => _space = disclosures.mutation(&id).await,
+                None => _unscoped = disclosures.unscoped_mutation().await,
+            }
+        }
         let _commit_gate = if let Some(writer) = self.inner.writer_coord.get() {
             Some(writer.acquire_commit_read_guard().await)
         } else {
@@ -1182,6 +1210,7 @@ impl CanonicalStore {
     pub async fn create_space(&self, spec: CreateSpaceSpec) -> Result<SpaceRecord, PortError> {
         let inner = Arc::clone(&self.inner);
         self.with_auxiliary_command(
+            spec.space_id.clone(),
             None,
             move |record: SpaceRecord| {
                 inner.grant_writer_epoch(&record.space.id, record.active_epoch);
@@ -1224,7 +1253,7 @@ impl CanonicalStore {
         let cmd_id = new_prefixed_hex_id("cmd_")?;
 
         let out = self
-            .with_write_tx(|tx| {
+            .with_write_tx_for_space(Some(spec.scope.space_id.clone()), |tx| {
                 let spec_cl = spec.clone();
                 let slug_fold_cl = slug_fold.clone();
                 let proj_fold_cl = project_slug_fold.clone();
@@ -1476,7 +1505,7 @@ impl CanonicalStore {
 
         let broadcast_scope = scope.clone();
         let out = self
-            .with_write_tx(|tx| {
+            .with_write_tx_for_space(Some(scope.space_id.clone()), |tx| {
                 let new_rev_cl = new_rev.clone();
                 let cmd_cl_in = cmd_id.clone();
                 Box::pin(async move {

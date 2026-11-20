@@ -61,6 +61,7 @@ pub struct ChatSubmission {
 pub struct ChatSubscription {
     stream: StepSubscription,
     cancellation: Cancellation,
+    expires_at: Option<Instant>,
     _revocation: ViewerRevocationLease,
     _buffer: Arc<StepStreamBuffer>,
 }
@@ -70,9 +71,19 @@ impl ChatSubscription {
         let next = tokio::select! {
             biased;
             () = self.cancellation.cancelled() => return StreamRead::Closed,
+            () = async {
+                match self.expires_at {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            } => return StreamRead::Closed,
             next = self.stream.next() => next,
         };
-        if self.cancellation.is_cancelled() {
+        if self.cancellation.is_cancelled()
+            || self
+                .expires_at
+                .is_some_and(|deadline| Instant::now() >= deadline)
+        {
             StreamRead::Closed
         } else {
             next
@@ -308,7 +319,6 @@ impl AgentRunSupervisor {
         thread: ChatThreadId,
         cursor: Option<&StreamCursor>,
     ) -> Result<Option<ChatSubscription>, PortError> {
-        let account = self.live_account(account).await?;
         let cancellation = Cancellation::default();
         let revocation = self.inner.revocations.register_viewer(
             maintenance(account.budget.clone()),
@@ -316,12 +326,13 @@ impl AgentRunSupervisor {
             &scope.space_id,
             cancellation.clone(),
         )?;
-        let account = self.live_account(account).await?;
-        let ctx = SpaceContext::new(
-            account.auth().clone(),
-            scope.clone(),
-            account.budget.clone(),
-        )?;
+        let (auth, expires_at) = self
+            .inner
+            .registry
+            .control()
+            .revalidate_chat_viewer(account.clone())
+            .await?;
+        let ctx = SpaceContext::new(auth, scope.clone(), account.budget)?;
         let branch = self
             .thread_at(ctx.clone(), &thread, ThreadEntrySeq::ZERO)
             .await?;
@@ -334,6 +345,7 @@ impl AgentRunSupervisor {
             Ok(Some(ChatSubscription {
                 stream: run.stream.subscribe(cursor),
                 cancellation,
+                expires_at: expires_at.map(Instant::from_std),
                 _revocation: revocation,
                 _buffer: run.stream.clone(),
             }))
@@ -349,25 +361,48 @@ impl AgentRunSupervisor {
         thread: ChatThreadId,
         run: AgentRunId,
     ) -> Result<(), PortError> {
-        let account = self.live_account(account).await?;
         require_write_bearer(account.auth())?;
         let ctx = SpaceContext::new(
             account.auth().clone(),
             scope.clone(),
             account.budget.clone(),
         )?;
-        let branch = self.thread_at(ctx, &thread, ThreadEntrySeq::ZERO).await?;
+        let ctx = self
+            .inner
+            .registry
+            .control()
+            .fence_canonical_effect(account.auth().clone(), ctx, CanonicalEffect::ChatStop)
+            .await?;
+        let branch = self
+            .thread_at(ctx.clone(), &thread, ThreadEntrySeq::ZERO)
+            .await?;
+        let permit = ctx
+            .canonical_effect()
+            .ok_or_else(|| invalid(ValidationReason::InvalidAuthority))?
+            .begin()
+            .await?;
         let active = self
             .active(&scope, &thread)
             .filter(|active| {
                 active.id == run && active.scope == scope && active.admitted.load(Ordering::Acquire)
             })
             .ok_or(DomainError::ResourceNotFound)?;
-        if active.auth.principal() != account.auth().principal()
-            && &branch.thread.owner != account.auth().principal()
+        if active.auth.principal() != ctx.auth().principal()
+            && !ctx
+                .auth()
+                .spaces()
+                .get(&branch.thread.space)
+                .is_some_and(|grant| {
+                    matches!(
+                        grant.role,
+                        notarium_core::auth::SpaceRole::Owner
+                            | notarium_core::auth::SpaceRole::Editor
+                    )
+                })
         {
             return Err(DomainError::AccessDenied.into());
         }
+        permit.check()?;
         active.cancellation.cancel();
         Ok(())
     }
@@ -381,7 +416,6 @@ impl AgentRunSupervisor {
     ) -> Result<Committed<RollbackResult>, PortError> {
         let service = self.clone();
         detached(async move {
-            let account = service.live_account(account).await?;
             account.auth().authorize_human_management()?;
             let ctx = SpaceContext::new(
                 account.auth().clone(),
@@ -1063,6 +1097,11 @@ fn stream_failure(error: &PortError) -> RunFailure {
         }
         PortError::Domain(DomainError::AccessDenied | DomainError::ResourceNotFound) => {
             RunFailure::HistoryUnavailable
+        }
+        PortError::Domain(DomainError::ValidationFailed { diagnostic })
+            if diagnostic.reason == ValidationReason::ProviderContentFiltered =>
+        {
+            RunFailure::ContentFiltered
         }
         PortError::Domain(DomainError::Provider { .. }) => RunFailure::ProviderUnavailable,
         PortError::Domain(DomainError::ValidationFailed { diagnostic })

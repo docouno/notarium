@@ -258,6 +258,7 @@ async fn submit_tx(
                 body: ChatInputBody::Text(request.body),
                 tool_calls: Vec::new(),
                 provenance: None,
+                interruption: None,
                 proposed_diff: None,
                 referenced_notes: Vec::new(),
                 tainted: false,

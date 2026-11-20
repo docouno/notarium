@@ -376,6 +376,7 @@ pub(super) async fn relocated_empty_folder_blocks_old_and_compacted_history(
                         projects: vec![],
                         compacts_through: None,
                     }),
+                    interruption: None,
                     proposed_diff: None,
                     referenced_notes: vec![],
                     tainted: context.auth().taint().is_tainted(),

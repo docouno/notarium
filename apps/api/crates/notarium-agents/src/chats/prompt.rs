@@ -10,7 +10,7 @@ use notarium_core::{
         ChatBranch, ChatContentRead, ChatEntryKind, ChatPort, ChatProvenance, ChatRead,
         CompletionFinish, CompletionMessage, CompletionRequest, CompletionRole, HydratedChatEntry,
         MAX_PROVIDER_SECONDARY_PROJECTS, PageLimit, ProviderInstruction, ProviderSelection,
-        ProviderToolCallId, SpaceContext,
+        SpaceContext,
     },
 };
 
@@ -36,6 +36,7 @@ pub(crate) fn validate_summary(
 pub(crate) struct History {
     pub branch: ChatBranch,
     messages: Vec<CompletionMessage>,
+    has_tail: bool,
     groups: Vec<HistoryGroup>,
 }
 
@@ -44,7 +45,6 @@ struct HistoryGroup {
     through: ThreadEntrySeq,
     checkpoint: bool,
     starts_with_tool: bool,
-    compactable: bool,
 }
 
 impl History {
@@ -59,6 +59,7 @@ impl History {
             branch,
             messages,
             groups,
+            has_tail,
         } = self;
         let input_ceiling = request.budget.max_input_tokens.min(run_input_ceiling);
         let base = request.messages.len();
@@ -69,7 +70,8 @@ impl History {
         let mut summary = request.clone();
         request.messages.extend(messages);
         let full = completion_input_estimate(&request)?;
-        let wants_summary = full > input_ceiling
+        let wants_summary = has_tail
+            || full > input_ceiling
             || branch.entries.len() >= COMPACTION_ENTRIES
             || (branch.entries.len() > 8 && full > input_ceiling.saturating_mul(3) / 4);
         if wants_summary
@@ -84,7 +86,7 @@ impl History {
             let proof = provenance(&mut summary, Some(through))?;
             return Ok((branch, summary, proof));
         }
-        if full > input_ceiling {
+        if has_tail || full > input_ceiling {
             return Err(invalid(ValidationReason::TokenBudgetExceeded));
         }
         let proof = provenance(&mut request, None)?;
@@ -135,7 +137,7 @@ impl History {
             }
             from = group.end;
             total = total.saturating_add(tokens);
-            eligible &= group.compactable && total <= input_ceiling;
+            eligible &= total <= input_ceiling;
             if eligible
                 && index < latest_message
                 && !group.checkpoint
@@ -226,17 +228,13 @@ pub(crate) async fn load_history_after(
     if floor.is_some_and(|floor| floor > leaf) {
         return Err(invalid(ValidationReason::SourceMismatch));
     }
-    let mut branch = engine
-        .read_chat_context(
-            ctx.clone(),
-            ChatRead {
-                thread: thread.clone(),
-                leaf,
-                before: None,
-                max_entries: PageLimit::new(HISTORY_WINDOW)?,
-            },
-        )
-        .await?;
+    let read = ChatRead {
+        thread: thread.clone(),
+        leaf,
+        before: None,
+        max_entries: PageLimit::new(HISTORY_WINDOW)?,
+    };
+    let mut branch = engine.read_chat_context(ctx.clone(), read.clone()).await?;
     if branch.thread.id != *thread || branch.thread.space != ctx.scope().space_id {
         return Err(invalid(ValidationReason::SourceMismatch));
     }
@@ -246,34 +244,49 @@ pub(crate) async fn load_history_after(
             branch.next_ancestor = None;
         }
     }
-    if branch.next_ancestor.is_some() {
-        return Err(invalid(ValidationReason::BudgetExceeded));
-    }
-    let ids: Vec<_> = branch
-        .entries
-        .iter()
-        .filter(|entry| entry.kind != ChatEntryKind::Redacted)
-        .map(|entry| entry.seq)
-        .collect();
-    let hydrated = if ids.is_empty() {
-        Vec::new()
+    let (hydrated, has_tail) = if branch.next_ancestor.is_some() {
+        let prefix = engine
+            .read_chat_compaction_prefix(ctx.clone(), read)
+            .await?;
+        if prefix.branch.thread.revision != branch.thread.revision
+            || prefix.branch.thread.id != *thread
+            || prefix.branch.thread.space != ctx.scope().space_id
+            || floor
+                .is_some_and(|floor| prefix.branch.entries.iter().any(|entry| entry.seq <= floor))
+        {
+            return Err(invalid(ValidationReason::SourceMismatch));
+        }
+        branch = prefix.branch;
+        (prefix.contents, prefix.has_tail)
     } else {
-        engine
-            .read_chat_contents(
-                ctx.clone(),
-                ChatContentRead {
-                    thread: thread.clone(),
-                    leaf,
-                    entries: ids,
-                },
-            )
-            .await?
+        let entries: Vec<_> = branch
+            .entries
+            .iter()
+            .filter(|entry| entry.kind != ChatEntryKind::Redacted)
+            .map(|entry| entry.seq)
+            .collect();
+        let contents = if entries.is_empty() {
+            Vec::new()
+        } else {
+            engine
+                .read_chat_contents(
+                    ctx.clone(),
+                    ChatContentRead {
+                        thread: thread.clone(),
+                        leaf,
+                        entries,
+                    },
+                )
+                .await?
+        };
+        (contents, false)
     };
     let (messages, groups) = assemble(ctx, &branch, hydrated, selection)?;
     Ok(History {
         branch,
         messages,
         groups,
+        has_tail,
     })
 }
 
@@ -334,13 +347,15 @@ fn assemble(
     while let Some(entry) = entries.next() {
         let item = content.remove(&entry.seq);
         let mut through = entry.seq;
-        let mut compactable = true;
-        let mut tool_rows = 0;
+
         match &entry.kind {
             // Retained entries still carry their original proofs, including
             // any revoked dependency.
             ChatEntryKind::Redacted => continue,
-            ChatEntryKind::Tool { .. } => compactable = false,
+            ChatEntryKind::Tool { .. } => {
+                let item = item.ok_or_else(|| invalid(ValidationReason::SourceMismatch))?;
+                output.push(unpaired_tool_output(typed(item)?)?);
+            }
             ChatEntryKind::Compaction | ChatEntryKind::Human => {
                 let item = item.ok_or_else(|| invalid(ValidationReason::SourceMismatch))?;
                 let role = if entry.kind == ChatEntryKind::Human {
@@ -353,47 +368,49 @@ fn assemble(
             ChatEntryKind::Model => {
                 let mut model = item.ok_or_else(|| invalid(ValidationReason::SourceMismatch))?;
                 let calls = std::mem::take(&mut model.tool_calls);
-                let expected: BTreeSet<_> = calls.iter().map(|call| call.id.as_str()).collect();
-                let mut results = BTreeMap::new();
+                let mut assistant = message(CompletionRole::Assistant, typed(model)?);
+                let mut results = vec![None; calls.len()];
+                let mut unpaired = Vec::new();
                 while let Some(candidate) = entries.peek() {
                     let ChatEntryKind::Tool { call_id } = &candidate.kind else {
                         break;
                     };
                     let candidate = entries.next().expect("peeked tool result");
                     through = candidate.seq;
-                    tool_rows += 1;
                     let item = content
                         .remove(&candidate.seq)
                         .ok_or_else(|| invalid(ValidationReason::SourceMismatch))?;
-                    if expected.contains(call_id.as_str())
-                        && candidate.run == entry.run
-                        && results.insert(call_id.as_str(), item).is_some()
+                    let part = typed(item)?;
+                    if candidate.run == entry.run
+                        && let Some(index) = calls
+                            .iter()
+                            .position(|call| call.id.as_str() == call_id.as_str())
+                        && results[index].is_none()
                     {
-                        return Err(invalid(ValidationReason::SourceMismatch));
+                        let mut result = message(CompletionRole::Tool, part);
+                        result.result_for = Some(calls[index].id.clone());
+                        results[index] = Some(result);
+                    } else {
+                        unpaired.push(unpaired_tool_output(part)?);
                     }
                 }
-                let mut assistant = message(CompletionRole::Assistant, typed(model)?);
-                if results.len() == expected.len() && calls.len() == expected.len() {
-                    compactable = tool_rows == results.len();
-                    let paired = calls
-                        .iter()
-                        .map(|call| {
-                            let item = results
-                                .remove(call.id.as_str())
-                                .ok_or_else(|| invalid(ValidationReason::SourceMismatch))?;
-                            let mut response = message(CompletionRole::Tool, typed(item)?);
-                            response.result_for =
-                                Some(ProviderToolCallId::new(call.id.as_str().to_owned())?);
-                            Ok(response)
-                        })
-                        .collect::<Result<Vec<_>, PortError>>()?;
-                    assistant.tool_calls = calls;
-                    output.push(assistant);
-                    output.extend(paired);
-                } else {
-                    compactable = through == entry.seq;
-                    output.push(assistant);
+                // Cancellation can leave a proper subset of results. Only
+                // replay pairs that really exist, in the original call order.
+                let mut paired = Vec::new();
+                for (call, result) in calls.into_iter().zip(results) {
+                    if let Some(result) = result {
+                        assistant.tool_calls.push(call);
+                        paired.push(result);
+                    }
                 }
+                if assistant.tool_calls.is_empty() && assistant.parts[0].text().is_empty() {
+                    assistant.instruction = Some(ProviderInstruction::from_orchestrator(
+                        "[Recorded assistant turn with no text]".into(),
+                    )?);
+                }
+                output.push(assistant);
+                output.extend(paired);
+                output.extend(unpaired);
             }
         }
         groups.push(HistoryGroup {
@@ -401,7 +418,6 @@ fn assemble(
             through,
             checkpoint: entry.kind == ChatEntryKind::Compaction,
             starts_with_tool: matches!(entry.kind, ChatEntryKind::Tool { .. }),
-            compactable,
         });
     }
     if !content.is_empty() {
@@ -421,6 +437,16 @@ pub(crate) fn system_prompt(
         tool_calls: vec![],
         result_for: None,
     })
+}
+
+// A redacted model or interrupted group can leave an actual tool value
+// without a matching call. Preserve the classified bytes as historical data.
+fn unpaired_tool_output(part: ProviderMessage) -> Result<CompletionMessage, PortError> {
+    let mut output = message(CompletionRole::Assistant, part);
+    output.instruction = Some(ProviderInstruction::from_orchestrator(
+        "[Untrusted historical tool output]".into(),
+    )?);
+    Ok(output)
 }
 
 fn message(role: CompletionRole, part: ProviderMessage) -> CompletionMessage {

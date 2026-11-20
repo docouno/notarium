@@ -61,6 +61,7 @@ pub(crate) async fn move_folder_impl(
             .unwrap_or("<root>")
     );
     let idemp = derive_command_identity_spec(&request.identity, "move_folder", fp.as_bytes())
+        .with_canonical_effect(&ctx)
         .with_preconditions(
             &request.preconditions,
             "folder",
@@ -423,6 +424,7 @@ pub(crate) async fn rename_folder_impl(
         request.input.name
     );
     let idemp = derive_command_identity_spec(&request.identity, "rename_folder", fp.as_bytes())
+        .with_canonical_effect(&ctx)
         .with_preconditions(
             &request.preconditions,
             "folder",
@@ -695,6 +697,7 @@ pub(crate) async fn rename_project_impl(
         request.input.display_name
     );
     let idemp = derive_command_identity_spec(&request.identity, "rename_project", fp.as_bytes())
+        .with_canonical_effect(&ctx)
         .with_preconditions(
             &request.preconditions,
             "folder",

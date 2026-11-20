@@ -470,6 +470,7 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
                 AppendChat {
                     tool_calls: Vec::new(),
                     provenance: None,
+                    interruption: None,
                     proposed_diff: None,
                     thread: thread.clone(),
                     parent: ThreadEntrySeq::ZERO,
@@ -500,6 +501,7 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
                 AppendChat {
                     tool_calls: Vec::new(),
                     provenance: None,
+                    interruption: None,
                     proposed_diff: None,
                     thread: thread.clone(),
                     parent: e1.seq,
@@ -536,6 +538,7 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
                 AppendChat {
                     tool_calls: Vec::new(),
                     provenance: None,
+                    interruption: None,
                     proposed_diff: None,
                     thread: thread.clone(),
                     parent: e1.seq,
@@ -566,6 +569,7 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
                 AppendChat {
                     tool_calls: Vec::new(),
                     provenance: None,
+                    interruption: None,
                     proposed_diff: None,
                     thread: thread.clone(),
                     parent: e1.seq,
@@ -662,6 +666,7 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
                 AppendChat {
                     tool_calls: Vec::new(),
                     provenance: None,
+                    interruption: None,
                     proposed_diff: None,
                     thread: thread.clone(),
                     parent: e1.seq,
@@ -711,6 +716,7 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
                     AppendChat {
                         tool_calls: Vec::new(),
                         provenance: None,
+                        interruption: None,
                         proposed_diff: None,
                         thread: thread.clone(),
                         parent: branch_b_tip,
@@ -743,6 +749,7 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
                         AppendChat {
                             tool_calls: Vec::new(),
                             provenance: None,
+                            interruption: None,
                             proposed_diff: None,
                             thread: thread.clone(),
                             parent: branch_b_tip,
@@ -768,6 +775,7 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
                     AppendChat {
                         tool_calls: Vec::new(),
                         provenance: None,
+                        interruption: None,
                         proposed_diff: None,
                         thread: thread.clone(),
                         parent: cur_a,
@@ -960,6 +968,7 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
             body: ChatInputBody::Text("A post on a sibling branch".into()),
             tool_calls: Vec::new(),
             provenance: None,
+            interruption: None,
             proposed_diff: None,
             referenced_notes: Vec::new(),
             tainted: false,
@@ -1439,6 +1448,7 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
         AppendChat {
             tool_calls: Vec::new(),
             provenance: None,
+            interruption: None,
             proposed_diff: None,
             thread: thread.clone(),
             parent: cur_a,
@@ -1465,6 +1475,7 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
                 AppendChat {
                     tool_calls: Vec::new(),
                     provenance: None,
+                    interruption: None,
                     proposed_diff: None,
                     thread: thread.clone(),
                     parent: comp_a.seq,
@@ -1490,6 +1501,7 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
                 AppendChat {
                     tool_calls: Vec::new(),
                     provenance: None,
+                    interruption: None,
                     proposed_diff: None,
                     thread: thread.clone(),
                     parent: branch_b_tip,
@@ -1672,6 +1684,7 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
                 AppendChat {
                     tool_calls: Vec::new(),
                     provenance: None,
+                    interruption: None,
                     proposed_diff: None,
                     thread: thread.clone(),
                     parent: cur_a,
@@ -1696,6 +1709,7 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
                 AppendChat {
                     tool_calls: Vec::new(),
                     provenance: None,
+                    interruption: None,
                     proposed_diff: None,
                     thread: thread.clone(),
                     parent: tainted_append.seq,
@@ -1802,6 +1816,7 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
                 AppendChat {
                     tool_calls: Vec::new(),
                     provenance: None,
+                    interruption: None,
                     proposed_diff: None,
                     thread: group_thread.clone(),
                     parent: ThreadEntrySeq::ZERO,
@@ -1854,6 +1869,7 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
                     AppendChat {
                         tool_calls: Vec::new(),
                         provenance: None,
+                        interruption: None,
                         proposed_diff: None,
                         thread: redact_thread.clone(),
                         parent: ThreadEntrySeq::ZERO,
@@ -2027,6 +2043,7 @@ async fn run_ten_thousand_entry_chat_dag_read_suite(store: &CanonicalStore) {
                 AppendChat {
                     tool_calls: Vec::new(),
                     provenance: None,
+                    interruption: None,
                     proposed_diff: None,
                     thread: thread.clone(),
                     parent: ThreadEntrySeq::ZERO,
@@ -2061,6 +2078,7 @@ async fn run_ten_thousand_entry_chat_dag_read_suite(store: &CanonicalStore) {
                             AppendChat {
                                 tool_calls: Vec::new(),
                                 provenance: None,
+                                interruption: None,
                                 proposed_diff: None,
                                 thread: th.clone(),
                                 parent: tip,
@@ -2102,6 +2120,7 @@ async fn run_ten_thousand_entry_chat_dag_read_suite(store: &CanonicalStore) {
                     AppendChat {
                         tool_calls: Vec::new(),
                         provenance: None,
+                        interruption: None,
                         proposed_diff: None,
                         thread: thread.clone(),
                         parent: tip,
@@ -3354,6 +3373,7 @@ async fn l7_sqlite_chats_jobs_collab_and_crash_fenced_recovery() {
             AppendChat {
                 tool_calls: Vec::new(),
                 provenance: None,
+                interruption: None,
                 proposed_diff: None,
                 thread: staging_thread.clone(),
                 parent: ThreadEntrySeq::ZERO,
@@ -3976,6 +3996,7 @@ async fn chat_receipts_preserve_body_and_reference_boundaries() {
             AppendChat {
                 tool_calls: Vec::new(),
                 provenance: None,
+                interruption: None,
                 proposed_diff: None,
                 thread: thread.clone(),
                 parent: ThreadEntrySeq::ZERO,

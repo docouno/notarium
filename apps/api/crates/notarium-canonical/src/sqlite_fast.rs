@@ -20,7 +20,7 @@ use notarium_core::{
     model::{HistoryScope, Lifecycle, NoteRef, PathTarget},
     ports::{
         CallBudget, CommandSeqRange, CreateNote, GetNote, NoteRevision, NoteSnapshot,
-        Preconditions, RollbackAgentRun, SpaceContext,
+        Preconditions, RevocationLease, RollbackAgentRun, SpaceContext,
     },
     query::{FieldObservation, FieldSchema, FieldValue},
     receipt::{CausalBasis, CommandIdentity, MutationReceiptToken},
@@ -58,8 +58,9 @@ use crate::{
             StoredCommittedRollbackV1, extract_agent_run_from_auth, note_rank_version_digest,
         },
         notes::{
-            EvaluatedFields, PreparedCarrierInfo, build_carrier_replacement_intent,
-            build_create_note_intent, changed_note_fields, revision_fields,
+            CarrierReplacement, EvaluatedFields, PreparedCarrierInfo,
+            build_carrier_replacement_intent, build_create_note_intent, changed_note_fields,
+            revision_fields,
         },
         rollback::{
             CandidateAction, RollbackRevision, build_rollback_direct_single_tx_exec,
@@ -70,7 +71,7 @@ use crate::{
     runtime::{FolderHeadRow, SqlDriverState},
     wal::{SqliteWalCoordinator, read_cancelled},
     writer::{
-        BatchEventDraft, BatchExecOutcome, ChangePayloadDraft, CommandIdentitySpec,
+        BatchEventDraft, BatchExecOutcome, ChangePayloadDraft, CommandIdentitySpec, CommitAction,
         ItemCommitArtifacts, ItemExecCtx, ItemExecuteFn, ItemOutcomeSlot, PreparedWriteIntent,
         SemanticCutMismatchKind, SpaceBatchEntry, StoredReceiptRow, WriterFaultState,
     },
@@ -1531,6 +1532,10 @@ impl DeferredAppendRows {
 pub(crate) trait SqliteSyncItemPlan: Send {
     fn take_deferred_local_staging(&self) -> Option<DeferredLocalStaging>;
 
+    fn supports_canonical_effect(&self) -> bool {
+        false
+    }
+
     fn phase1_receipt_checked_at_gen(&self) -> Option<u64> {
         None
     }
@@ -1566,6 +1571,7 @@ struct FastBatchPendingWaves {
     batch_dir_syncs: PendingDirSyncs,
     batch_retained_tickets: Vec<StagedBlobTicket>,
     batch_retained_guards: Vec<Box<dyn Send>>,
+    after_commit: Vec<CommitAction>,
     slots: Vec<ItemOutcomeSlot>,
 }
 
@@ -1648,6 +1654,7 @@ pub(crate) async fn execute_sqlite_fast_batch(
 
     let stage1_fut = tokio::task::spawn_blocking(move || {
         let mut approval_tx_opt = Some(wave_approval_tx);
+        let mut active_effect = None;
         let stage = run_sqlite_fast_sql_stage(
             &rconn,
             fast_items,
@@ -1656,6 +1663,7 @@ pub(crate) async fn execute_sqlite_fast_batch(
             has_external_stagings,
             current_writer_gen,
             &mut approval_tx_opt,
+            &mut active_effect,
         );
         if let Some(tx) = approval_tx_opt.take() {
             match &stage {
@@ -1674,7 +1682,7 @@ pub(crate) async fn execute_sqlite_fast_batch(
                 }
             }
         }
-        (rconn, stage)
+        (rconn, stage, active_effect)
     });
 
     let local_cas_fut = async {
@@ -1736,7 +1744,8 @@ pub(crate) async fn execute_sqlite_fast_batch(
             }
         };
 
-    let (mut rconn, stage1_res) = match stage1_join {
+    // Keep any active effect until the SQL acknowledgement or connection cleanup.
+    let (mut rconn, stage1_res, _active_effect) = match stage1_join {
         Ok(pair_out) => pair_out,
         Err(join_err) => {
             store
@@ -1890,6 +1899,9 @@ pub(crate) async fn execute_sqlite_fast_batch(
                     drop(pending.batch_retained_tickets);
                     drop(pending.batch_retained_guards);
 
+                    for action in pending.after_commit {
+                        action.settle(commit_res.is_ok());
+                    }
                     match commit_res {
                         Ok(()) => {
                             if let Some(w) = wal_opt.as_deref() {
@@ -1979,6 +1991,7 @@ fn finalize_committed_batch(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_sqlite_fast_sql_stage(
     conn: &rusqlite::Connection,
     items: Vec<(FastIntentMeta, Box<dyn SqliteSyncItemPlan>)>,
@@ -1987,8 +2000,21 @@ fn run_sqlite_fast_sql_stage(
     has_external_stagings: bool,
     current_writer_gen: u64,
     approval_tx_opt: &mut Option<tokio::sync::oneshot::Sender<EarlyWaveApproval>>,
+    active_effect: &mut Option<Box<dyn RevocationLease>>,
 ) -> FastSqlStageResult {
-    if items.len() > 1 && items.iter().any(|(_, p)| p.requires_savepoint_isolation()) {
+    let guarded = items.iter().any(|(meta, _)| {
+        meta.idempotency
+            .as_ref()
+            .and_then(CommandIdentitySpec::canonical_effect)
+            .is_some()
+    });
+    if guarded && !(items.len() == 1 && items[0].1.supports_canonical_effect()) {
+        return FastSqlStageResult::AbortedBeforeCommit(internal_not_committed(
+            "sqlite_fast_guarded_plan",
+            "guarded rollback requires its own SQLite transaction",
+        ));
+    }
+    if guarded || (items.len() > 1 && items.iter().any(|(_, p)| p.requires_savepoint_isolation())) {
         return run_savepoint_fallback_sql_stage(
             conn,
             &items,
@@ -1996,6 +2022,7 @@ fn run_sqlite_fast_sql_stage(
             wal,
             has_external_stagings,
             current_writer_gen,
+            active_effect,
         );
     }
     match try_run_optimistic_fast_sql_stage(
@@ -2018,6 +2045,7 @@ fn run_sqlite_fast_sql_stage(
                 wal,
                 has_external_stagings,
                 current_writer_gen,
+                active_effect,
             )
         }
     }
@@ -2082,6 +2110,7 @@ fn try_run_optimistic_fast_sql_stage(
     let mut batch_dir_syncs = PendingDirSyncs::default();
     let mut batch_retained_tickets: Vec<StagedBlobTicket> = Vec::with_capacity(items.len());
     let mut batch_retained_guards: Vec<Box<dyn Send>> = Vec::new();
+    let mut after_commit = Vec::new();
     let mut slots: Vec<ItemOutcomeSlot> = Vec::with_capacity(items.len());
     let mut cache = FastBatchSqlCache {
         current_writer_gen,
@@ -2148,6 +2177,7 @@ fn try_run_optimistic_fast_sql_stage(
                 dir_syncs,
                 retained_tickets,
                 retained_guards,
+                commit_action,
             }) => {
                 if let Some(SpaceBatchEntry::Loaded {
                     effective_cut,
@@ -2163,6 +2193,7 @@ fn try_run_optimistic_fast_sql_stage(
                 batch_dir_syncs.merge(&dir_syncs);
                 batch_retained_tickets.extend(retained_tickets);
                 batch_retained_guards.extend(retained_guards);
+                after_commit.extend(commit_action);
                 slots.push(ItemOutcomeSlot::Succeeded {
                     response_bytes,
                     has_idempotency: has_idemp,
@@ -2191,9 +2222,11 @@ fn try_run_optimistic_fast_sql_stage(
         batch_dir_syncs,
         batch_retained_tickets,
         batch_retained_guards,
+        after_commit,
         slots,
         wal,
         has_external_stagings,
+        None,
     ))
 }
 
@@ -2204,6 +2237,7 @@ fn run_savepoint_fallback_sql_stage(
     wal: Option<&SqliteWalCoordinator>,
     has_external_stagings: bool,
     current_writer_gen: u64,
+    active_effect: &mut Option<Box<dyn RevocationLease>>,
 ) -> FastSqlStageResult {
     if let Err(err) = conn.execute_batch("BEGIN IMMEDIATE") {
         if let Some(w) = wal {
@@ -2213,6 +2247,22 @@ fn run_savepoint_fallback_sql_stage(
             "sqlite_begin_immediate",
             err.to_string(),
         ));
+    }
+
+    if let [(meta, _)] = items
+        && let Some(effect) = meta
+            .idempotency
+            .as_ref()
+            .and_then(CommandIdentitySpec::canonical_effect)
+    {
+        // This is a blocking worker with the SQLite write transaction open.
+        match tokio::runtime::Handle::current().block_on(effect.begin()) {
+            Ok(lease) => *active_effect = Some(lease),
+            Err(error) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                return FastSqlStageResult::AbortedBeforeCommit(error);
+            }
+        }
     }
 
     let committed_at_ms = match now_unix_ms() {
@@ -2236,12 +2286,16 @@ fn run_savepoint_fallback_sql_stage(
     let mut batch_dir_syncs = PendingDirSyncs::default();
     let mut batch_retained_tickets: Vec<StagedBlobTicket> = Vec::new();
     let mut batch_retained_guards: Vec<Box<dyn Send>> = Vec::new();
+    let mut after_commit = Vec::new();
     let mut slots: Vec<ItemOutcomeSlot> = Vec::with_capacity(items.len());
     let mut cache = FastBatchSqlCache {
         current_writer_gen,
         ..FastBatchSqlCache::default()
     };
 
+    // A guarded singleton aborts the entire transaction on error. It can use
+    // the same batched revision and event inserts as an optimistic native write.
+    let mut deferred = active_effect.is_some().then(DeferredAppendRows::default);
     let use_savepoint = items.len() > 1;
     for (meta, plan) in items {
         let space_id = meta.scope.space_id.clone();
@@ -2292,7 +2346,7 @@ fn run_savepoint_fallback_sql_stage(
             committed_at_ms,
             expires_at_ms,
             current_writer_gen,
-            None,
+            deferred.as_mut(),
         );
 
         match item_res {
@@ -2303,6 +2357,7 @@ fn run_savepoint_fallback_sql_stage(
                 dir_syncs,
                 retained_tickets,
                 retained_guards,
+                commit_action,
             }) => {
                 if use_savepoint && let Err(err) = conn.execute_batch("RELEASE SAVEPOINT sp_item") {
                     if let Some(w) = wal {
@@ -2328,6 +2383,7 @@ fn run_savepoint_fallback_sql_stage(
                 batch_dir_syncs.merge(&dir_syncs);
                 batch_retained_tickets.extend(retained_tickets);
                 batch_retained_guards.extend(retained_guards);
+                after_commit.extend(commit_action);
                 slots.push(ItemOutcomeSlot::Succeeded {
                     response_bytes,
                     has_idempotency: has_idemp,
@@ -2361,15 +2417,23 @@ fn run_savepoint_fallback_sql_stage(
         }
     }
 
+    if let Some(rows) = deferred
+        && let Err(error) = rows.flush(conn)
+    {
+        let _ = conn.execute_batch("ROLLBACK");
+        return FastSqlStageResult::AbortedBeforeCommit(error);
+    }
     finish_fast_sql_stage(
         conn,
         space_states,
         batch_dir_syncs,
         batch_retained_tickets,
         batch_retained_guards,
+        after_commit,
         slots,
         wal,
         has_external_stagings,
+        active_effect.as_deref(),
     )
 }
 
@@ -2380,9 +2444,11 @@ fn finish_fast_sql_stage(
     batch_dir_syncs: PendingDirSyncs,
     batch_retained_tickets: Vec<StagedBlobTicket>,
     batch_retained_guards: Vec<Box<dyn Send>>,
+    after_commit: Vec<CommitAction>,
     slots: Vec<ItemOutcomeSlot>,
     wal: Option<&SqliteWalCoordinator>,
     has_external_stagings: bool,
+    active_effect: Option<&dyn RevocationLease>,
 ) -> FastSqlStageResult {
     for entry in space_states.values() {
         if let SpaceBatchEntry::Loaded {
@@ -2416,8 +2482,17 @@ fn finish_fast_sql_stage(
 
     if !has_external_stagings && !has_deferred_publish && !has_dir_syncs {
         let _ = crate::wal::take_last_wal_commit_frames();
+        if let Some(effect) = active_effect
+            && let Err(error) = effect.check()
+        {
+            let _ = conn.execute_batch("ROLLBACK");
+            return FastSqlStageResult::AbortedBeforeCommit(error);
+        }
         match conn.execute_batch("COMMIT") {
             Ok(()) => {
+                for action in after_commit {
+                    action.settle(true);
+                }
                 let wal_frames = crate::wal::take_last_wal_commit_frames();
                 drop(batch_retained_tickets);
                 drop(batch_retained_guards);
@@ -2428,6 +2503,11 @@ fn finish_fast_sql_stage(
                 }
             }
             Err(commit_err) => {
+                if conn.is_autocommit() {
+                    for action in after_commit {
+                        action.settle(false);
+                    }
+                }
                 if let Some(w) = wal {
                     record_rusqlite_busy(w, &commit_err);
                 }
@@ -2439,12 +2519,21 @@ fn finish_fast_sql_stage(
                 }
             }
         }
+    } else if active_effect.is_some() {
+        // Native rollback only rebinds existing blobs. A plan that stages new
+        // content needs the ordinary writer's admission across its CAS waves.
+        let _ = conn.execute_batch("ROLLBACK");
+        FastSqlStageResult::AbortedBeforeCommit(internal_not_committed(
+            "guarded_sqlite_rollback_staging",
+            "guarded rollback unexpectedly staged content",
+        ))
     } else {
         FastSqlStageResult::NeedsLocalWaves(FastBatchPendingWaves {
             space_states,
             batch_dir_syncs,
             batch_retained_tickets,
             batch_retained_guards,
+            after_commit,
             slots,
         })
     }
@@ -2457,6 +2546,7 @@ struct FastSingleItemSuccess {
     dir_syncs: PendingDirSyncs,
     retained_tickets: Vec<StagedBlobTicket>,
     retained_guards: Vec<Box<dyn Send>>,
+    commit_action: Option<CommitAction>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2506,11 +2596,14 @@ fn execute_single_fast_item(
         let existing_opt = if let Some(in_batch) = cache.in_batch_receipts.get(&rcpt_key) {
             authorize_replay_rusqlite(conn, &meta.scope, idemp)
                 .map_err(FastItemExecError::PreWrite)?;
-            Some(StoredReceiptRow {
+            let receipt = StoredReceiptRow {
                 command_hash: in_batch.command_hash,
                 status: in_batch.status.clone(),
                 response_blob: in_batch.response_blob.clone(),
-            })
+            };
+            authorize_rollback_disclosures_rusqlite(conn, &meta.scope, idemp, &receipt)
+                .map_err(FastItemExecError::PreWrite)?;
+            Some(receipt)
         } else if plan.phase1_receipt_checked_at_gen() == Some(current_writer_gen) {
             None
         } else {
@@ -2531,6 +2624,7 @@ fn execute_single_fast_item(
                     dir_syncs: PendingDirSyncs::default(),
                     retained_tickets: Vec::new(),
                     retained_guards: Vec::new(),
+                    commit_action: None,
                 }),
                 _ => Err(FastItemExecError::PreWrite(unavailable_retryable(
                     "command_receipt_pending",
@@ -2611,6 +2705,7 @@ fn execute_single_fast_item(
         }
     }
 
+    let commit_action = item_ctx.take_after_commit();
     let (receipt_status, dir_syncs, retained_tickets, retained_guards) =
         item_ctx.into_batch_parts();
 
@@ -2750,6 +2845,7 @@ fn execute_single_fast_item(
             dir_syncs,
             retained_tickets,
             retained_guards,
+            commit_action,
         });
     }
 
@@ -2805,6 +2901,7 @@ fn execute_single_fast_item(
         dir_syncs,
         retained_tickets,
         retained_guards,
+        commit_action,
     })
 }
 
@@ -3357,7 +3454,10 @@ impl SqliteSyncItemPlan for CarrierReplacementFastPlan {
             me.preconditions,
             me.note_id,
             me.expected_base_rev,
-            me.explicit_slug_override,
+            match me.explicit_slug_override {
+                Some((slug, folded)) => CarrierReplacement::Rename(slug, folded),
+                None => CarrierReplacement::Edit,
+            },
             me.info,
             me.ticket,
             None,
@@ -3958,7 +4058,7 @@ fn authorize_replay_rusqlite(
     scope: &HistoryScope,
     idemp: &CommandIdentitySpec,
 ) -> Result<(), PortError> {
-    use crate::writer::replay::{ReplayPolicy, ReplayResource, authorize_head, destination};
+    use crate::writer::replay::ReplayPolicy;
     let Some(crate::writer::replay::ReplayAuthority { auth, policy, .. }) =
         idemp.authority.as_deref()
     else {
@@ -3966,13 +4066,51 @@ fn authorize_replay_rusqlite(
     };
     let srec = load_space_record_rusqlite(conn, &scope.space_id)?;
     srec.scope.check(scope)?;
-    let ReplayPolicy::Documents(targets) = policy else {
+    let (ReplayPolicy::Documents(targets) | ReplayPolicy::RollbackDocuments(targets)) = policy
+    else {
         return Err(internal_not_committed(
             "unsupported_fast_replay",
             "command requires the general writer",
         ));
     };
     auth.authorize_space_write(&srec.space)?;
+    authorize_replay_targets_rusqlite(conn, &srec, auth, targets)
+}
+
+fn authorize_rollback_disclosures_rusqlite(
+    conn: &rusqlite::Connection,
+    scope: &HistoryScope,
+    idemp: &CommandIdentitySpec,
+    receipt: &StoredReceiptRow,
+) -> Result<(), PortError> {
+    use crate::writer::replay::ReplayResource;
+    let disclosed = idemp.rollback_disclosures(scope, receipt)?;
+    if disclosed.is_empty() {
+        return Ok(());
+    }
+    let srec = load_space_record_rusqlite(conn, &scope.space_id)?;
+    let auth = &idemp.authority.as_ref().expect("rollback authority").auth;
+    let mut targets = Vec::with_capacity(disclosed.len());
+    for (note, is_view) in disclosed {
+        if is_note_purge_fenced_rusqlite(conn, &scope.space_id, note.as_str())? {
+            return Err(DomainError::ResourceNotFound.into());
+        }
+        targets.push(if is_view {
+            ReplayResource::View(note)
+        } else {
+            ReplayResource::Read(note)
+        });
+    }
+    authorize_replay_targets_rusqlite(conn, &srec, auth, &targets)
+}
+
+fn authorize_replay_targets_rusqlite(
+    conn: &rusqlite::Connection,
+    srec: &SpaceRecord,
+    auth: &EngineAuthContext,
+    targets: &[crate::writer::replay::ReplayResource],
+) -> Result<(), PortError> {
+    use crate::writer::replay::{ReplayResource, authorize_head, destination};
     for target in targets {
         let note = match target {
             ReplayResource::WriteFolder(folder) => {
@@ -4012,7 +4150,7 @@ fn authorize_replay_rusqlite(
         {
             return Err(DomainError::ResourceNotFound.into());
         }
-        let head = load_note_head_row_opt_rusqlite(conn, &scope.space_id, note)?;
+        let head = load_note_head_row_opt_rusqlite(conn, &srec.space.id, note)?;
         if let Some((parent, class)) = destination(target, head.as_ref().map(|h| h.doc_class)) {
             let (facts, _) = build_resource_facts_rusqlite(
                 conn,
@@ -4107,11 +4245,13 @@ fn lookup_command_receipt_rusqlite(
         sanitized_blob
     };
 
-    Ok(Some(StoredReceiptRow {
+    let receipt = StoredReceiptRow {
         command_hash: ContentDigest::from_bytes(arr),
         status,
         response_blob: effective_blob,
-    }))
+    };
+    authorize_rollback_disclosures_rusqlite(conn, scope, idemp, &receipt)?;
+    Ok(Some(receipt))
 }
 
 fn is_note_purge_fenced_rusqlite(
@@ -5723,6 +5863,10 @@ pub(crate) fn build_rollback_direct_sqlite_fast_intent(
 }
 
 impl SqliteSyncItemPlan for RollbackDirectSqliteFastPlan {
+    fn supports_canonical_effect(&self) -> bool {
+        true
+    }
+
     fn take_deferred_local_staging(&self) -> Option<DeferredLocalStaging> {
         None
     }
@@ -5756,7 +5900,7 @@ impl SqliteSyncItemPlan for RollbackDirectSqliteFastPlan {
         let input = &self.input;
 
         // --- 1. Read-only preconditions & pure validation (zero SQL mutations) ---
-        if has_any_board_moves_in_space_rusqlite(conn, &scope_cl.space_id)
+        if has_rollback_board_history_rusqlite(conn, &scope_cl.space_id, &input.run)
             .map_err(FastItemExecError::PreWrite)?
         {
             return Err(FastItemExecError::PreWrite(
@@ -5862,6 +6006,11 @@ impl SqliteSyncItemPlan for RollbackDirectSqliteFastPlan {
                 let has_stored_state: bool = row.get(5).map_err(map_history_error)?;
                 closed_room_has_stored_state.insert(nid.clone(), has_stored_state);
             }
+            if head.doc_class == DocClass::Skill || head.ability_id.is_some() {
+                return Err(FastItemExecError::PreWrite(
+                    crate::domain::rollback::rollback_fallback_ability_slot_err(),
+                ));
+            }
             let pre_raw: Option<String> = row.get(2).map_err(map_history_error)?;
             let Some(pre_raw) = pre_raw else {
                 let bytes: Vec<u8> = row.get(6).map_err(map_history_error)?;
@@ -5951,6 +6100,11 @@ impl SqliteSyncItemPlan for RollbackDirectSqliteFastPlan {
             } = action
             {
                 let require_active_folder = pre_meta.lifecycle == Lifecycle::Active;
+                if pre_meta.ability_id.is_some() {
+                    return Err(FastItemExecError::PreWrite(
+                        crate::domain::rollback::rollback_fallback_ability_slot_err(),
+                    ));
+                }
                 let (after, anc) = build_resource_facts_cached(
                     conn,
                     cache,
@@ -6152,13 +6306,12 @@ impl SqliteSyncItemPlan for RollbackDirectSqliteFastPlan {
             .preview_seq_range(total_seqs)
             .map_err(FastItemExecError::PreWrite)?;
 
-        // Consume all closed-room reservations in ascending NoteId order after all PreWrite checks pass.
-        for (mut guard, res) in locked_fences {
-            guard
-                .consume(res, &self.request_identity)
-                .map_err(|e| FastItemExecError::PreWrite(e.into()))?;
-            item_ctx.retain_until_batch_commit(guard);
-        }
+        crate::domain::rollback::stage_rollback_fences(
+            item_ctx,
+            locked_fences,
+            &self.request_identity,
+        )
+        .map_err(FastItemExecError::PreWrite)?;
 
         // --- 2. Authoritative SQL writes ---
         let vis_i64 = visibility_seq.get() as i64;
@@ -6800,15 +6953,8 @@ impl SqliteSyncItemPlan for RollbackDirectSqliteFastPlan {
             receipt: receipt_token.clone(),
         };
         let resp_bytes = encode_msgpack(&wire).map_err(FastItemExecError::PostWrite)?;
-        let sanitized = encode_msgpack(&StoredCommittedRollbackV1 {
-            restored: Vec::new(),
-            trashed: Vec::new(),
-            restored_ranks: Vec::new(),
-            skipped_manual_edits,
-            skipped_room_active,
-            receipt: receipt_token,
-        })
-        .map_err(FastItemExecError::PostWrite)?;
+        let sanitized = encode_msgpack(&StoredCommittedRollbackV1::sanitized(receipt_token))
+            .map_err(FastItemExecError::PostWrite)?;
 
         Ok(ItemCommitArtifacts {
             command_id: format!(
@@ -6820,7 +6966,7 @@ impl SqliteSyncItemPlan for RollbackDirectSqliteFastPlan {
             change_payload: Some(effect_draft),
             receipt_detail_blob: Some(resp_bytes.clone()),
             receipt_sanitized_blob: sanitized,
-            receipt_owner_note_ids: owner_vec,
+            receipt_owner_note_ids: wire.receipt_owners(owner_vec),
             response_bytes: resp_bytes,
         })
     }
@@ -6941,18 +7087,16 @@ fn load_revision_meta_bytes_rusqlite(
     .map_err(|err| map_interrupt_or_internal(err, "sqlite_load_rev_meta_fast"))
 }
 
-fn has_any_board_moves_in_space_rusqlite(
+fn has_rollback_board_history_rusqlite(
     conn: &rusqlite::Connection,
     space_id: &SpaceId,
+    run: &AgentRunId,
 ) -> Result<bool, PortError> {
     let mut stmt = conn
-        .prepare_cached("SELECT 1 FROM board_move_history WHERE space_id = ?1 LIMIT 1")
+        .prepare_cached(include_str!("domain/rollback/sqlite_board_history.sql"))
         .map_err(|err| internal_not_committed("sqlite_has_bmh", err.to_string()))?;
-    let found: Option<i64> = stmt
-        .query_row(params![space_id.as_str()], |r| r.get(0))
-        .optional()
-        .map_err(|err| map_interrupt_or_internal(err, "sqlite_has_bmh"))?;
-    Ok(found.is_some())
+    stmt.query_row(params![space_id.as_str(), run.as_str()], |row| row.get(0))
+        .map_err(|err| map_interrupt_or_internal(err, "sqlite_has_bmh"))
 }
 
 fn has_any_overlays_in_space_rusqlite(

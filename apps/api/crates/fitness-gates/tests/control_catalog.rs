@@ -799,21 +799,56 @@ async fn empty_folder_disclosure(
         .unwrap();
     assert_eq!(lease.current()[0].origin(), origin);
     assert!(lease.current()[0].in_project(project));
-    lease.mark_dispatched();
-    canonical
-        .rename_folder(
-            scoped.clone(),
-            mutation(
-                scoped,
-                96,
-                RenameFolder {
-                    folder: folder.folder_id,
-                    name: "renamed".into(),
+    let mut second = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        canonical.acquire_egress(account.clone(), request.clone(), Cancellation::default()),
+    )
+    .await
+    .expect("two disclosures can share the same Space")
+    .unwrap();
+    let mut rename = Box::pin(canonical.rename_folder(
+        scoped.clone(),
+        mutation(
+            scoped,
+            96,
+            RenameFolder {
+                folder: folder.folder_id,
+                name: "renamed".into(),
+            },
+        ),
+    ));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(20), &mut rename)
+            .await
+            .is_err()
+    );
+    let owner = account.auth().principal().clone();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        canonical.ensure_space(
+            budget(),
+            EnsureCatalogSpace {
+                identity: support::command(&owner, &owner, 98, ControlRevision::ZERO),
+                owner,
+                space: CreateSpace {
+                    id: SpaceId::from_bytes([98; 16]),
+                    kind: SpaceKind::Shared,
+                    name: "Concurrent workspace".into(),
                 },
-            ),
-        )
-        .await
-        .unwrap();
+            },
+        ),
+    )
+    .await
+    .expect("independent Space can commit during disclosure")
+    .unwrap();
+    lease.mark_dispatched();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(20), &mut rename)
+            .await
+            .is_err()
+    );
+    second.mark_dispatched();
+    rename.await.unwrap();
     assert!(matches!(
         canonical
             .acquire_egress(account.clone(), request, Cancellation::default())

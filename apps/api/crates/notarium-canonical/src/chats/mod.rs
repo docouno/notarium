@@ -4,12 +4,37 @@ mod queue;
 mod staging;
 mod submission;
 
+#[cfg(feature = "test-support")]
+pub mod preparation_test {
+    use std::{cell::Cell, future::Future, sync::Arc};
+    use tokio::sync::Barrier;
+
+    tokio::task_local! {
+        static PAUSE: Cell<Option<Arc<Barrier>>>;
+    }
+
+    /// Let a competing command commit after this command's receipt miss and
+    /// before its prefix validation or first proof page.
+    pub async fn pause_once<T>(barrier: Arc<Barrier>, command: impl Future<Output = T>) -> T {
+        PAUSE.scope(Cell::new(Some(barrier)), command).await
+    }
+
+    pub(super) async fn pause() {
+        if let Ok(Some(barrier)) = PAUSE.try_with(Cell::take) {
+            barrier.wait().await;
+            barrier.wait().await;
+        }
+    }
+}
+
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
 
-pub(crate) use content::{load_current_chat_for_egress_tx, verify_confirmed_chat_step_tx};
+pub(crate) use content::{
+    chat_source_tx, load_current_chat_for_egress_tx, verify_confirmed_chat_step_tx,
+};
 use notarium_core::{
     DomainError,
     auth::{EngineAuthContext, PrincipalKind, Space, SpaceKind, SpaceLifecycle},
@@ -428,6 +453,14 @@ impl ChatPort for CanonicalStore {
         Box::pin(compaction::context(self, ctx, request))
     }
 
+    fn read_chat_compaction_prefix(
+        &self,
+        ctx: SpaceContext,
+        request: ChatRead,
+    ) -> PortFuture<'_, notarium_core::ports::ChatCompactionPrefix> {
+        Box::pin(compaction::hydrated_prefix(self, ctx, request))
+    }
+
     fn read_chat_contents(
         &self,
         ctx: SpaceContext,
@@ -613,51 +646,59 @@ impl CanonicalStore {
         let publish_ticket = ticket.clone();
         let publisher = self.clone();
         let value = self
-            .with_auxiliary_command(Some((&ctx.budget, deadline)), Ok, move |tx| {
-                Box::pin(async move {
-                    let live_space =
-                        crate::runtime::load_space_record_for_update_opt(tx, &scope.space_id)
-                            .await?
-                            .ok_or(DomainError::ResourceNotFound)?;
-                    live_space.scope.check(&scope)?;
-                    authorize_chat_write_on_space(&auth_cl, &live_space.space)?;
-                    if live_space.active_epoch != staged_epoch {
-                        return Err(crate::codec::unavailable_retryable(
-                            "stage_chat_blob_epoch_changed",
-                            "Space active_epoch changed while staging chat blob",
-                            std::time::Duration::from_millis(25),
-                        ));
-                    }
-                    let owner_lease = staged_chat_lease_key(lease, auth_cl.taint().is_tainted());
-                    activate_and_bind_blob_ref_tx(
-                        tx,
-                        &live_space.scope,
-                        live_space.active_epoch,
-                        &BlobReferenceClaim {
-                            ticket,
-                            owner_kind: BlobOwnerKind::StagedChat,
-                            owner_id,
-                            owner_rev_id: owner_lease.clone(),
-                            resource_key,
-                        },
-                        live_space.last_seq,
-                    )
-                    .await?;
-                    let dirs = publisher
-                        .publish_deferred_local_tickets_async(std::slice::from_ref(&publish_ticket))
+            .with_auxiliary_command(
+                ctx.scope().space_id.clone(),
+                Some((&ctx.budget, deadline)),
+                Ok,
+                move |tx| {
+                    Box::pin(async move {
+                        let live_space =
+                            crate::runtime::load_space_record_for_update_opt(tx, &scope.space_id)
+                                .await?
+                                .ok_or(DomainError::ResourceNotFound)?;
+                        live_space.scope.check(&scope)?;
+                        authorize_chat_write_on_space(&auth_cl, &live_space.space)?;
+                        if live_space.active_epoch != staged_epoch {
+                            return Err(crate::codec::unavailable_retryable(
+                                "stage_chat_blob_epoch_changed",
+                                "Space active_epoch changed while staging chat blob",
+                                std::time::Duration::from_millis(25),
+                            ));
+                        }
+                        let owner_lease =
+                            staged_chat_lease_key(lease, auth_cl.taint().is_tainted());
+                        activate_and_bind_blob_ref_tx(
+                            tx,
+                            &live_space.scope,
+                            live_space.active_epoch,
+                            &BlobReferenceClaim {
+                                ticket,
+                                owner_kind: BlobOwnerKind::StagedChat,
+                                owner_id,
+                                owner_rev_id: owner_lease.clone(),
+                                resource_key,
+                            },
+                            live_space.last_seq,
+                        )
                         .await?;
-                    publisher.flush_pending_local_dirs_async(&dirs).await?;
-                    Ok((
-                        staging::UndeliveredLease::new(
-                            publisher,
-                            scope,
-                            attested.with_lease(lease),
-                            owner_lease,
-                        ),
-                        publish_ticket,
-                    ))
-                })
-            })
+                        let dirs = publisher
+                            .publish_deferred_local_tickets_async(std::slice::from_ref(
+                                &publish_ticket,
+                            ))
+                            .await?;
+                        publisher.flush_pending_local_dirs_async(&dirs).await?;
+                        Ok((
+                            staging::UndeliveredLease::new(
+                                publisher,
+                                scope,
+                                attested.with_lease(lease),
+                                owner_lease,
+                            ),
+                            publish_ticket,
+                        ))
+                    })
+                },
+            )
             .await?;
         Ok(value.0.deliver())
     }
@@ -2995,6 +3036,7 @@ async fn append_chat_impl(
         PrincipalKind::AgentRun(_) | PrincipalKind::Keeper(_)
     );
     if (!request.input.tool_calls.is_empty()
+        || request.input.interruption.is_some()
         || request.input.provenance.is_some()
         || request.input.proposed_diff.is_some())
         && !is_run
@@ -3123,9 +3165,26 @@ async fn append_chat_impl(
         return Ok(replayed.into_committed());
     }
 
-    deadline
+    let prefix = deadline
         .prepare(&ctx.budget, || {
             compaction::verify_prefix(store, ctx.clone(), &request)
+        })
+        .await;
+    match prefix {
+        // A different revision cannot pass the writer's CAS. Submit the original
+        // command so an identical winner can replay under the current authority.
+        Err(PortError::Domain(DomainError::RevisionConflict { ref current, .. }))
+            if request
+                .preconditions
+                .revision
+                .as_ref()
+                .is_some_and(|rev| rev != current) => {}
+        result => result?,
+    }
+
+    let provenance_json = deadline
+        .prepare(&ctx.budget, || {
+            content::prepare_proof(store, &ctx, &request, provenance_json)
         })
         .await?;
 
@@ -4939,6 +4998,8 @@ async fn redact_chat_entry_impl(
                 };
 
                 // Mark ONLY true descendant `compaction` checkpoints stale along `parent_seq` (sibling forks untouched)!
+                content::invalidate_folded_proofs(tx, &scope.space_id, &input.thread, entry_i64)
+                    .await?;
                 let invalidated_contexts = mark_descendant_compactions_stale_tx(
                     tx,
                     &scope,

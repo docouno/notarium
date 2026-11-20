@@ -159,6 +159,10 @@ async fn supervised_turn_survives_disconnect_and_stops_cleanly(
         options.clone(),
     ))
     .await;
+    let expiry = fixture.storage.clock.0.load(Ordering::SeqCst) + 100;
+    let viewer = fixture
+        .pat_with_expiry(BearerScope::Read, false, Some(expiry))
+        .await;
     let former_input = input(242, ThreadEntrySeq::ZERO, "Start a detached turn.");
     let first = supervisor
         .enqueue_input(owner.clone(), former_input.clone(), options.clone())
@@ -188,6 +192,26 @@ async fn supervised_turn_survives_disconnect_and_stops_cleanly(
     };
     assert_eq!(checkpoint.cursor.run, run);
     drop(subscription);
+    let mut buffered = supervisor
+        .subscribe(viewer.clone(), scope.clone(), thread.clone(), None)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut live = supervisor
+        .subscribe(
+            viewer,
+            scope.clone(),
+            thread.clone(),
+            Some(&checkpoint.cursor),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        timeout(Duration::from_secs(2), live.next()).await.unwrap(),
+        StreamRead::Closed
+    ));
+    assert!(matches!(buffered.next().await, StreamRead::Closed));
     let mut retained = supervisor
         .subscribe(
             owner.clone(),
@@ -242,6 +266,7 @@ async fn supervised_turn_survives_disconnect_and_stops_cleanly(
         .await
         .unwrap()
         .unwrap();
+    *fixture.projections.fail_finish_once.lock().unwrap() = true;
     send_ollama(
         &mut final_wire,
         json!({"role":"assistant", "content":"The detached turn completed."}),
@@ -296,10 +321,55 @@ async fn supervised_turn_survives_disconnect_and_stops_cleanly(
         "The detached turn completed."
     );
 
+    let partial = supervisor
+        .enqueue_input(
+            owner.clone(),
+            input(245, head, "Return a limited response."),
+            options.clone(),
+        )
+        .await
+        .unwrap();
+    let (mut limited, _) = timeout(Duration::from_secs(10), read_request(&listener))
+        .await
+        .unwrap();
+    let stream = supervisor
+        .subscribe(owner.clone(), scope.clone(), thread.clone(), None)
+        .await
+        .unwrap()
+        .unwrap();
+    send_ollama(
+        &mut limited,
+        json!({"role":"assistant","content":"Partial result"}),
+        "length",
+    )
+    .await;
+    let events = stream_events(stream).await;
+    assert_eq!(events.last().unwrap()["type"], "run_failed");
+    assert_eq!(events.last().unwrap()["code"], "budget_exceeded");
+    let partial_head = idle_leaf(fixture, personal, &thread).await;
+    assert!(partial.run.is_some());
+    let entries = fixture
+        .canonical
+        .read_chat_contents(
+            personal.clone(),
+            ChatContentRead {
+                thread: thread.clone(),
+                leaf: partial_head,
+                entries: vec![partial_head],
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(entries[0].interruption, Some(CompletionFinish::Length));
+    assert_eq!(
+        ClassEgressFence::chat_transcript(&entries[0].content, owner.auth()).unwrap(),
+        "Partial result"
+    );
+
     let second = supervisor
         .enqueue_input(
             owner.clone(),
-            input(243, head, "Stop without committing a model."),
+            input(243, partial_head, "Stop without committing a model."),
             options.clone(),
         )
         .await
@@ -475,6 +545,7 @@ async fn resilience_submit_gate_and_archival(
                     body: ChatInputBody::Text("Seed resilience branch".into()),
                     tool_calls: Vec::new(),
                     provenance: None,
+                    interruption: None,
                     proposed_diff: None,
                     referenced_notes: Vec::new(),
                     tainted: false,
@@ -995,6 +1066,7 @@ async fn queue_conflicts_and_lost_ack(
                     body: ChatInputBody::Text("A concurrent post".into()),
                     tool_calls: Vec::new(),
                     provenance: None,
+                    interruption: None,
                     proposed_diff: None,
                     referenced_notes: Vec::new(),
                     tainted: false,

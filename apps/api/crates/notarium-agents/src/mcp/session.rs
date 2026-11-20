@@ -69,6 +69,7 @@ struct SessionLocator {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StartPlan {
+    // Older journals fingerprinted the observed account revision. Preserve it on replay.
     expected: ControlRevision,
     requested: EpisodeId,
     project: Option<FolderRef>,
@@ -96,6 +97,34 @@ pub(super) async fn handle(
         ToolName::StartSession => start(call, decode(args)?).await,
         _ => Err(invalid(ValidationReason::InvalidQuery)),
     }
+}
+
+pub(super) async fn selected_project(
+    call: &ToolCallContext<'_>,
+    project: Option<&str>,
+    episode: Option<&EpisodeId>,
+) -> Result<Option<FolderRef>, PortError> {
+    let episode_project = match episode {
+        Some(id) => {
+            call.registry
+                .control
+                .get_episode(call.account(), id.clone())
+                .await?
+                .project_hint
+        }
+        None => None,
+    };
+    let target = match project {
+        Some(handle) => Some(resolve_project(call, handle).await?.folder),
+        None => episode_project,
+    };
+    let target = match &call.target {
+        EgressTarget::InAppProvider {
+            primary_project, ..
+        } => target.or_else(|| primary_project.clone()),
+        EgressTarget::ExternalMcp => target,
+    };
+    Ok(target)
 }
 
 async fn whoami(call: &mut ToolCallContext<'_>) -> Result<Value, PortError> {
@@ -297,9 +326,8 @@ async fn start(call: &mut ToolCallContext<'_>, args: StartArgs) -> Result<Value,
                     .await?;
                 check_requested_project(project.as_ref(), &episode)?;
             }
-            let principal = call.registry.control.whoami(call.account()).await?;
             Ok(StartPlan {
-                expected: principal.account_revision,
+                expected: ControlRevision::ZERO,
                 requested,
                 project,
             })
@@ -318,7 +346,7 @@ async fn start(call: &mut ToolCallContext<'_>, args: StartArgs) -> Result<Value,
     let opened = call
         .registry
         .control
-        .start_or_resume_episode(
+        .start_agent_episode(
             call.account(),
             AccountMutation {
                 identity: call.account_identity(plan.expected, "start-episode", 0),

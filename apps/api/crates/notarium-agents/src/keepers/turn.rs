@@ -160,6 +160,7 @@ pub(super) async fn run_keeper_turn(
                     body: ChatInputBody::Text(settled.text),
                     tool_calls: calls.clone(),
                     provenance: Some(proof),
+                    interruption: settled.finish.interruption(),
                     proposed_diff: None,
                     referenced_notes: vec![],
                     tainted: false,
@@ -171,7 +172,7 @@ pub(super) async fn run_keeper_turn(
             continue;
         }
         if calls.is_empty() {
-            return Ok(());
+            return crate::completion::terminal_outcome(settled.finish);
         }
         for call in calls {
             let key = call_key(&call)?;
@@ -195,6 +196,7 @@ pub(super) async fn run_keeper_turn(
                         body: ChatInputBody::Text(display),
                         tool_calls: vec![],
                         provenance: Some(proof),
+                        interruption: None,
                         proposed_diff: None,
                         referenced_notes: vec![],
                         tainted: false,

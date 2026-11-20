@@ -19,8 +19,12 @@ use crate::{
 pub(crate) const SLUG: &str = "index";
 
 pub(super) fn validate_create(input: &CreateNote) -> Result<String, PortError> {
-    let folded = normalize_slug_key(&input.slug)?;
-    if input.folder_page && input.slug != SLUG || !input.folder_page && folded == SLUG {
+    validate_new_slug(&input.slug, input.folder_page)
+}
+
+pub(super) fn validate_new_slug(slug: &str, folder_page: bool) -> Result<String, PortError> {
+    let folded = normalize_slug_key(slug)?;
+    if folder_page && slug != SLUG || !folder_page && folded == SLUG {
         return Err(DomainError::validation(ValidationReason::InvalidPathComponent).into());
     }
     Ok(folded)

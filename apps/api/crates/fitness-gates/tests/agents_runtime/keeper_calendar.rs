@@ -9,16 +9,17 @@ use notarium_agents::{
 };
 use notarium_canonical::CreateFolderSpec;
 use notarium_core::{
-    classes::{AbilityKind, DocClass},
+    classes::{AbilityKind, ClassEgressFence, DocClass},
     model::FolderRef,
     ports::schedules::*,
     value::Timestamp,
 };
-use tokio::{net::TcpListener, time::timeout};
+use tokio::{io::AsyncWriteExt, net::TcpListener, time::timeout};
 
 use super::{
     runtime_ability_cases::{
-        approve_disclosure, identity, loopback_provider, read_request, send_ollama,
+        approve_disclosure, begin_ollama_response, identity, loopback_provider, read_request,
+        send_ollama,
     },
     *,
 };
@@ -137,6 +138,19 @@ pub(super) async fn calendar_scope_and_orphan(fixture: &mut RuntimeFixture, spac
             "0 0 12 1 12 * 2026",
             "UTC",
             final_slot,
+        ),
+    )
+    .await;
+    let partial_slot = parse("2026-12-01T12:00:01Z");
+    let partial = create(
+        fixture,
+        124,
+        new_schedule(
+            124,
+            "Concurrent keeper",
+            "1 0 12 1 12 * 2026",
+            "UTC",
+            partial_slot,
         ),
     )
     .await;
@@ -290,7 +304,92 @@ pub(super) async fn calendar_scope_and_orphan(fixture: &mut RuntimeFixture, spac
         .unwrap();
 
     set_clock(final_slot);
-    successful_tick(&scheduler, final_slot, &listener, "Final calendar answer").await;
+    // A live provider request from the previous scan must leave capacity for
+    // another schedule becoming due one second later.
+    let stop = Cancellation::default();
+    let provider = async {
+        let (mut slow, _) = read_request(&listener).await;
+        // The same Space must admit writes for the next run's log after
+        // dispatch. Keep the first completion in flight by delaying its body.
+        let delayed = begin_ollama_response(
+            &mut slow,
+            json!({"role":"assistant","content":"Final calendar answer"}),
+            "stop",
+        )
+        .await;
+        set_clock(partial_slot);
+        let (mut second, _) = read_request(&listener).await;
+        send_ollama(
+            &mut second,
+            json!({"role":"assistant","content":"Partial result"}),
+            "length",
+        )
+        .await;
+        slow.get_mut().write_all(delayed.as_bytes()).await.unwrap();
+        for id in [&finite.id, &partial.id] {
+            loop {
+                if schedule_runs(fixture, id)
+                    .await
+                    .iter()
+                    .any(|run| matches!(run.status, ScheduleRunStatus::Terminal(_)))
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+        stop.cancel();
+    };
+    let (poll, ()) = timeout(Duration::from_secs(12), async {
+        tokio::join!(
+            scheduler.poll(
+                clock.clone(),
+                Duration::from_millis(25),
+                Duration::from_secs(60),
+                stop.clone()
+            ),
+            provider
+        )
+    })
+    .await
+    .expect("concurrent Keeper turns did not settle");
+    poll.unwrap();
+    let failed = schedule_runs(fixture, &partial.id).await.pop().unwrap();
+    assert_eq!(
+        failed.status,
+        ScheduleRunStatus::Terminal(ScheduleOutcome::Failed)
+    );
+    let log = failed.keeper_log.unwrap();
+    let read = |leaf| ChatRead {
+        thread: log.clone(),
+        leaf,
+        before: None,
+        max_entries: PageLimit::new(1).unwrap(),
+    };
+    let head = fixture
+        .canonical
+        .read_chat(space.clone(), read(ThreadEntrySeq::ZERO))
+        .await
+        .unwrap()
+        .thread
+        .head;
+    let entries = fixture
+        .canonical
+        .read_chat_contents(
+            space.clone(),
+            ChatContentRead {
+                thread: log,
+                leaf: head,
+                entries: vec![head],
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(entries[0].interruption, Some(CompletionFinish::Length));
+    assert_eq!(
+        ClassEgressFence::chat_transcript(&entries[0].content, space.auth()).unwrap(),
+        "Partial result"
+    );
     let terminal = schedule_runs(fixture, &finite.id).await;
     assert_eq!(terminal.len(), 1);
     assert_eq!(terminal[0].slot, final_slot);

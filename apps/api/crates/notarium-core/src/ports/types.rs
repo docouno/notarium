@@ -594,6 +594,14 @@ pub struct ChatBranch {
     pub entries: Vec<ChatEntry>,
     pub next_ancestor: Option<ThreadEntrySeq>,
 }
+/// Oldest retained prefix of the selected prompt, hydrated from its actual branch.
+#[derive(Clone, Debug)]
+pub struct ChatCompactionPrefix {
+    pub branch: ChatBranch,
+    pub contents: Vec<HydratedChatEntry>,
+    /// A completion must summarize the prefix before using the unprocessed suffix.
+    pub has_tail: bool,
+}
 /// A bounded batch of entry identities from one already selected branch.
 #[derive(Clone, Debug)]
 pub struct ChatContentRead {
@@ -605,6 +613,7 @@ pub struct ChatContentRead {
 pub struct HydratedChatEntry {
     pub seq: ThreadEntrySeq,
     pub content: CanonicalChatContent,
+    pub interruption: Option<super::CompletionFinish>,
     pub tool_calls: Vec<super::ProviderToolCall>,
 }
 /// Immutable sources of a derived chat entry. Missing provenance on a legacy
@@ -643,6 +652,8 @@ pub struct AppendChat {
     pub body: ChatInputBody,
     pub tool_calls: Vec<super::ProviderToolCall>,
     pub provenance: Option<ChatProvenance>,
+    /// Provider interruption retained with a partial Model body.
+    pub interruption: Option<super::CompletionFinish>,
     pub proposed_diff: Option<String>,
     pub referenced_notes: Vec<NoteRef>,
     pub tainted: bool,

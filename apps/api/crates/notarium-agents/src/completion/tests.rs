@@ -16,6 +16,15 @@ fn budget() -> CallBudget {
     }
 }
 
+#[test]
+fn a_filtered_terminal_reply_has_a_safe_failure_reason() {
+    assert!(matches!(
+        terminal_outcome(CompletionFinish::ContentFilter),
+        Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
+            if diagnostic.reason == ValidationReason::ProviderContentFiltered
+    ));
+}
+
 fn request() -> CompletionRequest {
     let provider = ProviderResourceId::from_bytes([2; 16]);
     CompletionRequest {

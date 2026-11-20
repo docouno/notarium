@@ -343,6 +343,7 @@ async fn persist_summary(
             origins: vec![origin],
             ..Default::default()
         }),
+        interruption: None,
         proposed_diff: None,
         referenced_notes: vec![],
         tainted: false,

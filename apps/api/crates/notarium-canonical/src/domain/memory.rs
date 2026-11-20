@@ -9,7 +9,7 @@ use notarium_core::{
     classes::DocClass,
     error::{PortError, ValidationReason},
     ids::{FolderId, RevisionId},
-    model::HistoryScope,
+    model::{HistoryScope, Lifecycle},
     patch::CarrierEditOrigin,
     ports::{
         AppendMemory, Committed, CreateNote, MemoryAppendOutcome, MemoryAppendResult,
@@ -38,8 +38,8 @@ use super::{
         validate_mutation_identity,
     },
     notes::{
-        analyze_and_prepare_carrier, build_carrier_replacement_intent, build_create_note_intent,
-        try_replay_completed_receipt,
+        CarrierReplacement, analyze_and_prepare_carrier, build_carrier_replacement_intent,
+        build_create_note_intent, try_replay_completed_receipt,
     },
 };
 
@@ -131,8 +131,10 @@ pub(super) async fn append(
     loop {
         ctx.budget.remaining = deadline.remaining(&budget)?;
         let (space, parent, head) = read_slot(store, &ctx, target.clone()).await?;
-        if let Err(error) = check_requested_state(head.as_ref(), input.mode, &request.preconditions)
-        {
+        let active = head
+            .as_ref()
+            .filter(|head| head.lifecycle == Lifecycle::Active);
+        if let Err(error) = check_requested_state(active, input.mode, &request.preconditions) {
             // An identical command may have committed after the first lookup
             // and advanced the head to the revision that failed this predicate.
             if let Some(replayed) = deadline
@@ -150,7 +152,7 @@ pub(super) async fn append(
             }
             return Err(error);
         }
-        let base = match &head {
+        let base = match active {
             Some(head) => {
                 let digest = head.content_digest.ok_or_else(|| {
                     internal_not_committed("memory_missing_digest", "AgentMemory note lacks digest")
@@ -198,7 +200,11 @@ pub(super) async fn append(
                 request.preconditions.clone(),
                 note.clone(),
                 head.head_rev_id,
-                None,
+                if head.lifecycle == Lifecycle::Trashed {
+                    CarrierReplacement::RestartMemory
+                } else {
+                    CarrierReplacement::Edit
+                },
                 info,
                 ticket,
                 None,
@@ -346,6 +352,9 @@ fn bind_intent(
             let space = load_space_record(tx, &scope.space_id).await?;
             space.scope.check(&scope)?;
             let (_, head) = authorized_slot(tx, &auth, &space, &target).await?;
+            let restarting = head
+                .as_ref()
+                .is_some_and(|head| head.lifecycle == Lifecycle::Trashed);
             let actual = head.map(|head| head.head_rev_id);
             if actual != prepared_revision {
                 return Err(actual.map_or_else(|| DomainError::ResourceNotFound.into(), conflict));
@@ -356,7 +365,7 @@ fn bind_intent(
             let stored = StoredMemoryAppend {
                 value: stored.value,
                 receipt: stored.receipt,
-                created: prepared_revision.is_none(),
+                created: prepared_revision.is_none() || restarting,
                 summary_updated,
             };
             let bytes = CanonicalStore::encode_command_outcome(&stored)?;

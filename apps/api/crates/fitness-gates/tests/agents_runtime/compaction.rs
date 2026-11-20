@@ -122,6 +122,12 @@ async fn compact_prefix_preserving_recent_context(
         };
         leaf = entry.value.seq;
         entries.push((leaf, label));
+        if ordinal == 1 {
+            let interrupted =
+                interrupted_tool_group(fixture, personal, &thread, leaf, &identity).await;
+            leaf = interrupted.last().unwrap().0;
+            entries.extend(interrupted);
+        }
     }
     let before_compaction = wait_for_idle(fixture, personal, &thread).await;
     let independent_redaction = fixture
@@ -181,6 +187,14 @@ async fn compact_prefix_preserving_recent_context(
         .iter()
         .map(|message| message["content"].as_str().unwrap())
         .collect();
+    let calls = summary_messages[1]["tool_calls"].as_array().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["function"]["name"], "get_note");
+    assert_eq!(summary_messages[2]["role"], "tool");
+    assert_eq!(summary_messages[2]["tool_name"], "get_note");
+    assert_eq!(summary_messages[3]["role"], "assistant");
+    assert!(shown[2].contains("Untrusted historical tool output"));
+    assert!(shown[2].contains("Unpaired result"));
     let covered = shown.len();
     assert!((2..live_entries.len()).contains(&covered));
     for (text, (_, label)) in shown.iter().zip(live_entries) {
@@ -223,18 +237,18 @@ async fn compact_prefix_preserving_recent_context(
         .read_chat(personal.clone(), read())
         .await
         .unwrap();
-    assert_eq!(audit.entries.len(), 12);
+    assert_eq!(audit.entries.len(), entries.len() + 2);
     assert_eq!(audit.entries[0].kind, ChatEntryKind::Redacted);
     assert_eq!(
-        audit.entries[..10]
+        audit.entries[..entries.len()]
             .iter()
             .map(|entry| entry.seq)
             .collect::<Vec<_>>(),
         entries.iter().map(|(seq, _)| *seq).collect::<Vec<_>>(),
     );
-    let checkpoint = audit.entries[10].seq;
-    assert_eq!(audit.entries[10].kind, ChatEntryKind::Compaction);
-    assert_eq!(audit.entries[10].parent, Some(leaf));
+    let checkpoint = audit.entries[entries.len()].seq;
+    assert_eq!(audit.entries[entries.len()].kind, ChatEntryKind::Compaction);
+    assert_eq!(audit.entries[entries.len()].parent, Some(leaf));
     let summary = fixture
         .canonical
         .read_chat_contents(
@@ -249,6 +263,13 @@ async fn compact_prefix_preserving_recent_context(
         .unwrap();
     let proof = summary[0].content.provenance().unwrap();
     assert_eq!(proof.compacts_through, Some(live_entries[covered - 1].0));
+    assert!(
+        proof
+            .origins
+            .iter()
+            .all(|origin| !matches!(origin, notarium_core::classes::ProviderOrigin::Chat { .. })),
+        "the checkpoint covers its chat-only prefix without historical chat edges",
+    );
     let context = fixture
         .canonical
         .read_chat_context(personal.clone(), read())
@@ -281,7 +302,7 @@ async fn compact_prefix_preserving_recent_context(
         .await
         .unwrap();
     assert_eq!(audit.entries[1].kind, ChatEntryKind::Redacted);
-    assert_eq!(audit.entries[10].kind, ChatEntryKind::Redacted);
+    assert_eq!(audit.entries[entries.len()].kind, ChatEntryKind::Redacted);
     supervisor
         .start(fixture.human.clone(), request(final_thread.head))
         .await
@@ -294,6 +315,116 @@ async fn compact_prefix_preserving_recent_context(
     );
     wait_for_idle(fixture, personal, &thread).await;
     supervisor.shutdown();
+}
+
+/// A prior run persisted one of two results, and the log also contains a
+/// tool value without a matching call. Both actual results must reach the
+/// summary with their canonical identities.
+async fn interrupted_tool_group(
+    fixture: &RuntimeFixture,
+    personal: &SpaceContext,
+    thread: &ChatThreadId,
+    mut leaf: ThreadEntrySeq,
+    identity: &impl Fn(u8) -> CommandIdentity,
+) -> Vec<(ThreadEntrySeq, String)> {
+    let run = AgentRunId::from_bytes([135; 16]);
+    let auth = personal
+        .auth()
+        .for_agent_run(
+            run.clone(),
+            personal.scope().space_id.clone(),
+            notarium_core::auth::ChatAudience::Personal,
+            personal.auth().spaces().clone(),
+        )
+        .unwrap();
+    let ctx = SpaceContext::new(auth, personal.scope().clone(), budget()).unwrap();
+    fixture
+        .canonical
+        .claim_active_run(
+            ctx.clone(),
+            ClaimChatRun {
+                thread: thread.clone(),
+                run: run.clone(),
+                expected_leaf: leaf,
+                previous_run: None,
+            },
+        )
+        .await
+        .unwrap();
+    let completed = CommandKey::from_bytes([136; 16]);
+    let missing = CommandKey::from_bytes([137; 16]);
+    let orphan = CommandKey::from_bytes([138; 16]);
+    let calls = [(completed.clone(), "get_note"), (missing, "list_notes")]
+        .into_iter()
+        .map(|(id, name)| ProviderToolCall {
+            id: ProviderToolCallId::new(id.to_string()).unwrap(),
+            name: name.into(),
+            arguments: Default::default(),
+        })
+        .collect();
+    let mut saved = Vec::new();
+    for (key, kind, calls, text) in [
+        (136, ChatEntryKind::Model, calls, "Two requested reads"),
+        (
+            137,
+            ChatEntryKind::Tool { call_id: completed },
+            vec![],
+            "Completed read",
+        ),
+        (
+            138,
+            ChatEntryKind::Tool { call_id: orphan },
+            vec![],
+            "Unpaired result",
+        ),
+    ] {
+        let entry = fixture
+            .canonical
+            .append_chat(
+                ctx.clone(),
+                Mutation {
+                    identity: identity(key),
+                    preconditions: Preconditions::default(),
+                    input: AppendChat {
+                        thread: thread.clone(),
+                        parent: leaf,
+                        kind,
+                        body: ChatInputBody::Text(text.into()),
+                        tool_calls: calls,
+                        interruption: None,
+                        proposed_diff: None,
+                        provenance: Some(ChatProvenance::default()),
+                        referenced_notes: vec![],
+                        tainted: false,
+                    },
+                },
+            )
+            .await
+            .unwrap()
+            .value;
+        leaf = entry.seq;
+        let label = if key == 138 {
+            "[Untrusted historical tool output]"
+        } else {
+            text
+        };
+        saved.push((leaf, label.into()));
+    }
+    assert_eq!(
+        fixture
+            .canonical
+            .finish_run_if_queue_empty(
+                ctx,
+                ChatRunRequest {
+                    thread: thread.clone(),
+                    expected_run: run,
+                }
+            )
+            .await
+            .unwrap(),
+        FinishChatRunOutcome::Cleared
+    );
+    saved
 }
 
 async fn wait_for_idle(

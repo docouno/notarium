@@ -2166,6 +2166,50 @@ pub(crate) struct StoredCommittedRollbackV1 {
 }
 
 impl StoredCommittedRollbackV1 {
+    pub(crate) fn sanitized(receipt: MutationReceiptToken) -> Self {
+        Self {
+            restored: Vec::new(),
+            trashed: Vec::new(),
+            restored_ranks: Vec::new(),
+            skipped_manual_edits: Vec::new(),
+            skipped_room_active: Vec::new(),
+            receipt,
+        }
+    }
+
+    pub(crate) fn disclosed_notes(&self) -> impl Iterator<Item = &NoteId> {
+        self.restored
+            .iter()
+            .chain(&self.trashed)
+            .map(|head| &head.note)
+            .chain(&self.skipped_manual_edits)
+            .chain(&self.skipped_room_active)
+            .chain(self.restored_ranks.iter().map(|rank| &rank.note))
+    }
+
+    /// Effect pointers retain their original owners. A receipt can also disclose
+    /// notes whose history was skipped and both ends of a restored board rank.
+    pub(crate) fn receipt_owners(&self, mut changed: Vec<NoteId>) -> Vec<NoteId> {
+        if !(self.skipped_manual_edits.is_empty()
+            && self.skipped_room_active.is_empty()
+            && self.restored_ranks.is_empty())
+        {
+            changed.extend(
+                self.skipped_manual_edits
+                    .iter()
+                    .chain(&self.skipped_room_active)
+                    .cloned(),
+            );
+            for rank in &self.restored_ranks {
+                changed.push(rank.note.clone());
+                changed.push(rank.view.note.clone());
+            }
+            changed.sort_unstable();
+            changed.dedup();
+        }
+        changed
+    }
+
     pub fn into_committed(self) -> Committed<RollbackResult> {
         Committed {
             value: RollbackResult {

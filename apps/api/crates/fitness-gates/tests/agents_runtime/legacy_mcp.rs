@@ -147,3 +147,143 @@ pub(super) async fn stored_legacy_episodes_and_notes_round_trip_through_mcp(
         .is_err()
     );
 }
+
+#[tokio::test]
+async fn episode_target_commands_replay_old_receipts_and_survive_account_changes() {
+    let fixture = RuntimeFixture::open_named(false, "episode_command_replay").await;
+    let human = &fixture.human;
+    let plane = &fixture.control_plane;
+    let start = AccountMutation {
+        identity: identity(&fixture, human, 110).await,
+        input: StartEpisode {
+            selector: EpisodeSelector::New {
+                requested: EpisodeId::from_bytes([110; 16]),
+                name: None,
+            },
+            project_hint: None,
+        },
+    };
+    let saved = fixture
+        .control
+        .start_or_resume_episode(human.clone(), start.clone())
+        .await
+        .unwrap();
+    let replayed = plane
+        .start_agent_episode(human.clone(), start.clone())
+        .await
+        .unwrap();
+    assert_eq!(saved.revision, replayed.revision);
+    let EpisodeStartResult::New(ep) = replayed.value else {
+        panic!("expected saved episode")
+    };
+
+    let mut second = start;
+    second.identity.key = CommandKey::from_bytes([111; 16]);
+    second.input.selector = EpisodeSelector::New {
+        requested: EpisodeId::from_bytes([111; 16]),
+        name: None,
+    };
+    assert!(matches!(
+        fixture
+            .control
+            .start_or_resume_episode(human.clone(), second.clone())
+            .await,
+        Err(PortError::Domain(
+            DomainError::ControlRevisionConflict { .. }
+        ))
+    ));
+    plane
+        .start_agent_episode(human.clone(), second)
+        .await
+        .unwrap();
+
+    let roles = plane
+        .discover_abilities(
+            human.clone(),
+            AbilityQuery {
+                page: ControlPageRequest::new(50, None).unwrap(),
+                project: None,
+                kind: Some(notarium_core::classes::AbilityKind::Role),
+                name: None,
+                authoring: false,
+            },
+        )
+        .await
+        .unwrap()
+        .items;
+    let first_role = roles.iter().find(|entry| entry.name == "research").unwrap();
+    let next_role = roles.iter().find(|entry| entry.name == "grooming").unwrap();
+    let mut binding = AccountMutation {
+        identity: identity(&fixture, human, 112).await,
+        input: EpisodeUpdate {
+            episode: ep.id,
+            expected: ep.revision,
+            name: ep.name,
+            active_role: Some(first_role.reference.clone()),
+            project_hint: None,
+            lifecycle: EpisodeLifecycle::Active,
+        },
+    };
+    let saved = fixture
+        .control
+        .update_episode(human.clone(), binding.clone())
+        .await
+        .unwrap();
+    let replay = plane
+        .bind_episode_role(human.clone(), binding.clone())
+        .await
+        .unwrap();
+    assert_eq!(saved.revision, replay.revision);
+
+    binding.identity.key = CommandKey::from_bytes([113; 16]);
+    binding.input.active_role = Some(next_role.reference.clone());
+    assert!(matches!(
+        plane
+            .bind_episode_role(human.clone(), binding.clone())
+            .await,
+        Err(PortError::Domain(
+            DomainError::ControlRevisionConflict { .. }
+        ))
+    ));
+    binding.input.expected = saved.value.revision;
+    let rebound = plane
+        .bind_episode_role(human.clone(), binding)
+        .await
+        .unwrap();
+    assert_eq!(rebound.value.active_role, Some(next_role.reference.clone()));
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn ordinary_mcp_calls_keep_an_active_episode_forkable() {
+    let fixture = RuntimeFixture::open_named(false, "episode_mcp_activity").await;
+    let human = &fixture.human;
+    let start = call(&fixture, human, 115, "start_session", json!({}))
+        .await
+        .unwrap();
+    let session = start.structured_content["session"]["id"].clone();
+    let advance = |minutes: i64| {
+        fixture
+            .storage
+            .clock
+            .0
+            .fetch_add(minutes * 60_000, std::sync::atomic::Ordering::SeqCst);
+    };
+    advance(20);
+    call(&fixture, human, 116, "whoami", json!({"session":session}))
+        .await
+        .unwrap();
+    advance(20);
+    let joined = call(
+        &fixture,
+        human,
+        117,
+        "start_session",
+        json!({"session":{"id":session}}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(joined.structured_content["session"]["state"], "forked");
+    assert_eq!(joined.structured_content["session"]["parentId"], session);
+    fixture.close().await;
+}

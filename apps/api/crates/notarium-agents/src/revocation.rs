@@ -58,6 +58,7 @@ struct Registered {
 
 struct CanonicalRegistration {
     entry: Registered,
+    deadline: Instant,
     active: usize,
     revoked: bool,
 }
@@ -577,18 +578,23 @@ impl Drop for RegistryLease {
 struct EffectRegistration {
     hub: RevocationHub,
     id: RegistrationId,
-    budget: RevocationBudget,
+    caller_cancellation: Cancellation,
     cancellation: Cancellation,
 }
 
 impl EffectRegistration {
     fn check_state(&self, state: &State) -> Result<(), PortError> {
         state.ensure_open()?;
-        self.budget.check()?;
+        if self.caller_cancellation.is_cancelled() {
+            return Err(cancelled());
+        }
         let entry = state
             .canonical_effects
             .get(&self.id)
             .ok_or_else(revocation_unavailable)?;
+        if Instant::now() >= entry.deadline {
+            return Err(deadline_exceeded());
+        }
         if entry.revoked || self.cancellation.is_cancelled() || state.fenced(&entry.entry.selectors)
         {
             return Err(cancelled());
@@ -604,6 +610,16 @@ impl Drop for EffectRegistration {
 }
 
 impl CanonicalEffectRegistration for EffectRegistration {
+    fn restrict_until(&self, deadline: std::time::Instant) -> Result<(), PortError> {
+        let mut state = self.hub.inner.lock();
+        let entry = state
+            .canonical_effects
+            .get_mut(&self.id)
+            .ok_or_else(revocation_unavailable)?;
+        entry.deadline = entry.deadline.min(Instant::from_std(deadline));
+        self.check_state(&state)
+    }
+
     fn check(&self) -> Result<(), PortError> {
         self.check_state(&self.hub.inner.lock())
     }
@@ -672,6 +688,7 @@ impl SessionRevocationPort for RevocationHub {
                                     selectors,
                                     cancellation: cancellation.clone(),
                                 },
+                                deadline: budget.deadline,
                                 active: 0,
                                 revoked: false,
                             },
@@ -679,7 +696,7 @@ impl SessionRevocationPort for RevocationHub {
                         let owner = EffectRegistration {
                             hub: self.clone(),
                             id,
-                            budget,
+                            caller_cancellation: budget.cancellation,
                             cancellation,
                         };
                         return Ok(Arc::new(owner) as Arc<dyn CanonicalEffectRegistration>);

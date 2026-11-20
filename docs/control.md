@@ -539,6 +539,10 @@ A repeated accepted intent reports its existing call state, even after configura
 changes; different input rejects the reused key. No stream is replayed or resent.
 After reservation, the service rechecks current authority/configuration/consent,
 changes intent to sending and acquires its live registration in one SQL transaction.
+SQLite pins the participating canonical Spaces through dispatch. It releases the
+database writer after reading their metadata, so unrelated Spaces can commit
+while a provider is still sending its response headers. Restore waits for
+outstanding disclosures before switching generations.
 The transport handle exists before awaiting response headers. Shutdown acknowledgement
 precedes release of canonical/registry leases and the independent five-second audit
 finalizer. `ProviderConfig.max_active_calls` (default 64 per `ProviderService`
@@ -569,9 +573,12 @@ Episodes belong to an account, independent of its browser sessions. New episodes
 have explicit IDs and replayable commands. An active ID forks a fresh episode;
 a sleeping episode or one idle for at least 30 minutes resumes. Forks copy separate
 acknowledgement rows. Name lookup returns bounded ID/name choices when ambiguous.
-Updates use both account and episode revision CAS. Closed episodes cannot resume.
-Activity touches are throttled to once per minute; the stored touch counter is not
-an exact transport-call total.
+Management updates check both the account and episode revisions. MCP starts
+serialize selection under the owner lock. MCP role activation checks the episode
+revision, so an unrelated account change preserves the validity of the request.
+Closed episodes cannot resume. Accepting an external tool call updates the
+active episode in the audit transaction. Activity advances at most once per
+minute and preserves the selection revision.
 
 Acknowledgements are monotonic MAX values keyed by owner or episode, Space and
 history incarnation. The catalog checks the current history and delivered sequence
@@ -668,7 +675,19 @@ when its early occurrence already has a receipt under the same configuration.
 Finite calendars issue their last due slot and store a null next slot. Only the new
 winner receives a non-deserializable ScheduledRun credential and Keeper context.
 Exact retries return `AlreadyClaimed` inspection receipts, including after restart.
-Changed claim payloads conflict. Replayed receipts confer inspection only.
+Changed claim payloads conflict. An edit can preserve the existing overdue slot for
+catch-up. A replacement due must be unissued and at or after the current Control
+clock, including after run history expires. Retention protects receipts for a
+live schedule within the 48 hours up to and including its saved due. This covers
+both UTC occurrences of every repeated civil time, across configuration edits.
+A legacy late-fold with an earlier receipt from its current configuration
+advances without issuing a run. If older cleanup has already removed receipts,
+Control compares previous cursor advances with retained runs. Complete history
+or a slot inside the minimum retention period still permits a catch-up run. When
+the early occurrence has no receipt and the remaining history cannot establish
+whether it ran, Control skips that one uncertain slot, reports
+`SkippedUnverifiedFold`, and advances to the next calendar occurrence. Replayed
+receipts confer inspection only.
 The next distinct due slot can still be claimed through its fresh revision.
 
 Each scheduled effect checks the owner auth version, current membership, Space

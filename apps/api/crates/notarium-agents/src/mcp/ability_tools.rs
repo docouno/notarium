@@ -867,6 +867,7 @@ pub(super) async fn activate_session_role(
 
 #[derive(Serialize, Deserialize)]
 struct EpisodeRolePlan {
+    // Older journals fingerprinted the observed account revision. Preserve it on replay.
     account_revision: ControlRevision,
     update: EpisodeUpdate,
 }
@@ -882,9 +883,8 @@ async fn save_active_role(
     }
     let plan: EpisodeRolePlan = call
         .journal("activate-role", || async {
-            let principal = call.registry.control.whoami(call.account()).await?;
             Ok(EpisodeRolePlan {
-                account_revision: principal.account_revision,
+                account_revision: ControlRevision::ZERO,
                 update: EpisodeUpdate {
                     episode: episode.id.clone(),
                     expected: episode.revision,
@@ -904,7 +904,7 @@ async fn save_active_role(
     }
     call.registry
         .control
-        .update_episode(
+        .bind_episode_role(
             call.account(),
             AccountMutation {
                 identity: call.account_identity(plan.account_revision, "activate-role-effect", 0),

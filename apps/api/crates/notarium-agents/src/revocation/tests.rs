@@ -141,6 +141,32 @@ async fn canonical_fence_cancels_queued_effects_and_drains_active_sql() {
 }
 
 #[tokio::test]
+async fn credential_deadline_bounds_queued_and_active_effects() {
+    let hub = RevocationHub::new_local();
+    let registration = hub
+        .register_canonical_effect(
+            context(1),
+            vec![RevocationSelector::Principal(PrincipalId::from_bytes(
+                [1; 16],
+            ))],
+            Cancellation::default(),
+        )
+        .await
+        .unwrap();
+    let active = registration.clone().begin().await.unwrap();
+    let now = std::time::Instant::now();
+    assert!(registration.restrict_until(now).is_err());
+    assert!(
+        registration
+            .restrict_until(now + std::time::Duration::from_secs(10))
+            .is_err()
+    );
+    assert!(registration.check().is_err());
+    assert!(registration.begin().await.is_err());
+    assert!(active.check().is_err());
+}
+
+#[tokio::test]
 async fn viewer_revocation_closes_only_that_viewer_without_draining_the_stream() {
     let hub = RevocationHub::new_local();
     let space = SpaceId::from_bytes([1; 16]);

@@ -24,6 +24,12 @@ use notarium_core::{
 };
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum EpisodeGuard {
+    Account,
+    Target,
+}
+
 #[derive(Serialize, Deserialize)]
 enum Started {
     New(EpisodeId),
@@ -49,6 +55,26 @@ pub(super) async fn episode(
         "SELECT * FROM v1_control.agent_episodes WHERE owner_id=$1 AND episode_id=$2";owner.as_str(),id.as_str())?
         .ok_or(DomainError::ResourceNotFound.into())
 }
+/// Activity and selection have independent concurrency boundaries. A tool heartbeat
+/// cannot invalidate an in-flight role binding or overwrite a later heartbeat.
+pub(super) async fn touch_active(
+    tx: &mut Transaction,
+    row: &AgentEpisodesRow,
+    now: i64,
+) -> Result<(), PortError> {
+    if row.lifecycle == "active"
+        && now
+            .checked_sub(row.last_seen_at)
+            .is_some_and(|age| age >= 60_000)
+    {
+        execute!(tx,
+            "UPDATE agent_episodes SET last_seen_at=$1,calls=$2 WHERE episode_id=$3 AND last_seen_at=$4 AND lifecycle='active'",
+            "UPDATE v1_control.agent_episodes SET last_seen_at=$1,calls=$2 WHERE episode_id=$3 AND last_seen_at=$4 AND lifecycle='active'";
+            now,next(row.calls)?,&row.episode_id,row.last_seen_at)?;
+    }
+    Ok(())
+}
+
 fn lifecycle(value: &str) -> Result<EpisodeLifecycle, PortError> {
     match value {
         "active" => Ok(EpisodeLifecycle::Active),
@@ -247,6 +273,15 @@ impl ControlService {
         ctx: AccountContext,
         request: AccountMutation<StartEpisode>,
     ) -> Result<ControlCommit<EpisodeStartResult>, PortError> {
+        self.start_or_resume_episode_under_guard(ctx, request, EpisodeGuard::Account)
+            .await
+    }
+    pub(super) async fn start_or_resume_episode_under_guard(
+        &self,
+        ctx: AccountContext,
+        request: AccountMutation<StartEpisode>,
+        guard: EpisodeGuard,
+    ) -> Result<ControlCommit<EpisodeStartResult>, PortError> {
         match &request.input.selector {
             EpisodeSelector::New { name: value, .. } => name(value.as_deref())?,
             EpisodeSelector::Name(value) => name(Some(value))?,
@@ -262,11 +297,13 @@ impl ControlService {
         let (revision, current, started_value) = budget.run(async {
             let auth = self.revalidate_with_keeper(tx.inner_mut(), ctx.auth(), keeper.as_ref()).await?;
             let current = AccountContext::new(auth, budget.context(ctx.budget.request.clone()));
+            let owner = user(tx.inner_mut(), current.auth().principal().as_str()).await?;
             if let Some((revision, saved)) = command.replay::<Started>(tx.inner_mut()).await? {
                 return Ok((revision, current, saved.value));
             }
-            let owner = user(tx.inner_mut(), current.auth().principal().as_str()).await?;
-            expect_revision(&owner, command.identity.expected)?;
+            if guard == EpisodeGuard::Account {
+                expect_revision(&owner, command.identity.expected)?;
+            }
             let now = self.clock.now_ms()?;
             let (existing, requested, chosen_name) = match &request.input.selector {
                 EpisodeSelector::New { requested, name } => (None, requested.clone(), name.clone()),
@@ -287,6 +324,11 @@ impl ControlService {
                 },
             };
             let started = if let Some(mut old) = existing {
+                if guard == EpisodeGuard::Target && let Some(project) = &request.input.project_hint
+                    && (old.project_space.as_deref() != Some(project.space_id.as_str())
+                        || old.project_folder.as_deref() != Some(project.folder_id.as_str())) {
+                    return Err(invalid(ValidationReason::ScopeMismatch));
+                }
                 if old.lifecycle == "closed" { return Err(invalid(ValidationReason::InvalidState)); }
                 // An idle episode can resume without requiring an always-on timer.
                 let idle = now.checked_sub(old.last_seen_at).is_some_and(|age| age >= 30 * 60 * 1000);
@@ -349,6 +391,15 @@ impl ControlService {
         ctx: AccountContext,
         request: AccountMutation<EpisodeUpdate>,
     ) -> Result<ControlCommit<AgentEpisode>, PortError> {
+        self.update_episode_under_guard(ctx, request, EpisodeGuard::Account)
+            .await
+    }
+    pub(super) async fn update_episode_under_guard(
+        &self,
+        ctx: AccountContext,
+        request: AccountMutation<EpisodeUpdate>,
+        guard: EpisodeGuard,
+    ) -> Result<ControlCommit<AgentEpisode>, PortError> {
         name(request.input.name.as_deref())?;
         let command = Command::new(request.identity, "update-episode", &request.input)?;
         command.require(ctx.auth().principal(), ctx.auth().principal())?;
@@ -390,14 +441,20 @@ impl ControlService {
         let (revision, current, saved_id) = budget.run(async {
             let auth = self.revalidate_with_keeper(tx.inner_mut(), ctx.auth(), keeper.as_ref()).await?;
             let current = AccountContext::new(auth, budget.context(ctx.budget.request.clone()));
+            let owner = user(tx.inner_mut(), current.auth().principal().as_str()).await?;
             if let Some((revision, saved)) = command.replay::<EpisodeId>(tx.inner_mut()).await? {
                 return Ok((revision, current, saved.value));
             }
-            let owner = user(tx.inner_mut(), current.auth().principal().as_str()).await?;
-            expect_revision(&owner, command.identity.expected)?;
+            if guard == EpisodeGuard::Account {
+                expect_revision(&owner, command.identity.expected)?;
+            }
             let old = episode(tx.inner_mut(), current.auth().principal(), &request.input.episode).await?;
             if old.revision as u64 != request.input.expected.get() {
                 return Err(DomainError::ControlRevisionConflict { current: ControlRevision::new(old.revision as u64)? }.into());
+            }
+            if guard == EpisodeGuard::Target && (request.input.active_role.is_none()
+                || request.input.name != old.name || request.input.lifecycle != lifecycle(&old.lifecycle)?) {
+                return Err(invalid(ValidationReason::InvalidState));
             }
             if old.lifecycle == "closed" { return Err(invalid(ValidationReason::InvalidState)); }
             if let Some(raw) = prechecked_role
@@ -441,16 +498,21 @@ impl ControlService {
             .precheck_keeper_catalog(ctx.auth(), &budget, &ctx.budget.request)
             .await?;
         let mut tx = self.store.write(budget.clone()).await?;
-        budget.run(async {
-            let auth = self.revalidate_with_keeper(tx.inner_mut(), ctx.auth(), keeper.as_ref()).await?;
-            let row = episode(tx.inner_mut(), auth.principal(), &id).await?;
-            if row.lifecycle != "active" { return Err(invalid(ValidationReason::InvalidState)); }
-            let now = self.clock.now_ms()?;
-            if now.checked_sub(row.last_seen_at).is_some_and(|age| age >= 60_000) {
-                execute!(tx.inner_mut(),"UPDATE agent_episodes SET last_seen_at=$1,calls=$2,revision=$3 WHERE episode_id=$4","UPDATE v1_control.agent_episodes SET last_seen_at=$1,calls=$2,revision=$3 WHERE episode_id=$4";now,next(row.calls)?,next(row.revision)?,id.as_str())?;
-            }
-            Ok(())
-        }, CommitEffect::NotCommitted).await?;
+        budget
+            .run(
+                async {
+                    let auth = self
+                        .revalidate_with_keeper(tx.inner_mut(), ctx.auth(), keeper.as_ref())
+                        .await?;
+                    let row = episode(tx.inner_mut(), auth.principal(), &id).await?;
+                    if row.lifecycle != "active" {
+                        return Err(invalid(ValidationReason::InvalidState));
+                    }
+                    touch_active(tx.inner_mut(), &row, self.clock.now_ms()?).await
+                },
+                CommitEffect::NotCommitted,
+            )
+            .await?;
         budget.run(tx.commit(), CommitEffect::Unknown).await
     }
 }

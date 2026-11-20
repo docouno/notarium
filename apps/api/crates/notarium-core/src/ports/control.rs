@@ -410,6 +410,11 @@ pub trait ControlPort: Send + Sync {
     /// Refreshes a previously verified credential and intersects its current
     /// authority with the original delegation, project pin and branch taint.
     fn revalidate_auth(&self, ctx: AccountContext) -> PortFuture<'_, EngineAuthContext>;
+    /// Revalidate stream authority and pin the natural expiry of this credential.
+    fn revalidate_chat_viewer(
+        &self,
+        ctx: AccountContext,
+    ) -> PortFuture<'_, (EngineAuthContext, Option<std::time::Instant>)>;
     /// Register and revalidate short-lived authority for one canonical write or
     /// its replay. The original grants also cover a proposal's source Space.
     fn fence_canonical_effect(
@@ -468,8 +473,20 @@ pub trait ControlPort: Send + Sync {
         ctx: AccountContext,
         request: AccountMutation<StartEpisode>,
     ) -> PortFuture<'_, ControlCommit<EpisodeStartResult>>;
+    /// Start using the current owner state; the command identity remains stable on replay.
+    fn start_agent_episode(
+        &self,
+        ctx: AccountContext,
+        request: AccountMutation<StartEpisode>,
+    ) -> PortFuture<'_, ControlCommit<EpisodeStartResult>>;
     fn get_episode(&self, ctx: AccountContext, episode: EpisodeId) -> PortFuture<'_, AgentEpisode>;
     fn update_episode(
+        &self,
+        ctx: AccountContext,
+        request: AccountMutation<EpisodeUpdate>,
+    ) -> PortFuture<'_, ControlCommit<AgentEpisode>>;
+    /// Bind a role with episode revision CAS, preserving its name and lifecycle.
+    fn bind_episode_role(
         &self,
         ctx: AccountContext,
         request: AccountMutation<EpisodeUpdate>,

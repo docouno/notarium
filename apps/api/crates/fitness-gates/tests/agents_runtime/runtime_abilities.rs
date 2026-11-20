@@ -555,11 +555,20 @@ pub(super) async fn read_request(listener: &TcpListener) -> (BufReader<TcpStream
     (stream, serde_json::from_slice(&bytes).unwrap())
 }
 
-pub(super) async fn send_ollama(stream: &mut BufReader<TcpStream>, message: Value, reason: &str) {
+pub(super) async fn begin_ollama_response(
+    stream: &mut BufReader<TcpStream>,
+    message: Value,
+    reason: &str,
+) -> String {
     let reply = format!(
         "{}\n{}\n",
         json!({"model":MODEL,"message":message,"done":false}),
         json!({"model":MODEL,"done":true,"done_reason":reason,"prompt_eval_count":100,"eval_count":2}),
     );
-    stream.get_mut().write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).as_bytes()).await.unwrap();
+    stream.get_mut().write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", reply.len()).as_bytes()).await.unwrap();
+    reply
+}
+pub(super) async fn send_ollama(stream: &mut BufReader<TcpStream>, message: Value, reason: &str) {
+    let reply = begin_ollama_response(stream, message, reason).await;
+    stream.get_mut().write_all(reply.as_bytes()).await.unwrap();
 }

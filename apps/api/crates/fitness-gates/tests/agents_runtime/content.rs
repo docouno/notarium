@@ -41,6 +41,10 @@ pub(super) async fn edit_folder_cover_and_view(fixture: &RuntimeFixture, space: 
         "```nota\nname: Second view\ntype: table\n```\n\n",
         "```nota\nname: Third view\ntype: table\n```\n"
     );
+    let admissions = fixture
+        .projections
+        .admitted_sql_effects
+        .load(std::sync::atomic::Ordering::Relaxed);
     let page = call(
         fixture,
         account,
@@ -52,6 +56,15 @@ pub(super) async fn edit_folder_cover_and_view(fixture: &RuntimeFixture, space: 
     )
     .await
     .unwrap();
+    // Both creation of the destination folder and the note commit enter
+    // the writer under the external caller's revocation registration.
+    assert!(
+        fixture
+            .projections
+            .admitted_sql_effects
+            .load(std::sync::atomic::Ordering::Relaxed)
+            >= admissions + 2
+    );
     let note = page.structured_content["noteId"].as_str().unwrap();
     let id = NoteId::parse(note).unwrap();
     let mut projected_notes = (20..=42)
@@ -522,4 +535,130 @@ async fn replay_keeps_forward_link_receipt(
     let carrier = live["content"].as_str().unwrap();
     assert!(carrier.contains(&link));
     assert!(carrier.contains("Manual edit."));
+}
+
+#[tokio::test]
+async fn session_relative_folder_mutations_target_the_listed_folder() {
+    let fixture = RuntimeFixture::open_named(false, "session_folder_scope").await;
+    let human = &fixture.human;
+    let space = fixture.personal_scope().await;
+    let store = fixture
+        .canonical
+        .read_space(&space.scope().space_id)
+        .await
+        .unwrap();
+    let project = FolderId::from_bytes([101; 16]);
+    let in_project = FolderId::from_bytes([102; 16]);
+    let in_root = FolderId::from_bytes([103; 16]);
+    for (id, parent, name, is_project) in [
+        (project.clone(), None, "plans", true),
+        (in_project.clone(), Some(project.clone()), "drafts", false),
+        (in_root.clone(), None, "drafts", false),
+        (
+            FolderId::from_bytes([108; 16]),
+            Some(project.clone()),
+            "archive",
+            false,
+        ),
+    ] {
+        fixture
+            .canonical
+            .create_folder(CreateFolderSpec {
+                scope: space.scope().clone(),
+                active_epoch: store.active_epoch,
+                folder_id: id,
+                parent,
+                slug: name.into(),
+                display_name: name.into(),
+                is_project,
+                project_slug: is_project.then(|| name.to_owned()),
+                actor: human.auth().principal().clone(),
+                timestamp: None,
+            })
+            .await
+            .unwrap();
+    }
+    fixture.projections.install(engine::ProjectionFixture {
+        view_owner: NoteRef {
+            space_id: space.scope().space_id.clone(),
+            note_id: NoteId::from_bytes([104; 16]),
+        },
+        notes: Vec::new(),
+    });
+    let episode = EpisodeId::from_bytes([105; 16]);
+    fixture
+        .control
+        .start_or_resume_episode(
+            human.clone(),
+            AccountMutation {
+                identity: runtime_ability_cases::identity(&fixture, human, 105).await,
+                input: StartEpisode {
+                    selector: EpisodeSelector::New {
+                        requested: episode.clone(),
+                        name: None,
+                    },
+                    project_hint: Some(notarium_core::model::FolderRef {
+                        space_id: space.scope().space_id.clone(),
+                        folder_id: project,
+                    }),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let list = call(
+        &fixture,
+        human,
+        106,
+        "list_notes",
+        json!({
+            "path":"drafts", "session":episode,
+        }),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    let listed = &list["folderPage"];
+    assert_eq!(listed["folderId"], in_project.as_str(), "{list}");
+    let rename = call(
+        &fixture,
+        human,
+        107,
+        "rename_folder",
+        json!({
+            "folder":"drafts", "name":"published", "session":episode,
+        }),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    assert_eq!(rename["folderId"], listed["folderId"]);
+    let moved = call(
+        &fixture,
+        human,
+        108,
+        "move_folder",
+        json!({
+            "folder":"published", "toFolder":"archive", "session":episode,
+        }),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    assert_eq!(moved["folderId"], listed["folderId"]);
+    let snapshot = fixture
+        .canonical
+        .resolve_folder_path(space.clone(), Some(in_project), String::new())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshot.path, "plans/archive/published");
+    let other = fixture
+        .canonical
+        .resolve_folder_path(space, Some(in_root), String::new())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(other.path, "drafts");
+    fixture.close().await;
 }

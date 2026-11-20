@@ -201,7 +201,7 @@ async fn delete(call: &mut ToolCallContext<'_>, input: NoteInput) -> Result<Valu
     let committed = call
         .registry
         .engine
-        .delete_note(scope.clone(), command)
+        .delete_note(call.corpus_writer(scope.clone()).await?, command)
         .await?;
     receipt_result(call, scope, &route.note, committed, "trashed").await
 }
@@ -308,7 +308,7 @@ async fn ensure_destination(
                 call.registry
                     .engine
                     .ensure_folder_path(
-                        scope.clone(),
+                        call.corpus_writer(scope.clone()).await?,
                         Mutation {
                             identity: CommandIdentity {
                                 scope: content_command.scope.clone(),
@@ -378,7 +378,7 @@ async fn move_note(call: &mut ToolCallContext<'_>, input: MoveInput) -> Result<V
         .registry
         .engine
         .move_note(
-            scope.clone(),
+            call.corpus_writer(scope.clone()).await?,
             Mutation {
                 identity,
                 preconditions: preconditions(&route),
@@ -459,7 +459,7 @@ async fn rename(call: &mut ToolCallContext<'_>, input: RenameInput) -> Result<Va
         .registry
         .engine
         .rename_note(
-            scope.clone(),
+            call.corpus_writer(scope.clone()).await?,
             Mutation {
                 identity: call.command_identity(&route.scope, "rename_note", 0),
                 preconditions: preconditions(&route),

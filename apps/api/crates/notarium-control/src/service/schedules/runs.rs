@@ -122,11 +122,20 @@ impl ControlService {
                     grant("scheduled-run", run.as_str()), true,
                 ).await?;
                 let row = schedule(tx.inner_mut(), &request.schedule, true).await?;
-                if let Some(previous) = slot_receipt(tx.inner_mut(), &request.schedule, slot).await? {
-                    if previous.claim_request_hash != fingerprint {
+                let previous = slot_receipt(tx.inner_mut(), &request.schedule, slot).await?;
+                if let Some(previous) = &previous {
+                    if previous.claim_request_hash == fingerprint {
+                        return Ok((ScheduleClaim::AlreadyClaimed(receipt(previous)?), Vec::new()));
+                    }
+                    // Older configurations could rewind the current due to an already
+                    // issued slot. Only its live revision may advance past that receipt.
+                    let expected = request.expected.get();
+                    let current = row.revision as u64;
+                    let repairing = row.next_slot_utc_ms == Some(slot) && current == expected;
+                    let repaired = row.next_slot_utc_ms == next_slot && current == expected.saturating_add(1);
+                    if previous.claimed_schedule_revision as u64 >= expected || !(repairing || repaired) {
                         return Err(DomainError::IdempotencyKeyReused.into());
                     }
-                    return Ok((ScheduleClaim::AlreadyClaimed(receipt(&previous)?), Vec::new()));
                 }
                 if row.deleted_at.is_some() {
                     return Err(DomainError::ResourceNotFound.into());
@@ -141,17 +150,26 @@ impl ControlService {
 
                 let calendar = Calendar::parse(&info.definition.cron, &info.definition.timezone)?;
                 let civil_slot = calendar.civil_slot_ms(slot)?;
-                let duplicate = if civil_slot != slot {
-                    slot_receipt(tx.inner_mut(), &request.schedule, civil_slot)
-                        .await?.filter(|previous| previous.config_revision == row.config_revision)
+                let skipped = if let Some(previous) = previous {
+                    Some(ScheduleClaim::SkippedDuplicate(receipt(&previous)?))
+                } else if civil_slot != slot {
+                    match slot_receipt(tx.inner_mut(), &request.schedule, civil_slot).await? {
+                        Some(early) if early.config_revision == row.config_revision =>
+                            Some(ScheduleClaim::SkippedDuplicate(receipt(&early)?)),
+                        None if observed_at.saturating_sub(civil_slot.max(row.created_at))
+                            >= super::super::telemetry::MIN_COMPACT_MS &&
+                            missing_cursor_history(tx.inner_mut(), &row, request.expected).await? =>
+                            Some(ScheduleClaim::SkippedUnverifiedFold),
+                        _ => None,
+                    }
                 } else {
                     None
                 };
-                if let Some(previous) = &duplicate
-                    && row.next_slot_utc_ms == next_slot
-                    && info.revision.get() == request.expected.get() + 1
+                if row.next_slot_utc_ms == next_slot
+                    && info.revision.get().checked_sub(1) == Some(request.expected.get())
+                    && let Some(outcome) = skipped
                 {
-                    return Ok((ScheduleClaim::SkippedDuplicate(receipt(previous)?), Vec::new()));
+                    return Ok((outcome, Vec::new()));
                 }
                 expect(&row, request.expected)?;
                 if row.next_slot_utc_ms != Some(slot) {
@@ -161,9 +179,9 @@ impl ControlService {
                 if calendar.next_ms(request.slot.max(trusted_instant))? != next_slot {
                     return Err(invalid(ValidationReason::InvalidTimestamp));
                 }
-                if let Some(previous) = &duplicate {
+                if let Some(outcome) = skipped {
                     advance(tx.inner_mut(), &request.schedule, next_slot, &row, self.clock.now_ms()?).await?;
-                    return Ok((ScheduleClaim::SkippedDuplicate(receipt(previous)?), Vec::new()));
+                    return Ok((outcome, Vec::new()));
                 }
                 validate(&info.definition, request.next_slot, RunLimits::HARD_CEILING, false)?;
 
@@ -300,7 +318,27 @@ impl ControlService {
     }
 }
 
-async fn slot_receipt(
+/// Configuration edits bump both counters; claims and duplicate skips only
+/// bump the schedule revision. If receipts explain all prior cursor advances,
+/// the absence of an early-fold receipt still proves it was never issued.
+async fn missing_cursor_history(
+    tx: &mut Transaction,
+    row: &AgentSchedulesRow,
+    expected: ControlRevision,
+) -> Result<bool, PortError> {
+    let advances = expected.get().saturating_sub(row.config_revision as u64);
+    if advances == 0 {
+        return Ok(false);
+    }
+    let retained = rows!(tx, (i64,), fetch_one,
+        "SELECT COUNT(*) FROM agent_schedule_runs WHERE schedule_id=$1",
+        "SELECT COUNT(*) FROM v1_control.agent_schedule_runs WHERE schedule_id=$1";
+        &row.schedule_id)?
+    .0;
+    Ok((retained as u64) < advances)
+}
+
+pub(super) async fn slot_receipt(
     tx: &mut Transaction,
     schedule: &ScheduleId,
     slot: i64,

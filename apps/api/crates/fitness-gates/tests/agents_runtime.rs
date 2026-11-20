@@ -1,6 +1,8 @@
 //! Exercise agent entry points with the real control and canonical owners.
 #[path = "agents_runtime/abilities.rs"]
 mod ability_cases;
+#[path = "agents_runtime/ability_rollback.rs"]
+mod ability_rollback;
 #[path = "agents_runtime/authoring_authority.rs"]
 mod authoring_authority_cases;
 #[path = "agents_runtime/compaction.rs"]
@@ -25,6 +27,8 @@ mod moved_note_cases;
 mod proposal_cases;
 #[path = "agents_runtime/proposal_notes.rs"]
 mod proposal_note_cases;
+#[path = "agents_runtime/rollback_receipts.rs"]
+mod rollback_receipts;
 #[path = "agents_runtime/runtime_abilities.rs"]
 mod runtime_ability_cases;
 #[path = "agents_runtime/supervised_chat.rs"]
@@ -313,6 +317,15 @@ impl RuntimeFixture {
     }
 
     async fn pat(&self, scope: BearerScope, ability_write: bool) -> AccountContext {
+        self.pat_with_expiry(scope, ability_write, None).await
+    }
+
+    async fn pat_with_expiry(
+        &self,
+        scope: BearerScope,
+        ability_write: bool,
+        expires_at_ms: Option<i64>,
+    ) -> AccountContext {
         let account = self
             .control
             .account(self.human.clone(), self.human.auth().principal().clone())
@@ -327,7 +340,7 @@ impl RuntimeFixture {
                     scope,
                     ability_write,
                     selected_spaces: None,
-                    expires_at_ms: None,
+                    expires_at_ms,
                     expected: account.revision,
                 },
             )

@@ -1253,7 +1253,7 @@ pub(crate) async fn edit_note_impl(
         request.preconditions,
         request.input.note,
         base_head.head_rev_id,
-        None,
+        CarrierReplacement::Edit,
         info,
         ticket,
         reservation_opt,
@@ -1373,6 +1373,12 @@ impl CarrierRoomCommit {
     }
 }
 
+pub(crate) enum CarrierReplacement {
+    Edit,
+    Rename(String, String),
+    RestartMemory,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_carrier_replacement_intent(
     store: &CanonicalStore,
@@ -1385,7 +1391,7 @@ pub(crate) fn build_carrier_replacement_intent(
     preconditions: Preconditions,
     note_id: NoteId,
     expected_base_rev: RevisionId,
-    explicit_slug_override: Option<(String, String)>,
+    operation: CarrierReplacement,
     info: PreparedCarrierInfo,
     ticket: crate::blobs::StagedBlobTicket,
     reservation_opt: Option<CarrierRoomWrite>,
@@ -1404,7 +1410,15 @@ pub(crate) fn build_carrier_replacement_intent(
         execute: Box::new(move |tx, item_ctx| {
             Box::pin(async move {
                 let head = load_note_head_row_tx(tx, &scope_cl.space_id, &note_id).await?;
-                if head.lifecycle != Lifecycle::Active {
+                let restarting = matches!(operation, CarrierReplacement::RestartMemory);
+                let expected_lifecycle = if restarting {
+                    Lifecycle::Trashed
+                } else {
+                    Lifecycle::Active
+                };
+                if head.lifecycle != expected_lifecycle
+                    || (restarting && head.doc_class != DocClass::AgentMemory)
+                {
                     return Err(DomainError::ResourceNotFound.into());
                 }
                 let (facts, anc) = build_resource_facts_tx(
@@ -1446,39 +1460,38 @@ pub(crate) fn build_carrier_replacement_intent(
                 check_collab_preconditions_tx(tx, &scope_cl.space_id, &note_id, &preconditions)
                     .await?;
 
-                let (final_slug, final_slug_fold) = match &explicit_slug_override {
-                    Some((s, sf)) => {
+                let (final_slug, final_slug_fold) = match &operation {
+                    CarrierReplacement::Rename(slug, folded) => {
                         super::folder_cover::validate_slug_change(
                             &head.slug_fold,
-                            sf,
-                            s,
+                            folded,
+                            slug,
                             anc.cover_note.as_ref() == Some(&note_id),
                         )?;
-                        if sf != &head.slug_fold
-                            && active_note_sibling_exists_tx(
-                                tx,
-                                &scope_cl.space_id,
-                                &head.parent_folder_id,
-                                sf,
-                                Some(&note_id),
-                            )
-                            .await?
-                        {
-                            let report_parent = (head.parent_folder_id != item_ctx.root_folder_id)
-                                .then_some(head.parent_folder_id.clone());
-                            return Err(DomainError::PathConflict {
-                                target: PathTarget {
-                                    space_id: scope_cl.space_id.clone(),
-                                    parent: report_parent,
-                                    component: s.clone(),
-                                },
-                            }
-                            .into());
-                        }
-                        (s.clone(), sf.clone())
+                        (slug.clone(), folded.clone())
                     }
-                    None => (head.slug.clone(), head.slug_fold.clone()),
+                    _ => (head.slug.clone(), head.slug_fold.clone()),
                 };
+                if (restarting || final_slug_fold != head.slug_fold)
+                    && active_note_sibling_exists_tx(
+                        tx,
+                        &scope_cl.space_id,
+                        &head.parent_folder_id,
+                        &final_slug_fold,
+                        Some(&note_id),
+                    )
+                    .await?
+                {
+                    return Err(DomainError::PathConflict {
+                        target: PathTarget {
+                            space_id: scope_cl.space_id.clone(),
+                            parent: (head.parent_folder_id != item_ctx.root_folder_id)
+                                .then_some(head.parent_folder_id.clone()),
+                            component: final_slug,
+                        },
+                    }
+                    .into());
+                }
 
                 if let Some(ab_id) = &head.ability_id
                     && final_slug_fold != head.slug_fold
@@ -1535,7 +1548,7 @@ pub(crate) fn build_carrier_replacement_intent(
                     BackendConn::Sqlite(conn) => {
                         sqlx::query(
                             "UPDATE note_heads
-                             SET slug = ?, slug_fold = ?, title = ?, title_fold = ?,
+                             SET lifecycle_state = 'active', slug = ?, slug_fold = ?, title = ?, title_fold = ?,
                                  head_rev_id = ?, content_blake3 = ?, byte_size = ?,
                                  updated_seq = ?, updated_at_sec = ?, updated_at_nsec = ?, last_actor_id = ?
                              WHERE space_id = ? AND note_id = ?",
@@ -1562,7 +1575,7 @@ pub(crate) fn build_carrier_replacement_intent(
                     BackendConn::Postgres(conn) => {
                         sqlx::query(
                             "UPDATE note_heads
-                             SET slug = $1, slug_fold = $2, title = $3, title_fold = $4,
+                             SET lifecycle_state = 'active', slug = $1, slug_fold = $2, title = $3, title_fold = $4,
                                  head_rev_id = $5, content_blake3 = $6, byte_size = $7,
                                  updated_seq = $8, updated_at_sec = $9, updated_at_nsec = $10, last_actor_id = $11
                              WHERE space_id = $12 AND note_id = $13",
@@ -1670,10 +1683,10 @@ pub(crate) fn build_carrier_replacement_intent(
                     .await?;
                 }
 
-                let op_kind = if explicit_slug_override.is_some() {
-                    "rename"
-                } else {
-                    "edit"
+                let op_kind = match operation {
+                    CarrierReplacement::Rename(..) => "rename",
+                    CarrierReplacement::Edit => "edit",
+                    CarrierReplacement::RestartMemory => "restore",
                 };
 
                 let cmd_id = new_prefixed_hex_id("cmd_")?;
@@ -2937,7 +2950,7 @@ pub(crate) async fn rename_note_impl(
                 request.preconditions,
                 request.input.note,
                 base_head.head_rev_id,
-                Some((request.input.slug, new_slug_fold)),
+                CarrierReplacement::Rename(request.input.slug, new_slug_fold),
                 info,
                 ticket,
                 None,
@@ -5353,6 +5366,7 @@ async fn authorize_schema_placement_tx(
     (
         Option<crate::domain::common::NoteHeadRow>,
         crate::domain::common::FolderAncestryFacts,
+        bool,
     ),
     PortError,
 > {
@@ -5361,8 +5375,8 @@ async fn authorize_schema_placement_tx(
         build_resource_facts_tx(tx, &space.space, destination, DocClass::UserDoc, None, true)
             .await?;
     let head = load_note_head_row_opt_tx(tx, &space.space.id, note).await?;
-    if let Some(head) = &head {
-        let (before, _) = build_resource_facts_tx(
+    let is_cover = if let Some(head) = &head {
+        let (before, source) = build_resource_facts_tx(
             tx,
             &space.space,
             &head.parent_folder_id,
@@ -5372,10 +5386,12 @@ async fn authorize_schema_placement_tx(
         )
         .await?;
         auth.authorize_direct_write(&before, &after)?;
+        source.cover_note.as_ref() == Some(note)
     } else {
         auth.authorize_direct_write(&after, &after)?;
-    }
-    Ok((head, anc))
+        false
+    };
+    Ok((head, anc, is_cover))
 }
 
 pub(crate) async fn update_space_schema_impl(
@@ -5491,7 +5507,7 @@ pub(crate) async fn update_space_schema_impl(
                     .parent
                     .clone()
                     .unwrap_or_else(|| item_ctx.root_folder_id.clone());
-                let (existing_note, anc) = authorize_schema_placement_tx(
+                let (existing_note, anc, folder_page) = authorize_schema_placement_tx(
                     tx,
                     &live_space,
                     &auth,
@@ -5499,6 +5515,23 @@ pub(crate) async fn update_space_schema_impl(
                     &parent_id,
                 )
                 .await?;
+
+                if let Some(head) = &existing_note {
+                    super::folder_cover::validate_slug_change(
+                        &head.slug_fold,
+                        &slug_fold,
+                        &input.slug,
+                        folder_page,
+                    )?;
+                    if folder_page && head.parent_folder_id != parent_id {
+                        return Err(DomainError::validation(
+                            ValidationReason::InvalidPathComponent,
+                        )
+                        .into());
+                    }
+                } else {
+                    super::folder_cover::validate_new_slug(&input.slug, false)?;
+                }
 
                 if existing_note.is_none() && preconditions.revision.is_some() {
                     return Err(DomainError::ResourceNotFound.into());
@@ -5825,7 +5858,7 @@ pub(crate) async fn update_space_schema_impl(
                 let run_opt = extract_agent_run_from_auth(&auth);
                 let meta = RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Note(
                     NoteRevisionMetadata {
-                        folder_page: false,
+                        folder_page,
                         note_id: input.schema_note.clone(),
                         parent_folder_id: parent_id,
                         is_root_child: anc.is_root_child,

@@ -132,6 +132,15 @@ pub(super) async fn check(
     assert_eq!(carrier.matches("Second durable fact.").count(), 1);
     assert!(!carrier.contains("Stale proposal."));
 
+    Box::pin(rollback_new_category(
+        store,
+        &ctx,
+        &account,
+        target.clone(),
+        owner,
+    ))
+    .await;
+
     let parallel = store
         .inspect_memory_target(account, target, "parallel".into())
         .await
@@ -172,4 +181,99 @@ pub(super) async fn check(
     let content = snap.document.explicit_read(ctx.auth()).unwrap();
     assert_eq!(content.matches("Unique first.").count(), 1);
     assert_eq!(content.matches("Unique second.").count(), 1);
+}
+
+async fn rollback_new_category(
+    store: &CanonicalStore,
+    ctx: &SpaceContext,
+    account: &AccountContext,
+    target: MemoryTarget,
+    owner: &PrincipalId,
+) {
+    let category = "rollback-new";
+    let slot = || store.inspect_memory_target(account.clone(), target.clone(), category.into());
+    let original = slot().await.unwrap();
+    let write = |text: &str, summary: Option<&str>| {
+        next_mutation(
+            ctx.scope(),
+            owner,
+            AppendMemory {
+                target: original.resolved.clone(),
+                text: text.into(),
+                summary: summary.map(str::to_owned),
+                mode: MemoryWriteMode::CreateIfMissing,
+            },
+        )
+    };
+    // Rolling back the second run restores the first tombstone. A subsequent
+    // observation must still start from an empty carrier at the same stable ID.
+    for n in [237, 238] {
+        let run = sample_run_id(n);
+        let auth = ctx
+            .auth()
+            .for_agent_run(
+                run.clone(),
+                ctx.scope().space_id.clone(),
+                ChatAudience::Personal,
+                ctx.auth().spaces().clone(),
+            )
+            .unwrap();
+        let agent = SpaceContext::new(auth, ctx.scope().clone(), make_budget()).unwrap();
+        let created = store
+            .append_memory(agent, write("Undone observation.", Some("Undone summary")))
+            .await
+            .unwrap();
+        assert_eq!(created.value.outcome, MemoryAppendOutcome::Created);
+        let undone = store
+            .rollback_agent_run_by_id(ctx.clone(), next_mutation(ctx.scope(), owner, run))
+            .await
+            .unwrap();
+        assert_eq!(undone.value.trashed.len() + undone.value.restored.len(), 1);
+        assert!(slot().await.unwrap().revision.is_none());
+    }
+    let new = write("New observation.", None);
+    let created = store.append_memory(ctx.clone(), new.clone()).await.unwrap();
+    assert_eq!(created.value.outcome, MemoryAppendOutcome::Created);
+    let replayed = store.append_memory(ctx.clone(), new).await.unwrap();
+    assert_eq!(replayed.receipt, created.receipt);
+    let note = store
+        .get_note(
+            ctx.clone(),
+            GetNote {
+                note: original.resolved.note.note_id.clone(),
+                revision: None,
+                causal: CausalBasis::Exact(ReceiptSet::default()),
+            },
+        )
+        .await
+        .unwrap();
+    let carrier = note.document.explicit_read(ctx.auth()).unwrap();
+    assert_eq!(carrier.matches("New observation.").count(), 1);
+    assert!(!carrier.contains("Undone"));
+
+    store
+        .delete_note(
+            ctx.clone(),
+            next_mutation(
+                ctx.scope(),
+                owner,
+                DeleteNote {
+                    note: original.resolved.note.note_id.clone(),
+                    disposition: DeleteDisposition::Trash,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        slot().await.unwrap_err(),
+        PortError::Domain(DomainError::ResourceNotFound)
+    );
+    assert_eq!(
+        store
+            .append_memory(ctx.clone(), write("Do not revive.", None))
+            .await
+            .unwrap_err(),
+        PortError::Domain(DomainError::ResourceNotFound)
+    );
 }

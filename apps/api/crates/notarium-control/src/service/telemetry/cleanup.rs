@@ -227,12 +227,17 @@ impl ControlService {
                             compact, remaining
                         )? as i64;
                     }
+                    // A legacy due may be the late UTC instant of a repeated civil
+                    // time. Each Chrono offset has absolute value below 24 hours,
+                    // so the two instants differ by less than 48 hours. Preserve
+                    // this small window across configuration changes until the
+                    // schedule advances; claims resolve the exact civil instant.
                     if remaining > 0 {
                         remaining -= execute!(
                             tx.inner_mut(),
-                            "DELETE FROM agent_schedule_runs WHERE run_id IN (SELECT run_id FROM agent_schedule_runs WHERE status IN ('succeeded','failed','unknown') AND finished_at IS NOT NULL AND finished_at<=$1 ORDER BY finished_at,run_id LIMIT $2)",
-                            "DELETE FROM v1_control.agent_schedule_runs WHERE run_id IN (SELECT run_id FROM v1_control.agent_schedule_runs WHERE status IN ('succeeded','failed','unknown') AND finished_at IS NOT NULL AND finished_at<=$1 ORDER BY finished_at,run_id LIMIT $2 FOR UPDATE SKIP LOCKED)";
-                            compact, remaining
+                            "DELETE FROM agent_schedule_runs WHERE run_id IN (SELECT r.run_id FROM agent_schedule_runs r WHERE r.status IN ('succeeded','failed','unknown') AND r.finished_at IS NOT NULL AND r.finished_at<=$1 AND NOT EXISTS(SELECT 1 FROM agent_schedules s WHERE s.schedule_id=r.schedule_id AND s.deleted_at IS NULL AND r.slot_utc_ms BETWEEN s.next_slot_utc_ms-$3 AND s.next_slot_utc_ms) ORDER BY r.finished_at,r.run_id LIMIT $2)",
+                            "DELETE FROM v1_control.agent_schedule_runs WHERE run_id IN (SELECT r.run_id FROM v1_control.agent_schedule_runs r WHERE r.status IN ('succeeded','failed','unknown') AND r.finished_at IS NOT NULL AND r.finished_at<=$1 AND NOT EXISTS(SELECT 1 FROM v1_control.agent_schedules s WHERE s.schedule_id=r.schedule_id AND s.deleted_at IS NULL AND r.slot_utc_ms BETWEEN s.next_slot_utc_ms-$3 AND s.next_slot_utc_ms) ORDER BY r.finished_at,r.run_id LIMIT $2 FOR UPDATE OF r SKIP LOCKED)";
+                            compact, remaining, 2 * DAY
                         )? as i64;
                     }
                     if remaining > 0 {

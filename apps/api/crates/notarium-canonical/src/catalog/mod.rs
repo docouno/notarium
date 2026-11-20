@@ -411,6 +411,6 @@ impl ControlCatalogPort for CanonicalStore {
         target: MemoryTarget,
         category: String,
     ) -> PortFuture<'_, MemoryTargetSnapshot> {
-        Box::pin(async move { memory::inspect(self, &ctx, target, category).await })
+        Box::pin(async move { memory::inspect(self, &ctx, target, category, true).await })
     }
 }

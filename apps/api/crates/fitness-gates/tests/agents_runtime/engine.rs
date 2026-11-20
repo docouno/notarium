@@ -15,6 +15,7 @@ use notarium_core::{
 };
 use std::{
     collections::BTreeMap,
+    sync::atomic::{AtomicUsize, Ordering},
     sync::{Arc, Mutex},
 };
 use tokio::sync::oneshot;
@@ -30,6 +31,10 @@ struct ObservingEffectRegistration {
 }
 
 impl CanonicalEffectRegistration for ObservingEffectRegistration {
+    fn restrict_until(&self, deadline: std::time::Instant) -> Result<(), PortError> {
+        self.inner.restrict_until(deadline)
+    }
+
     fn check(&self) -> Result<(), PortError> {
         self.inner.check()
     }
@@ -37,6 +42,9 @@ impl CanonicalEffectRegistration for ObservingEffectRegistration {
     fn begin(self: Arc<Self>) -> PortFuture<'static, Box<dyn RevocationLease>> {
         Box::pin(async move {
             let lease = self.inner.clone().begin().await?;
+            self.fixtures
+                .admitted_sql_effects
+                .fetch_add(1, Ordering::Relaxed);
             let pause = self.fixtures.active_sql_effect.lock().unwrap().take();
             if let Some(pause) = pause {
                 let _ = pause.entered.send(self.cancellation.clone());
@@ -106,6 +114,7 @@ impl SessionRevocationPort for TestRevocations {
 
 #[derive(Default)]
 pub struct ProjectionFixtures {
+    pub admitted_sql_effects: AtomicUsize,
     seed: Mutex<Option<ProjectionFixture>>,
     directory: Mutex<BTreeMap<EffectiveReadId, NoteQuery>>,
     before_ability_trash: Mutex<Option<MutationPause>>,
@@ -114,6 +123,7 @@ pub struct ProjectionFixtures {
     before_memory_append: Mutex<Option<MutationPause>>,
     lose_note_edit_ack: Mutex<bool>,
     before_chat_consume: Mutex<Option<MutationPause>>,
+    before_chat_hydration: Mutex<Option<MutationPause>>,
     chat_consume: Mutex<ChatConsumeFixture>,
     before_chat_submit: Mutex<Option<MutationPause>>,
     before_chat_lookup: Mutex<Option<MutationPause>>,
@@ -127,6 +137,7 @@ pub struct ProjectionFixtures {
     submit_unknown_then_not_committed: Mutex<u8>,
     lose_claim_acks: Mutex<usize>,
     lose_finish_acks: Mutex<usize>,
+    pub fail_finish_once: Mutex<bool>,
 }
 
 #[derive(Default)]
@@ -217,6 +228,10 @@ impl ProjectionFixtures {
 
     pub fn pause_chat_consume(&self) -> (oneshot::Receiver<Cancellation>, oneshot::Sender<()>) {
         MutationPause::install(&self.before_chat_consume)
+    }
+
+    pub fn pause_chat_hydration(&self) -> (oneshot::Receiver<Cancellation>, oneshot::Sender<()>) {
+        MutationPause::install(&self.before_chat_hydration)
     }
 
     pub fn trace_chat_consume_with_lost_ack(&self) {
@@ -371,7 +386,7 @@ canonical_port!(NoteWritePort;
 
 canonical_port!(ChatPort;
     read_chat(ChatRead) -> ChatBranch,
-    read_chat_contents(ChatContentRead) -> Vec<HydratedChatEntry>,
+    read_chat_compaction_prefix(ChatRead) -> ChatCompactionPrefix,
     read_chat_proposal(ChatProposalRead) -> CanonicalChatProposal,
     stage_chat_blob(String) -> StagedChatBlob,
     discard_staged_chat_blob(StagedChatBlob) -> (),
@@ -382,6 +397,12 @@ canonical_port!(ChatPort;
     list_pending_chat_inputs(ChatThreadId) -> Vec<QueuedChatInput>,
     dismiss_chat_input(DismissPending) -> bool,
     recover_active_run(ChatRunRequest) -> FinishChatRunOutcome;
+    fn read_chat_contents(&self, ctx: SpaceContext, request: ChatContentRead) -> PortFuture<'_, Vec<HydratedChatEntry>> {
+        Box::pin(async move {
+            MutationPause::enter(&self.1.before_chat_hydration, ctx.budget.cancellation.clone()).await;
+            ChatPort::read_chat_contents(&self.0, ctx, request).await
+        })
+    }
     fn read_chat_context(
         &self,
         ctx: SpaceContext,
@@ -471,6 +492,11 @@ canonical_port!(ChatPort;
     }
     fn finish_run_if_queue_empty(&self, ctx: SpaceContext, request: ChatRunRequest) -> PortFuture<'_, FinishChatRunOutcome> {
         Box::pin(async move {
+            if std::mem::take(&mut *self.1.fail_finish_once.lock().unwrap()) {
+                return Err(PortError::Internal(OperationalFailure::new(
+                    ContentDigest::from_bytes([191; 32]), CommitEffect::NotCommitted, RetryAdvice::Never, false,
+                ).unwrap()));
+            }
             let finished = ChatPort::finish_run_if_queue_empty(&self.0, ctx, request).await?;
             if finished == FinishChatRunOutcome::Cleared {
                 if let Some(pause) = self

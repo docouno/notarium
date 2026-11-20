@@ -1,4 +1,4 @@
-use super::super::{EgressTarget, ToolCallContext, session};
+use super::super::{ToolCallContext, session};
 use notarium_core::{
     error::PortError,
     ids::{EpisodeId, SpaceId, SpaceSeq},
@@ -18,26 +18,7 @@ pub(super) async fn targets(
     episode: Option<&EpisodeId>,
     all_spaces: bool,
 ) -> Result<Vec<ReadTarget>, PortError> {
-    let episode_project = match episode {
-        Some(id) => {
-            call.registry
-                .control
-                .get_episode(call.account(), id.clone())
-                .await?
-                .project_hint
-        }
-        None => None,
-    };
-    let target = match project {
-        Some(handle) => Some(session::resolve_project(call, handle).await?.folder),
-        None => episode_project,
-    };
-    let target = match &call.target {
-        EgressTarget::InAppProvider {
-            primary_project, ..
-        } => target.or_else(|| primary_project.clone()),
-        EgressTarget::ExternalMcp => target,
-    };
+    let target = session::selected_project(call, project, episode).await?;
     if let Some(project) = target {
         session::project_for_folder(call, &project).await?;
         return Ok(vec![

@@ -1044,8 +1044,16 @@ impl CanonicalStore {
                             if let Some(cached) = payload_cache.get(pid) {
                                 cached.clone()
                             } else {
-                                let loaded =
-                                    load_decoded_effect_tx(tx, &after.scope.space_id, pid).await?;
+                                let loaded = match load_decoded_effect_tx(tx, &after.scope.space_id, pid).await {
+                                    // Activity can still show independently authorized revision metadata
+                                    // from this command, including siblings of a purged note.
+                                    Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
+                                        if with_provenance && diagnostic.reason == ValidationReason::PurgeResync =>
+                                    {
+                                        MutationEffect::AwaitProjection { reason: AwaitReason::UnavailableVersion }
+                                    }
+                                    result => result?,
+                                };
                                 payload_cache.insert(pid.clone(), loaded.clone());
                                 loaded
                             }
@@ -1073,18 +1081,24 @@ impl CanonicalStore {
                         && change.lifecycle != Lifecycle::Purged
                         && change.class != Some(notarium_core::classes::DocClass::EncryptedNote)
                         && let EntityId::Note(note) = &change.entity
-                        && let Some(record) = read_immutable_revision_tx(
-                            tx, &after.scope, "note", note.as_str(), last_seq,
-                        ).await?
-                        && record.revision_id == change.revision
-                        && let RevisionMetadataPayload::Note(meta) = record.metadata.payload
                     {
-                        let ancestry = crate::domain::common::FolderAncestryCache::at_cut(&after.scope, last_seq)
-                            .load_ancestry_tx(tx, &after.scope.space_id, &meta.parent_folder_id, false)
-                            .await?;
-                        change.provenance = Some(ancestry.note_provenance(
-                            note, &meta.slug, meta.title, record.actor_id, record.created_at,
-                        ));
+                        let record = match read_immutable_revision_tx(
+                            tx, &after.scope, "note", note.as_str(), last_seq,
+                        ).await {
+                            Err(PortError::Domain(DomainError::ResourceNotFound)) => continue,
+                            result => result?,
+                        };
+                        if let Some(record) = record
+                            && record.revision_id == change.revision
+                            && let RevisionMetadataPayload::Note(meta) = record.metadata.payload
+                        {
+                            let ancestry = crate::domain::common::FolderAncestryCache::at_cut(&after.scope, last_seq)
+                                .load_ancestry_tx(tx, &after.scope.space_id, &meta.parent_folder_id, false)
+                                .await?;
+                            change.provenance = Some(ancestry.note_provenance(
+                                note, &meta.slug, meta.title, record.actor_id, record.created_at,
+                            ));
+                        }
                     }
                     changes.push(change);
                 }

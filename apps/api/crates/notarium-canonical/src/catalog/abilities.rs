@@ -402,6 +402,7 @@ pub(super) async fn pin_schedule(
         abilities.push(current);
     }
     guard.check()?;
+    guard.finish_snapshot();
     Ok(Box::new(SchedulePin {
         _guard: guard,
         history: space.scope,

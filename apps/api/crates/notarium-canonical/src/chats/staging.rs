@@ -65,6 +65,7 @@ impl CanonicalStore {
         let store = self.clone();
         let result = self
             .with_auxiliary_command(
+                ctx.scope().space_id.clone(),
                 Some((&budget, deadline)),
                 |handoff| {
                     drop(handoff);
@@ -237,7 +238,7 @@ impl Drop for UndeliveredLease {
         let task = self.store.inner.backup_executor.spawn(async move {
             let mut delay = std::time::Duration::from_millis(25);
             loop {
-                let cleanup = store.with_write_tx(|tx| {
+                let cleanup = store.with_write_tx_for_space(Some(scope.space_id.clone()), |tx| {
                     let scope = scope.clone();
                     let staged = staged.clone();
                     let lease = lease.clone();

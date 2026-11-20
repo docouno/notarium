@@ -3,12 +3,13 @@ use notarium_agents::chats::{
     AgentRunSupervisor, ChatRunOptions, ChatSubscription, ExclusiveDataRoot, StartChatRun,
     stream::{StreamCheckpoint, StreamRead},
 };
+use notarium_control::auth::token::{TokenKind, mint};
 use notarium_core::{
-    auth::{EngineAuthContext, SpaceGrant, SpaceKind, SpaceRole, VerifiedHuman},
+    auth::{SpaceKind, SpaceRole},
     classes::{ClassEgressFence, DocClass},
     ids::ThreadEntrySeq,
 };
-use std::{collections::BTreeMap, time::Duration};
+use std::{sync::atomic::Ordering, time::Duration};
 use tokio::{
     io::{AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
@@ -36,12 +37,12 @@ async fn postgres_group_wire_attribution_and_reconnect() {
 }
 
 async fn exercise(postgres: bool) {
-    let fixture = RuntimeFixture::open_named(postgres, "group_wire").await;
-    Box::pin(peer_contributions_keep_attributed_boundaries(&fixture)).await;
+    let mut fixture = RuntimeFixture::open_named(postgres, "group_wire").await;
+    Box::pin(peer_contributions_keep_attributed_boundaries(&mut fixture)).await;
     fixture.close().await;
 }
 
-async fn peer_contributions_keep_attributed_boundaries(fixture: &RuntimeFixture) {
+async fn peer_contributions_keep_attributed_boundaries(fixture: &mut RuntimeFixture) {
     let shared = fixture
         .control
         .create_space(
@@ -100,28 +101,35 @@ async fn peer_contributions_keep_attributed_boundaries(fixture: &RuntimeFixture)
         )
         .await
         .unwrap();
-    // The canonical fixture consumes the already admitted peer context.
-    let peer_scope = SpaceContext::new(
-        EngineAuthContext::for_human(VerifiedHuman::attest(
-            peer.clone(),
-            GrantId::from_bytes([101; 16]),
-            BTreeMap::from([(
-                membership.value.space,
-                SpaceGrant {
-                    role: membership.value.role.unwrap(),
-                    read_classes: DocClass::all(),
-                    write_classes: DocClass::all(),
-                    project_root: None,
-                },
-            )]),
-            false,
-        )),
-        shared.history,
-        budget(),
+    let token = mint(TokenKind::Session).unwrap();
+    fixture
+        .storage
+        .observer
+        .seed_session(
+            &peer,
+            &AuthSessionId::from_bytes([101; 16]),
+            &token,
+            fixture.storage.clock.0.load(Ordering::SeqCst),
+        )
+        .await;
+    let auth = fixture
+        .control
+        .resolve(support::evidence(
+            AuthEvidenceKind::Session,
+            token.secret.expose(),
+        ))
+        .await
+        .unwrap();
+    let peer_scope = SpaceContext::new(auth, shared.history, budget()).unwrap();
+    group_turn(
+        fixture,
+        &human,
+        &scope,
+        &peer_scope,
+        membership.revision,
+        76,
     )
-    .unwrap();
-
-    group_turn(fixture, &human, &scope, &peer_scope, 76).await;
+    .await;
 }
 
 async fn group_turn(
@@ -129,6 +137,7 @@ async fn group_turn(
     human: &AccountContext,
     scope: &SpaceContext,
     peer: &SpaceContext,
+    membership: ControlRevision,
     tag: u8,
 ) {
     let thread = ChatThreadId::from_bytes([tag; 16]);
@@ -141,14 +150,14 @@ async fn group_turn(
     fixture
         .canonical
         .create_chat(
-            scope.clone(),
+            peer.clone(),
             Mutation {
-                identity: command(scope, 0),
+                identity: command(peer, 0),
                 preconditions: Preconditions::default(),
                 input: CreateChat {
                     thread: thread.clone(),
                     kind: ChatThreadKind::SpaceGroup,
-                    owner: human.auth().principal().clone(),
+                    owner: peer.auth().principal().clone(),
                     project_folder: None,
                     title: "Group wire".into(),
                 },
@@ -170,6 +179,7 @@ async fn group_turn(
                     body: ChatInputBody::Text(PEER_TEXT.into()),
                     tool_calls: vec![],
                     provenance: None,
+                    interruption: None,
                     proposed_diff: None,
                     referenced_notes: vec![],
                     tainted: false,
@@ -365,7 +375,7 @@ async fn group_turn(
                 scope: scope.scope().clone(),
                 thread: thread.clone(),
                 expected_leaf: sender.value.seq,
-                options,
+                options: options.clone(),
             },
         )
         .await
@@ -397,6 +407,7 @@ async fn group_turn(
                     body: ChatInputBody::Text("A new peer message.".into()),
                     tool_calls: Vec::new(),
                     provenance: None,
+                    interruption: None,
                     proposed_diff: None,
                     referenced_notes: Vec::new(),
                     tainted: false,
@@ -436,7 +447,198 @@ async fn group_turn(
     })
     .await
     .unwrap();
+    let demoted = fixture
+        .control
+        .change_membership(
+            scope.clone(),
+            MembershipChange {
+                command: CommandKey::from_bytes([165; 16]),
+                member: peer.auth().principal().clone(),
+                role: Some(SpaceRole::Viewer),
+                expected: membership,
+            },
+        )
+        .await
+        .unwrap();
+    let run = supervisor
+        .start(
+            human.clone(),
+            StartChatRun {
+                scope: scope.scope().clone(),
+                thread: thread.clone(),
+                expected_leaf: accepted_peer.seq,
+                options: options.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    let (socket, _) = timeout(WIRE_DEADLINE, read_request(&listener))
+        .await
+        .unwrap();
+    let peer_account = AccountContext::new(peer.auth().clone(), budget());
+    assert!(matches!(
+        supervisor
+            .stop(
+                peer_account.clone(),
+                scope.scope().clone(),
+                thread.clone(),
+                run.clone()
+            )
+            .await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+    fixture
+        .control
+        .change_membership(
+            scope.clone(),
+            MembershipChange {
+                command: CommandKey::from_bytes([166; 16]),
+                member: peer.auth().principal().clone(),
+                role: Some(SpaceRole::Editor),
+                expected: demoted.revision,
+            },
+        )
+        .await
+        .unwrap();
+    supervisor
+        .stop(peer_account, scope.scope().clone(), thread.clone(), run)
+        .await
+        .unwrap();
+    drop(socket);
+    Box::pin(catch_up_long_group(
+        fixture,
+        &supervisor,
+        human,
+        scope,
+        &listener,
+        options,
+    ))
+    .await;
     supervisor.shutdown();
+}
+
+async fn catch_up_long_group(
+    fixture: &RuntimeFixture,
+    supervisor: &AgentRunSupervisor,
+    human: &AccountContext,
+    ctx: &SpaceContext,
+    listener: &TcpListener,
+    options: ChatRunOptions,
+) {
+    let thread = ChatThreadId::from_bytes([184; 16]);
+    let key = |ordinal| {
+        let mut bytes = [184; 16];
+        bytes[15] = ordinal;
+        bytes
+    };
+    let identity = |ordinal| CommandIdentity {
+        scope: ctx.scope().clone(),
+        actor: human.auth().principal().clone(),
+        key: CommandKey::from_bytes(key(ordinal)),
+        hash: ContentDigest::from_bytes([ordinal; 32]),
+    };
+    fixture
+        .canonical
+        .create_chat(
+            ctx.clone(),
+            Mutation {
+                identity: identity(0),
+                preconditions: Preconditions::default(),
+                input: CreateChat {
+                    thread: thread.clone(),
+                    kind: ChatThreadKind::SpaceGroup,
+                    owner: human.auth().principal().clone(),
+                    project_folder: None,
+                    title: "Long group".into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let mut leaf = ThreadEntrySeq::ZERO;
+    for ordinal in 1..=201u8 {
+        let mention = ordinal == 201;
+        let submitted = supervisor
+            .enqueue_input(
+                human.clone(),
+                SubmitUserChatInput {
+                    identity: identity(ordinal),
+                    id: PendingInputId::from_bytes(key(ordinal)),
+                    thread: thread.clone(),
+                    expected_leaf: leaf,
+                    body: format!("Message {ordinal}"),
+                    mentions_agent: mention,
+                },
+                options.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(submitted.run.is_some(), mention);
+        let SubmitUserChatOutcome::Appended(entry) = submitted.outcome else {
+            panic!("expected idle chat")
+        };
+        leaf = entry.value.seq;
+    }
+    let (mut summary, request) = timeout(WIRE_DEADLINE, read_request(listener))
+        .await
+        .unwrap();
+    let messages = request["messages"].as_array().unwrap();
+    assert!(
+        messages[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("older conversation prefix")
+    );
+    assert_eq!(messages[1]["content"], "Message 1");
+    let covered = messages.len() - 1;
+    assert!((1..201).contains(&covered));
+    super::runtime_ability_cases::send_ollama(
+        &mut summary,
+        json!({"role":"assistant","content":"Summary."}),
+        "stop",
+    )
+    .await;
+    drop(summary);
+    let (mut answer, request) = timeout(WIRE_DEADLINE, read_request(listener))
+        .await
+        .unwrap();
+    let messages = request["messages"].as_array().unwrap();
+    assert_eq!(messages[1]["content"], "Summary.");
+    assert_eq!(messages.len() - 2, 201 - covered);
+    for (ordinal, message) in (covered + 1..=201).zip(&messages[2..]) {
+        assert_eq!(message["content"], format!("Message {ordinal}"));
+    }
+    super::runtime_ability_cases::send_ollama(
+        &mut answer,
+        json!({"role":"assistant","content":"Done."}),
+        "stop",
+    )
+    .await;
+    drop(answer);
+    timeout(WIRE_DEADLINE, async {
+        loop {
+            let page = fixture
+                .canonical
+                .read_chat(
+                    ctx.clone(),
+                    ChatRead {
+                        thread: thread.clone(),
+                        leaf: ThreadEntrySeq::ZERO,
+                        before: None,
+                        max_entries: PageLimit::new(1).unwrap(),
+                    },
+                )
+                .await
+                .unwrap();
+            if page.thread.active_run.is_none() {
+                assert!(page.thread.head > leaf);
+                return;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
 }
 
 async fn checkpoint(subscription: &mut ChatSubscription) -> StreamCheckpoint {

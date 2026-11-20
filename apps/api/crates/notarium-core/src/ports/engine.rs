@@ -159,6 +159,12 @@ pub trait ChatPort: Send + Sync {
     /// its retained original suffix, with its durable sequence unchanged.
     fn read_chat_context(&self, ctx: SpaceContext, request: ChatRead)
     -> PortFuture<'_, ChatBranch>;
+    /// Read the oldest logical window when the suffix extends beyond a single page.
+    fn read_chat_compaction_prefix(
+        &self,
+        ctx: SpaceContext,
+        request: ChatRead,
+    ) -> PortFuture<'_, ChatCompactionPrefix>;
     fn read_chat_contents(
         &self,
         ctx: SpaceContext,

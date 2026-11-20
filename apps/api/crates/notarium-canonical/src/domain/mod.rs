@@ -251,7 +251,9 @@ impl CanonicalStore {
         ctx: SpaceContext,
         run: AgentRunId,
     ) -> Result<RollbackAgentRun, PortError> {
-        rollback::prepare_agent_run_rollback(self, ctx, run).await
+        rollback::prepare_agent_run_rollback(self, ctx, run)
+            .await
+            .map(|(prepared, _)| prepared)
     }
 
     pub fn room_fences(&self) -> &Arc<RoomFenceTable> {

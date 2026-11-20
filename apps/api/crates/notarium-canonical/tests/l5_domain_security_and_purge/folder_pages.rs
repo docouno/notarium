@@ -1,8 +1,14 @@
 use super::*;
 use notarium_core::ports::EnsureFolderPath;
 
-pub(super) async fn check(store: &CanonicalStore, scope: &HistoryScope, owner: &PrincipalId) {
+pub(super) async fn check(
+    store: &CanonicalStore,
+    scope: &HistoryScope,
+    owner: &PrincipalId,
+    schema_revision: &RevisionId,
+) {
     let ctx = owner_ctx(scope, owner.clone(), true, true);
+    let before_covers = store.read_space(&scope.space_id).await.unwrap().last_seq;
     let path = next_mutation(
         scope,
         owner,
@@ -94,6 +100,34 @@ pub(super) async fn check(store: &CanonicalStore, scope: &HistoryScope, owner: &
     };
     assert_eq!(cover_at(&left).await.as_ref(), Some(&left_note));
     assert_eq!(cover_at(&right).await.as_ref(), Some(&right_note));
+
+    for (note, parent, slug) in [
+        (
+            left_note.clone(),
+            right.folder_id.clone(),
+            "relocated-schema",
+        ),
+        (left_note.clone(), left.folder_id.clone(), "renamed-schema"),
+        (sample_note_id(237), left.folder_id.clone(), "INDEX"),
+    ] {
+        let request = next_mutation(
+            scope,
+            owner,
+            UpdateSpaceSchema {
+                schema_note: note,
+                parent: Some(parent),
+                slug: slug.into(),
+                carrier: "# Schema\n".into(),
+                schema: BTreeMap::new(),
+                expected_schema_revision: Some(schema_revision.clone()),
+            },
+        );
+        assert_validation_err(
+            &store.update_space_schema(ctx.clone(), request).await,
+            ValidationReason::InvalidPathComponent,
+        );
+    }
+    assert_eq!(cover_at(&left).await.as_ref(), Some(&left_note));
 
     let rename = store
         .rename_note(
@@ -206,7 +240,7 @@ pub(super) async fn check(store: &CanonicalStore, scope: &HistoryScope, owner: &
                 scope,
                 owner,
                 DeleteNote {
-                    note: right_note,
+                    note: right_note.clone(),
                     disposition: DeleteDisposition::Purge,
                 },
             ),
@@ -214,4 +248,59 @@ pub(super) async fn check(store: &CanonicalStore, scope: &HistoryScope, owner: &
         .await
         .unwrap();
     assert_eq!(cover_at(&right).await, None);
+    let updated = store
+        .update_space_schema(
+            ctx.clone(),
+            next_mutation(
+                scope,
+                owner,
+                UpdateSpaceSchema {
+                    schema_note: left_note.clone(),
+                    parent: Some(left.folder_id.clone()),
+                    slug: "index".into(),
+                    carrier: "# Schema cover\n".into(),
+                    schema: BTreeMap::new(),
+                    expected_schema_revision: Some(schema_revision.clone()),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let note = store
+        .get_note(
+            ctx.clone(),
+            GetNote {
+                note: left_note.clone(),
+                revision: Some(updated.value.note_revision),
+                causal: CausalBasis::Exact(Default::default()),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(note.provenance.unwrap().folder_page);
+    assert_eq!(cover_at(&left).await.as_ref(), Some(&left_note));
+
+    // Purging a note erases its old effects. Activity still includes the surviving
+    // cover with its authorized metadata; delta consumers must reseed.
+    let query = ChangeRead::Log {
+        after: ChangeCursor {
+            scope: scope.clone(),
+            after: before_covers,
+        },
+        through: store.read_space(&scope.space_id).await.unwrap().last_seq,
+        limit: PageLimit::new(200).unwrap(),
+    };
+    assert_validation_err(
+        &store.read_changes(ctx.clone(), query.clone()).await,
+        ValidationReason::PurgeResync,
+    );
+    let ChangeReadResult::Log(activity) = store.recent_activity(ctx, query).await.unwrap() else {
+        panic!("expected activity log");
+    };
+    assert!(activity.changes.iter().any(|row| row.entity
+        == notarium_core::ports::EntityId::Note(left_note.clone())
+        && row.provenance.is_some()));
+    assert!(activity.changes.iter().all(|row| row.entity
+        != notarium_core::ports::EntityId::Note(right_note.clone())
+        || row.provenance.is_none()));
 }

@@ -757,7 +757,7 @@ impl S3BlobStore {
                 let pub_done = target.publication_id.clone();
                 let part_idx = target.part_index;
                 store
-                    .with_write_tx(|tx| {
+                    .with_write_tx_for_space(Some(scope.space_id.clone()), |tx| {
                         Box::pin(async move {
                             lock_and_check_space_tx(tx, &scope_done, active_epoch).await?;
                             mark_retirement_target_completed_tx(
@@ -822,7 +822,7 @@ impl S3BlobStore {
                     let part_idx = target.part_index;
                     let vids_save = data_vids.clone();
                     store
-                        .with_write_tx(|tx| {
+                        .with_write_tx_for_space(Some(scope.space_id.clone()), |tx| {
                             Box::pin(async move {
                                 lock_and_check_space_tx(tx, &scope_save, active_epoch).await?;
                                 persist_s3_target_version_ids_tx(
@@ -892,7 +892,7 @@ impl S3BlobStore {
                 let pub_done = target.publication_id.clone();
                 let part_idx = target.part_index;
                 store
-                    .with_write_tx(|tx| {
+                    .with_write_tx_for_space(Some(scope.space_id.clone()), |tx| {
                         Box::pin(async move {
                             lock_and_check_space_tx(tx, &scope_done, active_epoch).await?;
                             mark_retirement_target_completed_tx(

@@ -443,7 +443,7 @@ pub struct CommitPermit {
     pub epoch: LeaseEpoch,
 }
 /// Pure transition kernel; storage applies consume and commit under one fence lock.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct RoomFenceState {
     note: NoteId,
     scope: HistoryScope,
@@ -622,6 +622,10 @@ pub trait SessionRevocationPort: Send + Sync {
 /// A cancellable registration prepared before the Control authority snapshot.
 /// Each SQL execution or receipt read enters after acquiring its storage locks.
 pub trait CanonicalEffectRegistration: Send + Sync {
+    /// Narrow this registration to the credential lifetime observed after registration.
+    /// Both queued and active leases enforce the earlier of this and the call deadline.
+    fn restrict_until(&self, deadline: std::time::Instant) -> Result<(), crate::error::PortError>;
+
     fn check(&self) -> Result<(), crate::error::PortError>;
 
     /// Enter atomically against a revocation fence. A canceled registration or

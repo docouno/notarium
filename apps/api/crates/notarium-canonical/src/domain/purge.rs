@@ -115,7 +115,7 @@ impl CanonicalStore {
     ) -> Result<(), PortError> {
         self.inner.check_writer_epoch(&scope.space_id, epoch)?;
         let current = scope.clone();
-        self.with_write_tx(|tx| {
+        self.with_write_tx_for_space(Some(scope.space_id.clone()), |tx| {
             Box::pin(async move {
                 crate::blobs::lock_and_check_space_tx(tx, &current, epoch).await?;
                 crate::blobs::plan_unowned_active_blobs_tx(tx, &current, epoch).await
@@ -1946,7 +1946,7 @@ async fn mark_pending_purge_cas_retired(
     let purge_cl = purge_id.to_owned();
     let now_ms = now_unix_ms()?;
     store
-        .with_write_tx(|tx| {
+        .with_write_tx_for_space(Some(scope.space_id.clone()), |tx| {
             Box::pin(async move {
                 crate::blobs::lock_and_check_space_tx(tx, &scope_cl, epoch).await?;
                 match tx {
@@ -2002,7 +2002,7 @@ async fn mark_pending_purge_completed_tx(
     let now_ms = now_unix_ms()?;
 
     store
-        .with_write_tx(|tx| {
+        .with_write_tx_for_space(Some(scope.space_id.clone()), |tx| {
             Box::pin(async move {
                 crate::blobs::lock_and_check_space_tx(tx, &scope_cl, epoch).await?;
                 match tx {
@@ -2086,7 +2086,7 @@ async fn record_pending_purge_safe_error(
     let now_ms = now_unix_ms()?;
 
     store
-        .with_write_tx(|tx| {
+        .with_write_tx_for_space(Some(scope.space_id.clone()), |tx| {
             Box::pin(async move {
                 crate::blobs::lock_and_check_space_tx(tx, &scope_cl, epoch).await?;
                 match tx {

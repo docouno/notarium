@@ -3,7 +3,7 @@ use notarium_core::{
     auth::ResourceFacts,
     classes::DocClass,
     error::{PortError, ValidationReason},
-    ids::{FolderId, RevisionId},
+    ids::{EpisodeId, FolderId, RevisionId},
     model::{FolderRef, HistoryScope, Lifecycle},
     ports::{
         FolderSnapshot, MoveFolder, Mutation, Preconditions, RenameFolder, RenameProject,
@@ -14,7 +14,7 @@ use notarium_syntax::unicode::{lookup_key, validate_component};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::super::{EgressTarget, ToolCallContext, ToolName, corpus, decode, invalid, session};
+use super::super::{ToolCallContext, ToolName, corpus, decode, invalid, session};
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -22,6 +22,7 @@ struct MoveArgs {
     folder: String,
     to_folder: String,
     project: Option<String>,
+    session: Option<EpisodeId>,
 }
 
 #[derive(Deserialize)]
@@ -29,6 +30,7 @@ struct RenameArgs {
     folder: String,
     name: String,
     project: Option<String>,
+    session: Option<EpisodeId>,
 }
 
 #[derive(Deserialize)]
@@ -75,17 +77,12 @@ struct FolderAddress {
 }
 
 impl FolderAddress {
-    async fn open(call: &ToolCallContext<'_>, project: Option<&str>) -> Result<Self, PortError> {
-        let explicit = match project {
-            Some(project) => Some(session::resolve_project(call, project).await?.folder),
-            None => None,
-        };
-        let selected = explicit.or_else(|| match &call.target {
-            EgressTarget::InAppProvider {
-                primary_project, ..
-            } => primary_project.clone(),
-            EgressTarget::ExternalMcp => None,
-        });
+    async fn open(
+        call: &ToolCallContext<'_>,
+        project: Option<&str>,
+        episode: Option<&EpisodeId>,
+    ) -> Result<Self, PortError> {
+        let selected = session::selected_project(call, project, episode).await?;
         let space = match &selected {
             Some(project) => project.space_id.clone(),
             None => match call.auth.pinned_write_space() {
@@ -190,7 +187,8 @@ async fn plan(
     match name {
         ToolName::MoveFolder => {
             let args: MoveArgs = decode(args)?;
-            let address = FolderAddress::open(call, args.project.as_deref()).await?;
+            let address =
+                FolderAddress::open(call, args.project.as_deref(), args.session.as_ref()).await?;
             let source = address.resolve(call, &args.folder).await?;
             let dest = address.resolve(call, &args.to_folder).await?;
             let parent = dest.reference.folder_id;
@@ -204,7 +202,8 @@ async fn plan(
         ToolName::RenameFolder => {
             let args: RenameArgs = decode(args)?;
             validate_component(&args.name)?;
-            let address = FolderAddress::open(call, args.project.as_deref()).await?;
+            let address =
+                FolderAddress::open(call, args.project.as_deref(), args.session.as_ref()).await?;
             let source = address.resolve(call, &args.folder).await?;
             let operation = if same_name(&source, &args.name, &args.name) {
                 FolderOperation::Unchanged
@@ -307,7 +306,7 @@ pub(super) async fn handle(
             call.registry
                 .engine
                 .move_folder(
-                    scope.clone(),
+                    call.corpus_writer(scope.clone()).await?,
                     Mutation {
                         identity,
                         preconditions,
@@ -323,7 +322,7 @@ pub(super) async fn handle(
             call.registry
                 .engine
                 .rename_folder(
-                    scope.clone(),
+                    call.corpus_writer(scope.clone()).await?,
                     Mutation {
                         identity,
                         preconditions,
@@ -339,7 +338,7 @@ pub(super) async fn handle(
             call.registry
                 .engine
                 .rename_project(
-                    scope.clone(),
+                    call.corpus_writer(scope.clone()).await?,
                     Mutation {
                         identity,
                         preconditions,

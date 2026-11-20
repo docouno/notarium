@@ -354,7 +354,7 @@ pub(super) async fn edit_note(
         .registry
         .engine
         .edit_note(
-            scope.clone(),
+            call.corpus_writer(scope.clone()).await?,
             Mutation {
                 identity: call.command_identity(&route.scope, "edit_note", 0),
                 preconditions: preconditions(&route),

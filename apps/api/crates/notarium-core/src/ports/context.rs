@@ -343,12 +343,14 @@ impl fmt::Debug for CanonicalEffectAdmission {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CanonicalEffect {
+    ExternalCorpusWrite,
     AbilityAuthoring,
     ConfirmedProposal,
     ChatInput,
     ChatClaim,
     ChatRollback,
     ChatRedaction,
+    ChatStop,
 }
 
 /// The step identity and source witness travel together on the trusted writer

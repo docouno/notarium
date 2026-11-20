@@ -1387,7 +1387,7 @@ impl crate::CanonicalStore {
         // Step 1: Under Space lock + active_epoch, either reuse an Active publication OR durably
         // register the Staging publication and ALL part keys BEFORE sending any HTTP PUT!
         let registration = self
-            .with_write_tx(|tx| {
+            .with_write_tx_for_space(Some(scope.space_id.clone()), |tx| {
                 Box::pin(async move {
                     lock_and_check_space_tx(tx, &scope_cl, active_epoch).await?;
                     let registration = register_s3_staging_or_reuse_tx(
@@ -1440,7 +1440,7 @@ impl crate::CanonicalStore {
             let pub_part = pub_id.clone();
             let part_idx = part.part_index;
             let digest = prepared.digest;
-            self.with_write_tx(|tx| {
+            self.with_write_tx_for_space(Some(scope.space_id.clone()), |tx| {
                 Box::pin(async move {
                     lock_and_check_space_tx(tx, &scope_part, active_epoch).await?;
                     confirm_s3_part_uploaded_tx(
@@ -1588,7 +1588,7 @@ impl crate::CanonicalStore {
         let worker = self.clone();
         let (notify, attempted) = tokio::sync::oneshot::channel();
         let (planned_retirements, handoff) = self
-            .with_write_tx(|tx| {
+            .with_write_tx_for_space(Some(scope.space_id.clone()), |tx| {
                 let scope_in = scope_cl.clone();
                 let digests_in = digests_vec.clone();
                 let purge_in = purge_opt.clone();
@@ -1654,7 +1654,7 @@ impl crate::CanonicalStore {
         let scope_cl = scope.clone();
         let ret_cl = retirement_id.to_owned();
         let (reason, targets) = self
-            .with_write_tx(|tx| {
+            .with_write_tx_for_space(Some(scope.space_id.clone()), |tx| {
                 let scope_in = scope_cl.clone();
                 let ret_in = ret_cl.clone();
                 Box::pin(async move {
@@ -1748,7 +1748,7 @@ impl crate::CanonicalStore {
                     let ret_done = retirement_id.to_owned();
                     let pub_done = target.publication_id.clone();
                     let part_idx = target.part_index;
-                    self.with_write_tx(|tx| {
+                    self.with_write_tx_for_space(Some(scope.space_id.clone()), |tx| {
                         Box::pin(async move {
                             lock_and_check_space_tx(tx, &scope_done, active_epoch).await?;
                             mark_retirement_target_completed_tx(
@@ -1788,7 +1788,7 @@ impl crate::CanonicalStore {
                     // publication had already been retired. Accept only that proven empty case.
                     let scope_done = scope.clone();
                     let ret_done = retirement_id.to_owned();
-                    self.with_write_tx(|tx| Box::pin(async move {
+                    self.with_write_tx_for_space(Some(scope.space_id.clone()), |tx| Box::pin(async move {
                         lock_and_check_space_tx(tx, &scope_done, active_epoch).await?;
                         const OWNERS: &str = "SELECT COUNT(*), COUNT(*) FILTER (WHERE codec <> 's3_chunked_v1' OR state <> 'retired')
                             FROM blob_publications WHERE space_id = $1 AND content_blake3 = $2";
@@ -1813,7 +1813,7 @@ impl crate::CanonicalStore {
 
         let scope_fin = scope.clone();
         let ret_fin = retirement_id.to_owned();
-        self.with_write_tx(|tx| {
+        self.with_write_tx_for_space(Some(scope.space_id.clone()), |tx| {
             Box::pin(async move {
                 lock_and_check_space_tx(tx, &scope_fin, active_epoch).await?;
                 finalize_retirement_tx(tx, &scope_fin.space_id, &ret_fin).await

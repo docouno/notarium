@@ -142,6 +142,10 @@ async fn rotate(
     if let Some(error) = attempt.interruption() {
         return Err(error);
     }
+    let _disclosures = match &store.inner.sql {
+        SqlDriverState::Sqlite { disclosures, .. } => Some(disclosures.unscoped_mutation().await),
+        SqlDriverState::Postgres { .. } => None,
+    };
     let _safe_point = store.inner.writer()?.acquire_safe_point().await;
     let Rotation {
         fences,

@@ -27,6 +27,8 @@ use notarium_core::{
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 const DAY: i64 = 86_400_000;
+const MIN_COMPACT_DAYS: u16 = 1;
+pub(super) const MIN_COMPACT_MS: i64 = MIN_COMPACT_DAYS as i64 * DAY;
 fn json(value: &impl Serialize) -> Result<String, PortError> {
     serde_json::to_string(value).map_err(|_| invalid(ValidationReason::InvalidState))
 }
@@ -141,7 +143,7 @@ impl ControlService {
     ) -> Result<ControlCommit<TelemetrySettings>, PortError> {
         ctx.auth().authorize_human_management()?;
         let input = request.input;
-        if input.compact_retention_days == 0
+        if input.compact_retention_days < MIN_COMPACT_DAYS
             || input.compact_retention_days > 3650
             || input.detailed_retention_days == 0
             || input.detailed_retention_days > input.compact_retention_days

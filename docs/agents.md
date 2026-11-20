@@ -20,7 +20,11 @@ write-token opt-in, and is unavailable to chat runs and Keepers. See the
 Use the same command key when retrying a logical request within the seven-day
 tool journal window. The registry binds it to the credential and normalized
 arguments. Compound actions reserve a content-free plan and use canonical
-receipts for individual effects. Tool
+receipts for individual effects. Each external corpus mutation registers its
+credential and target Space with Control, including intermediate folder creation.
+The canonical writer acquires the registration under its storage locks,
+checks the earlier of the call deadline and credential expiry before commit,
+and holds the registration through transaction settlement. Tool
 telemetry records typed operations, references and counters. Each result
 includes self-contained Markdown in `content[0].text` and machine-readable
 fields in `structuredContent`. The text contains the revision and continuation
@@ -39,7 +43,9 @@ on a successful item reports an unconfirmed link upgrade.
 Confirmed creation proposals persist the title links shown during review.
 
 `start_session` opens an episode by starting, resuming or forking it. Pass the
-returned `session.id` on subsequent calls. Follow `delta.nextAction` to
+returned `session.id` on subsequent calls to keep the episode active.
+Folder listing, moves and renames resolve relative paths using the explicit
+project, then the project bound to the episode. Follow `delta.nextAction` to
 drain the bootstrap delta. Continuations bind the caller, episode and original
 Space cuts.
 When acknowledgement is enabled, the next continuation or final
@@ -88,7 +94,10 @@ queued input after an intervening peer message is materialized as an ordinary
 Human entry from its sender. Starting a new run requires a separate activation.
 Redaction erases the peer body and retains the minimum author and turn
 classification needed for this rule. Peer messages reach the model with their
-canonical author and an untrusted-content marker.
+canonical author and an untrusted-content marker. The initiating principal
+can stop its run. Stopping another participant's run requires current Owner
+or Editor access to the Space. The supervisor holds the authority lease through
+cancellation of that specific run.
 
 Provider dispatch rechecks every canonical source used by the prompt, including
 the dependencies of prior Tool, Model and Compaction entries. Admission uses
@@ -96,14 +105,30 @@ current membership, document classes, source projects and the selected
 provider's consent. A note disclosure binds the note class and nearest project
 at disclosure. Moving a note can invalidate its prior disclosures even when its
 revision and bytes stay the same. If admission fails, choose an authorized
-provider or an earlier clean branch. Redaction invalidates dependent summaries.
+provider or an earlier clean branch. Canonical storage folds verified entries
+from the same thread into a derived entry's source proof. External dependencies
+keep their individual digests and current disclosure checks. Redaction invalidates
+later folded proofs in the thread and dependent summaries. The original source
+edges remain available to recompute the proof on surviving branches. Legacy
+proofs are traversed in bounded read snapshots, each tied to the original
+thread revision and Space incarnation within the caller's deadline.
 Automatic compaction records the covered prefix and keeps newer turns in the
-next prompt. Tombstones contribute no content to a summary. Surviving entries
+next prompt. When a group accumulates more than 200 entries between AI
+activations, the supervisor summarizes the oldest remaining prefix in bounded
+windows before answering the latest message. Each window uses the selected
+branch and retains its source proofs. Tombstones contribute no content to a summary. Surviving entries
 retain their source proofs and may block a request when a source was redacted.
+If a run stops between tool results, the next prompt replays only calls with
+recorded responses. It includes unpaired tool output as labelled historical
+data. Each retained part keeps its canonical source through compaction.
 The full parent chain remains available through `read_chat`.
 Run rollback uses canonical mutation provenance to undo eligible note effects
 while preserving later manual edits. Retrying the same run and command key
-returns the original rollback receipt under current authorization.
+returns the original rollback receipt under current authorization. The writer checks every
+note and board view named in the stored response against current access, including
+notes skipped because of manual edits or an active room. Purging a referenced
+note erases new receipt details. The remaining envelope contains the receipt
+token and empty result lists.
 
 ## Stream replay and runtime ownership
 
@@ -115,7 +140,10 @@ committed leaf and a matching stream cursor. Read that canonical snapshot,
 discard partial step output identified in the checkpoint and then consume live
 frames. Use canonical entry sequence numbers to reconcile committed events.
 Disconnecting a viewer releases its subscription while the admitted run
-continues.
+continues. A viewer's own credential expiry closes both replay and live
+delivery, including while the viewer is waiting for the next frame. A provider
+token limit or content filter preserves the partial model text and the
+interruption reason in the model entry and ends the run with a failure event.
 
 Local composition supplies an exclusive open data-root writer and shares a
 `RevocationHub` across the supervisor and control/provider services.
@@ -137,7 +165,11 @@ command.
 
 `KeeperScheduler` polls durable due slots and runs with an admitted
 `ScheduledRun` credential. Applications drive `poll` with their clock and
-cancellation token. `tick(now)` runs one due scan. Each slot has one winner.
+cancellation token. Polling admits newly due schedules while earlier runs are
+active, up to the shared worker limit. `tick(now)` waits for the runs from one
+due scan. Each slot has one winner. When the provider truncates or filters a
+reply, the log retains the partial model text and its interruption reason, and
+the receipt records failure.
 Reconciliation records expired unfinished runs as `Unknown` after ownership
 checks. Clustered composition supplies `ClusterKeeperAuthority` for slot
 leases and positive evidence that an expired run has no live owner.
@@ -167,3 +199,18 @@ projection/search fixtures and offline loopback provider responses. Canonical
 and control tests exercise database receipts, upgrades and recovery at their
 own boundaries. HTTP transport and production cluster authority have separate
 integration requirements.
+
+The Keeper integration test reports the latency of the first supervisor rollback
+of nine changed memory notes, including live authorization and the commit. It
+checks all nine restored digests and the replayed receipt outside the timer.
+Use a release build on a quiet host to measure the five-millisecond target.
+The command below puts PostgreSQL data and its WAL on a disposable Docker
+volume. Verify the volume is disk-backed and keep synchronous commit enabled
+when recording latency. The regular integration fixture uses a memory
+filesystem.
+
+```sh
+sh scripts/control-db-fixture.sh run-durable sh .devkit/runtime/devkit.sh cli exec \
+  --component apps/api --network none -- cargo test --release --locked --offline \
+  -p fitness-gates --test agents_runtime keeper_turn_cases:: -- --nocapture --test-threads=1
+```

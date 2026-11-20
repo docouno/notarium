@@ -78,6 +78,7 @@ impl AuxiliaryEffect {
 impl CanonicalStore {
     pub(crate) async fn with_auxiliary_command<T, R, F>(
         &self,
+        space: notarium_core::ids::SpaceId,
         timing: Option<(&CallBudget, CommandDeadline)>,
         after_commit: impl FnOnce(T) -> Result<R, PortError> + Send + 'static,
         op: F,
@@ -89,12 +90,13 @@ impl CanonicalStore {
         T: Send + 'static,
         R: Send + 'static,
     {
-        self.with_guarded_auxiliary_command(timing, None, after_commit, move |tx, _| op(tx))
+        self.with_guarded_auxiliary_command(space, timing, None, after_commit, move |tx, _| op(tx))
             .await
     }
 
     pub(crate) async fn with_guarded_auxiliary_command<T, R, F>(
         &self,
+        space: notarium_core::ids::SpaceId,
         timing: Option<(&CallBudget, CommandDeadline)>,
         registration: Option<CanonicalEffectAdmission>,
         after_commit: impl FnOnce(T) -> Result<R, PortError> + Send + 'static,
@@ -134,7 +136,7 @@ impl CanonicalStore {
             // while the connection acknowledges COMMIT or ROLLBACK.
             let operation_effect = active.clone();
             let result = store
-                .with_write_tx(move |tx| {
+                .with_write_tx_for_space(Some(space), move |tx| {
                     Box::pin(async move {
                         check()?;
                         if !commit.load(Ordering::Acquire) {

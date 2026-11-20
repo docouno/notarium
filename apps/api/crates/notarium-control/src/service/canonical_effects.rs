@@ -27,6 +27,14 @@ impl ControlService {
             return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
         }
         match effect {
+            CanonicalEffect::ExternalCorpusWrite | CanonicalEffect::ChatStop
+                if authority.kind() == ctx.auth().kind()
+                    && matches!(
+                        authority.kind(),
+                        PrincipalKind::DirectHuman
+                            | PrincipalKind::Pat
+                            | PrincipalKind::OAuth { .. }
+                    ) => {}
             CanonicalEffect::AbilityAuthoring => authority.authorize_ability_mutation()?,
             CanonicalEffect::ConfirmedProposal => authority.authorize_proposal_confirmation()?,
             CanonicalEffect::ChatRollback => authority.authorize_human_management()?,
@@ -43,7 +51,9 @@ impl ControlService {
             CanonicalEffect::ChatClaim
                 if authority.kind() == &PrincipalKind::DirectHuman
                     && matches!(ctx.auth().kind(), PrincipalKind::AgentRun(_)) => {}
-            CanonicalEffect::ChatInput
+            CanonicalEffect::ExternalCorpusWrite
+            | CanonicalEffect::ChatInput
+            | CanonicalEffect::ChatStop
             | CanonicalEffect::ChatRedaction
             | CanonicalEffect::ChatClaim => {
                 return Err(DomainError::AccessDenied.into());
@@ -72,15 +82,25 @@ impl ControlService {
                 CommitEffect::NotCommitted,
             )
             .await?;
-        let account = AccountContext::new(authority, budget.context(request));
-        let current = self.current_account(&account, &budget).await?;
-        registration.check()?;
+        let (auth, expires_at) = self
+            .current_auth_with_expiry(&budget, &request, &authority)
+            .await?;
+        let mut remaining = budget.context(request);
+        if let Some(deadline) = expires_at {
+            registration.restrict_until(deadline)?;
+            remaining.remaining = remaining
+                .remaining
+                .min(deadline.saturating_duration_since(std::time::Instant::now()));
+        } else {
+            registration.check()?;
+        }
+        let current = AccountContext::new(auth, remaining);
         if source.is_some_and(|scope| !current.auth().spaces().contains_key(&scope.space_id)) {
             return Err(DomainError::ResourceNotFound.into());
         }
         let ctx = ctx.with_canonical_effect(&current, registration)?;
         let grant = &ctx.auth().spaces()[&ctx.scope().space_id];
-        if grant.role == SpaceRole::Viewer
+        if (effect != CanonicalEffect::ChatStop && grant.role == SpaceRole::Viewer)
             || (matches!(
                 ctx.auth().kind(),
                 PrincipalKind::Pat | PrincipalKind::OAuth { .. }

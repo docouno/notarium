@@ -465,38 +465,6 @@ async fn keeper_turn_reconsent(fixture: &mut RuntimeFixture) {
         assert_ne!(note.document.digest(), *before);
         assert_eq!(note.document.class(), DocClass::AgentMemory);
     }
-    let rollback = fixture
-        .canonical
-        .prepare_agent_run_rollback(scope.clone(), first_run.run.clone())
-        .await
-        .unwrap();
-    assert_eq!(rollback.expected_entities.len(), 9);
-    let started = Instant::now();
-    let restored = fixture
-        .canonical
-        .rollback_agent_run(
-            scope.clone(),
-            Mutation {
-                identity: command(205),
-                preconditions: Preconditions::default(),
-                input: rollback,
-            },
-        )
-        .await
-        .unwrap();
-    let latency = started.elapsed();
-    let backend = if fixture.storage.root.is_some() {
-        "sqlite"
-    } else {
-        "postgres"
-    };
-    eprintln!(
-        "Keeper rollback sample ({backend}): {} µs for nine canonical restorations",
-        latency.as_micros()
-    );
-    assert_eq!(restored.value.restored.len(), 9);
-    assert!(restored.value.trashed.is_empty());
-
     let supervisor = AgentRunSupervisor::new_local(
         fixture.registry.clone(),
         fixture.revocations.clone(),
@@ -511,17 +479,37 @@ async fn keeper_turn_reconsent(fixture: &mut RuntimeFixture) {
             rollback_key.clone(),
         )
     };
-    let prepared_revision = || async {
+    let run_revision = || async {
         fixture
             .canonical
-            .prepare_agent_run_rollback(scope.clone(), first_run.run.clone())
+            .read_entity_revision_at_cutoff(
+                scope.scope(),
+                "agent_run",
+                first_run.run.as_str(),
+                None,
+            )
             .await
             .unwrap()
-            .expected_run_revision
+            .unwrap()
+            .revision_id
     };
-    let before = prepared_revision().await;
+    let before = run_revision().await;
+    let started = Instant::now();
     let resolved = undo().await.unwrap();
-    assert_ne!(prepared_revision().await, before);
+    let elapsed = started.elapsed();
+    assert_eq!(resolved.value.restored.len(), original_memories.len());
+    assert!(resolved.value.trashed.is_empty());
+    let backend = if fixture.storage.root.is_some() {
+        "sqlite"
+    } else {
+        "postgres"
+    };
+    eprintln!(
+        "Product rollback sample ({backend}): {} us for {} restored memories",
+        elapsed.as_micros(),
+        resolved.value.restored.len()
+    );
+    assert_ne!(run_revision().await, before);
     let replayed = undo().await.unwrap();
     assert_eq!(replayed.receipt, resolved.receipt);
     assert_eq!(replayed.value, resolved.value);
@@ -531,6 +519,41 @@ async fn keeper_turn_reconsent(fixture: &mut RuntimeFixture) {
         .await
         .unwrap();
     assert_eq!(after.last_seq, resolved.receipt.seq());
+    let revisions = resolved
+        .value
+        .restored
+        .iter()
+        .map(|entry| format!("'{}'", entry.revision.as_str()))
+        .collect::<Vec<_>>()
+        .join(",");
+    let refs = fixture.canonical.execute_diagnostic_read_sql_for_test(None, &format!(
+        "SELECT COUNT(*) FROM revisions v
+         JOIN blob_references b ON b.space_id=v.space_id AND b.owner_id=v.entity_key
+           AND b.owner_rev_id=v.rev_id AND b.owner_kind='note_revision' AND b.resource_key='carrier'
+           AND b.content_blake3=v.content_blake3
+         JOIN blob_catalog c ON c.space_id=b.space_id AND c.content_blake3=b.content_blake3
+           AND c.current_publication_id=b.publication_id AND c.admission_state='open' AND c.blob_state='active'
+         WHERE v.space_id='{}' AND v.rev_id IN ({revisions}) AND c.ref_count=(
+             SELECT COUNT(*) FROM blob_references x WHERE x.space_id=c.space_id AND x.content_blake3=c.content_blake3)",
+        scope.scope().space_id.as_str(),
+    )).await.unwrap();
+    assert_eq!(refs as usize, resolved.value.restored.len());
+    let digests = original_memories
+        .iter()
+        .map(|(_, digest)| *digest)
+        .collect::<Vec<_>>();
+    let retired = fixture
+        .canonical
+        .retire_zero_ref_digests(
+            scope.scope(),
+            after.active_epoch,
+            &digests,
+            notarium_canonical::blobs::RetirementReason::Gc,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(retired.is_empty(), "GC must preserve every rebound carrier");
     Box::pin(authoring_authority_cases::revoked_rollback(
         fixture,
         &supervisor,

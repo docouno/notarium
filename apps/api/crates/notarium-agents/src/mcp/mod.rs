@@ -591,6 +591,22 @@ impl<'a> ToolCallContext<'a> {
         Ok(SpaceContext::new(self.auth.clone(), scope, self.budget())?)
     }
 
+    async fn corpus_writer(&self, mut scope: SpaceContext) -> Result<SpaceContext, PortError> {
+        scope.budget = self.budget();
+        if matches!(self.target, EgressTarget::ExternalMcp) {
+            self.registry
+                .control
+                .fence_canonical_effect(
+                    self.auth.clone(),
+                    scope,
+                    CanonicalEffect::ExternalCorpusWrite,
+                )
+                .await
+        } else {
+            Ok(scope)
+        }
+    }
+
     fn budget(&self) -> CallBudget {
         CallBudget {
             request: self.request.clone(),

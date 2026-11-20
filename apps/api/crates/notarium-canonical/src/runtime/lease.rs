@@ -269,7 +269,7 @@ impl CanonicalStore {
         }
         let scope = scope.clone();
         let store = self.clone();
-        self.with_write_tx(move |tx| {
+        self.with_write_tx_for_space(Some(scope.space_id.clone()), move |tx| {
             Box::pin(async move {
                 store
                     .update_lease_rows(tx, &scope, new_epoch, &attempt)

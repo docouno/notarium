@@ -81,6 +81,8 @@ pub struct UpdateSchedule {
     /// empty set approves a role with no dependencies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approved_skills: Option<Vec<AbilityRef>>,
+    /// An overdue slot may be retained for catch-up. A replacement due must
+    /// match the calendar, be unissued and be at or after the control clock.
     pub next_slot: Option<Timestamp>,
     pub paused: bool,
 }
@@ -144,9 +146,12 @@ pub enum ScheduleClaim {
         context: Box<SpaceContext>,
     },
     AlreadyClaimed(ScheduleRunReceipt),
-    /// A migrated due was the second UTC representation of an earlier
-    /// completed or claimed civil window. The schedule advanced without a run.
+    /// A persisted due referred to an issued slot or its repeated civil time.
+    /// The schedule advanced without issuing a second run.
     SkippedDuplicate(ScheduleRunReceipt),
+    /// History for a legacy repeated civil time was incomplete. The cursor
+    /// advanced without issuing a run or fabricating a historical receipt.
+    SkippedUnverifiedFold,
     Paused(SchedulePauseReason),
 }
 #[derive(Clone, Debug)]

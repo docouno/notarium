@@ -5,8 +5,8 @@ use notarium_core::{
     classes::DocClass,
     error::{Diagnostic, PortError, ValidationReason},
     ids::{
-        AgentRunId, ContentDigest, FolderId, HistoryIncarnation, NoteId, RevisionId, SpaceId,
-        SpaceSeq,
+        AbilityId, AgentRunId, ContentDigest, FolderId, HistoryIncarnation, NoteId, RevisionId,
+        SpaceId, SpaceSeq,
     },
     model::{HistoryScope, Lifecycle, PathTarget},
     ports::{
@@ -51,6 +51,7 @@ use crate::{
     writer::{BatchEventDraft, ItemCommitArtifacts, PreparedWriteIntent, SemanticCutMismatchKind},
 };
 
+mod ability;
 mod fingerprint;
 
 const MAX_PLANNER_RETRIES: usize = 4;
@@ -206,8 +207,42 @@ pub(crate) fn rollback_fallback_cover_change_err() -> PortError {
     )
 }
 
+pub(crate) fn rollback_fallback_ability_slot_err() -> PortError {
+    internal_not_committed(
+        "rb_fallback_ability_slot",
+        "restoring an active ability requires its project package slot check",
+    )
+}
+
 fn requires_general_planner(err: &PortError) -> bool {
-    err == &rollback_fallback_board_present_err() || err == &rollback_fallback_cover_change_err()
+    err == &rollback_fallback_board_present_err()
+        || err == &rollback_fallback_cover_change_err()
+        || err == &rollback_fallback_ability_slot_err()
+}
+
+type RoomGuard = tokio::sync::OwnedMutexGuard<notarium_core::ports::RoomFenceState>;
+
+/// Validate every room transition before writing and keep each guard through settlement.
+pub(crate) fn stage_rollback_fences(
+    ctx: &mut crate::writer::ItemExecCtx,
+    guards: Vec<(RoomGuard, ClosedRoomReservation)>,
+    identity: &notarium_core::receipt::CommandIdentity,
+) -> Result<(), PortError> {
+    if guards.is_empty() {
+        return Ok(());
+    }
+    let mut transitions = Vec::with_capacity(guards.len());
+    for (guard, reservation) in guards {
+        let mut next = (*guard).clone();
+        next.consume(reservation, identity)?;
+        transitions.push((guard, next));
+    }
+    ctx.on_commit_or_unknown(move || {
+        for (mut guard, next) in transitions {
+            *guard = next;
+        }
+    });
+    Ok(())
 }
 
 pub(crate) async fn rollback_agent_run_impl(
@@ -222,7 +257,7 @@ pub(crate) async fn rollback_agent_run_impl(
         .with_canonical_effect(&ctx)
         .with_policy(ctx.auth(), rollback_policy(&request.input));
 
-    let result = execute_rollback(store, &mut ctx, &request, &idemp, deadline).await;
+    let result = execute_rollback(store, &mut ctx, &request, &idemp, None, deadline).await;
     if !matches!(
         result,
         Err(PortError::Domain(DomainError::IdempotencyKeyReused))
@@ -259,20 +294,73 @@ pub(crate) async fn rollback_agent_run_by_id(
     let deadline = super::common::CommandDeadline::start(&ctx.budget, "rollback").at;
     validate_mutation_identity(&ctx, &request.identity)?;
     super::common::require_empty_preconditions(&request.preconditions)?;
-    let input = prepare_agent_run_rollback(store, ctx.clone(), request.input).await?;
-    let idemp = super::common::derive_command_identity_spec(
-        &request.identity,
-        "rollback_agent_run_by_id_v1",
-        input.run.as_str().as_bytes(),
-    )
-    .with_canonical_effect(&ctx)
-    .with_policy(ctx.auth(), rollback_policy(&input));
+    let identity = |policy| {
+        super::common::derive_command_identity_spec(
+            &request.identity,
+            "rollback_agent_run_by_id_v1",
+            request.input.as_str().as_bytes(),
+        )
+        .with_canonical_effect(&ctx)
+        .with_policy(ctx.auth(), policy)
+    };
+    let direct_by_id = store.is_postgres()
+        && ctx.canonical_effect().is_some()
+        && store.inner.collab_interceptor.get().is_none();
+    if direct_by_id {
+        let scope = ctx.scope();
+        let guard = store.enter_write_op(&scope.space_id)?;
+        let epoch = store.inner.writer_epoch(&scope.space_id)?;
+        let idemp = identity(crate::writer::replay::ReplayPolicy::RollbackRun(
+            request.input.clone(),
+        ));
+        let intent = build_rollback_direct_single_tx_intent(
+            scope.clone(),
+            epoch,
+            idemp,
+            ctx.auth().clone(),
+            request.identity.clone(),
+            DirectRollbackTarget::ById(request.input.clone()),
+            store.inner.room_fences.clone(),
+        );
+        let result = store
+            .submit_write_command_until::<StoredCommittedRollbackV1>(
+                &ctx.budget,
+                deadline,
+                intent,
+                None,
+                None,
+                Some(guard),
+            )
+            .await;
+        match result {
+            Ok(done) => return Ok(done.into_committed()),
+            Err(error) if requires_general_planner(&error) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let mut read_ctx = ctx.clone();
+    read_ctx.budget.remaining = rollback_time_left(&ctx.budget, deadline)?;
+    let (input, prepared_epoch) =
+        prepare_agent_run_rollback(store, read_ctx, request.input.clone()).await?;
+    let idemp = identity(rollback_policy(&input));
     let prepared = Mutation {
         identity: request.identity,
         preconditions: request.preconditions,
         input,
     };
-    execute_rollback(store, &mut ctx, &prepared, &idemp, deadline).await
+    if direct_by_id {
+        // Only a confirmed request for the general planner reaches this point.
+        return execute_general_rollback(store, &mut ctx, &prepared, &idemp, deadline).await;
+    }
+    execute_rollback(
+        store,
+        &mut ctx,
+        &prepared,
+        &idemp,
+        Some(prepared_epoch),
+        deadline,
+    )
+    .await
 }
 
 fn rollback_policy(input: &RollbackAgentRun) -> crate::writer::replay::ReplayPolicy {
@@ -283,7 +371,7 @@ fn rollback_policy(input: &RollbackAgentRun) -> crate::writer::replay::ReplayPol
         .iter()
         .map(|entry| &entry.view.note)
         .collect::<BTreeSet<_>>();
-    ReplayPolicy::Documents(
+    ReplayPolicy::RollbackDocuments(
         input
             .expected_entities
             .iter()
@@ -298,6 +386,7 @@ async fn execute_rollback(
     ctx: &mut SpaceContext,
     request: &Mutation<RollbackAgentRun>,
     idemp: &crate::writer::CommandIdentitySpec,
+    prepared_epoch: Option<notarium_core::ids::LeaseEpoch>,
     deadline: Instant,
 ) -> Result<Committed<RollbackResult>, PortError> {
     ctx.budget.remaining = rollback_time_left(&ctx.budget, deadline)?;
@@ -305,11 +394,12 @@ async fn execute_rollback(
         && store.inner.collab_interceptor.get().is_none()
     {
         let active_op_guard = store.enter_write_op(&ctx.scope().space_id)?;
-        let writer_epoch = match &store.inner.sql {
-            crate::runtime::SqlDriverState::Postgres { .. } => {
+        let writer_epoch = match (&store.inner.sql, prepared_epoch) {
+            (crate::runtime::SqlDriverState::Postgres { .. }, _) => {
                 store.inner.writer_epoch(&ctx.scope().space_id)?
             }
-            crate::runtime::SqlDriverState::Sqlite { .. } => {
+            (crate::runtime::SqlDriverState::Sqlite { .. }, Some(epoch)) => epoch,
+            (crate::runtime::SqlDriverState::Sqlite { .. }, None) => {
                 rollback_wait(
                     &ctx.budget,
                     deadline,
@@ -341,7 +431,7 @@ async fn execute_rollback(
         }
         ctx.budget.remaining = rollback_time_left(&ctx.budget, deadline)?;
         let single_res: Result<StoredCommittedRollbackV1, PortError> = if store.is_sqlite_local()
-            && !standard_writer
+            && !idemp.has_confirmed_chat_step()
         {
             let (intent, fast_plan) = crate::sqlite_fast::build_rollback_direct_sqlite_fast_intent(
                 ctx.scope(),
@@ -398,12 +488,22 @@ async fn execute_rollback(
         match single_res {
             Ok(decoded) => return Ok(decoded.into_committed()),
             Err(err) if requires_general_planner(&err) => {
-                // Space contains board move history; delegate to general 2-phase planner path.
+                // The general planner handles board history, folder covers and restored ability slots.
             }
             Err(err) => return Err(err),
         }
     }
 
+    execute_general_rollback(store, ctx, request, idemp, deadline).await
+}
+
+async fn execute_general_rollback(
+    store: &CanonicalStore,
+    ctx: &mut SpaceContext,
+    request: &Mutation<RollbackAgentRun>,
+    idemp: &crate::writer::CommandIdentitySpec,
+    deadline: Instant,
+) -> Result<Committed<RollbackResult>, PortError> {
     ctx.budget.remaining = rollback_time_left(&ctx.budget, deadline)?;
     if let Some(replayed) = rollback_wait(
         &ctx.budget,
@@ -425,17 +525,23 @@ async fn execute_rollback(
         ctx.budget.remaining = rollback_time_left(&ctx.budget, deadline)?;
         let ctx_read = ctx.clone();
         let input_read = request.input.clone();
-        let (space_rec, skipped_manual_edits, candidates, durable_active_rooms, run_board_moves) =
-            rollback_wait(
-                &ctx.budget,
-                deadline,
-                store.with_read_tx_budget(Some(&ctx.budget), |tx| {
-                    Box::pin(
-                        async move { discover_rollback_state_tx(tx, &ctx_read, &input_read).await },
-                    )
-                }),
-            )
-            .await??;
+        let (
+            space_rec,
+            skipped_manual_edits,
+            candidates,
+            durable_active_rooms,
+            run_board_moves,
+            package_cut,
+        ) = rollback_wait(
+            &ctx.budget,
+            deadline,
+            store.with_read_tx_budget(Some(&ctx.budget), |tx| {
+                Box::pin(
+                    async move { discover_rollback_state_tx(tx, &ctx_read, &input_read).await },
+                )
+            }),
+        )
+        .await??;
 
         // Load pre-run carriers from CAS ONLY when board views were moved by this run and require
         // `planned_carrier` in `RollbackBoardFactsRequest`.
@@ -581,7 +687,11 @@ async fn execute_rollback(
         // created-note trashing FIRST, note restoration, overlay updates, and agent_run_heads bump.
         let required_cut = rb_facts_opt
             .as_ref()
-            .map(|f| (f.cutoff(), SemanticCutMismatchKind::CursorStale));
+            .map(|f| f.cutoff())
+            .into_iter()
+            .chain(package_cut)
+            .min()
+            .map(|cut| (cut, SemanticCutMismatchKind::CursorStale));
 
         let mut source_note_ids: Vec<NoteId> = eligible_notes.keys().cloned().collect();
         for v in &affected_views_set {
@@ -648,6 +758,17 @@ async fn execute_rollback(
     ))
 }
 
+pub(crate) enum DirectRollbackTarget {
+    Prepared(RollbackAgentRun),
+    ById(AgentRunId),
+}
+
+impl From<RollbackAgentRun> for DirectRollbackTarget {
+    fn from(input: RollbackAgentRun) -> Self {
+        Self::Prepared(input)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_rollback_direct_single_tx_intent(
     scope: HistoryScope,
@@ -655,7 +776,7 @@ pub(crate) fn build_rollback_direct_single_tx_intent(
     idemp: crate::writer::CommandIdentitySpec,
     auth: notarium_core::auth::EngineAuthContext,
     req_id: notarium_core::receipt::CommandIdentity,
-    input: RollbackAgentRun,
+    input: impl Into<DirectRollbackTarget>,
     room_fences: std::sync::Arc<crate::domain::RoomFenceTable>,
 ) -> PreparedWriteIntent {
     PreparedWriteIntent {
@@ -673,24 +794,28 @@ pub(crate) fn build_rollback_direct_single_tx_exec(
     scope_cl: HistoryScope,
     auth: notarium_core::auth::EngineAuthContext,
     req_id: notarium_core::receipt::CommandIdentity,
-    input: RollbackAgentRun,
+    input: impl Into<DirectRollbackTarget>,
     room_fences: std::sync::Arc<crate::domain::RoomFenceTable>,
 ) -> crate::writer::ItemExecuteFn {
+    let target = input.into();
     Box::new(move |tx, item_ctx| {
         Box::pin(async move {
             auth.authorize_space_write(&item_ctx.space)?;
+            let (run, expected) = match &target {
+                DirectRollbackTarget::Prepared(input) => (&input.run, Some(input)),
+                DirectRollbackTarget::ById(run) => (run, None),
+            };
             let mut folder_cache = FolderAncestryCache::default();
             // 1. Consolidated Space + Run + RootFolder state probe (1 single query on PostgreSQL!).
-            type RollbackStateProbeTuple =
-                (bool, bool, bool, bool, bool, Option<(Vec<u8>, String)>);
-            let (has_bmh, has_pf, has_cs, has_ov, has_schema, run_head_opt): RollbackStateProbeTuple =
+            type RollbackStateProbeTuple = (bool, bool, bool, bool, Option<(Vec<u8>, String)>);
+            let (has_bmh, has_note_states, has_ov, has_schema, run_head_opt): RollbackStateProbeTuple =
                 match tx {
                 BackendConn::Postgres(conn) => {
                     let r = sqlx::query(
                         "SELECT
                             EXISTS(SELECT 1 FROM board_move_history WHERE space_id = $1) AS has_bmh,
-                            EXISTS(SELECT 1 FROM revision_purge_fences WHERE space_id = $1) AS has_pf,
-                            EXISTS(SELECT 1 FROM collab_sessions WHERE space_id = $1) AS has_cs,
+                            (EXISTS(SELECT 1 FROM revision_purge_fences WHERE space_id = $1) OR
+                             EXISTS(SELECT 1 FROM collab_sessions WHERE space_id = $1)) AS has_note_states,
                             EXISTS(SELECT 1 FROM view_rank_overlays WHERE space_id = $1) AS has_ov,
                             EXISTS(SELECT 1 FROM space_field_schemas WHERE space_id = $1 AND is_current = 1) AS has_schema,
                             arh.history_incarnation AS run_inc,
@@ -714,7 +839,7 @@ pub(crate) fn build_rollback_direct_single_tx_exec(
                          LEFT JOIN folder_heads rf ON rf.space_id = $1 AND rf.folder_id = $3",
                     )
                     .bind(scope_cl.space_id.as_str())
-                    .bind(input.run.as_str())
+                    .bind(run.as_str())
                     .bind(item_ctx.root_folder_id.as_str())
                     .fetch_one(&mut **conn)
                     .await
@@ -768,68 +893,40 @@ pub(crate) fn build_rollback_direct_single_tx_exec(
                     let run_rev: Option<String> = r.get("run_rev");
                     (
                         r.get("has_bmh"),
-                        r.get("has_pf"),
-                        r.get("has_cs"),
+                        r.get("has_note_states"),
                         r.get("has_ov"),
                         r.get("has_schema"),
                         run_inc.zip(run_rev),
                     )
                 }
                 BackendConn::Sqlite(conn) => {
-                    let bmh = sqlx::query_scalar::<_, i64>(
-                        "SELECT 1 FROM board_move_history WHERE space_id = ? LIMIT 1",
-                    )
+                    let row = sqlx::query(concat!(
+                        "SELECT (", include_str!("rollback/sqlite_board_history.sql"), ") AS has_bmh,
+                                (EXISTS(SELECT 1 FROM revision_purge_fences WHERE space_id = ?1) OR
+                                 EXISTS(SELECT 1 FROM collab_sessions WHERE space_id = ?1)) AS has_note_states,
+                                EXISTS(SELECT 1 FROM view_rank_overlays WHERE space_id = ?1) AS has_ov,
+                                EXISTS(SELECT 1 FROM space_field_schemas WHERE space_id = ?1 AND is_current = 1) AS has_schema,
+                                arh.history_incarnation, arh.run_revision
+                         FROM (SELECT 1)
+                         LEFT JOIN agent_run_heads arh ON arh.space_id = ?1 AND arh.run_id = ?2"
+                    ))
                     .bind(scope_cl.space_id.as_str())
-                    .fetch_optional(&mut **conn)
+                    .bind(run.as_str())
+                    .fetch_one(&mut **conn)
                     .await
-                    .map_err(|e| internal_not_committed("sqlite_rb_bmh", e.to_string()))?
-                    .is_some();
-                    let pf = sqlx::query_scalar::<_, i64>(
-                        "SELECT 1 FROM revision_purge_fences WHERE space_id = ? LIMIT 1",
+                    .map_err(|e| internal_not_committed("sqlite_rb_combined_probe", e.to_string()))?;
+                    let incarnation: Option<Vec<u8>> = row.get("history_incarnation");
+                    (
+                        row.get("has_bmh"),
+                        row.get("has_note_states"),
+                        row.get("has_ov"),
+                        row.get("has_schema"),
+                        incarnation.zip(row.get("run_revision")),
                     )
-                    .bind(scope_cl.space_id.as_str())
-                    .fetch_optional(&mut **conn)
-                    .await
-                    .map_err(|e| internal_not_committed("sqlite_rb_pf", e.to_string()))?
-                    .is_some();
-                    let cs = sqlx::query_scalar::<_, i64>(
-                        "SELECT 1 FROM collab_sessions WHERE space_id = ? LIMIT 1",
-                    )
-                    .bind(scope_cl.space_id.as_str())
-                    .fetch_optional(&mut **conn)
-                    .await
-                    .map_err(|e| internal_not_committed("sqlite_rb_cs", e.to_string()))?
-                    .is_some();
-                    let ov = sqlx::query_scalar::<_, i64>(
-                        "SELECT 1 FROM view_rank_overlays WHERE space_id = ? LIMIT 1",
-                    )
-                    .bind(scope_cl.space_id.as_str())
-                    .fetch_optional(&mut **conn)
-                    .await
-                    .map_err(|e| internal_not_committed("sqlite_rb_ov", e.to_string()))?
-                    .is_some();
-                    let sch = sqlx::query_scalar::<_, i64>(
-                        "SELECT 1 FROM space_field_schemas WHERE space_id = ? AND is_current = 1 LIMIT 1",
-                    )
-                    .bind(scope_cl.space_id.as_str())
-                    .fetch_optional(&mut **conn)
-                    .await
-                    .map_err(|e| internal_not_committed("sqlite_rb_sch", e.to_string()))?
-                    .is_some();
-                    let rr = sqlx::query(
-                        "SELECT history_incarnation, run_revision FROM agent_run_heads WHERE space_id = ? AND run_id = ?",
-                    )
-                    .bind(scope_cl.space_id.as_str())
-                    .bind(input.run.as_str())
-                    .fetch_optional(&mut **conn)
-                    .await
-                    .map_err(|e| internal_not_committed("sqlite_rb_rh", e.to_string()))?
-                    .map(|r| (r.get("history_incarnation"), r.get("run_revision")));
-                    (bmh, pf, cs, ov, sch, rr)
                 }
             };
 
-            if has_bmh {
+            if has_bmh && matches!(tx, BackendConn::Sqlite(_)) {
                 return Err(rollback_fallback_board_present_err());
             }
 
@@ -847,45 +944,55 @@ pub(crate) fn build_rollback_direct_single_tx_exec(
             let actual_run_rev = RevisionId::parse(&run_rev_raw)
                 .map_err(|_| internal_not_committed("corrupt_run_rev", "invalid run_revision"))?;
 
-            let purged_notes = if has_pf {
-                load_space_purged_notes_tx(tx, &scope_cl.space_id).await?
+            let histories = load_direct_rollback_histories(tx, &scope_cl.space_id, run).await?;
+            let touched: Vec<NoteId> = histories.keys().cloned().collect();
+            // Explicit expectations can include a now-purged note no longer in the run.
+            let states = if has_note_states {
+                let ids = match expected {
+                    Some(input) => input
+                        .expected_entities
+                        .iter()
+                        .map(|entry| entry.note.as_str())
+                        .collect(),
+                    None => touched.iter().map(NoteId::as_str).collect(),
+                };
+                load_rollback_note_states(tx, &scope_cl.space_id, ids).await?
             } else {
-                HashMap::new()
+                RollbackNoteStates::default()
             };
-
-            let mut caller_notes: BTreeMap<NoteId, RevisionId> = BTreeMap::new();
-            for exp in &input.expected_entities {
-                if purged_notes.contains_key(exp.note.as_str()) {
-                    return Err(DomainError::ResourceNotFound.into());
+            if expected.is_none() && !states.purged.is_empty() {
+                return Err(DomainError::ResourceNotFound.into());
+            }
+            if has_bmh && let BackendConn::Postgres(conn) = &mut *tx {
+                let ids: Vec<_> = touched.iter().map(NoteId::as_str).collect();
+                let relevant: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM board_move_history WHERE space_id = $1
+                      AND (agent_run_id = $2 OR target_note_id = ANY($3) OR view_note_id = ANY($3)))",
+                ).bind(scope_cl.space_id.as_str()).bind(run.as_str()).bind(ids)
+                 .fetch_one(&mut **conn).await
+                 .map_err(|err| crate::runtime::pg_read_error("pg_rollback_board_scope", err))?;
+                if relevant {
+                    return Err(rollback_fallback_board_present_err());
                 }
-                if caller_notes
-                    .insert(exp.note.clone(), exp.revision.clone())
-                    .is_some()
-                {
-                    return Err(DomainError::validation(ValidationReason::InvalidState).into());
+            }
+            if let Some(input) = expected {
+                let mut notes = BTreeSet::new();
+                for note in &input.expected_entities {
+                    if states.purged.contains(&note.note) {
+                        return Err(DomainError::ResourceNotFound.into());
+                    }
+                    if !notes.insert(&note.note) {
+                        return Err(DomainError::validation(ValidationReason::InvalidState).into());
+                    }
+                }
+                if notes.into_iter().ne(touched.iter()) {
+                    return Err(DomainError::validation(ValidationReason::SourceMismatch).into());
                 }
             }
 
-            let caller_note_vec: Vec<NoteId> = caller_notes.keys().cloned().collect();
+            let mut heads_map = load_note_heads_batch_tx(tx, &scope_cl.space_id, &touched).await?;
 
-            // Load all note revisions for `caller_note_vec` PLUS any extra notes touched by `input.run` in 1 query!
-            let (mut rev_histories, touched_set) = load_revisions_and_run_touched_combined_tx(
-                tx,
-                &scope_cl.space_id,
-                &input.run,
-                &caller_note_vec,
-            )
-            .await?;
-
-            let caller_set: BTreeSet<NoteId> = caller_notes.keys().cloned().collect();
-            if caller_set != touched_set {
-                return Err(DomainError::validation(ValidationReason::SourceMismatch).into());
-            }
-
-            let mut heads_map =
-                load_note_heads_batch_tx(tx, &scope_cl.space_id, &caller_note_vec).await?;
-
-            for nid in caller_notes.keys() {
+            for nid in &touched {
                 let head = heads_map.get(nid).ok_or(DomainError::ResourceNotFound)?;
                 if head.slug_fold == super::folder_cover::SLUG {
                     return Err(rollback_fallback_cover_change_err());
@@ -903,37 +1010,23 @@ pub(crate) fn build_rollback_direct_single_tx_exec(
                 auth.authorize_direct_write(&rfacts, &rfacts)?;
             }
 
-            verify_authorized_rollback_revisions(actual_run_rev, &input, |nid| {
-                heads_map.get(nid).map(|head| &head.head_rev_id)
-            })?;
+            if let Some(input) = expected {
+                verify_authorized_rollback_revisions(actual_run_rev, input, |nid| {
+                    heads_map.get(nid).map(|head| &head.head_rev_id)
+                })?;
+            }
 
-            let collab_states = if has_cs {
-                load_space_collab_states_tx(tx, &scope_cl.space_id).await?
-            } else {
-                HashMap::new()
-            };
+            let collab_states = states.rooms;
 
             let mut skipped_manual_edits = Vec::new();
             let mut skipped_room_active = Vec::new();
             let mut eligible_notes: BTreeMap<NoteId, CandidateAction> = BTreeMap::new();
 
-            for nid in caller_note_vec {
+            for (nid, history) in histories {
                 let head = heads_map
                     .remove(&nid)
                     .ok_or(DomainError::ResourceNotFound)?;
-                let note_revs = rev_histories.remove(&nid).unwrap_or_default();
-
-                let first_run_seq = note_revs
-                    .iter()
-                    .filter(|r| r.3.as_ref() == Some(&input.run))
-                    .map(|r| r.1)
-                    .min()
-                    .ok_or_else(|| DomainError::validation(ValidationReason::SourceMismatch))?;
-
-                let has_foreign_note_edit = note_revs
-                    .iter()
-                    .any(|r| r.1 > first_run_seq && r.3.as_ref() != Some(&input.run));
-                if has_foreign_note_edit {
+                if history.foreign_edit {
                     skipped_manual_edits.push(nid);
                     continue;
                 }
@@ -943,14 +1036,21 @@ pub(crate) fn build_rollback_direct_single_tx_exec(
                     continue;
                 }
 
-                let pre_rev_opt = note_revs
-                    .iter()
-                    .filter(|r| r.1 < first_run_seq)
-                    .max_by_key(|r| r.1);
+                if head.doc_class == DocClass::Skill || head.ability_id.is_some() {
+                    return Err(rollback_fallback_ability_slot_err());
+                }
 
-                let action = match pre_rev_opt {
+                let action = match history.prior {
                     None => CandidateAction::TrashCreated {
-                        metadata: current_rollback_metadata(&note_revs, &head.head_rev_id, &nid)?,
+                        metadata: Box::new(decode_rollback_note(
+                            history.current_metadata.as_deref().ok_or_else(|| {
+                                internal_not_committed(
+                                    "rollback_missing_head",
+                                    "current note revision is missing",
+                                )
+                            })?,
+                            &nid,
+                        )?),
                         current_rev: head.head_rev_id,
                         current_lifecycle: head.lifecycle,
                         doc_class: head.doc_class,
@@ -963,20 +1063,23 @@ pub(crate) fn build_rollback_direct_single_tx_exec(
                         byte_size: head.byte_size,
                         content_digest: head.content_digest,
                     },
-                    Some((pre_rev_id, _, meta_bytes, _)) => {
-                        let pre_meta = decode_rollback_note(meta_bytes, &nid)?;
+                    Some((pre_rev_id, meta_bytes)) => {
+                        let pre_meta = decode_rollback_note(&meta_bytes, &nid)?;
                         if pre_meta.slug_fold == super::folder_cover::SLUG {
                             return Err(rollback_fallback_cover_change_err());
+                        }
+                        if pre_meta.ability_id.is_some() {
+                            return Err(rollback_fallback_ability_slot_err());
                         }
                         let head_unchanged_placement = head.lifecycle == pre_meta.lifecycle
                             && head.parent_folder_id == pre_meta.parent_folder_id
                             && head.slug == pre_meta.slug
                             && head.slug_fold == pre_meta.slug_fold;
                         let needs_note_mutation =
-                            head.head_rev_id != *pre_rev_id || !head_unchanged_placement;
+                            head.head_rev_id != pre_rev_id || !head_unchanged_placement;
                         CandidateAction::RestorePreExisting {
                             current_rev: head.head_rev_id,
-                            pre_rev_id: pre_rev_id.clone(),
+                            pre_rev_id,
                             pre_meta: Box::new(pre_meta),
                             pre_carrier: None,
                             needs_note_mutation,
@@ -1062,42 +1165,15 @@ pub(crate) fn build_rollback_direct_single_tx_exec(
                 }
             }
 
-            let mut needed_rebind_digests: BTreeSet<ContentDigest> = BTreeSet::new();
-            for action in final_eligible.values() {
-                match action {
-                    CandidateAction::TrashCreated {
-                        current_lifecycle,
-                        content_digest: Some(d),
-                        ..
-                    } if *current_lifecycle != Lifecycle::Trashed => {
-                        needed_rebind_digests.insert(*d);
-                    }
-                    CandidateAction::RestorePreExisting {
-                        needs_note_mutation: true,
-                        pre_meta,
-                        ..
-                    } => {
-                        if let Some(d) = pre_meta.content_digest {
-                            needed_rebind_digests.insert(d);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-
-            let pg_pub_by_digest_opt = verify_collisions_and_load_pg_rebind_pubs_tx(
+            verify_no_active_non_eligible_collisions_batch_tx(
                 tx,
                 &scope_cl.space_id,
                 &planned_collision_checks,
                 &eligible_all_ids,
-                &needed_rebind_digests,
             )
             .await?;
 
-            for (mut guard, res) in locked_fences {
-                guard.consume(res, &req_id)?;
-                item_ctx.retain_until_batch_commit(guard);
-            }
+            stage_rollback_fences(item_ctx, locked_fences, &req_id)?;
 
             let current_schema = if has_schema {
                 load_current_space_schema_tx(tx, &scope_cl.space_id).await?
@@ -1369,7 +1445,7 @@ pub(crate) fn build_rollback_direct_single_tx_exec(
             let new_run_rev = new_revision_id()?;
             let run_meta = RevisionMetadataEnvelope::v1(RevisionMetadataPayload::AgentRun(
                 crate::codec::AgentRunRevisionMetadata {
-                    run_id: input.run.clone(),
+                    run_id: run.clone(),
                     last_seq: visibility_seq,
                 },
             ))
@@ -1377,13 +1453,13 @@ pub(crate) fn build_rollback_direct_single_tx_exec(
             pending_rev_rows.push(PendingSingleRev {
                 rev_id: new_run_rev.clone(),
                 entity_type: "agent_run",
-                entity_key: input.run.as_str().to_owned(),
+                entity_key: run.as_str().to_owned(),
                 space_seq: visibility_seq,
                 parent_rev_id: None,
                 restored_from_rev_id: None,
                 content_blake3: None,
                 metadata_msgpack: run_meta,
-                agent_run_id: Some(input.run.clone()),
+                agent_run_id: Some(run.clone()),
             });
 
             let rev_items: Vec<RevisionInsertItem<'_>> = pending_rev_rows
@@ -1404,13 +1480,11 @@ pub(crate) fn build_rollback_direct_single_tx_exec(
                 })
                 .collect();
 
-            if let (Some(pub_by_digest), BackendConn::Postgres(conn)) =
-                (pg_pub_by_digest_opt.as_ref(), &mut *tx)
-            {
+            if let BackendConn::Postgres(conn) = &mut *tx {
                 execute_pg_rollback_domain_writes_cte(
                     conn,
                     &scope_cl,
-                    &input.run,
+                    run,
                     &new_run_rev,
                     vis_i64,
                     sec,
@@ -1418,7 +1492,6 @@ pub(crate) fn build_rollback_direct_single_tx_exec(
                     auth.principal().as_str(),
                     &pending_restore_heads,
                     &pending_blob_rebinds,
-                    pub_by_digest,
                     &rev_items,
                 )
                 .await?;
@@ -1446,7 +1519,7 @@ pub(crate) fn build_rollback_direct_single_tx_exec(
                 upsert_agent_run_head_row_only_tx(
                     tx,
                     &scope_cl,
-                    &input.run,
+                    run,
                     &new_run_rev,
                     vis_i64,
                     sec,
@@ -1490,14 +1563,7 @@ pub(crate) fn build_rollback_direct_single_tx_exec(
                 receipt: receipt_token.clone(),
             };
             let resp_bytes = encode_msgpack(&wire)?;
-            let sanitized = encode_msgpack(&StoredCommittedRollbackV1 {
-                restored: Vec::new(),
-                trashed: Vec::new(),
-                restored_ranks: Vec::new(),
-                skipped_manual_edits: wire.skipped_manual_edits,
-                skipped_room_active,
-                receipt: receipt_token,
-            })?;
+            let sanitized = encode_msgpack(&StoredCommittedRollbackV1::sanitized(receipt_token))?;
 
             Ok(ItemCommitArtifacts {
                 command_id: new_prefixed_hex_id("cmd_")?,
@@ -1506,7 +1572,7 @@ pub(crate) fn build_rollback_direct_single_tx_exec(
                 change_payload: Some(effect_draft),
                 receipt_detail_blob: Some(resp_bytes.clone()),
                 receipt_sanitized_blob: sanitized,
-                receipt_owner_note_ids: owner_vec,
+                receipt_owner_note_ids: wire.receipt_owners(owner_vec),
                 response_bytes: resp_bytes,
             })
         })
@@ -1532,7 +1598,10 @@ fn build_rollback_execute_fn(
         Box::pin(async move {
             // 1. Re-verify `expected_run_revision`, `expected_entities`, and `associated_board_expectations`.
             let mut folder_cache = FolderAncestryCache::default();
-            let _ = verify_run_and_entity_preconditions_tx(
+            let VerifiedRollbackSources {
+                rooms: collab_states,
+                ..
+            } = verify_run_and_entity_preconditions_tx(
                 tx,
                 &scope_cl,
                 &item_ctx.space,
@@ -1542,18 +1611,17 @@ fn build_rollback_execute_fn(
             )
             .await?;
 
-            // 2. Consume all closed-room reservations in ascending NoteId order.
-            let collab_states = load_space_collab_states_tx(tx, &scope_cl.space_id).await?;
+            // 2. Lock all closed-room reservations in ascending NoteId order.
+            let mut locked_fences = Vec::with_capacity(eligible_reservations.len());
             for (nid, res) in eligible_reservations {
-                let guard = room_fences
-                    .consume_reservation(&scope_cl, &nid, res, &req_id)
-                    .await?;
+                let guard = room_fences.lock_for_write(&scope_cl, &nid)?;
                 // Double-check durable `collab_sessions` did not become `'active'` or `'fenced'` concurrently.
                 if collab_states.get(&nid) == Some(&true) {
                     return Err(DomainError::validation(ValidationReason::InvalidState).into());
                 }
-                item_ctx.retain_until_batch_commit(guard);
+                locked_fences.push((guard, res));
             }
+            stage_rollback_fences(item_ctx, locked_fences, &req_id)?;
 
             // 3. Validate folder existence and post-trash slug uniqueness for all eligible restored notes.
             let eligible_all_ids: BTreeSet<NoteId> = eligible_notes.keys().cloned().collect();
@@ -1569,8 +1637,15 @@ fn build_rollback_execute_fn(
             let mut planned_collision_checks: Vec<(FolderId, String, String, bool)> = Vec::new();
             let mut restored_ancestries: HashMap<NoteId, bool> = HashMap::new();
 
+            let mut changed_packages = Vec::new();
+            let mut restored_ability_slots = Vec::new();
             for (nid, action) in &eligible_notes {
-                if let CandidateAction::RestorePreExisting { pre_meta, .. } = action {
+                if let CandidateAction::RestorePreExisting {
+                    pre_meta,
+                    needs_note_mutation,
+                    ..
+                } = action
+                {
                     let anc = authorize_rollback_destination_tx(
                         tx,
                         &mut folder_cache,
@@ -1582,6 +1657,13 @@ fn build_rollback_execute_fn(
                     restored_ancestries.insert(nid.clone(), anc.is_root_child);
 
                     if pre_meta.lifecycle == Lifecycle::Active {
+                        if *needs_note_mutation && let Some(ability) = &pre_meta.ability_id {
+                            restored_ability_slots.push((
+                                ability,
+                                &pre_meta.slug_fold,
+                                anc.project,
+                            ));
+                        }
                         let slot_key = (
                             pre_meta.parent_folder_id.clone(),
                             pre_meta.slug_fold.clone(),
@@ -2016,6 +2098,9 @@ fn build_rollback_execute_fn(
                     .await?;
 
                 pending_trash_heads.push((nid.clone(), trev.clone()));
+                if let Some(ability) = &metadata.ability_id {
+                    changed_packages.push((nid, ability));
+                }
                 if collab_states.contains_key(nid) {
                     bump_closed_collab_session_lineage_tx(
                         tx,
@@ -2123,6 +2208,9 @@ fn build_rollback_execute_fn(
                     normalize_title_key(&pre_meta.title)
                 };
 
+                if let Some(ability) = &pre_meta.ability_id {
+                    changed_packages.push((nid, ability));
+                }
                 pending_restore_heads.push(RestoredHeadUpdateItem {
                     note_id: nid,
                     parent_folder_id: &pre_meta.parent_folder_id,
@@ -2196,6 +2284,20 @@ fn build_rollback_execute_fn(
                 auth.principal().as_str(),
             )
             .await?;
+            for (note, ability) in changed_packages {
+                ability::sync_entrypoint(tx, &scope_cl.space_id, note, ability).await?;
+            }
+            // Final heads include every package arriving in or leaving the same project.
+            for (ability, slug, project) in restored_ability_slots {
+                super::packages::check_restored_ability_slot_tx(
+                    tx,
+                    &scope_cl.space_id,
+                    ability,
+                    slug,
+                    project.as_ref(),
+                )
+                .await?;
+            }
             bind_existing_active_blob_refs_batch_tx(tx, &scope_cl.space_id, &pending_blob_rebinds)
                 .await?;
 
@@ -2412,14 +2514,9 @@ fn build_rollback_execute_fn(
                 receipt: receipt_token,
             };
             let resp_bytes = encode_msgpack(&wire)?;
-            let sanitized = encode_msgpack(&StoredCommittedRollbackV1 {
-                restored: Vec::new(),
-                trashed: Vec::new(),
-                restored_ranks: Vec::new(),
-                skipped_manual_edits: skipped_manual_cl,
-                skipped_room_active: skipped_room_cl,
-                receipt: MutationReceiptToken::new(scope_cl, visibility_seq)?,
-            })?;
+            let sanitized = encode_msgpack(&StoredCommittedRollbackV1::sanitized(
+                MutationReceiptToken::new(scope_cl, visibility_seq)?,
+            ))?;
 
             Ok(ItemCommitArtifacts {
                 command_id: new_prefixed_hex_id("cmd_")?,
@@ -2428,7 +2525,7 @@ fn build_rollback_execute_fn(
                 change_payload: Some(effect_draft),
                 receipt_detail_blob: Some(resp_bytes.clone()),
                 receipt_sanitized_blob: sanitized,
-                receipt_owner_note_ids: owner_vec,
+                receipt_owner_note_ids: wire.receipt_owners(owner_vec),
                 response_bytes: resp_bytes,
             })
         })
@@ -2456,17 +2553,6 @@ async fn authorize_rollback_destination_tx(
         )
         .await?;
     auth.authorize_direct_write(&after, &after)?;
-    if meta.lifecycle == Lifecycle::Active
-        && let Some(ability) = &meta.ability_id
-    {
-        super::packages::check_restored_ability_slot_tx(
-            tx,
-            &space.id,
-            ability,
-            anc.project.as_ref(),
-        )
-        .await?;
-    }
     Ok(anc)
 }
 
@@ -2481,6 +2567,7 @@ async fn discover_rollback_state_tx(
         BTreeMap<NoteId, CandidateAction>,
         BTreeSet<NoteId>,
         Vec<RunBoardMoveRow>,
+        Option<SpaceSeq>,
     ),
     PortError,
 > {
@@ -2488,7 +2575,11 @@ async fn discover_rollback_state_tx(
     srec.scope.check(ctx.scope())?;
 
     let mut folder_cache = FolderAncestryCache::default();
-    let (mut heads_map, run_moves) = verify_run_and_entity_preconditions_tx(
+    let VerifiedRollbackSources {
+        heads: mut heads_map,
+        moves: run_moves,
+        rooms: collab_states,
+    } = verify_run_and_entity_preconditions_tx(
         tx,
         &srec.scope,
         &srec.space,
@@ -2511,11 +2602,11 @@ async fn discover_rollback_state_tx(
         load_notes_revision_histories_batch_tx(tx, &srec.scope.space_id, &touched_sorted).await?;
     let space_has_bmh =
         !run_moves.is_empty() || has_any_board_moves_in_space_tx(tx, &srec.scope.space_id).await?;
-    let collab_states = load_space_collab_states_tx(tx, &srec.scope.space_id).await?;
 
     let mut skipped_manual_edits = Vec::new();
     let mut candidates = BTreeMap::new();
     let mut durable_active_rooms = BTreeSet::new();
+    let mut package_cut = None;
 
     for nid in touched_sorted {
         let head = heads_map
@@ -2569,6 +2660,24 @@ async fn discover_rollback_state_tx(
             .filter(|r| r.1 < first_run_seq)
             .max_by_key(|r| r.1);
 
+        if head.doc_class == DocClass::Skill || head.ability_id.is_some() {
+            // Publication attaches a binding without advancing the note revision.
+            // Retry this rare plan if publication changes before the writer commits it.
+            package_cut = Some(srec.last_seq);
+            if ability::has_later_foreign_publication(
+                tx,
+                &srec.scope,
+                &head,
+                first_run_seq,
+                &input.run,
+                pre_rev_opt.is_none(),
+            )
+            .await?
+            {
+                skipped_manual_edits.push(nid);
+                continue;
+            }
+        }
         let current_cover_parent = if head.slug_fold == super::folder_cover::SLUG
             && crate::runtime::load_folder_head_row(
                 tx,
@@ -2588,6 +2697,7 @@ async fn discover_rollback_state_tx(
             None => {
                 let mut metadata = current_rollback_metadata(&note_revs, &head.head_rev_id, &nid)?;
                 metadata.folder_page |= current_cover_parent.is_some();
+                ability::retain_binding(&mut metadata, &head)?;
                 candidates.insert(
                     nid.clone(),
                     CandidateAction::TrashCreated {
@@ -2607,7 +2717,8 @@ async fn discover_rollback_state_tx(
                 );
             }
             Some((pre_rev_id, _, meta_bytes, _)) => {
-                let pre_meta = decode_rollback_note(meta_bytes, &nid)?;
+                let mut pre_meta = decode_rollback_note(meta_bytes, &nid)?;
+                ability::retain_binding(&mut pre_meta, &head)?;
                 authorize_rollback_destination_tx(
                     tx,
                     &mut folder_cache,
@@ -2644,6 +2755,7 @@ async fn discover_rollback_state_tx(
         candidates,
         durable_active_rooms,
         run_moves,
+        package_cut,
     ))
 }
 
@@ -2707,7 +2819,15 @@ async fn load_run_revision(
     let Some((inc_bytes, run_rev_raw)) = run_row else {
         return Err(DomainError::ResourceNotFound.into());
     };
-    let inc_arr: [u8; 16] = inc_bytes
+    scoped_run_revision(scope, &inc_bytes, &run_rev_raw)
+}
+
+fn scoped_run_revision(
+    scope: &HistoryScope,
+    incarnation: &[u8],
+    revision: &str,
+) -> Result<RevisionId, PortError> {
+    let inc_arr: [u8; 16] = incarnation
         .try_into()
         .map_err(|_| internal_not_committed("corrupt_run_inc", "incarnation != 16B"))?;
     let run_scope = HistoryScope {
@@ -2716,15 +2836,69 @@ async fn load_run_revision(
     };
     scope.check(&run_scope)?;
 
-    RevisionId::parse(&run_rev_raw)
+    RevisionId::parse(revision)
         .map_err(|_| internal_not_committed("corrupt_run_rev", "invalid run_revision"))
+}
+
+// A run can touch a note through revisions, board moves, or both. LEFT JOIN
+// preserves missing and purge-fenced heads for the same authorization checks.
+#[derive(sqlx::FromRow)]
+struct RollbackHeadFacts {
+    incarnation: Vec<u8>,
+    run_revision: String,
+    note_id: Option<String>,
+    parent_folder_id: Option<String>,
+    doc_class: Option<String>,
+    ability_id: Option<String>,
+    head_rev_id: Option<String>,
+    purged: bool,
+    has_board_move: bool,
+}
+
+async fn load_rollback_head_facts(
+    tx: &mut BackendConn<'_>,
+    space: &SpaceId,
+    run: &AgentRunId,
+) -> Result<Vec<RollbackHeadFacts>, PortError> {
+    const SQL: &str = "WITH touched(note_id, board_move) AS (
+        SELECT entity_key, 0 FROM revisions
+        WHERE space_id = $1 AND agent_run_id = $2 AND entity_type = 'note'
+        UNION ALL
+        SELECT target_note_id, 1 FROM board_move_history
+        WHERE space_id = $1 AND agent_run_id = $2
+    ), notes AS (
+        SELECT note_id, MAX(board_move) <> 0 AS has_board_move FROM touched GROUP BY note_id
+    )
+    SELECT r.history_incarnation AS incarnation, r.run_revision, n.note_id, h.parent_folder_id,
+           h.doc_class, h.ability_id, h.head_rev_id,
+           EXISTS (SELECT 1 FROM revision_purge_fences p
+                   WHERE p.space_id = $1 AND p.note_id = n.note_id) AS purged,
+           COALESCE(n.has_board_move, FALSE) AS has_board_move
+    FROM agent_run_heads r LEFT JOIN notes n ON TRUE
+    LEFT JOIN note_heads h ON h.space_id = $1 AND h.note_id = n.note_id
+    WHERE r.space_id = $1 AND r.run_id = $2
+    ORDER BY n.note_id";
+    match tx {
+        BackendConn::Sqlite(conn) => sqlx::query_as(SQL)
+            .bind(space.as_str())
+            .bind(run.as_str())
+            .fetch_all(&mut **conn)
+            .await
+            .map_err(|error| internal_not_committed("sqlite_rollback_heads", error.to_string())),
+        BackendConn::Postgres(conn) => sqlx::query_as(SQL)
+            .bind(space.as_str())
+            .bind(run.as_str())
+            .fetch_all(&mut **conn)
+            .await
+            .map_err(|error| crate::runtime::pg_read_error("pg_rollback_heads", error)),
+    }
 }
 
 pub(super) async fn prepare_agent_run_rollback(
     store: &CanonicalStore,
     ctx: SpaceContext,
     run: AgentRunId,
-) -> Result<RollbackAgentRun, PortError> {
+) -> Result<(RollbackAgentRun, notarium_core::ids::LeaseEpoch), PortError> {
     let scope = ctx.scope().clone();
     let auth = ctx.auth().clone();
     store
@@ -2732,69 +2906,109 @@ pub(super) async fn prepare_agent_run_rollback(
             Box::pin(async move {
                 let record = load_space_record(tx, &scope.space_id).await?;
                 record.scope.check(&scope)?;
-                auth.authorize_space_write(&record.space)?;
-                let expected_run_revision = load_run_revision(tx, &scope, &run).await?;
-                let notes = load_run_touched_notes_tx(tx, &scope.space_id, &run).await?;
-                let mut heads = load_note_heads_batch_tx(tx, &scope.space_id, &notes).await?;
-                let mut folders = FolderAncestryCache::default();
-                let mut expected_entities = Vec::with_capacity(notes.len());
-                for id in notes {
-                    let head = heads.remove(&id).ok_or(DomainError::ResourceNotFound)?;
-                    if crate::runtime::is_note_purge_fenced_tx(tx, &scope.space_id, id.as_str())
-                        .await?
-                    {
-                        return Err(DomainError::ResourceNotFound.into());
-                    }
-                    let (facts, _) = folders
-                        .build_resource_facts_tx(
-                            tx,
-                            &record.space,
-                            &head.parent_folder_id,
-                            head.doc_class,
-                            head.ability_id,
-                            false,
-                        )
-                        .await?;
-                    auth.authorize_direct_write(&facts, &facts)?;
-                    expected_entities.push(NoteRevision {
-                        note: id,
-                        revision: head.head_rev_id,
-                    });
-                }
-                let mut associated_board_expectations = Vec::new();
-                let moves = load_run_board_moves_tx(tx, &scope.space_id, &run).await?;
-                let pairs: BTreeSet<_> = moves
-                    .into_iter()
-                    .map(|m| (m.view, m.target_note_id))
-                    .collect();
-                for (view, note) in pairs {
-                    super::board::authorized_view_head(tx, &record.space, &auth, &view.note)
-                        .await?;
-                    let overlay =
-                        load_overlay_row_opt_tx(tx, &scope.space_id, &view, &note).await?;
-                    let (expected_rank, expected_placement_revision) = match overlay {
-                        Some(overlay) => (
-                            RankExpectation::Existing(overlay.rank_rev_id),
-                            overlay.placement_revision,
-                        ),
-                        None => (RankExpectation::Absent, expected_run_revision.clone()),
-                    };
-                    associated_board_expectations.push(AssociatedBoardExpectation {
-                        view,
-                        note,
-                        expected_rank,
-                        expected_placement_revision,
-                    });
-                }
-                Ok(RollbackAgentRun {
-                    run,
-                    expected_run_revision,
-                    expected_entities,
-                    associated_board_expectations,
-                })
+                let input = prepare_rollback_sources_tx(tx, &record, &auth, run, false).await?;
+                Ok((input, record.active_epoch))
             })
         })
         .await
+}
+
+pub(crate) async fn prepare_rollback_sources_tx(
+    tx: &mut BackendConn<'_>,
+    record: &crate::runtime::SpaceRecord,
+    auth: &notarium_core::auth::EngineAuthContext,
+    run: AgentRunId,
+    require_active_folders: bool,
+) -> Result<RollbackAgentRun, PortError> {
+    let scope = &record.scope;
+    auth.authorize_space_write(&record.space)?;
+    let rows = load_rollback_head_facts(tx, &scope.space_id, &run).await?;
+    let run_head = rows.first().ok_or(DomainError::ResourceNotFound)?;
+    let expected_run_revision =
+        scoped_run_revision(scope, &run_head.incarnation, &run_head.run_revision)?;
+    if rows.iter().any(|row| row.purged) {
+        return Err(DomainError::ResourceNotFound.into());
+    }
+    let mut folders = FolderAncestryCache::default();
+    let mut expected_entities = Vec::with_capacity(rows.len());
+    let mut has_board_moves = false;
+    for row in rows {
+        // A run with no touched notes still has one row with its revision.
+        let Some(id) = row.note_id else {
+            continue;
+        };
+        let (Some(parent), Some(class), Some(revision)) =
+            (row.parent_folder_id, row.doc_class, row.head_rev_id)
+        else {
+            return Err(DomainError::ResourceNotFound.into());
+        };
+        let parent = FolderId::parse(&parent).map_err(|_| {
+            internal_not_committed("corrupt_note_parent", "invalid parent_folder_id")
+        })?;
+        let ability = row
+            .ability_id
+            .as_deref()
+            .map(AbilityId::parse)
+            .transpose()
+            .map_err(|_| internal_not_committed("corrupt_ability_id", "invalid ability_id"))?;
+        let (facts, _) = folders
+            .build_resource_facts_tx(
+                tx,
+                &record.space,
+                &parent,
+                crate::codec::doc_class_from_db(&class)?,
+                ability,
+                require_active_folders,
+            )
+            .await?;
+        auth.authorize_direct_write(&facts, &facts)?;
+        expected_entities.push(NoteRevision {
+            note: NoteId::parse(&id)
+                .map_err(|_| internal_not_committed("corrupt_touched_note_id", "invalid NoteId"))?,
+            revision: RevisionId::parse(&revision)
+                .map_err(|_| internal_not_committed("corrupt_note_rev", "invalid head_rev_id"))?,
+        });
+        has_board_moves |= row.has_board_move;
+    }
+    let mut associated_board_expectations = Vec::new();
+    let moves = if has_board_moves {
+        load_run_board_moves_tx(tx, &scope.space_id, &run).await?
+    } else {
+        Vec::new()
+    };
+    let pairs: BTreeSet<_> = moves
+        .into_iter()
+        .map(|m| (m.view, m.target_note_id))
+        .collect();
+    for (view, note) in pairs {
+        super::board::authorized_view_head(tx, &record.space, auth, &view.note).await?;
+        let overlay = load_overlay_row_opt_tx(tx, &scope.space_id, &view, &note).await?;
+        let (expected_rank, expected_placement_revision) = match overlay {
+            Some(overlay) => (
+                RankExpectation::Existing(overlay.rank_rev_id),
+                overlay.placement_revision,
+            ),
+            None => (RankExpectation::Absent, expected_run_revision.clone()),
+        };
+        associated_board_expectations.push(AssociatedBoardExpectation {
+            view,
+            note,
+            expected_rank,
+            expected_placement_revision,
+        });
+    }
+    Ok(RollbackAgentRun {
+        run,
+        expected_run_revision,
+        expected_entities,
+        associated_board_expectations,
+    })
+}
+
+struct VerifiedRollbackSources {
+    heads: BTreeMap<NoteId, NoteHeadRow>,
+    moves: Vec<RunBoardMoveRow>,
+    rooms: HashMap<NoteId, bool>,
 }
 
 async fn verify_run_and_entity_preconditions_tx(
@@ -2804,7 +3018,7 @@ async fn verify_run_and_entity_preconditions_tx(
     auth: &notarium_core::auth::EngineAuthContext,
     input: &RollbackAgentRun,
     folder_cache: &mut FolderAncestryCache,
-) -> Result<(BTreeMap<NoteId, NoteHeadRow>, Vec<RunBoardMoveRow>), PortError> {
+) -> Result<VerifiedRollbackSources, PortError> {
     auth.authorize_space_write(space)?;
     for view in input
         .associated_board_expectations
@@ -2822,10 +3036,15 @@ async fn verify_run_and_entity_preconditions_tx(
         touched_set.insert(nid);
     }
 
-    let purged_notes = load_space_purged_notes_tx(tx, &scope.space_id).await?;
+    let ids = input
+        .expected_entities
+        .iter()
+        .map(|entry| entry.note.as_str())
+        .collect();
+    let states = load_rollback_note_states(tx, &scope.space_id, ids).await?;
     let mut caller_notes: BTreeMap<NoteId, RevisionId> = BTreeMap::new();
     for exp in &input.expected_entities {
-        if purged_notes.contains_key(exp.note.as_str()) {
+        if states.purged.contains(&exp.note) {
             return Err(DomainError::ResourceNotFound.into());
         }
         if caller_notes
@@ -2903,7 +3122,11 @@ async fn verify_run_and_entity_preconditions_tx(
         }
     }
 
-    Ok((heads_map, run_moves))
+    Ok(VerifiedRollbackSources {
+        heads: heads_map,
+        moves: run_moves,
+        rooms: states.rooms,
+    })
 }
 
 async fn load_run_touched_notes_tx(
@@ -3202,83 +3425,81 @@ async fn load_notes_revision_histories_batch_tx(
     Ok(out)
 }
 
-#[allow(clippy::type_complexity)]
-async fn load_revisions_and_run_touched_combined_tx(
-    tx: &mut BackendConn<'_>,
-    space_id: &SpaceId,
-    run_id: &AgentRunId,
-    caller_notes: &[NoteId],
-) -> Result<
-    (
-        BTreeMap<NoteId, Vec<(RevisionId, SpaceSeq, Vec<u8>, Option<AgentRunId>)>>,
-        BTreeSet<NoteId>,
-    ),
-    PortError,
-> {
-    let mut histories: BTreeMap<NoteId, Vec<(RevisionId, SpaceSeq, Vec<u8>, Option<AgentRunId>)>> =
-        BTreeMap::new();
-    let mut touched_set: BTreeSet<NoteId> = BTreeSet::new();
+struct DirectRollbackHistory {
+    foreign_edit: bool,
+    prior: Option<(RevisionId, Vec<u8>)>,
+    current_metadata: Option<Vec<u8>>,
+}
 
-    let rows: Vec<(String, String, i64, Vec<u8>, Option<String>)> = match tx {
-        BackendConn::Postgres(conn) => {
-            let note_strs: Vec<&str> = caller_notes.iter().map(NoteId::as_str).collect();
-            let fetched = sqlx::query(
-                "SELECT entity_key, rev_id, space_seq, metadata_msgpack, agent_run_id
-                 FROM revisions
-                 WHERE space_id = $1 AND entity_type = 'note'
-                   AND (entity_key = ANY($2) OR agent_run_id = $3)",
-            )
-            .bind(space_id.as_str())
-            .bind(note_strs)
-            .bind(run_id.as_str())
+async fn load_direct_rollback_histories(
+    tx: &mut BackendConn<'_>,
+    space: &SpaceId,
+    run: &AgentRunId,
+) -> Result<BTreeMap<NoteId, DirectRollbackHistory>, PortError> {
+    // Command visibility is monotonic, with space_seq ordering events inside a command.
+    // The newest non-run revision is either a foreign edit after the first touch
+    // or the exact predecessor to restore. Only a run-created note needs its head payload.
+    const SQLITE_SQL: &str = concat!(
+        include_str!("rollback/direct_history_select.sql"),
+        "LEFT JOIN revisions p ON p.space_id = $1 AND p.rev_id = (
+        SELECT r.rev_id FROM revisions r
+        WHERE r.space_id = $1 AND r.entity_type = 'note' AND r.entity_key = t.entity_key
+          AND r.agent_run_id IS DISTINCT FROM $2
+        ORDER BY r.visibility_seq DESC, r.space_seq DESC LIMIT 1
+    )"
+    );
+    const PG_SQL: &str = concat!(
+        include_str!("rollback/direct_history_select.sql"),
+        "LEFT JOIN LATERAL (
+        SELECT r.space_seq, r.rev_id, r.metadata_msgpack FROM revisions r
+        WHERE r.space_id = $1 AND r.entity_type = 'note' AND r.entity_key = t.entity_key
+          AND r.agent_run_id IS DISTINCT FROM $2
+        ORDER BY r.visibility_seq DESC, r.space_seq DESC LIMIT 1
+    ) p ON TRUE"
+    );
+    type Row = (
+        String,
+        bool,
+        Option<String>,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+    );
+    let rows: Vec<Row> = match tx {
+        BackendConn::Postgres(conn) => sqlx::query_as(PG_SQL)
+            .bind(space.as_str())
+            .bind(run.as_str())
             .fetch_all(&mut **conn)
             .await
-            .map_err(|err| internal_not_committed("pg_load_note_revs_combined", err.to_string()))?;
-            fetched
-                .into_iter()
-                .map(|r| {
-                    (
-                        r.get("entity_key"),
-                        r.get("rev_id"),
-                        r.get("space_seq"),
-                        r.get("metadata_msgpack"),
-                        r.get("agent_run_id"),
-                    )
-                })
-                .collect()
-        }
-        BackendConn::Sqlite(_) => {
-            for nid in load_run_touched_notes_tx(tx, space_id, run_id).await? {
-                touched_set.insert(nid);
-            }
-            let h = load_notes_revision_histories_batch_tx(tx, space_id, caller_notes).await?;
-            return Ok((h, touched_set));
-        }
+            .map_err(|err| crate::runtime::pg_read_error("pg_rollback_history", err))?,
+        BackendConn::Sqlite(conn) => sqlx::query_as(SQLITE_SQL)
+            .bind(space.as_str())
+            .bind(run.as_str())
+            .fetch_all(&mut **conn)
+            .await
+            .map_err(|err| internal_not_committed("sqlite_rollback_history", err.to_string()))?,
     };
-
-    for (nid_raw, rev_raw, seq_raw, meta, run_raw) in rows {
-        let nid = NoteId::parse(&nid_raw)
-            .map_err(|_| internal_not_committed("corrupt_rev_nid", "invalid note_id"))?;
-        let rev = RevisionId::parse(&rev_raw)
-            .map_err(|_| internal_not_committed("corrupt_rev_id", "invalid rev_id"))?;
-        let seq = i64_to_space_seq(seq_raw)?;
-        let run = match run_raw {
-            Some(s) => {
-                let parsed = AgentRunId::parse(&s)
-                    .map_err(|_| internal_not_committed("corrupt_rev_run", "invalid run_id"))?;
-                if &parsed == run_id {
-                    touched_set.insert(nid.clone());
-                }
-                Some(parsed)
-            }
-            None => None,
-        };
-        histories
-            .entry(nid)
-            .or_default()
-            .push((rev, seq, meta, run));
-    }
-    Ok((histories, touched_set))
+    rows.into_iter()
+        .map(|(id, foreign_edit, rev, metadata, current_metadata)| {
+            let note = NoteId::parse(&id)
+                .map_err(|_| internal_not_committed("corrupt_rev_nid", "invalid note_id"))?;
+            let prior = rev
+                .zip(metadata)
+                .map(|(rev, meta)| {
+                    RevisionId::parse(&rev)
+                        .map(|rev| (rev, meta))
+                        .map_err(|_| internal_not_committed("corrupt_rev_id", "invalid rev_id"))
+                })
+                .transpose()?;
+            Ok((
+                note,
+                DirectRollbackHistory {
+                    foreign_edit,
+                    prior,
+                    current_metadata,
+                },
+            ))
+        })
+        .collect()
 }
 
 async fn upsert_agent_run_head_row_only_tx(
@@ -3341,74 +3562,59 @@ async fn upsert_agent_run_head_row_only_tx(
     Ok(())
 }
 
-async fn load_space_purged_notes_tx(
-    tx: &mut BackendConn<'_>,
-    space_id: &SpaceId,
-) -> Result<HashMap<String, ()>, PortError> {
-    let rows: Vec<String> = match tx {
-        BackendConn::Sqlite(conn) => {
-            sqlx::query_scalar("SELECT note_id FROM revision_purge_fences WHERE space_id = ?")
-                .bind(space_id.as_str())
-                .fetch_all(&mut **conn)
-                .await
-                .map_err(|err| {
-                    internal_not_committed("sqlite_load_purged_notes", err.to_string())
-                })?
-        }
-        BackendConn::Postgres(conn) => {
-            sqlx::query_scalar("SELECT note_id FROM revision_purge_fences WHERE space_id = $1")
-                .bind(space_id.as_str())
-                .fetch_all(&mut **conn)
-                .await
-                .map_err(|err| crate::runtime::pg_read_error("pg_load_purged_notes", err))?
-        }
-    };
-    Ok(rows.into_iter().map(|s| (s, ())).collect())
+#[derive(Default)]
+struct RollbackNoteStates {
+    purged: BTreeSet<NoteId>,
+    // No entry means no durable session. A clean closed session still needs a lineage bump.
+    rooms: HashMap<NoteId, bool>,
 }
 
-async fn load_space_collab_states_tx(
+const SQLITE_ROLLBACK_NOTE_STATES: &str = concat!(
+    "WITH requested(note_id) AS (SELECT value FROM json_each($2)) ",
+    include_str!("rollback/note_states.sql")
+);
+const PG_ROLLBACK_NOTE_STATES: &str = concat!(
+    "WITH requested(note_id) AS (SELECT unnest($2::text[])) ",
+    include_str!("rollback/note_states.sql")
+);
+
+async fn load_rollback_note_states(
     tx: &mut BackendConn<'_>,
-    space_id: &SpaceId,
-) -> Result<HashMap<NoteId, bool>, PortError> {
-    let rows: Vec<(String, bool)> = match tx {
+    space: &SpaceId,
+    notes: Vec<&str>,
+) -> Result<RollbackNoteStates, PortError> {
+    let mut states = RollbackNoteStates::default();
+    if notes.is_empty() {
+        return Ok(states);
+    }
+    let rows: Vec<(String, bool, Option<bool>)> = match tx {
         BackendConn::Sqlite(conn) => {
-            let fetched =
-                sqlx::query("SELECT s.note_id, (s.room_state <> 'closed' OR COALESCE(c.carrier_dirty, 0) <> 0
-                        OR EXISTS (SELECT 1 FROM collab_update_log u WHERE u.space_id = s.space_id AND u.note_id = s.note_id)) AS blocked
-                     FROM collab_sessions s LEFT JOIN collab_checkpoints c USING (space_id, note_id) WHERE s.space_id = ?")
-                    .bind(space_id.as_str())
-                    .fetch_all(&mut **conn)
-                    .await
-                    .map_err(|err| {
-                        internal_not_committed("sqlite_collab_states", err.to_string())
-                    })?;
-            fetched
-                .into_iter()
-                .map(|r| (r.get("note_id"), r.get("blocked")))
-                .collect()
+            let ids = serde_json::to_string(&notes)
+                .map_err(|e| internal_not_committed("sqlite_rollback_note_ids", e.to_string()))?;
+            sqlx::query_as(SQLITE_ROLLBACK_NOTE_STATES)
+                .bind(space.as_str())
+                .bind(ids)
+                .fetch_all(&mut **conn)
+                .await
+                .map_err(|e| internal_not_committed("sqlite_rollback_note_states", e.to_string()))?
         }
-        BackendConn::Postgres(conn) => {
-            let fetched =
-                sqlx::query("SELECT s.note_id, (s.room_state <> 'closed' OR COALESCE(c.carrier_dirty, 0) <> 0
-                        OR EXISTS (SELECT 1 FROM collab_update_log u WHERE u.space_id = s.space_id AND u.note_id = s.note_id)) AS blocked
-                     FROM collab_sessions s LEFT JOIN collab_checkpoints c USING (space_id, note_id) WHERE s.space_id = $1")
-                    .bind(space_id.as_str())
-                    .fetch_all(&mut **conn)
-                    .await
-                    .map_err(|err| crate::runtime::pg_read_error("pg_collab_states", err))?;
-            fetched
-                .into_iter()
-                .map(|r| (r.get("note_id"), r.get("blocked")))
-                .collect()
-        }
+        BackendConn::Postgres(conn) => sqlx::query_as(PG_ROLLBACK_NOTE_STATES)
+            .bind(space.as_str())
+            .bind(notes)
+            .fetch_all(&mut **conn)
+            .await
+            .map_err(|e| crate::runtime::pg_read_error("pg_rollback_note_states", e))?,
     };
-    let mut out = HashMap::with_capacity(rows.len());
-    for (nid_raw, state) in rows {
-        if let Ok(nid) = NoteId::parse(&nid_raw) {
-            out.insert(nid, state);
+    for (id, purged, blocked) in rows {
+        let note = NoteId::parse(&id)?;
+        if purged {
+            states.purged.insert(note.clone());
+        }
+        if let Some(blocked) = blocked {
+            states.rooms.insert(note, blocked);
         }
     }
-    Ok(out)
+    Ok(states)
 }
 
 async fn has_any_board_moves_in_space_tx(
@@ -3849,151 +4055,6 @@ async fn delete_single_overlay_tx(
     Ok(())
 }
 
-async fn verify_collisions_and_load_pg_rebind_pubs_tx(
-    tx: &mut BackendConn<'_>,
-    space_id: &SpaceId,
-    checks: &[(FolderId, String, String, bool)],
-    eligible_notes: &BTreeSet<NoteId>,
-    needed_digests: &BTreeSet<ContentDigest>,
-) -> Result<Option<HashMap<ContentDigest, String>>, PortError> {
-    let BackendConn::Postgres(conn) = tx else {
-        verify_no_active_non_eligible_collisions_batch_tx(tx, space_id, checks, eligible_notes)
-            .await?;
-        return Ok(None);
-    };
-
-    if checks.is_empty() && needed_digests.is_empty() {
-        return Ok(Some(HashMap::new()));
-    }
-
-    let mut unique_parents: Vec<&str> = checks.iter().map(|(f, _, _, _)| f.as_str()).collect();
-    unique_parents.sort_unstable();
-    unique_parents.dedup();
-    let mut unique_slugs: Vec<&str> = checks.iter().map(|(_, sf, _, _)| sf.as_str()).collect();
-    unique_slugs.sort_unstable();
-    unique_slugs.dedup();
-    let has_checks = !checks.is_empty();
-    let digest_slices: Vec<&[u8]> = needed_digests
-        .iter()
-        .map(|d| d.as_bytes().as_slice())
-        .collect();
-
-    let rows = sqlx::query(
-        "WITH col AS (
-            SELECT parent_folder_id, slug_fold, note_id
-            FROM note_heads
-            WHERE $4::BOOLEAN
-              AND space_id = $1
-              AND lifecycle_state = 'active'
-              AND parent_folder_id = ANY($2::TEXT[])
-              AND slug_fold = ANY($3::TEXT[])
-        ),
-        cat AS (
-            SELECT content_blake3, admission_state, blob_state, current_publication_id
-            FROM blob_catalog
-            WHERE space_id = $1
-              AND content_blake3 = ANY($5::BYTEA[])
-        )
-        SELECT
-            1::INT4 AS kind,
-            parent_folder_id, slug_fold, note_id,
-            NULL::BYTEA AS content_blake3, NULL::TEXT AS admission_state,
-            NULL::TEXT AS blob_state, NULL::TEXT AS current_publication_id
-        FROM col
-        UNION ALL
-        SELECT
-            2::INT4 AS kind,
-            NULL::TEXT, NULL::TEXT, NULL::TEXT,
-            content_blake3, admission_state, blob_state, current_publication_id
-        FROM cat",
-    )
-    .bind(space_id.as_str())
-    .bind(&unique_parents)
-    .bind(&unique_slugs)
-    .bind(has_checks)
-    .bind(&digest_slices)
-    .fetch_all(&mut **conn)
-    .await
-    .map_err(|err| internal_not_committed("pg_rb_col_and_cat_batch", err.to_string()))?;
-
-    let mut non_eligible_occupants: HashMap<(String, String), ()> = HashMap::new();
-    let mut cat_rows: Vec<(Vec<u8>, String, String, Option<String>)> =
-        Vec::with_capacity(needed_digests.len());
-
-    for r in rows {
-        let kind: i32 = r.get("kind");
-        if kind == 1 {
-            let p_raw: String = r.get("parent_folder_id");
-            let sf: String = r.get("slug_fold");
-            let nid_raw: String = r.get("note_id");
-            let nid = NoteId::parse(&nid_raw)
-                .map_err(|_| internal_not_committed("corrupt_collision_nid", "invalid NoteId"))?;
-            if !eligible_notes.contains(&nid) {
-                non_eligible_occupants.insert((p_raw, sf), ());
-            }
-        } else {
-            cat_rows.push((
-                r.get("content_blake3"),
-                r.get("admission_state"),
-                r.get("blob_state"),
-                r.get("current_publication_id"),
-            ));
-        }
-    }
-
-    for (parent_id, slug_fold, slug, is_root_child) in checks {
-        if non_eligible_occupants.contains_key(&(parent_id.as_str().to_owned(), slug_fold.clone()))
-        {
-            return Err(DomainError::PathConflict {
-                target: PathTarget {
-                    space_id: space_id.clone(),
-                    parent: if *is_root_child {
-                        None
-                    } else {
-                        Some(parent_id.clone())
-                    },
-                    component: slug.clone(),
-                },
-            }
-            .into());
-        }
-    }
-
-    let mut pub_by_digest: HashMap<ContentDigest, String> =
-        HashMap::with_capacity(needed_digests.len());
-    for (d_bytes, admission, blob_state, pub_opt) in cat_rows {
-        let arr: [u8; 32] = d_bytes
-            .try_into()
-            .map_err(|_| internal_not_committed("corrupt_cat_digest", "digest != 32B"))?;
-        let digest = ContentDigest::from_bytes(arr);
-        let Some(pub_id) = pub_opt else {
-            return Err(unavailable_retryable(
-                "blob_missing_for_rebind",
-                "existing blob publication missing during metadata revision bind",
-                std::time::Duration::from_millis(25),
-            ));
-        };
-        if admission != "open" || blob_state != "active" {
-            return Err(unavailable_retryable(
-                "blob_retiring_on_rebind",
-                "existing blob entered retirement before metadata revision commit",
-                std::time::Duration::from_millis(25),
-            ));
-        }
-        pub_by_digest.insert(digest, pub_id);
-    }
-
-    if pub_by_digest.len() != needed_digests.len() {
-        return Err(unavailable_retryable(
-            "blob_missing_for_rebind",
-            "existing blob publication missing during metadata revision bind",
-            std::time::Duration::from_millis(25),
-        ));
-    }
-
-    Ok(Some(pub_by_digest))
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn execute_pg_rollback_domain_writes_cte(
     conn: &mut sqlx::PgConnection,
@@ -4006,11 +4067,8 @@ async fn execute_pg_rollback_domain_writes_cte(
     actor_str: &str,
     restore_heads: &[RestoredHeadUpdateItem<'_>],
     blob_rebinds: &[ExistingBlobRefItem],
-    pub_by_digest: &HashMap<ContentDigest, String>,
     rev_items: &[RevisionInsertItem<'_>],
 ) -> Result<(), PortError> {
-    let now_ms = now_unix_ms()?;
-
     let mut rh_note_ids: Vec<&str> = Vec::with_capacity(restore_heads.len());
     let mut rh_parents: Vec<&str> = Vec::with_capacity(restore_heads.len());
     let mut rh_slugs: Vec<&str> = Vec::with_capacity(restore_heads.len());
@@ -4047,11 +4105,7 @@ async fn execute_pg_rollback_domain_writes_cte(
     let mut br_owner_rev_ids: Vec<&str> = Vec::with_capacity(blob_rebinds.len());
     let mut br_res_keys: Vec<&str> = Vec::with_capacity(blob_rebinds.len());
     let mut br_digests: Vec<&[u8]> = Vec::with_capacity(blob_rebinds.len());
-    let mut br_pub_ids: Vec<&str> = Vec::with_capacity(blob_rebinds.len());
     let mut br_created_seqs: Vec<i64> = Vec::with_capacity(blob_rebinds.len());
-    let mut delta_by_digest: HashMap<ContentDigest, i64> =
-        HashMap::with_capacity(pub_by_digest.len());
-
     for it in blob_rebinds {
         let key = (
             it.owner_kind.as_db_str(),
@@ -4060,36 +4114,14 @@ async fn execute_pg_rollback_domain_writes_cte(
             it.resource_key,
         );
         if seen_refs.insert(key) {
-            let pub_id = pub_by_digest
-                .get(&it.digest)
-                .ok_or_else(|| {
-                    unavailable_retryable(
-                        "blob_missing_for_rebind",
-                        "existing blob publication missing during metadata revision bind",
-                        std::time::Duration::from_millis(25),
-                    )
-                })?
-                .as_str();
             br_owner_kinds.push(it.owner_kind.as_db_str());
             br_owner_ids.push(&it.owner_id);
             br_owner_rev_ids.push(&it.owner_rev_id);
             br_res_keys.push(it.resource_key);
             br_digests.push(it.digest.as_bytes().as_slice());
-            br_pub_ids.push(pub_id);
             br_created_seqs.push(it.created_seq.get() as i64);
-            *delta_by_digest.entry(it.digest).or_insert(0) += 1;
         }
     }
-
-    let mut cat_digests_owned: Vec<[u8; 32]> = Vec::with_capacity(delta_by_digest.len());
-    let mut cat_deltas: Vec<i64> = Vec::with_capacity(delta_by_digest.len());
-    for (d, delta) in &delta_by_digest {
-        if *delta > 0 {
-            cat_digests_owned.push(*d.as_bytes());
-            cat_deltas.push(*delta);
-        }
-    }
-    let cat_digests: Vec<&[u8]> = cat_digests_owned.iter().map(|a| a.as_slice()).collect();
 
     let mut rv_ids: Vec<&str> = Vec::with_capacity(rev_items.len());
     let mut rv_entity_types: Vec<&str> = Vec::with_capacity(rev_items.len());
@@ -4113,7 +4145,8 @@ async fn execute_pg_rollback_domain_writes_cte(
         rv_runs.push(it.agent_run_id.map(AgentRunId::as_str));
     }
 
-    sqlx::query(
+    let expected_refs = br_digests.len() as i64;
+    let inserted_refs: i64 = sqlx::query_scalar(
         "WITH upd_restore AS (
             UPDATE note_heads AS nh
             SET parent_folder_id = v.parent_folder_id,
@@ -4133,9 +4166,9 @@ async fn execute_pg_rollback_domain_writes_cte(
                 updated_at_nsec = $5,
                 last_actor_id = $6
             FROM UNNEST(
-                $10::TEXT[], $11::TEXT[], $12::TEXT[], $13::TEXT[], $14::TEXT[],
-                $15::TEXT[], $16::TEXT[], $17::TEXT[], $18::TEXT[], $19::BYTEA[],
-                $20::BIGINT[], $21::TEXT[], $22::INT4[]
+                $9::TEXT[], $10::TEXT[], $11::TEXT[], $12::TEXT[], $13::TEXT[],
+                $14::TEXT[], $15::TEXT[], $16::TEXT[], $17::TEXT[], $18::BYTEA[],
+                $19::BIGINT[], $20::TEXT[], $21::INT4[]
             ) AS v(
                 note_id, parent_folder_id, slug, slug_fold, title,
                 title_fold, doc_class, ability_id, head_rev_id, content_blake3,
@@ -4143,23 +4176,28 @@ async fn execute_pg_rollback_domain_writes_cte(
             )
             WHERE nh.space_id = $1 AND nh.note_id = v.note_id
         ),
+        ref_inputs AS (
+            SELECT * FROM UNNEST($22::TEXT[], $23::TEXT[], $24::TEXT[], $25::TEXT[],
+                                 $26::BYTEA[], $27::BIGINT[])
+                AS u(owner_kind, owner_id, owner_rev_id, res_key, digest, cseq)
+        ),
+        rebound AS (
+            UPDATE blob_catalog AS bc SET ref_count = bc.ref_count + v.delta
+            FROM (SELECT digest, COUNT(*) AS delta FROM ref_inputs GROUP BY digest) AS v
+            WHERE bc.space_id = $1 AND bc.content_blake3 = v.digest
+              AND bc.admission_state = 'open' AND bc.blob_state = 'active'
+              AND bc.current_publication_id IS NOT NULL
+            RETURNING bc.content_blake3, bc.current_publication_id
+        ),
         ins_refs AS (
             INSERT INTO blob_references (
                 space_id, owner_kind, owner_id, owner_rev_id, resource_key,
                 content_blake3, publication_id, created_seq
             )
             SELECT $1, u.owner_kind, u.owner_id, u.owner_rev_id, u.res_key,
-                   u.digest, u.pub_id, u.cseq
-            FROM UNNEST(
-                $23::TEXT[], $24::TEXT[], $25::TEXT[], $26::TEXT[],
-                $27::BYTEA[], $28::TEXT[], $29::BIGINT[]
-            ) AS u(owner_kind, owner_id, owner_rev_id, res_key, digest, pub_id, cseq)
-        ),
-        upd_cat AS (
-            UPDATE blob_catalog AS bc
-            SET ref_count = bc.ref_count + v.delta
-            FROM UNNEST($30::BYTEA[], $31::BIGINT[]) AS v(digest, delta)
-            WHERE bc.space_id = $1 AND bc.content_blake3 = v.digest AND $7::BIGINT >= 0
+                   u.digest, r.current_publication_id, u.cseq
+            FROM ref_inputs u JOIN rebound r ON r.content_blake3 = u.digest
+            RETURNING 1
         ),
         ins_revs AS (
             INSERT INTO revisions (
@@ -4176,24 +4214,25 @@ async fn execute_pg_rollback_domain_writes_cte(
                 NULL, $6, NULL, u.agent_run_id,
                 NULL, $4, $5
             FROM UNNEST(
-                $32::TEXT[], $33::TEXT[], $34::TEXT[], $35::BIGINT[],
-                $36::TEXT[], $37::TEXT[], $38::BYTEA[], $39::BYTEA[],
-                $40::TEXT[]
+                $28::TEXT[], $29::TEXT[], $30::TEXT[], $31::BIGINT[],
+                $32::TEXT[], $33::TEXT[], $34::BYTEA[], $35::BYTEA[],
+                $36::TEXT[]
             ) AS u(
                 rev_id, entity_type, entity_key, space_seq,
                 parent_rev_id, restored_rev_id, content_blake3, metadata_msgpack,
                 agent_run_id
             )
-        )
+        ), upsert_run AS (
         INSERT INTO agent_run_heads (
             space_id, history_incarnation, run_id, run_revision, last_seq, updated_at_sec, updated_at_nsec
-        ) VALUES ($1, $2, $8, $9, $3, $4, $5)
+        ) VALUES ($1, $2, $7, $8, $3, $4, $5)
         ON CONFLICT (space_id, run_id) DO UPDATE SET
             history_incarnation = EXCLUDED.history_incarnation,
             run_revision = EXCLUDED.run_revision,
             last_seq = EXCLUDED.last_seq,
             updated_at_sec = EXCLUDED.updated_at_sec,
-            updated_at_nsec = EXCLUDED.updated_at_nsec",
+            updated_at_nsec = EXCLUDED.updated_at_nsec
+        ) SELECT COUNT(*) FROM ins_refs",
     )
     .bind(scope.space_id.as_str())
     .bind(scope.incarnation.as_bytes().as_slice())
@@ -4201,7 +4240,6 @@ async fn execute_pg_rollback_domain_writes_cte(
     .bind(sec)
     .bind(nsec)
     .bind(actor_str)
-    .bind(now_ms)
     .bind(run_id.as_str())
     .bind(new_run_rev.as_str())
     .bind(rh_note_ids)
@@ -4221,11 +4259,8 @@ async fn execute_pg_rollback_domain_writes_cte(
     .bind(br_owner_ids)
     .bind(br_owner_rev_ids)
     .bind(br_res_keys)
-    .bind(br_digests)
-    .bind(br_pub_ids)
+    .bind(&br_digests)
     .bind(br_created_seqs)
-    .bind(cat_digests)
-    .bind(cat_deltas)
     .bind(rv_ids)
     .bind(rv_entity_types)
     .bind(rv_entity_keys)
@@ -4235,10 +4270,40 @@ async fn execute_pg_rollback_domain_writes_cte(
     .bind(rv_digests)
     .bind(rv_metas)
     .bind(rv_runs)
-    .execute(&mut *conn)
+    .fetch_one(&mut *conn)
     .await
     .map_err(|err| internal_not_committed("pg_rb_domain_writes_cte", err.to_string()))?;
 
+    if inserted_refs != expected_refs {
+        // Returning an error aborts all domain writes in this item. Preserve
+        // the retry diagnostic for a publication that has started retirement.
+        let retiring: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM blob_catalog WHERE space_id = $1
+             AND content_blake3 = ANY($2) AND current_publication_id IS NOT NULL
+             AND (admission_state <> 'open' OR blob_state <> 'active'))",
+        )
+        .bind(scope.space_id.as_str())
+        .bind(&br_digests)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|err| internal_not_committed("pg_rb_rebind_status", err.to_string()))?;
+        let (code, message) = if retiring {
+            (
+                "blob_retiring_on_rebind",
+                "existing blob entered retirement before metadata revision commit",
+            )
+        } else {
+            (
+                "blob_missing_for_rebind",
+                "existing blob publication missing during metadata revision bind",
+            )
+        };
+        return Err(unavailable_retryable(
+            code,
+            message,
+            std::time::Duration::from_millis(25),
+        ));
+    }
     Ok(())
 }
 
@@ -5189,6 +5254,13 @@ async fn try_execute_pg_root_rollback(
     let eff_pid_str = effect_draft.payload_id.as_str();
     let owner_key_str = owner_key.as_str();
 
+    if !skipped_manual_edits.is_empty() || !skipped_room_active.is_empty() {
+        // The native SQL functions share their eligible set with the receipt owner set.
+        // The standard writer stores skipped receipt owners separately from changed notes.
+        *try_pg_batch_plan = false;
+        park_pg_rollback_connection(store, pooled);
+        return None;
+    }
     let result_value = RollbackResult {
         restored: restored_out,
         trashed: trashed_out,
@@ -5206,14 +5278,7 @@ async fn try_execute_pg_root_rollback(
     };
     let (Ok(resp_bytes), Ok(sanitized)) = (
         encode_msgpack(&wire),
-        encode_msgpack(&StoredCommittedRollbackV1 {
-            restored: Vec::new(),
-            trashed: Vec::new(),
-            restored_ranks: Vec::new(),
-            skipped_manual_edits: result_value.skipped_manual_edits.clone(),
-            skipped_room_active: result_value.skipped_room_active.clone(),
-            receipt: sentinel_receipt,
-        }),
+        encode_msgpack(&StoredCommittedRollbackV1::sanitized(sentinel_receipt)),
     ) else {
         park_pg_rollback_connection(store, pooled);
         return None;
@@ -5989,6 +6054,12 @@ async fn execute_pg_fast_rollback_inner(
             skipped_manual_edits.push(nid);
             continue;
         }
+        if head.doc_class == DocClass::Skill || head.ability_id.is_some() {
+            return PgFastInnerResult::Failed {
+                err: rollback_fallback_ability_slot_err(),
+                effective_cut: Some(current_effective_cut),
+            };
+        }
         let action = match summary.pre_rev {
             None => CandidateAction::TrashCreated {
                 metadata: match summary.created_source {
@@ -6030,6 +6101,12 @@ async fn execute_pg_fast_rollback_inner(
                 if pre_meta.slug_fold == super::folder_cover::SLUG {
                     return PgFastInnerResult::Failed {
                         err: rollback_fallback_cover_change_err(),
+                        effective_cut: Some(current_effective_cut),
+                    };
+                }
+                if pre_meta.ability_id.is_some() {
+                    return PgFastInnerResult::Failed {
+                        err: rollback_fallback_ability_slot_err(),
                         effective_cut: Some(current_effective_cut),
                     };
                 }
@@ -6076,6 +6153,10 @@ async fn execute_pg_fast_rollback_inner(
         }
     }
     skipped_room_active.sort();
+
+    if !skipped_manual_edits.is_empty() || !skipped_room_active.is_empty() {
+        return PgFastInnerResult::FallbackToStandard;
+    }
 
     let mut planned_active_slots: HashMap<(FolderId, String), NoteId> = HashMap::new();
     let mut planned_collision_checks: Vec<(FolderId, String, String, bool)> = Vec::new();
@@ -6467,14 +6548,7 @@ async fn execute_pg_fast_rollback_inner(
             receipt: receipt_token.clone(),
         };
         let resp_bytes = encode_msgpack(&wire)?;
-        let sanitized = encode_msgpack(&StoredCommittedRollbackV1 {
-            restored: Vec::new(),
-            trashed: Vec::new(),
-            restored_ranks: Vec::new(),
-            skipped_manual_edits: wire.skipped_manual_edits,
-            skipped_room_active,
-            receipt: receipt_token,
-        })?;
+        let sanitized = encode_msgpack(&StoredCommittedRollbackV1::sanitized(receipt_token))?;
         let owner_key = format!("{}:{}", idemp.actor.as_str(), idemp.command_key.as_str());
         let resp_pid = format!("rcpt_pay:{owner_key}");
 

@@ -76,7 +76,10 @@ moving, trashing, restoring, purging or rolling back a folder page updates
 both the covering note and the relevant folder revisions at the same command
 boundary. Renaming its title keeps the reserved stem. Visible note snapshots
 and recent activity carry the title, path, project, actor and timestamp from
-the admitted revision and folder placement.
+the admitted revision and folder placement. Schema updates preserve a folder
+page at its current folder and reserved stem. Activity omits erased note
+metadata and can still report other changes in the same window. Delta
+consumers crossing an erased command payload must resync.
 
 In PostgreSQL, creating a Space grants its initial writer epoch to the
 provisioning runtime when storage receives the commit acknowledgement, even if
@@ -164,6 +167,9 @@ identify stable AgentMemory notes in the personal root or project folder.
 Inspecting a memory category returns its current revision or observed absence.
 Appending an observation can create the category and set its optional summary
 in the same canonical command. An append that omits the summary preserves it.
+After rollback undoes the creation of a category, the next observation starts
+a fresh carrier at its stable note ID. Manually trashed categories require
+an explicit restore.
 The writer checks explicit revision or absence predicates and replays its
 receipt only while the memory slot remains authorized.
 Published ability manifests expose up to 256 auxiliary names of at most 1024

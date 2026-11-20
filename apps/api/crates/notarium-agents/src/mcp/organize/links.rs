@@ -365,7 +365,10 @@ async fn single(call: &mut ToolCallContext<'_>, input: LinkInput) -> Result<Valu
     let committed = call
         .registry
         .engine
-        .link(scope.clone(), plan.mutation(identity))
+        .link(
+            call.corpus_writer(scope.clone()).await?,
+            plan.mutation(identity),
+        )
         .await?;
     render(call, &scope, &plan, committed).await
 }
@@ -415,7 +418,10 @@ async fn many(call: &mut ToolCallContext<'_>, inputs: Vec<LinkInput>) -> Result<
         let response = call
             .registry
             .engine
-            .link_many(scope.clone(), LinkBatch { items: mutations })
+            .link_many(
+                call.corpus_writer(scope.clone()).await?,
+                LinkBatch { items: mutations },
+            )
             .await?;
         if response.items.len() != batch.len() {
             return Err(invalid(ValidationReason::SourceMismatch));

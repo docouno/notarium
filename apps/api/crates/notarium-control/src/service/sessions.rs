@@ -91,7 +91,86 @@ impl CredentialAuthority {
     }
 }
 
+pub(super) async fn credential_expiry(
+    tx: &mut Transaction,
+    credential: &AuthenticatedCredential,
+) -> Result<Option<i64>, PortError> {
+    match credential {
+        AuthenticatedCredential::Session(id) => Ok(Some(rows!(
+            tx, (i64,), fetch_one,
+            "SELECT expires_at FROM sessions WHERE session_id=$1",
+            "SELECT expires_at FROM v1_control.sessions WHERE session_id=$1"; id.as_str()
+        )?.0)),
+        AuthenticatedCredential::Pat(id) => Ok(rows!(
+            tx, (Option<i64>,), fetch_one,
+            "SELECT expires_at FROM pats WHERE token_id=$1",
+            "SELECT expires_at FROM v1_control.pats WHERE token_id=$1"; id.as_str()
+        )?.0),
+        AuthenticatedCredential::OAuth { token, .. } => Ok(Some(rows!(
+            tx, (i64,), fetch_one,
+            "SELECT expires_at FROM oauth_access_tokens WHERE token_id=$1",
+            "SELECT expires_at FROM v1_control.oauth_access_tokens WHERE token_id=$1"; token.as_str()
+        )?.0)),
+        AuthenticatedCredential::ScheduledRun { run, .. } => Ok(Some(rows!(
+            tx, (i64,), fetch_one,
+            "SELECT expires_at FROM agent_schedule_runs WHERE run_id=$1",
+            "SELECT expires_at FROM v1_control.agent_schedule_runs WHERE run_id=$1"; run.as_str()
+        )?.0)),
+        AuthenticatedCredential::TrustedNone => Ok(None),
+    }
+}
+
 impl ControlService {
+    pub(super) async fn revalidate_chat_viewer(
+        &self,
+        ctx: AccountContext,
+    ) -> Result<(EngineAuthContext, Option<std::time::Instant>), PortError> {
+        if !matches!(
+            ctx.auth().kind(),
+            PrincipalKind::DirectHuman | PrincipalKind::Pat | PrincipalKind::OAuth { .. }
+        ) {
+            return Err(denied());
+        }
+        let budget = OperationBudget::new(ctx.budget.clone());
+        self.current_auth_with_expiry(&budget, &ctx.budget.request, ctx.auth())
+            .await
+    }
+
+    pub(super) async fn current_auth_with_expiry(
+        &self,
+        budget: &OperationBudget,
+        request: &RequestId,
+        authority: &EngineAuthContext,
+    ) -> Result<(EngineAuthContext, Option<std::time::Instant>), PortError> {
+        let (mut tx, auth) = self
+            .open_revalidated_read(budget, request, authority)
+            .await?;
+        let expiry = budget
+            .run(
+                credential_expiry(tx.inner_mut(), auth.credential().ok_or_else(denied)?),
+                CommitEffect::NotCommitted,
+            )
+            .await?;
+        budget
+            .run(tx.rollback(), CommitEffect::NotCommitted)
+            .await?;
+        let deadline = if let Some(expiry) = expiry {
+            let start = std::time::Instant::now();
+            let now = self.clock.now_ms()?;
+            if expiry <= now {
+                return Err(denied());
+            }
+            Some(
+                start
+                    .checked_add(std::time::Duration::from_millis(expiry.abs_diff(now)))
+                    .ok_or_else(denied)?,
+            )
+        } else {
+            None
+        };
+        Ok((auth, deadline))
+    }
+
     pub(super) async fn revalidate(
         &self,
         tx: &mut Transaction,

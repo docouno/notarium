@@ -93,6 +93,7 @@ async fn held_redactions(
                     AppendChat {
                         tool_calls: Vec::new(),
                         provenance: None,
+                        interruption: None,
                         proposed_diff: None,
                         thread: thread.clone(),
                         parent: *leaves.last().unwrap(),
@@ -341,6 +342,7 @@ async fn committed_redaction_and_replay_return_while_local_stager_holds_bytes() 
                 AppendChat {
                     tool_calls: Vec::new(),
                     provenance: None,
+                    interruption: None,
                     proposed_diff: None,
                     thread: thread.clone(),
                     parent: ThreadEntrySeq::ZERO,

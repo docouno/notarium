@@ -137,6 +137,7 @@ impl NoteWritePort for RejectingPorts {
 impl ChatPort for RejectingPorts {
     reject! {
     fn read_chat(&self, ctx: SpaceContext, request: ChatRead) -> PortFuture<'_, ChatBranch>;
+    fn read_chat_compaction_prefix(&self, ctx: SpaceContext, request: ChatRead) -> PortFuture<'_, ChatCompactionPrefix>;
     fn read_chat_context(&self, ctx: SpaceContext, request: ChatRead) -> PortFuture<'_, ChatBranch>;
     fn read_chat_contents(&self, ctx: SpaceContext, request: ChatContentRead) -> PortFuture<'_, Vec<HydratedChatEntry>>;
     fn read_chat_proposal(&self, ctx: SpaceContext, request: ChatProposalRead) -> PortFuture<'_, CanonicalChatProposal>;
@@ -226,6 +227,10 @@ impl ControlPort for RejectingPorts {
     reject! {
     fn resolve_auth(&self, ctx: PreAuthContext) -> PortFuture<'_, EngineAuthContext>;
     fn revalidate_auth(&self, ctx: AccountContext) -> PortFuture<'_, EngineAuthContext>;
+    fn revalidate_chat_viewer(
+        &self,
+        ctx: AccountContext,
+    ) -> PortFuture<'_, (EngineAuthContext, Option<std::time::Instant>)>;
     fn whoami(&self, ctx: AccountContext) -> PortFuture<'_, PrincipalInfo>;
     fn list_spaces(&self, ctx: AccountContext, page: ControlPageRequest) -> PortFuture<'_, ControlPage<AccessibleSpace>>;
     fn list_projects(&self, ctx: AccountContext, page: ControlPageRequest) -> PortFuture<'_, ControlPage<ProjectInfo>>;
@@ -255,8 +260,18 @@ impl ControlPort for RejectingPorts {
             ctx: AccountContext,
             request: AccountMutation<StartEpisode>,
         ) -> PortFuture<'_, ControlCommit<EpisodeStartResult>>;
+    fn start_agent_episode(
+            &self,
+            ctx: AccountContext,
+            request: AccountMutation<StartEpisode>,
+        ) -> PortFuture<'_, ControlCommit<EpisodeStartResult>>;
     fn get_episode(&self, ctx: AccountContext, episode: EpisodeId) -> PortFuture<'_, AgentEpisode>;
     fn update_episode(
+            &self,
+            ctx: AccountContext,
+            request: AccountMutation<EpisodeUpdate>,
+        ) -> PortFuture<'_, ControlCommit<AgentEpisode>>;
+    fn bind_episode_role(
             &self,
             ctx: AccountContext,
             request: AccountMutation<EpisodeUpdate>,

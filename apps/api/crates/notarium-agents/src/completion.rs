@@ -136,6 +136,16 @@ pub(crate) struct SettledStep {
     pub finish: CompletionFinish,
 }
 
+/// Classify a terminal response after its partial text has been persisted.
+pub(crate) fn terminal_outcome(finish: CompletionFinish) -> Result<(), PortError> {
+    match finish {
+        CompletionFinish::Stop => Ok(()),
+        CompletionFinish::Length => Err(invalid(ValidationReason::TokenBudgetExceeded)),
+        CompletionFinish::ContentFilter => Err(invalid(ValidationReason::ProviderContentFiltered)),
+        CompletionFinish::ToolCalls => Err(protocol()),
+    }
+}
+
 /// Wait for wire validation and durable provider settlement before arming a
 /// tool. The caller still owns the durable Model/Tool append and any effects.
 pub(crate) async fn complete_step(

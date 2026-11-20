@@ -2486,8 +2486,14 @@ async fn run_domain_and_security_suite(
         assert_validation_err(&result, ValidationReason::CursorStale);
     }
     folder_authority::check(store, &scope, &owner).await;
-    folder_pages::check(store, &scope, &owner).await;
-    memory_writes::check(store, &scope, &owner, proj_a).await;
+    Box::pin(folder_pages::check(
+        store,
+        &scope,
+        &owner,
+        &schema_committed.value.schema_revision,
+    ))
+    .await;
+    Box::pin(memory_writes::check(store, &scope, &owner, proj_a)).await;
 }
 
 #[tokio::test]
@@ -2497,7 +2503,7 @@ async fn l5_domain_crud_batches_packages_and_security_parity() {
         let root = TempDataRoot::new("l5-domain-sqlite");
         let cfg = CanonicalConfig::local_default(sample_installation_id(1), root.data_root());
         let (store, runtime) = CanonicalRuntime::open(cfg).await.expect("open sqlite");
-        run_domain_and_security_suite(&store, None, Some(&root)).await;
+        Box::pin(run_domain_and_security_suite(&store, None, Some(&root))).await;
         runtime.shutdown().await.expect("shutdown sqlite");
     }
 
@@ -2515,7 +2521,7 @@ async fn l5_domain_crud_batches_packages_and_security_parity() {
         let (store, runtime) = CanonicalRuntime::open_with_s3_transport(cfg, Some(gate.clone()))
             .await
             .expect("open pg+s3");
-        run_domain_and_security_suite(&store, Some(&gate), None).await;
+        Box::pin(run_domain_and_security_suite(&store, Some(&gate), None)).await;
         runtime.shutdown().await.expect("shutdown pg+s3");
         fixtures.drop_pg_schema(&schema).await;
     }

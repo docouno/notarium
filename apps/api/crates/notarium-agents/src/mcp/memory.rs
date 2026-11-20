@@ -155,7 +155,11 @@ pub(super) async fn handle(
         identity,
         MemoryWriteMode::CreateIfMissing,
     )?;
-    let committed = call.registry.engine.append_memory(scope, mutation).await?;
+    let committed = call
+        .registry
+        .engine
+        .append_memory(call.corpus_writer(scope).await?, mutation)
+        .await?;
     route.scope.check(committed.receipt.scope())?;
     if committed.value.revision.note != note.note_id {
         return Err(invalid(ValidationReason::SourceMismatch));

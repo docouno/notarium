@@ -447,6 +447,6 @@ pub(super) fn retry_cleanup(error: &PortError) -> bool {
     unknown_commit(error)
         || matches!(
             error,
-            PortError::Unavailable(_) | PortError::DeadlineExceeded(_)
+            PortError::Unavailable(_) | PortError::DeadlineExceeded(_) | PortError::Internal(_)
         )
 }

@@ -1759,6 +1759,7 @@ async fn seed_chat_windows(
                     AppendChat {
                         tool_calls: Vec::new(),
                         provenance: None,
+                        interruption: None,
                         proposed_diff: None,
                         thread: thread.clone(),
                         parent,

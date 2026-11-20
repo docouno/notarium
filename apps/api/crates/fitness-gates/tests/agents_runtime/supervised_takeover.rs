@@ -368,10 +368,35 @@ async fn fenced_ownership_recovers_pending_inputs(
     let live = wait_idle(&fixture, &primary, reader, &thread_id).await;
     assert_eq!(live.head, first_post.value.seq);
 
+    let (hydrating, resume) = fixture.projections.pause_chat_hydration();
     let abandoned = primary
         .start(fixture.human.clone(), request(live.head, options.clone()))
         .await
         .unwrap();
+    timeout(Duration::from_secs(15), hydrating)
+        .await
+        .unwrap()
+        .unwrap();
+    let body = "A staged message from the previous owner's queue. ".repeat(20);
+    let digest = ContentDigest::from_bytes(*blake3::hash(body.as_bytes()).as_bytes());
+    let enqueue = |index| {
+        primary.enqueue_input(
+            fixture.human.clone(),
+            input(index, live.head, body.clone()),
+            options.clone(),
+        )
+    };
+    // Fill the durable queue on the active writer before the provider's
+    // request deadline starts. Reserve the final slot for the live HTTP call.
+    for index in 2..17 {
+        let accepted = enqueue(index).await.unwrap();
+        assert!(
+            matches!(accepted.outcome, SubmitUserChatOutcome::Queued(_)),
+            "input {index} must enter the active run's queue: {:?}",
+            accepted.outcome,
+        );
+    }
+    resume.send(()).unwrap();
     let (mut blocked, _) = timeout(Duration::from_secs(15), read_request(&listener))
         .await
         .unwrap();
@@ -383,45 +408,30 @@ async fn fenced_ownership_recovers_pending_inputs(
         )
         .await
         .unwrap();
-    let body = "A staged message from the previous owner's queue. ".repeat(20);
-    let digest = ContentDigest::from_bytes(*blake3::hash(body.as_bytes()).as_bytes());
-
-    // Inputs are routed to the current writer, which retains their credentials.
-    for index in 2..=17 {
-        let accepted = primary
-            .enqueue_input(
-                fixture.human.clone(),
-                input(index, live.head, body.clone()),
-                options.clone(),
-            )
-            .await
-            .unwrap();
-        assert!(
-            matches!(accepted.outcome, SubmitUserChatOutcome::Queued(_)),
-            "input {index} must enter the active run's queue: {:?}",
-            accepted.outcome,
+    let fill_final_slot = async {
+        assert!(matches!(
+            enqueue(17).await.unwrap().outcome,
+            SubmitUserChatOutcome::Queued(_)
+        ));
+        assert!(matches!(
+            enqueue(18).await.unwrap().outcome,
+            SubmitUserChatOutcome::Full { limit: 16 }
+        ));
+        assert_eq!(
+            fixture
+                .canonical
+                .read_verified_blob(&scope, digest)
+                .await
+                .unwrap(),
+            body.as_bytes()
         );
+    };
+    let mut byte = [0; 1];
+    tokio::select! {
+        biased;
+        result = blocked.read(&mut byte) => panic!("unexpected provider socket read before fencing: {result:?}"),
+        () = fill_final_slot => {}
     }
-    assert!(matches!(
-        primary
-            .enqueue_input(
-                fixture.human.clone(),
-                input(18, live.head, body.clone()),
-                options.clone(),
-            )
-            .await
-            .unwrap()
-            .outcome,
-        SubmitUserChatOutcome::Full { limit: 16 }
-    ));
-    assert_eq!(
-        fixture
-            .canonical
-            .read_verified_blob(&scope, digest)
-            .await
-            .unwrap(),
-        body.as_bytes()
-    );
 
     old_authority.fence_writer();
     assert_socket_closed(&mut blocked).await;
