@@ -703,7 +703,7 @@ pub(crate) async fn mint_and_purge_impl(
     let existing = deadline.prepare(&ctx.budget, read_existing).await?;
     if let Some(receipt) = existing {
         if receipt.status != "completed" {
-            let pending = deadline
+            let (pending, _) = deadline
                 .prepare(&ctx.budget, || {
                     load_pending_purge_for_idempotency(store, &space_rec.scope, &idemp)
                 })
