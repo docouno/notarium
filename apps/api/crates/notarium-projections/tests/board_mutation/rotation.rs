@@ -10,6 +10,7 @@ use notarium_core::{
     query::{FieldFilterAstV1, Predicate, ReadRequest},
     receipt::{AwaitWatermarks, CausalBasis, ChangeCursor},
 };
+use notarium_projections::PostgresProjectionCache;
 
 use super::{
     CanonicalStore, DerivedStore, ProjectorRuntime, budget, mutation, note, open_space, sync,
@@ -266,7 +267,9 @@ async fn postgres_single_owner_rotation() {
         projection_context(),
         pool.clone(),
         &derived_schema,
-        cache.root(),
+        PostgresProjectionCache::provision(cache.root())
+            .await
+            .unwrap(),
         initial,
         ProjectionConfig {
             retained_read_lifetime: Duration::from_secs(3),
@@ -383,27 +386,31 @@ async fn postgres_split_owners_backlinks_and_detached_erasure() {
         .await
         .unwrap();
     let initial = ProjectionGeneration::new(1).unwrap();
-    let derived_a = DerivedStore::open_postgres(pool_a.clone(), &derived_schema, initial)
+    let local_a = PostgresProjectionCache::provision(cache_a.root())
         .await
         .unwrap();
-    let derived_b = DerivedStore::open_postgres(pool_b.clone(), &derived_schema, initial)
-        .await
-        .unwrap();
-
-    let runtime_a = ProjectorRuntime::start_for_test(
+    let runtime_a = ProjectorRuntime::start_postgres(
         a.clone(),
         projection_context(),
-        derived_a,
-        cache_a.root(),
+        pool_a.clone(),
+        &derived_schema,
+        local_a.clone(),
+        initial,
         ProjectionConfig::default(),
     )
     .await
     .unwrap();
-    let runtime_b = ProjectorRuntime::start_for_test(
+    let local_b = PostgresProjectionCache::provision(cache_b.root())
+        .await
+        .unwrap();
+    assert_ne!(local_a.expected_id, local_b.expected_id);
+    let runtime_b = ProjectorRuntime::start_postgres(
         b.clone(),
         projection_context(),
-        derived_b,
-        cache_b.root(),
+        pool_b.clone(),
+        &derived_schema,
+        local_b,
+        initial,
         ProjectionConfig::default(),
     )
     .await

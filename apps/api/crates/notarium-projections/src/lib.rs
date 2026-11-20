@@ -29,8 +29,8 @@ pub use notarium_core::ports::{
     NoteLinkDirection, NoteLinkPage,
 };
 pub use runtime::{
-    BacklinkOwnerEndpoint, BacklinkOwnerResolver, ProjectedNoteReadPort, ProjectionConfig,
-    ProjectionEngine, ProjectorRuntime, SpaceEventBus,
+    BacklinkOwnerEndpoint, BacklinkOwnerResolver, PostgresProjectionCache, ProjectedNoteReadPort,
+    ProjectionConfig, ProjectionEngine, ProjectorRuntime, SpaceEventBus,
 };
 #[cfg(feature = "test-support")]
 pub use runtime::{BenchmarkCheckpoint, BenchmarkMappedCheckpoint, ProjectionPause};

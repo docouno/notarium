@@ -6,6 +6,7 @@ use sqlx::PgPool;
 
 use super::*;
 use crate::{
+    PostgresProjectionCache,
     derived::{GenerationControl, GenerationDescriptor},
     index::IndexNote,
     runtime::erasure::Eraser,
@@ -405,13 +406,16 @@ async fn postgres_writer_takeover_requires_registered_eraser_after_reopen() {
     let victim = create(&original, &ctx, "victim", "private".into()).await;
     let request = purge(&ctx, &victim.value.note);
     let initial = ProjectionGeneration::new(GENERATION).unwrap();
+    let local = PostgresProjectionCache::provision(root.clone())
+        .await
+        .unwrap();
     let start = async |canonical: &CanonicalStore, schema_prefix: &str| {
         ProjectorRuntime::start_postgres(
             canonical.clone(),
             projection_context(),
             pool.clone(),
             schema_prefix,
-            root.clone(),
+            local.clone(),
             initial,
             ProjectionConfig::default(),
         )
@@ -507,13 +511,16 @@ async fn offline_pg_cache_substitution_needs_exact_volume_to_finish_purge() {
     let ctx = owner(&canonical).await;
     let victim = create(&canonical, &ctx, "offline-victim", "old-cache".into()).await;
     let initial = ProjectionGeneration::new(GENERATION).unwrap();
+    let local = PostgresProjectionCache::provision(cache.clone())
+        .await
+        .unwrap();
     let start = || {
         ProjectorRuntime::start_postgres(
             canonical.clone(),
             projection_context(),
             pool.clone(),
             &prefix,
-            cache.clone(),
+            local.clone(),
             initial,
             ProjectionConfig::default(),
         )
@@ -592,6 +599,163 @@ async fn offline_pg_cache_substitution_needs_exact_volume_to_finish_purge() {
         format!("{prefix}_ctrl"),
     ] {
         ddl(&pool, format!("DROP SCHEMA IF EXISTS {name} CASCADE")).await;
+    }
+    pool.close().await;
+}
+
+async fn s3_blob_backend() -> BlobBackendConfig {
+    use notarium_canonical::{
+        S3AddressingStyle, S3BucketModePolicy, S3Config, S3Credentials,
+        blobs::s3::admin_ensure_bucket,
+    };
+    #[derive(Deserialize)]
+    struct S3Fixture {
+        s3_socket_container: PathBuf,
+        s3_socket_host: PathBuf,
+        s3_endpoint: String,
+        s3_region: String,
+        s3_access_key: String,
+        s3_secret_key: String,
+    }
+    let fixture: S3Fixture = storage_fixture();
+    let socket = [fixture.s3_socket_container, fixture.s3_socket_host]
+        .into_iter()
+        .find(|path| path.exists())
+        .unwrap();
+    let config = S3Config {
+        endpoint: fixture.s3_endpoint,
+        region: fixture.s3_region,
+        bucket: format!("notarium-projection-{}", hex::encode(&entropy()[..6])),
+        application_prefix: String::new(),
+        addressing: S3AddressingStyle::PathStyle,
+        credentials: S3Credentials {
+            access_key_id: fixture.s3_access_key,
+            secret_access_key: fixture.s3_secret_key,
+            session_token: None,
+        },
+        custom_ca_pem: None,
+        unix_socket: Some(socket),
+        bucket_mode_policy: S3BucketModePolicy::DetectFromBucket,
+        request_timeout: Duration::from_secs(10),
+    };
+    admin_ensure_bucket(&config, Some("Enabled")).await.unwrap();
+    BlobBackendConfig::S3(Box::new(config))
+}
+
+#[tokio::test]
+async fn pg_cold_restart_requires_configured_cache_before_confirming_purge() {
+    let storage = Scratch::new();
+    let cache = DataRoot::new(storage.0.join("mounted"));
+    let node_config = storage.0.join("node-cache-id");
+    let (mut config, pool, canonical_schema, prefix) = postgres_fixture(&cache).await;
+    config.blobs = s3_blob_backend().await;
+    let initial = ProjectionGeneration::new(GENERATION).unwrap();
+    let configured = PostgresProjectionCache::provision(cache.clone())
+        .await
+        .unwrap();
+    std::fs::write(&node_config, configured.expected_id).unwrap();
+    assert!(
+        PostgresProjectionCache::provision(cache.clone())
+            .await
+            .is_err()
+    );
+    let start = async |canonical: &CanonicalStore| {
+        ProjectorRuntime::start_postgres(
+            canonical.clone(),
+            projection_context(),
+            pool.clone(),
+            &prefix,
+            PostgresProjectionCache {
+                root: cache.clone(),
+                expected_id: std::fs::read_to_string(&node_config).unwrap(),
+            },
+            initial,
+            ProjectionConfig::default(),
+        )
+        .await
+    };
+    let revocation = MaintenanceContext {
+        authority: ServiceAuthority::admit(ServicePurpose::Revocation),
+        budget: budget(),
+    };
+    let (ctx, victim) = {
+        let (canonical, writer) = CanonicalRuntime::open(config.clone()).await.unwrap();
+        let ctx = owner(&canonical).await;
+        let victim = create(&canonical, &ctx, "victim", "private".into()).await;
+        let projector = start(&canonical).await.unwrap();
+        projector
+            .engine()
+            .wait_for_projected(ctx.scope(), victim.receipt.seq(), &budget())
+            .await
+            .unwrap();
+        projector.shutdown().await.unwrap();
+        canonical
+            .drain_projection_owner(&revocation, ctx.scope())
+            .await
+            .unwrap();
+        writer.shutdown().await.unwrap();
+        (ctx, victim)
+    };
+
+    let checkpoint = cache.space_fast_index(initial, &ctx.scope().space_id, victim.receipt.seq());
+    let offline = storage.0.join("original");
+    let evidence = offline.join(checkpoint.strip_prefix(cache.root()).unwrap());
+    std::fs::rename(cache.root(), &offline).unwrap();
+    std::fs::create_dir(cache.root()).unwrap();
+    let (canonical, writer) = CanonicalRuntime::open(config).await.unwrap();
+    canonical
+        .advance_space_lease(&revocation, ctx.scope(), LeaseEpoch::new(2).unwrap())
+        .await
+        .unwrap();
+    let request = purge(&ctx, &victim.value.note);
+    assert!(start(&canonical).await.is_err());
+    expect_unconfirmed(&canonical, &ctx, &request).await;
+    let committed = canonical
+        .read_space(&ctx.scope().space_id)
+        .await
+        .unwrap()
+        .last_seq;
+    assert!(std::fs::read_dir(cache.root()).unwrap().next().is_none());
+    assert!(evidence.is_file());
+
+    // This is a valid, independently provisioned peer cache on the same mountpoint.
+    let foreign_root = DataRoot::new(storage.0.join("foreign"));
+    let foreign = PostgresProjectionCache::provision(foreign_root.clone())
+        .await
+        .unwrap();
+    std::fs::remove_dir(cache.root()).unwrap();
+    std::fs::rename(foreign_root.root(), cache.root()).unwrap();
+    assert!(start(&canonical).await.is_err());
+    expect_unconfirmed(&canonical, &ctx, &request).await;
+    assert_eq!(
+        std::fs::read_to_string(cache.root().join("v1/projection_cache_id")).unwrap(),
+        foreign.expected_id
+    );
+    let cached = async || {
+        let sql =
+            format!("SELECT EXISTS (SELECT 1 FROM {prefix}_g1.projected_notes WHERE note_id=$1)");
+        sqlx::query_scalar::<_, bool>(sqlx::AssertSqlSafe(sql))
+            .bind(victim.value.note.as_str())
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+    };
+    assert!(evidence.is_file() && cached().await);
+
+    std::fs::rename(cache.root(), foreign_root.root()).unwrap();
+    std::fs::rename(&offline, cache.root()).unwrap();
+    let projector = start(&canonical).await.unwrap();
+    let confirmed = canonical.delete_note(ctx, request).await.unwrap();
+    assert_eq!(confirmed.receipt.seq(), committed);
+    assert!(!checkpoint.exists() && !cached().await);
+    projector.shutdown().await.unwrap();
+    writer.shutdown().await.unwrap();
+    for schema in [
+        canonical_schema,
+        format!("{prefix}_g1"),
+        format!("{prefix}_ctrl"),
+    ] {
+        ddl(&pool, format!("DROP SCHEMA IF EXISTS {schema} CASCADE")).await;
     }
     pool.close().await;
 }

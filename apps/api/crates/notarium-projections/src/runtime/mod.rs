@@ -63,6 +63,32 @@ pub use benchmark::{BenchmarkCheckpoint, BenchmarkMappedCheckpoint, ProjectionPa
 pub use events::SpaceEventBus;
 pub use read::ProjectedNoteReadPort;
 
+/// A node's configured PostgreSQL projection cache. Persist `expected_id`
+/// outside the cache volume and supply it on every start, including after restart.
+#[derive(Clone, Debug)]
+pub struct PostgresProjectionCache {
+    pub root: DataRoot,
+    pub expected_id: String,
+}
+
+impl PostgresProjectionCache {
+    /// Creates the identity of a new node cache. Provision once before starting
+    /// a projector. An existing marker or generation requires its original ID.
+    pub async fn provision(root: DataRoot) -> Result<Self, PortError> {
+        let owner = PostgresCacheOwner::acquire(root.clone()).await?;
+        if owner.cache_identity.get().is_some()
+            || !GenerationFiles::inventory(owner.root()).await?.is_empty()
+        {
+            return Err(DomainError::validation(ValidationReason::InvalidState).into());
+        }
+        let expected_id =
+            tokio::task::spawn_blocking(move || initialize_cache_identity(owner.root(), true))
+                .await
+                .map_err(checkpoint_error)??;
+        Ok(Self { root, expected_id })
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ProjectionConfig {
     pub max_open_spaces: NonZeroUsize,
@@ -153,18 +179,19 @@ impl ProjectorRuntime {
         projection_context: MaintenanceContext,
         pool: sqlx::PgPool,
         schema_prefix: &str,
-        cache_root: DataRoot,
+        cache: PostgresProjectionCache,
         initial: ProjectionGeneration,
         config: ProjectionConfig,
     ) -> Result<Self, PortError> {
         let source = maintenance::Source::Postgres {
             pool,
             schema_prefix: schema_prefix.to_owned(),
+            expected_cache_id: cache.expected_id,
         };
         Self::start_with(
             canonical,
             projection_context,
-            cache_root,
+            cache.root,
             source,
             initial,
             config,
@@ -184,6 +211,22 @@ impl ProjectorRuntime {
         projection_context
             .authority
             .require(ServicePurpose::Projection)?;
+        let expected_cache_id = match &source {
+            maintenance::Source::Postgres {
+                expected_cache_id, ..
+            } => Some(expected_cache_id.clone()),
+            _ => None,
+        };
+        if let Some(expected) = &expected_cache_id {
+            // Reject a missing or foreign mount before opening locks or creating directories.
+            let root = cache_root.clone();
+            let observed = tokio::task::spawn_blocking(move || read_cache_identity(&root))
+                .await
+                .map_err(checkpoint_error)??;
+            if &observed != expected {
+                return Err(DomainError::validation(ValidationReason::NotReady).into());
+            }
+        }
         let shutdown = Cancellation::default();
         let catalog = canonical.subscribe_projection_catalog(&projection_context)?;
         let spaces = canonical.list_spaces(&projection_context).await?;
@@ -205,7 +248,11 @@ impl ProjectorRuntime {
         let identity_root = cache_root.clone();
         let identity_owner = postgres_cache_owner.clone();
         let cache_identity = tokio::task::spawn_blocking(move || {
-            cache_identity(&identity_root, identity_owner.as_deref())
+            cache_identity(
+                &identity_root,
+                identity_owner.as_deref(),
+                expected_cache_id.as_deref(),
+            )
         })
         .await
         .map_err(checkpoint_error)??;
@@ -993,12 +1040,17 @@ fn cache_cleanup(cache_root: &DataRoot) -> Arc<GenerationCleanup> {
 fn cache_identity(
     root: &DataRoot,
     owner: Option<&PostgresCacheOwner>,
+    expected: Option<&str>,
 ) -> Result<String, PortError> {
-    let id = if owner.is_some_and(|owner| owner.cache_identity.get().is_some()) {
-        read_cache_identity(root)?
-    } else {
-        initialize_cache_identity(root)?
-    };
+    let id =
+        if expected.is_some() || owner.is_some_and(|owner| owner.cache_identity.get().is_some()) {
+            read_cache_identity(root)?
+        } else {
+            initialize_cache_identity(root, false)?
+        };
+    if expected.is_some_and(|expected| expected != id) {
+        return Err(DomainError::validation(ValidationReason::NotReady).into());
+    }
     if let Some(owner) = owner
         && owner.cache_identity.get_or_init(|| id.clone()) != &id
     {
@@ -1007,7 +1059,7 @@ fn cache_identity(
     Ok(id)
 }
 
-fn initialize_cache_identity(root: &DataRoot) -> Result<String, PortError> {
+fn initialize_cache_identity(root: &DataRoot, create_new: bool) -> Result<String, PortError> {
     use std::{fs, io::Write};
     let directory = root.root().join("v1");
     fs::create_dir_all(&directory).map_err(checkpoint_error)?;
@@ -1018,6 +1070,9 @@ fn initialize_cache_identity(root: &DataRoot) -> Result<String, PortError> {
     }
     let path = directory.join("projection_cache_id");
     if path.try_exists().map_err(checkpoint_error)? {
+        if create_new {
+            return Err(DomainError::validation(ValidationReason::InvalidState).into());
+        }
         return read_cache_identity(root);
     }
     let value = hex::encode(notarium_canonical::codec::csprng_16()?);
@@ -1046,17 +1101,27 @@ fn initialize_cache_identity(root: &DataRoot) -> Result<String, PortError> {
         file.sync_all()?;
         match fs::hard_link(&staging, &path) {
             Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) if !create_new && error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error),
         }
         #[cfg(unix)]
-        fs::File::open(&directory)?.sync_all()?;
+        {
+            fs::File::open(&directory)?.sync_all()?;
+            if create_new {
+                // Provisioning may have just created v1 on the selected volume.
+                fs::File::open(root.root())?.sync_all()?;
+            }
+        }
         Ok(())
     })();
     drop(file);
     let _ = fs::remove_file(staging);
     result.map_err(checkpoint_error)?;
-    read_cache_identity(root)
+    if create_new {
+        Ok(value)
+    } else {
+        read_cache_identity(root)
+    }
 }
 
 // Erasure must inspect the mounted cache without creating a new identity.

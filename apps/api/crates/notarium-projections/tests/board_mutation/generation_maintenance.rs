@@ -7,7 +7,10 @@ use notarium_core::{
     ports::{DeleteDisposition, DeleteNote, PageLimit, StructuralReadPort},
     receipt::{AwaitWatermarks, CausalBasis},
 };
-use notarium_projections::derived::{GenerationControl, GenerationDescriptor};
+use notarium_projections::{
+    PostgresProjectionCache,
+    derived::{GenerationControl, GenerationDescriptor},
+};
 
 use super::*;
 
@@ -273,12 +276,18 @@ async fn postgres_recovers_only_after_the_old_worker_releases_its_admission() {
         "Recover from canonical".into(),
     )
     .await;
+    let local = PostgresProjectionCache::provision(cache.root())
+        .await
+        .unwrap();
+    let other = PostgresProjectionCache::provision(other_cache.root())
+        .await
+        .unwrap();
     let runtime = ProjectorRuntime::start_postgres(
         canonical.clone(),
         projection_context(),
         pool.clone(),
         &derived_schema,
-        cache.root(),
+        local.clone(),
         initial,
         ProjectionConfig::default(),
     )
@@ -300,7 +309,7 @@ async fn postgres_recovers_only_after_the_old_worker_releases_its_admission() {
         projection_context(),
         pool.clone(),
         &derived_schema,
-        other_cache.root(),
+        other,
         initial,
         ProjectionConfig::default(),
     )
@@ -321,7 +330,7 @@ async fn postgres_recovers_only_after_the_old_worker_releases_its_admission() {
                 projection_context(),
                 pool.clone(),
                 &derived_schema,
-                cache.root(),
+                local.clone(),
                 initial,
                 ProjectionConfig::default(),
             )
@@ -416,13 +425,16 @@ async fn postgres_recovers_obsolete_format_and_resets_obsolete_candidate() {
     let initial = ProjectionGeneration::new(1).unwrap();
     let next = initial.checked_next().unwrap();
 
-    let start = |canonical, pool, schema: String, cache_root| async move {
+    let local = PostgresProjectionCache::provision(cache.root())
+        .await
+        .unwrap();
+    let start = |canonical, pool, schema: String, cache| async move {
         ProjectorRuntime::start_postgres(
             canonical,
             projection_context(),
             pool,
             &schema,
-            cache_root,
+            cache,
             initial,
             ProjectionConfig::default(),
         )
@@ -432,7 +444,7 @@ async fn postgres_recovers_obsolete_format_and_resets_obsolete_candidate() {
         store.clone(),
         pool.clone(),
         derived_schema.clone(),
-        cache.root(),
+        local.clone(),
     )
     .await
     .unwrap();
@@ -490,7 +502,7 @@ async fn postgres_recovers_obsolete_format_and_resets_obsolete_candidate() {
         store.clone(),
         pool.clone(),
         derived_schema.clone(),
-        cache.root(),
+        local.clone(),
     )
     .await
     .err()
@@ -521,7 +533,7 @@ async fn postgres_recovers_obsolete_format_and_resets_obsolete_candidate() {
         store.clone(),
         pool.clone(),
         derived_schema.clone(),
-        cache.root(),
+        local.clone(),
     ));
     let reservation = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -540,7 +552,9 @@ async fn postgres_recovers_obsolete_format_and_resets_obsolete_candidate() {
             store.clone(),
             pool.clone(),
             derived_schema.clone(),
-            other_cache.root(),
+            PostgresProjectionCache::provision(other_cache.root())
+                .await
+                .unwrap(),
         ),
     )
     .await

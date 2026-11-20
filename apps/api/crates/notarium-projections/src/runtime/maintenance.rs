@@ -32,6 +32,7 @@ pub(super) enum Source {
     Postgres {
         pool: PgPool,
         schema_prefix: String,
+        expected_cache_id: String,
     },
 }
 
@@ -44,6 +45,7 @@ impl Source {
             Self::Postgres {
                 pool,
                 schema_prefix,
+                ..
             } => GenerationControl::open_postgres(pool.clone(), schema_prefix).await,
         }
     }
@@ -66,6 +68,7 @@ impl Source {
             Self::Postgres {
                 pool,
                 schema_prefix,
+                ..
             } => {
                 DerivedStore::open_postgres_for_runtime(pool.clone(), schema_prefix, generation)
                     .await?

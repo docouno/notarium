@@ -789,7 +789,7 @@ struct PgFixture {
     pg_database: String,
 }
 
-async fn postgres_fixture(root: &DataRoot) -> (CanonicalConfig, sqlx::PgPool, String, String) {
+fn storage_fixture<T: serde::de::DeserializeOwned>() -> T {
     let manifest = std::env::var_os("NOTARIUM_STORAGE_FIXTURES_MANIFEST")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
@@ -799,10 +799,14 @@ async fn postgres_fixture(root: &DataRoot) -> (CanonicalConfig, sqlx::PgPool, St
                 .unwrap()
                 .join(".artifacts/storage-tests/current.json")
         });
-    let fixture: PgFixture = serde_json::from_slice(
-        &std::fs::read(manifest).expect("run through the required PostgreSQL storage fixture"),
+    serde_json::from_slice(
+        &std::fs::read(manifest).expect("run through the required storage fixture"),
     )
-    .unwrap();
+    .unwrap()
+}
+
+async fn postgres_fixture(root: &DataRoot) -> (CanonicalConfig, sqlx::PgPool, String, String) {
+    let fixture: PgFixture = storage_fixture();
     let socket = format!(".s.PGSQL.{}", fixture.pg_port);
     let directory = [
         &fixture.pg_socket_dir_container,

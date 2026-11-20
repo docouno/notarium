@@ -194,7 +194,19 @@ installation binds the cache identity even when the projection cache and
 canonical database use different directories. PostgreSQL binds the identity
 of the shared generation control schema, so each serving node can keep its own
 local cache. Portable backups carry canonical data and exclude these
-installation bindings. The cleanup handler verifies its own cache volume when
+installation bindings.
+
+For each new PostgreSQL node, call `PostgresProjectionCache::provision(root)`
+once on its intended cache volume. Save the returned `expected_id` in durable
+node configuration outside that volume before starting the projector. For an
+existing node upgraded from a path-only configuration, record the 32-character
+ID from `v1/projection_cache_id` on its verified original volume. Pass
+`PostgresProjectionCache { root, expected_id }` to `ProjectorRuntime::start_postgres`
+on every start. This also applies when PostgreSQL and S3 hold all canonical
+state. Each peer keeps its own configured ID. If the mount is missing, empty
+or belongs to another peer, restore the intended volume and retry startup.
+
+The cleanup handler verifies its own cache volume when
 it erases data. If that volume is offline or the shared PostgreSQL control
 schema has changed identity, restore the original target and retry the command.
 
