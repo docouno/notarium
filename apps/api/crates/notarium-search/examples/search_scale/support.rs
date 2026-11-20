@@ -291,7 +291,7 @@ impl Fixture {
                     ctx.scope().clone(),
                     Some(cutoff),
                     after,
-                    PageLimit::new(200)?,
+                    PageLimit::new(50)?,
                 )
                 .await?;
             for carrier in page.notes {

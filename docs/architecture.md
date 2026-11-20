@@ -64,7 +64,7 @@ TLS uses rustls 0.23 with ring, reqwest 0.13 with `rustls-no-provider`, and toni
 0.14 with `tls-ring`. Dependencies build in the pinned Rust image without adding
 C++/OpenSSL tools. Core/syntax tests exercise domain and document behavior;
 Canonical tests exercise dual-dialect storage and CAS. Control storage tests its SQL schema, target import/export, authentication,
-Space authority and crash recovery. Remaining per-crate scaffold tests are compile
+Space authority and crash recovery. Search tests exercise lexical analysis, pure-Rust CSR-HNSW and SIMD kernels (with `unsafe` quarantined to `src/vector/mmap_segment.rs` and `src/vector/simd.rs`), pure-Rust tokenizers and dynamic ONNX loading, dual-dialect causal alignment and physical erasure, plus an offline 100k/400k scale gate. Remaining per-crate scaffold tests are compile
 smoke checks.
 
 `notarium-control` owns a 45-table baseline in SQLite and the PostgreSQL

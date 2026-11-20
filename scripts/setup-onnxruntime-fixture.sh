@@ -21,7 +21,8 @@ case "$(uname -m)" in
         ;;
 esac
 
-directory=.artifacts/onnxruntime/current
+repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+directory="$repo_root/.artifacts/onnxruntime/current"
 library="$directory/libonnxruntime.so"
 if [ -f "$library" ] && printf '%s  %s\n' "$lib_sha" "$library" | sha256sum --check --status; then
     exit 0
