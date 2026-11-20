@@ -1,6 +1,7 @@
 mod link_invalidation;
 mod postgres_erasure;
 mod retained_schema;
+mod sqlite_erasure;
 
 use std::{
     path::{Path, PathBuf},

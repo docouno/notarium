@@ -391,6 +391,19 @@ pub(crate) struct LocalRotationWitness {
     pub durable: bool,
 }
 
+impl LocalRotationWitness {
+    pub(crate) fn selected(&self, generation: ProjectionGeneration) -> bool {
+        self.active
+            .iter()
+            .chain(&self.candidate)
+            .any(|descriptor| descriptor.generation == generation)
+    }
+
+    pub(crate) fn excludes_writers(&self, generation: ProjectionGeneration) -> bool {
+        self.durable && self.active.is_some() && !self.selected(generation)
+    }
+}
+
 fn validate_transition(
     expected: Option<&GenerationDescriptor>,
     next: &GenerationDescriptor,

@@ -15,6 +15,11 @@ use super::{
     stale,
 };
 
+pub(crate) struct GroupRankRange<'a> {
+    pub after: Option<(&'a str, &'a NoteId)>,
+    pub through: Option<(&'a str, &'a NoteId)>,
+}
+
 impl DerivedStore {
     pub async fn watermarks(
         &self,
@@ -227,6 +232,10 @@ impl DerivedStore {
         targets: &[NoteId],
     ) -> Result<Vec<ProjectedViewRank>, PortError> {
         check_batch(targets.len())?;
+        #[cfg(test)]
+        {
+            self.rank_read_work.lock().unwrap().targets += targets.len();
+        }
         let mut params = vec![value(&view.note), value(&view.key)];
         params.extend(targets.iter().map(value));
         self.at_cut(
@@ -248,7 +257,7 @@ impl DerivedStore {
         cut: SpaceSeq,
         view: &ViewRef,
         group: &str,
-        after: Option<(&str, &NoteId)>,
+        range: GroupRankRange<'_>,
         limit: PageLimit,
     ) -> Result<Vec<GroupRankPosition>, PortError> {
         let mut filter = String::from("view_note_id = ? AND view_key = ? AND group_key_hex = ?");
@@ -257,19 +266,29 @@ impl DerivedStore {
             value(&view.key),
             value(&group.to_owned()),
         ];
-        if let Some((rank, note)) = after {
+        if let Some((rank, note)) = range.after {
             filter.push_str(" AND (sort_rank_lexo, target_note_id) > (?, ?)");
             params.extend([value(&rank.to_owned()), value(note)]);
         }
+        if let Some((rank, note)) = range.through {
+            filter.push_str(" AND (sort_rank_lexo, target_note_id) <= (?, ?)");
+            params.extend([value(&rank.to_owned()), value(note)]);
+        }
         params.push(value(&limit.get()));
-        self.at_cut(
-            scope,
-            cut,
-            filter,
-            params,
-            "ORDER BY sort_rank_lexo, target_note_id LIMIT ?",
-        )
-        .await
+        let rows = self
+            .at_cut(
+                scope,
+                cut,
+                filter,
+                params,
+                "ORDER BY sort_rank_lexo, target_note_id LIMIT ?",
+            )
+            .await?;
+        #[cfg(test)]
+        {
+            self.rank_read_work.lock().unwrap().positions += rows.len();
+        }
+        Ok(rows)
     }
 
     pub(crate) async fn unranked_candidates(
@@ -280,6 +299,10 @@ impl DerivedStore {
         group: &str,
         candidates: &[u32],
     ) -> Result<Vec<u32>, PortError> {
+        #[cfg(test)]
+        {
+            self.rank_read_work.lock().unwrap().targets += candidates.len();
+        }
         let scope = scope.clone();
         let view = view.clone();
         let group = group.to_owned();

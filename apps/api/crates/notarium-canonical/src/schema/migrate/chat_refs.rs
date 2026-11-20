@@ -30,19 +30,38 @@ const LEGACY_REFS: &str = "SELECT created_space_seq,referenced_notes_json FROM c
     WHERE space_id=$1 AND thread_id=$2 AND entry_seq=$3
       AND kind <> 'redacted' AND checkpoint_stale=0";
 
+// Both paths run under the bootstrap transaction. SQLite needs a replacement
+// table for the NOT NULL column. Keep its source on disk and index the empty
+// destination before copying, so the sort never holds the full catalog in RAM.
+const SQLITE_PREPARE_V7: &str =
+    "ALTER TABLE chat_entry_note_refs RENAME TO chat_entry_note_refs_v7;
+     DROP INDEX idx_chat_entry_note_refs_target";
+const SQLITE_COPY_V7: &str = "INSERT INTO chat_entry_note_refs
+         (space_id,thread_id,entry_seq,ref_ordinal,target_space_id,target_note_id,created_space_seq)
+     SELECT r.space_id,r.thread_id,r.entry_seq,r.ref_ordinal,r.target_space_id,r.target_note_id,
+         (SELECT e.created_space_seq FROM chat_entries e WHERE e.space_id=r.space_id
+             AND e.thread_id=r.thread_id AND e.entry_seq=r.entry_seq)
+     FROM chat_entry_note_refs_v7 r;
+     DROP TABLE chat_entry_note_refs_v7";
+
+// PostgreSQL can add the column in place. Updating only this column preserves
+// the validated foreign keys and avoids queueing a trigger event per occurrence.
+const POSTGRES_PREPARE_V7: &str =
+    "ALTER TABLE chat_entry_note_refs ADD COLUMN created_space_seq BIGINT CHECK (created_space_seq >= 1);
+     DROP INDEX idx_chat_entry_note_refs_target;
+     UPDATE chat_entry_note_refs r SET created_space_seq=e.created_space_seq
+       FROM chat_entries e
+       WHERE e.space_id=r.space_id AND e.thread_id=r.thread_id AND e.entry_seq=r.entry_seq;
+     ALTER TABLE chat_entry_note_refs ALTER COLUMN created_space_seq SET NOT NULL";
+
 macro_rules! migrate {
-    ($name:ident, $connection:ty, $variant:ident, $ddl:ident $(, $release_primary_index:literal)?) => {
+    ($name:ident, $connection:ty, $variant:ident, $ddl:ident, $prepare:ident $(, $copy:ident)?) => {
         pub(super) async fn $name(conn: &mut $connection, version: i64) -> Result<(), PortError> {
             if version == 7 {
-                // Reuse the old on-disk table as the source. Create the destination
-                // indexes while empty so SQLite never sorts the full catalog in RAM.
-                for sql in [
-                    "ALTER TABLE chat_entry_note_refs RENAME TO chat_entry_note_refs_v7",
-                    "DROP INDEX idx_chat_entry_note_refs_target",
-                    $($release_primary_index,)?
-                ] {
-                    sqlx::query(sqlx::AssertSqlSafe(sql)).execute(&mut *conn).await.map_err(migration_error)?;
-                }
+                sqlx::raw_sql($prepare)
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(migration_error)?;
             }
             for prefix in OBJECTS {
                 let statement = baseline_statement($ddl, prefix)?;
@@ -52,23 +71,10 @@ macro_rules! migrate {
                     .map_err(migration_error)?;
             }
             if version == 7 {
-                // Preserve surviving ordinals. A missing parent fails NOT NULL and
-                // rolls the transaction back to the intact v7 table and indexes.
-                sqlx::query(
-                    "INSERT INTO chat_entry_note_refs
-                        (space_id,thread_id,entry_seq,ref_ordinal,target_space_id,target_note_id,created_space_seq)
-                     SELECT r.space_id,r.thread_id,r.entry_seq,r.ref_ordinal,r.target_space_id,r.target_note_id,
-                        (SELECT e.created_space_seq FROM chat_entries e WHERE e.space_id=r.space_id
-                            AND e.thread_id=r.thread_id AND e.entry_seq=r.entry_seq)
-                     FROM chat_entry_note_refs_v7 r",
-                )
-                .execute(&mut *conn)
-                .await
-                .map_err(migration_error)?;
-                sqlx::query("DROP TABLE chat_entry_note_refs_v7")
+                $(sqlx::raw_sql($copy)
                     .execute(&mut *conn)
                     .await
-                    .map_err(migration_error)?;
+                    .map_err(migration_error)?;)?
                 return Ok(());
             }
             sqlx::query("DELETE FROM chat_entry_note_refs")
@@ -113,13 +119,20 @@ macro_rules! migrate {
     };
 }
 
-migrate!(sqlite, SqliteConnection, Sqlite, SQLITE_BASELINE_DDL);
+migrate!(
+    sqlite,
+    SqliteConnection,
+    Sqlite,
+    SQLITE_BASELINE_DDL,
+    SQLITE_PREPARE_V7,
+    SQLITE_COPY_V7
+);
 migrate!(
     postgres,
     PgConnection,
     Postgres,
     POSTGRES_BASELINE_DDL,
-    "ALTER TABLE chat_entry_note_refs_v7 RENAME CONSTRAINT chat_entry_note_refs_pkey TO chat_entry_note_refs_v7_pkey"
+    POSTGRES_PREPARE_V7
 );
 
 #[cfg(test)]

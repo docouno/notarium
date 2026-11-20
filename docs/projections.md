@@ -110,7 +110,10 @@ Canonical rank overlays order cards within a column. Timestamp-ordered boards
 seek eligible ranked cards by column, rank and note ID. Sparse selections and
 custom field sorts can fetch placements for candidate notes. When only a few
 cards in a column have ranks, continuation reads those placements through the
-column index and selects the unranked page from the checkpoint. The query keeps its
+column index and selects the unranked page from the checkpoint. A continuation
+can verify its leading candidates in one batch. If that yields too few cards, it
+continues the rank scan until it has covered the group or checked as many
+placements as there are remaining candidates. The query keeps its
 exact receipt replacements separate until the final window is merged. `options.columns` applies
 to grouped and board views (up to 256 columns) without interfering with
 table/list presentation options, and contradictory `scope: space` or
@@ -181,8 +184,11 @@ stops so offline purges and redactions still clean derived databases and local
 checkpoint files. A purge verifies the current canonical history while holding
 the same cache lock used for checkpoint publication. For that Space it removes
 checkpoints below the purge sequence in the current history and checkpoints
-from previous histories at any sequence. A missing PostgreSQL generation floor
-keeps matching files pending until the generation is initialized or retired.
+from previous histories at any sequence. When an active or reserved generation
+has no SQL floor, its matching files keep the purge pending. A retired SQLite
+generation with a missing database can release the matching files while readers
+of other Spaces keep their shared leases. SQLite checkpoint writers verify the
+generation descriptor and the floor in the current database before publication.
 Worker recovery uses only the exact history being built.
 
 ## Verification

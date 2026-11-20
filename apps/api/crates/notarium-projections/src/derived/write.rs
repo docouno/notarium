@@ -310,21 +310,6 @@ impl DerivedStore {
             .await
     }
 
-    /// Removes committed data from the actual history of this generation.
-    pub(crate) async fn erase_committed_visibility(
-        &self,
-        canonical: &CanonicalStore,
-        erasures: &ProjectionErasures,
-    ) -> Result<(), PortError> {
-        let canonical = canonical.clone();
-        let erasures = erasures.clone();
-        self.database
-            .write(true, move |mut tx| {
-                Box::pin(async move { erase_committed(&mut tx, &canonical, &erasures).await })
-            })
-            .await
-    }
-
     pub async fn apply(&self, change: &SpaceApply) -> Result<(), PortError> {
         self.apply_with_replay(change, None).await
     }
@@ -705,7 +690,7 @@ impl DerivedStore {
     ) -> Result<(), PortError> {
         let scope = scope.clone();
         self.database
-            .read(move |mut tx| {
+            .read_with_file_check(true, move |mut tx| {
                 Box::pin(async move {
                     let guard = read_space_guard(&mut tx, &scope.space_id, false)
                         .await?

@@ -442,25 +442,26 @@ async fn retained_board_pages_match_ordered_sql_ranks_and_exact_overlay() {
             id(ordinal(dense)),
         )
     });
-    // The prefix probe can return at most five positions. The dense fixture
-    // leaves just one ordinary card ahead of a long run of physical ranks in
-    // timestamp order, forcing the bulk path on its next ordinary cursor.
-    let phase_views: Vec<_> = [0, 1, 4, 5, 6, 30]
+    // Put the first rank page at the old end of the timestamp order. On a
+    // reachable ordinary cursor, later ranks occupy just enough leading
+    // timestamp positions to prevent a single candidate probe filling the page.
+    let phase_views: Vec<_> = [0, 1, 4, 5, 6, 30, 103, 213]
         .into_iter()
         .map(|count: usize| {
-            let targets: Vec<_> = if count == 30 {
-                newest
-                    .iter()
-                    .rev()
-                    .take(5)
-                    .chain(newest.iter().skip(1).take(25))
-                    .copied()
-                    .collect()
-            } else {
-                newest.iter().take(count).copied().collect()
+            let (oldest, skip_newest) = match count {
+                5 => (2, 2),
+                30 => (5, 1),
+                103 => (51, 47),
+                213 => (51, 37),
+                _ => (0, 0),
             };
+            let targets = newest
+                .iter()
+                .rev()
+                .take(oldest)
+                .chain(newest.iter().skip(skip_newest).take(count - oldest))
+                .copied();
             let placements = targets
-                .into_iter()
                 .enumerate()
                 .map(|(i, dense)| {
                     (
@@ -636,11 +637,18 @@ async fn retained_board_pages_match_ordered_sql_ranks_and_exact_overlay() {
             rank: "0".into(),
         },
     )]);
-    let mut saw_dense_fallback = false;
-    for (rank_view, placements) in phase_views {
-        let page_size = if placements.is_empty() { 1 } else { 4 };
+    let empty_rows = BTreeMap::new();
+    let empty_ranks = BTreeMap::new();
+    let mut measured_cliffs = Vec::new();
+    for (rank_view, placements) in &phase_views {
+        let (page_size, rows, exact_ranks) = match placements.len() {
+            5 => (1, &empty_rows, &empty_ranks),
+            103 | 213 => (50, &empty_rows, &empty_ranks),
+            0 => (1, &overlay, &overlay_rank),
+            _ => (4, &overlay, &overlay_rank),
+        };
         let mut all_ranks = placements.clone();
-        all_ranks.extend(overlay_rank.clone());
+        all_ranks.extend(exact_ranks.clone());
         for direction in [Direction::Asc, Direction::Desc] {
             let sort = SortSpec::new(vec![SortKey {
                 column: SortColumn::UpdatedAt,
@@ -662,22 +670,24 @@ async fn retained_board_pages_match_ordered_sql_ranks_and_exact_overlay() {
                     columns: std::slice::from_ref(&current_group),
                     board: true,
                     ranks: &all_ranks,
-                    overlay: &overlay,
+                    overlay: rows,
                     after: cursor.as_ref(),
                     limit: PageLimit::new(page_size as u16).unwrap(),
                 };
                 let expected = select_window(input).await.unwrap();
                 store.take_sqlite_read_work();
+                store.take_rank_read_work();
                 let result = select_view_window(
                     WindowInput {
-                        ranks: &overlay_rank,
+                        ranks: exact_ranks,
                         ..input
                     },
-                    Some(&rank_view),
+                    Some(rank_view),
                 )
                 .await
                 .unwrap();
                 let (transactions, progress) = store.take_sqlite_read_work();
+                let (positions, targets) = store.take_rank_read_work();
                 assert_eq!(result.groups, expected.groups);
                 assert_eq!(result.has_more, expected.has_more);
                 assert_eq!(result.rows.len(), page_size);
@@ -696,21 +706,26 @@ async fn retained_board_pages_match_ordered_sql_ranks_and_exact_overlay() {
                     .is_some_and(|c| cursor_rank(&c.cells).unwrap().is_none())
                 {
                     saw_ordinary_continue = true;
+                    // The sparse group costs at most its own physical positions
+                    // and one bounded candidate probe, independent of their order.
+                    assert!(positions <= placements.len());
+                    assert!(targets <= 2 * (page_size + 1));
                     if placements.len() <= 6 {
-                        let max_transactions = if placements.len() < 5 { 1 } else { 2 };
-                        assert!(
-                            transactions <= max_transactions,
-                            "{} ranks, {transactions} SQL transactions",
-                            placements.len()
-                        );
-                        assert!(
-                            progress < 8,
-                            "{} ranks, at least {} VM steps",
-                            placements.len(),
-                            progress * 128
-                        );
-                    } else if transactions > 2 && progress >= 8 {
-                        saw_dense_fallback = true;
+                        assert!(transactions <= 4 && progress < 8);
+                    }
+                    let short_preview = match placements.len() {
+                        5 => Some((1, 4)),
+                        103 => Some((46, 102)),
+                        213 => Some((36, 102)),
+                        _ => None,
+                    };
+                    if direction == Direction::Desc
+                        && let Some((last, preview)) = short_preview
+                        && cursor.as_ref().unwrap().entity_id == id(ordinal(newest[last]))
+                    {
+                        assert_eq!(positions, placements.len());
+                        assert_eq!(targets, preview);
+                        measured_cliffs.push(placements.len());
                     }
                 }
                 cursor = result.rows.last().map(|row| row.tuple.clone());
@@ -718,5 +733,104 @@ async fn retained_board_pages_match_ordered_sql_ranks_and_exact_overlay() {
             assert!(saw_ordinary_continue);
         }
     }
-    assert!(saw_dense_fallback);
+    assert_eq!(measured_cliffs, [5, 103, 213]);
+
+    // A selective source on the same physically ranked group should not read
+    // a much larger rank index. These timestamp slices have no physical ranks.
+    let (populated_view, populated_ranks) = phase_views
+        .iter()
+        .find(|(_, ranks)| ranks.len() == 103)
+        .unwrap();
+    let sort = SortSpec::default();
+    for chosen in [2, 19, 73] {
+        let slice = Bitmap::from(&newest[130..130 + chosen]);
+        let filter = Predicate::Eq {
+            key: "phase".into(),
+            value: ScalarValue::Bool(true),
+        };
+        let mut cursor = None;
+        for page in 0..2 {
+            let input = WindowInput {
+                index: &index,
+                store: &store,
+                scope: &scope,
+                cut,
+                candidates: &slice,
+                filter: &filter,
+                sort: &sort,
+                group_by: Some("phase"),
+                columns: std::slice::from_ref(&current_group),
+                board: true,
+                ranks: &empty_ranks,
+                overlay: &empty_rows,
+                after: cursor.as_ref(),
+                limit: PageLimit::new(1).unwrap(),
+            };
+            let expected = select_window(input).await.unwrap();
+            store.take_rank_read_work();
+            let result = select_view_window(input, Some(populated_view))
+                .await
+                .unwrap();
+            let (positions, targets) = store.take_rank_read_work();
+            assert_eq!(result.rows[0].tuple, expected.rows[0].tuple);
+            assert!(positions <= chosen && targets <= chosen + 4);
+            if page == 0 {
+                assert_eq!(
+                    targets, chosen,
+                    "small source should address its candidate IDs"
+                );
+            }
+            cursor = Some(result.rows[0].tuple.clone());
+        }
+    }
+
+    // These admitted targets are scattered behind unrelated leading ranks.
+    // Once the first ordinary cursor is reached, its preview consists of
+    // ranks. Reading the group's remaining prefix would exceed this selection.
+    let mut mixed = Bitmap::from(&newest[47..62]);
+    mixed.add(newest[0]);
+    mixed.add_many(&newest[130..139]);
+    let mut cursor = None;
+    let mut saw_target_lookup = false;
+    for _ in 0..mixed.cardinality() {
+        let input = WindowInput {
+            index: &index,
+            store: &store,
+            scope: &scope,
+            cut,
+            candidates: &mixed,
+            filter: &all,
+            sort: &sort,
+            group_by: Some("phase"),
+            columns: std::slice::from_ref(&current_group),
+            board: true,
+            ranks: populated_ranks,
+            overlay: &empty_rows,
+            after: cursor.as_ref(),
+            limit: PageLimit::new(1).unwrap(),
+        };
+        let expected = select_window(input).await.unwrap();
+        store.take_rank_read_work();
+        let result = select_view_window(
+            WindowInput {
+                ranks: &empty_ranks,
+                ..input
+            },
+            Some(populated_view),
+        )
+        .await
+        .unwrap();
+        let (positions, targets) = store.take_rank_read_work();
+        assert_eq!(result.rows[0].tuple, expected.rows[0].tuple);
+        if cursor
+            .as_ref()
+            .is_some_and(|last| last.entity_id == id(ordinal(newest[0])))
+        {
+            assert_eq!(positions, mixed.cardinality() as usize);
+            assert_eq!(targets, mixed.cardinality() as usize + 4);
+            saw_target_lookup = true;
+        }
+        cursor = Some(result.rows[0].tuple.clone());
+    }
+    assert!(saw_target_lookup);
 }

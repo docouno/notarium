@@ -742,7 +742,21 @@ async fn l7_projection_refs_postgres_bounded_pages_and_erasure() {
     assert_eq!(covers_v6_references(&store, &legacy[1]).await, 2);
     runtime.shutdown().await.unwrap();
     downgrade_chat_refs_v7!(db, legacy);
+    // The existing validated parent key must survive the backfill. Rebuilding
+    // every occurrence under a new FK queues a PG trigger event for each row.
+    const PARENT_KEY: &str = "SELECT oid::bigint FROM pg_constraint
+        WHERE conrelid='chat_entry_note_refs'::regclass AND contype='f'
+          AND confrelid='chat_entries'::regclass AND convalidated";
+    let parent_key: i64 = sqlx::query_scalar(PARENT_KEY)
+        .fetch_one(&mut db)
+        .await
+        .unwrap();
     let (store, runtime) = CanonicalRuntime::open(config).await.unwrap();
+    let migrated_key: i64 = sqlx::query_scalar(PARENT_KEY)
+        .fetch_one(&mut db)
+        .await
+        .unwrap();
+    assert_eq!(migrated_key, parent_key);
     covers_v7_references(&store, &legacy).await;
     fixed_cut_terminates_during_appends(&store).await;
     let (scope, entry) = exercise(&store).await;

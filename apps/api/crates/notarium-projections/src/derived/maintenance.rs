@@ -162,19 +162,14 @@ impl GenerationFiles {
         }
     }
 
-    pub(crate) async fn with_exclusive_reclamation<T: Send + 'static>(
-        root: &DataRoot,
-        generation: ProjectionGeneration,
+    async fn with_reclamation_lease<T: Send + 'static>(
+        lease: File,
         operation: impl FnOnce() -> Result<T, PortError> + Send + 'static,
-    ) -> Result<Option<T>, PortError> {
-        let path = Self::lock_path(root, generation);
+    ) -> Result<T, PortError> {
         tokio::task::spawn_blocking(move || {
-            let Some(_lease) = try_exclusive(&path)? else {
-                return Ok(None);
-            };
-            // Cancellation can drop the join future. The file lease stays
-            // with the filesystem operation until the blocking task finishes.
-            operation().map(Some)
+            // Cancelling the join future cannot release the file lease before unlink finishes.
+            let _lease = lease;
+            operation()
         })
         .await
         .map_err(|_| internal("projection_generation_worker"))?
@@ -191,8 +186,7 @@ impl GenerationFiles {
             .parent()
             .ok_or_else(invalid_row)?
             .to_owned();
-        tokio::task::spawn_blocking(move || {
-            let _lease = lease;
+        Self::with_reclamation_lease(lease, move || {
             let error = || internal("projection_generation_remove_files");
             let meta = match fs::symlink_metadata(&path) {
                 Ok(meta) => meta,
@@ -240,7 +234,6 @@ impl GenerationFiles {
             Ok(())
         })
         .await
-        .map_err(|_| internal("projection_generation_worker"))?
     }
 
     pub(crate) async fn inventory(root: &DataRoot) -> Result<Vec<ProjectionGeneration>, PortError> {
@@ -298,7 +291,10 @@ async fn canceled_reclamation_keeps_its_file_lease_until_the_work_stops() {
     let (entered, ready) = tokio::sync::oneshot::channel();
     let (release, held) = std::sync::mpsc::channel();
     let cleanup = tokio::spawn(async move {
-        GenerationFiles::with_exclusive_reclamation(&cleanup_root, generation, move || {
+        let lease = GenerationFiles::for_reclamation(&cleanup_root, generation)
+            .await?
+            .ok_or_else(not_ready)?;
+        GenerationFiles::with_reclamation_lease(lease, move || {
             entered.send(()).unwrap();
             held.recv().unwrap();
             Ok(())

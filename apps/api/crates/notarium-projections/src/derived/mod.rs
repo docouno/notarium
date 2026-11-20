@@ -29,9 +29,10 @@ mod staging;
 mod write;
 
 pub use control::{GenerationControl, GenerationDescriptor};
-pub(crate) use erasure::PostgresEraser;
+pub(crate) use erasure::{ErasureOutcome, PostgresEraser};
 pub(crate) use lookup::{LinkAddress, LinkPosition};
 pub(crate) use maintenance::{GenerationFiles, PostgresCacheOwner};
+pub(crate) use read::GroupRankRange;
 pub(crate) use records::decode as decode_payload;
 pub use records::{
     CandidateLookupKey, ProjectedChatRef, ProjectedChatThread, ProjectedCluster, ProjectedFolder,
@@ -43,6 +44,13 @@ pub(crate) use staging::{MAX_STAGE_BYTES, StageBuffer, approx_mutation_bytes};
 
 use sql::Database;
 
+#[cfg(test)]
+#[derive(Default)]
+struct RankReadWork {
+    positions: usize,
+    targets: usize,
+}
+
 /// Access to the derived database of a single generation. Canonical state and
 /// private staging are never attached to a reader's connection.
 #[derive(Clone)]
@@ -51,6 +59,8 @@ pub struct DerivedStore {
     pub(crate) folder_page_reads: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
     pub(crate) reverse_link_reads: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    rank_read_work: Arc<std::sync::Mutex<RankReadWork>>,
     database: Arc<Database>,
     generation: ProjectionGeneration,
     cache_lease: Option<Arc<std::fs::File>>,
@@ -58,6 +68,12 @@ pub struct DerivedStore {
 }
 
 impl DerivedStore {
+    /// Group positions returned and target IDs supplied to physical rank queries.
+    #[cfg(test)]
+    pub(crate) fn take_rank_read_work(&self) -> (usize, usize) {
+        let work = std::mem::take(&mut *self.rank_read_work.lock().unwrap());
+        (work.positions, work.targets)
+    }
     /// Take the number of real SQLite read transactions and 128-step VM progress callbacks.
     #[cfg(test)]
     pub(crate) fn take_sqlite_read_work(&self) -> (usize, usize) {
@@ -123,6 +139,8 @@ impl DerivedStore {
             folder_page_reads: Default::default(),
             #[cfg(test)]
             reverse_link_reads: Default::default(),
+            #[cfg(test)]
+            rank_read_work: Default::default(),
             database,
             generation,
             cache_lease,

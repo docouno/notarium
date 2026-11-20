@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, sync::Arc};
 
 use notarium_canonical::{CanonicalStore, ProjectionErasures};
 use notarium_core::{epoch::DataRoot, error::PortError, ids::ProjectionGeneration};
@@ -8,7 +8,7 @@ use super::{
     DerivedStore, GenerationControl, GenerationFiles, internal, invalid_row,
     maintenance::reclaim_postgres_schema,
     not_ready, parse_generation,
-    schema::SCHEMA_VERSION,
+    schema::{MetadataState, SCHEMA_VERSION, metadata_state},
     sql::{Database, Kind, SqlColumn, SqlTransaction},
     write::erase_committed,
 };
@@ -30,6 +30,47 @@ pub(crate) struct CheckpointErasures {
 }
 
 impl DerivedStore {
+    /// Erasure must never initialize a missing database or create metadata to
+    /// claim ownership of a directory left by another generation.
+    pub(crate) async fn erase_existing_sqlite(
+        root: &DataRoot,
+        generation: ProjectionGeneration,
+        resident: Option<&Self>,
+        canonical: &CanonicalStore,
+        erasures: &ProjectionErasures,
+    ) -> Result<ErasureOutcome, PortError> {
+        let path = root.derived(generation);
+        match tokio::fs::symlink_metadata(&path).await {
+            Ok(meta) if meta.is_file() => {}
+            Ok(_) => return Err(invalid_row()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(ErasureOutcome::Empty);
+            }
+            Err(_) => return Err(internal("projection_generation_inventory")),
+        }
+        if !tokio::fs::symlink_metadata(path.parent().ok_or_else(invalid_row)?)
+            .await
+            .map_err(|_| invalid_row())?
+            .is_dir()
+        {
+            return Err(invalid_row());
+        }
+        let lease = GenerationFiles::hold(root, generation).await?;
+        let db = match resident {
+            Some(store) if store.database.owns_sqlite_file(&path) => Arc::clone(&store.database),
+            _ => Arc::new(Database::open_existing_sqlite(path).await?),
+        };
+        let canonical = canonical.clone();
+        let erasures = erasures.clone();
+        db.write(true, move |mut tx| {
+            Box::pin(async move {
+                let _lease = lease;
+                erase_generation(&mut tx, generation, &canonical, &erasures).await
+            })
+        })
+        .await
+    }
+
     pub(crate) fn postgres_eraser(
         &self,
         control: &GenerationControl,
@@ -60,14 +101,7 @@ impl PostgresEraser {
             let canonical = canonical.clone();
             let outcome = Database::write_existing_postgres(&self.pool, &schema, move |mut tx| {
                 Box::pin(async move {
-                    match erasure_layout(&mut tx, generation).await? {
-                        Some(SCHEMA_VERSION) => {
-                            erase_committed(&mut tx, &canonical, &erasures).await?;
-                            Ok(ErasureOutcome::Reconciled)
-                        }
-                        Some(_) => Ok(ErasureOutcome::Obsolete),
-                        None => Ok(ErasureOutcome::Empty),
-                    }
+                    erase_generation(&mut tx, generation, &canonical, &erasures).await
                 })
             })
             .await?;
@@ -117,10 +151,26 @@ impl PostgresEraser {
     }
 }
 
-enum ErasureOutcome {
+pub(crate) enum ErasureOutcome {
     Empty,
     Reconciled,
     Obsolete,
+}
+
+async fn erase_generation(
+    tx: &mut SqlTransaction<'_>,
+    generation: ProjectionGeneration,
+    canonical: &CanonicalStore,
+    erasures: &ProjectionErasures,
+) -> Result<ErasureOutcome, PortError> {
+    match erasure_layout(tx, generation).await? {
+        Some(SCHEMA_VERSION) => {
+            erase_committed(tx, canonical, erasures).await?;
+            Ok(ErasureOutcome::Reconciled)
+        }
+        Some(_) => Ok(ErasureOutcome::Obsolete),
+        None => Ok(ErasureOutcome::Empty),
+    }
 }
 
 async fn erasure_layout(
@@ -130,23 +180,30 @@ async fn erasure_layout(
     // Creation can provision the namespace before the schema transaction.
     // Serialize with initialization to distinguish that empty namespace from
     // a damaged or incompatible durable cache.
-    tx.batch("SELECT pg_advisory_xact_lock(hashtextextended(current_schema(), 272014))")
-        .await?;
-    let relations = tx
-        .select(
-            "SELECT c.relname::TEXT FROM pg_catalog.pg_class c
-             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-             WHERE n.nspname = current_schema() AND c.relkind IN ('r', 'p', 'm', 'f')
-             ORDER BY (c.relname = 'derived_schema_meta') DESC LIMIT 1",
-            Vec::new(),
-            &[Kind::Text],
-        )
-        .await?;
+    let relations = if tx.postgres() {
+        tx.batch("SELECT pg_advisory_xact_lock(hashtextextended(current_schema(), 272014))")
+            .await?;
+        "SELECT c.relname::TEXT FROM pg_catalog.pg_class c
+         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+         WHERE n.nspname = current_schema() AND c.relkind IN ('r', 'p', 'm', 'f')
+         ORDER BY (c.relname = 'derived_schema_meta') DESC LIMIT 1"
+    } else {
+        "SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+         ORDER BY (name = 'derived_schema_meta') DESC LIMIT 1"
+    };
+    let relations = tx.select(relations, Vec::new(), &[Kind::Text]).await?;
     let Some(name) = relations.into_iter().next().and_then(|mut row| row.pop()) else {
         return Ok(None);
     };
     if String::read(name)? != "derived_schema_meta" {
         return Err(invalid_row());
+    }
+    if !tx.postgres() {
+        match metadata_state(tx, "derived_schema_meta", generation).await? {
+            MetadataState::Current => return Ok(Some(SCHEMA_VERSION)),
+            MetadataState::Empty => return Err(invalid_row()),
+            MetadataState::Obsolete => {}
+        }
     }
     let rows = tx
         .select(

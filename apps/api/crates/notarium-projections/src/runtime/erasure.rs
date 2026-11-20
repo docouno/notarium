@@ -1,4 +1,7 @@
-use std::sync::{Arc, Weak, atomic::Ordering};
+use std::{
+    collections::BTreeSet,
+    sync::{Arc, Weak, atomic::Ordering},
+};
 
 use notarium_canonical::{CanonicalStore, ProjectionErasures, ProjectionVisibilityCleanup};
 use notarium_core::{
@@ -11,7 +14,8 @@ use notarium_core::{
 
 use crate::{
     derived::{
-        DerivedStore, GenerationControl, GenerationFiles, PostgresCacheOwner, PostgresEraser,
+        DerivedStore, ErasureOutcome, GenerationControl, GenerationFiles, PostgresCacheOwner,
+        PostgresEraser,
     },
     mmap::{BaseIndexHandle, CheckpointRange, IndexIdentity, sweep_erased_checkpoint},
 };
@@ -24,6 +28,7 @@ pub(super) struct Eraser {
     engine: Weak<ProjectionEngine>,
     postgres: Option<PostgresEraser>,
     root: DataRoot,
+    control: GenerationControl,
     generation_cleanup: Arc<GenerationCleanup>,
     postgres_cache_owner: Option<Arc<PostgresCacheOwner>>,
 }
@@ -38,6 +43,7 @@ impl Eraser {
                 .store
                 .postgres_eraser(&engine.control)?,
             root: engine.cache_root.clone(),
+            control: engine.control.clone(),
             generation_cleanup: Arc::clone(&engine.generation_cleanup),
             postgres_cache_owner: engine.postgres_cache_owner.clone(),
         })
@@ -57,18 +63,9 @@ impl ProjectionVisibilityCleanup for Eraser {
             if canonical.read_space(&erasures.scope.space_id).await?.scope != erasures.scope {
                 return Ok(());
             }
-            if let Some(engine) = self.engine.upgrade() {
-                return engine
-                    .erase_committed_visibility(
-                        self.postgres.as_ref(),
-                        canonical,
-                        erasures,
-                        &maintenance,
-                    )
-                    .await;
-            }
+            let engine = self.engine.upgrade();
             if let Some(postgres) = &self.postgres {
-                return erase_postgres_visibility(
+                erase_postgres_visibility(
                     postgres,
                     &self.root,
                     self.postgres_cache_owner.as_ref(),
@@ -76,9 +73,17 @@ impl ProjectionVisibilityCleanup for Eraser {
                     erasures,
                     &maintenance,
                 )
-                .await;
+                .await?;
+            } else {
+                self.erase_sqlite_visibility(engine.as_deref(), canonical, erasures, &maintenance)
+                    .await?;
             }
-            erase_offline_sqlite(&self.root, canonical, erasures, &maintenance).await
+            if !erasures.purged.is_empty()
+                && let Some(engine) = engine
+            {
+                engine.invalidate_purged_cuts(erasures);
+            }
+            Ok(())
         })
     }
 }
@@ -154,106 +159,25 @@ impl ProjectionEngine {
         Ok(())
     }
 
-    async fn erase_committed_visibility(
-        &self,
-        postgres: Option<&PostgresEraser>,
-        canonical: &CanonicalStore,
-        erasures: &ProjectionErasures,
-        maintenance: &Maintenance,
-    ) -> Result<(), PortError> {
-        let purging = !erasures.purged.is_empty();
-        if let Some(postgres) = postgres {
-            erase_postgres_visibility(
-                postgres,
-                &self.cache_root,
-                self.postgres_cache_owner.as_ref(),
-                canonical,
-                erasures,
-                maintenance,
-            )
-            .await?;
-        } else {
-            let generations = self
-                .known_generations
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone();
-            let active = self.generation.load_full();
-            for id in active.store.related_generations(&self.cache_root).await? {
-                let resident = generations.get(&id);
-                let store = match resident {
-                    Some(generation) => Some(generation.store.clone()),
-                    None => {
-                        active
-                            .store
-                            .related_generation_for_runtime(&self.cache_root, id)
-                            .await?
-                    }
-                };
-                let Some(store) = store else {
-                    self.remove_closed_local_generation(id).await?;
-                    continue;
-                };
-                store
-                    .erase_committed_visibility(canonical, erasures)
-                    .await?;
-                if purging {
-                    erase_scoped_checkpoints(
-                        &self.cache_root,
-                        id,
-                        &CheckpointRange::current(&erasures.scope, erasures.through),
-                        None,
-                        true,
-                        maintenance,
-                    )
-                    .await?;
-                }
+    fn invalidate_purged_cuts(&self, erasures: &ProjectionErasures) {
+        let generations = self
+            .known_generations
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        for generation in generations.values() {
+            if let Some(slot) = generation.slot(&erasures.scope.space_id)
+                && let Some(cut) = slot.cut.load_full()
+                && cut.cut.scope == erasures.scope
+                && (cut.cut.projected_seq < erasures.through || cut.base.repair_pending())
+            {
+                slot.clear_if_current(&cut);
+                self.pool.evict(&cut.base);
+                slot.repair.notify_one();
             }
         }
-        if purging {
-            let generations = self
-                .known_generations
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone();
-            for generation in generations.values() {
-                if let Some(slot) = generation.slot(&erasures.scope.space_id)
-                    && let Some(cut) = slot.cut.load_full()
-                    && cut.cut.scope == erasures.scope
-                    && (cut.cut.projected_seq < erasures.through || cut.base.repair_pending())
-                {
-                    slot.clear_if_current(&cut);
-                    self.pool.evict(&cut.base);
-                    slot.repair.notify_one();
-                }
-            }
-            self.reads.invalidate_history(&erasures.scope);
-            self.scrub_space_events(&erasures.scope, erasures.through);
-        }
-        Ok(())
-    }
-
-    async fn remove_closed_local_generation(
-        &self,
-        generation: ProjectionGeneration,
-    ) -> Result<(), PortError> {
-        if self
-            .control
-            .active()
-            .await?
-            .is_none_or(|active| active.generation <= generation)
-            || self
-                .control
-                .candidate()
-                .await?
-                .is_some_and(|candidate| candidate.generation == generation)
-        {
-            return Err(not_ready());
-        }
-        let lease = GenerationFiles::for_reclamation(&self.cache_root, generation)
-            .await?
-            .ok_or_else(not_ready)?;
-        GenerationFiles::remove(&self.cache_root, generation, false, lease).await
+        self.reads.invalidate_history(&erasures.scope);
+        self.scrub_space_events(&erasures.scope, erasures.through);
     }
 }
 
@@ -293,51 +217,79 @@ async fn erase_postgres_visibility(
     .map_err(checkpoint_error)?
 }
 
-async fn erase_offline_sqlite(
-    root: &DataRoot,
-    canonical: &CanonicalStore,
-    erasures: &ProjectionErasures,
-    maintenance: &Maintenance,
-) -> Result<(), PortError> {
-    let purging = !erasures.purged.is_empty();
-    let range = CheckpointRange::current(&erasures.scope, erasures.through);
-    let control = GenerationControl::open_sqlite(root).await?;
-    for id in GenerationFiles::inventory(root).await? {
-        if !root.derived(id).exists() {
-            if purging {
-                erase_closed_checkpoints(root, id, &range, maintenance).await?;
-            }
-            continue;
-        }
-        let store = DerivedStore::open_sqlite_for_runtime(root, id).await?;
-        let Some(store) = store else {
-            if control
-                .active()
-                .await?
-                .is_none_or(|active| active.generation <= id)
-                || control
-                    .candidate()
-                    .await?
-                    .is_some_and(|candidate| candidate.generation == id)
-            {
-                return Err(not_ready());
-            }
-            let lease = GenerationFiles::for_reclamation(root, id)
-                .await?
-                .ok_or_else(not_ready)?;
-            GenerationFiles::remove(root, id, false, lease).await?;
-            continue;
-        };
-        store
-            .erase_committed_visibility(canonical, erasures)
+impl Eraser {
+    async fn erase_sqlite_visibility(
+        &self,
+        engine: Option<&ProjectionEngine>,
+        canonical: &CanonicalStore,
+        erasures: &ProjectionErasures,
+        maintenance: &Maintenance,
+    ) -> Result<(), PortError> {
+        let resident = engine
+            .map(|engine| {
+                engine
+                    .known_generations
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone()
+            })
+            .unwrap_or_default();
+        let mut ids: BTreeSet<_> = GenerationFiles::inventory(&self.root)
+            .await?
+            .into_iter()
+            .collect();
+        ids.extend(resident.keys().copied());
+        let witness = self.control.local_rotation_witness().await?;
+        let range = CheckpointRange::current(&erasures.scope, erasures.through);
+        for id in ids {
+            let outcome = DerivedStore::erase_existing_sqlite(
+                &self.root,
+                id,
+                resident.get(&id).map(|generation| &generation.store),
+                canonical,
+                erasures,
+            )
             .await?;
-        if purging {
-            // The committed floor excludes old writers. A reader in any Space
-            // can still hold the shared generation lease during this sweep.
-            erase_scoped_checkpoints(root, id, &range, None, true, maintenance).await?;
+            let remove_files = match outcome {
+                ErasureOutcome::Reconciled => true,
+                ErasureOutcome::Empty => witness.excludes_writers(id),
+                ErasureOutcome::Obsolete => {
+                    // A reused candidate number may again acquire this name.
+                    // Only a generation behind the durable active one is final.
+                    if !witness.excludes_writers(id)
+                        || witness
+                            .active
+                            .as_ref()
+                            .is_none_or(|active| active.generation <= id)
+                    {
+                        return Err(not_ready());
+                    }
+                    let lease = GenerationFiles::for_reclamation(&self.root, id)
+                        .await?
+                        .ok_or_else(not_ready)?;
+                    GenerationFiles::remove(&self.root, id, false, lease).await?;
+                    continue;
+                }
+            };
+            if !erasures.purged.is_empty() {
+                if remove_files {
+                    erase_scoped_checkpoints(&self.root, id, &range, None, true, maintenance)
+                        .await?;
+                } else {
+                    let maintenance = Arc::clone(maintenance);
+                    let root = self.root.clone();
+                    let range = range.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let _maintenance = maintenance;
+                        sweep_checkpoint_files(&root, id, &range, Sweep::Unreconciled)
+                    })
+                    .await
+                    .map_err(checkpoint_error)??;
+                }
+            }
         }
+        Ok(())
     }
-    Ok(())
 }
 
 async fn erase_scoped_checkpoints(
@@ -363,25 +315,6 @@ async fn erase_scoped_checkpoints(
     })
     .await
     .map_err(checkpoint_error)?
-}
-
-async fn erase_closed_checkpoints(
-    root: &DataRoot,
-    generation: ProjectionGeneration,
-    range: &CheckpointRange,
-    maintenance: &Maintenance,
-) -> Result<(), PortError> {
-    erase_scoped_checkpoints(root, generation, range, None, false, maintenance).await?;
-    let cache = root.clone();
-    let range = range.clone();
-    let maintenance = Arc::clone(maintenance);
-    GenerationFiles::with_exclusive_reclamation(root, generation, move || {
-        let _maintenance = maintenance;
-        sweep_checkpoint_files(&cache, generation, &range, Sweep::Purged)
-    })
-    .await?
-    .ok_or_else(not_ready)?;
-    Ok(())
 }
 
 fn retire_registered(

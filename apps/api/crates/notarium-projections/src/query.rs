@@ -26,7 +26,7 @@ use notarium_core::{
 use notarium_syntax::unicode::lookup_key;
 
 use crate::{
-    derived::{DerivedStore, ProjectedNote, ProjectedQueryRow},
+    derived::{DerivedStore, GroupRankRange, ProjectedNote, ProjectedQueryRow},
     index::{IndexView, PostingKey},
     nota::{NotaDescriptor, SourceFolder, SourceScope, ViewKind, ViewSource},
 };
@@ -759,7 +759,8 @@ async fn ranked_header_window(
     }
     // Small selections can address the target primary keys directly even when
     // the board has many ranks belonging to other filters or grants.
-    if ids.cardinality() <= capacity as u64 && ids.cardinality() <= 200 {
+    let candidate_count = ids.cardinality();
+    if candidate_count <= capacity as u64 && candidate_count <= 200 {
         let ranks = candidate_ranks(input, view, &ids.to_vec()).await?;
         return header_window(
             &WindowInput {
@@ -783,7 +784,7 @@ async fn ranked_header_window(
     if same_group.is_none() || start.is_some() {
         let mut scanned = 0u64;
         loop {
-            let limit = PageLimit::new(capacity.clamp(1, 200) as u16)?;
+            let limit = rank_page_limit(capacity, scanned, candidate_count - scanned)?;
             let page = input
                 .store
                 .group_rank_page(
@@ -791,7 +792,10 @@ async fn ranked_header_window(
                     input.cut,
                     view,
                     &group_hex,
-                    start.as_ref().map(|(r, id)| (r.as_str(), id)),
+                    GroupRankRange {
+                        after: start.as_ref().map(|(r, id)| (r.as_str(), id)),
+                        through: None,
+                    },
                     limit,
                 )
                 .await?;
@@ -820,7 +824,7 @@ async fn ranked_header_window(
             if ranks.len() == capacity || end {
                 break;
             }
-            if scanned >= ids.cardinality() {
+            if scanned >= candidate_count {
                 // Beyond this point, seeking the already-filtered candidates
                 // by target is cheaper than walking unrelated placements.
                 let mut best = BoundedHeap::new(capacity);
@@ -871,8 +875,14 @@ async fn ranked_header_window(
     Ok(rows)
 }
 
-/// A continuation may have passed physical placements. Exclude a sparse group
-/// using its covering index before considering SQL work over candidate notes.
+// Grow a range scan when placements have been skipped, with one bounded SQL
+// batch and at most as many new positions as the remaining candidate budget.
+fn rank_page_limit(first: usize, scanned: u64, budget: u64) -> DomainResult<PageLimit> {
+    PageLimit::new((first as u64).max(2 * scanned).min(budget).clamp(1, 200) as u16)
+}
+
+/// The suffix after a ranked cursor has already been exhausted. Read the
+/// disjoint prefix through that cursor, or the full group for an ordinary cursor.
 async fn continued_unranked_window(
     input: &WindowInput<'_>,
     view: &ViewRef,
@@ -882,57 +892,62 @@ async fn continued_unranked_window(
     cursor: &SortTuple,
     capacity: usize,
 ) -> Result<Vec<SelectedRow>, PortError> {
-    if candidates.is_empty() {
-        return Ok(Vec::new());
-    }
-    let probe = PageLimit::new((input.limit.get() + 1).min(200))?;
-    let prefix = input
-        .store
-        .group_rank_page(input.scope, input.cut, view, group_hex, None, probe)
-        .await?;
-    let cursor_position = cursor_rank(&cursor.cells)?.map(|rank| (rank, &cursor.entity_id));
-    let covered = prefix.len() < usize::from(probe.get())
-        || prefix
-            .last()
-            .zip(cursor_position)
-            .is_some_and(|(last, position)| {
-                (last.sort_rank_lexo.as_str(), &last.target_note_id) >= position
+    let through = cursor_rank(&cursor.cells)?.map(|rank| (rank, &cursor.entity_id));
+    let mut start = None::<(String, NoteId)>;
+    let mut scanned = 0;
+    let mut remaining = candidates.cardinality();
+    // Candidate checks cost one lookup per remaining ID. Switch to them only
+    // once the index has actually yielded at least that many physical ranks.
+    while scanned < remaining {
+        let first = start.is_none();
+        let limit = rank_page_limit(
+            usize::from(input.limit.get()) + 1,
+            scanned,
+            remaining - scanned,
+        )?;
+        let page = input
+            .store
+            .group_rank_page(
+                input.scope,
+                input.cut,
+                view,
+                group_hex,
+                GroupRankRange {
+                    after: start.as_ref().map(|(rank, id)| (rank.as_str(), id)),
+                    through,
+                },
+                limit,
+            )
+            .await?;
+        scanned += page.len() as u64;
+        let exhausted = page.len() < usize::from(limit.get())
+            || page.last().zip(through).is_some_and(|(last, position)| {
+                (last.sort_rank_lexo.as_str(), &last.target_note_id) == position
             });
-    for placement in prefix {
-        if let Some(dense) = input.index.dense_id(&placement.target_note_id) {
-            candidates.remove(dense);
+        start = page
+            .last()
+            .map(|row| (row.sort_rank_lexo.clone(), row.target_note_id.clone()));
+        for row in page {
+            if let Some(dense) = input.index.dense_id(&row.target_note_id)
+                && candidates.remove_checked(dense)
+            {
+                remaining -= 1;
+            }
+        }
+        if exhausted || remaining == 0 {
+            return header_window(input, &candidates, group, capacity);
+        }
+        // In a dense group the leading timestamp candidates may already fill
+        // the page. Try this once; a short result resumes the same rank scan.
+        if first
+            && scanned < remaining
+            && let Some(window) =
+                verified_ordinary_window(input, view, group, group_hex, &candidates, capacity)
+                    .await?
+        {
+            return Ok(window);
         }
     }
-    if covered {
-        // Either every rank was read or the prefix meets the exhausted suffix.
-        return header_window(input, &candidates, group, capacity);
-    }
-
-    // A full prefix need not mean a dense group. Verify the leading mmap
-    // candidates in one SQL batch, allowing for some intervening placements.
-    let preview_limit = (2 * capacity).min(201);
-    let preview = header_window(input, &candidates, group, preview_limit)?;
-    if preview.is_empty() {
-        return Ok(preview);
-    }
-    let exhausted = preview.len() < preview_limit;
-    let ids = preview.iter().map(|r| r.dense_id).collect::<Vec<_>>();
-    let ordinary = input
-        .store
-        .unranked_candidates(input.scope, input.cut, view, group_hex, &ids)
-        .await?;
-    let ordinary = Bitmap::from(ordinary.as_slice());
-    let window: Vec<_> = preview
-        .into_iter()
-        .filter(|r| ordinary.contains(r.dense_id))
-        .take(capacity)
-        .collect();
-    if window.len() == capacity || exhausted {
-        return Ok(window);
-    }
-
-    // Many leading candidates were ranks, so check the remaining candidate
-    // set in bulk instead of repeatedly opening small windows.
     let mut unranked = Bitmap::new();
     let mut iter = candidates.iter();
     let mut batch = [0; 2048];
@@ -948,6 +963,34 @@ async fn continued_unranked_window(
         unranked.add_many(&found);
     }
     header_window(input, &unranked, group, capacity)
+}
+
+async fn verified_ordinary_window(
+    input: &WindowInput<'_>,
+    view: &ViewRef,
+    group: &GroupKey,
+    group_hex: &str,
+    candidates: &Bitmap,
+    capacity: usize,
+) -> Result<Option<Vec<SelectedRow>>, PortError> {
+    let preview_limit = (2 * capacity).min(201);
+    let preview = header_window(input, candidates, group, preview_limit)?;
+    if preview.is_empty() {
+        return Ok(Some(preview));
+    }
+    let exhausted = preview.len() < preview_limit;
+    let ids = preview.iter().map(|r| r.dense_id).collect::<Vec<_>>();
+    let ordinary = input
+        .store
+        .unranked_candidates(input.scope, input.cut, view, group_hex, &ids)
+        .await?;
+    let ordinary = Bitmap::from(ordinary.as_slice());
+    let window: Vec<_> = preview
+        .into_iter()
+        .filter(|r| ordinary.contains(r.dense_id))
+        .take(capacity)
+        .collect();
+    Ok((window.len() == capacity || exhausted).then_some(window))
 }
 
 fn overlay_window(

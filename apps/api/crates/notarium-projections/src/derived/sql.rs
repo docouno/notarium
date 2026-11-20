@@ -333,7 +333,18 @@ struct ReadWork {
     progress_calls: std::sync::atomic::AtomicUsize,
 }
 
+#[cfg(unix)]
+fn sqlite_file_id(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let file = std::fs::symlink_metadata(path).ok()?;
+    file.is_file().then(|| (file.dev(), file.ino()))
+}
+
 struct SqliteDatabase {
+    #[cfg(unix)]
+    file_id: (u64, u64),
+    #[cfg(windows)]
+    file_id: same_file::Handle,
     #[cfg(test)]
     read_work: Arc<ReadWork>,
     path: PathBuf,
@@ -500,25 +511,56 @@ impl Database {
         }
     }
 
+    pub(super) fn owns_sqlite_file(&self, path: &Path) -> bool {
+        let Backend::Sqlite(sqlite) = &self.0 else {
+            return false;
+        };
+        #[cfg(unix)]
+        {
+            sqlite_file_id(path) == Some(sqlite.file_id)
+        }
+        #[cfg(windows)]
+        {
+            std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file())
+                && same_file::Handle::from_path(path).is_ok_and(|current| current == sqlite.file_id)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (sqlite, path);
+            false
+        }
+    }
+
     pub(super) async fn open_sqlite(path: PathBuf) -> Result<Self, PortError> {
+        Self::open_sqlite_file(path, true).await
+    }
+
+    pub(super) async fn open_existing_sqlite(path: PathBuf) -> Result<Self, PortError> {
+        Self::open_sqlite_file(path, false).await
+    }
+
+    async fn open_sqlite_file(path: PathBuf, create: bool) -> Result<Self, PortError> {
         tokio::task::spawn_blocking(move || {
             let directory = path.parent().ok_or_else(invalid_row)?;
-            std::fs::create_dir_all(directory)
-                .map_err(|_| internal("projection_sqlite_directory"))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700));
+            if create {
+                std::fs::create_dir_all(directory)
+                    .map_err(|_| internal("projection_sqlite_directory"))?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ =
+                        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700));
+                }
+                #[cfg(target_os = "linux")]
+                suppress_access_times(directory);
             }
-            #[cfg(target_os = "linux")]
-            suppress_access_times(directory);
-            let writer = Connection::open_with_flags(
-                &path,
-                OpenFlags::SQLITE_OPEN_READ_WRITE
-                    | OpenFlags::SQLITE_OPEN_CREATE
-                    | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-            )
-            .map_err(sqlite_error)?;
+            let mut flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+            if create {
+                flags |= OpenFlags::SQLITE_OPEN_CREATE;
+            } else {
+                flags |= OpenFlags::SQLITE_OPEN_NOFOLLOW;
+            }
+            let writer = Connection::open_with_flags(&path, flags).map_err(sqlite_error)?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -548,13 +590,22 @@ impl Database {
             if mode != "wal" || secure_delete != 1 {
                 return Err(internal("projection_sqlite_pragmas"));
             }
-            let mut readers = Vec::with_capacity(READERS);
-            for _ in 0..READERS {
+            let reader_count = if create { READERS } else { 0 };
+            let mut readers = Vec::with_capacity(reader_count);
+            for _ in 0..reader_count {
                 readers.push(open_reader(&path)?);
             }
             let mut wal = path.as_os_str().to_os_string();
             wal.push("-wal");
             Ok(Self(Backend::Sqlite(Box::new(SqliteDatabase {
+                #[cfg(unix)]
+                file_id: {
+                    use std::os::unix::fs::MetadataExt;
+                    let metadata = std::fs::metadata(&path).map_err(|_| invalid_row())?;
+                    (metadata.dev(), metadata.ino())
+                },
+                #[cfg(windows)]
+                file_id: same_file::Handle::from_path(&path).map_err(|_| invalid_row())?,
                 #[cfg(test)]
                 read_work: Arc::default(),
                 path,
@@ -752,6 +803,19 @@ impl Database {
         F: for<'a> FnOnce(SqlTransaction<'a>) -> SqlFuture<'a, T> + Send + 'static,
         T: Send + 'static,
     {
+        self.read_with_file_check(false, operation).await
+    }
+
+    /// A retained SQLite reader may still refer to an unlinked database.
+    pub(super) async fn read_with_file_check<T, F>(
+        self: &Arc<Self>,
+        check_file: bool,
+        operation: F,
+    ) -> Result<T, PortError>
+    where
+        F: for<'a> FnOnce(SqlTransaction<'a>) -> SqlFuture<'a, T> + Send + 'static,
+        T: Send + 'static,
+    {
         let cutoff = Instant::now() + READ_LIMIT;
         let budget = tokio::time::Instant::from_std(cutoff);
         match &self.0 {
@@ -823,6 +887,9 @@ impl Database {
                         sqlite,
                         reader: Some(reader),
                     };
+                    if check_file && !database.owns_sqlite_file(&sqlite.path) {
+                        return Err(super::stale());
+                    }
                     run_sqlite_read(
                         guard.reader.as_mut().expect("reader present"),
                         #[cfg(test)]

@@ -1760,6 +1760,11 @@ pub(super) async fn publish_checkpoint_file(
         return Err(DomainError::validation(ValidationReason::InvalidState).into());
     }
     let maintenance = Arc::clone(&engine.generation_cleanup).lock_owned().await;
+    // An active or reserved generation can publish. A cancelled operation can
+    // outlive its runtime, so use the installation's atomic descriptor here.
+    if !engine.control.is_postgres() && engine.control.generation_reclaimable(*generation).await? {
+        return Err(visibility_cursor_stale());
+    }
     store.validate_checkpoint_publication(scope, *seq).await?;
     engine
         .canonical

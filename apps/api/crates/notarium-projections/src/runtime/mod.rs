@@ -197,7 +197,10 @@ impl ProjectorRuntime {
             let owner = PostgresCacheOwner::acquire(cache_root).await?;
             (owner.root().clone(), Some(owner))
         } else {
-            (cache_root, None)
+            let path = tokio::fs::canonicalize(cache_root.root())
+                .await
+                .map_err(checkpoint_error)?;
+            (DataRoot::new(path), None)
         };
         let identity_root = cache_root.clone();
         let cache_identity = tokio::task::spawn_blocking(move || cache_identity(&identity_root))

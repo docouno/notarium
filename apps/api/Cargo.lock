@@ -3022,6 +3022,7 @@ dependencies = [
  "rmp-serde",
  "rusqlite",
  "rustix",
+ "same-file",
  "serde",
  "serde_json",
  "sqlx",

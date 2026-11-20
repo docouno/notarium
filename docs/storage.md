@@ -110,7 +110,9 @@ Redaction and stale-summary cleanup remove the indexed occurrences atomically.
 
 The upgrade from version 7 copies the surviving normalized references and their
 original ordinals, looking up the creation sequence on each parent entry.
-It streams the old on-disk table into the indexed destination in one pass.
+SQLite streams the old on-disk table into the indexed destination. PostgreSQL
+backfills the new column in place, preserving the existing foreign key and
+avoiding a pending trigger event for every reference.
 Earlier versions populate the sequence while normalizing the legacy arrays.
 Stop preceding-version PostgreSQL writers before upgrading. Bootstrap installs
 the data, indexes and schema witness in one transaction.
