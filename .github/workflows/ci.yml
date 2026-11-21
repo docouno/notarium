@@ -14,27 +14,293 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  verify:
+  plan:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 5
+    outputs:
+      run_code: ${{ steps.plan.outputs.run_code }}
+      shards_matrix: ${{ steps.plan.outputs.shards_matrix }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 2
+      - run: python3 scripts/check-docs-hygiene.py
+      - id: plan
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python3 scripts/ci-api-shards.py plan
+
+  node:
+    needs: plan
+    if: needs.plan.outputs.run_code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: docker/setup-compose-action@v2.4.0
         with:
           version: v5.0.2
-      - name: Configure Devkit cache directory
-        run: echo "DEVKIT_CACHE_DIR=${RUNNER_TEMP}/devkit-cache" >> "$GITHUB_ENV"
+      - &configure_cache
+        name: Configure the Devkit cache
+        run: echo "DEVKIT_CACHE_DIR=$RUNNER_TEMP/devkit-cache" >> "$GITHUB_ENV"
+      - id: pins
+        name: Read the pinned desktop recipe
+        run: |
+          hash=$(sed -n 's/^DEVKIT_DESKTOP_RECIPE_HASH=//p' .devkit/runtime/toolchains.env)
+          [[ "$hash" =~ ^[a-f0-9]{64}$ ]]
+          echo "desktop_recipe_hash=$hash" >> "$GITHUB_OUTPUT"
       - uses: actions/cache@v6.1.0
         with:
           path: |
-            ${{ env.DEVKIT_CACHE_DIR }}
+            ${{ env.DEVKIT_CACHE_DIR }}/engines
+            ${{ env.DEVKIT_CACHE_DIR }}/pnpm-store
+            ${{ env.DEVKIT_CACHE_DIR }}/pnpm-cache
+            ${{ env.DEVKIT_CACHE_DIR }}/tools
+            ${{ env.DEVKIT_CACHE_DIR }}/electron
             .devkit/cache
-          key: devkit-${{ runner.os }}-${{ hashFiles('.devkit/manifest.json', 'pnpm-lock.yaml', 'apps/api/Cargo.lock') }}
-          restore-keys: |
-            devkit-${{ runner.os }}-
+          key: devkit-node-${{ runner.os }}-${{ hashFiles('.devkit/manifest.json', 'pnpm-lock.yaml') }}
+          restore-keys: devkit-node-${{ runner.os }}-
+      - uses: actions/cache/restore@v6.1.0
+        id: desktop-cache
+        with:
+          path: ${{ runner.temp }}/docker-cache/desktop.tar
+          key: docker-desktop-${{ runner.os }}-${{ steps.pins.outputs.desktop_recipe_hash }}
+      - name: Load the cached desktop image
+        if: steps.desktop-cache.outputs.cache-hit == 'true'
+        run: |
+          docker load -i "$RUNNER_TEMP/docker-cache/desktop.tar"
+          rm -f "$RUNNER_TEMP/docker-cache/desktop.tar"
       - run: sh .devkit/runtime/devkit.sh cli doctor .
-      - run: make setup
-      - run: make doctor
-      - run: make check
-      - run: make test
-      - run: make build
+      - run: make setup app=desktop
+      - name: Export the desktop image
+        if: steps.desktop-cache.outputs.cache-hit != 'true'
+        env:
+          DESKTOP_HASH: ${{ steps.pins.outputs.desktop_recipe_hash }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/docker-cache"
+          docker save -o "$RUNNER_TEMP/docker-cache/desktop.tar" "devkit-derived-desktop:$DESKTOP_HASH"
+      - uses: actions/cache/save@v6.1.0
+        if: steps.desktop-cache.outputs.cache-hit != 'true'
+        with:
+          path: ${{ runner.temp }}/docker-cache/desktop.tar
+          key: ${{ steps.desktop-cache.outputs.cache-primary-key }}
+      - name: Remove the desktop archive
+        if: always()
+        run: rm -f "$RUNNER_TEMP/docker-cache/desktop.tar"
+      - name: Verify Node and desktop readiness
+        shell: bash
+        run: |
+          sh .devkit/runtime/devkit.sh cli doctor . --json |
+            jq -e '.result | .ok == true and
+              any(.checks[]; .id == "checkout_state" and
+                .details.receipts.nodeWorkspaceReady == true and
+                .details.receipts.desktopImageReady == true)'
+      - name: Check, test and build the Node workspace
+        run: make check-web check-desktop test/packages/api-contract test/packages/client test-web test-desktop build-web build-desktop
+
+  api-check:
+    needs: plan
+    if: needs.plan.outputs.run_code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Test CI cache rules
+        run: python3 -B -m unittest discover -s scripts/tests
+      - uses: docker/setup-compose-action@v2.4.0
+        with:
+          version: v5.0.2
+      - *configure_cache
+      - uses: actions/cache@v6.1.0
+        with: &rust_registry
+          path: |
+            ${{ env.DEVKIT_CACHE_DIR }}/engines
+            ${{ env.DEVKIT_CACHE_DIR }}/cargo
+          key: devkit-rust-${{ runner.os }}-${{ hashFiles('.devkit/runtime/toolchains.env') }}-${{ hashFiles('apps/api/Cargo.lock') }}
+          restore-keys: devkit-rust-${{ runner.os }}-${{ hashFiles('.devkit/runtime/toolchains.env') }}-
+      - &restore_target
+        uses: actions/cache/restore@v6.1.0
+        id: target-cache
+        with:
+          path: apps/api/target
+          key: rust-target-v1-${{ runner.os }}-${{ hashFiles('.devkit/runtime/toolchains.env', 'apps/api/Cargo.toml') }}-${{ hashFiles('apps/api/Cargo.lock', 'apps/api/crates/*/Cargo.toml', 'apps/api/vendor/pulldown-cmark/**') }}
+          restore-keys: rust-target-v1-${{ runner.os }}-${{ hashFiles('.devkit/runtime/toolchains.env', 'apps/api/Cargo.toml') }}-
+      - &validate_vendor
+        name: Validate the vendored parser cache
+        run: python3 scripts/ci-prune-rust-target.py --stabilize-vendor-mtime apps/api/vendor/pulldown-cmark --target-dir apps/api/target
+      - run: sh .devkit/runtime/devkit.sh cli doctor .
+      - &setup_api_without_fixtures
+        run: make setup app=api
+        env:
+          NOTARIUM_SKIP_API_FIXTURES: '1'
+      - &verify_rust
+        name: Verify Rust readiness
+        shell: bash
+        run: |
+          sh .devkit/runtime/devkit.sh cli doctor . --json |
+            jq -e '.result | .ok == true and
+              any(.checks[]; .id == "checkout_state" and .details.receipts.rustImageReady == true)'
+      - name: Check Rust formatting and lint all targets
+        run: |
+          sh .devkit/runtime/devkit.sh cli exec --component apps/api --network none -- sh -eu -c '
+            export CARGO_TERM_COLOR=never
+            cargo fmt --all -- --check --config-path "$PWD/rustfmt.toml"
+            cargo clippy --workspace --all-targets --locked --offline -- -D warnings
+          '
+      - run: make build app=api
+      - name: Keep only reusable Cargo dependencies
+        if: steps.target-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          cargo_offline() {
+            sh .devkit/runtime/devkit.sh cli exec --component apps/api --network none -- cargo "$@"
+          }
+          metadata="$RUNNER_TEMP/api-metadata.json"
+          events="$RUNNER_TEMP/api-cargo-events.ndjson"
+          cargo_offline metadata --no-deps --format-version 1 --locked --offline > "$metadata"
+          cargo_offline clippy --workspace --all-targets --locked --offline --message-format=json -- -D warnings > "$events"
+          cargo_offline test --workspace --no-run --locked --offline --message-format=json >> "$events"
+          cargo_offline build --workspace --locked --offline --message-format=json >> "$events"
+          python3 scripts/ci-prune-rust-target.py --metadata "$metadata" --cargo-events "$events" \
+            --target-dir apps/api/target --vendor-dir apps/api/vendor/pulldown-cmark
+      - uses: actions/cache/save@v6.1.0
+        if: steps.target-cache.outputs.cache-hit != 'true'
+        with:
+          path: apps/api/target
+          key: ${{ steps.target-cache.outputs.cache-primary-key }}
+
+  api-discovery:
+    needs: plan
+    if: needs.plan.outputs.run_code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: docker/setup-compose-action@v2.4.0
+        with:
+          version: v5.0.2
+      - *configure_cache
+      - uses: actions/cache/restore@v6.1.0
+        with: *rust_registry
+      - *restore_target
+      - *validate_vendor
+      - run: sh .devkit/runtime/devkit.sh cli doctor .
+      - *setup_api_without_fixtures
+      - *verify_rust
+      - name: Discover Rust tests and reject ignored tests
+        run: sh .devkit/runtime/devkit.sh cli exec --component apps/api --network none -- sh /workspace/scripts/ci-api-discovery.sh
+
+  api-test:
+    needs: plan
+    if: needs.plan.outputs.run_code == 'true'
+    name: api-test (${{ matrix.id }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.shards_matrix) }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: docker/setup-compose-action@v2.4.0
+        with:
+          version: v5.0.2
+      - *configure_cache
+      - uses: actions/cache/restore@v6.1.0
+        with: *rust_registry
+      - *restore_target
+      - name: Read storage fixture recipes
+        id: fixture-recipes
+        shell: bash
+        run: |
+          digest=$(sh docker/storage-fixtures/with-storage-fixtures.sh fixture-images | sha256sum)
+          echo "digest=${digest%% *}" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache/restore@v6.1.0
+        id: fixtures-cache
+        with:
+          path: ${{ runner.temp }}/docker-cache/storage-fixtures.tar
+          key: docker-storage-fixtures-${{ runner.os }}-${{ steps.fixture-recipes.outputs.digest }}
+      - *validate_vendor
+      - name: Load the cached storage fixtures
+        if: steps.fixtures-cache.outputs.cache-hit == 'true'
+        run: |
+          docker load -i "$RUNNER_TEMP/docker-cache/storage-fixtures.tar"
+          rm -f "$RUNNER_TEMP/docker-cache/storage-fixtures.tar"
+      - run: sh .devkit/runtime/devkit.sh cli doctor .
+      - run: make setup app=api
+      - name: Export the storage fixtures
+        if: matrix.saves_fixture_cache && steps.fixtures-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          images=$(sh docker/storage-fixtures/with-storage-fixtures.sh fixture-images)
+          mapfile -t tags <<< "$images"
+          mkdir -p "$RUNNER_TEMP/docker-cache"
+          docker save -o "$RUNNER_TEMP/docker-cache/storage-fixtures.tar" "${tags[@]}"
+      - uses: actions/cache/save@v6.1.0
+        if: matrix.saves_fixture_cache && steps.fixtures-cache.outputs.cache-hit != 'true'
+        with:
+          path: ${{ runner.temp }}/docker-cache/storage-fixtures.tar
+          key: ${{ steps.fixtures-cache.outputs.cache-primary-key }}
+      - name: Remove the storage fixture archive
+        if: always()
+        run: rm -f "$RUNNER_TEMP/docker-cache/storage-fixtures.tar"
+      - *verify_rust
+      - name: Run API test shard
+        env:
+          SHARD_ID: ${{ matrix.id }}
+        run: sh scripts/ci-run-api-shard.sh "$SHARD_ID"
+
+  verify:
+    needs: [plan, node, api-check, api-discovery, api-test]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read
+    steps:
+      - name: Verify required job results
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PLAN_RESULT: ${{ needs.plan.result }}
+          RUN_CODE: ${{ needs.plan.outputs.run_code }}
+          NODE_RESULT: ${{ needs.node.result }}
+          API_CHECK_RESULT: ${{ needs.api-check.result }}
+          API_DISCOVERY_RESULT: ${{ needs.api-discovery.result }}
+          API_TEST_RESULT: ${{ needs.api-test.result }}
+        run: |
+          if [ "$PLAN_RESULT" != success ]; then
+            echo "plan job did not succeed: $PLAN_RESULT" >&2
+            exit 1
+          fi
+          case "$EVENT_NAME:$RUN_CODE" in
+            *:true) expected=success ;;
+            pull_request:false) expected=skipped ;;
+            *) echo "invalid run_code '$RUN_CODE' for event '$EVENT_NAME'" >&2; exit 1 ;;
+          esac
+          for job in "node:$NODE_RESULT" "api-check:$API_CHECK_RESULT" "api-discovery:$API_DISCOVERY_RESULT" "api-test:$API_TEST_RESULT"; do
+            if [ "${job#*:}" != "$expected" ]; then
+              echo "${job%%:*} result was '${job#*:}', expected '$expected'" >&2
+              exit 1
+            fi
+          done
+      - name: Verify each API test shard
+        if: needs.plan.outputs.run_code == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHARDS_MATRIX: ${{ needs.plan.outputs.shards_matrix }}
+        shell: bash
+        run: |
+          # A matrix result can report success when a shard never got a runner.
+          # Prefer the newest result for each shard to support partial reruns.
+          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?filter=all&per_page=100" |
+            jq -es --argjson matrix "$SHARDS_MATRIX" '
+              ($matrix | map("api-test (" + .id + ")") | sort) as $expected
+              | [.[].jobs[] | select(.name | startswith("api-test ("))]
+              | if all(.[]; (.run_attempt | type) == "number") then . else error("Missing job attempt") end
+              | group_by(.name)
+              | map(max_by(.run_attempt).run_attempt as $latest | .[] | select(.run_attempt == $latest))
+              | ($expected | length) > 0
+                and map(.name) == $expected
+                and all(.[]; .status == "completed" and .conclusion == "success")
+            '

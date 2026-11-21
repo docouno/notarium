@@ -7,6 +7,8 @@ RUN rustc --edition=2024 -O ./uds_tcp_bridge.rs -o /usr/local/bin/uds-tcp-bridge
 
 FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
 
-LABEL org.opencontainers.image.title="notarium-storage-fixture-uds-bridge"
+ARG NOTARIUM_FIXTURE_RECIPE_SHA256
+LABEL org.opencontainers.image.title="notarium-storage-fixture-uds-bridge" \
+      io.notarium.fixture-recipe-sha256="${NOTARIUM_FIXTURE_RECIPE_SHA256}"
 COPY --from=build /usr/local/bin/uds-tcp-bridge /usr/local/bin/uds-tcp-bridge
 ENTRYPOINT ["/usr/local/bin/uds-tcp-bridge"]
