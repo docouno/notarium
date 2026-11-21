@@ -2,6 +2,8 @@ pub mod archive_export;
 pub mod archive_import;
 pub mod archive_uploads;
 mod fence;
+#[cfg(test)]
+mod job_queue_tests;
 
 use fence::RoomTransition;
 use std::{
@@ -131,27 +133,16 @@ enum StoredJobPayloadV1 {
     Reembed { model: ModelProfileId },
 }
 
-impl From<&ContentJobKind> for StoredJobPayloadV1 {
-    fn from(k: &ContentJobKind) -> Self {
+impl From<ContentJobKind> for StoredJobPayloadV1 {
+    fn from(k: ContentJobKind) -> Self {
         match k {
-            ContentJobKind::Import { artifact } => Self::Import {
-                artifact: artifact.clone(),
-            },
-            ContentJobKind::Export { notes, encrypted } => Self::Export {
-                notes: notes.clone(),
-                encrypted: *encrypted,
-            },
-            ContentJobKind::ExportSpace { encrypted } => Self::ExportSpace {
-                encrypted: *encrypted,
-            },
+            ContentJobKind::Import { artifact } => Self::Import { artifact },
+            ContentJobKind::Export { notes, encrypted } => Self::Export { notes, encrypted },
+            ContentJobKind::ExportSpace { encrypted } => Self::ExportSpace { encrypted },
             ContentJobKind::Backup => Self::Backup,
-            ContentJobKind::Restore { artifact } => Self::Restore {
-                artifact: artifact.clone(),
-            },
+            ContentJobKind::Restore { artifact } => Self::Restore { artifact },
             ContentJobKind::Reindex => Self::Reindex,
-            ContentJobKind::Reembed { model } => Self::Reembed {
-                model: model.clone(),
-            },
+            ContentJobKind::Reembed { model } => Self::Reembed { model },
         }
     }
 }
@@ -173,9 +164,17 @@ impl From<StoredJobPayloadV1> for ContentJobKind {
 const DELEGATED_PAYLOAD_TAG: &[u8] = b"NJ2\0";
 
 #[derive(Serialize, Deserialize)]
-struct DelegatedJobPayload {
-    input: StoredJobPayloadV1,
+struct DelegatedJobPayload<T = StoredJobPayloadV1> {
+    input: T,
     delegation: JobDelegation,
+}
+
+// The historical framing tag precedes the bounded MessagePack body.
+const MAX_JOB_WIRE_BYTES: usize = MAX_MSGPACK_DECODE_BYTES + DELEGATED_PAYLOAD_TAG.len();
+
+fn encode_job_payload(value: &impl Serialize) -> Result<Vec<u8>, PortError> {
+    crate::codec::encode_msgpack_bounded::<MAX_MSGPACK_DECODE_BYTES>(value, "encode_job_payload")?
+        .ok_or_else(|| DomainError::validation(ValidationReason::BudgetExceeded).into())
 }
 
 fn decode_job_payload(
@@ -241,7 +240,7 @@ impl From<&ContentJob> for StoredContentJobV1 {
     fn from(j: &ContentJob) -> Self {
         Self {
             id: j.id.clone(),
-            kind: (&j.kind).into(),
+            kind: j.kind.clone().into(),
             state: j.state.into(),
             completed_units: j.completed_units,
             total_units: j.total_units,
@@ -493,6 +492,21 @@ impl ContentJobPort for CanonicalStore {
     }
 }
 
+const RUNNABLE_ARCHIVE_SCOPES: &str = "WITH queued AS (
+        SELECT DISTINCT j.space_id FROM content_jobs j JOIN spaces s ON s.space_id=j.space_id
+        WHERE j.state='queued' AND j.space_id>$1 AND j.job_kind=$3 AND s.lifecycle_state='active'
+        ORDER BY j.space_id LIMIT $2
+    ), reclaimable AS (
+        SELECT DISTINCT j.space_id FROM content_jobs j JOIN spaces s ON s.space_id=j.space_id
+        WHERE j.state='running' AND j.space_id>$1 AND j.job_kind=$3 AND s.lifecycle_state='active'
+          AND (j.lease_until_ms<=$4 OR j.claim_space_epoch IS DISTINCT FROM s.active_epoch)
+        ORDER BY j.space_id LIMIT $2
+    ), candidates AS (
+        SELECT space_id FROM queued UNION SELECT space_id FROM reclaimable
+    )
+    SELECT c.space_id, s.history_incarnation FROM candidates c JOIN spaces s ON s.space_id=c.space_id
+    ORDER BY c.space_id LIMIT $2";
+
 impl CanonicalStore {
     /// Active Spaces with queued work or a reclaimable lease for this class.
     pub async fn archive_job_scopes(
@@ -527,20 +541,7 @@ impl CanonicalStore {
         self.with_read_tx_budget(Some(budget), |tx| {
             Box::pin(async move {
                 let sql = if class.is_some() {
-                    "WITH queued AS (
-                         SELECT DISTINCT j.space_id FROM content_jobs j JOIN spaces s ON s.space_id=j.space_id
-                         WHERE j.state='queued' AND j.space_id>$1 AND j.job_kind=$3 AND s.lifecycle_state='active'
-                         ORDER BY j.space_id LIMIT $2
-                     ), reclaimable AS (
-                         SELECT DISTINCT j.space_id FROM content_jobs j JOIN spaces s ON s.space_id=j.space_id
-                         WHERE j.state='running' AND j.space_id>$1 AND j.job_kind=$3 AND s.lifecycle_state='active'
-                           AND (j.lease_until_ms<=$4 OR j.claim_space_epoch IS DISTINCT FROM s.active_epoch)
-                         ORDER BY j.space_id LIMIT $2
-                     ), candidates AS (
-                         SELECT space_id FROM queued UNION SELECT space_id FROM reclaimable
-                     )
-                     SELECT c.space_id, s.history_incarnation FROM candidates c JOIN spaces s ON s.space_id=c.space_id
-                     ORDER BY c.space_id LIMIT $2"
+                    RUNNABLE_ARCHIVE_SCOPES
                 } else {
                     "SELECT space_id, history_incarnation FROM spaces
                      WHERE space_id>$1 ORDER BY space_id LIMIT $2"
@@ -551,7 +552,9 @@ impl CanonicalStore {
                 };
                 macro_rules! select_scopes {
                     ($conn:expr) => {{
-                        let mut query = sqlx::query_as(sql).bind(&after).bind(i64::from(limit.get()));
+                        let mut query = sqlx::query_as(sql)
+                            .bind(&after)
+                            .bind(i64::from(limit.get()));
                         if let Some((kind, now)) = filter {
                             query = query.bind(kind).bind(now);
                         }
@@ -561,7 +564,8 @@ impl CanonicalStore {
                 let rows: Vec<(String, Vec<u8>)> = match tx {
                     BackendConn::Sqlite(conn) => select_scopes!(conn),
                     BackendConn::Postgres(conn) => select_scopes!(conn),
-                }.map_err(|err| crate::runtime::pg_read_error("archive_scopes", err))?;
+                }
+                .map_err(|err| crate::runtime::pg_read_error("archive_scopes", err))?;
                 rows.into_iter()
                     .map(|(space, history)| {
                         let history = history.try_into().map_err(|_| {
@@ -623,11 +627,12 @@ impl CanonicalStore {
                     .check(&scope)?;
                 let sql = "SELECT payload_msgpack FROM content_jobs
                     WHERE space_id = $1 AND job_id = $2 AND payload_erased_by_purge = 0
-                      AND job_kind IN ('import', 'export')";
+                      AND job_kind IN ('import', 'export') AND length(payload_msgpack) <= $3";
                 let bytes: Option<Vec<u8>> = match tx {
                     BackendConn::Sqlite(conn) => sqlx::query_scalar(sql)
                         .bind(scope.space_id.as_str())
                         .bind(id.as_str())
+                        .bind(MAX_JOB_WIRE_BYTES as i64)
                         .fetch_optional(&mut **conn)
                         .await
                         .map_err(|err| {
@@ -636,6 +641,7 @@ impl CanonicalStore {
                     BackendConn::Postgres(conn) => sqlx::query_scalar(sql)
                         .bind(scope.space_id.as_str())
                         .bind(id.as_str())
+                        .bind(MAX_JOB_WIRE_BYTES as i64)
                         .fetch_optional(&mut **conn)
                         .await
                         .map_err(|err| {
@@ -1136,12 +1142,13 @@ async fn load_job_row_opt_tx(
     )> = match tx {
         BackendConn::Sqlite(conn) => {
             let r = sqlx::query(
-                "SELECT job_kind, payload_msgpack, payload_erased_by_purge, state,
+                "SELECT job_kind, CASE WHEN length(payload_msgpack) <= $1 THEN payload_msgpack END AS payload_msgpack, payload_erased_by_purge, state,
                         lease_owner, lease_epoch, lease_until_ms, attempts,
                         completed_units, total_units, artifacts_json, created_seq
                  FROM content_jobs
-                 WHERE space_id = ? AND job_id = ?",
+                 WHERE space_id = $2 AND job_id = $3",
             )
+            .bind(MAX_JOB_WIRE_BYTES as i64)
             .bind(space_id.as_str())
             .bind(job_id.as_str())
             .fetch_optional(&mut **conn)
@@ -1166,12 +1173,13 @@ async fn load_job_row_opt_tx(
         }
         BackendConn::Postgres(conn) => {
             let r = sqlx::query(
-                "SELECT job_kind, payload_msgpack, payload_erased_by_purge::BIGINT AS pe, state,
+                "SELECT job_kind, CASE WHEN length(payload_msgpack) <= $1 THEN payload_msgpack END AS payload_msgpack, payload_erased_by_purge::BIGINT AS pe, state,
                         lease_owner, lease_epoch, lease_until_ms, attempts::BIGINT AS att,
                         completed_units, total_units, artifacts_json, created_seq
                  FROM content_jobs
-                 WHERE space_id = $1 AND job_id = $2",
+                 WHERE space_id = $2 AND job_id = $3",
             )
+            .bind(MAX_JOB_WIRE_BYTES as i64)
             .bind(space_id.as_str())
             .bind(job_id.as_str())
             .fetch_optional(&mut **conn)
@@ -1214,6 +1222,19 @@ async fn load_job_row_opt_tx(
         return Ok(None);
     };
 
+    // An older writer could queue a selected export larger than the reader's
+    // limit. Never copy that blob into the application to classify the row.
+    if jkind == "export"
+        && perased == 0
+        && pmsg.as_deref().is_none_or(|wire| {
+            wire.strip_prefix(DELEGATED_PAYLOAD_TAG)
+                .unwrap_or(wire)
+                .len()
+                > MAX_MSGPACK_DECODE_BYTES
+        })
+    {
+        return Err(DomainError::validation(ValidationReason::BudgetExceeded).into());
+    }
     let job = decode_content_job_row(
         job_id.as_str().to_owned(),
         jkind,
@@ -1290,10 +1311,55 @@ async fn authorize_job_payload_tx(
 ) -> Result<(), PortError> {
     match &job.kind {
         ContentJobKind::Export { notes, .. } => {
-            authorize_export_notes_tx(tx, space, auth, notes).await?
+            if notes.is_empty() && job.state == JobState::Failed && job.total_units.is_none() {
+                // Failed legacy selections retain their canonical owners for visibility and purge.
+                authorize_failed_export_owners_tx(tx, space, auth, &job.id).await?;
+            } else {
+                authorize_export_notes_tx(tx, space, auth, notes).await?;
+            }
         }
         ContentJobKind::ExportSpace { .. } => authorize_full_space_export(auth, space)?,
         _ => {}
+    }
+    Ok(())
+}
+
+async fn authorize_failed_export_owners_tx(
+    tx: &mut BackendConn<'_>,
+    space: &Space,
+    auth: &EngineAuthContext,
+    job: &JobId,
+) -> Result<(), PortError> {
+    let mut after = String::new();
+    loop {
+        const PAGE: &str = "SELECT note_id FROM payload_owners WHERE space_id=$1
+            AND payload_kind='content_job' AND payload_id=$2 AND note_id>$3
+            ORDER BY note_id LIMIT 200";
+        macro_rules! owners {
+            ($conn:expr) => {
+                sqlx::query_scalar::<_, String>(PAGE)
+                    .bind(space.id.as_str())
+                    .bind(job.as_str())
+                    .bind(&after)
+                    .fetch_all(&mut **$conn)
+                    .await
+            };
+        }
+        let page = match tx {
+            BackendConn::Sqlite(conn) => owners!(conn),
+            BackendConn::Postgres(conn) => owners!(conn),
+        }
+        .map_err(|e| crate::runtime::pg_read_error("read_export_owners", e))?;
+        let Some(last) = page.last() else { break };
+        after.clone_from(last);
+        let owners = page
+            .iter()
+            .map(|id| NoteId::parse(id))
+            .collect::<Result<Vec<_>, _>>()?;
+        authorize_export_notes_tx(tx, space, auth, &owners).await?;
+        if page.len() < 200 {
+            break;
+        }
     }
     Ok(())
 }
@@ -1351,43 +1417,44 @@ async fn create_job_impl(
         .await?;
     space_rec.scope.check(ctx.scope())?;
 
-    let payload_wire = StoredJobPayloadV1::from(&request.input);
-    let identity_payload = encode_msgpack(&payload_wire)?;
-    let export_notes = match &request.input {
+    let payload_wire = StoredJobPayloadV1::from(request.input);
+    let identity_payload = encode_job_payload(&payload_wire)?;
+    let delegation = match &payload_wire {
+        StoredJobPayloadV1::Import { .. }
+        | StoredJobPayloadV1::Export { .. }
+        | StoredJobPayloadV1::ExportSpace { .. } => JobDelegation::capture(ctx.auth(), ctx.scope()),
+        _ => None,
+    };
+    let delegated_bytes = if let Some(delegation) = delegation {
+        let body = encode_job_payload(&DelegatedJobPayload {
+            input: &payload_wire,
+            delegation,
+        })?;
+        let mut wire = Vec::with_capacity(DELEGATED_PAYLOAD_TAG.len() + body.len());
+        wire.extend_from_slice(DELEGATED_PAYLOAD_TAG);
+        wire.extend_from_slice(&body);
+        Some(wire)
+    } else {
+        None
+    };
+    let input = ContentJobKind::from(payload_wire);
+    let export_notes = match &input {
         ContentJobKind::Export { notes, .. } => notes.as_slice(),
         _ => &[],
     };
     let idemp = derive_command_identity_spec(&request.identity, "create_job", &identity_payload)
         .for_job(ctx.auth(), None, export_notes);
-    let payload_bytes = if matches!(
-        &request.input,
-        ContentJobKind::Import { .. }
-            | ContentJobKind::Export { .. }
-            | ContentJobKind::ExportSpace { .. }
-    ) && let Some(delegation) =
-        JobDelegation::capture(ctx.auth(), ctx.scope())
-    {
-        let mut bytes = DELEGATED_PAYLOAD_TAG.to_vec();
-        bytes.extend(encode_msgpack(&DelegatedJobPayload {
-            input: payload_wire,
-            delegation,
-        })?);
-        bytes
-    } else {
-        identity_payload
-    };
-
+    let payload_bytes = delegated_bytes.unwrap_or(identity_payload);
     let scope = space_rec.scope.clone();
     let active_epoch = space_rec.active_epoch;
     let auth = ctx.auth().clone();
-    let input = request.input;
 
     let intent = PreparedWriteIntent {
         scope: scope.clone(),
         active_epoch,
         idempotency: Some(idemp),
         source_note_ids: Vec::new(),
-        staged_bytes: 0,
+        staged_bytes: payload_bytes.len() as u64,
         required_semantic_cut: None,
         execute: Box::new(move |tx, item_ctx| {
             Box::pin(async move {
@@ -1593,8 +1660,17 @@ pub(crate) async fn read_visible_job_tx(
 ) -> Result<ContentJob, PortError> {
     authorize_job_read_on_space(auth, space)?;
 
-    let Some((found, ..)) = load_job_row_opt_tx(tx, &space.id, job).await? else {
-        return Err(DomainError::ResourceNotFound.into());
+    let found = match load_job_row_opt_tx(tx, &space.id, job).await {
+        Ok(Some((found, ..))) => found,
+        Ok(None)
+        | Err(PortError::Domain(DomainError::ValidationFailed {
+            diagnostic:
+                notarium_core::error::Diagnostic {
+                    reason: ValidationReason::BudgetExceeded,
+                    ..
+                },
+        })) => return Err(DomainError::ResourceNotFound.into()),
+        Err(error) => return Err(error),
     };
     authorize_job_payload_tx(tx, space, auth, &found).await?;
     Ok(found)
@@ -2017,6 +2093,8 @@ async fn query_jobs_page_tx(
                    AND created_seq <= ?
                    AND (? = 1 OR state IN (?, ?, ?, ?, ?))
                    AND (? = 0 OR created_seq < ? OR (created_seq = ? AND job_id > ?))
+                   AND (payload_erased_by_purge=1 OR length(payload_msgpack)<=?
+                        OR (length(payload_msgpack)<=? AND substr(payload_msgpack,1,4)=?))
                  ORDER BY created_seq DESC, job_id ASC
                  LIMIT ?",
             )
@@ -2032,6 +2110,9 @@ async fn query_jobs_page_tx(
             .bind(after_seq)
             .bind(after_seq)
             .bind(after_id)
+            .bind(MAX_MSGPACK_DECODE_BYTES as i64)
+            .bind(MAX_JOB_WIRE_BYTES as i64)
+            .bind(DELEGATED_PAYLOAD_TAG)
             .bind(fetch_limit)
             .fetch_all(&mut **conn)
             .await
@@ -2063,8 +2144,10 @@ async fn query_jobs_page_tx(
                    AND created_seq <= $2
                    AND ($3 = 1 OR state IN ($4, $5, $6, $7, $8))
                    AND ($9 = 0 OR created_seq < $10 OR (created_seq = $10 AND job_id > $11))
+                   AND (payload_erased_by_purge=1 OR length(payload_msgpack)<=$12
+                        OR (length(payload_msgpack)<=$13 AND substr(payload_msgpack,1,4)=$14))
                  ORDER BY created_seq DESC, job_id ASC
-                 LIMIT $12",
+                 LIMIT $15",
             )
             .bind(space_id.as_str())
             .bind(base_cut_i64)
@@ -2077,6 +2160,9 @@ async fn query_jobs_page_tx(
             .bind(has_after)
             .bind(after_seq)
             .bind(after_id)
+            .bind(MAX_MSGPACK_DECODE_BYTES as i64)
+            .bind(MAX_JOB_WIRE_BYTES as i64)
+            .bind(DELEGATED_PAYLOAD_TAG)
             .bind(fetch_limit)
             .fetch_all(&mut **conn)
             .await
@@ -2343,47 +2429,59 @@ pub(crate) async fn job_clock_ms(tx: &mut BackendConn<'_>) -> Result<i64, PortEr
     }
 }
 
+enum ClaimRead {
+    Sqlite,
+    Postgres { lock: bool },
+}
+
+fn candidate_sql(class: Option<ArchiveJobClass>, read: ClaimRead) -> &'static str {
+    macro_rules! candidate {
+        ($kinds:literal, $index:literal, $suffix:literal) => {
+            concat!(
+                "SELECT job_id FROM content_jobs", $index, "
+                 WHERE state IN ('queued','running') AND ", $kinds, " AND space_id=$1
+                   AND (state='queued' OR lease_until_ms<=$2 OR claim_space_epoch IS DISTINCT FROM
+                        (SELECT active_epoch FROM spaces WHERE space_id=$1))
+                 ORDER BY created_seq, job_id LIMIT 1", $suffix
+            )
+        };
+        ($kinds:literal) => {
+            match read {
+                // With skewed queue statistics SQLite can otherwise scan terminal history.
+                ClaimRead::Sqlite => candidate!($kinds, " INDEXED BY idx_content_jobs_claim", ""),
+                ClaimRead::Postgres { lock: false } => candidate!($kinds, "", ""),
+                ClaimRead::Postgres { lock: true } => candidate!($kinds, "", " FOR UPDATE SKIP LOCKED"),
+            }
+        };
+    }
+    match class {
+        Some(ArchiveJobClass::Import) => candidate!("job_kind='import'"),
+        Some(ArchiveJobClass::Export) => candidate!("job_kind='export'"),
+        // Seek each legal kind in the claim index inside this Space.
+        None => {
+            candidate!("job_kind IN ('import','export','backup','restore','reindex','reembed')")
+        }
+    }
+}
+
 async fn next_claimable_job(
     tx: &mut BackendConn<'_>,
     scope: &HistoryScope,
     class: Option<ArchiveJobClass>,
     lock: bool,
 ) -> Result<Option<JobId>, PortError> {
-    macro_rules! candidate {
-        ($suffix:literal) => {
-            concat!(
-                "SELECT job_id FROM content_jobs
-                 WHERE space_id = $1
-                   AND (state = 'queued' OR (state = 'running' AND (
-                      lease_until_ms <= $2 OR claim_space_epoch IS DISTINCT FROM
-                        (SELECT active_epoch FROM spaces WHERE space_id=$1)
-                   )))
-                   AND (CAST($3 AS TEXT) IS NULL OR job_kind = $3)
-                 ORDER BY created_seq, job_id LIMIT 1",
-                $suffix,
-            )
-        };
-    }
     let now = job_clock_ms(tx).await?;
-    let kind = class.map(ArchiveJobClass::as_db);
     let id: Option<String> = match tx {
-        BackendConn::Sqlite(conn) => sqlx::query_scalar(candidate!(""))
+        BackendConn::Sqlite(conn) => sqlx::query_scalar(candidate_sql(class, ClaimRead::Sqlite))
             .bind(scope.space_id.as_str())
             .bind(now)
-            .bind(kind)
             .fetch_optional(&mut **conn)
             .await
             .map_err(|err| internal_not_committed("sqlite_select_claim_job", err.to_string()))?,
         BackendConn::Postgres(conn) => {
-            let sql = if lock {
-                candidate!(" FOR UPDATE SKIP LOCKED")
-            } else {
-                candidate!("")
-            };
-            sqlx::query_scalar(sql)
+            sqlx::query_scalar(candidate_sql(class, ClaimRead::Postgres { lock }))
                 .bind(scope.space_id.as_str())
                 .bind(now)
-                .bind(kind)
                 .fetch_optional(&mut **conn)
                 .await
                 .map_err(|err| crate::runtime::pg_read_error("pg_select_claim_job", err))?
@@ -2451,6 +2549,80 @@ async fn require_active_job_lease_tx(
     Ok((job, now, erased, until))
 }
 
+// Old writers could persist a selected export that its worker could never decode.
+// Finish only this locked candidate; a database or transport failure still rolls back.
+async fn fail_oversized_export_tx(
+    tx: &mut BackendConn<'_>,
+    scope: &HistoryScope,
+    id: &JobId,
+    seq: SpaceSeq,
+) -> Result<(), PortError> {
+    let payload = encode_job_payload(&StoredJobPayloadV1::Export {
+        notes: Vec::new(),
+        encrypted: false,
+    })?;
+    let error = crate::codec::diagnostic_digest("claim_export", "payload_size_limit");
+    const FAIL: &str = "UPDATE content_jobs SET state='failed', payload_msgpack=$1, error_ref=$2,
+        lease_epoch=lease_epoch+1, lease_owner=NULL, lease_until_ms=NULL, claim_space_epoch=NULL,
+        completed_units=0, total_units=NULL, artifacts_json='[]', result_msgpack=NULL, updated_seq=$3
+        WHERE space_id=$4 AND job_id=$5 AND job_kind='export' AND payload_erased_by_purge=0
+          AND (length(payload_msgpack)>$6 OR (length(payload_msgpack)>$7 AND substr(payload_msgpack,1,4)<>$8))";
+    macro_rules! fail {
+        ($conn:expr) => {
+            sqlx::query(FAIL)
+                .bind(payload.as_slice())
+                .bind(error.as_bytes().as_slice())
+                .bind(seq.get() as i64)
+                .bind(scope.space_id.as_str())
+                .bind(id.as_str())
+                .bind(MAX_JOB_WIRE_BYTES as i64)
+                .bind(MAX_MSGPACK_DECODE_BYTES as i64)
+                .bind(DELEGATED_PAYLOAD_TAG)
+                .execute(&mut **$conn)
+                .await
+                .map(|result| result.rows_affected())
+        };
+    }
+    let affected = match tx {
+        BackendConn::Sqlite(conn) => fail!(conn),
+        BackendConn::Postgres(conn) => fail!(conn),
+    }
+    .map_err(|e| crate::runtime::pg_read_error("fail_oversized_export", e))?;
+    if affected != 1 {
+        return Err(internal_not_committed(
+            "fail_oversized_export",
+            "locked candidate did not match",
+        ));
+    }
+    Ok(())
+}
+
+fn claim_artifacts(
+    id: &JobId,
+    seq: SpaceSeq,
+    claim: Option<StoredClaimedJobV1>,
+) -> Result<ItemCommitArtifacts, PortError> {
+    let response_bytes = CanonicalStore::encode_command_outcome(&claim)?;
+    Ok(ItemCommitArtifacts {
+        command_id: new_prefixed_hex_id("cmd_")?,
+        command_kind: "claim_job".to_owned(),
+        events: vec![BatchEventDraft {
+            space_seq: seq,
+            entity_type: "job".to_owned(),
+            entity_id: id.as_str().to_owned(),
+            op_kind: "edit".to_owned(),
+            rev_id: new_revision_id()?,
+            lifecycle: Lifecycle::Active,
+            doc_class: None,
+        }],
+        change_payload: None,
+        receipt_detail_blob: None,
+        receipt_sanitized_blob: Vec::new(),
+        receipt_owner_note_ids: Vec::new(),
+        response_bytes,
+    })
+}
+
 async fn claim_next_job_impl(
     store: &CanonicalStore,
     budget: &CallBudget,
@@ -2504,16 +2676,23 @@ async fn claim_next_job_impl(
                 let Some(jid) = next_claimable_job(tx, &scope_cl, class, true).await? else {
                     return Err(DomainError::validation(ValidationReason::NotReady).into());
                 };
+                let seq = item_ctx.alloc_next_seq()?;
                 let (mut job, _, _, prev_attempts, erased, _) =
-                    load_job_row_opt_tx(tx, &scope_cl.space_id, &jid)
-                        .await?
-                        .ok_or(DomainError::ResourceNotFound)?;
+                    match load_job_row_opt_tx(tx, &scope_cl.space_id, &jid).await {
+                        Ok(Some(row)) => row,
+                        Ok(None) => return Err(DomainError::ResourceNotFound.into()),
+                        Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
+                            if diagnostic.reason == ValidationReason::BudgetExceeded =>
+                        {
+                            fail_oversized_export_tx(tx, &scope_cl, &jid, seq).await?;
+                            return claim_artifacts(&jid, seq, None);
+                        }
+                        Err(error) => return Err(error),
+                    };
 
                 let new_lease = job.lease.checked_next()?;
                 let new_attempts = prev_attempts.saturating_add(1);
                 let lease_until_ms = checked_lease_end(job_clock_ms(tx).await?, duration_ms)?;
-                let seq = item_ctx.alloc_next_seq()?;
-                let rev_id = new_revision_id()?;
 
                 match tx {
                     BackendConn::Sqlite(conn) => {
@@ -2578,36 +2757,17 @@ async fn claim_next_job_impl(
                     attempts: new_attempts,
                     payload_erased_by_purge: erased,
                 };
-                let resp_bytes = CanonicalStore::encode_command_outcome(&wire)?;
-                let cmd_id = new_prefixed_hex_id("cmd_")?;
-
-                Ok(ItemCommitArtifacts {
-                    command_id: cmd_id,
-                    command_kind: "claim_job".to_owned(),
-                    events: vec![BatchEventDraft {
-                        space_seq: seq,
-                        entity_type: "job".to_owned(),
-                        entity_id: jid.as_str().to_owned(),
-                        op_kind: "edit".to_owned(),
-                        rev_id,
-                        lifecycle: Lifecycle::Active,
-                        doc_class: None,
-                    }],
-                    change_payload: None,
-                    receipt_detail_blob: None,
-                    receipt_sanitized_blob: resp_bytes.clone(),
-                    receipt_owner_note_ids: Vec::new(),
-                    response_bytes: resp_bytes,
-                })
+                claim_artifacts(&jid, seq, Some(wire))
             })
         }),
     };
 
     match deadline
-        .submit::<StoredClaimedJobV1>(store, budget, intent)
+        .submit::<Option<StoredClaimedJobV1>>(store, budget, intent)
         .await
     {
-        Ok(claimed) => Ok(Some(ClaimedContentJob {
+        Ok(None) => Ok(None),
+        Ok(Some(claimed)) => Ok(Some(ClaimedContentJob {
             job: claimed.job.into(),
             lease_owner: claimed.lease_owner,
             lease_until_ms: claimed.lease_until_ms,

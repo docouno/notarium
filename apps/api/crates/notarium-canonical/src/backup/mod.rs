@@ -28,8 +28,9 @@ use notarium_core::{
     model::HistoryScope,
     ports::{
         BackupArtifactKind, BackupBudget, BackupHold, BackupParticipantPort, BackupProgress,
-        BackupSnapshot, BackupSpool, BackupWitness, CallBudget, Cancellation, MaintenanceContext,
-        PausedBackup, PortFuture, PreparedBackup, ServicePurpose, TemporaryBackupSpool,
+        BackupSnapshot, BackupSpool, BackupWitness, CallBudget, Cancellation, MAX_BACKUP_SPACES,
+        MaintenanceContext, PausedBackup, PortFuture, PreparedBackup, ServicePurpose,
+        TemporaryBackupSpool,
     },
     ports::{BackupRetentionBudget, BackupRetentionProgress},
     receipt::ChangeCursor,
@@ -40,9 +41,9 @@ use sqlx::{Connection, PgConnection, Row};
 use crate::{
     CanonicalStore, RoomFenceTable,
     codec::{
-        MAX_MSGPACK_DECODE_BYTES, cancelled_not_committed, deadline_not_committed,
-        decode_msgpack_bounded, encode_msgpack, i64_to_space_seq, internal_not_committed,
-        now_unix_ms, unavailable_retryable,
+        cancelled_not_committed, deadline_not_committed, decode_msgpack_bounded,
+        encode_msgpack_bounded, i64_to_space_seq, internal_not_committed, now_unix_ms,
+        unavailable_retryable,
     },
     config::{BlobBackendConfig, SqlBackendConfig},
     domain::purge::has_incomplete_pending_purges_tx,
@@ -60,6 +61,26 @@ use crate::{
 
 pub const POSTGRES_SPOOL_V1_MAGIC: &[u8] = b"NOTARIUM_PG_SPOOL_V1\n";
 pub const PG_SLICE_MAX_BYTES: usize = 64 * 1024;
+// Named MessagePack includes the scope field names, 35-byte Space ID,
+// sixteen two-byte incarnation values and a 64-bit sequence per history.
+const PG_WITNESS_BYTES: usize = 256 + MAX_BACKUP_SPACES * 128;
+
+fn encode_pg_witness(witness: &BackupWitness) -> Result<Vec<u8>, PortError> {
+    check_pg_witness(witness)?;
+    encode_msgpack_bounded::<PG_WITNESS_BYTES>(witness, "pg_spool_witness")?
+        .ok_or_else(|| DomainError::validation(ValidationReason::BudgetExceeded).into())
+}
+
+fn check_pg_witness(witness: &BackupWitness) -> Result<(), PortError> {
+    if witness.histories.len() > MAX_BACKUP_SPACES {
+        return Err(DomainError::validation(ValidationReason::BudgetExceeded).into());
+    }
+    if !witness.canaries.is_empty() {
+        return Err(DomainError::validation(ValidationReason::InvalidState).into());
+    }
+    Ok(())
+}
+
 const PG_SPOOL_PAGE_ROWS: usize = 16;
 const PG_SPOOL_INLINE_BYTES: usize = 4096;
 pub const SQLITE_BACKUP_PAGES_PER_STEP: i32 = 16;
@@ -962,6 +983,9 @@ fn read_and_verify_sqlite_conn_witness(
         .next()
         .map_err(|err| internal_not_committed("sqlite_backup_next_space", err.to_string()))?
     {
+        if histories.len() == MAX_BACKUP_SPACES {
+            return Err(DomainError::validation(ValidationReason::BudgetExceeded).into());
+        }
         let sid_raw: String = row
             .get(0)
             .map_err(|err| internal_not_committed("sqlite_backup_space_id", err.to_string()))?;
@@ -1575,6 +1599,9 @@ async fn pin_and_read_pg_witness(
         if row.try_get::<i16, _>(0).map_err(read_error)? == 2 {
             return Err(pending_retirement_at_cut());
         }
+        if histories.len() == MAX_BACKUP_SPACES {
+            return Err(DomainError::validation(ValidationReason::BudgetExceeded).into());
+        }
         let after = i64_to_space_seq(row.try_get(1).map_err(read_error)?)?;
         let space_id = SpaceId::parse(row.try_get(2).map_err(read_error)?).map_err(|_| {
             internal_not_committed("corrupt_pg_backup_space_id", "invalid SpaceId in spaces")
@@ -1753,6 +1780,7 @@ async fn stream_postgres_spool_v1(
         .map_err(|err| internal_not_committed("open_pg_spool_tmp", err.to_string()))?;
 
     let mut spool_writer = HashingSpoolWriter::new(tmp_file, started, budget);
+    let mut witness_capacity = 0usize;
     let mut max_slice_seen = 0usize;
     let mut slice_or_row_ops = 0u64;
 
@@ -1777,12 +1805,14 @@ async fn stream_postgres_spool_v1(
         spool_writer.write_body(&CANONICAL_SCHEMA_VERSION.to_be_bytes())?;
         spool_writer.write_body(manifest_checksum().as_bytes())?;
 
-        let witness_bytes = encode_msgpack(witness)?;
+        let witness_bytes = encode_pg_witness(witness)?;
         let witness_len = u32::try_from(witness_bytes.len()).map_err(|_| {
             internal_not_committed("pg_spool_witness_too_large", "witness > u32::MAX")
         })?;
         spool_writer.write_body(&witness_len.to_be_bytes())?;
         spool_writer.write_body(&witness_bytes)?;
+        witness_capacity = witness_bytes.capacity();
+        drop(witness_bytes);
 
         let table_count = u32::try_from(CANONICAL_TABLES.len()).expect("table count fits in u32");
         spool_writer.write_body(&table_count.to_be_bytes())?;
@@ -2065,7 +2095,7 @@ async fn stream_postgres_spool_v1(
         BackupExporterMemoryStats {
             encoding: BackupArtifactEncoding::PostgresSpoolV1,
             max_chunk_buffer_bytes: max_chunk,
-            max_working_buffer_bytes: working_bytes,
+            max_working_buffer_bytes: working_bytes.max(witness_capacity + STREAM_IO_BUF_BYTES),
             total_bytes_written: total_bytes,
             step_or_slice_count: slice_or_row_ops,
         },
@@ -2100,6 +2130,9 @@ pub fn spool_tables(schema_version: u32) -> impl Iterator<Item = TableSpec> + Cl
         .iter()
         .copied()
         .filter_map(move |mut table| {
+            if schema_version < 8 && table.name == "blob_gc_retries" {
+                return None;
+            }
             if schema_version < 7 {
                 match table.name {
                     "archive_privacy"
@@ -2260,7 +2293,7 @@ fn read_postgres_spool(
     let expected_tables = spool_tables(schema_version);
     let expected_checksum = match schema_version {
         CANONICAL_SCHEMA_VERSION => manifest_checksum(),
-        1..=6 => {
+        1..=7 => {
             let digest = checksum_tables(schema_version, expected_tables.clone());
             if !crate::schema::migrate::recognized_predecessor(
                 i64::from(schema_version),
@@ -2281,16 +2314,20 @@ fn read_postgres_spool(
 
     reader.read_exact_body(&mut u32_buf, body_limit)?;
     let witness_len = u32::from_be_bytes(u32_buf) as usize;
-    if witness_len > MAX_MSGPACK_DECODE_BYTES {
+    if witness_len > PG_WITNESS_BYTES {
         return Err(DomainError::validation(ValidationReason::BudgetExceeded).into());
     }
     if witness_len as u64 > body_limit.saturating_sub(reader.pos) {
         return Err(DomainError::validation(ValidationReason::InvalidState).into());
     }
-    charge(witness_len as u64)?;
+    if materialize {
+        charge(witness_len as u64)?;
+    }
     let mut witness_bytes = vec![0u8; witness_len];
     reader.read_exact_body(&mut witness_bytes, body_limit)?;
-    let witness: BackupWitness = decode_msgpack_bounded(&witness_bytes, MAX_MSGPACK_DECODE_BYTES)?;
+    let witness: BackupWitness = decode_msgpack_bounded(&witness_bytes, PG_WITNESS_BYTES)?;
+    drop(witness_bytes);
+    check_pg_witness(&witness)?;
     if witness.schema_version != schema_version {
         return Err(DomainError::validation(ValidationReason::InvalidState).into());
     }
@@ -3987,9 +4024,10 @@ async fn acquire_durable_backup_holds(
                             "SELECT space_id, history_incarnation, last_seq
                              FROM spaces
                              WHERE CAST($1 AS TEXT) IS NULL OR space_id = $1
-                             ORDER BY space_id ASC",
+                             ORDER BY space_id ASC LIMIT $2",
                         )
                         .bind(scope.as_ref().map(|scope| scope.space_id.as_str()))
+                        .bind(MAX_BACKUP_SPACES as i64 + 1)
                         .fetch_all(&mut **conn)
                         .await
                         .map_err(|err| {
@@ -4010,10 +4048,11 @@ async fn acquire_durable_backup_holds(
                             "SELECT space_id, history_incarnation, last_seq
                              FROM spaces
                              WHERE CAST($1 AS TEXT) IS NULL OR space_id = $1
-                             ORDER BY space_id ASC
+                             ORDER BY space_id ASC LIMIT $2
                              FOR UPDATE",
                         )
                         .bind(scope.as_ref().map(|scope| scope.space_id.as_str()))
+                        .bind(MAX_BACKUP_SPACES as i64 + 1)
                         .fetch_all(&mut **conn)
                         .await
                         .map_err(|err| {
@@ -4031,6 +4070,9 @@ async fn acquire_durable_backup_holds(
                     }
                 };
 
+                if spaces.len() > MAX_BACKUP_SPACES {
+                    return Err(DomainError::validation(ValidationReason::BudgetExceeded).into());
+                }
                 let mut histories = Vec::with_capacity(spaces.len());
                 for (sid_raw, inc_bytes, last_seq_i64) in &spaces {
                     let space_id = SpaceId::parse(sid_raw).map_err(|_| {
@@ -4568,6 +4610,47 @@ async fn load_restored_room_fences(
             .await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod witness_tests {
+    use super::*;
+    use notarium_core::ids::SpaceSeq;
+
+    #[test]
+    fn full_pg_witness_round_trips_with_a_smaller_row_budget() {
+        let mut witness = BackupWitness {
+            installation: InstallationId::from_bytes([255; 16]),
+            schema_version: 5,
+            canaries: Vec::new(),
+            histories: (0..MAX_BACKUP_SPACES)
+                .map(|index| ChangeCursor {
+                    scope: HistoryScope {
+                        space_id: SpaceId::from_bytes((index as u128).to_be_bytes()),
+                        incarnation: HistoryIncarnation::from_bytes([255; 16]),
+                    },
+                    after: SpaceSeq::new(i64::MAX as u64).unwrap(),
+                })
+                .collect(),
+        };
+        let wire = encode_pg_witness(&witness).unwrap();
+        let fixture = include_bytes!("../../tests/fixtures/schema-v5.pgspool");
+        let start = POSTGRES_SPOOL_V1_MAGIC.len() + 4 + 32;
+        let old_len = u32::from_be_bytes(fixture[start..start + 4].try_into().unwrap()) as usize;
+        let mut spool = fixture[..start].to_vec();
+        spool.extend_from_slice(&(wire.len() as u32).to_be_bytes());
+        spool.extend_from_slice(&wire);
+        spool.extend_from_slice(&fixture[start + 4 + old_len..fixture.len() - 32]);
+        let digest = blake3::hash(&spool);
+        spool.extend_from_slice(digest.as_bytes());
+        let len = spool.len() as u64;
+        assert!(wire.len() > 4 * 1024 * 1024);
+        let decoded =
+            scan_postgres_spool_v1(&spool[..], len, len, 1024 * 1024, |_, _| Ok(())).unwrap();
+        assert_eq!(decoded.histories, witness.histories);
+        witness.histories.push(witness.histories[0].clone());
+        assert!(encode_pg_witness(&witness).is_err());
+    }
 }
 
 #[cfg(test)]

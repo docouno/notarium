@@ -382,6 +382,18 @@ CREATE TABLE IF NOT EXISTS blob_retirements (
 CREATE INDEX IF NOT EXISTS idx_blob_retirements_status
     ON blob_retirements (status, space_id);
 
+CREATE TABLE IF NOT EXISTS blob_gc_retries (
+    space_id TEXT NOT NULL,
+    retirement_id TEXT NOT NULL,
+    retry_at_ms BIGINT NOT NULL,
+    backoff_ms BIGINT NOT NULL DEFAULT 250 CHECK (backoff_ms BETWEEN 250 AND 5000),
+    PRIMARY KEY (space_id, retirement_id),
+    FOREIGN KEY (space_id, retirement_id) REFERENCES blob_retirements (space_id, retirement_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_blob_gc_retries_due
+    ON blob_gc_retries (retry_at_ms, space_id, retirement_id);
+
 CREATE TABLE IF NOT EXISTS blob_retirement_targets (
     space_id TEXT NOT NULL,
     retirement_id TEXT NOT NULL,
@@ -734,7 +746,7 @@ CREATE TABLE IF NOT EXISTS content_jobs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_content_jobs_claim
-    ON content_jobs (state, space_id, job_kind, lease_until_ms, job_id);
+    ON content_jobs (state, job_kind, space_id, lease_until_ms, job_id);
 
 CREATE TABLE IF NOT EXISTS archive_artifacts (
     space_id TEXT NOT NULL,

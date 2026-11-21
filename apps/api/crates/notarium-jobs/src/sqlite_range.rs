@@ -60,11 +60,14 @@ impl Drop for Registration {
 pub(crate) fn with_database<T>(
     mut source: impl Read + Seek + Send + 'static,
     image_bytes: u64,
-    max_image_bytes: u64,
     cancellation: &Cancellation,
     verify: impl FnOnce(&Connection) -> Result<T, PortError>,
 ) -> Result<T, PortError> {
-    check_header(&mut source, image_bytes, max_image_bytes)?;
+    check_header(
+        &mut source,
+        image_bytes,
+        notarium_core::ports::MAX_BACKUP_SQLITE_IMAGE_BYTES,
+    )?;
     check_cancelled(cancellation)?;
     let registration = register(source, image_bytes, cancellation.clone())?;
     let database = Connection::open_with_flags_and_vfs(

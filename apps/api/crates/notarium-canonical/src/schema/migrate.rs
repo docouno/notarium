@@ -29,7 +29,10 @@ pub(crate) fn recognized_predecessor(version: i64, hash: &[u8]) -> bool {
         3 => hex::encode(hash) == V3_HASH,
         4 => hex::encode(hash) == V4_HASH,
         5 => hex::encode(hash) == V5_HASH,
-        6 => super::manifest::checksum_tables(6, crate::backup::spool_tables(6)).as_bytes() == hash,
+        6 | 7 => {
+            let v = version as u32;
+            super::manifest::checksum_tables(v, crate::backup::spool_tables(v)).as_bytes() == hash
+        }
         _ => false,
     }
 }
@@ -229,7 +232,7 @@ async fn upgrade_archive_state_v7(
 }
 
 macro_rules! upgrade {
-    ($name:ident, $connection:ty, $variant:ident, $ddl:ident, $pg_v2:expr, $legacy_claim_index:expr $(, $catalog:ident)?) => {
+    ($name:ident, $connection:ty, $variant:ident, $ddl:ident, $pg_v2:expr $(, $catalog:ident)?) => {
         pub(super) async fn $name(
             conn: &mut $connection,
             installation: &InstallationId,
@@ -244,26 +247,16 @@ macro_rules! upgrade {
             let Some((version, hash)) = previous else {
                 return Ok(());
             };
-            let current = version == i64::from(CANONICAL_SCHEMA_VERSION)
-                && hash.as_slice() == checksum.as_bytes();
-            if !current && !recognized_predecessor(version, &hash) {
+            if !recognized_predecessor(version, &hash) {
                 return Ok(());
             }
-            // The index keeps the same logical name and row format. Upgrade
-            // the earlier Space-first ordering once when opening an existing DB.
-            if sqlx::query_scalar::<_, bool>($legacy_claim_index)
-                .fetch_one(&mut *conn).await
-                .map_err(|e| internal_not_committed("inspect_job_claim_index", e.to_string()))?
-            {
-                sqlx::query("DROP INDEX idx_content_jobs_claim").execute(&mut *conn).await
-                    .map_err(|e| internal_not_committed("drop_job_claim_index", e.to_string()))?;
-                let sql = baseline_statement($ddl, "CREATE INDEX IF NOT EXISTS idx_content_jobs_claim")?;
-                sqlx::query(sqlx::AssertSqlSafe(sql)).execute(&mut *conn).await
-                    .map_err(|e| internal_not_committed("create_job_claim_index", e.to_string()))?;
-            }
-            if current {
-                return Ok(());
-            }
+            // Both earlier claim indexes have the same name. Version 8 puts
+            // the job class before the Space so an idle worker skips other classes.
+            sqlx::query("DROP INDEX idx_content_jobs_claim").execute(&mut *conn).await
+                .map_err(|e| internal_not_committed("drop_job_claim_index", e.to_string()))?;
+            let sql = baseline_statement($ddl, "CREATE INDEX IF NOT EXISTS idx_content_jobs_claim")?;
+            sqlx::query(sqlx::AssertSqlSafe(sql)).execute(&mut *conn).await
+                .map_err(|e| internal_not_committed("create_job_claim_index", e.to_string()))?;
             if version == 1 {
                 sqlx::query(sqlx::AssertSqlSafe(create_new_table(
                     $ddl,
@@ -323,23 +316,33 @@ macro_rules! upgrade {
                 sqlx::query(sqlx::AssertSqlSafe(index)).execute(&mut *conn).await
                     .map_err(|e| internal_not_committed("migration_v6_retirement_index", e.to_string()))?;
             }
-            upgrade_archive_state_v7(&mut crate::sql_exec::BackendConn::$variant(conn)).await?;
+            if version < 7 {
+                upgrade_archive_state_v7(&mut crate::sql_exec::BackendConn::$variant(conn)).await?;
+                for prefix in [
+                    "CREATE TABLE IF NOT EXISTS archive_privacy (",
+                    "CREATE INDEX IF NOT EXISTS idx_blob_catalog_gc",
+                    "CREATE TABLE IF NOT EXISTS archive_artifacts (",
+                    "CREATE INDEX IF NOT EXISTS idx_archive_artifacts_expiry",
+                    "CREATE TABLE IF NOT EXISTS archive_export_cuts (",
+                    "CREATE INDEX IF NOT EXISTS idx_archive_export_cuts_space",
+                    "CREATE TABLE IF NOT EXISTS archive_export_shadows (",
+                    "CREATE TABLE IF NOT EXISTS archive_uploads (",
+                    "CREATE TABLE IF NOT EXISTS archive_import_sources (",
+                    "CREATE INDEX IF NOT EXISTS idx_archive_import_sources_artifact",
+                    "CREATE INDEX IF NOT EXISTS idx_archive_uploads_created",
+                ] {
+                    let sql = baseline_statement($ddl, prefix)?;
+                    sqlx::query(sqlx::AssertSqlSafe(sql)).execute(&mut *conn).await
+                        .map_err(|e| internal_not_committed("migration_v7_archive_schema", e.to_string()))?;
+                }
+            }
             for prefix in [
-                "CREATE TABLE IF NOT EXISTS archive_privacy (",
-                "CREATE INDEX IF NOT EXISTS idx_blob_catalog_gc",
-                "CREATE TABLE IF NOT EXISTS archive_artifacts (",
-                "CREATE INDEX IF NOT EXISTS idx_archive_artifacts_expiry",
-                "CREATE TABLE IF NOT EXISTS archive_export_cuts (",
-                "CREATE INDEX IF NOT EXISTS idx_archive_export_cuts_space",
-                "CREATE TABLE IF NOT EXISTS archive_export_shadows (",
-                "CREATE TABLE IF NOT EXISTS archive_uploads (",
-                "CREATE TABLE IF NOT EXISTS archive_import_sources (",
-                "CREATE INDEX IF NOT EXISTS idx_archive_import_sources_artifact",
-                "CREATE INDEX IF NOT EXISTS idx_archive_uploads_created",
+                "CREATE TABLE IF NOT EXISTS blob_gc_retries (",
+                "CREATE INDEX IF NOT EXISTS idx_blob_gc_retries_due",
             ] {
                 let sql = baseline_statement($ddl, prefix)?;
                 sqlx::query(sqlx::AssertSqlSafe(sql)).execute(&mut *conn).await
-                    .map_err(|e| internal_not_committed("migration_v7_archive_schema", e.to_string()))?;
+                    .map_err(|e| internal_not_committed("migration_v8_gc_schedule", e.to_string()))?;
             }
             let (sec, nsec) =
                 crate::codec::encode_timestamp_parts(crate::codec::now_utc_timestamp()?);
@@ -361,7 +364,6 @@ upgrade!(
     Sqlite,
     SQLITE_BASELINE_DDL,
     None::<&'static str>,
-    "SELECT EXISTS(SELECT 1 FROM pragma_index_info('idx_content_jobs_claim') WHERE seqno=0 AND name='space_id')",
     upgrade_sqlite_catalog
 );
 upgrade!(
@@ -369,8 +371,7 @@ upgrade!(
     PgConnection,
     Postgres,
     POSTGRES_BASELINE_DDL,
-    Some(NORMALIZE_PG_V2),
-    "SELECT EXISTS(SELECT 1 FROM pg_index WHERE indexrelid=to_regclass('idx_content_jobs_claim') AND pg_get_indexdef(indexrelid,1,true)='space_id')"
+    Some(NORMALIZE_PG_V2)
 );
 
 #[cfg(test)]

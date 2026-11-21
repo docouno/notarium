@@ -94,7 +94,7 @@ recovers writes under its exclusive DataRoot owner lock.
 ## Dual-dialect schema and history model
 
 Both SQL dialects materialize the same ordinary B-tree tables in schema
-version `7` and verify live database catalogs (`sqlite_master` / `pg_catalog`)
+version `8` and verify live database catalogs (`sqlite_master` / `pg_catalog`)
 against a shared typed manifest checksum (`schema_meta`) on every startup.
 Unknown newer schema versions, mismatched manifest checksums or unfinished
 migration states fail closed.
@@ -106,6 +106,10 @@ and resulting Space identity, history and cutoff, including after restart.
 The caller can replay a pending control operation after losing the canonical
 response. Reusing the key with a different payload is rejected. Rebinding a
 Space's history invalidates receipts issued for its earlier incarnation.
+
+Schema version 8 adds `blob_gc_retries`, a durable schedule for physical
+retirement attempts admitted by the ordinary sweep. The scheduler releases
+its concurrency slot between attempts and resumes pending work on restart.
 
 Schema version 7 adds the CAS quarantine stamp and its partial index. It also
 adds the archive artifact registry and the Space privacy generation. Previously
@@ -173,7 +177,10 @@ rule under their writer savepoints.
 - **Immutable revisions and command-end cuts:** `revisions` stores complete
   immutable MessagePack metadata snapshots (`RevisionMetadataEnvelope`) for
   notes, folders, schemas, ability packages, view rank overlays and chat
-  threads. Every row written by an atomic command shares `visibility_seq` equal
+  threads. Note snapshots encode Active, Trashed and Purged as the one-byte
+  indices 0, 1 and 2. Readers also accept the original state names. A note at
+  the 4 MiB metadata limit can still be trashed and restored.
+  Every row written by an atomic command shares `visibility_seq` equal
   to that command's `CommandSeqRange::end()`. Historical reads select
   `visibility_seq <= cutoff` via `(space_id, entity_type, entity_key, visibility_seq DESC)`
   after verifying that `cutoff` is `0`, `spaces.last_seq` or a committed
@@ -493,10 +500,11 @@ same example against an isolated prefix.
   A Local hold whose release timed out waiting for a writer retains ownership
   while the runtime retries cleanup of its exact generation.
   The offline `notarium_canonical::backup::decode_postgres_spool_v1_bounded`
-  API verifies the trailer and recognizes the exact manifests for schemas 1 through 7.
+  API verifies the trailer and recognizes the exact manifests for schemas 1 through 8.
   It returns typed rows in the original table and column order within the
   caller's byte budget. To materialize a historical spool, create an empty
-  target with `schema::POSTGRES_BASELINE_DDL`. For versions 1 and 2, drop
+  target with `schema::POSTGRES_BASELINE_DDL`. For versions 1 through 7, drop
+  `blob_gc_retries`. For versions 1 and 2, drop
   `collab_checkpoints` and `backup_holds.owner_generation`. For version 1,
   also drop `account_catalog_receipts` and `chat_pending_inputs.ext_space_tainted`.
   For versions 1 through 4, drop `idx_receipt_exception_pointer` and
@@ -510,7 +518,7 @@ same example against an isolated prefix.
   temporary table, then inserts the full set in one statement so foreign keys
   can resolve parents that appear later in the archive.
   Opening the target with the original installation ID applies the remaining
-  migrations through version 7. The canonical L4 backup suite exercises the
+  migrations through version 8. The canonical L4 backup suite exercises the
   historical row importer and the schema migration path. The streaming
   `notarium-jobs` restore handles installation cutover and repository-level
   verification. See [archive jobs and recovery](archive-jobs.md).

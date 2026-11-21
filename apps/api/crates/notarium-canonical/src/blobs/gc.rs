@@ -141,6 +141,8 @@ impl CanonicalStore {
                             // through COMMIT. A lost acknowledgement drops the same handoff.
                             let handoff = match (&result, slot) {
                                 (Decision::Retire(id), Some(slot)) => {
+                                    super::gc_retry::enqueue_tx(tx, &owner.space_id, id, now)
+                                        .await?;
                                     let mut handoff = worker.retirement_handoff(
                                         &owner,
                                         epoch,

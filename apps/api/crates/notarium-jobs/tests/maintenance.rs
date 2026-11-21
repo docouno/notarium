@@ -881,7 +881,15 @@ async fn sqlite_archive_verification_restore_and_rejection() {
         );
     }
 
-    for (target, existing) in [("absent", false), ("existing", true)] {
+    for (target, legacy_order) in [
+        ("absent", Some("space_id, state, lease_until_ms, job_id")),
+        (
+            "space-before-kind",
+            Some("state, space_id, job_kind, lease_until_ms, job_id"),
+        ),
+        ("existing", None),
+    ] {
+        let existing = legacy_order.is_none();
         let restored = DataRoot::new(scratch.0.join(target));
         if existing {
             fs::create_dir(restored.root()).unwrap();
@@ -900,15 +908,18 @@ async fn sqlite_archive_verification_restore_and_rejection() {
         } else {
             RestoreKeyring::External(root.keyring())
         };
-        let archive = if existing {
-            open(&destination)
-        } else {
+        let archive = if let Some(columns) = legacy_order {
             let legacy = repackage_sqlite(
                 &destination,
                 &scratch.0,
                 "canonical",
-                "DROP INDEX idx_content_jobs_claim; CREATE INDEX idx_content_jobs_claim
-                 ON content_jobs (space_id, state, lease_until_ms, job_id)",
+                &format!(
+                    "DROP TABLE blob_gc_retries;
+                     UPDATE schema_meta SET schema_version=7,
+                         manifest_checksum=X'69d765f45ef72feff9238b179deb7a0afae85de76555b3720d2d3c5b9a954699';
+                     DROP INDEX idx_content_jobs_claim;
+                     CREATE INDEX idx_content_jobs_claim ON content_jobs ({columns})"
+                ),
             );
             let report = run_fsck(
                 authority(ServicePurpose::Fsck),
@@ -920,6 +931,8 @@ async fn sqlite_archive_verification_restore_and_rejection() {
             .unwrap();
             assert_eq!(report.spaces, 1);
             ArchiveInput::new(legacy).unwrap()
+        } else {
+            open(&destination)
         };
         let result = run_restore(
             authority(ServicePurpose::Restore),
@@ -952,15 +965,15 @@ async fn sqlite_archive_verification_restore_and_rejection() {
         )
         .await
         .unwrap();
-        let first_key: String = rusqlite::Connection::open(restored.canonical())
+        let keys: String = rusqlite::Connection::open(restored.canonical())
             .unwrap()
             .query_row(
-                "SELECT name FROM pragma_index_info('idx_content_jobs_claim') WHERE seqno=0",
+                "SELECT group_concat(name, ',' ORDER BY seqno) FROM pragma_index_info('idx_content_jobs_claim')",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(first_key, "state");
+        assert_eq!(keys, "state,job_kind,space_id,lease_until_ms,job_id");
         concurrent_write
             .check_restored(&restored_canonical, &owner, &result.histories[0])
             .await;
@@ -999,6 +1012,69 @@ async fn sqlite_archive_verification_restore_and_rejection() {
         restored_runtime.shutdown().await.unwrap();
     }
     paired_load::capture_under_load(&canonical, &binding, &root, &scope, &owner, "sqlite").await;
+    let note = NoteId::from_bytes([9; 16]);
+    let current = canonical
+        .get_note(
+            auth(&scope, &owner),
+            GetNote {
+                note: note.clone(),
+                revision: None,
+                causal: CausalBasis::Exact(ReceiptSet::default()),
+            },
+        )
+        .await
+        .unwrap();
+    canonical
+        .open_collab_session(
+            &budget(),
+            notarium_canonical::OpenCollabSession {
+                scope: scope.clone(),
+                note,
+                owner_id: "large-snapshot".into(),
+                expected_carrier_rev: current.document.revision().clone(),
+                expected_lease: None,
+                expected_lineage: None,
+                initial_yrs_snapshot: Some(vec![0; 33 * 1024 * 1024]),
+                allow_fenced_recovery: false,
+            },
+        )
+        .await
+        .unwrap();
+    let checkpoint_archive = scratch.0.join("large-checkpoint.zip");
+    run_backup(
+        authority(ServicePurpose::Backup),
+        &canonical,
+        &binding,
+        &checkpoint_archive,
+        sqlite_backup_options(),
+    )
+    .await
+    .unwrap();
+    let verified = run_fsck(
+        authority(ServicePurpose::Fsck),
+        FsckInput::Archive(open(&checkpoint_archive)),
+        &root.keyring(),
+        sqlite_backup_options(),
+    )
+    .await
+    .unwrap();
+    assert!(verified.sqlite_native_peak_bytes.unwrap() < 80 * 1024 * 1024);
+    let restored = DataRoot::new(scratch.0.join("with-large-checkpoint"));
+    run_restore(
+        authority(ServicePurpose::Restore),
+        open(&checkpoint_archive),
+        RestoreTarget::Local {
+            root: restored.clone(),
+            keyring: RestoreKeyring::External(root.keyring()),
+        },
+        sqlite_backup_options(),
+    )
+    .await
+    .unwrap();
+    let size: i64 = rusqlite::Connection::open(restored.canonical()).unwrap()
+        .query_row("SELECT length(yrs_snapshot_blob) FROM collab_sessions WHERE space_id=?1 AND note_id=?2",
+            [scope.space_id.as_str(), NoteId::from_bytes([9; 16]).as_str()], |row| row.get(0)).unwrap();
+    assert_eq!(size, 33 * 1024 * 1024);
     drop(binding);
     control.close().await;
     runtime.shutdown().await.unwrap();

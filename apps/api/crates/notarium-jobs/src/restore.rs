@@ -30,13 +30,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     ArchiveInput, BackupOptions,
-    backup_format::{CasRecord, copy_hash, invalid, io_error},
+    backup_format::{CasRecord, MAX_BACKUP_METADATA_JSON_BYTES, copy_hash, invalid, io_error},
     fsck::{VerifiedArchive, verify_archive},
     import::check_cancelled,
     sqlite_range::sql_error,
 };
 
-const JOURNAL_MAX: u64 = 32 * 1024 * 1024;
 const LOCAL_MANIFEST: &str = "v1-epoch.json";
 const GUARD_LENGTH: usize = 64;
 
@@ -928,20 +927,30 @@ fn rename_noreplace(_: &Path, _: &Path) -> Result<(), PortError> {
 }
 
 fn read_journal(path: &Path) -> Result<Journal, PortError> {
-    let mut input = File::open(path).map_err(io_error)?.take(JOURNAL_MAX + 1);
+    let mut input = File::open(path)
+        .map_err(io_error)?
+        .take(MAX_BACKUP_METADATA_JSON_BYTES as u64 + 1);
     let mut bytes = Vec::new();
     input.read_to_end(&mut bytes).map_err(io_error)?;
-    if bytes.len() as u64 > JOURNAL_MAX {
+    if bytes.len() > MAX_BACKUP_METADATA_JSON_BYTES {
         return Err(invalid(ValidationReason::BudgetExceeded));
     }
     serde_json::from_slice(&bytes).map_err(|_| invalid(ValidationReason::InvalidState))
 }
 
+fn encode_journal(value: &impl Serialize) -> Result<String, PortError> {
+    let data = serde_json::to_string(value).map_err(|_| invalid(ValidationReason::InvalidState))?;
+    if data.len() > MAX_BACKUP_METADATA_JSON_BYTES {
+        return Err(invalid(ValidationReason::BudgetExceeded));
+    }
+    Ok(data)
+}
+
 fn save_journal(path: &Path, value: &Journal) -> Result<(), PortError> {
     let parent = path.parent().expect("journal path has parent");
     let tmp = parent.join(codec::new_prefixed_hex_id(".notarium-restore-journal-")?);
-    let data = serde_json::to_vec(value).map_err(|_| invalid(ValidationReason::InvalidState))?;
-    write_new(&tmp, &data)?;
+    let data = encode_journal(value)?;
+    write_new(&tmp, data.as_bytes())?;
     fs::rename(&tmp, path).map_err(io_error)?;
     sync_dir(parent)
 }
@@ -987,3 +996,40 @@ fn sync_dir(path: &Path) -> Result<(), PortError> {
 
 mod cloud;
 pub use cloud::CloudRestoreTarget;
+
+#[cfg(test)]
+mod journal_tests {
+    use super::*;
+
+    #[test]
+    fn full_history_local_and_cloud_journals_round_trip() {
+        let directory =
+            std::env::temp_dir().join(codec::new_prefixed_hex_id("restore-journal-").unwrap());
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("journal.json");
+        let journal = Journal {
+            version: 1,
+            installation: InstallationId::from_bytes([255; 16]),
+            digest: ContentDigest::from_bytes([255; 32]),
+            existing: None,
+            external_keyring: true,
+            histories: crate::backup_format::full_history_fixture(),
+            stage: ".notarium-restore-generation-ffffffffffffffffffffffffffffffff".into(),
+            phase: Phase::Build {
+                directory: Some(Identity {
+                    device: u64::MAX,
+                    inode: u64::MAX,
+                }),
+            },
+            published_manifest: None,
+        };
+        save_journal(&path, &journal).unwrap();
+        assert_eq!(read_journal(&path).unwrap().histories, journal.histories);
+        let cloud = encode_journal(&journal.histories).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Vec<ChangeCursor>>(&cloud).unwrap(),
+            journal.histories
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+}

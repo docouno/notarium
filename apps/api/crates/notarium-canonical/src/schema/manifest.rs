@@ -2,7 +2,7 @@ use std::{collections::BTreeSet, sync::LazyLock};
 
 use notarium_core::ids::ContentDigest;
 
-pub const CANONICAL_SCHEMA_VERSION: u32 = 7;
+pub const CANONICAL_SCHEMA_VERSION: u32 = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LogicalColKind {
@@ -386,6 +386,17 @@ pub const CANONICAL_TABLES: &[TableSpec] = &[
             col("completed_at_ms", Int, true),
         ],
         indexes: &["idx_blob_retirements_status"],
+    },
+    TableSpec {
+        name: "blob_gc_retries",
+        primary_key: &["space_id", "retirement_id"],
+        columns: &[
+            col("space_id", Text, false),
+            col("retirement_id", Text, false),
+            col("retry_at_ms", Int, false),
+            col("backoff_ms", Int, false),
+        ],
+        indexes: &["idx_blob_gc_retries_due"],
     },
     TableSpec {
         name: "blob_retirement_targets",

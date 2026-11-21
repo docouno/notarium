@@ -26,6 +26,10 @@ pub(crate) const CANONICAL: &str = "db/canonical";
 pub(crate) const CAS_INDEX: &str = "cas/index";
 pub(crate) const CAS_DATA: &str = "cas/data";
 pub(crate) const ZIP_NAMES: [&str; 5] = [MANIFEST, CONTROL, CANONICAL, CAS_INDEX, CAS_DATA];
+// Includes 65,536 JSON histories (35-byte IDs, 16 incarnation bytes and
+// 64-bit sequences), their control cursor IDs, and the bounded keyring report.
+// Restore journals use the same encoding for the rotated histories.
+pub(crate) const MAX_BACKUP_METADATA_JSON_BYTES: usize = 32 * 1024 * 1024;
 pub(crate) const MANIFEST_LIMIT: usize = 64 * 1024;
 pub(crate) const CAS_INDEX_MAGIC: &[u8; 8] = b"NTBCAS1\0";
 pub(crate) const CAS_HEADER_BYTES: u64 = 16;
@@ -37,7 +41,7 @@ pub(crate) fn raw_cas_limit(max_archive_bytes: u64) -> u64 {
 }
 
 pub(crate) fn check_history_count(count: usize) -> Result<(), PortError> {
-    if count > 65_536 {
+    if count > notarium_core::ports::MAX_BACKUP_SPACES {
         return Err(invalid(ValidationReason::BudgetExceeded));
     }
     Ok(())
@@ -239,6 +243,25 @@ pub(crate) fn invalid(reason: ValidationReason) -> PortError {
 
 pub(crate) fn io_error(err: io::Error) -> PortError {
     codec::internal_not_committed("backup_archive_io", err.kind().to_string())
+}
+
+#[cfg(test)]
+pub(crate) fn full_history_fixture() -> Vec<notarium_core::receipt::ChangeCursor> {
+    use notarium_core::{
+        ids::{HistoryIncarnation, SpaceSeq},
+        model::HistoryScope,
+        ports::MAX_BACKUP_SPACES,
+        receipt::ChangeCursor,
+    };
+    (0..MAX_BACKUP_SPACES)
+        .map(|index| ChangeCursor {
+            scope: HistoryScope {
+                space_id: SpaceId::from_bytes((index as u128).to_be_bytes()),
+                incarnation: HistoryIncarnation::from_bytes([255; 16]),
+            },
+            after: SpaceSeq::new(i64::MAX as u64).unwrap(),
+        })
+        .collect()
 }
 
 #[cfg(test)]

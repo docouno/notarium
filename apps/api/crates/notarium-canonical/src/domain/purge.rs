@@ -181,11 +181,13 @@ impl CanonicalStore {
     ) -> Result<(), PortError> {
         let mut after = String::new();
         let mut permanent_failure = None;
+        let mut sweep_retries_woken = false;
         let restored_gc = recovery == RetirementRecovery::RestoredGc;
         let online_epoch = (recovery != RetirementRecovery::Startup).then_some(epoch.get() as i64);
         // The retirement owner can change when a recovery adopts it. The publication's
         // creation epoch stays immutable, including across unsuccessful recovery attempts.
-        const PAGE: &str = "SELECT r.retirement_id FROM blob_retirements r
+        const PAGE: &str = "SELECT r.retirement_id, EXISTS(SELECT 1 FROM blob_gc_retries q
+                WHERE q.space_id=r.space_id AND q.retirement_id=r.retirement_id) FROM blob_retirements r
             WHERE r.space_id=$1 AND r.history_incarnation=$2 AND r.status='pending' AND r.retirement_id>$3
               AND (NOT $5 OR r.reason='gc')
               AND (CAST($4 AS BIGINT) IS NULL OR NOT EXISTS (
@@ -196,14 +198,14 @@ impl CanonicalStore {
             self.inner.check_writer_epoch(&scope.space_id, epoch)?;
             let current = scope.clone();
             let page_after = after.clone();
-            let ids: Vec<String> = self
+            let ids: Vec<(String, bool)> = self
                 .with_read_tx(|tx| {
                     Box::pin(async move {
                         let sid = current.space_id.as_str();
                         let inc = current.incarnation.as_bytes().as_slice();
                         match tx {
                             BackendConn::Sqlite(conn) => {
-                                sqlx::query_scalar(PAGE)
+                                sqlx::query_as(PAGE)
                                     .bind(sid)
                                     .bind(inc)
                                     .bind(page_after)
@@ -213,7 +215,7 @@ impl CanonicalStore {
                                     .await
                             }
                             BackendConn::Postgres(conn) => {
-                                sqlx::query_scalar(PAGE)
+                                sqlx::query_as(PAGE)
                                     .bind(sid)
                                     .bind(inc)
                                     .bind(page_after)
@@ -232,7 +234,15 @@ impl CanonicalStore {
             if ids.is_empty() {
                 return permanent_failure.map_or(Ok(()), Err);
             }
-            for id in ids {
+            for (id, scheduled_gc) in ids {
+                if scheduled_gc {
+                    if !sweep_retries_woken {
+                        self.wake_gc_retries();
+                        sweep_retries_woken = true;
+                    }
+                    after = id;
+                    continue;
+                }
                 let mut attempts = self.schedule_retirements(scope, epoch, vec![id.clone()]);
                 if let Err(error) = crate::blobs::retirement_worker::outcome(&mut attempts[0]).await
                     && error != crate::blobs::held_retirement()

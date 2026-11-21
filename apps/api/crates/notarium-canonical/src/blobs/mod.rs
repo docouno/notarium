@@ -1,4 +1,5 @@
 pub mod gc;
+mod gc_retry;
 pub mod local;
 pub(crate) mod retirement_worker;
 pub mod s3;
@@ -4473,6 +4474,7 @@ async fn finalize_retirement_tx(
         }
     }
 
+    gc_retry::remove_tx(tx, space_id, retirement_id).await?;
     match tx {
         BackendConn::Sqlite(conn) => {
             sqlx::query(

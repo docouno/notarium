@@ -121,6 +121,36 @@ pub struct CommittedExport {
     pub expires_at_ms: i64,
 }
 
+// The (Space, artifact) key names an insert-only publication. Cleanup deletes
+// the row and never reuses its artifact ID. Range reads need only its binding.
+struct ExportBinding {
+    id: ArtifactId,
+    job: JobId,
+    generation: u64,
+    expires: i64,
+}
+
+impl CommittedExport {
+    fn binding(
+        &self,
+        store: &CanonicalStore,
+        scope: &HistoryScope,
+    ) -> Result<ExportBinding, PortError> {
+        if self.object.installation != *store.installation_id()
+            || self.object.scope != *scope
+            || self.object.kind != ArchiveObjectKind::Export
+        {
+            return Err(DomainError::ResourceNotFound.into());
+        }
+        Ok(ExportBinding {
+            id: self.object.id.clone(),
+            job: self.job.clone(),
+            generation: self.privacy_generation,
+            expires: self.expires_at_ms,
+        })
+    }
+}
+
 enum ChunkState {
     Pending,
     Delivered,
@@ -431,9 +461,8 @@ impl CanonicalStore {
         pointer: &CommittedExport,
         handoff: impl FnOnce() -> Result<(), PortError> + Send + 'static,
     ) -> Result<(), PortError> {
+        let binding = pointer.binding(self, scope)?;
         let scope = scope.clone();
-        let generation = pointer.privacy_generation;
-        let expires = pointer.expires_at_ms;
         let deadline = CommandDeadline::start(budget, "handoff_archive_chunk");
         let check = budget.clone();
         let delivery = ChunkDelivery(Arc::new(Mutex::new(ChunkState::Pending)));
@@ -458,11 +487,7 @@ impl CanonicalStore {
                     }
                     let live = load_space_record(tx, &scope.space_id).await?;
                     live.scope.check(&scope)?;
-                    if expires <= job_clock_ms(tx).await?
-                        || privacy_generation_tx(tx, &scope.space_id).await? != generation
-                    {
-                        return Err(DomainError::ResourceNotFound.into());
-                    }
+                    check_publication_tx(tx, &scope.space_id, &binding).await?;
                     // Serialize the synchronous enqueue with revocation of the
                     // caller's wait. An accepted transfer has its own receipt.
                     let mut state = state.lock().unwrap_or_else(|err| err.into_inner());
@@ -492,39 +517,116 @@ impl CanonicalStore {
         let scope = ctx.scope().clone();
         let auth = ctx.auth().clone();
         let id = id.clone();
-        let installation = self.installation_id().clone();
+        let store = self.clone();
         self.with_read_tx_budget(Some(&ctx.budget), |tx| {
             Box::pin(async move {
                 let live = load_space_record(tx, &scope.space_id).await?;
                 live.scope.check(&scope)?;
                 authorize_job_read_on_space(&auth, &live.space)?;
-                let pointer = read_pointer_tx(tx, &scope.space_id, &id).await?;
-                if pointer.expires_at_ms <= job_clock_ms(tx).await?
-                    || pointer.privacy_generation
-                        != privacy_generation_tx(tx, &scope.space_id).await?
-                    || pointer.object.installation != installation
-                    || pointer.object.scope != scope
-                    || pointer.object.id != id
-                    || pointer.object.kind != ArchiveObjectKind::Export
-                {
+                let pointer = store.read_pointer_tx(tx, &scope.space_id, &id).await?;
+                let binding = pointer.binding(&store, &scope)?;
+                if binding.id != id {
                     return Err(DomainError::ResourceNotFound.into());
                 }
-                let (job, _, _, _, erased, _) =
-                    load_job_row_opt_tx(tx, &scope.space_id, &pointer.job)
-                        .await?
-                        .ok_or(DomainError::ResourceNotFound)?;
-                if job.state != notarium_core::ports::JobState::Succeeded
-                    || erased
-                    || !job.artifacts.contains(&id)
-                {
-                    return Err(DomainError::ResourceNotFound.into());
-                }
-                authorize_job_payload_tx(tx, &live.space, &auth, &job).await?;
+                authorize_publication_tx(tx, &live, &binding, &auth, None).await?;
                 Ok(pointer)
             })
         })
         .await
     }
+
+    /// Recheck the opened publication and current visibility for each authority
+    /// in one snapshot. The immutable storage descriptor stays with its reader.
+    pub async fn revalidate_committed_export(
+        &self,
+        ctx: &SpaceContext,
+        origin: Option<&SpaceContext>,
+        pointer: &CommittedExport,
+    ) -> Result<(), PortError> {
+        let scope = ctx.scope().clone();
+        if let Some(origin) = origin {
+            scope.check(origin.scope())?;
+        }
+        let binding = pointer.binding(self, &scope)?;
+        let auth = ctx.auth().clone();
+        let origin = origin.map(|source| source.auth().clone());
+        self.with_read_tx_budget(Some(&ctx.budget), |tx| {
+            Box::pin(async move {
+                let live = load_space_record(tx, &scope.space_id).await?;
+                live.scope.check(&scope)?;
+                authorize_publication_tx(tx, &live, &binding, &auth, origin.as_ref()).await
+            })
+        })
+        .await
+    }
+}
+
+async fn authorize_publication_tx(
+    tx: &mut BackendConn<'_>,
+    live: &crate::SpaceRecord,
+    binding: &ExportBinding,
+    auth: &notarium_core::auth::EngineAuthContext,
+    origin: Option<&notarium_core::auth::EngineAuthContext>,
+) -> Result<(), PortError> {
+    check_publication_tx(tx, &live.scope.space_id, binding).await?;
+    let (job, _, _, _, erased, _) = load_job_row_opt_tx(tx, &live.scope.space_id, &binding.job)
+        .await?
+        .ok_or(DomainError::ResourceNotFound)?;
+    if job.state != notarium_core::ports::JobState::Succeeded
+        || erased
+        || !job.artifacts.contains(&binding.id)
+        || !matches!(
+            job.kind,
+            ContentJobKind::Export { .. } | ContentJobKind::ExportSpace { .. }
+        )
+    {
+        return Err(DomainError::ResourceNotFound.into());
+    }
+    for account in std::iter::once(auth).chain(origin) {
+        authorize_job_read_on_space(account, &live.space)?;
+        authorize_job_payload_tx(tx, &live.space, account, &job).await?;
+    }
+    Ok(())
+}
+
+// Keep the projection entirely before the object blob in the SQLite row.
+const CHECK_PUBLICATION: &str = "SELECT EXISTS(
+        SELECT 1 FROM archive_artifacts a JOIN content_jobs j
+          ON j.space_id=a.space_id AND j.job_id=a.job_id
+        LEFT JOIN archive_privacy p ON p.space_id=a.space_id
+        WHERE a.space_id=$1 AND a.artifact_id=$2 AND a.job_id=$3
+          AND a.privacy_generation=$4 AND COALESCE(p.generation,0)=a.privacy_generation
+          AND a.expires_at_ms=$5 AND a.expires_at_ms>$6
+          AND j.state='succeeded' AND j.job_kind='export' AND j.payload_erased_by_purge=0)";
+
+async fn check_publication_tx(
+    tx: &mut BackendConn<'_>,
+    space: &SpaceId,
+    binding: &ExportBinding,
+) -> Result<(), PortError> {
+    let now = job_clock_ms(tx).await?;
+    macro_rules! check {
+        ($conn:expr) => {
+            sqlx::query_scalar(CHECK_PUBLICATION)
+                .bind(space.as_str())
+                .bind(binding.id.as_str())
+                .bind(binding.job.as_str())
+                .bind(binding.generation as i64)
+                .bind(binding.expires)
+                .bind(now)
+                .fetch_one(&mut **$conn)
+                .await
+        };
+    }
+    let current: bool = match tx {
+        BackendConn::Sqlite(conn) => check!(conn),
+        BackendConn::Postgres(conn) => check!(conn),
+    }
+    .map_err(sql_error)?;
+    if !current {
+        return Err(DomainError::ResourceNotFound.into());
+    }
+    Ok(())
 }
 
 fn authorize_job_write_for_export(
@@ -712,37 +814,51 @@ pub(super) async fn insert_export_pointer_tx(
     .map_err(sql_error)
 }
 
-async fn read_pointer_tx(
-    tx: &mut BackendConn<'_>,
-    space: &SpaceId,
-    artifact: &ArtifactId,
-) -> Result<CommittedExport, PortError> {
-    const SQL: &str = "SELECT job_id, privacy_generation, expires_at_ms, object_msgpack
+impl CanonicalStore {
+    async fn read_pointer_tx(
+        &self,
+        tx: &mut BackendConn<'_>,
+        space: &SpaceId,
+        artifact: &ArtifactId,
+    ) -> Result<CommittedExport, PortError> {
+        const SQL: &str = "SELECT job_id, privacy_generation, expires_at_ms, object_msgpack
         FROM archive_artifacts WHERE space_id=$1 AND artifact_id=$2";
-    let row: Option<(String, i64, i64, Vec<u8>)> = match tx {
-        BackendConn::Sqlite(conn) => {
-            sqlx::query_as(SQL)
-                .bind(space.as_str())
-                .bind(artifact.as_str())
-                .fetch_optional(&mut **conn)
-                .await
+        let row: Option<(String, i64, i64, Vec<u8>)> = match tx {
+            BackendConn::Sqlite(conn) => {
+                sqlx::query_as(SQL)
+                    .bind(space.as_str())
+                    .bind(artifact.as_str())
+                    .fetch_optional(&mut **conn)
+                    .await
+            }
+            BackendConn::Postgres(conn) => {
+                sqlx::query_as(SQL)
+                    .bind(space.as_str())
+                    .bind(artifact.as_str())
+                    .fetch_optional(&mut **conn)
+                    .await
+            }
         }
-        BackendConn::Postgres(conn) => {
-            sqlx::query_as(SQL)
-                .bind(space.as_str())
-                .bind(artifact.as_str())
-                .fetch_optional(&mut **conn)
-                .await
-        }
+        .map_err(sql_error)?;
+        let (job, generation, expires_at_ms, bytes) = row.ok_or(DomainError::ResourceNotFound)?;
+        #[cfg(feature = "test-support")]
+        self.inner
+            .export_descriptor_bytes_read
+            .fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        Ok(CommittedExport {
+            object: decode_msgpack_bounded(&bytes, MAX_MSGPACK_DECODE_BYTES)?,
+            job: JobId::parse(&job)?,
+            privacy_generation: generation as u64,
+            expires_at_ms,
+        })
     }
-    .map_err(sql_error)?;
-    let (job, generation, expires_at_ms, bytes) = row.ok_or(DomainError::ResourceNotFound)?;
-    Ok(CommittedExport {
-        object: decode_msgpack_bounded(&bytes, MAX_MSGPACK_DECODE_BYTES)?,
-        job: JobId::parse(&job)?,
-        privacy_generation: generation as u64,
-        expires_at_ms,
-    })
+
+    #[cfg(feature = "test-support")]
+    pub fn export_descriptor_bytes_read_for_test(&self) -> u64 {
+        self.inner
+            .export_descriptor_bytes_read
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 async fn selected_note_entries(
@@ -1137,4 +1253,49 @@ fn sql_error(err: sqlx::Error) -> PortError {
 
 fn invalid(reason: ValidationReason) -> PortError {
     DomainError::validation(reason).into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CHECK_PUBLICATION;
+    use rusqlite::{
+        Connection,
+        hooks::{AuthAction, AuthContext, Authorization},
+        params,
+    };
+
+    #[test]
+    fn range_fence_checks_a_large_publication_without_reading_its_descriptor() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(crate::schema::SQLITE_BASELINE_DDL)
+            .unwrap();
+        db.execute_batch(
+            "INSERT INTO spaces VALUES('space',zeroblob(16),'root','space','space','personal','owner','active',1,0,'{}',0,0);
+             INSERT INTO content_jobs(space_id,job_id,job_kind,state,lease_epoch,artifacts_json,created_seq,updated_seq)
+               VALUES('space','job','export','succeeded',1,'[]',1,2);
+             INSERT INTO archive_artifacts(space_id,artifact_id,job_id,privacy_generation,expires_at_ms,object_msgpack,object_namespace)
+               VALUES('space','artifact','job',0,1000,zeroblob(647498),zeroblob(32));"
+        ).unwrap();
+        db.authorizer(Some(|event: AuthContext<'_>| match event.action {
+            AuthAction::Read {
+                table_name: "archive_artifacts",
+                column_name: "object_msgpack",
+            } => Authorization::Deny,
+            _ => Authorization::Allow,
+        }))
+        .unwrap();
+        let active = |now| {
+            db.query_row(
+                CHECK_PUBLICATION,
+                params!["space", "artifact", "job", 0, 1000, now],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap()
+        };
+        assert!(active(999));
+        assert!(!active(1000));
+        db.execute("UPDATE content_jobs SET payload_erased_by_purge=1", [])
+            .unwrap();
+        assert!(!active(999));
+    }
 }

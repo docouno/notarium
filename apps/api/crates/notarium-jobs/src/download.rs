@@ -72,7 +72,10 @@ impl ArchiveJobs {
                 .await?;
             live_origin.budget = request.remaining()?;
             request
-                .wait(self.store.open_committed_export(live_origin, artifact))
+                .wait(
+                    self.store
+                        .revalidate_committed_export(&live_origin, None, &pointer),
+                )
                 .await?;
         }
         let file = request
@@ -154,35 +157,32 @@ impl ArchiveDownload {
             .control
             .register_archive_job(request.remaining()?, &self.caller)
             .await?;
-        let id = &self.pointer.object.id;
-        let source_registration = if self.origin != self.caller {
-            let (mut source, registration) = self
-                .jobs
-                .control
-                .register_archive_job(request.remaining()?, &self.origin)
-                .await?;
-            source.budget = request.remaining()?;
-            request
-                .wait(self.jobs.store.open_committed_export(source, id))
-                .await?;
-            Some(registration)
+        let source = if self.origin != self.caller {
+            Some(
+                self.jobs
+                    .control
+                    .register_archive_job(request.remaining()?, &self.origin)
+                    .await?,
+            )
         } else {
             None
         };
         ctx.budget = request.remaining()?;
-        let current = request
-            .wait(self.jobs.store.open_committed_export(ctx.clone(), id))
+        request
+            .wait(self.jobs.store.revalidate_committed_export(
+                &ctx,
+                source.as_ref().map(|(ctx, _)| ctx),
+                &self.pointer,
+            ))
             .await?;
-        if current.object != self.pointer.object || current.job != self.pointer.job {
-            return Err(DomainError::ResourceNotFound.into());
-        }
+        let source_registration = source.map(|(_, lease)| lease);
         let bytes = request
             .wait(async {
                 let mut file = self.file.lock().await;
                 self.jobs
                     .artifacts
                     .download_chunk(
-                        &current.object,
+                        &self.pointer.object,
                         &mut file,
                         offset,
                         bytes,
@@ -194,7 +194,7 @@ impl ArchiveDownload {
         let budget = request.remaining()?;
         self.jobs
             .store
-            .handoff_export_chunk(&budget, ctx.scope(), &current, move || {
+            .handoff_export_chunk(&budget, ctx.scope(), &self.pointer, move || {
                 request.check()?;
                 registration.check()?;
                 if let Some(source_registration) = &source_registration {

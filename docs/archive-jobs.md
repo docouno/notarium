@@ -10,10 +10,13 @@ use job IDs and artifact IDs without exposing storage paths or object keys.
 Use `ArchiveJobs::stage_import` to seal an upload, then `ArchiveJobs::enqueue`
 to submit the returned artifact. Upload and enqueue each use one caller deadline
 across authority checks, storage and canonical admission. The same enqueue method
-accepts explicit note selection or a whole-Space export. The worker revalidates
-the submitting credential and Space grant at claim and during execution. The
-default runner
-admits one import and one export on its own runtime with a bounded blocking pool.
+accepts explicit note selection or a whole-Space export. A job's encoded input,
+including its delegation, must fit within 4 MiB. Enqueue returns `BudgetExceeded`
+before creating a job when the input exceeds this limit. A worker marks an
+oversized export left by an earlier writer as failed and continues processing
+the queue. The worker revalidates the submitting credential and Space grant at
+claim and during execution. The default runner admits one import and one export
+on its own runtime with a bounded blocking pool.
 Each worker polls its class for Spaces with queued jobs or reclaimable leases.
 The canonical writer fences job progress and terminal results by lease owner,
 both the job and Space epochs, and lease expiry. It retains the authority
@@ -63,8 +66,10 @@ retains the winning import plan across lease changes and retires abandoned
 generations in their own namespace.
 
 `ArchiveJobs::open_export` returns an authorized reader with a bounded
-`read_chunk` method. Check its metadata for content length and expiry. Each
-chunk checks explicit revocation and natural credential expiry for both the
+`read_chunk` method. Its metadata includes content length and expiry. The reader
+loads the immutable segment descriptors once at open. Each chunk rechecks its
+publication, job state and current access to the selected content. It checks
+explicit revocation and natural credential expiry for both the
 caller and the original exporter at handoff, inside the canonical privacy
 fence. A successful enqueue into a reserved transport slot is the receipt for
 that chunk. Archive bytes already handed off belong to the caller. An artifact
@@ -87,8 +92,10 @@ retirement after 24 hours and 5 minutes. The canonical transaction checks the
 publication identity, active writer epoch, staged tickets, references and holds
 again. Reacquisition of a reference resets its quarantine. Canonical retirement
 workers own the physical operation and recover durable work after interruption.
-Each store admits up to four ordinary sweep retirements at once. When all four
-slots are in use, mature entries stay eligible for the next sweep. Startup and
+Each store admits up to four physical sweep attempts at once. When all four
+slots are in use, mature entries stay eligible for the next sweep. A failed
+attempt releases its slot and records the next retry time in SQL. One dispatcher
+visits the pending retirements in bounded pages across Spaces. Startup and
 lease recovery resume sealed work and preserve immediate cleanup obligations
 from pre-quarantine catalogs.
 
@@ -142,7 +149,14 @@ recover its own spool after a process exits.
 Packing uses a private, installation-specific work directory beside the destination.
 A subsequent backup to the same parent reclaims marked packing attempts whose
 owner has exited. On Unix the published ZIP is created with mode `0600`.
-The paired archive format supports up to 65,536 Spaces.
+The paired archive format supports up to 65,536 Spaces within the configured
+time and storage budgets. Each SQLite image is limited to 10 GiB. Backup
+and verification stream inline collaboration snapshots through incremental
+SQLite BLOB reads in 64 KiB chunks. This supports values above the verifier’s
+32 MiB limit on materialized SQL values. The PostgreSQL
+canonical spool bounds the history witness separately from its row budget.
+SQLite verifier reports and Local and Cloud restore journals allow up to
+32 MiB of JSON metadata.
 Paired backup reserves capacity before preparing the databases. The spool
 digest check, CAS scanning and packing, and live verification use owned native
 workers. The scanner and writer can run together even when the caller's

@@ -494,6 +494,12 @@ impl BackendCase {
                 .execute(&mut *tx)
                 .await
                 .unwrap();
+            if decoded.schema_version < 8 {
+                sqlx::query("DROP TABLE blob_gc_retries")
+                    .execute(&mut *tx)
+                    .await
+                    .unwrap();
+            }
             if decoded.schema_version < 7 {
                 sqlx::raw_sql(
                     "DROP TABLE archive_export_shadows, archive_export_cuts, archive_artifacts,

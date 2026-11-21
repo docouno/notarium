@@ -19,8 +19,8 @@ use notarium_core::{
     ids::{ContentDigest, HistoryIncarnation, InstallationId, SpaceId, SpaceSeq},
     model::HistoryScope,
     ports::{
-        BackupArtifactKind, CallBudget, KeyCanary, MaintenanceContext, ServiceAuthority,
-        ServicePurpose,
+        BackupArtifactKind, CallBudget, KeyCanary, MAX_BACKUP_KEYS, MaintenanceContext,
+        ServiceAuthority, ServicePurpose,
     },
     receipt::ChangeCursor,
 };
@@ -44,8 +44,6 @@ use crate::{
     sqlite_range::{sql_error, with_database},
     zip_layout::{EntrySpan, ZipLimits, open_zip},
 };
-
-const MAX_DB_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 
 pub(crate) trait SeekRead: Read + Seek + Send {}
 impl<T: Read + Seek + Send> SeekRead for T {}
@@ -348,11 +346,14 @@ fn verify_databases(
     })
 }
 
+// A native key ID, hash, state and sealed canary together fit in 256 bytes.
+const MAX_BACKUP_KEY_FIELDS_BYTES: usize = MAX_BACKUP_KEYS * 256;
+
 #[derive(serde::Deserialize, serde::Serialize)]
 pub(crate) struct SqliteFacts {
-    keys: Vec<BackupKeyRow>,
-    histories: Vec<ChangeCursor>,
-    control_cursors: BTreeSet<SpaceId>,
+    pub(crate) keys: Vec<BackupKeyRow>,
+    pub(crate) histories: Vec<ChangeCursor>,
+    pub(crate) control_cursors: BTreeSet<SpaceId>,
 }
 
 pub(crate) fn inspect_sqlite(
@@ -363,99 +364,85 @@ pub(crate) fn inspect_sqlite(
     index: Option<&mut CasIndex>,
 ) -> Result<SqliteFacts, PortError> {
     let mut control_cursors = BTreeSet::new();
-    let keys = with_database(
-        control,
-        manifest.control.bytes,
-        MAX_DB_BYTES,
-        cancellation,
-        |db| {
-            check_sqlite_control(db)?;
-            check_integrity(db)?;
-            let (install, epoch, state): (String, i64, String) = db.query_row(
+    let keys = with_database(control, manifest.control.bytes, cancellation, |db| {
+        check_sqlite_control(db)?;
+        check_integrity(db)?;
+        let (install, epoch, state): (String, i64, String) = db.query_row(
             "SELECT installation_id,epoch_version,state FROM v1_storage_epoch WHERE singleton=1",
             [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
         ).map_err(sql_error)?;
-            if install != manifest.installation.as_str()
-                || epoch != i64::from(SUPPORTED_V1_EPOCH)
-                || state != "ready"
-            {
-                return Err(invalid(ValidationReason::InvalidState));
-            }
-            for sql in [
-                "SELECT DISTINCT space_id FROM mcp_delta_owner_cursors",
-                "SELECT DISTINCT space_id FROM mcp_delta_session_cursors",
-            ] {
-                let mut query = db.prepare(sql).map_err(sql_error)?;
-                let mut rows = query.query([]).map_err(sql_error)?;
-                while let Some(row) = rows.next().map_err(sql_error)? {
-                    let id: String = row.get(0).map_err(sql_error)?;
-                    record_cursor(&mut control_cursors, &id)?;
-                }
-            }
-            let mut controls = db
-                .prepare(
-                    "SELECT key_id,key_hash,generation,state,canary FROM secret_keyring
-             WHERE retired_at IS NULL ORDER BY generation LIMIT 4097",
-                )
-                .map_err(sql_error)?;
-            let mut rows = controls.query([]).map_err(sql_error)?;
-            let mut keys = Vec::new();
-            let mut bytes = 0;
+        if install != manifest.installation.as_str()
+            || epoch != i64::from(SUPPORTED_V1_EPOCH)
+            || state != "ready"
+        {
+            return Err(invalid(ValidationReason::InvalidState));
+        }
+        for sql in [
+            "SELECT DISTINCT space_id FROM mcp_delta_owner_cursors",
+            "SELECT DISTINCT space_id FROM mcp_delta_session_cursors",
+        ] {
+            let mut query = db.prepare(sql).map_err(sql_error)?;
+            let mut rows = query.query([]).map_err(sql_error)?;
             while let Some(row) = rows.next().map_err(sql_error)? {
-                let key = BackupKeyRow {
-                    key_id: row.get(0).map_err(sql_error)?,
-                    key_hash: row.get(1).map_err(sql_error)?,
-                    generation: row.get(2).map_err(sql_error)?,
-                    state: row.get(3).map_err(sql_error)?,
-                    canary: row.get(4).map_err(sql_error)?,
-                };
-                bytes += key.key_id.len() + key.key_hash.len() + key.state.len() + key.canary.len();
-                if keys.len() >= 4096 || bytes > 1024 * 1024 {
-                    return Err(invalid(ValidationReason::BudgetExceeded));
-                }
-                keys.push(key);
+                let id: String = row.get(0).map_err(sql_error)?;
+                record_cursor(&mut control_cursors, &id)?;
             }
-            Ok(keys)
-        },
-    )?;
-    let histories = with_database(
-        canonical,
-        manifest.canonical.bytes,
-        MAX_DB_BYTES,
-        cancellation,
-        |db| {
-            let (install, epoch, version, checksum, state): (String, i64, u32, Vec<u8>, String) = db.query_row(
+        }
+        let mut controls = db
+            .prepare(
+                "SELECT key_id,key_hash,generation,state,canary FROM secret_keyring
+             WHERE retired_at IS NULL ORDER BY generation LIMIT 4097",
+            )
+            .map_err(sql_error)?;
+        let mut rows = controls.query([]).map_err(sql_error)?;
+        let mut keys = Vec::new();
+        let mut bytes = 0;
+        while let Some(row) = rows.next().map_err(sql_error)? {
+            let key = BackupKeyRow {
+                key_id: row.get(0).map_err(sql_error)?,
+                key_hash: row.get(1).map_err(sql_error)?,
+                generation: row.get(2).map_err(sql_error)?,
+                state: row.get(3).map_err(sql_error)?,
+                canary: row.get(4).map_err(sql_error)?,
+            };
+            bytes += key.key_id.len() + key.key_hash.len() + key.state.len() + key.canary.len();
+            if keys.len() >= MAX_BACKUP_KEYS || bytes > MAX_BACKUP_KEY_FIELDS_BYTES {
+                return Err(invalid(ValidationReason::BudgetExceeded));
+            }
+            keys.push(key);
+        }
+        Ok(keys)
+    })?;
+    let histories = with_database(canonical, manifest.canonical.bytes, cancellation, |db| {
+        let (install, epoch, version, checksum, state): (String, i64, u32, Vec<u8>, String) = db.query_row(
             "SELECT installation_id,epoch_version,schema_version,manifest_checksum,migration_state
              FROM schema_meta WHERE singleton_id=1",
             [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
         ).map_err(sql_error)?;
-            verify_schema_witness(version, &checksum)?;
-            if install != manifest.installation.as_str()
-                || epoch != i64::from(SUPPORTED_V1_EPOCH)
-                || state != "ready"
-            {
-                return Err(invalid(ValidationReason::InvalidState));
-            }
-            check_sqlite_canonical(db, version)?;
-            check_integrity(db)?;
-            verify_sqlite_references(db, index)?;
-            let mut query = db
-                .prepare(
-                    "SELECT space_id,history_incarnation,last_seq FROM spaces ORDER BY space_id",
-                )
-                .map_err(sql_error)?;
-            let mut rows = query.query([]).map_err(sql_error)?;
-            let mut history = Vec::new();
-            while let Some(row) = rows.next().map_err(sql_error)? {
-                let space: String = row.get(0).map_err(sql_error)?;
-                let incarnation: Vec<u8> = row.get(1).map_err(sql_error)?;
-                let seq: i64 = row.get(2).map_err(sql_error)?;
-                history.push(cursor(&space, &incarnation, seq)?);
-                check_history_count(history.len())?;
-            }
-            Ok(history)
-        },
-    )?;
+        verify_schema_witness(version, &checksum)?;
+        if install != manifest.installation.as_str()
+            || epoch != i64::from(SUPPORTED_V1_EPOCH)
+            || state != "ready"
+        {
+            return Err(invalid(ValidationReason::InvalidState));
+        }
+        check_sqlite_canonical(db, version)?;
+        check_integrity(db)?;
+        verify_sqlite_references(db, index, cancellation)?;
+        let mut query = db
+            .prepare("SELECT space_id,history_incarnation,last_seq FROM spaces ORDER BY space_id")
+            .map_err(sql_error)?;
+        let mut rows = query.query([]).map_err(sql_error)?;
+        let mut history = Vec::new();
+        while let Some(row) = rows.next().map_err(sql_error)? {
+            let space: String = row.get(0).map_err(sql_error)?;
+            let incarnation: Vec<u8> = row.get(1).map_err(sql_error)?;
+            let seq: i64 = row.get(2).map_err(sql_error)?;
+            history.push(cursor(&space, &incarnation, seq)?);
+            check_history_count(history.len())?;
+        }
+        Ok(history)
+    })?;
     Ok(SqliteFacts {
         keys,
         histories,
@@ -494,6 +481,7 @@ fn check_integrity(db: &Connection) -> Result<(), PortError> {
 pub(crate) fn verify_sqlite_references(
     db: &Connection,
     mut index: Option<&mut CasIndex>,
+    cancellation: &notarium_core::ports::Cancellation,
 ) -> Result<(), PortError> {
     let missing_root: bool = db
         .query_row(
@@ -510,7 +498,7 @@ pub(crate) fn verify_sqlite_references(
     if missing_root {
         return Err(invalid(ValidationReason::InvalidState));
     }
-    check_sqlite_blob_owners(db)?;
+    check_sqlite_blob_owners(db, cancellation)?;
     let lost: bool = db.query_row(
         "SELECT EXISTS (SELECT 1 FROM blob_references r
             LEFT JOIN blob_catalog c ON c.space_id=r.space_id AND c.content_blake3=r.content_blake3
@@ -603,7 +591,7 @@ fn verify_control_spool(
                     return Err(invalid(ValidationReason::InvalidArchive));
                 }
                 key_bytes += key_id.len() + key_hash.len() + state.len() + canary.len();
-                if keys.len() >= 4096 || key_bytes > 1024 * 1024 {
+                if keys.len() >= MAX_BACKUP_KEYS || key_bytes > MAX_BACKUP_KEY_FIELDS_BYTES {
                     return Err(invalid(ValidationReason::BudgetExceeded));
                 }
                 keys.push(BackupKeyRow {
@@ -1092,6 +1080,6 @@ mod tests {
             .unwrap(),
             0,
         );
-        assert!(verify_sqlite_references(&db, None).is_err());
+        assert!(verify_sqlite_references(&db, None, &Default::default()).is_err());
     }
 }

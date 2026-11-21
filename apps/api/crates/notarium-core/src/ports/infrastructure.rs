@@ -634,6 +634,11 @@ pub trait RevocationLease: Send {
     fn check(&self) -> Result<(), crate::error::PortError>;
 }
 
+/// Format limits shared by paired backup producers and consumers.
+pub const MAX_BACKUP_SPACES: usize = 65_536;
+pub const MAX_BACKUP_KEYS: usize = 4096;
+pub const MAX_BACKUP_SQLITE_IMAGE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+
 #[derive(Clone, Copy, Debug)]
 pub struct BackupBudget {
     pub deadline: Duration,
@@ -662,7 +667,10 @@ impl BackupBudget {
             (
                 BackupRetentionBudget::SqliteWal { max_pinned_bytes },
                 BackupRetentionProgress::SqliteWal { pinned_bytes },
-            ) => pinned_bytes > max_pinned_bytes,
+            ) => {
+                pinned_bytes > max_pinned_bytes
+                    || progress.spool_bytes > MAX_BACKUP_SQLITE_IMAGE_BYTES
+            }
             (
                 BackupRetentionBudget::PostgresSnapshot { max_age },
                 BackupRetentionProgress::PostgresSnapshot { age },

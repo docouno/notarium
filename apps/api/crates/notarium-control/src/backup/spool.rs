@@ -6,7 +6,7 @@ use crate::{
 use notarium_core::{
     error::{PortError, ValidationReason},
     ids::ContentDigest,
-    ports::BackupWitness,
+    ports::{BackupWitness, MAX_BACKUP_KEYS},
 };
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
@@ -71,7 +71,7 @@ impl<R: Read> SpoolReader<R> {
             || witness.schema_version != schema
             || !witness.histories.is_empty()
             || witness.canaries.is_empty()
-            || witness.canaries.len() > 4096
+            || witness.canaries.len() > MAX_BACKUP_KEYS
         {
             return Err(invalid_stream());
         }

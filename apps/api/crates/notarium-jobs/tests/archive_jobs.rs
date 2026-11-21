@@ -17,7 +17,7 @@ use notarium_core::{
     epoch::{DataRoot, EpochClassification, EpochReason, StorageEpochState},
     error::{PortError, ValidationReason},
     ids::*,
-    model::HistoryScope,
+    model::{HistoryScope, Lifecycle},
     ports::*,
     receipt::{CausalBasis, CommandIdentity, ReceiptSet},
 };
@@ -587,7 +587,19 @@ async fn exercise_local_archive_worker(entries: usize) {
     eprintln!("export of {entries} linked notes: {:?}", started.elapsed());
     assert_eq!(exported.state, JobState::Succeeded);
     let id = &exported.artifacts[0];
+    let encoded_len = |artifact: &ArtifactId| -> u64 {
+        let bytes: i64 = rusqlite::Connection::open(root.canonical()).unwrap().query_row(
+            "SELECT length(object_msgpack) FROM archive_artifacts WHERE space_id=?1 AND artifact_id=?2",
+            rusqlite::params![scope.space_id.as_str(), artifact.as_str()], |row| row.get(0),
+        ).unwrap();
+        u64::try_from(bytes).unwrap()
+    };
+    let descriptor_before = store.export_descriptor_bytes_read_for_test();
     let download = open_export_during_stalled_fsck(&jobs, ctx.clone(), id, root).await;
+    assert_eq!(
+        store.export_descriptor_bytes_read_for_test() - descriptor_before,
+        encoded_len(id)
+    );
     if entries == 201 {
         let expires = clock.now.load(Ordering::SeqCst) + 86_400_000;
         let pat = control_service
@@ -620,11 +632,17 @@ async fn exercise_local_archive_worker(entries: usize) {
             .unwrap()
             .value;
         let exported_by_pat = terminal(&store, &pat_ctx, &job).await;
+        let descriptor_before = store.export_descriptor_bytes_read_for_test();
         let as_caller = jobs.open_export(pat_ctx, id).await.unwrap();
         let as_origin = jobs
             .open_export(ctx.clone(), &exported_by_pat.artifacts[0])
             .await
             .unwrap();
+        let admitted_bytes = store.export_descriptor_bytes_read_for_test();
+        assert_eq!(
+            admitted_bytes - descriptor_before,
+            encoded_len(id) + encoded_len(&exported_by_pat.artifacts[0])
+        );
         let before_expiry = clock.now.load(Ordering::SeqCst);
         for reader in [as_caller, as_origin] {
             *registry.advance_at_handoff.lock().unwrap() = Some(expires);
@@ -638,8 +656,13 @@ async fn exercise_local_archive_worker(entries: usize) {
             ));
             assert!(recv.try_recv().is_err());
             clock.now.store(before_expiry, Ordering::SeqCst);
+            assert_eq!(
+                store.export_descriptor_bytes_read_for_test(),
+                admitted_bytes
+            );
         }
     }
+    let admitted_bytes = store.export_descriptor_bytes_read_for_test();
     let metadata = download.metadata();
     let (sender, mut chunks) = tokio::sync::mpsc::channel(1);
     download
@@ -661,6 +684,10 @@ async fn exercise_local_archive_worker(entries: usize) {
         assert!(!part.is_empty());
         bytes.extend_from_slice(&part);
     }
+    assert_eq!(
+        store.export_descriptor_bytes_read_for_test(),
+        admitted_bytes
+    );
     assert!(bytes.ends_with(&last));
     assert_eq!(metadata.etag.as_bytes(), blake3::hash(&bytes).as_bytes());
     let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
@@ -940,51 +967,135 @@ async fn check_import_admission(
         ValidationReason::BudgetExceeded
     );
 
-    let (id, bytes): (String, Vec<u8>) = db
-        .query_row(
-            "SELECT n.note_id,r.metadata_msgpack FROM note_heads n JOIN revisions r
-         ON r.space_id=n.space_id AND r.rev_id=n.head_rev_id WHERE n.slug='writer-a'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .unwrap();
-    let mut envelope = codec::RevisionMetadataEnvelope::decode(&bytes).unwrap();
-    let codec::RevisionMetadataPayload::Note(note) = &mut envelope.payload else {
-        panic!("expected a note")
-    };
-    note.title = "x".repeat(codec::MAX_MSGPACK_DECODE_BYTES);
-    let excess = codec::encode_msgpack(&envelope).unwrap().len() - codec::MAX_MSGPACK_DECODE_BYTES;
-    let codec::RevisionMetadataPayload::Note(note) = &mut envelope.payload else {
-        unreachable!()
-    };
-    note.title
-        .truncate(codec::MAX_MSGPACK_DECODE_BYTES - excess);
-    let encoded = envelope.encode().unwrap();
-    assert_eq!(encoded.len(), codec::MAX_MSGPACK_DECODE_BYTES);
-    assert_eq!(
-        codec::RevisionMetadataEnvelope::decode(&encoded).unwrap(),
-        envelope
-    );
-    let codec::RevisionMetadataPayload::Note(note) = &mut envelope.payload else {
-        unreachable!()
-    };
-    note.title.push('x');
-    assert!(
-        matches!(envelope.encode(), Err(PortError::Domain(DomainError::ValidationFailed { diagnostic })) if diagnostic.reason == ValidationReason::BudgetExceeded)
-    );
-    store
-        .delete_note(
-            ctx.clone(),
-            mutation(
-                ctx,
-                DeleteNote {
-                    note: NoteId::parse(&id).unwrap(),
-                    disposition: DeleteDisposition::Trash,
-                },
-            ),
-        )
-        .await
-        .unwrap();
+    check_imported_lifecycle_boundary(jobs, store, ctx, &db).await;
+}
+
+async fn check_imported_lifecycle_boundary(
+    jobs: &ArchiveJobs,
+    store: &CanonicalStore,
+    ctx: &SpaceContext,
+    db: &rusqlite::Connection,
+) {
+    // The title and its digest fill exactly 4 MiB with the original named Active
+    // state and slug "a". The one-byte state frees six bytes, exactly the
+    // growth of slug and slug_fold when the slug is "aaaa".
+    let carrier = format!("# b{}aa", "漢".repeat(1_397_971));
+    let limit = codec::MAX_MSGPACK_DECODE_BYTES;
+    for (slug, legacy) in [("a", true), ("aaaa", false)] {
+        let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        archive
+            .start_file(
+                format!("{slug}.md"),
+                zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored),
+            )
+            .unwrap();
+        archive.write_all(carrier.as_bytes()).unwrap();
+        let job = import(jobs, store, ctx, &archive.finish().unwrap().into_inner()).await;
+        assert_eq!((job.state, job.completed_units), (JobState::Succeeded, 1));
+
+        let (id, revision, bytes): (String, String, Vec<u8>) = db.query_row(
+            "SELECT n.note_id,n.head_rev_id,r.metadata_msgpack FROM note_heads n JOIN revisions r
+             ON r.space_id=n.space_id AND r.rev_id=n.head_rev_id WHERE n.space_id=?1 AND n.slug=?2",
+            [ctx.scope().space_id.as_str(), slug],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        let id = NoteId::parse(&id).unwrap();
+        if legacy {
+            let mut wire: serde_json::Value = codec::decode_msgpack_bounded(&bytes, limit).unwrap();
+            assert_eq!(wire["payload"]["data"]["lifecycle"], 0);
+            let compact = codec::RevisionMetadataEnvelope::decode(&bytes).unwrap();
+            // A generic map encoder may emit the payload before its kind.
+            let reordered = codec::encode_msgpack(&wire).unwrap();
+            assert_eq!(
+                codec::RevisionMetadataEnvelope::decode(&reordered).unwrap(),
+                compact
+            );
+            wire["payload"]["data"]["lifecycle"] = serde_json::json!("Active");
+            let original = codec::encode_msgpack(&wire).unwrap();
+            assert_eq!(original.len(), limit);
+            assert_eq!(
+                codec::RevisionMetadataEnvelope::decode(&original).unwrap(),
+                compact
+            );
+            assert_eq!(
+                db.execute(
+                    "UPDATE revisions SET metadata_msgpack=?1 WHERE rev_id=?2 AND space_id=?3",
+                    rusqlite::params![original, revision, ctx.scope().space_id.as_str()],
+                )
+                .unwrap(),
+                1
+            );
+        } else {
+            assert_eq!(bytes.len(), limit);
+            let mut envelope = codec::RevisionMetadataEnvelope::decode(&bytes).unwrap();
+            assert_eq!(envelope.encode().unwrap(), bytes);
+            for state in [Lifecycle::Active, Lifecycle::Trashed, Lifecycle::Purged] {
+                let codec::RevisionMetadataPayload::Note(note) = &mut envelope.payload else {
+                    panic!("expected a note")
+                };
+                note.lifecycle = state;
+                let encoded = envelope.encode().unwrap();
+                assert_eq!(encoded.len(), limit);
+                assert_eq!(
+                    codec::RevisionMetadataEnvelope::decode(&encoded).unwrap(),
+                    envelope
+                );
+            }
+            let codec::RevisionMetadataPayload::Note(note) = &mut envelope.payload else {
+                panic!("expected a note")
+            };
+            note.title.push('x');
+            assert!(
+                matches!(envelope.encode(), Err(PortError::Domain(DomainError::ValidationFailed { diagnostic })) if diagnostic.reason == ValidationReason::BudgetExceeded)
+            );
+        }
+        let mut current = RevisionId::parse(&revision).unwrap();
+        for (disposition, expected) in [
+            (None, Lifecycle::Active),
+            (Some(DeleteDisposition::Trash), Lifecycle::Trashed),
+            (Some(DeleteDisposition::Restore), Lifecycle::Active),
+        ] {
+            if let Some(disposition) = disposition {
+                let committed = store
+                    .delete_note(
+                        ctx.clone(),
+                        mutation(
+                            ctx,
+                            DeleteNote {
+                                note: id.clone(),
+                                disposition,
+                            },
+                        ),
+                    )
+                    .await
+                    .unwrap();
+                current = committed.value.revision;
+                let size: i64 = db.query_row(
+                    "SELECT length(metadata_msgpack) FROM revisions WHERE space_id=?1 AND rev_id=?2",
+                    [ctx.scope().space_id.as_str(), current.as_str()],
+                    |row| row.get(0),
+                ).unwrap();
+                assert_eq!(usize::try_from(size).unwrap(), bytes.len());
+            }
+            let snapshot = store
+                .get_note(
+                    ctx.clone(),
+                    GetNote {
+                        note: id.clone(),
+                        revision: Some(current.clone()),
+                        causal: CausalBasis::Exact(ReceiptSet::default()),
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(snapshot.document.lifecycle(), expected);
+            assert_eq!(
+                snapshot.document.explicit_read(ctx.auth()).unwrap(),
+                carrier
+            );
+        }
+    }
 }
 
 async fn stage_import_shares_the_upload_deadline(

@@ -22,7 +22,7 @@ use notarium_core::{
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::{
-    backup_format::{Manifest, invalid, io_error},
+    backup_format::{MAX_BACKUP_METADATA_JSON_BYTES, Manifest, invalid, io_error},
     fsck::{ArchiveRange, CasIndex, SeekRead, SqliteFacts, inspect_sqlite},
     import::check_cancelled,
     range_source::RangeSource,
@@ -31,7 +31,6 @@ use crate::{
 
 pub const SQLITE_VERIFIER_ARGUMENT: &str = "--internal-verify-sqlite-archive";
 const HELLO: &[u8] = b"NOTARIUM_SQLITE_VERIFY_1\n";
-const MAX_FRAME: usize = 12 * 1024 * 1024;
 const MAX_READ: usize = 128 * 1024;
 const DEFAULT_HEAP_BYTES: u64 = 80 * 1024 * 1024;
 
@@ -317,7 +316,7 @@ fn read_message<R: DeserializeOwned>(source: &mut impl Read) -> Result<R, PortEr
     let mut header = [0; 4];
     source.read_exact(&mut header).map_err(io_error)?;
     let len = u32::from_be_bytes(header) as usize;
-    if !(1..=MAX_FRAME).contains(&len) {
+    if !(1..=MAX_BACKUP_METADATA_JSON_BYTES).contains(&len) {
         return Err(invalid(ValidationReason::BudgetExceeded));
     }
     let mut body = vec![0; len];
@@ -327,7 +326,7 @@ fn read_message<R: DeserializeOwned>(source: &mut impl Read) -> Result<R, PortEr
 
 fn write_message(output: &mut impl Write, value: &impl Serialize) -> Result<(), PortError> {
     let body = serde_json::to_vec(value).map_err(|_| invalid(ValidationReason::InvalidState))?;
-    if body.len() > MAX_FRAME {
+    if body.len() > MAX_BACKUP_METADATA_JSON_BYTES {
         return Err(invalid(ValidationReason::BudgetExceeded));
     }
     output
@@ -342,5 +341,69 @@ fn validate_heap(bytes: u64) -> Result<(), PortError> {
         Ok(())
     } else {
         Err(invalid(ValidationReason::InvalidLimit))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use notarium_control::keyring::BackupKeyRow;
+    use notarium_core::{
+        ids::KeyId,
+        ports::{MAX_BACKUP_KEYS, MAX_BACKUP_SPACES},
+    };
+
+    #[test]
+    fn full_history_cursor_and_key_report_round_trips() {
+        let histories = crate::backup_format::full_history_fixture();
+        let control_cursors = histories.iter().map(|c| c.scope.space_id.clone()).collect();
+        let vector: serde_json::Value = serde_json::from_str(include_str!(
+            "../../notarium-control/tests/fixtures/keyring/vectors.json"
+        ))
+        .unwrap();
+        let keys = (0..MAX_BACKUP_KEYS)
+            .map(|index| {
+                let mut id = [255; 12];
+                id[..8].copy_from_slice(&(index as u64).to_be_bytes());
+                let key_id = KeyId::from_derived(id).as_str().to_owned();
+                let key = BackupKeyRow {
+                    canary: vector["canaryEnvelope"]
+                        .as_str()
+                        .unwrap()
+                        .replace(vector["keyId"].as_str().unwrap(), &key_id),
+                    key_id,
+                    key_hash: vector["keyHash"].as_str().unwrap().to_owned(),
+                    generation: i64::MAX - (MAX_BACKUP_KEYS - 1 - index) as i64,
+                    state: if index == MAX_BACKUP_KEYS - 1 {
+                        "active"
+                    } else {
+                        "readable"
+                    }
+                    .into(),
+                };
+                assert!(
+                    key.key_id.len() + key.key_hash.len() + key.canary.len() + key.state.len()
+                        <= 256
+                );
+                key
+            })
+            .collect();
+        let report = Report::Verified {
+            facts: SqliteFacts {
+                keys,
+                histories,
+                control_cursors,
+            },
+            peak: DEFAULT_HEAP_BYTES,
+        };
+        let mut frame = Vec::new();
+        write_message(&mut frame, &report).unwrap();
+        assert!(frame.len() > 12 * 1024 * 1024);
+        let Report::Verified { facts, .. } = read_message(&mut &frame[..]).unwrap() else {
+            panic!("verified report")
+        };
+        assert_eq!(facts.histories.len(), MAX_BACKUP_SPACES);
+        assert_eq!(facts.control_cursors.len(), MAX_BACKUP_SPACES);
+        assert_eq!(facts.keys.len(), MAX_BACKUP_KEYS);
     }
 }

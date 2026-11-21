@@ -17,7 +17,7 @@ use std::{io::Read, path::Path};
 use zeroize::Zeroizing;
 
 const MAX_FILE: usize = 16 * 1024;
-pub(super) const MAX_KEYS: usize = 4096;
+pub(super) use notarium_core::ports::MAX_BACKUP_KEYS as MAX_KEYS;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

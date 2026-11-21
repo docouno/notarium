@@ -41,6 +41,7 @@ pub async fn import_postgres_spool(
                     | "archive_import_sources"
                     | "backup_artifacts"
                     | "backup_holds"
+                    | "blob_gc_retries"
                     | "blob_retirements"
                     | "blob_retirement_targets"
                     | "pending_purges"

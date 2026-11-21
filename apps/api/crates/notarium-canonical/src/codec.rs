@@ -443,6 +443,40 @@ pub enum RevisionMetadataPayload {
     AgentRun(AgentRunRevisionMetadata),
 }
 
+// V1 readers accept both the original names and the MessagePack enum indices.
+// Each lifecycle transition must fit the same metadata budget as its source.
+fn serialize_note_lifecycle<S: serde::Serializer>(
+    lifecycle: &Lifecycle,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    if serializer.is_human_readable() {
+        return lifecycle.serialize(serializer);
+    }
+    serializer.serialize_u8(match lifecycle {
+        Lifecycle::Active => 0,
+        Lifecycle::Trashed => 1,
+        Lifecycle::Purged => 2,
+    })
+}
+
+fn deserialize_note_lifecycle<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Lifecycle, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StoredLifecycle {
+        Index(u8),
+        Name(Lifecycle),
+    }
+    match StoredLifecycle::deserialize(deserializer)? {
+        StoredLifecycle::Index(0) => Ok(Lifecycle::Active),
+        StoredLifecycle::Index(1) => Ok(Lifecycle::Trashed),
+        StoredLifecycle::Index(2) => Ok(Lifecycle::Purged),
+        StoredLifecycle::Index(_) => Err(serde::de::Error::custom("invalid note lifecycle index")),
+        StoredLifecycle::Name(state) => Ok(state),
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct NoteRevisionMetadata {
     pub note_id: NoteId,
@@ -453,6 +487,10 @@ pub struct NoteRevisionMetadata {
     pub title: String,
     pub doc_class: DocClass,
     pub ability_id: Option<AbilityId>,
+    #[serde(
+        serialize_with = "serialize_note_lifecycle",
+        deserialize_with = "deserialize_note_lifecycle"
+    )]
     pub lifecycle: Lifecycle,
     pub visibility_mask: i32,
     pub byte_size: u64,

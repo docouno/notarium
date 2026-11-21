@@ -407,6 +407,27 @@ async fn l1_postgres_bootstrap_idempotence_and_fail_closed_guards() {
             "missing full index on {key}"
         );
     }
+    for ddl in [
+        "CREATE INDEX idx_content_jobs_claim ON content_jobs(space_id,state,lease_until_ms,job_id)",
+        "CREATE INDEX idx_content_jobs_claim ON content_jobs(state,space_id,job_kind,lease_until_ms,job_id)",
+    ] {
+        sqlx::raw_sql(
+            "DROP TABLE blob_gc_retries;
+             UPDATE schema_meta SET schema_version=7,
+                manifest_checksum=decode('69d765f45ef72feff9238b179deb7a0afae85de76555b3720d2d3c5b9a954699','hex');
+             DROP INDEX idx_content_jobs_claim;",
+        ).execute(&mut raw).await.unwrap();
+        sqlx::query(ddl).execute(&mut raw).await.unwrap();
+        notarium_canonical::schema::bootstrap_postgres_schema(&mut raw, &schema, &install)
+            .await
+            .unwrap();
+        let definition: String =
+            sqlx::query_scalar("SELECT pg_get_indexdef('idx_content_jobs_claim'::regclass)")
+                .fetch_one(&mut raw)
+                .await
+                .unwrap();
+        assert!(definition.ends_with("(state, job_kind, space_id, lease_until_ms, job_id)"));
+    }
     let upgraded_constraints: Vec<(String, String, String)> = sqlx::query_as(CONSTRAINTS)
         .fetch_all(&mut raw)
         .await

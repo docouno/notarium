@@ -26,7 +26,6 @@ use notarium_core::{
     },
     receipt::ChangeCursor,
 };
-use rusqlite::{Connection, OpenFlags};
 use tokio::sync::{Semaphore, SemaphorePermit, mpsc, oneshot};
 use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
@@ -37,6 +36,7 @@ use crate::{
     },
     export::{LimitedFile, zip_error},
     import::check_cancelled,
+    sqlite_range::{sql_error, with_database},
 };
 
 #[derive(Clone, Debug)]
@@ -635,28 +635,29 @@ fn snapshot_references(
             .map_err(|_| invalid(ValidationReason::InvalidState))
     };
     match kind {
-        BackupArtifactKind::SqliteSnapshotV1 => {
-            let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-                .map_err(sqlite_error)?;
-            let interrupted = cancellation.clone();
-            db.progress_handler(4096, Some(move || interrupted.is_cancelled()))
-                .map_err(sqlite_error)?;
-            let verified = crate::fsck::verify_sqlite_references(&db, None);
-            check_cancelled(cancellation)?;
-            verified?;
-            let mut query = db
-                .prepare(
-                    "SELECT DISTINCT space_id,content_blake3 FROM blob_references
+        BackupArtifactKind::SqliteSnapshotV1 => with_database(
+            File::open(path).map_err(io_error)?,
+            bytes,
+            cancellation,
+            |db| {
+                let verified = crate::fsck::verify_sqlite_references(db, None, cancellation);
+                check_cancelled(cancellation)?;
+                verified?;
+                let mut query = db
+                    .prepare(
+                        "SELECT DISTINCT space_id,content_blake3 FROM blob_references
                  ORDER BY space_id,content_blake3",
-                )
-                .map_err(sqlite_error)?;
-            let mut rows = query.query([]).map_err(sqlite_error)?;
-            while let Some(row) = rows.next().map_err(sqlite_error)? {
-                let space: String = row.get(0).map_err(sqlite_error)?;
-                let digest: Vec<u8> = row.get(1).map_err(sqlite_error)?;
-                push(&space, &digest)?;
-            }
-        }
+                    )
+                    .map_err(sql_error)?;
+                let mut rows = query.query([]).map_err(sql_error)?;
+                while let Some(row) = rows.next().map_err(sql_error)? {
+                    let space: String = row.get(0).map_err(sql_error)?;
+                    let digest: Vec<u8> = row.get(1).map_err(sql_error)?;
+                    push(&space, &digest)?;
+                }
+                Ok(())
+            },
+        )?,
         BackupArtifactKind::PostgresSpoolV1 => {
             let mut checks = crate::db_integrity::PgRowChecks::new(true)?;
             crate::db_integrity::Relations::new(true)?.verify(cancellation, |keys| {
@@ -809,10 +810,6 @@ fn new_file(path: &Path) -> Result<File, PortError> {
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
     options.open(path).map_err(io_error)
-}
-
-fn sqlite_error(error: rusqlite::Error) -> PortError {
-    codec::internal_not_committed("backup_sqlite_references", error.to_string())
 }
 
 #[cfg(test)]

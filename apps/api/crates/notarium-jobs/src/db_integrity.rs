@@ -137,7 +137,7 @@ pub(crate) fn check_sqlite_canonical(db: &Connection, version: u32) -> Result<()
     {
         return Err(invalid(ValidationReason::InvalidArchive));
     }
-    if version >= CANONICAL_SCHEMA_VERSION {
+    if version >= 7 {
         for sql in sqlite_archive_privacy_ddl().chain(sqlite_archive_versions_ddl()) {
             expected.execute_batch(&sql).map_err(sql_error)?;
         }
@@ -160,14 +160,16 @@ pub(crate) fn check_sqlite_canonical(db: &Connection, version: u32) -> Result<()
     }
     const LEGACY_CLAIM_INDEX: &str =
         "CREATE INDEX idx_content_jobs_claim ON content_jobs(space_id,state,lease_until_ms,job_id)";
+    const V7_SPACE_BEFORE_KIND_INDEX: &str = "CREATE INDEX idx_content_jobs_claim ON content_jobs(state,space_id,job_kind,lease_until_ms,job_id)";
     for (name, sql) in &actual_indexes {
         let actual = normalize_ddl(sql);
         let trusted = match (version, name.as_str()) {
             (1..=6, "idx_content_jobs_claim") => Some(LEGACY_CLAIM_INDEX),
-            // The physical reorder preserves the v7 logical schema witness.
+            // Both orderings shipped under the same v7 logical schema witness.
             (7, "idx_content_jobs_claim") if actual == normalize_ddl(LEGACY_CLAIM_INDEX) => {
                 continue;
             }
+            (7, "idx_content_jobs_claim") => Some(V7_SPACE_BEFORE_KIND_INDEX),
             (1..=3, "idx_blob_references_non_note_owner") => Some(
                 "CREATE INDEX idx_blob_references_non_note_owner ON blob_references
                  (space_id, owner_kind, owner_id) WHERE owner_kind <> 'note_revision'",
@@ -624,7 +626,10 @@ fn target_value(value: TargetValue<'_>) -> ValueRef<'_> {
     }
 }
 
-pub(crate) fn check_sqlite_blob_owners(db: &Connection) -> Result<(), PortError> {
+pub(crate) fn check_sqlite_blob_owners(
+    db: &Connection,
+    cancellation: &Cancellation,
+) -> Result<(), PortError> {
     const OWNERS: &str = "
         SELECT space_id,'note_revision' AS kind,entity_key AS owner,rev_id AS rev,'carrier' AS resource,content_blake3 AS digest
           FROM revisions WHERE entity_type='note' AND content_blake3 IS NOT NULL
@@ -678,14 +683,42 @@ pub(crate) fn check_sqlite_blob_owners(db: &Connection) -> Result<(), PortError>
         return Err(invalid(ValidationReason::InvalidDigest));
     }
     check_sqlite_ability_resources(db)?;
+    // typeof reads the record header. Selecting the value itself would exceed
+    // SQLite's per-value limit for otherwise valid large room checkpoints.
     let mut snapshots = db
-        .prepare("SELECT yrs_snapshot_blake3,yrs_snapshot_blob FROM collab_sessions")
+        .prepare("SELECT rowid,yrs_snapshot_blake3,typeof(yrs_snapshot_blob) FROM collab_sessions")
         .map_err(sql_error)?;
     let mut rows = snapshots.query([]).map_err(sql_error)?;
+    let mut buffer = vec![0; 64 * 1024];
     while let Some(row) = rows.next().map_err(sql_error)? {
-        let hash: Option<Vec<u8>> = row.get(0).map_err(sql_error)?;
-        let snapshot: Option<Vec<u8>> = row.get(1).map_err(sql_error)?;
-        check_inline_snapshot(hash.as_deref(), snapshot.as_deref())?;
+        let hash: Option<Vec<u8>> = row.get(1).map_err(sql_error)?;
+        let kind: String = row.get(2).map_err(sql_error)?;
+        let expected = match (hash, kind.as_str()) {
+            (None, "null") => continue,
+            (Some(hash), "blob") if hash.len() == 32 => hash,
+            _ => return Err(invalid(ValidationReason::InvalidDigest)),
+        };
+        let snapshot = db
+            .blob_open(
+                "main",
+                "collab_sessions",
+                "yrs_snapshot_blob",
+                row.get(0).map_err(sql_error)?,
+                true,
+            )
+            .map_err(sql_error)?;
+        let mut digest = blake3::Hasher::new();
+        for offset in (0..snapshot.len()).step_by(buffer.len()) {
+            check_cancelled(cancellation)?;
+            let len = buffer.len().min(snapshot.len() - offset);
+            snapshot
+                .read_at_exact(&mut buffer[..len], offset)
+                .map_err(sql_error)?;
+            digest.update(&buffer[..len]);
+        }
+        if expected.as_slice() != digest.finalize().as_bytes() {
+            return Err(invalid(ValidationReason::InvalidDigest));
+        }
     }
     Ok(())
 }
@@ -1351,7 +1384,8 @@ mod tests {
     fn historical_sqlite_ddl_preserves_constraints() {
         let db = trusted(SQLITE_BASELINE_DDL).unwrap();
         db.execute_batch(
-            "DROP TABLE archive_export_shadows;
+            "DROP TABLE blob_gc_retries;
+             DROP TABLE archive_export_shadows;
              DROP TABLE archive_export_cuts;
              DROP TABLE archive_artifacts;
              DROP TABLE archive_uploads;

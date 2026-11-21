@@ -188,8 +188,9 @@ async fn open_gate(
         type GateRow = (String, Vec<u8>, Vec<u8>, String, bool, String, Vec<u8>);
         let (install, saved, target, histories, canonical_loaded, phase, namespace_owner): GateRow = sqlx::query_as(
              "SELECT installation_id,archive_digest,object_namespace,histories,canonical_loaded,phase,namespace_owner
-              FROM notarium_restore.readiness WHERE singleton=1",
-        ).fetch_one(&mut *conn).await.map_err(pg_error)?;
+              FROM notarium_restore.readiness WHERE singleton=1 AND octet_length(histories) <= $1",
+        ).bind(super::MAX_BACKUP_METADATA_JSON_BYTES as i32).fetch_optional(&mut *conn).await.map_err(pg_error)?
+         .ok_or_else(|| invalid(ValidationReason::InvalidState))?;
         let histories: Vec<ChangeCursor> = serde_json::from_str(&histories)
             .map_err(|_| invalid(ValidationReason::InvalidState))?;
         if install != installation.as_str()
@@ -230,8 +231,7 @@ async fn open_gate(
     for cursor in &mut histories {
         cursor.scope.incarnation = HistoryIncarnation::from_bytes(codec::csprng_16()?);
     }
-    let serialized =
-        serde_json::to_string(&histories).map_err(|_| invalid(ValidationReason::InvalidState))?;
+    let serialized = super::encode_journal(&histories)?;
     let mut tx = conn.begin().await.map_err(pg_error)?;
     sqlx::raw_sql(
         "CREATE SCHEMA notarium_restore;

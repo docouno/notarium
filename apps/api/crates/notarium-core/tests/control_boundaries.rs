@@ -65,6 +65,23 @@ fn backup_retention_requires_matching_backend_and_actual_bound() {
         spool_bytes: 100,
         retention: BackupRetentionProgress::SqliteWal { pinned_bytes: 20 },
     };
+    let unlimited = BackupBudget {
+        max_spool_bytes: u64::MAX,
+        ..sqlite
+    };
+    let image = BackupProgress {
+        spool_bytes: notarium_core::ports::MAX_BACKUP_SQLITE_IMAGE_BYTES,
+        ..base
+    };
+    assert!(unlimited.check(image).is_ok());
+    assert!(
+        unlimited
+            .check(BackupProgress {
+                spool_bytes: image.spool_bytes + 1,
+                ..image
+            })
+            .is_err()
+    );
     assert!(sqlite.check(base).is_ok());
     assert!(pg.check(base).is_err());
     assert!(

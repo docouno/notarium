@@ -3848,6 +3848,267 @@ async fn chat_receipts_preserve_body_and_reference_boundaries() {
 }
 
 #[tokio::test]
+async fn oversized_export_jobs_are_rejected_or_failed_before_the_next_claim() {
+    use notarium_canonical::{ArchiveJobClass, codec};
+
+    #[derive(serde::Serialize)]
+    #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
+    enum LegacyJob<'a> {
+        Export {
+            notes: &'a [NoteId],
+            encrypted: bool,
+        },
+    }
+
+    let fixtures = StorageTestFixtures::load_required();
+    let local = TempDataRoot::new("oversized-export");
+    let pg_root = TempDataRoot::new("oversized-export-pg");
+    let schema = fixtures.fresh_pg_schema();
+    let installation = sample_installation_id(0xd3);
+    let sqlite = CanonicalConfig::local_default(installation.clone(), local.data_root());
+    let pg = fixtures.pg_local_config(installation, &schema, pg_root.data_root());
+    let note = sample_note_id(0xd3);
+    let notes = vec![note.clone(); codec::MAX_MSGPACK_DECODE_BYTES / note.as_str().len() + 1];
+    let legacy = codec::encode_msgpack(&LegacyJob::Export {
+        notes: &notes,
+        encrypted: false,
+    })
+    .unwrap();
+    assert!(legacy.len() > 4 * 1024 * 1024);
+
+    for (config, postgres) in [(sqlite, false), (pg, true)] {
+        let (store, runtime) = CanonicalRuntime::open(config).await.unwrap();
+        let owner = sample_principal_id(0xd3);
+        let scope = store
+            .create_space(CreateSpaceSpec {
+                space_id: sample_space_id(0xd3),
+                incarnation: sample_incarnation(0xd3),
+                root_folder_id: sample_folder_id(0xd3),
+                slug: "oversized-export".into(),
+                kind: SpaceKind::Personal,
+                owner: owner.clone(),
+                active_epoch: LeaseEpoch::new(1).unwrap(),
+                initial_last_seq: SpaceSeq::ZERO,
+                created_at: None,
+            })
+            .await
+            .unwrap()
+            .scope;
+        let ctx = || owner_ctx(&scope, owner.clone());
+        let cut = store.read_space(&scope.space_id).await.unwrap().last_seq;
+        // This note does not exist yet. Size admission must precede per-note checks.
+        let rejected = store
+            .create_job(
+                ctx(),
+                next_mutation(
+                    &scope,
+                    &owner,
+                    ContentJobKind::Export {
+                        notes: notes.clone(),
+                        encrypted: false,
+                    },
+                ),
+            )
+            .await;
+        assert_validation_err(&rejected, ValidationReason::BudgetExceeded);
+
+        // Size the original selection just below the bound. Only its delegation overflows.
+        let item_bytes = codec::encode_msgpack(&note).unwrap().len();
+        let trim = (legacy.len() - codec::MAX_MSGPACK_DECODE_BYTES).div_ceil(item_bytes);
+        let near_limit = &notes[..notes.len() - trim];
+        let base_bytes = codec::encode_msgpack(&LegacyJob::Export {
+            notes: near_limit,
+            encrypted: false,
+        })
+        .unwrap()
+        .len();
+        assert!(
+            (codec::MAX_MSGPACK_DECODE_BYTES - item_bytes..=codec::MAX_MSGPACK_DECODE_BYTES)
+                .contains(&base_bytes)
+        );
+        let verified = VerifiedHuman::attest(
+            owner.clone(),
+            ctx().auth().grant().clone(),
+            ctx().auth().spaces().clone(),
+            true,
+        )
+        .with_credential(notarium_core::auth::AuthenticatedCredential::TrustedNone);
+        let delegated_ctx = SpaceContext::new(
+            EngineAuthContext::for_human(verified),
+            scope.clone(),
+            make_budget(),
+        )
+        .unwrap();
+        let delegated = store
+            .create_job(
+                delegated_ctx,
+                next_mutation(
+                    &scope,
+                    &owner,
+                    ContentJobKind::Export {
+                        notes: near_limit.to_vec(),
+                        encrypted: false,
+                    },
+                ),
+            )
+            .await;
+        assert_validation_err(&delegated, ValidationReason::BudgetExceeded);
+
+        assert_eq!(
+            store.read_space(&scope.space_id).await.unwrap().last_seq,
+            cut
+        );
+
+        store
+            .create_note(
+                ctx(),
+                next_mutation(
+                    &scope,
+                    &owner,
+                    CreateNote {
+                        note: note.clone(),
+                        parent: None,
+                        slug: "selected".into(),
+                        class: DocClass::UserDoc,
+                        carrier: "# Selected\n".into(),
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        let old = store
+            .create_job(
+                ctx(),
+                next_mutation(
+                    &scope,
+                    &owner,
+                    ContentJobKind::Export {
+                        notes: vec![note.clone()],
+                        encrypted: false,
+                    },
+                ),
+            )
+            .await
+            .unwrap()
+            .value;
+        let healthy = store
+            .create_job(
+                ctx(),
+                next_mutation(
+                    &scope,
+                    &owner,
+                    ContentJobKind::ExportSpace { encrypted: false },
+                ),
+            )
+            .await
+            .unwrap()
+            .value;
+        // Keep the original job identity and owners while restoring the wire
+        // representation accepted by a producer without the payload bound.
+        let changed = if postgres {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "UPDATE \"{schema}\".content_jobs SET payload_msgpack=$1,total_units=$2 WHERE space_id=$3 AND job_id=$4"
+            ))).bind(&legacy).bind(notes.len() as i64).bind(scope.space_id.as_str()).bind(old.id.as_str())
+                .execute(&mut fixtures.open_raw_pg().await).await.unwrap().rows_affected()
+        } else {
+            sqlx::query("UPDATE content_jobs SET payload_msgpack=$1,total_units=$2 WHERE space_id=$3 AND job_id=$4")
+                .bind(&legacy).bind(notes.len() as i64).bind(scope.space_id.as_str()).bind(old.id.as_str())
+                .execute(&mut local.open_raw_sqlite().await).await.unwrap().rows_affected()
+        };
+        assert_eq!(changed, 1);
+        let queued = store
+            .list_jobs(
+                ctx(),
+                ReadRequest::Open {
+                    query: JobQuery {
+                        states: vec![JobState::Queued],
+                        limit: PageLimit::new(8).unwrap(),
+                    },
+                    causal: CausalBasis::Exact(ReceiptSet::default()),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            queued.items.iter().map(|job| &job.id).collect::<Vec<_>>(),
+            vec![&healthy.id]
+        );
+
+        let claim = async || {
+            store
+                .claim_next_archive_job(
+                    &make_budget(),
+                    &scope,
+                    "export-worker",
+                    Duration::from_secs(30),
+                    ArchiveJobClass::Export,
+                )
+                .await
+                .unwrap()
+        };
+        assert!(claim().await.is_none());
+        let failed = store.get_job(ctx(), old.id.clone()).await.unwrap();
+        assert_eq!(failed.state, JobState::Failed);
+        assert!(failed.artifacts.is_empty());
+        // Replacing the oversized wire must not broaden visibility of a formerly selected note.
+        let mut restricted = ctx().auth().spaces().clone();
+        restricted
+            .get_mut(&scope.space_id)
+            .unwrap()
+            .read_classes
+            .remove(&DocClass::UserDoc);
+        let restricted = SpaceContext::new(
+            EngineAuthContext::for_human(VerifiedHuman::attest(
+                owner.clone(),
+                ctx().auth().grant().clone(),
+                restricted,
+                false,
+            )),
+            scope.clone(),
+            make_budget(),
+        )
+        .unwrap();
+        assert!(matches!(
+            store.get_job(restricted, old.id.clone()).await,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ));
+
+        let no_result = store
+            .execute_diagnostic_read_sql_for_test(
+                None,
+                &format!(
+                    "SELECT COUNT(*) FROM content_jobs WHERE space_id='{}' AND job_id='{}'
+             AND result_msgpack IS NULL AND artifacts_json='[]'",
+                    scope.space_id, old.id
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(no_result, 1);
+        let claimed = claim().await.unwrap().job;
+        assert_eq!(claimed.id, healthy.id);
+        assert_eq!(claimed.state, JobState::Running);
+        let page = store
+            .list_jobs(
+                ctx(),
+                ReadRequest::Open {
+                    query: JobQuery {
+                        states: vec![JobState::Failed, JobState::Running],
+                        limit: PageLimit::new(8).unwrap(),
+                    },
+                    causal: CausalBasis::Exact(ReceiptSet::default()),
+                },
+            )
+            .await
+            .unwrap();
+        let ids: BTreeSet<_> = page.items.into_iter().map(|job| job.id).collect();
+        assert_eq!(ids, BTreeSet::from([old.id, healthy.id]));
+        runtime.shutdown().await.unwrap();
+    }
+    fixtures.drop_pg_schema(&schema).await;
+}
+
+#[tokio::test]
 async fn paged_archive_export_keeps_chat_appends_out_of_the_cut() {
     use notarium_canonical::UpdateSpaceSchema;
     use notarium_canonical::peers::{
@@ -4280,6 +4541,76 @@ async fn paged_archive_export_keeps_chat_appends_out_of_the_cut() {
             privacy_generation: after_purge.generation,
             expires_at_ms: i64::MAX,
         };
+        let (send, mut queue) = tokio::sync::mpsc::channel(1);
+        let slot = send.reserve_owned().await.unwrap();
+        let refused = store
+            .handoff_export_chunk(&make_budget(), &scope, &pointer, move || {
+                slot.send(b'x');
+                Ok(())
+            })
+            .await;
+        assert!(matches!(
+            refused,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ));
+        assert!(queue.try_recv().is_err());
+        let publication_job = store
+            .create_job(
+                ctx(),
+                next_mutation(
+                    &scope,
+                    &owner,
+                    ContentJobKind::ExportSpace { encrypted: false },
+                ),
+            )
+            .await
+            .unwrap()
+            .value;
+        let publication_claim = store
+            .claim_next_job(
+                &make_budget(),
+                &scope,
+                "publication-test",
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(publication_claim.job.id, publication_job.id);
+        let object = pointer.object;
+        let id = object.id.clone();
+        store
+            .reserve_archive_upload(
+                &ctx(),
+                &publication_claim,
+                id.clone(),
+                object.kind.clone(),
+                object.bytes,
+                object.namespace,
+            )
+            .await
+            .unwrap();
+        store
+            .complete_archive_job(
+                &make_budget(),
+                &scope,
+                &publication_claim,
+                JobCompletionOutcome::Exported(
+                    notarium_canonical::peers::archive_export::ExportPublication {
+                        object,
+                        cut: after_purge.seq,
+                        privacy_generation: after_purge.generation,
+                        files: 1,
+                    },
+                ),
+                ArchiveCommitAuthority::new(Box::new(Registration {
+                    entered: Default::default(),
+                    released: Default::default(),
+                })),
+            )
+            .await
+            .unwrap();
+        let pointer = store.open_committed_export(ctx(), &id).await.unwrap();
         let (send, mut queue) = tokio::sync::mpsc::channel(1);
         let slot = send.reserve_owned().await.unwrap();
         let transfer = make_budget();

@@ -20,7 +20,7 @@ serde.workspace = true
 serde_json.workspace = true
 blake3.workspace = true
 zstd.workspace = true
-rusqlite.workspace = true
+rusqlite = { workspace = true, features = ["blob"] }
 cap-std.workspace = true
 cap-fs-ext.workspace = true
 rustix.workspace = true
