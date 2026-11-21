@@ -1,6 +1,8 @@
 //! Check the schema and references using trusted storage definitions. Logical
 //! spools cannot prove a foreign key by presenting only a self-authored header.
 
+mod revisions;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use notarium_canonical::{
@@ -17,7 +19,6 @@ use notarium_control::store::{
 };
 use notarium_core::{
     error::{PortError, ValidationReason},
-    ids::ContentDigest,
     ports::Cancellation,
 };
 use rusqlite::{
@@ -690,29 +691,7 @@ pub(crate) fn check_sqlite_blob_owners(
     ).map_err(sql_error)? {
         return Err(invalid(ValidationReason::InvalidDigest));
     }
-    let mut notes = db
-        .prepare(
-            "SELECT r.entity_key,r.content_blake3,r.metadata_msgpack,c.raw_size FROM revisions r
-             LEFT JOIN blob_catalog c ON c.space_id=r.space_id AND c.content_blake3=r.content_blake3
-             WHERE r.entity_type='note'",
-        )
-        .map_err(sql_error)?;
-    let mut rows = notes.query([]).map_err(sql_error)?;
-    while let Some(row) = rows.next().map_err(sql_error)? {
-        check_cancelled(cancellation)?;
-        let owner: String = row.get(0).map_err(sql_error)?;
-        let digest: Option<Vec<u8>> = row.get(1).map_err(sql_error)?;
-        let metadata = row
-            .get_ref(2)
-            .map_err(sql_error)?
-            .as_blob()
-            .map_err(|_| invalid(ValidationReason::InvalidArchive))?;
-        let raw_size: Option<i64> = row.get(3).map_err(sql_error)?;
-        if note_carrier_size(&owner, digest.as_deref(), metadata)? != raw_size {
-            return Err(invalid(ValidationReason::InvalidDigest));
-        }
-    }
-    check_sqlite_ability_resources(db)?;
+    revisions::sqlite(db, cancellation)?;
     // typeof reads the record header. Selecting the value itself would exceed
     // SQLite's per-value limit for otherwise valid large room checkpoints.
     let mut snapshots = db
@@ -753,74 +732,23 @@ pub(crate) fn check_sqlite_blob_owners(
     Ok(())
 }
 
-fn check_sqlite_ability_resources(db: &Connection) -> Result<(), PortError> {
-    let mut revisions = db.prepare("SELECT space_id,entity_key,rev_id,metadata_msgpack FROM revisions WHERE entity_type='ability'")
-        .map_err(sql_error)?;
-    let mut resources = db
-        .prepare(
-            "SELECT resource_key,content_blake3 FROM blob_references
-         WHERE owner_kind='ability_resource' AND space_id=?1 AND owner_id=?2 AND owner_rev_id=?3",
-        )
-        .map_err(sql_error)?;
-    let mut rows = revisions.query([]).map_err(sql_error)?;
-    while let Some(row) = rows.next().map_err(sql_error)? {
-        let space: String = row.get(0).map_err(sql_error)?;
-        let owner: String = row.get(1).map_err(sql_error)?;
-        let rev: String = row.get(2).map_err(sql_error)?;
-        let metadata = row
-            .get_ref(3)
-            .map_err(sql_error)?
-            .as_blob()
-            .map_err(|_| invalid(ValidationReason::InvalidArchive))?;
-        let mut expected = ability_resources(&owner, metadata)?;
-        let mut refs = resources
-            .query(params![space, owner, rev])
-            .map_err(sql_error)?;
-        while let Some(r) = refs.next().map_err(sql_error)? {
-            let path: String = r.get(0).map_err(sql_error)?;
-            let digest: Vec<u8> = r.get(1).map_err(sql_error)?;
-            if expected
-                .remove(&path)
-                .is_none_or(|hash| hash.as_bytes() != digest.as_slice())
-            {
-                return Err(invalid(ValidationReason::InvalidDigest));
-            }
-        }
-        if !expected.is_empty() {
-            return Err(invalid(ValidationReason::InvalidDigest));
-        }
-    }
-    if db
-        .query_row(
-            "SELECT 1 FROM blob_references r WHERE r.owner_kind='ability_resource' AND NOT EXISTS(
-           SELECT 1 FROM revisions v WHERE v.space_id=r.space_id AND v.rev_id=r.owner_rev_id
-              AND v.entity_type='ability' AND v.entity_key=r.owner_id) LIMIT 1",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .optional()
-        .map_err(sql_error)?
-        .is_some()
-    {
-        return Err(invalid(ValidationReason::InvalidDigest));
-    }
-    Ok(())
-}
-
 fn note_carrier_size(
     owner: &str,
     digest: Option<&[u8]>,
     metadata: &[u8],
 ) -> Result<Option<i64>, PortError> {
+    let value = revisions::metadata("note", owner, metadata)?;
+    note_size(&value, digest)
+}
+
+fn note_size(
+    value: &RevisionMetadataPayload,
+    digest: Option<&[u8]>,
+) -> Result<Option<i64>, PortError> {
     use notarium_core::model::Lifecycle;
-    let envelope = RevisionMetadataEnvelope::decode(metadata)
-        .map_err(|_| invalid(ValidationReason::InvalidArchive))?;
-    let RevisionMetadataPayload::Note(note) = envelope.payload else {
+    let RevisionMetadataPayload::Note(note) = value else {
         return Err(invalid(ValidationReason::InvalidArchive));
     };
-    if note.note_id.as_str() != owner {
-        return Err(invalid(ValidationReason::InvalidArchive));
-    }
     match (note.lifecycle, note.content_digest, digest) {
         (Lifecycle::Purged, None, None) => Ok(None),
         (Lifecycle::Active | Lifecycle::Trashed, Some(actual), Some(expected))
@@ -832,21 +760,6 @@ fn note_carrier_size(
         }
         _ => Err(invalid(ValidationReason::InvalidDigest)),
     }
-}
-
-fn ability_resources(
-    owner: &str,
-    metadata: &[u8],
-) -> Result<BTreeMap<String, ContentDigest>, PortError> {
-    let RevisionMetadataPayload::Ability(value) =
-        RevisionMetadataEnvelope::decode(metadata)?.payload
-    else {
-        return Err(invalid(ValidationReason::InvalidArchive));
-    };
-    if value.ability_id.as_str() != owner {
-        return Err(invalid(ValidationReason::InvalidArchive));
-    }
-    Ok(value.resources)
 }
 
 fn check_inline_snapshot(digest: Option<&[u8]>, snapshot: Option<&[u8]>) -> Result<(), PortError> {
@@ -940,6 +853,7 @@ impl Relations {
                 prefix,
                 keys: BTreeMap::new(),
                 references: BTreeMap::new(),
+                history: revisions::Histories::default(),
                 full: false,
                 parts: None,
             };
@@ -958,6 +872,9 @@ impl Relations {
             {
                 return Err(invalid(ValidationReason::InvalidArchive));
             }
+            if !partition.full {
+                partition.check_histories()?;
+            }
         }
         Ok(())
     }
@@ -969,6 +886,7 @@ pub(crate) struct Partition<'a> {
     prefix: u16,
     keys: BTreeMap<[u8; 32], u8>,
     references: BTreeMap<[u8; 32], BlobReferences>,
+    history: revisions::Histories,
     full: bool,
     parts: Option<PublicationParts>,
 }
@@ -1020,7 +938,8 @@ impl Partition<'_> {
             self.prefix,
             *hasher.finalize().as_bytes(),
             UNIQUE,
-        ) || self.keys.len() + self.references.len() > MAX_KEYS_PER_PARTITION;
+        ) || self.keys.len() + self.references.len() + self.history.len()
+            > MAX_KEYS_PER_PARTITION;
     }
 
     pub(crate) fn canonical(
@@ -1028,6 +947,9 @@ impl Partition<'_> {
         table: TableSpec,
         row: &[PostgresSpoolValue],
     ) -> Result<(), PortError> {
+        let metadata = self.history_row(table.name, row)?;
+        self.full |=
+            self.keys.len() + self.references.len() + self.history.len() > MAX_KEYS_PER_PARTITION;
         self.record(table.name, |name, digest| {
             let index = table
                 .columns
@@ -1039,13 +961,14 @@ impl Partition<'_> {
         if table.name != "blob_parts" {
             self.finish_parts();
         }
-        self.record_blob_owners(table.name, row)
+        self.record_blob_owners(table.name, row, metadata)
     }
 
     fn record_blob_owners(
         &mut self,
         table: &str,
         row: &[PostgresSpoolValue],
+        decoded: Option<RevisionMetadataPayload>,
     ) -> Result<(), PortError> {
         use PostgresSpoolValue::{Bytes, Int, Null, Text};
         match (table, row) {
@@ -1067,17 +990,21 @@ impl Partition<'_> {
                     Bytes(hash) => {
                         // Decode the reader's payload only in the partition for this carrier.
                         if let Some(blob) = self.blob_references(space, hash) {
-                            let size = note_carrier_size(owner, Some(hash), metadata)?
-                                .ok_or_else(|| invalid(ValidationReason::InvalidDigest))?;
+                            let size = match decoded {
+                                Some(value) => note_size(&value, Some(hash))?,
+                                None => note_carrier_size(owner, Some(hash), metadata)?,
+                            }
+                            .ok_or_else(|| invalid(ValidationReason::InvalidDigest))?;
                             blob.check_size(size)?;
                         }
                         self.domain_key("note_revision", &[space, owner, rev, "carrier"], hash, 5);
                         self.domain_key("head_revision", &[space, owner, rev], hash, 2);
                     }
-                    Null if self.bits == 0 => {
-                        note_carrier_size(owner, None, metadata)?;
+                    Null => {
+                        if let Some(value) = decoded {
+                            note_size(&value, None)?;
+                        }
                     }
-                    Null => {}
                     _ => return Err(invalid(ValidationReason::InvalidDigest)),
                 }
             }
@@ -1087,16 +1014,33 @@ impl Partition<'_> {
                 let Bytes(metadata) = &row[11] else {
                     return Err(invalid(ValidationReason::InvalidArchive));
                 };
-                for (path, hash) in ability_resources(owner, metadata)? {
-                    self.domain_key(
-                        "ability_resource",
-                        &[space, owner, rev, &path],
-                        hash.as_bytes(),
-                        5,
-                    );
+                if self.includes(&revisions::key(&[space, "ability_resources", rev])) {
+                    let value = match decoded {
+                        Some(value) => value,
+                        None => revisions::metadata("ability", owner, metadata)?,
+                    };
+                    let RevisionMetadataPayload::Ability(ability) = value else {
+                        return Err(invalid(ValidationReason::InvalidArchive));
+                    };
+                    for (path, hash) in ability.resources {
+                        self.ability_key(
+                            space,
+                            owner,
+                            rev,
+                            &path,
+                            hash.as_bytes(),
+                            REQUIRED | EXACT,
+                        );
+                    }
                 }
             }
+            ("revision_purge_fences", [Text(space), _, Text(note), ..]) => {
+                self.domain_key("note_purge", &[space, note], &[], PRESENT | EXACT);
+            }
             ("note_heads", [Text(space), Text(note), ..]) => {
+                if matches!(&row[12], Text(state) if state == "purged") {
+                    self.domain_key("note_purge", &[space, note], &[], REQUIRED);
+                }
                 if let (Text(rev), Bytes(hash)) = (&row[9], &row[10]) {
                     self.domain_key("head_revision", &[space, note, rev], hash, 1);
                 }
@@ -1147,7 +1091,12 @@ impl Partition<'_> {
                         .ok_or_else(|| invalid(ValidationReason::InvalidState))?;
                 }
                 match kind.as_str() {
-                    "note_revision" | "ability_resource" | "chat_entry" => {
+                    "ability_resource" => {
+                        if self.includes(&revisions::key(&[space, "ability_resources", rev])) {
+                            self.ability_key(space, owner, rev, resource, hash, PRESENT | EXACT);
+                        }
+                    }
+                    "note_revision" | "chat_entry" => {
                         self.domain_key(kind, &[space, owner, rev, resource], hash, 6);
                     }
                     "chat_pending_input" => {
@@ -1285,7 +1234,8 @@ impl Partition<'_> {
         if self.bits != 0 && top >> (16 - self.bits) != self.prefix {
             return None;
         }
-        let at_capacity = self.keys.len() + self.references.len() >= MAX_KEYS_PER_PARTITION;
+        let at_capacity =
+            self.keys.len() + self.references.len() + self.history.len() >= MAX_KEYS_PER_PARTITION;
         let entry = self.references.entry(key);
         self.full = at_capacity && matches!(entry, std::collections::btree_map::Entry::Vacant(_));
         Some(entry.or_default())
@@ -1327,7 +1277,8 @@ impl Partition<'_> {
             0,
             *key.finalize().as_bytes(),
             if required { REQUIRED } else { PRESENT },
-        ) || self.keys.len() + self.references.len() > MAX_KEYS_PER_PARTITION;
+        ) || self.keys.len() + self.references.len() + self.history.len()
+            > MAX_KEYS_PER_PARTITION;
     }
 
     fn finish_parts(&mut self) {
@@ -1369,6 +1320,39 @@ impl Partition<'_> {
     }
 
     fn domain_key(&mut self, relation: &str, values: &[&str], hash: &[u8], flag: u8) {
+        self.record_domain_key(relation, values, hash, flag, self.bits, self.prefix);
+    }
+
+    fn ability_key(
+        &mut self,
+        space: &str,
+        owner: &str,
+        rev: &str,
+        path: &str,
+        hash: &[u8],
+        flag: u8,
+    ) {
+        // Both sides route all resources of one immutable version to the same
+        // shard before decoding its manifest, independent of the resource path.
+        self.record_domain_key(
+            "ability_resource",
+            &[space, owner, rev, path],
+            hash,
+            flag,
+            0,
+            0,
+        );
+    }
+
+    fn record_domain_key(
+        &mut self,
+        relation: &str,
+        values: &[&str],
+        hash: &[u8],
+        flag: u8,
+        bits: u8,
+        prefix: u16,
+    ) {
         if self.full {
             return;
         }
@@ -1380,11 +1364,12 @@ impl Partition<'_> {
         scalar(&mut hasher, b'b', hash);
         self.full = Self::record_key(
             &mut self.keys,
-            self.bits,
-            self.prefix,
+            bits,
+            prefix,
             *hasher.finalize().as_bytes(),
             flag,
-        ) || self.keys.len() + self.references.len() > MAX_KEYS_PER_PARTITION;
+        ) || self.keys.len() + self.references.len() + self.history.len()
+            > MAX_KEYS_PER_PARTITION;
     }
 
     pub(crate) fn control(&mut self, row: &TargetRecord) -> Result<(), PortError> {
@@ -1424,7 +1409,8 @@ impl Partition<'_> {
                     self.prefix,
                     *hasher.finalize().as_bytes(),
                     flag,
-                ) || self.keys.len() + self.references.len() > MAX_KEYS_PER_PARTITION;
+                ) || self.keys.len() + self.references.len() + self.history.len()
+                    > MAX_KEYS_PER_PARTITION;
             }
         }
         Ok(())
@@ -1486,7 +1472,7 @@ mod tests {
     fn note_carriers_accept_legacy_lifecycle_names_and_contentless_purged_revisions() {
         use notarium_canonical::codec::encode_msgpack;
         let owner = "legacyNote01";
-        let digest = ContentDigest::from_bytes([42; 32]);
+        let digest = notarium_core::ids::ContentDigest::from_bytes([42; 32]);
         let mut stored = serde_json::json!({
             "version": 1, "payload": { "kind": "note", "data": {
                 "note_id": owner, "parent_folder_id": "legacyRoot01", "is_root_child": true,

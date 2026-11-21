@@ -33,6 +33,8 @@ use notarium_jobs::{
 mod cloud_takeover;
 #[path = "maintenance/paired_load.rs"]
 mod paired_load;
+#[path = "maintenance/revision_integrity.rs"]
+mod revision_integrity;
 
 struct Scratch(PathBuf);
 
@@ -455,6 +457,26 @@ async fn check_restored_note(
         snapshot.document.explicit_read(ctx.auth()).unwrap(),
         expected
     );
+    let ChangeReadResult::Seed(seed) = store
+        .catch_up(
+            authority(ServicePurpose::Projection),
+            ChangeRead::Seed {
+                scope: scope.clone(),
+                cutoff: None,
+                limit: PageLimit::new(10).unwrap(),
+            },
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("expected a projection seed")
+    };
+    assert_eq!(&seed.cutoff.scope, scope);
+    assert!(seed.next.is_none());
+    assert!(seed.notes.iter().any(|item| {
+        item.document.reference() == snapshot.document.reference()
+            && item.document.revision() == snapshot.document.revision()
+    }));
 }
 
 async fn held_export(
@@ -883,6 +905,23 @@ async fn sqlite_archive_verification_restore_and_rejection() {
         note.note_id = NoteId::from_bytes([12; 16])
     }));
     let stale_size = replace_note(change_note_metadata(&metadata, |note| note.byte_size += 1));
+    let (folder_metadata, root_seq): (Vec<u8>, i64) = source_db
+        .query_row(
+            "SELECT metadata_msgpack,space_seq FROM revisions WHERE entity_type='folder'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(root_seq, 0);
+    let wrong_owner: String = source_db
+        .query_row(
+            "SELECT quote(?1)",
+            [revision_integrity::foreign_folder_owner(&folder_metadata)],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let foreign_folder =
+        format!("UPDATE revisions SET metadata_msgpack={wrong_owner} WHERE entity_type='folder'");
     drop(source_db);
     let missing_owner = format!(
         "DELETE FROM blob_references WHERE owner_kind='note_revision' AND owner_id='{}';
@@ -897,6 +936,19 @@ async fn sqlite_archive_verification_restore_and_rejection() {
              CREATE TRIGGER archive_privacy_spaces AFTER UPDATE ON spaces BEGIN SELECT 1; END;",
         ),
         ("canonical", "DELETE FROM folder_heads WHERE is_root=1"),
+        (
+            "canonical",
+            "DELETE FROM revisions WHERE entity_type='folder'",
+        ),
+        (
+            "canonical",
+            "UPDATE revisions SET metadata_msgpack=x'c1' WHERE entity_type='folder'",
+        ),
+        (
+            "canonical",
+            "UPDATE revisions SET visibility_seq=(SELECT last_seq+1 FROM spaces) WHERE entity_type='folder'",
+        ),
+        ("canonical", foreign_folder.as_str()),
         ("canonical", missing_owner.as_str()),
         ("canonical", stale_digest.as_str()),
         ("canonical", stale_owner.as_str()),
@@ -1655,56 +1707,35 @@ async fn cloud_archive_verification_and_restore_to_an_independent_namespace() {
         scratch: root.clone(),
         external_keyring: root.keyring(),
     };
-    // Preserve the framed row length and both independent spool/archive checksums.
-    let forged = repackage_database(&path, "canonical", |spool| {
-        let changed = change_note_metadata(&original_metadata, stale_carrier);
-        assert_eq!(changed.len(), original_metadata.len());
-        let body_len = spool.len() - 32;
-        let (body, trailer) = spool.split_at_mut(body_len);
-        let offset = body
-            .windows(original_metadata.len())
-            .position(|window| window == original_metadata)
-            .unwrap();
-        body[offset..offset + changed.len()].copy_from_slice(&changed);
-        trailer.copy_from_slice(blake3::hash(body).as_bytes());
-        let mut changed_rows = 0;
-        use notarium_canonical::backup::{PostgresSpoolValue, scan_postgres_spool_v1};
-        scan_postgres_spool_v1(
-            &spool[..],
-            spool.len() as u64,
-            spool.len() as u64,
-            BackupOptions::default().max_pg_row_bytes,
-            |table, row| {
-                if table.name == "revisions"
-                    && let PostgresSpoolValue::Bytes(value) = &row[11]
-                    && value == &changed
-                {
-                    changed_rows += 1;
-                }
-                Ok(())
-            },
+    use revision_integrity::RevisionFault;
+    for fault in [
+        RevisionFault::NoteCarrier,
+        RevisionFault::MissingRoot,
+        RevisionFault::MalformedFolder,
+        RevisionFault::ForeignFolderOwner,
+        RevisionFault::FutureVisibility,
+    ] {
+        let forged = fault.postgres_archive(&path, &original_metadata);
+        let fsck = run_fsck(
+            authority(ServicePurpose::Fsck),
+            FsckInput::Archive(ArchiveInput::new(forged.clone()).unwrap()),
+            &root.keyring(),
+            BackupOptions::default(),
         )
-        .unwrap();
-        assert_eq!(changed_rows, 1);
-    });
-    let fsck = run_fsck(
-        authority(ServicePurpose::Fsck),
-        FsckInput::Archive(ArchiveInput::new(forged.clone()).unwrap()),
-        &root.keyring(),
-        BackupOptions::default(),
-    )
-    .await;
-    let restore = run_restore(
-        authority(ServicePurpose::Restore),
-        ArchiveInput::new(forged).unwrap(),
-        RestoreTarget::Cloud(Box::new(cloud_target.clone())),
-        BackupOptions::default(),
-    )
-    .await;
-    for error in [fsck.unwrap_err(), restore.unwrap_err()] {
-        assert!(
-            matches!(error, notarium_core::error::PortError::Domain(notarium_core::DomainError::ValidationFailed { diagnostic }) if diagnostic.reason == notarium_core::error::ValidationReason::InvalidDigest)
-        );
+        .await;
+        let restore = run_restore(
+            authority(ServicePurpose::Restore),
+            ArchiveInput::new(forged).unwrap(),
+            RestoreTarget::Cloud(Box::new(cloud_target.clone())),
+            BackupOptions::default(),
+        )
+        .await;
+        for error in [fsck.unwrap_err(), restore.unwrap_err()] {
+            assert!(
+                matches!(&error, notarium_core::error::PortError::Domain(notarium_core::DomainError::ValidationFailed { diagnostic }) if diagnostic.reason == fault.reason()),
+                "{fault:?}: {error:?}",
+            );
+        }
     }
     let mut fresh = PgConnection::connect_with(&build_pg_connect_options(&target))
         .await

@@ -21,9 +21,12 @@ Each worker polls its class for Spaces with queued jobs or reclaimable leases.
 After a claim it continues with the next Space and wraps to the beginning before
 applying the idle interval. A single busy Space can therefore drain continuously.
 The canonical writer fences job progress and terminal results by lease owner,
-both the job and Space epochs, and lease expiry. It retains the authority
-registration until an admitted write commits or rolls back. In Cloud, the
-control and canonical schemas must share the same primary PostgreSQL database.
+both the job and Space epochs, and lease expiry. It checks the original lease
+deadline after the final credential check, before admitting the commit.
+If credential admission fails, the worker can record a sanitized failure while
+its lease is current. The writer retains the registration until an admitted
+write commits or rolls back. In Cloud, the control and canonical schemas must
+share the same primary PostgreSQL database.
 Their transaction lock keeps revocation delivery ordered with archive writes
 even when a worker loses its commit response. Shut down the
 runner by cancelling its token and awaiting it.
@@ -130,6 +133,12 @@ from pre-quarantine catalogs.
   database structure and references, decoded CAS bytes, and external keyring
   readability. For retained note revisions it matches the reader's metadata
   against the note ID, carrier digest and uncompressed carrier size.
+  Each retained revision must decode as its declared entity and owner within
+  the Space's captured history and sequence ceiling. The verifier checks
+  revision pointers for folders, notes, threads, ability manifests, rank
+  overlays and agent runs. It verifies current folder and project links, the
+  root's initial revision at sequence zero and permanent fences for purged
+  notes. Historical moves retain the parent recorded at the time of the move.
   SQLite verification reads the stored database slices through a
   read-only range VFS in a separate process. The default worker caps SQLite's
   native heap at 80 MiB and reports the measured native high-water mark.

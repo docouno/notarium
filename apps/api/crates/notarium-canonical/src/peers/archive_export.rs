@@ -935,11 +935,11 @@ async fn check_publication_tx(
     if !current {
         return Err(DomainError::ResourceNotFound.into());
     }
-    // Both backends truncate their clock to milliseconds. Anchor the remaining
-    // whole milliseconds before the clock round trip so admission can check
-    // expiry synchronously after the credential registration check.
-    let remaining = Duration::from_millis(binding.expires.abs_diff(now).saturating_sub(1));
-    Ok(crate::runtime::deadline_after(sampled_at, remaining))
+    Ok(crate::runtime::database_expiry_deadline(
+        sampled_at,
+        now,
+        binding.expires,
+    ))
 }
 
 fn authorize_job_write_for_export(

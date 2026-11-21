@@ -338,6 +338,12 @@ pub enum JobCompletionOutcome {
     },
 }
 
+enum JobSettlement {
+    Ordinary(JobCompletionOutcome),
+    Delegated(JobCompletionOutcome, archive_import::ArchiveCommitAuthority),
+    RejectedArchive(ContentDigest),
+}
+
 /// Persistent collaborative room state stored in `collab_sessions`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CollabRoomState {
@@ -746,8 +752,7 @@ impl CanonicalStore {
             budget,
             scope,
             (job, worker_id, expected_lease),
-            outcome,
-            None,
+            JobSettlement::Ordinary(outcome),
         )
         .await
     }
@@ -767,10 +772,29 @@ impl CanonicalStore {
             budget,
             scope,
             (&claim.job.id, &claim.lease_owner, claim.job.lease),
-            outcome,
-            Some(authority),
+            JobSettlement::Delegated(outcome, authority),
         )
         .await
+    }
+
+    /// Record a sanitized failure for a current archive claim when its delegated
+    /// authority cannot be admitted. The durable job retains its progress.
+    pub async fn fail_unadmitted_archive_job(
+        &self,
+        budget: &CallBudget,
+        scope: &HistoryScope,
+        claim: &ClaimedContentJob,
+        error_ref: ContentDigest,
+    ) -> Result<(), PortError> {
+        complete_job_impl(
+            self,
+            budget,
+            scope,
+            (&claim.job.id, &claim.lease_owner, claim.job.lease),
+            JobSettlement::RejectedArchive(error_ref),
+        )
+        .await
+        .map(drop)
     }
 
     /// Reads the persisted collaborative session and ordered `collab_update_log` for `note`.
@@ -2877,8 +2901,7 @@ async fn complete_job_impl(
     budget: &CallBudget,
     scope: &HistoryScope,
     claim: (&JobId, &str, LeaseEpoch),
-    outcome: JobCompletionOutcome,
-    authority: Option<archive_import::ArchiveCommitAuthority>,
+    settlement: JobSettlement,
 ) -> Result<Committed<ContentJob>, PortError> {
     let (job_id, worker_id, expected_lease) = claim;
     let deadline = crate::domain::common::CommandDeadline::start(budget, "complete_job");
@@ -2894,7 +2917,7 @@ async fn complete_job_impl(
     let worker_owned = worker_id.to_owned();
     let installation = store.installation_id().clone();
 
-    let archive_commit = authority.is_some();
+    let archive_commit = !matches!(&settlement, JobSettlement::Ordinary(_));
     let intent = PreparedWriteIntent {
         scope: scope_cl.clone(),
         active_epoch: space_rec.active_epoch,
@@ -2904,16 +2927,42 @@ async fn complete_job_impl(
         required_semantic_cut: None,
         execute: Box::new(move |tx, item_ctx| {
             Box::pin(async move {
-                if authority.is_none() && matches!(outcome, JobCompletionOutcome::Exported(_)) {
+                if matches!(
+                    &settlement,
+                    JobSettlement::Ordinary(JobCompletionOutcome::Exported(_))
+                ) {
                     return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
                 }
                 let (mut cur_job, now, erased, until) =
                     require_active_job_lease_tx(tx, &scope_cl, &jid, &worker_owned, expected_lease)
                         .await?;
-                if let Some(authority) = authority {
-                    authority.check()?;
-                    item_ctx.guard_archive_commit(authority, until);
-                }
+                let outcome = match settlement {
+                    JobSettlement::Ordinary(outcome) => outcome,
+                    JobSettlement::Delegated(outcome, authority) => {
+                        authority.check()?;
+                        item_ctx.guard_archive_commit(Some(authority), until);
+                        outcome
+                    }
+                    JobSettlement::RejectedArchive(error_ref) => {
+                        if !matches!(
+                            &cur_job.kind,
+                            ContentJobKind::Import { .. }
+                                | ContentJobKind::Export { .. }
+                                | ContentJobKind::ExportSpace { .. }
+                        ) {
+                            return Err(DomainError::validation(
+                                ValidationReason::InvalidAuthority,
+                            )
+                            .into());
+                        }
+                        item_ctx.guard_archive_commit(None, until);
+                        JobCompletionOutcome::Failed {
+                            completed_units: cur_job.completed_units,
+                            total_units: cur_job.total_units,
+                            error_ref,
+                        }
+                    }
+                };
 
                 let new_lease = cur_job.lease.checked_next()?;
                 let seq = item_ctx.alloc_next_seq()?;

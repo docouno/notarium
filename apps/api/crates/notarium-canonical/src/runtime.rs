@@ -60,6 +60,21 @@ pub(crate) fn deadline_after(
         .unwrap_or_else(|| tokio::time::sleep(duration).deadline())
 }
 
+/// Both database clocks truncate to milliseconds. Starting before the sample
+/// round trip gives a conservative local cutoff for a subsequent synchronous effect.
+pub(crate) fn database_expiry_deadline(
+    sampled_at: tokio::time::Instant,
+    now_ms: i64,
+    expires_ms: i64,
+) -> tokio::time::Instant {
+    let millis = if expires_ms > now_ms {
+        expires_ms.abs_diff(now_ms).saturating_sub(1)
+    } else {
+        0
+    };
+    deadline_after(sampled_at, Duration::from_millis(millis))
+}
+
 fn pg_read_caller_deadline(
     pool: &StorePgPool,
     budget: Option<&CallBudget>,

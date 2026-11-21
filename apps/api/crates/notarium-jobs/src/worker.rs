@@ -330,14 +330,12 @@ impl ArchiveRunner {
         let result = self.admit_and_execute(&scope, &claim, &cancellation).await;
         if let Err(err) = result
             && terminal_failure(&err)
+            && let Ok(budget) = command_budget(&cancellation)
         {
-            self.complete(
-                &scope,
-                &claim,
-                &cancellation,
-                failed_outcome((claim.job.completed_units, claim.job.total_units), &err),
-            )
-            .await;
+            let _ = self
+                .store
+                .fail_unadmitted_archive_job(&budget, &scope, &claim, failure_digest(&err))
+                .await;
         }
         cancellation.cancel();
         let _ = relay.await;
@@ -386,8 +384,13 @@ impl ArchiveRunner {
                     match result {
                         Ok(outcome) => break outcome,
                         Err(err) if terminal_failure(&err) => {
-                            let progress = *execution.progress.lock().unwrap_or_else(|e| e.into_inner());
-                            break failed_outcome(progress, &err);
+                            let (completed_units, total_units) =
+                                *execution.progress.lock().unwrap_or_else(|e| e.into_inner());
+                            break JobCompletionOutcome::Failed {
+                                completed_units,
+                                total_units,
+                                error_ref: failure_digest(&err),
+                            };
                         }
                         Err(err) => return Err(err),
                     }
@@ -411,28 +414,6 @@ impl ArchiveRunner {
             )
             .await?;
         Ok(())
-    }
-
-    async fn complete(
-        &self,
-        scope: &HistoryScope,
-        claim: &ClaimedContentJob,
-        cancellation: &Cancellation,
-        outcome: JobCompletionOutcome,
-    ) {
-        if let Ok(budget) = command_budget(cancellation) {
-            let _ = self
-                .store
-                .complete_job(
-                    &budget,
-                    scope,
-                    &claim.job.id,
-                    &claim.lease_owner,
-                    claim.job.lease,
-                    outcome,
-                )
-                .await;
-        }
     }
 
     async fn heartbeat(&self, job: &JobExecution) -> Result<(), PortError> {
@@ -471,21 +452,14 @@ pub(crate) fn command_budget(cancellation: &Cancellation) -> Result<CallBudget, 
     })
 }
 
-fn failed_outcome(
-    (completed_units, total_units): (u64, Option<u64>),
-    err: &PortError,
-) -> JobCompletionOutcome {
+fn failure_digest(err: &PortError) -> ContentDigest {
     let code = match err {
         PortError::Domain(DomainError::ValidationFailed { diagnostic }) => {
             format!("{:?}", diagnostic.reason)
         }
         _ => err.code().to_owned(),
     };
-    JobCompletionOutcome::Failed {
-        completed_units,
-        total_units,
-        error_ref: ContentDigest::from_bytes(*blake3::hash(code.as_bytes()).as_bytes()),
-    }
+    ContentDigest::from_bytes(*blake3::hash(code.as_bytes()).as_bytes())
 }
 
 fn terminal_failure(error: &PortError) -> bool {

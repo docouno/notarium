@@ -116,7 +116,7 @@ pub struct ItemExecCtx {
     pending_dir_syncs: PendingDirSyncs,
     retained_tickets: Vec<StagedBlobTicket>,
     retained_guards: Vec<Box<dyn Send>>,
-    archive_commit: Option<(crate::peers::archive_import::ArchiveCommitAuthority, i64)>,
+    archive_commit: Option<crate::peers::archive_import::ArchiveCommitGuard>,
     after_commit: Option<Box<dyn FnOnce() + Send>>,
 }
 
@@ -179,10 +179,12 @@ impl ItemExecCtx {
 
     pub(crate) fn guard_archive_commit(
         &mut self,
-        authority: crate::peers::archive_import::ArchiveCommitAuthority,
+        authority: Option<crate::peers::archive_import::ArchiveCommitAuthority>,
         expires: i64,
     ) {
-        self.archive_commit = Some((authority, expires));
+        self.archive_commit = Some(crate::peers::archive_import::ArchiveCommitGuard::new(
+            authority, expires,
+        ));
     }
 
     pub(crate) fn on_commit(&mut self, action: impl FnOnce() + Send + 'static) {
@@ -1964,19 +1966,11 @@ async fn execute_batch_on_conn(
         return BatchExecOutcome::AbortedBeforeCommit(sync_err);
     }
 
-    if !archive_commits.is_empty() {
-        let settled = async {
-            let now = crate::peers::archive_import::archive_commit_clock(tx).await?;
-            for (authority, until) in &archive_commits {
-                authority.check_expiry(now, *until)?;
-            }
-            Ok(())
-        }
-        .await;
-        if let Err(err) = settled {
-            transaction.rollback().await;
-            return BatchExecOutcome::AbortedBeforeCommit(err);
-        }
+    if let Err(err) =
+        crate::peers::archive_import::ArchiveCommitGuard::settle(tx, &archive_commits).await
+    {
+        transaction.rollback().await;
+        return BatchExecOutcome::AbortedBeforeCommit(err);
     }
 
     // Commit outer SQL transaction!
@@ -2059,7 +2053,7 @@ struct SingleItemSuccess {
     dir_syncs: PendingDirSyncs,
     retained_tickets: Vec<StagedBlobTicket>,
     retained_guards: Vec<Box<dyn Send>>,
-    archive_commit: Option<(crate::peers::archive_import::ArchiveCommitAuthority, i64)>,
+    archive_commit: Option<crate::peers::archive_import::ArchiveCommitGuard>,
     after_commit: Option<Box<dyn FnOnce() + Send>>,
 }
 

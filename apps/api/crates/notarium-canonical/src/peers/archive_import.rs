@@ -160,20 +160,60 @@ impl ArchiveCommitAuthority {
         tx: &mut BackendConn<'_>,
         lease_until: i64,
     ) -> Result<(), PortError> {
-        let now = archive_commit_clock(tx).await?;
-        self.check_expiry(now, lease_until)
+        let guard = ArchiveCommitGuard::new(Some(self.clone()), lease_until);
+        ArchiveCommitGuard::settle(tx, &[guard]).await
+    }
+}
+
+pub(crate) struct ArchiveCommitGuard {
+    authority: Option<ArchiveCommitAuthority>,
+    lease_until: i64,
+}
+
+impl ArchiveCommitGuard {
+    pub(crate) fn new(authority: Option<ArchiveCommitAuthority>, lease_until: i64) -> Self {
+        Self {
+            authority,
+            lease_until,
+        }
     }
 
-    pub(crate) fn check_expiry(&self, now: i64, lease_until: i64) -> Result<(), PortError> {
-        self.check()?;
-        if lease_until <= now {
+    pub(crate) async fn settle(tx: &mut BackendConn<'_>, guards: &[Self]) -> Result<(), PortError> {
+        let Some(first) = guards.first() else {
+            return Ok(());
+        };
+        let mut until = first.lease_until;
+        for guard in &guards[1..] {
+            // One isolated import batch shares a single Control registration.
+            match (&first.authority, &guard.authority) {
+                (Some(a), Some(b)) if Arc::ptr_eq(&a.0, &b.0) => {}
+                _ => {
+                    return Err(internal_not_committed(
+                        "archive_commit_group",
+                        "mixed archive guards",
+                    ));
+                }
+            }
+            until = until.min(guard.lease_until);
+        }
+        let sampled_at = tokio::time::Instant::now();
+        let now = if first.authority.is_some() {
+            archive_commit_clock(tx).await?
+        } else {
+            super::job_clock_ms(tx).await?
+        };
+        let deadline = crate::runtime::database_expiry_deadline(sampled_at, now, until);
+        if let Some(authority) = &first.authority {
+            authority.check()?;
+        }
+        if tokio::time::Instant::now() >= deadline {
             return Err(invalid(ValidationReason::InvalidAuthority));
         }
         Ok(())
     }
 }
 
-pub(crate) async fn archive_commit_clock(tx: &mut BackendConn<'_>) -> Result<i64, PortError> {
+async fn archive_commit_clock(tx: &mut BackendConn<'_>) -> Result<i64, PortError> {
     match tx {
         BackendConn::Sqlite(_) => super::job_clock_ms(tx).await,
         BackendConn::Postgres(conn) => sqlx::query_scalar(
@@ -734,7 +774,7 @@ impl CanonicalStore {
                     )
                     .await?;
                     let expires = fence.check_and_apply(tx, ordinal).await?;
-                    item.guard_archive_commit(authority, expires);
+                    item.guard_archive_commit(Some(authority), expires);
                     execute(tx, item).await
                 })
             });
@@ -986,4 +1026,36 @@ async fn import_source_tx(
     .map_err(|err| internal_not_committed("archive_import_source_read", err.to_string()))?
     .ok_or(DomainError::ResourceNotFound)?;
     decode_msgpack_bounded(&payload, MAX_MSGPACK_DECODE_BYTES)
+}
+
+#[cfg(test)]
+mod settlement_tests {
+    use super::*;
+    use sqlx::Connection;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountChecks(Arc<AtomicUsize>);
+    impl RevocationLease for CountChecks {
+        fn check(&self) -> Result<(), PortError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn isolated_import_group_checks_one_registration_and_the_earliest_expiry() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let registration = ArchiveCommitAuthority::new(Box::new(CountChecks(calls.clone())));
+        let mut db = sqlx::SqliteConnection::connect(":memory:").await.unwrap();
+        let mut tx = BackendConn::Sqlite(&mut db);
+        let mut guards = (0..IMPORT_BATCH_LIMIT)
+            .map(|_| ArchiveCommitGuard::new(Some(registration.clone()), i64::MAX))
+            .collect::<Vec<_>>();
+        ArchiveCommitGuard::settle(&mut tx, &guards).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        guards.last_mut().unwrap().lease_until = 0;
+        assert!(matches!(ArchiveCommitGuard::settle(&mut tx, &guards).await,
+            Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
+                if diagnostic.reason == ValidationReason::InvalidAuthority));
+    }
 }

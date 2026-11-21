@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+#[path = "l7_chats_jobs_and_collab/archive_commit.rs"]
+mod archive_commit;
 #[path = "l7_chats_jobs_and_collab/authority.rs"]
 mod authority;
 #[path = "l7_chats_jobs_and_collab/pg_read_cancellation.rs"]
