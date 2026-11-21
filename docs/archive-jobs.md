@@ -139,6 +139,10 @@ from pre-quarantine catalogs.
   overlays and agent runs. It verifies current folder and project links, the
   root's initial revision at sequence zero and permanent fences for purged
   notes. Historical moves retain the parent recorded at the time of the move.
+  Ability manifests must name the active Skill revision visible when the package
+  was published. Its carrier digest must match the manifest row and the
+  `SKILL.md` resource. Active packages must also resolve to their bound live
+  Skill note.
   SQLite verification reads the stored database slices through a
   read-only range VFS in a separate process. The default worker caps SQLite's
   native heap at 80 MiB and reports the measured native high-water mark.

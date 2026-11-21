@@ -727,6 +727,9 @@ fn verify_canonical_spool(
             options.max_pg_row_bytes,
             |table, row| {
                 check_cancelled(&budget.cancellation)?;
+                if let Some(result) = keys.publication_pass(table, row) {
+                    return result;
+                }
                 if let (
                     "blob_catalog",
                     [

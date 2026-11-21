@@ -1,6 +1,7 @@
 //! Check the schema and references using trusted storage definitions. Logical
 //! spools cannot prove a foreign key by presenting only a self-authored header.
 
+mod ability;
 mod revisions;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -854,6 +855,7 @@ impl Relations {
                 keys: BTreeMap::new(),
                 references: BTreeMap::new(),
                 history: revisions::Histories::default(),
+                replay_publications: false,
                 full: false,
                 parts: None,
             };
@@ -874,6 +876,11 @@ impl Relations {
             }
             if !partition.full {
                 partition.check_histories()?;
+                if partition.history.publications.len() > 0 {
+                    partition.replay_publications = true;
+                    scan(&mut partition)?;
+                    partition.history.publications.verify(cancellation)?;
+                }
             }
         }
         Ok(())
@@ -887,6 +894,7 @@ pub(crate) struct Partition<'a> {
     keys: BTreeMap<[u8; 32], u8>,
     references: BTreeMap<[u8; 32], BlobReferences>,
     history: revisions::Histories,
+    replay_publications: bool,
     full: bool,
     parts: Option<PublicationParts>,
 }
@@ -921,6 +929,15 @@ struct PublicationParts {
 }
 
 impl Partition<'_> {
+    pub(crate) fn publication_pass(
+        &mut self,
+        table: TableSpec,
+        row: &[PostgresSpoolValue],
+    ) -> Option<Result<(), PortError>> {
+        self.replay_publications
+            .then(|| self.history.publications.observe(table.name, row))
+    }
+
     fn note_unique(&mut self, index: &IndexRule, values: &[ValueRef<'_>]) {
         if self.full {
             return;
@@ -1022,6 +1039,16 @@ impl Partition<'_> {
                     let RevisionMetadataPayload::Ability(ability) = value else {
                         return Err(invalid(ValidationReason::InvalidArchive));
                     };
+                    let sql_digest = match &row[10] {
+                        Bytes(hash) => Some(hash.as_slice()),
+                        _ => None,
+                    };
+                    let Int(cutoff) = row[6] else {
+                        return Err(invalid(ValidationReason::InvalidArchive));
+                    };
+                    self.history
+                        .publications
+                        .require(space, cutoff, &ability, sql_digest)?;
                     for (path, hash) in ability.resources {
                         self.ability_key(
                             space,
@@ -1037,7 +1064,29 @@ impl Partition<'_> {
             ("revision_purge_fences", [Text(space), _, Text(note), ..]) => {
                 self.domain_key("note_purge", &[space, note], &[], PRESENT | EXACT);
             }
+            (
+                "ability_packages",
+                [
+                    Text(space),
+                    Text(ability),
+                    _,
+                    _,
+                    Text(note),
+                    _,
+                    _,
+                    Text(state),
+                    ..,
+                ],
+            ) if state == "active" => {
+                self.domain_key("active_entrypoint", &[space, note, ability], &[], REQUIRED);
+            }
             ("note_heads", [Text(space), Text(note), ..]) => {
+                if let (Text(class), Text(ability), Text(state)) = (&row[7], &row[8], &row[12])
+                    && class == "skill"
+                    && state == "active"
+                {
+                    self.domain_key("active_entrypoint", &[space, note, ability], &[], PRESENT);
+                }
                 if matches!(&row[12], Text(state) if state == "purged") {
                     self.domain_key("note_purge", &[space, note], &[], REQUIRED);
                 }

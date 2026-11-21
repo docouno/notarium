@@ -29,6 +29,8 @@ use notarium_jobs::{
     run_backup, run_fsck, run_restore,
 };
 
+#[path = "maintenance/ability_history.rs"]
+mod ability_history;
 #[path = "maintenance/cloud_takeover.rs"]
 mod cloud_takeover;
 #[path = "maintenance/paired_load.rs"]
@@ -70,6 +72,14 @@ fn authority(purpose: ServicePurpose) -> MaintenanceContext {
 }
 
 fn auth(scope: &HistoryScope, owner: &PrincipalId) -> SpaceContext {
+    human_context(scope, owner, false)
+}
+
+fn human_context(
+    scope: &HistoryScope,
+    owner: &PrincipalId,
+    manage_abilities: bool,
+) -> SpaceContext {
     let human = VerifiedHuman::attest(
         owner.clone(),
         GrantId::from_bytes([1; 16]),
@@ -82,8 +92,9 @@ fn auth(scope: &HistoryScope, owner: &PrincipalId) -> SpaceContext {
                 project_root: None,
             },
         )]),
-        false,
-    );
+        manage_abilities,
+    )
+    .with_human_management(manage_abilities);
     SpaceContext::new(EngineAuthContext::for_human(human), scope.clone(), budget()).unwrap()
 }
 
@@ -336,12 +347,23 @@ fn repackage_sqlite(
     database: &str,
     statement: &str,
 ) -> Cursor<Vec<u8>> {
+    change_sqlite_archive(path, scratch, database, |db| {
+        db.execute_batch(statement).unwrap()
+    })
+}
+
+fn change_sqlite_archive(
+    path: &Path,
+    scratch: &Path,
+    database: &str,
+    change: impl FnOnce(&rusqlite::Connection),
+) -> Cursor<Vec<u8>> {
     repackage_database(path, database, |payload| {
         let image = scratch.join(codec::new_prefixed_hex_id("forged_sqlite_").unwrap());
         fs::write(&image, &*payload).unwrap();
         let db = rusqlite::Connection::open(&image).unwrap();
         db.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
-        db.execute_batch(statement).unwrap();
+        change(&db);
         assert_eq!(
             db.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
                 .unwrap(),
@@ -1163,7 +1185,7 @@ async fn sqlite_archive_verification_restore_and_rejection() {
             replay_published_local(&restored, &root, &destination, &result).await;
         }
         let location = if existing {
-            KeyringLocation::LocalDefault(restored)
+            KeyringLocation::LocalDefault(restored.clone())
         } else {
             KeyringLocation::External(root.keyring())
         };
@@ -1171,7 +1193,27 @@ async fn sqlite_archive_verification_restore_and_rejection() {
             .await
             .unwrap();
         assert_eq!(keys.inspect(budget()).await.unwrap().len(), 1);
-        drop(keys);
+        if existing {
+            let adapter = ControlBackup::new(
+                restored_control.clone(),
+                keys,
+                restored,
+                BackupConfig::default(),
+            )
+            .unwrap();
+            ability_history::round_trip(
+                &restored_canonical,
+                &adapter,
+                &result.histories[0].scope,
+                &owner,
+                &scratch.0,
+                RestoreTarget::Local {
+                    root: DataRoot::new(scratch.0.join("ability-target")),
+                    keyring: RestoreKeyring::External(root.keyring()),
+                },
+            )
+            .await;
+        }
         restored_control.close().await;
         restored_runtime.shutdown().await.unwrap();
     }
@@ -1446,7 +1488,14 @@ async fn cloud_archive_verification_and_restore_to_an_independent_namespace() {
     source.database = codec::new_prefixed_hex_id("jobs_src_").unwrap();
     target.database = codec::new_prefixed_hex_id("jobs_dst_").unwrap();
     competing.database = codec::new_prefixed_hex_id("jobs_compete_").unwrap();
-    for database in [&source.database, &target.database, &competing.database] {
+    let mut ability_target = target.clone();
+    ability_target.database = codec::new_prefixed_hex_id("jobs_ability_").unwrap();
+    for database in [
+        &source.database,
+        &target.database,
+        &competing.database,
+        &ability_target.database,
+    ] {
         QueryBuilder::<Postgres>::new("CREATE DATABASE ")
             .push(database)
             .build()
@@ -1861,7 +1910,28 @@ async fn cloud_archive_verification_and_restore_to_an_independent_namespace() {
     .await
     .unwrap();
     assert_eq!(new_keys.inspect(budget()).await.unwrap().len(), 1);
-    drop(new_keys);
+    let target_backup = ControlBackup::new(
+        restored_control.clone(),
+        new_keys,
+        root.clone(),
+        BackupConfig::default(),
+    )
+    .unwrap();
+    ability_history::round_trip(
+        &restored_store,
+        &target_backup,
+        live_scope,
+        &owner,
+        &scratch.0,
+        RestoreTarget::Cloud(Box::new(CloudRestoreTarget {
+            database: ability_target.clone(),
+            object_store: fixture.s3("ability-target", bucket.clone()),
+            scratch: root.clone(),
+            external_keyring: root.keyring(),
+        })),
+    )
+    .await;
+    drop(target_backup);
     restored_control.close().await;
     restored_runtime.shutdown().await.unwrap();
     let mut legacy = PgConnection::connect_with(&build_pg_connect_options(&target))
@@ -1911,7 +1981,12 @@ async fn cloud_archive_verification_and_restore_to_an_independent_namespace() {
     control.close().await;
     runtime.shutdown().await.unwrap();
     src_sql.close().await.unwrap();
-    for database in [&source.database, &target.database, &competing.database] {
+    for database in [
+        &source.database,
+        &target.database,
+        &competing.database,
+        &ability_target.database,
+    ] {
         QueryBuilder::<Postgres>::new("DROP DATABASE ")
             .push(database)
             .build()

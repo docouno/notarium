@@ -1,5 +1,6 @@
 //! The immutable revision selected by the reader must belong to the retained head.
 use super::*;
+use notarium_canonical::codec::ability_kind_to_db;
 use notarium_core::{
     ids::{AgentRunId, PrincipalId, RevisionId},
     model::Lifecycle,
@@ -75,7 +76,10 @@ pub(super) fn sqlite(db: &Connection, cancellation: &Cancellation) -> Result<(),
            (n.lifecycle_state='purged')<>EXISTS(SELECT 1 FROM revision_purge_fences p
              WHERE p.space_id=n.space_id AND p.note_id=n.note_id))
            OR EXISTS (SELECT 1 FROM revision_purge_fences p WHERE NOT EXISTS(
-             SELECT 1 FROM note_heads n WHERE n.space_id=p.space_id AND n.note_id=p.note_id AND n.lifecycle_state='purged'))",
+             SELECT 1 FROM note_heads n WHERE n.space_id=p.space_id AND n.note_id=p.note_id AND n.lifecycle_state='purged'))
+           OR EXISTS (SELECT 1 FROM ability_packages a WHERE a.lifecycle_state='active' AND NOT EXISTS (
+             SELECT 1 FROM note_heads n WHERE n.space_id=a.space_id AND n.note_id=a.entrypoint_note_id
+               AND n.ability_id=a.ability_id AND n.doc_class='skill' AND n.lifecycle_state='active'))",
         [], |r| r.get(0)).map_err(sql_error)?;
     if bad {
         return Err(invalid_history());
@@ -85,6 +89,13 @@ pub(super) fn sqlite(db: &Connection, cancellation: &Cancellation) -> Result<(),
         .prepare(
             "SELECT resource_key,content_blake3 FROM blob_references
           WHERE owner_kind='ability_resource' AND space_id=?1 AND owner_id=?2 AND owner_rev_id=?3",
+        )
+        .map_err(sql_error)?;
+    let mut entrypoint = db
+        .prepare(
+            "SELECT rev_id,content_blake3,metadata_msgpack,visibility_seq,space_seq FROM revisions
+         WHERE space_id=?1 AND entity_type='note' AND entity_key=?2 AND visibility_seq<=?3
+         ORDER BY visibility_seq DESC,space_seq DESC LIMIT 2",
         )
         .map_err(sql_error)?;
     let mut all = db.prepare(
@@ -97,7 +108,11 @@ pub(super) fn sqlite(db: &Connection, cancellation: &Cancellation) -> Result<(),
                  WHEN 'thread' THEN EXISTS(SELECT 1 FROM chat_threads t WHERE t.space_id=r.space_id AND t.thread_id=r.entity_key)
                  WHEN 'ability' THEN EXISTS(SELECT 1 FROM ability_packages a WHERE a.space_id=r.space_id AND a.ability_id=r.entity_key)
                  WHEN 'agent_run' THEN EXISTS(SELECT 1 FROM agent_run_heads a WHERE a.space_id=r.space_id AND a.run_id=r.entity_key)
-                 ELSE 1 END
+                 ELSE 1 END, r.visibility_seq,
+                 CASE WHEN r.entity_type='ability' THEN
+                     (SELECT a.entrypoint_note_id FROM ability_packages a WHERE a.space_id=r.space_id AND a.ability_id=r.entity_key) END,
+                 CASE WHEN r.entity_type='ability' THEN
+                     (SELECT a.kind FROM ability_packages a WHERE a.space_id=r.space_id AND a.ability_id=r.entity_key AND a.manifest_rev_id=r.rev_id) END
          FROM revisions r LEFT JOIN spaces s ON s.space_id=r.space_id
          LEFT JOIN blob_catalog c ON r.entity_type='note' AND c.space_id=r.space_id AND c.content_blake3=r.content_blake3",
     ).map_err(sql_error)?;
@@ -140,6 +155,20 @@ pub(super) fn sqlite(db: &Connection, cancellation: &Cancellation) -> Result<(),
             }
             RevisionMetadataPayload::Ability(a) => {
                 let space: String = row.get(8).map_err(sql_error)?;
+                let listed_kind: Option<String> = row.get(15).map_err(sql_error)?;
+                if a.entrypoint_note_id.as_str() != row.get::<_, String>(14).map_err(sql_error)?
+                    || listed_kind.is_some_and(|kind| kind != ability_kind_to_db(a.kind))
+                {
+                    return Err(invalid_history());
+                }
+                let stored: Option<Vec<u8>> = row.get(9).map_err(sql_error)?;
+                ability::sqlite(
+                    &mut entrypoint,
+                    &space,
+                    row.get(13).map_err(sql_error)?,
+                    &a,
+                    stored.as_deref(),
+                )?;
                 let mut expected = a.resources;
                 let mut refs = resources
                     .query(params![space, owner, rev])
@@ -158,12 +187,12 @@ pub(super) fn sqlite(db: &Connection, cancellation: &Cancellation) -> Result<(),
                     return Err(invalid(ValidationReason::InvalidDigest));
                 }
             }
-            RevisionMetadataPayload::Folder(folder) => {
+            RevisionMetadataPayload::Folder(folder)
                 if folder.is_root
-                    != (folder.folder_id.as_str() == row.get::<_, String>(11).map_err(sql_error)?)
-                {
-                    return Err(invalid_history());
-                }
+                    != (folder.folder_id.as_str()
+                        == row.get::<_, String>(11).map_err(sql_error)?) =>
+            {
+                return Err(invalid_history());
             }
             _ => {}
         }
@@ -279,11 +308,12 @@ pub(super) struct Histories {
     // Partition by (space, incarnation), so witnesses and maximum revision
     // visibility meet without copying every Space into each partition.
     cuts: BTreeMap<Key, (Option<i64>, i64)>,
+    pub(super) publications: super::ability::Publications,
 }
 
 impl Histories {
     pub(super) fn len(&self) -> usize {
-        self.entities.len() + self.cuts.len()
+        self.entities.len() + self.cuts.len() + self.publications.len()
     }
 }
 
@@ -358,6 +388,16 @@ impl Partition<'_> {
                     optional(&row[9])?,
                 )?;
                 let value = metadata(kind, owner, bytes(&row[11])?)?;
+                if let RevisionMetadataPayload::Ability(a) = &value {
+                    self.record_domain_key(
+                        "package_note",
+                        &[space, owner, a.entrypoint_note_id.as_str()],
+                        &[],
+                        REQUIRED,
+                        0,
+                        0,
+                    );
+                }
                 let state = self.history.entities.entry(id).or_default();
                 state.needs_owner = kind != "rank";
                 if let RevisionMetadataPayload::Folder(f) = &value
@@ -374,7 +414,11 @@ impl Partition<'_> {
                 {
                     state.at_zero = true;
                 }
-                let witness = key(&[rev, head_link(&value).unwrap_or("")]);
+                let package_kind = match &value {
+                    RevisionMetadataPayload::Ability(manifest) => ability_kind_to_db(manifest.kind),
+                    _ => "",
+                };
+                let witness = key(&[rev, head_link(&value).unwrap_or(""), package_kind]);
                 match state.latest {
                     Some((old, _)) if old == order => state.tie = true,
                     Some((old, _)) if old > order => {}
@@ -431,6 +475,16 @@ impl Partition<'_> {
         let space = string(&row[0])?;
         let id = key(&[space, kind, &owner]);
         if self.includes(&id) {
+            if table == "ability_packages" {
+                self.record_domain_key(
+                    "package_note",
+                    &[space, &owner, string(&row[4])?],
+                    &[],
+                    PRESENT,
+                    0,
+                    0,
+                );
+            }
             let state = self.history.entities.entry(id).or_default();
             state.has_owner = true;
             if (table == "note_heads" && string(&row[12])? == "purged")
@@ -438,7 +492,12 @@ impl Partition<'_> {
             {
                 return Ok(None);
             }
-            state.head = Some(key(&[rev, link.unwrap_or("")]));
+            let listed_kind = if table == "ability_packages" {
+                string(&row[2])?
+            } else {
+                ""
+            };
+            state.head = Some(key(&[rev, link.unwrap_or(""), listed_kind]));
             state.root = kind == "folder" && link.is_none();
         }
         Ok(None)

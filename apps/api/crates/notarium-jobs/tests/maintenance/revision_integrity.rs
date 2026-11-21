@@ -35,9 +35,7 @@ impl RevisionFault {
 
     pub(super) fn postgres_archive(self, path: &Path, note_metadata: &[u8]) -> Cursor<Vec<u8>> {
         use PostgresSpoolValue::{Bytes, Int, Text};
-        repackage_database(path, "canonical", |spool| {
-            let mut rows = revision_rows(spool);
-            let original = encode_rows(&rows);
+        change_postgres_revisions(path, |rows| {
             // This space began at sequence zero, before any user command.
             let root = rows
                 .iter()
@@ -64,17 +62,28 @@ impl RevisionFault {
                 }
                 Self::FutureVisibility => rows[root][6] = Int(i64::MAX),
             }
-            let offset = spool
-                .windows(original.len())
-                .position(|bytes| bytes == original)
-                .unwrap();
-            spool.splice(offset..offset + original.len(), encode_rows(&rows));
-            let body_len = spool.len() - 32;
-            let (body, trailer) = spool.split_at_mut(body_len);
-            trailer.copy_from_slice(blake3::hash(body).as_bytes());
-            assert_eq!(revision_rows(spool), rows);
         })
     }
+}
+
+pub(super) fn change_postgres_revisions(
+    path: &Path,
+    change: impl FnOnce(&mut Vec<Vec<PostgresSpoolValue>>),
+) -> Cursor<Vec<u8>> {
+    repackage_database(path, "canonical", |spool| {
+        let mut rows = revision_rows(spool);
+        let original = encode_rows(&rows);
+        change(&mut rows);
+        let offset = spool
+            .windows(original.len())
+            .position(|bytes| bytes == original)
+            .unwrap();
+        spool.splice(offset..offset + original.len(), encode_rows(&rows));
+        let body_len = spool.len() - 32;
+        let (body, trailer) = spool.split_at_mut(body_len);
+        trailer.copy_from_slice(blake3::hash(body).as_bytes());
+        assert_eq!(revision_rows(spool), rows);
+    })
 }
 
 fn revision_rows(spool: &[u8]) -> Vec<Vec<PostgresSpoolValue>> {

@@ -668,6 +668,9 @@ fn snapshot_references(
                     options.max_pg_row_bytes,
                     |table, row| {
                         check_cancelled(cancellation)?;
+                        if let Some(result) = keys.publication_pass(table, row) {
+                            return result;
+                        }
                         checks.check(table, row, Some(keys))?;
                         keys.canonical(table, row)
                     },
