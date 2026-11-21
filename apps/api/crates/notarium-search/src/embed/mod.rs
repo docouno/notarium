@@ -20,6 +20,8 @@ pub enum EmbeddingError {
     ModelUnavailable,
     #[error("the embedding provider is unavailable")]
     ProviderUnavailable,
+    #[error("the document no longer qualifies for remote indexing")]
+    IndexingDenied,
     #[error("the embedding request exceeded its budget")]
     BudgetExceeded,
     #[error("invalid or unsupported tokenizer or model")]
@@ -72,7 +74,9 @@ impl EmbeddingError {
         use notarium_core::ports::SearchDegradation;
         match self {
             Self::BudgetExceeded | Self::Cancelled => SearchDegradation::BudgetExceeded,
-            Self::ProviderUnavailable => SearchDegradation::ProviderUnavailable,
+            Self::ProviderUnavailable | Self::IndexingDenied => {
+                SearchDegradation::ProviderUnavailable
+            }
             Self::ModelUnavailable | Self::InvalidModel | Self::Io(_) => {
                 SearchDegradation::ModelUnavailable
             }

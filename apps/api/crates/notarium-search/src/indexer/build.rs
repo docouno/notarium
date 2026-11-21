@@ -10,15 +10,12 @@ use crate::{
 use notarium_canonical::chats::search::HydratedChatHit;
 use notarium_core::{
     classes::{ClassEgressFence, DocClass, SearchContent},
-    ids::{ChatThreadId, FolderId, NoteId, SpaceSeq, ThreadEntrySeq},
+    ids::{ChatThreadId, SpaceSeq, ThreadEntrySeq},
     model::Lifecycle,
     ports::PageLimit,
     receipt::ChangeCursor,
 };
-use std::{
-    collections::{BTreeSet, HashMap},
-    sync::Arc,
-};
+use std::{collections::HashMap, sync::Arc};
 
 pub(super) async fn scrub(
     cx: &Context<'_>,
@@ -171,56 +168,34 @@ pub(super) async fn refresh_model(
             }
             None => (None, target.is_some()),
         };
-        let mut folder_events = dirty.take_remote_folders(target.as_ref());
-        loop {
-            if let (Some(epoch), Some(embedder)) = (epoch.as_mut(), embedder.as_ref()) {
-                let cutoff = disk.cursor();
-                if !folder_events.is_empty() {
-                    let descendants = super::during_model_work(
-                        cx,
-                        disk,
-                        publisher,
-                        &mut dirty,
-                        subtree_notes(cx, &cutoff, &folder_events),
-                    )
-                    .await?;
-                    dirty.notes.extend(descendants);
-                }
-                if !dirty.notes.is_empty() {
-                    let ids = std::mem::take(&mut dirty.notes).into_iter().collect();
-                    let cutoff = disk.cursor();
-                    let folders = disk.folders.clone();
-                    pending |= super::during_model_work(
-                        cx,
-                        disk,
-                        publisher,
-                        &mut dirty,
-                        refresh_notes(cx, epoch, embedder, &cutoff, &folders, ids),
-                    )
-                    .await?;
-                    if pending && have_epoch {
-                        return Err(crate::embed::EmbeddingError::ModelUnavailable.into());
-                    }
-                }
-            }
-            let selected = super::during_model_work(cx, disk, publisher, &mut dirty, async {
-                Ok(cx.services.model_target(&base.scope, None, None).await?)
-            })
+        if let (Some(epoch), Some(embedder)) = (epoch.as_mut(), embedder.as_ref())
+            && !dirty.notes.is_empty()
+        {
+            let ids = std::mem::take(&mut dirty.notes).into_iter().collect();
+            let cutoff = disk.cursor();
+            let folders = disk.folders.clone();
+            pending |= super::during_model_work(
+                cx,
+                disk,
+                publisher,
+                &mut dirty,
+                refresh_notes(cx, epoch, embedder, &cutoff, &folders, ids),
+            )
             .await?;
-            if selected != target {
-                return Err(crate::embed::EmbeddingError::ModelUnavailable.into());
-            }
-            folder_events = dirty.take_remote_folders(target.as_ref());
-            if epoch.is_none() || folder_events.is_empty() {
-                break;
-            }
+        }
+        let selected = super::during_model_work(cx, disk, publisher, &mut dirty, async {
+            Ok(cx.services.model_target(&base.scope, None, None).await?)
+        })
+        .await?;
+        if selected != target {
+            return Err(crate::embed::EmbeddingError::ModelUnavailable.into());
         }
         if let Some(epoch) = epoch.as_mut() {
-            // The replacement is complete for the replay cut. Newer edits
-            // receive the same durable invalidation as live edits on an active
-            // epoch, so promotion never waits for a quiet stream of writers.
+            // Mask edits newer than the replay. The structural cut enforces
+            // folder membership while bounded repair reconciles vector slots.
             let seq = disk.manifest.tantivy_seq;
-            pending |= !dirty.notes.is_empty();
+            pending |=
+                !dirty.take_remote_folders(target.as_ref()).is_empty() || !dirty.notes.is_empty();
             for id in dirty.notes {
                 epoch.apply(seq, crate::vector::MutableOperation::Delete(id))?;
             }
@@ -248,32 +223,6 @@ pub(super) async fn refresh_model(
     disk.embedder = embedder;
     publisher.publish(disk);
     Ok(true)
-}
-
-/// A folder transition need only replay descendants. Preserve the candidate
-/// and its embeddings for notes outside the affected subtrees.
-async fn subtree_notes(
-    cx: &Context<'_>,
-    cutoff: &ChangeCursor,
-    folders: &BTreeSet<FolderId>,
-) -> Result<Vec<NoteId>, IndexError> {
-    let mut notes = Vec::new();
-    let mut after = None;
-    loop {
-        let page = note_page(cx, cutoff, after).await?;
-        for note in page.notes {
-            if let Ok(content) =
-                ClassEgressFence::index_for_search(note.document, &cx.services.authority)
-                && content.was_under_any_folder(folders)
-            {
-                notes.push(note.note_id);
-            }
-        }
-        after = page.next_after;
-        if after.is_none() {
-            return Ok(notes);
-        }
-    }
 }
 
 async fn refresh_notes(

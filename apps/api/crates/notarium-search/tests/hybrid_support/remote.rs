@@ -632,29 +632,57 @@ pub async fn model_epochs_and_repair(store: Arc<CanonicalStore>, root: DataRoot)
         })
         .await
         .unwrap();
+    let leaving = sample_folder_id(0x6d);
+    store
+        .create_folder(CreateFolderSpec {
+            scope: space.scope.clone(),
+            active_epoch: lease,
+            folder_id: leaving.clone(),
+            parent: Some(project.clone()),
+            slug: "leaving".into(),
+            display_name: "Leaving".into(),
+            is_project: false,
+            project_slug: None,
+            actor: owner.clone(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+    let revoked_note = sample_note_id(0x6d);
     let scoped_note = sample_note_id(0x6c);
     let (range, _) = store
         .commit_synthetic_note_batch_for_test(
             &space.scope,
             lease,
             &owner,
-            vec![note(&scoped_note, &project, "Project note", "inside scope")],
+            vec![
+                note(&scoped_note, &project, "Project note", "inside scope"),
+                note(&revoked_note, &leaving, "Project note", "inside scope"),
+            ],
         )
         .await
         .unwrap();
     {
         let mut view = projection.snapshot.write().unwrap();
         view.project(project.clone(), folder.clone());
+        view.folder(leaving.clone(), project.clone());
         view.index(scoped_note.clone(), project.clone());
+        view.index(revoked_note.clone(), leaving.clone());
         view.advance(range.last_seq);
     }
-    projection.live.write().unwrap().insert(scoped_note.clone());
+    projection
+        .live
+        .write()
+        .unwrap()
+        .extend([scoped_note.clone(), revoked_note.clone()]);
     acknowledged(&store, &root, &space.scope, range.last_seq).await;
     let previous_outside_parts = provider.outside_parts.load(Ordering::SeqCst);
-    *resolver.project.write().unwrap() = Some(FolderRef {
+    let selected_project = FolderRef {
         space_id: space.scope.space_id.clone(),
         folder_id: project.clone(),
-    });
+    };
+    *provider.block_project.lock().unwrap() = Some(selected_project.clone());
+    *resolver.project.write().unwrap() = Some(selected_project);
     let narrowed = resolver.current_target();
     let (outside, _) = store
         .commit_synthetic_note_batch_for_test(
@@ -675,9 +703,102 @@ pub async fn model_epochs_and_repair(store: Arc<CanonicalStore>, root: DataRoot)
         .write()
         .unwrap()
         .advance(outside.last_seq);
-    acknowledged(&store, &root, &space.scope, outside.last_seq).await;
+    tokio::time::timeout(
+        Duration::from_secs(8),
+        provider.first_project_batch.notified(),
+    )
+    .await
+    .unwrap();
+    resolver.hold_resolution.store(true, Ordering::SeqCst);
+    provider.release_first_project_batch.notify_one();
+    tokio::time::timeout(
+        Duration::from_secs(8),
+        resolver.resolution_started.notified(),
+    )
+    .await
+    .unwrap();
+    let pages = carriers.full_seed_pages.load(Ordering::SeqCst);
+    let move_and_publish = async |id: &FolderId, destination: &FolderId| {
+        use notarium_core::ports::{MoveFolder, NoteWritePort};
+        let moved = store
+            .move_folder(
+                ctx.clone(),
+                crate::mutation(
+                    &ctx,
+                    MoveFolder {
+                        folder: id.clone(),
+                        new_parent: Some(destination.clone()),
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        let seq = moved.receipt.seq();
+        {
+            let mut view = projection.snapshot.write().unwrap();
+            view.folder(id.clone(), destination.clone());
+            view.advance(seq);
+        }
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while layout.search_manifest().unwrap().unwrap().tantivy_seq < seq {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+    };
+    // Both notes qualified at the frozen cut. Revoke one while the final
+    // model selection is held, then keep moving an unrelated empty folder.
+    move_and_publish(&leaving, &folder).await;
+    let empty = sample_folder_id(0xa0);
+    for destination in [&project, &folder, &project, &folder] {
+        move_and_publish(&empty, destination).await;
+    }
+    resolver.hold_grant.store(true, Ordering::SeqCst);
+    resolver.release_resolution.notify_one();
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            move_and_publish(&empty, &project).await;
+            move_and_publish(&empty, &folder).await;
+            if layout
+                .search_manifest()
+                .unwrap()
+                .unwrap()
+                .active_model
+                .as_ref()
+                == Some(&narrowed)
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(carriers.full_seed_pages.load(Ordering::SeqCst), pages);
+    assert!(
+        layout
+            .search_manifest()
+            .unwrap()
+            .unwrap()
+            .embeddings_pending
+    );
     let mut scoped = query("vectorprobe");
     scoped.folder = Some(project.clone());
+    let hits = engine
+        .search(ctx.clone(), scoped.clone())
+        .await
+        .unwrap()
+        .hits;
+    assert!(
+        hits.iter()
+            .any(|hit| hit.card.document.provenance().reference().note_id == scoped_note)
+    );
+    assert!(
+        hits.iter()
+            .all(|hit| hit.card.document.provenance().reference().note_id != revoked_note)
+    );
+    resolver.release_grant.notify_one();
+    acknowledged(&store, &root, &space.scope, outside.last_seq).await;
     tokio::time::timeout(Duration::from_secs(8), async {
         loop {
             let result = engine.search(ctx.clone(), scoped.clone()).await.unwrap();

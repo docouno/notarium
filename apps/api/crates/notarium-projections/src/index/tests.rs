@@ -485,7 +485,7 @@ fn high_cardinality_lists_require_exact_witnesses_even_under_negation() {
     let query = Predicate::Not(Box::new(contains(key, target)));
     let candidates = view.filter_candidates(&query, &universe).unwrap();
     assert_eq!(candidates.definite, flags(&[2]));
-    assert_eq!(candidates.needs_check(), flags(&[0, 1]));
+    assert_eq!(candidates.uncertain, flags(&[0, 1]));
     let exact = view
         .filter(&query, &universe, |dense, predicate| {
             Ok(predicate.matches(&rows[dense.index(view.generation()).unwrap() as usize]))

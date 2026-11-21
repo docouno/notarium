@@ -362,9 +362,13 @@ impl Embedder {
                 )
                 .await
             };
-            let Ok(rows) = rows else {
-                pending = true;
-                continue;
+            let rows = match rows {
+                Ok(rows) => rows,
+                Err(EmbeddingError::IndexingDenied) => return Ok((Vec::new(), false)),
+                Err(_) => {
+                    pending = true;
+                    continue;
+                }
             };
             for (group, row) in batch.into_iter().zip(rows) {
                 if let Some(vector) = row.and_then(|row| QuantizedVector::quantize(&row).ok()) {
@@ -485,7 +489,7 @@ impl Embedder {
                     .await
                     .map_err(|_| EmbeddingError::ProviderUnavailable)?
                 {
-                    return Err(EmbeddingError::ProviderUnavailable);
+                    return Err(EmbeddingError::IndexingDenied);
                 }
                 grant.ctx.budget.remaining = remaining.saturating_sub(started.elapsed());
                 if grant.ctx.budget.remaining.is_zero() {

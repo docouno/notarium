@@ -342,6 +342,7 @@ impl StructuralReadPort for Projection {
 
 pub struct ControlledCarriers {
     canonical: Arc<CanonicalStore>,
+    pub full_seed_pages: AtomicUsize,
     pub reject_seed: AtomicBool,
     pub seed_rejected: Notify,
     pub release_seed: Notify,
@@ -360,6 +361,7 @@ impl ControlledCarriers {
     pub fn new(canonical: Arc<CanonicalStore>) -> Self {
         Self {
             canonical,
+            full_seed_pages: AtomicUsize::new(0),
             reject_seed: AtomicBool::new(false),
             seed_rejected: Notify::new(),
             release_seed: Notify::new(),
@@ -413,6 +415,9 @@ impl SearchCarrierReadPort for ControlledCarriers {
         after_note: Option<NoteId>,
         limit: PageLimit,
     ) -> PortFuture<'_, SearchNotesSeedPage> {
+        if limit.get() == 100 {
+            self.full_seed_pages.fetch_add(1, Ordering::SeqCst);
+        }
         if self.reject_seed.load(Ordering::SeqCst) {
             return Box::pin(async {
                 self.seed_rejected.notify_one();

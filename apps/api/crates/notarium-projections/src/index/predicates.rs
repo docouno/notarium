@@ -35,10 +35,6 @@ impl FilterCandidates {
         self.definite.is_empty() && self.uncertain.is_empty()
     }
 
-    pub fn needs_check(&self) -> Bitmap {
-        self.uncertain.clone()
-    }
-
     #[cfg(test)]
     pub fn possible(&self) -> Bitmap {
         if self.uncertain.is_empty() {
