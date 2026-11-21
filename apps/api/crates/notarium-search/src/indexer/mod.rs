@@ -7,8 +7,8 @@ use crate::{
     config::VectorMode,
     embed::EmbeddingError,
     engine::{
-        Published, Services, SpaceHandle, Worker, maintenance_budget, remove_exited_worker,
-        try_evict_idle_worker,
+        DrainGate, Published, Services, SpaceHandle, WorkerTable, finish_exited_worker,
+        maintenance_budget, try_evict_idle_worker,
     },
     layout::{FolderDictionary, LayoutError, SearchLayout, SearchManifest},
     lexical::{LexicalError, LexicalIndex, TOKENIZER_VERSION},
@@ -39,6 +39,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
+    sync::watch,
     task::JoinHandle,
     time::{MissedTickBehavior, interval, sleep},
 };
@@ -261,10 +262,12 @@ impl Disk {
         }
     }
 
+    fn has_pending_embeddings(&self) -> bool {
+        !self.dirty_notes.is_empty() || self.full_sweep_needed
+    }
+
     fn needs_embedding_work(&self) -> bool {
-        self.epoch.is_some()
-            && self.embedder.is_some()
-            && (!self.dirty_notes.is_empty() || self.full_sweep_needed)
+        self.epoch.is_some() && self.embedder.is_some() && self.has_pending_embeddings()
     }
 
     async fn resume_reader(&mut self, cx: &Context<'_>) -> Result<bool, IndexError> {
@@ -378,6 +381,7 @@ enum LoopEvent {
         force_seed: bool,
         scrub: bool,
         rebind: bool,
+        purge_resync: bool,
     },
     Lagged {
         resume: ChangeCursor,
@@ -385,6 +389,11 @@ enum LoopEvent {
     Wake,
     BgDone(Box<Result<BgOutcome, tokio::task::JoinError>>),
     Tick,
+}
+
+enum AdvanceOutcome {
+    Resync(HistoryScope),
+    Done { scrubbed: bool },
 }
 
 struct Publisher<'a> {
@@ -412,8 +421,8 @@ impl Publisher<'_> {
             active_model: disk.manifest.active_model.clone(),
             embedder: disk.embedder.clone(),
             embeddings_pending: disk.manifest.embeddings_pending,
-            reopening_vectors: disk.manifest.vector_seq.is_some()
-                && (disk.epoch.is_none() || reopening),
+            reopening_vectors: reopening
+                || (disk.manifest.vector_seq.is_some() && disk.epoch.is_none()),
         })));
     }
 
@@ -426,12 +435,41 @@ impl Publisher<'_> {
     }
 }
 
+struct WorkerExitGuard {
+    workers: Weak<Mutex<WorkerTable>>,
+    space_id: SpaceId,
+    handle: Arc<SpaceHandle>,
+    gate: Arc<DrainGate>,
+}
+
+impl Drop for WorkerExitGuard {
+    fn drop(&mut self) {
+        finish_exited_worker(&self.workers, &self.space_id, &self.handle, &self.gate);
+    }
+}
+
 pub(super) async fn run(
     services: Arc<Services>,
     handle: Arc<SpaceHandle>,
-    workers: Weak<Mutex<HashMap<SpaceId, Worker>>>,
+    workers: Weak<Mutex<WorkerTable>>,
+    gate: Arc<DrainGate>,
+    mut prev_drain: Option<watch::Receiver<bool>>,
     mut scope: HistoryScope,
 ) {
+    let _exit_guard = WorkerExitGuard {
+        workers: workers.clone(),
+        space_id: scope.space_id.clone(),
+        handle: handle.clone(),
+        gate,
+    };
+    // Serialize per-Space disk ownership against any evicted worker still
+    // finishing in-flight I/O or draining published snapshots.
+    if let Some(rx) = prev_drain.as_mut() {
+        let _ = rx.wait_for(|done| *done).await;
+    }
+    if handle.stop.is_cancelled() {
+        return;
+    }
     let cx = Context {
         services: &services,
         handle: &handle,
@@ -471,13 +509,12 @@ pub(super) async fn run(
     }
     publisher.replace(None);
     publisher.drain().await;
-    remove_exited_worker(&workers, &scope.space_id, &handle);
 }
 
 async fn consume(
     cx: &Context<'_>,
     publisher: &mut Publisher<'_>,
-    workers: &Weak<Mutex<HashMap<SpaceId, Worker>>>,
+    workers: &Weak<Mutex<WorkerTable>>,
     starting_scope: HistoryScope,
     schedule: Schedule,
 ) -> Result<Option<HistoryScope>, IndexError> {
@@ -574,7 +611,7 @@ async fn consume(
 async fn run_active_loop(
     cx: &Context<'_>,
     publisher: &mut Publisher<'_>,
-    workers: &Weak<Mutex<HashMap<SpaceId, Worker>>>,
+    workers: &Weak<Mutex<WorkerTable>>,
     layout: &Arc<SearchLayout>,
     scope: &HistoryScope,
     schedule: Schedule,
@@ -603,6 +640,7 @@ async fn run_active_loop(
             model_retry_at,
             embedder_retry_at,
             repair_at,
+            schedule.embedder_idle,
             false,
         )?;
         publisher.publish(current, bg.as_ref().is_some_and(BgTask::is_reopening));
@@ -614,9 +652,12 @@ async fn run_active_loop(
     loop {
         let now = Instant::now();
         let wake_repair = bg.is_none()
-            && disk
-                .as_ref()
-                .is_some_and(|d| d.lexical.is_some() && d.needs_embedding_work());
+            && disk.as_ref().is_some_and(|d| {
+                d.lexical.is_some()
+                    && d.epoch.is_some()
+                    && d.has_pending_embeddings()
+                    && (d.embedder.is_some() || d.manifest.active_model.is_some())
+            });
         let wake_model = bg.is_none()
             && disk.as_ref().is_some_and(|d| {
                 d.lexical.is_some()
@@ -687,14 +728,27 @@ async fn run_active_loop(
             }
             LoopEvent::Advance {
                 target,
-                force_seed,
-                scrub,
+                mut force_seed,
+                mut scrub,
                 rebind,
+                purge_resync,
             } => {
                 if *scope != target.scope {
                     return Ok(Some(target.scope));
                 }
-                let resync = advance_to(
+                if purge_resync
+                    && let Some(current) = disk.as_ref()
+                    && current.epoch.is_none()
+                    && current.manifest.vector_seq.is_none()
+                    && !cx.cut_needs_scrub(&current.cursor(), true).await?
+                {
+                    // Already scrubbed and reseeded past every prior purge;
+                    // a lagged re-scan from an unacked pre-purge cursor must
+                    // not cancel an in-flight ModelRefresh.
+                    force_seed = false;
+                    scrub = false;
+                }
+                match advance_to(
                     cx,
                     publisher,
                     layout,
@@ -709,12 +763,32 @@ async fn run_active_loop(
                     &mut repair_delay,
                     &mut ack_after_embed,
                 )
-                .await?;
-                if let Some(next_scope) = resync {
-                    return Ok(Some(next_scope));
+                .await?
+                {
+                    AdvanceOutcome::Resync(next_scope) => return Ok(Some(next_scope)),
+                    AdvanceOutcome::Done { scrubbed } => {
+                        needs_ack = true;
+                        pending_rebind |= rebind;
+                        if (purge_resync || scrubbed)
+                            && let Some(current) = &disk
+                            && current.epoch.is_none()
+                        {
+                            // Acknowledge past the scrubbed purge before spawning a
+                            // long ModelRefresh so BroadcastHub lag cannot re-emit
+                            // PurgeResync in an endless scrub/reseed loop.
+                            let force_rebind = std::mem::take(&mut pending_rebind);
+                            sync_subscription(
+                                cx,
+                                &mut subscription,
+                                &mut delivered,
+                                current.cursor(),
+                                force_rebind,
+                            )
+                            .await?;
+                            needs_ack = false;
+                        }
+                    }
                 }
-                needs_ack = true;
-                pending_rebind |= rebind;
                 if bg.is_none() && Instant::now() >= model_retry_at {
                     model_check_due = true;
                 }
@@ -724,7 +798,7 @@ async fn run_active_loop(
                 if *scope != target.scope {
                     return Ok(Some(target.scope));
                 }
-                let resync = advance_to(
+                match advance_to(
                     cx,
                     publisher,
                     layout,
@@ -739,12 +813,29 @@ async fn run_active_loop(
                     &mut repair_delay,
                     &mut ack_after_embed,
                 )
-                .await?;
-                if let Some(next_scope) = resync {
-                    return Ok(Some(next_scope));
+                .await?
+                {
+                    AdvanceOutcome::Resync(next_scope) => return Ok(Some(next_scope)),
+                    AdvanceOutcome::Done { scrubbed } => {
+                        needs_ack = true;
+                        pending_rebind = true;
+                        if scrubbed
+                            && let Some(current) = &disk
+                            && current.epoch.is_none()
+                        {
+                            let force_rebind = std::mem::take(&mut pending_rebind);
+                            sync_subscription(
+                                cx,
+                                &mut subscription,
+                                &mut delivered,
+                                current.cursor(),
+                                force_rebind,
+                            )
+                            .await?;
+                            needs_ack = false;
+                        }
+                    }
                 }
-                needs_ack = true;
-                pending_rebind = true;
             }
             LoopEvent::Wake => {
                 cx.handle.touch();
@@ -765,7 +856,7 @@ async fn run_active_loop(
                     .as_ref()
                     .is_none_or(|d| d.lexical.is_none() || d.manifest.tantivy_seq < latest.after);
                 if needs_advance {
-                    let resync = advance_to(
+                    match advance_to(
                         cx,
                         publisher,
                         layout,
@@ -780,11 +871,28 @@ async fn run_active_loop(
                         &mut repair_delay,
                         &mut ack_after_embed,
                     )
-                    .await?;
-                    if let Some(next_scope) = resync {
-                        return Ok(Some(next_scope));
+                    .await?
+                    {
+                        AdvanceOutcome::Resync(next_scope) => return Ok(Some(next_scope)),
+                        AdvanceOutcome::Done { scrubbed } => {
+                            needs_ack = true;
+                            if scrubbed
+                                && let Some(current) = &disk
+                                && current.epoch.is_none()
+                            {
+                                let force_rebind = std::mem::take(&mut pending_rebind);
+                                sync_subscription(
+                                    cx,
+                                    &mut subscription,
+                                    &mut delivered,
+                                    current.cursor(),
+                                    force_rebind,
+                                )
+                                .await?;
+                                needs_ack = false;
+                            }
+                        }
                     }
-                    needs_ack = true;
                 }
                 // Allow immediate model check on wake ONLY when replacement backoff is inactive.
                 if !retry_model || Instant::now() >= model_retry_at {
@@ -812,7 +920,8 @@ async fn run_active_loop(
                         {
                             publisher.publish(current, false);
                         }
-                        let has_immediate_repair = current.needs_embedding_work()
+                        let has_immediate_repair = current.epoch.is_some()
+                            && current.has_pending_embeddings()
                             && repair_delay < Duration::from_secs(30);
                         if !has_immediate_repair
                             && cx.handle.idle_elapsed() >= schedule.worker_idle
@@ -850,6 +959,7 @@ async fn run_active_loop(
                 model_retry_at,
                 embedder_retry_at,
                 repair_at,
+                schedule.embedder_idle,
                 ack_after_embed,
             )?;
             if spawned && bg.as_ref().is_some_and(BgTask::is_reopening) {
@@ -928,6 +1038,7 @@ async fn next_event(
                             force_seed: false,
                             scrub: false,
                             rebind: false,
+                            purge_resync: false,
                         }
                     } else {
                         LoopEvent::Advance {
@@ -935,6 +1046,7 @@ async fn next_event(
                             force_seed: true,
                             scrub: true,
                             rebind: false,
+                            purge_resync: false,
                         }
                     }
                 }
@@ -945,6 +1057,7 @@ async fn next_event(
                         force_seed: true,
                         scrub: true,
                         rebind: false,
+                        purge_resync: true,
                     }
                 }
                 ChangeNotice::Advanced(target) => {
@@ -954,6 +1067,7 @@ async fn next_event(
                         force_seed: false,
                         scrub: false,
                         rebind: false,
+                        purge_resync: false,
                     }
                 }
                 ChangeNotice::Lagged { resume } => LoopEvent::Lagged { resume },
@@ -1001,7 +1115,9 @@ async fn advance_to(
     repair_at: &mut Instant,
     repair_delay: &mut Duration,
     ack_after_embed: &mut bool,
-) -> Result<Option<HistoryScope>, IndexError> {
+) -> Result<AdvanceOutcome, IndexError> {
+    let had_disk = disk.is_some();
+    let mut scrubbed = false;
     let mut seed_at = (force_seed || disk.is_none()).then(|| target.clone());
     cx.handle.touch();
     if let Some(current) = disk.as_mut() {
@@ -1017,6 +1133,7 @@ async fn advance_to(
         cancel_bg(bg).await;
         drop(disk.take());
         build::scrub(cx, publisher, layout).await?;
+        scrubbed = true;
         seed_at = Some(target.clone());
         scrub = false;
     }
@@ -1036,6 +1153,7 @@ async fn advance_to(
                 cancel_bg(bg).await;
                 drop(disk.take());
                 build::scrub(cx, publisher, layout).await?;
+                scrubbed = true;
                 seed_at = Some(target.clone());
                 scrub = false;
                 false
@@ -1066,6 +1184,7 @@ async fn advance_to(
                         cancel_bg(bg).await;
                         drop(disk.take());
                         build::scrub(cx, publisher, layout).await?;
+                        scrubbed = true;
                     }
                     let latest = cx.latest(scope).await?;
                     if latest.scope != *scope {
@@ -1074,7 +1193,7 @@ async fn advance_to(
                         tokio::task::spawn_blocking(move || layout_clear.clear_lexical_manifests())
                             .await
                             .map_err(|_| IndexError::Inconsistent)??;
-                        return Ok(Some(latest.scope));
+                        return Ok(AdvanceOutcome::Resync(latest.scope));
                     }
                     seed_at = Some(latest);
                     scrub = !retired;
@@ -1090,6 +1209,9 @@ async fn advance_to(
         if scrub {
             drop(disk.take());
             build::scrub(cx, publisher, layout).await?;
+            if had_disk {
+                scrubbed = true;
+            }
         }
         let seeded = build::seed_lexical(cx, layout.clone(), &cutoff).await?;
         seeded.publish_manifest().await?;
@@ -1100,7 +1222,7 @@ async fn advance_to(
         *repair_delay = Duration::from_secs(1);
     }
 
-    Ok(None)
+    Ok(AdvanceOutcome::Done { scrubbed })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1112,6 +1234,7 @@ fn spawn_bg_if_ready(
     model_retry_at: Instant,
     embedder_retry_at: Instant,
     repair_at: Instant,
+    embedder_idle: Duration,
     prioritize_embed: bool,
 ) -> Result<bool, IndexError> {
     if bg.is_some() || disk.lexical.is_none() {
@@ -1138,9 +1261,13 @@ fn spawn_bg_if_ready(
         });
         return Ok(true);
     }
-    // 2. Load active embedder when epoch is open and embedder was released or not yet loaded.
+    // 2. Load active embedder only when embeddings are due or a recent query/wake
+    // requested it, avoiding an unload/reload loop on EMBEDDER_IDLE.
+    let embedder_needed = (disk.has_pending_embeddings() && now >= repair_at)
+        || now.saturating_duration_since(disk.embedder_last_use) < embedder_idle;
     if disk.epoch.is_some()
         && disk.embedder.is_none()
+        && embedder_needed
         && now >= embedder_retry_at
         && let Some(active) = disk.manifest.active_model.clone()
     {
@@ -1252,6 +1379,7 @@ fn spawn_bg_if_ready(
         let Some(epoch) = disk.epoch.as_ref() else {
             return Ok(false);
         };
+        disk.embedder_last_use = now;
         let cancel = Cancellation::default();
         let mode = if !disk.dirty_notes.is_empty() {
             let batch: Vec<NoteId> = disk.dirty_notes.iter().take(100).cloned().collect();
@@ -1486,12 +1614,14 @@ async fn handle_bg_done(
         },
         BgOutcome::EmbedBatch(result) => match result {
             Ok(update::EmbedBatchOutcome::ModelChanged { requeue }) => {
+                current.embedder_last_use = Instant::now();
                 current.dirty_notes.extend(requeue);
                 *model_check_due = true;
                 *repair_at = Instant::now() + *repair_delay;
                 *repair_delay = (*repair_delay * 2).min(Duration::from_secs(300));
             }
             Ok(update::EmbedBatchOutcome::Backoff { requeue }) => {
+                current.embedder_last_use = Instant::now();
                 current.dirty_notes.extend(requeue);
                 *repair_at = Instant::now() + *repair_delay;
                 *repair_delay = (*repair_delay * 2).min(Duration::from_secs(300));
@@ -1504,6 +1634,7 @@ async fn handle_bg_done(
                 was_full_sweep,
                 had_transient_failure,
             }) => {
+                current.embedder_last_use = Instant::now();
                 if !missing_folders.is_empty() {
                     let folders = Arc::make_mut(&mut current.folders);
                     let before = folders.len();
@@ -1562,14 +1693,15 @@ async fn handle_bg_done(
                     Err(error) => return Err(IndexError::Vector(error)),
                 }
                 current.dirty_notes.extend(requeue);
-                if !changed_folders.is_empty() {
-                    current.full_sweep_needed = true;
-                }
                 if was_full_sweep {
                     current.full_sweep_after = next_sweep_after;
                     if current.full_sweep_after.is_none() {
                         current.full_sweep_needed = false;
                     }
+                }
+                if !changed_folders.is_empty() {
+                    current.full_sweep_needed = true;
+                    current.full_sweep_after = None;
                 }
                 if current.dirty_notes.is_empty() {
                     current.cached_vectors.clear();

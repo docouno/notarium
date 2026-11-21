@@ -27,12 +27,34 @@ fn search_unsafe_operations_are_confined_to_audited_vector_leaves() {
         allowed_external_test_paths: &["../../notarium-canonical/tests/support/mod.rs"],
     });
 
-    // Safe top-level modules must forbid unsafe overrides explicitly on every declaration.
-    let lib_rs = fs::read_to_string(crate_root.join("src/lib.rs")).expect("read search lib.rs");
-    let lines: Vec<&str> = lib_rs.lines().collect();
-    for module in [
-        "config", "embed", "engine", "indexer", "layout", "lexical", "model", "ports", "query",
-    ] {
+    // Safe top-level modules and safe vector submodules must forbid unsafe
+    // overrides explicitly on every declaration.
+    assert_modules_forbid_unsafe(
+        &crate_root.join("src/lib.rs"),
+        "notarium-search/src/lib.rs",
+        &[
+            "config", "embed", "engine", "indexer", "layout", "lexical", "model", "ports", "query",
+        ],
+    );
+    assert_modules_forbid_unsafe(
+        &crate_root.join("src/vector/mod.rs"),
+        "notarium-search/src/vector/mod.rs",
+        &[
+            "builder",
+            "epoch",
+            "format",
+            "hnsw",
+            "quantization",
+            "tombstone",
+            "wal",
+        ],
+    );
+}
+
+fn assert_modules_forbid_unsafe(path: &Path, label: &str, modules: &[&str]) {
+    let source = fs::read_to_string(path).unwrap_or_else(|err| panic!("read {label}: {err}"));
+    let lines: Vec<&str> = source.lines().collect();
+    for module in modules {
         let decl_indices: Vec<usize> = lines
             .iter()
             .enumerate()
@@ -44,12 +66,12 @@ fn search_unsafe_operations_are_confined_to_audited_vector_leaves() {
             .collect();
         assert!(
             !decl_indices.is_empty(),
-            "notarium-search/src/lib.rs missing module declaration `{module}`"
+            "{label} missing module declaration `{module}`"
         );
         for index in decl_indices {
             assert!(
                 index > 0 && lines[index - 1].trim() == "#[forbid(unsafe_code)]",
-                "notarium-search/src/lib.rs must mark module `{module}` (line {}) with #[forbid(unsafe_code)]",
+                "{label} must mark module `{module}` (line {}) with #[forbid(unsafe_code)]",
                 index + 1
             );
         }

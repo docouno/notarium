@@ -73,8 +73,8 @@ causal alignment and physical erasure. An offline scale gate uses 100,000 notes
 and 400,000 chunks, reporting query latency, recall, warm reopen, compaction
 and resident memory bounds. Search confines unsafe code to the mmap segment and
 SIMD modules (`mmap_segment.rs` and `simd.rs`), forbids unsafe overrides across
-its remaining modules, and gates internal test helpers behind `test-support`
-enforced by `fitness-gates`.
+its remaining modules and safe vector submodules, and gates internal test
+helpers behind `test-support` enforced by `fitness-gates`.
 
 `notarium-control` owns a 45-table baseline in SQLite and the PostgreSQL
 `v1_control` schema. Its typed target records support offline import and paged

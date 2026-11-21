@@ -63,8 +63,7 @@ impl SearchDependencies {
 /// Start on a Tokio runtime and drain with `shutdown` before closing storage.
 pub struct SearchEngine {
     pub(super) services: Arc<Services>,
-    workers: Arc<Mutex<HashMap<SpaceId, Worker>>>,
-    bg_tasks: Mutex<Vec<JoinHandle<()>>>,
+    workers: Arc<Mutex<WorkerTable>>,
     max_open_spaces: usize,
 }
 
@@ -232,13 +231,41 @@ impl SpaceHandle {
     }
 }
 
+pub(super) struct DrainGate {
+    tx: watch::Sender<bool>,
+}
+
+impl DrainGate {
+    pub(super) fn new() -> Self {
+        Self {
+            tx: watch::channel(false).0,
+        }
+    }
+
+    pub(super) fn signal(&self) {
+        self.tx.send_replace(true);
+    }
+
+    pub(super) fn subscribe(&self) -> watch::Receiver<bool> {
+        self.tx.subscribe()
+    }
+}
+
 pub(super) struct Worker {
     pub(super) handle: Arc<SpaceHandle>,
+    gate: Arc<DrainGate>,
     task: JoinHandle<()>,
 }
 
+#[derive(Default)]
+pub(super) struct WorkerTable {
+    active: HashMap<SpaceId, Worker>,
+    draining: HashMap<SpaceId, Arc<DrainGate>>,
+    bg_tasks: Vec<JoinHandle<()>>,
+}
+
 pub(super) fn try_evict_idle_worker(
-    workers: &Weak<Mutex<HashMap<SpaceId, Worker>>>,
+    workers: &Weak<Mutex<WorkerTable>>,
     space_id: &SpaceId,
     handle: &Arc<SpaceHandle>,
     min_idle: Duration,
@@ -246,36 +273,49 @@ pub(super) fn try_evict_idle_worker(
     let Some(workers) = workers.upgrade() else {
         return true;
     };
-    let mut map = workers.lock().unwrap_or_else(|error| error.into_inner());
-    let can_evict = map
+    let mut table = workers.lock().unwrap_or_else(|error| error.into_inner());
+    let can_evict = table
+        .active
         .get(space_id)
         .is_some_and(|worker| Arc::ptr_eq(&worker.handle, handle))
         && handle.active_queries.load(Ordering::Acquire) == 0
         && !handle.has_align_waiters()
         && handle.idle_elapsed() >= min_idle;
-    if can_evict {
-        map.remove(space_id);
+    if can_evict && let Some(evicted) = table.active.remove(space_id) {
+        table.draining.insert(space_id.clone(), evicted.gate);
+        table.bg_tasks.retain(|task| !task.is_finished());
+        table.bg_tasks.push(evicted.task);
         true
     } else {
         false
     }
 }
 
-pub(super) fn remove_exited_worker(
-    workers: &Weak<Mutex<HashMap<SpaceId, Worker>>>,
+pub(super) fn finish_exited_worker(
+    workers: &Weak<Mutex<WorkerTable>>,
     space_id: &SpaceId,
     handle: &Arc<SpaceHandle>,
+    gate: &Arc<DrainGate>,
 ) {
-    let Some(workers) = workers.upgrade() else {
-        return;
-    };
-    let mut map = workers.lock().unwrap_or_else(|error| error.into_inner());
-    if map
-        .get(space_id)
-        .is_some_and(|worker| Arc::ptr_eq(&worker.handle, handle))
-    {
-        map.remove(space_id);
+    if let Some(workers) = workers.upgrade() {
+        let mut table = workers.lock().unwrap_or_else(|error| error.into_inner());
+        if table
+            .active
+            .get(space_id)
+            .is_some_and(|worker| Arc::ptr_eq(&worker.handle, handle))
+        {
+            table.active.remove(space_id);
+        }
+        if table
+            .draining
+            .get(space_id)
+            .is_some_and(|existing| Arc::ptr_eq(existing, gate))
+        {
+            table.draining.remove(space_id);
+        }
+        table.bg_tasks.retain(|task| !task.is_finished());
     }
+    gate.signal();
 }
 
 impl SearchEngine {
@@ -315,10 +355,19 @@ impl SearchEngine {
         });
         Self {
             services,
-            workers: Arc::new(Mutex::new(HashMap::new())),
-            bg_tasks: Mutex::new(vec![local_worker, remote_worker, writer_reaper]),
+            workers: Arc::new(Mutex::new(WorkerTable {
+                active: HashMap::new(),
+                draining: HashMap::new(),
+                bg_tasks: vec![local_worker, remote_worker, writer_reaper],
+            })),
             max_open_spaces: MAX_OPEN_SPACES,
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_max_open_spaces(mut self, max_open_spaces: usize) -> Self {
+        self.max_open_spaces = max_open_spaces.max(1);
+        self
     }
 
     #[cfg(test)]
@@ -326,7 +375,46 @@ impl SearchEngine {
         self.workers
             .lock()
             .unwrap_or_else(|error| error.into_inner())
+            .active
             .len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn hold_drain_gate(&self, space_id: SpaceId) -> Arc<DrainGate> {
+        let gate = Arc::new(DrainGate::new());
+        self.workers
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .draining
+            .insert(space_id, gate.clone());
+        gate
+    }
+
+    #[cfg(test)]
+    pub(super) fn release_held_drain_gate(&self, space_id: &SpaceId, gate: &Arc<DrainGate>) {
+        {
+            let mut table = self
+                .workers
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if table
+                .draining
+                .get(space_id)
+                .is_some_and(|existing| Arc::ptr_eq(existing, gate))
+            {
+                table.draining.remove(space_id);
+            }
+        }
+        gate.signal();
+    }
+
+    #[cfg(test)]
+    pub(super) fn draining_and_bg_count(&self) -> (usize, usize) {
+        let table = self
+            .workers
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        (table.draining.len(), table.bg_tasks.len())
     }
 
     pub fn start_space(&self, scope: HistoryScope) -> Result<(), PortError> {
@@ -347,86 +435,85 @@ impl SearchEngine {
         scope: HistoryScope,
         pin_query: bool,
     ) -> Result<Arc<SpaceHandle>, PortError> {
-        let mut evicted_task = None;
-        let handle = {
-            let mut workers = self.workers.lock().map_err(|_| internal("space_workers"))?;
-            if self.services.shutdown.is_cancelled() {
-                return Err(PortError::Cancelled(failure("engine_stopped")));
-            }
-            if let Some(worker) = workers.get(&scope.space_id) {
-                worker.handle.touch();
-                if pin_query {
-                    worker.handle.active_queries.fetch_add(1, Ordering::AcqRel);
-                }
-                return Ok(worker.handle.clone());
-            }
-            if workers.len() >= self.max_open_spaces {
-                let candidate = workers
-                    .iter()
-                    .filter(|(_, worker)| {
-                        worker.handle.active_queries.load(Ordering::Acquire) == 0
-                            && !worker.handle.has_align_waiters()
-                    })
-                    .max_by_key(|(_, worker)| worker.handle.idle_elapsed())
-                    .map(|(id, _)| id.clone());
-                if let Some(oldest_id) = candidate
-                    && let Some(evicted) = workers.remove(&oldest_id)
-                {
-                    evicted.handle.stop.cancel();
-                    evicted_task = Some(evicted.task);
-                }
-            }
-            let id = scope.space_id.clone();
-            let handle = Arc::new(SpaceHandle::new());
-            if pin_query {
-                handle.active_queries.fetch_add(1, Ordering::AcqRel);
-            }
-            let task = tokio::spawn(crate::indexer::run(
-                self.services.clone(),
-                handle.clone(),
-                Arc::downgrade(&self.workers),
-                scope,
-            ));
-            workers.insert(
-                id,
-                Worker {
-                    handle: handle.clone(),
-                    task,
-                },
-            );
-            handle
-        };
-        if let Some(task) = evicted_task {
-            let mut bg = self
-                .bg_tasks
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            bg.retain(|existing| !existing.is_finished());
-            bg.push(task);
+        let mut table = self.workers.lock().map_err(|_| internal("space_workers"))?;
+        if self.services.shutdown.is_cancelled() {
+            return Err(PortError::Cancelled(failure("engine_stopped")));
         }
+        if let Some(worker) = table.active.get(&scope.space_id) {
+            worker.handle.touch();
+            if pin_query {
+                worker.handle.active_queries.fetch_add(1, Ordering::AcqRel);
+            }
+            return Ok(worker.handle.clone());
+        }
+        if table.active.len() >= self.max_open_spaces {
+            let candidate = table
+                .active
+                .iter()
+                .filter(|(_, worker)| {
+                    worker.handle.active_queries.load(Ordering::Acquire) == 0
+                        && !worker.handle.has_align_waiters()
+                })
+                .max_by_key(|(_, worker)| worker.handle.idle_elapsed())
+                .map(|(id, _)| id.clone());
+            if let Some(oldest_id) = candidate
+                && let Some(evicted) = table.active.remove(&oldest_id)
+            {
+                evicted.handle.stop.cancel();
+                table.draining.insert(oldest_id, evicted.gate);
+                table.bg_tasks.retain(|existing| !existing.is_finished());
+                table.bg_tasks.push(evicted.task);
+            }
+        }
+        let id = scope.space_id.clone();
+        let prev_drain = table.draining.get(&id).map(|gate| gate.subscribe());
+        let handle = Arc::new(SpaceHandle::new());
+        if pin_query {
+            handle.active_queries.fetch_add(1, Ordering::AcqRel);
+        }
+        let gate = Arc::new(DrainGate::new());
+        let task = tokio::spawn(crate::indexer::run(
+            self.services.clone(),
+            handle.clone(),
+            Arc::downgrade(&self.workers),
+            gate.clone(),
+            prev_drain,
+            scope,
+        ));
+        table.active.insert(
+            id,
+            Worker {
+                handle: handle.clone(),
+                gate,
+                task,
+            },
+        );
         Ok(handle)
     }
 
     pub async fn shutdown(&self) {
         self.stop();
-        let workers = std::mem::take(
-            &mut *self
-                .workers
-                .lock()
-                .unwrap_or_else(|error| error.into_inner()),
-        );
-        for worker in workers.into_values() {
-            let _ = worker.task.await;
-            worker.handle.replace(None);
-        }
-        let bg = std::mem::take(
-            &mut *self
-                .bg_tasks
-                .lock()
-                .unwrap_or_else(|error| error.into_inner()),
-        );
-        for task in bg {
-            let _ = task.await;
+        loop {
+            let (workers, bg) = {
+                let mut table = self
+                    .workers
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                (
+                    std::mem::take(&mut table.active),
+                    std::mem::take(&mut table.bg_tasks),
+                )
+            };
+            if workers.is_empty() && bg.is_empty() {
+                break;
+            }
+            for worker in workers.into_values() {
+                let _ = worker.task.await;
+                worker.handle.replace(None);
+            }
+            for task in bg {
+                let _ = task.await;
+            }
         }
         let writers = self.services.writers.clone();
         let readers = Arc::clone(&self.services.readers);
@@ -445,6 +532,7 @@ impl SearchEngine {
             .workers
             .lock()
             .unwrap_or_else(|error| error.into_inner())
+            .active
             .values()
         {
             worker.handle.stop.cancel();

@@ -21,7 +21,10 @@ use std::{
     collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering as AtomicOrdering},
+    },
     time::Instant,
 };
 
@@ -94,6 +97,41 @@ pub struct VectorResults {
     pub hnsw_hops: usize,
 }
 
+struct PlanGuard {
+    slot: Arc<AtomicU64>,
+    token: u64,
+}
+
+impl PlanGuard {
+    fn acquire(slot: &Arc<AtomicU64>, token: u64) -> Option<Self> {
+        slot.compare_exchange(0, token, AtomicOrdering::AcqRel, AtomicOrdering::Acquire)
+            .ok()
+            .map(|_| Self {
+                slot: Arc::clone(slot),
+                token,
+            })
+    }
+
+    fn release(&self) {
+        let _ = self.slot.compare_exchange(
+            self.token,
+            0,
+            AtomicOrdering::AcqRel,
+            AtomicOrdering::Relaxed,
+        );
+    }
+
+    fn matches(&self, slot: &Arc<AtomicU64>) -> bool {
+        Arc::ptr_eq(&self.slot, slot) && slot.load(AtomicOrdering::Acquire) == self.token
+    }
+}
+
+impl Drop for PlanGuard {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 /// Immutable snapshot of one bounded compaction step. Build runs off-owner on a
 /// blocking thread while live updates keep appending to `VectorEpoch`.
 pub struct CompactionPlan {
@@ -102,6 +140,7 @@ pub struct CompactionPlan {
     replaced_ids: Vec<u64>,
     sources: Vec<(u64, Arc<MmapSegment>, Tombstones)>,
     target_id: u64,
+    guard: PlanGuard,
 }
 
 impl CompactionPlan {
@@ -114,6 +153,14 @@ impl CompactionPlan {
     }
 
     pub fn execute(&self, cancel: &Cancellation) -> Result<Option<MmapSegment>, VectorError> {
+        let result = self.execute_inner(cancel);
+        if result.is_err() {
+            self.guard.release();
+        }
+        result
+    }
+
+    fn execute_inner(&self, cancel: &Cancellation) -> Result<Option<MmapSegment>, VectorError> {
         if cancel.is_cancelled() {
             return Err(VectorError::Cancelled);
         }
@@ -145,6 +192,7 @@ pub struct FlushL0Plan {
     entries: Vec<(NoteId, Arc<Vec<VectorChunk>>)>,
     replaced_notes: Vec<NoteId>,
     target_id: Option<u64>,
+    guard: PlanGuard,
 }
 
 impl FlushL0Plan {
@@ -153,6 +201,14 @@ impl FlushL0Plan {
     }
 
     pub fn execute(&self, cancel: &Cancellation) -> Result<Option<MmapSegment>, VectorError> {
+        let result = self.execute_inner(cancel);
+        if result.is_err() {
+            self.guard.release();
+        }
+        result
+    }
+
+    fn execute_inner(&self, cancel: &Cancellation) -> Result<Option<MmapSegment>, VectorError> {
         if cancel.is_cancelled() {
             return Err(VectorError::Cancelled);
         }
@@ -532,6 +588,8 @@ pub struct VectorEpoch {
     segments: Vec<Segment>,
     mutable: MutableBuffer,
     next_segment: u64,
+    active_plan: Arc<AtomicU64>,
+    next_plan_token: u64,
 }
 
 impl VectorEpoch {
@@ -591,7 +649,22 @@ impl VectorEpoch {
             segments,
             mutable,
             next_segment,
+            active_plan: Arc::new(AtomicU64::new(0)),
+            next_plan_token: 1,
         })
+    }
+
+    fn has_active_plan(&self) -> bool {
+        self.active_plan.load(AtomicOrdering::Acquire) != 0
+    }
+
+    fn acquire_plan_guard(&mut self) -> Option<PlanGuard> {
+        if self.has_active_plan() {
+            return None;
+        }
+        let token = self.next_plan_token;
+        self.next_plan_token = token.checked_add(1).unwrap_or(1);
+        PlanGuard::acquire(&self.active_plan, token)
     }
 
     pub fn snapshot(&self) -> VectorSnapshot {
@@ -738,7 +811,7 @@ impl VectorEpoch {
         if self.mutable.is_failed() {
             return Err(VectorError::CorruptIndex);
         }
-        if self.mutable.is_empty() {
+        if self.mutable.is_empty() || self.has_active_plan() {
             return Ok(None);
         }
         let snapshot = self.mutable.snapshot_for_flush();
@@ -757,6 +830,9 @@ impl VectorEpoch {
         } else {
             None
         };
+        let Some(guard) = self.acquire_plan_guard() else {
+            return Ok(None);
+        };
         Ok(Some(FlushL0Plan {
             path: self.path.clone(),
             model: self.manifest.model.clone(),
@@ -766,6 +842,7 @@ impl VectorEpoch {
             entries: snapshot.entries,
             replaced_notes,
             target_id,
+            guard,
         }))
     }
 
@@ -775,7 +852,7 @@ impl VectorEpoch {
         replacement: Option<MmapSegment>,
         dirty_notes: &HashSet<NoteId>,
     ) -> Result<(), VectorError> {
-        if self.mutable.is_failed() {
+        if self.mutable.is_failed() || !plan.guard.matches(&self.active_plan) {
             return Err(VectorError::CorruptIndex);
         }
         if plan.model != self.manifest.model {
@@ -821,6 +898,9 @@ impl VectorEpoch {
                 .filter(|seg| seg.id > plan.prior_max_segment_id)
             {
                 for n_ord in 0..newer.data.num_notes() {
+                    if !segment_note_has_live_slots(newer, n_ord)? {
+                        continue;
+                    }
                     if let Some(bytes) = newer.data.note_bytes_by_ord(n_ord)
                         && let Some(ord) = data.find_note_ord(bytes)
                         && let Some(slots) = data.note_slots_by_ord(ord)
@@ -859,8 +939,11 @@ impl VectorEpoch {
     }
 
     pub fn flush_cancellable(&mut self, cancel: &Cancellation) -> Result<(), VectorError> {
-        let Some(plan) = self.plan_flush_l0()? else {
+        if self.mutable.is_empty() {
             return Ok(());
+        }
+        let Some(plan) = self.plan_flush_l0()? else {
+            return Err(VectorError::BufferFull);
         };
         let replacement = plan.execute(cancel)?;
         self.commit_flush_l0(plan, replacement, &HashSet::new())
@@ -997,6 +1080,9 @@ impl VectorEpoch {
     /// Select one bounded compaction group (`<= MAX_SEGMENT_BUILD_BYTES` live)
     /// without removing `self` from the owning indexer.
     pub fn plan_compact(&mut self) -> Option<CompactionPlan> {
+        if self.has_active_plan() {
+            return None;
+        }
         let mut dead: Vec<usize> = self
             .segments
             .iter()
@@ -1058,12 +1144,14 @@ impl VectorEpoch {
                 (seg.id, seg.data.clone(), seg.tombstones.clone())
             })
             .collect();
+        let guard = self.acquire_plan_guard()?;
         Some(CompactionPlan {
             path: self.path.clone(),
             model: self.manifest.model.clone(),
             replaced_ids,
             sources,
             target_id,
+            guard,
         })
     }
 
@@ -1075,6 +1163,9 @@ impl VectorEpoch {
         replacement: Option<MmapSegment>,
         dirty_notes: &HashSet<NoteId>,
     ) -> Result<(), VectorError> {
+        if !plan.guard.matches(&self.active_plan) {
+            return Err(VectorError::CorruptIndex);
+        }
         if plan.model != self.manifest.model {
             return Err(VectorError::InvalidDimension);
         }
@@ -1150,6 +1241,9 @@ impl VectorEpoch {
     }
 
     pub fn compact_cancellable(&mut self, cancel: &Cancellation) -> Result<(), VectorError> {
+        if self.has_active_plan() {
+            return Err(VectorError::BufferFull);
+        }
         self.flush_cancellable(cancel)?;
         while let Some(plan) = self.plan_compact() {
             let replacement = plan.execute(cancel)?;
@@ -1227,6 +1321,18 @@ impl VectorEpoch {
     }
 }
 
+fn segment_note_has_live_slots(segment: &Segment, note_ord: u32) -> Result<bool, VectorError> {
+    if segment.tombstones.bitmap().is_empty() {
+        return Ok(true);
+    }
+    let mut slots = segment
+        .data
+        .note_slots_by_ord(note_ord)
+        .ok_or(VectorError::CorruptIndex)?;
+    let dead = segment.tombstones.bitmap();
+    Ok(slots.any(|slot| !dead.contains(slot)))
+}
+
 fn reconcile_superseded_tombstones(
     path: &Path,
     segments: &mut [Segment],
@@ -1243,6 +1349,9 @@ fn reconcile_superseded_tombstones(
             let newer_notes = newer.data.num_notes();
             if (newer_notes as usize).saturating_mul(20) < (older_notes as usize) {
                 for n_ord in 0..newer_notes {
+                    if !segment_note_has_live_slots(newer, n_ord)? {
+                        continue;
+                    }
                     let bytes = newer
                         .data
                         .note_bytes_by_ord(n_ord)
@@ -1272,12 +1381,14 @@ fn reconcile_superseded_tombstones(
                         Ordering::Less => oi += 1,
                         Ordering::Greater => ni += 1,
                         Ordering::Equal => {
-                            let slots = older
-                                .data
-                                .note_slots_by_ord(oi)
-                                .ok_or(VectorError::CorruptIndex)?;
-                            for slot in slots {
-                                older.tombstones.mark(slot);
+                            if segment_note_has_live_slots(newer, ni)? {
+                                let slots = older
+                                    .data
+                                    .note_slots_by_ord(oi)
+                                    .ok_or(VectorError::CorruptIndex)?;
+                                for slot in slots {
+                                    older.tombstones.mark(slot);
+                                }
                             }
                             oi += 1;
                             ni += 1;

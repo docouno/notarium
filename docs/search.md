@@ -14,10 +14,13 @@ before shutting down canonical storage.
   Filter metadata is stored in fast fields without stored note or chat text.
   English and Russian prose use case folding and stemming. Exact fields retain
   code identifiers and path terms. Quoted clauses match phrase positions.
-  Rare terms check matching postings directly, while broad queries switch to a
-  segment-wide mask and score-thresholded top-K collection. Multi-term queries
-  fall back to single-term matching only when fewer than `min(top_k, 10)` hits
-  match all terms. Both paths observe the request deadline and cancellation.
+  Queries run score-thresholded top-K collection across segments, building a
+  per-segment ordinal bitmap upfront when a structural filter narrows the
+  candidate set to at most 4,096 notes (`SELECTIVE_NOTE_MASK_LIMIT`). Clause
+  queries require a quorum (`1` clause for 1–2 clauses, `2` for 3–4 clauses, and
+  `ceil(3 * count / 5)` for 5 or more); queries with more than two clauses fall
+  back to single-clause matching only when fewer than `min(top_k, 10)` hits
+  satisfy the quorum. Both paths observe the request deadline and cancellation.
 - Folder and structural filters apply before ranking. A blank query with a
   filter browses notes in stable ID order using per-segment term ordinals.
   Personal chat hits enter the ranking only for an authorized personal
@@ -62,12 +65,14 @@ A manifest identifies the active lexical generation and
 the vector checkpoint. After an edit the worker invalidates the old vector slots
 before publishing the new lexical cut. The pending marker keeps outstanding
 embedding work recoverable after restart. Readers pin a cut through ArcSwap.
-Idle Spaces release their cached embedder handles after 60 seconds without
-vector activity while retaining lightweight mmap vector epochs until idle
-worker eviction (30 seconds without lexical activity triggers idle
-housekeeping, and archived Spaces retire and unload immediately). Disk indexing
-shares the bounded four-writer pool, while exact receipt overlays run in
-ephemeral in-memory writers outside that pool.
+Idle Spaces drop their lexical reader and unpublish their in-memory snapshot
+after 30 seconds without activity (`LEXICAL_IDLE`), release cached embedder
+handles after 60 seconds without vector activity (`EMBEDDER_IDLE`) while
+retaining lightweight mmap vector epochs, and evict idle Space workers after
+300 seconds (`WORKER_IDLE`). Archived Spaces scrub their derived data
+immediately and evict their worker after 30 seconds (`ARCHIVED_IDLE`). Disk
+indexing shares the bounded four-writer pool, while exact receipt overlays run
+in ephemeral in-memory writers outside that pool.
 
 Vectors use a bounded mutable L0 journal (capped at 16 MiB with batched fsync)
 and read-only, single-pass BLAKE3-checksummed v2 mmap segments (bounded to
@@ -134,8 +139,10 @@ Local CPU ONNX inference and remote provider calls run on separate bounded
 priority schedulers so remote network latency never starves local inference.
 Each scheduler runs one bounded batch at a time and checks interactive requests
 first, then live edits, then import and backfill. Batches contain at most 16
-chunks (for both local ONNX and remote providers) and respect the model's
-aggregate token cap. Interactive embedding work has a deadline of at most
+chunks; remote provider batches stay within the model's aggregate
+`max_input_tokens` cap, while local ONNX batches pack up to 16 chunks each
+bounded by `max_input_tokens` (up to `max_input_tokens * 16` tokens per batch).
+Interactive embedding work has a deadline of at most
 150 ms, including queueing. On expiry, the query uses lexical ranking and
 cancellation signals the active backend.
 The durable pending state schedules bounded repair when embeddings are missing.

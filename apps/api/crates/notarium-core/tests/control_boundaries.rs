@@ -1,13 +1,21 @@
 use notarium_core::{
+    DomainError,
     auth::{
-        AuthenticatedCredential, Cap, EngineAuthContext, PrincipalKind, SpaceRole, VerifiedHuman,
+        AuthenticatedCredential, Cap, ChatAudience, EngineAuthContext, PrincipalKind, Space,
+        SpaceGrant, SpaceKind, SpaceLifecycle, SpaceRole, VerifiedHuman,
     },
     classes::DocClass,
     document::{estimate_conservative_tokens, estimate_token_twelfths},
-    ids::{GrantId, KeyId, PrincipalId, ProviderResourceId, SpaceId},
-    ports::{BackupBudget, BackupProgress, BackupRetentionBudget, BackupRetentionProgress},
+    ids::{AgentRunId, GrantId, KeyId, PrincipalId, ProviderResourceId, SpaceId},
+    ports::{
+        BackupBudget, BackupProgress, BackupRetentionBudget, BackupRetentionProgress,
+        ChatThreadKind,
+    },
 };
-use std::{collections::BTreeMap, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Duration,
+};
 
 #[test]
 fn native_key_ids_have_one_exact_encoding() {
@@ -178,4 +186,122 @@ fn search_indexing_authority_is_single_space_viewer_without_encrypted_or_human_r
     let intersected = auth.intersect_current(&refreshed).unwrap();
     assert_eq!(intersected.kind(), &PrincipalKind::SearchIndexing);
     assert!(!intersected.human_management());
+}
+
+#[test]
+fn search_indexing_authority_cannot_delegate_or_view_chats_or_cross_intersect() {
+    let principal = PrincipalId::from_bytes([21; 16]);
+    let grant = GrantId::from_bytes([22; 16]);
+    let space_id = SpaceId::from_bytes([23; 16]);
+    let provider = ProviderResourceId::from_bytes([24; 16]);
+    let auth = EngineAuthContext::for_search_indexing(
+        principal.clone(),
+        grant.clone(),
+        space_id.clone(),
+        provider.clone(),
+    );
+
+    let requested = auth.spaces().clone();
+    assert_eq!(
+        auth.for_agent_run(
+            AgentRunId::from_bytes([25; 16]),
+            space_id.clone(),
+            ChatAudience::Personal,
+            requested.clone(),
+        )
+        .unwrap_err(),
+        DomainError::AccessDenied
+    );
+    assert_eq!(
+        auth.for_keeper(
+            AgentRunId::from_bytes([26; 16]),
+            space_id.clone(),
+            None,
+            BTreeSet::new(),
+        )
+        .unwrap_err(),
+        DomainError::AccessDenied
+    );
+    assert_eq!(
+        auth.for_oauth(GrantId::from_bytes([27; 16]), requested.clone())
+            .unwrap_err(),
+        DomainError::AccessDenied
+    );
+    assert_eq!(
+        auth.for_pat(requested.clone()).unwrap_err(),
+        DomainError::AccessDenied
+    );
+
+    let personal_space = Space {
+        id: space_id.clone(),
+        lifecycle: SpaceLifecycle::Active,
+        kind: SpaceKind::Personal,
+    };
+    let shared_space = Space {
+        id: space_id.clone(),
+        lifecycle: SpaceLifecycle::Active,
+        kind: SpaceKind::Shared,
+    };
+    for space in [&personal_space, &shared_space] {
+        assert_eq!(
+            auth.can_view_chat_thread(space, ChatThreadKind::Personal, &principal, None, false),
+            Err(DomainError::ResourceNotFound)
+        );
+        assert_eq!(
+            auth.can_view_chat_thread(space, ChatThreadKind::SpaceGroup, &principal, None, false),
+            Err(DomainError::ResourceNotFound)
+        );
+        assert_eq!(
+            auth.authorize_chat_thread_read(
+                space,
+                ChatThreadKind::Personal,
+                &principal,
+                None,
+                false,
+            ),
+            Err(DomainError::ResourceNotFound)
+        );
+        assert_eq!(
+            auth.can_view_chat(space, None, false),
+            Err(DomainError::ResourceNotFound)
+        );
+        assert_eq!(
+            auth.authorize_chat_read(space, None, false),
+            Err(DomainError::ResourceNotFound)
+        );
+    }
+
+    let forged_grants = BTreeMap::from([(
+        space_id.clone(),
+        SpaceGrant {
+            role: SpaceRole::Owner,
+            read_classes: DocClass::all(),
+            write_classes: DocClass::all(),
+            project_root: None,
+        },
+    )]);
+    let forged_human = EngineAuthContext::for_human(
+        VerifiedHuman::attest(principal, grant, forged_grants, false).with_credential(
+            AuthenticatedCredential::SearchIndexing {
+                space: space_id.clone(),
+                provider,
+            },
+        ),
+    );
+    assert_eq!(
+        forged_human.intersect_current(&auth).unwrap_err(),
+        DomainError::AuthenticationFailed
+    );
+    assert_eq!(
+        auth.intersect_current(&forged_human).unwrap_err(),
+        DomainError::AuthenticationFailed
+    );
+    assert_eq!(
+        forged_human.for_pat(requested).unwrap_err(),
+        DomainError::AccessDenied
+    );
+    assert_eq!(
+        forged_human.can_view_chat(&personal_space, None, false),
+        Err(DomainError::ResourceNotFound)
+    );
 }

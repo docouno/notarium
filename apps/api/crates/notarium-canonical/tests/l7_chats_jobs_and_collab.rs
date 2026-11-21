@@ -3973,3 +3973,292 @@ async fn chat_receipts_preserve_body_and_reference_boundaries() {
     }
     fixtures.drop_pg_schema(&schema).await;
 }
+
+#[tokio::test]
+async fn batched_chat_search_hydration_handles_multi_thread_deep_chains_and_branches() {
+    let fixtures = StorageTestFixtures::load_required();
+    let schema = fixtures.fresh_pg_schema();
+    for postgres in [false, true] {
+        let root = TempDataRoot::new("chat-search-batched-hydration");
+        let installation = sample_installation_id(0x65);
+        let cfg = if postgres {
+            fixtures.pg_local_config(installation, &schema, root.data_root())
+        } else {
+            CanonicalConfig::local_default(installation, root.data_root())
+        };
+        let (store, runtime) = CanonicalRuntime::open(cfg).await.unwrap();
+        let scope = HistoryScope {
+            space_id: sample_space_id(0x65),
+            incarnation: sample_incarnation(0x65),
+        };
+        let owner = sample_principal_id(0x65);
+        store
+            .create_space(CreateSpaceSpec {
+                space_id: scope.space_id.clone(),
+                incarnation: scope.incarnation,
+                root_folder_id: sample_folder_id(0x65),
+                slug: "batched-chat-search".into(),
+                kind: SpaceKind::Personal,
+                owner: owner.clone(),
+                active_epoch: LeaseEpoch::new(1).unwrap(),
+                initial_last_seq: SpaceSeq::ZERO,
+                created_at: None,
+            })
+            .await
+            .unwrap();
+        let ctx = owner_ctx(&scope, owner.clone());
+
+        let t1 = sample_thread_id(0x71);
+        let t2 = sample_thread_id(0x72);
+        let t3 = sample_thread_id(0x73);
+        for (thread, title) in [
+            (&t1, "Deep Thread"),
+            (&t2, "Redacted Thread"),
+            (&t3, "Short Thread"),
+        ] {
+            store
+                .create_chat(
+                    ctx.clone(),
+                    next_mutation(
+                        &scope,
+                        &owner,
+                        CreateChat {
+                            thread: thread.clone(),
+                            kind: ChatThreadKind::Personal,
+                            owner: owner.clone(),
+                            project_folder: None,
+                            title: title.into(),
+                        },
+                    ),
+                )
+                .await
+                .unwrap();
+        }
+
+        // Thread 1: build depth 0..=19 (crossing anc_16_seq) plus an orphaned
+        // sibling branch off entry 3 so active head_leaf_seq is entry 20.
+        let mut parent = ThreadEntrySeq::ZERO;
+        let mut t1_e1 = ThreadEntrySeq::ZERO;
+        let mut t1_e3 = ThreadEntrySeq::ZERO;
+        for step in 1..=3u32 {
+            let entry = store
+                .append_chat(
+                    ctx.clone(),
+                    next_mutation(
+                        &scope,
+                        &owner,
+                        AppendChat {
+                            thread: t1.clone(),
+                            parent,
+                            kind: ChatEntryKind::Human,
+                            body: ChatInputBody::Text(format!("t1 entry {step}")),
+                            referenced_notes: Vec::new(),
+                            tainted: false,
+                        },
+                    ),
+                )
+                .await
+                .unwrap()
+                .value;
+            if step == 1 {
+                t1_e1 = entry.seq;
+            }
+            if step == 3 {
+                t1_e3 = entry.seq;
+            }
+            parent = entry.seq;
+        }
+        let t1_orphan = store
+            .append_chat(
+                ctx.clone(),
+                next_mutation(
+                    &scope,
+                    &owner,
+                    AppendChat {
+                        thread: t1.clone(),
+                        parent: t1_e3,
+                        kind: ChatEntryKind::Model,
+                        body: ChatInputBody::Text("t1 orphaned sibling".into()),
+                        referenced_notes: Vec::new(),
+                        tainted: false,
+                    },
+                ),
+            )
+            .await
+            .unwrap()
+            .value
+            .seq;
+        parent = t1_e3;
+        for step in 4..=20u32 {
+            parent = store
+                .append_chat(
+                    ctx.clone(),
+                    next_mutation(
+                        &scope,
+                        &owner,
+                        AppendChat {
+                            thread: t1.clone(),
+                            parent,
+                            kind: ChatEntryKind::Human,
+                            body: ChatInputBody::Text(format!("t1 entry {step}")),
+                            referenced_notes: Vec::new(),
+                            tainted: false,
+                        },
+                    ),
+                )
+                .await
+                .unwrap()
+                .value
+                .seq;
+        }
+
+        // Thread 2: 5 entries with entry 2 redacted.
+        let mut t2_parent = ThreadEntrySeq::ZERO;
+        let mut t2_e1 = ThreadEntrySeq::ZERO;
+        let mut t2_e2 = ThreadEntrySeq::ZERO;
+        for step in 1..=5u32 {
+            let entry = store
+                .append_chat(
+                    ctx.clone(),
+                    next_mutation(
+                        &scope,
+                        &owner,
+                        AppendChat {
+                            thread: t2.clone(),
+                            parent: t2_parent,
+                            kind: ChatEntryKind::Human,
+                            body: ChatInputBody::Text(format!("t2 entry {step}")),
+                            referenced_notes: Vec::new(),
+                            tainted: false,
+                        },
+                    ),
+                )
+                .await
+                .unwrap()
+                .value;
+            if step == 1 {
+                t2_e1 = entry.seq;
+            }
+            if step == 2 {
+                t2_e2 = entry.seq;
+            }
+            t2_parent = entry.seq;
+        }
+        let t2_head = store
+            .read_chat(
+                ctx.clone(),
+                ChatRead {
+                    thread: t2.clone(),
+                    leaf: t2_parent,
+                    before: None,
+                    max_entries: PageLimit::new(2).unwrap(),
+                },
+            )
+            .await
+            .unwrap()
+            .thread;
+        store
+            .redact_chat_entry(
+                ctx.clone(),
+                next_mutation(
+                    &scope,
+                    &owner,
+                    RedactChatEntry {
+                        thread: t2.clone(),
+                        entry: t2_e2,
+                        expected_thread_revision: t2_head.revision,
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+
+        // Thread 3: 4 entries.
+        let mut t3_parent = ThreadEntrySeq::ZERO;
+        let mut t3_e2 = ThreadEntrySeq::ZERO;
+        for step in 1..=4u32 {
+            let entry = store
+                .append_chat(
+                    ctx.clone(),
+                    next_mutation(
+                        &scope,
+                        &owner,
+                        AppendChat {
+                            thread: t3.clone(),
+                            parent: t3_parent,
+                            kind: ChatEntryKind::Model,
+                            body: ChatInputBody::Text(format!("t3 entry {step}")),
+                            referenced_notes: Vec::new(),
+                            tainted: false,
+                        },
+                    ),
+                )
+                .await
+                .unwrap()
+                .value;
+            if step == 2 {
+                t3_e2 = entry.seq;
+            }
+            t3_parent = entry.seq;
+        }
+        let t3_tip = t3_parent;
+
+        let candidates = vec![
+            (t1.clone(), t1_e1),
+            (t1.clone(), t1_orphan),
+            (t2.clone(), t2_e2),
+            (t2.clone(), t2_e1),
+            (t3.clone(), t3_tip),
+            (t3.clone(), t3_e2),
+        ];
+
+        let visible = store
+            .visible_chat_hit_keys(&ctx, &candidates)
+            .await
+            .unwrap();
+        assert_eq!(
+            visible,
+            vec![
+                (t1.clone(), t1_e1),
+                (t2.clone(), t2_e1),
+                (t3.clone(), t3_tip),
+                (t3.clone(), t3_e2),
+            ]
+        );
+
+        let (page, truncated) = store
+            .hydrate_live_visible_chat_hits(&ctx, &candidates, PageLimit::new(2).unwrap())
+            .await
+            .unwrap();
+        assert!(truncated);
+        assert_eq!(page.len(), 2);
+        assert_eq!(
+            (&page[0].thread, page[0].entry, page[0].text.as_str()),
+            (&t1, t1_e1, "t1 entry 1")
+        );
+        assert_eq!(
+            (&page[1].thread, page[1].entry, page[1].text.as_str()),
+            (&t2, t2_e1, "t2 entry 1")
+        );
+
+        let (full, truncated_full) = store
+            .hydrate_live_visible_chat_hits(&ctx, &candidates, PageLimit::new(4).unwrap())
+            .await
+            .unwrap();
+        assert!(!truncated_full);
+        assert_eq!(
+            full.iter()
+                .map(|hit| (hit.thread.clone(), hit.entry, hit.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (t1.clone(), t1_e1, "t1 entry 1"),
+                (t2.clone(), t2_e1, "t2 entry 1"),
+                (t3.clone(), t3_tip, "t3 entry 4"),
+                (t3.clone(), t3_e2, "t3 entry 2"),
+            ]
+        );
+
+        runtime.shutdown().await.unwrap();
+    }
+    fixtures.drop_pg_schema(&schema).await;
+}

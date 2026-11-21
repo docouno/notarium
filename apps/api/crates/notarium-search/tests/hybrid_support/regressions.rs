@@ -1,5 +1,5 @@
 use super::{
-    ControlledCarriers, HeldPages, Projection, View, context, mutation,
+    HeldPages, Projection, View, context, mutation,
     remote::{ModelProvider, SwitchingResolver},
 };
 use crate::{
@@ -10,15 +10,20 @@ use crate::{
 };
 use notarium_canonical::{CanonicalStore, CreateFolderSpec, CreateSpaceSpec};
 use notarium_core::{
+    DomainError, DomainResult,
     auth::SpaceKind,
+    classes::DocClass,
     epoch::{DataRoot, SearchIndexKind},
-    ids::{ChatThreadId, LeaseEpoch, SpaceSeq, ThreadEntrySeq},
-    model::Lifecycle,
+    error::{PortError, ValidationReason},
+    ids::{ChatThreadId, FolderId, LeaseEpoch, NoteId, SpaceSeq, ThreadEntrySeq},
+    model::{DenseNodeId, DenseNodeIter, HistoryScope, Lifecycle, SnapshotCut},
     ports::{
         AppendChat, ChatEntryKind, ChatInputBody, ChatPort, ChatRead, ChatThreadKind, CreateChat,
-        DeleteDisposition, DeleteNote, NoteWritePort, PageLimit, RedactChatEntry, SearchPort,
-        ServiceAuthority, ServicePurpose, StructuralSnapshot,
+        DeleteDisposition, DeleteNote, NoteCard, NoteWritePort, PageLimit, PortFuture, RecallQuery,
+        RedactChatEntry, SearchPort, ServiceAuthority, ServicePurpose, SpaceContext,
+        StructuralReadPort, StructuralSnapshot,
     },
+    query::FieldFilterAstV1,
     receipt::{AwaitWatermarks, CausalBasis, MutationReceiptToken, ReceiptSet},
 };
 use notarium_search::{
@@ -27,10 +32,15 @@ use notarium_search::{
     layout::SearchLayout,
     ports::SearchDocumentTarget,
 };
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::{
     collections::BTreeSet,
     fs,
-    sync::{Arc, RwLock, atomic::Ordering},
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -40,7 +50,9 @@ pub async fn run_all(store: Arc<CanonicalStore>, root: DataRoot) {
     redaction_incomplete_cleanup_during_model_refresh_blocks_ack(store.clone(), root.clone()).await;
     purge_resync_during_embedding_repair_recovers_cleanly(store.clone(), root.clone()).await;
     trash_and_restore_during_seed_recovers_cleanly(store.clone(), root.clone()).await;
-    stray_files_and_orphan_tmps_do_not_break_reopen_or_scrub(store, root).await;
+    stray_files_and_orphan_tmps_do_not_break_reopen_or_scrub(store.clone(), root.clone()).await;
+    empty_query_preserves_exact_causal_and_stale_incarnation(store.clone(), root.clone()).await;
+    concurrent_trash_during_search_and_recall_skips_vanished_notes(store, root).await;
 }
 
 async fn trashed_folder_hidden_in_overlay_and_authorized_documents(
@@ -215,10 +227,9 @@ async fn exact_overlay_zero_grace_and_concurrent_align_convergence(
     let pages = Arc::new(HeldPages::new(store.clone()));
     let mut deps = SearchDependencies::new(store.clone(), projection.clone());
     deps.changes = pages.clone();
-    let engine = Arc::new(SearchEngine::start(
-        SearchConfig::new(root.clone(), VectorMode::Disabled),
-        deps,
-    ));
+    let mut config = SearchConfig::new(root.clone(), VectorMode::Disabled);
+    config.causal_wait_budget = Duration::from_secs(2);
+    let engine = Arc::new(SearchEngine::start(config, deps));
     engine.start_space(scope.clone()).unwrap();
     acknowledged(&store, &root, &scope, seeded.last_seq).await;
 
@@ -414,22 +425,47 @@ async fn redaction_incomplete_cleanup_during_model_refresh_blocks_ack(
     });
     let resolver = Arc::new(SwitchingResolver::new(5, 512));
     let provider = Arc::new(ModelProvider::default());
-    let carriers = Arc::new(ControlledCarriers::new(store.clone()));
-    let mut deps = SearchDependencies::new(store.clone(), projection.clone());
-    deps.model_resolver = Some(resolver.clone());
-    deps.providers = Some(provider.clone());
-    deps.carriers = carriers.clone();
-    let engine = Arc::new(SearchEngine::start(
-        SearchConfig::new(root.clone(), VectorMode::RemoteOnly),
-        deps,
-    ));
+    let start = || {
+        let mut deps = SearchDependencies::new(store.clone(), projection.clone());
+        deps.model_resolver = Some(resolver.clone());
+        deps.providers = Some(provider.clone());
+        Arc::new(SearchEngine::start(
+            SearchConfig::new(root.clone(), VectorMode::RemoteOnly),
+            deps,
+        ))
+    };
+    let engine = start();
     engine.start_space(scope.clone()).unwrap();
     let initial = acknowledged(&store, &root, &scope, appended.receipt.seq()).await;
     assert_eq!(initial.vector_seq, Some(appended.receipt.seq()));
     assert!(!initial.embeddings_pending);
     assert!(seeded.last_seq < appended.receipt.seq());
+    engine.shutdown().await;
 
-    // Begin a ModelRefresh and hold it mid-provider call.
+    // Register an extra managed path before reopening so Tantivy loads it into
+    // `ManagedDirectory` while `open_disk` still sees only regular files.
+    let layout = SearchLayout::open(&root, scope.clone()).unwrap();
+    let initial_dir = layout.index_dir(&initial).unwrap();
+    let managed_path = initial_dir.join(".managed.json");
+    let mut managed: Vec<String> =
+        serde_json::from_slice(&fs::read(&managed_path).unwrap()).unwrap();
+    managed.push("stale_obsolete.term".to_owned());
+    fs::write(&managed_path, serde_json::to_vec(&managed).unwrap()).unwrap();
+
+    let engine = start();
+    engine.start_space(scope.clone()).unwrap();
+    assert_eq!(
+        engine
+            .search(ctx.clone(), query("pinreaderterm"))
+            .await
+            .unwrap()
+            .hits
+            .len(),
+        1
+    );
+
+    // Hold a ModelRefresh mid-provider call so the redaction event runs while
+    // ModelRefresh is active and cannot race with `BgDone(ModelRefresh)`.
     provider.block_next_part.store(true, Ordering::SeqCst);
     resolver.provider.store(6, Ordering::SeqCst);
     let _ = engine
@@ -440,18 +476,38 @@ async fn redaction_incomplete_cleanup_during_model_refresh_blocks_ack(
         .await
         .unwrap();
 
-    // Pin the active Tantivy reader inside a held query so cleanup cannot
-    // remove the redacted generation while ModelRefresh reconciles changes.
-    carriers.hold_note_reads.store(true, Ordering::SeqCst);
-    let held_engine = engine.clone();
-    let mut held_ctx = ctx.clone();
-    held_ctx.budget.remaining = Duration::from_secs(30);
-    let pinned_reader = tokio::spawn(async move {
-        let _ = held_engine.search(held_ctx, query("pinreaderterm")).await;
-    });
-    tokio::time::timeout(Duration::from_secs(5), carriers.note_read_held.notified())
-        .await
-        .unwrap();
+    // Plant a non-empty directory at the registered managed path after reopen
+    // so `collect_obsolete` returns `LexicalError::IncompleteCleanup` (EISDIR)
+    // once `publisher.drain()` completes. Locking it read-only on non-root Unix
+    // also pauses `build::scrub` after manifest invalidation so we can observe
+    // the watermark staying below `redacted.receipt.seq()`.
+    #[cfg(unix)]
+    struct ReadOnlyDirGuard(std::path::PathBuf);
+    #[cfg(unix)]
+    impl ReadOnlyDirGuard {
+        fn lock(path: std::path::PathBuf) -> Self {
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o555)).unwrap();
+            Self(path)
+        }
+    }
+    #[cfg(unix)]
+    impl Drop for ReadOnlyDirGuard {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    let blocker_dir = initial_dir.join("stale_obsolete.term");
+    fs::create_dir(&blocker_dir).unwrap();
+    fs::write(blocker_dir.join("hold"), b"pinned obsolete entry").unwrap();
+    #[cfg(unix)]
+    let non_root_unix = fs::metadata(&blocker_dir)
+        .map(|meta| meta.uid() != 0)
+        .unwrap_or(false);
+    #[cfg(not(unix))]
+    let non_root_unix = false;
+    #[cfg(unix)]
+    let blocker_guard = non_root_unix.then(|| ReadOnlyDirGuard::lock(blocker_dir.clone()));
 
     let redacted = store
         .redact_chat_entry(
@@ -472,22 +528,35 @@ async fn redaction_incomplete_cleanup_during_model_refresh_blocks_ack(
         .write()
         .unwrap()
         .advance(redacted.receipt.seq());
-    provider.release_part.notify_one();
 
-    // Give the worker time to process the redaction event while the old reader
-    // remains pinned; IncompleteCleanup must NOT be swallowed or acked.
-    tokio::time::sleep(Duration::from_millis(250)).await;
-    assert!(
-        store
-            .min_consumer_watermark(&scope.space_id, &scope.incarnation)
-            .is_none_or(|seq| seq < redacted.receipt.seq()),
-        "redaction watermark advanced while obsolete Tantivy reader remained pinned"
-    );
+    // No reader is pinned, so `publisher.drain()` finishes immediately and
+    // `collect_obsolete` returns `IncompleteCleanup`, cancelling `ModelRefresh`
+    // and entering `build::scrub` without advancing the watermark.
+    if non_root_unix {
+        tokio::time::timeout(Duration::from_secs(8), async {
+            while !matches!(layout.search_manifest(), Ok(None)) {
+                tokio::time::sleep(Duration::from_millis(15)).await;
+            }
+        })
+        .await
+        .expect("IncompleteCleanup must trigger scrub and invalidate manifest");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            store
+                .min_consumer_watermark(&scope.space_id, &scope.incarnation)
+                .is_none_or(|seq| seq < redacted.receipt.seq()),
+            "redaction watermark advanced while IncompleteCleanup scrub remained blocked"
+        );
+        assert!(blocker_dir.exists());
+        #[cfg(unix)]
+        drop(blocker_guard);
+    }
 
-    pinned_reader.abort();
-    let _ = pinned_reader.await;
-    carriers.hold_note_reads.store(false, Ordering::SeqCst);
     acknowledged(&store, &root, &scope, redacted.receipt.seq()).await;
+    assert!(
+        !blocker_dir.exists(),
+        "IncompleteCleanup must scrub and rebuild the dirty Tantivy generation"
+    );
     assert_absent(
         &root.search(&scope.space_id, SearchIndexKind::Tantivy),
         REDACTED,
@@ -848,5 +917,370 @@ async fn stray_files_and_orphan_tmps_do_not_break_reopen_or_scrub(
             .hits
             .is_empty()
     );
+    engine.shutdown().await;
+}
+
+async fn empty_query_preserves_exact_causal_and_stale_incarnation(
+    store: Arc<CanonicalStore>,
+    root: DataRoot,
+) {
+    let tag = 0xed;
+    let owner = sample_principal_id(tag);
+    let root_folder = sample_folder_id(tag);
+    let lease = LeaseEpoch::new(1).unwrap();
+    let scope = store
+        .create_space(CreateSpaceSpec {
+            space_id: sample_space_id(tag),
+            incarnation: sample_incarnation(tag),
+            root_folder_id: root_folder.clone(),
+            slug: "reg-empty-exact".into(),
+            kind: SpaceKind::Personal,
+            owner: owner.clone(),
+            active_epoch: lease,
+            initial_last_seq: SpaceSeq::ZERO,
+            created_at: None,
+        })
+        .await
+        .unwrap()
+        .scope;
+    let note_id = sample_note_id(tag);
+    let (seeded, _) = store
+        .commit_synthetic_note_batch_for_test(
+            &scope,
+            lease,
+            &owner,
+            vec![note(&note_id, &root_folder, "Seed", "emptyexactseed")],
+        )
+        .await
+        .unwrap();
+    let mut view = View::new(scope.clone(), root_folder.clone());
+    view.index(note_id.clone(), root_folder.clone());
+    view.advance(seeded.last_seq);
+    let projection = Arc::new(Projection {
+        store: store.clone(),
+        snapshot: RwLock::new(view),
+        live: RwLock::new(BTreeSet::from([note_id])),
+    });
+    let engine = SearchEngine::start(
+        SearchConfig::new(root, VectorMode::Disabled),
+        SearchDependencies::new(store.clone(), projection.clone()),
+    );
+    engine.start_space(scope.clone()).unwrap();
+    let ctx = context(&scope, &owner);
+
+    let stale_scope = HistoryScope {
+        space_id: scope.space_id.clone(),
+        incarnation: sample_incarnation(tag + 1),
+    };
+    let stale_receipt =
+        ReceiptSet::new([
+            MutationReceiptToken::new(stale_scope, SpaceSeq::new(1).unwrap()).unwrap(),
+        ])
+        .unwrap();
+
+    // Punctuation-only query (`empty_query == true`) must still reject stale incarnation receipts.
+    let mut empty_stale = query("---");
+    empty_stale.folder = Some(root_folder.clone());
+    empty_stale.causal = CausalBasis::Exact(stale_receipt.clone());
+    let err = engine
+        .search(ctx.clone(), empty_stale)
+        .await
+        .expect_err("empty_query must reject stale incarnation receipt");
+    assert!(matches!(
+        err,
+        PortError::Domain(DomainError::ValidationFailed { diagnostic })
+            if diagnostic.reason == ValidationReason::HistoryIncarnationMismatch
+    ));
+
+    // Encrypted-only query must also reject stale incarnation receipts.
+    let mut enc_stale = query("anything");
+    enc_stale.classes = BTreeSet::from([DocClass::EncryptedNote]);
+    enc_stale.causal = CausalBasis::Exact(stale_receipt);
+    let err = engine
+        .search(ctx.clone(), enc_stale)
+        .await
+        .expect_err("encrypted_only must reject stale incarnation receipt");
+    assert!(matches!(
+        err,
+        PortError::Domain(DomainError::ValidationFailed { diagnostic })
+            if diagnostic.reason == ValidationReason::HistoryIncarnationMismatch
+    ));
+
+    // Exact receipt for a newly created folder must be honoured on empty_query
+    // and encrypted_only early exits rather than reading a stale projection cut.
+    let new_folder = sample_folder_id(tag + 1);
+    let (_, _, folder_seq) = store
+        .create_folder(CreateFolderSpec {
+            scope: scope.clone(),
+            active_epoch: lease,
+            folder_id: new_folder.clone(),
+            parent: Some(root_folder.clone()),
+            slug: "fresh-folder".into(),
+            display_name: "Fresh folder".into(),
+            is_project: false,
+            project_slug: None,
+            actor: owner,
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+    let proj_bg = projection.clone();
+    let folder_bg = new_folder.clone();
+    let root_bg = root_folder;
+    let advance_task = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let mut snap = proj_bg.snapshot.write().unwrap();
+        snap.folder(folder_bg, root_bg);
+        snap.advance(folder_seq);
+    });
+    let folder_receipt =
+        ReceiptSet::new([MutationReceiptToken::new(scope, folder_seq).unwrap()]).unwrap();
+    let mut empty_exact = query("---");
+    empty_exact.folder = Some(new_folder.clone());
+    empty_exact.causal = CausalBasis::Exact(folder_receipt.clone());
+    let empty_res = engine.search(ctx.clone(), empty_exact).await.unwrap();
+    assert!(empty_res.cut.projected_seq >= folder_seq);
+    assert!(empty_res.hits.is_empty());
+
+    let mut enc_exact = query("anything");
+    enc_exact.folder = Some(new_folder);
+    enc_exact.classes = BTreeSet::from([DocClass::EncryptedNote]);
+    enc_exact.causal = CausalBasis::Exact(folder_receipt);
+    let enc_res = engine.search(ctx, enc_exact).await.unwrap();
+    assert!(enc_res.cut.projected_seq >= folder_seq);
+    assert!(enc_res.hits.is_empty());
+
+    advance_task.await.unwrap();
+    engine.shutdown().await;
+}
+
+struct VanishingSnapshot {
+    inner: View,
+    vanished: NoteId,
+    vanish_doc_class: bool,
+    vanish_note_id: bool,
+}
+
+impl StructuralSnapshot for VanishingSnapshot {
+    fn cut(&self) -> &SnapshotCut {
+        self.inner.cut()
+    }
+
+    fn lookup(&self, note: &NoteId) -> DomainResult<Option<DenseNodeId>> {
+        self.inner.lookup(note)
+    }
+
+    fn note_id(&self, node: DenseNodeId) -> DomainResult<NoteId> {
+        let id = self.inner.note_id(node)?;
+        if self.vanish_note_id && id == self.vanished {
+            return Err(DomainError::ResourceNotFound);
+        }
+        Ok(id)
+    }
+
+    fn doc_class(&self, node: DenseNodeId) -> DomainResult<DocClass> {
+        if self.vanish_doc_class && self.inner.note_id(node).is_ok_and(|id| id == self.vanished) {
+            return Err(DomainError::ResourceNotFound);
+        }
+        self.inner.doc_class(node)
+    }
+
+    fn folder_subtree<'a>(&'a self, folder: &'a FolderId) -> PortFuture<'a, DenseNodeIter<'a>> {
+        self.inner.folder_subtree(folder)
+    }
+
+    fn folder_descendants<'a>(&'a self, folder: &'a FolderId) -> PortFuture<'a, Vec<FolderId>> {
+        self.inner.folder_descendants(folder)
+    }
+
+    fn enclosing_project<'a>(&'a self, folder: &'a FolderId) -> PortFuture<'a, Option<FolderId>> {
+        self.inner.enclosing_project(folder)
+    }
+
+    fn filter_notes<'a>(
+        &'a self,
+        filter: &'a FieldFilterAstV1,
+    ) -> PortFuture<'a, Option<DenseNodeIter<'a>>> {
+        self.inner.filter_notes(filter)
+    }
+
+    fn outgoing(&self, node: DenseNodeId) -> DomainResult<DenseNodeIter<'_>> {
+        self.inner.outgoing(node)
+    }
+
+    fn incoming(&self, node: DenseNodeId) -> DomainResult<DenseNodeIter<'_>> {
+        self.inner.incoming(node)
+    }
+}
+
+struct VanishingProjection {
+    inner: Arc<Projection>,
+    vanished: NoteId,
+    vanish_doc_class: Arc<AtomicBool>,
+    vanish_note_id: Arc<AtomicBool>,
+}
+
+impl StructuralReadPort for VanishingProjection {
+    fn acquire_snapshot(
+        &self,
+        ctx: SpaceContext,
+        _: CausalBasis,
+    ) -> PortFuture<'_, Box<dyn StructuralSnapshot>> {
+        Box::pin(async move {
+            let inner = self.inner.snapshot.read().unwrap().clone();
+            ctx.check_current(&inner.cut().scope)?;
+            Ok(Box::new(VanishingSnapshot {
+                inner,
+                vanished: self.vanished.clone(),
+                vanish_doc_class: self.vanish_doc_class.load(Ordering::SeqCst),
+                vanish_note_id: self.vanish_note_id.load(Ordering::SeqCst),
+            }) as Box<dyn StructuralSnapshot>)
+        })
+    }
+
+    fn is_live_visible<'a>(
+        &'a self,
+        ctx: &'a SpaceContext,
+        note: &'a NoteId,
+    ) -> PortFuture<'a, bool> {
+        self.inner.is_live_visible(ctx, note)
+    }
+
+    fn hydrate(
+        &self,
+        ctx: SpaceContext,
+        cut: SnapshotCut,
+        notes: Vec<NoteId>,
+    ) -> PortFuture<'_, Vec<Option<NoteCard>>> {
+        self.inner.hydrate(ctx, cut, notes)
+    }
+}
+
+async fn concurrent_trash_during_search_and_recall_skips_vanished_notes(
+    store: Arc<CanonicalStore>,
+    root: DataRoot,
+) {
+    let tag = 0xef;
+    let owner = sample_principal_id(tag);
+    let folder = sample_folder_id(tag);
+    let lease = LeaseEpoch::new(1).unwrap();
+    let scope = store
+        .create_space(CreateSpaceSpec {
+            space_id: sample_space_id(tag),
+            incarnation: sample_incarnation(tag),
+            root_folder_id: folder.clone(),
+            slug: "reg-vanish-trash".into(),
+            kind: SpaceKind::Personal,
+            owner: owner.clone(),
+            active_epoch: lease,
+            initial_last_seq: SpaceSeq::ZERO,
+            created_at: None,
+        })
+        .await
+        .unwrap()
+        .scope;
+    let anchor = sample_note_id(tag);
+    let vanished = sample_note_id(tag + 1);
+    let survivor = sample_note_id(tag + 2);
+    let (seeded, _) = store
+        .commit_synthetic_note_batch_for_test(
+            &scope,
+            lease,
+            &owner,
+            vec![
+                note(&anchor, &folder, "Anchor", "anchorvanishterm"),
+                note(&vanished, &folder, "Vanished", "sharedvanishterm"),
+                note(&survivor, &folder, "Survivor", "sharedvanishterm"),
+            ],
+        )
+        .await
+        .unwrap();
+    let mut view = View::new(scope.clone(), folder.clone());
+    view.index(anchor.clone(), folder.clone());
+    view.index(vanished.clone(), folder.clone());
+    view.index(survivor.clone(), folder.clone());
+    view.link(0, 1);
+    view.link(0, 2);
+    view.advance(seeded.last_seq);
+    let inner = Arc::new(Projection {
+        store: store.clone(),
+        snapshot: RwLock::new(view),
+        live: RwLock::new(BTreeSet::from([
+            anchor.clone(),
+            vanished.clone(),
+            survivor.clone(),
+        ])),
+    });
+    let vanish_doc_class = Arc::new(AtomicBool::new(false));
+    let vanish_note_id = Arc::new(AtomicBool::new(false));
+    let projection = Arc::new(VanishingProjection {
+        inner,
+        vanished: vanished.clone(),
+        vanish_doc_class: vanish_doc_class.clone(),
+        vanish_note_id: vanish_note_id.clone(),
+    });
+    let engine = SearchEngine::start(
+        SearchConfig::new(
+            root.clone(),
+            VectorMode::DeterministicTest { dimension: 64 },
+        ),
+        SearchDependencies::new(store.clone(), projection),
+    );
+    engine.start_space(scope.clone()).unwrap();
+    let initial = acknowledged(&store, &root, &scope, seeded.last_seq).await;
+    assert_eq!(initial.vector_seq, Some(seeded.last_seq));
+    let ctx = context(&scope, &owner);
+
+    // Gap 1: note vanishes between lookup() and doc_class() during unfiltered
+    // lexical (`admits_note`) and vector (`visible`) checks.
+    vanish_doc_class.store(true, Ordering::SeqCst);
+    let unfiltered = engine
+        .search(ctx.clone(), query("sharedvanishterm"))
+        .await
+        .expect("vanished doc_class must be skipped, not fail with 404");
+    let unfiltered_ids: Vec<_> = unfiltered
+        .hits
+        .iter()
+        .map(|hit| &hit.card.document.provenance().reference().note_id)
+        .collect();
+    assert!(unfiltered_ids.contains(&&survivor));
+    assert!(!unfiltered_ids.contains(&&vanished));
+
+    // Gap 2: note vanishes before `note_id()` during folder-filtered vector
+    // candidate expansion (`vector_notes`) and 2-hop graph `recall` (`expand`).
+    vanish_note_id.store(true, Ordering::SeqCst);
+    let mut folder_req = query("sharedvanishterm");
+    folder_req.folder = Some(folder);
+    let filtered = engine
+        .search(ctx.clone(), folder_req)
+        .await
+        .expect("vanished note_id in vector_notes must be skipped, not fail with 404");
+    let filtered_ids: Vec<_> = filtered
+        .hits
+        .iter()
+        .map(|hit| &hit.card.document.provenance().reference().note_id)
+        .collect();
+    assert!(filtered_ids.contains(&&survivor));
+    assert!(!filtered_ids.contains(&&vanished));
+
+    let recalled = engine
+        .recall(
+            ctx,
+            RecallQuery {
+                query: query("anchorvanishterm"),
+                graph_depth: 2,
+                token_budget: 2048,
+            },
+        )
+        .await
+        .expect("vanished neighbor in ranking::expand must be skipped, not fail with 404");
+    let recall_ids: Vec<_> = recalled
+        .hits
+        .iter()
+        .map(|hit| &hit.card.document.provenance().reference().note_id)
+        .collect();
+    assert!(recall_ids.contains(&&anchor));
+    assert!(recall_ids.contains(&&survivor));
+    assert!(!recall_ids.contains(&&vanished));
     engine.shutdown().await;
 }

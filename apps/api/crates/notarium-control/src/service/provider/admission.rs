@@ -17,7 +17,7 @@ use crate::{
 };
 use notarium_core::{
     DomainError,
-    auth::{AuthenticatedCredential, EngineAuthContext, Space},
+    auth::{AuthenticatedCredential, EngineAuthContext, PrincipalKind, Space},
     classes::{ClassEgressFence, ProviderCurrentContent, ProviderMessage},
     error::{CommitEffect, PortError, ValidationReason},
     ids::*,
@@ -51,6 +51,7 @@ pub(super) struct DispatchAuthority<'a> {
     pub embedding_inputs: &'a [EmbeddingInput],
     pub current: &'a [ProviderCurrentContent],
     pub keeper: Option<&'a crate::service::schedules::PrecheckedKeeper>,
+    pub allow_search_indexing: bool,
 }
 impl Snapshot {
     pub fn budgets(
@@ -127,6 +128,7 @@ impl ProviderService {
             embedding_inputs,
             current,
             keeper,
+            allow_search_indexing,
         } = authority;
         let users = rows!(tx,UsersRow,fetch_all,"SELECT * FROM users WHERE user_id IN ($1,$2) ORDER BY user_id","SELECT * FROM v1_control.users WHERE user_id IN ($1,$2) ORDER BY user_id FOR UPDATE";ctx.auth().principal().as_str(),&snapshot.resource.owner_id)?;
         if !users
@@ -135,15 +137,22 @@ impl ProviderService {
         {
             return Err(selection::unavailable());
         }
-        let auth = self
-            .control
-            .revalidate_with_keeper(tx, ctx.auth(), keeper)
-            .await?;
-        let indexing_project =
-            if let Some(AuthenticatedCredential::SearchIndexing { space, provider }) =
-                auth.credential()
-            {
-                if provider.as_str() != snapshot.resource.id
+        let auth = if allow_search_indexing {
+            self.control
+                .revalidate_for_embedding(tx, ctx.auth(), keeper)
+                .await?
+        } else {
+            self.control
+                .revalidate_with_keeper(tx, ctx.auth(), keeper)
+                .await?
+        };
+        let indexing_project = match (auth.kind(), auth.credential()) {
+            (
+                PrincipalKind::SearchIndexing,
+                Some(AuthenticatedCredential::SearchIndexing { space, provider }),
+            ) => {
+                if !allow_search_indexing
+                    || provider.as_str() != snapshot.resource.id
                     || primary.is_none_or(|primary| &primary.space.id != space)
                     || embedding_inputs.is_empty()
                     || embedding_inputs
@@ -153,9 +162,13 @@ impl ProviderService {
                     return Err(DomainError::AccessDenied.into());
                 }
                 project
-            } else {
-                None
-            };
+            }
+            (PrincipalKind::SearchIndexing, _)
+            | (_, Some(AuthenticatedCredential::SearchIndexing { .. })) => {
+                return Err(DomainError::AccessDenied.into());
+            }
+            _ => None,
+        };
         let resource = resource(tx, &snapshot.resource.id).await?;
         if resource.owner_id != snapshot.resource.owner_id
             || resource.runtime_epoch != snapshot.resource.runtime_epoch

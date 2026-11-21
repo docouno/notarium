@@ -57,7 +57,21 @@ fn restrict(
         })
         .collect())
 }
+fn is_search_indexing(auth: &EngineAuthContext) -> bool {
+    auth.kind() == &PrincipalKind::SearchIndexing
+        || matches!(
+            auth.credential(),
+            Some(AuthenticatedCredential::SearchIndexing { .. })
+        )
+}
+
 impl ControlService {
+    pub(super) fn reject_search_indexing(&self, auth: &EngineAuthContext) -> Result<(), PortError> {
+        if is_search_indexing(auth) {
+            return Err(access_denied());
+        }
+        Ok(())
+    }
     pub(super) async fn revalidate(
         &self,
         tx: &mut Transaction,
@@ -71,20 +85,15 @@ impl ControlService {
         auth: &EngineAuthContext,
         keeper: Option<&super::schedules::PrecheckedKeeper>,
     ) -> Result<EngineAuthContext, PortError> {
-        let current_user = user(tx, auth.principal().as_str()).await?;
-        let credential = auth.credential().cloned().ok_or_else(denied)?;
-        let current = self
-            .credential_context(
-                tx,
-                &current_user,
-                credential,
-                auth.human_management(),
-                auth.has_cap(Cap::AbilityWrite),
-                true,
-                keeper,
-            )
-            .await?;
-        auth.intersect_current(&current).map_err(Into::into)
+        self.revalidate_inner(tx, auth, keeper, true, false).await
+    }
+    pub(super) async fn revalidate_for_embedding(
+        &self,
+        tx: &mut Transaction,
+        auth: &EngineAuthContext,
+        keeper: Option<&super::schedules::PrecheckedKeeper>,
+    ) -> Result<EngineAuthContext, PortError> {
+        self.revalidate_inner(tx, auth, keeper, true, true).await
     }
     pub(super) async fn revalidate_read(
         &self,
@@ -99,7 +108,24 @@ impl ControlService {
         auth: &EngineAuthContext,
         keeper: Option<&super::schedules::PrecheckedKeeper>,
     ) -> Result<EngineAuthContext, PortError> {
-        let current_user = user_read(tx, auth.principal().as_str()).await?;
+        self.revalidate_inner(tx, auth, keeper, false, false).await
+    }
+    async fn revalidate_inner(
+        &self,
+        tx: &mut Transaction,
+        auth: &EngineAuthContext,
+        keeper: Option<&super::schedules::PrecheckedKeeper>,
+        lock: bool,
+        allow_search_indexing: bool,
+    ) -> Result<EngineAuthContext, PortError> {
+        if !allow_search_indexing {
+            self.reject_search_indexing(auth)?;
+        }
+        let current_user = if lock {
+            user(tx, auth.principal().as_str()).await?
+        } else {
+            user_read(tx, auth.principal().as_str()).await?
+        };
         let credential = auth.credential().cloned().ok_or_else(denied)?;
         let current = self
             .credential_context(
@@ -108,8 +134,9 @@ impl ControlService {
                 credential,
                 auth.human_management(),
                 auth.has_cap(Cap::AbilityWrite),
-                false,
+                lock,
                 keeper,
+                allow_search_indexing,
             )
             .await?;
         auth.intersect_current(&current).map_err(Into::into)
@@ -120,11 +147,39 @@ impl ControlService {
         request: &RequestId,
         auth: &EngineAuthContext,
     ) -> Result<(crate::store::ReadTransaction, EngineAuthContext), PortError> {
+        self.open_revalidated_read_inner(budget, request, auth, false)
+            .await
+    }
+    pub(super) async fn open_revalidated_read_for_search_indexing(
+        &self,
+        budget: &OperationBudget,
+        request: &RequestId,
+        auth: &EngineAuthContext,
+    ) -> Result<(crate::store::ReadTransaction, EngineAuthContext), PortError> {
+        self.open_revalidated_read_inner(budget, request, auth, true)
+            .await
+    }
+    async fn open_revalidated_read_inner(
+        &self,
+        budget: &OperationBudget,
+        request: &RequestId,
+        auth: &EngineAuthContext,
+        allow_search_indexing: bool,
+    ) -> Result<(crate::store::ReadTransaction, EngineAuthContext), PortError> {
+        if !allow_search_indexing {
+            self.reject_search_indexing(auth)?;
+        }
         let keeper = self.precheck_keeper_catalog(auth, budget, request).await?;
         let mut rtx = self.store.read(budget.clone()).await?;
         match budget
             .run(
-                self.revalidate_read_with_keeper(rtx.inner_mut(), auth, keeper.as_ref()),
+                self.revalidate_inner(
+                    rtx.inner_mut(),
+                    auth,
+                    keeper.as_ref(),
+                    false,
+                    allow_search_indexing,
+                ),
                 CommitEffect::NotCommitted,
             )
             .await
@@ -146,10 +201,14 @@ impl ControlService {
         ability_write: bool,
         lock: bool,
         keeper: Option<&super::schedules::PrecheckedKeeper>,
+        allow_search_indexing: bool,
     ) -> Result<EngineAuthContext, PortError> {
         let now = self.clock.now_ms()?;
         match &credential {
             AuthenticatedCredential::SearchIndexing { space, provider } => {
+                if !allow_search_indexing {
+                    return Err(access_denied());
+                }
                 if current_user.disabled_at.is_some() {
                     return Err(denied());
                 }
@@ -337,8 +396,13 @@ impl ControlService {
                             space: space.space.id.clone(),
                             provider: provider.clone(),
                         },
-                        false, false, false, None,
-                    ).await
+                        false,
+                        false,
+                        false,
+                        None,
+                        true,
+                    )
+                    .await
                 },
                 CommitEffect::NotCommitted,
             )
@@ -428,6 +492,7 @@ impl ControlService {
                         ability_write,
                         false,
                         None,
+                        false,
                     )
                     .await?;
                 let needs_touch = current.last_used_at <= now.saturating_sub(TOUCH_WINDOW_MS);
@@ -447,6 +512,7 @@ impl ControlService {
                         false,
                         false,
                         None,
+                        false,
                     )
                     .await?;
                 let needs_touch = current
@@ -470,7 +536,16 @@ impl ControlService {
                         .transpose()?,
                 };
                 let auth = self
-                    .credential_context(tx, &current_user, credential, false, false, false, None)
+                    .credential_context(
+                        tx,
+                        &current_user,
+                        credential,
+                        false,
+                        false,
+                        false,
+                        None,
+                        false,
+                    )
                     .await?;
                 let needs_touch = current
                     .last_used_at
@@ -509,6 +584,7 @@ impl ControlService {
                         ability_write,
                         true,
                         None,
+                        false,
                     )
                     .await?;
                 let now = self.clock.now_ms()?;
@@ -537,6 +613,7 @@ impl ControlService {
                         false,
                         true,
                         None,
+                        false,
                     )
                     .await?;
                 let now = self.clock.now_ms()?;
@@ -565,7 +642,16 @@ impl ControlService {
                         .transpose()?,
                 };
                 let auth = self
-                    .credential_context(tx, &current_user, credential, false, false, true, None)
+                    .credential_context(
+                        tx,
+                        &current_user,
+                        credential,
+                        false,
+                        false,
+                        true,
+                        None,
+                        false,
+                    )
                     .await?;
                 let now = self.clock.now_ms()?;
                 if current

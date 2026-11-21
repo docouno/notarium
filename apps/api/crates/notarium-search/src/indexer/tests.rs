@@ -617,3 +617,901 @@ async fn arc_search_engine_shutdown_is_idempotent() {
     runtime.shutdown().await.unwrap();
     std::fs::remove_dir_all(path).unwrap();
 }
+
+#[test]
+fn reopening_vectors_stays_true_during_reopen_after_live_edit_clears_vector_seq() {
+    let mut entropy = [0u8; 16];
+    getrandom::fill(&mut entropy).unwrap();
+    let path = std::env::temp_dir().join(format!("search-reopen-flag-{}", hex::encode(entropy)));
+    std::fs::create_dir(&path).unwrap();
+    let root = DataRoot::new(&path);
+    let scope = HistoryScope {
+        space_id: SpaceId::from_bytes([0xa1; 16]),
+        incarnation: HistoryIncarnation::from_bytes([0xa1; 16]),
+    };
+    let layout = Arc::new(SearchLayout::open(&root, scope.clone()).unwrap());
+    let lexical =
+        Arc::new(LexicalIndex::create(&layout.create_index_generation(1).unwrap()).unwrap());
+    let now = Instant::now();
+    let seq = SpaceSeq::new(2).unwrap();
+    let mut disk = Disk {
+        layout,
+        manifest: SearchManifest {
+            scope,
+            tantivy_seq: seq,
+            tantivy_commit: lexical.commit_id().unwrap(),
+            active_index_dir: crate::layout::index_name(1),
+            tokenizer_version: TOKENIZER_VERSION,
+            active_model: Some(ResolvedEmbeddingTarget {
+                model: ModelProfileId::from_bytes([0xa2; 16]),
+                dimension: 64,
+                max_input_tokens: 512,
+                backend: EmbeddingBackendTarget::LocalOnnx,
+            }),
+            vector_seq: None,
+            embeddings_pending: true,
+        },
+        folders: Arc::new(FolderDictionary::default()),
+        lexical: Some(lexical),
+        epoch: None,
+        embedder: None,
+        dirty_notes: BTreeSet::new(),
+        cached_vectors: HashMap::new(),
+        full_sweep_after: None,
+        full_sweep_needed: false,
+        last_activity: now,
+        embedder_last_use: now,
+    };
+    let handle = Arc::new(SpaceHandle::new());
+    let mut publisher = Publisher {
+        handle: &handle,
+        old: Vec::new(),
+    };
+    // Live edit during BgKind::ReopenVectors clears vector_seq while passing
+    // reopening = true; published state must stay marked reopening_vectors.
+    publisher.publish(&disk, true);
+    assert!(handle.published.load_full().unwrap().reopening_vectors);
+
+    publisher.publish(&disk, false);
+    assert!(!handle.published.load_full().unwrap().reopening_vectors);
+
+    disk.manifest.vector_seq = Some(seq);
+    publisher.publish(&disk, false);
+    assert!(handle.published.load_full().unwrap().reopening_vectors);
+
+    publisher.replace(None);
+    drop(publisher);
+    drop(handle);
+    drop(disk);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[tokio::test]
+async fn full_sweep_completion_preserves_resweep_when_remote_folders_changed() {
+    use crate::{
+        SearchDependencies, SearchEngine,
+        config::{SearchConfig, VectorMode},
+    };
+    use notarium_canonical::{CanonicalConfig, CanonicalRuntime};
+    use notarium_core::{
+        ids::{InstallationId, ProviderResourceId},
+        ports::ProviderRuntimeEpochs,
+    };
+
+    let mut entropy = [0u8; 16];
+    getrandom::fill(&mut entropy).unwrap();
+    let path = std::env::temp_dir().join(format!("search-sweep-folder-{}", hex::encode(entropy)));
+    std::fs::create_dir(&path).unwrap();
+    let root = DataRoot::new(&path);
+    let (store, runtime) = CanonicalRuntime::open(CanonicalConfig::local_default(
+        InstallationId::from_bytes([0xb1; 16]),
+        root.clone(),
+    ))
+    .await
+    .unwrap();
+    let engine = SearchEngine::start(
+        SearchConfig::new(root.clone(), VectorMode::RemoteOnly),
+        SearchDependencies::new(Arc::new(store), Arc::new(UnusedStructural)),
+    );
+    let scope = HistoryScope {
+        space_id: SpaceId::from_bytes([0xb2; 16]),
+        incarnation: HistoryIncarnation::from_bytes([0xb2; 16]),
+    };
+    let layout = Arc::new(SearchLayout::open(&root, scope.clone()).unwrap());
+    let lexical =
+        Arc::new(LexicalIndex::create(&layout.create_index_generation(1).unwrap()).unwrap());
+    let profile = ModelProfileId::from_bytes([0xb3; 16]);
+    let seq = SpaceSeq::new(1).unwrap();
+    let mut epoch = VectorEpoch::open(layout.clone(), profile.clone(), 64).unwrap();
+    epoch
+        .seed(SegmentBuilder::new(&profile, 64).unwrap(), seq)
+        .unwrap();
+    let now = Instant::now();
+    let mut disk = Some(Disk {
+        layout: layout.clone(),
+        manifest: SearchManifest {
+            scope,
+            tantivy_seq: seq,
+            tantivy_commit: lexical.commit_id().unwrap(),
+            active_index_dir: crate::layout::index_name(1),
+            tokenizer_version: TOKENIZER_VERSION,
+            active_model: Some(ResolvedEmbeddingTarget {
+                model: profile,
+                dimension: 64,
+                max_input_tokens: 512,
+                backend: EmbeddingBackendTarget::Remote {
+                    provider: ProviderResourceId::from_bytes([0xb4; 16]),
+                    runtime_epochs: ProviderRuntimeEpochs {
+                        resource: std::num::NonZeroU64::MIN,
+                        credential: None,
+                    },
+                    project: None,
+                },
+            }),
+            vector_seq: Some(seq),
+            embeddings_pending: true,
+        },
+        folders: Arc::new(FolderDictionary::default()),
+        lexical: Some(lexical),
+        epoch: Some(epoch),
+        embedder: None,
+        dirty_notes: BTreeSet::new(),
+        cached_vectors: HashMap::new(),
+        full_sweep_after: Some(NoteId::from_bytes([1; 16])),
+        full_sweep_needed: true,
+        last_activity: now,
+        embedder_last_use: now,
+    });
+    let handle = Arc::new(SpaceHandle::new());
+    let cx = Context {
+        services: &engine.services,
+        handle: &handle,
+    };
+    let mut publisher = Publisher {
+        handle: &handle,
+        old: Vec::new(),
+    };
+    let mut model_check_due = false;
+    let mut retry_model = false;
+    let mut model_retry_at = now;
+    let mut model_retry_delay = Duration::from_secs(1);
+    let mut embedder_retry_at = now;
+    let mut repair_at = now;
+    let mut repair_delay = Duration::from_secs(1);
+
+    // Final full-sweep page with a concurrent remote folder move must stay scheduled from the start.
+    handle_bg_done(
+        &cx,
+        &mut publisher,
+        &mut disk,
+        &layout,
+        BgOutcome::EmbedBatch(Ok(update::EmbedBatchOutcome::Applied {
+            rows: Vec::new(),
+            requeue: Vec::new(),
+            missing_folders: BTreeSet::new(),
+            next_sweep_after: None,
+            was_full_sweep: true,
+            had_transient_failure: false,
+        })),
+        BgDirty {
+            notes: HashSet::new(),
+            folders: BTreeSet::from([FolderId::from_bytes([0xb5; 16])]),
+        },
+        &mut model_check_due,
+        &mut retry_model,
+        &mut model_retry_at,
+        &mut model_retry_delay,
+        &mut embedder_retry_at,
+        &mut repair_at,
+        &mut repair_delay,
+    )
+    .await
+    .unwrap();
+    let current = disk.as_ref().unwrap();
+    assert!(current.full_sweep_needed);
+    assert!(current.full_sweep_after.is_none());
+    assert!(current.manifest.embeddings_pending);
+
+    // Intermediate full-sweep page with a folder change must also reset the sweep cursor to None.
+    handle_bg_done(
+        &cx,
+        &mut publisher,
+        &mut disk,
+        &layout,
+        BgOutcome::EmbedBatch(Ok(update::EmbedBatchOutcome::Applied {
+            rows: Vec::new(),
+            requeue: Vec::new(),
+            missing_folders: BTreeSet::new(),
+            next_sweep_after: Some(NoteId::from_bytes([2; 16])),
+            was_full_sweep: true,
+            had_transient_failure: false,
+        })),
+        BgDirty {
+            notes: HashSet::new(),
+            folders: BTreeSet::from([FolderId::from_bytes([0xb6; 16])]),
+        },
+        &mut model_check_due,
+        &mut retry_model,
+        &mut model_retry_at,
+        &mut model_retry_delay,
+        &mut embedder_retry_at,
+        &mut repair_at,
+        &mut repair_delay,
+    )
+    .await
+    .unwrap();
+    let current = disk.as_ref().unwrap();
+    assert!(current.full_sweep_needed);
+    assert!(current.full_sweep_after.is_none());
+    assert!(current.manifest.embeddings_pending);
+
+    // Final page with no folder changes clears full_sweep_needed and embeddings_pending.
+    handle_bg_done(
+        &cx,
+        &mut publisher,
+        &mut disk,
+        &layout,
+        BgOutcome::EmbedBatch(Ok(update::EmbedBatchOutcome::Applied {
+            rows: Vec::new(),
+            requeue: Vec::new(),
+            missing_folders: BTreeSet::new(),
+            next_sweep_after: None,
+            was_full_sweep: true,
+            had_transient_failure: false,
+        })),
+        BgDirty::default(),
+        &mut model_check_due,
+        &mut retry_model,
+        &mut model_retry_at,
+        &mut model_retry_delay,
+        &mut embedder_retry_at,
+        &mut repair_at,
+        &mut repair_delay,
+    )
+    .await
+    .unwrap();
+    let current = disk.as_ref().unwrap();
+    assert!(!current.full_sweep_needed);
+    assert!(current.full_sweep_after.is_none());
+    assert!(!current.manifest.embeddings_pending);
+
+    publisher.replace(None);
+    drop(publisher);
+    drop(disk);
+    engine.shutdown().await;
+    runtime.shutdown().await.unwrap();
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[tokio::test]
+async fn idle_embedder_stays_unloaded_during_non_embedding_writes_until_wake() {
+    use crate::{
+        SearchDependencies, SearchEngine,
+        config::{SearchConfig, VectorMode},
+    };
+    use notarium_canonical::{
+        CanonicalConfig, CanonicalRuntime, CreateFolderSpec, CreateSpaceSpec,
+        changes::SyntheticNoteSpec,
+    };
+    use notarium_core::{
+        auth::SpaceKind,
+        ids::{InstallationId, LeaseEpoch, PrincipalId},
+        model::Lifecycle,
+    };
+    use std::collections::BTreeMap;
+
+    let mut entropy = [0u8; 16];
+    getrandom::fill(&mut entropy).unwrap();
+    let path = std::env::temp_dir().join(format!("search-embed-idle-{}", hex::encode(entropy)));
+    std::fs::create_dir(&path).unwrap();
+    let root = DataRoot::new(&path);
+    let (store, runtime) = CanonicalRuntime::open(CanonicalConfig::local_default(
+        InstallationId::from_bytes([0xc1; 16]),
+        root.clone(),
+    ))
+    .await
+    .unwrap();
+    let store = Arc::new(store);
+    let owner = PrincipalId::from_bytes([0xc2; 16]);
+    let root_folder = FolderId::from_bytes([0xc3; 16]);
+    let lease = LeaseEpoch::new(1).unwrap();
+    let space = store
+        .create_space(CreateSpaceSpec {
+            space_id: SpaceId::from_bytes([0xc4; 16]),
+            incarnation: HistoryIncarnation::from_bytes([0xc4; 16]),
+            root_folder_id: root_folder.clone(),
+            slug: "embed-idle".into(),
+            kind: SpaceKind::Personal,
+            owner: owner.clone(),
+            active_epoch: lease,
+            initial_last_seq: SpaceSeq::ZERO,
+            created_at: None,
+        })
+        .await
+        .unwrap();
+    let (seeded, _) = store
+        .commit_synthetic_note_batch_for_test(
+            &space.scope,
+            lease,
+            &owner,
+            vec![SyntheticNoteSpec {
+                note_id: NoteId::from_bytes([0xc5; 16]),
+                parent_folder: Some(root_folder.clone()),
+                slug: "idle-note".into(),
+                title: "Idle note".into(),
+                doc_class: DocClass::UserDoc,
+                lifecycle: Lifecycle::Active,
+                carrier: "# Idle note\n\nsteady body".into(),
+                fields: BTreeMap::new(),
+            }],
+        )
+        .await
+        .unwrap();
+
+    let engine = SearchEngine::start(
+        SearchConfig::new(root, VectorMode::DeterministicTest { dimension: 64 }),
+        SearchDependencies::new(store.clone(), Arc::new(UnusedStructural)),
+    );
+    let handle = Arc::new(SpaceHandle::new());
+    let worker_services = engine.services.clone();
+    let worker_handle = handle.clone();
+    let worker_scope = space.scope.clone();
+    let task = tokio::spawn(async move {
+        let cx = Context {
+            services: &worker_services,
+            handle: &worker_handle,
+        };
+        let mut publisher = Publisher {
+            handle: &worker_handle,
+            old: Vec::new(),
+        };
+        let schedule = Schedule {
+            tick: Duration::from_millis(20),
+            lexical_idle: Duration::from_secs(5),
+            embedder_idle: Duration::from_millis(50),
+            worker_idle: Duration::from_secs(300),
+            archived_idle: Duration::from_secs(30),
+        };
+        consume(&cx, &mut publisher, &Weak::new(), worker_scope, schedule).await
+    });
+
+    let mut epochs = handle.epoch.subscribe();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(state) = handle.published.load_full()
+                && state.seq >= seeded.last_seq
+                && state.embedder.is_some()
+                && !state.embeddings_pending
+            {
+                break;
+            }
+            epochs.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+
+    // Wait for embedder_idle to release the embedder while lexical stays open.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(state) = handle.published.load_full()
+                && state.embedder.is_none()
+            {
+                break;
+            }
+            epochs.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+
+    // Folder-only writes keep lexical active but must not trigger an embedder reload loop.
+    let (_, _, folder_seq) = store
+        .create_folder(CreateFolderSpec {
+            scope: space.scope.clone(),
+            active_epoch: lease,
+            folder_id: FolderId::from_bytes([0xc6; 16]),
+            parent: Some(root_folder),
+            slug: "folder-write".into(),
+            display_name: "Folder write".into(),
+            is_project: false,
+            project_slug: None,
+            actor: owner,
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(state) = handle.published.load_full()
+                && state.seq >= folder_seq
+            {
+                break;
+            }
+            epochs.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    let steady = handle.published.load_full().unwrap();
+    assert_eq!(steady.seq, folder_seq);
+    assert!(
+        steady.embedder.is_none(),
+        "embedder must stay unloaded across idle ticks and non-embedding writes"
+    );
+
+    // An interactive Wake reloads the active embedder on demand.
+    handle.wake.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(state) = handle.published.load_full()
+                && state.embedder.is_some()
+            {
+                break;
+            }
+            epochs.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+
+    handle.stop.cancel();
+    assert!(matches!(
+        task.await.unwrap(),
+        Ok(None) | Err(IndexError::Port(PortError::Cancelled(_)))
+    ));
+    engine.shutdown().await;
+    runtime.shutdown().await.unwrap();
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[tokio::test]
+async fn purge_resync_acknowledges_before_model_refresh_preventing_lagged_livelock() {
+    use crate::{
+        SearchDependencies, SearchEngine,
+        config::{SearchConfig, VectorMode},
+        ports::{RemoteIndexingGrant, SearchModelResolverPort},
+    };
+    use notarium_canonical::{
+        CanonicalConfig, CanonicalRuntime, CreateSpaceSpec,
+        changes::{DEFAULT_BROADCAST_CAPACITY, SyntheticNoteSpec},
+    };
+    use notarium_core::{
+        auth::{EngineAuthContext, SpaceGrant, SpaceKind, SpaceRole, VerifiedHuman},
+        classes::{ProviderAudience, ProviderPolicy},
+        ids::{
+            CommandKey, GrantId, InstallationId, LeaseEpoch, PrincipalId, ProviderResourceId,
+            RequestId,
+        },
+        model::{FolderRef, Lifecycle},
+        ports::{
+            DeleteDisposition, DeleteNote, EmbeddingInput, EmbeddingProviderPort, EmbeddingRequest,
+            EmbeddingResult, Mutation, NoteWritePort, ProviderRuntimeEpochs, ProviderUsage,
+            ServiceAuthority,
+        },
+        receipt::CommandIdentity,
+    };
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        sync::atomic::{AtomicBool, AtomicUsize},
+    };
+    use tokio::sync::Notify;
+
+    struct StaticResolver;
+    impl SearchModelResolverPort for StaticResolver {
+        fn resolve_model<'a>(
+            &'a self,
+            _: &'a ServiceAuthority,
+            _: &'a HistoryScope,
+            _: Option<&'a ModelProfileId>,
+            _: &'a CallBudget,
+        ) -> PortFuture<'a, Option<ResolvedEmbeddingTarget>> {
+            Box::pin(async {
+                Ok(Some(ResolvedEmbeddingTarget {
+                    model: ModelProfileId::from_bytes([0xd0; 16]),
+                    dimension: 64,
+                    max_input_tokens: 512,
+                    backend: EmbeddingBackendTarget::Remote {
+                        provider: ProviderResourceId::from_bytes([0xd1; 16]),
+                        runtime_epochs: ProviderRuntimeEpochs {
+                            resource: std::num::NonZeroU64::MIN,
+                            credential: None,
+                        },
+                        project: None,
+                    },
+                }))
+            })
+        }
+
+        fn acquire_remote_indexing_grant<'a>(
+            &'a self,
+            _: &'a ServiceAuthority,
+            scope: &'a HistoryScope,
+            actor: &'a PrincipalId,
+            provider: &'a ProviderResourceId,
+            _: Option<&'a FolderRef>,
+            budget: CallBudget,
+        ) -> PortFuture<'a, Option<RemoteIndexingGrant>> {
+            Box::pin(async move {
+                let grant = SpaceGrant {
+                    role: SpaceRole::Owner,
+                    read_classes: DocClass::all(),
+                    write_classes: DocClass::all(),
+                    project_root: None,
+                };
+                let auth = EngineAuthContext::for_human(VerifiedHuman::attest(
+                    actor.clone(),
+                    GrantId::from_bytes([0xd2; 16]),
+                    BTreeMap::from([(scope.space_id.clone(), grant)]),
+                    true,
+                ));
+                let ctx = SpaceContext::new(auth, scope.clone(), budget).unwrap();
+                Ok(Some(RemoteIndexingGrant {
+                    ctx,
+                    policy: ProviderPolicy {
+                        provider: provider.clone(),
+                        audience: ProviderAudience::Personal { consented: true },
+                        allowed_classes: BTreeSet::from([DocClass::UserDoc]),
+                    },
+                }))
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct BlockingProvider {
+        parts: AtomicUsize,
+        block_next_part: AtomicBool,
+        part_started: Notify,
+        release_part: Notify,
+    }
+    impl EmbeddingProviderPort for BlockingProvider {
+        fn query_disclosure(
+            &self,
+            _: SpaceContext,
+            _: ProviderResourceId,
+            _: ModelProfileId,
+            _: Option<FolderRef>,
+        ) -> PortFuture<'_, BTreeSet<DocClass>> {
+            Box::pin(async { Ok(BTreeSet::from([DocClass::UserDoc])) })
+        }
+
+        fn embed(
+            &self,
+            ctx: SpaceContext,
+            request: EmbeddingRequest,
+        ) -> PortFuture<'_, EmbeddingResult> {
+            Box::pin(async move {
+                if !matches!(&request.inputs[..], [EmbeddingInput::Query(_)]) {
+                    self.parts.fetch_add(request.inputs.len(), Ordering::SeqCst);
+                    if self.block_next_part.swap(false, Ordering::SeqCst) {
+                        self.part_started.notify_one();
+                        tokio::select! {
+                            () = self.release_part.notified() => {},
+                            () = ctx.budget.cancellation.cancelled() => {
+                                return Err(DomainError::AccessDenied.into());
+                            }
+                        }
+                    }
+                }
+                let mut vector = vec![0.0; 64];
+                vector[0] = 1.0;
+                Ok(EmbeddingResult {
+                    model: request.model,
+                    dimension: 64,
+                    vectors: vec![Ok(vector); request.inputs.len()],
+                    usage: ProviderUsage::Unknown,
+                })
+            })
+        }
+    }
+
+    let mut entropy = [0u8; 16];
+    getrandom::fill(&mut entropy).unwrap();
+    let path = std::env::temp_dir().join(format!("search-purge-lag-{}", hex::encode(entropy)));
+    std::fs::create_dir(&path).unwrap();
+    let root = DataRoot::new(&path);
+    let (store, runtime) = CanonicalRuntime::open(CanonicalConfig::local_default(
+        InstallationId::from_bytes([0xd3; 16]),
+        root.clone(),
+    ))
+    .await
+    .unwrap();
+    let store = Arc::new(store);
+    let owner = PrincipalId::from_bytes([0xd4; 16]);
+    let lease = LeaseEpoch::new(1).unwrap();
+    let folder_a = FolderId::from_bytes([0xd5; 16]);
+    let space_a = store
+        .create_space(CreateSpaceSpec {
+            space_id: SpaceId::from_bytes([0xd6; 16]),
+            incarnation: HistoryIncarnation::from_bytes([0xd6; 16]),
+            root_folder_id: folder_a.clone(),
+            slug: "purge-target".into(),
+            kind: SpaceKind::Personal,
+            owner: owner.clone(),
+            active_epoch: lease,
+            initial_last_seq: SpaceSeq::ZERO,
+            created_at: None,
+        })
+        .await
+        .unwrap();
+    let space_b = store
+        .create_space(CreateSpaceSpec {
+            space_id: SpaceId::from_bytes([0xd7; 16]),
+            incarnation: HistoryIncarnation::from_bytes([0xd7; 16]),
+            root_folder_id: FolderId::from_bytes([0xd8; 16]),
+            slug: "noisy-peer".into(),
+            kind: SpaceKind::Personal,
+            owner: owner.clone(),
+            active_epoch: lease,
+            initial_last_seq: SpaceSeq::ZERO,
+            created_at: None,
+        })
+        .await
+        .unwrap();
+    let victim = NoteId::from_bytes([0xd9; 16]);
+    let survivor = NoteId::from_bytes([0xda; 16]);
+    let (seeded, revisions) = store
+        .commit_synthetic_note_batch_for_test(
+            &space_a.scope,
+            lease,
+            &owner,
+            vec![
+                SyntheticNoteSpec {
+                    note_id: victim.clone(),
+                    parent_folder: Some(folder_a.clone()),
+                    slug: "victim".into(),
+                    title: "Victim".into(),
+                    doc_class: DocClass::UserDoc,
+                    lifecycle: Lifecycle::Active,
+                    carrier: "# Victim\n\nsecret payload to purge".into(),
+                    fields: BTreeMap::new(),
+                },
+                SyntheticNoteSpec {
+                    note_id: survivor,
+                    parent_folder: Some(folder_a),
+                    slug: "survivor".into(),
+                    title: "Survivor".into(),
+                    doc_class: DocClass::UserDoc,
+                    lifecycle: Lifecycle::Active,
+                    carrier: "# Survivor\n\ndistinct surviving document".into(),
+                    fields: BTreeMap::new(),
+                },
+            ],
+        )
+        .await
+        .unwrap();
+
+    let provider = Arc::new(BlockingProvider::default());
+    let mut deps = SearchDependencies::new(store.clone(), Arc::new(UnusedStructural));
+    deps.model_resolver = Some(Arc::new(StaticResolver));
+    deps.providers = Some(provider.clone());
+    let engine = SearchEngine::start(
+        SearchConfig::new(root.clone(), VectorMode::RemoteOnly),
+        deps,
+    );
+    engine.start_space(space_a.scope.clone()).unwrap();
+    let layout = SearchLayout::open(&root, space_a.scope.clone()).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok(Some(manifest)) = layout.search_manifest()
+                && manifest.tantivy_seq >= seeded.last_seq
+                && manifest.vector_seq.is_some()
+                && !manifest.embeddings_pending
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let parts_before = provider.parts.load(Ordering::SeqCst);
+    provider.block_next_part.store(true, Ordering::SeqCst);
+
+    let grant = SpaceGrant {
+        role: SpaceRole::Owner,
+        read_classes: DocClass::all(),
+        write_classes: DocClass::all(),
+        project_root: None,
+    };
+    let auth = EngineAuthContext::for_human(VerifiedHuman::attest(
+        owner.clone(),
+        GrantId::from_bytes([0xdb; 16]),
+        BTreeMap::from([(space_a.scope.space_id.clone(), grant)]),
+        true,
+    ));
+    let ctx = SpaceContext::new(
+        auth,
+        space_a.scope.clone(),
+        CallBudget {
+            request: RequestId::from_bytes([0xdc; 16]),
+            cancellation: Cancellation::default(),
+            remaining: Duration::from_secs(10),
+        },
+    )
+    .unwrap();
+    let key_bytes = [0xdd; 16];
+    let mut purge_req = Mutation {
+        identity: CommandIdentity {
+            scope: space_a.scope.clone(),
+            actor: owner,
+            key: CommandKey::from_bytes(key_bytes),
+            hash: ContentDigest::from_bytes(*blake3::hash(&key_bytes).as_bytes()),
+        },
+        preconditions: Default::default(),
+        input: DeleteNote {
+            note: victim,
+            disposition: DeleteDisposition::Purge,
+        },
+    };
+    purge_req.preconditions.revision = Some(revisions[0].1.clone());
+    let purged = store.delete_note(ctx, purge_req).await.unwrap();
+
+    tokio::time::timeout(Duration::from_secs(10), provider.part_started.notified())
+        .await
+        .unwrap();
+    assert!(
+        store
+            .min_consumer_watermark(&space_a.scope.space_id, &space_a.scope.incarnation)
+            .is_some_and(|seq| seq >= purged.receipt.seq()),
+        "PurgeResync must acknowledge scrubbed lexical seed before ModelRefresh finishes"
+    );
+
+    // Overflow the shared process-wide BroadcastHub via another Space while
+    // Space A's post-purge ModelRefresh is paused; it must not re-scrub/restart.
+    let mut peer_seq = space_b.last_seq;
+    for _ in 0..=(DEFAULT_BROADCAST_CAPACITY + 16) {
+        peer_seq = peer_seq.checked_next().unwrap();
+        store
+            .fast_forward_space_to_seq_for_test(&space_b.scope, lease, peer_seq)
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        provider.parts.load(Ordering::SeqCst),
+        parts_before + 1,
+        "BroadcastHub lag must not cancel and restart post-purge ModelRefresh"
+    );
+
+    provider.release_part.notify_one();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok(Some(manifest)) = layout.search_manifest()
+                && manifest.tantivy_seq >= purged.receipt.seq()
+                && manifest.vector_seq.is_some()
+                && !manifest.embeddings_pending
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(provider.parts.load(Ordering::SeqCst), parts_before + 1);
+
+    engine.shutdown().await;
+    runtime.shutdown().await.unwrap();
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[tokio::test]
+async fn draining_gate_serializes_replacement_worker_until_evicted_worker_exits() {
+    use crate::{
+        SearchDependencies, SearchEngine,
+        config::{SearchConfig, VectorMode},
+    };
+    use notarium_canonical::{CanonicalConfig, CanonicalRuntime, CreateSpaceSpec};
+    use notarium_core::{
+        auth::SpaceKind,
+        ids::{InstallationId, LeaseEpoch, PrincipalId},
+    };
+
+    let mut entropy = [0u8; 16];
+    getrandom::fill(&mut entropy).unwrap();
+    let path = std::env::temp_dir().join(format!("search-drain-gate-{}", hex::encode(entropy)));
+    std::fs::create_dir(&path).unwrap();
+    let root = DataRoot::new(&path);
+    let (store, runtime) = CanonicalRuntime::open(CanonicalConfig::local_default(
+        InstallationId::from_bytes([0xe1; 16]),
+        root.clone(),
+    ))
+    .await
+    .unwrap();
+    let store = Arc::new(store);
+    let owner = PrincipalId::from_bytes([0xe2; 16]);
+    let lease = LeaseEpoch::new(1).unwrap();
+    let space_a = store
+        .create_space(CreateSpaceSpec {
+            space_id: SpaceId::from_bytes([0xe3; 16]),
+            incarnation: HistoryIncarnation::from_bytes([0xe3; 16]),
+            root_folder_id: FolderId::from_bytes([0xe4; 16]),
+            slug: "drain-a".into(),
+            kind: SpaceKind::Personal,
+            owner: owner.clone(),
+            active_epoch: lease,
+            initial_last_seq: SpaceSeq::ZERO,
+            created_at: None,
+        })
+        .await
+        .unwrap();
+    let space_b = store
+        .create_space(CreateSpaceSpec {
+            space_id: SpaceId::from_bytes([0xe5; 16]),
+            incarnation: HistoryIncarnation::from_bytes([0xe5; 16]),
+            root_folder_id: FolderId::from_bytes([0xe6; 16]),
+            slug: "drain-b".into(),
+            kind: SpaceKind::Personal,
+            owner,
+            active_epoch: lease,
+            initial_last_seq: SpaceSeq::ZERO,
+            created_at: None,
+        })
+        .await
+        .unwrap();
+
+    let engine = SearchEngine::start(
+        SearchConfig::new(root, VectorMode::Disabled),
+        SearchDependencies::new(store, Arc::new(UnusedStructural)),
+    )
+    .with_max_open_spaces(1);
+
+    let gate = engine.hold_drain_gate(space_a.scope.space_id.clone());
+    let handle_a = engine.space(space_a.scope.clone()).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        handle_a.published.load_full().is_none(),
+        "replacement worker must wait on per-Space drain gate before opening disk"
+    );
+
+    engine.release_held_drain_gate(&space_a.scope.space_id, &gate);
+    let mut epochs_a = handle_a.epoch.subscribe();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if handle_a.published.load_full().is_some() {
+                break;
+            }
+            epochs_a.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+
+    // Opening Space B evicts Space A under max_open_spaces = 1; immediately
+    // re-opening Space A must serialize cleanly behind the evicted worker.
+    let handle_b = engine.space(space_b.scope.clone()).unwrap();
+    let mut epochs_b = handle_b.epoch.subscribe();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if handle_b.published.load_full().is_some() {
+                break;
+            }
+            epochs_b.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+
+    let handle_a2 = engine.space(space_a.scope.clone()).unwrap();
+    let mut epochs_a2 = handle_a2.epoch.subscribe();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if handle_a2.published.load_full().is_some() {
+                break;
+            }
+            epochs_a2.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+
+    engine.shutdown().await;
+    assert_eq!(engine.worker_count(), 0);
+    assert_eq!(engine.draining_and_bg_count(), (0, 0));
+    runtime.shutdown().await.unwrap();
+    std::fs::remove_dir_all(path).unwrap();
+}

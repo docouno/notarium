@@ -88,6 +88,38 @@ impl Entry {
     }
 }
 
+#[derive(sqlx::FromRow)]
+struct BatchEntry {
+    thread_id: String,
+    entry_seq: i64,
+    parent_seq: Option<i64>,
+    branch_depth: i64,
+    kind: String,
+    author_id: String,
+    inline_text: Option<String>,
+    payload_blake3: Option<Vec<u8>>,
+    checkpoint_stale: i64,
+    ext_space_tainted: i64,
+}
+impl BatchEntry {
+    fn into_parts(self) -> Result<(ChatThreadId, Entry), PortError> {
+        Ok((
+            ChatThreadId::parse(&self.thread_id)?,
+            Entry {
+                entry_seq: self.entry_seq,
+                parent_seq: self.parent_seq,
+                branch_depth: self.branch_depth,
+                kind: self.kind,
+                author_id: self.author_id,
+                inline_text: self.inline_text,
+                payload_blake3: self.payload_blake3,
+                checkpoint_stale: self.checkpoint_stale,
+                ext_space_tainted: self.ext_space_tainted,
+            },
+        ))
+    }
+}
+
 fn entry_seq(raw: i64) -> Result<ThreadEntrySeq, PortError> {
     Ok(ThreadEntrySeq::new(u64::try_from(raw).map_err(|_| {
         internal_not_committed("search_chat_seq", "negative entry sequence")
@@ -393,10 +425,12 @@ impl CanonicalStore {
             return Err(DomainError::validation(ValidationReason::InvalidLimit).into());
         }
         let deadline = CommandDeadline::start(&ctx.budget, "filter_search_chat");
-        let (_, rows, _) = self
+        let planned = self
             .plan_chat_hits(ctx, &deadline, candidates.to_vec(), candidates.len())
             .await?;
-        rows.into_iter()
+        planned
+            .rows
+            .into_iter()
             .map(|(thread, entry)| Ok((thread.thread_id, entry.seq()?)))
             .collect()
     }
@@ -413,12 +447,12 @@ impl CanonicalStore {
         }
         let deadline = CommandDeadline::start(&ctx.budget, "hydrate_search_chat");
         let max = usize::from(limit.get());
-        let (_, planned, remaining) = self
+        let planned = self
             .plan_chat_hits(ctx, &deadline, candidates.to_vec(), max)
             .await?;
         let mut hydrated = BTreeMap::new();
         let mut keys = Vec::new();
-        for (thread, row) in planned {
+        for (thread, row) in planned.rows {
             if let Some(text) = self
                 .read_search_chat_text(ctx.scope(), &ctx.budget, &deadline, &row)
                 .await?
@@ -429,7 +463,13 @@ impl CanonicalStore {
             }
         }
         let (space, current, truncated) = self
-            .recheck_hydrated_chat_hits(ctx, &deadline, keys, remaining)
+            .recheck_hydrated_chat_hits(
+                ctx,
+                &deadline,
+                keys,
+                planned.remaining,
+                planned.verified_tips,
+            )
             .await?;
         let mut hits = Vec::with_capacity(current.len());
         for (thread, row) in current {
@@ -461,14 +501,7 @@ impl CanonicalStore {
         deadline: &CommandDeadline,
         candidates: Vec<(ChatThreadId, ThreadEntrySeq)>,
         limit: usize,
-    ) -> Result<
-        (
-            Space,
-            Vec<(ThreadHeadRow, Entry)>,
-            Vec<(ChatThreadId, ThreadEntrySeq)>,
-        ),
-        PortError,
-    > {
+    ) -> Result<PlannedChatHits, PortError> {
         let scope = ctx.scope().clone();
         let auth = ctx.auth().clone();
         self.with_read_tx_budget(Some(&tx_budget(&ctx.budget, deadline)?), |tx| {
@@ -483,26 +516,63 @@ impl CanonicalStore {
                 }
                 let (heads, entries_by_thread) =
                     load_chat_candidates_batch_tx(tx, &space.id, &deduped).await?;
-                let mut rows = Vec::new();
-                for (index, (thread, seq)) in deduped.iter().enumerate() {
-                    if let Some((head, row)) = admit_chat_candidate_tx(
-                        tx,
+                let mut prefiltered = Vec::with_capacity(deduped.len());
+                let mut jump_set = BTreeSet::new();
+                let mut verified_count = 0usize;
+                for (index, candidate) in deduped.iter().enumerate() {
+                    if let Some((head, row, reach)) = prefilter_chat_candidate(
                         &space,
                         &auth,
                         &heads,
                         &entries_by_thread,
-                        thread,
-                        *seq,
-                    )
-                    .await?
-                    {
-                        if rows.len() == limit {
-                            return Ok((space, rows, deduped[index..].to_vec()));
+                        None,
+                        candidate,
+                    )? {
+                        match reach {
+                            ReachCheck::Verified => {
+                                verified_count += 1;
+                            }
+                            ReachCheck::NeedsJump { tip, depth } => {
+                                jump_set.insert((candidate.0.clone(), tip, depth));
+                            }
                         }
-                        rows.push((head, row));
+                        prefiltered.push((index, head, row, reach));
+                        if verified_count > limit {
+                            break;
+                        }
                     }
                 }
-                Ok((space, rows, Vec::new()))
+                let jump_requests: Vec<_> = jump_set.into_iter().collect();
+                let landed =
+                    jump_to_ancestors_at_depth_batch_tx(tx, &space.id, &jump_requests).await?;
+                let mut rows = Vec::new();
+                let mut verified_tips = BTreeMap::new();
+                for (index, head, row, reach) in prefiltered {
+                    let seq = row.seq()?;
+                    let is_reachable = match reach {
+                        ReachCheck::Verified => true,
+                        ReachCheck::NeedsJump { tip, depth } => {
+                            landed.get(&(head.thread_id.clone(), tip, depth)) == Some(&seq)
+                        }
+                    };
+                    if !is_reachable {
+                        continue;
+                    }
+                    verified_tips.insert((head.thread_id.clone(), seq), head.head_leaf_seq);
+                    if rows.len() == limit {
+                        return Ok(PlannedChatHits {
+                            rows,
+                            remaining: deduped[index..].to_vec(),
+                            verified_tips,
+                        });
+                    }
+                    rows.push((head, row));
+                }
+                Ok(PlannedChatHits {
+                    rows,
+                    remaining: Vec::new(),
+                    verified_tips,
+                })
             })
         })
         .await
@@ -514,6 +584,7 @@ impl CanonicalStore {
         deadline: &CommandDeadline,
         keys: Vec<(ChatThreadId, ThreadEntrySeq)>,
         remaining: Vec<(ChatThreadId, ThreadEntrySeq)>,
+        verified_tips: BTreeMap<(ChatThreadId, ThreadEntrySeq), ThreadEntrySeq>,
     ) -> Result<(Space, Vec<(ThreadHeadRow, Entry)>, bool), PortError> {
         let scope = ctx.scope().clone();
         let auth = ctx.auth().clone();
@@ -529,38 +600,74 @@ impl CanonicalStore {
                 }
                 let (heads, entries_by_thread) =
                     load_chat_candidates_batch_tx(tx, &space.id, &all).await?;
-                let mut current = Vec::with_capacity(keys.len());
-                for (thread, seq) in keys {
-                    if let Some(hit) = admit_chat_candidate_tx(
-                        tx,
+                let mut jump_set = BTreeSet::new();
+                let mut key_candidates = Vec::with_capacity(keys.len());
+                for candidate in &keys {
+                    if let Some((head, row, reach)) = prefilter_chat_candidate(
                         &space,
                         &auth,
                         &heads,
                         &entries_by_thread,
-                        &thread,
-                        seq,
-                    )
-                    .await?
-                    {
-                        current.push(hit);
+                        Some(&verified_tips),
+                        candidate,
+                    )? {
+                        if let ReachCheck::NeedsJump { tip, depth } = reach {
+                            jump_set.insert((candidate.0.clone(), tip, depth));
+                        }
+                        key_candidates.push((head, row, reach));
                     }
                 }
-                let mut truncated = false;
-                for (thread, seq) in remaining {
-                    if admit_chat_candidate_tx(
-                        tx,
+                let mut truncated_verified = false;
+                let mut remaining_jumps = Vec::new();
+                for candidate in &remaining {
+                    if let Some((head, row, reach)) = prefilter_chat_candidate(
                         &space,
                         &auth,
                         &heads,
                         &entries_by_thread,
-                        &thread,
-                        seq,
-                    )
-                    .await?
-                    .is_some()
-                    {
-                        truncated = true;
-                        break;
+                        Some(&verified_tips),
+                        candidate,
+                    )? {
+                        match reach {
+                            ReachCheck::Verified => {
+                                truncated_verified = true;
+                                break;
+                            }
+                            ReachCheck::NeedsJump { tip, depth } => {
+                                remaining_jumps.push((head, row, tip, depth));
+                            }
+                        }
+                    }
+                }
+                if !truncated_verified {
+                    for (head, _, tip, depth) in &remaining_jumps {
+                        jump_set.insert((head.thread_id.clone(), *tip, *depth));
+                    }
+                }
+                let jump_requests: Vec<_> = jump_set.into_iter().collect();
+                let landed =
+                    jump_to_ancestors_at_depth_batch_tx(tx, &space.id, &jump_requests).await?;
+                let mut current = Vec::with_capacity(key_candidates.len());
+                for (head, row, reach) in key_candidates {
+                    let seq = row.seq()?;
+                    let is_reachable = match reach {
+                        ReachCheck::Verified => true,
+                        ReachCheck::NeedsJump { tip, depth } => {
+                            landed.get(&(head.thread_id.clone(), tip, depth)) == Some(&seq)
+                        }
+                    };
+                    if is_reachable {
+                        current.push((head, row));
+                    }
+                }
+                let mut truncated = truncated_verified;
+                if !truncated {
+                    for (head, row, tip, depth) in remaining_jumps {
+                        let seq = row.seq()?;
+                        if landed.get(&(head.thread_id, tip, depth)) == Some(&seq) {
+                            truncated = true;
+                            break;
+                        }
                     }
                 }
                 Ok((space, current, truncated))
@@ -603,6 +710,18 @@ impl CanonicalStore {
     }
 }
 
+struct PlannedChatHits {
+    rows: Vec<(ThreadHeadRow, Entry)>,
+    remaining: Vec<(ChatThreadId, ThreadEntrySeq)>,
+    verified_tips: BTreeMap<(ChatThreadId, ThreadEntrySeq), ThreadEntrySeq>,
+}
+
+#[derive(Clone, Copy)]
+enum ReachCheck {
+    Verified,
+    NeedsJump { tip: ThreadEntrySeq, depth: u32 },
+}
+
 async fn load_chat_candidates_batch_tx(
     tx: &mut BackendConn<'_>,
     space_id: &SpaceId,
@@ -625,41 +744,36 @@ async fn load_chat_candidates_batch_tx(
         }
     }
     let heads = load_thread_heads_batch_tx(tx, space_id, &thread_ids).await?;
-    let mut seqs_by_thread: BTreeMap<ChatThreadId, BTreeSet<ThreadEntrySeq>> = BTreeMap::new();
+    let mut entry_pairs = BTreeSet::new();
     for (thread, seq) in candidates {
         if let Some(head) = heads.get(thread) {
-            let set = seqs_by_thread.entry(thread.clone()).or_default();
-            set.insert(*seq);
+            entry_pairs.insert((thread.clone(), *seq));
             if head.head_leaf_seq != ThreadEntrySeq::ZERO {
-                set.insert(head.head_leaf_seq);
+                entry_pairs.insert((thread.clone(), head.head_leaf_seq));
             }
         }
     }
-    let mut entries_by_thread = BTreeMap::new();
-    for (thread, seqs) in seqs_by_thread {
-        let seq_vec: Vec<ThreadEntrySeq> = seqs.into_iter().collect();
-        let loaded = load_entries_for_thread_batch_tx(tx, space_id, &thread, &seq_vec).await?;
-        entries_by_thread.insert(thread, loaded);
-    }
+    let pairs: Vec<_> = entry_pairs.into_iter().collect();
+    let entries_by_thread = load_entries_batch_tx(tx, space_id, &pairs).await?;
     Ok((heads, entries_by_thread))
 }
 
-async fn admit_chat_candidate_tx(
-    tx: &mut BackendConn<'_>,
+fn prefilter_chat_candidate(
     space: &Space,
     auth: &notarium_core::auth::EngineAuthContext,
     heads: &BTreeMap<ChatThreadId, ThreadHeadRow>,
     entries_by_thread: &BTreeMap<ChatThreadId, BTreeMap<ThreadEntrySeq, Entry>>,
-    thread: &ChatThreadId,
-    seq: ThreadEntrySeq,
-) -> Result<Option<(ThreadHeadRow, Entry)>, PortError> {
+    verified_tips: Option<&BTreeMap<(ChatThreadId, ThreadEntrySeq), ThreadEntrySeq>>,
+    candidate: &(ChatThreadId, ThreadEntrySeq),
+) -> Result<Option<(ThreadHeadRow, Entry, ReachCheck)>, PortError> {
+    let (thread, seq) = candidate;
     let Some(head) = heads.get(thread) else {
         return Ok(None);
     };
     let Some(entries) = entries_by_thread.get(thread) else {
         return Ok(None);
     };
-    let Some(row) = entries.get(&seq) else {
+    let Some(row) = entries.get(seq) else {
         return Ok(None);
     };
     if !row.searchable() {
@@ -678,14 +792,222 @@ async fn admit_chat_candidate_tx(
     {
         return Ok(None);
     }
-    let tip_depth = entries
-        .get(&head.head_leaf_seq)
-        .map(Entry::depth)
-        .transpose()?;
-    if !reachable_with_tip_depth(tx, &space.id, thread, head.head_leaf_seq, tip_depth, row).await? {
-        return Ok(None);
+    let tip = head.head_leaf_seq;
+    let reach =
+        if *seq == tip || verified_tips.is_some_and(|tips| tips.get(candidate) == Some(&tip)) {
+            ReachCheck::Verified
+        } else if *seq > tip {
+            return Ok(None);
+        } else {
+            let depth = row.depth()?;
+            let Some(tip_depth) = entries.get(&tip).map(Entry::depth).transpose()? else {
+                return Ok(None);
+            };
+            if tip_depth <= depth {
+                return Ok(None);
+            }
+            ReachCheck::NeedsJump { tip, depth }
+        };
+    Ok(Some((head.clone(), row.clone(), reach)))
+}
+
+async fn load_entries_batch_tx(
+    tx: &mut BackendConn<'_>,
+    space_id: &SpaceId,
+    pairs: &[(ChatThreadId, ThreadEntrySeq)],
+) -> Result<BTreeMap<ChatThreadId, BTreeMap<ThreadEntrySeq, Entry>>, PortError> {
+    let mut out: BTreeMap<ChatThreadId, BTreeMap<ThreadEntrySeq, Entry>> = BTreeMap::new();
+    if pairs.is_empty() {
+        return Ok(out);
     }
-    Ok(Some((head.clone(), row.clone())))
+    let rows: Vec<BatchEntry> = match tx {
+        BackendConn::Sqlite(conn) => {
+            let mut acc = Vec::with_capacity(pairs.len());
+            for chunk in pairs.chunks(200) {
+                let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new("WITH keys(t, s) AS (VALUES ");
+                let mut sep = qb.separated(", ");
+                for (thread, seq) in chunk {
+                    sep.push("(");
+                    sep.push_bind_unseparated(thread.as_str());
+                    sep.push_unseparated(", ");
+                    sep.push_bind_unseparated(seq.get() as i64);
+                    sep.push_unseparated(")");
+                }
+                qb.push(
+                    ") SELECT e.thread_id, e.entry_seq, e.parent_seq,
+                             CAST(e.branch_depth AS BIGINT) AS branch_depth,
+                             e.kind, e.author_id, e.inline_text, e.payload_blake3,
+                             CAST(e.checkpoint_stale AS BIGINT) AS checkpoint_stale,
+                             CAST(e.ext_space_tainted AS BIGINT) AS ext_space_tainted
+                      FROM keys
+                      JOIN chat_entries e
+                        ON e.space_id = ",
+                );
+                qb.push_bind(space_id.as_str())
+                    .push(" AND e.thread_id = keys.t AND e.entry_seq = keys.s");
+                let part = qb
+                    .build_query_as::<BatchEntry>()
+                    .fetch_all(&mut **conn)
+                    .await
+                    .map_err(|error| {
+                        internal_not_committed(
+                            "sqlite_search_chat_entries_pairs_batch",
+                            error.to_string(),
+                        )
+                    })?;
+                acc.extend(part);
+            }
+            acc
+        }
+        BackendConn::Postgres(conn) => {
+            const SQL: &str = "SELECT e.thread_id, e.entry_seq, e.parent_seq,
+                        CAST(e.branch_depth AS BIGINT) AS branch_depth,
+                        e.kind, e.author_id, e.inline_text, e.payload_blake3,
+                        CAST(e.checkpoint_stale AS BIGINT) AS checkpoint_stale,
+                        CAST(e.ext_space_tainted AS BIGINT) AS ext_space_tainted
+                 FROM UNNEST($2::text[], $3::bigint[]) AS k(t, s)
+                 JOIN chat_entries e
+                   ON e.space_id = $1 AND e.thread_id = k.t AND e.entry_seq = k.s";
+            let threads: Vec<&str> = pairs.iter().map(|(t, _)| t.as_str()).collect();
+            let seqs: Vec<i64> = pairs.iter().map(|(_, s)| s.get() as i64).collect();
+            sqlx::query_as(SQL)
+                .bind(space_id.as_str())
+                .bind(&threads)
+                .bind(&seqs)
+                .fetch_all(&mut **conn)
+                .await
+                .map_err(|error| pg_read_error("pg_search_chat_entries_pairs_batch", error))?
+        }
+    };
+    for row in rows {
+        let (thread, entry) = row.into_parts()?;
+        let seq = entry.seq()?;
+        out.entry(thread).or_default().insert(seq, entry);
+    }
+    Ok(out)
+}
+
+async fn jump_to_ancestors_at_depth_batch_tx(
+    tx: &mut BackendConn<'_>,
+    space_id: &SpaceId,
+    requests: &[(ChatThreadId, ThreadEntrySeq, u32)],
+) -> Result<BTreeMap<(ChatThreadId, ThreadEntrySeq, u32), ThreadEntrySeq>, PortError> {
+    let mut out = BTreeMap::new();
+    if requests.is_empty() {
+        return Ok(out);
+    }
+    let rows: Vec<(String, i64, i64, i64)> = match tx {
+        BackendConn::Sqlite(conn) => {
+            let mut acc = Vec::with_capacity(requests.len());
+            for chunk in requests.chunks(100) {
+                let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+                    "WITH RECURSIVE reqs(thread_id, start_seq, target_depth) AS (VALUES ",
+                );
+                let mut sep = qb.separated(", ");
+                for (thread, start, depth) in chunk {
+                    sep.push("(");
+                    sep.push_bind_unseparated(thread.as_str());
+                    sep.push_unseparated(", ");
+                    sep.push_bind_unseparated(start.get() as i64);
+                    sep.push_unseparated(", ");
+                    sep.push_bind_unseparated(i64::from(*depth));
+                    sep.push_unseparated(")");
+                }
+                qb.push(
+                    "), jump(thread_id, start_seq, target_depth, entry_seq, branch_depth, parent_seq, anc_16_seq, anc_256_seq, hops) AS (
+                         SELECT r.thread_id, r.start_seq, r.target_depth,
+                                e.entry_seq, e.branch_depth, e.parent_seq, e.anc_16_seq, e.anc_256_seq, 0
+                         FROM reqs r
+                         JOIN chat_entries e
+                           ON e.space_id = ",
+                );
+                qb.push_bind(space_id.as_str());
+                qb.push(
+                    " AND e.thread_id = r.thread_id AND e.entry_seq = r.start_seq
+                         UNION ALL
+                         SELECT j.thread_id, j.start_seq, j.target_depth,
+                                e.entry_seq, e.branch_depth, e.parent_seq, e.anc_16_seq, e.anc_256_seq, j.hops + 1
+                         FROM jump j
+                         JOIN chat_entries e
+                           ON e.space_id = ",
+                );
+                qb.push_bind(space_id.as_str());
+                qb.push(
+                    " AND e.thread_id = j.thread_id
+                          AND e.entry_seq = CASE
+                              WHEN j.branch_depth - j.target_depth >= 256 AND j.anc_256_seq IS NOT NULL THEN j.anc_256_seq
+                              WHEN j.branch_depth - j.target_depth >= 16 AND j.anc_16_seq IS NOT NULL THEN j.anc_16_seq
+                              ELSE j.parent_seq
+                          END
+                         WHERE j.branch_depth > j.target_depth AND j.hops < 100000
+                     )
+                     SELECT thread_id, start_seq, target_depth, entry_seq
+                     FROM jump
+                     WHERE branch_depth = target_depth",
+                );
+                let part = qb
+                    .build_query_as::<(String, i64, i64, i64)>()
+                    .fetch_all(&mut **conn)
+                    .await
+                    .map_err(|error| {
+                        internal_not_committed("sqlite_jump_ancestors_batch", error.to_string())
+                    })?;
+                acc.extend(part);
+            }
+            acc
+        }
+        BackendConn::Postgres(conn) => {
+            const SQL: &str =
+                "WITH RECURSIVE reqs(thread_id, start_seq, target_depth) AS (
+                     SELECT t, s, d
+                     FROM UNNEST($2::text[], $3::bigint[], $4::bigint[]) AS k(t, s, d)
+                 ),
+                 jump(thread_id, start_seq, target_depth, entry_seq, branch_depth, parent_seq, anc_16_seq, anc_256_seq, hops) AS (
+                     SELECT r.thread_id, r.start_seq, r.target_depth,
+                            e.entry_seq, e.branch_depth::BIGINT, e.parent_seq, e.anc_16_seq, e.anc_256_seq, 0::BIGINT
+                     FROM reqs r
+                     JOIN chat_entries e
+                       ON e.space_id = $1 AND e.thread_id = r.thread_id AND e.entry_seq = r.start_seq
+                     UNION ALL
+                     SELECT j.thread_id, j.start_seq, j.target_depth,
+                            e.entry_seq, e.branch_depth::BIGINT, e.parent_seq, e.anc_16_seq, e.anc_256_seq, j.hops + 1
+                     FROM jump j
+                     JOIN chat_entries e
+                       ON e.space_id = $1
+                      AND e.thread_id = j.thread_id
+                      AND e.entry_seq = CASE
+                          WHEN j.branch_depth - j.target_depth >= 256 AND j.anc_256_seq IS NOT NULL THEN j.anc_256_seq
+                          WHEN j.branch_depth - j.target_depth >= 16 AND j.anc_16_seq IS NOT NULL THEN j.anc_16_seq
+                          ELSE j.parent_seq
+                      END
+                     WHERE j.branch_depth > j.target_depth AND j.hops < 100000
+                 )
+                 SELECT thread_id, start_seq, target_depth, entry_seq
+                 FROM jump
+                 WHERE branch_depth = target_depth";
+            let threads: Vec<&str> = requests.iter().map(|(t, _, _)| t.as_str()).collect();
+            let starts: Vec<i64> = requests.iter().map(|(_, s, _)| s.get() as i64).collect();
+            let targets: Vec<i64> = requests.iter().map(|(_, _, d)| i64::from(*d)).collect();
+            sqlx::query_as(SQL)
+                .bind(space_id.as_str())
+                .bind(&threads)
+                .bind(&starts)
+                .bind(&targets)
+                .fetch_all(&mut **conn)
+                .await
+                .map_err(|error| pg_read_error("pg_jump_ancestors_batch", error))?
+        }
+    };
+    for (thread_raw, start_raw, depth_raw, landed_raw) in rows {
+        let thread = ChatThreadId::parse(&thread_raw)?;
+        let start = entry_seq(start_raw)?;
+        let depth = u32::try_from(depth_raw).map_err(|_| {
+            internal_not_committed("search_chat_depth", "invalid target branch depth")
+        })?;
+        let landed = entry_seq(landed_raw)?;
+        out.insert((thread, start, depth), landed);
+    }
+    Ok(out)
 }
 
 async fn thread_has_redaction_or_compaction_after_tx(

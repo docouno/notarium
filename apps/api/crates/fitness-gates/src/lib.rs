@@ -127,6 +127,12 @@ pub const CORE_RUNTIME_DEPENDENCIES: &[&str] = &[
     "croaring",
 ];
 
+const FIXTURE_CRATES: &[&str] = &[
+    "notarium-canonical",
+    "notarium-projections",
+    "notarium-search",
+];
+
 pub fn validate_metadata(metadata: &Value, root: &Path) -> Result<(), String> {
     let packages = metadata["packages"].as_array().ok_or("missing packages")?;
     let members = metadata["workspace_members"]
@@ -164,10 +170,8 @@ pub fn validate_metadata(metadata: &Value, root: &Path) -> Result<(), String> {
             if expected.contains(target) {
                 // Cargo builds a package's own integration tests as downstream crates.
                 // Self dev-dependencies select fixture methods only for test targets.
-                let self_test_harness = matches!(
-                    source,
-                    "notarium-canonical" | "notarium-projections" | "notarium-search"
-                ) && target == source
+                let self_test_harness = FIXTURE_CRATES.contains(&source)
+                    && target == source
                     && dep["kind"] == "dev"
                     && dep["features"] == serde_json::json!(["test-support"])
                     && dep["rename"].is_null()
@@ -181,10 +185,8 @@ pub fn validate_metadata(metadata: &Value, root: &Path) -> Result<(), String> {
                         dep["rename"], dep["kind"], dep["target"]
                     ));
                 }
-                if matches!(
-                    target,
-                    "notarium-canonical" | "notarium-projections" | "notarium-search"
-                ) && dep["kind"] != "dev"
+                if FIXTURE_CRATES.contains(&target)
+                    && dep["kind"] != "dev"
                     && dep["features"]
                         .as_array()
                         .is_some_and(|features| features.iter().any(|f| f == "test-support"))
@@ -198,6 +200,33 @@ pub fn validate_metadata(metadata: &Value, root: &Path) -> Result<(), String> {
             }
             if source == "notarium-agents" && ["tantivy", "ort", "yrs"].contains(&target) {
                 return Err(format!("heavy dependency {source} -> {target}"));
+            }
+        }
+        if let Some(features) = package["features"].as_object() {
+            for (feature_name, entries) in features {
+                let Some(entries) = entries.as_array() else {
+                    continue;
+                };
+                for entry in entries.iter().filter_map(Value::as_str) {
+                    if feature_name == "default"
+                        && entry == "test-support"
+                        && FIXTURE_CRATES.contains(&source)
+                    {
+                        return Err(format!(
+                            "fixture API enabled by default feature in {source}"
+                        ));
+                    }
+                    let stripped = entry.strip_prefix("dep:").unwrap_or(entry);
+                    if let Some((dep_name, feat)) = stripped.split_once('/')
+                        && feat == "test-support"
+                        && FIXTURE_CRATES.contains(&dep_name.trim_end_matches('?'))
+                        && (source != "fitness-gates" || feature_name == "default")
+                    {
+                        return Err(format!(
+                            "fixture API enabled by feature {source}/{feature_name} -> {entry}"
+                        ));
+                    }
+                }
             }
         }
     }

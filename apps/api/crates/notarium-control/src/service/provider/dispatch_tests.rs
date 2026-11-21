@@ -825,6 +825,137 @@ async fn gateway(pg: bool, kind: ProviderWireKind, label: &str) {
             .write_classes
             .is_empty()
     );
+    // SearchIndexing authority is restricted to internal document embedding
+    // dispatch and must be rejected across ControlService and non-embedding
+    // ProviderService entrypoints without issuing egress or HTTP traffic.
+    let before_rejected = requests.lock().unwrap().len();
+    let indexing_account = AccountContext::new(indexing.auth().clone(), budget());
+    let control = setup.provider.control_service();
+    assert!(matches!(
+        control.whoami(indexing_account.clone()).await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+    assert!(matches!(
+        control
+            .list_spaces(
+                indexing_account.clone(),
+                ControlPageRequest::new(10, None).unwrap(),
+            )
+            .await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+    assert!(matches!(
+        control
+            .list_favorites(
+                indexing_account.clone(),
+                ControlPageRequest::new(10, None).unwrap(),
+            )
+            .await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+    assert!(matches!(
+        control
+            .begin_agent_call(
+                indexing_account.clone(),
+                BeginAgentCall {
+                    call: RequestId::from_bytes([120; 16]),
+                    request: RequestId::from_bytes([121; 16]),
+                    episode: None,
+                    operation: AgentOperation::Search,
+                    transport: AgentTransport::Internal,
+                    effect: AgentEffect::Read,
+                    input_bytes: 0,
+                },
+            )
+            .await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+    assert!(matches!(
+        control
+            .start_or_resume_episode(
+                indexing_account.clone(),
+                AccountMutation {
+                    identity: command(
+                        indexing.auth().principal(),
+                        indexing.auth().principal(),
+                        122,
+                        setup.revision,
+                    ),
+                    input: StartEpisode {
+                        selector: EpisodeSelector::New {
+                            requested: EpisodeId::from_bytes([122; 16]),
+                            name: None,
+                        },
+                        project_hint: None,
+                    },
+                },
+            )
+            .await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+    assert!(matches!(
+        setup
+            .provider
+            .inspect_call(indexing_account.clone(), RequestId::from_bytes([123; 16]))
+            .await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+    assert!(matches!(
+        setup
+            .provider
+            .select_provider(
+                indexing.clone(),
+                SelectProvider {
+                    kind: PreferenceModelKind::Embedding,
+                    resource: Some(setup.selection.provider.clone()),
+                    model: Some(ModelProfileId::from_bytes([4; 16])),
+                    project: None,
+                },
+            )
+            .await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+    assert!(matches!(
+        setup
+            .provider
+            .query_disclosure(
+                indexing.clone(),
+                setup.selection.provider.clone(),
+                ModelProfileId::from_bytes([4; 16]),
+                None,
+            )
+            .await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+    assert!(matches!(
+        complete(&setup.provider, indexing.clone(), setup.completion(124)).await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+    assert!(matches!(
+        setup
+            .provider
+            .check_connection(
+                indexing_account,
+                CheckProviderConnection {
+                    resource: setup.selection.provider.clone(),
+                    intent: CommandKey::from_bytes([125; 16]),
+                },
+            )
+            .await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+    assert!(matches!(
+        setup
+            .provider
+            .embed(
+                indexing.clone(),
+                query(126, DocClass::UserDoc).with_runtime_epochs(setup.selection.runtime_epochs),
+            )
+            .await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+    assert_eq!(requests.lock().unwrap().len(), before_rejected);
+    assert_eq!(setup.egress.active.load(Ordering::SeqCst), 0);
     // Narrowed caller read_classes constrain both query_disclosure and EmbeddingInput::Query.
     let mut narrowed_grants = setup.space.auth().spaces().clone();
     narrowed_grants

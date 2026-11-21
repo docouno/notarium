@@ -291,12 +291,19 @@ impl StructuralReadPort for Projection {
         causal: CausalBasis,
     ) -> PortFuture<'_, Box<dyn StructuralSnapshot>> {
         Box::pin(async move {
+            let required = match &causal {
+                CausalBasis::Await(watermarks) => watermarks.required(ctx.scope())?,
+                CausalBasis::Exact(receipts) => receipts
+                    .for_scope(ctx.scope())?
+                    .into_iter()
+                    .map(|receipt| receipt.seq())
+                    .max()
+                    .unwrap_or_default(),
+            };
             loop {
                 let view = self.snapshot.read().unwrap().clone();
                 ctx.check_current(&view.cut.scope)?;
-                if let CausalBasis::Await(watermarks) = &causal
-                    && watermarks.required(ctx.scope())? > view.cut.projected_seq
-                {
+                if required > view.cut.projected_seq {
                     tokio::time::sleep(Duration::from_millis(1)).await;
                     continue;
                 }

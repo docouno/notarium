@@ -130,6 +130,25 @@ pub fn verify_crate_quarantine(spec: &CrateQuarantine<'_>) {
                             !target.contains(".."),
                             "parent traversal #[path = \"{target}\"] in {rel_posix}"
                         );
+                        let target_rel = resolved
+                            .strip_prefix(&canonical_root)
+                            .expect("resolved #[path] target under crate root");
+                        let target_posix = normalize_relative_path(target_rel);
+                        assert!(
+                            resolved.extension().and_then(|ext| ext.to_str()) == Some("rs"),
+                            "non-.rs #[path = \"{target}\"] target in {rel_posix}"
+                        );
+                        assert!(
+                            !target_rel.components().any(|component| {
+                                matches!(component, Component::Normal(part) if part == "target")
+                            }),
+                            "#[path = \"{target}\"] targets build directory in {rel_posix}"
+                        );
+                        assert!(
+                            !spec.leaves.iter().any(|leaf| leaf.path == target_posix),
+                            "#[path = \"{target}\"] targets audited unsafe leaf in {rel_posix}"
+                        );
+                        verify_clean_source(&resolved, &target_posix);
                     } else {
                         assert!(
                             in_tests && allowed_external.contains(&resolved),
@@ -239,10 +258,13 @@ fn verify_safety_comments(label: &str, raw: &str, code_only: &str) {
             has_safety_comment = !rest.trim().is_empty();
             continue;
         }
-        if trimmed.starts_with("//") || trimmed.starts_with("#[") {
+        if trimmed.starts_with("//") {
             continue;
         }
         let blocks = unsafe_block_count(code_line);
+        if trimmed.starts_with("#[") && blocks == 0 {
+            continue;
+        }
         assert!(
             blocks == 0 || (blocks == 1 && has_safety_comment),
             "audited leaf {label} has undocumented unsafe block on line: {raw_line}"
@@ -251,12 +273,33 @@ fn verify_safety_comments(label: &str, raw: &str, code_only: &str) {
     }
 }
 
+fn is_ident_char(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
 pub fn unsafe_block_count(code_line: &str) -> usize {
-    let mut words = code_tokens(code_line).peekable();
+    let bytes = code_line.as_bytes();
     let mut count = 0;
-    while let Some(word) = words.next() {
-        if word == "unsafe" && words.peek() != Some(&"fn") {
-            count += 1;
+    let mut i = 0;
+    while i < bytes.len() {
+        if is_ident_char(bytes[i]) {
+            let start = i;
+            while i < bytes.len() && is_ident_char(bytes[i]) {
+                i += 1;
+            }
+            if &bytes[start..i] == b"unsafe" {
+                let mut j = i;
+                while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                let followed_by_fn = bytes[j..].starts_with(b"fn")
+                    && (j + 2 >= bytes.len() || !is_ident_char(bytes[j + 2]));
+                if !followed_by_fn {
+                    count += 1;
+                }
+            }
+        } else {
+            i += 1;
         }
     }
     count
@@ -475,6 +518,66 @@ pub fn contains_include_macro(code_only: &str) -> bool {
     false
 }
 
+fn skip_literal(source: &str, i: usize) -> Result<Option<usize>, String> {
+    let bytes = source.as_bytes();
+    if let Some((prefix_end, hashes)) = match_raw_string_start(bytes, i) {
+        let mut j = prefix_end;
+        while j < bytes.len() {
+            if bytes[j] == b'"'
+                && j + 1 + hashes <= bytes.len()
+                && bytes[j + 1..j + 1 + hashes].iter().all(|&b| b == b'#')
+            {
+                return Ok(Some(j + 1 + hashes));
+            }
+            j += 1;
+        }
+        return Err("unterminated raw string literal".into());
+    }
+    let string_quote = if bytes[i] == b'"' {
+        Some(i)
+    } else if (bytes[i] == b'b' || bytes[i] == b'c')
+        && (i == 0 || !is_ident_char(bytes[i - 1]))
+        && i + 1 < bytes.len()
+        && bytes[i + 1] == b'"'
+    {
+        Some(i + 1)
+    } else {
+        None
+    };
+    if let Some(quote) = string_quote {
+        let mut j = quote + 1;
+        while j < bytes.len() {
+            if bytes[j] == b'\\' && j + 1 < bytes.len() {
+                let ch = source[j + 1..].chars().next().expect("valid utf8");
+                j += 1 + ch.len_utf8();
+            } else if bytes[j] == b'"' {
+                return Ok(Some(j + 1));
+            } else {
+                let ch = source[j..].chars().next().expect("valid utf8");
+                j += ch.len_utf8();
+            }
+        }
+        return Err("unterminated string literal".into());
+    }
+    let char_quote = if bytes[i] == b'\'' {
+        Some(i)
+    } else if bytes[i] == b'b'
+        && (i == 0 || !is_ident_char(bytes[i - 1]))
+        && i + 1 < bytes.len()
+        && bytes[i + 1] == b'\''
+    {
+        Some(i + 1)
+    } else {
+        None
+    };
+    if let Some(quote) = char_quote
+        && let Some(end) = match_char_literal(source, quote)
+    {
+        return Ok(Some(end));
+    }
+    Ok(None)
+}
+
 /// Extract all `#[path = "..."]` / `#![path = "..."]` (and `cfg_attr(..., path = "...")`)
 /// targets from comment-stripped Rust source. Fails closed if a `path =` attribute
 /// does not use a plain string literal.
@@ -483,6 +586,10 @@ pub fn extract_path_attrs(no_comments: &str) -> Result<Vec<String>, String> {
     let bytes = no_comments.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
+        if let Some(next) = skip_literal(no_comments, i)? {
+            i = next;
+            continue;
+        }
         if bytes[i] == b'#' {
             let mut j = i + 1;
             while j < bytes.len() && bytes[j].is_ascii_whitespace() {
@@ -496,36 +603,28 @@ pub fn extract_path_attrs(no_comments: &str) -> Result<Vec<String>, String> {
             }
             if j < bytes.len() && bytes[j] == b'[' {
                 let start = j + 1;
-                let end = find_matching_bracket(bytes, j)?;
+                let end = find_matching_bracket(no_comments, j)?;
                 extract_path_assignments(&no_comments[start..end], &mut targets)?;
                 i = end + 1;
                 continue;
             }
         }
-        i += 1;
+        let ch = no_comments[i..].chars().next().expect("valid utf8");
+        i += ch.len_utf8();
     }
     Ok(targets)
 }
 
-fn find_matching_bracket(bytes: &[u8], open: usize) -> Result<usize, String> {
+fn find_matching_bracket(source: &str, open: usize) -> Result<usize, String> {
+    let bytes = source.as_bytes();
     let mut depth = 0usize;
     let mut i = open;
     while i < bytes.len() {
+        if let Some(next) = skip_literal(source, i)? {
+            i = next;
+            continue;
+        }
         match bytes[i] {
-            b'"' => {
-                i += 1;
-                while i < bytes.len() {
-                    if bytes[i] == b'\\' {
-                        i = (i + 2).min(bytes.len());
-                    } else if bytes[i] == b'"' {
-                        i += 1;
-                        break;
-                    } else {
-                        i += 1;
-                    }
-                }
-                continue;
-            }
             b'[' => depth += 1,
             b']' => {
                 depth -= 1;
@@ -535,7 +634,8 @@ fn find_matching_bracket(bytes: &[u8], open: usize) -> Result<usize, String> {
             }
             _ => {}
         }
-        i += 1;
+        let ch = source[i..].chars().next().expect("valid utf8");
+        i += ch.len_utf8();
     }
     Err("unclosed attribute bracket".into())
 }
@@ -544,24 +644,9 @@ fn extract_path_assignments(attr: &str, targets: &mut Vec<String>) -> Result<(),
     let bytes = attr.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'"' {
-            i += 1;
-            while i < bytes.len() {
-                if bytes[i] == b'\\' {
-                    i = (i + 2).min(bytes.len());
-                } else if bytes[i] == b'"' {
-                    i += 1;
-                    break;
-                } else {
-                    i += 1;
-                }
-            }
-            continue;
-        }
         if bytes[i..].starts_with(b"path")
-            && (i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_'))
-            && (i + 4 >= bytes.len()
-                || !(bytes[i + 4].is_ascii_alphanumeric() || bytes[i + 4] == b'_'))
+            && (i == 0 || !is_ident_char(bytes[i - 1]))
+            && (i + 4 >= bytes.len() || !is_ident_char(bytes[i + 4]))
         {
             let mut j = i + 4;
             while j < bytes.len() && bytes[j].is_ascii_whitespace() {
@@ -591,7 +676,12 @@ fn extract_path_assignments(attr: &str, targets: &mut Vec<String>) -> Result<(),
                 return Err("non-literal #[path = ...] value".into());
             }
         }
-        i += 1;
+        if let Some(next) = skip_literal(attr, i)? {
+            i = next;
+            continue;
+        }
+        let ch = attr[i..].chars().next().expect("valid utf8");
+        i += ch.len_utf8();
     }
     Ok(())
 }
@@ -599,6 +689,29 @@ fn extract_path_assignments(attr: &str, targets: &mut Vec<String>) -> Result<(),
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct TempCrateDir(PathBuf);
+
+    impl TempCrateDir {
+        fn new(tag: &str) -> Self {
+            static COUNTER: AtomicUsize = AtomicUsize::new(0);
+            let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "notarium-quarantine-{tag}-{}-{id}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempCrateDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 
     #[test]
     fn comment_and_string_stripper_handles_nested_comments_raw_strings_and_lifetimes() {
@@ -640,6 +753,118 @@ mod tests {
         assert_eq!(
             unsafe_block_count("unsafe fn f() { unsafe { inner() } }"),
             1
+        );
+    }
+
+    #[test]
+    fn path_parser_resists_raw_string_and_char_literal_bypasses() {
+        let raw_string_smuggle = r####"
+            const A: &str = r##"#["##;
+            #[path = "../../../outside.rs"]
+            mod smuggled;
+            const B: &str = r##"]"##;
+        "####;
+        let stripped = strip_rust_comments(raw_string_smuggle, false);
+        assert_eq!(
+            extract_path_attrs(&stripped).unwrap(),
+            vec!["../../../outside.rs".to_owned()]
+        );
+
+        let raw_backslash_smuggle = r####"
+            #[cfg_attr(all(), doc = r#"\"#, path = "../../../outside.rs", doc = r#"""#)]
+            mod smuggled;
+        "####;
+        let stripped = strip_rust_comments(raw_backslash_smuggle, false);
+        assert_eq!(
+            extract_path_attrs(&stripped).unwrap(),
+            vec!["../../../outside.rs".to_owned()]
+        );
+
+        let no_false_positive = r##"const S: &str = "#["; const C: char = '[';"##;
+        let stripped = strip_rust_comments(no_false_positive, false);
+        assert!(extract_path_attrs(&stripped).unwrap().is_empty());
+    }
+
+    #[test]
+    fn safety_comment_check_catches_inline_attr_and_unsafe_block_with_fn() {
+        assert_eq!(unsafe_block_count("unsafe { fn _() {} }"), 1);
+        assert_eq!(unsafe_block_count("#[inline] unsafe { foo() }"), 1);
+        assert_eq!(unsafe_block_count("unsafe fn helper() {}"), 0);
+
+        let inline_bypass = "#[inline] unsafe { foo() }\n";
+        let code_only = strip_rust_comments(inline_bypass, true);
+        assert!(
+            std::panic::catch_unwind(|| verify_safety_comments(
+                "leaf.rs",
+                inline_bypass,
+                &code_only
+            ))
+            .is_err()
+        );
+
+        let block_with_fn = "unsafe { fn _() {} foo() }\n";
+        let code_only = strip_rust_comments(block_with_fn, true);
+        assert!(
+            std::panic::catch_unwind(|| verify_safety_comments(
+                "leaf.rs",
+                block_with_fn,
+                &code_only
+            ))
+            .is_err()
+        );
+
+        let documented_with_attr =
+            "// SAFETY: verified invariant\n#[allow(clippy::all)]\nunsafe { foo() }\n";
+        let code_only = strip_rust_comments(documented_with_attr, true);
+        verify_safety_comments("leaf.rs", documented_with_attr, &code_only);
+    }
+
+    #[test]
+    fn intra_crate_path_rejects_non_rs_and_target_files() {
+        let non_rs = TempCrateDir::new("non-rs");
+        fs::create_dir_all(non_rs.0.join("src")).unwrap();
+        fs::create_dir_all(non_rs.0.join("tests")).unwrap();
+        fs::write(non_rs.0.join("src/lib.rs"), "pub fn ok() {}\n").unwrap();
+        fs::write(non_rs.0.join("tests/helper.inc"), "unsafe { bad(); }\n").unwrap();
+        fs::write(
+            non_rs.0.join("tests/entry.rs"),
+            "#[path = \"helper.inc\"]\nmod helper;\n",
+        )
+        .unwrap();
+        assert!(
+            std::panic::catch_unwind(|| {
+                verify_crate_quarantine(&CrateQuarantine {
+                    crate_dir: &non_rs.0,
+                    leaves: &[],
+                    allowed_external_test_paths: &[],
+                });
+            })
+            .is_err()
+        );
+
+        let target_dir = TempCrateDir::new("target-dir");
+        fs::create_dir_all(target_dir.0.join("src")).unwrap();
+        fs::create_dir_all(target_dir.0.join("tests/target")).unwrap();
+        fs::write(target_dir.0.join("src/lib.rs"), "pub fn ok() {}\n").unwrap();
+        fs::write(
+            target_dir.0.join("tests/target/helper.rs"),
+            "unsafe { bad(); }\n",
+        )
+        .unwrap();
+        fs::write(
+            target_dir.0.join("tests/entry.rs"),
+            "#[path = \"target/helper.rs\"]\nmod helper;\n",
+        )
+        .unwrap();
+        assert!(
+            std::panic::catch_unwind(|| {
+                verify_crate_quarantine(&CrateQuarantine {
+                    crate_dir: &target_dir.0,
+                    leaves: &[],
+                    allowed_external_test_paths: &[],
+                });
+            })
+            .is_err()
         );
     }
 }

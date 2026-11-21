@@ -63,7 +63,11 @@ impl LexicalFilter<'_> {
         {
             return Ok(false);
         }
-        let class = self.snapshot.doc_class(node)?;
+        let class = match self.snapshot.doc_class(node) {
+            Ok(class) => class,
+            Err(DomainError::ResourceNotFound) => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
         Ok(self.classes & (1 << class_ord(class)) != 0)
     }
 }

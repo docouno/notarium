@@ -3356,5 +3356,126 @@ async fn backlink_lookahead_taints_and_tainted_mutation_hides_foreign_personal_c
     canonical.shutdown().await.unwrap();
 }
 
+#[tokio::test]
+async fn snapshot_outgoing_and_incoming_enforce_live_fence_and_propagate_not_ready() {
+    use notarium_core::error::ValidationReason;
+
+    let scratch = Scratch::new();
+    let root = scratch.root();
+    let installation = InstallationId::from_bytes(rand16());
+    let (store, canonical) =
+        CanonicalRuntime::open(CanonicalConfig::local_default(installation, root.clone()))
+            .await
+            .unwrap();
+    let (scope, owner) = open_space(&store, SpaceKind::Personal).await;
+    let target = create_note(
+        &store,
+        &owner,
+        None,
+        "edge-target",
+        DocClass::UserDoc,
+        "Target\n".into(),
+    )
+    .await;
+    let source = create_note(
+        &store,
+        &owner,
+        None,
+        "edge-source",
+        DocClass::UserDoc,
+        format!("See [[{}]]\n", target.note),
+    )
+    .await;
+    let target2 = create_note(
+        &store,
+        &owner,
+        None,
+        "edge-target-2",
+        DocClass::UserDoc,
+        "Target 2\n".into(),
+    )
+    .await;
+    let source2 = create_note(
+        &store,
+        &owner,
+        None,
+        "edge-source-2",
+        DocClass::UserDoc,
+        format!("See [[{}]]\n", target2.note),
+    )
+    .await;
+
+    let runtime = ProjectorRuntime::start_sqlite(
+        store.clone(),
+        projection_ctx(),
+        root,
+        ProjectionGeneration::new(1).unwrap(),
+        ProjectionConfig::default(),
+    )
+    .await
+    .unwrap();
+    sync(&store, &runtime, &scope).await;
+
+    let engine = runtime.engine();
+    let snapshot = engine
+        .acquire_snapshot(
+            owner.clone(),
+            CausalBasis::Await(AwaitWatermarks::default()),
+        )
+        .await
+        .unwrap();
+    let source_node = snapshot.lookup(&source.note).unwrap().unwrap();
+    let target_node = snapshot.lookup(&target.note).unwrap().unwrap();
+    let source2_node = snapshot.lookup(&source2.note).unwrap().unwrap();
+    let target2_node = snapshot.lookup(&target2.note).unwrap().unwrap();
+
+    assert_eq!(
+        snapshot.outgoing(source_node).unwrap().collect::<Vec<_>>(),
+        vec![target_node]
+    );
+    assert_eq!(
+        snapshot.incoming(target_node).unwrap().collect::<Vec<_>>(),
+        vec![source_node]
+    );
+
+    // Pause projection and trash `target` so we verify eager neighbor filtering
+    // under the live fence against an older projected cut.
+    let _hold = engine.pause_before_projection_for_test(&scope, 1).unwrap();
+    let mut trash = mutation(
+        &owner,
+        DeleteNote {
+            note: target.note.clone(),
+            disposition: DeleteDisposition::Trash,
+        },
+    );
+    trash.preconditions.revision = Some(target.revision);
+    store.delete_note(owner.clone(), trash).await.unwrap();
+    assert!(
+        snapshot.outgoing(source_node).unwrap().next().is_none(),
+        "trashed neighbor must be filtered under live fence"
+    );
+    assert_eq!(
+        snapshot.incoming(target_node).err(),
+        Some(DomainError::ResourceNotFound)
+    );
+
+    // Once the canonical runtime shuts down (closing the live visibility fence),
+    // outgoing/incoming must propagate ValidationReason::NotReady instead of
+    // returning empty iterators.
+    drop(_hold);
+    runtime.shutdown().await.unwrap();
+    canonical.shutdown().await.unwrap();
+    assert!(matches!(
+        snapshot.outgoing(source2_node),
+        Err(DomainError::ValidationFailed { ref diagnostic })
+            if diagnostic.reason == ValidationReason::NotReady
+    ));
+    assert!(matches!(
+        snapshot.incoming(target2_node),
+        Err(DomainError::ValidationFailed { ref diagnostic })
+            if diagnostic.reason == ValidationReason::NotReady
+    ));
+}
+
 #[path = "projection_regressions/read_windows.rs"]
 mod read_windows;

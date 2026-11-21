@@ -5,7 +5,7 @@ use crate::{
     vector::ChunkMetadata,
 };
 use notarium_core::{
-    DomainResult,
+    DomainError, DomainResult,
     error::PortError,
     ids::NoteId,
     model::DenseNodeId,
@@ -101,10 +101,17 @@ pub(super) async fn expand(
     let mut seed_entries = Vec::new();
     let mut seed_notes = Vec::new();
     for seed in candidates.iter().take(16) {
-        if let Some(node) = retry_snapshot(snapshot, clock, || snapshot.lookup(&seed.note)).await? {
-            seed_notes.push(seed.note.clone());
-            seed_entries.push((seed.note.clone(), seed.score, node));
-        }
+        let Some(node) = retry_snapshot(snapshot, clock, || match snapshot.lookup(&seed.note) {
+            Ok(node) => Ok(node),
+            Err(DomainError::ResourceNotFound) => Ok(None),
+            Err(error) => Err(error),
+        })
+        .await?
+        else {
+            continue;
+        };
+        seed_notes.push(seed.note.clone());
+        seed_entries.push((seed.note.clone(), seed.score, node));
     }
     if seed_entries.is_empty() {
         return Ok(());
@@ -139,21 +146,42 @@ pub(super) async fn expand(
         for (seed_idx, state) in states.iter_mut().enumerate() {
             let frontier = std::mem::take(&mut state.frontier);
             for via in frontier {
-                let nbrs = retry_snapshot(snapshot, clock, || neighbors(snapshot, via)).await?;
+                let Some(nbrs) =
+                    retry_snapshot(snapshot, clock, || match neighbors(snapshot, via) {
+                        Ok(nbrs) => Ok(Some(nbrs)),
+                        Err(DomainError::ResourceNotFound) => Ok(None),
+                        Err(error) => Err(error),
+                    })
+                    .await?
+                else {
+                    continue;
+                };
                 let penalty = 1.0 + (1.0 + nbrs.len() as f64).ln();
                 for neighbor in nbrs {
                     let pos = neighbor.index(generation)?;
                     if !state.seen.insert(pos) {
                         continue;
                     }
-                    let note =
-                        retry_snapshot(snapshot, clock, || snapshot.note_id(neighbor)).await?;
+                    let Some(note) =
+                        retry_snapshot(snapshot, clock, || match snapshot.note_id(neighbor) {
+                            Ok(note) => Ok(Some(note)),
+                            Err(DomainError::ResourceNotFound) => Ok(None),
+                            Err(error) => Err(error),
+                        })
+                        .await?
+                    else {
+                        continue;
+                    };
                     let admitted = match overlay.get(&note) {
                         Some(None) => false,
                         Some(Some(row)) => eligible.overlay_allowed(predicate, row),
                         None => {
                             retry_snapshot(snapshot, clock, || {
-                                eligible.node_allowed(snapshot, neighbor)
+                                match eligible.node_allowed(snapshot, neighbor) {
+                                    Ok(allowed) => Ok(allowed),
+                                    Err(DomainError::ResourceNotFound) => Ok(false),
+                                    Err(error) => Err(error),
+                                }
                             })
                             .await?
                         }

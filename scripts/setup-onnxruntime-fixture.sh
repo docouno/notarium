@@ -70,7 +70,7 @@ if [ -n "${DEVKIT_CACHE_DIR:-}" ] && [ ! -L "$DEVKIT_CACHE_DIR" ] && [ -d "$DEVK
 fi
 
 wheel="onnxruntime-1.31.0-cp312-cp312-manylinux_2_28_$arch.whl"
-curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 --max-time 120 \
+curl --proto '=https' --proto-redir '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 --max-time 120 \
     "https://files.pythonhosted.org/packages/$wheel_path/$wheel" -o "$scratch/$wheel"
 printf '%s  %s\n' "$wheel_sha" "$scratch/$wheel" | sha256sum --check
 unzip -p "$scratch/$wheel" onnxruntime/capi/libonnxruntime.so.1.31.0 > "$scratch/libonnxruntime.so"

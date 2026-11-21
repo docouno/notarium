@@ -150,7 +150,11 @@ fn workspace_dependencies_are_bound_locked_and_lints_inherited() {
 fn canonical_fixture_methods_are_only_enabled_for_tests() {
     let actual = metadata();
     let packages = actual["packages"].as_array().unwrap();
-    for target_crate in ["notarium-canonical", "notarium-search"] {
+    for target_crate in [
+        "notarium-canonical",
+        "notarium-projections",
+        "notarium-search",
+    ] {
         let index = packages
             .iter()
             .position(|p| p["name"] == target_crate)
@@ -175,6 +179,13 @@ fn canonical_fixture_methods_are_only_enabled_for_tests() {
                     .contains("forbidden edge")
             );
         }
+        let mut altered_default = actual.clone();
+        altered_default["packages"][index]["features"]["default"] = json!(["test-support"]);
+        assert!(
+            validate_metadata(&altered_default, &root())
+                .unwrap_err()
+                .contains("fixture API")
+        );
         let mut altered = actual.clone();
         let bin = altered["packages"]
             .as_array_mut()
@@ -194,6 +205,28 @@ fn canonical_fixture_methods_are_only_enabled_for_tests() {
                 .unwrap_err()
                 .contains("fixture API")
         );
+        for (feature_name, forwarded) in [
+            ("default", format!("{target_crate}/test-support")),
+            ("bench-hook", format!("{target_crate}/test-support")),
+            ("optional-hook", format!("{target_crate}?/test-support")),
+        ] {
+            let mut forwarded_meta = actual.clone();
+            let bin = forwarded_meta["packages"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|p| p["name"] == "notarium-bin")
+                .unwrap();
+            bin["features"]
+                .as_object_mut()
+                .unwrap()
+                .insert(feature_name.into(), json!([forwarded]));
+            assert!(
+                validate_metadata(&forwarded_meta, &root())
+                    .unwrap_err()
+                    .contains("fixture API")
+            );
+        }
     }
 }
 

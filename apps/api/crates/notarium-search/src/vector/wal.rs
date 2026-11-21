@@ -18,6 +18,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub const L0_FLUSH_CHUNKS: usize = 20_000;
+pub const L0_FLUSH_BYTES: usize = 12 * 1024 * 1024;
 pub const L0_MAX_CHUNKS: usize = 25_000;
 pub const L0_MAX_BYTES: usize = 16 * 1024 * 1024;
 const MIN_TIMED_FLUSH_CHUNKS: usize = 4096;
@@ -180,9 +182,9 @@ impl MutableBuffer {
     }
 
     pub fn should_flush(&self, now: Instant) -> bool {
-        self.chunks >= L0_MAX_CHUNKS
-            || self.entries.len() >= L0_MAX_CHUNKS
-            || self.mem_bytes >= L0_MAX_BYTES
+        self.chunks >= L0_FLUSH_CHUNKS
+            || self.entries.len() >= L0_FLUSH_CHUNKS
+            || self.mem_bytes >= L0_FLUSH_BYTES
             || (self.chunks >= MIN_TIMED_FLUSH_CHUNKS
                 && self
                     .first_dirty
@@ -321,9 +323,13 @@ impl MutableBuffer {
                 .saturating_sub(prev_bytes)
                 .saturating_add(op_bytes);
             batch_state.insert(note, (op_chunks, op_bytes));
-            if projected_chunks > L0_MAX_CHUNKS
-                || projected_entries > L0_MAX_CHUNKS
-                || projected_bytes > L0_MAX_BYTES
+            // Keep Delete operations unblocked while background L0 flush runs
+            // (and across crash-recovery replay) so live deletes/updates never
+            // stall on BufferFull or force a duplicate synchronous flush.
+            if !matches!(operation, MutableOperation::Delete(_))
+                && (projected_chunks > L0_MAX_CHUNKS
+                    || projected_entries > L0_MAX_CHUNKS
+                    || projected_bytes > L0_MAX_BYTES)
             {
                 return Err(VectorError::BufferFull);
             }

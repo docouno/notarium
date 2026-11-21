@@ -23,7 +23,6 @@ use notarium_core::{
         SpaceContext, StructuralSnapshot,
     },
     query::Predicate,
-    receipt::CausalBasis,
 };
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
@@ -94,11 +93,7 @@ impl SearchEngine {
                 .iter()
                 .all(|class| *class == DocClass::EncryptedNote);
         if empty_query || encrypted_only {
-            let causal = match request.causal {
-                CausalBasis::Exact(_) => CausalBasis::Exact(Default::default()),
-                CausalBasis::Await(_) => request.causal,
-            };
-            let snapshot = self.projection(&ctx, causal, clock).await?;
+            let snapshot = self.projection(&ctx, request.causal, clock).await?;
             let _ = snapshot.filter_notes(&request.filter).await?;
             if let Some(folder) = &request.folder {
                 let _ = snapshot.folder_descendants(folder).await?;
@@ -438,12 +433,17 @@ impl SearchEngine {
         let vector_notes = match &filter.nodes {
             Some(nodes) if nodes.cardinality() <= EXACT_SCAN_LIMIT => Some(Arc::new(
                 retry_snapshot(snapshot.as_ref(), clock, || {
-                    nodes
-                        .iter()
-                        .map(|index| {
-                            snapshot.note_id(DenseNodeId::new(filter.cut.generation, index))
-                        })
-                        .collect::<Result<BTreeSet<_>, _>>()
+                    let mut ids = BTreeSet::new();
+                    for index in nodes.iter() {
+                        match snapshot.note_id(DenseNodeId::new(filter.cut.generation, index)) {
+                            Ok(id) => {
+                                ids.insert(id);
+                            }
+                            Err(DomainError::ResourceNotFound) => continue,
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    Ok(ids)
                 })
                 .await?,
             )),
@@ -459,10 +459,16 @@ impl SearchEngine {
             let notes_attempt = vector_notes.clone();
             let result = blocking_search(clock, "vector_search_worker", move |budget| {
                 let visible = |note: &NoteId| -> Result<bool, crate::vector::VectorError> {
-                    let Some(node) = snapshot_attempt.lookup(note)? else {
-                        return Ok(false);
+                    let node = match snapshot_attempt.lookup(note) {
+                        Ok(Some(node)) => node,
+                        Ok(None) | Err(DomainError::ResourceNotFound) => return Ok(false),
+                        Err(error) => return Err(error.into()),
                     };
-                    Ok(filter_attempt.node_allowed(snapshot_attempt.as_ref(), node)?)
+                    match filter_attempt.node_allowed(snapshot_attempt.as_ref(), node) {
+                        Ok(allowed) => Ok(allowed),
+                        Err(DomainError::ResourceNotFound) => Ok(false),
+                        Err(error) => Err(error.into()),
+                    }
                 };
                 let mask = VectorFilter {
                     classes: &filter_attempt.classes,

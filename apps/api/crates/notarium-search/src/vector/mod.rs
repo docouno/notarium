@@ -1,13 +1,20 @@
 //! Quantized vector storage and filtered nearest-neighbor search.
 
+#[forbid(unsafe_code)]
 mod builder;
+#[forbid(unsafe_code)]
 mod epoch;
+#[forbid(unsafe_code)]
 mod format;
+#[forbid(unsafe_code)]
 mod hnsw;
 mod mmap_segment;
+#[forbid(unsafe_code)]
 mod quantization;
 pub mod simd;
+#[forbid(unsafe_code)]
 mod tombstone;
+#[forbid(unsafe_code)]
 mod wal;
 
 pub use builder::{MAX_SEGMENT_BUILD_BYTES, SegmentBuilder};
@@ -25,7 +32,7 @@ pub use mmap_segment::SegmentSearch;
 pub use quantization::QuantizedVector;
 pub use tombstone::Tombstones;
 #[cfg(any(test, feature = "test-support"))]
-pub use wal::{L0_MAX_BYTES, L0_MAX_CHUNKS};
+pub use wal::{L0_FLUSH_BYTES, L0_FLUSH_CHUNKS, L0_MAX_BYTES, L0_MAX_CHUNKS};
 pub use wal::{MutableBuffer, MutableOperation};
 
 use notarium_core::{

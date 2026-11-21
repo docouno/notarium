@@ -2051,11 +2051,15 @@ impl Snapshot {
         Ok(matches)
     }
 
-    fn live_node(&self, id: u32) -> DomainResult<bool> {
-        let permit = self.live.try_read().map_err(|error| match error {
+    fn live_permit(&self) -> DomainResult<LiveReadPermit> {
+        self.live.try_read().map_err(|error| match error {
             PortError::Domain(domain) => domain,
             _ => DomainError::validation(ValidationReason::NotReady),
-        })?;
+        })
+    }
+
+    fn live_node(&self, id: u32) -> DomainResult<bool> {
+        let permit = self.live_permit()?;
         Ok(self.visible_under(&permit, id))
     }
 
@@ -2077,9 +2081,41 @@ impl Snapshot {
             .is_some_and(|note| ensure_active(permit, &self.ctx, &note).is_ok())
     }
 
-    fn live_edge(&self, focal: u32, adjacent: u32) -> bool {
+    fn live_edges(
+        &self,
+        id: u32,
+        edges: impl Iterator<Item = u32>,
+    ) -> DomainResult<DenseNodeIter<'_>> {
+        let permit = self.live_permit()?;
+        if !self.visible_under(&permit, id) {
+            return Err(DomainError::ResourceNotFound);
+        }
+        let verified_head = permit.head();
+        let neighbors: Vec<u32> = edges
+            .filter(|&neighbor| self.visible_under(&permit, neighbor))
+            .collect();
+        drop(permit);
+        // Neighbors are verified eagerly under `live_permit()?` so write-lock
+        // contention propagates `NotReady` instead of silently dropping edges.
+        // Keep a fail-closed check on iteration so an iterator retained across
+        // a subsequent trash mutation stops yielding edges.
+        Ok(DenseNodeIter::from_iter(
+            self.cut.generation,
+            neighbors
+                .into_iter()
+                .filter(move |&neighbor| self.live_edge_after_commit(id, neighbor, verified_head)),
+        ))
+    }
+
+    fn live_edge_after_commit(&self, focal: u32, adjacent: u32, verified_head: SpaceSeq) -> bool {
+        if self.expires <= Instant::now() {
+            return false;
+        }
         self.live.try_read().is_ok_and(|permit| {
-            self.visible_under(&permit, focal) && self.visible_under(&permit, adjacent)
+            permit.space().lifecycle == SpaceLifecycle::Active
+                && (permit.head() == verified_head
+                    || (self.visible_under(&permit, focal)
+                        && self.visible_under(&permit, adjacent)))
         })
     }
 
@@ -2320,28 +2356,12 @@ impl StructuralSnapshot for Snapshot {
 
     fn outgoing(&self, node: DenseNodeId) -> DomainResult<DenseNodeIter<'_>> {
         let id = node.index(self.cut.generation)?;
-        if !self.live_node(id)? {
-            return Err(DomainError::ResourceNotFound);
-        }
-        Ok(DenseNodeIter::from_iter(
-            self.cut.generation,
-            self.index
-                .outgoing(id)
-                .filter(move |neighbor| self.live_edge(id, *neighbor)),
-        ))
+        self.live_edges(id, self.index.outgoing(id))
     }
 
     fn incoming(&self, node: DenseNodeId) -> DomainResult<DenseNodeIter<'_>> {
         let id = node.index(self.cut.generation)?;
-        if !self.live_node(id)? {
-            return Err(DomainError::ResourceNotFound);
-        }
-        Ok(DenseNodeIter::from_iter(
-            self.cut.generation,
-            self.index
-                .incoming(id)
-                .filter(move |neighbor| self.live_edge(id, *neighbor)),
-        ))
+        self.live_edges(id, self.index.incoming(id))
     }
 }
 

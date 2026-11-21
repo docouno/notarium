@@ -343,7 +343,7 @@ impl ProviderService {
         let space = self.selection_catalog(&ctx, project).await?;
         let (mut tx, auth) = self
             .control
-            .open_revalidated_read(&budget, &call.request, ctx.auth())
+            .open_revalidated_read_for_search_indexing(&budget, &call.request, ctx.auth())
             .await?;
         let admitted = budget
             .run(
@@ -663,6 +663,7 @@ impl ProviderService {
         ctx: SpaceContext,
         request: SelectProvider,
     ) -> Result<ProviderSelection, PortError> {
+        self.control.reject_search_indexing(ctx.auth())?;
         let budget = OperationBudget::new(ctx.budget.clone());
         let space = self
             .selection_catalog(&ctx, request.project.as_ref())

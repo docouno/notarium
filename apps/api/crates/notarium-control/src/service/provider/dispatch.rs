@@ -253,13 +253,33 @@ impl ProviderService {
     ) -> Result<Output, PortError> {
         let hash = job.fingerprint()?;
         let scope_key = job.scope_key()?;
+        let allow_search_indexing = matches!(job.request, Request::Embedding(_))
+            && !job.embedding_inputs().is_empty()
+            && job
+                .embedding_inputs()
+                .iter()
+                .all(|input| matches!(input, EmbeddingInput::Part(_)));
         let (mut tx, auth) = runtime
             .run(
-                self.control.open_revalidated_read(
-                    &runtime.budget,
-                    &job.ctx.budget.request,
-                    job.ctx.auth(),
-                ),
+                async {
+                    if allow_search_indexing {
+                        self.control
+                            .open_revalidated_read_for_search_indexing(
+                                &runtime.budget,
+                                &job.ctx.budget.request,
+                                job.ctx.auth(),
+                            )
+                            .await
+                    } else {
+                        self.control
+                            .open_revalidated_read(
+                                &runtime.budget,
+                                &job.ctx.budget.request,
+                                job.ctx.auth(),
+                            )
+                            .await
+                    }
+                },
                 CommitEffect::NotCommitted,
             )
             .await?;
@@ -341,6 +361,7 @@ impl ProviderService {
             embedding_inputs: job.embedding_inputs(),
             current: &current,
             keeper: keeper.as_ref(),
+            allow_search_indexing,
         };
         let body = job.encode(&snapshot)?;
         let mut tx = runtime

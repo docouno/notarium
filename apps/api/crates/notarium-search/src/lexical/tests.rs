@@ -41,6 +41,8 @@ struct Snapshot {
     lookups: AtomicUsize,
     cancel_at: Option<(usize, Cancellation)>,
     not_ready: AtomicBool,
+    not_ready_on_doc_class: AtomicBool,
+    vanished_on_doc_class: BTreeSet<NoteId>,
 }
 impl Snapshot {
     fn new(notes: impl IntoIterator<Item = NoteId>) -> Self {
@@ -62,6 +64,8 @@ impl Snapshot {
             lookups: AtomicUsize::new(0),
             cancel_at: None,
             not_ready: AtomicBool::new(false),
+            not_ready_on_doc_class: AtomicBool::new(false),
+            vanished_on_doc_class: BTreeSet::new(),
         }
     }
 }
@@ -95,13 +99,19 @@ impl StructuralSnapshot for Snapshot {
             .ok_or(DomainError::ResourceNotFound)
     }
     fn doc_class(&self, node: DenseNodeId) -> DomainResult<DocClass> {
-        if self.not_ready.load(Ordering::Relaxed) {
+        if self.not_ready.load(Ordering::Relaxed)
+            || self.not_ready_on_doc_class.load(Ordering::Relaxed)
+        {
             return Err(DomainError::validation(ValidationReason::NotReady));
         }
-        self.notes
+        let (id, class) = self
+            .notes
             .get(node.index(self.cut.generation)? as usize)
-            .map(|(_, class)| *class)
-            .ok_or(DomainError::ResourceNotFound)
+            .ok_or(DomainError::ResourceNotFound)?;
+        if self.vanished_on_doc_class.contains(id) {
+            return Err(DomainError::ResourceNotFound);
+        }
+        Ok(*class)
     }
     fn folder_subtree<'a>(&'a self, _: &'a FolderId) -> PortFuture<'a, DenseNodeIter<'a>> {
         let generation = self.cut.generation;
@@ -1107,4 +1117,63 @@ fn merge_deleted_expunges_dirty_segments_individually_without_collapsing_corpus(
             .unwrap()
             .is_empty()
     );
+}
+
+#[test]
+fn admits_note_skips_vanished_doc_class_and_propagates_not_ready() {
+    let scratch = TestDir::new();
+    let vanished_id = NoteId::from_bytes([1; 16]);
+    let live_id = NoteId::from_bytes([2; 16]);
+    let mut snapshot = Snapshot::new([vanished_id.clone(), live_id.clone()]);
+    snapshot.vanished_on_doc_class.insert(vanished_id);
+    let index = LexicalIndex::create(&scratch.0).unwrap();
+    let folder = FolderDictionary::default()
+        .insert(FolderId::from_bytes([1; 16]))
+        .unwrap();
+    let vanished_doc = note("concurrent trash target", 1, &snapshot.cut.scope);
+    let live_doc = note("concurrent trash target", 2, &snapshot.cut.scope);
+    index
+        .apply(
+            &WriterPool::default(),
+            &[
+                Update::Note {
+                    content: &vanished_doc,
+                    title: "Vanished",
+                    folder,
+                },
+                Update::Note {
+                    content: &live_doc,
+                    title: "Live",
+                    folder,
+                },
+            ],
+        )
+        .unwrap();
+
+    // `ResourceNotFound` from `doc_class(node)` after a live `lookup(&note)` must skip
+    // the vanished note cleanly on both scored search and browse paths.
+    let filter = LexicalFilter::new(&snapshot, None, None, [DocClass::UserDoc], false);
+    let scored = index.search("concurrent", &filter, 10, 10, false).unwrap();
+    assert_eq!(scored.len(), 1);
+    assert_eq!(scored[0].key, HitKey::Note(live_id.clone()));
+    let browsed = index.search("", &filter, 10, 10, true).unwrap();
+    assert_eq!(browsed.len(), 1);
+    assert_eq!(browsed[0].key, HitKey::Note(live_id));
+
+    // `NotReady` from `doc_class(node)` must still propagate through `LexicalError::Domain`.
+    snapshot.vanished_on_doc_class.clear();
+    snapshot
+        .not_ready_on_doc_class
+        .store(true, Ordering::Relaxed);
+    let filter = LexicalFilter::new(&snapshot, None, None, [DocClass::UserDoc], false);
+    assert!(matches!(
+        index.search("concurrent", &filter, 10, 10, false),
+        Err(LexicalError::Domain(DomainError::ValidationFailed { diagnostic }))
+            if diagnostic.reason == ValidationReason::NotReady
+    ));
+    assert!(matches!(
+        index.search("", &filter, 10, 10, true),
+        Err(LexicalError::Domain(DomainError::ValidationFailed { diagnostic }))
+            if diagnostic.reason == ValidationReason::NotReady
+    ));
 }

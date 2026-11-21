@@ -237,6 +237,13 @@ impl EngineAuthContext {
             credential: Some(AuthenticatedCredential::SearchIndexing { space, provider }),
         }
     }
+    fn is_search_indexing(&self) -> bool {
+        self.kind == PrincipalKind::SearchIndexing
+            || matches!(
+                self.credential,
+                Some(AuthenticatedCredential::SearchIndexing { .. })
+            )
+    }
     pub fn for_agent_run(
         &self,
         run: AgentRunId,
@@ -244,6 +251,9 @@ impl EngineAuthContext {
         audience: ChatAudience,
         requested: BTreeMap<SpaceId, SpaceGrant>,
     ) -> DomainResult<Self> {
+        if self.is_search_indexing() {
+            return Err(DomainError::AccessDenied);
+        }
         let mut derived = self.narrow(requested)?;
         if !derived.spaces.contains_key(&thread_space) {
             return Err(DomainError::ResourceNotFound);
@@ -284,6 +294,9 @@ impl EngineAuthContext {
         project_root: Option<FolderId>,
         readonly_abilities: BTreeSet<AbilityId>,
     ) -> DomainResult<Self> {
+        if self.is_search_indexing() {
+            return Err(DomainError::AccessDenied);
+        }
         let mut grant = self
             .spaces
             .get(&space)
@@ -322,6 +335,9 @@ impl EngineAuthContext {
         source: GrantId,
         requested: BTreeMap<SpaceId, SpaceGrant>,
     ) -> DomainResult<Self> {
+        if self.is_search_indexing() {
+            return Err(DomainError::AccessDenied);
+        }
         let mut derived = self.narrow(requested)?;
         derived.kind = PrincipalKind::OAuth {
             source,
@@ -331,6 +347,9 @@ impl EngineAuthContext {
     }
     /// Personal access tokens are delegated credentials, never interactive humans.
     pub fn for_pat(&self, requested: BTreeMap<SpaceId, SpaceGrant>) -> DomainResult<Self> {
+        if self.is_search_indexing() {
+            return Err(DomainError::AccessDenied);
+        }
         let mut derived = self.narrow(requested)?;
         derived.kind = PrincipalKind::Pat;
         Ok(derived)
@@ -383,6 +402,8 @@ impl EngineAuthContext {
             || self.grant != current.grant
             || self.credential != current.credential
             || self.credential.is_none()
+            || (self.kind == PrincipalKind::SearchIndexing)
+                != (current.kind == PrincipalKind::SearchIndexing)
         {
             return Err(DomainError::AuthenticationFailed);
         }
@@ -534,6 +555,9 @@ impl EngineAuthContext {
         project: Option<&FolderId>,
         tainted: bool,
     ) -> DomainResult<()> {
+        if self.is_search_indexing() {
+            return Err(DomainError::ResourceNotFound);
+        }
         let grant = self
             .spaces
             .get(&space.id)
@@ -602,6 +626,9 @@ impl EngineAuthContext {
         project: Option<&FolderId>,
         tainted: bool,
     ) -> DomainResult<()> {
+        if self.is_search_indexing() {
+            return Err(DomainError::ResourceNotFound);
+        }
         let grant = self
             .spaces
             .get(&space.id)

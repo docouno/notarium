@@ -1183,3 +1183,238 @@ fn metadata_caps_context_spans_and_oversized_notes_bypass_wal_limit() {
     assert!(buffer.exceeds_single_limit(&oversized));
     assert_eq!(L0_MAX_BYTES, 16 * 1024 * 1024);
 }
+
+#[test]
+fn l0_soft_flush_headroom_and_delete_batches_never_block_on_buffer_full() {
+    assert_eq!(L0_FLUSH_CHUNKS, 20_000);
+    assert_eq!(L0_FLUSH_BYTES, 12 * 1024 * 1024);
+    assert_eq!(L0_MAX_CHUNKS, 25_000);
+    assert_eq!(L0_MAX_BYTES, 16 * 1024 * 1024);
+
+    let seq = |n| SpaceSeq::new(n).unwrap();
+    let note_id = |index: u32| {
+        let mut bytes = [0u8; 16];
+        bytes[12..].copy_from_slice(&index.to_be_bytes());
+        NoteId::from_bytes(bytes)
+    };
+
+    // 1. MutableBuffer triggers should_flush at L0_FLUSH_BYTES (12 MiB) while
+    // retaining 4 MiB headroom for Upserts before L0_MAX_BYTES (16 MiB), and
+    // never rejects Delete-only batches on BufferFull (including on reopen).
+    let scratch = Scratch::new();
+    let mut buffer = MutableBuffer::open(&scratch.0, 4096).unwrap();
+    let base_chunk = fixture(1, 4096);
+    let make_upsert = |index: u32, count: usize| {
+        let mut chunk = base_chunk.clone();
+        let note = note_id(index);
+        chunk.metadata.note = note.clone();
+        MutableOperation::Upsert {
+            note,
+            chunks: vec![chunk; count],
+        }
+    };
+    let initial: Vec<_> = (1..=30).map(|i| make_upsert(i, 100)).collect();
+    buffer.apply_batch(seq(1), initial).unwrap();
+    assert!(buffer.mem_bytes() >= L0_FLUSH_BYTES);
+    assert!(buffer.mem_bytes() < L0_MAX_BYTES);
+    assert!(buffer.should_flush(Instant::now()));
+
+    // Upsert within the 4 MiB headroom succeeds.
+    buffer.apply(seq(2), make_upsert(31, 100)).unwrap();
+    assert!(buffer.mem_bytes() < L0_MAX_BYTES);
+
+    // Fill close to L0_MAX_BYTES (39 notes ~= 15.95 MiB) and verify an extra Upsert hits BufferFull.
+    let fill: Vec<_> = (32..=39).map(|i| make_upsert(i, 100)).collect();
+    buffer.apply_batch(seq(3), fill).unwrap();
+    assert!(matches!(
+        buffer.apply(seq(4), make_upsert(40, 100)),
+        Err(VectorError::BufferFull)
+    ));
+
+    // Delete-only batch pushing mem_bytes above L0_MAX_BYTES still succeeds and replays.
+    let deletes: Vec<_> = (10_000..15_000)
+        .map(|i| MutableOperation::Delete(note_id(i)))
+        .collect();
+    buffer.apply_batch(seq(4), deletes).unwrap();
+    assert!(buffer.mem_bytes() > L0_MAX_BYTES);
+    drop(buffer);
+    let reopened = MutableBuffer::open(&scratch.0, 4096).unwrap();
+    assert!(reopened.mem_bytes() > L0_MAX_BYTES);
+    assert!(reopened.supersedes(&note_id(14_999)));
+
+    // 2. VectorEpoch triggers soft flush at L0_FLUSH_CHUNKS entries while live
+    // Delete-only batches continue above L0_MAX_CHUNKS without a sync flush.
+    let epoch_scratch = Scratch::new();
+    let scope = HistoryScope {
+        space_id: SpaceId::from_bytes([5; 16]),
+        incarnation: HistoryIncarnation::from_bytes([5; 16]),
+    };
+    let layout = Arc::new(SearchLayout::open(&DataRoot::new(&epoch_scratch.0), scope).unwrap());
+    let mut epoch = VectorEpoch::open(layout, model(), 64).unwrap();
+    let live_chunk = fixture(1, 64);
+    let mut ops = Vec::with_capacity(L0_FLUSH_CHUNKS);
+    ops.push(MutableOperation::Upsert {
+        note: live_chunk.metadata.note.clone(),
+        chunks: vec![live_chunk.clone()],
+    });
+    for i in 2..=(L0_FLUSH_CHUNKS as u32) {
+        ops.push(MutableOperation::Delete(note_id(i)));
+    }
+    epoch.apply_batch(seq(1), ops).unwrap();
+    assert!(epoch.should_flush(Instant::now()));
+
+    let plan = epoch.plan_flush_l0().unwrap().expect("flush plan");
+    let concurrent_deletes: Vec<_> = (100_000..106_000)
+        .map(|i| MutableOperation::Delete(note_id(i)))
+        .collect();
+    epoch.apply_batch(seq(2), concurrent_deletes).unwrap();
+    assert!(
+        epoch.snapshot().manifest().active_segments.is_empty(),
+        "Delete-only batch during FlushL0 must not force a duplicate sync flush"
+    );
+    let replacement = plan.execute(&Cancellation::default()).unwrap();
+    epoch
+        .commit_flush_l0(plan, replacement, &HashSet::new())
+        .unwrap();
+    assert_eq!(epoch.snapshot().manifest().active_segments.len(), 1);
+    assert!(
+        epoch.matches_note_chunks(&live_chunk.metadata.note, std::slice::from_ref(&live_chunk),)
+    );
+}
+
+#[test]
+fn active_plan_prevents_overlap_and_reopen_skips_fully_tombstoned_newer_notes() {
+    let seq = |n| SpaceSeq::new(n).unwrap();
+
+    // 1. Active plan flag forbids overlapping FlushL0 and Compaction plans, and
+    // releases on execute error, Drop, and commit.
+    let scratch = Scratch::new();
+    let scope = HistoryScope {
+        space_id: SpaceId::from_bytes([6; 16]),
+        incarnation: HistoryIncarnation::from_bytes([6; 16]),
+    };
+    let layout = Arc::new(SearchLayout::open(&DataRoot::new(&scratch.0), scope).unwrap());
+    let mut epoch = VectorEpoch::open(layout, model(), 64).unwrap();
+    let c1 = fixture(1, 64);
+    let c2 = fixture(2, 64);
+    let mut builder = SegmentBuilder::new(&model(), 64).unwrap();
+    builder.push(c1.clone()).unwrap();
+    builder.push(c2.clone()).unwrap();
+    epoch.seed(builder, seq(1)).unwrap();
+
+    let mut c1_v2 = c1.clone();
+    c1_v2.metadata.spans = vec![ByteSpan::new(10, 22).unwrap()];
+    epoch
+        .apply(
+            seq(2),
+            MutableOperation::Upsert {
+                note: c1.metadata.note.clone(),
+                chunks: vec![c1_v2],
+            },
+        )
+        .unwrap();
+    epoch.flush().unwrap();
+    assert!(epoch.should_compact());
+
+    let mut c2_v2 = c2.clone();
+    c2_v2.metadata.spans = vec![ByteSpan::new(11, 24).unwrap()];
+    epoch
+        .apply(
+            seq(3),
+            MutableOperation::Upsert {
+                note: c2.metadata.note.clone(),
+                chunks: vec![c2_v2.clone()],
+            },
+        )
+        .unwrap();
+
+    let flush_plan = epoch.plan_flush_l0().unwrap().expect("flush plan");
+    assert!(epoch.plan_compact().is_none());
+    assert!(epoch.plan_flush_l0().unwrap().is_none());
+    assert!(matches!(epoch.flush(), Err(VectorError::BufferFull)));
+
+    let cancelled = Cancellation::default();
+    cancelled.cancel();
+    assert!(matches!(
+        flush_plan.execute(&cancelled),
+        Err(VectorError::Cancelled)
+    ));
+    // Guard released on execute error even while flush_plan stays in scope.
+    let compact_plan = epoch.plan_compact().expect("compact plan after cancel");
+    assert!(epoch.plan_flush_l0().unwrap().is_none());
+    assert!(epoch.plan_compact().is_none());
+    // Dropping the plan without committing releases the guard.
+    drop(compact_plan);
+
+    let compact_plan = epoch.plan_compact().expect("compact plan after drop");
+    let replacement = compact_plan.execute(&Cancellation::default()).unwrap();
+    epoch
+        .commit_compaction(compact_plan, replacement, &HashSet::new())
+        .unwrap();
+    let flush_plan2 = epoch
+        .plan_flush_l0()
+        .unwrap()
+        .expect("flush plan after commit");
+    let flush_seg = flush_plan2.execute(&Cancellation::default()).unwrap();
+    epoch
+        .commit_flush_l0(flush_plan2, flush_seg, &HashSet::new())
+        .unwrap();
+    assert!(epoch.matches_note_chunks(&c2.metadata.note, std::slice::from_ref(&c2_v2)));
+
+    // 2. Reopen reconciliation must skip notes whose slots are all tombstoned
+    // in a newer segment (both merge and small-newer binary-search branches).
+    for (tag, older_count) in [(7u8, 2u32), (8u8, 25u32)] {
+        let reopen_scratch = Scratch::new();
+        let reopen_scope = HistoryScope {
+            space_id: SpaceId::from_bytes([tag; 16]),
+            incarnation: HistoryIncarnation::from_bytes([tag; 16]),
+        };
+        let reopen_layout =
+            Arc::new(SearchLayout::open(&DataRoot::new(&reopen_scratch.0), reopen_scope).unwrap());
+        let epoch_dir = reopen_layout
+            .model_epoch(&VectorModel::local(model(), 64))
+            .unwrap();
+        let mut reopen_epoch = VectorEpoch::open(reopen_layout.clone(), model(), 64).unwrap();
+
+        let mut a_v2 = fixture(1, 64);
+        a_v2.metadata.spans = vec![ByteSpan::new(10, 22).unwrap()];
+        let mut older_rows = vec![a_v2.clone()];
+        for idx in 2..=older_count {
+            older_rows.push(fixture(idx, 64));
+        }
+        let seg1 = SegmentBuilder::with_test_rows(&model(), 64, older_rows)
+            .finish(&segment_file_path(&epoch_dir, 1))
+            .unwrap()
+            .unwrap();
+
+        let a_v1 = fixture(1, 64);
+        let newer_rows = if older_count == 2 {
+            vec![a_v1.clone(), fixture(100, 64)]
+        } else {
+            vec![a_v1.clone()]
+        };
+        let seg2 = SegmentBuilder::with_test_rows(&model(), 64, newer_rows)
+            .finish(&segment_file_path(&epoch_dir, 2))
+            .unwrap()
+            .unwrap();
+        let mut tomb2 = Tombstones::default();
+        for slot in seg2.note_slots(&a_v1.metadata.note).unwrap() {
+            tomb2.mark(slot);
+        }
+        tomb2
+            .persist(&epoch_dir.join("seg_0000000000000002.tomb"))
+            .unwrap();
+
+        reopen_epoch
+            .seed_segments(vec![(1, seg1), (2, seg2)], seq(1))
+            .unwrap();
+        drop(reopen_epoch);
+
+        let reopened = VectorEpoch::open(reopen_layout, model(), 64).unwrap();
+        assert!(
+            !epoch_dir.join("seg_0000000000000001.tomb").exists(),
+            "fully tombstoned note in newer segment must not tombstone live note in older segment"
+        );
+        assert!(reopened.matches_note_chunks(&a_v2.metadata.note, std::slice::from_ref(&a_v2)));
+    }
+}
