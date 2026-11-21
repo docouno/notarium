@@ -101,6 +101,27 @@ impl DerivedStore {
             .await
     }
 
+    /// Active paths already exclude folders below a trashed ancestor.
+    pub(crate) async fn active_descendants(
+        &self,
+        scope: &HistoryScope,
+        cut: SpaceSeq,
+        folder: &FolderId,
+        path: &str,
+    ) -> Result<Vec<FolderId>, PortError> {
+        let mut filter = "norm_path_prefix IS NOT NULL AND folder_id <> ?".to_owned();
+        let mut args = vec![value(folder)];
+        if !path.is_empty() {
+            let prefix = format!("{path}/");
+            filter.push_str(" AND substr(norm_path_prefix, 1, length(CAST(? AS TEXT))) = ?");
+            args.extend([value(&prefix), value(&prefix)]);
+        }
+        let rows = self
+            .at_cut::<FolderIdentity>(scope, cut, filter, args, "ORDER BY folder_id")
+            .await?;
+        Ok(rows.into_iter().map(|row| row.folder_id).collect())
+    }
+
     pub async fn folder_alias_page(
         &self,
         scope: &HistoryScope,

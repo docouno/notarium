@@ -165,6 +165,20 @@ pub(super) struct NoteProjection {
     pub(super) tags: Vec<String>,
 }
 
+pub(super) fn field_observations(
+    note: &ProjectionNote,
+    fields: &BTreeMap<String, FieldSchema>,
+) -> BTreeMap<String, FieldObservation<FieldValue>> {
+    if note.metadata.doc_class == DocClass::EncryptedNote {
+        return BTreeMap::new();
+    }
+    evaluate_fields_with_schema(
+        note.metadata.raw_fields.as_ref(),
+        note.header_diagnostic.as_ref(),
+        Some(fields),
+    )
+}
+
 pub(super) fn project_note(
     scope: &HistoryScope,
     note: ProjectionNote,
@@ -173,6 +187,7 @@ pub(super) fn project_note(
     source: Option<&str>,
     fields: &BTreeMap<String, FieldSchema>,
 ) -> Result<NoteProjection, PortError> {
+    let observations = field_observations(&note, fields);
     let m = note.metadata;
     let plain = m.doc_class != DocClass::EncryptedNote;
     let (blocks, tags, links, preview) = if let Some(source) = source.filter(|_| plain) {
@@ -208,11 +223,6 @@ pub(super) fn project_note(
         note.header_diagnostic.as_ref()
     } else {
         None
-    };
-    let observations = if plain {
-        evaluate_fields_with_schema(raw, diagnostic, Some(fields))
-    } else {
-        BTreeMap::new()
     };
     let blocks: Vec<_> = blocks.into_iter().map(ViewInput::from).collect();
     let views = compile_projected_views(&blocks, fields);

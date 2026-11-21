@@ -46,7 +46,7 @@ use notarium_core::{
         DeleteNote, EditNote, EntityId, FilenamePin, ForkChat, GetNote, InterceptedMutation,
         InterceptionResult, JobQuery, JobState, LiveCollabInterceptor, Mutation, NoteWritePort,
         PageLimit, PendingChatInput, PortFuture, Preconditions, QueueInputOutcome, RedactChatEntry,
-        RollbackReservation, SpaceContext, StagedChatBlob,
+        RollbackReservation, ServiceAuthority, ServicePurpose, SpaceContext, StagedChatBlob,
     },
     query::ReadRequest,
     receipt::{CausalBasis, ChangeCursor, CommandIdentity, ReceiptSet},
@@ -1222,6 +1222,19 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
     );
     assert!(replay_reader.auth().taint().is_tainted());
     cur_a = inline_entry.seq;
+    let search_reader = owner_ctx(&scope, owner.clone());
+    let (hits, truncated) = store
+        .hydrate_live_visible_chat_hits(
+            &search_reader,
+            &[(thread.clone(), e1.seq), (thread.clone(), inline_entry.seq)],
+            PageLimit::new(1).unwrap(),
+        )
+        .await
+        .expect("hydrate the top-ranked live chat entry");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].text, exact_512);
+    assert!(truncated);
+    assert!(!search_reader.auth().taint().is_tainted());
     let retained = store.execute_diagnostic_read_sql_for_test(None,
         "SELECT COUNT(*) FROM chat_pending_inputs WHERE status = 'consumed' AND (inline_text <> '' OR payload_blake3 IS NOT NULL)"
     ).await.unwrap();
@@ -1336,6 +1349,47 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
     assert_eq!(redacted.parent, Some(e1.seq));
     // ONLY descendant `comp_a.seq` is invalidated — sibling `comp_b.seq` MUST NOT be invalidated!
     assert_eq!(redacted.invalidated_contexts, vec![comp_a.seq]);
+    let search = ServiceAuthority::admit(ServicePurpose::Search);
+    let cutoff = store.read_space(&scope.space_id).await.unwrap().last_seq;
+    let (threads, _) = store
+        .list_searchable_threads_seed_page(
+            &search,
+            &search_reader.budget,
+            &scope,
+            cutoff,
+            None,
+            PageLimit::new(20).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(threads.contains(&thread));
+    let page = store
+        .read_searchable_chat_entries_page(
+            &search,
+            &search_reader.budget,
+            &scope,
+            &thread,
+            cutoff,
+            None,
+            PageLimit::new(10).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !page
+            .entries
+            .iter()
+            .any(|hit| hit.entry == e2.seq || hit.entry == comp_a.seq)
+    );
+    let (hits, _) = store
+        .hydrate_live_visible_chat_hits(
+            &search_reader,
+            &[(thread.clone(), e2.seq), (thread.clone(), comp_a.seq)],
+            PageLimit::new(2).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(hits.is_empty());
 
     let stale = StaleCompactionCase {
         scope: scope.clone(),

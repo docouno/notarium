@@ -15,7 +15,6 @@ use notarium_core::{
         GraphTier, LinkReadPort, NoteLink, NoteLinkCursor, NoteLinkDirection, NoteLinkPage,
         PageLimit, PortFuture, SpaceContext,
     },
-    query::Predicate,
     receipt::CausalBasis,
 };
 use notarium_syntax::unicode::lookup_key;
@@ -24,7 +23,7 @@ use crate::{
     derived::{LinkAddress, LinkPosition},
     graph::{SettledGraph, plan_graph},
     index::{IndexView, PostingKey},
-    query::{entry_folder, structural_universe},
+    query::{entry_folder, exact_filter, structural_universe},
 };
 
 use super::{
@@ -127,7 +126,15 @@ impl ProjectionEngine {
             }
             (lens, _) => lens,
         };
-        let matched = exact_filter(&index, &cut, &query.filter.predicate, &authorized).await?;
+        let matched = exact_filter(
+            &index,
+            &cut.store,
+            &cut.cut.scope,
+            cut.cut.projected_seq,
+            &authorized,
+            &query.filter.predicate,
+        )
+        .await?;
         let mut issued_cut = cut.cut.clone();
         issued_cut.canonical_seq = head;
         let durable_clusters = match (index.deferred_clusters(), &query.tier) {
@@ -471,34 +478,6 @@ fn visible_note_id(
         Err(PortError::Domain(DomainError::ResourceNotFound)) => Ok(None),
         Err(error) => Err(error),
     }
-}
-
-async fn exact_filter(
-    index: &IndexView,
-    cut: &PublishedCut,
-    predicate: &Predicate,
-    universe: &Bitmap,
-) -> Result<Bitmap, PortError> {
-    let hits = index
-        .filter_candidates(predicate, universe)
-        .map_err(checkpoint_error)?;
-    let unknown = hits.needs_check();
-    let mut resolved = hits.definite;
-    let mut pending = unknown.iter().peekable();
-    while pending.peek().is_some() {
-        let page: Vec<_> = pending.by_ref().take(MAX_ROWS).collect();
-        let rows = cut
-            .store
-            .hydrate_query_rows(&cut.cut.scope, cut.cut.projected_seq, &page)
-            .await?;
-        for row in rows {
-            let note = row.ok_or_else(stale)?;
-            if predicate.matches(&note.evaluated_fields()?) {
-                resolved.add(note.dense_id);
-            }
-        }
-    }
-    Ok(resolved)
 }
 
 async fn within_budget<T>(

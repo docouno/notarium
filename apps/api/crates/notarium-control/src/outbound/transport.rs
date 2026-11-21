@@ -366,8 +366,17 @@ impl OutboundTransport {
     /// actual network shutdown before releasing their revocation registrations.
     pub(crate) fn start(
         &self,
+        call: CallBudget,
+        request: OutboundRequest,
+    ) -> Result<OutboundResponse, PortError> {
+        self.start_checked(call, request, || Ok(()))
+    }
+
+    pub(crate) fn start_checked(
+        &self,
         mut call: CallBudget,
         mut request: OutboundRequest,
+        preflight: impl FnOnce() -> Result<(), PortError> + Send + 'static,
     ) -> Result<OutboundResponse, PortError> {
         call.remaining = call.remaining.min(request.validate()?);
         let request_id = call.request.clone();
@@ -431,7 +440,10 @@ impl OutboundTransport {
                     .build()
                     .map_err(|_| failed())?;
                 let mut response = context
-                    .run(async { client.execute(outgoing).await.map_err(send_failed) })
+                    .run(async {
+                        preflight()?;
+                        client.execute(outgoing).await.map_err(send_failed)
+                    })
                     .await?;
                 header_bytes(response.headers()).map_err(|_| failed())?;
                 if response

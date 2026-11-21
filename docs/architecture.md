@@ -9,8 +9,9 @@ The backend separates control, canonical and rebuildable derived state. Local
 delivery uses independent SQLite files without `ATTACH DATABASE`: control data,
 canonical data with a batch writer and Zstd CAS, and derived generations
 published through ArcSwap. Cloud delivery pairs PostgreSQL 16 with S3-compatible
-CAS. Search targets pure Rust i8 mmap CSR-HNSW with `std::arch` SIMD. ONNX is
-loaded dynamically through `ort`, never downloaded during offline builds.
+CAS. Search combines Tantivy with a pure Rust i8 mmap CSR-HNSW index and
+`std::arch` SIMD. The optional ONNX backend loads the CPU runtime dynamically
+through `ort`. Offline builds use cached dependencies.
 
 The core, syntax, canonical and control libraries implement [domain contracts](core-contracts.md),
 [document syntax](syntax.md) and [control-plane services](control.md), including
@@ -21,7 +22,8 @@ the native keyring, guarded outbound HTTP, the AI provider gateway and the
 provides SQLite and PostgreSQL persistence, CAS, chat history and a backup
 participant. [Structural projections](projections.md) consume canonical
 commands to provide structural snapshots, note lists, declarative note views
-and graph reads. Transport wiring composes engine ports independently.
+and graph reads. The [search engine](search.md) subscribes independently
+to canonical changes and consumes the structural read port.
 
 ## Internal dependency allowlist
 
@@ -66,6 +68,9 @@ Canonical tests exercise dual-dialect storage and CAS. Control storage tests its
 SQL schema, target import/export, authentication, Space authority and crash
 recovery. Projection tests include the trusted mmap loader and both SQL
 fixtures. The loader is the projection crate's sole narrow unsafe-code scope.
+Search tests exercise lexical analysis, CSR-HNSW, SIMD, dynamic ONNX loading,
+causal alignment and physical erasure. An offline scale gate uses 100,000 notes
+and 400,000 chunks. Search confines unsafe code to the mmap and SIMD modules.
 
 `notarium-control` owns a 45-table baseline in SQLite and the PostgreSQL
 `v1_control` schema. Its typed target records support offline import and paged

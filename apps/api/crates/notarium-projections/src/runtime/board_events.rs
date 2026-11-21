@@ -293,8 +293,8 @@ impl ProjectionEngine {
         if descriptor.kind != ViewKind::Board {
             return Ok(None);
         }
-        let Some(location) = self
-            .try_location_at(cut, seq, &carrier.parent_folder_id)
+        let Some(location) = cut
+            .try_location_at(seq, &carrier.parent_folder_id)
             .await?
             .filter(|location| !location.trashed)
         else {
@@ -311,8 +311,8 @@ impl ProjectionEngine {
         let requires_folder_grant =
             query::view_authorization_folder(&descriptor.source, folder.as_ref()).is_some();
         let source_folder = if let Some(folder) = folder {
-            let Some(location) = self
-                .try_location_at(cut, seq, &folder)
+            let Some(location) = cut
+                .try_location_at(seq, &folder)
                 .await?
                 .filter(|location| !location.trashed)
             else {
@@ -470,8 +470,8 @@ impl ProjectionEngine {
         else {
             return Ok(None);
         };
-        let Some(location) = self
-            .try_location_at(cut, seq, &row.parent_folder_id)
+        let Some(location) = cut
+            .try_location_at(seq, &row.parent_folder_id)
             .await?
             .filter(|location| !location.trashed)
         else {

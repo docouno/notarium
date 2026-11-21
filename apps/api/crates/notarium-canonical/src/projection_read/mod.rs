@@ -10,7 +10,10 @@ use notarium_core::{
     auth::{Space, SpaceKind, SpaceLifecycle},
     classes::DocClass,
     error::{Diagnostic, PortError, ValidationReason},
-    ids::{ContentDigest, FolderId, HistoryIncarnation, NoteId, RevisionId, SpaceId, SpaceSeq},
+    ids::{
+        ContentDigest, FolderId, HistoryIncarnation, NoteId, PrincipalId, RevisionId, SpaceId,
+        SpaceSeq,
+    },
     model::{HistoryScope, Lifecycle},
     ports::{MaintenanceContext, PageLimit, ServicePurpose},
     query::FieldSchema,
@@ -60,6 +63,7 @@ pub use aliases::{
     ProjectionAlias, ProjectionAliasCursor, ProjectionFolderAlias, ProjectionNoteAlias,
 };
 pub use delta::{ProjectionAbility, ProjectionDelta};
+pub(crate) use exact::structural_overlay_supported;
 pub use exact::{ProjectionOverlayNote, ProjectionOverlaySelection};
 pub use ranks::{ProjectionRank, ProjectionRankKey};
 
@@ -194,6 +198,7 @@ pub struct ProjectionFolder {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProjectionNote {
+    pub(crate) revision_actor: PrincipalId,
     pub metadata: NoteRevisionMetadata,
     pub revision_id: RevisionId,
     pub visibility_seq: SpaceSeq,
@@ -397,6 +402,27 @@ impl CanonicalStore {
         .await
     }
 
+    /// Reads only metadata for a bounded set of notes at a retained command cut.
+    pub async fn read_projection_note_metadata_batch(
+        &self,
+        ctx: &MaintenanceContext,
+        scope: &HistoryScope,
+        cutoff: SpaceSeq,
+        ids: Vec<NoteId>,
+    ) -> Result<HashMap<NoteId, ProjectionNote>, PortError> {
+        if ids.len() > 200 {
+            return Err(DomainError::validation(ValidationReason::InvalidLimit).into());
+        }
+        let scope = scope.clone();
+        self.with_projection_read(ctx, |tx| {
+            Box::pin(async move {
+                checked_cut(tx, &scope, cutoff).await?;
+                notes_at_batch(tx, &scope, cutoff, &ids).await
+            })
+        })
+        .await
+    }
+
     /// Opens the canonical carrier admitted with this exact metadata record.
     /// Encrypted notes never admit a digest for carrier I/O.
     pub async fn read_projection_note_carrier(
@@ -569,7 +595,7 @@ async fn checked_cut(
     validate_cut(tx, &record, cutoff).await
 }
 
-async fn schema_at(
+pub(crate) async fn schema_at(
     tx: &mut BackendConn<'_>,
     scope: &HistoryScope,
     cut: SpaceSeq,
@@ -608,9 +634,12 @@ async fn schema_at(
 // the cut. Ability publishers can change attachment without a note revision.
 macro_rules! note_snapshot_sql {
     () => {
-        "SELECT h.note_id, h.created_at_sec, CAST(h.created_at_nsec AS BIGINT),
+        note_snapshot_sql!("h.created_seq")
+    };
+    ($created_seq:literal) => {
+        concat!("SELECT h.note_id, h.created_at_sec, CAST(h.created_at_nsec AS BIGINT),
             r.rev_id, r.visibility_seq, r.created_at_sec, CAST(r.created_at_nsec AS BIGINT),
-            r.content_blake3, r.metadata_msgpack, b.rev_id, b.metadata_msgpack
+            r.content_blake3, r.metadata_msgpack, b.rev_id, b.metadata_msgpack, r.actor_id
          FROM note_heads h
          LEFT JOIN revisions r ON r.space_id = h.space_id AND r.rev_id = (
             SELECT x.rev_id FROM revisions x
@@ -629,10 +658,10 @@ macro_rules! note_snapshot_sql {
               AND x.visibility_seq <= $3 AND x.history_incarnation = $2
             ORDER BY x.visibility_seq DESC, x.space_seq DESC LIMIT 1
          )
-         WHERE h.space_id = $1 AND h.created_seq <= $3 AND NOT EXISTS (
+         WHERE h.space_id = $1 AND ", $created_seq, " <= $3 AND NOT EXISTS (
             SELECT 1 FROM revision_purge_fences p
             WHERE p.space_id = h.space_id AND p.note_id = h.note_id
-         ) AND "
+         ) AND ")
     };
 }
 
@@ -664,6 +693,7 @@ type NoteRow = (
     Option<Vec<u8>>,
     Option<String>,
     Option<Vec<u8>>,
+    Option<String>,
 );
 type FolderRow = (String, Option<String>, Option<i64>, Option<Vec<u8>>);
 
@@ -703,6 +733,7 @@ fn note_from_row(
         meta,
         ability_rev,
         ability_meta,
+        actor,
     ): NoteRow,
 ) -> Result<ProjectionNote, PortError> {
     let (Some(rev), Some(visible), Some(updated_sec), Some(updated_nsec), Some(meta)) =
@@ -767,6 +798,7 @@ fn note_from_row(
         digest: carrier_digest,
     };
     Ok(ProjectionNote {
+        revision_actor: PrincipalId::parse(&actor.ok_or_else(stale)?)?,
         metadata,
         revision_id,
         visibility_seq: i64_to_space_seq(visible)?,
@@ -810,16 +842,7 @@ pub(super) async fn notes_at_batch(
         BackendConn::Sqlite(conn) => {
             let mut acc = Vec::with_capacity(ids.len());
             for chunk in ids.chunks(200) {
-                let mut sql = String::from(note_snapshot_sql!());
-                sql.push_str(" h.note_id IN (");
-                for i in 0..chunk.len() {
-                    if i > 0 {
-                        sql.push_str(", ");
-                    }
-                    use std::fmt::Write;
-                    let _ = write!(sql, "${}", i + 4);
-                }
-                sql.push(')');
+                let sql = sqlite_selected_note_sql(chunk.len());
                 let mut query = sqlx::query_as::<_, NoteRow>(sqlx::AssertSqlSafe(sql))
                     .bind(space)
                     .bind(incarnation)
@@ -841,6 +864,41 @@ pub(super) async fn notes_at_batch(
         out.insert(note.metadata.note_id.clone(), note);
     }
     Ok(out)
+}
+
+fn sqlite_selected_note_sql(count: usize) -> String {
+    // Both operands are integers. Unary + keeps the cutoff check but prevents
+    // SQLite from scanning every earlier head instead of seeking the given IDs.
+    let mut sql = String::from(note_snapshot_sql!("+h.created_seq"));
+    sql.push_str(" h.note_id IN (");
+    for i in 0..count {
+        if i > 0 {
+            sql.push_str(", ");
+        }
+        use std::fmt::Write;
+        let _ = write!(sql, "${}", i + 4);
+    }
+    sql.push(')');
+    sql
+}
+
+#[test]
+fn sqlite_selected_notes_seek_the_requested_ids() {
+    let db = rusqlite::Connection::open_in_memory().unwrap();
+    db.execute_batch(crate::schema::SQLITE_BASELINE_DDL)
+        .unwrap();
+    let sql = format!("EXPLAIN QUERY PLAN {}", sqlite_selected_note_sql(50));
+    let mut statement = db.prepare(&sql).unwrap();
+    let mut rows = statement.raw_query();
+    let mut plan = Vec::new();
+    while let Some(row) = rows.next().unwrap() {
+        plan.push(row.get::<_, String>(3).unwrap());
+    }
+    assert!(
+        plan.iter()
+            .any(|step| step.contains("SEARCH h ") && step.contains("(space_id=? AND note_id=?)")),
+        "{plan:?}"
+    );
 }
 
 pub(super) async fn folders_at_batch(

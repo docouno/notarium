@@ -8,14 +8,15 @@ needed for optional `npx` CLI entry points.
 `make setup` downloads images and caches dependencies — including the pinned
 `pnpm 12.21.0` binary, shared caches under `DEVKIT_CACHE_DIR` (default
 `~/.cache/docouno/devkit`, with hardlinked `pnpm-store` and reusable derived
-container images), the digest-pinned PostgreSQL 16 image and the source-built
-MinIO Community storage test fixture (`compose.storage-tests.yaml`) — and requires
-networking. Subsequent check/test/build commands use `--network none`, read-only
-sources, manifests, lockfiles and `node_modules/.pnpm`, with writable declared
-cache/output paths. `make test` automatically launches and tears down isolated
-Unix-domain-socket PostgreSQL 16 and MinIO Community fixtures for `apps/api`
-without network access; integration tests fail closed if fixtures are absent
-(see [canonical storage](storage.md)).
+container images), the digest-pinned PostgreSQL 16 image, the source-built
+MinIO Community storage test fixture (`compose.storage-tests.yaml`), and the
+SHA-256-pinned ONNX Runtime 1.31 CPU test library (using host `curl`, `unzip`
+and `sha256sum`) — and requires networking. Subsequent check/test/build commands
+use `--network none`, read-only sources, manifests, lockfiles and
+`node_modules/.pnpm`, with writable declared cache/output paths. `make test`
+automatically launches and tears down isolated Unix-domain-socket PostgreSQL 16
+and MinIO Community fixtures for `apps/api` without network access; integration
+tests fail closed if fixtures are absent (see [canonical storage](storage.md)).
 
 | Command | Purpose |
 | --- | --- |
@@ -26,6 +27,7 @@ without network access; integration tests fail closed if fixtures are absent
 | `make check` | Formatting, lint and types, including all Cargo targets |
 | `make fix` | Apply Prettier, ESLint `--fix` and `rustfmt` explicitly |
 | `make test` | All component tests, architecture rules and process smoke tests |
+| `make benchmark-search` | Offline release gate on 100,000 notes and 400,000 chunks |
 | `make build` | Build all components offline |
 | `make check app=api` | Select the Rust app |
 | `make test package=api-contract` | Select the contract library |
@@ -52,6 +54,11 @@ configuration fails the database suite. The project wrapper serializes fixture
 runs within one checkout and removes its container and scratch directory on
 clean exit; logs remain in `.artifacts/control-db-fixture/` when a run fails.
 No host PostgreSQL installation is required.
+
+API setup also prepares the pinned dynamic ONNX Runtime CPU fixture. The search
+tests use both canonical storage dialects and exercise the native runtime with
+a small embedded test graph. The scale gate needs a writable Cargo target mount
+and emits a JSON report to standard output. See [search verification](search.md#verification).
 
 ## Dependencies and ownership
 

@@ -4,7 +4,7 @@ use super::{
     admission::DispatchAuthority,
     execution::{CancelOnDrop, Job, Request, Runtime},
     records::*,
-    wire,
+    selection, wire,
 };
 use crate::{
     error::{invalid, unavailable},
@@ -13,8 +13,10 @@ use crate::{
 };
 use notarium_core::{
     DomainError,
+    classes::DocClass,
     error::{BudgetKind, CommitEffect, PortError, ValidationReason},
     ids::*,
+    model::FolderRef,
     ports::{control::*, *},
 };
 use reqwest::{
@@ -22,6 +24,7 @@ use reqwest::{
     header::{ACCEPT, CONTENT_TYPE, HeaderValue},
 };
 use std::{
+    collections::BTreeSet,
     future::Future,
     sync::{Arc, Mutex},
 };
@@ -284,6 +287,12 @@ impl ProviderService {
                 CommitEffect::NotCommitted,
             )
             .await?;
+        if let Request::Embedding(request) = &job.request
+            && let Some(expected) = request.runtime_epochs()
+            && runtime_epochs(&snapshot.resource, snapshot.credential.as_ref())? != expected
+        {
+            return Err(selection::unavailable());
+        }
         let primary = if let Some(scope) = &job.scope {
             let ctx = SpaceContext::new(job.ctx.auth().clone(), scope.clone(), runtime.context())?;
             Some(
@@ -329,6 +338,7 @@ impl ProviderService {
             primary: primary.as_ref(),
             project: job.project(),
             parts: &parts,
+            embedding_inputs: job.embedding_inputs(),
             current: &current,
             keeper: keeper.as_ref(),
         };
@@ -450,7 +460,19 @@ impl ProviderService {
             expires,
             self.control.clock.now_ms()?,
         )?;
-        progress.response = Some(self.outbound.start(
+        let query_taint = job
+            .embedding_inputs()
+            .iter()
+            .any(|input| matches!(input, EmbeddingInput::Query(_)))
+            .then(|| job.ctx.auth().taint().clone());
+        let check_query_taint = move || {
+            if query_taint.as_ref().is_some_and(|taint| taint.is_tainted()) {
+                return Err(DomainError::CrossSpaceTainted.into());
+            }
+            Ok(())
+        };
+        check_query_taint()?;
+        progress.response = Some(self.outbound.start_checked(
             network_budget,
             OutboundRequest {
                 scope: scope(
@@ -473,11 +495,13 @@ impl ProviderService {
                     32 * 1024 * 1024
                 },
             },
+            check_query_taint,
         )?);
         progress.submitted = true;
         let response = progress.response.as_mut().expect("started transport");
         if let Err(error) = progress.leases.run(runtime, response.receive_head()).await {
             if matches!(&error,PortError::Unavailable(failure) if failure.effect()==CommitEffect::NotCommitted)
+                || matches!(&error, PortError::Domain(DomainError::CrossSpaceTainted))
             {
                 progress.submitted = false;
             }
@@ -494,6 +518,32 @@ impl ProviderService {
 }
 
 impl EmbeddingProviderPort for ProviderService {
+    fn query_disclosure(
+        &self,
+        ctx: SpaceContext,
+        provider: ProviderResourceId,
+        model: ModelProfileId,
+        project: Option<FolderRef>,
+    ) -> PortFuture<'_, BTreeSet<DocClass>> {
+        Box::pin(async move {
+            if ctx.auth().taint().is_tainted() {
+                return Err(DomainError::CrossSpaceTainted.into());
+            }
+            let selected = self
+                .select_provider(
+                    ctx,
+                    SelectProvider {
+                        kind: PreferenceModelKind::Embedding,
+                        resource: Some(provider),
+                        model: Some(model),
+                        project,
+                    },
+                )
+                .await?;
+            Ok(selected.policy.allowed_classes)
+        })
+    }
+
     fn embed(
         &self,
         ctx: SpaceContext,

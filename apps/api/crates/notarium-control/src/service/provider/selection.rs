@@ -1,7 +1,7 @@
 use super::super::{commands::Command, spaces::require_owner};
 use super::{
     ProviderService,
-    attachments::{check_member, epochs, epochs_read},
+    attachments::{check_member, credential_for_selection, epochs},
     records::*,
 };
 use crate::{
@@ -19,7 +19,7 @@ use notarium_core::{
     classes::{ProviderAudience, ProviderPolicy},
     error::{CommitEffect, PortError, ValidationReason},
     ids::*,
-    model::FolderRef,
+    model::{FolderRef, HistoryScope},
     ports::{control::*, *},
 };
 
@@ -191,6 +191,72 @@ async fn shared_attachment(
         .ok_or_else(unavailable)
 }
 impl ProviderService {
+    /// Admit the revision author in a Shared Space or the owner of a Personal
+    /// Space. Dispatch rechecks membership and disclosure before sending.
+    pub async fn admit_search_indexing(
+        &self,
+        authority: &ServiceAuthority,
+        scope: HistoryScope,
+        revision_actor: &PrincipalId,
+        provider: &ProviderResourceId,
+        project: Option<&FolderRef>,
+        call: CallBudget,
+    ) -> Result<(SpaceContext, ProviderPolicy), PortError> {
+        authority.require(ServicePurpose::Search)?;
+        let budget = OperationBudget::new(call.clone());
+        let space = budget
+            .run(
+                self.control
+                    .catalog
+                    .space(budget.context(call.request.clone()), scope.space_id.clone()),
+                CommitEffect::NotCommitted,
+            )
+            .await?;
+        scope.check(&space.history)?;
+        let mut ctx = self
+            .control
+            .admit_search_indexing(
+                authority,
+                &space,
+                revision_actor,
+                provider,
+                budget.context(call.request.clone()),
+            )
+            .await?;
+        let space = self.selection_catalog(&ctx, project).await?;
+        let (mut tx, auth) = self
+            .control
+            .open_revalidated_read(&budget, &call.request, ctx.auth())
+            .await?;
+        let admitted = budget
+            .run(
+                async {
+                    let resource = resource_read(tx.inner_mut(), provider.as_str()).await?;
+                    let epoch = credential_for_selection(tx.inner_mut(), &resource)
+                        .await?
+                        .map(|credential| credential.consent_epoch);
+                    policy(
+                        tx.inner_mut(),
+                        &auth,
+                        &resource,
+                        epoch,
+                        &space.space,
+                        project,
+                        self.control.clock.now_ms()?,
+                        false,
+                    )
+                    .await
+                },
+                CommitEffect::NotCommitted,
+            )
+            .await;
+        budget
+            .run(tx.rollback(), CommitEffect::NotCommitted)
+            .await?;
+        ctx.budget = budget.context(call.request);
+        Ok((ctx, admitted?.policy))
+    }
+
     pub(super) async fn selection_catalog(
         &self,
         ctx: &SpaceContext,
@@ -261,14 +327,16 @@ impl ProviderService {
             if owner_active != 1 {
                 return Err(unavailable());
             }
-            let credential_epoch=epochs_read(tx.inner_mut(),&resource).await.map_err(|_| unavailable())?;
+            let credential=credential_for_selection(tx.inner_mut(),&resource).await.map_err(|_| unavailable())?;
+            let credential_epoch=credential.as_ref().map(|row| row.consent_epoch);
             let model_id=model_id.or_else(||resource.default_model.as_deref().and_then(|value|ModelProfileId::parse(value).ok())).ok_or_else(unavailable)?;
             let loaded=model_info(&model_read(tx.inner_mut(),&resource.id,model_id.as_str()).await.map_err(|_| unavailable())?)?;
             if !matches_preference_kind(&loaded.model.kind, request.kind) {
                 return Err(unavailable());
             }
             let admission=policy(tx.inner_mut(),&auth,&resource,credential_epoch,&space.space,request.project.as_ref(),now,false).await?;
-            Ok(ProviderSelection{provider:id,model:model_id,project:request.project,policy:admission.policy})
+            let runtime_epochs=runtime_epochs(&resource,credential.as_ref())?;
+            Ok(ProviderSelection{provider:id,model:model_id,runtime_epochs,project:request.project,policy:admission.policy})
         },CommitEffect::NotCommitted).await?;
         budget
             .run(tx.rollback(), CommitEffect::NotCommitted)

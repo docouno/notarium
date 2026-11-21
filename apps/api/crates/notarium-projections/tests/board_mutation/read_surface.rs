@@ -7,14 +7,16 @@ use notarium_core::{
     classes::DocClass,
     error::{PortError, ValidationReason},
     ids::{FolderId, GrantId, LeaseEpoch, NoteId, PrincipalId, ViewKey},
+    model::Lifecycle,
     patch::CarrierEditOrigin,
     ports::{
         CreateNote, DeleteDisposition, DeleteNote, EditNote, GraphNodeId, GraphQuery, GraphTier,
-        MoveNote, NoteRevision, NoteWritePort, PageLimit, RenameNote, SpaceContext,
+        MoveFolder, MoveNote, NoteRevision, NoteWritePort, PageLimit, RenameNote, SpaceContext,
         StructuralReadPort, ViewGraphPort, ViewQuery, ViewRef, ViewRow,
     },
     query::{FieldFilterAstV1, Predicate, ReadRequest},
     receipt::{AwaitWatermarks, CausalBasis},
+    value::{ScalarValue, YamlValue},
 };
 use notarium_projections::{NoteLinkDirection, ProjectionEngine};
 
@@ -24,6 +26,7 @@ use super::{
 
 pub(super) async fn exercise(store: &CanonicalStore, runtime: &ProjectorRuntime) {
     scoped_graph(store, runtime).await;
+    retained_structural_snapshot(store, runtime).await;
     let (scope, owner) = open_space(store).await;
     let view_key = ViewKey::from_bytes([18; 16]);
     let view = note(
@@ -235,10 +238,23 @@ pub(super) async fn exercise(store: &CanonicalStore, runtime: &ProjectorRuntime)
         },
     );
     trash.preconditions.revision = Some(gamma.revision);
-    store
+    let trashed = store
         .delete_note(owner.clone(), trash)
         .await
         .expect("trash the final note");
+    let mut waiting = owner.clone();
+    waiting.budget.remaining = Duration::from_millis(120);
+    let watermark = AwaitWatermarks::from_receipts([trashed.receipt]);
+    assert!(matches!(
+        engine
+            .acquire_snapshot(waiting, CausalBasis::Await(watermark))
+            .await,
+        Err(PortError::DeadlineExceeded(_))
+    ));
+    assert_eq!(
+        snapshot.doc_class(focal),
+        Err(DomainError::ResourceNotFound)
+    );
     assert!(
         !engine
             .is_live_visible(&owner, &gamma.note)
@@ -261,9 +277,154 @@ pub(super) async fn exercise(store: &CanonicalStore, runtime: &ProjectorRuntime)
     assert!(last.rows.next.is_none());
 }
 
+async fn retained_structural_snapshot(store: &CanonicalStore, runtime: &ProjectorRuntime) {
+    let (scope, owner) = open_space(store).await;
+    let engine = runtime.engine();
+    engine.bucket_list_at_checkpoint_for_test(&scope, "labels");
+    let project = create_project(store, &owner).await;
+    let child = FolderId::from_bytes(random_bytes());
+    store
+        .create_folder(CreateFolderSpec {
+            scope: scope.clone(),
+            active_epoch: LeaseEpoch::new(1).unwrap(),
+            folder_id: child.clone(),
+            parent: Some(project.clone()),
+            slug: "moving".into(),
+            display_name: "Moving".into(),
+            is_project: false,
+            project_slug: None,
+            actor: owner.auth().principal().clone(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+
+    let carrier = "---\nlabels: [entry-0]\n---\n# Target\n";
+    let target = note(store, &owner, "target", DocClass::UserDoc, carrier.into()).await;
+    // Packed string values use the first 12 low bits of their typed digest.
+    let bucket = |value: &str| {
+        let hash = blake3::hash(&[&[2][..], value.as_bytes()].concat());
+        u16::from_be_bytes([hash.as_bytes()[0], hash.as_bytes()[1]]) & 0x0fff
+    };
+    let collision = (1..65_536)
+        .map(|i| format!("entry-{i}"))
+        .find(|value| bucket(value) == bucket("entry-0"))
+        .unwrap();
+    let decoy = note(
+        store,
+        &owner,
+        "decoy",
+        DocClass::UserDoc,
+        format!("---\nlabels: [{collision}]\n---\n# Decoy\n"),
+    )
+    .await;
+    let head = store.read_space(&scope.space_id).await.unwrap().last_seq;
+    sync(store, runtime, &scope).await;
+    engine.checkpoint_for_test(&scope, head).await.unwrap();
+    let old = engine
+        .acquire_snapshot(owner.clone(), CausalBasis::Exact(Default::default()))
+        .await
+        .unwrap();
+    assert_eq!(old.cut().projected_seq, head);
+
+    let plan = notarium_syntax::frontmatter::set_field(
+        carrier,
+        DocClass::UserDoc,
+        "labels",
+        YamlValue::Sequence(vec![YamlValue::String(collision)]),
+    )
+    .unwrap();
+    let mut edit = mutation(
+        &owner,
+        EditNote {
+            note: target.note.clone(),
+            plan,
+        },
+    );
+    edit.preconditions.revision = Some(target.revision);
+    store.edit_note(owner.clone(), edit).await.unwrap();
+    store
+        .move_folder(
+            owner.clone(),
+            mutation(
+                &owner,
+                MoveFolder {
+                    folder: child.clone(),
+                    new_parent: None,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    sync(store, runtime, &scope).await;
+
+    let filter = FieldFilterAstV1 {
+        version: 1,
+        predicate: Predicate::Contains {
+            key: "labels".into(),
+            value: ScalarValue::String("entry-0".into()),
+        },
+    };
+    assert_eq!(
+        old.folder_descendants(&project).await.unwrap(),
+        vec![project.clone(), child.clone()]
+    );
+    assert_eq!(
+        old.enclosing_project(&child).await.unwrap(),
+        Some(project.clone())
+    );
+    let (matched, rest) = (
+        old.lookup(&target.note).unwrap(),
+        old.lookup(&decoy.note).unwrap(),
+    );
+    let historical = old
+        .filter_notes(&filter)
+        .await
+        .unwrap()
+        .unwrap()
+        .collect::<Vec<_>>();
+    assert_eq!(historical, vec![matched]);
+    assert!(!historical.contains(&rest));
+
+    let new = engine
+        .acquire_snapshot(owner, CausalBasis::Exact(Default::default()))
+        .await
+        .unwrap();
+    assert!(new.cut().projected_seq > head);
+    assert_eq!(
+        new.folder_descendants(&project).await.unwrap(),
+        vec![project]
+    );
+    assert_eq!(new.enclosing_project(&child).await.unwrap(), None);
+    assert!(
+        new.filter_notes(&filter)
+            .await
+            .unwrap()
+            .unwrap()
+            .next()
+            .is_none()
+    );
+}
+
 async fn scoped_graph(store: &CanonicalStore, runtime: &ProjectorRuntime) {
     let (scope, owner) = open_space(store).await;
     let project = create_project(store, &owner).await;
+    let child = FolderId::from_bytes(random_bytes());
+    let (_, child_revision, _) = store
+        .create_folder(CreateFolderSpec {
+            scope: scope.clone(),
+            active_epoch: LeaseEpoch::new(1).unwrap(),
+            folder_id: child.clone(),
+            parent: Some(project.clone()),
+            slug: "nested".into(),
+            display_name: "Nested".into(),
+            is_project: false,
+            project_slug: None,
+            actor: owner.auth().principal().clone(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
     let focal = project_note(store, &owner, &project, "focal", "# Focal\n".into()).await;
     let outside = note(
         store,
@@ -288,6 +449,70 @@ async fn scoped_graph(store: &CanonicalStore, runtime: &ProjectorRuntime) {
 
     let scoped = scoped_reader(&owner, &project);
     let engine = runtime.engine();
+    let snapshot = engine
+        .acquire_snapshot(scoped.clone(), CausalBasis::Await(Default::default()))
+        .await
+        .unwrap();
+    assert_eq!(
+        snapshot.folder_descendants(&project).await.unwrap(),
+        vec![project.clone(), child.clone()]
+    );
+    assert_eq!(
+        snapshot.enclosing_project(&child).await.unwrap(),
+        Some(project.clone())
+    );
+    let root = store
+        .read_space(&scope.space_id)
+        .await
+        .unwrap()
+        .root_folder_id;
+    assert!(matches!(
+        snapshot.folder_descendants(&root).await,
+        Err(PortError::Domain(DomainError::ResourceNotFound))
+    ));
+    assert_eq!(
+        snapshot
+            .doc_class(snapshot.lookup(&focal).unwrap())
+            .unwrap(),
+        DocClass::UserDoc
+    );
+    let predicate = FieldFilterAstV1 {
+        version: 1,
+        predicate: Predicate::Not(Box::new(Predicate::IsAbsent { key: "tags".into() })),
+    };
+    let filtered: Vec<_> = snapshot
+        .filter_notes(&predicate)
+        .await
+        .unwrap()
+        .unwrap()
+        .map(|node| snapshot.note_id(node).unwrap())
+        .collect();
+    assert_eq!(filtered, vec![source.clone()]);
+    assert!(snapshot.filter_notes(&filter()).await.unwrap().is_none());
+    {
+        let _hold = engine.pause_before_projection_for_test(&scope, 1).unwrap();
+        store
+            .set_folder_lifecycle(
+                &scope,
+                LeaseEpoch::new(1).unwrap(),
+                &child,
+                &child_revision,
+                Lifecycle::Trashed,
+                owner.auth().principal(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot.folder_descendants(&project).await.unwrap(),
+            vec![project.clone()]
+        );
+        assert!(matches!(
+            snapshot.enclosing_project(&child).await,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ));
+    }
+    sync(store, runtime, &scope).await;
     let allowed = BTreeSet::from([
         GraphNodeId::Note(source.clone()),
         GraphNodeId::Note(focal.clone()),

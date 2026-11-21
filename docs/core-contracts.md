@@ -377,6 +377,17 @@ Control owns authentication, account episodes, abilities, schedules and provider
 requests. The other boundaries are structural snapshots, change broadcast,
 embedding, live interception, events, revocation and backup participants.
 
+`SearchQuery` combines text, folder and field filters, class selection, causal
+basis, and optional chat hits. `RecallQuery` adds a graph depth and a token
+budget. The `StructuralReadPort` supplies a pinned generation, live visibility,
+and ordered card hydration. Folder ancestry and field predicates resolve
+asynchronously on that generation within the caller's deadline. Predicates
+that produce ambiguous index matches are verified against retained fields.
+Exact mutation receipts can name a bounded set of
+canonical revisions for immediate search. Wait watermarks require an indexed cut.
+Results carry a `SnapshotCut`, a truncation flag, and any embedding degradation.
+See [search and recall](search.md).
+
 The following 28 tool names are consumer coverage, not a tool registry in core:
 
 | Consumer tools | Typed operations |

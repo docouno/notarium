@@ -10,7 +10,7 @@ use crate::{
     test_support::*,
 };
 use notarium_core::{
-    auth::{ResourceFacts, SecretString},
+    auth::{BranchTaint, ResourceFacts, SecretString},
     classes::*,
     document::ChunkDescriptor,
     epoch::DataRoot,
@@ -103,7 +103,59 @@ struct Setup {
     revision: ControlRevision,
     credential: ProviderCredentialInfo,
     session: SecretString,
+    revoker: Arc<TaintOnRegistration>,
 }
+
+struct TaintOnRegistration {
+    inner: Arc<dyn SessionRevocationPort>,
+    next: Mutex<Option<BranchTaint>>,
+}
+
+impl SessionRevocationPort for TaintOnRegistration {
+    fn register_provider(
+        &self,
+        ctx: MaintenanceContext,
+        selectors: Vec<RevocationSelector>,
+        cancellation: Cancellation,
+    ) -> PortFuture<'_, Box<dyn RevocationLease>> {
+        Box::pin(async move {
+            let lease = self
+                .inner
+                .register_provider(ctx, selectors, cancellation)
+                .await?;
+            if let Some(taint) = self.next.lock().unwrap().take() {
+                taint.mark_external_read();
+            }
+            Ok(lease)
+        })
+    }
+
+    fn fence_provider(
+        &self,
+        ctx: MaintenanceContext,
+        selectors: Vec<RevocationSelector>,
+    ) -> PortFuture<'_, Box<dyn RevocationLease>> {
+        self.inner.fence_provider(ctx, selectors)
+    }
+
+    fn fence_inactive_provider(
+        &self,
+        ctx: MaintenanceContext,
+        call: RequestId,
+    ) -> PortFuture<'_, Option<Box<dyn RevocationLease>>> {
+        self.inner.fence_inactive_provider(ctx, call)
+    }
+
+    fn revoke(
+        &self,
+        ctx: MaintenanceContext,
+        selector: RevocationSelector,
+        reason: RevocationReason,
+    ) -> PortFuture<'_, ()> {
+        self.inner.revoke(ctx, selector, reason)
+    }
+}
+
 async fn keys(fixture: &mut Fixture) -> Arc<Keyring> {
     let value: Value =
         serde_json::from_str(include_str!("../../../tests/fixtures/keyring/vectors.json")).unwrap();
@@ -150,7 +202,12 @@ impl Setup {
     async fn new(pg: bool, label: &str, kind: ProviderWireKind, server: &HttpsFixture) -> Self {
         let mut fixture = Fixture::new(pg, label).await;
         let keys = keys(&mut fixture).await;
-        let control = fixture.service(AuthenticationMode::Password).await.unwrap();
+        let mut control = fixture.service(AuthenticationMode::Password).await.unwrap();
+        let revoker = Arc::new(TaintOnRegistration {
+            inner: control.revoker.clone(),
+            next: Mutex::new(None),
+        });
+        Arc::get_mut(&mut control).unwrap().revoker = revoker.clone();
         let bootstrap = control
             .bootstrap(
                 empty(),
@@ -396,6 +453,7 @@ impl Setup {
             revision: attached.revision,
             credential,
             session,
+            revoker,
         }
     }
     fn completion(&self, id: u8) -> CompletionRequest {
@@ -424,8 +482,8 @@ impl Setup {
             },
         }
     }
-    fn embedding(&self, id: u8) -> EmbeddingRequest {
-        let document = Arc::new(self.document.clone());
+    fn embedding(&self, id: u8, document: &ClassifiedDocument) -> EmbeddingRequest {
+        let document = Arc::new(document.clone());
         let part = ContentPart::from_chunk(
             document.clone(),
             ChunkDescriptor {
@@ -439,17 +497,17 @@ impl Setup {
             },
         )
         .unwrap();
-        EmbeddingRequest {
-            intent: CommandKey::from_bytes([id; 16]),
-            model: ModelProfileId::from_bytes([4; 16]),
-            provider: self.selection.provider.clone(),
-            project: None,
-            chunks: vec![
+        EmbeddingRequest::parts(
+            CommandKey::from_bytes([id; 16]),
+            ModelProfileId::from_bytes([4; 16]),
+            self.selection.provider.clone(),
+            None,
+            vec![
                 ClassEgressFence::provider_part(part, self.ctx.auth(), &self.selection.policy)
                     .unwrap(),
             ],
-            declared_tokens: 3,
-        }
+            3,
+        )
     }
     async fn close(self) {
         self.other_store.close().await;
@@ -519,12 +577,9 @@ async fn gateway(pg: bool, kind: ProviderWireKind, label: &str) {
     let mode = Arc::new(AtomicU8::new(0));
     let response_mode = mode.clone();
     let server = HttpsFixture::start(move |request| {
-        assert!(
-            request
-                .headers
-                .to_lowercase()
-                .contains("authorization: bearer fixture-secret")
-        );
+        let headers = request.headers.to_lowercase();
+        let rotated = headers.contains("authorization: bearer replacement");
+        assert!(rotated || headers.contains("authorization: bearer fixture-secret"));
         assert!(
             request
                 .headers
@@ -532,12 +587,13 @@ async fn gateway(pg: bool, kind: ProviderWireKind, label: &str) {
                 .contains("x-tenant-key: fixture-tenant")
         );
         let reply = if request.path.ends_with("embeddings") || request.path.ends_with("api/embed") {
+            let vector = if rotated { [0.5, 0.25] } else { [0.25, -0.5] };
             Reply::json(match kind {
                 ProviderWireKind::OpenaiCompatible => {
-                    json!({"model":"fixture-embedding","data":[{"index":0,"embedding":[0.25,-0.5]}],"usage":{"prompt_tokens":3,"total_tokens":3}})
+                    json!({"model":"fixture-embedding","data":[{"index":0,"embedding":vector}],"usage":{"prompt_tokens":3,"total_tokens":3}})
                 }
                 ProviderWireKind::Ollama => {
-                    json!({"model":"fixture-embedding","embeddings":[[0.25,-0.5]],"prompt_eval_count":3})
+                    json!({"model":"fixture-embedding","embeddings":[vector],"prompt_eval_count":3})
                 }
             })
         } else if request.method == "GET" {
@@ -604,7 +660,7 @@ async fn gateway(pg: bool, kind: ProviderWireKind, label: &str) {
     }
     let embedding = setup
         .provider
-        .embed(setup.space.clone(), setup.embedding(11))
+        .embed(setup.space.clone(), setup.embedding(11, &setup.document))
         .await
         .unwrap();
     assert_eq!(embedding.vectors, vec![Ok(vec![0.25, -0.5])]);
@@ -703,7 +759,191 @@ async fn gateway(pg: bool, kind: ProviderWireKind, label: &str) {
             .is_ok(),
         "budget_mismatch records audit spend without cross-user 60s DoS lockout"
     );
+    let query = |intent, class| {
+        EmbeddingRequest::query(
+            CommandKey::from_bytes([intent; 16]),
+            ModelProfileId::from_bytes([4; 16]),
+            setup.selection.provider.clone(),
+            EmbeddingQueryInput {
+                text: "related search".into(),
+                tokens: 3,
+                classes: BTreeSet::from([class]),
+                project_scope: None,
+            },
+        )
+    };
+    let disclosed = setup
+        .provider
+        .query_disclosure(
+            setup.space.clone(),
+            setup.selection.provider.clone(),
+            ModelProfileId::from_bytes([4; 16]),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(disclosed, BTreeSet::from([DocClass::UserDoc]));
+    let result = setup
+        .provider
+        .embed(
+            setup.space.clone(),
+            query(100, DocClass::UserDoc).with_runtime_epochs(setup.selection.runtime_epochs),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.vectors, vec![Ok(vec![0.25, -0.5])]);
+    {
+        let requests = requests.lock().unwrap();
+        let body: Value = serde_json::from_slice(&requests.last().unwrap().body).unwrap();
+        assert_eq!(body["input"], json!(["related search"]));
+    }
+    let (indexing, _) = setup
+        .provider
+        .admit_search_indexing(
+            &ServiceAuthority::admit(ServicePurpose::Search),
+            setup.space.scope().clone(),
+            &PrincipalId::from_bytes([100; 16]),
+            &setup.selection.provider,
+            None,
+            budget(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(indexing.auth().principal(), setup.space.auth().principal());
+    assert!(
+        indexing.auth().spaces()[&indexing.scope().space_id]
+            .write_classes
+            .is_empty()
+    );
+    assert!(
+        setup
+            .provider
+            .embed(indexing.clone(), setup.embedding(101, &setup.document))
+            .await
+            .is_ok()
+    );
+    // Personal consent covers the whole Space. Search still binds a selected
+    // project to both the original part and the metadata held by the lease.
+    let project = FolderRef {
+        space_id: indexing.scope().space_id.clone(),
+        folder_id: FolderId::from_bytes([17; 16]),
+    };
+    setup
+        .fixture
+        .catalog
+        .project_entries
+        .lock()
+        .unwrap()
+        .insert(
+            (project.space_id.clone(), project.folder_id.clone()),
+            ProjectInfo {
+                folder: project.clone(),
+                name: "Selected project".into(),
+            },
+        );
+    let space = setup
+        .fixture
+        .catalog
+        .space(budget(), project.space_id.clone())
+        .await
+        .unwrap();
+    let inside = ClassifiedDocument::from_canonical(
+        setup.document.reference().clone(),
+        setup.document.revision().clone(),
+        ResourceFacts {
+            space: space.space,
+            class: DocClass::UserDoc,
+            ancestor_folders: vec![project.folder_id.clone()],
+            folder_write_locked: false,
+            ability_package: None,
+        },
+        Lifecycle::Active,
+        setup
+            .document
+            .explicit_read(setup.ctx.auth())
+            .unwrap()
+            .to_owned(),
+        setup.document.digest(),
+    )
+    .unwrap();
+    let mut scoped = setup.embedding(109, &inside);
+    scoped.project = Some(project.clone());
+    let before = requests.lock().unwrap().len();
+    assert!(matches!(
+        setup.provider.embed(indexing.clone(), scoped).await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+    assert_eq!(requests.lock().unwrap().len(), before);
+    *setup.egress.current.lock().unwrap() = vec![ProviderCurrentContent::Note(inside.metadata())];
+    let mut scoped = setup.embedding(110, &inside);
+    scoped.project = Some(project);
+    assert!(setup.provider.embed(indexing.clone(), scoped).await.is_ok());
+    *setup.egress.current.lock().unwrap() =
+        vec![ProviderCurrentContent::Note(setup.document.metadata())];
     let count = requests.lock().unwrap().len();
+    let stale_epochs = ProviderRuntimeEpochs {
+        resource: (setup.selection.runtime_epochs.resource.get() + 1)
+            .try_into()
+            .unwrap(),
+        ..setup.selection.runtime_epochs
+    };
+    assert!(
+        setup
+            .provider
+            .embed(
+                setup.space.clone(),
+                query(106, DocClass::UserDoc).with_runtime_epochs(stale_epochs),
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(requests.lock().unwrap().len(), count);
+    assert!(matches!(
+        setup
+            .provider
+            .embed(indexing, query(102, DocClass::UserDoc))
+            .await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+    assert!(
+        setup
+            .provider
+            .embed(setup.space.clone(), query(103, DocClass::Profile))
+            .await
+            .is_err()
+    );
+    let auth = setup
+        .provider
+        .control
+        .resolve(evidence(AuthEvidenceKind::Session, setup.session.expose()))
+        .await
+        .unwrap();
+    auth.taint().mark_external_read();
+    let tainted = SpaceContext::new(auth, setup.space.scope().clone(), budget()).unwrap();
+    assert!(matches!(
+        setup
+            .provider
+            .embed(tainted, query(104, DocClass::UserDoc))
+            .await,
+        Err(PortError::Domain(DomainError::CrossSpaceTainted))
+    ));
+    assert_eq!(requests.lock().unwrap().len(), count);
+    let auth = setup
+        .provider
+        .control
+        .resolve(evidence(AuthEvidenceKind::Session, setup.session.expose()))
+        .await
+        .unwrap();
+    let racing = SpaceContext::new(auth, setup.space.scope().clone(), budget()).unwrap();
+    *setup.revoker.next.lock().unwrap() = Some(racing.auth().taint().clone());
+    assert!(matches!(
+        setup
+            .provider
+            .embed(racing, query(105, DocClass::UserDoc))
+            .await,
+        Err(PortError::Domain(DomainError::CrossSpaceTainted)),
+    ));
+    assert_eq!(requests.lock().unwrap().len(), count);
     // A retry still resolves the old intent after mutable configuration changes.
     let changed = setup
         .other
@@ -730,6 +970,48 @@ async fn gateway(pg: bool, kind: ProviderWireKind, label: &str) {
         .await
         .unwrap();
     setup.revision = changed.revision;
+    let rotated = setup
+        .provider
+        .select_provider(
+            setup.space.clone(),
+            SelectProvider {
+                kind: PreferenceModelKind::Embedding,
+                resource: Some(setup.selection.provider.clone()),
+                model: Some(ModelProfileId::from_bytes([4; 16])),
+                project: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rotated.runtime_epochs.resource,
+        setup.selection.runtime_epochs.resource
+    );
+    assert_ne!(
+        rotated.runtime_epochs.credential,
+        setup.selection.runtime_epochs.credential
+    );
+    assert!(
+        setup
+            .provider
+            .embed(
+                setup.space.clone(),
+                query(107, DocClass::UserDoc).with_runtime_epochs(setup.selection.runtime_epochs),
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(requests.lock().unwrap().len(), count);
+    let fresh = setup
+        .provider
+        .embed(
+            setup.space.clone(),
+            query(108, DocClass::UserDoc).with_runtime_epochs(rotated.runtime_epochs),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fresh.vectors, vec![Ok(vec![0.5, 0.25])]);
+    assert_eq!(requests.lock().unwrap().len(), count + 1);
     assert!(matches!(
         complete(&setup.provider, setup.space.clone(), setup.completion(10)).await,
         Err(PortError::Domain(DomainError::ProviderCallAlreadyStarted {
@@ -743,7 +1025,7 @@ async fn gateway(pg: bool, kind: ProviderWireKind, label: &str) {
         complete(&setup.provider, setup.space.clone(), modified).await,
         Err(PortError::Domain(DomainError::IdempotencyKeyReused))
     ));
-    assert_eq!(requests.lock().unwrap().len(), count);
+    assert_eq!(requests.lock().unwrap().len(), count + 1);
     assert_eq!(setup.egress.active.load(Ordering::SeqCst), 0);
     setup.close().await;
 }

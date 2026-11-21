@@ -11,14 +11,14 @@ use notarium_canonical::{
     codec::EFFECT_PAYLOAD_BUDGET_BYTES,
 };
 use notarium_core::{
-    auth::SpaceKind,
+    auth::{EngineAuthContext, SpaceGrant, SpaceKind, SpaceRole, VerifiedHuman},
     classes::DocClass,
     error::{Diagnostic, ValidationReason},
-    ids::{ChatThreadId, HistoryIncarnation, LeaseEpoch, NoteId, SpaceSeq},
+    ids::{ChatThreadId, GrantId, HistoryIncarnation, LeaseEpoch, NoteId, SpaceSeq},
     model::{HistoryScope, Lifecycle},
     ports::{
         BackupParticipantPort, ChangeBroadcast, ChangeKind, ChangeNotice, ChangeRead,
-        ChangeReadResult, PageLimit, SeedPosition, ServicePurpose,
+        ChangeReadResult, PageLimit, SeedPosition, ServicePurpose, SpaceContext,
     },
     query::{FieldObservation, FieldValue},
     receipt::{
@@ -158,6 +158,75 @@ async fn run_changes_and_seed_suite(store: &CanonicalStore, seed: u8) {
 
     assert_eq!(range_ab.first_seq.get(), 101);
     assert_eq!(range_ab.last_seq.get(), 102);
+
+    let search = maintenance_ctx(ServicePurpose::Search);
+    let index_page = store
+        .read_searchable_notes_seed_page(
+            &search.authority,
+            search.budget.clone(),
+            scope1.clone(),
+            None,
+            None,
+            PageLimit::new(1).unwrap(),
+        )
+        .await
+        .expect("read search seed");
+    assert_eq!(index_page.cutoff.after, range_ab.last_seq);
+    assert_eq!(index_page.next_after.as_ref(), Some(&note_a));
+    let indexed = &index_page.notes[0];
+    assert_eq!(indexed.title, "Note A");
+    assert_eq!(indexed.parent_folder_id, s1.root_folder_id);
+    assert_eq!(indexed.revision_actor, actor);
+    assert_eq!(indexed.enclosing_project, None);
+    let next_page = store
+        .read_searchable_notes_seed_page(
+            &search.authority,
+            search.budget.clone(),
+            scope1.clone(),
+            Some(index_page.cutoff.after),
+            index_page.next_after,
+            PageLimit::new(1).unwrap(),
+        )
+        .await
+        .expect("read search seed continuation");
+    assert_eq!(next_page.notes[0].note_id, note_b);
+    assert!(next_page.next_after.is_none());
+    let search_context = SpaceContext::new(
+        EngineAuthContext::for_human(VerifiedHuman::attest(
+            actor.clone(),
+            GrantId::from_bytes([seed; 16]),
+            BTreeMap::from([(
+                scope1.space_id.clone(),
+                SpaceGrant {
+                    role: SpaceRole::Owner,
+                    read_classes: DocClass::all(),
+                    write_classes: DocClass::all(),
+                    project_root: None,
+                },
+            )]),
+            true,
+        )),
+        scope1.clone(),
+        search.budget.clone(),
+    )
+    .unwrap();
+    let overlay = store
+        .read_note_revisions_for_overlay(
+            &search.authority,
+            search_context,
+            index_page.cutoff.after,
+            vec![
+                (note_b.clone(), pairs_ab[0].1.clone()),
+                (note_a.clone(), pairs_ab[0].1.clone()),
+            ],
+        )
+        .await
+        .expect("hydrate only the requested note and revision pair");
+    assert!(overlay[0].1.is_none());
+    let overlay = overlay[1].1.as_ref().unwrap();
+    assert_eq!(overlay.document.revision(), &pairs_ab[0].1);
+    assert_eq!(overlay.path, "note-a.md");
+    assert!(overlay.preview.contains("Body A"));
 
     // Confirm broadcast hint arrived at 102 AFTER commit!
     let adv_102 = sub_at_100.next().await.expect("next").expect("some notice");
@@ -460,6 +529,32 @@ async fn run_changes_and_seed_suite(store: &CanonicalStore, seed: u8) {
         .await
         .expect("purge note_a");
 
+    let stale_search_seed = store
+        .read_searchable_notes_seed_page(
+            &search.authority,
+            search.budget.clone(),
+            scope1.clone(),
+            Some(range_ab.last_seq),
+            None,
+            PageLimit::new(1).unwrap(),
+        )
+        .await;
+    assert_validation_err(&stale_search_seed, ValidationReason::CursorStale);
+    let selected = store
+        .read_note_documents_at_cutoff(
+            &search.authority,
+            search.budget,
+            scope1.clone(),
+            range_ab.last_seq,
+            vec![note_b.clone(), note_a.clone()],
+        )
+        .await
+        .expect("load ordered changes at the pinned cut");
+    assert_eq!(selected[0].0, note_b);
+    assert!(selected[0].1.is_some());
+    assert_eq!(selected[1].0, note_a);
+    assert!(selected[1].1.is_none());
+
     let lag_over_purged = store
         .catch_up(
             maintenance_ctx(ServicePurpose::Projection),
@@ -701,13 +796,14 @@ async fn run_changes_and_seed_suite(store: &CanonicalStore, seed: u8) {
     let cursor_after_p1 = sp1.next.expect("more seed items after page 1");
 
     // Mutate note 4, note 5, thread 1 AND create brand-new note 6 and thread 5 WHILE Seed is mid-flight!
+    let editor = sample_principal_id(seed.wrapping_add(25));
     for idx in [4u16, 5u16, 6u16] {
         let nid = note_id_seq(seed.wrapping_add(2), idx);
         store
             .commit_synthetic_note_batch_for_test(
                 &scope3,
                 epoch,
-                &actor,
+                &editor,
                 vec![SyntheticNoteSpec {
                     note_id: nid,
                     parent_folder: None,
@@ -737,10 +833,67 @@ async fn run_changes_and_seed_suite(store: &CanonicalStore, seed: u8) {
     }
 
     // Both birth and purge occurred after the pinned cut. This fence cannot invalidate it.
-    store
+    let purge_seq = store
         .commit_synthetic_note_purge_for_test(&scope3, epoch, &note_id_seq(seed.wrapping_add(2), 6))
         .await
         .expect("purge the note created after the seed cut");
+
+    let search = maintenance_ctx(ServicePurpose::Search);
+    let fourth = note_id_seq(seed.wrapping_add(2), 4);
+    let fifth = note_id_seq(seed.wrapping_add(2), 5);
+    let sixth = note_id_seq(seed.wrapping_add(2), 6);
+    let old = store
+        .read_searchable_notes_seed_page(
+            &search.authority,
+            search.budget.clone(),
+            scope3.clone(),
+            Some(sp1.cutoff.after),
+            Some(note_id_seq(seed.wrapping_add(2), 3)),
+            PageLimit::new(2).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(old.cutoff, sp1.cutoff);
+    assert!(old.next_after.is_none());
+    assert_eq!(old.notes.len(), 2);
+    for (row, expected) in old.notes.iter().zip([&fourth, &fifth]) {
+        assert_eq!(&row.note_id, expected);
+        assert_eq!(row.document.revision(), &initial_revs[expected]);
+        assert_eq!(row.revision_actor, actor);
+    }
+    let ids = vec![fifth.clone(), sixth, fourth.clone(), fifth.clone()];
+    let selected = store
+        .read_note_documents_at_cutoff(
+            &search.authority,
+            search.budget.clone(),
+            scope3.clone(),
+            sp1.cutoff.after,
+            ids.clone(),
+        )
+        .await
+        .unwrap();
+    assert!(selected.iter().map(|(id, _)| id).eq(&ids));
+    assert!(selected[1].1.is_none());
+    for index in [0, 2, 3] {
+        let row = selected[index].1.as_ref().unwrap();
+        assert_eq!(row.document.revision(), &initial_revs[&ids[index]]);
+        assert_eq!(row.revision_actor, actor);
+    }
+    let current = store
+        .read_searchable_notes_seed_page(
+            &search.authority,
+            search.budget,
+            scope3.clone(),
+            Some(purge_seq),
+            Some(fourth),
+            PageLimit::new(2).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(current.notes.len(), 1);
+    assert_eq!(current.notes[0].note_id, fifth);
+    assert_eq!(current.notes[0].revision_actor, editor);
+    assert_ne!(current.notes[0].document.revision(), &initial_revs[&fifth]);
 
     // Page 2 (`ContinueSeed`) MUST still return pinned cut 9 (2 remaining notes at v1 + 1 thread at head=1)!
     let ChangeReadResult::Seed(sp2) = store
@@ -1014,6 +1167,110 @@ async fn run_changes_and_seed_suite(store: &CanonicalStore, seed: u8) {
         &catch_up_stale_inc,
         ValidationReason::HistoryIncarnationMismatch,
     );
+
+    // Structural folder commands without change_payloads must resolve as
+    // AwaitProjection(Structural) in both receipt resolution and log reads.
+    let before_folder_seq = store
+        .read_space(&scope1.space_id)
+        .await
+        .expect("read space1 head")
+        .last_seq;
+    let structural_folder = sample_folder_id(seed.wrapping_add(0x41));
+    let (_, folder_rev, create_folder_seq) = store
+        .create_folder(notarium_canonical::CreateFolderSpec {
+            scope: scope1.clone(),
+            active_epoch: epoch,
+            folder_id: structural_folder.clone(),
+            parent: None,
+            slug: "structural-receipt-folder".to_owned(),
+            display_name: "Structural receipt folder".to_owned(),
+            is_project: false,
+            project_slug: None,
+            actor: actor.clone(),
+            timestamp: None,
+        })
+        .await
+        .expect("create folder for structural receipt check");
+    let (trashed_rev, trash_folder_seq) = store
+        .set_folder_lifecycle(
+            &scope1,
+            epoch,
+            &structural_folder,
+            &folder_rev,
+            Lifecycle::Trashed,
+            &actor,
+            None,
+        )
+        .await
+        .expect("trash folder for structural receipt check");
+    let (_, restore_folder_seq) = store
+        .set_folder_lifecycle(
+            &scope1,
+            epoch,
+            &structural_folder,
+            &trashed_rev,
+            Lifecycle::Active,
+            &actor,
+            None,
+        )
+        .await
+        .expect("restore folder for structural receipt check");
+    for seq in [create_folder_seq, trash_folder_seq, restore_folder_seq] {
+        let token = MutationReceiptToken::new(scope1.clone(), seq).unwrap();
+        let set = ReceiptSet::new([token.clone()]).unwrap();
+        let resolved = store
+            .resolve_receipt_effects(&scope1, &set)
+            .await
+            .expect("resolve structural folder receipt");
+        assert_eq!(resolved.len(), 1);
+        assert!(matches!(
+            resolved[0].effect,
+            MutationEffect::AwaitProjection {
+                reason: AwaitReason::Structural
+            }
+        ));
+        let decision = plan_overlay(
+            &scope1,
+            before_folder_seq,
+            &set,
+            &resolved,
+            EFFECT_PAYLOAD_BUDGET_BYTES,
+        )
+        .expect("plan overlay for structural folder receipt");
+        assert!(matches!(
+            decision,
+            OverlayDecision::AwaitProjection {
+                reason: AwaitReason::Structural,
+                ..
+            }
+        ));
+    }
+    let ChangeReadResult::Log(folder_log) = store
+        .catch_up(
+            maintenance_ctx(ServicePurpose::Projection),
+            ChangeRead::Log {
+                after: ChangeCursor {
+                    scope: scope1.clone(),
+                    after: before_folder_seq,
+                },
+                through: restore_folder_seq,
+                limit: PageLimit::new(10).unwrap(),
+            },
+        )
+        .await
+        .expect("read folder structural log page")
+    else {
+        panic!("expected ChangeReadResult::Log");
+    };
+    assert_eq!(folder_log.changes.len(), 3);
+    for change in &folder_log.changes {
+        assert!(matches!(
+            change.effect,
+            MutationEffect::AwaitProjection {
+                reason: AwaitReason::Structural
+            }
+        ));
+    }
 }
 
 // Exercise real command entrypoints in both directions, including a retry after the base head moved.

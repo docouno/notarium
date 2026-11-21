@@ -84,10 +84,10 @@ pub(super) async fn epochs(
         Ok(None)
     }
 }
-pub(super) async fn epochs_read(
+pub(super) async fn credential_for_selection(
     tx: &mut Transaction,
     resource: &ProviderResourcesRow,
-) -> Result<Option<i64>, PortError> {
+) -> Result<Option<CredentialsRow>, PortError> {
     if resource.disabled_at.is_some() {
         return Err(DomainError::AccessDenied.into());
     }
@@ -97,7 +97,7 @@ pub(super) async fn epochs_read(
         if credential.disabled_at.is_some() {
             return Err(DomainError::AccessDenied.into());
         }
-        Ok(Some(credential.consent_epoch))
+        Ok(Some(credential))
     } else {
         Ok(None)
     }

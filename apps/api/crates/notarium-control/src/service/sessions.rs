@@ -149,6 +149,33 @@ impl ControlService {
     ) -> Result<EngineAuthContext, PortError> {
         let now = self.clock.now_ms()?;
         match &credential {
+            AuthenticatedCredential::SearchIndexing { space, .. } => {
+                let source = grant("search-indexing", &current_user.user_id);
+                let space = space.clone();
+                let auth = self
+                    .human_context(
+                        tx,
+                        current_user,
+                        credential.clone(),
+                        source.clone(),
+                        false,
+                        false,
+                        lock,
+                    )
+                    .await?;
+                let mut membership = auth.spaces().get(&space).cloned().ok_or_else(denied)?;
+                membership.role = SpaceRole::Viewer;
+                membership.write_classes.clear();
+                Ok(EngineAuthContext::for_human(
+                    VerifiedHuman::attest(
+                        auth.principal().clone(),
+                        source,
+                        BTreeMap::from([(space, membership)]),
+                        false,
+                    )
+                    .with_credential(credential),
+                ))
+            }
             AuthenticatedCredential::ScheduledRun { .. } => {
                 self.scheduled_context(tx, current_user, credential, lock, keeper)
                     .await
@@ -269,6 +296,48 @@ impl ControlService {
                     .map_err(Into::into)
             }
         }
+    }
+    pub(super) async fn admit_search_indexing(
+        &self,
+        authority: &ServiceAuthority,
+        space: &CatalogSpace,
+        revision_actor: &PrincipalId,
+        provider: &ProviderResourceId,
+        budget: CallBudget,
+    ) -> Result<SpaceContext, PortError> {
+        authority.require(ServicePurpose::Search)?;
+        let budget_guard = OperationBudget::new(budget.clone());
+        let mut tx = self.store.read(budget_guard.clone()).await?;
+        let auth = budget_guard
+            .run(
+                async {
+                    let user = match space.space.kind {
+                        SpaceKind::Shared => user_read(tx.inner_mut(), revision_actor.as_str()).await?,
+                        SpaceKind::Personal => rows!(
+                            tx.inner_mut(), UsersRow, fetch_optional,
+                            "SELECT u.* FROM users u JOIN space_members m ON u.user_id=m.user_id WHERE u.personal_space_id=$1 AND m.space_id=$1 AND m.role='owner' AND m.admission='active'",
+                            "SELECT u.* FROM v1_control.users u JOIN v1_control.space_members m ON u.user_id=m.user_id WHERE u.personal_space_id=$1 AND m.space_id=$1 AND m.role='owner' AND m.admission='active'";
+                            space.space.id.as_str()
+                        )?.ok_or_else(denied)?,
+                    };
+                    self.credential_context(
+                        tx.inner_mut(),
+                        &user,
+                        AuthenticatedCredential::SearchIndexing {
+                            space: space.space.id.clone(),
+                            provider: provider.clone(),
+                        },
+                        false, false, false, None,
+                    ).await
+                },
+                CommitEffect::NotCommitted,
+            )
+            .await?;
+        budget_guard
+            .run(tx.rollback(), CommitEffect::NotCommitted)
+            .await?;
+        let budget = budget_guard.context(budget.request);
+        SpaceContext::new(auth, space.history.clone(), budget).map_err(Into::into)
     }
     pub async fn resolve(&self, ctx: PreAuthContext) -> Result<EngineAuthContext, PortError> {
         let budget = OperationBudget::new(ctx.budget);

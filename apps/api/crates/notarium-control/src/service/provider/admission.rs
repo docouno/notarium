@@ -48,6 +48,7 @@ pub(super) struct DispatchAuthority<'a> {
     pub primary: Option<&'a CatalogSpace>,
     pub project: Option<&'a FolderRef>,
     pub parts: &'a [ProviderMessage],
+    pub embedding_inputs: &'a [EmbeddingInput],
     pub current: &'a [ProviderCurrentContent],
     pub keeper: Option<&'a crate::service::schedules::PrecheckedKeeper>,
 }
@@ -123,6 +124,7 @@ impl ProviderService {
             primary,
             project,
             parts,
+            embedding_inputs,
             current,
             keeper,
         } = authority;
@@ -137,6 +139,23 @@ impl ProviderService {
             .control
             .revalidate_with_keeper(tx, ctx.auth(), keeper)
             .await?;
+        let indexing_project =
+            if let Some(AuthenticatedCredential::SearchIndexing { space, provider }) =
+                auth.credential()
+            {
+                if provider.as_str() != snapshot.resource.id
+                    || primary.is_none_or(|primary| &primary.space.id != space)
+                    || embedding_inputs.is_empty()
+                    || embedding_inputs
+                        .iter()
+                        .any(|input| !matches!(input, EmbeddingInput::Part(_)))
+                {
+                    return Err(DomainError::AccessDenied.into());
+                }
+                project
+            } else {
+                None
+            };
         let resource = resource(tx, &snapshot.resource.id).await?;
         if resource.owner_id != snapshot.resource.owner_id
             || resource.runtime_epoch != snapshot.resource.runtime_epoch
@@ -222,6 +241,27 @@ impl ProviderService {
                 .await?,
             );
         }
+        for input in embedding_inputs {
+            let EmbeddingInput::Query(query) = input else {
+                continue;
+            };
+            if auth.taint().is_tainted() {
+                return Err(DomainError::CrossSpaceTainted.into());
+            }
+            let admitted = primary
+                .and_then(|primary| policies.get(&primary.space.id))
+                .ok_or_else(selection::unavailable)?;
+            if admitted
+                .project_only
+                .as_ref()
+                .is_some_and(|required| query.project_scope.as_ref() != Some(required))
+            {
+                return Err(DomainError::AccessDenied.into());
+            }
+            if !query.classes.is_subset(&admitted.policy.allowed_classes) {
+                return Err(invalid(ValidationReason::ClassEgressForbidden));
+            }
+        }
         let mut used = std::collections::BTreeSet::new();
         for part in parts {
             let origin = json(&part.origin())?;
@@ -235,6 +275,7 @@ impl ProviderService {
             if admitted
                 .project_only
                 .as_ref()
+                .or(indexing_project)
                 .is_some_and(|project| !part.in_project(project) || !metadata.in_project(project))
             {
                 return Err(DomainError::AccessDenied.into());
@@ -259,7 +300,7 @@ impl ProviderService {
             AuthenticatedCredential::Session(id)=>{selectors.push(RevocationSelector::Session(id.clone()));Some(rows!(tx,(i64,),fetch_one,"SELECT expires_at FROM sessions WHERE session_id=$1","SELECT expires_at FROM v1_control.sessions WHERE session_id=$1";id.as_str())?.0)},
             AuthenticatedCredential::Pat(id)=>rows!(tx,(Option<i64>,),fetch_one,"SELECT expires_at FROM pats WHERE token_id=$1","SELECT expires_at FROM v1_control.pats WHERE token_id=$1";id.as_str())?.0,
             AuthenticatedCredential::OAuth{token,grant,family}=>{selectors.push(RevocationSelector::OAuthAccess(token.clone()));selectors.push(RevocationSelector::OAuthGrant(grant.clone()));if let Some(family)=family{selectors.push(RevocationSelector::OAuthFamily(family.clone()));}Some(rows!(tx,(i64,),fetch_one,"SELECT expires_at FROM oauth_access_tokens WHERE token_id=$1","SELECT expires_at FROM v1_control.oauth_access_tokens WHERE token_id=$1";token.as_str())?.0)},
-            AuthenticatedCredential::TrustedNone=>None,
+            AuthenticatedCredential::TrustedNone | AuthenticatedCredential::SearchIndexing { .. }=>None,
             AuthenticatedCredential::ScheduledRun{schedule,run,..}=>{
                 selectors.push(RevocationSelector::Schedule(schedule.clone()));
                 selectors.push(RevocationSelector::ScheduledRun(run.clone()));

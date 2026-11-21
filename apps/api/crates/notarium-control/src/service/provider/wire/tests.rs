@@ -299,6 +299,10 @@ fn encoded_requests_keep_base_paths_roles_tools_and_conservative_limits() {
             project: None,
             provider: ProviderResourceId::from_bytes([1; 16]),
             model: model.id.clone(),
+            runtime_epochs: ProviderRuntimeEpochs {
+                resource: std::num::NonZeroU64::MIN,
+                credential: None,
+            },
             policy: ProviderPolicy {
                 provider: ProviderResourceId::from_bytes([1; 16]),
                 audience: ProviderAudience::Personal { consented: true },

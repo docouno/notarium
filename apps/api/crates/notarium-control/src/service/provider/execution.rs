@@ -192,12 +192,20 @@ impl Job {
                 .flat_map(|message| message.parts.iter().cloned())
                 .collect(),
             Request::Embedding(request) => request
-                .chunks
+                .inputs
                 .iter()
-                .cloned()
-                .map(ProviderMessage::Part)
+                .filter_map(|input| match input {
+                    EmbeddingInput::Part(part) => Some(ProviderMessage::Part(part.clone())),
+                    EmbeddingInput::Query(_) => None,
+                })
                 .collect(),
             Request::Check(_) => vec![],
+        }
+    }
+    pub fn embedding_inputs(&self) -> &[EmbeddingInput] {
+        match &self.request {
+            Request::Embedding(request) => &request.inputs,
+            _ => &[],
         }
     }
     pub fn egress(&self, parts: &[ProviderMessage]) -> Result<ProviderEgressRequest, PortError> {

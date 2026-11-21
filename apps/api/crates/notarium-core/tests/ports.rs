@@ -1153,6 +1153,27 @@ impl StructuralSnapshot for PinnedGraph {
             .cloned()
             .ok_or(DomainError::ResourceNotFound)
     }
+    fn doc_class(&self, node: DenseNodeId) -> notarium_core::DomainResult<DocClass> {
+        self.note_id(node)?;
+        Ok(DocClass::UserDoc)
+    }
+    fn folder_descendants<'a>(&'a self, folder: &'a FolderId) -> PortFuture<'a, Vec<FolderId>> {
+        Box::pin(async move { Ok(vec![folder.clone()]) })
+    }
+    fn enclosing_project<'a>(&'a self, _: &'a FolderId) -> PortFuture<'a, Option<FolderId>> {
+        Box::pin(async move { Ok(None) })
+    }
+    fn filter_notes<'a>(
+        &'a self,
+        filter: &'a FieldFilterAstV1,
+    ) -> PortFuture<'a, Option<DenseNodeIter<'a>>> {
+        Box::pin(async move {
+            match &filter.predicate {
+                Predicate::All(predicates) if predicates.is_empty() => Ok(None),
+                _ => Ok(Some(DenseNodeIter::from_slice(self.0.cut.generation, &[]))),
+            }
+        })
+    }
     fn folder_subtree(&self, _: &FolderId) -> notarium_core::DomainResult<DenseNodeIter<'_>> {
         Ok(DenseNodeIter::from_iter(
             self.0.cut.generation,

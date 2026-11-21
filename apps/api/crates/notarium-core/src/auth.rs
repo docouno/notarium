@@ -49,6 +49,11 @@ pub enum AuthenticatedCredential {
         run: AgentRunId,
         lease: LeaseEpoch,
     },
+    /// Internal, read-only authority scoped to one search indexing destination.
+    SearchIndexing {
+        space: SpaceId,
+        provider: ProviderResourceId,
+    },
     TrustedNone,
 }
 
@@ -550,6 +555,20 @@ impl EngineAuthContext {
         project: Option<&FolderId>,
         tainted: bool,
     ) -> DomainResult<()> {
+        self.can_view_chat(space, project, tainted)?;
+        if tainted || self.write_space.as_ref().is_some_and(|id| id != &space.id) {
+            self.taint.mark_external_read();
+        }
+        Ok(())
+    }
+
+    /// Chat visibility check for candidate filtering without recording a read.
+    pub fn can_view_chat(
+        &self,
+        space: &Space,
+        project: Option<&FolderId>,
+        tainted: bool,
+    ) -> DomainResult<()> {
         let grant = self
             .spaces
             .get(&space.id)
@@ -564,9 +583,6 @@ impl EngineAuthContext {
         }
         if tainted && space.kind == SpaceKind::Shared {
             return Err(DomainError::CrossSpaceTainted);
-        }
-        if tainted || self.write_space.as_ref().is_some_and(|id| id != &space.id) {
-            self.taint.mark_external_read();
         }
         Ok(())
     }

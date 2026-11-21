@@ -85,15 +85,7 @@ impl CanonicalStore {
                         .map(|selection| selection.receipt.seq())
                         .max()
                         .unwrap_or(base_seq);
-                    const MAX_OVERLAY_INTERVENING_LAG: u64 = 4_096;
-                    if max_cutoff.get().saturating_sub(base_seq.get()) > MAX_OVERLAY_INTERVENING_LAG
-                    {
-                        return Ok(None);
-                    }
-                    if max_cutoff > base_seq
-                        && has_intervening_schema_or_folder_change(tx, &scope, base_seq, max_cutoff)
-                            .await?
-                    {
+                    if !structural_overlay_supported(tx, &scope, base_seq, max_cutoff).await? {
                         return Ok(None);
                     }
                     let anchor = rank_anchor(tx, &scope).await?;
@@ -199,13 +191,20 @@ fn matches_rank_version(
     }
 }
 
-async fn has_intervening_schema_or_folder_change(
+pub(crate) async fn structural_overlay_supported(
     tx: &mut crate::sql_exec::BackendConn<'_>,
     scope: &HistoryScope,
     after: SpaceSeq,
     through: SpaceSeq,
 ) -> Result<bool, PortError> {
     use crate::{codec::internal_not_committed, runtime::pg_read_error, sql_exec::BackendConn};
+    const MAX_OVERLAY_INTERVENING_LAG: u64 = 4_096;
+    if through <= after {
+        return Ok(true);
+    }
+    if through.get() - after.get() > MAX_OVERLAY_INTERVENING_LAG {
+        return Ok(false);
+    }
     const SQL: &str = "SELECT CAST(CASE WHEN EXISTS(
             SELECT 1 FROM space_field_schemas
             WHERE space_id = $1 AND visibility_seq > $2 AND visibility_seq <= $3
@@ -224,5 +223,5 @@ async fn has_intervening_schema_or_folder_change(
         after.get() as i64,
         through.get() as i64,
     )?;
-    Ok(changed != 0)
+    Ok(changed == 0)
 }
