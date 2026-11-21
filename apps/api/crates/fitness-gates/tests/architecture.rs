@@ -85,7 +85,6 @@ fn validate_shards(config: &Value, workspace: &BTreeSet<&str>) {
                 "needs_build_api",
                 "saves_fixture_cache",
                 "runs_doc_tests",
-                "prebuild_examples",
             ],
         );
         let id = shard["id"].as_str().unwrap();
@@ -99,29 +98,19 @@ fn validate_shards(config: &Value, workspace: &BTreeSet<&str>) {
         let needs_build_api = shard["needs_build_api"].as_bool().unwrap();
         fixture_writers += usize::from(shard["saves_fixture_cache"].as_bool().unwrap());
         doc_runners += usize::from(shard["runs_doc_tests"].as_bool().unwrap());
-        let mut crates = BTreeSet::new();
-        for krate in shard["crates"].as_array().unwrap() {
+        let crates = shard["crates"].as_array().unwrap();
+        for krate in crates {
             let name = krate.as_str().unwrap();
             assert!(
                 assigned.insert(name),
                 "crate {name} assigned more than once"
             );
-            crates.insert(name);
         }
         assert!(!crates.is_empty(), "shard {id} has no crates");
         assert!(
-            !crates.contains("fitness-gates") || needs_build_api,
+            !crates.iter().any(|krate| krate == "fitness-gates") || needs_build_api,
             "fitness-gates requires build-api"
         );
-        for example in shard["prebuild_examples"].as_array().unwrap() {
-            assert_json_fields(example, &["package", "example"]);
-            let package = example["package"].as_str().unwrap();
-            assert!(
-                crates.contains(package),
-                "example package {package} is outside shard {id}"
-            );
-            assert!(!example["example"].as_str().unwrap().is_empty());
-        }
     }
     assert_eq!(
         &assigned, workspace,
@@ -160,26 +149,6 @@ fn ci_api_shards_cover_all_workspace_members_exactly() {
     )
     .expect("parse API shard manifest");
     validate_shards(&config, &workspace);
-
-    for shard in config["shards"].as_array().unwrap() {
-        for example in shard["prebuild_examples"].as_array().unwrap() {
-            let package = packages
-                .iter()
-                .find(|pkg| pkg["name"] == example["package"])
-                .unwrap();
-            assert!(
-                package["targets"].as_array().unwrap().iter().any(|target| {
-                    target["name"] == example["example"]
-                        && target["kind"]
-                            .as_array()
-                            .unwrap()
-                            .iter()
-                            .any(|kind| kind == "example")
-                }),
-                "unknown prebuild example {example}"
-            );
-        }
-    }
 }
 
 #[test]
@@ -189,9 +158,9 @@ fn invalid_ci_api_shards_are_rejected() {
         "feature_anchor_crates": ["notarium-bin"],
         "shards": [
             {"id": "bin", "crates": ["notarium-bin", "another-crate"], "needs_build_api": false,
-             "saves_fixture_cache": true, "runs_doc_tests": false, "prebuild_examples": []},
+             "saves_fixture_cache": true, "runs_doc_tests": false},
             {"id": "fitness", "crates": ["fitness-gates"], "needs_build_api": true,
-             "saves_fixture_cache": false, "runs_doc_tests": true, "prebuild_examples": []}
+             "saves_fixture_cache": false, "runs_doc_tests": true}
         ]
     });
     let workspace = BTreeSet::from(["notarium-bin", "another-crate", "fitness-gates"]);
@@ -209,10 +178,6 @@ fn invalid_ci_api_shards_are_rejected() {
         ("/shards/1/saves_fixture_cache", json!(true)),
         ("/shards/1/runs_doc_tests", json!(false)),
         ("/shards/0/runs_doc_tests", json!(true)),
-        (
-            "/shards/0/prebuild_examples",
-            json!([{"package": "fitness-gates", "example": "foreign"}]),
-        ),
     ];
     for (field, replacement) in invalid_fields {
         let mut config = valid.clone();

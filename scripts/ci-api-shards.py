@@ -77,7 +77,7 @@ def validate_manifest(data, members):
     ids, assigned = set(), set()
     flags = ("needs_build_api", "saves_fixture_cache", "runs_doc_tests")
     for shard in shards:
-        require_fields(shard, ("id", "crates", "prebuild_examples", *flags), "shard")
+        require_fields(shard, ("id", "crates", *flags), "shard")
         shard_id = shard["id"]
         require(matches(ID, shard_id), f"invalid shard id: {shard_id!r}")
         require(shard_id not in ids, f"duplicate shard id: {shard_id}")
@@ -93,12 +93,6 @@ def validate_manifest(data, members):
             assigned.add(name)
         if "fitness-gates" in crates:
             require(shard["needs_build_api"], "the fitness-gates shard requires build-api")
-        examples = shard["prebuild_examples"]
-        require(isinstance(examples, list), f"{shard_id}.prebuild_examples must be an array")
-        for example in examples:
-            require_fields(example, ("package", "example"), f"{shard_id} example")
-            require(example["package"] in crates and matches(CARGO_NAME, example["example"]),
-                    f"invalid prebuild example in {shard_id}: {example!r}")
 
     require(assigned == set(members), f"unassigned packages: {sorted(set(members) - assigned)}")
     for field in ("saves_fixture_cache", "runs_doc_tests"):
@@ -222,10 +216,7 @@ def run_shard(data, members, shard_id):
                 if pkg["id"] in workspace and wanted.get(pkg["manifest_path"]) == pkg["name"]}
     require(len(selected) == len(wanted), "Cargo metadata does not match the shard manifest")
     anchors = data["feature_anchor_crates"]
-    for example in shard["prebuild_examples"]:
-        subprocess.run([*devkit, "cargo", "build", "--locked", "--offline",
-                        *package_flags([example["package"], *anchors]),
-                        f"--example={example['example']}"], cwd=ROOT, check=True)
+    # Default test target selection also builds examples such as live_s3_acceptance.
     events = subprocess.check_output(
         [*devkit, "cargo", "test", "--locked", "--offline", "--no-run",
          "--message-format=json-render-diagnostics", *package_flags([*shard["crates"], *anchors])],
