@@ -634,7 +634,10 @@ pub(crate) async fn schema_at(
 // the cut. Ability publishers can change attachment without a note revision.
 macro_rules! note_snapshot_sql {
     () => {
-        "SELECT h.note_id, h.created_at_sec, CAST(h.created_at_nsec AS BIGINT),
+        note_snapshot_sql!("h.created_seq")
+    };
+    ($created_seq:literal) => {
+        concat!("SELECT h.note_id, h.created_at_sec, CAST(h.created_at_nsec AS BIGINT),
             r.rev_id, r.visibility_seq, r.created_at_sec, CAST(r.created_at_nsec AS BIGINT),
             r.content_blake3, r.metadata_msgpack, b.rev_id, b.metadata_msgpack, r.actor_id
          FROM note_heads h
@@ -655,10 +658,10 @@ macro_rules! note_snapshot_sql {
               AND x.visibility_seq <= $3 AND x.history_incarnation = $2
             ORDER BY x.visibility_seq DESC, x.space_seq DESC LIMIT 1
          )
-         WHERE h.space_id = $1 AND h.created_seq <= $3 AND NOT EXISTS (
+         WHERE h.space_id = $1 AND ", $created_seq, " <= $3 AND NOT EXISTS (
             SELECT 1 FROM revision_purge_fences p
             WHERE p.space_id = h.space_id AND p.note_id = h.note_id
-         ) AND "
+         ) AND ")
     };
 }
 
@@ -839,16 +842,7 @@ pub(super) async fn notes_at_batch(
         BackendConn::Sqlite(conn) => {
             let mut acc = Vec::with_capacity(ids.len());
             for chunk in ids.chunks(200) {
-                let mut sql = String::from(note_snapshot_sql!());
-                sql.push_str(" h.note_id IN (");
-                for i in 0..chunk.len() {
-                    if i > 0 {
-                        sql.push_str(", ");
-                    }
-                    use std::fmt::Write;
-                    let _ = write!(sql, "${}", i + 4);
-                }
-                sql.push(')');
+                let sql = sqlite_selected_note_sql(chunk.len());
                 let mut query = sqlx::query_as::<_, NoteRow>(sqlx::AssertSqlSafe(sql))
                     .bind(space)
                     .bind(incarnation)
@@ -870,6 +864,41 @@ pub(super) async fn notes_at_batch(
         out.insert(note.metadata.note_id.clone(), note);
     }
     Ok(out)
+}
+
+fn sqlite_selected_note_sql(count: usize) -> String {
+    // Both operands are integers. Unary + keeps the cutoff check but prevents
+    // SQLite from scanning every earlier head instead of seeking the given IDs.
+    let mut sql = String::from(note_snapshot_sql!("+h.created_seq"));
+    sql.push_str(" h.note_id IN (");
+    for i in 0..count {
+        if i > 0 {
+            sql.push_str(", ");
+        }
+        use std::fmt::Write;
+        let _ = write!(sql, "${}", i + 4);
+    }
+    sql.push(')');
+    sql
+}
+
+#[test]
+fn sqlite_selected_notes_seek_the_requested_ids() {
+    let db = rusqlite::Connection::open_in_memory().unwrap();
+    db.execute_batch(crate::schema::SQLITE_BASELINE_DDL)
+        .unwrap();
+    let sql = format!("EXPLAIN QUERY PLAN {}", sqlite_selected_note_sql(50));
+    let mut statement = db.prepare(&sql).unwrap();
+    let mut rows = statement.raw_query();
+    let mut plan = Vec::new();
+    while let Some(row) = rows.next().unwrap() {
+        plan.push(row.get::<_, String>(3).unwrap());
+    }
+    assert!(
+        plan.iter()
+            .any(|step| step.contains("SEARCH h ") && step.contains("(space_id=? AND note_id=?)")),
+        "{plan:?}"
+    );
 }
 
 pub(super) async fn folders_at_batch(
