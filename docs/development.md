@@ -53,36 +53,6 @@ runs within one checkout and removes its container and scratch directory on
 clean exit; logs remain in `.artifacts/control-db-fixture/` when a run fails.
 No host PostgreSQL installation is required.
 
-## Continuous integration
-
-Pull requests against `v1` and pushes to `v1` run public documentation and shard
-configuration checks first. For a verified docs-only PR, the workflow skips
-the code jobs. The allowlist covers `docs/**`, `README.md`, `AGENTS.md`, and
-`LICENSE`. Every push and every other PR runs the full workflow.
-
-- `node` checks, tests and builds the four Node components in their workspace.
-- `api-check` checks Rust formatting, lints all targets and runs
-  `make build app=api`.
-- `api-discovery` enumerates tests across the Cargo workspace and rejects
-  ignored tests. It runs independently of lint and the build.
-- Five `api-test` shards run the offline Rust tests with isolated fixture
-  stacks. Each workspace crate belongs to exactly one shard. The platform
-  shard also runs all workspace doc tests. [Shard manifest](../scripts/ci-api-shards.json)
-- The required `verify` job passes only when the planning job and all required
-  jobs succeed, or when planning confirms a docs-only PR and all code jobs
-  were skipped. For a code run, it also checks the latest result of each shard
-  through the GitHub Actions jobs API.
-
-CI caches Node and Rust tooling separately. Only `api-check` saves the pruned
-Cargo dependency artifacts, which the shards can restore. The desktop and
-storage fixture images have separate recipe-keyed caches. The Rust check and
-discovery jobs set `NOTARIUM_SKIP_API_FIXTURES=1` on `make setup app=api` to omit
-fixture images. Test runs require the regular setup.
-
-After making changes, run `make setup`, `make check`, `make test`, and
-`make build` locally. To reproduce one CI shard after setup, run
-`sh scripts/ci-run-api-shard.sh canonical` with Python 3.11 or newer on the host.
-
 ## Dependencies and ownership
 
 `.devkit/manifest.json`, generated projections (including `.devkit/runtime/api.env`
@@ -173,6 +143,40 @@ old worktree and remove it with `wt remove --no-hooks <branch>`, because `0.4.1`
 Use `umask 022` so container mounts can read new source files. Keep temporary
 evidence in ignored `.artifacts/<task>/`, respect real cgroup quotas and run heavy
 checks sequentially. Stop only this checkout's services.
+
+## Continuous integration
+
+Pull requests against `v1` and pushes to `v1` run public documentation and shard
+configuration checks first. For a verified docs-only PR, the workflow skips
+the code jobs. The allowlist covers `docs/**`, `README.md`, `AGENTS.md`, and
+`LICENSE`. Every push and every other PR runs the full workflow.
+
+- `node` checks, tests and builds the four Node components in their workspace.
+- `api-check` checks Rust formatting, lints all targets and runs
+  `make build app=api`.
+- `api-discovery` enumerates tests across the Cargo workspace and rejects
+  ignored tests. It runs independently of lint and the build.
+- Five `api-test` shards run the offline Rust tests with isolated fixture
+  stacks. Each workspace crate belongs to exactly one shard. The platform
+  shard also runs all workspace doc tests. [Shard manifest](../scripts/ci-api-shards.json)
+- The required `verify` job passes only when the planning job and all required
+  jobs succeed, or when planning confirms a docs-only PR and all code jobs
+  were skipped. For a code run, it also checks the latest result of each shard
+  through the GitHub Actions jobs API.
+
+CI caches Node and Rust tooling separately. Only `api-check` saves the pruned
+Cargo dependency artifacts, which the shards can restore. The desktop and
+storage fixture images have separate recipe-keyed caches. The Rust check and
+discovery jobs set `NOTARIUM_SKIP_API_FIXTURES=1` on `make setup app=api` to omit
+fixture images. Test runs require the regular setup.
+
+Shard builds include the storage test-support features enabled by the full
+workspace. When changing Cargo features or shard membership, compare the test
+executables with those selected by `cargo test --workspace --no-run`.
+
+After making changes, run `make setup`, `make check`, `make test`, and
+`make build` locally. To reproduce one CI shard after setup, run
+`sh scripts/ci-run-api-shard.sh canonical` with Python 3.11 or newer on the host.
 
 ## Core and syntax gates
 

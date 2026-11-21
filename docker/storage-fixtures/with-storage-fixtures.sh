@@ -7,8 +7,6 @@ umask 022
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd -P)
 COMPOSE_FILE="$ROOT/compose.storage-tests.yaml"
 PG_IMAGE="postgres:16-bookworm@sha256:a49f7438ba03589f9b1ca062f2da82e899b48ea1dc50d2449fa09a70be83ebca"
-MINIO_IMAGE="notarium-storage-fixture-minio-ce:9e49d5e7a648"
-BRIDGE_IMAGE="notarium-storage-fixture-uds-bridge:local"
 
 CHECKOUT_HASH=$(printf '%s' "$ROOT" | sha256sum | cut -c1-12)
 FIXTURES_BASE="$ROOT/.artifacts/storage-tests"
@@ -51,6 +49,13 @@ sweep_stale_runs() {
 }
 
 recipe_sha256() {
+  # Dockerfile-specific ignore rules take precedence over the context-wide file.
+  if [ -f "$ROOT/$1.dockerignore" ]; then
+    set -- "$@" "$1.dockerignore"
+  elif [ -f "$ROOT/.dockerignore" ]; then
+    set -- "$@" .dockerignore
+  fi
+  set -- compose.storage-tests.yaml "$@"
   recipe=
   for input in "$@"; do
     digest=$(sha256sum <"$ROOT/$input") || fail "cannot hash fixture recipe input: $input"
@@ -63,9 +68,11 @@ ${digest%% *}
 }
 
 export_recipe_shas() {
-  NOTARIUM_MINIO_RECIPE_SHA256=$(recipe_sha256 compose.storage-tests.yaml docker/storage-fixtures/minio-ce.Dockerfile)
-  NOTARIUM_BRIDGE_RECIPE_SHA256=$(recipe_sha256 compose.storage-tests.yaml docker/storage-fixtures/uds-bridge.Dockerfile docker/storage-fixtures/uds_tcp_bridge.rs)
+  NOTARIUM_MINIO_RECIPE_SHA256=$(recipe_sha256 docker/storage-fixtures/minio-ce.Dockerfile)
+  NOTARIUM_BRIDGE_RECIPE_SHA256=$(recipe_sha256 docker/storage-fixtures/uds-bridge.Dockerfile docker/storage-fixtures/uds_tcp_bridge.rs)
   export NOTARIUM_MINIO_RECIPE_SHA256 NOTARIUM_BRIDGE_RECIPE_SHA256
+  MINIO_IMAGE="notarium-storage-fixture-minio-ce:$NOTARIUM_MINIO_RECIPE_SHA256"
+  BRIDGE_IMAGE="notarium-storage-fixture-uds-bridge:$NOTARIUM_BRIDGE_RECIPE_SHA256"
 }
 
 fixture_image_id() {
@@ -122,6 +129,7 @@ case "${1:-}" in
     ;;
   fixture-images)
     [ "$#" -eq 1 ] || fail "usage: fixture-images"
+    export_recipe_shas
     printf '%s\n' "$MINIO_IMAGE" "$BRIDGE_IMAGE"
     exit 0
     ;;
@@ -139,8 +147,7 @@ export_recipe_shas
 docker image inspect "$PG_IMAGE" >/dev/null 2>&1 || \
   fail "missing fixture image '$PG_IMAGE'; run 'make setup app=api' first"
 if [ "$projection_benchmark" = 0 ]; then
-  # Pin the inspected IDs so another checkout can retag its builds while this
-  # run waits for the fixture lock. Compose uses these IDs with --pull never.
+  # A forced rebuild can retag the same recipe while this run waits for the lock.
   NOTARIUM_MINIO_FIXTURE_IMAGE=$(fixture_image_id "$MINIO_IMAGE" "$NOTARIUM_MINIO_RECIPE_SHA256") || \
     fail "missing or stale fixture image '$MINIO_IMAGE'; run 'make setup app=api' first"
   NOTARIUM_BRIDGE_FIXTURE_IMAGE=$(fixture_image_id "$BRIDGE_IMAGE" "$NOTARIUM_BRIDGE_RECIPE_SHA256") || \

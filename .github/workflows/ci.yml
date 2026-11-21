@@ -106,7 +106,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7.0.1
-      - name: Test the Cargo cache pruning rules
+      - name: Test CI cache rules
         run: python3 -B -m unittest discover -s scripts/tests
       - uses: docker/setup-compose-action@v2.4.0
         with:
@@ -210,11 +210,17 @@ jobs:
       - uses: actions/cache/restore@v6.1.0
         with: *rust_registry
       - *restore_target
+      - name: Read storage fixture recipes
+        id: fixture-recipes
+        shell: bash
+        run: |
+          digest=$(sh docker/storage-fixtures/with-storage-fixtures.sh fixture-images | sha256sum)
+          echo "digest=${digest%% *}" >> "$GITHUB_OUTPUT"
       - uses: actions/cache/restore@v6.1.0
         id: fixtures-cache
         with:
           path: ${{ runner.temp }}/docker-cache/storage-fixtures.tar
-          key: docker-storage-fixtures-${{ runner.os }}-${{ hashFiles('compose.storage-tests.yaml', 'docker/storage-fixtures/minio-ce.Dockerfile', 'docker/storage-fixtures/uds-bridge.Dockerfile', 'docker/storage-fixtures/uds_tcp_bridge.rs') }}
+          key: docker-storage-fixtures-${{ runner.os }}-${{ steps.fixture-recipes.outputs.digest }}
       - *validate_vendor
       - name: Load the cached storage fixtures
         if: steps.fixtures-cache.outputs.cache-hit == 'true'

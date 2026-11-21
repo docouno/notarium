@@ -573,9 +573,11 @@ same example against an isolated prefix.
 pinned MinIO Community image from source (`RELEASE.2025-10-15T17-29-55Z`, commit
 `9e49d5e7a648f00e26f2246f4dc28e6b07f8c84a`) and builds the `#![forbid(unsafe_code)]`
 Unix-socket-to-loopback S3 bridge (`compose.storage-tests.yaml`). Setup reuses
-an existing image when its `io.notarium.fixture-recipe-sha256` label matches
-the hash of the Compose file and that image's build inputs. Pass `--force` to
-request both builds.
+an image by recipe hash. The hash covers the Compose file, the Dockerfile, its
+local source inputs and the effective Docker ignore file. Each recipe has its
+own tag, so checkouts with different recipes can share a Docker daemon.
+Setup checks the `io.notarium.fixture-recipe-sha256` label before reuse.
+Pass `--force` to request both builds.
 
 ```sh
 sh docker/storage-fixtures/with-storage-fixtures.sh setup-images --force
