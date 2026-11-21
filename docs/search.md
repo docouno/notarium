@@ -12,20 +12,25 @@ before shutting down canonical storage.
 - Lexical ranking uses Tantivy with distinct title, body, memory and chat fields.
   English and Russian prose use case folding and stemming. Exact fields retain
   code identifiers and path terms. Quoted clauses match phrase positions.
+  Rare terms check matching postings directly. Broad queries can switch to a
+  segment-wide mask. Both paths observe the request deadline and cancellation.
 - Folder and structural filters apply before ranking. A blank query with a
   filter browses notes in stable ID order. Personal chat hits enter the ranking
-  for their owner. Hydration checks the live reachable branch.
+  only for an authorized personal audience. Hydration rechecks thread access
+  and the live reachable branch. A project-scoped Keeper can search its
+  explicitly pinned skills outside the project when no folder is requested.
 - The hybrid path fuses lexical and vector ranks with reciprocal rank fusion
   (`k = 60`). Recall can expand the leading notes through up to two graph hops.
   It serves the best eligible chunk per note first, then fills the remaining
-  token budget with ranked chunks. Each chunk carries canonical source spans.
+  token budget with ranked chunks. Lexical fallback ranks chunks by matching
+  phrases and normalized terms. Each chunk carries canonical source spans.
 - Wait watermarks require a caught-up search cut. A bounded set of exact
   receipts can score the named canonical revisions while the indexes catch up.
-  The overlay applies predicates to the receipt revisions' evaluated fields
-  and masks their older indexed hits. Exact carriers pass both historical and
-  current authorization before ranking. Structural receipts wait for full
-  catch-up. Base postings, structural filters and note carriers share a
-  projected cut. When the indexes and projection have
+  The overlay evaluates receipt revisions against the field schema at the base
+  cut and masks their older indexed hits. Exact carriers pass both historical and
+  current authorization before ranking. Intervening folder or schema changes
+  and receipts for package publication require full catch-up. Base postings,
+  structural filters and note carriers share a projected cut. When the indexes and projection have
   different cuts, search waits within the call budget. The response reports
   its cut, truncation, and any embedding degradation.
 
@@ -39,7 +44,9 @@ The DataRoot holds `v1/search/<space>/tantivy/` and `vector/`. Tantivy stores
 terms and fast fields without stored note or chat text. A durable folder
 dictionary assigns stable ordinals, so moving a folder requires only a search
 watermark update. A manifest identifies the active lexical generation and
-the vector checkpoint. The reader pins both together through ArcSwap. Idle
+the vector checkpoint. After an edit the worker invalidates the old vector slots
+before publishing the new lexical cut. The pending marker keeps outstanding
+embedding work recoverable after restart. Readers pin a cut through ArcSwap. Idle
 Spaces release their lexical reader pins and retain their subscriptions. After
 60 seconds without vector activity, they release the in-memory vector state
 and embedder. The next access reopens the durable epoch and journal. Disk and
@@ -63,7 +70,8 @@ Chat redaction commits and merges affected Tantivy segments, waits for pinned
 readers, and publishes and acknowledges the new cut once obsolete files are
 removed. If the reader or writer pool blocks the update, the worker retires
 the old generation on disk before waiting to rebuild it. The worker
-discards abandoned epochs and rebuilds invalid cuts.
+discards abandoned epochs and rebuilds invalid cuts. On reopening an archived
+Space the worker retires its derived data before waiting for reactivation.
 Search checks live note visibility after asynchronous hydration and before
 returning results.
 
@@ -77,9 +85,11 @@ and supply its canonical absolute library path. Under the configured model
 directory, each profile contains `<model-id>/model.onnx` with inline weights
 and `<model-id>/tokenizer.json`. The graph accepts `input_ids` and
 `attention_mask`, and can also accept `token_type_ids`. The output is a pooled
-float32 matrix or a per-token float32 tensor. Search uses masked mean pooling
-and normalizes the result. The tokenizer supports WordPiece, BPE and Unigram
-profiles with the supported Hugging Face preprocessing stages. Unsupported
+float32 matrix or a per-token float32 tensor. For token-level outputs the
+resolver selects masked mean pooling with `LocalOnnx` or the first token with
+`LocalOnnxCls`, according to the model profile. Search normalizes the result
+and uses a separate local vector epoch for each pooling mode. The tokenizer
+supports WordPiece, BPE and Unigram profiles with the supported Hugging Face preprocessing stages. Unsupported
 model formats produce lexical degradation.
 
 `VectorMode::RemoteOnly` uses `SearchModelResolverPort` and the typed provider
@@ -89,7 +99,8 @@ rechecks the selected target before dispatch. Interactive requests require
 an untainted context, a matching project scope, and a nonempty intersection
 of search classes and provider disclosure. Provider admission rechecks current
 access and token limits. Dispatch compares both resolved runtime generations
-and checks the shared taint. Chat text stays in the lexical index.
+and checks the shared taint. Remote indexing excludes descendants of trashed
+folders. Chat text stays in the lexical index.
 
 The embedding worker runs one bounded batch at a time. It checks interactive
 requests first, then live edits, then import and backfill. Batches contain at

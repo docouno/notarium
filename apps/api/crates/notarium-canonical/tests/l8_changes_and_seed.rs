@@ -214,6 +214,7 @@ async fn run_changes_and_seed_suite(store: &CanonicalStore, seed: u8) {
         .read_note_revisions_for_overlay(
             &search.authority,
             search_context,
+            index_page.cutoff.after,
             vec![
                 (note_b.clone(), pairs_ab[0].1.clone()),
                 (note_a.clone(), pairs_ab[0].1.clone()),

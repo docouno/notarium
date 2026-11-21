@@ -355,25 +355,32 @@ impl StructuralSnapshot for Projection {
     }
 
     fn doc_class(&self, node: DenseNodeId) -> DomainResult<DocClass> {
-        self.note_id(node)?;
+        self.notes
+            .get(node.index(self.cut.generation)? as usize)
+            .ok_or(DomainError::ResourceNotFound)?;
         Ok(DocClass::UserDoc)
     }
 
     fn folder_subtree(&self, _: &FolderId) -> DomainResult<DenseNodeIter<'_>> {
         Err(unavailable())
     }
-    fn folder_descendants(&self, _: &FolderId) -> DomainResult<Vec<FolderId>> {
-        Err(unavailable())
+    fn folder_descendants<'a>(&'a self, _: &'a FolderId) -> PortFuture<'a, Vec<FolderId>> {
+        Box::pin(async move { Err(unavailable().into()) })
     }
-    fn enclosing_project(&self, _: &FolderId) -> DomainResult<Option<FolderId>> {
-        Err(unavailable())
+    fn enclosing_project<'a>(&'a self, _: &'a FolderId) -> PortFuture<'a, Option<FolderId>> {
+        Box::pin(async move { Err(unavailable().into()) })
     }
-    fn filter_notes(&self, filter: &FieldFilterAstV1) -> DomainResult<Option<DenseNodeIter<'_>>> {
-        if matches!(&filter.predicate, Predicate::All(items) if items.is_empty()) {
-            Ok(None)
-        } else {
-            Err(unavailable())
-        }
+    fn filter_notes<'a>(
+        &'a self,
+        filter: &'a FieldFilterAstV1,
+    ) -> PortFuture<'a, Option<DenseNodeIter<'a>>> {
+        Box::pin(async move {
+            if matches!(&filter.predicate, Predicate::All(items) if items.is_empty()) {
+                Ok(None)
+            } else {
+                Err(unavailable().into())
+            }
+        })
     }
     fn outgoing(&self, _: DenseNodeId) -> DomainResult<DenseNodeIter<'_>> {
         Err(unavailable())

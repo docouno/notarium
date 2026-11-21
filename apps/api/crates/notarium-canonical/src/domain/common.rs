@@ -1243,6 +1243,15 @@ impl FolderAncestryCache {
         Ok((facts, anc))
     }
 
+    /// Check the lineage already loaded while resolving the resource facts.
+    pub(crate) fn all_active(&self, ancestors: &[FolderId]) -> bool {
+        ancestors.iter().all(|id| {
+            self.rows
+                .get(id)
+                .is_some_and(|row| row.lifecycle == Lifecycle::Active)
+        })
+    }
+
     pub(crate) fn enclosing_project(&self, ancestry: &FolderAncestryFacts) -> Option<FolderId> {
         ancestry.ancestors.iter().find_map(|id| {
             self.rows

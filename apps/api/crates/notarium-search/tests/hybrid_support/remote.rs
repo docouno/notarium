@@ -1,3 +1,6 @@
+mod folder_privacy;
+pub use folder_privacy::trashed_ancestor;
+
 use super::{ControlledCarriers, Projection, View, context, context_with_grant, status_field};
 use crate::{acknowledged, note, query};
 use notarium_canonical::{CanonicalStore, CreateFolderSpec, CreateSpaceSpec};
@@ -136,6 +139,9 @@ struct ModelProvider {
     parts: AtomicUsize,
     outside_parts: AtomicUsize,
     fail_indexing: AtomicBool,
+    block_next_part: AtomicBool,
+    part_started: Notify,
+    release_part: Notify,
     project_parts: Mutex<Vec<FolderRef>>,
     block_project: Mutex<Option<FolderRef>>,
     first_project_batch: Notify,
@@ -153,12 +159,23 @@ impl EmbeddingProviderPort for ModelProvider {
         Box::pin(async { Ok(BTreeSet::from([DocClass::UserDoc])) })
     }
 
-    fn embed(&self, _: SpaceContext, request: EmbeddingRequest) -> PortFuture<'_, EmbeddingResult> {
+    fn embed(
+        &self,
+        ctx: SpaceContext,
+        request: EmbeddingRequest,
+    ) -> PortFuture<'_, EmbeddingResult> {
         Box::pin(async move {
             if matches!(&request.inputs[..], [EmbeddingInput::Query(_)]) {
                 self.queries.lock().unwrap().push(request.provider.clone());
             } else {
                 self.parts.fetch_add(request.inputs.len(), Ordering::SeqCst);
+                if self.block_next_part.swap(false, Ordering::SeqCst) {
+                    self.part_started.notify_one();
+                    tokio::select! {
+                        () = self.release_part.notified() => {},
+                        () = ctx.budget.cancellation.cancelled() => return Err(DomainError::AccessDenied.into()),
+                    }
+                }
                 if let Some(project) = &request.project {
                     self.project_parts.lock().unwrap().push(project.clone());
                     let block = {
@@ -251,8 +268,24 @@ pub async fn model_epochs_and_repair(store: Arc<CanonicalStore>, root: DataRoot)
         )
     };
     let ctx = context(&space.scope, &owner);
+    provider.block_next_part.store(true, Ordering::SeqCst);
     let engine = start(resolver.clone());
     engine.start_space(space.scope.clone()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), provider.part_started.notified())
+        .await
+        .unwrap();
+    let mut short = ctx.clone();
+    short.budget.remaining = Duration::from_millis(500);
+    let cold = engine
+        .search(short.clone(), query("identical"))
+        .await
+        .unwrap();
+    assert_eq!(cold.hits[0].card.title, "Repeated note");
+    assert!(matches!(
+        cold.degraded,
+        Some(SearchDegradation::EmbeddingsPending)
+    ));
+    provider.release_part.notify_one();
     let seeded = acknowledged(&store, &root, &space.scope, seeded.last_seq).await;
     assert!(!seeded.embeddings_pending);
     assert_eq!(
@@ -353,7 +386,8 @@ pub async fn model_epochs_and_repair(store: Arc<CanonicalStore>, root: DataRoot)
     assert_eq!(restarted.hits[0].card.title, "Repeated note");
 
     provider.fail_indexing.store(true, Ordering::SeqCst);
-    let edited = sample_note_id(0x6b);
+    provider.block_next_part.store(true, Ordering::SeqCst);
+    let edited = sample_note_id(0x64);
     let mut recovered_note = note(
         &edited,
         &folder,
@@ -367,11 +401,47 @@ pub async fn model_epochs_and_repair(store: Arc<CanonicalStore>, root: DataRoot)
         .unwrap();
     {
         let mut snapshot = projection.snapshot.write().unwrap();
-        snapshot.index(edited.clone(), folder.clone());
         snapshot.set_status(edited.clone(), "done");
         snapshot.advance(edit.last_seq);
     }
     projection.live.write().unwrap().insert(edited.clone());
+    tokio::time::timeout(Duration::from_secs(5), provider.part_started.notified())
+        .await
+        .unwrap();
+    let mut edited_query = query("durable");
+    edited_query.filter.predicate = notarium_core::query::Predicate::Eq {
+        key: "status".to_owned(),
+        value: notarium_core::value::ScalarValue::String("done".to_owned()),
+    };
+    let live = engine
+        .search(short.clone(), edited_query.clone())
+        .await
+        .unwrap();
+    assert_eq!(live.hits[0].card.title, "Recoverable note");
+    assert_eq!(live.cut.projected_seq, edit.last_seq);
+    assert!(live.degraded.is_some());
+
+    // Another canonical command can advance the same Space while the first
+    // edit is still in the provider. The blocked request is never released.
+    let (_, _, next) = store
+        .create_folder(CreateFolderSpec {
+            scope: space.scope.clone(),
+            active_epoch: lease,
+            folder_id: sample_folder_id(0xa0),
+            parent: Some(folder.clone()),
+            slug: "during-embedding".into(),
+            display_name: "During embedding".into(),
+            is_project: false,
+            project_slug: None,
+            actor: owner.clone(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+    projection.snapshot.write().unwrap().advance(next);
+    let next_hit = engine.search(short.clone(), edited_query).await.unwrap();
+    assert_eq!(next_hit.cut.projected_seq, next);
+    assert_eq!(next_hit.hits[0].card.title, "Recoverable note");
     let before_restart = acknowledged(&store, &root, &space.scope, edit.last_seq).await;
     assert!(before_restart.embeddings_pending);
     engine.shutdown().await;
@@ -495,7 +565,7 @@ pub async fn model_epochs_and_repair(store: Arc<CanonicalStore>, root: DataRoot)
         .advance(outside.last_seq);
     acknowledged(&store, &root, &space.scope, outside.last_seq).await;
     let mut scoped = query("vectorprobe");
-    scoped.folder = Some(project);
+    scoped.folder = Some(project.clone());
     tokio::time::timeout(Duration::from_secs(8), async {
         loop {
             let result = engine.search(ctx.clone(), scoped.clone()).await.unwrap();
@@ -523,6 +593,35 @@ pub async fn model_epochs_and_repair(store: Arc<CanonicalStore>, root: DataRoot)
         provider.outside_parts.load(Ordering::SeqCst),
         previous_outside_parts
     );
+    let keeper = SpaceContext::new(
+        ctx.auth()
+            .for_keeper(
+                notarium_core::ids::AgentRunId::from_bytes([7; 16]),
+                space.scope.space_id.clone(),
+                Some(project.clone()),
+                [notarium_core::ids::AbilityId::from_bytes([8; 16])].into(),
+            )
+            .unwrap(),
+        space.scope.clone(),
+        ctx.budget.clone(),
+    )
+    .unwrap();
+    let mut mixed_scope = query("vectorprobe");
+    mixed_scope.classes.insert(DocClass::Skill);
+    let before = provider.queries.lock().unwrap().len();
+    let broad = engine
+        .search(keeper.clone(), mixed_scope.clone())
+        .await
+        .unwrap();
+    assert!(matches!(
+        broad.degraded,
+        Some(SearchDegradation::ProviderUnavailable)
+    ));
+    assert_eq!(provider.queries.lock().unwrap().len(), before);
+    mixed_scope.folder = Some(project);
+    let narrow = engine.search(keeper, mixed_scope).await.unwrap();
+    assert!(narrow.degraded.is_none());
+    assert_eq!(provider.queries.lock().unwrap().len(), before + 1);
     engine.shutdown().await;
 
     let cold_root = DataRoot::new(root.root().join("undersized"));

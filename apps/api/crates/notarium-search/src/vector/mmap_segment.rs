@@ -421,6 +421,7 @@ impl MmapSegment {
             top_k,
             budget,
             eligible.cardinality() <= EXACT_SCAN_LIMIT,
+            |_| true,
         )
     }
 
@@ -431,6 +432,7 @@ impl MmapSegment {
         top_k: usize,
         budget: SearchBudget<'_>,
         exact: bool,
+        visible: impl Fn(u32) -> bool,
     ) -> Result<SegmentSearch, VectorError> {
         budget.check()?;
         query.validate(self.dimension)?;
@@ -451,7 +453,7 @@ impl MmapSegment {
                 self.max_level,
                 top_k,
                 budget,
-                |slot| eligible.contains(slot),
+                |slot| eligible.contains(slot) && visible(slot),
             )?;
             hnsw_hops = explored.evaluations;
             if explored.neighbors.len() >= top_k.min(eligible.cardinality() as usize) {
@@ -464,7 +466,7 @@ impl MmapSegment {
             // fills top-k. Score the remaining eligible domain within the query budget.
         }
         Ok(SegmentSearch {
-            neighbors: self.exact_neighbors(query, eligible, top_k, budget)?,
+            neighbors: self.exact_neighbors(query, eligible, top_k, budget, visible)?,
             hnsw_hops,
         })
     }
@@ -475,6 +477,7 @@ impl MmapSegment {
         eligible: &Bitmap,
         top_k: usize,
         budget: SearchBudget<'_>,
+        visible: impl Fn(u32) -> bool,
     ) -> Result<Vec<Neighbor>, VectorError> {
         let dot = Dot::new(query.values()).ok_or(VectorError::InvalidDimension)?;
         let mut best = BinaryHeap::<Reverse<ExactNeighbor<'_>>>::with_capacity(top_k);
@@ -502,6 +505,9 @@ impl MmapSegment {
                         .peek()
                         .is_some_and(|worst| score.total_cmp(&worst.0.hit.score) == Ordering::Less)
                 {
+                    continue;
+                }
+                if !visible(slot) {
                     continue;
                 }
                 let meta = self.row(METADATA, slot as usize, META_BYTES);

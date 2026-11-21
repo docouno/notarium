@@ -1,11 +1,7 @@
 use super::{Context, Disk, IndexError, Publisher, build};
 use crate::{
-    embed::Priority,
-    layout::FolderOrd,
-    lexical::Update,
-    model::{Embedder, IndexNote},
-    ports::SearchIndexedNote,
-    vector::MutableOperation,
+    embed::Priority, layout::FolderOrd, lexical::Update, model::IndexNote,
+    ports::SearchIndexedNote, vector::MutableOperation,
 };
 use notarium_canonical::chats::search::HydratedChatHit;
 use notarium_core::{
@@ -54,6 +50,20 @@ pub(super) async fn apply(
             }
             EntityId::Thread(thread) => {
                 threads.insert(thread);
+            }
+            EntityId::Folder(_)
+                if change.kind == ChangeKind::Restore
+                    && disk.manifest.active_model.as_ref().is_some_and(|target| {
+                        matches!(
+                            target.backend,
+                            crate::ports::EmbeddingBackendTarget::Remote { .. }
+                        )
+                    }) =>
+            {
+                // A remote seed can omit descendants of a trashed folder.
+                // Restoration reopens those notes for bounded embedding repair.
+                disk.manifest.embeddings_pending = true;
+                disk.embedding_failures = disk.embedding_failures.wrapping_add(1);
             }
             EntityId::Folder(_) | EntityId::Ability(_) | EntityId::Job(_) => {}
         }
@@ -136,18 +146,26 @@ pub(super) async fn apply(
         }
         disk.manifest.tantivy_commit = lexical.commit_id()?;
     }
-    if disk.epoch.is_some() && (!updated_notes.is_empty() || !deleted.is_empty()) {
-        disk.ensure_embedder(cx).await;
-        let embedder = disk.embedder.clone();
-        apply_vectors(
-            cx,
-            disk,
-            &cutoff,
-            updated_notes,
-            deleted,
-            embedder.as_deref(),
-        )
-        .await?;
+    let previous_pending = disk.manifest.embeddings_pending;
+    let mut previous_vectors = std::collections::HashMap::new();
+    if let Some(epoch) = &mut disk.epoch
+        && (!updated_notes.is_empty() || !deleted.is_empty())
+    {
+        for update in &updated_notes {
+            let id = &update.row.note_id;
+            for chunk in epoch.mutable_note_chunks(id) {
+                previous_vectors
+                    .entry(chunk.metadata.key)
+                    .or_insert_with(|| chunk.vector.clone());
+            }
+            epoch.apply(cutoff.after, MutableOperation::Delete(id.clone()))?;
+        }
+        for id in deleted {
+            epoch.apply(cutoff.after, MutableOperation::Delete(id))?;
+        }
+        epoch.checkpoint(cutoff.after)?;
+        disk.manifest.vector_seq = Some(cutoff.after);
+        disk.manifest.embeddings_pending |= !updated_notes.is_empty();
     }
     if !chat.removed.is_empty() {
         publisher.replace(None);
@@ -158,57 +176,65 @@ pub(super) async fn apply(
     // Publishing the cut certifies that any redacted files have been removed.
     disk.layout.publish_search(&disk.manifest)?;
     publisher.publish(disk);
-    Ok(())
-}
-
-async fn apply_vectors(
-    cx: &Context<'_>,
-    disk: &mut Disk,
-    cutoff: &ChangeCursor,
-    notes: Vec<PreparedNote>,
-    deleted: BTreeSet<NoteId>,
-    embedder: Option<&Embedder>,
-) -> Result<(), IndexError> {
-    let selected = cx.services.model_target(&cutoff.scope, None, None).await;
-    let embedder = match selected {
-        Ok(selected) if selected == disk.manifest.active_model => embedder,
-        _ => None,
-    };
-    let epoch = disk.epoch.as_mut().ok_or(IndexError::Inconsistent)?;
-    for note in deleted {
-        epoch.apply(cutoff.after, MutableOperation::Delete(note))?;
-    }
-    for note in notes {
-        let (chunks, pending) = match embedder {
-            Some(embedder) => {
-                embedder
-                    .index_note(IndexNote {
-                        services: cx.services,
-                        scope: &cutoff.scope,
-                        note: &note.row,
-                        folder: note.folder.get(),
-                        budget: cx.budget(),
-                        priority: Priority::LiveNoteEdit,
-                        existing: &|key| epoch.find_vector(key),
-                    })
-                    .await?
-            }
-            None => (Vec::new(), true),
-        };
-        disk.manifest.embeddings_pending |= pending;
+    if disk.epoch.is_some() && !updated_notes.is_empty() {
+        // Missing work survives a crash in the pending manifest. Readers can
+        // already search the new text and cannot rank the old vector slots.
+        let pending = cx
+            .while_current(&cutoff, async {
+                let selected = cx.services.model_target(&cutoff.scope, None, None).await;
+                if !matches!(selected, Ok(selected) if selected == disk.manifest.active_model) {
+                    return Ok(true);
+                }
+                disk.ensure_embedder(cx).await;
+                let Some(embedder) = disk.embedder.as_ref() else {
+                    return Ok(true);
+                };
+                let epoch = disk.epoch.as_mut().ok_or(IndexError::Inconsistent)?;
+                let mut pending = false;
+                for note in updated_notes {
+                    let (chunks, missing) = embedder
+                        .index_note(IndexNote {
+                            services: cx.services,
+                            scope: &cutoff.scope,
+                            note: &note.row,
+                            folder: note.folder.get(),
+                            budget: cx.budget(),
+                            priority: Priority::LiveNoteEdit,
+                            existing: &|key| {
+                                previous_vectors
+                                    .get(&key)
+                                    .cloned()
+                                    .or_else(|| epoch.find_vector(key))
+                            },
+                        })
+                        .await?;
+                    pending |= missing;
+                    if !chunks.is_empty() {
+                        epoch.apply(
+                            cutoff.after,
+                            MutableOperation::Upsert {
+                                note: note.row.note_id,
+                                chunks,
+                            },
+                        )?;
+                    }
+                }
+                Ok::<_, IndexError>(pending)
+            })
+            .await?
+            .transpose()?
+            .unwrap_or(true);
         if pending {
             disk.embedding_failures = disk.embedding_failures.wrapping_add(1);
         }
-        epoch.apply(
-            cutoff.after,
-            MutableOperation::Upsert {
-                note: note.row.note_id,
-                chunks,
-            },
-        )?;
+        disk.manifest.embeddings_pending = previous_pending || pending;
+        disk.epoch
+            .as_mut()
+            .ok_or(IndexError::Inconsistent)?
+            .checkpoint(cutoff.after)?;
+        disk.layout.publish_search(&disk.manifest)?;
+        publisher.publish(disk);
     }
-    epoch.checkpoint(cutoff.after)?;
-    disk.manifest.vector_seq = Some(cutoff.after);
     Ok(())
 }
 

@@ -198,50 +198,59 @@ impl StructuralSnapshot for View {
         ))
     }
 
-    fn folder_descendants(&self, folder: &FolderId) -> DomainResult<Vec<FolderId>> {
-        Ok(self
-            .parents
-            .keys()
-            .filter(|candidate| self.in_folder(candidate, folder))
-            .cloned()
-            .collect())
-    }
-
-    fn enclosing_project(&self, folder: &FolderId) -> DomainResult<Option<FolderId>> {
-        Ok(std::iter::successors(Some(folder), |id| {
-            self.parents.get(*id).and_then(Option::as_ref)
+    fn folder_descendants<'a>(&'a self, folder: &'a FolderId) -> PortFuture<'a, Vec<FolderId>> {
+        Box::pin(async move {
+            Ok(self
+                .parents
+                .keys()
+                .filter(|candidate| self.in_folder(candidate, folder))
+                .cloned()
+                .collect())
         })
-        .find(|ancestor| self.projects.contains(*ancestor))
-        .cloned())
     }
 
-    fn filter_notes(&self, filter: &FieldFilterAstV1) -> DomainResult<Option<DenseNodeIter<'_>>> {
-        filter.validate(&BTreeMap::from([(
-            "status".to_owned(),
-            FieldSchema {
-                kind: FieldType::Scalar(ScalarType::String),
-                nullable: false,
-            },
-        )]))?;
-        if matches!(&filter.predicate, Predicate::All(items) if items.is_empty()) {
-            return Ok(None);
-        }
-        let empty = BTreeMap::new();
-        let nodes = self
-            .rows
-            .iter()
-            .enumerate()
-            .filter_map(|(index, (note, _))| {
-                filter
-                    .predicate
-                    .matches(self.fields.get(note).unwrap_or(&empty))
-                    .then_some(index as u32)
+    fn enclosing_project<'a>(&'a self, folder: &'a FolderId) -> PortFuture<'a, Option<FolderId>> {
+        Box::pin(async move {
+            Ok(std::iter::successors(Some(folder), |id| {
+                self.parents.get(*id).and_then(Option::as_ref)
             })
-            .collect::<Vec<_>>();
-        Ok(Some(DenseNodeIter::from_iter(
-            self.cut.generation,
-            nodes.into_iter(),
-        )))
+            .find(|ancestor| self.projects.contains(*ancestor))
+            .cloned())
+        })
+    }
+
+    fn filter_notes<'a>(
+        &'a self,
+        filter: &'a FieldFilterAstV1,
+    ) -> PortFuture<'a, Option<DenseNodeIter<'a>>> {
+        Box::pin(async move {
+            filter.validate(&BTreeMap::from([(
+                "status".to_owned(),
+                FieldSchema {
+                    kind: FieldType::Scalar(ScalarType::String),
+                    nullable: false,
+                },
+            )]))?;
+            if matches!(&filter.predicate, Predicate::All(items) if items.is_empty()) {
+                return Ok(None);
+            }
+            let empty = BTreeMap::new();
+            let nodes = self
+                .rows
+                .iter()
+                .enumerate()
+                .filter_map(|(index, (note, _))| {
+                    filter
+                        .predicate
+                        .matches(self.fields.get(note).unwrap_or(&empty))
+                        .then_some(index as u32)
+                })
+                .collect::<Vec<_>>();
+            Ok(Some(DenseNodeIter::from_iter(
+                self.cut.generation,
+                nodes.into_iter(),
+            )))
+        })
     }
 
     fn outgoing(&self, node: DenseNodeId) -> DomainResult<DenseNodeIter<'_>> {
@@ -473,12 +482,14 @@ impl SearchCarrierReadPort for ControlledCarriers {
         &self,
         authority: ServiceAuthority,
         ctx: SpaceContext,
+        filter_cut: SpaceSeq,
         targets: Vec<(NoteId, RevisionId)>,
     ) -> PortFuture<'_, Vec<(NoteId, Option<SearchOverlayNote>)>> {
         SearchCarrierReadPort::read_note_revisions_for_overlay(
             &*self.canonical,
             authority,
             ctx,
+            filter_cut,
             targets,
         )
     }
@@ -495,6 +506,14 @@ impl SearchCarrierReadPort for ControlledCarriers {
             });
         }
         SearchCarrierReadPort::read_authorized_documents_for_search(&*self.canonical, ctx, targets)
+    }
+
+    fn visible_chat_hit_keys<'a>(
+        &'a self,
+        ctx: &'a SpaceContext,
+        candidates: &'a [(ChatThreadId, ThreadEntrySeq)],
+    ) -> PortFuture<'a, Vec<(ChatThreadId, ThreadEntrySeq)>> {
+        Box::pin(self.canonical.visible_chat_hit_keys(ctx, candidates))
     }
 
     fn hydrate_live_visible_chat_hits<'a>(

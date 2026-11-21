@@ -2,13 +2,12 @@ use crate::{
     engine::{Clock, Published, SearchEngine, SpaceHandle, deadline_error, unavailable},
     ports::SearchOverlayNote,
 };
-use notarium_canonical::codec::EFFECT_PAYLOAD_BUDGET_BYTES;
 use notarium_core::{
     error::PortError,
     ids::{NoteId, SpaceSeq},
     model::{HistoryScope, SnapshotCut},
     ports::{SpaceContext, StructuralSnapshot},
-    receipt::{AwaitWatermarks, CausalBasis, MutationReceiptToken, OverlayDecision, plan_overlay},
+    receipt::{AwaitWatermarks, CausalBasis, MutationReceiptToken},
 };
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tokio::time::{Instant, timeout_at};
@@ -127,19 +126,18 @@ impl SearchEngine {
         base: SpaceSeq,
         receipts: &notarium_core::receipt::ReceiptSet,
     ) -> Result<Option<Overlay>, PortError> {
-        let effects = self
+        let Some(versions) = self
             .services
             .deps
             .canonical
-            .resolve_receipt_effects(ctx.scope(), receipts)
-            .await?;
-        let OverlayDecision::Bounded { versions } = plan_overlay(
-            ctx.scope(),
-            base,
-            receipts,
-            &effects,
-            EFFECT_PAYLOAD_BUDGET_BYTES,
-        )?
+            .plan_search_overlay(
+                &self.services.authority,
+                &clock.remaining()?,
+                ctx.scope(),
+                base,
+                receipts,
+            )
+            .await?
         else {
             return Ok(None);
         };
@@ -158,7 +156,12 @@ impl SearchEngine {
             self.services
                 .deps
                 .carriers
-                .read_note_revisions_for_overlay(self.services.authority.clone(), context, targets)
+                .read_note_revisions_for_overlay(
+                    self.services.authority.clone(),
+                    context,
+                    base,
+                    targets,
+                )
                 .await?,
         );
         Ok(Some(overlay))

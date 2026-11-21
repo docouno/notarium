@@ -160,6 +160,8 @@ pub struct VectorModel {
     pub remote: Option<RemoteVectorModel>,
     pub dimension: u32,
     pub max_input_tokens: u32,
+    #[serde(default, skip_serializing_if = "crate::embed::Pooling::is_mean")]
+    pub pooling: crate::embed::Pooling,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
@@ -177,11 +179,18 @@ impl VectorModel {
             remote: None,
             dimension,
             max_input_tokens: 512,
+            pooling: crate::embed::Pooling::Mean,
         }
     }
 
     pub(crate) fn hash(&self) -> [u8; 32] {
         match &self.remote {
+            None if self.pooling == crate::embed::Pooling::Cls => {
+                let mut hash =
+                    blake3::Hasher::new_derive_key("notarium/search/cls-vector-model/v1");
+                hash.update(self.profile.as_str().as_bytes());
+                *hash.finalize().as_bytes()
+            }
             None => crate::vector::model_hash(&self.profile),
             Some(remote) => {
                 let mut hash =
@@ -619,6 +628,22 @@ mod tests {
                 .search_manifest(),
             Err(LayoutError::WrongHistory)
         ));
+    }
+
+    #[test]
+    fn legacy_mean_profiles_keep_the_manifest_checksum_and_epoch_identity() {
+        let profile = ModelProfileId::from_bytes([1; 16]);
+        let legacy = format!(
+            r#"{{"profile":"{profile}","remote":null,"dimension":384,"max_input_tokens":512}}"#
+        );
+        let mean: VectorModel = serde_json::from_str(&legacy).unwrap();
+        assert_eq!(serde_json::to_string(&mean).unwrap(), legacy);
+        assert_eq!(mean.hash(), crate::vector::model_hash(&profile));
+        let cls = VectorModel {
+            pooling: crate::embed::Pooling::Cls,
+            ..mean.clone()
+        };
+        assert_ne!(model_epoch_name(&mean), model_epoch_name(&cls));
     }
 
     #[test]

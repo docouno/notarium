@@ -11,7 +11,7 @@ use notarium_core::{
     classes::{ClassEgressFence, ClassifiedDocument, DocClass},
     ids::{ContentDigest, NoteId},
     model::{Lifecycle, NoteRef},
-    ports::{Cancellation, ServiceAuthority, ServicePurpose},
+    ports::{Cancellation, ServiceAuthority, ServicePurpose, StructuralSnapshot},
     span::ByteSpan,
 };
 use notarium_search::{
@@ -331,6 +331,14 @@ fn run_samples(
         excluded: None,
     };
     let snapshot = epoch.snapshot();
+    let visible = |id: &NoteId| {
+        fixture.projection.lookup(id).is_some_and(|node| {
+            fixture
+                .projection
+                .doc_class(node)
+                .is_ok_and(|value| class.contains(&value))
+        })
+    };
     let cancellation = Cancellation::default();
     let budget = || SearchBudget {
         cancellation: &cancellation,
@@ -346,7 +354,7 @@ fn run_samples(
         let lexical_time = started.elapsed();
         assert!(!lexical.is_empty());
 
-        let approx = snapshot.search(&query, &open, CANDIDATES, budget())?;
+        let approx = snapshot.search_visible(&query, &open, CANDIDATES, budget(), visible)?;
         let fused = fuse_search_candidates(lexical.clone(), approx.hits.clone(), false);
         let hybrid_time = started.elapsed();
         assert!(approx.hnsw_hops > 0);
@@ -364,7 +372,7 @@ fn run_samples(
 
         let local_query = embedding(note % (EXACT_SCAN_LIMIT as u32 / CHUNKS), sample % CHUNKS)?;
         let started = Instant::now();
-        let local = snapshot.search(&local_query, &folder, TOP_K, budget())?;
+        let local = snapshot.search_visible(&local_query, &folder, TOP_K, budget(), visible)?;
         let selective_time = started.elapsed();
         assert_eq!(local.hnsw_hops, 0);
         if sample >= 4 {

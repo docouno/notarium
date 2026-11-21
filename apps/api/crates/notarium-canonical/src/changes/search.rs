@@ -22,7 +22,10 @@ use notarium_core::{
     model::{HistoryScope, Lifecycle, NoteRef},
     ports::{CallBudget, PageLimit, ServiceAuthority, ServicePurpose, SpaceContext},
     query::{FieldObservation, FieldValue},
-    receipt::ChangeCursor,
+    receipt::{
+        ChangeCursor, OverlayDecision, OverlayRowVersion, ReceiptSet, TrustedMutationEffect,
+        plan_overlay,
+    },
 };
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
@@ -34,6 +37,8 @@ pub struct SearchIndexedNote {
     pub parent_folder_id: FolderId,
     pub enclosing_project: Option<FolderId>,
     pub revision_actor: PrincipalId,
+    /// Folder ancestry was active at the indexing cut and the last live check.
+    pub remote_indexable: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -50,6 +55,7 @@ struct PendingNote {
     digest: ContentDigest,
     facts: ResourceFacts,
     project: Option<FolderId>,
+    active_ancestry: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -85,10 +91,67 @@ enum Notes {
 }
 
 impl CanonicalStore {
+    /// A receipt overlay may only reuse the base cut's folder and schema state.
+    pub async fn plan_search_overlay(
+        &self,
+        authority: &ServiceAuthority,
+        budget: &CallBudget,
+        scope: &HistoryScope,
+        base: SpaceSeq,
+        receipts: &ReceiptSet,
+    ) -> Result<Option<Vec<OverlayRowVersion>>, PortError> {
+        authority.require(ServicePurpose::Search)?;
+        let selected: Vec<_> = receipts
+            .for_scope(scope)?
+            .into_iter()
+            .filter(|receipt| receipt.seq() > base)
+            .cloned()
+            .collect();
+        let scope = scope.clone();
+        let receipts = receipts.clone();
+        self.with_read_tx_budget(Some(budget), |tx| {
+            Box::pin(async move {
+                active_space(tx, &scope).await?;
+                let through = selected
+                    .iter()
+                    .map(|receipt| receipt.seq())
+                    .max()
+                    .unwrap_or(base);
+                if !crate::projection_read::structural_overlay_supported(tx, &scope, base, through)
+                    .await?
+                {
+                    return Ok(None);
+                }
+                let mut effects = Vec::with_capacity(selected.len());
+                for receipt in selected {
+                    let (kind, effect) =
+                        super::resolve_receipt_effect_tx(tx, &scope, receipt.seq()).await?;
+                    // The package binding can change without a new note revision.
+                    if kind.as_deref() == Some("publish_ability_package") {
+                        return Ok(None);
+                    }
+                    effects.push(TrustedMutationEffect { receipt, effect });
+                }
+                match plan_overlay(
+                    &scope,
+                    base,
+                    &receipts,
+                    &effects,
+                    crate::codec::EFFECT_PAYLOAD_BUDGET_BYTES,
+                )? {
+                    OverlayDecision::Bounded { versions } => Ok(Some(versions)),
+                    OverlayDecision::AwaitProjection { .. } => Ok(None),
+                }
+            })
+        })
+        .await
+    }
+
     pub async fn read_note_revisions_for_overlay(
         &self,
         authority: &ServiceAuthority,
         ctx: SpaceContext,
+        filter_cut: SpaceSeq,
         targets: Vec<(NoteId, RevisionId)>,
     ) -> Result<Vec<(NoteId, Option<SearchOverlayNote>)>, PortError> {
         authority.require(ServicePurpose::Search)?;
@@ -105,7 +168,7 @@ impl CanonicalStore {
             .collect();
         let scope = ctx.scope().clone();
         let auth = ctx.auth().clone();
-        self.read_search_targets(ctx.budget, scope, targets, auth)
+        self.read_search_targets(ctx.budget, scope, targets, auth, Some(filter_cut))
             .await?
             .into_iter()
             .map(|(key, row)| {
@@ -143,7 +206,7 @@ impl CanonicalStore {
         let scope = ctx.scope().clone();
         let auth = ctx.auth().clone();
         let rows = self
-            .read_search_targets(ctx.budget, scope, targets, auth.clone())
+            .read_search_targets(ctx.budget, scope, targets, auth.clone(), None)
             .await?;
         Ok(rows
             .into_iter()
@@ -162,6 +225,7 @@ impl CanonicalStore {
         scope: HistoryScope,
         targets: Vec<SearchDocumentTarget>,
         auth: EngineAuthContext,
+        filter_cut: Option<SpaceSeq>,
     ) -> Result<Vec<(NoteId, Option<SearchTargetNote>)>, PortError> {
         let deadline = CommandDeadline::start(&budget, "read_search_targets");
         let mut tx_budget = budget.clone();
@@ -173,6 +237,13 @@ impl CanonicalStore {
                 Box::pin(async move {
                     let space = active_space(tx, &scope_for_tx).await?;
                     let mut live = FolderAncestryCache::default();
+                    let schema = match filter_cut {
+                        Some(cut) => {
+                            validate_snapshot_cutoff_tx(tx, &scope_for_tx, Some(cut)).await?;
+                            crate::projection_read::schema_at(tx, &scope_for_tx, cut).await?
+                        }
+                        None => None,
+                    };
                     let mut historical = BTreeMap::new();
                     let mut slots = Vec::with_capacity(targets.len());
                     for target in targets {
@@ -210,6 +281,12 @@ impl CanonicalStore {
                             )
                             .await?
                         };
+                        let mut row = row;
+                        if filter_cut.is_some()
+                            && let Some((pending, _)) = &mut row
+                        {
+                            refresh_overlay_fields(&mut pending.meta, schema.as_ref());
+                        }
                         slots.push((target.note_id, row));
                     }
                     Ok(slots)
@@ -267,6 +344,28 @@ impl CanonicalStore {
                 let cutoff =
                     validate_snapshot_cutoff_tx(tx, &cursor.scope, Some(cursor.after)).await?;
                 check_seed(tx, &space, cutoff).await
+            })
+        })
+        .await
+    }
+
+    /// Verify current placement again when an admitted batch leaves the queue.
+    /// This read never fetches document bytes.
+    pub async fn can_index_remote_search_note(
+        &self,
+        authority: &ServiceAuthority,
+        budget: CallBudget,
+        scope: HistoryScope,
+        note: NoteId,
+    ) -> Result<bool, PortError> {
+        authority.require(ServicePurpose::Search)?;
+        self.with_read_tx_budget(Some(&budget), |tx| {
+            Box::pin(async move {
+                let space = active_space(tx, &scope).await?;
+                let mut live = FolderAncestryCache::default();
+                Ok(live_search_facts(tx, &space, &note, &mut live)
+                    .await?
+                    .is_some_and(|facts| live.all_active(&facts.ancestor_folders)))
             })
         })
         .await
@@ -446,6 +545,8 @@ impl CanonicalStore {
                         if let Some(note) = row {
                             match live_search_facts(tx, &space, key, &mut live).await? {
                                 Some(facts) => {
+                                    note.remote_indexable &=
+                                        live.all_active(&facts.ancestor_folders);
                                     note.document.bind_current(facts, Lifecycle::Active)?
                                 }
                                 None => *row = None,
@@ -500,8 +601,38 @@ impl CanonicalStore {
             parent_folder_id: pending.meta.parent_folder_id,
             enclosing_project: pending.project,
             revision_actor: pending.actor,
+            remote_indexable: pending.active_ancestry,
         }))
     }
+}
+
+// Moves and restores can carry field observations from an earlier schema.
+fn refresh_overlay_fields(
+    meta: &mut NoteRevisionMetadata,
+    schema: Option<&crate::projection_read::ProjectedSchemaSnapshot>,
+) {
+    if meta.schema_revision.as_ref() != schema.map(|schema| &schema.schema_rev_id) {
+        meta.evaluated_fields = crate::codec::evaluate_fields_with_schema(
+            meta.raw_fields.as_ref(),
+            meta.diagnostics.first(),
+            schema.map(|schema| &schema.fields),
+        );
+    }
+}
+
+// Package publications can change a skill's binding without a new note revision.
+async fn bind_search_ability(
+    tx: &mut BackendConn<'_>,
+    scope: &HistoryScope,
+    cutoff: SpaceSeq,
+    meta: &mut NoteRevisionMetadata,
+) -> Result<(), PortError> {
+    if matches!(meta.doc_class, DocClass::Skill | DocClass::Profile) {
+        meta.ability_id = crate::projection_read::note_at(tx, scope, cutoff, &meta.note_id)
+            .await?
+            .and_then(|note| note.metadata.ability_id);
+    }
+    Ok(())
 }
 
 async fn load_exact_note(
@@ -542,7 +673,7 @@ async fn load_exact_note(
     let Some((bytes, visibility, actor)) = row else {
         return Ok(None);
     };
-    let RevisionMetadataPayload::Note(meta) = RevisionMetadataEnvelope::decode(&bytes)?.payload
+    let RevisionMetadataPayload::Note(mut meta) = RevisionMetadataEnvelope::decode(&bytes)?.payload
     else {
         return Err(internal_not_committed(
             "search_exact_revision",
@@ -558,7 +689,9 @@ async fn load_exact_note(
             "active note is missing its carrier",
         )
     })?;
-    let mut history = FolderAncestryCache::at_cut(&space.scope, i64_to_space_seq(visibility)?);
+    let cutoff = i64_to_space_seq(visibility)?;
+    bind_search_ability(tx, &space.scope, cutoff, &mut meta).await?;
+    let mut history = FolderAncestryCache::at_cut(&space.scope, cutoff);
     let (facts, ancestry) = history
         .build_resource_facts_tx(
             tx,
@@ -578,6 +711,7 @@ async fn load_exact_note(
         format!("{}/{}.md", ancestry.folder_path, meta.slug)
     };
     let project = history.enclosing_project(&ancestry);
+    let active_ancestry = history.all_active(&ancestry.ancestors);
     Ok(Some((
         PendingNote {
             meta,
@@ -586,6 +720,7 @@ async fn load_exact_note(
             digest,
             facts,
             project,
+            active_ancestry,
         },
         path,
     )))
@@ -649,7 +784,7 @@ async fn load_note(
     else {
         return Ok(None);
     };
-    let RevisionMetadataPayload::Note(meta) = revision.metadata.payload else {
+    let RevisionMetadataPayload::Note(mut meta) = revision.metadata.payload else {
         return Err(internal_not_committed(
             "search_note_revision",
             "expected note metadata",
@@ -661,6 +796,7 @@ async fn load_note(
     let digest = meta.content_digest.ok_or_else(|| {
         internal_not_committed("search_note_revision", "active note is missing its carrier")
     })?;
+    bind_search_ability(tx, &space.scope, cutoff, &mut meta).await?;
     let (facts, ancestry) = historical
         .build_resource_facts_tx(
             tx,
@@ -675,6 +811,7 @@ async fn load_note(
         return Ok(None);
     }
     let project = historical.enclosing_project(&ancestry);
+    let active_ancestry = historical.all_active(&ancestry.ancestors);
     Ok(Some(PendingNote {
         meta,
         revision: revision.revision_id,
@@ -682,5 +819,6 @@ async fn load_note(
         digest,
         facts,
         project,
+        active_ancestry,
     }))
 }

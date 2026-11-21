@@ -350,7 +350,7 @@ fn equal_vectors_stay_reachable_in_a_sealed_graph() {
     let mut tail = Bitmap::new();
     tail.add_range(33..count);
     let approximate = segment
-        .search_mode(&vector, &tail, 10, budget, false)
+        .search_mode(&vector, &tail, 10, budget, false, |_| true)
         .unwrap();
     assert_eq!(approximate.neighbors.len(), 10);
     assert!(approximate.hnsw_hops > 0);
@@ -741,4 +741,92 @@ fn hnsw_traverses_but_never_returns_ineligible_slots() {
             .iter()
             .all(|neighbor| neighbor.slot % 2 == 1)
     );
+}
+
+#[test]
+fn invisible_chunks_cannot_displace_visible_sealed_or_mutable_hits() {
+    use notarium_core::{epoch::DataRoot, ids::HistoryIncarnation, model::HistoryScope};
+    use std::collections::BTreeSet;
+
+    let scratch = Scratch::new();
+    let scope = HistoryScope {
+        space_id: SpaceId::from_bytes([1; 16]),
+        incarnation: HistoryIncarnation::from_bytes([1; 16]),
+    };
+    let layout = Arc::new(SearchLayout::open(&DataRoot::new(&scratch.0), scope).unwrap());
+    let mut epoch = VectorEpoch::open(layout, model(), 64).unwrap();
+    let visible_sealed = fixture(1, 64);
+    let visible_mutable = fixture(2, 64);
+    let hidden = fixture(0, 64);
+    let query = hidden.vector.clone();
+    let sealed = std::iter::repeat_n(hidden.clone(), 100)
+        .chain([visible_sealed.clone()])
+        .collect();
+    epoch
+        .seed(
+            SegmentBuilder::with_test_rows(&model(), 64, sealed),
+            SpaceSeq::new(1).unwrap(),
+        )
+        .unwrap();
+    let mut hidden_mutable = fixture(3, 64);
+    hidden_mutable.vector = query.clone();
+    for (chunk, count) in [(hidden_mutable, 100), (visible_mutable.clone(), 1)] {
+        epoch
+            .apply(
+                SpaceSeq::new(2).unwrap(),
+                MutableOperation::Upsert {
+                    note: chunk.metadata.note.clone(),
+                    chunks: vec![chunk; count],
+                },
+            )
+            .unwrap();
+    }
+    let classes = BTreeSet::from([DocClass::UserDoc]);
+    let filter = VectorFilter {
+        classes: &classes,
+        folders: None,
+        notes: None,
+        excluded: None,
+    };
+    let cancellation = Cancellation::default();
+    let budget = SearchBudget {
+        cancellation: &cancellation,
+        deadline: Instant::now() + Duration::from_secs(3),
+    };
+    let expected = BTreeSet::from([visible_sealed.metadata.note, visible_mutable.metadata.note]);
+    let hits = epoch
+        .snapshot()
+        .search_visible(&query, &filter, 100, budget, |note| expected.contains(note))
+        .unwrap();
+    assert_eq!(hits.hnsw_hops, 0);
+    assert_eq!(
+        hits.hits
+            .into_iter()
+            .map(|hit| hit.metadata.note)
+            .collect::<BTreeSet<_>>(),
+        expected
+    );
+}
+
+#[test]
+fn ann_returns_oversampled_candidates_above_the_exploration_width() {
+    let scratch = Scratch::new();
+    let query = fixture(0, 64).vector;
+    let chunks = (0..2048).map(|slot| fixture(slot, 64)).collect();
+    let segment = SegmentBuilder::with_test_rows(&model(), 64, chunks)
+        .finish(&scratch.0.join("wide.seg"))
+        .unwrap()
+        .unwrap();
+    let cancellation = Cancellation::default();
+    let budget = SearchBudget {
+        cancellation: &cancellation,
+        deadline: Instant::now() + Duration::from_secs(3),
+    };
+    let scorer = hnsw::Similarity::new(query.values(), query.scale()).unwrap();
+    for top_k in [260, 800] {
+        let result =
+            hnsw::query_graph(&segment, scorer, 0, 0, top_k, budget, |slot| slot >= 256).unwrap();
+        assert_eq!(result.neighbors.len(), top_k);
+        assert!(result.neighbors.iter().all(|hit| hit.slot >= 256));
+    }
 }

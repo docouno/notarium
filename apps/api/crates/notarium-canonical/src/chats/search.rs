@@ -17,7 +17,7 @@ use crate::{
 };
 use notarium_core::{
     DomainError,
-    auth::{EngineAuthContext, Space, SpaceLifecycle},
+    auth::{Space, SpaceLifecycle},
     error::{PortError, ValidationReason},
     ids::{ChatThreadId, ContentDigest, FolderId, PrincipalId, SpaceId, SpaceSeq, ThreadEntrySeq},
     model::HistoryScope,
@@ -221,13 +221,33 @@ impl CanonicalStore {
         })
     }
 
+    /// Admit one ranked candidate page without recording a chat read. Only
+    /// the final page assembled for delivery may affect the caller's taint.
+    pub async fn visible_chat_hit_keys(
+        &self,
+        ctx: &SpaceContext,
+        candidates: &[(ChatThreadId, ThreadEntrySeq)],
+    ) -> Result<Vec<(ChatThreadId, ThreadEntrySeq)>, PortError> {
+        if candidates.len() > 200 {
+            return Err(DomainError::validation(ValidationReason::InvalidLimit).into());
+        }
+        let deadline = CommandDeadline::start(&ctx.budget, "filter_search_chat");
+        let (_, rows, _) = self
+            .plan_chat_hits(ctx, &deadline, candidates.to_vec(), candidates.len())
+            .await?;
+        rows.into_iter()
+            .map(|(thread, entry)| Ok((thread.thread_id, entry.seq()?)))
+            .collect()
+    }
+
     pub async fn hydrate_live_visible_chat_hits(
         &self,
         ctx: &SpaceContext,
         candidates: &[(ChatThreadId, ThreadEntrySeq)],
         limit: PageLimit,
     ) -> Result<(Vec<HydratedChatHit>, bool), PortError> {
-        if candidates.len() > 200 {
+        // One additional candidate witnesses truncation at the largest page limit.
+        if candidates.len() > 201 {
             return Err(DomainError::validation(ValidationReason::InvalidLimit).into());
         }
         let deadline = CommandDeadline::start(&ctx.budget, "hydrate_search_chat");
@@ -253,8 +273,10 @@ impl CanonicalStore {
             let Some(text) = hydrated.remove(&(thread.thread_id.clone(), row.seq()?)) else {
                 continue;
             };
-            ctx.auth().authorize_chat_read(
+            ctx.auth().authorize_chat_thread_read(
                 &space,
+                thread.kind,
+                &thread.owner,
                 thread.project_folder.as_ref(),
                 row.tainted(),
             )?;
@@ -300,15 +322,18 @@ impl CanonicalStore {
                     let Some(head) = head else {
                         continue;
                     };
-                    if !can_read_thread(head, &space, &auth) {
-                        continue;
-                    }
                     let Some(row) = load_entry(tx, &space.id, &thread, seq).await? else {
                         continue;
                     };
                     if !row.searchable()
                         || auth
-                            .can_view_chat(&space, head.project_folder.as_ref(), row.tainted())
+                            .can_view_chat_thread(
+                                &space,
+                                head.kind,
+                                &head.owner,
+                                head.project_folder.as_ref(),
+                                row.tainted(),
+                            )
                             .is_err()
                         || !reachable(tx, &space.id, &thread, head.head_leaf_seq, &row).await?
                     {
@@ -394,13 +419,6 @@ fn make_hit(
         author: PrincipalId::parse(&row.author_id)?,
         text,
     })
-}
-
-fn can_read_thread(head: &ThreadHeadRow, space: &Space, auth: &EngineAuthContext) -> bool {
-    (head.kind != ChatThreadKind::Personal || &head.owner == auth.principal())
-        && auth
-            .can_view_chat(space, head.project_folder.as_ref(), false)
-            .is_ok()
 }
 
 async fn reachable(

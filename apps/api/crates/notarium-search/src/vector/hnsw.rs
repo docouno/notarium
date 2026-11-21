@@ -245,7 +245,8 @@ pub(super) fn query_graph(
         anchors,
         Exploration {
             level: 0,
-            result_capacity: width,
+            // Oversampling can request more hits than the capped exploration width.
+            result_capacity: width.max(top_k),
             max_evaluations: width * 48,
             budget: Some(budget),
         },

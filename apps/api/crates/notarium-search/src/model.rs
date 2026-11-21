@@ -1,8 +1,8 @@
 use crate::{
     config::VectorMode,
     embed::{
-        EmbeddingError, OrtModel, Pooling, Priority, RemoteConservativeTokenizerBudget,
-        RemoteEmbedder, bounded_batches, deterministic_embedding,
+        EmbeddingError, OrtModel, Priority, RemoteConservativeTokenizerBudget, RemoteEmbedder,
+        bounded_batches, deterministic_embedding,
     },
     engine::Services,
     ports::{
@@ -132,7 +132,7 @@ impl Services {
                         dylib_path,
                         model_dir,
                     },
-                    EmbeddingBackendTarget::LocalOnnx,
+                    EmbeddingBackendTarget::LocalOnnx | EmbeddingBackendTarget::LocalOnnxCls,
                 ) => {
                     let mut installed = self.models.0.lock().await;
                     let key = target.vector_model();
@@ -142,8 +142,9 @@ impl Services {
                         let library = dylib_path.clone();
                         let root = model_dir.clone();
                         let selected = target.clone();
+                        let pooling = key.pooling;
                         let model = tokio::task::spawn_blocking(move || {
-                            OrtModel::open(&library, &root, &selected, Pooling::Mean)
+                            OrtModel::open(&library, &root, &selected, pooling)
                         })
                         .await
                         .map_err(|_| EmbeddingError::ModelUnavailable)??;
@@ -155,7 +156,10 @@ impl Services {
                     let tokenizer = model.tokenizer();
                     (Backend::Onnx(model), tokenizer)
                 }
-                (VectorMode::RemoteOnly, EmbeddingBackendTarget::LocalOnnx) => {
+                (
+                    VectorMode::RemoteOnly,
+                    EmbeddingBackendTarget::LocalOnnx | EmbeddingBackendTarget::LocalOnnxCls,
+                ) => {
                     return Err(EmbeddingError::ModelUnavailable);
                 }
             };
@@ -275,6 +279,9 @@ impl Embedder {
             existing,
         } = input;
         let remote = if let Backend::Remote(backend) = &self.backend {
+            if !note.remote_indexable {
+                return Ok((Vec::new(), false));
+            }
             let Some(resolver) = &services.deps.model_resolver else {
                 return Ok((Vec::new(), true));
             };
@@ -423,6 +430,9 @@ impl Embedder {
             .map_err(|_| EmbeddingError::InvalidModel)?;
         let backend = backend.clone();
         let target = self.target.clone();
+        let canonical = services.deps.canonical.clone();
+        let authority = services.authority.clone();
+        let note = document.reference().note_id.clone();
         services
             .scheduler
             .submit(priority, budget.clone(), move |budget| async move {
@@ -442,9 +452,26 @@ impl Embedder {
                 if selected.as_ref() != Some(&target) {
                     return Err(EmbeddingError::ModelUnavailable);
                 }
+                let remaining = budget.remaining;
                 grant.ctx.budget = budget;
                 grant.ctx.budget.remaining =
                     grant.ctx.budget.remaining.saturating_sub(started.elapsed());
+                if grant.ctx.budget.remaining.is_zero() {
+                    return Err(EmbeddingError::BudgetExceeded);
+                }
+                if !canonical
+                    .can_index_remote_search_note(
+                        &authority,
+                        grant.ctx.budget.clone(),
+                        grant.ctx.scope().clone(),
+                        note,
+                    )
+                    .await
+                    .map_err(|_| EmbeddingError::ProviderUnavailable)?
+                {
+                    return Err(EmbeddingError::ProviderUnavailable);
+                }
+                grant.ctx.budget.remaining = remaining.saturating_sub(started.elapsed());
                 if grant.ctx.budget.remaining.is_zero() {
                     return Err(EmbeddingError::BudgetExceeded);
                 }

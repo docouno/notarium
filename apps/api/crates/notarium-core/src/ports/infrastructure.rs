@@ -24,12 +24,15 @@ pub trait StructuralSnapshot: Send + Sync {
     fn doc_class(&self, node: DenseNodeId) -> DomainResult<DocClass>;
     fn folder_subtree(&self, folder: &FolderId) -> DomainResult<DenseNodeIter<'_>>;
     /// Return the active folder itself followed by its active descendants.
-    fn folder_descendants(&self, folder: &FolderId) -> DomainResult<Vec<FolderId>>;
+    fn folder_descendants<'a>(&'a self, folder: &'a FolderId) -> PortFuture<'a, Vec<FolderId>>;
     /// Include the folder itself when it is an active project root.
-    fn enclosing_project(&self, folder: &FolderId) -> DomainResult<Option<FolderId>>;
+    fn enclosing_project<'a>(&'a self, folder: &'a FolderId) -> PortFuture<'a, Option<FolderId>>;
     /// Validate against the snapshot's field schema. Return `None` when the
     /// predicate does not restrict the note set.
-    fn filter_notes(&self, filter: &FieldFilterAstV1) -> DomainResult<Option<DenseNodeIter<'_>>>;
+    fn filter_notes<'a>(
+        &'a self,
+        filter: &'a FieldFilterAstV1,
+    ) -> PortFuture<'a, Option<DenseNodeIter<'a>>>;
     fn outgoing(&self, node: DenseNodeId) -> DomainResult<DenseNodeIter<'_>>;
     fn incoming(&self, node: DenseNodeId) -> DomainResult<DenseNodeIter<'_>>;
 }

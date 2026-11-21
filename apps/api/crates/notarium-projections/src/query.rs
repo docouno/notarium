@@ -637,19 +637,15 @@ pub(crate) async fn select_view_window(
     for dense in input.overlay.keys() {
         base.remove(*dense);
     }
-    let hits = input
-        .index
-        .filter_candidates(input.filter, &base)
-        .map_err(index_failure)?;
-    let mut matching = hits.definite;
-    let uncertain = hits.uncertain;
-    for page in dense_pages(&uncertain) {
-        for note in query_rows(&input, &page).await? {
-            if input.filter.matches(&note.evaluated_fields()?) {
-                matching.add(note.dense_id);
-            }
-        }
-    }
+    let mut matching = exact_filter(
+        input.index,
+        input.store,
+        input.scope,
+        input.cut,
+        &base,
+        input.filter,
+    )
+    .await?;
     if let Some(required_tags) = verify_tags.filter(|tags| !tags.is_empty()) {
         let mut verified = Bitmap::new();
         for page in dense_pages(&matching) {
@@ -699,7 +695,7 @@ pub(crate) async fn select_view_window(
             ranks: ranks.as_ref().unwrap_or(input.ranks),
             ..input
         };
-        for note in query_rows(&input, &page).await? {
+        for note in query_rows(input.store, input.scope, input.cut, &page).await? {
             let fields = note.evaluated_fields()?;
             collect_row(
                 &base,
@@ -1086,14 +1082,36 @@ fn finish_window(
     }
 }
 
+/// Resolve bucket collisions against the stored field observations at the same cut.
+pub(crate) async fn exact_filter(
+    index: &IndexView,
+    store: &DerivedStore,
+    scope: &HistoryScope,
+    cut: SpaceSeq,
+    universe: &Bitmap,
+    predicate: &Predicate,
+) -> Result<Bitmap, PortError> {
+    let candidates = index
+        .filter_candidates(predicate, universe)
+        .map_err(index_failure)?;
+    let mut matching = candidates.definite;
+    for page in dense_pages(&candidates.uncertain) {
+        for note in query_rows(store, scope, cut, &page).await? {
+            if predicate.matches(&note.evaluated_fields()?) {
+                matching.add(note.dense_id);
+            }
+        }
+    }
+    Ok(matching)
+}
+
 async fn query_rows(
-    input: &WindowInput<'_>,
+    store: &DerivedStore,
+    scope: &HistoryScope,
+    cut: SpaceSeq,
     ids: &[u32],
 ) -> Result<Vec<ProjectedQueryRow>, PortError> {
-    let rows = input
-        .store
-        .hydrate_query_rows(input.scope, input.cut, ids)
-        .await?;
+    let rows = store.hydrate_query_rows(scope, cut, ids).await?;
     if rows.len() != ids.len() {
         return Err(stale_cut());
     }

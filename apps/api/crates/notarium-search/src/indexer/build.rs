@@ -39,12 +39,101 @@ pub(super) async fn scrub(
 
 pub(super) async fn seed(
     cx: &Context<'_>,
+    publisher: &mut Publisher<'_>,
     layout: Arc<SearchLayout>,
     cutoff: &ChangeCursor,
     prior: Option<&Disk>,
 ) -> Result<Disk, IndexError> {
-    let generations = layout.index_generations()?;
-    let generation = generations
+    // The lexical reader owns the searchable cut. A slow model may populate
+    // it afterwards, and a change of model reuses the same lexical generation.
+    let mut disk = if let Some(prior) = prior {
+        if prior.cursor() != *cutoff {
+            return Err(IndexError::Inconsistent);
+        }
+        Disk {
+            layout: layout.clone(),
+            manifest: prior.manifest.clone(),
+            folders: prior.folders.clone(),
+            lexical: prior.lexical.clone(),
+            epoch: None,
+            embedder: None,
+            embedding_failures: prior.embedding_failures,
+            vector_last_use: std::time::Instant::now(),
+        }
+    } else {
+        let disk = seed_lexical(cx, layout.clone(), cutoff).await?;
+        disk.layout.publish_search(&disk.manifest)?;
+        publisher.publish(&disk);
+        disk
+    };
+
+    let prepared = cx
+        .while_current(cutoff, async {
+            let target = cx.services.model_target(&cutoff.scope, None, None).await?;
+            let Some(target) = target else {
+                return Ok((None, None, None));
+            };
+            let model = target.vector_model();
+            if prior
+                .and_then(|prior| prior.epoch.as_ref())
+                .is_some_and(|epoch| epoch.matches_model(&model))
+            {
+                return Err(IndexError::Inconsistent);
+            }
+            let embedder = match cx.services.embedder(target.clone()).await {
+                Ok(embedder) => Arc::new(embedder),
+                Err(error) if prior.is_some_and(|prior| prior.manifest.vector_seq.is_some()) => {
+                    return Err(error.into());
+                }
+                Err(_) => return Ok((Some(target), None, None)),
+            };
+            let replacing = prior.is_some_and(|prior| prior.manifest.vector_seq.is_some());
+            let vectors =
+                seed_vectors(cx, cutoff, &disk.folders, &embedder, model, replacing).await?;
+            if cx
+                .services
+                .model_target(&cutoff.scope, None, None)
+                .await?
+                .as_ref()
+                != Some(&target)
+            {
+                return Err(crate::embed::EmbeddingError::ModelUnavailable.into());
+            }
+            Ok::<_, IndexError>((Some(target), Some(embedder), Some(vectors)))
+        })
+        .await?;
+    let (target, embedder, vectors) = match prepared {
+        Some(Ok(result)) => result,
+        Some(Err(error)) if prior.is_some() || error.requires_reseed() => return Err(error),
+        None if prior.is_some() => {
+            return Err(crate::embed::EmbeddingError::ModelUnavailable.into());
+        }
+        _ => return Ok(disk),
+    };
+    let (epoch, pending) = match vectors {
+        Some(vectors) => {
+            layout.remove_model_epoch(&vectors.model)?;
+            let (epoch, pending) = vectors.finish(layout.clone(), cutoff.after).await?;
+            (Some(epoch), pending)
+        }
+        None => (None, target.is_some()),
+    };
+    disk.manifest.vector_seq = epoch.as_ref().map(|_| cutoff.after);
+    disk.manifest.active_model = target;
+    disk.manifest.embeddings_pending = pending;
+    disk.epoch = epoch;
+    disk.embedder = embedder;
+    disk.layout.publish_search(&disk.manifest)?;
+    Ok(disk)
+}
+
+async fn seed_lexical(
+    cx: &Context<'_>,
+    layout: Arc<SearchLayout>,
+    cutoff: &ChangeCursor,
+) -> Result<Disk, IndexError> {
+    let generation = layout
+        .index_generations()?
         .last()
         .copied()
         .unwrap_or(0)
@@ -61,118 +150,41 @@ pub(super) async fn seed(
     let before = folders.len();
     folders.insert(space.root_folder_id)?;
     save_new_folders(&layout, &folders, before)?;
-
-    let (target, retry_resolution) = match cx.services.model_target(&cutoff.scope, None, None).await
-    {
-        Ok(target) => (target, false),
-        Err(error) if prior.is_some() => return Err(error.into()),
-        Err(_) => (None, true),
-    };
-    let model = target.as_ref().map(|target| target.vector_model());
-    if let Some(model) = &model
-        && prior
-            .and_then(|disk| disk.epoch.as_ref())
-            .is_some_and(|epoch| epoch.matches_model(model))
-    {
-        // The selection changed back before staging began.
-        return Err(IndexError::Inconsistent);
-    }
-    let embedder = match &target {
-        Some(target) => match cx.services.embedder(target.clone()).await {
-            Ok(embedder) => Some(Arc::new(embedder)),
-            Err(error)
-                if prior.is_some_and(|disk| {
-                    disk.manifest.vector_seq.is_some()
-                        || disk.manifest.active_model.as_ref() == Some(target)
-                }) =>
-            {
-                return Err(error.into());
-            }
-            Err(_) => None,
-        },
-        None => None,
-    };
     let path = layout.create_index_generation(generation)?;
     let result = async {
         let lexical = cx.services.readers.create(&path)?;
-        let mut vectors = embedder
-            .as_ref()
-            .zip(model.as_ref())
-            .map(|(_, model)| SeedVectors::new(model.clone()))
-            .transpose()?;
-        seed_notes(
-            cx,
-            &layout,
-            &lexical,
-            &mut folders,
-            cutoff,
-            embedder.as_deref().zip(vectors.as_mut()),
-        )
-        .await?;
-        if prior.is_some_and(|disk| disk.manifest.vector_seq.is_some())
-            && vectors.as_ref().is_some_and(|vectors| vectors.pending)
-        {
-            // Keep serving the prior epoch until the selected backend can
-            // embed the eligible replacement corpus.
-            return Err(crate::embed::EmbeddingError::ModelUnavailable.into());
-        }
+        seed_notes(cx, &layout, &lexical, &mut folders, cutoff).await?;
         seed_chats(cx, &layout, &lexical, &mut folders, cutoff).await?;
         lexical.commit_seed(&cx.services.writers)?;
-        if let Some(model) = &model {
-            layout.remove_model_epoch(model)?;
-        }
-        let (epoch, pending) = match vectors {
-            Some(vectors) => {
-                let (epoch, pending) = vectors.finish(layout.clone(), cutoff.after).await?;
-                (Some(epoch), pending)
-            }
-            None => (None, target.is_some() || retry_resolution),
-        };
-        if !retry_resolution && cx.services.model_target(&cutoff.scope, None, None).await? != target
-        {
-            // A backfill can outlive its selection. Retry with the live target.
-            return Err(crate::embed::EmbeddingError::ModelUnavailable.into());
-        }
         let manifest = SearchManifest {
             scope: cutoff.scope.clone(),
             tantivy_seq: cutoff.after,
             tantivy_commit: lexical.commit_id()?,
             active_index_dir: index_name(generation),
             tokenizer_version: TOKENIZER_VERSION,
-            active_model: target,
-            vector_seq: epoch.as_ref().map(|_| cutoff.after),
-            embeddings_pending: pending,
+            active_model: None,
+            vector_seq: None,
+            embeddings_pending: !matches!(
+                cx.services.config.vector_mode,
+                crate::config::VectorMode::Disabled
+            ),
         };
         Ok::<_, IndexError>(Disk {
             layout: layout.clone(),
             manifest,
             folders: Arc::new(folders),
             lexical: Some(lexical),
-            epoch,
-            embedder,
+            epoch: None,
+            embedder: None,
             embedding_failures: 0,
             vector_last_use: std::time::Instant::now(),
         })
     }
     .await;
-    let disk = match result {
-        Ok(disk) => disk,
-        Err(error) => {
-            cx.services.writers.release(&path)?;
-            if !cx.services.readers.release(&path)? {
-                return Err(IndexError::Inconsistent);
-            }
-            layout.remove_index_generation(generation)?;
-            if let Some(model) = &model {
-                layout.remove_model_epoch(model)?;
-            }
-            return Err(error);
-        }
-    };
-    // A crash before this point can only cause a new seed. After publishing,
-    // startup removes all unreferenced generations before exposing the cut.
-    disk.layout.publish_search(&disk.manifest)?;
-    Ok(disk)
+    if result.is_err() {
+        remove_generation(cx, &layout, generation)?;
+    }
+    result
 }
 
 pub(super) async fn refresh_model(
@@ -192,7 +204,7 @@ pub(super) async fn refresh_model(
     if reader || vectors {
         publisher.publish(disk);
     }
-    seed(cx, disk.layout.clone(), &cutoff, Some(disk))
+    seed(cx, publisher, disk.layout.clone(), &cutoff, Some(disk))
         .await
         .map(Some)
 }
@@ -225,58 +237,14 @@ async fn seed_notes(
     lexical: &LexicalIndex,
     folders: &mut FolderDictionary,
     cutoff: &ChangeCursor,
-    mut vectors: Option<(&Embedder, &mut SeedVectors)>,
 ) -> Result<(), IndexError> {
     let mut after = None;
     loop {
-        let page = cx
-            .services
-            .deps
-            .carriers
-            .read_searchable_notes_seed_page(
-                cx.services.authority.clone(),
-                cx.budget(),
-                cutoff.scope.clone(),
-                Some(cutoff.after),
-                after,
-                PageLimit::new(100)?,
-            )
-            .await?;
-        if page.cutoff != *cutoff {
-            return Err(IndexError::Inconsistent);
-        }
+        let page = note_page(cx, cutoff, after).await?;
         let before = folders.len();
         let mut prepared = Vec::new();
-        let mut pending_vectors: Vec<VectorChunk> = Vec::new();
-        let mut page_keys = HashMap::<_, usize>::new();
         for note in page.notes {
             if let Some((content, folder)) = prepare_note(cx, folders, &note)? {
-                if let Some((embedder, builder)) = vectors.as_mut() {
-                    let existing = |key| {
-                        page_keys
-                            .get(&key)
-                            .map(|&slot| pending_vectors[slot].vector.clone())
-                            .or_else(|| builder.builder.as_ref()?.find_vector(key).cloned())
-                    };
-                    let (for_note, pending) = embedder
-                        .index_note(IndexNote {
-                            services: cx.services,
-                            scope: &cutoff.scope,
-                            note: &note,
-                            folder: folder.get(),
-                            budget: cx.budget(),
-                            priority: Priority::BulkImportBackfill,
-                            existing: &existing,
-                        })
-                        .await?;
-                    builder.pending |= pending;
-                    for (position, chunk) in for_note.iter().enumerate() {
-                        page_keys
-                            .entry(chunk.metadata.key)
-                            .or_insert(pending_vectors.len() + position);
-                    }
-                    pending_vectors.extend(for_note);
-                }
                 prepared.push((content, note.title, folder));
             }
         }
@@ -290,13 +258,93 @@ async fn seed_notes(
             })
             .collect();
         lexical.stage_seed(&cx.services.writers, &updates)?;
-        if let Some((_, vectors)) = vectors.as_mut() {
-            vectors.push(pending_vectors).await?;
-        }
-        if let Some(next) = page.next_after {
-            after = Some(next);
-        } else {
+        after = page.next_after;
+        if after.is_none() {
             return Ok(());
+        }
+    }
+}
+
+async fn note_page(
+    cx: &Context<'_>,
+    cutoff: &ChangeCursor,
+    after: Option<notarium_core::ids::NoteId>,
+) -> Result<crate::ports::SearchNotesSeedPage, IndexError> {
+    let page = cx
+        .services
+        .deps
+        .carriers
+        .read_searchable_notes_seed_page(
+            cx.services.authority.clone(),
+            cx.budget(),
+            cutoff.scope.clone(),
+            Some(cutoff.after),
+            after,
+            PageLimit::new(100)?,
+        )
+        .await?;
+    if page.cutoff != *cutoff {
+        return Err(IndexError::Inconsistent);
+    }
+    Ok(page)
+}
+
+async fn seed_vectors(
+    cx: &Context<'_>,
+    cutoff: &ChangeCursor,
+    folders: &FolderDictionary,
+    embedder: &Embedder,
+    model: VectorModel,
+    require_complete: bool,
+) -> Result<SeedVectors, IndexError> {
+    let mut vectors = SeedVectors::new(model)?;
+    let mut after = None;
+    loop {
+        let page = note_page(cx, cutoff, after).await?;
+        let mut records: Vec<VectorChunk> = Vec::new();
+        let mut page_keys = HashMap::<_, usize>::new();
+        for note in page.notes {
+            if note.document.lifecycle() != Lifecycle::Active
+                || note.document.class() == DocClass::EncryptedNote
+                || ClassEgressFence::index_for_search(note.document.clone(), &cx.services.authority)
+                    .is_err()
+            {
+                continue;
+            }
+            let folder = folders
+                .get(&note.parent_folder_id)
+                .ok_or(IndexError::Inconsistent)?;
+            let (for_note, pending) = embedder
+                .index_note(IndexNote {
+                    services: cx.services,
+                    scope: &cutoff.scope,
+                    note: &note,
+                    folder: folder.get(),
+                    budget: cx.budget(),
+                    priority: Priority::BulkImportBackfill,
+                    existing: &|key| {
+                        page_keys
+                            .get(&key)
+                            .map(|&slot| records[slot].vector.clone())
+                            .or_else(|| vectors.builder.as_ref()?.find_vector(key).cloned())
+                    },
+                })
+                .await?;
+            if require_complete && pending {
+                return Err(crate::embed::EmbeddingError::ModelUnavailable.into());
+            }
+            vectors.pending |= pending;
+            for (offset, chunk) in for_note.iter().enumerate() {
+                page_keys
+                    .entry(chunk.metadata.key)
+                    .or_insert(records.len() + offset);
+            }
+            records.extend(for_note);
+        }
+        vectors.push(records).await?;
+        after = page.next_after;
+        if after.is_none() {
+            return Ok(vectors);
         }
     }
 }

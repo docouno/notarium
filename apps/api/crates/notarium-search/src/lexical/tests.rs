@@ -9,7 +9,7 @@ use notarium_core::{
         SpaceId, SpaceSeq,
     },
     model::{DenseNodeId, DenseNodeIter, HistoryScope, Lifecycle, NoteRef, SnapshotCut},
-    ports::{Cancellation, ServiceAuthority, ServicePurpose},
+    ports::{Cancellation, PortFuture, ServiceAuthority, ServicePurpose},
     query::FieldFilterAstV1,
 };
 use std::{fs, time::Duration};
@@ -33,6 +33,8 @@ impl Drop for TestDir {
 struct Snapshot {
     cut: SnapshotCut,
     notes: Vec<NoteId>,
+    lookups: std::sync::atomic::AtomicUsize,
+    cancel_at: Option<(usize, Cancellation)>,
 }
 impl Snapshot {
     fn new(notes: impl IntoIterator<Item = NoteId>) -> Self {
@@ -47,6 +49,8 @@ impl Snapshot {
                 projected_seq: SpaceSeq::new(1).unwrap(),
             },
             notes: notes.into_iter().collect(),
+            lookups: Default::default(),
+            cancel_at: None,
         }
     }
 }
@@ -55,6 +59,14 @@ impl StructuralSnapshot for Snapshot {
         &self.cut
     }
     fn lookup(&self, note: &NoteId) -> Option<DenseNodeId> {
+        let previous = self
+            .lookups
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some((threshold, signal)) = &self.cancel_at
+            && previous == *threshold
+        {
+            signal.cancel();
+        }
         self.notes
             .iter()
             .position(|id| id == note)
@@ -76,14 +88,17 @@ impl StructuralSnapshot for Snapshot {
             0..self.notes.len() as u32,
         ))
     }
-    fn folder_descendants(&self, folder: &FolderId) -> DomainResult<Vec<FolderId>> {
-        Ok(vec![folder.clone()])
+    fn folder_descendants<'a>(&'a self, folder: &'a FolderId) -> PortFuture<'a, Vec<FolderId>> {
+        Box::pin(async move { Ok(vec![folder.clone()]) })
     }
-    fn enclosing_project(&self, _: &FolderId) -> DomainResult<Option<FolderId>> {
-        Ok(None)
+    fn enclosing_project<'a>(&'a self, _: &'a FolderId) -> PortFuture<'a, Option<FolderId>> {
+        Box::pin(async move { Ok(None) })
     }
-    fn filter_notes(&self, _: &FieldFilterAstV1) -> DomainResult<Option<DenseNodeIter<'_>>> {
-        Ok(None)
+    fn filter_notes<'a>(
+        &'a self,
+        _: &'a FieldFilterAstV1,
+    ) -> PortFuture<'a, Option<DenseNodeIter<'a>>> {
+        Box::pin(async move { Ok(None) })
     }
     fn outgoing(&self, _: DenseNodeId) -> DomainResult<DenseNodeIter<'_>> {
         Ok(DenseNodeIter::from_slice(self.cut.generation, &[]))
@@ -418,4 +433,51 @@ fn reader_cache_enforces_its_bound_without_evicting_pinned_generations() {
     cache.create(&path(32)).unwrap();
     assert!(cache.release(&path(32)).unwrap());
     assert!(!cache.release(&path(0)).unwrap());
+}
+
+#[test]
+fn sparse_matches_only_check_postings_and_broad_matches_obey_cancellation() {
+    use crate::vector::SearchBudget;
+    use std::sync::atomic::Ordering;
+    let scratch = TestDir::new();
+    let mut snapshot = Snapshot::new((1..=250).map(|seed| NoteId::from_bytes([seed; 16])));
+    let index = LexicalIndex::create(&scratch.0).unwrap();
+    let folder = FolderDictionary::default()
+        .insert(FolderId::from_bytes([1; 16]))
+        .unwrap();
+    let documents: Vec<_> = (1..=250)
+        .map(|i| {
+            note(
+                if i == 173 { "common rare" } else { "common" },
+                i,
+                &snapshot.cut.scope,
+            )
+        })
+        .collect();
+    let updates: Vec<_> = documents
+        .iter()
+        .map(|content| Update::Note {
+            content,
+            title: "",
+            folder,
+        })
+        .collect();
+    index.apply(&WriterPool::default(), &updates).unwrap();
+    let filter = LexicalFilter::new(&snapshot, None, None, [DocClass::UserDoc], false);
+    assert_eq!(index.search("rare", &filter, 1, false).unwrap().len(), 1);
+    assert_eq!(snapshot.lookups.load(Ordering::Relaxed), 1);
+
+    let stop = Cancellation::default();
+    snapshot.cancel_at = Some((30, stop.clone()));
+    let filter = LexicalFilter::new(&snapshot, None, None, [DocClass::UserDoc], false).within(
+        SearchBudget {
+            cancellation: &stop,
+            deadline: std::time::Instant::now() + Duration::from_secs(60),
+        },
+    );
+    assert!(matches!(
+        index.search("common", &filter, 1, false),
+        Err(LexicalError::Stopped)
+    ));
+    assert!(snapshot.lookups.load(Ordering::Relaxed) < 150);
 }

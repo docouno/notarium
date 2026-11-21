@@ -38,7 +38,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-struct LocalResolver(BTreeMap<SpaceId, ModelProfileId>);
+struct LocalResolver(
+    BTreeMap<SpaceId, ModelProfileId>,
+    std::sync::atomic::AtomicBool,
+);
 
 impl SearchModelResolverPort for LocalResolver {
     fn resolve_model<'a>(
@@ -59,7 +62,11 @@ impl SearchModelResolverPort for LocalResolver {
                     model: model.clone(),
                     dimension: 64,
                     max_input_tokens: 512,
-                    backend: EmbeddingBackendTarget::LocalOnnx,
+                    backend: if self.1.load(std::sync::atomic::Ordering::SeqCst) {
+                        EmbeddingBackendTarget::LocalOnnxCls
+                    } else {
+                        EmbeddingBackendTarget::LocalOnnx
+                    },
                 }))
         })
     }
@@ -152,10 +159,13 @@ pub async fn search_with_dynamic_models(store: Arc<CanonicalStore>, root: DataRo
     let (slow, slow_seq, slow_projection) = seed(store.clone(), 0x71, "Cool palette", "blue").await;
     let fast_model = ModelProfileId::from_bytes([0x70; 16]);
     let slow_model = ModelProfileId::from_bytes([0x71; 16]);
-    let resolver = Arc::new(LocalResolver(BTreeMap::from([
-        (fast.scope().space_id.clone(), fast_model.clone()),
-        (slow.scope().space_id.clone(), slow_model.clone()),
-    ])));
+    let resolver = Arc::new(LocalResolver(
+        BTreeMap::from([
+            (fast.scope().space_id.clone(), fast_model.clone()),
+            (slow.scope().space_id.clone(), slow_model.clone()),
+        ]),
+        Default::default(),
+    ));
     let projection = Arc::new(Projections(BTreeMap::from([
         (fast.scope().space_id.clone(), fast_projection),
         (slow.scope().space_id.clone(), slow_projection),
@@ -270,8 +280,43 @@ pub async fn search_with_dynamic_models(store: Arc<CanonicalStore>, root: DataRo
         timed.degraded,
         Some(SearchDegradation::BudgetExceeded)
     ));
-    let after = engine.search(fast, query("red")).await.unwrap();
+    let after = engine.search(fast.clone(), query("red")).await.unwrap();
     assert_eq!(after.hits[0].card.title, "Warm palette");
     assert!(after.degraded.is_none());
+
+    // The first fixture token has a zero output, the second is a basis vector.
+    // Only mean pooling can produce a query embedding from this pair.
+    assert!(
+        engine
+            .search(fast.clone(), query("zero red"))
+            .await
+            .unwrap()
+            .degraded
+            .is_none()
+    );
+    resolver.1.store(true, std::sync::atomic::Ordering::SeqCst);
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let result = engine
+                .search(fast.clone(), query("zero red"))
+                .await
+                .unwrap();
+            if matches!(
+                layout
+                    .search_manifest()
+                    .unwrap()
+                    .unwrap()
+                    .active_model
+                    .map(|m| m.backend),
+                Some(EmbeddingBackendTarget::LocalOnnxCls)
+            ) && matches!(result.degraded, Some(SearchDegradation::ModelUnavailable))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
     engine.shutdown().await;
 }

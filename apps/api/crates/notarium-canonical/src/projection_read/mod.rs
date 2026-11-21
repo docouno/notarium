@@ -60,6 +60,7 @@ pub use aliases::{
     ProjectionAlias, ProjectionAliasCursor, ProjectionFolderAlias, ProjectionNoteAlias,
 };
 pub use delta::{ProjectionAbility, ProjectionDelta};
+pub(crate) use exact::structural_overlay_supported;
 pub use exact::{ProjectionOverlayNote, ProjectionOverlaySelection};
 pub use ranks::{ProjectionRank, ProjectionRankKey};
 
@@ -569,7 +570,7 @@ async fn checked_cut(
     validate_cut(tx, &record, cutoff).await
 }
 
-async fn schema_at(
+pub(crate) async fn schema_at(
     tx: &mut BackendConn<'_>,
     scope: &HistoryScope,
     cut: SpaceSeq,

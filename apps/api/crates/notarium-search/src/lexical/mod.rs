@@ -6,13 +6,14 @@ mod pool;
 mod query;
 mod schema;
 
+pub(crate) use analysis::ChunkRelevance;
 pub use analysis::{TOKENIZER_VERSION, extract_note_body};
 pub use collector::LexicalFilter;
 pub use pool::{ReaderCache, WriterPool};
 
 use self::{
     analysis::{EXACT, Exact, PROSE, Prose},
-    collector::DocFilterCollector,
+    collector::collect_filtered,
     query::QueryPlan,
     schema::{CHAT, Fields, NOTE, class_ord, decode_chat_locator},
 };
@@ -45,6 +46,8 @@ pub enum LexicalError {
     Tantivy(#[from] tantivy::TantivyError),
     #[error("lexical index I/O failed")]
     Io(#[from] std::io::Error),
+    #[error("lexical search stopped")]
+    Stopped,
     #[error("invalid lexical index format")]
     CorruptIndex,
     #[error("lexical writer unavailable")]
@@ -83,6 +86,12 @@ pub enum HitKey {
 pub struct LexicalHit {
     pub key: HitKey,
     pub score: f32,
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ChatCursor {
+    relaxed: bool,
+    after: Option<(f32, DocAddress)>,
 }
 
 pub struct LexicalIndex {
@@ -336,6 +345,55 @@ impl LexicalIndex {
         )
     }
 
+    pub(crate) fn chat_page(
+        &self,
+        searcher: &Searcher,
+        text: &str,
+        filter: &LexicalFilter<'_>,
+        limit: usize,
+        cursor: ChatCursor,
+    ) -> Result<(Vec<LexicalHit>, Option<ChatCursor>), LexicalError> {
+        use tantivy::query::{BooleanQuery, Occur, Query};
+        let plan = QueryPlan::parse(text, &self.fields.bodies[3..], false)?;
+        let query: Box<dyn Query> = if cursor.relaxed {
+            // The second pass only contributes documents absent from the strict pass.
+            Box::new(BooleanQuery::new(vec![
+                (Occur::Must, plan.query(true)),
+                (Occur::MustNot, plan.query(false)),
+            ]))
+        } else {
+            plan.query(false)
+        };
+        let collector = TopDocs::with_limit(limit + 1).order_by_score();
+        let mut scores = collect_filtered(
+            searcher,
+            query.as_ref(),
+            &collector,
+            filter,
+            false,
+            cursor.after,
+        )?;
+        let next = if scores.len() > limit {
+            scores.truncate(limit);
+            Some(ChatCursor {
+                relaxed: cursor.relaxed,
+                after: scores.last().copied(),
+            })
+        } else if !cursor.relaxed && plan.can_fallback() {
+            Some(ChatCursor {
+                relaxed: true,
+                after: None,
+            })
+        } else {
+            None
+        };
+        let hits = scores
+            .into_iter()
+            .map(|(score, addr)| decode_hit(searcher, addr, score))
+            .collect::<Result<_, _>>()?;
+        Ok((hits, next))
+    }
+
     /// Score only receipt-bound rows already admitted by the query filters.
     /// A RAM directory uses the same schema, tokenizers and query parser.
     pub(crate) fn rank_overlay(
@@ -343,20 +401,27 @@ impl LexicalIndex {
         text: &str,
         updates: &[Update<'_>],
         filtered: bool,
+        budget: crate::vector::SearchBudget<'_>,
     ) -> Result<Vec<LexicalHit>, LexicalError> {
         if updates.is_empty() {
             return Ok(Vec::new());
         }
+        collector::check_budget(Some(budget))?;
         let fields = Fields::new();
         let index = Index::create_in_ram(fields.schema.clone());
         let lexical = Self::from_index(PathBuf::new(), index, fields)?;
         writers.with_temporary_writer(&lexical.index, |writer| {
-            for (_, document) in lexical.mutations(updates)? {
-                writer.add_document(document.ok_or(LexicalError::CorruptIndex)?)?;
+            for update in updates {
+                collector::check_budget(Some(budget))?;
+                for (_, document) in lexical.mutations(std::slice::from_ref(update))? {
+                    writer.add_document(document.ok_or(LexicalError::CorruptIndex)?)?;
+                }
             }
+            collector::check_budget(Some(budget))?;
             writer.commit()?;
             Ok(())
         })?;
+        collector::check_budget(Some(budget))?;
         lexical.reader.reload()?;
         let searcher = lexical.searcher();
         let plan = QueryPlan::parse(text, &lexical.fields.bodies[..3], filtered)?;
@@ -406,26 +471,38 @@ fn search_pinned(
     };
     let query = QueryPlan::parse(text, fields, filtered)?;
     if query.browse {
-        let collector = DocFilterCollector {
-            inner: TopDocs::with_limit(candidate_limit)
-                .order_by((SortByBytes::for_field("note_id_raw"), Order::Asc)),
+        let collector = TopDocs::with_limit(candidate_limit)
+            .order_by((SortByBytes::for_field("note_id_raw"), Order::Asc));
+        return collect_filtered(
+            searcher,
+            query.query(false).as_ref(),
+            &collector,
             filter,
-            browse: true,
-        };
-        return searcher
-            .search(query.query(false).as_ref(), &collector)?
-            .into_iter()
-            .map(|(_, address)| decode_hit(searcher, address, 1.0))
-            .collect();
+            true,
+            None,
+        )?
+        .into_iter()
+        .map(|(_, address)| decode_hit(searcher, address, 1.0))
+        .collect();
     }
-    let collector = DocFilterCollector {
-        inner: TopDocs::with_limit(candidate_limit).order_by_score(),
+    let collector = TopDocs::with_limit(candidate_limit).order_by_score();
+    let mut ranked = collect_filtered(
+        searcher,
+        query.query(false).as_ref(),
+        &collector,
         filter,
-        browse: false,
-    };
-    let mut ranked = searcher.search(query.query(false).as_ref(), &collector)?;
+        false,
+        None,
+    )?;
     if ranked.len() < candidate_limit && query.can_fallback() {
-        let fallback = searcher.search(query.query(true).as_ref(), &collector)?;
+        let fallback = collect_filtered(
+            searcher,
+            query.query(true).as_ref(),
+            &collector,
+            filter,
+            false,
+            None,
+        )?;
         let seen: std::collections::HashSet<_> = ranked.iter().map(|(_, addr)| *addr).collect();
         ranked.extend(
             fallback
@@ -479,7 +556,13 @@ impl<'a> LexicalFilter<'a> {
             include_chats,
             chat_viewer: None,
             excluded: None,
+            budget: None,
         }
+    }
+
+    pub(crate) fn within(mut self, budget: crate::vector::SearchBudget<'a>) -> Self {
+        self.budget = Some(budget);
+        self
     }
 
     pub fn excluding(mut self, notes: &'a BTreeSet<NoteId>) -> Self {

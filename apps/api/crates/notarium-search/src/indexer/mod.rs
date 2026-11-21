@@ -70,6 +70,36 @@ struct Context<'a> {
 }
 
 impl Context<'_> {
+    /// Let a slow embedding pass yield to newer canonical work. The second
+    /// subscription is only opened when the computation actually stalls.
+    async fn while_current<T>(
+        &self,
+        cutoff: &ChangeCursor,
+        work: impl Future<Output = T>,
+    ) -> Result<Option<T>, IndexError> {
+        let advanced = async {
+            sleep(Duration::from_millis(50)).await;
+            let mut changes = self
+                .services
+                .deps
+                .changes
+                .subscribe(self.maintenance(), cutoff.clone())
+                .await?;
+            loop {
+                match changes.next().await? {
+                    Some(ChangeNotice::SeedRequired { cutoff: initial }) if initial == *cutoff => {}
+                    _ => return Ok(None),
+                }
+            }
+        };
+        tokio::select! {
+            biased;
+            () = self.handle.stop.cancelled() => Ok(None),
+            result = work => Ok(Some(result)),
+            changed = advanced => changed,
+        }
+    }
+
     fn budget(&self) -> CallBudget {
         static REQUEST: AtomicU64 = AtomicU64::new(0);
         let mut id = [0; 16];
@@ -295,8 +325,13 @@ async fn consume_with_schedule(
     tick_interval: Duration,
     vector_idle: Duration,
 ) -> Result<Option<HistoryScope>, IndexError> {
-    let latest = cx.latest(&starting_scope).await?;
-    let scope = latest.scope;
+    let record = cx
+        .services
+        .deps
+        .canonical
+        .read_space(&starting_scope.space_id)
+        .await?;
+    let scope = record.scope;
     let layout = Arc::new(SearchLayout::open(
         &cx.services.config.data_root,
         scope.clone(),
@@ -304,7 +339,29 @@ async fn consume_with_schedule(
     if scope != starting_scope {
         layout.clear_lexical_manifests()?;
     }
-    let mut disk = open_disk(cx, publisher, layout.clone(), latest.after).await?;
+    if record.space.lifecycle != notarium_core::auth::SpaceLifecycle::Active {
+        // Archiving can race a purge or redaction. Retire every derived copy
+        // before waiting for reactivation, without opening a reader or carrier.
+        build::scrub(cx, publisher, &layout).await?;
+        loop {
+            tokio::select! {
+                () = cx.handle.stop.cancelled() => return Ok(None),
+                () = sleep(MAINTENANCE_TICK) => {}
+            }
+            let current = cx
+                .services
+                .deps
+                .canonical
+                .read_space(&scope.space_id)
+                .await?;
+            if current.scope != scope
+                || current.space.lifecycle == notarium_core::auth::SpaceLifecycle::Active
+            {
+                return Ok(Some(current.scope));
+            }
+        }
+    }
+    let mut disk = open_disk(cx, publisher, layout.clone(), record.last_seq).await?;
     let start = disk
         .as_ref()
         .map(Disk::cursor)
@@ -339,7 +396,8 @@ async fn consume_with_schedule(
                             if current.resume_vectors(cx).await? {
                                 publisher.publish(current);
                             }
-                            repair.page(cx, current, publisher).await?;
+                            let cutoff = current.cursor();
+                            cx.while_current(&cutoff, repair.page(cx, current, publisher)).await?.transpose()?;
                         }
                         continue;
                     }
@@ -487,7 +545,7 @@ async fn consume_with_schedule(
                     drop(disk.take());
                     build::scrub(cx, publisher, &layout).await?;
                 }
-                match build::seed(cx, layout.clone(), &cutoff, disk.as_ref()).await {
+                match build::seed(cx, publisher, layout.clone(), &cutoff, disk.as_ref()).await {
                     Ok(seeded) => {
                         drop(disk.replace(seeded));
                         repair = update::EmbeddingRepair::default();

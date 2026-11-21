@@ -856,6 +856,7 @@ async fn sqlite_hybrid_seed_causal_boundaries_and_scrub() {
     .unwrap();
     let store = Arc::new(store);
     run_scenario(store.clone(), data.data_root(), 0x42).await;
+    hybrid_support::remote::trashed_ancestor(store.clone(), data.data_root()).await;
     hybrid_support::remote::lexical_fallback(store.clone(), data.data_root()).await;
     chat_candidate_visibility(store.clone(), data.data_root()).await;
     reader_capacity(store.clone(), data.data_root()).await;
@@ -885,6 +886,7 @@ async fn postgres_hybrid_seed_causal_boundaries_and_scrub() {
     let (store, runtime) = CanonicalRuntime::open(config).await.unwrap();
     let store = Arc::new(store);
     run_scenario(store.clone(), data.data_root(), 0x43).await;
+    hybrid_support::remote::trashed_ancestor(store.clone(), data.data_root()).await;
     hybrid_support::remote::lexical_fallback(store.clone(), data.data_root()).await;
     chat_candidate_visibility(store.clone(), data.data_root()).await;
     reader_capacity(store.clone(), data.data_root()).await;
@@ -1303,8 +1305,45 @@ async fn chat_candidate_visibility(store: Arc<CanonicalStore>, root: DataRoot) {
     assert_eq!(owner_results.chat_hits.len(), 1);
     assert_eq!(owner_results.chat_hits[0].thread, shared);
     assert!(!owner_results.truncated);
-    let other_results = engine.search(other_ctx, req.clone()).await.unwrap();
+    let other_results = engine.search(other_ctx.clone(), req.clone()).await.unwrap();
     assert_eq!(other_results.chat_hits[0].kind, ChatThreadKind::Personal);
+    let private = &other_results.chat_hits[0];
+    let run = notarium_core::ids::AgentRunId::from_bytes([0x59; 16]);
+    for confined in [
+        other_ctx
+            .auth()
+            .for_agent_run(
+                run.clone(),
+                space.scope.space_id.clone(),
+                notarium_core::auth::ChatAudience::Shared,
+                other_ctx.auth().spaces().clone(),
+            )
+            .unwrap(),
+        other_ctx
+            .auth()
+            .for_keeper(run, space.scope.space_id.clone(), None, BTreeSet::new())
+            .unwrap(),
+    ] {
+        let ctx = notarium_core::ports::SpaceContext::new(
+            confined,
+            space.scope.clone(),
+            other_ctx.budget.clone(),
+        )
+        .unwrap();
+        let (rows, _) = store
+            .hydrate_live_visible_chat_hits(
+                &ctx,
+                &[(private.thread.clone(), private.entry)],
+                req.top_k,
+            )
+            .await
+            .unwrap();
+        assert!(rows.is_empty());
+        let results = engine.search(ctx, req.clone()).await.unwrap();
+        assert_eq!(results.chat_hits.len(), 1);
+        assert_eq!(results.chat_hits[0].thread, shared);
+        assert!(!results.truncated);
+    }
     let viewer = context_with_grant(
         &space.scope,
         &other,
@@ -1372,7 +1411,83 @@ async fn chat_candidate_visibility(store: Arc<CanonicalStore>, root: DataRoot) {
     );
     engine.shutdown().await;
 
+    let thread = store
+        .read_chat(
+            other_ctx.clone(),
+            ChatRead {
+                thread: private.thread.clone(),
+                leaf: private.entry,
+                before: None,
+                max_entries: PageLimit::new(1).unwrap(),
+            },
+        )
+        .await
+        .unwrap()
+        .thread;
+    store
+        .redact_chat_entry(
+            other_ctx.clone(),
+            mutation(
+                &other_ctx,
+                RedactChatEntry {
+                    thread: private.thread.clone(),
+                    entry: private.entry,
+                    expected_thread_revision: thread.revision,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    set_space_state(
+        &store,
+        &context(&space.scope, &owner),
+        notarium_core::auth::SpaceLifecycle::Archived,
+    )
+    .await;
+    let archived = SearchEngine::start(
+        SearchConfig::new(root.clone(), VectorMode::Disabled),
+        SearchDependencies::new(store.clone(), projection),
+    );
+    archived.start_space(space.scope.clone()).unwrap();
+    wait_for_retirement(&layout).await;
+    archived.shutdown().await;
+
     tainted_chat_below_limit(store, root, owner).await;
+}
+
+async fn set_space_state(
+    store: &CanonicalStore,
+    ctx: &notarium_core::ports::SpaceContext,
+    lifecycle: notarium_core::auth::SpaceLifecycle,
+) {
+    use notarium_core::{ports::ControlCatalogPort, receipt::AccountCommandIdentity};
+    let identity = mutation(ctx, ()).identity;
+    store
+        .change_lifecycle(
+            ctx.budget.clone(),
+            AccountCommandIdentity {
+                owner: ctx.auth().principal().clone(),
+                actor: identity.actor,
+                key: identity.key,
+                hash: identity.hash,
+                expected: notarium_core::ids::ControlRevision::ZERO,
+            },
+            ctx.scope().clone(),
+            lifecycle,
+        )
+        .await
+        .unwrap();
+}
+
+async fn wait_for_retirement(layout: &SearchLayout) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !layout.index_generations().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(layout.search_manifest().unwrap().is_none());
 }
 
 async fn tainted_chat_below_limit(
@@ -1496,7 +1611,7 @@ async fn purge_and_rebind(store: Arc<CanonicalStore>, root: DataRoot) {
             incarnation: sample_incarnation(0x62),
             root_folder_id: folder.clone(),
             slug: "indexed-history".to_owned(),
-            kind: SpaceKind::Personal,
+            kind: SpaceKind::Shared,
             owner: owner.clone(),
             active_epoch: lease,
             initial_last_seq: SpaceSeq::ZERO,
@@ -1594,8 +1709,13 @@ async fn purge_and_rebind(store: Arc<CanonicalStore>, root: DataRoot) {
         .write()
         .unwrap()
         .advance(purged.receipt.seq());
+    set_space_state(&store, &ctx, notarium_core::auth::SpaceLifecycle::Archived).await;
     let engine = start();
     engine.start_space(space.scope.clone()).unwrap();
+    let archived = SearchLayout::open(&root, space.scope.clone()).unwrap();
+    wait_for_retirement(&archived).await;
+    assert_absent(&vectors, old.as_str());
+    set_space_state(&store, &ctx, notarium_core::auth::SpaceLifecycle::Active).await;
     tokio::time::timeout(Duration::from_secs(5), carriers.seed_rejected.notified())
         .await
         .unwrap();
@@ -2167,4 +2287,170 @@ async fn exact_overlay_auth_and_structural_folder_receipts(
     pages.release();
     acknowledged(&store, &root, &scope, trash_seq).await;
     engine.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lexical_evidence_and_live_chat_pagination() {
+    let _guard = INTEGRATION_LOCK.lock().await;
+    let data = TempDataRoot::new("search-lexical-pages");
+    let root = data.data_root();
+    let (store, runtime) = CanonicalRuntime::open(CanonicalConfig::local_default(
+        sample_installation_id(0x31),
+        root.clone(),
+    ))
+    .await
+    .unwrap();
+    let store = Arc::new(store);
+    let owner = sample_principal_id(0x31);
+    let folder = sample_folder_id(0x31);
+    let lease = LeaseEpoch::new(1).unwrap();
+    let scope = store
+        .create_space(CreateSpaceSpec {
+            space_id: sample_space_id(0x31),
+            incarnation: sample_incarnation(0x31),
+            root_folder_id: folder.clone(),
+            slug: "lexical-pages".into(),
+            kind: SpaceKind::Personal,
+            owner: owner.clone(),
+            active_epoch: lease,
+            initial_last_seq: SpaceSeq::ZERO,
+            created_at: None,
+        })
+        .await
+        .unwrap()
+        .scope;
+    let ctx = context(&scope, &owner);
+    let id = sample_note_id(32);
+    let text = "## First\n\nUnrelated.\n\n## Second\n\nIntroduction.\n\n## Third\n\nBackground.\n\n## Fourth\n\nRareWidget::dispatch";
+    store
+        .commit_synthetic_note_batch_for_test(
+            &scope,
+            lease,
+            &owner,
+            vec![note(&id, &folder, "Reference", text)],
+        )
+        .await
+        .unwrap();
+    let thread = ChatThreadId::from_bytes([31; 16]);
+    store
+        .create_chat(
+            ctx.clone(),
+            mutation(
+                &ctx,
+                CreateChat {
+                    thread: thread.clone(),
+                    kind: ChatThreadKind::Personal,
+                    owner: owner.clone(),
+                    project_folder: None,
+                    title: "Paged results".into(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let mut parent = ThreadEntrySeq::ZERO;
+    let mut first = None;
+    let mut last = SpaceSeq::ZERO;
+    for index in 0..201 {
+        let body = if index == 0 {
+            format!("pageterm {}", "background ".repeat(48))
+        } else {
+            "pageterm pageterm".into()
+        };
+        let appended = store
+            .append_chat(
+                ctx.clone(),
+                mutation(
+                    &ctx,
+                    AppendChat {
+                        thread: thread.clone(),
+                        parent,
+                        kind: ChatEntryKind::Human,
+                        body: ChatInputBody::Text(body),
+                        referenced_notes: vec![],
+                        tainted: false,
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        parent = appended.value.seq;
+        first.get_or_insert(parent);
+        last = appended.receipt.seq();
+    }
+
+    let mut view = View::new(scope.clone(), folder.clone());
+    view.index(id.clone(), folder);
+    view.advance(last);
+    let projection = Arc::new(Projection {
+        store: store.clone(),
+        snapshot: RwLock::new(view),
+        live: RwLock::new([id].into()),
+    });
+    let pages = Arc::new(HeldPages::new(store.clone()));
+    let mut deps = SearchDependencies::new(store.clone(), projection);
+    deps.changes = pages.clone();
+    let engine = SearchEngine::start(SearchConfig::new(root.clone(), VectorMode::Disabled), deps);
+    engine.start_space(scope.clone()).unwrap();
+    acknowledged(&store, &root, &scope, last).await;
+    let hit = engine
+        .search(ctx.clone(), query("RareWidget::dispatch"))
+        .await
+        .unwrap();
+    assert!(
+        hit.hits[0].chunks[0]
+            .text()
+            .contains("RareWidget::dispatch")
+    );
+    let tokens = hit.hits[0].chunks[0].part().tokens();
+    let recall = engine
+        .recall(
+            ctx.clone(),
+            RecallQuery {
+                query: query("RareWidget::dispatch"),
+                graph_depth: 0,
+                token_budget: tokens,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(recall.hits[0].chunks.len(), 1);
+    assert!(
+        recall.hits[0].chunks[0]
+            .text()
+            .contains("RareWidget::dispatch")
+    );
+
+    let mut request = query("pageterm");
+    request.include_chats = true;
+    request.top_k = PageLimit::new(200).unwrap();
+    let all = engine.search(ctx.clone(), request.clone()).await.unwrap();
+    assert_eq!(all.chat_hits.len(), 200);
+    assert!(all.truncated);
+
+    // Keep the lexical cut pinned while the canonical branch drops all 200
+    // higher-scoring entries. The remaining, weaker entry must still be found.
+    pages.hold(last);
+    let first = first.unwrap();
+    store
+        .fork_chat(
+            ctx.clone(),
+            mutation(
+                &ctx,
+                notarium_core::ports::ForkChat {
+                    thread,
+                    parent: first,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    request.top_k = PageLimit::new(1).unwrap();
+    let visible = engine.search(ctx, request).await.unwrap();
+    assert_eq!(visible.chat_hits.len(), 1);
+    assert_eq!(visible.chat_hits[0].entry, first);
+    assert!(!visible.truncated);
+    pages.release();
+    engine.shutdown().await;
+    runtime.shutdown().await.unwrap();
 }

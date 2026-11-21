@@ -212,6 +212,92 @@ pub(super) fn atoms(text: &str) -> BTreeSet<String> {
     result
 }
 
+/// Rank canonical chunks using the same prose stems, identifier aliases and
+/// phrase positions as the document index. Equal evidence keeps source order.
+pub(crate) struct ChunkRelevance {
+    prose: Prose,
+    prose_terms: BTreeSet<String>,
+    exact_terms: BTreeSet<String>,
+    phrases: Vec<(Vec<Token>, Vec<Token>)>,
+}
+
+fn exact_tokens(text: &str) -> Vec<Token> {
+    Exact.token_stream(text).pending.collect()
+}
+
+impl ChunkRelevance {
+    pub(crate) fn new(text: &str) -> Self {
+        let mut prose = Prose::default();
+        let prose_terms = prose
+            .tokens(text)
+            .into_iter()
+            .map(|token| token.text)
+            .collect();
+        let exact_terms = exact_tokens(text)
+            .into_iter()
+            .map(|token| token.text)
+            .collect();
+        let pieces: Vec<_> = text.split('"').collect();
+        let phrases = pieces
+            .windows(2)
+            .skip(1)
+            .step_by(2)
+            .map(|piece| (prose.tokens(piece[0]), exact_phrase(piece[0])))
+            .filter(|(prose, exact)| prose.len() > 1 || exact.len() > 1)
+            .collect();
+        Self {
+            prose,
+            prose_terms,
+            exact_terms,
+            phrases,
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.prose_terms.is_empty() && self.exact_terms.is_empty()
+    }
+
+    pub(crate) fn score(&mut self, text: &str) -> (usize, usize, usize) {
+        let prose = self.prose.tokens(text);
+        let exact = exact_tokens(text);
+        let phrases = self
+            .phrases
+            .iter()
+            .filter(|(p, e)| phrase_matches(p, &prose) || phrase_matches(e, &exact))
+            .count();
+        let mut distinct = BTreeSet::new();
+        let mut matches = 0;
+        for (tokens, terms) in [(&prose, &self.prose_terms), (&exact, &self.exact_terms)] {
+            for token in tokens {
+                if terms.contains(&token.text) {
+                    distinct.insert(token.text.as_str());
+                    matches += 1;
+                }
+            }
+        }
+        (phrases, distinct.len(), matches)
+    }
+}
+
+fn phrase_matches(phrase: &[Token], tokens: &[Token]) -> bool {
+    let Some(first) = phrase.first() else {
+        return false;
+    };
+    tokens
+        .iter()
+        .filter(|token| token.text == first.text)
+        .any(|start| {
+            phrase.iter().skip(1).all(|expected| {
+                let position = start.position + (expected.position - first.position);
+                let offset = tokens.partition_point(|token| token.position < position);
+                tokens[offset..]
+                    .iter()
+                    .take_while(|token| token.position == position)
+                    .any(|token| token.text == expected.text)
+            })
+        })
+}
+
 pub fn extract_note_body(content: &SearchContent) -> DomainResult<String> {
     let source = content.text();
     let header = notarium_syntax::frontmatter::analyze(source, content.provenance().class())?;

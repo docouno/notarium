@@ -20,7 +20,7 @@ use notarium_core::{
     },
     model::{Lifecycle, SnapshotCut},
     ports::{
-        CreateNote, DeleteDisposition, DeleteNote, Mutation, NoteWritePort, PageLimit,
+        CreateNote, DeleteDisposition, DeleteNote, MoveNote, Mutation, NoteWritePort, PageLimit,
         Preconditions, PublishAbilityPackage, RenameNote, ServicePurpose, SpaceContext,
     },
     query::{FieldObservation, FieldSchema, FieldType, FieldValue, ScalarType},
@@ -342,6 +342,18 @@ async fn run_projection_reads(store: &CanonicalStore) {
             .hydrate_cards(keeper.clone(), cut, vec![skill.clone()])
             .await
             .unwrap();
+        let carriers = store
+            .read_authorized_documents_for_search(
+                keeper.clone(),
+                vec![notarium_canonical::changes::search::SearchDocumentTarget {
+                    note_id: skill.clone(),
+                    revision: old.revision_id.clone(),
+                    projected_at: Some(receipt.seq()),
+                }],
+            )
+            .await
+            .unwrap();
+        assert_eq!(carriers[0].is_some(), visible);
         assert_eq!(
             cards[0].is_some(),
             visible,
@@ -418,7 +430,7 @@ async fn run_projection_reads(store: &CanonicalStore) {
                     parent: None,
                     slug: "later".into(),
                     class: DocClass::UserDoc,
-                    carrier: "# Later".into(),
+                    carrier: "---\npriority: urgent\n---\n# Later".into(),
                 },
             },
         )
@@ -532,6 +544,44 @@ async fn run_projection_reads(store: &CanonicalStore) {
             .unwrap()
             .is_some()
     );
+    let search = maintenance_ctx(ServicePurpose::Search);
+    let receipts = ReceiptSet::new([after_schema.receipt.clone()]).unwrap();
+    for (base, eligible) in [(later.receipt.seq(), false), (schema.receipt.seq(), true)] {
+        let versions = store
+            .plan_search_overlay(&search.authority, &search.budget, scope, base, &receipts)
+            .await
+            .unwrap();
+        assert_eq!(versions.is_some(), eligible);
+    }
+    // Moving a note retains its last evaluation, even if the schema has changed.
+    let moved = store
+        .move_note(
+            human.clone(),
+            Mutation {
+                identity: identity(7),
+                preconditions: Preconditions::default(),
+                input: MoveNote {
+                    note: sample_note_id(13),
+                    parent: None,
+                    slug: "later-moved".into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let overlay = store
+        .read_note_revisions_for_overlay(
+            &search.authority,
+            human.clone(),
+            schema.receipt.seq(),
+            vec![(sample_note_id(13), moved.value.revision)],
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        overlay[0].1.as_ref().unwrap().fields.get("priority"),
+        Some(FieldObservation::Bad { .. })
+    ));
     let before_schema = store
         .read_projection_space_header(&projection, &scope.space_id, Some(later.receipt.seq()))
         .await

@@ -105,29 +105,40 @@ impl SearchEngine {
         let aligned = self.align(&ctx, &request.causal, &handle, clock).await?;
         let snapshot = aligned.snapshot;
         let state = aligned.state;
-        let filter = Arc::new(Eligible::new(
-            &ctx,
-            &request,
-            snapshot.as_ref(),
-            state.as_deref(),
-        )?);
+        let chat_space = if request.include_chats && recall.is_none() && !browse {
+            let record = self
+                .services
+                .deps
+                .canonical
+                .read_space(&ctx.scope().space_id)
+                .await?;
+            ctx.check_current(&record.scope)?;
+            Some(record.space)
+        } else {
+            None
+        };
+        let filter = Arc::new(
+            Eligible::new(
+                &ctx,
+                &request,
+                snapshot.as_ref(),
+                state.as_deref(),
+                chat_space.as_ref(),
+            )
+            .await?,
+        );
         let top_k = usize::from(request.top_k.get());
         let candidate_k = (top_k * 4).max(100);
-        let chat_k = if recall.is_none() && request.include_chats && !browse {
-            (top_k * 2).min(200)
-        } else {
-            0
-        };
         let excluded: Arc<BTreeSet<_>> = Arc::new(aligned.overlay.keys().cloned().collect());
 
         let lexical = lexical_candidates(
+            clock,
             snapshot.clone(),
             state.clone(),
             filter.clone(),
             excluded.clone(),
             request.text.clone(),
             candidate_k,
-            chat_k,
             filtered,
         );
         let vectors = self.vector_candidates(VectorRequest {
@@ -135,6 +146,7 @@ impl SearchEngine {
             query: &request,
             clock,
             filter: filter.clone(),
+            snapshot: snapshot.clone(),
             state: state.clone(),
             handle: &handle,
             excluded,
@@ -142,16 +154,10 @@ impl SearchEngine {
             browse,
         });
         let (lexical, vectors) = tokio::join!(lexical, vectors);
-        let (mut notes, chats) = lexical?;
-        let mut vectors = vectors?;
-        vectors.hits.retain(|hit| {
-            snapshot.lookup(&hit.metadata.note).is_some_and(|node| {
-                filter
-                    .node_allowed(snapshot.as_ref(), node)
-                    .unwrap_or(false)
-            })
-        });
-        let overlay = rank_overlay(self, &request, &aligned.overlay, &filter, filtered).await?;
+        let mut notes = lexical?;
+        let vectors = vectors?;
+        let overlay =
+            rank_overlay(self, clock, &request, &aligned.overlay, &filter, filtered).await?;
         if browse {
             notes.extend(overlay);
             notes.sort_by(|left, right| note_key(left).cmp(&note_key(right)));
@@ -186,6 +192,7 @@ impl SearchEngine {
         let (hits, notes_truncated) = self
             .hydrate_notes(hydrate::Hydration {
                 context: &ctx,
+                text: &request.text,
                 clock,
                 cut: &aligned.base_cut,
                 overlay: &aligned.overlay,
@@ -196,7 +203,14 @@ impl SearchEngine {
             })
             .await?;
         ctx.budget = clock.remaining()?;
-        let (chat_hits, chat_truncated) = self.hydrate_chats(&ctx, chats, request.top_k).await?;
+        let (chat_hits, chat_truncated) = if let Some(state) =
+            state.filter(|_| recall.is_none() && request.include_chats && !browse)
+        {
+            self.search_chats(&ctx, clock, &request, snapshot, state, filter)
+                .await?
+        } else {
+            (Vec::new(), false)
+        };
         // Chat hydration can yield while canonical access to a selected note changes.
         let (hits, packing_truncated) = self.finish_note_hits(&ctx, clock, hits, recall)?;
         Ok(SearchResult {
@@ -217,6 +231,7 @@ impl SearchEngine {
             query,
             clock,
             filter,
+            snapshot,
             state,
             handle,
             excluded,
@@ -282,7 +297,7 @@ impl SearchEngine {
                     .ok_or(EmbeddingError::ModelUnavailable)?
             };
             if matches!(target.backend, EmbeddingBackendTarget::Remote { .. })
-                && matches!(requested.backend, EmbeddingBackendTarget::LocalOnnx)
+                && requested.backend.local_pooling().is_some()
             {
                 return Ok(None);
             }
@@ -335,7 +350,14 @@ impl SearchEngine {
         let budget = clock.remaining()?;
         let deadline = clock.deadline.into_std();
         let vectors = tokio::task::spawn_blocking(move || {
-            let filter = VectorFilter {
+            let visible = |note: &NoteId| {
+                snapshot.lookup(note).is_some_and(|node| {
+                    filter
+                        .node_allowed(snapshot.as_ref(), node)
+                        .unwrap_or(false)
+                })
+            };
+            let mask = VectorFilter {
                 classes: &filter.classes,
                 folders: filter.ordinals.as_deref(),
                 notes: filter.vector_notes.as_ref(),
@@ -349,7 +371,7 @@ impl SearchEngine {
                 .vectors
                 .as_ref()
                 .ok_or(crate::vector::VectorError::CorruptIndex)?;
-            index.search(&vector, &filter, limit, search)
+            index.search_visible(&vector, &mask, limit, search, visible)
         })
         .await
         .map_err(|_| internal("vector_search_worker"))?;
@@ -377,6 +399,7 @@ struct VectorRequest<'a> {
     query: &'a SearchQuery,
     clock: &'a Clock,
     filter: Arc<Eligible>,
+    snapshot: Arc<dyn StructuralSnapshot>,
     state: Option<Arc<Published>>,
     handle: &'a crate::engine::SpaceHandle,
     excluded: Arc<BTreeSet<NoteId>>,
@@ -407,17 +430,18 @@ struct Eligible {
     folders: Option<BTreeSet<FolderId>>,
     ordinals: Option<Arc<Bitmap>>,
     chat_folders: Option<Arc<Bitmap>>,
-    chat_viewer: PrincipalId,
+    chat_viewer: Option<PrincipalId>,
     nodes: Option<Bitmap>,
     vector_notes: Option<BTreeSet<NoteId>>,
 }
 
 impl Eligible {
-    fn new(
+    async fn new(
         ctx: &SpaceContext,
         query: &SearchQuery,
         snapshot: &dyn StructuralSnapshot,
         state: Option<&Published>,
+        chat_space: Option<&notarium_core::auth::Space>,
     ) -> Result<Self, PortError> {
         let cut = snapshot.cut().clone();
         let grant = ctx
@@ -425,7 +449,7 @@ impl Eligible {
             .spaces()
             .get(&cut.scope.space_id)
             .ok_or(DomainError::ResourceNotFound)?;
-        let classes = grant
+        let classes: BTreeSet<_> = grant
             .read_classes
             .iter()
             .copied()
@@ -435,19 +459,25 @@ impl Eligible {
             })
             .collect();
         let root = grant.project_root.as_ref();
-        let mut masks = [query.folder.as_ref(), root]
-            .into_iter()
-            .flatten()
-            .map(|folder| {
-                snapshot
-                    .folder_descendants(folder)
-                    .map(|descendants| descendants.into_iter().collect::<BTreeSet<_>>())
-            });
-        let mut folders = masks.next().transpose()?;
-        if let Some(folders) = &mut folders
-            && let Some(restrict) = masks.next().transpose()?
-        {
-            folders.retain(|folder| restrict.contains(folder));
+        // A Keeper's authorized structural snapshot includes its pinned skills,
+        // which can live outside the project. A requested folder still narrows
+        // those notes just as it narrows ordinary project notes.
+        let includes_pins =
+            classes.contains(&DocClass::Skill) && !ctx.auth().readonly_abilities().is_empty();
+        let note_root = root.filter(|_| !includes_pins);
+        let scope_folders = [query.folder.as_ref(), note_root];
+        let mut folders: Option<BTreeSet<FolderId>> = None;
+        for folder in scope_folders.into_iter().flatten() {
+            let descendants: BTreeSet<_> = snapshot
+                .folder_descendants(folder)
+                .await?
+                .into_iter()
+                .collect();
+            if let Some(folders) = &mut folders {
+                folders.retain(|id| descendants.contains(id));
+            } else {
+                folders = Some(descendants);
+            }
         }
         let ordinals = folders.as_ref().map(|folders| {
             Arc::new(
@@ -475,36 +505,32 @@ impl Eligible {
             }
             None => ordinals.clone(),
         };
-        let project = match root {
-            Some(folder) => Some(folder.clone()),
-            None => query
-                .folder
-                .as_ref()
-                .map(|folder| snapshot.enclosing_project(folder))
-                .transpose()?
-                .flatten(),
+        // Only label a query as project-scoped when its requested search
+        // domain fits that project. Pinned reads do not widen provider consent.
+        let project = match (note_root, query.folder.as_ref()) {
+            (Some(root), _) => Some(root.clone()),
+            (None, Some(folder)) => snapshot.enclosing_project(folder).await?,
+            (None, None) => None,
         }
         .map(|folder_id| FolderRef {
             space_id: cut.scope.space_id.clone(),
             folder_id,
         });
         let fields = snapshot
-            .filter_notes(&query.filter)?
+            .filter_notes(&query.filter)
+            .await?
             .map(|nodes| {
                 nodes
                     .map(|node| node.index(cut.generation))
                     .collect::<Result<Bitmap, _>>()
             })
             .transpose()?;
-        let folder_masks = [query.folder.as_ref(), root]
-            .into_iter()
-            .flatten()
-            .map(|folder| {
-                snapshot
-                    .folder_subtree(folder)?
-                    .map(|node| node.index(cut.generation))
-                    .collect::<Result<Bitmap, _>>()
-            });
+        let folder_masks = scope_folders.into_iter().flatten().map(|folder| {
+            snapshot
+                .folder_subtree(folder)?
+                .map(|node| node.index(cut.generation))
+                .collect::<Result<Bitmap, _>>()
+        });
         let mut nodes = fields.clone();
         for mask in folder_masks {
             let mask = mask?;
@@ -519,9 +545,7 @@ impl Eligible {
             .map(|nodes| {
                 nodes
                     .iter()
-                    .map(|index| {
-                        snapshot.note_id(DenseNodeId::new(cut.generation, index))
-                    })
+                    .map(|index| snapshot.note_id(DenseNodeId::new(cut.generation, index)))
                     .collect::<Result<BTreeSet<_>, _>>()
             })
             .transpose()?;
@@ -532,7 +556,19 @@ impl Eligible {
             folders,
             ordinals,
             chat_folders,
-            chat_viewer: ctx.auth().principal().clone(),
+            chat_viewer: chat_space
+                .filter(|space| {
+                    ctx.auth()
+                        .can_view_chat_thread(
+                            space,
+                            notarium_core::ports::ChatThreadKind::Personal,
+                            ctx.auth().principal(),
+                            root,
+                            false,
+                        )
+                        .is_ok()
+                })
+                .map(|_| ctx.auth().principal().clone()),
             nodes,
             vector_notes,
         })
@@ -565,21 +601,56 @@ impl Eligible {
     }
 }
 
+struct LexicalWorker {
+    stop: notarium_core::ports::Cancellation,
+    task: tokio::task::AbortHandle,
+}
+
+impl Drop for LexicalWorker {
+    fn drop(&mut self) {
+        self.stop.cancel();
+        self.task.abort();
+    }
+}
+
+async fn lexical_work<T: Send + 'static>(
+    clock: &Clock,
+    work: impl FnOnce(SearchBudget<'_>) -> Result<T, LexicalError> + Send + 'static,
+) -> Result<T, PortError> {
+    clock.remaining()?;
+    let deadline = clock.deadline.into_std();
+    let stop = notarium_core::ports::Cancellation::default();
+    let worker_stop = stop.clone();
+    let task = tokio::task::spawn_blocking(move || {
+        work(SearchBudget {
+            cancellation: &worker_stop,
+            deadline,
+        })
+    });
+    let _guard = LexicalWorker {
+        stop,
+        task: task.abort_handle(),
+    };
+    let result = task.await.map_err(|_| internal("lexical_search_worker"))?;
+    clock.remaining()?;
+    result.map_err(lexical_error)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn lexical_candidates(
+    clock: &Clock,
     snapshot: Arc<dyn StructuralSnapshot>,
     state: Option<Arc<Published>>,
     filter: Arc<Eligible>,
     excluded: Arc<BTreeSet<NoteId>>,
     text: String,
     candidate_k: usize,
-    chat_k: usize,
     filtered: bool,
-) -> Result<(Vec<LexicalHit>, Vec<LexicalHit>), PortError> {
+) -> Result<Vec<LexicalHit>, PortError> {
     let Some(state) = state else {
-        return Ok((Vec::new(), Vec::new()));
+        return Ok(Vec::new());
     };
-    tokio::task::spawn_blocking(move || {
+    lexical_work(clock, move |budget| {
         let notes_filter = LexicalFilter::new(
             snapshot.as_ref(),
             filter.ordinals.clone(),
@@ -587,35 +658,18 @@ async fn lexical_candidates(
             filter.classes.iter().copied(),
             false,
         )
-        .excluding(&excluded);
-        let notes = state
+        .excluding(&excluded)
+        .within(budget);
+        state
             .lexical
             .search_pinned(&state.searcher, &text, &notes_filter, candidate_k, filtered)
-            .map_err(lexical_error)?;
-        let chats = if chat_k == 0 {
-            Vec::new()
-        } else {
-            let chat_filter = LexicalFilter::new(
-                snapshot.as_ref(),
-                filter.chat_folders.clone(),
-                None,
-                [],
-                true,
-            )
-            .visible_chats_for(&filter.chat_viewer);
-            state
-                .lexical
-                .search_pinned(&state.searcher, &text, &chat_filter, chat_k, filtered)
-                .map_err(lexical_error)?
-        };
-        Ok((notes, chats))
     })
     .await
-    .map_err(|_| internal("lexical_search_worker"))?
 }
 
 async fn rank_overlay(
     engine: &SearchEngine,
+    clock: &Clock,
     query: &SearchQuery,
     overlay: &align::Overlay,
     filter: &Eligible,
@@ -642,7 +696,7 @@ async fn rank_overlay(
     }
     let text = query.text.clone();
     let writers = engine.services.writers.clone();
-    tokio::task::spawn_blocking(move || {
+    lexical_work(clock, move |budget| {
         let updates: Vec<_> = notes
             .iter()
             .map(|(title, content, folder)| Update::Note {
@@ -651,10 +705,9 @@ async fn rank_overlay(
                 folder: *folder,
             })
             .collect();
-        LexicalIndex::rank_overlay(&writers, &text, &updates, filtered).map_err(lexical_error)
+        LexicalIndex::rank_overlay(&writers, &text, &updates, filtered, budget)
     })
     .await
-    .map_err(|_| internal("overlay_search_worker"))?
 }
 
 fn note_key(hit: &LexicalHit) -> Option<&NoteId> {
@@ -668,5 +721,37 @@ fn lexical_error(error: LexicalError) -> PortError {
     match error {
         LexicalError::Domain(error) => error.into(),
         _ => internal("lexical_search"),
+    }
+}
+
+#[cfg(test)]
+mod lexical_worker_tests {
+    use super::*;
+    use notarium_core::{ids::RequestId, ports::CallBudget};
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn dropping_the_query_signals_its_active_lexical_worker() {
+        let clock = Clock::new(&CallBudget {
+            request: RequestId::from_bytes([44; 16]),
+            remaining: Duration::from_secs(10),
+            cancellation: Default::default(),
+        }).unwrap();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (resume, wait) = std::sync::mpsc::channel();
+        let (finished, stopped) = tokio::sync::oneshot::channel();
+        let mut query = Box::pin(lexical_work(&clock, move |budget| {
+            started.send(()).unwrap();
+            wait.recv_timeout(Duration::from_secs(5)).unwrap();
+            finished.send(budget.cancellation.is_cancelled()).unwrap();
+            Ok(())
+        }));
+        tokio::select! {
+            result = &mut query => panic!("lexical worker finished before cancellation: {result:?}"),
+            signal = ready => signal.unwrap(),
+        }
+        drop(query);
+        resume.send(()).unwrap();
+        assert!(stopped.await.unwrap());
     }
 }

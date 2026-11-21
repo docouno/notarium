@@ -26,10 +26,18 @@ const MODEL_BYTES: u64 = 1024 * 1024 * 1024;
 const BUCKETS: [usize; 5] = [64, 128, 256, 384, 512];
 static RUNTIME: Mutex<Option<(PathBuf, Environment)>> = Mutex::new(None);
 
-#[derive(Clone, Copy)]
+#[derive(
+    Clone, Copy, Debug, Default, Eq, Hash, PartialEq, serde::Serialize, serde::Deserialize,
+)]
 pub enum Pooling {
+    #[default]
     Mean,
     Cls,
+}
+impl Pooling {
+    pub(crate) fn is_mean(&self) -> bool {
+        *self == Self::Mean
+    }
 }
 
 pub struct OrtModel {

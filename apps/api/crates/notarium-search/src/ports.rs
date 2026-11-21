@@ -1,5 +1,6 @@
 //! Read and model-selection contracts for the search engine.
 
+use crate::embed::Pooling;
 use crate::layout::{RemoteVectorModel, VectorModel};
 pub use notarium_canonical::changes::search::{
     SearchDocumentTarget, SearchIndexedNote, SearchNotesSeedPage, SearchOverlayNote,
@@ -32,7 +33,7 @@ impl ResolvedEmbeddingTarget {
         VectorModel {
             profile: self.model.clone(),
             remote: match &self.backend {
-                EmbeddingBackendTarget::LocalOnnx => None,
+                EmbeddingBackendTarget::LocalOnnx | EmbeddingBackendTarget::LocalOnnxCls => None,
                 EmbeddingBackendTarget::Remote {
                     provider,
                     runtime_epochs,
@@ -45,18 +46,32 @@ impl ResolvedEmbeddingTarget {
             },
             dimension: self.dimension,
             max_input_tokens: self.max_input_tokens,
+            pooling: self.backend.local_pooling().unwrap_or_default(),
         }
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum EmbeddingBackendTarget {
+    /// Token-level output uses masked mean pooling.
     LocalOnnx,
+    /// Token-level output uses its first token as the sentence embedding.
+    LocalOnnxCls,
     Remote {
         provider: ProviderResourceId,
         runtime_epochs: ProviderRuntimeEpochs,
         project: Option<FolderRef>,
     },
+}
+
+impl EmbeddingBackendTarget {
+    pub(crate) fn local_pooling(&self) -> Option<Pooling> {
+        match self {
+            Self::LocalOnnx => Some(Pooling::Mean),
+            Self::LocalOnnxCls => Some(Pooling::Cls),
+            Self::Remote { .. } => None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -110,6 +125,7 @@ pub trait SearchCarrierReadPort: Send + Sync {
         &self,
         authority: ServiceAuthority,
         ctx: SpaceContext,
+        filter_cut: SpaceSeq,
         targets: Vec<(NoteId, RevisionId)>,
     ) -> PortFuture<'_, Vec<(NoteId, Option<SearchOverlayNote>)>>;
 
@@ -118,6 +134,12 @@ pub trait SearchCarrierReadPort: Send + Sync {
         ctx: SpaceContext,
         targets: Vec<SearchDocumentTarget>,
     ) -> PortFuture<'_, Vec<Option<Arc<ClassifiedDocument>>>>;
+
+    fn visible_chat_hit_keys<'a>(
+        &'a self,
+        ctx: &'a SpaceContext,
+        candidates: &'a [(ChatThreadId, ThreadEntrySeq)],
+    ) -> PortFuture<'a, Vec<(ChatThreadId, ThreadEntrySeq)>>;
 
     fn hydrate_live_visible_chat_hits<'a>(
         &'a self,
@@ -163,10 +185,11 @@ impl SearchCarrierReadPort for CanonicalStore {
         &self,
         authority: ServiceAuthority,
         ctx: SpaceContext,
+        filter_cut: SpaceSeq,
         targets: Vec<(NoteId, RevisionId)>,
     ) -> PortFuture<'_, Vec<(NoteId, Option<SearchOverlayNote>)>> {
         Box::pin(async move {
-            self.read_note_revisions_for_overlay(&authority, ctx, targets)
+            self.read_note_revisions_for_overlay(&authority, ctx, filter_cut, targets)
                 .await
         })
     }
@@ -179,6 +202,14 @@ impl SearchCarrierReadPort for CanonicalStore {
         Box::pin(CanonicalStore::read_authorized_documents_for_search(
             self, ctx, targets,
         ))
+    }
+
+    fn visible_chat_hit_keys<'a>(
+        &'a self,
+        ctx: &'a SpaceContext,
+        candidates: &'a [(ChatThreadId, ThreadEntrySeq)],
+    ) -> PortFuture<'a, Vec<(ChatThreadId, ThreadEntrySeq)>> {
+        Box::pin(CanonicalStore::visible_chat_hit_keys(self, ctx, candidates))
     }
 
     fn hydrate_live_visible_chat_hits<'a>(

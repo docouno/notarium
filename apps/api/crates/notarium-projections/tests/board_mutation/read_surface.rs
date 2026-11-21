@@ -7,6 +7,7 @@ use notarium_core::{
     classes::DocClass,
     error::{PortError, ValidationReason},
     ids::{FolderId, GrantId, LeaseEpoch, NoteId, PrincipalId, ViewKey},
+    model::Lifecycle,
     patch::CarrierEditOrigin,
     ports::{
         CreateNote, DeleteDisposition, DeleteNote, EditNote, GraphNodeId, GraphQuery, GraphTier,
@@ -235,10 +236,23 @@ pub(super) async fn exercise(store: &CanonicalStore, runtime: &ProjectorRuntime)
         },
     );
     trash.preconditions.revision = Some(gamma.revision);
-    store
+    let trashed = store
         .delete_note(owner.clone(), trash)
         .await
         .expect("trash the final note");
+    let mut waiting = owner.clone();
+    waiting.budget.remaining = Duration::from_millis(120);
+    let watermark = AwaitWatermarks::from_receipts([trashed.receipt]);
+    assert!(matches!(
+        engine
+            .acquire_snapshot(waiting, CausalBasis::Await(watermark))
+            .await,
+        Err(PortError::DeadlineExceeded(_))
+    ));
+    assert_eq!(
+        snapshot.doc_class(focal),
+        Err(DomainError::ResourceNotFound)
+    );
     assert!(
         !engine
             .is_live_visible(&owner, &gamma.note)
@@ -264,6 +278,22 @@ pub(super) async fn exercise(store: &CanonicalStore, runtime: &ProjectorRuntime)
 async fn scoped_graph(store: &CanonicalStore, runtime: &ProjectorRuntime) {
     let (scope, owner) = open_space(store).await;
     let project = create_project(store, &owner).await;
+    let child = FolderId::from_bytes(random_bytes());
+    let (_, child_revision, _) = store
+        .create_folder(CreateFolderSpec {
+            scope: scope.clone(),
+            active_epoch: LeaseEpoch::new(1).unwrap(),
+            folder_id: child.clone(),
+            parent: Some(project.clone()),
+            slug: "nested".into(),
+            display_name: "Nested".into(),
+            is_project: false,
+            project_slug: None,
+            actor: owner.auth().principal().clone(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
     let focal = project_note(store, &owner, &project, "focal", "# Focal\n".into()).await;
     let outside = note(
         store,
@@ -288,6 +318,70 @@ async fn scoped_graph(store: &CanonicalStore, runtime: &ProjectorRuntime) {
 
     let scoped = scoped_reader(&owner, &project);
     let engine = runtime.engine();
+    let snapshot = engine
+        .acquire_snapshot(scoped.clone(), CausalBasis::Await(Default::default()))
+        .await
+        .unwrap();
+    assert_eq!(
+        snapshot.folder_descendants(&project).await.unwrap(),
+        vec![project.clone(), child.clone()]
+    );
+    assert_eq!(
+        snapshot.enclosing_project(&child).await.unwrap(),
+        Some(project.clone())
+    );
+    let root = store
+        .read_space(&scope.space_id)
+        .await
+        .unwrap()
+        .root_folder_id;
+    assert!(matches!(
+        snapshot.folder_descendants(&root).await,
+        Err(PortError::Domain(DomainError::ResourceNotFound))
+    ));
+    assert_eq!(
+        snapshot
+            .doc_class(snapshot.lookup(&focal).unwrap())
+            .unwrap(),
+        DocClass::UserDoc
+    );
+    let predicate = FieldFilterAstV1 {
+        version: 1,
+        predicate: Predicate::Not(Box::new(Predicate::IsAbsent { key: "tags".into() })),
+    };
+    let filtered: Vec<_> = snapshot
+        .filter_notes(&predicate)
+        .await
+        .unwrap()
+        .unwrap()
+        .map(|node| snapshot.note_id(node).unwrap())
+        .collect();
+    assert_eq!(filtered, vec![source.clone()]);
+    assert!(snapshot.filter_notes(&filter()).await.unwrap().is_none());
+    {
+        let _hold = engine.pause_before_projection_for_test(&scope, 1).unwrap();
+        store
+            .set_folder_lifecycle(
+                &scope,
+                LeaseEpoch::new(1).unwrap(),
+                &child,
+                &child_revision,
+                Lifecycle::Trashed,
+                owner.auth().principal(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot.folder_descendants(&project).await.unwrap(),
+            vec![project.clone()]
+        );
+        assert!(matches!(
+            snapshot.enclosing_project(&child).await,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ));
+    }
+    sync(store, runtime, &scope).await;
     let allowed = BTreeSet::from([
         GraphNodeId::Note(source.clone()),
         GraphNodeId::Note(focal.clone()),

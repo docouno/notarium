@@ -1,8 +1,8 @@
-use super::{Recall, align::Overlay, ranking::Candidate};
+use super::{Eligible, Recall, align::Overlay, lexical_work, ranking::Candidate};
 use crate::{
     embed::RemoteConservativeTokenizerBudget,
-    engine::{Clock, SearchEngine, internal},
-    lexical::{HitKey, LexicalHit},
+    engine::{Clock, Published, SearchEngine, internal},
+    lexical::{ChatCursor, ChunkRelevance, HitKey, LexicalFilter},
     model::chunks_for,
     ports::SearchDocumentTarget,
 };
@@ -11,13 +11,18 @@ use notarium_core::{
     error::PortError,
     ids::NoteId,
     model::SnapshotCut,
-    ports::{ChatSearchHit, NoteCard, PageLimit, SearchHit, SpaceContext},
+    ports::{ChatSearchHit, NoteCard, SearchHit, SearchQuery, SpaceContext, StructuralSnapshot},
 };
 use notarium_syntax::chunk::TokenizerBudget;
-use std::collections::{BTreeMap, HashSet};
+use std::{
+    cmp::Reverse,
+    collections::{BTreeMap, HashSet},
+    sync::Arc,
+};
 
 pub(super) struct Hydration<'a> {
     pub context: &'a SpaceContext,
+    pub text: &'a str,
     pub clock: &'a Clock,
     pub cut: &'a SnapshotCut,
     pub overlay: &'a Overlay,
@@ -34,6 +39,7 @@ impl SearchEngine {
     ) -> Result<(Vec<SearchHit>, bool), PortError> {
         let Hydration {
             context,
+            text,
             clock,
             cut,
             overlay,
@@ -134,6 +140,7 @@ impl SearchEngine {
             return Err(internal("canonical_search_batch"));
         }
         let mut hits = Vec::new();
+        let mut relevance = ChunkRelevance::new(text);
         for ((candidate, card), document) in ordered.drain(..).zip(documents) {
             clock.remaining()?;
             let Some(document) = document else { continue };
@@ -148,7 +155,7 @@ impl SearchEngine {
             else {
                 continue;
             };
-            let descriptors = hit_chunks(&candidate, &content, tokenizer)?;
+            let descriptors = hit_chunks(&candidate, &content, tokenizer, &mut relevance, clock)?;
             let maximum = if recall.is_some() { usize::MAX } else { 3 };
             let chunks = descriptors
                 .into_iter()
@@ -187,30 +194,89 @@ impl SearchEngine {
         Ok((visible, truncated))
     }
 
-    pub(super) async fn hydrate_chats(
+    pub(super) async fn search_chats(
         &self,
         ctx: &SpaceContext,
-        hits: Vec<LexicalHit>,
-        limit: PageLimit,
+        clock: &Clock,
+        request: &SearchQuery,
+        snapshot: Arc<dyn StructuralSnapshot>,
+        state: Arc<Published>,
+        eligible: Arc<Eligible>,
     ) -> Result<(Vec<ChatSearchHit>, bool), PortError> {
-        let mut ids = Vec::new();
+        let limit = usize::from(request.top_k.get());
+        let mut page_size = (limit * 2).clamp(16, 200);
+        let mut selected = Vec::with_capacity(limit + 1);
         let mut scores = BTreeMap::new();
-        for hit in hits {
-            if let HitKey::Chat { thread, entry, .. } = hit.key {
-                let key = (thread, entry);
-                if scores.insert(key.clone(), f64::from(hit.score)).is_none() {
-                    ids.push(key);
+        let mut cursor = ChatCursor::default();
+        let mut context = ctx.clone();
+        loop {
+            let state = state.clone();
+            let eligible = eligible.clone();
+            let snapshot = snapshot.clone();
+            let text = request.text.clone();
+            let (hits, next) = lexical_work(clock, move |budget| {
+                let mut filter = LexicalFilter::new(
+                    snapshot.as_ref(),
+                    eligible.chat_folders.clone(),
+                    None,
+                    [],
+                    true,
+                )
+                .within(budget);
+                if let Some(viewer) = eligible.chat_viewer.as_ref() {
+                    filter = filter.visible_chats_for(viewer);
+                }
+                state
+                    .lexical
+                    .chat_page(&state.searcher, &text, &filter, page_size, cursor)
+            })
+            .await?;
+            let mut keys = Vec::with_capacity(hits.len());
+            let mut page_scores = BTreeMap::new();
+            for hit in hits {
+                if let HitKey::Chat { thread, entry, .. } = hit.key {
+                    let key = (thread, entry);
+                    page_scores.insert(key.clone(), f64::from(hit.score));
+                    keys.push(key);
                 }
             }
+            // An isolated page can go directly through the final live fence.
+            // Otherwise admit keys without reading content or marking branch taint.
+            if next.is_none() && selected.is_empty() {
+                selected = keys;
+                scores = page_scores;
+                break;
+            }
+            context.budget = clock.remaining()?;
+            keys = self
+                .services
+                .deps
+                .carriers
+                .visible_chat_hit_keys(&context, &keys)
+                .await?;
+            for key in keys.into_iter().take(limit + 1 - selected.len()) {
+                let score = page_scores
+                    .remove(&key)
+                    .ok_or_else(|| internal("chat_search_identity"))?;
+                scores.insert(key.clone(), score);
+                selected.push(key);
+            }
+            if selected.len() > limit {
+                break;
+            }
+            let Some(next) = next else { break };
+            cursor = next;
+            page_size = 200;
         }
-        if ids.is_empty() {
+        if selected.is_empty() {
             return Ok((Vec::new(), false));
         }
+        context.budget = clock.remaining()?;
         let (rows, truncated) = self
             .services
             .deps
             .carriers
-            .hydrate_live_visible_chat_hits(ctx, &ids, limit)
+            .hydrate_live_visible_chat_hits(&context, &selected, request.top_k)
             .await?;
         let hits = rows
             .into_iter()
@@ -235,6 +301,8 @@ fn hit_chunks(
     candidate: &Candidate,
     content: &SearchContent,
     tokenizer: &dyn TokenizerBudget,
+    relevance: &mut ChunkRelevance,
+    clock: &Clock,
 ) -> Result<Vec<notarium_core::document::ChunkDescriptor>, PortError> {
     let profile = tokenizer.profile();
     let mut seen = HashSet::new();
@@ -247,13 +315,22 @@ fn hit_chunks(
     if !descriptors.is_empty() {
         return Ok(descriptors);
     }
-    match chunks_for(content, tokenizer) {
-        Ok(chunks) => Ok(chunks),
-        Err(_) => Ok(chunks_for(
+    let chunks = chunks_for(content, tokenizer).or_else(|_| {
+        chunks_for(
             content,
             &RemoteConservativeTokenizerBudget::lexical_fallback(),
-        )?),
+        )
+    })?;
+    if chunks.len() <= 1 || relevance.is_empty() {
+        return Ok(chunks);
     }
+    let mut ranked = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        clock.remaining()?;
+        ranked.push((Reverse(relevance.score(&chunk.text)), chunk));
+    }
+    ranked.sort_by_key(|(score, _)| *score);
+    Ok(ranked.into_iter().map(|(_, chunk)| chunk).collect())
 }
 
 fn pack(hits: &mut Vec<SearchHit>, tokens: u32) -> bool {

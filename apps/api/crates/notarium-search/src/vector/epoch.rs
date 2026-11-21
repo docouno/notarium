@@ -101,7 +101,19 @@ impl VectorSnapshot {
         limit: usize,
         budget: SearchBudget<'_>,
     ) -> Result<VectorResults, VectorError> {
-        self.search_mode(query, filter, limit, budget, false)
+        self.search_mode(query, filter, limit, budget, false, None)
+    }
+
+    /// Apply snapshot visibility before admitting a candidate into the result heap.
+    pub fn search_visible(
+        &self,
+        query: &QuantizedVector,
+        filter: &VectorFilter<'_>,
+        limit: usize,
+        budget: SearchBudget<'_>,
+        visible: impl Fn(&NoteId) -> bool,
+    ) -> Result<VectorResults, VectorError> {
+        self.search_mode(query, filter, limit, budget, false, Some(&visible))
     }
 
     /// Exhaustive quantized scoring for callers that need a recall reference.
@@ -112,7 +124,7 @@ impl VectorSnapshot {
         limit: usize,
         budget: SearchBudget<'_>,
     ) -> Result<VectorResults, VectorError> {
-        self.search_mode(query, filter, limit, budget, true)
+        self.search_mode(query, filter, limit, budget, true, None)
     }
 
     fn search_mode(
@@ -122,6 +134,7 @@ impl VectorSnapshot {
         limit: usize,
         budget: SearchBudget<'_>,
         force_exact: bool,
+        visible: Option<&dyn Fn(&NoteId) -> bool>,
     ) -> Result<VectorResults, VectorError> {
         budget.check()?;
         query.validate(self.epoch.model.dimension as usize)?;
@@ -134,15 +147,15 @@ impl VectorSnapshot {
         }
         let mut hits = Vec::new();
         let mut hnsw_hops = 0;
-        self.search_mutable(query, filter, limit, budget, &mut hits)?;
+        self.search_mutable(query, filter, limit, budget, visible, &mut hits)?;
         for segment in &self.segments {
             budget.check()?;
             let allowed = self.allowed_slots(segment, filter, budget)?;
             let exact = force_exact || allowed.cardinality() <= EXACT_SCAN_LIMIT;
-            let result = segment
-                .index
-                .data
-                .search_mode(query, &allowed, limit, budget, exact)?;
+            let data = &segment.index.data;
+            let result = data.search_mode(query, &allowed, limit, budget, exact, |slot| {
+                visible.is_none_or(|check| data.note_id(slot).is_some_and(|note| check(&note)))
+            })?;
             hnsw_hops += result.hnsw_hops;
             for neighbor in result.neighbors {
                 let metadata = segment
@@ -242,41 +255,54 @@ impl VectorSnapshot {
         filter: &VectorFilter<'_>,
         limit: usize,
         budget: SearchBudget<'_>,
+        visible: Option<&dyn Fn(&NoteId) -> bool>,
         hits: &mut Vec<VectorHit>,
     ) -> Result<(), VectorError> {
         let scorer = Similarity::new(query.values(), query.scale())?;
         let mut eligible = Vec::new();
-        let mut best = BinaryHeap::with_capacity(limit);
-        let chunks = self
-            .mutable
-            .iter()
-            .filter(|(note, _)| filter.notes.is_none_or(|notes| notes.contains(*note)))
-            .filter(|(note, _)| filter.excluded.is_none_or(|notes| !notes.contains(*note)))
-            .flat_map(|(_, chunks)| chunks.iter());
-        for (index, chunk) in chunks.enumerate() {
-            if index.is_multiple_of(128) {
+        let mut best = BinaryHeap::<std::cmp::Reverse<ExactNeighbor<'_>>>::with_capacity(limit);
+        for (position, (note, chunks)) in self.mutable.iter().enumerate() {
+            if position.is_multiple_of(128) {
                 budget.check()?;
             }
-            let meta = &chunk.metadata;
-            if !filter.classes.contains(&meta.class)
-                || filter
-                    .folders
-                    .is_some_and(|folders| !folders.contains(meta.folder))
+            if chunks.is_empty()
+                || filter.notes.is_some_and(|notes| !notes.contains(note))
+                || filter.excluded.is_some_and(|notes| notes.contains(note))
             {
                 continue;
             }
-            let slot = eligible.len() as u32;
-            eligible.push(chunk);
-            hnsw::keep_best(
-                &mut best,
-                ExactNeighbor {
+            let mut checked_visibility = false;
+            for (index, chunk) in chunks.iter().enumerate() {
+                if index != 0 && index.is_multiple_of(128) {
+                    budget.check()?;
+                }
+                let meta = &chunk.metadata;
+                if !filter.classes.contains(&meta.class)
+                    || filter
+                        .folders
+                        .is_some_and(|folders| !folders.contains(meta.folder))
+                {
+                    continue;
+                }
+                let slot = eligible.len() as u32;
+                let candidate = ExactNeighbor {
                     hit: scorer.score(slot, chunk.vector.values(), chunk.vector.scale()),
                     note: meta.note.as_str().as_bytes(),
                     span: meta.spans[0].start(),
                     key: meta.key.as_bytes(),
-                },
-                limit,
-            );
+                };
+                if best.len() == limit && best.peek().is_some_and(|worst| candidate <= worst.0) {
+                    continue;
+                }
+                if !checked_visibility {
+                    if visible.is_some_and(|check| !check(note)) {
+                        break;
+                    }
+                    checked_visibility = true;
+                }
+                eligible.push(chunk);
+                hnsw::keep_best(&mut best, candidate, limit);
+            }
         }
         for neighbor in hnsw::finish(best) {
             let hit = neighbor.hit;
@@ -362,6 +388,10 @@ impl VectorEpoch {
             segments: self.segments.clone(),
             mutable: self.mutable.snapshot(),
         }
+    }
+
+    pub(crate) fn mutable_note_chunks(&self, note: &NoteId) -> &[VectorChunk] {
+        self.mutable.chunks_for_note(note).unwrap_or_default()
     }
 
     /// Copy a numerical embedding with the same model and rendered text.
