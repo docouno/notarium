@@ -94,7 +94,7 @@ recovers writes under its exclusive DataRoot owner lock.
 ## Dual-dialect schema and history model
 
 Both SQL dialects materialize the same ordinary B-tree tables in schema
-version `8` and verify live database catalogs (`sqlite_master` / `pg_catalog`)
+version `9` and verify live database catalogs (`sqlite_master` / `pg_catalog`)
 against a shared typed manifest checksum (`schema_meta`) on every startup.
 Unknown newer schema versions, mismatched manifest checksums or unfinished
 migration states fail closed.
@@ -107,8 +107,14 @@ The caller can replay a pending control operation after losing the canonical
 response. Reusing the key with a different payload is rejected. Rebinding a
 Space's history invalidates receipts issued for its earlier incarnation.
 
+Schema version 9 adds partial indexes for legacy cleanup and export access
+checks. Recovery seeks only legacy zero-reference entries and commits at most 128
+per page. A current staging ticket or backup hold defers cleanup until release.
+
 Schema version 8 adds `blob_gc_retries`, a durable schedule for physical
-retirement attempts admitted by the ordinary sweep. The scheduler releases
+retirement attempts admitted by the ordinary sweep. Version 9 also records
+legacy cleanup in that schedule when it closes admission. Up to four physical
+GC attempts can run concurrently across the store. The scheduler releases
 its concurrency slot between attempts and resumes pending work on restart.
 
 Schema version 7 adds the CAS quarantine stamp and its partial index. It also
@@ -500,10 +506,13 @@ same example against an isolated prefix.
   A Local hold whose release timed out waiting for a writer retains ownership
   while the runtime retries cleanup of its exact generation.
   The offline `notarium_canonical::backup::decode_postgres_spool_v1_bounded`
-  API verifies the trailer and recognizes the exact manifests for schemas 1 through 8.
+  API verifies the trailer and recognizes the exact manifests for schemas 1 through 9.
   It returns typed rows in the original table and column order within the
   caller's byte budget. To materialize a historical spool, create an empty
-  target with `schema::POSTGRES_BASELINE_DDL`. For versions 1 through 7, drop
+  target with `schema::POSTGRES_BASELINE_DDL`. For versions 1 through 8, drop
+  `idx_blob_catalog_legacy`, `idx_note_heads_export_access`,
+  `idx_folder_heads_export_access` and `idx_content_jobs_export_access`.
+  For versions 1 through 7, drop
   `blob_gc_retries`. For versions 1 and 2, drop
   `collab_checkpoints` and `backup_holds.owner_generation`. For version 1,
   also drop `account_catalog_receipts` and `chat_pending_inputs.ext_space_tainted`.
@@ -518,7 +527,7 @@ same example against an isolated prefix.
   temporary table, then inserts the full set in one statement so foreign keys
   can resolve parents that appear later in the archive.
   Opening the target with the original installation ID applies the remaining
-  migrations through version 8. The canonical L4 backup suite exercises the
+  migrations through version 9. The canonical L4 backup suite exercises the
   historical row importer and the schema migration path. The streaming
   `notarium-jobs` restore handles installation cutover and repository-level
   verification. See [archive jobs and recovery](archive-jobs.md).

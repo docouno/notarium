@@ -29,7 +29,7 @@ pub(crate) fn recognized_predecessor(version: i64, hash: &[u8]) -> bool {
         3 => hex::encode(hash) == V3_HASH,
         4 => hex::encode(hash) == V4_HASH,
         5 => hex::encode(hash) == V5_HASH,
-        6 | 7 => {
+        6..=8 => {
             let v = version as u32;
             super::manifest::checksum_tables(v, crate::backup::spool_tables(v)).as_bytes() == hash
         }
@@ -250,13 +250,15 @@ macro_rules! upgrade {
             if !recognized_predecessor(version, &hash) {
                 return Ok(());
             }
-            // Both earlier claim indexes have the same name. Version 8 puts
-            // the job class before the Space so an idle worker skips other classes.
-            sqlx::query("DROP INDEX idx_content_jobs_claim").execute(&mut *conn).await
-                .map_err(|e| internal_not_committed("drop_job_claim_index", e.to_string()))?;
-            let sql = baseline_statement($ddl, "CREATE INDEX IF NOT EXISTS idx_content_jobs_claim")?;
-            sqlx::query(sqlx::AssertSqlSafe(sql)).execute(&mut *conn).await
-                .map_err(|e| internal_not_committed("create_job_claim_index", e.to_string()))?;
+            if version < 8 {
+                // Both earlier claim indexes have the same name. Version 8 puts
+                // the job class before the Space so an idle worker skips other classes.
+                sqlx::query("DROP INDEX idx_content_jobs_claim").execute(&mut *conn).await
+                    .map_err(|e| internal_not_committed("drop_job_claim_index", e.to_string()))?;
+                let sql = baseline_statement($ddl, "CREATE INDEX IF NOT EXISTS idx_content_jobs_claim")?;
+                sqlx::query(sqlx::AssertSqlSafe(sql)).execute(&mut *conn).await
+                    .map_err(|e| internal_not_committed("create_job_claim_index", e.to_string()))?;
+            }
             if version == 1 {
                 sqlx::query(sqlx::AssertSqlSafe(create_new_table(
                     $ddl,
@@ -336,13 +338,25 @@ macro_rules! upgrade {
                         .map_err(|e| internal_not_committed("migration_v7_archive_schema", e.to_string()))?;
                 }
             }
+            if version < 8 {
+                for prefix in [
+                    "CREATE TABLE IF NOT EXISTS blob_gc_retries (",
+                    "CREATE INDEX IF NOT EXISTS idx_blob_gc_retries_due",
+                ] {
+                    let sql = baseline_statement($ddl, prefix)?;
+                    sqlx::query(sqlx::AssertSqlSafe(sql)).execute(&mut *conn).await
+                        .map_err(|e| internal_not_committed("migration_v8_gc_schedule", e.to_string()))?;
+                }
+            }
             for prefix in [
-                "CREATE TABLE IF NOT EXISTS blob_gc_retries (",
-                "CREATE INDEX IF NOT EXISTS idx_blob_gc_retries_due",
+                "CREATE INDEX IF NOT EXISTS idx_blob_catalog_legacy",
+                "CREATE INDEX IF NOT EXISTS idx_note_heads_export_access",
+                "CREATE INDEX IF NOT EXISTS idx_folder_heads_export_access",
+                "CREATE INDEX IF NOT EXISTS idx_content_jobs_export_access",
             ] {
                 let sql = baseline_statement($ddl, prefix)?;
                 sqlx::query(sqlx::AssertSqlSafe(sql)).execute(&mut *conn).await
-                    .map_err(|e| internal_not_committed("migration_v8_gc_schedule", e.to_string()))?;
+                    .map_err(|e| internal_not_committed("migration_v9_indexes", e.to_string()))?;
             }
             let (sec, nsec) =
                 crate::codec::encode_timestamp_parts(crate::codec::now_utc_timestamp()?);

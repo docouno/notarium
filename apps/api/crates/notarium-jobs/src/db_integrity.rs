@@ -1385,6 +1385,10 @@ mod tests {
         let db = trusted(SQLITE_BASELINE_DDL).unwrap();
         db.execute_batch(
             "DROP TABLE blob_gc_retries;
+             DROP INDEX idx_blob_catalog_legacy;
+             DROP INDEX idx_note_heads_export_access;
+             DROP INDEX idx_folder_heads_export_access;
+             DROP INDEX idx_content_jobs_export_access;
              DROP TABLE archive_export_shadows;
              DROP TABLE archive_export_cuts;
              DROP TABLE archive_artifacts;

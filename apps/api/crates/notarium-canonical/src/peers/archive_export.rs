@@ -6,6 +6,7 @@ use std::{
 
 use notarium_core::{
     DomainError,
+    auth::{EngineAuthContext, JobDelegation},
     classes::DocClass,
     error::{PortError, ValidationReason},
     ids::{
@@ -13,7 +14,7 @@ use notarium_core::{
         SpaceSeq,
     },
     model::HistoryScope,
-    ports::{BackupHold, CallBudget, ContentJobKind, SpaceContext},
+    ports::{BackupHold, CallBudget, ContentJobKind, RevocationLease, SpaceContext},
 };
 use notarium_syntax::unicode::{PortableFilename, lookup_key};
 use serde::Serialize;
@@ -31,11 +32,10 @@ use crate::{
 };
 
 use super::{
-    ArchiveCleanupCursor,
+    ArchiveCleanupCursor, StoredJobPayloadV1,
     archive_import::{ArchiveObject, ArchiveObjectKind},
-    authorize_full_space_export, authorize_job_payload_tx, authorize_job_read_on_space,
-    job_clock_ms, load_job_row_opt_tx, require_active_job_lease_tx,
-    visit_authorized_export_notes_tx,
+    authorize_full_space_export, authorize_job_read_on_space, decode_job_payload, job_clock_ms,
+    require_active_job_lease_tx, visit_authorized_export_notes_tx,
 };
 
 mod versioned;
@@ -113,42 +113,72 @@ pub struct ExportPublication {
     pub files: u64,
 }
 
-#[derive(Clone, Debug)]
+/// An opened, immutable publication bound to its two credential ceilings.
 pub struct CommittedExport {
-    pub object: ArchiveObject,
-    pub job: JobId,
-    pub privacy_generation: u64,
-    pub expires_at_ms: i64,
+    object: ArchiveObject,
+    binding: ExportBinding,
+    caller: JobDelegation,
+    origin: JobDelegation,
+    selection: ExportSelection,
 }
 
-// The (Space, artifact) key names an insert-only publication. Cleanup deletes
-// the row and never reuses its artifact ID. Range reads need only its binding.
+#[derive(Clone)]
+enum ExportSelection {
+    WholeSpace,
+    Selected(Arc<SelectedNotes>),
+}
+
+struct SelectedNotes {
+    count: usize,
+    // This reader has one immutable history and privacy generation. Its
+    // canonical visibility facts can be reused only at the same Space sequence.
+    visible: Mutex<Option<(SpaceSeq, BTreeSet<DocClass>)>>,
+}
+
+struct ExportAccess {
+    seq: SpaceSeq,
+    caller: EngineAuthContext,
+    origin: Option<EngineAuthContext>,
+    selection: ExportSelection,
+}
+
+#[derive(Clone)]
 struct ExportBinding {
     id: ArtifactId,
     job: JobId,
     generation: u64,
     expires: i64,
+    namespace: ContentDigest,
 }
 
 impl CommittedExport {
-    fn binding(
-        &self,
-        store: &CanonicalStore,
-        scope: &HistoryScope,
-    ) -> Result<ExportBinding, PortError> {
-        if self.object.installation != *store.installation_id()
-            || self.object.scope != *scope
-            || self.object.kind != ArchiveObjectKind::Export
-        {
-            return Err(DomainError::ResourceNotFound.into());
-        }
-        Ok(ExportBinding {
-            id: self.object.id.clone(),
-            job: self.job.clone(),
-            generation: self.privacy_generation,
-            expires: self.expires_at_ms,
-        })
+    pub fn object(&self) -> &ArchiveObject {
+        &self.object
     }
+
+    pub fn expires_at_ms(&self) -> i64 {
+        self.binding.expires
+    }
+
+    pub fn caller(&self) -> &JobDelegation {
+        &self.caller
+    }
+
+    pub fn origin(&self) -> &JobDelegation {
+        &self.origin
+    }
+}
+
+type RegisteredAuthority = (SpaceContext, Box<dyn RevocationLease>);
+
+/// Issued after the live visibility check and consumed by one handoff.
+pub struct ExportChunkPermit {
+    binding: ExportBinding,
+    installation: notarium_core::ids::InstallationId,
+    scope: HistoryScope,
+    access: ExportAccess,
+    caller_registration: Box<dyn RevocationLease>,
+    origin_registration: Option<Box<dyn RevocationLease>>,
 }
 
 enum ChunkState {
@@ -457,12 +487,21 @@ impl CanonicalStore {
     pub async fn handoff_export_chunk(
         &self,
         budget: &CallBudget,
-        scope: &HistoryScope,
-        pointer: &CommittedExport,
+        permit: ExportChunkPermit,
         handoff: impl FnOnce() -> Result<(), PortError> + Send + 'static,
     ) -> Result<(), PortError> {
-        let binding = pointer.binding(self, scope)?;
-        let scope = scope.clone();
+        if &permit.installation != self.installation_id() {
+            return Err(DomainError::ResourceNotFound.into());
+        }
+        let ExportChunkPermit {
+            binding,
+            scope,
+            access,
+            caller_registration,
+            origin_registration,
+            ..
+        } = permit;
+        let store = self.clone();
         let deadline = CommandDeadline::start(budget, "handoff_archive_chunk");
         let check = budget.clone();
         let delivery = ChunkDelivery(Arc::new(Mutex::new(ChunkState::Pending)));
@@ -488,6 +527,18 @@ impl CanonicalStore {
                     let live = load_space_record(tx, &scope.space_id).await?;
                     live.scope.check(&scope)?;
                     check_publication_tx(tx, &scope.space_id, &binding).await?;
+                    if live.last_seq != access.seq {
+                        store
+                            .authorize_export_selection_tx(
+                                tx,
+                                &live,
+                                &binding.job,
+                                &access.selection,
+                                &access.caller,
+                                access.origin.as_ref(),
+                            )
+                            .await?;
+                    }
                     // Serialize the synchronous enqueue with revocation of the
                     // caller's wait. An accepted transfer has its own receipt.
                     let mut state = state.lock().unwrap_or_else(|err| err.into_inner());
@@ -498,6 +549,10 @@ impl CanonicalStore {
                         ));
                     }
                     deadline.remaining(&check)?;
+                    caller_registration.check()?;
+                    if let Some(origin) = &origin_registration {
+                        origin.check()?;
+                    }
                     handoff()?;
                     *state = ChunkState::Delivered;
                     Ok(())
@@ -507,97 +562,352 @@ impl CanonicalStore {
         if delivery.settle() { Ok(()) } else { result }
     }
 
-    /// Read the pointer and authorize the selected notes or whole scope in the
-    /// same snapshot. Physical bytes are delivered after this transaction closes.
+    /// Ask the authentication owner for the original authority after loading
+    /// its immutable binding. Release the descriptor only after both authorities
+    /// pass visibility checks in a current canonical snapshot.
     pub async fn open_committed_export(
         &self,
         ctx: SpaceContext,
         id: &ArtifactId,
+        refresh_origin: impl AsyncFnOnce(&JobDelegation) -> Result<SpaceContext, PortError>,
     ) -> Result<CommittedExport, PortError> {
         let scope = ctx.scope().clone();
         let auth = ctx.auth().clone();
         let id = id.clone();
         let store = self.clone();
-        self.with_read_tx_budget(Some(&ctx.budget), |tx| {
-            Box::pin(async move {
-                let live = load_space_record(tx, &scope.space_id).await?;
-                live.scope.check(&scope)?;
-                authorize_job_read_on_space(&auth, &live.space)?;
-                let pointer = store.read_pointer_tx(tx, &scope.space_id, &id).await?;
-                let binding = pointer.binding(&store, &scope)?;
-                if binding.id != id {
-                    return Err(DomainError::ResourceNotFound.into());
-                }
-                authorize_publication_tx(tx, &live, &binding, &auth, None).await?;
-                Ok(pointer)
+        let pointer = self
+            .with_read_tx_budget(Some(&ctx.budget), |tx| {
+                Box::pin(async move {
+                    let live = load_space_record(tx, &scope.space_id).await?;
+                    live.scope.check(&scope)?;
+                    authorize_job_read_on_space(&auth, &live.space)?;
+                    let caller =
+                        JobDelegation::capture(&auth, &scope).ok_or(DomainError::AccessDenied)?;
+                    let (object, binding) = store.read_pointer_tx(tx, &scope.space_id, &id).await?;
+                    if object.installation != *store.installation_id()
+                        || object.scope != scope
+                        || object.kind != ArchiveObjectKind::Export
+                        || object.id != id
+                    {
+                        return Err(DomainError::ResourceNotFound.into());
+                    }
+                    check_publication_tx(tx, &scope.space_id, &binding).await?;
+                    let (origin, selection) =
+                        store.read_export_policy_tx(tx, &scope, &binding).await?;
+                    if origin.principal() != caller.principal() || origin.scope() != &scope {
+                        return Err(DomainError::ResourceNotFound.into());
+                    }
+                    Ok(CommittedExport {
+                        object,
+                        binding,
+                        caller,
+                        origin,
+                        selection,
+                    })
+                })
             })
-        })
-        .await
+            .await?;
+        let origin = if pointer.caller != pointer.origin {
+            Some(refresh_origin(&pointer.origin).await?)
+        } else {
+            None
+        };
+        self.revalidate_committed_export(&ctx, origin.as_ref(), &pointer)
+            .await?;
+        Ok(pointer)
     }
 
-    /// Recheck the opened publication and current visibility for each authority
-    /// in one snapshot. The immutable storage descriptor stays with its reader.
-    pub async fn revalidate_committed_export(
+    pub async fn authorize_export_chunk(
+        &self,
+        pointer: &CommittedExport,
+        caller: RegisteredAuthority,
+        origin: Option<RegisteredAuthority>,
+    ) -> Result<ExportChunkPermit, PortError> {
+        let access = self
+            .revalidate_committed_export(&caller.0, origin.as_ref().map(|(ctx, _)| ctx), pointer)
+            .await?;
+        Ok(ExportChunkPermit {
+            binding: pointer.binding.clone(),
+            installation: self.installation_id().clone(),
+            scope: pointer.object.scope.clone(),
+            access,
+            caller_registration: caller.1,
+            origin_registration: origin.map(|(_, lease)| lease),
+        })
+    }
+
+    /// Check both live authorities against the same snapshot of the selection.
+    async fn revalidate_committed_export(
         &self,
         ctx: &SpaceContext,
         origin: Option<&SpaceContext>,
         pointer: &CommittedExport,
-    ) -> Result<(), PortError> {
+    ) -> Result<ExportAccess, PortError> {
         let scope = ctx.scope().clone();
-        if let Some(origin) = origin {
-            scope.check(origin.scope())?;
+        pointer.object.scope.check(&scope)?;
+        if pointer.object.installation != *self.installation_id() {
+            return Err(DomainError::ResourceNotFound.into());
         }
-        let binding = pointer.binding(self, &scope)?;
-        let auth = ctx.auth().clone();
-        let origin = origin.map(|source| source.auth().clone());
+        let caller = pointer.caller.limit(ctx.auth())?;
+        let origin = if pointer.origin != pointer.caller {
+            let source = origin.ok_or(DomainError::AccessDenied)?;
+            scope.check(source.scope())?;
+            Some(pointer.origin.limit(source.auth())?)
+        } else {
+            None
+        };
+        let binding = pointer.binding.clone();
+        let selection = pointer.selection.clone();
+        let store = self.clone();
         self.with_read_tx_budget(Some(&ctx.budget), |tx| {
             Box::pin(async move {
                 let live = load_space_record(tx, &scope.space_id).await?;
                 live.scope.check(&scope)?;
-                authorize_publication_tx(tx, &live, &binding, &auth, origin.as_ref()).await
+                check_publication_tx(tx, &scope.space_id, &binding).await?;
+                store
+                    .authorize_export_selection_tx(
+                        tx,
+                        &live,
+                        &binding.job,
+                        &selection,
+                        &caller,
+                        origin.as_ref(),
+                    )
+                    .await?;
+                Ok(ExportAccess {
+                    seq: live.last_seq,
+                    caller,
+                    origin,
+                    selection,
+                })
             })
         })
         .await
     }
+
+    async fn read_export_policy_tx(
+        &self,
+        tx: &mut BackendConn<'_>,
+        scope: &HistoryScope,
+        binding: &ExportBinding,
+    ) -> Result<(JobDelegation, ExportSelection), PortError> {
+        const SQL: &str = "SELECT payload_msgpack, artifacts_json FROM content_jobs
+            WHERE space_id=$1 AND job_id=$2 AND payload_erased_by_purge=0 AND length(payload_msgpack)<=$3";
+        macro_rules! policy {
+            ($conn:expr) => {
+                sqlx::query_as(SQL)
+                    .bind(scope.space_id.as_str())
+                    .bind(binding.job.as_str())
+                    .bind(super::MAX_JOB_WIRE_BYTES as i64)
+                    .fetch_optional(&mut **$conn)
+                    .await
+            };
+        }
+        let row: Option<(Vec<u8>, String)> = match tx {
+            BackendConn::Sqlite(conn) => policy!(conn),
+            BackendConn::Postgres(conn) => policy!(conn),
+        }
+        .map_err(sql_error)?;
+        let (bytes, artifacts) = row.ok_or(DomainError::ResourceNotFound)?;
+        #[cfg(feature = "test-support")]
+        self.inner
+            .export_policy_bytes_read
+            .fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        let ids: Vec<ArtifactId> =
+            serde_json::from_str(&artifacts).map_err(|_| DomainError::ResourceNotFound)?;
+        if !ids.contains(&binding.id) {
+            return Err(DomainError::ResourceNotFound.into());
+        }
+        let (kind, origin) = decode_job_payload(&bytes)?;
+        let selection = match kind {
+            StoredJobPayloadV1::ExportSpace { .. } => ExportSelection::WholeSpace,
+            StoredJobPayloadV1::Export { notes, .. } => {
+                let selected: BTreeSet<_> = notes.iter().map(|note| note.as_str()).collect();
+                const OWNERS: &str = "SELECT note_id FROM payload_owners WHERE space_id=$1
+                    AND payload_kind='content_job' AND payload_id=$2 LIMIT $3";
+                macro_rules! owners {
+                    ($conn:expr) => {
+                        sqlx::query_scalar(OWNERS)
+                            .bind(scope.space_id.as_str())
+                            .bind(binding.job.as_str())
+                            .bind(selected.len() as i64 + 1)
+                            .fetch_all(&mut **$conn)
+                            .await
+                    };
+                }
+                let owners: Vec<String> = match tx {
+                    BackendConn::Sqlite(conn) => owners!(conn),
+                    BackendConn::Postgres(conn) => owners!(conn),
+                }
+                .map_err(sql_error)?;
+                if selected.len() != owners.len()
+                    || owners.iter().any(|id| !selected.contains(id.as_str()))
+                {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+                ExportSelection::Selected(Arc::new(SelectedNotes {
+                    count: selected.len(),
+                    visible: Mutex::default(),
+                }))
+            }
+            _ => return Err(DomainError::ResourceNotFound.into()),
+        };
+        Ok((origin.ok_or(DomainError::ResourceNotFound)?, selection))
+    }
+
+    async fn authorize_export_selection_tx(
+        &self,
+        tx: &mut BackendConn<'_>,
+        live: &crate::SpaceRecord,
+        job: &JobId,
+        selection: &ExportSelection,
+        caller: &EngineAuthContext,
+        origin: Option<&EngineAuthContext>,
+    ) -> Result<(), PortError> {
+        let accounts = || std::iter::once(caller).chain(origin);
+        let ExportSelection::Selected(notes) = selection else {
+            for account in accounts() {
+                authorize_full_space_export(account, &live.space)?;
+            }
+            return Ok(());
+        };
+        for account in accounts() {
+            authorize_job_read_on_space(account, &live.space)?;
+        }
+        let cached = notes
+            .visible
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .filter(|(seq, _)| *seq == live.last_seq)
+            .map(|(_, classes)| classes.clone());
+        let classes = match cached {
+            Some(classes) => classes,
+            None => {
+                let classes = self
+                    .live_selected_classes_tx(tx, live, job, notes.count)
+                    .await?;
+                let mut visible = notes.visible.lock().unwrap_or_else(|e| e.into_inner());
+                if visible
+                    .as_ref()
+                    .is_none_or(|(seq, _)| *seq <= live.last_seq)
+                {
+                    *visible = Some((live.last_seq, classes.clone()));
+                }
+                classes
+            }
+        };
+        for account in accounts() {
+            if !account.spaces()[&live.space.id]
+                .read_classes
+                .is_superset(&classes)
+            {
+                return Err(DomainError::ResourceNotFound.into());
+            }
+        }
+        Ok(())
+    }
+
+    async fn live_selected_classes_tx(
+        &self,
+        tx: &mut BackendConn<'_>,
+        live: &crate::SpaceRecord,
+        job: &JobId,
+        distinct_notes: usize,
+    ) -> Result<BTreeSet<DocClass>, PortError> {
+        // Owners are inserted with the immutable job payload. Purge erases the
+        // job and revokes its generation in the same transaction as owner removal.
+        macro_rules! classes {
+            ($conn:expr, $sql:expr) => {
+                sqlx::query_as($sql)
+                    .bind(live.scope.space_id.as_str())
+                    .bind(job.as_str())
+                    .bind(crate::domain::common::MAX_FOLDER_DEPTH as i64)
+                    .bind(live.root_folder_id.as_str())
+                    .fetch_all(&mut **$conn)
+                    .await
+            };
+        }
+        let rows: Vec<(String, i64)> = match tx {
+            BackendConn::Sqlite(conn) => classes!(conn, SQLITE_SELECTED_CLASSES),
+            BackendConn::Postgres(conn) => classes!(conn, PG_SELECTED_CLASSES),
+        }
+        .map_err(sql_error)?;
+        #[cfg(feature = "test-support")]
+        self.inner
+            .export_selection_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if rows.iter().map(|(_, count)| *count).sum::<i64>() != distinct_notes as i64 {
+            return Err(DomainError::ResourceNotFound.into());
+        }
+        rows.into_iter()
+            .map(|(class, _)| doc_class_from_db(&class))
+            .collect()
+    }
 }
 
-async fn authorize_publication_tx(
-    tx: &mut BackendConn<'_>,
-    live: &crate::SpaceRecord,
-    binding: &ExportBinding,
-    auth: &notarium_core::auth::EngineAuthContext,
-    origin: Option<&notarium_core::auth::EngineAuthContext>,
-) -> Result<(), PortError> {
-    check_publication_tx(tx, &live.scope.space_id, binding).await?;
-    let (job, _, _, _, erased, _) = load_job_row_opt_tx(tx, &live.scope.space_id, &binding.job)
-        .await?
-        .ok_or(DomainError::ResourceNotFound)?;
-    if job.state != notarium_core::ports::JobState::Succeeded
-        || erased
-        || !job.artifacts.contains(&binding.id)
-        || !matches!(
-            job.kind,
-            ContentJobKind::Export { .. } | ContentJobKind::ExportSpace { .. }
-        )
-    {
-        return Err(DomainError::ResourceNotFound.into());
-    }
-    for account in std::iter::once(auth).chain(origin) {
-        authorize_job_read_on_space(account, &live.space)?;
-        authorize_job_payload_tx(tx, &live.space, account, &job).await?;
-    }
-    Ok(())
+// Resolve only the selected active heads and their active ancestor chains.
+// Group by document class in SQL so at most one row per class crosses the port.
+macro_rules! selected_classes {
+    ($heads:literal, $parent:literal, $root_index:literal) => {
+        concat!("WITH RECURSIVE heads AS MATERIALIZED (
+    SELECT n.parent_folder_id,n.doc_class FROM payload_owners o ", $heads, "
+    WHERE o.space_id=$1 AND o.payload_kind='content_job' AND o.payload_id=$2 AND NOT EXISTS (
+        SELECT 1 FROM revision_purge_fences p WHERE p.space_id=o.space_id AND p.note_id=o.note_id)
+), ancestry(start_id,folder_id,depth) AS (
+    SELECT DISTINCT parent_folder_id,parent_folder_id,0 FROM heads
+    UNION ALL SELECT a.start_id,f.parent_folder_id,a.depth+1 FROM ancestry a ", $parent, "
+    WHERE a.depth<$3
+) SELECT h.doc_class,COUNT(*) FROM heads h
+    WHERE h.parent_folder_id IN (SELECT start_id FROM ancestry WHERE folder_id=$4)
+      AND EXISTS (SELECT 1 FROM folder_heads f ", $root_index, "
+        WHERE f.space_id=$1 AND f.folder_id=$4 AND f.is_root=1 AND f.lifecycle_state='active')
+    GROUP BY h.doc_class")
+    };
 }
+// Keep lookups driven by owners and ancestors even before planner statistics
+// exist. The composite keys make each bounded PostgreSQL lookup unique.
+const SQLITE_SELECTED_CLASSES: &str = selected_classes!(
+    "CROSS JOIN note_heads n INDEXED BY idx_note_heads_export_access
+        ON n.space_id=o.space_id AND n.note_id=o.note_id AND n.lifecycle_state='active'",
+    "CROSS JOIN folder_heads f INDEXED BY idx_folder_heads_export_access
+        ON f.space_id=$1 AND f.folder_id=a.folder_id AND f.lifecycle_state='active' AND f.is_root=0",
+    "INDEXED BY idx_folder_heads_export_access"
+);
+const PG_SELECTED_CLASSES: &str = selected_classes!(
+    "JOIN LATERAL (SELECT parent_folder_id,doc_class,lifecycle_state FROM note_heads
+        WHERE space_id=o.space_id AND note_id=o.note_id LIMIT 1) n ON n.lifecycle_state='active'",
+    "JOIN LATERAL (SELECT parent_folder_id,lifecycle_state,is_root FROM folder_heads
+        WHERE space_id=$1 AND folder_id=a.folder_id LIMIT 1) f ON f.lifecycle_state='active' AND f.is_root=0",
+    ""
+);
 
-// Keep the projection entirely before the object blob in the SQLite row.
-const CHECK_PUBLICATION: &str = "SELECT EXISTS(
-        SELECT 1 FROM archive_artifacts a JOIN content_jobs j
-          ON j.space_id=a.space_id AND j.job_id=a.job_id
+// The (Space, artifact) key is insert-only. The original open bound the job
+// and generation to it. Match its complete expiry index key at handoff to
+// avoid the overflow pages of the WITHOUT ROWID table's large object value.
+macro_rules! check_publication {
+    ($artifact:literal, $job:literal) => {
+        concat!(
+            "SELECT EXISTS(
+        SELECT 1 FROM archive_artifacts a ",
+            $artifact,
+            " JOIN content_jobs j ",
+            $job,
+            "
+          ON j.space_id=a.space_id
         LEFT JOIN archive_privacy p ON p.space_id=a.space_id
-        WHERE a.space_id=$1 AND a.artifact_id=$2 AND a.job_id=$3
-          AND a.privacy_generation=$4 AND COALESCE(p.generation,0)=a.privacy_generation
-          AND a.expires_at_ms=$5 AND a.expires_at_ms>$6
-          AND j.state='succeeded' AND j.job_kind='export' AND j.payload_erased_by_purge=0)";
+        WHERE a.space_id=$1 AND a.artifact_id=$2 AND j.job_id=$3
+          AND COALESCE(p.generation,0)=$4 AND a.expires_at_ms=$5 AND a.expires_at_ms>$6
+          AND a.object_namespace=$7 AND j.state='succeeded' AND j.job_kind='export'
+          AND j.payload_erased_by_purge=0)"
+        )
+    };
+}
+const SQLITE_CHECK_PUBLICATION: &str = check_publication!(
+    "INDEXED BY idx_archive_artifacts_expiry",
+    "INDEXED BY idx_content_jobs_export_access"
+);
+const PG_CHECK_PUBLICATION: &str = check_publication!("", "");
 
 async fn check_publication_tx(
     tx: &mut BackendConn<'_>,
@@ -606,21 +916,22 @@ async fn check_publication_tx(
 ) -> Result<(), PortError> {
     let now = job_clock_ms(tx).await?;
     macro_rules! check {
-        ($conn:expr) => {
-            sqlx::query_scalar(CHECK_PUBLICATION)
+        ($conn:expr, $sql:expr) => {
+            sqlx::query_scalar($sql)
                 .bind(space.as_str())
                 .bind(binding.id.as_str())
                 .bind(binding.job.as_str())
                 .bind(binding.generation as i64)
                 .bind(binding.expires)
                 .bind(now)
+                .bind(binding.namespace.as_bytes().as_slice())
                 .fetch_one(&mut **$conn)
                 .await
         };
     }
     let current: bool = match tx {
-        BackendConn::Sqlite(conn) => check!(conn),
-        BackendConn::Postgres(conn) => check!(conn),
+        BackendConn::Sqlite(conn) => check!(conn, SQLITE_CHECK_PUBLICATION),
+        BackendConn::Postgres(conn) => check!(conn, PG_CHECK_PUBLICATION),
     }
     .map_err(sql_error)?;
     if !current {
@@ -820,14 +1131,15 @@ impl CanonicalStore {
         tx: &mut BackendConn<'_>,
         space: &SpaceId,
         artifact: &ArtifactId,
-    ) -> Result<CommittedExport, PortError> {
+    ) -> Result<(ArchiveObject, ExportBinding), PortError> {
         const SQL: &str = "SELECT job_id, privacy_generation, expires_at_ms, object_msgpack
-        FROM archive_artifacts WHERE space_id=$1 AND artifact_id=$2";
+        FROM archive_artifacts WHERE space_id=$1 AND artifact_id=$2 AND length(object_msgpack)<=$3";
         let row: Option<(String, i64, i64, Vec<u8>)> = match tx {
             BackendConn::Sqlite(conn) => {
                 sqlx::query_as(SQL)
                     .bind(space.as_str())
                     .bind(artifact.as_str())
+                    .bind(MAX_MSGPACK_DECODE_BYTES as i64)
                     .fetch_optional(&mut **conn)
                     .await
             }
@@ -835,6 +1147,7 @@ impl CanonicalStore {
                 sqlx::query_as(SQL)
                     .bind(space.as_str())
                     .bind(artifact.as_str())
+                    .bind(MAX_MSGPACK_DECODE_BYTES as i64)
                     .fetch_optional(&mut **conn)
                     .await
             }
@@ -845,12 +1158,27 @@ impl CanonicalStore {
         self.inner
             .export_descriptor_bytes_read
             .fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
-        Ok(CommittedExport {
-            object: decode_msgpack_bounded(&bytes, MAX_MSGPACK_DECODE_BYTES)?,
-            job: JobId::parse(&job)?,
-            privacy_generation: generation as u64,
-            expires_at_ms,
-        })
+        let object: ArchiveObject = decode_msgpack_bounded(&bytes, MAX_MSGPACK_DECODE_BYTES)?;
+        let namespace = object.namespace;
+        Ok((
+            object,
+            ExportBinding {
+                id: artifact.clone(),
+                job: JobId::parse(&job)?,
+                generation: generation as u64,
+                expires: expires_at_ms,
+                namespace,
+            },
+        ))
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn export_policy_reads_for_test(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            self.inner.export_policy_bytes_read.load(Relaxed),
+            self.inner.export_selection_reads.load(Relaxed),
+        )
     }
 
     #[cfg(feature = "test-support")]
@@ -1257,12 +1585,96 @@ fn invalid(reason: ValidationReason) -> PortError {
 
 #[cfg(test)]
 mod tests {
-    use super::CHECK_PUBLICATION;
+    use super::{SQLITE_CHECK_PUBLICATION, SQLITE_SELECTED_CLASSES};
     use rusqlite::{
         Connection,
         hooks::{AuthAction, AuthContext, Authorization},
         params,
     };
+
+    #[test]
+    fn selected_range_reads_one_class_through_its_own_active_ancestry() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(crate::schema::SQLITE_BASELINE_DDL)
+            .unwrap();
+        db.execute_batch(
+            "INSERT INTO spaces VALUES('space',zeroblob(16),'root','space','space','personal','owner','active',1,0,'{}',0,0);
+             INSERT INTO folder_heads(space_id,folder_id,is_root,slug,slug_fold,display_name,is_project,lifecycle_state,
+                 rev_seq,head_rev_id,created_seq,updated_seq,updated_at_sec,updated_at_nsec)
+             VALUES('space','root',1,'','','',0,'active',0,'rev',0,0,0,0);
+             WITH RECURSIVE seq(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM seq WHERE i<10000)
+             INSERT INTO folder_heads(space_id,folder_id,parent_folder_id,is_root,slug,slug_fold,display_name,is_project,lifecycle_state,
+                 rev_seq,head_rev_id,created_seq,updated_seq,updated_at_sec,updated_at_nsec)
+             SELECT 'space',printf('f%d',i),'root',0,printf('f%d',i),printf('f%d',i),'',0,'active',0,'rev',0,0,0,0 FROM seq;
+             INSERT INTO note_heads(space_id,note_id,parent_folder_id,slug,slug_fold,title,title_fold,doc_class,head_rev_id,
+                 content_blake3,byte_size,lifecycle_state,created_seq,updated_seq,created_at_sec,created_at_nsec,updated_at_sec,updated_at_nsec,last_actor_id)
+             SELECT 'space',folder_id,folder_id,'n','n','','','user-doc','r',zeroblob(32),1,'active',1,1,0,0,0,0,'actor'
+             FROM folder_heads WHERE is_root=0;
+             INSERT INTO payload_owners(space_id,note_id,payload_kind,payload_id) VALUES('space','f1','content_job','job');"
+        ).unwrap();
+        let title = format!("b{}aa", "漢".repeat(1_397_971));
+        db.execute(
+            "UPDATE note_heads SET title=?1,title_fold=?1 WHERE note_id='f1'",
+            [&title],
+        )
+        .unwrap();
+        let read = || {
+            let mut query = db.prepare(SQLITE_SELECTED_CLASSES).unwrap();
+            let rows = query
+                .query_map(params!["space", "job", 256, "root"], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert!(query.get_status(rusqlite::StatementStatus::VmStep) < 2_000);
+            rows
+        };
+        for analyzed in [false, true] {
+            if analyzed {
+                db.execute_batch("ANALYZE").unwrap();
+            }
+            db.authorizer(Some(|event: AuthContext<'_>| match event.action {
+                AuthAction::Read {
+                    table_name: "note_heads",
+                    column_name: "title" | "title_fold" | "content_blake3",
+                }
+                | AuthAction::Read {
+                    table_name: "folder_heads",
+                    column_name: "display_name" | "description",
+                }
+                | AuthAction::Read {
+                    table_name: "content_jobs" | "archive_artifacts",
+                    ..
+                } => Authorization::Deny,
+                _ => Authorization::Allow,
+            }))
+            .unwrap();
+            assert_eq!(read(), vec![("user-doc".into(), 1)]);
+            db.authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+                .unwrap();
+        }
+        db.execute(
+            "UPDATE note_heads SET doc_class='agent-memory' WHERE note_id='f1'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(read(), vec![("agent-memory".into(), 1)]);
+        db.execute(
+            "UPDATE folder_heads SET lifecycle_state='trashed' WHERE folder_id='f1'",
+            [],
+        )
+        .unwrap();
+        assert!(read().is_empty());
+        db.execute(
+            "UPDATE note_heads SET parent_folder_id='root' WHERE note_id='f1'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(read(), vec![("agent-memory".into(), 1)]);
+        db.execute("INSERT INTO revision_purge_fences VALUES('space',zeroblob(16),'f1',2,'active',NULL,0,0)", []).unwrap();
+        assert!(read().is_empty());
+    }
 
     #[test]
     fn range_fence_checks_a_large_publication_without_reading_its_descriptor() {
@@ -1271,8 +1683,8 @@ mod tests {
             .unwrap();
         db.execute_batch(
             "INSERT INTO spaces VALUES('space',zeroblob(16),'root','space','space','personal','owner','active',1,0,'{}',0,0);
-             INSERT INTO content_jobs(space_id,job_id,job_kind,state,lease_epoch,artifacts_json,created_seq,updated_seq)
-               VALUES('space','job','export','succeeded',1,'[]',1,2);
+             INSERT INTO content_jobs(space_id,job_id,job_kind,payload_msgpack,state,lease_epoch,artifacts_json,created_seq,updated_seq)
+               VALUES('space','job','export',zeroblob(4000000),'succeeded',1,'[]',1,2);
              INSERT INTO archive_artifacts(space_id,artifact_id,job_id,privacy_generation,expires_at_ms,object_msgpack,object_namespace)
                VALUES('space','artifact','job',0,1000,zeroblob(647498),zeroblob(32));"
         ).unwrap();
@@ -1280,14 +1692,18 @@ mod tests {
             AuthAction::Read {
                 table_name: "archive_artifacts",
                 column_name: "object_msgpack",
+            }
+            | AuthAction::Read {
+                table_name: "content_jobs",
+                column_name: "payload_msgpack",
             } => Authorization::Deny,
             _ => Authorization::Allow,
         }))
         .unwrap();
         let active = |now| {
             db.query_row(
-                CHECK_PUBLICATION,
-                params!["space", "artifact", "job", 0, 1000, now],
+                SQLITE_CHECK_PUBLICATION,
+                params!["space", "artifact", "job", 0, 1000, now, [0u8; 32]],
                 |row| row.get::<_, bool>(0),
             )
             .unwrap()

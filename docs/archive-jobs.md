@@ -67,12 +67,14 @@ generations in their own namespace.
 
 `ArchiveJobs::open_export` returns an authorized reader with a bounded
 `read_chunk` method. Its metadata includes content length and expiry. The reader
-loads the immutable segment descriptors once at open. Each chunk rechecks its
-publication, job state and current access to the selected content. It checks
-explicit revocation and natural credential expiry for both the
-caller and the original exporter at handoff, inside the canonical privacy
-fence. A successful enqueue into a reserved transport slot is the receipt for
-that chunk. Archive bytes already handed off belong to the caller. An artifact
+loads the immutable segment descriptors and the job policy once at open. Each
+chunk checks the publication and job state. For selected exports the reader
+reuses document classes and active ancestry while the history, privacy generation
+and Space sequence match. SQLite resolves changed selections through covering
+indexes. The caller and original exporter both need current access. Their
+revocation and expiry checks run at handoff inside the canonical privacy fence.
+A successful enqueue into a reserved transport slot is the receipt for that
+chunk. Archive bytes already handed off belong to the caller. An artifact
 expires seven days after publication. The maintenance loop retires its sealed
 storage generation and then removes the pointer.
 

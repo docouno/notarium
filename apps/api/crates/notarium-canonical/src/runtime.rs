@@ -150,6 +150,10 @@ pub(crate) struct CanonicalInner {
     pub job_reads: crate::peers::JobReadRegistry,
     #[cfg(feature = "test-support")]
     pub export_descriptor_bytes_read: std::sync::atomic::AtomicU64,
+    #[cfg(feature = "test-support")]
+    pub export_policy_bytes_read: std::sync::atomic::AtomicU64,
+    #[cfg(feature = "test-support")]
+    pub export_selection_reads: std::sync::atomic::AtomicU64,
     pub backup_shutdown: notarium_core::ports::Cancellation,
     pub backup_executor: tokio::runtime::Handle,
     pub backup_local_holds:
@@ -481,6 +485,10 @@ impl CanonicalRuntime {
             job_reads: crate::peers::JobReadRegistry::default(),
             #[cfg(feature = "test-support")]
             export_descriptor_bytes_read: Default::default(),
+            #[cfg(feature = "test-support")]
+            export_policy_bytes_read: Default::default(),
+            #[cfg(feature = "test-support")]
+            export_selection_reads: Default::default(),
             backup_shutdown: Default::default(),
             backup_executor: tokio::runtime::Handle::current(),
             backup_local_holds: Default::default(),

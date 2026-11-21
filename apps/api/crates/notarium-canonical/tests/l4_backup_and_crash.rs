@@ -494,6 +494,17 @@ impl BackendCase {
                 .execute(&mut *tx)
                 .await
                 .unwrap();
+            if decoded.schema_version < 9 {
+                sqlx::raw_sql(
+                    "DROP INDEX idx_blob_catalog_legacy;
+                     DROP INDEX idx_note_heads_export_access;
+                     DROP INDEX idx_folder_heads_export_access;
+                     DROP INDEX idx_content_jobs_export_access;",
+                )
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            }
             if decoded.schema_version < 8 {
                 sqlx::query("DROP TABLE blob_gc_retries")
                     .execute(&mut *tx)

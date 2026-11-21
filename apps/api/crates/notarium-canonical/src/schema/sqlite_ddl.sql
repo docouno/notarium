@@ -72,6 +72,10 @@ CREATE TABLE IF NOT EXISTS folder_heads (
     FOREIGN KEY (space_id, parent_folder_id) REFERENCES folder_heads (space_id, folder_id)
 );
 
+CREATE INDEX IF NOT EXISTS idx_folder_heads_export_access
+    ON folder_heads (space_id, folder_id, parent_folder_id, is_root)
+    WHERE lifecycle_state = 'active';
+
 CREATE UNIQUE INDEX IF NOT EXISTS uq_folder_heads_root
     ON folder_heads (space_id)
     WHERE is_root = 1;
@@ -136,6 +140,10 @@ CREATE TABLE IF NOT EXISTS note_heads (
     FOREIGN KEY (space_id) REFERENCES spaces (space_id),
     FOREIGN KEY (space_id, parent_folder_id) REFERENCES folder_heads (space_id, folder_id)
 );
+
+CREATE INDEX IF NOT EXISTS idx_note_heads_export_access
+    ON note_heads (space_id, note_id, parent_folder_id, doc_class)
+    WHERE lifecycle_state = 'active';
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_note_heads_active_sibling
     ON note_heads (space_id, parent_folder_id, slug_fold)
@@ -301,6 +309,10 @@ CREATE TABLE IF NOT EXISTS blob_catalog (
 CREATE INDEX IF NOT EXISTS idx_blob_catalog_zero_ref
     ON blob_catalog (space_id, touched_at_ms)
     WHERE ref_count = 0;
+
+CREATE INDEX IF NOT EXISTS idx_blob_catalog_legacy
+    ON blob_catalog (space_id, touched_at_ms, content_blake3)
+    WHERE ref_count = 0 AND legacy_cleanup = 1 AND admission_state = 'open' AND blob_state = 'active';
 
 CREATE INDEX IF NOT EXISTS idx_blob_catalog_gc
     ON blob_catalog (space_id, touched_at_ms, content_blake3)
@@ -744,6 +756,10 @@ CREATE TABLE IF NOT EXISTS content_jobs (
     PRIMARY KEY (space_id, job_id),
     FOREIGN KEY (space_id) REFERENCES spaces (space_id)
 );
+
+CREATE INDEX IF NOT EXISTS idx_content_jobs_export_access
+    ON content_jobs (space_id, job_id)
+    WHERE job_kind = 'export' AND state = 'succeeded' AND payload_erased_by_purge = 0;
 
 CREATE INDEX IF NOT EXISTS idx_content_jobs_claim
     ON content_jobs (state, job_kind, space_id, lease_until_ms, job_id);

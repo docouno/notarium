@@ -881,15 +881,26 @@ async fn sqlite_archive_verification_restore_and_rejection() {
         );
     }
 
-    for (target, legacy_order) in [
-        ("absent", Some("space_id, state, lease_until_ms, job_id")),
+    const V7: &str = "DROP TABLE blob_gc_retries;
+        UPDATE schema_meta SET schema_version=7,
+            manifest_checksum=X'69d765f45ef72feff9238b179deb7a0afae85de76555b3720d2d3c5b9a954699'";
+    const V8: &str = "UPDATE schema_meta SET schema_version=8,
+        manifest_checksum=X'5d75c6594906f1a5d59f5a0e45ebbd1a1dc48f0138bafbad5c4b12cd2bb000e1'";
+    for (target, predecessor, legacy_order) in [
+        (
+            "absent",
+            Some(V7),
+            Some("space_id, state, lease_until_ms, job_id"),
+        ),
         (
             "space-before-kind",
+            Some(V7),
             Some("state, space_id, job_kind, lease_until_ms, job_id"),
         ),
-        ("existing", None),
+        ("v8", Some(V8), None),
+        ("existing", None, None),
     ] {
-        let existing = legacy_order.is_none();
+        let existing = predecessor.is_none();
         let restored = DataRoot::new(scratch.0.join(target));
         if existing {
             fs::create_dir(restored.root()).unwrap();
@@ -908,17 +919,25 @@ async fn sqlite_archive_verification_restore_and_rejection() {
         } else {
             RestoreKeyring::External(root.keyring())
         };
-        let archive = if let Some(columns) = legacy_order {
+        let archive = if let Some(predecessor) = predecessor {
+            let claim = legacy_order
+                .map(|columns| {
+                    format!(
+                        "DROP INDEX idx_content_jobs_claim;
+                 CREATE INDEX idx_content_jobs_claim ON content_jobs ({columns})"
+                    )
+                })
+                .unwrap_or_default();
             let legacy = repackage_sqlite(
                 &destination,
                 &scratch.0,
                 "canonical",
                 &format!(
-                    "DROP TABLE blob_gc_retries;
-                     UPDATE schema_meta SET schema_version=7,
-                         manifest_checksum=X'69d765f45ef72feff9238b179deb7a0afae85de76555b3720d2d3c5b9a954699';
-                     DROP INDEX idx_content_jobs_claim;
-                     CREATE INDEX idx_content_jobs_claim ON content_jobs ({columns})"
+                    "DROP INDEX idx_blob_catalog_legacy;
+                     DROP INDEX idx_note_heads_export_access;
+                     DROP INDEX idx_folder_heads_export_access;
+                     DROP INDEX idx_content_jobs_export_access;
+                     {predecessor}; {claim}"
                 ),
             );
             let report = run_fsck(

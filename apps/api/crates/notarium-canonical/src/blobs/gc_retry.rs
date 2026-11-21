@@ -10,6 +10,50 @@ pub(super) struct Dispatcher {
     wake: tokio::sync::Notify,
 }
 
+impl Dispatcher {
+    /// Wake the existing scanner, or acquire ownership of a new one.
+    pub(super) fn request(&self) -> bool {
+        let mut state = self.state.lock().expect("GC dispatcher");
+        if state.replace(true).is_some() {
+            self.wake.notify_one();
+            return false;
+        }
+        true
+    }
+
+    pub(super) async fn run<F, Fut>(&self, mut pass: F)
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<Option<Duration>, PortError>>,
+    {
+        loop {
+            *self.state.lock().expect("GC dispatcher") = Some(false);
+            let wait = match pass().await {
+                Ok(wait) => wait,
+                Err(error) => {
+                    tracing::warn!(?error, "could not scan pending GC");
+                    Some(Duration::from_secs(1))
+                }
+            };
+            let delay = {
+                let mut state = self.state.lock().expect("GC dispatcher");
+                if *state == Some(true) {
+                    continue;
+                }
+                let Some(delay) = wait else {
+                    *state = None;
+                    return;
+                };
+                delay
+            };
+            tokio::select! {
+                () = tokio::time::sleep(delay) => {},
+                () = self.wake.notified() => {},
+            }
+        }
+    }
+}
+
 pub(super) async fn enqueue_tx(
     tx: &mut BackendConn<'_>,
     space: &SpaceId,
@@ -147,46 +191,16 @@ impl crate::CanonicalStore {
     }
 
     pub(crate) fn wake_gc_retries(&self) {
-        let dispatcher = &self.inner.retirement_workers.retries;
-        let mut state = dispatcher.state.lock().expect("GC dispatcher");
-        if state.replace(true).is_some() {
-            dispatcher.wake.notify_one();
+        if !self.inner.retirement_workers.retries.request() {
             return;
         }
         let store = self.clone();
         let shutdown = self.inner.backup_shutdown.clone();
         let handle = self.inner.backup_executor.spawn(async move {
-            tokio::select! { biased; () = shutdown.cancelled() => {}, () = store.run_gc_retries() => {} }
+            let retries = &store.inner.retirement_workers.retries;
+            tokio::select! { biased; () = shutdown.cancelled() => {}, () = retries.run(|| store.gc_retry_pass()) => {} }
         });
         crate::backup::register_cleanup_task(&self.inner, handle);
-    }
-
-    async fn run_gc_retries(&self) {
-        let dispatcher = &self.inner.retirement_workers.retries;
-        loop {
-            *dispatcher.state.lock().expect("GC dispatcher") = Some(false);
-            let wait = match self.gc_retry_pass().await {
-                Ok(wait) => wait,
-                Err(error) => {
-                    tracing::warn!(?error, "could not scan durable GC retries");
-                    Some(Duration::from_secs(1))
-                }
-            };
-            {
-                let mut state = dispatcher.state.lock().expect("GC dispatcher");
-                if *state == Some(true) {
-                    continue;
-                }
-                if wait.is_none() {
-                    *state = None;
-                    return;
-                }
-            }
-            tokio::select! {
-                () = tokio::time::sleep(wait.expect("pending retry")) => {},
-                () = dispatcher.wake.notified() => {},
-            }
-        }
     }
 
     async fn gc_retry_pass(&self) -> Result<Option<Duration>, PortError> {

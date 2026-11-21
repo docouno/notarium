@@ -4112,7 +4112,7 @@ async fn oversized_export_jobs_are_rejected_or_failed_before_the_next_claim() {
 async fn paged_archive_export_keeps_chat_appends_out_of_the_cut() {
     use notarium_canonical::UpdateSpaceSchema;
     use notarium_canonical::peers::{
-        archive_export::{CommittedExport, ExportChatBody, ExportData},
+        archive_export::{ExportChatBody, ExportData},
         archive_import::{ArchiveObject, ArchiveObjectKind},
     };
     let local = TempDataRoot::new("paged-archive-export");
@@ -4526,37 +4526,43 @@ async fn paged_archive_export_keeps_chat_appends_out_of_the_cut() {
                 .iter()
                 .all(|entry| entry.path != ".notarium/fields/schema.yaml")
         );
-        let pointer = CommittedExport {
-            object: ArchiveObject {
-                installation: store.installation_id().clone(),
-                namespace: ContentDigest::from_bytes([1; 32]),
-                scope: scope.clone(),
-                id: notarium_core::ids::ArtifactId::from_bytes([1; 16]),
-                kind: ArchiveObjectKind::Export,
-                digest: ContentDigest::from_bytes([2; 32]),
-                bytes: 1,
-                segments: Vec::new(),
-            },
-            job: claim.job.id.clone(),
-            privacy_generation: after_purge.generation,
-            expires_at_ms: i64::MAX,
+        let object = ArchiveObject {
+            installation: store.installation_id().clone(),
+            namespace: ContentDigest::from_bytes([1; 32]),
+            scope: scope.clone(),
+            id: notarium_core::ids::ArtifactId::from_bytes([1; 16]),
+            kind: ArchiveObjectKind::Export,
+            digest: ContentDigest::from_bytes([2; 32]),
+            bytes: 1,
+            segments: Vec::new(),
         };
-        let (send, mut queue) = tokio::sync::mpsc::channel(1);
-        let slot = send.reserve_owned().await.unwrap();
-        let refused = store
-            .handoff_export_chunk(&make_budget(), &scope, &pointer, move || {
-                slot.send(b'x');
-                Ok(())
-            })
-            .await;
+        let download_ctx = || {
+            let grant = ctx().auth().spaces()[&scope.space_id].clone();
+            let verified = VerifiedHuman::attest(
+                owner.clone(),
+                GrantId::from_bytes([8; 16]),
+                BTreeMap::from([(scope.space_id.clone(), grant)]),
+                true,
+            )
+            .with_credential(notarium_core::auth::AuthenticatedCredential::TrustedNone);
+            SpaceContext::new(
+                EngineAuthContext::for_human(verified),
+                scope.clone(),
+                make_budget(),
+            )
+            .unwrap()
+        };
         assert!(matches!(
-            refused,
+            store
+                .open_committed_export(download_ctx(), &object.id, async |_| Err(
+                    DomainError::AccessDenied.into()
+                ))
+                .await,
             Err(PortError::Domain(DomainError::ResourceNotFound))
         ));
-        assert!(queue.try_recv().is_err());
         let publication_job = store
             .create_job(
-                ctx(),
+                download_ctx(),
                 next_mutation(
                     &scope,
                     &owner,
@@ -4577,7 +4583,6 @@ async fn paged_archive_export_keeps_chat_appends_out_of_the_cut() {
             .unwrap()
             .unwrap();
         assert_eq!(publication_claim.job.id, publication_job.id);
-        let object = pointer.object;
         let id = object.id.clone();
         store
             .reserve_archive_upload(
@@ -4610,13 +4615,32 @@ async fn paged_archive_export_keeps_chat_appends_out_of_the_cut() {
             )
             .await
             .unwrap();
-        let pointer = store.open_committed_export(ctx(), &id).await.unwrap();
+        let pointer = store
+            .open_committed_export(download_ctx(), &id, async |_| {
+                Err(DomainError::AccessDenied.into())
+            })
+            .await
+            .unwrap();
+        let permit = store
+            .authorize_export_chunk(
+                &pointer,
+                (
+                    download_ctx(),
+                    Box::new(Registration {
+                        entered: Default::default(),
+                        released: Default::default(),
+                    }),
+                ),
+                None,
+            )
+            .await
+            .unwrap();
         let (send, mut queue) = tokio::sync::mpsc::channel(1);
         let slot = send.reserve_owned().await.unwrap();
         let transfer = make_budget();
         let cancel = transfer.cancellation.clone();
         store
-            .handoff_export_chunk(&transfer, &scope, &pointer, move || {
+            .handoff_export_chunk(&transfer, permit, move || {
                 slot.send(b'x');
                 cancel.cancel();
                 Ok(())

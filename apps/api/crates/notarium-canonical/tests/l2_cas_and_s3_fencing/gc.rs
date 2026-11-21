@@ -79,11 +79,15 @@ async fn replayed_lease_keeps_a_current_epoch_local_ticket_admissible() {
     let (store, runtime) = CanonicalRuntime::open(config).await.unwrap();
     let (scope, epoch) = init_test_space(&store, 44).await;
     let prepared = orphan(&store, &scope, epoch, 40).await;
-    store
-        .mark_legacy_blob_cleanup(&scope, epoch, prepared.digest())
-        .await
-        .unwrap();
     let ticket = store.stage_blob(&scope, epoch, &prepared).await.unwrap();
+    let abandoned = orphan(&store, &scope, epoch, 43).await;
+    let unused_ticket = store.stage_blob(&scope, epoch, &abandoned).await.unwrap();
+    for digest in [prepared.digest(), abandoned.digest()] {
+        store
+            .mark_legacy_blob_cleanup(&scope, epoch, digest)
+            .await
+            .unwrap();
+    }
     let mut ctx = maintenance_ctx(ServicePurpose::Revocation);
     ctx.budget.remaining = Duration::from_secs(1);
     assert_eq!(
@@ -94,6 +98,16 @@ async fn replayed_lease_keeps_a_current_epoch_local_ticket_admissible() {
         epoch
     );
     bind(&store, &scope, epoch, &NoteId::from_bytes([41; 16]), ticket).await;
+    let path = root.data_root().blob(&scope.space_id, abandoned.digest());
+    assert!(path.exists());
+    drop(unused_ticket);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while path.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("releasing the current-epoch ticket must resume legacy cleanup");
     assert_eq!(
         store
             .read_verified_blob(&scope, prepared.digest())
@@ -162,6 +176,41 @@ async fn postgres_gc_owns_a_retirement_after_losing_the_commit_acknowledgement()
     .expect("the committed retirement must finish without a restart or lease change");
     let ticket = store.stage_blob(&scope, epoch, &prepared).await.unwrap();
     bind(&store, &scope, epoch, &NoteId::from_bytes([43; 16]), ticket).await;
+
+    let legacy = orphan(&store, &scope, epoch, 44).await;
+    store
+        .mark_legacy_blob_cleanup(&scope, epoch, legacy.digest())
+        .await
+        .unwrap();
+    store
+        .writer_faults()
+        .unwrap()
+        .drop_auxiliary_commit_response_once
+        .store(true, Ordering::SeqCst);
+    let next = epoch.checked_next().unwrap();
+    store
+        .advance_space_lease(&maintenance_ctx(ServicePurpose::Revocation), &scope, next)
+        .await
+        .unwrap();
+    assert!(
+        !store
+            .writer_faults()
+            .unwrap()
+            .drop_auxiliary_commit_response_once
+            .load(Ordering::SeqCst)
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while root
+            .data_root()
+            .blob(&scope.space_id, legacy.digest())
+            .exists()
+            || !store.storage_cleanup_idle_for_test()
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("legacy page handoff must survive loss of the COMMIT acknowledgement");
     runtime.shutdown().await.unwrap();
     fixtures.drop_pg_schema(&schema).await;
 }
@@ -267,5 +316,81 @@ async fn failing_retirements_release_capacity_for_other_spaces_and_recover_after
     .await
     .expect("durable retries must drain after repair without another sweep or epoch change");
     assert_eq!(count("SELECT COUNT(*) FROM blob_gc_retries"), 0);
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn legacy_pages_resume_after_a_live_hold_and_skip_earlier_ordinary_orphans() {
+    use notarium_core::{ids::BackupId, ports::BackupParticipantPort};
+    let root = TempDataRoot::new("legacy-gc-pages");
+    let config = CanonicalConfig::local_default(sample_installation_id(49), root.data_root());
+    let (store, runtime) = CanonicalRuntime::open(config).await.unwrap();
+    let (scope, epoch) = init_test_space(&store, 49).await;
+    let owner = NoteId::from_bytes([49; 16]);
+    let mut ordinary = Vec::new();
+    let mut legacy = Vec::new();
+    for (kind, paths) in [(0, &mut ordinary), (1, &mut legacy)] {
+        for i in 0..129 {
+            let prepared = store.prepare_blob(&[kind, i]).unwrap();
+            let ticket = store.stage_blob(&scope, epoch, &prepared).await.unwrap();
+            bind(&store, &scope, epoch, &owner, ticket).await;
+            store
+                .release_blob_owner_references(
+                    &scope,
+                    epoch,
+                    BlobOwnerKind::NoteRevision,
+                    owner.as_str(),
+                )
+                .await
+                .unwrap();
+            if kind == 1 {
+                store
+                    .mark_legacy_blob_cleanup(&scope, epoch, prepared.digest())
+                    .await
+                    .unwrap();
+            }
+            paths.push(root.data_root().blob(&scope.space_id, prepared.digest()));
+        }
+    }
+    // Ordinary rows occupy the whole first sweep page; all legacy rows share a timestamp.
+    store
+        .execute_diagnostic_write_sql_for_test(
+            "UPDATE blob_catalog SET touched_at_ms=legacy_cleanup",
+        )
+        .await
+        .unwrap();
+    assert!(ordinary.iter().chain(&legacy).all(|path| path.is_file()));
+
+    let mut source = store
+        .prepare(
+            maintenance_ctx(ServicePurpose::Backup),
+            BackupId::from_bytes([49; 16]),
+            store.default_backup_budget(),
+        )
+        .await
+        .unwrap();
+    let hold = source.acquire_hold().await.unwrap();
+    let next = epoch.checked_next().unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        store.advance_space_lease(&maintenance_ctx(ServicePurpose::Revocation), &scope, next),
+    )
+    .await
+    .expect("a backup hold must not delay the lease grant")
+    .unwrap();
+    assert!(legacy.iter().all(|path| path.is_file()));
+    hold.release().await.unwrap();
+    source.abort().await.unwrap();
+
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while legacy.iter().any(|path| path.exists()) || !store.storage_cleanup_idle_for_test() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("legacy cleanup must cross the page boundary after hold release without a sweep");
+    assert!(ordinary.iter().all(|path| path.is_file()));
+    let untouched = store.execute_diagnostic_read_sql_for_test(None, "SELECT count(*) FROM blob_catalog WHERE legacy_cleanup=0 AND blob_state='active' AND quarantined_at_ms IS NULL").await.unwrap();
+    assert_eq!(untouched, 129);
     runtime.shutdown().await.unwrap();
 }

@@ -413,6 +413,10 @@ async fn l1_postgres_bootstrap_idempotence_and_fail_closed_guards() {
     ] {
         sqlx::raw_sql(
             "DROP TABLE blob_gc_retries;
+             DROP INDEX idx_blob_catalog_legacy;
+             DROP INDEX idx_note_heads_export_access;
+             DROP INDEX idx_folder_heads_export_access;
+             DROP INDEX idx_content_jobs_export_access;
              UPDATE schema_meta SET schema_version=7,
                 manifest_checksum=decode('69d765f45ef72feff9238b179deb7a0afae85de76555b3720d2d3c5b9a954699','hex');
              DROP INDEX idx_content_jobs_claim;",
@@ -428,6 +432,27 @@ async fn l1_postgres_bootstrap_idempotence_and_fail_closed_guards() {
                 .unwrap();
         assert!(definition.ends_with("(state, job_kind, space_id, lease_until_ms, job_id)"));
     }
+    // The v8 manifest already has the durable GC ledger and the current claim index.
+    sqlx::raw_sql(
+        "DROP INDEX idx_blob_catalog_legacy;
+         DROP INDEX idx_note_heads_export_access;
+         DROP INDEX idx_folder_heads_export_access;
+         DROP INDEX idx_content_jobs_export_access;
+         UPDATE schema_meta SET schema_version=8,
+            manifest_checksum=decode('5d75c6594906f1a5d59f5a0e45ebbd1a1dc48f0138bafbad5c4b12cd2bb000e1','hex');",
+    ).execute(&mut raw).await.unwrap();
+    notarium_canonical::schema::bootstrap_postgres_schema(&mut raw, &schema, &install)
+        .await
+        .unwrap();
+    let added: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_indexes WHERE schemaname=current_schema()
+            AND indexname IN ('idx_blob_catalog_legacy', 'idx_note_heads_export_access',
+                'idx_folder_heads_export_access', 'idx_content_jobs_export_access')",
+    )
+    .fetch_one(&mut raw)
+    .await
+    .unwrap();
+    assert_eq!(added, 4);
     let upgraded_constraints: Vec<(String, String, String)> = sqlx::query_as(CONSTRAINTS)
         .fetch_all(&mut raw)
         .await

@@ -600,6 +600,7 @@ async fn exercise_local_archive_worker(entries: usize) {
         store.export_descriptor_bytes_read_for_test() - descriptor_before,
         encoded_len(id)
     );
+    let mut selected_caller = None;
     if entries == 201 {
         let expires = clock.now.load(Ordering::SeqCst) + 86_400_000;
         let pat = control_service
@@ -633,6 +634,7 @@ async fn exercise_local_archive_worker(entries: usize) {
             .value;
         let exported_by_pat = terminal(&store, &pat_ctx, &job).await;
         let descriptor_before = store.export_descriptor_bytes_read_for_test();
+        selected_caller = Some(pat_ctx.clone());
         let as_caller = jobs.open_export(pat_ctx, id).await.unwrap();
         let as_origin = jobs
             .open_export(ctx.clone(), &exported_by_pat.artifacts[0])
@@ -750,7 +752,7 @@ async fn exercise_local_archive_worker(entries: usize) {
             |row| row.get::<_, String>(0),
         )
         .unwrap();
-    if entries == 201 {
+    let selected_reader = if entries == 201 {
         db.execute(
             "WITH RECURSIVE counts(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM counts WHERE i<10000)
              INSERT INTO folder_heads(space_id,folder_id,parent_folder_id,is_root,slug,slug_fold,display_name,
@@ -765,7 +767,7 @@ async fn exercise_local_archive_worker(entries: usize) {
                 mutation(
                     &ctx,
                     ContentJobKind::Export {
-                        notes: vec![NoteId::parse(&note).unwrap()],
+                        notes: vec![NoteId::parse(&note).unwrap(); 2],
                         encrypted: false,
                     },
                 ),
@@ -781,10 +783,113 @@ async fn exercise_local_archive_worker(entries: usize) {
             (completed.state, completed.completed_units),
             (JobState::Succeeded, 1)
         );
-        let selected_download = jobs
-            .open_export(ctx.clone(), &completed.artifacts[0])
+        // A legitimate imported title can fill nearly four MiB. Updating just
+        // the title preserves the selection's active class and ancestry.
+        let old_title: (String, String) = db
+            .query_row(
+                "SELECT title,title_fold FROM note_heads WHERE space_id=?1 AND note_id=?2",
+                rusqlite::params![scope.space_id.as_str(), &note],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let title = format!("b{}aa", "漢".repeat(1_397_971));
+        db.execute(
+            "UPDATE note_heads SET title=?1,title_fold=?1 WHERE space_id=?2 AND note_id=?3",
+            rusqlite::params![&title, scope.space_id.as_str(), &note],
+        )
+        .unwrap();
+        let pat_ctx = selected_caller.unwrap();
+        let publication = store
+            .open_committed_export(pat_ctx.clone(), &completed.artifacts[0], async |origin| {
+                control_service.refresh_archive_job(budget(), origin).await
+            })
             .await
             .unwrap();
+        let registered = |ctx: &SpaceContext| {
+            (
+                ctx.clone(),
+                Box::<TestLease>::default() as Box<dyn RevocationLease>,
+            )
+        };
+        assert!(
+            store
+                .authorize_export_chunk(&publication, registered(&pat_ctx), None)
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .authorize_export_chunk(
+                    &publication,
+                    registered(&pat_ctx),
+                    Some(registered(&pat_ctx))
+                )
+                .await
+                .is_err()
+        );
+        let restrict = |account: &SpaceContext| {
+            let mut grants = account.auth().spaces().clone();
+            grants
+                .get_mut(&scope.space_id)
+                .unwrap()
+                .read_classes
+                .remove(&notarium_core::classes::DocClass::UserDoc);
+            SpaceContext::new(
+                account.auth().for_pat(grants).unwrap(),
+                scope.clone(),
+                budget(),
+            )
+            .unwrap()
+        };
+        for (caller, source) in [
+            (restrict(&pat_ctx), ctx.clone()),
+            (pat_ctx.clone(), restrict(&ctx)),
+        ] {
+            assert!(matches!(
+                store
+                    .authorize_export_chunk(
+                        &publication,
+                        registered(&caller),
+                        Some(registered(&source))
+                    )
+                    .await,
+                Err(PortError::Domain(DomainError::ResourceNotFound))
+            ));
+        }
+        let descriptor_before = store.export_descriptor_bytes_read_for_test();
+        let (payload_before, _) = store.export_policy_reads_for_test();
+        let policy_bytes: i64 = db
+            .query_row(
+                "SELECT length(payload_msgpack) FROM content_jobs WHERE space_id=?1 AND job_id=?2",
+                rusqlite::params![scope.space_id.as_str(), selected.id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let selected_download = jobs
+            .open_export(pat_ctx, &completed.artifacts[0])
+            .await
+            .unwrap();
+        let opened_descriptor = store.export_descriptor_bytes_read_for_test();
+        assert_eq!(
+            opened_descriptor - descriptor_before,
+            encoded_len(&completed.artifacts[0])
+        );
+        let (opened_policy, opened_selection_reads) = store.export_policy_reads_for_test();
+        assert_eq!(opened_policy - payload_before, policy_bytes as u64);
+        for offset in 0..3 {
+            selected_download
+                .read_chunk(budget(), offset, 1)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            store.export_descriptor_bytes_read_for_test(),
+            opened_descriptor
+        );
+        assert_eq!(
+            store.export_policy_reads_for_test(),
+            (opened_policy, opened_selection_reads)
+        );
         let bytes = selected_download
             .read_chunk(budget(), 0, 16 * 1024)
             .await
@@ -803,7 +908,41 @@ async fn exercise_local_archive_worker(entries: usize) {
                 .by_name(&format!("documents/{slug}.md"))
                 .is_ok()
         );
-    }
+        db.execute(
+            "UPDATE note_heads SET title=?1,title_fold=?2 WHERE space_id=?3 AND note_id=?4",
+            rusqlite::params![old_title.0, old_title.1, scope.space_id.as_str(), &note],
+        )
+        .unwrap();
+        // A note move advances the Space sequence while this ZIP remains
+        // valid. Both credentials share one check of its new ancestry.
+        store
+            .move_note(
+                ctx.clone(),
+                mutation(
+                    &ctx,
+                    MoveNote {
+                        note: NoteId::parse(&note).unwrap(),
+                        parent: None,
+                        slug,
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        for offset in 1..=2 {
+            selected_download
+                .read_chunk(budget(), offset, 1)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            store.export_policy_reads_for_test(),
+            (opened_policy, opened_selection_reads + 1)
+        );
+        Some(selected_download)
+    } else {
+        None
+    };
     store
         .delete_note(
             ctx.clone(),
@@ -821,6 +960,12 @@ async fn exercise_local_archive_worker(entries: usize) {
         download.read_chunk(budget(), 0, 1).await,
         Err(PortError::Domain(DomainError::ResourceNotFound))
     ));
+    if let Some(selected) = selected_reader {
+        assert!(matches!(
+            selected.read_chunk(budget(), 0, 1).await,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ));
+    }
     assert!(jobs.open_export(ctx.clone(), id).await.is_err());
 
     db.execute(

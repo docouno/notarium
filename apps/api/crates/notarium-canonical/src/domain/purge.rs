@@ -67,6 +67,24 @@ pub(crate) enum RetirementRecovery {
     RestoredGc,
 }
 
+impl RetirementRecovery {
+    pub(crate) async fn outcome(
+        self,
+        attempt: &mut crate::blobs::retirement_worker::Attempt,
+    ) -> Result<(), PortError> {
+        match crate::blobs::retirement_worker::outcome(attempt).await {
+            Err(error) if error == crate::blobs::held_retirement() => Ok(()),
+            Err(error)
+                if self == Self::RestoredGc
+                    && crate::blobs::retirement_worker::retry_after(&error).is_some() =>
+            {
+                Ok(())
+            }
+            result => result,
+        }
+    }
+}
+
 pub(crate) async fn resume_pending_purges_on_startup(
     store: &CanonicalStore,
 ) -> Result<(), PortError> {
@@ -77,31 +95,41 @@ pub(crate) async fn resume_pending_purges_on_startup(
     ) {
         return Ok(());
     }
-    const SQL: &str = "SELECT space_id FROM pending_purges WHERE phase <> 'completed'
-        UNION SELECT space_id FROM blob_retirements WHERE status = 'pending'
-        UNION SELECT space_id FROM blob_catalog WHERE ref_count=0 AND blob_state='active' AND admission_state='open'";
-    let spaces: Vec<String> = store
-        .with_read_tx(|tx| {
-            Box::pin(async move {
-                let BackendConn::Sqlite(conn) = tx else {
-                    unreachable!()
-                };
-                sqlx::query_scalar(SQL)
-                    .fetch_all(&mut **conn)
-                    .await
-                    .map_err(|err| internal_not_committed("scan_storage_recovery", err.to_string()))
+    const SQL: &str = "SELECT space_id FROM pending_purges WHERE space_id>$1 AND phase <> 'completed'
+        UNION SELECT space_id FROM blob_retirements WHERE space_id>$1 AND status='pending'
+        UNION SELECT space_id FROM blob_catalog INDEXED BY idx_blob_catalog_legacy
+            WHERE space_id>$1 AND legacy_cleanup=1 AND ref_count=0 AND blob_state='active' AND admission_state='open'
+        ORDER BY space_id LIMIT 128";
+    let mut after = String::new();
+    loop {
+        let spaces: Vec<String> = store
+            .with_read_tx(move |tx| {
+                Box::pin(async move {
+                    let BackendConn::Sqlite(conn) = tx else {
+                        unreachable!()
+                    };
+                    sqlx::query_scalar(SQL)
+                        .bind(after)
+                        .fetch_all(&mut **conn)
+                        .await
+                        .map_err(|err| {
+                            internal_not_committed("scan_storage_recovery", err.to_string())
+                        })
+                })
             })
-        })
-        .await?;
-    for space in spaces {
-        let space = store.read_space(&SpaceId::parse(&space)?).await?;
-        store
-            .resume_pending_storage_for_space(
-                &space.scope,
-                space.active_epoch,
-                RetirementRecovery::Startup,
-            )
             .await?;
+        let Some(last) = spaces.last() else { break };
+        after = last.clone();
+        for space in spaces {
+            let space = store.read_space(&SpaceId::parse(&space)?).await?;
+            store
+                .resume_pending_storage_for_space(
+                    &space.scope,
+                    space.active_epoch,
+                    RetirementRecovery::Startup,
+                )
+                .await?;
+        }
     }
     Ok(())
 }
@@ -114,15 +142,6 @@ impl CanonicalStore {
         recovery: RetirementRecovery,
     ) -> Result<(), PortError> {
         self.inner.check_writer_epoch(&scope.space_id, epoch)?;
-        let current = scope.clone();
-        let local = self.local_store_arc();
-        self.with_write_tx(move |tx| {
-            Box::pin(async move {
-                crate::blobs::lock_and_check_space_tx(tx, &current, epoch).await?;
-                crate::blobs::gc::reconcile_unowned_tx(tx, &current, epoch, local.as_deref()).await
-            })
-        })
-        .await?;
         const PURGES: &str = "SELECT purge_id, actor_id, idempotency_key, old_note_id, retirement_ids_json, sanitized_response_msgpack
             FROM pending_purges WHERE space_id = $1 AND history_incarnation = $2 AND phase <> 'completed' ORDER BY created_at_ms";
         type PendingPurge = (String, String, String, String, String, Vec<u8>);
@@ -170,7 +189,7 @@ impl CanonicalStore {
             };
             drive_pending_purge_steps_2_and_3(self, &exec).await?;
         }
-        Ok(())
+        self.reconcile_legacy_cleanup(scope, epoch, recovery).await
     }
 
     pub(crate) async fn resume_blob_retirements(
@@ -187,7 +206,11 @@ impl CanonicalStore {
         // The retirement owner can change when a recovery adopts it. The publication's
         // creation epoch stays immutable, including across unsuccessful recovery attempts.
         const PAGE: &str = "SELECT r.retirement_id, EXISTS(SELECT 1 FROM blob_gc_retries q
-                WHERE q.space_id=r.space_id AND q.retirement_id=r.retirement_id) FROM blob_retirements r
+                WHERE q.space_id=r.space_id AND q.retirement_id=r.retirement_id),
+            EXISTS(SELECT 1 FROM blob_catalog c WHERE c.space_id=r.space_id AND c.legacy_cleanup=1
+                AND c.content_blake3=(SELECT t.content_blake3 FROM blob_retirement_targets t
+                    WHERE t.space_id=r.space_id AND t.retirement_id=r.retirement_id LIMIT 1))
+            FROM blob_retirements r
             WHERE r.space_id=$1 AND r.history_incarnation=$2 AND r.status='pending' AND r.retirement_id>$3
               AND (NOT $5 OR r.reason='gc')
               AND (CAST($4 AS BIGINT) IS NULL OR NOT EXISTS (
@@ -198,7 +221,7 @@ impl CanonicalStore {
             self.inner.check_writer_epoch(&scope.space_id, epoch)?;
             let current = scope.clone();
             let page_after = after.clone();
-            let ids: Vec<(String, bool)> = self
+            let ids: Vec<(String, bool, bool)> = self
                 .with_read_tx(|tx| {
                     Box::pin(async move {
                         let sid = current.space_id.as_str();
@@ -234,9 +257,12 @@ impl CanonicalStore {
             if ids.is_empty() {
                 return permanent_failure.map_or(Ok(()), Err);
             }
-            for (id, scheduled_gc) in ids {
+            for (id, scheduled_gc, legacy) in ids {
                 if scheduled_gc {
-                    if !sweep_retries_woken {
+                    if legacy && !restored_gc {
+                        self.attempt_legacy_gc(scope, epoch, id.clone(), recovery)
+                            .await?;
+                    } else if !sweep_retries_woken {
                         self.wake_gc_retries();
                         sweep_retries_woken = true;
                     }
@@ -244,17 +270,11 @@ impl CanonicalStore {
                     continue;
                 }
                 let mut attempts = self.schedule_retirements(scope, epoch, vec![id.clone()]);
-                if let Err(error) = crate::blobs::retirement_worker::outcome(&mut attempts[0]).await
-                    && error != crate::blobs::held_retirement()
-                {
+                if let Err(error) = recovery.outcome(&mut attempts[0]).await {
                     if !restored_gc {
                         return Err(error);
                     }
-                    // A retryable ID keeps its existing worker. It can wait for the
-                    // filesystem or object store without occupying a restore scan slot.
-                    if crate::blobs::retirement_worker::retry_after(&error).is_none() {
-                        permanent_failure.get_or_insert(error);
-                    }
+                    permanent_failure.get_or_insert(error);
                 }
                 after = id;
             }

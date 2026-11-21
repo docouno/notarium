@@ -10,6 +10,7 @@ pub(crate) type HandoffSender = oneshot::Sender<Vec<Attempt>>;
 pub(crate) struct RetirementWorkers {
     running: std::sync::Mutex<HashMap<Key, Attempt>>,
     pub(super) retries: super::gc_retry::Dispatcher,
+    pub(super) legacy: super::gc_retry::Dispatcher,
 }
 
 pub(super) struct Work {
@@ -171,11 +172,11 @@ impl crate::CanonicalStore {
 }
 
 impl Work {
-    async fn attempt(&self) -> Result<(), PortError> {
+    async fn attempt(&self, defer_local_readers: bool) -> Result<(), PortError> {
         let (scope, epoch, id) = &self.key;
         match self
             .store
-            .drive_retirement_to_completion(scope, *epoch, id)
+            .drive_retirement(scope, *epoch, id, defer_local_readers)
             .await
         {
             Err(PortError::Domain(DomainError::ResourceNotFound)) => Ok(()),
@@ -207,7 +208,7 @@ impl Work {
     }
 
     pub(super) async fn sweep_attempt(self) -> bool {
-        let result = self.attempt().await;
+        let result = self.attempt(true).await;
         let (scope, epoch, id) = &self.key;
         let mut retry = false;
         if let Err(error) = &result {
@@ -235,7 +236,7 @@ async fn run(mut pending: Vec<Work>) {
         let mut delay = backoff;
         for work in pending {
             let (scope, _, id) = &work.key;
-            let result = work.attempt().await;
+            let result = work.attempt(false).await;
             if let Some(minimum) = result.as_ref().err().and_then(retry_after) {
                 delay = delay.max(minimum);
                 work.outcome.send_replace(Some(result));

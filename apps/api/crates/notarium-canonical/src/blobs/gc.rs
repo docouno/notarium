@@ -9,8 +9,11 @@ use notarium_core::{
 };
 
 use crate::{
-    CanonicalStore, codec::internal_not_committed, domain::common::CommandDeadline,
-    peers::job_clock_ms, sql_exec::BackendConn,
+    CanonicalStore,
+    codec::internal_not_committed,
+    domain::{common::CommandDeadline, purge::RetirementRecovery},
+    peers::job_clock_ms,
+    sql_exec::BackendConn,
 };
 
 use super::{
@@ -41,11 +44,12 @@ pub struct GcPage {
 struct Candidate {
     cursor: GcCursor,
     publication: Option<String>,
-    legacy: bool,
 }
 
 enum Decision {
     Skip,
+    Busy,
+    Held,
     Quarantine,
     Retire(String),
 }
@@ -73,7 +77,7 @@ impl CanonicalStore {
                             DomainError::validation(ValidationReason::InvalidAuthority).into()
                         );
                     }
-                    candidates(tx, &scope.space_id, after.as_ref()).await
+                    candidates(tx, &scope.space_id, after.as_ref(), false).await
                 })
             })
             .await?;
@@ -135,6 +139,7 @@ impl CanonicalStore {
                                 candidate,
                                 now,
                                 slot.is_some(),
+                                worker.local_store_arc().as_deref(),
                             )
                             .await?;
                             // The SQL result owns both the local stripe and the durable ID
@@ -160,7 +165,7 @@ impl CanonicalStore {
                 )
                 .await;
             match decision {
-                Ok(Decision::Skip) => {}
+                Ok(Decision::Skip | Decision::Busy | Decision::Held) => {}
                 Ok(Decision::Quarantine) => page.quarantined += 1,
                 Ok(Decision::Retire(_)) => page.retirements += 1,
                 Err(error) => {
@@ -173,87 +178,336 @@ impl CanonicalStore {
     }
 }
 
-/// Run under startup/takeover/offline-restore ownership. An already sealed
-/// retirement is recovered via the existing durable retirement queue.
-pub(crate) async fn reconcile_unowned_tx(
-    tx: &mut BackendConn<'_>,
-    scope: &HistoryScope,
-    epoch: LeaseEpoch,
-    local: Option<&super::local::LocalBlobStore>,
-) -> Result<(bool, Vec<super::local::LocalExclusiveGuard>), PortError> {
-    let mut planned = false;
-    let mut guards = Vec::new();
-    let now = job_clock_ms(tx).await?;
-    // Restore only the immediate-cleanup obligation from pre-quarantine
-    // catalogs. Ordinary orphans stay eligible for bounded sweep admission.
-    for candidate in candidates(tx, &scope.space_id, None).await? {
-        if !candidate.legacy {
-            continue;
+// A submitted page can commit after its caller disappears. SQL owns the exact IDs;
+// the same indexed scans pick up sealed retirements and any unplanned legacy suffix.
+struct LegacyHandoff(Option<CanonicalStore>);
+
+macro_rules! legacy_space_sql {
+    ($index:literal, $filter:literal) => {
+        concat!(
+            "SELECT space_id FROM blob_catalog ",
+            $index,
+            " WHERE ",
+            $filter,
+            " AND legacy_cleanup=1 AND ref_count=0 AND admission_state='open'
+              AND blob_state='active' ORDER BY space_id LIMIT 1"
+        )
+    };
+}
+
+impl Drop for LegacyHandoff {
+    fn drop(&mut self) {
+        if let Some(store) = self.0.take() {
+            store.wake_gc_retries();
+            store.wake_legacy_cleanup();
         }
-        if let Some(local) = local {
+    }
+}
+
+impl CanonicalStore {
+    /// Commit one page of legacy retirements at a time. Keep each staging fence
+    /// through the page's COMMIT, then release it before attempting physical I/O.
+    pub(crate) async fn reconcile_legacy_cleanup(
+        &self,
+        scope: &HistoryScope,
+        epoch: LeaseEpoch,
+        recovery: RetirementRecovery,
+    ) -> Result<(), PortError> {
+        let mut deferred = false;
+        let result = self
+            .reconcile_legacy_pages(scope, epoch, Some(recovery), &mut deferred)
+            .await;
+        if deferred {
+            self.wake_legacy_cleanup();
+        }
+        result
+    }
+
+    // An open hold or staging ticket has no sealed retirement to enqueue yet.
+    // Only a deferred legacy page starts this catalog scanner. It performs no physical I/O.
+    fn wake_legacy_cleanup(&self) {
+        if !self.inner.retirement_workers.legacy.request() {
+            return;
+        }
+        let store = self.clone();
+        let shutdown = self.inner.backup_shutdown.clone();
+        let handle = self.inner.backup_executor.spawn(async move {
+            let legacy = &store.inner.retirement_workers.legacy;
+            tokio::select! { biased; () = shutdown.cancelled() => {}, () = legacy.run(|| store.retry_deferred_legacy()) => {} }
+        });
+        crate::backup::register_cleanup_task(&self.inner, handle);
+    }
+
+    async fn retry_deferred_legacy(&self) -> Result<Option<Duration>, PortError> {
+        let mut after = String::new();
+        let mut waiting = false;
+        loop {
+            // Seek to the next Space, skipping its entire run of legacy index entries.
+            let space: Option<String> = self
+                .with_read_tx(move |tx| {
+                    Box::pin(async move {
+                        match tx {
+                            BackendConn::Sqlite(c) => {
+                                sqlx::query_scalar(legacy_space_sql!(
+                                    "INDEXED BY idx_blob_catalog_legacy",
+                                    "space_id>$1"
+                                ))
+                                .bind(after)
+                                .fetch_optional(&mut **c)
+                                .await
+                            }
+                            BackendConn::Postgres(c) => {
+                                sqlx::query_scalar(legacy_space_sql!("", "space_id>$1"))
+                                    .bind(after)
+                                    .fetch_optional(&mut **c)
+                                    .await
+                            }
+                        }
+                        .map_err(gc_sql)
+                    })
+                })
+                .await?;
+            let Some(space) = space else { break };
+            let current = self.read_space(&SpaceId::parse(&space)?).await?;
+            after = space;
+            if self
+                .inner
+                .check_writer_epoch(&current.scope.space_id, current.active_epoch)
+                .is_err()
+            {
+                continue;
+            }
+            if let Err(error) = self
+                .reconcile_legacy_pages(&current.scope, current.active_epoch, None, &mut waiting)
+                .await
+            {
+                waiting |= super::retirement_worker::retry_after(&error).is_some();
+                tracing::warn!(?error, "legacy cleanup page failed");
+            }
+        }
+        Ok(waiting.then_some(Duration::from_secs(1)))
+    }
+
+    async fn reconcile_legacy_pages(
+        &self,
+        scope: &HistoryScope,
+        epoch: LeaseEpoch,
+        recovery: Option<RetirementRecovery>,
+        deferred: &mut bool,
+    ) -> Result<(), PortError> {
+        let mut after = None;
+        let mut permanent = None;
+        loop {
+            self.inner.check_writer_epoch(&scope.space_id, epoch)?;
+            let scope_in = scope.clone();
+            let worker = self.clone();
+            let mut page = self
+                .with_auxiliary_command(
+                    None,
+                    |(_guards, page)| Ok(page),
+                    move |tx| Box::pin(plan_legacy_page_tx(tx, worker, scope_in, epoch, after)),
+                )
+                .await
+                .map_err(|error| crate::codec::retry_unknown_commit("legacy_gc_page", error))?;
+            *deferred |= page.deferred;
+            if let Some(recovery) = recovery {
+                for id in page.retirements {
+                    if let Err(error) = self.attempt_legacy_gc(scope, epoch, id, recovery).await {
+                        if recovery != RetirementRecovery::RestoredGc {
+                            return Err(error);
+                        }
+                        permanent.get_or_insert(error);
+                    }
+                }
+            } else if !page.retirements.is_empty() {
+                self.wake_gc_retries();
+            }
+            page.handoff.0 = None;
+            let Some(next) = page.next else {
+                return permanent.map_or(Ok(()), Err);
+            };
+            after = Some(next);
+        }
+    }
+
+    pub(crate) async fn attempt_legacy_gc(
+        &self,
+        scope: &HistoryScope,
+        epoch: LeaseEpoch,
+        id: String,
+        recovery: RetirementRecovery,
+    ) -> Result<(), PortError> {
+        let slot = self
+            .inner
+            .gc_retirements
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("GC semaphore is open");
+        let (mut attempt, work) = self.reserve_retirement(scope, epoch, id);
+        if let Some(work) = work {
+            let retry = if recovery == RetirementRecovery::RestoredGc {
+                work.retry_if_due().await?.is_some()
+            } else {
+                // Startup and lease grants report the first physical outcome.
+                work.sweep_attempt().await
+            };
+            if retry {
+                self.wake_gc_retries();
+            }
+        }
+        drop(slot);
+        recovery.outcome(&mut attempt).await
+    }
+}
+
+struct LegacyPage {
+    next: Option<GcCursor>,
+    deferred: bool,
+    retirements: Vec<String>,
+    handoff: LegacyHandoff,
+}
+
+async fn plan_legacy_page_tx(
+    tx: &mut BackendConn<'_>,
+    store: CanonicalStore,
+    scope: HistoryScope,
+    epoch: LeaseEpoch,
+    after: Option<GcCursor>,
+) -> Result<(Vec<super::local::LocalExclusiveGuard>, LegacyPage), PortError> {
+    lock_and_check_space_tx(tx, &scope, epoch).await?;
+    let rows = candidates(tx, &scope.space_id, after.as_ref(), true).await?;
+    let mut next =
+        (rows.len() == PAGE as usize).then(|| rows.last().expect("full page").cursor.clone());
+    let now = job_clock_ms(tx).await?;
+    let local = store.local_store_arc();
+    let mut guards = Vec::new();
+    let mut retirements = Vec::new();
+    let mut deferred = false;
+    for candidate in rows {
+        if let Some(local) = &local {
             let Some(guard) =
                 local.try_fence_staging_epoch(&scope.space_id, candidate.cursor.digest, epoch)
             else {
+                deferred = true;
                 continue;
             };
             guards.push(guard);
         }
-        planned |= matches!(
-            plan_candidate_tx(tx, scope, epoch, candidate, now, true).await?,
-            Decision::Retire(_)
-        );
+        match plan_candidate_tx(tx, &scope, epoch, candidate, now, true, local.as_deref()).await? {
+            Decision::Retire(id) => {
+                super::gc_retry::enqueue_tx(tx, &scope.space_id, &id, now).await?;
+                retirements.push(id);
+            }
+            Decision::Busy => deferred = true,
+            Decision::Held => {
+                // A backup hold covers this entire Space, including later pages.
+                next = None;
+                deferred = true;
+                break;
+            }
+            Decision::Skip | Decision::Quarantine => {}
+        }
     }
-    Ok((planned, guards))
+    let armed = deferred || !retirements.is_empty() || next.is_some();
+    let handoff = LegacyHandoff(armed.then_some(store));
+    Ok((
+        guards,
+        LegacyPage {
+            next,
+            deferred,
+            retirements,
+            handoff,
+        },
+    ))
+}
+
+pub(crate) async fn has_legacy_cleanup_tx(
+    tx: &mut BackendConn<'_>,
+    space: &SpaceId,
+) -> Result<bool, PortError> {
+    let found: Option<String> = match tx {
+        BackendConn::Sqlite(c) => {
+            sqlx::query_scalar(legacy_space_sql!(
+                "INDEXED BY idx_blob_catalog_legacy",
+                "space_id=$1"
+            ))
+            .bind(space.as_str())
+            .fetch_optional(&mut **c)
+            .await
+        }
+        BackendConn::Postgres(c) => {
+            sqlx::query_scalar(legacy_space_sql!("", "space_id=$1"))
+                .bind(space.as_str())
+                .fetch_optional(&mut **c)
+                .await
+        }
+    }
+    .map_err(gc_sql)?;
+    Ok(found.is_some())
 }
 
 async fn candidates(
     tx: &mut BackendConn<'_>,
     space: &SpaceId,
     after: Option<&GcCursor>,
+    legacy: bool,
 ) -> Result<Vec<Candidate>, PortError> {
     macro_rules! sql {
-        ($index:literal) => {
+        ($index:literal, $legacy:literal) => {
             concat!(
-                "SELECT touched_at_ms, content_blake3, current_publication_id, legacy_cleanup<>0 FROM blob_catalog ",
+                "SELECT touched_at_ms, content_blake3, current_publication_id FROM blob_catalog ",
                 $index,
                 " WHERE space_id=$1 AND (touched_at_ms,content_blake3)>($2,$3)
                   AND ref_count=0 AND admission_state='open' AND blob_state='active'
-                  ORDER BY touched_at_ms,content_blake3 LIMIT $4",
+                 ",
+                $legacy,
+                " ORDER BY touched_at_ms,content_blake3 LIMIT $4",
             )
         };
     }
     let touched = after.map_or(i64::MIN, |cursor| cursor.touched);
     let digest = after.map_or(&[][..], |cursor| cursor.digest.as_bytes().as_slice());
-    let rows: Vec<(i64, Vec<u8>, Option<String>, bool)> = match tx {
+    let rows: Vec<(i64, Vec<u8>, Option<String>)> = match tx {
         BackendConn::Sqlite(conn) => {
-            sqlx::query_as(sql!("INDEXED BY idx_blob_catalog_gc"))
-                .bind(space.as_str())
-                .bind(touched)
-                .bind(digest)
-                .bind(PAGE)
-                .fetch_all(&mut **conn)
-                .await
+            sqlx::query_as(if legacy {
+                sql!(
+                    "INDEXED BY idx_blob_catalog_legacy",
+                    " AND legacy_cleanup=1"
+                )
+            } else {
+                sql!("INDEXED BY idx_blob_catalog_gc", "")
+            })
+            .bind(space.as_str())
+            .bind(touched)
+            .bind(digest)
+            .bind(PAGE)
+            .fetch_all(&mut **conn)
+            .await
         }
         BackendConn::Postgres(conn) => {
-            sqlx::query_as(sql!(""))
-                .bind(space.as_str())
-                .bind(touched)
-                .bind(digest)
-                .bind(PAGE)
-                .fetch_all(&mut **conn)
-                .await
+            sqlx::query_as(if legacy {
+                sql!("", " AND legacy_cleanup=1")
+            } else {
+                sql!("", "")
+            })
+            .bind(space.as_str())
+            .bind(touched)
+            .bind(digest)
+            .bind(PAGE)
+            .fetch_all(&mut **conn)
+            .await
         }
     }
     .map_err(gc_sql)?;
     rows.into_iter()
-        .map(|(touched, digest, publication, legacy)| {
+        .map(|(touched, digest, publication)| {
             let digest = ContentDigest::from_bytes(digest.try_into().map_err(|_| {
                 internal_not_committed("gc_catalog_digest", "invalid content digest")
             })?);
             Ok(Candidate {
                 cursor: GcCursor { touched, digest },
                 publication,
-                legacy,
             })
         })
         .collect()
@@ -276,6 +530,7 @@ async fn plan_candidate_tx(
     candidate: Candidate,
     now: i64,
     can_retire: bool,
+    local: Option<&super::local::LocalBlobStore>,
 ) -> Result<Decision, PortError> {
     let space = &scope.space_id;
     let digest = candidate.cursor.digest;
@@ -297,7 +552,9 @@ async fn plan_candidate_tx(
     }
     .map_err(gc_sql)?;
     let Some((publication, stamp, legacy)) = row else {
-        return Ok(Decision::Skip);
+        // Legacy recovery selected this row under the same Space lock. A live
+        // publication or purge can still prevent admission until its owner finishes.
+        return Ok(Decision::Busy);
     };
     if candidate.publication != publication
         || (publication.is_none() && legacy == 0)
@@ -339,11 +596,11 @@ async fn plan_candidate_tx(
     }
     match ensure_no_backup_holds_tx(tx, space, RetirementReason::Gc).await {
         Ok(()) => {}
-        Err(err) if err == super::held_retirement() => return Ok(Decision::Skip),
+        Err(err) if err == super::held_retirement() => return Ok(Decision::Held),
         Err(err) => return Err(err),
     }
     Ok(
-        initiate_digest_retirement_tx(tx, scope, epoch, digest, RetirementReason::Gc, None, None)
+        initiate_digest_retirement_tx(tx, scope, epoch, digest, RetirementReason::Gc, None, local)
             .await?
             .map_or(Decision::Skip, Decision::Retire),
     )

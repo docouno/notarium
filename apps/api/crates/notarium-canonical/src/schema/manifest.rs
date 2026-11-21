@@ -2,7 +2,7 @@ use std::{collections::BTreeSet, sync::LazyLock};
 
 use notarium_core::ids::ContentDigest;
 
-pub const CANONICAL_SCHEMA_VERSION: u32 = 8;
+pub const CANONICAL_SCHEMA_VERSION: u32 = 9;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LogicalColKind {
@@ -111,6 +111,7 @@ pub const CANONICAL_TABLES: &[TableSpec] = &[
             "uq_folder_heads_active_project",
             "idx_folder_heads_parent_lifecycle",
             "idx_folder_heads_cover",
+            "idx_folder_heads_export_access",
         ],
     },
     TableSpec {
@@ -162,6 +163,7 @@ pub const CANONICAL_TABLES: &[TableSpec] = &[
             "uq_note_heads_active_sibling",
             "idx_note_heads_parent_lifecycle",
             "idx_note_heads_created_seq",
+            "idx_note_heads_export_access",
         ],
     },
     TableSpec {
@@ -310,7 +312,11 @@ pub const CANONICAL_TABLES: &[TableSpec] = &[
             col("quarantined_at_ms", Int, true),
             col("legacy_cleanup", Int, false),
         ],
-        indexes: &["idx_blob_catalog_zero_ref", "idx_blob_catalog_gc"],
+        indexes: &[
+            "idx_blob_catalog_zero_ref",
+            "idx_blob_catalog_gc",
+            "idx_blob_catalog_legacy",
+        ],
     },
     TableSpec {
         name: "blob_publications",
@@ -733,7 +739,7 @@ pub const CANONICAL_TABLES: &[TableSpec] = &[
             col("updated_seq", Int, false),
             col("claim_space_epoch", Int, true),
         ],
-        indexes: &["idx_content_jobs_claim"],
+        indexes: &["idx_content_jobs_claim", "idx_content_jobs_export_access"],
     },
     TableSpec {
         name: "archive_artifacts",

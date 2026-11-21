@@ -2130,6 +2130,14 @@ pub fn spool_tables(schema_version: u32) -> impl Iterator<Item = TableSpec> + Cl
         .iter()
         .copied()
         .filter_map(move |mut table| {
+            if schema_version < 9
+                && matches!(
+                    table.name,
+                    "folder_heads" | "note_heads" | "content_jobs" | "blob_catalog"
+                )
+            {
+                table.indexes = &table.indexes[..table.indexes.len() - 1];
+            }
             if schema_version < 8 && table.name == "blob_gc_retries" {
                 return None;
             }
@@ -2293,7 +2301,7 @@ fn read_postgres_spool(
     let expected_tables = spool_tables(schema_version);
     let expected_checksum = match schema_version {
         CANONICAL_SCHEMA_VERSION => manifest_checksum(),
-        1..=7 => {
+        1..=8 => {
             let digest = checksum_tables(schema_version, expected_tables.clone());
             if !crate::schema::migrate::recognized_predecessor(
                 i64::from(schema_version),
@@ -3817,14 +3825,10 @@ async fn recover_restored_gc(store: CanonicalStore, spaces: Vec<(HistoryScope, L
             async move {
                 let mut backoff = Duration::from_millis(50);
                 loop {
-                    match store
-                        .resume_blob_retirements(
-                            &scope,
-                            epoch,
-                            crate::domain::purge::RetirementRecovery::RestoredGc,
-                        )
-                        .await
-                    {
+                    let recovery = crate::domain::purge::RetirementRecovery::RestoredGc;
+                    let pending = store.resume_blob_retirements(&scope, epoch, recovery).await;
+                    let legacy = store.reconcile_legacy_cleanup(&scope, epoch, recovery).await;
+                    match pending.and(legacy) {
                         Ok(()) => return,
                         Err(error) => {
                             let Some(minimum) = crate::blobs::retirement_worker::retry_after(&error) else {
@@ -4568,10 +4572,10 @@ async fn apply_restore_cursor_tx(
         }
     }
 
-    rebound_retirements |=
-        crate::blobs::gc::reconcile_unowned_tx(tx, &target.scope, next_epoch, None)
-            .await?
-            .0;
+    if !rebound_retirements {
+        rebound_retirements =
+            crate::blobs::gc::has_legacy_cleanup_tx(tx, &target.scope.space_id).await?;
+    }
     Ok(rebound_retirements)
 }
 

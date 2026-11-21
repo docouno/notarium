@@ -1010,8 +1010,19 @@ async fn restored_retirements_release_terminal_workers_and_serve_other_spaces() 
         // The ninth Space completes with every obstruction still in place.
         tokio::time::timeout(Duration::from_secs(10), async {
             while spaces.iter().any(|(_, path)| path.exists())
-                || store.active_retirement_workers_for_test() != 8
+                || store
+                    .execute_diagnostic_read_sql_for_test(
+                        None,
+                        "SELECT COUNT(*) FROM blob_gc_retries WHERE backoff_ms>250",
+                    )
+                    .await
+                    .unwrap()
+                    != 8
             {
+                assert!(
+                    store.active_retirement_workers_for_test()
+                        <= notarium_canonical::blobs::gc::MAX_GC_RETIREMENTS
+                );
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
@@ -1030,7 +1041,16 @@ async fn restored_retirements_release_terminal_workers_and_serve_other_spaces() 
         )
         .await;
         tokio::time::timeout(Duration::from_secs(10), async {
-            while store.active_retirement_workers_for_test() != 4 {
+            while store
+                .execute_diagnostic_read_sql_for_test(None, "SELECT COUNT(*) FROM blob_gc_retries")
+                .await
+                .unwrap()
+                != 4
+            {
+                assert!(
+                    store.active_retirement_workers_for_test()
+                        <= notarium_canonical::blobs::gc::MAX_GC_RETIREMENTS
+                );
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })

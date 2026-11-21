@@ -1656,6 +1656,17 @@ impl crate::CanonicalStore {
         active_epoch: LeaseEpoch,
         retirement_id: &str,
     ) -> Result<(), PortError> {
+        self.drive_retirement(scope, active_epoch, retirement_id, false)
+            .await
+    }
+
+    async fn drive_retirement(
+        &self,
+        scope: &HistoryScope,
+        active_epoch: LeaseEpoch,
+        retirement_id: &str,
+        defer_local_readers: bool,
+    ) -> Result<(), PortError> {
         self.inner
             .check_writer_epoch(&scope.space_id, active_epoch)?;
 
@@ -1714,9 +1725,21 @@ impl crate::CanonicalStore {
             }
             match (&self.inner.blobs, target.codec) {
                 (BlobBackendDriver::Local(local), BlobCodecTag::LocalZstdV1) => {
-                    let guard = local
-                        .acquire_exclusive_guard(&scope.space_id, target.digest)
-                        .await;
+                    let guard = if defer_local_readers {
+                        local
+                            .try_acquire_exclusive_guard(&scope.space_id, target.digest)
+                            .ok_or_else(|| {
+                                unavailable_retryable(
+                                    "gc_reader_active",
+                                    "local readers are active",
+                                    Duration::from_millis(250),
+                                )
+                            })?
+                    } else {
+                        local
+                            .acquire_exclusive_guard(&scope.space_id, target.digest)
+                            .await
+                    };
                     // Re-verify zero refs & zero holds while holding exclusive local guard!
                     let scope_chk = scope.clone();
                     let digest = target.digest;
