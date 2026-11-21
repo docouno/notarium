@@ -833,7 +833,7 @@ async fn run_changes_and_seed_suite(store: &CanonicalStore, seed: u8) {
     }
 
     // Both birth and purge occurred after the pinned cut. This fence cannot invalidate it.
-    store
+    let purge_seq = store
         .commit_synthetic_note_purge_for_test(&scope3, epoch, &note_id_seq(seed.wrapping_add(2), 6))
         .await
         .expect("purge the note created after the seed cut");
@@ -884,7 +884,7 @@ async fn run_changes_and_seed_suite(store: &CanonicalStore, seed: u8) {
             &search.authority,
             search.budget,
             scope3.clone(),
-            None,
+            Some(purge_seq),
             Some(fourth),
             PageLimit::new(2).unwrap(),
         )
