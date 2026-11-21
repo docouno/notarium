@@ -509,8 +509,10 @@ async fn l1_postgres_bootstrap_idempotence_and_fail_closed_guards() {
         .await
         .unwrap();
     let claim_indexes: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM pg_indexes WHERE schemaname=current_schema()
-         AND indexname IN ('idx_content_jobs_claim','idx_content_jobs_reclaim') AND indexdef LIKE '% WHERE %'",
+        "SELECT count(*) FROM pg_catalog.pg_index
+         WHERE indrelid = 'content_jobs'::regclass
+           AND indexrelid IN ('idx_content_jobs_claim'::regclass, 'idx_content_jobs_reclaim'::regclass)
+           AND indpred IS NOT NULL",
     ).fetch_one(&mut raw).await.unwrap();
     assert_eq!(claim_indexes, 2);
     let upgraded_constraints: Vec<(String, String, String)> = sqlx::query_as(CONSTRAINTS)
