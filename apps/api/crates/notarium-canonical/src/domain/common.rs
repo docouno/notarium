@@ -138,6 +138,7 @@ impl CommandDeadline {
     }
 }
 
+/// Maximum parent edges from the Space root. A complete ancestry also includes the root.
 pub const MAX_FOLDER_DEPTH: usize = 256;
 
 pub(crate) fn persisted_room_fence(

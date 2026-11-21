@@ -40,11 +40,42 @@ impl DataRoot {
             .join(format!("derived_gen_{}", generation.get()))
             .join("derived.sqlite")
     }
-    pub fn fast_index(&self, generation: ProjectionGeneration, seq: SpaceSeq) -> PathBuf {
-        self.0
-            .join("v1")
-            .join(format!("derived_gen_{}", generation.get()))
+    pub fn space_fast_index_dir(
+        &self,
+        generation: ProjectionGeneration,
+        space: &SpaceId,
+    ) -> PathBuf {
+        self.derived(generation)
+            .with_file_name("spaces")
+            .join(space.as_str())
+    }
+    pub fn space_fast_index(
+        &self,
+        generation: ProjectionGeneration,
+        space: &SpaceId,
+        seq: SpaceSeq,
+    ) -> PathBuf {
+        self.space_fast_index_dir(generation, space)
             .join(format!("fast_index_{}.mmap", seq.get()))
+    }
+    pub fn space_fast_index_with_nonce(
+        &self,
+        generation: ProjectionGeneration,
+        space: &SpaceId,
+        seq: SpaceSeq,
+        nonce: &str,
+    ) -> PathBuf {
+        self.space_fast_index_dir(generation, space).join(format!(
+            "fast_index_{}_{}.mmap",
+            seq.get(),
+            nonce
+        ))
+    }
+    pub fn active_projection_generation(&self) -> PathBuf {
+        self.0.join("v1/active_projection_generation.json")
+    }
+    pub fn projection_scratch_dir(&self) -> PathBuf {
+        self.0.join("v1/scratch")
     }
     pub fn search(&self, space: &SpaceId, index: SearchIndexKind) -> PathBuf {
         self.0

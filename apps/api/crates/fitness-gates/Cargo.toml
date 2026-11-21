@@ -7,10 +7,14 @@ license.workspace = true
 publish.workspace = true
 
 [features]
-storage-bench = ["notarium-canonical/test-support"]
+storage-bench = ["notarium-canonical/test-support", "notarium-projections/test-support"]
 
 [[example]]
 name = "d3_benchmarks"
+required-features = ["storage-bench"]
+
+[[example]]
+name = "projection_benchmarks"
 required-features = ["storage-bench"]
 
 [lints]
@@ -41,3 +45,7 @@ rusqlite.workspace = true
 serde.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
+tracing-subscriber.workspace = true
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+rustix = { workspace = true }

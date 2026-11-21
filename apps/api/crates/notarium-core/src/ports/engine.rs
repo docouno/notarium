@@ -1,5 +1,5 @@
 use super::{PortFuture, SpaceContext, types::*};
-use crate::{ids::*, model::*, query::*};
+use crate::{ids::*, model::*, query::*, receipt::CausalBasis};
 
 pub trait NoteReadPort: Send + Sync {
     /// Read exactly one committed protected package resource. The canonical owner
@@ -147,6 +147,30 @@ pub trait ViewGraphPort: Send + Sync {
         request: Mutation<MoveBoardCard>,
     ) -> PortFuture<'_, Committed<BoardMoveResult>>;
     fn query_graph(&self, ctx: SpaceContext, request: GraphQuery) -> PortFuture<'_, GraphResult>;
+}
+pub trait LinkReadPort: Send + Sync {
+    fn note_links(
+        &self,
+        ctx: SpaceContext,
+        note: NoteId,
+        direction: NoteLinkDirection,
+        after: Option<NoteLinkCursor>,
+        limit: PageLimit,
+    ) -> PortFuture<'_, NoteLinkPage>;
+    fn chat_backlinks(
+        &self,
+        ctx: SpaceContext,
+        note: NoteId,
+        causal: CausalBasis,
+    ) -> PortFuture<'_, Vec<ChatBacklink>>;
+    fn chat_backlinks_page(
+        &self,
+        ctx: SpaceContext,
+        note: NoteId,
+        causal: CausalBasis,
+        after: Option<ChatBacklinkCursor>,
+        limit: PageLimit,
+    ) -> PortFuture<'_, ChatBacklinkPage>;
 }
 pub trait SearchPort: Send + Sync {
     fn search(&self, ctx: SpaceContext, request: SearchQuery) -> PortFuture<'_, SearchResult>;

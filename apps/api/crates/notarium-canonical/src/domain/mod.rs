@@ -32,6 +32,8 @@ pub mod rollback;
 
 pub use common::{RoomFenceTable, SpaceSchemaRevision, UpdateSpaceSchema};
 
+pub(crate) type BoardProviderBinding = (BoardPlannerAuthority, Arc<dyn BoardMutationFactsProvider>);
+
 impl NoteWritePort for CanonicalStore {
     fn create_note(
         &self,
@@ -190,12 +192,48 @@ impl CanonicalStore {
         &self,
         provider: Arc<dyn BoardMutationFactsProvider>,
     ) -> Result<BoardPlannerAuthority, PortError> {
+        let mut binding = self
+            .inner
+            .board_provider
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        if binding.is_some() {
+            return Err(DomainError::validation(ValidationReason::DuplicateKey).into());
+        }
         let authority = BoardPlannerAuthority::admit();
+        *binding = Some((authority.clone(), provider));
+        Ok(authority)
+    }
+
+    /// Release this installation's binding when its planner runtime shuts down.
+    /// The original authority is required, so a previous runtime cannot remove
+    /// a replacement. Already prepared commands retain their canonical checks.
+    pub fn unregister_board_facts_provider(&self, authority: &BoardPlannerAuthority) -> bool {
+        let retired = {
+            let mut binding = self
+                .inner
+                .board_provider
+                .write()
+                .unwrap_or_else(|error| error.into_inner());
+            if binding
+                .as_ref()
+                .is_some_and(|(current, _)| current.matches(authority))
+            {
+                binding.take()
+            } else {
+                None
+            }
+        };
+        retired.is_some()
+    }
+
+    pub(crate) fn board_facts_provider(&self) -> Result<BoardProviderBinding, PortError> {
         self.inner
             .board_provider
-            .set((authority.clone(), provider))
-            .map_err(|_| DomainError::validation(ValidationReason::DuplicateKey))?;
-        Ok(authority)
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+            .ok_or_else(|| DomainError::validation(ValidationReason::NotReady).into())
     }
 
     pub fn register_collab_interceptor(

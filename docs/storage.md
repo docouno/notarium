@@ -33,9 +33,13 @@ same behavioral parity suites:
   issuer. Local PostgreSQL fixtures connect through a Unix socket.
 
 `CanonicalRuntime::open` acquires lifetime `DataRootOwnerLock` guards where
-local storage is used, verifies or bootstraps the schema transactionally,
-reconciles interrupted collaboration room fences and resumes any interrupted
-purge closure before returning `(CanonicalStore, CanonicalRuntime)`.
+local storage is used, verifies or bootstraps the schema transactionally and
+reconciles interrupted collaboration room fences. SQLite resumes pending blob
+retirements on open. If the installation has used projections, a purge that
+still requires derived cleanup stays pending until its handler is available.
+While the exclusive SQLite opener waits for that handler, it can still reclaim
+unbound S3 uploads left by the previous process, including uploads from the
+current lease epoch. Online recovery protects uploads owned by a live writer.
 If recovery fails, opening cancels its workers and releases local ownership
 before returning the error. Dropping an opening future schedules the same
 shutdown on its Tokio runtime. The DataRoot stays locked until the workers and
@@ -94,10 +98,44 @@ recovers writes under its exclusive DataRoot owner lock.
 ## Dual-dialect schema and history model
 
 Both SQL dialects materialize the same ordinary B-tree tables in schema
-version `6` and verify live database catalogs (`sqlite_master` / `pg_catalog`)
+version `8` and verify live database catalogs (`sqlite_master` / `pg_catalog`)
 against a shared typed manifest checksum (`schema_meta`) on every startup.
 Unknown newer schema versions, mismatched manifest checksums or unfinished
 migration states fail closed.
+
+Schema version 8 records each chat reference's immutable source entry creation
+sequence in the same transaction as the entry. One index orders occurrences by
+source Space and creation sequence. The incoming-reference index first selects
+the source and target Spaces, then orders by the same sequence. Both continue
+by thread, entry and ordinal within a sequence. A fixed-cut scan can seek past
+its last occurrence and stop at the cutoff even while writers append. Readers
+check current entry visibility and purge fences before returning references.
+Redaction and stale-summary cleanup remove the indexed occurrences atomically.
+
+The upgrade from version 7 copies the surviving normalized references and their
+original ordinals, looking up the creation sequence on each parent entry.
+SQLite streams the old on-disk table into the indexed destination. PostgreSQL
+backfills the new column in place, preserving the existing foreign key and
+avoiding a pending trigger event for every reference.
+Earlier versions populate the sequence while normalizing the legacy arrays.
+When opening a local database, including a restored SQLite snapshot, the runtime
+uses file-backed temporary storage during schema bootstrap. This allows large
+index-build sorts to spill to disk. After bootstrap commits, the serving writer
+returns to in-memory temporary storage.
+Stop preceding-version PostgreSQL writers before upgrading. Bootstrap installs
+the data, indexes and schema witness in one transaction.
+
+Schema version 7 records a rank anchor at each existing Space's committed head.
+The anchor preserves exactly the live view-rank overlays at upgrade. Rank
+revisions after that head include deletion tombstones, so a projection rebuild
+can distinguish an absent rank from an older live revision. The migration also
+builds a covering chat-entry lookup. It reads one legacy reference array at
+a time and stores one indexed row per distinct target and entry, retaining
+the first occurrence's ordinal. Projection readers page through those keys
+and validate each source entry and target before returning its backlink.
+Startup copies the live anchor rows under the migration fence in one transaction.
+PostgreSQL copies Space markers and placements in primary-key pages of 1,024
+rows so foreign-key trigger memory stays bounded during the upgrade.
 
 The canonical store implements `ControlCatalogPort`. Account provisioning and
 lifecycle changes store a compact receipt keyed by owner, actor and command key
@@ -191,6 +229,16 @@ rule under their writer savepoints.
   final column so room-state and lease precondition checks read inline tuple
   headers without traversing overflow pages.
 
+Projection readers use purpose-scoped canonical pagination and the current
+Space owner's lifecycle fence. PostgreSQL installations additionally maintain
+two non-portable runtime coordination tables excluded from backups
+(`projection_space_owners` for single-Space writer ownership/draining and
+`projection_cleanup_registration` for persistent derived cleanup binding). Chat
+thread reads enforce a single unified `Personal`-thread owner and
+`ChatAudience::Shared` policy across `ChatPort::read_chat`, change visibility,
+and projection backlinks. They maintain a separate derived database and
+checkpoint cache. See [structural projections](projections.md).
+
 ## Content-addressed storage and crash-safe purge
 
 Logical blob identities are 32-byte `BLAKE3` digests over raw uncompressed
@@ -279,7 +327,11 @@ Irreversible erasure executes as a crash-recoverable 3-phase protocol:
    enforced ahead of historical reads, cold seeds and card hydration). SQLite
    startup resumes pending purges and standalone blob retirements. For an
    existing PostgreSQL Space, the incoming writer must acquire a higher epoch
-   with `advance_space_lease`. The caller waits for recovery within its budget.
+   with `advance_space_lease`. An installation with projections completes a
+   pending purge after its registered handler has erased the derived data.
+   Recovery reads pending commands in bounded batches and checks out a new
+   read transaction for each batch. A caller that loses the acknowledgement
+   can retry with the original key.
 
 Shared blobs that remain referenced by independent live notes or chat entries
 retain their active references, and historical external backups created prior to
@@ -481,10 +533,16 @@ same example against an isolated prefix.
   volume, where lookup checks file size and BLAKE3 before returning the path.
   Startup reconciles abandoned holds and pending local artifacts.
   The offline `notarium_canonical::backup::decode_postgres_spool_v1_bounded`
-  API verifies the trailer and recognizes the exact manifests for schemas 1 through 6.
+  API verifies the trailer and recognizes the exact manifests for schemas 1 through 8.
   It returns typed rows in the original table and column order within the
   caller's byte budget. To materialize a historical spool, create an empty
-  target with `schema::POSTGRES_BASELINE_DDL`. For versions 1 and 2, drop
+  target with `schema::POSTGRES_BASELINE_DDL`. For version 7, apply
+  `tests/fixtures/schema-v7-chat-refs.sql` to restore the original six-column
+  occurrence table and its target index. For versions 1 through 6, apply
+  `tests/fixtures/schema-v6-remove-projection.sql` from the canonical crate.
+  For versions 1 through 5, drop `idx_blob_retirements_status` and recreate it
+  on `(space_id, status)`.
+  For versions 1 and 2, drop
   `collab_checkpoints` and `backup_holds.owner_generation`. For version 1,
   also drop `account_catalog_receipts` and `chat_pending_inputs.ext_space_tainted`.
   For versions 1 through 4, drop `idx_receipt_exception_pointer` and
@@ -498,8 +556,8 @@ same example against an isolated prefix.
   temporary table, then inserts the full set in one statement so foreign keys
   can resolve parents that appear later in the archive.
   Opening the target with the original installation ID applies the remaining
-  migrations through version 6. The canonical L4 backup suite exercises this
-  procedure with archives from all five predecessor versions.
+  migrations through version 8. The canonical L4 backup suite exercises this
+  procedure with archives from all seven predecessor versions.
   Before serving the restored database, call `restore_cursors` with each
   original cutoff and a fresh history incarnation. The same transaction
   rotates the writer epoch and fences active rooms, retaining their snapshots,

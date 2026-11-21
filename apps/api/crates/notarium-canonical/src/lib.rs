@@ -14,6 +14,14 @@ pub mod config;
 mod dialect;
 pub mod domain;
 pub mod peers;
+pub mod projection_chat;
+pub use projection_chat::{
+    ProjectionChatChange, ProjectionChatChangePage, ProjectionChatChangePosition,
+    ProjectionChatEntryKey, ProjectionChatHead, ProjectionChatPage, ProjectionChatPosition,
+    ProjectionChatRef, ProjectionChatRefLimits, ProjectionChatRefLocator,
+};
+mod projection_fence;
+pub mod projection_read;
 pub mod runtime;
 pub mod schema;
 pub(crate) mod sql_exec;
@@ -30,8 +38,8 @@ pub use backup::{
 };
 
 pub use changes::{
-    ChangedNoteSummaryV1, EFFECT_CODEC_V1, EffectBodyV1, EffectEnvelopeV1, StoredAwaitReasonV1,
-    build_effect_payload_draft,
+    ChangedNoteSummaryV1, EFFECT_CODEC_V1, EffectBodyV1, EffectEnvelopeV1,
+    ProjectionCatalogSubscription, StoredAwaitReasonV1, build_effect_payload_draft,
 };
 pub use config::{
     BlobBackendConfig, CanonicalConfig, PgConnectConfig, PgTransport, S3AddressingStyle,
@@ -46,6 +54,14 @@ pub use peers::{
     AppendCollabUpdate, CheckpointCollabSession, ClaimedContentJob, CloseCollabSession,
     CollabCarrierSettlement, CollabRoomState, CollabSessionRecord, CollabSessionSnapshot,
     CollabUpdateEntry, JobCompletionOutcome, OpenCollabSession,
+};
+#[cfg(feature = "test-support")]
+pub use projection_fence::FenceCensusFixture;
+pub use projection_fence::{
+    FenceMemoryUsage, LiveDenseLookup, LiveLifecycleFence, LiveNoteStatus, LiveReadPermit,
+    LiveSpaceHandle, ProjectionCleanupRegistration, ProjectionErasures, ProjectionOwnerIdentity,
+    ProjectionOwnerWitness, ProjectionRedactedEntry, ProjectionVisibilityCleanup,
+    StoppedProjectionDeployment, StoppedProjectionOwner,
 };
 pub use runtime::{
     CanonicalRuntime, CanonicalStore, CreateFolderSpec, CreateSpaceSpec, SpaceRecord,

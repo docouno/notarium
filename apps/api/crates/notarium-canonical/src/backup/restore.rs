@@ -150,14 +150,33 @@ async fn rotate(
     } = match &store.inner.sql {
         SqlDriverState::Sqlite { .. } => {
             let cursors = restored.clone();
+            let spaces = cursors
+                .iter()
+                .map(|cur| cur.scope.space_id.clone())
+                .collect();
             let attempt = Arc::clone(attempt);
+            let owner = store.clone();
             store
-                .with_write_tx_unfenced(move |tx| {
-                    Box::pin(async move { rotate_rows(tx, &cursors, &attempt).await })
-                })
+                .with_write_tx_unfenced(
+                    Some(spaces),
+                    move |tx| {
+                        Box::pin(async move { rotate_rows(&owner, tx, &cursors, &attempt).await })
+                    },
+                    Ok,
+                )
                 .await?
         }
         SqlDriverState::Postgres { pool, .. } => {
+            let mut visibility = store
+                .inner
+                .live_visibility
+                .for_write(
+                    restored
+                        .iter()
+                        .map(|cur| cur.scope.space_id.clone())
+                        .collect(),
+                )
+                .await;
             let mut connection = pool.acquire().await.map_err(|err| {
                 unavailable_retryable(
                     "pg_acquire_restore",
@@ -179,7 +198,8 @@ async fn rotate(
             attempt.pg_pid.store(pid, Ordering::Release);
             let mut conn = BackendConn::Postgres(&mut connection);
             let mut tx = WriteTransaction::begin(&mut conn).await?;
-            let plan = rotate_rows(&mut tx.conn(), &restored, attempt).await?;
+            let plan = rotate_rows(store, &mut tx.conn(), &restored, attempt).await?;
+            visibility.committing();
             tx.commit().await?;
             plan
         }
@@ -231,6 +251,7 @@ struct Rotation {
 }
 
 async fn rotate_rows(
+    store: &CanonicalStore,
     tx: &mut BackendConn<'_>,
     restored: &[ChangeCursor],
     attempt: &Attempt,
@@ -242,6 +263,9 @@ async fn rotate_rows(
     let fences = RoomFenceTable::default();
     let mut retirements = Vec::new();
     for (cur, epoch) in restored.iter().zip(epochs.iter().copied()) {
+        store
+            .bind_projection_owner_restore(tx, &cur.scope, epoch)
+            .await?;
         if apply_restore_cursor_tx(tx, cur, epoch).await? {
             retirements.push((cur.scope.clone(), epoch));
         }

@@ -22,6 +22,46 @@ fn version(note: u8, revision: u8) -> OverlayRowVersion {
 }
 
 #[test]
+fn open_world_query_checks_declared_types_and_rejects_null_list_members() {
+    let predicate = |predicate| FieldFilterAstV1 {
+        version: 1,
+        predicate,
+    };
+    let fields = BTreeMap::from([(
+        "score".into(),
+        FieldSchema {
+            kind: FieldType::Scalar(ScalarType::Number),
+            nullable: false,
+        },
+    )]);
+    let tag = predicate(Predicate::Contains {
+        key: "topics".into(),
+        value: ScalarValue::String("rust".into()),
+    });
+    assert!(tag.validate_declared(&fields).is_ok());
+    assert!(tag.validate(&fields).is_err());
+    assert!(tag.predicate.matches(&BTreeMap::from([(
+        "topics".into(),
+        FieldObservation::Ok(FieldValue::List(vec![ScalarValue::String("rust".into())]))
+    )])));
+    for invalid in [
+        Predicate::Contains {
+            key: "topics".into(),
+            value: ScalarValue::Null,
+        },
+        Predicate::Eq {
+            key: "score".into(),
+            value: ScalarValue::String("2".into()),
+        },
+    ] {
+        assert_eq!(
+            predicate(invalid).validate_declared(&fields),
+            Err(DomainError::validation(ValidationReason::InvalidQuery))
+        );
+    }
+}
+
+#[test]
 fn exact_numbers_compare_represented_values_without_f64_rounding() {
     let a = ExactNumber::from(9_007_199_254_740_992_u64);
     let b = ExactNumber::from(9_007_199_254_740_993_u64);
@@ -524,4 +564,65 @@ fn every_domain_error_has_a_unique_serialized_code_and_safe_typed_details() {
         assert_eq!(serde_json::from_value::<DomainError>(value).unwrap(), error);
     }
     assert_eq!(codes.len(), 12);
+}
+
+#[test]
+fn filter_validation_rejects_empty_and_proto_field_keys() {
+    let schema = BTreeMap::new();
+    for bad_key in ["", "__proto__"] {
+        let predicates = [
+            Predicate::Eq {
+                key: bad_key.into(),
+                value: ScalarValue::String("x".into()),
+            },
+            Predicate::Contains {
+                key: bad_key.into(),
+                value: ScalarValue::String("x".into()),
+            },
+            Predicate::NumberRange {
+                key: bad_key.into(),
+                range: ValueRange {
+                    lower: None,
+                    upper: None,
+                },
+            },
+            Predicate::DateRange {
+                key: bad_key.into(),
+                range: ValueRange {
+                    lower: None,
+                    upper: None,
+                },
+            },
+            Predicate::TimestampRange {
+                key: bad_key.into(),
+                range: ValueRange {
+                    lower: None,
+                    upper: None,
+                },
+            },
+            Predicate::Exists {
+                key: bad_key.into(),
+            },
+            Predicate::IsBad {
+                key: bad_key.into(),
+            },
+            Predicate::IsAbsent {
+                key: bad_key.into(),
+            },
+        ];
+        for predicate in predicates {
+            let filter = FieldFilterAstV1 {
+                version: 1,
+                predicate,
+            };
+            assert!(
+                filter.validate(&schema).is_err(),
+                "expected invalid filter for key {bad_key:?}"
+            );
+            assert!(
+                filter.validate_declared(&schema).is_err(),
+                "expected strict invalid filter for key {bad_key:?}"
+            );
+        }
+    }
 }
