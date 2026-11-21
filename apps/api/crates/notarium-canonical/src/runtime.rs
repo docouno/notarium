@@ -3079,9 +3079,9 @@ pub(crate) async fn are_any_notes_purge_fenced_tx(
     if note_ids.len() == 1 {
         return is_note_purge_fenced_tx(tx, space_id, note_ids[0].as_str()).await;
     }
-    for chunk in note_ids.chunks(200) {
-        let found = match tx {
-            BackendConn::Sqlite(conn) => {
+    match tx {
+        BackendConn::Sqlite(conn) => {
+            for chunk in note_ids.chunks(200) {
                 let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
                     "SELECT 1 FROM revision_purge_fences WHERE space_id = ",
                 );
@@ -3098,31 +3098,76 @@ pub(crate) async fn are_any_notes_purge_fenced_tx(
                     .map_err(|err| {
                         internal_not_committed("sqlite_check_purge_fence_batch", err.to_string())
                     })?;
-                row.is_some()
+                if row.is_some() {
+                    return Ok(true);
+                }
             }
-            BackendConn::Postgres(conn) => {
-                let mut qb = sqlx::QueryBuilder::<sqlx::Postgres>::new(
-                    "SELECT 1::BIGINT FROM revision_purge_fences WHERE space_id = ",
+            Ok(false)
+        }
+        BackendConn::Postgres(conn) => {
+            let ids: Vec<&str> = note_ids.iter().map(NoteId::as_str).collect();
+            let row: Option<i64> = sqlx::query_scalar(
+                "SELECT 1::BIGINT FROM revision_purge_fences WHERE space_id = $1 AND note_id = ANY($2) LIMIT 1",
+            )
+            .bind(space_id.as_str())
+            .bind(&ids)
+            .fetch_optional(&mut **conn)
+            .await
+            .map_err(|err| pg_read_error("pg_check_purge_fence_batch", err))?;
+            Ok(row.is_some())
+        }
+    }
+}
+
+pub(crate) async fn purge_fenced_note_ids_tx(
+    tx: &mut BackendConn<'_>,
+    space_id: &SpaceId,
+    note_ids: &[NoteId],
+) -> Result<std::collections::HashSet<NoteId>, PortError> {
+    let mut out = std::collections::HashSet::new();
+    if note_ids.is_empty() {
+        return Ok(out);
+    }
+    match tx {
+        BackendConn::Sqlite(conn) => {
+            for chunk in note_ids.chunks(200) {
+                let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+                    "SELECT note_id FROM revision_purge_fences WHERE space_id = ",
                 );
                 qb.push_bind(space_id.as_str()).push(" AND note_id IN (");
                 let mut sep = qb.separated(", ");
                 for nid in chunk {
                     sep.push_bind(nid.as_str());
                 }
-                sep.push_unseparated(") LIMIT 1");
-                let row: Option<i64> = qb
+                sep.push_unseparated(")");
+                let rows: Vec<String> = qb
                     .build_query_scalar()
-                    .fetch_optional(&mut **conn)
+                    .fetch_all(&mut **conn)
                     .await
-                    .map_err(|err| pg_read_error("pg_check_purge_fence_batch", err))?;
-                row.is_some()
+                    .map_err(|err| {
+                        internal_not_committed("sqlite_purge_fence_ids_batch", err.to_string())
+                    })?;
+                for raw in rows {
+                    out.insert(NoteId::parse(&raw)?);
+                }
             }
-        };
-        if found {
-            return Ok(true);
+        }
+        BackendConn::Postgres(conn) => {
+            let ids: Vec<&str> = note_ids.iter().map(NoteId::as_str).collect();
+            let rows: Vec<String> = sqlx::query_scalar(
+                "SELECT note_id FROM revision_purge_fences WHERE space_id = $1 AND note_id = ANY($2)",
+            )
+            .bind(space_id.as_str())
+            .bind(&ids)
+            .fetch_all(&mut **conn)
+            .await
+            .map_err(|err| pg_read_error("pg_purge_fence_ids_batch", err))?;
+            for raw in rows {
+                out.insert(NoteId::parse(&raw)?);
+            }
         }
     }
-    Ok(false)
+    Ok(out)
 }
 
 #[allow(clippy::type_complexity)]

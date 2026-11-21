@@ -114,10 +114,16 @@ async fn main() {
     .await;
     let microprofile = micro::run(&work_root.join("million")).await;
     pool.close().await;
+    let process_vm_hwm_bytes = read_vm_hwm_bytes();
+    eprintln!(
+        "projection benchmark process VmHWM: {} MiB ({process_vm_hwm_bytes} bytes)",
+        process_vm_hwm_bytes / (1024 * 1024)
+    );
 
     let report = ProjectionReport {
         version: REPORT_VERSION,
         environment,
+        process_vm_hwm_bytes,
         backends: [sqlite, postgres],
         microprofile,
     };
@@ -152,6 +158,17 @@ fn required(arguments: &mut BTreeMap<String, String>, key: &str) -> String {
     arguments
         .remove(key)
         .unwrap_or_else(|| panic!("missing {key}"))
+}
+
+fn read_vm_hwm_bytes() -> u64 {
+    let status = fs::read_to_string("/proc/self/status").expect("read /proc/self/status");
+    let kb: u64 = status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmHWM:"))
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|num| num.parse().ok())
+        .expect("parse VmHWM kB from /proc/self/status");
+    kb.saturating_mul(1024)
 }
 
 fn read_setting(path: &str) -> String {

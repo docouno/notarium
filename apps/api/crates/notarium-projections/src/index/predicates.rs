@@ -1,4 +1,4 @@
-use std::cmp::Ordering;
+use std::{borrow::Cow, cmp::Ordering};
 
 use croaring::Bitmap;
 #[cfg(any(test, feature = "test-support"))]
@@ -14,24 +14,53 @@ use super::{
     model::*,
 };
 
-/// Rows in `possible - definite` require exact validation against their
-/// retained card version. Boolean composition preserves this distinction,
-/// including when a hashed test is negated.
+/// Disjoint partition of candidates: `definite` rows satisfy the predicate
+/// without hydration, while `uncertain` rows require exact validation against
+/// their retained card version. Storing `uncertain` disjointly eliminates
+/// full-bitmap clones on exact predicates.
 pub struct FilterCandidates {
     pub definite: Bitmap,
-    pub possible: Bitmap,
+    pub uncertain: Bitmap,
 }
 
 impl FilterCandidates {
-    fn exact(rows: Bitmap) -> Self {
+    pub(crate) fn exact(rows: Bitmap) -> Self {
         Self {
-            definite: rows.clone(),
-            possible: rows,
+            definite: rows,
+            uncertain: Bitmap::new(),
         }
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.definite.is_empty() && self.uncertain.is_empty()
+    }
+
     pub fn needs_check(&self) -> Bitmap {
-        self.possible.andnot(&self.definite)
+        self.uncertain.clone()
+    }
+
+    #[cfg(test)]
+    pub fn possible(&self) -> Bitmap {
+        if self.uncertain.is_empty() {
+            self.definite.clone()
+        } else {
+            self.definite.or(&self.uncertain)
+        }
+    }
+
+    pub fn into_possible(mut self) -> Bitmap {
+        if !self.uncertain.is_empty() {
+            self.definite.or_inplace(&self.uncertain);
+        }
+        self.definite
+    }
+
+    fn possible_cow(&self) -> Cow<'_, Bitmap> {
+        if self.uncertain.is_empty() {
+            Cow::Borrowed(&self.definite)
+        } else {
+            Cow::Owned(self.definite.or(&self.uncertain))
+        }
     }
 }
 
@@ -44,14 +73,35 @@ impl IndexView {
         mut check: impl FnMut(DenseNodeId, &Predicate) -> Result<bool, IndexError>,
     ) -> Result<Bitmap, IndexError> {
         let candidates = self.filter_candidates(predicate, universe)?;
-        let witness = candidates.needs_check();
         let mut definite = candidates.definite;
-        for dense in witness.iter() {
+        for dense in candidates.uncertain.iter() {
             if check(self.dense(dense), predicate)? {
                 definite.add(dense);
             }
         }
         Ok(definite)
+    }
+
+    pub fn tag_candidates(
+        &self,
+        tag: &str,
+        universe: &Bitmap,
+    ) -> Result<FilterCandidates, IndexError> {
+        let prefix = [TAG_NAMESPACE];
+        let direct_key = PostingKey::Tag(tag.to_owned()).encode();
+        if !self.base.has_posting(&bucket_marker(&prefix), false) {
+            return Ok(FilterCandidates::exact(
+                self.ordinary_posting_in(&direct_key, universe)?,
+            ));
+        }
+        let slot = bucket_key(&prefix, tag.as_bytes());
+        let mut uncertain = self.base_posting_in(&slot, false, universe)?;
+        let definite = self.l0_posting_in(&direct_key, universe);
+        uncertain.andnot_inplace(&definite);
+        Ok(FilterCandidates {
+            definite,
+            uncertain,
+        })
     }
 
     pub fn filter_candidates(
@@ -62,35 +112,61 @@ impl IndexView {
         let posting = |key: &PostingKey| self.posting_in(key, universe);
         let exact = match predicate {
             Predicate::All(terms) => {
-                let mut conjunction = FilterCandidates::exact(universe.clone());
-                for term in terms {
-                    if conjunction.possible.is_empty() {
+                let mut iter = terms.iter();
+                let Some(first) = iter.next() else {
+                    return Ok(FilterCandidates::exact(universe.clone()));
+                };
+                let mut conjunction = self.filter_candidates(first, universe)?;
+                for term in iter {
+                    if conjunction.is_empty() {
                         break;
                     }
-                    let next = self.filter_candidates(term, &conjunction.possible)?;
-                    conjunction.definite.and_inplace(&next.definite);
-                    conjunction.possible = next.possible;
+                    let scope = conjunction.possible_cow();
+                    let next = self.filter_candidates(term, scope.as_ref())?;
+                    if conjunction.uncertain.is_empty() && next.uncertain.is_empty() {
+                        conjunction.definite = next.definite;
+                    } else {
+                        let new_definite = conjunction.definite.and(&next.definite);
+                        let mut new_uncertain = next.into_possible();
+                        new_uncertain.andnot_inplace(&new_definite);
+                        conjunction.definite = new_definite;
+                        conjunction.uncertain = new_uncertain;
+                    }
                 }
                 return Ok(conjunction);
             }
             Predicate::Any(terms) => {
                 let mut disjunction = FilterCandidates::exact(Bitmap::new());
                 for term in terms {
-                    let unresolved = universe.andnot(&disjunction.definite);
-                    if unresolved.is_empty() {
-                        break;
-                    }
-                    let next = self.filter_candidates(term, &unresolved)?;
+                    let unresolved = if disjunction.definite.is_empty() {
+                        Cow::Borrowed(universe)
+                    } else {
+                        let u = universe.andnot(&disjunction.definite);
+                        if u.is_empty() {
+                            break;
+                        }
+                        Cow::Owned(u)
+                    };
+                    let next = self.filter_candidates(term, unresolved.as_ref())?;
                     disjunction.definite.or_inplace(&next.definite);
-                    disjunction.possible.or_inplace(&next.possible);
+                    if !next.uncertain.is_empty() {
+                        disjunction.uncertain.or_inplace(&next.uncertain);
+                    }
+                    if !disjunction.uncertain.is_empty() {
+                        disjunction.uncertain.andnot_inplace(&disjunction.definite);
+                    }
                 }
                 return Ok(disjunction);
             }
             Predicate::Not(term) => {
                 let complement = self.filter_candidates(term, universe)?;
+                let mut definite = universe.andnot(&complement.definite);
+                if !complement.uncertain.is_empty() {
+                    definite.andnot_inplace(&complement.uncertain);
+                }
                 return Ok(FilterCandidates {
-                    definite: universe.andnot(&complement.possible),
-                    possible: universe.andnot(&complement.definite),
+                    definite,
+                    uncertain: complement.uncertain,
                 });
             }
             Predicate::Eq {
@@ -153,14 +229,13 @@ impl IndexView {
             ));
         }
         let slot = bucket_key(&prefix, &direct_key[prefix.len()..]);
-        let mut possible = self.base_posting_in(&slot, false, universe)?;
-        let definite = self
-            .l0
-            .postings
-            .get(&direct_key)
-            .map_or_else(Bitmap::new, |live| live.and(universe));
-        possible.or_inplace(&definite);
-        Ok(FilterCandidates { definite, possible })
+        let mut uncertain = self.base_posting_in(&slot, false, universe)?;
+        let definite = self.l0_posting_in(&direct_key, universe);
+        uncertain.andnot_inplace(&definite);
+        Ok(FilterCandidates {
+            definite,
+            uncertain,
+        })
     }
 
     fn bsi_range<T: Clone>(
@@ -199,21 +274,21 @@ impl IndexView {
         let mut selected = self.base_posting_in(&bsi_entry(&domain, BSI_EXISTS), true, universe)?;
         match comparison {
             Comparison::Equal(value) => {
-                let (_, equal) = self.compare_base(&domain, kind, selected, value)?;
+                let (_, equal, _) = self.compare_base(&domain, kind, selected, value, false)?;
                 selected = equal;
             }
             Comparison::Range { lower, upper } => {
                 if let Some(bound) = lower {
-                    let (mut less, equal) =
-                        self.compare_base(&domain, kind, selected.clone(), &bound.value)?;
-                    if !bound.inclusive {
-                        less.or_inplace(&equal);
+                    let (_, equal, mut greater) =
+                        self.compare_base(&domain, kind, selected, &bound.value, true)?;
+                    if bound.inclusive {
+                        greater.or_inplace(&equal);
                     }
-                    selected.andnot_inplace(&less);
+                    selected = greater;
                 }
                 if let Some(bound) = upper {
-                    let (mut less, equal) =
-                        self.compare_base(&domain, kind, selected, &bound.value)?;
+                    let (mut less, equal, _) =
+                        self.compare_base(&domain, kind, selected, &bound.value, false)?;
                     if bound.inclusive {
                         less.or_inplace(&equal);
                     }
@@ -221,10 +296,22 @@ impl IndexView {
                 }
             }
         }
-        if let Some(live) = self.l0.bsi_live.get(&domain) {
-            for (dense, value) in live.iter() {
-                if universe.contains(*dense) && comparison.matches(value) {
-                    selected.add(*dense);
+        if !self.l0.all_replaced.is_empty() {
+            let mut shadowed = Bitmap::new();
+            let multi_layer = !self.l0.layers.is_empty();
+            for layer in self.l0.iter_layers_newest_first() {
+                if let Some(live) = layer.bsi_live.get(&domain) {
+                    for (&dense, value) in live {
+                        if universe.contains(dense)
+                            && (!multi_layer || !shadowed.contains(dense))
+                            && comparison.matches(value)
+                        {
+                            selected.add(dense);
+                        }
+                    }
+                }
+                if multi_layer {
+                    shadowed.or_inplace(&layer.replaced);
                 }
             }
         }
@@ -237,9 +324,11 @@ impl IndexView {
         kind: BsiKind,
         mut equal: Bitmap,
         bound: &ScalarValue,
-    ) -> Result<(Bitmap, Bitmap), IndexError> {
+        track_greater: bool,
+    ) -> Result<(Bitmap, Bitmap, Bitmap), IndexError> {
         let key = BsiKind::key(bound).ok_or(IndexError::InvalidInput("invalid range boundary"))?;
         let mut less = Bitmap::new();
+        let mut greater = Bitmap::new();
         let mut plane_key = Vec::with_capacity(domain.len() + 1);
         plane_key.extend_from_slice(domain);
         plane_key.push(0);
@@ -251,24 +340,40 @@ impl IndexView {
             let plane = self.base.bitmap_view(&plane_key, true)?;
             if key & (1u128 << bit) != 0 {
                 if let Some(plane) = plane {
-                    less.or_inplace(&equal.andnot(&plane));
+                    if !track_greater {
+                        less.or_inplace(&equal.andnot(&plane));
+                    }
                     equal.and_inplace(&plane);
                 } else {
-                    less.or_inplace(&equal);
+                    if !track_greater {
+                        less.or_inplace(&equal);
+                    }
                     equal.clear();
                 }
             } else if let Some(plane) = plane {
+                if track_greater {
+                    greater.or_inplace(&equal.and(&plane));
+                }
                 equal.andnot_inplace(&plane);
             }
         }
         if let ScalarValue::Number(number) = bound
             && !equal.is_empty()
         {
-            self.refine_numeric_boundary(domain, key, number, &mut less, &mut equal)?;
+            self.refine_numeric_boundary(
+                domain,
+                key,
+                number,
+                &mut less,
+                &mut equal,
+                &mut greater,
+                track_greater,
+            )?;
         }
-        Ok((less, equal))
+        Ok((less, equal, greater))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn refine_numeric_boundary(
         &self,
         domain: &[u8],
@@ -276,6 +381,8 @@ impl IndexView {
         bound: &ExactNumber,
         less: &mut Bitmap,
         equal: &mut Bitmap,
+        greater: &mut Bitmap,
+        track_greater: bool,
     ) -> Result<(), IndexError> {
         let large_keys = bsi_entry(domain, BSI_LARGE_INTEGER);
         let large = self
@@ -285,7 +392,21 @@ impl IndexView {
         equal.andnot_inplace(&large);
         let projected = ExactNumber::from_f64(number_from_key(key))
             .map_err(|_| IndexError::Untrusted("nonfinite BSI boundary bucket"))?;
-        push_bucket(projected.cmp(bound), less, equal);
+        match projected.cmp(bound) {
+            Ordering::Equal => {}
+            Ordering::Less => {
+                if !track_greater {
+                    less.or_inplace(equal);
+                }
+                equal.clear();
+            }
+            Ordering::Greater => {
+                if track_greater {
+                    greater.or_inplace(equal);
+                }
+                equal.clear();
+            }
+        }
 
         for index in large.iter() {
             let integer = self
@@ -299,23 +420,20 @@ impl IndexView {
             }
             .map_err(|_| IndexError::Untrusted("invalid exact integer BSI record"))?;
             match number.cmp(bound) {
-                Ordering::Less => less.add(index),
+                Ordering::Less => {
+                    if !track_greater {
+                        less.add(index);
+                    }
+                }
                 Ordering::Equal => equal.add(index),
-                Ordering::Greater => {}
+                Ordering::Greater => {
+                    if track_greater {
+                        greater.add(index);
+                    }
+                }
             }
         }
         Ok(())
-    }
-}
-
-fn push_bucket(order: Ordering, less: &mut Bitmap, equal: &mut Bitmap) {
-    match order {
-        Ordering::Equal => {}
-        Ordering::Less => {
-            less.or_inplace(equal);
-            equal.clear();
-        }
-        Ordering::Greater => equal.clear(),
     }
 }
 

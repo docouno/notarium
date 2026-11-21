@@ -1269,14 +1269,26 @@ impl SqliteWalCoordinator {
             self.wal_reset_cycle_deadline,
         );
 
-        // Close ordinary reader admission and ensure an RAII guard ALWAYS reopens it!
+        // 1. Acquire writer safe point FIRST (bounded by `cycle_deadline`) while the ordinary
+        // reader gate is STILL OPEN. This matches the canonical lock hierarchy
+        // (`commit_gate` -> `LiveLifecycleFence` -> `wal.reader_gate`) and prevents an AB-BA
+        // deadlock where an in-flight writer holding `commit_gate.read()` needs a short
+        // visibility/erasure read transaction via `wal.reader_gate`.
+        let Ok(safe_point) =
+            tokio::time::timeout_at(cycle_deadline, writer_coord.acquire_safe_point()).await
+        else {
+            return;
+        };
+
+        // 2. Close ordinary reader admission and ensure an RAII guard ALWAYS reopens it
+        // BEFORE `safe_point` drops (reverse declaration order).
         self.close_reader_gate();
         let reopen_guard = GateReopenGuard {
             coord: self,
             closed_at: Instant::now(),
         };
 
-        // 1. Wait for active ordinary readers to drain by their monotonic deadlines.
+        // 3. Wait for active ordinary readers to drain by their monotonic deadlines.
         loop {
             let notified = self.drained_notify.notified();
             tokio::pin!(notified);
@@ -1297,13 +1309,6 @@ impl SqliteWalCoordinator {
                 _ = tokio::time::sleep_until(cycle_deadline) => return,
             }
         }
-
-        // 2. Acquire writer safe point bounded by `cycle_deadline` so no new batch commits occur during reset.
-        let Ok(safe_point) =
-            tokio::time::timeout_at(cycle_deadline, writer_coord.acquire_safe_point()).await
-        else {
-            return;
-        };
 
         // 3. Run bounded `RESTART` (preserving `journal_size_limit = 64MiB` pre-allocated blocks)
         // or `TRUNCATE` (when explicitly forced or using small test watermarks) on writer connection.

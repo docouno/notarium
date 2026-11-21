@@ -15,7 +15,7 @@ use notarium_core::{
     error::{CommitEffect, PortError, ValidationReason},
     ids::{ContentDigest, FolderId, ProjectionGeneration, SpaceSeq},
     model::HistoryScope,
-    ports::{CallBudget, Cancellation, SpaceEventKind},
+    ports::{CallBudget, Cancellation},
 };
 
 use crate::derived::{GenerationControl, GenerationDescriptor};
@@ -464,16 +464,27 @@ async fn wait_for_handoff(
                 }
                 let mut next = reservation.clone();
                 next.cut_fingerprint = exact;
-                let reply = commit_rotation(engine, coordinator, old, &next, stop).await?;
+                let commit_remaining = budget.remaining.saturating_sub(started.elapsed());
+                let reply = commit_rotation(
+                    engine,
+                    coordinator,
+                    old,
+                    &next,
+                    budget,
+                    commit_remaining,
+                    stop,
+                )
+                .await?;
                 drop(permits);
                 apply::activate_generation(engine, candidate);
                 drop(publication);
+                // `activation` wakes every open `EventStream` to rebind and emit
+                // its single authoritative `ResyncRequired` once the new Space
+                // lookup is bound; emitting another one on the broadcast ring
+                // would duplicate the signal.
                 engine
                     .activation
                     .send_modify(|revision| *revision = revision.wrapping_add(1));
-                for (_, scope, _, seq) in &catalog {
-                    engine.emit(scope, *seq, SpaceEventKind::ResyncRequired);
-                }
                 return Ok(LocalActivation {
                     descriptor: next,
                     reply,
@@ -493,8 +504,11 @@ pub(super) async fn commit_rotation(
     coordinator: &GenerationControl,
     old: &GenerationDescriptor,
     next: &GenerationDescriptor,
+    budget: &CallBudget,
+    remaining: Duration,
     stop: &Cancellation,
 ) -> Result<Result<(), PortError>, PortError> {
+    let deadline = Instant::now() + remaining;
     let uncertain = match coordinator.compare_and_swap(Some(old), next).await {
         Ok(true) => return Ok(Ok(())),
         Ok(false) => not_ready(),
@@ -531,12 +545,21 @@ pub(super) async fn commit_rotation(
                 Err(_) => {}
             }
         }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() || stop.is_cancelled() || budget.cancellation.is_cancelled() {
+            engine.publication_closed.store(true, Ordering::Release);
+            return Err(unknown_switch());
+        }
         tokio::select! {
             _ = stop.cancelled() => {
                 engine.publication_closed.store(true, Ordering::Release);
                 return Err(unknown_switch());
             }
-            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            _ = budget.cancellation.cancelled() => {
+                engine.publication_closed.store(true, Ordering::Release);
+                return Err(unknown_switch());
+            }
+            _ = tokio::time::sleep(left.min(Duration::from_millis(50))) => {}
         }
     }
 }

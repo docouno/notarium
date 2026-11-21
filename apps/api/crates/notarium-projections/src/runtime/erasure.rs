@@ -17,7 +17,10 @@ use crate::{
         DerivedStore, ErasureOutcome, GenerationControl, GenerationFiles, PostgresCacheOwner,
         PostgresEraser,
     },
-    mmap::{BaseIndexHandle, CheckpointRange, IndexIdentity, sweep_erased_checkpoint},
+    mmap::{
+        BaseIndexHandle, CheckpointRange, IndexIdentity, parse_checkpoint_seq,
+        sweep_erased_checkpoint,
+    },
 };
 
 use super::{GenerationCleanup, ProjectionEngine, PublishedCut, checkpoint_error};
@@ -78,6 +81,14 @@ impl ProjectionVisibilityCleanup for Eraser {
             }
             self.verify_target().await?;
             let engine = self.engine.upgrade();
+            // Immediately scrub queued RAM events (SpaceEvent + BoardDelta) on
+            // both Purge and pure RedactChatEntry BEFORE disk/SQL work that
+            // could fail halfway through, so erased IDs never linger in RAM.
+            if (!erasures.purged.is_empty() || !erasures.redacted.is_empty())
+                && let Some(engine) = engine.as_deref()
+            {
+                engine.scrub_space_events(&erasures.scope, erasures.through);
+            }
             if let Some(postgres) = &self.postgres {
                 erase_postgres_visibility(
                     postgres,
@@ -365,12 +376,7 @@ fn sweep_checkpoint_files(
     for entry in paths {
         let entry = entry.map_err(checkpoint_error)?;
         let name = entry.file_name();
-        let seq = name
-            .to_str()
-            .and_then(|name| name.strip_prefix("fast_index_"))
-            .and_then(|name| name.strip_suffix(".mmap"))
-            .and_then(|seq| seq.parse::<u64>().ok())
-            .and_then(|seq| SpaceSeq::new(seq).ok());
+        let seq = name.to_str().and_then(parse_checkpoint_seq);
         if !range.include_replaced && seq.is_some_and(|seq| seq >= range.through) {
             continue;
         }

@@ -1,11 +1,6 @@
 use std::collections::BTreeSet;
 
-use notarium_core::{
-    DomainError,
-    classes::DocClass,
-    error::{PortError, ValidationReason},
-    ids::NoteId,
-};
+use notarium_core::{classes::DocClass, error::PortError, ids::NoteId};
 
 use super::{
     DerivedMutation, ProjectedChatRef, StageKey, invalid_row, records::encode,
@@ -140,11 +135,44 @@ impl StageChecks {
                 }
                 self.notes.insert(row.note_id.clone());
             }
+            DerivedMutation::UpsertFolder(row) => {
+                if row.space_id != key.scope.space_id {
+                    return Err(invalid_row());
+                }
+                if let Some(cover) = &row.cover_note_id {
+                    self.notes.insert(cover.clone());
+                }
+            }
+            DerivedMutation::UpsertNoteAlias(row) => {
+                if row.space_id != key.scope.space_id {
+                    return Err(invalid_row());
+                }
+                self.notes.insert(row.target_note_id.clone());
+            }
             DerivedMutation::UpsertViewDescriptor(row) => {
                 if row.space_id != key.scope.space_id {
                     return Err(invalid_row());
                 }
                 self.notes.insert(row.view_note_id.clone());
+            }
+            DerivedMutation::UpsertViewRank(row) => {
+                if row.space_id != key.scope.space_id {
+                    return Err(invalid_row());
+                }
+                self.notes.insert(row.view_note_id.clone());
+                self.notes.insert(row.target_note_id.clone());
+            }
+            DerivedMutation::UpsertCandidate(row) => {
+                if row.space_id != key.scope.space_id {
+                    return Err(invalid_row());
+                }
+                self.notes.insert(row.target_note_id.clone());
+            }
+            DerivedMutation::UpsertCluster(row) => {
+                if row.space_id != key.scope.space_id {
+                    return Err(invalid_row());
+                }
+                self.notes.insert(row.anchor_note_id.clone());
             }
             DerivedMutation::UpsertChatRef(reference) => {
                 self.references.push(reference.clone());
@@ -172,6 +200,8 @@ impl StagePage {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub(super) fn invalid_limit() -> PortError {
-    DomainError::validation(ValidationReason::InvalidLimit).into()
+    notarium_core::DomainError::validation(notarium_core::error::ValidationReason::InvalidLimit)
+        .into()
 }

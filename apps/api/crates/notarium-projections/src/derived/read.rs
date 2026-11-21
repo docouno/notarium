@@ -11,7 +11,9 @@ use notarium_core::{
 use super::{
     DerivedStore, invalid_row, mismatch, not_ready,
     records::*,
-    sql::{Kind, SqlColumn, SqlRecord, SqlTransaction, SqlValue, placeholders, value},
+    sql::{
+        Kind, SqlColumn, SqlRecord, SqlTransaction, SqlValue, pad_sqlite_in, placeholders, value,
+    },
     stale,
 };
 
@@ -231,24 +233,59 @@ impl DerivedStore {
         view: &ViewRef,
         targets: &[NoteId],
     ) -> Result<Vec<ProjectedViewRank>, PortError> {
+        if targets.is_empty() {
+            self.check_cut(scope, cut).await?;
+            return Ok(Vec::new());
+        }
         check_batch(targets.len())?;
         #[cfg(test)]
         {
             self.rank_read_work.lock().unwrap().targets += targets.len();
         }
-        let mut params = vec![value(&view.note), value(&view.key)];
-        params.extend(targets.iter().map(value));
-        self.at_cut(
-            scope,
-            cut,
-            format!(
-                "view_note_id = ? AND view_key = ? AND target_note_id IN ({})",
-                placeholders(targets.len())
-            ),
-            params,
-            "",
-        )
-        .await
+        let scope = scope.clone();
+        let view = view.clone();
+        let ids: Vec<String> = targets.iter().map(|id| id.as_str().to_owned()).collect();
+        self.database
+            .read(move |mut tx| {
+                Box::pin(async move {
+                    let row = watermark(&mut tx, &scope.space_id)
+                        .await?
+                        .ok_or_else(not_ready)?;
+                    assert_cut(&row, &scope, cut)?;
+                    let cols = ProjectedViewRank::columns();
+                    let table = ProjectedViewRank::TABLE;
+                    if tx.postgres() {
+                        let sql = format!(
+                            "SELECT {cols} FROM {table} WHERE space_id = ? AND view_note_id = ? AND view_key = ? AND target_note_id = ANY(?)"
+                        );
+                        tx.records(
+                            &sql,
+                            vec![
+                                value(&scope.space_id),
+                                value(&view.note),
+                                value(&view.key),
+                                SqlValue::TextArray(ids),
+                            ],
+                        )
+                        .await
+                    } else {
+                        let padded = pad_sqlite_in(&ids);
+                        let mut params = Vec::with_capacity(3 + padded.len());
+                        params.extend([
+                            value(&scope.space_id),
+                            value(&view.note),
+                            value(&view.key),
+                        ]);
+                        params.extend(padded.iter().map(value));
+                        let sql = format!(
+                            "SELECT {cols} FROM {table} WHERE space_id = ? AND view_note_id = ? AND view_key = ? AND target_note_id IN ({})",
+                            placeholders(padded.len())
+                        );
+                        tx.records(&sql, params).await
+                    }
+                })
+            })
+            .await
     }
 
     pub(crate) async fn group_rank_page(
@@ -299,6 +336,11 @@ impl DerivedStore {
         group: &str,
         candidates: &[u32],
     ) -> Result<Vec<u32>, PortError> {
+        if candidates.is_empty() {
+            self.check_cut(scope, cut).await?;
+            return Ok(Vec::new());
+        }
+        check_batch(candidates.len())?;
         #[cfg(test)]
         {
             self.rank_read_work.lock().unwrap().targets += candidates.len();
@@ -322,8 +364,9 @@ impl DerivedStore {
                         params.push(SqlValue::IntArray(ids));
                         "n.dense_id = ANY(?)".to_owned()
                     } else {
-                        let marks = placeholders(ids.len());
-                        params.extend(ids.iter().map(value));
+                        let padded = pad_sqlite_in(&ids);
+                        let marks = placeholders(padded.len());
+                        params.extend(padded.iter().map(value));
                         format!("n.dense_id IN ({marks})")
                     };
                     params.extend([value(&view.note), value(&view.key), value(&group)]);
@@ -382,30 +425,7 @@ impl DerivedStore {
             .await
     }
 
-    pub async fn chat_thread(
-        &self,
-        scope: &HistoryScope,
-        thread: &ChatThreadId,
-    ) -> Result<Option<ProjectedChatThread>, PortError> {
-        let scope = scope.clone();
-        let params = vec![value(&scope.space_id), value(thread)];
-        let cols = ProjectedChatThread::columns();
-        let sql = format!(
-            "SELECT {cols} FROM projected_chat_threads WHERE space_id = ? AND thread_id = ?"
-        );
-        self.database
-            .read(move |mut tx| {
-                Box::pin(async move {
-                    let row = watermark(&mut tx, &scope.space_id)
-                        .await?
-                        .ok_or_else(not_ready)?;
-                    assert_cut(&row, &scope, row.projected_seq)?;
-                    Ok(tx.records(&sql, params).await?.pop())
-                })
-            })
-            .await
-    }
-
+    #[cfg(test)]
     pub async fn latest_trusted_checkpoint(
         &self,
         scope: &HistoryScope,
@@ -514,7 +534,7 @@ impl DerivedStore {
             .await
     }
 
-    async fn at_cut_in_u32<R: SqlRecord + Send + 'static>(
+    pub(super) async fn at_cut_in_u32<R: SqlRecord + Send + 'static>(
         &self,
         scope: &HistoryScope,
         cut: SpaceSeq,
@@ -539,14 +559,19 @@ impl DerivedStore {
                         tx.records(&sql, vec![value(&scope.space_id), SqlValue::IntArray(ids)])
                             .await
                     } else {
-                        let mut args = Vec::with_capacity(1 + ids.len());
+                        let padded = pad_sqlite_in(&ids);
+                        let mut args = Vec::with_capacity(1 + padded.len());
                         args.push(value(&scope.space_id));
-                        args.extend(ids.iter().map(value));
+                        args.extend(padded.iter().map(value));
                         let sql = format!(
                             "SELECT {cols} FROM {table} WHERE space_id = ? AND {column} IN ({})",
-                            placeholders(ids.len())
+                            placeholders(padded.len())
                         );
-                        tx.records(&sql, args).await
+                        if padded.len() <= 256 {
+                            tx.records(&sql, args).await
+                        } else {
+                            tx.records_uncached(&sql, args).await
+                        }
                     }
                 })
             })
@@ -577,14 +602,19 @@ impl DerivedStore {
                         tx.records(&sql, vec![value(&scope.space_id), SqlValue::TextArray(ids)])
                             .await
                     } else {
-                        let mut args = Vec::with_capacity(1 + ids.len());
+                        let padded = pad_sqlite_in(&ids);
+                        let mut args = Vec::with_capacity(1 + padded.len());
                         args.push(value(&scope.space_id));
-                        args.extend(ids.iter().map(value));
+                        args.extend(padded.iter().map(value));
                         let sql = format!(
                             "SELECT {cols} FROM {table} WHERE space_id = ? AND {column} IN ({})",
-                            placeholders(ids.len())
+                            placeholders(padded.len())
                         );
-                        tx.records(&sql, args).await
+                        if padded.len() <= 256 {
+                            tx.records(&sql, args).await
+                        } else {
+                            tx.records_uncached(&sql, args).await
+                        }
                     }
                 })
             })

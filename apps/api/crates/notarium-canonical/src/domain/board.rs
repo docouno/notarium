@@ -935,7 +935,19 @@ pub(crate) async fn move_board_card_impl(
             .await?
         {
             Ok(facts) => facts,
-            Err(error) => return replay_planning_conflict(&ctx, error).await,
+            Err(error) => match replay_planning_conflict(&ctx, error).await {
+                Ok(committed) => return Ok(committed),
+                Err(PortError::Domain(DomainError::ValidationFailed {
+                    diagnostic:
+                        Diagnostic {
+                            reason: ValidationReason::CursorStale,
+                            ..
+                        },
+                })) if attempt + 1 < MAX_PLANNER_RETRIES => {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            },
         };
         facts.verify_authority(&board_authority)?;
         ctx.scope().check(facts.scope())?;

@@ -62,6 +62,24 @@ mod read_surface;
 #[path = "board_mutation/rotation.rs"]
 mod rotation;
 
+fn find_checkpoint_file(
+    root: &DataRoot,
+    generation: ProjectionGeneration,
+    space: &SpaceId,
+    seq: SpaceSeq,
+) -> Option<PathBuf> {
+    let dir = root.space_fast_index_dir(generation, space);
+    let prefix = format!("fast_index_{}", seq.get());
+    std::fs::read_dir(dir).ok()?.flatten().find_map(|entry| {
+        let name = entry.file_name();
+        let name = name.to_str()?;
+        let rest = name.strip_prefix(&prefix)?;
+        let matches = rest == ".mmap"
+            || (rest.starts_with('_') && rest.ends_with(".mmap") && rest.len() == 1 + 32 + 5);
+        matches.then(|| entry.path())
+    })
+}
+
 #[derive(Deserialize)]
 struct PgFixture {
     pg_socket_dir_container: PathBuf,

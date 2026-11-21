@@ -1,6 +1,9 @@
 //! History-pinned metadata and carrier access for rebuildable projections.
 
-use std::{collections::BTreeMap, time::Duration};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    time::Duration,
+};
 
 use notarium_core::{
     DomainError,
@@ -24,7 +27,7 @@ use crate::{
     domain::common::{CommandDeadline, note_rank_version_digest},
     runtime::{
         SpaceRecord, is_note_purge_fenced_tx, load_space_record, pg_read_error,
-        require_command_end_tx,
+        purge_fenced_note_ids_tx, require_command_end_tx,
     },
     sql_exec::BackendConn,
 };
@@ -321,10 +324,7 @@ impl CanonicalStore {
                     usize::from(limit.get()) as i64 + 1,
                 )?;
                 let more = truncate_page(&mut records, limit);
-                let mut rows = Vec::with_capacity(records.len());
-                for record in records {
-                    rows.push(folder_from_row(tx, &scope, record).await?);
-                }
+                let rows = folders_from_rows_batch(tx, &scope, records).await?;
                 Ok(ProjectionPage {
                     next: page_next(&rows, more, |row| row.metadata.folder_id.clone()),
                     rows,
@@ -783,57 +783,174 @@ fn timestamp(seconds: i64, nanos: i64) -> Result<Timestamp, PortError> {
     Ok(decode_timestamp_parts(seconds, nanos)?)
 }
 
-async fn folder_at(
+pub(super) async fn notes_at_batch(
     tx: &mut BackendConn<'_>,
     scope: &HistoryScope,
     cutoff: SpaceSeq,
-    id: &FolderId,
-) -> Result<Option<ProjectionFolder>, PortError> {
-    let row = read_rows!(
-        tx,
-        fetch_optional,
-        "projection_folder_at",
-        FolderRow,
-        concat!(
-            "SELECT h.folder_id, r.rev_id, r.visibility_seq, r.metadata_msgpack ",
-            folder_snapshot_sql!(),
-            " h.folder_id = $4",
-        ),
-        scope.space_id.as_str(),
-        scope.incarnation.as_bytes().as_slice(),
-        cutoff.get() as i64,
-        id.as_str(),
-    )?;
-    match row {
-        Some(record) => Ok(Some(folder_from_row(tx, scope, record).await?)),
-        None => Ok(None),
+    ids: &[NoteId],
+) -> Result<HashMap<NoteId, ProjectionNote>, PortError> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
     }
+    let space = scope.space_id.as_str();
+    let incarnation = scope.incarnation.as_bytes().as_slice();
+    let cut = cutoff.get() as i64;
+    let records: Vec<NoteRow> = match tx {
+        BackendConn::Postgres(conn) => {
+            let id_strs: Vec<&str> = ids.iter().map(NoteId::as_str).collect();
+            sqlx::query_as::<_, NoteRow>(concat!(note_snapshot_sql!(), " h.note_id = ANY($4)"))
+                .bind(space)
+                .bind(incarnation)
+                .bind(cut)
+                .bind(&id_strs)
+                .fetch_all(&mut **conn)
+                .await
+                .map_err(|err| pg_read_error("pg_projection_notes_batch", err))?
+        }
+        BackendConn::Sqlite(conn) => {
+            let mut acc = Vec::with_capacity(ids.len());
+            for chunk in ids.chunks(200) {
+                let mut sql = String::from(note_snapshot_sql!());
+                sql.push_str(" h.note_id IN (");
+                for i in 0..chunk.len() {
+                    if i > 0 {
+                        sql.push_str(", ");
+                    }
+                    use std::fmt::Write;
+                    let _ = write!(sql, "${}", i + 4);
+                }
+                sql.push(')');
+                let mut query = sqlx::query_as::<_, NoteRow>(sqlx::AssertSqlSafe(sql))
+                    .bind(space)
+                    .bind(incarnation)
+                    .bind(cut);
+                for id in chunk {
+                    query = query.bind(id.as_str());
+                }
+                let part = query.fetch_all(&mut **conn).await.map_err(|err| {
+                    internal_not_committed("sqlite_projection_notes_batch", err.to_string())
+                })?;
+                acc.extend(part);
+            }
+            acc
+        }
+    };
+    let mut out = HashMap::with_capacity(records.len());
+    for record in records {
+        let note = note_from_row(scope, cutoff, record)?;
+        out.insert(note.metadata.note_id.clone(), note);
+    }
+    Ok(out)
 }
 
-async fn folder_from_row(
+pub(super) async fn folders_at_batch(
     tx: &mut BackendConn<'_>,
     scope: &HistoryScope,
-    (id, rev, visible, meta): FolderRow,
-) -> Result<ProjectionFolder, PortError> {
-    let (Some(rev), Some(visible), Some(meta)) = (rev, visible, meta) else {
-        return Err(stale());
-    };
-    let RevisionMetadataPayload::Folder(mut metadata) =
-        RevisionMetadataEnvelope::decode(&meta)?.payload
-    else {
-        return Err(corrupt("expected a folder revision"));
-    };
-    if metadata.folder_id.as_str() != id {
-        return Err(corrupt("folder revision identity does not match its head"));
+    cutoff: SpaceSeq,
+    ids: &[FolderId],
+) -> Result<HashMap<FolderId, ProjectionFolder>, PortError> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
     }
-    if let Some(cover) = &metadata.cover_note_id
-        && is_note_purge_fenced_tx(tx, &scope.space_id, cover.as_str()).await?
-    {
-        metadata.cover_note_id = None;
+    let space = scope.space_id.as_str();
+    let incarnation = scope.incarnation.as_bytes().as_slice();
+    let cut = cutoff.get() as i64;
+    let records: Vec<FolderRow> = match tx {
+        BackendConn::Postgres(conn) => {
+            let id_strs: Vec<&str> = ids.iter().map(FolderId::as_str).collect();
+            sqlx::query_as::<_, FolderRow>(concat!(
+                "SELECT h.folder_id, r.rev_id, r.visibility_seq, r.metadata_msgpack ",
+                folder_snapshot_sql!(),
+                " h.folder_id = ANY($4)"
+            ))
+            .bind(space)
+            .bind(incarnation)
+            .bind(cut)
+            .bind(&id_strs)
+            .fetch_all(&mut **conn)
+            .await
+            .map_err(|err| pg_read_error("pg_projection_folders_batch", err))?
+        }
+        BackendConn::Sqlite(conn) => {
+            let mut acc = Vec::with_capacity(ids.len());
+            for chunk in ids.chunks(200) {
+                let mut sql = String::from(concat!(
+                    "SELECT h.folder_id, r.rev_id, r.visibility_seq, r.metadata_msgpack ",
+                    folder_snapshot_sql!(),
+                    " h.folder_id IN ("
+                ));
+                for i in 0..chunk.len() {
+                    if i > 0 {
+                        sql.push_str(", ");
+                    }
+                    use std::fmt::Write;
+                    let _ = write!(sql, "${}", i + 4);
+                }
+                sql.push(')');
+                let mut query = sqlx::query_as::<_, FolderRow>(sqlx::AssertSqlSafe(sql))
+                    .bind(space)
+                    .bind(incarnation)
+                    .bind(cut);
+                for id in chunk {
+                    query = query.bind(id.as_str());
+                }
+                let part = query.fetch_all(&mut **conn).await.map_err(|err| {
+                    internal_not_committed("sqlite_projection_folders_batch", err.to_string())
+                })?;
+                acc.extend(part);
+            }
+            acc
+        }
+    };
+    let rows = folders_from_rows_batch(tx, scope, records).await?;
+    let mut out = HashMap::with_capacity(rows.len());
+    for folder in rows {
+        out.insert(folder.metadata.folder_id.clone(), folder);
     }
-    Ok(ProjectionFolder {
-        metadata,
-        revision_id: RevisionId::parse(&rev)?,
-        visibility_seq: i64_to_space_seq(visible)?,
-    })
+    Ok(out)
+}
+
+async fn folders_from_rows_batch(
+    tx: &mut BackendConn<'_>,
+    scope: &HistoryScope,
+    records: Vec<FolderRow>,
+) -> Result<Vec<ProjectionFolder>, PortError> {
+    let mut folders = Vec::with_capacity(records.len());
+    let mut cover_notes = HashSet::new();
+    for (id, rev, visible, meta) in records {
+        let (Some(rev), Some(visible), Some(meta)) = (rev, visible, meta) else {
+            return Err(stale());
+        };
+        let RevisionMetadataPayload::Folder(metadata) =
+            RevisionMetadataEnvelope::decode(&meta)?.payload
+        else {
+            return Err(corrupt("expected a folder revision"));
+        };
+        if metadata.folder_id.as_str() != id {
+            return Err(corrupt("folder revision identity does not match its head"));
+        }
+        if let Some(cover) = &metadata.cover_note_id {
+            cover_notes.insert(cover.clone());
+        }
+        folders.push(ProjectionFolder {
+            metadata,
+            revision_id: RevisionId::parse(&rev)?,
+            visibility_seq: i64_to_space_seq(visible)?,
+        });
+    }
+    if !cover_notes.is_empty() {
+        let cover_vec: Vec<NoteId> = cover_notes.into_iter().collect();
+        let fenced = purge_fenced_note_ids_tx(tx, &scope.space_id, &cover_vec).await?;
+        for folder in &mut folders {
+            if folder
+                .metadata
+                .cover_note_id
+                .as_ref()
+                .is_some_and(|cover| fenced.contains(cover))
+            {
+                folder.metadata.cover_note_id = None;
+            }
+        }
+    }
+    Ok(folders)
 }

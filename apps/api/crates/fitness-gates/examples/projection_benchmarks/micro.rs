@@ -402,6 +402,23 @@ pub(crate) async fn run(path: &Path) -> Microprofile {
     assert_eq!(fixture.pool.live_mmap_count(), 0);
     let evicted = census_sample(&fence, FencePhase::Evicted, 0, 0);
 
+    let l0_sequential_edit = measure_l0_sequential_edit(&fixture);
+    eprintln!(
+        "projection benchmark sequential CoW L0 edit: {} samples, p50={} ns, p95={} ns, p99={} ns",
+        l0_sequential_edit.samples,
+        l0_sequential_edit.p50_ns,
+        l0_sequential_edit.p95_ns,
+        l0_sequential_edit.p99_ns
+    );
+    let high_cardinality_tag_probe = measure_high_cardinality_tags(&fixture, &root);
+    eprintln!(
+        "projection benchmark high-cardinality tag probe: {} samples, p50={} ns, p95={} ns, p99={} ns",
+        high_cardinality_tag_probe.samples,
+        high_cardinality_tag_probe.p50_ns,
+        high_cardinality_tag_probe.p95_ns,
+        high_cardinality_tag_probe.p99_ns
+    );
+
     Microprofile {
         scope: super::report::MICROPROFILE_SCOPE.to_owned(),
         indexed_notes,
@@ -409,8 +426,87 @@ pub(crate) async fn run(path: &Path) -> Microprofile {
         checkpoint_bytes,
         cold_checkpoint_open,
         warm_board,
+        l0_sequential_edit,
+        high_cardinality_tag_probe,
         fence: [hydrated, lagged, compacted, evicted],
     }
+}
+
+fn measure_l0_sequential_edit(fixture: &Fixture) -> Timing {
+    // Seed a non-trivial L0Delta with 512 distinct notes, then measure 128
+    // sequential single-note edits through Arc::make_mut while retaining a
+    // previous Arc snapshot (simulating concurrent readers across commits).
+    let mut current = Arc::new(L0Delta::default());
+    {
+        let delta = Arc::make_mut(&mut current);
+        for index in 0..512 {
+            let note = fixture.note(index);
+            delta.replace_note(note.index_row()).unwrap();
+        }
+    }
+    let mut samples = Vec::with_capacity(ADDED);
+    for step in 0..ADDED {
+        let note = fixture.note(512 + step);
+        let retained_previous = Arc::clone(&current);
+        let started = Instant::now();
+        let mut next = Arc::clone(&current);
+        Arc::make_mut(&mut next)
+            .replace_note(note.index_row())
+            .unwrap();
+        samples.push(u64::try_from(started.elapsed().as_nanos()).unwrap());
+        current = next;
+        drop(retained_previous);
+    }
+    Timing::from_samples(samples)
+}
+
+fn measure_high_cardinality_tags(fixture: &Fixture, root: &DataRoot) -> Timing {
+    use notarium_projections::index::PostingKey;
+
+    const TAG_NOTES: usize = 5_000;
+    const TAGS_PER_NOTE: usize = 14;
+    let mut builder = FastIndexBuilder::default();
+    for (dense, folder) in fixture.folders.iter().enumerate() {
+        builder
+            .add_folder(dense as u32, folder, Lifecycle::Active)
+            .unwrap();
+    }
+    for index in 0..TAG_NOTES {
+        let mut note = fixture.note(index);
+        note.tags = (0..TAGS_PER_NOTE)
+            .map(|slot| format!("hc-tag-{index:05}-{slot:02}"))
+            .collect();
+        builder.add_note(note.index_row()).unwrap();
+    }
+    let seq = SpaceSeq::new(99).unwrap();
+    let path = root.space_fast_index_with_nonce(
+        fixture.generation,
+        &fixture.scope.space_id,
+        seq,
+        "00000000000000000000000000000001",
+    );
+    let identity = IndexIdentity {
+        generation: fixture.generation,
+        scope: fixture.scope.clone(),
+        seq,
+    };
+    let (handle, _) = builder.publish(&path, identity).unwrap();
+    let pool = MmapPool::new(NonZeroUsize::MIN);
+    let view = IndexView::new(handle.open(&pool).unwrap(), Arc::new(L0Delta::default()));
+    assert!(
+        view.tags_bucketed(),
+        "70000 distinct tags must engage 4096-bucket tag partitioning"
+    );
+    let mut samples = Vec::with_capacity(MINIMUM_SAMPLES);
+    for i in 0..MINIMUM_SAMPLES {
+        let target_idx = (i * 97) % TAG_NOTES;
+        let tag = format!("hc-tag-{target_idx:05}-00");
+        let started = Instant::now();
+        let hits = view.posting(&PostingKey::Tag(tag)).unwrap();
+        assert!(hits.contains(target_idx as u32));
+        samples.push(u64::try_from(started.elapsed().as_nanos()).unwrap());
+    }
+    Timing::from_samples(samples)
 }
 
 fn measure_cold_open(base: &BaseIndexHandle) -> Timing {

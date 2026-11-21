@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, Weak},
     time::{Duration, Instant},
 };
@@ -16,8 +16,8 @@ use notarium_core::{
     ids::{ChatThreadId, NoteId, ProjectionGeneration, SpaceId, SpaceSeq, ThreadEntrySeq},
     model::{HistoryScope, NoteRef, SnapshotCut},
     ports::{
-        CallBudget, ChatBacklink, ChatBacklinkCursor, ChatBacklinkPage, ChatThreadKind,
-        MaintenanceContext, PageLimit, SpaceContext,
+        CallBudget, ChatBacklink, ChatBacklinkCursor, ChatBacklinkPage, MaintenanceContext,
+        PageLimit, SpaceContext,
     },
     receipt::CausalBasis,
 };
@@ -95,8 +95,8 @@ impl BacklinkOwner {
 }
 
 struct VerifiedBacklinks {
-    visible: Vec<(ProjectedChatRef, ChatBacklink)>,
-    _permits: BTreeMap<SpaceId, BacklinkOwnerRead>,
+    visible: Vec<(ProjectedChatRef, ChatBacklink, bool)>,
+    permits: BTreeMap<SpaceId, BacklinkOwnerRead>,
 }
 
 impl ProjectionEngine {
@@ -201,9 +201,9 @@ impl ProjectionEngine {
                 Err(cancelled_not_committed("chat_backlinks", "caller cancelled"))
             }
             result = tokio::time::timeout(remaining, async {
-                let verified = self.visible_backlinks(&ctx, note, &target_cut, after, limit).await?;
+                let (verified, has_more) = self.visible_backlinks(&ctx, note, &target_cut, after, limit).await?;
                 let _admission = after.is_none().then(|| self.current_admission(generation)).transpose()?;
-                Ok(visible_page(scope, generation, note, usize::from(limit.get()), verified))
+                Ok(visible_page(scope, generation, note, has_more, verified))
             }) => {
                 result.map_err(|_| deadline_not_committed("chat_backlinks", "source authority verification exceeded deadline"))?
             }
@@ -217,46 +217,55 @@ impl ProjectionEngine {
         cut: &PublishedCut,
         after: Option<&ChatBacklinkCursor>,
         limit: PageLimit,
-    ) -> Result<VerifiedBacklinks, PortError> {
+    ) -> Result<(VerifiedBacklinks, bool), PortError> {
         let capacity = usize::from(limit.get());
+        let want = capacity + 1;
+        let scan_size = limit.get().saturating_add(1).clamp(64, 200);
+        let scan_limit = PageLimit::new(scan_size).unwrap_or(limit);
         let mut position = after.map(|cursor| cursor.after.clone());
-        let mut pending = Vec::with_capacity(capacity);
+        let mut pending = Vec::with_capacity(want);
         loop {
             let after = position
                 .as_ref()
                 .map(|(space, thread, entry)| (space, thread, *entry));
             let candidates = cut
                 .store
-                .chat_ref_page(ctx.scope(), note, after, limit)
+                .chat_ref_page(ctx.scope(), note, after, scan_limit)
                 .await?;
-            let complete = candidates.len() < capacity;
-            let verified = self.verify_chat_backlinks(ctx, note, &candidates).await?;
-            if pending.is_empty() && (complete || verified.visible.len() == capacity) {
-                return Ok(verified);
+            let complete = candidates.len() < usize::from(scan_limit.get());
+            let mut verified = self.verify_chat_backlinks(ctx, note, &candidates).await?;
+            if pending.is_empty() && (complete || verified.visible.len() >= want) {
+                let has_more = verified.visible.len() > capacity;
+                verified.visible.truncate(capacity);
+                apply_delivered_taint(ctx, &verified);
+                return Ok((verified, has_more));
             }
-            let room = capacity - pending.len();
-            let VerifiedBacklinks { visible, _permits } = verified;
+            let room = want - pending.len();
+            let VerifiedBacklinks { visible, permits } = verified;
             let truncated = visible.len() > room;
             let mut last_consumed = None;
-            for (candidate, _) in visible.into_iter().take(room) {
+            for (candidate, _, _) in visible.into_iter().take(room) {
                 last_consumed = Some(backlink_position(&candidate));
                 pending.push(candidate);
             }
-            drop(_permits);
+            drop(permits);
             let exhausted = complete && !truncated;
-            if exhausted || pending.len() == capacity {
+            if exhausted || pending.len() >= want {
                 // Earlier pages released their permits. Verify the full
                 // result under current owners again before returning it.
-                let reverified = self.verify_chat_backlinks(ctx, note, &pending).await?;
-                if exhausted || reverified.visible.len() == capacity {
-                    return Ok(reverified);
+                let mut reverified = self.verify_chat_backlinks(ctx, note, &pending).await?;
+                if exhausted || reverified.visible.len() >= want {
+                    let has_more = reverified.visible.len() > capacity;
+                    reverified.visible.truncate(capacity);
+                    apply_delivered_taint(ctx, &reverified);
+                    return Ok((reverified, has_more));
                 }
                 // Concurrent redaction or revocation shrank the batch; keep
                 // surviving entries and continue scanning instead of truncating.
                 pending = reverified
                     .visible
                     .into_iter()
-                    .map(|(candidate, _)| candidate)
+                    .map(|(candidate, _, _)| candidate)
                     .collect();
             }
             position = if truncated {
@@ -312,6 +321,11 @@ impl ProjectionEngine {
             let owner = self.backlink_owner(&projection, &scope).await?;
             {
                 let read = owner.admit(self, &scope)?;
+                if read.permit.space().lifecycle != SpaceLifecycle::Active {
+                    continue;
+                }
+                // Observing a foreign Space's causal state taints a pinned run.
+                ctx.auth().mark_chat_read_taint(read.permit.space(), false);
                 check_causal_head(&read.permit, seq)?;
             }
             // A shared generation may already contain the required source cut,
@@ -389,9 +403,8 @@ impl ProjectionEngine {
         authorize_entry(ctx, target)?;
         super::read::ensure_active(target, ctx, note)?;
 
-        let mut heads = BTreeMap::new();
-        let mut links = Vec::with_capacity(candidates.len());
-        for row in candidates {
+        let mut by_space: BTreeMap<SpaceId, Vec<usize>> = BTreeMap::new();
+        for (idx, row) in candidates.iter().enumerate() {
             let Some(source) = permits.get(&row.thread_space_id) else {
                 continue;
             };
@@ -400,78 +413,119 @@ impl ProjectionEngine {
             {
                 continue;
             }
-            let head_key = (row.thread_space_id.clone(), row.thread_id.clone());
-            let cached = match heads.entry(head_key) {
-                std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
-                std::collections::btree_map::Entry::Vacant(entry) => {
-                    let head = source
-                        .canonical
-                        .read_projection_chat_head(
-                            &projection,
-                            source.permit.scope(),
-                            Some(source.permit.head()),
-                            &row.thread_id,
-                        )
-                        .await?;
-                    let visible = head.filter(|head| {
-                        let thread = &head.thread;
-                        !(thread.kind == ChatThreadKind::Personal
-                            && &thread.owner != ctx.auth().principal())
-                            && ctx
-                                .auth()
-                                .authorize_chat_read(
-                                    source.permit.space(),
-                                    thread.project_folder.as_ref(),
-                                    thread.tainted,
-                                )
-                                .is_ok()
-                    });
-                    entry.insert(visible)
-                }
-            };
-            let Some(head) = cached else {
+            by_space
+                .entry(row.thread_space_id.clone())
+                .or_default()
+                .push(idx);
+        }
+
+        let mut verified_by_index = BTreeMap::new();
+        for (space_id, indices) in by_space {
+            let Some(source) = permits.get(&space_id) else {
                 continue;
             };
-            let occurrence = ProjectionChatRef {
-                locator: ProjectionChatRefLocator {
-                    source: source.permit.scope().clone(),
-                    entry: ProjectionChatEntryKey {
-                        thread: row.thread_id.clone(),
-                        seq: row.entry_seq,
-                    },
-                    revision: row.source_revision.clone(),
-                    ref_ordinal: u32::try_from(row.ref_ordinal).map_err(|_| {
-                        internal_not_committed(
-                            "chat_backlinks",
-                            "invalid derived reference ordinal",
-                        )
-                    })?,
-                },
-                target: NoteRef {
-                    space_id: scope.space_id.clone(),
-                    note_id: note.clone(),
-                },
-                target_scope: scope.clone(),
-            };
-            if source
+            let unique_threads: Vec<ChatThreadId> = indices
+                .iter()
+                .map(|&idx| candidates[idx].thread_id.clone())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            let heads = source
                 .canonical
-                .verify_projection_chat_ref(&projection, &occurrence)
-                .await?
-            {
-                links.push((
-                    row.clone(),
-                    ChatBacklink {
-                        thread: head.thread.clone(),
-                        title: head.title.clone(),
-                        entry: row.entry_seq,
+                .read_projection_chat_heads(
+                    &projection,
+                    source.permit.scope(),
+                    Some(source.permit.head()),
+                    &unique_threads,
+                )
+                .await?;
+            let visible_heads: BTreeMap<ChatThreadId, _> = heads
+                .into_iter()
+                .filter(|(_, head)| {
+                    let thread = &head.thread;
+                    ctx.auth()
+                        .can_view_chat_thread(
+                            source.permit.space(),
+                            thread.kind,
+                            &thread.owner,
+                            thread.project_folder.as_ref(),
+                            thread.tainted,
+                        )
+                        .is_ok()
+                })
+                .collect();
+
+            let mut check_indices = Vec::new();
+            let mut occurrences = Vec::new();
+            for idx in indices {
+                let row = &candidates[idx];
+                if !visible_heads.contains_key(&row.thread_id) {
+                    continue;
+                }
+                let ref_ordinal = u32::try_from(row.ref_ordinal).map_err(|_| {
+                    internal_not_committed("chat_backlinks", "invalid derived reference ordinal")
+                })?;
+                check_indices.push(idx);
+                occurrences.push(ProjectionChatRef {
+                    locator: ProjectionChatRefLocator {
+                        source: source.permit.scope().clone(),
+                        entry: ProjectionChatEntryKey {
+                            thread: row.thread_id.clone(),
+                            seq: row.entry_seq,
+                        },
+                        revision: row.source_revision.clone(),
+                        ref_ordinal,
                     },
-                ));
+                    target: NoteRef {
+                        space_id: scope.space_id.clone(),
+                        note_id: note.clone(),
+                    },
+                    target_scope: scope.clone(),
+                });
+            }
+            if occurrences.is_empty() {
+                continue;
+            }
+            let verified = source
+                .canonical
+                .verify_projection_chat_refs(&projection, &occurrences)
+                .await?;
+            for (idx, ok) in check_indices.into_iter().zip(verified) {
+                if !ok {
+                    continue;
+                }
+                let row = &candidates[idx];
+                if let Some(head) = visible_heads.get(&row.thread_id) {
+                    verified_by_index.insert(
+                        idx,
+                        (
+                            row.clone(),
+                            ChatBacklink {
+                                thread: head.thread.clone(),
+                                title: head.title.clone(),
+                                entry: row.entry_seq,
+                            },
+                            head.thread.tainted,
+                        ),
+                    );
+                }
             }
         }
+
+        let links = verified_by_index.into_values().collect();
         Ok(VerifiedBacklinks {
             visible: links,
-            _permits: permits,
+            permits,
         })
+    }
+}
+
+fn apply_delivered_taint(ctx: &SpaceContext, verified: &VerifiedBacklinks) {
+    for (row, _, tainted) in &verified.visible {
+        if let Some(source) = verified.permits.get(&row.thread_space_id) {
+            ctx.auth()
+                .mark_chat_read_taint(source.permit.space(), *tainted);
+        }
     }
 }
 
@@ -498,21 +552,24 @@ fn visible_page(
     scope: &HistoryScope,
     generation: ProjectionGeneration,
     note: &NoteId,
-    capacity: usize,
+    has_more: bool,
     verified: VerifiedBacklinks,
 ) -> ChatBacklinkPage {
-    let VerifiedBacklinks { visible, _permits } = verified;
+    let VerifiedBacklinks {
+        visible,
+        permits: _,
+    } = verified;
     let next = visible
         .last()
-        .filter(|_| visible.len() == capacity)
-        .map(|(row, _)| ChatBacklinkCursor {
+        .filter(|_| has_more)
+        .map(|(row, _, _)| ChatBacklinkCursor {
             scope: scope.clone(),
             generation,
             note: note.clone(),
             after: backlink_position(row),
         });
     ChatBacklinkPage {
-        links: visible.into_iter().map(|(_, link)| link).collect(),
+        links: visible.into_iter().map(|(_, link, _)| link).collect(),
         next,
     }
 }

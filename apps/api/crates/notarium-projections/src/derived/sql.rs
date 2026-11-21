@@ -30,9 +30,10 @@ use tokio::{runtime::Handle, sync::Semaphore};
 use super::{deadline, failure, internal, invalid_row};
 
 const READ_LIMIT: Duration = Duration::from_millis(240);
-const PG_READ_LIMIT: Duration = Duration::from_millis(225);
+const PG_READ_LIMIT: Duration = Duration::from_millis(240);
 const READERS: usize = 8;
 const WAL_LIMIT: u64 = 64 * 1024 * 1024;
+const SQLITE_IN_PAD_MAX: usize = 256;
 // PostgreSQL identifier limit (NAMEDATALEN - 1 = 63) minus "_g" and max u64 digits (19).
 const MAX_SCHEMA_PREFIX_LEN: usize = 42;
 
@@ -318,6 +319,22 @@ pub(super) fn placeholders(count: usize) -> String {
         .join(", ")
 }
 
+/// Pads a small SQLite `IN (...)` list to the next power of two by repeating
+/// the final element so `prepare_cached` keeps at most 9 statement shapes.
+pub(super) fn pad_sqlite_in<T: Clone>(items: &[T]) -> Vec<T> {
+    let Some(last) = items.last() else {
+        return Vec::new();
+    };
+    if items.len() > SQLITE_IN_PAD_MAX {
+        return items.to_vec();
+    }
+    let target = items.len().next_power_of_two().min(SQLITE_IN_PAD_MAX);
+    let mut padded = Vec::with_capacity(target);
+    padded.extend_from_slice(items);
+    padded.resize(target, last.clone());
+    padded
+}
+
 pub(super) fn key_filter<R: SqlRecord>() -> String {
     R::KEY
         .iter()
@@ -452,12 +469,23 @@ impl CheckpointGate {
             .state
             .lock()
             .map_err(|_| internal("projection_checkpoint_gate"))?;
-        state.draining = true;
-        while state.active_readers != 0 {
+        while state.draining {
             state = self
                 .changed
                 .wait(state)
                 .map_err(|_| internal("projection_checkpoint_gate"))?;
+        }
+        state.draining = true;
+        while state.active_readers != 0 {
+            state = match self.changed.wait(state) {
+                Ok(updated) => updated,
+                Err(poisoned) => {
+                    let mut guard = poisoned.into_inner();
+                    guard.draining = false;
+                    self.changed.notify_all();
+                    return Err(internal("projection_checkpoint_gate"));
+                }
+            };
         }
         Ok(CheckpointLease {
             gate: self,
@@ -543,10 +571,52 @@ impl Database {
         }
     }
 
+    /// Evicts SQLite user-space page caches (`PRAGMA shrink_memory`) across all
+    /// pooled reader and writer connections without tearing down the connection
+    /// pool, so cold-board benchmarks read from OS/disk rather than warm SQLite
+    /// page caches while remaining comparable to PostgreSQL's persistent pool.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) fn evict_sqlite_cache(&self) {
+        if let Backend::Sqlite(sqlite) = &self.0 {
+            if let Ok(mut readers) = sqlite.readers.lock() {
+                for conn in readers.iter_mut() {
+                    let _ = conn.execute_batch("PRAGMA shrink_memory;");
+                }
+            }
+            if let Ok(writer) = sqlite.writer.lock() {
+                let _ = writer.execute_batch("PRAGMA shrink_memory;");
+            }
+        }
+    }
+
     pub(super) fn postgres_config(&self) -> Option<(PgPool, &str)> {
         match &self.0 {
             Backend::Postgres { pool, schema } => Some((pool.clone(), schema)),
             Backend::Sqlite(_) => None,
+        }
+    }
+
+    /// Refreshes PostgreSQL planner statistics on the active generation's
+    /// derived tables after a bulk cold seed so subsequent ordered keyset scans
+    /// pick B-tree indexes instead of blind bitmap scans and sorts.
+    pub(super) async fn analyze_postgres(&self) {
+        let Backend::Postgres { pool, schema } = &self.0 else {
+            return;
+        };
+        let Ok(schema) = validate_identifier(schema) else {
+            return;
+        };
+        let sql = format!(
+            "ANALYZE \"{schema}\".projected_notes, \"{schema}\".projected_folders, \
+             \"{schema}\".projected_note_links, \"{schema}\".candidate_lookup_keys, \
+             \"{schema}\".projected_view_ranks, \"{schema}\".projected_note_aliases, \
+             \"{schema}\".projected_folder_aliases, \"{schema}\".chat_note_refs"
+        );
+        if let Err(error) = sqlx::raw_sql(AssertSqlSafe(sql.as_str()))
+            .execute(pool)
+            .await
+        {
+            tracing::debug!(?error, "best-effort derived PostgreSQL ANALYZE skipped");
         }
     }
 
@@ -590,23 +660,24 @@ impl Database {
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
-                    let _ =
-                        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700));
+                    std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
+                        .map_err(|_| internal("projection_sqlite_permissions"))?;
                 }
                 #[cfg(target_os = "linux")]
                 suppress_access_times(directory);
             }
-            let mut flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+            let mut flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_NOFOLLOW;
             if create {
                 flags |= OpenFlags::SQLITE_OPEN_CREATE;
-            } else {
-                flags |= OpenFlags::SQLITE_OPEN_NOFOLLOW;
             }
             let writer = Connection::open_with_flags(&path, flags).map_err(sqlite_error)?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                    .map_err(|_| internal("projection_sqlite_permissions"))?;
             }
             writer
                 .busy_timeout(Duration::from_secs(5))
@@ -642,7 +713,10 @@ impl Database {
                 #[cfg(unix)]
                 file_id: {
                     use std::os::unix::fs::MetadataExt;
-                    let metadata = std::fs::metadata(&path).map_err(|_| invalid_row())?;
+                    let metadata = std::fs::symlink_metadata(&path).map_err(|_| invalid_row())?;
+                    if !metadata.is_file() {
+                        return Err(invalid_row());
+                    }
                     (metadata.dev(), metadata.ino())
                 },
                 #[cfg(windows)]
@@ -796,8 +870,8 @@ impl Database {
                     }
                     let (result, scrub_wal) = result?;
                     let over_limit = !scrub_wal
-                        && std::fs::metadata(&sqlite.wal)
-                            .is_ok_and(|metadata| metadata.len() > WAL_LIMIT);
+                        && std::fs::symlink_metadata(&sqlite.wal)
+                            .is_ok_and(|metadata| metadata.is_file() && metadata.len() > WAL_LIMIT);
                     if scrub_wal || over_limit {
                         // Backfill WAL frames while readers can still run so
                         // the exclusive TRUNCATE step does minimal I/O.
@@ -815,14 +889,20 @@ impl Database {
                             }
                         } else if let Ok(_checkpoint) = sqlite.checkpoint.checkpoint() {
                             match writer.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
-                                r.get::<_, i64>(0)
+                                Ok((
+                                    r.get::<_, i64>(0)?,
+                                    r.get::<_, i64>(1)?,
+                                    r.get::<_, i64>(2)?,
+                                ))
                             }) {
-                                Ok(0) => {}
-                                Ok(busy) => {
+                                Ok((0, log, checkpointed)) if log == -1 || log == checkpointed => {}
+                                Ok((busy, log, checkpointed)) => {
                                     tracing::warn!(
                                         scrub_wal,
                                         busy,
-                                        "derived SQLite TRUNCATE checkpoint busy"
+                                        log,
+                                        checkpointed,
+                                        "derived SQLite TRUNCATE checkpoint incomplete"
                                     );
                                     if scrub_wal {
                                         return Err(unknown_commit());
@@ -901,13 +981,12 @@ impl Database {
                             Ok(result)
                         }
                         Err(err) => {
-                            let clean_domain = !matches!(
-                                err,
-                                PortError::Internal(_)
-                                    | PortError::DeadlineExceeded(_)
-                                    | PortError::Cancelled(_)
-                            );
-                            if clean_domain && tx.rollback().await.is_ok() {
+                            // Server-side statement_timeout (57014 -> DeadlineExceeded) and
+                            // domain errors leave the connection healthy after ROLLBACK;
+                            // client-side timeout_at aborts this future and triggers close_on_drop.
+                            let clean_rollback =
+                                !matches!(err, PortError::Internal(_) | PortError::Cancelled(_));
+                            if clean_rollback && tx.rollback().await.is_ok() {
                                 lease.finished = true;
                             }
                             Err(err)
@@ -939,12 +1018,15 @@ impl Database {
                     if Instant::now() >= cutoff || abort_worker.load(Ordering::Acquire) {
                         return Err(deadline());
                     }
-                    let reader = sqlite
+                    let reader = match sqlite
                         .readers
                         .lock()
                         .map_err(|_| internal("projection_reader_lock"))?
                         .pop()
-                        .ok_or_else(|| internal("projection_reader_pool"))?;
+                    {
+                        Some(reader) => reader,
+                        None => open_reader(&sqlite.path)?,
+                    };
                     let mut guard = ReaderGuard {
                         sqlite,
                         reader: Some(reader),
@@ -1044,7 +1126,9 @@ where
 fn open_reader(path: &Path) -> Result<Connection, PortError> {
     let conn = Connection::open_with_flags(
         path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )
     .map_err(sqlite_error)?;
     conn.busy_timeout(Duration::from_millis(25))
@@ -1087,7 +1171,7 @@ async fn configure_postgres(
 ) -> Result<(), PortError> {
     let settings = if read {
         "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY;
-         SET LOCAL statement_timeout = '240ms';
+         SET LOCAL statement_timeout = '220ms';
          SET LOCAL idle_in_transaction_session_timeout = '240ms';
          SET LOCAL client_connection_check_interval = '10ms';"
     } else {
@@ -1197,11 +1281,33 @@ impl SqlTransaction<'_> {
         params: Vec<SqlValue>,
         kinds: &[Kind],
     ) -> Result<Vec<Vec<SqlValue>>, PortError> {
+        self.select_inner(sql, params, kinds, true).await
+    }
+
+    pub(super) async fn select_uncached(
+        &mut self,
+        sql: &str,
+        params: Vec<SqlValue>,
+        kinds: &[Kind],
+    ) -> Result<Vec<Vec<SqlValue>>, PortError> {
+        self.select_inner(sql, params, kinds, false).await
+    }
+
+    async fn select_inner(
+        &mut self,
+        sql: &str,
+        params: Vec<SqlValue>,
+        kinds: &[Kind],
+        cached: bool,
+    ) -> Result<Vec<Vec<SqlValue>>, PortError> {
         match self {
-            Self::Sqlite(conn) => sqlite_select(conn, sql, &params, kinds),
+            Self::Sqlite(conn) => sqlite_select(conn, sql, &params, kinds, cached),
             Self::Postgres(conn) => {
                 let sql = postgres_parameters(sql);
-                let query = bind_postgres(&sql, params)?;
+                let mut query = bind_postgres(&sql, params)?;
+                if !cached {
+                    query = query.persistent(false);
+                }
                 query
                     .fetch_all(&mut **conn)
                     .await
@@ -1225,6 +1331,18 @@ impl SqlTransaction<'_> {
         params: Vec<SqlValue>,
     ) -> Result<Vec<R>, PortError> {
         self.select(sql, params, &R::kinds())
+            .await?
+            .into_iter()
+            .map(R::read)
+            .collect()
+    }
+
+    pub(super) async fn records_uncached<R: SqlRecord>(
+        &mut self,
+        sql: &str,
+        params: Vec<SqlValue>,
+    ) -> Result<Vec<R>, PortError> {
+        self.select_uncached(sql, params, &R::kinds())
             .await?
             .into_iter()
             .map(R::read)
@@ -1257,18 +1375,27 @@ fn sqlite_select(
     sql: &str,
     params: &[SqlValue],
     kinds: &[Kind],
+    cached: bool,
 ) -> Result<Vec<Vec<SqlValue>>, PortError> {
-    let mut statement = conn.prepare_cached(sql).map_err(sqlite_error)?;
-    let rows = statement
-        .query_map(rusqlite::params_from_iter(params), |row| {
-            kinds
-                .iter()
-                .enumerate()
-                .map(|(i, kind)| kind.sqlite(row, i))
-                .collect::<rusqlite::Result<Vec<_>>>()
-        })
-        .map_err(sqlite_error)?;
-    rows.map(|row| row.map_err(sqlite_error)).collect()
+    let run = |statement: &mut rusqlite::Statement<'_>| -> Result<Vec<Vec<SqlValue>>, PortError> {
+        let rows = statement
+            .query_map(rusqlite::params_from_iter(params), |row| {
+                kinds
+                    .iter()
+                    .enumerate()
+                    .map(|(i, kind)| kind.sqlite(row, i))
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .map_err(sqlite_error)?;
+        rows.map(|row| row.map_err(sqlite_error)).collect()
+    };
+    if cached {
+        let mut statement = conn.prepare_cached(sql).map_err(sqlite_error)?;
+        run(&mut statement)
+    } else {
+        let mut statement = conn.prepare(sql).map_err(sqlite_error)?;
+        run(&mut statement)
+    }
 }
 
 fn postgres_parameters(sql: &str) -> String {
@@ -1276,9 +1403,26 @@ fn postgres_parameters(sql: &str) -> String {
     let mut result = String::with_capacity(sql.len() + 16);
     let mut index = 0usize;
     let mut in_single = false;
+    let mut in_double = false;
+    let mut in_line_comment = false;
+    let mut block_comment_depth = 0usize;
     let mut chars = sql.chars().peekable();
     while let Some(ch) = chars.next() {
-        if in_single {
+        if in_line_comment {
+            result.push(ch);
+            if ch == '\n' {
+                in_line_comment = false;
+            }
+        } else if block_comment_depth > 0 {
+            result.push(ch);
+            if ch == '/' && chars.peek() == Some(&'*') {
+                result.push(chars.next().expect("peeked star"));
+                block_comment_depth += 1;
+            } else if ch == '*' && chars.peek() == Some(&'/') {
+                result.push(chars.next().expect("peeked slash"));
+                block_comment_depth -= 1;
+            }
+        } else if in_single {
             result.push(ch);
             if ch == '\'' {
                 if chars.peek() == Some(&'\'') {
@@ -1287,8 +1431,28 @@ fn postgres_parameters(sql: &str) -> String {
                     in_single = false;
                 }
             }
+        } else if in_double {
+            result.push(ch);
+            if ch == '"' {
+                if chars.peek() == Some(&'"') {
+                    result.push(chars.next().expect("peeked quote"));
+                } else {
+                    in_double = false;
+                }
+            }
+        } else if ch == '-' && chars.peek() == Some(&'-') {
+            result.push(ch);
+            result.push(chars.next().expect("peeked dash"));
+            in_line_comment = true;
+        } else if ch == '/' && chars.peek() == Some(&'*') {
+            result.push(ch);
+            result.push(chars.next().expect("peeked star"));
+            block_comment_depth = 1;
         } else if ch == '\'' {
             in_single = true;
+            result.push(ch);
+        } else if ch == '"' {
+            in_double = true;
             result.push(ch);
         } else if ch == '?' {
             index += 1;

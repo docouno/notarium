@@ -28,10 +28,11 @@ mod sql;
 mod staging;
 mod write;
 
+pub(crate) use card::ListCardRow;
 pub use control::{GenerationControl, GenerationDescriptor};
 pub(crate) use erasure::{ErasureOutcome, PostgresEraser};
 pub(crate) use lookup::{LinkAddress, LinkPosition};
-pub(crate) use maintenance::{GenerationFiles, PostgresCacheOwner};
+pub(crate) use maintenance::{GenerationFiles, PostgresCacheOwner, PostgresRuntimeGuard};
 pub(crate) use read::GroupRankRange;
 pub(crate) use records::decode as decode_payload;
 pub use records::{
@@ -78,6 +79,11 @@ impl DerivedStore {
     #[cfg(test)]
     pub(crate) fn take_sqlite_read_work(&self) -> (usize, usize) {
         self.database.sqlite_read_work()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn evict_sqlite_cache_for_test(&self) {
+        self.database.evict_sqlite_cache();
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -253,6 +259,10 @@ impl DerivedStore {
 
     pub fn generation(&self) -> ProjectionGeneration {
         self.generation
+    }
+
+    pub(crate) async fn analyze_postgres(&self) {
+        self.database.analyze_postgres().await;
     }
 }
 

@@ -201,6 +201,20 @@ impl ScrubbableBoardDelta {
 }
 
 #[derive(Clone)]
+pub(super) enum BoardNoticePayload {
+    /// Externally published payload (scrubbed immediately in RAM on erasure).
+    Published(ScrubbableBoardDelta),
+    /// Computed lazily on subscriber delivery only when `Full && permit.head() == seq`,
+    /// keeping heavy board window/rank scans off the Space worker hot path.
+    Lazy {
+        descriptor: Arc<NotaDescriptor>,
+        budget: usize,
+    },
+    /// Fanout/overflow or already consumed: delivers `ResyncRequired`.
+    ResyncOnly,
+}
+
+#[derive(Clone)]
 pub(super) struct BoardNotice {
     pub(super) scope: HistoryScope,
     pub(super) seq: SpaceSeq,
@@ -208,7 +222,7 @@ pub(super) struct BoardNotice {
     pub(super) view: ViewRef,
     pub(super) source: Arc<BoardSourceFacts>,
     pub(super) affected: Arc<[AffectedCardAtCut]>,
-    pub(super) delta: Option<ScrubbableBoardDelta>,
+    pub(super) payload: BoardNoticePayload,
 }
 
 impl BoardNotice {
@@ -318,7 +332,11 @@ impl ProjectionEngine {
         Ok(Some(BoardDefinition { source, descriptor }))
     }
 
-    pub(super) async fn board_events(
+    /// Captures lightweight board source and affected-card authority facts at
+    /// the command cut without running heavy window/rank queries on the Space
+    /// worker. Full-audience subscribers compute `BoardDelta` lazily at
+    /// delivery if the cut is still current.
+    pub(super) async fn board_notices(
         &self,
         cut: &PublishedCut,
         boards: &AffectedBoards,
@@ -326,9 +344,8 @@ impl ProjectionEngine {
         let mut proof_incomplete = boards.incomplete;
         let deadline = Instant::now() + BOARD_EVENT_BUDGET;
         let seq = cut.cut.projected_seq;
-        let mut prepared = Vec::with_capacity(boards.views.len());
-        // Capture source authority before spending the remaining shared budget
-        // on aggregates. A per-view invalidation can still fit without them.
+        let fanout = boards.fanout();
+        let mut notices = Vec::with_capacity(boards.views.len());
         for (view, targets) in &boards.views {
             if Instant::now() >= deadline {
                 proof_incomplete = true;
@@ -367,51 +384,14 @@ impl ProjectionEngine {
                     }
                 }
             }
-            prepared.push((view, definition, affected));
-        }
-
-        let index = if !prepared.is_empty() && !boards.fanout() && Instant::now() < deadline {
-            Some(match self.open_index_async(cut).await {
-                Ok(index) => (|| -> Result<_, PortError> {
-                    let mut active = index.posting(&PostingKey::Active).map_err(index_error)?;
-                    active.andnot_inplace(
-                        &index
-                            .posting(&PostingKey::TrashedSubtree)
-                            .map_err(index_error)?,
-                    );
-                    Ok((index, active))
-                })(),
-                Err(error) => Err(error),
-            })
-        } else {
-            None
-        };
-        let mut items = MAX_BOARD_EVENT_ITEMS;
-        let mut notices = Vec::with_capacity(prepared.len());
-        for (view, definition, affected) in prepared {
-            let delta = if let Some(Ok((index, active))) = &index
-                && items > 0
-                && Instant::now() < deadline
-            {
-                match timeout_at(
-                    deadline,
-                    board_delta(cut, index, active, view, &definition, items - 1),
-                )
-                .await
-                {
-                    Ok(Ok(delta)) => delta,
-                    Ok(Err(error)) => {
-                        tracing::debug!(?error, "could not build board event payload");
-                        None
-                    }
-                    Err(_) => None,
-                }
+            let payload = if fanout {
+                BoardNoticePayload::ResyncOnly
             } else {
-                None
+                BoardNoticePayload::Lazy {
+                    descriptor: Arc::new(definition.descriptor),
+                    budget: MAX_BOARD_EVENT_ITEMS - 1,
+                }
             };
-            if let Some(delta) = &delta {
-                items -= delta.groups.len() + delta.ranks.len() + 1;
-            }
             notices.push(BoardNotice {
                 scope: cut.cut.scope.clone(),
                 seq,
@@ -419,12 +399,59 @@ impl ProjectionEngine {
                 view: view.clone(),
                 source: Arc::new(definition.source),
                 affected: affected.into(),
-                delta: delta.map(ScrubbableBoardDelta::new),
+                payload,
             });
         }
         BoardAssembly {
             notices,
             proof_incomplete,
+        }
+    }
+
+    /// Lazily materializes a `BoardDelta` on the subscriber task when the
+    /// advertised cut is still current.
+    pub(super) async fn compute_board_delta(
+        &self,
+        notice: &BoardNotice,
+        descriptor: &NotaDescriptor,
+        budget: usize,
+    ) -> Result<Option<BoardDelta>, PortError> {
+        let Ok(cut) = self.published_cut(&notice.scope) else {
+            return Ok(None);
+        };
+        if cut.cut.generation != notice.generation || cut.cut.projected_seq != notice.seq {
+            return Ok(None);
+        }
+        let deadline = Instant::now() + BOARD_EVENT_BUDGET;
+        let Ok(Ok(index)) = timeout_at(deadline, self.open_index_async(&cut)).await else {
+            return Ok(None);
+        };
+        let mut active = index.posting(&PostingKey::Active).map_err(index_error)?;
+        active.andnot_inplace(
+            &index
+                .posting(&PostingKey::TrashedSubtree)
+                .map_err(index_error)?,
+        );
+        match timeout_at(
+            deadline,
+            board_delta(
+                &cut,
+                &index,
+                &active,
+                &notice.view,
+                notice.source.folder(),
+                descriptor,
+                budget,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(delta)) => Ok(delta),
+            Ok(Err(error)) => {
+                tracing::debug!(?error, "could not build lazy board event payload");
+                Ok(None)
+            }
+            Err(_) => Ok(None),
         }
     }
 
@@ -484,15 +511,14 @@ async fn board_delta(
     index: &IndexView,
     active: &Bitmap,
     view: &ViewRef,
-    definition: &BoardDefinition,
+    folder: Option<&FolderId>,
+    descriptor: &NotaDescriptor,
     budget: usize,
 ) -> Result<Option<BoardDelta>, PortError> {
-    let descriptor = &definition.descriptor;
     let group_field = descriptor
         .group_by
         .as_deref()
         .ok_or_else(|| DomainError::validation(ValidationReason::InvalidView))?;
-    let folder = definition.source.folder();
     let candidates =
         query::view_source_candidates(index, &descriptor.source, folder, active.clone())?;
     let scope = &cut.cut.scope;
@@ -554,7 +580,7 @@ async fn board_ranks(
     let possible = index
         .filter_candidates(&descriptor.filter.predicate, candidates)
         .map_err(index_error)?
-        .possible;
+        .into_possible();
     if possible.is_empty() {
         return Ok(Some(Vec::new()));
     }

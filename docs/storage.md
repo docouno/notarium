@@ -230,7 +230,13 @@ rule under their writer savepoints.
   headers without traversing overflow pages.
 
 Projection readers use purpose-scoped canonical pagination and the current
-Space owner's lifecycle fence. They maintain a separate derived database and
+Space owner's lifecycle fence. PostgreSQL installations additionally maintain
+two non-portable runtime coordination tables excluded from backups
+(`projection_space_owners` for single-Space writer ownership/draining and
+`projection_cleanup_registration` for persistent derived cleanup binding). Chat
+thread reads enforce a single unified `Personal`-thread owner and
+`ChatAudience::Shared` policy across `ChatPort::read_chat`, change visibility,
+and projection backlinks. They maintain a separate derived database and
 checkpoint cache. See [structural projections](projections.md).
 
 ## Content-addressed storage and crash-safe purge

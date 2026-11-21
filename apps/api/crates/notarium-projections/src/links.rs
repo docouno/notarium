@@ -26,6 +26,7 @@ const TARGET_NAME: u32 = 0;
 const TARGET_STABLE_ID: u32 = 1;
 const TARGET_LEGACY_OR_NAME: u32 = 2;
 const ALIAS_PAGE: u16 = 64;
+const MAX_AUTHORED_ALIASES_PER_NOTE: usize = 64;
 
 pub(crate) struct LinkNote {
     pub id: NoteId,
@@ -394,9 +395,14 @@ pub(crate) fn candidate_keys(
         insert(40, GLOBAL_FOLDER, slug);
     }
     if let Some(YamlValue::Sequence(aliases)) = note.raw_fields.get("aliases") {
+        let mut added = 0usize;
         for alias in aliases {
             if let YamlValue::String(alias) = alias {
+                if added >= MAX_AUTHORED_ALIASES_PER_NOTE {
+                    break;
+                }
                 insert(AUTHORED_ALIAS, GLOBAL_FOLDER, alias);
+                added += 1;
             }
         }
     }

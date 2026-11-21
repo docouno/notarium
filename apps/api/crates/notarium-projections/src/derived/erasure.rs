@@ -1,7 +1,11 @@
-use std::{collections::BTreeSet, sync::Arc};
+use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use notarium_canonical::{CanonicalStore, ProjectionErasures};
-use notarium_core::{epoch::DataRoot, error::PortError, ids::ProjectionGeneration};
+use notarium_core::{
+    epoch::DataRoot,
+    error::{PortError, RetryAdvice},
+    ids::ProjectionGeneration,
+};
 use sqlx::PgPool;
 
 use super::{
@@ -10,7 +14,7 @@ use super::{
     not_ready, parse_generation,
     schema::{MetadataState, SCHEMA_VERSION, metadata_state},
     sql::{Database, Kind, SqlColumn, SqlTransaction, sqlite_main_present},
-    write::erase_committed,
+    write::{EraseStep, erase_committed_step},
 };
 
 /// Lives with the canonical writer. It owns connection routing and can run
@@ -53,15 +57,41 @@ impl DerivedStore {
             Some(store) if store.database.owns_sqlite_file(&path) => Arc::clone(&store.database),
             _ => Arc::new(Database::open_existing_sqlite(path).await?),
         };
-        let canonical = canonical.clone();
-        let erasures = erasures.clone();
-        db.write_adaptive((lease, maintenance), move |mut tx| {
-            Box::pin(async move {
-                let outcome = erase_generation(&mut tx, generation, &canonical, &erasures).await?;
-                Ok((outcome, true))
-            })
-        })
-        .await
+        let mut verified_guard = None;
+        for _ in 0..4 {
+            let erasures_tx = erasures.clone();
+            let lease_tx = Arc::clone(&lease);
+            let maintenance_tx = Arc::clone(&maintenance);
+            let step = db
+                .write_adaptive((lease_tx, maintenance_tx), move |mut tx| {
+                    Box::pin(async move {
+                        let outcome = erase_generation_step(
+                            &mut tx,
+                            generation,
+                            &erasures_tx,
+                            verified_guard,
+                        )
+                        .await?;
+                        let scrub = matches!(
+                            outcome,
+                            GenerationEraseStep::Outcome(ErasureOutcome::Reconciled)
+                        );
+                        Ok((outcome, scrub))
+                    })
+                })
+                .await?;
+            match step {
+                GenerationEraseStep::Outcome(outcome) => return Ok(outcome),
+                GenerationEraseStep::NeedCanonicalCheck(observed) => {
+                    if canonical.read_space(&erasures.scope.space_id).await?.scope != erasures.scope
+                    {
+                        return Err(not_ready());
+                    }
+                    verified_guard = Some(observed);
+                }
+            }
+        }
+        Err(not_ready())
     }
 
     pub(crate) fn postgres_eraser(
@@ -90,14 +120,62 @@ impl PostgresEraser {
         let mut affected = CheckpointErasures::default();
         for generation in postgres_generation_inventory(&self.pool, &self.prefix).await? {
             let schema = format!("{}_g{}", self.prefix, generation.get());
-            let erasures = erasures.clone();
-            let canonical = canonical.clone();
-            let outcome = Database::write_existing_postgres(&self.pool, &schema, move |mut tx| {
-                Box::pin(async move {
-                    erase_generation(&mut tx, generation, &canonical, &erasures).await
-                })
-            })
-            .await?;
+            let mut verified_guard = None;
+            let mut outcome = None;
+            let mut resolved = false;
+            let mut guard_checks = 0usize;
+            let mut lock_retries = 0usize;
+            while guard_checks < 4 {
+                let erasures_tx = erasures.clone();
+                let step =
+                    match Database::write_existing_postgres(&self.pool, &schema, move |mut tx| {
+                        Box::pin(async move {
+                            erase_generation_step(&mut tx, generation, &erasures_tx, verified_guard)
+                                .await
+                        })
+                    })
+                    .await
+                    {
+                        Ok(step) => step,
+                        Err(PortError::Unavailable(ref failure))
+                            if lock_retries < 8
+                                && matches!(failure.retry(), RetryAdvice::After(_)) =>
+                        {
+                            let delay = match failure.retry() {
+                                RetryAdvice::After(delay) => delay.min(Duration::from_millis(50)),
+                                _ => Duration::from_millis(20),
+                            };
+                            lock_retries += 1;
+                            tokio::time::sleep(delay).await;
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
+                match step {
+                    None => {
+                        outcome = None;
+                        resolved = true;
+                        break;
+                    }
+                    Some(GenerationEraseStep::Outcome(done)) => {
+                        outcome = Some(done);
+                        resolved = true;
+                        break;
+                    }
+                    Some(GenerationEraseStep::NeedCanonicalCheck(observed)) => {
+                        if canonical.read_space(&erasures.scope.space_id).await?.scope
+                            != erasures.scope
+                        {
+                            return Err(not_ready());
+                        }
+                        verified_guard = Some(observed);
+                        guard_checks += 1;
+                    }
+                }
+            }
+            if !resolved {
+                return Err(not_ready());
+            }
             match outcome {
                 Some(ErasureOutcome::Reconciled) => {
                     affected.reconciled.push(generation);
@@ -150,19 +228,26 @@ pub(crate) enum ErasureOutcome {
     Obsolete,
 }
 
-async fn erase_generation(
+enum GenerationEraseStep {
+    Outcome(ErasureOutcome),
+    NeedCanonicalCheck(Option<notarium_core::ids::HistoryIncarnation>),
+}
+
+async fn erase_generation_step(
     tx: &mut SqlTransaction<'_>,
     generation: ProjectionGeneration,
-    canonical: &CanonicalStore,
     erasures: &ProjectionErasures,
-) -> Result<ErasureOutcome, PortError> {
+    verified_guard: Option<Option<notarium_core::ids::HistoryIncarnation>>,
+) -> Result<GenerationEraseStep, PortError> {
     match erasure_layout(tx, generation).await? {
-        Some(SCHEMA_VERSION) => {
-            erase_committed(tx, canonical, erasures).await?;
-            Ok(ErasureOutcome::Reconciled)
-        }
-        Some(_) => Ok(ErasureOutcome::Obsolete),
-        None => Ok(ErasureOutcome::Empty),
+        Some(SCHEMA_VERSION) => match erase_committed_step(tx, erasures, verified_guard).await? {
+            EraseStep::Reconciled => Ok(GenerationEraseStep::Outcome(ErasureOutcome::Reconciled)),
+            EraseStep::NeedCanonicalCheck(observed) => {
+                Ok(GenerationEraseStep::NeedCanonicalCheck(observed))
+            }
+        },
+        Some(_) => Ok(GenerationEraseStep::Outcome(ErasureOutcome::Obsolete)),
+        None => Ok(GenerationEraseStep::Outcome(ErasureOutcome::Empty)),
     }
 }
 
@@ -191,12 +276,10 @@ async fn erasure_layout(
     if String::read(name)? != "derived_schema_meta" {
         return Err(invalid_row());
     }
-    if !tx.postgres() {
-        match metadata_state(tx, "derived_schema_meta", generation).await? {
-            MetadataState::Current => return Ok(Some(SCHEMA_VERSION)),
-            MetadataState::Empty => return Err(invalid_row()),
-            MetadataState::Obsolete => {}
-        }
+    match metadata_state(tx, "derived_schema_meta", generation).await? {
+        MetadataState::Current => return Ok(Some(SCHEMA_VERSION)),
+        MetadataState::Empty => return Err(invalid_row()),
+        MetadataState::Obsolete => {}
     }
     let rows = tx
         .select(

@@ -40,6 +40,24 @@ use crate::{
 
 const GENERATION: u64 = 1;
 
+fn find_checkpoint_file(
+    root: &DataRoot,
+    generation: ProjectionGeneration,
+    space: &SpaceId,
+    seq: SpaceSeq,
+) -> Option<PathBuf> {
+    let dir = root.space_fast_index_dir(generation, space);
+    let prefix = format!("fast_index_{}", seq.get());
+    std::fs::read_dir(dir).ok()?.flatten().find_map(|entry| {
+        let name = entry.file_name();
+        let name = name.to_str()?;
+        let rest = name.strip_prefix(&prefix)?;
+        let matches = rest == ".mmap"
+            || (rest.starts_with('_') && rest.ends_with(".mmap") && rest.len() == 1 + 32 + 5);
+        matches.then(|| entry.path())
+    })
+}
+
 struct Scratch(PathBuf);
 
 impl Scratch {
@@ -200,12 +218,14 @@ async fn cluster_lens_survives_forced_compaction_and_generation_rotation() {
     let scope = ctx.scope();
     let generation = ProjectionGeneration::new(GENERATION).unwrap();
     let derived = DerivedStore::open_sqlite(&root, generation).await.unwrap();
-    let [a, b, c, d] = [1, 2, 3, 4].map(|value| NoteId::from_bytes([value; 16]));
+    let [a, b, c, d, f, g] = [1, 2, 3, 4, 6, 7].map(|value| NoteId::from_bytes([value; 16]));
     create_with_id(&canonical, &ctx, b.clone(), "b", format!("[[{c}]]")).await;
     create_with_id(&canonical, &ctx, c.clone(), "c", "C".into()).await;
-    let isolated = create_with_id(&canonical, &ctx, d.clone(), "d", "D".into()).await;
+    create_with_id(&canonical, &ctx, d.clone(), "d", format!("[[{f}]]")).await;
+    create_with_id(&canonical, &ctx, f.clone(), "f", "F".into()).await;
+    let isolated = create_with_id(&canonical, &ctx, g.clone(), "g", "G".into()).await;
     let stop = Cancellation::default();
-    let (stable, isolated_id, latest) = {
+    let (stable, second_cluster, latest) = {
         let runtime = start(&canonical, &derived, &root).await;
         let engine = runtime.engine();
         engine
@@ -217,8 +237,14 @@ async fn cluster_lens_survives_forced_compaction_and_generation_rotation() {
         let cluster = |id: &NoteId| index.cluster(index.dense_id(id).unwrap()).unwrap();
         let stable = cluster(&b);
         assert_eq!(cluster(&c), stable);
-        let isolated_id = cluster(&d);
-        assert_ne!(isolated_id, stable);
+        let second_cluster = cluster(&d);
+        assert_eq!(cluster(&f), second_cluster);
+        assert_ne!(second_cluster, stable);
+        assert_eq!(
+            index.cluster(index.dense_id(&g).unwrap()),
+            None,
+            "isolated degree-0 notes must remain unclustered"
+        );
         runtime.shutdown().await.unwrap();
 
         // Install the adjacency first, then settle at the same sequence. Only
@@ -252,7 +278,7 @@ async fn cluster_lens_survives_forced_compaction_and_generation_rotation() {
         // ordinary command must discard that delta and checkpoint immediately.
         let delta = &mut Arc::get_mut(&mut settled).unwrap().delta;
         Arc::make_mut(delta).replace_adjacency(
-            index.dense_id(&d).unwrap(),
+            index.dense_id(&g).unwrap(),
             Some(Vec::with_capacity(
                 crate::index::L0_BYTE_LIMIT / size_of::<u32>(),
             )),
@@ -274,7 +300,7 @@ async fn cluster_lens_survives_forced_compaction_and_generation_rotation() {
             engine.open_index(&forced.cut).unwrap().cluster(a_dense),
             Some(stable.clone())
         );
-        (stable, isolated_id, r)
+        (stable, second_cluster, r)
     };
 
     // The candidate seeds in NoteId order, so A is now the first dense slot.
@@ -292,8 +318,11 @@ async fn cluster_lens_survives_forced_compaction_and_generation_rotation() {
         .wait_for_projected(scope, latest, &budget())
         .await
         .unwrap();
-    let lenses = [(stable, vec![a, b, c]), (isolated_id, vec![d])];
+    let lenses = [(stable, vec![a, b, c]), (second_cluster, vec![d, f])];
     let check_lenses = async |engine: &super::ProjectionEngine| {
+        let cut = engine.published_cut(scope).unwrap();
+        let index = engine.open_index(&cut).unwrap();
+        assert_eq!(index.cluster(index.dense_id(&g).unwrap()), None);
         for (id, expected) in &lenses {
             let result = engine
                 .query_graph(
@@ -370,7 +399,6 @@ async fn exercise(
     let first = create(canonical, &ctx, "first", "# First\n".into()).await;
     let p = first.receipt.seq();
     let generation = derived.generation();
-    let path_p = root.space_fast_index(generation, &scope.space_id, p);
 
     let original = start(canonical, derived, root).await;
     let engine = original.engine();
@@ -385,6 +413,7 @@ async fn exercise(
     assert!(retained.lookup(&first.value.note).is_some());
     let published = engine.published_cut(scope).unwrap();
     assert_eq!(published.watermark.snapshot_seq, p);
+    let path_p = published.base.path().to_owned();
     original.shutdown().await.unwrap();
 
     // Commit the usual command and drive the production apply path after the
@@ -443,6 +472,7 @@ async fn exercise(
                 format_version: u32::from(FORMAT_VERSION),
                 platform_abi: trust.abi,
                 publication_id: cache.clone(),
+                file_nonce: String::new(),
                 size_bytes: trust.size,
                 digest: ContentDigest::from_bytes(trust.digest),
                 graph_seq: q,
@@ -492,6 +522,9 @@ async fn exercise(
         .unwrap();
     assert_ne!(registered.digest.as_bytes(), &wrong_digest);
     assert_eq!(registered.graph_seq, q);
+    assert!(!registered.file_nonce.is_empty());
+    let published_q =
+        engine.checkpoint_path(generation, &scope.space_id, q, &registered.file_nonce);
     assert_eq!(
         canonical
             .read_space(&scope.space_id)
@@ -519,11 +552,16 @@ async fn exercise(
     let crash_image =
         matches!(orphan, Orphan::Unregistered).then(|| std::fs::read(&path_p).unwrap());
     drop(retained);
-    assert!(
-        !path_p.exists(),
-        "the last old runtime lease must reclaim P"
-    );
-    assert!(path_q.is_file());
+    // Lazy drop offloads nonce-named retired unlink onto spawn_blocking; wait briefly.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while path_p.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the last old runtime lease must reclaim P");
+    assert!(!path_q.exists(), "orphan file at Q must be swept");
+    assert!(published_q.is_file());
     drop(snapshot);
     restarted.shutdown().await.unwrap();
     drop(engine);
@@ -532,8 +570,11 @@ async fn exercise(
         // Model a process exiting after durable Q while a reader still held P.
         // Restore that exact writer image without any surviving file leases.
         std::fs::write(&path_p, &bytes).unwrap();
-        std::fs::set_permissions(&path_p, std::fs::metadata(&path_q).unwrap().permissions())
-            .unwrap();
+        std::fs::set_permissions(
+            &path_p,
+            std::fs::metadata(&published_q).unwrap().permissions(),
+        )
+        .unwrap();
         let neighbor = owner(canonical).await;
         let survivor = create(canonical, &neighbor, "neighbor", "# Neighbor".into()).await;
         let runtime = start(canonical, derived, root).await;
@@ -543,7 +584,7 @@ async fn exercise(
             .await
             .unwrap();
         assert!(!path_p.exists(), "restart must reclaim the unleased P");
-        assert!(path_q.is_file());
+        assert!(published_q.is_file());
         engine
             .wait_for_projected(neighbor.scope(), survivor.receipt.seq(), &budget())
             .await
@@ -632,16 +673,17 @@ async fn exercise_purge_publication(
         scope: scope.clone(),
         seq: q,
     };
-    let path = root.space_fast_index(generation, &scope.space_id, q);
 
     // A completed native publication has no SQL writer row yet. Keep the
     // producing lease alive across a real canonical Purge.
     let prepared = FastIndexBuilder::default()
         .prepare(identity.clone())
         .unwrap();
-    let (pending, _) = apply::publish_checkpoint_file(&engine, store, prepared)
+    let (pending, _, nonce) = apply::publish_checkpoint_file(&engine, store, prepared)
         .await
         .unwrap();
+    assert!(!nonce.is_empty());
+    let path = pending.path().to_owned();
     assert!(path.is_file());
     assert!(pending.open(&engine.pool).is_err());
     assert!(
@@ -757,6 +799,7 @@ async fn exercise_purge_publication(
             if diagnostic.reason == ValidationReason::CursorStale)
     );
     assert!(!path.exists());
+    assert!(find_checkpoint_file(root, generation, &scope.space_id, q).is_none());
 }
 
 #[tokio::test]

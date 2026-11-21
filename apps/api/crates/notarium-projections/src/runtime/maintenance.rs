@@ -32,7 +32,7 @@ pub(super) enum Source {
     Postgres {
         pool: PgPool,
         schema_prefix: String,
-        expected_cache_id: String,
+        expected_cache_id: Option<String>,
     },
 }
 
@@ -252,7 +252,17 @@ pub(super) async fn recover_generation(
                     .list_spaces(&engine.projection_context)
                     .await?;
                 if rotation::fingerprint(&current)? == next.cut_fingerprint {
-                    rotation::commit_rotation(engine, coordinator, old, &next, stop).await??;
+                    let commit_remaining = budget.remaining.saturating_sub(started.elapsed());
+                    rotation::commit_rotation(
+                        engine,
+                        coordinator,
+                        old,
+                        &next,
+                        budget,
+                        commit_remaining,
+                        stop,
+                    )
+                    .await??;
                     return Ok(next);
                 }
             }
@@ -348,27 +358,40 @@ async fn collect(engine: &ProjectionEngine) -> Result<bool, PortError> {
     );
     let mut pending = false;
     for generation in disposable {
-        if !engine.control.generation_reclaimable(generation).await? {
-            pending = true;
-            continue;
+        let step: Result<bool, PortError> = async {
+            if !engine.control.generation_reclaimable(generation).await? {
+                return Ok(true);
+            }
+            let Some(lease) =
+                GenerationFiles::for_reclamation(&engine.cache_root, generation).await?
+            else {
+                return Ok(true);
+            };
+            engine.pool.evict_generation(generation);
+            if !active.store.reclaim_postgres_schema(generation).await? {
+                return Ok(true);
+            }
+            GenerationFiles::remove(
+                &engine.cache_root,
+                generation,
+                engine.control.is_postgres(),
+                lease,
+            )
+            .await?;
+            Ok(false)
         }
-        let Some(lease) = GenerationFiles::for_reclamation(&engine.cache_root, generation).await?
-        else {
-            pending = true;
-            continue;
-        };
-        engine.pool.evict_generation(generation);
-        if !active.store.reclaim_postgres_schema(generation).await? {
-            pending = true;
-            continue;
+        .await;
+        match step {
+            Ok(still_pending) => pending |= still_pending,
+            Err(error) => {
+                tracing::warn!(
+                    generation = generation.get(),
+                    error = error.code(),
+                    "projection generation cleanup deferred"
+                );
+                pending = true;
+            }
         }
-        GenerationFiles::remove(
-            &engine.cache_root,
-            generation,
-            engine.control.is_postgres(),
-            lease,
-        )
-        .await?;
     }
     Ok(pending)
 }

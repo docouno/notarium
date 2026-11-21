@@ -51,6 +51,10 @@ pub(super) fn page_bytes(
         let n = &row.note;
         bytes += size_of::<ExactRow>()
             + 512
+            + row.location.dense.capacity() * size_of::<u32>()
+            + row.location.ids.capacity() * size_of::<notarium_core::ids::FolderId>()
+            + row.location.display_path.capacity()
+            + row.location.norm_path.capacity()
             + n.tags_msgpack.capacity()
             + n.view_blocks_msgpack.capacity()
             + n.raw_fields_msgpack.capacity()

@@ -2,11 +2,11 @@
 use crate::{
     CanonicalStore, ProjectionRedactedEntry,
     changes::list_thread_keys_at_or_below_cutoff_tx,
-    codec::{RevisionMetadataPayload, internal_not_committed},
+    codec::{RevisionMetadataEnvelope, RevisionMetadataPayload, internal_not_committed},
     projection_read::ProjectionPage,
     runtime::{
-        is_note_purge_fenced_tx, pg_read_error, read_immutable_revision_tx,
-        validate_snapshot_cutoff_tx,
+        is_note_purge_fenced_tx, pg_read_error, purge_fenced_note_ids_tx,
+        read_immutable_revision_tx, validate_snapshot_cutoff_tx,
     },
     sql_exec::BackendConn,
 };
@@ -20,7 +20,7 @@ use notarium_core::{
     ports::{ChatThread, MaintenanceContext, PageLimit},
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 const REF_INSERT_CHUNK: usize = 100;
 
@@ -81,7 +81,7 @@ pub struct ProjectionChatHead {
     pub title: String,
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct ProjectionChatEntryKey {
     pub thread: ChatThreadId,
     pub seq: ThreadEntrySeq,
@@ -212,15 +212,44 @@ impl CanonicalStore {
                     i64::from(limit.get()),
                 )
                 .await?;
+                let mut map = read_heads_batch(tx, &scope, cutoff, &keys).await?;
                 let mut heads = Vec::with_capacity(keys.len());
                 for key in keys {
-                    heads.push(
-                        read_head(tx, &scope, cutoff, &key)
-                            .await?
-                            .ok_or_else(stale)?,
-                    );
+                    heads.push(map.remove(&key).ok_or_else(stale)?);
                 }
                 Ok(heads)
+            })
+        })
+        .await
+    }
+
+    /// Reads a batch of chat thread heads in a single canonical read transaction.
+    pub async fn read_projection_chat_heads(
+        &self,
+        ctx: &MaintenanceContext,
+        scope: &HistoryScope,
+        cutoff: Option<SpaceSeq>,
+        threads: &[ChatThreadId],
+    ) -> Result<BTreeMap<ChatThreadId, ProjectionChatHead>, PortError> {
+        if threads.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let scope = scope.clone();
+        let keys: Vec<String> = threads
+            .iter()
+            .map(|id| id.as_str().to_owned())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        self.with_projection_read(ctx, move |tx| {
+            Box::pin(async move {
+                let cutoff = validate_snapshot_cutoff_tx(tx, &scope, cutoff).await?;
+                let map = read_heads_batch(tx, &scope, cutoff, &keys).await?;
+                let mut out = BTreeMap::new();
+                for (_, head) in map {
+                    out.insert(head.thread.id.clone(), head);
+                }
+                Ok(out)
             })
         })
         .await
@@ -478,6 +507,129 @@ impl CanonicalStore {
         .await
     }
 
+    /// Batched equivalent of `verify_projection_chat_ref` for backlink verification.
+    /// Returns a vector of booleans aligned 1-to-1 with `references`.
+    pub async fn verify_projection_chat_refs(
+        &self,
+        ctx: &MaintenanceContext,
+        references: &[ProjectionChatRef],
+    ) -> Result<Vec<bool>, PortError> {
+        if references.is_empty() {
+            return Ok(Vec::new());
+        }
+        let references = references.to_vec();
+        self.with_projection_read(ctx, move |tx| {
+            Box::pin(async move {
+                let mut results = vec![false; references.len()];
+                let mut all_spaces = BTreeSet::new();
+                for reference in &references {
+                    all_spaces.insert(reference.locator.source.space_id.clone());
+                    all_spaces.insert(reference.target.space_id.clone());
+                }
+                let space_vec: Vec<SpaceId> = all_spaces.into_iter().collect();
+                let scopes = target_scopes_batch(tx, &space_vec).await?;
+
+                // Group candidate targets for batched purge-fence checks.
+                let mut target_notes_by_space: BTreeMap<SpaceId, BTreeSet<NoteId>> =
+                    BTreeMap::new();
+                let mut scope_ok_indices = Vec::with_capacity(references.len());
+                for (idx, reference) in references.iter().enumerate() {
+                    if reference.target.space_id != reference.target_scope.space_id {
+                        continue;
+                    }
+                    if scopes.get(&reference.locator.source.space_id)
+                        != Some(&reference.locator.source)
+                    {
+                        continue;
+                    }
+                    if scopes.get(&reference.target.space_id) != Some(&reference.target_scope) {
+                        continue;
+                    }
+                    target_notes_by_space
+                        .entry(reference.target.space_id.clone())
+                        .or_default()
+                        .insert(reference.target.note_id.clone());
+                    scope_ok_indices.push(idx);
+                }
+                let mut fenced_by_space: HashMap<SpaceId, HashSet<NoteId>> = HashMap::new();
+                for (space_id, notes) in target_notes_by_space {
+                    let note_vec: Vec<NoteId> = notes.into_iter().collect();
+                    let fenced = purge_fenced_note_ids_tx(tx, &space_id, &note_vec).await?;
+                    fenced_by_space.insert(space_id, fenced);
+                }
+
+                // Group entry lookups by source Space.
+                let mut entries_by_space: BTreeMap<SpaceId, BTreeSet<ProjectionChatEntryKey>> =
+                    BTreeMap::new();
+                let mut live_indices = Vec::with_capacity(scope_ok_indices.len());
+                for idx in scope_ok_indices {
+                    let reference = &references[idx];
+                    if fenced_by_space
+                        .get(&reference.target.space_id)
+                        .is_some_and(|set| set.contains(&reference.target.note_id))
+                    {
+                        continue;
+                    }
+                    entries_by_space
+                        .entry(reference.locator.source.space_id.clone())
+                        .or_default()
+                        .insert(reference.locator.entry.clone());
+                    live_indices.push(idx);
+                }
+                let mut entry_heads: HashMap<(SpaceId, ProjectionChatEntryKey), EntryHead> =
+                    HashMap::new();
+                for (space_id, entries) in entries_by_space {
+                    let entry_vec: Vec<ProjectionChatEntryKey> = entries.into_iter().collect();
+                    let batch = exact_entries_batch(tx, &space_id, &entry_vec).await?;
+                    for (key, head) in batch {
+                        entry_heads.insert((space_id.clone(), key), head);
+                    }
+                }
+
+                // Batch verify exact chat_entry_note_refs rows per source Space.
+                type RefCheckTuple = (String, i64, i64, String, String, i64);
+                let mut checks_by_space: BTreeMap<SpaceId, Vec<(usize, RefCheckTuple)>> =
+                    BTreeMap::new();
+                for idx in live_indices {
+                    let reference = &references[idx];
+                    let Some(head) = entry_heads.get(&(
+                        reference.locator.source.space_id.clone(),
+                        reference.locator.entry.clone(),
+                    )) else {
+                        continue;
+                    };
+                    if head.revision != reference.locator.revision || !head.current_visible() {
+                        continue;
+                    }
+                    checks_by_space
+                        .entry(reference.locator.source.space_id.clone())
+                        .or_default()
+                        .push((
+                            idx,
+                            (
+                                reference.locator.entry.thread.as_str().to_owned(),
+                                reference.locator.entry.seq.get() as i64,
+                                i64::from(reference.locator.ref_ordinal),
+                                reference.target.space_id.as_str().to_owned(),
+                                reference.target.note_id.as_str().to_owned(),
+                                head.created_seq.get() as i64,
+                            ),
+                        ));
+                }
+                for (space_id, checks) in checks_by_space {
+                    let found = existing_chat_refs_batch(tx, &space_id, &checks).await?;
+                    for (idx, key) in checks {
+                        if found.contains(&key) {
+                            results[idx] = true;
+                        }
+                    }
+                }
+                Ok(results)
+            })
+        })
+        .await
+    }
+
     /// Rechecks the exact stored occurrence before granting a backlink.
     pub async fn verify_projection_chat_ref(
         &self,
@@ -530,6 +682,93 @@ impl CanonicalStore {
         })
         .await
     }
+}
+
+pub(crate) async fn read_heads_batch(
+    tx: &mut BackendConn<'_>,
+    scope: &HistoryScope,
+    cutoff: SpaceSeq,
+    keys: &[String],
+) -> Result<HashMap<String, ProjectionChatHead>, PortError> {
+    if keys.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let space = scope.space_id.as_str();
+    let incarnation = scope.incarnation.as_bytes().as_slice();
+    let cut = cutoff.get() as i64;
+    let rows: Vec<(String, String, Vec<u8>)> = match tx {
+        BackendConn::Postgres(conn) => {
+            let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+            sqlx::query_as(
+                "SELECT DISTINCT ON (entity_key) entity_key, rev_id, metadata_msgpack
+                 FROM revisions
+                 WHERE space_id = $1 AND history_incarnation = $2 AND entity_type = 'thread'
+                   AND entity_key = ANY($3) AND visibility_seq <= $4
+                 ORDER BY entity_key, visibility_seq DESC, space_seq DESC",
+            )
+            .bind(space)
+            .bind(incarnation)
+            .bind(&key_refs)
+            .bind(cut)
+            .fetch_all(&mut **conn)
+            .await
+            .map_err(pg_chat_read_error)?
+        }
+        BackendConn::Sqlite(conn) => {
+            let mut acc = Vec::with_capacity(keys.len());
+            for chunk in keys.chunks(200) {
+                let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+                    "SELECT entity_key, rev_id, metadata_msgpack FROM (
+                        SELECT entity_key, rev_id, metadata_msgpack,
+                               ROW_NUMBER() OVER (PARTITION BY entity_key ORDER BY visibility_seq DESC, space_seq DESC) AS rn
+                        FROM revisions
+                        WHERE space_id = ",
+                );
+                qb.push_bind(space)
+                    .push(" AND history_incarnation = ")
+                    .push_bind(incarnation)
+                    .push(" AND entity_type = 'thread' AND entity_key IN (");
+                let mut sep = qb.separated(", ");
+                for key in chunk {
+                    sep.push_bind(key.as_str());
+                }
+                sep.push_unseparated(") AND visibility_seq <= ");
+                qb.push_bind(cut).push(") WHERE rn = 1");
+                let part: Vec<(String, String, Vec<u8>)> = qb
+                    .build_query_as()
+                    .fetch_all(&mut **conn)
+                    .await
+                    .map_err(sqlite_read_error)?;
+                acc.extend(part);
+            }
+            acc
+        }
+    };
+    let mut out = HashMap::with_capacity(rows.len());
+    for (entity_key, rev_id, meta_bytes) in rows {
+        let RevisionMetadataPayload::Thread(meta) =
+            RevisionMetadataEnvelope::decode(&meta_bytes)?.payload
+        else {
+            return Err(corrupt("non-thread payload in a thread revision"));
+        };
+        out.insert(
+            entity_key,
+            ProjectionChatHead {
+                thread: ChatThread {
+                    id: meta.thread_id,
+                    space: scope.space_id.clone(),
+                    kind: meta.kind,
+                    owner: meta.owner_id,
+                    project_folder: meta.project_folder_id,
+                    head: meta.head_leaf_seq,
+                    revision: RevisionId::parse(&rev_id)?,
+                    tainted: meta.tainted,
+                },
+                title: meta.title,
+            },
+        );
+    }
+    Ok(out)
 }
 
 pub(crate) async fn read_head(
@@ -770,31 +1009,53 @@ async fn read_page(
             ref_ordinal: *ord,
         });
 
-    let mut scopes = BTreeMap::<SpaceId, Option<HistoryScope>>::new();
-    scopes.insert(
-        position.scope.space_id.clone(),
-        Some(position.scope.clone()),
-    );
+    let mut scopes = BTreeMap::<SpaceId, HistoryScope>::new();
+    scopes.insert(position.scope.space_id.clone(), position.scope.clone());
     if let RefSelection::Target(target) = &position.selection {
-        scopes.insert(target.space_id.clone(), Some(target.clone()));
+        scopes.insert(target.space_id.clone(), target.clone());
     }
 
-    let mut refs = Vec::with_capacity(rows.len());
+    let mut parsed_rows = Vec::with_capacity(rows.len());
+    let mut missing_spaces = BTreeSet::new();
+    let mut notes_by_space: BTreeMap<SpaceId, BTreeSet<NoteId>> = BTreeMap::new();
     for (thread, seq, ord, target_space_raw, target_note_raw, _, revision) in rows {
         let Some(revision) = revision else { continue };
         let target_space_id = SpaceId::parse(&target_space_raw)?;
         let target_note_id = NoteId::parse(&target_note_raw)?;
-        let resolved_scope = if let Some(cached) = scopes.get(&target_space_id) {
-            cached.clone()
-        } else {
-            let loaded = target_scope(tx, &target_space_id).await?;
-            scopes.insert(target_space_id.clone(), loaded.clone());
-            loaded
-        };
-        let Some(resolved_scope) = resolved_scope else {
+        if !scopes.contains_key(&target_space_id) {
+            missing_spaces.insert(target_space_id.clone());
+        }
+        notes_by_space
+            .entry(target_space_id.clone())
+            .or_default()
+            .insert(target_note_id.clone());
+        parsed_rows.push((thread, seq, ord, target_space_id, target_note_id, revision));
+    }
+
+    if !missing_spaces.is_empty() {
+        let missing_vec: Vec<SpaceId> = missing_spaces.into_iter().collect();
+        let loaded = target_scopes_batch(tx, &missing_vec).await?;
+        scopes.extend(loaded);
+    }
+    let mut fenced_by_space: HashMap<SpaceId, HashSet<NoteId>> = HashMap::new();
+    for (space_id, notes) in notes_by_space {
+        if !scopes.contains_key(&space_id) {
+            continue;
+        }
+        let note_vec: Vec<NoteId> = notes.into_iter().collect();
+        let fenced = purge_fenced_note_ids_tx(tx, &space_id, &note_vec).await?;
+        fenced_by_space.insert(space_id, fenced);
+    }
+
+    let mut refs = Vec::with_capacity(parsed_rows.len());
+    for (thread, seq, ord, target_space_id, target_note_id, revision) in parsed_rows {
+        let Some(resolved_scope) = scopes.get(&target_space_id).cloned() else {
             continue;
         };
-        if is_note_purge_fenced_tx(tx, &target_space_id, target_note_id.as_str()).await? {
+        if fenced_by_space
+            .get(&target_space_id)
+            .is_some_and(|set| set.contains(&target_note_id))
+        {
             continue;
         }
         let ref_ordinal =
@@ -919,6 +1180,230 @@ async fn redacted_after(
         space.as_str(),
         cutoff.get() as i64
     ))
+}
+
+async fn target_scopes_batch(
+    tx: &mut BackendConn<'_>,
+    spaces: &[SpaceId],
+) -> Result<BTreeMap<SpaceId, HistoryScope>, PortError> {
+    let mut out = BTreeMap::new();
+    if spaces.is_empty() {
+        return Ok(out);
+    }
+    let rows: Vec<(String, Vec<u8>)> = match tx {
+        BackendConn::Postgres(conn) => {
+            let ids: Vec<&str> = spaces.iter().map(SpaceId::as_str).collect();
+            sqlx::query_as(
+                "SELECT space_id, history_incarnation FROM spaces WHERE space_id = ANY($1)",
+            )
+            .bind(&ids)
+            .fetch_all(&mut **conn)
+            .await
+            .map_err(pg_chat_read_error)?
+        }
+        BackendConn::Sqlite(conn) => {
+            let mut acc = Vec::with_capacity(spaces.len());
+            for chunk in spaces.chunks(200) {
+                let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+                    "SELECT space_id, history_incarnation FROM spaces WHERE space_id IN (",
+                );
+                let mut sep = qb.separated(", ");
+                for space in chunk {
+                    sep.push_bind(space.as_str());
+                }
+                sep.push_unseparated(")");
+                let part: Vec<(String, Vec<u8>)> = qb
+                    .build_query_as()
+                    .fetch_all(&mut **conn)
+                    .await
+                    .map_err(sqlite_read_error)?;
+                acc.extend(part);
+            }
+            acc
+        }
+    };
+    for (id_raw, bytes) in rows {
+        let space_id = SpaceId::parse(&id_raw)?;
+        let raw: [u8; 16] = bytes
+            .try_into()
+            .map_err(|_| corrupt("invalid target Space incarnation"))?;
+        out.insert(
+            space_id.clone(),
+            HistoryScope {
+                space_id,
+                incarnation: HistoryIncarnation::from_bytes(raw),
+            },
+        );
+    }
+    Ok(out)
+}
+
+async fn exact_entries_batch(
+    tx: &mut BackendConn<'_>,
+    space: &SpaceId,
+    keys: &[ProjectionChatEntryKey],
+) -> Result<HashMap<ProjectionChatEntryKey, EntryHead>, PortError> {
+    let mut out = HashMap::new();
+    if keys.is_empty() {
+        return Ok(out);
+    }
+    type EntryRow = (String, i64, String, i64, Option<i64>, String, i64);
+    let rows: Vec<EntryRow> = match tx {
+        BackendConn::Postgres(conn) => {
+            let threads: Vec<&str> = keys.iter().map(|k| k.thread.as_str()).collect();
+            let seqs: Vec<i64> = keys.iter().map(|k| k.seq.get() as i64).collect();
+            sqlx::query_as(
+                "SELECT e.thread_id, e.entry_seq, e.revision_id, e.created_space_seq,
+                        e.redacted_at_seq, e.kind, CAST(e.checkpoint_stale AS BIGINT)
+                 FROM UNNEST($2::text[], $3::bigint[]) AS k(t, s)
+                 JOIN chat_entries e
+                   ON e.space_id = $1 AND e.thread_id = k.t AND e.entry_seq = k.s",
+            )
+            .bind(space.as_str())
+            .bind(&threads)
+            .bind(&seqs)
+            .fetch_all(&mut **conn)
+            .await
+            .map_err(pg_chat_read_error)?
+        }
+        BackendConn::Sqlite(conn) => {
+            let mut acc = Vec::with_capacity(keys.len());
+            for chunk in keys.chunks(150) {
+                let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new("WITH keys(t, s) AS (VALUES ");
+                let mut sep = qb.separated(", ");
+                for k in chunk {
+                    sep.push("(");
+                    sep.push_bind_unseparated(k.thread.as_str());
+                    sep.push_unseparated(", ");
+                    sep.push_bind_unseparated(k.seq.get() as i64);
+                    sep.push_unseparated(")");
+                }
+                qb.push(
+                    ") SELECT e.thread_id, e.entry_seq, e.revision_id, e.created_space_seq,
+                             e.redacted_at_seq, e.kind, CAST(e.checkpoint_stale AS BIGINT)
+                      FROM keys
+                      JOIN chat_entries e INDEXED BY idx_chat_entries_projection
+                        ON e.space_id = ",
+                );
+                qb.push_bind(space.as_str())
+                    .push(" AND e.thread_id = keys.t AND e.entry_seq = keys.s");
+                let part: Vec<EntryRow> = qb
+                    .build_query_as()
+                    .fetch_all(&mut **conn)
+                    .await
+                    .map_err(sqlite_read_error)?;
+                acc.extend(part);
+            }
+            acc
+        }
+    };
+    for (thread, seq, revision, created, redacted, kind, stale_flag) in rows {
+        let key = ProjectionChatEntryKey {
+            thread: ChatThreadId::parse(&thread)?,
+            seq: ThreadEntrySeq::new(stored_sequence(seq)?)?,
+        };
+        out.insert(
+            key,
+            EntryHead {
+                revision: RevisionId::parse(&revision)?,
+                created_seq: SpaceSeq::new(stored_sequence(created)?)?,
+                redacted_at_seq: redacted
+                    .map(|value| Ok::<_, PortError>(SpaceSeq::new(stored_sequence(value)?)?))
+                    .transpose()?,
+                kind,
+                checkpoint_stale: stale_flag != 0,
+            },
+        );
+    }
+    Ok(out)
+}
+
+type ChatRefRow = (String, i64, i64, String, String, i64);
+
+async fn existing_chat_refs_batch(
+    tx: &mut BackendConn<'_>,
+    space: &SpaceId,
+    checks: &[(usize, ChatRefRow)],
+) -> Result<HashSet<ChatRefRow>, PortError> {
+    let mut out = HashSet::new();
+    if checks.is_empty() {
+        return Ok(out);
+    }
+    let rows: Vec<ChatRefRow> = match tx {
+        BackendConn::Postgres(conn) => {
+            let threads: Vec<&str> = checks.iter().map(|(_, c)| c.0.as_str()).collect();
+            let seqs: Vec<i64> = checks.iter().map(|(_, c)| c.1).collect();
+            let ords: Vec<i64> = checks.iter().map(|(_, c)| c.2).collect();
+            let target_spaces: Vec<&str> = checks.iter().map(|(_, c)| c.3.as_str()).collect();
+            let target_notes: Vec<&str> = checks.iter().map(|(_, c)| c.4.as_str()).collect();
+            let created_seqs: Vec<i64> = checks.iter().map(|(_, c)| c.5).collect();
+            sqlx::query_as(
+                "SELECT r.thread_id, r.entry_seq, r.ref_ordinal,
+                        r.target_space_id, r.target_note_id, r.created_space_seq
+                 FROM UNNEST($2::text[], $3::bigint[], $4::bigint[], $5::text[], $6::text[], $7::bigint[])
+                      AS k(t, s, o, ts, tn, cs)
+                 JOIN chat_entry_note_refs r
+                   ON r.space_id = $1 AND r.thread_id = k.t AND r.entry_seq = k.s
+                  AND r.ref_ordinal = k.o AND r.target_space_id = k.ts
+                  AND r.target_note_id = k.tn AND r.created_space_seq = k.cs",
+            )
+            .bind(space.as_str())
+            .bind(&threads)
+            .bind(&seqs)
+            .bind(&ords)
+            .bind(&target_spaces)
+            .bind(&target_notes)
+            .bind(&created_seqs)
+            .fetch_all(&mut **conn)
+            .await
+            .map_err(pg_chat_read_error)?
+        }
+        BackendConn::Sqlite(conn) => {
+            let mut acc = Vec::with_capacity(checks.len());
+            for chunk in checks.chunks(100) {
+                let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+                    "WITH keys(t, s, o, ts, tn, cs) AS (VALUES ",
+                );
+                let mut sep = qb.separated(", ");
+                for (_, c) in chunk {
+                    sep.push("(");
+                    sep.push_bind_unseparated(c.0.as_str());
+                    sep.push_unseparated(", ");
+                    sep.push_bind_unseparated(c.1);
+                    sep.push_unseparated(", ");
+                    sep.push_bind_unseparated(c.2);
+                    sep.push_unseparated(", ");
+                    sep.push_bind_unseparated(c.3.as_str());
+                    sep.push_unseparated(", ");
+                    sep.push_bind_unseparated(c.4.as_str());
+                    sep.push_unseparated(", ");
+                    sep.push_bind_unseparated(c.5);
+                    sep.push_unseparated(")");
+                }
+                qb.push(
+                    ") SELECT r.thread_id, r.entry_seq, r.ref_ordinal,
+                             r.target_space_id, r.target_note_id, r.created_space_seq
+                      FROM keys
+                      JOIN chat_entry_note_refs r
+                        ON r.space_id = ",
+                );
+                qb.push_bind(space.as_str()).push(
+                    " AND r.thread_id = keys.t AND r.entry_seq = keys.s
+                      AND r.ref_ordinal = keys.o AND r.target_space_id = keys.ts
+                      AND r.target_note_id = keys.tn AND r.created_space_seq = keys.cs",
+                );
+                let part: Vec<ChatRefRow> = qb
+                    .build_query_as()
+                    .fetch_all(&mut **conn)
+                    .await
+                    .map_err(sqlite_read_error)?;
+                acc.extend(part);
+            }
+            acc
+        }
+    };
+    out.extend(rows);
+    Ok(out)
 }
 
 async fn target_scope(

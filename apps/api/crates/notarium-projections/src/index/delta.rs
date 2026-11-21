@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, sync::Arc, time::Instant};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+    time::Instant,
+};
 
 use croaring::{Bitmap, Frozen};
 use notarium_core::{
@@ -9,6 +13,11 @@ use notarium_core::{
 
 use super::{IndexError, IndexNote, NoteSortHeader, model::*};
 use crate::graph::LeidenSnapshot;
+
+/// Maximum notes buffered in the mutable tip before sealing into an immutable
+/// `Arc<L0Layer>`. Keeps copy-on-write clone cost per edit strictly O(1).
+const TIP_FLUSH_NOTES: usize = 128;
+const TIP_FLUSH_BYTES: usize = 256 * 1024;
 
 #[derive(Clone)]
 pub(crate) enum ClusterOverlay {
@@ -42,22 +51,73 @@ impl SubtreeOverlay {
     }
 }
 
+/// Adjacency override for one node: either a complete replacement list or an
+/// incremental add/remove delta layered over the base checkpoint (avoids
+/// reloading 50k-edge hubs on single-link edits).
+#[derive(Clone)]
+pub(super) enum EdgeOverlay {
+    Replace(Arc<Vec<u32>>),
+    Delta {
+        added: BTreeSet<u32>,
+        removed: BTreeSet<u32>,
+    },
+}
+
+impl EdgeOverlay {
+    fn approx_bytes(&self) -> usize {
+        match self {
+            Self::Replace(edges) => 64 + edges.capacity() * size_of::<u32>(),
+            Self::Delta { added, removed } => {
+                64 + (added.len() + removed.len()) * (size_of::<u32>() + 24)
+            }
+        }
+    }
+}
+
+/// One bounded temporal layer of structural note edits followed by optional
+/// subtree membership overrides. Once sealed into `L0Delta::layers`, a layer
+/// is never cloned again across subsequent sequential edits.
+#[derive(Clone, Default)]
+pub(super) struct L0Layer {
+    pub(super) notes: BTreeMap<u32, Arc<ChangedNote>>,
+    pub(super) note_lookup: BTreeMap<NoteId, u32>,
+    pub(super) replaced: Bitmap,
+    pub(super) deleted: Bitmap,
+    pub(super) subtree_overrides: BTreeMap<u32, SubtreeOverlay>,
+    pub(super) postings: BTreeMap<Vec<u8>, Bitmap>,
+    pub(super) bsi_live: BTreeMap<Vec<u8>, BTreeMap<u32, ScalarValue>>,
+    pub(super) approx_bytes: usize,
+}
+
+impl L0Layer {
+    fn is_empty(&self) -> bool {
+        self.notes.is_empty()
+            && self.replaced.is_empty()
+            && self.deleted.is_empty()
+            && self.subtree_overrides.is_empty()
+    }
+
+    fn should_seal(&self) -> bool {
+        self.notes.len() >= TIP_FLUSH_NOTES || self.approx_bytes >= TIP_FLUSH_BYTES
+    }
+}
+
 /// Private mutable command delta. A cut retains it through an Arc before the
-/// next command changes it. Heavy values and rarely-mutated side maps use
-/// copy-on-write Arc sharing so sequential edits only clone touched keys.
+/// next command changes it. Note/posting mutations accumulate in a bounded
+/// mutable `tip` layer and periodically seal into `layers` (`Arc<Vec<Arc<L0Layer>>>`),
+/// giving amortized O(1) copy-on-write cloning across sequential edits.
 #[derive(Clone, Default)]
 pub struct L0Delta {
-    pub(super) notes: BTreeMap<u32, Arc<ChangedNote>>,
-    pub(super) note_lookup: Arc<BTreeMap<NoteId, u32>>,
-    pub(super) replaced: Bitmap,
+    pub(super) layers: Arc<Vec<Arc<L0Layer>>>,
+    pub(super) tip: L0Layer,
+    /// Union of `replaced` across `layers` and `tip` for O(1) base fast-path checks.
+    pub(super) all_replaced: Bitmap,
+    /// Current live deleted mask (notes removed and not subsequently re-added).
     pub(super) deleted: Bitmap,
     pub(super) folders: Arc<BTreeMap<u32, (FolderId, Lifecycle)>>,
     pub(super) folder_lookup: Arc<BTreeMap<FolderId, u32>>,
-    pub(super) subtree_overrides: Arc<BTreeMap<u32, Arc<SubtreeOverlay>>>,
-    pub(super) postings: BTreeMap<Vec<u8>, Arc<Bitmap>>,
-    pub(super) bsi_live: BTreeMap<Vec<u8>, Arc<BTreeMap<u32, ScalarValue>>>,
-    pub(super) outgoing: Arc<BTreeMap<u32, Arc<Vec<u32>>>>,
-    pub(super) incoming: Arc<BTreeMap<u32, Arc<Vec<u32>>>>,
+    pub(super) outgoing: Arc<BTreeMap<u32, EdgeOverlay>>,
+    pub(super) incoming: Arc<BTreeMap<u32, EdgeOverlay>>,
     pub(super) cluster_delta: Arc<BTreeMap<u32, Option<ClusterId>>>,
     pub(super) cluster_dirty: Bitmap,
     pub(super) clusters: Arc<BTreeMap<ClusterId, Arc<Bitmap>>>,
@@ -70,26 +130,67 @@ pub struct L0Delta {
 }
 
 impl L0Delta {
+    pub(super) fn iter_layers_newest_first(&self) -> impl Iterator<Item = &L0Layer> {
+        std::iter::once(&self.tip).chain(self.layers.iter().rev().map(Arc::as_ref))
+    }
+
+    pub(super) fn iter_layers_oldest_first(&self) -> impl Iterator<Item = &L0Layer> {
+        self.layers
+            .iter()
+            .map(Arc::as_ref)
+            .chain(std::iter::once(&self.tip))
+    }
+
+    fn seal_tip(&mut self) {
+        if self.tip.is_empty() {
+            return;
+        }
+        let sealed = std::mem::take(&mut self.tip);
+        Arc::make_mut(&mut self.layers).push(Arc::new(sealed));
+    }
+
+    fn ensure_tip_accepts_notes(&mut self) {
+        // Keep the layer invariant: every layer applies `notes/replaced` BEFORE
+        // `subtree_overrides`. If `tip` already carries a subtree move, seal it
+        // first so subsequent note edits sit in a newer layer above the move.
+        if !self.tip.subtree_overrides.is_empty() || self.tip.should_seal() {
+            self.seal_tip();
+        }
+    }
+
     pub fn replace_note(&mut self, note: IndexNote<'_>) -> Result<(), IndexError> {
         let NotePostings { ordinary, scalars } = note.postings()?;
-        self.remove_replacement(note.dense);
-        self.replaced.add(note.dense);
-        self.deleted.remove(note.dense);
-        Arc::make_mut(&mut self.note_lookup).insert(note.id.clone(), note.dense);
+        self.ensure_tip_accepts_notes();
+        self.remove_replacement_from_tip(note.dense);
+        self.tip.replaced.add(note.dense);
+        self.tip.deleted.remove(note.dense);
+        self.all_replaced.add(note.dense);
+        if self.deleted.remove_checked(note.dense) {
+            self.approx_bytes = self.approx_bytes.saturating_sub(64);
+        }
+        self.tip.note_lookup.insert(note.id.clone(), note.dense);
         let mut bytes = 256 + 2 * note.id.as_str().len();
         let mut keys = Vec::with_capacity(ordinary.len());
         let mut domains = Vec::with_capacity(scalars.len());
         for key in ordinary {
-            Arc::make_mut(self.postings.entry(key.clone()).or_default()).add(note.dense);
+            self.tip
+                .postings
+                .entry(key.clone())
+                .or_default()
+                .add(note.dense);
             bytes = bytes.saturating_add(192 + 2 * key.capacity());
             keys.push(key);
         }
         for (key, (_, scalar)) in scalars {
-            Arc::make_mut(self.bsi_live.entry(key.clone()).or_default()).insert(note.dense, scalar);
+            self.tip
+                .bsi_live
+                .entry(key.clone())
+                .or_default()
+                .insert(note.dense, scalar);
             bytes = bytes.saturating_add(192 + 2 * key.capacity());
             domains.push(key);
         }
-        self.notes.insert(
+        self.tip.notes.insert(
             note.dense,
             Arc::new(ChangedNote {
                 id: note.id.clone(),
@@ -99,15 +200,22 @@ impl L0Delta {
                 bytes,
             }),
         );
+        self.tip.approx_bytes = self.tip.approx_bytes.saturating_add(bytes);
         self.node_count = self.node_count.max(note.dense + 1);
         self.approx_bytes = self.approx_bytes.saturating_add(bytes);
         self.last_change = Some(Instant::now());
+        if self.tip.should_seal() {
+            self.seal_tip();
+        }
         Ok(())
     }
 
     pub fn remove_note(&mut self, dense: u32) {
-        self.remove_replacement(dense);
-        self.replaced.add(dense);
+        self.ensure_tip_accepts_notes();
+        self.remove_replacement_from_tip(dense);
+        self.tip.replaced.add(dense);
+        self.tip.deleted.add(dense);
+        self.all_replaced.add(dense);
         if self.deleted.add_checked(dense) {
             self.approx_bytes = self.approx_bytes.saturating_add(64);
         }
@@ -116,57 +224,26 @@ impl L0Delta {
         self.replace_cluster(dense, None);
     }
 
-    fn remove_replacement(&mut self, dense: u32) {
-        // The new note image carries its current ancestry. A previous subtree
-        // move must not override the membership of this replacement.
-        if !self.subtree_overrides.is_empty()
-            && self
-                .subtree_overrides
-                .values()
-                .any(|o| o.added.contains(dense) || o.removed.contains(dense))
-        {
-            let mut bytes = self.approx_bytes;
-            Arc::make_mut(&mut self.subtree_overrides).retain(|_, overlay_arc| {
-                if !overlay_arc.added.contains(dense) && !overlay_arc.removed.contains(dense) {
-                    return true;
-                }
-                let overlay = Arc::make_mut(overlay_arc);
-                bytes = bytes.saturating_sub(overlay.bytes());
-                overlay.added.remove(dense);
-                overlay.removed.remove(dense);
-                if overlay.is_empty() {
-                    false
-                } else {
-                    bytes = bytes.saturating_add(overlay.bytes());
-                    true
-                }
-            });
-            self.approx_bytes = bytes;
-        }
-
-        if self.deleted.remove_checked(dense) {
-            self.approx_bytes = self.approx_bytes.saturating_sub(64);
-        }
-        let Some(old) = self.notes.remove(&dense) else {
+    fn remove_replacement_from_tip(&mut self, dense: u32) {
+        let Some(old) = self.tip.notes.remove(&dense) else {
             return;
         };
-        Arc::make_mut(&mut self.note_lookup).remove(&old.id);
+        self.tip.note_lookup.remove(&old.id);
+        self.tip.approx_bytes = self.tip.approx_bytes.saturating_sub(old.bytes);
         self.approx_bytes = self.approx_bytes.saturating_sub(old.bytes);
         for key in &old.postings {
-            if let Some(bitmap_arc) = self.postings.get_mut(key) {
-                let bitmap = Arc::make_mut(bitmap_arc);
+            if let Some(bitmap) = self.tip.postings.get_mut(key) {
                 bitmap.remove(dense);
                 if bitmap.is_empty() {
-                    self.postings.remove(key);
+                    self.tip.postings.remove(key);
                 }
             }
         }
         for key in &old.domains {
-            if let Some(values_arc) = self.bsi_live.get_mut(key) {
-                let values = Arc::make_mut(values_arc);
+            if let Some(values) = self.tip.bsi_live.get_mut(key) {
                 values.remove(&dense);
                 if values.is_empty() {
-                    self.bsi_live.remove(key);
+                    self.tip.bsi_live.remove(key);
                 }
             }
         }
@@ -203,11 +280,7 @@ impl L0Delta {
         if rows.is_empty() {
             return;
         }
-        let overlay = Arc::make_mut(
-            Arc::make_mut(&mut self.subtree_overrides)
-                .entry(ancestor)
-                .or_default(),
-        );
+        let overlay = self.tip.subtree_overrides.entry(ancestor).or_default();
         let old_bytes = if overlay.is_empty() {
             0
         } else {
@@ -222,10 +295,16 @@ impl L0Delta {
         }
         overlay.added.run_optimize();
         overlay.removed.run_optimize();
+        let new_bytes = overlay.bytes();
+        self.tip.approx_bytes = self
+            .tip
+            .approx_bytes
+            .saturating_sub(old_bytes)
+            .saturating_add(new_bytes);
         self.approx_bytes = self
             .approx_bytes
             .saturating_sub(old_bytes)
-            .saturating_add(overlay.bytes());
+            .saturating_add(new_bytes);
         self.last_change = Some(Instant::now());
     }
 
@@ -235,22 +314,92 @@ impl L0Delta {
         outgoing: Option<Vec<u32>>,
         incoming: Option<Vec<u32>>,
     ) {
-        for (direction, old) in [
+        for (direction, map) in [
             (outgoing, &mut self.outgoing),
             (incoming, &mut self.incoming),
         ] {
             if let Some(mut edges) = direction {
                 edges.sort_unstable();
                 edges.dedup();
-                let bytes = 64 + edges.capacity() * size_of::<u32>();
-                if let Some(previous) = Arc::make_mut(old).insert(node, Arc::new(edges)) {
-                    self.approx_bytes = self
-                        .approx_bytes
-                        .saturating_sub(64 + previous.capacity() * size_of::<u32>());
+                let next = EdgeOverlay::Replace(Arc::new(edges));
+                let next_bytes = next.approx_bytes();
+                if let Some(previous) = Arc::make_mut(map).insert(node, next) {
+                    self.approx_bytes = self.approx_bytes.saturating_sub(previous.approx_bytes());
                 }
-                self.approx_bytes = self.approx_bytes.saturating_add(bytes);
+                self.approx_bytes = self.approx_bytes.saturating_add(next_bytes);
             }
         }
+        self.last_change = Some(Instant::now());
+    }
+
+    /// Incrementally adds/removes edges on `node` without reloading its full
+    /// adjacency list (prevents hub amplification on high-degree targets).
+    pub(crate) fn apply_adjacency_delta(
+        &mut self,
+        node: u32,
+        incoming: bool,
+        added: &[u32],
+        removed: &[u32],
+    ) {
+        if added.is_empty() && removed.is_empty() {
+            return;
+        }
+        let map = if incoming {
+            &mut self.incoming
+        } else {
+            &mut self.outgoing
+        };
+        let table = Arc::make_mut(map);
+        let old_bytes = table.get(&node).map_or(0, EdgeOverlay::approx_bytes);
+        match table.get_mut(&node) {
+            Some(EdgeOverlay::Replace(existing)) => {
+                let mut vec = (**existing).clone();
+                if !removed.is_empty() {
+                    vec.retain(|edge| !removed.contains(edge));
+                }
+                vec.extend_from_slice(added);
+                vec.sort_unstable();
+                vec.dedup();
+                *existing = Arc::new(vec);
+            }
+            Some(EdgeOverlay::Delta {
+                added: a,
+                removed: r,
+            }) => {
+                for &edge in removed {
+                    if !a.remove(&edge) {
+                        r.insert(edge);
+                    }
+                }
+                for &edge in added {
+                    r.remove(&edge);
+                    a.insert(edge);
+                }
+            }
+            None => {
+                let mut a = BTreeSet::new();
+                let mut r = BTreeSet::new();
+                for &edge in removed {
+                    r.insert(edge);
+                }
+                for &edge in added {
+                    r.remove(&edge);
+                    a.insert(edge);
+                }
+                table.insert(
+                    node,
+                    EdgeOverlay::Delta {
+                        added: a,
+                        removed: r,
+                    },
+                );
+            }
+        }
+        let new_bytes = table.get(&node).map_or(0, EdgeOverlay::approx_bytes);
+        self.approx_bytes = self
+            .approx_bytes
+            .saturating_sub(old_bytes)
+            .saturating_add(new_bytes);
         self.last_change = Some(Instant::now());
     }
 
@@ -297,6 +446,7 @@ impl L0Delta {
         } else {
             Some(ClusterOverlay::Deferred(seq))
         };
+        self.last_change = Some(Instant::now());
     }
 
     pub fn record_events(&mut self, count: u32) {
@@ -307,7 +457,7 @@ impl L0Delta {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.last_change.is_none()
+        self.last_change.is_none() && self.cluster_overlay.is_none()
     }
 
     pub fn approx_bytes(&self) -> usize {

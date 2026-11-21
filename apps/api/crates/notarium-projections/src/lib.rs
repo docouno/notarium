@@ -1,19 +1,33 @@
 //! Rebuildable structural indexes, declarative note views and knowledge graphs.
 
+#[forbid(unsafe_code)]
 mod board;
 #[cfg(feature = "test-support")]
+#[forbid(unsafe_code)]
 pub mod derived;
 #[cfg(not(feature = "test-support"))]
+#[forbid(unsafe_code)]
 mod derived;
+#[forbid(unsafe_code)]
 mod graph;
 #[cfg(feature = "test-support")]
+#[forbid(unsafe_code)]
 pub mod index;
 #[cfg(not(feature = "test-support"))]
+#[forbid(unsafe_code)]
 mod index;
+#[forbid(unsafe_code)]
 mod links;
 mod mmap;
+#[cfg(feature = "test-support")]
+#[forbid(unsafe_code)]
 pub mod nota;
+#[cfg(not(feature = "test-support"))]
+#[forbid(unsafe_code)]
+mod nota;
+#[forbid(unsafe_code)]
 mod query;
+#[forbid(unsafe_code)]
 mod runtime;
 
 #[cfg(feature = "test-support")]

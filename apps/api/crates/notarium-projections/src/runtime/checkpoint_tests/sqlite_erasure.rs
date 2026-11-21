@@ -62,9 +62,14 @@ async fn sqlite_purges_file_only_retired_generation_while_neighbor_is_held() {
     old.wait_for_projected(neighbor.scope(), survivor.receipt.seq(), &budget())
         .await
         .unwrap();
-    let neighbor_file =
-        root.space_fast_index(first, &neighbor.scope().space_id, survivor.receipt.seq());
-    let named = root.space_fast_index(first, &ctx.scope().space_id, seq);
+    let neighbor_file = find_checkpoint_file(
+        &root,
+        first,
+        &neighbor.scope().space_id,
+        survivor.receipt.seq(),
+    )
+    .unwrap();
+    let named = find_checkpoint_file(&root, first, &ctx.scope().space_id, seq).unwrap();
     let image = std::fs::read(&named).unwrap();
     #[cfg(unix)]
     let held = old
@@ -169,7 +174,7 @@ async fn sqlite_purges_file_only_retired_generation_while_neighbor_is_held() {
         .wait_for_projected(current.scope(), receipt.seq(), &budget())
         .await
         .unwrap();
-    let path = root.space_fast_index(second, &ctx.scope().space_id, receipt.seq());
+    let path = find_checkpoint_file(&root, second, &ctx.scope().space_id, receipt.seq()).unwrap();
     assert!(path.is_file());
     eraser
         .erase_visibility(
@@ -266,7 +271,7 @@ async fn sqlite_file_only_candidate_retries_and_reused_number_rejects_old_writer
             .prepare(identity.clone())
             .unwrap()
     };
-    let (base, _) = apply::publish_checkpoint_file(&engine, &old, prepare())
+    let (base, _, _) = apply::publish_checkpoint_file(&engine, &old, prepare())
         .await
         .unwrap();
     base.finish_publication().unwrap();
@@ -503,7 +508,6 @@ async fn sqlite_detached_cleanup_runs_after_canonical_writer_epoch_advances() {
     let thread = ChatThreadId::from_bytes(entropy());
     let (redact, head) = prepare_redaction(&canonical, &ctx, &thread, &survivor.value.note).await;
     let first = ProjectionGeneration::new(1).unwrap();
-    let checkpoint = root.space_fast_index(first, &ctx.scope().space_id, head);
     let rows = || {
         erasure_rows(
             &root.derived(first),
@@ -519,6 +523,7 @@ async fn sqlite_detached_cleanup_runs_after_canonical_writer_epoch_advances() {
         .await
         .unwrap();
     projector.shutdown().await.unwrap();
+    let checkpoint = find_checkpoint_file(&root, first, &ctx.scope().space_id, head).unwrap();
     assert_eq!(rows(), (1, 1, 1));
     assert!(checkpoint.is_file());
 
@@ -594,7 +599,6 @@ async fn sqlite_restart_requires_cleanup_before_acknowledging_purge_and_redactio
         (ErasureCommand::Redact(redact), &neighbor),
     ];
     let first = ProjectionGeneration::new(1).unwrap();
-    let file = root.space_fast_index(first, &owner_ctx.scope().space_id, victim.receipt.seq());
 
     let projector = start_checkpoint_projector(&canonical, &root).await;
     projector
@@ -608,6 +612,13 @@ async fn sqlite_restart_requires_cleanup_before_acknowledging_purge_and_redactio
         .await
         .unwrap();
     projector.shutdown().await.unwrap();
+    let file = find_checkpoint_file(
+        &root,
+        first,
+        &owner_ctx.scope().space_id,
+        victim.receipt.seq(),
+    )
+    .unwrap();
     writer.shutdown().await.unwrap();
     drop(canonical);
     let rows = || {
@@ -1080,8 +1091,13 @@ async fn detached_sqlite_eraser_requires_its_registered_cache_after_failed_resta
     // Remount the original volume before inspecting physical rows and checkpoints.
     std::fs::rename(&mount, media.root().root().join("empty-mount")).unwrap();
     std::fs::rename(&detached, &mount).unwrap();
-    let checkpoint =
-        root.space_fast_index(first, &owner_ctx.scope().space_id, victim.receipt.seq());
+    let checkpoint = find_checkpoint_file(
+        &root,
+        first,
+        &owner_ctx.scope().space_id,
+        victim.receipt.seq(),
+    )
+    .unwrap();
     let rows = || {
         erasure_rows(
             &root.derived(first),

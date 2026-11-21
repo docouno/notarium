@@ -20,11 +20,11 @@ const OBJECTS: [&str; 6] = [
     "CREATE INDEX IF NOT EXISTS idx_chat_entries_redacted_change",
 ];
 
-// Page only fixed-size identities. Holding several complete legacy JSON values
-// at once would make bootstrap memory depend on the sum of their sizes.
+// Page only fixed-size identities using the covering index, skipping redacted and stale entries.
 const LEGACY_KEYS: &str = "SELECT space_id,thread_id,entry_seq
     FROM chat_entries
     WHERE (space_id,thread_id,entry_seq)>($1,$2,$3)
+      AND kind <> 'redacted' AND checkpoint_stale = 0
     ORDER BY space_id,thread_id,entry_seq LIMIT 128";
 const LEGACY_REFS: &str = "SELECT created_space_seq,referenced_notes_json FROM chat_entries
     WHERE space_id=$1 AND thread_id=$2 AND entry_seq=$3
@@ -44,24 +44,75 @@ const SQLITE_COPY_V7: &str = "INSERT INTO chat_entry_note_refs
      FROM chat_entry_note_refs_v7 r;
      DROP TABLE chat_entry_note_refs_v7";
 
-// PostgreSQL can add the column in place. Updating only this column preserves
-// the validated foreign keys and avoids queueing a trigger event per occurrence.
-const POSTGRES_PREPARE_V7: &str =
+// PostgreSQL can add the column in place and backfill it in bounded keyset pages
+// so large deployments do not perform a single unbounded table-wide UPDATE.
+const POSTGRES_PREPARE_V7_ADD: &str =
     "ALTER TABLE chat_entry_note_refs ADD COLUMN created_space_seq BIGINT CHECK (created_space_seq >= 1);
-     DROP INDEX idx_chat_entry_note_refs_target;
-     UPDATE chat_entry_note_refs r SET created_space_seq=e.created_space_seq
-       FROM chat_entries e
-       WHERE e.space_id=r.space_id AND e.thread_id=r.thread_id AND e.entry_seq=r.entry_seq;
-     ALTER TABLE chat_entry_note_refs ALTER COLUMN created_space_seq SET NOT NULL";
+     DROP INDEX idx_chat_entry_note_refs_target";
+const POSTGRES_V7_BACKFILL_BATCH: &str = "WITH page AS (
+         SELECT space_id, thread_id, entry_seq, ref_ordinal
+         FROM chat_entry_note_refs
+         WHERE created_space_seq IS NULL
+           AND (space_id, thread_id, entry_seq, ref_ordinal) > ($1, $2, $3, $4)
+         ORDER BY space_id, thread_id, entry_seq, ref_ordinal
+         LIMIT 4096
+     ), updated AS (
+         UPDATE chat_entry_note_refs r
+         SET created_space_seq = e.created_space_seq
+         FROM page p
+         JOIN chat_entries e
+           ON e.space_id = p.space_id AND e.thread_id = p.thread_id AND e.entry_seq = p.entry_seq
+         WHERE r.space_id = p.space_id AND r.thread_id = p.thread_id
+           AND r.entry_seq = p.entry_seq AND r.ref_ordinal = p.ref_ordinal
+         RETURNING r.space_id, r.thread_id, r.entry_seq, r.ref_ordinal
+     )
+     SELECT space_id, thread_id, entry_seq, ref_ordinal
+     FROM updated
+     ORDER BY space_id DESC, thread_id DESC, entry_seq DESC, ref_ordinal DESC
+     LIMIT 1";
+const POSTGRES_PREPARE_V7_FINALIZE: &str =
+    "ALTER TABLE chat_entry_note_refs ALTER COLUMN created_space_seq SET NOT NULL";
+
+async fn prepare_v7_sqlite(conn: &mut SqliteConnection) -> Result<(), PortError> {
+    sqlx::raw_sql(SQLITE_PREPARE_V7)
+        .execute(&mut *conn)
+        .await
+        .map_err(migration_error)?;
+    Ok(())
+}
+
+async fn prepare_v7_postgres(conn: &mut PgConnection) -> Result<(), PortError> {
+    sqlx::raw_sql(POSTGRES_PREPARE_V7_ADD)
+        .execute(&mut *conn)
+        .await
+        .map_err(migration_error)?;
+    let mut after = (String::new(), String::new(), 0_i64, -1_i64);
+    loop {
+        let last: Option<(String, String, i64, i64)> = sqlx::query_as(POSTGRES_V7_BACKFILL_BATCH)
+            .bind(&after.0)
+            .bind(&after.1)
+            .bind(after.2)
+            .bind(after.3)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(migration_error)?;
+        match last {
+            Some(next) => after = next,
+            None => break,
+        }
+    }
+    sqlx::raw_sql(POSTGRES_PREPARE_V7_FINALIZE)
+        .execute(&mut *conn)
+        .await
+        .map_err(migration_error)?;
+    Ok(())
+}
 
 macro_rules! migrate {
     ($name:ident, $connection:ty, $variant:ident, $ddl:ident, $prepare:ident $(, $copy:ident)?) => {
         pub(super) async fn $name(conn: &mut $connection, version: i64) -> Result<(), PortError> {
             if version == 7 {
-                sqlx::raw_sql($prepare)
-                    .execute(&mut *conn)
-                    .await
-                    .map_err(migration_error)?;
+                $prepare(conn).await?;
             }
             for prefix in OBJECTS {
                 let statement = baseline_statement($ddl, prefix)?;
@@ -124,7 +175,7 @@ migrate!(
     SqliteConnection,
     Sqlite,
     SQLITE_BASELINE_DDL,
-    SQLITE_PREPARE_V7,
+    prepare_v7_sqlite,
     SQLITE_COPY_V7
 );
 migrate!(
@@ -132,7 +183,7 @@ migrate!(
     PgConnection,
     Postgres,
     POSTGRES_BASELINE_DDL,
-    POSTGRES_PREPARE_V7
+    prepare_v7_postgres
 );
 
 #[cfg(test)]

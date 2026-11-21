@@ -2,7 +2,7 @@ use std::io;
 
 use serde::{Deserialize, Serialize};
 
-pub(crate) const REPORT_VERSION: u8 = 4;
+pub(crate) const REPORT_VERSION: u8 = 5;
 pub(crate) const MICROPROFILE_SCOPE: &str =
     "synthetic_checkpoint_planner_and_50_row_sqlite_hydration";
 pub(crate) const CORPUS_NOTES: usize = 100_000;
@@ -20,6 +20,7 @@ const MIB: u64 = 1_048_576;
 pub(crate) struct ProjectionReport {
     pub version: u8,
     pub environment: Environment,
+    pub process_vm_hwm_bytes: u64,
     pub backends: [BackendMeasurements; 2],
     pub microprofile: Microprofile,
 }
@@ -126,6 +127,8 @@ pub(crate) struct Microprofile {
     pub checkpoint_bytes: u64,
     pub cold_checkpoint_open: Timing,
     pub warm_board: Timing,
+    pub l0_sequential_edit: Timing,
+    pub high_cardinality_tag_probe: Timing,
     pub fence: [FenceSample; 4],
 }
 
@@ -171,7 +174,14 @@ impl Timing {
         }
     }
 
-    fn check(&self, name: &str, limit_ns: u64, inclusive: bool, failures: &mut Vec<String>) {
+    fn check(
+        &self,
+        name: &str,
+        p95_limit_ns: u64,
+        p99_limit_ns: u64,
+        inclusive: bool,
+        failures: &mut Vec<String>,
+    ) {
         if self.samples < MINIMUM_SAMPLES
             || self.p50_ns == 0
             || self.p50_ns > self.p95_ns
@@ -181,11 +191,17 @@ impl Timing {
                 "{name} has malformed or insufficient samples: {self:?}"
             ));
         }
-        if self.p95_ns > limit_ns || (!inclusive && self.p95_ns == limit_ns) {
+        if self.p95_ns > p95_limit_ns || (!inclusive && self.p95_ns == p95_limit_ns) {
             let inequality = if inclusive { "<=" } else { "<" };
             failures.push(format!(
-                "{name} p95 {} ns must be {inequality} {limit_ns} ns",
+                "{name} p95 {} ns must be {inequality} {p95_limit_ns} ns",
                 self.p95_ns
+            ));
+        }
+        if self.p99_ns > p99_limit_ns {
+            failures.push(format!(
+                "{name} p99 {} ns must be <= {p99_limit_ns} ns",
+                self.p99_ns
             ));
         }
     }
@@ -243,6 +259,11 @@ impl ProjectionReport {
             &mut failures,
             "invalid memory.max measurement or caller fallback".into(),
         );
+        expect(
+            self.process_vm_hwm_bytes > 0,
+            &mut failures,
+            "report must record positive process VmHWM bytes".into(),
+        );
         let [sqlite, postgres] = &self.backends;
         expect(
             sqlite.backend == Backend::Sqlite && postgres.backend == Backend::Postgres,
@@ -290,30 +311,45 @@ impl BackendMeasurements {
             failures,
             format!("{label} measured the wrong corpus"),
         );
-        for (operation, timing, limit, inclusive) in [
+        for (operation, timing, limit, p99_limit, inclusive) in [
             (
                 "cold checkpoint open",
                 &self.cold_checkpoint_open,
                 5 * MS,
+                15 * MS,
                 false,
             ),
-            ("warm board", &self.warm_board, 5 * MS, false),
-            ("cold board", &self.cold_board, 15 * MS, true),
+            ("warm board", &self.warm_board, 5 * MS, 15 * MS, false),
+            ("cold board", &self.cold_board, 15 * MS, 45 * MS, true),
             (
                 "warm rank-materialized board",
                 &self.warm_ranked_board,
                 5 * MS,
+                15 * MS,
                 false,
             ),
             (
                 "cold rank-materialized board",
                 &self.cold_ranked_board,
                 15 * MS,
+                45 * MS,
                 true,
             ),
-            ("two-hop neighborhood", &self.neighborhood, MS, false),
+            (
+                "two-hop neighborhood",
+                &self.neighborhood,
+                MS,
+                3 * MS,
+                false,
+            ),
         ] {
-            timing.check(&format!("{label} {operation}"), limit, inclusive, failures);
+            timing.check(
+                &format!("{label} {operation}"),
+                limit,
+                p99_limit,
+                inclusive,
+                failures,
+            );
         }
         expect(
             self.replayed_tail_notes == TAIL_NOTES && (1..65 * MS).contains(&self.tail_replay_ns),
@@ -382,21 +418,36 @@ impl Microprofile {
         );
         expect(
             self.indexed_notes == MICROPROFILE_NOTES
-                && (150 * MIB..=180 * MIB).contains(&self.checkpoint_bytes),
+                && (120 * MIB..=180 * MIB).contains(&self.checkpoint_bytes),
             failures,
             format!(
-                "million-note checkpoint: {} notes, {} bytes (expected 150–180 MiB)",
+                "million-note checkpoint: {} notes, {} bytes (expected 120–180 MiB)",
                 self.indexed_notes, self.checkpoint_bytes
             ),
         );
         self.cold_checkpoint_open.check(
             "million-note cold checkpoint open",
             500 * MS,
+            1_000 * MS,
             true,
             failures,
         );
         self.warm_board
-            .check("million-note warm board", 5 * MS, false, failures);
+            .check("million-note warm board", 5 * MS, 15 * MS, false, failures);
+        self.l0_sequential_edit.check(
+            "sequential CoW L0 single-note edit",
+            5 * MS,
+            15 * MS,
+            false,
+            failures,
+        );
+        self.high_cardinality_tag_probe.check(
+            "high-cardinality tag bucket probe",
+            5 * MS,
+            15 * MS,
+            false,
+            failures,
+        );
         for (phase, sample) in [
             FencePhase::Hydrated,
             FencePhase::Lagged,

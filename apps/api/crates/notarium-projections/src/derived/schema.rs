@@ -13,7 +13,7 @@ use super::{
     sql::{Kind, SqlColumn, SqlRecord, SqlTransaction, SqlValue, value},
 };
 
-pub(super) const SCHEMA_VERSION: i64 = 2;
+pub(super) const SCHEMA_VERSION: i64 = 3;
 const MMAP_VERSION: i64 = crate::mmap::FORMAT_VERSION as i64;
 
 pub(super) async fn initialize(
@@ -24,42 +24,55 @@ pub(super) async fn initialize(
         tx.batch("SELECT pg_advisory_xact_lock(hashtextextended(current_schema(), 272014));")
             .await?;
     }
-    tx.batch(
-        "CREATE TABLE IF NOT EXISTS derived_schema_meta (
-            generation BIGINT PRIMARY KEY,
-            schema_version BIGINT NOT NULL,
-            unicode_casefold_ver TEXT NOT NULL,
-            unicode_norm_ver TEXT NOT NULL,
-            mmap_format_ver BIGINT NOT NULL,
-            created_at_ms BIGINT NOT NULL
-        );",
+    let meta_exists_sql = if tx.postgres() {
+        "SELECT CAST(1 AS BIGINT) FROM pg_catalog.pg_class c
+         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+         WHERE n.nspname = current_schema() AND c.relname = 'derived_schema_meta' AND c.relkind IN ('r', 'p')"
+    } else {
+        "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'derived_schema_meta'"
+    };
+    let meta_exists = !tx
+        .select(meta_exists_sql, Vec::new(), &[Kind::Integer])
+        .await?
+        .is_empty();
+    if meta_exists {
+        match metadata_state(tx, "derived_schema_meta", generation).await? {
+            MetadataState::Current => return Ok(true),
+            MetadataState::Obsolete => return Ok(false),
+            MetadataState::Empty => {}
+        }
+    } else {
+        tx.batch(
+            "CREATE TABLE IF NOT EXISTS derived_schema_meta (
+                generation BIGINT PRIMARY KEY,
+                schema_version BIGINT NOT NULL,
+                unicode_casefold_ver TEXT NOT NULL,
+                unicode_norm_ver TEXT NOT NULL,
+                mmap_format_ver BIGINT NOT NULL,
+                created_at_ms BIGINT NOT NULL
+            );",
+        )
+        .await?;
+    }
+    let existing = if tx.postgres() {
+        "SELECT COUNT(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n
+         ON n.oid = c.relnamespace WHERE n.nspname = current_schema() AND c.relkind IN ('r', 'p')"
+    } else {
+        "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+    };
+    let count = tx.select(existing, Vec::new(), &[Kind::Integer]).await?;
+    if count.as_slice() != [vec![value(&1_i64)]] {
+        return Err(generation_mismatch());
+    }
+    let mut values = expected_metadata(generation);
+    values.push(value(&now_ms()));
+    tx.execute(
+        "INSERT INTO derived_schema_meta
+            (generation, schema_version, unicode_casefold_ver, unicode_norm_ver, mmap_format_ver, created_at_ms)
+         VALUES (?, ?, ?, ?, ?, ?)",
+        values,
     )
     .await?;
-    match metadata_state(tx, "derived_schema_meta", generation).await? {
-        MetadataState::Obsolete => return Ok(false),
-        MetadataState::Current => {}
-        MetadataState::Empty => {
-            let existing = if tx.postgres() {
-                "SELECT COUNT(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n
-                 ON n.oid = c.relnamespace WHERE n.nspname = current_schema() AND c.relkind IN ('r', 'p')"
-            } else {
-                "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
-            };
-            let count = tx.select(existing, Vec::new(), &[Kind::Integer]).await?;
-            if count.as_slice() != [vec![value(&1_i64)]] {
-                return Err(generation_mismatch());
-            }
-            let mut values = expected_metadata(generation);
-            values.push(value(&now_ms()));
-            tx.execute(
-                "INSERT INTO derived_schema_meta
-                    (generation, schema_version, unicode_casefold_ver, unicode_norm_ver, mmap_format_ver, created_at_ms)
-                 VALUES (?, ?, ?, ?, ?, ?)",
-                values,
-            )
-            .await?;
-        }
-    }
 
     let postgres = tx.postgres();
     let mut ddl = String::new();
@@ -192,14 +205,9 @@ fn define<R: SqlRecord>(ddl: &mut String, postgres: bool, extra: &str) {
         .collect::<Vec<_>>()
         .join(", ");
     let key = R::KEY.join(", ");
-    let without_rowid = if postgres || R::TABLE != ProjectedNote::TABLE {
-        ""
-    } else {
-        " WITHOUT ROWID"
-    };
     writeln!(
         ddl,
-        "CREATE TABLE IF NOT EXISTS {} ({columns}, PRIMARY KEY ({key}){extra}){without_rowid};",
+        "CREATE TABLE IF NOT EXISTS {} ({columns}, PRIMARY KEY ({key}){extra});",
         R::TABLE
     )
     .expect("writing a String");
@@ -211,16 +219,19 @@ const INDEXES: &str = "
     CREATE INDEX IF NOT EXISTS projected_folder_cover ON projected_folders (space_id, cover_note_id)
         WHERE cover_note_id IS NOT NULL;
     CREATE INDEX IF NOT EXISTS projected_folder_alias_target ON projected_folder_aliases (space_id, target_folder_id);
-    CREATE INDEX IF NOT EXISTS projected_note_parents ON projected_notes (space_id, parent_folder_id, slug_fold, lifecycle);
+    CREATE INDEX IF NOT EXISTS projected_note_parents ON projected_notes (space_id, parent_folder_id, slug_fold, lifecycle, note_id);
     CREATE INDEX IF NOT EXISTS projected_view_group_order ON projected_view_ranks
         (space_id, view_note_id, view_key, group_key_hex, sort_rank_lexo, target_note_id);
     CREATE INDEX IF NOT EXISTS projected_view_rank_target ON projected_view_ranks (space_id, target_note_id);
     CREATE INDEX IF NOT EXISTS candidate_scope_leaf_tier ON candidate_lookup_keys
         (space_id, scope_folder_dense_id, leaf_norm_key, tier, created_at_sec, created_at_nsec, target_note_id);
     CREATE INDEX IF NOT EXISTS candidate_target_dense ON candidate_lookup_keys (space_id, target_dense_id);
+    CREATE INDEX IF NOT EXISTS candidate_target_note ON candidate_lookup_keys (space_id, target_note_id);
     CREATE INDEX IF NOT EXISTS projected_link_qualified ON projected_note_links (space_id, dir_norm_prefix, src_dense_id, link_ord);
     CREATE INDEX IF NOT EXISTS projected_link_leaf ON projected_note_links (space_id, leaf_norm_key, src_dense_id, link_ord);
     CREATE INDEX IF NOT EXISTS projected_link_resolved ON projected_note_links (space_id, resolved_dense_id, src_dense_id, link_ord);
+    CREATE UNIQUE INDEX IF NOT EXISTS projected_link_src_resolved ON projected_note_links (space_id, src_dense_id, link_ord, resolved_dense_id)
+        WHERE resolved_dense_id IS NOT NULL;
     CREATE INDEX IF NOT EXISTS projected_link_relative ON projected_note_links (space_id, uses_relative_prefix, src_folder_id, src_dense_id, link_ord);
     CREATE INDEX IF NOT EXISTS projected_note_alias_slug ON projected_note_aliases (space_id, old_slug_fold, old_parent_folder_id, created_seq, target_note_id);
     CREATE INDEX IF NOT EXISTS projected_note_alias_title ON projected_note_aliases (space_id, old_title_norm, old_parent_folder_id, old_slug_fold, created_seq, target_note_id);

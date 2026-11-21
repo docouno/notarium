@@ -402,17 +402,23 @@ returns the accepted input and receipt. Limits and authority must also be enforc
 by each runtime owner before performing effects; port declarations are not adapters.
 
 Graph nodes and edge endpoints distinguish `GraphNodeId::Note(NoteId)` from
-`GraphNodeId::Cluster(ClusterId)`. The projection owner assigns and matches stable
-cluster identities across generations within a history scope; representative notes
-and generation-local dense indices do not serve as cluster identities. Requests
-carry that scope through `SpaceContext`, and results retain it in `SnapshotCut`.
-Cluster supernodes have no fabricated note card. A `Lens` may select a cluster,
-intersecting its members with the existing project, tag and field filters. An
-unknown or unauthorized cluster returns `ResourceNotFound`, without widening the
-query to the whole Space. `GraphResult.hidden_count` counts active non-encrypted
-notes excluded by filters or node caps, never unauthorized notes. Clustering,
-identity matching and membership lookup remain projection owner
-responsibilities. The existing 500/2000 node caps and 1–2 hop bound remain.
+`GraphNodeId::Cluster(ClusterId)`. The projection owner assigns opaque 128-bit
+CSPRNG cluster identities and matches them across generations within a history
+scope; representative notes and generation-local dense indices do not serve as
+cluster identities, and isolated degree-0 notes remain unclustered.
+`GraphTier::Superclusters` requires full plain-note access across the Space
+(`AccessDenied` for narrowed grants) so hidden cluster topology cannot be
+inferred. Requests carry that scope through `SpaceContext`, and results retain
+it in `SnapshotCut`. Cluster supernodes have no fabricated note card. A `Lens`
+may select a cluster, intersecting its members with the existing project, tag
+and field filters. An unknown or unauthorized cluster returns
+`ResourceNotFound`, without widening the query to the whole Space.
+`GraphResult.hidden_count` counts active non-encrypted notes excluded by filters
+or node caps, never unauthorized notes. Clustering, identity matching and
+membership lookup remain projection owner responsibilities. The existing
+500/2000 node caps and 1–2 hop bound remain. `Personal` chat thread reads,
+backlinks, and event delivery share one centralized authorization rule enforcing
+both thread ownership and `ChatAudience::Shared` isolation.
 
 ## Verification boundary
 

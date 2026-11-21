@@ -11,7 +11,7 @@ use notarium_core::{
     error::{Diagnostic, PortError, ValidationReason},
     ids::*,
     model::{HistoryScope, Lifecycle},
-    query::FieldSchema,
+    query::{FieldObservation, FieldSchema, FieldValue},
     value::YamlValue,
 };
 use notarium_syntax::{
@@ -161,6 +161,8 @@ pub(super) struct NoteProjection {
     pub(super) row: ProjectedNote,
     pub(super) views: CompiledViews,
     pub(super) links: Vec<String>,
+    pub(super) evaluated: BTreeMap<String, FieldObservation<FieldValue>>,
+    pub(super) tags: Vec<String>,
 }
 
 pub(super) fn project_note(
@@ -214,6 +216,7 @@ pub(super) fn project_note(
     };
     let blocks: Vec<_> = blocks.into_iter().map(ViewInput::from).collect();
     let views = compile_projected_views(&blocks, fields);
+    let merged_tags = effective_tags(&tags, raw);
     let row = ProjectedNote {
         space_id: scope.space_id.clone(),
         dense_id,
@@ -256,28 +259,39 @@ pub(super) fn project_note(
         has_pending_nota: views.has_pending_nota,
         has_invalid_nota: views.has_invalid_nota,
     };
-    Ok(NoteProjection { row, views, links })
+    Ok(NoteProjection {
+        row,
+        views,
+        links,
+        evaluated: observations,
+        tags: merged_tags,
+    })
 }
+
+pub(super) type EvaluatedNoteParts = (
+    CompiledViews,
+    BTreeMap<String, FieldObservation<FieldValue>>,
+    Vec<String>,
+);
 
 pub(super) fn reevaluate(
     row: &mut ProjectedNote,
     fields: &BTreeMap<String, FieldSchema>,
-) -> Result<CompiledViews, PortError> {
+) -> Result<EvaluatedNoteParts, PortError> {
     if row.doc_class == DocClass::EncryptedNote {
-        return Ok(CompiledViews::default());
+        return Ok((CompiledViews::default(), BTreeMap::new(), Vec::new()));
     }
     let raw = note_raw_fields(row)?;
     let diagnostic: Option<Diagnostic> = decode(&row.header_diagnostic_msgpack)?;
     let blocks: Vec<ViewInput> = decode(&row.view_blocks_msgpack)?;
-    row.evaluated_fields_msgpack = encode_msgpack(&evaluate_fields_with_schema(
-        raw.as_ref(),
-        diagnostic.as_ref(),
-        Some(fields),
-    ))?;
+    let inline: Vec<String> = decode(&row.tags_msgpack)?;
+    let evaluated = evaluate_fields_with_schema(raw.as_ref(), diagnostic.as_ref(), Some(fields));
+    let merged_tags = effective_tags(&inline, raw.as_ref());
+    row.evaluated_fields_msgpack = encode_msgpack(&evaluated)?;
     let views = compile_projected_views(&blocks, fields);
     row.has_pending_nota = views.has_pending_nota;
     row.has_invalid_nota = views.has_invalid_nota;
-    Ok(views)
+    Ok((views, evaluated, merged_tags))
 }
 
 pub(super) fn persisted_schema(
@@ -396,6 +410,30 @@ pub(super) fn index_note(
     let inline: Vec<String> = decode(&row.tags_msgpack)?;
     let raw = note_raw_fields(row)?;
     let tags = effective_tags(&inline, raw.as_ref());
+    index_note_with_parts(row, location, &fields, &tags, apply)
+}
+
+pub(super) fn index_projected_note(
+    outcome: &NoteProjection,
+    location: &FolderLocation,
+    apply: impl FnOnce(IndexNote<'_>) -> Result<(), crate::index::IndexError>,
+) -> Result<(), PortError> {
+    index_note_with_parts(
+        &outcome.row,
+        location,
+        &outcome.evaluated,
+        &outcome.tags,
+        apply,
+    )
+}
+
+pub(super) fn index_note_with_parts(
+    row: &ProjectedNote,
+    location: &FolderLocation,
+    fields: &BTreeMap<String, FieldObservation<FieldValue>>,
+    tags: &[String],
+    apply: impl FnOnce(IndexNote<'_>) -> Result<(), crate::index::IndexError>,
+) -> Result<(), PortError> {
     apply(IndexNote {
         dense: row.dense_id,
         id: &row.note_id,
@@ -408,8 +446,8 @@ pub(super) fn index_note(
         ),
         ancestors: &location.dense,
         trashed_ancestor: location.trashed,
-        fields: &fields,
-        tags: &tags,
+        fields,
+        tags,
         ability: row.ability_id.as_ref(),
     })
     .map_err(checkpoint_error)

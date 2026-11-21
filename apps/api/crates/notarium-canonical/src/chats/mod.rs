@@ -569,7 +569,13 @@ fn authorize_thread_mutation(
     {
         return Err(DomainError::CrossSpaceTainted.into());
     }
-    Ok(auth.authorize_chat_read(space, th.project_folder.as_ref(), tainted)?)
+    Ok(auth.authorize_chat_thread_read(
+        space,
+        th.kind,
+        &th.owner,
+        th.project_folder.as_ref(),
+        tainted,
+    )?)
 }
 
 #[derive(Clone, Debug)]
@@ -1190,7 +1196,13 @@ async fn read_chat_impl(
 
                 let th = load_thread_head_tx(tx, &scope.space_id, &request.thread).await?;
                 let thread_tainted = th.tainted_mask != 0;
-                auth.authorize_chat_read(&srec.space, th.project_folder.as_ref(), thread_tainted)?;
+                auth.authorize_chat_thread_read(
+                    &srec.space,
+                    th.kind,
+                    &th.owner,
+                    th.project_folder.as_ref(),
+                    thread_tainted,
+                )?;
 
                 let thread_out = ChatThread {
                     id: th.thread_id.clone(),
@@ -1494,7 +1506,13 @@ async fn read_chat_impl(
                     })?;
                     let entry_taint = taint_raw != 0;
                     if entry_taint {
-                        auth.authorize_chat_read(&srec.space, thread_out.project_folder.as_ref(), true)?;
+                        auth.authorize_chat_thread_read(
+                            &srec.space,
+                            thread_out.kind,
+                            &thread_out.owner,
+                            thread_out.project_folder.as_ref(),
+                            true,
+                        )?;
                     }
 
                     entries.push(ChatEntry {
@@ -1686,7 +1704,7 @@ async fn read_chat_pg_single_query(
     let th_rev = RevisionId::parse(ct_head_rev_raw)
         .map_err(|_| internal_not_committed("corrupt_thread_rev", "invalid head_rev_id"))?;
     let thread_tainted = ct_tainted_raw != 0;
-    auth.authorize_chat_read(&space, th_proj.as_ref(), thread_tainted)?;
+    auth.authorize_chat_thread_read(&space, th_kind, &th_owner, th_proj.as_ref(), thread_tainted)?;
 
     let first_e_seq: Option<i64> = hdr.get::<Option<i64>, usize>(10);
     if first_e_seq != Some(tip_i64) {
@@ -1780,7 +1798,13 @@ async fn read_chat_pg_single_query(
             .map_err(|_| internal_not_committed("corrupt_chat_depth", "invalid depth"))?;
         let entry_taint = taint_raw != 0;
         if entry_taint {
-            auth.authorize_chat_read(&space, thread_out.project_folder.as_ref(), true)?;
+            auth.authorize_chat_thread_read(
+                &space,
+                thread_out.kind,
+                &thread_out.owner,
+                thread_out.project_folder.as_ref(),
+                true,
+            )?;
         }
 
         Ok(ChatEntry {
@@ -1892,7 +1916,13 @@ fn read_chat_rusqlite(
         };
 
     let thread_tainted = th.tainted_mask != 0;
-    auth.authorize_chat_read(&srec.space, th.project_folder.as_ref(), thread_tainted)?;
+    auth.authorize_chat_thread_read(
+        &srec.space,
+        th.kind,
+        &th.owner,
+        th.project_folder.as_ref(),
+        thread_tainted,
+    )?;
 
     let thread_out = ChatThread {
         id: th.thread_id,
@@ -2151,7 +2181,13 @@ fn read_chat_rusqlite(
             .map_err(|_| internal_not_committed("corrupt_chat_depth", "invalid depth"))?;
         let entry_taint = taint_raw != 0;
         if entry_taint {
-            auth.authorize_chat_read(&srec.space, thread_out.project_folder.as_ref(), true)?;
+            auth.authorize_chat_thread_read(
+                &srec.space,
+                thread_out.kind,
+                &thread_out.owner,
+                thread_out.project_folder.as_ref(),
+                true,
+            )?;
         }
 
         entries.push(ChatEntry {
@@ -2245,8 +2281,10 @@ async fn create_chat_impl(
                     return Err(DomainError::CrossSpaceTainted.into());
                 }
 
-                auth.authorize_chat_read(
+                auth.authorize_chat_thread_read(
                     &live_space.space,
+                    input.kind,
+                    &input.owner,
                     input.project_folder.as_ref(),
                     tainted,
                 )?;
@@ -3879,8 +3917,10 @@ async fn consume_chat_input_impl(
                     return Err(DomainError::CrossSpaceTainted.into());
                 }
 
-                auth.authorize_chat_read(
+                auth.authorize_chat_thread_read(
                     &live_space.space,
+                    th.kind,
+                    &th.owner,
                     th.project_folder.as_ref(),
                     effective_tainted,
                 )?;

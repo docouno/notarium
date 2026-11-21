@@ -164,11 +164,13 @@ impl OfflineErasures {
     ) {
         let scope = self.source.scope();
         let watermark = derived.watermarks(&scope.space_id).await.unwrap().unwrap();
-        let checkpoint = root.space_fast_index(
+        let checkpoint = find_checkpoint_file(
+            root,
             derived.generation(),
             &scope.space_id,
             watermark.snapshot_seq,
-        );
+        )
+        .unwrap();
         assert!(checkpoint.is_file());
         self.old_checkpoint = Some(checkpoint);
 

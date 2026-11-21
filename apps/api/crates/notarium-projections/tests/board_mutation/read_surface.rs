@@ -395,11 +395,28 @@ async fn scoped_graph(store: &CanonicalStore, runtime: &ProjectorRuntime) {
     assert_eq!(incoming.links.len(), 1);
     assert_eq!(incoming.links[0].source, source);
 
+    let denied_superclusters = engine
+        .query_graph(
+            scoped.clone(),
+            GraphQuery {
+                tier: GraphTier::Superclusters,
+                filter: filter(),
+            },
+        )
+        .await;
+    assert!(
+        matches!(
+            denied_superclusters,
+            Err(PortError::Domain(DomainError::AccessDenied))
+        ),
+        "project-scoped callers must not observe Space-wide Leiden superclusters: {denied_superclusters:?}"
+    );
+
     let settled = tokio::time::timeout(Duration::from_secs(8), async {
         loop {
             let graph = engine
                 .query_graph(
-                    scoped.clone(),
+                    owner.clone(),
                     GraphQuery {
                         tier: GraphTier::Superclusters,
                         filter: filter(),
@@ -412,7 +429,7 @@ async fn scoped_graph(store: &CanonicalStore, runtime: &ProjectorRuntime) {
                 .iter()
                 .map(|node| node.member_count)
                 .sum::<u64>()
-                == 2
+                == 3
             {
                 break graph;
             }
@@ -422,10 +439,7 @@ async fn scoped_graph(store: &CanonicalStore, runtime: &ProjectorRuntime) {
     .await
     .expect("the graph settles without another canonical edit");
     assert!(settled.nodes.iter().all(|node| node.card.is_none()));
-    assert_eq!(
-        settled.hidden_count, 0,
-        "supercluster hidden_count must exclude unauthorized notes"
-    );
+    assert_eq!(settled.hidden_count, 0);
 
     let mut trash = mutation(
         &owner,

@@ -4,7 +4,6 @@ use std::{
 };
 
 use croaring::{Bitmap, Portable};
-use notarium_canonical::codec::encode_msgpack;
 use notarium_core::{
     DomainError,
     error::{PortError, ValidationReason},
@@ -29,7 +28,7 @@ pub(super) async fn settle_mapped_cut(
     let index = engine.open_index_async(current).await?;
     let scope = current.cut.scope.clone();
     let cutoff = current.cut.projected_seq;
-    let previous = deferred_snapshot(current, &index).await?;
+    let previous = deferred_snapshot(current, &index, stop).await?;
     let cancel = stop.clone();
     let (settled, mutations) = tokio::task::spawn_blocking(move || {
         let effective = active_plain(&index)?;
@@ -90,8 +89,8 @@ pub(super) async fn align_for_handoff(
     }
     let source = engine.open_index_async(serving).await?;
     let target = engine.open_index_async(candidate).await?;
-    let source_deferred = deferred_snapshot(serving, &source).await?;
-    let target_deferred = deferred_snapshot(candidate, &target).await?;
+    let source_deferred = deferred_snapshot(serving, &source, stop).await?;
+    let target_deferred = deferred_snapshot(candidate, &target, stop).await?;
     let previously_settled = candidate.watermark.graph_settled_seq == cutoff;
     let scope = scope.clone();
     let cancel = stop.clone();
@@ -105,12 +104,12 @@ pub(super) async fn align_for_handoff(
             settlement: target_deferred.as_ref(),
         };
         let active = active_plain(&target)?;
-        let inherited = |dense| {
-            let note = graph.note_id(dense).ok_or_else(invalid_cluster)?;
-            source
-                .lookup(&note)
-                .and_then(|old| source.cluster_key(old))
-                .ok_or_else(invalid_cluster)
+        // Isolated (degree-0) notes legitimately carry `None` cluster membership;
+        // missing note identity across aligned cuts remains an error.
+        let inherited = |dense| -> Result<Option<crate::index::ClusterKey<'_>>, PortError> {
+            let note = graph.note_id_str(dense).ok_or_else(invalid_cluster)?;
+            let old = source.lookup_str(note).ok_or_else(invalid_cluster)?;
+            Ok(source.cluster_key(old))
         };
         if previously_settled {
             let mut identical = true;
@@ -118,7 +117,7 @@ pub(super) async fn align_for_handoff(
                 if n % 1024 == 0 {
                     super::apply::check_stop(&cancel)?;
                 }
-                if graph.cluster_key(dense) != Some(inherited(dense)?) {
+                if graph.cluster_key(dense) != inherited(dense)? {
                     identical = false;
                     break;
                 }
@@ -132,7 +131,9 @@ pub(super) async fn align_for_handoff(
             if n % 1024 == 0 {
                 super::apply::check_stop(&cancel)?;
             }
-            members.entry(inherited(dense)?).or_default().add(dense);
+            if let Some(key) = inherited(dense)? {
+                members.entry(key).or_default().add(dense);
+            }
         }
         let members = members
             .into_iter()
@@ -160,10 +161,19 @@ pub(super) async fn align_for_handoff(
 async fn deferred_snapshot(
     cut: &PublishedCut,
     index: &IndexView,
+    stop: &Cancellation,
 ) -> Result<Option<LeidenSnapshot>, PortError> {
     match index.deferred_clusters() {
         Some(seq) => Ok(Some(
-            load_clusters(&cut.store, &cut.cut.scope, seq, index.node_count(), None).await?,
+            load_clusters(
+                &cut.store,
+                &cut.cut.scope,
+                seq,
+                index.node_count(),
+                None,
+                stop,
+            )
+            .await?,
         )),
         None => Ok(None),
     }
@@ -177,7 +187,8 @@ pub(super) async fn restore_settlement(
 ) -> Result<L0Delta, PortError> {
     let mut delta = L0Delta::default();
     if settled != SpaceSeq::ZERO {
-        let clusters = load_clusters(store, scope, settled, node_count, None).await?;
+        let stop = Cancellation::default();
+        let clusters = load_clusters(store, scope, settled, node_count, None, &stop).await?;
         delta.settle_clusters(clusters, settled);
     }
     Ok(delta)
@@ -189,17 +200,45 @@ pub(super) async fn load_clusters(
     settled: SpaceSeq,
     node_count: u32,
     only: Option<&ClusterId>,
+    stop: &Cancellation,
 ) -> Result<LeidenSnapshot, PortError> {
-    let mut members = BTreeMap::new();
+    let mut raw_rows = Vec::new();
     let mut after = None;
     let page =
         PageLimit::new(if only.is_some() { 1 } else { 200 }).expect("settlement page is bounded");
     loop {
+        super::apply::check_stop(stop)?;
         let rows = store
             .graph_clusters_page(scope, settled, after.as_ref(), only, page)
             .await?;
         let count = rows.len();
-        for row in rows {
+        after = rows.last().map(|row| row.cluster_id.clone());
+        raw_rows.extend(rows);
+        if count < usize::from(page.get()) || only.is_some() {
+            break;
+        }
+    }
+    let single = only.is_some();
+    let cancel = stop.clone();
+    tokio::task::spawn_blocking(move || {
+        if single {
+            let Some(row) = raw_rows.into_iter().next() else {
+                return Ok(LeidenSnapshot::from_members(0, BTreeMap::new())?);
+            };
+            let bitmap = Bitmap::try_deserialize::<Portable>(&row.members_roaring)
+                .ok_or_else(invalid_cluster)?;
+            if bitmap.cardinality() != row.member_count
+                || bitmap.get_serialized_size_in_bytes::<Portable>() != row.members_roaring.len()
+            {
+                return Err(invalid_cluster());
+            }
+            return Ok(LeidenSnapshot::from_single_cluster(row.cluster_id, bitmap)?);
+        }
+        let mut members = BTreeMap::new();
+        for (idx, row) in raw_rows.into_iter().enumerate() {
+            if idx % 64 == 0 {
+                super::apply::check_stop(&cancel)?;
+            }
             let bitmap = Bitmap::try_deserialize::<Portable>(&row.members_roaring)
                 .ok_or_else(invalid_cluster)?;
             if bitmap.cardinality() != row.member_count
@@ -208,13 +247,11 @@ pub(super) async fn load_clusters(
             {
                 return Err(invalid_cluster());
             }
-            after = Some(row.cluster_id);
         }
-        if count < usize::from(page.get()) || only.is_some() {
-            break;
-        }
-    }
-    Ok(LeidenSnapshot::from_members(node_count, members)?)
+        Ok(LeidenSnapshot::from_members(node_count, members)?)
+    })
+    .await
+    .map_err(checkpoint_error)?
 }
 
 pub(super) fn active_plain(index: &IndexView) -> Result<Bitmap, PortError> {
@@ -240,21 +277,16 @@ pub(super) fn cluster_mutations(
     scope: &HistoryScope,
     seq: SpaceSeq,
 ) -> Result<Vec<DerivedMutation>, PortError> {
+    // MessagePack fixmap(0) — inter-cluster edge weights are computed per
+    // authorized caller on read rather than persisted globally.
+    const EMPTY_MSGPACK_MAP: [u8; 1] = [0x80];
     let mut mutations = Vec::with_capacity(snapshot.members.len() + 1);
     mutations.push(DerivedMutation::DeleteClusters);
     for (cluster, members) in &snapshot.members {
         let mut anchor: Option<&str> = None;
-        let mut edges = BTreeMap::<&ClusterId, u64>::new();
         for dense in members.iter() {
             let note = graph.note_id_str(dense).ok_or_else(invalid_cluster)?;
             anchor = Some(anchor.map_or(note, |current| current.min(note)));
-            for target in graph.outgoing(dense) {
-                if let Some(other) = snapshot.cluster(target)
-                    && other != cluster
-                {
-                    *edges.entry(other).or_default() += 1;
-                }
-            }
         }
         let anchor_note_id = NoteId::parse(anchor.ok_or_else(invalid_cluster)?)?;
         mutations.push(DerivedMutation::UpsertCluster(ProjectedCluster {
@@ -263,7 +295,7 @@ pub(super) fn cluster_mutations(
             member_count: members.cardinality(),
             anchor_note_id,
             members_roaring: members.serialize::<Portable>(),
-            inter_edges_msgpack: encode_msgpack(&edges)?,
+            inter_edges_msgpack: EMPTY_MSGPACK_MAP.to_vec(),
             updated_seq: seq,
         }));
     }
@@ -373,8 +405,7 @@ mod tests {
                         member_count: 1,
                         anchor_note_id: NoteId::from_bytes([6; 16]),
                         members_roaring: member.serialize::<Portable>(),
-                        inter_edges_msgpack: encode_msgpack(&BTreeMap::<ClusterId, u64>::new())
-                            .unwrap(),
+                        inter_edges_msgpack: vec![0x80],
                         updated_seq: seq,
                     }),
                 ],

@@ -246,8 +246,9 @@ async fn set_space_lifecycle(
 async fn offline_sqlite_purge_cleans_derived_db_and_mmap_checkpoint() {
     let scratch = Scratch::new();
     let root = scratch.root();
+    let installation = InstallationId::from_bytes(rand16());
     let (store, canonical) = CanonicalRuntime::open(CanonicalConfig::local_default(
-        InstallationId::from_bytes(rand16()),
+        installation.clone(),
         root.clone(),
     ))
     .await
@@ -274,7 +275,16 @@ async fn offline_sqlite_purge_cleans_derived_db_and_mmap_checkpoint() {
     .unwrap();
     sync(&store, &runtime, &scope).await;
     let head_before = store.read_space(&scope.space_id).await.unwrap().last_seq;
-    let checkpoint = root.space_fast_index(gen1, &scope.space_id, head_before);
+    let checkpoint = std::fs::read_dir(root.space_fast_index_dir(gen1, &scope.space_id))
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|s| s.starts_with(&format!("fast_index_{}", head_before.get())))
+        })
+        .unwrap();
     assert!(checkpoint.is_file());
 
     // Stop the projector while leaving canonical running with its registered eraser.
@@ -314,8 +324,9 @@ async fn offline_sqlite_purge_cleans_derived_db_and_mmap_checkpoint() {
 async fn is_live_visible_hydrate_and_note_links_enforce_cross_space_taint_and_auth() {
     let scratch = Scratch::new();
     let root = scratch.root();
+    let installation = InstallationId::from_bytes(rand16());
     let (store, canonical) = CanonicalRuntime::open(CanonicalConfig::local_default(
-        InstallationId::from_bytes(rand16()),
+        installation.clone(),
         root.clone(),
     ))
     .await
@@ -547,8 +558,9 @@ async fn is_live_visible_hydrate_and_note_links_enforce_cross_space_taint_and_au
 async fn folder_by_path_ignores_trashed_collision_and_list_notes_hydrates_cover_page() {
     let scratch = Scratch::new();
     let root = scratch.root();
+    let installation = InstallationId::from_bytes(rand16());
     let (store, canonical) = CanonicalRuntime::open(CanonicalConfig::local_default(
-        InstallationId::from_bytes(rand16()),
+        installation.clone(),
         root.clone(),
     ))
     .await
@@ -800,8 +812,9 @@ async fn lagged_folder_visibility_yields_to_writers_and_rejects_a_mixed_head() {
 
     let scratch = Scratch::new();
     let root = scratch.root();
+    let installation = InstallationId::from_bytes(rand16());
     let (store, canonical) = CanonicalRuntime::open(CanonicalConfig::local_default(
-        InstallationId::from_bytes(rand16()),
+        installation.clone(),
         root.clone(),
     ))
     .await
@@ -882,8 +895,28 @@ async fn lagged_folder_visibility_yields_to_writers_and_rejects_a_mixed_head() {
             if diagnostic.reason == ValidationReason::CursorStale
     ));
 
+    // Restricted project-scoped readers are denied whole-Space Superclusters.
+    let superclusters_err = engine
+        .query_graph(
+            reader.clone(),
+            GraphQuery {
+                tier: GraphTier::Superclusters,
+                filter: empty_filter(),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        superclusters_err,
+        PortError::Domain(DomainError::AccessDenied)
+    ));
+
     let graph = GraphQuery {
-        tier: GraphTier::Superclusters,
+        tier: GraphTier::Lens {
+            cluster: None,
+            project: Some(project.clone()),
+            tags: Vec::new(),
+        },
         filter: empty_filter(),
     };
     let cancelled = SpaceContext::new(reader.auth().clone(), scope.clone(), budget()).unwrap();
@@ -913,8 +946,9 @@ async fn lagged_folder_visibility_yields_to_writers_and_rejects_a_mixed_head() {
 async fn ryow_exact_falls_back_to_wait_on_intervening_schema_or_folder_mutation() {
     let scratch = Scratch::new();
     let root = scratch.root();
+    let installation = InstallationId::from_bytes(rand16());
     let (store, canonical) = CanonicalRuntime::open(CanonicalConfig::local_default(
-        InstallationId::from_bytes(rand16()),
+        installation.clone(),
         root.clone(),
     ))
     .await
@@ -1110,8 +1144,9 @@ async fn ryow_exact_falls_back_to_wait_on_intervening_schema_or_folder_mutation(
 async fn per_space_event_channels_isolate_bursts_and_purge_scrubs_board_deltas() {
     let scratch = Scratch::new();
     let root = scratch.root();
+    let installation = InstallationId::from_bytes(rand16());
     let (store, canonical) = CanonicalRuntime::open(CanonicalConfig::local_default(
-        InstallationId::from_bytes(rand16()),
+        installation.clone(),
         root.clone(),
     ))
     .await
@@ -1305,8 +1340,9 @@ async fn per_space_event_channels_isolate_bursts_and_purge_scrubs_board_deltas()
 async fn shared_space_personal_chat_does_not_leak_and_exact_number_board_parity() {
     let scratch = Scratch::new();
     let root = scratch.root();
+    let installation = InstallationId::from_bytes(rand16());
     let (store, canonical) = CanonicalRuntime::open(CanonicalConfig::local_default(
-        InstallationId::from_bytes(rand16()),
+        installation.clone(),
         root.clone(),
     ))
     .await
@@ -1657,8 +1693,9 @@ async fn security_admission_and_lifecycle_regressions() {
 
     let scratch = Scratch::new();
     let root = scratch.root();
+    let installation = InstallationId::from_bytes(rand16());
     let (store, canonical) = CanonicalRuntime::open(CanonicalConfig::local_default(
-        InstallationId::from_bytes(rand16()),
+        installation.clone(),
         root.clone(),
     ))
     .await
@@ -1805,6 +1842,980 @@ async fn security_admission_and_lifecycle_regressions() {
     );
 
     canonical.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn personal_chat_audience_isolation_and_deferred_backlink_taint() {
+    use notarium_core::ports::{ChangeRead, ChangeReadResult, ChatRead, EntityId};
+
+    let scratch = Scratch::new();
+    let root = scratch.root();
+    let installation = InstallationId::from_bytes(rand16());
+    let (store, canonical) = CanonicalRuntime::open(CanonicalConfig::local_default(
+        installation.clone(),
+        root.clone(),
+    ))
+    .await
+    .unwrap();
+    let (scope_a, owner_a) = open_space(&store, SpaceKind::Shared).await;
+    let (scope_a_personal, owner_a_personal) = open_space(&store, SpaceKind::Personal).await;
+    let (scope_b, owner_b_home) = open_space(&store, SpaceKind::Personal).await;
+    let principal_a = owner_a.auth().principal().clone();
+    let principal_a_personal = owner_a_personal.auth().principal().clone();
+    let principal_b = owner_b_home.auth().principal().clone();
+    let owner_b_in_a = owner_ctx(&scope_a, &principal_b);
+
+    let target_a = create_note(
+        &store,
+        &owner_a,
+        None,
+        "target-a",
+        DocClass::UserDoc,
+        "# Target A\n".into(),
+    )
+    .await;
+    let target_b = create_note(
+        &store,
+        &owner_b_home,
+        None,
+        "target-b",
+        DocClass::UserDoc,
+        "# Target B\n".into(),
+    )
+    .await;
+
+    let runtime = ProjectorRuntime::start_sqlite(
+        store.clone(),
+        projection_ctx(),
+        root,
+        ProjectionGeneration::new(1).unwrap(),
+        ProjectionConfig::default(),
+    )
+    .await
+    .unwrap();
+    let engine = runtime.engine();
+    sync(&store, &runtime, &scope_a).await;
+    sync(&store, &runtime, &scope_a_personal).await;
+    sync(&store, &runtime, &scope_b).await;
+
+    let head_a_before = store.read_space(&scope_a.space_id).await.unwrap().last_seq;
+    let thread = ChatThreadId::from_bytes(rand16());
+    store
+        .create_chat(
+            owner_a.clone(),
+            mutation(
+                &owner_a,
+                CreateChat {
+                    thread: thread.clone(),
+                    kind: ChatThreadKind::Personal,
+                    owner: principal_a.clone(),
+                    project_folder: None,
+                    title: "Owner A private thread".into(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let appended = store
+        .append_chat(
+            owner_a.clone(),
+            mutation(
+                &owner_a,
+                AppendChat {
+                    thread: thread.clone(),
+                    parent: ThreadEntrySeq::ZERO,
+                    kind: ChatEntryKind::Human,
+                    body: ChatInputBody::Text("Mentions note A".into()),
+                    referenced_notes: vec![NoteRef {
+                        space_id: scope_a.space_id.clone(),
+                        note_id: target_a.note.clone(),
+                    }],
+                    tainted: false,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    sync(&store, &runtime, &scope_a).await;
+    let head_a_after = store.read_space(&scope_a.space_id).await.unwrap().last_seq;
+
+    // Cross-space chat backlink from a Personal Space referencing target_b in scope_b.
+    let owner_a_cross_grants = BTreeMap::from([
+        (
+            scope_a_personal.space_id.clone(),
+            SpaceGrant {
+                role: SpaceRole::Owner,
+                read_classes: DocClass::all(),
+                write_classes: DocClass::all(),
+                project_root: None,
+            },
+        ),
+        (
+            scope_b.space_id.clone(),
+            SpaceGrant {
+                role: SpaceRole::Viewer,
+                read_classes: DocClass::all(),
+                write_classes: Default::default(),
+                project_root: None,
+            },
+        ),
+    ]);
+    let owner_a_cross = SpaceContext::new(
+        EngineAuthContext::for_human(VerifiedHuman::attest(
+            principal_a_personal.clone(),
+            GrantId::from_bytes(rand16()),
+            owner_a_cross_grants,
+            false,
+        )),
+        scope_a_personal.clone(),
+        budget(),
+    )
+    .unwrap();
+    let cross_thread = ChatThreadId::from_bytes(rand16());
+    store
+        .create_chat(
+            owner_a_cross.clone(),
+            mutation(
+                &owner_a_cross,
+                CreateChat {
+                    thread: cross_thread.clone(),
+                    kind: ChatThreadKind::Personal,
+                    owner: principal_a_personal,
+                    project_folder: None,
+                    title: "Cross-space private thread".into(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    store
+        .append_chat(
+            owner_a_cross.clone(),
+            mutation(
+                &owner_a_cross,
+                AppendChat {
+                    thread: cross_thread,
+                    parent: ThreadEntrySeq::ZERO,
+                    kind: ChatEntryKind::Human,
+                    body: ChatInputBody::Text("Mentions foreign note B".into()),
+                    referenced_notes: vec![NoteRef {
+                        space_id: scope_b.space_id.clone(),
+                        note_id: target_b.note.clone(),
+                    }],
+                    tainted: false,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    sync(&store, &runtime, &scope_a_personal).await;
+
+    let full_grants_a = BTreeMap::from([(
+        scope_a.space_id.clone(),
+        SpaceGrant {
+            role: SpaceRole::Owner,
+            read_classes: DocClass::all(),
+            write_classes: DocClass::all(),
+            project_root: None,
+        },
+    )]);
+    let human_a = EngineAuthContext::for_human(VerifiedHuman::attest(
+        principal_a.clone(),
+        GrantId::from_bytes(rand16()),
+        full_grants_a.clone(),
+        false,
+    ));
+    let shared_agent_a = SpaceContext::new(
+        human_a
+            .for_agent_run(
+                AgentRunId::from_bytes(rand16()),
+                scope_a.space_id.clone(),
+                ChatAudience::Shared,
+                full_grants_a.clone(),
+            )
+            .unwrap(),
+        scope_a.clone(),
+        budget(),
+    )
+    .unwrap();
+    let personal_agent_a = SpaceContext::new(
+        human_a
+            .for_agent_run(
+                AgentRunId::from_bytes(rand16()),
+                scope_a.space_id.clone(),
+                ChatAudience::Personal,
+                full_grants_a,
+            )
+            .unwrap(),
+        scope_a.clone(),
+        budget(),
+    )
+    .unwrap();
+
+    let read_req = ChatRead {
+        thread: thread.clone(),
+        leaf: appended.value.seq,
+        before: None,
+        max_entries: PageLimit::new(10).unwrap(),
+    };
+    assert!(
+        store
+            .read_chat(owner_a.clone(), read_req.clone())
+            .await
+            .is_ok()
+    );
+    assert!(
+        store
+            .read_chat(personal_agent_a.clone(), read_req.clone())
+            .await
+            .is_ok()
+    );
+    assert!(matches!(
+        store
+            .read_chat(owner_b_in_a.clone(), read_req.clone())
+            .await,
+        Err(PortError::Domain(DomainError::ResourceNotFound))
+    ));
+    assert!(matches!(
+        store.read_chat(shared_agent_a.clone(), read_req).await,
+        Err(PortError::Domain(DomainError::ResourceNotFound))
+    ));
+
+    let await_all = CausalBasis::Await(AwaitWatermarks::default());
+    assert_eq!(
+        LinkReadPort::chat_backlinks(
+            engine.as_ref(),
+            owner_a.clone(),
+            target_a.note.clone(),
+            await_all.clone(),
+        )
+        .await
+        .unwrap()
+        .len(),
+        1
+    );
+    assert_eq!(
+        LinkReadPort::chat_backlinks(
+            engine.as_ref(),
+            personal_agent_a,
+            target_a.note.clone(),
+            await_all.clone(),
+        )
+        .await
+        .unwrap()
+        .len(),
+        1
+    );
+    assert!(
+        LinkReadPort::chat_backlinks(
+            engine.as_ref(),
+            owner_b_in_a,
+            target_a.note.clone(),
+            await_all.clone(),
+        )
+        .await
+        .unwrap()
+        .is_empty()
+    );
+    assert!(
+        LinkReadPort::chat_backlinks(
+            engine.as_ref(),
+            shared_agent_a.clone(),
+            target_a.note.clone(),
+            await_all.clone(),
+        )
+        .await
+        .unwrap()
+        .is_empty()
+    );
+
+    let ChangeReadResult::Log(log_page) = ProjectedNoteReadPort::new(engine.clone())
+        .recent_activity(
+            shared_agent_a,
+            ChangeRead::Log {
+                after: ChangeCursor {
+                    scope: scope_a.clone(),
+                    after: head_a_before,
+                },
+                through: head_a_after,
+                limit: PageLimit::new(50).unwrap(),
+            },
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("expected log page");
+    };
+    assert!(
+        !log_page
+            .changes
+            .iter()
+            .any(|row| row.entity == EntityId::Thread(thread.clone())),
+        "Shared-audience agent must not observe Personal thread changes in recent_activity"
+    );
+
+    let cross_grants_b = BTreeMap::from([
+        (
+            scope_b.space_id.clone(),
+            SpaceGrant {
+                role: SpaceRole::Owner,
+                read_classes: DocClass::all(),
+                write_classes: DocClass::all(),
+                project_root: None,
+            },
+        ),
+        (
+            scope_a_personal.space_id.clone(),
+            SpaceGrant {
+                role: SpaceRole::Viewer,
+                read_classes: DocClass::all(),
+                write_classes: Default::default(),
+                project_root: None,
+            },
+        ),
+    ]);
+    let human_b = EngineAuthContext::for_human(VerifiedHuman::attest(
+        principal_b,
+        GrantId::from_bytes(rand16()),
+        cross_grants_b.clone(),
+        false,
+    ));
+    let agent_b_in_b = SpaceContext::new(
+        human_b
+            .for_agent_run(
+                AgentRunId::from_bytes(rand16()),
+                scope_b.space_id.clone(),
+                ChatAudience::Personal,
+                cross_grants_b,
+            )
+            .unwrap(),
+        scope_b.clone(),
+        budget(),
+    )
+    .unwrap();
+    assert!(!agent_b_in_b.auth().taint().is_tainted());
+    let backlinks_b = LinkReadPort::chat_backlinks(
+        engine.as_ref(),
+        agent_b_in_b.clone(),
+        target_b.note,
+        await_all,
+    )
+    .await
+    .unwrap();
+    assert!(backlinks_b.is_empty());
+    assert!(
+        !agent_b_in_b.auth().taint().is_tainted(),
+        "hidden foreign Personal chat candidate must not taint caller"
+    );
+
+    runtime.shutdown().await.unwrap();
+    canonical.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn event_scrub_on_redact_chat_and_restricted_subscriber_floor() {
+    use notarium_core::ports::{ChatRead, RedactChatEntry};
+
+    let scratch = Scratch::new();
+    let root = scratch.root();
+    let installation = InstallationId::from_bytes(rand16());
+    let (store, canonical) = CanonicalRuntime::open(CanonicalConfig::local_default(
+        installation.clone(),
+        root.clone(),
+    ))
+    .await
+    .unwrap();
+    let (scope, owner) = open_space(&store, SpaceKind::Personal).await;
+    let note = create_note(
+        &store,
+        &owner,
+        None,
+        "linked",
+        DocClass::UserDoc,
+        "# Linked\n".into(),
+    )
+    .await;
+    let runtime = ProjectorRuntime::start_sqlite(
+        store.clone(),
+        projection_ctx(),
+        root,
+        ProjectionGeneration::new(1).unwrap(),
+        ProjectionConfig::default(),
+    )
+    .await
+    .unwrap();
+    let engine = runtime.engine();
+    sync(&store, &runtime, &scope).await;
+    let base_head = store.read_space(&scope.space_id).await.unwrap().last_seq;
+
+    let thread = ChatThreadId::from_bytes(rand16());
+    store
+        .create_chat(
+            owner.clone(),
+            mutation(
+                &owner,
+                CreateChat {
+                    thread: thread.clone(),
+                    kind: ChatThreadKind::Personal,
+                    owner: owner.auth().principal().clone(),
+                    project_folder: None,
+                    title: "Scrub test".into(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    sync(&store, &runtime, &scope).await;
+    let pre_append_head = store.read_space(&scope.space_id).await.unwrap().last_seq;
+
+    let bus = engine.event_bus();
+    let mut owner_stream = bus
+        .subscribe(
+            owner.clone(),
+            ChangeCursor {
+                scope: scope.clone(),
+                after: pre_append_head,
+            },
+        )
+        .await
+        .unwrap();
+    let restricted_grants = BTreeMap::from([(
+        scope.space_id.clone(),
+        SpaceGrant {
+            role: SpaceRole::Viewer,
+            read_classes: [DocClass::UserDoc].into_iter().collect(),
+            write_classes: Default::default(),
+            project_root: None,
+        },
+    )]);
+    let restricted_ctx = SpaceContext::new(
+        EngineAuthContext::for_human(VerifiedHuman::attest(
+            PrincipalId::from_bytes(rand16()),
+            GrantId::from_bytes(rand16()),
+            restricted_grants,
+            false,
+        )),
+        scope.clone(),
+        budget(),
+    )
+    .unwrap();
+    let mut restricted_stream = bus
+        .subscribe(
+            restricted_ctx,
+            ChangeCursor {
+                scope: scope.clone(),
+                after: base_head,
+            },
+        )
+        .await
+        .unwrap();
+
+    let appended = store
+        .append_chat(
+            owner.clone(),
+            mutation(
+                &owner,
+                AppendChat {
+                    thread: thread.clone(),
+                    parent: ThreadEntrySeq::ZERO,
+                    kind: ChatEntryKind::Human,
+                    body: ChatInputBody::Text("Sensitive secret".into()),
+                    referenced_notes: vec![NoteRef {
+                        space_id: scope.space_id.clone(),
+                        note_id: note.note,
+                    }],
+                    tainted: false,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    sync(&store, &runtime, &scope).await;
+
+    let branch = store
+        .read_chat(
+            owner.clone(),
+            ChatRead {
+                thread: thread.clone(),
+                leaf: appended.value.seq,
+                before: None,
+                max_entries: PageLimit::new(10).unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+
+    store
+        .redact_chat_entry(
+            owner.clone(),
+            mutation(
+                &owner,
+                RedactChatEntry {
+                    thread,
+                    entry: appended.value.seq,
+                    expected_thread_revision: branch.thread.revision,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    sync(&store, &runtime, &scope).await;
+
+    let first_event = tokio::time::timeout(Duration::from_secs(3), owner_stream.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(first_event.kind, SpaceEventKind::ResyncRequired),
+        "pure RedactChatEntry must scrub queued Changed events into ResyncRequired, got: {first_event:?}"
+    );
+
+    let restricted_event = tokio::time::timeout(Duration::from_secs(3), restricted_stream.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        restricted_event.kind,
+        SpaceEventKind::ResyncRequired
+    ));
+    assert_eq!(
+        restricted_event.seq, base_head,
+        "restricted subscriber must not observe global projected_seq in ResyncRequired"
+    );
+
+    runtime.shutdown().await.unwrap();
+    canonical.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn live_single_purge_recovers_incrementally_without_reading_surviving_blobs() {
+    let scratch = Scratch::new();
+    let root = scratch.root();
+    let installation = InstallationId::from_bytes(rand16());
+    let (store, canonical) = CanonicalRuntime::open(CanonicalConfig::local_default(
+        installation.clone(),
+        root.clone(),
+    ))
+    .await
+    .unwrap();
+    let (scope, owner) = open_space(&store, SpaceKind::Personal).await;
+    let (parent_folder, _) = create_folder(&store, &owner, None, "parent", false).await;
+    let (child_folder, _) =
+        create_folder(&store, &owner, Some(parent_folder.clone()), "child", false).await;
+
+    let victim = create_note(
+        &store,
+        &owner,
+        Some(child_folder.clone()),
+        "shared-topic",
+        DocClass::UserDoc,
+        "# Shared Topic\n".into(),
+    )
+    .await;
+    let fallback = create_note(
+        &store,
+        &owner,
+        Some(parent_folder.clone()),
+        "shared-topic",
+        DocClass::UserDoc,
+        "# Shared Topic\n".into(),
+    )
+    .await;
+    let linker = create_note(
+        &store,
+        &owner,
+        None,
+        "linker",
+        DocClass::UserDoc,
+        "Points to [[shared-topic]].\n".into(),
+    )
+    .await;
+
+    let gen1 = ProjectionGeneration::new(1).unwrap();
+    let runtime = ProjectorRuntime::start_sqlite(
+        store.clone(),
+        projection_ctx(),
+        root.clone(),
+        gen1,
+        ProjectionConfig::default(),
+    )
+    .await
+    .unwrap();
+    let engine = runtime.engine();
+    sync(&store, &runtime, &scope).await;
+    let seq_before = store.read_space(&scope.space_id).await.unwrap().last_seq;
+
+    let dir = root.space_fast_index_dir(gen1, &scope.space_id);
+    let prefix = format!("fast_index_{}_", seq_before.get());
+    let nonce_file = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .find(|name| name.starts_with(&prefix) && name.ends_with(".mmap"))
+        .expect("published checkpoint must carry a publication nonce");
+    let nonce_hex = nonce_file
+        .strip_prefix(&prefix)
+        .unwrap()
+        .strip_suffix(".mmap")
+        .unwrap();
+    assert_eq!(nonce_hex.len(), 32);
+    assert!(nonce_hex.bytes().all(|b| b.is_ascii_hexdigit()));
+
+    let before_links = LinkReadPort::note_links(
+        engine.as_ref(),
+        owner.clone(),
+        linker.note.clone(),
+        NoteLinkDirection::Outgoing,
+        None,
+        PageLimit::new(10).unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(before_links.links.len(), 1);
+    assert_eq!(before_links.links[0].target, Some(victim.note.clone()));
+
+    // Hide surviving notes' canonical CAS blobs so any full-Space CAS reseed would fail.
+    let notes_page = store
+        .read_projection_notes_page(
+            &projection_ctx(),
+            &scope,
+            seq_before,
+            None,
+            PageLimit::new(10).unwrap(),
+        )
+        .await
+        .unwrap();
+    let mut hidden_blobs = Vec::new();
+    for row in notes_page.rows {
+        if row.metadata.note_id != victim.note
+            && let Some(digest) = row.metadata.content_digest
+        {
+            let path = root.blob(&scope.space_id, digest);
+            let backup = path.with_extension("hidden-during-incremental-purge");
+            std::fs::rename(&path, &backup).unwrap();
+            hidden_blobs.push((path, backup));
+        }
+    }
+    assert_eq!(hidden_blobs.len(), 2);
+
+    store
+        .delete_note(
+            owner.clone(),
+            mutation(
+                &owner,
+                DeleteNote {
+                    note: victim.note.clone(),
+                    disposition: DeleteDisposition::Purge,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    sync(&store, &runtime, &scope).await;
+
+    for (original, backup) in hidden_blobs {
+        std::fs::rename(backup, original).unwrap();
+    }
+
+    let after_links = LinkReadPort::note_links(
+        engine.as_ref(),
+        owner.clone(),
+        linker.note.clone(),
+        NoteLinkDirection::Outgoing,
+        None,
+        PageLimit::new(10).unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(after_links.links.len(), 1);
+    assert_eq!(after_links.links[0].target, Some(fallback.note.clone()));
+
+    let db = rusqlite::Connection::open(root.derived(gen1)).unwrap();
+    let count_for = |folder: &FolderId| -> i64 {
+        db.query_row(
+            "SELECT active_note_count FROM projected_folders WHERE space_id = ? AND folder_id = ?",
+            [scope.space_id.as_str(), folder.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(count_for(&child_folder), 0);
+    assert_eq!(count_for(&parent_folder), 1);
+
+    runtime.shutdown().await.unwrap();
+    canonical.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn root_non_recursive_listing_supercluster_csprng_and_decommission_gate() {
+    use notarium_canonical::StoppedProjectionDeployment;
+    use notarium_core::{
+        error::ValidationReason,
+        ports::{GraphNodeId, GraphQuery, GraphTier},
+    };
+
+    let scratch = Scratch::new();
+    let root = scratch.root();
+    let installation = InstallationId::from_bytes(rand16());
+    let (store, canonical) = CanonicalRuntime::open(CanonicalConfig::local_default(
+        installation.clone(),
+        root.clone(),
+    ))
+    .await
+    .unwrap();
+    let (scope, owner) = open_space(&store, SpaceKind::Personal).await;
+    let (project, _) = create_folder(&store, &owner, None, "proj", true).await;
+    let (sub, _) = create_folder(&store, &owner, Some(project.clone()), "sub", false).await;
+
+    let root_note = create_note(
+        &store,
+        &owner,
+        None,
+        "root-only",
+        DocClass::UserDoc,
+        "# Root\n".into(),
+    )
+    .await;
+    let proj_note = create_note(
+        &store,
+        &owner,
+        Some(project.clone()),
+        "proj-direct",
+        DocClass::UserDoc,
+        "# Proj\n".into(),
+    )
+    .await;
+    let sub_note = create_note(
+        &store,
+        &owner,
+        Some(sub.clone()),
+        "sub-nested",
+        DocClass::UserDoc,
+        format!("# Sub\nLinks to [[{}]].\n", proj_note.note),
+    )
+    .await;
+
+    let (scope2, owner2) = open_space(&store, SpaceKind::Personal).await;
+    let n1 = store
+        .create_note(
+            owner2.clone(),
+            mutation(
+                &owner2,
+                CreateNote {
+                    note: proj_note.note.clone(),
+                    parent: None,
+                    slug: "n1".into(),
+                    class: DocClass::UserDoc,
+                    carrier: "# N1\n".into(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let _n2 = store
+        .create_note(
+            owner2.clone(),
+            mutation(
+                &owner2,
+                CreateNote {
+                    note: sub_note.note.clone(),
+                    parent: None,
+                    slug: "n2".into(),
+                    class: DocClass::UserDoc,
+                    carrier: format!("# N2 [[{}]]\n", n1.value.note),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+
+    let runtime = ProjectorRuntime::start_sqlite(
+        store.clone(),
+        projection_ctx(),
+        root.clone(),
+        ProjectionGeneration::new(1).unwrap(),
+        ProjectionConfig::default(),
+    )
+    .await
+    .unwrap();
+    let engine = runtime.engine();
+    sync(&store, &runtime, &scope).await;
+    sync(&store, &runtime, &scope2).await;
+
+    let read_port = engine.note_reads();
+    let direct_root = read_port
+        .list_notes(
+            owner.clone(),
+            ReadRequest::Open {
+                query: NoteQuery {
+                    folder: None,
+                    recursive: false,
+                    classes: DocClass::all(),
+                    lifecycle: LifecycleMask::Active,
+                    filter: empty_filter(),
+                    sort: SortSpec::default(),
+                    limit: PageLimit::new(20).unwrap(),
+                },
+                causal: CausalBasis::Await(AwaitWatermarks::default()),
+            },
+        )
+        .await
+        .unwrap();
+    let root_ids: BTreeSet<_> = direct_root
+        .children
+        .items
+        .iter()
+        .map(|row| row.document.reference().note_id.clone())
+        .collect();
+    assert_eq!(root_ids, BTreeSet::from([root_note.note.clone()]));
+
+    let proj_grants = BTreeMap::from([(
+        scope.space_id.clone(),
+        SpaceGrant {
+            role: SpaceRole::Editor,
+            read_classes: DocClass::all(),
+            write_classes: DocClass::all(),
+            project_root: Some(project.clone()),
+        },
+    )]);
+    let proj_ctx = SpaceContext::new(
+        EngineAuthContext::for_human(VerifiedHuman::attest(
+            PrincipalId::from_bytes(rand16()),
+            GrantId::from_bytes(rand16()),
+            proj_grants,
+            false,
+        )),
+        scope.clone(),
+        budget(),
+    )
+    .unwrap();
+    let direct_proj = read_port
+        .list_notes(
+            proj_ctx.clone(),
+            ReadRequest::Open {
+                query: NoteQuery {
+                    folder: None,
+                    recursive: false,
+                    classes: DocClass::all(),
+                    lifecycle: LifecycleMask::Active,
+                    filter: empty_filter(),
+                    sort: SortSpec::default(),
+                    limit: PageLimit::new(20).unwrap(),
+                },
+                causal: CausalBasis::Await(AwaitWatermarks::default()),
+            },
+        )
+        .await
+        .unwrap();
+    let proj_ids: BTreeSet<_> = direct_proj
+        .children
+        .items
+        .iter()
+        .map(|row| row.document.reference().note_id.clone())
+        .collect();
+    assert_eq!(proj_ids, BTreeSet::from([proj_note.note.clone()]));
+
+    let super_err = engine
+        .query_graph(
+            proj_ctx,
+            GraphQuery {
+                tier: GraphTier::Superclusters,
+                filter: empty_filter(),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        super_err,
+        PortError::Domain(DomainError::AccessDenied)
+    ));
+
+    let sc = engine
+        .query_graph(
+            owner.clone(),
+            GraphQuery {
+                tier: GraphTier::Superclusters,
+                filter: empty_filter(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        sc.nodes.len(),
+        1,
+        "isolated degree-0 note must not create a singleton cluster"
+    );
+    let GraphNodeId::Cluster(cluster_1) = sc.nodes[0].id.clone() else {
+        panic!("expected cluster node");
+    };
+
+    let sc2 = engine
+        .query_graph(
+            owner2,
+            GraphQuery {
+                tier: GraphTier::Superclusters,
+                filter: empty_filter(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(sc2.nodes.len(), 1);
+    let GraphNodeId::Cluster(cluster_2) = sc2.nodes[0].id.clone() else {
+        panic!("expected cluster node");
+    };
+    assert_ne!(
+        cluster_1, cluster_2,
+        "fresh ClusterId must be 128-bit CSPRNG, not derived from anchor NoteId"
+    );
+
+    let cache_id = std::fs::read_to_string(root.root().join("v1/projection_cache_id"))
+        .unwrap()
+        .trim()
+        .to_owned();
+    let revocation = MaintenanceContext {
+        authority: ServiceAuthority::admit(ServicePurpose::Revocation),
+        budget: budget(),
+    };
+    let witness = StoppedProjectionDeployment::attest(cache_id.clone()).unwrap();
+    let attached_err = store
+        .confirm_projection_cleanup_decommissioned(&revocation, witness)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        attached_err,
+        PortError::Domain(DomainError::ValidationFailed { diagnostic })
+            if diagnostic.reason == ValidationReason::NotReady
+    ));
+
+    runtime.shutdown().await.unwrap();
+    canonical.shutdown().await.unwrap();
+    drop(store);
+
+    let (reopened_store, reopened_canonical) =
+        CanonicalRuntime::open(CanonicalConfig::local_default(installation, root.clone()))
+            .await
+            .unwrap();
+    let witness = StoppedProjectionDeployment::attest(cache_id).unwrap();
+    reopened_store
+        .confirm_projection_cleanup_decommissioned(&revocation, witness)
+        .await
+        .unwrap();
+    reopened_store
+        .delete_note(
+            owner.clone(),
+            mutation(
+                &owner,
+                DeleteNote {
+                    note: root_note.note,
+                    disposition: DeleteDisposition::Purge,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    reopened_canonical.shutdown().await.unwrap();
 }
 
 #[path = "projection_regressions/read_windows.rs"]

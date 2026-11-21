@@ -61,7 +61,7 @@ pub use projection_fence::{
     FenceMemoryUsage, LiveDenseLookup, LiveLifecycleFence, LiveNoteStatus, LiveReadPermit,
     LiveSpaceHandle, ProjectionCleanupRegistration, ProjectionErasures, ProjectionOwnerIdentity,
     ProjectionOwnerWitness, ProjectionRedactedEntry, ProjectionVisibilityCleanup,
-    StoppedProjectionOwner,
+    StoppedProjectionDeployment, StoppedProjectionOwner,
 };
 pub use runtime::{
     CanonicalRuntime, CanonicalStore, CreateFolderSpec, CreateSpaceSpec, SpaceRecord,

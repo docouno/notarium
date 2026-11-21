@@ -20,7 +20,7 @@ use notarium_core::{
         Direction, FieldObservation, FieldSchema, FieldValue, Predicate, SortCell, SortColumn,
         SortSpec, SortTuple,
     },
-    value::{ScalarValue, Timestamp},
+    value::{ExactNumber, ScalarValue, Timestamp},
 };
 
 use notarium_syntax::unicode::lookup_key;
@@ -180,7 +180,9 @@ pub fn structural_universe(
     auth: &EngineAuthContext,
 ) -> Result<Bitmap, PortError> {
     let mut visible = note_universe(index, space, auth, LifecycleMask::Active)?;
-    visible.andnot_inplace(&posting(index, &PostingKey::Encrypted)?);
+    index
+        .andnot_posting_inplace(&mut visible, &PostingKey::Encrypted)
+        .map_err(index_failure)?;
     Ok(visible)
 }
 
@@ -211,20 +213,29 @@ pub fn note_universe(
             visible
         }
     };
-    let mut active = posting(index, &PostingKey::Active)?;
     match lifecycle {
         LifecycleMask::Active => {
-            active.andnot_inplace(&posting(index, &PostingKey::TrashedSubtree)?);
+            index
+                .and_posting_inplace(&mut visible, &PostingKey::Active)
+                .map_err(index_failure)?;
+            index
+                .andnot_posting_inplace(&mut visible, &PostingKey::TrashedSubtree)
+                .map_err(index_failure)?;
         }
         LifecycleMask::Trashed => {
-            active.and_inplace(&posting(index, &PostingKey::TrashedSubtree)?);
+            let mut active = posting(index, &PostingKey::Active)?;
+            index
+                .and_posting_inplace(&mut active, &PostingKey::TrashedSubtree)
+                .map_err(index_failure)?;
             active.or_inplace(&posting(index, &PostingKey::Trashed)?);
+            visible.and_inplace(&active);
         }
         LifecycleMask::ActiveAndTrashed => {
+            let mut active = posting(index, &PostingKey::Active)?;
             active.or_inplace(&posting(index, &PostingKey::Trashed)?);
+            visible.and_inplace(&active);
         }
     }
-    visible.and_inplace(&active);
     Ok(visible)
 }
 
@@ -235,12 +246,26 @@ pub fn view_source_candidates(
     mut universe: Bitmap,
 ) -> Result<Bitmap, PortError> {
     universe.and_inplace(&class_union(index, &source.classes)?);
-    universe.andnot_inplace(&posting(index, &PostingKey::Encrypted)?);
+    index
+        .andnot_posting_inplace(&mut universe, &PostingKey::Encrypted)
+        .map_err(index_failure)?;
     if let Some(folder) = folder {
         universe.and_inplace(&folder_notes(index, folder, source.recursive)?);
     }
     for tag in &source.tags {
-        universe.and_inplace(&posting(index, &PostingKey::Tag(tag.clone()))?);
+        if universe.is_empty() {
+            break;
+        }
+        if index.tags_bucketed() {
+            let hits = index
+                .tag_candidates(tag, &universe)
+                .map_err(index_failure)?;
+            universe = hits.into_possible();
+        } else {
+            index
+                .and_posting_inplace(&mut universe, &PostingKey::Tag(tag.clone()))
+                .map_err(index_failure)?;
+        }
     }
     Ok(universe)
 }
@@ -248,11 +273,14 @@ pub fn view_source_candidates(
 pub fn note_source_candidates(
     index: &IndexView,
     query: &NoteQuery,
+    entry: &FolderId,
     mut universe: Bitmap,
 ) -> Result<Bitmap, PortError> {
     universe.and_inplace(&class_union(index, &query.classes)?);
     if let Some(folder) = &query.folder {
         universe.and_inplace(&folder_notes(index, folder, query.recursive)?);
+    } else if !query.recursive {
+        universe.and_inplace(&folder_notes(index, entry, false)?);
     }
     Ok(universe)
 }
@@ -585,12 +613,13 @@ pub struct Selection {
 }
 
 pub async fn select_window(input: WindowInput<'_>) -> Result<Selection, PortError> {
-    select_view_window(input, None).await
+    select_view_window(input, None, None).await
 }
 
 pub(crate) async fn select_view_window(
     input: WindowInput<'_>,
     rank_view: Option<&ViewRef>,
+    verify_tags: Option<&BTreeSet<String>>,
 ) -> Result<Selection, PortError> {
     if input.board && input.group_by.is_none() {
         return Err(invalid_query().into());
@@ -613,13 +642,35 @@ pub(crate) async fn select_view_window(
         .filter_candidates(input.filter, &base)
         .map_err(index_failure)?;
     let mut matching = hits.definite;
-    let uncertain = hits.possible.andnot(&matching);
+    let uncertain = hits.uncertain;
     for page in dense_pages(&uncertain) {
         for note in query_rows(&input, &page).await? {
             if input.filter.matches(&note.evaluated_fields()?) {
                 matching.add(note.dense_id);
             }
         }
+    }
+    if let Some(required_tags) = verify_tags.filter(|tags| !tags.is_empty()) {
+        let mut verified = Bitmap::new();
+        for page in dense_pages(&matching) {
+            let rows = input.store.hydrate(input.scope, input.cut, &page).await?;
+            for (note, expected) in rows.into_iter().zip(&page) {
+                let note = note
+                    .filter(|row| row.dense_id == *expected)
+                    .ok_or_else(stale_cut)?;
+                let inline: Vec<String> = crate::derived::decode_payload(&note.tags_msgpack)?;
+                let raw: Option<BTreeMap<String, notarium_core::value::YamlValue>> =
+                    crate::derived::decode_payload(&note.raw_fields_msgpack)?;
+                let effective: BTreeSet<String> =
+                    crate::runtime::records::effective_tags(&inline, raw.as_ref())
+                        .into_iter()
+                        .collect();
+                if required_tags.is_subset(&effective) {
+                    verified.add(note.dense_id);
+                }
+            }
+        }
+        matching = verified;
     }
 
     let header_sort = input
@@ -1068,13 +1119,37 @@ fn group_partitions(
     matching: &Bitmap,
     field: &str,
 ) -> Result<Option<Vec<(GroupKey, Bitmap)>>, PortError> {
-    let Some(values) = input
+    if let Some(values) = input
         .index
         .direct_scalar_values(field, 64)
         .map_err(index_failure)?
-    else {
-        return Ok(None);
-    };
+    {
+        return build_exact_group_partitions(input, matching, field, &values, false);
+    }
+    // Numeric/date/timestamp boards use BSI bit-slices rather than direct
+    // scalar postings. When the board declares explicit columns, try exact BSI
+    // partitioning and accept it if those columns cover every matching row.
+    if !input.columns.is_empty() {
+        let values: Vec<ScalarValue> = input
+            .columns
+            .iter()
+            .filter_map(|group| match group {
+                GroupKey::Value(value) => Some(value.clone()),
+                _ => None,
+            })
+            .collect();
+        return build_exact_group_partitions(input, matching, field, &values, true);
+    }
+    Ok(None)
+}
+
+fn build_exact_group_partitions(
+    input: &WindowInput<'_>,
+    matching: &Bitmap,
+    field: &str,
+    values: &[ScalarValue],
+    require_full_coverage: bool,
+) -> Result<Option<Vec<(GroupKey, Bitmap)>>, PortError> {
     let mut known = Bitmap::new();
     let mut partitions = Vec::with_capacity(values.len() + input.columns.len() + 3);
     let mut add = |group, ids: Bitmap| {
@@ -1094,10 +1169,10 @@ fn group_partitions(
                 matching,
             )
             .map_err(index_failure)?;
-        if hits.definite != hits.possible {
+        if !hits.uncertain.is_empty() {
             return Ok(None);
         }
-        add(GroupKey::Value(value), hits.definite);
+        add(GroupKey::Value(value.clone()), hits.definite);
     }
     let empty = posting(input.index, &PostingKey::FieldEmptyList(field.into()))?;
     add(GroupKey::EmptyList, matching.and(&empty));
@@ -1105,9 +1180,25 @@ fn group_partitions(
     let bad = posting(input.index, &PostingKey::FieldBad(field.into()))?;
     let mut assigned = ok.or(&bad);
     assigned.and_inplace(matching);
-    let unreadable = assigned.andnot(&known);
-    if !unreadable.is_empty() || input.columns.contains(&GroupKey::Bad) {
-        partitions.push((GroupKey::Bad, unreadable));
+    if require_full_coverage {
+        // Under BSI/declared-column partitioning, any ok row not matched by an
+        // explicit column or EmptyList belongs to an undeclared scalar value
+        // (or Map/non-empty List), so fall back to SQL exact grouping.
+        let mut ok_in_matching = ok;
+        ok_in_matching.and_inplace(matching);
+        if !ok_in_matching.andnot(&known).is_empty() {
+            return Ok(None);
+        }
+        let mut bad_in_matching = bad;
+        bad_in_matching.and_inplace(matching);
+        if !bad_in_matching.is_empty() || input.columns.contains(&GroupKey::Bad) {
+            partitions.push((GroupKey::Bad, bad_in_matching));
+        }
+    } else {
+        let unreadable = assigned.andnot(&known);
+        if !unreadable.is_empty() || input.columns.contains(&GroupKey::Bad) {
+            partitions.push((GroupKey::Bad, unreadable));
+        }
     }
     let absent = matching.andnot(&assigned);
     if !absent.is_empty() || input.columns.contains(&GroupKey::Absent) {
@@ -1298,6 +1389,21 @@ impl<'a> HeaderRow<'a> {
     }
 }
 
+fn exact_number_same_encoding(left: &ExactNumber, right: &ExactNumber) -> bool {
+    let l = left.as_json();
+    let r = right.as_json();
+    if let (Some(a), Some(b)) = (l.as_u64(), r.as_u64()) {
+        return a == b;
+    }
+    if let (Some(a), Some(b)) = (l.as_i64(), r.as_i64()) {
+        return a == b;
+    }
+    if l.is_f64() && r.is_f64() {
+        return l.as_f64().map(f64::to_bits) == r.as_f64().map(f64::to_bits);
+    }
+    false
+}
+
 fn admitted_rank<'a>(
     input: &'a WindowInput<'_>,
     dense_id: u32,
@@ -1315,8 +1421,11 @@ fn admitted_rank<'a>(
     };
     // The canonical writer binds a ranked placement to the group's encoded
     // identity. Equal numeric values can still carry different authored kinds.
-    if matches!(group, GroupKey::Value(ScalarValue::Number(_)))
-        && group_key_hex(&rank.group)?.1 != group_key_hex(group)?.1
+    if let (
+        GroupKey::Value(ScalarValue::Number(rank_num)),
+        GroupKey::Value(ScalarValue::Number(group_num)),
+    ) = (&rank.group, group)
+        && !exact_number_same_encoding(rank_num, group_num)
     {
         return Ok(None);
     }

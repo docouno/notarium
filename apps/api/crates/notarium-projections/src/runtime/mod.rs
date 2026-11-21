@@ -31,7 +31,7 @@ use tokio::{
 use crate::{
     derived::{
         DerivedStore, GenerationControl, GenerationDescriptor, GenerationFiles, PostgresCacheOwner,
-        ProjectionWatermark,
+        PostgresRuntimeGuard, ProjectionWatermark,
     },
     index::{IndexView, L0Delta},
     mmap::{BaseIndexHandle, MmapPool},
@@ -89,11 +89,26 @@ impl PostgresProjectionCache {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ProjectionConfig {
     pub max_open_spaces: NonZeroUsize,
     pub max_retained_reads: NonZeroUsize,
     pub retained_read_lifetime: Duration,
+    pub backlink_owner_resolver: Option<Arc<dyn BacklinkOwnerResolver>>,
+}
+
+impl std::fmt::Debug for ProjectionConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProjectionConfig")
+            .field("max_open_spaces", &self.max_open_spaces)
+            .field("max_retained_reads", &self.max_retained_reads)
+            .field("retained_read_lifetime", &self.retained_read_lifetime)
+            .field(
+                "backlink_owner_resolver",
+                &self.backlink_owner_resolver.is_some(),
+            )
+            .finish()
+    }
 }
 
 impl ProjectionConfig {
@@ -111,6 +126,7 @@ impl Default for ProjectionConfig {
             max_open_spaces: NonZeroUsize::new(256).unwrap(),
             max_retained_reads: NonZeroUsize::new(128).unwrap(),
             retained_read_lifetime: Duration::from_secs(60),
+            backlink_owner_resolver: None,
         }
     }
 }
@@ -124,6 +140,7 @@ pub struct ProjectorRuntime {
     control: GenerationControl,
     maintenance: Option<(Cancellation, JoinHandle<()>)>,
     local_owner: Option<Arc<std::fs::File>>,
+    _postgres_runtime_guard: Option<PostgresRuntimeGuard>,
     local_rotation: Option<rotation::LocalRotation>,
     _board_provider: crate::board::BoardProviderRegistration,
 }
@@ -172,8 +189,8 @@ impl ProjectorRuntime {
         .await
     }
 
-    /// Opens the durable PostgreSQL generation. Obsolete-format recovery needs
-    /// the canonical owner vector and no participants using the old format.
+    /// Opens the durable PostgreSQL generation with an explicitly provisioned
+    /// persistent local mmap cache volume.
     pub async fn start_postgres(
         canonical: CanonicalStore,
         projection_context: MaintenanceContext,
@@ -186,12 +203,41 @@ impl ProjectorRuntime {
         let source = maintenance::Source::Postgres {
             pool,
             schema_prefix: schema_prefix.to_owned(),
-            expected_cache_id: cache.expected_id,
+            expected_cache_id: Some(cache.expected_id),
         };
         Self::start_with(
             canonical,
             projection_context,
             cache.root,
+            source,
+            initial,
+            config,
+        )
+        .await
+    }
+
+    /// Opens the durable PostgreSQL generation using an ephemeral local mmap
+    /// cache directory (such as a stateless pod's `emptyDir`). Clears any
+    /// leftover local cache files under the exclusive directory lock on boot
+    /// and binds cleanup to the shared PostgreSQL control schema identity.
+    pub async fn start_postgres_ephemeral(
+        canonical: CanonicalStore,
+        projection_context: MaintenanceContext,
+        pool: sqlx::PgPool,
+        schema_prefix: &str,
+        cache_root: DataRoot,
+        initial: ProjectionGeneration,
+        config: ProjectionConfig,
+    ) -> Result<Self, PortError> {
+        let source = maintenance::Source::Postgres {
+            pool,
+            schema_prefix: schema_prefix.to_owned(),
+            expected_cache_id: None,
+        };
+        Self::start_with(
+            canonical,
+            projection_context,
+            cache_root,
             source,
             initial,
             config,
@@ -211,11 +257,11 @@ impl ProjectorRuntime {
         projection_context
             .authority
             .require(ServicePurpose::Projection)?;
-        let expected_cache_id = match &source {
+        let (expected_cache_id, ephemeral_pg_cache) = match &source {
             maintenance::Source::Postgres {
                 expected_cache_id, ..
-            } => Some(expected_cache_id.clone()),
-            _ => None,
+            } => (expected_cache_id.clone(), expected_cache_id.is_none()),
+            _ => (None, false),
         };
         if let Some(expected) = &expected_cache_id {
             // Reject a missing or foreign mount before opening locks or creating directories.
@@ -236,15 +282,32 @@ impl ProjectorRuntime {
         } else {
             Some(GenerationFiles::owner(&cache_root).await?)
         };
-        let (cache_root, postgres_cache_owner) = if control.is_postgres() {
+        let (cache_root, postgres_cache_owner, postgres_runtime_guard) = if control.is_postgres() {
             let owner = PostgresCacheOwner::acquire(cache_root).await?;
-            (owner.root().clone(), Some(owner))
+            let guard = owner.claim_runtime()?;
+            (owner.root().clone(), Some(owner), Some(guard))
         } else {
             let path = tokio::fs::canonicalize(cache_root.root())
                 .await
                 .map_err(checkpoint_error)?;
-            (DataRoot::new(path), None)
+            (DataRoot::new(path), None, None)
         };
+        if ephemeral_pg_cache
+            && postgres_cache_owner
+                .as_ref()
+                .is_some_and(|o| o.cache_identity.get().is_none())
+        {
+            let clean_root = cache_root.clone();
+            tokio::task::spawn_blocking(move || reset_ephemeral_cache_dir(&clean_root))
+                .await
+                .map_err(checkpoint_error)??;
+        }
+        {
+            let scratch_root = cache_root.clone();
+            let _ =
+                tokio::task::spawn_blocking(move || link_apply::sweep_scratch_dir(&scratch_root))
+                    .await;
+        }
         let identity_root = cache_root.clone();
         let identity_owner = postgres_cache_owner.clone();
         let cache_identity = tokio::task::spawn_blocking(move || {
@@ -256,12 +319,6 @@ impl ProjectorRuntime {
         })
         .await
         .map_err(checkpoint_error)??;
-        let cleanup_registration = canonical
-            .prepare_projection_visibility_cleanup(
-                &projection_context,
-                control.cleanup_identity(&cache_identity),
-            )
-            .await?;
         let generation_cleanup = cache_cleanup(&cache_root);
         let coordinator = control.acquire_coordinator().await?;
         coordinator.clear_interrupted_rotation().await?;
@@ -271,72 +328,74 @@ impl ProjectorRuntime {
             recovery,
         } = maintenance::select(&source, &cache_root, &coordinator, initial, &spaces).await?;
         drop(source);
-        for (_, scope, _, _) in &spaces {
-            let previous = match derived.watermarks(&scope.space_id).await {
-                Ok(previous) => previous,
-                Err(error) => {
-                    if let Some(candidate) = &recovery {
-                        let _ = coordinator.cancel_candidate(candidate).await;
-                    }
-                    return Err(error);
-                }
-            };
-            if previous.as_ref().is_none_or(|row| row.scope == *scope)
-                && let Err(error) = derived.register_scope(scope).await
-                && !(previous.is_none() && apply::is_history_mismatch(&error))
-            {
-                if let Some(candidate) = &recovery {
-                    let _ = coordinator.cancel_candidate(candidate).await;
-                }
-                return Err(error);
+        // Cancel any reserved startup recovery candidate if setup errors or
+        // the opening future is dropped before activation completes.
+        let mut candidate_guard = CandidateDropGuard {
+            control: coordinator.clone(),
+            candidate: recovery.clone(),
+        };
+        let setup = async {
+            // Persist canonical cleanup registration only after generation selection
+            // succeeds so failed startups leave no dangling cleanup obligation.
+            let cleanup_registration = canonical
+                .prepare_projection_visibility_cleanup(
+                    &projection_context,
+                    control.cleanup_identity(&cache_identity),
+                )
+                .await?;
+            let startup_scopes: Vec<HistoryScope> = spaces
+                .iter()
+                .map(|(_, scope, _, _)| scope.clone())
+                .collect();
+            derived.register_startup_scopes(&startup_scopes).await?;
+            let generation = Arc::new(Generation::new(derived));
+            let backlink_owners = OnceLock::new();
+            if let Some(resolver) = config.backlink_owner_resolver {
+                let _ = backlink_owners.set(resolver);
             }
+            let engine = Arc::new(ProjectionEngine {
+                canonical,
+                projection_context,
+                cache_root,
+                cache_identity,
+                postgres_cache_owner,
+                control: control.clone(),
+                pool: MmapPool::new(config.max_open_spaces),
+                generation: ArcSwap::new(Arc::clone(&generation)),
+                known_generations: RwLock::new(BTreeMap::from([(
+                    generation.store.generation(),
+                    Arc::clone(&generation),
+                )])),
+                generation_cleanup,
+                publication: Arc::new(tokio::sync::RwLock::new(())),
+                publication_closed: AtomicBool::new(recovery.is_some()),
+                startup_recovery: AtomicBool::new(recovery.is_some()),
+                stopped: Cancellation::default(),
+                activation: watch::channel(0).0,
+                discovery: Notify::new(),
+                backlink_owners,
+                space_events: RwLock::new(BTreeMap::new()),
+                reads: read::RetainedReads::new(
+                    config.max_retained_reads,
+                    config.retained_read_lifetime,
+                ),
+            });
+            let board_provider = crate::board::register_board_provider(&engine)?;
+            let eraser = erasure::Eraser::new(&engine)?;
+            cleanup_registration.attach(Arc::new(eraser));
+            Ok::<_, PortError>((engine, generation, board_provider))
         }
-        let generation = Arc::new(Generation::new(derived));
-        let engine = Arc::new(ProjectionEngine {
-            canonical,
-            projection_context,
-            cache_root,
-            cache_identity,
-            postgres_cache_owner,
-            control: control.clone(),
-            pool: MmapPool::new(config.max_open_spaces),
-            generation: ArcSwap::new(Arc::clone(&generation)),
-            known_generations: RwLock::new(BTreeMap::from([(
-                generation.store.generation(),
-                Arc::clone(&generation),
-            )])),
-            generation_cleanup,
-            publication: Arc::new(tokio::sync::RwLock::new(())),
-            publication_closed: AtomicBool::new(recovery.is_some()),
-            stopped: Cancellation::default(),
-            activation: watch::channel(0).0,
-            discovery: Notify::new(),
-            backlink_owners: OnceLock::new(),
-            space_events: RwLock::new(BTreeMap::new()),
-            reads: read::RetainedReads::new(
-                config.max_retained_reads,
-                config.retained_read_lifetime,
-            ),
-        });
-        let board_provider = match crate::board::register_board_provider(&engine) {
-            Ok(provider) => provider,
+        .await;
+        let (engine, generation, board_provider) = match setup {
+            Ok(ready) => ready,
             Err(error) => {
+                candidate_guard.disarm();
                 if let Some(candidate) = &recovery {
                     let _ = coordinator.cancel_candidate(candidate).await;
                 }
                 return Err(error);
             }
         };
-        let eraser = match erasure::Eraser::new(&engine) {
-            Ok(eraser) => eraser,
-            Err(error) => {
-                if let Some(candidate) = &recovery {
-                    let _ = coordinator.cancel_candidate(candidate).await;
-                }
-                return Err(error);
-            }
-        };
-        cleanup_registration.attach(Arc::new(eraser));
         let worker_engine = Arc::clone(&engine);
         let worker_stop = shutdown.clone();
         let worker_owner = local_owner.clone();
@@ -352,6 +411,7 @@ impl ProjectorRuntime {
             control,
             maintenance: None,
             local_owner,
+            _postgres_runtime_guard: postgres_runtime_guard,
             local_rotation: None,
             _board_provider: board_provider,
         };
@@ -371,11 +431,17 @@ impl ProjectorRuntime {
                 Ok(recovered) => recovered,
                 Err(error) => {
                     let _ = runtime.shutdown().await;
+                    candidate_guard.disarm();
                     let _ = coordinator.cancel_candidate(&candidate).await;
                     return Err(error);
                 }
             };
+            candidate_guard.disarm();
             runtime.descriptor = recovered;
+            runtime
+                .engine
+                .startup_recovery
+                .store(false, Ordering::Release);
             runtime
                 .engine
                 .publication_closed
@@ -384,6 +450,8 @@ impl ProjectorRuntime {
                 .engine
                 .activation
                 .send_modify(|value| *value = value.wrapping_add(1));
+        } else {
+            candidate_guard.disarm();
         }
         let stop = Cancellation::default();
         let engine = Arc::clone(&runtime.engine);
@@ -449,6 +517,7 @@ pub struct ProjectionEngine {
     generation_cleanup: Arc<GenerationCleanup>,
     publication: Arc<tokio::sync::RwLock<()>>,
     publication_closed: AtomicBool,
+    startup_recovery: AtomicBool,
     stopped: Cancellation,
     activation: watch::Sender<u64>,
     discovery: Notify,
@@ -460,6 +529,7 @@ pub struct ProjectionEngine {
 struct Generation {
     store: DerivedStore,
     spaces: RwLock<BTreeMap<SpaceId, Arc<SpaceSlot>>>,
+    slot_added: Notify,
 }
 
 impl Generation {
@@ -467,6 +537,7 @@ impl Generation {
         Self {
             store,
             spaces: RwLock::new(BTreeMap::new()),
+            slot_added: Notify::new(),
         }
     }
 
@@ -492,12 +563,15 @@ impl Generation {
         if let Some(slot) = self.slot(space) {
             return slot;
         }
-        self.spaces
+        let slot = self
+            .spaces
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .entry(space.clone())
             .or_default()
-            .clone()
+            .clone();
+        self.slot_added.notify_waiters();
+        slot
     }
 }
 
@@ -618,35 +692,37 @@ pub(crate) struct PublishedCut {
 }
 
 type BoardDeltaSlot = Mutex<Option<notarium_core::ports::BoardDelta>>;
+type SpaceEventSlot = Mutex<Option<notarium_core::ports::SpaceEvent>>;
 
 #[derive(Default)]
-struct BoardDeltaState {
-    deltas: Vec<Weak<BoardDeltaSlot>>,
+struct EventScrubState {
+    board_deltas: Vec<(HistoryIncarnation, SpaceSeq, Weak<BoardDeltaSlot>)>,
+    space_events: Vec<(HistoryIncarnation, SpaceSeq, Weak<SpaceEventSlot>)>,
     scrub_floors: BTreeMap<HistoryIncarnation, SpaceSeq>,
 }
 
-type BoardDeltaRegistry = Arc<Mutex<BoardDeltaState>>;
+type EventScrubRegistry = Arc<Mutex<EventScrubState>>;
 
 struct SpaceEventChannel {
     sender: broadcast::Sender<events::QueuedEvent>,
-    board_deltas: BoardDeltaRegistry,
+    scrub: EventScrubRegistry,
 }
 
 impl SpaceEventChannel {
     fn new() -> Self {
         Self {
             sender: broadcast::channel(256).0,
-            board_deltas: Arc::new(Mutex::new(BoardDeltaState::default())),
+            scrub: Arc::new(Mutex::new(EventScrubState::default())),
         }
     }
 
     fn track_board_delta(
-        board_deltas: &BoardDeltaRegistry,
+        scrub: &EventScrubRegistry,
         scope: &HistoryScope,
         seq: SpaceSeq,
         delta: &board_events::ScrubbableBoardDelta,
     ) {
-        let mut state = board_deltas
+        let mut state = scrub
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if state
@@ -656,17 +732,42 @@ impl SpaceEventChannel {
         {
             delta.clear();
         } else {
-            state.deltas.retain(|weak| weak.strong_count() > 0);
-            state.deltas.push(delta.downgrade());
+            state
+                .board_deltas
+                .retain(|(_, _, weak)| weak.strong_count() > 0);
+            state
+                .board_deltas
+                .push((scope.incarnation, seq, delta.downgrade()));
         }
     }
 
-    fn scrub_board_deltas(
-        board_deltas: &BoardDeltaRegistry,
+    fn track_space_event(
+        scrub: &EventScrubRegistry,
         scope: &HistoryScope,
-        through: SpaceSeq,
+        seq: SpaceSeq,
+        event: &events::ScrubbableSpaceEvent,
     ) {
-        let mut state = board_deltas
+        let mut state = scrub
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state
+            .scrub_floors
+            .get(&scope.incarnation)
+            .is_some_and(|&floor| seq <= floor)
+        {
+            event.clear();
+        } else {
+            state
+                .space_events
+                .retain(|(_, _, weak)| weak.strong_count() > 0);
+            state
+                .space_events
+                .push((scope.incarnation, seq, event.downgrade()));
+        }
+    }
+
+    fn scrub_through(scrub: &EventScrubRegistry, scope: &HistoryScope, through: SpaceSeq) {
+        let mut state = scrub
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state
@@ -674,21 +775,56 @@ impl SpaceEventChannel {
             .entry(scope.incarnation)
             .and_modify(|floor| *floor = (*floor).max(through))
             .or_insert(through);
-        for weak in state.deltas.drain(..) {
-            if let Some(slot) = weak.upgrade() {
+        state.board_deltas.retain(|(inc, seq, weak)| {
+            let Some(slot) = weak.upgrade() else {
+                return false;
+            };
+            if *inc == scope.incarnation && *seq <= through {
                 *slot
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                false
+            } else {
+                true
             }
-        }
+        });
+        state.space_events.retain(|(inc, seq, weak)| {
+            let Some(slot) = weak.upgrade() else {
+                return false;
+            };
+            if *inc == scope.incarnation && *seq <= through {
+                *slot
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                false
+            } else {
+                true
+            }
+        });
     }
 }
 
 impl ProjectionEngine {
     fn close_admissions(&self) {
         self.publication_closed.store(true, Ordering::Release);
+        self.startup_recovery.store(false, Ordering::Release);
         self.stopped.cancel();
         self.reads.clear();
+    }
+
+    pub(super) fn checkpoint_path(
+        &self,
+        generation: ProjectionGeneration,
+        space: &SpaceId,
+        seq: SpaceSeq,
+        file_nonce: &str,
+    ) -> PathBuf {
+        if file_nonce.is_empty() {
+            self.cache_root.space_fast_index(generation, space, seq)
+        } else {
+            self.cache_root
+                .space_fast_index_with_nonce(generation, space, seq, file_nonce)
+        }
     }
 
     fn subscribe_space_events(&self, space: &SpaceId) -> broadcast::Receiver<events::QueuedEvent> {
@@ -719,6 +855,29 @@ impl ProjectionEngine {
             .is_some_and(|channel| channel.sender.receiver_count() > 0)
     }
 
+    pub(super) fn erasure_floor(&self, scope: &HistoryScope) -> SpaceSeq {
+        let scrub = {
+            let channels = self
+                .space_events
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            channels
+                .get(&scope.space_id)
+                .map(|channel| Arc::clone(&channel.scrub))
+        };
+        let Some(scrub) = scrub else {
+            return SpaceSeq::ZERO;
+        };
+        let state = scrub
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state
+            .scrub_floors
+            .get(&scope.incarnation)
+            .copied()
+            .unwrap_or(SpaceSeq::ZERO)
+    }
+
     fn send_space_event(&self, space: &SpaceId, event: events::QueuedEvent) {
         let channel = {
             let channels = self
@@ -728,32 +887,44 @@ impl ProjectionEngine {
             channels
                 .get(space)
                 .filter(|channel| channel.sender.receiver_count() > 0)
-                .map(|channel| (channel.sender.clone(), Arc::clone(&channel.board_deltas)))
+                .map(|channel| (channel.sender.clone(), Arc::clone(&channel.scrub)))
         };
-        if let Some((sender, board_deltas)) = channel {
-            if let events::QueuedEvent::Board(notice) = &event
-                && let Some(delta) = &notice.delta
-            {
-                SpaceEventChannel::track_board_delta(
-                    &board_deltas,
-                    &notice.scope,
-                    notice.seq,
-                    delta,
-                );
+        if let Some((sender, scrub)) = channel {
+            match &event {
+                events::QueuedEvent::Board(notice) => {
+                    if let board_events::BoardNoticePayload::Published(delta) = &notice.payload {
+                        SpaceEventChannel::track_board_delta(
+                            &scrub,
+                            &notice.scope,
+                            notice.seq,
+                            delta,
+                        );
+                    }
+                }
+                events::QueuedEvent::Space {
+                    scope,
+                    seq,
+                    scrubbable,
+                    event: slot,
+                    ..
+                } if *scrubbable => {
+                    SpaceEventChannel::track_space_event(&scrub, scope, *seq, slot);
+                }
+                _ => {}
             }
             let _ = sender.send(event);
         }
     }
 
     pub(super) fn scrub_space_events(&self, scope: &HistoryScope, through: SpaceSeq) {
-        let board_deltas = {
+        let scrub = {
             let channels = self
                 .space_events
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             channels
                 .get(&scope.space_id)
-                .map(|channel| Arc::clone(&channel.board_deltas))
+                .map(|channel| Arc::clone(&channel.scrub))
         }
         .unwrap_or_else(|| {
             let mut channels = self
@@ -764,10 +935,10 @@ impl ProjectionEngine {
                 &channels
                     .entry(scope.space_id.clone())
                     .or_insert_with(SpaceEventChannel::new)
-                    .board_deltas,
+                    .scrub,
             )
         });
-        SpaceEventChannel::scrub_board_deltas(&board_deltas, scope, through);
+        SpaceEventChannel::scrub_through(&scrub, scope, through);
     }
 
     fn prune_event_channels(&self) {
@@ -831,6 +1002,7 @@ impl ProjectionEngine {
         Ok(cut)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn open_index(&self, cut: &PublishedCut) -> Result<IndexView, PortError> {
         let base = cut
             .base
@@ -843,17 +1015,11 @@ impl ProjectionEngine {
         &self,
         cut: &PublishedCut,
     ) -> Result<IndexView, PortError> {
-        match cut.base.try_open_resident(&self.pool) {
-            Ok(Some(base)) => return Ok(IndexView::new(base, Arc::clone(&cut.delta))),
-            Ok(None) => {}
-            Err(error) => return Err(self.handle_open_index_error(cut, error)),
-        }
-        let base = cut.base.clone();
-        let pool = self.pool.clone();
-        let opened = tokio::task::spawn_blocking(move || base.open(&pool))
+        let base = cut
+            .base
+            .open_async(&self.pool)
             .await
-            .map_err(checkpoint_error)?;
-        let base = opened.map_err(|error| self.handle_open_index_error(cut, error))?;
+            .map_err(|error| self.handle_open_index_error(cut, error))?;
         Ok(IndexView::new(base, Arc::clone(&cut.delta)))
     }
 
@@ -945,13 +1111,45 @@ impl ProjectionEngine {
                     "caller cancelled",
                 ));
             }
-            let generation = self.generation.load();
-            let slot = match generation.slot(&scope.space_id) {
-                Some(slot) => slot,
-                None => {
-                    self.discovery.notify_one();
-                    generation.ensure_slot(&scope.space_id)
+            let generation = self.generation.load_full();
+            let Some(slot) = generation.slot(&scope.space_id) else {
+                // Do not materialize phantom `SpaceSlot` entries for arbitrary or
+                // unauthorized Space IDs; wait for catalog discovery instead.
+                let slot_added = generation.slot_added.notified();
+                self.discovery.notify_one();
+                if let Some(slot) = generation.slot(&scope.space_id) {
+                    if !slot.is_detached()
+                        && self.publication.try_read().is_ok()
+                        && !self.publication_closed.load(Ordering::Acquire)
+                        && let Some(cut) = slot.admitted_cut()
+                    {
+                        scope.check(&cut.cut.scope)?;
+                        if cut.cut.projected_seq >= seq && !cut.base.repair_pending() {
+                            return Ok(cut);
+                        }
+                    }
+                    continue;
                 }
+                let remaining = maximum
+                    .min(budget.remaining)
+                    .saturating_sub(started.elapsed());
+                if remaining.is_zero() {
+                    return Err(deadline_not_committed(
+                        "projection_wait",
+                        "projected cut unavailable",
+                    ));
+                }
+                tokio::select! {
+                    _ = budget.cancellation.cancelled() => {
+                        return Err(cancelled_not_committed("projection_wait", "caller cancelled"));
+                    }
+                    _ = tokio::time::sleep(remaining) => {
+                        return Err(deadline_not_committed("projection_wait", "projected cut unavailable"));
+                    }
+                    _ = slot_added => {}
+                    _ = activation.changed() => {}
+                }
+                continue;
             };
             let mut progress = slot.progress.subscribe();
             if slot.is_detached() {
@@ -1011,6 +1209,57 @@ impl ProjectionEngine {
             Err(error) => Err(error),
         }
     }
+}
+
+struct CandidateDropGuard {
+    control: GenerationControl,
+    candidate: Option<GenerationDescriptor>,
+}
+
+impl CandidateDropGuard {
+    fn disarm(&mut self) {
+        self.candidate = None;
+    }
+}
+
+impl Drop for CandidateDropGuard {
+    fn drop(&mut self) {
+        if let Some(candidate) = self.candidate.take() {
+            let control = self.control.clone();
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    let _ = control.cancel_candidate(&candidate).await;
+                });
+            }
+        }
+    }
+}
+
+/// Clears leftover local cache state under an exclusively locked ephemeral
+/// PostgreSQL cache root while preserving the live owner lock file.
+fn reset_ephemeral_cache_dir(root: &DataRoot) -> Result<(), PortError> {
+    use std::fs;
+    let v1 = root.root().join("v1");
+    let entries = match fs::read_dir(&v1) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(checkpoint_error(err)),
+    };
+    for entry in entries {
+        let entry = entry.map_err(checkpoint_error)?;
+        let name = entry.file_name();
+        if name.to_str() == Some("projection_checkpoint.lock") {
+            continue;
+        }
+        let path = entry.path();
+        let meta = fs::symlink_metadata(&path).map_err(checkpoint_error)?;
+        if meta.is_dir() {
+            fs::remove_dir_all(&path).map_err(checkpoint_error)?;
+        } else {
+            fs::remove_file(&path).map_err(checkpoint_error)?;
+        }
+    }
+    Ok(())
 }
 
 fn checkpoint_error(error: impl std::fmt::Display) -> PortError {
@@ -1215,36 +1464,51 @@ mod event_scrub_tests {
 
         let queued_delta = make_delta(5);
         SpaceEventChannel::track_board_delta(
-            &channel.board_deltas,
+            &channel.scrub,
             &scope,
             SpaceSeq::new(5).unwrap(),
             &queued_delta,
         );
         assert!(queued_delta.clone_payload().is_some());
 
-        // Purge at seq 10 must immediately clear queued BoardDelta in RAM before
-        // any subscriber polls, and record scrub_floor = 10 for late notices.
-        SpaceEventChannel::scrub_board_deltas(
-            &channel.board_deltas,
+        let queued_space = events::ScrubbableSpaceEvent::new(notarium_core::ports::SpaceEvent {
+            scope: scope.clone(),
+            seq: SpaceSeq::new(5).unwrap(),
+            kind: notarium_core::ports::SpaceEventKind::GraphSettled {
+                generation: ProjectionGeneration::new(1).unwrap(),
+            },
+        });
+        SpaceEventChannel::track_space_event(
+            &channel.scrub,
             &scope,
-            SpaceSeq::new(10).unwrap(),
+            SpaceSeq::new(5).unwrap(),
+            &queued_space,
         );
+        assert!(queued_space.clone_event().is_some());
+
+        // Purge/redaction at seq 10 must immediately clear queued payloads in RAM
+        // before any subscriber polls, and record scrub_floor = 10 for late notices.
+        SpaceEventChannel::scrub_through(&channel.scrub, &scope, SpaceSeq::new(10).unwrap());
         assert!(
             queued_delta.clone_payload().is_none(),
-            "queued BoardDelta payload must be scrubbed in RAM immediately on purge"
+            "queued BoardDelta payload must be scrubbed in RAM immediately on erasure"
+        );
+        assert!(
+            queued_space.clone_event().is_none(),
+            "queued SpaceEvent payload must be scrubbed in RAM immediately on erasure"
         );
 
         // Late notice at seq 9 <= floor 10 must be cleared on enqueue; newer seq 11 must survive.
         let late_delta = make_delta(9);
         SpaceEventChannel::track_board_delta(
-            &channel.board_deltas,
+            &channel.scrub,
             &scope,
             SpaceSeq::new(9).unwrap(),
             &late_delta,
         );
         let newer_delta = make_delta(11);
         SpaceEventChannel::track_board_delta(
-            &channel.board_deltas,
+            &channel.scrub,
             &scope,
             SpaceSeq::new(11).unwrap(),
             &newer_delta,

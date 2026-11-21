@@ -25,33 +25,69 @@ impl ResolutionIndex for DerivedStore {
         limit: u16,
     ) -> Result<Vec<CandidateLookupKey>, PortError> {
         PageLimit::new(limit)?;
-        let mut filter = String::from(
-            "WHERE space_id = ? AND scope_folder_dense_id = ? AND leaf_norm_key = ? \
-             AND tier >= ? AND tier <= ?",
-        );
+        if query.min_tier > query.max_tier {
+            return Ok(Vec::new());
+        }
+        let mut filter =
+            String::from("WHERE space_id = ? AND scope_folder_dense_id = ? AND leaf_norm_key = ?");
         let mut params = vec![
             value(query.space),
             value(&query.folder),
             value(&query.leaf.to_owned()),
-            value(&query.min_tier),
-            value(&query.max_tier),
         ];
-        if let Some(note) = query.exact_note {
-            filter.push_str(" AND target_note_id = ?");
-            params.push(value(&note.to_owned()));
-        }
-        if let Some(after) = after {
+        if query.min_tier == query.max_tier {
+            if let Some(after) = after
+                && after.tier > query.max_tier
+            {
+                return Ok(Vec::new());
+            }
+            filter.push_str(" AND tier = ?");
+            params.push(value(&query.min_tier));
+            if let Some(note) = query.exact_note {
+                filter.push_str(" AND target_note_id = ?");
+                params.push(value(&note.to_owned()));
+            }
+            if let Some(after) = after
+                && after.tier == query.min_tier
+            {
+                filter
+                    .push_str(" AND (created_at_sec, created_at_nsec, target_note_id) > (?, ?, ?)");
+                params.extend([
+                    value(&after.created_at_sec),
+                    value(&after.created_at_nsec),
+                    value(&after.note),
+                ]);
+            }
+            filter.push_str(" ORDER BY created_at_sec, created_at_nsec, target_note_id LIMIT ?");
+        } else {
+            if let Some(after) = after
+                && after.tier >= query.min_tier
+            {
+                if after.tier > query.max_tier {
+                    return Ok(Vec::new());
+                }
+                filter.push_str(
+                    " AND tier <= ? AND (tier, created_at_sec, created_at_nsec, target_note_id) > (?, ?, ?, ?)",
+                );
+                params.extend([
+                    value(&query.max_tier),
+                    value(&after.tier),
+                    value(&after.created_at_sec),
+                    value(&after.created_at_nsec),
+                    value(&after.note),
+                ]);
+            } else {
+                filter.push_str(" AND tier >= ? AND tier <= ?");
+                params.extend([value(&query.min_tier), value(&query.max_tier)]);
+            }
+            if let Some(note) = query.exact_note {
+                filter.push_str(" AND target_note_id = ?");
+                params.push(value(&note.to_owned()));
+            }
             filter.push_str(
-                " AND (tier, created_at_sec, created_at_nsec, target_note_id) > (?, ?, ?, ?)",
+                " ORDER BY tier, created_at_sec, created_at_nsec, target_note_id LIMIT ?",
             );
-            params.extend([
-                value(&after.tier),
-                value(&after.created_at_sec),
-                value(&after.created_at_nsec),
-                value(&after.note),
-            ]);
         }
-        filter.push_str(" ORDER BY tier, created_at_sec, created_at_nsec, target_note_id LIMIT ?");
         params.push(value(&i64::from(limit)));
         self.select_current(filter, params).await
     }
@@ -64,17 +100,44 @@ impl ResolutionIndex for DerivedStore {
         after: Option<&NoteAliasPosition>,
         limit: u16,
     ) -> Result<Vec<ProjectedNoteAlias>, PortError> {
-        let filter = match selector {
-            AliasKey::Slug => "WHERE space_id = ? AND old_slug_fold = ?",
-            AliasKey::Title => "WHERE space_id = ? AND old_title_norm = ?",
-        };
-        self.note_alias_page(
-            filter,
-            vec![value(space), value(&leaf.to_owned())],
-            after,
-            PageLimit::new(limit)?,
-        )
-        .await
+        let limit = PageLimit::new(limit)?;
+        match selector {
+            AliasKey::Slug => {
+                // Index: projected_note_alias_slug (space_id, old_slug_fold, old_parent_folder_id, created_seq, target_note_id)
+                let mut filter = String::from("WHERE space_id = ? AND old_slug_fold = ?");
+                let mut params = vec![value(space), value(&leaf.to_owned())];
+                if let Some(after) = after {
+                    filter.push_str(
+                        " AND (old_parent_folder_id, created_seq, target_note_id) > (?, ?, ?)",
+                    );
+                    params.extend([value(&after.parent), value(&after.seq), value(&after.note)]);
+                }
+                filter.push_str(
+                    " ORDER BY old_parent_folder_id, created_seq, target_note_id LIMIT ?",
+                );
+                params.push(value(&i64::from(limit.get())));
+                self.select_current(filter, params).await
+            }
+            AliasKey::Title => {
+                // Index: projected_note_alias_title (space_id, old_title_norm, old_parent_folder_id, old_slug_fold, created_seq, target_note_id)
+                let mut filter = String::from("WHERE space_id = ? AND old_title_norm = ?");
+                let mut params = vec![value(space), value(&leaf.to_owned())];
+                if let Some(after) = after {
+                    filter.push_str(" AND (old_parent_folder_id, old_slug_fold, created_seq, target_note_id) > (?, ?, ?, ?)");
+                    params.extend([
+                        value(&after.parent),
+                        value(&after.slug),
+                        value(&after.seq),
+                        value(&after.note),
+                    ]);
+                }
+                filter.push_str(
+                    " ORDER BY old_parent_folder_id, old_slug_fold, created_seq, target_note_id LIMIT ?",
+                );
+                params.push(value(&i64::from(limit.get())));
+                self.select_current(filter, params).await
+            }
+        }
     }
 
     async fn slot_occupant(
@@ -96,7 +159,7 @@ impl ResolutionIndex for DerivedStore {
                         .select(
                             "SELECT note_id FROM projected_notes \
                  WHERE space_id = ? AND parent_folder_id = ? AND slug_fold = ? AND lifecycle = ? \
-                 ORDER BY note_id LIMIT 2",
+                 LIMIT 2",
                             params,
                             &[Kind::Text],
                         )
@@ -224,8 +287,11 @@ impl DerivedStore {
         cut: SpaceSeq,
         address: LinkAddress<'_>,
         after: Option<&LinkPosition>,
-        limit: PageLimit,
+        limit: u16,
     ) -> Result<Vec<ProjectedLink>, PortError> {
+        if limit == 0 || limit > 201 {
+            return Err(DomainError::validation(ValidationReason::InvalidLimit).into());
+        }
         let (mut filter, key) = match address {
             LinkAddress::Source(source) => ("src_dense_id = ?".to_owned(), source),
             LinkAddress::Target(target) => ("resolved_dense_id = ?".to_owned(), target),
@@ -236,7 +302,7 @@ impl DerivedStore {
             filter.push_str(" AND (src_dense_id, link_ord) > (?, ?)");
             params.extend([value(&after.source), value(&after.ordinal)]);
         }
-        params.push(value(&limit.get()));
+        params.push(value(&limit));
         self.at_cut(
             scope,
             cut,
@@ -253,8 +319,11 @@ impl DerivedStore {
         cut: SpaceSeq,
         address: Option<LinkAddress<'_>>,
         after: Option<(u32, u32)>,
-        limit: PageLimit,
+        limit: u16,
     ) -> Result<Vec<(u32, u32, u32)>, PortError> {
+        if limit == 0 || limit > 4_096 {
+            return Err(DomainError::validation(ValidationReason::InvalidLimit).into());
+        }
         let scope = scope.clone();
         let mut sql = String::from(
             "SELECT src_dense_id, link_ord, resolved_dense_id FROM projected_note_links \
@@ -278,7 +347,7 @@ impl DerivedStore {
             params.extend([value(&source), value(&ordinal)]);
         }
         sql.push_str(" ORDER BY src_dense_id, link_ord LIMIT ?");
-        params.push(value(&limit.get()));
+        params.push(value(&limit));
         self.database
             .read(move |mut tx| {
                 Box::pin(async move {
@@ -349,6 +418,28 @@ impl DerivedStore {
         Ok(rows)
     }
 
+    /// Pages unresolved links and historical-alias links (tier >= 60) in
+    /// `(src_dense_id, link_ord)` order so incremental purge recovery can
+    /// re-resolve affected edges without re-reading canonical note carriers.
+    pub(crate) async fn unresolved_or_alias_links_page(
+        &self,
+        space: &SpaceId,
+        after: Option<&LinkPosition>,
+        limit: PageLimit,
+    ) -> Result<Vec<ProjectedLink>, PortError> {
+        let mut filter = String::from(
+            "WHERE space_id = ? AND (resolved_dense_id IS NULL OR resolved_tier >= 60)",
+        );
+        let mut params = vec![value(space)];
+        if let Some(after) = after {
+            filter.push_str(" AND (src_dense_id, link_ord) > (?, ?)");
+            params.extend([value(&after.source), value(&after.ordinal)]);
+        }
+        filter.push_str(" ORDER BY src_dense_id, link_ord LIMIT ?");
+        params.push(value(&i64::from(limit.get())));
+        self.select_current(filter, params).await
+    }
+
     async fn prefix_link_page(
         &self,
         space: &SpaceId,
@@ -373,21 +464,41 @@ impl DerivedStore {
         }
         let mut filter = String::from("WHERE space_id = ?");
         let mut params = vec![value(space)];
+        let child_after = after.filter(|after| after.prefix != prefix);
         if prefix.is_empty() {
-            filter.push_str(" AND dir_norm_prefix > ''");
+            if let Some(after) = child_after
+                && !after.prefix.is_empty()
+            {
+                filter.push_str(" AND (dir_norm_prefix, src_dense_id, link_ord) > (?, ?, ?)");
+                params.extend([
+                    value(&after.prefix),
+                    value(&after.source),
+                    value(&after.ordinal),
+                ]);
+            } else {
+                filter.push_str(" AND dir_norm_prefix > ''");
+            }
         } else {
-            // Both dialects use bytewise collation. One bounded range scan
-            // starts at the first child and stops before lexical siblings.
-            filter.push_str(" AND dir_norm_prefix >= ? AND dir_norm_prefix < ?");
-            params.extend([value(&format!("{prefix}/")), value(&format!("{prefix}0"))]);
-        }
-        if let Some(after) = after.filter(|after| after.prefix != prefix) {
-            filter.push_str(" AND (dir_norm_prefix, src_dense_id, link_ord) > (?, ?, ?)");
-            params.extend([
-                value(&after.prefix),
-                value(&after.source),
-                value(&after.ordinal),
-            ]);
+            // Both dialects use bytewise collation. Avoid redundant lower bounds
+            // so the B-tree seeks directly to the cursor position.
+            let lower = format!("{prefix}/");
+            let upper = format!("{prefix}0");
+            if let Some(after) = child_after
+                && after.prefix >= lower
+            {
+                filter.push_str(
+                    " AND dir_norm_prefix < ? AND (dir_norm_prefix, src_dense_id, link_ord) > (?, ?, ?)",
+                );
+                params.extend([
+                    value(&upper),
+                    value(&after.prefix),
+                    value(&after.source),
+                    value(&after.ordinal),
+                ]);
+            } else {
+                filter.push_str(" AND dir_norm_prefix >= ? AND dir_norm_prefix < ?");
+                params.extend([value(&lower), value(&upper)]);
+            }
         }
         filter.push_str(" ORDER BY dir_norm_prefix, src_dense_id, link_ord LIMIT ?");
         let remaining = usize::from(limit.get()) - rows.len();
@@ -404,13 +515,17 @@ impl DerivedStore {
         after: Option<&NoteAliasPosition>,
         limit: PageLimit,
     ) -> Result<Vec<ProjectedNoteAlias>, PortError> {
-        self.note_alias_page(
-            "WHERE space_id = ? AND old_parent_folder_id = ? AND old_slug_fold = ?",
-            vec![value(space), value(parent), value(&slug_fold.to_owned())],
-            after,
-            limit,
-        )
-        .await
+        // PK: (space_id, old_parent_folder_id, old_slug_fold, created_seq, target_note_id)
+        let mut filter =
+            String::from("WHERE space_id = ? AND old_parent_folder_id = ? AND old_slug_fold = ?");
+        let mut params = vec![value(space), value(parent), value(&slug_fold.to_owned())];
+        if let Some(after) = after {
+            filter.push_str(" AND (created_seq, target_note_id) > (?, ?)");
+            params.extend([value(&after.seq), value(&after.note)]);
+        }
+        filter.push_str(" ORDER BY created_seq, target_note_id LIMIT ?");
+        params.push(value(&i64::from(limit.get())));
+        self.select_current(filter, params).await
     }
 
     pub(crate) async fn link_aliases_for_note(
@@ -420,35 +535,14 @@ impl DerivedStore {
         after: Option<&NoteAliasPosition>,
         limit: PageLimit,
     ) -> Result<Vec<ProjectedNoteAlias>, PortError> {
-        self.note_alias_page(
-            "WHERE space_id = ? AND target_note_id = ?",
-            vec![value(space), value(note)],
-            after,
-            limit,
-        )
-        .await
-    }
-
-    async fn note_alias_page(
-        &self,
-        filter: &'static str,
-        mut params: Vec<super::sql::SqlValue>,
-        after: Option<&NoteAliasPosition>,
-        limit: PageLimit,
-    ) -> Result<Vec<ProjectedNoteAlias>, PortError> {
-        let mut filter = filter.to_owned();
+        // Index: projected_note_alias_target (space_id, target_note_id, old_parent_folder_id, old_slug_fold, created_seq)
+        let mut filter = String::from("WHERE space_id = ? AND target_note_id = ?");
+        let mut params = vec![value(space), value(note)];
         if let Some(after) = after {
-            filter.push_str(" AND (old_parent_folder_id, old_slug_fold, created_seq, target_note_id) > (?, ?, ?, ?)");
-            params.extend([
-                value(&after.parent),
-                value(&after.slug),
-                value(&after.seq),
-                value(&after.note),
-            ]);
+            filter.push_str(" AND (old_parent_folder_id, old_slug_fold, created_seq) > (?, ?, ?)");
+            params.extend([value(&after.parent), value(&after.slug), value(&after.seq)]);
         }
-        filter.push_str(
-            " ORDER BY old_parent_folder_id, old_slug_fold, created_seq, target_note_id LIMIT ?",
-        );
+        filter.push_str(" ORDER BY old_parent_folder_id, old_slug_fold, created_seq LIMIT ?");
         params.push(value(&i64::from(limit.get())));
         self.select_current(filter, params).await
     }

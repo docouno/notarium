@@ -9,7 +9,7 @@ use notarium_core::{
 use super::{
     DerivedStore, ProjectedFolder, ProjectionWatermark, invalid_row, not_ready,
     read::{assert_cut, watermark},
-    sql::{Kind, SqlColumn, SqlTransaction, placeholders, value},
+    sql::{Kind, SqlColumn, SqlTransaction, SqlValue, pad_sqlite_in, placeholders, value},
     stale,
 };
 use crate::index::L0_EVENT_LIMIT;
@@ -185,14 +185,8 @@ impl DerivedStore {
             return Ok(Vec::new());
         }
         PageLimit::new(u16::try_from(dense_ids.len()).unwrap_or(u16::MAX))?;
-        self.at_cut(
-            scope,
-            cutoff,
-            format!("dense_folder_id IN ({})", placeholders(dense_ids.len())),
-            dense_ids.iter().map(value).collect(),
-            "",
-        )
-        .await
+        self.at_cut_in_u32(scope, cutoff, "dense_folder_id", dense_ids)
+            .await
     }
 
     /// One indexed batch of forward or reverse slots at the durable head.
@@ -215,14 +209,8 @@ impl DerivedStore {
         } else {
             "src_dense_id"
         };
-        let sql = format!(
-            "SELECT src_dense_id, resolved_dense_id FROM projected_note_links
-             WHERE space_id = ? AND resolved_dense_id IS NOT NULL AND {key} IN ({}) LIMIT ?",
-            placeholders(dense_ids.len()),
-        );
-        let mut params = vec![value(&scope.space_id)];
-        params.extend(dense_ids.iter().map(value));
-        params.push(value(&remaining.saturating_add(1)));
+        let ids: Vec<i64> = dense_ids.iter().map(|&id| i64::from(id)).collect();
+        let limit = remaining.saturating_add(1);
         self.database
             .read(move |mut tx| {
                 Box::pin(async move {
@@ -233,7 +221,34 @@ impl DerivedStore {
                     if row.projected_seq != cut {
                         return Err(stale());
                     }
-                    let rows = tx.select(&sql, params, &[Kind::Integer; 2]).await?;
+                    let rows = if tx.postgres() {
+                        let sql = format!(
+                            "SELECT src_dense_id, resolved_dense_id FROM projected_note_links
+                             WHERE space_id = ? AND resolved_dense_id IS NOT NULL AND {key} = ANY(?) LIMIT ?"
+                        );
+                        tx.select(
+                            &sql,
+                            vec![
+                                value(&scope.space_id),
+                                SqlValue::IntArray(ids),
+                                value(&limit),
+                            ],
+                            &[Kind::Integer; 2],
+                        )
+                        .await?
+                    } else {
+                        let padded = pad_sqlite_in(&ids);
+                        let sql = format!(
+                            "SELECT src_dense_id, resolved_dense_id FROM projected_note_links
+                             WHERE space_id = ? AND resolved_dense_id IS NOT NULL AND {key} IN ({}) LIMIT ?",
+                            placeholders(padded.len()),
+                        );
+                        let mut params = Vec::with_capacity(2 + padded.len());
+                        params.push(value(&scope.space_id));
+                        params.extend(padded.iter().map(value));
+                        params.push(value(&limit));
+                        tx.select(&sql, params, &[Kind::Integer; 2]).await?
+                    };
                     if rows.len() > remaining as usize {
                         return Ok(None);
                     }

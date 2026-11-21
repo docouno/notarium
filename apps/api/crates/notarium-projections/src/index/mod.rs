@@ -33,8 +33,10 @@ pub use crate::mmap::{
 #[cfg(not(any(test, feature = "test-support")))]
 use crate::mmap::{IndexIdentity, MappedFastIndex};
 
-use delta::ClusterOverlay;
-use model::{BsiKind, FIELD_SCALAR, bucket_marker, field_prefix, simple_scalar};
+use delta::{ChangedNote, ClusterOverlay, EdgeOverlay};
+use model::{
+    BsiKind, FIELD_SCALAR, TAG_NAMESPACE, bucket_key, bucket_marker, field_prefix, simple_scalar,
+};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -78,21 +80,48 @@ impl IndexView {
         self.base.folder_count().max(self.l0.folder_count)
     }
 
+    fn l0_note(&self, index: u32) -> Option<&ChangedNote> {
+        for layer in self.l0.iter_layers_newest_first() {
+            if layer.replaced.contains(index) {
+                return layer.notes.get(&index).map(Arc::as_ref);
+            }
+        }
+        None
+    }
+
     pub fn dense_id(&self, note: &NoteId) -> Option<u32> {
-        self.l0.note_lookup.get(note).copied().or_else(|| {
-            self.base
-                .lookup(note)
-                .filter(|index| !self.l0.replaced.contains(*index))
-        })
+        for layer in self.l0.iter_layers_newest_first() {
+            if let Some(&dense) = layer.note_lookup.get(note) {
+                // Verify this slot wasn't deleted or overwritten by a newer layer.
+                return (self.l0_note(dense).is_some_and(|n| &n.id == note)).then_some(dense);
+            }
+        }
+        self.base
+            .lookup(note)
+            .filter(|index| !self.l0.all_replaced.contains(*index))
+    }
+
+    pub fn dense_id_str(&self, note: &str) -> Option<u32> {
+        if !self.l0.all_replaced.is_empty() {
+            for layer in self.l0.iter_layers_newest_first() {
+                if let Some((&dense, _)) =
+                    layer.notes.iter().find(|(_, row)| row.id.as_str() == note)
+                {
+                    return (self.l0_note(dense).is_some_and(|n| n.id.as_str() == note))
+                        .then_some(dense);
+                }
+            }
+        }
+        self.base
+            .lookup_str(note)
+            .filter(|index| !self.l0.all_replaced.contains(*index))
     }
 
     pub fn note_id(&self, note: DenseNodeId) -> DomainResult<NoteId> {
         let index = note.index(self.generation())?;
-        if self.l0.replaced.contains(index) {
+        if self.l0.all_replaced.contains(index) {
             return self
-                .l0
-                .notes
-                .get(&index)
+                .l0_note(index)
                 .map(|row| row.id.clone())
                 .ok_or(DomainError::ResourceNotFound);
         }
@@ -100,26 +129,22 @@ impl IndexView {
     }
 
     pub fn note_id_str(&self, index: u32) -> Option<&str> {
-        if self.l0.replaced.contains(index) {
-            return self.l0.notes.get(&index).map(|row| row.id.as_str());
+        if self.l0.all_replaced.contains(index) {
+            return self.l0_note(index).map(|row| row.id.as_str());
         }
         self.base.note_id_str(index)
     }
 
     pub fn note_header(&self, index: u32) -> Option<NoteSortHeader> {
-        if self.l0.replaced.contains(index) {
-            return self.l0.notes.get(&index).map(|row| row.header);
+        if self.l0.all_replaced.contains(index) {
+            return self.l0_note(index).map(|row| row.header);
         }
         self.base.note_header(index)
     }
 
     pub(crate) fn updated_at_prefix(&self, index: u32) -> Option<(i64, u16)> {
-        if self.l0.replaced.contains(index) {
-            return self
-                .l0
-                .notes
-                .get(&index)
-                .map(|row| row.header.updated_prefix());
+        if self.l0.all_replaced.contains(index) {
+            return self.l0_note(index).map(|row| row.header.updated_prefix());
         }
         self.base.updated_at_prefix(index)
     }
@@ -154,6 +179,11 @@ impl IndexView {
             .or_else(|| self.base.folder_lifecycle(index))
     }
 
+    pub fn tags_bucketed(&self) -> bool {
+        self.base
+            .has_posting(&bucket_marker(&[TAG_NAMESPACE]), false)
+    }
+
     pub fn posting(&self, key: &PostingKey) -> Result<Bitmap, IndexError> {
         if let PostingKey::ClusterMembers(cluster) = key {
             let mut main = match &self.l0.cluster_overlay {
@@ -170,14 +200,112 @@ impl IndexView {
             main.andnot_inplace(&self.l0.deleted);
             return Ok(main);
         }
-        let mut posting = self.ordinary_posting(&key.encode())?;
-        if let PostingKey::FolderSubtree(folder) = key
-            && let Some(overlay) = self.l0.subtree_overrides.get(folder)
-        {
-            posting.or_inplace(&overlay.added);
-            posting.andnot_inplace(&overlay.removed);
+        if let PostingKey::FolderSubtree(folder) = key {
+            let encoded = key.encode();
+            let mut posting = self.base.bitmap(&encoded, false)?;
+            for layer in self.l0.iter_layers_oldest_first() {
+                if !layer.replaced.is_empty() {
+                    posting.andnot_inplace(&layer.replaced);
+                }
+                if let Some(added) = layer.postings.get(&encoded) {
+                    posting.or_inplace(added);
+                }
+                if let Some(overlay) = layer.subtree_overrides.get(folder) {
+                    posting.or_inplace(&overlay.added);
+                    posting.andnot_inplace(&overlay.removed);
+                }
+            }
+            return Ok(posting);
         }
-        Ok(posting)
+        if let PostingKey::Tag(tag) = key
+            && self.tags_bucketed()
+        {
+            let prefix = [TAG_NAMESPACE];
+            let slot = bucket_key(&prefix, tag.as_bytes());
+            let mut posting = self.base_posting(&slot, false)?;
+            let encoded = key.encode();
+            posting.or_inplace(&self.l0_posting(&encoded));
+            return Ok(posting);
+        }
+        self.ordinary_posting(&key.encode())
+    }
+
+    /// Intersects `target` in place with `key`, avoiding full-bitmap clones
+    /// when `L0Delta` has no overrides for `key`.
+    pub(crate) fn and_posting_inplace(
+        &self,
+        target: &mut Bitmap,
+        key: &PostingKey,
+    ) -> Result<(), IndexError> {
+        if target.is_empty() {
+            return Ok(());
+        }
+        if matches!(
+            key,
+            PostingKey::ClusterMembers(_) | PostingKey::FolderSubtree(_)
+        ) || (matches!(key, PostingKey::Tag(_)) && self.tags_bucketed())
+        {
+            let set = self.posting(key)?;
+            target.and_inplace(&set);
+            return Ok(());
+        }
+        let encoded = key.encode();
+        let l0_hits = if self.l0.all_replaced.is_empty() {
+            None
+        } else {
+            let hits = self.l0_posting_in(&encoded, target);
+            (!hits.is_empty()).then_some(hits)
+        };
+        if let Some(view) = self.base.bitmap_view(&encoded, false)? {
+            if !self.l0.all_replaced.is_empty() {
+                target.andnot_inplace(&self.l0.all_replaced);
+            }
+            target.and_inplace(&view);
+        } else {
+            target.clear();
+        }
+        if let Some(hits) = l0_hits {
+            target.or_inplace(&hits);
+        }
+        Ok(())
+    }
+
+    /// Subtracts `key` from `target` in place directly against the mapped
+    /// `BitmapView` when possible.
+    pub(crate) fn andnot_posting_inplace(
+        &self,
+        target: &mut Bitmap,
+        key: &PostingKey,
+    ) -> Result<(), IndexError> {
+        if target.is_empty() {
+            return Ok(());
+        }
+        if matches!(
+            key,
+            PostingKey::ClusterMembers(_) | PostingKey::FolderSubtree(_)
+        ) || (matches!(key, PostingKey::Tag(_)) && self.tags_bucketed())
+        {
+            let set = self.posting(key)?;
+            target.andnot_inplace(&set);
+            return Ok(());
+        }
+        let encoded = key.encode();
+        if let Some(view) = self.base.bitmap_view(&encoded, false)? {
+            if self.l0.all_replaced.is_empty() {
+                target.andnot_inplace(&view);
+            } else {
+                let mut base_in = view.and(target);
+                base_in.andnot_inplace(&self.l0.all_replaced);
+                target.andnot_inplace(&base_in);
+            }
+        }
+        if !self.l0.all_replaced.is_empty() {
+            let l0_hits = self.l0_posting_in(&encoded, target);
+            if !l0_hits.is_empty() {
+                target.andnot_inplace(&l0_hits);
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn posting_in(
@@ -188,16 +316,64 @@ impl IndexView {
         if matches!(
             key,
             PostingKey::ClusterMembers(_) | PostingKey::FolderSubtree(_)
-        ) {
+        ) || (matches!(key, PostingKey::Tag(_)) && self.tags_bucketed())
+        {
             return self.posting(key).map(|set| set.and(universe));
         }
         self.ordinary_posting_in(&key.encode(), universe)
     }
 
+    fn l0_posting(&self, key: &[u8]) -> Bitmap {
+        let mut out = Bitmap::new();
+        if self.l0.all_replaced.is_empty() {
+            return out;
+        }
+        let multi_layer = !self.l0.layers.is_empty();
+        let mut shadowed = Bitmap::new();
+        for layer in self.l0.iter_layers_newest_first() {
+            if let Some(p) = layer.postings.get(key) {
+                if !multi_layer || shadowed.is_empty() {
+                    out.or_inplace(p);
+                } else {
+                    out.or_inplace(&p.andnot(&shadowed));
+                }
+            }
+            if multi_layer {
+                shadowed.or_inplace(&layer.replaced);
+            }
+        }
+        out
+    }
+
+    pub(super) fn l0_posting_in(&self, key: &[u8], universe: &Bitmap) -> Bitmap {
+        let mut out = Bitmap::new();
+        if self.l0.all_replaced.is_empty() || universe.is_empty() {
+            return out;
+        }
+        let multi_layer = !self.l0.layers.is_empty();
+        let mut shadowed = Bitmap::new();
+        for layer in self.l0.iter_layers_newest_first() {
+            if let Some(p) = layer.postings.get(key) {
+                let mut hits = p.and(universe);
+                if multi_layer && !shadowed.is_empty() {
+                    hits.andnot_inplace(&shadowed);
+                }
+                out.or_inplace(&hits);
+            }
+            if multi_layer {
+                shadowed.or_inplace(&layer.replaced);
+            }
+        }
+        out
+    }
+
     fn ordinary_posting(&self, key: &[u8]) -> Result<Bitmap, IndexError> {
         let mut posting = self.base_posting(key, false)?;
-        if let Some(override_set) = self.l0.postings.get(key) {
-            posting.or_inplace(override_set);
+        if !self.l0.all_replaced.is_empty() {
+            let live = self.l0_posting(key);
+            if !live.is_empty() {
+                posting.or_inplace(&live);
+            }
         }
         Ok(posting)
     }
@@ -208,8 +384,11 @@ impl IndexView {
         universe: &Bitmap,
     ) -> Result<Bitmap, IndexError> {
         let mut posting = self.base_posting_in(key, false, universe)?;
-        if let Some(override_set) = self.l0.postings.get(key) {
-            posting.or_inplace(&override_set.and(universe));
+        if !self.l0.all_replaced.is_empty() {
+            let live = self.l0_posting_in(key, universe);
+            if !live.is_empty() {
+                posting.or_inplace(&live);
+            }
         }
         Ok(posting)
     }
@@ -219,10 +398,10 @@ impl IndexView {
             .base
             .bitmap_view(key, bsi)?
             .map_or_else(Bitmap::new, |view| {
-                if self.l0.replaced.is_empty() {
+                if self.l0.all_replaced.is_empty() {
                     view.to_bitmap()
                 } else {
-                    view.andnot(&self.l0.replaced)
+                    view.andnot(&self.l0.all_replaced)
                 }
             }))
     }
@@ -238,8 +417,8 @@ impl IndexView {
             .bitmap_view(key, bsi)?
             .map_or_else(Bitmap::new, |view| {
                 let mut result = view.and(universe);
-                if !self.l0.replaced.is_empty() {
-                    result.andnot_inplace(&self.l0.replaced);
+                if !self.l0.all_replaced.is_empty() {
+                    result.andnot_inplace(&self.l0.all_replaced);
                 }
                 result
             }))
@@ -256,7 +435,10 @@ impl IndexView {
         for kind in [BsiKind::Number, BsiKind::Date, BsiKind::Timestamp] {
             let domain = kind.prefix(field);
             if self.base.has_posting(&bsi_entry(&domain, BSI_EXISTS), true)
-                || self.l0.bsi_live.contains_key(&domain)
+                || self
+                    .l0
+                    .iter_layers_newest_first()
+                    .any(|layer| layer.bsi_live.contains_key(&domain))
             {
                 return Ok(None);
             }
@@ -272,15 +454,16 @@ impl IndexView {
         }) {
             return Ok(None);
         }
-        for (key, _) in self
-            .l0
-            .postings
-            .range(prefix.clone()..)
-            .take_while(|(key, _)| key.starts_with(&prefix))
-        {
-            keys.insert(key.clone());
-            if keys.len() > capacity {
-                return Ok(None);
+        for layer in self.l0.iter_layers_newest_first() {
+            for (key, _) in layer
+                .postings
+                .range(prefix.clone()..)
+                .take_while(|(key, _)| key.starts_with(&prefix))
+            {
+                keys.insert(key.clone());
+                if keys.len() > capacity {
+                    return Ok(None);
+                }
             }
         }
         let mut values = Vec::new();
@@ -317,17 +500,28 @@ impl IndexView {
         } else {
             &self.l0.outgoing
         };
-        let overlay = edges.get(&index);
-        let base = if overlay.is_some() {
-            &[][..]
-        } else {
-            self.base.neighbors(incoming, index)
+        let (replace, delta, base) = match edges.get(&index) {
+            Some(EdgeOverlay::Replace(vec)) => (Some(vec.as_slice()), None, &[][..]),
+            Some(EdgeOverlay::Delta { added, removed }) => (
+                None,
+                Some((added, removed)),
+                self.base.neighbors(incoming, index),
+            ),
+            None => (None, None, self.base.neighbors(incoming, index)),
         };
-        overlay
-            .into_iter()
-            .flat_map(|vec| vec.iter())
+        let replace_iter = replace.into_iter().flat_map(|slice| slice.iter().copied());
+        let base_iter = base
+            .iter()
             .copied()
-            .chain(base.iter().copied().map(u32::from_le_bytes))
+            .map(u32::from_le_bytes)
+            .filter(move |edge| {
+                delta
+                    .is_none_or(|(added, removed)| !removed.contains(edge) && !added.contains(edge))
+            });
+        let added_iter = delta
+            .into_iter()
+            .flat_map(|(added, _)| added.iter().copied());
+        replace_iter.chain(base_iter).chain(added_iter)
     }
 }
 

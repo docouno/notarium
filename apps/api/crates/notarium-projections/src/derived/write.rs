@@ -1,11 +1,11 @@
 use std::collections::{BTreeMap, HashSet};
 
-use notarium_canonical::{CanonicalStore, ProjectionErasures};
+use notarium_canonical::ProjectionErasures;
 use notarium_core::{
     DomainError,
     classes::DocClass,
     error::{PortError, ValidationReason},
-    ids::{ChatThreadId, HistoryIncarnation, NoteId, SpaceId, SpaceSeq, ThreadEntrySeq},
+    ids::{ChatThreadId, FolderId, HistoryIncarnation, NoteId, SpaceId, SpaceSeq, ThreadEntrySeq},
     model::{HistoryScope, Lifecycle},
     ports::Cancellation,
     value::YamlValue,
@@ -18,8 +18,11 @@ use super::{
     records::*,
     replay,
     schema::{SpaceGuard, lock_space_guard_with_origin, read_space_guard},
-    sql::{Kind, SqlColumn, SqlRecord, SqlTransaction, SqlValue, key_filter, placeholders, value},
-    staging::{StageBuffer, StagePage, invalid_limit},
+    sql::{
+        Kind, SqlColumn, SqlRecord, SqlTransaction, SqlValue, key_filter, pad_sqlite_in,
+        placeholders, value,
+    },
+    staging::{StageBuffer, StagePage},
     stale,
 };
 
@@ -50,6 +53,43 @@ impl DerivedStore {
         self.database
             .write(false, move |mut tx| {
                 Box::pin(async move { check_guard(&mut tx, &scope).await.map(|_| ()) })
+            })
+            .await
+    }
+
+    /// Registers startup Space scopes in one writer transaction so cold startup
+    /// neither incurs `2*N` round-trips nor opens an interactive reader under
+    /// the short interactive `READ_LIMIT`.
+    pub(crate) async fn register_startup_scopes(
+        &self,
+        scopes: &[HistoryScope],
+    ) -> Result<(), PortError> {
+        if scopes.is_empty() {
+            return Ok(());
+        }
+        let mut ordered = scopes.to_vec();
+        ordered.sort_by(|a, b| a.space_id.cmp(&b.space_id));
+        self.database
+            .write(false, move |mut tx| {
+                Box::pin(async move {
+                    for scope in &ordered {
+                        let previous = watermark(&mut tx, &scope.space_id).await?;
+                        if previous
+                            .as_ref()
+                            .is_none_or(|row| row.history_incarnation == scope.incarnation)
+                            && let Err(error) = check_guard(&mut tx, scope).await
+                            && !(previous.is_none()
+                                && matches!(
+                                    error,
+                                    PortError::Domain(DomainError::ValidationFailed { ref diagnostic })
+                                        if diagnostic.reason == ValidationReason::HistoryIncarnationMismatch
+                                ))
+                        {
+                            return Err(error);
+                        }
+                    }
+                    Ok(())
+                })
             })
             .await
     }
@@ -228,62 +268,112 @@ impl DerivedStore {
             .await
     }
 
-    /// Reuses an existing row ID during a rebuild of the same incarnation.
-    pub async fn note_dense_for_seed(
+    /// Reuses existing row IDs in batch during a rebuild of the same incarnation.
+    pub async fn note_dense_ids_for_seed(
         &self,
         scope: &HistoryScope,
-        note: &NoteId,
-    ) -> Result<Option<u32>, PortError> {
+        notes: &[NoteId],
+    ) -> Result<BTreeMap<NoteId, u32>, PortError> {
+        if notes.is_empty() {
+            return Ok(BTreeMap::new());
+        }
         let scope = scope.clone();
-        let note = note.clone();
+        let ids: Vec<String> = notes.iter().map(|id| id.as_str().to_owned()).collect();
         self.database
             .read(move |mut tx| {
                 Box::pin(async move {
                     let Some(row) = watermark(&mut tx, &scope.space_id).await? else {
-                        return Ok(None);
+                        return Ok(BTreeMap::new());
                     };
                     if row.history_incarnation != scope.incarnation {
                         return Err(mismatch());
                     }
-                    let row = tx
-                        .select(
-                            "SELECT dense_id FROM projected_notes WHERE space_id = ? AND note_id = ?",
-                            vec![value(&scope.space_id), value(&note)],
-                            &[Kind::Integer],
-                        )
-                        .await?
-                        .pop();
-                    row.map(one::<u32>).transpose()
+                    let mut found = BTreeMap::new();
+                    for chunk in ids.chunks(500) {
+                        let rows = if tx.postgres() {
+                            tx.select(
+                                "SELECT note_id, dense_id FROM projected_notes WHERE space_id = ? AND note_id = ANY(?)",
+                                vec![value(&scope.space_id), SqlValue::TextArray(chunk.to_vec())],
+                                &[Kind::Text, Kind::Integer],
+                            )
+                            .await?
+                        } else {
+                            let padded = pad_sqlite_in(chunk);
+                            let mut args = Vec::with_capacity(1 + padded.len());
+                            args.push(value(&scope.space_id));
+                            args.extend(padded.iter().map(value));
+                            let sql = format!(
+                                "SELECT note_id, dense_id FROM projected_notes WHERE space_id = ? AND note_id IN ({})",
+                                placeholders(padded.len())
+                            );
+                            if padded.len() <= 256 {
+                                tx.select(&sql, args, &[Kind::Text, Kind::Integer]).await?
+                            } else {
+                                tx.select_uncached(&sql, args, &[Kind::Text, Kind::Integer])
+                                    .await?
+                            }
+                        };
+                        for row in rows {
+                            let [note, dense] = row.try_into().map_err(|_| invalid_row())?;
+                            found.insert(NoteId::read(note)?, u32::read(dense)?);
+                        }
+                    }
+                    Ok(found)
                 })
             })
             .await
     }
 
-    pub async fn folder_dense_for_seed(
+    pub async fn folder_dense_ids_for_seed(
         &self,
         scope: &HistoryScope,
-        folder: &notarium_core::ids::FolderId,
-    ) -> Result<Option<u32>, PortError> {
+        folders: &[FolderId],
+    ) -> Result<BTreeMap<FolderId, u32>, PortError> {
+        if folders.is_empty() {
+            return Ok(BTreeMap::new());
+        }
         let scope = scope.clone();
-        let folder = folder.clone();
+        let ids: Vec<String> = folders.iter().map(|id| id.as_str().to_owned()).collect();
         self.database
             .read(move |mut tx| {
                 Box::pin(async move {
                     let Some(row) = watermark(&mut tx, &scope.space_id).await? else {
-                        return Ok(None);
+                        return Ok(BTreeMap::new());
                     };
                     if row.history_incarnation != scope.incarnation {
                         return Err(mismatch());
                     }
-                    tx.select(
-                        "SELECT dense_folder_id FROM projected_folders WHERE space_id = ? AND folder_id = ?",
-                        vec![value(&scope.space_id), value(&folder)],
-                        &[Kind::Integer],
-                    )
-                    .await?
-                    .pop()
-                    .map(one::<u32>)
-                    .transpose()
+                    let mut found = BTreeMap::new();
+                    for chunk in ids.chunks(500) {
+                        let rows = if tx.postgres() {
+                            tx.select(
+                                "SELECT folder_id, dense_folder_id FROM projected_folders WHERE space_id = ? AND folder_id = ANY(?)",
+                                vec![value(&scope.space_id), SqlValue::TextArray(chunk.to_vec())],
+                                &[Kind::Text, Kind::Integer],
+                            )
+                            .await?
+                        } else {
+                            let padded = pad_sqlite_in(chunk);
+                            let mut args = Vec::with_capacity(1 + padded.len());
+                            args.push(value(&scope.space_id));
+                            args.extend(padded.iter().map(value));
+                            let sql = format!(
+                                "SELECT folder_id, dense_folder_id FROM projected_folders WHERE space_id = ? AND folder_id IN ({})",
+                                placeholders(padded.len())
+                            );
+                            if padded.len() <= 256 {
+                                tx.select(&sql, args, &[Kind::Text, Kind::Integer]).await?
+                            } else {
+                                tx.select_uncached(&sql, args, &[Kind::Text, Kind::Integer])
+                                    .await?
+                            }
+                        };
+                        for row in rows {
+                            let [folder, dense] = row.try_into().map_err(|_| invalid_row())?;
+                            found.insert(FolderId::read(folder)?, u32::read(dense)?);
+                        }
+                    }
+                    Ok(found)
                 })
             })
             .await
@@ -385,6 +475,7 @@ impl DerivedStore {
             .await
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn stage_page(
         &self,
         key: &StageKey,
@@ -397,7 +488,7 @@ impl DerivedStore {
                 return if mutations.len() == 1 {
                     self.stage_single(key, page_no, mutation).await
                 } else {
-                    Err(invalid_limit())
+                    Err(super::staging::invalid_limit())
                 };
             }
         }
@@ -499,6 +590,7 @@ impl DerivedStore {
             .await
     }
 
+    #[cfg(test)]
     pub async fn publish_staged(
         &self,
         key: &StageKey,
@@ -523,7 +615,8 @@ impl DerivedStore {
         }
         let key = key.clone();
         let next = next.clone();
-        self.database
+        let was_seed = self
+            .database
             .write_adaptive((), move |mut tx| {
                 Box::pin(async move {
                     let dep_sql = "SELECT DISTINCT target_space_id, target_incarnation
@@ -547,7 +640,7 @@ impl DerivedStore {
                     }
                     let current = watermark(&mut tx, &key.scope.space_id).await?;
                     if already_applied(current.as_ref(), expected, &next)? {
-                        return Ok(((), false));
+                        return Ok((false, false));
                     }
 
                     let mut witness = tx
@@ -606,7 +699,18 @@ impl DerivedStore {
                         if destructive {
                             let mut purged = Vec::new();
                             let mut redacted = Vec::new();
-                            for page in 0..page_count {
+                            let destructive_pages = tx
+                                .select(
+                                    "SELECT page_no FROM projection_apply_pages
+                                     WHERE space_id = ? AND history_incarnation = ? AND first_seq = ? AND last_seq = ?
+                                       AND destructive = 1
+                                     ORDER BY page_no",
+                                    stage_values(&key),
+                                    &[Kind::Integer],
+                                )
+                                .await?;
+                            for row in destructive_pages {
+                                let page = one::<u64>(row)?;
                                 let encoded = get_staging_page(&mut tx, &key, page)
                                     .await?
                                     .ok_or_else(stale)?;
@@ -657,10 +761,14 @@ impl DerivedStore {
                     finish_apply(&mut tx, &next).await?;
                     let slots = if destructive { None } else { slots };
                     replay::publish(&mut tx, &next, expected, slots).await?;
-                    Ok(((), destructive || seed))
+                    Ok((seed, destructive || seed))
                 })
             })
-            .await
+            .await?;
+        if was_seed {
+            self.database.analyze_postgres().await;
+        }
+        Ok(())
     }
 
     pub async fn discard_staging(&self, scope: &HistoryScope) -> Result<(), PortError> {
@@ -809,64 +917,6 @@ impl DerivedStore {
                             value(&platform_abi),
                             value(&publication_id),
                         ],
-                    )
-                    .await?;
-                    Ok(())
-                })
-            })
-            .await
-    }
-
-    /// Installs a permanent same-history marker and removes all incoming copies.
-    pub async fn purge_chat_target(
-        &self,
-        scope: &HistoryScope,
-        target: &NoteId,
-    ) -> Result<(), PortError> {
-        let scope = scope.clone();
-        let target = target.clone();
-        self.database
-            .write(true, move |mut tx| {
-                Box::pin(async move {
-                    check_guard(&mut tx, &scope).await?;
-                    purge_target(&mut tx, &scope, &target).await
-                })
-            })
-            .await
-    }
-
-    pub async fn redact_chat_refs(
-        &self,
-        scope: &HistoryScope,
-        entries: &[(ChatThreadId, ThreadEntrySeq)],
-    ) -> Result<(), PortError> {
-        let scope = scope.clone();
-        let mut entries = entries.to_vec();
-        entries.sort_unstable();
-        entries.dedup();
-        self.database
-            .write(true, move |mut tx| {
-                Box::pin(async move {
-                    check_guard(&mut tx, &scope).await?;
-                    // Canonical lock order: markers -> projection_apply_pages (PK order)
-                    // -> chat_note_refs (PK order).
-                    for (thread, entry) in &entries {
-                        insert_redaction_marker(&mut tx, &scope, thread, *entry).await?;
-                    }
-                    delete_apply_pages_ordered(
-                        &mut tx,
-                        ApplyPageDeleteSpec {
-                            redacted: Some((&scope, &entries)),
-                            ..ApplyPageDeleteSpec::default()
-                        },
-                    )
-                    .await?;
-                    delete_chat_refs_ordered(
-                        &mut tx,
-                        ChatRefDeleteSpec {
-                            redacted: Some((&scope, &entries)),
-                            ..ChatRefDeleteSpec::default()
-                        },
                     )
                     .await?;
                     Ok(())
@@ -1130,6 +1180,21 @@ async fn flush_batch(
             .notes
             .iter()
             .map(|row| &row.note_id)
+            .chain(
+                batch
+                    .folders
+                    .iter()
+                    .filter_map(|row| row.cover_note_id.as_ref()),
+            )
+            .chain(batch.note_aliases.iter().map(|row| &row.target_note_id))
+            .chain(batch.descriptors.iter().map(|row| &row.view_note_id))
+            .chain(
+                batch
+                    .ranks
+                    .iter()
+                    .flat_map(|row| [&row.view_note_id, &row.target_note_id]),
+            )
+            .chain(batch.candidates.iter().map(|row| &row.target_note_id))
             .chain(batch.clusters.iter().map(|row| &row.anchor_note_id)),
     )
     .await?
@@ -1156,7 +1221,6 @@ async fn apply_mutations(
     pre_erased: bool,
 ) -> Result<(), PortError> {
     let space = &next.scope.space_id;
-    let seq = next.projected_seq;
     let mut cached_floor: Option<SpaceSeq> = None;
     let mut batch = MutationBatch::default();
 
@@ -1233,87 +1297,137 @@ async fn apply_mutations(
                 }
                 batch.clusters.push(row);
             }
-            other => {
+            UpsertChatRef(row) => {
+                if chat_reference_current(tx, row).await? {
+                    upsert_chat_ref(tx, row).await?;
+                }
+            }
+            DeleteNoteCandidates(dense) => {
+                if !batch.candidates.is_empty() {
+                    let pending = std::mem::take(&mut batch.candidates);
+                    if any_purge_marked(
+                        tx,
+                        &next.scope,
+                        pending.iter().map(|row| &row.target_note_id),
+                    )
+                    .await?
+                    {
+                        return Err(stale());
+                    }
+                    upsert_batch(tx, &pending).await?;
+                }
+                remove::<CandidateLookupKey>(
+                    tx,
+                    "space_id = ? AND target_dense_id = ?",
+                    vec![value(space), value(dense)],
+                )
+                .await?;
+            }
+            DeleteNoteLinks(dense) => {
+                if !batch.links.is_empty() {
+                    let pending = std::mem::take(&mut batch.links);
+                    upsert_batch(tx, &pending).await?;
+                }
+                remove::<ProjectedLink>(
+                    tx,
+                    "space_id = ? AND src_dense_id = ?",
+                    vec![value(space), value(dense)],
+                )
+                .await?;
+            }
+            DeleteLink(dense, ordinal) => {
+                if !batch.links.is_empty() {
+                    let pending = std::mem::take(&mut batch.links);
+                    upsert_batch(tx, &pending).await?;
+                }
+                remove::<ProjectedLink>(
+                    tx,
+                    "space_id = ? AND src_dense_id = ? AND link_ord = ?",
+                    vec![value(space), value(dense), value(ordinal)],
+                )
+                .await?;
+            }
+            DeleteDescriptors(note) => {
+                if !batch.descriptors.is_empty() {
+                    let pending = std::mem::take(&mut batch.descriptors);
+                    if any_purge_marked(
+                        tx,
+                        &next.scope,
+                        pending.iter().map(|row| &row.view_note_id),
+                    )
+                    .await?
+                    {
+                        return Err(stale());
+                    }
+                    upsert_batch(tx, &pending).await?;
+                }
+                remove::<ProjectedViewDescriptor>(
+                    tx,
+                    "space_id = ? AND view_note_id = ?",
+                    vec![value(space), value(note)],
+                )
+                .await?;
+            }
+            DeleteRank(view, key, target) => {
+                if !batch.ranks.is_empty() {
+                    let pending = std::mem::take(&mut batch.ranks);
+                    if any_purge_marked(
+                        tx,
+                        &next.scope,
+                        pending
+                            .iter()
+                            .flat_map(|row| [&row.view_note_id, &row.target_note_id]),
+                    )
+                    .await?
+                    {
+                        return Err(stale());
+                    }
+                    upsert_batch(tx, &pending).await?;
+                }
+                remove::<ProjectedViewRank>(
+                    tx,
+                    "space_id = ? AND view_note_id = ? AND view_key = ? AND target_note_id = ?",
+                    vec![value(space), value(view), value(key), value(target)],
+                )
+                .await?;
+            }
+            InvalidateCheckpointClusters => {
+                // Same-sequence handoff can replace the partition carried
+                // in a valid mmap. Recovery must overlay its durable rows.
+                tx.execute(
+                    "UPDATE projection_checkpoints SET graph_seq = 0 WHERE space_id = ? AND history_incarnation = ? AND graph_seq = ?",
+                    vec![value(space), value(&next.scope.incarnation), value(&next.graph_settled_seq)],
+                )
+                .await?;
+            }
+            DeleteClusters => {
+                if !batch.clusters.is_empty() {
+                    let pending = std::mem::take(&mut batch.clusters);
+                    if any_purge_marked(
+                        tx,
+                        &next.scope,
+                        pending.iter().map(|row| &row.anchor_note_id),
+                    )
+                    .await?
+                    {
+                        return Err(stale());
+                    }
+                    upsert_batch(tx, &pending).await?;
+                }
+                remove::<ProjectedCluster>(tx, "space_id = ?", vec![value(space)]).await?;
+            }
+            PurgeNote(note) => {
                 flush_batch(tx, next, std::mem::take(&mut batch)).await?;
-                match other {
-                    UpsertChatRef(row) => {
-                        if chat_reference_current(tx, row).await? {
-                            upsert_chat_ref(tx, row).await?;
-                        }
-                    }
-                    DeleteNoteCandidates(dense) => {
-                        remove::<CandidateLookupKey>(
-                            tx,
-                            "space_id = ? AND target_dense_id = ?",
-                            vec![value(space), value(dense)],
-                        )
-                        .await?;
-                    }
-                    DeleteNoteLinks(dense) => {
-                        remove::<ProjectedLink>(
-                            tx,
-                            "space_id = ? AND src_dense_id = ?",
-                            vec![value(space), value(dense)],
-                        )
-                        .await?;
-                    }
-                    DeleteLink(dense, ordinal) => {
-                        remove::<ProjectedLink>(
-                            tx,
-                            "space_id = ? AND src_dense_id = ? AND link_ord = ?",
-                            vec![value(space), value(dense), value(ordinal)],
-                        )
-                        .await?;
-                    }
-                    DeleteDescriptors(note) => {
-                        remove::<ProjectedViewDescriptor>(
-                            tx,
-                            "space_id = ? AND view_note_id = ?",
-                            vec![value(space), value(note)],
-                        )
-                        .await?;
-                    }
-                    DeleteRank(view, key, target) => {
-                        remove::<ProjectedViewRank>(
-                            tx,
-                            "space_id = ? AND view_note_id = ? AND view_key = ? AND target_note_id = ?",
-                            vec![value(space), value(view), value(key), value(target)],
-                        )
-                        .await?;
-                    }
-                    InvalidateCheckpointClusters => {
-                        // Same-sequence handoff can replace the partition carried
-                        // in a valid mmap. Recovery must overlay its durable rows.
-                        tx.execute(
-                            "UPDATE projection_checkpoints SET graph_seq = 0 WHERE space_id = ? AND history_incarnation = ? AND graph_seq = ?",
-                            vec![value(space), value(&next.scope.incarnation), value(&next.graph_settled_seq)],
-                        ).await?;
-                    }
-                    DeleteClusters => {
-                        remove::<ProjectedCluster>(tx, "space_id = ?", vec![value(space)]).await?;
-                    }
-                    PurgeNote(note) => {
-                        if !pre_erased {
-                            return Err(invalid_row());
-                        }
-                        cached_floor = None;
-                        purge_note_rows(tx, &next.scope, note, seq).await?;
-                    }
-                    RedactChatEntry(_, _) => {
-                        if !pre_erased {
-                            return Err(invalid_row());
-                        }
-                    }
-                    UpsertNote(_)
-                    | UpsertFolder(_)
-                    | UpsertNoteAlias(_)
-                    | UpsertFolderAlias(_)
-                    | UpsertViewDescriptor(_)
-                    | UpsertViewRank(_)
-                    | UpsertCandidate(_)
-                    | UpsertLink(_)
-                    | UpsertChatThread(_)
-                    | UpsertCluster(_) => unreachable!(),
+                if !pre_erased {
+                    return Err(invalid_row());
+                }
+                cached_floor = None;
+                purge_note_rows(tx, &next.scope, note).await?;
+            }
+            RedactChatEntry(_, _) => {
+                flush_batch(tx, next, std::mem::take(&mut batch)).await?;
+                if !pre_erased {
+                    return Err(invalid_row());
                 }
             }
         }
@@ -1566,20 +1680,42 @@ async fn any_purge_marked<'a>(
         return Ok(false);
     }
     for chunk in unique.chunks(500) {
-        let mut args = vec![value(&scope.space_id), value(&scope.incarnation)];
-        args.extend(chunk.iter().copied().map(value));
-        let ids = placeholders(chunk.len());
-        if exists(
-            tx,
-            &format!(
+        if tx.postgres() {
+            let ids = chunk.iter().map(|n| n.as_str().to_owned()).collect();
+            if exists(
+                tx,
                 "SELECT CAST(1 AS BIGINT) FROM projected_purge_markers
-                 WHERE space_id = ? AND history_incarnation = ? AND note_id IN ({ids}) LIMIT 1"
-            ),
-            args,
-        )
-        .await?
-        {
-            return Ok(true);
+                 WHERE space_id = ? AND history_incarnation = ? AND note_id = ANY(?) LIMIT 1",
+                vec![
+                    value(&scope.space_id),
+                    value(&scope.incarnation),
+                    SqlValue::TextArray(ids),
+                ],
+            )
+            .await?
+            {
+                return Ok(true);
+            }
+        } else {
+            let ids: Vec<String> = chunk.iter().map(|n| n.as_str().to_owned()).collect();
+            let padded = pad_sqlite_in(&ids);
+            let mut args = Vec::with_capacity(2 + padded.len());
+            args.push(value(&scope.space_id));
+            args.push(value(&scope.incarnation));
+            args.extend(padded.iter().map(value));
+            let marks = placeholders(padded.len());
+            let sql = format!(
+                "SELECT CAST(1 AS BIGINT) FROM projected_purge_markers
+                 WHERE space_id = ? AND history_incarnation = ? AND note_id IN ({marks}) LIMIT 1"
+            );
+            let rows = if padded.len() <= 256 {
+                tx.select(&sql, args, &[Kind::Integer]).await?
+            } else {
+                tx.select_uncached(&sql, args, &[Kind::Integer]).await?
+            };
+            if !rows.is_empty() {
+                return Ok(true);
+            }
         }
     }
     Ok(false)
@@ -1611,21 +1747,38 @@ async fn chat_reference_current(
     Ok(!redacted)
 }
 
-pub(super) async fn erase_committed(
+pub(super) enum EraseStep {
+    Reconciled,
+    NeedCanonicalCheck(Option<HistoryIncarnation>),
+}
+
+pub(super) async fn erase_committed_step(
     tx: &mut SqlTransaction<'_>,
-    canonical: &CanonicalStore,
     erasures: &ProjectionErasures,
-) -> Result<(), PortError> {
-    // An erasure or cross-Space staging can register the guard before the
-    // first watermark. Choose the history under the same lock as deletion.
-    let (guard, inserted) = lock_space_guard_with_origin(tx, &erasures.scope).await?;
-    if (inserted || guard.incarnation != erasures.scope.incarnation)
-        && canonical.read_space(&erasures.scope.space_id).await?.scope != erasures.scope
-    {
-        // A different owner can restore shared PostgreSQL while this transaction
-        // waits for the guard. Roll back before binding a history or raising its floor.
-        return Err(super::not_ready());
-    }
+    verified_guard: Option<Option<HistoryIncarnation>>,
+) -> Result<EraseStep, PortError> {
+    // Lock or observe the existing guard without performing canonical I/O inside
+    // an open derived write transaction. If the guard is absent or belongs to
+    // another history, return to the caller to verify canonical outside the tx.
+    let existing = read_space_guard(tx, &erasures.scope.space_id, true).await?;
+    let observed = existing.as_ref().map(|g| g.incarnation);
+    let guard = if observed == Some(erasures.scope.incarnation) {
+        existing.expect("guard present")
+    } else {
+        if verified_guard != Some(observed) {
+            return Ok(EraseStep::NeedCanonicalCheck(observed));
+        }
+        let (guard, inserted) = lock_space_guard_with_origin(tx, &erasures.scope).await?;
+        if !inserted
+            && guard.incarnation != erasures.scope.incarnation
+            && Some(guard.incarnation) != observed
+        {
+            // Another transaction inserted a different guard between our check
+            // and ON CONFLICT DO NOTHING; nothing was written here.
+            return Ok(EraseStep::NeedCanonicalCheck(Some(guard.incarnation)));
+        }
+        guard
+    };
     let scope = HistoryScope {
         space_id: erasures.scope.space_id.clone(),
         incarnation: guard.incarnation,
@@ -1640,7 +1793,8 @@ pub(super) async fn erase_committed(
         .iter()
         .map(|row| (row.thread.clone(), row.entry))
         .collect::<Vec<_>>();
-    erase_guarded(tx, &scope, through, &erasures.purged, &redacted).await
+    erase_guarded(tx, &scope, through, &erasures.purged, &redacted).await?;
+    Ok(EraseStep::Reconciled)
 }
 
 #[derive(Default)]
@@ -1727,6 +1881,9 @@ async fn pre_erase_destructive_mutations(
         },
     )
     .await?;
+    if !sorted_purged.is_empty() {
+        purge_space_epoch_rows(tx, &scope.space_id, seq).await?;
+    }
     Ok(())
 }
 
@@ -2113,7 +2270,10 @@ async fn erase_guarded(
     )
     .await?;
     for note in &sorted_purged {
-        purge_note_rows(tx, scope, note, through).await?;
+        purge_note_rows(tx, scope, note).await?;
+    }
+    if !sorted_purged.is_empty() {
+        purge_space_epoch_rows(tx, &scope.space_id, through).await?;
     }
     if let Some(current) = watermark(tx, &scope.space_id).await? {
         if current.history_incarnation != scope.incarnation {
@@ -2152,32 +2312,6 @@ async fn insert_purge_marker(
     Ok(())
 }
 
-async fn purge_target(
-    tx: &mut SqlTransaction<'_>,
-    scope: &HistoryScope,
-    note: &NoteId,
-) -> Result<(), PortError> {
-    // Canonical lock order: markers -> projection_apply_pages (PK order) -> chat_note_refs (PK order).
-    insert_purge_marker(tx, scope, note).await?;
-    delete_apply_pages_ordered(
-        tx,
-        ApplyPageDeleteSpec {
-            purged: Some((scope, std::slice::from_ref(note))),
-            ..ApplyPageDeleteSpec::default()
-        },
-    )
-    .await?;
-    delete_chat_refs_ordered(
-        tx,
-        ChatRefDeleteSpec {
-            purged: Some((scope, std::slice::from_ref(note))),
-            ..ChatRefDeleteSpec::default()
-        },
-    )
-    .await?;
-    Ok(())
-}
-
 fn redaction_args(
     scope: &HistoryScope,
     thread: &ChatThreadId,
@@ -2206,23 +2340,88 @@ async fn insert_redaction_marker(
     Ok(())
 }
 
+async fn purge_space_epoch_rows(
+    tx: &mut SqlTransaction<'_>,
+    space: &SpaceId,
+    through: SpaceSeq,
+) -> Result<(), PortError> {
+    tx.execute(
+        "DELETE FROM graph_clusters WHERE space_id = ? AND updated_seq < ?",
+        vec![value(space), value(&through)],
+    )
+    .await?;
+    tx.execute(
+        "DELETE FROM projection_checkpoints WHERE space_id = ? AND seq < ?",
+        vec![value(space), value(&through)],
+    )
+    .await?;
+    Ok(())
+}
+
 async fn purge_note_rows(
     tx: &mut SqlTransaction<'_>,
     scope: &HistoryScope,
     note: &NoteId,
-    through: SpaceSeq,
 ) -> Result<(), PortError> {
     let space = &scope.space_id;
     let args = vec![value(space), value(note)];
-    let dense = tx
+    let rows = tx
         .select(
-            "SELECT dense_id FROM projected_notes WHERE space_id = ? AND note_id = ?",
+            "SELECT dense_id, parent_folder_id, doc_class, lifecycle FROM projected_notes WHERE space_id = ? AND note_id = ?",
             args.clone(),
-            &[Kind::Integer],
+            &[Kind::Integer, Kind::Text, Kind::Text, Kind::Text],
         )
         .await?;
-    for id in dense {
-        let id = one::<u32>(id)?;
+    for row in rows {
+        let [dense, parent, doc_class, lifecycle] = row.try_into().map_err(|_| invalid_row())?;
+        let id = u32::read(dense)?;
+        let parent = FolderId::read(parent)?;
+        let doc_class = DocClass::read(doc_class)?;
+        let lifecycle = Lifecycle::read(lifecycle)?;
+        if lifecycle == Lifecycle::Active && doc_class != DocClass::EncryptedNote {
+            let mut ancestors = Vec::new();
+            let mut current = Some(parent);
+            let mut all_active = true;
+            for _ in 0..=notarium_canonical::domain::common::MAX_FOLDER_DEPTH {
+                let Some(folder_id) = current.take() else {
+                    break;
+                };
+                if ancestors.contains(&folder_id) {
+                    all_active = false;
+                    break;
+                }
+                let folder_rows = tx
+                    .select(
+                        "SELECT parent_folder_id, lifecycle FROM projected_folders WHERE space_id = ? AND folder_id = ?",
+                        vec![value(space), value(&folder_id)],
+                        &[Kind::Text, Kind::Text],
+                    )
+                    .await?;
+                let Some(folder_row) = folder_rows.into_iter().next() else {
+                    all_active = false;
+                    break;
+                };
+                let [next_parent, folder_lifecycle] =
+                    folder_row.try_into().map_err(|_| invalid_row())?;
+                if Lifecycle::read(folder_lifecycle)? != Lifecycle::Active {
+                    all_active = false;
+                    break;
+                }
+                ancestors.push(folder_id);
+                current = Option::<FolderId>::read(next_parent)?;
+            }
+            if all_active {
+                for folder_id in ancestors {
+                    tx.execute(
+                        "UPDATE projected_folders
+                         SET active_note_count = CASE WHEN active_note_count > 0 THEN active_note_count - 1 ELSE 0 END
+                         WHERE space_id = ? AND folder_id = ?",
+                        vec![value(space), value(&folder_id)],
+                    )
+                    .await?;
+                }
+            }
+        }
         tx.execute(
             "DELETE FROM projected_note_links WHERE space_id = ? AND src_dense_id = ?",
             vec![value(space), value(&id)],
@@ -2240,6 +2439,11 @@ async fn purge_note_rows(
         )
         .await?;
     }
+    tx.execute(
+        "DELETE FROM candidate_lookup_keys WHERE space_id = ? AND target_note_id = ?",
+        args.clone(),
+    )
+    .await?;
     tx.execute(
         "DELETE FROM projected_notes WHERE space_id = ? AND note_id = ?",
         args.clone(),
@@ -2268,16 +2472,6 @@ async fn purge_note_rows(
     tx.execute(
         "UPDATE projected_folders SET cover_note_id = NULL WHERE space_id = ? AND cover_note_id = ?",
         args,
-    )
-    .await?;
-    tx.execute(
-        "DELETE FROM graph_clusters WHERE space_id = ? AND updated_seq < ?",
-        vec![value(space), value(&through)],
-    )
-    .await?;
-    tx.execute(
-        "DELETE FROM projection_checkpoints WHERE space_id = ? AND seq < ?",
-        vec![value(space), value(&through)],
     )
     .await?;
     Ok(())

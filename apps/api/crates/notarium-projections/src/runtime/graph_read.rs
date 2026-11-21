@@ -100,9 +100,12 @@ impl ProjectionEngine {
     ) -> Result<GraphResult, PortError> {
         let cut = self.published_cut(ctx.scope())?;
         let index = self.open_index_async(&cut).await?;
-        let (head, authorized, lens) = {
+        let (head, authorized, lens, lens_tags_need_exact) = {
             let permit = cut.live.try_read()?;
             authorize_graph_entry(&permit, ctx, &cut)?;
+            if matches!(query.tier, GraphTier::Superclusters) && !has_full_plain_graph_access(ctx) {
+                return Err(DomainError::AccessDenied.into());
+            }
             query.filter.validate_declared(&cut.fields)?;
             let universe = structural_universe(&index, permit.space(), ctx.auth())?;
             let (authorized, permit) = current_bitmap(
@@ -115,8 +118,14 @@ impl ProjectionEngine {
                 true,
             )
             .await?;
-            let lens = lens_scope(&index, ctx, &permit, &query.tier, &authorized)?;
-            (permit.head(), authorized, lens)
+            let (lens, tags_exact) = lens_scope(&index, ctx, &permit, &query.tier, &authorized)?;
+            (permit.head(), authorized, lens, tags_exact)
+        };
+        let lens = match (lens, lens_tags_need_exact) {
+            (Some(scope_bm), Some(req_tags)) => {
+                Some(exact_tag_filter(&cut, &scope_bm, &req_tags).await?)
+            }
+            (lens, _) => lens,
         };
         let matched = exact_filter(&index, &cut, &query.filter.predicate, &authorized).await?;
         let mut issued_cut = cut.cut.clone();
@@ -129,6 +138,7 @@ impl ProjectionEngine {
                     seq,
                     index.node_count(),
                     None,
+                    &ctx.budget.cancellation,
                 )
                 .await?,
             ),
@@ -145,6 +155,7 @@ impl ProjectionEngine {
                     seq,
                     index.node_count(),
                     Some(cluster),
+                    &ctx.budget.cancellation,
                 )
                 .await?,
             ),
@@ -175,7 +186,7 @@ impl ProjectionEngine {
         for page in plan.hydration.chunks(MAX_ROWS) {
             let dense: Vec<_> = page.iter().map(|&(_, dense)| dense).collect();
             let cards = self
-                .hydrate_cards_at(ctx, &cut, &dense, &overlay, head)
+                .hydrate_cards_at(ctx, &cut, &dense, &overlay, Some(head))
                 .await?;
             if cards.len() != page.len() {
                 return Err(DomainError::validation(ValidationReason::InvalidState).into());
@@ -244,6 +255,7 @@ impl ProjectionEngine {
             NoteLinkDirection::Incoming => LinkAddress::Target(dense),
         };
         let capacity = usize::from(limit.get());
+        let fetch_limit = limit.get().saturating_add(1).min(201);
         let mut cursor_pos = after.map(|c| LinkPosition::from_key(c.src_dense_id, c.link_ord));
         let mut links = Vec::with_capacity(capacity);
         let mut last_returned_key: Option<(u32, u32)> = None;
@@ -257,10 +269,10 @@ impl ProjectionEngine {
                     cut.cut.projected_seq,
                     address,
                     cursor_pos.as_ref(),
-                    limit,
+                    fetch_limit,
                 )
                 .await?;
-            let page_exhausted = rows.len() < capacity;
+            let page_exhausted = rows.len() < usize::from(fetch_limit);
             let last_scanned = rows.last().map(LinkPosition::from);
 
             let permit = cut.live.try_read()?;
@@ -334,20 +346,36 @@ fn authorize_graph_entry(
     authorize_entry(permit, ctx, entry_folder(grant, &cut.root_folder_id, None))
 }
 
+fn has_full_plain_graph_access(ctx: &SpaceContext) -> bool {
+    use notarium_core::classes::DocClass;
+    let Some(grant) = ctx.auth().spaces().get(&ctx.scope().space_id) else {
+        return false;
+    };
+    grant.project_root.is_none()
+        && [
+            DocClass::UserDoc,
+            DocClass::AgentMemory,
+            DocClass::Skill,
+            DocClass::Profile,
+        ]
+        .iter()
+        .all(|class| grant.read_classes.contains(class))
+}
+
 fn lens_scope(
     index: &IndexView,
     ctx: &SpaceContext,
     permit: &LiveReadPermit,
     tier: &GraphTier,
     universe: &Bitmap,
-) -> Result<Option<Bitmap>, PortError> {
+) -> Result<(Option<Bitmap>, Option<std::collections::BTreeSet<String>>), PortError> {
     let GraphTier::Lens { project, tags, .. } = tier else {
-        return Ok(None);
+        return Ok((None, None));
     };
     let mut scope = universe.clone();
     if let Some(project) = project {
         let facts = permit
-            .folder_facts(project)
+            .active_folder_facts(project, true)
             .ok_or(DomainError::ResourceNotFound)?;
         ctx.auth()
             .authorize_folder_read(&facts.space, project, &facts.ancestor_folders)?;
@@ -360,14 +388,56 @@ fn lens_scope(
                 .map_err(checkpoint_error)?,
         );
     }
-    for tag in tags {
-        scope.and_inplace(
-            &index
-                .posting(&PostingKey::Tag(lookup_key(tag)))
-                .map_err(checkpoint_error)?,
-        );
+    let mut exact_tags = None;
+    if !tags.is_empty() {
+        let normalized: std::collections::BTreeSet<String> =
+            tags.iter().map(|tag| lookup_key(tag)).collect();
+        if index.tags_bucketed() {
+            for tag in &normalized {
+                let hits = index
+                    .tag_candidates(tag, &scope)
+                    .map_err(checkpoint_error)?;
+                scope = hits.into_possible();
+            }
+            exact_tags = Some(normalized);
+        } else {
+            for tag in &normalized {
+                index
+                    .and_posting_inplace(&mut scope, &PostingKey::Tag(tag.clone()))
+                    .map_err(checkpoint_error)?;
+            }
+        }
     }
-    Ok(Some(scope))
+    Ok((Some(scope), exact_tags))
+}
+
+async fn exact_tag_filter(
+    cut: &PublishedCut,
+    candidates: &Bitmap,
+    required: &std::collections::BTreeSet<String>,
+) -> Result<Bitmap, PortError> {
+    let mut resolved = Bitmap::new();
+    let mut pending = candidates.iter().peekable();
+    while pending.peek().is_some() {
+        let page: Vec<_> = pending.by_ref().take(MAX_ROWS).collect();
+        let rows = cut
+            .store
+            .hydrate(&cut.cut.scope, cut.cut.projected_seq, &page)
+            .await?;
+        for row in rows {
+            let note = row.ok_or_else(stale)?;
+            let inline: Vec<String> = crate::derived::decode_payload(&note.tags_msgpack)?;
+            let raw = super::records::note_raw_fields(&note)?;
+            let effective: std::collections::BTreeSet<String> =
+                super::records::effective_tags(&inline, raw.as_ref())
+                    .into_iter()
+                    .collect();
+            if required.is_subset(&effective) {
+                resolved.add(note.dense_id);
+            }
+        }
+    }
+    Ok(resolved)
 }
 
 fn authorize_plain_note(
@@ -419,7 +489,7 @@ async fn exact_filter(
         let page: Vec<_> = pending.by_ref().take(MAX_ROWS).collect();
         let rows = cut
             .store
-            .hydrate(&cut.cut.scope, cut.cut.projected_seq, &page)
+            .hydrate_query_rows(&cut.cut.scope, cut.cut.projected_seq, &page)
             .await?;
         for row in rows {
             let note = row.ok_or_else(stale)?;

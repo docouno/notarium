@@ -538,12 +538,45 @@ async fn execute_rollback(
                 eligible_notes: planned_list,
             };
             ctx.budget.remaining = rollback_time_left(&ctx.budget, deadline)?;
-            let facts = rollback_wait(
+            let facts = match rollback_wait(
                 &ctx.budget,
                 deadline,
                 provider.evaluate_rollback(&board_authority, ctx.clone(), req),
             )
-            .await??;
+            .await?
+            {
+                Ok(facts) => facts,
+                Err(
+                    err @ PortError::Domain(DomainError::ValidationFailed {
+                        diagnostic:
+                            Diagnostic {
+                                reason: ValidationReason::CursorStale,
+                                ..
+                            },
+                    }),
+                ) => {
+                    ctx.budget.remaining = rollback_time_left(&ctx.budget, deadline)?;
+                    if let Some(replayed) = rollback_wait(
+                        &ctx.budget,
+                        deadline,
+                        try_replay_completed_receipt::<StoredCommittedRollbackV1>(
+                            store,
+                            ctx.scope(),
+                            idemp,
+                            Some(&ctx.budget),
+                        ),
+                    )
+                    .await??
+                    {
+                        return Ok(replayed.into_committed());
+                    }
+                    if attempt + 1 < MAX_PLANNER_RETRIES {
+                        continue;
+                    }
+                    return Err(err);
+                }
+                Err(err) => return Err(err),
+            };
             facts.verify_authority(&board_authority)?;
             ctx.scope().check(facts.scope())?;
             Some(facts)

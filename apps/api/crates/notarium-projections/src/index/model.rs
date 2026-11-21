@@ -14,7 +14,10 @@ const ACTIVE: u8 = 1;
 const TRASHED: u8 = 2;
 const TOMBSTONE: u8 = 4;
 const ENCRYPTED: u8 = 8;
-const HAS_SUBUS_NS: u8 = 16;
+
+const PACKED_LIFECYCLE_ACTIVE: u32 = 1;
+const PACKED_LIFECYCLE_TRASHED: u32 = 2;
+const PACKED_LIFECYCLE_PURGED: u32 = 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NoteSortHeader {
@@ -56,8 +59,7 @@ impl NoteSortHeader {
                     ENCRYPTED
                 } else {
                     0
-                }
-                | if remainder != 0 { HAS_SUBUS_NS } else { 0 },
+                },
             updated_subms_us: ((updated.nanosecond() % 1_000_000) / 1_000) as u16,
             updated_subus_ns: remainder as u16,
         }
@@ -88,37 +90,37 @@ impl NoteSortHeader {
     }
 
     pub(crate) fn encode(self, out: &mut Vec<u8>) {
+        // Pack full sub-millisecond nanoseconds (0..999_999 -> 20 bits),
+        // doc_class (0..4 -> 3 bits), and lifecycle (1..3 -> 2 bits) into 4 bytes.
+        let subms_ns = u32::from(self.updated_subms_us) * 1_000 + u32::from(self.updated_subus_ns);
+        let class_bits = u32::from(class_tag(self.doc_class));
+        let life_bits = match self.lifecycle() {
+            Lifecycle::Active => PACKED_LIFECYCLE_ACTIVE,
+            Lifecycle::Trashed => PACKED_LIFECYCLE_TRASHED,
+            Lifecycle::Purged => PACKED_LIFECYCLE_PURGED,
+        };
+        let packed = (subms_ns & 0x000F_FFFF) | (class_bits << 20) | (life_bits << 23);
         out.extend(self.updated_at_ms.to_le_bytes());
         out.extend(self.created_at_ms.to_le_bytes());
         out.extend(self.parent_dense_folder_id.to_le_bytes());
-        out.push(class_tag(self.doc_class));
-        out.push(self.state_flags);
-        out.extend(self.updated_subms_us.to_le_bytes());
+        out.extend(packed.to_le_bytes());
     }
 
     pub(crate) fn decode_updated_prefix(raw: &[u8]) -> Option<(i64, u16)> {
-        Some(Self::decode_prefix(raw)?.updated_prefix())
+        Some(Self::decode(raw)?.updated_prefix())
     }
 
-    pub(crate) fn decode(raw: &[u8], ns_remainder: impl FnOnce() -> Option<u16>) -> Option<Self> {
-        let mut header = Self::decode_prefix(raw)?;
-        if header.state_flags & HAS_SUBUS_NS != 0 {
-            header.updated_subus_ns = ns_remainder().filter(|value| (1..1_000).contains(value))?;
-        }
-        Some(header)
-    }
-
-    fn decode_prefix(raw: &[u8]) -> Option<Self> {
-        let state_flags = *raw.get(21)?;
-        if state_flags & !(ACTIVE | TRASHED | TOMBSTONE | ENCRYPTED | HAS_SUBUS_NS) != 0
-            || !matches!(
-                state_flags & (ACTIVE | TRASHED | TOMBSTONE),
-                ACTIVE | TRASHED | TOMBSTONE
-            )
-        {
+    pub(crate) fn decode(raw: &[u8]) -> Option<Self> {
+        let packed = u32::from_le_bytes(raw.get(20..24)?.try_into().ok()?);
+        // Upper 7 bits are reserved and must be zero.
+        if packed >> 25 != 0 {
             return None;
         }
-        let doc_class = match *raw.get(20)? {
+        let subms_ns = packed & 0x000F_FFFF;
+        if subms_ns >= 1_000_000 {
+            return None;
+        }
+        let doc_class = match (packed >> 20) & 0x7 {
             0 => DocClass::UserDoc,
             1 => DocClass::EncryptedNote,
             2 => DocClass::AgentMemory,
@@ -126,20 +128,26 @@ impl NoteSortHeader {
             4 => DocClass::Profile,
             _ => return None,
         };
-        let updated_subms_us = u16::from_le_bytes(raw.get(22..24)?.try_into().ok()?);
-        if updated_subms_us >= 1_000
-            || (state_flags & ENCRYPTED != 0) != (doc_class == DocClass::EncryptedNote)
-        {
-            return None;
-        }
+        let lifecycle = match (packed >> 23) & 0x3 {
+            PACKED_LIFECYCLE_ACTIVE => ACTIVE,
+            PACKED_LIFECYCLE_TRASHED => TRASHED,
+            PACKED_LIFECYCLE_PURGED => TOMBSTONE,
+            _ => return None,
+        };
+        let state_flags = lifecycle
+            | if doc_class == DocClass::EncryptedNote {
+                ENCRYPTED
+            } else {
+                0
+            };
         Some(Self {
             updated_at_ms: i64::from_le_bytes(raw.get(..8)?.try_into().ok()?),
             created_at_ms: i64::from_le_bytes(raw.get(8..16)?.try_into().ok()?),
             parent_dense_folder_id: u32::from_le_bytes(raw.get(16..20)?.try_into().ok()?),
             doc_class,
             state_flags,
-            updated_subms_us,
-            updated_subus_ns: 0,
+            updated_subms_us: (subms_ns / 1_000) as u16,
+            updated_subus_ns: (subms_ns % 1_000) as u16,
         })
     }
 }
@@ -227,6 +235,7 @@ pub(crate) fn field_prefix(namespace: u8, key: &str) -> Vec<u8> {
     out
 }
 
+pub(crate) const TAG_NAMESPACE: u8 = 9;
 pub(crate) const FIELD_SCALAR: u8 = 16;
 pub(crate) const FIELD_LIST_ELEM: u8 = 17;
 pub(crate) const FIELD_BUCKET: u8 = 18;
@@ -245,8 +254,12 @@ pub(crate) fn bucket_marker(prefix: &[u8]) -> Vec<u8> {
 }
 
 pub(crate) fn bucket_key(prefix: &[u8], scalar_bytes: &[u8]) -> Vec<u8> {
-    let mut key = bucket_marker(prefix);
-    key.push(blake3::hash(scalar_bytes).as_bytes()[0]);
+    let mut key = Vec::with_capacity(3 + prefix.len());
+    key.push(FIELD_BUCKET);
+    key.extend(prefix);
+    let digest = blake3::hash(scalar_bytes);
+    let bucket = u16::from_be_bytes([digest.as_bytes()[0], digest.as_bytes()[1]]) & 0x0FFF;
+    key.extend(bucket.to_be_bytes());
     key
 }
 
@@ -348,7 +361,8 @@ impl BsiKind {
     pub(crate) fn width(self) -> u8 {
         match self {
             Self::Number => 64,
-            Self::Date => 32,
+            // 9999-12-31 encodes as 99_991_231 < 2^27 (134_217_728).
+            Self::Date => 27,
             Self::Timestamp => 94,
         }
     }

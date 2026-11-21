@@ -17,6 +17,25 @@ use super::{IndexError, IndexIdentity, IndexNote, PostingKey, model::*};
 
 const MAX_DIRECT_VALUES: usize = 65_536;
 
+struct BsiColumn {
+    exists: Bitmap,
+    planes: Vec<Bitmap>,
+    large_integer: Bitmap,
+}
+
+impl BsiColumn {
+    fn new(kind: BsiKind) -> Self {
+        let width = usize::from(kind.width());
+        let mut planes = Vec::with_capacity(width);
+        planes.resize_with(width, Bitmap::new);
+        Self {
+            exists: Bitmap::new(),
+            planes,
+            large_integer: Bitmap::new(),
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct GraphSections {
     pub outgoing: Vec<Vec<u32>>,
@@ -32,7 +51,7 @@ pub struct FastIndexBuilder {
     folder_count: u32,
     postings: BTreeMap<Vec<u8>, Bitmap>,
     value_counts: BTreeMap<Vec<u8>, usize>,
-    bsi: BTreeMap<Vec<u8>, Bitmap>,
+    bsi: BTreeMap<Vec<u8>, BsiColumn>,
     exact_integers: BTreeMap<Vec<u8>, Vec<(u32, i128)>>,
     graph: GraphSections,
 }
@@ -78,10 +97,18 @@ impl FastIndexBuilder {
     }
 
     fn insert_posting(&mut self, mut key: Vec<u8>, dense: u32) {
-        if matches!(key.first(), Some(&FIELD_SCALAR) | Some(&FIELD_LIST_ELEM)) {
-            // Field keys are generated here, with a five-byte length prefix.
-            let field_len = u32::from_be_bytes(key[1..5].try_into().expect("field key")) as usize;
-            let (prefix, value) = key.split_at(5 + field_len);
+        let prefix_len = match key.first() {
+            Some(&FIELD_SCALAR) | Some(&FIELD_LIST_ELEM) => {
+                // Field keys are generated here, with a five-byte length prefix.
+                let field_len =
+                    u32::from_be_bytes(key[1..5].try_into().expect("field key")) as usize;
+                Some(5 + field_len)
+            }
+            Some(&TAG_NAMESPACE) => Some(1),
+            _ => None,
+        };
+        if let Some(prefix_len) = prefix_len {
+            let (prefix, value) = key.split_at(prefix_len);
             let marker = bucket_marker(prefix);
             if self.postings.contains_key(&marker) {
                 key = bucket_key(prefix, value);
@@ -122,28 +149,31 @@ impl FastIndexBuilder {
         let Some(bits) = BsiKind::key(value) else {
             return;
         };
-        self.bsi
-            .entry(bsi_entry(&prefix, BSI_EXISTS))
-            .or_default()
-            .add(dense);
-        let mut set_bits = bits;
-        while set_bits != 0 {
-            let index = set_bits.trailing_zeros() as u8;
-            set_bits &= set_bits - 1;
-            self.bsi
-                .entry(bsi_entry(&prefix, BSI_FIRST_PLANE + index))
-                .or_default()
-                .add(dense);
-        }
-        if kind == BsiKind::Number
+        let large_int = if kind == BsiKind::Number
             && let ScalarValue::Number(value) = value
             && let Some(integer) = exact_integer(value)
             && integer.unsigned_abs() > (1u128 << 53)
         {
+            Some(integer)
+        } else {
+            None
+        };
+        let col = if let Some(col) = self.bsi.get_mut(&prefix) {
+            col
+        } else {
             self.bsi
-                .entry(bsi_entry(&prefix, BSI_LARGE_INTEGER))
-                .or_default()
-                .add(dense);
+                .entry(prefix.clone())
+                .or_insert_with(|| BsiColumn::new(kind))
+        };
+        col.exists.add(dense);
+        let mut set_bits = bits;
+        while set_bits != 0 {
+            let index = set_bits.trailing_zeros() as usize;
+            set_bits &= set_bits - 1;
+            col.planes[index].add(dense);
+        }
+        if let Some(integer) = large_int {
+            col.large_integer.add(dense);
             self.exact_integers
                 .entry(prefix)
                 .or_default()
@@ -165,31 +195,16 @@ impl FastIndexBuilder {
     }
 
     pub(crate) fn prepare(
-        mut self,
+        self,
         identity: IndexIdentity,
     ) -> Result<mmap::PreparedCheckpoint, IndexError> {
-        let sections = self.sections()?;
-        let active_count = self
-            .postings
-            .get(&PostingKey::Active.encode())
-            .map_or(0, Bitmap::cardinality)
-            - self
-                .postings
-                .get(&PostingKey::Active.encode())
-                .zip(self.postings.get(&PostingKey::TrashedSubtree.encode()))
-                .map_or(0, |(active, trashed)| active.and_cardinality(trashed));
-        let active_count =
-            u32::try_from(active_count).map_err(|_| IndexError::InvalidInput("active slots"))?;
-        mmap::prepare(
-            identity,
-            self.node_count,
-            self.folder_count,
-            active_count,
-            sections,
-        )
+        let node_count = self.node_count;
+        let folder_count = self.folder_count;
+        let (active_count, sections) = self.into_sections()?;
+        mmap::prepare(identity, node_count, folder_count, active_count, sections)
     }
 
-    fn sections(&mut self) -> Result<Vec<WriteSection>, IndexError> {
+    fn into_sections(mut self) -> Result<(u32, Vec<WriteSection>), IndexError> {
         let node_count = self.node_count as usize;
         if self.graph.outgoing.len() > node_count
             || self.graph.incoming.len() > node_count
@@ -197,42 +212,50 @@ impl FastIndexBuilder {
         {
             return Err(IndexError::InvalidInput("graph exceeds dense slots"));
         }
-        let active = self
+        let active_key = PostingKey::Active.encode();
+        let trashed_subtree_key = PostingKey::TrashedSubtree.encode();
+        let active_total = self
             .postings
-            .get(&PostingKey::Active.encode())
-            .cloned()
-            .unwrap_or_default();
-        let mut graph_nodes = active;
-        if let Some(trashed) = self.postings.get(&PostingKey::TrashedSubtree.encode()) {
+            .get(&active_key)
+            .map_or(0, Bitmap::cardinality);
+        let trashed_overlap = self
+            .postings
+            .get(&active_key)
+            .zip(self.postings.get(&trashed_subtree_key))
+            .map_or(0, |(active, trashed)| active.and_cardinality(trashed));
+        let active_count = u32::try_from(active_total - trashed_overlap)
+            .map_err(|_| IndexError::InvalidInput("active slots"))?;
+
+        let mut graph_nodes = self.postings.get(&active_key).cloned().unwrap_or_default();
+        if let Some(trashed) = self.postings.get(&trashed_subtree_key) {
             graph_nodes.andnot_inplace(trashed);
         }
         if let Some(encrypted) = self.postings.get(&PostingKey::Encrypted.encode()) {
             graph_nodes.andnot_inplace(encrypted);
         }
-        let mut dense_ids = BTreeSet::new();
-        if self.notes.values().any(|(id, header)| {
-            !dense_ids.insert(id) || !self.folders.contains_key(&header.parent_dense_folder_id)
-        }) {
-            return Err(IndexError::InvalidInput(
-                "duplicate note identity or missing parent folder",
-            ));
+        {
+            let mut dense_ids = BTreeSet::new();
+            if self.notes.values().any(|(id, header)| {
+                !dense_ids.insert(id) || !self.folders.contains_key(&header.parent_dense_folder_id)
+            }) {
+                return Err(IndexError::InvalidInput(
+                    "duplicate note identity or missing parent folder",
+                ));
+            }
+            let mut folder_ids = BTreeSet::new();
+            if self.folders.values().any(|(id, _)| !folder_ids.insert(id)) {
+                return Err(IndexError::InvalidInput("duplicate folder identity"));
+            }
         }
-        let mut folder_ids = BTreeSet::new();
-        if self.folders.values().any(|(id, _)| !folder_ids.insert(id)) {
-            return Err(IndexError::InvalidInput("duplicate folder identity"));
-        }
+        self.value_counts.clear();
 
+        // Progressively consume each builder map so peak RAM stays near 1x instead of 4x.
+        let notes_map = std::mem::take(&mut self.notes);
         let notes = identity_tables(
             self.node_count,
-            self.notes
+            notes_map
                 .iter()
                 .map(|(&dense, (id, _))| (dense, id.as_str(), 0)),
-        )?;
-        let folders = identity_tables(
-            self.folder_count,
-            self.folders
-                .iter()
-                .map(|(&dense, (id, lifecycle))| (dense, id.as_str(), lifecycle_tag(*lifecycle))),
         )?;
         let mut headers = vec![
             0;
@@ -240,73 +263,87 @@ impl FastIndexBuilder {
                 .checked_mul(NoteSortHeader::WIDTH)
                 .ok_or(IndexError::InvalidInput("sort header size"))?
         ];
-        let mut remainder = Vec::new();
         let mut header_bytes = Vec::with_capacity(NoteSortHeader::WIDTH);
-        for (&dense, (_, header)) in &self.notes {
+        for (dense, (_, header)) in notes_map {
             let offset = dense as usize * NoteSortHeader::WIDTH;
             header_bytes.clear();
             header.encode(&mut header_bytes);
             headers[offset..offset + NoteSortHeader::WIDTH].copy_from_slice(&header_bytes);
-            if header.ns_remainder() != 0 {
-                remainder.extend(dense.to_le_bytes());
-                remainder.extend(header.ns_remainder().to_le_bytes());
-                remainder.extend(0u16.to_le_bytes());
-            }
         }
 
+        let folders_map = std::mem::take(&mut self.folders);
+        let folders = identity_tables(
+            self.folder_count,
+            folders_map
+                .iter()
+                .map(|(&dense, (id, lifecycle))| (dense, id.as_str(), lifecycle_tag(*lifecycle))),
+        )?;
+        drop(folders_map);
+
+        let graph_clusters = std::mem::take(&mut self.graph.clusters);
         let (cluster_count, cluster_bytes) = clusters(
             self.node_count,
-            &self.graph.clusters,
+            &graph_clusters,
             &graph_nodes,
             &mut self.postings,
         )?;
-        let (cat_count, catalog, arena) = bitmap_catalog(&self.postings)?;
-        let (bsi_count, bsi_catalog, bsi_arena) = bitmap_catalog(&self.bsi)?;
+        drop(graph_clusters);
+
+        let postings_map = std::mem::take(&mut self.postings);
+        let (cat_count, catalog, arena) = bitmap_catalog_owned(postings_map)?;
+
+        let bsi_map = std::mem::take(&mut self.bsi);
+        let (bsi_count, bsi_catalog, bsi_arena) = bsi_catalog_owned(bsi_map)?;
+
+        let exact_map = std::mem::take(&mut self.exact_integers);
         let mut exact = Vec::new();
         let mut exact_directory = Vec::new();
-        for (key, integers) in &mut self.exact_integers {
+        let exact_len = exact_map.len() as u32;
+        let mut exact_keys = Vec::with_capacity(exact_map.len());
+        for (key, mut integers) in exact_map {
             integers.sort_unstable_by_key(|(dense, _)| *dense);
             let offset = exact.len();
             for (dense, integer) in integers {
                 exact.extend(dense.to_le_bytes());
                 exact.extend(integer.to_le_bytes());
             }
-            exact_directory.push((key.as_slice(), offset, exact.len() - offset));
+            let len = exact.len() - offset;
+            exact_keys.push((key, offset, len));
+        }
+        for (key, offset, len) in &exact_keys {
+            exact_directory.push((key.as_slice(), *offset, *len));
         }
         let exact_directory_bytes = directory_bytes(&exact_directory)?;
+        drop(exact_directory);
+        drop(exact_keys);
         let exact_data_offset = exact_directory_bytes.len() as u64;
         let mut exact_bytes = exact_directory_bytes;
         exact_bytes.extend(exact);
-        let outgoing = adjacency(self.node_count, &self.graph.outgoing, &graph_nodes)?;
-        let incoming = adjacency(self.node_count, &self.graph.incoming, &graph_nodes)?;
+
+        let outgoing_lists = std::mem::take(&mut self.graph.outgoing);
+        let outgoing = adjacency(self.node_count, outgoing_lists, &graph_nodes)?;
+        let incoming_lists = std::mem::take(&mut self.graph.incoming);
+        let incoming = adjacency(self.node_count, incoming_lists, &graph_nodes)?;
 
         use SectionKind::*;
-        Ok(vec![
-            WriteSection::new(NoteIdentities, self.node_count, notes.ids, 0),
-            WriteSection::new(NoteLookup, notes.lookup_count, notes.lookup, 0),
-            WriteSection::new(FolderIdentities, self.folder_count, folders.ids, 0),
-            WriteSection::new(FolderLookup, folders.lookup_count, folders.lookup, 0),
-            WriteSection::new(SortHeaders, self.node_count, headers, 0),
-            WriteSection::new(BitmapCatalog, cat_count, catalog, 0),
-            WriteSection::new(BitmapArena, cat_count, arena, 0),
-            WriteSection::new(BsiCatalog, bsi_count, bsi_catalog, 0),
-            WriteSection::new(BsiPlanes, bsi_count, bsi_arena, 0),
-            WriteSection::new(
-                ExactIntegers,
-                self.exact_integers.len() as u32,
-                exact_bytes,
-                exact_data_offset,
-            ),
-            WriteSection::new(GraphOutgoing, self.node_count, outgoing, 0),
-            WriteSection::new(GraphIncoming, self.node_count, incoming, 0),
-            WriteSection::new(Clusters, cluster_count, cluster_bytes, 0),
-            WriteSection::new(
-                TimestampRemainder,
-                (remainder.len() / 8) as u32,
-                remainder,
-                0,
-            ),
-        ])
+        Ok((
+            active_count,
+            vec![
+                WriteSection::new(NoteIdentities, self.node_count, notes.ids, 0),
+                WriteSection::new(NoteLookup, notes.lookup_count, notes.lookup, 0),
+                WriteSection::new(FolderIdentities, self.folder_count, folders.ids, 0),
+                WriteSection::new(FolderLookup, folders.lookup_count, folders.lookup, 0),
+                WriteSection::new(SortHeaders, self.node_count, headers, 0),
+                WriteSection::new(BitmapCatalog, cat_count, catalog, 0),
+                WriteSection::new(BitmapArena, cat_count, arena, 0),
+                WriteSection::new(BsiCatalog, bsi_count, bsi_catalog, 0),
+                WriteSection::new(BsiPlanes, bsi_count, bsi_arena, 0),
+                WriteSection::new(ExactIntegers, exact_len, exact_bytes, exact_data_offset),
+                WriteSection::new(GraphOutgoing, self.node_count, outgoing, 0),
+                WriteSection::new(GraphIncoming, self.node_count, incoming, 0),
+                WriteSection::new(Clusters, cluster_count, cluster_bytes, 0),
+            ],
+        ))
     }
 }
 
@@ -383,8 +420,12 @@ fn identity_tables<'a>(
     })
 }
 
-fn adjacency(count: u32, lists: &[Vec<u32>], graph_nodes: &Bitmap) -> Result<Vec<u8>, IndexError> {
-    let mut out = Vec::new();
+fn adjacency(
+    count: u32,
+    mut lists: Vec<Vec<u32>>,
+    graph_nodes: &Bitmap,
+) -> Result<Vec<u8>, IndexError> {
+    let mut out = Vec::with_capacity((count as usize + 1) * 8);
     let mut edges = Vec::new();
     for node in 0..count {
         out.extend(
@@ -392,13 +433,16 @@ fn adjacency(count: u32, lists: &[Vec<u32>], graph_nodes: &Bitmap) -> Result<Vec
                 .map_err(|_| IndexError::InvalidInput("graph edge count"))?
                 .to_le_bytes(),
         );
-        let Some(neighbors) = lists.get(node as usize) else {
+        let Some(neighbors) = lists.get_mut(node as usize) else {
             continue;
         };
-        if !neighbors.is_empty() && !graph_nodes.contains(node) {
+        if neighbors.is_empty() {
+            continue;
+        }
+        if !graph_nodes.contains(node) {
             return Err(IndexError::InvalidInput("graph contains hidden source"));
         }
-        let mut sorted = neighbors.clone();
+        let mut sorted = std::mem::take(neighbors);
         sorted.sort_unstable();
         sorted.dedup();
         for target in sorted {
@@ -408,6 +452,7 @@ fn adjacency(count: u32, lists: &[Vec<u32>], graph_nodes: &Bitmap) -> Result<Vec
             edges.push(target);
         }
     }
+    drop(lists);
     out.extend(
         u64::try_from(edges.len())
             .map_err(|_| IndexError::InvalidInput("graph edge count"))?
@@ -464,24 +509,72 @@ fn clusters(
     Ok((lookup.len() as u32, out))
 }
 
-fn bitmap_catalog(
-    postings: &BTreeMap<Vec<u8>, Bitmap>,
+fn bitmap_catalog_owned(
+    postings: BTreeMap<Vec<u8>, Bitmap>,
 ) -> Result<(u32, Vec<u8>, Vec<u8>), IndexError> {
-    let mut directory = Vec::new();
+    let mut entries = Vec::with_capacity(postings.len());
     let mut arena = Vec::new();
     let mut scratch = Vec::new();
-    for (key, bitmap) in postings {
+    for (key, mut bitmap) in postings {
+        bitmap.run_optimize();
         let alignment = Frozen::REQUIRED_ALIGNMENT;
         let offset = arena.len().next_multiple_of(alignment);
         arena.resize(offset, 0);
         scratch.clear();
         let bytes = bitmap.serialize_into_vec::<Frozen>(&mut scratch);
         arena.extend_from_slice(bytes);
-        directory.push((key.as_slice(), offset, bytes.len()));
+        entries.push((key, offset, bytes.len()));
     }
     let count =
-        u32::try_from(directory.len()).map_err(|_| IndexError::InvalidInput("bitmap catalog"))?;
-    Ok((count, directory_bytes(&directory)?, arena))
+        u32::try_from(entries.len()).map_err(|_| IndexError::InvalidInput("bitmap catalog"))?;
+    let dir_refs: Vec<(&[u8], usize, usize)> = entries
+        .iter()
+        .map(|(k, off, len)| (k.as_slice(), *off, *len))
+        .collect();
+    let directory = directory_bytes(&dir_refs)?;
+    Ok((count, directory, arena))
+}
+
+fn bsi_catalog_owned(
+    bsi: BTreeMap<Vec<u8>, BsiColumn>,
+) -> Result<(u32, Vec<u8>, Vec<u8>), IndexError> {
+    let mut entries: Vec<(Vec<u8>, usize, usize)> = Vec::new();
+    let mut arena = Vec::new();
+    let mut scratch = Vec::new();
+    let mut push_bitmap = |key: Vec<u8>, mut bitmap: Bitmap| {
+        bitmap.run_optimize();
+        let alignment = Frozen::REQUIRED_ALIGNMENT;
+        let offset = arena.len().next_multiple_of(alignment);
+        arena.resize(offset, 0);
+        scratch.clear();
+        let bytes = bitmap.serialize_into_vec::<Frozen>(&mut scratch);
+        arena.extend_from_slice(bytes);
+        entries.push((key, offset, bytes.len()));
+    };
+    // BsiMap keys (`prefix`) are strictly prefix-free (4-byte length prefix), so
+    // iterating `prefix` in sorted BTreeMap order and roles in ascending byte order
+    // (`0`, `1..=width`, `255`) emits keys in strictly sorted catalog order!
+    for (prefix, column) in bsi {
+        if !column.exists.is_empty() {
+            push_bitmap(bsi_entry(&prefix, BSI_EXISTS), column.exists);
+        }
+        for (bit, plane) in column.planes.into_iter().enumerate() {
+            if !plane.is_empty() {
+                push_bitmap(bsi_entry(&prefix, BSI_FIRST_PLANE + bit as u8), plane);
+            }
+        }
+        if !column.large_integer.is_empty() {
+            push_bitmap(bsi_entry(&prefix, BSI_LARGE_INTEGER), column.large_integer);
+        }
+    }
+    let count =
+        u32::try_from(entries.len()).map_err(|_| IndexError::InvalidInput("bitmap catalog"))?;
+    let dir_refs: Vec<(&[u8], usize, usize)> = entries
+        .iter()
+        .map(|(k, off, len)| (k.as_slice(), *off, *len))
+        .collect();
+    let directory = directory_bytes(&dir_refs)?;
+    Ok((count, directory, arena))
 }
 
 fn directory_bytes(entries: &[(&[u8], usize, usize)]) -> Result<Vec<u8>, IndexError> {

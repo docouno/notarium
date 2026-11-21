@@ -407,6 +407,7 @@ record! {
         format_version: u32,
         platform_abi: String,
         publication_id: String,
+        file_nonce: String,
         size_bytes: u64,
         digest: ContentDigest,
         graph_seq: SpaceSeq,

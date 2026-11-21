@@ -567,9 +567,16 @@ mod tests {
             .unwrap();
         assert_eq!(cut.watermark.snapshot_seq, base_seq);
         assert!(
-            !root
-                .space_fast_index(generation, &scope.space_id, tail_seq)
-                .exists()
+            std::fs::read_dir(root.space_fast_index_dir(generation, &scope.space_id))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .all(|entry| {
+                    let name = entry.file_name();
+                    !name
+                        .to_str()
+                        .is_some_and(|s| s.starts_with(&format!("fast_index_{}", tail_seq.get())))
+                })
         );
         assert_index(&engine, &cut);
         stop_without_checkpoint(runtime).await;

@@ -114,7 +114,7 @@ async fn detached_postgres_purge_retries_missing_and_reset_generations() {
         .wait_for_projected(neighbor.scope(), unrelated.receipt.seq(), &budget())
         .await
         .unwrap();
-    let active_file = root.space_fast_index(initial, &scope.space_id, seq);
+    let active_file = find_checkpoint_file(&root, initial, &scope.space_id, seq).unwrap();
     assert!(active_file.is_file());
     let candidate_file = root.space_fast_index(next, &scope.space_id, seq);
 
@@ -352,7 +352,7 @@ async fn detached_postgres_purge_retries_missing_and_reset_generations() {
         .wait_for_projected(latest.scope(), committed, &budget())
         .await
         .unwrap();
-    let path = root.space_fast_index(initial, &scope.space_id, committed);
+    let path = find_checkpoint_file(&root, initial, &scope.space_id, committed).unwrap();
     assert!(path.is_file());
     let before = floor(&pool, &g1, latest.scope()).await;
     assert_eq!(before.0, latest.scope().incarnation.as_bytes().to_vec());
@@ -432,7 +432,7 @@ async fn postgres_writer_takeover_requires_registered_eraser_after_reopen() {
             "SELECT EXISTS (SELECT 1 FROM {prefix}_g1.projected_notes WHERE space_id=$1 AND note_id=$2)"
         ))).bind(scope.space_id.as_str()).bind(victim.value.note.as_str()).fetch_one(&pool).await.unwrap()
     };
-    let file = root.space_fast_index(initial, &scope.space_id, victim.receipt.seq());
+    let file = find_checkpoint_file(&root, initial, &scope.space_id, victim.receipt.seq()).unwrap();
     assert!(file.is_file() && cached().await);
     runtime.shutdown().await.unwrap();
     let revocation = MaintenanceContext {
@@ -532,7 +532,8 @@ async fn offline_pg_cache_substitution_needs_exact_volume_to_finish_purge() {
         .await
         .unwrap();
     projector.shutdown().await.unwrap();
-    let file = cache.space_fast_index(initial, &ctx.scope().space_id, victim.receipt.seq());
+    let file =
+        find_checkpoint_file(&cache, initial, &ctx.scope().space_id, victim.receipt.seq()).unwrap();
     assert!(file.is_file());
     let detached = projection.0.join("previous");
     let previous_file = detached.join(file.strip_prefix(cache.root()).unwrap());
@@ -697,7 +698,8 @@ async fn pg_cold_restart_requires_configured_cache_before_confirming_purge() {
         (ctx, victim)
     };
 
-    let checkpoint = cache.space_fast_index(initial, &ctx.scope().space_id, victim.receipt.seq());
+    let checkpoint =
+        find_checkpoint_file(&cache, initial, &ctx.scope().space_id, victim.receipt.seq()).unwrap();
     let offline = storage.0.join("original");
     let evidence = offline.join(checkpoint.strip_prefix(cache.root()).unwrap());
     std::fs::rename(cache.root(), &offline).unwrap();
@@ -749,6 +751,79 @@ async fn pg_cold_restart_requires_configured_cache_before_confirming_purge() {
     assert_eq!(confirmed.receipt.seq(), committed);
     assert!(!checkpoint.exists() && !cached().await);
     projector.shutdown().await.unwrap();
+    writer.shutdown().await.unwrap();
+    for schema in [
+        canonical_schema,
+        format!("{prefix}_g1"),
+        format!("{prefix}_ctrl"),
+    ] {
+        ddl(&pool, format!("DROP SCHEMA IF EXISTS {schema} CASCADE")).await;
+    }
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn pg_ephemeral_cache_and_single_runtime_guard_work_on_postgres() {
+    let storage = Scratch::new();
+    let cache = DataRoot::new(storage.0.join("ephemeral-cache"));
+    let (config, pool, canonical_schema, prefix) = postgres_fixture(&storage.root()).await;
+    let (canonical, writer) = CanonicalRuntime::open(config).await.unwrap();
+    let ctx = owner(&canonical).await;
+    let first_note = create(&canonical, &ctx, "ephemeral-one", "# Ephemeral 1\n".into()).await;
+    let initial = ProjectionGeneration::new(GENERATION).unwrap();
+
+    // Seed a stale leftover marker/file inside the ephemeral directory before boot.
+    let stale_file = cache.root().join("v1/stale-leftover.tmp");
+    std::fs::create_dir_all(stale_file.parent().unwrap()).unwrap();
+    std::fs::write(&stale_file, b"leftover").unwrap();
+
+    let start_ephemeral = || {
+        ProjectorRuntime::start_postgres_ephemeral(
+            canonical.clone(),
+            projection_context(),
+            pool.clone(),
+            &prefix,
+            cache.clone(),
+            initial,
+            ProjectionConfig::default(),
+        )
+    };
+    let runtime1 = start_ephemeral().await.unwrap();
+    assert!(
+        !stale_file.exists(),
+        "start_postgres_ephemeral must clear stale files on startup"
+    );
+    let engine1 = runtime1.engine();
+    engine1
+        .wait_for_projected(ctx.scope(), first_note.receipt.seq(), &budget())
+        .await
+        .unwrap();
+
+    // A second concurrent runtime in the same process on the same cache root must be rejected.
+    assert!(
+        start_ephemeral().await.is_err(),
+        "concurrent ProjectorRuntime on the same PostgreSQL cache root must be rejected"
+    );
+
+    // Hold a retained snapshot across runtime1 shutdown to prove sequential
+    // restart succeeds even while the old cache owner Arc is still pinned.
+    let retained = engine1
+        .acquire_snapshot(ctx.clone(), CausalBasis::Await(Default::default()))
+        .await
+        .unwrap();
+    assert!(retained.lookup(&first_note.value.note).is_some());
+    drop(engine1);
+    runtime1.shutdown().await.unwrap();
+
+    let second_note = create(&canonical, &ctx, "ephemeral-two", "# Ephemeral 2\n".into()).await;
+    let runtime2 = start_ephemeral().await.unwrap();
+    runtime2
+        .engine()
+        .wait_for_projected(ctx.scope(), second_note.receipt.seq(), &budget())
+        .await
+        .unwrap();
+    drop(retained);
+    runtime2.shutdown().await.unwrap();
     writer.shutdown().await.unwrap();
     for schema in [
         canonical_schema,

@@ -24,6 +24,7 @@ pub(crate) use leiden::LeidenSnapshot;
 pub(crate) trait GraphAdjacency {
     fn node_count(&self) -> u32;
     fn lookup(&self, note: &NoteId) -> Option<u32>;
+    fn lookup_str(&self, note: &str) -> Option<u32>;
     fn note_id(&self, node: u32) -> Option<NoteId>;
     fn note_id_str(&self, node: u32) -> Option<&str>;
     fn outgoing(&self, node: u32) -> impl Iterator<Item = u32> + Send + '_;
@@ -46,6 +47,10 @@ impl GraphAdjacency for IndexView {
 
     fn lookup(&self, note: &NoteId) -> Option<u32> {
         self.dense_id(note)
+    }
+
+    fn lookup_str(&self, note: &str) -> Option<u32> {
+        self.dense_id_str(note)
     }
 
     fn note_id(&self, node: u32) -> Option<NoteId> {
@@ -94,6 +99,10 @@ impl GraphAdjacency for SettledGraph<'_> {
         self.index.dense_id(note)
     }
 
+    fn lookup_str(&self, note: &str) -> Option<u32> {
+        self.index.dense_id_str(note)
+    }
+
     fn note_id(&self, node: u32) -> Option<NoteId> {
         GraphAdjacency::note_id(self.index, node)
     }
@@ -138,9 +147,13 @@ impl GraphAdjacency for GraphBuild<'_> {
     }
 
     fn lookup(&self, note: &NoteId) -> Option<u32> {
+        self.lookup_str(note.as_str())
+    }
+
+    fn lookup_str(&self, note: &str) -> Option<u32> {
         self.notes
             .iter()
-            .position(|entry| entry.as_ref() == Some(note))
+            .position(|entry| entry.as_ref().is_some_and(|id| id.as_str() == note))
             .map(|index| index as u32)
     }
 

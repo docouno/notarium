@@ -8,12 +8,12 @@ use crate::index::NoteSortHeader;
 
 const MAGIC: [u8; 8] = *b"NTRMFI01";
 const ENDIAN: u16 = 0x0102;
-pub(crate) const FORMAT_VERSION: u16 = 1;
+pub(crate) const FORMAT_VERSION: u16 = 2;
 pub(super) const HEADER_SIZE: usize = 128;
 const ALIGN: usize = 64;
 const ENTRY_SIZE: usize = 32;
 pub(super) const DIGEST_SIZE: usize = 32;
-const SECTION_COUNT: usize = 14;
+const SECTION_COUNT: usize = 13;
 const CATALOG_ENTRY_SIZE: usize = 24;
 
 #[derive(Clone, Copy, Debug)]
@@ -32,7 +32,6 @@ pub(crate) enum SectionKind {
     GraphOutgoing = 11,
     GraphIncoming = 12,
     Clusters = 13,
-    TimestampRemainder = 14,
 }
 
 pub(crate) struct WriteSection {
@@ -187,8 +186,6 @@ impl Directory {
             != count
                 .checked_mul(4)?
                 .checked_add(cluster_count.checked_mul(16)?)?
-            || data(TimestampRemainder).len()
-                != (self.count(TimestampRemainder) as usize).checked_mul(8)?
         {
             return None;
         }
@@ -316,8 +313,8 @@ pub(super) fn encode(
     nodes: u32,
     folders: u32,
     active: u32,
-    sections: &[WriteSection],
-) -> Result<Vec<u8>, IndexError> {
+    sections: Vec<WriteSection>,
+) -> Result<(Vec<u8>, [u8; 32]), IndexError> {
     let size_error = || IndexError::InvalidInput("checkpoint exceeds addressable size");
     if sections.len() != SECTION_COUNT {
         return Err(IndexError::InvalidInput("incomplete sections"));
@@ -352,7 +349,7 @@ pub(super) fn encode(
     out[64..96]
         .copy_from_slice(blake3::hash(identity.scope.space_id.as_str().as_bytes()).as_bytes());
     out[104..112].copy_from_slice(&(HEADER_SIZE as u64).to_le_bytes());
-    for (index, section) in sections.iter().enumerate() {
+    for (index, section) in sections.into_iter().enumerate() {
         if section.kind as usize != index + 1 {
             return Err(IndexError::InvalidInput("sections out of order"));
         }
@@ -372,16 +369,27 @@ pub(super) fn encode(
         out[directory_offset + 24..directory_offset + 32]
             .copy_from_slice(&section.aux.to_le_bytes());
         out.resize(start, 0);
-        out.extend(&section.bytes);
+        out.extend_from_slice(&section.bytes);
         if section.bytes.is_empty() && index + 1 != SECTION_COUNT {
             out.push(0);
         }
+        // Release each section's buffer immediately after copying into `out`.
+        drop(section);
     }
     let total_size = out.len().checked_add(DIGEST_SIZE).ok_or_else(size_error)?;
     out[96..104].copy_from_slice(&(total_size as u64).to_le_bytes());
-    let footer = blake3::hash(&out);
-    out.extend(footer.as_bytes());
-    Ok(out)
+    // Compute both the payload footer digest and the full-file digest in a single pass.
+    let mut hasher = blake3::Hasher::new();
+    if out.len() >= 1024 * 1024 {
+        hasher.update_rayon(&out);
+    } else {
+        hasher.update(&out);
+    }
+    let footer = hasher.finalize();
+    out.extend_from_slice(footer.as_bytes());
+    hasher.update(footer.as_bytes());
+    let file_digest = *hasher.finalize().as_bytes();
+    Ok((out, file_digest))
 }
 
 pub(super) struct Catalog<'a> {

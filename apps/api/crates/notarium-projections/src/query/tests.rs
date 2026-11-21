@@ -600,6 +600,7 @@ async fn retained_board_pages_match_ordered_sql_ranks_and_exact_overlay() {
                     ..input
                 },
                 Some(&view),
+                None,
             )
             .await
             .unwrap();
@@ -683,6 +684,7 @@ async fn retained_board_pages_match_ordered_sql_ranks_and_exact_overlay() {
                         ..input
                     },
                     Some(rank_view),
+                    None,
                 )
                 .await
                 .unwrap();
@@ -768,7 +770,7 @@ async fn retained_board_pages_match_ordered_sql_ranks_and_exact_overlay() {
             };
             let expected = select_window(input).await.unwrap();
             store.take_rank_read_work();
-            let result = select_view_window(input, Some(populated_view))
+            let result = select_view_window(input, Some(populated_view), None)
                 .await
                 .unwrap();
             let (positions, targets) = store.take_rank_read_work();
@@ -817,6 +819,7 @@ async fn retained_board_pages_match_ordered_sql_ranks_and_exact_overlay() {
                 ..input
             },
             Some(populated_view),
+            None,
         )
         .await
         .unwrap();

@@ -10,7 +10,13 @@ fn projection_unsafe_operations_are_confined_to_the_mmap_loader() {
         for entry in fs::read_dir(&directory).expect("read projections crate directory") {
             let entry = entry.expect("read projection crate entry");
             let path = entry.path();
-            if entry.file_type().expect("entry type").is_dir() {
+            let file_type = entry.file_type().expect("entry type");
+            assert!(
+                !file_type.is_symlink(),
+                "symlinked path is forbidden inside projections crate: {}",
+                path.display()
+            );
+            if file_type.is_dir() {
                 if path.file_name().is_some_and(|name| name == "target") {
                     continue;
                 }
@@ -25,34 +31,31 @@ fn projection_unsafe_operations_are_confined_to_the_mmap_loader() {
                     "unsafe operation outside {}",
                     path.display()
                 );
-                // Reject include!() everywhere and #[path] anywhere outside tests/
-                // or pointing outside the crate root (which could smuggle Rust files
-                // outside this recursive scan).
+                // Reject include!() everywhere (including spaced `include ! (` or `std::include!`)
+                // and #[path] anywhere outside tests/ or pointing outside the crate root.
                 let in_tests = path
                     .strip_prefix(&crate_root)
                     .is_ok_and(|rel| rel.starts_with("tests"));
                 assert!(
-                    !contents.contains("include!("),
+                    !contains_include_macro(&contents),
                     "external source inclusion outside {}",
                     path.display()
                 );
-                if contents.contains("#[path") {
+                if contains_path_attr(&contents) {
                     assert!(
                         in_tests,
                         "external #[path] inclusion outside tests/ in {}",
                         path.display()
                     );
                     let parent = path.parent().expect("source file parent");
-                    for line in contents.lines().filter(|l| l.contains("#[path")) {
-                        let (_, rest) = line.split_once('"').expect("quoted #[path]");
-                        let (target, _) = rest.split_once('"').expect("closed #[path]");
+                    for target in extract_path_attr_targets(&contents) {
                         assert!(
                             !target.starts_with('/') && !target.contains(".."),
                             "escaping #[path = \"{target}\"] in {}",
                             path.display()
                         );
                         let resolved =
-                            fs::canonicalize(parent.join(target)).expect("resolve #[path] target");
+                            fs::canonicalize(parent.join(&target)).expect("resolve #[path] target");
                         assert!(
                             resolved.starts_with(&canonical_root),
                             "#[path = \"{target}\"] escapes crate root in {}",
@@ -135,4 +138,79 @@ fn source_tokens(contents: &str) -> impl Iterator<Item = &str> {
         .filter(|line| !line.trim_start().starts_with("//"))
         .flat_map(|source| source.split(|ch: char| ch != '_' && !ch.is_ascii_alphanumeric()))
         .filter(|token| !token.is_empty())
+}
+
+fn contains_include_macro(contents: &str) -> bool {
+    let bytes = contents.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i..].starts_with(b"include")
+            && (i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_'))
+        {
+            let mut j = i + "include".len();
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'!' {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+fn contains_path_attr(contents: &str) -> bool {
+    !extract_path_attr_targets(contents).is_empty()
+}
+
+fn extract_path_attr_targets(contents: &str) -> Vec<String> {
+    let mut targets = Vec::new();
+    let bytes = contents.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'#' {
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'!' {
+                j += 1;
+                while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+            }
+            if j < bytes.len() && bytes[j] == b'[' {
+                j += 1;
+                while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                if bytes[j..].starts_with(b"path") {
+                    j += 4;
+                    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                        j += 1;
+                    }
+                    if j < bytes.len() && bytes[j] == b'=' {
+                        j += 1;
+                        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                            j += 1;
+                        }
+                        if j < bytes.len() && bytes[j] == b'"' {
+                            j += 1;
+                            let start = j;
+                            while j < bytes.len() && bytes[j] != b'"' {
+                                j += 1;
+                            }
+                            if j < bytes.len() {
+                                targets
+                                    .push(String::from_utf8_lossy(&bytes[start..j]).into_owned());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    targets
 }

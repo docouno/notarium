@@ -85,6 +85,11 @@ impl CanonicalStore {
                         .map(|selection| selection.receipt.seq())
                         .max()
                         .unwrap_or(base_seq);
+                    const MAX_OVERLAY_INTERVENING_LAG: u64 = 4_096;
+                    if max_cutoff.get().saturating_sub(base_seq.get()) > MAX_OVERLAY_INTERVENING_LAG
+                    {
+                        return Ok(None);
+                    }
                     if max_cutoff > base_seq
                         && has_intervening_schema_or_folder_change(tx, &scope, base_seq, max_cutoff)
                             .await?

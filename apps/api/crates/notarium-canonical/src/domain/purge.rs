@@ -82,7 +82,7 @@ pub(crate) async fn resume_pending_purges_on_startup(
     ) {
         return Ok(());
     }
-    const SQL: &str = "SELECT space_id FROM pending_purges WHERE phase <> 'completed'
+    const SQL: &str = "SELECT space_id FROM pending_purges WHERE (phase < 'completed' OR phase > 'completed')
         UNION SELECT space_id FROM blob_retirements WHERE status = 'pending'
         UNION SELECT space_id FROM blob_catalog WHERE ref_count=0 AND blob_state='active' AND admission_state='open'";
     let spaces: Vec<String> = store

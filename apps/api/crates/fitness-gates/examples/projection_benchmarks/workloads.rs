@@ -584,6 +584,7 @@ fn evict_cold_board(
 ) {
     evict_checkpoint(engine, fixture, checkpoint);
     if backend == Backend::Sqlite {
+        engine.evict_sqlite_cache_for_test();
         let db = cache.derived(generation());
         evict_file_cache(&db);
         let wal = Path::new(&format!("{}-wal", db.display())).to_path_buf();

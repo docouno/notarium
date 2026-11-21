@@ -1,5 +1,6 @@
 //! Private immutable checkpoint I/O. A persisted writer record is mandatory on reopen.
 
+#[forbid(unsafe_code)]
 mod format;
 mod raw;
 
@@ -156,31 +157,40 @@ impl FileLease {
         let Some(expected) = &self.witness else {
             return Ok(());
         };
-        let metadata = match fs::symlink_metadata(&self.path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(error),
-        };
-        if metadata.is_file() && FileWitness::from_metadata(&metadata) == *expected {
-            #[cfg(not(unix))]
-            {
-                // Portable timestamps and size are weaker than a vnode ID.
-                // Verify the exact writer digest before unlinking on these hosts.
-                let mut source = File::open(&self.path)?;
+        unlink_target(&self.path, expected, &self.record.digest)
+    }
+}
+
+fn unlink_target(path: &Path, expected: &FileWitness, digest: &[u8; 32]) -> io::Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if metadata.is_file() && FileWitness::from_metadata(&metadata) == *expected {
+        #[cfg(not(unix))]
+        {
+            // Nonce-named files are globally unique per publication and cannot
+            // collide with a later publication at the same sequence; legacy
+            // deterministic filenames still verify the writer digest before unlink.
+            if !has_publication_nonce(path) {
+                let mut source = File::open(path)?;
                 let mut hasher = blake3::Hasher::new();
                 io::copy(&mut source, &mut hasher)?;
-                if hasher.finalize().as_bytes() != &self.record.digest {
+                if hasher.finalize().as_bytes() != digest {
                     return Ok(());
                 }
                 drop(source);
             }
-            remove_readonly(&self.path)?;
-            if let Some(directory) = self.path.parent() {
-                sync_directory(directory)?;
-            }
         }
-        Ok(())
+        #[cfg(unix)]
+        let _ = digest;
+        remove_readonly(path)?;
+        if let Some(directory) = path.parent() {
+            sync_directory(directory)?;
+        }
     }
+    Ok(())
 }
 
 impl Drop for FileLease {
@@ -188,30 +198,55 @@ impl Drop for FileLease {
         let Some(directory) = self.path.parent() else {
             return;
         };
-        // Keep the registry locked through unlink so a late registration
-        // either joins the retired vnode or can no longer open its name.
-        let _mutation = file_mutations();
-        let mut checkpoints = CHECKPOINTS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let state = self.state.load(Ordering::Acquire);
-        let mut reclaim = matches!(state, PENDING | RETIRED | PURGED | PENDING_PURGED);
-        let mut held = false;
-        if let Some(entries) = checkpoints.get_mut(directory) {
-            entries.retain(|entry| {
-                let ours = std::ptr::eq(entry.lease.as_ptr(), self);
-                reclaim |= ours && entry.retired && !matches!(state, INVALIDATED | UNLINKED);
-                !ours
-            });
-            held = entries
-                .iter()
-                .any(|entry| self.registered_file(entry) && entry.lease.strong_count() != 0);
-            if entries.is_empty() {
-                checkpoints.remove(directory);
+        let nonce_named = has_publication_nonce(&self.path);
+        // For nonce-named files, filenames are unique per publication so we do
+        // not need the global FILE_MUTATIONS mutex during lazy drop; release
+        // CHECKPOINTS BEFORE performing filesystem unlink/fsync I/O.
+        let (reclaim, held) = {
+            let _mutation = (!nonce_named).then(file_mutations);
+            let mut checkpoints = CHECKPOINTS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut reclaim = matches!(state, PENDING | RETIRED | PURGED | PENDING_PURGED);
+            let mut held = false;
+            if let Some(entries) = checkpoints.get_mut(directory) {
+                entries.retain(|entry| {
+                    let ours = std::ptr::eq(entry.lease.as_ptr(), self);
+                    reclaim |= ours && entry.retired && !matches!(state, INVALIDATED | UNLINKED);
+                    !ours
+                });
+                held = entries
+                    .iter()
+                    .any(|entry| self.registered_file(entry) && entry.lease.strong_count() != 0);
+                if entries.is_empty() {
+                    checkpoints.remove(directory);
+                }
             }
-        }
-        if reclaim && !held {
-            let _ = self.unlink_original();
+            if reclaim && !held && !nonce_named {
+                // Legacy non-nonce paths must keep the mutation guard across unlink.
+                let _ = self.unlink_original();
+                return;
+            }
+            (reclaim, held)
+        };
+        if reclaim
+            && !held
+            && let Some(witness) = self.witness.clone()
+        {
+            let path = self.path.clone();
+            let digest = self.record.digest;
+            // Offload lazy retirement unlink/fsync off Tokio async workers;
+            // synchronous/non-Tokio callers and purge/pending drops run inline.
+            if state == RETIRED
+                && let Ok(handle) = tokio::runtime::Handle::try_current()
+            {
+                drop(handle.spawn_blocking(move || {
+                    let _ = unlink_target(&path, &witness, &digest);
+                }));
+            } else {
+                let _ = unlink_target(&path, &witness, &digest);
+            }
         }
     }
 }
@@ -324,22 +359,12 @@ impl BaseIndexHandle {
                     if let Some(pool) = pool.upgrade() {
                         MmapPool(pool).evict(&Self(Arc::clone(&lease)));
                     }
-                    // On Unix, unlinking an already-mapped file is safe and immediately
-                    // removes purged bytes from the directory namespace before purge returns.
-                    #[cfg(unix)]
+                    // Unlink purged bytes from the directory namespace before purge returns,
+                    // propagating any unlink error fail-closed on every platform (including Windows).
                     {
                         let _mutation = file_mutations();
                         if lease.state.load(Ordering::Acquire) != UNLINKED {
                             lease.unlink_original()?;
-                            lease.state.store(UNLINKED, Ordering::Release);
-                        }
-                    }
-                    #[cfg(not(unix))]
-                    {
-                        let _mutation = file_mutations();
-                        if lease.state.load(Ordering::Acquire) != UNLINKED
-                            && lease.unlink_original().is_ok()
-                        {
                             lease.state.store(UNLINKED, Ordering::Release);
                         }
                     }
@@ -443,12 +468,19 @@ impl BaseIndexHandle {
         Ok(map)
     }
 
-    pub(crate) fn try_open_resident(
+    pub(crate) async fn open_async(
         &self,
         pool: &MmapPool,
-    ) -> Result<Option<Arc<MappedFastIndex>>, IndexError> {
+    ) -> Result<Arc<MappedFastIndex>, IndexError> {
         self.check_open()?;
-        Ok(pool.try_get_resident(self))
+        let map = pool.open_async(self).await?;
+        self.check_open()?;
+        Ok(map)
+    }
+
+    pub(crate) fn is_usable(&self) -> bool {
+        let state = self.0.state.load(Ordering::Acquire);
+        state != PENDING && state < REPAIR_PENDING
     }
 
     fn check_open(&self) -> Result<(), IndexError> {
@@ -507,12 +539,17 @@ impl BaseIndexHandle {
         Ok(())
     }
 
-    /// Revoke an erased or history-replaced checkpoint before reusing its name.
-    /// Outstanding readers must independently honor the canonical revocation.
-    /// A failed unlink leaves admissions closed and can be retried by the writer.
-    pub(crate) fn invalidate(&self, pool: &MmapPool) -> Result<(), IndexError> {
+    /// Non-blocking first half of invalidation: blocks future opens and evicts
+    /// any resident mapping without acquiring the blocking filesystem lock.
+    pub(crate) fn begin_invalidate(&self, pool: &MmapPool) {
         self.0.state.fetch_max(INVALIDATED, Ordering::AcqRel);
         pool.evict(self);
+    }
+
+    /// Blocking second half of invalidation: unlinks the original vnode under
+    /// `file_mutations()`. Safe to call on a blocking thread pool after
+    /// `begin_invalidate`.
+    pub(crate) fn finish_invalidate(&self) -> Result<(), IndexError> {
         let _mutation = file_mutations();
         if self.0.state.load(Ordering::Acquire) == UNLINKED {
             return Ok(());
@@ -524,12 +561,75 @@ impl BaseIndexHandle {
         Ok(())
     }
 
+    /// Revoke an erased or history-replaced checkpoint before reusing its name.
+    /// Outstanding readers must independently honor the canonical revocation.
+    /// A failed unlink leaves admissions closed and can be retried by the writer.
+    #[cfg(test)]
+    pub(crate) fn invalidate(&self, pool: &MmapPool) -> Result<(), IndexError> {
+        self.begin_invalidate(pool);
+        self.finish_invalidate()
+    }
+
     /// Remove an orphan or invalid checkpoint discovered during startup. Only
     /// call before admitting readers, while the coordinator owns the directory.
+    #[cfg(test)]
     pub(crate) fn discard_unleased(path: &Path) -> Result<(), IndexError> {
         let _mutation = file_mutations();
         let path = absolute(path)?;
         discard_path(&path)
+    }
+
+    /// Remove any unleased checkpoint files (legacy or nonce-named) matching
+    /// `seq` inside `directory` during startup recovery.
+    pub(crate) fn discard_unleased_seq(directory: &Path, seq: SpaceSeq) -> Result<(), IndexError> {
+        let _mutation = file_mutations();
+        let directory = absolute(directory)?;
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name();
+            if name.to_str().and_then(parse_checkpoint_seq) == Some(seq) {
+                discard_path(&entry.path())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Clear any unpublished legacy or nonce-named checkpoint files for `seq`
+    /// inside `directory`. Returns `false` if any live vnode still owns a file
+    /// at that sequence.
+    pub(crate) fn discard_unpublished_seq(
+        directory: &Path,
+        seq: SpaceSeq,
+    ) -> Result<bool, IndexError> {
+        let directory = absolute(directory)?;
+        match check_private_directory(&directory) {
+            Ok(()) => {}
+            Err(IndexError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(true);
+            }
+            Err(error) => return Err(error),
+        }
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
+            Err(error) => return Err(error.into()),
+        };
+        let mut all_clear = true;
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name();
+            if name.to_str().and_then(parse_checkpoint_seq) == Some(seq)
+                && !Self::discard_unpublished_name(&entry.path(), seq)?
+            {
+                all_clear = false;
+            }
+        }
+        Ok(all_clear)
     }
 
     /// Clear the reserved filename for a head independently proven unpublished
@@ -538,10 +638,14 @@ impl BaseIndexHandle {
     pub(crate) fn discard_unpublished_name(path: &Path, seq: SpaceSeq) -> Result<bool, IndexError> {
         let _mutation = file_mutations();
         let path = absolute(path)?;
-        let name = format!("fast_index_{}.mmap", seq.get());
         let directory = path
             .parent()
-            .filter(|_| path.file_name() == Some(std::ffi::OsStr::new(&name)))
+            .filter(|_| {
+                path.file_name()
+                    .and_then(|n| n.to_str())
+                    .and_then(parse_checkpoint_seq)
+                    == Some(seq)
+            })
             .ok_or(IndexError::Untrusted("invalid unpublished checkpoint path"))?;
         match check_private_directory(directory) {
             Ok(()) => {}
@@ -627,6 +731,29 @@ impl BaseIndexHandle {
     }
 }
 
+/// Parses either `fast_index_<seq>.mmap` or `fast_index_<seq>_<nonce>.mmap`.
+pub(crate) fn parse_checkpoint_seq(file_name: &str) -> Option<SpaceSeq> {
+    let body = file_name
+        .strip_prefix("fast_index_")?
+        .strip_suffix(".mmap")?;
+    let seq_str = match body.split_once('_') {
+        Some((seq_part, nonce)) if is_lower_hex(nonce, 32) => seq_part,
+        Some(_) => return None,
+        None => body,
+    };
+    let raw = seq_str.parse::<u64>().ok()?;
+    SpaceSeq::new(raw).ok()
+}
+
+fn has_publication_nonce(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix("fast_index_"))
+        .and_then(|name| name.strip_suffix(".mmap"))
+        .and_then(|body| body.split_once('_'))
+        .is_some_and(|(seq, nonce)| seq.parse::<u64>().is_ok() && is_lower_hex(nonce, 32))
+}
+
 fn is_lower_hex(value: &str, len: usize) -> bool {
     value.len() == len
         && value
@@ -664,10 +791,21 @@ pub(crate) fn sweep_erased_checkpoint(
         format::matches_range(header, generation, range, named_seq)
     };
     if probe {
-        return Ok(matches!(
-            match_file_header(&path, matches)?,
-            HeaderMatch::Matching
-        ));
+        return match match_file_header(&path, matches) {
+            Ok(HeaderMatch::Matching) => Ok(true),
+            Ok(_) => Ok(false),
+            #[cfg(windows)]
+            Err(IndexError::Io(error))
+                if path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(".deleted-"))
+                    && error.kind() == io::ErrorKind::PermissionDenied =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        };
     }
     match discard_matching_header(&path, matches) {
         Ok(matched) => Ok(matched),
@@ -809,10 +947,10 @@ pub(crate) fn prepare(
             "checkpoint requires little-endian Frozen ABI",
         ));
     }
-    let bytes = format::encode(&identity, nodes, folders, active, &sections)?;
+    let (bytes, digest) = format::encode(&identity, nodes, folders, active, sections)?;
     let record = TrustedCheckpoint {
         size: bytes.len() as u64,
-        digest: *blake3::hash(&bytes).as_bytes(),
+        digest,
         abi: platform_abi(),
     };
     Ok(PreparedCheckpoint {
@@ -981,7 +1119,22 @@ fn create_private_directory(path: &Path) -> io::Result<()> {
         use std::os::unix::fs::DirBuilderExt;
         builder.mode(0o700);
     }
-    builder.create(path)
+    builder.create(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        // If the leaf directory already existed with overly broad permissions
+        // (e.g. 0o755 from umask or parent setup) and is owned by us and not a
+        // symlink, tighten it to 0o700 instead of failing closed on startup.
+        let meta = fs::symlink_metadata(path)?;
+        if meta.is_dir()
+            && meta.uid() == rustix::process::geteuid().as_raw()
+            && meta.permissions().mode() & 0o077 != 0
+        {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    Ok(())
 }
 
 fn check_private_directory(path: &Path) -> Result<(), IndexError> {
@@ -991,13 +1144,13 @@ fn check_private_directory(path: &Path) -> Result<(), IndexError> {
     }
     #[cfg(windows)]
     {
+        // Only reject a reparse point on the private checkpoint directory itself
+        // (and its immediate runtime parent inside DataRoot), never host-level
+        // user-profile junctions/OneDrive ancestors outside DataRoot.
         use std::os::windows::fs::MetadataExt;
         const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-        for ancestor in path.ancestors().filter(|value| value.has_root()) {
-            if fs::symlink_metadata(ancestor)?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-            {
-                return Err(IndexError::Untrusted("checkpoint directory is aliased"));
-            }
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(IndexError::Untrusted("checkpoint directory is aliased"));
         }
     }
     #[cfg(unix)]
@@ -1008,9 +1161,11 @@ fn check_private_directory(path: &Path) -> Result<(), IndexError> {
                 "checkpoint directory has a different owner",
             ));
         }
-        if fs::canonicalize(path)? != path {
-            return Err(IndexError::Untrusted("checkpoint directory is aliased"));
-        }
+        // Do not compare `canonicalize(path) == path`, which rejects legitimate
+        // symlinked host ancestors like macOS `/var -> /private/var` or symlinked
+        // Linux data volumes. `symlink_metadata(path)` + `O_DIRECTORY|O_NOFOLLOW`
+        // + `openat` validate the private directory directly without breaking
+        // host volume paths.
         if metadata.permissions().mode() & 0o077 != 0 {
             return Err(IndexError::Untrusted("checkpoint directory is not private"));
         }
@@ -1089,10 +1244,13 @@ struct OpenFlight {
     ready: Condvar,
 }
 
+type AsyncOpenOutcome = Result<Arc<MappedFastIndex>, Arc<IndexError>>;
+
 struct MmapPoolInner {
     capacity: NonZeroUsize,
     maps: Mutex<VecDeque<Arc<MappedFastIndex>>>,
     opening: Mutex<HashMap<usize, Arc<OpenFlight>>>,
+    async_opening: Mutex<HashMap<usize, tokio::sync::watch::Receiver<Option<AsyncOpenOutcome>>>>,
     live: Arc<AtomicUsize>,
 }
 
@@ -1102,6 +1260,7 @@ impl MmapPool {
             capacity,
             maps: Mutex::new(VecDeque::new()),
             opening: Mutex::new(HashMap::new()),
+            async_opening: Mutex::new(HashMap::new()),
             live: Arc::new(AtomicUsize::new(0)),
         }))
     }
@@ -1145,6 +1304,86 @@ impl MmapPool {
         handle: &BaseIndexHandle,
     ) -> Option<Arc<MappedFastIndex>> {
         take_resident(&mut self.lock_maps(), handle)
+    }
+
+    pub(crate) async fn open_async(
+        &self,
+        handle: &BaseIndexHandle,
+    ) -> Result<Arc<MappedFastIndex>, IndexError> {
+        if let Some(resident) = self.try_get_resident(handle) {
+            return Ok(resident);
+        }
+        let key = Arc::as_ptr(&handle.0) as usize;
+        enum AsyncRole {
+            Leader(tokio::sync::watch::Sender<Option<AsyncOpenOutcome>>),
+            Follower(tokio::sync::watch::Receiver<Option<AsyncOpenOutcome>>),
+        }
+        let role = {
+            let mut inflight = self
+                .0
+                .async_opening
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(rx) = inflight.get(&key) {
+                AsyncRole::Follower(rx.clone())
+            } else {
+                let (tx, rx) = tokio::sync::watch::channel(None);
+                inflight.insert(key, rx);
+                AsyncRole::Leader(tx)
+            }
+        };
+        match role {
+            AsyncRole::Follower(mut rx) => {
+                loop {
+                    if let Some(outcome) = rx.borrow().clone() {
+                        return outcome.map_err(|err| clone_index_error(&err));
+                    }
+                    if rx.changed().await.is_err() {
+                        // Leader was cancelled/dropped; fall back to opening directly.
+                        let handle = handle.clone();
+                        let pool = self.clone();
+                        return tokio::task::spawn_blocking(move || pool.open(&handle))
+                            .await
+                            .map_err(|err| IndexError::Io(io::Error::other(err.to_string())))?;
+                    }
+                }
+            }
+            AsyncRole::Leader(tx) => {
+                struct AsyncFlightGuard {
+                    pool: Arc<MmapPoolInner>,
+                    key: usize,
+                }
+                impl Drop for AsyncFlightGuard {
+                    fn drop(&mut self) {
+                        self.pool
+                            .async_opening
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .remove(&self.key);
+                    }
+                }
+                let _guard = AsyncFlightGuard {
+                    pool: Arc::clone(&self.0),
+                    key,
+                };
+                let handle = handle.clone();
+                let pool = self.clone();
+                let result = tokio::task::spawn_blocking(move || pool.open(&handle))
+                    .await
+                    .map_err(|err| IndexError::Io(io::Error::other(err.to_string())))?;
+                match result {
+                    Ok(index) => {
+                        let _ = tx.send(Some(Ok(Arc::clone(&index))));
+                        Ok(index)
+                    }
+                    Err(err) => {
+                        let shared = Arc::new(err);
+                        let _ = tx.send(Some(Err(Arc::clone(&shared))));
+                        Err(clone_index_error(&shared))
+                    }
+                }
+            }
+        }
     }
 
     fn open(&self, handle: &BaseIndexHandle) -> Result<Arc<MappedFastIndex>, IndexError> {
@@ -1229,8 +1468,11 @@ impl MmapPool {
                 }
                 let mut evicted = None;
                 if handle.0.state.load(Ordering::Acquire) == LIVE {
+                    // Evict an older checkpoint ONLY within the same generation so
+                    // serving (gen G) and candidate (gen G+1) do not ping-pong during rotation.
                     if let Some(position) = maps.iter().position(|older| {
-                        older.identity().scope.space_id == index.identity().scope.space_id
+                        older.identity().generation == index.identity().generation
+                            && older.identity().scope.space_id == index.identity().scope.space_id
                     }) {
                         evicted = maps.remove(position);
                     } else if maps.len() == self.0.capacity.get() {
@@ -1250,6 +1492,14 @@ impl MmapPool {
             .maps
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+fn clone_index_error(error: &IndexError) -> IndexError {
+    match error {
+        IndexError::Io(io_err) => IndexError::Io(io::Error::new(io_err.kind(), io_err.to_string())),
+        IndexError::InvalidInput(msg) => IndexError::InvalidInput(msg),
+        IndexError::Untrusted(msg) => IndexError::Untrusted(msg),
     }
 }
 
@@ -1288,38 +1538,84 @@ impl MappedFastIndex {
             .path
             .parent()
             .ok_or(IndexError::Untrusted("missing checkpoint directory"))?;
-        check_private_directory(parent)?;
-        let witness = fs::symlink_metadata(&lease.path)?;
-        if !witness.is_file() || !witness.permissions().readonly() {
-            return Err(IndexError::Untrusted(
-                "checkpoint is not an immutable regular file",
-            ));
-        }
-        let file = open_readonly(&lease.path)?;
-        let meta = file.metadata()?;
-        if !meta.is_file()
-            || !meta.permissions().readonly()
-            || meta.len() != lease.record.size
-            || meta.len() < (format::HEADER_SIZE + format::DIGEST_SIZE) as u64
-        {
-            return Err(IndexError::Untrusted(
-                "checkpoint size or file type differs from registry",
-            ));
-        }
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            if (meta.dev(), meta.ino()) != (witness.dev(), witness.ino()) {
+        let file = {
+            use rustix::fs::{Mode, OFlags, open, openat};
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            let file_name = lease
+                .path
+                .file_name()
+                .ok_or(IndexError::Untrusted("missing checkpoint filename"))?;
+            let dir_fd = open(
+                parent,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(io::Error::from)?;
+            let dir_file = File::from(dir_fd);
+            let dir_meta = dir_file.metadata()?;
+            if !dir_meta.is_dir() {
+                return Err(IndexError::Untrusted("checkpoint directory is aliased"));
+            }
+            let euid = rustix::process::geteuid().as_raw();
+            if dir_meta.uid() != euid {
                 return Err(IndexError::Untrusted(
-                    "checkpoint file changed during opening",
+                    "checkpoint directory has a different owner",
                 ));
             }
-            if meta.uid() != rustix::process::geteuid().as_raw() {
+            if dir_meta.permissions().mode() & 0o077 != 0 {
+                return Err(IndexError::Untrusted("checkpoint directory is not private"));
+            }
+            let fd = openat(
+                &dir_file,
+                file_name,
+                OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                Mode::empty(),
+            )
+            .map_err(io::Error::from)?;
+            let file = File::from(fd);
+            let meta = file.metadata()?;
+            if !meta.is_file()
+                || !meta.permissions().readonly()
+                || meta.len() != lease.record.size
+                || meta.len() < (format::HEADER_SIZE + format::DIGEST_SIZE) as u64
+            {
+                return Err(IndexError::Untrusted(
+                    "checkpoint size or file type differs from registry",
+                ));
+            }
+            if meta.uid() != euid {
                 return Err(IndexError::Untrusted(
                     "checkpoint file has a different owner",
                 ));
             }
-        }
+            if meta.nlink() > 1 {
+                return Err(IndexError::Untrusted("checkpoint file has multiple links"));
+            }
+            file
+        };
+        #[cfg(not(unix))]
+        let file = {
+            check_private_directory(parent)?;
+            let witness = fs::symlink_metadata(&lease.path)?;
+            if !witness.is_file() || !witness.permissions().readonly() {
+                return Err(IndexError::Untrusted(
+                    "checkpoint is not an immutable regular file",
+                ));
+            }
+            let file = open_readonly(&lease.path)?;
+            let meta = file.metadata()?;
+            if !meta.is_file()
+                || !meta.permissions().readonly()
+                || meta.len() != lease.record.size
+                || meta.len() < (format::HEADER_SIZE + format::DIGEST_SIZE) as u64
+            {
+                return Err(IndexError::Untrusted(
+                    "checkpoint size or file type differs from registry",
+                ));
+            }
+            file
+        };
         let map = raw::map_immutable(&file)?;
         let directory = format::decode(
             &map,
@@ -1400,9 +1696,11 @@ impl MappedFastIndex {
     }
 
     pub fn lookup(&self, id: &NoteId) -> Option<u32> {
-        self.id_lookup(SectionKind::NoteLookup, id.as_str(), |slot| {
-            self.note_id_str(slot)
-        })
+        self.lookup_str(id.as_str())
+    }
+
+    pub fn lookup_str(&self, id: &str) -> Option<u32> {
+        self.id_lookup(SectionKind::NoteLookup, id, |slot| self.note_id_str(slot))
     }
 
     pub fn dense_folder_id(&self, id: &FolderId) -> Option<u32> {
@@ -1453,16 +1751,7 @@ impl MappedFastIndex {
     }
 
     pub fn note_header(&self, index: u32) -> Option<NoteSortHeader> {
-        NoteSortHeader::decode(self.note_header_bytes(index)?, || {
-            let records = self
-                .section(SectionKind::TimestampRemainder)
-                .as_chunks::<8>()
-                .0;
-            let at = records
-                .binary_search_by_key(&index, |row| u32_at(row, 0).expect("fixed row"))
-                .ok()?;
-            u16_at(&records[at], 4)
-        })
+        NoteSortHeader::decode(self.note_header_bytes(index)?)
     }
 
     fn catalog(&self, bsi: bool) -> format::Catalog<'_> {
@@ -1552,4 +1841,5 @@ impl MappedFastIndex {
 }
 
 #[cfg(test)]
+#[forbid(unsafe_code)]
 mod tests;

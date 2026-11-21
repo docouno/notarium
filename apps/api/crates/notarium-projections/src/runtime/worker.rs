@@ -134,10 +134,16 @@ fn refresh_workers(
         let previous = generation.detach_slot(id);
         cancellation.cancel();
         if let Some(slot) = previous {
-            if let Some(cut) = slot.cut.load_full()
-                && let Err(error) = cut.base.invalidate(&engine.pool)
-            {
-                tracing::warn!(error = %error, "projection checkpoint invalidation deferred");
+            if let Some(cut) = slot.cut.load_full() {
+                // Close admissions and evict synchronously, then offload
+                // filesystem unlink/fsync off the supervisor loop.
+                cut.base.begin_invalidate(&engine.pool);
+                let base = cut.base.clone();
+                tokio::task::spawn_blocking(move || {
+                    if let Err(error) = base.finish_invalidate() {
+                        tracing::warn!(error = %error, "projection checkpoint invalidation deferred");
+                    }
+                });
             }
             slot.replace(None);
         }
@@ -326,13 +332,18 @@ async fn run_feed(
         engine.generation.load().store.generation() == generation.store.generation()
             && !slot.lookup_bound.load(Ordering::Acquire)
     };
-    let force_seed = matches!(
-        *pending_delivery,
+    let required_through = match *pending_delivery {
         Some(PendingDelivery::AfterRecovery { through, .. })
-            if stored.as_ref().is_none_or(|row| row.scope != *scope || row.projected_seq < through)
-    );
+            if stored
+                .as_ref()
+                .is_none_or(|row| row.scope != *scope || row.projected_seq < through) =>
+        {
+            Some(through)
+        }
+        _ => None,
+    };
     let usable = slot.cut.load_full().filter(|cut| {
-        !force_seed
+        required_through.is_none()
             && cut.cut.scope == *scope
             && !cut.base.repair_pending()
             && stored.as_ref().is_some_and(|row| {
@@ -365,11 +376,15 @@ async fn run_feed(
                 _ = stop.cancelled() => return Ok(()),
                 lease = seed_slots.acquire() => lease.map_err(|_| not_ready())?,
             };
-            let cut = if force_seed {
-                apply::seed(engine, &generation.store, scope, slot, None, stop).await?
-            } else {
-                apply::recover(engine, &generation.store, scope, slot, stop).await?
-            };
+            let cut = apply::recover_through(
+                engine,
+                &generation.store,
+                scope,
+                slot,
+                required_through,
+                stop,
+            )
+            .await?;
             drop(lease);
             if stop.is_cancelled() {
                 return Ok(());
@@ -422,7 +437,7 @@ async fn run_feed(
                 }
                 match pending {
                     PendingDelivery::Command(range) => {
-                        engine.emit_command_refresh(scope, range, cut.cut.generation, true);
+                        engine.emit_command_refresh(scope, range, cut.cut.generation, true, true);
                     }
                     PendingDelivery::AfterRecovery {
                         through,
@@ -443,8 +458,25 @@ async fn run_feed(
         tokio::select! {
             biased;
             _ = stop.cancelled() => {
-                if !cut.delta.is_empty() && check_writer(engine, scope).is_ok() {
-                    let _ = apply::checkpoint(engine, &cut, false, &Cancellation::default()).await;
+                // Skip shutdown checkpoint flush for retired/candidate generations
+                // or detached slots; bound active-generation flush concurrency and time.
+                if !cut.delta.is_empty()
+                    && !slot.is_detached()
+                    && generation.store.generation() == engine.generation.load().store.generation()
+                    && check_writer(engine, scope).is_ok()
+                {
+                    let flush_cancel = Cancellation::default();
+                    let flush = async {
+                        if let Ok(_lease) = seed_slots.acquire().await {
+                            let _ = apply::checkpoint(engine, &cut, false, &flush_cancel).await;
+                        }
+                    };
+                    if tokio::time::timeout(Duration::from_secs(10), flush)
+                        .await
+                        .is_err()
+                    {
+                        flush_cancel.cancel();
+                    }
                 }
                 return Ok(());
             }
@@ -515,12 +547,17 @@ async fn run_feed(
                 | Some(ChangeNotice::SeedRequired { cutoff: ceiling }) => {
                     check_writer(engine, scope)?;
                     let through = ceiling.after;
+                    let prev_delta = Arc::clone(&cut.delta);
                     match consume(engine, generation, slot, &mut cut, &mut feed, ceiling, stop).await {
                         Ok(outcome) => {
                             *last_cut_seq = Some(cut.cut.projected_seq);
                             *made_progress = true;
                             graph_schedule.advance(outcome, Instant::now());
-                            last_change = (!cut.delta.is_empty()).then(Instant::now);
+                            if cut.delta.is_empty() {
+                                last_change = None;
+                            } else if !Arc::ptr_eq(&cut.delta, &prev_delta) {
+                                last_change = Some(Instant::now());
+                            }
                             if cut.delta.should_checkpoint(std::time::Instant::now()) {
                                 cut = apply::checkpoint(engine, &cut, false, stop).await?;
                                 last_change = None;
@@ -818,7 +855,7 @@ async fn consume(
                     let unrestricted = applied.boards.fanout() || command.overflow;
                     let mut proof_incomplete = false;
                     if !applied.boards.is_empty() {
-                        let assembly = engine.board_events(cut, &applied.boards).await;
+                        let assembly = engine.board_notices(cut, &applied.boards).await;
                         for board in assembly.notices {
                             engine.emit_board(board);
                         }
@@ -830,6 +867,7 @@ async fn consume(
                             command.range,
                             cut.cut.generation,
                             unrestricted,
+                            applied.has_chat,
                         );
                     }
                 }

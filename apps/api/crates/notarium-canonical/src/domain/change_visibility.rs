@@ -7,29 +7,15 @@ use crate::{
     sql_exec::BackendConn,
 };
 use notarium_core::{
-    DomainError, DomainResult,
+    DomainError,
     auth::EngineAuthContext,
     classes::DocClass,
     error::{PortError, ValidationReason},
-    ids::{JobId, NoteId, PrincipalId, RevisionId, SpaceSeq},
-    ports::{
-        Change, ChangeKind, ChatThreadKind, ContentJobKind, EntityId, MaintenanceContext,
-        SpaceContext,
-    },
+    ids::{JobId, NoteId, RevisionId, SpaceSeq},
+    ports::{Change, ChangeKind, ContentJobKind, EntityId, MaintenanceContext, SpaceContext},
     receipt::{AwaitReason, MutationEffect},
 };
 use std::{collections::HashMap, sync::Arc};
-
-pub(crate) fn authorize_thread_owner(
-    auth: &EngineAuthContext,
-    kind: ChatThreadKind,
-    owner: &PrincipalId,
-) -> DomainResult<()> {
-    if kind == ChatThreadKind::Personal && owner != auth.principal() {
-        return Err(DomainError::ResourceNotFound);
-    }
-    Ok(())
-}
 
 pub(crate) struct ChangeVisibility<'a> {
     space: &'a SpaceRecord,
@@ -249,19 +235,28 @@ impl<'a> ChangeVisibility<'a> {
                     let RevisionMetadataPayload::Thread(meta) = old.metadata.payload else {
                         return Err(DomainError::validation(ValidationReason::InvalidState).into());
                     };
-                    // Kind and owner are immutable for this thread identity.
-                    authorize_thread_owner(self.auth, meta.kind, &meta.owner_id)?;
+                    // Check both live and historical visibility without mutating branch
+                    // taint until both pass, enforcing Personal ownership and ChatAudience.
                     let (project, tainted) =
                         super::lookup_thread_visibility_tx(tx, &space.id, id.as_str())
                             .await?
                             .ok_or(DomainError::ResourceNotFound)?;
-                    self.auth
-                        .authorize_chat_read(space, project.as_ref(), tainted)?;
-                    self.auth.authorize_chat_read(
+                    self.auth.can_view_chat_thread(
                         space,
+                        meta.kind,
+                        &meta.owner_id,
+                        project.as_ref(),
+                        tainted,
+                    )?;
+                    self.auth.can_view_chat_thread(
+                        space,
+                        meta.kind,
+                        &meta.owner_id,
                         meta.project_folder_id.as_ref(),
                         meta.tainted,
                     )?;
+                    self.auth
+                        .mark_chat_read_taint(space, tainted || meta.tainted);
                 }
                 EntityId::Job(id) => {
                     self.authorize_job(tx, id).await?;

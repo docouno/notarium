@@ -12,7 +12,7 @@ use notarium_core::{
     ids::{ContentDigest, ProjectionGeneration},
 };
 use serde::{Deserialize, Serialize};
-use sqlx::{PgConnection, PgPool};
+use sqlx::{Connection as _, PgConnection, PgPool};
 
 use super::{
     internal, invalid_row,
@@ -98,6 +98,7 @@ impl GenerationControl {
                 .await
                 .map_err(|_| internal("projection_coordinator_lock"))?;
         if !acquired {
+            let _ = session.close().await;
             return Err(super::not_ready());
         }
         Ok(Self(Arc::new(ControlBackend::Postgres(PostgresControl {
@@ -116,7 +117,8 @@ impl GenerationControl {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                let _ = fs::set_permissions(&directory, fs::Permissions::from_mode(0o700));
+                fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+                    .map_err(|_| internal("projection_control_permissions"))?;
             }
             Ok::<_, PortError>(())
         })
@@ -134,16 +136,55 @@ impl GenerationControl {
         let cleanup_identity = database
             .write(false, |mut tx| {
                 Box::pin(async move {
-                    tx.batch(
-                        "SELECT pg_advisory_xact_lock(hashtextextended(current_schema(), 272014));
-                         CREATE TABLE IF NOT EXISTS projection_generation_control (
-                             row_id BIGINT PRIMARY KEY CHECK (row_id = 1),
-                             descriptor BYTEA NOT NULL
-                         );
-                         ALTER TABLE projection_generation_control ADD COLUMN IF NOT EXISTS
-                             cleanup_identity UUID NOT NULL DEFAULT gen_random_uuid();",
-                    )
-                    .await?;
+                    let has_column = !tx
+                        .select(
+                            "SELECT CAST(1 AS BIGINT) FROM pg_catalog.pg_attribute a
+                             JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
+                             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                             WHERE n.nspname = current_schema()
+                               AND c.relname = 'projection_generation_control'
+                               AND a.attname = 'cleanup_identity'
+                               AND NOT a.attisdropped",
+                            Vec::new(),
+                            &[Kind::Integer],
+                        )
+                        .await?
+                        .is_empty();
+                    if !has_column {
+                        tx.batch(
+                            "SELECT pg_advisory_xact_lock(hashtextextended(current_schema(), 272014));
+                             CREATE TABLE IF NOT EXISTS projection_generation_control (
+                                 row_id BIGINT PRIMARY KEY CHECK (row_id = 1),
+                                 descriptor BYTEA NOT NULL,
+                                 cleanup_identity UUID NOT NULL DEFAULT gen_random_uuid()
+                             );",
+                        )
+                        .await?;
+                        let still_missing = tx
+                            .select(
+                                "SELECT CAST(1 AS BIGINT) FROM pg_catalog.pg_attribute a
+                                 JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
+                                 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                                 WHERE n.nspname = current_schema()
+                                   AND c.relname = 'projection_generation_control'
+                                   AND a.attname = 'cleanup_identity'
+                                   AND NOT a.attisdropped",
+                                Vec::new(),
+                                &[Kind::Integer],
+                            )
+                            .await?
+                            .is_empty();
+                        if still_missing {
+                            tx.batch(
+                                "ALTER TABLE projection_generation_control ADD COLUMN IF NOT EXISTS
+                                     cleanup_identity UUID NOT NULL DEFAULT gen_random_uuid();",
+                            )
+                            .await?;
+                        }
+                    }
+                    if let Some(identity) = try_read_cleanup_identity(&mut tx).await? {
+                        return Ok(identity);
+                    }
                     tx.execute(
                         "INSERT INTO projection_generation_control (row_id, descriptor) VALUES (1, ?)
                          ON CONFLICT (row_id) DO NOTHING",
@@ -265,7 +306,7 @@ impl GenerationControl {
         let path = path.clone();
         tokio::task::spawn_blocking(move || {
             let _lock = lock_local(&path)?;
-            let state = read_local(&path)?;
+            let state = read_local_unlocked(&path)?;
             let durable = sync_descriptor_directory(&path).is_ok();
             Ok(LocalRotationWitness {
                 active: state.active,
@@ -365,7 +406,7 @@ impl GenerationControl {
                 let path = path.clone();
                 tokio::task::spawn_blocking(move || {
                     let _lock = lock_local(&path)?;
-                    let mut state = read_local(&path)?;
+                    let mut state = read_local_unlocked(&path)?;
                     if !operation(&mut state) {
                         return Ok(false);
                     }
@@ -462,6 +503,16 @@ fn validate_state(state: DescriptorState) -> Result<DescriptorState, PortError> 
 }
 
 fn read_local(path: &Path) -> Result<DescriptorState, PortError> {
+    #[cfg(windows)]
+    let _shared = if path.parent().is_some_and(Path::is_dir) {
+        Some(lock_local_shared(path)?)
+    } else {
+        None
+    };
+    read_local_unlocked(path)
+}
+
+fn read_local_unlocked(path: &Path) -> Result<DescriptorState, PortError> {
     let file = match open_local_readonly(path) {
         Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -477,6 +528,21 @@ fn read_local(path: &Path) -> Result<DescriptorState, PortError> {
         return Err(invalid_row());
     }
     validate_state(serde_json::from_slice(&bytes).map_err(|_| invalid_row())?)
+}
+
+#[cfg(windows)]
+fn lock_local_shared(path: &Path) -> Result<File, PortError> {
+    let lock_path = path.with_extension("lock");
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|_| internal("projection_control_lock_open"))?;
+    file.lock_shared()
+        .map_err(|_| internal("projection_control_lock"))?;
+    Ok(file)
 }
 
 fn open_local_readonly(path: &Path) -> std::io::Result<File> {
@@ -598,12 +664,26 @@ fn sync_descriptor_directory(path: &Path) -> Result<(), PortError> {
     Ok(())
 }
 
+async fn try_read_cleanup_identity(
+    tx: &mut SqlTransaction<'_>,
+) -> Result<Option<String>, PortError> {
+    let Some(identity) = tx
+        .select(
+            "SELECT replace(cleanup_identity::text, '-', '') FROM projection_generation_control WHERE row_id=1",
+            Vec::new(),
+            &[Kind::Text],
+        )
+        .await?
+        .pop()
+        .and_then(|mut row| row.pop())
+    else {
+        return Ok(None);
+    };
+    Ok(Some(String::read(identity)?))
+}
+
 async fn read_cleanup_identity(tx: &mut SqlTransaction<'_>) -> Result<String, PortError> {
-    let identity = tx.select(
-        "SELECT replace(cleanup_identity::text, '-', '') FROM projection_generation_control WHERE row_id=1",
-        Vec::new(), &[Kind::Text],
-    ).await?.pop().and_then(|mut row| row.pop()).ok_or_else(invalid_row)?;
-    String::read(identity)
+    try_read_cleanup_identity(tx).await?.ok_or_else(invalid_row)
 }
 
 async fn read_postgres(

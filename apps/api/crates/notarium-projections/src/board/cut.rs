@@ -161,14 +161,22 @@ impl BoardCut {
                 Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
                     if diagnostic.reason == ValidationReason::CursorStale =>
                 {
-                    // Derived advanced ahead of this cut while loading; fall back
-                    // to canonical reads at the exact requested cutoff.
+                    if requested.is_none() {
+                        return Err(stale());
+                    }
+                    // Explicit historical cutoffs may fall back to canonical
+                    // reads at the requested sequence.
                     cut.folders.clear();
                     cut.notes.clear();
                     cut.ranks.clear();
                 }
                 Err(error) => return Err(error),
             }
+        } else if requested.is_none() {
+            if published.cut.projected_seq > cut.cutoff {
+                return Err(stale());
+            }
+            return Err(DomainError::validation(ValidationReason::NotReady).into());
         }
         cut.load_from_canonical(engine, ctx, &views, &view_notes, deadline)
             .await?;
@@ -377,7 +385,7 @@ impl BoardCut {
         replayed: &ReplayedChanges,
         deadline: &PlannerDeadline,
     ) -> Result<(), PortError> {
-        let index = engine.open_index(published)?;
+        let index = deadline.wait(engine.open_index_async(published)).await?;
         let mut universe = index.posting(&PostingKey::Active).map_err(index_error)?;
         // Folder mutations can change membership for rows whose individual
         // note revisions did not change. Their current ancestry is checked
@@ -410,7 +418,7 @@ impl BoardCut {
                 let matches = index
                     .filter_candidates(&plan.descriptor.filter.predicate, &source)
                     .map_err(index_error)?;
-                candidates.or_inplace(&matches.possible);
+                candidates.or_inplace(&matches.into_possible());
             }
         }
         // These are semantic candidates, including rows outside the caller's
@@ -834,7 +842,7 @@ impl BoardCut {
         let check_folder = |folder: &FolderId| -> Result<(), PortError> {
             deadline.check()?;
             let facts = permit
-                .folder_facts(folder)
+                .active_folder_facts(folder, true)
                 .ok_or(DomainError::ResourceNotFound)?;
             Ok(ctx
                 .auth()

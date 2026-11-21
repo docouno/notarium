@@ -19,9 +19,9 @@ use notarium_core::{
 
 use crate::{
     derived::{
-        DerivedMutation, DerivedStore, ProjectedChatRef, ProjectedChatThread, ProjectedFolderAlias,
-        ProjectedNoteAlias, ProjectionWatermark, SpaceApply, StageBuffer, StageKey,
-        TrustedCheckpoint,
+        DerivedMutation, DerivedStore, LinkPosition, ProjectedChatRef, ProjectedChatThread,
+        ProjectedFolderAlias, ProjectedNoteAlias, ProjectionWatermark, SpaceApply, StageBuffer,
+        StageKey, TrustedCheckpoint,
     },
     index::{FastIndexBuilder, IndexView, L0Delta, PostingKey},
     mmap::{
@@ -35,7 +35,8 @@ use super::{
     checkpoint_error, folder_move, graph_settle, link_apply,
     records::{
         FolderCatalog, NoteProjection, allocate_dense, decode, descriptors, index_note,
-        persisted_schema, project_note, rank_row, reevaluate,
+        index_note_with_parts, index_projected_note, persisted_schema, project_note, rank_row,
+        reevaluate,
     },
     replay,
     worker::page_limit,
@@ -46,8 +47,10 @@ pub(super) struct Applied {
     pub(super) graph_changes: u32,
     pub(super) events: Vec<SpaceEventKind>,
     pub(super) boards: AffectedBoards,
+    pub(super) has_chat: bool,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub(super) async fn recover(
     engine: &ProjectionEngine,
     store: &DerivedStore,
@@ -55,7 +58,18 @@ pub(super) async fn recover(
     slot: &Arc<SpaceSlot>,
     stop: &Cancellation,
 ) -> Result<Arc<PublishedCut>, PortError> {
-    let current = recover_cut(engine, store, scope, slot, stop).await?;
+    recover_through(engine, store, scope, slot, None, stop).await
+}
+
+pub(super) async fn recover_through(
+    engine: &ProjectionEngine,
+    store: &DerivedStore,
+    scope: &HistoryScope,
+    slot: &Arc<SpaceSlot>,
+    min_through: Option<SpaceSeq>,
+    stop: &Cancellation,
+) -> Result<Arc<PublishedCut>, PortError> {
+    let current = recover_cut(engine, store, scope, slot, min_through, stop).await?;
     engine.reclaim_superseded_checkpoints(&current).await?;
     Ok(current)
 }
@@ -65,6 +79,7 @@ async fn recover_cut(
     store: &DerivedStore,
     scope: &HistoryScope,
     slot: &Arc<SpaceSlot>,
+    min_through: Option<SpaceSeq>,
     stop: &Cancellation,
 ) -> Result<Arc<PublishedCut>, PortError> {
     slot.check_attached()?;
@@ -82,11 +97,6 @@ async fn recover_cut(
         store.discard_staging(scope).await?;
         let previous = slot.cut.load_full().filter(|cut| &cut.cut.scope == scope);
         let purge_floor = hydrate_visibility(engine, store, scope, None, stop).await?;
-        if purge_floor > watermark.projected_seq {
-            // The old projection predates erased data and its checkpoint
-            // cannot be recovered. Seed from the current canonical history.
-            return seed(engine, store, scope, slot, None, stop).await;
-        }
         let mut watermark = if purge_floor == SpaceSeq::ZERO {
             watermark
         } else {
@@ -100,6 +110,28 @@ async fn recover_cut(
                 })
                 .ok_or_else(visibility_cursor_stale)?
         };
+        if purge_floor > watermark.projected_seq {
+            if let Some(cut) = try_incremental_purge_recovery(
+                engine,
+                store,
+                scope,
+                slot,
+                watermark,
+                purge_floor,
+                previous.as_ref(),
+                stop,
+            )
+            .await?
+            {
+                return Ok(cut);
+            }
+            // The old projection predates erased data with non-purge changes or
+            // trimmed history. Seed from the current canonical history.
+            return seed(engine, store, scope, slot, None, stop).await;
+        }
+        if min_through.is_some_and(|through| watermark.projected_seq < through) {
+            return seed(engine, store, scope, slot, None, stop).await;
+        }
         let reopened = open_checkpoint(
             engine,
             store,
@@ -114,14 +146,9 @@ async fn recover_cut(
             return publish_cut(engine, store, slot, watermark, base, delta).await;
         }
 
-        let desired = engine.cache_root.space_fast_index(
-            store.generation(),
-            &scope.space_id,
-            watermark.projected_seq,
-        );
         if previous
             .as_ref()
-            .is_none_or(|cut| cut.base.path() != desired)
+            .is_none_or(|cut| cut.base.identity().seq != watermark.projected_seq)
         {
             // A crash can leave trust metadata for a file whose new snapshot
             // watermark was never installed. A rebuild publishes a fresh file.
@@ -151,6 +178,157 @@ async fn recover_cut(
         return Ok(cut);
     }
     seed(engine, store, scope, slot, None, stop).await
+}
+
+/// Advances a live projection across pure-purge commands without re-reading
+/// canonical note carriers: `hydrate_visibility` has already removed purged
+/// rows and decremented folder counts in `DerivedStore`, so we only verify
+/// that `(after_seq, purge_floor]` contains solely `Purge` deltas (and no chat
+/// changes), re-resolve unresolved/alias links against `DerivedStore`, and
+/// rebuild the `.mmap` checkpoint directly from derived tables.
+#[allow(clippy::too_many_arguments)]
+async fn try_incremental_purge_recovery(
+    engine: &ProjectionEngine,
+    store: &DerivedStore,
+    scope: &HistoryScope,
+    slot: &Arc<SpaceSlot>,
+    mut watermark: ProjectionWatermark,
+    purge_floor: SpaceSeq,
+    previous: Option<&Arc<PublishedCut>>,
+    stop: &Cancellation,
+) -> Result<Option<Arc<PublishedCut>>, PortError> {
+    let after_seq = watermark.projected_seq;
+    let Some(expected_count) = purge_floor.get().checked_sub(after_seq.get()) else {
+        return Ok(None);
+    };
+    if expected_count == 0 {
+        return Ok(None);
+    }
+    let ctx = engine.projection_context();
+    let mut next = None;
+    let mut purged_count: u64 = 0;
+    loop {
+        check_stop(stop)?;
+        let page = match engine
+            .canonical
+            .read_projection_delta_batch(&ctx, scope, after_seq, purge_floor, next, page_limit())
+            .await
+        {
+            Ok(page) => page,
+            Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
+                if matches!(
+                    diagnostic.reason,
+                    ValidationReason::CursorStale
+                        | ValidationReason::InvalidCutoff
+                        | ValidationReason::PurgeResync
+                ) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        for item in page.rows {
+            match item {
+                ProjectionDelta::Purge(_) => {
+                    purged_count = purged_count.saturating_add(1);
+                }
+                _ => return Ok(None),
+            }
+        }
+        next = page.next;
+        if next.is_none() {
+            break;
+        }
+    }
+    if purged_count != expected_count {
+        return Ok(None);
+    }
+    let chat_probe = match engine
+        .canonical
+        .read_projection_chat_changes_page(
+            &ctx,
+            scope,
+            after_seq,
+            purge_floor,
+            None,
+            notarium_core::ports::PageLimit::new(1)?,
+        )
+        .await
+    {
+        Ok(page) => page,
+        Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
+            if matches!(
+                diagnostic.reason,
+                ValidationReason::CursorStale
+                    | ValidationReason::InvalidCutoff
+                    | ValidationReason::PurgeResync
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    if !chat_probe.changes.is_empty() {
+        return Ok(None);
+    }
+
+    let folders = load_folders(store, scope, after_seq).await?;
+    let aliases = load_folder_aliases(store, scope, after_seq).await?;
+    let topology = link_apply::build_topology(&watermark.root_folder_id, &folders, aliases)?;
+    let first_seq = after_seq.checked_next()?;
+    let mut sink = CommandSink::new(store, scope, first_seq, purge_floor);
+    let mut cursor: Option<LinkPosition> = None;
+    let mut source_active: BTreeMap<u32, bool> = BTreeMap::new();
+    loop {
+        check_stop(stop)?;
+        let rows = store
+            .unresolved_or_alias_links_page(&scope.space_id, cursor.as_ref(), page_limit())
+            .await?;
+        let Some(last) = rows.last() else {
+            break;
+        };
+        cursor = Some(LinkPosition::from(last));
+        let mut updates = Vec::new();
+        for row in rows {
+            let active = match source_active.get(&row.src_dense_id).copied() {
+                Some(active) => active,
+                None => {
+                    let active = store
+                        .is_link_source_active(&scope.space_id, row.src_dense_id)
+                        .await?;
+                    source_active.insert(row.src_dense_id, active);
+                    active
+                }
+            };
+            let mut next_row = row.clone();
+            next_row.resolved_dense_id = None;
+            next_row.resolved_tier = None;
+            if active && topology.is_active(&next_row.src_folder_id) {
+                crate::links::resolve_link(&mut next_row, &topology, store).await?;
+            }
+            if next_row != row {
+                updates.push(DerivedMutation::UpsertLink(next_row));
+            }
+        }
+        if !updates.is_empty() {
+            sink.push(updates).await?;
+        }
+    }
+
+    watermark.projected_seq = purge_floor;
+    watermark.snapshot_seq = SpaceSeq::ZERO;
+    watermark.graph_settled_seq = SpaceSeq::ZERO;
+    watermark.updated_at_ms = now_unix_ms()?;
+    sink.publish(&watermark, Some(after_seq), None).await?;
+    discard_checkpoint(engine, store, scope, slot, watermark.projected_seq).await?;
+    let base = write_checkpoint(engine, store, &mut watermark, None, true, stop).await?;
+    let cut = publish_cut(engine, store, slot, watermark, base, L0Delta::default()).await?;
+    if let Some(previous) = previous
+        && previous.base.path() != cut.base.path()
+    {
+        previous.base.retire(&engine.pool);
+    }
+    Ok(Some(cut))
 }
 
 pub(super) async fn seed(
@@ -227,14 +405,18 @@ async fn seed_once(
         let page = canonical
             .read_projection_folders_page(&ctx, scope, header.cutoff, after, page_limit())
             .await?;
+        let known_folders = if same_history.is_some() {
+            let ids: Vec<FolderId> = page
+                .rows
+                .iter()
+                .map(|folder| folder.metadata.folder_id.clone())
+                .collect();
+            store.folder_dense_ids_for_seed(scope, &ids).await?
+        } else {
+            BTreeMap::new()
+        };
         for folder in page.rows {
-            let known = if same_history.is_some() {
-                store
-                    .folder_dense_for_seed(scope, &folder.metadata.folder_id)
-                    .await?
-            } else {
-                None
-            };
+            let known = known_folders.get(&folder.metadata.folder_id).copied();
             folders.put(scope, folder, &mut watermark.next_dense_folder_id, known)?;
         }
         after = page.next;
@@ -245,7 +427,8 @@ async fn seed_once(
     folders.refresh_paths()?;
 
     let mut aliases = Vec::new();
-    let mut links = link_apply::ColdLinks::default();
+    let mut links =
+        link_apply::ColdLinks::new(engine.cache_root.projection_scratch_dir(), stop.clone());
     let mut after = None;
     loop {
         check_stop(stop)?;
@@ -259,7 +442,7 @@ async fn seed_once(
                 aliases.push(row.clone());
             }
             if let DerivedMutation::UpsertNoteAlias(row) = &mutation {
-                links.add_note_alias(row)?;
+                links.add_note_alias(row).await?;
             }
             mutations.push(mutation);
         }
@@ -270,7 +453,11 @@ async fn seed_once(
         }
     }
 
-    let topology = link_apply::build_topology(&watermark.root_folder_id, &folders, aliases)?;
+    let topology = Arc::new(link_apply::build_topology(
+        &watermark.root_folder_id,
+        &folders,
+        aliases,
+    )?);
     let fields = header
         .schema
         .map(|schema| schema.fields)
@@ -281,14 +468,19 @@ async fn seed_once(
         let page = canonical
             .read_projection_notes_page(&ctx, scope, header.cutoff, after, page_limit())
             .await?;
+        let known_notes = if same_history.is_some() {
+            let ids: Vec<NoteId> = page
+                .rows
+                .iter()
+                .map(|note| note.metadata.note_id.clone())
+                .collect();
+            store.note_dense_ids_for_seed(scope, &ids).await?
+        } else {
+            BTreeMap::new()
+        };
+        let mut prepared_page = Vec::with_capacity(page.rows.len());
         for note in page.rows {
-            let known = if same_history.is_some() {
-                store
-                    .note_dense_for_seed(scope, &note.metadata.note_id)
-                    .await?
-            } else {
-                None
-            };
+            let known = known_notes.get(&note.metadata.note_id).copied();
             let dense = match known {
                 Some(dense) => dense,
                 None => allocate_dense(&mut watermark.next_dense_id)?,
@@ -296,7 +488,12 @@ async fn seed_once(
             let outcome =
                 prepare_note(engine, scope, header.cutoff, note, dense, &folders, &fields).await?;
             count_note(&mut folders, &outcome.row, true)?;
-            stage.push(links.add(&outcome, &topology)?).await?;
+            prepared_page.push(outcome);
+        }
+        stage
+            .push(links.add_batch(&prepared_page, &topology).await?)
+            .await?;
+        for outcome in prepared_page {
             stage
                 .push(note_mutations(outcome, watermark.schema.as_ref())?)
                 .await?;
@@ -602,16 +799,19 @@ pub(super) async fn command_with_folders(
         || !folder_aliases.is_empty()
         || schema_change.is_some();
 
-    let (fields, mut delta, mut replay, bulk_folder_move, links) =
+    let (fields, shared_delta, mut delta, mut replay, bulk_folder_move, links, previous_index) =
         if !structural_change {
             // Pure chat / board-rank commands leave folders, notes, links and L0
-            // postings unchanged; skip topology loading and mmap opening.
+            // postings unchanged; reuse the existing Arc<L0Delta> without cloning
+            // and skip topology loading and mmap opening.
             (
                 Arc::clone(&current.fields),
-                Some((*current.delta).clone()),
+                Some(Arc::clone(&current.delta)),
+                None,
                 replay::ChangedSlots::default(),
                 false,
                 link_apply::LinkApply::default(),
+                None,
             )
         } else {
             let changed_folders = folder_updates.keys().cloned().collect::<Vec<_>>();
@@ -672,8 +872,14 @@ pub(super) async fn command_with_folders(
             let mut delta = Some((*current.delta).clone());
             let mut replay = replay::ChangedSlots::default();
             let index = engine.open_index_async(current).await?;
-            let mut link_stage =
-                link_apply::LinkStage::new(store, scope.clone(), &old_topology, topology);
+            let mut link_stage = link_apply::LinkStage::new(
+                store,
+                scope.clone(),
+                &old_topology,
+                topology,
+                engine.cache_root.projection_scratch_dir(),
+                stop.clone(),
+            );
             let mut pending = croaring::Bitmap::new();
             for note_id in &purged {
                 let old = store.note_by_id(scope, after_seq, note_id).await?;
@@ -711,7 +917,7 @@ pub(super) async fn command_with_folders(
             if has_notes || has_note_aliases {
                 if !notes_spilled {
                     for alias in &buffered_note_aliases {
-                        link_stage.record_alias(alias)?;
+                        link_stage.record_alias(alias).await?;
                     }
                     for note in buffered_notes {
                         check_stop(stop)?;
@@ -762,7 +968,7 @@ pub(super) async fn command_with_folders(
                                     if let DerivedMutation::UpsertNoteAlias(row) =
                                         alias_mutation(scope, alias)
                                     {
-                                        link_stage.record_alias(&row)?;
+                                        link_stage.record_alias(&row).await?;
                                     }
                                     continue;
                                 }
@@ -881,25 +1087,33 @@ pub(super) async fn command_with_folders(
                                 .record_change(Some(&row), Some(&row), None)
                                 .await?;
                         }
-                        let views = schema_change
+                        let reevaluated = schema_change
                             .is_some()
                             .then(|| reevaluate(&mut row, &fields))
                             .transpose()?;
                         if let Some(active) = &mut delta
-                            && (views.is_some()
+                            && (reevaluated.is_some()
                                 || old.dense != current.dense
                                 || old.trashed != current.trashed)
                         {
-                            index_note(&row, &current, |note| active.replace_note(note))?;
+                            if let Some((_, evaluated, tags)) = &reevaluated {
+                                index_note_with_parts(&row, &current, evaluated, tags, |note| {
+                                    active.replace_note(note)
+                                })?;
+                            } else {
+                                index_note(&row, &current, |note| active.replace_note(note))?;
+                            }
                             replay.note(row.dense_id);
                         }
                         enforce_l0_budget(&mut delta);
-                        if let Some(views) = views {
+                        if let Some((views, evaluated, tags)) = reevaluated {
                             sink.push(note_mutations(
                                 NoteProjection {
                                     row,
                                     views,
                                     links: Vec::new(),
+                                    evaluated,
+                                    tags,
                                 },
                                 watermark.schema.as_ref(),
                             )?)
@@ -941,17 +1155,27 @@ pub(super) async fn command_with_folders(
                 rows: folders,
                 topology: new_topology.unwrap_or(old_topology),
             });
-            (fields, delta, replay, bulk_folder_move, links)
+            (
+                fields,
+                None,
+                delta,
+                replay,
+                bulk_folder_move,
+                links,
+                Some(index),
+            )
         };
-    delta_chats(engine, scope, after_seq, cutoff, &mut sink, stop).await?;
+    let chat_changes = delta_chats(engine, scope, after_seq, cutoff, &mut sink, stop).await?;
+    let has_chat = thread_changed || chat_changes;
     check_stop(stop)?;
     // Large bitmap-wide moves and erasures rebuild from current derived rows.
-    let slots = if delta.is_some() && purged.is_empty() && !bulk_folder_move {
-        replay.edges(&links.outgoing, &links.incoming);
-        replay.encode()
-    } else {
-        None
-    };
+    let slots =
+        if (shared_delta.is_some() || delta.is_some()) && purged.is_empty() && !bulk_folder_move {
+            replay.edges(&links.outgoing, &links.incoming);
+            replay.encode()
+        } else {
+            None
+        };
     sink.publish(&watermark, Some(after_seq), slots).await?;
     #[cfg(any(test, feature = "test-support"))]
     {
@@ -966,15 +1190,31 @@ pub(super) async fn command_with_folders(
         }
     }
 
-    if let Some(active) = &mut delta {
-        if link_apply::reload_adjacency(store, scope, cutoff, active, &links).await? {
-            active.record_events(u32::try_from(cutoff.get() - after_seq.get()).unwrap_or(u32::MAX));
-        } else {
-            delta = None;
+    let (next_delta, force_checkpoint) = if let Some(shared) = shared_delta {
+        (shared, false)
+    } else {
+        if let Some(active) = &mut delta {
+            if link_apply::reload_adjacency(
+                store,
+                scope,
+                cutoff,
+                active,
+                &links,
+                previous_index.as_ref(),
+            )
+            .await?
+            {
+                active.record_events(
+                    u32::try_from(cutoff.get() - after_seq.get()).unwrap_or(u32::MAX),
+                );
+            } else {
+                delta = None;
+            }
         }
-    }
-    enforce_l0_budget(&mut delta);
-    let force_checkpoint = delta.is_none();
+        enforce_l0_budget(&mut delta);
+        let force_checkpoint = delta.is_none();
+        (Arc::new(delta.unwrap_or_default()), force_checkpoint)
+    };
     let mut cut = Arc::new(PublishedCut {
         handoff_graph_source: Weak::new(),
         slot: current.slot.clone(),
@@ -989,7 +1229,7 @@ pub(super) async fn command_with_folders(
         fields,
         live: current.live.clone(),
         base: current.base.clone(),
-        delta: Arc::new(delta.unwrap_or_default()),
+        delta: next_delta,
         watermark,
     });
     if !purged.is_empty()
@@ -1012,6 +1252,7 @@ pub(super) async fn command_with_folders(
         graph_changes: links.graph_changes,
         events,
         boards,
+        has_chat,
     })
 }
 
@@ -1036,7 +1277,7 @@ async fn apply_command_note(
     sink: &mut CommandSink<'_>,
 ) -> Result<(), PortError> {
     let id = &note.metadata.note_id;
-    if purged.contains(id) || !link_stage.first_note(id)? {
+    if purged.contains(id) || !link_stage.first_note(id).await? {
         return Ok(());
     }
     let old = store.note_by_id(scope, after_seq, id).await?;
@@ -1056,7 +1297,7 @@ async fn apply_command_note(
     remember_counts(folders, &location, previous_counts);
     count_note_with_location(folders, &outcome.row, &location, true)?;
     if let Some(active) = delta {
-        index_note(&outcome.row, &location, |note| active.replace_note(note))?;
+        index_projected_note(&outcome, &location, |note| active.replace_note(note))?;
         replay.note(dense);
     }
     enforce_l0_budget(delta);
@@ -1327,9 +1568,10 @@ async fn delta_chats(
     cutoff: SpaceSeq,
     sink: &mut CommandSink<'_>,
     stop: &Cancellation,
-) -> Result<(), PortError> {
+) -> Result<bool, PortError> {
     let ctx = engine.projection_context();
     let mut position = None;
+    let mut changed = false;
     loop {
         check_stop(stop)?;
         let page = engine
@@ -1344,6 +1586,7 @@ async fn delta_chats(
             )
             .await?;
         for change in page.changes {
+            changed = true;
             if change.removed {
                 sink.push(vec![DerivedMutation::RedactChatEntry(
                     change.entry.thread,
@@ -1379,7 +1622,7 @@ async fn delta_chats(
             break;
         }
     }
-    Ok(())
+    Ok(changed)
 }
 
 fn thread_mutation(head: ProjectionChatHead, cutoff: SpaceSeq) -> DerivedMutation {
@@ -1633,15 +1876,15 @@ async fn reclaim_unpublished_head(
         .await?;
     let seq = watermark.projected_seq;
     let space = watermark.scope.space_id.clone();
-    let path = engine
+    let dir = engine
         .cache_root
-        .space_fast_index(store.generation(), &space, seq);
+        .space_fast_index_dir(store.generation(), &space);
     let canonical = engine.canonical.clone();
     let ctx = engine.projection_context();
     tokio::task::spawn_blocking(move || {
         let _maintenance = maintenance;
         canonical.check_projection_writer_candidate(&ctx, &space)?;
-        BaseIndexHandle::discard_unpublished_name(&path, seq).map_err(checkpoint_error)
+        BaseIndexHandle::discard_unpublished_seq(&dir, seq).map_err(checkpoint_error)
     })
     .await
     .map_err(checkpoint_error)?
@@ -1657,6 +1900,9 @@ async fn write_checkpoint(
 ) -> Result<BaseIndexHandle, PortError> {
     let scope = &watermark.scope;
     let cutoff = watermark.projected_seq;
+    if watermark.snapshot_seq == SpaceSeq::ZERO {
+        store.analyze_postgres().await;
+    }
     let folders = load_folders(store, scope, cutoff).await?;
     let identity = IndexIdentity {
         generation: store.generation(),
@@ -1713,7 +1959,7 @@ async fn write_checkpoint(
         .await
         .map_err(checkpoint_error)?
         .map_err(checkpoint_error)?;
-    let (base, trusted) = publish_checkpoint_file(engine, store, prepared).await?;
+    let (base, trusted, file_nonce) = publish_checkpoint_file(engine, store, prepared).await?;
     store
         .register_checkpoint(&TrustedCheckpoint {
             space_id: scope.space_id.clone(),
@@ -1722,6 +1968,7 @@ async fn write_checkpoint(
             format_version: u32::from(crate::mmap::FORMAT_VERSION),
             platform_abi: trusted.abi,
             publication_id: engine.cache_identity.clone(),
+            file_nonce,
             size_bytes: trusted.size,
             digest: ContentDigest::from_bytes(trusted.digest),
             graph_seq: if settle {
@@ -1750,7 +1997,7 @@ pub(super) async fn publish_checkpoint_file(
     engine: &ProjectionEngine,
     store: &DerivedStore,
     prepared: PreparedCheckpoint,
-) -> Result<(BaseIndexHandle, MmapTrust), PortError> {
+) -> Result<(BaseIndexHandle, MmapTrust, String), PortError> {
     let IndexIdentity {
         generation,
         scope,
@@ -1769,22 +2016,24 @@ pub(super) async fn publish_checkpoint_file(
     engine
         .canonical
         .check_projection_writer_candidate(&engine.projection_context(), &scope.space_id)?;
-    let path = engine
-        .cache_root
-        .space_fast_index(*generation, &scope.space_id, *seq);
+    let mut nonce_bytes = [0u8; 16];
+    getrandom::fill(&mut nonce_bytes).map_err(checkpoint_error)?;
+    let file_nonce = hex::encode(nonce_bytes);
+    let path = engine.checkpoint_path(*generation, &scope.space_id, *seq, &file_nonce);
     let pool = engine.pool.clone();
     let cache_lease = store.cache_lease()?;
     let cache_owner = engine.postgres_cache_owner.clone();
     // The blocking operation retains the maintenance permit and cache
     // ownership even if cancelled. The published lease retains ownership too.
-    tokio::task::spawn_blocking(move || {
+    let (base, trust) = tokio::task::spawn_blocking(move || {
         let _maintenance = maintenance;
         let _cache_lease = cache_lease;
         mmap::publish(prepared, &path, Some(&pool), cache_owner)
     })
     .await
     .map_err(checkpoint_error)?
-    .map_err(checkpoint_error)
+    .map_err(checkpoint_error)?;
+    Ok((base, trust, file_nonce))
 }
 
 async fn open_checkpoint(
@@ -1807,9 +2056,7 @@ async fn open_checkpoint(
     let Some(record) = record else {
         return Ok(None);
     };
-    let path = engine
-        .cache_root
-        .space_fast_index(store.generation(), &scope.space_id, seq);
+    let path = engine.checkpoint_path(store.generation(), &scope.space_id, seq, &record.file_nonce);
     let identity = IndexIdentity {
         generation: store.generation(),
         scope: scope.clone(),
@@ -1855,7 +2102,10 @@ async fn publish_cut(
     slot.check_attached()?;
     let scope = &watermark.scope;
     base.register_for_erasure(&engine.pool);
-    let active = store.generation() == engine.generation.load().store.generation();
+    let active = store.generation() == engine.generation.load().store.generation()
+        && !engine.stopped.is_cancelled()
+        && (!engine.publication_closed.load(Ordering::Acquire)
+            || engine.startup_recovery.load(Ordering::Acquire));
     let live = if active {
         bind_lookup(engine, store, scope, &base, slot).await?
     } else {
@@ -1898,10 +2148,17 @@ async fn bind_lookup(
     base: &BaseIndexHandle,
     slot: &Arc<SpaceSlot>,
 ) -> Result<LiveSpaceHandle, PortError> {
+    if engine.stopped.is_cancelled()
+        || (engine.publication_closed.load(Ordering::Acquire)
+            && !engine.startup_recovery.load(Ordering::Acquire))
+    {
+        return Err(DomainError::validation(ValidationReason::NotReady).into());
+    }
     let lookup = Arc::new(DenseLookup {
         base: base.clone(),
         pool: engine.pool.clone(),
         slot: Arc::downgrade(slot),
+        cached: std::sync::Mutex::new(Weak::new()),
         _cache_lease: store.cache_lease()?,
     });
     engine
@@ -1958,16 +2215,16 @@ async fn discard_checkpoint(
     slot: &SpaceSlot,
     seq: SpaceSeq,
 ) -> Result<(), PortError> {
-    // A restored history can reuse the same pathname. Serialize the check
+    // A restored history can reuse the same sequence. Serialize the check
     // and unlink against publication by the replacement worker.
     let maintenance = Arc::clone(&engine.generation_cleanup).lock_owned().await;
     slot.check_attached()?;
-    let path = engine
+    let dir = engine
         .cache_root
-        .space_fast_index(store.generation(), &scope.space_id, seq);
+        .space_fast_index_dir(store.generation(), &scope.space_id);
     tokio::task::spawn_blocking(move || {
         let _maintenance = maintenance;
-        BaseIndexHandle::discard_unleased(&path).map_err(checkpoint_error)
+        BaseIndexHandle::discard_unleased_seq(&dir, seq).map_err(checkpoint_error)
     })
     .await
     .map_err(checkpoint_error)?
@@ -1977,6 +2234,9 @@ struct DenseLookup {
     base: BaseIndexHandle,
     pool: crate::mmap::MmapPool,
     slot: Weak<SpaceSlot>,
+    // Weak cache avoids repeated pool mutex locks on hot canonical lookups while
+    // never pinning an evicted mapping when `pool.evict` runs.
+    cached: std::sync::Mutex<Weak<crate::mmap::MappedFastIndex>>,
     // Canonical authorization can outlive its projector's serving generation.
     // Pin local files only, allowing the old PostgreSQL schema to be reclaimed.
     _cache_lease: Arc<std::fs::File>,
@@ -1984,9 +2244,28 @@ struct DenseLookup {
 
 impl DenseLookup {
     fn open(&self) -> Option<Arc<crate::mmap::MappedFastIndex>> {
+        if self.base.is_usable()
+            && let Some(map) = self
+                .cached
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .upgrade()
+        {
+            return Some(map);
+        }
         match self.base.open(&self.pool) {
-            Ok(map) => Some(map),
+            Ok(map) => {
+                *self
+                    .cached
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::downgrade(&map);
+                Some(map)
+            }
             Err(_) => {
+                *self
+                    .cached
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Weak::new();
                 if let Some(slot) = self.slot.upgrade() {
                     slot.request_repair(&self.base);
                 }

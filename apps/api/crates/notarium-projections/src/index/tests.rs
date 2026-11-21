@@ -397,7 +397,7 @@ fn overlay_and_folded_checkpoint_match_typed_state_and_exact_boundaries() {
         for view in [&over, &materialized] {
             let result = view.filter_candidates(&predicate, &universal).unwrap();
             assert_eq!(result.definite, flags(&expected), "{predicate:?}");
-            assert_eq!(result.possible, result.definite);
+            assert!(result.uncertain.is_empty());
         }
     }
 }
@@ -631,9 +631,9 @@ fn large_subtree_delta_keeps_membership_compressed() {
     delta.set_subtree_membership(1, &members, false);
     delta.set_subtree_membership(2, &members, true);
     assert!(delta.approx_bytes() < 1_024);
-    assert_eq!(delta.subtree_overrides[&1].removed, members);
-    assert_eq!(delta.subtree_overrides[&2].added, members);
-    assert!(delta.notes.is_empty());
+    assert_eq!(delta.tip.subtree_overrides[&1].removed, members);
+    assert_eq!(delta.tip.subtree_overrides[&2].added, members);
+    assert!(delta.tip.notes.is_empty());
 }
 
 proptest::proptest! {
@@ -734,7 +734,7 @@ proptest::proptest! {
             let expected: Bitmap = universal.iter().filter(|&dense| predicate.matches(&source[dense as usize])).collect();
             for view in [&delta_only, &with_delta, &checkpoint] {
                 let actual = view.filter_candidates(&predicate, &universal).unwrap();
-                proptest::prop_assert_eq!(&actual.possible, &expected, "{:?}", predicate);
+                proptest::prop_assert_eq!(&actual.possible(), &expected, "{:?}", predicate);
                 proptest::prop_assert_eq!(&actual.definite, &expected, "{:?}", predicate);
             }
         }

@@ -160,6 +160,7 @@ impl From<ViewBlock> for ViewInput {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub fn compile_views(
     blocks: &[ViewBlock],
     schema: &BTreeMap<String, FieldSchema>,
@@ -313,7 +314,7 @@ fn compile_ready(
             return Err(invalid_view());
         }
     }
-    let columns = if group_by.is_some() || kind == ViewKind::Board {
+    let columns = if kind == ViewKind::Board {
         parse_columns(
             fields.get("options"),
             group_by.as_deref().and_then(|key| schema.get(key)),
@@ -395,8 +396,18 @@ fn boolean(value: &YamlValue) -> DomainResult<bool> {
     }
 }
 
+const MAX_SOURCE_TAGS: usize = 256;
+
 fn parse_source(value: &YamlValue) -> DomainResult<ViewSource> {
     let fields = mapping(value)?;
+    if fields.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "scope" | "folder" | "recursive" | "classes" | "tags"
+        )
+    }) {
+        return Err(invalid_view());
+    }
     let folder = optional_string(fields, "folder")?
         .map(parse_source_folder)
         .transpose()?;
@@ -419,7 +430,11 @@ fn parse_source(value: &YamlValue) -> DomainResult<ViewSource> {
     let tags = fields
         .get("tags")
         .map(|tags| {
-            sequence(tags)?
+            let items = sequence(tags)?;
+            if items.len() > MAX_SOURCE_TAGS {
+                return Err(DomainError::validation(ValidationReason::InvalidLimit));
+            }
+            items
                 .iter()
                 .map(|tag| {
                     let tag = string(tag)?.trim_start_matches('#');
@@ -479,6 +494,12 @@ fn parse_sort(value: &YamlValue, schema: &BTreeMap<String, FieldSchema>) -> Doma
     let mut result = Vec::with_capacity(keys.len());
     for key in keys {
         let key = mapping(key)?;
+        if key
+            .keys()
+            .any(|k| !matches!(k.as_str(), "field" | "direction" | "type" | "nullable"))
+        {
+            return Err(invalid_view());
+        }
         let name = optional_string(key, "field")?.ok_or_else(invalid_view)?;
         if name.is_empty() || name == "__proto__" {
             return Err(invalid_view());
@@ -562,9 +583,9 @@ fn parse_columns(
         let group = match column {
             YamlValue::Mapping(fields) => {
                 let value = fields.get("value").ok_or_else(invalid_view)?;
-                GroupKey::Value(scalar(value, kind, true)?)
+                GroupKey::Value(scalar(value, kind, true).map_err(|_| invalid_view())?)
             }
-            value => GroupKey::Value(scalar(value, kind, true)?),
+            value => GroupKey::Value(scalar(value, kind, true).map_err(|_| invalid_view())?),
         };
         let group = match group {
             GroupKey::Value(ScalarValue::Number(number)) => {
@@ -666,11 +687,15 @@ fn parse_comparison(
         }),
         "date_range" => Ok(Predicate::DateRange {
             key,
-            range: parse_range(fields, |value| Date::parse(string(value)?))?,
+            range: parse_range(fields, |value| {
+                Date::parse(string(value).map_err(|_| invalid_query())?)
+            })?,
         }),
         "timestamp_range" => Ok(Predicate::TimestampRange {
             key,
-            range: parse_range(fields, |value| Timestamp::parse(string(value)?))?,
+            range: parse_range(fields, |value| {
+                Timestamp::parse(string(value).map_err(|_| invalid_query())?)
+            })?,
         }),
         _ => Err(invalid_query()),
     }
@@ -698,7 +723,7 @@ fn parse_range<T>(
             value: value(bound.get("value").ok_or_else(invalid_query)?)?,
             inclusive: bound
                 .get("inclusive")
-                .map(boolean)
+                .map(|raw| boolean(raw).map_err(|_| invalid_query()))
                 .transpose()?
                 .unwrap_or(true),
         })

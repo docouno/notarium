@@ -103,7 +103,6 @@ async fn exercise(store: &CanonicalStore, derived: DerivedStore, root: &DataRoot
     sync(store, &runtime, &scope).await;
     sync(store, &runtime, &other_scope).await;
     let engine = runtime.engine();
-    let path = root.space_fast_index(generation, &scope.space_id, seq);
     let source = store
         .read_projection_notes_page(
             &projection_context(),
@@ -120,6 +119,7 @@ async fn exercise(store: &CanonicalStore, derived: DerivedStore, root: &DataRoot
     fs::rename(&blob, &hidden).unwrap();
 
     for corrupt in [false, true] {
+        let path = find_checkpoint_file(root, generation, &scope.space_id, seq).unwrap();
         let mut stream = engine
             .event_bus()
             .subscribe(
@@ -261,12 +261,17 @@ async fn exercise(store: &CanonicalStore, derived: DerivedStore, root: &DataRoot
             seq
         );
 
+        let repaired_path = find_checkpoint_file(root, generation, &scope.space_id, seq).unwrap();
+        assert_ne!(
+            repaired_path, path,
+            "repaired checkpoint must publish under a fresh nonce filename"
+        );
         let mut original_bytes = Vec::new();
         original.read_to_end(&mut original_bytes).unwrap();
         assert_eq!(original_bytes, bytes);
         drop(retained);
         assert!(
-            path.is_file(),
+            repaired_path.is_file(),
             "retiring the old mapping cannot unlink its replacement"
         );
     }

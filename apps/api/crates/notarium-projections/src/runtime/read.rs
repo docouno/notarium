@@ -30,7 +30,7 @@ use notarium_core::{
 };
 
 use crate::{
-    derived::{ProjectedNote, ProjectedViewRank},
+    derived::{ListCardRow, ProjectedNote, ProjectedViewRank},
     index::{IndexView, PostingKey},
     nota::{NotaDescriptor, SourceFolder, ViewKind, ViewSource, compile_projected_views},
     query::{self, BoardRank, WindowInput},
@@ -56,23 +56,59 @@ impl RetainedReads {
     }
 
     fn insert(&self, state: Arc<ReadState>) {
+        const TOTAL_BYTE_BUDGET: usize = 64 * 1024 * 1024;
+        const PER_SPACE_BYTE_BUDGET: usize = 16 * 1024 * 1024;
+        let per_space_limit = (self.limit / 4).max(16).min(self.limit);
+        let inserted_id = state.read.id.clone();
+        let inserted_space = state.read.cut.scope.space_id.clone();
         let mut entries = self.by_id.lock().unwrap_or_else(|error| error.into_inner());
         entries.retain(|_, entry| entry.expires > Instant::now());
-        entries.insert(state.read.id.clone(), state);
+        entries.insert(inserted_id.clone(), state);
+        // Enforce a per-Space quota first so one hot tenant cannot evict all
+        // retained cursors belonging to other Spaces. Never evict the freshly
+        // inserted cursor itself.
+        loop {
+            let space_count = entries
+                .values()
+                .filter(|entry| entry.read.cut.scope.space_id == inserted_space)
+                .count();
+            let space_bytes = retained_bytes(
+                entries
+                    .values()
+                    .filter(|entry| entry.read.cut.scope.space_id == inserted_space)
+                    .map(|entry| (&entry.cut, entry.owned_bytes)),
+            );
+            if space_count <= per_space_limit && space_bytes <= PER_SPACE_BYTE_BUDGET {
+                break;
+            }
+            let Some(victim) = entries
+                .values()
+                .filter(|entry| {
+                    entry.read.cut.scope.space_id == inserted_space && entry.read.id != inserted_id
+                })
+                .min_by_key(|entry| entry.expires)
+                .map(|entry| entry.read.id.clone())
+            else {
+                break;
+            };
+            entries.remove(&victim);
+        }
         while entries.len() > self.limit
             || retained_bytes(
                 entries
                     .values()
                     .map(|entry| (&entry.cut, entry.owned_bytes)),
-            ) > 64 * 1024 * 1024
+            ) > TOTAL_BYTE_BUDGET
         {
-            let next = entries
+            let Some(victim) = entries
                 .values()
+                .filter(|entry| entry.read.id != inserted_id)
                 .min_by_key(|entry| entry.expires)
-                .map(|entry| entry.read.id.clone());
-            if let Some(id) = next {
-                entries.remove(&id);
-            }
+                .map(|entry| entry.read.id.clone())
+            else {
+                break;
+            };
+            entries.remove(&victim);
         }
         self.inserted.notify_one();
     }
@@ -194,6 +230,7 @@ struct PreparedView {
 
 pub(super) struct ExactRow {
     pub(super) note: ProjectedNote,
+    pub(super) location: records::FolderLocation,
     ranks: Vec<ProjectedViewRank>,
 }
 
@@ -203,6 +240,11 @@ fn authority_fingerprint(ctx: &SpaceContext) -> Result<ContentDigest, PortError>
         .spaces()
         .get(&ctx.scope().space_id)
         .ok_or(DomainError::ResourceNotFound)?;
+    let audience: u8 = match auth.chat_audience() {
+        None => 0,
+        Some(notarium_core::auth::ChatAudience::Personal) => 1,
+        Some(notarium_core::auth::ChatAudience::Shared) => 2,
+    };
     let payload = encode_msgpack(&(
         auth.principal(),
         auth.grant(),
@@ -210,9 +252,10 @@ fn authority_fingerprint(ctx: &SpaceContext) -> Result<ContentDigest, PortError>
         &grant.read_classes,
         &grant.project_root,
         auth.readonly_abilities(),
+        audience,
     ))?;
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"notarium-projection-read-authority-v1");
+    hasher.update(b"notarium-projection-read-authority-v2");
     hasher.update(&payload);
     Ok(ContentDigest::from_bytes(*hasher.finalize().as_bytes()))
 }
@@ -259,6 +302,24 @@ impl ProjectionEngine {
         query: Option<&RetainedQuery>,
     ) -> Result<ChosenRead, PortError> {
         let scope = ctx.scope();
+        // Fail closed on unauthorized callers before waiting on projector lag
+        // so `wait_for_cut` cannot act as a timing/existence oracle.
+        if !ctx.auth().spaces().contains_key(&scope.space_id) {
+            return Err(DomainError::ResourceNotFound.into());
+        }
+        if let Ok(live) = self.canonical.live_visibility_fence().space(scope)
+            && let Ok(permit) = live.try_read()
+        {
+            match query {
+                Some(RetainedQuery::Notes(notes)) => {
+                    authorize_notes(&permit, ctx, permit.root_folder_id(), notes)?;
+                }
+                Some(RetainedQuery::View(view)) => ensure_active(&permit, ctx, &view.view.note)?,
+                None => {
+                    authorize_query(&permit, ctx, permit.root_folder_id(), None, true)?;
+                }
+            }
+        }
         let mut apply_overlay = query.is_some();
         loop {
             let base = match self.published_cut(scope) {
@@ -435,6 +496,7 @@ impl ProjectionEngine {
                 dense,
                 ExactRow {
                     note: projected.row,
+                    location,
                     ranks,
                 },
             );
@@ -511,7 +573,13 @@ impl ProjectionEngine {
                     Some(PreparedView {
                         source: descriptor.source,
                         board: descriptor.kind == ViewKind::Board,
-                        columns: descriptor.columns,
+                        columns: if descriptor.kind == ViewKind::Board
+                            && plan.group_by == descriptor.group_by
+                        {
+                            descriptor.columns
+                        } else {
+                            Vec::new()
+                        },
                         plan,
                         folder,
                     }),
@@ -703,9 +771,7 @@ impl ProjectionEngine {
         };
         let mut exact = BTreeMap::new();
         for (id, row) in &state.overlay {
-            let Some(location) = self.try_location(cut, &row.note.parent_folder_id).await? else {
-                return Err(stale());
-            };
+            let location = &row.location;
             let inline = records::decode::<Vec<String>>(&row.note.tags_msgpack)?;
             let raw = records::note_raw_fields(&row.note)?;
             let tags = records::effective_tags(&inline, raw.as_ref())
@@ -729,7 +795,7 @@ impl ProjectionEngine {
                 && live
                 && row.note.lifecycle == Lifecycle::Active
                 && !location.trashed
-                && recorded_visible(&permit, ctx, &row.note, &location)
+                && recorded_visible(&permit, ctx, &row.note, location)
             {
                 candidates.add(*id);
             }
@@ -769,6 +835,7 @@ impl ProjectionEngine {
                 limit: request.limit,
             },
             (*board).then_some(&request.view),
+            index.tags_bucketed().then_some(&source.tags),
         )
         .await?;
         let ids = selection
@@ -776,7 +843,9 @@ impl ProjectionEngine {
             .iter()
             .map(|row| row.dense_id)
             .collect::<Vec<_>>();
-        let cards = self.hydrate_cards_at(ctx, cut, &ids, &exact, head).await?;
+        let cards = self
+            .hydrate_cards_at(ctx, cut, &ids, &exact, Some(head))
+            .await?;
         let next = next_cursor(state, selection.has_more, &selection.rows);
         let permit = cut.live.try_read()?;
         ensure_active_head(&permit, head)?;
@@ -816,7 +885,7 @@ impl ProjectionEngine {
             let entry = authorize_notes(&permit, ctx, &cut.root_folder_id, query)?;
             let universe =
                 query::note_universe(&index, permit.space(), ctx.auth(), query.lifecycle)?;
-            let candidates = query::note_source_candidates(&index, query, universe)?;
+            let candidates = query::note_source_candidates(&index, query, &entry, universe)?;
             let (candidates, permit) =
                 current_bitmap(&index, cut, ctx, permit, candidates, query.lifecycle, false)
                     .await?;
@@ -824,9 +893,7 @@ impl ProjectionEngine {
         };
         let mut exact = BTreeMap::new();
         for (id, row) in &state.overlay {
-            let Some(location) = self.try_location(cut, &row.note.parent_folder_id).await? else {
-                return Err(stale());
-            };
+            let location = &row.location;
             let permit = cut.live.try_read()?;
             let live =
                 current_facts(&permit, ctx, &row.note.note_id, query.lifecycle, false)?.is_some();
@@ -836,14 +903,18 @@ impl ProjectionEngine {
                 row.note.lifecycle
             };
             candidates.remove(*id);
-            if live
-                && recorded_visible(&permit, ctx, &row.note, &location)
-                && query.lifecycle.includes(effective)
-                && query.classes.contains(&row.note.doc_class)
-                && query.folder.as_ref().is_none_or(|folder| {
+            let folder_match = match &query.folder {
+                Some(folder) => {
                     folder == &row.note.parent_folder_id
                         || (query.recursive && location.ids.contains(folder))
-                })
+                }
+                None => query.recursive || entry == row.note.parent_folder_id,
+            };
+            if live
+                && recorded_visible(&permit, ctx, &row.note, location)
+                && query.lifecycle.includes(effective)
+                && query.classes.contains(&row.note.doc_class)
+                && folder_match
             {
                 candidates.add(*id);
             }
@@ -871,7 +942,7 @@ impl ProjectionEngine {
             .iter()
             .map(|row| row.dense_id)
             .collect::<Vec<_>>();
-        let planned = self.hydration_plan(ctx, cut, &ids, &exact).await?;
+        let planned = self.hydration_list_plan(ctx, cut, &ids, &exact).await?;
         let cover_note = cut
             .store
             .folder_by_id(ctx.scope(), cut.cut.projected_seq, &entry)
@@ -950,26 +1021,13 @@ impl ProjectionEngine {
         })
     }
 
-    async fn hydration_plan(
+    async fn load_folder_catalog(
         &self,
-        ctx: &SpaceContext,
+        scope: &HistoryScope,
         cut: &PublishedCut,
-        ids: &[u32],
-        overlay: &BTreeMap<u32, ProjectedNote>,
-    ) -> Result<Vec<Option<CardPlan>>, PortError> {
-        let scope = ctx.scope();
-        let mut rows = cut.store.hydrate(scope, cut.cut.projected_seq, ids).await?;
-        for (slot, dense) in rows.iter_mut().zip(ids) {
-            if let Some(row) = overlay.get(dense) {
-                *slot = Some(row.clone());
-            }
-        }
+        mut pending: BTreeSet<FolderId>,
+    ) -> Result<records::FolderCatalog, PortError> {
         let mut folders = records::FolderCatalog::default();
-        let mut pending = rows
-            .iter()
-            .flatten()
-            .map(|row| row.parent_folder_id.clone())
-            .collect::<BTreeSet<_>>();
         for _ in 0..=MAX_FOLDER_DEPTH {
             if pending.is_empty() {
                 break;
@@ -996,6 +1054,74 @@ impl ProjectionEngine {
             }
             pending.retain(|id| !folders.rows.contains_key(id));
         }
+        Ok(folders)
+    }
+
+    async fn hydration_list_plan(
+        &self,
+        ctx: &SpaceContext,
+        cut: &PublishedCut,
+        ids: &[u32],
+        overlay: &BTreeMap<u32, ProjectedNote>,
+    ) -> Result<Vec<Option<ListCardPlan>>, PortError> {
+        let scope = ctx.scope();
+        let mut rows = cut
+            .store
+            .hydrate_list_rows(scope, cut.cut.projected_seq, ids)
+            .await?;
+        for (slot, dense) in rows.iter_mut().zip(ids) {
+            if let Some(row) = overlay.get(dense) {
+                *slot = Some(ListCardRow {
+                    space_id: row.space_id.clone(),
+                    note_id: row.note_id.clone(),
+                    rev_id: row.rev_id.clone(),
+                    parent_folder_id: row.parent_folder_id.clone(),
+                    ability_id: row.ability_id.clone(),
+                    doc_class: row.doc_class,
+                    lifecycle: row.lifecycle,
+                    content_digest: row.content_digest,
+                    title: row.title.clone(),
+                    slug: row.slug.clone(),
+                });
+            }
+        }
+        let pending = rows
+            .iter()
+            .flatten()
+            .map(|row| row.parent_folder_id.clone())
+            .collect::<BTreeSet<_>>();
+        let folders = self.load_folder_catalog(scope, cut, pending).await?;
+        rows.into_iter()
+            .map(|row| {
+                row.map(|row| {
+                    let location = folders.location(&row.parent_folder_id)?;
+                    Ok(ListCardPlan { row, location })
+                })
+                .transpose()
+            })
+            .collect()
+    }
+
+    async fn hydration_plan(
+        &self,
+        ctx: &SpaceContext,
+        cut: &PublishedCut,
+        ids: &[u32],
+        overlay: &BTreeMap<u32, ProjectedNote>,
+    ) -> Result<Vec<Option<CardPlan>>, PortError> {
+        let scope = ctx.scope();
+        let mut rows = cut.store.hydrate(scope, cut.cut.projected_seq, ids).await?;
+        for (slot, dense) in rows.iter_mut().zip(ids) {
+            if let Some(row) = overlay.get(dense) {
+                *slot = Some(row.clone());
+            }
+        }
+        let pending = rows
+            .iter()
+            .flatten()
+            .map(|row| row.parent_folder_id.clone())
+            .collect::<BTreeSet<_>>();
+        let folders = self.load_folder_catalog(scope, cut, pending).await?;
         rows.into_iter()
             .map(|row| {
                 row.map(|row| {
@@ -1013,17 +1139,21 @@ impl ProjectionEngine {
         cut: &PublishedCut,
         ids: &[u32],
         overlay: &BTreeMap<u32, ProjectedNote>,
-        expected_head: SpaceSeq,
+        require_head: Option<SpaceSeq>,
     ) -> Result<Vec<Option<NoteCard>>, PortError> {
-        if expected_head == cut.cut.projected_seq
+        if require_head.is_none_or(|head| head == cut.cut.projected_seq)
             && overlay.is_empty()
             && let Some(cards) = cut
                 .store
-                .hydrate_current_cards(ctx.scope(), expected_head, ids)
+                .hydrate_current_cards(ctx.scope(), cut.cut.projected_seq, ids)
                 .await?
         {
             let permit = cut.live.try_read()?;
-            ensure_active_head(&permit, expected_head)?;
+            if let Some(expected_head) = require_head {
+                ensure_active_head(&permit, expected_head)?;
+            } else if permit.space().lifecycle != SpaceLifecycle::Active {
+                return Err(DomainError::ResourceNotFound.into());
+            }
             return cards
                 .into_iter()
                 .map(|card| {
@@ -1061,7 +1191,11 @@ impl ProjectionEngine {
         }
         let planned = self.hydration_plan(ctx, cut, ids, overlay).await?;
         let permit = cut.live.try_read()?;
-        ensure_active_head(&permit, expected_head)?;
+        if let Some(expected_head) = require_head {
+            ensure_active_head(&permit, expected_head)?;
+        } else if permit.space().lifecycle != SpaceLifecycle::Active {
+            return Err(DomainError::ResourceNotFound.into());
+        }
         planned
             .into_iter()
             .map(|plan| {
@@ -1083,6 +1217,64 @@ impl ProjectionEngine {
                     }))
             })
             .collect()
+    }
+}
+
+struct ListCardPlan {
+    row: ListCardRow,
+    location: records::FolderLocation,
+}
+
+impl ListCardPlan {
+    fn admit(
+        self,
+        permit: &LiveReadPermit,
+        ctx: &SpaceContext,
+        mask: LifecycleMask,
+        plain: bool,
+    ) -> Result<Option<(ClassifiedMetadata, String, ListCardRow)>, PortError> {
+        let Some((current, live_cycle)) =
+            current_facts(permit, ctx, &self.row.note_id, mask, plain)?
+        else {
+            return Ok(None);
+        };
+        let Some(digest) = self.row.content_digest else {
+            return Ok(None);
+        };
+        let recorded = ResourceFacts {
+            space: permit.space().clone(),
+            class: self.row.doc_class,
+            ancestor_folders: self.location.ids,
+            folder_write_locked: self.location.write_locked,
+            ability_package: self.row.ability_id.clone(),
+        };
+        let lifecycle = if self.location.trashed {
+            Lifecycle::Trashed
+        } else {
+            self.row.lifecycle
+        };
+        if !mask.includes(lifecycle) || (plain && recorded.class == DocClass::EncryptedNote) {
+            return Ok(None);
+        }
+        let mut metadata = ClassifiedMetadata::from_canonical(
+            NoteRef {
+                space_id: self.row.space_id.clone(),
+                note_id: self.row.note_id.clone(),
+            },
+            self.row.rev_id.clone(),
+            recorded,
+            lifecycle,
+            digest,
+        )?;
+        if metadata.bind_current(current, live_cycle).is_err() {
+            return Ok(None);
+        }
+        let path = if self.location.display_path.is_empty() {
+            format!("{}.md", self.row.slug)
+        } else {
+            format!("{}/{}.md", self.location.display_path, self.row.slug)
+        };
+        Ok(Some((metadata, path, self.row)))
     }
 }
 
@@ -1262,7 +1454,7 @@ fn ensure_active_head(permit: &LiveReadPermit, head: SpaceSeq) -> Result<(), Por
         return Err(DomainError::ResourceNotFound.into());
     }
     if permit.head() != head {
-        return Err(not_ready());
+        return Err(stale());
     }
     Ok(())
 }
@@ -1546,13 +1738,21 @@ impl Snapshot {
     }
 
     fn visible_under(&self, permit: &LiveReadPermit, id: u32) -> bool {
-        self.expires > Instant::now()
-            && self.visible.contains(id)
-            && self
-                .index
-                .note_id(self.index.dense(id))
-                .ok()
-                .is_some_and(|note| ensure_active(permit, &self.ctx, &note).is_ok())
+        if self.expires <= Instant::now()
+            || permit.space().lifecycle != SpaceLifecycle::Active
+            || !self.visible.contains(id)
+        {
+            return false;
+        }
+        // `self.visible` was verified against `self.cut.canonical_seq`; while
+        // the Space head has not moved, membership is already authoritative.
+        if permit.head() == self.cut.canonical_seq {
+            return true;
+        }
+        self.index
+            .note_id(self.index.dense(id))
+            .ok()
+            .is_some_and(|note| ensure_active(permit, &self.ctx, &note).is_ok())
     }
 
     fn live_edge(&self, focal: u32, adjacent: u32) -> bool {
@@ -1622,12 +1822,51 @@ impl StructuralSnapshot for Snapshot {
         rows.and_inplace(&self.visible);
         drop(permit);
         let folder = folder.clone();
-        let ids = bitmap_ids(rows).filter(move |id| {
-            self.live.try_read().is_ok_and(|permit| {
-                (permit.head() == initial_head
-                    || authorize_entry(&permit, &self.ctx, &folder).is_ok())
-                    && self.visible_under(&permit, *id)
-            })
+        // Re-verify once per 64-node batch under a single live permit instead
+        // of acquiring `RwLock::try_read()` on every node.
+        let mut next = Some(0u32);
+        let mut batch = Vec::with_capacity(64);
+        let mut offset = 0usize;
+        let ids = std::iter::from_fn(move || {
+            loop {
+                if offset < batch.len() {
+                    let id = batch[offset];
+                    offset += 1;
+                    return Some(id);
+                }
+                let start = next.take()?;
+                let mut raw = [0u32; 64];
+                let mut iter = rows.iter();
+                iter.reset_at_or_after(start);
+                let count = iter.next_many(&mut raw);
+                if count == 0 {
+                    return None;
+                }
+                next = raw[count - 1].checked_add(1);
+                let Ok(permit) = self.live.try_read() else {
+                    next = None;
+                    return None;
+                };
+                if self.expires <= Instant::now()
+                    || permit.space().lifecycle != SpaceLifecycle::Active
+                    || (permit.head() != initial_head
+                        && authorize_entry(&permit, &self.ctx, &folder).is_err())
+                {
+                    next = None;
+                    return None;
+                }
+                batch.clear();
+                offset = 0;
+                if permit.head() == self.cut.canonical_seq {
+                    batch.extend_from_slice(&raw[..count]);
+                } else {
+                    for &id in &raw[..count] {
+                        if self.visible_under(&permit, id) {
+                            batch.push(id);
+                        }
+                    }
+                }
+            }
         });
         Ok(DenseNodeIter::from_iter(self.cut.generation, ids))
     }
@@ -1733,6 +1972,40 @@ impl StructuralReadPort for ProjectionEngine {
         }
     }
 
+    fn filter_live_visible(&self, ctx: &SpaceContext, notes: &[NoteId]) -> DomainResult<Vec<bool>> {
+        let generation = self.generation.load().store.generation();
+        let _admission = self
+            .current_admission(generation)
+            .map_err(|_| DomainError::validation(ValidationReason::NotReady))?;
+        let permit = self
+            .live_handle(ctx.scope())
+            .and_then(|handle| handle.try_read())
+            .map_err(|error| match error {
+                PortError::Domain(error) => error,
+                _ => DomainError::ResourceNotFound,
+            })?;
+        authorize_query(&permit, ctx, permit.root_folder_id(), None, true).map_err(|error| {
+            match error {
+                PortError::Domain(error) => error,
+                _ => DomainError::ResourceNotFound,
+            }
+        })?;
+        let mut results = Vec::with_capacity(notes.len());
+        for note in notes {
+            match permit
+                .classify(ctx, note, true)
+                .map_err(|_| DomainError::ResourceNotFound)?
+            {
+                LiveNoteStatus::ActiveVisible(facts) => {
+                    ctx.auth().authorize_read(&facts)?;
+                    results.push(true);
+                }
+                _ => results.push(false),
+            }
+        }
+        Ok(results)
+    }
+
     fn hydrate(
         &self,
         ctx: SpaceContext,
@@ -1770,7 +2043,7 @@ impl StructuralReadPort for ProjectionEngine {
                                     &current,
                                     batch,
                                     &BTreeMap::new(),
-                                    head,
+                                    None,
                                 )
                                 .await?,
                             );
@@ -1780,13 +2053,23 @@ impl StructuralReadPort for ProjectionEngine {
                             }
                         }
                         let mut cards = cards.into_iter();
-                        let result: Vec<Option<NoteCard>> = slots
+                        let mut result: Vec<Option<NoteCard>> = slots
                             .into_iter()
                             .map(|slot| slot.and_then(|_| cards.next().flatten()))
                             .collect();
                         let _admission = self.current_admission(current.cut.generation)?;
                         let permit = live.try_read()?;
-                        ensure_active_head(&permit, head)?;
+                        if permit.space().lifecycle != SpaceLifecycle::Active {
+                            return Err(DomainError::ResourceNotFound.into());
+                        }
+                        if permit.head() != head {
+                            authorize_query(&permit, &ctx, permit.root_folder_id(), None, true)?;
+                            for (card, id) in result.iter_mut().zip(&notes) {
+                                if card.is_some() && ensure_active(&permit, &ctx, id).is_err() {
+                                    *card = None;
+                                }
+                            }
+                        }
                         Ok::<_, PortError>(result)
                     }
                     .await;
@@ -1811,7 +2094,12 @@ impl StructuralReadPort for ProjectionEngine {
                 }
                 let _admission = self.current_admission(self.active_generation())?;
                 let permit = live.try_read()?;
-                ensure_active_head(&permit, head)?;
+                if permit.space().lifecycle != SpaceLifecycle::Active {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+                if permit.head() != head {
+                    authorize_query(&permit, &ctx, permit.root_folder_id(), None, true)?;
+                }
                 for (card, id) in cards.iter_mut().zip(notes) {
                     if card.is_some() && ensure_active(&permit, &ctx, &id).is_err() {
                         *card = None;

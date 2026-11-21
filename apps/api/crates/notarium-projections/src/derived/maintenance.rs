@@ -2,7 +2,10 @@ use std::{
     collections::BTreeMap,
     fs::{self, File, TryLockError},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock, Weak},
+    sync::{
+        Arc, Mutex, OnceLock, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use notarium_core::{epoch::DataRoot, error::PortError, ids::ProjectionGeneration};
@@ -11,9 +14,7 @@ use sqlx::{AssertSqlSafe, PgPool};
 use super::{
     DerivedStore, internal, invalid_row, not_ready, parse_generation,
     schema::{MetadataState, generation_mismatch, metadata_state},
-    sql::{
-        Database, Kind, SqlColumn, SqlTransaction, sqlite_main_present, validate_identifier, value,
-    },
+    sql::{Kind, SqlColumn, SqlTransaction, sqlite_main_present, validate_identifier, value},
 };
 
 /// In-process pin preventing `reclaim_postgres_schema` from dropping a
@@ -56,8 +57,23 @@ pub(crate) struct GenerationFiles;
 #[derive(Debug)]
 pub(crate) struct PostgresCacheOwner {
     pub(crate) cache_identity: OnceLock<String>,
+    active_runtime: AtomicBool,
     root: DataRoot,
     _lease: File,
+}
+
+/// Exclusive in-process guard ensuring only one `ProjectionEngine` operates on a
+/// given `PostgresCacheOwner` root at a time while retained cleanup callbacks
+/// may still hold `Arc<PostgresCacheOwner>`.
+#[derive(Debug)]
+pub(crate) struct PostgresRuntimeGuard {
+    owner: Arc<PostgresCacheOwner>,
+}
+
+impl Drop for PostgresRuntimeGuard {
+    fn drop(&mut self) {
+        self.owner.active_runtime.store(false, Ordering::Release);
+    }
 }
 
 #[cfg(unix)]
@@ -101,6 +117,7 @@ impl PostgresCacheOwner {
                 .ok_or_else(not_ready)?;
             let owner = Arc::new(Self {
                 cache_identity: OnceLock::new(),
+                active_runtime: AtomicBool::new(false),
                 root: DataRoot::new(path),
                 _lease: lease,
             });
@@ -109,6 +126,15 @@ impl PostgresCacheOwner {
         })
         .await
         .map_err(|_| internal("projection_generation_worker"))?
+    }
+
+    pub(crate) fn claim_runtime(self: &Arc<Self>) -> Result<PostgresRuntimeGuard, PortError> {
+        self.active_runtime
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| not_ready())?;
+        Ok(PostgresRuntimeGuard {
+            owner: Arc::clone(self),
+        })
     }
 
     pub(crate) fn root(&self) -> &DataRoot {
@@ -159,15 +185,27 @@ impl GenerationFiles {
         generation: ProjectionGeneration,
         lease: File,
     ) -> Result<(), PortError> {
-        let database = Arc::new(Database::open_sqlite(root.derived(generation)).await?);
-        let status = database
-            .read(move |mut tx| {
-                Box::pin(
-                    async move { metadata_state(&mut tx, "derived_schema_meta", generation).await },
-                )
-            })
-            .await?;
-        drop(database);
+        let path = root.derived(generation);
+        let runtime = tokio::runtime::Handle::current();
+        let status = tokio::task::spawn_blocking(move || {
+            if !sqlite_main_present(&path)? {
+                return Err(generation_mismatch());
+            }
+            let mut conn = rusqlite::Connection::open_with_flags(
+                &path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            )
+            .map_err(|_| internal("projection_generation_file_witness"))?;
+            runtime.block_on(metadata_state(
+                &mut SqlTransaction::Sqlite(&mut conn),
+                "derived_schema_meta",
+                generation,
+            ))
+        })
+        .await
+        .map_err(|_| internal("projection_generation_worker"))??;
         match status {
             MetadataState::Obsolete => Self::remove(root, generation, false, lease).await,
             MetadataState::Current => Ok(()),
@@ -220,14 +258,20 @@ impl GenerationFiles {
                     .transpose()
                     .map_err(|_| error())?;
                 if first.is_some() {
-                    check_sqlite_witness(&path.join("derived.sqlite"), generation)?;
+                    let db_path = path.join("derived.sqlite");
+                    check_sqlite_witness(&db_path, generation)?;
                     #[cfg(windows)]
                     clear_readonly(&path).map_err(|_| error())?;
-                    // The database is the ownership witness. Leave it in
-                    // place until every other item has been removed.
+                    // Remove every non-SQLite artifact first while keeping the
+                    // witness database and its WAL/journal intact for crash retries.
                     for entry in fs::read_dir(&path).map_err(|_| error())? {
                         let entry = entry.map_err(|_| error())?;
-                        if entry.file_name() == "derived.sqlite" {
+                        let name = entry.file_name();
+                        if name == "derived.sqlite"
+                            || name == "derived.sqlite-wal"
+                            || name == "derived.sqlite-shm"
+                            || name == "derived.sqlite-journal"
+                        {
                             continue;
                         }
                         if entry.file_type().map_err(|_| error())?.is_dir() {
@@ -236,7 +280,33 @@ impl GenerationFiles {
                             fs::remove_file(entry.path()).map_err(|_| error())?;
                         }
                     }
-                    fs::remove_file(path.join("derived.sqlite")).map_err(|_| error())?;
+                    // Flush WAL frames into derived.sqlite before removing -wal so
+                    // derived_schema_meta remains durable in the main file if a
+                    // crash interrupts removal between unlinking -wal and derived.sqlite.
+                    let wal_path = path.join("derived.sqlite-wal");
+                    if fs::symlink_metadata(&wal_path).is_ok() {
+                        let conn = rusqlite::Connection::open_with_flags(
+                            &db_path,
+                            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+                                | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+                        )
+                        .map_err(|_| error())?;
+                        let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+                        drop(conn);
+                    }
+                    for sidecar in [
+                        "derived.sqlite-shm",
+                        "derived.sqlite-wal",
+                        "derived.sqlite-journal",
+                    ] {
+                        match fs::remove_file(path.join(sidecar)) {
+                            Ok(()) => {}
+                            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(_) => return Err(error()),
+                        }
+                    }
+                    fs::remove_file(&db_path).map_err(|_| error())?;
                 }
                 fs::remove_dir(&path).map_err(|_| error())?;
             }
@@ -400,9 +470,13 @@ fn check_sqlite_witness(path: &Path, generation: ProjectionGeneration) -> Result
     if !sqlite_main_present(path)? {
         return Err(invalid_row());
     }
-    let db =
-        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .map_err(error)?;
+    let db = rusqlite::Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(error)?;
     let mut query = db
         .prepare("SELECT generation FROM derived_schema_meta LIMIT 2")
         .map_err(error)?;
@@ -492,22 +566,42 @@ pub(super) async fn reclaim_postgres_schema(
     if !exists {
         return Ok(true);
     }
-    let witness = format!("SELECT generation FROM \"{schema}\".derived_schema_meta LIMIT 2");
-    let found: Vec<i64> = sqlx::query_scalar(AssertSqlSafe(witness.as_str()))
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(error)?;
-    if found.as_slice() != [generation.get() as i64] {
-        return Err(invalid_row());
-    }
-    sqlx::query("SET LOCAL lock_timeout = '225ms'")
-        .execute(&mut *tx)
-        .await
-        .map_err(error)?;
-    match drop_postgres_tables(&mut SqlTransaction::Postgres(&mut tx), schema).await {
-        Ok(()) => {}
-        Err(PortError::Unavailable(_)) => return Ok(false),
-        Err(err) => return Err(err),
+    let first_relation: Option<String> = sqlx::query_scalar(
+        "SELECT c.relname::TEXT FROM pg_catalog.pg_class c
+         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+         WHERE n.nspname = $1 AND c.relkind IN ('r', 'p', 'm', 'f')
+         ORDER BY (c.relname = 'derived_schema_meta') DESC LIMIT 1",
+    )
+    .bind(schema)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(error)?;
+    if let Some(first_relation) = first_relation {
+        if first_relation != "derived_schema_meta" {
+            return Err(invalid_row());
+        }
+        let witness = format!("SELECT generation FROM \"{schema}\".derived_schema_meta LIMIT 2");
+        let found: Vec<i64> = sqlx::query_scalar(AssertSqlSafe(witness.as_str()))
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(error)?;
+        if found.as_slice() != [generation.get() as i64] {
+            return Err(invalid_row());
+        }
+        sqlx::query("SET LOCAL lock_timeout = '225ms'")
+            .execute(&mut *tx)
+            .await
+            .map_err(error)?;
+        match drop_postgres_tables(&mut SqlTransaction::Postgres(&mut tx), schema).await {
+            Ok(()) => {}
+            Err(PortError::Unavailable(_)) => return Ok(false),
+            Err(err) => return Err(err),
+        }
+    } else {
+        sqlx::query("SET LOCAL lock_timeout = '225ms'")
+            .execute(&mut *tx)
+            .await
+            .map_err(error)?;
     }
     let drop_schema = format!("DROP SCHEMA \"{schema}\" RESTRICT");
     if let Err(err) = sqlx::query(AssertSqlSafe(drop_schema.as_str()))
@@ -574,6 +668,9 @@ async fn drop_postgres_tables(tx: &mut SqlTransaction<'_>, schema: &str) -> Resu
             &[Kind::Text],
         )
         .await?;
+    if relations.is_empty() {
+        return Ok(());
+    }
     // Delete all ordinary relations together to permit dependencies within
     // the generation. RESTRICT keeps any unexpected outside dependencies.
     let mut qualified = Vec::with_capacity(relations.len());

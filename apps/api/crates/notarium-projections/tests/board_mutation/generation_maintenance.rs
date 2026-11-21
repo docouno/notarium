@@ -605,16 +605,12 @@ async fn postgres_recovers_obsolete_format_and_resets_obsolete_candidate() {
     assert!(!victim_exists);
     assert!(!contains_abandoned().await);
     assert!(
-        cache
-            .root()
-            .space_fast_index(next, &scope_a.space_id, head_a)
-            .is_file()
+        find_checkpoint_file(&cache.root(), next, &scope_a.space_id, head_a)
+            .is_some_and(|path| path.is_file())
     );
     assert!(
-        cache
-            .root()
-            .space_fast_index(next, &scope_b.space_id, head_b)
-            .is_file()
+        find_checkpoint_file(&cache.root(), next, &scope_b.space_id, head_b)
+            .is_some_and(|path| path.is_file())
     );
     drop((snapshot_a, snapshot_b));
     tokio::time::timeout(Duration::from_secs(5), async {

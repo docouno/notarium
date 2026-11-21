@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use notarium_core::{
     error::PortError,
@@ -13,7 +13,7 @@ use crate::{
         MAX_MSGPACK_DECODE_BYTES, RankRevisionMetadata, RevisionMetadataEnvelope,
         RevisionMetadataPayload, decode_msgpack_bounded, i64_to_space_seq, internal_not_committed,
     },
-    runtime::{are_any_notes_purge_fenced_tx, pg_read_error},
+    runtime::{pg_read_error, purge_fenced_note_ids_tx},
     sql_exec::BackendConn,
 };
 
@@ -60,12 +60,7 @@ impl CanonicalStore {
                     rank_keys(tx, &scope, anchor, cutoff, after.as_ref(), None, limit).await?;
                 let more = truncate_page(&mut keys, limit);
                 let next = page_next(&keys, more, Clone::clone);
-                let mut rows = Vec::with_capacity(keys.len());
-                for key in keys {
-                    if let Some(row) = rank_at(tx, &scope, anchor, cutoff, key).await? {
-                        rows.push(row);
-                    }
-                }
+                let rows = ranks_at_batch(tx, &scope, anchor, cutoff, keys).await?;
                 Ok(ProjectionPage { rows, next })
             })
         })
@@ -108,12 +103,7 @@ pub(super) async fn target_ranks(
     if keys.len() > usize::from(limit.get()) {
         return Ok(None);
     }
-    let mut rows = Vec::with_capacity(keys.len());
-    for key in keys {
-        if let Some(rank) = rank_at(tx, scope, anchor, cutoff, key).await? {
-            rows.push(rank);
-        }
-    }
+    let rows = ranks_at_batch(tx, scope, anchor, cutoff, keys).await?;
     Ok(Some(rows))
 }
 
@@ -300,75 +290,197 @@ fn decode_rank_key(view: &str, key: &str, target: &str) -> Result<ProjectionRank
     ))
 }
 
-async fn rank_at(
+async fn ranks_at_batch(
     tx: &mut BackendConn<'_>,
     scope: &HistoryScope,
     anchor: SpaceSeq,
     cutoff: SpaceSeq,
-    key: ProjectionRankKey,
-) -> Result<Option<ProjectionRank>, PortError> {
-    if are_any_notes_purge_fenced_tx(tx, &scope.space_id, &[key.0.clone(), key.2.clone()]).await? {
-        return Ok(None);
+    keys: Vec<ProjectionRankKey>,
+) -> Result<Vec<ProjectionRank>, PortError> {
+    if keys.is_empty() {
+        return Ok(Vec::new());
     }
-    let entity = format!("{}:{}:{}", key.0, key.1, key.2);
-    const REVISIONS: &str = "SELECT rev_id, visibility_seq, metadata_msgpack FROM revisions
-        WHERE space_id = $1 AND history_incarnation = $2 AND entity_type = 'rank'
-          AND entity_key = $3 AND visibility_seq > $4 AND visibility_seq <= $5
-        ORDER BY visibility_seq DESC, space_seq DESC LIMIT 1";
-    let latest = read_rows!(
-        tx,
-        fetch_optional,
-        "projection_rank_at",
-        (String, i64, Vec<u8>),
-        REVISIONS,
-        scope.space_id.as_str(),
-        scope.incarnation.as_bytes().as_slice(),
-        entity.as_str(),
-        anchor.get() as i64,
-        cutoff.get() as i64,
-    )?;
-    if let Some((rev, visible, meta)) = latest {
-        let row = decode_rank(rev, visible, &meta)?;
-        if row.key() != key {
-            return Err(corrupt("rank revision identity does not match its key"));
-        }
-        return Ok((!row.metadata.removed).then_some(row));
+    // 1. Batch purge-fence check across every view and target note in one query.
+    let mut check_notes = BTreeSet::new();
+    for (view, _, target) in &keys {
+        check_notes.insert(view.clone());
+        check_notes.insert(target.clone());
+    }
+    let check_vec: Vec<NoteId> = check_notes.into_iter().collect();
+    let fenced = purge_fenced_note_ids_tx(tx, &scope.space_id, &check_vec).await?;
+    let live_keys: Vec<(ProjectionRankKey, String)> = keys
+        .into_iter()
+        .filter(|(view, _, target)| !fenced.contains(view) && !fenced.contains(target))
+        .map(|key| {
+            let entity = format!("{}:{}:{}", key.0, key.1, key.2);
+            (key, entity)
+        })
+        .collect();
+    if live_keys.is_empty() {
+        return Ok(Vec::new());
     }
 
-    const ANCHOR: &str = "SELECT a.rank_rev_id, a.group_key_msgpack, a.sort_rank_lexo,
-            a.placement_revision, a.placement_actor_id, a.placement_run_id, r.visibility_seq
-        FROM projection_rank_anchor_rows a
-        LEFT JOIN revisions r ON r.space_id = a.space_id AND r.rev_id = a.rank_rev_id
-        WHERE a.space_id = $1 AND a.view_note_id = $2 AND a.view_key = $3 AND a.target_note_id = $4";
-    type AnchorRow = (
-        String,
-        Vec<u8>,
-        String,
-        String,
-        String,
-        Option<String>,
-        Option<i64>,
-    );
-    let source = read_rows!(
-        tx,
-        fetch_optional,
-        "projection_rank_anchor_row",
-        AnchorRow,
-        ANCHOR,
-        scope.space_id.as_str(),
-        key.0.as_str(),
-        key.1.as_str(),
-        key.2.as_str(),
-    )?;
-    source
-        .map(|(rev, group, rank, placement, actor, run, visible)| {
-            Ok(ProjectionRank {
+    // 2. Batch latest post-anchor rank revision per entity_key.
+    let mut latest_revs: HashMap<String, ProjectionRank> = HashMap::new();
+    if cutoff > anchor {
+        let space = scope.space_id.as_str();
+        let incarnation = scope.incarnation.as_bytes().as_slice();
+        let start = anchor.get() as i64;
+        let end = cutoff.get() as i64;
+        let rev_rows: Vec<(String, String, i64, Vec<u8>)> = match tx {
+            BackendConn::Postgres(conn) => {
+                let entity_keys: Vec<&str> = live_keys.iter().map(|(_, e)| e.as_str()).collect();
+                sqlx::query_as(
+                    "SELECT DISTINCT ON (entity_key) entity_key, rev_id, visibility_seq, metadata_msgpack
+                     FROM revisions
+                     WHERE space_id = $1 AND history_incarnation = $2 AND entity_type = 'rank'
+                       AND entity_key = ANY($3) AND visibility_seq > $4 AND visibility_seq <= $5
+                     ORDER BY entity_key, visibility_seq DESC, space_seq DESC",
+                )
+                .bind(space)
+                .bind(incarnation)
+                .bind(&entity_keys)
+                .bind(start)
+                .bind(end)
+                .fetch_all(&mut **conn)
+                .await
+                .map_err(|err| pg_read_error("pg_projection_ranks_batch", err))?
+            }
+            BackendConn::Sqlite(conn) => {
+                let mut acc = Vec::new();
+                for chunk in live_keys.chunks(200) {
+                    let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+                        "SELECT entity_key, rev_id, visibility_seq, metadata_msgpack FROM (
+                            SELECT entity_key, rev_id, visibility_seq, metadata_msgpack,
+                                   ROW_NUMBER() OVER (PARTITION BY entity_key ORDER BY visibility_seq DESC, space_seq DESC) AS rn
+                            FROM revisions
+                            WHERE space_id = ",
+                    );
+                    qb.push_bind(space)
+                        .push(" AND history_incarnation = ")
+                        .push_bind(incarnation)
+                        .push(" AND entity_type = 'rank' AND entity_key IN (");
+                    let mut sep = qb.separated(", ");
+                    for (_, entity) in chunk {
+                        sep.push_bind(entity.as_str());
+                    }
+                    sep.push_unseparated(") AND visibility_seq > ");
+                    qb.push_bind(start)
+                        .push(" AND visibility_seq <= ")
+                        .push_bind(end)
+                        .push(") WHERE rn = 1");
+                    let part: Vec<(String, String, i64, Vec<u8>)> = qb
+                        .build_query_as()
+                        .fetch_all(&mut **conn)
+                        .await
+                        .map_err(|err| {
+                            internal_not_committed("sqlite_projection_ranks_batch", err.to_string())
+                        })?;
+                    acc.extend(part);
+                }
+                acc
+            }
+        };
+        for (entity_key, rev, visible, meta) in rev_rows {
+            let row = decode_rank(rev, visible, &meta)?;
+            latest_revs.insert(entity_key, row);
+        }
+    }
+
+    // 3. Batch anchor fallback only for keys missing a post-anchor revision.
+    let missing_keys: Vec<&ProjectionRankKey> = live_keys
+        .iter()
+        .filter(|(_, entity)| !latest_revs.contains_key(entity))
+        .map(|(key, _)| key)
+        .collect();
+    let mut anchor_rows_map: HashMap<ProjectionRankKey, ProjectionRank> = HashMap::new();
+    if anchor > SpaceSeq::ZERO && !missing_keys.is_empty() {
+        type AnchorBatchRow = (
+            String,
+            String,
+            String,
+            String,
+            Vec<u8>,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<i64>,
+        );
+        let space = scope.space_id.as_str();
+        let fetched: Vec<AnchorBatchRow> = match tx {
+            BackendConn::Postgres(conn) => {
+                let views: Vec<&str> = missing_keys.iter().map(|k| k.0.as_str()).collect();
+                let vkeys: Vec<&str> = missing_keys.iter().map(|k| k.1.as_str()).collect();
+                let targets: Vec<&str> = missing_keys.iter().map(|k| k.2.as_str()).collect();
+                sqlx::query_as(
+                    "SELECT a.view_note_id, a.view_key, a.target_note_id,
+                            a.rank_rev_id, a.group_key_msgpack, a.sort_rank_lexo,
+                            a.placement_revision, a.placement_actor_id, a.placement_run_id, r.visibility_seq
+                     FROM UNNEST($2::text[], $3::text[], $4::text[]) AS k(v, vk, t)
+                     JOIN projection_rank_anchor_rows a
+                       ON a.space_id = $1 AND a.view_note_id = k.v AND a.view_key = k.vk AND a.target_note_id = k.t
+                     LEFT JOIN revisions r ON r.space_id = a.space_id AND r.rev_id = a.rank_rev_id",
+                )
+                .bind(space)
+                .bind(&views)
+                .bind(&vkeys)
+                .bind(&targets)
+                .fetch_all(&mut **conn)
+                .await
+                .map_err(|err| pg_read_error("pg_projection_rank_anchors_batch", err))?
+            }
+            BackendConn::Sqlite(conn) => {
+                let mut acc = Vec::new();
+                for chunk in missing_keys.chunks(100) {
+                    let mut qb =
+                        sqlx::QueryBuilder::<sqlx::Sqlite>::new("WITH keys(v, vk, t) AS (VALUES ");
+                    let mut sep = qb.separated(", ");
+                    for k in chunk {
+                        sep.push("(");
+                        sep.push_bind_unseparated(k.0.as_str());
+                        sep.push_unseparated(", ");
+                        sep.push_bind_unseparated(k.1.as_str());
+                        sep.push_unseparated(", ");
+                        sep.push_bind_unseparated(k.2.as_str());
+                        sep.push_unseparated(")");
+                    }
+                    qb.push(
+                        ") SELECT a.view_note_id, a.view_key, a.target_note_id,
+                                 a.rank_rev_id, a.group_key_msgpack, a.sort_rank_lexo,
+                                 a.placement_revision, a.placement_actor_id, a.placement_run_id, r.visibility_seq
+                          FROM keys
+                          JOIN projection_rank_anchor_rows a
+                            ON a.space_id = ",
+                    );
+                    qb.push_bind(space).push(
+                        " AND a.view_note_id = keys.v AND a.view_key = keys.vk AND a.target_note_id = keys.t
+                          LEFT JOIN revisions r ON r.space_id = a.space_id AND r.rev_id = a.rank_rev_id",
+                    );
+                    let part: Vec<AnchorBatchRow> = qb
+                        .build_query_as()
+                        .fetch_all(&mut **conn)
+                        .await
+                        .map_err(|err| {
+                            internal_not_committed(
+                                "sqlite_projection_rank_anchors_batch",
+                                err.to_string(),
+                            )
+                        })?;
+                    acc.extend(part);
+                }
+                acc
+            }
+        };
+        for (view, vkey, target, rev, group, rank, placement, actor, run, visible) in fetched {
+            let key = decode_rank_key(&view, &vkey, &target)?;
+            let row = ProjectionRank {
                 revision_id: RevisionId::parse(&rev)?,
                 visibility_seq: visible.map(i64_to_space_seq).transpose()?.unwrap_or(anchor),
                 metadata: RankRevisionMetadata {
-                    view_note_id: key.0,
-                    view_key: key.1,
-                    target_note_id: key.2,
+                    view_note_id: key.0.clone(),
+                    view_key: key.1.clone(),
+                    target_note_id: key.2.clone(),
                     group_key: decode_msgpack_bounded(&group, MAX_MSGPACK_DECODE_BYTES)?,
                     sort_rank_lexo: rank,
                     placement_revision: RevisionId::parse(&placement)?,
@@ -377,9 +489,26 @@ async fn rank_at(
                     is_pma_normalization: false,
                     removed: false,
                 },
-            })
-        })
-        .transpose()
+            };
+            anchor_rows_map.insert(key, row);
+        }
+    }
+
+    // 4. Reassemble in exact original key order.
+    let mut rows = Vec::with_capacity(live_keys.len());
+    for (key, entity) in live_keys {
+        if let Some(row) = latest_revs.remove(&entity) {
+            if row.key() != key {
+                return Err(corrupt("rank revision identity does not match its key"));
+            }
+            if !row.metadata.removed {
+                rows.push(row);
+            }
+        } else if let Some(row) = anchor_rows_map.remove(&key) {
+            rows.push(row);
+        }
+    }
+    Ok(rows)
 }
 
 pub(super) fn decode_rank(

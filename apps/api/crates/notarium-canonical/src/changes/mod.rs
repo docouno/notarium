@@ -1321,17 +1321,15 @@ impl CanonicalStore {
                                 };
 
                                 if let Some(auth) = &auth_in
-                                    && (crate::domain::change_visibility::authorize_thread_owner(
-                                        auth, kind, &owner_id,
-                                    )
-                                    .is_err()
-                                        || auth
-                                            .authorize_chat_read(
-                                                &space_rec.space,
-                                                project_folder_id.as_ref(),
-                                                tainted,
-                                            )
-                                            .is_err())
+                                    && auth
+                                        .can_view_chat_thread(
+                                            &space_rec.space,
+                                            kind,
+                                            &owner_id,
+                                            project_folder_id.as_ref(),
+                                            tainted,
+                                        )
+                                        .is_err()
                                 {
                                     continue;
                                 }
@@ -1451,6 +1449,7 @@ impl CanonicalStore {
                     note.document.bind_current(facts, lifecycle)?;
                 }
                 if let Some(auth) = &space_auth {
+                    let mut any_tainted = false;
                     for thread in &thread_items {
                         let (project, tainted) = crate::domain::lookup_thread_visibility_tx(
                             tx,
@@ -1459,7 +1458,24 @@ impl CanonicalStore {
                         )
                         .await?
                         .ok_or(DomainError::ResourceNotFound)?;
-                        auth.authorize_chat_read(&space.space, project.as_ref(), tainted)?;
+                        auth.can_view_chat_thread(
+                            &space.space,
+                            thread.kind,
+                            &thread.owner,
+                            project.as_ref(),
+                            tainted,
+                        )?;
+                        auth.can_view_chat_thread(
+                            &space.space,
+                            thread.kind,
+                            &thread.owner,
+                            thread.project_folder.as_ref(),
+                            thread.tainted,
+                        )?;
+                        any_tainted |= tainted || thread.tainted;
+                    }
+                    if !thread_items.is_empty() {
+                        auth.mark_chat_read_taint(&space.space, any_tainted);
                     }
                 }
                 Ok(ChangeSeed {

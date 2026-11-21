@@ -13,7 +13,8 @@ use notarium_core::{
 use notarium_projections::PostgresProjectionCache;
 
 use super::{
-    CanonicalStore, DerivedStore, ProjectorRuntime, budget, mutation, note, open_space, sync,
+    CanonicalStore, DerivedStore, ProjectorRuntime, budget, find_checkpoint_file, mutation, note,
+    open_space, sync,
 };
 
 #[tokio::test]
@@ -450,9 +451,8 @@ async fn postgres_split_owners_backlinks_and_detached_erasure() {
         .unwrap()
         .unwrap()
         .snapshot_seq;
-    let orphan_file = cache_a
-        .root()
-        .space_fast_index(initial, &scope_a.space_id, earlier);
+    let orphan_file =
+        find_checkpoint_file(&cache_a.root(), initial, &scope_a.space_id, earlier).unwrap();
     let orphan_bytes = std::fs::read(&orphan_file).unwrap();
     let _detached_victim = note(
         &a,
@@ -485,10 +485,13 @@ async fn postgres_split_owners_backlinks_and_detached_erasure() {
     assert_eq!(held.cut().generation, initial);
     assert!(held.lookup(&ca.note).is_some());
     assert_eq!(held.cut().projected_seq, source_checkpoint.snapshot_seq);
-    let source_file =
-        cache_a
-            .root()
-            .space_fast_index(initial, &scope_a.space_id, source_checkpoint.snapshot_seq);
+    let source_file = find_checkpoint_file(
+        &cache_a.root(),
+        initial,
+        &scope_a.space_id,
+        source_checkpoint.snapshot_seq,
+    )
+    .unwrap();
     assert!(source_file.is_file());
 
     let stopped = std::sync::Arc::downgrade(&engine_a);

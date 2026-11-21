@@ -441,6 +441,11 @@ impl ProjectionEngine {
         }
         Ok(())
     }
+
+    #[doc(hidden)]
+    pub fn evict_sqlite_cache_for_test(&self) {
+        self.generation.load().store.evict_sqlite_cache_for_test();
+    }
 }
 
 fn not_ready() -> PortError {

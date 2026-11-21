@@ -426,6 +426,7 @@ async fn test_storage(store: &DerivedStore) {
         format_version: 1,
         platform_abi: "test".to_owned(),
         publication_id: "test".to_owned(),
+        file_nonce: String::new(),
         size_bytes: 23,
         digest: ContentDigest::from_bytes([42; 32]),
         graph_seq: SpaceSeq::ZERO,
@@ -1049,14 +1050,73 @@ async fn test_postgres_seed_batches(store: &DerivedStore) {
         [Some(other), Some(note(&history, "Last", 11)), None]
     );
     let links = store
-        .link_page_at(
-            &history,
-            seq(10),
-            LinkAddress::Source(1),
-            None,
-            PageLimit::new(2).unwrap(),
-        )
+        .link_page_at(&history, seq(10), LinkAddress::Source(1), None, 2)
         .await
         .unwrap();
     assert_eq!(links, [resolved]);
+}
+
+#[tokio::test]
+async fn sqlite_explain_query_plan_covers_slot_occupant_and_replay_edges_without_analyze() {
+    let scratch = Scratch::new();
+    let generation = ProjectionGeneration::new(1).unwrap();
+    let _store = DerivedStore::open_sqlite(&scratch.data(), generation)
+        .await
+        .unwrap();
+    let conn = rusqlite::Connection::open(scratch.data().derived(generation)).unwrap();
+    let explain = |sql: &str| -> Vec<String> {
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    };
+
+    let slot_plan = explain(
+        "SELECT note_id FROM projected_notes \
+         WHERE space_id = 's' AND parent_folder_id = 'f' AND slug_fold = 'x' AND lifecycle = 'active' \
+         LIMIT 2",
+    );
+    assert!(
+        slot_plan
+            .iter()
+            .any(|detail| detail.contains("COVERING INDEX projected_note_parents")),
+        "slot_occupant must use covering index projected_note_parents without ANALYZE: {slot_plan:?}"
+    );
+
+    let whole_space_edge_plan = explain(
+        "SELECT src_dense_id, link_ord, resolved_dense_id FROM projected_note_links \
+         WHERE space_id = 's' AND resolved_dense_id IS NOT NULL \
+         ORDER BY src_dense_id, link_ord LIMIT 100",
+    );
+    assert!(
+        whole_space_edge_plan
+            .iter()
+            .any(|detail| detail.contains("COVERING INDEX projected_link_src_resolved")),
+        "whole-space graph_edges_page must use covering index projected_link_src_resolved without ANALYZE: {whole_space_edge_plan:?}"
+    );
+
+    let edge_plan = explain(
+        "SELECT src_dense_id, link_ord, resolved_dense_id FROM projected_note_links \
+         WHERE space_id = 's' AND resolved_dense_id IS NOT NULL AND src_dense_id = 1 \
+         ORDER BY src_dense_id, link_ord LIMIT 100",
+    );
+    assert!(
+        edge_plan
+            .iter()
+            .any(|detail| detail.contains("COVERING INDEX projected_link_src_resolved")),
+        "single-source graph_edges_page must use covering index projected_link_src_resolved without ANALYZE: {edge_plan:?}"
+    );
+
+    let target_edge_plan = explain(
+        "SELECT src_dense_id, link_ord, resolved_dense_id FROM projected_note_links \
+         WHERE space_id = 's' AND resolved_dense_id IS NOT NULL AND resolved_dense_id = 5 \
+         ORDER BY src_dense_id, link_ord LIMIT 100",
+    );
+    assert!(
+        target_edge_plan
+            .iter()
+            .any(|detail| detail.contains("COVERING INDEX projected_link_resolved")),
+        "single-target graph_edges_page must use covering index projected_link_resolved without ANALYZE: {target_edge_plan:?}"
+    );
 }

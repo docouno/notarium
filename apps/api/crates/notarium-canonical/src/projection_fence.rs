@@ -3,7 +3,7 @@
 mod registration;
 mod source;
 
-pub use registration::ProjectionCleanupRegistration;
+pub use registration::{ProjectionCleanupRegistration, StoppedProjectionDeployment};
 
 #[cfg(feature = "test-support")]
 mod census;
@@ -48,7 +48,7 @@ use self::source::{FolderRow, NoteRow};
 const MAX_PRIVATE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_DELTA_NOTES: usize = 16_384;
 const MAX_TRACKED_CHANGES: usize = 4_096;
-const PAGE_ROWS: usize = 200;
+const PAGE_ROWS: usize = 4_096;
 const NO_PARENT: u32 = u32::MAX;
 const SLOT_CHUNK: usize = 65_536;
 
@@ -169,9 +169,10 @@ impl VisibilityChanges {
     pub(crate) fn from_events(events: &[crate::writer::BatchEventDraft]) -> Self {
         let mut out = Self::default();
         for ev in events {
-            match ev.entity_type.as_str() {
-                "note" | "ability" => out.notes = true,
-                "folder" => out.folders = true,
+            match (ev.entity_type.as_str(), ev.op_kind.as_str()) {
+                ("note", "edit" | "rename") => {}
+                ("note", _) | ("ability", _) => out.notes = true,
+                ("folder", _) => out.folders = true,
                 _ => {}
             }
             if ev.op_kind == "purge" || ev.op_kind == "redact" {
@@ -498,6 +499,17 @@ impl LiveState {
         None
     }
 
+    fn release_private_memory(&mut self) {
+        self.readable = false;
+        self.lookup = None;
+        self.dense = DenseSlots::default();
+        self.abilities = HashMap::new();
+        self.delta = HashMap::new();
+        self.folder_slots = HashMap::new();
+        self.folders = Vec::new();
+        self.note_changes = VecDeque::new();
+    }
+
     fn enforce_limit(&mut self) -> Result<(), PortError> {
         let bytes = self.allocated_capacity();
         self.peak_private_bytes = self.peak_private_bytes.max(bytes);
@@ -605,6 +617,14 @@ impl GateData {
 type Gate = Arc<RwLock<GateData>>;
 type Topology = BTreeMap<SpaceId, Gate>;
 
+#[derive(Clone, Debug)]
+struct SuspendedWatermark {
+    scope: HistoryScope,
+    active_epoch: LeaseEpoch,
+    lookup_generation: Option<ProjectionGeneration>,
+    retired_before: Option<SpaceSeq>,
+}
+
 #[derive(Clone)]
 pub struct LiveLifecycleFence {
     topology: Arc<std::sync::RwLock<Topology>>,
@@ -612,6 +632,7 @@ pub struct LiveLifecycleFence {
     process: Arc<str>,
     cleanup: Arc<std::sync::RwLock<Option<Arc<dyn ProjectionVisibilityCleanup>>>>,
     cleanup_debt: Arc<std::sync::Mutex<HashMap<HistoryScope, (SpaceSeq, SpaceSeq)>>>,
+    suspended_watermarks: Arc<std::sync::Mutex<HashMap<SpaceId, SuspendedWatermark>>>,
 }
 
 impl LiveLifecycleFence {
@@ -622,6 +643,7 @@ impl LiveLifecycleFence {
             process: crate::codec::new_prefixed_hex_id("owner_")?.into(),
             cleanup: Arc::default(),
             cleanup_debt: Arc::default(),
+            suspended_watermarks: Arc::default(),
         })
     }
 
@@ -676,6 +698,10 @@ impl LiveLifecycleFence {
 
     pub(crate) async fn close_and_drain(&self) {
         self.closed.store(true, Ordering::Release);
+        self.suspended_watermarks
+            .lock()
+            .expect("projection suspended watermarks")
+            .clear();
         let gates: Vec<Gate> = {
             let mut topology = self.topology.write().expect("projection topology");
             std::mem::take(&mut *topology).into_values().collect()
@@ -1149,9 +1175,32 @@ impl LiveWriteSet {
         windows: &[VisibilityWindow],
     ) -> Result<(), PortError> {
         let cleanup = if windows.iter().any(|window| window.changes.erasures) {
-            store
+            match store
                 .projection_cleanup_for_erasure(&source::internal_budget())
-                .await?
+                .await
+            {
+                Ok(cleanup) => cleanup,
+                Err(error) => {
+                    // Record erasure debt BEFORE returning an error so detached redactions
+                    // or purges cannot be lost if a projector re-attaches later.
+                    let mut pending = store
+                        .inner
+                        .live_visibility
+                        .cleanup_debt
+                        .lock()
+                        .expect("projection cleanup debt");
+                    for window in windows.iter().filter(|window| window.changes.erasures) {
+                        pending
+                            .entry(window.scope.clone())
+                            .and_modify(|(after, through)| {
+                                *after = (*after).min(window.after);
+                                *through = (*through).max(window.through);
+                            })
+                            .or_insert((window.after, window.through));
+                    }
+                    return Err(error);
+                }
+            }
         } else {
             store.inner.live_visibility.cleanup()
         };
@@ -1279,6 +1328,7 @@ impl Drop for LiveWriteSet {
                 && let Some(state) = guard.state_mut()
             {
                 state.readable = false;
+                state.lookup = None;
             }
             if matches!(**guard, GateData::Empty) {
                 empty_spaces.push(space.clone());
@@ -1529,25 +1579,51 @@ impl CanonicalStore {
             fence.remove_gate_if_same(&scope.space_id, gate);
             return Err(not_ready());
         }
-        if let (Some(state), Some(next_lookup)) = (old.state(), lookup.as_ref())
-            && &state.record.scope == scope
-            && self
-                .inner
-                .check_writer_epoch(&scope.space_id, state.record.active_epoch)
-                .is_ok()
-        {
-            if next_lookup.generation() < state.lookup_generation {
-                // A publisher from before handoff can finish after the new lookup.
-                // Retirement clears the backing file, but keeps this generation.
-                return Err(not_ready());
-            }
-            if let Some(floor) = state.retired_before
-                && next_lookup
-                    .published_seq()
-                    .is_none_or(|published| published < floor)
+        let suspended_mark = fence
+            .suspended_watermarks
+            .lock()
+            .expect("projection suspended watermarks")
+            .get(&scope.space_id)
+            .cloned();
+        if let Some(next_lookup) = lookup.as_ref() {
+            if let Some(state) = old.state()
+                && &state.record.scope == scope
+                && self
+                    .inner
+                    .check_writer_epoch(&scope.space_id, state.record.active_epoch)
+                    .is_ok()
             {
-                // Never re-admit a pre-purge checkpoint directory of the same generation.
-                return Err(not_ready());
+                if next_lookup.generation() < state.lookup_generation {
+                    // A publisher from before handoff can finish after the new lookup.
+                    // Retirement clears the backing file, but keeps this generation.
+                    return Err(not_ready());
+                }
+                if let Some(floor) = state.retired_before
+                    && next_lookup
+                        .published_seq()
+                        .is_none_or(|published| published < floor)
+                {
+                    // Never re-admit a pre-purge checkpoint directory of the same generation.
+                    return Err(not_ready());
+                }
+            }
+            if let Some(mark) = suspended_mark.as_ref()
+                && &mark.scope == scope
+                && self
+                    .inner
+                    .check_writer_epoch(&scope.space_id, mark.active_epoch)
+                    .is_ok()
+            {
+                if next_lookup.generation() < mark.lookup_generation {
+                    return Err(not_ready());
+                }
+                if let Some(floor) = mark.retired_before
+                    && next_lookup
+                        .published_seq()
+                        .is_none_or(|published| published < floor)
+                {
+                    return Err(not_ready());
+                }
             }
         }
         if lookup.is_none()
@@ -1638,30 +1714,67 @@ impl CanonicalStore {
                 .expect("projection cleanup debt")
                 .remove(scope);
         }
-        if let Some(old) = old.state_mut()
-            && !old.readable
-            && &old.record.scope == scope
-            && let Err(source::RefreshError::Cleanup(error)) =
-                source::refresh(self, old, &ctx.budget, VisibilityChanges::all()).await
+        if let Some(old_state) = old.state_mut()
+            && !old_state.readable
+            && &old_state.record.scope == scope
+            && old_state.record.last_seq < record.last_seq
+            && let Some(callback) = fence.cleanup()
         {
-            return Err(error);
+            let window = VisibilityWindow {
+                scope: scope.clone(),
+                after: old_state.record.last_seq,
+                through: record.last_seq,
+                changes: VisibilityChanges {
+                    notes: false,
+                    folders: false,
+                    erasures: true,
+                },
+            };
+            let purged = source::erase_window(self, callback.as_ref(), &window).await?;
+            if purged {
+                old_state.retire_lookup_before(record.last_seq);
+            }
         }
+        // Release the previous admission's private buffers BEFORE allocating the
+        // replacement LiveState so re-admission does not double peak RAM (>8 MiB).
+        let previous_meta = if let Some(old_state) = old.state_mut() {
+            let meta = (
+                old_state.record.scope.clone(),
+                old_state.record.active_epoch,
+                old_state.lookup_generation,
+                old_state.retired_before,
+                old_state.peak_private_bytes,
+            );
+            old_state.release_private_memory();
+            Some(meta)
+        } else {
+            None
+        };
         let mut state = LiveState::new(record, lookup)?;
         source::seed(self, &mut state, &ctx.budget, deadline).await?;
-        if let Some(previous) = old.state() {
-            if previous.record.scope == state.record.scope
-                && previous.record.active_epoch == state.record.active_epoch
-            {
-                state.lookup_generation = state.lookup_generation.max(previous.lookup_generation);
-                state.retired_before = match (state.retired_before, previous.retired_before) {
+        if let Some((prev_scope, prev_epoch, prev_gen, prev_retired, prev_peak)) = previous_meta {
+            if prev_scope == state.record.scope && prev_epoch == state.record.active_epoch {
+                state.lookup_generation = state.lookup_generation.max(prev_gen);
+                state.retired_before = match (state.retired_before, prev_retired) {
                     (Some(a), Some(b)) => Some(a.max(b)),
                     (a, b) => a.or(b),
                 };
             }
-            state.peak_private_bytes = state
-                .peak_private_bytes
-                .saturating_add(previous.allocated_capacity())
-                .max(previous.peak_private_bytes);
+            state.peak_private_bytes = state.peak_private_bytes.max(prev_peak);
+        }
+        if let Some(mark) = fence
+            .suspended_watermarks
+            .lock()
+            .expect("projection suspended watermarks")
+            .remove(&scope.space_id)
+            && mark.scope == state.record.scope
+            && mark.active_epoch == state.record.active_epoch
+        {
+            state.lookup_generation = state.lookup_generation.max(mark.lookup_generation);
+            state.retired_before = match (state.retired_before, mark.retired_before) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (a, b) => a.or(b),
+            };
         }
         let epoch = state.record.active_epoch;
         if fence.closed.load(Ordering::Acquire)
@@ -1694,21 +1807,30 @@ impl CanonicalStore {
         let fence = &self.inner.live_visibility;
         let deadline =
             crate::runtime::deadline_after(tokio::time::Instant::now(), ctx.budget.remaining);
-        let gate = fence
-            .topology
-            .read()
-            .expect("projection topology")
-            .get(&scope.space_id)
-            .cloned();
-        if let Some(gate) = gate {
-            let mut guard = budgeted(&ctx.budget, deadline, gate.write()).await?;
-            if let Some(state) = guard.state() {
-                state.record.scope.check(scope)?;
+        let (gate, mut guard) = fence
+            .lock_current_gate(&scope.space_id, &ctx.budget, deadline)
+            .await?;
+        if let Some(state) = guard.state() {
+            state.record.scope.check(scope)?;
+            if state.lookup_generation.is_some() || state.retired_before.is_some() {
+                fence
+                    .suspended_watermarks
+                    .lock()
+                    .expect("projection suspended watermarks")
+                    .insert(
+                        scope.space_id.clone(),
+                        SuspendedWatermark {
+                            scope: state.record.scope.clone(),
+                            active_epoch: state.record.active_epoch,
+                            lookup_generation: state.lookup_generation,
+                            retired_before: state.retired_before,
+                        },
+                    );
             }
-            *guard = GateData::Revoked;
-            fence.remove_gate_if_same(&scope.space_id, &gate);
-            drop(guard);
         }
+        *guard = GateData::Revoked;
+        fence.remove_gate_if_same(&scope.space_id, &gate);
+        drop(guard);
         Ok(())
     }
 
@@ -1743,6 +1865,11 @@ impl CanonicalStore {
         if let Some(state) = guard.state() {
             state.record.scope.check(scope)?;
         }
+        fence
+            .suspended_watermarks
+            .lock()
+            .expect("projection suspended watermarks")
+            .remove(&scope.space_id);
         *guard = GateData::Revoked;
         // Remove the revoked gate from topology while still holding its write lock
         // (including on cancellation/error) so concurrent writers/admissions cannot

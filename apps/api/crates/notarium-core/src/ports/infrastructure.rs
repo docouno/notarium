@@ -28,6 +28,13 @@ pub trait StructuralReadPort: Send + Sync {
     ) -> PortFuture<'_, Box<dyn StructuralSnapshot>>;
     /// Current canonical fence, including class changes; never the pinned snapshot bit.
     fn is_live_visible(&self, ctx: &SpaceContext, note: &NoteId) -> DomainResult<bool>;
+    /// Batch check against the current canonical fence preserving request order.
+    fn filter_live_visible(&self, ctx: &SpaceContext, notes: &[NoteId]) -> DomainResult<Vec<bool>> {
+        notes
+            .iter()
+            .map(|note| self.is_live_visible(ctx, note))
+            .collect()
+    }
     /// Preserve request ordering, including absent/hidden rows.
     fn hydrate(
         &self,
