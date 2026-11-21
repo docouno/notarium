@@ -340,9 +340,19 @@ impl StructuralReadPort for Projection {
     }
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub struct SeedPageAttempt {
+    pub after: Option<NoteId>,
+    scope: HistoryScope,
+    cutoff: Option<SpaceSeq>,
+    limit: PageLimit,
+    request: RequestId,
+}
+
 pub struct ControlledCarriers {
     canonical: Arc<CanonicalStore>,
     pub full_seed_pages: AtomicUsize,
+    pub seed_deadline_attempts: StdMutex<Option<Vec<SeedPageAttempt>>>,
     pub reject_seed: AtomicBool,
     pub seed_rejected: Notify,
     pub release_seed: Notify,
@@ -362,6 +372,7 @@ impl ControlledCarriers {
         Self {
             canonical,
             full_seed_pages: AtomicUsize::new(0),
+            seed_deadline_attempts: StdMutex::new(None),
             reject_seed: AtomicBool::new(false),
             seed_rejected: Notify::new(),
             release_seed: Notify::new(),
@@ -418,6 +429,26 @@ impl SearchCarrierReadPort for ControlledCarriers {
         if limit.get() == 100 {
             self.full_seed_pages.fetch_add(1, Ordering::SeqCst);
         }
+        let limit = if let Some(attempts) = self.seed_deadline_attempts.lock().unwrap().as_mut() {
+            attempts.push(SeedPageAttempt {
+                after: after_note.clone(),
+                scope: scope.clone(),
+                cutoff,
+                limit,
+                request: budget.request.clone(),
+            });
+            if attempts.len() == 2 {
+                return Box::pin(async {
+                    Err(notarium_canonical::codec::deadline_not_committed(
+                        "seed_page_deadline",
+                        "injected read deadline",
+                    ))
+                });
+            }
+            PageLimit::new(2).unwrap()
+        } else {
+            limit
+        };
         if self.reject_seed.load(Ordering::SeqCst) {
             return Box::pin(async {
                 self.seed_rejected.notify_one();

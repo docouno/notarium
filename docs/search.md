@@ -41,6 +41,9 @@ before shutting down canonical storage.
 Search data is derived and rebuildable. Every active Space has an independent
 canonical change subscriber. Command boundaries govern publication and
 acknowledgement, including commands that span several change pages.
+During a cold build, a transient storage read timeout retries the same note
+page up to twice within its original budget. A purge or history change
+invalidates the pinned cut and starts a new build.
 
 The DataRoot holds `v1/search/<space>/tantivy/` and `vector/`. Tantivy stores
 terms and fast fields without stored note or chat text. A durable folder

@@ -285,6 +285,7 @@ async fn run_scenario(store: Arc<CanonicalStore>, root: DataRoot, tag: u8) {
     });
     let pages = Arc::new(HeldPages::new(store.clone()));
     let carriers = Arc::new(ControlledCarriers::new(store.clone()));
+    *carriers.seed_deadline_attempts.lock().unwrap() = Some(Vec::new());
     let mut deps = SearchDependencies::new(store.clone(), projection.clone());
     deps.changes = pages.clone();
     deps.carriers = carriers.clone();
@@ -292,6 +293,15 @@ async fn run_scenario(store: Arc<CanonicalStore>, root: DataRoot, tag: u8) {
     let engine = SearchEngine::start(SearchConfig::new(root.clone(), vector_mode.clone()), deps);
     engine.start_space(scope.clone()).unwrap();
     let before_lag = acknowledged(&store, &root, scope, seeded.last_seq).await;
+    let attempts = carriers
+        .seed_deadline_attempts
+        .lock()
+        .unwrap()
+        .take()
+        .unwrap();
+    assert!(attempts[0].after.is_none());
+    assert!(attempts[1].after.is_some());
+    assert_eq!(attempts[1], attempts[2], "resume the same seed page");
     assert!(before_lag.active_model.is_some());
     let vectors = root.search(&scope.space_id, SearchIndexKind::Vector);
     let old_vectors = files(&vectors);

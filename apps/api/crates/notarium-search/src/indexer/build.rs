@@ -1,6 +1,7 @@
 use super::{Context, Disk, IndexError, Publisher};
 use crate::{
     embed::Priority,
+    engine::Clock,
     layout::{FolderDictionary, FolderOrd, SearchLayout, SearchManifest, VectorModel, index_name},
     lexical::{LexicalIndex, TOKENIZER_VERSION, Update},
     model::{Embedder, IndexNote},
@@ -10,12 +11,13 @@ use crate::{
 use notarium_canonical::chats::search::HydratedChatHit;
 use notarium_core::{
     classes::{ClassEgressFence, DocClass, SearchContent},
+    error::{CommitEffect, PortError},
     ids::{ChatThreadId, SpaceSeq, ThreadEntrySeq},
     model::Lifecycle,
     ports::PageLimit,
     receipt::ChangeCursor,
 };
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 pub(super) async fn scrub(
     cx: &Context<'_>,
@@ -346,18 +348,38 @@ async fn note_page(
     cutoff: &ChangeCursor,
     after: Option<notarium_core::ids::NoteId>,
 ) -> Result<crate::ports::SearchNotesSeedPage, IndexError> {
-    let page = cx
-        .services
-        .deps
-        .carriers
-        .read_searchable_notes_seed_page(
-            cx.services.authority.clone(),
-            cx.budget(),
-            cutoff.scope.clone(),
-            Some(cutoff.after),
-            after,
-            PageLimit::new(100)?,
-        )
+    let clock = Clock::new(&cx.budget())?;
+    let limit = PageLimit::new(100)?;
+    let page = clock
+        .within(async {
+            let mut retries = 0;
+            loop {
+                let result = cx
+                    .services
+                    .deps
+                    .carriers
+                    .read_searchable_notes_seed_page(
+                        cx.services.authority.clone(),
+                        clock.remaining()?,
+                        cutoff.scope.clone(),
+                        Some(cutoff.after),
+                        after.clone(),
+                        limit,
+                    )
+                    .await;
+                match result {
+                    // A failed read has staged no rows. Re-read this keyset under
+                    // the same deadline and let canonical recheck live visibility.
+                    Err(PortError::DeadlineExceeded(failure))
+                        if failure.effect() == CommitEffect::NotCommitted && retries < 2 =>
+                    {
+                        retries += 1;
+                        tokio::time::sleep(Duration::from_millis(25 * retries)).await;
+                    }
+                    result => return result,
+                }
+            }
+        })
         .await?;
     if page.cutoff != *cutoff {
         return Err(IndexError::Inconsistent);
