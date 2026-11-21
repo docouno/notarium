@@ -1146,10 +1146,11 @@ impl StructuralSnapshot for PinnedGraph {
             .position(|n| n == note)
             .map(|i| DenseNodeId::new(self.0.cut.generation, i as u32))
     }
-    fn note_id(&self, node: DenseNodeId) -> notarium_core::DomainResult<&NoteId> {
+    fn note_id(&self, node: DenseNodeId) -> notarium_core::DomainResult<NoteId> {
         self.0
             .notes
             .get(node.index(self.0.cut.generation)? as usize)
+            .cloned()
             .ok_or(DomainError::ResourceNotFound)
     }
     fn doc_class(&self, node: DenseNodeId) -> notarium_core::DomainResult<DocClass> {
@@ -1304,7 +1305,7 @@ fn pinned_graph_survives_a_swap_but_visibility_uses_the_current_fence() {
         .store(false, std::sync::atomic::Ordering::SeqCst);
     let new =
         ready(port.acquire_snapshot(context(), CausalBasis::Exact(ReceiptSet::default()))).unwrap();
-    assert_eq!(old.note_id(neighbors.next().unwrap()).unwrap(), &id);
+    assert_eq!(old.note_id(neighbors.next().unwrap()).unwrap(), id);
     assert!(new.note_id(node).is_err());
     assert!(!port.is_live_visible(&context(), &id).unwrap());
     assert_eq!(

@@ -4,13 +4,14 @@ Notarium is a knowledge workspace for people and AI agents. Version 1.0 is being
 built from scratch on `v1` with a Rust backend, React web client and Electron
 desktop client. The `main` branch remains the released v0 showcase.
 
-This branch contains the development foundation, pure domain contracts,
-byte-preserving document syntax, dual-dialect canonical storage with CAS, control storage and transport-independent account
+This branch contains domain contracts, byte-preserving document syntax,
+dual-dialect canonical storage with CAS, control storage and rebuildable
+structural projections. The engine ports support declarative Markdown views,
+board reads and knowledge graphs. Control services cover transport-independent
 authentication, Space access, OAuth issuance, OIDC identity, provider services,
-account context, schedule claims, content-free telemetry, control backup snapshots,
-and a hybrid search engine library. Derived projections, collaboration, agents
-and the product UI arrive in subsequent waves. The greeting screen and its API
-remain starter examples.
+account context, schedule claims, content-free telemetry and backup snapshots.
+The hybrid search library provides search and recall. Collaboration, agents and
+the product UI arrive in subsequent waves.
 
 ## Start developing
 
@@ -75,6 +76,8 @@ The implemented library boundaries are documented in [core contracts](docs/core-
 See [control storage](docs/control.md) for the control-plane primitives.
 See [hybrid search](docs/search.md) for search and recall, model setup, and the
 offline scale gate.
+The [projections guide](docs/projections.md) covers note views, graph queries
+and the SQLite and PostgreSQL acceptance workload.
 
 ## Contract and delivery
 

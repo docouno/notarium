@@ -347,9 +347,10 @@ impl StructuralSnapshot for Projection {
             .map(|_| DenseNodeId::new(self.cut.generation, slot))
     }
 
-    fn note_id(&self, node: DenseNodeId) -> DomainResult<&NoteId> {
+    fn note_id(&self, node: DenseNodeId) -> DomainResult<NoteId> {
         self.notes
             .get(node.index(self.cut.generation)? as usize)
+            .cloned()
             .ok_or(DomainError::ResourceNotFound)
     }
 

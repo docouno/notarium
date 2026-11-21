@@ -166,6 +166,7 @@ pub struct EngineAuthContext {
     human_management: bool,
     ability_write: bool,
     write_space: Option<SpaceId>,
+    chat_audience: Option<ChatAudience>,
     taint: BranchTaint,
     readonly_abilities: BTreeSet<AbilityId>,
     credential: Option<AuthenticatedCredential>,
@@ -197,6 +198,7 @@ impl EngineAuthContext {
             human_management: verified.human_management,
             ability_write: verified.human_management && verified.ability_write,
             write_space: None,
+            chat_audience: None,
             taint: BranchTaint::default(),
             readonly_abilities: BTreeSet::new(),
             credential: verified.credential,
@@ -213,7 +215,13 @@ impl EngineAuthContext {
         if !derived.spaces.contains_key(&thread_space) {
             return Err(DomainError::ResourceNotFound);
         }
-        if audience == ChatAudience::Shared {
+        // A nested run derived from a Shared-audience run cannot widen back to Personal.
+        let effective_audience = if self.chat_audience == Some(ChatAudience::Shared) {
+            ChatAudience::Shared
+        } else {
+            audience
+        };
+        if effective_audience == ChatAudience::Shared {
             derived.spaces.retain(|space, _| space == &thread_space);
             for grant in derived.spaces.values_mut() {
                 grant.read_classes.remove(&DocClass::Profile);
@@ -230,6 +238,7 @@ impl EngineAuthContext {
         }
         derived.kind = PrincipalKind::AgentRun(run);
         derived.write_space = Some(thread_space);
+        derived.chat_audience = Some(effective_audience);
         if self.kind == PrincipalKind::DirectHuman {
             derived.taint = BranchTaint::default();
         }
@@ -359,7 +368,13 @@ impl EngineAuthContext {
         result.human_management = self.human_management && current.human_management;
         result.ability_write =
             result.human_management && self.ability_write && current.ability_write;
+        if current.chat_audience == Some(ChatAudience::Shared) {
+            result.chat_audience = Some(ChatAudience::Shared);
+        }
         Ok(result)
+    }
+    pub fn chat_audience(&self) -> Option<ChatAudience> {
+        self.chat_audience
     }
     pub fn grant(&self) -> &GrantId {
         &self.grant
@@ -473,6 +488,63 @@ impl EngineAuthContext {
         {
             self.taint.mark_external_read();
         }
+        Ok(())
+    }
+    /// Metadata visibility check for a chat thread that never mutates shared branch taint.
+    /// Content reading and backlink delivery must call `mark_chat_read_taint`
+    /// (or `authorize_chat_thread_read`) only for admitted rows.
+    pub fn can_view_chat_thread(
+        &self,
+        space: &Space,
+        kind: crate::ports::ChatThreadKind,
+        owner: &PrincipalId,
+        project: Option<&FolderId>,
+        tainted: bool,
+    ) -> DomainResult<()> {
+        let grant = self
+            .spaces
+            .get(&space.id)
+            .ok_or(DomainError::ResourceNotFound)?;
+        if space.lifecycle != SpaceLifecycle::Active {
+            return Err(DomainError::ResourceNotFound);
+        }
+        if kind == crate::ports::ChatThreadKind::Personal
+            && (owner != &self.principal
+                || self.chat_audience == Some(ChatAudience::Shared)
+                || (matches!(self.kind, PrincipalKind::Keeper(_))
+                    && space.kind == SpaceKind::Shared))
+        {
+            return Err(DomainError::ResourceNotFound);
+        }
+        if let Some(root) = &grant.project_root
+            && project != Some(root)
+        {
+            return Err(DomainError::ResourceNotFound);
+        }
+        if tainted && space.kind == SpaceKind::Shared {
+            return Err(DomainError::CrossSpaceTainted);
+        }
+        Ok(())
+    }
+    /// Marks branch taint after a chat thread has passed visibility checks and is
+    /// actually delivered to the caller.
+    pub fn mark_chat_read_taint(&self, space: &Space, tainted: bool) {
+        if tainted || self.write_space.as_ref().is_some_and(|id| id != &space.id) {
+            self.taint.mark_external_read();
+        }
+    }
+    /// Full chat thread read authorization, enforcing Space membership, Personal
+    /// thread ownership, ChatAudience::Shared isolation, project pin and taint.
+    pub fn authorize_chat_thread_read(
+        &self,
+        space: &Space,
+        kind: crate::ports::ChatThreadKind,
+        owner: &PrincipalId,
+        project: Option<&FolderId>,
+        tainted: bool,
+    ) -> DomainResult<()> {
+        self.can_view_chat_thread(space, kind, owner, project, tainted)?;
+        self.mark_chat_read_taint(space, tainted);
         Ok(())
     }
     /// Chat provenance is separate from document classes. Project-scoped grants

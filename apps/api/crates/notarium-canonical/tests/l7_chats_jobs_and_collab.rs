@@ -4,6 +4,8 @@
 mod authority;
 #[path = "l7_chats_jobs_and_collab/pg_read_cancellation.rs"]
 mod pg_read_cancellation;
+#[path = "l7_chats_jobs_and_collab/projection_refs.rs"]
+mod projection_refs;
 #[path = "l7_chats_jobs_and_collab/retirement.rs"]
 mod retirement;
 mod support;

@@ -1159,6 +1159,165 @@ impl S3Transport for StalledStartupMarker {
 }
 
 #[tokio::test]
+async fn detached_sqlite_startup_retires_an_interrupted_current_epoch_upload() {
+    let fixtures = StorageTestFixtures::load_required();
+    let root = TempDataRoot::new("detached-startup-discard");
+    let mut config = CanonicalConfig::local_default(sample_installation_id(0xea), root.data_root());
+    let bucket = fixtures.fresh_s3_bucket("detached-discard");
+    let s3 = fixtures.s3_config(&bucket, S3BucketModePolicy::DetectFromBucket);
+    admin_ensure_bucket(&s3, Some("Enabled")).await.unwrap();
+    let audit = Arc::new(QueueS3Audit::new(&s3));
+    config.blobs = notarium_canonical::BlobBackendConfig::S3(Box::new(s3));
+    let (store, runtime) =
+        CanonicalRuntime::open_with_s3_transport(config.clone(), Some(audit.clone()))
+            .await
+            .unwrap();
+    let (scope, actor, thread) = create_thread(&store, 0xea).await;
+    let ctx = owner_ctx(&scope, actor.clone());
+    let note = sample_note_id(0xea);
+    store
+        .create_note(
+            ctx.clone(),
+            next_mutation(
+                &scope,
+                &actor,
+                CreateNote {
+                    note: note.clone(),
+                    parent: None,
+                    slug: "pending-purge".into(),
+                    class: DocClass::UserDoc,
+                    carrier: "# Pending purge".into(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let body = "current-epoch private queue upload ".repeat(32);
+    let prepared = store.prepare_blob(body.as_bytes()).unwrap();
+    let (reached, uploaded) = tokio::sync::oneshot::channel();
+    let (release, resume) = tokio::sync::oneshot::channel();
+    *audit.takeover.lock().unwrap() = Some(PausedQueuePut {
+        hash: blake3::hash(&prepared.s3_parts()[0].compressed),
+        uploaded: true,
+        reached,
+        resume,
+    });
+    let mut upload = store.queue_chat_input(
+        ctx.clone(),
+        next_mutation(
+            &scope,
+            &actor,
+            PendingChatInput {
+                id: PendingInputId::from_bytes([0xea; 16]),
+                thread,
+                sender: actor.clone(),
+                body,
+                queued_base_leaf: ThreadEntrySeq::ZERO,
+                in_flight_run: sample_run_id(0xea),
+                mentions_agent: false,
+            },
+        ),
+    );
+    let (key, version) = tokio::select! {
+        result = &mut upload => panic!("expected PUT to be held before interning the upload: {result:?}"),
+        observed = tokio::time::timeout(Duration::from_secs(10), uploaded) => observed.unwrap().unwrap(),
+    };
+    let version = version.expect("versioned PUT");
+    drop(
+        store
+            .prepare_projection_visibility_cleanup(
+                &support::maintenance_ctx(ServicePurpose::Projection),
+                "eaeaeaeaeaeaeaeaeaeaeaeaeaeaeaea",
+            )
+            .await
+            .unwrap(),
+    );
+    store
+        .delete_note(
+            ctx,
+            next_mutation(
+                &scope,
+                &actor,
+                DeleteNote {
+                    note,
+                    disposition: DeleteDisposition::Purge,
+                },
+            ),
+        )
+        .await
+        .unwrap_err();
+    const PENDING_PURGE: &str = "SELECT COUNT(*) FROM pending_purges WHERE phase='sql_erased'";
+    assert_eq!(
+        store
+            .execute_diagnostic_read_sql_for_test(None, PENDING_PURGE)
+            .await
+            .unwrap(),
+        1
+    );
+
+    let epoch = LeaseEpoch::new(1).unwrap();
+    store
+        .advance_space_lease(
+            &support::maintenance_ctx(ServicePurpose::Revocation),
+            &scope,
+            epoch,
+        )
+        .await
+        .unwrap();
+    let get = |version: Option<String>| S3RawRequest {
+        method: http::Method::GET,
+        key: Some(key.clone()),
+        query: version
+            .into_iter()
+            .map(|v| ("versionId".into(), v))
+            .collect(),
+        headers: vec![],
+        body: bytes::Bytes::new(),
+    };
+    assert_eq!(
+        audit
+            .origin
+            .send(get(Some(version.clone())))
+            .await
+            .unwrap()
+            .body
+            .as_ref(),
+        prepared.s3_parts()[0].compressed.as_ref()
+    );
+    // Drop the interrupted caller after shutdown has stopped its retirement workers.
+    // The new owner must recover the durable discard.
+    runtime.shutdown().await.unwrap();
+    drop(upload);
+    assert!(release.send(()).is_err());
+    drop(store);
+
+    let (reopened, runtime) = CanonicalRuntime::open(config).await.unwrap();
+    assert_eq!(
+        reopened
+            .read_space(&scope.space_id)
+            .await
+            .unwrap()
+            .active_epoch,
+        epoch
+    );
+    assert_eq!(
+        reopened
+            .execute_diagnostic_read_sql_for_test(None, PENDING_PURGE)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        audit.origin.send(get(Some(version))).await.unwrap().status,
+        404
+    );
+    let latest = audit.origin.send(get(None)).await.unwrap();
+    assert_eq!(latest.status, 200);
+    assert!(TerminalMarkerMeta::is_terminal_marker(&latest.body));
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn sqlite_startup_cancels_unpublished_work_when_open_is_dropped() {
     let fixtures = StorageTestFixtures::load_required();
     let tmp = TempDataRoot::new("drop-startup");

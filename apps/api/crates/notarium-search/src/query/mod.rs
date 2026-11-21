@@ -520,9 +520,7 @@ impl Eligible {
                 nodes
                     .iter()
                     .map(|index| {
-                        snapshot
-                            .note_id(DenseNodeId::new(cut.generation, index))
-                            .cloned()
+                        snapshot.note_id(DenseNodeId::new(cut.generation, index))
                     })
                     .collect::<Result<BTreeSet<_>, _>>()
             })

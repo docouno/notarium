@@ -18,6 +18,29 @@ impl ExactNumber {
             .map(Self)
             .ok_or_else(|| DomainError::validation(ValidationReason::InvalidNumber))
     }
+    /// Returns an equal `ExactNumber` with a canonical representation so that
+    /// equal values (`1`, `1.0`, `-0.0`, `0`) serialize identically.
+    pub fn canonicalize(&self) -> Self {
+        if let Some(u) = self.0.as_u64() {
+            return Self::from(u);
+        }
+        if let Some(i) = self.0.as_i64() {
+            return Self::from(i);
+        }
+        let f = self.0.as_f64().expect("ExactNumber is finite");
+        if f == 0.0 {
+            return Self::from(0u64);
+        }
+        if f.fract() == 0.0 {
+            if f > 0.0 && f < 18_446_744_073_709_551_616.0 {
+                return Self::from(f as u64);
+            }
+            if (-9_223_372_036_854_775_808.0..0.0).contains(&f) {
+                return Self::from(f as i64);
+            }
+        }
+        Self::from_f64(f).expect("ExactNumber is finite")
+    }
 }
 impl From<i64> for ExactNumber {
     fn from(value: i64) -> Self {
@@ -128,6 +151,9 @@ impl Date {
         )
         .map(Self)
         .map_err(|_| DomainError::validation(ValidationReason::InvalidDate))
+    }
+    pub fn ymd(self) -> (i32, u8, u8) {
+        (self.0.year(), self.0.month() as u8, self.0.day())
     }
 }
 impl TryFrom<String> for Date {

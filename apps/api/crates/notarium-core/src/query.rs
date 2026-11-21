@@ -126,12 +126,26 @@ pub struct FieldFilterAstV1 {
 }
 impl FieldFilterAstV1 {
     pub fn validate(&self, schema: &BTreeMap<String, FieldSchema>) -> DomainResult<()> {
+        self.validate_with_schema(schema, false)
+    }
+
+    /// Checks the expression and enforces types for every declared field.
+    /// Undeclared fields are evaluated against their observed values at read time.
+    pub fn validate_declared(&self, schema: &BTreeMap<String, FieldSchema>) -> DomainResult<()> {
+        self.validate_with_schema(schema, true)
+    }
+
+    fn validate_with_schema(
+        &self,
+        schema: &BTreeMap<String, FieldSchema>,
+        allow_undeclared: bool,
+    ) -> DomainResult<()> {
         if self.version != 1 {
             return Err(DomainError::validation(
                 ValidationReason::UnsupportedQueryVersion,
             ));
         }
-        self.predicate.validate(schema, 0, &mut 0)
+        self.predicate.validate(schema, allow_undeclared, 0, &mut 0)
     }
     pub fn matches(
         &self,
@@ -146,6 +160,7 @@ impl Predicate {
     fn validate(
         &self,
         schema: &BTreeMap<String, FieldSchema>,
+        allow_undeclared: bool,
         depth: usize,
         count: &mut usize,
     ) -> DomainResult<()> {
@@ -154,52 +169,75 @@ impl Predicate {
             return Err(DomainError::validation(ValidationReason::InvalidQuery));
         }
         let invalid = || DomainError::validation(ValidationReason::InvalidQuery);
-        let field = |key: &str| schema.get(key).ok_or_else(invalid);
+        let check_field = |key: &str, compatible: Option<bool>| {
+            if key.is_empty() || key == "__proto__" {
+                return Err(invalid());
+            }
+            compatible
+                .unwrap_or(allow_undeclared)
+                .then_some(())
+                .ok_or_else(invalid)
+        };
         match self {
             Self::All(items) | Self::Any(items) => {
                 for item in items {
-                    item.validate(schema, depth + 1, count)?;
+                    item.validate(schema, allow_undeclared, depth + 1, count)?;
                 }
             }
-            Self::Not(item) => item.validate(schema, depth + 1, count)?,
+            Self::Not(item) => item.validate(schema, allow_undeclared, depth + 1, count)?,
             Self::Eq { key, value } => {
-                let f = field(key)?;
-                if !matches!(f.kind,FieldType::Scalar(t) if t.accepts(value) || (f.nullable && *value==ScalarValue::Null))
-                {
-                    return Err(invalid());
-                }
+                check_field(
+                    key,
+                    schema.get(key).map(|f| {
+                        matches!(f.kind, FieldType::Scalar(t) if t.accepts(value) || (f.nullable && *value == ScalarValue::Null))
+                    }),
+                )?;
             }
             Self::Contains { key, value } => {
-                let f = field(key)?;
-                if !matches!(f.kind,FieldType::List(t) if t.accepts(value)) {
+                if *value == ScalarValue::Null {
                     return Err(invalid());
                 }
+                check_field(
+                    key,
+                    schema
+                        .get(key)
+                        .map(|f| matches!(f.kind, FieldType::List(t) if t.accepts(value))),
+                )?;
             }
             Self::NumberRange { key, range } => {
-                if field(key)?.kind != FieldType::Scalar(ScalarType::Number) {
-                    return Err(invalid());
-                }
+                check_field(
+                    key,
+                    schema
+                        .get(key)
+                        .map(|f| f.kind == FieldType::Scalar(ScalarType::Number)),
+                )?;
                 range.validate()?;
             }
             Self::DateRange { key, range } => {
-                if field(key)?.kind != FieldType::Scalar(ScalarType::Date) {
-                    return Err(invalid());
-                }
+                check_field(
+                    key,
+                    schema
+                        .get(key)
+                        .map(|f| f.kind == FieldType::Scalar(ScalarType::Date)),
+                )?;
                 range.validate()?;
             }
             Self::TimestampRange { key, range } => {
-                if field(key)?.kind != FieldType::Scalar(ScalarType::Timestamp) {
-                    return Err(invalid());
-                }
+                check_field(
+                    key,
+                    schema
+                        .get(key)
+                        .map(|f| f.kind == FieldType::Scalar(ScalarType::Timestamp)),
+                )?;
                 range.validate()?;
             }
             Self::Exists { key } | Self::IsBad { key } | Self::IsAbsent { key } => {
-                field(key)?;
+                check_field(key, schema.get(key).map(|_| true))?;
             }
         }
         Ok(())
     }
-    /// Evaluate a predicate already validated against the snapshot's field schema.
+    /// Evaluates a validated predicate against a row's observable metadata.
     pub fn matches(&self, fields: &BTreeMap<String, FieldObservation<FieldValue>>) -> bool {
         let observed = |key: &String| fields.get(key).unwrap_or(&FieldObservation::Absent);
         match self {
@@ -287,10 +325,16 @@ impl SortSpec {
         left: &SortTuple<I>,
         right: &SortTuple<I>,
     ) -> DomainResult<Ordering> {
-        if left.cells.len() != self.0.len() || right.cells.len() != self.0.len() {
+        self.compare_cells(&left.cells, &right.cells)
+            .map(|order| order.then_with(|| left.entity_id.cmp(&right.entity_id)))
+    }
+
+    /// Compares the sort columns before applying an owner's stable identity tie-breaker.
+    pub fn compare_cells(&self, left: &[SortCell], right: &[SortCell]) -> DomainResult<Ordering> {
+        if left.len() != self.0.len() || right.len() != self.0.len() {
             return Err(DomainError::validation(ValidationReason::InvalidQuery));
         }
-        for ((a, b), key) in left.cells.iter().zip(&right.cells).zip(&self.0) {
+        for ((a, b), key) in left.iter().zip(right).zip(&self.0) {
             let a = normalize_cell(a, key);
             let b = normalize_cell(b, key);
             let category = |c: &SortCell| match c {
@@ -313,7 +357,7 @@ impl SortSpec {
                 }
             }
         }
-        Ok(left.entity_id.cmp(&right.entity_id))
+        Ok(Ordering::Equal)
     }
 }
 impl Default for SortSpec {

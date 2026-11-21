@@ -171,10 +171,11 @@ impl StructuralSnapshot for View {
             .map(|offset| DenseNodeId::new(self.cut.generation, offset as u32))
     }
 
-    fn note_id(&self, node: DenseNodeId) -> DomainResult<&NoteId> {
+    fn note_id(&self, node: DenseNodeId) -> DomainResult<NoteId> {
         self.rows
             .get(node.index(self.cut.generation)? as usize)
             .map(|(note, _)| note)
+            .cloned()
             .ok_or(DomainError::ResourceNotFound)
     }
 

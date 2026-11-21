@@ -1,0 +1,836 @@
+use std::sync::Arc;
+
+use notarium_canonical::{ProjectionErasures, ProjectionVisibilityCleanup};
+use notarium_core::{error::CommitEffect, ports::BackupParticipantPort, receipt::ChangeCursor};
+use sqlx::PgPool;
+
+use super::*;
+use crate::{
+    PostgresProjectionCache,
+    derived::{GenerationControl, GenerationDescriptor},
+    index::IndexNote,
+    runtime::erasure::Eraser,
+};
+
+async fn ddl(pool: &PgPool, command: String) {
+    sqlx::query(sqlx::AssertSqlSafe(command))
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+fn purge(ctx: &SpaceContext, note: &NoteId) -> Mutation<DeleteNote> {
+    Mutation {
+        identity: command_identity(ctx),
+        preconditions: Preconditions::default(),
+        input: DeleteNote {
+            note: note.clone(),
+            disposition: DeleteDisposition::Purge,
+        },
+    }
+}
+
+async fn expect_unconfirmed(
+    canonical: &CanonicalStore,
+    ctx: &SpaceContext,
+    mutation: &Mutation<DeleteNote>,
+) {
+    let error = canonical
+        .delete_note(ctx.clone(), mutation.clone())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, PortError::Internal(f) | PortError::Unavailable(f)
+            if f.effect() == CommitEffect::Unknown),
+        "{error:?}"
+    );
+}
+
+async fn restore(canonical: &CanonicalStore, ctx: &SpaceContext) -> SpaceContext {
+    let scope = HistoryScope {
+        space_id: ctx.scope().space_id.clone(),
+        incarnation: HistoryIncarnation::from_bytes(entropy()),
+    };
+    let after = canonical
+        .read_space(&scope.space_id)
+        .await
+        .unwrap()
+        .last_seq;
+    canonical
+        .restore_cursors(
+            MaintenanceContext {
+                authority: ServiceAuthority::admit(ServicePurpose::Restore),
+                budget: budget(),
+            },
+            vec![ChangeCursor {
+                scope: scope.clone(),
+                after,
+            }],
+        )
+        .await
+        .unwrap();
+    SpaceContext::new(ctx.auth().clone(), scope, budget()).unwrap()
+}
+
+async fn floor(pool: &PgPool, schema: &str, scope: &HistoryScope) -> (Vec<u8>, i64) {
+    let sql = format!(
+        "SELECT history_incarnation, minimum_checkpoint_seq FROM {schema}.projection_space_guard WHERE space_id=$1"
+    );
+    sqlx::query_as(sqlx::AssertSqlSafe(sql))
+        .bind(scope.space_id.as_str())
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn detached_postgres_purge_retries_missing_and_reset_generations() {
+    let scratch = Scratch::new();
+    let root = scratch.root();
+    let (config, pool, canonical_schema, prefix) = postgres_fixture(&root).await;
+    let (canonical, writer) = CanonicalRuntime::open(config.clone()).await.unwrap();
+    let ctx = owner(&canonical).await;
+    let neighbor = owner(&canonical).await;
+    let victim = create(&canonical, &ctx, "victim", "purged".into()).await;
+    let unrelated = create(&canonical, &neighbor, "neighbor", "another space".into()).await;
+    let initial = ProjectionGeneration::new(GENERATION).unwrap();
+    let next = initial.checked_next().unwrap();
+    let g1 = format!("{prefix}_g1");
+    let g2 = format!("{prefix}_g2");
+    let derived = DerivedStore::open_postgres(pool.clone(), &prefix, initial)
+        .await
+        .unwrap();
+    let projector = start(&canonical, &derived, &root).await;
+    let engine = projector.engine();
+    let scope = ctx.scope();
+    let old_scope = scope.clone();
+    let old_pool = engine.pool.clone();
+    let seq = victim.receipt.seq();
+    engine
+        .wait_for_projected(scope, seq, &budget())
+        .await
+        .unwrap();
+    engine
+        .wait_for_projected(neighbor.scope(), unrelated.receipt.seq(), &budget())
+        .await
+        .unwrap();
+    let active_file = find_checkpoint_file(&root, initial, &scope.space_id, seq).unwrap();
+    assert!(active_file.is_file());
+    let candidate_file = root.space_fast_index(next, &scope.space_id, seq);
+
+    let control = GenerationControl::open_postgres(pool.clone(), &prefix)
+        .await
+        .unwrap();
+    let active = control.active().await.unwrap().unwrap();
+    let candidate = GenerationDescriptor {
+        generation: next,
+        publication_epoch: active.publication_epoch + 1,
+        cut_fingerprint: active.cut_fingerprint,
+    };
+    let eraser = Arc::new(Eraser::new(&engine).unwrap());
+    let (header, parent, lifecycle) = {
+        let cut = engine.published_cut(scope).unwrap();
+        let index = engine.open_index(&cut).unwrap();
+        let header = index
+            .note_header(index.dense_id(&victim.value.note).unwrap())
+            .unwrap();
+        let dense = header.parent_dense_folder_id;
+        let parent = FolderId::parse(index.folder_id_str(dense).unwrap()).unwrap();
+        (header, parent, index.folder_lifecycle(dense).unwrap())
+    };
+    drop(engine);
+    projector.shutdown().await.unwrap();
+    drop(derived);
+
+    assert!(
+        control
+            .reserve_candidate(Some(&active), &candidate)
+            .await
+            .unwrap()
+    );
+    drop(
+        DerivedStore::open_postgres(pool.clone(), &prefix, next)
+            .await
+            .unwrap(),
+    );
+    let publish_candidate = |seq| {
+        let mut builder = FastIndexBuilder::default();
+        builder
+            .add_folder(header.parent_dense_folder_id, &parent, lifecycle)
+            .unwrap();
+        builder
+            .add_note(IndexNote {
+                dense: 0,
+                id: &victim.value.note,
+                header,
+                ancestors: &[header.parent_dense_folder_id],
+                trashed_ancestor: false,
+                fields: &Default::default(),
+                tags: &[],
+                ability: None,
+            })
+            .unwrap();
+        let identity = IndexIdentity {
+            generation: next,
+            scope: scope.clone(),
+            seq,
+        };
+        let path = root.space_fast_index(next, &scope.space_id, seq);
+        drop(builder.publish(&path, identity).unwrap());
+        path
+    };
+    publish_candidate(seq);
+    let above_floor = publish_candidate(SpaceSeq::new(seq.get() + 100).unwrap());
+    let temporary = above_floor.with_file_name(".fast-index-0123456789abcdef0123456789abcdef.tmp");
+    std::fs::copy(&above_floor, &temporary).unwrap();
+
+    // Stop at the durable boundary between a real candidate reset and its initializer.
+    ddl(
+        &pool,
+        format!("UPDATE {g2}.derived_schema_meta SET mmap_format_ver = 0"),
+    )
+    .await;
+    control
+        .reset_obsolete_postgres_candidate(&active, &candidate)
+        .await
+        .unwrap();
+    let (namespace, tables): (bool, bool) =
+        sqlx::query_as("SELECT to_regnamespace($1) IS NOT NULL, to_regclass($2) IS NOT NULL")
+            .bind(&g2)
+            .bind(format!("{g2}.derived_schema_meta"))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(namespace && !tables);
+    assert_eq!(
+        control.candidate().await.unwrap().as_ref(),
+        Some(&candidate)
+    );
+    canonical
+        .delete_note(neighbor.clone(), purge(&neighbor, &unrelated.value.note))
+        .await
+        .unwrap();
+
+    // Restore retains the victim and its identifier in the replacement history.
+    let ctx = restore(&canonical, &ctx).await;
+    let scope = ctx.scope();
+    // The stopped projector left its H1 admission behind. Rebind the canonical
+    // owner in H2 before handing this epoch to the reopened writer.
+    canonical
+        .admit_projection_space(&projection_context(), scope)
+        .await
+        .unwrap();
+    // The active namespace can also be absent from the SQL inventory.
+    ddl(&pool, format!("DROP SCHEMA {g1} CASCADE")).await;
+    let mutation = purge(&ctx, &victim.value.note);
+    expect_unconfirmed(&canonical, &ctx, &mutation).await;
+    assert!(active_file.is_file() && candidate_file.is_file() && above_floor.is_file());
+    let committed = canonical
+        .read_space(&scope.space_id)
+        .await
+        .unwrap()
+        .last_seq;
+    assert!(committed > seq);
+
+    drop(
+        DerivedStore::open_postgres(pool.clone(), &prefix, initial)
+            .await
+            .unwrap(),
+    );
+    expect_unconfirmed(&canonical, &ctx, &mutation).await;
+    assert!(!active_file.exists() && candidate_file.is_file());
+
+    let clean_file = root.space_fast_index(next, &scope.space_id, committed);
+    let stale = FastIndexBuilder::default()
+        .publish(
+            &clean_file,
+            IndexIdentity {
+                generation: next,
+                scope: old_scope,
+                seq: committed,
+            },
+        )
+        .unwrap()
+        .0;
+    stale.register_for_erasure(&old_pool);
+    // Restore may reuse this immutable name before an old lease is revoked.
+    BaseIndexHandle::discard_unleased(&clean_file).unwrap();
+    let identity = IndexIdentity {
+        generation: next,
+        scope: scope.clone(),
+        seq: committed,
+    };
+    drop(
+        FastIndexBuilder::default()
+            .publish(&clean_file, identity)
+            .unwrap(),
+    );
+    let foreign = candidate_file.with_file_name(".fast-index-1123456789abcdef0123456789abcdef.tmp");
+    let identity = IndexIdentity {
+        generation: next,
+        scope: neighbor.scope().clone(),
+        seq,
+    };
+    let neighbor_file = root.space_fast_index(next, &neighbor.scope().space_id, seq);
+    drop(
+        FastIndexBuilder::default()
+            .publish(&neighbor_file, identity)
+            .unwrap(),
+    );
+    std::fs::copy(&neighbor_file, &foreign).unwrap();
+    // Reopen canonical to discard in-memory debt and retry from the receipt.
+    let revocation = MaintenanceContext {
+        authority: ServiceAuthority::admit(ServicePurpose::Revocation),
+        budget: budget(),
+    };
+    canonical
+        .drain_projection_owner(&revocation, scope)
+        .await
+        .unwrap();
+    writer.shutdown().await.unwrap();
+    drop(canonical);
+    let (canonical, writer) = CanonicalRuntime::open(config).await.unwrap();
+    let epoch = canonical
+        .read_space(&scope.space_id)
+        .await
+        .unwrap()
+        .active_epoch;
+    canonical
+        .advance_space_lease(&revocation, scope, epoch.checked_next().unwrap())
+        .await
+        .unwrap();
+    canonical
+        .set_projection_visibility_cleanup(&projection_context(), eraser.clone())
+        .unwrap();
+    ddl(&pool, format!("DROP SCHEMA {g2}")).await;
+    // A complete old-history temporary image alone must keep a missing SQL
+    // namespace unconfirmed, even above this purge's sequence.
+    BaseIndexHandle::discard_unleased(&candidate_file).unwrap();
+    BaseIndexHandle::discard_unleased(&above_floor).unwrap();
+    expect_unconfirmed(&canonical, &ctx, &mutation).await;
+    assert!(temporary.is_file());
+
+    // Reinitialization can persist the new guard before receipt replay. Its
+    // exact history cannot identify the abandoned images of the previous one.
+    DerivedStore::open_postgres(pool.clone(), &prefix, next)
+        .await
+        .unwrap()
+        .register_scope(scope)
+        .await
+        .unwrap();
+    publish_candidate(SpaceSeq::new(seq.get() + 100).unwrap());
+    let replay = canonical.delete_note(ctx.clone(), mutation).await.unwrap();
+    assert_eq!(replay.receipt.seq(), committed);
+    assert!(!temporary.exists() && !above_floor.exists());
+    assert!(stale.open(&old_pool).is_err());
+    drop(stale);
+    assert!(clean_file.is_file() && foreign.is_file() && neighbor_file.is_file());
+    assert_eq!(
+        floor(&pool, &g2, scope).await,
+        (
+            scope.incarnation.as_bytes().to_vec(),
+            committed.get() as i64
+        )
+    );
+    assert_eq!(
+        canonical
+            .read_space(&scope.space_id)
+            .await
+            .unwrap()
+            .last_seq,
+        committed
+    );
+
+    // Deliver the old callback after another real restore and a new admission.
+    let latest = restore(&canonical, &ctx).await;
+    let derived = DerivedStore::open_postgres(pool.clone(), &prefix, initial)
+        .await
+        .unwrap();
+    let projector = start(&canonical, &derived, &root).await;
+    let engine = projector.engine();
+    engine
+        .wait_for_projected(latest.scope(), committed, &budget())
+        .await
+        .unwrap();
+    let path = find_checkpoint_file(&root, initial, &scope.space_id, committed).unwrap();
+    assert!(path.is_file());
+    let before = floor(&pool, &g1, latest.scope()).await;
+    assert_eq!(before.0, latest.scope().incarnation.as_bytes().to_vec());
+    eraser
+        .erase_visibility(
+            &canonical,
+            &ProjectionErasures {
+                scope: scope.clone(),
+                through: committed,
+                purged: vec![victim.value.note.clone()],
+                redacted: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(path.is_file());
+    assert_eq!(floor(&pool, &g1, latest.scope()).await, before);
+    projector.shutdown().await.unwrap();
+    drop(engine);
+    drop(derived);
+    writer.shutdown().await.unwrap();
+    for schema in [canonical_schema, g1, g2, format!("{prefix}_ctrl")] {
+        ddl(&pool, format!("DROP SCHEMA IF EXISTS {schema} CASCADE")).await;
+    }
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn postgres_writer_takeover_requires_registered_eraser_after_reopen() {
+    let scratch = Scratch::new();
+    let root = scratch.root();
+    let successor_scratch = Scratch::new();
+    let successor_root = successor_scratch.root();
+    let (config, pool, canonical_schema, prefix) = postgres_fixture(&root).await;
+    let mut successor_config = config.clone();
+    successor_config.blobs = BlobBackendConfig::Local {
+        data_root: successor_root.clone(),
+    };
+    let (original, writer) = CanonicalRuntime::open(config).await.unwrap();
+    // This process has already booted before the first projector registers.
+    let (successor, next_writer) = CanonicalRuntime::open(successor_config.clone())
+        .await
+        .unwrap();
+    let ctx = owner(&original).await;
+    let scope = ctx.scope();
+    let control = create(&original, &ctx, "canonical-only", "control".into()).await;
+    original
+        .delete_note(ctx.clone(), purge(&ctx, &control.value.note))
+        .await
+        .unwrap();
+    let victim = create(&original, &ctx, "victim", "private".into()).await;
+    let request = purge(&ctx, &victim.value.note);
+    let initial = ProjectionGeneration::new(GENERATION).unwrap();
+    let local = PostgresProjectionCache::provision(root.clone())
+        .await
+        .unwrap();
+    let start = async |canonical: &CanonicalStore, schema_prefix: &str| {
+        ProjectorRuntime::start_postgres(
+            canonical.clone(),
+            projection_context(),
+            pool.clone(),
+            schema_prefix,
+            local.clone(),
+            initial,
+            ProjectionConfig::default(),
+        )
+        .await
+    };
+    let runtime = start(&original, &prefix).await.unwrap();
+    runtime
+        .engine()
+        .wait_for_projected(scope, victim.receipt.seq(), &budget())
+        .await
+        .unwrap();
+    let cached = async || {
+        sqlx::query_scalar::<_, bool>(sqlx::AssertSqlSafe(format!(
+            "SELECT EXISTS (SELECT 1 FROM {prefix}_g1.projected_notes WHERE space_id=$1 AND note_id=$2)"
+        ))).bind(scope.space_id.as_str()).bind(victim.value.note.as_str()).fetch_one(&pool).await.unwrap()
+    };
+    let file = find_checkpoint_file(&root, initial, &scope.space_id, victim.receipt.seq()).unwrap();
+    assert!(file.is_file() && cached().await);
+    runtime.shutdown().await.unwrap();
+    let revocation = MaintenanceContext {
+        authority: ServiceAuthority::admit(ServicePurpose::Revocation),
+        budget: budget(),
+    };
+    original
+        .drain_projection_owner(&revocation, scope)
+        .await
+        .unwrap();
+    writer.shutdown().await.unwrap();
+    drop(original);
+
+    // The PG fixture gives each process an exclusively owned local CAS.
+    // Hand off the Space's carriers with its writer authority.
+    let space_blobs = Path::new("blobs").join(scope.space_id.as_str());
+    std::fs::rename(
+        root.root().join(&space_blobs),
+        successor_root.root().join(space_blobs),
+    )
+    .unwrap();
+    successor
+        .advance_space_lease(&revocation, scope, LeaseEpoch::new(2).unwrap())
+        .await
+        .unwrap();
+    expect_unconfirmed(&successor, &ctx, &request).await;
+    let committed = successor
+        .read_space(&scope.space_id)
+        .await
+        .unwrap()
+        .last_seq;
+    assert!(committed > victim.receipt.seq());
+    assert!(file.is_file() && cached().await);
+    next_writer.shutdown().await.unwrap();
+    drop(successor);
+
+    // An idempotent replay on a fresh writer has no in-memory cleanup debt.
+    let (successor, next_writer) = CanonicalRuntime::open(successor_config).await.unwrap();
+    successor
+        .advance_space_lease(&revocation, scope, LeaseEpoch::new(3).unwrap())
+        .await
+        .unwrap();
+    expect_unconfirmed(&successor, &ctx, &request).await;
+    assert!(file.is_file() && cached().await);
+    let other_prefix = format!("{prefix}_other");
+    assert!(start(&successor, &other_prefix).await.is_err());
+    expect_unconfirmed(&successor, &ctx, &request).await;
+    assert!(file.is_file() && cached().await);
+
+    let runtime = start(&successor, &prefix).await.unwrap();
+    let replay = successor.delete_note(ctx.clone(), request).await.unwrap();
+    assert_eq!(replay.receipt.seq(), committed);
+    assert!(!file.exists() && !cached().await);
+    runtime.shutdown().await.unwrap();
+    next_writer.shutdown().await.unwrap();
+    for schema in [
+        canonical_schema,
+        format!("{prefix}_g1"),
+        format!("{prefix}_ctrl"),
+        format!("{other_prefix}_g1"),
+        format!("{other_prefix}_ctrl"),
+    ] {
+        ddl(&pool, format!("DROP SCHEMA IF EXISTS {schema} CASCADE")).await;
+    }
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn offline_pg_cache_substitution_needs_exact_volume_to_finish_purge() {
+    let scratch = Scratch::new();
+    let root = scratch.root();
+    let projection = Scratch::new();
+    let cache = DataRoot::new(projection.0.join("mounted"));
+    let (config, pool, canonical_schema, prefix) = postgres_fixture(&root).await;
+    let (canonical, writer) = CanonicalRuntime::open(config).await.unwrap();
+    let ctx = owner(&canonical).await;
+    let victim = create(&canonical, &ctx, "offline-victim", "old-cache".into()).await;
+    let initial = ProjectionGeneration::new(GENERATION).unwrap();
+    let local = PostgresProjectionCache::provision(cache.clone())
+        .await
+        .unwrap();
+    let start = || {
+        ProjectorRuntime::start_postgres(
+            canonical.clone(),
+            projection_context(),
+            pool.clone(),
+            &prefix,
+            local.clone(),
+            initial,
+            ProjectionConfig::default(),
+        )
+    };
+    let projector = start().await.unwrap();
+    projector
+        .engine()
+        .wait_for_projected(ctx.scope(), victim.receipt.seq(), &budget())
+        .await
+        .unwrap();
+    projector.shutdown().await.unwrap();
+    let file =
+        find_checkpoint_file(&cache, initial, &ctx.scope().space_id, victim.receipt.seq()).unwrap();
+    assert!(file.is_file());
+    let detached = projection.0.join("previous");
+    let previous_file = detached.join(file.strip_prefix(cache.root()).unwrap());
+    std::fs::rename(cache.root(), &detached).unwrap();
+    std::fs::create_dir_all(cache.root().join("v1")).unwrap();
+    assert!(start().await.is_err());
+    let request = purge(&ctx, &victim.value.note);
+    expect_unconfirmed(&canonical, &ctx, &request).await;
+    assert!(previous_file.is_file());
+    assert!(!cache.root().join("v1/projection_cache_id").exists());
+    std::fs::remove_dir_all(cache.root()).unwrap();
+    std::fs::rename(&detached, cache.root()).unwrap();
+
+    // Remounting just v1 can preserve the root directory's file identity.
+    // A reused lease must check its immutable marker without minting another.
+    let marker = cache.root().join("v1/projection_cache_id");
+    let original_id = std::fs::read(&marker).unwrap();
+    std::fs::remove_file(&marker).unwrap();
+    assert!(start().await.is_err() && !marker.exists());
+    let mut other_id = original_id.clone();
+    other_id[0] = if other_id[0] == b'0' { b'1' } else { b'0' };
+    std::fs::write(&marker, other_id).unwrap();
+    assert!(start().await.is_err());
+    expect_unconfirmed(&canonical, &ctx, &request).await;
+    std::fs::write(&marker, original_id).unwrap();
+
+    // G1 is still accessible by name while the original control is offline.
+    let control = format!("{prefix}_ctrl");
+    let offline_control = format!("{prefix}_offline_ctrl");
+    ddl(
+        &pool,
+        format!("ALTER SCHEMA {control} RENAME TO {offline_control}"),
+    )
+    .await;
+    expect_unconfirmed(&canonical, &ctx, &request).await;
+    drop(
+        GenerationControl::open_postgres(pool.clone(), &prefix)
+            .await
+            .unwrap(),
+    );
+    expect_unconfirmed(&canonical, &ctx, &request).await;
+    let row = async || {
+        sqlx::query_scalar::<_, bool>(sqlx::AssertSqlSafe(format!(
+            "SELECT EXISTS (SELECT 1 FROM {prefix}_g1.projected_notes WHERE note_id=$1)"
+        )))
+        .bind(victim.value.note.as_str())
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+    };
+    assert!(file.is_file() && row().await);
+    ddl(&pool, format!("DROP SCHEMA {control} CASCADE")).await;
+    ddl(
+        &pool,
+        format!("ALTER SCHEMA {offline_control} RENAME TO {control}"),
+    )
+    .await;
+    canonical.delete_note(ctx, request).await.unwrap();
+    assert!(!file.exists() && !row().await);
+    writer.shutdown().await.unwrap();
+    for name in [
+        canonical_schema,
+        format!("{prefix}_g1"),
+        format!("{prefix}_ctrl"),
+    ] {
+        ddl(&pool, format!("DROP SCHEMA IF EXISTS {name} CASCADE")).await;
+    }
+    pool.close().await;
+}
+
+async fn s3_blob_backend() -> BlobBackendConfig {
+    use notarium_canonical::{
+        S3AddressingStyle, S3BucketModePolicy, S3Config, S3Credentials,
+        blobs::s3::admin_ensure_bucket,
+    };
+    #[derive(Deserialize)]
+    struct S3Fixture {
+        s3_socket_container: PathBuf,
+        s3_socket_host: PathBuf,
+        s3_endpoint: String,
+        s3_region: String,
+        s3_access_key: String,
+        s3_secret_key: String,
+    }
+    let fixture: S3Fixture = storage_fixture();
+    let socket = [fixture.s3_socket_container, fixture.s3_socket_host]
+        .into_iter()
+        .find(|path| path.exists())
+        .unwrap();
+    let config = S3Config {
+        endpoint: fixture.s3_endpoint,
+        region: fixture.s3_region,
+        bucket: format!("notarium-projection-{}", hex::encode(&entropy()[..6])),
+        application_prefix: String::new(),
+        addressing: S3AddressingStyle::PathStyle,
+        credentials: S3Credentials {
+            access_key_id: fixture.s3_access_key,
+            secret_access_key: fixture.s3_secret_key,
+            session_token: None,
+        },
+        custom_ca_pem: None,
+        unix_socket: Some(socket),
+        bucket_mode_policy: S3BucketModePolicy::DetectFromBucket,
+        request_timeout: Duration::from_secs(10),
+    };
+    admin_ensure_bucket(&config, Some("Enabled")).await.unwrap();
+    BlobBackendConfig::S3(Box::new(config))
+}
+
+#[tokio::test]
+async fn pg_cold_restart_requires_configured_cache_before_confirming_purge() {
+    let storage = Scratch::new();
+    let cache = DataRoot::new(storage.0.join("mounted"));
+    let node_config = storage.0.join("node-cache-id");
+    let (mut config, pool, canonical_schema, prefix) = postgres_fixture(&cache).await;
+    config.blobs = s3_blob_backend().await;
+    let initial = ProjectionGeneration::new(GENERATION).unwrap();
+    let configured = PostgresProjectionCache::provision(cache.clone())
+        .await
+        .unwrap();
+    std::fs::write(&node_config, configured.expected_id).unwrap();
+    assert!(
+        PostgresProjectionCache::provision(cache.clone())
+            .await
+            .is_err()
+    );
+    let start = async |canonical: &CanonicalStore| {
+        ProjectorRuntime::start_postgres(
+            canonical.clone(),
+            projection_context(),
+            pool.clone(),
+            &prefix,
+            PostgresProjectionCache {
+                root: cache.clone(),
+                expected_id: std::fs::read_to_string(&node_config).unwrap(),
+            },
+            initial,
+            ProjectionConfig::default(),
+        )
+        .await
+    };
+    let revocation = MaintenanceContext {
+        authority: ServiceAuthority::admit(ServicePurpose::Revocation),
+        budget: budget(),
+    };
+    let (ctx, victim) = {
+        let (canonical, writer) = CanonicalRuntime::open(config.clone()).await.unwrap();
+        let ctx = owner(&canonical).await;
+        let victim = create(&canonical, &ctx, "victim", "private".into()).await;
+        let projector = start(&canonical).await.unwrap();
+        projector
+            .engine()
+            .wait_for_projected(ctx.scope(), victim.receipt.seq(), &budget())
+            .await
+            .unwrap();
+        projector.shutdown().await.unwrap();
+        canonical
+            .drain_projection_owner(&revocation, ctx.scope())
+            .await
+            .unwrap();
+        writer.shutdown().await.unwrap();
+        (ctx, victim)
+    };
+
+    let checkpoint =
+        find_checkpoint_file(&cache, initial, &ctx.scope().space_id, victim.receipt.seq()).unwrap();
+    let offline = storage.0.join("original");
+    let evidence = offline.join(checkpoint.strip_prefix(cache.root()).unwrap());
+    std::fs::rename(cache.root(), &offline).unwrap();
+    std::fs::create_dir(cache.root()).unwrap();
+    let (canonical, writer) = CanonicalRuntime::open(config).await.unwrap();
+    canonical
+        .advance_space_lease(&revocation, ctx.scope(), LeaseEpoch::new(2).unwrap())
+        .await
+        .unwrap();
+    let request = purge(&ctx, &victim.value.note);
+    assert!(start(&canonical).await.is_err());
+    expect_unconfirmed(&canonical, &ctx, &request).await;
+    let committed = canonical
+        .read_space(&ctx.scope().space_id)
+        .await
+        .unwrap()
+        .last_seq;
+    assert!(std::fs::read_dir(cache.root()).unwrap().next().is_none());
+    assert!(evidence.is_file());
+
+    // This is a valid, independently provisioned peer cache on the same mountpoint.
+    let foreign_root = DataRoot::new(storage.0.join("foreign"));
+    let foreign = PostgresProjectionCache::provision(foreign_root.clone())
+        .await
+        .unwrap();
+    std::fs::remove_dir(cache.root()).unwrap();
+    std::fs::rename(foreign_root.root(), cache.root()).unwrap();
+    assert!(start(&canonical).await.is_err());
+    expect_unconfirmed(&canonical, &ctx, &request).await;
+    assert_eq!(
+        std::fs::read_to_string(cache.root().join("v1/projection_cache_id")).unwrap(),
+        foreign.expected_id
+    );
+    let cached = async || {
+        let sql =
+            format!("SELECT EXISTS (SELECT 1 FROM {prefix}_g1.projected_notes WHERE note_id=$1)");
+        sqlx::query_scalar::<_, bool>(sqlx::AssertSqlSafe(sql))
+            .bind(victim.value.note.as_str())
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+    };
+    assert!(evidence.is_file() && cached().await);
+
+    std::fs::rename(cache.root(), foreign_root.root()).unwrap();
+    std::fs::rename(&offline, cache.root()).unwrap();
+    let projector = start(&canonical).await.unwrap();
+    let confirmed = canonical.delete_note(ctx, request).await.unwrap();
+    assert_eq!(confirmed.receipt.seq(), committed);
+    assert!(!checkpoint.exists() && !cached().await);
+    projector.shutdown().await.unwrap();
+    writer.shutdown().await.unwrap();
+    for schema in [
+        canonical_schema,
+        format!("{prefix}_g1"),
+        format!("{prefix}_ctrl"),
+    ] {
+        ddl(&pool, format!("DROP SCHEMA IF EXISTS {schema} CASCADE")).await;
+    }
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn pg_ephemeral_cache_and_single_runtime_guard_work_on_postgres() {
+    let storage = Scratch::new();
+    let cache = DataRoot::new(storage.0.join("ephemeral-cache"));
+    let (config, pool, canonical_schema, prefix) = postgres_fixture(&storage.root()).await;
+    let (canonical, writer) = CanonicalRuntime::open(config).await.unwrap();
+    let ctx = owner(&canonical).await;
+    let first_note = create(&canonical, &ctx, "ephemeral-one", "# Ephemeral 1\n".into()).await;
+    let initial = ProjectionGeneration::new(GENERATION).unwrap();
+
+    // Seed a stale leftover marker/file inside the ephemeral directory before boot.
+    let stale_file = cache.root().join("v1/stale-leftover.tmp");
+    std::fs::create_dir_all(stale_file.parent().unwrap()).unwrap();
+    std::fs::write(&stale_file, b"leftover").unwrap();
+
+    let start_ephemeral = || {
+        ProjectorRuntime::start_postgres_ephemeral(
+            canonical.clone(),
+            projection_context(),
+            pool.clone(),
+            &prefix,
+            cache.clone(),
+            initial,
+            ProjectionConfig::default(),
+        )
+    };
+    let runtime1 = start_ephemeral().await.unwrap();
+    assert!(
+        !stale_file.exists(),
+        "start_postgres_ephemeral must clear stale files on startup"
+    );
+    let engine1 = runtime1.engine();
+    engine1
+        .wait_for_projected(ctx.scope(), first_note.receipt.seq(), &budget())
+        .await
+        .unwrap();
+
+    // A second concurrent runtime in the same process on the same cache root must be rejected.
+    assert!(
+        start_ephemeral().await.is_err(),
+        "concurrent ProjectorRuntime on the same PostgreSQL cache root must be rejected"
+    );
+
+    // Hold a retained snapshot across runtime1 shutdown to prove sequential
+    // restart succeeds even while the old cache owner Arc is still pinned.
+    let retained = engine1
+        .acquire_snapshot(ctx.clone(), CausalBasis::Await(Default::default()))
+        .await
+        .unwrap();
+    assert!(retained.lookup(&first_note.value.note).is_some());
+    drop(engine1);
+    runtime1.shutdown().await.unwrap();
+
+    let second_note = create(&canonical, &ctx, "ephemeral-two", "# Ephemeral 2\n".into()).await;
+    let runtime2 = start_ephemeral().await.unwrap();
+    runtime2
+        .engine()
+        .wait_for_projected(ctx.scope(), second_note.receipt.seq(), &budget())
+        .await
+        .unwrap();
+    drop(retained);
+    runtime2.shutdown().await.unwrap();
+    writer.shutdown().await.unwrap();
+    for schema in [
+        canonical_schema,
+        format!("{prefix}_g1"),
+        format!("{prefix}_ctrl"),
+    ] {
+        ddl(&pool, format!("DROP SCHEMA IF EXISTS {schema} CASCADE")).await;
+    }
+    pool.close().await;
+}

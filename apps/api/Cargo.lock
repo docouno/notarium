@@ -436,6 +436,7 @@ dependencies = [
  "cfg-if",
  "constant_time_eq 0.4.2",
  "cpufeatures 0.3.1",
+ "rayon-core",
 ]
 
 [[package]]
@@ -1431,11 +1432,13 @@ dependencies = [
  "notarium-vault",
  "proptest",
  "rusqlite",
+ "rustix",
  "serde",
  "serde_json",
  "sqlx",
  "tokio",
  "toml 0.9.12+spec-1.1.0",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -3006,11 +3009,26 @@ name = "notarium-projections"
 version = "1.0.0-dev.0"
 dependencies = [
  "arc-swap",
+ "blake3",
  "croaring",
+ "getrandom 0.4.3",
+ "hex",
  "memmap2",
  "notarium-canonical",
  "notarium-core",
+ "notarium-projections",
  "notarium-syntax",
+ "proptest",
+ "rmp-serde",
+ "rusqlite",
+ "rustix",
+ "same-file",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

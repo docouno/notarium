@@ -18,11 +18,12 @@ The core, syntax, canonical and control libraries implement [domain contracts](c
 authority/egress checks, typed ports, history-scoped receipts, exact comparisons,
 byte-preserving edits, SQLite/PostgreSQL control storage, authentication, OAuth/OIDC,
 the native keyring, guarded outbound HTTP, the AI provider gateway and the
-[control backup participant](control-backup.md). [Canonical storage](storage.md) provides SQLite and PostgreSQL persistence, CAS,
-chat history and a backup participant. The [search engine](search.md) subscribes
-to canonical changes independently and consumes the structural projection port.
-Application composition provides the projection and embedding adapters. The
-current HTTP and MCP transport work remains separate.
+[control backup participant](control-backup.md). [Canonical storage](storage.md)
+provides SQLite and PostgreSQL persistence, CAS, chat history and a backup
+participant. [Structural projections](projections.md) consume canonical
+commands to provide structural snapshots, note lists, declarative note views
+and graph reads. The [search engine](search.md) subscribes independently
+to canonical changes and consumes the structural read port.
 
 ## Internal dependency allowlist
 
@@ -62,10 +63,14 @@ locked for offline setup. `Cargo.lock` must contain none of `openssl-sys`,
 
 TLS uses rustls 0.23 with ring, reqwest 0.13 with `rustls-no-provider`, and tonic
 0.14 with `tls-ring`. Dependencies build in the pinned Rust image without adding
-C++/OpenSSL tools. Core/syntax tests exercise domain and document behavior;
-Canonical tests exercise dual-dialect storage and CAS. Control storage tests its SQL schema, target import/export, authentication,
-Space authority and crash recovery. Search tests exercise lexical analysis, pure-Rust CSR-HNSW and SIMD kernels (with `unsafe` quarantined to `src/vector/mmap_segment.rs` and `src/vector/simd.rs`), pure-Rust tokenizers and dynamic ONNX loading, dual-dialect causal alignment and physical erasure, plus an offline 100k/400k scale gate. Remaining per-crate scaffold tests are compile
-smoke checks.
+C++/OpenSSL tools. Core and syntax tests exercise domain and document behavior.
+Canonical tests exercise dual-dialect storage and CAS. Control storage tests its
+SQL schema, target import/export, authentication, Space authority and crash
+recovery. Projection tests include the trusted mmap loader and both SQL
+fixtures. The loader is the projection crate's sole narrow unsafe-code scope.
+Search tests exercise lexical analysis, CSR-HNSW, SIMD, dynamic ONNX loading,
+causal alignment and physical erasure. An offline scale gate uses 100,000 notes
+and 400,000 chunks. Search confines unsafe code to the mmap and SIMD modules.
 
 `notarium-control` owns a 45-table baseline in SQLite and the PostgreSQL
 `v1_control` schema. Its typed target records support offline import and paged

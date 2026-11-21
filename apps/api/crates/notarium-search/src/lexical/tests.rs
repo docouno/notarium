@@ -60,9 +60,10 @@ impl StructuralSnapshot for Snapshot {
             .position(|id| id == note)
             .map(|index| DenseNodeId::new(self.cut.generation, index as u32))
     }
-    fn note_id(&self, node: DenseNodeId) -> DomainResult<&NoteId> {
+    fn note_id(&self, node: DenseNodeId) -> DomainResult<NoteId> {
         self.notes
             .get(node.index(self.cut.generation)? as usize)
+            .cloned()
             .ok_or(DomainError::ResourceNotFound)
     }
     fn doc_class(&self, node: DenseNodeId) -> DomainResult<DocClass> {

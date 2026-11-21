@@ -565,12 +565,22 @@ fn authorize_thread_mutation(
     legacy_staged: bool,
 ) -> Result<(), PortError> {
     let tainted = th.tainted_mask != 0 || legacy_staged;
+    // Verify visibility and Personal-chat ownership before taint checks so a
+    // tainted caller cannot distinguish a foreign Personal thread from absent.
+    auth.can_view_chat_thread(
+        space,
+        th.kind,
+        &th.owner,
+        th.project_folder.as_ref(),
+        tainted,
+    )?;
     if (auth.taint().is_tainted() || tainted)
         && (th.kind == ChatThreadKind::SpaceGroup || space.kind == SpaceKind::Shared)
     {
         return Err(DomainError::CrossSpaceTainted.into());
     }
-    Ok(auth.authorize_chat_read(space, th.project_folder.as_ref(), tainted)?)
+    auth.mark_chat_read_taint(space, tainted);
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -1191,7 +1201,13 @@ async fn read_chat_impl(
 
                 let th = load_thread_head_tx(tx, &scope.space_id, &request.thread).await?;
                 let thread_tainted = th.tainted_mask != 0;
-                auth.authorize_chat_read(&srec.space, th.project_folder.as_ref(), thread_tainted)?;
+                auth.authorize_chat_thread_read(
+                    &srec.space,
+                    th.kind,
+                    &th.owner,
+                    th.project_folder.as_ref(),
+                    thread_tainted,
+                )?;
 
                 let thread_out = ChatThread {
                     id: th.thread_id.clone(),
@@ -1495,7 +1511,13 @@ async fn read_chat_impl(
                     })?;
                     let entry_taint = taint_raw != 0;
                     if entry_taint {
-                        auth.authorize_chat_read(&srec.space, thread_out.project_folder.as_ref(), true)?;
+                        auth.authorize_chat_thread_read(
+                            &srec.space,
+                            thread_out.kind,
+                            &thread_out.owner,
+                            thread_out.project_folder.as_ref(),
+                            true,
+                        )?;
                     }
 
                     entries.push(ChatEntry {
@@ -1687,7 +1709,7 @@ async fn read_chat_pg_single_query(
     let th_rev = RevisionId::parse(ct_head_rev_raw)
         .map_err(|_| internal_not_committed("corrupt_thread_rev", "invalid head_rev_id"))?;
     let thread_tainted = ct_tainted_raw != 0;
-    auth.authorize_chat_read(&space, th_proj.as_ref(), thread_tainted)?;
+    auth.authorize_chat_thread_read(&space, th_kind, &th_owner, th_proj.as_ref(), thread_tainted)?;
 
     let first_e_seq: Option<i64> = hdr.get::<Option<i64>, usize>(10);
     if first_e_seq != Some(tip_i64) {
@@ -1781,7 +1803,13 @@ async fn read_chat_pg_single_query(
             .map_err(|_| internal_not_committed("corrupt_chat_depth", "invalid depth"))?;
         let entry_taint = taint_raw != 0;
         if entry_taint {
-            auth.authorize_chat_read(&space, thread_out.project_folder.as_ref(), true)?;
+            auth.authorize_chat_thread_read(
+                &space,
+                thread_out.kind,
+                &thread_out.owner,
+                thread_out.project_folder.as_ref(),
+                true,
+            )?;
         }
 
         Ok(ChatEntry {
@@ -1893,7 +1921,13 @@ fn read_chat_rusqlite(
         };
 
     let thread_tainted = th.tainted_mask != 0;
-    auth.authorize_chat_read(&srec.space, th.project_folder.as_ref(), thread_tainted)?;
+    auth.authorize_chat_thread_read(
+        &srec.space,
+        th.kind,
+        &th.owner,
+        th.project_folder.as_ref(),
+        thread_tainted,
+    )?;
 
     let thread_out = ChatThread {
         id: th.thread_id,
@@ -2152,7 +2186,13 @@ fn read_chat_rusqlite(
             .map_err(|_| internal_not_committed("corrupt_chat_depth", "invalid depth"))?;
         let entry_taint = taint_raw != 0;
         if entry_taint {
-            auth.authorize_chat_read(&srec.space, thread_out.project_folder.as_ref(), true)?;
+            auth.authorize_chat_thread_read(
+                &srec.space,
+                thread_out.kind,
+                &thread_out.owner,
+                thread_out.project_folder.as_ref(),
+                true,
+            )?;
         }
 
         entries.push(ChatEntry {
@@ -2246,8 +2286,10 @@ async fn create_chat_impl(
                     return Err(DomainError::CrossSpaceTainted.into());
                 }
 
-                auth.authorize_chat_read(
+                auth.authorize_chat_thread_read(
                     &live_space.space,
+                    input.kind,
+                    &input.owner,
                     input.project_folder.as_ref(),
                     tainted,
                 )?;
@@ -3136,7 +3178,15 @@ async fn insert_chat_entry_row_tx(
             .map_err(|err| internal_not_committed("pg_insert_chat_entry", err.to_string()))?;
         }
     }
-    Ok(())
+    crate::projection_chat::write_chat_note_refs_json_tx(
+        tx,
+        space_id.as_str(),
+        thread_id.as_str(),
+        e_i64,
+        cseq_i64,
+        refs_json,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3872,8 +3922,10 @@ async fn consume_chat_input_impl(
                     return Err(DomainError::CrossSpaceTainted.into());
                 }
 
-                auth.authorize_chat_read(
+                auth.authorize_chat_thread_read(
                     &live_space.space,
+                    th.kind,
+                    &th.owner,
                     th.project_folder.as_ref(),
                     effective_tainted,
                 )?;
@@ -4111,6 +4163,22 @@ async fn wait_for_redaction_gc(
     }
 }
 
+async fn finish_redacted_projection_replay(
+    store: &CanonicalStore,
+    committed: &Committed<RedactedChat>,
+    budget: &notarium_core::ports::CallBudget,
+    deadline: &crate::domain::common::CommandDeadline,
+) -> Result<(), PortError> {
+    deadline
+        .wait(budget, || {
+            store.retry_redacted_chat_cleanup(committed, budget)
+        })
+        .await
+        .map_err(|error| {
+            crate::codec::unknown_commit_outcome("redaction_projection_cleanup", error.to_string())
+        })?
+}
+
 async fn redact_chat_entry_impl(
     store: &CanonicalStore,
     ctx: SpaceContext,
@@ -4154,6 +4222,7 @@ async fn redact_chat_entry_impl(
         .await?
     {
         let (committed, zero_refs) = replayed.into_committed();
+        finish_redacted_projection_replay(store, &committed, &ctx.budget, &deadline).await?;
         if !zero_refs.is_empty() {
             // A receipt from an older writer can refer to bytes released before
             // it gained transactional GC. Reconciliation on open/lease also covers these.
@@ -4181,6 +4250,8 @@ async fn redact_chat_entry_impl(
 
     let cleanup_store = store.clone();
     let (attempted, first_attempt) = tokio::sync::oneshot::channel();
+    let committed_in_writer = Arc::new(AtomicBool::new(false));
+    let observe_commit = Arc::clone(&committed_in_writer);
     let intent = PreparedWriteIntent {
         scope: scope.clone(),
         active_epoch,
@@ -4263,7 +4334,7 @@ async fn redact_chat_entry_impl(
                             "UPDATE chat_entries
                              SET kind = 'redacted', tool_call_id = NULL, inline_text = NULL,
                                  payload_blake3 = NULL, referenced_notes_json = '[]',
-                                 is_chain_node = 1, redacted_at_seq = ?
+                                 is_chain_node = 1, redacted_at_seq = COALESCE(redacted_at_seq, ?)
                              WHERE space_id = ? AND thread_id = ? AND entry_seq = ?",
                         )
                         .bind(seq_i64)
@@ -4281,7 +4352,7 @@ async fn redact_chat_entry_impl(
                             "UPDATE chat_entries
                              SET kind = 'redacted', tool_call_id = NULL, inline_text = NULL,
                                  payload_blake3 = NULL, referenced_notes_json = '[]',
-                                 is_chain_node = 1, redacted_at_seq = $1
+                                 is_chain_node = 1, redacted_at_seq = COALESCE(redacted_at_seq, $1)
                              WHERE space_id = $2 AND thread_id = $3 AND entry_seq = $4",
                         )
                         .bind(seq_i64)
@@ -4296,7 +4367,15 @@ async fn redact_chat_entry_impl(
                     }
                 }
 
-                // Release CAS reference owned by this chat entry!
+                crate::projection_chat::clear_chat_note_refs_tx(
+                    tx,
+                    &scope.space_id,
+                    &input.thread,
+                    entry_i64,
+                )
+                .await?;
+
+                // Release the CAS reference owned by this chat entry.
                 let entry_owner = format!("{}:{}", input.thread.as_str(), input.entry.get());
                 let mut zero_ref_digests = release_owner_blob_refs_tx(
                     tx,
@@ -4455,6 +4534,7 @@ async fn redact_chat_entry_impl(
                     Vec::new(),
                 )?;
 
+                item_ctx.on_commit(move || observe_commit.store(true, Ordering::Release));
                 Ok(ItemCommitArtifacts {
                     command_id: cmd_id,
                     command_kind: "redact_chat_entry".to_owned(),
@@ -4479,6 +4559,9 @@ async fn redact_chat_entry_impl(
 
     let stored: StoredCommittedRedactedChatV1 = deadline.submit(store, &ctx.budget, intent).await?;
     let (committed, _) = stored.into_committed();
+    if !committed_in_writer.load(Ordering::Acquire) {
+        finish_redacted_projection_replay(store, &committed, &ctx.budget, &deadline).await?;
+    }
     wait_for_redaction_gc(
         &ctx.budget,
         started,
@@ -4692,7 +4775,7 @@ async fn mark_descendant_compactions_stale_tx(
             BackendConn::Sqlite(conn) => {
                 sqlx::query_scalar(
                     "UPDATE chat_entries SET checkpoint_stale = 1, kind='redacted', inline_text=NULL,
-                            payload_blake3=NULL, referenced_notes_json='[]', redacted_at_seq=?4
+                            payload_blake3=NULL, referenced_notes_json='[]', redacted_at_seq=COALESCE(redacted_at_seq, ?4)
                      WHERE space_id = ?1 AND thread_id = ?2 AND entry_seq = ?3 RETURNING created_space_seq",
                 )
                 .bind(space_id.as_str())
@@ -4708,7 +4791,7 @@ async fn mark_descendant_compactions_stale_tx(
             BackendConn::Postgres(conn) => {
                 sqlx::query_scalar(
                     "UPDATE chat_entries SET checkpoint_stale = 1, kind='redacted', inline_text=NULL,
-                            payload_blake3=NULL, referenced_notes_json='[]', redacted_at_seq=$4
+                            payload_blake3=NULL, referenced_notes_json='[]', redacted_at_seq=COALESCE(redacted_at_seq, $4)
                      WHERE space_id = $1 AND thread_id = $2 AND entry_seq = $3 RETURNING created_space_seq",
                 )
                 .bind(space_id.as_str())
@@ -4722,6 +4805,7 @@ async fn mark_descendant_compactions_stale_tx(
                 })?
             }
         };
+        crate::projection_chat::clear_chat_note_refs_tx(tx, space_id, thread_id, raw).await?;
         let owner = format!("{}:{raw}", thread_id.as_str());
         zero_refs.extend(
             release_owner_blob_refs_tx(tx, space_id, BlobOwnerKind::ChatEntry, &owner).await?,

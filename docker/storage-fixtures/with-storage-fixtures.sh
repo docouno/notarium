@@ -72,12 +72,21 @@ if [ "${1:-}" = "setup-images" ]; then
   exit 0
 fi
 
-if [ "${1:-}" != "test" ] && [ "${1:-}" != "exec-custom" ] && [ "${1:-}" != "benchmark" ]; then
-  exec sh "$ROOT/.devkit/runtime/devkit.sh" "$@"
-fi
+case "${1:-}" in
+  test|exec-custom|benchmark) projection_benchmark=0 ;;
+  projection-benchmark)
+    [ "$#" -eq 1 ] || fail "usage: projection-benchmark"
+    projection_benchmark=1
+    ;;
+  *) exec sh "$ROOT/.devkit/runtime/devkit.sh" "$@" ;;
+esac
 
 # Verify all pinned fixture images exist locally (offline --pull never enforcement).
-for required_image in "$PG_IMAGE" "$MINIO_IMAGE" "$BRIDGE_IMAGE"; do
+required_images="$PG_IMAGE"
+if [ "$projection_benchmark" = 0 ]; then
+  required_images="$required_images $MINIO_IMAGE $BRIDGE_IMAGE"
+fi
+for required_image in $required_images; do
   docker image inspect "$required_image" >/dev/null 2>&1 || \
     fail "missing fixture image '$required_image'; run 'make setup app=api' first"
 done
@@ -107,12 +116,20 @@ if [ "$1" = "benchmark" ]; then
   tree=$(source_tree)
   sh "$ROOT/.devkit/runtime/devkit.sh" cli exec --component apps/api --network none -- \
     cargo build --offline --locked --release -p fitness-gates --features storage-bench --example d3_benchmarks
+elif [ "$projection_benchmark" = 1 ]; then
+  commit=$(git -C "$ROOT" rev-parse HEAD)
+  head_tree=$(git -C "$ROOT" rev-parse 'HEAD^{tree}')
+  tree=$(source_tree)
+  sh "$ROOT/.devkit/runtime/devkit.sh" cli exec --component apps/api --network none -- \
+    cargo build --offline --locked --release -p fitness-gates --features storage-bench --example projection_benchmarks
 fi
 sweep_stale_runs
 
 RUN_ID="run-$$-$(date +%s)"
 RUN_DIR="$FIXTURES_BASE/$RUN_ID"
 COMPOSE_PROJECT="notarium-st-${CHECKOUT_HASH}-$$"
+projection_artifacts=".artifacts/5-projections-graph"
+projection_work="$projection_artifacts/$RUN_ID"
 
 UID_VAL=$(id -u)
 GID_VAL=$(id -g)
@@ -152,13 +169,20 @@ cleanup() {
   rm -f -- "$ACTIVE_MANIFEST"
   docker compose --progress plain -f "$COMPOSE_FILE" -p "$COMPOSE_PROJECT" down -v --remove-orphans </dev/null >/dev/null 2>&1 || true
   rm -rf -- "$RUN_DIR" 2>/dev/null || true
+  if [ "$projection_benchmark" = 1 ]; then
+    rm -rf -- "$ROOT/$projection_work" 2>/dev/null || true
+  fi
 }
 trap cleanup EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-docker compose --progress plain -f "$COMPOSE_FILE" -p "$COMPOSE_PROJECT" up -d --pull never --no-build </dev/null
+if [ "$projection_benchmark" = 1 ]; then
+  docker compose --progress plain -f "$COMPOSE_FILE" -p "$COMPOSE_PROJECT" up -d --pull never --no-build postgres </dev/null
+else
+  docker compose --progress plain -f "$COMPOSE_FILE" -p "$COMPOSE_PROJECT" up -d --pull never --no-build </dev/null
+fi
 
 # Wait for PostgreSQL 16 UDS readiness (bounded 30s).
 pg_ready=0
@@ -181,7 +205,7 @@ done
 # Give the startup refusal test a separate cluster and socket in the pinned PG
 # container. Its temporary data directory disappears with the fixture.
 pg_fsync_off_port=null
-if [ "$1" != "benchmark" ]; then
+if [ "$1" != "benchmark" ] && [ "$projection_benchmark" = 0 ]; then
   pg_fsync_off_port=5433
   docker compose -f "$COMPOSE_FILE" -p "$COMPOSE_PROJECT" exec -T postgres \
     sh -eu -s -- "$pg_fsync_off_port" <<'PG_FIXTURE'
@@ -194,22 +218,24 @@ PG_FIXTURE
 fi
 
 # Wait for MinIO Community Edition + UDS bridge readiness (bounded 30s).
-s3_ready=0
-attempt=0
-while [ "$attempt" -lt 150 ]; do
-  if [ -S "$RUN_DIR/s3sock/s3.sock" ] && \
-     docker compose -f "$COMPOSE_FILE" -p "$COMPOSE_PROJECT" exec -T s3-bridge \
-       /usr/local/bin/uds-tcp-bridge probe-http /s3sock/s3.sock /minio/health/live >/dev/null 2>&1; then
-    s3_ready=1
-    break
-  fi
-  attempt=$((attempt + 1))
-  sleep 0.2
-done
-[ "$s3_ready" = 1 ] || {
-  docker compose -f "$COMPOSE_FILE" -p "$COMPOSE_PROJECT" logs >&2 || true
-  fail "MinIO CE UDS fixture failed readiness within 30s"
-}
+if [ "$projection_benchmark" = 0 ]; then
+  s3_ready=0
+  attempt=0
+  while [ "$attempt" -lt 150 ]; do
+    if [ -S "$RUN_DIR/s3sock/s3.sock" ] && \
+       docker compose -f "$COMPOSE_FILE" -p "$COMPOSE_PROJECT" exec -T s3-bridge \
+         /usr/local/bin/uds-tcp-bridge probe-http /s3sock/s3.sock /minio/health/live >/dev/null 2>&1; then
+      s3_ready=1
+      break
+    fi
+    attempt=$((attempt + 1))
+    sleep 0.2
+  done
+  [ "$s3_ready" = 1 ] || {
+    docker compose -f "$COMPOSE_FILE" -p "$COMPOSE_PROJECT" logs >&2 || true
+    fail "MinIO CE UDS fixture failed readiness within 30s"
+  }
+fi
 
 TMP_MANIFEST="$RUN_DIR/current.json.tmp"
 cat >"$TMP_MANIFEST" <<EOF
@@ -236,7 +262,25 @@ EOF
 chmod 0644 "$TMP_MANIFEST"
 mv -f "$TMP_MANIFEST" "$ACTIVE_MANIFEST"
 
-if [ "$1" = "benchmark" ]; then
+if [ "$projection_benchmark" = 1 ]; then
+  mkdir -p "$ROOT/$projection_work"
+  caller_cpu=$(cat /sys/fs/cgroup/cpu.max 2>/dev/null || printf unknown)
+  caller_memory=$(cat /sys/fs/cgroup/memory.max 2>/dev/null || printf unknown)
+  sh "$ROOT/.devkit/runtime/devkit.sh" cli exec --component apps/api --write --network none -- \
+    ./target/release/examples/projection_benchmarks --git-base "$commit" --head-tree "$head_tree" \
+    --git-tree "$tree" --caller-cgroup-cpu "$caller_cpu" --caller-cgroup-memory "$caller_memory" \
+    --work-root "/workspace/$projection_work" --output "/workspace/$projection_work/report.json"
+  [ "$tree" = "$(source_tree)" ] || fail "benchmark source changed during measurement"
+  [ "$commit" = "$(git -C "$ROOT" rev-parse HEAD)" ] || fail "benchmark HEAD changed during measurement"
+  [ -s "$ROOT/$projection_work/report.json" ] || fail "projection benchmark produced no report"
+  mv -f "$ROOT/$projection_work/report.json" "$ROOT/$projection_artifacts/metrics.json"
+  printf '%s\n' "$ROOT/$projection_artifacts/metrics.json"
+  sh "$ROOT/.devkit/runtime/devkit.sh" cli exec --component apps/api --network none -- \
+    env NOTARIUM_REQUIRE_PROJECTION_SAMPLES=1 NOTARIUM_PROJECTION_GIT_COMMIT="$commit" \
+    NOTARIUM_PROJECTION_HEAD_TREE="$head_tree" NOTARIUM_PROJECTION_SOURCE_TREE="$tree" \
+    cargo test --offline --locked --release -p fitness-gates --features storage-bench \
+    --test projection_samples -- --nocapture
+elif [ "$1" = "benchmark" ]; then
   shift
   mkdir -p "$ROOT/.artifacts/3-storage-cas"
   status=0

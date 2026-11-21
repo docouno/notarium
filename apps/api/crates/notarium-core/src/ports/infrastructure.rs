@@ -2,7 +2,7 @@ use super::{PortFuture, PortStream, context::*, provider::ProviderRuntimeEpochs,
 use crate::{
     DomainError, DomainResult,
     classes::{DocClass, ProviderPart},
-    error::ValidationReason,
+    error::{Diagnostic, ValidationReason},
     ids::*,
     model::*,
     patch::*,
@@ -20,7 +20,7 @@ use std::{
 pub trait StructuralSnapshot: Send + Sync {
     fn cut(&self) -> &SnapshotCut;
     fn lookup(&self, note: &NoteId) -> Option<DenseNodeId>;
-    fn note_id(&self, node: DenseNodeId) -> DomainResult<&NoteId>;
+    fn note_id(&self, node: DenseNodeId) -> DomainResult<NoteId>;
     fn doc_class(&self, node: DenseNodeId) -> DomainResult<DocClass>;
     fn folder_subtree(&self, folder: &FolderId) -> DomainResult<DenseNodeIter<'_>>;
     /// Return the active folder itself followed by its active descendants.
@@ -41,6 +41,13 @@ pub trait StructuralReadPort: Send + Sync {
     ) -> PortFuture<'_, Box<dyn StructuralSnapshot>>;
     /// Current canonical fence, including class changes; never the pinned snapshot bit.
     fn is_live_visible(&self, ctx: &SpaceContext, note: &NoteId) -> DomainResult<bool>;
+    /// Batch check against the current canonical fence preserving request order.
+    fn filter_live_visible(&self, ctx: &SpaceContext, notes: &[NoteId]) -> DomainResult<Vec<bool>> {
+        notes
+            .iter()
+            .map(|note| self.is_live_visible(ctx, note))
+            .collect()
+    }
     /// Preserve request ordering, including absent/hidden rows.
     fn hydrate(
         &self,
@@ -236,7 +243,7 @@ pub trait EmbeddingProviderPort: Send + Sync {
     ) -> PortFuture<'_, EmbeddingResult>;
 }
 
-/// Trusted planner capability minted on single-registration by composition root.
+/// Trusted capability for the planner currently registered by the composition root.
 /// ```compile_fail
 /// use notarium_core::ports::BoardPlannerAuthority;
 /// let _: BoardPlannerAuthority = serde_json::from_str("{}").unwrap();
@@ -411,6 +418,11 @@ pub struct PlannedNoteRestoration {
     pub current_revision: RevisionId,
     pub restored_from_revision: Option<RevisionId>,
     pub planned_lifecycle: Lifecycle,
+    /// Exact placement prepared by the canonical rollback command.
+    pub planned_parent_folder: FolderId,
+    pub planned_class: DocClass,
+    pub planned_ability: Option<AbilityId>,
+    pub planned_header_diagnostic: Option<Diagnostic>,
     pub planned_carrier: Option<String>,
     pub planned_fields: BTreeMap<String, Option<YamlValue>>,
 }

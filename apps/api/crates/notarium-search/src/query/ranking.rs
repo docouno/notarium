@@ -110,10 +110,10 @@ pub(super) fn expand(
                         continue;
                     }
                     let note = snapshot.note_id(neighbor)?;
-                    if overlay.contains_key(note) || !live(note)? {
+                    if overlay.contains_key(&note) || !live(&note)? {
                         continue;
                     }
-                    *boosts.entry(note.clone()).or_default() += seed.score * weight / penalty;
+                    *boosts.entry(note).or_default() += seed.score * weight / penalty;
                     next.push(neighbor);
                 }
             }
