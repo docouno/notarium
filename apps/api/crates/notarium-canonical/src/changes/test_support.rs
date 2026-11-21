@@ -1,8 +1,9 @@
 use std::{collections::BTreeMap, time::Duration};
 
 use notarium_core::{
+    DomainError,
     classes::DocClass,
-    error::{Diagnostic, PortError},
+    error::{Diagnostic, PortError, ValidationReason},
     ids::{
         ChatThreadId, ContentDigest, FolderId, HistoryIncarnation, LeaseEpoch, NoteId, PrincipalId,
         RequestId, RevisionId, SpaceSeq, ThreadEntrySeq,
@@ -53,6 +54,11 @@ impl CanonicalStore {
     ) -> Result<(CommandSeqRange, Vec<(NoteId, RevisionId)>), PortError> {
         let mut staged_items = Vec::with_capacity(notes.len());
         let mut total_staged_bytes = 0u64;
+        let space = self.read_space(&scope.space_id).await?;
+        space.scope.check(scope)?;
+        if space.active_epoch != active_epoch {
+            return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
+        }
 
         for spec in notes {
             let (raw_fields, diagnostics) = if spec.doc_class == DocClass::EncryptedNote {
@@ -70,7 +76,9 @@ impl CanonicalStore {
                 (header.fields, diagnostics)
             };
             let prep = self.prepare_blob(spec.carrier.as_bytes())?;
-            let ticket = self.stage_blob(scope, active_epoch, &prep).await?;
+            let ticket = self
+                .stage_blob_for_batch_prechecked(scope, active_epoch, &prep)
+                .await?;
             total_staged_bytes = total_staged_bytes.saturating_add(ticket.compressed_size);
             staged_items.push((spec, prep.digest, ticket, raw_fields, diagnostics));
         }

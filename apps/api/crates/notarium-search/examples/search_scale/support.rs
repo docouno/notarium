@@ -155,7 +155,8 @@ impl Fixture {
             }
             let (_, committed) = store
                 .commit_synthetic_note_batch_for_test(&space.scope, lease, &owner, writes)
-                .await?;
+                .await
+                .map_err(|error| format!("preparing canonical fixture batch {page}: {error:?}"))?;
             if !committed.iter().map(|(note, _)| note).eq(group.iter()) {
                 return Err("canonical corpus identities disagree with the search fixture".into());
             }
