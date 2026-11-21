@@ -222,6 +222,8 @@ jobs:
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    permissions:
+      actions: read
     steps:
       - name: Verify required job results
         env:
@@ -247,3 +249,23 @@ jobs:
               exit 1
             fi
           done
+      - name: Verify each API test shard
+        if: needs.plan.outputs.run_code == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHARDS_MATRIX: ${{ needs.plan.outputs.shards_matrix }}
+        shell: bash
+        run: |
+          # A matrix result can report success when a shard never got a runner.
+          # Prefer the newest result for each shard to support partial reruns.
+          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?filter=all&per_page=100" |
+            jq -es --argjson matrix "$SHARDS_MATRIX" '
+              ($matrix | map("api-test (" + .id + ")") | sort) as $expected
+              | [.[].jobs[] | select(.name | startswith("api-test ("))]
+              | if all(.[]; (.run_attempt | type) == "number") then . else error("Missing job attempt") end
+              | group_by(.name)
+              | map(max_by(.run_attempt).run_attempt as $latest | .[] | select(.run_attempt == $latest))
+              | ($expected | length) > 0
+                and map(.name) == $expected
+                and all(.[]; .status == "completed" and .conclusion == "success")
+            '

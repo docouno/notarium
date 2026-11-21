@@ -52,7 +52,7 @@ services:
       io.notarium.storage-fixture.run: "${NOTARIUM_FIXTURE_RUN_ID:?}"
 
   minio:
-    image: notarium-storage-fixture-minio-ce:9e49d5e7a648
+    image: "${NOTARIUM_MINIO_FIXTURE_IMAGE:-notarium-storage-fixture-minio-ce:9e49d5e7a648}"
     build:
       context: .
       dockerfile: docker/storage-fixtures/minio-ce.Dockerfile
@@ -90,7 +90,7 @@ services:
       io.notarium.storage-fixture.run: "${NOTARIUM_FIXTURE_RUN_ID:?}"
 
   s3-bridge:
-    image: notarium-storage-fixture-uds-bridge:local
+    image: "${NOTARIUM_BRIDGE_FIXTURE_IMAGE:-notarium-storage-fixture-uds-bridge:local}"
     build:
       context: .
       dockerfile: docker/storage-fixtures/uds-bridge.Dockerfile

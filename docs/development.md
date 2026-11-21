@@ -68,7 +68,8 @@ the code jobs. The allowlist covers `docs/**`, `README.md`, `AGENTS.md`, and
   shard also runs all workspace doc tests. [Shard manifest](../scripts/ci-api-shards.json)
 - The required `verify` job passes only when the planning job and all required
   jobs succeed, or when planning confirms a docs-only PR and all code jobs
-  were skipped.
+  were skipped. For a code run, it also checks the latest result of each shard
+  through the GitHub Actions jobs API.
 
 CI caches Node and Rust tooling separately. Only `api-check` saves the pruned
 Cargo dependency artifacts, which the shards can restore. The desktop and

@@ -584,7 +584,8 @@ sh docker/storage-fixtures/with-storage-fixtures.sh setup-images --force
 `make test` starts an isolated per-run fixture stack (`--network none` / internal namespace)
 mounted over `.artifacts/storage-tests/<run>/` Unix domain sockets and tears it
 down automatically via signal/exit traps. The offline runner rejects missing
-or stale fixture images. Run `make setup app=api` to prepare the current recipes.
+or stale fixture images and starts services by their verified image IDs. Run
+`make setup app=api` to prepare the current recipes.
 
 The test and benchmark commands hold one checkout-wide fixture lock from startup
 through cleanup. Other checkouts can run independently.

@@ -68,21 +68,25 @@ export_recipe_shas() {
   export NOTARIUM_MINIO_RECIPE_SHA256 NOTARIUM_BRIDGE_RECIPE_SHA256
 }
 
-image_matches_recipe() {
+fixture_image_id() {
   [ -n "$2" ] || return 1
-  observed=$(docker image inspect --format '{{index .Config.Labels "io.notarium.fixture-recipe-sha256"}}' "$1" 2>/dev/null) || return 1
-  [ "$observed" = "$2" ]
+  observed=$(docker image inspect --format '{{.Id}} {{index .Config.Labels "io.notarium.fixture-recipe-sha256"}}' "$1" 2>/dev/null) || return 1
+  [ "${observed#* }" = "$2" ] || return 1
+  case "${observed%% *}" in
+    sha256:*) printf '%s\n' "${observed%% *}" ;;
+    *) return 1 ;;
+  esac
 }
 
 ensure_fixture_image() {
   image=$1 dockerfile=$2 expected=$3 force=$4
-  if [ "$force" = 0 ] && image_matches_recipe "$image" "$expected"; then
+  if [ "$force" = 0 ] && fixture_image_id "$image" "$expected" >/dev/null; then
     printf 'storage-fixtures: reusing %s\n' "$image"
     return
   fi
   # Compose's service network dependency would also build MinIO for the bridge.
   docker build -f "$ROOT/$dockerfile" --build-arg "NOTARIUM_FIXTURE_RECIPE_SHA256=$expected" -t "$image" "$ROOT"
-  image_matches_recipe "$image" "$expected" || fail "built fixture image '$image' did not match its recipe"
+  fixture_image_id "$image" "$expected" >/dev/null || fail "built fixture image '$image' did not match its recipe"
 }
 
 setup_images() {
@@ -135,10 +139,13 @@ export_recipe_shas
 docker image inspect "$PG_IMAGE" >/dev/null 2>&1 || \
   fail "missing fixture image '$PG_IMAGE'; run 'make setup app=api' first"
 if [ "$projection_benchmark" = 0 ]; then
-  image_matches_recipe "$MINIO_IMAGE" "$NOTARIUM_MINIO_RECIPE_SHA256" || \
+  # Pin the inspected IDs so another checkout can retag its builds while this
+  # run waits for the fixture lock. Compose uses these IDs with --pull never.
+  NOTARIUM_MINIO_FIXTURE_IMAGE=$(fixture_image_id "$MINIO_IMAGE" "$NOTARIUM_MINIO_RECIPE_SHA256") || \
     fail "missing or stale fixture image '$MINIO_IMAGE'; run 'make setup app=api' first"
-  image_matches_recipe "$BRIDGE_IMAGE" "$NOTARIUM_BRIDGE_RECIPE_SHA256" || \
+  NOTARIUM_BRIDGE_FIXTURE_IMAGE=$(fixture_image_id "$BRIDGE_IMAGE" "$NOTARIUM_BRIDGE_RECIPE_SHA256") || \
     fail "missing or stale fixture image '$BRIDGE_IMAGE'; run 'make setup app=api' first"
+  export NOTARIUM_MINIO_FIXTURE_IMAGE NOTARIUM_BRIDGE_FIXTURE_IMAGE
 fi
 
 mkdir -p -- "$FIXTURES_BASE"
