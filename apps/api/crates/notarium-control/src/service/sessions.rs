@@ -131,40 +131,68 @@ impl ControlService {
         budget: CallBudget,
         delegation: &JobDelegation,
     ) -> Result<(SpaceContext, Box<dyn RevocationLease>), PortError> {
+        let (ctx, _, registration) = self
+            .register_archive_readers(budget, delegation, delegation)
+            .await?;
+        Ok((ctx, registration))
+    }
+
+    /// Register all selectors before releasing either credential's authority
+    /// locks. Both ceilings share one revocation lease and one expiry check.
+    pub async fn register_archive_readers(
+        &self,
+        budget: CallBudget,
+        caller: &JobDelegation,
+        origin: &JobDelegation,
+    ) -> Result<(SpaceContext, Option<SpaceContext>, Box<dyn RevocationLease>), PortError> {
+        if origin.principal() != caller.principal() || origin.scope() != caller.scope() {
+            return Err(denied());
+        }
         let operation = OperationBudget::new(budget.clone());
         let mut tx = self.store.write(operation.clone()).await?;
-        let credential = delegation.credential_reference();
-        let (auth, lease) = operation
+        let (caller_auth, origin_auth, lease) = operation
             .run(
                 async {
-                    let current_user =
-                        user(tx.inner_mut(), delegation.principal().as_str()).await?;
-                    let current = self
-                        .credential_context(
-                            tx.inner_mut(),
-                            &current_user,
-                            credential.clone(),
-                            false,
-                            false,
-                            true,
-                            None,
-                        )
-                        .await?;
-                    let auth = delegation.limit(&current)?;
-                    let scope = delegation.scope();
+                    let current_user = user(tx.inner_mut(), caller.principal().as_str()).await?;
+                    let scope = caller.scope();
                     let mut selectors = vec![
-                        RevocationSelector::Principal(delegation.principal().clone()),
-                        RevocationSelector::Grant(delegation.grant().clone()),
+                        RevocationSelector::Principal(caller.principal().clone()),
                         RevocationSelector::Space(scope.space_id.clone()),
                         RevocationSelector::Membership {
                             space: scope.space_id.clone(),
-                            principal: delegation.principal().clone(),
+                            principal: caller.principal().clone(),
                         },
                     ];
-                    let expires =
-                        credential_registration(tx.inner_mut(), &credential, &mut selectors)
-                            .await?;
-                    let lease = self
+                    let credential = caller.credential_reference();
+                    let (current, mut expires) = self
+                        .archive_credential(
+                            tx.inner_mut(),
+                            &current_user,
+                            &credential,
+                            &mut selectors,
+                        )
+                        .await?;
+                    let caller_auth = caller.limit(&current)?;
+                    let origin_auth = if origin == caller {
+                        None
+                    } else {
+                        let other = origin.credential_reference();
+                        if other == credential {
+                            Some(origin.limit(&current)?)
+                        } else {
+                            let (current, other_expires) = self
+                                .archive_credential(
+                                    tx.inner_mut(),
+                                    &current_user,
+                                    &other,
+                                    &mut selectors,
+                                )
+                                .await?;
+                            expires = expires.into_iter().chain(other_expires).min();
+                            Some(origin.limit(&current)?)
+                        }
+                    };
+                    let registry = self
                         .revoker
                         .register_content_job(
                             MaintenanceContext {
@@ -177,21 +205,49 @@ impl ControlService {
                         .await?;
                     let lease: Box<dyn RevocationLease> = match expires {
                         Some(expires_at_ms) => Box::new(ExpiringArchiveLease {
-                            registry: lease,
+                            registry,
                             clock: self.clock.clone(),
                             expires_at_ms,
                         }),
-                        None => lease,
+                        None => registry,
                     };
                     lease.check()?;
-                    Ok((auth, lease))
+                    Ok((caller_auth, origin_auth, lease))
                 },
                 CommitEffect::NotCommitted,
             )
             .await?;
         operation.run(tx.commit(), CommitEffect::Unknown).await?;
-        let ctx = SpaceContext::new(auth, delegation.scope().clone(), budget)?;
-        Ok((ctx, lease))
+        let budget = operation.context(budget.request);
+        let scope = caller.scope();
+        let origin_ctx = origin_auth
+            .map(|auth| SpaceContext::new(auth, scope.clone(), budget.clone()))
+            .transpose()?;
+        Ok((
+            SpaceContext::new(caller_auth, scope.clone(), budget)?,
+            origin_ctx,
+            lease,
+        ))
+    }
+
+    async fn archive_credential(
+        &self,
+        tx: &mut Transaction,
+        user: &UsersRow,
+        credential: &AuthenticatedCredential,
+        selectors: &mut Vec<RevocationSelector>,
+    ) -> Result<(EngineAuthContext, Option<i64>), PortError> {
+        let current = self
+            .credential_context(tx, user, credential.clone(), false, false, true, None)
+            .await?;
+        let mut credential_selectors = vec![RevocationSelector::Grant(current.grant().clone())];
+        let expires = credential_registration(tx, credential, &mut credential_selectors).await?;
+        for selector in credential_selectors {
+            if !selectors.contains(&selector) {
+                selectors.push(selector);
+            }
+        }
+        Ok((current, expires))
     }
 
     /// Refresh the delegation without acquiring a new registry lease. This is

@@ -1,6 +1,8 @@
 mod archive_privacy;
 pub(crate) mod archive_versions;
-pub use archive_privacy::sqlite_statements as sqlite_archive_privacy_ddl;
+pub use archive_privacy::{
+    sqlite_statements as sqlite_archive_privacy_ddl, sqlite_v7_privacy_definitions,
+};
 pub use archive_versions::sqlite_statements as sqlite_archive_versions_ddl;
 pub mod manifest;
 pub(crate) mod migrate;

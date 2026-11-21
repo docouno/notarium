@@ -334,6 +334,27 @@ fn repackage_sqlite(
     database: &str,
     statement: &str,
 ) -> Cursor<Vec<u8>> {
+    repackage_database(path, database, |payload| {
+        let image = scratch.join(codec::new_prefixed_hex_id("forged_sqlite_").unwrap());
+        fs::write(&image, &*payload).unwrap();
+        let db = rusqlite::Connection::open(&image).unwrap();
+        db.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+        db.execute_batch(statement).unwrap();
+        assert_eq!(
+            db.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "ok"
+        );
+        drop(db);
+        *payload = fs::read(image).unwrap();
+    })
+}
+
+fn repackage_database(
+    path: &Path,
+    database: &str,
+    change: impl FnOnce(&mut Vec<u8>),
+) -> Cursor<Vec<u8>> {
     let mut source = zip::ZipArchive::new(File::open(path).unwrap()).unwrap();
     let bytes = |source: &mut zip::ZipArchive<File>, name| {
         let mut bytes = Vec::new();
@@ -344,7 +365,6 @@ fn repackage_sqlite(
             .unwrap();
         bytes
     };
-    let image = scratch.join(codec::new_prefixed_hex_id("forged_sqlite_").unwrap());
     let mut control = bytes(&mut source, "db/control");
     let mut canonical = bytes(&mut source, "db/canonical");
     let payload = match database {
@@ -352,17 +372,7 @@ fn repackage_sqlite(
         "canonical" => &mut canonical,
         _ => panic!("unknown database"),
     };
-    fs::write(&image, &*payload).unwrap();
-    let db = rusqlite::Connection::open(&image).unwrap();
-    db.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
-    db.execute_batch(statement).unwrap();
-    assert_eq!(
-        db.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
-            .unwrap(),
-        "ok"
-    );
-    drop(db);
-    *payload = fs::read(image).unwrap();
+    change(payload);
     let mut manifest: serde_json::Value =
         serde_json::from_slice(&bytes(&mut source, "manifest.json")).unwrap();
     manifest[database]["bytes"] = payload.len().into();
@@ -383,6 +393,43 @@ fn repackage_sqlite(
         output.write_all(&data).unwrap();
     }
     output.finish().unwrap()
+}
+
+fn change_note_metadata(
+    encoded: &[u8],
+    change: impl FnOnce(&mut codec::NoteRevisionMetadata),
+) -> Vec<u8> {
+    let mut envelope = codec::RevisionMetadataEnvelope::decode(encoded).unwrap();
+    let codec::RevisionMetadataPayload::Note(note) = &mut envelope.payload else {
+        panic!("expected a note revision");
+    };
+    change(note);
+    envelope.encode().unwrap()
+}
+
+fn stale_carrier(note: &mut codec::NoteRevisionMetadata) {
+    let digest = note.content_digest.unwrap();
+    let mut bytes = *digest.as_bytes();
+    bytes.rotate_left(1);
+    assert_ne!(bytes, *digest.as_bytes());
+    note.content_digest = Some(ContentDigest::from_bytes(bytes));
+}
+
+fn v7_privacy_fixture() -> (String, String) {
+    use notarium_canonical::schema::sqlite_v7_privacy_definitions;
+
+    let triggers: BTreeMap<_, _> = sqlite_v7_privacy_definitions().collect();
+    let sql: Vec<_> = triggers.values().map(String::as_str).collect();
+    // Fingerprint the six sqlite_schema.sql values from the original supported v7.
+    assert_eq!(
+        blake3::hash(sql.join("\n").as_bytes()).to_hex().as_str(),
+        "005c85d18644b31b10444c13b88185aa9def835401f26ab2894adc9f18aac09e"
+    );
+    let statements: Vec<_> = triggers
+        .into_iter()
+        .map(|(name, sql)| format!("DROP TRIGGER {name}; {sql};"))
+        .collect();
+    (statements.join("\n"), statements[0].clone())
 }
 
 async fn check_restored_note(
@@ -816,14 +863,44 @@ async fn sqlite_archive_verification_restore_and_rejection() {
 
     let reject_parent = scratch.0.join("reject-before-install");
     fs::create_dir(&reject_parent).unwrap();
+    let (v7_privacy, mixed_privacy) = v7_privacy_fixture();
+    let note_id = NoteId::from_bytes([9; 16]);
+    let source_db = rusqlite::Connection::open(root.canonical()).unwrap();
+    let metadata: Vec<u8> = source_db.query_row(
+        "SELECT metadata_msgpack FROM revisions WHERE entity_type='note' AND entity_key=?1 ORDER BY space_seq LIMIT 1",
+        [note_id.as_str()], |row| row.get(0),
+    ).unwrap();
+    let replace_note = |metadata: Vec<u8>| {
+        let literal: String = source_db
+            .query_row("SELECT quote(?1)", [metadata], |row| row.get(0))
+            .unwrap();
+        format!(
+            "UPDATE revisions SET metadata_msgpack={literal} WHERE entity_type='note' AND entity_key='{note_id}'"
+        )
+    };
+    let stale_digest = replace_note(change_note_metadata(&metadata, stale_carrier));
+    let stale_owner = replace_note(change_note_metadata(&metadata, |note| {
+        note.note_id = NoteId::from_bytes([12; 16])
+    }));
+    let stale_size = replace_note(change_note_metadata(&metadata, |note| note.byte_size += 1));
+    drop(source_db);
     let missing_owner = format!(
         "DELETE FROM blob_references WHERE owner_kind='note_revision' AND owner_id='{}';
          UPDATE blob_catalog SET ref_count=1 WHERE ref_count=2;",
         NoteId::from_bytes([9; 16])
     );
     for (database, corruption) in [
+        ("canonical", mixed_privacy.as_str()),
+        (
+            "canonical",
+            "DROP TRIGGER archive_privacy_spaces;
+             CREATE TRIGGER archive_privacy_spaces AFTER UPDATE ON spaces BEGIN SELECT 1; END;",
+        ),
         ("canonical", "DELETE FROM folder_heads WHERE is_root=1"),
         ("canonical", missing_owner.as_str()),
+        ("canonical", stale_digest.as_str()),
+        ("canonical", stale_owner.as_str()),
+        ("canonical", stale_size.as_str()),
         (
             "canonical",
             "DROP INDEX uq_spaces_slug_fold; CREATE INDEX uq_spaces_slug_fold ON spaces(slug_fold)",
@@ -907,6 +984,7 @@ async fn sqlite_archive_verification_restore_and_rejection() {
         ),
         ("v8", Some(V8), V8_KEYS, BEFORE_V9),
         ("v9", Some(V9), V8_KEYS, ""),
+        ("v10-inherited", Some(""), "", ""),
         ("existing", None, "", ""),
     ] {
         let existing = predecessor.is_none();
@@ -929,15 +1007,24 @@ async fn sqlite_archive_verification_restore_and_rejection() {
             RestoreKeyring::External(root.keyring())
         };
         let archive = if let Some(predecessor) = predecessor {
+            let claims = if legacy_order.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "DROP INDEX idx_content_jobs_reclaim; DROP INDEX idx_content_jobs_claim;
+                     CREATE INDEX idx_content_jobs_claim ON content_jobs ({legacy_order});"
+                )
+            };
+            let privacy = if target == "space-before-kind" {
+                ""
+            } else {
+                &v7_privacy
+            };
             let legacy = repackage_sqlite(
                 &destination,
                 &scratch.0,
                 "canonical",
-                &format!(
-                    "{older_indexes} {predecessor};
-                     DROP INDEX idx_content_jobs_reclaim; DROP INDEX idx_content_jobs_claim;
-                     CREATE INDEX idx_content_jobs_claim ON content_jobs ({legacy_order})"
-                ),
+                &format!("{older_indexes} {predecessor}; {claims} {privacy}"),
             );
             let report = run_fsck(
                 authority(ServicePurpose::Fsck),
@@ -983,8 +1070,8 @@ async fn sqlite_archive_verification_restore_and_rejection() {
         )
         .await
         .unwrap();
-        let keys: String = rusqlite::Connection::open(restored.canonical())
-            .unwrap()
+        let db = rusqlite::Connection::open(restored.canonical()).unwrap();
+        let keys: String = db
             .query_row(
                 "SELECT group_concat(name, ',' ORDER BY seqno) FROM pragma_index_info('idx_content_jobs_claim')",
                 [],
@@ -992,6 +1079,13 @@ async fn sqlite_archive_verification_restore_and_rejection() {
             )
             .unwrap();
         assert_eq!(keys, "job_kind,space_id,created_seq,job_id");
+        let clearing_triggers: i64 = db.query_row(
+            "SELECT count(*) FROM sqlite_schema WHERE type='trigger' AND name GLOB 'archive_privacy_*'
+             AND instr(sql, 'DELETE FROM archive_export_cuts WHERE space_id=NEW.space_id') > 0",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(clearing_triggers, 6);
+        drop(db);
         concurrent_write
             .check_restored(&restored_canonical, &owner, &result.histories[0])
             .await;
@@ -1401,6 +1495,14 @@ async fn cloud_archive_verification_and_restore_to_an_independent_namespace() {
         .await
         .unwrap();
     let wrong_count = scratch.0.join("wrong-ref-count.zip");
+    let original_metadata: Vec<u8> = sqlx::query_scalar(
+        "SELECT metadata_msgpack FROM v1_canonical.revisions WHERE space_id=$1 AND rev_id=$2",
+    )
+    .bind(scope.space_id.as_str())
+    .bind(created.value.revision.as_str())
+    .fetch_one(&mut src_sql)
+    .await
+    .unwrap();
     let failed_spools = scratch.0.join("failed-capture-spools");
     store.set_backup_spool_dir(failed_spools.clone());
     sqlx::query("UPDATE v1_canonical.blob_catalog SET ref_count=2 WHERE space_id=$1")
@@ -1553,6 +1655,65 @@ async fn cloud_archive_verification_and_restore_to_an_independent_namespace() {
         scratch: root.clone(),
         external_keyring: root.keyring(),
     };
+    // Preserve the framed row length and both independent spool/archive checksums.
+    let forged = repackage_database(&path, "canonical", |spool| {
+        let changed = change_note_metadata(&original_metadata, stale_carrier);
+        assert_eq!(changed.len(), original_metadata.len());
+        let body_len = spool.len() - 32;
+        let (body, trailer) = spool.split_at_mut(body_len);
+        let offset = body
+            .windows(original_metadata.len())
+            .position(|window| window == original_metadata)
+            .unwrap();
+        body[offset..offset + changed.len()].copy_from_slice(&changed);
+        trailer.copy_from_slice(blake3::hash(body).as_bytes());
+        let mut changed_rows = 0;
+        use notarium_canonical::backup::{PostgresSpoolValue, scan_postgres_spool_v1};
+        scan_postgres_spool_v1(
+            &spool[..],
+            spool.len() as u64,
+            spool.len() as u64,
+            BackupOptions::default().max_pg_row_bytes,
+            |table, row| {
+                if table.name == "revisions"
+                    && let PostgresSpoolValue::Bytes(value) = &row[11]
+                    && value == &changed
+                {
+                    changed_rows += 1;
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(changed_rows, 1);
+    });
+    let fsck = run_fsck(
+        authority(ServicePurpose::Fsck),
+        FsckInput::Archive(ArchiveInput::new(forged.clone()).unwrap()),
+        &root.keyring(),
+        BackupOptions::default(),
+    )
+    .await;
+    let restore = run_restore(
+        authority(ServicePurpose::Restore),
+        ArchiveInput::new(forged).unwrap(),
+        RestoreTarget::Cloud(Box::new(cloud_target.clone())),
+        BackupOptions::default(),
+    )
+    .await;
+    for error in [fsck.unwrap_err(), restore.unwrap_err()] {
+        assert!(
+            matches!(error, notarium_core::error::PortError::Domain(notarium_core::DomainError::ValidationFailed { diagnostic }) if diagnostic.reason == notarium_core::error::ValidationReason::InvalidDigest)
+        );
+    }
+    let mut fresh = PgConnection::connect_with(&build_pg_connect_options(&target))
+        .await
+        .unwrap();
+    let untouched: bool = sqlx::query_scalar(
+        "SELECT NOT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname IN ('notarium_restore','v1_canonical','v1_control'))",
+    ).fetch_one(&mut fresh).await.unwrap();
+    assert!(untouched);
+    fresh.close().await.unwrap();
     competing_cloud_restore(&path, &cloud_target, &competing).await;
     let target_spec = RestoreTarget::Cloud(Box::new(cloud_target));
     let restored = run_restore(

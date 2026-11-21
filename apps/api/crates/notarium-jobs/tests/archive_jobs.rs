@@ -51,7 +51,14 @@ impl ControlClock for TestClock {
 
 struct TestRegistry {
     clock: Arc<TestClock>,
-    advance_at_handoff: Mutex<Option<i64>>,
+    handoff_probe: Mutex<Option<HandoffProbe>>,
+}
+
+struct HandoffProbe {
+    request: RequestId,
+    origin: RevocationSelector,
+    expires: i64,
+    registrations: Vec<Vec<RevocationSelector>>,
 }
 
 #[derive(Default)]
@@ -90,11 +97,21 @@ impl RevocationLease for WaitForArtifactExpiry {
 impl SessionRevocationPort for TestRegistry {
     fn register_provider(
         &self,
-        _: MaintenanceContext,
-        _: Vec<RevocationSelector>,
+        ctx: MaintenanceContext,
+        selectors: Vec<RevocationSelector>,
         _: Cancellation,
     ) -> PortFuture<'_, Box<dyn RevocationLease>> {
-        let advance = self.advance_at_handoff.lock().unwrap().take();
+        let advance = self
+            .handoff_probe
+            .lock()
+            .unwrap()
+            .as_mut()
+            .filter(|probe| ctx.budget.request == probe.request)
+            .and_then(|probe| {
+                let origin_matches = selectors.contains(&probe.origin);
+                probe.registrations.push(selectors);
+                origin_matches.then_some(probe.expires)
+            });
         Box::pin(async move {
             Ok(Box::new(TestLease {
                 expiry: advance.map(|time| (self.clock.clone(), time)),
@@ -205,6 +222,44 @@ async fn import(
         .unwrap()
         .value;
     terminal(store, ctx, &job).await
+}
+
+async fn drain_prequeued_exports(
+    jobs: &Arc<ArchiveJobs>,
+    store: &CanonicalStore,
+    ctx: &SpaceContext,
+) {
+    let mut queued = Vec::new();
+    for _ in 0..3 {
+        let job = jobs
+            .enqueue(
+                ctx.clone(),
+                mutation(ctx, ContentJobKind::ExportSpace { encrypted: false }),
+            )
+            .await
+            .unwrap();
+        queued.push(job.value);
+    }
+    let stop = Cancellation::default();
+    let running = tokio::spawn(
+        jobs.runner(JobWorkerConfig {
+            imports: 0,
+            exports: 1,
+            idle_poll: Duration::from_secs(60),
+            ..Default::default()
+        })
+        .unwrap()
+        .run(stop.clone()),
+    );
+    let drained = tokio::time::timeout(Duration::from_secs(15), async {
+        for job in &queued {
+            assert_eq!(terminal(store, ctx, job).await.state, JobState::Succeeded);
+        }
+    })
+    .await;
+    stop.cancel();
+    running.await.unwrap().unwrap();
+    drained.expect("a worker must drain a ready Space before its idle poll");
 }
 
 fn note_count(root: &DataRoot, scope: &HistoryScope) -> i64 {
@@ -323,7 +378,7 @@ async fn exercise_local_archive_worker(entries: usize) {
     });
     let registry = Arc::new(TestRegistry {
         clock: clock.clone(),
-        advance_at_handoff: Mutex::new(None),
+        handoff_probe: Mutex::new(None),
     });
     let control_service = Arc::new(
         ControlService::open(
@@ -388,6 +443,7 @@ async fn exercise_local_archive_worker(entries: usize) {
         .unwrap(),
     );
     if entries == 201 {
+        drain_prequeued_exports(&jobs, &store, &ctx).await;
         stage_import_shares_the_upload_deadline(&jobs, &ctx, &clock, root).await;
     }
     let stop = Cancellation::default();
@@ -619,65 +675,135 @@ async fn exercise_local_archive_worker(entries: usize) {
     let mut selected_caller = None;
     if entries == 201 {
         let expires = clock.now.load(Ordering::SeqCst) + 86_400_000;
-        let pat = control_service
-            .create_pat(
-                AccountContext::new(ctx.auth().clone(), budget()),
-                CreatePat {
-                    name: "archive".into(),
-                    scope: BearerScope::Write,
-                    selected_spaces: None,
-                    expires_at_ms: Some(expires),
-                    expected: account.revision,
-                },
+        let issue = async |name: &str, expires_at_ms, expected| {
+            let pat = control_service
+                .create_pat(
+                    AccountContext::new(ctx.auth().clone(), budget()),
+                    CreatePat {
+                        name: name.into(),
+                        scope: BearerScope::Write,
+                        selected_spaces: None,
+                        expires_at_ms: Some(expires_at_ms),
+                        expected,
+                    },
+                )
+                .await
+                .unwrap();
+            let auth = control_service
+                .resolve(PreAuthContext {
+                    budget: budget(),
+                    evidence: AuthEvidence::new(
+                        AuthEvidenceKind::Pat,
+                        pat.value.token.expose().into(),
+                    ),
+                })
+                .await
+                .unwrap();
+            (
+                SpaceContext::new(auth, scope.clone(), budget()).unwrap(),
+                pat.revision,
             )
-            .await
-            .unwrap();
-        let pat_auth = control_service
-            .resolve(PreAuthContext {
-                budget: budget(),
-                evidence: AuthEvidence::new(AuthEvidenceKind::Pat, pat.value.token.expose().into()),
-            })
-            .await
-            .unwrap();
-        let pat_ctx = SpaceContext::new(pat_auth, scope.clone(), budget()).unwrap();
-        let job = jobs
-            .enqueue(
-                pat_ctx.clone(),
-                mutation(&pat_ctx, ContentJobKind::ExportSpace { encrypted: false }),
-            )
-            .await
-            .unwrap()
-            .value;
-        let exported_by_pat = terminal(&store, &pat_ctx, &job).await;
-        let descriptor_before = store.export_descriptor_bytes_read_for_test();
-        selected_caller = Some(pat_ctx.clone());
-        let as_caller = jobs.open_export(pat_ctx, id).await.unwrap();
-        let as_origin = jobs
-            .open_export(ctx.clone(), &exported_by_pat.artifacts[0])
-            .await
-            .unwrap();
-        let admitted_bytes = store.export_descriptor_bytes_read_for_test();
-        assert_eq!(
-            admitted_bytes - descriptor_before,
-            encoded_len(id) + encoded_len(&exported_by_pat.artifacts[0])
-        );
+        };
+        let (early, revision) = issue("early archive", expires, account.revision).await;
+        let (later, _) = issue("later archive", expires + 86_400_000, revision).await;
+        let publish = async |source: &SpaceContext| {
+            let job = jobs
+                .enqueue(
+                    source.clone(),
+                    mutation(source, ContentJobKind::ExportSpace { encrypted: false }),
+                )
+                .await
+                .unwrap()
+                .value;
+            terminal(&store, source, &job).await.artifacts[0].clone()
+        };
+        let early_export = publish(&early).await;
+        let later_export = publish(&later).await;
+        selected_caller = Some(early.clone());
         let before_expiry = clock.now.load(Ordering::SeqCst);
-        for reader in [as_caller, as_origin] {
-            *registry.advance_at_handoff.lock().unwrap() = Some(expires);
+        for (caller, origin, artifact) in [
+            (&early, &ctx, id),
+            (&ctx, &early, &early_export),
+            (&early, &later, &later_export),
+            (&later, &early, &early_export),
+        ] {
+            let descriptor_before = store.export_descriptor_bytes_read_for_test();
+            let reader = jobs.open_export(caller.clone(), artifact).await.unwrap();
+            let admitted_bytes = store.export_descriptor_bytes_read_for_test();
+            assert_eq!(admitted_bytes - descriptor_before, encoded_len(artifact));
+            let call = budget();
+            let origin_grant = RevocationSelector::Grant(origin.auth().grant().clone());
+            // Advance Control's clock only in the lease covering the original
+            // exporter, after the registry has performed its synchronous work.
+            *registry.handoff_probe.lock().unwrap() = Some(HandoffProbe {
+                request: call.request.clone(),
+                origin: origin_grant.clone(),
+                expires,
+                registrations: Vec::new(),
+            });
             let (out, mut recv) = tokio::sync::mpsc::channel(1);
             let chunk = reader
-                .read_chunk_into(budget(), 0, 1, out.reserve_owned().await.unwrap())
+                .read_chunk_into(call, 0, 1, out.reserve_owned().await.unwrap())
                 .await;
+            clock.now.store(before_expiry, Ordering::SeqCst);
             assert!(matches!(
                 chunk,
                 Err(PortError::Domain(DomainError::AuthenticationFailed))
             ));
             assert!(recv.try_recv().is_err());
-            clock.now.store(before_expiry, Ordering::SeqCst);
+            let batches = registry
+                .handoff_probe
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap()
+                .registrations;
+            assert_eq!(batches.len(), 1);
+            let expected = [
+                RevocationSelector::Principal(caller.auth().principal().clone()),
+                RevocationSelector::Space(scope.space_id.clone()),
+                RevocationSelector::Membership {
+                    space: scope.space_id.clone(),
+                    principal: caller.auth().principal().clone(),
+                },
+                RevocationSelector::Grant(caller.auth().grant().clone()),
+                origin_grant,
+            ];
+            assert_eq!(batches[0].len(), expected.len());
+            assert!(
+                expected
+                    .iter()
+                    .all(|selector| batches[0].contains(selector))
+            );
             assert_eq!(
                 store.export_descriptor_bytes_read_for_test(),
                 admitted_bytes
             );
+        }
+
+        // A single credential may have different stored ceilings on the
+        // submission and download. Sharing its lease must preserve both.
+        let mut grants = early.auth().spaces().clone();
+        grants
+            .get_mut(&scope.space_id)
+            .unwrap()
+            .read_classes
+            .remove(&notarium_core::classes::DocClass::UserDoc);
+        let narrow = early.auth().for_pat(grants).unwrap();
+        let wide = notarium_core::auth::JobDelegation::capture(early.auth(), &scope).unwrap();
+        let narrow = notarium_core::auth::JobDelegation::capture(&narrow, &scope).unwrap();
+        for (caller, origin, caller_can_read) in [(&wide, &narrow, true), (&narrow, &wide, false)] {
+            let (current, source, _lease) = control_service
+                .register_archive_readers(budget(), caller, origin)
+                .await
+                .unwrap();
+            let can_read = |ctx: &SpaceContext| {
+                ctx.auth().spaces()[&scope.space_id]
+                    .read_classes
+                    .contains(&notarium_core::classes::DocClass::UserDoc)
+            };
+            assert_eq!(can_read(&current), caller_can_read);
+            assert_eq!(can_read(&source.unwrap()), !caller_can_read);
         }
     }
     let admitted_bytes = store.export_descriptor_bytes_read_for_test();
@@ -821,15 +947,12 @@ async fn exercise_local_archive_worker(entries: usize) {
             })
             .await
             .unwrap();
-        let registered = |ctx: &SpaceContext| {
-            (
-                ctx.clone(),
-                Box::<TestLease>::default() as Box<dyn RevocationLease>,
-            )
-        };
         assert!(
             store
-                .authorize_export_chunk(&publication, registered(&pat_ctx), None)
+                .authorize_export_chunk(
+                    &publication,
+                    (pat_ctx.clone(), None, Box::<TestLease>::default())
+                )
                 .await
                 .is_err()
         );
@@ -837,8 +960,11 @@ async fn exercise_local_archive_worker(entries: usize) {
             store
                 .authorize_export_chunk(
                     &publication,
-                    registered(&pat_ctx),
-                    Some(registered(&pat_ctx))
+                    (
+                        pat_ctx.clone(),
+                        Some(pat_ctx.clone()),
+                        Box::<TestLease>::default()
+                    ),
                 )
                 .await
                 .is_err()
@@ -865,8 +991,7 @@ async fn exercise_local_archive_worker(entries: usize) {
                 store
                     .authorize_export_chunk(
                         &publication,
-                        registered(&caller),
-                        Some(registered(&source))
+                        (caller, Some(source), Box::<TestLease>::default()),
                     )
                     .await,
                 Err(PortError::Domain(DomainError::ResourceNotFound))
@@ -965,12 +1090,12 @@ async fn exercise_local_archive_worker(entries: usize) {
                 &near_expiry,
                 (
                     ctx.clone(),
+                    None,
                     Box::new(WaitForArtifactExpiry {
                         expires_at_ms,
                         checked: checked.clone(),
                     }),
                 ),
-                None,
             )
             .await
             .unwrap();

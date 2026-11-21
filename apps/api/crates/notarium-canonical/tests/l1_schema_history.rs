@@ -433,6 +433,47 @@ async fn l1_postgres_bootstrap_idempotence_and_fail_closed_guards() {
                 .unwrap();
         assert!(definition.contains("(job_kind, space_id, created_seq, job_id) WHERE"));
     }
+    // Exercise the trigger WHEN independently of its function. An older writer
+    // ignored trashed-to-purged notes and only bumped the generation.
+    sqlx::raw_sql(
+        "UPDATE note_heads SET lifecycle_state='trashed' WHERE space_id='legacy-collab' AND note_id='clean';
+         CREATE OR REPLACE TRIGGER archive_privacy_note_heads
+           AFTER UPDATE OF lifecycle_state, doc_class, visibility_mask ON note_heads
+           FOR EACH ROW WHEN (OLD.lifecycle_state = 'active' AND
+             (NEW.lifecycle_state <> 'active' OR OLD.doc_class <> NEW.doc_class
+              OR OLD.visibility_mask <> NEW.visibility_mask))
+           EXECUTE FUNCTION notarium_bump_archive_privacy();
+         CREATE OR REPLACE FUNCTION notarium_bump_archive_privacy()
+           RETURNS TRIGGER LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
+           BEGIN
+             PERFORM pg_advisory_xact_lock(hashtextextended(current_schema() || ':' || NEW.space_id, 7311231));
+             INSERT INTO archive_privacy(space_id,generation) VALUES (NEW.space_id,1)
+               ON CONFLICT(space_id) DO UPDATE SET generation=archive_privacy.generation + 1;
+             RETURN NEW;
+           END; $$;
+         INSERT INTO archive_export_cuts VALUES ('old-hold','legacy-collab',1);
+         INSERT INTO archive_export_shadows VALUES ('old-hold','legacy-collab','note','clean','[]');",
+    ).execute(&mut raw).await.unwrap();
+    notarium_canonical::schema::bootstrap_postgres_schema(&mut raw, &schema, &install)
+        .await
+        .unwrap();
+    const CUT_STATE: &str = "SELECT generation,
+        (SELECT count(*) FROM archive_export_cuts WHERE backup_id='old-hold'),
+        (SELECT count(*) FROM archive_export_shadows WHERE backup_id='old-hold')
+        FROM archive_privacy WHERE space_id='legacy-collab'";
+    let (before, cuts, shadows): (i64, i64, i64) =
+        sqlx::query_as(CUT_STATE).fetch_one(&mut raw).await.unwrap();
+    assert_eq!((cuts, shadows), (1, 1));
+    sqlx::query(
+        "UPDATE note_heads SET lifecycle_state='purged',content_blake3=NULL,byte_size=0
+        WHERE space_id='legacy-collab' AND note_id='clean'",
+    )
+    .execute(&mut raw)
+    .await
+    .unwrap();
+    let after: (i64, i64, i64) = sqlx::query_as(CUT_STATE).fetch_one(&mut raw).await.unwrap();
+    assert_eq!(after, (before + 1, 0, 0));
+
     // Version 8 introduced the durable GC ledger.
     sqlx::raw_sql(
         "DROP INDEX idx_blob_catalog_legacy;

@@ -4654,17 +4654,54 @@ async fn paged_archive_export_keeps_chat_appends_out_of_the_cut() {
             })
             .await
             .unwrap();
+        enum StopOnCheck {
+            Cancel(notarium_core::ports::Cancellation),
+            Delay(Duration),
+        }
+        impl RevocationLease for StopOnCheck {
+            fn check(&self) -> Result<(), PortError> {
+                match self {
+                    Self::Cancel(request) => request.cancel(),
+                    Self::Delay(duration) => std::thread::sleep(*duration),
+                }
+                Ok(())
+            }
+        }
+        let cancelled = make_budget();
+        let cancel = StopOnCheck::Cancel(cancelled.cancellation.clone());
+        let mut expiring = make_budget();
+        expiring.remaining = Duration::from_millis(250);
+        let delay = StopOnCheck::Delay(expiring.remaining + Duration::from_millis(1));
+        for (call, registration) in [(cancelled, cancel), (expiring, delay)] {
+            let permit = store
+                .authorize_export_chunk(&pointer, (download_ctx(), None, Box::new(registration)))
+                .await
+                .unwrap();
+            let (send, queue) = tokio::sync::oneshot::channel();
+            let result = store
+                .handoff_export_chunk(&call, permit, move || {
+                    send.send(b'x').unwrap();
+                    Ok(())
+                })
+                .await;
+            if call.cancellation.is_cancelled() {
+                assert!(matches!(result, Err(PortError::Cancelled(_))));
+            } else {
+                assert!(matches!(result, Err(PortError::DeadlineExceeded(_))));
+            }
+            assert!(queue.await.is_err());
+        }
         let permit = store
             .authorize_export_chunk(
                 &pointer,
                 (
                     download_ctx(),
+                    None,
                     Box::new(Registration {
                         entered: Default::default(),
                         released: Default::default(),
                     }),
                 ),
-                None,
             )
             .await
             .unwrap();

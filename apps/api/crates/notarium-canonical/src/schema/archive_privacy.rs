@@ -1,6 +1,8 @@
 //! Privacy invalidation shares the commit of its mutation, including fast
 //! writer, rollback and maintenance paths in both storage profiles.
 
+use std::collections::BTreeMap;
+
 use notarium_core::error::PortError;
 use sqlx::{PgConnection, SqliteConnection};
 
@@ -53,18 +55,64 @@ const BUMP: &str = "INSERT INTO archive_privacy(space_id, generation) VALUES (NE
 // atomically with the privacy mutation, including any just captured by it.
 const CLEAR_CUTS: &str = "DELETE FROM archive_export_cuts WHERE space_id=NEW.space_id";
 
-pub fn sqlite_statements() -> impl Iterator<Item = String> {
-    GATES.iter().map(|(table, columns, condition)| {
-        format!(
-            "CREATE TRIGGER IF NOT EXISTS archive_privacy_{table}
+// SQLite stores the CREATE statement without IF NOT EXISTS in sqlite_schema.
+fn sqlite_definitions(clear_cuts: bool) -> impl Iterator<Item = (String, String)> {
+    let body = if clear_cuts {
+        format!("{BUMP}; {CLEAR_CUTS};")
+    } else {
+        format!("{BUMP};")
+    };
+    GATES.iter().map(move |(table, columns, condition)| {
+        let name = format!("archive_privacy_{table}");
+        let sql = format!(
+            "CREATE TRIGGER {name}
              AFTER UPDATE OF {columns} ON {table} WHEN ({condition})
-             BEGIN {BUMP}; {CLEAR_CUTS}; END"
-        )
+             BEGIN {body} END"
+        );
+        (name, sql)
     })
 }
 
+pub fn sqlite_statements() -> impl Iterator<Item = String> {
+    sqlite_definitions(true)
+        .map(|(_, sql)| sql.replacen("CREATE TRIGGER", "CREATE TRIGGER IF NOT EXISTS", 1))
+}
+
+/// Stored definitions from the recognized v7 manifest before eager cut deletion.
+/// Subsequent schema upgrades could retain this complete set via IF NOT EXISTS.
+pub fn sqlite_v7_privacy_definitions() -> impl Iterator<Item = (String, String)> {
+    sqlite_definitions(false)
+}
+
 pub(super) async fn sqlite(conn: &mut SqliteConnection) -> Result<(), PortError> {
-    for sql in sqlite_statements() {
+    let stored: Vec<(String, String)> = sqlx::query_as(
+        "SELECT name,sql FROM sqlite_schema WHERE type='trigger' AND name GLOB 'archive_privacy_*'
+         LIMIT ?",
+    )
+    .bind(GATES.len() as i64 + 1)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(error)?;
+    let stored: BTreeMap<_, _> = stored.into_iter().collect();
+    let current: BTreeMap<_, _> = sqlite_definitions(true).collect();
+    if stored == current {
+        return Ok(());
+    }
+    if !stored.is_empty() {
+        if stored != sqlite_v7_privacy_definitions().collect() {
+            return Err(internal_not_committed(
+                "archive_privacy_triggers",
+                "unrecognized SQLite privacy trigger definitions",
+            ));
+        }
+        for name in current.keys() {
+            sqlx::query(sqlx::AssertSqlSafe(format!("DROP TRIGGER {name}")))
+                .execute(&mut *conn)
+                .await
+                .map_err(error)?;
+        }
+    }
+    for sql in current.into_values() {
         sqlx::query(sqlx::AssertSqlSafe(sql))
             .execute(&mut *conn)
             .await

@@ -267,6 +267,10 @@ impl ArchiveRunner {
         shutdown: &Cancellation,
     ) -> Result<Option<(HistoryScope, ClaimedContentJob)>, PortError> {
         let limit = PageLimit::new(SCOPE_PAGE_SIZE)?;
+        // A saved cursor follows the last successful claim. Work may still be
+        // waiting in that Space or before it. Wrap once before polling idle.
+        let start = cursor.clone();
+        let mut wrapped = false;
         while !shutdown.is_cancelled() {
             let scopes = self
                 .store
@@ -274,6 +278,9 @@ impl ArchiveRunner {
                 .await?;
             let reached_end = scopes.len() < usize::from(limit.get());
             for scope in scopes {
+                if wrapped && start.as_ref().is_some_and(|start| &scope.space_id > start) {
+                    return Ok(None);
+                }
                 *cursor = Some(scope.space_id.clone());
                 let claim = self
                     .store
@@ -294,7 +301,11 @@ impl ArchiveRunner {
                 }
             }
             if reached_end {
-                return Ok(None);
+                if wrapped || start.is_none() {
+                    return Ok(None);
+                }
+                wrapped = true;
+                *cursor = None;
             }
         }
         Ok(None)

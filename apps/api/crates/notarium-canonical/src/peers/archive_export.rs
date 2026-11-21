@@ -169,16 +169,13 @@ impl CommittedExport {
     }
 }
 
-type RegisteredAuthority = (SpaceContext, Box<dyn RevocationLease>);
-
 /// Issued after the live visibility check and consumed by one handoff.
 pub struct ExportChunkPermit {
     binding: ExportBinding,
     installation: notarium_core::ids::InstallationId,
     scope: HistoryScope,
     access: ExportAccess,
-    caller_registration: Box<dyn RevocationLease>,
-    origin_registration: Option<Box<dyn RevocationLease>>,
+    registration: Box<dyn RevocationLease>,
 }
 
 enum ChunkState {
@@ -497,8 +494,7 @@ impl CanonicalStore {
             binding,
             scope,
             access,
-            caller_registration,
-            origin_registration,
+            registration,
             ..
         } = permit;
         let store = self.clone();
@@ -549,10 +545,8 @@ impl CanonicalStore {
                         ));
                     }
                     deadline.remaining(&check)?;
-                    caller_registration.check()?;
-                    if let Some(origin) = &origin_registration {
-                        origin.check()?;
-                    }
+                    registration.check()?;
+                    deadline.remaining(&check)?;
                     if tokio::time::Instant::now() >= expires {
                         return Err(DomainError::ResourceNotFound.into());
                     }
@@ -620,22 +614,22 @@ impl CanonicalStore {
         Ok(pointer)
     }
 
+    /// Consume Control's two current contexts and their shared registration.
     pub async fn authorize_export_chunk(
         &self,
         pointer: &CommittedExport,
-        caller: RegisteredAuthority,
-        origin: Option<RegisteredAuthority>,
+        readers: (SpaceContext, Option<SpaceContext>, Box<dyn RevocationLease>),
     ) -> Result<ExportChunkPermit, PortError> {
+        let (caller, origin, registration) = readers;
         let access = self
-            .revalidate_committed_export(&caller.0, origin.as_ref().map(|(ctx, _)| ctx), pointer)
+            .revalidate_committed_export(&caller, origin.as_ref(), pointer)
             .await?;
         Ok(ExportChunkPermit {
             binding: pointer.binding.clone(),
             installation: self.installation_id().clone(),
             scope: pointer.object.scope.clone(),
             access,
-            caller_registration: caller.1,
-            origin_registration: origin.map(|(_, lease)| lease),
+            registration,
         })
     }
 
@@ -943,7 +937,7 @@ async fn check_publication_tx(
     }
     // Both backends truncate their clock to milliseconds. Anchor the remaining
     // whole milliseconds before the clock round trip so admission can check
-    // expiry synchronously after the two credential registrations.
+    // expiry synchronously after the credential registration check.
     let remaining = Duration::from_millis(binding.expires.abs_diff(now).saturating_sub(1));
     Ok(crate::runtime::deadline_after(sampled_at, remaining))
 }

@@ -129,28 +129,19 @@ impl ArchiveDownload {
             return Err(DomainError::validation(ValidationReason::InvalidRange).into());
         }
         let request = RequestDeadline::new(budget)?;
-        let (mut ctx, registration) = self
-            .jobs
-            .control
-            .register_archive_job(request.remaining()?, self.pointer.caller())
-            .await?;
-        let source = if self.pointer.origin() != self.pointer.caller() {
-            Some(
-                self.jobs
-                    .control
-                    .register_archive_job(request.remaining()?, self.pointer.origin())
-                    .await?,
-            )
-        } else {
-            None
-        };
-        ctx.budget = request.remaining()?;
-        let permit = request
-            .wait(self.jobs.store.authorize_export_chunk(
-                &self.pointer,
-                (ctx, registration),
-                source,
+        let readers = request
+            .wait(self.jobs.control.register_archive_readers(
+                request.remaining()?,
+                self.pointer.caller(),
+                self.pointer.origin(),
             ))
+            .await?;
+        let permit = request
+            .wait(
+                self.jobs
+                    .store
+                    .authorize_export_chunk(&self.pointer, readers),
+            )
             .await?;
         let bytes = request
             .wait(async {

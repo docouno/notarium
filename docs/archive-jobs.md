@@ -18,6 +18,8 @@ the queue. The worker revalidates the submitting credential and Space grant at
 claim and during execution. The default runner admits one import and one export
 on its own runtime with a bounded blocking pool.
 Each worker polls its class for Spaces with queued jobs or reclaimable leases.
+After a claim it continues with the next Space and wraps to the beginning before
+applying the idle interval. A single busy Space can therefore drain continuously.
 The canonical writer fences job progress and terminal results by lease owner,
 both the job and Space epochs, and lease expiry. It retains the authority
 registration until an admitted write commits or rolls back. In Cloud, the
@@ -72,7 +74,9 @@ chunk checks the publication and job state. For selected exports the reader
 reuses document classes and active ancestry while the history, privacy generation
 and Space sequence match. SQLite resolves changed selections through covering
 indexes. The caller and original exporter both need current access. Their
-revocation and expiry checks run at handoff inside the canonical privacy fence.
+credentials share one revocation registration. At handoff inside the canonical
+privacy fence, the reader checks that registration, then compares the earliest
+credential expiry with the Control clock.
 The reader checks the ZIP's remaining lifetime against the database clock and
 enforces that deadline when it hands off the bytes.
 A successful enqueue into a reserved transport slot is the receipt for that
@@ -124,7 +128,9 @@ from pre-quarantine catalogs.
   opening the source. Use `ArchiveInput::with_length` when the pinned version
   already supplies the exact byte count. Archive verification checks ZIP metadata and digests,
   database structure and references, decoded CAS bytes, and external keyring
-  readability. SQLite verification reads the stored database slices through a
+  readability. For retained note revisions it matches the reader's metadata
+  against the note ID, carrier digest and uncompressed carrier size.
+  SQLite verification reads the stored database slices through a
   read-only range VFS in a separate process. The default worker caps SQLite's
   native heap at 80 MiB and reports the measured native high-water mark.
   The verifier operates under a caller deadline. Both Notarium binaries

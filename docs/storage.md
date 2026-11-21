@@ -128,6 +128,12 @@ adds the archive artifact registry and the Space privacy generation. Previously
 unowned entries retain their pending cleanup obligations across the upgrade.
 New ordinary orphans go through quarantine, with a grace period of 24 hours
 and 5 minutes. Explicit redaction and purge use the durable retirement protocol.
+The first supported v7 SQLite privacy triggers incremented the generation on
+revocation. Later triggers also delete that Space's export cuts and their
+pre-images in the same transaction. Backup verification recognizes the complete
+original trigger set, which SQLite upgrades could retain through version 10.
+Opening such a database replaces those six triggers atomically. PostgreSQL
+reinstalls both the trigger conditions and their function on open.
 
 Schema version 6 orders the existing retirement index by status and then Space.
 Both the installation-wide and per-Space pending checks can seek directly to
@@ -539,7 +545,7 @@ same example against an isolated prefix.
   temporary table, then inserts the full set in one statement so foreign keys
   can resolve parents that appear later in the archive.
   Opening the target with the original installation ID applies the remaining
-  migrations through version 9. The canonical L4 backup suite exercises the
+  migrations through version 10. The canonical L4 backup suite exercises the
   historical row importer and the schema migration path. The streaming
   `notarium-jobs` restore handles installation cutover and repository-level
   verification. See [archive jobs and recovery](archive-jobs.md).
