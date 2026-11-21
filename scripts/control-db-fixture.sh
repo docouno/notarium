@@ -3,7 +3,12 @@
 set -eu
 image=postgres:16-bookworm@sha256:a49f7438ba03589f9b1ca062f2da82e899b48ea1dc50d2449fa09a70be83ebca
 case ${1:-} in
-    prepare) exec docker pull "$image" ;;
+    prepare)
+        if ! docker image inspect "$image" >/dev/null 2>&1; then
+            exec docker pull "$image"
+        fi
+        exit 0
+        ;;
     run) shift ;;
     *) echo 'usage: control-db-fixture.sh prepare | run COMMAND [ARG...]' >&2; exit 2 ;;
 esac
