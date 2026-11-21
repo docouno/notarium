@@ -473,7 +473,7 @@ impl EventStream {
                         continue;
                     }
                     let Some(event) = event.clone_event() else {
-                        if scrubbable && seq > self.delivered && seq > self.floor {
+                        if scrubbable && seq >= self.delivered && seq > self.floor {
                             let target = engine.erasure_floor(&event_scope).max(seq);
                             self.pending = Some(PendingEvent::Space(SpaceEvent {
                                 scope: event_scope,
@@ -973,7 +973,7 @@ async fn pending_delivery<'engine>(
             space_delivery(engine, ctx, generation, delivered, event).await
         }
         PendingEvent::Lagged => transport_refresh(engine, ctx, generation, delivered, None).await,
-        PendingEvent::Board(notice) => board_delivery(engine, ctx, notice).await,
+        PendingEvent::Board(notice) => board_delivery(engine, ctx, delivered, notice).await,
         PendingEvent::Command(command) if command.direct => {
             direct_refresh(
                 engine,
@@ -1421,6 +1421,7 @@ fn needs_rank_proof(change: &Change) -> bool {
 async fn board_delivery<'engine>(
     engine: &'engine ProjectionEngine,
     ctx: &SpaceContext,
+    delivered: SpaceSeq,
     notice: &mut BoardNotice,
 ) -> Result<Option<EventDelivery<'engine>>, PortError> {
     let mut head_retries = 0usize;
@@ -1428,18 +1429,14 @@ async fn board_delivery<'engine>(
         if !wait_event_publication(engine, notice.generation).await? {
             return Ok(None);
         }
-        if notice.seq <= engine.erasure_floor(&notice.scope) {
+        let early_floor = engine.erasure_floor(&notice.scope);
+        if notice.seq <= early_floor {
             notice.payload = BoardNoticePayload::ResyncOnly;
-            return Ok(None);
         }
         let live = engine.live_handle(&notice.scope)?;
         let (head, lazy_compute) = {
             let permit = live.read(&ctx.budget).await?;
             can_view_entry(ctx, &permit)?;
-            if notice.seq <= engine.erasure_floor(&notice.scope) {
-                notice.payload = BoardNoticePayload::ResyncOnly;
-                return Ok(None);
-            }
             if notice.seq > permit.head() {
                 return Ok(None);
             }
@@ -1450,6 +1447,19 @@ async fn board_delivery<'engine>(
                 && !notice.affected_visible(ctx, &permit, &notice.source)?
             {
                 return Ok(None);
+            }
+            let floor = engine.erasure_floor(&notice.scope);
+            if notice.seq <= floor {
+                notice.payload = BoardNoticePayload::ResyncOnly;
+                drop(permit);
+                return transport_refresh(
+                    engine,
+                    ctx,
+                    notice.generation,
+                    delivered,
+                    Some(floor.max(notice.seq)),
+                )
+                .await;
             }
             if permit.head() == notice.seq {
                 match (
@@ -1464,7 +1474,16 @@ async fn board_delivery<'engine>(
                             continue;
                         };
                         let Some(delta) = slot.clone_payload() else {
-                            return Ok(None);
+                            drop(permit);
+                            let floor = engine.erasure_floor(&notice.scope);
+                            return transport_refresh(
+                                engine,
+                                ctx,
+                                notice.generation,
+                                delivered,
+                                Some(floor.max(notice.seq)),
+                            )
+                            .await;
                         };
                         if !board_ranks_visible(ctx, &permit, &delta)? {
                             return Ok(None);
@@ -1502,8 +1521,16 @@ async fn board_delivery<'engine>(
             let delta = engine
                 .compute_board_delta(notice, &descriptor, budget)
                 .await?;
-            if notice.seq <= engine.erasure_floor(&notice.scope) {
-                return Ok(None);
+            let floor = engine.erasure_floor(&notice.scope);
+            if notice.seq <= floor {
+                return transport_refresh(
+                    engine,
+                    ctx,
+                    notice.generation,
+                    delivered,
+                    Some(floor.max(notice.seq)),
+                )
+                .await;
             }
             let permit = live.read(&ctx.budget).await?;
             can_view_entry(ctx, &permit)?;

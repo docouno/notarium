@@ -1384,3 +1384,164 @@ async fn postgres_multi_space_trickle_writes_never_starve_admit() {
     runtime.shutdown().await.unwrap();
     fixtures.drop_pg_schema(&schema).await;
 }
+
+#[tokio::test]
+async fn admit_rejects_stale_lookup_across_repeated_retries_after_unadmitted_purge_debt() {
+    struct SeqLookup {
+        note: NoteId,
+        generation: ProjectionGeneration,
+        seq: SpaceSeq,
+    }
+
+    impl LiveDenseLookup for SeqLookup {
+        fn slots(&self) -> u32 {
+            1
+        }
+
+        fn dense_id(&self, note: &NoteId) -> Option<u32> {
+            (note == &self.note).then_some(0)
+        }
+
+        fn generation(&self) -> Option<ProjectionGeneration> {
+            Some(self.generation)
+        }
+
+        fn published_seq(&self) -> Option<SpaceSeq> {
+            Some(self.seq)
+        }
+    }
+
+    struct FailOnceCleanup {
+        failed_once: std::sync::atomic::AtomicBool,
+    }
+
+    impl ProjectionVisibilityCleanup for FailOnceCleanup {
+        fn erase_visibility<'a>(
+            &'a self,
+            _canonical: &'a CanonicalStore,
+            _erasures: &'a ProjectionErasures,
+        ) -> PortFuture<'a, ()> {
+            Box::pin(async move {
+                if !self.failed_once.swap(true, Ordering::AcqRel) {
+                    return Err(DomainError::validation(ValidationReason::NotReady).into());
+                }
+                Ok(())
+            })
+        }
+    }
+
+    let root = TempDataRoot::new("visibility-retired-floor");
+    let (store, runtime) = CanonicalRuntime::open(CanonicalConfig::local_default(
+        sample_installation_id(77),
+        root.data_root(),
+    ))
+    .await
+    .unwrap();
+    let projection = maintenance_ctx(ServicePurpose::Projection);
+    let registration = store
+        .prepare_projection_visibility_cleanup(&projection, "0123456789abcdef0123456789abcdef")
+        .await
+        .unwrap();
+    registration.attach(Arc::new(FailOnceCleanup {
+        failed_once: std::sync::atomic::AtomicBool::new(false),
+    }));
+
+    let space = create_space(&store, 77).await;
+    let ctx = owner_ctx(&space);
+    let note_id = sample_note_id(77);
+    store
+        .commit_synthetic_note_batch_for_test(
+            &space.scope,
+            space.active_epoch,
+            &space.owner,
+            vec![SyntheticNoteSpec {
+                note_id: note_id.clone(),
+                parent_folder: None,
+                slug: "ephemeral".into(),
+                title: "Ephemeral".into(),
+                doc_class: DocClass::UserDoc,
+                lifecycle: Lifecycle::Active,
+                carrier: "# Ephemeral\n".into(),
+                fields: BTreeMap::new(),
+            }],
+        )
+        .await
+        .unwrap();
+    let pre_purge_seq = store
+        .read_space(&space.scope.space_id)
+        .await
+        .unwrap()
+        .last_seq;
+
+    // Purge while the Space is unadmitted (GateData::Empty). The cleanup
+    // callback fails on its first call, leaving purge debt recorded on the
+    // fence without an admitted LiveState.
+    let purge_err = store
+        .delete_note(
+            ctx.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: space.scope.clone(),
+                    actor: space.owner.clone(),
+                    key: CommandKey::from_bytes([77; 16]),
+                    hash: ContentDigest::from_bytes([77; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: DeleteNote {
+                    note: note_id.clone(),
+                    disposition: DeleteDisposition::Purge,
+                },
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        purge_err,
+        PortError::Unavailable(failure) | PortError::Internal(failure)
+            if failure.effect() == CommitEffect::Unknown
+    ));
+
+    let post_purge_seq = store
+        .read_space(&space.scope.space_id)
+        .await
+        .unwrap()
+        .last_seq;
+    assert!(post_purge_seq > pre_purge_seq);
+
+    let gen1 = ProjectionGeneration::new(1).unwrap();
+    let stale_lookup: Arc<dyn LiveDenseLookup> = Arc::new(SeqLookup {
+        note: note_id.clone(),
+        generation: gen1,
+        seq: pre_purge_seq,
+    });
+
+    // Call #1 drains cleanup_debt, records retired_floor on the fence, and
+    // rejects the pre-purge lookup.
+    let res1 = store
+        .admit_projection_space_with_lookup(&projection, &space.scope, Arc::clone(&stale_lookup))
+        .await
+        .map(|_| ());
+    assert_validation_err(&res1, ValidationReason::NotReady);
+
+    // Call #2 (after cleanup_debt has already been removed) MUST still reject
+    // the pre-purge lookup using the persisted retired_floor on the fence.
+    let res2 = store
+        .admit_projection_space_with_lookup(&projection, &space.scope, stale_lookup)
+        .await
+        .map(|_| ());
+    assert_validation_err(&res2, ValidationReason::NotReady);
+
+    // A fresh post-purge lookup at `post_purge_seq` MUST be admitted.
+    let fresh_lookup: Arc<dyn LiveDenseLookup> = Arc::new(SeqLookup {
+        note: note_id,
+        generation: gen1,
+        seq: post_purge_seq,
+    });
+    let admitted = store
+        .admit_projection_space_with_lookup(&projection, &space.scope, fresh_lookup)
+        .await
+        .unwrap();
+    assert!(admitted.try_read().is_ok());
+
+    runtime.shutdown().await.unwrap();
+}

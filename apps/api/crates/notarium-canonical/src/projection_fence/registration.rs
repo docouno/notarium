@@ -135,11 +135,26 @@ impl CanonicalStore {
                 .await?;
             }
             SqlBackendConfig::Postgres { .. } => {
+                let store = self.clone();
                 self.with_write_tx(move |tx| {
                     Box::pin(async move {
                         let BackendConn::Postgres(conn) = tx else {
                             unreachable!()
                         };
+                        let fence = &store.inner.live_visibility;
+                        if fence.has_cleanup() {
+                            return Err(not_ready());
+                        }
+                        if !fence
+                            .cleanup_debt
+                            .lock()
+                            .expect("projection cleanup debt")
+                            .is_empty()
+                        {
+                            return Err(
+                                DomainError::validation(ValidationReason::InvalidState).into(),
+                            );
+                        }
                         let has_active_owner: bool = sqlx::query_scalar(
                             "SELECT EXISTS(SELECT 1 FROM projection_space_owners WHERE phase <> 'drained')",
                         )

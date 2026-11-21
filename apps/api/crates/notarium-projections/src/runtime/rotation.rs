@@ -202,6 +202,7 @@ struct LocalActivation {
     reply: Result<(), PortError>,
 }
 
+#[derive(Clone)]
 struct RuntimeOwners {
     _local_owner: Option<Arc<std::fs::File>>,
     _pg_guard: Option<Arc<crate::derived::PostgresRuntimeGuard>>,
@@ -216,6 +217,10 @@ async fn rotate_local(
     stop: Cancellation,
     owners: RuntimeOwners,
 ) -> LocalOutcome {
+    // Keep ownership locks alive through candidate stop, drop, and
+    // coordinator.cancel_candidate so a competing start cannot claim the same
+    // cache root before this rotation cleans up its reservation.
+    let _owners_hold = owners.clone();
     let started = Instant::now();
     let coordinator =
         match before_activation(&budget, &stop, engine.control.acquire_coordinator()).await {

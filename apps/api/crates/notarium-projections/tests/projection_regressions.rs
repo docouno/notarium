@@ -2913,6 +2913,11 @@ async fn hydrate_older_snapshot_checks_recorded_facts_and_schema_move_updates_fe
         projected_seq: opened.children.projected_seq,
     };
 
+    // Pause background projection so the retained cut stays pinned at
+    // `snapshot_before` while canonical head advances past it, deterministically
+    // exercising `hydrate_cards_at`'s fast-path head check.
+    let _pause = engine.pause_before_projection_for_test(&scope, 1).unwrap();
+
     // Sanitize the secret note and move it into `/public/`. Canonical head
     // advances past `snapshot_before`, while the retained cut still holds the
     // pre-sanitization title/preview/path at `snapshot_before`.
@@ -2971,6 +2976,7 @@ async fn hydrate_older_snapshot_checks_recorded_facts_and_schema_move_updates_fe
         hydrated[0].is_none(),
         "historical hydrate must verify recorded facts and must not leak pre-sanitization metadata"
     );
+    drop(_pause);
 
     // Move an existing note out of `/public/` via `update_space_schema` and
     // verify `LiveLifecycleFence` immediately hides it from `/public/` readers.

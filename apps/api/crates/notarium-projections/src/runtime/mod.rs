@@ -76,16 +76,18 @@ impl PostgresProjectionCache {
     /// a projector. An existing marker or generation requires its original ID.
     pub async fn provision(root: DataRoot) -> Result<Self, PortError> {
         let owner = PostgresCacheOwner::acquire(root.clone()).await?;
-        let _guard = owner.claim_runtime()?;
+        let guard = owner.claim_runtime()?;
         if owner.cache_identity.get().is_some()
             || !GenerationFiles::inventory(owner.root()).await?.is_empty()
         {
             return Err(DomainError::validation(ValidationReason::InvalidState).into());
         }
-        let expected_id =
-            tokio::task::spawn_blocking(move || initialize_cache_identity(owner.root(), true))
-                .await
-                .map_err(checkpoint_error)??;
+        let expected_id = tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            initialize_cache_identity(owner.root(), true)
+        })
+        .await
+        .map_err(checkpoint_error)??;
         Ok(Self { root, expected_id })
     }
 }
@@ -299,19 +301,36 @@ impl ProjectorRuntime {
                 .is_some_and(|o| o.cache_identity.get().is_none())
         {
             let clean_root = cache_root.clone();
-            tokio::task::spawn_blocking(move || reset_ephemeral_cache_dir(&clean_root))
-                .await
-                .map_err(checkpoint_error)??;
+            let clean_owner = postgres_cache_owner.clone();
+            let clean_guard = postgres_runtime_guard.clone();
+            tokio::task::spawn_blocking(move || {
+                let _owner = clean_owner;
+                let _guard = clean_guard;
+                reset_ephemeral_cache_dir(&clean_root)
+            })
+            .await
+            .map_err(checkpoint_error)??;
         }
         {
             let scratch_root = cache_root.clone();
-            let _ =
-                tokio::task::spawn_blocking(move || link_apply::sweep_scratch_dir(&scratch_root))
-                    .await;
+            let scratch_local = local_owner.clone();
+            let scratch_pg_owner = postgres_cache_owner.clone();
+            let scratch_pg_guard = postgres_runtime_guard.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let _local = scratch_local;
+                let _pg_owner = scratch_pg_owner;
+                let _pg_guard = scratch_pg_guard;
+                link_apply::sweep_scratch_dir(&scratch_root)
+            })
+            .await;
         }
         let identity_root = cache_root.clone();
+        let identity_local = local_owner.clone();
         let identity_owner = postgres_cache_owner.clone();
+        let identity_pg_guard = postgres_runtime_guard.clone();
         let cache_identity = tokio::task::spawn_blocking(move || {
+            let _local = identity_local;
+            let _pg_guard = identity_pg_guard;
             cache_identity(
                 &identity_root,
                 identity_owner.as_deref(),
@@ -488,16 +507,26 @@ impl ProjectorRuntime {
             stop.cancel();
         }
         let rotation = self.finish_local_shutdown().await;
-        if let Some(worker) = self.worker.take() {
-            worker
-                .await
-                .map_err(|e| internal_not_committed("projection_supervisor", e.to_string()))??;
-        }
-        if let Some((_, maintenance)) = self.maintenance.take() {
+        let worker_result = if let Some(worker) = self.worker.take() {
+            match worker.await {
+                Ok(result) => result,
+                Err(e) => Err(internal_not_committed(
+                    "projection_supervisor",
+                    e.to_string(),
+                )),
+            }
+        } else {
+            Ok(())
+        };
+        let maintenance_result = if let Some((_, maintenance)) = self.maintenance.take() {
             maintenance
                 .await
-                .map_err(|e| internal_not_committed("projection_maintenance", e.to_string()))?;
-        }
+                .map_err(|e| internal_not_committed("projection_maintenance", e.to_string()))
+        } else {
+            Ok(())
+        };
+        worker_result?;
+        maintenance_result?;
         rotation
     }
 }

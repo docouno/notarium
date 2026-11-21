@@ -750,10 +750,6 @@ impl Scratch {
         value: &(impl Serialize + Sync),
     ) -> Result<(), PortError> {
         let encoded = rmp_serde::to_vec(value).map_err(error)?;
-        self.put_encoded_async(key, encoded).await
-    }
-
-    async fn put_encoded_async(&mut self, key: Key, encoded: Vec<u8>) -> Result<(), PortError> {
         self.put_batch_async(vec![(key, encoded)]).await
     }
 

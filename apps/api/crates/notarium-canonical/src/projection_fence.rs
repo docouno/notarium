@@ -632,6 +632,7 @@ pub struct LiveLifecycleFence {
     process: Arc<str>,
     cleanup: Arc<std::sync::RwLock<Option<Arc<dyn ProjectionVisibilityCleanup>>>>,
     cleanup_debt: Arc<std::sync::Mutex<HashMap<HistoryScope, (SpaceSeq, SpaceSeq)>>>,
+    retired_floors: Arc<std::sync::Mutex<HashMap<HistoryScope, SpaceSeq>>>,
     suspended_watermarks: Arc<std::sync::Mutex<HashMap<SpaceId, SuspendedWatermark>>>,
 }
 
@@ -643,8 +644,29 @@ impl LiveLifecycleFence {
             process: crate::codec::new_prefixed_hex_id("owner_")?.into(),
             cleanup: Arc::default(),
             cleanup_debt: Arc::default(),
+            retired_floors: Arc::default(),
             suspended_watermarks: Arc::default(),
         })
+    }
+
+    fn record_retired_floor(&self, scope: &HistoryScope, floor: SpaceSeq) {
+        let mut floors = self
+            .retired_floors
+            .lock()
+            .expect("projection retired floors");
+        floors.retain(|k, _| k.space_id != scope.space_id || k.incarnation == scope.incarnation);
+        floors
+            .entry(scope.clone())
+            .and_modify(|current| *current = (*current).max(floor))
+            .or_insert(floor);
+    }
+
+    fn retired_floor(&self, scope: &HistoryScope) -> Option<SpaceSeq> {
+        self.retired_floors
+            .lock()
+            .expect("projection retired floors")
+            .get(scope)
+            .copied()
     }
 
     fn cleanup(&self) -> Option<Arc<dyn ProjectionVisibilityCleanup>> {
@@ -698,6 +720,10 @@ impl LiveLifecycleFence {
 
     pub(crate) async fn close_and_drain(&self) {
         self.closed.store(true, Ordering::Release);
+        self.retired_floors
+            .lock()
+            .expect("projection retired floors")
+            .clear();
         self.suspended_watermarks
             .lock()
             .expect("projection suspended watermarks")
@@ -1227,6 +1253,12 @@ impl LiveWriteSet {
             let after = state.record.last_seq;
             let visibility = match source::refresh(store, state, &budget, changes).await {
                 Ok(checked) => {
+                    if let Some(floor) = state.retired_before {
+                        store
+                            .inner
+                            .live_visibility
+                            .record_retired_floor(&state.record.scope, floor);
+                    }
                     if changes.erasures {
                         uncovered.retain(|window| {
                             window.scope != state.record.scope
@@ -1296,6 +1328,10 @@ impl LiveWriteSet {
                     }
                     Ok(purged) => {
                         if purged {
+                            store
+                                .inner
+                                .live_visibility
+                                .record_retired_floor(&window.scope, window.through);
                             for state in
                                 self.guards.iter_mut().filter_map(|guard| guard.state_mut())
                             {
@@ -1447,6 +1483,9 @@ impl CanonicalStore {
         .map_err(retry)?;
         visibility.committing();
         if !erasures.purged.is_empty() {
+            self.inner
+                .live_visibility
+                .record_retired_floor(&erasures.scope, erasures.through);
             for state in visibility
                 .guards
                 .iter_mut()
@@ -1586,6 +1625,13 @@ impl CanonicalStore {
             .get(&scope.space_id)
             .cloned();
         if let Some(next_lookup) = lookup.as_ref() {
+            if let Some(floor) = fence.retired_floor(scope)
+                && next_lookup
+                    .published_seq()
+                    .is_none_or(|published| published < floor)
+            {
+                return Err(not_ready());
+            }
             if let Some(state) = old.state()
                 && &state.record.scope == scope
                 && self
@@ -1698,7 +1744,7 @@ impl CanonicalStore {
             .expect("projection cleanup debt")
             .get(scope)
             .copied();
-        let mut retired_floor: Option<SpaceSeq> = None;
+        let mut retired_floor: Option<SpaceSeq> = fence.retired_floor(scope);
         if let Some((after, through)) = pending
             && let Some(callback) = fence.cleanup()
         {
@@ -1710,6 +1756,14 @@ impl CanonicalStore {
             };
             let purged = source::erase_window(self, callback.as_ref(), &window).await?;
             if purged {
+                // Persist retired_floor on the fence BEFORE removing cleanup_debt
+                // so a retry after NotReady or seed failure cannot admit a pre-purge lookup.
+                fence.record_retired_floor(scope, through);
+                if let Some(old_state) = old.state_mut()
+                    && &old_state.record.scope == scope
+                {
+                    old_state.retire_lookup_before(through);
+                }
                 retired_floor = Some(retired_floor.map_or(through, |cur| cur.max(through)));
             }
             fence
@@ -1736,6 +1790,7 @@ impl CanonicalStore {
             };
             let purged = source::erase_window(self, callback.as_ref(), &window).await?;
             if purged {
+                fence.record_retired_floor(scope, record.last_seq);
                 old_state.retire_lookup_before(record.last_seq);
                 retired_floor =
                     Some(retired_floor.map_or(record.last_seq, |cur| cur.max(record.last_seq)));
@@ -1888,6 +1943,11 @@ impl CanonicalStore {
         if let Some(state) = guard.state() {
             state.record.scope.check(scope)?;
         }
+        fence
+            .retired_floors
+            .lock()
+            .expect("projection retired floors")
+            .retain(|k, _| k.space_id != scope.space_id);
         fence
             .suspended_watermarks
             .lock()

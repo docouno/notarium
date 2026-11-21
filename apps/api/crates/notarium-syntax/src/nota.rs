@@ -352,60 +352,72 @@ fn starts_block_scalar(rest: &str) -> bool {
 
 fn split_yaml_mapping_colon(text: &str) -> Option<(&str, &str)> {
     let mut quote: Option<char> = None;
+    let mut prev: Option<char> = None;
     let mut chars = text.char_indices().peekable();
     while let Some((idx, ch)) = chars.next() {
         if let Some(q) = quote {
             if q == '"' {
                 if ch == '\\' {
-                    let _ = chars.next();
+                    prev = chars.next().map(|(_, c)| c).or(Some(ch));
+                    continue;
                 } else if ch == '"' {
                     quote = None;
                 }
             } else if ch == '\'' {
                 if chars.peek().is_some_and(|(_, next)| *next == '\'') {
                     let _ = chars.next();
+                    prev = Some('\'');
+                    continue;
                 } else {
                     quote = None;
                 }
             }
+            prev = Some(ch);
             continue;
         }
         match ch {
             '"' | '\'' => quote = Some(ch),
-            '#' => return None,
+            '#' if prev.is_none_or(|c| c == ' ' || c == '\t') => return None,
             ':' => return Some((&text[..idx], &text[idx + 1..])),
             _ => {}
         }
+        prev = Some(ch);
     }
     None
 }
 
 fn advance_yaml_inline_state(text: &str, open_quote: &mut Option<char>, flow_depth: &mut usize) {
+    let mut prev: Option<char> = None;
     let mut chars = text.chars().peekable();
     while let Some(ch) = chars.next() {
         if let Some(quote) = *open_quote {
             if quote == '"' {
                 if ch == '\\' {
-                    let _ = chars.next();
+                    prev = chars.next().or(Some(ch));
+                    continue;
                 } else if ch == '"' {
                     *open_quote = None;
                 }
             } else if ch == '\'' {
                 if chars.peek() == Some(&'\'') {
                     let _ = chars.next();
+                    prev = Some('\'');
+                    continue;
                 } else {
                     *open_quote = None;
                 }
             }
+            prev = Some(ch);
             continue;
         }
         match ch {
-            '#' => break,
+            '#' if prev.is_none_or(|c| c == ' ' || c == '\t') => break,
             '"' | '\'' => *open_quote = Some(ch),
             '[' | '{' => *flow_depth = flow_depth.saturating_add(1),
             ']' | '}' => *flow_depth = flow_depth.saturating_sub(1),
             _ => {}
         }
+        prev = Some(ch);
     }
 }
 
@@ -486,6 +498,9 @@ mod tests {
         let quoted_key_with_colon =
             format!("\"title: x\": \"hello\nid: {}\"\nbad: [", key.as_str());
         assert_eq!(recover_top_level_id(&quoted_key_with_colon), None);
+
+        let hash_inside_key = format!("foo#bar: \"hello\nid: {}\"\nbad: [", key.as_str());
+        assert_eq!(recover_top_level_id(&hash_inside_key), None);
 
         let after_doc_end = format!("kind: list\n...\nid: {}", key.as_str());
         assert_eq!(recover_top_level_id(&after_doc_end), None);
