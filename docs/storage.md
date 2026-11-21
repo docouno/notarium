@@ -301,6 +301,11 @@ retirements and re-uploads never collide:
   registered-but-unsent keys) instead of relying on S3 `DeleteMarker`s, and—on
   `Enabled` buckets—enumerates `ListObjectVersions` to issue exact `versionId`
   `DELETE` calls for prior data versions while preserving the terminal marker.
+  If recovery and a command replay overlap, a data version can disappear between
+  listing and reading it. The writer skips a missing version only after a fresh
+  listing of that key confirms its absence. Before confirming retirement, the
+  writer verifies that every remaining version is a terminal marker, including
+  the latest version.
 
 If versioning changes during retirement, the operation stays pending. After a
 restart with the detected `Enabled` mode, the writer resumes from the durable
