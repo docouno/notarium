@@ -71,6 +71,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     drop((epoch, index));
     let movement = fixture.move_folder().await?;
     let peak_bytes = peak.finish();
+    eprintln!("Measuring embedding queue priority");
     let (foreground, queued_on_release) = priority::measure(&fixture).await?;
     fixture.shutdown().await?;
 

@@ -15,9 +15,9 @@ use notarium_core::{
     },
     model::{DenseNodeId, DenseNodeIter, Lifecycle, SnapshotCut},
     ports::{
-        CallBudget, Cancellation, MoveFolder, Mutation, NoteCard, NoteWritePort, PageLimit,
-        PortFuture, ServiceAuthority, ServicePurpose, SpaceContext, StructuralReadPort,
-        StructuralSnapshot,
+        CallBudget, Cancellation, MaintenanceContext, MoveFolder, Mutation, NoteCard,
+        NoteWritePort, PageLimit, PortFuture, ServiceAuthority, ServicePurpose, SpaceContext,
+        StructuralReadPort, StructuralSnapshot,
     },
     query::{FieldFilterAstV1, Predicate},
     receipt::{CausalBasis, CommandIdentity},
@@ -223,8 +223,17 @@ impl Fixture {
             remaining: Duration::from_secs(30),
         };
         let context = SpaceContext::new(auth, scope.clone(), budget)?;
-        self.verify_canonical_corpus(&context, initial.tantivy_seq, None)
+        let inspection = MaintenanceContext {
+            authority: ServiceAuthority::admit(ServicePurpose::Projection),
+            budget: context.budget.clone(),
+        };
+        eprintln!(
+            "Verifying canonical corpus before MoveFolder at cut {}",
+            initial.tantivy_seq.get()
+        );
+        self.verify_canonical_corpus(&inspection, initial.tantivy_seq, &self.root_folder)
             .await?;
+        eprintln!("Executing MoveFolder at cut {}", initial.tantivy_seq.get());
         let changed = self
             .store
             .move_folder(
@@ -245,6 +254,10 @@ impl Fixture {
             )
             .await?;
         let end = changed.receipt.seq();
+        eprintln!(
+            "Waiting for the search subscriber to acknowledge MoveFolder at cut {}",
+            end.get()
+        );
         let after = tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 if self
@@ -261,7 +274,11 @@ impl Fixture {
         })
         .await??;
         engine.shutdown().await;
-        self.verify_canonical_corpus(&context, end, Some(&self.destination))
+        eprintln!(
+            "Verifying canonical corpus after MoveFolder at cut {}",
+            end.get()
+        );
+        self.verify_canonical_corpus(&inspection, end, &self.destination)
             .await?;
         if initial.tantivy_commit != after.tantivy_commit
             || initial.active_index_dir != after.active_index_dir
@@ -275,47 +292,107 @@ impl Fixture {
 
     async fn verify_canonical_corpus(
         &self,
-        ctx: &SpaceContext,
+        ctx: &MaintenanceContext,
         cutoff: SpaceSeq,
-        project: Option<&FolderId>,
+        corpus_parent: &FolderId,
     ) -> Result<(), Box<dyn Error>> {
-        let authority = ServiceAuthority::admit(ServicePurpose::Search);
-        let mut after = None;
+        let scope = &self.projection.cut.scope;
+        let limit = PageLimit::new(50)?;
+        let folders = self
+            .store
+            .read_projection_folders_page(ctx, scope, cutoff, None, limit)
+            .await
+            .map_err(|error| {
+                format!(
+                    "canonical folder page at cut {}, first page: {error:?}",
+                    cutoff.get()
+                )
+            })?;
+        let expected = [
+            (&self.root_folder, None, false),
+            (&self.destination, Some(&self.root_folder), true),
+            (&self.corpus, Some(corpus_parent), false),
+            (&self.selective, Some(&self.corpus), false),
+            (&self.broad, Some(&self.corpus), false),
+        ];
+        if folders.next.is_some() || folders.rows.len() != expected.len() {
+            return Err(
+                format!("unexpected canonical folder count at cut {}", cutoff.get()).into(),
+            );
+        }
+        for (id, parent, is_project) in expected {
+            if !folders.rows.iter().any(|row| {
+                let folder = &row.metadata;
+                &folder.folder_id == id
+                    && folder.parent_folder_id.as_ref() == parent
+                    && folder.is_root == parent.is_none()
+                    && folder.is_project == is_project
+                    && folder.lifecycle == Lifecycle::Active
+            }) {
+                return Err(format!(
+                    "canonical folder {id} has unexpected placement or state at cut {}",
+                    cutoff.get()
+                )
+                .into());
+            }
+        }
+
+        let mut after: Option<NoteId> = None;
         let mut seen = 0;
         loop {
             let page = self
                 .store
-                .read_searchable_notes_seed_page(
-                    &authority,
-                    ctx.budget.clone(),
-                    ctx.scope().clone(),
-                    Some(cutoff),
-                    after,
-                    PageLimit::new(50)?,
-                )
-                .await?;
-            for carrier in page.notes {
-                let expected = self
-                    .projection
-                    .notes
-                    .get(seen)
-                    .ok_or("unexpected canonical corpus note")?;
-                if &carrier.note_id != expected
-                    || (carrier.parent_folder_id != self.selective
-                        && carrier.parent_folder_id != self.broad)
-                    || carrier.enclosing_project.as_ref() != project
+                .read_projection_notes_page(ctx, scope, cutoff, after.clone(), limit)
+                .await
+                .map_err(|error| {
+                    let cursor = after.as_ref().map_or("<start>", NoteId::as_str);
+                    format!(
+                        "canonical note page at cut {}, after {cursor}, with {seen} notes verified: {error:?}",
+                        cutoff.get()
+                    )
+                })?;
+            for row in page.rows {
+                let meta = &row.metadata;
+                let parent = if seen as u64 * u64::from(super::CHUNKS)
+                    < notarium_search::vector::EXACT_SCAN_LIMIT
                 {
-                    return Err(
-                        "canonical corpus membership disagrees with the search fixture".into(),
-                    );
+                    &self.selective
+                } else {
+                    &self.broad
+                };
+                if self.projection.notes.get(seen) != Some(&meta.note_id)
+                    || self.revisions.get(seen) != Some(&row.revision_id)
+                    || &meta.parent_folder_id != parent
+                    || meta.doc_class != DocClass::UserDoc
+                    || meta.lifecycle != Lifecycle::Active
+                {
+                    return Err(format!(
+                        "canonical note {} at ordinal {seen} disagrees with the fixture at cut {}",
+                        meta.note_id,
+                        cutoff.get()
+                    )
+                    .into());
                 }
                 seen += 1;
             }
-            let Some(next) = page.next_after else { break };
+            let Some(next) = page.next else { break };
+            if after.as_ref().is_some_and(|prior| &next <= prior) {
+                return Err(format!(
+                    "canonical note cursor failed to advance at {} at cut {}",
+                    next,
+                    cutoff.get()
+                )
+                .into());
+            }
             after = Some(next);
         }
         if seen != self.projection.notes.len() {
-            return Err("canonical corpus has an unexpected number of notes".into());
+            return Err(format!(
+                "saw {seen} canonical notes at cut {}, expected {}",
+                cutoff.get(),
+                self.projection.notes.len()
+            )
+            .into());
         }
         Ok(())
     }

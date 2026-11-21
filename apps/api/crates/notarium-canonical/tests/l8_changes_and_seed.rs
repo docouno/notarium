@@ -796,13 +796,14 @@ async fn run_changes_and_seed_suite(store: &CanonicalStore, seed: u8) {
     let cursor_after_p1 = sp1.next.expect("more seed items after page 1");
 
     // Mutate note 4, note 5, thread 1 AND create brand-new note 6 and thread 5 WHILE Seed is mid-flight!
+    let editor = sample_principal_id(seed.wrapping_add(25));
     for idx in [4u16, 5u16, 6u16] {
         let nid = note_id_seq(seed.wrapping_add(2), idx);
         store
             .commit_synthetic_note_batch_for_test(
                 &scope3,
                 epoch,
-                &actor,
+                &editor,
                 vec![SyntheticNoteSpec {
                     note_id: nid,
                     parent_folder: None,
@@ -836,6 +837,63 @@ async fn run_changes_and_seed_suite(store: &CanonicalStore, seed: u8) {
         .commit_synthetic_note_purge_for_test(&scope3, epoch, &note_id_seq(seed.wrapping_add(2), 6))
         .await
         .expect("purge the note created after the seed cut");
+
+    let search = maintenance_ctx(ServicePurpose::Search);
+    let fourth = note_id_seq(seed.wrapping_add(2), 4);
+    let fifth = note_id_seq(seed.wrapping_add(2), 5);
+    let sixth = note_id_seq(seed.wrapping_add(2), 6);
+    let old = store
+        .read_searchable_notes_seed_page(
+            &search.authority,
+            search.budget.clone(),
+            scope3.clone(),
+            Some(sp1.cutoff.after),
+            Some(note_id_seq(seed.wrapping_add(2), 3)),
+            PageLimit::new(2).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(old.cutoff, sp1.cutoff);
+    assert!(old.next_after.is_none());
+    assert_eq!(old.notes.len(), 2);
+    for (row, expected) in old.notes.iter().zip([&fourth, &fifth]) {
+        assert_eq!(&row.note_id, expected);
+        assert_eq!(row.document.revision(), &initial_revs[expected]);
+        assert_eq!(row.revision_actor, actor);
+    }
+    let ids = vec![fifth.clone(), sixth, fourth.clone(), fifth.clone()];
+    let selected = store
+        .read_note_documents_at_cutoff(
+            &search.authority,
+            search.budget.clone(),
+            scope3.clone(),
+            sp1.cutoff.after,
+            ids.clone(),
+        )
+        .await
+        .unwrap();
+    assert!(selected.iter().map(|(id, _)| id).eq(&ids));
+    assert!(selected[1].1.is_none());
+    for index in [0, 2, 3] {
+        let row = selected[index].1.as_ref().unwrap();
+        assert_eq!(row.document.revision(), &initial_revs[&ids[index]]);
+        assert_eq!(row.revision_actor, actor);
+    }
+    let current = store
+        .read_searchable_notes_seed_page(
+            &search.authority,
+            search.budget,
+            scope3.clone(),
+            None,
+            Some(fourth),
+            PageLimit::new(2).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(current.notes.len(), 1);
+    assert_eq!(current.notes[0].note_id, fifth);
+    assert_eq!(current.notes[0].revision_actor, editor);
+    assert_ne!(current.notes[0].document.revision(), &initial_revs[&fifth]);
 
     // Page 2 (`ContinueSeed`) MUST still return pinned cut 9 (2 remaining notes at v1 + 1 thread at head=1)!
     let ChangeReadResult::Seed(sp2) = store

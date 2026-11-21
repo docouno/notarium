@@ -10,7 +10,10 @@ use notarium_core::{
     auth::{Space, SpaceKind, SpaceLifecycle},
     classes::DocClass,
     error::{Diagnostic, PortError, ValidationReason},
-    ids::{ContentDigest, FolderId, HistoryIncarnation, NoteId, RevisionId, SpaceId, SpaceSeq},
+    ids::{
+        ContentDigest, FolderId, HistoryIncarnation, NoteId, PrincipalId, RevisionId, SpaceId,
+        SpaceSeq,
+    },
     model::{HistoryScope, Lifecycle},
     ports::{MaintenanceContext, PageLimit, ServicePurpose},
     query::FieldSchema,
@@ -195,6 +198,7 @@ pub struct ProjectionFolder {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProjectionNote {
+    pub(crate) revision_actor: PrincipalId,
     pub metadata: NoteRevisionMetadata,
     pub revision_id: RevisionId,
     pub visibility_seq: SpaceSeq,
@@ -632,7 +636,7 @@ macro_rules! note_snapshot_sql {
     () => {
         "SELECT h.note_id, h.created_at_sec, CAST(h.created_at_nsec AS BIGINT),
             r.rev_id, r.visibility_seq, r.created_at_sec, CAST(r.created_at_nsec AS BIGINT),
-            r.content_blake3, r.metadata_msgpack, b.rev_id, b.metadata_msgpack
+            r.content_blake3, r.metadata_msgpack, b.rev_id, b.metadata_msgpack, r.actor_id
          FROM note_heads h
          LEFT JOIN revisions r ON r.space_id = h.space_id AND r.rev_id = (
             SELECT x.rev_id FROM revisions x
@@ -686,6 +690,7 @@ type NoteRow = (
     Option<Vec<u8>>,
     Option<String>,
     Option<Vec<u8>>,
+    Option<String>,
 );
 type FolderRow = (String, Option<String>, Option<i64>, Option<Vec<u8>>);
 
@@ -725,6 +730,7 @@ fn note_from_row(
         meta,
         ability_rev,
         ability_meta,
+        actor,
     ): NoteRow,
 ) -> Result<ProjectionNote, PortError> {
     let (Some(rev), Some(visible), Some(updated_sec), Some(updated_nsec), Some(meta)) =
@@ -789,6 +795,7 @@ fn note_from_row(
         digest: carrier_digest,
     };
     Ok(ProjectionNote {
+        revision_actor: PrincipalId::parse(&actor.ok_or_else(stale)?)?,
         metadata,
         revision_id,
         visibility_seq: i64_to_space_seq(visible)?,

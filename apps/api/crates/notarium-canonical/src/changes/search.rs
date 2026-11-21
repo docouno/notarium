@@ -6,10 +6,13 @@ use crate::{
         NoteRevisionMetadata, RevisionMetadataEnvelope, RevisionMetadataPayload, i64_to_space_seq,
         internal_not_committed,
     },
-    domain::common::{CommandDeadline, FolderAncestryCache, extract_note_preview},
+    domain::common::{
+        CommandDeadline, FolderAncestryCache, extract_note_preview, load_note_heads_batch_tx,
+    },
+    projection_read::notes_at_batch,
     runtime::{
-        CanonicalStore, SpaceRecord, load_space_record, pg_read_error, read_immutable_revision_tx,
-        validate_snapshot_cutoff_tx,
+        CanonicalStore, SpaceRecord, load_space_record, pg_read_error, purge_fenced_note_ids_tx,
+        read_immutable_revision_tx, validate_snapshot_cutoff_tx,
     },
     sql_exec::BackendConn,
 };
@@ -485,7 +488,7 @@ impl CanonicalStore {
         let mut tx_budget = budget.clone();
         tx_budget.remaining = deadline.remaining(&budget)?.min(Duration::from_millis(250));
         let scope_for_tx = scope.clone();
-        let (cutoff, pending, next_after) = self
+        let (cutoff, keys, pending, next_after) = self
             .with_read_tx_budget(Some(&tx_budget), |tx| {
                 Box::pin(async move {
                     let space = active_space(tx, &scope_for_tx).await?;
@@ -513,28 +516,71 @@ impl CanonicalStore {
                         }
                         Notes::Selected(keys) => (keys, None),
                     };
+                    let live = live_search_batch(tx, &space, &keys).await?;
+                    let visible = live.into_keys().collect::<Vec<_>>();
+                    let revisions = notes_at_batch(tx, &scope_for_tx, cutoff, &visible).await?;
                     let mut historical = FolderAncestryCache::at_cut(&scope_for_tx, cutoff);
-                    let mut live = FolderAncestryCache::default();
-                    let mut pending = Vec::with_capacity(keys.len());
-                    for key in keys {
-                        let candidate =
-                            load_note(tx, &space, &key, cutoff, &mut historical, &mut live, None)
-                                .await?;
-                        pending.push((key, candidate));
+                    let mut pending = Vec::with_capacity(revisions.len());
+                    for revision in revisions.into_values() {
+                        let meta = revision.metadata;
+                        if meta.lifecycle != Lifecycle::Active
+                            || meta.doc_class == DocClass::EncryptedNote
+                        {
+                            continue;
+                        }
+                        let digest = meta.content_digest.ok_or_else(|| {
+                            internal_not_committed(
+                                "search_note_revision",
+                                "active note is missing its carrier",
+                            )
+                        })?;
+                        let (facts, ancestry) = historical
+                            .build_resource_facts_tx(
+                                tx,
+                                &space.space,
+                                &meta.parent_folder_id,
+                                meta.doc_class,
+                                meta.ability_id.clone(),
+                                false,
+                            )
+                            .await?;
+                        pending.push(PendingNote {
+                            meta,
+                            revision: revision.revision_id,
+                            actor: revision.revision_actor,
+                            digest,
+                            facts,
+                            project: historical.enclosing_project(&ancestry),
+                            active_ancestry: historical.all_active(&ancestry.ancestors),
+                        });
                     }
-                    Ok((cutoff, pending, next_after))
+                    Ok((cutoff, keys, pending, next_after))
                 })
             })
             .await?;
 
-        let mut rows = Vec::with_capacity(pending.len());
-        for (key, note) in pending {
+        let mut loaded = BTreeMap::new();
+        for note in pending {
             budget.remaining = deadline.remaining(&budget)?;
-            let row = match note {
-                Some(note) => self.load_search_carrier(&scope, &budget, note).await?,
-                None => None,
+            if let Some(note) = self.load_search_carrier(&scope, &budget, note).await? {
+                loaded.insert(note.note_id.clone(), note);
+            }
+        }
+
+        let ids = loaded.keys().cloned().collect::<Vec<_>>();
+        // Fill missing and duplicate positions before the final live check.
+        // Only an explicitly repeated note needs a second copy of the carrier.
+        let mut rows: Vec<(NoteId, Option<SearchIndexedNote>)> = Vec::with_capacity(keys.len());
+        let mut positions = BTreeMap::<NoteId, usize>::new();
+        for key in keys {
+            let note = match positions.entry(key.clone()) {
+                std::collections::btree_map::Entry::Occupied(first) => rows[*first.get()].1.clone(),
+                std::collections::btree_map::Entry::Vacant(first) => {
+                    first.insert(rows.len());
+                    loaded.remove(&key)
+                }
             };
-            rows.push((key, row));
+            rows.push((key, note));
         }
 
         tx_budget.remaining = deadline.remaining(&budget)?.min(Duration::from_millis(250));
@@ -546,16 +592,15 @@ impl CanonicalStore {
                     if seed {
                         check_seed(tx, &space, cutoff).await?;
                     }
-                    let mut live = FolderAncestryCache::default();
+                    let live = live_search_batch(tx, &space, &ids).await?;
                     for (key, row) in &mut rows {
                         if let Some(note) = row {
-                            match live_search_facts(tx, &space, key, &mut live).await? {
-                                Some(facts) => {
-                                    note.remote_indexable &=
-                                        live.all_active(&facts.ancestor_folders);
-                                    note.document.bind_current(facts, Lifecycle::Active)?
-                                }
-                                None => *row = None,
+                            if let Some((facts, active_ancestry)) = live.get(key) {
+                                note.remote_indexable &= *active_ancestry;
+                                note.document
+                                    .bind_current(facts.clone(), Lifecycle::Active)?;
+                            } else {
+                                *row = None;
                             }
                         }
                     }
@@ -753,6 +798,41 @@ async fn check_seed(
         return Err(DomainError::validation(ValidationReason::CursorStale).into());
     }
     Ok(())
+}
+
+/// Resolve current visibility in one head/fence batch, sharing ancestry
+/// across every note in the same folder and keeping historical facts separate.
+async fn live_search_batch(
+    tx: &mut BackendConn<'_>,
+    space: &SpaceRecord,
+    notes: &[NoteId],
+) -> Result<BTreeMap<NoteId, (ResourceFacts, bool)>, PortError> {
+    let fenced = purge_fenced_note_ids_tx(tx, &space.scope.space_id, notes).await?;
+    let unfenced: Vec<_> = notes
+        .iter()
+        .filter(|id| !fenced.contains(*id))
+        .cloned()
+        .collect();
+    let heads = load_note_heads_batch_tx(tx, &space.scope.space_id, &unfenced).await?;
+    let mut folders = FolderAncestryCache::default();
+    let mut live = BTreeMap::new();
+    for (id, head) in heads {
+        if head.lifecycle != Lifecycle::Active || head.doc_class == DocClass::EncryptedNote {
+            continue;
+        }
+        let (facts, ancestry) = folders
+            .build_resource_facts_tx(
+                tx,
+                &space.space,
+                &head.parent_folder_id,
+                head.doc_class,
+                head.ability_id,
+                false,
+            )
+            .await?;
+        live.insert(id, (facts, folders.all_active(&ancestry.ancestors)));
+    }
+    Ok(live)
 }
 
 async fn live_search_facts(
