@@ -398,6 +398,27 @@ impl CanonicalStore {
         .await
     }
 
+    /// Reads only metadata for a bounded set of notes at a retained command cut.
+    pub async fn read_projection_note_metadata_batch(
+        &self,
+        ctx: &MaintenanceContext,
+        scope: &HistoryScope,
+        cutoff: SpaceSeq,
+        ids: Vec<NoteId>,
+    ) -> Result<HashMap<NoteId, ProjectionNote>, PortError> {
+        if ids.len() > 200 {
+            return Err(DomainError::validation(ValidationReason::InvalidLimit).into());
+        }
+        let scope = scope.clone();
+        self.with_projection_read(ctx, |tx| {
+            Box::pin(async move {
+                checked_cut(tx, &scope, cutoff).await?;
+                notes_at_batch(tx, &scope, cutoff, &ids).await
+            })
+        })
+        .await
+    }
+
     /// Opens the canonical carrier admitted with this exact metadata record.
     /// Encrypted notes never admit a digest for carrier I/O.
     pub async fn read_projection_note_carrier(

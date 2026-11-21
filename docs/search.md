@@ -31,8 +31,10 @@ before shutting down canonical storage.
   current authorization before ranking. Intervening folder or schema changes
   and receipts for package publication require full catch-up. Base postings,
   structural filters and note carriers share a projected cut. When the indexes
-  and projection have different cuts, search waits within the call budget. The response reports
-  its cut, truncation, and any embedding degradation.
+  and projection have different cuts, search waits within the call budget.
+  Folder and field lookups continue to use the selected cut if the projector
+  advances during the request. The response reports its cut, truncation and
+  any embedding degradation.
 
 ## Storage
 
@@ -111,6 +113,8 @@ most 16 chunks and respect the model's aggregate token cap. Interactive
 embedding work has a deadline of at most 150 ms, including queueing. On expiry,
 the query uses lexical ranking and cancellation signals the active backend.
 The durable pending state schedules bounded repair when embeddings are missing.
+Each page can finish while unrelated edits arrive. If a note changes during
+its embedding call, the worker discards that result and retries the new text.
 
 ## Verification
 

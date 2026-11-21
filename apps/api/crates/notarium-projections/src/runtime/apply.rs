@@ -1910,6 +1910,12 @@ async fn write_checkpoint(
         seq: cutoff,
     };
     let mut builder = FastIndexBuilder::default();
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(slot) = engine.generation.load().slot(&scope.space_id)
+        && let Some(field) = slot.bucketed_list_for_test.lock().unwrap().as_deref()
+    {
+        builder.bucket_list_for_test(field);
+    }
     builder.reserve_dense(
         u32::try_from(watermark.next_dense_id).map_err(checkpoint_error)?,
         u32::try_from(watermark.next_dense_folder_id).map_err(checkpoint_error)?,

@@ -1,7 +1,11 @@
-use super::{Context, Disk, IndexError, Publisher, build};
+use super::{ChangedNotes, Context, Disk, IndexError, Publisher, build, during_model_work};
 use crate::{
-    embed::Priority, layout::FolderOrd, lexical::Update, model::IndexNote,
-    ports::SearchIndexedNote, vector::MutableOperation,
+    embed::Priority,
+    layout::{FolderDictionary, FolderOrd},
+    lexical::Update,
+    model::{Embedder, IndexNote},
+    ports::SearchIndexedNote,
+    vector::{MutableOperation, VectorChunk, VectorSnapshot},
 };
 use notarium_canonical::chats::search::HydratedChatHit;
 use notarium_core::{
@@ -12,7 +16,7 @@ use notarium_core::{
     receipt::ChangeCursor,
 };
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -269,6 +273,17 @@ impl Default for EmbeddingRepair {
     }
 }
 
+struct RepairPage {
+    next_after: Option<NoteId>,
+    rows: Vec<PreparedEmbedding>,
+}
+
+struct PreparedEmbedding {
+    content: SearchContent,
+    chunks: Vec<VectorChunk>,
+    missing: bool,
+}
+
 impl EmbeddingRepair {
     pub(super) fn next(&self) -> tokio::time::Instant {
         self.next
@@ -279,35 +294,18 @@ impl EmbeddingRepair {
         self.backoff = (self.backoff * 2).min(Duration::from_secs(300));
     }
 
-    /// Use the durable pending bit to resume a bounded pass after restart.
-    /// A failed live edit during a pass leaves the next pass armed.
-    pub(super) async fn page(
-        &mut self,
+    async fn prepare(
+        &self,
         cx: &Context<'_>,
-        disk: &mut Disk,
-        publisher: &mut Publisher<'_>,
-    ) -> Result<(), IndexError> {
-        if !cx
-            .services
-            .model_target(&disk.manifest.scope, None, None)
-            .await
-            .is_ok_and(|selected| selected == disk.manifest.active_model)
-        {
-            self.defer();
-            return Ok(());
+        cutoff: &ChangeCursor,
+        folders: &FolderDictionary,
+        embedder: &Embedder,
+        snapshot: &VectorSnapshot,
+    ) -> Result<Option<RepairPage>, IndexError> {
+        let selected = || cx.services.model_target(&cutoff.scope, None, None);
+        if selected().await?.as_ref() != Some(&embedder.target) {
+            return Ok(None);
         }
-        if disk.ensure_embedder(cx).await {
-            publisher.publish(disk);
-        }
-        let Some(embedder) = disk.embedder.as_deref() else {
-            self.defer();
-            return Ok(());
-        };
-        if self.after.is_none() {
-            self.pending = false;
-            self.started_failures = disk.embedding_failures;
-        }
-        let cutoff = disk.cursor();
         let page = cx
             .services
             .deps
@@ -321,17 +319,16 @@ impl EmbeddingRepair {
                 PageLimit::new(16)?,
             )
             .await?;
-        if page.cutoff != cutoff {
+        if &page.cutoff != cutoff {
             return Err(IndexError::Inconsistent);
         }
-        let epoch = disk.epoch.as_mut().ok_or(IndexError::Inconsistent)?;
-        let mut vectors_changed = false;
+        let mut rows: Vec<PreparedEmbedding> = Vec::with_capacity(page.notes.len());
+        let mut page_keys = HashMap::<_, (usize, usize)>::new();
         for note in page.notes {
-            let folder = disk
-                .folders
+            let folder = folders
                 .get(&note.parent_folder_id)
                 .ok_or(IndexError::Inconsistent)?;
-            let (chunks, pending) = embedder
+            let (chunks, missing) = embedder
                 .index_note(IndexNote {
                     services: cx.services,
                     scope: &cutoff.scope,
@@ -339,16 +336,98 @@ impl EmbeddingRepair {
                     folder: folder.get(),
                     budget: cx.budget(),
                     priority: Priority::BulkImportBackfill,
-                    existing: &|key| epoch.find_vector(key),
+                    existing: &|key| {
+                        page_keys
+                            .get(&key)
+                            .map(|&(row, slot)| rows[row].chunks[slot].vector.clone())
+                            .or_else(|| snapshot.find_vector(key))
+                    },
                 })
                 .await?;
-            self.pending |= pending;
-            if !epoch.matches_note_chunks(&note.note_id, &chunks) {
+            let content = notarium_core::classes::ClassEgressFence::index_for_search(
+                note.document,
+                &cx.services.authority,
+            )?;
+            for (slot, chunk) in chunks.iter().enumerate() {
+                page_keys
+                    .entry(chunk.metadata.key)
+                    .or_insert((rows.len(), slot));
+            }
+            rows.push(PreparedEmbedding {
+                content,
+                chunks,
+                missing,
+            });
+        }
+        Ok(
+            (selected().await?.as_ref() == Some(&embedder.target)).then_some(RepairPage {
+                next_after: page.next_after,
+                rows,
+            }),
+        )
+    }
+
+    /// Use the durable pending bit to resume a bounded pass after restart.
+    /// A failed live edit during a pass leaves the next pass armed.
+    pub(super) async fn page(
+        &mut self,
+        cx: &Context<'_>,
+        disk: &mut Disk,
+        publisher: &mut Publisher<'_>,
+    ) -> Result<bool, IndexError> {
+        let Some(embedder) = disk.embedder.clone() else {
+            self.defer();
+            return Ok(false);
+        };
+        if self.after.is_none() {
+            self.pending = false;
+            self.started_failures = disk.embedding_failures;
+        }
+        let cutoff = disk.cursor();
+        let folders = disk.folders.clone();
+        let snapshot = disk
+            .epoch
+            .as_ref()
+            .ok_or(IndexError::Inconsistent)?
+            .snapshot();
+        let mut dirty = ChangedNotes::default();
+        let computed = during_model_work(
+            cx,
+            disk,
+            publisher,
+            &mut dirty,
+            self.prepare(cx, &cutoff, &folders, &embedder, &snapshot),
+        )
+        .await;
+        let page = match computed {
+            Ok(Some(page)) => page,
+            Ok(None) => {
+                self.defer();
+                return Ok(true);
+            }
+            Err(IndexError::Embedding(_)) => {
+                self.defer();
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
+        let changed_folders = dirty.take_remote_folders(Some(&embedder.target));
+        let seq = disk.manifest.tantivy_seq;
+        let epoch = disk.epoch.as_mut().ok_or(IndexError::Inconsistent)?;
+        let mut vectors_changed = false;
+        for row in page.rows {
+            let id = &row.content.provenance().reference().note_id;
+            if dirty.notes.contains(id) || row.content.was_under_any_folder(&changed_folders) {
+                self.pending = true;
+                continue;
+            }
+            self.pending |= row.missing;
+            if !epoch.matches_note_chunks(id, &row.chunks) {
                 epoch.apply(
-                    cutoff.after,
+                    seq,
                     MutableOperation::Upsert {
-                        note: note.note_id,
-                        chunks,
+                        note: id.clone(),
+                        chunks: row.chunks,
                     },
                 )?;
                 vectors_changed = true;
@@ -367,22 +446,15 @@ impl EmbeddingRepair {
         } else {
             self.next = tokio::time::Instant::now() + Duration::from_millis(25);
         }
-        // An interrupted page may already have journaled chunks before its
-        // final checkpoint. Publish those writes even if this retry reused them.
-        let needs_checkpoint = vectors_changed
-            || disk
-                .manifest
-                .vector_seq
-                .is_none_or(|seq| !epoch.is_checkpointed(seq));
-        if needs_checkpoint {
-            epoch.checkpoint(cutoff.after)?;
-            disk.manifest.vector_seq = Some(cutoff.after);
+        if vectors_changed {
+            epoch.checkpoint(seq)?;
+            disk.manifest.vector_seq = Some(seq);
         }
-        if needs_checkpoint || previous_pending != disk.manifest.embeddings_pending {
+        if vectors_changed || previous_pending != disk.manifest.embeddings_pending {
             disk.layout.publish_search(&disk.manifest)?;
             publisher.publish(disk);
         }
-        Ok(())
+        Ok(false)
     }
 }
 

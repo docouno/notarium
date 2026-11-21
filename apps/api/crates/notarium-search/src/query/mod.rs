@@ -297,6 +297,11 @@ impl SearchEngine {
             } = &requested.backend
                 && filter.project.as_ref() != Some(expected)
             {
+                // A changed default still needs indexing when this request cannot
+                // disclose its query to the newly selected project.
+                if query.model.is_none() && state.active_model.as_ref() != Some(&requested) {
+                    handle.wake.notify_one();
+                }
                 return Err(EmbeddingError::ProviderUnavailable);
             }
             let Some(indexed) = &state.vectors else {

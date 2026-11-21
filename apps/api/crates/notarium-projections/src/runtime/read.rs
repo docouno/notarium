@@ -1737,9 +1737,60 @@ impl PublishedCut {
     }
 }
 
+struct HistoricalFolders {
+    // Only active folders contribute an edge. A trashed ancestor therefore
+    // cannot connect a live entry to any of its children.
+    parents: BTreeMap<FolderId, (Option<FolderId>, bool)>,
+    children: BTreeMap<FolderId, Vec<FolderId>>,
+}
+
+struct FolderScope {
+    ancestors: Vec<FolderId>,
+    project: Option<FolderId>,
+    descendants: Vec<FolderId>,
+}
+
+impl HistoricalFolders {
+    fn scope(&self, folder: &FolderId, include_children: bool) -> Result<FolderScope, PortError> {
+        let mut ancestors = Vec::new();
+        let mut project = None;
+        let mut current = Some(folder);
+        while let Some(id) = current {
+            if ancestors.len() > MAX_FOLDER_DEPTH {
+                return Err(DomainError::validation(ValidationReason::InvalidState).into());
+            }
+            let (parent, is_project) = self.parents.get(id).ok_or(DomainError::ResourceNotFound)?;
+            ancestors.push(id.clone());
+            if project.is_none() && *is_project {
+                project = Some(id.clone());
+            }
+            current = parent.as_ref();
+        }
+        let mut descendants = Vec::new();
+        if include_children {
+            let mut queue = vec![folder];
+            while let Some(id) = queue.pop() {
+                if let Some(children) = self.children.get(id) {
+                    descendants.extend(children.iter().cloned());
+                    queue.extend(children);
+                }
+            }
+            descendants.sort_unstable();
+        }
+        Ok(FolderScope {
+            ancestors,
+            project,
+            descendants,
+        })
+    }
+}
+
 struct Snapshot {
     cut: SnapshotCut,
     published: Arc<PublishedCut>,
+    canonical: notarium_canonical::CanonicalStore,
+    authority: ServiceAuthority,
+    historical_folders: tokio::sync::OnceCell<HistoricalFolders>,
     request_deadline: Instant,
     index: IndexView,
     visible: Bitmap,
@@ -1784,23 +1835,140 @@ impl Snapshot {
         Ok(result)
     }
 
-    async fn folder_location(
+    fn maintenance(&self) -> Result<MaintenanceContext, PortError> {
+        let mut budget = self.ctx.budget.clone();
+        budget.remaining = self.remaining()?;
+        Ok(MaintenanceContext {
+            authority: self.authority.clone(),
+            budget,
+        })
+    }
+
+    async fn historical_folders(&self) -> Result<&HistoricalFolders, PortError> {
+        self.historical_folders
+            .get_or_try_init(|| async {
+                let mut parents = BTreeMap::new();
+                let mut children = BTreeMap::<FolderId, Vec<FolderId>>::new();
+                let mut after = None;
+                loop {
+                    let page = self
+                        .canonical
+                        .read_projection_folders_page(
+                            &self.maintenance()?,
+                            &self.cut.scope,
+                            self.cut.projected_seq,
+                            after,
+                            PageLimit::new(200)?,
+                        )
+                        .await?;
+                    for row in page.rows {
+                        let folder = row.metadata;
+                        if folder.lifecycle == Lifecycle::Active {
+                            if let Some(parent) = &folder.parent_folder_id {
+                                children
+                                    .entry(parent.clone())
+                                    .or_default()
+                                    .push(folder.folder_id.clone());
+                            }
+                            parents.insert(
+                                folder.folder_id,
+                                (folder.parent_folder_id, folder.is_project),
+                            );
+                        }
+                    }
+                    after = page.next;
+                    if after.is_none() {
+                        return Ok(HistoricalFolders { parents, children });
+                    }
+                }
+            })
+            .await
+    }
+
+    async fn folder_scope(
         &self,
         folder: &FolderId,
-    ) -> Result<records::FolderLocation, PortError> {
+        include_children: bool,
+    ) -> Result<FolderScope, PortError> {
         authorize_entry(&self.live.try_read()?, &self.ctx, folder)?;
-        let location = self
-            .published
-            .try_location_at(self.cut.projected_seq, folder)
-            .await?
-            .filter(|location| !location.trashed)
-            .ok_or(DomainError::ResourceNotFound)?;
+        if self.index.dense_folder_id(folder).is_none() {
+            return Err(DomainError::ResourceNotFound.into());
+        }
+        let scope = if let Some(folders) = self.historical_folders.get() {
+            folders.scope(folder, include_children)?
+        } else {
+            let derived = async {
+                let location = self
+                    .published
+                    .try_location_at(self.cut.projected_seq, folder)
+                    .await?
+                    .filter(|location| !location.trashed)
+                    .ok_or(DomainError::ResourceNotFound)?;
+                let descendants = if include_children {
+                    self.published
+                        .store
+                        .active_descendants(
+                            &self.cut.scope,
+                            self.cut.projected_seq,
+                            folder,
+                            &location.norm_path,
+                        )
+                        .await?
+                } else {
+                    Vec::new()
+                };
+                Ok(FolderScope {
+                    ancestors: location.ids,
+                    project: location.project,
+                    descendants,
+                })
+            }
+            .await;
+            match derived {
+                Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
+                    if diagnostic.reason == ValidationReason::CursorStale =>
+                {
+                    self.historical_folders()
+                        .await?
+                        .scope(folder, include_children)?
+                }
+                result => result?,
+            }
+        };
         let permit = self.live.try_read()?;
         authorize_entry(&permit, &self.ctx, folder)?;
         self.ctx
             .auth()
-            .can_view_folder(permit.space(), folder, &location.ids)?;
-        Ok(location)
+            .can_view_folder(permit.space(), folder, &scope.ancestors)?;
+        Ok(scope)
+    }
+
+    async fn verify_filter_page(
+        &self,
+        page: Vec<u32>,
+        predicate: &Predicate,
+    ) -> Result<Bitmap, PortError> {
+        let notes = page
+            .iter()
+            .copied()
+            .map(|dense| self.index.note_id(self.index.dense(dense)))
+            .collect::<DomainResult<Vec<_>>>()?;
+        let rows = self
+            .canonical
+            .read_projection_note_metadata_batch(
+                &self.maintenance()?,
+                &self.cut.scope,
+                self.cut.projected_seq,
+                notes,
+            )
+            .await?;
+        let mut matches = Bitmap::new();
+        for (note, row) in rows {
+            if predicate.matches(&records::field_observations(&row, &self.published.fields)) {
+                matches.add(self.index.dense_id(&note).ok_or_else(stale)?);
+            }
+        }
+        Ok(matches)
     }
 
     fn live_node(&self, id: u32) -> bool {
@@ -1890,30 +2058,29 @@ impl StructuralSnapshot for Snapshot {
     fn folder_descendants<'a>(&'a self, folder: &'a FolderId) -> PortFuture<'a, Vec<FolderId>> {
         Box::pin(async move {
             self.within_request(async {
-                let location = self.folder_location(folder).await?;
-                let descendants = self
-                    .published
-                    .store
-                    .active_descendants(
-                        &self.cut.scope,
-                        self.cut.projected_seq,
-                        folder,
-                        &location.norm_path,
-                    )
-                    .await?;
-                let mut result = Vec::with_capacity(1 + descendants.len());
-                result.push(folder.clone());
-                let mut permit = self.live.try_read()?;
-                authorize_entry(&permit, &self.ctx, folder)?;
-                let head = permit.head();
-                if head == self.cut.projected_seq {
-                    result.extend(descendants);
-                } else {
+                let descendants = self.folder_scope(folder, true).await?.descendants;
+                // Yield the live fence between batches. If a writer changes it,
+                // revalidate the prefix under the new head before returning IDs.
+                'verify: loop {
+                    self.remaining()?;
+                    let mut permit = self.live.try_read()?;
+                    authorize_entry(&permit, &self.ctx, folder)?;
+                    let head = permit.head();
+                    let mut result = Vec::with_capacity(1 + descendants.len());
+                    result.push(folder.clone());
+                    if head == self.cut.projected_seq {
+                        result.extend(descendants);
+                        return Ok(result);
+                    }
                     for (i, batch) in descendants.chunks(VISIBILITY_BATCH).enumerate() {
                         if i > 0 {
                             drop(permit);
-                            permit =
-                                next_visibility_batch(&self.published, &self.ctx, head).await?;
+                            tokio::task::yield_now().await;
+                            permit = self.live.try_read()?;
+                            authorize_entry(&permit, &self.ctx, folder)?;
+                            if permit.head() != head {
+                                continue 'verify;
+                            }
                         }
                         for child in batch {
                             if let Some(facts) = permit.folder_facts(child)
@@ -1927,8 +2094,8 @@ impl StructuralSnapshot for Snapshot {
                             }
                         }
                     }
+                    return Ok(result);
                 }
-                Ok(result)
             })
             .await
         })
@@ -1937,7 +2104,7 @@ impl StructuralSnapshot for Snapshot {
     fn enclosing_project<'a>(&'a self, folder: &'a FolderId) -> PortFuture<'a, Option<FolderId>> {
         Box::pin(async move {
             self.within_request(async {
-                let location = self.folder_location(folder).await?;
+                let location = self.folder_scope(folder, false).await?;
                 if let Some(project) = &location.project {
                     authorize_entry(&self.live.try_read()?, &self.ctx, project)?;
                 }
@@ -1957,13 +2124,11 @@ impl StructuralSnapshot for Snapshot {
                 if matches!(&filter.predicate, Predicate::All(terms) if terms.is_empty()) {
                     return Ok(None);
                 }
-                let matches = query::exact_filter(
+                let matches = query::exact_filter_pages(
                     &self.index,
-                    &self.published.store,
-                    &self.cut.scope,
-                    self.cut.projected_seq,
                     &self.visible,
                     &filter.predicate,
+                    |page| self.verify_filter_page(page, &filter.predicate),
                 )
                 .await?;
                 let ids = bitmap_ids(matches).filter(move |id| self.live_node(*id));
@@ -2100,6 +2265,9 @@ impl StructuralReadPort for ProjectionEngine {
                 let snapshot: Box<dyn StructuralSnapshot> = Box::new(Snapshot {
                     cut: snapshot_cut,
                     published: cut,
+                    canonical: self.canonical.clone(),
+                    authority: self.projection_context.authority.clone(),
+                    historical_folders: tokio::sync::OnceCell::new(),
                     request_deadline,
                     index,
                     visible,

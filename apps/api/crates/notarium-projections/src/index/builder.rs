@@ -57,6 +57,13 @@ pub struct FastIndexBuilder {
 }
 
 impl FastIndexBuilder {
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn bucket_list_for_test(&mut self, field: &str) {
+        self.postings
+            .entry(bucket_marker(&field_prefix(FIELD_LIST_ELEM, field)))
+            .or_default();
+    }
+
     pub fn reserve_dense(&mut self, notes: u32, folders: u32) {
         self.node_count = self.node_count.max(notes);
         self.folder_count = self.folder_count.max(folders);

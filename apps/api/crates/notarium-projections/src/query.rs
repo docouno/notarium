@@ -1091,16 +1091,33 @@ pub(crate) async fn exact_filter(
     universe: &Bitmap,
     predicate: &Predicate,
 ) -> Result<Bitmap, PortError> {
+    exact_filter_pages(index, universe, predicate, |page| async move {
+        let mut matches = Bitmap::new();
+        for note in query_rows(store, scope, cut, &page).await? {
+            if predicate.matches(&note.evaluated_fields()?) {
+                matches.add(note.dense_id);
+            }
+        }
+        Ok(matches)
+    })
+    .await
+}
+
+pub(crate) async fn exact_filter_pages<F>(
+    index: &IndexView,
+    universe: &Bitmap,
+    predicate: &Predicate,
+    verify: impl Fn(Vec<u32>) -> F,
+) -> Result<Bitmap, PortError>
+where
+    F: std::future::Future<Output = Result<Bitmap, PortError>>,
+{
     let candidates = index
         .filter_candidates(predicate, universe)
         .map_err(index_failure)?;
     let mut matching = candidates.definite;
     for page in dense_pages(&candidates.uncertain) {
-        for note in query_rows(store, scope, cut, &page).await? {
-            if predicate.matches(&note.evaluated_fields()?) {
-                matching.add(note.dense_id);
-            }
-        }
+        matching.or_inplace(&verify(page).await?);
     }
     Ok(matching)
 }

@@ -284,5 +284,100 @@ pub async fn folder_eligibility(store: Arc<CanonicalStore>, root: DataRoot) {
     assert_eq!(left.tantivy_commit, initial.tantivy_commit);
     assert_eq!(slots(), 0);
     assert_eq!(provider.parts.load(Ordering::SeqCst), 1);
+    // Two newly eligible descendants lie on distinct 16-note repair pages.
+    // Canonical edits to a note outside this project keep arriving on both.
+    let padding: Vec<_> = (1..=15)
+        .map(|offset| sample_note_id(tag + offset))
+        .collect();
+    let last = sample_note_id(tag + 16);
+    let mut batch = vec![
+        note(&id, &child, "First repaired", "first repaired source"),
+        note(&last, &child, "Last repaired", "last repaired source"),
+    ];
+    batch.extend(
+        padding
+            .iter()
+            .map(|other| note(other, &folder, "Outside", "irrelevant")),
+    );
+    let (added, _) = store
+        .commit_synthetic_note_batch_for_test(&scope, lease, &owner, batch)
+        .await
+        .unwrap();
+    {
+        let mut view = projection.snapshot.write().unwrap();
+        let mut live = projection.live.write().unwrap();
+        for other in &padding {
+            view.index(other.clone(), folder.clone());
+            live.insert(other.clone());
+        }
+        view.index(last.clone(), child.clone());
+        live.insert(last.clone());
+        view.advance(added.last_seq);
+    }
+    ready(added.last_seq).await;
+    let baseline = provider.parts.load(Ordering::SeqCst);
+    provider.block_next_part.store(true, Ordering::SeqCst);
+    move_to(&project.folder_id).await;
+    let commit_edit = async |edit| {
+        let (range, _) = store
+            .commit_synthetic_note_batch_for_test(&scope, lease, &owner, vec![edit])
+            .await
+            .unwrap();
+        projection.snapshot.write().unwrap().advance(range.last_seq);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while layout.search_manifest().unwrap().unwrap().tantivy_seq < range.last_seq {
+                tokio::time::sleep(Duration::from_millis(8)).await;
+            }
+        })
+        .await
+        .unwrap();
+        range.last_seq
+    };
+    let await_part = async |phase| {
+        tokio::time::timeout(Duration::from_secs(8), async {
+            let mut revision = 0;
+            while tokio::time::timeout(Duration::from_millis(20), provider.part_started.notified())
+                .await
+                .is_err()
+            {
+                let text = format!("between repair pages {phase} mutation {revision}");
+                commit_edit(note(&padding[0], &folder, "Outside", &text)).await;
+                revision += 1;
+            }
+        })
+        .await
+        .unwrap();
+    };
+    let mut latest = added.last_seq;
+    for page in 0..2 {
+        await_part(page).await;
+        for revision in 0..3 {
+            let edit = if page == 1 && revision == 2 {
+                note(&last, &child, "Last repaired", "newer text after dispatch")
+            } else {
+                let text = format!("unrelated page {page} mutation {revision}");
+                note(&padding[0], &folder, "Outside", &text)
+            };
+            latest = commit_edit(edit).await;
+        }
+        provider.block_next_part.store(true, Ordering::SeqCst);
+        provider.release_part.notify_one();
+    }
+    await_part(2).await;
+    let interim: BTreeSet<_> = MutableBuffer::open(&epoch, 64)
+        .unwrap()
+        .chunks()
+        .map(|chunk| chunk.metadata.note.clone())
+        .collect();
+    assert_eq!(interim, BTreeSet::from([id.clone()]));
+    provider.release_part.notify_one();
+    ready(latest).await;
+    assert_eq!(provider.parts.load(Ordering::SeqCst), baseline + 3);
+    let repaired: BTreeSet<_> = MutableBuffer::open(&epoch, 64)
+        .unwrap()
+        .chunks()
+        .map(|chunk| chunk.metadata.note.clone())
+        .collect();
+    assert_eq!(repaired, BTreeSet::from([id, last]));
     engine.shutdown().await;
 }

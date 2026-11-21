@@ -461,18 +461,31 @@ async fn consume_with_schedule(
                 break tokio::select! {
                     biased;
                     () = cx.handle.stop.cancelled() => return Ok(None),
-                    notice = &mut next => notice?.ok_or(IndexError::Inconsistent)?,
-                    () = cx.handle.wake.notified() => ChangeNotice::Lagged { resume },
                     _ = tokio::time::sleep_until(repair.next()), if disk.as_ref().is_some_and(Disk::needs_embedding_repair) => {
+                        // A ready change stream must not starve the next bounded page.
+                        // Check destructive changes before resuming an idle mapping.
                         if let Some(current) = &mut disk {
+                            if cx.requires_scrub(current.cursor()).await?
+                                || (current.lexical.is_none() && cx.has_pending_redaction(current.cursor()).await?)
+                            {
+                                break ChangeNotice::PurgeResync { cutoff: cx.latest(&scope).await? };
+                            }
                             if current.resume_vectors(cx, publisher).await? {
                                 publisher.publish(current);
                             }
-                            let cutoff = current.cursor();
-                            cx.while_current(&cutoff, repair.page(cx, current, publisher)).await?.transpose()?;
+                            match repair.page(cx, current, publisher).await {
+                                Ok(true) => break ChangeNotice::Lagged { resume },
+                                Ok(false) => {}
+                                Err(error) if error.requires_scrub() => {
+                                    break ChangeNotice::PurgeResync { cutoff: cx.latest(&scope).await? };
+                                }
+                                Err(error) => return Err(error),
+                            }
                         }
                         continue;
                     }
+                    notice = &mut next => notice?.ok_or(IndexError::Inconsistent)?,
+                    () = cx.handle.wake.notified() => ChangeNotice::Lagged { resume },
                     _ = ticker.tick() => {
                         // Resolving a consumed ring signal can require a durable read.
                         // Keep that read alive across idle vector maintenance.
@@ -764,8 +777,7 @@ fn open_vector_epoch(
 #[derive(Default)]
 struct ChangedNotes {
     notes: BTreeSet<NoteId>,
-    moved_folders: BTreeSet<FolderId>,
-    restored_folders: BTreeSet<FolderId>,
+    folders: BTreeSet<FolderId>,
 }
 
 impl ChangedNotes {
@@ -773,15 +785,11 @@ impl ChangedNotes {
         &mut self,
         target: Option<&crate::ports::ResolvedEmbeddingTarget>,
     ) -> BTreeSet<FolderId> {
-        let moved = std::mem::take(&mut self.moved_folders);
-        let mut restored = std::mem::take(&mut self.restored_folders);
-        if let Some(crate::ports::EmbeddingBackendTarget::Remote { project, .. }) =
+        let folders = std::mem::take(&mut self.folders);
+        if let Some(crate::ports::EmbeddingBackendTarget::Remote { .. }) =
             target.map(|target| &target.backend)
         {
-            if project.is_some() {
-                restored.extend(moved);
-            }
-            restored
+            folders
         } else {
             BTreeSet::new()
         }
@@ -904,11 +912,13 @@ async fn catch_up(
                         EntityId::Note(id) => {
                             dirty.notes.insert(id.clone());
                         }
-                        EntityId::Folder(id) if change.kind == ChangeKind::Move => {
-                            dirty.moved_folders.insert(id.clone());
-                        }
-                        EntityId::Folder(id) if change.kind == ChangeKind::Restore => {
-                            dirty.restored_folders.insert(id.clone());
+                        EntityId::Folder(id)
+                            if matches!(
+                                change.kind,
+                                ChangeKind::Move | ChangeKind::Trash | ChangeKind::Restore
+                            ) =>
+                        {
+                            dirty.folders.insert(id.clone());
                         }
                         _ => {}
                     }

@@ -90,6 +90,14 @@ pub struct VectorSnapshot {
 }
 
 impl VectorSnapshot {
+    pub(crate) fn find_vector(&self, key: ContentDigest) -> Option<QuantizedVector> {
+        find_cached_vector(
+            self.mutable.values().flat_map(|chunks| chunks.iter()),
+            &self.segments,
+            key,
+        )
+    }
+
     pub fn manifest(&self) -> &EpochManifest {
         &self.epoch
     }
@@ -316,6 +324,23 @@ impl VectorSnapshot {
     }
 }
 
+fn find_cached_vector<'a>(
+    mut mutable: impl Iterator<Item = &'a VectorChunk>,
+    segments: &[Segment],
+    key: ContentDigest,
+) -> Option<QuantizedVector> {
+    if let Some(chunk) = mutable.find(|chunk| chunk.metadata.key == key) {
+        return Some(chunk.vector.clone());
+    }
+    segments.iter().rev().find_map(|segment| {
+        segment
+            .index
+            .keys
+            .get(&key)
+            .and_then(|&slot| segment.index.data.owned_vector(slot))
+    })
+}
+
 /// A single indexing owner mutates an epoch. Queries use immutable snapshots.
 pub struct VectorEpoch {
     layout: Arc<SearchLayout>,
@@ -397,20 +422,7 @@ impl VectorEpoch {
     /// Copy a numerical embedding with the same model and rendered text.
     /// Every new chunk keeps its own metadata and source spans.
     pub fn find_vector(&self, key: ContentDigest) -> Option<QuantizedVector> {
-        if let Some(chunk) = self
-            .mutable
-            .chunks()
-            .find(|chunk| chunk.metadata.key == key)
-        {
-            return Some(chunk.vector.clone());
-        }
-        self.segments.iter().rev().find_map(|segment| {
-            segment
-                .index
-                .keys
-                .get(&key)
-                .and_then(|&slot| segment.index.data.owned_vector(slot))
-        })
+        find_cached_vector(self.mutable.chunks(), &self.segments, key)
     }
 
     pub fn apply(&mut self, seq: SpaceSeq, operation: MutableOperation) -> Result<(), VectorError> {

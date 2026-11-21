@@ -905,7 +905,12 @@ pub async fn scoped_backfill_recovers_and_rechecks_selection(
             }
         })
         .await
-        .unwrap();
+        .unwrap_or_else(|_| {
+            panic!(
+                "model switch to {selected:?} did not finish: {:?}",
+                layout.search_manifest()
+            )
+        });
     };
     // The subscriber must recover from the cold resolver error and complete
     // the switch without support from a query or a new canonical edit.
@@ -920,6 +925,7 @@ pub async fn scoped_backfill_recovers_and_rechecks_selection(
     resolver.cap.store(8, Ordering::SeqCst);
     *resolver.project.write().unwrap() = Some(empty);
     let ctx = context(&space.scope, &owner);
+    let queries_before = provider.queries.lock().unwrap().len();
     assert!(
         !engine
             .search(ctx, query("source"))
@@ -928,6 +934,7 @@ pub async fn scoped_backfill_recovers_and_rechecks_selection(
             .hits
             .is_empty()
     );
+    assert_eq!(provider.queries.lock().unwrap().len(), queries_before);
     await_model(resolver.current_target()).await;
     assert_eq!(provider.project_parts.lock().unwrap().len(), 2);
     assert_eq!(provider.outside_parts.load(Ordering::SeqCst), 0);

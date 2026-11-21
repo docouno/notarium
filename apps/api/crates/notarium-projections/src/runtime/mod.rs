@@ -628,6 +628,8 @@ struct SpaceSlot {
     repair: Notify,
     #[cfg(any(test, feature = "test-support"))]
     benchmark_pause: benchmark::PauseSlot,
+    #[cfg(any(test, feature = "test-support"))]
+    bucketed_list_for_test: Mutex<Option<String>>,
 }
 
 impl SpaceSlot {
