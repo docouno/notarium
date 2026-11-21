@@ -53,6 +53,33 @@ runs within one checkout and removes its container and scratch directory on
 clean exit; logs remain in `.artifacts/control-db-fixture/` when a run fails.
 No host PostgreSQL installation is required.
 
+## Continuous integration
+
+Pull requests against `v1` and pushes to `v1` run public documentation and shard
+configuration checks first. For a verified docs-only PR, the workflow skips
+the code jobs. The allowlist covers `docs/**`, `README.md`, `AGENTS.md`, and
+`LICENSE`. Every push and every other PR runs the full workflow.
+
+- `node` checks, tests and builds the four Node components in their workspace.
+- `api-check` runs `make check app=api` and `make build app=api`, including test
+  discovery across the Cargo workspace.
+- Five `api-test` shards run the offline Rust tests with isolated fixture
+  stacks. Each workspace crate belongs to exactly one shard. The platform
+  shard also runs all workspace doc tests. [Shard manifest](../scripts/ci-api-shards.json)
+- The required `verify` job passes only when the planning job and all required
+  jobs succeed, or when planning confirms a docs-only PR and all code jobs
+  were skipped.
+
+CI caches Node and Rust tooling separately. Only `api-check` saves the pruned
+Cargo dependency artifacts, which the shards can restore. The desktop and
+storage fixture images have separate recipe-keyed caches. The check-only Rust
+job sets `NOTARIUM_SKIP_API_FIXTURES=1` on `make setup app=api` to omit fixture
+images. Test runs require the regular setup.
+
+After making changes, run `make setup`, `make check`, `make test`, and
+`make build` locally. To reproduce one CI shard after setup, run
+`sh scripts/ci-run-api-shard.sh canonical` with Python 3.11 or newer on the host.
+
 ## Dependencies and ownership
 
 `.devkit/manifest.json`, generated projections (including `.devkit/runtime/api.env`

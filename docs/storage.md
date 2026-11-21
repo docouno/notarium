@@ -572,11 +572,19 @@ same example against an isolated prefix.
 `make setup` pulls the digest-pinned `postgres:16-bookworm` image, builds the
 pinned MinIO Community image from source (`RELEASE.2025-10-15T17-29-55Z`, commit
 `9e49d5e7a648f00e26f2246f4dc28e6b07f8c84a`) and builds the `#![forbid(unsafe_code)]`
-Unix-socket-to-loopback S3 bridge (`compose.storage-tests.yaml`). `make test`
-starts an isolated per-run fixture stack (`--network none` / internal namespace)
+Unix-socket-to-loopback S3 bridge (`compose.storage-tests.yaml`). Setup reuses
+an existing image when its `io.notarium.fixture-recipe-sha256` label matches
+the hash of the Compose file and that image's build inputs. Pass `--force` to
+request both builds.
+
+```sh
+sh docker/storage-fixtures/with-storage-fixtures.sh setup-images --force
+```
+
+`make test` starts an isolated per-run fixture stack (`--network none` / internal namespace)
 mounted over `.artifacts/storage-tests/<run>/` Unix domain sockets and tears it
-down automatically via signal/exit traps. Integration tests fail closed if
-fixtures are absent.
+down automatically via signal/exit traps. The offline runner rejects missing
+or stale fixture images. Run `make setup app=api` to prepare the current recipes.
 
 The test and benchmark commands hold one checkout-wide fixture lock from startup
 through cleanup. Other checkouts can run independently.

@@ -50,29 +50,77 @@ sweep_stale_runs() {
   fi
 }
 
+recipe_sha256() {
+  recipe=
+  for input in "$@"; do
+    digest=$(sha256sum <"$ROOT/$input") || fail "cannot hash fixture recipe input: $input"
+    recipe="$recipe$input
+${digest%% *}
+"
+  done
+  digest=$(printf '%s' "$recipe" | sha256sum) || fail "cannot hash fixture recipe"
+  printf '%s\n' "${digest%% *}"
+}
+
+export_recipe_shas() {
+  NOTARIUM_MINIO_RECIPE_SHA256=$(recipe_sha256 compose.storage-tests.yaml docker/storage-fixtures/minio-ce.Dockerfile)
+  NOTARIUM_BRIDGE_RECIPE_SHA256=$(recipe_sha256 compose.storage-tests.yaml docker/storage-fixtures/uds-bridge.Dockerfile docker/storage-fixtures/uds_tcp_bridge.rs)
+  export NOTARIUM_MINIO_RECIPE_SHA256 NOTARIUM_BRIDGE_RECIPE_SHA256
+}
+
+image_matches_recipe() {
+  [ -n "$2" ] || return 1
+  observed=$(docker image inspect --format '{{index .Config.Labels "io.notarium.fixture-recipe-sha256"}}' "$1" 2>/dev/null) || return 1
+  [ "$observed" = "$2" ]
+}
+
+ensure_fixture_image() {
+  image=$1 dockerfile=$2 expected=$3 force=$4
+  if [ "$force" = 0 ] && image_matches_recipe "$image" "$expected"; then
+    printf 'storage-fixtures: reusing %s\n' "$image"
+    return
+  fi
+  # Compose's service network dependency would also build MinIO for the bridge.
+  docker build -f "$ROOT/$dockerfile" --build-arg "NOTARIUM_FIXTURE_RECIPE_SHA256=$expected" -t "$image" "$ROOT"
+  image_matches_recipe "$image" "$expected" || fail "built fixture image '$image' did not match its recipe"
+}
+
 setup_images() {
+  case "$#:${1:-}" in
+    0:) force=0 ;;
+    1:--force) force=1 ;;
+    *) fail "usage: setup-images [--force]" ;;
+  esac
+  if [ "$skip_api_fixtures" = 1 ]; then
+    [ "$force" = 0 ] || fail "NOTARIUM_SKIP_API_FIXTURES=1 cannot be used with --force"
+    printf 'storage-fixtures: skipping fixture image setup (NOTARIUM_SKIP_API_FIXTURES=1)\n' >&2
+    return
+  fi
+  export_recipe_shas
   if ! docker image inspect "$PG_IMAGE" >/dev/null 2>&1; then
     docker pull "$PG_IMAGE"
   fi
-  NOTARIUM_FIXTURE_UID=$(id -u) \
-  NOTARIUM_FIXTURE_GID=$(id -g) \
-  NOTARIUM_FIXTURE_CHECKOUT_HASH="$CHECKOUT_HASH" \
-  NOTARIUM_FIXTURE_RUN_ID="setup" \
-  NOTARIUM_FIXTURE_RUN_DIR="/tmp" \
-  NOTARIUM_FIXTURE_PG_USER="setup" \
-  NOTARIUM_FIXTURE_PG_PASSWORD="setup" \
-  NOTARIUM_FIXTURE_PG_DB="setup" \
-  NOTARIUM_FIXTURE_S3_ACCESS_KEY="setupaccesskey" \
-  NOTARIUM_FIXTURE_S3_SECRET_KEY="setupsecretkey1234" \
-    docker compose -f "$COMPOSE_FILE" build minio s3-bridge
+  ensure_fixture_image "$MINIO_IMAGE" docker/storage-fixtures/minio-ce.Dockerfile "$NOTARIUM_MINIO_RECIPE_SHA256" "$force"
+  ensure_fixture_image "$BRIDGE_IMAGE" docker/storage-fixtures/uds-bridge.Dockerfile "$NOTARIUM_BRIDGE_RECIPE_SHA256" "$force"
 }
 
-if [ "${1:-}" = "setup-images" ]; then
-  setup_images
-  exit 0
-fi
+skip_api_fixtures=${NOTARIUM_SKIP_API_FIXTURES:-0}
+case "$skip_api_fixtures" in
+  0|1) ;;
+  *) fail "NOTARIUM_SKIP_API_FIXTURES must be 0 or 1" ;;
+esac
 
 case "${1:-}" in
+  setup-images)
+    shift
+    setup_images "$@"
+    exit 0
+    ;;
+  fixture-images)
+    [ "$#" -eq 1 ] || fail "usage: fixture-images"
+    printf '%s\n' "$MINIO_IMAGE" "$BRIDGE_IMAGE"
+    exit 0
+    ;;
   test|exec-custom|benchmark) projection_benchmark=0 ;;
   projection-benchmark)
     [ "$#" -eq 1 ] || fail "usage: projection-benchmark"
@@ -81,15 +129,17 @@ case "${1:-}" in
   *) exec sh "$ROOT/.devkit/runtime/devkit.sh" "$@" ;;
 esac
 
-# Verify all pinned fixture images exist locally (offline --pull never enforcement).
-required_images="$PG_IMAGE"
+[ "$skip_api_fixtures" = 0 ] || fail "NOTARIUM_SKIP_API_FIXTURES=1 is permitted only for setup"
+export_recipe_shas
+
+docker image inspect "$PG_IMAGE" >/dev/null 2>&1 || \
+  fail "missing fixture image '$PG_IMAGE'; run 'make setup app=api' first"
 if [ "$projection_benchmark" = 0 ]; then
-  required_images="$required_images $MINIO_IMAGE $BRIDGE_IMAGE"
+  image_matches_recipe "$MINIO_IMAGE" "$NOTARIUM_MINIO_RECIPE_SHA256" || \
+    fail "missing or stale fixture image '$MINIO_IMAGE'; run 'make setup app=api' first"
+  image_matches_recipe "$BRIDGE_IMAGE" "$NOTARIUM_BRIDGE_RECIPE_SHA256" || \
+    fail "missing or stale fixture image '$BRIDGE_IMAGE'; run 'make setup app=api' first"
 fi
-for required_image in $required_images; do
-  docker image inspect "$required_image" >/dev/null 2>&1 || \
-    fail "missing fixture image '$required_image'; run 'make setup app=api' first"
-done
 
 mkdir -p -- "$FIXTURES_BASE"
 # The manifest and stale-run sweep belong to one checkout. Keep ownership

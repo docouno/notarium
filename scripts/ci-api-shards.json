@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "feature_anchor_crates": ["notarium-bin"],
+  "shards": [
+    {
+      "id": "control",
+      "crates": ["notarium-control"],
+      "needs_build_api": false,
+      "saves_fixture_cache": false,
+      "runs_doc_tests": false,
+      "prebuild_examples": []
+    },
+    {
+      "id": "canonical",
+      "crates": ["notarium-canonical"],
+      "needs_build_api": false,
+      "saves_fixture_cache": true,
+      "runs_doc_tests": false,
+      "prebuild_examples": [
+        {"package": "notarium-canonical", "example": "live_s3_acceptance"}
+      ]
+    },
+    {
+      "id": "projections",
+      "crates": ["notarium-projections"],
+      "needs_build_api": false,
+      "saves_fixture_cache": false,
+      "runs_doc_tests": false,
+      "prebuild_examples": []
+    },
+    {
+      "id": "engine",
+      "crates": ["notarium-search", "notarium-collab", "notarium-vault"],
+      "needs_build_api": false,
+      "saves_fixture_cache": false,
+      "runs_doc_tests": false,
+      "prebuild_examples": []
+    },
+    {
+      "id": "platform",
+      "crates": [
+        "notarium-core",
+        "notarium-syntax",
+        "notarium-jobs",
+        "notarium-agents",
+        "notarium-http",
+        "notarium-bin",
+        "notarium-migrate",
+        "fitness-gates"
+      ],
+      "needs_build_api": true,
+      "saves_fixture_cache": false,
+      "runs_doc_tests": true,
+      "prebuild_examples": []
+    }
+  ]
+}
