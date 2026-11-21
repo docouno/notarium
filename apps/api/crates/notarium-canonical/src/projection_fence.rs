@@ -703,6 +703,33 @@ impl LiveLifecycleFence {
         Ok(self.bind(gate, scope, epoch))
     }
 
+    /// Gets a handle for the current history, waiting within `budget` if a
+    /// writer briefly holds the Space gate.
+    pub async fn read_space(
+        &self,
+        scope: &HistoryScope,
+        budget: &CallBudget,
+    ) -> Result<LiveSpaceHandle, PortError> {
+        let gate = self
+            .topology
+            .read()
+            .expect("projection topology")
+            .get(&scope.space_id)
+            .cloned()
+            .ok_or_else(not_ready)?;
+        let deadline =
+            crate::runtime::deadline_after(tokio::time::Instant::now(), budget.remaining);
+        let guard = budgeted(budget, deadline, Arc::clone(&gate).read_owned()).await?;
+        let state = guard.state().ok_or_else(not_ready)?;
+        state.record.scope.check(scope)?;
+        if !state.readable || state.lookup_retired || self.closed.load(Ordering::Acquire) {
+            return Err(not_ready());
+        }
+        let epoch = state.record.active_epoch;
+        drop(guard);
+        Ok(self.bind(gate, scope, epoch))
+    }
+
     fn bind(&self, gate: Gate, scope: &HistoryScope, epoch: LeaseEpoch) -> LiveSpaceHandle {
         LiveSpaceHandle {
             gate,

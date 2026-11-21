@@ -598,6 +598,195 @@ struct ThreadHeadRow {
     tainted_mask: i64,
 }
 
+#[allow(clippy::type_complexity)]
+fn parse_thread_head_row(
+    thread_id: ChatThreadId,
+    raw: (
+        String,
+        String,
+        Option<String>,
+        String,
+        i64,
+        String,
+        i64,
+        Option<String>,
+        i64,
+    ),
+) -> Result<ThreadHeadRow, PortError> {
+    let (
+        kind_raw,
+        owner_raw,
+        proj_opt,
+        title,
+        head_leaf_raw,
+        head_rev_raw,
+        next_entry_raw,
+        run_opt,
+        tainted_mask,
+    ) = raw;
+    let kind = chat_thread_kind_from_db(&kind_raw)?;
+    let owner = PrincipalId::parse(&owner_raw)
+        .map_err(|_| internal_not_committed("corrupt_thread_owner", "invalid owner_id"))?;
+    let project_folder = match proj_opt {
+        Some(s) => Some(
+            FolderId::parse(&s)
+                .map_err(|_| internal_not_committed("corrupt_thread_proj", "invalid FolderId"))?,
+        ),
+        None => None,
+    };
+    let head_leaf_seq = ThreadEntrySeq::new(
+        u64::try_from(head_leaf_raw)
+            .map_err(|_| internal_not_committed("corrupt_head_leaf", "negative head_leaf_seq"))?,
+    )?;
+    let head_rev_id = RevisionId::parse(&head_rev_raw)
+        .map_err(|_| internal_not_committed("corrupt_thread_rev", "invalid head_rev_id"))?;
+    let next_entry_seq =
+        ThreadEntrySeq::new(u64::try_from(next_entry_raw).map_err(|_| {
+            internal_not_committed("corrupt_next_entry", "negative next_entry_seq")
+        })?)?;
+    let active_run_id = match run_opt {
+        Some(s) => Some(
+            AgentRunId::parse(&s)
+                .map_err(|_| internal_not_committed("corrupt_thread_run", "invalid AgentRunId"))?,
+        ),
+        None => None,
+    };
+
+    Ok(ThreadHeadRow {
+        thread_id,
+        kind,
+        owner,
+        project_folder,
+        title,
+        head_leaf_seq,
+        head_rev_id,
+        next_entry_seq,
+        active_run_id,
+        tainted_mask,
+    })
+}
+
+async fn load_thread_heads_batch_tx(
+    tx: &mut BackendConn<'_>,
+    space_id: &SpaceId,
+    thread_ids: &[ChatThreadId],
+) -> Result<std::collections::BTreeMap<ChatThreadId, ThreadHeadRow>, PortError> {
+    let mut out = std::collections::BTreeMap::new();
+    if thread_ids.is_empty() {
+        return Ok(out);
+    }
+    #[allow(clippy::type_complexity)]
+    let rows: Vec<(
+        String,
+        String,
+        String,
+        Option<String>,
+        String,
+        i64,
+        String,
+        i64,
+        Option<String>,
+        i64,
+    )> = match tx {
+        BackendConn::Sqlite(conn) => {
+            let mut acc = Vec::with_capacity(thread_ids.len());
+            for chunk in thread_ids.chunks(200) {
+                let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+                    "SELECT thread_id, kind, owner_id, project_folder_id, title, head_leaf_seq,
+                            head_rev_id, next_entry_seq, active_run_id, ext_space_tainted_mask
+                     FROM chat_threads WHERE space_id = ",
+                );
+                qb.push_bind(space_id.as_str());
+                qb.push(" AND thread_id IN (");
+                let mut sep = qb.separated(", ");
+                for id in chunk {
+                    sep.push_bind(id.as_str());
+                }
+                qb.push(")");
+                let part = qb.build().fetch_all(&mut **conn).await.map_err(|err| {
+                    internal_not_committed("sqlite_load_threads_batch", err.to_string())
+                })?;
+                for row in part {
+                    acc.push((
+                        row.get("thread_id"),
+                        row.get("kind"),
+                        row.get("owner_id"),
+                        row.get("project_folder_id"),
+                        row.get("title"),
+                        row.get("head_leaf_seq"),
+                        row.get("head_rev_id"),
+                        row.get("next_entry_seq"),
+                        row.get("active_run_id"),
+                        row.get("ext_space_tainted_mask"),
+                    ));
+                }
+            }
+            acc
+        }
+        BackendConn::Postgres(conn) => {
+            let id_strs: Vec<&str> = thread_ids.iter().map(ChatThreadId::as_str).collect();
+            let part = sqlx::query(
+                "SELECT thread_id, kind, owner_id, project_folder_id, title, head_leaf_seq,
+                        head_rev_id, next_entry_seq, active_run_id, ext_space_tainted_mask::BIGINT AS tainted_mask
+                 FROM chat_threads WHERE space_id = $1 AND thread_id = ANY($2)",
+            )
+            .bind(space_id.as_str())
+            .bind(&id_strs)
+            .fetch_all(&mut **conn)
+            .await
+            .map_err(|err| crate::runtime::pg_read_error("pg_load_threads_batch", err))?;
+            part.into_iter()
+                .map(|row| {
+                    (
+                        row.get("thread_id"),
+                        row.get("kind"),
+                        row.get("owner_id"),
+                        row.get("project_folder_id"),
+                        row.get("title"),
+                        row.get("head_leaf_seq"),
+                        row.get("head_rev_id"),
+                        row.get("next_entry_seq"),
+                        row.get("active_run_id"),
+                        row.get("tainted_mask"),
+                    )
+                })
+                .collect()
+        }
+    };
+    for (
+        thread_raw,
+        kind_raw,
+        owner_raw,
+        proj_opt,
+        title,
+        head_leaf_raw,
+        head_rev_raw,
+        next_entry_raw,
+        run_opt,
+        tainted_mask,
+    ) in rows
+    {
+        let thread_id = ChatThreadId::parse(&thread_raw)
+            .map_err(|_| internal_not_committed("corrupt_thread_id", "invalid thread_id"))?;
+        let head = parse_thread_head_row(
+            thread_id.clone(),
+            (
+                kind_raw,
+                owner_raw,
+                proj_opt,
+                title,
+                head_leaf_raw,
+                head_rev_raw,
+                next_entry_raw,
+                run_opt,
+                tainted_mask,
+            ),
+        )?;
+        out.insert(thread_id, head);
+    }
+    Ok(out)
+}
+
 async fn load_thread_head_opt_tx(
     tx: &mut BackendConn<'_>,
     space_id: &SpaceId,
@@ -667,61 +856,8 @@ async fn load_thread_head_opt_tx(
         }
     };
 
-    let Some((
-        kind_raw,
-        owner_raw,
-        proj_opt,
-        title,
-        head_leaf_raw,
-        head_rev_raw,
-        next_entry_raw,
-        run_opt,
-        tainted_mask,
-    )) = raw
-    else {
-        return Ok(None);
-    };
-
-    let kind = chat_thread_kind_from_db(&kind_raw)?;
-    let owner = PrincipalId::parse(&owner_raw)
-        .map_err(|_| internal_not_committed("corrupt_thread_owner", "invalid owner_id"))?;
-    let project_folder = match proj_opt {
-        Some(s) => Some(
-            FolderId::parse(&s)
-                .map_err(|_| internal_not_committed("corrupt_thread_proj", "invalid FolderId"))?,
-        ),
-        None => None,
-    };
-    let head_leaf_seq = ThreadEntrySeq::new(
-        u64::try_from(head_leaf_raw)
-            .map_err(|_| internal_not_committed("corrupt_head_leaf", "negative head_leaf_seq"))?,
-    )?;
-    let head_rev_id = RevisionId::parse(&head_rev_raw)
-        .map_err(|_| internal_not_committed("corrupt_thread_rev", "invalid head_rev_id"))?;
-    let next_entry_seq =
-        ThreadEntrySeq::new(u64::try_from(next_entry_raw).map_err(|_| {
-            internal_not_committed("corrupt_next_entry", "negative next_entry_seq")
-        })?)?;
-    let active_run_id = match run_opt {
-        Some(s) => Some(
-            AgentRunId::parse(&s)
-                .map_err(|_| internal_not_committed("corrupt_thread_run", "invalid AgentRunId"))?,
-        ),
-        None => None,
-    };
-
-    Ok(Some(ThreadHeadRow {
-        thread_id: thread_id.clone(),
-        kind,
-        owner,
-        project_folder,
-        title,
-        head_leaf_seq,
-        head_rev_id,
-        next_entry_seq,
-        active_run_id,
-        tainted_mask,
-    }))
+    raw.map(|row| parse_thread_head_row(thread_id.clone(), row))
+        .transpose()
 }
 
 async fn load_thread_head_tx(

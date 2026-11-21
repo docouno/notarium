@@ -1,5 +1,6 @@
 //! One worker consumes bounded FIFO queues in priority order, checking the
-//! interactive lane between every batch.
+//! interactive lane between every batch. Each job runs in a spawned task so
+//! panics cannot take down the scheduler.
 
 use super::EmbeddingError;
 use crate::config::MAX_QUERY_EMBEDDING_BUDGET;
@@ -28,6 +29,7 @@ pub enum Priority {
     LiveNoteEdit,
     BulkImportBackfill,
 }
+
 impl Priority {
     fn lane(self) -> usize {
         match self {
@@ -61,6 +63,24 @@ struct Shared {
     state: Mutex<State>,
     wake: Notify,
     next_id: AtomicU64,
+}
+
+impl Shared {
+    fn close_and_drain(&self) {
+        let (active, queued) = {
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            state.closed = true;
+            (state.active.take(), std::mem::take(&mut state.jobs))
+        };
+        if let Some(active) = active {
+            active.cancel();
+        }
+        for job in queued.into_iter().flatten() {
+            job.budget.cancellation.cancel();
+            let _ = job.result.send(Err(EmbeddingError::Cancelled));
+        }
+        self.wake.notify_one();
+    }
 }
 
 #[derive(Clone)]
@@ -149,23 +169,7 @@ impl EmbeddingScheduler {
     /// Signal the worker and queued jobs. Await the worker before dropping the
     /// runtime so native and provider calls have acknowledged cancellation.
     pub fn shutdown(&self) {
-        let (active, queued) = {
-            let mut state = self
-                .shared
-                .state
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            state.closed = true;
-            (state.active.clone(), std::mem::take(&mut state.jobs))
-        };
-        if let Some(active) = active {
-            active.cancel();
-        }
-        for job in queued.into_iter().flatten() {
-            job.budget.cancellation.cancel();
-            let _ = job.result.send(Err(EmbeddingError::Cancelled));
-        }
-        self.shared.wake.notify_one();
+        self.shared.close_and_drain();
     }
 }
 
@@ -175,6 +179,7 @@ struct Submission<'a> {
     lane: usize,
     child: Cancellation,
 }
+
 impl Drop for Submission<'_> {
     fn drop(&mut self) {
         self.child.cancel();
@@ -193,7 +198,35 @@ impl Drop for Submission<'_> {
     }
 }
 
+struct WorkerGuard {
+    shared: Arc<Shared>,
+}
+
+impl Drop for WorkerGuard {
+    fn drop(&mut self) {
+        self.shared.close_and_drain();
+    }
+}
+
+struct ActiveGuard<'a> {
+    shared: &'a Shared,
+}
+
+impl Drop for ActiveGuard<'_> {
+    fn drop(&mut self) {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.active = None;
+    }
+}
+
 async fn run(shared: Arc<Shared>) {
+    let _worker_guard = WorkerGuard {
+        shared: shared.clone(),
+    };
     loop {
         let work = {
             let mut state = shared
@@ -211,14 +244,26 @@ async fn run(shared: Arc<Shared>) {
             shared.wake.notified().await;
             continue;
         };
+        let active_guard = ActiveGuard { shared: &shared };
         job.budget.remaining = job.deadline.saturating_duration_since(Instant::now());
         let result = if job.budget.cancellation.is_cancelled() {
             Err(EmbeddingError::Cancelled)
         } else if job.budget.remaining.is_zero() {
             Err(EmbeddingError::BudgetExceeded)
         } else {
-            (job.execute)(job.budget).await
+            let execute = job.execute;
+            let budget = job.budget;
+            match tokio::spawn(async move { execute(budget).await }).await {
+                Ok(output) => output,
+                Err(error) => {
+                    if error.is_panic() {
+                        tracing::error!("embedding scheduler job panicked");
+                    }
+                    Err(EmbeddingError::ModelUnavailable)
+                }
+            }
         };
+        drop(active_guard);
         let _ = job.result.send(result);
     }
 }

@@ -18,6 +18,7 @@ use ort::{
 };
 use std::{
     io::Read,
+    num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -34,9 +35,23 @@ pub enum Pooling {
     Mean,
     Cls,
 }
+
 impl Pooling {
     pub(crate) fn is_mean(&self) -> bool {
         *self == Self::Mean
+    }
+}
+
+struct TerminateOnDrop {
+    options: Arc<RunOptions>,
+    completed: bool,
+}
+
+impl Drop for TerminateOnDrop {
+    fn drop(&mut self) {
+        if !self.completed {
+            let _ = self.options.terminate();
+        }
     }
 }
 
@@ -71,16 +86,22 @@ impl OrtModel {
             target.max_input_tokens,
         )?);
         let meta = profile.symlink_metadata("model.onnx")?;
-        if !meta.is_file() || meta.len() > MODEL_BYTES {
+        if !meta.is_file() || meta.len() == 0 || meta.len() > MODEL_BYTES {
             return Err(EmbeddingError::InvalidModel);
         }
         let graph = profile.open_with(
             "model.onnx",
             OpenOptions::new().read(true).follow(FollowSymlinks::No),
         )?;
-        let mut bytes = Vec::new();
+        let file_meta = graph.metadata()?;
+        if !file_meta.is_file() || file_meta.len() == 0 || file_meta.len() > MODEL_BYTES {
+            return Err(EmbeddingError::InvalidModel);
+        }
+        let capacity =
+            usize::try_from(file_meta.len()).map_err(|_| EmbeddingError::InvalidModel)?;
+        let mut bytes = Vec::with_capacity(capacity);
         graph.take(MODEL_BYTES + 1).read_to_end(&mut bytes)?;
-        if bytes.len() as u64 > MODEL_BYTES {
+        if bytes.is_empty() || bytes.len() as u64 > MODEL_BYTES {
             return Err(EmbeddingError::InvalidModel);
         }
         let environment = environment(library)?;
@@ -92,6 +113,7 @@ impl OrtModel {
                 .commit_from_memory(&bytes)
         })()
         .map_err(|_| EmbeddingError::InvalidModel)?;
+        drop(bytes);
         let input_names: Vec<_> = session.inputs().iter().map(|input| input.name()).collect();
         let types = input_names.contains(&"token_type_ids");
         if !input_names.contains(&"input_ids")
@@ -133,7 +155,14 @@ impl OrtModel {
         texts: Vec<String>,
         budget: CallBudget,
     ) -> Result<Vec<Option<Vec<f32>>>, EmbeddingError> {
+        if budget.cancellation.is_cancelled() {
+            return Err(EmbeddingError::Cancelled);
+        }
         let options = Arc::new(RunOptions::new().map_err(|_| EmbeddingError::ModelUnavailable)?);
+        let mut guard = TerminateOnDrop {
+            options: options.clone(),
+            completed: false,
+        };
         let mut worker = tokio::task::spawn_blocking({
             let options = options.clone();
             let cancellation = budget.cancellation.clone();
@@ -146,9 +175,13 @@ impl OrtModel {
                 // A native run is released between ONNX operators. Keep the
                 // scheduler's slot until that run has actually stopped.
                 let _ = worker.await;
+                guard.completed = true;
                 Err(EmbeddingError::Cancelled)
             }
-            result = &mut worker => result.map_err(|_| EmbeddingError::ModelUnavailable)?,
+            result = &mut worker => {
+                guard.completed = true;
+                result.map_err(|_| EmbeddingError::ModelUnavailable)?
+            }
         }
     }
 
@@ -260,8 +293,12 @@ impl OrtModel {
 }
 
 fn environment(path: &Path) -> Result<Environment, EmbeddingError> {
+    let leaf = std::fs::symlink_metadata(path)?;
+    if !leaf.is_file() {
+        return Err(EmbeddingError::InvalidModel);
+    }
     let library = path.canonicalize()?;
-    if library != path || !library.is_file() {
+    if !library.is_file() {
         return Err(EmbeddingError::InvalidModel);
     }
     let mut runtime = RUNTIME
@@ -287,12 +324,60 @@ fn environment(path: &Path) -> Result<Environment, EmbeddingError> {
 }
 
 fn intra_threads() -> usize {
-    let quota = std::fs::read_to_string("/sys/fs/cgroup/cpu.max").ok();
-    let cores = quota.as_deref().and_then(|quota| {
-        let mut parts = quota.split_whitespace();
-        let limit: usize = parts.next()?.parse().ok()?;
-        let period: usize = parts.next()?.parse().ok()?;
-        limit.checked_div(period)
-    });
-    (cores.unwrap_or(2) / 2).clamp(1, 4)
+    let host = std::thread::available_parallelism()
+        .map(NonZeroUsize::get)
+        .unwrap_or(2);
+    let cores = cgroup_cpu_quota().map_or(host, |quota| host.min(quota));
+    (cores / 2).clamp(1, 4)
+}
+
+#[cfg(any(target_os = "linux", test))]
+pub(super) fn parse_cpu_max(content: &str) -> Option<usize> {
+    let mut parts = content.split_whitespace();
+    let limit = parts.next()?;
+    if limit == "max" {
+        return None;
+    }
+    let limit: usize = limit.parse().ok()?;
+    let period: usize = parts.next()?.parse().ok()?;
+    if period == 0 {
+        return None;
+    }
+    Some(limit.div_ceil(period).max(1))
+}
+
+#[cfg(target_os = "linux")]
+fn cgroup_cpu_quota() -> Option<usize> {
+    let root = Path::new("/sys/fs/cgroup");
+    let mut minimum = None;
+    let mut record = |path: &Path| {
+        if let Ok(content) = std::fs::read_to_string(path.join("cpu.max"))
+            && let Some(cores) = parse_cpu_max(&content)
+        {
+            minimum = Some(minimum.map_or(cores, |current: usize| current.min(cores)));
+        }
+    };
+    if let Ok(proc_cgroup) = std::fs::read_to_string("/proc/self/cgroup")
+        && let Some(relative) = proc_cgroup
+            .lines()
+            .find_map(|line| line.strip_prefix("0::"))
+            .map(|entry| entry.trim().trim_start_matches('/'))
+    {
+        let mut current = root.to_path_buf();
+        record(&current);
+        for component in Path::new(relative).components() {
+            if let std::path::Component::Normal(part) = component {
+                current.push(part);
+                record(&current);
+            }
+        }
+    } else {
+        record(root);
+    }
+    minimum
+}
+
+#[cfg(not(target_os = "linux"))]
+fn cgroup_cpu_quota() -> Option<usize> {
+    None
 }

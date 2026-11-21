@@ -9,8 +9,11 @@ use notarium_core::{
     ports::{SpaceContext, StructuralSnapshot},
     receipt::{AwaitWatermarks, CausalBasis, MutationReceiptToken},
 };
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
-use tokio::time::{Instant, timeout_at};
+use std::{collections::BTreeMap, sync::Arc};
+use tokio::{
+    sync::oneshot,
+    time::{Instant, timeout_at},
+};
 
 pub(super) type Overlay = BTreeMap<NoteId, Option<SearchOverlayNote>>;
 
@@ -47,19 +50,24 @@ impl SearchEngine {
         };
         let mut snapshot = self.projection(ctx, structural_causal, clock).await?;
         let mut state = current(handle, ctx.scope());
-        let target = snapshot.cut().projected_seq.max(required);
-        if state.as_ref().is_none_or(|state| state.seq < target) {
-            handle.wake.notify_one();
-            drop(state.take());
-            let grace = self
-                .services
-                .config
-                .causal_wait_budget
-                .min(Duration::from_millis(15))
-                .min(clock.remaining()?.remaining / 2);
-            state = wait(handle, ctx.scope(), target, Instant::now() + grace)
-                .await?
-                .or_else(|| current(handle, ctx.scope()));
+        // Exact queries skip initial grace so receipt overlays run immediately
+        // when the published index already matches the structural cut.
+        if matches!(causal, CausalBasis::Await(_)) {
+            let target = snapshot.cut().projected_seq.max(required);
+            if state.as_ref().is_none_or(|state| state.seq < target) {
+                handle.wake.notify_one();
+                drop(state.take());
+                let grace = self
+                    .services
+                    .config
+                    .causal_wait_budget
+                    .min(clock.remaining()?.remaining / 2);
+                if !grace.is_zero() {
+                    state = wait_at_least(handle, ctx.scope(), target, Instant::now() + grace)
+                        .await?
+                        .or_else(|| current(handle, ctx.scope()));
+                }
+            }
         }
         let overlay = loop {
             let indexed = state.as_ref().map_or(SpaceSeq::ZERO, |state| state.seq);
@@ -74,6 +82,8 @@ impl SearchEngine {
                     }
                 }
                 let cause = CausalBasis::Await(AwaitWatermarks::from_receipts(waiting));
+                // Release the old structural snapshot before awaiting a newer cut.
+                drop(snapshot);
                 snapshot = self.projection(ctx, cause, clock).await?;
                 if snapshot.cut().projected_seq < indexed {
                     return Err(unavailable("projection_behind_search"));
@@ -93,19 +103,31 @@ impl SearchEngine {
                 }
             }
             // A newer projection cannot filter or expand an older index.
-            // Hold its cut while the subscriber catches up, then compare again.
-            let target = if indexed < projected {
-                projected
-            } else {
-                required
-            };
+            // When catching up to `projected`, register an exact align waiter so
+            // catch-up publishes `projected` without ping-ponging under writes.
             drop(state.take());
-            handle.wake.notify_one();
-            state = Some(
-                wait(handle, ctx.scope(), target, clock.deadline)
-                    .await?
-                    .ok_or_else(deadline_error)?,
-            );
+            if indexed < projected {
+                let rx = handle.register_align_waiter(projected);
+                if let Some(ready) =
+                    current(handle, ctx.scope()).filter(|ready| ready.seq >= projected)
+                {
+                    state = Some(ready);
+                    continue;
+                }
+                handle.wake.notify_one();
+                state = Some(
+                    wait_exact(handle, ctx.scope(), projected, rx, clock.deadline)
+                        .await?
+                        .ok_or_else(deadline_error)?,
+                );
+            } else {
+                handle.wake.notify_one();
+                state = Some(
+                    wait_at_least(handle, ctx.scope(), required, clock.deadline)
+                        .await?
+                        .ok_or_else(deadline_error)?,
+                );
+            }
         };
         let cut = snapshot.cut().clone();
         let mut base_cut = cut.clone();
@@ -193,23 +215,57 @@ fn current(handle: &SpaceHandle, scope: &HistoryScope) -> Option<Arc<Published>>
         .filter(|state| &state.scope == scope)
 }
 
-async fn wait(
+async fn wait_exact(
+    handle: &SpaceHandle,
+    scope: &HistoryScope,
+    target: SpaceSeq,
+    rx: oneshot::Receiver<Arc<Published>>,
+    deadline: Instant,
+) -> Result<Option<Arc<Published>>, PortError> {
+    let awaited = timeout_at(deadline, async {
+        tokio::select! {
+            biased;
+            () = handle.stop.cancelled() => return Err(unavailable("search_indexer_closed")),
+            delivered = rx => {
+                if let Ok(state) = delivered
+                    && &state.scope == scope
+                {
+                    return Ok(Some(state));
+                }
+            }
+        }
+        if let Some(state) = current(handle, scope).filter(|state| state.seq >= target) {
+            return Ok(Some(state));
+        }
+        wait_at_least_inner(handle, scope, target).await
+    })
+    .await;
+    awaited.unwrap_or(Ok(None))
+}
+
+async fn wait_at_least(
     handle: &SpaceHandle,
     scope: &HistoryScope,
     target: SpaceSeq,
     deadline: Instant,
 ) -> Result<Option<Arc<Published>>, PortError> {
-    let mut wake = handle.epoch.subscribe();
-    let awaited = timeout_at(deadline, async {
-        loop {
-            if let Some(state) = current(handle, scope).filter(|state| state.seq >= target) {
-                return Ok(Some(state));
-            }
-            tokio::select! {
-                () = handle.stop.cancelled() => return Err(unavailable("search_indexer_closed")),
-                result = wake.changed() => result.map_err(|_| unavailable("search_indexer_closed"))?,
-            }
-        }
-    }).await;
+    let awaited = timeout_at(deadline, wait_at_least_inner(handle, scope, target)).await;
     awaited.unwrap_or(Ok(None))
+}
+
+async fn wait_at_least_inner(
+    handle: &SpaceHandle,
+    scope: &HistoryScope,
+    target: SpaceSeq,
+) -> Result<Option<Arc<Published>>, PortError> {
+    let mut wake = handle.epoch.subscribe();
+    loop {
+        if let Some(state) = current(handle, scope).filter(|state| state.seq >= target) {
+            return Ok(Some(state));
+        }
+        tokio::select! {
+            () = handle.stop.cancelled() => return Err(unavailable("search_indexer_closed")),
+            result = wake.changed() => result.map_err(|_| unavailable("search_indexer_closed"))?,
+        }
+    }
 }

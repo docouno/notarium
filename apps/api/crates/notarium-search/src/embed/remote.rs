@@ -65,7 +65,7 @@ impl RemoteEmbedder {
                 input.project_scope.clone(),
             )
             .await
-            .map_err(port_error)?;
+            .map_err(query_port_error)?;
         input.classes.retain(|class| disclosed.contains(class));
         if input.classes.is_empty() || ctx.auth().taint().is_tainted() {
             return Err(EmbeddingError::ProviderUnavailable);
@@ -86,11 +86,11 @@ impl RemoteEmbedder {
             self.provider.clone(),
             input,
         );
-        let mut rows = self.dispatch(ctx, request).await?;
+        let mut rows = self.dispatch(ctx, request, query_port_error).await?;
         let vector = rows
             .pop()
             .ok_or(EmbeddingError::ProviderUnavailable)?
-            .map_err(provider_error)?;
+            .map_err(query_provider_error)?;
         Ok(vec![Some(
             self.normalized_row(vector)
                 .ok_or(EmbeddingError::ProviderUnavailable)?,
@@ -106,8 +106,11 @@ impl RemoteEmbedder {
         if parts.len() > 16 || parts.is_empty() {
             return Err(EmbeddingError::BudgetExceeded);
         }
-        if grant.ctx.auth().taint().is_tainted() || grant.policy.provider != self.provider {
+        if grant.policy.provider != self.provider {
             return Err(EmbeddingError::ProviderUnavailable);
+        }
+        if grant.ctx.auth().taint().is_tainted() {
+            return Err(EmbeddingError::IndexingDenied);
         }
         let mut intent = self.intent(&grant.ctx, b"parts", project.as_ref());
         let mut positions = Vec::new();
@@ -127,27 +130,59 @@ impl RemoteEmbedder {
                 hash_field(&mut intent, content.key().as_bytes());
                 total = total
                     .checked_add(content.tokens())
-                    .ok_or(EmbeddingError::BudgetExceeded)?;
+                    .ok_or(EmbeddingError::PermanentInputRejected)?;
                 positions.push(position);
                 admitted.push(part);
             }
         }
-        if total > self.max_input_tokens {
-            return Err(EmbeddingError::BudgetExceeded);
+        if admitted.is_empty() {
+            return Err(EmbeddingError::IndexingDenied);
         }
-        if !admitted.is_empty() {
-            let request = EmbeddingRequest::parts(
-                command(intent),
-                self.model.clone(),
-                self.provider.clone(),
-                project,
-                admitted,
-                total,
-            );
-            let result = self.dispatch(grant.ctx, request).await?;
-            for (position, vector) in positions.into_iter().zip(result) {
-                output[position] = vector.ok().and_then(|vector| self.normalized_row(vector));
+        if total > self.max_input_tokens {
+            return Err(EmbeddingError::PermanentInputRejected);
+        }
+        let request = EmbeddingRequest::parts(
+            command(intent),
+            self.model.clone(),
+            self.provider.clone(),
+            project,
+            admitted,
+            total,
+        );
+        let result = self
+            .dispatch(grant.ctx, request, indexing_port_error)
+            .await?;
+        let mut permanent_error = None;
+        let mut has_success = false;
+        let mut has_transient_failure = false;
+        for (position, row) in positions.into_iter().zip(result) {
+            match row {
+                Ok(vector) => {
+                    if vector.len() != self.dimension as usize {
+                        return Err(EmbeddingError::ProviderUnavailable);
+                    }
+                    if let Some(normalized) = self.normalized_row(vector) {
+                        output[position] = Some(normalized);
+                        has_success = true;
+                    } else {
+                        permanent_error.get_or_insert(EmbeddingError::PermanentInputRejected);
+                    }
+                }
+                Err(error) => {
+                    let mapped = indexing_provider_error(error);
+                    if mapped.is_permanent_note_rejection() {
+                        permanent_error.get_or_insert(mapped);
+                    } else {
+                        has_transient_failure = true;
+                    }
+                }
             }
+        }
+        if !has_success
+            && !has_transient_failure
+            && let Some(error) = permanent_error
+        {
+            return Err(error);
         }
         Ok(output)
     }
@@ -156,14 +191,17 @@ impl RemoteEmbedder {
         &self,
         ctx: SpaceContext,
         request: EmbeddingRequest,
+        map_error: fn(PortError) -> EmbeddingError,
     ) -> Result<Vec<Result<Vec<f32>, DomainError>>, EmbeddingError> {
         if ctx.budget.cancellation.is_cancelled() {
             return Err(EmbeddingError::Cancelled);
         }
         let request = request.with_runtime_epochs(self.runtime_epochs);
-        request.validate().map_err(provider_error)?;
+        request
+            .validate()
+            .map_err(|error| map_error(PortError::Domain(error)))?;
         let count = request.inputs.len();
-        let result = self.port.embed(ctx, request).await.map_err(port_error)?;
+        let result = self.port.embed(ctx, request).await.map_err(map_error)?;
         if result.model != self.model
             || result.dimension != self.dimension
             || result.vectors.len() != count
@@ -209,11 +247,61 @@ impl RemoteEmbedder {
     }
 }
 
-fn port_error(error: PortError) -> EmbeddingError {
+fn query_port_error(error: PortError) -> EmbeddingError {
     match error {
-        PortError::Domain(error) => provider_error(error),
+        PortError::Domain(error) => query_provider_error(error),
         PortError::Cancelled(_) => EmbeddingError::Cancelled,
         PortError::DeadlineExceeded(_) => EmbeddingError::BudgetExceeded,
+        _ => EmbeddingError::ProviderUnavailable,
+    }
+}
+
+fn query_provider_error(error: DomainError) -> EmbeddingError {
+    match error {
+        DomainError::ValidationFailed { diagnostic }
+            if matches!(
+                diagnostic.reason,
+                ValidationReason::BudgetExceeded | ValidationReason::TokenBudgetExceeded
+            ) =>
+        {
+            EmbeddingError::BudgetExceeded
+        }
+        DomainError::RateLimited { .. } => EmbeddingError::BudgetExceeded,
+        DomainError::Provider {
+            error: ProviderErrorCode::BudgetMismatch,
+        } => EmbeddingError::BudgetExceeded,
+        _ => EmbeddingError::ProviderUnavailable,
+    }
+}
+
+fn indexing_port_error(error: PortError) -> EmbeddingError {
+    match error {
+        PortError::Domain(error) => indexing_provider_error(error),
+        PortError::Cancelled(_) => EmbeddingError::Cancelled,
+        PortError::DeadlineExceeded(_) => EmbeddingError::BudgetExceeded,
+        _ => EmbeddingError::ProviderUnavailable,
+    }
+}
+
+fn indexing_provider_error(error: DomainError) -> EmbeddingError {
+    match error {
+        DomainError::ResourceNotFound | DomainError::CrossSpaceTainted => {
+            EmbeddingError::IndexingDenied
+        }
+        DomainError::ValidationFailed { diagnostic } => match diagnostic.reason {
+            ValidationReason::ClassEgressForbidden
+            | ValidationReason::ClassMismatch
+            | ValidationReason::SourceMismatch => EmbeddingError::IndexingDenied,
+            ValidationReason::TokenBudgetExceeded | ValidationReason::InvalidLimit => {
+                EmbeddingError::PermanentInputRejected
+            }
+            ValidationReason::BudgetExceeded => EmbeddingError::BudgetExceeded,
+            _ => EmbeddingError::ProviderUnavailable,
+        },
+        DomainError::RateLimited { .. } => EmbeddingError::BudgetExceeded,
+        DomainError::Provider {
+            error: ProviderErrorCode::BudgetMismatch,
+        } => EmbeddingError::BudgetExceeded,
         _ => EmbeddingError::ProviderUnavailable,
     }
 }
@@ -227,21 +315,4 @@ fn command(hash: blake3::Hasher) -> CommandKey {
     let mut bytes = [0; 16];
     hash.finalize_xof().fill(&mut bytes);
     CommandKey::from_bytes(bytes)
-}
-
-fn provider_error(error: DomainError) -> EmbeddingError {
-    match error {
-        DomainError::ValidationFailed { diagnostic }
-            if matches!(
-                diagnostic.reason,
-                ValidationReason::BudgetExceeded | ValidationReason::TokenBudgetExceeded
-            ) =>
-        {
-            EmbeddingError::BudgetExceeded
-        }
-        DomainError::Provider {
-            error: ProviderErrorCode::BudgetMismatch,
-        } => EmbeddingError::BudgetExceeded,
-        _ => EmbeddingError::ProviderUnavailable,
-    }
 }

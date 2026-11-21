@@ -5,7 +5,7 @@ use notarium_canonical::{
 use notarium_core::{
     DomainError, DomainResult,
     auth::{EngineAuthContext, Space, SpaceGrant, SpaceKind, SpaceRole, VerifiedHuman},
-    classes::DocClass,
+    classes::{ClassEgressFence, DocClass},
     epoch::{DataRoot, SearchIndexKind},
     error::ValidationReason,
     ids::{
@@ -16,25 +16,26 @@ use notarium_core::{
     model::{DenseNodeId, DenseNodeIter, Lifecycle, SnapshotCut},
     ports::{
         CallBudget, Cancellation, MaintenanceContext, MoveFolder, Mutation, NoteCard,
-        NoteWritePort, PageLimit, PortFuture, ServiceAuthority, ServicePurpose, SpaceContext,
-        StructuralReadPort, StructuralSnapshot,
+        NoteWritePort, PageLimit, PortFuture, SearchPort, SearchQuery, ServiceAuthority,
+        ServicePurpose, SpaceContext, StructuralReadPort, StructuralSnapshot,
     },
     query::{FieldFilterAstV1, Predicate},
-    receipt::{CausalBasis, CommandIdentity},
+    receipt::{CausalBasis, CommandIdentity, ReceiptSet},
 };
 use notarium_search::{
     SearchDependencies, SearchEngine,
     config::{SearchConfig, VectorMode},
     layout::SearchLayout,
+    ports::SearchCarrierReadPort,
 };
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     error::Error,
     fs, io,
     path::{Path, PathBuf},
     sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, RwLock,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     thread::JoinHandle,
     time::{Duration, SystemTime},
@@ -129,15 +130,18 @@ impl Fixture {
         let notes: Vec<_> = (1..=count)
             .map(|index| NoteId::from_bytes(u128::from(index).to_be_bytes()))
             .collect();
+        let selective_notes = (0..count)
+            .take_while(|&ordinal| {
+                u64::from(ordinal * super::CHUNKS) < notarium_search::vector::EXACT_SCAN_LIMIT
+            })
+            .count();
         let mut revisions = Vec::with_capacity(notes.len());
         for (page, group) in notes.chunks(150).enumerate() {
             let mut writes = Vec::with_capacity(group.len());
             for (slot, note_id) in group.iter().enumerate() {
                 let ordinal = (page * 150 + slot) as u32;
                 let super::SourceNote { title, carrier, .. } = super::source_note(ordinal)?;
-                let parent = if u64::from(ordinal * super::CHUNKS)
-                    < notarium_search::vector::EXACT_SCAN_LIMIT
-                {
+                let parent = if (ordinal as usize) < selective_notes {
                     &selective
                 } else {
                     &broad
@@ -163,15 +167,29 @@ impl Fixture {
             revisions.extend(committed.into_iter().map(|(_, revision)| revision));
         }
         let current = store.read_space(&space.scope.space_id).await?;
-        let projection = Arc::new(Projection {
-            cut: SnapshotCut {
-                scope: space.scope,
-                generation: ProjectionGeneration::new(1)?,
-                canonical_seq: current.last_seq,
-                projected_seq: current.last_seq,
-            },
+        let parents = BTreeMap::from([
+            (root_folder.clone(), None),
+            (corpus.clone(), Some(root_folder.clone())),
+            (destination.clone(), Some(root_folder.clone())),
+            (selective.clone(), Some(corpus.clone())),
+            (broad.clone(), Some(corpus.clone())),
+        ]);
+        let cut = SnapshotCut {
+            scope: space.scope,
+            generation: ProjectionGeneration::new(1)?,
+            canonical_seq: current.last_seq,
+            projected_seq: current.last_seq,
+        };
+        let projection = Arc::new(Projection::new(
+            store.clone(),
+            cut,
             notes,
-        });
+            selective_notes,
+            selective.clone(),
+            broad.clone(),
+            Some(destination.clone()),
+            parents,
+        ));
         let model = ModelProfileId::from_bytes(*b"deterministic-v1");
         Ok(Self {
             root: root.clone(),
@@ -190,8 +208,9 @@ impl Fixture {
         })
     }
 
-    pub async fn move_folder(&self) -> Result<(usize, usize), Box<dyn Error>> {
-        let scope = &self.projection.cut.scope;
+    pub async fn move_folder(&self) -> Result<(usize, usize, usize), Box<dyn Error>> {
+        let cut = self.projection.cut();
+        let scope = &cut.scope;
         let layout = SearchLayout::open(&self.root, scope.clone())?;
         let initial = layout.search_manifest()?.ok_or("missing search manifest")?;
         let tantivy = layout.index_dir(&initial)?;
@@ -224,6 +243,32 @@ impl Fixture {
             remaining: Duration::from_secs(30),
         };
         let context = SpaceContext::new(auth, scope.clone(), budget)?;
+        let folder_query = |folder: &FolderId| SearchQuery {
+            text: "facet0000".to_owned(),
+            filter: FieldFilterAstV1 {
+                version: 1,
+                predicate: Predicate::All(Vec::new()),
+            },
+            classes: BTreeSet::from([DocClass::UserDoc]),
+            folder: Some(folder.clone()),
+            causal: CausalBasis::Exact(ReceiptSet::default()),
+            include_chats: false,
+            top_k: PageLimit::new(10).expect("valid page limit"),
+            model: None,
+        };
+        let pre_dest = engine
+            .search(context.clone(), folder_query(&self.destination))
+            .await?;
+        if !pre_dest.hits.is_empty() {
+            return Err("destination folder unexpectedly matched notes before MoveFolder".into());
+        }
+        let pre_sel = engine
+            .search(context.clone(), folder_query(&self.selective))
+            .await?;
+        if pre_sel.hits.is_empty() {
+            return Err("selective folder did not match notes before MoveFolder".into());
+        }
+
         let inspection = MaintenanceContext {
             authority: ServiceAuthority::admit(ServicePurpose::Projection),
             budget: context.budget.clone(),
@@ -274,6 +319,23 @@ impl Fixture {
             }
         })
         .await??;
+
+        self.projection
+            .reparent_folder(self.corpus.clone(), self.destination.clone(), end);
+        let post_dest = engine
+            .search(context.clone(), folder_query(&self.destination))
+            .await?;
+        if post_dest.hits.is_empty() {
+            return Err("moved subtree was not visible under destination after MoveFolder".into());
+        }
+        let post_sel = engine
+            .search(context, folder_query(&self.selective))
+            .await?;
+        if post_sel.hits.is_empty() {
+            return Err("moved selective folder lost hits after MoveFolder".into());
+        }
+        let post_move_hits = post_dest.hits.len();
+
         engine.shutdown().await;
         eprintln!(
             "Verifying canonical corpus after MoveFolder at cut {}",
@@ -288,7 +350,7 @@ impl Fixture {
         {
             return Err("folder movement rewrote search data".into());
         }
-        Ok((0, 0))
+        Ok((0, 0, post_move_hits))
     }
 
     async fn verify_canonical_corpus(
@@ -297,7 +359,9 @@ impl Fixture {
         cutoff: SpaceSeq,
         corpus_parent: &FolderId,
     ) -> Result<(), Box<dyn Error>> {
-        let scope = &self.projection.cut.scope;
+        let cut = self.projection.cut();
+        let scope = &cut.scope;
+        let notes = self.projection.notes();
         let limit = PageLimit::new(50)?;
         let folders = self
             .store
@@ -361,7 +425,7 @@ impl Fixture {
                 } else {
                     &self.broad
                 };
-                if self.projection.notes.get(seen) != Some(&meta.note_id)
+                if notes.get(seen) != Some(&meta.note_id)
                     || self.revisions.get(seen) != Some(&row.revision_id)
                     || &meta.parent_folder_id != parent
                     || meta.doc_class != DocClass::UserDoc
@@ -387,11 +451,11 @@ impl Fixture {
             }
             after = Some(next);
         }
-        if seen != self.projection.notes.len() {
+        if seen != notes.len() {
             return Err(format!(
                 "saw {seen} canonical notes at cut {}, expected {}",
                 cutoff.get(),
-                self.projection.notes.len()
+                notes.len()
             )
             .into());
         }
@@ -405,24 +469,60 @@ impl Fixture {
 }
 
 #[derive(Clone)]
-pub struct Projection {
+pub struct ProjectionSnapshot {
     pub cut: SnapshotCut,
-    pub notes: Vec<NoteId>,
+    pub notes: Arc<Vec<NoteId>>,
+    selective_notes: usize,
+    selective: FolderId,
+    broad: FolderId,
+    project: Option<FolderId>,
+    parents: BTreeMap<FolderId, Option<FolderId>>,
+    lookups: Arc<AtomicUsize>,
 }
 
-impl StructuralSnapshot for Projection {
+impl ProjectionSnapshot {
+    fn in_folder(&self, member: &FolderId, folder: &FolderId) -> bool {
+        std::iter::successors(Some(member), |id| {
+            self.parents.get(*id).and_then(Option::as_ref)
+        })
+        .any(|ancestor| ancestor == folder)
+    }
+
+    fn contains_note(&self, note: &NoteId) -> bool {
+        let Some(hex) = note.as_str().strip_prefix(NoteId::PREFIX) else {
+            return false;
+        };
+        let Some(slot) = u32::from_str_radix(hex, 16)
+            .ok()
+            .and_then(|value| value.checked_sub(1))
+        else {
+            return false;
+        };
+        self.notes.get(slot as usize) == Some(note)
+    }
+}
+
+impl StructuralSnapshot for ProjectionSnapshot {
     fn cut(&self) -> &SnapshotCut {
         &self.cut
     }
 
-    fn lookup(&self, note: &NoteId) -> Option<DenseNodeId> {
-        let slot = u32::from_str_radix(note.as_str().strip_prefix(NoteId::PREFIX)?, 16)
-            .ok()?
-            .checked_sub(1)?;
-        self.notes
+    fn lookup(&self, note: &NoteId) -> DomainResult<Option<DenseNodeId>> {
+        self.lookups.fetch_add(1, Ordering::Relaxed);
+        let Some(hex) = note.as_str().strip_prefix(NoteId::PREFIX) else {
+            return Ok(None);
+        };
+        let Some(slot) = u32::from_str_radix(hex, 16)
+            .ok()
+            .and_then(|value| value.checked_sub(1))
+        else {
+            return Ok(None);
+        };
+        Ok(self
+            .notes
             .get(slot as usize)
             .filter(|expected| *expected == note)
-            .map(|_| DenseNodeId::new(self.cut.generation, slot))
+            .map(|_| DenseNodeId::new(self.cut.generation, slot)))
     }
 
     fn note_id(&self, node: DenseNodeId) -> DomainResult<NoteId> {
@@ -439,15 +539,43 @@ impl StructuralSnapshot for Projection {
         Ok(DocClass::UserDoc)
     }
 
-    fn folder_subtree(&self, _: &FolderId) -> DomainResult<DenseNodeIter<'_>> {
-        Err(unavailable())
+    fn folder_subtree<'a>(&'a self, folder: &'a FolderId) -> PortFuture<'a, DenseNodeIter<'a>> {
+        Box::pin(async move {
+            let has_selective = self.in_folder(&self.selective, folder);
+            let has_broad = self.in_folder(&self.broad, folder);
+            let total = self.notes.len() as u32;
+            let split = self.selective_notes as u32;
+            let range = match (has_selective, has_broad) {
+                (true, true) => 0..total,
+                (true, false) => 0..split,
+                (false, true) => split..total,
+                (false, false) => 0..0,
+            };
+            Ok(DenseNodeIter::from_iter(self.cut.generation, range))
+        })
     }
-    fn folder_descendants<'a>(&'a self, _: &'a FolderId) -> PortFuture<'a, Vec<FolderId>> {
-        Box::pin(async move { Err(unavailable().into()) })
+
+    fn folder_descendants<'a>(&'a self, folder: &'a FolderId) -> PortFuture<'a, Vec<FolderId>> {
+        Box::pin(async move {
+            Ok(self
+                .parents
+                .keys()
+                .filter(|candidate| self.in_folder(candidate, folder))
+                .cloned()
+                .collect())
+        })
     }
-    fn enclosing_project<'a>(&'a self, _: &'a FolderId) -> PortFuture<'a, Option<FolderId>> {
-        Box::pin(async move { Err(unavailable().into()) })
+
+    fn enclosing_project<'a>(&'a self, folder: &'a FolderId) -> PortFuture<'a, Option<FolderId>> {
+        Box::pin(async move {
+            Ok(self
+                .project
+                .as_ref()
+                .filter(|project| self.in_folder(folder, project))
+                .cloned())
+        })
     }
+
     fn filter_notes<'a>(
         &'a self,
         filter: &'a FieldFilterAstV1,
@@ -460,11 +588,96 @@ impl StructuralSnapshot for Projection {
             }
         })
     }
+
     fn outgoing(&self, _: DenseNodeId) -> DomainResult<DenseNodeIter<'_>> {
         Err(unavailable())
     }
+
     fn incoming(&self, _: DenseNodeId) -> DomainResult<DenseNodeIter<'_>> {
         Err(unavailable())
+    }
+}
+
+pub struct Projection {
+    store: Arc<CanonicalStore>,
+    view: RwLock<ProjectionSnapshot>,
+}
+
+impl Projection {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        store: Arc<CanonicalStore>,
+        cut: SnapshotCut,
+        notes: Vec<NoteId>,
+        selective_notes: usize,
+        selective: FolderId,
+        broad: FolderId,
+        project: Option<FolderId>,
+        parents: BTreeMap<FolderId, Option<FolderId>>,
+    ) -> Self {
+        Self {
+            store,
+            view: RwLock::new(ProjectionSnapshot {
+                cut,
+                notes: Arc::new(notes),
+                selective_notes,
+                selective,
+                broad,
+                project,
+                parents,
+                lookups: Arc::new(AtomicUsize::new(0)),
+            }),
+        }
+    }
+
+    pub fn single_folder(
+        store: Arc<CanonicalStore>,
+        cut: SnapshotCut,
+        root: FolderId,
+        notes: Vec<NoteId>,
+    ) -> Self {
+        let count = notes.len();
+        Self::new(
+            store,
+            cut,
+            notes,
+            count,
+            root.clone(),
+            root.clone(),
+            None,
+            BTreeMap::from([(root, None)]),
+        )
+    }
+
+    pub fn snapshot(&self) -> ProjectionSnapshot {
+        self.view.read().unwrap().clone()
+    }
+
+    pub fn cut(&self) -> SnapshotCut {
+        self.view.read().unwrap().cut.clone()
+    }
+
+    pub fn notes(&self) -> Arc<Vec<NoteId>> {
+        self.view.read().unwrap().notes.clone()
+    }
+
+    pub fn reset_lookups(&self) {
+        self.view
+            .read()
+            .unwrap()
+            .lookups
+            .store(0, Ordering::Relaxed);
+    }
+
+    pub fn lookups(&self) -> usize {
+        self.view.read().unwrap().lookups.load(Ordering::Relaxed)
+    }
+
+    pub fn reparent_folder(&self, folder: FolderId, new_parent: FolderId, seq: SpaceSeq) {
+        let mut view = self.view.write().unwrap();
+        view.parents.insert(folder, Some(new_parent));
+        view.cut.canonical_seq = seq;
+        view.cut.projected_seq = seq;
     }
 }
 
@@ -475,20 +688,52 @@ impl StructuralReadPort for Projection {
         _: CausalBasis,
     ) -> PortFuture<'_, Box<dyn StructuralSnapshot>> {
         Box::pin(async move {
-            ctx.check_current(&self.cut.scope)?;
-            Ok(Box::new(self.clone()) as Box<dyn StructuralSnapshot>)
+            let view = self.snapshot();
+            ctx.check_current(&view.cut.scope)?;
+            Ok(Box::new(view) as Box<dyn StructuralSnapshot>)
         })
     }
-    fn is_live_visible(&self, _: &SpaceContext, note: &NoteId) -> DomainResult<bool> {
-        Ok(self.lookup(note).is_some())
+
+    fn is_live_visible<'a>(
+        &'a self,
+        _: &'a SpaceContext,
+        note: &'a NoteId,
+    ) -> PortFuture<'a, bool> {
+        Box::pin(async move { Ok(self.view.read().unwrap().contains_note(note)) })
     }
+
     fn hydrate(
         &self,
-        _: SpaceContext,
-        _: SnapshotCut,
+        ctx: SpaceContext,
+        cut: SnapshotCut,
         notes: Vec<NoteId>,
     ) -> PortFuture<'_, Vec<Option<NoteCard>>> {
-        Box::pin(async move { Ok(notes.into_iter().map(|_| None).collect()) })
+        Box::pin(async move {
+            let carriers = SearchCarrierReadPort::read_note_documents_at_cutoff(
+                &*self.store,
+                ServiceAuthority::admit(ServicePurpose::Search),
+                ctx.budget.clone(),
+                cut.scope,
+                cut.projected_seq,
+                notes,
+            )
+            .await?;
+            Ok(carriers
+                .into_iter()
+                .map(|(_, row)| {
+                    let row = row?;
+                    let document =
+                        ClassEgressFence::search_metadata(row.document.metadata(), ctx.auth())
+                            .ok()?;
+                    Some(NoteCard {
+                        document,
+                        title: row.title,
+                        path: String::new(),
+                        preview: String::new(),
+                    })
+                })
+                .collect())
+        })
     }
 }
 

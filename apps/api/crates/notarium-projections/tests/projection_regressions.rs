@@ -396,10 +396,36 @@ async fn is_live_visible_hydrate_and_note_links_enforce_cross_space_taint_and_au
         SpaceContext::new(auth, scope_b.clone(), budget()).unwrap()
     };
 
-    // 1. StructuralReadPort::is_live_visible must taint cross-space reads.
+    // 1. StructuralReadPort::is_live_visible must not taint on Ok(false),
+    // and must taint cross-space reads on Ok(true).
+    let ctx_miss = cross_ctx();
+    let absent_note = NoteId::from_bytes(rand16());
+    assert!(!ctx_miss.auth().taint().is_tainted());
+    assert!(
+        !engine
+            .is_live_visible(&ctx_miss, &absent_note)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !ctx_miss.auth().taint().is_tainted(),
+        "is_live_visible returning false must not taint cross-space branches"
+    );
+    assert_eq!(
+        engine
+            .filter_live_visible(&ctx_miss, std::slice::from_ref(&absent_note))
+            .await
+            .unwrap(),
+        vec![false]
+    );
+    assert!(
+        !ctx_miss.auth().taint().is_tainted(),
+        "filter_live_visible with all-false results must not taint cross-space branches"
+    );
+
     let ctx1 = cross_ctx();
     assert!(!ctx1.auth().taint().is_tainted());
-    assert!(engine.is_live_visible(&ctx1, &note_b.note).unwrap());
+    assert!(engine.is_live_visible(&ctx1, &note_b.note).await.unwrap());
     assert!(
         ctx1.auth().taint().is_tainted(),
         "is_live_visible must taint cross-space branches"
@@ -858,7 +884,7 @@ async fn lagged_folder_visibility_yields_to_writers_and_rejects_a_mixed_head() {
         .acquire_snapshot(reader.clone(), causal.clone())
         .await
         .unwrap();
-    assert_eq!(warm.folder_subtree(&project).unwrap().count(), 40);
+    assert_eq!(warm.folder_subtree(&project).await.unwrap().count(), 40);
 
     let mut projection = engine.pause_before_projection_for_test(&scope, 1).unwrap();
     let mut mv = mutation(
@@ -3003,6 +3029,7 @@ async fn hydrate_older_snapshot_checks_recorded_facts_and_schema_move_updates_fe
             &public_ctx,
             &public_schema_note.note,
         )
+        .await
         .unwrap(),
         "update_space_schema moving an existing note out of project_root must update live fence"
     );

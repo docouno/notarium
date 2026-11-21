@@ -2,7 +2,7 @@ use crate::{
     config::VectorMode,
     embed::{
         EmbeddingError, OrtModel, Priority, RemoteConservativeTokenizerBudget, RemoteEmbedder,
-        bounded_batches, deterministic_embedding,
+        bounded_batches,
     },
     engine::Services,
     ports::{
@@ -16,24 +16,84 @@ use notarium_core::{
     classes::{ClassEgressFence, ClassifiedDocument, ContentPart, DocClass, SearchContent},
     document::{ChunkDescriptor, ChunkPlan},
     error::{PortError, ValidationReason},
-    ids::{ContentDigest, FolderId, ModelProfileId},
+    ids::{ContentDigest, ModelProfileId},
     model::{FolderRef, HistoryScope},
     ports::{CallBudget, EmbeddingQueryInput, SpaceContext},
 };
 use notarium_syntax::chunk::TokenizerBudget;
 use std::{
     collections::{BTreeSet, HashMap},
-    sync::{Arc, Weak},
+    path::PathBuf,
+    sync::{Arc, Mutex as StdMutex, Weak},
 };
-use tokio::sync::Mutex;
+
+const LOCAL_BATCH_QUANTUM: u32 = 16;
 
 #[derive(Default)]
-pub(super) struct LocalModels(Mutex<HashMap<crate::layout::VectorModel, Weak<OrtModel>>>);
+pub(super) struct LocalModels {
+    models: StdMutex<HashMap<crate::layout::VectorModel, Weak<OrtModel>>>,
+    loading: StdMutex<HashMap<crate::layout::VectorModel, Weak<tokio::sync::Mutex<()>>>>,
+}
 
-#[cfg(test)]
 impl LocalModels {
-    pub(super) async fn hold_loading(&self) -> impl Drop + '_ {
-        self.0.lock().await
+    fn cached(&self, key: &crate::layout::VectorModel) -> Option<Arc<OrtModel>> {
+        let models = self
+            .models
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        models.get(key).and_then(Weak::upgrade)
+    }
+
+    fn loading_gate(&self, key: &crate::layout::VectorModel) -> Arc<tokio::sync::Mutex<()>> {
+        let mut loading = self
+            .loading
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        loading.retain(|_, entry| entry.strong_count() != 0);
+        loading.get(key).and_then(Weak::upgrade).unwrap_or_else(|| {
+            let gate = Arc::new(tokio::sync::Mutex::new(()));
+            loading.insert(key.clone(), Arc::downgrade(&gate));
+            gate
+        })
+    }
+
+    async fn get_or_open(
+        &self,
+        key: crate::layout::VectorModel,
+        library: PathBuf,
+        root: PathBuf,
+        selected: ResolvedEmbeddingTarget,
+    ) -> Result<Arc<OrtModel>, EmbeddingError> {
+        if let Some(model) = self.cached(&key) {
+            return Ok(model);
+        }
+        let gate = self.loading_gate(&key);
+        let _guard = gate.lock().await;
+        if let Some(model) = self.cached(&key) {
+            return Ok(model);
+        }
+        let pooling = key.pooling;
+        let model = tokio::task::spawn_blocking(move || {
+            OrtModel::open(&library, &root, &selected, pooling)
+        })
+        .await
+        .map_err(|_| EmbeddingError::ModelUnavailable)??;
+        let model = Arc::new(model);
+        {
+            let mut models = self
+                .models
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            models.retain(|_, entry| entry.strong_count() != 0);
+            models.insert(key, Arc::downgrade(&model));
+        }
+        Ok(model)
+    }
+
+    #[cfg(test)]
+    pub(super) async fn hold_loading(&self, key: crate::layout::VectorModel) -> impl Drop {
+        let gate = self.loading_gate(&key);
+        gate.lock_owned().await
     }
 }
 
@@ -46,38 +106,79 @@ pub(super) struct Embedder {
 enum Backend {
     Onnx(Arc<OrtModel>),
     Remote(Arc<RemoteEmbedder>),
+    #[cfg(any(test, feature = "test-support"))]
     Deterministic,
+}
+
+pub(super) struct IndexedNoteVectors {
+    pub chunks: Vec<VectorChunk>,
+    pub outcome: NoteIndexOutcome,
+}
+
+#[derive(Debug)]
+pub(super) enum NoteIndexOutcome {
+    /// All embeddable chunks completed, or the note was permanently skipped.
+    Complete,
+    /// At least one chunk failed transiently and should be retried later.
+    Pending,
+    /// Provider, model, or cancellation failure that should halt backfill.
+    Fatal(EmbeddingError),
 }
 
 impl Services {
     pub async fn model_target(
         &self,
         scope: &HistoryScope,
-        project: Option<&FolderId>,
         explicit: Option<&ModelProfileId>,
+        budget: &CallBudget,
     ) -> Result<Option<ResolvedEmbeddingTarget>, EmbeddingError> {
         if matches!(self.config.vector_mode, VectorMode::Disabled) {
             return Ok(None);
+        }
+        if self.shutdown.is_cancelled() || budget.cancellation.is_cancelled() {
+            return Err(EmbeddingError::Cancelled);
+        }
+        if budget.remaining.is_zero() {
+            return Err(EmbeddingError::BudgetExceeded);
         }
         let target = if let Some(resolver) = &self.deps.model_resolver {
             tokio::select! {
                 biased;
                 () = self.shutdown.cancelled() => return Err(EmbeddingError::Cancelled),
-                resolved = tokio::time::timeout(crate::engine::MAINTENANCE_TIMEOUT, resolver.resolve_model(scope, project, explicit)) =>
-                    resolved.map_err(|_| EmbeddingError::BudgetExceeded)?.map_err(|_| EmbeddingError::ModelUnavailable)?,
+                () = budget.cancellation.cancelled() => return Err(EmbeddingError::Cancelled),
+                resolved = tokio::time::timeout(
+                    budget.remaining,
+                    resolver.resolve_model(&self.authority, scope, explicit, budget),
+                ) => match resolved {
+                    Ok(Ok(target)) => target,
+                    Ok(Err(PortError::Cancelled(_))) => return Err(EmbeddingError::Cancelled),
+                    Ok(Err(PortError::DeadlineExceeded(_))) | Err(_) => {
+                        return Err(EmbeddingError::BudgetExceeded);
+                    }
+                    Ok(Err(_)) => return Err(EmbeddingError::ModelUnavailable),
+                },
             }
-        } else if let VectorMode::DeterministicTest { dimension } = self.config.vector_mode {
-            let model = ModelProfileId::from_bytes(*b"deterministic-v1");
-            explicit
-                .is_none_or(|explicit| *explicit == model)
-                .then_some(ResolvedEmbeddingTarget {
-                    model,
-                    dimension,
-                    max_input_tokens: 512,
-                    backend: EmbeddingBackendTarget::LocalOnnx,
-                })
         } else {
-            None
+            #[cfg(any(test, feature = "test-support"))]
+            {
+                if let VectorMode::DeterministicTest { dimension } = self.config.vector_mode {
+                    let model = ModelProfileId::from_bytes(*b"deterministic-v1");
+                    explicit
+                        .is_none_or(|explicit| *explicit == model)
+                        .then_some(ResolvedEmbeddingTarget {
+                            model,
+                            dimension,
+                            max_input_tokens: 512,
+                            backend: EmbeddingBackendTarget::LocalOnnx,
+                        })
+                } else {
+                    None
+                }
+            }
+            #[cfg(not(any(test, feature = "test-support")))]
+            {
+                None
+            }
         };
         match target {
             Some(target)
@@ -96,20 +197,22 @@ impl Services {
         &self,
         target: ResolvedEmbeddingTarget,
     ) -> Result<Embedder, EmbeddingError> {
-        let conservative = || {
-            Arc::new(RemoteConservativeTokenizerBudget::new(
+        let conservative = || -> Result<Arc<dyn TokenizerBudget + Send + Sync>, EmbeddingError> {
+            Ok(Arc::new(RemoteConservativeTokenizerBudget::new(
                 target.model.clone(),
                 target.max_input_tokens,
-            ))
+            )?))
         };
         let (backend, tokenizer): (_, Arc<dyn TokenizerBudget + Send + Sync>) =
             match (&self.config.vector_mode, &target.backend) {
                 (VectorMode::Disabled, _) => return Err(EmbeddingError::ModelUnavailable),
+                #[cfg(any(test, feature = "test-support"))]
                 (VectorMode::DeterministicTest { dimension }, _)
                     if *dimension == target.dimension =>
                 {
-                    (Backend::Deterministic, conservative())
+                    (Backend::Deterministic, conservative()?)
                 }
+                #[cfg(any(test, feature = "test-support"))]
                 (VectorMode::DeterministicTest { .. }, _) => {
                     return Err(EmbeddingError::InvalidModel);
                 }
@@ -134,7 +237,7 @@ impl Services {
                         target.max_input_tokens,
                         *runtime_epochs,
                     );
-                    (Backend::Remote(Arc::new(backend)), conservative())
+                    (Backend::Remote(Arc::new(backend)), conservative()?)
                 }
                 (
                     VectorMode::DynamicOrt {
@@ -143,25 +246,11 @@ impl Services {
                     },
                     EmbeddingBackendTarget::LocalOnnx | EmbeddingBackendTarget::LocalOnnxCls,
                 ) => {
-                    let mut installed = self.models.0.lock().await;
                     let key = target.vector_model();
-                    let model = if let Some(model) = installed.get(&key).and_then(Weak::upgrade) {
-                        model
-                    } else {
-                        let library = dylib_path.clone();
-                        let root = model_dir.clone();
-                        let selected = target.clone();
-                        let pooling = key.pooling;
-                        let model = tokio::task::spawn_blocking(move || {
-                            OrtModel::open(&library, &root, &selected, pooling)
-                        })
-                        .await
-                        .map_err(|_| EmbeddingError::ModelUnavailable)??;
-                        let model = Arc::new(model);
-                        installed.retain(|_, model| model.strong_count() != 0);
-                        installed.insert(key, Arc::downgrade(&model));
-                        model
-                    };
+                    let model = self
+                        .models
+                        .get_or_open(key, dylib_path.clone(), model_dir.clone(), target.clone())
+                        .await?;
                     let tokenizer = model.tokenizer();
                     (Backend::Onnx(model), tokenizer)
                 }
@@ -208,7 +297,7 @@ impl Embedder {
                     .map_err(|_| EmbeddingError::BudgetExceeded)?;
                 let backend = remote.clone();
                 services
-                    .scheduler
+                    .remote_scheduler
                     .submit(
                         Priority::InteractiveSearchQuery,
                         ctx.budget.clone(),
@@ -254,18 +343,19 @@ impl Embedder {
             Backend::Onnx(model) => {
                 let model = model.clone();
                 services
-                    .scheduler
+                    .local_scheduler
                     .submit(priority, budget, move |budget| model.embed(texts, budget))
                     .await
             }
+            #[cfg(any(test, feature = "test-support"))]
             Backend::Deterministic => {
                 let dimension = self.target.dimension;
                 services
-                    .scheduler
+                    .local_scheduler
                     .submit(priority, budget, move |_| async move {
                         Ok(texts
                             .iter()
-                            .map(|text| deterministic_embedding(text, dimension))
+                            .map(|text| crate::embed::deterministic_embedding(text, dimension))
                             .collect())
                     })
                     .await
@@ -277,7 +367,7 @@ impl Embedder {
     pub async fn index_note(
         &self,
         input: IndexNote<'_>,
-    ) -> Result<(Vec<VectorChunk>, bool), DomainError> {
+    ) -> Result<IndexedNoteVectors, DomainError> {
         let IndexNote {
             services,
             scope,
@@ -289,24 +379,58 @@ impl Embedder {
         } = input;
         let remote = if let Backend::Remote(backend) = &self.backend {
             if !note.remote_indexable {
-                return Ok((Vec::new(), false));
+                return Ok(IndexedNoteVectors {
+                    chunks: Vec::new(),
+                    outcome: NoteIndexOutcome::Complete,
+                });
             }
             let Some(resolver) = &services.deps.model_resolver else {
-                return Ok((Vec::new(), true));
+                return Ok(IndexedNoteVectors {
+                    chunks: Vec::new(),
+                    outcome: NoteIndexOutcome::Fatal(EmbeddingError::ModelUnavailable),
+                });
             };
             let started = std::time::Instant::now();
             let grant = tokio::select! {
                 biased;
-                () = budget.cancellation.cancelled() => return Ok((Vec::new(), true)),
-                grant = tokio::time::timeout(budget.remaining,
-                    self.indexing_grant(services, resolver.as_ref(), scope, note, budget.clone())
+                () = budget.cancellation.cancelled() => {
+                    return Ok(IndexedNoteVectors {
+                        chunks: Vec::new(),
+                        outcome: NoteIndexOutcome::Fatal(EmbeddingError::Cancelled),
+                    });
+                }
+                grant = tokio::time::timeout(
+                    budget.remaining,
+                    self.indexing_grant(services, resolver.as_ref(), scope, note, budget.clone()),
                 ) => grant,
             };
             budget.remaining = budget.remaining.saturating_sub(started.elapsed());
             match grant {
                 Ok(Ok(Some((grant, project)))) => Some((backend, resolver, grant, project)),
-                Ok(Ok(None)) => return Ok((Vec::new(), false)),
-                _ => return Ok((Vec::new(), true)),
+                Ok(Ok(None)) => {
+                    return Ok(IndexedNoteVectors {
+                        chunks: Vec::new(),
+                        outcome: NoteIndexOutcome::Complete,
+                    });
+                }
+                Ok(Err(PortError::Cancelled(_))) => {
+                    return Ok(IndexedNoteVectors {
+                        chunks: Vec::new(),
+                        outcome: NoteIndexOutcome::Fatal(EmbeddingError::Cancelled),
+                    });
+                }
+                Ok(Err(PortError::DeadlineExceeded(_))) | Err(_) => {
+                    return Ok(IndexedNoteVectors {
+                        chunks: Vec::new(),
+                        outcome: NoteIndexOutcome::Pending,
+                    });
+                }
+                Ok(Err(_)) => {
+                    return Ok(IndexedNoteVectors {
+                        chunks: Vec::new(),
+                        outcome: NoteIndexOutcome::Fatal(EmbeddingError::ProviderUnavailable),
+                    });
+                }
             }
         } else {
             None
@@ -315,15 +439,29 @@ impl Embedder {
         let content =
             ClassEgressFence::index_for_search(note.document.clone(), &services.authority)?;
         let Ok(chunks) = chunks_for(&content, self.tokenizer()) else {
-            return Ok((Vec::new(), true));
+            tracing::warn!(
+                note = %note.note_id,
+                "skipping note that failed markdown chunking for vector indexing"
+            );
+            return Ok(IndexedNoteVectors {
+                chunks: Vec::new(),
+                outcome: NoteIndexOutcome::Complete,
+            });
         };
         if chunks.is_empty() {
-            return Ok((Vec::new(), false));
+            return Ok(IndexedNoteVectors {
+                chunks: Vec::new(),
+                outcome: NoteIndexOutcome::Complete,
+            });
         }
+        let max_per_chunk = self.target.max_input_tokens;
         let mut missing: Vec<Vec<ChunkDescriptor>> = Vec::new();
         let mut group_by_key = HashMap::new();
         let mut vectors = Vec::new();
         for descriptor in chunks {
+            if descriptor.tokens == 0 || descriptor.tokens > max_per_chunk {
+                continue;
+            }
             if let Some(vector) = existing(descriptor.key) {
                 vectors.push(vector_chunk(&document, folder, descriptor, vector));
             } else {
@@ -334,11 +472,30 @@ impl Embedder {
                 missing[group].push(descriptor);
             }
         }
-        let mut pending = false;
-        let cap = self.target.max_input_tokens;
-        let Ok(batches) = bounded_batches(missing, |group| group[0].tokens, cap) else {
-            return Ok((vectors, true));
+        if missing.is_empty() {
+            return Ok(IndexedNoteVectors {
+                chunks: vectors,
+                outcome: NoteIndexOutcome::Complete,
+            });
+        }
+        let batch_cap = match &self.backend {
+            Backend::Remote(_) => self.target.max_input_tokens,
+            _ => self
+                .target
+                .max_input_tokens
+                .saturating_mul(LOCAL_BATCH_QUANTUM),
         };
+        let Ok(batches) = bounded_batches(missing, |group| group[0].tokens, batch_cap) else {
+            tracing::warn!(
+                note = %note.note_id,
+                "skipping note chunks that exceed model batch token cap"
+            );
+            return Ok(IndexedNoteVectors {
+                chunks: vectors,
+                outcome: NoteIndexOutcome::Complete,
+            });
+        };
+        let mut pending = false;
         for batch in batches {
             let rows = if let Some((backend, resolver, grant, project)) = &remote {
                 self.remote_index(
@@ -364,23 +521,65 @@ impl Embedder {
             };
             let rows = match rows {
                 Ok(rows) => rows,
-                Err(EmbeddingError::IndexingDenied) => return Ok((Vec::new(), false)),
-                Err(_) => {
-                    pending = true;
+                Err(EmbeddingError::IndexingDenied) => {
+                    return Ok(IndexedNoteVectors {
+                        chunks: Vec::new(),
+                        outcome: NoteIndexOutcome::Complete,
+                    });
+                }
+                Err(err) if err.is_permanent_note_rejection() => {
+                    tracing::warn!(
+                        note = %note.note_id,
+                        kind = %err,
+                        "skipping permanently rejected note batch for vector indexing"
+                    );
                     continue;
+                }
+                Err(EmbeddingError::BudgetExceeded) => {
+                    pending = true;
+                    break;
+                }
+                Err(err) => {
+                    return Ok(IndexedNoteVectors {
+                        chunks: vectors,
+                        outcome: NoteIndexOutcome::Fatal(err),
+                    });
                 }
             };
             for (group, row) in batch.into_iter().zip(rows) {
-                if let Some(vector) = row.and_then(|row| QuantizedVector::quantize(&row).ok()) {
-                    for descriptor in group {
-                        vectors.push(vector_chunk(&document, folder, descriptor, vector.clone()));
+                match row {
+                    Some(raw) => match QuantizedVector::quantize(&raw) {
+                        Ok(vector) => {
+                            for descriptor in group {
+                                vectors.push(vector_chunk(
+                                    &document,
+                                    folder,
+                                    descriptor,
+                                    vector.clone(),
+                                ));
+                            }
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                note = %note.note_id,
+                                "skipping unquantizable embedding chunk"
+                            );
+                        }
+                    },
+                    None => {
+                        pending = true;
                     }
-                } else {
-                    pending = true;
                 }
             }
         }
-        Ok((vectors, pending))
+        Ok(IndexedNoteVectors {
+            chunks: vectors,
+            outcome: if pending {
+                NoteIndexOutcome::Pending
+            } else {
+                NoteIndexOutcome::Complete
+            },
+        })
     }
 
     async fn indexing_grant(
@@ -453,7 +652,7 @@ impl Embedder {
         let authority = services.authority.clone();
         let note = document.reference().note_id.clone();
         services
-            .scheduler
+            .remote_scheduler
             .submit(priority, budget.clone(), move |budget| async move {
                 // Resolve at the scheduled boundary. A queued batch must not
                 // inherit the project selection from the start of a backfill.
@@ -463,10 +662,15 @@ impl Embedder {
                     () = budget.cancellation.cancelled() => return Err(EmbeddingError::Cancelled),
                     result = tokio::time::timeout(
                         budget.remaining,
-                        resolver.resolve_model(grant.ctx.scope(), None, None),
-                    ) => result
-                        .map_err(|_| EmbeddingError::BudgetExceeded)?
-                        .map_err(|_| EmbeddingError::ModelUnavailable)?,
+                        resolver.resolve_model(&authority, grant.ctx.scope(), None, &budget),
+                    ) => match result {
+                        Ok(Ok(selected)) => selected,
+                        Ok(Err(PortError::Cancelled(_))) => return Err(EmbeddingError::Cancelled),
+                        Ok(Err(PortError::DeadlineExceeded(_))) | Err(_) => {
+                            return Err(EmbeddingError::BudgetExceeded);
+                        }
+                        Ok(Err(_)) => return Err(EmbeddingError::ModelUnavailable),
+                    },
                 };
                 if selected.as_ref() != Some(&target) {
                     return Err(EmbeddingError::ModelUnavailable);

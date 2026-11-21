@@ -897,6 +897,20 @@ async fn model_epochs_and_repair_while_writes_continue() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lifecycle_overlay_and_resilience_regressions() {
+    let _guard = INTEGRATION_LOCK.lock().await;
+    let data = TempDataRoot::new("search-regressions");
+    let (store, runtime) = CanonicalRuntime::open(CanonicalConfig::local_default(
+        sample_installation_id(0xe0),
+        data.data_root(),
+    ))
+    .await
+    .unwrap();
+    hybrid_support::regressions::run_all(Arc::new(store), data.data_root()).await;
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn postgres_hybrid_seed_causal_boundaries_and_scrub() {
     let _guard = INTEGRATION_LOCK.lock().await;
     let data = TempDataRoot::new("search-pg");
@@ -1173,7 +1187,8 @@ async fn reader_capacity(store: Arc<CanonicalStore>, root: DataRoot) {
         &root.search(&chat_scope.space_id, SearchIndexKind::Tantivy),
         REDACTED,
     );
-    Arc::try_unwrap(engine).ok().unwrap().shutdown().await;
+    let _kept_alive = Arc::clone(&engine);
+    engine.shutdown().await;
 }
 
 async fn chat_candidate_visibility(store: Arc<CanonicalStore>, root: DataRoot) {
@@ -1537,22 +1552,28 @@ async fn tainted_chat_below_limit(
         .scope;
     let ctx = context(&scope, &owner);
     let thread = ChatThreadId::from_bytes([tag; 16]);
-    store
-        .create_chat(
-            ctx.clone(),
-            mutation(
-                &ctx,
-                CreateChat {
-                    thread: thread.clone(),
-                    kind: ChatThreadKind::Personal,
-                    owner: owner.clone(),
-                    project_folder: None,
-                    title: "Chat taint limit".into(),
-                },
-            ),
-        )
-        .await
-        .unwrap();
+    let tainted_thread = ChatThreadId::from_bytes([tag.wrapping_add(1); 16]);
+    for (id, title) in [
+        (&thread, "Chat taint limit clean"),
+        (&tainted_thread, "Chat taint limit tainted"),
+    ] {
+        store
+            .create_chat(
+                ctx.clone(),
+                mutation(
+                    &ctx,
+                    CreateChat {
+                        thread: id.clone(),
+                        kind: ChatThreadKind::Personal,
+                        owner: owner.clone(),
+                        project_folder: None,
+                        title: title.into(),
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+    }
     let highest = store
         .append_chat(
             ctx.clone(),
@@ -1576,8 +1597,8 @@ async fn tainted_chat_below_limit(
             mutation(
                 &ctx,
                 AppendChat {
-                    thread,
-                    parent: highest.value.seq,
+                    thread: tainted_thread.clone(),
+                    parent: ThreadEntrySeq::ZERO,
                     kind: ChatEntryKind::Model,
                     body: ChatInputBody::Text(format!("filterterm {}", "details ".repeat(32))),
                     referenced_notes: vec![],
@@ -1609,7 +1630,10 @@ async fn tainted_chat_below_limit(
         .search(viewer.clone(), request.clone())
         .await
         .unwrap();
-    assert_eq!(result.chat_hits[0].entry, highest.value.seq);
+    assert_eq!(
+        (&result.chat_hits[0].thread, result.chat_hits[0].entry),
+        (&thread, highest.value.seq)
+    );
     assert!(result.truncated);
     assert!(!viewer.auth().taint().is_tainted());
     request.top_k = PageLimit::new(2).unwrap();
@@ -1618,7 +1642,7 @@ async fn tainted_chat_below_limit(
         result
             .chat_hits
             .iter()
-            .any(|hit| hit.entry == lower.value.seq)
+            .any(|hit| hit.thread == tainted_thread && hit.entry == lower.value.seq)
     );
     assert!(viewer.auth().taint().is_tainted());
     engine.shutdown().await;

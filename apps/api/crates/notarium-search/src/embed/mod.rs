@@ -12,7 +12,9 @@ mod tokenizer_model;
 pub use onnx::{OrtModel, Pooling};
 pub use remote::RemoteEmbedder;
 pub use scheduler::{EmbeddingScheduler, Priority, bounded_batches};
-pub use tokenizer::{Encoding, LocalTokenizerBudget, RemoteConservativeTokenizerBudget};
+#[cfg(any(test, feature = "test-support"))]
+pub use tokenizer::Encoding;
+pub use tokenizer::{LocalTokenizerBudget, RemoteConservativeTokenizerBudget};
 
 #[derive(Debug, thiserror::Error)]
 pub enum EmbeddingError {
@@ -22,6 +24,8 @@ pub enum EmbeddingError {
     ProviderUnavailable,
     #[error("the document no longer qualifies for remote indexing")]
     IndexingDenied,
+    #[error("the input cannot be embedded by this model")]
+    PermanentInputRejected,
     #[error("the embedding request exceeded its budget")]
     BudgetExceeded,
     #[error("invalid or unsupported tokenizer or model")]
@@ -70,6 +74,13 @@ pub fn deterministic_embedding(text: &str, dimension: u32) -> Option<Vec<f32>> {
 }
 
 impl EmbeddingError {
+    /// Returns `true` when retrying the same document input cannot succeed
+    /// (egress policy denial or permanently unembeddable/oversized input),
+    /// as opposed to a transient network, rate-limit, budget, or provider error.
+    pub fn is_permanent_note_rejection(&self) -> bool {
+        matches!(self, Self::IndexingDenied | Self::PermanentInputRejected)
+    }
+
     pub fn degradation(&self) -> notarium_core::ports::SearchDegradation {
         use notarium_core::ports::SearchDegradation;
         match self {
@@ -77,9 +88,10 @@ impl EmbeddingError {
             Self::ProviderUnavailable | Self::IndexingDenied => {
                 SearchDegradation::ProviderUnavailable
             }
-            Self::ModelUnavailable | Self::InvalidModel | Self::Io(_) => {
-                SearchDegradation::ModelUnavailable
-            }
+            Self::ModelUnavailable
+            | Self::InvalidModel
+            | Self::PermanentInputRejected
+            | Self::Io(_) => SearchDegradation::ModelUnavailable,
         }
     }
 }

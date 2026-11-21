@@ -1,14 +1,20 @@
-use super::{Eligible, align::Overlay};
+use super::{Eligible, align::Overlay, retry_snapshot};
 use crate::{
+    engine::{Clock, internal},
     lexical::{HitKey, LexicalHit},
     vector::ChunkMetadata,
 };
 use notarium_core::{
-    DomainResult, error::PortError, ids::NoteId, model::DenseNodeId, ports::StructuralSnapshot,
+    DomainResult,
+    error::PortError,
+    ids::NoteId,
+    model::DenseNodeId,
+    ports::{SpaceContext, StructuralReadPort, StructuralSnapshot},
+    query::Predicate,
 };
 use std::{
     cmp::Ordering,
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
 };
 
 #[doc(hidden)]
@@ -79,47 +85,102 @@ fn order(left: &Candidate, right: &Candidate) -> Ordering {
         .then_with(|| left.note.cmp(&right.note))
 }
 
-pub(super) fn expand(
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn expand(
     candidates: &mut Vec<Candidate>,
     snapshot: &dyn StructuralSnapshot,
+    structural: &dyn StructuralReadPort,
+    ctx: &SpaceContext,
+    clock: &Clock,
     eligible: &Eligible,
+    predicate: &Predicate,
     overlay: &Overlay,
     depth: u8,
-    live: impl Fn(&NoteId) -> Result<bool, PortError>,
 ) -> Result<(), PortError> {
-    let mut boosts = BTreeMap::<NoteId, f64>::new();
     let generation = snapshot.cut().generation;
+    let mut seed_entries = Vec::new();
+    let mut seed_notes = Vec::new();
     for seed in candidates.iter().take(16) {
-        let Some(node) = snapshot.lookup(&seed.note) else {
-            continue;
-        };
-        if !live(&seed.note)? {
-            continue;
-        }
-        let mut seen = HashSet::from([node.index(generation)?]);
-        let mut frontier = vec![node];
-        for weight in [0.25, 0.10].into_iter().take(usize::from(depth)) {
-            let mut next = Vec::new();
-            for via in frontier {
-                let neighbors = neighbors(snapshot, via)?;
-                let penalty = 1.0 + (1.0 + neighbors.len() as f64).ln();
-                for neighbor in neighbors {
-                    if !seen.insert(neighbor.index(generation)?)
-                        || !eligible.node_allowed(snapshot, neighbor)?
-                    {
-                        continue;
-                    }
-                    let note = snapshot.note_id(neighbor)?;
-                    if overlay.contains_key(&note) || !live(&note)? {
-                        continue;
-                    }
-                    *boosts.entry(note).or_default() += seed.score * weight / penalty;
-                    next.push(neighbor);
-                }
-            }
-            frontier = next;
+        if let Some(node) = retry_snapshot(snapshot, clock, || snapshot.lookup(&seed.note)).await? {
+            seed_notes.push(seed.note.clone());
+            seed_entries.push((seed.note.clone(), seed.score, node));
         }
     }
+    if seed_entries.is_empty() {
+        return Ok(());
+    }
+
+    let mut live_cache = HashMap::<NoteId, bool>::new();
+    resolve_live(structural, ctx, clock, &mut live_cache, &seed_notes).await?;
+
+    struct SeedState {
+        score: f64,
+        seen: HashSet<u32>,
+        frontier: Vec<DenseNodeId>,
+    }
+    let mut states = Vec::new();
+    for (note, score, node) in seed_entries {
+        if live_cache.get(&note).copied().unwrap_or(false) {
+            states.push(SeedState {
+                score,
+                seen: HashSet::from([node.index(generation)?]),
+                frontier: vec![node],
+            });
+        }
+    }
+    if states.is_empty() {
+        return Ok(());
+    }
+
+    let mut boosts = BTreeMap::<NoteId, f64>::new();
+    for weight in [0.25, 0.10].into_iter().take(usize::from(depth)) {
+        let mut layer_edges: Vec<(usize, DenseNodeId, NoteId, f64)> = Vec::new();
+        let mut layer_notes: Vec<NoteId> = Vec::new();
+        for (seed_idx, state) in states.iter_mut().enumerate() {
+            let frontier = std::mem::take(&mut state.frontier);
+            for via in frontier {
+                let nbrs = retry_snapshot(snapshot, clock, || neighbors(snapshot, via)).await?;
+                let penalty = 1.0 + (1.0 + nbrs.len() as f64).ln();
+                for neighbor in nbrs {
+                    let pos = neighbor.index(generation)?;
+                    if !state.seen.insert(pos) {
+                        continue;
+                    }
+                    let note =
+                        retry_snapshot(snapshot, clock, || snapshot.note_id(neighbor)).await?;
+                    let admitted = match overlay.get(&note) {
+                        Some(None) => false,
+                        Some(Some(row)) => eligible.overlay_allowed(predicate, row),
+                        None => {
+                            retry_snapshot(snapshot, clock, || {
+                                eligible.node_allowed(snapshot, neighbor)
+                            })
+                            .await?
+                        }
+                    };
+                    if !admitted {
+                        continue;
+                    }
+                    if !live_cache.contains_key(&note) {
+                        layer_notes.push(note.clone());
+                    }
+                    layer_edges.push((seed_idx, neighbor, note, state.score * weight / penalty));
+                }
+            }
+        }
+        if layer_edges.is_empty() {
+            break;
+        }
+        resolve_live(structural, ctx, clock, &mut live_cache, &layer_notes).await?;
+        for (seed_idx, neighbor, note, delta) in layer_edges {
+            if !live_cache.get(&note).copied().unwrap_or(false) {
+                continue;
+            }
+            *boosts.entry(note).or_default() += delta;
+            states[seed_idx].frontier.push(neighbor);
+        }
+    }
+
     for candidate in candidates.iter_mut() {
         candidate.score += boosts.remove(&candidate.note).unwrap_or(0.0);
     }
@@ -131,17 +192,48 @@ pub(super) fn expand(
     Ok(())
 }
 
+async fn resolve_live(
+    structural: &dyn StructuralReadPort,
+    ctx: &SpaceContext,
+    clock: &Clock,
+    cache: &mut HashMap<NoteId, bool>,
+    notes: &[NoteId],
+) -> Result<(), PortError> {
+    let mut missing = Vec::new();
+    let mut queued = HashSet::new();
+    for note in notes {
+        if !cache.contains_key(note) && queued.insert(note) {
+            missing.push(note.clone());
+        }
+    }
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let mut check_ctx = ctx.clone();
+    check_ctx.budget = clock.remaining()?;
+    let flags = structural.filter_live_visible(&check_ctx, &missing).await?;
+    if flags.len() != missing.len() {
+        return Err(internal("projection_live_batch"));
+    }
+    for (note, visible) in missing.into_iter().zip(flags) {
+        cache.insert(note, visible);
+    }
+    Ok(())
+}
+
 fn neighbors(
     snapshot: &dyn StructuralSnapshot,
     node: DenseNodeId,
 ) -> DomainResult<Vec<DenseNodeId>> {
     let generation = snapshot.cut().generation;
+    let source = node.index(generation)?;
     let mut positions = snapshot
         .outgoing(node)?
         .take(64)
         .chain(snapshot.incoming(node)?.take(64))
-        .map(|node| node.index(generation))
+        .map(|neighbor| neighbor.index(generation))
         .collect::<DomainResult<Vec<_>>>()?;
+    positions.retain(|&position| position != source);
     positions.sort_unstable();
     positions.dedup();
     Ok(positions

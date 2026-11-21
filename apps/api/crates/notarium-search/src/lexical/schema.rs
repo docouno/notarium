@@ -8,9 +8,7 @@ use notarium_core::{
 };
 use tantivy::{
     TantivyDocument, Term,
-    schema::{
-        FAST, Field, INDEXED, IndexRecordOption, STRING, Schema, TextFieldIndexing, TextOptions,
-    },
+    schema::{FAST, Field, IndexRecordOption, STRING, Schema, TextFieldIndexing, TextOptions},
 };
 
 pub(super) const NOTE: u64 = 1;
@@ -25,7 +23,7 @@ pub(super) struct Fields {
     chat_owner: Field,
     class: Field,
     folder: Field,
-    pub bodies: [TextFields; 4],
+    pub bodies: [TextFields; 3],
 }
 
 #[derive(Clone, Copy)]
@@ -48,16 +46,15 @@ impl Fields {
     pub fn new() -> Self {
         let mut schema = Schema::builder();
         let key = schema.add_text_field("doc_key", STRING);
-        let kind = schema.add_u64_field("doc_kind", FAST | INDEXED);
+        let kind = schema.add_u64_field("doc_kind", FAST);
         let note_id = schema.add_bytes_field("note_id_raw", FAST);
         let chat_locator = schema.add_bytes_field("chat_locator", FAST);
         let chat_owner = schema.add_bytes_field("chat_owner", FAST);
-        let class = schema.add_u64_field("doc_class_ord", FAST | INDEXED);
-        let folder = schema.add_u64_field("parent_folder_ord", FAST | INDEXED);
+        let class = schema.add_u64_field("doc_class_ord", FAST);
+        let folder = schema.add_u64_field("parent_folder_ord", FAST);
         let bodies = [
             ("note_title", 2.0, 2.5),
             ("note_body", 1.0, 1.5),
-            ("memory_body", 1.0, 1.5),
             ("chat_body", 0.9, 1.35),
         ]
         .map(|(name, prose_weight, exact_weight)| TextFields {
@@ -94,12 +91,7 @@ impl Fields {
         indexed.add_u64(self.class, class_ord(doc.class()));
         indexed.add_u64(self.folder, u64::from(folder.get()));
         self.add_text(&mut indexed, self.bodies[0], title);
-        let body_field = if doc.class() == DocClass::AgentMemory {
-            2
-        } else {
-            1
-        };
-        self.add_text(&mut indexed, self.bodies[body_field], body);
+        self.add_text(&mut indexed, self.bodies[1], body);
         indexed
     }
 
@@ -116,7 +108,7 @@ impl Fields {
         if hit.kind == ChatThreadKind::Personal {
             indexed.add_bytes(self.chat_owner, hit.owner.as_str().as_bytes());
         }
-        self.add_text(&mut indexed, self.bodies[3], &hit.text);
+        self.add_text(&mut indexed, self.bodies[2], &hit.text);
         indexed
     }
 

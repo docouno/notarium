@@ -382,7 +382,7 @@ pub async fn folder_eligibility(store: Arc<CanonicalStore>, root: DataRoot) {
         .chunks()
         .map(|chunk| chunk.metadata.note.clone())
         .collect();
-    assert_eq!(repaired, BTreeSet::from([id, last]));
+    assert_eq!(repaired, BTreeSet::from([id.clone(), last]));
 
     // The model covers the whole Space, but a note's grant still depends on
     // its actual project. The query below has no folder or lexical matches.
@@ -432,5 +432,187 @@ pub async fn folder_eligibility(store: Arc<CanonicalStore>, root: DataRoot) {
     assert!(semantic().await.is_empty());
     assert_eq!(slots(), 0);
     assert_eq!(provider.parts.load(Ordering::SeqCst), baseline + 2);
+
+    engine.shutdown().await;
+    move_from_space_root_into_denied_project(store, root).await;
+}
+
+async fn move_from_space_root_into_denied_project(store: Arc<CanonicalStore>, root: DataRoot) {
+    let tag = 0xc5;
+    let owner = sample_principal_id(tag);
+    let root_folder = sample_folder_id(tag);
+    let denied = sample_folder_id(tag + 1);
+    let movable = sample_folder_id(tag + 2);
+    let lease = LeaseEpoch::new(1).unwrap();
+    let scope = store
+        .create_space(CreateSpaceSpec {
+            space_id: sample_space_id(tag),
+            incarnation: sample_incarnation(tag),
+            root_folder_id: root_folder.clone(),
+            slug: "remote-root-to-denied".into(),
+            kind: SpaceKind::Personal,
+            owner: owner.clone(),
+            active_epoch: lease,
+            initial_last_seq: SpaceSeq::ZERO,
+            created_at: None,
+        })
+        .await
+        .unwrap()
+        .scope;
+    store
+        .create_folder(CreateFolderSpec {
+            scope: scope.clone(),
+            active_epoch: lease,
+            folder_id: denied.clone(),
+            parent: Some(root_folder.clone()),
+            slug: "denied-project".into(),
+            display_name: "Denied project".into(),
+            is_project: true,
+            project_slug: Some("denied-project".into()),
+            actor: owner.clone(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+    store
+        .create_folder(CreateFolderSpec {
+            scope: scope.clone(),
+            active_epoch: lease,
+            folder_id: movable.clone(),
+            parent: Some(denied.clone()),
+            slug: "movable".into(),
+            display_name: "Movable".into(),
+            is_project: false,
+            project_slug: None,
+            actor: owner.clone(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+    let id = sample_note_id(tag);
+    let (written, _) = store
+        .commit_synthetic_note_batch_for_test(
+            &scope,
+            lease,
+            &owner,
+            vec![note(
+                &id,
+                &movable,
+                "Root-move note",
+                "root to denied secret",
+            )],
+        )
+        .await
+        .unwrap();
+
+    let mut view = View::new(scope.clone(), root_folder.clone());
+    view.project(denied.clone(), root_folder.clone());
+    view.folder(movable.clone(), denied.clone());
+    view.index(id.clone(), movable.clone());
+    view.advance(written.last_seq);
+    let projection = Arc::new(Projection {
+        store: store.clone(),
+        snapshot: RwLock::new(view),
+        live: RwLock::new(BTreeSet::from([id.clone()])),
+    });
+
+    let isolated_root = DataRoot::new(root.root().join("root-to-denied"));
+    std::fs::create_dir(isolated_root.root()).unwrap();
+    let denied_ref = FolderRef {
+        space_id: scope.space_id.clone(),
+        folder_id: denied.clone(),
+    };
+    let resolver = Arc::new(SwitchingResolver::new(5, 512));
+    *resolver.deny_project.write().unwrap() = Some(denied_ref);
+    let provider = Arc::new(ModelProvider::default());
+    let mut deps = SearchDependencies::new(store.clone(), projection.clone());
+    deps.model_resolver = Some(resolver.clone());
+    deps.providers = Some(provider.clone());
+    let engine = SearchEngine::start(
+        SearchConfig::new(isolated_root.clone(), VectorMode::RemoteOnly),
+        deps,
+    );
+    engine.start_space(scope.clone()).unwrap();
+
+    let layout = SearchLayout::open(&isolated_root, scope.clone()).unwrap();
+    let ready = async |seq: SpaceSeq| {
+        tokio::time::timeout(Duration::from_secs(12), async {
+            loop {
+                if let Some(manifest) = layout.search_manifest().unwrap()
+                    && manifest.tantivy_seq >= seq
+                    && manifest.active_model.as_ref() == Some(&resolver.current_target())
+                    && manifest.vector_seq.is_some()
+                    && !manifest.embeddings_pending
+                {
+                    break manifest;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap()
+    };
+    ready(written.last_seq).await;
+    assert_eq!(provider.parts.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.outside_parts.load(Ordering::SeqCst), 0);
+
+    let ctx = context(&scope, &owner);
+    let authority = ServiceAuthority::admit(ServicePurpose::Search);
+    let move_to = async |destination: &FolderId| {
+        let moved = store
+            .move_folder(
+                ctx.clone(),
+                crate::mutation(
+                    &ctx,
+                    MoveFolder {
+                        folder: movable.clone(),
+                        new_parent: Some(destination.clone()),
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        let mut view = projection.snapshot.write().unwrap();
+        view.folder(movable.clone(), destination.clone());
+        view.advance(moved.receipt.seq());
+        moved.receipt.seq()
+    };
+
+    // Moving a folder from the Space root (no enclosing project) into a denied
+    // project while its Space-root grant is held must not leak plaintext to the
+    // remote provider.
+    resolver.hold_grant.store(true, Ordering::SeqCst);
+    move_to(&root_folder).await;
+    tokio::time::timeout(Duration::from_secs(12), resolver.grant_started.notified())
+        .await
+        .unwrap();
+    let entered_denied = move_to(&denied).await;
+    assert!(
+        !store
+            .can_index_remote_search_note(&authority, ctx.budget.clone(), scope.clone(), id, None)
+            .await
+            .unwrap()
+    );
+    resolver.release_grant.notify_one();
+    ready(entered_denied).await;
+
+    let vector_dir = isolated_root.search(&scope.space_id, SearchIndexKind::Vector);
+    let epoch = std::fs::read_dir(&vector_dir)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    assert_eq!(MutableBuffer::open(&epoch, 64).unwrap().len(), 0);
+    assert_eq!(provider.parts.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.outside_parts.load(Ordering::SeqCst), 0);
+    assert!(
+        engine
+            .search(ctx, query("vectorprobe"))
+            .await
+            .unwrap()
+            .hits
+            .is_empty()
+    );
     engine.shutdown().await;
 }

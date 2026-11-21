@@ -11,6 +11,7 @@ pub enum VectorMode {
         model_dir: PathBuf,
     },
     RemoteOnly,
+    #[cfg(any(test, feature = "test-support"))]
     DeterministicTest {
         dimension: u32,
     },

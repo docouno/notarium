@@ -248,8 +248,13 @@ impl ProviderService {
             if auth.taint().is_tainted() {
                 return Err(DomainError::CrossSpaceTainted.into());
             }
-            let admitted = primary
-                .and_then(|primary| policies.get(&primary.space.id))
+            let primary = primary.ok_or_else(selection::unavailable)?;
+            let admitted = policies
+                .get(&primary.space.id)
+                .ok_or_else(selection::unavailable)?;
+            let grant = auth
+                .spaces()
+                .get(&primary.space.id)
                 .ok_or_else(selection::unavailable)?;
             if admitted
                 .project_only
@@ -258,7 +263,10 @@ impl ProviderService {
             {
                 return Err(DomainError::AccessDenied.into());
             }
-            if !query.classes.is_subset(&admitted.policy.allowed_classes) {
+            if !query.classes.iter().all(|class| {
+                admitted.policy.allowed_classes.contains(class)
+                    && grant.read_classes.contains(class)
+            }) {
                 return Err(invalid(ValidationReason::ClassEgressForbidden));
             }
         }

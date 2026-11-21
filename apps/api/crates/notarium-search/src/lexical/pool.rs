@@ -3,23 +3,83 @@ use notarium_core::ports::Cancellation;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
     time::{Duration, Instant},
 };
-use tantivy::{Index, IndexWriter, indexer::LogMergePolicy};
+use tantivy::{
+    Index, IndexWriter,
+    indexer::{LogMergePolicy, MergePolicy},
+};
 
 const IDLE: Duration = Duration::from_secs(5);
+const REAP_INTERVAL: Duration = Duration::from_secs(1);
 pub(super) const WRITER_BUDGET: usize = 16 * 1024 * 1024;
 const MAX_ACTIVE_WRITERS: usize = 4;
 const MAX_READERS: usize = 32;
 
+pub(super) fn default_merge_policy() -> Box<dyn MergePolicy> {
+    let mut policy = LogMergePolicy::default();
+    policy.set_min_num_segments(4);
+    policy.set_max_docs_before_merge(100_000);
+    Box::new(policy)
+}
+
 struct Lease {
     writer: Option<IndexWriter>,
     last_used: Instant,
-    staged: bool,
+    staged_guards: usize,
+    commit_gen: u64,
+}
+
+impl Lease {
+    fn is_staged(&self) -> bool {
+        self.staged_guards > 0
+    }
 }
 
 type Entry = Arc<Mutex<Lease>>;
+
+/// Keeps a staged seed writer pinned until `commit_seed` completes. Dropping
+/// all active guards before commit unpins the slot and discards the uncommitted
+/// writer outside the pool mutex.
+#[must_use = "hold SeedLease until commit_seed completes"]
+pub struct SeedLease {
+    entry: Weak<Mutex<Lease>>,
+    commit_gen: u64,
+}
+
+impl SeedLease {
+    pub(super) fn inert() -> Self {
+        Self {
+            entry: Weak::new(),
+            commit_gen: 0,
+        }
+    }
+}
+
+impl Drop for SeedLease {
+    fn drop(&mut self) {
+        let Some(entry) = self.entry.upgrade() else {
+            return;
+        };
+        let uncommitted = {
+            let Ok(mut lease) = entry.lock() else {
+                return;
+            };
+            if lease.commit_gen != self.commit_gen {
+                return;
+            }
+            lease.staged_guards = lease.staged_guards.saturating_sub(1);
+            if lease.staged_guards == 0 {
+                lease.last_used = Instant::now();
+                lease.writer.take()
+            } else {
+                None
+            }
+        };
+        drop(uncommitted);
+    }
+}
 
 #[derive(Clone, Default)]
 pub struct WriterPool {
@@ -29,99 +89,140 @@ pub struct WriterPool {
 #[derive(Default)]
 struct WriterSlots {
     leases: HashMap<PathBuf, Entry>,
-    temporary: usize,
 }
 
 impl WriterSlots {
-    fn admit(&mut self) -> Result<(), LexicalError> {
-        if self.leases.len() + self.temporary >= MAX_ACTIVE_WRITERS {
+    fn admit(&mut self) -> Result<Option<Entry>, LexicalError> {
+        if self.leases.len() >= MAX_ACTIVE_WRITERS {
             let oldest = self
                 .leases
                 .iter()
                 .filter(|(_, entry)| Arc::strong_count(entry) == 1)
                 .filter_map(|(path, lease)| {
-                    let lease = lease.lock().ok()?;
-                    (!lease.staged).then_some((path, lease.last_used))
+                    let lease = lease.try_lock().ok()?;
+                    (!lease.is_staged()).then_some((path, lease.last_used))
                 })
                 .min_by_key(|(_, last_used)| *last_used)
                 .map(|(path, _)| path.clone())
                 .ok_or(LexicalError::WriterUnavailable)?;
-            self.leases.remove(&oldest);
+            return Ok(self.leases.remove(&oldest));
         }
-        Ok(())
-    }
-}
-
-struct TemporarySlot<'a>(&'a Mutex<WriterSlots>);
-
-impl Drop for TemporarySlot<'_> {
-    fn drop(&mut self) {
-        if let Ok(mut slots) = self.0.lock() {
-            slots.temporary -= 1;
-        }
+        Ok(None)
     }
 }
 
 impl WriterPool {
     fn checkout(&self, path: &Path) -> Result<Entry, LexicalError> {
-        let mut slots = self
-            .slots
-            .lock()
-            .map_err(|_| LexicalError::WriterUnavailable)?;
-        if let Some(lease) = slots.leases.get(path) {
-            return Ok(lease.clone());
-        }
-        slots.admit()?;
-        let lease = Arc::new(Mutex::new(Lease {
-            writer: None,
-            last_used: Instant::now(),
-            staged: false,
-        }));
-        slots.leases.insert(path.to_owned(), lease.clone());
-        Ok(lease)
-    }
-
-    pub(super) fn with_temporary_writer<T>(
-        &self,
-        index: &Index,
-        operation: impl FnOnce(&mut IndexWriter) -> Result<T, LexicalError>,
-    ) -> Result<T, LexicalError> {
-        {
+        let (lease, evicted) = {
             let mut slots = self
                 .slots
                 .lock()
                 .map_err(|_| LexicalError::WriterUnavailable)?;
-            slots.admit()?;
-            slots.temporary += 1;
+            if let Some(lease) = slots.leases.get(path) {
+                return Ok(lease.clone());
+            }
+            let evicted = slots.admit()?;
+            let lease = Arc::new(Mutex::new(Lease {
+                writer: None,
+                last_used: Instant::now(),
+                staged_guards: 0,
+                commit_gen: 0,
+            }));
+            slots.leases.insert(path.to_owned(), lease.clone());
+            (lease, evicted)
+        };
+        drop(evicted);
+        Ok(lease)
+    }
+
+    /// Extend an already-active staged seed across an empty page without
+    /// allocating a writer for an otherwise empty generation.
+    pub(super) fn pin_existing_stage(&self, path: &Path) -> Result<SeedLease, LexicalError> {
+        let entry = {
+            let slots = self
+                .slots
+                .lock()
+                .map_err(|_| LexicalError::WriterUnavailable)?;
+            slots.leases.get(path).cloned()
+        };
+        let Some(entry) = entry else {
+            return Ok(SeedLease::inert());
+        };
+        let mut lease = entry.lock().map_err(|_| LexicalError::WriterUnavailable)?;
+        if !lease.is_staged() {
+            return Ok(SeedLease::inert());
         }
-        let _slot = TemporarySlot(&self.slots);
-        let mut writer = index.writer_with_num_threads(1, WRITER_BUDGET)?;
-        operation(&mut writer)
+        lease.staged_guards += 1;
+        lease.last_used = Instant::now();
+        Ok(SeedLease {
+            entry: Arc::downgrade(&entry),
+            commit_gen: lease.commit_gen,
+        })
+    }
+
+    pub(super) fn with_stage_writer(
+        &self,
+        path: &Path,
+        index: &Index,
+        operation: impl FnOnce(&mut IndexWriter) -> Result<(), LexicalError>,
+    ) -> Result<SeedLease, LexicalError> {
+        let entry = self.checkout(path)?;
+        let (result, failed) = {
+            let mut lease = entry.lock().map_err(|_| LexicalError::WriterUnavailable)?;
+            if lease.writer.is_none() {
+                let writer = index.writer_with_num_threads(1, WRITER_BUDGET)?;
+                writer.set_merge_policy(default_merge_policy());
+                lease.writer = Some(writer);
+            }
+            let outcome = operation(lease.writer.as_mut().expect("writer admitted"));
+            lease.last_used = Instant::now();
+            match outcome {
+                Ok(()) => {
+                    lease.staged_guards += 1;
+                    (
+                        Ok(SeedLease {
+                            entry: Arc::downgrade(&entry),
+                            commit_gen: lease.commit_gen,
+                        }),
+                        None,
+                    )
+                }
+                Err(error) => (Err(error), lease.writer.take()),
+            }
+        };
+        drop(failed);
+        result
     }
 
     pub(super) fn with_writer<T>(
         &self,
         path: &Path,
         index: &Index,
-        staged: bool,
+        clear_staged: bool,
         operation: impl FnOnce(&mut IndexWriter) -> Result<T, LexicalError>,
     ) -> Result<T, LexicalError> {
         let entry = self.checkout(path)?;
-        let mut lease = entry.lock().map_err(|_| LexicalError::WriterUnavailable)?;
-        if lease.writer.is_none() {
-            let writer = index.writer_with_num_threads(1, WRITER_BUDGET)?;
-            let mut policy = LogMergePolicy::default();
-            policy.set_min_num_segments(4);
-            policy.set_max_docs_before_merge(100_000);
-            writer.set_merge_policy(Box::new(policy));
-            lease.writer = Some(writer);
-        }
-        let result = operation(lease.writer.as_mut().expect("writer admitted"));
-        lease.last_used = Instant::now();
-        lease.staged = result.is_ok() && staged;
-        if result.is_err() {
-            lease.writer.take();
-        }
+        let (result, failed) = {
+            let mut lease = entry.lock().map_err(|_| LexicalError::WriterUnavailable)?;
+            if lease.writer.is_none() {
+                let writer = index.writer_with_num_threads(1, WRITER_BUDGET)?;
+                writer.set_merge_policy(default_merge_policy());
+                lease.writer = Some(writer);
+            }
+            let outcome = operation(lease.writer.as_mut().expect("writer admitted"));
+            lease.last_used = Instant::now();
+            match outcome {
+                Ok(value) => {
+                    if clear_staged {
+                        lease.staged_guards = 0;
+                        lease.commit_gen = lease.commit_gen.wrapping_add(1);
+                    }
+                    (Ok(value), None)
+                }
+                Err(error) => (Err(error), lease.writer.take()),
+            }
+        };
+        drop(failed);
         result
     }
 
@@ -130,51 +231,79 @@ impl WriterPool {
             .slots
             .lock()
             .map_err(|_| LexicalError::WriterUnavailable)?;
-        Ok(slots.leases.len() + slots.temporary)
+        Ok(slots.leases.len())
     }
 
     pub fn release(&self, path: &Path) -> Result<(), LexicalError> {
-        let mut slots = self
-            .slots
-            .lock()
-            .map_err(|_| LexicalError::WriterUnavailable)?;
-        if slots
-            .leases
-            .get(path)
-            .is_some_and(|lease| Arc::strong_count(lease) > 1)
-        {
-            return Err(LexicalError::WriterUnavailable);
-        }
-        slots.leases.remove(path);
+        let removed = {
+            let mut slots = self
+                .slots
+                .lock()
+                .map_err(|_| LexicalError::WriterUnavailable)?;
+            if slots
+                .leases
+                .get(path)
+                .is_some_and(|lease| Arc::strong_count(lease) > 1)
+            {
+                return Err(LexicalError::WriterUnavailable);
+            }
+            slots.leases.remove(path)
+        };
+        drop(removed);
         Ok(())
     }
 
-    fn reap_idle(&self) -> Result<(), LexicalError> {
+    pub(crate) fn release_all(&self) {
+        let removed = {
+            let Ok(mut slots) = self.slots.lock() else {
+                return;
+            };
+            std::mem::take(&mut slots.leases)
+        };
+        drop(removed);
+    }
+
+    fn take_idle(&self) -> Result<Vec<Entry>, LexicalError> {
         let mut slots = self
             .slots
             .lock()
             .map_err(|_| LexicalError::WriterUnavailable)?;
-        slots.leases.retain(|_, entry| {
-            Arc::strong_count(entry) > 1
-                || entry
-                    .lock()
-                    .is_ok_and(|lease| lease.staged || lease.last_used.elapsed() < IDLE)
-        });
-        Ok(())
+        let expired_keys: Vec<_> = slots
+            .leases
+            .iter()
+            .filter(|(_, entry)| {
+                Arc::strong_count(entry) == 1
+                    && entry
+                        .try_lock()
+                        .is_ok_and(|lease| !lease.is_staged() && lease.last_used.elapsed() >= IDLE)
+            })
+            .map(|(path, _)| path.clone())
+            .collect();
+        let mut expired = Vec::with_capacity(expired_keys.len());
+        for path in expired_keys {
+            if let Some(entry) = slots.leases.remove(&path) {
+                expired.push(entry);
+            }
+        }
+        Ok(expired)
     }
 
     /// Own this future alongside the indexing worker and cancel it during drain.
     pub async fn evict_idle_until(&self, cancellation: Cancellation) -> Result<(), LexicalError> {
-        let mut interval = tokio::time::interval(Duration::from_millis(200));
+        let start = tokio::time::Instant::now() + REAP_INTERVAL;
+        let mut interval = tokio::time::interval_at(start, REAP_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 biased;
                 () = cancellation.cancelled() => return Ok(()),
                 _ = interval.tick() => {
-                    let pool = self.clone();
-                    tokio::task::spawn_blocking(move || pool.reap_idle()).await
-                        .map_err(|_| LexicalError::WriterUnavailable)??;
+                    let expired = self.take_idle()?;
+                    if !expired.is_empty() {
+                        tokio::task::spawn_blocking(move || drop(expired))
+                            .await
+                            .map_err(|_| LexicalError::WriterUnavailable)?;
+                    }
                 }
             }
         }
@@ -200,41 +329,83 @@ impl ReaderCache {
         path: &Path,
         admit: impl FnOnce(&Path) -> Result<LexicalIndex, LexicalError>,
     ) -> Result<Arc<LexicalIndex>, LexicalError> {
-        let mut indexes = self
-            .indexes
-            .lock()
-            .map_err(|_| LexicalError::ReaderUnavailable)?;
-        if let Some((index, last_use)) = indexes.get_mut(path) {
-            *last_use = Instant::now();
-            return Ok(index.clone());
+        {
+            let mut indexes = self
+                .indexes
+                .lock()
+                .map_err(|_| LexicalError::ReaderUnavailable)?;
+            if let Some((index, last_use)) = indexes.get_mut(path) {
+                *last_use = Instant::now();
+                return Ok(index.clone());
+            }
+            // Reject full pinned caches before opening or creating index files
+            // and never evict a valid reader until `admit` succeeds.
+            if indexes.len() >= MAX_READERS
+                && !indexes
+                    .values()
+                    .any(|(index, _)| Arc::strong_count(index) == 1)
+            {
+                return Err(LexicalError::ReaderUnavailable);
+            }
         }
-        if indexes.len() >= MAX_READERS {
-            let oldest = indexes
-                .iter()
-                .filter(|(_, (index, _))| Arc::strong_count(index) == 1)
-                .min_by_key(|(_, (_, last_use))| *last_use)
-                .map(|(path, _)| path.clone())
-                .ok_or(LexicalError::ReaderUnavailable)?;
-            indexes.remove(&oldest);
-        }
-        let index = Arc::new(admit(path)?);
-        indexes.insert(path.to_owned(), (index.clone(), Instant::now()));
-        Ok(index)
+        let opened = Arc::new(admit(path)?);
+        let (result, dropped) = {
+            let mut indexes = self
+                .indexes
+                .lock()
+                .map_err(|_| LexicalError::ReaderUnavailable)?;
+            if let Some((existing, last_use)) = indexes.get_mut(path) {
+                *last_use = Instant::now();
+                (Ok(existing.clone()), Some(opened))
+            } else if indexes.len() >= MAX_READERS {
+                let oldest = indexes
+                    .iter()
+                    .filter(|(_, (index, _))| Arc::strong_count(index) == 1)
+                    .min_by_key(|(_, (_, last_use))| *last_use)
+                    .map(|(path, _)| path.clone());
+                match oldest {
+                    Some(oldest) => {
+                        let evicted = indexes.remove(&oldest).map(|(index, _)| index);
+                        indexes.insert(path.to_owned(), (opened.clone(), Instant::now()));
+                        (Ok(opened), evicted)
+                    }
+                    None => (Err(LexicalError::ReaderUnavailable), Some(opened)),
+                }
+            } else {
+                indexes.insert(path.to_owned(), (opened.clone(), Instant::now()));
+                (Ok(opened), None)
+            }
+        };
+        drop(dropped);
+        result
     }
 
     /// Return whether the generation can be removed. Existing users keep it pinned.
     pub fn release(&self, path: &Path) -> Result<bool, LexicalError> {
-        let mut indexes = self
-            .indexes
-            .lock()
-            .map_err(|_| LexicalError::ReaderUnavailable)?;
-        if indexes
-            .get(path)
-            .is_some_and(|(index, _)| Arc::strong_count(index) > 1)
-        {
-            return Ok(false);
-        }
-        indexes.remove(path);
+        let removed = {
+            let mut indexes = self
+                .indexes
+                .lock()
+                .map_err(|_| LexicalError::ReaderUnavailable)?;
+            if indexes
+                .get(path)
+                .is_some_and(|(index, _)| Arc::strong_count(index) > 1)
+            {
+                return Ok(false);
+            }
+            indexes.remove(path).map(|(index, _)| index)
+        };
+        drop(removed);
         Ok(true)
+    }
+
+    pub(crate) fn release_all(&self) {
+        let removed = {
+            let Ok(mut indexes) = self.indexes.lock() else {
+                return;
+            };
+            std::mem::take(&mut *indexes)
+        };
+        drop(removed);
     }
 }

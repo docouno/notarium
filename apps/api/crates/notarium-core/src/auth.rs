@@ -91,6 +91,7 @@ pub enum PrincipalKind {
     AgentRun(AgentRunId),
     Keeper(AgentRunId),
     OAuth { source: GrantId, narrowed: bool },
+    SearchIndexing,
 }
 
 #[derive(Clone, Debug)]
@@ -202,6 +203,38 @@ impl EngineAuthContext {
             taint: BranchTaint::default(),
             readonly_abilities: BTreeSet::new(),
             credential: verified.credential,
+        }
+    }
+    /// Internal read-only context scoped to one Space for remote search indexing.
+    /// Never carries human management, write privileges, or encrypted-note reads.
+    pub fn for_search_indexing(
+        principal: PrincipalId,
+        grant: GrantId,
+        space: SpaceId,
+        provider: ProviderResourceId,
+    ) -> Self {
+        let mut read_classes = DocClass::all();
+        read_classes.remove(&DocClass::EncryptedNote);
+        Self {
+            principal,
+            grant,
+            kind: PrincipalKind::SearchIndexing,
+            spaces: BTreeMap::from([(
+                space.clone(),
+                SpaceGrant {
+                    role: SpaceRole::Viewer,
+                    read_classes,
+                    write_classes: BTreeSet::new(),
+                    project_root: None,
+                },
+            )]),
+            human_management: false,
+            ability_write: false,
+            write_space: None,
+            chat_audience: None,
+            taint: BranchTaint::default(),
+            readonly_abilities: BTreeSet::new(),
+            credential: Some(AuthenticatedCredential::SearchIndexing { space, provider }),
         }
     }
     pub fn for_agent_run(

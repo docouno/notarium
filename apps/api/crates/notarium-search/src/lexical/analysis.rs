@@ -10,8 +10,11 @@ use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
 
 pub const PROSE: &str = "notarium_prose_v1";
 pub const EXACT: &str = "notarium_exact_v1";
-pub const TOKENIZER_VERSION: u32 = 1;
+pub const TOKENIZER_VERSION: u32 = 2;
 const MAX_TERM_BYTES: usize = 255;
+// NFC and case folding cannot shrink valid UTF-8 by more than 4x.
+const MAX_RAW_TERM_BYTES: usize = MAX_TERM_BYTES * 4;
+const EXACT_TRIM: [char; 4] = ['.', ':', '-', '/'];
 
 #[derive(Clone)]
 pub(super) struct Prose {
@@ -35,38 +38,41 @@ impl Default for Prose {
 
 impl Prose {
     pub(super) fn tokens(&mut self, text: &str) -> Vec<Token> {
-        word_spans(text, |c| word(c) || c == '_')
-            .into_iter()
-            .enumerate()
-            .filter_map(|(position, (start, raw))| {
-                let normalized = normalize(raw.trim_matches('_'));
-                if normalized.is_empty() || normalized.len() > MAX_TERM_BYTES {
-                    return None;
-                }
-                let stemmer = if normalized
-                    .chars()
-                    .all(|c| matches!(c, '\u{0400}'..='\u{052f}'))
-                {
-                    Some(&mut self.russian)
-                } else if normalized.bytes().all(|byte| byte.is_ascii_lowercase()) {
-                    Some(&mut self.english)
-                } else {
-                    None
-                };
-                let text = match stemmer {
-                    Some(stemmer) => {
+        let mut tokens = Vec::new();
+        let mut position = 0;
+        for (start, raw) in word_spans(text, |c| word(c) || c == '_') {
+            let trimmed = raw.trim_matches('_');
+            if !has_alnum(trimmed) || trimmed.len() > MAX_RAW_TERM_BYTES {
+                continue;
+            }
+            let normalized = normalize(trimmed);
+            if normalized.is_empty() || normalized.len() > MAX_TERM_BYTES {
+                continue;
+            }
+            let stemmer = if normalized
+                .chars()
+                .all(|c| matches!(c, '\u{0400}'..='\u{052f}'))
+            {
+                Some(&mut self.russian)
+            } else if normalized.bytes().all(|byte| byte.is_ascii_lowercase()) {
+                Some(&mut self.english)
+            } else {
+                None
+            };
+            let text = match stemmer {
+                Some(stemmer) => {
+                    let stemmed = {
                         let mut stream = stemmer.token_stream(&normalized);
-                        if stream.advance() {
-                            stream.token().text.clone()
-                        } else {
-                            normalized.clone()
-                        }
-                    }
-                    None => normalized,
-                };
-                Some(make_token(start, raw.len(), position, text))
-            })
-            .collect()
+                        stream.advance().then(|| stream.token().text.clone())
+                    };
+                    stemmed.unwrap_or(normalized)
+                }
+                None => normalized,
+            };
+            tokens.push(make_token(start, raw.len(), position, text));
+            position += 1;
+        }
+        tokens
     }
 }
 
@@ -84,20 +90,29 @@ impl Tokenizer for Exact {
     type TokenStream<'a> = AnalysisStream;
     fn token_stream<'a>(&'a mut self, text: &'a str) -> AnalysisStream {
         let mut tokens = Vec::new();
-        for (position, (start, raw)) in exact_spans(text).into_iter().enumerate() {
-            let span = raw.trim_matches(['.', ':', '-', '/']);
+        let mut position = 0;
+        for (start, raw) in exact_spans(text) {
+            let span = raw.trim_matches(EXACT_TRIM);
+            if !has_alnum(span) {
+                continue;
+            }
             let mut terms = BTreeSet::new();
-            terms.insert(normalize(span));
+            insert_bounded_term(&mut terms, span);
             for segment in span.split(['/', ':', '@']) {
-                terms.insert(normalize(segment));
+                let segment = segment.trim_matches(EXACT_TRIM);
+                if has_alnum(segment) {
+                    insert_bounded_term(&mut terms, segment);
+                }
             }
             terms.extend(atoms(span));
-            tokens.extend(
-                terms
-                    .into_iter()
-                    .filter(|term| !term.is_empty() && term.len() <= MAX_TERM_BYTES)
-                    .map(|term| make_token(start, raw.len(), position, term)),
-            );
+            if !terms.is_empty() {
+                tokens.extend(
+                    terms
+                        .into_iter()
+                        .map(|term| make_token(start, raw.len(), position, term)),
+                );
+                position += 1;
+            }
         }
         tokens.into()
     }
@@ -135,11 +150,26 @@ fn word(c: char) -> bool {
     c.is_alphanumeric() || is_combining_mark(c)
 }
 
+fn has_alnum(value: &str) -> bool {
+    value.chars().any(char::is_alphanumeric)
+}
+
+fn insert_bounded_term(terms: &mut BTreeSet<String>, raw: &str) {
+    if raw.len() > MAX_RAW_TERM_BYTES {
+        return;
+    }
+    let normalized = normalize(raw);
+    if !normalized.is_empty() && normalized.len() <= MAX_TERM_BYTES {
+        terms.insert(normalized);
+    }
+}
+
 pub(super) fn normalize(value: &str) -> String {
     value
         .nfc()
         .flat_map(char::to_lowercase)
         .map(|c| if c == 'ё' { 'е' } else { c })
+        .nfc()
         .collect()
 }
 
@@ -174,41 +204,64 @@ fn exact_spans(text: &str) -> Vec<(usize, &str)> {
 }
 
 pub(super) fn exact_phrase(text: &str) -> Vec<Token> {
-    exact_spans(text)
-        .into_iter()
-        .enumerate()
-        .filter_map(|(position, (start, raw))| {
-            let span = normalize(raw.trim_matches(['.', ':', '-', '/']));
-            (!span.is_empty() && span.len() <= MAX_TERM_BYTES)
-                .then(|| make_token(start, raw.len(), position, span))
-        })
-        .collect()
+    let mut tokens = Vec::new();
+    let mut position = 0;
+    for (start, raw) in exact_spans(text) {
+        let span = raw.trim_matches(EXACT_TRIM);
+        if !has_alnum(span) {
+            continue;
+        }
+        let mut emitted = false;
+        if span.len() <= MAX_RAW_TERM_BYTES {
+            let normalized = normalize(span);
+            if !normalized.is_empty() && normalized.len() <= MAX_TERM_BYTES {
+                tokens.push(make_token(start, raw.len(), position, normalized));
+                emitted = true;
+            }
+        }
+        if emitted || !atoms(span).is_empty() {
+            position += 1;
+        }
+    }
+    tokens
 }
 
 pub(super) fn atoms(text: &str) -> BTreeSet<String> {
     let mut result = BTreeSet::new();
-    for (_, word) in word_spans(text, word) {
-        let mut chars = word.char_indices().peekable();
+    for (_, raw) in word_spans(text, word) {
+        if !has_alnum(raw) {
+            continue;
+        }
+        // Compose to NFC before splitting case/numeric boundaries so NFD and
+        // NFC spellings produce identical identifier atoms.
+        let word: std::borrow::Cow<'_, str> = if raw.is_ascii() {
+            std::borrow::Cow::Borrowed(raw)
+        } else {
+            std::borrow::Cow::Owned(raw.nfc().collect())
+        };
         let mut start = 0;
         let mut previous: Option<char> = None;
-        while let Some((offset, current)) = chars.next() {
-            if let Some(previous) = previous {
+        for (offset, current) in word.char_indices() {
+            if is_combining_mark(current) {
+                continue;
+            }
+            if let Some(prev) = previous {
+                let next_base = word[offset + current.len_utf8()..]
+                    .chars()
+                    .find(|&c| !is_combining_mark(c));
                 let case_boundary = current.is_uppercase()
-                    && (previous.is_lowercase()
-                        || (previous.is_uppercase()
-                            && chars.peek().is_some_and(|(_, c)| c.is_lowercase())));
-                let numeric_boundary =
-                    previous.is_numeric() != current.is_numeric() && !is_combining_mark(current);
+                    && (prev.is_lowercase()
+                        || (prev.is_uppercase() && next_base.is_some_and(char::is_lowercase)));
+                let numeric_boundary = prev.is_numeric() != current.is_numeric();
                 if case_boundary || numeric_boundary {
-                    result.insert(normalize(&word[start..offset]));
+                    insert_bounded_term(&mut result, &word[start..offset]);
                     start = offset;
                 }
             }
             previous = Some(current);
         }
-        result.insert(normalize(&word[start..]));
+        insert_bounded_term(&mut result, &word[start..]);
     }
-    result.retain(|word| word.len() <= MAX_TERM_BYTES);
     result
 }
 
@@ -330,11 +383,28 @@ pub fn extract_note_body(content: &SearchContent) -> DomainResult<String> {
                 output.push_str(&text);
                 output.push(' ');
             }
+            Event::Start(
+                Tag::Item
+                | Tag::List(_)
+                | Tag::Paragraph
+                | Tag::Heading { .. }
+                | Tag::BlockQuote(_)
+                | Tag::Table(_),
+            ) => {
+                if !prose.is_empty() {
+                    push_visible(&mut output, &mut prose);
+                    output.push('\n');
+                }
+            }
             Event::SoftBreak
             | Event::HardBreak
             | Event::Rule
             | Event::End(
-                TagEnd::Paragraph | TagEnd::Heading(_) | TagEnd::Item | TagEnd::TableCell,
+                TagEnd::Paragraph
+                | TagEnd::Heading(_)
+                | TagEnd::Item
+                | TagEnd::TableCell
+                | TagEnd::TableRow,
             ) => {
                 push_visible(&mut output, &mut prose);
                 output.push('\n');
@@ -349,12 +419,38 @@ pub fn extract_note_body(content: &SearchContent) -> DomainResult<String> {
 fn push_visible(output: &mut String, prose: &mut String) {
     let mut text = prose.as_str();
     while let Some((left, right)) = text.split_once("[[") {
+        output.push_str(left);
         let Some((link, tail)) = right.split_once("]]") else {
+            output.push_str("[[");
+            text = right;
             break;
         };
-        output.push_str(left);
-        let label = link.split_once('|').map_or(link, |(_, label)| label);
-        output.push_str(label);
+        // Any `[[` inside `link` starts a nearer candidate before `]]`;
+        // jumping straight to the last `[[` keeps total work linear.
+        let (prefix, candidate) = match link.rfind("[[") {
+            Some(pos) => {
+                output.push_str("[[");
+                (&link[..pos], &link[pos + 2..])
+            }
+            None => ("", link),
+        };
+        output.push_str(prefix);
+        if candidate.contains(['\r', '\n']) {
+            output.push_str("[[");
+            output.push_str(candidate);
+            output.push_str("]]");
+        } else {
+            let label = candidate
+                .split_once('|')
+                .map_or(candidate, |(target, label)| {
+                    if label.trim().is_empty() {
+                        target
+                    } else {
+                        label
+                    }
+                });
+            output.push_str(label);
+        }
         text = tail;
     }
     output.push_str(text);

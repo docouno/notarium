@@ -1,14 +1,26 @@
-use super::{M, M0, MAX_LEVEL, SearchBudget, VectorChunk, VectorError, simd::Dot};
+use super::{
+    GLOBAL_EVAL_BUDGET, M, M0, MAX_LEVEL, SearchBudget, VectorChunk, VectorError, simd::Dot,
+};
+use crate::vector::QuantizedVector;
+use notarium_core::{
+    classes::DocClass,
+    ids::{ContentDigest, NoteId},
+    ports::Cancellation,
+};
 use std::{
     cmp::{Ordering, Reverse},
-    collections::{BinaryHeap, HashSet},
+    collections::{BinaryHeap, HashMap, HashSet},
 };
 
 const EF_CONSTRUCTION: usize = 128;
 
 pub(super) trait Graph {
-    fn vector(&self, node: u32) -> (&[i8], f32);
-    fn neighbors(&self, node: u32, level: u8) -> impl Iterator<Item = u32> + '_;
+    fn vector(&self, node: u32) -> Result<(&[i8], f32), VectorError>;
+    fn neighbors(
+        &self,
+        node: u32,
+        level: u8,
+    ) -> Result<impl Iterator<Item = u32> + '_, VectorError>;
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -90,9 +102,9 @@ impl<'a> Similarity<'a> {
         }
     }
 
-    fn score_node(self, graph: &impl Graph, node: u32) -> Neighbor {
-        let (vector, scale) = graph.vector(node);
-        self.score(node, vector, scale)
+    fn score_node(self, graph: &impl Graph, node: u32) -> Result<Neighbor, VectorError> {
+        let (vector, scale) = graph.vector(node)?;
+        Ok(self.score(node, vector, scale))
     }
 }
 
@@ -101,28 +113,54 @@ fn greedily_descend(
     scorer: Similarity<'_>,
     entry: u32,
     levels: impl Iterator<Item = u8>,
-) -> Neighbor {
-    let mut nearest = scorer.score_node(graph, entry);
+) -> Result<Neighbor, VectorError> {
+    let mut nearest = scorer.score_node(graph, entry)?;
     for level in levels {
         loop {
-            let next = graph
-                .neighbors(nearest.slot, level)
-                .map(|node| scorer.score_node(graph, node))
-                .max();
-            match next {
+            let mut best: Option<Neighbor> = None;
+            for node in graph.neighbors(nearest.slot, level)? {
+                let scored = scorer.score_node(graph, node)?;
+                if best.is_none_or(|current| scored > current) {
+                    best = Some(scored);
+                }
+            }
+            match best {
                 Some(next) if next > nearest => nearest = next,
                 _ => break,
             }
         }
     }
-    nearest
+    Ok(nearest)
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum StopCheck<'a> {
+    None,
+    Cancel(&'a Cancellation),
+    Budget(SearchBudget<'a>),
+}
+
+impl StopCheck<'_> {
+    pub(super) fn check(self) -> Result<(), VectorError> {
+        match self {
+            Self::None => Ok(()),
+            Self::Cancel(cancel) => {
+                if cancel.is_cancelled() {
+                    Err(VectorError::Cancelled)
+                } else {
+                    Ok(())
+                }
+            }
+            Self::Budget(budget) => budget.check(),
+        }
+    }
 }
 
 pub(super) struct Exploration<'a> {
     pub level: u8,
     pub result_capacity: usize,
     pub max_evaluations: usize,
-    pub budget: Option<SearchBudget<'a>>,
+    pub stop: StopCheck<'a>,
 }
 
 pub(super) struct Explored {
@@ -135,7 +173,7 @@ pub(super) fn explore(
     scorer: Similarity<'_>,
     entries: impl IntoIterator<Item = Neighbor>,
     config: Exploration<'_>,
-    eligible: impl Fn(u32) -> bool,
+    mut eligible: impl FnMut(u32) -> Result<bool, VectorError>,
     mut visit: impl FnMut(u32) -> bool,
 ) -> Result<Explored, VectorError> {
     let mut wave = BinaryHeap::new();
@@ -145,7 +183,7 @@ pub(super) fn explore(
         if visit(entry.slot) {
             evaluations += 1;
             wave.push(entry);
-            if eligible(entry.slot) {
+            if eligible(entry.slot)? {
                 keep_best(&mut best, entry, config.result_capacity);
             }
         }
@@ -156,33 +194,29 @@ pub(super) fn explore(
         {
             break;
         }
-        for slot in graph.neighbors(candidate.slot, config.level) {
+        for slot in graph.neighbors(candidate.slot, config.level)? {
             if !visit(slot) {
                 continue;
             }
             if evaluations >= config.max_evaluations {
                 break 'walk;
             }
-            if evaluations.is_multiple_of(64)
-                && let Some(budget) = config.budget
-            {
-                budget.check()?;
+            if evaluations.is_multiple_of(64) {
+                config.stop.check()?;
             }
             evaluations += 1;
-            let next = scorer.score_node(graph, slot);
+            let next = scorer.score_node(graph, slot)?;
             if best.len() < config.result_capacity
                 || best.peek().is_some_and(|worst| next > worst.0)
             {
                 wave.push(next);
-                if eligible(slot) {
+                if eligible(slot)? {
                     keep_best(&mut best, next, config.result_capacity);
                 }
             }
         }
     }
-    if let Some(budget) = config.budget {
-        budget.check()?;
-    }
+    config.stop.check()?;
     Ok(Explored {
         neighbors: finish(best),
         evaluations,
@@ -204,21 +238,29 @@ pub(super) fn finish<T: Ord>(heap: BinaryHeap<Reverse<T>>) -> Vec<T> {
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn query_graph(
     graph: &impl Graph,
     scorer: Similarity<'_>,
     entry: u32,
     max_level: u8,
     top_k: usize,
+    active_segments: usize,
     budget: SearchBudget<'_>,
-    eligible: impl Fn(u32) -> bool,
+    eligible: impl FnMut(u32) -> Result<bool, VectorError>,
 ) -> Result<Explored, VectorError> {
-    let width = top_k.saturating_mul(2).clamp(64, 256);
+    let active = active_segments.max(1);
+    let width = if active <= 2 {
+        top_k.saturating_mul(2).clamp(64, 256)
+    } else {
+        top_k.clamp(64, 160)
+    };
+    let max_evaluations = (GLOBAL_EVAL_BUDGET / active).clamp(1_500, 9_600);
     let mut visited = HashSet::with_capacity(width * 8);
     // Carry several upper-layer candidates into layer zero. A single
     // greedy entry can settle in a nearby dense cluster and miss the target.
     const UPPER_WIDTH: usize = 12;
-    let mut anchors = vec![scorer.score_node(graph, entry)];
+    let mut anchors = vec![scorer.score_node(graph, entry)?];
     let mut upper_evaluations = 0;
     for level in (1..=max_level).rev() {
         visited.clear();
@@ -230,9 +272,9 @@ pub(super) fn query_graph(
                 level,
                 result_capacity: UPPER_WIDTH,
                 max_evaluations: UPPER_WIDTH * 32,
-                budget: Some(budget),
+                stop: StopCheck::Budget(budget),
             },
-            |_| true,
+            |_| Ok(true),
             |slot| visited.insert(slot),
         )?;
         upper_evaluations += explored.evaluations;
@@ -247,8 +289,8 @@ pub(super) fn query_graph(
             level: 0,
             // Oversampling can request more hits than the capped exploration width.
             result_capacity: width.max(top_k),
-            max_evaluations: width * 48,
-            budget: Some(budget),
+            max_evaluations,
+            stop: StopCheck::Budget(budget),
         },
         eligible,
         |slot| visited.insert(slot),
@@ -258,31 +300,70 @@ pub(super) fn query_graph(
     Ok(explored)
 }
 
-pub(super) struct Node {
-    pub chunk: VectorChunk,
-    pub edges: Vec<Vec<u32>>,
+pub(super) struct CompactMeta {
+    pub note_ord: u32,
+    pub key: ContentDigest,
+    pub source: ContentDigest,
+    pub folder: u32,
+    pub class: DocClass,
+    pub tokens: u16,
+    pub span_start: u32,
+    pub context_len: u16,
+    pub spans_len: u8,
 }
 
 pub(super) struct BuilderGraph {
-    pub nodes: Vec<Node>,
+    pub dimension: usize,
+    pub stride: usize,
+    pub scales: Vec<f32>,
+    pub vectors: Vec<i8>,
+    pub base_edges: Vec<[u32; M0]>,
+    pub base_lens: Vec<u8>,
+    pub upper_edges: Vec<Option<Box<[Vec<u32>]>>>,
+    pub metas: Vec<CompactMeta>,
+    pub spans: Vec<(u32, u32)>,
+    pub notes: Vec<NoteId>,
+    pub note_lookup: HashMap<NoteId, u32>,
     pub entry: u32,
     pub max_level: u8,
     visits: VisitEpochs,
 }
 
-struct NodeView<'a>(&'a [Node]);
-impl Graph for NodeView<'_> {
-    fn vector(&self, node: u32) -> (&[i8], f32) {
-        let vector = &self.0[node as usize].chunk.vector;
-        (vector.values(), vector.scale())
+struct BuilderView<'a> {
+    stride: usize,
+    scales: &'a [f32],
+    vectors: &'a [i8],
+    base_edges: &'a [[u32; M0]],
+    base_lens: &'a [u8],
+    upper_edges: &'a [Option<Box<[Vec<u32>]>>],
+}
+
+impl Graph for BuilderView<'_> {
+    fn vector(&self, node: u32) -> Result<(&[i8], f32), VectorError> {
+        let index = node as usize;
+        let start = index * self.stride;
+        Ok((
+            &self.vectors[start..start + self.stride],
+            self.scales[index],
+        ))
     }
-    fn neighbors(&self, node: u32, level: u8) -> impl Iterator<Item = u32> + '_ {
-        self.0[node as usize]
-            .edges
-            .get(usize::from(level))
-            .into_iter()
-            .flatten()
-            .copied()
+
+    fn neighbors(
+        &self,
+        node: u32,
+        level: u8,
+    ) -> Result<impl Iterator<Item = u32> + '_, VectorError> {
+        let index = node as usize;
+        let slice: &[u32] = if level == 0 {
+            &self.base_edges[index][..usize::from(self.base_lens[index])]
+        } else {
+            self.upper_edges[index]
+                .as_deref()
+                .and_then(|layers| layers.get(usize::from(level) - 1))
+                .map(Vec::as_slice)
+                .unwrap_or(&[])
+        };
+        Ok(slice.iter().copied())
     }
 }
 
@@ -312,60 +393,165 @@ impl VisitEpochs {
 }
 
 impl BuilderGraph {
-    pub fn new() -> Self {
+    pub fn new(dimension: usize) -> Self {
         Self {
-            nodes: Vec::new(),
+            dimension,
+            stride: dimension.next_multiple_of(64),
+            scales: Vec::new(),
+            vectors: Vec::new(),
+            base_edges: Vec::new(),
+            base_lens: Vec::new(),
+            upper_edges: Vec::new(),
+            metas: Vec::new(),
+            spans: Vec::new(),
+            notes: Vec::new(),
+            note_lookup: HashMap::new(),
             entry: 0,
             max_level: 0,
             visits: VisitEpochs::default(),
         }
     }
 
-    pub fn push(&mut self, chunk: VectorChunk) -> Result<(), VectorError> {
-        let slot = u32::try_from(self.nodes.len()).map_err(|_| VectorError::BufferFull)?;
+    pub fn len(&self) -> usize {
+        self.metas.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.metas.is_empty()
+    }
+
+    pub fn vector_at(&self, slot: usize) -> QuantizedVector {
+        let start = slot * self.stride;
+        QuantizedVector::from_parts(
+            self.scales[slot],
+            self.vectors[start..start + self.stride].to_vec(),
+            self.dimension,
+        )
+        .expect("builder vector already validated")
+    }
+
+    pub fn node_level_at(&self, slot: usize) -> u8 {
+        self.upper_edges[slot]
+            .as_deref()
+            .map_or(0, |layers| layers.len() as u8)
+    }
+
+    fn view(&self) -> BuilderView<'_> {
+        BuilderView {
+            stride: self.stride,
+            scales: &self.scales,
+            vectors: &self.vectors,
+            base_edges: &self.base_edges,
+            base_lens: &self.base_lens,
+            upper_edges: &self.upper_edges,
+        }
+    }
+
+    pub(super) fn append_node_data(
+        &mut self,
+        chunk: VectorChunk,
+        base_row: [u32; M0],
+        base_len: u8,
+        upper: Option<Box<[Vec<u32>]>>,
+    ) -> Result<(), VectorError> {
+        let span_start = u32::try_from(self.spans.len()).map_err(|_| VectorError::BufferFull)?;
+        let total_spans = chunk.metadata.context.len() + chunk.metadata.spans.len();
+        if self
+            .spans
+            .len()
+            .checked_add(total_spans)
+            .is_none_or(|count| count > u32::MAX as usize)
+        {
+            return Err(VectorError::BufferFull);
+        }
+        let note_ord = if let Some(&ord) = self.note_lookup.get(&chunk.metadata.note) {
+            ord
+        } else {
+            let ord = u32::try_from(self.notes.len()).map_err(|_| VectorError::BufferFull)?;
+            self.notes.push(chunk.metadata.note.clone());
+            self.note_lookup.insert(chunk.metadata.note, ord);
+            ord
+        };
+        for span in chunk.metadata.context.iter().chain(&chunk.metadata.spans) {
+            self.spans.push((span.start() as u32, span.end() as u32));
+        }
+        self.scales.push(chunk.vector.scale());
+        self.vectors.extend_from_slice(chunk.vector.values());
+        self.base_edges.push(base_row);
+        self.base_lens.push(base_len);
+        self.upper_edges.push(upper);
+        self.metas.push(CompactMeta {
+            note_ord,
+            key: chunk.metadata.key,
+            source: chunk.metadata.source,
+            folder: chunk.metadata.folder,
+            class: chunk.metadata.class,
+            tokens: chunk.metadata.tokens,
+            span_start,
+            context_len: chunk.metadata.context.len() as u16,
+            spans_len: chunk.metadata.spans.len() as u8,
+        });
+        Ok(())
+    }
+
+    pub fn push(
+        &mut self,
+        chunk: VectorChunk,
+        cancel: Option<&Cancellation>,
+    ) -> Result<(), VectorError> {
+        let stop = cancel.map_or(StopCheck::None, StopCheck::Cancel);
+        stop.check()?;
+        let slot = u32::try_from(self.len()).map_err(|_| VectorError::BufferFull)?;
         if slot == u32::MAX {
             return Err(VectorError::BufferFull);
         }
         let level = node_level(chunk.metadata.key.as_bytes(), slot);
-        if self.nodes.is_empty() {
+        if self.is_empty() {
+            let upper =
+                (level > 0).then(|| vec![Vec::new(); usize::from(level)].into_boxed_slice());
+            self.append_node_data(chunk, [0; M0], 0, upper)?;
             self.entry = slot;
             self.max_level = level;
-            self.nodes.push(Node {
-                chunk,
-                edges: vec![Vec::new(); usize::from(level) + 1],
-            });
             return Ok(());
         }
         let scorer = Similarity::new(chunk.vector.values(), chunk.vector.scale())?;
         let mut neighbors_by_level = vec![Vec::new(); usize::from(level) + 1];
         {
-            let graph = NodeView(&self.nodes);
+            let view = BuilderView {
+                stride: self.stride,
+                scales: &self.scales,
+                vectors: &self.vectors,
+                base_edges: &self.base_edges,
+                base_lens: &self.base_lens,
+                upper_edges: &self.upper_edges,
+            };
             let mut anchor = greedily_descend(
-                &graph,
+                &view,
                 scorer,
                 self.entry,
                 (level.saturating_add(1)..=self.max_level).rev(),
-            );
+            )?;
+            let node_count = self.metas.len();
             for layer in (0..=self.max_level.min(level)).rev() {
-                self.visits.next(self.nodes.len());
+                self.visits.next(node_count);
                 let explored = explore(
-                    &graph,
+                    &view,
                     scorer,
                     [anchor],
                     Exploration {
                         level: layer,
                         result_capacity: EF_CONSTRUCTION,
                         max_evaluations: usize::MAX,
-                        budget: None,
+                        stop,
                     },
-                    |_| true,
+                    |_| Ok(true),
                     |candidate| self.visits.visit(candidate),
                 )?;
                 if let Some(nearest) = explored.neighbors.first() {
                     anchor = *nearest;
                 }
                 neighbors_by_level[usize::from(layer)] =
-                    diversify(&graph, explored.neighbors, degree(layer))?;
+                    diversify(&view, explored.neighbors, degree(layer))?;
             }
         }
         // Keep a bounded spanning tree at layer zero. Equal vectors can otherwise
@@ -376,14 +562,19 @@ impl BuilderGraph {
             base.truncate(M0 - 1);
             base.push(parent);
         }
-        self.nodes.push(Node {
-            chunk,
-            edges: neighbors_by_level,
-        });
-        for layer in 0..=self.max_level.min(level) {
-            let attached = self.nodes[slot as usize].edges[usize::from(layer)].clone();
+        let mut base_row = [0u32; M0];
+        base_row[..base.len()].copy_from_slice(base);
+        let base_len = base.len() as u8;
+        let upper = (level > 0).then(|| neighbors_by_level[1..].to_vec().into_boxed_slice());
+        self.append_node_data(chunk, base_row, base_len, upper)?;
+        let attach_top = self.max_level.min(level);
+        for (layer, attached) in neighbors_by_level
+            .into_iter()
+            .enumerate()
+            .take(usize::from(attach_top) + 1)
+        {
             for neighbor in attached {
-                self.add_reverse_edge(neighbor, layer, slot)?;
+                self.add_reverse_edge(neighbor, layer as u8, slot, cancel)?;
             }
         }
         if level > self.max_level {
@@ -393,27 +584,73 @@ impl BuilderGraph {
         Ok(())
     }
 
-    fn add_reverse_edge(&mut self, node: u32, layer: u8, other: u32) -> Result<(), VectorError> {
-        let edges = &mut self.nodes[node as usize].edges[usize::from(layer)];
-        edges.push(other);
-        if edges.len() <= degree(layer) {
+    fn add_reverse_edge(
+        &mut self,
+        node: u32,
+        layer: u8,
+        other: u32,
+        cancel: Option<&Cancellation>,
+    ) -> Result<(), VectorError> {
+        if cancel.is_some_and(Cancellation::is_cancelled) {
+            return Err(VectorError::Cancelled);
+        }
+        let index = node as usize;
+        if layer == 0 {
+            let len = usize::from(self.base_lens[index]);
+            if len < M0 {
+                self.base_edges[index][len] = other;
+                self.base_lens[index] = (len + 1) as u8;
+                return Ok(());
+            }
+            let mut slots = Vec::with_capacity(M0 + 1);
+            slots.extend_from_slice(&self.base_edges[index][..M0]);
+            slots.push(other);
+            let chosen = self.prune_neighbors(node, 0, slots)?;
+            self.base_edges[index].fill(0);
+            self.base_edges[index][..chosen.len()].copy_from_slice(&chosen);
+            self.base_lens[index] = chosen.len() as u8;
             return Ok(());
         }
-        let graph = NodeView(&self.nodes);
-        let (query, scale) = graph.vector(node);
+        let upper_index = usize::from(layer) - 1;
+        let edges = &mut self.upper_edges[index]
+            .as_mut()
+            .expect("node with reverse upper edge has upper layers")[upper_index];
+        edges.push(other);
+        if edges.len() <= M {
+            return Ok(());
+        }
+        let slots = std::mem::take(edges);
+        let chosen = self.prune_neighbors(node, layer, slots)?;
+        self.upper_edges[index]
+            .as_mut()
+            .expect("node with reverse upper edge has upper layers")[upper_index] = chosen;
+        Ok(())
+    }
+
+    fn prune_neighbors(
+        &self,
+        node: u32,
+        layer: u8,
+        slots: Vec<u32>,
+    ) -> Result<Vec<u32>, VectorError> {
+        let view = self.view();
+        let (query, scale) = view.vector(node)?;
         let scorer = Similarity::new(query, scale)?;
-        let mut candidates: Vec<_> = graph
-            .neighbors(node, layer)
-            .map(|candidate| scorer.score_node(&graph, candidate))
-            .collect();
+        let mut candidates: Vec<_> = slots
+            .into_iter()
+            .map(|candidate| scorer.score_node(&view, candidate))
+            .collect::<Result<_, _>>()?;
         candidates.sort_unstable_by(|left, right| right.cmp(left));
         let (required, candidates): (Vec<_>, Vec<_>) = candidates
             .into_iter()
             .partition(|candidate| layer == 0 && linked_at_base(node, candidate.slot));
-        let mut chosen = diversify(&graph, candidates, degree(layer) - required.len())?;
+        let mut chosen = diversify(
+            &view,
+            candidates,
+            degree(layer).saturating_sub(required.len()),
+        )?;
         chosen.extend(required.into_iter().map(|candidate| candidate.slot));
-        self.nodes[node as usize].edges[usize::from(layer)] = chosen;
-        Ok(())
+        Ok(chosen)
     }
 }
 
@@ -437,11 +674,16 @@ fn diversify(
             .map(|neighbor| neighbor.slot)
             .collect());
     }
-    let (first, scale) = graph.vector(candidates[0].slot);
-    if candidates[1..].iter().all(|candidate| {
-        let (vector, candidate_scale) = graph.vector(candidate.slot);
-        candidate_scale.to_bits() == scale.to_bits() && vector == first
-    }) {
+    let (first, scale) = graph.vector(candidates[0].slot)?;
+    let mut all_equal = true;
+    for candidate in &candidates[1..] {
+        let (vector, candidate_scale) = graph.vector(candidate.slot)?;
+        if candidate_scale.to_bits() != scale.to_bits() || vector != first {
+            all_equal = false;
+            break;
+        }
+    }
+    if all_equal {
         return Ok(candidates
             .into_iter()
             .take(limit)
@@ -451,12 +693,16 @@ fn diversify(
     let mut keep = Vec::with_capacity(limit);
     let mut near_duplicates = Vec::new();
     for candidate in candidates {
-        let (query, scale) = graph.vector(candidate.slot);
+        let (query, scale) = graph.vector(candidate.slot)?;
         let scorer = Similarity::new(query, scale)?;
-        if keep
-            .iter()
-            .any(|&other| scorer.score_node(graph, other).score > candidate.score)
-        {
+        let mut dominated = false;
+        for &other in &keep {
+            if scorer.score_node(graph, other)?.score > candidate.score {
+                dominated = true;
+                break;
+            }
+        }
+        if dominated {
             near_duplicates.push(candidate.slot);
         } else {
             keep.push(candidate.slot);
@@ -494,12 +740,16 @@ mod tests {
     struct TwoBranches(Vec<QuantizedVector>);
 
     impl Graph for TwoBranches {
-        fn vector(&self, node: u32) -> (&[i8], f32) {
-            let vector = &self.0[node as usize];
-            (vector.values(), vector.scale())
+        fn vector(&self, node: u32) -> Result<(&[i8], f32), VectorError> {
+            let vector = self.0.get(node as usize).ok_or(VectorError::CorruptIndex)?;
+            Ok((vector.values(), vector.scale()))
         }
 
-        fn neighbors(&self, node: u32, level: u8) -> impl Iterator<Item = u32> + '_ {
+        fn neighbors(
+            &self,
+            node: u32,
+            level: u8,
+        ) -> Result<impl Iterator<Item = u32> + '_, VectorError> {
             let edges: &[u32] = match (level, node) {
                 (1, 0) => &[1, 2],
                 (1, 1) => &[0],
@@ -509,7 +759,7 @@ mod tests {
                 (0, 4) => &[3],
                 _ => &[],
             };
-            edges.iter().copied()
+            Ok(edges.iter().copied())
         }
     }
 
@@ -529,13 +779,18 @@ mod tests {
         );
         let query = vector(1.0);
         let scorer = Similarity::new(query.values(), query.scale()).unwrap();
-        assert_eq!(greedily_descend(&graph, scorer, 0, [1].into_iter()).slot, 1);
+        assert_eq!(
+            greedily_descend(&graph, scorer, 0, [1].into_iter())
+                .unwrap()
+                .slot,
+            1
+        );
         let cancellation = Cancellation::default();
         let budget = SearchBudget {
             cancellation: &cancellation,
             deadline: Instant::now() + Duration::from_secs(1),
         };
-        let nearest = query_graph(&graph, scorer, 0, 1, 1, budget, |_| true).unwrap();
+        let nearest = query_graph(&graph, scorer, 0, 1, 1, 1, budget, |_| Ok(true)).unwrap();
         assert_eq!(nearest.neighbors[0].slot, 4);
     }
 }

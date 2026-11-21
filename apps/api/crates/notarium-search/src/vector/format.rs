@@ -1,11 +1,13 @@
 use notarium_core::classes::DocClass;
 
-pub(super) const HEADER: usize = 256;
+pub(super) const HEADER: usize = 320;
 pub(super) const FOOTER: usize = 64;
 pub(super) const HEADER_MAGIC: &[u8; 8] = b"NCSRSEG1";
 pub(super) const FOOTER_MAGIC: &[u8; 8] = b"NCSRFTR1";
-pub(super) const VERSION: u32 = 1;
+pub(super) const VERSION: u32 = 2;
 pub(super) const META_BYTES: usize = 80;
+pub(super) const KEY_ENTRY_BYTES: usize = 12;
+pub(super) const FOLDER_DIR_ENTRY_BYTES: usize = 12;
 pub(super) const BASE_ROW_BYTES: usize = (super::M0 + 1) * 4;
 pub(super) const SCALES: usize = 0;
 pub(super) const VECTORS: usize = 1;
@@ -16,7 +18,10 @@ pub(super) const UPPER: usize = 5;
 pub(super) const METADATA: usize = 6;
 pub(super) const NOTES: usize = 7;
 pub(super) const SPANS: usize = 8;
-pub(super) const SECTION_COUNT: usize = 9;
+pub(super) const NOTE_SLOTS: usize = 9;
+pub(super) const KEY_INDEX: usize = 10;
+pub(super) const FILTERS: usize = 11;
+pub(super) const SECTION_COUNT: usize = 12;
 
 pub(super) fn class_number(class: DocClass) -> Option<u16> {
     match class {
@@ -54,6 +59,13 @@ pub(super) fn read_u32(bytes: &[u8], offset: usize) -> u32 {
 }
 pub(super) fn read_u64(bytes: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(
+        bytes[offset..offset + 8]
+            .try_into()
+            .expect("validated field width"),
+    )
+}
+pub(super) fn read_u64_be(bytes: &[u8], offset: usize) -> u64 {
+    u64::from_be_bytes(
         bytes[offset..offset + 8]
             .try_into()
             .expect("validated field width"),

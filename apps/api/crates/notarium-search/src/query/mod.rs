@@ -6,14 +6,14 @@ use crate::{
     config::VectorMode,
     embed::{EmbeddingError, RemoteConservativeTokenizerBudget},
     engine::{Clock, Published, SearchEngine, internal, invalid},
-    lexical::{LexicalError, LexicalFilter, LexicalHit, LexicalIndex, Update},
+    lexical::{LexicalError, LexicalFilter, LexicalHit, LexicalIndex, OverlayHits, Update},
     model::Embedder,
-    ports::EmbeddingBackendTarget,
-    vector::{SearchBudget, VectorFilter, VectorHit},
+    ports::{EmbeddingBackendTarget, ResolvedEmbeddingTarget},
+    vector::{EXACT_SCAN_LIMIT, SearchBudget, VectorFilter, VectorHit},
 };
 use croaring::Bitmap;
 use notarium_core::{
-    DomainError,
+    DomainError, DomainResult,
     classes::{ClassEgressFence, DocClass},
     error::{PortError, ValidationReason},
     ids::{FolderId, NoteId, PrincipalId},
@@ -23,8 +23,11 @@ use notarium_core::{
         SpaceContext, StructuralSnapshot,
     },
     query::Predicate,
+    receipt::CausalBasis,
 };
-use std::{collections::BTreeSet, sync::Arc};
+use std::{collections::BTreeSet, sync::Arc, time::Duration};
+
+const MAX_OVERLAY_FALLBACK_FLOOR: usize = 10;
 
 #[derive(Clone, Copy)]
 struct Recall {
@@ -91,7 +94,15 @@ impl SearchEngine {
                 .iter()
                 .all(|class| *class == DocClass::EncryptedNote);
         if empty_query || encrypted_only {
-            let snapshot = self.projection(&ctx, request.causal, clock).await?;
+            let causal = match request.causal {
+                CausalBasis::Exact(_) => CausalBasis::Exact(Default::default()),
+                CausalBasis::Await(_) => request.causal,
+            };
+            let snapshot = self.projection(&ctx, causal, clock).await?;
+            let _ = snapshot.filter_notes(&request.filter).await?;
+            if let Some(folder) = &request.folder {
+                let _ = snapshot.folder_descendants(folder).await?;
+            }
             return Ok(SearchResult {
                 hits: Vec::new(),
                 chat_hits: Vec::new(),
@@ -100,9 +111,9 @@ impl SearchEngine {
                 truncated: false,
             });
         }
-        let handle = self.space(ctx.scope().clone())?;
-        let _pin = handle.pin_query();
-        let aligned = self.align(&ctx, &request.causal, &handle, clock).await?;
+        let pinned = self.pin_space(ctx.scope().clone())?;
+        let handle = &pinned.handle;
+        let aligned = self.align(&ctx, &request.causal, handle, clock).await?;
         let snapshot = aligned.snapshot;
         let state = aligned.state;
         let chat_space = if request.include_chats && recall.is_none() && !browse {
@@ -139,6 +150,7 @@ impl SearchEngine {
             excluded.clone(),
             request.text.clone(),
             candidate_k,
+            top_k,
             filtered,
         );
         let vectors = self.vector_candidates(VectorRequest {
@@ -148,24 +160,36 @@ impl SearchEngine {
             filter: filter.clone(),
             snapshot: snapshot.clone(),
             state: state.clone(),
-            handle: &handle,
+            handle,
             excluded,
             limit: candidate_k,
             browse,
         });
-        let (lexical, vectors) = tokio::join!(lexical, vectors);
-        let mut notes = lexical?;
-        let vectors = vectors?;
+        let (mut notes, vectors) = tokio::try_join!(lexical, vectors)?;
         let overlay =
             rank_overlay(self, clock, &request, &aligned.overlay, &filter, filtered).await?;
         if browse {
-            notes.extend(overlay);
+            notes.extend(overlay.strict);
             notes.sort_by(|left, right| note_key(left).cmp(&note_key(right)));
         } else {
-            // Receipt-bound hits lead the lexical stream. BM25 magnitudes from
-            // an eight-row overlay and a durable corpus are not comparable.
-            let mut fresh = overlay;
+            // Receipt-bound strict hits lead the lexical stream. Fallback 1-term
+            // overlay hits only fill behind strict matches below the floor.
+            let mut fresh = overlay.strict;
             fresh.extend(notes);
+            let fallback_floor = top_k.min(MAX_OVERLAY_FALLBACK_FLOOR);
+            if fresh.len() < fallback_floor && !overlay.fallback.is_empty() {
+                let mut seen: BTreeSet<NoteId> = fresh
+                    .iter()
+                    .filter_map(|hit| note_key(hit).cloned())
+                    .collect();
+                for hit in overlay.fallback {
+                    if let Some(note) = note_key(&hit)
+                        && seen.insert(note.clone())
+                    {
+                        fresh.push(hit);
+                    }
+                }
+            }
             notes = fresh;
         }
 
@@ -174,14 +198,15 @@ impl SearchEngine {
             ranking::expand(
                 &mut candidates,
                 snapshot.as_ref(),
+                self.services.deps.structural.as_ref(),
+                &ctx,
+                clock,
                 &filter,
+                &request.filter.predicate,
                 &aligned.overlay,
                 recall.graph_depth,
-                |note| {
-                    clock.remaining()?;
-                    Ok(self.services.deps.structural.is_live_visible(&ctx, note)?)
-                },
-            )?;
+            )
+            .await?;
         }
         let fallback = RemoteConservativeTokenizerBudget::lexical_fallback();
         let tokenizer = vectors
@@ -202,17 +227,46 @@ impl SearchEngine {
                 recall,
             })
             .await?;
-        ctx.budget = clock.remaining()?;
         let (chat_hits, chat_truncated) = if let Some(state) =
             state.filter(|_| recall.is_none() && request.include_chats && !browse)
         {
-            self.search_chats(&ctx, clock, &request, snapshot, state, filter)
-                .await?
+            if hits.is_empty() {
+                ctx.budget = clock.remaining()?;
+                self.search_chats(&ctx, clock, &request, snapshot, state, filter)
+                    .await?
+            } else {
+                // Reserve a short tail for final live-visibility verification so
+                // a chat deadline preserves already-hydrated note hits.
+                let mut chat_budget = clock.remaining()?;
+                let reserve = Duration::from_millis(25).min(chat_budget.remaining / 5);
+                if chat_budget.remaining <= reserve {
+                    (Vec::new(), true)
+                } else {
+                    chat_budget.remaining -= reserve;
+                    let chat_clock = Clock::new(&chat_budget)?;
+                    ctx.budget = chat_clock.remaining()?;
+                    match chat_clock
+                        .within(self.search_chats(
+                            &ctx,
+                            &chat_clock,
+                            &request,
+                            snapshot,
+                            state,
+                            filter,
+                        ))
+                        .await
+                    {
+                        Ok(result) => result,
+                        Err(PortError::DeadlineExceeded(_)) => (Vec::new(), true),
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
         } else {
             (Vec::new(), false)
         };
         // Chat hydration can yield while canonical access to a selected note changes.
-        let (hits, packing_truncated) = self.finish_note_hits(&ctx, clock, hits, recall)?;
+        let (hits, packing_truncated) = self.finish_note_hits(&ctx, clock, hits, recall).await?;
         Ok(SearchResult {
             hits,
             chat_hits,
@@ -263,14 +317,18 @@ impl SearchEngine {
             let state = if state.reopening_vectors {
                 let mut updated = handle.epoch.subscribe();
                 loop {
-                    let current = handle
-                        .published
-                        .load_full()
-                        .filter(|current| {
-                            current.seq == state.seq
-                                && Arc::ptr_eq(&current.lexical, &state.lexical)
-                        })
-                        .ok_or(EmbeddingError::ModelUnavailable)?;
+                    let Some(current) = handle.published.load_full() else {
+                        return Ok(None);
+                    };
+                    if current.scope != state.scope
+                        || current.seq != state.seq
+                        || !Arc::ptr_eq(&current.lexical, &state.lexical)
+                    {
+                        // A live edit advanced the published cut while vectors
+                        // were reopening; degrade to EmbeddingsPending instead
+                        // of reporting a false ModelUnavailable.
+                        return Ok(None);
+                    }
                     if !current.reopening_vectors {
                         break current;
                     }
@@ -282,13 +340,13 @@ impl SearchEngine {
             } else {
                 state
             };
+            let mut resolve_budget = clock
+                .remaining()
+                .map_err(|_| EmbeddingError::BudgetExceeded)?;
+            resolve_budget.remaining = resolve_budget.remaining.min(max);
             let requested = self
                 .services
-                .model_target(
-                    ctx.scope(),
-                    filter.project.as_ref().map(|p| &p.folder_id),
-                    query.model.as_ref(),
-                )
+                .model_target(ctx.scope(), query.model.as_ref(), &resolve_budget)
                 .await?
                 .ok_or(EmbeddingError::ModelUnavailable)?;
             if let EmbeddingBackendTarget::Remote {
@@ -323,16 +381,14 @@ impl SearchEngine {
                 if query.model.is_some() {
                     return Ok(None);
                 }
-                state
-                    .active_model
-                    .as_ref()
-                    .ok_or(EmbeddingError::ModelUnavailable)?
+                let Some(active) = state.active_model.as_ref() else {
+                    return Ok(None);
+                };
+                if !can_fallback_to_active(active, &requested) {
+                    return Ok(None);
+                }
+                active
             };
-            if matches!(target.backend, EmbeddingBackendTarget::Remote { .. })
-                && requested.backend.local_pooling().is_some()
-            {
-                return Ok(None);
-            }
             if let EmbeddingBackendTarget::Remote { project, .. } = &target.backend
                 && (ctx.auth().taint().is_tainted()
                     || project
@@ -379,27 +435,55 @@ impl SearchEngine {
         let pending = state
             .embeddings_pending
             .then_some(SearchDegradation::EmbeddingsPending);
-        let vectors = blocking_search(clock, "vector_search_worker", move |budget| {
-            let visible = |note: &NoteId| {
-                snapshot.lookup(note).is_some_and(|node| {
-                    filter
-                        .node_allowed(snapshot.as_ref(), node)
-                        .unwrap_or(false)
+        let vector_notes = match &filter.nodes {
+            Some(nodes) if nodes.cardinality() <= EXACT_SCAN_LIMIT => Some(Arc::new(
+                retry_snapshot(snapshot.as_ref(), clock, || {
+                    nodes
+                        .iter()
+                        .map(|index| {
+                            snapshot.note_id(DenseNodeId::new(filter.cut.generation, index))
+                        })
+                        .collect::<Result<BTreeSet<_>, _>>()
                 })
-            };
-            let mask = VectorFilter {
-                classes: &filter.classes,
-                folders: filter.ordinals.as_deref(),
-                notes: filter.vector_notes.as_ref(),
-                excluded: Some(&excluded),
-            };
-            let index = state
-                .vectors
-                .as_ref()
-                .ok_or(crate::vector::VectorError::CorruptIndex)?;
-            index.search_visible(&vector, &mask, limit, budget, visible)
-        })
-        .await?;
+                .await?,
+            )),
+            _ => None,
+        };
+        let vectors = loop {
+            clock.remaining()?;
+            let snapshot_attempt = snapshot.clone();
+            let filter_attempt = filter.clone();
+            let excluded_attempt = excluded.clone();
+            let state_attempt = state.clone();
+            let vector_attempt = vector.clone();
+            let notes_attempt = vector_notes.clone();
+            let result = blocking_search(clock, "vector_search_worker", move |budget| {
+                let visible = |note: &NoteId| -> Result<bool, crate::vector::VectorError> {
+                    let Some(node) = snapshot_attempt.lookup(note)? else {
+                        return Ok(false);
+                    };
+                    Ok(filter_attempt.node_allowed(snapshot_attempt.as_ref(), node)?)
+                };
+                let mask = VectorFilter {
+                    classes: &filter_attempt.classes,
+                    folders: filter_attempt.ordinals.as_deref(),
+                    notes: notes_attempt.as_deref(),
+                    excluded: Some(&excluded_attempt),
+                };
+                let index = state_attempt
+                    .vectors
+                    .as_ref()
+                    .ok_or(crate::vector::VectorError::CorruptIndex)?;
+                index.search_visible(&vector_attempt, &mask, limit, budget, visible)
+            })
+            .await?;
+            match result {
+                Err(crate::vector::VectorError::Domain(error)) if is_not_ready(&error) => {
+                    clock.within(snapshot.wait_ready()).await?;
+                }
+                other => break other,
+            }
+        };
         match vectors {
             Ok(vectors) => Ok(VectorCandidates {
                 hits: vectors.hits,
@@ -412,9 +496,65 @@ impl SearchEngine {
                     SearchDegradation::BudgetExceeded,
                 ))
             }
+            Err(crate::vector::VectorError::Domain(error)) => Err(error.into()),
             Err(_) => Ok(VectorCandidates::degraded(
                 SearchDegradation::ModelUnavailable,
             )),
+        }
+    }
+}
+
+/// Privacy-first fallback policy when a new default model is still backfilling:
+/// local active indices may serve queries without external disclosure; remote
+/// active indices may only serve when provider, runtime epochs, and project
+/// scope are identical to the requested target.
+fn can_fallback_to_active(
+    active: &ResolvedEmbeddingTarget,
+    requested: &ResolvedEmbeddingTarget,
+) -> bool {
+    match (&active.backend, &requested.backend) {
+        (EmbeddingBackendTarget::LocalOnnx | EmbeddingBackendTarget::LocalOnnxCls, _) => true,
+        (
+            EmbeddingBackendTarget::Remote {
+                provider: active_provider,
+                runtime_epochs: active_epochs,
+                project: active_project,
+            },
+            EmbeddingBackendTarget::Remote {
+                provider: req_provider,
+                runtime_epochs: req_epochs,
+                project: req_project,
+            },
+        ) => {
+            active_provider == req_provider
+                && active_epochs == req_epochs
+                && active_project == req_project
+        }
+        (EmbeddingBackendTarget::Remote { .. }, _) => false,
+    }
+}
+
+pub(super) fn is_not_ready(error: &DomainError) -> bool {
+    matches!(
+        error,
+        DomainError::ValidationFailed { diagnostic }
+            if diagnostic.reason == ValidationReason::NotReady
+    )
+}
+
+pub(super) async fn retry_snapshot<T>(
+    snapshot: &dyn StructuralSnapshot,
+    clock: &Clock,
+    mut op: impl FnMut() -> DomainResult<T>,
+) -> Result<T, PortError> {
+    loop {
+        clock.remaining()?;
+        match op() {
+            Ok(value) => return Ok(value),
+            Err(error) if is_not_ready(&error) => {
+                clock.within(snapshot.wait_ready()).await?;
+            }
+            Err(error) => return Err(error.into()),
         }
     }
 }
@@ -457,7 +597,6 @@ struct Eligible {
     chat_folders: Option<Arc<Bitmap>>,
     chat_viewer: Option<PrincipalId>,
     nodes: Option<Bitmap>,
-    vector_notes: Option<BTreeSet<NoteId>>,
 }
 
 impl Eligible {
@@ -541,7 +680,7 @@ impl Eligible {
             space_id: cut.scope.space_id.clone(),
             folder_id,
         });
-        let fields = snapshot
+        let mut nodes = snapshot
             .filter_notes(&query.filter)
             .await?
             .map(|nodes| {
@@ -550,30 +689,18 @@ impl Eligible {
                     .collect::<Result<Bitmap, _>>()
             })
             .transpose()?;
-        let folder_masks = scope_folders.into_iter().flatten().map(|folder| {
-            snapshot
-                .folder_subtree(folder)?
+        for folder in scope_folders.into_iter().flatten() {
+            let mask = snapshot
+                .folder_subtree(folder)
+                .await?
                 .map(|node| node.index(cut.generation))
-                .collect::<Result<Bitmap, _>>()
-        });
-        let mut nodes = fields.clone();
-        for mask in folder_masks {
-            let mask = mask?;
+                .collect::<Result<Bitmap, _>>()?;
             if let Some(nodes) = &mut nodes {
                 nodes.and_inplace(&mask);
             } else {
                 nodes = Some(mask);
             }
         }
-        let vector_notes = fields
-            .as_ref()
-            .map(|nodes| {
-                nodes
-                    .iter()
-                    .map(|index| snapshot.note_id(DenseNodeId::new(cut.generation, index)))
-                    .collect::<Result<BTreeSet<_>, _>>()
-            })
-            .transpose()?;
         Ok(Self {
             cut,
             classes,
@@ -595,7 +722,6 @@ impl Eligible {
                 })
                 .map(|_| ctx.auth().principal().clone()),
             nodes,
-            vector_notes,
         })
     }
 
@@ -682,6 +808,25 @@ async fn lexical_work<T: Send + 'static>(
     result.map_err(lexical_error)
 }
 
+pub(super) async fn lexical_work_with_retry<T: Send + 'static>(
+    clock: &Clock,
+    snapshot: &Arc<dyn StructuralSnapshot>,
+    work: impl Fn(SearchBudget<'_>) -> Result<T, LexicalError> + Clone + Send + 'static,
+) -> Result<T, PortError> {
+    loop {
+        clock.remaining()?;
+        let result = blocking_search(clock, "lexical_search_worker", work.clone()).await?;
+        clock.remaining()?;
+        match result {
+            Ok(value) => return Ok(value),
+            Err(LexicalError::Domain(error)) if is_not_ready(&error) => {
+                clock.within(snapshot.wait_ready()).await?;
+            }
+            Err(error) => return Err(lexical_error(error)),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn lexical_candidates(
     clock: &Clock,
@@ -691,14 +836,16 @@ async fn lexical_candidates(
     excluded: Arc<BTreeSet<NoteId>>,
     text: String,
     candidate_k: usize,
+    top_k: usize,
     filtered: bool,
 ) -> Result<Vec<LexicalHit>, PortError> {
     let Some(state) = state else {
         return Ok(Vec::new());
     };
-    lexical_work(clock, move |budget| {
+    let snapshot_work = snapshot.clone();
+    lexical_work_with_retry(clock, &snapshot, move |budget| {
         let notes_filter = LexicalFilter::new(
-            snapshot.as_ref(),
+            snapshot_work.as_ref(),
             filter.ordinals.clone(),
             filter.nodes.as_ref(),
             filter.classes.iter().copied(),
@@ -706,9 +853,14 @@ async fn lexical_candidates(
         )
         .excluding(&excluded)
         .within(budget);
-        state
-            .lexical
-            .search_pinned(&state.searcher, &text, &notes_filter, candidate_k, filtered)
+        state.lexical.search_pinned(
+            &state.searcher,
+            &text,
+            &notes_filter,
+            candidate_k,
+            top_k,
+            filtered,
+        )
     })
     .await
 }
@@ -720,7 +872,7 @@ async fn rank_overlay(
     overlay: &align::Overlay,
     filter: &Eligible,
     filtered: bool,
-) -> Result<Vec<LexicalHit>, PortError> {
+) -> Result<OverlayHits, PortError> {
     let mut dictionary = crate::layout::FolderDictionary::default();
     let mut notes = Vec::new();
     for row in overlay
@@ -738,10 +890,9 @@ async fn rank_overlay(
         }
     }
     if notes.is_empty() {
-        return Ok(Vec::new());
+        return Ok(OverlayHits::default());
     }
     let text = query.text.clone();
-    let writers = engine.services.writers.clone();
     lexical_work(clock, move |budget| {
         let updates: Vec<_> = notes
             .iter()
@@ -751,7 +902,7 @@ async fn rank_overlay(
                 folder: *folder,
             })
             .collect();
-        LexicalIndex::rank_overlay(&writers, &text, &updates, filtered, budget)
+        LexicalIndex::rank_overlay(&text, &updates, filtered, budget)
     })
     .await
 }

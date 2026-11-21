@@ -1,4 +1,5 @@
 pub mod ort;
+pub mod regressions;
 pub mod remote;
 
 use notarium_canonical::{CanonicalStore, chats::search::HydratedChatHit};
@@ -164,11 +165,12 @@ impl StructuralSnapshot for View {
         &self.cut
     }
 
-    fn lookup(&self, note: &NoteId) -> Option<DenseNodeId> {
-        self.rows
+    fn lookup(&self, note: &NoteId) -> DomainResult<Option<DenseNodeId>> {
+        Ok(self
+            .rows
             .iter()
             .position(|(id, _)| id == note)
-            .map(|offset| DenseNodeId::new(self.cut.generation, offset as u32))
+            .map(|offset| DenseNodeId::new(self.cut.generation, offset as u32)))
     }
 
     fn note_id(&self, node: DenseNodeId) -> DomainResult<NoteId> {
@@ -184,18 +186,20 @@ impl StructuralSnapshot for View {
         Ok(DocClass::UserDoc)
     }
 
-    fn folder_subtree(&self, folder: &FolderId) -> DomainResult<DenseNodeIter<'_>> {
-        let rows: Vec<_> = self
-            .rows
-            .iter()
-            .enumerate()
-            .filter(|(_, (_, parent))| self.in_folder(parent, folder))
-            .map(|(index, _)| index as u32)
-            .collect();
-        Ok(DenseNodeIter::from_iter(
-            self.cut.generation,
-            rows.into_iter(),
-        ))
+    fn folder_subtree<'a>(&'a self, folder: &'a FolderId) -> PortFuture<'a, DenseNodeIter<'a>> {
+        Box::pin(async move {
+            let rows: Vec<_> = self
+                .rows
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, parent))| self.in_folder(parent, folder))
+                .map(|(index, _)| index as u32)
+                .collect();
+            Ok(DenseNodeIter::from_iter(
+                self.cut.generation,
+                rows.into_iter(),
+            ))
+        })
     }
 
     fn folder_descendants<'a>(&'a self, folder: &'a FolderId) -> PortFuture<'a, Vec<FolderId>> {
@@ -301,8 +305,12 @@ impl StructuralReadPort for Projection {
         })
     }
 
-    fn is_live_visible(&self, _: &SpaceContext, note: &NoteId) -> DomainResult<bool> {
-        Ok(self.live.read().unwrap().contains(note))
+    fn is_live_visible<'a>(
+        &'a self,
+        _: &'a SpaceContext,
+        note: &'a NoteId,
+    ) -> PortFuture<'a, bool> {
+        Box::pin(async move { Ok(self.live.read().unwrap().contains(note)) })
     }
 
     fn hydrate(

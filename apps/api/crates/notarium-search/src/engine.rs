@@ -19,19 +19,21 @@ use notarium_core::{
     },
 };
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     future::Future,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, Weak,
         atomic::{AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant as StdInstant},
 };
 use tokio::{
-    sync::{Notify, watch},
+    sync::{Notify, oneshot, watch},
     task::JoinHandle,
     time::{Instant, sleep_until},
 };
+
+pub(super) const MAX_OPEN_SPACES: usize = 256;
 
 /// Supply the canonical, structural and provider owners at composition time.
 /// The default constructor uses the canonical owner for its change and carrier ports.
@@ -61,9 +63,9 @@ impl SearchDependencies {
 /// Start on a Tokio runtime and drain with `shutdown` before closing storage.
 pub struct SearchEngine {
     pub(super) services: Arc<Services>,
-    workers: Mutex<HashMap<SpaceId, Worker>>,
-    embedding_worker: Option<JoinHandle<()>>,
-    writer_reaper: Option<JoinHandle<()>>,
+    workers: Arc<Mutex<HashMap<SpaceId, Worker>>>,
+    bg_tasks: Mutex<Vec<JoinHandle<()>>>,
+    max_open_spaces: usize,
 }
 
 pub(super) struct Services {
@@ -71,9 +73,10 @@ pub(super) struct Services {
     pub deps: SearchDependencies,
     pub authority: ServiceAuthority,
     pub shutdown: Cancellation,
-    pub scheduler: EmbeddingScheduler,
+    pub local_scheduler: EmbeddingScheduler,
+    pub remote_scheduler: EmbeddingScheduler,
     pub writers: WriterPool,
-    pub readers: ReaderCache,
+    pub readers: Arc<ReaderCache>,
     pub models: crate::model::LocalModels,
 }
 
@@ -96,62 +99,211 @@ pub(super) struct SpaceHandle {
     pub wake: Notify,
     pub stop: Cancellation,
     pub active_queries: AtomicUsize,
+    align_waiters: Mutex<BTreeMap<SpaceSeq, Vec<oneshot::Sender<Arc<Published>>>>>,
+    last_activity: Mutex<StdInstant>,
 }
 
-pub(super) struct QueryPin<'a>(&'a AtomicUsize);
+pub(super) struct PinnedSpace {
+    pub handle: Arc<SpaceHandle>,
+}
 
-impl Drop for QueryPin<'_> {
+impl Drop for PinnedSpace {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Release);
+        self.handle.touch();
+        self.handle.active_queries.fetch_sub(1, Ordering::Release);
     }
 }
 
 impl SpaceHandle {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             published: ArcSwapOption::empty(),
             epoch: watch::channel(0).0,
             wake: Notify::new(),
             stop: Cancellation::default(),
             active_queries: AtomicUsize::new(0),
+            align_waiters: Mutex::new(BTreeMap::new()),
+            last_activity: Mutex::new(StdInstant::now()),
         }
     }
 
-    pub fn pin_query(&self) -> QueryPin<'_> {
+    #[cfg(test)]
+    pub(super) fn pin_query(self: &Arc<Self>) -> PinnedSpace {
+        self.touch();
         self.active_queries.fetch_add(1, Ordering::AcqRel);
-        QueryPin(&self.active_queries)
+        PinnedSpace {
+            handle: Arc::clone(self),
+        }
+    }
+
+    pub(super) fn touch(&self) {
+        *self
+            .last_activity
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = StdInstant::now();
+    }
+
+    pub(super) fn idle_elapsed(&self) -> Duration {
+        self.last_activity
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .elapsed()
+    }
+
+    pub(super) fn register_align_waiter(&self, seq: SpaceSeq) -> oneshot::Receiver<Arc<Published>> {
+        let (tx, rx) = oneshot::channel();
+        let mut waiters = self
+            .align_waiters
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        waiters.retain(|_, list| {
+            list.retain(|sender| !sender.is_closed());
+            !list.is_empty()
+        });
+        waiters.entry(seq).or_default().push(tx);
+        rx
+    }
+
+    pub(super) fn next_align_target(&self, after: SpaceSeq, through: SpaceSeq) -> Option<SpaceSeq> {
+        let mut waiters = self
+            .align_waiters
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        waiters.retain(|&seq, list| {
+            list.retain(|sender| !sender.is_closed());
+            seq > after && !list.is_empty()
+        });
+        waiters
+            .keys()
+            .next()
+            .copied()
+            .filter(|&seq| seq > after && seq <= through)
+    }
+
+    pub(super) fn has_align_waiters(&self) -> bool {
+        let mut waiters = self
+            .align_waiters
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        waiters.retain(|_, list| {
+            list.retain(|sender| !sender.is_closed());
+            !list.is_empty()
+        });
+        !waiters.is_empty()
+    }
+
+    fn clear_align_waiters(&self) {
+        self.align_waiters
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
+    }
+
+    fn notify_align_waiters(&self, state: &Arc<Published>) {
+        let delivered = {
+            let mut waiters = self
+                .align_waiters
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let mut remaining = waiters.split_off(&state.seq);
+            let exact = remaining.remove(&state.seq).unwrap_or_default();
+            // Dropping all waiters for seq < state.seq wakes them so they can
+            // re-align against the newer published cut instead of timing out.
+            *waiters = remaining;
+            exact
+        };
+        for tx in delivered {
+            let _ = tx.send(Arc::clone(state));
+        }
     }
 
     pub fn replace(&self, state: Option<Arc<Published>>) -> Option<Arc<Published>> {
+        if state.is_none() {
+            self.clear_align_waiters();
+        }
+        let notify = state.clone();
         let previous = self.published.swap(state);
         self.epoch
             .send_modify(|sequence| *sequence = sequence.wrapping_add(1));
+        if let Some(published) = notify {
+            self.notify_align_waiters(&published);
+        }
         previous
     }
 }
 
-struct Worker {
-    handle: Arc<SpaceHandle>,
+pub(super) struct Worker {
+    pub(super) handle: Arc<SpaceHandle>,
     task: JoinHandle<()>,
 }
 
+pub(super) fn try_evict_idle_worker(
+    workers: &Weak<Mutex<HashMap<SpaceId, Worker>>>,
+    space_id: &SpaceId,
+    handle: &Arc<SpaceHandle>,
+    min_idle: Duration,
+) -> bool {
+    let Some(workers) = workers.upgrade() else {
+        return true;
+    };
+    let mut map = workers.lock().unwrap_or_else(|error| error.into_inner());
+    let can_evict = map
+        .get(space_id)
+        .is_some_and(|worker| Arc::ptr_eq(&worker.handle, handle))
+        && handle.active_queries.load(Ordering::Acquire) == 0
+        && !handle.has_align_waiters()
+        && handle.idle_elapsed() >= min_idle;
+    if can_evict {
+        map.remove(space_id);
+        true
+    } else {
+        false
+    }
+}
+
+pub(super) fn remove_exited_worker(
+    workers: &Weak<Mutex<HashMap<SpaceId, Worker>>>,
+    space_id: &SpaceId,
+    handle: &Arc<SpaceHandle>,
+) {
+    let Some(workers) = workers.upgrade() else {
+        return;
+    };
+    let mut map = workers.lock().unwrap_or_else(|error| error.into_inner());
+    if map
+        .get(space_id)
+        .is_some_and(|worker| Arc::ptr_eq(&worker.handle, handle))
+    {
+        map.remove(space_id);
+    }
+}
+
 impl SearchEngine {
-    /// Observe the scheduler queues in priority order for the release gate.
+    /// Observe the combined scheduler queues in priority order for the release gate.
+    #[cfg(feature = "test-support")]
     #[doc(hidden)]
     pub fn queued_embeddings(&self) -> [usize; 3] {
-        self.services.scheduler.queue_depths()
+        let local = self.services.local_scheduler.queue_depths();
+        let remote = self.services.remote_scheduler.queue_depths();
+        [
+            local[0] + remote[0],
+            local[1] + remote[1],
+            local[2] + remote[2],
+        ]
     }
 
     pub fn start(config: SearchConfig, deps: SearchDependencies) -> Self {
-        let (scheduler, embedding_worker) = EmbeddingScheduler::start();
+        let (local_scheduler, local_worker) = EmbeddingScheduler::start();
+        let (remote_scheduler, remote_worker) = EmbeddingScheduler::start();
         let services = Arc::new(Services {
             config,
             deps,
             authority: ServiceAuthority::admit(ServicePurpose::Search),
             shutdown: Cancellation::default(),
-            scheduler,
+            local_scheduler,
+            remote_scheduler,
             writers: WriterPool::default(),
-            readers: ReaderCache::default(),
+            readers: Arc::new(ReaderCache::default()),
             models: crate::model::LocalModels::default(),
         });
         let pool = services.writers.clone();
@@ -163,62 +315,132 @@ impl SearchEngine {
         });
         Self {
             services,
-            workers: Mutex::new(HashMap::new()),
-            embedding_worker: Some(embedding_worker),
-            writer_reaper: Some(writer_reaper),
+            workers: Arc::new(Mutex::new(HashMap::new())),
+            bg_tasks: Mutex::new(vec![local_worker, remote_worker, writer_reaper]),
+            max_open_spaces: MAX_OPEN_SPACES,
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn worker_count(&self) -> usize {
+        self.workers
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .len()
     }
 
     pub fn start_space(&self, scope: HistoryScope) -> Result<(), PortError> {
         self.space(scope).map(|_| ())
     }
 
+    pub(super) fn pin_space(&self, scope: HistoryScope) -> Result<PinnedSpace, PortError> {
+        let handle = self.acquire_space(scope, true)?;
+        Ok(PinnedSpace { handle })
+    }
+
     pub(super) fn space(&self, scope: HistoryScope) -> Result<Arc<SpaceHandle>, PortError> {
-        let mut workers = self.workers.lock().map_err(|_| internal("space_workers"))?;
-        if self.services.shutdown.is_cancelled() {
-            return Err(PortError::Cancelled(failure("engine_stopped")));
+        self.acquire_space(scope, false)
+    }
+
+    fn acquire_space(
+        &self,
+        scope: HistoryScope,
+        pin_query: bool,
+    ) -> Result<Arc<SpaceHandle>, PortError> {
+        let mut evicted_task = None;
+        let handle = {
+            let mut workers = self.workers.lock().map_err(|_| internal("space_workers"))?;
+            if self.services.shutdown.is_cancelled() {
+                return Err(PortError::Cancelled(failure("engine_stopped")));
+            }
+            if let Some(worker) = workers.get(&scope.space_id) {
+                worker.handle.touch();
+                if pin_query {
+                    worker.handle.active_queries.fetch_add(1, Ordering::AcqRel);
+                }
+                return Ok(worker.handle.clone());
+            }
+            if workers.len() >= self.max_open_spaces {
+                let candidate = workers
+                    .iter()
+                    .filter(|(_, worker)| {
+                        worker.handle.active_queries.load(Ordering::Acquire) == 0
+                            && !worker.handle.has_align_waiters()
+                    })
+                    .max_by_key(|(_, worker)| worker.handle.idle_elapsed())
+                    .map(|(id, _)| id.clone());
+                if let Some(oldest_id) = candidate
+                    && let Some(evicted) = workers.remove(&oldest_id)
+                {
+                    evicted.handle.stop.cancel();
+                    evicted_task = Some(evicted.task);
+                }
+            }
+            let id = scope.space_id.clone();
+            let handle = Arc::new(SpaceHandle::new());
+            if pin_query {
+                handle.active_queries.fetch_add(1, Ordering::AcqRel);
+            }
+            let task = tokio::spawn(crate::indexer::run(
+                self.services.clone(),
+                handle.clone(),
+                Arc::downgrade(&self.workers),
+                scope,
+            ));
+            workers.insert(
+                id,
+                Worker {
+                    handle: handle.clone(),
+                    task,
+                },
+            );
+            handle
+        };
+        if let Some(task) = evicted_task {
+            let mut bg = self
+                .bg_tasks
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            bg.retain(|existing| !existing.is_finished());
+            bg.push(task);
         }
-        if let Some(worker) = workers.get(&scope.space_id) {
-            return Ok(worker.handle.clone());
-        }
-        let id = scope.space_id.clone();
-        let handle = Arc::new(SpaceHandle::new());
-        let task = tokio::spawn(crate::indexer::run(
-            self.services.clone(),
-            handle.clone(),
-            scope,
-        ));
-        workers.insert(
-            id,
-            Worker {
-                handle: handle.clone(),
-                task,
-            },
-        );
         Ok(handle)
     }
 
-    pub async fn shutdown(mut self) {
+    pub async fn shutdown(&self) {
         self.stop();
         let workers = std::mem::take(
-            self.workers
-                .get_mut()
+            &mut *self
+                .workers
+                .lock()
                 .unwrap_or_else(|error| error.into_inner()),
         );
         for worker in workers.into_values() {
             let _ = worker.task.await;
+            worker.handle.replace(None);
         }
-        if let Some(worker) = self.writer_reaper.take() {
-            let _ = worker.await;
+        let bg = std::mem::take(
+            &mut *self
+                .bg_tasks
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+        );
+        for task in bg {
+            let _ = task.await;
         }
-        if let Some(worker) = self.embedding_worker.take() {
-            let _ = worker.await;
-        }
+        let writers = self.services.writers.clone();
+        let readers = Arc::clone(&self.services.readers);
+        let _ = tokio::task::spawn_blocking(move || {
+            writers.release_all();
+            readers.release_all();
+        })
+        .await;
     }
 
     fn stop(&self) {
         self.services.shutdown.cancel();
-        self.services.scheduler.shutdown();
+        self.services.local_scheduler.shutdown();
+        self.services.remote_scheduler.shutdown();
         for worker in self
             .workers
             .lock()

@@ -810,11 +810,120 @@ async fn gateway(pg: bool, kind: ProviderWireKind, label: &str) {
         .await
         .unwrap();
     assert_eq!(indexing.auth().principal(), setup.space.auth().principal());
+    assert_eq!(
+        indexing.auth().kind(),
+        &notarium_core::auth::PrincipalKind::SearchIndexing
+    );
+    assert!(indexing.auth().authorize_human_management().is_err());
+    assert!(
+        !indexing.auth().spaces()[&indexing.scope().space_id]
+            .read_classes
+            .contains(&DocClass::EncryptedNote)
+    );
     assert!(
         indexing.auth().spaces()[&indexing.scope().space_id]
             .write_classes
             .is_empty()
     );
+    // Narrowed caller read_classes constrain both query_disclosure and EmbeddingInput::Query.
+    let mut narrowed_grants = setup.space.auth().spaces().clone();
+    narrowed_grants
+        .get_mut(&setup.space.scope().space_id)
+        .unwrap()
+        .read_classes = BTreeSet::from([DocClass::AgentMemory]);
+    let narrowed_auth = setup.space.auth().for_pat(narrowed_grants).unwrap();
+    let narrowed_space =
+        SpaceContext::new(narrowed_auth, setup.space.scope().clone(), budget()).unwrap();
+    assert!(
+        setup
+            .provider
+            .query_disclosure(
+                narrowed_space.clone(),
+                setup.selection.provider.clone(),
+                ModelProfileId::from_bytes([4; 16]),
+                None,
+            )
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(matches!(
+        setup
+            .provider
+            .embed(
+                narrowed_space,
+                query(111, DocClass::UserDoc).with_runtime_epochs(setup.selection.runtime_epochs),
+            )
+            .await,
+        Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
+            if diagnostic.reason == ValidationReason::ClassEgressForbidden
+    ));
+    // Deterministic 2-step search embedding resolution for Personal Space.
+    let embedding_model = ModelProfileId::from_bytes([4; 16]);
+    let explicit_resolved = setup
+        .provider
+        .resolve_search_embedding_model(
+            &ServiceAuthority::admit(ServicePurpose::Search),
+            setup.space.scope().clone(),
+            Some(embedding_model.clone()),
+            budget(),
+        )
+        .await
+        .unwrap()
+        .expect("explicit personal embedding model resolves");
+    assert_eq!(explicit_resolved.provider, setup.selection.provider);
+    assert_eq!(explicit_resolved.model, embedding_model);
+    assert_eq!(explicit_resolved.dimension, 2);
+    assert_eq!(explicit_resolved.max_input_tokens, 8192);
+    assert_eq!(explicit_resolved.project, None);
+    assert!(
+        setup
+            .provider
+            .resolve_search_embedding_model(
+                &ServiceAuthority::admit(ServicePurpose::Search),
+                setup.space.scope().clone(),
+                None,
+                budget(),
+            )
+            .await
+            .unwrap()
+            .is_none(),
+        "without an embedding preference, resolution returns Ok(None)"
+    );
+    let pref = setup
+        .provider
+        .set_preference(
+            setup.ctx.clone(),
+            AccountMutation {
+                identity: command(
+                    setup.ctx.auth().principal(),
+                    setup.ctx.auth().principal(),
+                    19,
+                    setup.revision,
+                ),
+                input: SetProviderPreference {
+                    scope: ProviderPreferenceScope::Personal,
+                    kind: PreferenceModelKind::Embedding,
+                    resource: setup.selection.provider.clone(),
+                    model: embedding_model.clone(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    setup.revision = pref.revision;
+    let pref_resolved = setup
+        .provider
+        .resolve_search_embedding_model(
+            &ServiceAuthority::admit(ServicePurpose::Search),
+            setup.space.scope().clone(),
+            None,
+            budget(),
+        )
+        .await
+        .unwrap()
+        .expect("personal owner embedding preference resolves for personal Space");
+    assert_eq!(pref_resolved, explicit_resolved);
     assert!(
         setup
             .provider

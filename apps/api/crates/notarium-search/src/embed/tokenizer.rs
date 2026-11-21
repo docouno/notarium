@@ -1,6 +1,6 @@
 use super::{
     EmbeddingError,
-    preprocess::{Normalizer, PreTokenizer, Pretokenized, is_word_character},
+    preprocess::{MAX_INPUT_BYTES, Normalizer, PreTokenizer, is_word_character},
     tokenizer_model::{Model, ModelInput},
 };
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
@@ -14,8 +14,8 @@ use serde::Deserialize;
 use std::{collections::HashMap, io::Read, path::Path};
 
 const MAX_TOKENIZER_BYTES: u64 = 32 * 1024 * 1024;
-const MAX_INPUT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_MODEL_TOKENS: u32 = 512;
+const REMOTE_FRAMING_TOKENS: u32 = 8;
 
 pub struct Encoding {
     pub ids: Vec<i64>,
@@ -77,14 +77,17 @@ enum TemplatePiece {
     Sequence { id: String, type_id: u32 },
     SpecialToken { id: String, type_id: u32 },
 }
+
 #[derive(Deserialize)]
 struct SpecialToken {
     ids: Vec<u32>,
 }
+
 enum Template {
     Input(u32),
     Special(Vec<u32>, u32),
 }
+
 impl PostProcessor {
     fn instructions(self) -> Result<Vec<Template>, EmbeddingError> {
         match self {
@@ -133,6 +136,7 @@ impl PostProcessor {
 pub struct LocalTokenizerBudget {
     profile: ModelProfileId,
     max_tokens: u32,
+    wrapper_tokens: usize,
     pad_id: u32,
     model: Model,
     normalizer: Option<Normalizer>,
@@ -167,7 +171,13 @@ impl LocalTokenizerBudget {
             name,
             OpenOptions::new().read(true).follow(FollowSymlinks::No),
         )?;
-        let mut json = Vec::new();
+        let file_meta = file.metadata()?;
+        if !file_meta.is_file() || file_meta.len() > MAX_TOKENIZER_BYTES {
+            return Err(EmbeddingError::InvalidModel);
+        }
+        let capacity =
+            usize::try_from(file_meta.len()).map_err(|_| EmbeddingError::InvalidModel)?;
+        let mut json = Vec::with_capacity(capacity);
         file.take(MAX_TOKENIZER_BYTES + 1).read_to_end(&mut json)?;
         Self::from_json(&json, profile, max_tokens)
     }
@@ -182,6 +192,12 @@ impl LocalTokenizerBudget {
         }
         let input: Input =
             serde_json::from_slice(json).map_err(|_| EmbeddingError::InvalidModel)?;
+        if let Some(normalizer) = &input.normalizer {
+            normalizer.validate()?;
+        }
+        if let Some(pre_tokenizer) = &input.pre_tokenizer {
+            pre_tokenizer.validate()?;
+        }
         let model = Model::load(input.model)?;
         let mut added_tokens = input.added_tokens;
         if added_tokens.len() > 4096 || added_tokens.iter().any(|token| token.content.is_empty()) {
@@ -205,7 +221,7 @@ impl LocalTokenizerBudget {
             Some(processor) => processor.instructions()?,
             None => vec![Template::Input(0)],
         };
-        let wrapper: usize = template
+        let wrapper_tokens: usize = template
             .iter()
             .filter_map(|piece| {
                 if let Template::Special(ids, _) = piece {
@@ -216,12 +232,15 @@ impl LocalTokenizerBudget {
             })
             .sum();
         let max_tokens = max_tokens.min(MAX_MODEL_TOKENS);
-        if wrapper >= max_tokens as usize {
+        if wrapper_tokens >= max_tokens as usize {
             return Err(EmbeddingError::InvalidModel);
         }
         if let Some(normalizer) = &input.normalizer {
             for token in added_tokens.iter_mut().filter(|token| token.normalized) {
-                token.content = normalizer.apply(std::mem::take(&mut token.content))?;
+                // Do not prepend start-of-input prefixes onto added token patterns.
+                token.content = normalizer
+                    .apply(std::mem::take(&mut token.content), false)
+                    .map_err(|_| EmbeddingError::InvalidModel)?;
             }
         }
         added_tokens.sort_by_key(|token| std::cmp::Reverse(token.content.len()));
@@ -238,6 +257,7 @@ impl LocalTokenizerBudget {
         Ok(Self {
             profile,
             max_tokens,
+            wrapper_tokens,
             pad_id,
             model,
             normalizer: input.normalizer,
@@ -252,41 +272,10 @@ impl LocalTokenizerBudget {
     }
 
     pub fn encode(&self, text: &str) -> Result<Encoding, EmbeddingError> {
-        if text.len() > MAX_INPUT_BYTES {
-            return Err(EmbeddingError::BudgetExceeded);
-        }
-        let mut ids = Vec::new();
-        for piece in split_added(text, &self.added_tokens[0]) {
-            match piece {
-                Piece::Token(id) => ids.push(id),
-                Piece::Text(raw, raw_starts_input) => {
-                    let normalized = match &self.normalizer {
-                        Some(normalizer) => normalizer.apply(raw.to_owned())?,
-                        None => raw.to_owned(),
-                    };
-                    for piece in split_added(&normalized, &self.added_tokens[1]) {
-                        match piece {
-                            Piece::Token(id) => ids.push(id),
-                            Piece::Text(text, starts_input) => {
-                                if let Some(tokenizer) = &self.pre_tokenizer {
-                                    for part in tokenizer.split(vec![Pretokenized {
-                                        text: text.to_owned(),
-                                        starts_input: raw_starts_input && starts_input,
-                                    }]) {
-                                        self.model.encode(&part.text, &mut ids)?;
-                                    }
-                                } else {
-                                    self.model.encode(text, &mut ids)?;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        let ids = self.encode_ids(text, None)?;
         let mut encoding = Encoding {
-            ids: Vec::new(),
-            type_ids: Vec::new(),
+            ids: Vec::with_capacity(ids.len() + self.wrapper_tokens),
+            type_ids: Vec::with_capacity(ids.len() + self.wrapper_tokens),
         };
         for piece in &self.template {
             let (ids, type_id) = match piece {
@@ -299,6 +288,57 @@ impl LocalTokenizerBudget {
                 .extend(std::iter::repeat_n(i64::from(type_id), ids.len()));
         }
         Ok(encoding)
+    }
+
+    fn encode_ids(
+        &self,
+        text: &str,
+        max_body_tokens: Option<usize>,
+    ) -> Result<Vec<u32>, EmbeddingError> {
+        if text.len() > MAX_INPUT_BYTES {
+            return Err(EmbeddingError::BudgetExceeded);
+        }
+        let mut ids = Vec::new();
+        for piece in split_added(text, &self.added_tokens[0]) {
+            if max_body_tokens.is_some_and(|cap| ids.len() >= cap) {
+                break;
+            }
+            match piece {
+                Piece::Token(id) => ids.push(id),
+                Piece::Text(raw, raw_starts_input) => {
+                    let normalized = match &self.normalizer {
+                        Some(normalizer) => normalizer.apply(raw.to_owned(), raw_starts_input)?,
+                        None => raw.to_owned(),
+                    };
+                    for piece in split_added(&normalized, &self.added_tokens[1]) {
+                        if max_body_tokens.is_some_and(|cap| ids.len() >= cap) {
+                            break;
+                        }
+                        match piece {
+                            Piece::Token(id) => ids.push(id),
+                            Piece::Text(text, _) => {
+                                if let Some(tokenizer) = &self.pre_tokenizer {
+                                    for part in tokenizer.split(vec![text.to_owned()])? {
+                                        self.model.encode(&part, &mut ids)?;
+                                        if max_body_tokens.is_some_and(|cap| ids.len() >= cap) {
+                                            break;
+                                        }
+                                    }
+                                } else {
+                                    self.model.encode(text, &mut ids)?;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(cap) = max_body_tokens
+            && ids.len() > cap
+        {
+            ids.truncate(cap);
+        }
+        Ok(ids)
     }
 }
 
@@ -359,13 +399,22 @@ impl TokenizerBudget for LocalTokenizerBudget {
     fn profile(&self) -> ModelProfileId {
         self.profile.clone()
     }
+
     fn max_tokens(&self) -> u32 {
         self.max_tokens
     }
+
     fn count(&self, input: &str) -> DomainResult<u32> {
-        let count = self.encode(input).map_err(|_| token_error())?.ids.len();
-        u32::try_from(count.max(usize::from(!input.is_empty()))).map_err(|_| token_error())
+        let stop_at = (self.max_tokens as usize)
+            .saturating_add(1)
+            .saturating_sub(self.wrapper_tokens);
+        let body = self
+            .encode_ids(input, Some(stop_at))
+            .map_err(|_| token_error())?;
+        let total = body.len().saturating_add(self.wrapper_tokens);
+        u32::try_from(total).map_err(|_| token_error())
     }
+
     fn split_hint(&self, text: &str, budget: u32) -> Option<usize> {
         split_hint(self, text, budget)
     }
@@ -381,19 +430,23 @@ pub struct RemoteConservativeTokenizerBudget {
 }
 
 impl RemoteConservativeTokenizerBudget {
-    pub fn new(profile: ModelProfileId, max_tokens: u32) -> Self {
-        Self {
-            profile,
-            max_tokens: max_tokens.min(MAX_MODEL_TOKENS),
+    pub fn new(profile: ModelProfileId, max_tokens: u32) -> Result<Self, EmbeddingError> {
+        let max_tokens = max_tokens.min(MAX_MODEL_TOKENS);
+        if max_tokens <= REMOTE_FRAMING_TOKENS {
+            return Err(EmbeddingError::InvalidModel);
         }
+        Ok(Self {
+            profile,
+            max_tokens,
+        })
     }
 
     pub fn lexical_fallback() -> Self {
         const LEXICAL_PROFILE: [u8; 16] = *b"lexical-only-v1\0";
-        Self::new(
-            ModelProfileId::from_bytes(LEXICAL_PROFILE),
-            MAX_MODEL_TOKENS,
-        )
+        Self {
+            profile: ModelProfileId::from_bytes(LEXICAL_PROFILE),
+            max_tokens: MAX_MODEL_TOKENS,
+        }
     }
 }
 
@@ -401,30 +454,33 @@ impl TokenizerBudget for RemoteConservativeTokenizerBudget {
     fn profile(&self) -> ModelProfileId {
         self.profile.clone()
     }
+
     fn max_tokens(&self) -> u32 {
         self.max_tokens
     }
+
     fn count(&self, input: &str) -> DomainResult<u32> {
-        let twelfths = input
-            .chars()
-            .map(|c| match c.len_utf8() {
-                1 => 4u64,
-                2 => 6,
-                _ => 12,
-            })
-            .sum::<u64>();
-        u32::try_from(twelfths.div_ceil(12) + 8).map_err(|_| token_error())
+        if self.max_tokens <= REMOTE_FRAMING_TOKENS {
+            return Err(token_error());
+        }
+        let tokens = notarium_core::document::estimate_conservative_tokens(input)
+            .saturating_add(REMOTE_FRAMING_TOKENS as usize);
+        u32::try_from(tokens).map_err(|_| token_error())
     }
+
     fn split_hint(&self, text: &str, budget: u32) -> Option<usize> {
-        let max_units = u64::from(budget.checked_sub(8)?) * 12;
-        let mut units = 0;
+        let payload_tokens = budget.checked_sub(REMOTE_FRAMING_TOKENS)?;
+        if payload_tokens == 0 {
+            return None;
+        }
+        let max_units = u64::from(payload_tokens).saturating_mul(12);
+        let mut units = 0u64;
         let mut end = 0;
+        let mut buf = [0u8; 4];
         for (offset, c) in text.char_indices() {
-            units += match c.len_utf8() {
-                1 => 4,
-                2 => 6,
-                _ => 12,
-            };
+            units = units.saturating_add(notarium_core::document::estimate_token_twelfths(
+                c.encode_utf8(&mut buf),
+            ));
             if units > max_units {
                 break;
             }
@@ -438,26 +494,47 @@ fn split_hint(tokenizer: &impl TokenizerBudget, text: &str, budget: u32) -> Opti
     if text.is_empty() || budget == 0 {
         return None;
     }
-    let full = tokenizer.count(text).ok()?;
-    if full <= budget {
-        return Some(text.len());
+    let mut upper = text.len().min(MAX_INPUT_BYTES);
+    while upper > 0 && !text.is_char_boundary(upper) {
+        upper -= 1;
     }
+    if upper == 0 {
+        return None;
+    }
+    let full = match tokenizer.count(&text[..upper]) {
+        Ok(count) if count <= budget => return Some(upper),
+        Ok(count) => Some(count),
+        Err(_) => None,
+    };
     let mut lower = 0;
-    let mut upper = text.len();
-    let guess = text.len().saturating_mul(budget as usize) / full as usize;
+    let guess = full.and_then(|count| {
+        (count > 0).then(|| upper.saturating_mul(budget as usize) / count as usize)
+    });
     for probe in 0..8 {
-        let mut bound = if probe == 0 {
+        let mut bound = if probe == 0
+            && let Some(guess) = guess
+            && guess > lower
+            && guess < upper
+        {
             guess
         } else {
             lower + (upper - lower) / 2
         };
-        while !text.is_char_boundary(bound) {
+        while bound > lower && !text.is_char_boundary(bound) {
             bound -= 1;
         }
-        if bound <= lower || bound >= upper {
-            break;
+        if bound <= lower {
+            if probe == 0 {
+                bound = lower + (upper - lower) / 2;
+                while bound > lower && !text.is_char_boundary(bound) {
+                    bound -= 1;
+                }
+            }
+            if bound <= lower || bound >= upper {
+                break;
+            }
         }
-        if tokenizer.count(&text[..bound]).ok()? <= budget {
+        if tokenizer.count(&text[..bound]).is_ok_and(|c| c <= budget) {
             lower = bound;
         } else {
             upper = bound;
@@ -465,7 +542,10 @@ fn split_hint(tokenizer: &impl TokenizerBudget, text: &str, budget: u32) -> Opti
     }
     if lower == 0 {
         let first = text.chars().next()?.len_utf8();
-        return (tokenizer.count(&text[..first]).ok()? <= budget).then_some(first);
+        return tokenizer
+            .count(&text[..first])
+            .is_ok_and(|c| c <= budget)
+            .then_some(first);
     }
     Some(lower)
 }

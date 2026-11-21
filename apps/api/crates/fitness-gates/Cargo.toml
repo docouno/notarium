@@ -40,7 +40,9 @@ toml = { workspace = true }
 blake3.workspace = true
 getrandom.workspace = true
 hex.workspace = true
+ipnet.workspace = true
 mimalloc.workspace = true
+notarium-search = { workspace = true, features = ["test-support"] }
 rusqlite.workspace = true
 serde.workspace = true
 sqlx.workspace = true

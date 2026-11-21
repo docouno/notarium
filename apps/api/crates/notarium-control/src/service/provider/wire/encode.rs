@@ -1,6 +1,7 @@
 use super::*;
 use notarium_core::{
     classes::{DocClass, ProviderOrigin},
+    document::estimate_token_twelfths,
     error::ValidationReason,
     model::FolderRef,
     ports::{control::CompletionRequest, *},
@@ -348,21 +349,8 @@ fn history(request: &CompletionRequest, wire: ProviderWireKind) -> Result<Vec<Va
     }
     Ok(messages)
 }
-/// Conservative Unicode-aware upper bound (`~1` token per `3` ASCII chars,
-/// `~1` per `2` 2-byte UTF-8 chars such as Cyrillic, `1` per CJK/astral scalar).
-fn text_token_twelfths(value: &str) -> u64 {
-    let mut twelfths = 0u64;
-    for ch in value.chars() {
-        twelfths = twelfths.saturating_add(match ch.len_utf8() {
-            1 => 4,
-            2 => 6,
-            _ => 12,
-        });
-    }
-    twelfths
-}
 fn text_tokens(value: &str) -> u64 {
-    text_token_twelfths(value).div_ceil(12)
+    estimate_token_twelfths(value).div_ceil(12)
 }
 pub(in crate::service::provider) fn estimate_completion_input_tokens(
     request: &CompletionRequest,
@@ -372,10 +360,10 @@ pub(in crate::service::provider) fn estimate_completion_input_tokens(
         total = total.saturating_add(4);
         let mut msg_twelfths = 0u64;
         if let Some(instruction) = &message.instruction {
-            msg_twelfths = msg_twelfths.saturating_add(text_token_twelfths(instruction.text()));
+            msg_twelfths = msg_twelfths.saturating_add(estimate_token_twelfths(instruction.text()));
         }
         for part in &message.parts {
-            msg_twelfths = msg_twelfths.saturating_add(text_token_twelfths(part.text()));
+            msg_twelfths = msg_twelfths.saturating_add(estimate_token_twelfths(part.text()));
         }
         total = total.saturating_add(msg_twelfths.div_ceil(12));
         for call in &message.tool_calls {

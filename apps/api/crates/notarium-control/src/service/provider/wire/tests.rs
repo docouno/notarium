@@ -394,3 +394,82 @@ fn encoded_requests_keep_base_paths_roles_tools_and_conservative_limits() {
     request.budget.max_input_tokens = 1;
     assert!(completion(ProviderWireKind::OpenaiCompatible, &model, &request).is_err());
 }
+
+#[test]
+fn token_estimates_use_shared_conservative_weights_and_preserve_message_framing() {
+    let embed_request = |text: &str| {
+        EmbeddingRequest::query(
+            CommandKey::from_bytes([1; 16]),
+            ModelProfileId::from_bytes([1; 16]),
+            ProviderResourceId::from_bytes([1; 16]),
+            EmbeddingQueryInput {
+                text: text.into(),
+                tokens: 1,
+                classes: BTreeSet::from([DocClass::UserDoc]),
+                project_scope: None,
+            },
+        )
+    };
+    // ASCII prose: 12 chars * 4/12 = 4 tokens.
+    assert_eq!(
+        estimate_embedding_input_tokens(&embed_request("hello world ")).unwrap(),
+        4
+    );
+    // Cyrillic (2B UTF-8): 6 chars * 12/12 = 6 tokens.
+    assert_eq!(
+        estimate_embedding_input_tokens(&embed_request("привет")).unwrap(),
+        6
+    );
+    // Code punctuation/digits: 6 chars * 12/12 = 6 tokens.
+    assert_eq!(
+        estimate_embedding_input_tokens(&embed_request("a[0]+=1")).unwrap(),
+        1 + 6
+    );
+    // CJK (3B UTF-8): 2 chars * 18/12 = 3 tokens.
+    assert_eq!(
+        estimate_embedding_input_tokens(&embed_request("東京")).unwrap(),
+        3
+    );
+    // Emoji (4B UTF-8): 2 chars * 24/12 = 4 tokens.
+    assert_eq!(
+        estimate_embedding_input_tokens(&embed_request("🦀🚀")).unwrap(),
+        4
+    );
+
+    let model = model(ProviderModelKind::Completion);
+    let completion_req = CompletionRequest {
+        intent: CommandKey::from_bytes([2; 16]),
+        selection: ProviderSelection {
+            project: None,
+            provider: ProviderResourceId::from_bytes([1; 16]),
+            model: model.id.clone(),
+            runtime_epochs: ProviderRuntimeEpochs {
+                resource: std::num::NonZeroU64::MIN,
+                credential: None,
+            },
+            policy: ProviderPolicy {
+                provider: ProviderResourceId::from_bytes([1; 16]),
+                audience: ProviderAudience::Personal { consented: true },
+                allowed_classes: DocClass::all(),
+            },
+        },
+        messages: vec![CompletionMessage {
+            role: CompletionRole::User,
+            instruction: Some(ProviderInstruction::from_orchestrator("привет".into()).unwrap()),
+            parts: vec![],
+            tool_calls: vec![],
+            result_for: None,
+        }],
+        tools: vec![],
+        budget: CompletionBudget {
+            max_input_tokens: 1024,
+            max_output_tokens: 16,
+            max_tool_calls: 0,
+        },
+    };
+    // 4 framing tokens for the message + 6 conservative tokens for "привет".
+    assert_eq!(
+        estimate_completion_input_tokens(&completion_req).unwrap(),
+        10
+    );
+}

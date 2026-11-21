@@ -125,7 +125,89 @@ async fn production_adapter_pools_real_dynamic_onnx_rows() {
         assert_eq!(rows[1].as_ref().unwrap()[2], 1.0);
         assert!(rows[2].is_none());
     }
+
+    // Exercise a full 16-row heterogeneous batch with mixed lengths and empty rows.
     let model = Arc::new(OrtModel::open(&library(), &root.0, &target, Pooling::Mean).unwrap());
+    let mixed_batch: Vec<String> = (0..16)
+        .map(|idx| match idx % 4 {
+            0 => "red".to_owned(),
+            1 => "blue".to_owned(),
+            2 => "red blue".to_owned(),
+            _ => "   ".to_owned(),
+        })
+        .collect();
+    let mixed_rows = scheduler
+        .submit(
+            Priority::LiveNoteEdit,
+            call_budget(Duration::from_secs(5)),
+            {
+                let model = model.clone();
+                move |budget| model.embed(mixed_batch, budget)
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(mixed_rows.len(), 16);
+    let diag = 1.0f32 / 2.0f32.sqrt();
+    for (idx, row) in mixed_rows.iter().enumerate() {
+        match idx % 4 {
+            0 => assert!((row.as_ref().unwrap()[1] - 1.0).abs() < 1e-6),
+            1 => assert!((row.as_ref().unwrap()[2] - 1.0).abs() < 1e-6),
+            2 => {
+                let vec = row.as_ref().unwrap();
+                assert!((vec[1] - diag).abs() < 1e-6);
+                assert!((vec[2] - diag).abs() < 1e-6);
+            }
+            _ => assert!(row.is_none()),
+        }
+    }
+
+    // Exercise the optional token_type_ids input path.
+    let type_ids_target = ResolvedEmbeddingTarget {
+        model: ModelProfileId::from_bytes([5; 16]),
+        dimension: 64,
+        max_input_tokens: 512,
+        backend: EmbeddingBackendTarget::LocalOnnx,
+    };
+    root.install_with_type_ids(&type_ids_target.model);
+    let type_ids_model =
+        Arc::new(OrtModel::open(&library(), &root.0, &type_ids_target, Pooling::Mean).unwrap());
+    let type_rows = type_ids_model
+        .embed(
+            vec!["red blue".to_owned(), "blue".to_owned(), " ".to_owned()],
+            call_budget(Duration::from_secs(5)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(type_rows.len(), 3);
+    assert!((type_rows[0].as_ref().unwrap()[1] - diag).abs() < 1e-6);
+    assert!((type_rows[0].as_ref().unwrap()[2] - diag).abs() < 1e-6);
+    assert!((type_rows[1].as_ref().unwrap()[2] - 1.0).abs() < 1e-6);
+    assert!(type_rows[2].is_none());
+
+    // Exercise direct 2D sentence_embedding output without token-level pooling.
+    let pooled_target = ResolvedEmbeddingTarget {
+        model: ModelProfileId::from_bytes([6; 16]),
+        dimension: 64,
+        max_input_tokens: 512,
+        backend: EmbeddingBackendTarget::LocalOnnx,
+    };
+    root.install_pooled_2d(&pooled_target.model);
+    let pooled_model =
+        Arc::new(OrtModel::open(&library(), &root.0, &pooled_target, Pooling::Cls).unwrap());
+    let pooled_rows = pooled_model
+        .embed(
+            vec!["red blue".to_owned(), "blue".to_owned(), " ".to_owned()],
+            call_budget(Duration::from_secs(5)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(pooled_rows.len(), 3);
+    assert!((pooled_rows[0].as_ref().unwrap()[1] - diag).abs() < 1e-6);
+    assert!((pooled_rows[0].as_ref().unwrap()[2] - diag).abs() < 1e-6);
+    assert!((pooled_rows[1].as_ref().unwrap()[2] - 1.0).abs() < 1e-6);
+    assert!(pooled_rows[2].is_none());
+
     #[cfg(target_os = "linux")]
     let mut resident = Vec::new();
     for batch in 0..200 {
@@ -152,34 +234,68 @@ async fn production_adapter_pools_real_dynamic_onnx_rows() {
     #[cfg(target_os = "linux")]
     {
         let first = resident[3..10].iter().max().unwrap();
-        let last = resident[13..20].iter().min().unwrap();
+        let last = resident[13..20].iter().max().unwrap();
         assert!(
             *last <= first + 16 * 1024,
-            "anonymous RSS grew from {first} to {last} KiB"
+            "anonymous RSS grew from max {first} to max {last} KiB"
         );
     }
 
     drop(model);
-    root.install(&target.model, true);
-    let model = Arc::new(OrtModel::open(&library(), &root.0, &target, Pooling::Mean).unwrap());
+    let cond_target = ResolvedEmbeddingTarget {
+        model: ModelProfileId::from_bytes([7; 16]),
+        dimension: 64,
+        max_input_tokens: 512,
+        backend: EmbeddingBackendTarget::LocalOnnx,
+    };
+    root.install_conditional_slow(&cond_target.model);
+    let cond_model =
+        Arc::new(OrtModel::open(&library(), &root.0, &cond_target, Pooling::Mean).unwrap());
+    // Dropping OrtModel::embed directly (without cancelling CallBudget) must
+    // terminate the native ONNX run and leave the session healthy for reuse.
+    let dropped = tokio::time::timeout(
+        Duration::from_millis(120),
+        cond_model
+            .clone()
+            .embed(vec!["red".to_owned()], call_budget(Duration::from_secs(10))),
+    )
+    .await;
+    assert!(dropped.is_err());
+    let recovered = tokio::time::timeout(
+        Duration::from_secs(3),
+        cond_model
+            .clone()
+            .embed(vec!["blue".to_owned()], call_budget(Duration::from_secs(3))),
+    )
+    .await
+    .expect("dropped native run must terminate promptly and release session")
+    .expect("session must remain usable after drop termination");
+    assert_eq!(recovered.len(), 1);
+    assert!((recovered[0].as_ref().unwrap()[2] - 1.0).abs() < 1e-6);
+
+    // Scheduler deadline expiry must also terminate the native run cleanly and
+    // allow subsequent inference on the same session to succeed.
     let expired = scheduler
         .submit(
             Priority::InteractiveSearchQuery,
             call_budget(Duration::from_millis(150)),
-            move |budget| model.embed(vec!["red".to_owned()], budget),
+            {
+                let cond_model = cond_model.clone();
+                move |budget| cond_model.embed(vec!["red".to_owned()], budget)
+            },
         )
         .await;
     assert!(matches!(expired, Err(EmbeddingError::BudgetExceeded)));
-    // Queued work can start only after the native call has acknowledged
-    // termination and the blocking task has returned.
-    scheduler
+    let after_timeout = scheduler
         .submit(
             Priority::LiveNoteEdit,
-            call_budget(Duration::from_secs(2)),
-            |_| async { Ok(Vec::new()) },
+            call_budget(Duration::from_secs(3)),
+            move |budget| cond_model.embed(vec!["blue".to_owned()], budget),
         )
         .await
-        .unwrap();
+        .expect("subsequent embed after RunOptions::terminate must succeed");
+    assert_eq!(after_timeout.len(), 1);
+    assert!((after_timeout[0].as_ref().unwrap()[2] - 1.0).abs() < 1e-6);
     scheduler.shutdown();
     worker.await.unwrap();
 }

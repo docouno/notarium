@@ -402,6 +402,50 @@ impl CanonicalStore {
         .await
     }
 
+    /// Walks a single folder's active ancestor chain at a retained command cut (`O(depth)`).
+    /// Returns `Ok(None)` if the folder or any ancestor is absent or not `Lifecycle::Active`.
+    pub async fn read_projection_folder_ancestry_at_cut(
+        &self,
+        ctx: &MaintenanceContext,
+        scope: &HistoryScope,
+        cutoff: SpaceSeq,
+        folder: &FolderId,
+    ) -> Result<Option<(Vec<FolderId>, Option<FolderId>)>, PortError> {
+        let scope = scope.clone();
+        let folder = folder.clone();
+        self.with_projection_read(ctx, |tx| {
+            Box::pin(async move {
+                checked_cut(tx, &scope, cutoff).await?;
+                let mut ancestors = Vec::new();
+                let mut visited = HashSet::new();
+                let mut project = None;
+                let mut current = Some(folder);
+                while let Some(id) = current {
+                    if ancestors.len() > crate::domain::common::MAX_FOLDER_DEPTH
+                        || !visited.insert(id.clone())
+                    {
+                        return Err(corrupt("folder ancestry exceeds depth bound or cycles"));
+                    }
+                    let mut rows =
+                        folders_at_batch(tx, &scope, cutoff, std::slice::from_ref(&id)).await?;
+                    let Some(row) = rows.remove(&id) else {
+                        return Ok(None);
+                    };
+                    if row.metadata.lifecycle != Lifecycle::Active {
+                        return Ok(None);
+                    }
+                    if project.is_none() && row.metadata.is_project {
+                        project = Some(id.clone());
+                    }
+                    ancestors.push(id);
+                    current = row.metadata.parent_folder_id;
+                }
+                Ok(Some((ancestors, project)))
+            })
+        })
+        .await
+    }
+
     /// Reads only metadata for a bounded set of notes at a retained command cut.
     pub async fn read_projection_note_metadata_batch(
         &self,

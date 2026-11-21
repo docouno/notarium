@@ -9,11 +9,12 @@ mod schema;
 pub(crate) use analysis::ChunkRelevance;
 pub use analysis::{TOKENIZER_VERSION, extract_note_body};
 pub use collector::LexicalFilter;
-pub use pool::{ReaderCache, WriterPool};
+pub use pool::{ReaderCache, SeedLease, WriterPool};
 
 use self::{
     analysis::{EXACT, Exact, PROSE, Prose},
-    collector::collect_filtered,
+    collector::{collect_browse, collect_top_scored},
+    pool::default_merge_policy,
     query::QueryPlan,
     schema::{CHAT, Fields, NOTE, class_ord, decode_chat_locator},
 };
@@ -27,16 +28,25 @@ use notarium_core::{
     ports::{ChatThreadKind, StructuralSnapshot},
 };
 use std::{
-    collections::BTreeSet,
+    cmp::Ordering,
+    collections::{BTreeSet, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
+    time::{Duration, Instant},
 };
 use tantivy::{
-    DocAddress, DocSet, Index, IndexReader, Order, ReloadPolicy, Searcher, TERMINATED,
-    TantivyDocument, Term,
-    collector::{TopDocs, sort_key::SortByBytes},
+    DocAddress, DocSet, Index, IndexReader, ReloadPolicy, Searcher, TERMINATED, TantivyDocument,
+    Term,
+    collector::TopDocs,
+    directory::RamDirectory,
+    indexer::NoMergePolicy,
     schema::{IndexRecordOption, Schema},
+    tokenizer::TokenizerManager,
 };
+
+const OVERLAY_WRITER_BUDGET: usize = 256 * 1024;
+const MAX_FALLBACK_FLOOR: usize = 10;
+const MERGE_RACE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, thiserror::Error)]
 pub enum LexicalError {
@@ -86,6 +96,14 @@ pub enum HitKey {
 pub struct LexicalHit {
     pub key: HitKey,
     pub score: f32,
+}
+
+/// Separates strict overlay matches from 1-term fallback matches so fallback
+/// overlay rows never overtake full matches from the durable corpus.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct OverlayHits {
+    pub strict: Vec<LexicalHit>,
+    pub fallback: Vec<LexicalHit>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -157,7 +175,7 @@ impl LexicalIndex {
         if updates.is_empty() {
             return Ok(0);
         }
-        let mutations = self.mutations(updates)?;
+        let mutations = build_mutations(&self.fields, updates)?;
         pool.with_writer(&self.path, &self.index, false, |writer| {
             let added = mutations.iter().filter(|(_, doc)| doc.is_some()).count();
             for (term, doc) in mutations {
@@ -172,50 +190,19 @@ impl LexicalIndex {
         })
     }
 
-    fn mutations(
-        &self,
-        updates: &[Update<'_>],
-    ) -> Result<Vec<(Term, Option<TantivyDocument>)>, LexicalError> {
-        updates
-            .iter()
-            .map(|update| {
-                Ok(match update {
-                    Update::Note {
-                        content,
-                        title,
-                        folder,
-                    } => {
-                        let body = extract_note_body(content)?;
-                        let term = self
-                            .fields
-                            .note_term(&content.provenance().reference().note_id);
-                        (term, Some(self.fields.note(content, title, &body, *folder)))
-                    }
-                    Update::Chat { hit, folder } => (
-                        self.fields.chat_term(&hit.thread, hit.entry),
-                        Some(self.fields.chat(hit, *folder)),
-                    ),
-                    Update::RemoveNote(note) => (self.fields.note_term(note), None),
-                    Update::RemoveChat(thread, entry) => {
-                        (self.fields.chat_term(thread, *entry), None)
-                    }
-                })
-            })
-            .collect()
-    }
-
-    /// Append one page to an unpublished, empty generation. The writer remains
-    /// pinned between pages so the final commit has the entire seed.
+    /// Append one page to an unpublished, empty generation. Hold the returned
+    /// `SeedLease` until `commit_seed` completes so the writer stays pinned
+    /// between pages and releases automatically if seeding aborts.
     pub fn stage_seed(
         &self,
         pool: &WriterPool,
         updates: &[Update<'_>],
-    ) -> Result<(), LexicalError> {
+    ) -> Result<SeedLease, LexicalError> {
         if updates.is_empty() {
-            return Ok(());
+            return pool.pin_existing_stage(&self.path);
         }
-        let mutations = self.mutations(updates)?;
-        pool.with_writer(&self.path, &self.index, true, |writer| {
+        let mutations = build_mutations(&self.fields, updates)?;
+        pool.with_stage_writer(&self.path, &self.index, |writer| {
             for (_, doc) in mutations {
                 writer.add_document(doc.ok_or(LexicalError::CorruptIndex)?)?;
             }
@@ -224,39 +211,56 @@ impl LexicalIndex {
     }
 
     pub fn commit_seed(&self, pool: &WriterPool) -> Result<(), LexicalError> {
-        pool.with_writer(&self.path, &self.index, false, |writer| {
+        pool.with_writer(&self.path, &self.index, true, |writer| {
             writer.commit()?;
             self.reader.reload()?;
             Ok(())
         })
     }
 
-    /// Rewrite all active segments and collect obsolete files after a physical purge.
-    pub fn compact(&self, pool: &WriterPool) -> Result<(), LexicalError> {
-        pool.with_writer(&self.path, &self.index, false, |writer| {
-            let segments = self.index.searchable_segment_ids()?;
-            if !segments.is_empty() {
-                writer.merge(&segments).wait()?;
-            }
-            self.reader.reload()?;
-            check_garbage_collection(writer)
-        })
-    }
-
+    /// Expunge deleted documents one segment at a time so multi-segment corpora
+    /// never collapse into one mega-segment, handling races with background
+    /// `LogMergePolicy` merges.
     pub fn merge_deleted(&self, pool: &WriterPool) -> Result<(), LexicalError> {
         pool.with_writer(&self.path, &self.index, false, |writer| {
-            let segments: Vec<_> = self
-                .index
-                .searchable_segment_metas()?
-                .into_iter()
-                .filter(|segment| segment.num_deleted_docs() != 0)
-                .map(|segment| segment.id())
-                .collect();
-            if !segments.is_empty() {
-                writer.merge(&segments).wait()?;
-            }
-            self.reader.reload()?;
-            Ok(())
+            writer.set_merge_policy(Box::new(NoMergePolicy));
+            let result = (|| {
+                let deadline = Instant::now() + MERGE_RACE_TIMEOUT;
+                let mut attempt = 0_usize;
+                loop {
+                    let dirty: Vec<_> = self
+                        .index
+                        .searchable_segment_metas()?
+                        .into_iter()
+                        .filter(|segment| segment.num_deleted_docs() != 0)
+                        .map(|segment| segment.id())
+                        .collect();
+                    if dirty.is_empty() {
+                        break;
+                    }
+                    if attempt > 0 && Instant::now() >= deadline {
+                        return Err(LexicalError::IncompleteCleanup);
+                    }
+                    attempt += 1;
+                    let mut raced = false;
+                    for segment_id in dirty {
+                        match writer.merge(&[segment_id]).wait() {
+                            Ok(_) => {}
+                            Err(tantivy::TantivyError::InvalidArgument(_)) => {
+                                raced = true;
+                            }
+                            Err(error) => return Err(error.into()),
+                        }
+                    }
+                    if raced {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                }
+                self.reader.reload()?;
+                Ok(())
+            })();
+            writer.set_merge_policy(default_merge_policy());
+            result
         })
     }
 
@@ -316,6 +320,7 @@ impl LexicalIndex {
         text: &str,
         filter: &LexicalFilter<'_>,
         candidate_limit: usize,
+        top_k: usize,
         filtered: bool,
     ) -> Result<Vec<LexicalHit>, LexicalError> {
         self.search_pinned(
@@ -323,6 +328,7 @@ impl LexicalIndex {
             text,
             filter,
             candidate_limit,
+            top_k,
             filtered,
         )
     }
@@ -333,6 +339,7 @@ impl LexicalIndex {
         text: &str,
         filter: &LexicalFilter<'_>,
         candidate_limit: usize,
+        top_k: usize,
         filtered: bool,
     ) -> Result<Vec<LexicalHit>, LexicalError> {
         search_pinned(
@@ -341,6 +348,7 @@ impl LexicalIndex {
             text,
             filter,
             candidate_limit,
+            top_k,
             filtered,
         )
     }
@@ -354,7 +362,7 @@ impl LexicalIndex {
         cursor: ChatCursor,
     ) -> Result<(Vec<LexicalHit>, Option<ChatCursor>), LexicalError> {
         use tantivy::query::{BooleanQuery, Occur, Query};
-        let plan = QueryPlan::parse(text, &self.fields.bodies[3..], false)?;
+        let plan = QueryPlan::parse(text, &self.fields.bodies[2..], false)?;
         let query: Box<dyn Query> = if cursor.relaxed {
             // The second pass only contributes documents absent from the strict pass.
             Box::new(BooleanQuery::new(vec![
@@ -364,22 +372,20 @@ impl LexicalIndex {
         } else {
             plan.query(false)
         };
-        let collector = TopDocs::with_limit(limit + 1).order_by_score();
-        let mut scores = collect_filtered(
-            searcher,
-            query.as_ref(),
-            &collector,
-            filter,
-            false,
-            cursor.after,
-        )?;
+        let mut scores =
+            collect_top_scored(searcher, query.as_ref(), filter, limit + 1, cursor.after)?;
+        let fallback_floor = limit.min(MAX_FALLBACK_FLOOR);
         let next = if scores.len() > limit {
             scores.truncate(limit);
             Some(ChatCursor {
                 relaxed: cursor.relaxed,
                 after: scores.last().copied(),
             })
-        } else if !cursor.relaxed && plan.can_fallback() {
+        } else if !cursor.relaxed
+            && cursor.after.is_none()
+            && scores.len() < fallback_floor
+            && plan.can_fallback()
+        {
             Some(ChatCursor {
                 relaxed: true,
                 after: None,
@@ -395,62 +401,119 @@ impl LexicalIndex {
     }
 
     /// Score only receipt-bound rows already admitted by the query filters.
-    /// A RAM directory uses the same schema, tokenizers and query parser.
+    /// Runs outside `WriterPool` using Tantivy's threadless single-segment
+    /// writer over `RamDirectory` for exact tokenizer and scoring parity.
     pub(crate) fn rank_overlay(
-        writers: &WriterPool,
         text: &str,
         updates: &[Update<'_>],
         filtered: bool,
         budget: crate::vector::SearchBudget<'_>,
-    ) -> Result<Vec<LexicalHit>, LexicalError> {
+    ) -> Result<OverlayHits, LexicalError> {
         if updates.is_empty() {
-            return Ok(Vec::new());
+            return Ok(OverlayHits::default());
         }
         collector::check_budget(Some(budget))?;
         let fields = Fields::new();
-        let index = Index::create_in_ram(fields.schema.clone());
-        let lexical = Self::from_index(PathBuf::new(), index, fields)?;
-        writers.with_temporary_writer(&lexical.index, |writer| {
-            for update in updates {
-                collector::check_budget(Some(budget))?;
-                for (_, document) in lexical.mutations(std::slice::from_ref(update))? {
-                    writer.add_document(document.ok_or(LexicalError::CorruptIndex)?)?;
-                }
-            }
-            collector::check_budget(Some(budget))?;
-            writer.commit()?;
-            Ok(())
-        })?;
-        collector::check_budget(Some(budget))?;
-        lexical.reader.reload()?;
-        let searcher = lexical.searcher();
-        let plan = QueryPlan::parse(text, &lexical.fields.bodies[..3], filtered)?;
-        let size = updates.len();
+        let plan = QueryPlan::parse(text, &fields.bodies[..2], filtered)?;
         if plan.browse {
-            let collector = TopDocs::with_limit(size)
-                .order_by((SortByBytes::for_field("note_id_raw"), Order::Asc));
-            return searcher
-                .search(plan.query(false).as_ref(), &collector)?
-                .into_iter()
-                .map(|(_, addr)| decode_hit(&searcher, addr, 1.0))
-                .collect();
+            let mut strict: Vec<_> = updates
+                .iter()
+                .map(|update| match update {
+                    Update::Note { content, .. } => Ok(LexicalHit {
+                        key: HitKey::Note(content.provenance().reference().note_id.clone()),
+                        score: 1.0,
+                    }),
+                    _ => Err(LexicalError::CorruptIndex),
+                })
+                .collect::<Result<_, _>>()?;
+            strict.sort_by(|left, right| match (&left.key, &right.key) {
+                (HitKey::Note(a), HitKey::Note(b)) => {
+                    a.as_str().as_bytes().cmp(b.as_str().as_bytes())
+                }
+                _ => Ordering::Equal,
+            });
+            return Ok(OverlayHits {
+                strict,
+                fallback: Vec::new(),
+            });
         }
+        if plan.is_empty() {
+            return Ok(OverlayHits::default());
+        }
+        let tokenizers = TokenizerManager::default();
+        tokenizers.register(PROSE, Prose::default());
+        tokenizers.register(EXACT, Exact);
+        let mut writer = Index::builder()
+            .schema(fields.schema.clone())
+            .tokenizers(tokenizers)
+            .single_segment_index_writer::<TantivyDocument>(
+                RamDirectory::create(),
+                OVERLAY_WRITER_BUDGET,
+            )?;
+        for update in updates {
+            collector::check_budget(Some(budget))?;
+            for (_, document) in build_mutations(&fields, std::slice::from_ref(update))? {
+                writer.add_document(document.ok_or(LexicalError::CorruptIndex)?)?;
+            }
+        }
+        collector::check_budget(Some(budget))?;
+        let index = writer.finalize()?;
+        let reader = index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::Manual)
+            .try_into()?;
+        let searcher = reader.searcher();
+        let size = updates.len();
         let collector = TopDocs::with_limit(size).order_by_score();
-        let mut scores = searcher.search(plan.query(false).as_ref(), &collector)?;
-        if scores.len() < size && plan.can_fallback() {
-            let seen: std::collections::HashSet<_> = scores.iter().map(|(_, addr)| *addr).collect();
-            scores.extend(
-                searcher
-                    .search(plan.query(true).as_ref(), &collector)?
-                    .into_iter()
-                    .filter(|(_, addr)| !seen.contains(addr)),
-            );
-        }
-        scores
+        let strict_scores = searcher.search(plan.query(false).as_ref(), &collector)?;
+        let fallback_scores = if strict_scores.len() < size && plan.can_fallback() {
+            let seen: HashSet<_> = strict_scores.iter().map(|(_, addr)| *addr).collect();
+            searcher
+                .search(plan.query(true).as_ref(), &collector)?
+                .into_iter()
+                .filter(|(_, addr)| !seen.contains(addr))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let strict = strict_scores
             .into_iter()
             .map(|(score, addr)| decode_hit(&searcher, addr, score))
-            .collect()
+            .collect::<Result<_, _>>()?;
+        let fallback = fallback_scores
+            .into_iter()
+            .map(|(score, addr)| decode_hit(&searcher, addr, score))
+            .collect::<Result<_, _>>()?;
+        Ok(OverlayHits { strict, fallback })
     }
+}
+
+fn build_mutations(
+    fields: &Fields,
+    updates: &[Update<'_>],
+) -> Result<Vec<(Term, Option<TantivyDocument>)>, LexicalError> {
+    updates
+        .iter()
+        .map(|update| {
+            Ok(match update {
+                Update::Note {
+                    content,
+                    title,
+                    folder,
+                } => {
+                    let body = extract_note_body(content)?;
+                    let term = fields.note_term(&content.provenance().reference().note_id);
+                    (term, Some(fields.note(content, title, &body, *folder)))
+                }
+                Update::Chat { hit, folder } => (
+                    fields.chat_term(&hit.thread, hit.entry),
+                    Some(fields.chat(hit, *folder)),
+                ),
+                Update::RemoveNote(note) => (fields.note_term(note), None),
+                Update::RemoveChat(thread, entry) => (fields.chat_term(thread, *entry), None),
+            })
+        })
+        .collect()
 }
 
 fn search_pinned(
@@ -459,6 +522,7 @@ fn search_pinned(
     text: &str,
     filter: &LexicalFilter<'_>,
     candidate_limit: usize,
+    top_k: usize,
     filtered: bool,
 ) -> Result<Vec<LexicalHit>, LexicalError> {
     if candidate_limit == 0 || (filter.classes == 0 && !filter.include_chats) {
@@ -467,48 +531,34 @@ fn search_pinned(
     let fields = if filter.include_chats {
         &index_fields.bodies[..]
     } else {
-        &index_fields.bodies[..3]
+        &index_fields.bodies[..2]
     };
     let query = QueryPlan::parse(text, fields, filtered)?;
     if query.browse {
-        let collector = TopDocs::with_limit(candidate_limit)
-            .order_by((SortByBytes::for_field("note_id_raw"), Order::Asc));
-        return collect_filtered(
-            searcher,
-            query.query(false).as_ref(),
-            &collector,
-            filter,
-            true,
-            None,
-        )?
-        .into_iter()
-        .map(|(_, address)| decode_hit(searcher, address, 1.0))
-        .collect();
+        return collect_browse(searcher, filter, candidate_limit);
     }
-    let collector = TopDocs::with_limit(candidate_limit).order_by_score();
-    let mut ranked = collect_filtered(
+    let mut ranked = collect_top_scored(
         searcher,
         query.query(false).as_ref(),
-        &collector,
         filter,
-        false,
+        candidate_limit,
         None,
     )?;
-    if ranked.len() < candidate_limit && query.can_fallback() {
-        let fallback = collect_filtered(
+    let fallback_floor = top_k.min(MAX_FALLBACK_FLOOR).min(candidate_limit);
+    if ranked.len() < fallback_floor && query.can_fallback() {
+        let fallback = collect_top_scored(
             searcher,
             query.query(true).as_ref(),
-            &collector,
             filter,
-            false,
+            fallback_floor,
             None,
         )?;
-        let seen: std::collections::HashSet<_> = ranked.iter().map(|(_, addr)| *addr).collect();
+        let seen: HashSet<_> = ranked.iter().map(|(_, addr)| *addr).collect();
         ranked.extend(
             fallback
                 .into_iter()
                 .filter(|(_, addr)| !seen.contains(addr))
-                .take(candidate_limit - ranked.len()),
+                .take(fallback_floor - ranked.len()),
         );
     }
     ranked

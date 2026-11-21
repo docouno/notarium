@@ -410,7 +410,7 @@ async fn exercise(
         .acquire_snapshot(ctx.clone(), CausalBasis::Await(Default::default()))
         .await
         .unwrap();
-    assert!(retained.lookup(&first.value.note).is_some());
+    assert!(retained.lookup(&first.value.note).unwrap().is_some());
     let published = engine.published_cut(scope).unwrap();
     assert_eq!(published.watermark.snapshot_seq, p);
     let path_p = published.base.path().to_owned();
@@ -538,8 +538,8 @@ async fn exercise(
         .acquire_snapshot(ctx.clone(), CausalBasis::Await(Default::default()))
         .await
         .unwrap();
-    let source = snapshot.lookup(&second.value.note).unwrap();
-    let target = snapshot.lookup(&first.value.note).unwrap();
+    let source = snapshot.lookup(&second.value.note).unwrap().unwrap();
+    let target = snapshot.lookup(&first.value.note).unwrap().unwrap();
     assert_eq!(
         snapshot.outgoing(source).unwrap().collect::<Vec<_>>(),
         [target]
@@ -632,7 +632,7 @@ async fn exercise(
             !abandoned.exists(),
             "offline purge must finish its filesystem sweep"
         );
-        assert!(held.lookup(&survivor.value.note).is_some());
+        assert!(held.lookup(&survivor.value.note).unwrap().is_some());
     }
 }
 
@@ -1044,8 +1044,8 @@ async fn a_late_old_history_worker_cannot_withdraw_the_restored_cut() {
         .expect("the quiet replacement remains publicly readable after the old worker exits");
     assert_eq!(snapshot.cut().scope, restored);
     assert_eq!(snapshot.cut().projected_seq, restored_head);
-    assert!(snapshot.lookup(&retained.value.note).is_some());
-    assert!(snapshot.lookup(&pending.value.note).is_some());
+    assert!(snapshot.lookup(&retained.value.note).unwrap().is_some());
+    assert!(snapshot.lookup(&pending.value.note).unwrap().is_some());
     runtime.shutdown().await.unwrap();
     canonical_runtime.shutdown().await.unwrap();
 }
@@ -1143,7 +1143,7 @@ async fn rebind_waits_for_a_cut_withdrawn_during_admission() {
         .expect("the first read after rebind sees the repaired generation");
     assert_eq!(snapshot.cut().generation, next_generation);
     assert_eq!(snapshot.cut().projected_seq, seq);
-    assert!(snapshot.lookup(&note.value.note).is_some());
+    assert!(snapshot.lookup(&note.value.note).unwrap().is_some());
     runtime.shutdown().await.unwrap();
     canonical_runtime.shutdown().await.unwrap();
 }

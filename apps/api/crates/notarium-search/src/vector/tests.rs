@@ -2,12 +2,16 @@ use super::*;
 use crate::layout::{SearchLayout, VectorModel};
 use croaring::Bitmap;
 use notarium_core::{
+    DomainError,
     auth::{ResourceFacts, Space, SpaceKind, SpaceLifecycle},
     classes::{ClassifiedDocument, ContentPart},
-    ids::{RevisionId, SpaceId, SpaceSeq},
-    model::{Lifecycle, NoteRef},
+    epoch::DataRoot,
+    error::ValidationReason,
+    ids::{HistoryIncarnation, RevisionId, SpaceId, SpaceSeq},
+    model::{HistoryScope, Lifecycle, NoteRef},
 };
 use std::{
+    collections::{BTreeSet, HashSet},
     fs,
     path::{Path, PathBuf},
     sync::Arc,
@@ -17,7 +21,7 @@ use std::{
 struct Scratch(PathBuf);
 impl Scratch {
     fn new() -> Self {
-        let mut entropy = [0u8; 16];
+        let mut entropy = [0; 16];
         getrandom::fill(&mut entropy).unwrap();
         let path = std::env::temp_dir().join(format!("search-vector-{}", hex::encode(entropy)));
         fs::create_dir(&path).unwrap();
@@ -166,9 +170,12 @@ fn write_corrupt(path: &Path, mut bytes: Vec<u8>, rehash: bool) {
         bytes[end..end + 32].copy_from_slice(hash.as_bytes());
     }
     fs::write(path, bytes).unwrap();
-    let mut permissions = fs::metadata(path).unwrap().permissions();
-    permissions.set_readonly(true);
-    fs::set_permissions(path, permissions).unwrap();
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(path, permissions).unwrap();
+    }
 }
 
 #[test]
@@ -178,19 +185,15 @@ fn segment_parser_rejects_truncation_and_corrupt_graph_addresses() {
     drop(write_fixture(&path, 13));
     let valid = fs::read(&path).unwrap();
     let base = format::read_u64(&valid, 80 + 16 * format::BASE) as usize;
-    for (index, offset) in [
-        0,
-        8,
-        68,
-        80,
-        80 + format::UPPER_OFFSETS * 16,
-        base,
-        base + 4,
-    ]
-    .into_iter()
-    .enumerate()
+    let entry = format::read_u32(&valid, 68) as usize;
+    let entry_base = base + entry * format::BASE_ROW_BYTES;
+
+    // Header and section corruption fails on open even with a rehashed footer.
+    for (index, offset) in [0, 8, 68, 80, 80 + format::UPPER_OFFSETS * 16]
+        .into_iter()
+        .enumerate()
     {
-        let bad = scratch.0.join(format!("corrupt-{index}"));
+        let bad = scratch.0.join(format!("corrupt-header-{index}"));
         let mut bytes = valid.clone();
         bytes[offset] ^= 0xFF;
         write_corrupt(&bad, bytes, true);
@@ -199,6 +202,44 @@ fn segment_parser_rejects_truncation_and_corrupt_graph_addresses() {
             Err(VectorError::CorruptIndex)
         ));
     }
+
+    // Unrehashed body corruption is caught by the single-pass BLAKE3 check on open.
+    for (index, offset) in [entry_base, entry_base + 4].into_iter().enumerate() {
+        let bad = scratch.0.join(format!("corrupt-body-bitrot-{index}"));
+        let mut bytes = valid.clone();
+        bytes[offset] ^= 0xFF;
+        write_corrupt(&bad, bytes, false);
+        assert!(matches!(
+            MmapSegment::open(&bad, &model_hash(&model())),
+            Err(VectorError::CorruptIndex)
+        ));
+    }
+
+    // Forged rehashed graph corruption is caught without panic by checked accessors.
+    let cancellation = Cancellation::default();
+    let budget = SearchBudget {
+        cancellation: &cancellation,
+        deadline: Instant::now() + Duration::from_secs(1),
+    };
+    let query = fixture(0, 100).vector;
+    for (index, offset) in [entry_base, entry_base + 4].into_iter().enumerate() {
+        let bad = scratch.0.join(format!("corrupt-body-forged-{index}"));
+        let mut bytes = valid.clone();
+        bytes[offset] ^= 0xFF;
+        write_corrupt(&bad, bytes, true);
+        let opened = MmapSegment::open(&bad, &model_hash(&model())).unwrap();
+        let search = opened.search_mode(
+            &query,
+            &mmap_segment::SlotMask::All(opened.len()),
+            5,
+            1,
+            budget,
+            false,
+            |_| Ok(true),
+        );
+        assert!(matches!(search, Err(VectorError::CorruptIndex)));
+    }
+
     let short = scratch.0.join("short");
     write_corrupt(&short, valid[..130].to_vec(), false);
     assert!(matches!(
@@ -208,7 +249,7 @@ fn segment_parser_rejects_truncation_and_corrupt_graph_addresses() {
 }
 
 #[test]
-fn mutable_wal_replays_replacements_and_scrubs_every_purged_frame() {
+fn mutable_wal_replays_replacements_and_resets_after_flush() {
     let scratch = Scratch::new();
     let note = fixture(1, 64).metadata.note;
     let other = fixture(2, 64).metadata.note;
@@ -240,19 +281,8 @@ fn mutable_wal_replays_replacements_and_scrubs_every_purged_frame() {
     assert!(buffer.supersedes(&note));
     assert_eq!(buffer.len(), 1);
     assert_eq!(buffer.last_seq(), seq(3));
-    buffer.scrub_note(&note).unwrap();
     let path = scratch.0.join("l0.wal");
     let bytes = fs::read(&path).unwrap();
-    assert!(
-        !bytes
-            .windows(note.as_str().len())
-            .any(|window| window == note.as_str().as_bytes())
-    );
-    assert!(
-        bytes
-            .windows(other.as_str().len())
-            .any(|window| window == other.as_str().as_bytes())
-    );
     fs::write(&path, &bytes[..bytes.len() - 1]).unwrap();
     assert!(matches!(
         MutableBuffer::open(&scratch.0, 64),
@@ -260,6 +290,29 @@ fn mutable_wal_replays_replacements_and_scrubs_every_purged_frame() {
     ));
     buffer.reset_after_flush().unwrap();
     assert!(MutableBuffer::open(&scratch.0, 64).unwrap().is_empty());
+}
+
+#[test]
+fn truncated_17_byte_wal_header_with_max_len_fails_without_oom() {
+    let scratch = Scratch::new();
+    let mut header = Vec::with_capacity(17);
+    header.extend_from_slice(b"L0W1");
+    header.push(1);
+    header.extend_from_slice(&1u64.to_le_bytes());
+    header.extend_from_slice(&(32u32 * 1024 * 1024).to_le_bytes());
+    assert_eq!(header.len(), 17);
+    fs::write(scratch.0.join("l0.wal"), &header).unwrap();
+
+    let mut result = None;
+    let stats = allocation_counter::measure(|| {
+        result = Some(MutableBuffer::open(&scratch.0, 64));
+    });
+    assert!(matches!(result, Some(Err(VectorError::CorruptIndex))));
+    assert!(
+        stats.bytes_total < 1024 * 1024,
+        "truncated WAL header must not pre-allocate 32 MiB; allocated {} bytes",
+        stats.bytes_total
+    );
 }
 
 #[test]
@@ -350,7 +403,15 @@ fn equal_vectors_stay_reachable_in_a_sealed_graph() {
     let mut tail = Bitmap::new();
     tail.add_range(33..count);
     let approximate = segment
-        .search_mode(&vector, &tail, 10, budget, false, |_| true)
+        .search_mode(
+            &vector,
+            &mmap_segment::SlotMask::Ref(&tail),
+            10,
+            1,
+            budget,
+            false,
+            |_| Ok(true),
+        )
         .unwrap();
     assert_eq!(approximate.neighbors.len(), 10);
     assert!(approximate.hnsw_hops > 0);
@@ -364,9 +425,6 @@ fn equal_vectors_stay_reachable_in_a_sealed_graph() {
 
 #[test]
 fn selective_exact_uses_each_sealed_segment_cardinality() {
-    use notarium_core::{epoch::DataRoot, ids::HistoryIncarnation, model::HistoryScope};
-    use std::collections::BTreeSet;
-
     let scratch = Scratch::new();
     let scope = HistoryScope {
         space_id: SpaceId::from_bytes([1; 16]),
@@ -421,9 +479,6 @@ fn selective_exact_uses_each_sealed_segment_cardinality() {
 
 #[test]
 fn exact_ties_survive_compaction_and_the_epoch_rejects_mixed_dimensions() {
-    use notarium_core::{epoch::DataRoot, ids::HistoryIncarnation, model::HistoryScope};
-    use std::collections::BTreeSet;
-
     let scratch = Scratch::new();
     let scope = HistoryScope {
         space_id: SpaceId::from_bytes([1; 16]),
@@ -477,7 +532,7 @@ fn exact_ties_survive_compaction_and_the_epoch_rejects_mixed_dimensions() {
     let id = epoch.snapshot().manifest().active_segments[0];
     let path = directory.join(format!("seg_{id:016x}.seg"));
     drop(epoch);
-    fs::remove_file(&path).unwrap();
+    crate::layout::remove_path_if_exists(&path).unwrap();
     let mut wrong = SegmentBuilder::new(&model(), 128).unwrap();
     wrong.push(fixture(1, 128)).unwrap();
     wrong.finish(&path).unwrap().unwrap();
@@ -489,8 +544,6 @@ fn exact_ties_survive_compaction_and_the_epoch_rejects_mixed_dimensions() {
 
 #[test]
 fn direct_segment_upsert_preserves_unrelated_pending_chunks_on_reopen() {
-    use notarium_core::{epoch::DataRoot, ids::HistoryIncarnation, model::HistoryScope};
-
     let scratch = Scratch::new();
     let scope = HistoryScope {
         space_id: SpaceId::from_bytes([1; 16]),
@@ -531,9 +584,6 @@ fn direct_segment_upsert_preserves_unrelated_pending_chunks_on_reopen() {
 
 #[test]
 fn large_upsert_is_crash_safe_before_and_after_publish() {
-    use notarium_core::{epoch::DataRoot, ids::HistoryIncarnation, model::HistoryScope};
-    use std::collections::BTreeSet;
-
     let scratch = Scratch::new();
     let scope = HistoryScope {
         space_id: SpaceId::from_bytes([1; 16]),
@@ -619,25 +669,22 @@ fn large_upsert_is_crash_safe_before_and_after_publish() {
 }
 
 #[test]
-fn epoch_restarts_compacts_and_scrubs_obsolete_carriers() {
-    use notarium_core::{epoch::DataRoot, ids::HistoryIncarnation, model::HistoryScope};
-    use std::collections::BTreeSet;
-
+fn epoch_restarts_and_compacts_obsolete_carriers() {
     let scratch = Scratch::new();
     let scope = HistoryScope {
         space_id: SpaceId::from_bytes([1; 16]),
         incarnation: HistoryIncarnation::from_bytes([1; 16]),
     };
     let layout = Arc::new(SearchLayout::open(&DataRoot::new(&scratch.0), scope).unwrap());
-    let epoch_path = layout
-        .model_epoch(&VectorModel::local(model(), 100))
-        .unwrap();
     let mut epoch = VectorEpoch::open(layout.clone(), model(), 100).unwrap();
     let seq = |seq| SpaceSeq::new(seq).unwrap();
     let mut builder = SegmentBuilder::new(&model(), 100).unwrap();
     let first = fixture(1, 100);
     builder.push(first.clone()).unwrap();
-    assert_eq!(builder.find_vector(first.metadata.key), Some(&first.vector));
+    assert_eq!(
+        builder.find_vector(first.metadata.key),
+        Some(first.vector.clone())
+    );
     builder.push(fixture(2, 100)).unwrap();
     epoch.seed(builder, seq(1)).unwrap();
 
@@ -649,7 +696,7 @@ fn epoch_restarts_compacts_and_scrubs_obsolete_carriers() {
         .apply(
             seq(2),
             MutableOperation::Upsert {
-                note: note.clone(),
+                note,
                 chunks: vec![update.clone()],
             },
         )
@@ -678,7 +725,7 @@ fn epoch_restarts_compacts_and_scrubs_obsolete_carriers() {
     };
     check(&epoch);
     drop(epoch);
-    let mut epoch = VectorEpoch::open(layout.clone(), model(), 100).unwrap();
+    let mut epoch = VectorEpoch::open(layout, model(), 100).unwrap();
     check(&epoch);
     epoch.flush().unwrap();
     check(&epoch);
@@ -687,28 +734,6 @@ fn epoch_restarts_compacts_and_scrubs_obsolete_carriers() {
     epoch.collect_obsolete().unwrap();
     check(&epoch);
     assert_eq!(epoch.snapshot().manifest().active_segments.len(), 1);
-
-    epoch.scrub_note(&note, seq(3)).unwrap();
-    epoch.collect_obsolete().unwrap();
-    let budget = SearchBudget {
-        cancellation: &cancellation,
-        deadline: Instant::now() + Duration::from_secs(1),
-    };
-    let result = epoch
-        .snapshot()
-        .search(&first.vector, &filter, 20, budget)
-        .unwrap();
-    assert_eq!(result.hits.len(), 1);
-    assert_ne!(result.hits[0].metadata.note, note);
-    assert!(epoch.find_vector(first.metadata.key).is_none());
-    for file in fs::read_dir(epoch_path).unwrap() {
-        let bytes = fs::read(file.unwrap().path()).unwrap();
-        assert!(
-            !bytes
-                .windows(note.as_str().len())
-                .any(|window| window == note.as_str().as_bytes())
-        );
-    }
 }
 
 #[test]
@@ -725,11 +750,12 @@ fn hnsw_traverses_but_never_returns_ineligible_slots() {
         0,
         0,
         10,
+        1,
         SearchBudget {
             cancellation: &cancellation,
             deadline: Instant::now() + Duration::from_secs(1),
         },
-        |slot| slot % 2 == 1,
+        |slot| Ok(slot % 2 == 1),
     )
     .unwrap();
     assert!(result.evaluations > 1);
@@ -745,9 +771,6 @@ fn hnsw_traverses_but_never_returns_ineligible_slots() {
 
 #[test]
 fn invisible_chunks_cannot_displace_visible_sealed_or_mutable_hits() {
-    use notarium_core::{epoch::DataRoot, ids::HistoryIncarnation, model::HistoryScope};
-    use std::collections::BTreeSet;
-
     let scratch = Scratch::new();
     let scope = HistoryScope {
         space_id: SpaceId::from_bytes([1; 16]),
@@ -796,7 +819,9 @@ fn invisible_chunks_cannot_displace_visible_sealed_or_mutable_hits() {
     let expected = BTreeSet::from([visible_sealed.metadata.note, visible_mutable.metadata.note]);
     let hits = epoch
         .snapshot()
-        .search_visible(&query, &filter, 100, budget, |note| expected.contains(note))
+        .search_visible(&query, &filter, 100, budget, |note| {
+            Ok(expected.contains(note))
+        })
         .unwrap();
     assert_eq!(hits.hnsw_hops, 0);
     assert_eq!(
@@ -824,9 +849,337 @@ fn ann_returns_oversampled_candidates_above_the_exploration_width() {
     };
     let scorer = hnsw::Similarity::new(query.values(), query.scale()).unwrap();
     for top_k in [260, 800] {
-        let result =
-            hnsw::query_graph(&segment, scorer, 0, 0, top_k, budget, |slot| slot >= 256).unwrap();
+        let result = hnsw::query_graph(&segment, scorer, 0, 0, top_k, 1, budget, |slot| {
+            Ok(slot >= 256)
+        })
+        .unwrap();
         assert_eq!(result.neighbors.len(), top_k);
         assert!(result.neighbors.iter().all(|hit| hit.slot >= 256));
     }
+}
+
+#[test]
+fn key_index_handles_eight_byte_prefix_collisions_with_full_digest_check() {
+    let scratch = Scratch::new();
+    let path = scratch.0.join("collide.seg");
+    let make_key = |suffix: u8| {
+        let mut bytes = [0xABu8; 32];
+        bytes[8..].fill(suffix);
+        ContentDigest::from_bytes(bytes)
+    };
+    let mut c1 = fixture(1, 64);
+    let mut c2 = fixture(2, 64);
+    let mut c3 = fixture(3, 64);
+    let mut dup_c2 = fixture(4, 64);
+    c1.metadata.key = make_key(1);
+    c2.metadata.key = make_key(2);
+    c3.metadata.key = make_key(3);
+    dup_c2.metadata.key = make_key(2);
+    dup_c2.vector = c2.vector.clone();
+
+    let mut builder = SegmentBuilder::new(&model(), 64).unwrap();
+    for chunk in [&c1, &c2, &c3, &dup_c2] {
+        builder.push(chunk.clone()).unwrap();
+    }
+    let sealed = builder.finish(&path).unwrap().unwrap();
+    let reopened = MmapSegment::open(&path, &model_hash(&model())).unwrap();
+    for seg in [&sealed, &reopened] {
+        assert_eq!(seg.find_vector(c1.metadata.key), Some(c1.vector.clone()));
+        assert_eq!(seg.find_vector(c2.metadata.key), Some(c2.vector.clone()));
+        assert_eq!(seg.find_vector(c3.metadata.key), Some(c3.vector.clone()));
+        assert_eq!(seg.find_vector(make_key(99)), None);
+    }
+}
+
+#[test]
+fn slot_mask_fast_paths_selective_visibility_and_fallible_errors() {
+    let scratch = Scratch::new();
+    let scope = HistoryScope {
+        space_id: SpaceId::from_bytes([2; 16]),
+        incarnation: HistoryIncarnation::from_bytes([2; 16]),
+    };
+    let layout = Arc::new(SearchLayout::open(&DataRoot::new(&scratch.0), scope).unwrap());
+    let mut epoch = VectorEpoch::open(layout, model(), 64).unwrap();
+    let rows: Vec<_> = (0..64)
+        .map(|slot| {
+            let mut row = fixture(slot, 64);
+            row.metadata.class = if slot % 4 == 0 {
+                DocClass::AgentMemory
+            } else {
+                DocClass::UserDoc
+            };
+            row
+        })
+        .collect();
+    epoch
+        .seed(
+            SegmentBuilder::with_test_rows(&model(), 64, rows),
+            SpaceSeq::new(1).unwrap(),
+        )
+        .unwrap();
+
+    let snapshot = epoch.snapshot();
+    let cancellation = Cancellation::default();
+    let budget = SearchBudget {
+        cancellation: &cancellation,
+        deadline: Instant::now() + Duration::from_secs(1),
+    };
+    let query = fixture(0, 64).vector;
+
+    // Fast path SlotMask::All (all 4 non-encrypted classes, no filters).
+    let all_classes = BTreeSet::from([
+        DocClass::UserDoc,
+        DocClass::AgentMemory,
+        DocClass::Skill,
+        DocClass::Profile,
+    ]);
+    let all_filter = VectorFilter {
+        classes: &all_classes,
+        folders: None,
+        notes: None,
+        excluded: None,
+    };
+    assert_eq!(
+        snapshot
+            .search(&query, &all_filter, 64, budget)
+            .unwrap()
+            .hits
+            .len(),
+        64
+    );
+
+    // Fast path SlotMask::Ref (single UserDoc class, no filters).
+    let user_only = BTreeSet::from([DocClass::UserDoc]);
+    let user_filter = VectorFilter {
+        classes: &user_only,
+        folders: None,
+        notes: None,
+        excluded: None,
+    };
+    assert_eq!(
+        snapshot
+            .search(&query, &user_filter, 64, budget)
+            .unwrap()
+            .hits
+            .len(),
+        48
+    );
+
+    // Fallible visibility propagates DomainError instead of silently dropping hits.
+    let err = snapshot.search_visible(&query, &user_filter, 10, budget, |_| {
+        Err(VectorError::Domain(DomainError::validation(
+            ValidationReason::NotReady,
+        )))
+    });
+    assert!(matches!(err, Err(VectorError::Domain(_))));
+
+    // HNSW mode with selective visibility returns bounded graph hits directly
+    // without falling back to exact linear scan.
+    let seg_path = scratch.0.join("hnsw_only.seg");
+    let seg = SegmentBuilder::with_test_rows(
+        &model(),
+        64,
+        (0..64).map(|slot| fixture(slot, 64)).collect(),
+    )
+    .finish(&seg_path)
+    .unwrap()
+    .unwrap();
+    let mut checks = 0usize;
+    let res = seg
+        .search_mode(
+            &query,
+            &mmap_segment::SlotMask::All(seg.len()),
+            20,
+            1,
+            budget,
+            false,
+            |slot| {
+                checks += 1;
+                Ok(slot == 0)
+            },
+        )
+        .unwrap();
+    assert!(res.hnsw_hops > 0);
+    assert_eq!(res.neighbors.len(), 1);
+    assert_eq!(res.neighbors[0].slot, 0);
+    assert!(checks <= seg.len() as usize);
+}
+
+#[test]
+fn non_blocking_compaction_and_flush_support_cancellation_and_concurrent_writes() {
+    let scratch = Scratch::new();
+    let scope = HistoryScope {
+        space_id: SpaceId::from_bytes([3; 16]),
+        incarnation: HistoryIncarnation::from_bytes([3; 16]),
+    };
+    let layout = Arc::new(SearchLayout::open(&DataRoot::new(&scratch.0), scope).unwrap());
+    let seq = |n| SpaceSeq::new(n).unwrap();
+    let mut epoch = VectorEpoch::open(layout.clone(), model(), 64).unwrap();
+    let c1 = fixture(1, 64);
+    let c2 = fixture(2, 64);
+    let c3 = fixture(3, 64);
+    let mut builder = SegmentBuilder::new(&model(), 64).unwrap();
+    builder.push(c1.clone()).unwrap();
+    builder.push(c2.clone()).unwrap();
+    epoch.seed(builder, seq(1)).unwrap();
+
+    // Update c1 and flush so segment 1 becomes dead-heavy (1/2 > 20%).
+    let mut c1_v2 = c1.clone();
+    c1_v2.metadata.spans = vec![ByteSpan::new(10, 22).unwrap()];
+    epoch
+        .apply(
+            seq(2),
+            MutableOperation::Upsert {
+                note: c1.metadata.note.clone(),
+                chunks: vec![c1_v2.clone()],
+            },
+        )
+        .unwrap();
+    epoch.flush().unwrap();
+    assert!(epoch.should_compact());
+
+    // 1. Cancelled plan leaves epoch segments intact.
+    let before_segments = epoch.snapshot().manifest().active_segments.clone();
+    let plan = epoch.plan_compact().expect("compaction plan");
+    let cancelled = Cancellation::default();
+    cancelled.cancel();
+    assert!(matches!(
+        plan.execute(&cancelled),
+        Err(VectorError::Cancelled)
+    ));
+    assert_eq!(epoch.snapshot().manifest().active_segments, before_segments);
+
+    // 2. Live concurrent update during compaction is preserved when committing.
+    let plan = epoch.plan_compact().expect("compaction plan");
+    let live_cancel = Cancellation::default();
+    let replacement = plan.execute(&live_cancel).unwrap();
+    let mut c2_v2 = c2.clone();
+    c2_v2.metadata.spans = vec![ByteSpan::new(11, 25).unwrap()];
+    epoch
+        .apply(
+            seq(3),
+            MutableOperation::Upsert {
+                note: c2.metadata.note.clone(),
+                chunks: vec![c2_v2.clone()],
+            },
+        )
+        .unwrap();
+    let dirty = HashSet::from([c2.metadata.note.clone()]);
+    epoch.commit_compaction(plan, replacement, &dirty).unwrap();
+    assert!(epoch.matches_note_chunks(&c2.metadata.note, std::slice::from_ref(&c2_v2)));
+    assert!(epoch.matches_note_chunks(&c1.metadata.note, std::slice::from_ref(&c1_v2)));
+
+    // 3. Non-blocking FlushL0 preserves a concurrent same-SpaceSeq overwrite.
+    let flush_plan = epoch.plan_flush_l0().unwrap().expect("flush plan");
+    let flush_seg = flush_plan.execute(&live_cancel).unwrap();
+    let mut c2_v3 = c2.clone();
+    c2_v3.metadata.spans = vec![ByteSpan::new(12, 26).unwrap()];
+    epoch
+        .apply_batch(
+            seq(3),
+            vec![
+                MutableOperation::Upsert {
+                    note: c2.metadata.note.clone(),
+                    chunks: vec![c2_v3.clone()],
+                },
+                MutableOperation::Upsert {
+                    note: c3.metadata.note.clone(),
+                    chunks: vec![c3.clone()],
+                },
+            ],
+        )
+        .unwrap();
+    let flush_dirty = HashSet::from([c2.metadata.note.clone(), c3.metadata.note.clone()]);
+    epoch
+        .commit_flush_l0(flush_plan, flush_seg, &flush_dirty)
+        .unwrap();
+    assert!(epoch.matches_note_chunks(&c2.metadata.note, std::slice::from_ref(&c2_v3)));
+    assert!(epoch.matches_note_chunks(&c3.metadata.note, std::slice::from_ref(&c3)));
+    drop(epoch);
+
+    let reopened = VectorEpoch::open(layout, model(), 64).unwrap();
+    assert!(reopened.matches_note_chunks(&c2.metadata.note, std::slice::from_ref(&c2_v3)));
+    assert!(reopened.matches_note_chunks(&c3.metadata.note, std::slice::from_ref(&c3)));
+}
+
+#[test]
+fn quantize_preserves_small_nonzero_vectors_without_1e12_clipping() {
+    for magnitude in [1e-20_f32, f32::MIN_POSITIVE, f32::from_bits(1)] {
+        let mut values = [0.0f32; 64];
+        values[0] = magnitude;
+        let q = QuantizedVector::quantize(&values).unwrap();
+        assert!(q.scale() > 0.0 && q.scale() <= 1.0);
+        let dot = simd::dot_i8_scalar(q.values(), q.values()).unwrap();
+        let cosine = dot as f32 * q.scale() * q.scale();
+        assert!(
+            cosine > 0.99,
+            "expected unit self-cosine for {magnitude:e}, got {cosine}"
+        );
+    }
+    assert!(matches!(
+        QuantizedVector::quantize(&[0.0f32; 64]),
+        Err(VectorError::InvalidVector)
+    ));
+    assert!(matches!(
+        QuantizedVector::quantize(&[f32::NAN; 64]),
+        Err(VectorError::InvalidVector)
+    ));
+}
+
+#[test]
+fn collect_obsolete_cleans_orphan_temps_and_ignores_ds_store() {
+    let scratch = Scratch::new();
+    let scope = HistoryScope {
+        space_id: SpaceId::from_bytes([4; 16]),
+        incarnation: HistoryIncarnation::from_bytes([4; 16]),
+    };
+    let layout = Arc::new(SearchLayout::open(&DataRoot::new(&scratch.0), scope).unwrap());
+    let epoch_dir = layout
+        .model_epoch(&VectorModel::local(model(), 64))
+        .unwrap();
+    let mut epoch = VectorEpoch::open(layout.clone(), model(), 64).unwrap();
+    let mut builder = SegmentBuilder::new(&model(), 64).unwrap();
+    builder.push(fixture(1, 64)).unwrap();
+    epoch.seed(builder, SpaceSeq::new(1).unwrap()).unwrap();
+
+    let temps = [
+        ".segment-99-0.tmp",
+        "l0.wal.99.0.tmp",
+        "seg_0000000000000001.tomb.99.0.tmp",
+        "epoch_manifest.json.99.0.tmp",
+    ];
+    for name in temps {
+        fs::write(epoch_dir.join(name), b"orphan").unwrap();
+    }
+    fs::write(epoch_dir.join(".DS_Store"), b"finder").unwrap();
+
+    epoch.collect_obsolete().unwrap();
+    for name in temps {
+        assert!(!epoch_dir.join(name).exists(), "{name} should be removed");
+    }
+    assert!(epoch_dir.join(".DS_Store").exists());
+    drop(epoch);
+    assert!(VectorEpoch::open(layout, model(), 64).is_ok());
+}
+
+#[test]
+fn metadata_caps_context_spans_and_oversized_notes_bypass_wal_limit() {
+    let mut bad = fixture(1, 64);
+    bad.metadata.context = (0..=MAX_CONTEXT_SPANS)
+        .map(|i| ByteSpan::new(i, i + 1).unwrap())
+        .collect();
+    assert!(matches!(
+        bad.metadata.validate(),
+        Err(VectorError::InvalidChunk)
+    ));
+
+    let scratch = Scratch::new();
+    let buffer = MutableBuffer::open(&scratch.0, 4096).unwrap();
+    let sample = fixture(1, 4096);
+    let oversized = MutableOperation::Upsert {
+        note: sample.metadata.note.clone(),
+        chunks: vec![sample; 4_200],
+    };
+    assert!(buffer.exceeds_single_limit(&oversized));
+    assert_eq!(L0_MAX_BYTES, 16 * 1024 * 1024);
 }

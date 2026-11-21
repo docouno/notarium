@@ -99,10 +99,11 @@ pub fn chunks(
             || entering.iter().any(|h| h.section_span.end() >= block.end());
         if changed {
             if let Some(previous) = pending.take() {
-                emit(
+                let (_, prefix) = context(&active_headings);
+                push(
                     source,
                     previous,
-                    &mut active_headings,
+                    &prefix,
                     tokenizer,
                     &model,
                     source_digest,
@@ -120,14 +121,14 @@ pub fn chunks(
         if let Some(previous) = pending.take() {
             let (_, prefix) = context(&active_headings);
             let joined = ByteSpan::new(previous.start(), block.end())?;
-            if tokenizer.count(&render_chunk(source, &prefix, &[joined])?)? <= limit {
+            if fits(tokenizer, &render_chunk(source, &prefix, &[joined])?, limit)? {
                 pending = Some(joined);
                 continue;
             }
-            emit(
+            push(
                 source,
                 previous,
-                &mut active_headings,
+                &prefix,
                 tokenizer,
                 &model,
                 source_digest,
@@ -136,7 +137,7 @@ pub fn chunks(
         }
         let (_, prefix) = context(&active_headings);
         let full = render_chunk(source, &prefix, &[*block])?;
-        if tokenizer.count(&full)? <= limit {
+        if fits(tokenizer, &full, limit)? {
             pending = Some(*block);
         } else {
             emit(
@@ -151,10 +152,11 @@ pub fn chunks(
         }
     }
     if let Some(range) = pending {
-        emit(
+        let (_, prefix) = context(&active_headings);
+        push(
             source,
             range,
-            &mut active_headings,
+            &prefix,
             tokenizer,
             &model,
             source_digest,
@@ -165,6 +167,17 @@ pub fn chunks(
         model,
         chunks: output,
     })
+}
+fn fits(tokenizer: &dyn TokenizerBudget, text: &str, limit: u32) -> DomainResult<bool> {
+    match tokenizer.count(text) {
+        Ok(count) => Ok(count <= limit),
+        Err(DomainError::ValidationFailed { diagnostic })
+            if diagnostic.reason == ValidationReason::TokenBudgetExceeded =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
 }
 fn emit(
     source: &str,
@@ -179,18 +192,6 @@ fn emit(
     let text = range.slice(source)?;
     let limit = tokenizer.max_tokens();
     let (mut selected_headings, mut context) = context(headings);
-    let full = render_chunk(source, &context, &[range])?;
-    if tokenizer.count(&full)? <= limit {
-        return push(
-            source,
-            range,
-            &context,
-            tokenizer,
-            model,
-            source_digest,
-            output,
-        );
-    }
     let mut offset = 0;
     while offset < text.len() {
         let rest = &text[offset..];
@@ -211,7 +212,7 @@ fn emit(
         loop {
             let selected = ByteSpan::new(range.start() + offset, range.start() + offset + end)?;
             let candidate = render_chunk(source, &context, &[selected])?;
-            if tokenizer.count(&candidate)? <= limit {
+            if fits(tokenizer, &candidate, limit)? {
                 push(
                     source,
                     selected,
@@ -271,7 +272,11 @@ fn emit(
                 // A successful large check is paid for by its emitted output;
                 // a failed check ends this operation rather than every sibling.
                 let original: Vec<_> = headings.iter().map(|h| h.original).collect();
-                if tokenizer.count(&render_chunk(source, &original, &[range])?)? <= limit {
+                if fits(
+                    tokenizer,
+                    &render_chunk(source, &original, &[range])?,
+                    limit,
+                )? {
                     output.truncate(output_start);
                     return push(
                         source,
@@ -322,4 +327,147 @@ fn push(
         key: ContentDigest::from_bytes(*hash.finalize().as_bytes()),
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::markdown;
+
+    struct CappedTokenizer {
+        profile: ModelProfileId,
+        max_tokens: u32,
+        max_bytes: usize,
+        min_tokens_per_input: u32,
+    }
+
+    impl TokenizerBudget for CappedTokenizer {
+        fn profile(&self) -> ModelProfileId {
+            self.profile.clone()
+        }
+
+        fn max_tokens(&self) -> u32 {
+            self.max_tokens
+        }
+
+        fn count(&self, text: &str) -> DomainResult<u32> {
+            if text.len() > self.max_bytes {
+                return Err(DomainError::validation(
+                    ValidationReason::TokenBudgetExceeded,
+                ));
+            }
+            let tokens = text.len().div_ceil(4);
+            let tokens = u32::try_from(tokens)
+                .map_err(|_| DomainError::validation(ValidationReason::TokenBudgetExceeded))?;
+            Ok(tokens.max(self.min_tokens_per_input))
+        }
+
+        fn split_hint(&self, text: &str, budget: u32) -> Option<usize> {
+            let max_bytes = (budget as usize).saturating_mul(4).min(self.max_bytes);
+            if max_bytes == 0 || text.len() <= max_bytes {
+                return None;
+            }
+            let mut end = max_bytes;
+            while end > 0 && !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            (end > 0).then_some(end)
+        }
+    }
+
+    struct FailingTokenizer;
+
+    impl TokenizerBudget for FailingTokenizer {
+        fn profile(&self) -> ModelProfileId {
+            ModelProfileId::from_bytes([9; 16])
+        }
+
+        fn max_tokens(&self) -> u32 {
+            512
+        }
+
+        fn count(&self, _text: &str) -> DomainResult<u32> {
+            Err(DomainError::validation(ValidationReason::InvalidState))
+        }
+
+        fn split_hint(&self, _text: &str, _budget: u32) -> Option<usize> {
+            None
+        }
+    }
+
+    fn run_chunks(
+        source: &str,
+        tokenizer: &dyn TokenizerBudget,
+    ) -> DomainResult<Vec<ChunkDescriptor>> {
+        let body = ByteSpan::new(0, source.len())?;
+        let parsed = markdown::analyze(source, body)?;
+        match chunks(source, &parsed, Some(tokenizer))? {
+            ChunkPlan::Ready { chunks, .. } => Ok(chunks),
+            ChunkPlan::Deferred { .. } => unreachable!("tokenizer supplied"),
+        }
+    }
+
+    #[test]
+    fn splits_block_exceeding_64kib_tokenizer_cap() {
+        let source = format!("{} ", "alpha".repeat(14_000));
+        assert!(source.len() > 65_536);
+        let tokenizer = CappedTokenizer {
+            profile: ModelProfileId::from_bytes([7; 16]),
+            max_tokens: 512,
+            max_bytes: 65_536,
+            min_tokens_per_input: 0,
+        };
+        let output = run_chunks(&source, &tokenizer).unwrap();
+        assert!(output.len() > 1);
+        for chunk in &output {
+            assert!(chunk.text.len() <= 65_536);
+            assert!(chunk.tokens <= 512);
+        }
+    }
+
+    #[test]
+    fn halves_heading_exceeding_64kib_tokenizer_cap() {
+        let source = format!("# {}\n\nShort body paragraph.\n", "h".repeat(70_000));
+        assert!(source.len() > 65_536);
+        let tokenizer = CappedTokenizer {
+            profile: ModelProfileId::from_bytes([8; 16]),
+            max_tokens: 256,
+            max_bytes: 65_536,
+            min_tokens_per_input: 0,
+        };
+        let output = run_chunks(&source, &tokenizer).unwrap();
+        assert!(!output.is_empty());
+        assert!(
+            output
+                .iter()
+                .any(|chunk| chunk.text.contains("Short body paragraph."))
+        );
+        for chunk in &output {
+            assert!(chunk.text.len() <= 65_536);
+            assert!(chunk.tokens <= 256);
+        }
+    }
+
+    #[test]
+    fn propagates_non_budget_tokenizer_errors() {
+        let source = "# Title\n\nBody paragraph.\n";
+        let err = run_chunks(source, &FailingTokenizer).unwrap_err();
+        assert_eq!(err, DomainError::validation(ValidationReason::InvalidState));
+    }
+
+    #[test]
+    fn rejects_unshrinkable_unit_over_token_budget() {
+        let source = "x";
+        let tokenizer = CappedTokenizer {
+            profile: ModelProfileId::from_bytes([10; 16]),
+            max_tokens: 1,
+            max_bytes: 65_536,
+            min_tokens_per_input: 2,
+        };
+        let err = run_chunks(source, &tokenizer).unwrap_err();
+        assert_eq!(
+            err,
+            DomainError::validation(ValidationReason::TokenBudgetExceeded)
+        );
+    }
 }

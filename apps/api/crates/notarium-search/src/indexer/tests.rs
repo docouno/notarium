@@ -4,7 +4,6 @@ use crate::{
     vector::{ChunkMetadata, MutableOperation, QuantizedVector, SegmentBuilder, VectorChunk},
 };
 use notarium_core::{
-    DomainResult,
     classes::DocClass,
     epoch::DataRoot,
     ids::{ContentDigest, HistoryIncarnation, ModelProfileId, NoteId, SpaceId},
@@ -24,8 +23,8 @@ impl StructuralReadPort for UnusedStructural {
         Box::pin(async { unreachable!("indexer does not read structural snapshots") })
     }
 
-    fn is_live_visible(&self, _: &SpaceContext, _: &NoteId) -> DomainResult<bool> {
-        Ok(true)
+    fn is_live_visible<'a>(&'a self, _: &'a SpaceContext, _: &'a NoteId) -> PortFuture<'a, bool> {
+        Box::pin(async { Ok(true) })
     }
 
     fn hydrate(
@@ -39,7 +38,7 @@ impl StructuralReadPort for UnusedStructural {
 }
 
 #[tokio::test]
-async fn idle_space_releases_vectors_and_reopens_its_checkpointed_wal() {
+async fn idle_space_releases_embedder_and_reopens_checkpointed_wal_after_eviction() {
     let mut entropy = [0; 16];
     getrandom::fill(&mut entropy).unwrap();
     let path = std::env::temp_dir().join(format!("search-idle-{}", hex::encode(entropy)));
@@ -61,9 +60,9 @@ async fn idle_space_releases_vectors_and_reopens_its_checkpointed_wal() {
     let key = ContentDigest::from_bytes([4; 32]);
     let vector = QuantizedVector::quantize(&[1.0; 64]).unwrap();
     epoch
-        .apply(
+        .apply_batch(
             current,
-            MutableOperation::Upsert {
+            vec![MutableOperation::Upsert {
                 note: note.clone(),
                 chunks: vec![VectorChunk {
                     metadata: ChunkMetadata {
@@ -78,13 +77,13 @@ async fn idle_space_releases_vectors_and_reopens_its_checkpointed_wal() {
                     },
                     vector: vector.clone(),
                 }],
-            },
+            }],
         )
         .unwrap();
     epoch.checkpoint(current).unwrap();
     let idle_since = Instant::now();
     let mut disk = Disk {
-        layout,
+        layout: layout.clone(),
         manifest: SearchManifest {
             scope,
             tantivy_seq: current,
@@ -104,17 +103,22 @@ async fn idle_space_releases_vectors_and_reopens_its_checkpointed_wal() {
         lexical: None,
         epoch: Some(epoch),
         embedder: None,
-        embedding_failures: 0,
-        vector_last_use: idle_since,
+        dirty_notes: BTreeSet::new(),
+        cached_vectors: HashMap::new(),
+        full_sweep_after: None,
+        full_sweep_needed: false,
+        last_activity: idle_since,
+        embedder_last_use: idle_since,
     };
-    disk.release_idle_vectors(idle_since, VECTOR_IDLE);
+    // Embedder idle keeps the lightweight mmap VectorEpoch resident.
+    disk.release_idle_embedder(idle_since + EMBEDDER_IDLE, EMBEDDER_IDLE);
     assert!(disk.epoch.is_some());
-    disk.release_idle_vectors(idle_since + VECTOR_IDLE, VECTOR_IDLE);
-    assert!(disk.epoch.is_none());
-    let reopened = disk.start_epoch_reopen().await.unwrap().unwrap();
+    let manifest = disk.manifest.clone();
+    drop(disk);
+    let reopened = open_vector_epoch(layout, &manifest).unwrap();
     assert!(reopened.is_checkpointed(current));
     assert_eq!(reopened.find_vector(key), Some(vector));
-    drop((reopened, disk));
+    drop(reopened);
     std::fs::remove_dir_all(path).unwrap();
 }
 
@@ -125,7 +129,6 @@ async fn idle_reopen_during_replacement_backoff_restores_active_embedder() {
         config::{SearchConfig, VectorMode},
         ports::{RemoteIndexingGrant, SearchModelResolverPort},
     };
-    use arc_swap::ArcSwapOption;
     use notarium_canonical::{
         CanonicalConfig, CanonicalRuntime, CreateSpaceSpec, changes::SyntheticNoteSpec,
     };
@@ -135,15 +138,15 @@ async fn idle_reopen_during_replacement_backoff_restores_active_embedder() {
         ids::{FolderId, GrantId, InstallationId, LeaseEpoch, PrincipalId, ProviderResourceId},
         model::{FolderRef, Lifecycle},
         ports::{
-            Cancellation, EmbeddingInput, EmbeddingProviderPort, EmbeddingRequest, EmbeddingResult,
-            PortFuture, ProviderRuntimeEpochs, ProviderUsage, ServiceAuthority,
+            EmbeddingInput, EmbeddingProviderPort, EmbeddingRequest, EmbeddingResult, PortFuture,
+            ProviderRuntimeEpochs, ProviderUsage, ServiceAuthority,
         },
     };
     use std::{
         collections::{BTreeMap, BTreeSet},
         sync::atomic::{AtomicBool, AtomicU8, AtomicUsize},
     };
-    use tokio::sync::{Notify, watch};
+    use tokio::sync::Notify;
 
     fn remote_target(provider: u8) -> ResolvedEmbeddingTarget {
         ResolvedEmbeddingTarget {
@@ -167,9 +170,10 @@ async fn idle_reopen_during_replacement_backoff_restores_active_embedder() {
     impl SearchModelResolverPort for SwitchingResolver {
         fn resolve_model<'a>(
             &'a self,
+            _: &'a ServiceAuthority,
             _: &'a HistoryScope,
-            _: Option<&'a FolderId>,
             _: Option<&'a ModelProfileId>,
+            _: &'a CallBudget,
         ) -> PortFuture<'a, Option<ResolvedEmbeddingTarget>> {
             Box::pin(async move { Ok(Some(remote_target(self.provider.load(Ordering::SeqCst)))) })
         }
@@ -314,13 +318,7 @@ async fn idle_reopen_during_replacement_backoff_restores_active_embedder() {
     deps.model_resolver = Some(resolver.clone());
     deps.providers = Some(provider.clone());
     let engine = SearchEngine::start(SearchConfig::new(root, VectorMode::RemoteOnly), deps);
-    let handle = Arc::new(SpaceHandle {
-        published: ArcSwapOption::empty(),
-        epoch: watch::channel(0).0,
-        wake: tokio::sync::Notify::new(),
-        stop: Cancellation::default(),
-        active_queries: std::sync::atomic::AtomicUsize::new(0),
-    });
+    let handle = Arc::new(SpaceHandle::new());
     let _pin = handle.pin_query();
     let worker_services = engine.services.clone();
     let worker_handle = handle.clone();
@@ -334,14 +332,14 @@ async fn idle_reopen_during_replacement_backoff_restores_active_embedder() {
             handle: &worker_handle,
             old: Vec::new(),
         };
-        consume_with_schedule(
-            &cx,
-            &mut publisher,
-            worker_scope,
-            Duration::from_millis(20),
-            Duration::from_millis(40),
-        )
-        .await
+        let schedule = Schedule {
+            tick: Duration::from_millis(20),
+            lexical_idle: Duration::from_millis(20),
+            embedder_idle: Duration::from_millis(40),
+            worker_idle: Duration::from_secs(300),
+            archived_idle: Duration::from_secs(30),
+        };
+        consume(&cx, &mut publisher, &Weak::new(), worker_scope, schedule).await
     });
 
     let mut epochs = handle.epoch.subscribe();
@@ -369,7 +367,7 @@ async fn idle_reopen_during_replacement_backoff_restores_active_embedder() {
         .await
         .unwrap();
 
-    // Release active query pin so idle ticks evict lexical, vector epoch, and embedder.
+    // Release active query pin so idle ticks evict lexical and active embedder.
     drop(_pin);
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -401,7 +399,7 @@ async fn idle_reopen_during_replacement_backoff_restores_active_embedder() {
     .unwrap();
     assert!(
         resumed.vectors.is_some(),
-        "vector epoch must reopen on wake"
+        "vector epoch must remain available on wake"
     );
     assert!(
         resumed.embedder.is_some(),
@@ -494,18 +492,19 @@ async fn lexical_checkpoint_is_available_while_the_native_model_is_loading() {
         .seed(SegmentBuilder::new(&model, 64).unwrap(), base)
         .unwrap();
     drop(epoch);
+    let target = ResolvedEmbeddingTarget {
+        model,
+        dimension: 64,
+        max_input_tokens: 512,
+        backend: EmbeddingBackendTarget::LocalOnnx,
+    };
     let manifest = SearchManifest {
         scope: scope.clone(),
         tantivy_seq: base,
         tantivy_commit: lexical.commit_id().unwrap(),
         active_index_dir: crate::layout::index_name(1),
         tokenizer_version: TOKENIZER_VERSION,
-        active_model: Some(ResolvedEmbeddingTarget {
-            model,
-            dimension: 64,
-            max_input_tokens: 512,
-            backend: EmbeddingBackendTarget::LocalOnnx,
-        }),
+        active_model: Some(target.clone()),
         vector_seq: Some(base),
         embeddings_pending: false,
     };
@@ -521,7 +520,11 @@ async fn lexical_checkpoint_is_available_while_the_native_model_is_loading() {
         ),
         SearchDependencies::new(store.clone(), Arc::new(UnusedStructural)),
     );
-    let loading = engine.services.models.hold_loading().await;
+    let loading = engine
+        .services
+        .models
+        .hold_loading(target.vector_model())
+        .await;
     let handle = engine.space(scope.clone()).unwrap();
     let pin = handle.pin_query();
     let mut updates = handle.epoch.subscribe();
@@ -580,6 +583,37 @@ async fn lexical_checkpoint_is_available_while_the_native_model_is_loading() {
     .expect("lexical edits must progress while ONNX loading is blocked");
     drop((pin, loading));
     engine.shutdown().await;
+    runtime.shutdown().await.unwrap();
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[tokio::test]
+async fn arc_search_engine_shutdown_is_idempotent() {
+    use crate::{
+        SearchDependencies, SearchEngine,
+        config::{SearchConfig, VectorMode},
+    };
+    use notarium_canonical::{CanonicalConfig, CanonicalRuntime};
+    use notarium_core::ids::InstallationId;
+
+    let mut entropy = [0u8; 16];
+    getrandom::fill(&mut entropy).unwrap();
+    let path = std::env::temp_dir().join(format!("search-arc-shutdown-{}", hex::encode(entropy)));
+    std::fs::create_dir(&path).unwrap();
+    let root = DataRoot::new(&path);
+    let (store, runtime) = CanonicalRuntime::open(CanonicalConfig::local_default(
+        InstallationId::from_bytes([9; 16]),
+        root.clone(),
+    ))
+    .await
+    .unwrap();
+    let engine = Arc::new(SearchEngine::start(
+        SearchConfig::new(root, VectorMode::Disabled),
+        SearchDependencies::new(Arc::new(store), Arc::new(UnusedStructural)),
+    ));
+    engine.shutdown().await;
+    engine.shutdown().await;
+    assert_eq!(engine.worker_count(), 0);
     runtime.shutdown().await.unwrap();
     std::fs::remove_dir_all(path).unwrap();
 }

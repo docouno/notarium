@@ -1,5 +1,5 @@
 use super::support::{Fixture, Projection};
-use notarium_canonical::{CreateFolderSpec, CreateSpaceSpec, changes::SyntheticNoteSpec};
+use notarium_canonical::{CreateSpaceSpec, changes::SyntheticNoteSpec};
 use notarium_core::{
     auth::{EngineAuthContext, SpaceGrant, SpaceKind, SpaceRole, VerifiedHuman},
     classes::{DocClass, ProviderAudience, ProviderPolicy},
@@ -35,7 +35,7 @@ use std::{
 };
 use tokio::sync::Notify;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Event {
     Background(usize),
     Query,
@@ -53,9 +53,10 @@ struct Probe {
 impl SearchModelResolverPort for Probe {
     fn resolve_model<'a>(
         &'a self,
+        _: &'a ServiceAuthority,
         _: &'a HistoryScope,
-        _: Option<&'a FolderId>,
         _: Option<&'a ModelProfileId>,
+        _: &'a CallBudget,
     ) -> PortFuture<'a, Option<ResolvedEmbeddingTarget>> {
         Box::pin(async move {
             Ok(Some(ResolvedEmbeddingTarget {
@@ -163,7 +164,11 @@ fn context(
     SpaceContext::new(auth, scope.clone(), budget)
 }
 
-async fn small_space(fixture: &Fixture, tag: u8, body: &str) -> Result<Projection, Box<dyn Error>> {
+async fn space_with_body(
+    fixture: &Fixture,
+    tag: u8,
+    carrier: String,
+) -> Result<Projection, Box<dyn Error>> {
     let root = FolderId::from_bytes([tag; 16]);
     let lease = LeaseEpoch::new(1)?;
     let space = fixture
@@ -189,75 +194,126 @@ async fn small_space(fixture: &Fixture, tag: u8, body: &str) -> Result<Projectio
             &fixture.owner,
             vec![SyntheticNoteSpec {
                 note_id: note.clone(),
-                parent_folder: Some(root),
+                parent_folder: Some(root.clone()),
                 slug: "seed".into(),
                 title: "Priority exercise".into(),
                 doc_class: DocClass::UserDoc,
                 lifecycle: Lifecycle::Active,
-                carrier: format!("# Priority exercise\n\n{body}\n"),
+                carrier,
                 fields: BTreeMap::new(),
             }],
         )
         .await?;
-    Ok(Projection {
-        cut: SnapshotCut {
+    Ok(Projection::single_folder(
+        fixture.store.clone(),
+        SnapshotCut {
             scope: space.scope,
             generation: ProjectionGeneration::new(1)?,
             canonical_seq: cut.last_seq,
             projected_seq: cut.last_seq,
         },
-        notes: vec![note],
-    })
+        root,
+        vec![note],
+    ))
+}
+
+fn multi_quantum_carrier(sections: usize) -> String {
+    let mut body = String::from("# Priority exercise\n\n");
+    for idx in 1..=sections {
+        body.push_str(&format!(
+            "## Section {idx:02}\n\nDistinct quantum backfill paragraph {idx:02} for preemption.\n\n"
+        ));
+    }
+    body
 }
 
 pub async fn measure(fixture: &Fixture) -> Result<(usize, [usize; 3]), Box<dyn Error>> {
-    let query_view = small_space(fixture, 0x40, "interactive retrieval").await?;
-    let competing_view = small_space(fixture, 0x41, "independent bulk import").await?;
-    let bulk = &fixture.projection.cut.scope;
+    let query_view = space_with_body(
+        fixture,
+        0x40,
+        "# Priority exercise\n\ninteractive retrieval\n".into(),
+    )
+    .await?;
+    // 24 distinct sections split into a full 16-chunk quantum followed by an
+    // 8-chunk tail so interactive search proves preemption mid-note.
+    let bulk_view = space_with_body(fixture, 0x42, multi_quantum_carrier(24)).await?;
+    let competing_view = space_with_body(
+        fixture,
+        0x41,
+        "# Priority exercise\n\nindependent bulk import\n".into(),
+    )
+    .await?;
+    let query_cut = query_view.cut();
+    let bulk_cut = bulk_view.cut();
+    let competing_cut = competing_view.cut();
     let probe = Arc::new(Probe {
-        bulk: bulk.space_id.clone(),
-        query: query_view.cut.scope.space_id.clone(),
+        bulk: bulk_cut.scope.space_id.clone(),
+        query: query_cut.scope.space_id.clone(),
         first: AtomicBool::new(true),
         bulk_started: Notify::new(),
         release_bulk: Notify::new(),
         events: Mutex::new(Vec::new()),
     });
-    let mut deps = SearchDependencies::new(fixture.store.clone(), Arc::new(query_view.clone()));
+    let mut deps = SearchDependencies::new(fixture.store.clone(), Arc::new(query_view));
     deps.model_resolver = Some(probe.clone());
     deps.providers = Some(probe.clone());
     let engine = SearchEngine::start(
         SearchConfig::new(fixture.root.clone(), VectorMode::RemoteOnly),
         deps,
     );
-    engine.start_space(query_view.cut.scope.clone())?;
+    engine.start_space(query_cut.scope.clone())?;
     let run = async {
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
-                if fixture.store.min_consumer_watermark(&query_view.cut.scope.space_id, &query_view.cut.scope.incarnation)
-                    .is_some_and(|seq| seq >= query_view.cut.projected_seq) { break; }
+                if fixture
+                    .store
+                    .min_consumer_watermark(
+                        &query_cut.scope.space_id,
+                        &query_cut.scope.incarnation,
+                    )
+                    .is_some_and(|seq| seq >= query_cut.projected_seq)
+                {
+                    break;
+                }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-        }).await?;
-        engine.start_space(bulk.clone())?;
-        fixture.store.create_folder(CreateFolderSpec {
-            scope: bulk.clone(), active_epoch: LeaseEpoch::new(1)?, folder_id: FolderId::from_bytes([0x42; 16]),
-            parent: None, slug: "start-model-backfill".into(), display_name: "Start model backfill".into(),
-            is_project: false, project_slug: None, actor: fixture.owner.clone(), timestamp: None,
-        }).await?;
+        })
+        .await?;
+        engine.start_space(bulk_cut.scope.clone())?;
         tokio::time::timeout(Duration::from_secs(30), probe.bulk_started.notified()).await?;
-        engine.start_space(competing_view.cut.scope.clone())?;
+        engine.start_space(competing_cut.scope.clone())?;
         wait_for_queued(&engine, 2).await?;
-        let query = engine.search(context(&fixture.owner, &query_view.cut.scope, CallBudget {
-            request: RequestId::from_bytes([0x40; 16]), cancellation: Cancellation::default(), remaining: Duration::from_secs(5),
-        })?, SearchQuery {
-            text: "interactive".into(), filter: FieldFilterAstV1 { version: 1, predicate: Predicate::All(Vec::new()) },
-            classes: BTreeSet::from([DocClass::UserDoc]), folder: None, causal: CausalBasis::Exact(Default::default()),
-            include_chats: false, top_k: PageLimit::new(1)?, model: Some(ModelProfileId::from_bytes([0x19; 16])),
-        });
+        let query = engine.search(
+            context(
+                &fixture.owner,
+                &query_cut.scope,
+                CallBudget {
+                    request: RequestId::from_bytes([0x40; 16]),
+                    cancellation: Cancellation::default(),
+                    remaining: Duration::from_secs(5),
+                },
+            )?,
+            SearchQuery {
+                text: "interactive".into(),
+                filter: FieldFilterAstV1 {
+                    version: 1,
+                    predicate: Predicate::All(Vec::new()),
+                },
+                classes: BTreeSet::from([DocClass::UserDoc]),
+                folder: None,
+                causal: CausalBasis::Exact(Default::default()),
+                include_chats: false,
+                top_k: PageLimit::new(1)?,
+                model: Some(ModelProfileId::from_bytes([0x19; 16])),
+            },
+        );
         let release = async {
             let depths = wait_for_queued(&engine, 0).await?;
             if depths != [1, 0, 1] {
-                return Err("expected one queued request in each competing lane".into());
+                return Err(format!(
+                    "expected one queued request in lanes 0 and 2, observed {depths:?}"
+                )
+                .into());
             }
             probe.release_bulk.notify_one();
             Ok::<_, Box<dyn Error>>(depths)
@@ -270,13 +326,19 @@ pub async fn measure(fixture: &Fixture) -> Result<(usize, [usize; 3]), Box<dyn E
                 (query.await?, depths)
             }
         };
-        if response.degraded.is_some() { return Err("interactive embedding degraded during bounded backfill".into()); }
+        if response.degraded.is_some() {
+            return Err("interactive embedding degraded during bounded backfill".into());
+        }
         let events = probe.events.lock().unwrap();
         match events.as_slice() {
-            [Event::Background(count), Event::Query, ..] => Ok((*count, depths)),
-            _ => Err("interactive work did not start after the active background quantum".into()),
+            [Event::Background(count), Event::Query, ..] if *count == 16 => Ok((*count, depths)),
+            other => Err(format!(
+                "expected 16-chunk background quantum preempted by interactive query, got {other:?}"
+            )
+            .into()),
         }
-    }.await;
+    }
+    .await;
     probe.release_bulk.notify_one();
     engine.shutdown().await;
     run

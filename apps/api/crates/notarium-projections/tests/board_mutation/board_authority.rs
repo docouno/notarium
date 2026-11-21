@@ -305,8 +305,8 @@ async fn purge_reseed_refreshes_only_after_readiness(
     assert_eq!(ready.seq, SpaceSeq::ZERO);
     let snapshot = engine.acquire_snapshot(owner, causal()).await.unwrap();
     assert_eq!(snapshot.cut().projected_seq, purged.receipt.seq());
-    assert!(snapshot.lookup(&retained.note).is_some());
-    assert!(snapshot.lookup(&erased.note).is_none());
+    assert!(snapshot.lookup(&retained.note).unwrap().is_some());
+    assert!(snapshot.lookup(&erased.note).unwrap().is_none());
 }
 
 async fn implicit_root_source(store: &CanonicalStore, runtime: &ProjectorRuntime) {
@@ -476,7 +476,12 @@ async fn stale_board_aggregate(store: &CanonicalStore, runtime: &ProjectorRuntim
     );
     request.preconditions.revision = Some(card.revision);
     let moved = store.move_note(owner.clone(), request).await.unwrap();
-    assert!(!engine.is_live_visible(&subscriber, &card.note).unwrap());
+    assert!(
+        !engine
+            .is_live_visible(&subscriber, &card.note)
+            .await
+            .unwrap()
+    );
     {
         let held = tokio::time::timeout(Duration::from_secs(5), pause.reached())
             .await
@@ -600,11 +605,13 @@ async fn hidden_stale_board_aggregate(store: &CanonicalStore, runtime: &Projecto
     assert!(
         !engine
             .is_live_visible(&subscriber, &hidden_view.note)
+            .await
             .unwrap()
     );
     assert!(
         engine
             .is_live_visible(&subscriber, &cross_project.note)
+            .await
             .unwrap()
     );
     assert!(

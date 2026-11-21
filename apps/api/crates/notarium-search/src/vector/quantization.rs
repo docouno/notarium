@@ -15,20 +15,22 @@ impl QuantizedVector {
             .iter()
             .map(|&value| f64::from(value).powi(2))
             .sum::<f64>();
-        if !squared_norm.is_finite() || squared_norm == 0.0 {
+        if !squared_norm.is_finite() || squared_norm <= 0.0 {
             return Err(VectorError::InvalidVector);
         }
-        let norm = squared_norm.sqrt().max(1e-12);
+        let norm = squared_norm.sqrt();
+        if !norm.is_finite() || norm <= 0.0 {
+            return Err(VectorError::InvalidVector);
+        }
         let abs_max = values
             .iter()
             .map(|&value| f64::from(value).abs())
             .fold(0.0, f64::max)
             / norm;
-        let scale = if abs_max < 1e-12 {
-            1.0
-        } else {
-            (abs_max / 127.0) as f32
-        };
+        let scale = (abs_max / 127.0) as f32;
+        if !scale.is_finite() || scale <= 0.0 || scale > 1.0 {
+            return Err(VectorError::InvalidVector);
+        }
         let denominator = norm * f64::from(scale);
         let mut quantized: Vec<i8> = values
             .iter()

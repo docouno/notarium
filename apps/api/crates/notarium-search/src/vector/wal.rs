@@ -3,7 +3,7 @@
 use super::{
     ChunkMetadata, MAX_DIMENSION, MIN_DIMENSION, QuantizedVector, VectorChunk, VectorError,
 };
-use crate::layout::atomic_file;
+use crate::layout::{atomic_file, atomic_write_with, sync_dir};
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::{
     ambient_authority,
@@ -11,20 +11,21 @@ use cap_std::{
 };
 use notarium_core::ids::{NoteId, SpaceSeq};
 use std::{
-    collections::BTreeMap,
-    io::{self, BufReader, Read, Write},
+    collections::{BTreeMap, HashMap},
+    io::{self, BufReader, BufWriter, Read, Write},
     path::Path,
     sync::Arc,
     time::{Duration, Instant},
 };
 
 pub const L0_MAX_CHUNKS: usize = 25_000;
+pub const L0_MAX_BYTES: usize = 16 * 1024 * 1024;
 const MIN_TIMED_FLUSH_CHUNKS: usize = 4096;
 const TIMED_FLUSH: Duration = Duration::from_secs(60);
 const FRAME_MAGIC: &[u8; 4] = b"L0W1";
 const FRAME_HEADER: usize = 17;
 const CHECKSUM_BYTES: usize = 32;
-const MAX_PAYLOAD_BYTES: usize = 128 * 1024 * 1024;
+const MAX_PAYLOAD_BYTES: usize = 32 * 1024 * 1024;
 const MIN_REWRITE_BYTES: u64 = 1024 * 1024;
 const WAL_NAME: &str = "l0.wal";
 
@@ -36,7 +37,7 @@ pub enum MutableOperation {
     Delete(NoteId),
 }
 impl MutableOperation {
-    fn note(&self) -> &NoteId {
+    pub(super) fn note(&self) -> &NoteId {
         match self {
             Self::Upsert { note, .. } | Self::Delete(note) => note,
         }
@@ -49,11 +50,19 @@ impl MutableOperation {
     }
 }
 
+pub(super) struct FlushSnapshot {
+    pub(super) flushed_seq: SpaceSeq,
+    pub(super) flushed_gen: u64,
+    pub(super) entries: Vec<(NoteId, Arc<Vec<VectorChunk>>)>,
+}
+
 struct Record {
     seq: SpaceSeq,
+    write_gen: u64,
     chunks: Arc<Vec<VectorChunk>>,
     deleted: bool,
     frame_bytes: u64,
+    mem_bytes: usize,
 }
 
 pub struct MutableBuffer {
@@ -61,7 +70,9 @@ pub struct MutableBuffer {
     dimension: usize,
     entries: BTreeMap<NoteId, Record>,
     chunks: usize,
+    mem_bytes: usize,
     last_seq: SpaceSeq,
+    write_gen: u64,
     first_dirty: Option<Instant>,
     failed_write: bool,
     journal_bytes: u64,
@@ -79,7 +90,9 @@ impl MutableBuffer {
             dimension,
             entries: BTreeMap::new(),
             chunks: 0,
+            mem_bytes: 0,
             last_seq: SpaceSeq::ZERO,
+            write_gen: 0,
             first_dirty: None,
             failed_write: false,
             journal_bytes: 0,
@@ -101,7 +114,8 @@ impl MutableBuffer {
         let mut input = BufReader::new(file);
         while let Some((seq, operation, frame_bytes)) = read_record(&mut input, dimension)? {
             buffer.admit(seq, &operation)?;
-            buffer.apply_memory(seq, operation, frame_bytes);
+            let mem_bytes = operation_mem_bytes(&operation, dimension);
+            buffer.apply_memory(seq, operation, frame_bytes, mem_bytes);
         }
         Ok(buffer)
     }
@@ -112,8 +126,14 @@ impl MutableBuffer {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+    pub fn mem_bytes(&self) -> usize {
+        self.mem_bytes
+    }
     pub fn last_seq(&self) -> SpaceSeq {
         self.last_seq
+    }
+    pub(super) fn is_failed(&self) -> bool {
+        self.failed_write
     }
     pub fn supersedes(&self, note: &NoteId) -> bool {
         self.entries.contains_key(note)
@@ -138,21 +158,73 @@ impl MutableBuffer {
             .map(|(note, record)| (note.clone(), record.chunks.clone()))
             .collect()
     }
+
+    pub(super) fn snapshot_for_flush(&self) -> FlushSnapshot {
+        let entries = self
+            .entries
+            .iter()
+            .map(|(note, record)| (note.clone(), record.chunks.clone()))
+            .collect();
+        FlushSnapshot {
+            flushed_seq: self.last_seq,
+            flushed_gen: self.write_gen,
+            entries,
+        }
+    }
+
+    pub(super) fn notes_after_gen(&self, flushed_gen: u64) -> impl Iterator<Item = &NoteId> {
+        self.entries
+            .iter()
+            .filter(move |(_, record)| record.write_gen > flushed_gen)
+            .map(|(note, _)| note)
+    }
+
     pub fn should_flush(&self, now: Instant) -> bool {
         self.chunks >= L0_MAX_CHUNKS
             || self.entries.len() >= L0_MAX_CHUNKS
+            || self.mem_bytes >= L0_MAX_BYTES
             || (self.chunks >= MIN_TIMED_FLUSH_CHUNKS
                 && self
                     .first_dirty
                     .is_some_and(|start| now.saturating_duration_since(start) >= TIMED_FLUSH))
     }
 
+    pub(super) fn exceeds_single_limit(&self, operation: &MutableOperation) -> bool {
+        match operation {
+            MutableOperation::Delete(_) => false,
+            MutableOperation::Upsert { .. } => {
+                operation.count() > L0_MAX_CHUNKS
+                    || operation_mem_bytes(operation, self.dimension) > L0_MAX_BYTES
+                    || estimate_encoded_bytes(operation, self.dimension) > MAX_PAYLOAD_BYTES
+            }
+        }
+    }
+
     pub fn apply(&mut self, seq: SpaceSeq, operation: MutableOperation) -> Result<(), VectorError> {
+        self.apply_batch(seq, vec![operation])
+    }
+
+    pub fn apply_batch(
+        &mut self,
+        seq: SpaceSeq,
+        operations: Vec<MutableOperation>,
+    ) -> Result<(), VectorError> {
+        if operations.is_empty() {
+            return Ok(());
+        }
         if self.failed_write {
             return Err(VectorError::CorruptIndex);
         }
-        self.admit(seq, &operation)?;
-        let frame = encode(seq, &operation)?;
+        self.admit_batch(seq, &operations)?;
+        let mut encoded = Vec::new();
+        let mut frame_sizes = Vec::with_capacity(operations.len());
+        let mut mem_sizes = Vec::with_capacity(operations.len());
+        for operation in &operations {
+            let start = encoded.len();
+            encode_into(&mut encoded, seq, operation)?;
+            frame_sizes.push((encoded.len() - start) as u64);
+            mem_sizes.push(operation_mem_bytes(operation, self.dimension));
+        }
         let was_present = match self.directory.symlink_metadata(WAL_NAME) {
             Ok(meta) if meta.is_file() => true,
             Ok(_) => return Err(VectorError::CorruptIndex),
@@ -168,13 +240,10 @@ impl MutableBuffer {
         // prior in-memory image and make retry reopen/rebuild from disk.
         let write = (|| {
             let mut file = self.directory.open_with(WAL_NAME, &options)?;
-            file.write_all(&frame)?;
+            file.write_all(&encoded)?;
             file.sync_data()?;
             if !was_present {
-                use cap_fs_ext::OpenOptionsMaybeDirExt;
-                self.directory
-                    .open_with(".", OpenOptions::new().read(true).maybe_dir(true))?
-                    .sync_all()?;
+                sync_dir(&self.directory)?;
             }
             Ok::<_, VectorError>(())
         })();
@@ -182,13 +251,23 @@ impl MutableBuffer {
             self.failed_write = true;
             return Err(error);
         }
-        self.apply_memory(seq, operation, frame.len() as u64);
-        if self.journal_bytes - self.live_bytes >= self.live_bytes.max(MIN_REWRITE_BYTES) {
-            match self.rewrite(None) {
+        for ((operation, frame_bytes), mem_bytes) in
+            operations.into_iter().zip(frame_sizes).zip(mem_sizes)
+        {
+            self.apply_memory(seq, operation, frame_bytes, mem_bytes);
+        }
+        if self.journal_bytes.saturating_sub(self.live_bytes)
+            >= self.live_bytes.max(MIN_REWRITE_BYTES)
+        {
+            // The append is already synced and durable; atomic_write_with leaves
+            // the prior WAL intact on failure. Retain it and retry compaction later.
+            match self.rewrite() {
                 Ok(bytes) => self.journal_bytes = bytes,
                 Err(error) => {
-                    self.failed_write = true;
-                    return Err(error);
+                    tracing::warn!(
+                        %error,
+                        "vector L0 WAL compaction failed; retaining appended journal"
+                    );
                 }
             }
         }
@@ -200,48 +279,89 @@ impl MutableBuffer {
         seq: SpaceSeq,
         operation: &MutableOperation,
     ) -> Result<(), VectorError> {
+        self.admit_batch(seq, std::slice::from_ref(operation))
+    }
+
+    pub(super) fn admit_batch(
+        &self,
+        seq: SpaceSeq,
+        operations: &[MutableOperation],
+    ) -> Result<(), VectorError> {
         if seq < self.last_seq || seq == SpaceSeq::ZERO {
             return Err(VectorError::CorruptIndex);
         }
-        let existing = self
-            .entries
-            .get(operation.note())
-            .map_or(0, |record| record.chunks.len());
-        if self.chunks - existing + operation.count() > L0_MAX_CHUNKS
-            || (self.entries.len() == L0_MAX_CHUNKS && !self.entries.contains_key(operation.note()))
-        {
-            return Err(VectorError::BufferFull);
-        }
-        if let MutableOperation::Upsert { note, chunks } = operation {
-            for chunk in chunks {
-                if &chunk.metadata.note != note {
-                    return Err(VectorError::InvalidChunk);
+        let mut projected_chunks = self.chunks;
+        let mut projected_bytes = self.mem_bytes;
+        let mut projected_entries = self.entries.len();
+        let mut batch_state: HashMap<&NoteId, (usize, usize)> = HashMap::new();
+        for operation in operations {
+            if let MutableOperation::Upsert { note, chunks } = operation {
+                for chunk in chunks {
+                    if &chunk.metadata.note != note {
+                        return Err(VectorError::InvalidChunk);
+                    }
+                    chunk.validate(self.dimension)?;
                 }
-                chunk.validate(self.dimension)?;
+            }
+            let note = operation.note();
+            let op_chunks = operation.count();
+            let op_bytes = operation_mem_bytes(operation, self.dimension);
+            let (prev_chunks, prev_bytes) = if let Some(&prev) = batch_state.get(note) {
+                prev
+            } else if let Some(record) = self.entries.get(note) {
+                (record.chunks.len(), record.mem_bytes)
+            } else {
+                projected_entries += 1;
+                (0, 0)
+            };
+            projected_chunks = projected_chunks
+                .saturating_sub(prev_chunks)
+                .saturating_add(op_chunks);
+            projected_bytes = projected_bytes
+                .saturating_sub(prev_bytes)
+                .saturating_add(op_bytes);
+            batch_state.insert(note, (op_chunks, op_bytes));
+            if projected_chunks > L0_MAX_CHUNKS
+                || projected_entries > L0_MAX_CHUNKS
+                || projected_bytes > L0_MAX_BYTES
+            {
+                return Err(VectorError::BufferFull);
             }
         }
         Ok(())
     }
 
-    fn apply_memory(&mut self, seq: SpaceSeq, operation: MutableOperation, frame_bytes: u64) {
+    fn apply_memory(
+        &mut self,
+        seq: SpaceSeq,
+        operation: MutableOperation,
+        frame_bytes: u64,
+        mem_bytes: usize,
+    ) {
         let (note, chunks, deleted) = match operation {
             MutableOperation::Upsert { note, chunks } => (note, chunks, false),
             MutableOperation::Delete(note) => (note, Vec::new(), true),
         };
+        self.write_gen = self.write_gen.wrapping_add(1);
+        let write_gen = self.write_gen;
         self.chunks += chunks.len();
+        self.mem_bytes += mem_bytes;
         self.journal_bytes += frame_bytes;
         self.live_bytes += frame_bytes;
         if let Some(old) = self.entries.insert(
             note,
             Record {
                 seq,
+                write_gen,
                 chunks: Arc::new(chunks),
                 deleted,
                 frame_bytes,
+                mem_bytes,
             },
         ) {
             self.chunks -= old.chunks.len();
-            self.live_bytes -= old.frame_bytes;
+            self.mem_bytes -= old.mem_bytes;
+            self.live_bytes = self.live_bytes.saturating_sub(old.frame_bytes);
         }
         self.last_seq = seq;
         self.first_dirty.get_or_insert_with(Instant::now);
@@ -252,6 +372,7 @@ impl MutableBuffer {
         atomic_file(&self.directory, WAL_NAME, &[])?;
         self.entries.clear();
         self.chunks = 0;
+        self.mem_bytes = 0;
         self.journal_bytes = 0;
         self.live_bytes = 0;
         self.first_dirty = None;
@@ -259,47 +380,111 @@ impl MutableBuffer {
         Ok(())
     }
 
-    /// Remove every on-disk frame for a purged note after L1 has been scrubbed.
-    pub fn scrub_note(&mut self, purged: &NoteId) -> Result<(), VectorError> {
-        self.journal_bytes = self.rewrite(Some(purged))?;
-        if let Some(record) = self.entries.remove(purged) {
-            self.chunks -= record.chunks.len();
-            self.live_bytes -= record.frame_bytes;
+    /// Drop entries up to `flushed_gen` after the immutable replacement is
+    /// published, keeping any concurrent writes newer than `flushed_gen`
+    /// (including same-`SpaceSeq` overwrites).
+    pub(super) fn prune_flushed(&mut self, flushed_gen: u64) -> Result<(), VectorError> {
+        if self.failed_write {
+            return Err(VectorError::CorruptIndex);
         }
-        self.failed_write = false;
+        if self
+            .entries
+            .values()
+            .all(|record| record.write_gen <= flushed_gen)
+        {
+            return self.reset_after_flush();
+        }
+        let written = self.rewrite_filtered(flushed_gen)?;
+        self.entries
+            .retain(|_, record| record.write_gen > flushed_gen);
+        self.chunks = self
+            .entries
+            .values()
+            .map(|record| record.chunks.len())
+            .sum();
+        self.mem_bytes = self.entries.values().map(|record| record.mem_bytes).sum();
+        self.journal_bytes = written;
+        self.live_bytes = written;
+        self.first_dirty = Some(Instant::now());
         Ok(())
     }
 
-    fn rewrite(&self, excluded: Option<&NoteId>) -> Result<u64, VectorError> {
+    fn rewrite(&self) -> Result<u64, VectorError> {
+        self.rewrite_filtered(0)
+    }
+
+    fn rewrite_filtered(&self, min_write_gen: u64) -> Result<u64, VectorError> {
         let mut records: Vec<_> = self
             .entries
             .iter()
-            .filter(|(note, _)| Some(*note) != excluded)
+            .filter(|(_, record)| record.write_gen > min_write_gen)
             .collect();
-        records.sort_unstable_by_key(|(_, record)| record.seq);
-        let mut replacement = Vec::new();
-        for (note, record) in records {
-            encode_record(
-                &mut replacement,
-                record.seq,
-                note,
-                &record.chunks,
-                record.deleted,
-            )?;
-        }
-        atomic_file(&self.directory, WAL_NAME, &replacement)?;
-        Ok(replacement.len() as u64)
+        records.sort_unstable_by_key(|(_, record)| (record.seq, record.write_gen));
+        let mut written = 0u64;
+        atomic_write_with::<VectorError>(&self.directory, WAL_NAME, |file| {
+            let mut writer = BufWriter::with_capacity(64 * 1024, file);
+            let mut scratch = Vec::new();
+            for (note, record) in records {
+                scratch.clear();
+                encode_record(
+                    &mut scratch,
+                    record.seq,
+                    note,
+                    &record.chunks,
+                    record.deleted,
+                )?;
+                writer.write_all(&scratch)?;
+                written += scratch.len() as u64;
+            }
+            writer.flush()?;
+            Ok(())
+        })?;
+        Ok(written)
     }
 }
 
-fn encode(seq: SpaceSeq, operation: &MutableOperation) -> Result<Vec<u8>, VectorError> {
+fn operation_mem_bytes(operation: &MutableOperation, dimension: usize) -> usize {
+    let stride = dimension.next_multiple_of(64);
+    let note_bytes = operation.note().as_str().len().saturating_add(64);
+    match operation {
+        MutableOperation::Delete(_) => note_bytes,
+        MutableOperation::Upsert { chunks, .. } => chunks
+            .iter()
+            .map(|chunk| {
+                stride.saturating_add(160).saturating_add(
+                    (chunk.metadata.context.len() + chunk.metadata.spans.len()) * 16,
+                )
+            })
+            .fold(note_bytes, usize::saturating_add),
+    }
+}
+
+fn estimate_encoded_bytes(operation: &MutableOperation, dimension: usize) -> usize {
+    let stride = dimension.next_multiple_of(64);
+    let header = operation.note().as_str().len().saturating_add(64);
+    match operation {
+        MutableOperation::Delete(_) => header,
+        MutableOperation::Upsert { chunks, .. } => chunks
+            .iter()
+            .map(|chunk| {
+                stride.saturating_add(512).saturating_add(
+                    (chunk.metadata.context.len() + chunk.metadata.spans.len()) * 48,
+                )
+            })
+            .fold(header, usize::saturating_add),
+    }
+}
+
+fn encode_into(
+    out: &mut Vec<u8>,
+    seq: SpaceSeq,
+    operation: &MutableOperation,
+) -> Result<(), VectorError> {
     let (note, chunks, deleted) = match operation {
         MutableOperation::Upsert { note, chunks } => (note, chunks.as_slice(), false),
         MutableOperation::Delete(note) => (note, &[][..], true),
     };
-    let mut bytes = Vec::new();
-    encode_record(&mut bytes, seq, note, chunks, deleted)?;
-    Ok(bytes)
+    encode_record(out, seq, note, chunks, deleted)
 }
 
 fn encode_record(
@@ -359,8 +544,13 @@ fn read_record(
     if len > MAX_PAYLOAD_BYTES {
         return Err(VectorError::CorruptIndex);
     }
-    let mut payload = vec![0u8; len];
-    read_complete(input, &mut payload)?;
+    // Bound initial allocation before reading so a truncated 17-byte header
+    // claiming a 32 MiB payload cannot trigger an OOM allocation.
+    let mut payload = Vec::with_capacity(len.min(64 * 1024));
+    let read = input.by_ref().take(len as u64).read_to_end(&mut payload)?;
+    if read != len {
+        return Err(VectorError::CorruptIndex);
+    }
     let mut checksum = [0u8; CHECKSUM_BYTES];
     read_complete(input, &mut checksum)?;
     let mut expected = blake3::Hasher::new();
@@ -380,7 +570,7 @@ fn read_record(
     }
     let operation = match op {
         1 => {
-            let mut chunks = Vec::with_capacity(count);
+            let mut chunks = Vec::with_capacity(count.min(1024));
             let stride = dimension.next_multiple_of(64);
             for _ in 0..count {
                 let len =

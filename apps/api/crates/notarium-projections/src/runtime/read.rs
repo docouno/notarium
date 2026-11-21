@@ -1138,7 +1138,7 @@ impl ProjectionEngine {
                 .hydrate_current_cards(ctx.scope(), cut.cut.projected_seq, ids)
                 .await?
         {
-            let permit = cut.live.try_read()?;
+            let permit = cut.live.read(&ctx.budget).await?;
             if let Some(expected_head) = require_head {
                 ensure_active_head(&permit, expected_head)?;
             } else if permit.space().lifecycle != SpaceLifecycle::Active {
@@ -1185,7 +1185,7 @@ impl ProjectionEngine {
             }
         }
         let planned = self.hydration_plan(ctx, cut, ids, overlay).await?;
-        let permit = cut.live.try_read()?;
+        let permit = cut.live.read(&ctx.budget).await?;
         if let Some(expected_head) = require_head {
             ensure_active_head(&permit, expected_head)?;
         } else if permit.space().lifecycle != SpaceLifecycle::Active {
@@ -1416,6 +1416,31 @@ fn authorize_query(
     Ok(entry)
 }
 
+/// Untainted entry-folder visibility check for probes (`is_live_visible`,
+/// `filter_live_visible`) that must not taint cross-space callers before a
+/// live note is confirmed visible.
+fn can_view_query_entry(
+    permit: &LiveReadPermit,
+    ctx: &SpaceContext,
+    root: &FolderId,
+    requested: Option<&FolderId>,
+    active_only: bool,
+) -> Result<FolderId, PortError> {
+    let grant = ctx
+        .auth()
+        .spaces()
+        .get(&ctx.scope().space_id)
+        .ok_or(DomainError::ResourceNotFound)?;
+    let entry = query::entry_folder(grant, root, requested).clone();
+    ctx.check_current(permit.scope())?;
+    let facts = permit
+        .active_folder_facts(&entry, active_only)
+        .ok_or(DomainError::ResourceNotFound)?;
+    ctx.auth()
+        .can_view_folder(permit.space(), &entry, &facts.ancestor_folders)?;
+    Ok(entry)
+}
+
 pub(super) fn ensure_active(
     permit: &LiveReadPermit,
     ctx: &SpaceContext,
@@ -1520,7 +1545,7 @@ async fn next_visibility_batch(
 ) -> Result<LiveReadPermit, PortError> {
     tokio::task::yield_now().await;
     // The same handle validates its history and lease epoch on each acquisition.
-    let permit = cut.live.try_read()?;
+    let permit = cut.live.read(&ctx.budget).await?;
     ctx.check_current(permit.scope())?;
     if permit.space().lifecycle != SpaceLifecycle::Active {
         return Err(DomainError::ResourceNotFound.into());
@@ -1835,16 +1860,25 @@ impl Snapshot {
         Ok(result)
     }
 
-    fn maintenance(&self) -> Result<MaintenanceContext, PortError> {
+    fn budget(&self) -> Result<CallBudget, PortError> {
         let mut budget = self.ctx.budget.clone();
         budget.remaining = self.remaining()?;
+        Ok(budget)
+    }
+
+    async fn read_live(&self) -> Result<LiveReadPermit, PortError> {
+        self.live.read(&self.budget()?).await
+    }
+
+    fn maintenance(&self) -> Result<MaintenanceContext, PortError> {
         Ok(MaintenanceContext {
             authority: self.authority.clone(),
-            budget,
+            budget: self.budget()?,
         })
     }
 
     async fn historical_folders(&self) -> Result<&HistoricalFolders, PortError> {
+        const MAX_HISTORICAL_FOLDERS: usize = 16_384;
         self.historical_folders
             .get_or_try_init(|| async {
                 let mut parents = BTreeMap::new();
@@ -1864,6 +1898,9 @@ impl Snapshot {
                     for row in page.rows {
                         let folder = row.metadata;
                         if folder.lifecycle == Lifecycle::Active {
+                            if parents.len() >= MAX_HISTORICAL_FOLDERS {
+                                return Err(stale());
+                            }
                             if let Some(parent) = &folder.parent_folder_id {
                                 children
                                     .entry(parent.clone())
@@ -1890,7 +1927,7 @@ impl Snapshot {
         folder: &FolderId,
         include_children: bool,
     ) -> Result<FolderScope, PortError> {
-        authorize_entry(&self.live.try_read()?, &self.ctx, folder)?;
+        authorize_entry(&self.read_live().await?, &self.ctx, folder)?;
         if self.index.dense_folder_id(folder).is_none() {
             return Err(DomainError::ResourceNotFound.into());
         }
@@ -1928,14 +1965,30 @@ impl Snapshot {
                 Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
                     if diagnostic.reason == ValidationReason::CursorStale =>
                 {
-                    self.historical_folders()
-                        .await?
-                        .scope(folder, include_children)?
+                    if include_children {
+                        self.historical_folders().await?.scope(folder, true)?
+                    } else {
+                        let (ancestors, project) = self
+                            .canonical
+                            .read_projection_folder_ancestry_at_cut(
+                                &self.maintenance()?,
+                                &self.cut.scope,
+                                self.cut.projected_seq,
+                                folder,
+                            )
+                            .await?
+                            .ok_or(DomainError::ResourceNotFound)?;
+                        FolderScope {
+                            ancestors,
+                            project,
+                            descendants: Vec::new(),
+                        }
+                    }
                 }
                 result => result?,
             }
         };
-        let permit = self.live.try_read()?;
+        let permit = self.read_live().await?;
         authorize_entry(&permit, &self.ctx, folder)?;
         self.ctx
             .auth()
@@ -1948,6 +2001,33 @@ impl Snapshot {
         page: Vec<u32>,
         predicate: &Predicate,
     ) -> Result<Bitmap, PortError> {
+        let derived = self
+            .published
+            .store
+            .hydrate_query_rows(&self.cut.scope, self.cut.projected_seq, &page)
+            .await;
+        match derived {
+            Ok(rows) if rows.len() == page.len() => {
+                let mut matches = Bitmap::new();
+                let mut complete = true;
+                for (row, expected) in rows.into_iter().zip(&page) {
+                    let Some(row) = row.filter(|row| row.dense_id == *expected) else {
+                        complete = false;
+                        break;
+                    };
+                    if predicate.matches(&row.evaluated_fields()?) {
+                        matches.add(row.dense_id);
+                    }
+                }
+                if complete {
+                    return Ok(matches);
+                }
+            }
+            Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
+                if diagnostic.reason == ValidationReason::CursorStale => {}
+            Err(error) => return Err(error),
+            Ok(_) => {}
+        }
         let notes = page
             .iter()
             .copied()
@@ -1971,10 +2051,12 @@ impl Snapshot {
         Ok(matches)
     }
 
-    fn live_node(&self, id: u32) -> bool {
-        self.live
-            .try_read()
-            .is_ok_and(|permit| self.visible_under(&permit, id))
+    fn live_node(&self, id: u32) -> DomainResult<bool> {
+        let permit = self.live.try_read().map_err(|error| match error {
+            PortError::Domain(domain) => domain,
+            _ => DomainError::validation(ValidationReason::NotReady),
+        })?;
+        Ok(self.visible_under(&permit, id))
     }
 
     fn visible_under(&self, permit: &LiveReadPermit, id: u32) -> bool {
@@ -1999,6 +2081,64 @@ impl Snapshot {
         self.live.try_read().is_ok_and(|permit| {
             self.visible_under(&permit, focal) && self.visible_under(&permit, adjacent)
         })
+    }
+
+    /// Filter a dense bitmap against the current live fence in bounded batches,
+    /// waiting for brief writer holds instead of dropping hits under `try_read()`.
+    async fn filter_bitmap_live(
+        &self,
+        rows: Bitmap,
+        entry_folder: Option<&FolderId>,
+    ) -> Result<Bitmap, PortError> {
+        const LIVE_BITMAP_BATCH: usize = 64;
+        'verify: loop {
+            self.remaining()?;
+            let mut permit = self.read_live().await?;
+            if let Some(folder) = entry_folder {
+                authorize_entry(&permit, &self.ctx, folder)?;
+            } else if permit.space().lifecycle != SpaceLifecycle::Active {
+                return Err(DomainError::ResourceNotFound.into());
+            }
+            let head = permit.head();
+            if head == self.cut.canonical_seq {
+                let mut verified = rows;
+                verified.and_inplace(&self.visible);
+                return Ok(verified);
+            }
+            let mut verified = Bitmap::new();
+            let mut next = Some(0u32);
+            let mut batch_index = 0usize;
+            while let Some(start) = next.take() {
+                if batch_index > 0 {
+                    drop(permit);
+                    tokio::task::yield_now().await;
+                    permit = self.read_live().await?;
+                    if let Some(folder) = entry_folder {
+                        authorize_entry(&permit, &self.ctx, folder)?;
+                    } else if permit.space().lifecycle != SpaceLifecycle::Active {
+                        return Err(DomainError::ResourceNotFound.into());
+                    }
+                    if permit.head() != head {
+                        continue 'verify;
+                    }
+                }
+                batch_index += 1;
+                let mut raw = [0u32; LIVE_BITMAP_BATCH];
+                let mut iter = rows.iter();
+                iter.reset_at_or_after(start);
+                let count = iter.next_many(&mut raw);
+                if count == 0 {
+                    break;
+                }
+                next = raw[count - 1].checked_add(1);
+                for &id in &raw[..count] {
+                    if self.visible_under(&permit, id) {
+                        verified.add(id);
+                    }
+                }
+            }
+            return Ok(verified);
+        }
     }
 }
 
@@ -2032,13 +2172,15 @@ impl StructuralSnapshot for Snapshot {
         &self.cut
     }
 
-    fn lookup(&self, note: &NoteId) -> Option<DenseNodeId> {
-        let id = self.index.dense_id(note)?;
-        self.live_node(id).then(|| self.index.dense(id))
+    fn lookup(&self, note: &NoteId) -> DomainResult<Option<DenseNodeId>> {
+        let Some(id) = self.index.dense_id(note) else {
+            return Ok(None);
+        };
+        Ok(self.live_node(id)?.then(|| self.index.dense(id)))
     }
 
     fn note_id(&self, node: DenseNodeId) -> DomainResult<NoteId> {
-        if !self.live_node(node.index(self.cut.generation)?) {
+        if !self.live_node(node.index(self.cut.generation)?)? {
             return Err(DomainError::ResourceNotFound);
         }
         self.index.note_id(node)
@@ -2046,7 +2188,7 @@ impl StructuralSnapshot for Snapshot {
 
     fn doc_class(&self, node: DenseNodeId) -> DomainResult<DocClass> {
         let index = node.index(self.cut.generation)?;
-        if !self.live_node(index) {
+        if !self.live_node(index)? {
             return Err(DomainError::ResourceNotFound);
         }
         self.index
@@ -2063,7 +2205,7 @@ impl StructuralSnapshot for Snapshot {
                 // revalidate the prefix under the new head before returning IDs.
                 'verify: loop {
                     self.remaining()?;
-                    let mut permit = self.live.try_read()?;
+                    let mut permit = self.read_live().await?;
                     authorize_entry(&permit, &self.ctx, folder)?;
                     let head = permit.head();
                     let mut result = Vec::with_capacity(1 + descendants.len());
@@ -2076,7 +2218,7 @@ impl StructuralSnapshot for Snapshot {
                         if i > 0 {
                             drop(permit);
                             tokio::task::yield_now().await;
-                            permit = self.live.try_read()?;
+                            permit = self.read_live().await?;
                             authorize_entry(&permit, &self.ctx, folder)?;
                             if permit.head() != head {
                                 continue 'verify;
@@ -2106,7 +2248,7 @@ impl StructuralSnapshot for Snapshot {
             self.within_request(async {
                 let location = self.folder_scope(folder, false).await?;
                 if let Some(project) = &location.project {
-                    authorize_entry(&self.live.try_read()?, &self.ctx, project)?;
+                    authorize_entry(&self.read_live().await?, &self.ctx, project)?;
                 }
                 Ok(location.project)
             })
@@ -2131,83 +2273,54 @@ impl StructuralSnapshot for Snapshot {
                     |page| self.verify_filter_page(page, &filter.predicate),
                 )
                 .await?;
-                let ids = bitmap_ids(matches).filter(move |id| self.live_node(*id));
-                Ok(Some(DenseNodeIter::from_iter(self.cut.generation, ids)))
+                let verified = self.filter_bitmap_live(matches, None).await?;
+                Ok(Some(DenseNodeIter::from_iter(
+                    self.cut.generation,
+                    bitmap_ids(verified),
+                )))
             })
             .await
         })
     }
 
-    fn folder_subtree(&self, folder: &FolderId) -> DomainResult<DenseNodeIter<'_>> {
-        let permit = self
-            .live
-            .try_read()
-            .map_err(|_| DomainError::ResourceNotFound)?;
-        authorize_entry(&permit, &self.ctx, folder).map_err(|_| DomainError::ResourceNotFound)?;
-        let initial_head = permit.head();
-        let id = self
-            .index
-            .dense_folder_id(folder)
-            .ok_or(DomainError::ResourceNotFound)?;
-        let mut rows = self
-            .index
-            .posting(&PostingKey::FolderSubtree(id))
-            .map_err(|_| DomainError::ResourceNotFound)?;
-        rows.and_inplace(&self.visible);
-        drop(permit);
-        let folder = folder.clone();
-        // Re-verify once per 64-node batch under a single live permit instead
-        // of acquiring `RwLock::try_read()` on every node.
-        let mut next = Some(0u32);
-        let mut batch = Vec::with_capacity(64);
-        let mut offset = 0usize;
-        let ids = std::iter::from_fn(move || {
-            loop {
-                if offset < batch.len() {
-                    let id = batch[offset];
-                    offset += 1;
-                    return Some(id);
-                }
-                let start = next.take()?;
-                let mut raw = [0u32; 64];
-                let mut iter = rows.iter();
-                iter.reset_at_or_after(start);
-                let count = iter.next_many(&mut raw);
-                if count == 0 {
-                    return None;
-                }
-                next = raw[count - 1].checked_add(1);
-                let Ok(permit) = self.live.try_read() else {
-                    next = None;
-                    return None;
-                };
-                if self.expires <= Instant::now()
-                    || permit.space().lifecycle != SpaceLifecycle::Active
-                    || (permit.head() != initial_head
-                        && authorize_entry(&permit, &self.ctx, &folder).is_err())
-                {
-                    next = None;
-                    return None;
-                }
-                batch.clear();
-                offset = 0;
-                if permit.head() == self.cut.canonical_seq {
-                    batch.extend_from_slice(&raw[..count]);
-                } else {
-                    for &id in &raw[..count] {
-                        if self.visible_under(&permit, id) {
-                            batch.push(id);
-                        }
-                    }
-                }
-            }
-        });
-        Ok(DenseNodeIter::from_iter(self.cut.generation, ids))
+    fn folder_subtree<'a>(&'a self, folder: &'a FolderId) -> PortFuture<'a, DenseNodeIter<'a>> {
+        Box::pin(async move {
+            self.within_request(async {
+                let permit = self.read_live().await?;
+                authorize_entry(&permit, &self.ctx, folder)?;
+                let id = self
+                    .index
+                    .dense_folder_id(folder)
+                    .ok_or(DomainError::ResourceNotFound)?;
+                let mut rows = self
+                    .index
+                    .posting(&PostingKey::FolderSubtree(id))
+                    .map_err(|_| DomainError::ResourceNotFound)?;
+                rows.and_inplace(&self.visible);
+                drop(permit);
+                let verified = self.filter_bitmap_live(rows, Some(folder)).await?;
+                Ok(DenseNodeIter::from_iter(
+                    self.cut.generation,
+                    bitmap_ids(verified),
+                ))
+            })
+            .await
+        })
+    }
+
+    fn wait_ready(&self) -> PortFuture<'_, ()> {
+        Box::pin(async move {
+            self.within_request(async {
+                let _permit = self.read_live().await?;
+                Ok(())
+            })
+            .await
+        })
     }
 
     fn outgoing(&self, node: DenseNodeId) -> DomainResult<DenseNodeIter<'_>> {
         let id = node.index(self.cut.generation)?;
-        if !self.live_node(id) {
+        if !self.live_node(id)? {
             return Err(DomainError::ResourceNotFound);
         }
         Ok(DenseNodeIter::from_iter(
@@ -2220,7 +2333,7 @@ impl StructuralSnapshot for Snapshot {
 
     fn incoming(&self, node: DenseNodeId) -> DomainResult<DenseNodeIter<'_>> {
         let id = node.index(self.cut.generation)?;
-        if !self.live_node(id) {
+        if !self.live_node(id)? {
             return Err(DomainError::ResourceNotFound);
         }
         Ok(DenseNodeIter::from_iter(
@@ -2245,7 +2358,7 @@ impl StructuralReadPort for ProjectionEngine {
                     .ok_or_else(not_ready)?;
                 let cut = self.choose_read(&ctx, &causal, None).await?.cut;
                 let index = self.open_index_async(&cut).await?;
-                let permit = cut.live.try_read()?;
+                let permit = cut.live.read(&ctx.budget).await?;
                 authorize_query(&permit, &ctx, &cut.root_folder_id, None, true)?;
                 let universe = query::structural_universe(&index, permit.space(), ctx.auth())?;
                 let (visible, permit) = current_bitmap(
@@ -2283,68 +2396,67 @@ impl StructuralReadPort for ProjectionEngine {
         })
     }
 
-    fn is_live_visible(&self, ctx: &SpaceContext, note: &NoteId) -> DomainResult<bool> {
-        let generation = self.generation.load().store.generation();
-        let _admission = self
-            .current_admission(generation)
-            .map_err(|_| DomainError::validation(ValidationReason::NotReady))?;
-        let permit = self
-            .live_handle(ctx.scope())
-            .and_then(|handle| handle.try_read())
-            .map_err(|error| match error {
-                PortError::Domain(error) => error,
-                _ => DomainError::ResourceNotFound,
-            })?;
-        authorize_query(&permit, ctx, permit.root_folder_id(), None, true).map_err(|error| {
-            match error {
-                PortError::Domain(error) => error,
-                _ => DomainError::ResourceNotFound,
-            }
-        })?;
-        match permit
-            .classify(ctx, note, true)
-            .map_err(|_| DomainError::ResourceNotFound)?
-        {
-            LiveNoteStatus::ActiveVisible(facts) => {
-                ctx.auth().authorize_read(&facts)?;
-                Ok(true)
-            }
-            _ => Ok(false),
-        }
+    fn is_live_visible<'a>(
+        &'a self,
+        ctx: &'a SpaceContext,
+        note: &'a NoteId,
+    ) -> PortFuture<'a, bool> {
+        Box::pin(async move {
+            within_budget(ctx, async {
+                drop(self.current_admission(self.active_generation())?);
+                let handle = self.live_handle_async(ctx.scope(), &ctx.budget).await?;
+                let permit = handle.read(&ctx.budget).await?;
+                let _admission = self.current_admission(self.active_generation())?;
+                can_view_query_entry(&permit, ctx, permit.root_folder_id(), None, true)?;
+                match permit.classify(ctx, note, true)? {
+                    LiveNoteStatus::ActiveVisible(facts) => {
+                        ctx.auth().authorize_read(&facts)?;
+                        Ok(true)
+                    }
+                    _ => Ok(false),
+                }
+            })
+            .await
+        })
     }
 
-    fn filter_live_visible(&self, ctx: &SpaceContext, notes: &[NoteId]) -> DomainResult<Vec<bool>> {
-        let generation = self.generation.load().store.generation();
-        let _admission = self
-            .current_admission(generation)
-            .map_err(|_| DomainError::validation(ValidationReason::NotReady))?;
-        let permit = self
-            .live_handle(ctx.scope())
-            .and_then(|handle| handle.try_read())
-            .map_err(|error| match error {
-                PortError::Domain(error) => error,
-                _ => DomainError::ResourceNotFound,
-            })?;
-        authorize_query(&permit, ctx, permit.root_folder_id(), None, true).map_err(|error| {
-            match error {
-                PortError::Domain(error) => error,
-                _ => DomainError::ResourceNotFound,
-            }
-        })?;
-        let mut results = Vec::with_capacity(notes.len());
-        for note in notes {
-            match permit
-                .classify(ctx, note, true)
-                .map_err(|_| DomainError::ResourceNotFound)?
-            {
-                LiveNoteStatus::ActiveVisible(facts) => {
-                    ctx.auth().authorize_read(&facts)?;
-                    results.push(true);
+    fn filter_live_visible<'a>(
+        &'a self,
+        ctx: &'a SpaceContext,
+        notes: &'a [NoteId],
+    ) -> PortFuture<'a, Vec<bool>> {
+        Box::pin(async move {
+            within_budget(ctx, async {
+                drop(self.current_admission(self.active_generation())?);
+                let handle = self.live_handle_async(ctx.scope(), &ctx.budget).await?;
+                let mut results = Vec::with_capacity(notes.len());
+                if notes.is_empty() {
+                    let permit = handle.read(&ctx.budget).await?;
+                    let _admission = self.current_admission(self.active_generation())?;
+                    can_view_query_entry(&permit, ctx, permit.root_folder_id(), None, true)?;
+                    return Ok(results);
                 }
-                _ => results.push(false),
-            }
-        }
-        Ok(results)
+                for (i, batch) in notes.chunks(VISIBILITY_BATCH).enumerate() {
+                    if i > 0 {
+                        tokio::task::yield_now().await;
+                    }
+                    let permit = handle.read(&ctx.budget).await?;
+                    let _admission = self.current_admission(self.active_generation())?;
+                    can_view_query_entry(&permit, ctx, permit.root_folder_id(), None, true)?;
+                    for note in batch {
+                        match permit.classify(ctx, note, true)? {
+                            LiveNoteStatus::ActiveVisible(facts) => {
+                                ctx.auth().authorize_read(&facts)?;
+                                results.push(true);
+                            }
+                            _ => results.push(false),
+                        }
+                    }
+                }
+                Ok(results)
+            })
+            .await
+        })
     }
 
     fn hydrate(
@@ -2359,9 +2471,13 @@ impl StructuralReadPort for ProjectionEngine {
                 drop(self.current_admission(self.active_generation())?);
                 // A retained cut can use canonical hydration while this
                 // Space is still binding the newly selected generation.
-                let live = self.canonical.live_visibility_fence().space(ctx.scope())?;
+                let live = self
+                    .canonical
+                    .live_visibility_fence()
+                    .read_space(ctx.scope(), &ctx.budget)
+                    .await?;
                 let head = {
-                    let permit = live.try_read()?;
+                    let permit = live.read(&ctx.budget).await?;
                     authorize_query(&permit, &ctx, permit.root_folder_id(), None, true)?;
                     permit.head()
                 };
@@ -2399,7 +2515,7 @@ impl StructuralReadPort for ProjectionEngine {
                             .map(|slot| slot.and_then(|_| cards.next().flatten()))
                             .collect();
                         let _admission = self.current_admission(current.cut.generation)?;
-                        let permit = live.try_read()?;
+                        let permit = live.read(&ctx.budget).await?;
                         if permit.space().lifecycle != SpaceLifecycle::Active {
                             return Err(DomainError::ResourceNotFound.into());
                         }
@@ -2434,7 +2550,7 @@ impl StructuralReadPort for ProjectionEngine {
                     );
                 }
                 let _admission = self.current_admission(self.active_generation())?;
-                let permit = live.try_read()?;
+                let permit = live.read(&ctx.budget).await?;
                 if permit.space().lifecycle != SpaceLifecycle::Active {
                     return Err(DomainError::ResourceNotFound.into());
                 }

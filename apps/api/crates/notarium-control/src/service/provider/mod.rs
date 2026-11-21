@@ -11,6 +11,7 @@ mod ports;
 mod records;
 mod recovery;
 mod selection;
+pub use selection::ResolvedSearchEmbeddingModel;
 mod wire;
 
 use super::{

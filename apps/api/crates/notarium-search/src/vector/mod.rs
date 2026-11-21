@@ -10,16 +10,26 @@ pub mod simd;
 mod tombstone;
 mod wal;
 
-pub use builder::SegmentBuilder;
-pub use epoch::{VectorEpoch, VectorFilter, VectorHit, VectorResults, VectorSnapshot};
+pub use builder::{MAX_SEGMENT_BUILD_BYTES, SegmentBuilder};
+#[cfg(any(test, feature = "test-support"))]
+pub use epoch::VectorResults;
+pub use epoch::{
+    CompactionPlan, FlushL0Plan, VectorEpoch, VectorFilter, VectorHit, VectorSnapshot,
+    segment_file_path,
+};
+#[cfg(any(test, feature = "test-support"))]
 pub use hnsw::Neighbor;
-pub use mmap_segment::{MmapSegment, SegmentSearch};
+pub use mmap_segment::MmapSegment;
+#[cfg(any(test, feature = "test-support"))]
+pub use mmap_segment::SegmentSearch;
 pub use quantization::QuantizedVector;
 pub use tombstone::Tombstones;
-pub use wal::{L0_MAX_CHUNKS, MutableBuffer, MutableOperation};
+#[cfg(any(test, feature = "test-support"))]
+pub use wal::{L0_MAX_BYTES, L0_MAX_CHUNKS};
+pub use wal::{MutableBuffer, MutableOperation};
 
 use notarium_core::{
-    DomainResult,
+    DomainError, DomainResult,
     classes::DocClass,
     document::{ChunkDescriptor, render_chunk},
     ids::{ContentDigest, ModelProfileId, NoteId},
@@ -31,6 +41,8 @@ use std::{io, time::Instant};
 pub const MIN_DIMENSION: usize = 64;
 pub const MAX_DIMENSION: usize = 4096;
 pub const EXACT_SCAN_LIMIT: u64 = 16_384;
+pub const MAX_CONTEXT_SPANS: usize = 64;
+pub(super) const GLOBAL_EVAL_BUDGET: usize = 48_000;
 const M: usize = 16;
 const M0: usize = 32;
 const MAX_LEVEL: u8 = 16;
@@ -49,6 +61,8 @@ pub enum VectorError {
     Io(#[from] io::Error),
     #[error("vector index layout failed")]
     Layout(#[from] crate::layout::LayoutError),
+    #[error("vector search domain failure")]
+    Domain(#[from] DomainError),
     #[error("vector search budget ended")]
     Cancelled,
     #[error("mutable vector index capacity exceeded")]
@@ -73,7 +87,7 @@ impl ChunkMetadata {
             || self.class == DocClass::EncryptedNote
             || !(1..=512).contains(&self.tokens)
             || !(1..=7).contains(&self.spans.len())
-            || self.context.len() > u16::MAX as usize
+            || self.context.len() > MAX_CONTEXT_SPANS
             || self
                 .context
                 .iter()

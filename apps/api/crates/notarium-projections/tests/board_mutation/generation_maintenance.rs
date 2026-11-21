@@ -116,7 +116,7 @@ async fn sqlite_recovers_an_older_generation_and_keeps_held_files() {
         .acquire_snapshot(owner.clone(), causal.clone())
         .await
         .unwrap();
-    assert!(old.lookup(&victim.note).is_some());
+    assert!(old.lookup(&victim.note).unwrap().is_some());
     runtime.shutdown().await.unwrap();
     purge_offline(&canonical, &owner, &victim.note).await;
     let head = canonical
@@ -216,16 +216,16 @@ async fn sqlite_recovers_an_older_generation_and_keeps_held_files() {
         .unwrap();
     assert_eq!(current.cut().generation, next);
     assert_eq!(current.cut().projected_seq, head);
-    assert!(current.lookup(&created.note).is_some());
-    assert!(current.lookup(&victim.note).is_none());
+    assert!(current.lookup(&created.note).unwrap().is_some());
+    assert!(current.lookup(&victim.note).unwrap().is_none());
     {
         let db = rusqlite::Connection::open(candidate_db).unwrap();
         assert!(!contains_victim(&db));
         assert!(!contains_abandoned(&db));
     }
     assert_eq!(old.cut().generation, initial);
-    assert!(old.lookup(&created.note).is_some());
-    assert!(old.lookup(&victim.note).is_none());
+    assert!(old.lookup(&created.note).unwrap().is_some());
+    assert!(old.lookup(&victim.note).unwrap().is_none());
     assert!(old_db.exists(), "the held snapshot pins its old files");
     drop(old);
     tokio::time::timeout(Duration::from_secs(4), async {
@@ -352,7 +352,7 @@ async fn postgres_recovers_only_after_the_old_worker_releases_its_admission() {
         .await
         .unwrap();
     assert_eq!(snapshot.cut().generation, next);
-    assert!(snapshot.lookup(&created.note).is_some());
+    assert!(snapshot.lookup(&created.note).unwrap().is_some());
     let old_schema = format!("{derived_schema}_g1");
     tokio::time::timeout(Duration::from_secs(4), async {
         loop {
@@ -590,9 +590,9 @@ async fn postgres_recovers_obsolete_format_and_resets_obsolete_candidate() {
     assert_eq!(snapshot_a.cut().projected_seq, head_a);
     assert_eq!(snapshot_b.cut().generation, next);
     assert_eq!(snapshot_b.cut().projected_seq, head_b);
-    assert!(snapshot_a.lookup(&note_a.note).is_some());
-    assert!(snapshot_b.lookup(&note_b.note).is_some());
-    assert!(snapshot_b.lookup(&victim_b.note).is_none());
+    assert!(snapshot_a.lookup(&note_a.note).unwrap().is_some());
+    assert!(snapshot_b.lookup(&note_b.note).unwrap().is_some());
+    assert!(snapshot_b.lookup(&victim_b.note).unwrap().is_none());
     let victim_query = format!(
         "SELECT EXISTS (SELECT 1 FROM {new_schema}.projected_notes WHERE space_id = $1 AND note_id = $2)"
     );

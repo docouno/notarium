@@ -9,13 +9,9 @@ use crate::{
 };
 use notarium_canonical::{CanonicalStore, CreateSpaceSpec};
 use notarium_core::{
-    DomainResult,
     auth::SpaceKind,
     epoch::DataRoot,
-    ids::{
-        FolderId, LeaseEpoch, ModelProfileId, NoteId, PrincipalId, ProviderResourceId, SpaceId,
-        SpaceSeq,
-    },
+    ids::{LeaseEpoch, ModelProfileId, NoteId, PrincipalId, ProviderResourceId, SpaceId, SpaceSeq},
     model::{FolderRef, HistoryScope, SnapshotCut},
     ports::{
         CallBudget, NoteCard, PortFuture, SearchDegradation, SearchPort, ServiceAuthority,
@@ -46,9 +42,10 @@ struct LocalResolver(
 impl SearchModelResolverPort for LocalResolver {
     fn resolve_model<'a>(
         &'a self,
+        _: &'a ServiceAuthority,
         scope: &'a HistoryScope,
-        _: Option<&'a FolderId>,
         explicit: Option<&'a ModelProfileId>,
+        _: &'a CallBudget,
     ) -> PortFuture<'a, Option<ResolvedEmbeddingTarget>> {
         Box::pin(async move {
             if explicit.is_some() {
@@ -95,7 +92,11 @@ impl StructuralReadPort for Projections {
         self.0[&ctx.scope().space_id].acquire_snapshot(ctx, causal)
     }
 
-    fn is_live_visible(&self, ctx: &SpaceContext, note: &NoteId) -> DomainResult<bool> {
+    fn is_live_visible<'a>(
+        &'a self,
+        ctx: &'a SpaceContext,
+        note: &'a NoteId,
+    ) -> PortFuture<'a, bool> {
         self.0[&ctx.scope().space_id].is_live_visible(ctx, note)
     }
 

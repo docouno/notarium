@@ -399,6 +399,7 @@ struct CanonicalChangeSubscription {
     processed: ChangeCursor,
     delivered_complete_command_end: SpaceSeq,
     pending_initial: Option<ChangeNotice>,
+    pending_lagged: bool,
     rx: broadcast::Receiver<BroadcastSignal>,
     next_durable_poll: tokio::time::Instant,
     durable_checked_through: SpaceSeq,
@@ -432,6 +433,9 @@ impl CanonicalChangeSubscription {
             })
         }).await?;
 
+        if lagged {
+            self.pending_lagged = false;
+        }
         if head.scope != self.processed.scope {
             return Ok(Some(ChangeNotice::Resync { scope: head.scope }));
         }
@@ -467,6 +471,9 @@ impl ChangeSubscription for CanonicalChangeSubscription {
         Box::pin(async move {
             if let Some(initial) = self.pending_initial.take() {
                 return Ok(Some(initial));
+            }
+            if self.pending_lagged {
+                return self.durable_notice(true).await;
             }
 
             // The broadcast ring is process-local. Check durable PostgreSQL state while
@@ -537,6 +544,7 @@ impl ChangeSubscription for CanonicalChangeSubscription {
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
+                        self.pending_lagged = true;
                         return self.durable_notice(true).await;
                     }
                     Err(broadcast::error::RecvError::Closed) => {
@@ -686,6 +694,7 @@ impl ChangeBroadcast for CanonicalStore {
                 processed: after,
                 delivered_complete_command_end: delivered_end,
                 pending_initial,
+                pending_lagged: false,
                 rx,
                 next_durable_poll: tokio::time::Instant::now() + PG_CHANGE_POLL_INTERVAL,
                 durable_checked_through: space_rec.last_seq,

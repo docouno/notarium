@@ -53,29 +53,33 @@ fn remote_target(resource: u8, cap: u32) -> ResolvedEmbeddingTarget {
     }
 }
 
-struct SwitchingResolver {
-    provider: AtomicU8,
-    runtime_epoch: AtomicU64,
-    cap: AtomicU32,
-    project: RwLock<Option<FolderRef>>,
-    grant_project: RwLock<Option<FolderRef>>,
-    unavailable: AtomicBool,
-    hold_resolution: AtomicBool,
-    resolution_started: Notify,
-    release_resolution: Notify,
-    hold_grant: AtomicBool,
-    grant_started: Notify,
-    release_grant: Notify,
+pub(super) struct SwitchingResolver {
+    pub(super) model: AtomicU8,
+    pub(super) provider: AtomicU8,
+    pub(super) runtime_epoch: AtomicU64,
+    pub(super) cap: AtomicU32,
+    pub(super) project: RwLock<Option<FolderRef>>,
+    pub(super) grant_project: RwLock<Option<FolderRef>>,
+    pub(super) deny_project: RwLock<Option<FolderRef>>,
+    pub(super) unavailable: AtomicBool,
+    pub(super) hold_resolution: AtomicBool,
+    pub(super) resolution_started: Notify,
+    pub(super) release_resolution: Notify,
+    pub(super) hold_grant: AtomicBool,
+    pub(super) grant_started: Notify,
+    pub(super) release_grant: Notify,
 }
 
 impl SwitchingResolver {
-    fn new(provider: u8, cap: u32) -> Self {
+    pub(super) fn new(provider: u8, cap: u32) -> Self {
         Self {
+            model: AtomicU8::new(4),
             provider: AtomicU8::new(provider),
             runtime_epoch: AtomicU64::new(1),
             cap: AtomicU32::new(cap),
             project: RwLock::new(None),
             grant_project: RwLock::new(None),
+            deny_project: RwLock::new(None),
             unavailable: AtomicBool::new(false),
             hold_resolution: AtomicBool::new(false),
             resolution_started: Notify::new(),
@@ -91,6 +95,7 @@ impl SwitchingResolver {
             self.provider.load(Ordering::SeqCst),
             self.cap.load(Ordering::SeqCst),
         );
+        target.model = ModelProfileId::from_bytes([self.model.load(Ordering::SeqCst); 16]);
         if let EmbeddingBackendTarget::Remote {
             runtime_epochs,
             project,
@@ -111,9 +116,10 @@ impl SwitchingResolver {
 impl SearchModelResolverPort for SwitchingResolver {
     fn resolve_model<'a>(
         &'a self,
+        _: &'a ServiceAuthority,
         _: &'a HistoryScope,
-        _: Option<&'a FolderId>,
         _: Option<&'a ModelProfileId>,
+        _: &'a CallBudget,
     ) -> PortFuture<'a, Option<ResolvedEmbeddingTarget>> {
         Box::pin(async move {
             if self.hold_resolution.swap(false, Ordering::SeqCst) {
@@ -146,6 +152,15 @@ impl SearchModelResolverPort for SwitchingResolver {
             {
                 return Ok(None);
             }
+            if self
+                .deny_project
+                .read()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|denied| actual_project == Some(denied))
+            {
+                return Ok(None);
+            }
             if self.hold_grant.swap(false, Ordering::SeqCst) {
                 self.grant_started.notify_one();
                 self.release_grant.notified().await;
@@ -165,18 +180,18 @@ impl SearchModelResolverPort for SwitchingResolver {
 }
 
 #[derive(Default)]
-struct ModelProvider {
-    queries: Mutex<Vec<ProviderResourceId>>,
-    parts: AtomicUsize,
-    outside_parts: AtomicUsize,
-    fail_indexing: AtomicBool,
-    block_next_part: AtomicBool,
-    part_started: Notify,
-    release_part: Notify,
-    project_parts: Mutex<Vec<FolderRef>>,
-    block_project: Mutex<Option<FolderRef>>,
-    first_project_batch: Notify,
-    release_first_project_batch: Notify,
+pub(super) struct ModelProvider {
+    pub(super) queries: Mutex<Vec<ProviderResourceId>>,
+    pub(super) parts: AtomicUsize,
+    pub(super) outside_parts: AtomicUsize,
+    pub(super) fail_indexing: AtomicBool,
+    pub(super) block_next_part: AtomicBool,
+    pub(super) part_started: Notify,
+    pub(super) release_part: Notify,
+    pub(super) project_parts: Mutex<Vec<FolderRef>>,
+    pub(super) block_project: Mutex<Option<FolderRef>>,
+    pub(super) first_project_batch: Notify,
+    pub(super) release_first_project_batch: Notify,
 }
 
 impl EmbeddingProviderPort for ModelProvider {
@@ -374,15 +389,16 @@ pub async fn model_epochs_and_repair(store: Arc<CanonicalStore>, root: DataRoot)
         "Repeated note"
     );
 
+    // Switching models within the same remote provider and runtime epochs keeps
+    // serving the previous epoch while the replacement builds.
     carriers.reject_seed.store(true, Ordering::SeqCst);
-    resolver.provider.store(6, Ordering::SeqCst);
-    let old = engine.search(ctx.clone(), semantic.clone()).await.unwrap();
-    assert_eq!(old.hits[0].card.title, "Repeated note");
+    resolver.model.store(9, Ordering::SeqCst);
+    let same_provider = engine.search(ctx.clone(), semantic.clone()).await.unwrap();
+    assert_eq!(same_provider.hits[0].card.title, "Repeated note");
+    assert!(same_provider.degraded.is_none());
     tokio::time::timeout(Duration::from_secs(4), carriers.seed_rejected.notified())
         .await
         .unwrap();
-    let during = engine.search(ctx.clone(), semantic.clone()).await.unwrap();
-    assert_eq!(during.hits[0].card.title, "Repeated note");
     assert!(
         provider
             .queries
@@ -391,13 +407,48 @@ pub async fn model_epochs_and_repair(store: Arc<CanonicalStore>, root: DataRoot)
             .iter()
             .all(|id| id == &ProviderResourceId::from_bytes([5; 16]))
     );
+
+    // Switching to a different remote provider must immediately stop sending
+    // query plaintext to the prior provider and serve lexical-only results
+    // with EmbeddingsPending until the new epoch activates.
+    resolver.model.store(4, Ordering::SeqCst);
+    resolver.provider.store(6, Ordering::SeqCst);
+    let queries_before_provider_switch = provider.queries.lock().unwrap().len();
+    let during = engine.search(ctx.clone(), semantic.clone()).await.unwrap();
+    assert!(during.hits.is_empty());
+    assert!(matches!(
+        during.degraded,
+        Some(SearchDegradation::EmbeddingsPending)
+    ));
+    let lexical_during = engine
+        .search(ctx.clone(), query("identical"))
+        .await
+        .unwrap();
+    assert_eq!(lexical_during.hits[0].card.title, "Repeated note");
+    assert!(matches!(
+        lexical_during.degraded,
+        Some(SearchDegradation::EmbeddingsPending)
+    ));
+    assert_eq!(
+        provider.queries.lock().unwrap().len(),
+        queries_before_provider_switch
+    );
     provider.fail_indexing.store(true, Ordering::SeqCst);
     carriers.release_seed.notify_one();
     carriers.reject_seed.store(false, Ordering::SeqCst);
     let layout = SearchLayout::open(&root, space.scope.clone()).unwrap();
     tokio::time::timeout(Duration::from_secs(8), async {
         loop {
-            let _ = engine.search(ctx.clone(), semantic.clone()).await.unwrap();
+            let probe = engine.search(ctx.clone(), semantic.clone()).await.unwrap();
+            assert!(probe.hits.is_empty());
+            assert!(matches!(
+                probe.degraded,
+                Some(SearchDegradation::EmbeddingsPending)
+            ));
+            assert_eq!(
+                provider.queries.lock().unwrap().len(),
+                queries_before_provider_switch
+            );
             if provider.parts.load(Ordering::SeqCst) > 1
                 && layout.index_generations().unwrap() == [seeded.generation().unwrap()]
             {
@@ -408,8 +459,16 @@ pub async fn model_epochs_and_repair(store: Arc<CanonicalStore>, root: DataRoot)
     })
     .await
     .unwrap();
-    let still_served = engine.search(ctx.clone(), semantic.clone()).await.unwrap();
-    assert_eq!(still_served.hits[0].card.title, "Repeated note");
+    let still_blocked = engine.search(ctx.clone(), semantic.clone()).await.unwrap();
+    assert!(still_blocked.hits.is_empty());
+    assert!(matches!(
+        still_blocked.degraded,
+        Some(SearchDegradation::EmbeddingsPending)
+    ));
+    assert_eq!(
+        provider.queries.lock().unwrap().len(),
+        queries_before_provider_switch
+    );
     assert_eq!(
         layout.search_manifest().unwrap().unwrap().active_model,
         Some(remote_target(5, 512))
@@ -484,6 +543,11 @@ pub async fn model_epochs_and_repair(store: Arc<CanonicalStore>, root: DataRoot)
     .unwrap();
     // One base input, one repaired latest input, no restarted backfill.
     assert_eq!(provider.parts.load(Ordering::SeqCst), attempts + 2);
+    // Drain the notification stored by the repaired part blocked above so the
+    // next `part_started.notified().await` observes the post-restart live edit.
+    tokio::time::timeout(Duration::from_secs(5), provider.part_started.notified())
+        .await
+        .unwrap();
 
     // A stale caller can start the worker before the first current request.
     // The saved cut belongs to the current incarnation and is reusable.
@@ -1054,7 +1118,7 @@ pub async fn scoped_backfill_recovers_and_rechecks_selection(
 
     // A cap too small for notes outside the selected project is irrelevant:
     // the empty corpus is complete and may replace a ready previous epoch.
-    resolver.cap.store(8, Ordering::SeqCst);
+    resolver.cap.store(9, Ordering::SeqCst);
     *resolver.project.write().unwrap() = Some(empty);
     let ctx = context(&space.scope, &owner);
     let queries_before = provider.queries.lock().unwrap().len();
@@ -1081,9 +1145,10 @@ struct Resolver {
 impl SearchModelResolverPort for Resolver {
     fn resolve_model<'a>(
         &'a self,
+        _: &'a ServiceAuthority,
         _: &'a HistoryScope,
-        _: Option<&'a FolderId>,
         _: Option<&'a ModelProfileId>,
+        _: &'a CallBudget,
     ) -> PortFuture<'a, Option<ResolvedEmbeddingTarget>> {
         Box::pin(async move {
             Ok(Some(ResolvedEmbeddingTarget {
@@ -1265,7 +1330,7 @@ pub async fn lexical_fallback(store: Arc<CanonicalStore>, root: DataRoot) {
     .await
     .expect("the lexical response returned while provider work was pending")
     .unwrap();
-    println!(
+    eprintln!(
         "search-fallback-elapsed-us {}",
         started.elapsed().as_micros()
     );

@@ -16,6 +16,31 @@ use tantivy::{
 const TIE_BREAKER: f32 = 0.2;
 const MAX_QUERY_BYTES: usize = 4096;
 const MAX_CLAUSES: usize = 64;
+const MAX_TOTAL_TERMS: usize = 512;
+const MAX_ATOMS: usize = 16;
+const MAX_PHRASE: usize = 32;
+
+struct TermBudget {
+    used: usize,
+}
+
+impl TermBudget {
+    fn new() -> Self {
+        Self { used: 0 }
+    }
+
+    fn charge(&mut self, count: usize) -> DomainResult<()> {
+        self.used = self.used.saturating_add(count);
+        if self.used > MAX_TOTAL_TERMS {
+            return Err(invalid_query());
+        }
+        Ok(())
+    }
+}
+
+fn invalid_query() -> DomainError {
+    DomainError::validation(ValidationReason::InvalidQuery)
+}
 
 pub(super) struct QueryPlan {
     clauses: Vec<Box<dyn Query>>,
@@ -24,9 +49,8 @@ pub(super) struct QueryPlan {
 
 impl QueryPlan {
     pub fn parse(text: &str, fields: &[TextFields], filtered: bool) -> DomainResult<Self> {
-        let invalid = || DomainError::validation(ValidationReason::InvalidQuery);
         if text.len() > MAX_QUERY_BYTES {
-            return Err(invalid());
+            return Err(invalid_query());
         }
         if text.trim().is_empty() {
             return if filtered {
@@ -35,30 +59,31 @@ impl QueryPlan {
                     browse: true,
                 })
             } else {
-                Err(invalid())
+                Err(invalid_query())
             };
         }
         let mut prose = Prose::default();
+        let mut budget = TermBudget::new();
         let mut clauses = Vec::new();
         let pieces: Vec<_> = text.split('"').collect();
         for (index, piece) in pieces.iter().enumerate() {
             if index % 2 == 1 && index + 1 < pieces.len() {
-                if let Some(query) = phrase(&mut prose, piece, fields) {
+                if let Some(query) = phrase(&mut prose, piece, fields, &mut budget)? {
                     clauses.push(query);
+                    if clauses.len() > MAX_CLAUSES {
+                        return Err(invalid_query());
+                    }
                 }
             } else {
                 for token in piece.split_whitespace() {
-                    if let Some(query) = free_token(&mut prose, token, fields) {
+                    if let Some(query) = free_token(&mut prose, token, fields, &mut budget)? {
                         clauses.push(query);
-                    }
-                    if clauses.len() > MAX_CLAUSES {
-                        return Err(invalid());
+                        if clauses.len() > MAX_CLAUSES {
+                            return Err(invalid_query());
+                        }
                     }
                 }
             }
-        }
-        if clauses.len() > MAX_CLAUSES {
-            return Err(invalid());
         }
         Ok(Self {
             browse: false,
@@ -132,36 +157,59 @@ fn boosted(query: Box<dyn Query>, weight: f32) -> Box<dyn Query> {
     Box::new(BoostQuery::new(query, weight))
 }
 
-fn phrase(prose: &mut Prose, text: &str, fields: &[TextFields]) -> Option<Box<dyn Query>> {
-    let prose = prose.tokens(text);
-    let exact = exact_phrase(text);
+fn phrase(
+    prose: &mut Prose,
+    text: &str,
+    fields: &[TextFields],
+    budget: &mut TermBudget,
+) -> DomainResult<Option<Box<dyn Query>>> {
+    let prose_tokens = prose.tokens(text);
+    let exact_tokens = exact_phrase(text);
+    if prose_tokens.len() > MAX_PHRASE || exact_tokens.len() > MAX_PHRASE {
+        return Err(invalid_query());
+    }
     let mut clauses = Vec::with_capacity(fields.len() * 2);
     for field in fields {
-        if let Some(query) = in_order(field.prose, &prose) {
+        if let Some(query) = in_order(field.prose, &prose_tokens) {
+            budget.charge(prose_tokens.len())?;
             clauses.push(boosted(query, field.prose_weight));
         }
-        if let Some(query) = in_order(field.exact, &exact) {
+        if let Some(query) = in_order(field.exact, &exact_tokens) {
+            budget.charge(exact_tokens.len())?;
             clauses.push(boosted(query, field.exact_weight));
         }
     }
-    disjunction(clauses)
+    Ok(disjunction(clauses))
 }
 
-fn free_token(prose: &mut Prose, text: &str, fields: &[TextFields]) -> Option<Box<dyn Query>> {
+fn free_token(
+    prose: &mut Prose,
+    text: &str,
+    fields: &[TextFields],
+    budget: &mut TermBudget,
+) -> DomainResult<Option<Box<dyn Query>>> {
     let exact = exact_phrase(text);
     let atoms = atoms(text);
+    if exact.len() > MAX_PHRASE || atoms.len() > MAX_ATOMS {
+        return Err(invalid_query());
+    }
     if atoms.len() <= 1 {
-        let prose = prose.tokens(text);
+        let prose_tokens = prose.tokens(text);
+        if prose_tokens.len() > MAX_PHRASE {
+            return Err(invalid_query());
+        }
         let mut clauses = Vec::with_capacity(fields.len() * 2);
         for field in fields {
-            if let Some(query) = in_order(field.prose, &prose) {
+            if let Some(query) = in_order(field.prose, &prose_tokens) {
+                budget.charge(prose_tokens.len())?;
                 clauses.push(boosted(query, field.prose_weight));
             }
             if let Some(query) = in_order(field.exact, &exact) {
+                budget.charge(exact.len())?;
                 clauses.push(boosted(query, field.exact_weight));
             }
         }
-        return disjunction(clauses);
+        return Ok(disjunction(clauses));
     }
     let stems = atoms
         .iter()
@@ -170,8 +218,10 @@ fn free_token(prose: &mut Prose, text: &str, fields: &[TextFields]) -> Option<Bo
     let mut clauses = Vec::with_capacity(fields.len() * 3);
     for field in fields {
         if let Some(query) = in_order(field.exact, &exact) {
+            budget.charge(exact.len())?;
             clauses.push(boosted(query, field.exact_weight));
         }
+        budget.charge(atoms.len())?;
         let parts = atoms
             .iter()
             .map(|atom| (Occur::Must, term(field.exact, atom)))
@@ -181,6 +231,7 @@ fn free_token(prose: &mut Prose, text: &str, fields: &[TextFields]) -> Option<Bo
             field.prose_weight,
         ));
         if stems.len() == atoms.len() {
+            budget.charge(stems.len())?;
             let parts = stems
                 .iter()
                 .map(|stem| (Occur::Must, term(field.prose, &stem.text)))
@@ -191,5 +242,5 @@ fn free_token(prose: &mut Prose, text: &str, fields: &[TextFields]) -> Option<Bo
             ));
         }
     }
-    disjunction(clauses)
+    Ok(disjunction(clauses))
 }

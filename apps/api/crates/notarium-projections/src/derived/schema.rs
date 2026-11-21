@@ -74,7 +74,12 @@ pub(super) async fn initialize(
     )
     .await?;
 
-    let postgres = tx.postgres();
+    let ddl = schema_ddl(tx.postgres());
+    tx.batch(&ddl).await?;
+    Ok(true)
+}
+
+fn schema_ddl(postgres: bool) -> String {
     let mut ddl = String::new();
     define::<WatermarkRecord>(&mut ddl, postgres, "");
     define::<ProjectedFolder>(&mut ddl, postgres, ", UNIQUE (space_id, dense_folder_id)");
@@ -98,8 +103,12 @@ pub(super) async fn initialize(
         GUARDS.to_owned()
     };
     ddl.push_str(&guard);
-    tx.batch(&ddl).await?;
-    Ok(true)
+    ddl
+}
+
+#[cfg(test)]
+pub(super) fn sqlite_ddl() -> String {
+    schema_ddl(false)
 }
 
 #[derive(PartialEq, Eq)]

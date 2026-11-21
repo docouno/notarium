@@ -221,7 +221,10 @@ pub(super) async fn exercise(store: &CanonicalStore, runtime: &ProjectorRuntime)
         )
         .await
         .expect("hold the graph cut across the request");
-    let focal = snapshot.lookup(&gamma.note).expect("active before trash");
+    let focal = snapshot
+        .lookup(&gamma.note)
+        .unwrap()
+        .expect("active before trash");
     assert!(snapshot.outgoing(focal).unwrap().next().is_some());
     let mut retained_edges = snapshot
         .outgoing(focal)
@@ -258,6 +261,7 @@ pub(super) async fn exercise(store: &CanonicalStore, runtime: &ProjectorRuntime)
     assert!(
         !engine
             .is_live_visible(&owner, &gamma.note)
+            .await
             .expect("consult the owner fence")
     );
     assert!(
@@ -374,8 +378,8 @@ async fn retained_structural_snapshot(store: &CanonicalStore, runtime: &Projecto
         Some(project.clone())
     );
     let (matched, rest) = (
-        old.lookup(&target.note).unwrap(),
-        old.lookup(&decoy.note).unwrap(),
+        old.lookup(&target.note).unwrap().unwrap(),
+        old.lookup(&decoy.note).unwrap().unwrap(),
     );
     let historical = old
         .filter_notes(&filter)
@@ -472,7 +476,7 @@ async fn scoped_graph(store: &CanonicalStore, runtime: &ProjectorRuntime) {
     ));
     assert_eq!(
         snapshot
-            .doc_class(snapshot.lookup(&focal).unwrap())
+            .doc_class(snapshot.lookup(&focal).unwrap().unwrap())
             .unwrap(),
         DocClass::UserDoc
     );
@@ -756,6 +760,7 @@ impl StaleLinks {
         assert!(
             !stopped
                 .is_live_visible(&visible, &self.outside.note)
+                .await
                 .unwrap()
         );
 
@@ -795,6 +800,7 @@ impl StaleLinks {
         assert!(
             stopped
                 .is_live_visible(&visible, &self.outside.note)
+                .await
                 .unwrap()
         );
 

@@ -149,31 +149,41 @@ impl ControlService {
     ) -> Result<EngineAuthContext, PortError> {
         let now = self.clock.now_ms()?;
         match &credential {
-            AuthenticatedCredential::SearchIndexing { space, .. } => {
-                let source = grant("search-indexing", &current_user.user_id);
-                let space = space.clone();
-                let auth = self
-                    .human_context(
+            AuthenticatedCredential::SearchIndexing { space, provider } => {
+                if current_user.disabled_at.is_some() {
+                    return Err(denied());
+                }
+                let member = if lock {
+                    rows!(
                         tx,
-                        current_user,
-                        credential.clone(),
-                        source.clone(),
-                        false,
-                        false,
-                        lock,
-                    )
-                    .await?;
-                let mut membership = auth.spaces().get(&space).cloned().ok_or_else(denied)?;
-                membership.role = SpaceRole::Viewer;
-                membership.write_classes.clear();
-                Ok(EngineAuthContext::for_human(
-                    VerifiedHuman::attest(
-                        auth.principal().clone(),
-                        source,
-                        BTreeMap::from([(space, membership)]),
-                        false,
-                    )
-                    .with_credential(credential),
+                        SpaceMembersRow,
+                        fetch_optional,
+                        "SELECT m.* FROM space_members m JOIN space_admission s ON s.space_id=m.space_id WHERE m.user_id=$1 AND m.space_id=$2 AND m.admission='active' AND s.state='active'",
+                        "SELECT m.* FROM v1_control.space_members m JOIN v1_control.space_admission s ON s.space_id=m.space_id WHERE m.user_id=$1 AND m.space_id=$2 AND m.admission='active' AND s.state='active' FOR SHARE OF m,s";
+                        &current_user.user_id,
+                        space.as_str()
+                    )?
+                } else {
+                    rows!(
+                        tx,
+                        SpaceMembersRow,
+                        fetch_optional,
+                        "SELECT m.* FROM space_members m JOIN space_admission s ON s.space_id=m.space_id WHERE m.user_id=$1 AND m.space_id=$2 AND m.admission='active' AND s.state='active'",
+                        "SELECT m.* FROM v1_control.space_members m JOIN v1_control.space_admission s ON s.space_id=m.space_id WHERE m.user_id=$1 AND m.space_id=$2 AND m.admission='active' AND s.state='active'";
+                        &current_user.user_id,
+                        space.as_str()
+                    )?
+                }
+                .ok_or_else(denied)?;
+                if !matches!(member.role.as_str(), "owner" | "editor" | "viewer") {
+                    return Err(denied());
+                }
+                let source = grant("search-indexing", &current_user.user_id);
+                Ok(EngineAuthContext::for_search_indexing(
+                    PrincipalId::parse(&current_user.user_id)?,
+                    source,
+                    space.clone(),
+                    provider.clone(),
                 ))
             }
             AuthenticatedCredential::ScheduledRun { .. } => {

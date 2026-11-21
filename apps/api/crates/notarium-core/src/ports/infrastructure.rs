@@ -19,10 +19,10 @@ use std::{
 
 pub trait StructuralSnapshot: Send + Sync {
     fn cut(&self) -> &SnapshotCut;
-    fn lookup(&self, note: &NoteId) -> Option<DenseNodeId>;
+    fn lookup(&self, note: &NoteId) -> DomainResult<Option<DenseNodeId>>;
     fn note_id(&self, node: DenseNodeId) -> DomainResult<NoteId>;
     fn doc_class(&self, node: DenseNodeId) -> DomainResult<DocClass>;
-    fn folder_subtree(&self, folder: &FolderId) -> DomainResult<DenseNodeIter<'_>>;
+    fn folder_subtree<'a>(&'a self, folder: &'a FolderId) -> PortFuture<'a, DenseNodeIter<'a>>;
     /// Return the active folder itself followed by its active descendants.
     fn folder_descendants<'a>(&'a self, folder: &'a FolderId) -> PortFuture<'a, Vec<FolderId>>;
     /// Include the folder itself when it is an active project root.
@@ -35,6 +35,10 @@ pub trait StructuralSnapshot: Send + Sync {
     ) -> PortFuture<'a, Option<DenseNodeIter<'a>>>;
     fn outgoing(&self, node: DenseNodeId) -> DomainResult<DenseNodeIter<'_>>;
     fn incoming(&self, node: DenseNodeId) -> DomainResult<DenseNodeIter<'_>>;
+    /// Wait for the live visibility fence to become readable within the snapshot's budget.
+    fn wait_ready(&self) -> PortFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
 }
 pub trait StructuralReadPort: Send + Sync {
     fn acquire_snapshot(
@@ -43,13 +47,24 @@ pub trait StructuralReadPort: Send + Sync {
         causal: CausalBasis,
     ) -> PortFuture<'_, Box<dyn StructuralSnapshot>>;
     /// Current canonical fence, including class changes; never the pinned snapshot bit.
-    fn is_live_visible(&self, ctx: &SpaceContext, note: &NoteId) -> DomainResult<bool>;
+    fn is_live_visible<'a>(
+        &'a self,
+        ctx: &'a SpaceContext,
+        note: &'a NoteId,
+    ) -> PortFuture<'a, bool>;
     /// Batch check against the current canonical fence preserving request order.
-    fn filter_live_visible(&self, ctx: &SpaceContext, notes: &[NoteId]) -> DomainResult<Vec<bool>> {
-        notes
-            .iter()
-            .map(|note| self.is_live_visible(ctx, note))
-            .collect()
+    fn filter_live_visible<'a>(
+        &'a self,
+        ctx: &'a SpaceContext,
+        notes: &'a [NoteId],
+    ) -> PortFuture<'a, Vec<bool>> {
+        Box::pin(async move {
+            let mut results = Vec::with_capacity(notes.len());
+            for note in notes {
+                results.push(self.is_live_visible(ctx, note).await?);
+            }
+            Ok(results)
+        })
     }
     /// Preserve request ordering, including absent/hidden rows.
     fn hydrate(

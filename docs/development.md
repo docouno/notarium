@@ -1,6 +1,6 @@
 # Development
 
-Use Linux x86_64, a local Docker Engine, Docker Compose **5.0.0+**, Git and GNU
+Use Linux x86_64 or aarch64, a local Docker Engine, Docker Compose **5.0.0+**, Git and GNU
 Make. Devkit `0.5.1` pins the container toolchains (`Rust 1.99.1`, `Node 24.22.1`,
 static `pnpm 12.21.0`). Host Node/Rust SDKs do not replace them; host Node is only
 needed for optional `npx` CLI entry points.

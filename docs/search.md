@@ -9,23 +9,30 @@ before shutting down canonical storage.
 
 ## Queries and recall
 
-- Lexical ranking uses Tantivy with distinct title, body, memory and chat fields.
+- Lexical ranking uses Tantivy with title, body (shared across searchable note
+  classes, including agent memory) and chat fields (`TOKENIZER_VERSION = 2`).
+  Filter metadata is stored in fast fields without stored note or chat text.
   English and Russian prose use case folding and stemming. Exact fields retain
   code identifiers and path terms. Quoted clauses match phrase positions.
-  Rare terms check matching postings directly. Broad queries can switch to a
-  segment-wide mask. Both paths observe the request deadline and cancellation.
+  Rare terms check matching postings directly, while broad queries switch to a
+  segment-wide mask and score-thresholded top-K collection. Multi-term queries
+  fall back to single-term matching only when fewer than `min(top_k, 10)` hits
+  match all terms. Both paths observe the request deadline and cancellation.
 - Folder and structural filters apply before ranking. A blank query with a
-  filter browses notes in stable ID order. Personal chat hits enter the ranking
-  only for an authorized personal audience. Hydration rechecks thread access
-  and the live reachable branch. A project-scoped Keeper can search its
-  explicitly pinned skills outside the project when no folder is requested.
+  filter browses notes in stable ID order using per-segment term ordinals.
+  Personal chat hits enter the ranking only for an authorized personal
+  audience. Hydration rechecks thread access and the live reachable branch. A
+  project-scoped Keeper can search its explicitly pinned skills outside the
+  project when no folder is requested.
 - The hybrid path fuses lexical and vector ranks with reciprocal rank fusion
   (`k = 60`). Recall can expand the leading notes through up to two graph hops.
   It serves the best eligible chunk per note first, then fills the remaining
   token budget with ranked chunks. Lexical fallback ranks chunks by matching
   phrases and normalized terms. Each chunk carries canonical source spans.
 - Wait watermarks require a caught-up search cut. A bounded set of exact
-  receipts can score the named canonical revisions while the indexes catch up.
+  receipts can score the named canonical revisions while the indexes catch up,
+  using a lightweight in-memory single-segment overlay writer outside the disk
+  writer pool (skipped for blank browse queries).
   The overlay evaluates receipt revisions against the field schema at the base
   cut and masks their older indexed hits. Exact carriers pass both historical and
   current authorization before ranking. Intervening folder or schema changes
@@ -54,23 +61,32 @@ change when its folder moves to another project.
 A manifest identifies the active lexical generation and
 the vector checkpoint. After an edit the worker invalidates the old vector slots
 before publishing the new lexical cut. The pending marker keeps outstanding
-embedding work recoverable after restart. Readers pin a cut through ArcSwap. Idle
-Spaces release their lexical reader pins and retain their subscriptions. After
-60 seconds without vector activity, they release the in-memory vector state
-and embedder. On the next access, the lexical cut can serve queries while the
-worker reopens the durable vector epoch and journal. Disk and
-receipt-overlay writers share the four-writer pool.
+embedding work recoverable after restart. Readers pin a cut through ArcSwap.
+Idle Spaces release their cached embedder handles after 60 seconds without
+vector activity while retaining lightweight mmap vector epochs until idle
+worker eviction (30 seconds without lexical activity triggers idle
+housekeeping, and archived Spaces retire and unload immediately). Disk indexing
+shares the bounded four-writer pool, while exact receipt overlays run in
+ephemeral in-memory writers outside that pool.
 
-Vectors use a bounded mutable journal and read-only, checksummed mmap
-segments. The segment contains normalized, per-vector i8 embeddings and a
-CSR-HNSW graph built in Rust. An individual upsert that exceeds the journal
-capacity writes a replacement segment directly. SIMD scans serve selective
-filters up to 16,384 eligible slots per segment. Epoch identity includes the
-profile, dimension and input token cap. Remote epochs also bind the provider,
-its resource and credential runtime generations, and the selected project.
-The previous compatible epoch remains available while the replacement embeds
-its eligible corpus and catches up with edits. Readers switch to the new model
-and its vectors together.
+Vectors use a bounded mutable L0 journal (capped at 16 MiB with batched fsync)
+and read-only, single-pass BLAKE3-checksummed v2 mmap segments (bounded to
+112 MiB per segment build). Each segment contains normalized, per-vector i8
+embeddings, a CSR-HNSW graph built in Rust, sorted note-slot and content-key
+indexes, and precomputed class/folder filter bitmaps. Non-blocking partial
+compaction plans and writes replacement segments outside the reader lock before
+committing atomically. An individual upsert that exceeds the journal capacity
+writes a replacement segment directly. SIMD scans serve selective filters up to
+16,384 eligible slots per segment. Epoch identity includes the profile,
+dimension and input token cap. Remote epochs also bind the provider, its
+resource and credential runtime generations, and the selected project.
+When switching from a local model or changing models within the same remote
+provider and runtime generations, the previous epoch remains available while
+the replacement embeds its eligible corpus and catches up with edits. Switching
+remote providers, rotating runtime generations, or leaving a remote provider
+immediately stops sending query plaintext to the prior remote recipient and
+serves lexical results with `EmbeddingsPending` until the replacement epoch is
+ready. Readers switch to the new model and its vectors together.
 
 Encrypted notes are excluded. A purge invalidates the affected search cut and
 removes its retired disk copies before building a clean generation. On restart
@@ -94,28 +110,34 @@ and supply its canonical absolute library path. Under the configured model
 directory, each profile contains `<model-id>/model.onnx` with inline weights
 and `<model-id>/tokenizer.json`. The graph accepts `input_ids` and
 `attention_mask`, and can also accept `token_type_ids`. The output is a pooled
-float32 matrix or a per-token float32 tensor. For token-level outputs the
-resolver selects masked mean pooling with `LocalOnnx` or the first token with
-`LocalOnnxCls`, according to the model profile. Search normalizes the result
-and uses a separate local vector epoch for each pooling mode. The tokenizer
-supports WordPiece, BPE and Unigram profiles with the supported Hugging Face preprocessing stages. Unsupported
-model formats produce lexical degradation.
+2D float32 matrix (`sentence_embedding`) or a per-token 3D float32 tensor
+(`last_hidden_state`). For token-level outputs the resolver selects masked mean
+pooling with `LocalOnnx` or the first token with `LocalOnnxCls`, according to
+the model profile. Search normalizes the result and uses a separate local
+vector epoch for each pooling mode. The tokenizer supports WordPiece and BPE
+profiles with the supported Hugging Face preprocessing stages and bounds single
+inputs to 64 KiB. Unsupported model formats produce lexical degradation.
 
-`VectorMode::RemoteOnly` uses `SearchModelResolverPort` and the typed provider
-port. Background indexing obtains a current disclosure grant for the revision
-actor before reusing a vector or sending a part. Each scheduled part batch
-rechecks the selected target before dispatch. Interactive requests require
-an untainted context, a matching project scope, and a nonempty intersection
-of search classes and provider disclosure. Provider admission rechecks current
-access and token limits. Dispatch compares both resolved runtime generations
-and checks the shared taint. Remote indexing excludes descendants of trashed
-folders. Chat text stays in the lexical index.
+`VectorMode::RemoteOnly` uses `SearchModelResolverPort` (which resolves
+Space-level embedding targets, composable with
+`ProviderService::resolve_search_embedding_model`) and the typed provider port.
+Background indexing obtains a current disclosure grant for the revision actor
+before reusing a vector or sending a part. Each scheduled part batch rechecks
+the selected target before dispatch. Interactive requests require an untainted
+context, a matching project scope, and a nonempty intersection of search
+classes and provider disclosure. Provider admission rechecks current access and
+token limits. Dispatch compares both resolved runtime generations and checks
+the shared taint. Remote indexing excludes descendants of trashed folders. Chat
+text stays in the lexical index.
 
-The embedding worker runs one bounded batch at a time. It checks interactive
-requests first, then live edits, then import and backfill. Batches contain at
-most 16 chunks and respect the model's aggregate token cap. Interactive
-embedding work has a deadline of at most 150 ms, including queueing. On expiry,
-the query uses lexical ranking and cancellation signals the active backend.
+Local CPU ONNX inference and remote provider calls run on separate bounded
+priority schedulers so remote network latency never starves local inference.
+Each scheduler runs one bounded batch at a time and checks interactive requests
+first, then live edits, then import and backfill. Batches contain at most 16
+chunks (for both local ONNX and remote providers) and respect the model's
+aggregate token cap. Interactive embedding work has a deadline of at most
+150 ms, including queueing. On expiry, the query uses lexical ranking and
+cancellation signals the active backend.
 The durable pending state schedules bounded repair when embeddings are missing.
 Each page can finish while unrelated edits arrive. If a note changes during
 its embedding call, the worker discards that result and retries the new text.
@@ -130,8 +152,9 @@ Unix sockets. Missing fixtures fail the relevant tests.
 The two-dialect integration checks the interactive provider budget, lexical
 fallback, and provider cancellation. To measure full fallback responses against
 the 200 ms target, run the scenarios sequentially on an idle runner. The command
-prints a `search-fallback-elapsed-us` sample per dialect and a
-`search-onnx-fallback-elapsed-us` sample for the local runtime.
+emits a `search-fallback-elapsed-us` sample per dialect and a
+`search-onnx-fallback-elapsed-us` sample for the local runtime to standard
+error.
 
 ```sh
 sh docker/storage-fixtures/with-storage-fixtures.sh exec-custom \
@@ -146,12 +169,15 @@ make benchmark-search > .artifacts/search-scale/report.json
 
 The release gate writes 100,000 canonical fixture notes and builds 400,000
 384-dimensional chunks under the writable Cargo target. It measures BM25 at
-the production candidate limit, hybrid retrieval and fusion, and the selective
-SIMD path. Independent RRF over exact quantized search gives the hybrid recall
-reference. The report includes the sampled peak allocated index bytes, verified
-canonical descendants of a moved folder, index file changes, background chunks
-processed before interactive work starts, the queue depths at release of the
-active batch, and the cgroup and SIMD settings.
+the production candidate limit, broad and blank browse query lookup counts,
+hybrid retrieval and fusion, selective SIMD scans, warm vector epoch reopen,
+and non-blocking compaction. Independent RRF over exact quantized search and
+an unquantized float32 cosine reference measure ANN and quantization recall.
+The report includes sampled peak allocated index bytes, process anonymous RSS
+and HWM across build, reopen and compaction, verified canonical descendants and
+post-move search visibility of a moved folder, index file changes, background
+chunks processed before interactive work starts, the queue depths at release of
+the active batch, and the cgroup and SIMD settings.
 The gate fails when a threshold is missed and removes its temporary data on
 exit. The latency samples cover index operations. Canonical hydration, provider
 calls, and transport have separate tests and budgets.

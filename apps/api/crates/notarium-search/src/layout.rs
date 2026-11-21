@@ -1,10 +1,10 @@
 //! Space-local search generations and stable folder ordinals.
 
 use crate::ports::ResolvedEmbeddingTarget;
-use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt, OpenOptionsMaybeDirExt};
+use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::{
     ambient_authority,
-    fs::{Dir, OpenOptions},
+    fs::{Dir, File, OpenOptions},
 };
 use notarium_core::{
     epoch::{DataRoot, SearchIndexKind},
@@ -17,7 +17,7 @@ use std::{
     collections::HashMap,
     io::{self, Read, Write},
     num::NonZeroU32,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
 
@@ -279,7 +279,7 @@ impl SearchLayout {
     }
 
     pub fn remove_index_generation(&self, generation: u64) -> Result<(), LayoutError> {
-        self.tantivy.remove_dir_all(index_name(generation))?;
+        remove_dir_all_readonly(&self.tantivy, index_name(generation))?;
         sync_dir(&self.tantivy)?;
         Ok(())
     }
@@ -288,13 +288,37 @@ impl SearchLayout {
         let mut generations = Vec::new();
         for entry in self.tantivy.entries()? {
             let entry = entry?;
+            let file_type = entry.file_type()?;
+            if file_type.is_symlink() {
+                return Err(LayoutError::Corrupt);
+            }
             let name = entry.file_name();
-            let Some(name) = name.to_str().filter(|name| name.starts_with("index_")) else {
+            let Some(name_str) = name.to_str() else {
+                tracing::warn!(
+                    entry = ?name,
+                    "ignoring non-utf8 entry in tantivy search directory"
+                );
                 continue;
             };
-            let generation = parse_index_name(name)?;
-            if !entry.file_type()?.is_dir() {
-                return Err(LayoutError::Corrupt);
+            let Some(generation) = name_str
+                .starts_with("index_")
+                .then(|| parse_index_name(name_str).ok())
+                .flatten()
+            else {
+                if !matches!(name_str, SEARCH_MANIFEST | FOLDER_DICTIONARY) {
+                    tracing::warn!(
+                        entry = name_str,
+                        "ignoring unexpected entry in tantivy search directory"
+                    );
+                }
+                continue;
+            };
+            if !file_type.is_dir() {
+                tracing::warn!(
+                    entry = name_str,
+                    "ignoring non-directory entry matching index generation prefix"
+                );
+                continue;
             }
             generations.push(generation);
         }
@@ -308,6 +332,10 @@ impl SearchLayout {
         let preserve = preserve.map(model_epoch_name);
         for entry in self.vector.entries()? {
             let entry = entry?;
+            let file_type = entry.file_type()?;
+            if file_type.is_symlink() {
+                return Err(LayoutError::Corrupt);
+            }
             let name = entry.file_name();
             let valid = name.to_str().is_some_and(|name| {
                 name.len() == 16
@@ -315,11 +343,15 @@ impl SearchLayout {
                         .bytes()
                         .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
             });
-            if !valid || !entry.file_type()?.is_dir() {
-                return Err(LayoutError::Corrupt);
+            if !valid || !file_type.is_dir() {
+                tracing::warn!(
+                    entry = ?name,
+                    "ignoring unexpected entry in vector search directory"
+                );
+                continue;
             }
             if name.to_str() != preserve.as_deref() {
-                self.vector.remove_dir_all(name)?;
+                remove_dir_all_readonly(&self.vector, &name)?;
             }
         }
         sync_dir(&self.vector)?;
@@ -329,7 +361,7 @@ impl SearchLayout {
     pub fn remove_model_epoch(&self, model: &VectorModel) -> Result<(), LayoutError> {
         let name = model_epoch_name(model);
         match self.vector.open_dir_nofollow(&name) {
-            Ok(_) => self.vector.remove_dir_all(&name)?,
+            Ok(_) => remove_dir_all_readonly(&self.vector, &name)?,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(error.into()),
         }
@@ -480,17 +512,97 @@ fn open_or_create(parent: &Dir, name: &str) -> io::Result<Dir> {
     }
 }
 
-fn sync_dir(dir: &Dir) -> io::Result<()> {
+#[cfg(unix)]
+pub(crate) fn sync_dir(dir: &Dir) -> io::Result<()> {
+    use cap_fs_ext::OpenOptionsMaybeDirExt;
+
     dir.open_with(".", OpenOptions::new().read(true).maybe_dir(true))?
         .sync_all()
 }
 
-pub(crate) fn atomic_file(dir: &Dir, name: &str, bytes: &[u8]) -> Result<(), LayoutError> {
+#[cfg(not(unix))]
+pub(crate) fn sync_dir(_dir: &Dir) -> io::Result<()> {
+    // Directory handles cannot be flushed portably on Windows/non-Unix
+    // filesystems; derived indexes always rebuild on missing or corrupt files.
+    Ok(())
+}
+
+pub(crate) fn remove_file_if_exists(dir: &Dir, name: impl AsRef<Path>) -> io::Result<()> {
+    let name = name.as_ref();
+    #[cfg(windows)]
+    if let Ok(meta) = dir.symlink_metadata(name)
+        && meta.is_file()
+        && meta.permissions().readonly()
+    {
+        let mut permissions = meta.permissions();
+        permissions.set_readonly(false);
+        dir.set_permissions(name, permissions)?;
+    }
+    match dir.remove_file(name) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        result => result,
+    }
+}
+
+pub(crate) fn remove_path_if_exists(path: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    if let Ok(meta) = std::fs::symlink_metadata(path)
+        && meta.is_file()
+        && meta.permissions().readonly()
+    {
+        let mut permissions = meta.permissions();
+        permissions.set_readonly(false);
+        std::fs::set_permissions(path, permissions)?;
+    }
+    match std::fs::remove_file(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        result => result,
+    }
+}
+
+#[cfg(windows)]
+fn clear_readonly_in_dir(dir: &Dir) -> io::Result<()> {
+    for entry in dir.entries()? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let name = entry.file_name();
+        if file_type.is_dir() {
+            let child = dir.open_dir_nofollow(&name)?;
+            clear_readonly_in_dir(&child)?;
+        } else if file_type.is_file() {
+            let meta = dir.symlink_metadata(&name)?;
+            if meta.permissions().readonly() {
+                let mut permissions = meta.permissions();
+                permissions.set_readonly(false);
+                dir.set_permissions(&name, permissions)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn remove_dir_all_readonly(parent: &Dir, name: impl AsRef<Path>) -> io::Result<()> {
+    let name = name.as_ref();
+    #[cfg(windows)]
+    if let Ok(child) = parent.open_dir_nofollow(name) {
+        clear_readonly_in_dir(&child)?;
+    }
+    parent.remove_dir_all(name)
+}
+
+pub(crate) fn atomic_write_with<E>(
+    dir: &Dir,
+    name: &str,
+    write_fn: impl FnOnce(&mut File) -> Result<(), E>,
+) -> Result<(), E>
+where
+    E: From<LayoutError>,
+{
     match dir.symlink_metadata(name) {
-        Ok(meta) if !meta.is_file() => return Err(LayoutError::Corrupt),
+        Ok(meta) if !meta.is_file() => return Err(LayoutError::Corrupt.into()),
         Ok(_) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
+        Err(error) => return Err(LayoutError::from(error).into()),
     }
     let options = OpenOptions::new()
         .write(true)
@@ -503,21 +615,27 @@ pub(crate) fn atomic_file(dir: &Dir, name: &str, bytes: &[u8]) -> Result<(), Lay
         match dir.open_with(&tmp, &options) {
             Ok(file) => break (tmp, file),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error.into()),
+            Err(error) => return Err(LayoutError::from(error).into()),
         }
     };
-    let write = (|| {
-        file.write_all(bytes)?;
-        file.sync_data()?;
+    let write: Result<(), E> = (|| -> Result<(), E> {
+        write_fn(&mut file)?;
+        file.sync_data().map_err(LayoutError::from)?;
         drop(file);
-        dir.rename(&tmp, dir, name)?;
-        sync_dir(dir)?;
+        dir.rename(&tmp, dir, name).map_err(LayoutError::from)?;
+        sync_dir(dir).map_err(LayoutError::from)?;
         Ok(())
     })();
     if write.is_err() {
-        let _ = dir.remove_file(&tmp);
+        let _ = remove_file_if_exists(dir, &tmp);
     }
     write
+}
+
+pub(crate) fn atomic_file(dir: &Dir, name: &str, bytes: &[u8]) -> Result<(), LayoutError> {
+    atomic_write_with(dir, name, |file| {
+        file.write_all(bytes).map_err(LayoutError::from)
+    })
 }
 
 fn read_bounded(dir: &Dir, name: &str, limit: u64) -> Result<Option<Vec<u8>>, LayoutError> {
@@ -715,6 +833,45 @@ mod tests {
                 .is_err()
         );
         assert!(layout.folder_dictionary().is_err());
+    }
+
+    #[test]
+    fn stray_regular_files_are_ignored_while_symlinks_still_fail_closed() {
+        let scratch = TestRoot::create();
+        let root = DataRoot::new(&scratch.0);
+        let scope = scope();
+        let layout = SearchLayout::open(&root, scope.clone()).unwrap();
+        let tantivy_dir = root.search(&scope.space_id, SearchIndexKind::Tantivy);
+        let vector_dir = root.search(&scope.space_id, SearchIndexKind::Vector);
+
+        layout.create_index_generation(1).unwrap();
+        fs::write(tantivy_dir.join(".DS_Store"), b"finder").unwrap();
+        fs::write(tantivy_dir.join("index_stray_file"), b"junk").unwrap();
+        assert_eq!(layout.index_generations().unwrap(), vec![1]);
+
+        let model = VectorModel::local(ModelProfileId::from_bytes([9; 16]), 64);
+        let epoch_dir = layout.model_epoch(&model).unwrap();
+        assert!(epoch_dir.exists());
+        fs::write(vector_dir.join(".DS_Store"), b"finder").unwrap();
+        layout.remove_vector_epochs(None).unwrap();
+        assert!(!epoch_dir.exists());
+        assert!(vector_dir.join(".DS_Store").exists());
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&scratch.0, vector_dir.join("deadbeefdeadbeef")).unwrap();
+            assert!(matches!(
+                layout.remove_vector_epochs(None),
+                Err(LayoutError::Corrupt)
+            ));
+            fs::remove_file(vector_dir.join("deadbeefdeadbeef")).unwrap();
+
+            std::os::unix::fs::symlink(&scratch.0, tantivy_dir.join("stray_link")).unwrap();
+            assert!(matches!(
+                layout.index_generations(),
+                Err(LayoutError::Corrupt)
+            ));
+        }
     }
 }
 

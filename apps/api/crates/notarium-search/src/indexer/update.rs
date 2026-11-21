@@ -1,41 +1,53 @@
-use super::{ChangedNotes, Context, Disk, IndexError, Publisher, build, during_model_work};
+use super::{Context, Disk, IndexError, Publisher, build, new_budget};
 use crate::{
-    embed::Priority,
+    embed::{EmbeddingError, Priority},
+    engine::Services,
     layout::{FolderDictionary, FolderOrd},
     lexical::Update,
-    model::{Embedder, IndexNote},
+    model::{Embedder, IndexNote, NoteIndexOutcome},
     ports::SearchIndexedNote,
-    vector::{MutableOperation, VectorChunk, VectorSnapshot},
+    vector::{MutableOperation, QuantizedVector, VectorChunk, VectorError, VectorSnapshot},
 };
-use notarium_canonical::chats::search::HydratedChatHit;
+use notarium_canonical::chats::search::{HydratedChatHit, SearchChatDeltaPlan};
 use notarium_core::{
-    classes::{DocClass, SearchContent},
-    ids::{ChatThreadId, NoteId, ThreadEntrySeq},
+    classes::{ClassEgressFence, DocClass, SearchContent},
+    ids::{ChatThreadId, ContentDigest, FolderId, NoteId, SpaceSeq, ThreadEntrySeq},
     model::Lifecycle,
-    ports::{Change, ChangeKind, EntityId, PageLimit},
+    ports::{Cancellation, Change, ChangeKind, EntityId, PageLimit},
     receipt::ChangeCursor,
 };
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     sync::Arc,
-    time::{Duration, Instant},
 };
 
-pub(super) fn requires_scrub(disk: &Disk, changes: &[Change]) -> Result<bool, IndexError> {
-    let lexical = disk.lexical.as_ref().ok_or(IndexError::Inconsistent)?;
-    let searcher = lexical.searcher();
+pub(super) async fn requires_scrub(disk: &Disk, changes: &[Change]) -> Result<bool, IndexError> {
+    let mut encrypted_notes = Vec::new();
     for change in changes {
         if change.kind == ChangeKind::Purge || change.lifecycle == Lifecycle::Purged {
             return Ok(true);
         }
         if change.class == Some(DocClass::EncryptedNote)
             && let EntityId::Note(note) = &change.entity
-            && lexical.contains_note(&searcher, note)?
         {
-            return Ok(true);
+            encrypted_notes.push(note.clone());
         }
     }
-    Ok(false)
+    if encrypted_notes.is_empty() {
+        return Ok(false);
+    }
+    let lexical = disk.lexical.clone().ok_or(IndexError::Inconsistent)?;
+    tokio::task::spawn_blocking(move || -> Result<bool, IndexError> {
+        let searcher = lexical.searcher();
+        for note in &encrypted_notes {
+            if lexical.contains_note(&searcher, note)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    })
+    .await
+    .map_err(|_| IndexError::Inconsistent)?
 }
 
 pub(super) async fn apply(
@@ -44,10 +56,11 @@ pub(super) async fn apply(
     publisher: &mut Publisher<'_>,
     cutoff: ChangeCursor,
     changes: Vec<Change>,
-    defer_embeddings: bool,
+    reopening: bool,
 ) -> Result<(), IndexError> {
     let mut notes = BTreeMap::new();
     let mut threads = BTreeSet::new();
+    let mut active_folders = Vec::new();
     for change in changes {
         match change.entity {
             EntityId::Note(note) => {
@@ -56,48 +69,87 @@ pub(super) async fn apply(
             EntityId::Thread(thread) => {
                 threads.insert(thread);
             }
-            EntityId::Folder(_)
+            EntityId::Folder(folder) => {
+                if change.lifecycle == Lifecycle::Active {
+                    active_folders.push(folder);
+                }
                 if matches!(change.kind, ChangeKind::Restore | ChangeKind::Move)
                     && disk.manifest.active_model.as_ref().is_some_and(|target| {
                         matches!(
                             target.backend,
                             crate::ports::EmbeddingBackendTarget::Remote { .. }
                         )
-                    }) =>
-            {
-                // Each remote grant uses the note's actual project, including
-                // when the selected model serves the entire space.
-                disk.manifest.embeddings_pending = true;
-                disk.embedding_failures = disk.embedding_failures.wrapping_add(1);
+                    })
+                {
+                    // Each remote grant uses the note's actual project, including
+                    // when the selected model serves the entire space.
+                    disk.manifest.embeddings_pending = true;
+                    disk.full_sweep_needed = true;
+                }
             }
-            EntityId::Folder(_) | EntityId::Ability(_) | EntityId::Job(_) => {}
+            EntityId::Ability(_) | EntityId::Job(_) => {}
         }
     }
     if notes.is_empty() && threads.is_empty() {
+        if !active_folders.is_empty() {
+            let folders = Arc::make_mut(&mut disk.folders);
+            let before = folders.len();
+            for folder in active_folders {
+                folders.insert(folder)?;
+            }
+            if folders.len() != before {
+                let layout = disk.layout.clone();
+                let snapshot_folders = disk.folders.clone();
+                tokio::task::spawn_blocking(move || {
+                    build::save_new_folders(&layout, &snapshot_folders, before)
+                })
+                .await
+                .map_err(|_| IndexError::Inconsistent)??;
+            }
+        }
         disk.manifest.tantivy_seq = cutoff.after;
-        disk.layout.publish_search(&disk.manifest)?;
-        publisher.publish(disk);
+        disk.publish_manifest().await?;
+        publisher.publish(disk, reopening);
         return Ok(());
     }
 
-    let lexical = disk
-        .lexical
-        .as_ref()
-        .ok_or(IndexError::Inconsistent)?
-        .clone();
-    let previous = lexical.searcher();
+    let lexical = disk.lexical.clone().ok_or(IndexError::Inconsistent)?;
     let folders = Arc::make_mut(&mut disk.folders);
     let old_folder_count = folders.len();
-    let mut deleted = BTreeSet::new();
+    for folder in active_folders {
+        folders.insert(folder)?;
+    }
+
     let mut active = Vec::new();
+    let mut inactive_candidates = Vec::new();
     for (note, (lifecycle, class)) in notes {
         if lifecycle == Lifecycle::Active && class != Some(DocClass::EncryptedNote) {
             active.push(note);
-        } else if lexical.contains_note(&previous, &note)? {
-            deleted.insert(note);
+        } else {
+            inactive_candidates.push(note);
         }
     }
+
+    let mut deleted: BTreeSet<NoteId> = if inactive_candidates.is_empty() {
+        BTreeSet::new()
+    } else {
+        let lexical_check = lexical.clone();
+        tokio::task::spawn_blocking(move || -> Result<BTreeSet<NoteId>, IndexError> {
+            let searcher = lexical_check.searcher();
+            let mut found = BTreeSet::new();
+            for note in inactive_candidates {
+                if lexical_check.contains_note(&searcher, &note)? {
+                    found.insert(note);
+                }
+            }
+            Ok(found)
+        })
+        .await
+        .map_err(|_| IndexError::Inconsistent)??
+    };
+
     let mut updated_notes = Vec::new();
+    let mut missing_or_denied = Vec::new();
     for ids in active.chunks(200) {
         for (id, carrier) in cx
             .services
@@ -120,380 +172,422 @@ pub(super) async fn apply(
                     content,
                     folder,
                 });
-            } else if lexical.contains_note(&previous, &id)? {
-                deleted.insert(id);
+            } else {
+                missing_or_denied.push(id);
             }
         }
     }
-    let chat = reconcile_chats(cx, disk, &previous, &cutoff, threads).await?;
-    drop(previous);
-    let folders = Arc::make_mut(&mut disk.folders);
-    let mut updates = build::chat_updates(folders, &chat.added)?;
-    updates.extend(
-        chat.removed
-            .iter()
-            .map(|(thread, seq)| Update::RemoveChat(thread, *seq)),
-    );
-    updates.extend(deleted.iter().map(Update::RemoveNote));
-    updates.extend(updated_notes.iter().map(|note| Update::Note {
-        content: &note.content,
-        title: &note.row.title,
-        folder: note.folder,
-    }));
-    build::save_new_folders(&disk.layout, folders, old_folder_count)?;
-
-    if !updates.is_empty() {
-        // The opstamp detects interrupted updates before a newer vector cut
-        // could be paired with an older lexical publication on restart.
-        lexical.apply(&cx.services.writers, &updates)?;
-        if !chat.removed.is_empty() {
-            lexical.merge_deleted(&cx.services.writers)?;
-        }
-        disk.manifest.tantivy_commit = lexical.commit_id()?;
+    if !missing_or_denied.is_empty() {
+        let lexical_check = lexical.clone();
+        let found = tokio::task::spawn_blocking(move || -> Result<Vec<NoteId>, IndexError> {
+            let searcher = lexical_check.searcher();
+            let mut found = Vec::new();
+            for id in missing_or_denied {
+                if lexical_check.contains_note(&searcher, &id)? {
+                    found.push(id);
+                }
+            }
+            Ok(found)
+        })
+        .await
+        .map_err(|_| IndexError::Inconsistent)??;
+        deleted.extend(found);
     }
-    let previous_pending = disk.manifest.embeddings_pending;
-    let mut previous_vectors = std::collections::HashMap::new();
+
+    let previous_cutoff = disk.manifest.tantivy_seq;
+    let chat = reconcile_chats(cx, &lexical, previous_cutoff, &cutoff, threads).await?;
+    let folders = Arc::make_mut(&mut disk.folders);
+    let mut chat_rows = Vec::with_capacity(chat.added.len());
+    for hit in chat.added {
+        let folder = hit
+            .project_folder
+            .as_ref()
+            .map(|folder| folders.insert(folder.clone()))
+            .transpose()?;
+        chat_rows.push((hit, folder));
+    }
+    let has_chat_removed = !chat.removed.is_empty();
+    let updated_note_ids: Vec<NoteId> = updated_notes
+        .iter()
+        .map(|note| note.row.note_id.clone())
+        .collect();
+    let deleted_ids: Vec<NoteId> = deleted.iter().cloned().collect();
+
+    let needs_folders = folders.len() != old_folder_count;
+    let folders_snapshot = needs_folders.then(|| disk.folders.clone());
+    let layout = disk.layout.clone();
+    let writers = cx.services.writers.clone();
+    let lexical_apply = lexical.clone();
+    let chat_removed = chat.removed;
+    let new_commit_id = tokio::task::spawn_blocking(move || -> Result<Option<u64>, IndexError> {
+        if let Some(dict) = folders_snapshot {
+            build::save_new_folders(&layout, &dict, old_folder_count)?;
+        }
+        let mut updates = Vec::with_capacity(
+            chat_rows.len() + chat_removed.len() + deleted.len() + updated_notes.len(),
+        );
+        for (hit, folder) in &chat_rows {
+            updates.push(Update::Chat {
+                hit,
+                folder: *folder,
+            });
+        }
+        for (thread, seq) in &chat_removed {
+            updates.push(Update::RemoveChat(thread, *seq));
+        }
+        for id in &deleted {
+            updates.push(Update::RemoveNote(id));
+        }
+        for note in &updated_notes {
+            updates.push(Update::Note {
+                content: &note.content,
+                title: &note.row.title,
+                folder: note.folder,
+            });
+        }
+        if updates.is_empty() {
+            return Ok(None);
+        }
+        lexical_apply.apply(&writers, &updates)?;
+        if !chat_removed.is_empty() {
+            lexical_apply.merge_deleted(&writers)?;
+        }
+        Ok(Some(lexical_apply.commit_id()?))
+    })
+    .await
+    .map_err(|_| IndexError::Inconsistent)??;
+
+    if let Some(commit_id) = new_commit_id {
+        disk.manifest.tantivy_commit = commit_id;
+    }
+
     if disk.epoch.is_none()
         && disk.manifest.vector_seq.is_some()
-        && (!updated_notes.is_empty() || !deleted.is_empty())
+        && (!updated_note_ids.is_empty() || !deleted_ids.is_empty())
     {
         // A concurrent warm reopen will mask the changed slots after validation.
         // A crash before then must not expose their previous revisions.
         disk.manifest.vector_seq = None;
         disk.manifest.embeddings_pending = true;
     }
-    if let Some(epoch) = &mut disk.epoch
-        && (!updated_notes.is_empty() || !deleted.is_empty())
-    {
-        for update in &updated_notes {
-            let id = &update.row.note_id;
-            for chunk in epoch.mutable_note_chunks(id) {
-                previous_vectors
-                    .entry(chunk.metadata.key)
-                    .or_insert_with(|| chunk.vector.clone());
+
+    if disk.epoch.is_some() && (!updated_note_ids.is_empty() || !deleted_ids.is_empty()) {
+        for id in &updated_note_ids {
+            let chunks = disk
+                .epoch
+                .as_ref()
+                .map(|epoch| epoch.mutable_note_chunks(id).to_vec())
+                .unwrap_or_default();
+            if !chunks.is_empty() {
+                disk.cache_vectors(&chunks);
             }
-            epoch.apply(cutoff.after, MutableOperation::Delete(id.clone()))?;
         }
-        for id in deleted {
-            epoch.apply(cutoff.after, MutableOperation::Delete(id))?;
-        }
-        epoch.checkpoint(cutoff.after)?;
-        disk.manifest.vector_seq = Some(cutoff.after);
-        disk.manifest.embeddings_pending |= !updated_notes.is_empty();
+        let mut delete_ops = Vec::with_capacity(updated_note_ids.len() + deleted_ids.len());
+        delete_ops.extend(
+            updated_note_ids
+                .iter()
+                .cloned()
+                .map(MutableOperation::Delete),
+        );
+        delete_ops.extend(deleted_ids.iter().cloned().map(MutableOperation::Delete));
+        let mut epoch = disk.epoch.take().ok_or(IndexError::Inconsistent)?;
+        let seq = cutoff.after;
+        let epoch = tokio::task::spawn_blocking(move || -> Result<_, VectorError> {
+            epoch.apply_batch(seq, delete_ops)?;
+            epoch.checkpoint(seq)?;
+            Ok(epoch)
+        })
+        .await
+        .map_err(|_| IndexError::Inconsistent)??;
+        disk.epoch = Some(epoch);
+        disk.manifest.vector_seq = Some(seq);
+        disk.manifest.embeddings_pending |= !updated_note_ids.is_empty();
     }
-    if !chat.removed.is_empty() {
+
+    for id in &deleted_ids {
+        disk.dirty_notes.remove(id);
+    }
+    if !updated_note_ids.is_empty() && (disk.epoch.is_some() || disk.manifest.vector_seq.is_some())
+    {
+        disk.dirty_notes.extend(updated_note_ids);
+        disk.manifest.embeddings_pending = true;
+    }
+
+    if has_chat_removed {
         publisher.replace(None);
         publisher.drain().await;
-        lexical.collect_obsolete(&cx.services.writers)?;
+        let writers = cx.services.writers.clone();
+        let lexical_gc = lexical.clone();
+        tokio::task::spawn_blocking(move || lexical_gc.collect_obsolete(&writers))
+            .await
+            .map_err(|_| IndexError::Inconsistent)??;
     }
+
     disk.manifest.tantivy_seq = cutoff.after;
     // Publishing the cut certifies that any redacted files have been removed.
-    disk.layout.publish_search(&disk.manifest)?;
-    publisher.publish(disk);
-    if defer_embeddings && !updated_notes.is_empty() {
-        disk.embedding_failures = disk.embedding_failures.wrapping_add(1);
-        return Ok(());
-    }
-    if disk.epoch.is_some() && !updated_notes.is_empty() {
-        // Missing work survives a crash in the pending manifest. Readers can
-        // already search the new text and cannot rank the old vector slots.
-        let pending = cx
-            .while_current(&cutoff, async {
-                let selected = cx.services.model_target(&cutoff.scope, None, None).await;
-                if !matches!(selected, Ok(selected) if selected == disk.manifest.active_model) {
-                    return Ok(true);
-                }
-                disk.ensure_embedder(cx).await;
-                let Some(embedder) = disk.embedder.as_ref() else {
-                    return Ok(true);
-                };
-                let epoch = disk.epoch.as_mut().ok_or(IndexError::Inconsistent)?;
-                let mut pending = false;
-                for note in updated_notes {
-                    let (chunks, missing) = embedder
-                        .index_note(IndexNote {
-                            services: cx.services,
-                            scope: &cutoff.scope,
-                            note: &note.row,
-                            folder: note.folder.get(),
-                            budget: cx.budget(),
-                            priority: Priority::LiveNoteEdit,
-                            existing: &|key| {
-                                previous_vectors
-                                    .get(&key)
-                                    .cloned()
-                                    .or_else(|| epoch.find_vector(key))
-                            },
-                        })
-                        .await?;
-                    pending |= missing;
-                    if !chunks.is_empty() {
-                        epoch.apply(
-                            cutoff.after,
-                            MutableOperation::Upsert {
-                                note: note.row.note_id,
-                                chunks,
-                            },
-                        )?;
-                    }
-                }
-                Ok::<_, IndexError>(pending)
-            })
-            .await?
-            .transpose()?
-            .unwrap_or(true);
-        if pending {
-            disk.embedding_failures = disk.embedding_failures.wrapping_add(1);
-        }
-        disk.manifest.embeddings_pending = previous_pending || pending;
-        disk.epoch
-            .as_mut()
-            .ok_or(IndexError::Inconsistent)?
-            .checkpoint(cutoff.after)?;
-        disk.layout.publish_search(&disk.manifest)?;
-        publisher.publish(disk);
-    }
+    disk.publish_manifest().await?;
+    publisher.publish(disk, reopening);
     Ok(())
 }
 
-pub(super) struct EmbeddingRepair {
-    after: Option<NoteId>,
-    pending: bool,
-    started_failures: u64,
-    next: tokio::time::Instant,
-    backoff: Duration,
+pub(super) enum EmbedBatchMode {
+    DirtyNotes(Vec<NoteId>),
+    FullSweep { after: Option<NoteId> },
 }
 
-impl Default for EmbeddingRepair {
-    fn default() -> Self {
-        let backoff = Duration::from_secs(1);
-        Self {
-            after: None,
-            pending: false,
-            started_failures: 0,
-            next: tokio::time::Instant::now() + backoff,
-            backoff,
-        }
-    }
+pub(super) struct EmbedBatchInput {
+    pub services: Arc<Services>,
+    pub cutoff: ChangeCursor,
+    pub folders: Arc<FolderDictionary>,
+    pub embedder: Arc<Embedder>,
+    pub snapshot: VectorSnapshot,
+    pub cached_vectors: HashMap<ContentDigest, QuantizedVector>,
+    pub mode: EmbedBatchMode,
+    pub cancel: Cancellation,
 }
 
-struct RepairPage {
-    next_after: Option<NoteId>,
-    rows: Vec<PreparedEmbedding>,
+pub(super) struct EmbeddedNoteRow {
+    pub note_id: NoteId,
+    pub content: Option<SearchContent>,
+    pub chunks: Vec<VectorChunk>,
 }
 
-struct PreparedEmbedding {
-    content: SearchContent,
-    chunks: Vec<VectorChunk>,
-    missing: bool,
+pub(super) enum EmbedBatchOutcome {
+    ModelChanged {
+        requeue: Vec<NoteId>,
+    },
+    Backoff {
+        requeue: Vec<NoteId>,
+    },
+    Applied {
+        rows: Vec<EmbeddedNoteRow>,
+        requeue: Vec<NoteId>,
+        missing_folders: BTreeSet<FolderId>,
+        next_sweep_after: Option<NoteId>,
+        was_full_sweep: bool,
+        had_transient_failure: bool,
+    },
 }
 
-impl EmbeddingRepair {
-    pub(super) fn next(&self) -> tokio::time::Instant {
-        self.next
-    }
+pub(super) async fn run_embed_batch(
+    input: EmbedBatchInput,
+) -> Result<EmbedBatchOutcome, IndexError> {
+    let EmbedBatchInput {
+        services,
+        cutoff,
+        folders,
+        embedder,
+        snapshot,
+        cached_vectors,
+        mode,
+        cancel,
+    } = input;
 
-    fn defer(&mut self) {
-        self.next = tokio::time::Instant::now() + self.backoff;
-        self.backoff = (self.backoff * 2).min(Duration::from_secs(300));
-    }
+    let requeue_all = |mode: &EmbedBatchMode| match mode {
+        EmbedBatchMode::DirtyNotes(ids) => ids.clone(),
+        EmbedBatchMode::FullSweep { .. } => Vec::new(),
+    };
 
-    async fn prepare(
-        &self,
-        cx: &Context<'_>,
-        cutoff: &ChangeCursor,
-        folders: &FolderDictionary,
-        embedder: &Embedder,
-        snapshot: &VectorSnapshot,
-    ) -> Result<Option<RepairPage>, IndexError> {
-        let selected = || cx.services.model_target(&cutoff.scope, None, None);
-        if selected().await?.as_ref() != Some(&embedder.target) {
-            return Ok(None);
-        }
-        let page = cx
-            .services
-            .deps
-            .carriers
-            .read_searchable_notes_seed_page(
-                cx.services.authority.clone(),
-                cx.budget(),
-                cutoff.scope.clone(),
-                Some(cutoff.after),
-                self.after.clone(),
-                PageLimit::new(16)?,
-            )
-            .await?;
-        if &page.cutoff != cutoff {
-            return Err(IndexError::Inconsistent);
-        }
-        let mut rows: Vec<PreparedEmbedding> = Vec::with_capacity(page.notes.len());
-        let mut page_keys = HashMap::<_, (usize, usize)>::new();
-        for note in page.notes {
-            let folder = folders
-                .get(&note.parent_folder_id)
-                .ok_or(IndexError::Inconsistent)?;
-            let (chunks, missing) = embedder
-                .index_note(IndexNote {
-                    services: cx.services,
-                    scope: &cutoff.scope,
-                    note: &note,
-                    folder: folder.get(),
-                    budget: cx.budget(),
-                    priority: Priority::BulkImportBackfill,
-                    existing: &|key| {
-                        page_keys
-                            .get(&key)
-                            .map(|&(row, slot)| rows[row].chunks[slot].vector.clone())
-                            .or_else(|| snapshot.find_vector(key))
-                    },
-                })
-                .await?;
-            let content = notarium_core::classes::ClassEgressFence::index_for_search(
-                note.document,
-                &cx.services.authority,
-            )?;
-            for (slot, chunk) in chunks.iter().enumerate() {
-                page_keys
-                    .entry(chunk.metadata.key)
-                    .or_insert((rows.len(), slot));
-            }
-            rows.push(PreparedEmbedding {
-                content,
-                chunks,
-                missing,
+    match services
+        .model_target(&cutoff.scope, None, &new_budget(&cancel))
+        .await
+    {
+        Ok(selected) if selected.as_ref() == Some(&embedder.target) => {}
+        Ok(_) => {
+            return Ok(EmbedBatchOutcome::ModelChanged {
+                requeue: requeue_all(&mode),
             });
         }
-        Ok(
-            (selected().await?.as_ref() == Some(&embedder.target)).then_some(RepairPage {
-                next_after: page.next_after,
-                rows,
-            }),
-        )
+        Err(_) => {
+            return Ok(EmbedBatchOutcome::Backoff {
+                requeue: requeue_all(&mode),
+            });
+        }
     }
 
-    /// Use the durable pending bit to resume a bounded pass after restart.
-    /// A failed live edit during a pass leaves the next pass armed.
-    pub(super) async fn page(
-        &mut self,
-        cx: &Context<'_>,
-        disk: &mut Disk,
-        publisher: &mut Publisher<'_>,
-    ) -> Result<bool, IndexError> {
-        let Some(embedder) = disk.embedder.clone() else {
-            self.defer();
-            return Ok(false);
-        };
-        if self.after.is_none() {
-            self.pending = false;
-            self.started_failures = disk.embedding_failures;
+    let (was_full_sweep, next_sweep_after, items) = match &mode {
+        EmbedBatchMode::DirtyNotes(ids) => {
+            let rows = services
+                .deps
+                .carriers
+                .read_note_documents_at_cutoff(
+                    services.authority.clone(),
+                    new_budget(&cancel),
+                    cutoff.scope.clone(),
+                    cutoff.after,
+                    ids.clone(),
+                )
+                .await?;
+            (false, None, rows)
         }
-        let cutoff = disk.cursor();
-        let folders = disk.folders.clone();
-        let snapshot = disk
-            .epoch
-            .as_ref()
-            .ok_or(IndexError::Inconsistent)?
-            .snapshot();
-        let mut dirty = ChangedNotes::default();
-        let computed = during_model_work(
-            cx,
-            disk,
-            publisher,
-            &mut dirty,
-            self.prepare(cx, &cutoff, &folders, &embedder, &snapshot),
-        )
-        .await;
-        let page = match computed {
-            Ok(Some(page)) => page,
-            Ok(None) => {
-                self.defer();
-                return Ok(true);
+        EmbedBatchMode::FullSweep { after } => {
+            let page = services
+                .deps
+                .carriers
+                .read_searchable_notes_seed_page(
+                    services.authority.clone(),
+                    new_budget(&cancel),
+                    cutoff.scope.clone(),
+                    Some(cutoff.after),
+                    after.clone(),
+                    PageLimit::new(100)?,
+                )
+                .await?;
+            if page.cutoff != cutoff {
+                return Err(IndexError::Inconsistent);
             }
-            Err(IndexError::Embedding(_)) => {
-                self.defer();
-                return Ok(false);
-            }
-            Err(error) => return Err(error),
-        };
-        let changed_folders = dirty.take_remote_folders(Some(&embedder.target));
-        let seq = disk.manifest.tantivy_seq;
-        let epoch = disk.epoch.as_mut().ok_or(IndexError::Inconsistent)?;
-        let mut vectors_changed = false;
-        for row in page.rows {
-            let id = &row.content.provenance().reference().note_id;
-            if dirty.notes.contains(id) || row.content.was_under_any_folder(&changed_folders) {
-                self.pending = true;
-                continue;
-            }
-            self.pending |= row.missing;
-            if !epoch.matches_note_chunks(id, &row.chunks) {
-                epoch.apply(
-                    seq,
-                    MutableOperation::Upsert {
-                        note: id.clone(),
-                        chunks: row.chunks,
-                    },
-                )?;
-                vectors_changed = true;
-            }
+            let rows = page
+                .notes
+                .into_iter()
+                .map(|note| (note.note_id.clone(), Some(note)))
+                .collect();
+            (true, page.next_after, rows)
         }
-        self.after = page.next_after;
-        let previous_pending = disk.manifest.embeddings_pending;
-        if self.after.is_none() {
-            let pending = self.pending || self.started_failures != disk.embedding_failures;
-            disk.manifest.embeddings_pending = pending;
-            if pending {
-                self.defer();
-            } else {
-                *self = Self::default();
-            }
-        } else {
-            self.next = tokio::time::Instant::now() + Duration::from_millis(25);
-        }
-        if vectors_changed {
-            epoch.checkpoint(seq)?;
-            disk.manifest.vector_seq = Some(seq);
-        }
-        if vectors_changed || previous_pending != disk.manifest.embeddings_pending {
-            disk.layout.publish_search(&disk.manifest)?;
-            publisher.publish(disk);
-        }
-        Ok(false)
-    }
-}
-
-pub(super) async fn maintain_vectors(
-    disk: &mut Disk,
-    publisher: &mut Publisher<'_>,
-) -> Result<(), IndexError> {
-    let Some(epoch) = &mut disk.epoch else {
-        return Ok(());
     };
-    let compact = epoch.should_compact();
-    if compact || epoch.should_flush(Instant::now()) {
-        let mut epoch = disk.epoch.take().ok_or(IndexError::Inconsistent)?;
-        disk.epoch = Some(
-            tokio::task::spawn_blocking(move || {
-                if compact {
-                    epoch.compact()?;
-                } else {
-                    epoch.flush()?;
-                }
-                Ok::<_, crate::vector::VectorError>(epoch)
+
+    let priority = if was_full_sweep {
+        Priority::BulkImportBackfill
+    } else {
+        Priority::LiveNoteEdit
+    };
+
+    let mut rows: Vec<EmbeddedNoteRow> = Vec::with_capacity(items.len());
+    let mut requeue = Vec::new();
+    let mut missing_folders = BTreeSet::new();
+    let mut page_keys = HashMap::<ContentDigest, (usize, usize)>::new();
+    let mut had_transient_failure = false;
+    let mut hit_model_change = false;
+
+    for (idx, (note_id, carrier)) in items.iter().enumerate() {
+        if cancel.is_cancelled() {
+            for (remaining_id, _) in &items[idx..] {
+                requeue.push(remaining_id.clone());
+            }
+            return Ok(EmbedBatchOutcome::Backoff { requeue });
+        }
+        let Some(note) = carrier else {
+            rows.push(EmbeddedNoteRow {
+                note_id: note_id.clone(),
+                content: None,
+                chunks: Vec::new(),
+            });
+            continue;
+        };
+        if note.document.lifecycle() != Lifecycle::Active
+            || note.document.class() == DocClass::EncryptedNote
+        {
+            rows.push(EmbeddedNoteRow {
+                note_id: note_id.clone(),
+                content: None,
+                chunks: Vec::new(),
+            });
+            continue;
+        }
+        let Ok(content) =
+            ClassEgressFence::index_for_search(note.document.clone(), &services.authority)
+        else {
+            rows.push(EmbeddedNoteRow {
+                note_id: note_id.clone(),
+                content: None,
+                chunks: Vec::new(),
+            });
+            continue;
+        };
+        let Some(folder) = folders.get(&note.parent_folder_id) else {
+            missing_folders.insert(note.parent_folder_id.clone());
+            requeue.push(note_id.clone());
+            continue;
+        };
+        let indexed = embedder
+            .index_note(IndexNote {
+                services: &services,
+                scope: &cutoff.scope,
+                note,
+                folder: folder.get(),
+                budget: new_budget(&cancel),
+                priority,
+                existing: &|key| {
+                    page_keys
+                        .get(&key)
+                        .map(|&(row, slot)| rows[row].chunks[slot].vector.clone())
+                        .or_else(|| cached_vectors.get(&key).cloned())
+                        .or_else(|| snapshot.find_vector(key))
+                },
             })
-            .await
-            .map_err(|_| IndexError::Inconsistent)??,
-        );
-        publisher.publish(disk);
-        if compact {
-            publisher.drain().await;
-            disk.epoch
-                .as_ref()
-                .ok_or(IndexError::Inconsistent)?
-                .collect_obsolete()?;
+            .await?;
+        match indexed.outcome {
+            NoteIndexOutcome::Complete => {
+                let row_idx = rows.len();
+                for (slot, chunk) in indexed.chunks.iter().enumerate() {
+                    page_keys
+                        .entry(chunk.metadata.key)
+                        .or_insert((row_idx, slot));
+                }
+                rows.push(EmbeddedNoteRow {
+                    note_id: note_id.clone(),
+                    content: Some(content),
+                    chunks: indexed.chunks,
+                });
+            }
+            NoteIndexOutcome::Pending => {
+                had_transient_failure = true;
+                requeue.push(note_id.clone());
+                if !indexed.chunks.is_empty() {
+                    let row_idx = rows.len();
+                    for (slot, chunk) in indexed.chunks.iter().enumerate() {
+                        page_keys
+                            .entry(chunk.metadata.key)
+                            .or_insert((row_idx, slot));
+                    }
+                    rows.push(EmbeddedNoteRow {
+                        note_id: note_id.clone(),
+                        content: Some(content),
+                        chunks: indexed.chunks,
+                    });
+                }
+            }
+            NoteIndexOutcome::Fatal(error) => {
+                had_transient_failure = true;
+                for (remaining_id, _) in &items[idx..] {
+                    requeue.push(remaining_id.clone());
+                }
+                if matches!(error, EmbeddingError::ModelUnavailable) {
+                    hit_model_change = true;
+                }
+                break;
+            }
         }
     }
-    Ok(())
+
+    if hit_model_change {
+        return Ok(EmbedBatchOutcome::ModelChanged { requeue });
+    }
+
+    match services
+        .model_target(&cutoff.scope, None, &new_budget(&cancel))
+        .await
+    {
+        Ok(selected) if selected.as_ref() == Some(&embedder.target) => {}
+        Ok(_) => {
+            return Ok(EmbedBatchOutcome::ModelChanged {
+                requeue: requeue_all(&mode),
+            });
+        }
+        Err(_) => {
+            return Ok(EmbedBatchOutcome::Backoff {
+                requeue: requeue_all(&mode),
+            });
+        }
+    }
+
+    Ok(EmbedBatchOutcome::Applied {
+        rows,
+        requeue,
+        missing_folders,
+        next_sweep_after,
+        was_full_sweep,
+        had_transient_failure,
+    })
 }
 
 struct PreparedNote {
@@ -510,29 +604,66 @@ struct ChatChanges {
 
 async fn reconcile_chats(
     cx: &Context<'_>,
-    disk: &Disk,
-    previous: &tantivy::Searcher,
+    lexical: &Arc<crate::lexical::LexicalIndex>,
+    previous_cutoff: SpaceSeq,
     cutoff: &ChangeCursor,
     threads: BTreeSet<ChatThreadId>,
 ) -> Result<ChatChanges, IndexError> {
     let mut changes = ChatChanges::default();
     for thread in threads {
-        let lexical = disk.lexical.as_ref().ok_or(IndexError::Inconsistent)?;
-        let mut obsolete = lexical.live_chat_entries(previous, &thread)?;
-        let mut before = None;
-        loop {
-            let (page, next) = build::chat_page(cx, cutoff, &thread, before).await?;
-            changes
-                .added
-                .extend(page.into_iter().filter(|hit| !obsolete.remove(&hit.entry)));
-            before = next;
-            if before.is_none() {
-                break;
+        let plan = cx
+            .services
+            .deps
+            .canonical
+            .plan_searchable_chat_delta(
+                &cx.services.authority,
+                &cx.budget(),
+                &cutoff.scope,
+                &thread,
+                previous_cutoff,
+                cutoff.after,
+            )
+            .await?;
+        match plan {
+            SearchChatDeltaPlan::Unchanged => continue,
+            SearchChatDeltaPlan::AppendOnly { stop_at } => {
+                let mut before = None;
+                loop {
+                    let (page, next) =
+                        build::chat_page_until(cx, cutoff, &thread, before, Some(stop_at)).await?;
+                    changes.added.extend(page);
+                    before = next;
+                    if before.is_none() {
+                        break;
+                    }
+                }
+            }
+            SearchChatDeltaPlan::FullReconcile => {
+                let lexical_scan = lexical.clone();
+                let thread_scan = thread.clone();
+                let mut obsolete = tokio::task::spawn_blocking(move || {
+                    let searcher = lexical_scan.searcher();
+                    lexical_scan.live_chat_entries(&searcher, &thread_scan)
+                })
+                .await
+                .map_err(|_| IndexError::Inconsistent)??;
+                let mut before = None;
+                loop {
+                    let (page, next) =
+                        build::chat_page_until(cx, cutoff, &thread, before, None).await?;
+                    changes
+                        .added
+                        .extend(page.into_iter().filter(|hit| !obsolete.remove(&hit.entry)));
+                    before = next;
+                    if before.is_none() {
+                        break;
+                    }
+                }
+                changes
+                    .removed
+                    .extend(obsolete.into_iter().map(|seq| (thread.clone(), seq)));
             }
         }
-        changes
-            .removed
-            .extend(obsolete.into_iter().map(|seq| (thread.clone(), seq)));
     }
     Ok(changes)
 }

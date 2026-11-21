@@ -529,6 +529,12 @@ impl EmbeddingProviderPort for ProviderService {
             if ctx.auth().taint().is_tainted() {
                 return Err(DomainError::CrossSpaceTainted.into());
             }
+            let caller_classes = ctx
+                .auth()
+                .spaces()
+                .get(&ctx.scope().space_id)
+                .map(|grant| grant.read_classes.clone())
+                .unwrap_or_default();
             let selected = self
                 .select_provider(
                     ctx,
@@ -540,7 +546,12 @@ impl EmbeddingProviderPort for ProviderService {
                     },
                 )
                 .await?;
-            Ok(selected.policy.allowed_classes)
+            Ok(selected
+                .policy
+                .allowed_classes
+                .intersection(&caller_classes)
+                .copied()
+                .collect())
         })
     }
 

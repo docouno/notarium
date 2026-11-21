@@ -9,8 +9,8 @@ use notarium_canonical::{CanonicalStore, chats::search::HydratedChatHit};
 use notarium_core::{
     classes::{ClassifiedDocument, ProviderPolicy},
     ids::{
-        ChatThreadId, FolderId, ModelProfileId, NoteId, PrincipalId, ProviderResourceId,
-        RevisionId, SpaceSeq, ThreadEntrySeq,
+        ChatThreadId, ModelProfileId, NoteId, PrincipalId, ProviderResourceId, RevisionId,
+        SpaceSeq, ThreadEntrySeq,
     },
     model::{FolderRef, HistoryScope},
     ports::{
@@ -83,9 +83,10 @@ pub struct RemoteIndexingGrant {
 pub trait SearchModelResolverPort: Send + Sync {
     fn resolve_model<'a>(
         &'a self,
+        authority: &'a ServiceAuthority,
         scope: &'a HistoryScope,
-        project: Option<&'a FolderId>,
         explicit: Option<&'a ModelProfileId>,
+        budget: &'a CallBudget,
     ) -> PortFuture<'a, Option<ResolvedEmbeddingTarget>>;
 
     /// Admit the owner of a Personal Space or the revision author in a

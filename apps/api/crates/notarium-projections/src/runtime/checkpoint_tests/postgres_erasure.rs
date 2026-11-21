@@ -811,7 +811,7 @@ async fn pg_ephemeral_cache_and_single_runtime_guard_work_on_postgres() {
         .acquire_snapshot(ctx.clone(), CausalBasis::Await(Default::default()))
         .await
         .unwrap();
-    assert!(retained.lookup(&first_note.value.note).is_some());
+    assert!(retained.lookup(&first_note.value.note).unwrap().is_some());
     drop(engine1);
     runtime1.shutdown().await.unwrap();
 

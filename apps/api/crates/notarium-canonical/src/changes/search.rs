@@ -12,7 +12,7 @@ use crate::{
     projection_read::notes_at_batch,
     runtime::{
         CanonicalStore, SpaceRecord, load_space_record, pg_read_error, purge_fenced_note_ids_tx,
-        read_immutable_revision_tx, validate_snapshot_cutoff_tx,
+        validate_snapshot_cutoff_tx,
     },
     sql_exec::BackendConn,
 };
@@ -51,6 +51,7 @@ pub struct SearchNotesSeedPage {
     pub next_after: Option<NoteId>,
 }
 
+#[derive(Clone)]
 struct PendingNote {
     meta: NoteRevisionMetadata,
     revision: RevisionId,
@@ -239,7 +240,6 @@ impl CanonicalStore {
             .with_read_tx_budget(Some(&tx_budget), |tx| {
                 Box::pin(async move {
                     let space = active_space(tx, &scope_for_tx).await?;
-                    let mut live = FolderAncestryCache::default();
                     let schema = match filter_cut {
                         Some(cut) => {
                             validate_snapshot_cutoff_tx(tx, &scope_for_tx, Some(cut)).await?;
@@ -247,44 +247,105 @@ impl CanonicalStore {
                         }
                         None => None,
                     };
-                    let mut historical = BTreeMap::new();
+                    let mut unique_ids = Vec::new();
+                    let mut seen_ids = std::collections::BTreeSet::new();
+                    for target in &targets {
+                        if seen_ids.insert(target.note_id.clone()) {
+                            unique_ids.push(target.note_id.clone());
+                        }
+                    }
+                    let live_map = live_search_batch(tx, &space, &unique_ids).await?;
+                    let live_visible: std::collections::BTreeSet<NoteId> = live_map
+                        .into_iter()
+                        .filter_map(|(id, (facts, active_ancestry, _))| {
+                            (active_ancestry && auth_for_tx.can_view_resource(&facts).is_ok())
+                                .then_some(id)
+                        })
+                        .collect();
+
+                    let mut projected_by_cut = BTreeMap::<SpaceSeq, Vec<NoteId>>::new();
+                    for target in &targets {
+                        if let Some(cutoff) = target.projected_at
+                            && live_visible.contains(&target.note_id)
+                        {
+                            projected_by_cut
+                                .entry(cutoff)
+                                .or_default()
+                                .push(target.note_id.clone());
+                        }
+                    }
+                    let mut projected_rows = BTreeMap::<(SpaceSeq, NoteId), PendingNote>::new();
+                    for (cutoff, mut note_ids) in projected_by_cut {
+                        validate_snapshot_cutoff_tx(tx, &scope_for_tx, Some(cutoff)).await?;
+                        note_ids.sort();
+                        note_ids.dedup();
+                        let revisions =
+                            notes_at_batch(tx, &scope_for_tx, cutoff, &note_ids).await?;
+                        let mut historical = FolderAncestryCache::at_cut(&scope_for_tx, cutoff);
+                        for (note_id, revision) in revisions {
+                            let meta = revision.metadata;
+                            if meta.lifecycle != Lifecycle::Active
+                                || meta.doc_class == DocClass::EncryptedNote
+                            {
+                                continue;
+                            }
+                            let digest = meta.content_digest.ok_or_else(|| {
+                                internal_not_committed(
+                                    "search_note_revision",
+                                    "active note is missing its carrier",
+                                )
+                            })?;
+                            let (facts, ancestry) = historical
+                                .build_resource_facts_tx(
+                                    tx,
+                                    &space.space,
+                                    &meta.parent_folder_id,
+                                    meta.doc_class,
+                                    meta.ability_id.clone(),
+                                    false,
+                                )
+                                .await?;
+                            if !historical.all_active(&ancestry.ancestors)
+                                || auth_for_tx.can_view_resource(&facts).is_err()
+                            {
+                                continue;
+                            }
+                            let project = historical.enclosing_project(&ancestry);
+                            projected_rows.insert(
+                                (cutoff, note_id),
+                                PendingNote {
+                                    meta,
+                                    revision: revision.revision_id,
+                                    actor: revision.revision_actor,
+                                    digest,
+                                    facts,
+                                    project,
+                                    active_ancestry: true,
+                                },
+                            );
+                        }
+                    }
+
                     let mut slots = Vec::with_capacity(targets.len());
                     for target in targets {
-                        let row = if let Some(cutoff) = target.projected_at {
-                            let ancestry = match historical.entry(cutoff) {
-                                std::collections::btree_map::Entry::Occupied(entry) => {
-                                    entry.into_mut()
-                                }
-                                std::collections::btree_map::Entry::Vacant(entry) => {
-                                    validate_snapshot_cutoff_tx(tx, &scope_for_tx, Some(cutoff))
-                                        .await?;
-                                    entry.insert(FolderAncestryCache::at_cut(&scope_for_tx, cutoff))
-                                }
-                            };
-                            load_note(
-                                tx,
-                                &space,
-                                &target.note_id,
-                                cutoff,
-                                ancestry,
-                                &mut live,
-                                Some(&auth_for_tx),
-                            )
-                            .await?
-                            .filter(|pending| pending.revision == target.revision)
-                            .map(|pending| (pending, String::new()))
+                        let mut row = if !live_visible.contains(&target.note_id) {
+                            None
+                        } else if let Some(cutoff) = target.projected_at {
+                            projected_rows
+                                .get(&(cutoff, target.note_id.clone()))
+                                .filter(|pending| pending.revision == target.revision)
+                                .cloned()
+                                .map(|pending| (pending, String::new()))
                         } else {
                             load_exact_note(
                                 tx,
                                 &space,
                                 &target.note_id,
                                 target.revision,
-                                &mut live,
                                 &auth_for_tx,
                             )
                             .await?
                         };
-                        let mut row = row;
                         if filter_cut.is_some()
                             && let Some((pending, _)) = &mut row
                         {
@@ -314,14 +375,22 @@ impl CanonicalStore {
         self.with_read_tx_budget(Some(&tx_budget), |tx| {
             Box::pin(async move {
                 let space = active_space(tx, &scope).await?;
-                let mut live = FolderAncestryCache::default();
+                let mut ids = Vec::new();
+                let mut seen = std::collections::BTreeSet::new();
+                for (key, row) in &rows {
+                    if row.is_some() && seen.insert(key.clone()) {
+                        ids.push(key.clone());
+                    }
+                }
+                let live = live_search_batch(tx, &space, &ids).await?;
                 for (key, row) in &mut rows {
                     let Some(SearchTargetNote { note, .. }) = row else {
                         continue;
                     };
-                    match live_search_facts(tx, &space, key, &mut live).await? {
-                        Some(facts) if auth.can_view_resource(&facts).is_ok() => {
-                            note.document.bind_current(facts, Lifecycle::Active)?;
+                    match live.get(key) {
+                        Some((facts, true, _)) if auth.can_view_resource(facts).is_ok() => {
+                            note.document
+                                .bind_current(facts.clone(), Lifecycle::Active)?;
                         }
                         _ => *row = None,
                     }
@@ -371,9 +440,7 @@ impl CanonicalStore {
                     .await?
                     .is_some_and(|facts| {
                         live.all_active(&facts.ancestor_folders)
-                            && project
-                                .as_ref()
-                                .is_none_or(|id| facts.ancestor_folders.contains(id))
+                            && live.enclosing_project_in(&facts.ancestor_folders) == project
                     }))
             })
         })
@@ -395,21 +462,19 @@ impl CanonicalStore {
                 if cursor.after >= space.last_seq {
                     return Ok(false);
                 }
-                const SQL: &str = "SELECT EXISTS (SELECT 1 FROM change_log WHERE space_id=$1
-                    AND history_incarnation=$2 AND space_seq>$3 AND entity_type='thread' AND op_kind='redact')";
                 let scope = &space.scope;
                 let cutoff = cursor.after.get() as i64;
                 match tx {
-                    BackendConn::Sqlite(conn) => sqlx::query_scalar(SQL)
+                    BackendConn::Sqlite(conn) => sqlx::query_scalar(SEARCH_REDACTION_AFTER_SQL)
                         .bind(scope.space_id.as_str())
-                        .bind(scope.incarnation.as_bytes().as_slice())
                         .bind(cutoff)
                         .fetch_one(&mut **conn)
                         .await
-                        .map_err(|err| internal_not_committed("sqlite_search_redaction", err.to_string())),
-                    BackendConn::Postgres(conn) => sqlx::query_scalar(SQL)
+                        .map_err(|err| {
+                            internal_not_committed("sqlite_search_redaction", err.to_string())
+                        }),
+                    BackendConn::Postgres(conn) => sqlx::query_scalar(SEARCH_REDACTION_AFTER_SQL)
                         .bind(scope.space_id.as_str())
-                        .bind(scope.incarnation.as_bytes().as_slice())
                         .bind(cutoff)
                         .fetch_one(&mut **conn)
                         .await
@@ -595,8 +660,9 @@ impl CanonicalStore {
                     let live = live_search_batch(tx, &space, &ids).await?;
                     for (key, row) in &mut rows {
                         if let Some(note) = row {
-                            if let Some((facts, active_ancestry)) = live.get(key) {
-                                note.remote_indexable &= *active_ancestry;
+                            if let Some((facts, active_ancestry, live_project)) = live.get(key) {
+                                note.remote_indexable &=
+                                    *active_ancestry && live_project == &note.enclosing_project;
                                 note.document
                                     .bind_current(facts.clone(), Lifecycle::Active)?;
                             } else {
@@ -686,20 +752,16 @@ async fn bind_search_ability(
     Ok(())
 }
 
+const SEARCH_REDACTION_AFTER_SQL: &str = "SELECT EXISTS (SELECT 1 FROM chat_entries
+    WHERE space_id = $1 AND redacted_at_seq IS NOT NULL AND redacted_at_seq > $2)";
+
 async fn load_exact_note(
     tx: &mut BackendConn<'_>,
     space: &SpaceRecord,
     note: &NoteId,
     revision: RevisionId,
-    live: &mut FolderAncestryCache,
     auth: &EngineAuthContext,
 ) -> Result<Option<(PendingNote, String)>, PortError> {
-    let Some(current) = live_search_facts(tx, space, note, live).await? else {
-        return Ok(None);
-    };
-    if auth.can_view_resource(&current).is_err() {
-        return Ok(None);
-    }
     const SQL: &str = "SELECT metadata_msgpack, visibility_seq, actor_id FROM revisions
         WHERE space_id = $1 AND rev_id = $2 AND entity_type = 'note' AND entity_key = $3
           AND history_incarnation = $4";
@@ -753,7 +815,7 @@ async fn load_exact_note(
             false,
         )
         .await?;
-    if auth.can_view_resource(&facts).is_err() {
+    if !history.all_active(&ancestry.ancestors) || auth.can_view_resource(&facts).is_err() {
         return Ok(None);
     }
     let path = if ancestry.folder_path.is_empty() {
@@ -762,7 +824,6 @@ async fn load_exact_note(
         format!("{}/{}.md", ancestry.folder_path, meta.slug)
     };
     let project = history.enclosing_project(&ancestry);
-    let active_ancestry = history.all_active(&ancestry.ancestors);
     Ok(Some((
         PendingNote {
             meta,
@@ -771,7 +832,7 @@ async fn load_exact_note(
             digest,
             facts,
             project,
-            active_ancestry,
+            active_ancestry: true,
         },
         path,
     )))
@@ -806,7 +867,10 @@ async fn live_search_batch(
     tx: &mut BackendConn<'_>,
     space: &SpaceRecord,
     notes: &[NoteId],
-) -> Result<BTreeMap<NoteId, (ResourceFacts, bool)>, PortError> {
+) -> Result<BTreeMap<NoteId, (ResourceFacts, bool, Option<FolderId>)>, PortError> {
+    if notes.is_empty() {
+        return Ok(BTreeMap::new());
+    }
     let fenced = purge_fenced_note_ids_tx(tx, &space.scope.space_id, notes).await?;
     let unfenced: Vec<_> = notes
         .iter()
@@ -830,7 +894,14 @@ async fn live_search_batch(
                 false,
             )
             .await?;
-        live.insert(id, (facts, folders.all_active(&ancestry.ancestors)));
+        live.insert(
+            id,
+            (
+                facts,
+                folders.all_active(&ancestry.ancestors),
+                folders.enclosing_project(&ancestry),
+            ),
+        );
     }
     Ok(live)
 }
@@ -845,66 +916,33 @@ async fn live_search_facts(
         .live_note_facts(tx, &space.space, note, false)
         .await?
         .and_then(|(facts, lifecycle)| {
-            (lifecycle == Lifecycle::Active && facts.class != DocClass::EncryptedNote)
-                .then_some(facts)
+            (lifecycle == Lifecycle::Active
+                && facts.class != DocClass::EncryptedNote
+                && live.all_active(&facts.ancestor_folders))
+            .then_some(facts)
         }))
 }
 
-async fn load_note(
-    tx: &mut BackendConn<'_>,
-    space: &SpaceRecord,
-    note: &NoteId,
-    cutoff: SpaceSeq,
-    historical: &mut FolderAncestryCache,
-    live: &mut FolderAncestryCache,
-    auth: Option<&EngineAuthContext>,
-) -> Result<Option<PendingNote>, PortError> {
-    let Some(current) = live_search_facts(tx, space, note, live).await? else {
-        return Ok(None);
-    };
-    if auth.is_some_and(|auth| auth.can_view_resource(&current).is_err()) {
-        return Ok(None);
+#[cfg(test)]
+mod query_plan_tests {
+    use super::SEARCH_REDACTION_AFTER_SQL;
+
+    #[test]
+    fn sqlite_search_redaction_uses_redacted_change_index() {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch(crate::schema::SQLITE_BASELINE_DDL)
+            .unwrap();
+        let sql = format!("EXPLAIN QUERY PLAN {SEARCH_REDACTION_AFTER_SQL}");
+        let mut statement = db.prepare(&sql).unwrap();
+        let mut rows = statement.raw_query();
+        let mut plan = Vec::new();
+        while let Some(row) = rows.next().unwrap() {
+            plan.push(row.get::<_, String>(3).unwrap());
+        }
+        assert!(
+            plan.iter()
+                .any(|step| step.contains("idx_chat_entries_redacted_change")),
+            "{plan:?}"
+        );
     }
-    let Some(revision) =
-        read_immutable_revision_tx(tx, &space.scope, "note", note.as_str(), cutoff).await?
-    else {
-        return Ok(None);
-    };
-    let RevisionMetadataPayload::Note(mut meta) = revision.metadata.payload else {
-        return Err(internal_not_committed(
-            "search_note_revision",
-            "expected note metadata",
-        ));
-    };
-    if meta.lifecycle != Lifecycle::Active || meta.doc_class == DocClass::EncryptedNote {
-        return Ok(None);
-    }
-    let digest = meta.content_digest.ok_or_else(|| {
-        internal_not_committed("search_note_revision", "active note is missing its carrier")
-    })?;
-    bind_search_ability(tx, &space.scope, cutoff, &mut meta).await?;
-    let (facts, ancestry) = historical
-        .build_resource_facts_tx(
-            tx,
-            &space.space,
-            &meta.parent_folder_id,
-            meta.doc_class,
-            meta.ability_id.clone(),
-            false,
-        )
-        .await?;
-    if auth.is_some_and(|auth| auth.can_view_resource(&facts).is_err()) {
-        return Ok(None);
-    }
-    let project = historical.enclosing_project(&ancestry);
-    let active_ancestry = historical.all_active(&ancestry.ancestors);
-    Ok(Some(PendingNote {
-        meta,
-        revision: revision.revision_id,
-        actor: revision.actor_id,
-        digest,
-        facts,
-        project,
-        active_ancestry,
-    }))
 }

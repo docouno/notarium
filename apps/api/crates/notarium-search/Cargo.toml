@@ -9,6 +9,13 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+test-support = []
+
+[[example]]
+name = "scale_100k_400k_gate"
+required-features = ["test-support"]
+
 [dependencies]
 notarium-core = { workspace = true }
 notarium-syntax = { workspace = true }
@@ -18,7 +25,6 @@ ort = { workspace = true }
 memmap2 = { workspace = true }
 arc-swap = { workspace = true }
 blake3 = { workspace = true }
-caseless = { workspace = true }
 cap-std = { workspace = true }
 cap-fs-ext = { workspace = true }
 croaring = { workspace = true }
@@ -35,5 +41,6 @@ allocation-counter = { workspace = true }
 getrandom = { workspace = true }
 hex = { workspace = true }
 notarium-canonical = { workspace = true, features = ["test-support"] }
+notarium-search = { workspace = true, features = ["test-support"] }
 proptest = { workspace = true }
 sqlx = { workspace = true }

@@ -1,4 +1,4 @@
-use super::{Eligible, Recall, align::Overlay, lexical_work, ranking::Candidate};
+use super::{Eligible, Recall, align::Overlay, lexical_work_with_retry, ranking::Candidate};
 use crate::{
     embed::RemoteConservativeTokenizerBudget,
     engine::{Clock, Published, SearchEngine, internal},
@@ -7,7 +7,7 @@ use crate::{
     ports::SearchDocumentTarget,
 };
 use notarium_core::{
-    classes::{ClassEgressFence, ContentPart, SearchContent, SearchPart},
+    classes::{ClassEgressFence, ClassifiedDocument, ContentPart, SearchContent, SearchPart},
     error::PortError,
     ids::NoteId,
     model::SnapshotCut,
@@ -16,9 +16,11 @@ use notarium_core::{
 use notarium_syntax::chunk::TokenizerBudget;
 use std::{
     cmp::Reverse,
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
 };
+
+const MAX_CHAT_PAGES: usize = 8;
 
 pub(super) struct Hydration<'a> {
     pub context: &'a SpaceContext,
@@ -49,21 +51,43 @@ impl SearchEngine {
             recall,
         } = task;
         let structural = &self.services.deps.structural;
-        let mut selected = Vec::with_capacity(top_k);
+        let mut unmasked: Vec<Option<Candidate>> = candidates
+            .into_iter()
+            .filter(|candidate| !overlay.get(&candidate.note).is_some_and(Option::is_none))
+            .map(Some)
+            .collect();
+        let mut selected_indices = Vec::with_capacity(top_k);
         let mut truncated = false;
-        for candidate in candidates {
-            clock.remaining()?;
-            if overlay.get(&candidate.note).is_some_and(Option::is_none)
-                || !structural.is_live_visible(context, &candidate.note)?
-            {
-                continue;
+        let batch_size = (top_k.saturating_add(1)).clamp(32, 256);
+        let mut cursor = 0;
+        while cursor < unmasked.len() && !truncated {
+            let end = (cursor + batch_size).min(unmasked.len());
+            let ids: Vec<NoteId> = unmasked[cursor..end]
+                .iter()
+                .filter_map(|slot| slot.as_ref().map(|candidate| candidate.note.clone()))
+                .collect();
+            let mut check_ctx = context.clone();
+            check_ctx.budget = clock.remaining()?;
+            let flags = structural.filter_live_visible(&check_ctx, &ids).await?;
+            if flags.len() != ids.len() {
+                return Err(internal("projection_live_batch"));
             }
-            if selected.len() == top_k {
-                truncated = true;
-                break;
+            for (offset, visible) in flags.into_iter().enumerate() {
+                if !visible {
+                    continue;
+                }
+                if selected_indices.len() == top_k {
+                    truncated = true;
+                    break;
+                }
+                selected_indices.push(cursor + offset);
             }
-            selected.push(candidate);
+            cursor = end;
         }
+        let selected: Vec<Candidate> = selected_indices
+            .into_iter()
+            .filter_map(|index| unmasked[index].take())
+            .collect();
         if selected.is_empty() {
             return Ok((Vec::new(), truncated));
         }
@@ -112,38 +136,59 @@ impl SearchEngine {
                 },
             );
         }
-        let mut ordered: Vec<_> = selected
+        let ordered: Vec<_> = selected
             .into_iter()
             .filter_map(|candidate| cards.remove(&candidate.note).map(|card| (candidate, card)))
             .collect();
         if ordered.is_empty() {
             return Ok((Vec::new(), truncated));
         }
-        let targets = ordered
-            .iter()
-            .map(|(candidate, card)| SearchDocumentTarget {
-                note_id: candidate.note.clone(),
-                revision: card.document.provenance().revision().clone(),
-                projected_at: (!overlay.contains_key(&candidate.note)).then_some(cut.projected_seq),
-            })
-            .collect();
-        ctx.budget = clock.remaining()?;
-        // Authenticate the exact carrier chosen for each card, including any
-        // receipt-bound revision. This rereads live canonical egress facts.
-        let documents = self
-            .services
-            .deps
-            .carriers
-            .read_authorized_documents_for_search(ctx, targets)
-            .await?;
-        if documents.len() != ordered.len() {
-            return Err(internal("canonical_search_batch"));
+
+        // Only read CAS carriers for projected notes; overlay rows already carry
+        // their authorized receipt-bound document and passed live visibility.
+        let mut projected_ids = Vec::new();
+        let mut projected_targets = Vec::new();
+        for (candidate, card) in &ordered {
+            if !overlay.contains_key(&candidate.note) {
+                projected_ids.push(candidate.note.clone());
+                projected_targets.push(SearchDocumentTarget {
+                    note_id: candidate.note.clone(),
+                    revision: card.document.provenance().revision().clone(),
+                    projected_at: Some(cut.projected_seq),
+                });
+            }
         }
+        let mut docs: HashMap<NoteId, Arc<ClassifiedDocument>> = HashMap::new();
+        if !projected_targets.is_empty() {
+            ctx.budget = clock.remaining()?;
+            let documents = self
+                .services
+                .deps
+                .carriers
+                .read_authorized_documents_for_search(ctx, projected_targets)
+                .await?;
+            if documents.len() != projected_ids.len() {
+                return Err(internal("canonical_search_batch"));
+            }
+            for (note_id, document) in projected_ids.into_iter().zip(documents) {
+                if let Some(document) = document {
+                    docs.insert(note_id, document);
+                }
+            }
+        }
+        for (candidate, _) in &ordered {
+            if let Some(Some(row)) = overlay.get(&candidate.note) {
+                docs.insert(candidate.note.clone(), Arc::new(row.document.clone()));
+            }
+        }
+
         let mut hits = Vec::new();
         let mut relevance = ChunkRelevance::new(text);
-        for ((candidate, card), document) in ordered.drain(..).zip(documents) {
+        for (candidate, card) in ordered {
             clock.remaining()?;
-            let Some(document) = document else { continue };
+            let Some(document) = docs.remove(&candidate.note) else {
+                continue;
+            };
             if document.reference().note_id != candidate.note
                 || document.reference().space_id != cut.scope.space_id
                 || document.revision() != card.document.provenance().revision()
@@ -174,22 +219,36 @@ impl SearchEngine {
         Ok((hits, truncated))
     }
 
-    pub(super) fn finish_note_hits(
+    pub(super) async fn finish_note_hits(
         &self,
         ctx: &SpaceContext,
         clock: &Clock,
         hits: Vec<SearchHit>,
         recall: Option<Recall>,
     ) -> Result<(Vec<SearchHit>, bool), PortError> {
-        let mut visible = Vec::with_capacity(hits.len());
-        let structural = &self.services.deps.structural;
-        for hit in hits {
-            clock.remaining()?;
-            let note = &hit.card.document.provenance().reference().note_id;
-            if structural.is_live_visible(ctx, note)? {
-                visible.push(hit);
-            }
+        if hits.is_empty() {
+            return Ok((Vec::new(), false));
         }
+        let ids: Vec<NoteId> = hits
+            .iter()
+            .map(|hit| hit.card.document.provenance().reference().note_id.clone())
+            .collect();
+        let mut check_ctx = ctx.clone();
+        check_ctx.budget = clock.remaining()?;
+        let flags = self
+            .services
+            .deps
+            .structural
+            .filter_live_visible(&check_ctx, &ids)
+            .await?;
+        if flags.len() != hits.len() {
+            return Err(internal("projection_live_batch"));
+        }
+        let mut visible: Vec<_> = hits
+            .into_iter()
+            .zip(flags)
+            .filter_map(|(hit, ok)| ok.then_some(hit))
+            .collect();
         let truncated = recall.is_some_and(|recall| pack(&mut visible, recall.tokens));
         Ok((visible, truncated))
     }
@@ -209,28 +268,35 @@ impl SearchEngine {
         let mut scores = BTreeMap::new();
         let mut cursor = ChatCursor::default();
         let mut context = ctx.clone();
+        let mut pages = 0usize;
+        let mut page_capped = false;
         loop {
-            let state = state.clone();
-            let eligible = eligible.clone();
-            let snapshot = snapshot.clone();
-            let text = request.text.clone();
-            let (hits, next) = lexical_work(clock, move |budget| {
+            let state_page = state.clone();
+            let eligible_page = eligible.clone();
+            let snapshot_page = snapshot.clone();
+            let text_page = request.text.clone();
+            let (hits, next) = lexical_work_with_retry(clock, &snapshot, move |budget| {
                 let mut filter = LexicalFilter::new(
-                    snapshot.as_ref(),
-                    eligible.chat_folders.clone(),
+                    snapshot_page.as_ref(),
+                    eligible_page.chat_folders.clone(),
                     None,
                     [],
                     true,
                 )
                 .within(budget);
-                if let Some(viewer) = eligible.chat_viewer.as_ref() {
+                if let Some(viewer) = eligible_page.chat_viewer.as_ref() {
                     filter = filter.visible_chats_for(viewer);
                 }
-                state
-                    .lexical
-                    .chat_page(&state.searcher, &text, &filter, page_size, cursor)
+                state_page.lexical.chat_page(
+                    &state_page.searcher,
+                    &text_page,
+                    &filter,
+                    page_size,
+                    cursor,
+                )
             })
             .await?;
+            pages += 1;
             let mut keys = Vec::with_capacity(hits.len());
             let mut page_scores = BTreeMap::new();
             for hit in hits {
@@ -265,11 +331,15 @@ impl SearchEngine {
                 break;
             }
             let Some(next) = next else { break };
+            if pages >= MAX_CHAT_PAGES {
+                page_capped = true;
+                break;
+            }
             cursor = next;
             page_size = 200;
         }
         if selected.is_empty() {
-            return Ok((Vec::new(), false));
+            return Ok((Vec::new(), page_capped));
         }
         context.budget = clock.remaining()?;
         let (rows, truncated) = self
@@ -293,7 +363,7 @@ impl SearchEngine {
                 })
             })
             .collect();
-        Ok((hits, truncated))
+        Ok((hits, truncated || page_capped))
     }
 }
 
@@ -334,6 +404,7 @@ fn hit_chunks(
 }
 
 fn pack(hits: &mut Vec<SearchHit>, tokens: u32) -> bool {
+    let had_chunks: Vec<bool> = hits.iter().map(|hit| !hit.chunks.is_empty()).collect();
     let mut remaining = tokens;
     let mut selected: Vec<Vec<bool>> = hits
         .iter()
@@ -368,7 +439,10 @@ fn pack(hits: &mut Vec<SearchHit>, tokens: u32) -> bool {
         let mut keep = mask.into_iter();
         hit.chunks.retain(|_| keep.next().unwrap_or(false));
     }
-    hits.retain(|hit| !hit.chunks.is_empty());
+    // Preserve title-only notes that started without chunks while dropping
+    // notes whose chunks were all excluded by the token budget.
+    let mut had = had_chunks.into_iter();
+    hits.retain(|hit| !had.next().unwrap_or(false) || !hit.chunks.is_empty());
     truncated
 }
 

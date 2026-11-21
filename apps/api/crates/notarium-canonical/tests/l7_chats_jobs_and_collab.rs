@@ -1234,7 +1234,134 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].text, exact_512);
     assert!(truncated);
-    assert!(!search_reader.auth().taint().is_tainted());
+    // Parity with `read_chat`: a tainted thread head (`ext_space_tainted_mask != 0`)
+    // taints the caller even when the matched entry itself was untainted.
+    assert!(search_reader.auth().taint().is_tainted());
+
+    // Conversely, hydrating an untainted hit from a clean thread while using a tainted
+    // candidate only as the truncation witness must NOT taint the caller.
+    let clean_thread = sample_thread_id(0xcc);
+    store
+        .create_chat(
+            owner_ctx(&scope, owner.clone()),
+            next_mutation(
+                &scope,
+                &owner,
+                CreateChat {
+                    thread: clean_thread.clone(),
+                    kind: ChatThreadKind::Personal,
+                    owner: owner.clone(),
+                    project_folder: None,
+                    title: "Clean Search Thread".into(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let clean_entry = store
+        .append_chat(
+            owner_ctx(&scope, owner.clone()),
+            next_mutation(
+                &scope,
+                &owner,
+                AppendChat {
+                    thread: clean_thread.clone(),
+                    parent: ThreadEntrySeq::ZERO,
+                    kind: ChatEntryKind::Human,
+                    body: ChatInputBody::Text("untainted search entry".into()),
+                    referenced_notes: vec![],
+                    tainted: false,
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .value;
+    let clean_reader = owner_ctx(&scope, owner.clone());
+    let (clean_hits, clean_truncated) = store
+        .hydrate_live_visible_chat_hits(
+            &clean_reader,
+            &[
+                (clean_thread.clone(), clean_entry.seq),
+                (thread.clone(), inline_entry.seq),
+            ],
+            PageLimit::new(1).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(clean_hits.len(), 1);
+    assert_eq!(clean_hits[0].text, "untainted search entry");
+    assert!(clean_truncated);
+    assert!(!clean_reader.auth().taint().is_tainted());
+    // `plan_searchable_chat_delta` fast-path: append-only returns `AppendOnly { stop_at }`
+    // and `read_searchable_chat_entries_page_until` stops cleanly at `stop_at`.
+    let before_append_cut = store.read_space(&scope.space_id).await.unwrap().last_seq;
+    let delta_search = ServiceAuthority::admit(ServicePurpose::Search);
+    assert_eq!(
+        store
+            .plan_searchable_chat_delta(
+                &delta_search,
+                &search_reader.budget,
+                &scope,
+                &thread,
+                before_append_cut,
+                before_append_cut,
+            )
+            .await
+            .unwrap(),
+        notarium_canonical::chats::search::SearchChatDeltaPlan::FullReconcile
+    );
+    let fast_appended = store
+        .append_chat(
+            owner_ctx(&scope, owner.clone()),
+            next_mutation(
+                &scope,
+                &owner,
+                AppendChat {
+                    thread: thread.clone(),
+                    parent: cur_a,
+                    kind: ChatEntryKind::Human,
+                    body: ChatInputBody::Text("append-only delta message".into()),
+                    referenced_notes: vec![],
+                    tainted: false,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let after_append_cut = fast_appended.receipt.seq();
+    assert_eq!(
+        store
+            .plan_searchable_chat_delta(
+                &delta_search,
+                &search_reader.budget,
+                &scope,
+                &thread,
+                before_append_cut,
+                after_append_cut,
+            )
+            .await
+            .unwrap(),
+        notarium_canonical::chats::search::SearchChatDeltaPlan::AppendOnly { stop_at: cur_a }
+    );
+    let suffix_page = store
+        .read_searchable_chat_entries_page_until(
+            &delta_search,
+            &search_reader.budget,
+            &scope,
+            &thread,
+            after_append_cut,
+            None,
+            Some(cur_a),
+            PageLimit::new(10).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(suffix_page.entries.len(), 1);
+    assert_eq!(suffix_page.entries[0].entry, fast_appended.value.seq);
+    assert_eq!(suffix_page.entries[0].text, "append-only delta message");
+    assert_eq!(suffix_page.next_before, None);
+    cur_a = fast_appended.value.seq;
     let retained = store.execute_diagnostic_read_sql_for_test(None,
         "SELECT COUNT(*) FROM chat_pending_inputs WHERE status = 'consumed' AND (inline_text <> '' OR payload_blake3 IS NOT NULL)"
     ).await.unwrap();
@@ -1270,6 +1397,20 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
         .await
         .unwrap();
     let comp_a = appended.value;
+    assert_eq!(
+        store
+            .plan_searchable_chat_delta(
+                &delta_search,
+                &search_reader.budget,
+                &scope,
+                &thread,
+                after_append_cut,
+                appended.receipt.seq(),
+            )
+            .await
+            .unwrap(),
+        notarium_canonical::chats::search::SearchChatDeltaPlan::FullReconcile
+    );
     let child = store
         .append_chat(
             owner_ctx(&scope, owner.clone()),
@@ -1595,9 +1736,17 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
             break;
         }
     }
-    assert_eq!(seeded_threads.len(), 1);
-    assert_eq!(seeded_threads[0].id, thread);
-    assert!(seeded_threads[0].tainted);
+    assert_eq!(seeded_threads.len(), 2);
+    let tainted_seed = seeded_threads
+        .iter()
+        .find(|summary| summary.id == thread)
+        .expect("primary thread present in seed");
+    assert!(tainted_seed.tainted);
+    let clean_seed = seeded_threads
+        .iter()
+        .find(|summary| summary.id == clean_thread)
+        .expect("clean thread present in seed");
+    assert!(!clean_seed.tainted);
 
     // Shared Space + `SpaceGroup` thread rejects tainted entries!
     let shared_scope = HistoryScope {
