@@ -161,6 +161,7 @@ pub(crate) fn check_sqlite_canonical(db: &Connection, version: u32) -> Result<()
     const LEGACY_CLAIM_INDEX: &str =
         "CREATE INDEX idx_content_jobs_claim ON content_jobs(space_id,state,lease_until_ms,job_id)";
     const V7_SPACE_BEFORE_KIND_INDEX: &str = "CREATE INDEX idx_content_jobs_claim ON content_jobs(state,space_id,job_kind,lease_until_ms,job_id)";
+    const V8_V9_CLAIM_INDEX: &str = "CREATE INDEX idx_content_jobs_claim ON content_jobs(state,job_kind,space_id,lease_until_ms,job_id)";
     for (name, sql) in &actual_indexes {
         let actual = normalize_ddl(sql);
         let trusted = match (version, name.as_str()) {
@@ -170,6 +171,7 @@ pub(crate) fn check_sqlite_canonical(db: &Connection, version: u32) -> Result<()
                 continue;
             }
             (7, "idx_content_jobs_claim") => Some(V7_SPACE_BEFORE_KIND_INDEX),
+            (8 | 9, "idx_content_jobs_claim") => Some(V8_V9_CLAIM_INDEX),
             (1..=3, "idx_blob_references_non_note_owner") => Some(
                 "CREATE INDEX idx_blob_references_non_note_owner ON blob_references
                  (space_id, owner_kind, owner_id) WHERE owner_kind <> 'note_revision'",
@@ -1389,6 +1391,7 @@ mod tests {
              DROP INDEX idx_note_heads_export_access;
              DROP INDEX idx_folder_heads_export_access;
              DROP INDEX idx_content_jobs_export_access;
+             DROP INDEX idx_content_jobs_reclaim;
              DROP TABLE archive_export_shadows;
              DROP TABLE archive_export_cuts;
              DROP TABLE archive_artifacts;

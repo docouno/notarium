@@ -29,7 +29,7 @@ pub(crate) fn recognized_predecessor(version: i64, hash: &[u8]) -> bool {
         3 => hex::encode(hash) == V3_HASH,
         4 => hex::encode(hash) == V4_HASH,
         5 => hex::encode(hash) == V5_HASH,
-        6..=8 => {
+        6..=9 => {
             let v = version as u32;
             super::manifest::checksum_tables(v, crate::backup::spool_tables(v)).as_bytes() == hash
         }
@@ -250,15 +250,6 @@ macro_rules! upgrade {
             if !recognized_predecessor(version, &hash) {
                 return Ok(());
             }
-            if version < 8 {
-                // Both earlier claim indexes have the same name. Version 8 puts
-                // the job class before the Space so an idle worker skips other classes.
-                sqlx::query("DROP INDEX idx_content_jobs_claim").execute(&mut *conn).await
-                    .map_err(|e| internal_not_committed("drop_job_claim_index", e.to_string()))?;
-                let sql = baseline_statement($ddl, "CREATE INDEX IF NOT EXISTS idx_content_jobs_claim")?;
-                sqlx::query(sqlx::AssertSqlSafe(sql)).execute(&mut *conn).await
-                    .map_err(|e| internal_not_committed("create_job_claim_index", e.to_string()))?;
-            }
             if version == 1 {
                 sqlx::query(sqlx::AssertSqlSafe(create_new_table(
                     $ddl,
@@ -357,6 +348,18 @@ macro_rules! upgrade {
                 let sql = baseline_statement($ddl, prefix)?;
                 sqlx::query(sqlx::AssertSqlSafe(sql)).execute(&mut *conn).await
                     .map_err(|e| internal_not_committed("migration_v9_indexes", e.to_string()))?;
+            }
+            // All predecessors have a claim index with the same name. Version 10
+            // orders active jobs by FIFO and indexes running lease eligibility separately.
+            sqlx::query("DROP INDEX idx_content_jobs_claim").execute(&mut *conn).await
+                .map_err(|e| internal_not_committed("drop_job_claim_index", e.to_string()))?;
+            for prefix in [
+                "CREATE INDEX IF NOT EXISTS idx_content_jobs_claim",
+                "CREATE INDEX IF NOT EXISTS idx_content_jobs_reclaim",
+            ] {
+                let sql = baseline_statement($ddl, prefix)?;
+                sqlx::query(sqlx::AssertSqlSafe(sql)).execute(&mut *conn).await
+                    .map_err(|e| internal_not_committed("migration_v10_job_queue", e.to_string()))?;
             }
             let (sec, nsec) =
                 crate::codec::encode_timestamp_parts(crate::codec::now_utc_timestamp()?);

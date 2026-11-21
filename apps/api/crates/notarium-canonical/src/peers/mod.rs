@@ -2,6 +2,9 @@ pub mod archive_export;
 pub mod archive_import;
 pub mod archive_uploads;
 mod fence;
+mod job_queue;
+
+use job_queue::{RUNNABLE_ARCHIVE_SCOPES, candidate_sql};
 #[cfg(test)]
 mod job_queue_tests;
 
@@ -491,21 +494,6 @@ impl ContentJobPort for CanonicalStore {
         Box::pin(async move { cancel_job_impl(&store, ctx, request).await })
     }
 }
-
-const RUNNABLE_ARCHIVE_SCOPES: &str = "WITH queued AS (
-        SELECT DISTINCT j.space_id FROM content_jobs j JOIN spaces s ON s.space_id=j.space_id
-        WHERE j.state='queued' AND j.space_id>$1 AND j.job_kind=$3 AND s.lifecycle_state='active'
-        ORDER BY j.space_id LIMIT $2
-    ), reclaimable AS (
-        SELECT DISTINCT j.space_id FROM content_jobs j JOIN spaces s ON s.space_id=j.space_id
-        WHERE j.state='running' AND j.space_id>$1 AND j.job_kind=$3 AND s.lifecycle_state='active'
-          AND (j.lease_until_ms<=$4 OR j.claim_space_epoch IS DISTINCT FROM s.active_epoch)
-        ORDER BY j.space_id LIMIT $2
-    ), candidates AS (
-        SELECT space_id FROM queued UNION SELECT space_id FROM reclaimable
-    )
-    SELECT c.space_id, s.history_incarnation FROM candidates c JOIN spaces s ON s.space_id=c.space_id
-    ORDER BY c.space_id LIMIT $2";
 
 impl CanonicalStore {
     /// Active Spaces with queued work or a reclaimable lease for this class.
@@ -2429,68 +2417,63 @@ pub(crate) async fn job_clock_ms(tx: &mut BackendConn<'_>) -> Result<i64, PortEr
     }
 }
 
-enum ClaimRead {
-    Sqlite,
-    Postgres { lock: bool },
-}
-
-fn candidate_sql(class: Option<ArchiveJobClass>, read: ClaimRead) -> &'static str {
-    macro_rules! candidate {
-        ($kinds:literal, $index:literal, $suffix:literal) => {
-            concat!(
-                "SELECT job_id FROM content_jobs", $index, "
-                 WHERE state IN ('queued','running') AND ", $kinds, " AND space_id=$1
-                   AND (state='queued' OR lease_until_ms<=$2 OR claim_space_epoch IS DISTINCT FROM
-                        (SELECT active_epoch FROM spaces WHERE space_id=$1))
-                 ORDER BY created_seq, job_id LIMIT 1", $suffix
-            )
-        };
-        ($kinds:literal) => {
-            match read {
-                // With skewed queue statistics SQLite can otherwise scan terminal history.
-                ClaimRead::Sqlite => candidate!($kinds, " INDEXED BY idx_content_jobs_claim", ""),
-                ClaimRead::Postgres { lock: false } => candidate!($kinds, "", ""),
-                ClaimRead::Postgres { lock: true } => candidate!($kinds, "", " FOR UPDATE SKIP LOCKED"),
-            }
-        };
-    }
-    match class {
-        Some(ArchiveJobClass::Import) => candidate!("job_kind='import'"),
-        Some(ArchiveJobClass::Export) => candidate!("job_kind='export'"),
-        // Seek each legal kind in the claim index inside this Space.
-        None => {
-            candidate!("job_kind IN ('import','export','backup','restore','reindex','reembed')")
-        }
-    }
-}
-
 async fn next_claimable_job(
     tx: &mut BackendConn<'_>,
     scope: &HistoryScope,
+    active_epoch: LeaseEpoch,
     class: Option<ArchiveJobClass>,
     lock: bool,
 ) -> Result<Option<JobId>, PortError> {
     let now = job_clock_ms(tx).await?;
-    let id: Option<String> = match tx {
-        BackendConn::Sqlite(conn) => sqlx::query_scalar(candidate_sql(class, ClaimRead::Sqlite))
+    let epoch = active_epoch.get() as i64;
+    let mut after = (0_i64, String::new());
+    loop {
+        macro_rules! head {
+            ($conn:expr, $sqlite:expr) => {
+                sqlx::query_as::<_, (String, i64)>(candidate_sql(class, $sqlite))
+                    .bind(scope.space_id.as_str())
+                    .bind(now)
+                    .bind(after.0)
+                    .bind(&after.1)
+                    .bind(epoch)
+                    .fetch_optional(&mut **$conn)
+                    .await
+            };
+        }
+        let head = match tx {
+            BackendConn::Sqlite(conn) => head!(conn, true)
+                .map_err(|e| internal_not_committed("sqlite_select_claim_job", e.to_string()))?,
+            BackendConn::Postgres(conn) => head!(conn, false)
+                .map_err(|e| crate::runtime::pg_read_error("pg_select_claim_job", e))?,
+        };
+        let Some((id, seq)) = head else {
+            return Ok(None);
+        };
+        // Lock only the FIFO winner. A concurrent lock or state change skips
+        // that key and resumes the same ordered search in this transaction.
+        if lock && let BackendConn::Postgres(conn) = tx {
+            let locked = sqlx::query_scalar::<_, i32>(
+                "SELECT 1 FROM content_jobs WHERE space_id=$1 AND job_id=$2
+                 AND (state='queued' OR (state='running' AND
+                      (lease_until_ms<=$3 OR claim_space_epoch IS DISTINCT FROM $4)))
+                 FOR UPDATE SKIP LOCKED",
+            )
             .bind(scope.space_id.as_str())
+            .bind(&id)
             .bind(now)
+            .bind(epoch)
             .fetch_optional(&mut **conn)
             .await
-            .map_err(|err| internal_not_committed("sqlite_select_claim_job", err.to_string()))?,
-        BackendConn::Postgres(conn) => {
-            sqlx::query_scalar(candidate_sql(class, ClaimRead::Postgres { lock }))
-                .bind(scope.space_id.as_str())
-                .bind(now)
-                .fetch_optional(&mut **conn)
-                .await
-                .map_err(|err| crate::runtime::pg_read_error("pg_select_claim_job", err))?
+            .map_err(|e| crate::runtime::pg_read_error("pg_lock_claim_job", e))?;
+            if locked.is_none() {
+                after = (seq, id);
+                continue;
+            }
         }
-    };
-    id.map(|raw| {
-        JobId::parse(&raw).map_err(|_| internal_not_committed("corrupt_claim_id", "invalid JobId"))
-    })
-    .transpose()
+        return JobId::parse(&id)
+            .map(Some)
+            .map_err(|_| internal_not_committed("corrupt_claim_id", "invalid JobId"));
+    }
 }
 
 fn lease_duration_ms(duration: Duration) -> Result<i64, PortError> {
@@ -2645,7 +2628,7 @@ async fn claim_next_job_impl(
                 Box::pin(async move {
                     let srec = load_space_record(tx, &scope_read.space_id).await?;
                     srec.scope.check(&scope_read)?;
-                    next_claimable_job(tx, &scope_read, class, false).await
+                    next_claimable_job(tx, &scope_read, srec.active_epoch, class, false).await
                 })
             })
         })
@@ -2673,7 +2656,9 @@ async fn claim_next_job_impl(
         required_semantic_cut: None,
         execute: Box::new(move |tx, item_ctx| {
             Box::pin(async move {
-                let Some(jid) = next_claimable_job(tx, &scope_cl, class, true).await? else {
+                let Some(jid) =
+                    next_claimable_job(tx, &scope_cl, item_ctx.active_epoch, class, true).await?
+                else {
                     return Err(DomainError::validation(ValidationReason::NotReady).into());
                 };
                 let seq = item_ctx.alloc_next_seq()?;

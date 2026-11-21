@@ -526,7 +526,6 @@ impl CanonicalStore {
                     }
                     let live = load_space_record(tx, &scope.space_id).await?;
                     live.scope.check(&scope)?;
-                    check_publication_tx(tx, &scope.space_id, &binding).await?;
                     if live.last_seq != access.seq {
                         store
                             .authorize_export_selection_tx(
@@ -539,6 +538,7 @@ impl CanonicalStore {
                             )
                             .await?;
                     }
+                    let expires = check_publication_tx(tx, &scope.space_id, &binding).await?;
                     // Serialize the synchronous enqueue with revocation of the
                     // caller's wait. An accepted transfer has its own receipt.
                     let mut state = state.lock().unwrap_or_else(|err| err.into_inner());
@@ -552,6 +552,9 @@ impl CanonicalStore {
                     caller_registration.check()?;
                     if let Some(origin) = &origin_registration {
                         origin.check()?;
+                    }
+                    if tokio::time::Instant::now() >= expires {
+                        return Err(DomainError::ResourceNotFound.into());
                     }
                     handoff()?;
                     *state = ChunkState::Delivered;
@@ -913,7 +916,8 @@ async fn check_publication_tx(
     tx: &mut BackendConn<'_>,
     space: &SpaceId,
     binding: &ExportBinding,
-) -> Result<(), PortError> {
+) -> Result<tokio::time::Instant, PortError> {
+    let sampled_at = tokio::time::Instant::now();
     let now = job_clock_ms(tx).await?;
     macro_rules! check {
         ($conn:expr, $sql:expr) => {
@@ -937,7 +941,11 @@ async fn check_publication_tx(
     if !current {
         return Err(DomainError::ResourceNotFound.into());
     }
-    Ok(())
+    // Both backends truncate their clock to milliseconds. Anchor the remaining
+    // whole milliseconds before the clock round trip so admission can check
+    // expiry synchronously after the two credential registrations.
+    let remaining = Duration::from_millis(binding.expires.abs_diff(now).saturating_sub(1));
+    Ok(crate::runtime::deadline_after(sampled_at, remaining))
 }
 
 fn authorize_job_write_for_export(

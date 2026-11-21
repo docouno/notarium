@@ -4103,6 +4103,39 @@ async fn oversized_export_jobs_are_rejected_or_failed_before_the_next_claim() {
             .unwrap();
         let ids: BTreeSet<_> = page.items.into_iter().map(|job| job.id).collect();
         assert_eq!(ids, BTreeSet::from([old.id, healthy.id]));
+
+        if postgres {
+            let enqueue = async || {
+                store
+                    .create_job(
+                        ctx(),
+                        next_mutation(
+                            &scope,
+                            &owner,
+                            ContentJobKind::ExportSpace { encrypted: false },
+                        ),
+                    )
+                    .await
+                    .unwrap()
+                    .value
+                    .id
+            };
+            let first = enqueue().await;
+            let second = enqueue().await;
+            let mut lock = fixtures.open_raw_pg().await;
+            sqlx::query("BEGIN").execute(&mut lock).await.unwrap();
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "SELECT 1 FROM \"{schema}\".content_jobs WHERE space_id=$1 AND job_id=$2 FOR UPDATE"
+            )))
+            .bind(scope.space_id.as_str())
+            .bind(first.as_str())
+            .fetch_one(&mut lock)
+            .await
+            .unwrap();
+            assert_eq!(claim().await.unwrap().job.id, second);
+            sqlx::query("ROLLBACK").execute(&mut lock).await.unwrap();
+            assert_eq!(claim().await.unwrap().job.id, first);
+        }
         runtime.shutdown().await.unwrap();
     }
     fixtures.drop_pg_schema(&schema).await;

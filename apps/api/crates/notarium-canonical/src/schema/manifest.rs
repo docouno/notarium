@@ -2,7 +2,7 @@ use std::{collections::BTreeSet, sync::LazyLock};
 
 use notarium_core::ids::ContentDigest;
 
-pub const CANONICAL_SCHEMA_VERSION: u32 = 9;
+pub const CANONICAL_SCHEMA_VERSION: u32 = 10;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LogicalColKind {
@@ -739,7 +739,11 @@ pub const CANONICAL_TABLES: &[TableSpec] = &[
             col("updated_seq", Int, false),
             col("claim_space_epoch", Int, true),
         ],
-        indexes: &["idx_content_jobs_claim", "idx_content_jobs_export_access"],
+        indexes: &[
+            "idx_content_jobs_claim",
+            "idx_content_jobs_export_access",
+            "idx_content_jobs_reclaim",
+        ],
     },
     TableSpec {
         name: "archive_artifacts",

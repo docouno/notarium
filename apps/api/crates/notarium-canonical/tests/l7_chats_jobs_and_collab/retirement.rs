@@ -1007,7 +1007,7 @@ async fn restored_retirements_release_terminal_workers_and_serve_other_spaces() 
             .unwrap();
 
         // Eight blocked physical objects must release the restore scan slots.
-        // The ninth Space completes with every obstruction still in place.
+        // The ninth Space must also commit its SQL completion after unlink.
         tokio::time::timeout(Duration::from_secs(10), async {
             while spaces.iter().any(|(_, path)| path.exists())
                 || store
@@ -1018,6 +1018,7 @@ async fn restored_retirements_release_terminal_workers_and_serve_other_spaces() 
                     .await
                     .unwrap()
                     != 8
+                || pending(&store).await != 8
             {
                 assert!(
                     store.active_retirement_workers_for_test()
@@ -1028,7 +1029,6 @@ async fn restored_retirements_release_terminal_workers_and_serve_other_spaces() 
         })
         .await
         .expect("healthy Space must progress past all eight blocked Spaces");
-        assert_eq!(pending(&store).await, 8);
 
         // Corrupt durable metadata for four IDs. Their physical workers must
         // stop. The other four remain eligible for automatic recovery.

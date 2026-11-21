@@ -494,6 +494,27 @@ impl BackendCase {
                 .execute(&mut *tx)
                 .await
                 .unwrap();
+            if decoded.schema_version < 10 {
+                sqlx::raw_sql(
+                    "DROP INDEX idx_content_jobs_reclaim; DROP INDEX idx_content_jobs_claim",
+                )
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+                let previous = match decoded.schema_version {
+                    1..=6 => {
+                        "CREATE INDEX idx_content_jobs_claim ON content_jobs (space_id, state, lease_until_ms, job_id)"
+                    }
+                    // Both v7 index orders share the spool witness. Materialize the later one.
+                    7 => {
+                        "CREATE INDEX idx_content_jobs_claim ON content_jobs (state, space_id, job_kind, lease_until_ms, job_id)"
+                    }
+                    _ => {
+                        "CREATE INDEX idx_content_jobs_claim ON content_jobs (state, job_kind, space_id, lease_until_ms, job_id)"
+                    }
+                };
+                sqlx::query(previous).execute(&mut *tx).await.unwrap();
+            }
             if decoded.schema_version < 9 {
                 sqlx::raw_sql(
                     "DROP INDEX idx_blob_catalog_legacy;

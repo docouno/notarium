@@ -94,7 +94,7 @@ recovers writes under its exclusive DataRoot owner lock.
 ## Dual-dialect schema and history model
 
 Both SQL dialects materialize the same ordinary B-tree tables in schema
-version `9` and verify live database catalogs (`sqlite_master` / `pg_catalog`)
+version `10` and verify live database catalogs (`sqlite_master` / `pg_catalog`)
 against a shared typed manifest checksum (`schema_meta`) on every startup.
 Unknown newer schema versions, mismatched manifest checksums or unfinished
 migration states fail closed.
@@ -106,6 +106,12 @@ and resulting Space identity, history and cutoff, including after restart.
 The caller can replay a pending control operation after losing the canonical
 response. Reusing the key with a different payload is rejected. Rebinding a
 Space's history invalidates receipts issued for its earlier incarnation.
+
+Schema version 10 gives queued jobs a partial FIFO index ordered by class, Space,
+creation sequence and job ID. A second partial index contains running leases,
+with the claim epoch and deadline followed by the FIFO keys. Workers compare the
+oldest queued job with jobs whose lease expired or whose Space epoch changed.
+Discovery seeks directly to each successive Space with jobs of the requested class.
 
 Schema version 9 adds partial indexes for legacy cleanup and export access
 checks. Recovery seeks only legacy zero-reference entries and commits at most 128
@@ -506,10 +512,16 @@ same example against an isolated prefix.
   A Local hold whose release timed out waiting for a writer retains ownership
   while the runtime retries cleanup of its exact generation.
   The offline `notarium_canonical::backup::decode_postgres_spool_v1_bounded`
-  API verifies the trailer and recognizes the exact manifests for schemas 1 through 9.
+  API verifies the trailer and recognizes the exact manifests for schemas 1 through 10.
   It returns typed rows in the original table and column order within the
   caller's byte budget. To materialize a historical spool, create an empty
-  target with `schema::POSTGRES_BASELINE_DDL`. For versions 1 through 8, drop
+  target with `schema::POSTGRES_BASELINE_DDL`. For versions 1 through 9, drop
+  `idx_content_jobs_reclaim` and recreate `idx_content_jobs_claim`. Versions 1
+  through 6 use `(space_id, state, lease_until_ms, job_id)`. Version 7 initially
+  used that order and later used `(state, space_id, job_kind, lease_until_ms, job_id)`.
+  Both produce the same v7 spool witness. Either order is valid when materializing
+  a v7 spool. Versions 8 and 9 use `(state, job_kind, space_id, lease_until_ms, job_id)`.
+  For versions 1 through 8, drop
   `idx_blob_catalog_legacy`, `idx_note_heads_export_access`,
   `idx_folder_heads_export_access` and `idx_content_jobs_export_access`.
   For versions 1 through 7, drop

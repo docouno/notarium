@@ -762,7 +762,12 @@ CREATE INDEX IF NOT EXISTS idx_content_jobs_export_access
     WHERE job_kind = 'export' AND state = 'succeeded' AND payload_erased_by_purge = 0;
 
 CREATE INDEX IF NOT EXISTS idx_content_jobs_claim
-    ON content_jobs (state, job_kind, space_id, lease_until_ms, job_id);
+    ON content_jobs (job_kind, space_id, created_seq, job_id)
+    WHERE state = 'queued';
+
+CREATE INDEX IF NOT EXISTS idx_content_jobs_reclaim
+    ON content_jobs (job_kind, space_id, claim_space_epoch, lease_until_ms, created_seq, job_id)
+    WHERE state = 'running';
 
 CREATE TABLE IF NOT EXISTS archive_artifacts (
     space_id TEXT NOT NULL,

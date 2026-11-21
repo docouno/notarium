@@ -71,6 +71,22 @@ impl RevocationLease for TestLease {
     }
 }
 
+struct WaitForArtifactExpiry {
+    expires_at_ms: i64,
+    checked: Arc<AtomicBool>,
+}
+
+impl RevocationLease for WaitForArtifactExpiry {
+    fn check(&self) -> Result<(), PortError> {
+        let remaining = self.expires_at_ms - codec::now_unix_ms()?;
+        if remaining > 0 {
+            std::thread::sleep(Duration::from_millis(remaining as u64 + 1));
+        }
+        self.checked.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
 impl SessionRevocationPort for TestRegistry {
     fn register_provider(
         &self,
@@ -913,6 +929,52 @@ async fn exercise_local_archive_worker(entries: usize) {
             rusqlite::params![old_title.0, old_title.1, scope.space_id.as_str(), &note],
         )
         .unwrap();
+        // Exercise the end of a published archive's seven-day window without
+        // advancing the Control clock or changing the credential's validity.
+        let expiring_job = jobs
+            .enqueue(
+                ctx.clone(),
+                mutation(
+                    &ctx,
+                    ContentJobKind::Export {
+                        notes: vec![NoteId::parse(&note).unwrap()],
+                        encrypted: false,
+                    },
+                ),
+            )
+            .await
+            .unwrap()
+            .value;
+        let expiring_job = terminal(&store, &ctx, &expiring_job).await;
+        let artifact = &expiring_job.artifacts[0];
+        let expires_at_ms = codec::now_unix_ms().unwrap() + 2_000;
+        db.execute(
+            "UPDATE archive_artifacts SET expires_at_ms=?1 WHERE space_id=?2 AND artifact_id=?3",
+            rusqlite::params![expires_at_ms, scope.space_id.as_str(), artifact.as_str()],
+        )
+        .unwrap();
+        let near_expiry = store
+            .open_committed_export(ctx.clone(), artifact, async |_| {
+                Err(DomainError::AccessDenied.into())
+            })
+            .await
+            .unwrap();
+        let checked = Arc::new(AtomicBool::new(false));
+        let permit = store
+            .authorize_export_chunk(
+                &near_expiry,
+                (
+                    ctx.clone(),
+                    Box::new(WaitForArtifactExpiry {
+                        expires_at_ms,
+                        checked: checked.clone(),
+                    }),
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+        let before_move = store.export_policy_reads_for_test();
         // A note move advances the Space sequence while this ZIP remains
         // valid. Both credentials share one check of its new ancestry.
         store
@@ -929,6 +991,26 @@ async fn exercise_local_archive_worker(entries: usize) {
             )
             .await
             .unwrap();
+        let (send, mut received) = tokio::sync::oneshot::channel();
+        let result = store
+            .handoff_export_chunk(&budget(), permit, move || {
+                send.send(b'x').unwrap();
+                Ok(())
+            })
+            .await;
+        assert!(checked.load(Ordering::SeqCst));
+        assert!(matches!(
+            result,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ));
+        assert!(matches!(
+            received.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+        ));
+        assert_eq!(
+            store.export_policy_reads_for_test(),
+            (before_move.0, before_move.1 + 1)
+        );
         for offset in 1..=2 {
             selected_download
                 .read_chunk(budget(), offset, 1)
@@ -937,7 +1019,7 @@ async fn exercise_local_archive_worker(entries: usize) {
         }
         assert_eq!(
             store.export_policy_reads_for_test(),
-            (opened_policy, opened_selection_reads + 1)
+            (before_move.0, before_move.1 + 2)
         );
         Some(selected_download)
     } else {

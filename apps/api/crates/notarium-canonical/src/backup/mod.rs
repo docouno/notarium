@@ -2130,6 +2130,9 @@ pub fn spool_tables(schema_version: u32) -> impl Iterator<Item = TableSpec> + Cl
         .iter()
         .copied()
         .filter_map(move |mut table| {
+            if schema_version < 10 && table.name == "content_jobs" {
+                table.indexes = &table.indexes[..2];
+            }
             if schema_version < 9
                 && matches!(
                     table.name,
@@ -2301,7 +2304,7 @@ fn read_postgres_spool(
     let expected_tables = spool_tables(schema_version);
     let expected_checksum = match schema_version {
         CANONICAL_SCHEMA_VERSION => manifest_checksum(),
-        1..=8 => {
+        1..=9 => {
             let digest = checksum_tables(schema_version, expected_tables.clone());
             if !crate::schema::migrate::recognized_predecessor(
                 i64::from(schema_version),

@@ -73,6 +73,8 @@ reuses document classes and active ancestry while the history, privacy generatio
 and Space sequence match. SQLite resolves changed selections through covering
 indexes. The caller and original exporter both need current access. Their
 revocation and expiry checks run at handoff inside the canonical privacy fence.
+The reader checks the ZIP's remaining lifetime against the database clock and
+enforces that deadline when it hands off the bytes.
 A successful enqueue into a reserved transport slot is the receipt for that
 chunk. Archive bytes already handed off belong to the caller. An artifact
 expires seven days after publication. The maintenance loop retires its sealed
