@@ -245,7 +245,7 @@ fn folder_path(
 ) -> Result<Option<String>, PortError> {
     let mut names = Vec::new();
     let mut next = folder;
-    for _ in 0..256 {
+    for _ in 0..=crate::domain::common::MAX_FOLDER_DEPTH {
         let (parent, is_root, slug, lifecycle) = folders
             .get(next)
             .ok_or_else(|| invalid(ValidationReason::InvalidState))?;

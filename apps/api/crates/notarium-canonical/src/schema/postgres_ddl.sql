@@ -734,7 +734,7 @@ CREATE TABLE IF NOT EXISTS content_jobs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_content_jobs_claim
-    ON content_jobs (space_id, state, lease_until_ms, job_id);
+    ON content_jobs (state, space_id, job_kind, lease_until_ms, job_id);
 
 CREATE TABLE IF NOT EXISTS archive_artifacts (
     space_id TEXT NOT NULL,

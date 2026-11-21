@@ -528,6 +528,43 @@ pub(crate) async fn create_note_impl(
     }
 }
 
+pub(crate) fn created_note_metadata(
+    input: &CreateNote,
+    parent: &notarium_core::ids::FolderId,
+    is_root_child: bool,
+    slug_fold: String,
+    info: PreparedCarrierInfo,
+    schema: Option<&super::common::CurrentSpaceSchema>,
+) -> NoteRevisionMetadata {
+    let evaluated_fields = if input.class == DocClass::EncryptedNote {
+        BTreeMap::new()
+    } else {
+        evaluate_fields_with_schema(
+            info.raw_fields.as_ref(),
+            info.diagnostics.first(),
+            schema.map(|value| &value.fields),
+        )
+    };
+    NoteRevisionMetadata {
+        note_id: input.note.clone(),
+        parent_folder_id: parent.clone(),
+        is_root_child,
+        slug: input.slug.clone(),
+        slug_fold,
+        title: info.title,
+        doc_class: input.class,
+        ability_id: None,
+        lifecycle: Lifecycle::Active,
+        visibility_mask: 0,
+        byte_size: info.byte_size,
+        content_digest: Some(info.prepared_blob.digest),
+        schema_revision: schema.map(|value| value.schema_revision.clone()),
+        raw_fields: info.raw_fields,
+        evaluated_fields,
+        diagnostics: info.diagnostics,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_create_note_intent(
     scope: &notarium_core::model::HistoryScope,
@@ -696,39 +733,19 @@ pub(crate) fn build_create_note_intent(
                 }
 
                 let current_schema = load_current_space_schema_tx(tx, &scope_cl.space_id).await?;
-                let eval_fields = if input.class == DocClass::EncryptedNote {
-                    BTreeMap::new()
-                } else {
-                    evaluate_fields_with_schema(
-                        info.raw_fields.as_ref(),
-                        info.diagnostics.first(),
-                        current_schema.as_ref().map(|s| &s.fields),
-                    )
-                };
-
+                let metadata = created_note_metadata(
+                    &input,
+                    &parent_id,
+                    anc.is_root_child,
+                    slug_fold,
+                    info,
+                    current_schema.as_ref(),
+                );
                 let run_opt = extract_agent_run_from_auth(&auth);
-                let changed_fields = changed_note_fields(&EvaluatedFields::new(), &eval_fields);
-                let meta = RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Note(
-                    NoteRevisionMetadata {
-                        note_id: input.note.clone(),
-                        parent_folder_id: parent_id,
-                        is_root_child: anc.is_root_child,
-                        slug: input.slug,
-                        slug_fold,
-                        title: info.title,
-                        doc_class: input.class,
-                        ability_id: None,
-                        lifecycle: Lifecycle::Active,
-                        visibility_mask: 0,
-                        byte_size: info.byte_size,
-                        content_digest: Some(digest),
-                        schema_revision: current_schema.map(|s| s.schema_revision),
-                        raw_fields: info.raw_fields,
-                        evaluated_fields: eval_fields,
-                        diagnostics: info.diagnostics,
-                    },
-                ))
-                .encode()?;
+                let changed_fields =
+                    changed_note_fields(&EvaluatedFields::new(), &metadata.evaluated_fields);
+                let meta = RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Note(metadata))
+                    .encode()?;
 
                 insert_revision_row(
                     tx,

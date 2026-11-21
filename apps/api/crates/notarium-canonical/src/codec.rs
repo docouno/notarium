@@ -242,6 +242,44 @@ pub fn encode_msgpack<T: Serialize>(value: &T) -> Result<Vec<u8>, PortError> {
         .map_err(|err| internal_not_committed("msgpack_encode", err.to_string()))
 }
 
+#[derive(Default)]
+struct MsgpackBuffer<const LIMIT: usize> {
+    bytes: Vec<u8>,
+    exceeded: bool,
+}
+
+impl<const LIMIT: usize> std::io::Write for MsgpackBuffer<LIMIT> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > LIMIT - self.bytes.len() {
+            self.exceeded = true;
+            return Err(std::io::ErrorKind::WriteZero.into());
+        }
+        let required = self.bytes.len() + bytes.len();
+        if required > self.bytes.capacity() {
+            let capacity = required.max(self.bytes.capacity() * 2).clamp(32, LIMIT);
+            self.bytes.reserve_exact(capacity - self.bytes.len());
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+pub(crate) fn encode_msgpack_bounded<const LIMIT: usize>(
+    value: &impl Serialize,
+    error_code: &'static str,
+) -> Result<Option<Vec<u8>>, PortError> {
+    let mut buffer = MsgpackBuffer::<LIMIT>::default();
+    match rmp_serde::encode::write_named(&mut buffer, value) {
+        Ok(()) => Ok(Some(buffer.bytes)),
+        Err(_) if buffer.exceeded => Ok(None),
+        Err(err) => Err(internal_not_committed(error_code, err.to_string())),
+    }
+}
+
 pub fn decode_msgpack_bounded<T: DeserializeOwned>(
     bytes: &[u8],
     max_bytes: usize,
@@ -378,7 +416,8 @@ impl RevisionMetadataEnvelope {
     }
 
     pub fn encode(&self) -> Result<Vec<u8>, PortError> {
-        encode_msgpack(self)
+        encode_msgpack_bounded::<MAX_MSGPACK_DECODE_BYTES>(self, "msgpack_encode")?
+            .ok_or_else(|| DomainError::validation(ValidationReason::BudgetExceeded).into())
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, PortError> {

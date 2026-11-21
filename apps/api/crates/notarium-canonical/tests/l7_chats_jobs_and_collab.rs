@@ -2211,6 +2211,16 @@ async fn run_jobs_and_collab_lifecycle_suite(store: &CanonicalStore, sqlite: boo
         .await
         .unwrap();
 
+    let listed_for = async |class| {
+        store
+            .archive_job_scopes(&make_budget(), class, None, PageLimit::new(64).unwrap())
+            .await
+            .unwrap()
+            .contains(&scope)
+    };
+    use notarium_canonical::ArchiveJobClass;
+    assert!(!listed_for(ArchiveJobClass::Export).await);
+    assert!(!listed_for(ArchiveJobClass::Import).await);
     let job_export = store
         .create_job(
             owner_ctx(&scope, owner.clone()),
@@ -2226,6 +2236,20 @@ async fn run_jobs_and_collab_lifecycle_suite(store: &CanonicalStore, sqlite: boo
         .await
         .expect("create Export job")
         .value;
+    assert!(listed_for(ArchiveJobClass::Export).await);
+    assert!(!listed_for(ArchiveJobClass::Import).await);
+    assert!(
+        !store
+            .archive_job_scopes(
+                &make_budget(),
+                ArchiveJobClass::Export,
+                Some(&scope.space_id),
+                PageLimit::new(1).unwrap()
+            )
+            .await
+            .unwrap()
+            .contains(&scope)
+    );
     let source = ArtifactId::from_bytes([0xB2; 16]);
     for maintenance in [
         ContentJobKind::Backup,
@@ -2407,6 +2431,9 @@ async fn run_jobs_and_collab_lifecycle_suite(store: &CanonicalStore, sqlite: boo
         .await
         .expect("cancel reindex job");
 
+    assert!(listed_for(ArchiveJobClass::Export).await);
+    assert!(!listed_for(ArchiveJobClass::Import).await);
+
     // Expiration alone fences effects, even before the next worker claims it.
     tokio::time::sleep(Duration::from_millis(2)).await;
     let expired_heartbeat = store
@@ -2448,6 +2475,8 @@ async fn run_jobs_and_collab_lifecycle_suite(store: &CanonicalStore, sqlite: boo
     assert_eq!(claim2.job.id, job_export.id);
     assert_eq!(claim2.attempts, 2);
     assert!(claim2.job.lease > claim1.job.lease);
+
+    assert!(!listed_for(ArchiveJobClass::Export).await);
 
     // `heartbeat_job_lease` updates progress without advancing `spaces.last_seq`!
     let progress_cursor = store
@@ -3832,6 +3861,10 @@ async fn paged_archive_export_keeps_chat_appends_out_of_the_cut() {
     let pg = fixtures.pg_local_config(sample_installation_id(0xb9), &schema, pg_root.data_root());
     let sqlite = CanonicalConfig::local_default(sample_installation_id(0xb8), local.data_root());
     for config in [sqlite, pg] {
+        let postgres = matches!(
+            config.sql,
+            notarium_canonical::SqlBackendConfig::Postgres { .. }
+        );
         let (store, runtime) = CanonicalRuntime::open(config).await.unwrap();
         let owner = sample_principal_id(0xb7);
         let scope = store
@@ -3850,9 +3883,48 @@ async fn paged_archive_export_keeps_chat_appends_out_of_the_cut() {
             .unwrap()
             .scope;
         let ctx = || owner_ctx(&scope, owner.clone());
+        // Bulk-load the valid depth boundary to exercise both snapshot readers
+        // without benchmarking 256 individual folder mutations.
+        let mut parent = sample_folder_id(0xb7);
+        let mut deep_folders = Vec::new();
+        for depth in 1_u128..=256 {
+            let folder = notarium_core::ids::FolderId::from_bytes(depth.to_be_bytes());
+            deep_folders.push(format!(
+                "('{}','{folder}','{parent}',0,'x','x','x',0,'active',0,'rev_{depth:032x}',0,0,0,0)",
+                scope.space_id
+            ));
+            parent = folder;
+        }
+        store.execute_diagnostic_write_sql_for_test(&format!(
+            "INSERT INTO folder_heads(space_id,folder_id,parent_folder_id,is_root,slug,slug_fold,display_name,
+             is_project,lifecycle_state,rev_seq,head_rev_id,created_seq,updated_seq,updated_at_sec,updated_at_nsec)
+             VALUES {}", deep_folders.join(",")
+        )).await.unwrap();
+        let deepest = sample_note_id(0xd1);
+        store
+            .create_note(
+                ctx(),
+                next_mutation(
+                    &scope,
+                    &owner,
+                    CreateNote {
+                        note: deepest.clone(),
+                        parent: None,
+                        slug: "deep".into(),
+                        class: DocClass::UserDoc,
+                        carrier: "# Deep\n".into(),
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        store.execute_diagnostic_write_sql_for_test(&format!(
+            "UPDATE note_heads SET parent_folder_id='{parent}' WHERE space_id='{}' AND note_id='{deepest}'", scope.space_id
+        )).await.unwrap();
+        let deep_path = format!("{}deep.md", "x/".repeat(256));
         let original_schema = "# Schema at the cut\n";
         let schema_note = sample_note_id(0xbe);
-        let schema = store
+        let installed_schema = store
             .update_space_schema(
                 ctx(),
                 next_mutation(
@@ -3965,6 +4037,7 @@ async fn paged_archive_export_keeps_chat_appends_out_of_the_cut() {
         assert_eq!(claim.job.id, job.id);
         let check_schema =
             |entries: &[notarium_canonical::peers::archive_export::ExportEntry]| {
+                assert!(entries.iter().any(|entry| entry.path == deep_path));
                 let entry = entries
                     .iter()
                     .find(|entry| entry.path == ".notarium/fields/schema.yaml")
@@ -3996,7 +4069,7 @@ async fn paged_archive_export_keeps_chat_appends_out_of_the_cut() {
                                 slug: "new-schema".into(),
                                 carrier: "# After the cut\n".into(),
                                 schema: BTreeMap::new(),
-                                expected_schema_revision: Some(schema.schema_revision),
+                                expected_schema_revision: Some(installed_schema.schema_revision),
                             },
                         ),
                     )
@@ -4044,7 +4117,7 @@ async fn paged_archive_export_keeps_chat_appends_out_of_the_cut() {
             .unwrap();
         eprintln!("versioned export registration: {:?}", cut.snapshot_elapsed);
         assert!(cut.snapshot_elapsed < Duration::from_millis(50));
-        assert_eq!(cut.entries.len(), 3);
+        assert_eq!(cut.entries.len(), 4);
         check_schema(&cut.entries);
         assert!(cut.entries.iter().any(|entry| entry.path == "before.md"));
         let (header, chat) = cut
@@ -4259,6 +4332,19 @@ async fn paged_archive_export_keeps_chat_appends_out_of_the_cut() {
                 .await
                 .is_err()
         );
+        assert!(
+            store
+                .archive_job_scopes(
+                    &make_budget(),
+                    ArchiveJobClass::Export,
+                    None,
+                    PageLimit::new(64).unwrap()
+                )
+                .await
+                .unwrap()
+                .contains(&scope),
+            "a live worker lease from the previous Space epoch is immediately reclaimable",
+        );
         let new_claim = store
             .claim_next_archive_job(
                 &make_budget(),
@@ -4343,6 +4429,45 @@ async fn paged_archive_export_keeps_chat_appends_out_of_the_cut() {
             store.get_job(ctx(), job.id).await.unwrap().state,
             notarium_core::ports::JobState::Failed
         );
+        if postgres {
+            let selected = store
+                .create_job(
+                    ctx(),
+                    next_mutation(
+                        &scope,
+                        &owner,
+                        ContentJobKind::Export {
+                            notes: vec![sample_note_id(0xbc)],
+                            encrypted: false,
+                        },
+                    ),
+                )
+                .await
+                .unwrap()
+                .value;
+            let claim = store
+                .claim_next_job(
+                    &make_budget(),
+                    &scope,
+                    "budget-probe",
+                    Duration::from_secs(30),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(claim.job.id, selected.id);
+            let mut lock = fixtures.open_raw_pg().await;
+            sqlx::query("BEGIN").execute(&mut lock).await.unwrap();
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "LOCK TABLE \"{schema}\".folder_heads IN ACCESS EXCLUSIVE MODE"
+            )))
+            .execute(&mut lock)
+            .await
+            .unwrap();
+            let result = store.capture_archive_export(&ctx(), &claim).await.map(drop);
+            sqlx::query("ROLLBACK").execute(&mut lock).await.unwrap();
+            assert_validation_err(&result, ValidationReason::BudgetExceeded);
+        }
         runtime.shutdown().await.unwrap();
     }
     fixtures.drop_pg_schema(&schema).await;

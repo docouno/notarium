@@ -78,6 +78,16 @@ impl crate::CanonicalStore {
         epoch: LeaseEpoch,
         ids: Vec<String>,
     ) -> Vec<Attempt> {
+        self.schedule_retirements_with_slot(scope, epoch, ids, None)
+    }
+
+    pub(super) fn schedule_retirements_with_slot(
+        &self,
+        scope: &HistoryScope,
+        epoch: LeaseEpoch,
+        ids: Vec<String>,
+        sweep_slot: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) -> Vec<Attempt> {
         let mut pending = Vec::new();
         let mut attempts = Vec::with_capacity(ids.len());
         {
@@ -106,6 +116,7 @@ impl crate::CanonicalStore {
         if !pending.is_empty() {
             let shutdown = self.inner.backup_shutdown.clone();
             let handle = self.inner.backup_executor.spawn(async move {
+                let _slot = sweep_slot;
                 tokio::select! { biased; () = shutdown.cancelled() => {}, () = run(pending) => {} }
             });
             crate::backup::register_cleanup_task(&self.inner, handle);

@@ -55,6 +55,7 @@ pub struct CloudRestoreTarget {
 
 struct Gate {
     archive: ContentDigest,
+    namespace_owner: Vec<u8>,
     installation: InstallationId,
     histories: Vec<ChangeCursor>,
     canonical_loaded: bool,
@@ -172,15 +173,21 @@ async fn open_gate(
         return Err(invalid(ValidationReason::InvalidPathComponent));
     }
     let location = namespace_fingerprint(s3)?;
-    let has_gate: bool =
-        sqlx::query_scalar("SELECT to_regclass('notarium_restore.readiness') IS NOT NULL")
-            .fetch_one(&mut *conn)
-            .await
-            .map_err(pg_error)?;
+    let (has_gate, has_owner): (bool, bool) = sqlx::query_as(
+        "SELECT gate IS NOT NULL, EXISTS(SELECT 1 FROM pg_catalog.pg_attribute
+            WHERE attrelid=gate AND attname='namespace_owner' AND NOT attisdropped)
+         FROM (SELECT to_regclass('notarium_restore.readiness') AS gate) r",
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(pg_error)?;
     if has_gate {
-        type GateRow = (String, Vec<u8>, Vec<u8>, String, bool, String);
-        let (install, saved, target, histories, canonical_loaded, phase): GateRow = sqlx::query_as(
-             "SELECT installation_id,archive_digest,object_namespace,histories,canonical_loaded,phase
+        if !has_owner {
+            return Err(invalid(ValidationReason::InvalidState));
+        }
+        type GateRow = (String, Vec<u8>, Vec<u8>, String, bool, String, Vec<u8>);
+        let (install, saved, target, histories, canonical_loaded, phase, namespace_owner): GateRow = sqlx::query_as(
+             "SELECT installation_id,archive_digest,object_namespace,histories,canonical_loaded,phase,namespace_owner
               FROM notarium_restore.readiness WHERE singleton=1",
         ).fetch_one(&mut *conn).await.map_err(pg_error)?;
         let histories: Vec<ChangeCursor> = serde_json::from_str(&histories)
@@ -189,12 +196,15 @@ async fn open_gate(
             || saved != digest.as_bytes()
             || target != location.as_bytes()
             || !same_cuts(&histories, &archive.histories)
-            || !matches!(phase.as_str(), "loading" | "ready")
+            || !matches!(phase.as_str(), "reserving" | "loading" | "ready")
+            || namespace_owner.len() != 16
         {
             return Err(invalid(ValidationReason::InvalidAuthority));
         }
+        bind_prefix(conn, s3, prefix, &namespace_owner, phase == "reserving").await?;
         return Ok(Gate {
             archive: digest,
+            namespace_owner,
             installation,
             histories,
             canonical_loaded,
@@ -215,6 +225,7 @@ async fn open_gate(
         return Err(invalid(ValidationReason::InvalidState));
     }
     require_empty_prefix(s3, prefix).await?;
+    let namespace_owner = codec::csprng_16()?.to_vec();
     let mut histories = archive.histories.clone();
     for cursor in &mut histories {
         cursor.scope.incarnation = HistoryIncarnation::from_bytes(codec::csprng_16()?);
@@ -229,27 +240,73 @@ async fn open_gate(
            installation_id TEXT NOT NULL,
            archive_digest BYTEA NOT NULL CHECK(octet_length(archive_digest)=32),
            object_namespace BYTEA NOT NULL CHECK(octet_length(object_namespace)=32),
+           namespace_owner BYTEA NOT NULL CHECK(octet_length(namespace_owner)=16),
            histories TEXT NOT NULL,
            canonical_loaded BOOLEAN NOT NULL DEFAULT FALSE,
-           phase TEXT NOT NULL CHECK(phase IN ('loading','ready'))
+           phase TEXT NOT NULL CHECK(phase IN ('reserving','loading','ready'))
          );",
     )
     .execute(&mut *tx)
     .await
     .map_err(pg_error)?;
     sqlx::query(
-        "INSERT INTO notarium_restore.readiness(singleton,installation_id,archive_digest,object_namespace,histories,phase)
-         VALUES(1,$1,$2,$3,$4,'loading')",
+        "INSERT INTO notarium_restore.readiness(singleton,installation_id,archive_digest,object_namespace,histories,namespace_owner,phase)
+         VALUES(1,$1,$2,$3,$4,$5,'reserving')",
     ).bind(installation.as_str()).bind(digest.as_bytes().as_slice())
-        .bind(location.as_bytes().as_slice()).bind(serialized).execute(&mut *tx).await.map_err(pg_error)?;
+        .bind(location.as_bytes().as_slice()).bind(serialized).bind(&namespace_owner)
+        .execute(&mut *tx).await.map_err(pg_error)?;
     tx.commit().await.map_err(pg_error)?;
+    bind_prefix(conn, s3, prefix, &namespace_owner, true).await?;
     Ok(Gate {
         archive: digest,
+        namespace_owner,
         installation,
         histories,
         canonical_loaded: false,
         ready: false,
     })
+}
+
+async fn bind_prefix(
+    conn: &mut PgConnection,
+    config: &S3Config,
+    prefix: &str,
+    owner: &[u8],
+    reserving: bool,
+) -> Result<(), PortError> {
+    let transport = ReqwestS3Transport::new(config)?;
+    let request = S3RawRequest {
+        method: Method::GET,
+        key: Some(format!("{prefix}/.notarium-restore-owner")),
+        query: Vec::new(),
+        headers: Vec::new(),
+        body: Bytes::new(),
+    };
+    let mut object = transport.send_bounded(request.clone(), 8192).await?;
+    if object.status == 404 && reserving {
+        // Both databases may have observed an empty prefix. The conditional
+        // create is the point at which exactly one durable database nonce wins.
+        require_empty_prefix(config, prefix).await?;
+        let put = S3RawRequest {
+            method: Method::PUT,
+            headers: vec![("if-none-match".into(), "*".into())],
+            body: Bytes::copy_from_slice(owner),
+            ..request.clone()
+        };
+        let response = transport.send_bounded(put, 8192).await?;
+        if !matches!(response.status, 200 | 201 | 409 | 412) {
+            return Err(invalid(ValidationReason::InvalidState));
+        }
+        object = transport.send_bounded(request, 8192).await?;
+    }
+    if object.status != 200 || object.body.as_ref() != owner {
+        return Err(invalid(ValidationReason::InvalidAuthority));
+    }
+    if reserving {
+        sqlx::query("UPDATE notarium_restore.readiness SET phase='loading' WHERE singleton=1 AND phase='reserving' AND namespace_owner=$1")
+            .bind(owner).execute(conn).await.map_err(pg_error)?;
+    }
+    Ok(())
 }
 
 async fn require_empty_prefix(config: &S3Config, prefix: &str) -> Result<(), PortError> {
@@ -483,6 +540,7 @@ async fn restore_publication(
 ) -> Result<(), PortError> {
     let mut identity = blake3::Hasher::new();
     identity.update(b"notarium-restored-publication-v1\0");
+    identity.update(&gate.namespace_owner);
     identity.update(gate.archive.as_bytes());
     identity.update(record.space.as_str().as_bytes());
     identity.update(record.digest.as_bytes());

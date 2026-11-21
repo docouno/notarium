@@ -229,7 +229,7 @@ async fn upgrade_archive_state_v7(
 }
 
 macro_rules! upgrade {
-    ($name:ident, $connection:ty, $variant:ident, $ddl:ident, $pg_v2:expr $(, $catalog:ident)?) => {
+    ($name:ident, $connection:ty, $variant:ident, $ddl:ident, $pg_v2:expr, $legacy_claim_index:expr $(, $catalog:ident)?) => {
         pub(super) async fn $name(
             conn: &mut $connection,
             installation: &InstallationId,
@@ -244,7 +244,24 @@ macro_rules! upgrade {
             let Some((version, hash)) = previous else {
                 return Ok(());
             };
-            if !recognized_predecessor(version, &hash) {
+            let current = version == i64::from(CANONICAL_SCHEMA_VERSION)
+                && hash.as_slice() == checksum.as_bytes();
+            if !current && !recognized_predecessor(version, &hash) {
+                return Ok(());
+            }
+            // The index keeps the same logical name and row format. Upgrade
+            // the earlier Space-first ordering once when opening an existing DB.
+            if sqlx::query_scalar::<_, bool>($legacy_claim_index)
+                .fetch_one(&mut *conn).await
+                .map_err(|e| internal_not_committed("inspect_job_claim_index", e.to_string()))?
+            {
+                sqlx::query("DROP INDEX idx_content_jobs_claim").execute(&mut *conn).await
+                    .map_err(|e| internal_not_committed("drop_job_claim_index", e.to_string()))?;
+                let sql = baseline_statement($ddl, "CREATE INDEX IF NOT EXISTS idx_content_jobs_claim")?;
+                sqlx::query(sqlx::AssertSqlSafe(sql)).execute(&mut *conn).await
+                    .map_err(|e| internal_not_committed("create_job_claim_index", e.to_string()))?;
+            }
+            if current {
                 return Ok(());
             }
             if version == 1 {
@@ -344,6 +361,7 @@ upgrade!(
     Sqlite,
     SQLITE_BASELINE_DDL,
     None::<&'static str>,
+    "SELECT EXISTS(SELECT 1 FROM pragma_index_info('idx_content_jobs_claim') WHERE seqno=0 AND name='space_id')",
     upgrade_sqlite_catalog
 );
 upgrade!(
@@ -351,7 +369,8 @@ upgrade!(
     PgConnection,
     Postgres,
     POSTGRES_BASELINE_DDL,
-    Some(NORMALIZE_PG_V2)
+    Some(NORMALIZE_PG_V2),
+    "SELECT EXISTS(SELECT 1 FROM pg_index WHERE indexrelid=to_regclass('idx_content_jobs_claim') AND pg_get_indexdef(indexrelid,1,true)='space_id')"
 );
 
 #[cfg(test)]

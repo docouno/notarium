@@ -20,6 +20,8 @@ use super::{
 
 pub const GC_QUARANTINE: Duration = Duration::from_secs(24 * 3600 + 5 * 60);
 const PAGE: i64 = 128;
+/// Maximum number of sweep retirements admitted across all Spaces of a store.
+pub const MAX_GC_RETIREMENTS: usize = 4;
 
 #[derive(Clone, Debug)]
 pub struct GcCursor {
@@ -39,6 +41,7 @@ pub struct GcPage {
 struct Candidate {
     cursor: GcCursor,
     publication: Option<String>,
+    legacy: bool,
 }
 
 enum Decision {
@@ -116,26 +119,40 @@ impl CanonicalStore {
             };
             let owner = scope.clone();
             let worker = self.clone();
-            let worker_scope = scope.clone();
-            // The transaction owns the stripe even if COMMIT outlives the caller.
+            let slot = self.inner.gc_retirements.clone().try_acquire_owned().ok();
             let decision = self
                 .with_auxiliary_command(
                     Some((budget, deadline)),
-                    move |(result, stripe)| {
-                        drop(stripe);
-                        if let Decision::Retire(id) = &result {
-                            worker.schedule_retirements(&worker_scope, epoch, vec![id.clone()]);
-                        }
-                        Ok(result)
-                    },
+                    |(result, _guard, _handoff)| Ok(result),
                     move |tx| {
                         Box::pin(async move {
                             lock_and_check_space_tx(tx, &owner, epoch).await?;
                             let now = job_clock_ms(tx).await?;
-                            Ok((
-                                plan_candidate_tx(tx, &owner, epoch, candidate, now).await?,
-                                local_guard,
-                            ))
+                            let result = plan_candidate_tx(
+                                tx,
+                                &owner,
+                                epoch,
+                                candidate,
+                                now,
+                                slot.is_some(),
+                            )
+                            .await?;
+                            // The SQL result owns both the local stripe and the durable ID
+                            // through COMMIT. A lost acknowledgement drops the same handoff.
+                            let handoff = match (&result, slot) {
+                                (Decision::Retire(id), Some(slot)) => {
+                                    let mut handoff = worker.retirement_handoff(
+                                        &owner,
+                                        epoch,
+                                        vec![id.clone()],
+                                        None,
+                                    );
+                                    handoff.sweep_slot = Some(slot);
+                                    Some(handoff)
+                                }
+                                _ => None,
+                            };
+                            Ok((result, local_guard, handoff))
                         })
                     },
                 )
@@ -160,18 +177,31 @@ pub(crate) async fn reconcile_unowned_tx(
     tx: &mut BackendConn<'_>,
     scope: &HistoryScope,
     epoch: LeaseEpoch,
-) -> Result<bool, PortError> {
+    local: Option<&super::local::LocalBlobStore>,
+) -> Result<(bool, Vec<super::local::LocalExclusiveGuard>), PortError> {
     let mut planned = false;
+    let mut guards = Vec::new();
     let now = job_clock_ms(tx).await?;
-    // Leave subsequent pages to the regular sweep. A recovered Space may
-    // contain arbitrarily many zero-reference rows.
+    // Restore only the immediate-cleanup obligation from pre-quarantine
+    // catalogs. Ordinary orphans stay eligible for bounded sweep admission.
     for candidate in candidates(tx, &scope.space_id, None).await? {
+        if !candidate.legacy {
+            continue;
+        }
+        if let Some(local) = local {
+            let Some(guard) =
+                local.try_fence_staging_epoch(&scope.space_id, candidate.cursor.digest, epoch)
+            else {
+                continue;
+            };
+            guards.push(guard);
+        }
         planned |= matches!(
-            plan_candidate_tx(tx, scope, epoch, candidate, now).await?,
+            plan_candidate_tx(tx, scope, epoch, candidate, now, true).await?,
             Decision::Retire(_)
         );
     }
-    Ok(planned)
+    Ok((planned, guards))
 }
 
 async fn candidates(
@@ -182,7 +212,7 @@ async fn candidates(
     macro_rules! sql {
         ($index:literal) => {
             concat!(
-                "SELECT touched_at_ms, content_blake3, current_publication_id FROM blob_catalog ",
+                "SELECT touched_at_ms, content_blake3, current_publication_id, legacy_cleanup<>0 FROM blob_catalog ",
                 $index,
                 " WHERE space_id=$1 AND (touched_at_ms,content_blake3)>($2,$3)
                   AND ref_count=0 AND admission_state='open' AND blob_state='active'
@@ -192,7 +222,7 @@ async fn candidates(
     }
     let touched = after.map_or(i64::MIN, |cursor| cursor.touched);
     let digest = after.map_or(&[][..], |cursor| cursor.digest.as_bytes().as_slice());
-    let rows: Vec<(i64, Vec<u8>, Option<String>)> = match tx {
+    let rows: Vec<(i64, Vec<u8>, Option<String>, bool)> = match tx {
         BackendConn::Sqlite(conn) => {
             sqlx::query_as(sql!("INDEXED BY idx_blob_catalog_gc"))
                 .bind(space.as_str())
@@ -214,17 +244,28 @@ async fn candidates(
     }
     .map_err(gc_sql)?;
     rows.into_iter()
-        .map(|(touched, digest, publication)| {
+        .map(|(touched, digest, publication, legacy)| {
             let digest = ContentDigest::from_bytes(digest.try_into().map_err(|_| {
                 internal_not_committed("gc_catalog_digest", "invalid content digest")
             })?);
             Ok(Candidate {
                 cursor: GcCursor { touched, digest },
                 publication,
+                legacy,
             })
         })
         .collect()
 }
+
+const CHECK: &str =
+    "SELECT current_publication_id, quarantined_at_ms, CAST(legacy_cleanup AS BIGINT)
+        FROM blob_catalog c WHERE space_id=$1 AND content_blake3=$2
+          AND ref_count=0 AND admission_state='open' AND blob_state='active'
+          AND NOT EXISTS(SELECT 1 FROM blob_publications p
+              WHERE p.space_id=c.space_id AND p.content_blake3=c.content_blake3
+                AND p.state <> 'active' AND p.state IN ('staging','retiring'))
+          AND NOT EXISTS(SELECT 1 FROM pending_purges x
+              WHERE x.space_id=c.space_id AND x.phase IN ('sql_erased','cas_retired'))";
 
 async fn plan_candidate_tx(
     tx: &mut BackendConn<'_>,
@@ -232,18 +273,10 @@ async fn plan_candidate_tx(
     epoch: LeaseEpoch,
     candidate: Candidate,
     now: i64,
+    can_retire: bool,
 ) -> Result<Decision, PortError> {
     let space = &scope.space_id;
     let digest = candidate.cursor.digest;
-    const CHECK: &str =
-        "SELECT current_publication_id, quarantined_at_ms, CAST(legacy_cleanup AS BIGINT)
-        FROM blob_catalog c WHERE space_id=$1 AND content_blake3=$2
-          AND ref_count=0 AND admission_state='open' AND blob_state='active'
-          AND NOT EXISTS(SELECT 1 FROM blob_publications p
-              WHERE p.space_id=c.space_id AND p.content_blake3=c.content_blake3
-                AND p.state IN ('staging','retiring'))
-          AND NOT EXISTS(SELECT 1 FROM pending_purges x
-              WHERE x.space_id=c.space_id AND x.phase<>'completed')";
     let row: Option<(Option<String>, Option<i64>, i64)> = match tx {
         BackendConn::Sqlite(conn) => {
             sqlx::query_as(CHECK)
@@ -297,6 +330,11 @@ async fn plan_candidate_tx(
             return Ok(Decision::Skip);
         }
     }
+    // A full physical queue leaves this mature publication durably eligible.
+    // No task or closed digest waits for an unbounded number of earlier deletes.
+    if !can_retire {
+        return Ok(Decision::Skip);
+    }
     match ensure_no_backup_holds_tx(tx, space, RetirementReason::Gc).await {
         Ok(()) => {}
         Err(err) if err == super::held_retirement() => return Ok(Decision::Skip),
@@ -311,4 +349,41 @@ async fn plan_candidate_tx(
 
 fn gc_sql(err: sqlx::Error) -> PortError {
     internal_not_committed("cas_gc_catalog", err.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use rusqlite::{Connection, StatementStatus, params};
+
+    #[test]
+    fn candidate_recheck_seeks_past_active_publications_and_completed_purges() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(crate::schema::SQLITE_BASELINE_DDL)
+            .unwrap();
+        db.execute_batch(
+            "PRAGMA foreign_keys=OFF;
+             INSERT INTO blob_catalog(space_id,content_blake3,raw_size,compressed_size,ref_count,
+                 current_publication_id,admission_state,blob_state,touched_at_ms)
+                 VALUES ('s',zeroblob(32),1,1,0,'p','open','active',0);
+             WITH RECURSIVE seq(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM seq WHERE n<10000)
+             INSERT INTO blob_publications SELECT 's',printf('p%d',n),randomblob(32),1,'local_zstd_v1',
+                 'active',1,1,1,1,0,0 FROM seq;
+             WITH RECURSIVE seq(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM seq WHERE n<10000)
+             INSERT INTO pending_purges SELECT 's',printf('purge%d',n),zeroblob(16),'owner','key',
+                 zeroblob(32),'old',NULL,NULL,1,'completed','[]',X'',NULL,0,0 FROM seq;",
+        ).unwrap();
+        for analyze in [false, true] {
+            if analyze {
+                db.execute_batch("ANALYZE").unwrap();
+            }
+            let mut stmt = db.prepare(super::CHECK).unwrap();
+            assert_eq!(
+                stmt.query_row(params!["s", [0u8; 32].as_slice()], |r| r
+                    .get::<_, String>(0))
+                    .unwrap(),
+                "p"
+            );
+            assert!(stmt.get_status(StatementStatus::VmStep) < 200);
+        }
+    }
 }

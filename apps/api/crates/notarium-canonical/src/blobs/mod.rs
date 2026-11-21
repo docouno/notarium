@@ -355,13 +355,17 @@ pub(crate) struct RetirementHandoff {
     epoch: LeaseEpoch,
     ids: Vec<String>,
     first_attempt: Option<retirement_worker::HandoffSender>,
+    sweep_slot: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl Drop for RetirementHandoff {
     fn drop(&mut self) {
-        let attempts =
-            self.store
-                .schedule_retirements(&self.scope, self.epoch, std::mem::take(&mut self.ids));
+        let attempts = self.store.schedule_retirements_with_slot(
+            &self.scope,
+            self.epoch,
+            std::mem::take(&mut self.ids),
+            self.sweep_slot.take(),
+        );
         if let Some(sender) = self.first_attempt.take() {
             let _ = sender.send(attempts);
         }
@@ -964,7 +968,7 @@ impl crate::CanonicalStore {
             BlobBackendDriver::Local(local) => {
                 let digests: Vec<ContentDigest> = prepared_items.iter().map(|p| p.digest).collect();
                 let guards = local
-                    .acquire_shared_guards_sorted(&scope.space_id, &digests)
+                    .acquire_sorted_guards(&scope.space_id, &digests, Some(active_epoch))
                     .await;
                 let mut tickets = Vec::with_capacity(prepared_items.len());
                 for item in prepared_items {
@@ -1007,7 +1011,7 @@ impl crate::CanonicalStore {
         match &self.inner.blobs {
             BlobBackendDriver::Local(local) => {
                 let guard = local
-                    .acquire_shared_guard(&scope.space_id, prepared.digest)
+                    .acquire_staging_guard(&scope.space_id, prepared.digest, active_epoch)
                     .await;
                 self.stage_local_blob_with_guard(local, scope, active_epoch, prepared, guard)
                     .await
@@ -1038,7 +1042,7 @@ impl crate::CanonicalStore {
         match &self.inner.blobs {
             BlobBackendDriver::Local(local) => {
                 let guard = local
-                    .acquire_shared_guard(&scope.space_id, prepared.digest)
+                    .acquire_staging_guard(&scope.space_id, prepared.digest, active_epoch)
                     .await;
                 let scope_cl = scope.clone();
                 let digest = prepared.digest;
@@ -1154,7 +1158,7 @@ impl crate::CanonicalStore {
         match &self.inner.blobs {
             BlobBackendDriver::Local(local) => {
                 let guard = local
-                    .acquire_shared_guard(&scope.space_id, prepared.digest)
+                    .acquire_staging_guard(&scope.space_id, prepared.digest, active_epoch)
                     .await;
                 let digest = prepared.digest;
                 let raw_size = prepared.raw_size;
@@ -1347,6 +1351,7 @@ impl crate::CanonicalStore {
             epoch,
             ids,
             first_attempt,
+            sweep_slot: None,
         }
     }
 

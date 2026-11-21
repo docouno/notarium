@@ -23,7 +23,8 @@ use notarium_core::{
     model::{HistoryScope, Lifecycle, SnapshotCut},
     ports::{
         CallBudget, CancelJob, CommandSeqRange, Committed, ContentJob, ContentJobKind,
-        ContentJobPort, JobQuery, JobState, Mutation, PageLimit, PortFuture, SpaceContext,
+        ContentJobPort, ImportDiagnostic, JobQuery, JobState, Mutation, PageLimit, PortFuture,
+        SpaceContext,
     },
     query::{CursorPage, EffectiveRead, KeysetCursor, ReadRequest, SortCell, SortTuple},
     receipt::{CausalBasis, MutationReceiptToken, ReceiptSet},
@@ -260,6 +261,7 @@ impl From<StoredContentJobV1> for ContentJob {
             total_units: w.total_units,
             lease: w.lease,
             artifacts: w.artifacts,
+            import_diagnostic: None,
         }
     }
 }
@@ -320,6 +322,7 @@ impl ArchiveJobClass {
 #[derive(Clone, Debug)]
 pub enum JobCompletionOutcome {
     Exported(archive_export::ExportPublication),
+    ImportRejected(ImportDiagnostic),
     Succeeded {
         completed_units: u64,
         total_units: Option<u64>,
@@ -491,14 +494,15 @@ impl ContentJobPort for CanonicalStore {
 }
 
 impl CanonicalStore {
-    /// Active Spaces in stable keyset order. Scheduler scans retain no snapshot.
+    /// Active Spaces with queued work or a reclaimable lease for this class.
     pub async fn archive_job_scopes(
         &self,
         budget: &CallBudget,
+        class: ArchiveJobClass,
         after: Option<&SpaceId>,
         limit: PageLimit,
     ) -> Result<Vec<HistoryScope>, PortError> {
-        self.archive_scopes(budget, after, limit, true).await
+        self.archive_scopes(budget, after, limit, Some(class)).await
     }
 
     /// Archived and closing Spaces can still own outstanding physical
@@ -509,7 +513,7 @@ impl CanonicalStore {
         after: Option<&SpaceId>,
         limit: PageLimit,
     ) -> Result<Vec<HistoryScope>, PortError> {
-        self.archive_scopes(budget, after, limit, false).await
+        self.archive_scopes(budget, after, limit, None).await
     }
 
     async fn archive_scopes(
@@ -517,36 +521,47 @@ impl CanonicalStore {
         budget: &CallBudget,
         after: Option<&SpaceId>,
         limit: PageLimit,
-        active_only: bool,
+        class: Option<ArchiveJobClass>,
     ) -> Result<Vec<HistoryScope>, PortError> {
         let after = after.map_or("", SpaceId::as_str).to_owned();
         self.with_read_tx_budget(Some(budget), |tx| {
             Box::pin(async move {
-                let sql = if active_only {
-                    "SELECT space_id, history_incarnation FROM spaces
-                     WHERE lifecycle_state='active' AND space_id>$1 ORDER BY space_id LIMIT $2"
+                let sql = if class.is_some() {
+                    "WITH queued AS (
+                         SELECT DISTINCT j.space_id FROM content_jobs j JOIN spaces s ON s.space_id=j.space_id
+                         WHERE j.state='queued' AND j.space_id>$1 AND j.job_kind=$3 AND s.lifecycle_state='active'
+                         ORDER BY j.space_id LIMIT $2
+                     ), reclaimable AS (
+                         SELECT DISTINCT j.space_id FROM content_jobs j JOIN spaces s ON s.space_id=j.space_id
+                         WHERE j.state='running' AND j.space_id>$1 AND j.job_kind=$3 AND s.lifecycle_state='active'
+                           AND (j.lease_until_ms<=$4 OR j.claim_space_epoch IS DISTINCT FROM s.active_epoch)
+                         ORDER BY j.space_id LIMIT $2
+                     ), candidates AS (
+                         SELECT space_id FROM queued UNION SELECT space_id FROM reclaimable
+                     )
+                     SELECT c.space_id, s.history_incarnation FROM candidates c JOIN spaces s ON s.space_id=c.space_id
+                     ORDER BY c.space_id LIMIT $2"
                 } else {
                     "SELECT space_id, history_incarnation FROM spaces
                      WHERE space_id>$1 ORDER BY space_id LIMIT $2"
                 };
-                let rows: Vec<(String, Vec<u8>)> = match tx {
-                    BackendConn::Sqlite(conn) => sqlx::query_as(sql)
-                        .bind(after)
-                        .bind(i64::from(limit.get()))
-                        .fetch_all(&mut **conn)
-                        .await
-                        .map_err(|err| {
-                            internal_not_committed("sqlite_archive_job_scopes", err.to_string())
-                        })?,
-                    BackendConn::Postgres(conn) => sqlx::query_as(sql)
-                        .bind(after)
-                        .bind(i64::from(limit.get()))
-                        .fetch_all(&mut **conn)
-                        .await
-                        .map_err(|err| {
-                            crate::runtime::pg_read_error("pg_archive_job_scopes", err)
-                        })?,
+                let filter = match class {
+                    Some(class) => Some((class.as_db(), job_clock_ms(tx).await?)),
+                    None => None,
                 };
+                macro_rules! select_scopes {
+                    ($conn:expr) => {{
+                        let mut query = sqlx::query_as(sql).bind(&after).bind(i64::from(limit.get()));
+                        if let Some((kind, now)) = filter {
+                            query = query.bind(kind).bind(now);
+                        }
+                        query.fetch_all(&mut **$conn).await
+                    }};
+                }
+                let rows: Vec<(String, Vec<u8>)> = match tx {
+                    BackendConn::Sqlite(conn) => select_scopes!(conn),
+                    BackendConn::Postgres(conn) => select_scopes!(conn),
+                }.map_err(|err| crate::runtime::pg_read_error("archive_scopes", err))?;
                 rows.into_iter()
                     .map(|(space, history)| {
                         let history = history.try_into().map_err(|_| {
@@ -1095,6 +1110,7 @@ fn decode_content_job_row(
         total_units,
         lease,
         artifacts,
+        import_diagnostic: None,
     })
 }
 
@@ -1228,6 +1244,16 @@ async fn authorize_export_notes_tx(
     auth: &EngineAuthContext,
     notes: &[NoteId],
 ) -> Result<(), PortError> {
+    visit_authorized_export_notes_tx(tx, space, auth, notes, |_, _| Ok(())).await
+}
+
+async fn visit_authorized_export_notes_tx(
+    tx: &mut BackendConn<'_>,
+    space: &Space,
+    auth: &EngineAuthContext,
+    notes: &[NoteId],
+    mut visit: impl FnMut(&crate::domain::common::NoteHeadRow, &str) -> Result<(), PortError> + Send,
+) -> Result<(), PortError> {
     if crate::runtime::are_any_notes_purge_fenced_tx(tx, &space.id, notes).await? {
         return Err(DomainError::ResourceNotFound.into());
     }
@@ -1240,17 +1266,18 @@ async fn authorize_export_notes_tx(
         if head.lifecycle != Lifecycle::Active {
             return Err(DomainError::ResourceNotFound.into());
         }
-        let (facts, _) = folders
+        let (facts, ancestry) = folders
             .build_resource_facts_tx(
                 tx,
                 space,
                 &head.parent_folder_id,
                 head.doc_class,
-                head.ability_id,
+                head.ability_id.clone(),
                 true,
             )
             .await?;
         auth.authorize_read(&facts)?;
+        visit(&head, &ancestry.folder_path)?;
     }
     Ok(())
 }
@@ -1482,6 +1509,7 @@ async fn create_job_impl(
                     completed_units: 0,
                     total_units,
                     lease: LeaseEpoch::ZERO,
+                    import_diagnostic: None,
                     artifacts: Vec::new(),
                 };
                 let receipt = MutationReceiptToken::new(scope.clone(), seq)?;
@@ -1502,6 +1530,7 @@ async fn create_job_impl(
                         completed_units: 0,
                         total_units,
                         lease: LeaseEpoch::ZERO,
+                        import_diagnostic: None,
                         artifacts: Vec::new(),
                     };
                     let san_resp = StoredCommittedJobV1 {
@@ -1584,10 +1613,76 @@ async fn get_job_impl(
             Box::pin(async move {
                 let srec = load_space_record(tx, &scope.space_id).await?;
                 srec.scope.check(&scope)?;
-                read_visible_job_tx(tx, &srec.space, &auth, &job).await
+                let mut found = read_visible_job_tx(tx, &srec.space, &auth, &job).await?;
+                if found.state == JobState::Failed
+                    && matches!(found.kind, ContentJobKind::Import { .. })
+                {
+                    found.import_diagnostic = import_diagnostic_tx(tx, &scope, &job, &auth).await?;
+                }
+                Ok(found)
             })
         })
         .await
+}
+
+// The entry path belongs to the uploader. Keep it out of shared listings,
+// change notifications and command receipts, even for readers of this Space.
+async fn import_diagnostic_tx(
+    tx: &mut BackendConn<'_>,
+    scope: &HistoryScope,
+    job: &JobId,
+    auth: &EngineAuthContext,
+) -> Result<Option<ImportDiagnostic>, PortError> {
+    let Some(caller) = JobDelegation::capture(auth, scope) else {
+        return Ok(None);
+    };
+    let sql = "SELECT payload_msgpack, result_msgpack FROM content_jobs
+               WHERE space_id=$1 AND job_id=$2 AND payload_erased_by_purge=0
+                 AND state='failed' AND job_kind='import' AND result_msgpack IS NOT NULL";
+    let row: Option<(Vec<u8>, Vec<u8>)> = match tx {
+        BackendConn::Sqlite(conn) => {
+            sqlx::query_as(sql)
+                .bind(scope.space_id.as_str())
+                .bind(job.as_str())
+                .fetch_optional(&mut **conn)
+                .await
+        }
+        BackendConn::Postgres(conn) => {
+            sqlx::query_as(sql)
+                .bind(scope.space_id.as_str())
+                .bind(job.as_str())
+                .fetch_optional(&mut **conn)
+                .await
+        }
+    }
+    .map_err(|err| internal_not_committed("read_import_diagnostic", err.to_string()))?;
+    let Some((payload, result)) = row else {
+        return Ok(None);
+    };
+    let (_, delegation) = decode_job_payload(&payload)?;
+    if delegation.is_some_and(|d| {
+        d.scope() == scope
+            && d.principal() == caller.principal()
+            && d.grant() == caller.grant()
+            && d.credential_reference() == caller.credential_reference()
+    }) {
+        let diagnostic: ImportDiagnostic =
+            decode_msgpack_bounded(&result, MAX_MSGPACK_DECODE_BYTES)?;
+        validate_import_diagnostic(&diagnostic)?;
+        Ok(Some(diagnostic))
+    } else {
+        Ok(None)
+    }
+}
+
+fn validate_import_diagnostic(diagnostic: &ImportDiagnostic) -> Result<(), PortError> {
+    if let Some(path) = &diagnostic.path
+        && notarium_syntax::unicode::portable_archive_path(path, ImportDiagnostic::MAX_PATH_DEPTH)?
+            != *path
+    {
+        return Err(DomainError::validation(ValidationReason::InvalidPathComponent).into());
+    }
+    Ok(())
 }
 
 fn canonicalize_job_states(states: &[JobState]) -> Vec<JobState> {
@@ -2735,6 +2830,32 @@ async fn complete_job_impl(
                                 eff_art,
                                 eff_res,
                                 None::<ContentDigest>,
+                            )
+                        }
+                        JobCompletionOutcome::ImportRejected(diagnostic) => {
+                            if !archive_commit
+                                || erased
+                                || !matches!(cur_job.kind, ContentJobKind::Import { .. })
+                                || cur_job.completed_units != 0
+                                || cur_job.total_units.is_some()
+                            {
+                                return Err(DomainError::validation(
+                                    ValidationReason::InvalidState,
+                                )
+                                .into());
+                            }
+                            validate_import_diagnostic(&diagnostic)?;
+                            let error_ref = crate::codec::diagnostic_digest(
+                                "archive_preflight",
+                                &format!("{:?}", diagnostic.reason),
+                            );
+                            (
+                                JobState::Failed,
+                                0,
+                                None,
+                                Vec::new(),
+                                Some(encode_msgpack(&diagnostic)?),
+                                Some(error_ref),
                             )
                         }
                         JobCompletionOutcome::Failed {

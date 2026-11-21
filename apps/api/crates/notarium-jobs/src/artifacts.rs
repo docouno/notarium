@@ -1,4 +1,4 @@
-use std::{fs, io::ErrorKind, path::PathBuf, sync::Arc, time::Duration};
+use std::{collections::VecDeque, fs, io::ErrorKind, path::PathBuf, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
@@ -39,6 +39,7 @@ const MAX_OBJECT_BYTES: u64 = (MAX_SEGMENTS * SEGMENT_BYTES) as u64;
 const RETIRED_SEGMENT: &[u8] = b"notarium-archive-segment-retired-v1\n";
 const SCRATCH_GRACE: Duration = Duration::from_secs(3600);
 const SCRATCH_LOCK: &str = ".owner";
+const SCRATCH_MARKER: &[u8] = b"notarium-archive-scratch-v1\n";
 static LOCAL_DOWNLOAD_OPENS: Semaphore = Semaphore::const_new(16);
 
 /// Private operational artifacts bound to an installation. Cloud staging and
@@ -56,6 +57,13 @@ struct LocalArchiveStorage {
     work: Dir,
     work_path: PathBuf,
     objects: Dir,
+    legacy_exports: tokio::sync::Mutex<VecDeque<LegacySegmentIndex>>,
+}
+
+struct LegacySegmentIndex {
+    digest: ContentDigest,
+    bytes: u64,
+    segments: Arc<[ArchiveSegment]>,
 }
 
 pub(crate) struct ScratchDirectory {
@@ -66,6 +74,7 @@ pub(crate) struct ScratchDirectory {
 
 pub(crate) struct DownloadSource {
     local: Option<tokio::fs::File>,
+    legacy_segments: Option<Arc<[ArchiveSegment]>>,
     segment: Option<(usize, Bytes)>,
 }
 
@@ -75,6 +84,89 @@ pub(crate) struct UploadLayout {
 }
 
 impl ScratchDirectory {
+    pub(crate) fn create_in(work: &Dir, path: &std::path::Path) -> Result<Self, PortError> {
+        let name = codec::new_prefixed_hex_id("attempt_")?;
+        work.create_dir_with(&name, &archive_dir_builder())
+            .map_err(storage_io)?;
+        let dir = work.open_dir_nofollow(&name).map_err(storage_io)?;
+        let lock = scratch_lock(&dir, true).map_err(storage_io)?;
+        lock.try_lock()
+            .map_err(|_| invalid(ValidationReason::InvalidState))?;
+        // A newly created lock is empty until the owner holds it. Recovery
+        // may take a marked, unlocked file immediately after process exit.
+        std::io::Write::write_all(&mut &lock, SCRATCH_MARKER).map_err(storage_io)?;
+        Ok(Self {
+            dir,
+            path: path.join(name),
+            _lock: lock,
+        })
+    }
+
+    pub(crate) fn reap(
+        work: &Dir,
+        cancellation: &Cancellation,
+        grace: Duration,
+    ) -> Result<(), PortError> {
+        let mut removed = 0;
+        for entry in work.entries().map_err(storage_io)? {
+            check_cancelled(cancellation)?;
+            let entry = entry.map_err(storage_io)?;
+            let name = entry.file_name();
+            if !name
+                .to_str()
+                .and_then(|name| name.strip_prefix("attempt_"))
+                .is_some_and(|suffix| {
+                    suffix.len() == 32 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+            {
+                continue;
+            }
+            let Ok(dir) = work.open_dir_nofollow(&name) else {
+                continue;
+            };
+            let age = dir
+                .dir_metadata()
+                .and_then(|meta| meta.modified())
+                .ok()
+                .and_then(|time| time.into_std().elapsed().ok());
+            if !grace.is_zero() && !age.is_some_and(|age| age >= grace) {
+                continue;
+            }
+            // Only an abandoned owner can be claimed. An absent lock can
+            // arise before the creator has admitted the first payload file.
+            match scratch_lock(&dir, false) {
+                Ok(lock) => {
+                    let metadata = lock.metadata().map_err(storage_io)?;
+                    let mut marker = [0; SCRATCH_MARKER.len()];
+                    let marked = metadata.is_file()
+                        && metadata.len() == marker.len() as u64
+                        && std::io::Read::read_exact(&mut &lock, &mut marker).is_ok()
+                        && marker == SCRATCH_MARKER;
+                    // Earlier content jobs used an empty owner file with an age grace.
+                    let legacy = !grace.is_zero() && metadata.is_file() && metadata.len() == 0;
+                    if (marked || legacy) && lock.try_lock().is_ok() {
+                        match dir.remove_open_dir_all() {
+                            Ok(()) => removed += 1,
+                            Err(err) if err.kind() == ErrorKind::NotFound => {}
+                            Err(err) => return Err(storage_io(err)),
+                        }
+                    }
+                }
+                Err(err)
+                    if err.kind() == ErrorKind::NotFound
+                        && age.is_some_and(|age| age >= SCRATCH_GRACE) =>
+                {
+                    let _ = work.remove_dir(&name);
+                }
+                _ => {}
+            }
+            if removed >= 16 {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn file(&self, name: &'static str) -> PathBuf {
         self.path.join(name)
     }
@@ -147,70 +239,11 @@ impl ArchiveStorage {
     }
 
     pub(crate) fn scratch(&self) -> Result<ScratchDirectory, PortError> {
-        let name = codec::new_prefixed_hex_id("attempt_")?;
-        self.local
-            .work
-            .create_dir_with(&name, &archive_dir_builder())
-            .map_err(storage_io)?;
-        let dir = self
-            .local
-            .work
-            .open_dir_nofollow(&name)
-            .map_err(storage_io)?;
-        let lock = scratch_lock(&dir, true).map_err(storage_io)?;
-        lock.try_lock()
-            .map_err(|_| invalid(ValidationReason::InvalidState))?;
-        Ok(ScratchDirectory {
-            dir,
-            path: self.local.work_path.join(name),
-            _lock: lock,
-        })
+        ScratchDirectory::create_in(&self.local.work, &self.local.work_path)
     }
 
     pub(crate) fn reap_scratch(&self, cancellation: &Cancellation) -> Result<(), PortError> {
-        let mut removed = 0;
-        for entry in self.local.work.entries().map_err(storage_io)? {
-            check_cancelled(cancellation)?;
-            let entry = entry.map_err(storage_io)?;
-            let name = entry.file_name();
-            if !name
-                .to_str()
-                .and_then(|name| name.strip_prefix("attempt_"))
-                .is_some_and(|suffix| {
-                    suffix.len() == 32 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
-                })
-            {
-                continue;
-            }
-            let Ok(dir) = self.local.work.open_dir_nofollow(&name) else {
-                continue;
-            };
-            let age = dir
-                .dir_metadata()
-                .and_then(|meta| meta.modified())
-                .ok()
-                .and_then(|time| time.into_std().elapsed().ok());
-            if !age.is_some_and(|age| age >= SCRATCH_GRACE) {
-                continue;
-            }
-            // Only an abandoned owner can be claimed. An absent lock can
-            // arise before the creator has admitted the first payload file.
-            match scratch_lock(&dir, false) {
-                Ok(lock) if lock.try_lock().is_ok() => match dir.remove_open_dir_all() {
-                    Ok(()) => removed += 1,
-                    Err(err) if err.kind() == ErrorKind::NotFound => {}
-                    Err(err) => return Err(storage_io(err)),
-                },
-                Err(err) if err.kind() == ErrorKind::NotFound => {
-                    let _ = self.local.work.remove_dir(&name);
-                }
-                _ => {}
-            }
-            if removed >= 16 {
-                break;
-            }
-        }
-        Ok(())
+        ScratchDirectory::reap(&self.local.work, cancellation, SCRATCH_GRACE)
     }
 
     pub(crate) async fn stage_source<F: std::future::Future<Output = Result<(), PortError>>>(
@@ -298,11 +331,21 @@ impl ArchiveStorage {
                 .map_err(storage_io)?;
             let data = &buffer[..len];
             hasher.update(data);
-            if let Some(remote) = &self.remote {
-                let key = segment_key(&base, object.segments.len());
-                let data = Bytes::copy_from_slice(data);
-                let digest = digest(&data);
-                let version = put_segment(remote, &key, data, digest, cancellation).await?;
+            if self.remote.is_some() || object.kind == ArchiveObjectKind::Export {
+                let digest = digest(data);
+                let version = if let Some(remote) = &self.remote {
+                    let key = segment_key(&base, object.segments.len());
+                    put_segment(
+                        remote,
+                        &key,
+                        Bytes::copy_from_slice(data),
+                        digest,
+                        cancellation,
+                    )
+                    .await?
+                } else {
+                    None
+                };
                 object.segments.push(ArchiveSegment {
                     digest,
                     bytes: len as u32,
@@ -398,6 +441,7 @@ impl ArchiveStorage {
         if self.remote.is_some() {
             return Ok(DownloadSource {
                 local: None,
+                legacy_segments: None,
                 segment: None,
             });
         }
@@ -418,23 +462,69 @@ impl ArchiveStorage {
         if file.metadata().await.map_err(storage_io)?.len() != object.bytes {
             return Err(invalid(ValidationReason::InvalidDigest));
         }
-        let mut digest = blake3::Hasher::new();
-        let mut buffer = vec![0; 128 * 1024];
-        loop {
-            check_cancelled(cancellation)?;
-            let count = file.read(&mut buffer).await.map_err(storage_io)?;
-            if count == 0 {
-                break;
-            }
-            digest.update(&buffer[..count]);
-        }
-        if digest.finalize().as_bytes() != object.digest.as_bytes() {
-            return Err(invalid(ValidationReason::InvalidDigest));
-        }
+        // Earlier Local exports only recorded a whole-object digest.
+        let legacy_segments = if object.segments.is_empty() {
+            Some(
+                self.legacy_segments(object, &mut file, cancellation)
+                    .await?,
+            )
+        } else {
+            None
+        };
         Ok(DownloadSource {
             local: Some(file),
+            legacy_segments,
             segment: None,
         })
+    }
+
+    async fn legacy_segments(
+        &self,
+        object: &ArchiveObject,
+        file: &mut tokio::fs::File,
+        cancellation: &Cancellation,
+    ) -> Result<Arc<[ArchiveSegment]>, PortError> {
+        // Serialize reconstruction so concurrent opens can use the same index.
+        let mut cache = self.local.legacy_exports.lock().await;
+        if let Some(index) = cache
+            .iter()
+            .position(|entry| entry.digest == object.digest && entry.bytes == object.bytes)
+        {
+            let entry = cache.remove(index).expect("index from this cache");
+            let segments = entry.segments.clone();
+            cache.push_back(entry);
+            return Ok(segments);
+        }
+        let mut full = blake3::Hasher::new();
+        let mut buffer = vec![0; SEGMENT_BYTES];
+        let mut remaining = object.bytes;
+        let mut segments = Vec::new();
+        while remaining > 0 {
+            check_cancelled(cancellation)?;
+            let bytes = remaining.min(SEGMENT_BYTES as u64) as usize;
+            let data = &mut buffer[..bytes];
+            file.read_exact(data).await.map_err(storage_io)?;
+            full.update(data);
+            segments.push(ArchiveSegment {
+                digest: digest(data),
+                bytes: bytes as u32,
+                version: None,
+            });
+            remaining -= bytes as u64;
+        }
+        if full.finalize().as_bytes() != object.digest.as_bytes() {
+            return Err(invalid(ValidationReason::InvalidDigest));
+        }
+        let segments: Arc<[ArchiveSegment]> = segments.into();
+        if cache.len() == 8 {
+            cache.pop_front();
+        }
+        cache.push_back(LegacySegmentIndex {
+            digest: object.digest,
+            bytes: object.bytes,
+            segments: segments.clone(),
+        });
+        Ok(segments)
     }
 
     pub(crate) async fn download_chunk(
@@ -453,43 +543,39 @@ impl ArchiveStorage {
         if len == 0 {
             return Ok(Bytes::new());
         }
-        if let Some(remote) = &self.remote {
-            let index = (offset / SEGMENT_BYTES as u64) as usize;
-            let start = (offset % SEGMENT_BYTES as u64) as usize;
-            if source
-                .segment
-                .as_ref()
-                .is_none_or(|(cached, _)| *cached != index)
-            {
-                source.segment = None;
-                let data = verified_segment(
-                    remote,
-                    &base_key(object),
-                    index,
-                    &object.segments[index],
-                    cancellation,
+        let index = (offset / SEGMENT_BYTES as u64) as usize;
+        let start = (offset % SEGMENT_BYTES as u64) as usize;
+        if source
+            .segment
+            .as_ref()
+            .is_none_or(|(cached, _)| *cached != index)
+        {
+            source.segment = None;
+            let segment = &source
+                .legacy_segments
+                .as_deref()
+                .unwrap_or(&object.segments)[index];
+            let data = if let Some(remote) = &self.remote {
+                verified_segment(remote, &base_key(object), index, segment, cancellation).await?
+            } else {
+                let data = read_local_range(
+                    source.local.as_mut(),
+                    object.bytes,
+                    index as u64 * SEGMENT_BYTES as u64,
+                    segment.bytes as usize,
                 )
                 .await?;
-                source.segment = Some((index, data));
-            }
-            let (_, data) = source.segment.as_ref().expect("validated segment");
-            return Ok(Bytes::copy_from_slice(
-                &data[start..start + len.min(data.len() - start)],
-            ));
+                if digest(&data) != segment.digest {
+                    return Err(invalid(ValidationReason::InvalidDigest));
+                }
+                data
+            };
+            source.segment = Some((index, data));
         }
-        let file = source
-            .local
-            .as_mut()
-            .ok_or_else(|| invalid(ValidationReason::InvalidAuthority))?;
-        if file.metadata().await.map_err(storage_io)?.len() != object.bytes {
-            return Err(invalid(ValidationReason::InvalidDigest));
-        }
-        file.seek(std::io::SeekFrom::Start(offset))
-            .await
-            .map_err(storage_io)?;
-        let mut bytes = vec![0; len];
-        file.read_exact(&mut bytes).await.map_err(storage_io)?;
-        Ok(Bytes::from(bytes))
+        let (_, data) = source.segment.as_ref().expect("validated segment");
+        Ok(Bytes::copy_from_slice(
+            &data[start..start + len.min(data.len() - start)],
+        ))
     }
 
     pub(crate) async fn retire_export(
@@ -595,11 +681,16 @@ impl ArchiveStorage {
         {
             return Err(invalid(ValidationReason::InvalidAuthority));
         }
-        if let Some(remote) = &self.remote {
-            if object.segments.len() as u64 != object.bytes.div_ceil(SEGMENT_BYTES as u64) {
+        if self.remote.is_some() || !object.segments.is_empty() {
+            if (self.remote.is_none() && object.kind != ArchiveObjectKind::Export)
+                || object.segments.len() as u64 != object.bytes.div_ceil(SEGMENT_BYTES as u64)
+            {
                 return Err(invalid(ValidationReason::InvalidDigest));
             }
-            let versioned = remote.bucket_mode() == S3BucketMode::Enabled;
+            let versioned = self
+                .remote
+                .as_ref()
+                .is_some_and(|remote| remote.bucket_mode() == S3BucketMode::Enabled);
             for (index, segment) in object.segments.iter().enumerate() {
                 let expected =
                     (object.bytes - index as u64 * SEGMENT_BYTES as u64).min(SEGMENT_BYTES as u64);
@@ -607,8 +698,6 @@ impl ArchiveStorage {
                     return Err(invalid(ValidationReason::InvalidDigest));
                 }
             }
-        } else if !object.segments.is_empty() {
-            return Err(invalid(ValidationReason::InvalidDigest));
         }
         Ok(())
     }
@@ -642,6 +731,24 @@ impl ArchiveStorage {
     }
 }
 
+async fn read_local_range(
+    file: Option<&mut tokio::fs::File>,
+    total_bytes: u64,
+    offset: u64,
+    len: usize,
+) -> Result<Bytes, PortError> {
+    let file = file.ok_or_else(|| invalid(ValidationReason::InvalidAuthority))?;
+    if file.metadata().await.map_err(storage_io)?.len() != total_bytes {
+        return Err(invalid(ValidationReason::InvalidDigest));
+    }
+    file.seek(std::io::SeekFrom::Start(offset))
+        .await
+        .map_err(storage_io)?;
+    let mut bytes = vec![0; len];
+    file.read_exact(&mut bytes).await.map_err(storage_io)?;
+    Ok(Bytes::from(bytes))
+}
+
 fn scratch_lock(dir: &Dir, create: bool) -> std::io::Result<fs::File> {
     let mut options = OpenOptions::new();
     options
@@ -662,6 +769,7 @@ fn open_local(root: &DataRoot) -> Result<LocalArchiveStorage, PortError> {
     let work = child_dir(&archives, "work", true)?;
     let objects = child_dir(&archives, "objects", true)?;
     Ok(LocalArchiveStorage {
+        legacy_exports: Default::default(),
         work,
         objects,
         work_path: root.root().join("staging/archives/work"),
@@ -679,7 +787,7 @@ fn archive_dir_builder() -> DirBuilder {
     builder
 }
 
-fn child_dir(parent: &Dir, name: &str, private: bool) -> Result<Dir, PortError> {
+pub(crate) fn child_dir(parent: &Dir, name: &str, private: bool) -> Result<Dir, PortError> {
     let builder = if private {
         archive_dir_builder()
     } else {
@@ -979,4 +1087,74 @@ fn remote_error() -> PortError {
         "operational storage request failed",
         Duration::from_millis(250),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use notarium_core::ids::{HistoryIncarnation, SpaceId};
+    use std::io::{Seek, Write};
+
+    #[tokio::test]
+    async fn local_export_validates_only_the_requested_segment() {
+        let root = DataRoot::new(
+            std::env::temp_dir().join(codec::new_prefixed_hex_id("range_test_").unwrap()),
+        );
+        fs::create_dir(root.root()).unwrap();
+        let dir = Dir::open_ambient_dir(root.root(), ambient_authority()).unwrap();
+        let storage = ArchiveStorage::local(&root, InstallationId::from_bytes([1; 16])).unwrap();
+        let scratch = storage.scratch().unwrap();
+        let mut writer = scratch.open_new("zip").unwrap();
+        writer.write_all(&vec![1; SEGMENT_BYTES]).unwrap();
+        writer.write_all(&[2; 16]).unwrap();
+        writer.sync_all().unwrap();
+        let layout = storage
+            .measure_upload(&scratch, "zip", MAX_OBJECT_BYTES)
+            .unwrap();
+        let scope = HistoryScope {
+            space_id: SpaceId::from_bytes([2; 16]),
+            incarnation: HistoryIncarnation::from_bytes([3; 16]),
+        };
+        let cancel = Cancellation::default();
+        let object = storage
+            .seal(
+                &scratch,
+                "zip",
+                &scope,
+                ArchiveObjectKind::Export,
+                layout,
+                &cancel,
+            )
+            .await
+            .unwrap();
+        assert_eq!(object.segments.len(), 2);
+        let mut legacy = object.clone();
+        legacy.segments.clear();
+        drop(storage.open_download(&legacy, &cancel).await.unwrap());
+        // The fixture keeps a pre-seal writer solely to simulate disk corruption.
+        writer
+            .seek(std::io::SeekFrom::Start(SEGMENT_BYTES as u64))
+            .unwrap();
+        writer.write_all(&[0xff]).unwrap();
+        writer.sync_all().unwrap();
+        drop(writer);
+        for pointer in [&object, &legacy] {
+            let mut reader = storage.open_download(pointer, &cancel).await.unwrap();
+            let first = storage
+                .download_chunk(pointer, &mut reader, 1, 1, &cancel)
+                .await
+                .unwrap();
+            assert_eq!(first.as_ref(), &[1]);
+            let result = storage
+                .download_chunk(pointer, &mut reader, SEGMENT_BYTES as u64 + 2, 1, &cancel)
+                .await;
+            assert!(
+                matches!(result, Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
+                if diagnostic.reason == ValidationReason::InvalidDigest)
+            );
+        }
+        drop(scratch);
+        drop(storage);
+        dir.remove_open_dir_all().unwrap();
+    }
 }

@@ -12,7 +12,9 @@ use notarium_canonical::{
         sqlite_archive_privacy_ddl, sqlite_archive_versions_ddl,
     },
 };
-use notarium_control::store::{SQLITE_TARGET_DDL, TargetRecord, TargetValue};
+use notarium_control::store::{
+    SQLITE_TARGET_DDL, TargetRecord, TargetValue, sqlite_migrations_applied,
+};
 use notarium_core::{
     error::{PortError, ValidationReason},
     ids::ContentDigest,
@@ -80,9 +82,9 @@ fn tables(db: &Connection) -> Result<BTreeSet<String>, PortError> {
 }
 
 fn definitions(db: &Connection, kind: &str) -> Result<BTreeMap<String, String>, PortError> {
-    let mut schema = db.prepare(
-        "SELECT name,sql FROM sqlite_schema WHERE type=?1 AND sql IS NOT NULL AND name<>'_sqlx_migrations' LIMIT 1025",
-    ).map_err(sql_error)?;
+    let mut schema = db
+        .prepare("SELECT name,sql FROM sqlite_schema WHERE type=?1 AND sql IS NOT NULL LIMIT 1025")
+        .map_err(sql_error)?;
     let mut rows = schema.query([kind]).map_err(sql_error)?;
     let mut result = BTreeMap::new();
     let mut bytes = 0;
@@ -104,8 +106,15 @@ fn definitions(db: &Connection, kind: &str) -> Result<BTreeMap<String, String>, 
 
 pub(crate) fn check_sqlite_control(db: &Connection) -> Result<(), PortError> {
     let expected = trusted(SQLITE_TARGET_DDL)?;
+    if !sqlite_migrations_applied(db).map_err(sql_error)? {
+        return Err(invalid(ValidationReason::InvalidArchive));
+    }
     for kind in ["table", "index", "trigger", "view"] {
-        if definitions(db, kind)? != definitions(&expected, kind)? {
+        let mut actual = definitions(db, kind)?;
+        if kind == "table" {
+            actual.remove("_sqlx_migrations");
+        }
+        if actual != definitions(&expected, kind)? {
             return Err(invalid(ValidationReason::InvalidArchive));
         }
     }
@@ -149,8 +158,16 @@ pub(crate) fn check_sqlite_canonical(db: &Connection, version: u32) -> Result<()
     {
         return Err(invalid(ValidationReason::InvalidArchive));
     }
+    const LEGACY_CLAIM_INDEX: &str =
+        "CREATE INDEX idx_content_jobs_claim ON content_jobs(space_id,state,lease_until_ms,job_id)";
     for (name, sql) in &actual_indexes {
+        let actual = normalize_ddl(sql);
         let trusted = match (version, name.as_str()) {
+            (1..=6, "idx_content_jobs_claim") => Some(LEGACY_CLAIM_INDEX),
+            // The physical reorder preserves the v7 logical schema witness.
+            (7, "idx_content_jobs_claim") if actual == normalize_ddl(LEGACY_CLAIM_INDEX) => {
+                continue;
+            }
             (1..=3, "idx_blob_references_non_note_owner") => Some(
                 "CREATE INDEX idx_blob_references_non_note_owner ON blob_references
                  (space_id, owner_kind, owner_id) WHERE owner_kind <> 'note_revision'",
@@ -160,7 +177,7 @@ pub(crate) fn check_sqlite_canonical(db: &Connection, version: u32) -> Result<()
             ),
             _ => trusted_indexes.get(name).map(String::as_str),
         };
-        if trusted.is_none_or(|trusted| normalize_ddl(sql) != normalize_ddl(trusted)) {
+        if trusted.is_none_or(|trusted| actual != normalize_ddl(trusted)) {
             return Err(invalid(ValidationReason::InvalidArchive));
         }
     }
@@ -1095,9 +1112,14 @@ impl Partition<'_> {
                     _,
                     Int(count),
                     publication,
+                    Text(admission),
+                    Text(state),
                     ..,
                 ],
             ) if *count > 0 => {
+                if admission != "open" || state != "active" {
+                    return Err(invalid(ValidationReason::InvalidState));
+                }
                 self.count_reference(space, hash, *count)?;
                 let Text(publication) = publication else {
                     return Err(invalid(ValidationReason::InvalidDigest));
@@ -1336,6 +1358,8 @@ mod tests {
              DROP TABLE archive_import_sources;
              DROP TABLE archive_privacy;
              DROP INDEX idx_blob_catalog_gc;
+             DROP INDEX idx_content_jobs_claim;
+             CREATE INDEX idx_content_jobs_claim ON content_jobs (space_id, state, lease_until_ms, job_id);
              ALTER TABLE blob_catalog DROP COLUMN quarantined_at_ms;
              ALTER TABLE blob_catalog DROP COLUMN legacy_cleanup;
              ALTER TABLE backup_holds DROP COLUMN scoped_export;

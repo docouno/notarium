@@ -366,6 +366,7 @@ fn paginated_seed_and_jobs_preserve_their_own_identity_types_and_cut() {
                     completed_units: 0,
                     total_units: None,
                     lease: LeaseEpoch::ZERO,
+                    import_diagnostic: None,
                     artifacts: vec![],
                 })
                 .collect(),

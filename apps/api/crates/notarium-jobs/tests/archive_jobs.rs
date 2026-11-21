@@ -1,18 +1,21 @@
 use std::{
     io::{Cursor, Read, Seek, SeekFrom, Write},
-    sync::Arc,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
 use notarium_canonical::{CanonicalConfig, CanonicalRuntime, CanonicalStore, codec};
 use notarium_control::{
-    service::{AuthenticationMode, ControlConfig, ControlService, SystemClock},
+    service::{AuthenticationMode, ControlClock, ControlConfig, ControlService, SystemClock},
     store::ControlStore,
 };
 use notarium_core::{
     DomainError,
     epoch::{DataRoot, EpochClassification, EpochReason, StorageEpochState},
-    error::PortError,
+    error::{PortError, ValidationReason},
     ids::*,
     model::HistoryScope,
     ports::*,
@@ -31,11 +34,39 @@ impl Drop for FixtureRoot {
     }
 }
 
-struct TestRegistry;
-struct TestLease;
+struct TestClock {
+    now: AtomicI64,
+    delay_once_ms: AtomicU64,
+}
+
+impl ControlClock for TestClock {
+    fn now_ms(&self) -> Result<i64, PortError> {
+        let delay = self.delay_once_ms.swap(0, Ordering::SeqCst);
+        if delay > 0 {
+            std::thread::sleep(Duration::from_millis(delay));
+        }
+        Ok(self.now.load(Ordering::SeqCst))
+    }
+}
+
+struct TestRegistry {
+    clock: Arc<TestClock>,
+    advance_at_handoff: Mutex<Option<i64>>,
+}
+
+#[derive(Default)]
+struct TestLease {
+    expiry: Option<(Arc<TestClock>, i64)>,
+    admitted: AtomicBool,
+}
 
 impl RevocationLease for TestLease {
     fn check(&self) -> Result<(), PortError> {
+        if let Some((clock, expires)) = &self.expiry
+            && self.admitted.swap(true, Ordering::SeqCst)
+        {
+            clock.now.store(*expires, Ordering::SeqCst);
+        }
         Ok(())
     }
 }
@@ -47,7 +78,13 @@ impl SessionRevocationPort for TestRegistry {
         _: Vec<RevocationSelector>,
         _: Cancellation,
     ) -> PortFuture<'_, Box<dyn RevocationLease>> {
-        Box::pin(async { Ok(Box::new(TestLease) as Box<dyn RevocationLease>) })
+        let advance = self.advance_at_handoff.lock().unwrap().take();
+        Box::pin(async move {
+            Ok(Box::new(TestLease {
+                expiry: advance.map(|time| (self.clock.clone(), time)),
+                ..Default::default()
+            }) as Box<dyn RevocationLease>)
+        })
     }
 
     fn fence_provider(
@@ -55,7 +92,7 @@ impl SessionRevocationPort for TestRegistry {
         _: MaintenanceContext,
         _: Vec<RevocationSelector>,
     ) -> PortFuture<'_, Box<dyn RevocationLease>> {
-        Box::pin(async { Ok(Box::new(TestLease) as Box<dyn RevocationLease>) })
+        Box::pin(async { Ok(Box::<TestLease>::default() as Box<dyn RevocationLease>) })
     }
 
     fn fence_inactive_provider(
@@ -63,7 +100,7 @@ impl SessionRevocationPort for TestRegistry {
         _: MaintenanceContext,
         _: RequestId,
     ) -> PortFuture<'_, Option<Box<dyn RevocationLease>>> {
-        Box::pin(async { Ok(Some(Box::new(TestLease) as Box<dyn RevocationLease>)) })
+        Box::pin(async { Ok(Some(Box::<TestLease>::default() as Box<dyn RevocationLease>)) })
     }
 
     fn revoke(
@@ -258,19 +295,26 @@ async fn exercise_local_archive_worker(entries: usize) {
         "INSERT INTO v1_storage_epoch(singleton, epoch_version, state, installation_id) VALUES(1,1,'ready',?1)",
         [installation.as_str()],
     ).unwrap();
-    let (store, runtime) = CanonicalRuntime::open(CanonicalConfig::local_default(
-        installation.clone(),
-        root.clone(),
-    ))
-    .await
-    .unwrap();
+    let mut config = CanonicalConfig::local_default(installation.clone(), root.clone());
+    if entries == 201 {
+        config.writer.max_staged_bytes = 4096;
+    }
+    let (store, runtime) = CanonicalRuntime::open(config).await.unwrap();
     let owner = PrincipalId::from_bytes([12; 16]);
+    let clock = Arc::new(TestClock {
+        now: AtomicI64::new(SystemClock.now_ms().unwrap()),
+        delay_once_ms: AtomicU64::new(0),
+    });
+    let registry = Arc::new(TestRegistry {
+        clock: clock.clone(),
+        advance_at_handoff: Mutex::new(None),
+    });
     let control_service = Arc::new(
         ControlService::open(
             control.clone(),
             Arc::new(store.clone()),
-            Arc::new(TestRegistry),
-            Arc::new(SystemClock),
+            registry.clone(),
+            clock.clone(),
             ControlConfig {
                 authentication: AuthenticationMode::TrustedNone { owner },
                 resource_uri: "https://notarium.example/".into(),
@@ -321,12 +365,15 @@ async fn exercise_local_archive_worker(entries: usize) {
     let jobs = Arc::new(
         ArchiveJobs::new(
             store.clone(),
-            control_service,
+            control_service.clone(),
             ArchiveStorage::local(root, installation).unwrap(),
             ImportLimits::default(),
         )
         .unwrap(),
     );
+    if entries == 201 {
+        stage_import_shares_the_upload_deadline(&jobs, &ctx, &clock, root).await;
+    }
     let stop = Cancellation::default();
     let running = tokio::spawn(
         jobs.runner(JobWorkerConfig {
@@ -358,6 +405,68 @@ async fn exercise_local_archive_worker(entries: usize) {
             (rejected.state, rejected.completed_units),
             (JobState::Failed, 0)
         );
+        assert_eq!(
+            rejected.import_diagnostic,
+            Some(ImportDiagnostic {
+                reason: ValidationReason::InvalidPathComponent,
+                path: None,
+            })
+        );
+    }
+    if entries == 201 {
+        let rejected = import(
+            &jobs,
+            &store,
+            &ctx,
+            &zip([
+                ("first.md".into(), "# First".into()),
+                ("Folder/Cafe\u{301}.TXT".into(), "private content".into()),
+            ]),
+        )
+        .await;
+        assert_eq!(rejected.completed_units, 0);
+        assert_eq!(
+            rejected.import_diagnostic,
+            Some(ImportDiagnostic {
+                reason: ValidationReason::UnsupportedArchiveEntry,
+                path: Some("Folder/Café.TXT".into()),
+            })
+        );
+
+        use notarium_core::auth::{EngineAuthContext, VerifiedHuman};
+        let reader = VerifiedHuman::attest(
+            PrincipalId::from_bytes([90; 16]),
+            GrantId::from_bytes([91; 16]),
+            ctx.auth().spaces().clone(),
+            false,
+        );
+        let reader = SpaceContext::new(
+            EngineAuthContext::for_human(reader),
+            scope.clone(),
+            budget(),
+        )
+        .unwrap();
+        let derived = ctx
+            .auth()
+            .for_agent_run(
+                AgentRunId::from_bytes([92; 16]),
+                scope.space_id.clone(),
+                notarium_core::auth::ChatAudience::Shared,
+                ctx.auth().spaces().clone(),
+            )
+            .unwrap();
+        let derived = SpaceContext::new(derived, scope.clone(), budget()).unwrap();
+        assert!(
+            store
+                .get_job(derived, rejected.id.clone())
+                .await
+                .unwrap()
+                .import_diagnostic
+                .is_none()
+        );
+        let observed = store.get_job(reader, rejected.id).await.unwrap();
+        assert_eq!(observed.state, JobState::Failed);
+        assert!(observed.import_diagnostic.is_none());
     }
     assert_eq!(note_count(root, &scope), 0);
 
@@ -479,6 +588,58 @@ async fn exercise_local_archive_worker(entries: usize) {
     assert_eq!(exported.state, JobState::Succeeded);
     let id = &exported.artifacts[0];
     let download = open_export_during_stalled_fsck(&jobs, ctx.clone(), id, root).await;
+    if entries == 201 {
+        let expires = clock.now.load(Ordering::SeqCst) + 86_400_000;
+        let pat = control_service
+            .create_pat(
+                AccountContext::new(ctx.auth().clone(), budget()),
+                CreatePat {
+                    name: "archive".into(),
+                    scope: BearerScope::Write,
+                    selected_spaces: None,
+                    expires_at_ms: Some(expires),
+                    expected: account.revision,
+                },
+            )
+            .await
+            .unwrap();
+        let pat_auth = control_service
+            .resolve(PreAuthContext {
+                budget: budget(),
+                evidence: AuthEvidence::new(AuthEvidenceKind::Pat, pat.value.token.expose().into()),
+            })
+            .await
+            .unwrap();
+        let pat_ctx = SpaceContext::new(pat_auth, scope.clone(), budget()).unwrap();
+        let job = jobs
+            .enqueue(
+                pat_ctx.clone(),
+                mutation(&pat_ctx, ContentJobKind::ExportSpace { encrypted: false }),
+            )
+            .await
+            .unwrap()
+            .value;
+        let exported_by_pat = terminal(&store, &pat_ctx, &job).await;
+        let as_caller = jobs.open_export(pat_ctx, id).await.unwrap();
+        let as_origin = jobs
+            .open_export(ctx.clone(), &exported_by_pat.artifacts[0])
+            .await
+            .unwrap();
+        let before_expiry = clock.now.load(Ordering::SeqCst);
+        for reader in [as_caller, as_origin] {
+            *registry.advance_at_handoff.lock().unwrap() = Some(expires);
+            let (out, mut recv) = tokio::sync::mpsc::channel(1);
+            let chunk = reader
+                .read_chunk_into(budget(), 0, 1, out.reserve_owned().await.unwrap())
+                .await;
+            assert!(matches!(
+                chunk,
+                Err(PortError::Domain(DomainError::AuthenticationFailed))
+            ));
+            assert!(recv.try_recv().is_err());
+            clock.now.store(before_expiry, Ordering::SeqCst);
+        }
+    }
     let metadata = download.metadata();
     let (sender, mut chunks) = tokio::sync::mpsc::channel(1);
     download
@@ -562,6 +723,60 @@ async fn exercise_local_archive_worker(entries: usize) {
             |row| row.get::<_, String>(0),
         )
         .unwrap();
+    if entries == 201 {
+        db.execute(
+            "WITH RECURSIVE counts(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM counts WHERE i<10000)
+             INSERT INTO folder_heads(space_id,folder_id,parent_folder_id,is_root,slug,slug_fold,display_name,
+               is_project,lifecycle_state,rev_seq,head_rev_id,created_seq,updated_seq,updated_at_sec,updated_at_nsec)
+             SELECT space_id,printf('fld_%032x',i),root_folder_id,0,'sibling-' || i,'sibling-' || i,'',0,
+               'active',0,printf('rev_%032x',i),0,0,0,0 FROM spaces CROSS JOIN counts WHERE space_id=?1",
+            [scope.space_id.as_str()],
+        ).unwrap();
+        let selected = jobs
+            .enqueue(
+                ctx.clone(),
+                mutation(
+                    &ctx,
+                    ContentJobKind::Export {
+                        notes: vec![NoteId::parse(&note).unwrap()],
+                        encrypted: false,
+                    },
+                ),
+            )
+            .await
+            .unwrap()
+            .value;
+        let completed =
+            tokio::time::timeout(Duration::from_secs(10), terminal(&store, &ctx, &selected))
+                .await
+                .expect("one selected note must finish regardless of unrelated sibling folders");
+        assert_eq!(
+            (completed.state, completed.completed_units),
+            (JobState::Succeeded, 1)
+        );
+        let selected_download = jobs
+            .open_export(ctx.clone(), &completed.artifacts[0])
+            .await
+            .unwrap();
+        let bytes = selected_download
+            .read_chunk(budget(), 0, 16 * 1024)
+            .await
+            .unwrap();
+        let mut selected_archive = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let slug: String = db
+            .query_row(
+                "SELECT slug FROM note_heads WHERE space_id=?1 AND note_id=?2",
+                rusqlite::params![scope.space_id.as_str(), note],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(selected_archive.len(), 1);
+        assert!(
+            selected_archive
+                .by_name(&format!("documents/{slug}.md"))
+                .is_ok()
+        );
+    }
     store
         .delete_note(
             ctx.clone(),
@@ -628,6 +843,9 @@ async fn exercise_local_archive_worker(entries: usize) {
             .flatten()
             .any(|entry| entry.file_name().to_string_lossy().contains(id.as_str()))
     );
+    if entries == 201 {
+        check_import_admission(&jobs, &store, &ctx, root).await;
+    }
     stop.cancel();
     running.await.unwrap().unwrap();
     if entries == 10_000 {
@@ -635,6 +853,170 @@ async fn exercise_local_archive_worker(entries: usize) {
     }
     control.close().await;
     runtime.shutdown().await.unwrap();
+}
+
+async fn check_import_admission(
+    jobs: &ArchiveJobs,
+    store: &CanonicalStore,
+    ctx: &SpaceContext,
+    root: &DataRoot,
+) {
+    let initial = note_count(root, ctx.scope());
+    let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let stored =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    archive.start_file("budget/first.md", stored).unwrap();
+    archive.write_all(b"# First").unwrap();
+    archive.start_file("budget/last.md", stored).unwrap();
+    archive.write_all(b"# ").unwrap();
+    archive
+        .write_all(&vec![b'a'; codec::MAX_MSGPACK_DECODE_BYTES])
+        .unwrap();
+    let bytes = archive.finish().unwrap().into_inner();
+    let job = import(jobs, store, ctx, &bytes).await;
+    assert_eq!((job.state, job.completed_units), (JobState::Failed, 0));
+    assert_eq!(
+        job.import_diagnostic.unwrap().reason,
+        ValidationReason::BudgetExceeded
+    );
+    assert_eq!(note_count(root, ctx.scope()), initial);
+    let db = rusqlite::Connection::open(root.canonical()).unwrap();
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM folder_heads WHERE slug='budget'",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+
+    // Each note fits the configured writer capacity on its own.
+    let body = |name: &str, len| {
+        let mut data = vec![0; len];
+        blake3::Hasher::new()
+            .update(name.as_bytes())
+            .finalize_xof()
+            .fill(&mut data);
+        let text: String = data
+            .into_iter()
+            .map(|b| char::from(b'a' + b % 16))
+            .collect();
+        format!("# {name}\n\n{text}")
+    };
+    let mut notes = Vec::new();
+    for slug in ["writer-a", "writer-b"] {
+        let carrier = body(slug, 5000);
+        assert!(
+            (2049..=4096).contains(
+                &store
+                    .prepare_blob(carrier.as_bytes())
+                    .unwrap()
+                    .compressed_size()
+            )
+        );
+        notes.push((format!("{slug}.md"), carrier));
+    }
+    let job = import(jobs, store, ctx, &zip(notes)).await;
+    assert_eq!((job.state, job.completed_units), (JobState::Succeeded, 2));
+    let oversized = body("writer-limit", 16_000);
+    assert!(
+        store
+            .prepare_blob(oversized.as_bytes())
+            .unwrap()
+            .compressed_size()
+            > 4096
+    );
+    let job = import(
+        jobs,
+        store,
+        ctx,
+        &zip([("writer-limit.md".into(), oversized)]),
+    )
+    .await;
+    assert_eq!((job.state, job.completed_units), (JobState::Failed, 0));
+    assert_eq!(
+        job.import_diagnostic.unwrap().reason,
+        ValidationReason::BudgetExceeded
+    );
+
+    let (id, bytes): (String, Vec<u8>) = db
+        .query_row(
+            "SELECT n.note_id,r.metadata_msgpack FROM note_heads n JOIN revisions r
+         ON r.space_id=n.space_id AND r.rev_id=n.head_rev_id WHERE n.slug='writer-a'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let mut envelope = codec::RevisionMetadataEnvelope::decode(&bytes).unwrap();
+    let codec::RevisionMetadataPayload::Note(note) = &mut envelope.payload else {
+        panic!("expected a note")
+    };
+    note.title = "x".repeat(codec::MAX_MSGPACK_DECODE_BYTES);
+    let excess = codec::encode_msgpack(&envelope).unwrap().len() - codec::MAX_MSGPACK_DECODE_BYTES;
+    let codec::RevisionMetadataPayload::Note(note) = &mut envelope.payload else {
+        unreachable!()
+    };
+    note.title
+        .truncate(codec::MAX_MSGPACK_DECODE_BYTES - excess);
+    let encoded = envelope.encode().unwrap();
+    assert_eq!(encoded.len(), codec::MAX_MSGPACK_DECODE_BYTES);
+    assert_eq!(
+        codec::RevisionMetadataEnvelope::decode(&encoded).unwrap(),
+        envelope
+    );
+    let codec::RevisionMetadataPayload::Note(note) = &mut envelope.payload else {
+        unreachable!()
+    };
+    note.title.push('x');
+    assert!(
+        matches!(envelope.encode(), Err(PortError::Domain(DomainError::ValidationFailed { diagnostic })) if diagnostic.reason == ValidationReason::BudgetExceeded)
+    );
+    store
+        .delete_note(
+            ctx.clone(),
+            mutation(
+                ctx,
+                DeleteNote {
+                    note: NoteId::parse(&id).unwrap(),
+                    disposition: DeleteDisposition::Trash,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+}
+
+async fn stage_import_shares_the_upload_deadline(
+    jobs: &ArchiveJobs,
+    ctx: &SpaceContext,
+    clock: &Arc<TestClock>,
+    root: &DataRoot,
+) {
+    use tokio::io::AsyncWriteExt;
+
+    let mut ctx = ctx.clone();
+    ctx.budget.remaining = Duration::from_millis(300);
+    let (mut sender, input) = tokio::io::duplex(1);
+    let stream = async {
+        // The second byte cannot enter the pipe until the worker has polled
+        // the first read, after its initial authority check.
+        sender.write_all(b"ab").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(175)).await;
+        clock.delay_once_ms.store(175, Ordering::SeqCst);
+        sender.shutdown().await.unwrap();
+    };
+    let (result, ()) = tokio::join!(jobs.stage_import(ctx, input), stream);
+    assert!(matches!(result, Err(PortError::DeadlineExceeded(_))));
+    let db = rusqlite::Connection::open(root.canonical()).unwrap();
+    let pinned: i64 = db
+        .query_row(
+            "SELECT count(*) FROM archive_uploads WHERE object_kind='input' AND state='pinned'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(pinned, 0);
 }
 
 async fn open_export_during_stalled_fsck(

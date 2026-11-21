@@ -290,6 +290,8 @@ enum QueuedWriteEntry {
 #[derive(Default)]
 pub struct WriterFaultState {
     pub drop_commit_response_once: AtomicBool,
+    #[cfg(feature = "test-support")]
+    pub drop_auxiliary_commit_response_once: AtomicBool,
     pub pre_commit_space_delays: Mutex<HashMap<SpaceId, Duration>>,
     #[cfg(feature = "test-support")]
     pub archive_ack: Mutex<Option<Arc<ArchiveAckGate>>>,
@@ -390,7 +392,7 @@ impl Drop for StagedByteReservation {
 impl StagedByteLimiter {
     fn new(max_bytes: u64) -> Self {
         Self {
-            max_bytes: max_bytes.max(1024),
+            max_bytes,
             in_flight: AtomicU64::new(0),
             notify: Notify::new(),
         }
@@ -561,7 +563,7 @@ impl<'a> WriterWait<'a> {
 impl WriteCoordinator {
     pub(crate) fn start(inner: &Arc<CanonicalInner>) -> Arc<Self> {
         let cfg = inner.config.writer;
-        let byte_limiter = Arc::new(StagedByteLimiter::new(cfg.max_staged_bytes));
+        let byte_limiter = Arc::new(StagedByteLimiter::new(cfg.staged_byte_limit()));
         let commit_gate = Arc::new(RwLock::new(()));
         let faults = Arc::new(WriterFaultState::default());
         let batch_telemetry = Arc::new(BatchCommitTelemetry::default());

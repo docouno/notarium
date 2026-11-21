@@ -115,10 +115,11 @@ impl CanonicalStore {
     ) -> Result<(), PortError> {
         self.inner.check_writer_epoch(&scope.space_id, epoch)?;
         let current = scope.clone();
-        self.with_write_tx(|tx| {
+        let local = self.local_store_arc();
+        self.with_write_tx(move |tx| {
             Box::pin(async move {
                 crate::blobs::lock_and_check_space_tx(tx, &current, epoch).await?;
-                crate::blobs::gc::reconcile_unowned_tx(tx, &current, epoch).await
+                crate::blobs::gc::reconcile_unowned_tx(tx, &current, epoch, local.as_deref()).await
             })
         })
         .await?;

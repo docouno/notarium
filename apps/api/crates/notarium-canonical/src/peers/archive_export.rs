@@ -9,8 +9,8 @@ use notarium_core::{
     classes::DocClass,
     error::{PortError, ValidationReason},
     ids::{
-        ArtifactId, BackupId, ChatThreadId, ContentDigest, FolderId, JobId, NoteId, PrincipalId,
-        SpaceId, SpaceSeq,
+        ArtifactId, BackupId, ChatThreadId, ContentDigest, FolderId, JobId, PrincipalId, SpaceId,
+        SpaceSeq,
     },
     model::HistoryScope,
     ports::{BackupHold, CallBudget, ContentJobKind, SpaceContext},
@@ -23,7 +23,7 @@ use crate::{
     CanonicalStore, ClaimedContentJob,
     codec::{
         MAX_MSGPACK_DECODE_BYTES, cancelled_not_committed, decode_msgpack_bounded,
-        doc_class_from_db, encode_msgpack, internal_not_committed, ordered_id_16,
+        doc_class_from_db, encode_msgpack, ordered_id_16,
     },
     domain::common::CommandDeadline,
     runtime::{SqlDriverState, load_space_record},
@@ -33,8 +33,9 @@ use crate::{
 use super::{
     ArchiveCleanupCursor,
     archive_import::{ArchiveObject, ArchiveObjectKind},
-    authorize_export_notes_tx, authorize_full_space_export, authorize_job_payload_tx,
-    authorize_job_read_on_space, job_clock_ms, load_job_row_opt_tx, require_active_job_lease_tx,
+    authorize_full_space_export, authorize_job_payload_tx, authorize_job_read_on_space,
+    job_clock_ms, load_job_row_opt_tx, require_active_job_lease_tx,
+    visit_authorized_export_notes_tx,
 };
 
 mod versioned;
@@ -248,6 +249,11 @@ impl CanonicalStore {
                         )
                         .await?
                     }
+                    ContentJobKind::Export { .. }
+                        if size_limited && ctx.budget.remaining >= CUT_LIMIT =>
+                    {
+                        return Err(invalid(ValidationReason::BudgetExceeded));
+                    }
                     _ => return Err(err),
                 }
             }
@@ -372,12 +378,12 @@ impl CanonicalStore {
                     let generation = privacy_generation_tx(tx, &scoped.space_id).await?;
                     let entries = match job.kind {
                         ContentJobKind::Export { notes, encrypted } => {
-                            authorize_export_notes_tx(tx, &space.space, &auth, &notes).await?;
-                            note_entries(tx, &scoped, Some(&notes), encrypted).await?
+                            selected_note_entries(tx, &space.space, &auth, &notes, encrypted)
+                                .await?
                         }
                         ContentJobKind::ExportSpace { encrypted } => {
                             authorize_full_space_export(&auth, &space.space)?;
-                            let mut files = note_entries(tx, &scoped, None, encrypted).await?;
+                            let mut files = note_entries(tx, &scoped, encrypted).await?;
                             add_package_entries(tx, &scoped, &mut files).await?;
                             add_chat_entries(tx, &space, &auth, &mut files).await?;
                             files
@@ -563,18 +569,15 @@ fn capture_full_sqlite(
         .optional()
         .map_err(native_error)?
         .unwrap_or(0);
-    let mut notes = tx
-        .prepare_cached(note_export_query!("SELECT value FROM json_each($2)"))
-        .map_err(native_error)?;
+    let mut notes = tx.prepare_cached(SPACE_NOTES).map_err(native_error)?;
     let notes = notes
-        .query_map(
-            params![sid, rusqlite::types::Null, MAX_EXPORT_ITEMS + 1],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-        )
+        .query_map(params![sid, MAX_EXPORT_ITEMS + 1], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })
         .map_err(native_error)?
         .collect::<Result<Vec<NoteExportRow>, _>>()
         .map_err(native_error)?;
-    let mut files = validated_note_entries(notes, None, encrypted)?;
+    let mut files = validated_note_entries(notes, encrypted)?;
     let limit = MAX_EXPORT_ITEMS - files.len() as i64;
     let mut packages = tx.prepare_cached(PACKAGES).map_err(native_error)?;
     let packages = packages
@@ -742,84 +745,91 @@ async fn read_pointer_tx(
     })
 }
 
+async fn selected_note_entries(
+    tx: &mut BackendConn<'_>,
+    space: &notarium_core::auth::Space,
+    auth: &notarium_core::auth::EngineAuthContext,
+    notes: &[notarium_core::ids::NoteId],
+    encrypted: bool,
+) -> Result<Vec<ExportEntry>, PortError> {
+    let mut files = Vec::new();
+    visit_authorized_export_notes_tx(tx, space, auth, notes, |head, folder| {
+        if files.len() >= MAX_EXPORT_ITEMS as usize {
+            return Err(invalid(ValidationReason::BudgetExceeded));
+        }
+        if head.doc_class == DocClass::EncryptedNote && !encrypted {
+            return Err(invalid(ValidationReason::ClassEgressForbidden));
+        }
+        let mut path = folder.to_owned();
+        if !path.is_empty() {
+            path.push('/');
+        }
+        path.push_str(&head.slug);
+        path.push_str(".md");
+        files.push(ExportEntry {
+            path,
+            data: ExportData::Blob(
+                head.content_digest
+                    .ok_or_else(|| invalid(ValidationReason::InvalidDigest))?,
+            ),
+        });
+        Ok(())
+    })
+    .await?;
+    Ok(files)
+}
+
 async fn note_entries(
     tx: &mut BackendConn<'_>,
     scope: &HistoryScope,
-    notes: Option<&[NoteId]>,
     encrypted: bool,
 ) -> Result<Vec<ExportEntry>, PortError> {
-    let selected = notes.map(|notes| notes.iter().map(NoteId::as_str).collect::<BTreeSet<_>>());
-    let selection = selected
-        .as_ref()
-        .map(serde_json::to_string)
-        .transpose()
-        .map_err(|err| internal_not_committed("export_selection", err.to_string()))?;
-    let rows: Vec<NoteExportRow> = match tx {
-        BackendConn::Sqlite(conn) => {
-            sqlx::query_as(note_export_query!("SELECT value FROM json_each($2)"))
+    macro_rules! read {
+        ($conn:expr) => {
+            sqlx::query_as(SPACE_NOTES)
                 .bind(scope.space_id.as_str())
-                .bind(selection)
                 .bind(MAX_EXPORT_ITEMS + 1)
-                .fetch_all(&mut **conn)
+                .fetch_all(&mut **$conn)
                 .await
-        }
-        BackendConn::Postgres(conn) => {
-            sqlx::query_as(note_export_query!(
-                "SELECT jsonb_array_elements_text(CAST(CAST($2 AS TEXT) AS JSONB))"
-            ))
-            .bind(scope.space_id.as_str())
-            .bind(selection)
-            .bind(MAX_EXPORT_ITEMS + 1)
-            .fetch_all(&mut **conn)
-            .await
-        }
+        };
+    }
+    let rows = match tx {
+        BackendConn::Sqlite(conn) => read!(conn),
+        BackendConn::Postgres(conn) => read!(conn),
     }
     .map_err(sql_error)?;
-    validated_note_entries(rows, selected.as_ref().map(BTreeSet::len), encrypted)
+    validated_note_entries(rows, encrypted)
 }
 
-macro_rules! note_export_query {
-    ($selection:literal) => {
-        concat!(
-            "WITH RECURSIVE paths(folder_id, name, depth) AS (
-                  SELECT folder_id, CAST('' AS TEXT), 0 FROM folder_heads
-                    WHERE space_id=$1 AND is_root=1 AND lifecycle_state='active'
-                  UNION ALL
-                  SELECT h.folder_id, p.name || h.slug || '/', p.depth+1
-                    FROM folder_heads h JOIN paths p ON h.parent_folder_id=p.folder_id
-                    WHERE h.space_id=$1 AND h.lifecycle_state='active' AND p.depth<256
-                 ), schema_note AS (
-                   SELECT schema_note_id,created_seq FROM space_field_schemas
-                   WHERE space_id=$1 AND is_current=1 AND CAST($2 AS TEXT) IS NULL
-                 )
-                 SELECT n.note_id, p.name || n.slug || '.md' AS rel_path, n.doc_class, n.content_blake3
-                 FROM note_heads n JOIN paths p ON n.parent_folder_id=p.folder_id
-                 WHERE n.space_id=$1 AND n.lifecycle_state='active'
-                   AND ((CAST($2 AS TEXT) IS NULL AND n.ability_id IS NULL
-                         AND NOT EXISTS(SELECT 1 FROM schema_note s WHERE s.schema_note_id=n.note_id))
-                        OR n.note_id IN (", $selection, "))
-                 UNION ALL
-                 SELECT s.schema_note_id, '.notarium/fields/schema.yaml', 'user-doc', r.content_blake3
-                   FROM schema_note s LEFT JOIN revisions r ON r.space_id=$1 AND r.entity_type='note'
-                    AND r.entity_key=s.schema_note_id AND r.space_seq=s.created_seq
-                 LIMIT $3"
-        )
-    };
-}
-use note_export_query;
+const SPACE_NOTES: &str = "WITH RECURSIVE paths(folder_id, name, depth) AS (
+      SELECT folder_id, CAST('' AS TEXT), 0 FROM folder_heads
+        WHERE space_id=$1 AND is_root=1 AND lifecycle_state='active'
+      UNION ALL
+      SELECT h.folder_id, p.name || h.slug || '/', p.depth+1
+        FROM folder_heads h JOIN paths p ON h.parent_folder_id=p.folder_id
+        WHERE h.space_id=$1 AND h.lifecycle_state='active' AND p.depth<256
+     ), schema_note AS (
+       SELECT schema_note_id,created_seq FROM space_field_schemas
+       WHERE space_id=$1 AND is_current=1
+     )
+     SELECT n.note_id, p.name || n.slug || '.md', n.doc_class, n.content_blake3
+     FROM note_heads n JOIN paths p ON n.parent_folder_id=p.folder_id
+     WHERE n.space_id=$1 AND n.lifecycle_state='active' AND n.ability_id IS NULL
+       AND NOT EXISTS(SELECT 1 FROM schema_note s WHERE s.schema_note_id=n.note_id)
+     UNION ALL
+     SELECT s.schema_note_id, '.notarium/fields/schema.yaml', 'user-doc', r.content_blake3
+       FROM schema_note s LEFT JOIN revisions r ON r.space_id=$1 AND r.entity_type='note'
+        AND r.entity_key=s.schema_note_id AND r.space_seq=s.created_seq
+     LIMIT $2";
 
 type NoteExportRow = (String, String, String, Option<Vec<u8>>);
 
 fn validated_note_entries(
     rows: Vec<NoteExportRow>,
-    selected: Option<usize>,
     encrypted: bool,
 ) -> Result<Vec<ExportEntry>, PortError> {
     if rows.len() > MAX_EXPORT_ITEMS as usize {
         return Err(invalid(ValidationReason::BudgetExceeded));
-    }
-    if selected.is_some_and(|count| rows.len() != count) {
-        return Err(DomainError::ResourceNotFound.into());
     }
     rows.into_iter()
         .map(|(_, path, class, bytes)| {

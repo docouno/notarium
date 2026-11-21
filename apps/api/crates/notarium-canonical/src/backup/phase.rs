@@ -56,8 +56,7 @@ fn spawn_owner<T, F: Future<Output = ()> + Send + 'static>(
     if inner.backup_shutdown.is_cancelled() {
         return Err(resource);
     }
-    tasks.retain(|task| !task.is_finished());
-    tasks.push(inner.backup_executor.spawn(task(resource)));
+    super::track_cleanup_task(&mut tasks, inner.backup_executor.spawn(task(resource)));
     Ok(())
 }
 

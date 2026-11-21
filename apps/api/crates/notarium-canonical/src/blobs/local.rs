@@ -19,7 +19,7 @@ use cap_std::{
 use notarium_core::{
     epoch::DataRoot,
     error::PortError,
-    ids::{ContentDigest, SpaceId},
+    ids::{ContentDigest, LeaseEpoch, SpaceId},
 };
 use tokio::sync::{Mutex as AsyncMutex, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 
@@ -29,6 +29,7 @@ use crate::{blobs::decode_zstd_verified, codec::internal_not_committed};
 #[derive(Debug)]
 pub struct LocalSharedGuard {
     _guard: OwnedRwLockReadGuard<()>,
+    _staging: Option<OwnedRwLockReadGuard<()>>,
 }
 
 /// Exclusive per-`(SpaceId, ContentDigest)` guard held during local blob retirement unlink.
@@ -329,7 +330,7 @@ impl PendingDirSyncs {
     }
 }
 
-type DigestGuardKey = (SpaceId, ContentDigest);
+type DigestGuardKey = (SpaceId, ContentDigest, Option<LeaseEpoch>);
 type DigestGuardTable = HashMap<DigestGuardKey, Weak<RwLock<()>>>;
 
 const GUARD_SHARDS: usize = 64;
@@ -558,8 +559,9 @@ impl LocalBlobStore {
         map: &mut DigestGuardTable,
         space_id: &SpaceId,
         digest: ContentDigest,
+        epoch: Option<LeaseEpoch>,
     ) -> Arc<RwLock<()>> {
-        let key = (space_id.clone(), digest);
+        let key = (space_id.clone(), digest, epoch);
         if let Some(existing) = map.get(&key).and_then(Weak::upgrade) {
             return existing;
         }
@@ -578,7 +580,7 @@ impl LocalBlobStore {
         digest: ContentDigest,
     ) -> Arc<RwLock<()>> {
         let mut map = self.guard_shard(digest).lock().await;
-        Self::digest_lock(&mut map, space_id, digest)
+        Self::digest_lock(&mut map, space_id, digest, None)
     }
 
     pub async fn acquire_shared_guard(
@@ -588,7 +590,46 @@ impl LocalBlobStore {
     ) -> Arc<LocalSharedGuard> {
         let lock = self.wait_for_digest_lock(space_id, digest).await;
         let guard = lock.read_owned().await;
-        Arc::new(LocalSharedGuard { _guard: guard })
+        Arc::new(LocalSharedGuard {
+            _guard: guard,
+            _staging: None,
+        })
+    }
+
+    pub(super) async fn acquire_staging_guard(
+        &self,
+        space_id: &SpaceId,
+        digest: ContentDigest,
+        epoch: LeaseEpoch,
+    ) -> Arc<LocalSharedGuard> {
+        let (physical, staging) = {
+            let mut map = self.guard_shard(digest).lock().await;
+            (
+                Self::digest_lock(&mut map, space_id, digest, None),
+                Self::digest_lock(&mut map, space_id, digest, Some(epoch)),
+            )
+        };
+        Arc::new(LocalSharedGuard {
+            _guard: physical.read_owned().await,
+            _staging: Some(staging.read_owned().await),
+        })
+    }
+
+    /// Recovery may close admission past stale tickets from a previous epoch.
+    /// Physical deletion still waits for every digest reader.
+    pub(super) fn try_fence_staging_epoch(
+        &self,
+        space_id: &SpaceId,
+        digest: ContentDigest,
+        epoch: LeaseEpoch,
+    ) -> Option<LocalExclusiveGuard> {
+        let lock = {
+            let mut map = self.guard_shard(digest).try_lock().ok()?;
+            Self::digest_lock(&mut map, space_id, digest, Some(epoch))
+        };
+        Some(LocalExclusiveGuard {
+            _guard: lock.try_write_owned().ok()?,
+        })
     }
 
     pub fn try_acquire_shared_guard(
@@ -599,10 +640,13 @@ impl LocalBlobStore {
         // A contended registry must also defer the read until the SQL snapshot closes.
         let lock = {
             let mut map = self.guard_shard(digest).try_lock().ok()?;
-            Self::digest_lock(&mut map, space_id, digest)
+            Self::digest_lock(&mut map, space_id, digest, None)
         };
         let guard = lock.try_read_owned().ok()?;
-        Some(Arc::new(LocalSharedGuard { _guard: guard }))
+        Some(Arc::new(LocalSharedGuard {
+            _guard: guard,
+            _staging: None,
+        }))
     }
 
     /// Acquires shared guards in canonical ascending `ContentDigest` order to forbid lock-order cycles.
@@ -611,12 +655,24 @@ impl LocalBlobStore {
         space_id: &SpaceId,
         digests: &[ContentDigest],
     ) -> HashMap<ContentDigest, Arc<LocalSharedGuard>> {
+        self.acquire_sorted_guards(space_id, digests, None).await
+    }
+
+    pub(super) async fn acquire_sorted_guards(
+        &self,
+        space_id: &SpaceId,
+        digests: &[ContentDigest],
+        epoch: Option<LeaseEpoch>,
+    ) -> HashMap<ContentDigest, Arc<LocalSharedGuard>> {
         let mut sorted: Vec<ContentDigest> = digests.to_vec();
         sorted.sort_unstable();
         sorted.dedup();
         let mut out = HashMap::with_capacity(sorted.len());
         for digest in sorted {
-            let g = self.acquire_shared_guard(space_id, digest).await;
+            let g = match epoch {
+                Some(epoch) => self.acquire_staging_guard(space_id, digest, epoch).await,
+                None => self.acquire_shared_guard(space_id, digest).await,
+            };
             out.insert(digest, g);
         }
         out
@@ -639,7 +695,7 @@ impl LocalBlobStore {
     ) -> Option<LocalExclusiveGuard> {
         let lock = {
             let mut map = self.guard_shard(digest).try_lock().ok()?;
-            Self::digest_lock(&mut map, space_id, digest)
+            Self::digest_lock(&mut map, space_id, digest, None)
         };
         Some(LocalExclusiveGuard {
             _guard: lock.try_write_owned().ok()?,

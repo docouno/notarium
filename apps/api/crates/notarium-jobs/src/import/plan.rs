@@ -17,7 +17,7 @@ use notarium_core::{
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
-use super::{PLAN_VERSION, invalid, plan_error, sync_plan};
+use super::{PLAN_VERSION, PreflightError, invalid, plan_error, sync_plan};
 use crate::JobExecution;
 
 const MAX_BATCH_NOTES: usize = 200;
@@ -26,6 +26,7 @@ const MAX_BATCH_BYTES: usize = 32 * 1024 * 1024;
 struct Placement {
     ordinal: u64,
     path_key: String,
+    entry_path: String,
     slug: String,
     id: String,
     existing_folder: Option<FolderId>,
@@ -46,8 +47,9 @@ pub(crate) async fn bind_paths(
     job: &JobExecution,
     path: PathBuf,
     root: FolderId,
-) -> Result<u64, PortError> {
+) -> Result<u64, PreflightError> {
     let path = Arc::new(path);
+    let preflight = Arc::new(store.import_preflight(&job.authorize().await?).await?);
     let mut ordinal = 1;
     loop {
         let ctx = job.authorize().await?;
@@ -64,26 +66,39 @@ pub(crate) async fn bind_paths(
             })
             .await?;
         while ordinal <= page {
-            let placement = job
+            let (placement, checked) = job
                 .blocking({
                     let path = path.clone();
                     let root = root.clone();
+                    let preflight = preflight.clone();
                     move |_| {
                         let db = open_plan(&path, false)?;
-                        placement(&db, &root, ordinal)?
-                            .ok_or_else(|| invalid(ValidationReason::InvalidState))
+                        let placement = placement(&db, &root, ordinal)?
+                            .ok_or_else(|| invalid(ValidationReason::InvalidState))?;
+                        let checked = if let Some(class) = placement.class {
+                            let note = read_note(&db, &placement, class)?;
+                            preflight.validate_note(&note, &placement.parent)
+                        } else {
+                            Ok(())
+                        };
+                        Ok((placement, checked))
                     }
                 })
                 .await?;
+            checked.map_err(|err| PreflightError::at(err, &placement.entry_path))?;
             let space_grant = &ctx.auth().spaces()[&ctx.scope().space_id];
             let class = placement.class.unwrap_or(DocClass::UserDoc);
             if !space_grant.write_classes.contains(&class) {
-                return Err(DomainError::SpaceReadOnly.into());
+                return Err(PreflightError::at(
+                    DomainError::SpaceReadOnly.into(),
+                    &placement.entry_path,
+                ));
             }
             if !placement.new_ancestors {
                 let existing = store
                     .inspect_import_path(&ctx, &placement.parent, &placement.slug, placement.class)
-                    .await?;
+                    .await
+                    .map_err(|err| PreflightError::at(err, &placement.entry_path))?;
                 if let Some(id) = existing {
                     job.blocking({
                         let path = path.clone();
@@ -189,27 +204,7 @@ pub(crate) fn read_batch(
             break;
         }
         remaining -= len as usize;
-        let (carrier, digest): (String, Vec<u8>) = db
-            .query_row(
-                "SELECT carrier, final_digest FROM entries WHERE key=?1",
-                [&placement.path_key],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .map_err(plan_error)?;
-        if notarium_syntax::content_digest(&carrier)
-            .as_bytes()
-            .as_slice()
-            != digest
-        {
-            return Err(invalid(ValidationReason::InvalidDigest));
-        }
-        let note = CreateNote {
-            note: NoteId::parse(&placement.id)?,
-            parent: Some(placement.parent.folder().clone()),
-            slug: placement.slug,
-            class,
-            carrier,
-        };
+        let note = read_note(&db, &placement, class)?;
         notes.push(PlannedImportNote {
             ordinal: current,
             parent: placement.parent,
@@ -217,6 +212,34 @@ pub(crate) fn read_batch(
         });
     }
     Ok((!notes.is_empty()).then_some(ImportBatch::Notes(notes)))
+}
+
+fn read_note(
+    db: &Connection,
+    placement: &Placement,
+    class: DocClass,
+) -> Result<CreateNote, PortError> {
+    let (carrier, digest): (String, Vec<u8>) = db
+        .query_row(
+            "SELECT carrier, final_digest FROM entries WHERE key=?1",
+            [&placement.path_key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(plan_error)?;
+    if notarium_syntax::content_digest(&carrier)
+        .as_bytes()
+        .as_slice()
+        != digest
+    {
+        return Err(invalid(ValidationReason::InvalidDigest));
+    }
+    Ok(CreateNote {
+        note: NoteId::parse(&placement.id)?,
+        parent: Some(placement.parent.folder().clone()),
+        slug: placement.slug.clone(),
+        class,
+        carrier,
+    })
 }
 
 fn open_plan(path: &Path, write: bool) -> Result<Connection, PortError> {
@@ -246,7 +269,7 @@ fn placement(
 ) -> Result<Option<Placement>, PortError> {
     let row = db
         .query_row(
-            "SELECT e.key, e.parent, e.slug, e.id, e.resolved_folder, e.class
+            "SELECT e.key, e.parent, e.slug, e.id, e.resolved_folder, e.class, e.path
          FROM plan_order p JOIN entries e ON e.key=p.key WHERE p.ordinal=?1",
             [ordinal as i64],
             |row| {
@@ -257,12 +280,13 @@ fn placement(
                     row.get::<_, String>(3)?,
                     row.get::<_, Option<String>>(4)?,
                     row.get::<_, Option<String>>(5)?,
+                    row.get::<_, String>(6)?,
                 ))
             },
         )
         .optional()
         .map_err(plan_error)?;
-    let Some((path_key, mut parent, slug, id, existing, class)) = row else {
+    let Some((path_key, mut parent, slug, id, existing, class, entry_path)) = row else {
         return Ok(None);
     };
     let mut ancestors = Vec::new();
@@ -299,6 +323,7 @@ fn placement(
     Ok(Some(Placement {
         ordinal,
         path_key,
+        entry_path,
         slug,
         id,
         parent: ImportParent {

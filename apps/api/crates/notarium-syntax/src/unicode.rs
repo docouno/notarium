@@ -11,6 +11,17 @@ pub const NORMALIZATION_UNICODE_VERSION: (u8, u8, u8) = unicode_normalization::U
 pub fn lookup_key(input: &str) -> String {
     input.nfd().default_case_fold().nfc().collect()
 }
+/// Normalize the spelling of a relative archive entry without folding its case.
+pub fn portable_archive_path(path: &str, max_depth: usize) -> DomainResult<String> {
+    let normalized: String = path.nfc().collect();
+    for (depth, component) in normalized.split('/').enumerate() {
+        if depth >= max_depth {
+            return Err(DomainError::validation(ValidationReason::BudgetExceeded));
+        }
+        PortableFilename::parse(component)?;
+    }
+    Ok(normalized)
+}
 pub(crate) fn source_location(source: &str, offset: usize) -> SourceLocation {
     let prefix = &source[..offset];
     let mut line = 1;

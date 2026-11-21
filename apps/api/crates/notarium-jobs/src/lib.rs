@@ -11,6 +11,7 @@ mod fsck;
 mod import;
 mod maintenance;
 mod range_source;
+mod request_deadline;
 mod restore;
 mod sqlite_process;
 #[allow(unsafe_code)]

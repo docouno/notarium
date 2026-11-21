@@ -171,8 +171,19 @@ fn decode_witness_json(raw: &str) -> Result<BackupWitness, PortError> {
 
 pub(crate) fn register_cleanup_task(inner: &CanonicalInner, handle: tokio::task::JoinHandle<()>) {
     let mut guard = inner.backup_cleanups.lock().expect("backup cleanups mutex");
-    guard.retain(|h| !h.is_finished());
-    guard.push(handle);
+    track_cleanup_task(&mut guard, handle);
+}
+
+fn track_cleanup_task(
+    tasks: &mut Vec<tokio::task::JoinHandle<()>>,
+    handle: tokio::task::JoinHandle<()>,
+) {
+    // Amortize pruning even if most registered tasks stay blocked in I/O.
+    if tasks.len() == tasks.capacity() {
+        tasks.retain(|task| !task.is_finished());
+        tasks.reserve((tasks.len() / 2).max(16));
+    }
+    tasks.push(handle);
 }
 
 fn resolve_spool_dir(inner: &CanonicalInner) -> Result<PathBuf, PortError> {
@@ -4516,7 +4527,9 @@ async fn apply_restore_cursor_tx(
     }
 
     rebound_retirements |=
-        crate::blobs::gc::reconcile_unowned_tx(tx, &target.scope, next_epoch).await?;
+        crate::blobs::gc::reconcile_unowned_tx(tx, &target.scope, next_epoch, None)
+            .await?
+            .0;
     Ok(rebound_retirements)
 }
 

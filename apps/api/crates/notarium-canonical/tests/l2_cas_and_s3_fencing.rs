@@ -2,6 +2,9 @@
 
 mod support;
 
+#[path = "l2_cas_and_s3_fencing/gc.rs"]
+mod gc;
+
 #[cfg(unix)]
 #[path = "l2_cas_and_s3_fencing/local_directories.rs"]
 mod local_directories;

@@ -34,6 +34,47 @@ use tokio::sync::{OwnedRwLockReadGuard, OwnedSemaphorePermit, RwLock, Semaphore,
 static SQLITE_MIGRATIONS: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/sqlite");
 static POSTGRES_MIGRATIONS: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/postgres");
 
+/// Verify that the SQLite snapshot can reopen with this store's pinned migrator.
+pub fn sqlite_migrations_applied(snapshot: &rusqlite::Connection) -> rusqlite::Result<bool> {
+    use rusqlite::types::ValueRef;
+
+    // The catalog stores the pinned SQLx SQLite driver's table definition.
+    const LEDGER: &str = "CREATE TABLE _sqlx_migrations (
+    version BIGINT PRIMARY KEY,
+    description TEXT NOT NULL,
+    installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    success BOOLEAN NOT NULL,
+    checksum BLOB NOT NULL,
+    execution_time BIGINT NOT NULL
+)";
+    let expected_table: bool = snapshot.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='_sqlx_migrations' AND sql=?1)",
+        [LEDGER],
+        |row| row.get(0),
+    )?;
+    if !expected_table {
+        return Ok(false);
+    }
+    let mut query = snapshot
+        .prepare("SELECT version,success,checksum FROM _sqlx_migrations ORDER BY version")?;
+    let mut rows = query.query([])?;
+    for migration in SQLITE_MIGRATIONS
+        .iter()
+        .filter(|migration| !migration.migration_type.is_down_migration())
+    {
+        let Some(row) = rows.next()? else {
+            return Ok(false);
+        };
+        if row.get_ref(0)? != ValueRef::Integer(migration.version)
+            || row.get_ref(1)? != ValueRef::Integer(1)
+            || row.get_ref(2)? != ValueRef::Blob(&migration.checksum)
+        {
+            return Ok(false);
+        }
+    }
+    Ok(rows.next()?.is_none())
+}
+
 /// Every writer shares this cross-pod transaction lock with the backup owner.
 pub(crate) const BACKUP_LOCK: i64 = 0x4e54_4354_524c;
 pub(crate) const SQLITE_MAX_ACTIVE_WRITERS: usize = 1;

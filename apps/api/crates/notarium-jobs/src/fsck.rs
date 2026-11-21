@@ -32,7 +32,8 @@ use crate::{
     backup::capture_pair,
     backup_format::{
         CAS_HEADER_BYTES, CAS_INDEX_MAGIC, CAS_RECORD_BYTES, CasRecord, MANIFEST_LIMIT, Manifest,
-        Payload, ZIP_NAMES, authenticated_payload, copy_hash, invalid, io_error,
+        Payload, ZIP_NAMES, authenticated_payload, check_history_count, copy_hash, invalid,
+        io_error,
     },
     db_integrity::{
         Partition, PgRowChecks, Relations, check_sqlite_blob_owners, check_sqlite_canonical,
@@ -45,7 +46,6 @@ use crate::{
 };
 
 const MAX_DB_BYTES: u64 = 10 * 1024 * 1024 * 1024;
-const MAX_HISTORIES: usize = 65_536;
 
 pub(crate) trait SeekRead: Read + Seek + Send {}
 impl<T: Read + Seek + Send> SeekRead for T {}
@@ -451,9 +451,7 @@ pub(crate) fn inspect_sqlite(
                 let incarnation: Vec<u8> = row.get(1).map_err(sql_error)?;
                 let seq: i64 = row.get(2).map_err(sql_error)?;
                 history.push(cursor(&space, &incarnation, seq)?);
-                if history.len() > MAX_HISTORIES {
-                    return Err(invalid(ValidationReason::BudgetExceeded));
-                }
+                check_history_count(history.len())?;
             }
             Ok(history)
         },
@@ -518,6 +516,7 @@ pub(crate) fn verify_sqlite_references(
             LEFT JOIN blob_catalog c ON c.space_id=r.space_id AND c.content_blake3=r.content_blake3
             LEFT JOIN blob_publications p ON p.space_id=r.space_id AND p.publication_id=r.publication_id
             WHERE c.content_blake3 IS NULL OR p.publication_id IS NULL OR p.content_blake3<>r.content_blake3
+               OR c.admission_state<>'open' OR c.blob_state<>'active'
                OR p.state<>'active' OR p.manifest_sealed<>1 OR p.raw_size<>c.raw_size
                OR c.current_publication_id IS DISTINCT FROM p.publication_id)",
         [], |row| row.get(0),
@@ -648,10 +647,7 @@ fn verify_control_spool(
 
 fn record_cursor(cursors: &mut BTreeSet<SpaceId>, space: &str) -> Result<(), PortError> {
     cursors.insert(SpaceId::parse(space)?);
-    if cursors.len() > MAX_HISTORIES {
-        return Err(invalid(ValidationReason::BudgetExceeded));
-    }
-    Ok(())
+    check_history_count(cursors.len())
 }
 
 fn canary_identity(key: &KeyCanary) -> (&str, u64, bool, ContentDigest, bool) {
@@ -711,9 +707,7 @@ fn verify_canonical_spool(
                 }
                 ("spaces", [Text(id), Bytes(history), _, _, _, _, _, _, _, Int(seq), ..]) => {
                     histories.push(cursor(id, history, *seq)?);
-                    if histories.len() > MAX_HISTORIES {
-                        return Err(invalid(ValidationReason::BudgetExceeded));
-                    }
+                    check_history_count(histories.len())?;
                 }
                 ("blob_catalog", [Text(space), Bytes(digest), Int(raw), _, Int(refs), ..]) => {
                     if *refs > 0

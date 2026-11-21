@@ -21,6 +21,7 @@ use crate::{
     ArchiveOperation, ArchiveRunner, ArchiveStorage, ImportLimits, JobExecution, JobWorkerConfig,
     artifacts::ScratchDirectory,
     import::{ImportBatch, bind_paths, prepare_import, read_batch, validate_plan},
+    request_deadline::RequestDeadline,
     worker::command_budget,
 };
 
@@ -188,29 +189,32 @@ impl ArchiveJobs {
         ctx: SpaceContext,
         input: impl AsyncRead + Unpin,
     ) -> Result<ArtifactId, PortError> {
-        let ctx = self.fresh_writer(&ctx).await?;
-        let artifact = tokio::time::timeout(
-            ctx.budget.remaining,
-            self.artifacts.stage_source(
+        let request = RequestDeadline::new(ctx.budget.clone())?;
+        let ctx = self.fresh_writer(&ctx, &request).await?;
+        let artifact = request
+            .wait(self.artifacts.stage_source(
                 ctx.scope(),
                 input,
                 self.import_limits.compressed_bytes,
-                &ctx.budget.cancellation,
+                &request.budget.cancellation,
                 |id, bytes| {
-                    self.store.reserve_archive_source_upload(
-                        &ctx,
-                        id,
-                        bytes,
-                        self.artifacts.namespace,
-                    )
+                    let mut ctx = ctx.clone();
+                    let request = &request;
+                    async move {
+                        ctx.budget = request.remaining()?;
+                        self.store
+                            .reserve_archive_source_upload(
+                                &ctx,
+                                id,
+                                bytes,
+                                self.artifacts.namespace,
+                            )
+                            .await
+                    }
                 },
-            ),
-        )
-        .await
-        .map_err(|_| {
-            codec::deadline_not_committed("stage_archive_source", "upload deadline exceeded")
-        })??;
-        let ctx = self.fresh_writer(&ctx).await?;
+            ))
+            .await?;
+        let ctx = self.fresh_writer(&ctx, &request).await?;
         let id = artifact.id.clone();
         self.store
             .finish_archive_source_upload(&ctx, artifact)
@@ -223,7 +227,8 @@ impl ArchiveJobs {
         ctx: SpaceContext,
         request: Mutation<ContentJobKind>,
     ) -> Result<Committed<ContentJob>, PortError> {
-        let verified = self.fresh_writer(&ctx).await?;
+        let deadline = RequestDeadline::new(ctx.budget.clone())?;
+        let verified = self.fresh_writer(&ctx, &deadline).await?;
         match &request.input {
             ContentJobKind::Import { .. } => {
                 self.store
@@ -237,16 +242,24 @@ impl ArchiveJobs {
         }
     }
 
-    async fn fresh_writer(&self, ctx: &SpaceContext) -> Result<SpaceContext, PortError> {
+    async fn fresh_writer(
+        &self,
+        ctx: &SpaceContext,
+        deadline: &RequestDeadline,
+    ) -> Result<SpaceContext, PortError> {
         let delegation = JobDelegation::capture(ctx.auth(), ctx.scope())
             .ok_or_else(|| invalid(ValidationReason::InvalidAuthority))?;
-        let verified = self
+        let mut verified = self
             .control
-            .refresh_archive_job(ctx.budget.clone(), &delegation)
+            .refresh_archive_job(deadline.remaining()?, &delegation)
             .await?;
-        let space = self.store.read_space(&verified.scope().space_id).await?;
+        let space = self
+            .store
+            .read_space_with_budget(&verified.scope().space_id, &deadline.remaining()?)
+            .await?;
         space.scope.check(verified.scope())?;
         verified.auth().authorize_space_write(&space.space)?;
+        verified.budget = deadline.remaining()?;
         Ok(verified)
     }
 
@@ -303,18 +316,33 @@ impl ArchiveJobs {
         } else {
             let path = scratch.file("plan.sqlite");
             let archive = archive.into_std().await;
-            job.blocking({
-                let path = path.clone();
-                let scope = job.scope().clone();
-                let id = job.claim().job.id.clone();
-                let limits = self.import_limits;
-                let digest = source.digest;
-                move |cancellation| {
-                    prepare_import(archive, &path, &scope, &id, digest, limits, cancellation)
-                }
-            })
-            .await?;
-            let entries = bind_paths(&self.store, job, path.clone(), root.clone()).await?;
+            let preflight = job
+                .blocking({
+                    let path = path.clone();
+                    let scope = job.scope().clone();
+                    let id = job.claim().job.id.clone();
+                    let limits = self.import_limits;
+                    let digest = source.digest;
+                    move |cancellation| {
+                        Ok(prepare_import(
+                            archive,
+                            &path,
+                            &scope,
+                            &id,
+                            digest,
+                            limits,
+                            cancellation,
+                        ))
+                    }
+                })
+                .await?;
+            if let Err(failure) = preflight {
+                return failure.outcome();
+            }
+            let entries = match bind_paths(&self.store, job, path.clone(), root.clone()).await {
+                Ok(entries) => entries,
+                Err(failure) => return failure.outcome(),
+            };
             let object = self
                 .seal_attempt(
                     job,

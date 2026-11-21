@@ -17,7 +17,7 @@ use crate::{
 };
 use notarium_core::{
     DomainError,
-    auth::{AuthenticatedCredential, EngineAuthContext, Space},
+    auth::{EngineAuthContext, Space},
     classes::{ClassEgressFence, ProviderCurrentContent, ProviderMessage},
     error::{CommitEffect, PortError, ValidationReason},
     ids::*,
@@ -255,17 +255,12 @@ impl ProviderService {
                 &credential.id,
             )?));
         }
-        let expires_at_ms=match auth.credential().ok_or(DomainError::AuthenticationFailed)? {
-            AuthenticatedCredential::Session(id)=>{selectors.push(RevocationSelector::Session(id.clone()));Some(rows!(tx,(i64,),fetch_one,"SELECT expires_at FROM sessions WHERE session_id=$1","SELECT expires_at FROM v1_control.sessions WHERE session_id=$1";id.as_str())?.0)},
-            AuthenticatedCredential::Pat(id)=>rows!(tx,(Option<i64>,),fetch_one,"SELECT expires_at FROM pats WHERE token_id=$1","SELECT expires_at FROM v1_control.pats WHERE token_id=$1";id.as_str())?.0,
-            AuthenticatedCredential::OAuth{token,grant,family}=>{selectors.push(RevocationSelector::OAuthAccess(token.clone()));selectors.push(RevocationSelector::OAuthGrant(grant.clone()));if let Some(family)=family{selectors.push(RevocationSelector::OAuthFamily(family.clone()));}Some(rows!(tx,(i64,),fetch_one,"SELECT expires_at FROM oauth_access_tokens WHERE token_id=$1","SELECT expires_at FROM v1_control.oauth_access_tokens WHERE token_id=$1";token.as_str())?.0)},
-            AuthenticatedCredential::TrustedNone=>None,
-            AuthenticatedCredential::ScheduledRun{schedule,run,..}=>{
-                selectors.push(RevocationSelector::Schedule(schedule.clone()));
-                selectors.push(RevocationSelector::ScheduledRun(run.clone()));
-                Some(rows!(tx,(i64,),fetch_one,"SELECT expires_at FROM agent_schedule_runs WHERE run_id=$1","SELECT expires_at FROM v1_control.agent_schedule_runs WHERE run_id=$1";run.as_str())?.0)
-            },
-        };
+        let expires_at_ms = super::super::sessions::credential_registration(
+            tx,
+            auth.credential().ok_or(DomainError::AuthenticationFailed)?,
+            &mut selectors,
+        )
+        .await?;
         for space in spaces.keys() {
             selectors.push(RevocationSelector::Space(space.clone()));
             selectors.push(RevocationSelector::Membership {

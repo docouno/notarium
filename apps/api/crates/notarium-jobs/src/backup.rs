@@ -33,7 +33,7 @@ use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 use crate::{
     backup_format::{
         CANONICAL, CAS_DATA, CAS_INDEX, CAS_INDEX_MAGIC, CONTROL, CasRecord, MANIFEST, Manifest,
-        Payload, WorkDirectory, copy_hash, invalid, io_error, measure_file,
+        Payload, WorkDirectory, check_history_count, copy_hash, invalid, io_error, measure_file,
     },
     export::{LimitedFile, zip_error},
     import::check_cancelled,
@@ -150,11 +150,9 @@ impl Pair {
         cancellation: Cancellation,
         references: mpsc::Sender<(SpaceId, ContentDigest)>,
     ) -> Result<BackupWorker<()>, PortError> {
-        let file = self.canonical.try_clone().map_err(io_error)?;
         let spool = self.canonical_spool.clone();
         self.workers.spawn(move || {
             snapshot_references(
-                file,
                 spool.path(),
                 spool.receipt().kind,
                 spool.receipt().bytes,
@@ -201,7 +199,11 @@ async fn run_backup_inner(
     options: BackupOptions,
 ) -> Result<BackupArchive, PortError> {
     let started = Instant::now();
-    let work = WorkDirectory::sibling(destination)?;
+    let work = WorkDirectory::sibling(
+        destination,
+        canonical.installation_id(),
+        &ctx.budget.cancellation,
+    )?;
     let mut pair = capture_pair(ctx.clone(), canonical, control).await?;
     let mut budget = ctx.budget;
     budget.remaining = budget.remaining.saturating_sub(started.elapsed());
@@ -463,6 +465,7 @@ async fn capture_spools(
         pause,
     } = canon.capture_paired(ctrl, ctx.budget.clone()).await?;
     let result = async {
+        check_history_count(canonical_cut.witness().histories.len())?;
         if control_cut.witness().installation != *canonical.installation_id()
             || canonical_cut.witness().installation != *canonical.installation_id()
             || !control_cut.witness().histories.is_empty()
@@ -537,17 +540,25 @@ async fn pack_cas(
             check_cancelled(&budget.cancellation)?;
             let scope = history_for(histories, &space)?;
             let (raw, bytes) = mpsc::channel(2);
-            cas_tx
+            if cas_tx
                 .send(CasInput {
                     scope: scope.clone(),
                     digest,
                     bytes,
                 })
                 .await
-                .map_err(|_| invalid(ValidationReason::InvalidState))?;
-            canonical
+                .is_err()
+            {
+                break;
+            }
+            let streamed = canonical
                 .stream_held_blob(budget, &pair.id, scope, digest, &raw)
-                .await?;
+                .await;
+            if raw.is_closed() && matches!(streamed, Err(PortError::Cancelled(_))) {
+                // The packer stopped reading this blob. Collect its underlying error below.
+                break;
+            }
+            streamed?;
         }
         Ok::<_, PortError>(())
     };
@@ -555,8 +566,9 @@ async fn pack_cas(
     drop(cas_tx);
     drop(ref_rx);
     produce?;
+    let packed = writer.wait(&budget.cancellation).await?;
     reader.wait(&budget.cancellation).await?;
-    writer.wait(&budget.cancellation).await
+    Ok(packed)
 }
 
 pub(crate) async fn verify_live_cas(
@@ -602,7 +614,6 @@ pub(crate) async fn verify_live_cas(
 }
 
 fn snapshot_references(
-    file: File,
     path: &Path,
     kind: BackupArtifactKind,
     bytes: u64,
@@ -663,7 +674,7 @@ fn snapshot_references(
                 Ok(())
             })?;
             scan_postgres_spool_v1(
-                file,
+                File::open(path).map_err(io_error)?,
                 bytes,
                 options.max_archive_bytes,
                 options.max_pg_row_bytes,
@@ -793,12 +804,11 @@ fn compress_blob(
 }
 
 fn new_file(path: &Path) -> Result<File, PortError> {
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(io_error)
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options.open(path).map_err(io_error)
 }
 
 fn sqlite_error(error: rusqlite::Error) -> PortError {

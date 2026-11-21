@@ -5,6 +5,7 @@ use std::{
     sync::Arc,
 };
 
+use cap_std::{ambient_authority, fs::Dir};
 use notarium_canonical::codec;
 use notarium_core::{
     DomainError,
@@ -14,7 +15,10 @@ use notarium_core::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::import::check_cancelled;
+use crate::{
+    artifacts::{ScratchDirectory, child_dir},
+    import::check_cancelled,
+};
 
 pub(crate) const MANIFEST: &str = "manifest.json";
 pub(crate) const CONTROL: &str = "db/control";
@@ -30,6 +34,13 @@ pub(crate) const CAS_RECORD_BYTES: u64 = (SPACE_BYTES + 32 + 3 * 8) as u64;
 
 pub(crate) fn raw_cas_limit(max_archive_bytes: u64) -> u64 {
     max_archive_bytes.saturating_mul(8)
+}
+
+pub(crate) fn check_history_count(count: usize) -> Result<(), PortError> {
+    if count > 65_536 {
+        return Err(invalid(ValidationReason::BudgetExceeded));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -97,32 +108,30 @@ impl CasRecord {
 }
 
 #[derive(Clone)]
-pub(crate) struct WorkDirectory(Arc<OwnedWorkDirectory>);
-
-struct OwnedWorkDirectory {
-    path: PathBuf,
-}
+pub(crate) struct WorkDirectory(Arc<ScratchDirectory>);
 
 impl WorkDirectory {
-    pub(crate) fn sibling(destination: &Path) -> Result<Self, PortError> {
+    pub(crate) fn sibling(
+        destination: &Path,
+        installation: &InstallationId,
+        cancellation: &Cancellation,
+    ) -> Result<Self, PortError> {
         let parent = destination
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
-        let name = codec::new_prefixed_hex_id(".notarium-backup-")?;
-        let path = parent.join(name);
-        let mut builder = fs::DirBuilder::new();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            builder.mode(0o700);
-        }
-        builder.create(&path).map_err(io_error)?;
-        Ok(Self(Arc::new(OwnedWorkDirectory { path })))
+        let name = format!(".notarium-backup-{installation}");
+        let parent_dir = Dir::open_ambient_dir(parent, ambient_authority()).map_err(io_error)?;
+        let work = child_dir(&parent_dir, &name, true)?;
+        ScratchDirectory::reap(&work, cancellation, std::time::Duration::ZERO)?;
+        Ok(Self(Arc::new(ScratchDirectory::create_in(
+            &work,
+            &parent.join(name),
+        )?)))
     }
 
     pub(crate) fn path(&self, name: &'static str) -> PathBuf {
-        self.0.path.join(name)
+        self.0.file(name)
     }
 
     pub(crate) fn publish(&self, name: &'static str, destination: &Path) -> Result<(), PortError> {
@@ -139,12 +148,6 @@ impl WorkDirectory {
                     err.kind().to_string(),
                 )
             })
-    }
-}
-
-impl Drop for OwnedWorkDirectory {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
     }
 }
 
@@ -236,4 +239,68 @@ pub(crate) fn invalid(reason: ValidationReason) -> PortError {
 
 pub(crate) fn io_error(err: io::Error) -> PortError {
     codec::internal_not_committed("backup_archive_io", err.kind().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn history_count_includes_the_format_limit() {
+        assert!(check_history_count(65_536).is_ok());
+        assert_eq!(
+            check_history_count(65_537),
+            Err(invalid(ValidationReason::BudgetExceeded))
+        );
+    }
+
+    #[test]
+    fn backup_reclaims_abandoned_packing_files() {
+        const CHILD: &str = "NOTARIUM_TEST_ABANDON_BACKUP_PACK";
+        let installation = InstallationId::from_bytes([9; 16]);
+        let cancellation = Cancellation::default();
+        if let Some(parent) = std::env::var_os(CHILD) {
+            let work = WorkDirectory::sibling(
+                &Path::new(&parent).join("yesterday.zip"),
+                &installation,
+                &cancellation,
+            )
+            .unwrap();
+            fs::write(work.path("cas.data"), b"abandoned").unwrap();
+            std::process::exit(0);
+        }
+        let parent =
+            std::env::temp_dir().join(codec::new_prefixed_hex_id("notarium_pack_test_").unwrap());
+        fs::create_dir(&parent).unwrap();
+        let destination = parent.join("today.zip");
+        let live = WorkDirectory::sibling(&destination, &installation, &cancellation).unwrap();
+        let active = live.path("cas.data");
+        fs::write(&active, b"active").unwrap();
+        let work_root = active.parent().unwrap().parent().unwrap();
+        let foreign = work_root.join("attempt_00000000000000000000000000000000");
+        fs::create_dir(&foreign).unwrap();
+        fs::write(foreign.join("cas.data"), b"unowned").unwrap();
+        assert!(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "backup_format::tests::backup_reclaims_abandoned_packing_files"
+                ])
+                .env(CHILD, &parent)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let abandoned = fs::read_dir(work_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path().join("cas.data"))
+            .find(|file| fs::read(file).ok().as_deref() == Some(b"abandoned"))
+            .unwrap();
+        let next = WorkDirectory::sibling(&destination, &installation, &cancellation).unwrap();
+        assert!(!abandoned.exists());
+        assert_eq!(fs::read(&active).unwrap(), b"active");
+        assert_eq!(fs::read(foreign.join("cas.data")).unwrap(), b"unowned");
+        drop((live, next));
+        fs::remove_dir_all(parent).unwrap();
+    }
 }

@@ -270,7 +270,7 @@ impl ArchiveRunner {
         while !shutdown.is_cancelled() {
             let scopes = self
                 .store
-                .archive_job_scopes(&command_budget(shutdown)?, cursor.as_ref(), limit)
+                .archive_job_scopes(&command_budget(shutdown)?, class, cursor.as_ref(), limit)
                 .await?;
             let reached_end = scopes.len() < usize::from(limit.get());
             for scope in scopes {

@@ -15,7 +15,10 @@ use notarium_core::{
     ids::*,
     ports::*,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 const TOUCH_WINDOW_MS: i64 = 60 * 60 * 1000;
 
@@ -57,6 +60,69 @@ fn restrict(
         })
         .collect())
 }
+pub(super) async fn credential_registration(
+    tx: &mut Transaction,
+    credential: &AuthenticatedCredential,
+    selectors: &mut Vec<RevocationSelector>,
+) -> Result<Option<i64>, PortError> {
+    let expires = match credential {
+        AuthenticatedCredential::Session(id) => {
+            selectors.push(RevocationSelector::Session(id.clone()));
+            Some(
+                rows!(tx, (i64,), fetch_one,
+                "SELECT expires_at FROM sessions WHERE session_id=$1",
+                "SELECT expires_at FROM v1_control.sessions WHERE session_id=$1"; id.as_str())?
+                .0,
+            )
+        }
+        AuthenticatedCredential::Pat(id) => {
+            rows!(tx, (Option<i64>,), fetch_one,
+            "SELECT expires_at FROM pats WHERE token_id=$1",
+            "SELECT expires_at FROM v1_control.pats WHERE token_id=$1"; id.as_str())?
+            .0
+        }
+        AuthenticatedCredential::OAuth {
+            token,
+            grant,
+            family,
+        } => {
+            selectors.push(RevocationSelector::OAuthAccess(token.clone()));
+            selectors.push(RevocationSelector::OAuthGrant(grant.clone()));
+            selectors.extend(family.clone().map(RevocationSelector::OAuthFamily));
+            Some(rows!(tx, (i64,), fetch_one,
+                "SELECT expires_at FROM oauth_access_tokens WHERE token_id=$1",
+                "SELECT expires_at FROM v1_control.oauth_access_tokens WHERE token_id=$1"; token.as_str())?.0)
+        }
+        AuthenticatedCredential::TrustedNone => None,
+        AuthenticatedCredential::ScheduledRun { schedule, run, .. } => {
+            selectors.push(RevocationSelector::Schedule(schedule.clone()));
+            selectors.push(RevocationSelector::ScheduledRun(run.clone()));
+            Some(rows!(tx, (i64,), fetch_one,
+                "SELECT expires_at FROM agent_schedule_runs WHERE run_id=$1",
+                "SELECT expires_at FROM v1_control.agent_schedule_runs WHERE run_id=$1"; run.as_str())?.0)
+        }
+    };
+    Ok(expires)
+}
+
+/// Natural credential expiry does not emit a registry event. Check it at
+/// the same effect boundary as explicit revocation using Control's clock.
+struct ExpiringArchiveLease {
+    registry: Box<dyn RevocationLease>,
+    clock: Arc<dyn super::ControlClock>,
+    expires_at_ms: i64,
+}
+
+impl RevocationLease for ExpiringArchiveLease {
+    fn check(&self) -> Result<(), PortError> {
+        self.registry.check()?;
+        if self.clock.now_ms()? >= self.expires_at_ms {
+            return Err(denied());
+        }
+        Ok(())
+    }
+}
+
 impl ControlService {
     /// Acquire active revocation registration under the same authority locks
     /// used for synchronous effects. A runner drops it after stopping work.
@@ -95,21 +161,9 @@ impl ControlService {
                             principal: delegation.principal().clone(),
                         },
                     ];
-                    match credential {
-                        AuthenticatedCredential::Session(id) => {
-                            selectors.push(RevocationSelector::Session(id));
-                        }
-                        AuthenticatedCredential::OAuth {
-                            token,
-                            grant,
-                            family,
-                        } => {
-                            selectors.push(RevocationSelector::OAuthAccess(token));
-                            selectors.push(RevocationSelector::OAuthGrant(grant));
-                            selectors.extend(family.map(RevocationSelector::OAuthFamily));
-                        }
-                        _ => {}
-                    }
+                    let expires =
+                        credential_registration(tx.inner_mut(), &credential, &mut selectors)
+                            .await?;
                     let lease = self
                         .revoker
                         .register_content_job(
@@ -121,6 +175,14 @@ impl ControlService {
                             budget.cancellation.clone(),
                         )
                         .await?;
+                    let lease: Box<dyn RevocationLease> = match expires {
+                        Some(expires_at_ms) => Box::new(ExpiringArchiveLease {
+                            registry: lease,
+                            clock: self.clock.clone(),
+                            expires_at_ms,
+                        }),
+                        None => lease,
+                    };
                     lease.check()?;
                     Ok((auth, lease))
                 },

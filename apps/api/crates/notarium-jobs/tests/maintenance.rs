@@ -328,7 +328,12 @@ fn sqlite_verifier_protocol_child() {
     }
 }
 
-fn repackage_sqlite(path: &Path, scratch: &Path, statement: &str) -> ArchiveInput {
+fn repackage_sqlite(
+    path: &Path,
+    scratch: &Path,
+    database: &str,
+    statement: &str,
+) -> Cursor<Vec<u8>> {
     let mut source = zip::ZipArchive::new(File::open(path).unwrap()).unwrap();
     let bytes = |source: &mut zip::ZipArchive<File>, name| {
         let mut bytes = Vec::new();
@@ -340,7 +345,14 @@ fn repackage_sqlite(path: &Path, scratch: &Path, statement: &str) -> ArchiveInpu
         bytes
     };
     let image = scratch.join(codec::new_prefixed_hex_id("forged_sqlite_").unwrap());
-    fs::write(&image, bytes(&mut source, "db/canonical")).unwrap();
+    let mut control = bytes(&mut source, "db/control");
+    let mut canonical = bytes(&mut source, "db/canonical");
+    let payload = match database {
+        "control" => &mut control,
+        "canonical" => &mut canonical,
+        _ => panic!("unknown database"),
+    };
+    fs::write(&image, &*payload).unwrap();
     let db = rusqlite::Connection::open(&image).unwrap();
     db.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
     db.execute_batch(statement).unwrap();
@@ -350,21 +362,19 @@ fn repackage_sqlite(path: &Path, scratch: &Path, statement: &str) -> ArchiveInpu
         "ok"
     );
     drop(db);
-    let canonical = fs::read(image).unwrap();
+    *payload = fs::read(image).unwrap();
     let mut manifest: serde_json::Value =
         serde_json::from_slice(&bytes(&mut source, "manifest.json")).unwrap();
-    manifest["canonical"]["bytes"] = canonical.len().into();
-    manifest["canonical"]["digest"] = serde_json::to_value(ContentDigest::from_bytes(
-        *blake3::hash(&canonical).as_bytes(),
-    ))
-    .unwrap();
+    manifest[database]["bytes"] = payload.len().into();
+    manifest[database]["digest"] =
+        serde_json::to_value(ContentDigest::from_bytes(*blake3::hash(payload).as_bytes())).unwrap();
     let opts = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Stored)
         .large_file(true);
     let mut output = zip::ZipWriter::new(Cursor::new(Vec::new()));
     for (name, data) in [
         ("manifest.json", serde_json::to_vec(&manifest).unwrap()),
-        ("db/control", bytes(&mut source, "db/control")),
+        ("db/control", control),
         ("db/canonical", canonical),
         ("cas/index", bytes(&mut source, "cas/index")),
         ("cas/data", bytes(&mut source, "cas/data")),
@@ -372,7 +382,32 @@ fn repackage_sqlite(path: &Path, scratch: &Path, statement: &str) -> ArchiveInpu
         output.start_file(name, opts).unwrap();
         output.write_all(&data).unwrap();
     }
-    ArchiveInput::new(output.finish().unwrap()).unwrap()
+    output.finish().unwrap()
+}
+
+async fn check_restored_note(
+    store: &CanonicalStore,
+    scope: &HistoryScope,
+    owner: &PrincipalId,
+    note: NoteId,
+    expected: &str,
+) {
+    let ctx = auth(scope, owner);
+    let snapshot = store
+        .get_note(
+            ctx.clone(),
+            GetNote {
+                note,
+                revision: None,
+                causal: CausalBasis::Exact(ReceiptSet::default()),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        snapshot.document.explicit_read(ctx.auth()).unwrap(),
+        expected
+    );
 }
 
 async fn held_export(
@@ -549,6 +584,25 @@ async fn paired_archive_completes_with_a_single_caller_blocking_thread() {
         .unwrap();
     assert_eq!(report.blobs, 20);
     assert!(archive.is_file());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&archive).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+    let limited_path = scratch.0.join("one-record.zip");
+    let limited = BackupOptions {
+        max_index_records: 1,
+        ..sqlite_backup_options()
+    };
+    assert!(matches!(
+        run_backup(authority(ServicePurpose::Backup), &canonical, &binding, &limited_path, limited).await,
+        Err(notarium_core::error::PortError::Domain(notarium_core::DomainError::ValidationFailed { diagnostic }))
+            if diagnostic.reason == notarium_core::error::ValidationReason::BudgetExceeded
+    ));
+    assert!(!limited_path.exists());
     assert_eq!(
         canonical
             .execute_diagnostic_read_sql_for_test(None, "SELECT count(*) FROM backup_holds")
@@ -702,6 +756,7 @@ async fn sqlite_archive_verification_restore_and_rejection() {
             let image = repackage_sqlite(
                 &destination,
                 &scratch.0,
+                "canonical",
                 &format!(
                     "PRAGMA page_size={page_size}; VACUUM;
                      PRAGMA secure_delete=OFF;
@@ -713,7 +768,7 @@ async fn sqlite_archive_verification_restore_and_rejection() {
             let before = fs::read_dir(&scratch.0).unwrap().count();
             let result = run_fsck(
                 authority(ServicePurpose::Fsck),
-                FsckInput::Archive(image),
+                FsckInput::Archive(ArchiveInput::new(image).unwrap()),
                 &root.keyring(),
                 sqlite_backup_options(),
             )
@@ -759,29 +814,71 @@ async fn sqlite_archive_verification_restore_and_rejection() {
     assert!(failed.is_err());
     assert!(!reject.root().exists());
 
-    for corruption in [
-        "DELETE FROM folder_heads WHERE is_root=1;".to_owned(),
-        format!(
-            "DELETE FROM blob_references WHERE owner_kind='note_revision' AND owner_id='{}';
-                  UPDATE blob_catalog SET ref_count=1 WHERE ref_count=2;",
-            NoteId::from_bytes([9; 16])
+    let reject_parent = scratch.0.join("reject-before-install");
+    fs::create_dir(&reject_parent).unwrap();
+    let missing_owner = format!(
+        "DELETE FROM blob_references WHERE owner_kind='note_revision' AND owner_id='{}';
+         UPDATE blob_catalog SET ref_count=1 WHERE ref_count=2;",
+        NoteId::from_bytes([9; 16])
+    );
+    for (database, corruption) in [
+        ("canonical", "DELETE FROM folder_heads WHERE is_root=1"),
+        ("canonical", missing_owner.as_str()),
+        (
+            "canonical",
+            "DROP INDEX uq_spaces_slug_fold; CREATE INDEX uq_spaces_slug_fold ON spaces(slug_fold)",
         ),
-        "DROP INDEX uq_spaces_slug_fold; CREATE INDEX uq_spaces_slug_fold ON spaces(slug_fold);"
-            .to_owned(),
+        (
+            "canonical",
+            "UPDATE blob_catalog SET blob_state='corrupt' WHERE ref_count>0",
+        ),
+        (
+            "canonical",
+            "UPDATE blob_catalog SET admission_state='retiring' WHERE ref_count>0",
+        ),
+        ("control", "DELETE FROM _sqlx_migrations WHERE version=1"),
+        (
+            "control",
+            "UPDATE _sqlx_migrations SET checksum=zeroblob(48) WHERE version=1",
+        ),
+        (
+            "control",
+            "UPDATE _sqlx_migrations SET success=0 WHERE version=1",
+        ),
     ] {
-        let forged = repackage_sqlite(&destination, &scratch.0, &corruption);
+        let forged = repackage_sqlite(&destination, &scratch.0, database, corruption);
+        let checked = run_fsck(
+            authority(ServicePurpose::Fsck),
+            FsckInput::Archive(ArchiveInput::new(forged.clone()).unwrap()),
+            &root.keyring(),
+            sqlite_backup_options(),
+        )
+        .await;
+        assert!(
+            matches!(
+                checked,
+                Err(notarium_core::error::PortError::Domain(
+                    notarium_core::DomainError::ValidationFailed { .. }
+                ))
+            ),
+            "{corruption}: {checked:?}"
+        );
         let rejected = run_restore(
             authority(ServicePurpose::Restore),
-            forged,
+            ArchiveInput::new(forged).unwrap(),
             RestoreTarget::Local {
-                root: reject.clone(),
+                root: DataRoot::new(reject_parent.join("target")),
                 keyring: RestoreKeyring::External(root.keyring()),
             },
             sqlite_backup_options(),
         )
         .await;
         assert!(rejected.is_err(), "{corruption}");
-        assert!(!reject.root().exists());
+        assert_eq!(
+            fs::read_dir(&reject_parent).unwrap().count(),
+            0,
+            "{corruption}"
+        );
     }
 
     for (target, existing) in [("absent", false), ("existing", true)] {
@@ -803,9 +900,30 @@ async fn sqlite_archive_verification_restore_and_rejection() {
         } else {
             RestoreKeyring::External(root.keyring())
         };
+        let archive = if existing {
+            open(&destination)
+        } else {
+            let legacy = repackage_sqlite(
+                &destination,
+                &scratch.0,
+                "canonical",
+                "DROP INDEX idx_content_jobs_claim; CREATE INDEX idx_content_jobs_claim
+                 ON content_jobs (space_id, state, lease_until_ms, job_id)",
+            );
+            let report = run_fsck(
+                authority(ServicePurpose::Fsck),
+                FsckInput::Archive(ArchiveInput::new(legacy.clone()).unwrap()),
+                &root.keyring(),
+                sqlite_backup_options(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(report.spaces, 1);
+            ArchiveInput::new(legacy).unwrap()
+        };
         let result = run_restore(
             authority(ServicePurpose::Restore),
-            open(&destination),
+            archive,
             RestoreTarget::Local {
                 root: restored.clone(),
                 keyring,
@@ -817,6 +935,13 @@ async fn sqlite_archive_verification_restore_and_rejection() {
         assert_ne!(result.histories[0].scope.incarnation, scope.incarnation);
         assert_eq!(result.histories[0].scope.space_id, scope.space_id);
         assert!(!restored.restore_guard().exists());
+        assert!(!fs::read_dir(&scratch.0).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".notarium-restore-generation-")
+        }));
         #[cfg(unix)]
         if let Some(initial) = initial {
             use std::os::unix::fs::MetadataExt;
@@ -827,9 +952,26 @@ async fn sqlite_archive_verification_restore_and_rejection() {
         )
         .await
         .unwrap();
+        let first_key: String = rusqlite::Connection::open(restored.canonical())
+            .unwrap()
+            .query_row(
+                "SELECT name FROM pragma_index_info('idx_content_jobs_claim') WHERE seqno=0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(first_key, "state");
         concurrent_write
             .check_restored(&restored_canonical, &owner, &result.histories[0])
             .await;
+        check_restored_note(
+            &restored_canonical,
+            &result.histories[0].scope,
+            &owner,
+            NoteId::from_bytes([9; 16]),
+            body,
+        )
+        .await;
         let bytes = restored_canonical
             .read_verified_blob(
                 &result.histories[0].scope,
@@ -839,6 +981,10 @@ async fn sqlite_archive_verification_restore_and_rejection() {
             .unwrap();
         assert_eq!(bytes, body.as_bytes());
         let restored_control = ControlStore::sqlite(&restored).await.unwrap();
+        #[cfg(unix)]
+        if existing {
+            replay_published_local(&restored, &root, &destination, &result).await;
+        }
         let location = if existing {
             KeyringLocation::LocalDefault(restored)
         } else {
@@ -856,6 +1002,68 @@ async fn sqlite_archive_verification_restore_and_rejection() {
     drop(binding);
     control.close().await;
     runtime.shutdown().await.unwrap();
+}
+
+#[cfg(unix)]
+async fn replay_published_local(
+    restored: &DataRoot,
+    saved_keys: &DataRoot,
+    archive: &Path,
+    report: &notarium_jobs::RestoreReport,
+) {
+    use std::os::unix::fs::MetadataExt;
+    let identity = |path: &Path| {
+        let metadata = fs::metadata(path).unwrap();
+        serde_json::json!({"device": metadata.dev(), "inode": metadata.ino()})
+    };
+    let parent = restored.root().parent().unwrap();
+    let name = codec::new_prefixed_hex_id(".notarium-restore-generation-").unwrap();
+    let stage = DataRoot::new(parent.join(&name));
+    let backups = stage.staging().join("backups");
+    fs::create_dir_all(&backups).unwrap();
+    fs::hard_link(restored.manifest(), stage.manifest()).unwrap();
+    fs::write(stage.restore_guard(), report.archive_digest.to_hex()).unwrap();
+    let components: Vec<_> = ["v1", "blobs", "secret-keyring"]
+        .iter()
+        .map(|name| (*name, identity(&restored.root().join(name))))
+        .collect();
+    let journal = serde_json::json!({
+        "version": 1, "installation": report.installation, "digest": report.archive_digest,
+        "existing": identity(restored.root()), "external_keyring": false,
+        "histories": report.histories, "stage": name,
+        "phase": {"name": "Install", "directory": identity(stage.root()), "components": components}
+    });
+    let key = blake3::hash(restored.root().file_name().unwrap().as_encoded_bytes());
+    let pending = parent.join(format!(".notarium-restore-{key}.json"));
+    fs::write(&pending, serde_json::to_vec(&journal).unwrap()).unwrap();
+    assert!(restored.staging().join("backups").is_dir());
+    let live_file = restored.root().join("operator.txt");
+    fs::write(&live_file, b"keep").unwrap();
+    let foreign = backups.join("operator.txt");
+    fs::write(&foreign, b"keep too").unwrap();
+    let target = RestoreTarget::Local {
+        root: restored.clone(),
+        keyring: RestoreKeyring::ProvisionDefault {
+            separately_saved: saved_keys.keyring(),
+        },
+    };
+    let retry = || {
+        run_restore(
+            authority(ServicePurpose::Restore),
+            open(archive),
+            target.clone(),
+            sqlite_backup_options(),
+        )
+    };
+    assert!(retry().await.is_err());
+    assert_eq!(fs::read(&foreign).unwrap(), b"keep too");
+    assert!(pending.exists());
+    fs::remove_file(foreign).unwrap();
+    let recovered = retry().await.unwrap();
+    assert_eq!(recovered.histories, report.histories);
+    assert_eq!(fs::read(live_file).unwrap(), b"keep");
+    assert!(!stage.root().exists());
+    assert!(!pending.exists());
 }
 
 #[derive(serde::Deserialize)]
@@ -991,12 +1199,14 @@ async fn cloud_archive_verification_and_restore_to_an_independent_namespace() {
 
     let mut source = fixture.database();
     let mut target = source.clone();
+    let mut competing = source.clone();
     let mut admin = PgConnection::connect_with(&build_pg_connect_options(&source))
         .await
         .unwrap();
     source.database = codec::new_prefixed_hex_id("jobs_src_").unwrap();
     target.database = codec::new_prefixed_hex_id("jobs_dst_").unwrap();
-    for database in [&source.database, &target.database] {
+    competing.database = codec::new_prefixed_hex_id("jobs_compete_").unwrap();
+    for database in [&source.database, &target.database, &competing.database] {
         QueryBuilder::<Postgres>::new("CREATE DATABASE ")
             .push(database)
             .build()
@@ -1131,7 +1341,29 @@ async fn cloud_archive_verification_and_restore_to_an_independent_namespace() {
     assert!(!wrong_count.exists());
     assert!(paired_load::artifact_files(&failed_spools).is_empty());
     assert!(paired_load::artifact_files(&root.staging().join("control")).is_empty());
-    sqlx::query("UPDATE v1_canonical.blob_catalog SET ref_count=1 WHERE space_id=$1")
+    for (admission, state) in [("retiring", "active"), ("open", "corrupt")] {
+        sqlx::query("UPDATE v1_canonical.blob_catalog SET ref_count=1,admission_state=$2,blob_state=$3 WHERE space_id=$1")
+            .bind(scope.space_id.as_str())
+            .bind(admission)
+            .bind(state)
+            .execute(&mut src_sql)
+            .await
+            .unwrap();
+        assert!(
+            run_fsck(
+                authority(ServicePurpose::Fsck),
+                FsckInput::Live {
+                    canonical: &store,
+                    control: &adapter
+                },
+                &root.keyring(),
+                BackupOptions::default(),
+            )
+            .await
+            .is_err()
+        );
+    }
+    sqlx::query("UPDATE v1_canonical.blob_catalog SET admission_state='open',blob_state='active' WHERE space_id=$1")
         .bind(scope.space_id.as_str())
         .execute(&mut src_sql)
         .await
@@ -1151,7 +1383,7 @@ async fn cloud_archive_verification_and_restore_to_an_independent_namespace() {
                     ..Preconditions::default()
                 },
                 input: RenameNote {
-                    note,
+                    note: note.clone(),
                     slug: "long-title-with-alias".into(),
                     title: None,
                 },
@@ -1196,12 +1428,39 @@ async fn cloud_archive_verification_and_restore_to_an_independent_namespace() {
         (validated.spaces, validated.blobs, validated.readable_keys),
         (1, 1, 1)
     );
-    let target_spec = RestoreTarget::Cloud(Box::new(CloudRestoreTarget {
+    let live = run_fsck(
+        authority(ServicePurpose::Fsck),
+        FsckInput::Live {
+            canonical: &store,
+            control: &adapter,
+        },
+        &root.keyring(),
+        BackupOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (
+            live.spaces,
+            live.blobs,
+            live.raw_blob_bytes,
+            live.readable_keys
+        ),
+        (
+            validated.spaces,
+            validated.blobs,
+            validated.raw_blob_bytes,
+            validated.readable_keys
+        )
+    );
+    let cloud_target = CloudRestoreTarget {
         database: target.clone(),
         object_store: target_s3.clone(),
         scratch: root.clone(),
         external_keyring: root.keyring(),
-    }));
+    };
+    competing_cloud_restore(&path, &cloud_target, &competing).await;
+    let target_spec = RestoreTarget::Cloud(Box::new(cloud_target));
     let restored = run_restore(
         authority(ServicePurpose::Restore),
         open(&path),
@@ -1223,13 +1482,21 @@ async fn cloud_archive_verification_and_restore_to_an_independent_namespace() {
     let (restored_store, restored_runtime) = CanonicalRuntime::open(cloud_config(
         installation.clone(),
         target.clone(),
-        target_s3,
+        target_s3.clone(),
     ))
     .await
     .unwrap();
     concurrent_write
         .check_restored(&restored_store, &owner, &restored.histories[0])
         .await;
+    check_restored_note(
+        &restored_store,
+        &restored.histories[0].scope,
+        &owner,
+        note,
+        &carrier,
+    )
+    .await;
     let content = notarium_syntax::content_digest(&carrier);
     assert_eq!(
         restored_store
@@ -1281,7 +1548,7 @@ async fn cloud_archive_verification_and_restore_to_an_independent_namespace() {
     let replay = run_restore(
         authority(ServicePurpose::Restore),
         open(&path),
-        target_spec,
+        target_spec.clone(),
         BackupOptions::default(),
     )
     .await
@@ -1311,6 +1578,39 @@ async fn cloud_archive_verification_and_restore_to_an_independent_namespace() {
     drop(new_keys);
     restored_control.close().await;
     restored_runtime.shutdown().await.unwrap();
+    let mut legacy = PgConnection::connect_with(&build_pg_connect_options(&target))
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE notarium_restore.readiness DROP COLUMN namespace_owner")
+        .execute(&mut legacy)
+        .await
+        .unwrap();
+    legacy.close().await.unwrap();
+    let legacy_retry = run_restore(
+        authority(ServicePurpose::Restore),
+        open(&path),
+        target_spec,
+        BackupOptions::default(),
+    )
+    .await;
+    assert!(matches!(legacy_retry,
+        Err(notarium_core::error::PortError::Domain(notarium_core::DomainError::ValidationFailed { diagnostic }))
+            if diagnostic.reason == notarium_core::error::ValidationReason::InvalidState));
+    let (legacy_store, legacy_runtime) = CanonicalRuntime::open(cloud_config(
+        installation.clone(),
+        target.clone(),
+        target_s3,
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        legacy_store
+            .read_verified_blob(live_scope, content)
+            .await
+            .unwrap(),
+        carrier.as_bytes()
+    );
+    legacy_runtime.shutdown().await.unwrap();
     paired_load::capture_under_load(&store, &adapter, &root, &scope, &owner, "postgres").await;
     cloud_takeover::exercise(
         &store,
@@ -1325,7 +1625,7 @@ async fn cloud_archive_verification_and_restore_to_an_independent_namespace() {
     control.close().await;
     runtime.shutdown().await.unwrap();
     src_sql.close().await.unwrap();
-    for database in [&source.database, &target.database] {
+    for database in [&source.database, &target.database, &competing.database] {
         QueryBuilder::<Postgres>::new("DROP DATABASE ")
             .push(database)
             .build()
@@ -1333,4 +1633,94 @@ async fn cloud_archive_verification_and_restore_to_an_independent_namespace() {
             .await
             .unwrap();
     }
+}
+
+async fn competing_cloud_restore(
+    archive: &Path,
+    target: &notarium_jobs::CloudRestoreTarget,
+    competing: &notarium_canonical::PgConnectConfig,
+) {
+    use notarium_canonical::build_pg_connect_options;
+    use sqlx::{Connection, PgConnection};
+
+    let mut first = PgConnection::connect_with(&build_pg_connect_options(&target.database))
+        .await
+        .unwrap();
+    let mut second = PgConnection::connect_with(&build_pg_connect_options(competing))
+        .await
+        .unwrap();
+    // Delay the second journal after it observed empty S3 and before it commits.
+    sqlx::raw_sql(
+        "CREATE FUNCTION public.wait_for_restore() RETURNS event_trigger LANGUAGE plpgsql AS $$
+           BEGIN PERFORM pg_advisory_xact_lock(19482159); END; $$;
+         CREATE EVENT TRIGGER wait_for_restore ON ddl_command_end WHEN TAG IN ('CREATE SCHEMA')
+           EXECUTE FUNCTION public.wait_for_restore();
+         SELECT pg_advisory_lock(19482159);",
+    )
+    .execute(&mut second)
+    .await
+    .unwrap();
+    // Fail the first PostgreSQL acknowledgement of the durable S3 claim.
+    sqlx::raw_sql(
+        "CREATE FUNCTION public.reject_claim_ack() RETURNS trigger LANGUAGE plpgsql AS $$
+           BEGIN RAISE EXCEPTION 'interrupt namespace claim'; END; $$;
+         CREATE FUNCTION public.interrupt_restore() RETURNS event_trigger LANGUAGE plpgsql AS $$
+           BEGIN
+             CREATE TRIGGER reject_claim_ack BEFORE UPDATE ON notarium_restore.readiness
+                 FOR EACH ROW EXECUTE FUNCTION public.reject_claim_ack();
+           END; $$;
+         CREATE EVENT TRIGGER interrupt_restore ON ddl_command_end WHEN TAG IN ('CREATE TABLE')
+           EXECUTE FUNCTION public.interrupt_restore();",
+    )
+    .execute(&mut first)
+    .await
+    .unwrap();
+    let mut rival = target.clone();
+    rival.database = competing.clone();
+    let waiting = tokio::spawn(run_restore(
+        authority(ServicePurpose::Restore),
+        open(archive),
+        RestoreTarget::Cloud(Box::new(rival)),
+        BackupOptions::default(),
+    ));
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let blocked: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND NOT granted
+                   AND objid=19482159 AND database=(SELECT oid FROM pg_database WHERE datname=current_database()))"
+            ).fetch_one(&mut second).await.unwrap();
+            if blocked { break; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.expect("competing restore observed an empty prefix");
+    let stopped = run_restore(
+        authority(ServicePurpose::Restore),
+        open(archive),
+        RestoreTarget::Cloud(Box::new(target.clone())),
+        BackupOptions::default(),
+    )
+    .await;
+    assert!(stopped.is_err());
+    let pending: bool = sqlx::query_scalar(
+        "SELECT phase='reserving' AND NOT canonical_loaded FROM notarium_restore.readiness WHERE singleton=1"
+    ).fetch_one(&mut first).await.unwrap();
+    assert!(pending);
+    sqlx::query("SELECT pg_advisory_unlock(19482159)")
+        .execute(&mut second)
+        .await
+        .unwrap();
+    assert!(waiting.await.unwrap().is_err());
+    let lost: bool = sqlx::query_scalar(
+        "SELECT phase='reserving' AND NOT canonical_loaded FROM notarium_restore.readiness WHERE singleton=1"
+    ).fetch_one(&mut second).await.unwrap();
+    assert!(lost);
+    sqlx::raw_sql(
+        "DROP EVENT TRIGGER interrupt_restore;
+                   DROP TRIGGER reject_claim_ack ON notarium_restore.readiness",
+    )
+    .execute(&mut first)
+    .await
+    .unwrap();
+    first.close().await.unwrap();
+    second.close().await.unwrap();
 }

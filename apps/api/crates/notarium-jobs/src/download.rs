@@ -1,7 +1,7 @@
-use std::{future::Future, sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use bytes::Bytes;
-use notarium_canonical::{codec, peers::archive_export::CommittedExport};
+use notarium_canonical::peers::archive_export::CommittedExport;
 use notarium_core::{
     DomainError,
     auth::JobDelegation,
@@ -9,63 +9,11 @@ use notarium_core::{
     ids::{ArtifactId, ContentDigest},
     ports::{CallBudget, SpaceContext},
 };
-use tokio::{
-    sync::{Mutex, mpsc},
-    time::Instant,
-};
+use tokio::sync::{Mutex, mpsc};
 
-use crate::{ArchiveJobs, artifacts::DownloadSource, import::check_cancelled};
+use crate::{ArchiveJobs, artifacts::DownloadSource, request_deadline::RequestDeadline};
 
 const MAX_CHUNK_BYTES: usize = 256 * 1024;
-
-struct RequestDeadline {
-    budget: CallBudget,
-    ends: Instant,
-}
-
-impl RequestDeadline {
-    fn new(budget: CallBudget) -> Result<Self, PortError> {
-        let ends = Instant::now()
-            .checked_add(budget.remaining)
-            .ok_or_else(|| DomainError::validation(ValidationReason::InvalidRange))?;
-        Ok(Self { budget, ends })
-    }
-
-    fn check(&self) -> Result<Duration, PortError> {
-        check_cancelled(&self.budget.cancellation)?;
-        let remaining = self.ends.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(deadline_error());
-        }
-        Ok(remaining)
-    }
-
-    fn remaining(&self) -> Result<CallBudget, PortError> {
-        Ok(CallBudget {
-            remaining: self.check()?,
-            ..self.budget.clone()
-        })
-    }
-
-    async fn wait<T>(
-        &self,
-        operation: impl Future<Output = Result<T, PortError>>,
-    ) -> Result<T, PortError> {
-        self.check()?;
-        tokio::select! {
-            biased;
-            () = self.budget.cancellation.cancelled() => {
-                Err(codec::cancelled_not_committed("archive_download", "download cancelled"))
-            }
-            () = tokio::time::sleep_until(self.ends) => Err(deadline_error()),
-            result = operation => result,
-        }
-    }
-}
-
-fn deadline_error() -> PortError {
-    codec::deadline_not_committed("archive_download", "download deadline exceeded")
-}
 
 #[derive(Clone, Debug)]
 pub struct ArchiveDownloadMetadata {
@@ -249,36 +197,12 @@ impl ArchiveDownload {
             .handoff_export_chunk(&budget, ctx.scope(), &current, move || {
                 request.check()?;
                 registration.check()?;
-                if let Some(source_registration) = source_registration {
+                if let Some(source_registration) = &source_registration {
                     source_registration.check()?;
                 }
                 output(bytes)
             })
             .await?;
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use notarium_core::{ids::RequestId, ports::Cancellation};
-
-    #[tokio::test]
-    async fn a_waiting_read_uses_the_original_request_deadline() {
-        let request = RequestDeadline::new(CallBudget {
-            request: RequestId::from_bytes([1; 16]),
-            remaining: Duration::from_millis(10),
-            cancellation: Cancellation::default(),
-        })
-        .unwrap();
-        let result = request
-            .wait(std::future::pending::<Result<(), PortError>>())
-            .await;
-        assert!(matches!(result, Err(PortError::DeadlineExceeded(_))));
-        assert!(matches!(
-            request.remaining(),
-            Err(PortError::DeadlineExceeded(_))
-        ));
     }
 }

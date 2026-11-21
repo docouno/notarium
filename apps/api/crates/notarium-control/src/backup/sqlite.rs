@@ -203,6 +203,9 @@ impl SqliteCut {
             return Err(failure());
         }
         drop(statement);
+        if !crate::store::sqlite_migrations_applied(destination).map_err(|_| failure())? {
+            return Err(failure());
+        }
         self.destination
             .take()
             .ok_or_else(failure)?

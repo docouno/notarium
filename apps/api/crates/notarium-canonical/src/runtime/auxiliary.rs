@@ -79,6 +79,17 @@ impl CanonicalStore {
                     })
                 })
                 .await?;
+            #[cfg(feature = "test-support")]
+            if store
+                .writer_faults()?
+                .drop_auxiliary_commit_response_once
+                .swap(false, Ordering::AcqRel)
+            {
+                return Err(unknown_commit_non_idempotent(
+                    "auxiliary_commit_ack",
+                    "injected loss after SQL commit",
+                ));
+            }
             after_commit(result)
         });
         let mut pending = PendingWrite { permission, task };

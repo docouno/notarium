@@ -737,6 +737,18 @@ pub enum JobState {
     Failed,
     Cancelled,
 }
+/// A preflight rejection visible to the original import caller on a job detail read.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ImportDiagnostic {
+    pub reason: ValidationReason,
+    /// A portable relative archive path, omitted when the entry name itself is unsafe.
+    pub path: Option<String>,
+}
+
+impl ImportDiagnostic {
+    pub const MAX_PATH_DEPTH: usize = 64;
+}
+
 #[derive(Clone, Debug)]
 pub struct ContentJob {
     pub id: JobId,
@@ -746,6 +758,7 @@ pub struct ContentJob {
     pub total_units: Option<u64>,
     pub lease: LeaseEpoch,
     pub artifacts: Vec<ArtifactId>,
+    pub import_diagnostic: Option<ImportDiagnostic>,
 }
 #[derive(Clone, Debug)]
 pub struct JobQuery {

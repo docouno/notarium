@@ -16,17 +16,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     CanonicalStore, ClaimedContentJob,
-    blobs::lock_and_check_space_tx,
+    blobs::{BlobCodecTag, lock_and_check_space_tx},
     codec::{
-        MAX_MSGPACK_DECODE_BYTES, decode_msgpack_bounded, encode_msgpack, internal_not_committed,
-        normalize_slug_key,
+        MAX_MSGPACK_DECODE_BYTES, RevisionMetadataEnvelope, RevisionMetadataPayload,
+        decode_msgpack_bounded, encode_msgpack, internal_not_committed, normalize_slug_key,
     },
     domain::{
         common::{
-            CommandDeadline, StoredCommittedNoteRevV1, active_note_sibling_exists_tx,
-            build_resource_facts_tx,
+            CommandDeadline, CurrentSpaceSchema, StoredCommittedNoteRevV1,
+            active_note_sibling_exists_tx, build_resource_facts_tx, load_current_space_schema_tx,
         },
-        notes::{analyze_and_prepare_carrier, build_create_note_intent},
+        notes::{analyze_and_prepare_carrier, build_create_note_intent, created_note_metadata},
     },
     runtime::load_space_record,
     sql_exec::BackendConn,
@@ -98,6 +98,38 @@ pub struct PlannedImportNote {
     pub ordinal: u64,
     pub parent: ImportParent,
     pub note: CreateNote,
+}
+
+/// Validates the final carrier under the Space schema observed before plan publication.
+pub struct ImportPreflight {
+    schema: Option<CurrentSpaceSchema>,
+    codec: BlobCodecTag,
+    staged_byte_limit: u64,
+}
+
+impl ImportPreflight {
+    pub fn validate_note(&self, note: &CreateNote, parent: &ImportParent) -> Result<(), PortError> {
+        let info = analyze_and_prepare_carrier(
+            &note.carrier,
+            note.class,
+            &note.note,
+            &note.slug,
+            self.codec,
+        )?;
+        if info.prepared_blob.compressed_size() > self.staged_byte_limit {
+            return Err(invalid(ValidationReason::BudgetExceeded));
+        }
+        let metadata = created_note_metadata(
+            note,
+            parent.folder(),
+            parent.ancestors.is_empty(),
+            normalize_slug_key(&note.slug)?,
+            info,
+            self.schema.as_ref(),
+        );
+        RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Note(metadata)).encode()?;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -274,6 +306,26 @@ impl ImportFence {
 }
 
 impl CanonicalStore {
+    pub async fn import_preflight(&self, ctx: &SpaceContext) -> Result<ImportPreflight, PortError> {
+        let scope = ctx.scope().clone();
+        let auth = ctx.auth().clone();
+        let schema = self
+            .with_read_tx_budget(Some(&ctx.budget), |tx| {
+                Box::pin(async move {
+                    let live = load_space_record(tx, &scope.space_id).await?;
+                    live.scope.check(&scope)?;
+                    auth.authorize_space_write(&live.space)?;
+                    load_current_space_schema_tx(tx, &scope.space_id).await
+                })
+            })
+            .await?;
+        Ok(ImportPreflight {
+            schema,
+            codec: self.blob_codec(),
+            staged_byte_limit: self.inner.config.writer.staged_byte_limit(),
+        })
+    }
+
     pub async fn create_archive_import_job(
         &self,
         ctx: SpaceContext,
@@ -620,7 +672,10 @@ impl CanonicalStore {
         space.scope.check(ctx.scope())?;
         ctx.auth().authorize_space_write(&space.space)?;
         let fence = Arc::new(ImportFence::new(ctx.scope(), claim, plan));
+        let byte_limit = self.inner.config.writer.staged_byte_limit();
+        let mut groups = Vec::new();
         let mut intents = Vec::with_capacity(notes.len());
+        let mut group_bytes = 0;
         for PlannedImportNote {
             ordinal,
             parent,
@@ -642,6 +697,9 @@ impl CanonicalStore {
             })
             .await
             .map_err(|err| internal_not_committed("prepare_import_note", err.to_string()))??;
+            if info.prepared_blob.compressed_size() > byte_limit {
+                return Err(invalid(ValidationReason::BudgetExceeded));
+            }
             let ticket = deadline
                 .prepare(&ctx.budget, || {
                     self.stage_blob_for_batch(&space.scope, space.active_epoch, &info.prepared_blob)
@@ -680,21 +738,35 @@ impl CanonicalStore {
                     execute(tx, item).await
                 })
             });
+            if intent.staged_bytes > byte_limit {
+                return Err(invalid(ValidationReason::BudgetExceeded));
+            }
+            if intent.staged_bytes > byte_limit - group_bytes {
+                groups.push(std::mem::take(&mut intents));
+                group_bytes = 0;
+            }
+            group_bytes += intent.staged_bytes;
             intents.push(intent);
         }
+        groups.push(intents);
         let mut budget = ctx.budget.clone();
-        budget.remaining = deadline.remaining(&ctx.budget)?;
-        let (outcomes, _) = self
-            .submit_archive_write_batch::<StoredCommittedNoteRevV1>(
-                &budget,
-                &space.scope.space_id,
-                intents,
-            )
-            .await?;
-        Ok(outcomes
-            .into_iter()
-            .map(|outcome| outcome.map(drop))
-            .collect())
+        let mut results = Vec::new();
+        for group in groups {
+            budget.remaining = deadline.remaining(&ctx.budget)?;
+            let (outcomes, _) = self
+                .submit_archive_write_batch::<StoredCommittedNoteRevV1>(
+                    &budget,
+                    &space.scope.space_id,
+                    group,
+                )
+                .await?;
+            let failed = outcomes.iter().any(Result::is_err);
+            results.extend(outcomes.into_iter().map(|outcome| outcome.map(drop)));
+            if failed {
+                break;
+            }
+        }
+        Ok(results)
     }
 }
 

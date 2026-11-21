@@ -12,7 +12,7 @@ use notarium_core::{
     error::{PortError, ValidationReason},
     ids::{ContentDigest, FolderId, JobId, NoteId},
     model::HistoryScope,
-    ports::Cancellation,
+    ports::{Cancellation, ImportDiagnostic},
     value::YamlValue,
 };
 use notarium_syntax::{
@@ -47,7 +47,7 @@ impl Default for ImportLimits {
             compressed_bytes: 2048 * MIB,
             expanded_bytes: 8192 * MIB,
             entries: 100_000,
-            depth: 64,
+            depth: ImportDiagnostic::MAX_PATH_DEPTH,
             carrier_bytes: 16 * MIB,
             max_ratio: 200,
         }
@@ -76,6 +76,61 @@ impl ImportLimits {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct PreflightError {
+    error: PortError,
+    path: Option<String>,
+}
+
+impl From<PortError> for PreflightError {
+    fn from(error: PortError) -> Self {
+        Self { error, path: None }
+    }
+}
+
+impl From<DomainError> for PreflightError {
+    fn from(error: DomainError) -> Self {
+        PortError::from(error).into()
+    }
+}
+
+impl PreflightError {
+    fn at(error: PortError, path: &str) -> Self {
+        let path =
+            notarium_syntax::unicode::portable_archive_path(path, ImportDiagnostic::MAX_PATH_DEPTH)
+                .ok();
+        Self { error, path }
+    }
+
+    fn for_entry<T>(path: &str, work: impl FnOnce() -> Result<T, PortError>) -> Result<T, Self> {
+        work().map_err(|error| Self::at(error, path))
+    }
+
+    pub(crate) fn outcome(self) -> Result<notarium_canonical::JobCompletionOutcome, PortError> {
+        let reason = match self.error {
+            PortError::Domain(DomainError::ValidationFailed { diagnostic }) => diagnostic.reason,
+            PortError::Domain(DomainError::PathConflict { .. }) => {
+                ValidationReason::ArchivePathConflict
+            }
+            PortError::Domain(DomainError::UnsafePlaintextOutsideAgeFence) => {
+                ValidationReason::InvalidAgeCarrier
+            }
+            PortError::Domain(
+                DomainError::SpaceReadOnly
+                | DomainError::AccessDenied
+                | DomainError::AbilityWriteForbidden,
+            ) => ValidationReason::InvalidAuthority,
+            other => return Err(other),
+        };
+        Ok(notarium_canonical::JobCompletionOutcome::ImportRejected(
+            ImportDiagnostic {
+                reason,
+                path: self.path,
+            },
+        ))
+    }
+}
+
 /// A private staging index. Canonical path checks and sealing happen after
 /// archive preflight, so a rejected archive cannot allocate canonical IDs.
 pub(crate) fn prepare_import(
@@ -86,7 +141,7 @@ pub(crate) fn prepare_import(
     source_digest: ContentDigest,
     limits: ImportLimits,
     cancellation: &Cancellation,
-) -> Result<(), PortError> {
+) -> Result<(), PreflightError> {
     limits.check()?;
     check_cancelled(cancellation)?;
     let (mut zip, _) = open_zip(
@@ -114,53 +169,56 @@ pub(crate) fn prepare_import(
             .as_ref()
             != name
         {
-            return Err(invalid(ValidationReason::InvalidArchive));
+            return Err(invalid(ValidationReason::InvalidArchive).into());
         }
         let directory = name.ends_with('/');
-        let unix_type = entry.unix_mode().unwrap_or(0) & 0o170000;
-        if (unix_type != 0 && unix_type != if directory { 0o040000 } else { 0o100000 })
-            || entry.is_symlink()
-            || (entry.external_attributes() & 0x08 != 0)
-        {
-            return Err(invalid(ValidationReason::UnsupportedArchiveEntry));
-        }
         let name = name.strip_suffix('/').unwrap_or(name).to_owned();
         let components = valid_path(&name, limits.depth)?;
-        if lookup_key(components[0]) == ".notarium" {
-            return Err(invalid(ValidationReason::UnsupportedArchiveEntry));
-        }
-        let (parent, leaf) = if directory {
-            (components.as_slice(), None)
-        } else {
-            let (leaf, parent) = components.split_last().expect("validated nonempty path");
-            (parent, Some(*leaf))
-        };
-        let parent_key = insert_directories(&tx, parent, &mut remaining_entries)?;
-        if directory && entry.size() != 0 {
-            return Err(invalid(ValidationReason::InvalidArchive));
-        }
-        let allowed = entry
-            .compressed_size()
-            .saturating_mul(u64::from(limits.max_ratio))
-            .min(limits.carrier_bytes)
-            .min(limits.expanded_bytes.saturating_sub(expanded));
-        let stored_expanded = entry.size();
-        if stored_expanded > allowed {
-            return Err(invalid(ValidationReason::BudgetExceeded));
-        }
-        let carrier = read_carrier(&mut entry, stored_expanded, allowed, cancellation)?;
-        expanded += stored_expanded;
-        if let Some(filename) = leaf {
-            insert_note(
-                &tx,
-                index,
-                &name,
-                &parent_key,
-                filename,
-                carrier,
-                &mut remaining_entries,
-            )?;
-        }
+        PreflightError::for_entry(&name, || {
+            let unix_type = entry.unix_mode().unwrap_or(0) & 0o170000;
+            if (unix_type != 0 && unix_type != if directory { 0o040000 } else { 0o100000 })
+                || entry.is_symlink()
+                || (entry.external_attributes() & 0x08 != 0)
+            {
+                return Err(invalid(ValidationReason::UnsupportedArchiveEntry));
+            }
+            if lookup_key(components[0]) == ".notarium" {
+                return Err(invalid(ValidationReason::UnsupportedArchiveEntry));
+            }
+            let (parent, leaf) = if directory {
+                (components.as_slice(), None)
+            } else {
+                let (leaf, parent) = components.split_last().expect("validated nonempty path");
+                (parent, Some(*leaf))
+            };
+            let parent_key = insert_directories(&tx, parent, &mut remaining_entries)?;
+            if directory && entry.size() != 0 {
+                return Err(invalid(ValidationReason::InvalidArchive));
+            }
+            let allowed = entry
+                .compressed_size()
+                .saturating_mul(u64::from(limits.max_ratio))
+                .min(limits.carrier_bytes)
+                .min(limits.expanded_bytes.saturating_sub(expanded));
+            let stored_expanded = entry.size();
+            if stored_expanded > allowed {
+                return Err(invalid(ValidationReason::BudgetExceeded));
+            }
+            let carrier = read_carrier(&mut entry, stored_expanded, allowed, cancellation)?;
+            expanded += stored_expanded;
+            if let Some(filename) = leaf {
+                insert_note(
+                    &tx,
+                    index,
+                    &name,
+                    &parent_key,
+                    filename,
+                    carrier,
+                    &mut remaining_entries,
+                )?;
+            }
+            Ok(())
+        })?;
     }
     rebind_links(&tx, expanded, limits, cancellation)?;
     tx.execute(
@@ -169,7 +227,7 @@ pub(crate) fn prepare_import(
     ).map_err(plan_error)?;
     tx.commit().map_err(plan_error)?;
     plan.close().map_err(|(_, error)| plan_error(error))?;
-    sync_plan(path)
+    Ok(sync_plan(path)?)
 }
 
 fn create_plan(
@@ -398,74 +456,78 @@ fn rebind_links(
     mut expanded: u64,
     limits: ImportLimits,
     cancellation: &Cancellation,
-) -> Result<(), PortError> {
+) -> Result<(), PreflightError> {
     let mut next = tx
         .prepare(
-            "SELECT key, parent, carrier FROM entries
+            "SELECT key, path, parent, carrier FROM entries
          WHERE key>?1 AND class IS NOT NULL AND class<>'encrypted-note' ORDER BY key LIMIT 1",
         )
         .map_err(plan_error)?;
     let mut cursor = String::new();
-    while let Some((key, parent, carrier)) = next
+    while let Some((key, path, parent, carrier)) = next
         .query_row([&cursor], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
             ))
         })
         .optional()
         .map_err(plan_error)?
     {
         check_cancelled(cancellation)?;
-        let header = notarium_syntax::carrier::Carrier::scan(&carrier)?;
-        let parsed = markdown::analyze(&carrier, header.body)?;
-        let links = extract::wikilinks(&carrier, &parsed)?;
-        let mut output = None::<String>;
-        let mut copied = 0;
-        let mut final_len = carrier.len();
-        for link in links {
-            let WikiTargetKind::NamePath {
-                absolute,
-                directory,
-                leaf_key,
-            } = link.target
-            else {
-                continue;
-            };
-            if link.raw.contains(':') || link.raw.starts_with("//") || leaf_key.is_empty() {
-                continue;
+        PreflightError::for_entry(&path, || {
+            let header = notarium_syntax::carrier::Carrier::scan(&carrier)?;
+            let parsed = markdown::analyze(&carrier, header.body)?;
+            let links = extract::wikilinks(&carrier, &parsed)?;
+            let mut output = None::<String>;
+            let mut copied = 0;
+            let mut final_len = carrier.len();
+            for link in links {
+                let WikiTargetKind::NamePath {
+                    absolute,
+                    directory,
+                    leaf_key,
+                } = link.target
+                else {
+                    continue;
+                };
+                if link.raw.contains(':') || link.raw.starts_with("//") || leaf_key.is_empty() {
+                    continue;
+                }
+                let Some(id) = resolve_link(tx, &parent, absolute, &directory, &leaf_key)? else {
+                    continue;
+                };
+                let source = link.span.slice(&carrier)?;
+                let inside = &source[2..source.len() - 2];
+                let target = inside.split_once('|').map_or(inside, |(target, _)| target);
+                let start = link.span.start() + 2 + (target.len() - target.trim_start().len());
+                let end = start + target.trim().len();
+                final_len = final_len - (end - start) + id.len();
+                if final_len as u64 > limits.carrier_bytes {
+                    return Err(invalid(ValidationReason::BudgetExceeded));
+                }
+                let output = output.get_or_insert_with(|| String::with_capacity(carrier.len()));
+                output.push_str(&carrier[copied..start]);
+                output.push_str(&id);
+                copied = end;
             }
-            let Some(id) = resolve_link(tx, &parent, absolute, &directory, &leaf_key)? else {
-                continue;
-            };
-            let source = link.span.slice(&carrier)?;
-            let inside = &source[2..source.len() - 2];
-            let target = inside.split_once('|').map_or(inside, |(target, _)| target);
-            let start = link.span.start() + 2 + (target.len() - target.trim_start().len());
-            let end = start + target.trim().len();
-            final_len = final_len - (end - start) + id.len();
-            if final_len as u64 > limits.carrier_bytes {
-                return Err(invalid(ValidationReason::BudgetExceeded));
+            if let Some(mut output) = output {
+                output.push_str(&carrier[copied..]);
+                expanded = expanded - carrier.len() as u64 + output.len() as u64;
+                if expanded > limits.expanded_bytes {
+                    return Err(invalid(ValidationReason::BudgetExceeded));
+                }
+                let digest = notarium_syntax::content_digest(&output);
+                tx.execute(
+                    "UPDATE entries SET carrier=?1, final_digest=?2 WHERE key=?3",
+                    params![output, digest.as_bytes().as_slice(), key],
+                )
+                .map_err(plan_error)?;
             }
-            let output = output.get_or_insert_with(|| String::with_capacity(carrier.len()));
-            output.push_str(&carrier[copied..start]);
-            output.push_str(&id);
-            copied = end;
-        }
-        if let Some(mut output) = output {
-            output.push_str(&carrier[copied..]);
-            expanded = expanded - carrier.len() as u64 + output.len() as u64;
-            if expanded > limits.expanded_bytes {
-                return Err(invalid(ValidationReason::BudgetExceeded));
-            }
-            let digest = notarium_syntax::content_digest(&output);
-            tx.execute(
-                "UPDATE entries SET carrier=?1, final_digest=?2 WHERE key=?3",
-                params![output, digest.as_bytes().as_slice(), key],
-            )
-            .map_err(plan_error)?;
-        }
+            Ok(())
+        })?;
         cursor = key;
     }
     Ok(())
@@ -634,6 +696,7 @@ mod tests {
             ImportLimits::default(),
             &Cancellation::default(),
         )
+        .map_err(|failure| failure.error)
     }
 
     #[test]

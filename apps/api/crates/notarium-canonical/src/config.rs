@@ -186,6 +186,12 @@ impl Default for WriterConfig {
     }
 }
 
+impl WriterConfig {
+    pub(crate) fn staged_byte_limit(&self) -> u64 {
+        self.max_staged_bytes.max(1024)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct CanonicalConfig {
     pub installation_id: InstallationId,

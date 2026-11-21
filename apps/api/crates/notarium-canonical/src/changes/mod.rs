@@ -36,8 +36,8 @@ use crate::{
     codec::{
         EFFECT_MAX_NOTES, EFFECT_PAYLOAD_BUDGET_BYTES, MAX_MSGPACK_DECODE_BYTES,
         NoteRevisionMetadata, RevisionMetadataPayload, ThreadRevisionMetadata,
-        decode_msgpack_bounded, doc_class_from_db, encode_msgpack, i64_to_space_seq,
-        internal_not_committed, lifecycle_from_db,
+        decode_msgpack_bounded, doc_class_from_db, encode_msgpack, encode_msgpack_bounded,
+        i64_to_space_seq, internal_not_committed, lifecycle_from_db,
     },
     runtime::{
         CanonicalStore, load_space_record, read_immutable_revision_tx, validate_snapshot_cutoff_tx,
@@ -157,34 +157,6 @@ impl EffectEnvelopeV1 {
     }
 }
 
-#[derive(Default)]
-struct EffectBuffer {
-    bytes: Vec<u8>,
-    exceeded: bool,
-}
-
-impl std::io::Write for EffectBuffer {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        if bytes.len() > EFFECT_PAYLOAD_BUDGET_BYTES - self.bytes.len() {
-            self.exceeded = true;
-            return Err(std::io::ErrorKind::WriteZero.into());
-        }
-        let required = self.bytes.len() + bytes.len();
-        if required > self.bytes.capacity() {
-            let capacity = required
-                .max(self.bytes.capacity() * 2)
-                .clamp(32, EFFECT_PAYLOAD_BUDGET_BYTES);
-            self.bytes.reserve_exact(capacity - self.bytes.len());
-        }
-        self.bytes.extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
 /// Builds a bounded `ChangePayloadDraft` (`<= 64 KiB`, `<= 8` distinct notes), degrading oversized
 /// or >8-note summaries into `AwaitProjection` while preserving all `owner_note_ids` for purge erasure.
 pub fn build_effect_payload_draft(
@@ -235,22 +207,17 @@ pub fn build_effect_payload_draft(
         body: normalized_body,
     };
 
-    let mut buffer = EffectBuffer::default();
-    let encoded = match rmp_serde::encode::write_named(&mut buffer, &env) {
-        Ok(()) => buffer.bytes,
-        Err(_) if buffer.exceeded => {
-            env.body = EffectBodyV1::AwaitProjection {
-                reason: StoredAwaitReasonV1::PayloadBudget,
-            };
-            encode_msgpack(&env)?
-        }
-        Err(err) => {
-            return Err(internal_not_committed(
-                "msgpack_encode_effect",
-                err.to_string(),
-            ));
-        }
-    };
+    let encoded =
+        match encode_msgpack_bounded::<EFFECT_PAYLOAD_BUDGET_BYTES>(&env, "msgpack_encode_effect")?
+        {
+            Some(bytes) => bytes,
+            None => {
+                env.body = EffectBodyV1::AwaitProjection {
+                    reason: StoredAwaitReasonV1::PayloadBudget,
+                };
+                encode_msgpack(&env)?
+            }
+        };
 
     Ok(ChangePayloadDraft {
         payload_id,

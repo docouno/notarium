@@ -157,6 +157,7 @@ pub(crate) struct CanonicalInner {
     lease_recoveries: std::sync::Mutex<
         std::collections::HashMap<(HistoryScope, LeaseEpoch), lease::RecoveryWaiters>,
     >,
+    pub gc_retirements: Arc<tokio::sync::Semaphore>,
     pub retirement_workers: crate::blobs::retirement_worker::RetirementWorkers,
     pub backup_cleanups: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     pub last_backup_memory_stats:
@@ -482,6 +483,9 @@ impl CanonicalRuntime {
             backup_spool_roots: Default::default(),
             backup_spool_override: std::sync::Mutex::new(None),
             lease_recoveries: Default::default(),
+            gc_retirements: Arc::new(tokio::sync::Semaphore::new(
+                crate::blobs::gc::MAX_GC_RETIREMENTS,
+            )),
             retirement_workers: Default::default(),
             backup_cleanups: std::sync::Mutex::new(Vec::new()),
             last_backup_memory_stats: std::sync::Mutex::new(None),
@@ -671,6 +675,14 @@ impl CanonicalStore {
         let sid = space_id.clone();
         self.with_read_tx(|tx| Box::pin(async move { load_space_record(tx, &sid).await }))
             .await
+    }
+
+    pub async fn read_space_with_budget(
+        &self,
+        space_id: &SpaceId,
+        budget: &CallBudget,
+    ) -> Result<SpaceRecord, PortError> {
+        self.read_space_fast_or_pool(space_id, Some(budget)).await
     }
 
     pub(crate) async fn read_space_fast_or_pool(

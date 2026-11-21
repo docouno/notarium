@@ -8,10 +8,13 @@ use job IDs and artifact IDs without exposing storage paths or object keys.
 ## Content jobs
 
 Use `ArchiveJobs::stage_import` to seal an upload, then `ArchiveJobs::enqueue`
-to submit the returned artifact. The same enqueue method accepts explicit note
-selection or a whole-Space export. The worker revalidates the submitting
-credential and Space grant at claim and during execution. The default runner
+to submit the returned artifact. Upload and enqueue each use one caller deadline
+across authority checks, storage and canonical admission. The same enqueue method
+accepts explicit note selection or a whole-Space export. The worker revalidates
+the submitting credential and Space grant at claim and during execution. The
+default runner
 admits one import and one export on its own runtime with a bounded blocking pool.
+Each worker polls its class for Spaces with queued jobs or reclaimable leases.
 The canonical writer fences job progress and terminal results by lease owner,
 both the job and Space epochs, and lease expiry. It retains the authority
 registration until an admitted write commits or rolls back. In Cloud, the
@@ -25,7 +28,10 @@ carrier syntax before writing notes or folders. It seals the path and link plan
 and pins that plan to the job before its first content mutation. Successive
 leases use the plan's original IDs and committed ordinal. A concurrent write
 that claims a planned path can cause a conflict after a valid prefix has been
-committed. A rejected preflight commits zero content items.
+committed. A rejected preflight commits zero content items. The submitting
+credential can read the validation reason and normalized relative entry path
+through `get_job`. Invalid names and archive-wide failures omit the path. Job
+lists and change notifications carry only the shared job summary.
 Accepted inputs expire after seven days. Admitting another import with the
 same input extends its retention. A queued or running job retains its input
 until it reaches a terminal state.
@@ -33,8 +39,9 @@ until it reaches a terminal state.
 Export cuts record one history, Space sequence and privacy generation. The
 compact cut has a 50 ms SQL transaction budget. It captures paths, the active
 field schema's immutable carrier revision, ability package resources and chat
-metadata before reading CAS. Explicit selections use the selected notes'
-paths.
+metadata before reading CAS. Explicit selections resolve paths from the
+selected heads and their authorized ancestors. A selection that exceeds the
+compact cut budget finishes with a budget error.
 Larger whole-Space exports register a cut and read keyset pages. The writer
 preserves a row's first pre-image while the cut is active. Large chat threads
 can be read a page at a time while the archive is written. Trashing the current
@@ -46,14 +53,20 @@ while paired installation backups protect their captured cut. The final ZIP
 becomes visible after its immutable
 storage generation is sealed and its canonical pointer commits. The artifact ID
 names that committed pointer. ETag is the BLAKE3 digest of the ZIP bytes.
+Local and Cloud exports also record a digest per 4 MiB segment. A range read
+checks its segment and can reuse it for subsequent chunks from the same reader.
+For earlier Local exports with only a whole-file digest, the first open rebuilds
+the segment index against that digest. The process caches the eight most
+recently used legacy indexes.
 The writer journals plan and export generations before storage writes. It
 retains the winning import plan across lease changes and retires abandoned
 generations in their own namespace.
 
 `ArchiveJobs::open_export` returns an authorized reader with a bounded
 `read_chunk` method. Check its metadata for content length and expiry. Each
-chunk revalidates authority and crosses the canonical privacy fence before
-handoff. A successful enqueue into a reserved transport slot is the receipt for
+chunk checks explicit revocation and natural credential expiry for both the
+caller and the original exporter at handoff, inside the canonical privacy
+fence. A successful enqueue into a reserved transport slot is the receipt for
 that chunk. Archive bytes already handed off belong to the caller. An artifact
 expires seven days after publication. The maintenance loop retires its sealed
 storage generation and then removes the pointer.
@@ -74,6 +87,10 @@ retirement after 24 hours and 5 minutes. The canonical transaction checks the
 publication identity, active writer epoch, staged tickets, references and holds
 again. Reacquisition of a reference resets its quarantine. Canonical retirement
 workers own the physical operation and recover durable work after interruption.
+Each store admits up to four ordinary sweep retirements at once. When all four
+slots are in use, mature entries stay eligible for the next sweep. Startup and
+lease recovery resume sealed work and preserve immediate cleanup obligations
+from pre-quarantine catalogs.
 
 ## Backup, verification and restore
 
@@ -109,11 +126,23 @@ workers own the physical operation and recover durable work after interruption.
   default keyring directory from the separately saved files. Cloud restore
   requires a dedicated, empty PostgreSQL database and a fresh S3 prefix. A
   durable marker ties readiness to the database installation and S3 namespace.
+  Before loading either store, restore reserves the prefix with a create-only
+  `.notarium-restore-owner` object containing the target database's restore
+  generation ID. Keep this object with the restored CAS. A retry checks the
+  same ID before resuming. Concurrent restores into different databases that
+  select the same empty prefix can publish at most one installation. A ready
+  installation from an earlier experimental restore journal can still serve
+  its existing data. If the journal lacks a namespace owner, `run_restore`
+  returns `InvalidState`. Use a fresh database and prefix for another restore.
 
 Paired backup and live verification use private temporary database spools. The
 coordinator releases them when their last reader finishes, including cancelled
 and failed operations. An abandoned pending marker lets each participant
 recover its own spool after a process exits.
+Packing uses a private, installation-specific work directory beside the destination.
+A subsequent backup to the same parent reclaims marked packing attempts whose
+owner has exited. On Unix the published ZIP is created with mode `0600`.
+The paired archive format supports up to 65,536 Spaces.
 Paired backup reserves capacity before preparing the databases. The spool
 digest check, CAS scanning and packing, and live verification use owned native
 workers. The scanner and writer can run together even when the caller's

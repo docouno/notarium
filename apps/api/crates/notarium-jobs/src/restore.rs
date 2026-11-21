@@ -136,6 +136,8 @@ struct Journal {
     histories: Vec<ChangeCursor>,
     stage: String,
     phase: Phase,
+    #[serde(default)]
+    published_manifest: Option<Identity>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -226,6 +228,7 @@ async fn restore_local(
             histories,
             stage: codec::new_prefixed_hex_id(".notarium-restore-generation-")?,
             phase: Phase::Build { directory: None },
+            published_manifest: None,
         };
         save_journal(&journal_path, &journal)?;
         journal
@@ -278,24 +281,29 @@ async fn restore_local(
         save_journal(&journal_path, &journal)?;
     }
     check_cancelled(&ctx.budget.cancellation)?;
-    install_local(&parent, &root, &journal)?;
-    verify_installed(&root, &journal, false).map_err(after_local_publication)?;
-    // The ready directory is durable now. A leftover journal permits the
-    // same operation to validate and finish cleanup on retry.
-    let removed = fs::remove_file(&journal_path).is_ok();
-    if removed {
-        let _ = sync_dir(&parent);
-    }
-    if removed && let Phase::Install { directory, .. } = &journal.phase {
-        let stage = parent.join(&journal.stage);
-        if journal.existing.is_some()
-            && directory_identity(&stage).ok().flatten() == Some(*directory)
-        {
-            let _ = fs::remove_file(stage.join(LOCAL_MANIFEST));
-            let _ = fs::remove_file(DataRoot::new(stage.clone()).restore_guard());
-            let _ = fs::remove_dir(stage);
+    if let Some(manifest) = journal.published_manifest {
+        if regular_identity(&root.manifest())? != Some(manifest) || exists(&root.restore_guard())? {
+            return Err(invalid(ValidationReason::InvalidState));
         }
+        require_installed_components(&root, &journal)?;
+    } else {
+        install_local(&parent, &root, &journal)?;
     }
+    verify_installed(&root, &journal, false).map_err(after_local_publication)?;
+    if journal.existing.is_some() {
+        if journal.published_manifest.is_none() {
+            journal.published_manifest =
+                Some(regular_identity(&root.manifest())?.ok_or_else(|| {
+                    after_local_publication(invalid(ValidationReason::InvalidState))
+                })?);
+            save_journal(&journal_path, &journal).map_err(after_local_publication)?;
+        }
+        cleanup_local_stage(&parent, &journal).map_err(after_local_publication)?;
+    }
+    fs::remove_file(&journal_path).map_err(|err| after_local_publication(io_error(err)))?;
+    // Publication and stage cleanup have already been fsynced. A crash may
+    // resurrect this last journal entry, whose replay is read-only on the target.
+    let _ = sync_dir(&parent);
     Ok(RestoreReport {
         installation: journal.installation,
         archive_digest: digest,
@@ -559,6 +567,19 @@ fn install_local(parent: &Path, root: &DataRoot, journal: &Journal) -> Result<()
         {
             return Err(invalid(ValidationReason::InvalidState));
         }
+        if exists(&root.manifest())? && !exists(&root.restore_guard())? {
+            // Normal use may already have created staging or other root entries.
+            // The shared manifest inode and installed component identities prove
+            // that this journal published the target before its owner stopped.
+            require_installed_components(root, journal)?;
+            let marker = regular_identity(&stage.join(LOCAL_MANIFEST))?
+                .ok_or_else(|| invalid(ValidationReason::InvalidState))?;
+            if regular_identity(&root.manifest())? != Some(marker) {
+                return Err(invalid(ValidationReason::InvalidState));
+            }
+            sync_dir(root.root()).map_err(after_local_publication)?;
+            return sync_dir(parent).map_err(after_local_publication);
+        }
         validate_components(root, &stage, components)?;
         if !exists(&root.manifest())? {
             if !exists(&root.restore_guard())? {
@@ -587,6 +608,11 @@ fn install_local(parent: &Path, root: &DataRoot, journal: &Journal) -> Result<()
             sync_dir(root.root())?;
         }
         if exists(&root.restore_guard())? {
+            require_installed_components(root, journal)?;
+            if regular_identity(&root.manifest())? != regular_identity(&stage.join(LOCAL_MANIFEST))?
+            {
+                return Err(invalid(ValidationReason::InvalidState));
+            }
             verify_installed(root, journal, true)?;
             verify_guard(root, journal.digest)?;
             fs::remove_file(root.restore_guard()).map_err(io_error)?;
@@ -600,6 +626,81 @@ fn install_local(parent: &Path, root: &DataRoot, journal: &Journal) -> Result<()
         rename_noreplace(&stage, root.root())?;
     }
     sync_dir(parent).map_err(after_local_publication)
+}
+
+fn require_installed_components(root: &DataRoot, journal: &Journal) -> Result<(), PortError> {
+    let Phase::Install { components, .. } = &journal.phase else {
+        return Err(invalid(ValidationReason::InvalidState));
+    };
+    if directory_identity(root.root())? != journal.existing {
+        return Err(invalid(ValidationReason::InvalidState));
+    }
+    for (name, id) in components {
+        if directory_identity(&root.root().join(name))? != Some(*id) {
+            return Err(invalid(ValidationReason::InvalidState));
+        }
+    }
+    Ok(())
+}
+
+fn cleanup_local_stage(parent: &Path, journal: &Journal) -> Result<(), PortError> {
+    let Phase::Install { directory, .. } = &journal.phase else {
+        return Err(invalid(ValidationReason::InvalidState));
+    };
+    let stage = DataRoot::new(parent.join(&journal.stage));
+    let (parent_dir, name) = open_parent(stage.root())?;
+    let Some(dir) = open_optional_dir(&parent_dir, name)? else {
+        return sync_dir(parent);
+    };
+    let meta = dir.dir_metadata().map_err(io_error)?;
+    if (meta.dev(), meta.ino()) != (directory.device, directory.inode) {
+        return Err(invalid(ValidationReason::InvalidState));
+    }
+    // CanonicalRuntime creates this empty spool path on its first open.
+    // Remove only its known, empty directories through pinned handles.
+    if let Some(staging) = open_optional_dir(&dir, "staging")? {
+        if let Some(artifacts) = open_optional_dir(&staging, "artifacts")? {
+            if let Some(backups) = open_optional_dir(&artifacts, "backups")? {
+                backups.remove_open_dir().map_err(io_error)?;
+            }
+            artifacts.remove_open_dir().map_err(io_error)?;
+        }
+        staging.remove_open_dir().map_err(io_error)?;
+    }
+    if let Some(marker) = regular_identity(&stage.manifest())? {
+        if Some(marker) != journal.published_manifest {
+            return Err(invalid(ValidationReason::InvalidState));
+        }
+        dir.remove_file(LOCAL_MANIFEST).map_err(io_error)?;
+    }
+    if regular_identity(&stage.restore_guard())?.is_some() {
+        verify_guard(&stage, journal.digest)?;
+        dir.remove_file("v1-restore-in-progress")
+            .map_err(io_error)?;
+    }
+    dir.remove_open_dir().map_err(io_error)?;
+    sync_dir(parent)
+}
+
+fn open_optional_dir(dir: &Dir, name: impl AsRef<Path>) -> Result<Option<Dir>, PortError> {
+    match dir.open_dir_nofollow(name) {
+        Ok(child) => Ok(Some(child)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(io_error(err)),
+    }
+}
+
+fn regular_identity(path: &Path) -> Result<Option<Identity>, PortError> {
+    let (parent, name) = open_parent(path)?;
+    match parent.symlink_metadata(name) {
+        Ok(meta) if meta.is_file() => Ok(Some(Identity {
+            device: meta.dev(),
+            inode: meta.ino(),
+        })),
+        Ok(_) => Err(invalid(ValidationReason::InvalidPathComponent)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(io_error(err)),
+    }
 }
 
 fn after_local_publication(error: PortError) -> PortError {
@@ -655,8 +756,11 @@ fn verify_installed(
     }
     let canonical = Connection::open_with_flags(root.canonical(), OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(sql_error)?;
-    let control = Connection::open_with_flags(root.control(), OpenFlags::SQLITE_OPEN_READ_ONLY)
+    let mut control = Connection::open_with_flags(root.control(), OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(sql_error)?;
+    // A running target may acknowledge a new change between reads. Pin all
+    // acknowledgements before reading their respective canonical ceilings.
+    let control = control.transaction().map_err(sql_error)?;
     let installation: String = control
         .query_row(
             "SELECT installation_id FROM v1_storage_epoch WHERE singleton=1 AND state='ready'",
