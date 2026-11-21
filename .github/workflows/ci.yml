@@ -130,7 +130,8 @@ jobs:
         name: Validate the vendored parser cache
         run: python3 scripts/ci-prune-rust-target.py --stabilize-vendor-mtime apps/api/vendor/pulldown-cmark --target-dir apps/api/target
       - run: sh .devkit/runtime/devkit.sh cli doctor .
-      - run: make setup app=api
+      - &setup_api_without_fixtures
+        run: make setup app=api
         env:
           NOTARIUM_SKIP_API_FIXTURES: '1'
       - &verify_rust
@@ -140,7 +141,13 @@ jobs:
           sh .devkit/runtime/devkit.sh cli doctor . --json |
             jq -e '.result | .ok == true and
               any(.checks[]; .id == "checkout_state" and .details.receipts.rustImageReady == true)'
-      - run: make check app=api
+      - name: Check Rust formatting and lint all targets
+        run: |
+          sh .devkit/runtime/devkit.sh cli exec --component apps/api --network none -- sh -eu -c '
+            export CARGO_TERM_COLOR=never
+            cargo fmt --all -- --check --config-path "$PWD/rustfmt.toml"
+            cargo clippy --workspace --all-targets --locked --offline -- -D warnings
+          '
       - run: make build app=api
       - name: Keep only reusable Cargo dependencies
         if: steps.target-cache.outputs.cache-hit != 'true'
@@ -162,6 +169,27 @@ jobs:
         with:
           path: apps/api/target
           key: ${{ steps.target-cache.outputs.cache-primary-key }}
+
+  api-discovery:
+    needs: plan
+    if: needs.plan.outputs.run_code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: docker/setup-compose-action@v2.4.0
+        with:
+          version: v5.0.2
+      - *configure_cache
+      - uses: actions/cache/restore@v6.1.0
+        with: *rust_registry
+      - *restore_target
+      - *validate_vendor
+      - run: sh .devkit/runtime/devkit.sh cli doctor .
+      - *setup_api_without_fixtures
+      - *verify_rust
+      - name: Discover Rust tests and reject ignored tests
+        run: sh .devkit/runtime/devkit.sh cli exec --component apps/api --network none -- sh /workspace/scripts/ci-api-discovery.sh
 
   api-test:
     needs: plan
@@ -218,7 +246,7 @@ jobs:
         run: sh scripts/ci-run-api-shard.sh "$SHARD_ID"
 
   verify:
-    needs: [plan, node, api-check, api-test]
+    needs: [plan, node, api-check, api-discovery, api-test]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -232,6 +260,7 @@ jobs:
           RUN_CODE: ${{ needs.plan.outputs.run_code }}
           NODE_RESULT: ${{ needs.node.result }}
           API_CHECK_RESULT: ${{ needs.api-check.result }}
+          API_DISCOVERY_RESULT: ${{ needs.api-discovery.result }}
           API_TEST_RESULT: ${{ needs.api-test.result }}
         run: |
           if [ "$PLAN_RESULT" != success ]; then
@@ -243,7 +272,7 @@ jobs:
             pull_request:false) expected=skipped ;;
             *) echo "invalid run_code '$RUN_CODE' for event '$EVENT_NAME'" >&2; exit 1 ;;
           esac
-          for job in "node:$NODE_RESULT" "api-check:$API_CHECK_RESULT" "api-test:$API_TEST_RESULT"; do
+          for job in "node:$NODE_RESULT" "api-check:$API_CHECK_RESULT" "api-discovery:$API_DISCOVERY_RESULT" "api-test:$API_TEST_RESULT"; do
             if [ "${job#*:}" != "$expected" ]; then
               echo "${job%%:*} result was '${job#*:}', expected '$expected'" >&2
               exit 1
