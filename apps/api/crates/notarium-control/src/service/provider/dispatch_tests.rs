@@ -482,8 +482,8 @@ impl Setup {
             },
         }
     }
-    fn embedding(&self, id: u8) -> EmbeddingRequest {
-        let document = Arc::new(self.document.clone());
+    fn embedding(&self, id: u8, document: &ClassifiedDocument) -> EmbeddingRequest {
+        let document = Arc::new(document.clone());
         let part = ContentPart::from_chunk(
             document.clone(),
             ChunkDescriptor {
@@ -660,7 +660,7 @@ async fn gateway(pg: bool, kind: ProviderWireKind, label: &str) {
     }
     let embedding = setup
         .provider
-        .embed(setup.space.clone(), setup.embedding(11))
+        .embed(setup.space.clone(), setup.embedding(11, &setup.document))
         .await
         .unwrap();
     assert_eq!(embedding.vectors, vec![Ok(vec![0.25, -0.5])]);
@@ -818,10 +818,68 @@ async fn gateway(pg: bool, kind: ProviderWireKind, label: &str) {
     assert!(
         setup
             .provider
-            .embed(indexing.clone(), setup.embedding(101))
+            .embed(indexing.clone(), setup.embedding(101, &setup.document))
             .await
             .is_ok()
     );
+    // Personal consent covers the whole Space. Search still binds a selected
+    // project to both the original part and the metadata held by the lease.
+    let project = FolderRef {
+        space_id: indexing.scope().space_id.clone(),
+        folder_id: FolderId::from_bytes([17; 16]),
+    };
+    setup
+        .fixture
+        .catalog
+        .project_entries
+        .lock()
+        .unwrap()
+        .insert(
+            (project.space_id.clone(), project.folder_id.clone()),
+            ProjectInfo {
+                folder: project.clone(),
+                name: "Selected project".into(),
+            },
+        );
+    let space = setup
+        .fixture
+        .catalog
+        .space(budget(), project.space_id.clone())
+        .await
+        .unwrap();
+    let inside = ClassifiedDocument::from_canonical(
+        setup.document.reference().clone(),
+        setup.document.revision().clone(),
+        ResourceFacts {
+            space: space.space,
+            class: DocClass::UserDoc,
+            ancestor_folders: vec![project.folder_id.clone()],
+            folder_write_locked: false,
+            ability_package: None,
+        },
+        Lifecycle::Active,
+        setup
+            .document
+            .explicit_read(setup.ctx.auth())
+            .unwrap()
+            .to_owned(),
+        setup.document.digest(),
+    )
+    .unwrap();
+    let mut scoped = setup.embedding(109, &inside);
+    scoped.project = Some(project.clone());
+    let before = requests.lock().unwrap().len();
+    assert!(matches!(
+        setup.provider.embed(indexing.clone(), scoped).await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+    assert_eq!(requests.lock().unwrap().len(), before);
+    *setup.egress.current.lock().unwrap() = vec![ProviderCurrentContent::Note(inside.metadata())];
+    let mut scoped = setup.embedding(110, &inside);
+    scoped.project = Some(project);
+    assert!(setup.provider.embed(indexing.clone(), scoped).await.is_ok());
+    *setup.egress.current.lock().unwrap() =
+        vec![ProviderCurrentContent::Note(setup.document.metadata())];
     let count = requests.lock().unwrap().len();
     let stale_epochs = ProviderRuntimeEpochs {
         resource: (setup.selection.runtime_epochs.resource.get() + 1)

@@ -30,8 +30,8 @@ before shutting down canonical storage.
   cut and masks their older indexed hits. Exact carriers pass both historical and
   current authorization before ranking. Intervening folder or schema changes
   and receipts for package publication require full catch-up. Base postings,
-  structural filters and note carriers share a projected cut. When the indexes and projection have
-  different cuts, search waits within the call budget. The response reports
+  structural filters and note carriers share a projected cut. When the indexes
+  and projection have different cuts, search waits within the call budget. The response reports
   its cut, truncation, and any embedding degradation.
 
 ## Storage
@@ -42,14 +42,17 @@ acknowledgement, including commands that span several change pages.
 
 The DataRoot holds `v1/search/<space>/tantivy/` and `vector/`. Tantivy stores
 terms and fast fields without stored note or chat text. A durable folder
-dictionary assigns stable ordinals, so moving a folder requires only a search
-watermark update. A manifest identifies the active lexical generation and
+dictionary assigns stable ordinals. Moving a folder advances the lexical
+watermark without rewriting postings. When the embedding provider is scoped
+to a project, the worker also reconciles vector membership in the background.
+A manifest identifies the active lexical generation and
 the vector checkpoint. After an edit the worker invalidates the old vector slots
 before publishing the new lexical cut. The pending marker keeps outstanding
 embedding work recoverable after restart. Readers pin a cut through ArcSwap. Idle
 Spaces release their lexical reader pins and retain their subscriptions. After
 60 seconds without vector activity, they release the in-memory vector state
-and embedder. The next access reopens the durable epoch and journal. Disk and
+and embedder. On the next access, the lexical cut can serve queries while the
+worker reopens the durable vector epoch and journal. Disk and
 receipt-overlay writers share the four-writer pool.
 
 Vectors use a bounded mutable journal and read-only, checksummed mmap
@@ -60,8 +63,8 @@ filters up to 16,384 eligible slots per segment. Epoch identity includes the
 profile, dimension and input token cap. Remote epochs also bind the provider,
 its resource and credential runtime generations, and the selected project.
 The previous compatible epoch remains available while the replacement embeds
-its eligible corpus.
-Publication switches both together.
+its eligible corpus and catches up with edits. Readers switch to the new model
+and its vectors together.
 
 Encrypted notes are excluded. A purge invalidates the affected search cut and
 removes its retired disk copies before building a clean generation. On restart

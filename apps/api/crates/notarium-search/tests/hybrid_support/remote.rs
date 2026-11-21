@@ -1,5 +1,5 @@
 mod folder_privacy;
-pub use folder_privacy::trashed_ancestor;
+pub use folder_privacy::folder_eligibility;
 
 use super::{ControlledCarriers, Projection, View, context, context_with_grant, status_field};
 use crate::{acknowledged, note, query};
@@ -59,6 +59,12 @@ struct SwitchingResolver {
     cap: AtomicU32,
     project: RwLock<Option<FolderRef>>,
     unavailable: AtomicBool,
+    hold_resolution: AtomicBool,
+    resolution_started: Notify,
+    release_resolution: Notify,
+    hold_grant: AtomicBool,
+    grant_started: Notify,
+    release_grant: Notify,
 }
 
 impl SwitchingResolver {
@@ -69,6 +75,12 @@ impl SwitchingResolver {
             cap: AtomicU32::new(cap),
             project: RwLock::new(None),
             unavailable: AtomicBool::new(false),
+            hold_resolution: AtomicBool::new(false),
+            resolution_started: Notify::new(),
+            release_resolution: Notify::new(),
+            hold_grant: AtomicBool::new(false),
+            grant_started: Notify::new(),
+            release_grant: Notify::new(),
         }
     }
 
@@ -102,6 +114,10 @@ impl SearchModelResolverPort for SwitchingResolver {
         _: Option<&'a ModelProfileId>,
     ) -> PortFuture<'a, Option<ResolvedEmbeddingTarget>> {
         Box::pin(async move {
+            if self.hold_resolution.swap(false, Ordering::SeqCst) {
+                self.resolution_started.notify_one();
+                self.release_resolution.notified().await;
+            }
             if self.unavailable.load(Ordering::SeqCst) {
                 return Err(DomainError::AccessDenied.into());
             }
@@ -119,6 +135,10 @@ impl SearchModelResolverPort for SwitchingResolver {
         budget: CallBudget,
     ) -> PortFuture<'a, Option<RemoteIndexingGrant>> {
         Box::pin(async move {
+            if self.hold_grant.swap(false, Ordering::SeqCst) {
+                self.grant_started.notify_one();
+                self.release_grant.notified().await;
+            }
             let mut ctx = context(scope, actor);
             ctx.budget = budget;
             Ok(Some(RemoteIndexingGrant {
@@ -268,14 +288,50 @@ pub async fn model_epochs_and_repair(store: Arc<CanonicalStore>, root: DataRoot)
         )
     };
     let ctx = context(&space.scope, &owner);
+    let edit_during_work = async |body: &str| {
+        let (edit, _) = store
+            .commit_synthetic_note_batch_for_test(
+                &space.scope,
+                lease,
+                &owner,
+                vec![note(&sample_note_id(1), &folder, "Repeated note", body)],
+            )
+            .await
+            .unwrap();
+        projection.snapshot.write().unwrap().advance(edit.last_seq);
+        edit.last_seq
+    };
+    resolver.hold_resolution.store(true, Ordering::SeqCst);
     provider.block_next_part.store(true, Ordering::SeqCst);
     let engine = start(resolver.clone());
     engine.start_space(space.scope.clone()).unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        resolver.resolution_started.notified(),
+    )
+    .await
+    .unwrap();
+    let mut short = ctx.clone();
+    short.budget.remaining = Duration::from_millis(500);
+    let while_resolving = edit_during_work("pausedresolver").await;
+    let resolved = engine
+        .search(short.clone(), query("pausedresolver"))
+        .await
+        .unwrap();
+    assert_eq!(resolved.cut.projected_seq, while_resolving);
+    assert_eq!(resolved.hits[0].card.title, "Repeated note");
+    resolver.release_resolution.notify_one();
     tokio::time::timeout(Duration::from_secs(5), provider.part_started.notified())
         .await
         .unwrap();
-    let mut short = ctx.clone();
-    short.budget.remaining = Duration::from_millis(500);
+    let during_seed = edit_during_work("continuousseed").await;
+    let changed = engine
+        .search(short.clone(), query("continuousseed"))
+        .await
+        .unwrap();
+    assert_eq!(changed.cut.projected_seq, during_seed);
+    assert_eq!(changed.hits[0].card.title, "Repeated note");
+    let final_cut = edit_during_work("identical source material").await;
     let cold = engine
         .search(short.clone(), query("identical"))
         .await
@@ -285,8 +341,10 @@ pub async fn model_epochs_and_repair(store: Arc<CanonicalStore>, root: DataRoot)
         cold.degraded,
         Some(SearchDegradation::EmbeddingsPending)
     ));
+    assert_eq!(cold.cut.projected_seq, final_cut);
     provider.release_part.notify_one();
-    let seeded = acknowledged(&store, &root, &space.scope, seeded.last_seq).await;
+    let seeded = acknowledged(&store, &root, &space.scope, final_cut).await;
+    assert_eq!(seeded.vector_seq, Some(final_cut));
     assert!(!seeded.embeddings_pending);
     assert_eq!(
         provider.parts.load(Ordering::SeqCst),
@@ -346,44 +404,98 @@ pub async fn model_epochs_and_repair(store: Arc<CanonicalStore>, root: DataRoot)
         Some(remote_target(5, 512))
     );
     let attempts = provider.parts.load(Ordering::SeqCst);
+    provider.block_next_part.store(true, Ordering::SeqCst);
     provider.fail_indexing.store(false, Ordering::SeqCst);
-    tokio::time::timeout(Duration::from_secs(8), async {
+    tokio::time::timeout(Duration::from_secs(8), provider.part_started.notified())
+        .await
+        .unwrap();
+    // Stop the final selection check after the replacement has all its base
+    // vectors. Keep changing the same note while that check is suspended.
+    resolver.hold_resolution.store(true, Ordering::SeqCst);
+    provider.release_part.notify_one();
+    tokio::time::timeout(
+        Duration::from_secs(8),
+        resolver.resolution_started.notified(),
+    )
+    .await
+    .unwrap();
+    for term in ["handoffediting", "handofflatest"] {
+        let seq = edit_during_work(term).await;
+        let hit = engine.search(short.clone(), query(term)).await.unwrap();
+        assert_eq!(hit.cut.projected_seq, seq);
+        assert_eq!(
+            hit.hits[0].card.document.provenance().reference().note_id,
+            sample_note_id(1)
+        );
+        assert_eq!(
+            layout.search_manifest().unwrap().unwrap().active_model,
+            Some(remote_target(5, 512))
+        );
+    }
+    provider.block_next_part.store(true, Ordering::SeqCst);
+    resolver.release_resolution.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            let _ = engine.search(ctx.clone(), semantic.clone()).await.unwrap();
-            if layout.search_manifest().unwrap().unwrap().active_model
-                == Some(remote_target(6, 512))
-            {
+            let manifest = layout.search_manifest().unwrap().unwrap();
+            if manifest.active_model == Some(remote_target(6, 512)) {
+                assert!(manifest.embeddings_pending);
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(40)).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
     .unwrap();
-    assert_eq!(
-        engine
-            .search(ctx.clone(), semantic.clone())
-            .await
-            .unwrap()
-            .hits[0]
-            .card
-            .title,
-        "Repeated note"
+    let unaffected = engine.search(ctx.clone(), semantic.clone()).await.unwrap();
+    assert!(!unaffected.hits.is_empty());
+    assert!(
+        unaffected
+            .hits
+            .iter()
+            .all(|hit| hit.card.document.provenance().reference().note_id != sample_note_id(1))
     );
     assert_eq!(
         provider.queries.lock().unwrap().last(),
         Some(&ProviderResourceId::from_bytes([6; 16]))
     );
-    assert_eq!(provider.parts.load(Ordering::SeqCst), attempts + 1);
+    provider.release_part.notify_one();
+    tokio::time::timeout(Duration::from_secs(8), async {
+        while layout
+            .search_manifest()
+            .unwrap()
+            .unwrap()
+            .embeddings_pending
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    // One base input, one repaired latest input, no restarted backfill.
+    assert_eq!(provider.parts.load(Ordering::SeqCst), attempts + 2);
 
-    // Clean restart with no pending writes or repair must publish the active
-    // embedder immediately so the first semantic query does not degrade.
+    // A stale caller can start the worker before the first current request.
+    // The saved cut belongs to the current incarnation and is reusable.
     engine.shutdown().await;
+    let before = layout.search_manifest().unwrap().unwrap();
+    let lexical_path = layout.index_dir(&before).unwrap();
+    let lexical_files = crate::files(&lexical_path);
+    let vector_path = root.search(&space.scope.space_id, SearchIndexKind::Vector);
+    let vector_files = crate::files(&vector_path);
     let engine = start(resolver.clone());
-    engine.start_space(space.scope.clone()).unwrap();
+    engine
+        .start_space(HistoryScope {
+            space_id: space.scope.space_id.clone(),
+            incarnation: notarium_core::ids::HistoryIncarnation::from_bytes([0xff; 16]),
+        })
+        .unwrap();
     let restarted = engine.search(ctx.clone(), semantic.clone()).await.unwrap();
     assert!(restarted.degraded.is_none());
     assert_eq!(restarted.hits[0].card.title, "Repeated note");
+    assert_eq!(layout.search_manifest().unwrap().unwrap(), before);
+    assert_eq!(crate::files(&lexical_path), lexical_files);
+    assert_eq!(crate::files(&vector_path), vector_files);
+    assert_eq!(provider.parts.load(Ordering::SeqCst), attempts + 2);
 
     provider.fail_indexing.store(true, Ordering::SeqCst);
     provider.block_next_part.store(true, Ordering::SeqCst);

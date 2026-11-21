@@ -250,11 +250,38 @@ impl SearchEngine {
                 SearchDegradation::EmbeddingsPending,
             ));
         };
-        let max = clock
-            .remaining()?
-            .remaining
-            .min(self.services.config.interactive_budget());
-        let (embedder, vector) = match tokio::time::timeout(max, async {
+        let remaining = clock.remaining()?.remaining;
+        // Leave time for lexical hydration when a durable vector mapping or
+        // native model is still opening. Fast reopens can serve the first query.
+        let max = if state.reopening_vectors {
+            remaining / 2
+        } else {
+            remaining
+        };
+        let max = max.min(self.services.config.interactive_budget());
+        let (state, embedder, vector) = match tokio::time::timeout(max, async {
+            let state = if state.reopening_vectors {
+                let mut updated = handle.epoch.subscribe();
+                loop {
+                    let current = handle
+                        .published
+                        .load_full()
+                        .filter(|current| {
+                            current.seq == state.seq
+                                && Arc::ptr_eq(&current.lexical, &state.lexical)
+                        })
+                        .ok_or(EmbeddingError::ModelUnavailable)?;
+                    if !current.reopening_vectors {
+                        break current;
+                    }
+                    updated
+                        .changed()
+                        .await
+                        .map_err(|_| EmbeddingError::Cancelled)?;
+                }
+            } else {
+                state
+            };
             let requested = self
                 .services
                 .model_target(
@@ -327,7 +354,7 @@ impl SearchEngine {
                     filter.project.clone(),
                 )
                 .await?;
-            Ok::<_, EmbeddingError>(Some((embedder, embedding)))
+            Ok::<_, EmbeddingError>(Some((state, embedder, embedding)))
         })
         .await
         {
@@ -347,9 +374,7 @@ impl SearchEngine {
         let pending = state
             .embeddings_pending
             .then_some(SearchDegradation::EmbeddingsPending);
-        let budget = clock.remaining()?;
-        let deadline = clock.deadline.into_std();
-        let vectors = tokio::task::spawn_blocking(move || {
+        let vectors = blocking_search(clock, "vector_search_worker", move |budget| {
             let visible = |note: &NoteId| {
                 snapshot.lookup(note).is_some_and(|node| {
                     filter
@@ -363,18 +388,13 @@ impl SearchEngine {
                 notes: filter.vector_notes.as_ref(),
                 excluded: Some(&excluded),
             };
-            let search = SearchBudget {
-                cancellation: &budget.cancellation,
-                deadline,
-            };
             let index = state
                 .vectors
                 .as_ref()
                 .ok_or(crate::vector::VectorError::CorruptIndex)?;
-            index.search_visible(&vector, &mask, limit, search, visible)
+            index.search_visible(&vector, &mask, limit, budget, visible)
         })
-        .await
-        .map_err(|_| internal("vector_search_worker"))?;
+        .await?;
         match vectors {
             Ok(vectors) => Ok(VectorCandidates {
                 hits: vectors.hits,
@@ -601,37 +621,58 @@ impl Eligible {
     }
 }
 
-struct LexicalWorker {
+struct BlockingSearch<F> {
     stop: notarium_core::ports::Cancellation,
     task: tokio::task::AbortHandle,
+    pending: Arc<std::sync::Mutex<Option<F>>>,
 }
 
-impl Drop for LexicalWorker {
+impl<F> Drop for BlockingSearch<F> {
     fn drop(&mut self) {
         self.stop.cancel();
         self.task.abort();
+        // Tokio can leave an aborted task in a saturated blocking queue.
+        // Release its captured index and projection as soon as the query drops.
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
     }
+}
+
+async fn blocking_search<T: Send + 'static>(
+    clock: &Clock,
+    worker: &'static str,
+    work: impl FnOnce(SearchBudget<'_>) -> T + Send + 'static,
+) -> Result<T, PortError> {
+    clock.remaining()?;
+    let deadline = clock.deadline.into_std();
+    let stop = notarium_core::ports::Cancellation::default();
+    let worker_stop = stop.clone();
+    let pending = Arc::new(std::sync::Mutex::new(Some(work)));
+    let queued = pending.clone();
+    let task = tokio::task::spawn_blocking(move || {
+        let work = queued.lock().unwrap_or_else(|e| e.into_inner()).take()?;
+        Some(work(SearchBudget {
+            cancellation: &worker_stop,
+            deadline,
+        }))
+    });
+    let _guard = BlockingSearch {
+        stop,
+        task: task.abort_handle(),
+        pending,
+    };
+    task.await
+        .map_err(|_| internal(worker))?
+        .ok_or_else(|| internal(worker))
 }
 
 async fn lexical_work<T: Send + 'static>(
     clock: &Clock,
     work: impl FnOnce(SearchBudget<'_>) -> Result<T, LexicalError> + Send + 'static,
 ) -> Result<T, PortError> {
-    clock.remaining()?;
-    let deadline = clock.deadline.into_std();
-    let stop = notarium_core::ports::Cancellation::default();
-    let worker_stop = stop.clone();
-    let task = tokio::task::spawn_blocking(move || {
-        work(SearchBudget {
-            cancellation: &worker_stop,
-            deadline,
-        })
-    });
-    let _guard = LexicalWorker {
-        stop,
-        task: task.abort_handle(),
-    };
-    let result = task.await.map_err(|_| internal("lexical_search_worker"))?;
+    let result = blocking_search(clock, "lexical_search_worker", work).await?;
     clock.remaining()?;
     result.map_err(lexical_error)
 }
@@ -725,18 +766,23 @@ fn lexical_error(error: LexicalError) -> PortError {
 }
 
 #[cfg(test)]
-mod lexical_worker_tests {
+mod blocking_worker_tests {
     use super::*;
     use notarium_core::{ids::RequestId, ports::CallBudget};
     use std::time::Duration;
 
-    #[tokio::test]
-    async fn dropping_the_query_signals_its_active_lexical_worker() {
-        let clock = Clock::new(&CallBudget {
+    fn worker_clock() -> Clock {
+        Clock::new(&CallBudget {
             request: RequestId::from_bytes([44; 16]),
             remaining: Duration::from_secs(10),
             cancellation: Default::default(),
-        }).unwrap();
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn dropping_the_query_signals_its_active_lexical_worker() {
+        let clock = worker_clock();
         let (started, ready) = tokio::sync::oneshot::channel();
         let (resume, wait) = std::sync::mpsc::channel();
         let (finished, stopped) = tokio::sync::oneshot::channel();
@@ -753,5 +799,39 @@ mod lexical_worker_tests {
         drop(query);
         resume.send(()).unwrap();
         assert!(stopped.await.unwrap());
+    }
+
+    #[test]
+    fn dropping_a_queued_vector_search_releases_its_pin_before_the_pool_is_free() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (started, ready) = tokio::sync::oneshot::channel();
+            let (resume, wait) = std::sync::mpsc::channel();
+            let busy = tokio::task::spawn_blocking(move || {
+                started.send(()).unwrap();
+                wait.recv_timeout(Duration::from_secs(5)).unwrap();
+            });
+            ready.await.unwrap();
+            let clock = worker_clock();
+            let index = Arc::new(());
+            let retired = Arc::downgrade(&index);
+            let mut query = Box::pin(blocking_search(&clock, "vector_search_worker", move |_| {
+                drop(index);
+                panic!("cancelled vector search started");
+            }));
+            tokio::select! {
+                biased;
+                _ = &mut query => panic!("vector search ran on the occupied pool"),
+                () = std::future::ready(()) => {}
+            }
+            drop(query);
+            assert!(retired.upgrade().is_none());
+            resume.send(()).unwrap();
+            busy.await.unwrap();
+        });
     }
 }

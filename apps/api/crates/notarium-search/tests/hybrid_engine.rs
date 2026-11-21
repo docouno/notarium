@@ -856,13 +856,12 @@ async fn sqlite_hybrid_seed_causal_boundaries_and_scrub() {
     .unwrap();
     let store = Arc::new(store);
     run_scenario(store.clone(), data.data_root(), 0x42).await;
-    hybrid_support::remote::trashed_ancestor(store.clone(), data.data_root()).await;
+    hybrid_support::remote::folder_eligibility(store.clone(), data.data_root()).await;
     hybrid_support::remote::lexical_fallback(store.clone(), data.data_root()).await;
     chat_candidate_visibility(store.clone(), data.data_root()).await;
     reader_capacity(store.clone(), data.data_root()).await;
     writer_saturation_retires_redacted_chat_across_pages(store.clone(), data.data_root()).await;
     exact_overlay_auth_and_structural_folder_receipts(store.clone(), data.data_root()).await;
-    hybrid_support::remote::model_epochs_and_repair(store.clone(), data.data_root()).await;
     hybrid_support::remote::scoped_backfill_recovers_and_rechecks_selection(
         store.clone(),
         data.data_root(),
@@ -870,6 +869,20 @@ async fn sqlite_hybrid_seed_causal_boundaries_and_scrub() {
     .await;
     hybrid_support::ort::search_with_dynamic_models(store.clone(), data.data_root()).await;
     purge_and_rebind(store, data.data_root()).await;
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn model_epochs_and_repair_while_writes_continue() {
+    let _guard = INTEGRATION_LOCK.lock().await;
+    let data = TempDataRoot::new("search-model-epochs");
+    let (store, runtime) = CanonicalRuntime::open(CanonicalConfig::local_default(
+        sample_installation_id(0x6a),
+        data.data_root(),
+    ))
+    .await
+    .unwrap();
+    hybrid_support::remote::model_epochs_and_repair(Arc::new(store), data.data_root()).await;
     runtime.shutdown().await.unwrap();
 }
 
@@ -886,7 +899,7 @@ async fn postgres_hybrid_seed_causal_boundaries_and_scrub() {
     let (store, runtime) = CanonicalRuntime::open(config).await.unwrap();
     let store = Arc::new(store);
     run_scenario(store.clone(), data.data_root(), 0x43).await;
-    hybrid_support::remote::trashed_ancestor(store.clone(), data.data_root()).await;
+    hybrid_support::remote::folder_eligibility(store.clone(), data.data_root()).await;
     hybrid_support::remote::lexical_fallback(store.clone(), data.data_root()).await;
     chat_candidate_visibility(store.clone(), data.data_root()).await;
     reader_capacity(store.clone(), data.data_root()).await;
@@ -2097,22 +2110,8 @@ async fn exact_overlay_auth_and_structural_folder_receipts(
         },
     );
 
-    // Part A: Move F outside P, edit A with higher term frequency, then move F
-    // back into P while the index and projection remain on the base cut.
+    // Keep the base tree intact while A leaves P at the edited revision.
     pages.hold(seeded.last_seq);
-    store
-        .move_folder(
-            owner_ctx.clone(),
-            mutation(
-                &owner_ctx,
-                MoveFolder {
-                    folder: moving_folder.clone(),
-                    new_parent: None,
-                },
-            ),
-        )
-        .await
-        .unwrap();
     let (edited, edited_revs) = store
         .commit_synthetic_note_batch_for_test(
             &scope,
@@ -2120,29 +2119,59 @@ async fn exact_overlay_auth_and_structural_folder_receipts(
             &owner,
             vec![note(
                 &note_a,
-                &moving_folder,
+                &root_folder,
                 "Moved edit A",
                 "exactauthshared exactauthshared exactauthshared",
             )],
         )
         .await
         .unwrap();
-    let returned = store
-        .move_folder(
-            owner_ctx.clone(),
-            mutation(
-                &owner_ctx,
-                MoveFolder {
-                    folder: moving_folder.clone(),
-                    new_parent: Some(project.clone()),
-                },
-            ),
+    let outside = engine
+        .search(project_viewer.clone(), query("exactauthshared"))
+        .await
+        .unwrap();
+    assert_eq!(outside.hits.len(), 1);
+    assert_eq!(
+        outside.hits[0]
+            .card
+            .document
+            .provenance()
+            .reference()
+            .note_id,
+        note_b
+    );
+
+    let (returned, _) = store
+        .commit_synthetic_note_batch_for_test(
+            &scope,
+            lease,
+            &owner,
+            vec![note(
+                &note_a,
+                &moving_folder,
+                "Returned A",
+                "exactauthshared",
+            )],
         )
         .await
         .unwrap();
     tokio::time::timeout(Duration::from_secs(3), pages.reached.notified())
         .await
         .unwrap();
+
+    // A is visible at the base and at the live head. Its intervening
+    // exact revision still belongs outside the viewer's project.
+    let base = engine
+        .search(project_viewer.clone(), query("exactauthshared"))
+        .await
+        .unwrap();
+    assert_eq!(
+        base.hits
+            .iter()
+            .map(|hit| &hit.card.document.provenance().reference().note_id)
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([&note_a, &note_b])
+    );
 
     let edit_receipt = MutationReceiptToken::new(scope.clone(), edited.last_seq).unwrap();
     let mut viewer_req = query("exactauthshared");
@@ -2181,18 +2210,80 @@ async fn exact_overlay_auth_and_structural_folder_receipts(
         &edited_revs[0].1
     );
 
-    // Advance cleanly before Part B.
     projection
         .snapshot
         .write()
         .unwrap()
-        .advance(returned.receipt.seq());
+        .advance(returned.last_seq);
     pages.release();
-    acknowledged(&store, &root, &scope, returned.receipt.seq()).await;
+    acknowledged(&store, &root, &scope, returned.last_seq).await;
 
-    // Part B: Exact([CreateFolder, CreateNote]) and Exact([SetFolderLifecycle])
-    // must wait for full catch-up instead of scoring against a stale folder tree.
-    pages.hold(returned.receipt.seq());
+    // A note-only receipt following a folder move must wait for the new
+    // structural cut even when the request omits the move receipt.
+    pages.hold(returned.last_seq);
+    store
+        .move_folder(
+            owner_ctx.clone(),
+            mutation(
+                &owner_ctx,
+                MoveFolder {
+                    folder: moving_folder.clone(),
+                    new_parent: None,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let (after_move, after_move_revs) = store
+        .commit_synthetic_note_batch_for_test(
+            &scope,
+            lease,
+            &owner,
+            vec![note(
+                &note_a,
+                &moving_folder,
+                "After move",
+                "afterfoldermovetoken",
+            )],
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), pages.reached.notified())
+        .await
+        .unwrap();
+    let edit_receipt = MutationReceiptToken::new(scope.clone(), after_move.last_seq).unwrap();
+    let mut after_move_req = query("afterfoldermovetoken");
+    after_move_req.causal = CausalBasis::Exact(ReceiptSet::new([edit_receipt]).unwrap());
+    let mut short = owner_ctx.clone();
+    short.budget.remaining = Duration::from_millis(60);
+    assert!(matches!(
+        engine.search(short.clone(), after_move_req.clone()).await,
+        Err(PortError::DeadlineExceeded(_))
+    ));
+
+    {
+        let mut view = projection.snapshot.write().unwrap();
+        view.folder(moving_folder, root_folder.clone());
+        view.advance(after_move.last_seq);
+    }
+    pages.release();
+    acknowledged(&store, &root, &scope, after_move.last_seq).await;
+    let after_move_hits = engine
+        .search(owner_ctx.clone(), after_move_req)
+        .await
+        .unwrap();
+    assert_eq!(after_move_hits.hits.len(), 1);
+    assert_eq!(
+        after_move_hits.hits[0]
+            .card
+            .document
+            .provenance()
+            .revision(),
+        &after_move_revs[0].1
+    );
+
+    // Explicit create and trash receipts also need the corresponding tree.
+    pages.hold(after_move.last_seq);
     let created_folder = sample_folder_id(tag + 3);
     let (_, created_folder_rev, created_folder_seq) = store
         .create_folder(CreateFolderSpec {
@@ -2235,8 +2326,6 @@ async fn exact_overlay_auth_and_structural_folder_receipts(
     structural_req.folder = Some(created_folder.clone());
     structural_req.causal =
         CausalBasis::Exact(ReceiptSet::new([folder_receipt, note_receipt]).unwrap());
-    let mut short = owner_ctx.clone();
-    short.budget.remaining = Duration::from_millis(60);
     assert!(matches!(
         engine.search(short, structural_req.clone()).await,
         Err(PortError::DeadlineExceeded(_))
@@ -2353,7 +2442,7 @@ async fn lexical_evidence_and_live_chat_pagination() {
     let mut last = SpaceSeq::ZERO;
     for index in 0..201 {
         let body = if index == 0 {
-            format!("pageterm {}", "background ".repeat(48))
+            format!("pageterm {}", "background ".repeat(16))
         } else {
             "pageterm pageterm".into()
         };

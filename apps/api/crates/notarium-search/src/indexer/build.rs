@@ -10,12 +10,15 @@ use crate::{
 use notarium_canonical::chats::search::HydratedChatHit;
 use notarium_core::{
     classes::{ClassEgressFence, DocClass, SearchContent},
-    ids::{ChatThreadId, SpaceSeq, ThreadEntrySeq},
+    ids::{ChatThreadId, FolderId, NoteId, SpaceSeq, ThreadEntrySeq},
     model::Lifecycle,
     ports::PageLimit,
     receipt::ChangeCursor,
 };
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{BTreeSet, HashMap},
+    sync::Arc,
+};
 
 pub(super) async fn scrub(
     cx: &Context<'_>,
@@ -37,97 +40,7 @@ pub(super) async fn scrub(
     lexical_error.map_or(Ok(()), Err)
 }
 
-pub(super) async fn seed(
-    cx: &Context<'_>,
-    publisher: &mut Publisher<'_>,
-    layout: Arc<SearchLayout>,
-    cutoff: &ChangeCursor,
-    prior: Option<&Disk>,
-) -> Result<Disk, IndexError> {
-    // The lexical reader owns the searchable cut. A slow model may populate
-    // it afterwards, and a change of model reuses the same lexical generation.
-    let mut disk = if let Some(prior) = prior {
-        if prior.cursor() != *cutoff {
-            return Err(IndexError::Inconsistent);
-        }
-        Disk {
-            layout: layout.clone(),
-            manifest: prior.manifest.clone(),
-            folders: prior.folders.clone(),
-            lexical: prior.lexical.clone(),
-            epoch: None,
-            embedder: None,
-            embedding_failures: prior.embedding_failures,
-            vector_last_use: std::time::Instant::now(),
-        }
-    } else {
-        let disk = seed_lexical(cx, layout.clone(), cutoff).await?;
-        disk.layout.publish_search(&disk.manifest)?;
-        publisher.publish(&disk);
-        disk
-    };
-
-    let prepared = cx
-        .while_current(cutoff, async {
-            let target = cx.services.model_target(&cutoff.scope, None, None).await?;
-            let Some(target) = target else {
-                return Ok((None, None, None));
-            };
-            let model = target.vector_model();
-            if prior
-                .and_then(|prior| prior.epoch.as_ref())
-                .is_some_and(|epoch| epoch.matches_model(&model))
-            {
-                return Err(IndexError::Inconsistent);
-            }
-            let embedder = match cx.services.embedder(target.clone()).await {
-                Ok(embedder) => Arc::new(embedder),
-                Err(error) if prior.is_some_and(|prior| prior.manifest.vector_seq.is_some()) => {
-                    return Err(error.into());
-                }
-                Err(_) => return Ok((Some(target), None, None)),
-            };
-            let replacing = prior.is_some_and(|prior| prior.manifest.vector_seq.is_some());
-            let vectors =
-                seed_vectors(cx, cutoff, &disk.folders, &embedder, model, replacing).await?;
-            if cx
-                .services
-                .model_target(&cutoff.scope, None, None)
-                .await?
-                .as_ref()
-                != Some(&target)
-            {
-                return Err(crate::embed::EmbeddingError::ModelUnavailable.into());
-            }
-            Ok::<_, IndexError>((Some(target), Some(embedder), Some(vectors)))
-        })
-        .await?;
-    let (target, embedder, vectors) = match prepared {
-        Some(Ok(result)) => result,
-        Some(Err(error)) if prior.is_some() || error.requires_reseed() => return Err(error),
-        None if prior.is_some() => {
-            return Err(crate::embed::EmbeddingError::ModelUnavailable.into());
-        }
-        _ => return Ok(disk),
-    };
-    let (epoch, pending) = match vectors {
-        Some(vectors) => {
-            layout.remove_model_epoch(&vectors.model)?;
-            let (epoch, pending) = vectors.finish(layout.clone(), cutoff.after).await?;
-            (Some(epoch), pending)
-        }
-        None => (None, target.is_some()),
-    };
-    disk.manifest.vector_seq = epoch.as_ref().map(|_| cutoff.after);
-    disk.manifest.active_model = target;
-    disk.manifest.embeddings_pending = pending;
-    disk.epoch = epoch;
-    disk.embedder = embedder;
-    disk.layout.publish_search(&disk.manifest)?;
-    Ok(disk)
-}
-
-async fn seed_lexical(
+pub(super) async fn seed_lexical(
     cx: &Context<'_>,
     layout: Arc<SearchLayout>,
     cutoff: &ChangeCursor,
@@ -187,26 +100,240 @@ async fn seed_lexical(
     result
 }
 
+/// Build against a frozen cut. Ordinary edits advance the lexical reader
+/// while this future keeps the builder, cursor, and in-flight embedding.
 pub(super) async fn refresh_model(
     cx: &Context<'_>,
     publisher: &mut Publisher<'_>,
     disk: &mut Disk,
-) -> Result<Option<Disk>, IndexError> {
-    let cutoff = disk.cursor();
-    let selected = cx.services.model_target(&cutoff.scope, None, None).await?;
-    if disk.manifest.active_model == selected
-        && (!disk.manifest.embeddings_pending || disk.manifest.vector_seq.is_some())
-    {
-        return Ok(None);
+) -> Result<bool, IndexError> {
+    let base = disk.cursor();
+    let active = disk.manifest.active_model.clone();
+    let have_epoch = disk.manifest.vector_seq.is_some();
+    let pending = disk.manifest.embeddings_pending;
+    let folders = disk.folders.clone();
+    let mut dirty = super::ChangedNotes::default();
+    let prepared = super::during_model_work(cx, disk, publisher, &mut dirty, async {
+        let target = cx.services.model_target(&base.scope, None, None).await?;
+        if target == active && (!pending || have_epoch) {
+            return Ok(None);
+        }
+        let Some(target) = target else {
+            return Ok(Some((None, None, None)));
+        };
+        let embedder = match cx.services.embedder(target.clone()).await {
+            Ok(embedder) => Arc::new(embedder),
+            Err(error) if have_epoch => return Err(error.into()),
+            Err(_) => return Ok(Some((Some(target), None, None))),
+        };
+        let vectors = seed_vectors(
+            cx,
+            &base,
+            &folders,
+            &embedder,
+            target.vector_model(),
+            have_epoch,
+        )
+        .await?;
+        Ok(Some((Some(target), Some(embedder), Some(vectors))))
+    })
+    .await?;
+    let Some((target, embedder, vectors)) = prepared else {
+        return Ok(false);
+    };
+    let staging_model = vectors.as_ref().map(|vectors| vectors.model.clone());
+    if staging_model.as_ref().is_some_and(|model| {
+        disk.epoch
+            .as_ref()
+            .is_some_and(|epoch| epoch.matches_model(model))
+    }) {
+        return Err(IndexError::Inconsistent);
     }
-    let reader = disk.resume_reader(cx)?;
-    let vectors = disk.resume_vectors(cx).await?;
-    if reader || vectors {
-        publisher.publish(disk);
+    let staged = async {
+        let (mut epoch, mut pending) = match vectors {
+            Some(vectors) => {
+                disk.layout.remove_model_epoch(&vectors.model)?;
+                let mut writer = vectors.finish(disk.layout.clone(), base.after);
+                let written = super::during_model_work(cx, disk, publisher, &mut dirty, async {
+                    Ok((&mut writer).await)
+                })
+                .await;
+                let (epoch, pending) = match written {
+                    Ok(result) => result.map_err(|_| IndexError::Inconsistent)??,
+                    Err(error) => {
+                        // The blocking write must leave the directory before
+                        // a purge or shutdown can remove the staged files.
+                        let _ = writer.await;
+                        return Err(error);
+                    }
+                };
+                (Some(epoch), pending)
+            }
+            None => (None, target.is_some()),
+        };
+        let mut folder_events = dirty.take_remote_folders(target.as_ref());
+        loop {
+            if let (Some(epoch), Some(embedder)) = (epoch.as_mut(), embedder.as_ref()) {
+                let cutoff = disk.cursor();
+                if !folder_events.is_empty() {
+                    let descendants = super::during_model_work(
+                        cx,
+                        disk,
+                        publisher,
+                        &mut dirty,
+                        subtree_notes(cx, &cutoff, &folder_events),
+                    )
+                    .await?;
+                    dirty.notes.extend(descendants);
+                }
+                if !dirty.notes.is_empty() {
+                    let ids = std::mem::take(&mut dirty.notes).into_iter().collect();
+                    let cutoff = disk.cursor();
+                    let folders = disk.folders.clone();
+                    pending |= super::during_model_work(
+                        cx,
+                        disk,
+                        publisher,
+                        &mut dirty,
+                        refresh_notes(cx, epoch, embedder, &cutoff, &folders, ids),
+                    )
+                    .await?;
+                    if pending && have_epoch {
+                        return Err(crate::embed::EmbeddingError::ModelUnavailable.into());
+                    }
+                }
+            }
+            let selected = super::during_model_work(cx, disk, publisher, &mut dirty, async {
+                Ok(cx.services.model_target(&base.scope, None, None).await?)
+            })
+            .await?;
+            if selected != target {
+                return Err(crate::embed::EmbeddingError::ModelUnavailable.into());
+            }
+            folder_events = dirty.take_remote_folders(target.as_ref());
+            if epoch.is_none() || folder_events.is_empty() {
+                break;
+            }
+        }
+        if let Some(epoch) = epoch.as_mut() {
+            // The replacement is complete for the replay cut. Newer edits
+            // receive the same durable invalidation as live edits on an active
+            // epoch, so promotion never waits for a quiet stream of writers.
+            let seq = disk.manifest.tantivy_seq;
+            pending |= !dirty.notes.is_empty();
+            for id in dirty.notes {
+                epoch.apply(seq, crate::vector::MutableOperation::Delete(id))?;
+            }
+            epoch.checkpoint(seq)?;
+        }
+        Ok((epoch, pending))
     }
-    seed(cx, publisher, disk.layout.clone(), &cutoff, Some(disk))
-        .await
-        .map(Some)
+    .await;
+    let (epoch, pending) = match staged {
+        Ok(staged) => staged,
+        Err(error) => {
+            if let Some(model) = staging_model {
+                disk.layout.remove_model_epoch(&model)?;
+            }
+            return Err(error);
+        }
+    };
+    let mut manifest = disk.manifest.clone();
+    manifest.vector_seq = epoch.as_ref().map(|_| manifest.tantivy_seq);
+    manifest.active_model = target;
+    manifest.embeddings_pending = pending;
+    disk.layout.publish_search(&manifest)?;
+    disk.manifest = manifest;
+    disk.epoch = epoch;
+    disk.embedder = embedder;
+    publisher.publish(disk);
+    Ok(true)
+}
+
+/// A folder transition need only replay descendants. Preserve the candidate
+/// and its embeddings for notes outside the affected subtrees.
+async fn subtree_notes(
+    cx: &Context<'_>,
+    cutoff: &ChangeCursor,
+    folders: &BTreeSet<FolderId>,
+) -> Result<Vec<NoteId>, IndexError> {
+    let mut notes = Vec::new();
+    let mut after = None;
+    loop {
+        let page = note_page(cx, cutoff, after).await?;
+        for note in page.notes {
+            if let Ok(content) =
+                ClassEgressFence::index_for_search(note.document, &cx.services.authority)
+                && content.was_under_any_folder(folders)
+            {
+                notes.push(note.note_id);
+            }
+        }
+        after = page.next_after;
+        if after.is_none() {
+            return Ok(notes);
+        }
+    }
+}
+
+async fn refresh_notes(
+    cx: &Context<'_>,
+    epoch: &mut VectorEpoch,
+    embedder: &Embedder,
+    cutoff: &ChangeCursor,
+    folders: &FolderDictionary,
+    ids: Vec<notarium_core::ids::NoteId>,
+) -> Result<bool, IndexError> {
+    let mut pending = false;
+    for batch in ids.chunks(200) {
+        let rows = cx
+            .services
+            .deps
+            .carriers
+            .read_note_documents_at_cutoff(
+                cx.services.authority.clone(),
+                cx.budget(),
+                cutoff.scope.clone(),
+                cutoff.after,
+                batch.to_vec(),
+            )
+            .await?;
+        for (note_id, note) in rows {
+            let chunks = if let Some(note) = note
+                && ClassEgressFence::index_for_search(note.document.clone(), &cx.services.authority)
+                    .is_ok()
+            {
+                let folder = folders
+                    .get(&note.parent_folder_id)
+                    .ok_or(IndexError::Inconsistent)?;
+                let (chunks, missing) = embedder
+                    .index_note(IndexNote {
+                        services: cx.services,
+                        scope: &cutoff.scope,
+                        note: &note,
+                        folder: folder.get(),
+                        budget: cx.budget(),
+                        priority: Priority::LiveNoteEdit,
+                        existing: &|key| epoch.find_vector(key),
+                    })
+                    .await?;
+                pending |= missing;
+                chunks
+            } else {
+                Vec::new()
+            };
+            if !epoch.matches_note_chunks(&note_id, &chunks) {
+                epoch.apply(
+                    cutoff.after,
+                    crate::vector::MutableOperation::Upsert {
+                        note: note_id,
+                        chunks,
+                    },
+                )?;
+            }
+        }
+    }
+    Ok(pending)
 }
 
 pub(super) async fn publish_seed(
@@ -521,17 +648,15 @@ impl SeedVectors {
         Ok(())
     }
 
-    async fn finish(
+    fn finish(
         self,
         layout: Arc<SearchLayout>,
         seq: SpaceSeq,
-    ) -> Result<(VectorEpoch, bool), IndexError> {
+    ) -> tokio::task::JoinHandle<Result<(VectorEpoch, bool), IndexError>> {
         tokio::task::spawn_blocking(move || {
             let mut epoch = VectorEpoch::open_model(layout, self.model)?;
             epoch.seed(self.builder.ok_or(IndexError::Inconsistent)?, seq)?;
             Ok((epoch, self.pending))
         })
-        .await
-        .map_err(|_| IndexError::Inconsistent)?
     }
 }

@@ -139,16 +139,23 @@ impl ProviderService {
             .control
             .revalidate_with_keeper(tx, ctx.auth(), keeper)
             .await?;
-        if let Some(AuthenticatedCredential::SearchIndexing { space, provider }) = auth.credential()
-            && (provider.as_str() != snapshot.resource.id
-                || primary.is_none_or(|primary| &primary.space.id != space)
-                || embedding_inputs.is_empty()
-                || embedding_inputs
-                    .iter()
-                    .any(|input| !matches!(input, EmbeddingInput::Part(_))))
-        {
-            return Err(DomainError::AccessDenied.into());
-        }
+        let indexing_project =
+            if let Some(AuthenticatedCredential::SearchIndexing { space, provider }) =
+                auth.credential()
+            {
+                if provider.as_str() != snapshot.resource.id
+                    || primary.is_none_or(|primary| &primary.space.id != space)
+                    || embedding_inputs.is_empty()
+                    || embedding_inputs
+                        .iter()
+                        .any(|input| !matches!(input, EmbeddingInput::Part(_)))
+                {
+                    return Err(DomainError::AccessDenied.into());
+                }
+                project
+            } else {
+                None
+            };
         let resource = resource(tx, &snapshot.resource.id).await?;
         if resource.owner_id != snapshot.resource.owner_id
             || resource.runtime_epoch != snapshot.resource.runtime_epoch
@@ -268,6 +275,7 @@ impl ProviderService {
             if admitted
                 .project_only
                 .as_ref()
+                .or(indexing_project)
                 .is_some_and(|project| !part.in_project(project) || !metadata.in_project(project))
             {
                 return Err(DomainError::AccessDenied.into());

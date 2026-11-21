@@ -40,6 +40,7 @@ pub(super) async fn apply(
     publisher: &mut Publisher<'_>,
     cutoff: ChangeCursor,
     changes: Vec<Change>,
+    defer_embeddings: bool,
 ) -> Result<(), IndexError> {
     let mut notes = BTreeMap::new();
     let mut threads = BTreeSet::new();
@@ -51,17 +52,13 @@ pub(super) async fn apply(
             EntityId::Thread(thread) => {
                 threads.insert(thread);
             }
-            EntityId::Folder(_)
-                if change.kind == ChangeKind::Restore
-                    && disk.manifest.active_model.as_ref().is_some_and(|target| {
-                        matches!(
-                            target.backend,
-                            crate::ports::EmbeddingBackendTarget::Remote { .. }
-                        )
-                    }) =>
-            {
-                // A remote seed can omit descendants of a trashed folder.
-                // Restoration reopens those notes for bounded embedding repair.
+            EntityId::Folder(_) if disk.manifest.active_model.as_ref().is_some_and(|target| {
+                matches!(&target.backend, crate::ports::EmbeddingBackendTarget::Remote { project, .. }
+                    if change.kind == ChangeKind::Restore
+                        || (change.kind == ChangeKind::Move && project.is_some()))
+            }) => {
+                // A restore or move across the selected project boundary can
+                // change remote eligibility without a descendant note event.
                 disk.manifest.embeddings_pending = true;
                 disk.embedding_failures = disk.embedding_failures.wrapping_add(1);
             }
@@ -148,6 +145,15 @@ pub(super) async fn apply(
     }
     let previous_pending = disk.manifest.embeddings_pending;
     let mut previous_vectors = std::collections::HashMap::new();
+    if disk.epoch.is_none()
+        && disk.manifest.vector_seq.is_some()
+        && (!updated_notes.is_empty() || !deleted.is_empty())
+    {
+        // A concurrent warm reopen will mask the changed slots after validation.
+        // A crash before then must not expose their previous revisions.
+        disk.manifest.vector_seq = None;
+        disk.manifest.embeddings_pending = true;
+    }
     if let Some(epoch) = &mut disk.epoch
         && (!updated_notes.is_empty() || !deleted.is_empty())
     {
@@ -176,6 +182,10 @@ pub(super) async fn apply(
     // Publishing the cut certifies that any redacted files have been removed.
     disk.layout.publish_search(&disk.manifest)?;
     publisher.publish(disk);
+    if defer_embeddings && !updated_notes.is_empty() {
+        disk.embedding_failures = disk.embedding_failures.wrapping_add(1);
+        return Ok(());
+    }
     if disk.epoch.is_some() && !updated_notes.is_empty() {
         // Missing work survives a crash in the pending manifest. Readers can
         // already search the new text and cannot rank the old vector slots.
@@ -315,7 +325,7 @@ impl EmbeddingRepair {
             return Err(IndexError::Inconsistent);
         }
         let epoch = disk.epoch.as_mut().ok_or(IndexError::Inconsistent)?;
-        let mut changed = false;
+        let mut vectors_changed = false;
         for note in page.notes {
             let folder = disk
                 .folders
@@ -341,21 +351,34 @@ impl EmbeddingRepair {
                         chunks,
                     },
                 )?;
-                changed = true;
+                vectors_changed = true;
             }
         }
         self.after = page.next_after;
+        let previous_pending = disk.manifest.embeddings_pending;
         if self.after.is_none() {
             let pending = self.pending || self.started_failures != disk.embedding_failures;
-            changed |= pending != disk.manifest.embeddings_pending;
             disk.manifest.embeddings_pending = pending;
-            self.defer();
+            if pending {
+                self.defer();
+            } else {
+                *self = Self::default();
+            }
         } else {
             self.next = tokio::time::Instant::now() + Duration::from_millis(25);
         }
-        if changed {
+        // An interrupted page may already have journaled chunks before its
+        // final checkpoint. Publish those writes even if this retry reused them.
+        let needs_checkpoint = vectors_changed
+            || disk
+                .manifest
+                .vector_seq
+                .is_none_or(|seq| !epoch.is_checkpointed(seq));
+        if needs_checkpoint {
             epoch.checkpoint(cutoff.after)?;
             disk.manifest.vector_seq = Some(cutoff.after);
+        }
+        if needs_checkpoint || previous_pending != disk.manifest.embeddings_pending {
             disk.layout.publish_search(&disk.manifest)?;
             publisher.publish(disk);
         }

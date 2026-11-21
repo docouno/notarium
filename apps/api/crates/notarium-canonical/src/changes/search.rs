@@ -357,6 +357,7 @@ impl CanonicalStore {
         budget: CallBudget,
         scope: HistoryScope,
         note: NoteId,
+        project: Option<FolderId>,
     ) -> Result<bool, PortError> {
         authority.require(ServicePurpose::Search)?;
         self.with_read_tx_budget(Some(&budget), |tx| {
@@ -365,7 +366,12 @@ impl CanonicalStore {
                 let mut live = FolderAncestryCache::default();
                 Ok(live_search_facts(tx, &space, &note, &mut live)
                     .await?
-                    .is_some_and(|facts| live.all_active(&facts.ancestor_folders)))
+                    .is_some_and(|facts| {
+                        live.all_active(&facts.ancestor_folders)
+                            && project
+                                .as_ref()
+                                .is_none_or(|id| facts.ancestor_folders.contains(id))
+                    }))
             })
         })
         .await

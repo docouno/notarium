@@ -5,8 +5,8 @@ use crate::{
     document::{ChunkDescriptor, render_chunk},
     error::ValidationReason,
     ids::{
-        ChatThreadId, ContentDigest, ModelProfileId, ProviderResourceId, RevisionId, SpaceId,
-        ThreadEntrySeq,
+        ChatThreadId, ContentDigest, FolderId, ModelProfileId, ProviderResourceId, RevisionId,
+        SpaceId, ThreadEntrySeq,
     },
     model::{AbilityResourceRef, Lifecycle, NoteRef},
     ports::{ServiceAuthority, ServicePurpose},
@@ -403,6 +403,17 @@ macro_rules! content_wrapper {
 }
 content_wrapper!(ProjectionContent);
 content_wrapper!(SearchContent);
+impl SearchContent {
+    /// Match a subtree at the canonical cut captured by the indexed carrier.
+    pub fn was_under_any_folder(&self, folders: &BTreeSet<FolderId>) -> bool {
+        self.0
+            .facts
+            .recorded
+            .ancestor_folders
+            .iter()
+            .any(|id| folders.contains(id))
+    }
+}
 
 /// A source-bound extraction result, preserving the original canonical identity.
 /// Token count/key/model are assertions of the trusted tokenizer owner; text and

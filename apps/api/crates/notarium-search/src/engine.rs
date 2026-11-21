@@ -87,6 +87,7 @@ pub(super) struct Published {
     pub active_model: Option<crate::ports::ResolvedEmbeddingTarget>,
     pub embedder: Option<Arc<crate::model::Embedder>>,
     pub embeddings_pending: bool,
+    pub reopening_vectors: bool,
 }
 
 pub(super) struct SpaceHandle {
@@ -307,10 +308,12 @@ pub(super) fn invalid(reason: ValidationReason) -> PortError {
     DomainError::validation(reason).into()
 }
 
+pub(super) const MAINTENANCE_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub(super) fn maintenance_budget(cancellation: &Cancellation, request: RequestId) -> CallBudget {
     CallBudget {
         request,
         cancellation: cancellation.clone(),
-        remaining: Duration::from_secs(30),
+        remaining: MAINTENANCE_TIMEOUT,
     }
 }

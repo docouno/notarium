@@ -12,7 +12,7 @@ use crate::{
 use notarium_core::{
     DomainError,
     error::{PortError, ValidationReason},
-    ids::{RequestId, SpaceSeq},
+    ids::{FolderId, NoteId, RequestId, SpaceSeq},
     model::HistoryScope,
     ports::{
         CallBudget, ChangeNotice, ChangeRead, ChangeReadResult, MaintenanceContext, PageLimit,
@@ -20,6 +20,7 @@ use notarium_core::{
     receipt::ChangeCursor,
 };
 use std::{
+    collections::BTreeSet,
     sync::{
         Arc, Weak,
         atomic::{AtomicU64, Ordering},
@@ -45,6 +46,8 @@ enum IndexError {
     Vector(#[from] VectorError),
     #[error("embedding model unavailable")]
     Embedding(#[from] crate::embed::EmbeddingError),
+    #[error("the staged cut requires retirement")]
+    Retire,
     #[error("index checkpoints disagree")]
     Inconsistent,
 }
@@ -52,13 +55,15 @@ enum IndexError {
 impl IndexError {
     fn requires_reseed(&self) -> bool {
         match self {
+            Self::Retire => true,
             Self::Port(PortError::Domain(error)) | Self::Domain(error) => error.requires_resync(),
             _ => false,
         }
     }
 
     fn requires_scrub(&self) -> bool {
-        matches!(self, Self::Port(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
+        matches!(self, Self::Retire)
+            || matches!(self, Self::Port(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
             | Self::Domain(DomainError::ValidationFailed { diagnostic })
             if matches!(diagnostic.reason, ValidationReason::CursorStale | ValidationReason::PurgeResync))
     }
@@ -206,23 +211,89 @@ impl Disk {
         false
     }
 
-    async fn resume_epoch(&mut self) -> Result<bool, IndexError> {
-        self.vector_last_use = Instant::now();
-        if self.epoch.is_none() && self.manifest.vector_seq.is_some() {
-            let layout = self.layout.clone();
-            let manifest = self.manifest.clone();
-            self.epoch = tokio::task::spawn_blocking(move || open_vector_epoch(layout, &manifest))
-                .await
-                .map_err(|_| IndexError::Inconsistent)??;
-            return Ok(self.epoch.is_some());
-        }
-        Ok(false)
+    fn start_epoch_reopen(&self) -> tokio::task::JoinHandle<Result<VectorEpoch, IndexError>> {
+        let layout = self.layout.clone();
+        let manifest = self.manifest.clone();
+        tokio::task::spawn_blocking(move || open_vector_epoch(layout, &manifest))
     }
 
-    async fn resume_vectors(&mut self, cx: &Context<'_>) -> Result<bool, IndexError> {
-        let epoch = self.resume_epoch().await?;
-        let embedder = self.ensure_embedder(cx).await;
-        Ok(epoch || embedder)
+    async fn resume_vectors(
+        &mut self,
+        cx: &Context<'_>,
+        publisher: &mut Publisher<'_>,
+    ) -> Result<bool, IndexError> {
+        self.vector_last_use = Instant::now();
+        let result = self.reopen_vectors(cx, publisher).await;
+        if result.as_ref().is_err_and(IndexError::requires_scrub) {
+            self.lexical.take();
+            self.epoch.take();
+            self.embedder.take();
+            build::scrub(cx, publisher, &self.layout).await?;
+        }
+        result
+    }
+
+    async fn reopen_vectors(
+        &mut self,
+        cx: &Context<'_>,
+        publisher: &mut Publisher<'_>,
+    ) -> Result<bool, IndexError> {
+        let mut changed = false;
+        if self.epoch.is_none() && self.manifest.vector_seq.is_some() {
+            let mut loader = self.start_epoch_reopen();
+            let mut dirty = ChangedNotes::default();
+            let result = during_model_work(cx, self, publisher, &mut dirty, async {
+                Ok((&mut loader).await)
+            })
+            .await;
+            let opened = match result {
+                Ok(joined) => joined.map_err(|_| IndexError::Inconsistent)?,
+                Err(error) => {
+                    if error.requires_scrub() {
+                        publisher.replace(None);
+                    }
+                    // Validation can reclaim obsolete files. Finish its disk
+                    // access before the owner retires or reopens the epoch.
+                    let _ = loader.await;
+                    return Err(error);
+                }
+            };
+            match opened {
+                Ok(mut epoch) => {
+                    if !dirty.notes.is_empty() {
+                        let seq = self.manifest.tantivy_seq;
+                        for id in dirty.notes {
+                            epoch.apply(seq, crate::vector::MutableOperation::Delete(id))?;
+                        }
+                        epoch.checkpoint(seq)?;
+                        self.manifest.vector_seq = Some(seq);
+                        self.manifest.embeddings_pending = true;
+                        self.layout.publish_search(&self.manifest)?;
+                    }
+                    self.epoch = Some(epoch);
+                }
+                Err(error) => {
+                    tracing::warn!(kind = %error, "search vector checkpoint needs rebuilding");
+                    self.manifest.vector_seq = None;
+                    self.manifest.embeddings_pending = true;
+                    self.layout.publish_search(&self.manifest)?;
+                    self.embedder = None;
+                }
+            }
+            changed = true;
+        }
+        if self.epoch.is_some()
+            && self.embedder.is_none()
+            && let Some(active) = self.manifest.active_model.clone()
+        {
+            self.embedder =
+                during_model_work(cx, self, publisher, &mut ChangedNotes::default(), async {
+                    Ok(cx.services.embedder(active).await.ok().map(Arc::new))
+                })
+                .await?;
+            changed |= self.embedder.is_some();
+        }
+        Ok(changed)
     }
 
     fn release_idle_vectors(&mut self, now: Instant, idle: Duration) {
@@ -258,6 +329,7 @@ impl Publisher<'_> {
             active_model: disk.manifest.active_model.clone(),
             embedder: disk.embedder.clone(),
             embeddings_pending: disk.manifest.embeddings_pending,
+            reopening_vectors: disk.manifest.vector_seq.is_some() && disk.epoch.is_none(),
         })));
     }
 
@@ -336,9 +408,6 @@ async fn consume_with_schedule(
         &cx.services.config.data_root,
         scope.clone(),
     )?);
-    if scope != starting_scope {
-        layout.clear_lexical_manifests()?;
-    }
     if record.space.lifecycle != notarium_core::auth::SpaceLifecycle::Active {
         // Archiving can race a purge or redaction. Retire every derived copy
         // before waiting for reactivation, without opening a reader or carrier.
@@ -371,8 +440,11 @@ async fn consume_with_schedule(
         });
     let changes = &cx.services.deps.changes;
     let mut subscription = changes.subscribe(cx.maintenance(), start).await?;
-    if let Some(disk) = &disk {
+    if let Some(disk) = &mut disk {
         publisher.publish(disk);
+        if disk.resume_vectors(cx, publisher).await? {
+            publisher.publish(disk);
+        }
     }
     let mut ticker = interval(tick_interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -393,7 +465,7 @@ async fn consume_with_schedule(
                     () = cx.handle.wake.notified() => ChangeNotice::Lagged { resume },
                     _ = tokio::time::sleep_until(repair.next()), if disk.as_ref().is_some_and(Disk::needs_embedding_repair) => {
                         if let Some(current) = &mut disk {
-                            if current.resume_vectors(cx).await? {
+                            if current.resume_vectors(cx, publisher).await? {
                                 publisher.publish(current);
                             }
                             let cutoff = current.cursor();
@@ -409,30 +481,7 @@ async fn consume_with_schedule(
                             && (retry_model || (current.manifest.embeddings_pending
                                 && current.manifest.vector_seq.is_none()))
                         {
-                            match build::refresh_model(cx, publisher, current).await {
-                                Ok(seeded) => {
-                                    if let Some(seeded) = seeded {
-                                        drop(disk.replace(seeded));
-                                        repair = update::EmbeddingRepair::default();
-                                        build::publish_seed(cx, publisher, disk.as_ref().expect("refreshed seed")).await?;
-                                    }
-                                    retry_model = false;
-                                    model_retry_delay = Duration::from_secs(1);
-                                }
-                                Err(error) if error.requires_reseed() => {
-                                    if error.requires_scrub() {
-                                        drop(disk.take());
-                                        build::scrub(cx, publisher, &layout).await?;
-                                    }
-                                    return Err(error);
-                                }
-                                Err(error) => {
-                                    tracing::warn!(kind = %error, "search model refresh will retry");
-                                    retry_model = true;
-                                    next_model_check = Instant::now() + model_retry_delay;
-                                    model_retry_delay = (model_retry_delay * 2).min(Duration::from_secs(300));
-                                }
-                            }
+                            break ChangeNotice::Lagged { resume };
                         }
                         if let Some(disk) = &mut disk {
                             update::maintain_vectors(disk, publisher).await?;
@@ -455,6 +504,16 @@ async fn consume_with_schedule(
             return Ok(Some(scope));
         }
         let (target, mut scrub, mut rebind, force_seed) = match event {
+            // Subscribing at zero requests a seed even for an empty Space
+            // whose empty checkpoint was already verified on disk.
+            ChangeNotice::SeedRequired { cutoff }
+                if cutoff.after == SpaceSeq::ZERO
+                    && disk
+                        .as_ref()
+                        .is_some_and(|current| current.cursor() == cutoff) =>
+            {
+                (cutoff, false, false, false)
+            }
             ChangeNotice::SeedRequired { cutoff } => (cutoff, true, false, true),
             ChangeNotice::PurgeResync { cutoff } => (cutoff, true, false, true),
             ChangeNotice::Advanced(target) => (target, false, false, false),
@@ -471,7 +530,8 @@ async fn consume_with_schedule(
             && let Some(current) = disk.as_ref()
             && current.lexical.is_none()
             && current.manifest.tantivy_seq < target.after
-            && cx.requires_scrub(current.cursor()).await?
+            && (cx.requires_scrub(current.cursor()).await?
+                || cx.has_pending_redaction(current.cursor()).await?)
         {
             drop(disk.take());
             build::scrub(cx, publisher, &layout).await?;
@@ -480,8 +540,10 @@ async fn consume_with_schedule(
         if !force_seed && let Some(current) = &mut disk {
             let resumed = match current.resume_reader(cx) {
                 Ok(reopened) => {
-                    let vectors = current.resume_vectors(cx).await?;
-                    if reopened || vectors {
+                    if reopened {
+                        publisher.publish(current);
+                    }
+                    if current.resume_vectors(cx, publisher).await? {
                         publisher.publish(current);
                     }
                     true
@@ -499,7 +561,7 @@ async fn consume_with_schedule(
             };
             if resumed && let Some(current) = &mut disk {
                 let catch_up = if current.manifest.tantivy_seq < target.after {
-                    catch_up(cx, current, publisher, target.clone()).await
+                    catch_up(cx, current, publisher, target.clone(), None).await
                 } else {
                     Ok(false)
                 };
@@ -528,64 +590,50 @@ async fn consume_with_schedule(
                 }
             }
         }
-        if seed_at.is_none()
-            && Instant::now() >= next_model_check
-            && let Some(current) = &mut disk
-            && let Ok(selected) = cx.services.model_target(&scope, None, None).await
-        {
-            let selection_changed = current.manifest.active_model != selected;
-            let backfill = current.manifest.vector_seq.is_none() && selected.is_some();
-            if selection_changed || backfill {
-                seed_at = Some(target.clone());
+        if let Some(cutoff) = seed_at {
+            if scrub {
+                drop(disk.take());
+                build::scrub(cx, publisher, &layout).await?;
             }
+            let seeded = build::seed_lexical(cx, layout.clone(), &cutoff).await?;
+            seeded.layout.publish_search(&seeded.manifest)?;
+            disk = Some(seeded);
+            build::publish_seed(cx, publisher, disk.as_ref().expect("lexical seed")).await?;
+            repair = update::EmbeddingRepair::default();
+            next_model_check = Instant::now();
         }
-        if let Some(mut cutoff) = seed_at {
-            loop {
-                if scrub {
-                    drop(disk.take());
-                    build::scrub(cx, publisher, &layout).await?;
-                }
-                match build::seed(cx, publisher, layout.clone(), &cutoff, disk.as_ref()).await {
-                    Ok(seeded) => {
-                        drop(disk.replace(seeded));
+        if Instant::now() >= next_model_check
+            && let Some(current) = &mut disk
+        {
+            match build::refresh_model(cx, publisher, current).await {
+                Ok(changed) => {
+                    if changed {
                         repair = update::EmbeddingRepair::default();
-                        retry_model = false;
-                        model_retry_delay = Duration::from_secs(1);
-                        build::publish_seed(cx, publisher, disk.as_ref().expect("seed installed"))
-                            .await?;
-                        break;
+                        build::publish_seed(cx, publisher, current).await?;
                     }
-                    Err(error) if error.requires_reseed() => {
-                        let retired = error.requires_scrub();
-                        if retired {
-                            drop(disk.take());
-                            build::scrub(cx, publisher, &layout).await?;
-                        }
-                        let latest = cx.latest(&scope).await?;
-                        if latest.scope != scope {
-                            layout.clear_lexical_manifests()?;
-                            return Ok(Some(latest.scope));
-                        }
-                        if latest.after <= cutoff.after {
-                            return Err(error);
-                        }
-                        cutoff = latest;
-                        rebind = true;
-                        scrub = !retired;
+                    retry_model = false;
+                    model_retry_delay = Duration::from_secs(1);
+                }
+                Err(error) if error.requires_reseed() => {
+                    if error.requires_scrub() {
+                        drop(disk.take());
+                        build::scrub(cx, publisher, &layout).await?;
                     }
-                    Err(error) if disk.is_some() => {
-                        tracing::warn!(kind = %error, "search model replacement will retry");
-                        retry_model = true;
-                        next_model_check = Instant::now() + model_retry_delay;
-                        model_retry_delay = (model_retry_delay * 2).min(Duration::from_secs(300));
-                        break;
-                    }
-                    Err(error) => return Err(error),
+                    return Err(error);
+                }
+                // A failed manifest sync may follow a successful atomic rename.
+                // Reopen its durable selection before removing any staged epoch.
+                Err(error @ IndexError::Layout(_)) => return Err(error),
+                Err(error) => {
+                    tracing::warn!(kind = %error, "search model refresh will retry");
+                    retry_model = true;
+                    next_model_check = Instant::now() + model_retry_delay;
+                    model_retry_delay = (model_retry_delay * 2).min(Duration::from_secs(300));
                 }
             }
         }
         let committed = disk.as_ref().ok_or(IndexError::Inconsistent)?.cursor();
-        if rebind {
+        if rebind || committed.after > target.after {
             let replacement = changes.subscribe(cx.maintenance(), committed).await?;
             subscription = replacement;
         } else if committed.after >= subscription.processed().after {
@@ -609,16 +657,17 @@ async fn open_disk(
         })
     });
     if let Some(cursor) = &unapplied
-        && cx.requires_scrub(cursor.clone()).await?
+        && (cx.requires_scrub(cursor.clone()).await?
+            || cx.has_pending_redaction(cursor.clone()).await?)
     {
         build::scrub(cx, publisher, &layout).await?;
         return Ok(None);
     }
     let opened = (|| {
-        let Some(manifest) = manifest? else {
+        let Some(mut manifest) = manifest? else {
             return Ok(None);
         };
-        if manifest.tokenizer_version != TOKENIZER_VERSION {
+        if manifest.tokenizer_version != TOKENIZER_VERSION || manifest.tantivy_seq > latest {
             return Err(IndexError::Inconsistent);
         }
         let folders = Arc::new(
@@ -630,19 +679,25 @@ async fn open_disk(
         if lexical.commit_id()? != manifest.tantivy_commit {
             return Err(IndexError::Inconsistent);
         }
-        let epoch = open_vector_epoch(layout.clone(), &manifest)?;
+        if manifest.active_model.is_some()
+            && manifest.vector_seq.is_none()
+            && !manifest.embeddings_pending
+        {
+            manifest.embeddings_pending = true;
+            layout.publish_search(&manifest)?;
+        }
         Ok(Some(Disk {
             layout: layout.clone(),
             manifest,
             folders,
             lexical: Some(lexical),
-            epoch,
+            epoch: None,
             embedder: None,
             embedding_failures: 0,
             vector_last_use: Instant::now(),
         }))
     })();
-    let mut disk = match opened {
+    let disk = match opened {
         Ok(disk) => disk,
         Err(IndexError::Layout(LayoutError::WrongHistory)) => {
             layout.clear_lexical_manifests()?;
@@ -670,16 +725,16 @@ async fn open_disk(
     }
     let vector_model = disk
         .as_ref()
-        .and_then(|disk| disk.epoch.as_ref().and(disk.manifest.active_model.as_ref()))
+        .and_then(|disk| {
+            disk.manifest
+                .vector_seq
+                .and(disk.manifest.active_model.as_ref())
+        })
         .map(crate::ports::ResolvedEmbeddingTarget::vector_model);
     layout.remove_vector_epochs(vector_model.as_ref())?;
-    if let Some(disk) = &mut disk {
-        disk.ensure_embedder(cx).await;
-    } else {
-        // A corrupt dictionary cannot be used with an empty replacement index.
-        if layout.folder_dictionary().is_err() {
-            layout.clear_lexical_manifests()?;
-        }
+    // A corrupt dictionary cannot be used with an empty replacement index.
+    if disk.is_none() && layout.folder_dictionary().is_err() {
+        layout.clear_lexical_manifests()?;
     }
     Ok(disk)
 }
@@ -687,23 +742,113 @@ async fn open_disk(
 fn open_vector_epoch(
     layout: Arc<SearchLayout>,
     manifest: &SearchManifest,
-) -> Result<Option<VectorEpoch>, IndexError> {
-    match (&manifest.active_model, manifest.vector_seq) {
-        (Some(model), Some(seq)) if seq <= manifest.tantivy_seq => {
-            let model = model.vector_model();
-            let epoch = layout
-                .epoch_manifest(&model)?
-                .ok_or(IndexError::Inconsistent)?;
-            let opened = VectorEpoch::open_model(layout, model)?;
-            if !opened.is_checkpointed(seq) || !epoch.complete_backfill {
-                return Err(IndexError::Inconsistent);
+) -> Result<VectorEpoch, IndexError> {
+    let (Some(model), Some(seq)) = (&manifest.active_model, manifest.vector_seq) else {
+        return Err(IndexError::Inconsistent);
+    };
+    let model = model.vector_model();
+    let epoch = layout
+        .epoch_manifest(&model)?
+        .ok_or(IndexError::Inconsistent)?;
+    if seq > manifest.tantivy_seq || !epoch.complete_backfill {
+        return Err(IndexError::Inconsistent);
+    }
+    let opened = VectorEpoch::open_model(layout, model)?;
+    if !opened.is_checkpointed(seq) {
+        return Err(IndexError::Inconsistent);
+    }
+    opened.collect_obsolete()?;
+    Ok(opened)
+}
+
+#[derive(Default)]
+struct ChangedNotes {
+    notes: BTreeSet<NoteId>,
+    moved_folders: BTreeSet<FolderId>,
+    restored_folders: BTreeSet<FolderId>,
+}
+
+impl ChangedNotes {
+    fn take_remote_folders(
+        &mut self,
+        target: Option<&crate::ports::ResolvedEmbeddingTarget>,
+    ) -> BTreeSet<FolderId> {
+        let moved = std::mem::take(&mut self.moved_folders);
+        let mut restored = std::mem::take(&mut self.restored_folders);
+        if let Some(crate::ports::EmbeddingBackendTarget::Remote { project, .. }) =
+            target.map(|target| &target.backend)
+        {
+            if project.is_some() {
+                restored.extend(moved);
             }
-            opened.collect_obsolete()?;
-            Ok(Some(opened))
+            restored
+        } else {
+            BTreeSet::new()
         }
-        (None, None) => Ok(None),
-        (Some(_), None) if manifest.embeddings_pending => Ok(None),
-        _ => Err(IndexError::Inconsistent),
+    }
+}
+
+/// Keep the model computation alive while delivering newer lexical cuts. Its
+/// input snapshot is immutable. Only the indexing owner mutates either epoch.
+async fn during_model_work<T>(
+    cx: &Context<'_>,
+    disk: &mut Disk,
+    publisher: &mut Publisher<'_>,
+    dirty: &mut ChangedNotes,
+    work: impl Future<Output = Result<T, IndexError>>,
+) -> Result<T, IndexError> {
+    let stopped = || IndexError::Embedding(crate::embed::EmbeddingError::Cancelled);
+    tokio::pin!(work);
+    let mut changes = tokio::select! {
+        biased;
+        () = cx.handle.stop.cancelled() => return Err(stopped()),
+        value = &mut work => return value,
+        subscription = async {
+            sleep(Duration::from_millis(50)).await;
+            cx.services.deps.changes.subscribe(cx.maintenance(), disk.cursor()).await
+        } => subscription?,
+    };
+    loop {
+        let notice = tokio::select! {
+            biased;
+            () = cx.handle.stop.cancelled() => return Err(stopped()),
+            value = &mut work => return value,
+            notice = changes.next() => notice?.ok_or(IndexError::Inconsistent)?,
+            () = cx.handle.wake.notified() => ChangeNotice::Lagged {resume: disk.cursor()},
+        };
+        let target = match notice {
+            ChangeNotice::Advanced(cutoff) => cutoff,
+            ChangeNotice::Lagged { resume } => cx.latest(&resume.scope).await?,
+            ChangeNotice::SeedRequired { cutoff } if cutoff == disk.cursor() => continue,
+            _ => return Err(IndexError::Retire),
+        };
+        if target.scope != disk.manifest.scope {
+            return Err(IndexError::Retire);
+        }
+        if target.after > disk.manifest.tantivy_seq
+            && (cx.requires_scrub(disk.cursor()).await?
+                || (disk.lexical.is_none() && cx.has_pending_redaction(disk.cursor()).await?))
+        {
+            return Err(IndexError::Retire);
+        }
+        if disk.resume_reader(cx)? {
+            publisher.publish(disk);
+        }
+        if target.after > disk.manifest.tantivy_seq
+            && catch_up(cx, disk, publisher, target.clone(), Some(dirty)).await?
+        {
+            return Err(IndexError::Retire);
+        }
+        if target.after > changes.processed().after {
+            // A wakeup can observe a durable command before the subscription
+            // has delivered it. Rebind at the cut the owner has now published.
+            changes = cx
+                .services
+                .deps
+                .changes
+                .subscribe(cx.maintenance(), disk.cursor())
+                .await?;
+        }
     }
 }
 
@@ -713,6 +858,7 @@ async fn catch_up(
     disk: &mut Disk,
     publisher: &mut Publisher<'_>,
     target: ChangeCursor,
+    mut changed: Option<&mut ChangedNotes>,
 ) -> Result<bool, IndexError> {
     let mut after = disk.cursor();
     let mut tail = Vec::new();
@@ -751,6 +897,23 @@ async fn catch_up(
             if update::requires_scrub(disk, &complete)? {
                 return Ok(true);
             }
+            if let Some(dirty) = changed.as_deref_mut() {
+                use notarium_core::ports::{ChangeKind, EntityId};
+                for change in &complete {
+                    match &change.entity {
+                        EntityId::Note(id) => {
+                            dirty.notes.insert(id.clone());
+                        }
+                        EntityId::Folder(id) if change.kind == ChangeKind::Move => {
+                            dirty.moved_folders.insert(id.clone());
+                        }
+                        EntityId::Folder(id) if change.kind == ChangeKind::Restore => {
+                            dirty.restored_folders.insert(id.clone());
+                        }
+                        _ => {}
+                    }
+                }
+            }
             let committed = disk.cursor();
             let updated = update::apply(
                 cx,
@@ -761,6 +924,7 @@ async fn catch_up(
                     after: page.safe_ack_end,
                 },
                 complete,
+                changed.is_some(),
             )
             .await;
             if matches!(

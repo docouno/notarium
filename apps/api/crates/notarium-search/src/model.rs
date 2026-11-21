@@ -30,6 +30,13 @@ use tokio::sync::Mutex;
 #[derive(Default)]
 pub(super) struct LocalModels(Mutex<HashMap<crate::layout::VectorModel, Weak<OrtModel>>>);
 
+#[cfg(test)]
+impl LocalModels {
+    pub(super) async fn hold_loading(&self) -> impl Drop + '_ {
+        self.0.lock().await
+    }
+}
+
 pub(super) struct Embedder {
     pub target: ResolvedEmbeddingTarget,
     backend: Backend,
@@ -53,10 +60,12 @@ impl Services {
             return Ok(None);
         }
         let target = if let Some(resolver) = &self.deps.model_resolver {
-            resolver
-                .resolve_model(scope, project, explicit)
-                .await
-                .map_err(|_| EmbeddingError::ModelUnavailable)?
+            tokio::select! {
+                biased;
+                () = self.shutdown.cancelled() => return Err(EmbeddingError::Cancelled),
+                resolved = tokio::time::timeout(crate::engine::MAINTENANCE_TIMEOUT, resolver.resolve_model(scope, project, explicit)) =>
+                    resolved.map_err(|_| EmbeddingError::BudgetExceeded)?.map_err(|_| EmbeddingError::ModelUnavailable)?,
+            }
         } else if let VectorMode::DeterministicTest { dimension } = self.config.vector_mode {
             let model = ModelProfileId::from_bytes(*b"deterministic-v1");
             explicit
@@ -274,7 +283,7 @@ impl Embedder {
             scope,
             note,
             folder,
-            budget,
+            mut budget,
             priority,
             existing,
         } = input;
@@ -285,13 +294,19 @@ impl Embedder {
             let Some(resolver) = &services.deps.model_resolver else {
                 return Ok((Vec::new(), true));
             };
-            match self
-                .indexing_grant(services, resolver.as_ref(), scope, note, budget.clone())
-                .await
-            {
-                Ok(Some((grant, project))) => Some((backend, resolver, grant, project)),
-                Ok(None) => return Ok((Vec::new(), false)),
-                Err(_) => return Ok((Vec::new(), true)),
+            let started = std::time::Instant::now();
+            let grant = tokio::select! {
+                biased;
+                () = budget.cancellation.cancelled() => return Ok((Vec::new(), true)),
+                grant = tokio::time::timeout(budget.remaining,
+                    self.indexing_grant(services, resolver.as_ref(), scope, note, budget.clone())
+                ) => grant,
+            };
+            budget.remaining = budget.remaining.saturating_sub(started.elapsed());
+            match grant {
+                Ok(Ok(Some((grant, project)))) => Some((backend, resolver, grant, project)),
+                Ok(Ok(None)) => return Ok((Vec::new(), false)),
+                _ => return Ok((Vec::new(), true)),
             }
         } else {
             None
@@ -465,6 +480,7 @@ impl Embedder {
                         grant.ctx.budget.clone(),
                         grant.ctx.scope().clone(),
                         note,
+                        project.as_ref().map(|value| value.folder_id.clone()),
                     )
                     .await
                     .map_err(|_| EmbeddingError::ProviderUnavailable)?

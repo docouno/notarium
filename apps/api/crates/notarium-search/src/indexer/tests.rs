@@ -4,11 +4,39 @@ use crate::{
     vector::{ChunkMetadata, MutableOperation, QuantizedVector, SegmentBuilder, VectorChunk},
 };
 use notarium_core::{
+    DomainResult,
     classes::DocClass,
     epoch::DataRoot,
     ids::{ContentDigest, HistoryIncarnation, ModelProfileId, NoteId, SpaceId},
+    model::SnapshotCut,
+    ports::{NoteCard, PortFuture, SpaceContext, StructuralReadPort, StructuralSnapshot},
+    receipt::CausalBasis,
     span::ByteSpan,
 };
+
+struct UnusedStructural;
+impl StructuralReadPort for UnusedStructural {
+    fn acquire_snapshot(
+        &self,
+        _: SpaceContext,
+        _: CausalBasis,
+    ) -> PortFuture<'_, Box<dyn StructuralSnapshot>> {
+        Box::pin(async { unreachable!("indexer does not read structural snapshots") })
+    }
+
+    fn is_live_visible(&self, _: &SpaceContext, _: &NoteId) -> DomainResult<bool> {
+        Ok(true)
+    }
+
+    fn hydrate(
+        &self,
+        _: SpaceContext,
+        _: SnapshotCut,
+        _: Vec<NoteId>,
+    ) -> PortFuture<'_, Vec<Option<NoteCard>>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+}
 
 #[tokio::test]
 async fn idle_space_releases_vectors_and_reopens_its_checkpointed_wal() {
@@ -83,11 +111,10 @@ async fn idle_space_releases_vectors_and_reopens_its_checkpointed_wal() {
     assert!(disk.epoch.is_some());
     disk.release_idle_vectors(idle_since + VECTOR_IDLE, VECTOR_IDLE);
     assert!(disk.epoch.is_none());
-    assert!(disk.resume_epoch().await.unwrap());
-    let reopened = disk.epoch.as_ref().unwrap();
+    let reopened = disk.start_epoch_reopen().await.unwrap().unwrap();
     assert!(reopened.is_checkpointed(current));
     assert_eq!(reopened.find_vector(key), Some(vector));
-    drop(disk);
+    drop((reopened, disk));
     std::fs::remove_dir_all(path).unwrap();
 }
 
@@ -103,47 +130,20 @@ async fn idle_reopen_during_replacement_backoff_restores_active_embedder() {
         CanonicalConfig, CanonicalRuntime, CreateSpaceSpec, changes::SyntheticNoteSpec,
     };
     use notarium_core::{
-        DomainResult,
         auth::{EngineAuthContext, SpaceGrant, SpaceKind, SpaceRole, VerifiedHuman},
         classes::{ProviderAudience, ProviderPolicy},
         ids::{FolderId, GrantId, InstallationId, LeaseEpoch, PrincipalId, ProviderResourceId},
-        model::{FolderRef, Lifecycle, SnapshotCut},
+        model::{FolderRef, Lifecycle},
         ports::{
             Cancellation, EmbeddingInput, EmbeddingProviderPort, EmbeddingRequest, EmbeddingResult,
-            NoteCard, PortFuture, ProviderRuntimeEpochs, ProviderUsage, ServiceAuthority,
-            SpaceContext, StructuralReadPort, StructuralSnapshot,
+            PortFuture, ProviderRuntimeEpochs, ProviderUsage, ServiceAuthority,
         },
-        receipt::CausalBasis,
     };
     use std::{
         collections::{BTreeMap, BTreeSet},
         sync::atomic::{AtomicBool, AtomicU8, AtomicUsize},
     };
     use tokio::sync::{Notify, watch};
-
-    struct UnusedStructural;
-    impl StructuralReadPort for UnusedStructural {
-        fn acquire_snapshot(
-            &self,
-            _: SpaceContext,
-            _: CausalBasis,
-        ) -> PortFuture<'_, Box<dyn StructuralSnapshot>> {
-            Box::pin(async { unreachable!("indexer does not read structural snapshots") })
-        }
-
-        fn is_live_visible(&self, _: &SpaceContext, _: &NoteId) -> DomainResult<bool> {
-            Ok(true)
-        }
-
-        fn hydrate(
-            &self,
-            _: SpaceContext,
-            _: SnapshotCut,
-            _: Vec<NoteId>,
-        ) -> PortFuture<'_, Vec<Option<NoteCard>>> {
-            Box::pin(async { Ok(Vec::new()) })
-        }
-    }
 
     fn remote_target(provider: u8) -> ResolvedEmbeddingTarget {
         ResolvedEmbeddingTarget {
@@ -389,7 +389,9 @@ async fn idle_reopen_during_replacement_backoff_restores_active_embedder() {
     handle.wake.notify_one();
     let resumed = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if let Some(state) = handle.published.load_full() {
+            if let Some(state) = handle.published.load_full()
+                && state.embedder.is_some()
+            {
                 break state;
             }
             epochs.changed().await.unwrap();
@@ -417,6 +419,166 @@ async fn idle_reopen_during_replacement_backoff_restores_active_embedder() {
         task.await.unwrap(),
         Ok(None) | Err(IndexError::Port(PortError::Cancelled(_)))
     ));
+    engine.shutdown().await;
+    runtime.shutdown().await.unwrap();
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[tokio::test]
+async fn lexical_checkpoint_is_available_while_the_native_model_is_loading() {
+    use crate::{
+        SearchDependencies, SearchEngine,
+        config::{SearchConfig, VectorMode},
+    };
+    use notarium_canonical::{
+        CanonicalConfig, CanonicalRuntime, CreateFolderSpec, CreateSpaceSpec,
+        changes::SyntheticNoteSpec,
+    };
+    use notarium_core::{
+        auth::SpaceKind,
+        ids::{FolderId, InstallationId, LeaseEpoch, PrincipalId},
+    };
+
+    let mut entropy = [0; 16];
+    getrandom::fill(&mut entropy).unwrap();
+    let path = std::env::temp_dir().join(format!("search-warm-cut-{}", hex::encode(entropy)));
+    std::fs::create_dir(&path).unwrap();
+    let root = DataRoot::new(&path);
+    let (store, runtime) = CanonicalRuntime::open(CanonicalConfig::local_default(
+        InstallationId::from_bytes([1; 16]),
+        root.clone(),
+    ))
+    .await
+    .unwrap();
+    let store = Arc::new(store);
+    let lease = LeaseEpoch::new(1).unwrap();
+    let owner = PrincipalId::from_bytes([5; 16]);
+    let scope = store
+        .create_space(CreateSpaceSpec {
+            space_id: SpaceId::from_bytes([2; 16]),
+            incarnation: HistoryIncarnation::from_bytes([3; 16]),
+            root_folder_id: FolderId::from_bytes([4; 16]),
+            slug: "warm".into(),
+            kind: SpaceKind::Personal,
+            owner: owner.clone(),
+            active_epoch: lease,
+            initial_last_seq: SpaceSeq::ZERO,
+            created_at: None,
+        })
+        .await
+        .unwrap()
+        .scope;
+    let (_, _, base) = store
+        .create_folder(CreateFolderSpec {
+            scope: scope.clone(),
+            active_epoch: lease,
+            folder_id: FolderId::from_bytes([7; 16]),
+            parent: None,
+            slug: "work".into(),
+            display_name: "Work".into(),
+            is_project: false,
+            project_slug: None,
+            actor: owner.clone(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+    let layout = Arc::new(SearchLayout::open(&root, scope.clone()).unwrap());
+    let lexical = LexicalIndex::create(&layout.create_index_generation(1).unwrap()).unwrap();
+    layout
+        .persist_folder_dictionary(&FolderDictionary::default())
+        .unwrap();
+    let model = ModelProfileId::from_bytes([6; 16]);
+    let mut epoch = VectorEpoch::open(layout.clone(), model.clone(), 64).unwrap();
+    epoch
+        .seed(SegmentBuilder::new(&model, 64).unwrap(), base)
+        .unwrap();
+    drop(epoch);
+    let manifest = SearchManifest {
+        scope: scope.clone(),
+        tantivy_seq: base,
+        tantivy_commit: lexical.commit_id().unwrap(),
+        active_index_dir: crate::layout::index_name(1),
+        tokenizer_version: TOKENIZER_VERSION,
+        active_model: Some(ResolvedEmbeddingTarget {
+            model,
+            dimension: 64,
+            max_input_tokens: 512,
+            backend: EmbeddingBackendTarget::LocalOnnx,
+        }),
+        vector_seq: Some(base),
+        embeddings_pending: false,
+    };
+    layout.publish_search(&manifest).unwrap();
+    drop(lexical);
+    let engine = SearchEngine::start(
+        SearchConfig::new(
+            root,
+            VectorMode::DynamicOrt {
+                dylib_path: path.join("runtime"),
+                model_dir: path.join("models"),
+            },
+        ),
+        SearchDependencies::new(store.clone(), Arc::new(UnusedStructural)),
+    );
+    let loading = engine.services.models.hold_loading().await;
+    let handle = engine.space(scope.clone()).unwrap();
+    let pin = handle.pin_query();
+    let mut updates = handle.epoch.subscribe();
+    let published = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(state) = handle.published.load_full() {
+                break state;
+            }
+            updates.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("lexical readiness cannot wait for ONNX loading");
+    assert_eq!(
+        published.lexical.commit_id().unwrap(),
+        manifest.tantivy_commit
+    );
+    assert!(published.reopening_vectors);
+    drop(published);
+    let (edit, _) = store
+        .commit_synthetic_note_batch_for_test(
+            &scope,
+            lease,
+            &owner,
+            vec![SyntheticNoteSpec {
+                note_id: NoteId::from_bytes([8; 16]),
+                parent_folder: None,
+                slug: "new".into(),
+                title: "A new note".into(),
+                doc_class: DocClass::UserDoc,
+                lifecycle: notarium_core::model::Lifecycle::Active,
+                carrier: "A new note".into(),
+                fields: Default::default(),
+            }],
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(state) = handle.published.load_full()
+                && state.seq == edit.last_seq
+            {
+                assert!(state.embedder.is_none());
+                assert!(
+                    state
+                        .lexical
+                        .contains_note(&state.searcher, &NoteId::from_bytes([8; 16]))
+                        .unwrap()
+                );
+                break;
+            }
+            updates.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("lexical edits must progress while ONNX loading is blocked");
+    drop((pin, loading));
     engine.shutdown().await;
     runtime.shutdown().await.unwrap();
     std::fs::remove_dir_all(path).unwrap();
