@@ -56,13 +56,17 @@ pub(super) async fn apply(
             EntityId::Thread(thread) => {
                 threads.insert(thread);
             }
-            EntityId::Folder(_) if disk.manifest.active_model.as_ref().is_some_and(|target| {
-                matches!(&target.backend, crate::ports::EmbeddingBackendTarget::Remote { project, .. }
-                    if change.kind == ChangeKind::Restore
-                        || (change.kind == ChangeKind::Move && project.is_some()))
-            }) => {
-                // A restore or move across the selected project boundary can
-                // change remote eligibility without a descendant note event.
+            EntityId::Folder(_)
+                if matches!(change.kind, ChangeKind::Restore | ChangeKind::Move)
+                    && disk.manifest.active_model.as_ref().is_some_and(|target| {
+                        matches!(
+                            target.backend,
+                            crate::ports::EmbeddingBackendTarget::Remote { .. }
+                        )
+                    }) =>
+            {
+                // Each remote grant uses the note's actual project, including
+                // when the selected model serves the entire space.
                 disk.manifest.embeddings_pending = true;
                 disk.embedding_failures = disk.embedding_failures.wrapping_add(1);
             }

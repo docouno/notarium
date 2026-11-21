@@ -45,8 +45,9 @@ acknowledgement, including commands that span several change pages.
 The DataRoot holds `v1/search/<space>/tantivy/` and `vector/`. Tantivy stores
 terms and fast fields without stored note or chat text. A durable folder
 dictionary assigns stable ordinals. Moving a folder advances the lexical
-watermark without rewriting postings. When the embedding provider is scoped
-to a project, the worker also reconciles vector membership in the background.
+watermark without rewriting postings. With a remote provider, the worker also
+rechecks vector membership in the background, since the grant for a note can
+change when its folder moves to another project.
 A manifest identifies the active lexical generation and
 the vector checkpoint. After an edit the worker invalidates the old vector slots
 before publishing the new lexical cut. The pending marker keeps outstanding

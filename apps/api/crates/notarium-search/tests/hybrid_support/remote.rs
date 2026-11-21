@@ -58,6 +58,7 @@ struct SwitchingResolver {
     runtime_epoch: AtomicU64,
     cap: AtomicU32,
     project: RwLock<Option<FolderRef>>,
+    grant_project: RwLock<Option<FolderRef>>,
     unavailable: AtomicBool,
     hold_resolution: AtomicBool,
     resolution_started: Notify,
@@ -74,6 +75,7 @@ impl SwitchingResolver {
             runtime_epoch: AtomicU64::new(1),
             cap: AtomicU32::new(cap),
             project: RwLock::new(None),
+            grant_project: RwLock::new(None),
             unavailable: AtomicBool::new(false),
             hold_resolution: AtomicBool::new(false),
             resolution_started: Notify::new(),
@@ -131,10 +133,19 @@ impl SearchModelResolverPort for SwitchingResolver {
         scope: &'a HistoryScope,
         actor: &'a PrincipalId,
         provider: &'a ProviderResourceId,
-        _: Option<&'a FolderRef>,
+        actual_project: Option<&'a FolderRef>,
         budget: CallBudget,
     ) -> PortFuture<'a, Option<RemoteIndexingGrant>> {
         Box::pin(async move {
+            if self
+                .grant_project
+                .read()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|allowed| actual_project != Some(allowed))
+            {
+                return Ok(None);
+            }
             if self.hold_grant.swap(false, Ordering::SeqCst) {
                 self.grant_started.notify_one();
                 self.release_grant.notified().await;

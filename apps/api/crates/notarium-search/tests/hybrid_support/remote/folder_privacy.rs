@@ -157,10 +157,13 @@ pub async fn folder_eligibility(store: Arc<CanonicalStore>, root: DataRoot) {
         space_id: scope.space_id.clone(),
         folder_id: sample_folder_id(tag + 3),
     };
-    let mut spec = folder_spec(&project.folder_id, &folder, "selected");
-    spec.is_project = true;
-    spec.project_slug = Some("selected".into());
-    store.create_folder(spec).await.unwrap();
+    let denied = sample_folder_id(tag + 5);
+    for (id, slug) in [(&project.folder_id, "selected"), (&denied, "denied")] {
+        let mut spec = folder_spec(id, &folder, slug);
+        spec.is_project = true;
+        spec.project_slug = Some(slug.into());
+        store.create_folder(spec).await.unwrap();
+    }
     let destination = sample_folder_id(tag + 4);
     let (_, _, created) = store
         .create_folder(folder_spec(&destination, &project.folder_id, "sibling"))
@@ -169,6 +172,7 @@ pub async fn folder_eligibility(store: Arc<CanonicalStore>, root: DataRoot) {
     {
         let mut view = projection.snapshot.write().unwrap();
         view.project(project.folder_id.clone(), folder.clone());
+        view.project(denied.clone(), folder.clone());
         view.folder(destination.clone(), project.folder_id.clone());
         view.advance(created);
     }
@@ -379,5 +383,54 @@ pub async fn folder_eligibility(store: Arc<CanonicalStore>, root: DataRoot) {
         .map(|chunk| chunk.metadata.note.clone())
         .collect();
     assert_eq!(repaired, BTreeSet::from([id, last]));
+
+    // The model covers the whole Space, but a note's grant still depends on
+    // its actual project. The query below has no folder or lexical matches.
+    *resolver.grant_project.write().unwrap() = Some(project.clone());
+    *resolver.project.write().unwrap() = None;
+    let baseline = provider.parts.load(Ordering::SeqCst);
+    let initial = ready(move_to(&denied).await).await;
+    let semantic = async || {
+        engine
+            .search(ctx.clone(), query("vectorprobe"))
+            .await
+            .unwrap()
+            .hits
+    };
+    let active_epoch = std::fs::read_dir(&vector_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| *path != epoch)
+        .unwrap();
+    let slots = || MutableBuffer::open(&active_epoch, 64).unwrap().len();
+    assert_eq!(slots(), 0);
+    assert!(semantic().await.is_empty());
+    assert_eq!(provider.parts.load(Ordering::SeqCst), baseline);
+
+    resolver.hold_grant.store(true, Ordering::SeqCst);
+    move_to(&project.folder_id).await;
+    tokio::time::timeout(Duration::from_secs(12), resolver.grant_started.notified())
+        .await
+        .unwrap();
+    let outside = move_to(&denied).await;
+    resolver.release_grant.notify_one();
+    ready(outside).await;
+    assert_eq!(provider.parts.load(Ordering::SeqCst), baseline);
+
+    let entered = ready(move_to(&project.folder_id).await).await;
+    assert_eq!(entered.tantivy_commit, initial.tantivy_commit);
+    assert_eq!(provider.parts.load(Ordering::SeqCst), baseline + 2);
+    assert_eq!(slots(), 2);
+    let hits: BTreeSet<_> = semantic()
+        .await
+        .into_iter()
+        .map(|hit| hit.card.document.provenance().reference().note_id.clone())
+        .collect();
+    assert_eq!(hits, repaired);
+    let left = ready(move_to(&denied).await).await;
+    assert_eq!(left.tantivy_commit, initial.tantivy_commit);
+    assert!(semantic().await.is_empty());
+    assert_eq!(slots(), 0);
+    assert_eq!(provider.parts.load(Ordering::SeqCst), baseline + 2);
     engine.shutdown().await;
 }
