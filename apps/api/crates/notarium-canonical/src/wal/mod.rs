@@ -1314,7 +1314,6 @@ impl SqliteWalCoordinator {
         // or `TRUNCATE` (when explicitly forced or using small test watermarks) on writer connection.
         let Ok(mut writer_guard) = tokio::time::timeout_at(cycle_deadline, writer.lock()).await
         else {
-            drop(safe_point);
             return;
         };
 

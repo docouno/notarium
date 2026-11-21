@@ -80,37 +80,59 @@ impl CanonicalStore {
         let deployment_id = witness.deployment_id;
         match &self.inner.config.sql {
             SqlBackendConfig::Sqlite { data_root, .. } => {
-                let has_pending: bool = self
-                    .with_read_tx_budget(Some(&ctx.budget), |tx| {
-                        Box::pin(async move {
-                            let BackendConn::Sqlite(conn) = tx else {
-                                unreachable!()
-                            };
-                            sqlx::query_scalar(
-                                "SELECT EXISTS(SELECT 1 FROM pending_purges WHERE phase < 'completed' OR phase > 'completed')",
-                            )
-                            .fetch_one(&mut **conn)
-                            .await
-                            .map_err(|e| {
-                                internal_not_committed(
-                                    "sqlite_decommission_pending_purges",
-                                    e.to_string(),
-                                )
-                            })
-                        })
-                    })
-                    .await?;
-                if has_pending {
-                    return Err(DomainError::validation(ValidationReason::InvalidState).into());
-                }
                 let path = data_root.canonical().with_file_name("projection_cleanup");
-                tokio::task::spawn_blocking(move || {
-                    decommission_local_cache(&path, &deployment_id)
+                let store = self.clone();
+                // Serialize marker removal with SQLite Purge commits and
+                // prepare_projection_visibility_cleanup via the canonical write tx.
+                self.with_write_tx(move |tx| {
+                    Box::pin(async move {
+                        let BackendConn::Sqlite(conn) = tx else {
+                            unreachable!()
+                        };
+                        let fence = &store.inner.live_visibility;
+                        if fence.has_cleanup() {
+                            return Err(not_ready());
+                        }
+                        if !fence
+                            .cleanup_debt
+                            .lock()
+                            .expect("projection cleanup debt")
+                            .is_empty()
+                        {
+                            return Err(
+                                DomainError::validation(ValidationReason::InvalidState).into(),
+                            );
+                        }
+                        let has_pending: bool = sqlx::query_scalar(
+                            "SELECT EXISTS(SELECT 1 FROM pending_purges WHERE phase < 'completed' OR phase > 'completed')",
+                        )
+                        .fetch_one(&mut **conn)
+                        .await
+                        .map_err(|e| {
+                            internal_not_committed(
+                                "sqlite_decommission_pending_purges",
+                                e.to_string(),
+                            )
+                        })?;
+                        if has_pending {
+                            return Err(
+                                DomainError::validation(ValidationReason::InvalidState).into(),
+                            );
+                        }
+                        tokio::task::spawn_blocking(move || {
+                            decommission_local_cache(&path, &deployment_id)
+                        })
+                        .await
+                        .map_err(|err| {
+                            internal_not_committed(
+                                "projection_cleanup_decommission",
+                                err.to_string(),
+                            )
+                        })??;
+                        Ok(())
+                    })
                 })
-                .await
-                .map_err(|err| {
-                    internal_not_committed("projection_cleanup_decommission", err.to_string())
-                })??;
+                .await?;
             }
             SqlBackendConfig::Postgres { .. } => {
                 self.with_write_tx(move |tx| {
@@ -118,6 +140,20 @@ impl CanonicalStore {
                         let BackendConn::Postgres(conn) = tx else {
                             unreachable!()
                         };
+                        let has_active_owner: bool = sqlx::query_scalar(
+                            "SELECT EXISTS(SELECT 1 FROM projection_space_owners WHERE phase <> 'drained')",
+                        )
+                        .fetch_one(&mut **conn)
+                        .await
+                        .map_err(|e| {
+                            internal_not_committed(
+                                "pg_decommission_active_owners",
+                                e.to_string(),
+                            )
+                        })?;
+                        if has_active_owner {
+                            return Err(not_ready());
+                        }
                         let has_pending: bool = sqlx::query_scalar(
                             "SELECT EXISTS(SELECT 1 FROM pending_purges WHERE phase < 'completed' OR phase > 'completed')",
                         )
@@ -186,11 +222,22 @@ impl CanonicalStore {
             SqlBackendConfig::Sqlite { data_root, .. } => {
                 let path = data_root.canonical().with_file_name("projection_cleanup");
                 let cache_identity = deployment_id.to_owned();
-                tokio::task::spawn_blocking(move || bind_local_cache(&path, &cache_identity))
-                    .await
-                    .map_err(|err| {
-                        internal_not_committed("projection_cleanup_registration", err.to_string())
-                    })??;
+                self.with_write_tx(move |_tx| {
+                    Box::pin(async move {
+                        tokio::task::spawn_blocking(move || {
+                            bind_local_cache(&path, &cache_identity)
+                        })
+                        .await
+                        .map_err(|err| {
+                            internal_not_committed(
+                                "projection_cleanup_registration",
+                                err.to_string(),
+                            )
+                        })??;
+                        Ok(())
+                    })
+                })
+                .await?;
             }
             SqlBackendConfig::Postgres { .. } => {
                 let deployment_id = deployment_id.to_owned();

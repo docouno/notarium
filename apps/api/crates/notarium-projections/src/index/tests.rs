@@ -740,3 +740,95 @@ proptest::proptest! {
         }
     }
 }
+
+#[test]
+fn edge_overlay_delta_tombstone_survives_readd_delete_and_stays_sorted() {
+    let scratch = Scratch::new();
+    let path = scratch.path(7, 1);
+    let folder = fixture_root();
+    let mut builder = FastIndexBuilder::default();
+    builder.add_folder(0, &folder, Lifecycle::Active).unwrap();
+    let fields = Fields::new();
+    for dense in 0..25 {
+        builder
+            .add_note(row(
+                dense,
+                &note(dense),
+                &fields,
+                DocClass::UserDoc,
+                Lifecycle::Active,
+                false,
+            ))
+            .unwrap();
+    }
+    let mut outgoing = vec![Vec::new(); 25];
+    let mut incoming = vec![Vec::new(); 25];
+    outgoing[0] = vec![5, 10, 20];
+    incoming[0] = vec![5, 10, 20];
+    builder.set_graph(GraphSections {
+        outgoing,
+        incoming,
+        clusters: vec![None; 25],
+    });
+    let (handle, _) = builder.publish(&path, identity(7, 1)).unwrap();
+    let maps = pool(1);
+
+    let mut delta = L0Delta::default();
+    // Delete base edge 10, re-add 10, then delete 10 again while adding 7.
+    delta.apply_adjacency_delta(0, true, &[], &[10]);
+    delta.apply_adjacency_delta(0, true, &[10], &[]);
+    delta.apply_adjacency_delta(0, true, &[7], &[10]);
+    delta.apply_adjacency_delta(0, false, &[], &[10]);
+    delta.apply_adjacency_delta(0, false, &[10], &[]);
+    delta.apply_adjacency_delta(0, false, &[7], &[10]);
+
+    let view = IndexView::new(handle.open(&maps).unwrap(), Arc::new(delta));
+    assert_eq!(view.incoming(0).collect::<Vec<_>>(), vec![5, 7, 20]);
+    assert_eq!(view.outgoing(0).collect::<Vec<_>>(), vec![5, 7, 20]);
+}
+
+#[test]
+fn andnot_posting_inplace_rejects_bucketed_tag() {
+    let scratch = Scratch::new();
+    let path = scratch.path(8, 1);
+    let folder = fixture_root();
+    let mut builder = FastIndexBuilder::default();
+    builder.add_folder(0, &folder, Lifecycle::Active).unwrap();
+    let fields = Fields::new();
+    // Insert > 65,536 distinct tags to trigger 4096-bucket tag partitioning.
+    let tags_per_note = 1_000usize;
+    let note_count = 66u32;
+    for dense in 0..note_count {
+        let id = note(dense);
+        let tags: Vec<String> = (0..tags_per_note)
+            .map(|slot| format!("t-{dense:02}-{slot:04}"))
+            .collect();
+        builder
+            .add_note(IndexNote {
+                dense,
+                id: &id,
+                header: NoteSortHeader::new(
+                    Timestamp::parse(EARLY).unwrap(),
+                    Timestamp::parse(EARLY).unwrap(),
+                    0,
+                    DocClass::UserDoc,
+                    Lifecycle::Active,
+                ),
+                ancestors: &[0],
+                trashed_ancestor: false,
+                fields: &fields,
+                tags: &tags,
+                ability: None,
+            })
+            .unwrap();
+    }
+    let (handle, _) = builder.publish(&path, identity(8, 1)).unwrap();
+    let maps = pool(1);
+    let view = IndexView::new(handle.open(&maps).unwrap(), Arc::new(L0Delta::default()));
+    assert!(view.tags_bucketed());
+    let mut target = Bitmap::from_range(0..note_count);
+    let err = view
+        .andnot_posting_inplace(&mut target, &PostingKey::Tag("t-00-0000".into()))
+        .unwrap_err();
+    assert!(matches!(err, IndexError::InvalidInput(_)));
+}

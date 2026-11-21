@@ -36,7 +36,7 @@ pub(super) async fn settle_mapped_cut(
             index: &index,
             settlement: previous.as_ref(),
         };
-        let settled = LeidenSnapshot::compute(&graph, &scope, &effective, &cancel)?;
+        let settled = LeidenSnapshot::compute(&graph, &effective, &cancel)?;
         let mutations = cluster_mutations(&settled, &graph, &scope, cutoff)?;
         Ok::<_, PortError>((settled, mutations))
     })

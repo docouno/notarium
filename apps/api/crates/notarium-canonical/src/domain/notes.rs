@@ -5441,7 +5441,7 @@ pub(crate) async fn update_space_schema_impl(
                 )
                 .await?;
 
-                let op_kind = if existing_note.is_some() {
+                let op_kind = if let Some(ex) = &existing_note {
                     match tx {
                         BackendConn::Sqlite(conn) => {
                             sqlx::query(
@@ -5500,7 +5500,11 @@ pub(crate) async fn update_space_schema_impl(
                             })?;
                         }
                     }
-                    "edit"
+                    if ex.parent_folder_id != parent_id {
+                        "move"
+                    } else {
+                        "edit"
+                    }
                 } else {
                     match tx {
                         BackendConn::Sqlite(conn) => {

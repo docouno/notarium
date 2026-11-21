@@ -754,60 +754,7 @@ impl Scratch {
     }
 
     async fn put_encoded_async(&mut self, key: Key, encoded: Vec<u8>) -> Result<(), PortError> {
-        check_stop(&self.stop)?;
-        let backing = Arc::clone(self.backing()?);
-        if !self.spilled.load(Ordering::Acquire) {
-            let mut guard = backing.lock().map_err(error)?;
-            if let Backing::Memory { rows, bytes } = &mut *guard {
-                let size = if let Some(old) = rows.get(&key.0) {
-                    bytes
-                        .saturating_sub(old.capacity())
-                        .saturating_add(encoded.capacity())
-                } else {
-                    bytes.saturating_add(key.0.capacity() + encoded.capacity() + 112)
-                };
-                if size <= MEMORY_BYTES {
-                    *bytes = size;
-                    rows.insert(key.0, encoded);
-                    return Ok(());
-                }
-            }
-        }
-        let spilled = Arc::clone(&self.spilled);
-        let scratch_dir = self.scratch_dir.clone();
-        let stop = self.stop.clone();
-        tokio::task::spawn_blocking(move || {
-            check_stop(&stop)?;
-            let mut guard = backing.lock().map_err(error)?;
-            if let Backing::Memory { rows, .. } = &mut *guard {
-                let spill = SpillFile::open_in(&scratch_dir)?;
-                {
-                    let db = spill.db()?;
-                    let mut insert = db
-                        .prepare_cached("INSERT INTO work VALUES(?,?)")
-                        .map_err(error)?;
-                    for (idx, (k, v)) in std::mem::take(rows).into_iter().enumerate() {
-                        if idx & 255 == 0 {
-                            check_stop(&stop)?;
-                        }
-                        insert.execute(params![k, v]).map_err(error)?;
-                    }
-                }
-                *guard = Backing::File(spill);
-                spilled.store(true, Ordering::Release);
-            }
-            if let Backing::File(spill) = &*guard {
-                spill
-                    .db()?
-                    .prepare_cached("INSERT OR REPLACE INTO work VALUES(?,?)")
-                    .map_err(error)?
-                    .execute(params![key.0, encoded])
-                    .map_err(error)?;
-            }
-            Ok(())
-        })
-        .await
-        .map_err(join_error)?
+        self.put_batch_async(vec![(key, encoded)]).await
     }
 
     pub(super) async fn get_async<T: DeserializeOwned + Send + 'static>(

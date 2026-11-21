@@ -76,6 +76,7 @@ impl PostgresProjectionCache {
     /// a projector. An existing marker or generation requires its original ID.
     pub async fn provision(root: DataRoot) -> Result<Self, PortError> {
         let owner = PostgresCacheOwner::acquire(root.clone()).await?;
+        let _guard = owner.claim_runtime()?;
         if owner.cache_identity.get().is_some()
             || !GenerationFiles::inventory(owner.root()).await?.is_empty()
         {
@@ -140,7 +141,7 @@ pub struct ProjectorRuntime {
     control: GenerationControl,
     maintenance: Option<(Cancellation, JoinHandle<()>)>,
     local_owner: Option<Arc<std::fs::File>>,
-    _postgres_runtime_guard: Option<PostgresRuntimeGuard>,
+    postgres_runtime_guard: Option<Arc<PostgresRuntimeGuard>>,
     local_rotation: Option<rotation::LocalRotation>,
     _board_provider: crate::board::BoardProviderRegistration,
 }
@@ -284,7 +285,7 @@ impl ProjectorRuntime {
         };
         let (cache_root, postgres_cache_owner, postgres_runtime_guard) = if control.is_postgres() {
             let owner = PostgresCacheOwner::acquire(cache_root).await?;
-            let guard = owner.claim_runtime()?;
+            let guard = Arc::new(owner.claim_runtime()?);
             (owner.root().clone(), Some(owner), Some(guard))
         } else {
             let path = tokio::fs::canonicalize(cache_root.root())
@@ -333,6 +334,8 @@ impl ProjectorRuntime {
         let mut candidate_guard = CandidateDropGuard {
             control: coordinator.clone(),
             candidate: recovery.clone(),
+            local_owner: local_owner.clone(),
+            postgres_runtime_guard: postgres_runtime_guard.clone(),
         };
         let setup = async {
             // Persist canonical cleanup registration only after generation selection
@@ -399,8 +402,10 @@ impl ProjectorRuntime {
         let worker_engine = Arc::clone(&engine);
         let worker_stop = shutdown.clone();
         let worker_owner = local_owner.clone();
+        let worker_pg_guard = postgres_runtime_guard.clone();
         let worker = tokio::spawn(async move {
             let _owner = worker_owner;
+            let _pg_guard = worker_pg_guard;
             worker::supervise(worker_engine, generation, spaces, catalog, worker_stop).await
         });
         let mut runtime = Self {
@@ -411,7 +416,7 @@ impl ProjectorRuntime {
             control,
             maintenance: None,
             local_owner,
-            _postgres_runtime_guard: postgres_runtime_guard,
+            postgres_runtime_guard,
             local_rotation: None,
             _board_provider: board_provider,
         };
@@ -430,6 +435,11 @@ impl ProjectorRuntime {
             {
                 Ok(recovered) => recovered,
                 Err(error) => {
+                    // Retain ownership locks across shutdown until the reserved
+                    // candidate has been cancelled so a competing startup cannot
+                    // reuse the cache root and have its reservation cancelled.
+                    let _local_owner_hold = runtime.local_owner.clone();
+                    let _pg_guard_hold = runtime.postgres_runtime_guard.clone();
                     let _ = runtime.shutdown().await;
                     candidate_guard.disarm();
                     let _ = coordinator.cancel_candidate(&candidate).await;
@@ -457,8 +467,10 @@ impl ProjectorRuntime {
         let engine = Arc::clone(&runtime.engine);
         let maintenance_stop = stop.clone();
         let maintenance_owner = runtime.local_owner.clone();
+        let maintenance_pg_guard = runtime.postgres_runtime_guard.clone();
         let task = tokio::spawn(async move {
             let _owner = maintenance_owner;
+            let _pg_guard = maintenance_pg_guard;
             maintenance::supervise(engine, maintenance_stop).await;
         });
         runtime.maintenance = Some((stop, task));
@@ -1214,6 +1226,8 @@ impl ProjectionEngine {
 struct CandidateDropGuard {
     control: GenerationControl,
     candidate: Option<GenerationDescriptor>,
+    local_owner: Option<Arc<std::fs::File>>,
+    postgres_runtime_guard: Option<Arc<PostgresRuntimeGuard>>,
 }
 
 impl CandidateDropGuard {
@@ -1226,8 +1240,12 @@ impl Drop for CandidateDropGuard {
     fn drop(&mut self) {
         if let Some(candidate) = self.candidate.take() {
             let control = self.control.clone();
+            let local_owner = self.local_owner.take();
+            let postgres_runtime_guard = self.postgres_runtime_guard.take();
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 handle.spawn(async move {
+                    let _local_owner = local_owner;
+                    let _pg_guard = postgres_runtime_guard;
                     let _ = control.cancel_candidate(&candidate).await;
                 });
             }
@@ -1474,9 +1492,15 @@ mod event_scrub_tests {
         let queued_space = events::ScrubbableSpaceEvent::new(notarium_core::ports::SpaceEvent {
             scope: scope.clone(),
             seq: SpaceSeq::new(5).unwrap(),
-            kind: notarium_core::ports::SpaceEventKind::GraphSettled {
-                generation: ProjectionGeneration::new(1).unwrap(),
-            },
+            kind: notarium_core::ports::SpaceEventKind::Job(notarium_core::ports::ContentJob {
+                id: notarium_core::ids::JobId::from_bytes([7; 16]),
+                kind: notarium_core::ports::ContentJobKind::Backup,
+                state: notarium_core::ports::JobState::Running,
+                completed_units: 0,
+                total_units: None,
+                lease: notarium_core::ids::LeaseEpoch::new(1).unwrap(),
+                artifacts: Vec::new(),
+            }),
         });
         SpaceEventChannel::track_space_event(
             &channel.scrub,

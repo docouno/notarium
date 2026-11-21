@@ -126,7 +126,9 @@ impl ProjectionEngine {
         }
         let scrubbable = !matches!(
             kind,
-            SpaceEventKind::ResyncRequired | SpaceEventKind::Lifecycle(_)
+            SpaceEventKind::ResyncRequired
+                | SpaceEventKind::Lifecycle(_)
+                | SpaceEventKind::GraphSettled { .. }
         );
         let event = SpaceEvent {
             scope: scope.clone(),
@@ -1120,6 +1122,13 @@ async fn space_delivery<'engine>(
             }
         } else {
             if let SpaceEventKind::Job(job) = &event.kind {
+                let floor = engine.erasure_floor(&event.scope);
+                if event.seq <= floor {
+                    drop(permit);
+                    let target = floor.max(event.seq);
+                    return transport_refresh(engine, ctx, generation, delivered, Some(target))
+                        .await;
+                }
                 let Some(grant) = ctx.auth().spaces().get(&event.scope.space_id) else {
                     return Ok(None);
                 };
@@ -1427,6 +1436,10 @@ async fn board_delivery<'engine>(
         let (head, lazy_compute) = {
             let permit = live.read(&ctx.budget).await?;
             can_view_entry(ctx, &permit)?;
+            if notice.seq <= engine.erasure_floor(&notice.scope) {
+                notice.payload = BoardNoticePayload::ResyncOnly;
+                return Ok(None);
+            }
             if notice.seq > permit.head() {
                 return Ok(None);
             }
@@ -1450,15 +1463,13 @@ async fn board_delivery<'engine>(
                         let Ok(admission) = engine.current_admission(notice.generation) else {
                             continue;
                         };
-                        let kind = match slot.clone_payload() {
-                            Some(delta) => {
-                                if !board_ranks_visible(ctx, &permit, &delta)? {
-                                    return Ok(None);
-                                }
-                                SpaceEventKind::Board(delta)
-                            }
-                            None => SpaceEventKind::ResyncRequired,
+                        let Some(delta) = slot.clone_payload() else {
+                            return Ok(None);
                         };
+                        if !board_ranks_visible(ctx, &permit, &delta)? {
+                            return Ok(None);
+                        }
+                        let kind = SpaceEventKind::Board(delta);
                         authorize_entry(ctx, &permit)?;
                         return Ok(Some(EventDelivery {
                             seq: notice.seq,

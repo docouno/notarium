@@ -292,7 +292,14 @@ impl GenerationFiles {
                                 | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
                         )
                         .map_err(|_| error())?;
-                        let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+                        let (busy, log, checkpointed): (i64, i64, i64) = conn
+                            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                            })
+                            .map_err(|_| error())?;
+                        if busy != 0 || (log != -1 && log != checkpointed) {
+                            return Err(error());
+                        }
                         drop(conn);
                     }
                     for sidecar in [

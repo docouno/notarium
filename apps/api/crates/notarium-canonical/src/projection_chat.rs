@@ -17,7 +17,7 @@ use notarium_core::{
         ChatThreadId, HistoryIncarnation, NoteId, RevisionId, SpaceId, SpaceSeq, ThreadEntrySeq,
     },
     model::{HistoryScope, NoteRef},
-    ports::{ChatThread, MaintenanceContext, PageLimit},
+    ports::{ChatThread, MaintenanceContext, PageLimit, ServicePurpose},
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -231,6 +231,7 @@ impl CanonicalStore {
         cutoff: Option<SpaceSeq>,
         threads: &[ChatThreadId],
     ) -> Result<BTreeMap<ChatThreadId, ProjectionChatHead>, PortError> {
+        ctx.authority.require(ServicePurpose::Projection)?;
         if threads.is_empty() {
             return Ok(BTreeMap::new());
         }
@@ -514,6 +515,7 @@ impl CanonicalStore {
         ctx: &MaintenanceContext,
         references: &[ProjectionChatRef],
     ) -> Result<Vec<bool>, PortError> {
+        ctx.authority.require(ServicePurpose::Projection)?;
         if references.is_empty() {
             return Ok(Vec::new());
         }

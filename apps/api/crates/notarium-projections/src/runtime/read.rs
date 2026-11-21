@@ -1141,8 +1141,16 @@ impl ProjectionEngine {
         overlay: &BTreeMap<u32, ProjectedNote>,
         require_head: Option<SpaceSeq>,
     ) -> Result<Vec<Option<NoteCard>>, PortError> {
-        if require_head.is_none_or(|head| head == cut.cut.projected_seq)
-            && overlay.is_empty()
+        let fast_head_match = overlay.is_empty()
+            && match require_head {
+                Some(head) => head == cut.cut.projected_seq,
+                None => cut
+                    .live
+                    .try_read()
+                    .ok()
+                    .is_some_and(|permit| permit.head() == cut.cut.projected_seq),
+            };
+        if fast_head_match
             && let Some(cards) = cut
                 .store
                 .hydrate_current_cards(ctx.scope(), cut.cut.projected_seq, ids)
@@ -1154,40 +1162,45 @@ impl ProjectionEngine {
             } else if permit.space().lifecycle != SpaceLifecycle::Active {
                 return Err(DomainError::ResourceNotFound.into());
             }
-            return cards
-                .into_iter()
-                .map(|card| {
-                    let Some(card) = card else {
-                        return Ok(None);
-                    };
-                    let LiveNoteStatus::ActiveVisible(facts) =
-                        permit.classify(ctx, &card.note, true)?
-                    else {
-                        return Ok(None);
-                    };
-                    if card.class != facts.class || card.lifecycle != Lifecycle::Active {
-                        return Err(stale());
-                    }
-                    let metadata = ClassifiedMetadata::from_canonical(
-                        NoteRef {
-                            space_id: ctx.scope().space_id.clone(),
-                            note_id: card.note,
-                        },
-                        card.revision,
-                        facts,
-                        Lifecycle::Active,
-                        card.digest,
-                    )?;
-                    Ok(ClassEgressFence::search_metadata(metadata, ctx.auth())
-                        .ok()
-                        .map(|document| NoteCard {
-                            document,
-                            title: card.title,
-                            path: card.path,
-                            preview: card.preview,
-                        }))
-                })
-                .collect();
+            // Only substitute live facts as `recorded` when the live head still
+            // equals `cut.cut.projected_seq`; otherwise fall through to the
+            // historical `hydration_plan` path so `recorded` facts are verified.
+            if permit.head() == cut.cut.projected_seq {
+                return cards
+                    .into_iter()
+                    .map(|card| {
+                        let Some(card) = card else {
+                            return Ok(None);
+                        };
+                        let LiveNoteStatus::ActiveVisible(facts) =
+                            permit.classify(ctx, &card.note, true)?
+                        else {
+                            return Ok(None);
+                        };
+                        if card.class != facts.class || card.lifecycle != Lifecycle::Active {
+                            return Err(stale());
+                        }
+                        let metadata = ClassifiedMetadata::from_canonical(
+                            NoteRef {
+                                space_id: ctx.scope().space_id.clone(),
+                                note_id: card.note,
+                            },
+                            card.revision,
+                            facts,
+                            Lifecycle::Active,
+                            card.digest,
+                        )?;
+                        Ok(ClassEgressFence::search_metadata(metadata, ctx.auth())
+                            .ok()
+                            .map(|document| NoteCard {
+                                document,
+                                title: card.title,
+                                path: card.path,
+                                preview: card.preview,
+                            }))
+                    })
+                    .collect();
+            }
         }
         let planned = self.hydration_plan(ctx, cut, ids, overlay).await?;
         let permit = cut.live.try_read()?;

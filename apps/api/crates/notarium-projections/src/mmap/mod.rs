@@ -236,15 +236,19 @@ impl Drop for FileLease {
         {
             let path = self.path.clone();
             let digest = self.record.digest;
+            let owner = self._cache_owner.take();
             // Offload lazy retirement unlink/fsync off Tokio async workers;
             // synchronous/non-Tokio callers and purge/pending drops run inline.
+            // Keep `_cache_owner` alive until the unlink finishes.
             if state == RETIRED
                 && let Ok(handle) = tokio::runtime::Handle::try_current()
             {
                 drop(handle.spawn_blocking(move || {
+                    let _owner = owner;
                     let _ = unlink_target(&path, &witness, &digest);
                 }));
             } else {
+                let _owner = owner;
                 let _ = unlink_target(&path, &witness, &digest);
             }
         }
@@ -1310,77 +1314,74 @@ impl MmapPool {
         &self,
         handle: &BaseIndexHandle,
     ) -> Result<Arc<MappedFastIndex>, IndexError> {
-        if let Some(resident) = self.try_get_resident(handle) {
-            return Ok(resident);
-        }
         let key = Arc::as_ptr(&handle.0) as usize;
         enum AsyncRole {
             Leader(tokio::sync::watch::Sender<Option<AsyncOpenOutcome>>),
             Follower(tokio::sync::watch::Receiver<Option<AsyncOpenOutcome>>),
         }
-        let role = {
-            let mut inflight = self
-                .0
-                .async_opening
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(rx) = inflight.get(&key) {
-                AsyncRole::Follower(rx.clone())
-            } else {
-                let (tx, rx) = tokio::sync::watch::channel(None);
-                inflight.insert(key, rx);
-                AsyncRole::Leader(tx)
+        loop {
+            if let Some(resident) = self.try_get_resident(handle) {
+                return Ok(resident);
             }
-        };
-        match role {
-            AsyncRole::Follower(mut rx) => {
-                loop {
+            let role = {
+                let mut inflight = self
+                    .0
+                    .async_opening
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(rx) = inflight.get(&key) {
+                    AsyncRole::Follower(rx.clone())
+                } else {
+                    let (tx, rx) = tokio::sync::watch::channel(None);
+                    inflight.insert(key, rx);
+                    AsyncRole::Leader(tx)
+                }
+            };
+            match role {
+                AsyncRole::Follower(mut rx) => loop {
                     if let Some(outcome) = rx.borrow().clone() {
                         return outcome.map_err(|err| clone_index_error(&err));
                     }
                     if rx.changed().await.is_err() {
-                        // Leader was cancelled/dropped; fall back to opening directly.
-                        let handle = handle.clone();
-                        let pool = self.clone();
-                        return tokio::task::spawn_blocking(move || pool.open(&handle))
-                            .await
-                            .map_err(|err| IndexError::Io(io::Error::other(err.to_string())))?;
+                        // Leader was cancelled/dropped; loop to re-check resident
+                        // cache and elect a single replacement async leader.
+                        break;
                     }
-                }
-            }
-            AsyncRole::Leader(tx) => {
-                struct AsyncFlightGuard {
-                    pool: Arc<MmapPoolInner>,
-                    key: usize,
-                }
-                impl Drop for AsyncFlightGuard {
-                    fn drop(&mut self) {
-                        self.pool
-                            .async_opening
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .remove(&self.key);
+                },
+                AsyncRole::Leader(tx) => {
+                    struct AsyncFlightGuard {
+                        pool: Arc<MmapPoolInner>,
+                        key: usize,
                     }
-                }
-                let _guard = AsyncFlightGuard {
-                    pool: Arc::clone(&self.0),
-                    key,
-                };
-                let handle = handle.clone();
-                let pool = self.clone();
-                let result = tokio::task::spawn_blocking(move || pool.open(&handle))
-                    .await
-                    .map_err(|err| IndexError::Io(io::Error::other(err.to_string())))?;
-                match result {
-                    Ok(index) => {
-                        let _ = tx.send(Some(Ok(Arc::clone(&index))));
-                        Ok(index)
+                    impl Drop for AsyncFlightGuard {
+                        fn drop(&mut self) {
+                            self.pool
+                                .async_opening
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .remove(&self.key);
+                        }
                     }
-                    Err(err) => {
-                        let shared = Arc::new(err);
-                        let _ = tx.send(Some(Err(Arc::clone(&shared))));
-                        Err(clone_index_error(&shared))
-                    }
+                    let _guard = AsyncFlightGuard {
+                        pool: Arc::clone(&self.0),
+                        key,
+                    };
+                    let handle = handle.clone();
+                    let pool = self.clone();
+                    let result = tokio::task::spawn_blocking(move || pool.open(&handle))
+                        .await
+                        .map_err(|err| IndexError::Io(io::Error::other(err.to_string())))?;
+                    return match result {
+                        Ok(index) => {
+                            let _ = tx.send(Some(Ok(Arc::clone(&index))));
+                            Ok(index)
+                        }
+                        Err(err) => {
+                            let shared = Arc::new(err);
+                            let _ = tx.send(Some(Err(Arc::clone(&shared))));
+                            Err(clone_index_error(&shared))
+                        }
+                    };
                 }
             }
         }

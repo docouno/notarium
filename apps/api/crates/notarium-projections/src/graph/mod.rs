@@ -703,7 +703,6 @@ mod tests {
                 notes: &notes,
                 sections: &graph,
             },
-            &cut().scope,
             &effective,
             &cancel,
         )
@@ -723,7 +722,6 @@ mod tests {
                 notes: &notes,
                 sections: &graph,
             },
-            &cut().scope,
             &effective,
             &cancel,
         )

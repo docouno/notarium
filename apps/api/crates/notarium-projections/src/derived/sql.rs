@@ -966,7 +966,7 @@ impl Database {
                 // interrupted or timed-out transaction drops its connection so
                 // an in-flight query cannot pin MVCC, whereas clean domain
                 // errors roll back and return the connection to the pool.
-                let budget = tokio::time::Instant::from_std(cutoff - (READ_LIMIT - PG_READ_LIMIT));
+                let budget = tokio::time::Instant::from_std(Instant::now() + PG_READ_LIMIT);
                 tokio::time::timeout_at(budget, async {
                     let mut lease = PgReadConnection {
                         connection: pool.acquire().await.map_err(postgres_error)?,

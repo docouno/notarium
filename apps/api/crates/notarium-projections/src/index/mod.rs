@@ -280,11 +280,15 @@ impl IndexView {
         if target.is_empty() {
             return Ok(());
         }
+        if matches!(key, PostingKey::Tag(_)) && self.tags_bucketed() {
+            return Err(IndexError::InvalidInput(
+                "cannot subtract bucketed tag posting",
+            ));
+        }
         if matches!(
             key,
             PostingKey::ClusterMembers(_) | PostingKey::FolderSubtree(_)
-        ) || (matches!(key, PostingKey::Tag(_)) && self.tags_bucketed())
-        {
+        ) {
             let set = self.posting(key)?;
             target.andnot_inplace(&set);
             return Ok(());
@@ -500,28 +504,67 @@ impl IndexView {
         } else {
             &self.l0.outgoing
         };
-        let (replace, delta, base) = match edges.get(&index) {
-            Some(EdgeOverlay::Replace(vec)) => (Some(vec.as_slice()), None, &[][..]),
-            Some(EdgeOverlay::Delta { added, removed }) => (
-                None,
-                Some((added, removed)),
-                self.base.neighbors(incoming, index),
-            ),
-            None => (None, None, self.base.neighbors(incoming, index)),
-        };
-        let replace_iter = replace.into_iter().flat_map(|slice| slice.iter().copied());
-        let base_iter = base
-            .iter()
-            .copied()
-            .map(u32::from_le_bytes)
-            .filter(move |edge| {
-                delta
-                    .is_none_or(|(added, removed)| !removed.contains(edge) && !added.contains(edge))
-            });
-        let added_iter = delta
-            .into_iter()
-            .flat_map(|(added, _)| added.iter().copied());
-        replace_iter.chain(base_iter).chain(added_iter)
+        match edges.get(&index) {
+            Some(EdgeOverlay::Replace(vec)) => NeighborIter::Replace(vec.iter().copied()),
+            Some(EdgeOverlay::Delta { added, removed }) => NeighborIter::Delta {
+                base: self.base.neighbors(incoming, index).iter().peekable(),
+                added: added.iter().copied().peekable(),
+                removed,
+            },
+            None => NeighborIter::Base(self.base.neighbors(incoming, index).iter()),
+        }
+    }
+}
+
+enum NeighborIter<'a> {
+    Replace(std::iter::Copied<std::slice::Iter<'a, u32>>),
+    Base(std::slice::Iter<'a, [u8; 4]>),
+    Delta {
+        base: std::iter::Peekable<std::slice::Iter<'a, [u8; 4]>>,
+        added: std::iter::Peekable<std::iter::Copied<std::collections::btree_set::Iter<'a, u32>>>,
+        removed: &'a std::collections::BTreeSet<u32>,
+    },
+}
+
+impl Iterator for NeighborIter<'_> {
+    type Item = u32;
+
+    fn next(&mut self) -> Option<u32> {
+        match self {
+            Self::Replace(iter) => iter.next(),
+            Self::Base(iter) => iter.next().copied().map(u32::from_le_bytes),
+            Self::Delta {
+                base,
+                added,
+                removed,
+            } => {
+                while base
+                    .peek()
+                    .is_some_and(|raw| removed.contains(&u32::from_le_bytes(**raw)))
+                {
+                    base.next();
+                }
+                let next_base = base.peek().map(|raw| u32::from_le_bytes(**raw));
+                let next_added = added.peek().copied();
+                match (next_base, next_added) {
+                    (Some(b), Some(a)) if b < a => {
+                        base.next();
+                        Some(b)
+                    }
+                    (Some(b), Some(a)) if a < b => added.next(),
+                    (Some(_), Some(_)) => {
+                        base.next();
+                        added.next()
+                    }
+                    (Some(b), None) => {
+                        base.next();
+                        Some(b)
+                    }
+                    (None, Some(_)) => added.next(),
+                    (None, None) => None,
+                }
+            }
+        }
     }
 }
 

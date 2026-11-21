@@ -282,7 +282,7 @@ pub fn recover_top_level_id(raw: &str) -> Option<ViewKey> {
                 .get(..root_indent)
                 .is_some_and(|prefix| prefix.iter().all(|&byte| byte == b' '))
         {
-            if let Some((_, rest)) = trimmed_spaces.split_once(':') {
+            if let Some((_, rest)) = split_yaml_mapping_colon(trimmed_spaces) {
                 if starts_block_scalar(rest) {
                     block_scalar_indent = Some(indent);
                 } else {
@@ -300,7 +300,7 @@ pub fn recover_top_level_id(raw: &str) -> Option<ViewKey> {
         if at_root.starts_with(char::is_whitespace) {
             continue;
         }
-        let Some((key, rest)) = at_root.split_once(':') else {
+        let Some((key, rest)) = split_yaml_mapping_colon(at_root) else {
             advance_yaml_inline_state(at_root, &mut open_quote, &mut flow_depth);
             continue;
         };
@@ -348,6 +348,36 @@ fn starts_block_scalar(rest: &str) -> bool {
     after
         .bytes()
         .all(|b| matches!(b, b'+' | b'-' | b'1'..=b'9'))
+}
+
+fn split_yaml_mapping_colon(text: &str) -> Option<(&str, &str)> {
+    let mut quote: Option<char> = None;
+    let mut chars = text.char_indices().peekable();
+    while let Some((idx, ch)) = chars.next() {
+        if let Some(q) = quote {
+            if q == '"' {
+                if ch == '\\' {
+                    let _ = chars.next();
+                } else if ch == '"' {
+                    quote = None;
+                }
+            } else if ch == '\'' {
+                if chars.peek().is_some_and(|(_, next)| *next == '\'') {
+                    let _ = chars.next();
+                } else {
+                    quote = None;
+                }
+            }
+            continue;
+        }
+        match ch {
+            '"' | '\'' => quote = Some(ch),
+            '#' => return None,
+            ':' => return Some((&text[..idx], &text[idx + 1..])),
+            _ => {}
+        }
+    }
+    None
 }
 
 fn advance_yaml_inline_state(text: &str, open_quote: &mut Option<char>, flow_depth: &mut usize) {
@@ -452,6 +482,10 @@ mod tests {
 
         let in_quoted = format!("title: \"hello\nid: {}\"\nbad: [", key.as_str());
         assert_eq!(recover_top_level_id(&in_quoted), None);
+
+        let quoted_key_with_colon =
+            format!("\"title: x\": \"hello\nid: {}\"\nbad: [", key.as_str());
+        assert_eq!(recover_top_level_id(&quoted_key_with_colon), None);
 
         let after_doc_end = format!("kind: list\n...\nid: {}", key.as_str());
         assert_eq!(recover_top_level_id(&after_doc_end), None);

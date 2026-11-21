@@ -946,7 +946,7 @@ pub(super) async fn collect_graph_sections(
                 notes: &notes,
                 sections: &graph,
             };
-            let snapshot = LeidenSnapshot::compute(&build, &scope_owned, &effective, &cancel)?;
+            let snapshot = LeidenSnapshot::compute(&build, &effective, &cancel)?;
             let mutations = graph_settle::cluster_mutations(&snapshot, &build, &scope_owned, cut)?;
             graph.clusters = snapshot.expanded();
             Ok(CheckpointGraph {

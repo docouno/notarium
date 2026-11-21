@@ -236,8 +236,11 @@ impl ProjectionEngine {
             let mut verified = self.verify_chat_backlinks(ctx, note, &candidates).await?;
             if pending.is_empty() && (complete || verified.visible.len() >= want) {
                 let has_more = verified.visible.len() > capacity;
-                verified.visible.truncate(capacity);
+                // Apply taint across delivered rows AND the single lookahead
+                // witness that determined `has_more` (`page.next`) before truncating.
+                verified.visible.truncate(want);
                 apply_delivered_taint(ctx, &verified);
+                verified.visible.truncate(capacity);
                 return Ok((verified, has_more));
             }
             let room = want - pending.len();
@@ -256,8 +259,9 @@ impl ProjectionEngine {
                 let mut reverified = self.verify_chat_backlinks(ctx, note, &pending).await?;
                 if exhausted || reverified.visible.len() >= want {
                     let has_more = reverified.visible.len() > capacity;
-                    reverified.visible.truncate(capacity);
+                    reverified.visible.truncate(want);
                     apply_delivered_taint(ctx, &reverified);
+                    reverified.visible.truncate(capacity);
                     return Ok((reverified, has_more));
                 }
                 // Concurrent redaction or revocation shrank the batch; keep

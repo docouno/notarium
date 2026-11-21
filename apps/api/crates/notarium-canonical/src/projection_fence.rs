@@ -1698,6 +1698,7 @@ impl CanonicalStore {
             .expect("projection cleanup debt")
             .get(scope)
             .copied();
+        let mut retired_floor: Option<SpaceSeq> = None;
         if let Some((after, through)) = pending
             && let Some(callback) = fence.cleanup()
         {
@@ -1707,7 +1708,10 @@ impl CanonicalStore {
                 through,
                 changes: VisibilityChanges::all(),
             };
-            source::erase_window(self, callback.as_ref(), &window).await?;
+            let purged = source::erase_window(self, callback.as_ref(), &window).await?;
+            if purged {
+                retired_floor = Some(retired_floor.map_or(through, |cur| cur.max(through)));
+            }
             fence
                 .cleanup_debt
                 .lock()
@@ -1733,7 +1737,23 @@ impl CanonicalStore {
             let purged = source::erase_window(self, callback.as_ref(), &window).await?;
             if purged {
                 old_state.retire_lookup_before(record.last_seq);
+                retired_floor =
+                    Some(retired_floor.map_or(record.last_seq, |cur| cur.max(record.last_seq)));
             }
+        }
+        if let Some(old_state) = old.state_mut()
+            && &old_state.record.scope == scope
+            && old_state.record.active_epoch == record.active_epoch
+            && let Some(prev_retired) = old_state.retired_before
+        {
+            retired_floor = Some(retired_floor.map_or(prev_retired, |cur| cur.max(prev_retired)));
+        }
+        if let (Some(floor), Some(next_lookup)) = (retired_floor, lookup.as_ref())
+            && next_lookup
+                .published_seq()
+                .is_none_or(|published| published < floor)
+        {
+            return Err(not_ready());
         }
         // Release the previous admission's private buffers BEFORE allocating the
         // replacement LiveState so re-admission does not double peak RAM (>8 MiB).
@@ -1752,6 +1772,9 @@ impl CanonicalStore {
         };
         let mut state = LiveState::new(record, lookup)?;
         source::seed(self, &mut state, &ctx.budget, deadline).await?;
+        if let Some(floor) = retired_floor {
+            state.retired_before = Some(state.retired_before.map_or(floor, |cur| cur.max(floor)));
+        }
         if let Some((prev_scope, prev_epoch, prev_gen, prev_retired, prev_peak)) = previous_meta {
             if prev_scope == state.record.scope && prev_epoch == state.record.active_epoch {
                 state.lookup_generation = state.lookup_generation.max(prev_gen);

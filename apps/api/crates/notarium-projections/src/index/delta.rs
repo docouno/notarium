@@ -82,7 +82,6 @@ pub(super) struct L0Layer {
     pub(super) notes: BTreeMap<u32, Arc<ChangedNote>>,
     pub(super) note_lookup: BTreeMap<NoteId, u32>,
     pub(super) replaced: Bitmap,
-    pub(super) deleted: Bitmap,
     pub(super) subtree_overrides: BTreeMap<u32, SubtreeOverlay>,
     pub(super) postings: BTreeMap<Vec<u8>, Bitmap>,
     pub(super) bsi_live: BTreeMap<Vec<u8>, BTreeMap<u32, ScalarValue>>,
@@ -91,10 +90,7 @@ pub(super) struct L0Layer {
 
 impl L0Layer {
     fn is_empty(&self) -> bool {
-        self.notes.is_empty()
-            && self.replaced.is_empty()
-            && self.deleted.is_empty()
-            && self.subtree_overrides.is_empty()
+        self.notes.is_empty() && self.replaced.is_empty() && self.subtree_overrides.is_empty()
     }
 
     fn should_seal(&self) -> bool {
@@ -163,7 +159,6 @@ impl L0Delta {
         self.ensure_tip_accepts_notes();
         self.remove_replacement_from_tip(note.dense);
         self.tip.replaced.add(note.dense);
-        self.tip.deleted.remove(note.dense);
         self.all_replaced.add(note.dense);
         if self.deleted.remove_checked(note.dense) {
             self.approx_bytes = self.approx_bytes.saturating_sub(64);
@@ -214,7 +209,6 @@ impl L0Delta {
         self.ensure_tip_accepts_notes();
         self.remove_replacement_from_tip(dense);
         self.tip.replaced.add(dense);
-        self.tip.deleted.add(dense);
         self.all_replaced.add(dense);
         if self.deleted.add_checked(dense) {
             self.approx_bytes = self.approx_bytes.saturating_add(64);
@@ -367,9 +361,10 @@ impl L0Delta {
                 removed: r,
             }) => {
                 for &edge in removed {
-                    if !a.remove(&edge) {
-                        r.insert(edge);
-                    }
+                    // Always tombstone in `r` so a base edge cannot resurrect
+                    // across `delete -> re-add -> delete`.
+                    a.remove(&edge);
+                    r.insert(edge);
                 }
                 for &edge in added {
                     r.remove(&edge);

@@ -277,19 +277,20 @@ container cannot see the controller. The fixture runs both SQL drivers end-to-en
 folder subtree, tag, enum and indexed date range. The cold cases evict each
 checkpoint from the resident pool and advise the Linux kernel to discard its
 cached pages before opening or querying; for SQLite cold board queries the
-benchmark also clears idle SQLite reader connections (evicting SQLite's
-user-space page cache), runs `PRAGMA shrink_memory`, and advises
-`POSIX_FADV_DONTNEED` on the derived SQLite database and WAL files. For
-PostgreSQL cold board queries, the local mmap checkpoint is evicted from RAM and
-OS page cache while PostgreSQL `shared_buffers` remains warm across samples in
-the same fixture instance. The PostgreSQL profile uses a local Unix socket and
-local CAS. Its results describe the storage and projection workload under that
-setup. Both drivers also measure the warm and cold 50-row read after a canonical
-drag materializes the destination column. Every sample checks column counts,
-note order and the presence of physical ranks. The report records process peak
-memory (`VmHWM`), enforces explicit `p95` and `p99` guardrails, and includes
-microprofile timings for sequential single-note CoW `L0Delta` edits and
-high-cardinality (5,000-tag) bucketed tag probes.
+benchmark also runs `PRAGMA shrink_memory` across pooled SQLite reader and
+writer connections (evicting SQLite's user-space page cache without tearing
+down the connection pool) and advises `POSIX_FADV_DONTNEED` on the derived
+SQLite database and WAL files. For PostgreSQL cold board queries, the local
+mmap checkpoint is evicted from RAM and OS page cache while PostgreSQL
+`shared_buffers` remains warm across samples in the same fixture instance. The
+PostgreSQL profile uses a local Unix socket and local CAS. Its results describe
+the storage and projection workload under that setup. Both drivers also measure
+the warm and cold 50-row read after a canonical drag materializes the
+destination column. Every sample checks column counts, note order and the
+presence of physical ranks. The report records process peak memory (`VmHWM`),
+enforces explicit `p95` and `p99` guardrails, and includes microprofile timings
+for sequential single-note CoW `L0Delta` edits and high-cardinality
+(70,000-tag) bucketed tag probes.
 
 The report records p50, p95 and p99 for the read workloads, plus durable tail
 replay, board receipt and import observations, and cold rebuild. The replay

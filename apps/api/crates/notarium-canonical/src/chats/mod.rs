@@ -564,18 +564,22 @@ fn authorize_thread_mutation(
     legacy_staged: bool,
 ) -> Result<(), PortError> {
     let tainted = th.tainted_mask != 0 || legacy_staged;
-    if (auth.taint().is_tainted() || tainted)
-        && (th.kind == ChatThreadKind::SpaceGroup || space.kind == SpaceKind::Shared)
-    {
-        return Err(DomainError::CrossSpaceTainted.into());
-    }
-    Ok(auth.authorize_chat_thread_read(
+    // Verify visibility and Personal-chat ownership before taint checks so a
+    // tainted caller cannot distinguish a foreign Personal thread from absent.
+    auth.can_view_chat_thread(
         space,
         th.kind,
         &th.owner,
         th.project_folder.as_ref(),
         tainted,
-    )?)
+    )?;
+    if (auth.taint().is_tainted() || tainted)
+        && (th.kind == ChatThreadKind::SpaceGroup || space.kind == SpaceKind::Shared)
+    {
+        return Err(DomainError::CrossSpaceTainted.into());
+    }
+    auth.mark_chat_read_taint(space, tainted);
+    Ok(())
 }
 
 #[derive(Clone, Debug)]

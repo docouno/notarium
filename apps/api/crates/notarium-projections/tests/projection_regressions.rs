@@ -2818,5 +2818,510 @@ async fn root_non_recursive_listing_supercluster_csprng_and_decommission_gate() 
     reopened_canonical.shutdown().await.unwrap();
 }
 
+#[tokio::test]
+async fn hydrate_older_snapshot_checks_recorded_facts_and_schema_move_updates_fence() {
+    use notarium_core::ports::MoveNote;
+
+    let scratch = Scratch::new();
+    let root = scratch.root();
+    let (store, canonical) = CanonicalRuntime::open(CanonicalConfig::local_default(
+        InstallationId::from_bytes(rand16()),
+        root.clone(),
+    ))
+    .await
+    .unwrap();
+    let (scope, owner) = open_space(&store, SpaceKind::Personal).await;
+    let (secret_folder, _) = create_folder(&store, &owner, None, "secret", false).await;
+    let (public_folder, _) = create_folder(&store, &owner, None, "public", true).await;
+
+    let secret_note = create_note(
+        &store,
+        &owner,
+        Some(secret_folder.clone()),
+        "layoffs",
+        DocClass::UserDoc,
+        "# Layoffs Q4\nConfidential plan.\n".into(),
+    )
+    .await;
+    let public_schema_note = create_note(
+        &store,
+        &owner,
+        Some(public_folder.clone()),
+        "schema-note",
+        DocClass::UserDoc,
+        "# Schema Carrier\n".into(),
+    )
+    .await;
+
+    let runtime = ProjectorRuntime::start_sqlite(
+        store.clone(),
+        projection_ctx(),
+        root.clone(),
+        ProjectionGeneration::new(1).unwrap(),
+        ProjectionConfig::default(),
+    )
+    .await
+    .unwrap();
+    let engine = runtime.engine();
+    sync(&store, &runtime, &scope).await;
+
+    let public_grants = BTreeMap::from([(
+        scope.space_id.clone(),
+        SpaceGrant {
+            role: SpaceRole::Editor,
+            read_classes: DocClass::all(),
+            write_classes: DocClass::all(),
+            project_root: Some(public_folder.clone()),
+        },
+    )]);
+    let public_ctx = SpaceContext::new(
+        EngineAuthContext::for_human(VerifiedHuman::attest(
+            PrincipalId::from_bytes(rand16()),
+            GrantId::from_bytes(rand16()),
+            public_grants,
+            false,
+        )),
+        scope.clone(),
+        budget(),
+    )
+    .unwrap();
+
+    // Capture a retained snapshot cut at the pre-sanitization seq.
+    let read_port = engine.note_reads();
+    let opened = read_port
+        .list_notes(
+            public_ctx.clone(),
+            ReadRequest::Open {
+                query: NoteQuery {
+                    folder: None,
+                    recursive: true,
+                    classes: DocClass::all(),
+                    lifecycle: LifecycleMask::Active,
+                    filter: empty_filter(),
+                    sort: SortSpec::default(),
+                    limit: PageLimit::new(20).unwrap(),
+                },
+                causal: CausalBasis::Await(AwaitWatermarks::default()),
+            },
+        )
+        .await
+        .unwrap();
+    let snapshot_before = notarium_core::model::SnapshotCut {
+        scope: opened.children.scope,
+        generation: ProjectionGeneration::new(1).unwrap(),
+        canonical_seq: opened.children.canonical_seq,
+        projected_seq: opened.children.projected_seq,
+    };
+
+    // Sanitize the secret note and move it into `/public/`. Canonical head
+    // advances past `snapshot_before`, while the retained cut still holds the
+    // pre-sanitization title/preview/path at `snapshot_before`.
+    let old_carrier = "# Layoffs Q4\nConfidential plan.\n";
+    let body = notarium_syntax::frontmatter::analyze(old_carrier, DocClass::UserDoc)
+        .unwrap()
+        .carrier
+        .body;
+    let plan = notarium_syntax::patch::plan(
+        old_carrier,
+        body,
+        vec![(
+            CarrierEditOrigin::Body,
+            body,
+            "# Public FAQ\nSanitized text.\n".into(),
+        )],
+    )
+    .unwrap();
+    let mut edit = mutation(
+        &owner,
+        EditNote {
+            note: secret_note.note.clone(),
+            plan,
+        },
+    );
+    edit.preconditions.revision = Some(secret_note.revision);
+    let edited = store.edit_note(owner.clone(), edit).await.unwrap();
+    let _moved = store
+        .move_note(
+            owner.clone(),
+            mutation(
+                &owner,
+                MoveNote {
+                    note: secret_note.note.clone(),
+                    parent: Some(public_folder.clone()),
+                    slug: "public-faq".into(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(edited.receipt.seq() > snapshot_before.projected_seq);
+
+    // Hydrating `secret_note` at the older snapshot cut MUST NOT leak the
+    // pre-sanitization title/preview/path to the `/public/`-pinned caller.
+    let hydrated = StructuralReadPort::hydrate(
+        engine.as_ref(),
+        public_ctx.clone(),
+        snapshot_before,
+        vec![secret_note.note.clone()],
+    )
+    .await
+    .unwrap();
+    assert_eq!(hydrated.len(), 1);
+    assert!(
+        hydrated[0].is_none(),
+        "historical hydrate must verify recorded facts and must not leak pre-sanitization metadata"
+    );
+
+    // Move an existing note out of `/public/` via `update_space_schema` and
+    // verify `LiveLifecycleFence` immediately hides it from `/public/` readers.
+    let _schema = store
+        .update_space_schema(
+            owner.clone(),
+            mutation(
+                &owner,
+                UpdateSpaceSchema {
+                    schema_note: public_schema_note.note.clone(),
+                    parent: None,
+                    slug: "schema-note-root".into(),
+                    carrier: "# Moved Schema\n".into(),
+                    schema: BTreeMap::new(),
+                    expected_schema_revision: None,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !StructuralReadPort::is_live_visible(
+            engine.as_ref(),
+            &public_ctx,
+            &public_schema_note.note,
+        )
+        .unwrap(),
+        "update_space_schema moving an existing note out of project_root must update live fence"
+    );
+
+    runtime.shutdown().await.unwrap();
+    canonical.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn backlink_lookahead_taints_and_tainted_mutation_hides_foreign_personal_chat() {
+    let scratch = Scratch::new();
+    let root = scratch.root();
+    let (store, canonical) = CanonicalRuntime::open(CanonicalConfig::local_default(
+        InstallationId::from_bytes(rand16()),
+        root.clone(),
+    ))
+    .await
+    .unwrap();
+
+    // Create two Personal Spaces owned by `principal_a` and order them so the
+    // local Space ID sorts BEFORE the foreign Space ID (so row 0 is local and
+    // lookahead row 1 is foreign in `ORDER BY thread_space_id, thread_id, entry_seq`).
+    let principal_a = PrincipalId::from_bytes(rand16());
+    let principal_b = PrincipalId::from_bytes(rand16());
+    let mut personal_spaces = Vec::new();
+    for label in ["p1", "p2"] {
+        let scope = HistoryScope {
+            space_id: SpaceId::from_bytes(rand16()),
+            incarnation: HistoryIncarnation::from_bytes(rand16()),
+        };
+        store
+            .create_space(CreateSpaceSpec {
+                space_id: scope.space_id.clone(),
+                incarnation: scope.incarnation,
+                root_folder_id: FolderId::from_bytes(rand16()),
+                slug: format!("{label}-{}", hex::encode(&rand16()[..4])),
+                kind: SpaceKind::Personal,
+                owner: principal_a.clone(),
+                active_epoch: LeaseEpoch::new(1).unwrap(),
+                initial_last_seq: SpaceSeq::ZERO,
+                created_at: None,
+            })
+            .await
+            .unwrap();
+        let ctx = owner_ctx(&scope, &principal_a);
+        personal_spaces.push((scope, ctx));
+    }
+    personal_spaces.sort_by(|(a, _), (b, _)| a.space_id.as_str().cmp(b.space_id.as_str()));
+    let (scope_local, owner_local) = personal_spaces.remove(0);
+    let (scope_foreign, _owner_foreign) = personal_spaces.remove(0);
+
+    let target = create_note(
+        &store,
+        &owner_local,
+        None,
+        "target",
+        DocClass::UserDoc,
+        "# Target\n".into(),
+    )
+    .await;
+
+    // Backlink 0: same Space (`scope_local`), untainted.
+    let local_thread = ChatThreadId::from_bytes(rand16());
+    store
+        .create_chat(
+            owner_local.clone(),
+            mutation(
+                &owner_local,
+                CreateChat {
+                    thread: local_thread.clone(),
+                    kind: ChatThreadKind::Personal,
+                    owner: principal_a.clone(),
+                    project_folder: None,
+                    title: "Local".into(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let local_ref = NoteRef {
+        space_id: scope_local.space_id.clone(),
+        note_id: target.note.clone(),
+    };
+    store
+        .append_chat(
+            owner_local.clone(),
+            mutation(
+                &owner_local,
+                AppendChat {
+                    thread: local_thread,
+                    parent: ThreadEntrySeq::ZERO,
+                    kind: ChatEntryKind::Human,
+                    body: ChatInputBody::Text("local ref".into()),
+                    referenced_notes: vec![local_ref.clone()],
+                    tainted: false,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+
+    // Backlink 1: foreign Space (`scope_foreign > scope_local`), visible to `principal_a`.
+    let owner_foreign_cross = SpaceContext::new(
+        EngineAuthContext::for_human(VerifiedHuman::attest(
+            principal_a.clone(),
+            GrantId::from_bytes(rand16()),
+            BTreeMap::from([
+                (
+                    scope_foreign.space_id.clone(),
+                    SpaceGrant {
+                        role: SpaceRole::Owner,
+                        read_classes: DocClass::all(),
+                        write_classes: DocClass::all(),
+                        project_root: None,
+                    },
+                ),
+                (
+                    scope_local.space_id.clone(),
+                    SpaceGrant {
+                        role: SpaceRole::Owner,
+                        read_classes: DocClass::all(),
+                        write_classes: DocClass::all(),
+                        project_root: None,
+                    },
+                ),
+            ]),
+            false,
+        )),
+        scope_foreign.clone(),
+        budget(),
+    )
+    .unwrap();
+    let foreign_thread = ChatThreadId::from_bytes(rand16());
+    store
+        .create_chat(
+            owner_foreign_cross.clone(),
+            mutation(
+                &owner_foreign_cross,
+                CreateChat {
+                    thread: foreign_thread.clone(),
+                    kind: ChatThreadKind::Personal,
+                    owner: principal_a.clone(),
+                    project_folder: None,
+                    title: "Foreign".into(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    store
+        .append_chat(
+            owner_foreign_cross.clone(),
+            mutation(
+                &owner_foreign_cross,
+                AppendChat {
+                    thread: foreign_thread,
+                    parent: ThreadEntrySeq::ZERO,
+                    kind: ChatEntryKind::Human,
+                    body: ChatInputBody::Text("foreign ref".into()),
+                    referenced_notes: vec![local_ref],
+                    tainted: false,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+
+    // Shared Space where `principal_a` has a Personal thread and `principal_b`
+    // is an Editor with a tainted branch attempting to mutate `principal_a`'s
+    // Personal thread.
+    let shared_scope = HistoryScope {
+        space_id: SpaceId::from_bytes(rand16()),
+        incarnation: HistoryIncarnation::from_bytes(rand16()),
+    };
+    store
+        .create_space(CreateSpaceSpec {
+            space_id: shared_scope.space_id.clone(),
+            incarnation: shared_scope.incarnation,
+            root_folder_id: FolderId::from_bytes(rand16()),
+            slug: format!("shared-oracle-{}", hex::encode(&rand16()[..4])),
+            kind: SpaceKind::Shared,
+            owner: principal_a.clone(),
+            active_epoch: LeaseEpoch::new(1).unwrap(),
+            initial_last_seq: SpaceSeq::ZERO,
+            created_at: None,
+        })
+        .await
+        .unwrap();
+    let owner_shared = owner_ctx(&shared_scope, &principal_a);
+    let private_in_shared = ChatThreadId::from_bytes(rand16());
+    store
+        .create_chat(
+            owner_shared.clone(),
+            mutation(
+                &owner_shared,
+                CreateChat {
+                    thread: private_in_shared.clone(),
+                    kind: ChatThreadKind::Personal,
+                    owner: principal_a.clone(),
+                    project_folder: None,
+                    title: "Owner Private".into(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+
+    let runtime = ProjectorRuntime::start_sqlite(
+        store.clone(),
+        projection_ctx(),
+        root.clone(),
+        ProjectionGeneration::new(1).unwrap(),
+        ProjectionConfig::default(),
+    )
+    .await
+    .unwrap();
+    let engine = runtime.engine();
+    sync(&store, &runtime, &scope_local).await;
+    sync(&store, &runtime, &scope_foreign).await;
+
+    let agent_grants = BTreeMap::from([
+        (
+            scope_local.space_id.clone(),
+            SpaceGrant {
+                role: SpaceRole::Owner,
+                read_classes: DocClass::all(),
+                write_classes: DocClass::all(),
+                project_root: None,
+            },
+        ),
+        (
+            scope_foreign.space_id.clone(),
+            SpaceGrant {
+                role: SpaceRole::Owner,
+                read_classes: DocClass::all(),
+                write_classes: DocClass::all(),
+                project_root: None,
+            },
+        ),
+    ]);
+    let human_a = EngineAuthContext::for_human(VerifiedHuman::attest(
+        principal_a,
+        GrantId::from_bytes(rand16()),
+        agent_grants.clone(),
+        false,
+    ));
+    let agent_ctx = SpaceContext::new(
+        human_a
+            .for_agent_run(
+                AgentRunId::from_bytes(rand16()),
+                scope_local.space_id.clone(),
+                ChatAudience::Personal,
+                agent_grants,
+            )
+            .unwrap(),
+        scope_local.clone(),
+        budget(),
+    )
+    .unwrap();
+    assert!(!agent_ctx.auth().taint().is_tainted());
+
+    // Limit = 1 returns only the local backlink, while `next.is_some()` is
+    // determined by the foreign lookahead row -> branch taint MUST engage.
+    let page = LinkReadPort::chat_backlinks_page(
+        engine.as_ref(),
+        agent_ctx.clone(),
+        target.note.clone(),
+        CausalBasis::Await(AwaitWatermarks::default()),
+        None,
+        PageLimit::new(1).unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(page.links.len(), 1);
+    assert_eq!(page.links[0].thread.space, scope_local.space_id);
+    assert!(page.next.is_some());
+    assert!(
+        agent_ctx.auth().taint().is_tainted(),
+        "lookahead witness that sets page.next must taint the branch"
+    );
+
+    // Tainted non-owner attempting to mutate a foreign Personal thread in a
+    // Shared Space must get ResourceNotFound (not CrossSpaceTainted).
+    let b_grants = BTreeMap::from([(
+        shared_scope.space_id.clone(),
+        SpaceGrant {
+            role: SpaceRole::Editor,
+            read_classes: DocClass::all(),
+            write_classes: DocClass::all(),
+            project_root: None,
+        },
+    )]);
+    let b_auth = EngineAuthContext::for_human(VerifiedHuman::attest(
+        principal_b,
+        GrantId::from_bytes(rand16()),
+        b_grants,
+        false,
+    ));
+    b_auth.taint().mark_external_read();
+    let b_ctx = SpaceContext::new(b_auth, shared_scope, budget()).unwrap();
+    let err = store
+        .append_chat(
+            b_ctx.clone(),
+            mutation(
+                &b_ctx,
+                AppendChat {
+                    thread: private_in_shared,
+                    parent: ThreadEntrySeq::ZERO,
+                    kind: ChatEntryKind::Human,
+                    body: ChatInputBody::Text("probe".into()),
+                    referenced_notes: Vec::new(),
+                    tainted: false,
+                },
+            ),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, PortError::Domain(DomainError::ResourceNotFound)),
+        "expected ResourceNotFound for foreign Personal thread mutation by tainted caller, got {err:?}"
+    );
+
+    runtime.shutdown().await.unwrap();
+    canonical.shutdown().await.unwrap();
+}
+
 #[path = "projection_regressions/read_windows.rs"]
 mod read_windows;

@@ -537,6 +537,12 @@ pub(crate) trait ResolutionIndex: Sync {
     ) -> impl Future<Output = Result<Option<NoteId>, PortError>> + Send;
 }
 
+/// Resolves a parsed link against `index` and updates `row.resolved_dense_id`
+/// and `row.resolved_tier`.
+///
+/// Cold-seed batching drives this future synchronously on a blocking thread
+/// when backed by `SyncScratch` (`poll_sync`), so it must only `.await`
+/// methods on `index: &impl ResolutionIndex`.
 pub(crate) async fn resolve_link(
     row: &mut ProjectedLink,
     folders: &FolderTopology,

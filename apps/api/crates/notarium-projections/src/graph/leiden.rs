@@ -9,7 +9,6 @@ use notarium_core::{
     DomainError, DomainResult,
     error::{PortError, ValidationReason},
     ids::ClusterId,
-    model::HistoryScope,
     ports::Cancellation,
 };
 
@@ -30,7 +29,6 @@ const NO_COMMUNITY: u32 = u32::MAX;
 impl LeidenSnapshot {
     pub fn compute(
         adjacency: &impl GraphAdjacency,
-        _scope: &HistoryScope,
         effective: &Bitmap,
         cancel: &Cancellation,
     ) -> Result<Self, PortError> {

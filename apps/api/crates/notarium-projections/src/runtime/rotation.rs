@@ -85,18 +85,15 @@ impl ProjectorRuntime {
         let descriptor = self.descriptor.clone();
         let caller = budget.clone();
         let task_stop = stop.clone();
-        let local_owner = self.local_owner.clone();
+        let owners = RuntimeOwners {
+            _local_owner: self.local_owner.clone(),
+            _pg_guard: self.postgres_runtime_guard.clone(),
+        };
         let task = tokio::spawn(async move {
             // The cache owner survives cancellation/destruction of the API
             // object while an in-flight file operation is being resolved.
             rotate_local(
-                engine,
-                previous,
-                descriptor,
-                candidate,
-                caller,
-                task_stop,
-                local_owner,
+                engine, previous, descriptor, candidate, caller, task_stop, owners,
             )
             .await
         });
@@ -205,6 +202,11 @@ struct LocalActivation {
     reply: Result<(), PortError>,
 }
 
+struct RuntimeOwners {
+    _local_owner: Option<Arc<std::fs::File>>,
+    _pg_guard: Option<Arc<crate::derived::PostgresRuntimeGuard>>,
+}
+
 async fn rotate_local(
     engine: Arc<ProjectionEngine>,
     previous: LocalWorker,
@@ -212,7 +214,7 @@ async fn rotate_local(
     candidate: ProjectionGeneration,
     mut budget: CallBudget,
     stop: Cancellation,
-    local_owner: Option<Arc<std::fs::File>>,
+    owners: RuntimeOwners,
 ) -> LocalOutcome {
     let started = Instant::now();
     let coordinator =
@@ -235,7 +237,7 @@ async fn rotate_local(
         candidate,
         &budget,
         stop.clone(),
-        local_owner,
+        owners,
     )
     .await;
     let (candidate, reservation, worker) = match result {
@@ -302,7 +304,7 @@ async fn prepare_local(
     generation: ProjectionGeneration,
     budget: &CallBudget,
     stop: Cancellation,
-    local_owner: Option<Arc<std::fs::File>>,
+    owners: RuntimeOwners,
 ) -> Result<(Arc<Generation>, GenerationDescriptor, LocalWorker), PortError> {
     let started = Instant::now();
     let catalog = engine
@@ -381,7 +383,7 @@ async fn prepare_local(
     let worker_candidate = Arc::clone(&candidate);
     let worker_stop = stop.clone();
     let worker = tokio::spawn(async move {
-        let _owner = local_owner;
+        let _owners = owners;
         worker::supervise(
             worker_engine,
             worker_candidate,
