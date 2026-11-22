@@ -36,7 +36,7 @@ pub(super) enum Parent<'a> {
 
 #[derive(Clone, Copy, Debug)]
 pub(super) enum Content<'a> {
-    String(&'a str),
+    String { text: &'a str, has_surrogates: bool },
     Value,
     Deleted,
     Garbage,
@@ -240,9 +240,19 @@ fn block<'a>(cursor: &mut Cursor<'a>, id: ID, fm_writable: bool) -> Result<Block
         4 => {
             let text = cursor.string()?;
             validate_content(text).map_err(|_| Reject::InvalidBodyContent)?;
+            // In UTF-8 only 4-byte codepoints (>= 0xF0) encode to UTF-16
+            // surrogate pairs; all 1..=3-byte UTF-8 sequences are single BMP
+            // code units.
+            let has_surrogates = text.as_bytes().iter().any(|&b| b >= 0xF0);
             let len = u32::try_from(text.encode_utf16().count())
                 .map_err(|_| Reject::InvalidBodyContent)?;
-            (Content::String(text), len)
+            (
+                Content::String {
+                    text,
+                    has_surrogates,
+                },
+                len,
+            )
         }
         8 => {
             if cursor.count(1)? != 1 {

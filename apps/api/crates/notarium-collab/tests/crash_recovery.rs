@@ -70,7 +70,6 @@ fn configuration(root: &Path, pg: Option<(&StorageTestFixtures, &str, &str)>) ->
 // writes its witness only after receiving the ACK and observing that the
 // canonical Markdown still contains the seed. The parent kills it with SIGKILL.
 #[tokio::test]
-#[ignore = "subprocess entry point for the crash-recovery tests"]
 async fn crash_child() {
     let Some(root) = std::env::var_os(CHILD_ROOT) else {
         return;
@@ -199,7 +198,7 @@ async fn abrupt_restart(pg: Option<(&StorageTestFixtures, &str, &str)>) {
     let path = root.path();
     let mut command = Command::new(std::env::current_exe().unwrap());
     command
-        .args(["--exact", "crash_child", "--ignored", "--nocapture"])
+        .args(["--exact", "crash_child", "--nocapture"])
         .env(CHILD_ROOT, path);
     if let Some((_, schema, bucket)) = pg {
         command.env(CHILD_SCHEMA, schema).env(CHILD_BUCKET, bucket);

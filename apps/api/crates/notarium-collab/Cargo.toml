@@ -9,6 +9,14 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+collab-bench = []
+
+[[test]]
+name = "collab_cost"
+required-features = ["collab-bench"]
+
 [dependencies]
 notarium-core = { workspace = true }
 notarium-syntax = { workspace = true }

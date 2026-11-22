@@ -178,7 +178,8 @@ pub(crate) async fn open_and_bootstrap_postgres(
          SET timezone = 'UTC'; \
          SET plan_cache_mode = force_generic_plan; \
          SET seq_page_cost = 0.2; \
-         SET random_page_cost = 0.2;"
+         SET random_page_cost = 0.2; \
+         SET client_connection_check_interval = '20ms';"
     ));
     let pool = PgPoolOptions::new()
         .max_connections(pool_size.max(1))

@@ -8,7 +8,8 @@ use std::{
 };
 
 use notarium_canonical::{
-    CanonicalStore, CollabRoomState, CommittedTargets, OpenCollabSession, SpaceSignal,
+    CanonicalStore, CollabRoomState, CommittedTargets, NoteCollabAdmissionMeta, OpenCollabSession,
+    SpaceSignal,
 };
 use notarium_core::{
     DomainError,
@@ -41,6 +42,9 @@ use crate::{
 const OPEN_ATTEMPTS: usize = 3;
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_MAX_ACTIVE_ROOMS: usize = 512;
+const DEFAULT_MAX_ROOMS_PER_SPACE: usize = 128;
+const DEFAULT_MAX_TOTAL_PEERS: usize = 4096;
+const LIFECYCLE_DRAIN_CONCURRENCY: usize = 32;
 
 #[derive(Clone, Debug)]
 #[non_exhaustive]
@@ -52,6 +56,8 @@ pub struct CollabConfig {
     pub idle_unload: Duration,
     pub handshake_timeout: Duration,
     pub max_active_rooms: usize,
+    pub max_rooms_per_space: usize,
+    pub max_total_peers: usize,
 }
 
 impl Default for CollabConfig {
@@ -64,6 +70,8 @@ impl Default for CollabConfig {
             idle_unload: Duration::from_secs(30),
             handshake_timeout: Duration::from_secs(10),
             max_active_rooms: DEFAULT_MAX_ACTIVE_ROOMS,
+            max_rooms_per_space: DEFAULT_MAX_ROOMS_PER_SPACE,
+            max_total_peers: DEFAULT_MAX_TOTAL_PEERS,
         }
     }
 }
@@ -73,6 +81,8 @@ impl CollabConfig {
         let now = Instant::now();
         self.checkpoint_updates > 0
             && (1..=Semaphore::MAX_PERMITS).contains(&self.max_active_rooms)
+            && (1..=Semaphore::MAX_PERMITS).contains(&self.max_rooms_per_space)
+            && (1..=Semaphore::MAX_PERMITS).contains(&self.max_total_peers)
             && !self.idle_checkpoint.is_zero()
             && !self.periodic_checkpoint.is_zero()
             && !self.handshake_timeout.is_zero()
@@ -87,6 +97,25 @@ impl CollabConfig {
             ]
             .into_iter()
             .all(|duration| now.checked_add(duration).is_some())
+    }
+}
+
+pub(crate) struct SpaceRoomPermit {
+    hub: Weak<HubInner>,
+    space: SpaceId,
+}
+
+impl Drop for SpaceRoomPermit {
+    fn drop(&mut self) {
+        if let Some(hub) = self.hub.upgrade() {
+            let mut counts = hub.space_room_counts.lock().expect("space room counts");
+            if let Some(count) = counts.get_mut(&self.space) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    counts.remove(&self.space);
+                }
+            }
+        }
     }
 }
 
@@ -121,6 +150,8 @@ pub(crate) struct HubInner {
     slots: Mutex<HashMap<RoomKey, Weak<RoomSlot>>>,
     active: Mutex<HashMap<RoomKey, RoomHandle>>,
     room_capacity: Arc<Semaphore>,
+    space_room_counts: Mutex<HashMap<SpaceId, usize>>,
+    peer_capacity: Arc<Semaphore>,
     peers: Mutex<HashMap<u64, PeerRegistration>>,
     pending_revoke_settlement: Mutex<PendingRevokeSettlement>,
     unsettled_shutdown_rooms: Mutex<HashSet<(HistoryScope, NoteId)>>,
@@ -172,6 +203,8 @@ impl CollabHub {
         let inner = Arc::new(HubInner {
             store,
             room_capacity: Arc::new(Semaphore::new(config.max_active_rooms)),
+            space_room_counts: Mutex::default(),
+            peer_capacity: Arc::new(Semaphore::new(config.max_total_peers)),
             config,
             owner,
             entropy,
@@ -218,10 +251,10 @@ impl CollabHub {
     /// Gracefully reject new peers, settle and close all active rooms cleanly
     /// within `budget`, and stop background watchers.
     pub async fn shutdown(&self, budget: &CallBudget) -> Result<(), PortError> {
-        self.0.accept_closed.cancel();
         let deadline = Instant::now()
             .checked_add(budget.remaining)
             .ok_or_else(|| DomainError::validation(ValidationReason::InvalidRange))?;
+        self.0.accept_closed.cancel();
 
         // Close any peers still waiting on initial handshake or connected.
         let guards: Vec<_> = {
@@ -254,31 +287,56 @@ impl CollabHub {
         }
 
         let mut first_error = None;
-        for room in self.0.active_rooms() {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let mut room_budget = budget.clone();
-            room_budget.remaining = remaining;
-            match timeout(remaining, room.shutdown(room_budget)).await {
-                Ok(Ok(true) | Ok(false)) => {
-                    let rem = deadline.saturating_duration_since(Instant::now());
-                    if timeout(rem, room.stopped().cancelled()).await.is_err() {
-                        first_error
-                            .get_or_insert_with(|| deadline_error(b"collab_hub_shutdown_stop"));
+        let mut pending_rooms = self.0.active_rooms().into_iter();
+        let mut draining = tokio::task::JoinSet::new();
+        let spawn_room_shutdown = |set: &mut tokio::task::JoinSet<Result<(), PortError>>,
+                                   room: RoomHandle,
+                                   budget: CallBudget,
+                                   deadline: Instant| {
+            set.spawn(async move {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let mut room_budget = budget;
+                room_budget.remaining = remaining;
+                match timeout(remaining, room.shutdown(room_budget)).await {
+                    Ok(Ok(true) | Ok(false)) => {
+                        let rem = deadline.saturating_duration_since(Instant::now());
+                        if timeout(rem, room.stopped().cancelled()).await.is_err() {
+                            return Err(deadline_error(b"collab_hub_shutdown_stop"));
+                        }
+                        Ok(())
                     }
+                    Ok(Err(error)) => Err(error),
+                    Err(_) => Err(deadline_error(b"collab_hub_shutdown")),
                 }
+            });
+        };
+        for _ in 0..LIFECYCLE_DRAIN_CONCURRENCY {
+            let Some(room) = pending_rooms.next() else {
+                break;
+            };
+            spawn_room_shutdown(&mut draining, room, budget.clone(), deadline);
+        }
+        while let Some(joined) = draining.join_next().await {
+            match joined {
+                Ok(Ok(())) => {}
                 Ok(Err(error)) => {
                     first_error.get_or_insert(error);
                 }
                 Err(_) => {
-                    first_error.get_or_insert_with(|| deadline_error(b"collab_hub_shutdown"));
+                    first_error.get_or_insert_with(|| {
+                        operation_error(b"collab_hub_shutdown_join", CommitEffect::Unknown)
+                    });
                 }
+            }
+            if let Some(room) = pending_rooms.next() {
+                spawn_room_shutdown(&mut draining, room, budget.clone(), deadline);
             }
         }
         if let Some(error) = first_error {
             return Err(error);
         }
-        // A failed close can outlive its actor. Confirm its durable outcome
-        // before a later shutdown call reports success.
+        // A failed close or unresolved open can outlive its actor. Confirm its
+        // durable outcome before a later shutdown call reports success.
         let unsettled = self
             .0
             .unsettled_shutdown_rooms
@@ -325,13 +383,19 @@ impl CollabHub {
                 CommitEffect::NotCommitted,
             ));
         }
-        if matches!(
+        if !matches!(
             ctx.auth().kind(),
-            PrincipalKind::AgentRun(_) | PrincipalKind::Keeper(_)
+            PrincipalKind::DirectHuman | PrincipalKind::Pat | PrincipalKind::OAuth { .. }
         ) {
             return Err(DomainError::AccessDenied.into());
         }
-        let guard = PeerGuard::new(auth);
+        let Ok(peer_permit) = self.0.peer_capacity.clone().try_acquire_owned() else {
+            return Err(operation_error(
+                b"collab_peer_capacity_exceeded",
+                CommitEffect::NotCommitted,
+            ));
+        };
+        let guard = PeerGuard::new_with_permit(auth, Some(peer_permit));
         // Fail fast before running DB admission if credentials are already
         // revoked or expired.
         guard.check().map_err(|_| DomainError::AccessDenied)?;
@@ -447,45 +511,162 @@ impl CollabHub {
                 drop(lock_slot(&slot, &budget).await?);
             }
         }
-        for room in self.0.active_rooms() {
-            let key = (room.scope().space_id.clone(), room.note().clone());
-            let close = close_space == Some(&room.scope().space_id);
-            let targeted = close || affected.remove(&key);
-            if !targeted {
-                continue;
-            }
-            if room.stopped().is_cancelled() {
-                self.0
-                    .clear_pending_revoke_settlement(&key, selector, snapshot_seq);
-                continue;
-            }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            match timeout(remaining, room.settle_after_revoke(close)).await {
-                Ok(Ok(true)) => {
-                    if close {
+        let targeted_rooms: Vec<(RoomKey, RoomHandle, bool)> = self
+            .0
+            .active_rooms()
+            .into_iter()
+            .filter_map(|room| {
+                let key = (room.scope().space_id.clone(), room.note().clone());
+                let close = close_space == Some(&room.scope().space_id);
+                let targeted = close || affected.remove(&key);
+                targeted.then_some((key, room, close))
+            })
+            .collect();
+
+        let settle_one_room = |hub: Arc<HubInner>,
+                               key: RoomKey,
+                               room: RoomHandle,
+                               close: bool,
+                               selector: RevocationSelector,
+                               snapshot_seq: u64,
+                               budget: CallBudget,
+                               deadline: Instant| async move {
+            let needs_unhosted_recovery = if room.stopped().is_cancelled() {
+                !room.was_settled()
+            } else {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                match timeout(remaining, room.settle_after_revoke(close)).await {
+                    Ok(Ok(true)) => {
+                        if close {
+                            let rem = deadline.saturating_duration_since(Instant::now());
+                            timeout(rem, room.stopped().cancelled())
+                                .await
+                                .map_err(|_| deadline_error(b"collab_revocation_stop"))?;
+                            !room.was_settled()
+                        } else {
+                            false
+                        }
+                    }
+                    Ok(Ok(false)) => {
+                        // The room began stopping naturally (e.g. idle unload)
+                        // just before our revocation command arrived. Await
+                        // completion and check whether it actually settled.
                         let rem = deadline.saturating_duration_since(Instant::now());
                         timeout(rem, room.stopped().cancelled())
                             .await
                             .map_err(|_| deadline_error(b"collab_revocation_stop"))?;
+                        !room.was_settled()
                     }
-                    self.0
-                        .clear_pending_revoke_settlement(&key, selector, snapshot_seq);
+                    Ok(Err(error)) => return Err(error),
+                    Err(_) => return Err(deadline_error(b"collab_revocation_settle")),
                 }
-                Ok(Ok(false)) => {
-                    // The room began stopping naturally (e.g. idle unload) just
-                    // before our revocation command arrived. Await completion.
-                    let rem = deadline.saturating_duration_since(Instant::now());
-                    timeout(rem, room.stopped().cancelled())
-                        .await
-                        .map_err(|_| deadline_error(b"collab_revocation_stop"))?;
-                    self.0
-                        .clear_pending_revoke_settlement(&key, selector, snapshot_seq);
+            };
+            if needs_unhosted_recovery {
+                let scope = room.scope();
+                let note = room.note();
+                let slot = hub.slot(scope, note);
+                let mut rem = budget;
+                rem.remaining = deadline.saturating_duration_since(Instant::now());
+                let _held = lock_slot(&slot, &rem).await?;
+                rem.remaining = deadline.saturating_duration_since(Instant::now());
+                match tokio::time::timeout_at(deadline, hub.recover_unhosted(&rem, scope, note))
+                    .await
+                {
+                    Ok(Ok(_)) => {
+                        hub.unsettled_shutdown_rooms
+                            .lock()
+                            .expect("shutdown rooms")
+                            .remove(&(scope.clone(), note.clone()));
+                    }
+                    Ok(Err(PortError::Domain(DomainError::ValidationFailed { diagnostic })))
+                        if diagnostic.reason == ValidationReason::HistoryIncarnationMismatch => {}
+                    Ok(Err(error)) => return Err(error),
+                    Err(_) => return Err(deadline_error(b"collab_revocation_recovery")),
                 }
-                Ok(Err(error)) => return Err(error),
-                Err(_) => return Err(deadline_error(b"collab_revocation_settle")),
+            }
+            hub.clear_pending_revoke_settlement(&key, &selector, snapshot_seq);
+            Ok(())
+        };
+
+        let mut pending_iter = targeted_rooms.into_iter();
+        let mut draining = tokio::task::JoinSet::new();
+        for _ in 0..LIFECYCLE_DRAIN_CONCURRENCY {
+            let Some((key, room, close)) = pending_iter.next() else {
+                break;
+            };
+            draining.spawn(settle_one_room(
+                Arc::clone(&self.0),
+                key,
+                room,
+                close,
+                selector.clone(),
+                snapshot_seq,
+                ctx.budget.clone(),
+                deadline,
+            ));
+        }
+        let mut first_error = None;
+        while let Some(joined) = draining.join_next().await {
+            match joined {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    first_error.get_or_insert(error);
+                }
+                Err(_) => {
+                    first_error.get_or_insert_with(|| {
+                        operation_error(b"collab_revocation_join", CommitEffect::Unknown)
+                    });
+                }
+            }
+            if let Some((key, room, close)) = pending_iter.next() {
+                draining.spawn(settle_one_room(
+                    Arc::clone(&self.0),
+                    key,
+                    room,
+                    close,
+                    selector.clone(),
+                    snapshot_seq,
+                    ctx.budget.clone(),
+                    deadline,
+                ));
             }
         }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+
+        // Any remaining `affected` key was no longer in `active` when we
+        // scanned. If it still carries pending revocation entries, its room
+        // exited without settling cleanly; recover it before clearing.
         for key in affected {
+            let pending_scopes =
+                self.0
+                    .pending_revoke_scopes_if_inactive(&key, selector, snapshot_seq);
+            for scope in pending_scopes {
+                let slot = self.0.slot(&scope, &key.1);
+                let mut rem = ctx.budget.clone();
+                rem.remaining = deadline.saturating_duration_since(Instant::now());
+                let _held = lock_slot(&slot, &rem).await?;
+                rem.remaining = deadline.saturating_duration_since(Instant::now());
+                match tokio::time::timeout_at(
+                    deadline,
+                    self.0.recover_unhosted(&rem, &scope, &key.1),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => {
+                        self.0
+                            .unsettled_shutdown_rooms
+                            .lock()
+                            .expect("shutdown rooms")
+                            .remove(&(scope, key.1.clone()));
+                    }
+                    Ok(Err(PortError::Domain(DomainError::ValidationFailed { diagnostic })))
+                        if diagnostic.reason == ValidationReason::HistoryIncarnationMismatch => {}
+                    Ok(Err(error)) => return Err(error),
+                    Err(_) => return Err(deadline_error(b"collab_revocation_recovery")),
+                }
+            }
             self.0
                 .clear_pending_if_inactive(&key, selector, snapshot_seq);
         }
@@ -640,6 +821,35 @@ impl HubInner {
         }
     }
 
+    fn pending_revoke_scopes_if_inactive(
+        &self,
+        key: &RoomKey,
+        selector: &RevocationSelector,
+        through_seq: u64,
+    ) -> Vec<HistoryScope> {
+        let active = self.active.lock().expect("active rooms");
+        if active.contains_key(key) {
+            return Vec::new();
+        }
+        let pending = self
+            .pending_revoke_settlement
+            .lock()
+            .expect("pending revoke settlement");
+        let Some(entries) = pending.rooms.get(key) else {
+            return Vec::new();
+        };
+        let mut scopes = Vec::new();
+        for entry in entries.values() {
+            if entry.rev_seq <= through_seq && matches_selector(&entry.ctx, selector) {
+                let scope = entry.ctx.scope();
+                if !scopes.contains(scope) {
+                    scopes.push(scope.clone());
+                }
+            }
+        }
+        scopes
+    }
+
     fn clear_pending_if_inactive(
         &self,
         key: &RoomKey,
@@ -737,6 +947,22 @@ impl HubInner {
         slot
     }
 
+    fn try_acquire_space_room(self: &Arc<Self>, space: &SpaceId) -> Option<SpaceRoomPermit> {
+        let mut counts = self.space_room_counts.lock().expect("space room counts");
+        let count = counts.entry(space.clone()).or_insert(0);
+        if *count >= self.config.max_rooms_per_space {
+            if *count == 0 {
+                counts.remove(space);
+            }
+            return None;
+        }
+        *count += 1;
+        Some(SpaceRoomPermit {
+            hub: Arc::downgrade(self),
+            space: space.clone(),
+        })
+    }
+
     fn active_rooms(&self) -> Vec<RoomHandle> {
         self.active
             .lock()
@@ -746,25 +972,52 @@ impl HubInner {
             .collect()
     }
 
+    fn active_rooms_in_space(&self, space: &SpaceId) -> Vec<RoomHandle> {
+        self.active
+            .lock()
+            .expect("active rooms")
+            .iter()
+            .filter(|((sid, _), _)| sid == space)
+            .map(|(_, room)| room.clone())
+            .collect()
+    }
+
+    fn active_room(&self, space: &SpaceId, note: &NoteId) -> Option<RoomHandle> {
+        self.active
+            .lock()
+            .expect("active rooms")
+            .get(&(space.clone(), note.clone()))
+            .cloned()
+    }
+
     pub fn room_stopped(&self, room: &RoomHandle, settled: bool) {
         let key = (room.scope().space_id.clone(), room.note().clone());
         let mut active = self.active.lock().expect("active rooms");
-        if !settled && self.accept_closed.is_cancelled() {
+        if !settled {
             self.unsettled_shutdown_rooms
                 .lock()
                 .expect("shutdown rooms")
                 .insert((room.scope().clone(), room.note().clone()));
+        } else {
+            self.unsettled_shutdown_rooms
+                .lock()
+                .expect("shutdown rooms")
+                .remove(&(room.scope().clone(), room.note().clone()));
         }
         if active
             .get(&key)
             .is_some_and(|registered| registered.same_lease(room))
         {
             active.remove(&key);
-            self.pending_revoke_settlement
-                .lock()
-                .expect("pending revoke settlement")
-                .rooms
-                .remove(&key);
+            // Keep pending revocation entries intact when the room exited
+            // without settling so `revoke()` knows it must run durable recovery.
+            if settled {
+                self.pending_revoke_settlement
+                    .lock()
+                    .expect("pending revoke settlement")
+                    .rooms
+                    .remove(&key);
+            }
         }
     }
 
@@ -904,8 +1157,19 @@ impl HubInner {
             return Ok(None);
         }
         let slot = self.slot(ctx.scope(), note);
-        let mut held = lock_slot(&slot, &ctx.budget).await?;
+        let mut held = tokio::select! {
+            biased;
+            () = self.accept_closed.cancelled() => {
+                outbound.guard.close(SessionClose::GOING_AWAY);
+                return Ok(None);
+            }
+            () = outbound.guard.stopped().cancelled() => {
+                return Err(DomainError::AccessDenied.into());
+            }
+            res = lock_slot(&slot, &ctx.budget) => res?,
+        };
         let mut budget = ctx.budget.clone();
+        budget.cancellation = outbound.guard.stopped().clone();
         let mut open_conflicts = 0usize;
         let mut total_steps = 0usize;
         const MAX_ADMIT_STEPS: usize = 8;
@@ -928,10 +1192,14 @@ impl HubInner {
                 *held = None;
             }
             budget.remaining = deadline.saturating_duration_since(Instant::now());
-            let current = self
-                .store
-                .read_current_history_scope(Some(&budget), &ctx.scope().space_id)
-                .await?;
+            let current = tokio::select! {
+                biased;
+                () = self.accept_closed.cancelled() => {
+                    outbound.guard.close(SessionClose::GOING_AWAY);
+                    return Ok(None);
+                }
+                res = self.store.read_current_history_scope(Some(&budget), &ctx.scope().space_id) => res?,
+            };
             ctx.check_current(&current)?;
             if let Some(room) = held.as_ref()
                 && room.scope() == &current
@@ -948,18 +1216,22 @@ impl HubInner {
                 }
             {
                 budget.remaining = deadline.saturating_duration_since(Instant::now());
-                match self
-                    .store
-                    .read_active_room_facts(
+                let active_res = tokio::select! {
+                    biased;
+                    () = self.accept_closed.cancelled() => {
+                        outbound.guard.close(SessionClose::GOING_AWAY);
+                        return Ok(None);
+                    }
+                    res = self.store.read_active_room_facts(
                         Some(&budget),
                         &current,
                         note,
                         room.epoch(),
                         room.lineage(),
                         &self.owner,
-                    )
-                    .await
-                {
+                    ) => res,
+                };
+                match active_res {
                     Ok(facts) => {
                         ctx.auth().authorize_read(&facts.resource)?;
                         let role = if ctx
@@ -979,15 +1251,20 @@ impl HubInner {
                 }
             }
             // Existing actors and their reconnect handshakes do not need a
-            // second permit. A cold open reserves before loading any payloads.
-            let capacity = if held.is_some() {
-                None
+            // second permit. A cold open reserves global + per-Space capacity
+            // before loading any payloads.
+            let (capacity, space_capacity) = if held.is_some() {
+                (None, None)
             } else {
                 let Ok(permit) = self.room_capacity.clone().try_acquire_owned() else {
                     outbound.guard.close(SessionClose::ROOM_CAPACITY);
                     return Ok(None);
                 };
-                Some(permit)
+                let Some(space_permit) = self.try_acquire_space_room(&current.space_id) else {
+                    outbound.guard.close(SessionClose::ROOM_CAPACITY);
+                    return Ok(None);
+                };
+                (Some(permit), Some(space_permit))
             };
             let base = match hello {
                 LineageHello::Reconnect {
@@ -1001,10 +1278,14 @@ impl HubInner {
             };
             budget.remaining = deadline.saturating_duration_since(Instant::now());
             let read_ctx = SpaceContext::new(ctx.auth().clone(), current, budget.clone())?;
-            let admission = self
-                .store
-                .read_note_collab_admission(&read_ctx, note, base)
-                .await?;
+            let admission = tokio::select! {
+                biased;
+                () = self.accept_closed.cancelled() => {
+                    outbound.guard.close(SessionClose::GOING_AWAY);
+                    return Ok(None);
+                }
+                res = self.store.read_note_collab_admission_meta(&read_ctx, note, base) => res?,
+            };
             ctx.check_current(&admission.scope)?;
             if admission.doc_class != DocClass::UserDoc {
                 return Err(DomainError::validation(ValidationReason::ClassMismatch).into());
@@ -1053,7 +1334,8 @@ impl HubInner {
                 continue;
             }
             // Recover fenced or unhosted same-process rooms BEFORE checking
-            // Reconnect lineage mismatch so clients observe settled head/lineage.
+            // Reconnect lineage mismatch or loading the carrier blob so clients
+            // observe settled head/lineage without wasted CAS/S3 reads.
             budget.remaining = deadline.saturating_duration_since(Instant::now());
             if stored.is_some_and(|record| record.room_state == CollabRoomState::Fenced) {
                 recover_fenced(&self.store, &budget, &admission.scope, note).await?;
@@ -1102,7 +1384,29 @@ impl HubInner {
                 send_lineage_mismatch(outbound, admission, role);
                 return Ok(None);
             }
-            let prepared = Room::prepare(&admission)?;
+            if self.accept_closed.is_cancelled() {
+                outbound.guard.close(SessionClose::GOING_AWAY);
+                return Ok(None);
+            }
+            outbound
+                .guard
+                .check()
+                .map_err(|_| DomainError::AccessDenied)?;
+            budget.remaining = deadline.saturating_duration_since(Instant::now());
+            let carrier = tokio::select! {
+                biased;
+                () = self.accept_closed.cancelled() => {
+                    outbound.guard.close(SessionClose::GOING_AWAY);
+                    return Ok(None);
+                }
+                res = self.store.load_collab_carrier(
+                    &admission.scope,
+                    admission.carrier_digest,
+                    Some(&budget),
+                ) => res?,
+            };
+            let prepared = Room::prepare_from_meta(&admission, &carrier)?;
+            drop(carrier);
             outbound
                 .guard
                 .check()
@@ -1132,6 +1436,7 @@ impl HubInner {
                         record,
                         prepared,
                         capacity.expect("a cold open reserves room capacity"),
+                        space_capacity.expect("a cold open reserves per-Space room capacity"),
                     );
                     *held = Some(handle.clone());
                     return Ok(Some((handle, role)));
@@ -1149,9 +1454,18 @@ impl HubInner {
                 }
                 Err(error) if unknown(&error) => {
                     // The open may finish after the handshake expires. Resolve
-                    // any unpublished lease under the same slot.
-                    self.recover_unhosted(&self.budget(), &admission.scope, note)
-                        .await?;
+                    // any unpublished lease under the same slot; if recovery
+                    // fails, record it so shutdown reconciles it before Ok(()).
+                    if let Err(rec_err) = self
+                        .recover_unhosted(&self.budget(), &admission.scope, note)
+                        .await
+                    {
+                        self.unsettled_shutdown_rooms
+                            .lock()
+                            .expect("shutdown rooms")
+                            .insert((admission.scope.clone(), note.clone()));
+                        return Err(rec_err);
+                    }
                     return Err(error);
                 }
                 Err(error) => return Err(error),
@@ -1163,7 +1477,7 @@ impl HubInner {
 
 fn send_lineage_mismatch(
     outbound: &PeerOutbound,
-    admission: notarium_canonical::NoteCollabAdmission,
+    admission: NoteCollabAdmissionMeta,
     role: PeerRole,
 ) {
     let current_lineage_epoch = admission
@@ -1291,7 +1605,12 @@ async fn attach_peer(
                         guard.close(SessionClose::POLICY);
                     }
                     _ => {
-                        tracing::warn!(code = error.code(), "collaboration peer admission failed");
+                        tracing::warn!(
+                            code = error.code(),
+                            space_id = %ctx.scope().space_id,
+                            note_id = %note,
+                            "collaboration peer admission failed"
+                        );
                         guard.close(SessionClose::UNAVAILABLE);
                     }
                 }
@@ -1328,6 +1647,10 @@ async fn attach_peer(
                 }
                 Ok(JoinOutcome::Denied) => {
                     guard.close(SessionClose::POLICY);
+                    return None;
+                }
+                Ok(JoinOutcome::Unavailable) => {
+                    guard.close(SessionClose::UNAVAILABLE);
                     return None;
                 }
                 Ok(JoinOutcome::RoomClosing) | Err(_) => {}
@@ -1375,35 +1698,33 @@ async fn watch_storage(
                 scope,
                 new_last_seq,
                 targets,
-            }) => {
-                for room in hub.active_rooms() {
-                    if room.scope().space_id != scope.space_id {
-                        continue;
+            }) => match targets {
+                CommittedTargets::Notes(notes) => {
+                    if notes.len() == 1 {
+                        if let Some(room) = hub.active_room(&scope.space_id, &notes[0]) {
+                            room.note_solo_committed(new_last_seq.get());
+                        }
+                    } else {
+                        for note in notes.iter() {
+                            if let Some(room) = hub.active_room(&scope.space_id, note) {
+                                room.storage_changed();
+                            }
+                        }
                     }
-                    if !targets.affects(room.note()) {
-                        continue;
-                    }
-                    // Skip waking a room for its own solo checkpoint/command
-                    // commit when no other note or Space-wide target was touched.
-                    let solo_self = matches!(
-                        targets,
-                        CommittedTargets::Notes(notes)
-                            if notes.len() == 1 && &notes[0] == room.note()
-                    ) && room.last_self_seq() == new_last_seq.get();
-                    if !solo_self {
+                }
+                CommittedTargets::All => {
+                    for room in hub.active_rooms_in_space(&scope.space_id) {
                         room.storage_changed();
                     }
                 }
-            }
+            },
             Ok(
                 SpaceSignal::CatalogChanged { scope, .. }
                 | SpaceSignal::Purged { scope, .. }
                 | SpaceSignal::WriterLeaseChanged { scope },
             ) => {
-                for room in hub.active_rooms() {
-                    if room.scope().space_id == scope.space_id {
-                        room.storage_changed();
-                    }
+                for room in hub.active_rooms_in_space(&scope.space_id) {
+                    room.storage_changed();
                 }
             }
             Ok(SpaceSignal::IncarnationChanged { new_scope, .. }) => {
@@ -1421,10 +1742,8 @@ async fn watch_storage(
                 for guard in stale_guards {
                     guard.close(SessionClose::POLICY);
                 }
-                for room in hub.active_rooms() {
-                    if room.scope().space_id == new_scope.space_id {
-                        room.storage_changed();
-                    }
+                for room in hub.active_rooms_in_space(&new_scope.space_id) {
+                    room.storage_changed();
                 }
             }
             Err(broadcast::error::RecvError::Lagged(_)) => {

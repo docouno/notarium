@@ -522,10 +522,26 @@ async fn append_batch_tx(
             return Ok(());
         }
 
-        let (head, facts) = load_room_note_facts_after_purge_tx(tx, space, &batch.note).await?;
-        if head.doc_class != DocClass::UserDoc {
-            return Err(DomainError::ResourceNotFound.into());
-        }
+        let facts = match tx {
+            BackendConn::Postgres(conn) => {
+                let rows =
+                    super::admission::query_room_facts_pg(conn, &batch.scope.space_id, &batch.note)
+                        .await?;
+                let active = super::admission::decode_room_facts_rows(&batch.scope, rows, None)?;
+                if active.resource.class != DocClass::UserDoc {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+                active.resource
+            }
+            BackendConn::Sqlite(_) => {
+                let (head, facts) =
+                    load_room_note_facts_after_purge_tx(tx, space, &batch.note, true).await?;
+                if head.doc_class != DocClass::UserDoc {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+                facts
+            }
+        };
         for entry in &batch.entries {
             let auth = entry.auth.as_ref().ok_or_else(|| {
                 internal_not_committed("missing_room_writer", "new room WAL row lacks an author")

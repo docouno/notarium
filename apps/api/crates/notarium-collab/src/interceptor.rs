@@ -217,7 +217,7 @@ impl LiveCollabInterceptor for CollabHub {
             }
             // Fast path on local single-process SQLite: if local fences report
             // neither fenced nor active, no active room exists anywhere.
-            let local_fast_unpinned = self.0.store.sqlite_commit_generation().is_some()
+            let local_fast_unpinned = self.0.store.is_local_sqlite()
                 && !self
                     .0
                     .store

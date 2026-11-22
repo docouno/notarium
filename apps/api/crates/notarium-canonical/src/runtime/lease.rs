@@ -5,7 +5,7 @@ use crate::{
 };
 use notarium_core::{
     error::{CommitEffect, OperationalFailure, RetryAdvice},
-    ports::{Cancellation, MaintenanceContext, RoomFenceState, ServicePurpose},
+    ports::{Cancellation, MaintenanceContext, ServicePurpose},
 };
 use tokio::{
     sync::{broadcast, oneshot},
@@ -325,7 +325,7 @@ impl CanonicalStore {
     ) -> Result<bool, PortError> {
         if let SqlDriverState::Postgres { pool, .. } = &self.inner.sql {
             let room_fences = &self.inner.room_fences;
-            let pending: Vec<_> = {
+            let fenced = {
                 let _gate = self.inner.writer()?.acquire_commit_read_guard().await;
                 let mut visibility = self
                     .inner
@@ -384,23 +384,36 @@ impl CanonicalStore {
                     crate::codec::unknown_commit_outcome("pg_commit_lease", e.to_string())
                 })?;
                 lease.complete();
-                // Capture these slots while the commit guard still excludes a
-                // restore. Publication itself may wait for a note guard.
                 fenced
-                    .into_iter()
-                    .map(|(note, epoch)| {
-                        let slot = room_fences.get_or_init(scope, &note);
-                        let state = RoomFenceState::new(note.clone(), scope.clone(), epoch);
-                        (note, slot, state)
-                    })
-                    .collect()
             };
-            // Transition reconciliation may hold the note guard while it
-            // acquires the pool's only checkout and the writer commit guard.
-            for (note, slot, state) in pending {
-                let mut guard = slot.lock_owned().await;
-                room_fences
-                    .publish_persisted_transition(scope, &note, &mut guard, state, true, None);
+            // Synchronize every fenced and previously-cached local slot for this
+            // Space AFTER releasing the PG connection and writer commit guard so
+            // waiting for an in-flight local room fence never starves single-conn
+            // pools or safe points, while still clearing stale pre-takeover active
+            // slots and overwriting any higher local epoch from earlier ownership.
+            let fenced_map: std::collections::BTreeMap<_, _> = fenced.into_iter().collect();
+            let mut all_notes: std::collections::BTreeSet<_> = room_fences
+                .begin_space_takeover_sync(&scope.space_id)
+                .into_iter()
+                .collect();
+            all_notes.extend(fenced_map.keys().cloned());
+            for note in all_notes {
+                let fenced_epoch = fenced_map.get(&note).copied();
+                let lock = match fenced_epoch {
+                    Some(_) => Some(room_fences.get_or_init(scope, &note)),
+                    None => room_fences.existing_fence(scope, &note),
+                };
+                if let Some(lock) = lock {
+                    let mut guard = lock.lock_owned().await;
+                    let _ = room_fences.apply_takeover_transition(
+                        scope,
+                        &note,
+                        &mut guard,
+                        fenced_epoch,
+                    );
+                } else {
+                    room_fences.clear_evicted_takeover_recovery(&scope.space_id, &note);
+                }
             }
             return Ok(true);
         }

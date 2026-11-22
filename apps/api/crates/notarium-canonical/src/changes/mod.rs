@@ -281,24 +281,30 @@ impl CommittedTargets {
 }
 
 /// Accumulates note-only targets for one Space within a write batch, upgrading
-/// conservatively to `CommittedTargets::All` on any non-note event or >16 notes.
-#[derive(Clone, Debug)]
+/// conservatively to `CommittedTargets::All` on any hierarchy/ACL/Space event
+/// or >16 notes. Chat threads, jobs, and agent runs do not affect note room
+/// visibility or ancestry and leave note targets unchanged.
+#[derive(Clone, Debug, Default)]
 pub(crate) enum CommittedTargetAcc {
+    #[default]
+    Unrecorded,
     Notes(Vec<NoteId>),
     All,
-}
-
-impl Default for CommittedTargetAcc {
-    fn default() -> Self {
-        Self::Notes(Vec::new())
-    }
 }
 
 impl CommittedTargetAcc {
     pub(crate) fn record_events(&mut self, events: &[crate::writer::BatchEventDraft]) {
         const MAX_INLINE_NOTES: usize = 16;
         for event in events {
-            let Self::Notes(notes) = self else { return };
+            if matches!(self, Self::All) {
+                return;
+            }
+            if matches!(event.entity_type.as_str(), "thread" | "job" | "agent_run") {
+                if matches!(self, Self::Unrecorded) {
+                    *self = Self::Notes(Vec::new());
+                }
+                continue;
+            }
             if event.entity_type != "note" {
                 *self = Self::All;
                 return;
@@ -307,6 +313,10 @@ impl CommittedTargetAcc {
                 *self = Self::All;
                 return;
             };
+            if matches!(self, Self::Unrecorded) {
+                *self = Self::Notes(Vec::new());
+            }
+            let Self::Notes(notes) = self else { return };
             if !notes.contains(&note_id) {
                 if notes.len() >= MAX_INLINE_NOTES {
                     *self = Self::All;
@@ -319,8 +329,7 @@ impl CommittedTargetAcc {
 
     pub(crate) fn to_targets(&self) -> CommittedTargets {
         match self {
-            Self::All => CommittedTargets::All,
-            Self::Notes(notes) if notes.is_empty() => CommittedTargets::All,
+            Self::Unrecorded | Self::All => CommittedTargets::All,
             Self::Notes(notes) => CommittedTargets::Notes(Arc::from(notes.as_slice())),
         }
     }

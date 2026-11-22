@@ -347,7 +347,7 @@ fn replica(twin: &TwinDoc, id: u64) -> Replica {
         offset_kind: OffsetKind::Utf16,
         ..Options::with_client_id(ClientID::new(id))
     };
-    let replica = Replica::from_doc(Doc::with_options(options));
+    let replica = Replica::from_doc(Doc::with_options(options), false);
     replica.apply(&twin.live_snapshot()).unwrap();
     replica
 }
@@ -378,7 +378,6 @@ fn measure_retained_indexes() {
 }
 
 #[test]
-#[ignore = "run explicitly for the guard performance and structural oracle campaign"]
 fn guard_campaign() {
     println!(
         "guard_campaign,profile={},timing_excludes_metered_sample=true",

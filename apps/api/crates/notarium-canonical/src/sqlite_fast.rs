@@ -1846,6 +1846,10 @@ pub(crate) async fn execute_sqlite_fast_batch(
                         .inner
                         .sqlite_writer_commit_gen
                         .fetch_add(2, Ordering::Release);
+                    store
+                        .inner
+                        .sqlite_auth_commit_gen
+                        .fetch_add(2, Ordering::Release);
                     drop(pending.batch_retained_tickets);
                     drop(pending.batch_retained_guards);
                     BatchExecOutcome::AbortedBeforeCommit(io_err)
@@ -1883,6 +1887,10 @@ pub(crate) async fn execute_sqlite_fast_batch(
                                 store
                                     .inner
                                     .sqlite_writer_commit_gen
+                                    .fetch_add(2, Ordering::Release);
+                                store
+                                    .inner
+                                    .sqlite_auth_commit_gen
                                     .fetch_add(2, Ordering::Release);
                             }
                             if let Ok(reopened) = open_rusqlite_writer_connection(&pair.db_path) {
@@ -2170,6 +2178,7 @@ fn try_run_optimistic_fast_sql_stage(
                 dir_syncs,
                 retained_tickets,
                 retained_guards,
+                written_receipt: _,
             }) => {
                 if let Some(SpaceBatchEntry::Loaded {
                     effective_cut,
@@ -2211,6 +2220,7 @@ fn try_run_optimistic_fast_sql_stage(
         return Err(());
     }
 
+    let wal_only = items.iter().all(|(_, p)| p.is_unsequenced_room_wal());
     Ok(finish_fast_sql_stage(
         conn,
         space_states,
@@ -2222,6 +2232,7 @@ fn try_run_optimistic_fast_sql_stage(
         wal,
         inner,
         has_external_stagings,
+        wal_only,
     ))
 }
 
@@ -2336,6 +2347,7 @@ fn run_savepoint_fallback_sql_stage(
                 dir_syncs,
                 retained_tickets,
                 retained_guards,
+                written_receipt,
             }) => {
                 if use_savepoint && let Err(err) = conn.execute_batch("RELEASE SAVEPOINT sp_item") {
                     if let Some(w) = wal {
@@ -2346,6 +2358,9 @@ fn run_savepoint_fallback_sql_stage(
                         "sqlite_release_savepoint",
                         err.to_string(),
                     ));
+                }
+                if let Some((rcpt_key, rcpt_row)) = written_receipt {
+                    cache.in_batch_receipts.insert(rcpt_key, rcpt_row);
                 }
                 if let Some(SpaceBatchEntry::Loaded {
                     effective_cut,
@@ -2398,6 +2413,7 @@ fn run_savepoint_fallback_sql_stage(
         }
     }
 
+    let wal_only = items.iter().all(|(_, p)| p.is_unsequenced_room_wal());
     finish_fast_sql_stage(
         conn,
         space_states,
@@ -2409,6 +2425,7 @@ fn run_savepoint_fallback_sql_stage(
         wal,
         inner,
         has_external_stagings,
+        wal_only,
     )
 }
 
@@ -2424,6 +2441,7 @@ fn finish_fast_sql_stage(
     wal: Option<&SqliteWalCoordinator>,
     inner: &crate::runtime::CanonicalInner,
     has_external_stagings: bool,
+    wal_only: bool,
 ) -> FastSqlStageResult {
     for entry in space_states.values() {
         if let SpaceBatchEntry::Loaded {
@@ -2459,8 +2477,15 @@ fn finish_fast_sql_stage(
         let _ = crate::wal::take_last_wal_commit_frames();
         // Bracket SQLite COMMIT with the seqlock generation (even->odd before
         // COMMIT, odd->even immediately after COMMIT and strictly BEFORE
-        // dropping fence guards or waking readers).
-        let commit_seq = crate::runtime::SqliteCommitSeqGuard::begin(inner);
+        // dropping fence guards or waking readers). Pure unsequenced room WAL
+        // batches cannot change authorization, ancestry, or leases, so they
+        // leave `sqlite_auth_commit_gen` untouched while still advancing
+        // `sqlite_writer_commit_gen` for Phase-1 receipt/cache validation.
+        let commit_seq = if wal_only {
+            crate::runtime::SqliteCommitSeqGuard::begin_wal_only(inner)
+        } else {
+            crate::runtime::SqliteCommitSeqGuard::begin(inner)
+        };
         let commit_res = conn.execute_batch("COMMIT");
         commit_seq.finish();
         match commit_res {
@@ -2508,6 +2533,10 @@ struct FastSingleItemSuccess {
     dir_syncs: PendingDirSyncs,
     retained_tickets: Vec<StagedBlobTicket>,
     retained_guards: Vec<Box<dyn Send>>,
+    written_receipt: Option<(
+        (SpaceId, HistoryIncarnation, PrincipalId, CommandKey),
+        StoredReceiptRow,
+    )>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2584,6 +2613,7 @@ fn execute_single_fast_item(
                     retained_tickets: Vec::new(),
                     retained_guards: Vec::new(),
                     item_changes: crate::projection_fence::VisibilityChanges::default(),
+                    written_receipt: None,
                 }),
                 _ => Err(FastItemExecError::PreWrite(unavailable_retryable(
                     "command_receipt_pending",
@@ -2651,6 +2681,7 @@ fn execute_single_fast_item(
             dir_syncs,
             retained_tickets,
             retained_guards,
+            written_receipt: None,
         });
     }
     if allocated_count == 0 || artifacts.events.is_empty() {
@@ -2830,6 +2861,7 @@ fn execute_single_fast_item(
             dir_syncs,
             retained_tickets,
             retained_guards,
+            written_receipt: None,
         });
     }
 
@@ -2856,7 +2888,7 @@ fn execute_single_fast_item(
     )
     .map_err(FastItemExecError::PostWrite)?;
 
-    if let Some(idemp) = &meta.idempotency {
+    let written_receipt = if let Some(idemp) = &meta.idempotency {
         insert_receipt_rusqlite(
             conn,
             &meta.scope,
@@ -2869,7 +2901,25 @@ fn execute_single_fast_item(
             expires_at_ms,
         )
         .map_err(FastItemExecError::PostWrite)?;
-    }
+        let response_blob = artifacts
+            .receipt_detail_blob
+            .unwrap_or(artifacts.receipt_sanitized_blob);
+        Some((
+            (
+                meta.scope.space_id.clone(),
+                meta.scope.incarnation,
+                idemp.actor.clone(),
+                idemp.command_key.clone(),
+            ),
+            StoredReceiptRow {
+                command_hash: idemp.command_hash,
+                status: receipt_status.to_owned(),
+                response_blob,
+            },
+        ))
+    } else {
+        None
+    };
 
     let item_purge_seq = artifacts
         .events
@@ -2888,6 +2938,7 @@ fn execute_single_fast_item(
         dir_syncs,
         retained_tickets,
         retained_guards,
+        written_receipt,
     })
 }
 

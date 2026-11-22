@@ -28,8 +28,9 @@ with `recv`, or call `CollabPeerSession::split` to obtain independent
 `(CollabPeerSender, CollabPeerReceiver)` halves for full-duplex adapters without
 cancelling in-flight delivery checks. Call `recv` when the transport is ready
 for the next event, since this call checks the recipient's current access before
-releasing data (using a linearizable commit-generation cache with single-CTE
-re-certification on SQLite, and a single-CTE check on PostgreSQL). Flow control stays
+releasing data (using a linearizable authorization commit-generation cache with
+single-CTE re-certification on SQLite, and a single-statement autocommit CTE on
+PostgreSQL). Flow control stays
 at this boundary. `SessionEvent::Close` carries the transport close code and
 reason (`1000` disconnect, `1001` shutdown, `1002` protocol error, `1008`
 policy/revocation, `1009` oversize, `1011` internal/storage unavailable, `1013`
@@ -51,10 +52,11 @@ bounded per message (clients, blocks, delete ranges) and per room lineage
 before Yrs decoding. Empty `[0, 0]` updates advance `peer_write_seq` and ACK at
 the current durable watermark without writing no-op WAL rows. The server can
 concatenate updates and an author's acknowledgement in one binary payload and
-chunks outbound batches to stay within 2 MiB. Presence lives in memory and
-belongs to the connection that published it. Each peer can own up to eight
-awareness client IDs in a room (up to 1024 entries room-wide within the frame
-byte budget), and duplicate client IDs in one awareness message are rejected.
+chunks outbound batches to stay within 2 MiB. Presence lives in memory and belongs to the connection that published it, and
+awareness updates are broadcast to the other peers in the room without echoing
+back to the sender. Each peer can own up to eight awareness client IDs in a room
+(up to 1024 entries and 256 KiB of awareness JSON room-wide), and duplicate
+client IDs in one awareness message are rejected.
 
 Each custom message uses a lib0 unsigned tag followed by a length-prefixed byte
 buffer. All custom buffers start with the version byte `1`. The following
@@ -123,8 +125,9 @@ persists the snapshot and compacts the covered log prefix in one transaction.
 A durable peer ACK does not advance the canonical change feed. A checkpoint
 that changes the Markdown publishes the revision consumed by projections and search.
 The defaults checkpoint after 3 seconds idle, 60 seconds periodic, or 128
-updates, with up to 512 opening or active rooms per hub (`CollabConfig` is
-`#[non_exhaustive]`). An empty room unloads after 30 seconds.
+updates, with up to 512 opening or active rooms per hub, 128 rooms per Space,
+and 4096 total connected peers (`CollabConfig` is `#[non_exhaustive]`). An empty
+room unloads after 30 seconds.
 The actor budgets 2 milliseconds (`wal_coalesce`) by default to group pending
 peer updates when multiple editors are connected; a single active editor flushes
 immediately after draining any already-queued mailbox frames.
@@ -170,7 +173,7 @@ Linux with SQLite `FULL` and mimalloc.
 
 ```sh
 sh .devkit/runtime/devkit.sh cli exec --component apps/api --network none -- \
-  cargo test --locked --offline --release -p notarium-collab --lib guard_campaign -- --ignored --nocapture
+  cargo test --locked --offline --release -p notarium-collab --features collab-bench --lib guard_campaign -- --nocapture
 sh .devkit/runtime/devkit.sh cli exec --component apps/api --network none -- \
-  cargo test --locked --offline --release -p notarium-collab --test collab_cost -- --ignored --nocapture
+  cargo test --locked --offline --release -p notarium-collab --features collab-bench --test collab_cost -- --nocapture
 ```

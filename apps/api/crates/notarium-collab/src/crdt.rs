@@ -1,15 +1,15 @@
 //! Room-owned CRDT state. Only a durably settled update is copied into live.
 
 // The cost campaign observes actual work at these call sites. Production
-// builds compile out the instrumentation completely.
+// builds and ordinary test runs compile out the instrumentation completely.
 macro_rules! guard_work {
     ($($field:ident += $amount:expr),+ $(,)?) => {
-        #[cfg(test)]
+        #[cfg(all(test, feature = "collab-bench"))]
         $crate::crdt::benchmark::record(|work| { $(work.$field += $amount;)+ });
     };
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "collab-bench"))]
 mod benchmark;
 mod body;
 mod topology;
@@ -51,11 +51,19 @@ struct Replica {
     doc: Doc,
     body: TextRef,
     fields: MapRef,
-    observed_fields: Arc<Mutex<ObservedFields>>,
+    observed_fields: Option<Arc<Mutex<ObservedFields>>>,
 }
 
 impl Replica {
-    fn new(excluded: impl Fn(ClientID) -> bool) -> Self {
+    fn new_staging(excluded: impl Fn(ClientID) -> bool) -> Self {
+        Self::new_with_observer(excluded, true)
+    }
+
+    fn new_live(excluded: impl Fn(ClientID) -> bool) -> Self {
+        Self::new_with_observer(excluded, false)
+    }
+
+    fn new_with_observer(excluded: impl Fn(ClientID) -> bool, observe_fields: bool) -> Self {
         let mut options = Options {
             offset_kind: OffsetKind::Utf16,
             ..Options::default()
@@ -63,21 +71,27 @@ impl Replica {
         while excluded(options.client_id) {
             options.client_id = ClientID::random();
         }
-        Self::from_doc(Doc::with_options(options))
+        Self::from_doc(Doc::with_options(options), observe_fields)
     }
 
-    fn from_doc(doc: Doc) -> Self {
+    fn from_doc(doc: Doc, observe_fields: bool) -> Self {
         let body = doc.get_or_insert_text(BODY);
         let fields = doc.get_or_insert_map(FIELDS);
-        let observed_fields = Arc::new(Mutex::new(Vec::new()));
-        let observed = Arc::clone(&observed_fields);
-        fields.observe("collab", move |txn, event| {
-            observed.lock().expect("collab field observer").extend(
-                event.keys(txn).iter().map(|(key, entry)| {
-                    (Arc::clone(key), matches!(entry, EntryChange::Removed(_)))
-                }),
-            );
-        });
+        let observed_fields = if observe_fields {
+            let observed_fields = Arc::new(Mutex::new(Vec::new()));
+            let observed = Arc::clone(&observed_fields);
+            fields.observe("collab", move |txn, event| {
+                observed
+                    .lock()
+                    .expect("collab field observer")
+                    .extend(event.keys(txn).iter().map(|(key, entry)| {
+                        (Arc::clone(key), matches!(entry, EntryChange::Removed(_)))
+                    }));
+            });
+            Some(observed_fields)
+        } else {
+            None
+        };
         Self {
             doc,
             body,
@@ -106,7 +120,10 @@ impl Replica {
     }
 
     fn take_field_changes(&self) -> ObservedFields {
-        std::mem::take(&mut *self.observed_fields.lock().expect("collab field observer"))
+        match &self.observed_fields {
+            Some(observed) => std::mem::take(&mut *observed.lock().expect("collab field observer")),
+            None => Vec::new(),
+        }
     }
 
     fn overrides(&self, txn: &impl ReadTxn) -> Result<AppliedFm, Reject> {
@@ -200,7 +217,7 @@ pub(crate) fn replay_for_recovery(
         if base_body.encode_utf16().count() > i32::MAX as usize {
             return Err(Reject::InvalidBodyContent);
         }
-        let seed = Replica::new(|_| false);
+        let seed = Replica::new_live(|_| false);
         seed.body.insert(&mut seed.doc.transact_mut(), 0, base_body);
         return Ok(RecoveryReplay {
             snapshot_overrides: AppliedFm::new(),
@@ -211,7 +228,7 @@ pub(crate) fn replay_for_recovery(
     };
     let frame = update::inspect_snapshot(snapshot, true)?;
     Topology::from_snapshot(&frame)?;
-    let replica = Replica::new(|id| frame.runs.contains_key(&id));
+    let replica = Replica::new_live(|id| frame.runs.contains_key(&id));
     replica.apply(snapshot)?;
     let snapshot_overrides = {
         let txn = replica.doc.transact();
@@ -259,7 +276,7 @@ impl TwinDoc {
         if body.encode_utf16().count() > i32::MAX as usize {
             return Err(Reject::InvalidBodyContent);
         }
-        let seed = Replica::new(|_| false);
+        let seed = Replica::new_live(|_| false);
         seed.body.insert(&mut seed.doc.transact_mut(), 0, body);
         Self::restore(&seed.snapshot())
     }
@@ -267,8 +284,9 @@ impl TwinDoc {
     pub(crate) fn restore(snapshot: &[u8]) -> Result<Self, Reject> {
         let frame = update::inspect_snapshot(snapshot, true)?;
         let topology = Topology::from_snapshot(&frame)?;
-        let live = Replica::new(|id| frame.runs.contains_key(&id));
-        let staging = Replica::new(|id| id == live.doc.client_id() || frame.runs.contains_key(&id));
+        let live = Replica::new_live(|id| frame.runs.contains_key(&id));
+        let staging =
+            Replica::new_staging(|id| id == live.doc.client_id() || frame.runs.contains_key(&id));
         live.apply(snapshot)?;
         staging.apply(snapshot)?;
         {
@@ -321,6 +339,7 @@ impl TwinDoc {
         self.live.overrides(&self.live.doc.transact())
     }
 
+    #[cfg(test)]
     pub(crate) fn staging_overrides(&self) -> Result<AppliedFm, Reject> {
         self.staging.overrides(&self.staging.doc.transact())
     }
@@ -433,10 +452,6 @@ impl TwinDoc {
         let applied = txn.encode_update_v1();
         guard_work!(generated_binary_bytes += applied.len());
         drop(txn);
-        let encoded = update::inspect_snapshot(&applied, carrier.fm_writable)?;
-        let encoded_evidence =
-            self.topology
-                .prove(&encoded, &self.body, &reserved, Some(MAX_ROOM_CLIENTS))?;
         let body_len = body.as_ref().map_or(0, String::len);
         let bytes = if let Some(body) = &body {
             let bytes = self.finalize(applied, carrier, note, body, &fields)?;
@@ -448,6 +463,10 @@ impl TwinDoc {
             carrier
                 .validate_overrides(&fields)
                 .map_err(|_| Reject::FrontmatterNotWritable)?;
+            let encoded = update::inspect_snapshot(&applied, carrier.fm_writable)?;
+            let encoded_evidence =
+                self.topology
+                    .prove(&encoded, &self.body, &reserved, Some(MAX_ROOM_CLIENTS))?;
             self.topology.apply_resolved(&encoded, &encoded_evidence)?;
             applied
         };
@@ -492,7 +511,7 @@ impl TwinDoc {
         overrides_delta: &AppliedFm,
         carrier: &RoomCarrierState,
         note: &NoteId,
-    ) -> Result<Vec<u8>, Reject> {
+    ) -> Result<(Vec<u8>, Option<String>, AppliedFm), Reject> {
         let identity = CanonicalStore::derive_carrier_identities(&carrier.carrier_rev_id).0;
         let mut txn = self.staging.doc.transact_mut();
         let expected_body = body_plan
@@ -534,9 +553,10 @@ impl TwinDoc {
         drop(txn);
         if body_touched {
             let body = body.expect("body_touched loaded verified body");
-            let bytes = self.finalize(delta, carrier, note, &body, &fields)?;
+            let (bytes, final_body) =
+                self.finalize_with_body(delta, carrier, note, body, &fields)?;
             self.rebuild_staging_index()?;
-            Ok(bytes)
+            Ok((bytes, Some(final_body), fields))
         } else {
             carrier
                 .validate_overrides(&fields)
@@ -546,7 +566,7 @@ impl TwinDoc {
                 let evidence = self.topology.prove(&encoded, &self.body, &[], None)?;
                 self.topology.apply_resolved(&encoded, &evidence)?;
             }
-            Ok(delta)
+            Ok((delta, body, fields))
         }
     }
 
@@ -558,18 +578,31 @@ impl TwinDoc {
         body: &str,
         fields: &AppliedFm,
     ) -> Result<Vec<u8>, Reject> {
+        let (bytes, _) =
+            self.finalize_with_body(applied, carrier, note, body.to_owned(), fields)?;
+        Ok(bytes)
+    }
+
+    fn finalize_with_body(
+        &mut self,
+        applied: Vec<u8>,
+        carrier: &RoomCarrierState,
+        note: &NoteId,
+        body: String,
+        fields: &AppliedFm,
+    ) -> Result<(Vec<u8>, String), Reject> {
         carrier
             .validate_overrides(fields)
             .map_err(|_| Reject::FrontmatterNotWritable)?;
         let identity = CanonicalStore::derive_carrier_identities(&carrier.carrier_rev_id).0;
         guard_work!(nota_finalizations += 1, nota_input_bytes += body.len());
-        let Some(plan) = finalize_nota_body(carrier, body, fields, note, identity.clone())
+        let Some(plan) = finalize_nota_body(carrier, &body, fields, note, identity.clone())
             .map_err(|_| Reject::InvalidBodyContent)?
         else {
-            return Ok(applied);
+            return Ok((applied, body));
         };
 
-        let expected = validate_body_plan(body, &identity, &plan)?;
+        let expected = validate_body_plan(&body, &identity, &plan)?;
         let mut txn = self.staging.doc.transact_mut();
         check_local_clock(&txn, Some(&plan), 0)?;
         apply_splices(&self.staging.body, &mut txn, &plan);
@@ -578,16 +611,13 @@ impl TwinDoc {
         if body != expected {
             return Err(Reject::InvalidBodyContent);
         }
-        carrier
-            .validate_overrides(fields)
-            .map_err(|_| Reject::FrontmatterNotWritable)?;
         let normalization = txn.encode_update_v1();
         guard_work!(generated_binary_bytes += normalization.len());
         let merged = merge_updates_v1([applied.as_slice(), normalization.as_slice()])
             .map_err(|_| Reject::MalformedUpdate)?;
         guard_work!(generated_binary_bytes += merged.len());
         update::inspect_snapshot(&merged, carrier.fm_writable)?;
-        Ok(merged)
+        Ok((merged, body))
     }
 
     fn rebuild_staging_index(&mut self) -> Result<(), Reject> {
@@ -634,8 +664,9 @@ impl TwinDoc {
     pub(crate) fn reset_staging<T: AsRef<[u8]>>(&mut self, prefix: &[T]) -> Result<(), Reject> {
         let live = self.live.snapshot();
         let frame = update::inspect_snapshot(&live, true)?;
-        let staging =
-            Replica::new(|id| id == self.live.doc.client_id() || frame.runs.contains_key(&id));
+        let staging = Replica::new_staging(|id| {
+            id == self.live.doc.client_id() || frame.runs.contains_key(&id)
+        });
         staging.apply(&live)?;
         // The actor supplies only updates it already validated against this
         // exact durable base and prefix. Rebuild the projection once after

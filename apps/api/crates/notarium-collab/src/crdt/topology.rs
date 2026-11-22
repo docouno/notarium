@@ -6,7 +6,7 @@ use std::{
 use yrs::{ID, IdSet, block::ClientID};
 
 use super::{
-    body::{BodyIndex, UnitClass},
+    body::{BodyIndex, NibbleBuf, UnitClass},
     update::{Block, Content, Frame, Parent},
 };
 use crate::wire::PolicyRejectReason as Reject;
@@ -156,17 +156,29 @@ impl Topology {
             return Err(Reject::MalformedUpdate);
         }
 
+        let mut surrogate_cache: HashMap<usize, NibbleBuf> = HashMap::new();
         let mut maximum_body_len = body.len;
-        for block in &frame.blocks {
+        for (block_idx, block) in frame.blocks.iter().enumerate() {
             guard_work!(causal_blocks += 1);
             let current = self.clock(block.id.client);
             if block.end <= current {
                 continue;
             }
-            if let Content::String(text) = block.content {
+            if let Content::String {
+                text,
+                has_surrogates,
+            } = block.content
+            {
                 let overlap = current.saturating_sub(block.id.clock);
                 if overlap > 0
-                    && (utf16_unit_class_at(text, overlap).is_some_and(UnitClass::is_low)
+                    && (block_surrogate_class(
+                        &mut surrogate_cache,
+                        block_idx,
+                        text,
+                        has_surrogates,
+                        overlap,
+                    )
+                    .is_some_and(UnitClass::is_low)
                         || body
                             .unit_class(ID::new(block.id.client, current - 1))
                             .is_some_and(UnitClass::is_high))
@@ -194,7 +206,7 @@ impl Topology {
             stack.push((index, false));
             while let Some((index, resolve)) = stack.pop() {
                 if resolve {
-                    let root = self.resolve(frame, body, &evidence, index)?;
+                    let root = self.resolve(frame, body, &evidence, index, &mut surrogate_cache)?;
                     if let Root::Field(key) = &root {
                         evidence.fields.insert(Arc::clone(key));
                     }
@@ -229,10 +241,10 @@ impl Topology {
             let first = deletion.id;
             let last = ID::new(first.client, deletion.end - 1);
             if self
-                .unit_class(frame, body, first)
+                .unit_class(frame, body, first, &mut surrogate_cache)
                 .is_some_and(UnitClass::is_low)
                 || self
-                    .unit_class(frame, body, last)
+                    .unit_class(frame, body, last, &mut surrogate_cache)
                     .is_some_and(UnitClass::is_high)
             {
                 return Err(Reject::InvalidBodyContent);
@@ -261,6 +273,7 @@ impl Topology {
         body: &BodyIndex,
         evidence: &Evidence,
         index: usize,
+        surrogate_cache: &mut HashMap<usize, NibbleBuf>,
     ) -> Result<Root, Reject> {
         let block = frame.blocks[index];
         let current = self.clock(block.id.client);
@@ -286,7 +299,10 @@ impl Topology {
                 {
                     return Err(Reject::ForbiddenRootOrSubdoc);
                 }
-                if self.unit_class(frame, body, id).is_some_and(rejects) {
+                if self
+                    .unit_class(frame, body, id, surrogate_cache)
+                    .is_some_and(rejects)
+                {
                     return Err(Reject::InvalidBodyContent);
                 }
                 root = Some(anchored.clone());
@@ -300,7 +316,7 @@ impl Topology {
             return Err(Reject::ForbiddenRootOrSubdoc);
         }
         match (&root, block.content) {
-            (Root::Body, Content::String(_) | Content::Deleted)
+            (Root::Body, Content::String { .. } | Content::Deleted)
             | (Root::Field(_), Content::Value | Content::Deleted) => Ok(root),
             _ => Err(Reject::ForbiddenRootOrSubdoc),
         }
@@ -322,44 +338,52 @@ impl Topology {
         Ok((root, frame.blocks[index].end))
     }
 
-    fn unit_class(&self, frame: &Frame<'_>, body: &BodyIndex, id: ID) -> Option<UnitClass> {
+    fn unit_class(
+        &self,
+        frame: &Frame<'_>,
+        body: &BodyIndex,
+        id: ID,
+        surrogate_cache: &mut HashMap<usize, NibbleBuf>,
+    ) -> Option<UnitClass> {
         if id.clock < self.clock(id.client) {
             return body.unit_class(id);
         }
         let index = frame.block_at(id)?;
         let block = frame.blocks[index];
-        let Content::String(text) = block.content else {
+        let Content::String {
+            text,
+            has_surrogates,
+        } = block.content
+        else {
             return None;
         };
-        utf16_unit_class_at(text, id.clock - block.id.clock)
+        block_surrogate_class(
+            surrogate_cache,
+            index,
+            text,
+            has_surrogates,
+            id.clock - block.id.clock,
+        )
     }
 }
 
-fn utf16_unit_class_at(text: &str, utf16_offset: u32) -> Option<UnitClass> {
+/// Returns the surrogate class (`HighSurrogate`, `LowSurrogate`, or non-surrogate
+/// `Ordinary`) at `utf16_offset` within `text` in amortized O(1) time.
+fn block_surrogate_class(
+    cache: &mut HashMap<usize, NibbleBuf>,
+    block_index: usize,
+    text: &str,
+    has_surrogates: bool,
+    utf16_offset: u32,
+) -> Option<UnitClass> {
+    if !has_surrogates {
+        return Some(UnitClass::Ordinary);
+    }
+    let buf = cache
+        .entry(block_index)
+        .or_insert_with(|| NibbleBuf::from_str(text));
     let target = utf16_offset as usize;
-    if text.is_ascii() {
-        return text
-            .as_bytes()
-            .get(target)
-            .map(|&b| UnitClass::from_utf16(u16::from(b)));
-    }
-    let mut pos = 0usize;
-    for ch in text.chars() {
-        let len = ch.len_utf16();
-        if target < pos + len {
-            return Some(if len == 2 {
-                if target == pos {
-                    UnitClass::HighSurrogate
-                } else {
-                    UnitClass::LowSurrogate
-                }
-            } else {
-                UnitClass::from_utf16(ch as u16)
-            });
-        }
-        pos += len;
-    }
-    None
+    (target < buf.len() as usize).then(|| buf.get(target))
 }
 
 fn anchors(block: Block<'_>, current: u32) -> (Option<ID>, Option<ID>) {

@@ -57,8 +57,8 @@ pub use peers::{
     ActiveRoomFacts, AppendCollabUpdates, CheckpointCollabSession, ClaimedContentJob,
     CloseCollabSession, CollabCarrierSettlement, CollabRoomState, CollabSessionRecord,
     CollabSessionSnapshot, CollabSettlementActor, CollabUpdateEntry, FenceCollabSession,
-    FencedCollabRecovery, JobCompletionOutcome, NoteCollabAdmission, OpenCollabSession,
-    RoomWalEntry,
+    FencedCollabRecovery, JobCompletionOutcome, NoteCollabAdmission, NoteCollabAdmissionMeta,
+    OpenCollabSession, RoomWalEntry,
 };
 #[cfg(feature = "test-support")]
 pub use projection_fence::FenceCensusFixture;

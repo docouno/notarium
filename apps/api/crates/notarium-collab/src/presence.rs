@@ -9,20 +9,20 @@ use yrs::ClientID;
 use yrs::sync::AwarenessUpdate;
 use yrs::sync::awareness::AwarenessUpdateEntry;
 
-use crate::wire::MAX_FRAME_BYTES;
-
 const MAX_CLIENTS_PER_PEER: usize = 8;
 // Up to 128 concurrent peers × 8 clients per peer so no peer can starve another
 // peer's awareness slots before hitting the room byte budget.
 const MAX_ROOM_AWARENESS_CLIENTS: usize = 1024;
-// Reserve space for up to 1024 client IDs, clocks and length prefixes plus the
-// enclosing headers, so even a full snapshot fits in a single frame.
-const MAX_ROOM_JSON_BYTES: usize = MAX_FRAME_BYTES - 16 * 1024;
+// Bound total awareness JSON stored in memory per room to 256 KiB (well below
+// MAX_FRAME_BYTES so even a full snapshot fits in one outbound frame with ample
+// headroom for client IDs, clocks, and protocol framing).
+const MAX_ROOM_JSON_BYTES: usize = 256 * 1024;
 const UNSET: &str = "null";
 
 #[derive(Default)]
 pub(crate) struct Presence {
     entries: HashMap<ClientID, OwnedState>,
+    peer_counts: HashMap<u64, usize>,
     live_entries: usize,
     json_bytes: usize,
 }
@@ -35,12 +35,8 @@ struct OwnedState {
 impl Presence {
     /// Ignore foreign and stale records. Only accepted records are published.
     pub(crate) fn apply(&mut self, peer: u64, update: AwarenessUpdate) -> Option<AwarenessUpdate> {
-        let mut remaining = MAX_CLIENTS_PER_PEER
-            - self
-                .entries
-                .values()
-                .filter(|state| state.peer == peer)
-                .count();
+        let mut remaining =
+            MAX_CLIENTS_PER_PEER.saturating_sub(self.peer_counts.get(&peer).copied().unwrap_or(0));
         let mut candidates: Vec<_> = update.clients.into_iter().collect();
         // When a single message exceeds a quota, selection is deterministic.
         candidates.sort_unstable_by_key(|(id, _)| *id);
@@ -87,6 +83,7 @@ impl Presence {
                 .is_none()
             {
                 remaining -= 1;
+                *self.peer_counts.entry(peer).or_insert(0) += 1;
             }
             if !was_live && is_live {
                 self.live_entries += 1;
@@ -113,6 +110,7 @@ impl Presence {
     }
 
     pub(crate) fn remove_peer(&mut self, peer: u64) -> Option<AwarenessUpdate> {
+        self.peer_counts.remove(&peer)?;
         let mut cleared = HashMap::new();
         self.entries.retain(|&id, state| {
             if state.peer != peer {
@@ -235,6 +233,6 @@ mod tests {
         assert!(presence.json_bytes <= MAX_ROOM_JSON_BYTES);
         let snapshot = presence.snapshot().unwrap();
         assert_eq!(snapshot.clients.len(), MAX_ROOM_JSON_BYTES / (16 * 1024));
-        assert!(crate::wire::encode_awareness(&snapshot).len() <= MAX_FRAME_BYTES);
+        assert!(crate::wire::encode_awareness(&snapshot).len() <= crate::wire::MAX_FRAME_BYTES);
     }
 }

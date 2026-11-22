@@ -55,7 +55,6 @@ fn report(label: &str, kib: usize, mut samples: Vec<Duration>, wire_bytes: usize
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "run explicitly for release-profile latency and Linux RSS measurements"]
 async fn collab_cost() {
     let root = TempDataRoot::new("collab-cost");
     let canonical =
@@ -67,6 +66,7 @@ async fn collab_cost() {
     let mut settings = CollabConfig::default();
     settings.idle_checkpoint = Duration::from_secs(1);
     settings.idle_unload = Duration::from_secs(2);
+    settings.max_rooms_per_space = 256;
     println!(
         "collab_cost,profile={},allocator=mimalloc,backend=sqlite_full,tokio_workers=2,wal_coalesce_config_us={}",
         if cfg!(debug_assertions) {
@@ -80,41 +80,113 @@ async fn collab_cost() {
     hub.register().unwrap();
 
     let mut notes = Vec::new();
-    for seed in 1..=50 {
-        let prefix = format!("Room {seed:02}.\n\n");
+    for seed in 1..=200u16 {
+        let prefix = format!("Room {seed:03}.\n\n");
         let mut carrier = prefix.clone();
         carrier.push_str(&"x".repeat(100 * 1024 - prefix.len()));
-        notes.push(create_note(&store, &owner, seed, &carrier, None).await.note);
+        let mut id_bytes = [0u8; 16];
+        id_bytes[..2].copy_from_slice(&seed.to_be_bytes());
+        id_bytes[15] = 0xCC;
+        let note_rev = store
+            .create_note(
+                owner.clone(),
+                mutation(
+                    &owner,
+                    notarium_core::ports::CreateNote {
+                        note: NoteId::from_bytes(id_bytes),
+                        parent: None,
+                        slug: format!("rss-room-{seed:03}"),
+                        class: DocClass::UserDoc,
+                        carrier,
+                    },
+                ),
+            )
+            .await
+            .unwrap()
+            .value;
+        notes.push(note_rev.note);
     }
     // Warm the fixed runtime and one room before sampling. Retained client
     // handles do not contain replicas, isolating room memory from editor RAM.
     let (warm, _) = synced_client(&hub, &owner, &notes[0], 700).await;
     drop(warm);
     wait_until(async || hub.active_room_count() == 0).await;
-    let idle_rss = rss_kib();
-    let mut peers = Vec::new();
-    for note in notes {
-        let mut peer = open(&hub, &owner, &note).await;
-        peer.send(LineageHello::Fresh.encode()).await.unwrap();
-        custom(&mut peer, wire::LINEAGE_READY).await;
-        let notarium_collab::SessionEvent::Binary(frame) = recv(&mut peer).await else {
-            panic!("expected active room SyncStep1");
-        };
-        assert!(matches!(
-            messages(&frame).as_slice(),
-            [Message::Sync(SyncMessage::SyncStep1(_))]
-        ));
-        peers.push(peer);
+
+    for (count, cycles) in [(50usize, 2usize), (200usize, 2usize)] {
+        for cycle in 1..=cycles {
+            let idle_rss = rss_kib();
+            let mut peers = Vec::with_capacity(count);
+            for note in &notes[..count] {
+                let mut peer = open(&hub, &owner, note).await;
+                peer.send(LineageHello::Fresh.encode()).await.unwrap();
+                custom(&mut peer, wire::LINEAGE_READY).await;
+                let notarium_collab::SessionEvent::Binary(frame) = recv(&mut peer).await else {
+                    panic!("expected active room SyncStep1");
+                };
+                assert!(matches!(
+                    messages(&frame).as_slice(),
+                    [Message::Sync(SyncMessage::SyncStep1(_))]
+                ));
+                peers.push(peer);
+            }
+            assert_eq!(hub.active_room_count(), count);
+            let active_rss = rss_kib();
+            drop(peers);
+            let mut close_peak_rss = active_rss;
+            while hub.active_room_count() > 0 {
+                close_peak_rss = close_peak_rss.max(rss_kib());
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let unloaded_0ms = rss_kib();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let unloaded_50ms = rss_kib();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let unloaded_250ms = rss_kib();
+            println!(
+                "room_rss_kib,rooms={count},cycle={cycle},each_carrier_kib=100,baseline={idle_rss},active={active_rss},close_peak={close_peak_rss},unloaded_0ms={unloaded_0ms},unloaded_50ms={unloaded_50ms},unloaded_250ms={unloaded_250ms},delta={}",
+                active_rss.saturating_sub(idle_rss)
+            );
+        }
     }
-    assert_eq!(hub.active_room_count(), 50);
-    let active_rss = rss_kib();
-    drop(peers);
-    wait_until(async || hub.active_room_count() == 0).await;
-    let unloaded_rss = rss_kib();
-    println!(
-        "room_rss_kib,rooms=50,each_carrier_kib=100,baseline={idle_rss},active={active_rss},unloaded={unloaded_rss},delta={}",
-        active_rss.saturating_sub(idle_rss)
-    );
+
+    // Verify SQLite auth commit-generation cache invariance across pure WAL
+    // typing (auth_gen stays stable -> 100% cache hit after initial warm-up)
+    // and measure multi-editor 2ms coalescing + 2-char backspace.
+    {
+        let note = create_note(&store, &owner, 240, "Hello world from two editors.\n", None)
+            .await
+            .note;
+        let (mut ed1, _) = synced_client(&hub, &owner, &note, 901).await;
+        let (mut ed2, _) = synced_client(&hub, &owner, &note, 902).await;
+        let auth_gen_before = store.sqlite_auth_commit_generation().unwrap();
+        let writer_gen_before = store.sqlite_commit_generation().unwrap();
+        let mut two_editor_samples = Vec::new();
+        for sample in 0..WARMUP + SAMPLES {
+            let u1 = ed1.append("a");
+            let u2 = ed2.append("b");
+            let started = Instant::now();
+            tokio::join!(ed1.send_update(&u1), ed2.send_update(&u2));
+            tokio::join!(ed1.ack(), ed2.ack());
+            if sample >= WARMUP {
+                two_editor_samples.push(started.elapsed());
+            }
+            ed1.sync().await;
+            ed2.sync().await;
+        }
+        let auth_gen_after = store.sqlite_auth_commit_generation().unwrap();
+        let writer_gen_after = store.sqlite_commit_generation().unwrap();
+        assert_eq!(
+            auth_gen_before, auth_gen_after,
+            "pure WAL typing must not invalidate sqlite_auth_commit_generation"
+        );
+        assert!(
+            writer_gen_after > writer_gen_before,
+            "WAL commits must still advance sqlite_writer_commit_gen"
+        );
+        report("two_editor_wal_coalesce", 1, two_editor_samples, 0);
+        drop((ed1, ed2));
+        wait_until(async || hub.active_room_count() == 0).await;
+    }
 
     let mut seed = 64;
     for kib in SIZES_KIB {

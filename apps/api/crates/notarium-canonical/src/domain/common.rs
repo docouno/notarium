@@ -395,11 +395,107 @@ impl RoomFenceTable {
         Some(Arc::clone(&entry.state))
     }
 
-    pub(crate) async fn observed_epoch(&self, scope: &HistoryScope, note: &NoteId) -> LeaseEpoch {
-        let Some(lock) = self.existing_fence(scope, note) else {
-            return LeaseEpoch::ZERO;
+    pub(crate) async fn observed_active_lease(
+        &self,
+        scope: &HistoryScope,
+        note: &NoteId,
+    ) -> Option<LeaseEpoch> {
+        let lock = self.existing_fence(scope, note)?;
+        let guard = lock.lock().await;
+        guard.is_active().then(|| guard.epoch())
+    }
+
+    /// Returns all notes currently tracked in local `RoomFenceTable` or recovery
+    /// state for `space_id`, and advances `eviction_gen` so pre-takeover
+    /// untracked `ClosedRoomReservation`s cannot match post-takeover slots.
+    pub(crate) fn begin_space_takeover_sync(&self, space_id: &SpaceId) -> Vec<NoteId> {
+        let mut fences = self.fences.lock().expect("room fence table mutex");
+        fences.advance_eviction_gen();
+        let mut notes: Vec<NoteId> = fences
+            .entries
+            .keys()
+            .filter(|(sid, _)| sid == space_id)
+            .map(|(_, note)| note.clone())
+            .collect();
+        let recovery = self
+            .recovery
+            .lock()
+            .expect("room recovery fence table mutex");
+        for (sid, note) in &recovery.fenced {
+            if sid == space_id {
+                notes.push(note.clone());
+            }
+        }
+        for (sid, note) in recovery.recovered.keys() {
+            if sid == space_id {
+                notes.push(note.clone());
+            }
+        }
+        notes
+    }
+
+    /// Force-synchronizes one local `RoomFenceState` slot with authoritative
+    /// PostgreSQL writer-lease takeover state while the caller holds `guard`
+    /// (without holding any SQL connection or writer commit guard).
+    ///
+    /// Unlike `publish_persisted_transition`, takeover is authoritative for the
+    /// Space and therefore overwrites any stale pre-takeover active state or
+    /// higher local epoch from earlier ownership, and refreshes the slot's
+    /// eviction pin to invalidate pre-takeover `ClosedRoomReservation`s.
+    pub(crate) fn apply_takeover_transition(
+        &self,
+        scope: &HistoryScope,
+        note: &NoteId,
+        guard: &mut tokio::sync::OwnedMutexGuard<RoomFenceState>,
+        fenced_epoch: Option<LeaseEpoch>,
+    ) -> bool {
+        let key = (scope.space_id.clone(), note.clone());
+        let mut map = self.fences.lock().expect("room fence table mutex");
+        let current = tokio::sync::OwnedMutexGuard::mutex(guard);
+        // Preserve a concurrent Space restore that replaced the slot entirely.
+        if !map
+            .entries
+            .get(&key)
+            .is_some_and(|slot| Arc::ptr_eq(&slot.state, current))
+        {
+            return false;
+        }
+        let touched = map.next_touch();
+        map.advance_eviction_gen();
+        let slot_gen = map.eviction_gen;
+        if let Some(slot) = map.entries.get_mut(&key) {
+            slot.touched = touched;
+            slot.pin = Arc::new(slot_gen);
+        }
+        let mut recovery = self
+            .recovery
+            .lock()
+            .expect("room recovery fence table mutex");
+        recovery.recovered.remove(&key);
+        let next = match fenced_epoch {
+            Some(epoch) => {
+                recovery.fenced.insert(key);
+                RoomFenceState::new(note.clone(), scope.clone(), epoch)
+            }
+            None => {
+                recovery.fenced.remove(&key);
+                RoomFenceState::new(note.clone(), scope.clone(), LeaseEpoch::ZERO)
+            }
         };
-        lock.lock().await.epoch()
+        **guard = next;
+        true
+    }
+
+    /// Clears stale recovery markers for a note whose fence slot was already
+    /// evicted before takeover synchronization reached it.
+    pub(crate) fn clear_evicted_takeover_recovery(&self, space_id: &SpaceId, note: &NoteId) {
+        let key = (space_id.clone(), note.clone());
+        let mut recovery = self
+            .recovery
+            .lock()
+            .expect("room recovery fence table mutex");
+        recovery.fenced.remove(&key);
+        recovery.recovered.remove(&key);
     }
 
     pub fn get_or_init(&self, scope: &HistoryScope, note: &NoteId) -> Arc<Mutex<RoomFenceState>> {

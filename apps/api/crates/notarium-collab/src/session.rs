@@ -241,8 +241,9 @@ impl CollabPeerReceiver {
     }
 
     async fn authorize(&mut self, authority: &OutboundAuthority) -> Result<(), SessionClose> {
-        // Linearizable zero-SQL fast path on SQLite when no canonical commit
-        // has occurred since this session last verified the exact room lease.
+        // Linearizable zero-SQL fast path on SQLite when no authorization-
+        // affecting canonical commit has occurred since this session last
+        // verified the exact room lease.
         if let OutboundAuthority::Active {
             scope,
             role,
@@ -254,7 +255,7 @@ impl CollabPeerReceiver {
             if scope != self.context.scope() {
                 return Err(SessionClose::POLICY);
             }
-            if let Some(current_gen) = self.store.sqlite_commit_generation()
+            if let Some(current_gen) = self.store.sqlite_auth_commit_generation()
                 && self.last_verified.as_ref().is_some_and(|v| {
                     v.commit_gen == current_gen
                         && v.lease == *lease
@@ -267,7 +268,7 @@ impl CollabPeerReceiver {
             }
         }
 
-        let gen_before = self.store.sqlite_commit_generation();
+        let gen_before = self.store.sqlite_auth_commit_generation();
         let budget = CallBudget {
             request: self.context.budget.request.clone(),
             cancellation: Cancellation::default(),
@@ -310,7 +311,8 @@ impl CollabPeerReceiver {
             .await
             .unwrap_or(Err(SessionClose::POLICY));
         if res.is_ok()
-            && let (Some(before), Some(after)) = (gen_before, self.store.sqlite_commit_generation())
+            && let (Some(before), Some(after)) =
+                (gen_before, self.store.sqlite_auth_commit_generation())
             && before == after
             && let OutboundAuthority::Active {
                 role,
@@ -506,6 +508,7 @@ pub(crate) struct PeerGuard {
     expires_at: Option<Instant>,
     state: Mutex<PeerState>,
     hub_peer: Mutex<Option<(Weak<HubInner>, u64)>>,
+    peer_capacity: Mutex<Option<tokio::sync::OwnedSemaphorePermit>>,
     input_stopped: Cancellation,
     stopped: Cancellation,
     lease_lost: Cancellation,
@@ -523,12 +526,21 @@ impl PeerAdmission<'_> {
 }
 
 impl PeerGuard {
+    #[cfg(test)]
     pub(crate) fn new(auth: CollabSessionAuth) -> Arc<Self> {
+        Self::new_with_permit(auth, None)
+    }
+
+    pub(crate) fn new_with_permit(
+        auth: CollabSessionAuth,
+        peer_capacity: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) -> Arc<Self> {
         let guard = Arc::new(Self {
             cancellation: auth.cancellation.clone(),
             expires_at: auth.expires_at,
             state: Mutex::new(PeerState::Open(auth.lease)),
             hub_peer: Mutex::new(None),
+            peer_capacity: Mutex::new(peer_capacity),
             input_stopped: Cancellation::default(),
             stopped: Cancellation::default(),
             lease_lost: Cancellation::default(),
@@ -711,6 +723,10 @@ impl PeerGuard {
         // active, pending_revoke_settlement}`.
         self.unregister_hub_peer();
         drop(retired);
+        self.peer_capacity
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
         self.input_stopped.cancel();
         drop(state);
         self.lease_lost.cancel();
@@ -722,6 +738,10 @@ impl Drop for PeerGuard {
     fn drop(&mut self) {
         self.lease_lost.cancel();
         self.unregister_hub_peer();
+        self.peer_capacity
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
     }
 }
 

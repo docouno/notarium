@@ -111,13 +111,36 @@ impl Room {
         let live_body = self.twin.live_body();
         let live_fm = self.twin.live_overrides().map_err(invalid_state)?;
         let mut pending = self.carrier.pending_fields(&live_fm);
-        let live_changed = self.first_dirty.is_some()
-            && !self
-                .carrier
-                .matches_base(&self.carrier.materialize(&live_body, &live_fm)?);
+        let automated = matches!(
+            request.context.auth().kind(),
+            PrincipalKind::AgentRun(_) | PrincipalKind::Keeper(_)
+        );
+        // Compute full-carrier change detection at most once and only when
+        // board eligibility or autonomous-run separation actually needs it.
+        let mut live_changed_cache: Option<bool> = None;
+        let check_live_changed = |carrier: &crate::carrier::RoomCarrierState,
+                                  first_dirty: bool,
+                                  cache: &mut Option<bool>|
+         -> Result<bool, PortError> {
+            if !first_dirty {
+                return Ok(false);
+            }
+            if let Some(changed) = *cache {
+                return Ok(changed);
+            }
+            let changed = !carrier.matches_base(&carrier.materialize(&live_body, &live_fm)?);
+            *cache = Some(changed);
+            Ok(changed)
+        };
         // Board facts cover the persisted view cut. Live edits can change
         // the target's group or eligibility without advancing that cut.
-        if board_fields.is_some() && live_changed {
+        if board_fields.is_some()
+            && check_live_changed(
+                &self.carrier,
+                self.first_dirty.is_some(),
+                &mut live_changed_cache,
+            )?
+        {
             self.checkpoint_for_command(poison_room).await?;
             return Err(self.conflict().into());
         }
@@ -127,6 +150,7 @@ impl Room {
         if body_mismatch || header_conflict(header, board_fields, &pending) {
             let before_rev = self.carrier.carrier_rev_id.clone();
             self.checkpoint_for_command(poison_room).await?;
+            live_changed_cache = None;
             // If checkpoint was a no-op (for example, a peer set and reverted
             // an override back to the base value), re-evaluate pending fields
             // instead of returning a spurious self-conflict on the same head.
@@ -145,15 +169,12 @@ impl Room {
 
         // An autonomous run must never adopt earlier human keystrokes as its
         // own revision, because rolling it back would remove those keystrokes.
-        let automated = matches!(
-            request.context.auth().kind(),
-            PrincipalKind::AgentRun(_) | PrincipalKind::Keeper(_)
-        );
         if automated
-            && self.first_dirty.is_some()
-            && !self
-                .carrier
-                .matches_base(&self.carrier.materialize(&live_body, &live_fm)?)
+            && check_live_changed(
+                &self.carrier,
+                self.first_dirty.is_some(),
+                &mut live_changed_cache,
+            )?
         {
             self.checkpoint_for_command(poison_room).await?;
             if request.preconditions.revision.is_some() || entity_revision.is_some() {
@@ -166,6 +187,7 @@ impl Room {
                     CanonicalStore::derive_carrier_identities(&self.carrier.carrier_rev_id).0;
             }
         }
+        drop(live_body);
 
         let staged = self.prepare_command(body.as_ref(), projection);
         let (staged_update, materialized, fm) = match staged {
@@ -182,26 +204,28 @@ impl Room {
             }
         };
         let final_digest = digest(&materialized);
-        let settlement = RoomCommandSettlement {
-            owner_id: self.lease.owner.to_string(),
-            expected_lease: self.lease.epoch,
-            expected_lineage: self.lease.lineage,
-            expected_base_rev: self.carrier.carrier_rev_id.clone(),
-            final_carrier: materialized.clone(),
-            yrs_snapshot: self.twin.staging_snapshot(),
-            compacted_through_update_seq: Some(self.last_seq),
+        let build_settlement = |this: &Self, carrier: &str| RoomCommandSettlement {
+            owner_id: this.lease.owner.to_string(),
+            expected_lease: this.lease.epoch,
+            expected_lineage: this.lease.lineage,
+            expected_base_rev: this.carrier.carrier_rev_id.clone(),
+            final_carrier: carrier.to_owned(),
+            yrs_snapshot: this.twin.staging_snapshot(),
+            compacted_through_update_seq: Some(this.last_seq),
         };
+        let settlement = build_settlement(self, &materialized);
         request.context.budget.remaining = request
             .context
             .budget
             .remaining
             .saturating_sub(request_start.elapsed());
-        let result = commit(&self.store, request.clone(), settlement.clone()).await;
+        let result = commit(&self.store, request.clone(), settlement).await;
         let result = if result.as_ref().err().is_some_and(unknown) {
             let original_id = request.context.budget.request.clone();
             request.context.budget = self.budget();
             request.context.budget.request = original_id;
-            commit(&self.store, request, settlement)
+            let retry_settlement = build_settlement(self, &materialized);
+            commit(&self.store, request, retry_settlement)
                 .await
                 .map_err(|error| {
                     if unknown(&error) {
@@ -285,12 +309,11 @@ impl Room {
         body: Option<&BodyPatchPlan>,
         projection: HeaderProjection,
     ) -> Result<(Vec<u8>, String, AppliedFm), PortError> {
-        let staged = self
+        let (staged, staged_body, current_fm) = self
             .twin
             .stage_command(body, &projection.overrides, &self.carrier, &self.lease.note)
             .map_err(invalid_state)?;
-        let final_body = self.twin.staging_body();
-        let current_fm = self.twin.staging_overrides().map_err(invalid_state)?;
+        let final_body = staged_body.unwrap_or_else(|| self.twin.staging_body());
         let carrier = if let Some(header) = projection.raw_carrier {
             project_body(&header, &final_body)?
         } else {

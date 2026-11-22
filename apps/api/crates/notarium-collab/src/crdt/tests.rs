@@ -19,7 +19,7 @@ fn note() -> NoteId {
 }
 
 fn author(twin: &TwinDoc) -> Replica {
-    let replica = Replica::new(|id| twin.client_ids().contains(&id));
+    let replica = Replica::new_live(|id| twin.client_ids().contains(&id));
     replica.apply(&twin.live_snapshot()).unwrap();
     replica
 }
@@ -464,7 +464,7 @@ fn frontmatter_only_edit_and_command_skip_body_index_rebuild() {
         "count".into(),
         AppliedFmEntry::Set(notarium_core::value::YamlValue::Number(42_i64.into())),
     )]);
-    let cmd_bytes = twin
+    let (cmd_bytes, _, _) = twin
         .stage_command(None, &int_delta, &carrier, &note())
         .unwrap();
     assert_eq!(cmd_bytes, EMPTY_UPDATE);
@@ -504,6 +504,121 @@ fn batch_replay_and_single_replica_recovery_match_live_state() {
     assert_eq!(recovered.final_overrides, live.live_overrides().unwrap());
     let from_recovered = TwinDoc::restore(&recovered.final_snapshot).unwrap();
     assert_eq!(from_recovered.live_body(), live.live_body());
+}
+
+#[test]
+fn adversarial_multiblock_surrogate_and_non_ascii_update_validates_in_linear_time() {
+    use std::time::Instant;
+    use yrs::{encoding::write::Write, updates::encoder::Encoder};
+
+    let (carrier, body) = carrier("seed\n");
+    let mut twin = TwinDoc::seed(&body).unwrap();
+    let base_client = 9001u64;
+    let payload_text: String = "🚀".repeat(200_000); // 800 KB UTF-8, 400_000 UTF-16 units
+    let text_utf16_len = 400_000u32;
+
+    // Craft a valid-structure update containing 1 large emoji block + 4095
+    // anchored 1-unit blocks + 4096 delete ranges pointing near the tail of the
+    // large block (previously O(B * L) quadratic UTF-16 scanning).
+    let mut enc = yrs::updates::encoder::EncoderV1::new();
+    enc.write_var(1u32); // 1 client
+    enc.write_var(4096u32); // 4096 blocks (MAX_PEER_UPDATE_BLOCKS)
+    enc.write_var(base_client);
+    enc.write_var(0u32); // start clock 0
+    // Block 0: root "body", tag 4 (String), no origins
+    enc.write_u8(4);
+    enc.write_var(1u32); // parent info = named root
+    enc.write_string("body");
+    enc.write_string(&payload_text);
+    // Blocks 1..4096: anchored with left = (base_client, text_utf16_len - 1) (low surrogate - valid left!)
+    // and right = None. Each inserts "a" (1 UTF-16 unit).
+    for _ in 1..4096u32 {
+        enc.write_u8(0x80 | 4); // ORIGIN | String
+        enc.write_var(base_client);
+        enc.write_var(text_utf16_len - 1);
+        enc.write_string("a");
+    }
+    // Delete set: 1 client, 4096 non-overlapping 2-unit emoji ranges near the tail.
+    enc.write_var(1u32);
+    enc.write_var(base_client);
+    enc.write_var(4096u32);
+    let first_del = text_utf16_len - 4096 * 4;
+    for i in 0..4096u32 {
+        enc.write_var(first_del + i * 4);
+        enc.write_var(2u32);
+    }
+    let raw = enc.to_vec();
+    assert!(raw.len() < crate::wire::MAX_FRAME_BYTES);
+
+    let start = Instant::now();
+    let frame = update::inspect_peer(&raw, carrier.fm_writable).unwrap();
+    let reserved = twin.client_ids();
+    let evidence = twin
+        .topology
+        .prove(&frame, &twin.body, &reserved, Some(MAX_ROOM_CLIENTS))
+        .unwrap();
+    let elapsed = start.elapsed();
+    assert!(evidence.touches_body);
+    assert!(
+        elapsed.as_millis() < 1500,
+        "surrogate/anchor validation must stay linear (took {elapsed:?})"
+    );
+
+    // Splitting a surrogate pair via a bad delete boundary is still rejected.
+    let mut bad = yrs::updates::encoder::EncoderV1::new();
+    bad.write_var(1u32);
+    bad.write_var(1u32);
+    bad.write_var(base_client);
+    bad.write_var(0u32);
+    bad.write_u8(4);
+    bad.write_var(1u32);
+    bad.write_string("body");
+    bad.write_string("🚀ok");
+    bad.write_var(1u32);
+    bad.write_var(base_client);
+    bad.write_var(1u32);
+    bad.write_var(1u32); // starts on low surrogate of 🚀
+    bad.write_var(1u32);
+    let bad_raw = bad.to_vec();
+    assert_eq!(
+        twin.stage_peer(&bad_raw, &carrier, &note()).unwrap_err(),
+        Reject::InvalidBodyContent
+    );
+}
+
+#[test]
+fn consecutive_backspaces_then_retype_stay_on_ordinary_fast_path() {
+    let source = "---\nstatus: todo\n---\nIntro paragraph with words.\n\n```nota\nid: v_0000000000000001\ntype: table\n```\n";
+    let (carrier, body) = carrier(source);
+    let mut twin = TwinDoc::seed(&body).unwrap();
+    let peer = author(&twin);
+
+    // Delete 5 consecutive single characters (chained tombstones) then retype.
+    let mut pos = "Intro paragraph".encode_utf16().count() as u32;
+    for _ in 0..5 {
+        pos -= 1;
+        let del = edit(&peer, |txn| peer.body.remove_range(txn, pos, 1));
+        let (staged, path) = twin
+            .stage_peer_with_path(&del, &carrier, &note(), false)
+            .unwrap();
+        assert_eq!(
+            path,
+            GuardPath::Ordinary,
+            "single backspace must be Ordinary"
+        );
+        twin.publish(&staged.bytes).unwrap();
+    }
+    let retype = edit(&peer, |txn| peer.body.insert(txn, pos, "graph"));
+    let (staged, path) = twin
+        .stage_peer_with_path(&retype, &carrier, &note(), false)
+        .unwrap();
+    assert_eq!(
+        path,
+        GuardPath::Ordinary,
+        "retyping after consecutive backspaces must stay Ordinary via chained deleted_anchors"
+    );
+    twin.publish(&staged.bytes).unwrap();
+    assert_eq!(twin.live_body(), body);
 }
 
 mod differential_oracle {
@@ -759,6 +874,84 @@ mod differential_oracle {
                     // each replica's independent random ClientID, resync the
                     // oracle's CRDT history from `fast` so subsequent peer
                     // edits anchored to server-inserted IDs stay causally valid.
+                    if f_upd.bytes != bytes {
+                        oracle = TwinDoc::restore(&fast.live_snapshot()).unwrap();
+                    }
+                } else {
+                    fast.reset_staging::<&[u8]>(&[]).unwrap();
+                    oracle.reset_staging::<&[u8]>(&[]).unwrap();
+                    break;
+                }
+            }
+        }
+
+        #[test]
+        fn two_peer_cross_page_edits_match_structural_oracle(
+            steps in prop::collection::vec((any::<bool>(), step_strategy()), 1..20),
+        ) {
+            // Seed a >PAGE_UNITS (1024 UTF-16 units) document with a nota fence so
+            // page-boundary splits/merges and multi-peer interleaving are exercised.
+            let mut body_text = String::from("Alpha prose line.\n");
+            for i in 0..40 {
+                body_text.push_str(&format!("Paragraph line {i:02} with 🚀 emoji and words.\n"));
+            }
+            body_text.push_str("\n```nota\nid: v_0000000000000099\ntype: table\n```\n");
+            let source = format!("---\nstatus: todo\n---\n{body_text}");
+            let (carrier, body) = carrier(&source);
+            let mut fast = TwinDoc::seed(&body).unwrap();
+            let mut oracle = TwinDoc::restore(&fast.live_snapshot()).unwrap();
+            let peer_a = author(&fast);
+            let peer_b = Replica::new_live(|id| {
+                fast.client_ids().contains(&id) || id == peer_a.doc.client_id()
+            });
+            peer_b.apply(&fast.live_snapshot()).unwrap();
+
+            for (use_b, step) in steps {
+                let active = if use_b { &peer_b } else { &peer_a };
+                let other = if use_b { &peer_a } else { &peer_b };
+                let current = active.body.get_string(&active.doc.transact());
+                let boundaries = char_boundaries_utf16(&current);
+                let max_idx = boundaries.len() - 1;
+                let bytes = match step {
+                    Step::Insert { pos_seed, snippet_idx } => {
+                        let idx = (pos_seed as usize) % (max_idx + 1);
+                        let pos = boundaries[idx];
+                        edit(active, |txn| active.body.insert(txn, pos, INSERT_SNIPPETS[snippet_idx]))
+                    }
+                    Step::Delete { pos_seed, len } => {
+                        if max_idx == 0 {
+                            continue;
+                        }
+                        let start_idx = (pos_seed as usize) % max_idx;
+                        let end_idx = (start_idx + len as usize).min(max_idx);
+                        let start = boundaries[start_idx];
+                        let count = boundaries[end_idx] - start;
+                        edit(active, |txn| active.body.remove_range(txn, start, count))
+                    }
+                    Step::Replace { pos_seed, len, snippet_idx } => {
+                        if max_idx == 0 {
+                            continue;
+                        }
+                        let start_idx = (pos_seed as usize) % max_idx;
+                        let end_idx = (start_idx + len as usize).min(max_idx);
+                        let start = boundaries[start_idx];
+                        let count = boundaries[end_idx] - start;
+                        edit(active, |txn| {
+                            active.body.remove_range(txn, start, count);
+                            active.body.insert(txn, start, INSERT_SNIPPETS[snippet_idx]);
+                        })
+                    }
+                };
+                let fast_res = fast.stage_peer_with_path(&bytes, &carrier, &note(), false);
+                let oracle_res = oracle.stage_peer_with_path(&bytes, &carrier, &note(), true);
+                prop_assert_eq!(fast_res.is_ok(), oracle_res.is_ok());
+                if let (Ok((f_upd, _)), Ok((o_upd, _))) = (fast_res, oracle_res) {
+                    prop_assert_eq!(fast.staging_body(), oracle.staging_body());
+                    fast.publish(&f_upd.bytes).unwrap();
+                    oracle.publish(&o_upd.bytes).unwrap();
+                    active.apply(&f_upd.bytes).unwrap();
+                    other.apply(&f_upd.bytes).unwrap();
+                    prop_assert_eq!(fast.live_body(), oracle.live_body());
                     if f_upd.bytes != bytes {
                         oracle = TwinDoc::restore(&fast.live_snapshot()).unwrap();
                     }

@@ -348,54 +348,11 @@ fn analyze_base(source: &str, digest: ContentDigest) -> DomainResult<(HeaderAnal
 }
 
 pub(crate) fn project_body(header_source: &str, body: &str) -> DomainResult<String> {
-    let carrier = Carrier::scan(header_source)?;
-    project_scanned_body(header_source, &carrier, body)
+    notarium_syntax::live::project_body(header_source, body)
 }
 
 fn project_scanned_body(source: &str, carrier: &Carrier, body: &str) -> DomainResult<String> {
-    let mut result;
-    if let Some(header) = carrier.header {
-        result = String::with_capacity(header.end() + body.len());
-        result.push_str(header.slice(source)?);
-        append_body(&mut result, carrier.eol, body);
-    } else {
-        let bom = &source[..carrier.bom_end];
-        result = String::with_capacity(bom.len() + body.len());
-        result.push_str(bom);
-        result.push_str(body);
-        if let Ok(scan) = Carrier::scan(&result)
-            && scan.header.is_none()
-            && scan.bom_end == carrier.bom_end
-            && scan.body.slice(&result)? == body
-        {
-            return Ok(result);
-        }
-        result.truncate(bom.len());
-        result.push_str("---");
-        result.push_str(carrier.eol);
-        result.push_str("---");
-        result.push_str(carrier.eol);
-        append_body(&mut result, carrier.eol, body);
-    }
-    let scan = Carrier::scan(&result)?;
-    if scan.body.slice(&result)? != body {
-        return Err(DomainError::validation(ValidationReason::OriginMismatch));
-    }
-    Ok(result)
-}
-
-fn append_body(prefix: &mut String, eol: &str, body: &str) {
-    if body.is_empty() {
-        return;
-    }
-    if !prefix.ends_with(['\r', '\n']) {
-        prefix.push_str(eol);
-    }
-    // The closing fence's CR and the first body LF are separate characters.
-    if prefix.ends_with('\r') && body.starts_with('\n') {
-        prefix.push('\n');
-    }
-    prefix.push_str(body);
+    notarium_syntax::live::project_scanned_body(source, carrier, body)
 }
 
 /// Compute any missing `nota` view ID insertions on `body` with at most one

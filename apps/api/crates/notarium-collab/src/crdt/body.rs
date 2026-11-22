@@ -87,7 +87,7 @@ impl NibbleBuf {
         }
     }
 
-    fn from_str(text: &str) -> Self {
+    pub(super) fn from_str(text: &str) -> Self {
         let mut buf = Self::with_capacity(text.len());
         for unit in text.encode_utf16() {
             buf.push(UnitClass::from_utf16(unit));
@@ -99,7 +99,7 @@ impl NibbleBuf {
         self.len
     }
 
-    fn get(&self, idx: usize) -> UnitClass {
+    pub(super) fn get(&self, idx: usize) -> UnitClass {
         let byte = self.bytes[idx >> 1];
         let nibble = if idx & 1 == 0 { byte & 0x0f } else { byte >> 4 };
         UnitClass::from_nibble(nibble)
@@ -344,7 +344,7 @@ impl BodyIndex {
         block: Block<'_>,
         delete: Option<Removal>,
     ) -> Option<LocalEdit> {
-        let Content::String(text) = block.content else {
+        let Content::String { text, .. } = block.content else {
             return None;
         };
         let (mut left, right) = match block.parent {
@@ -356,12 +356,19 @@ impl BodyIndex {
             } => (left, right),
             _ => return None,
         };
-        if let Some(id) = left
+        let mut hops = 0usize;
+        while let Some(id) = left
             && self.unit_class(id).is_none()
         {
             // Yjs and Yrs skip deleted items before typing at a visible
-            // cursor. A recent deleted item can still identify the exact
-            // gap, provided its visible endpoints are still neighbors.
+            // cursor. Follow a bounded chain of consecutive deleted anchors
+            // (e.g. multiple backspaces before retyping) back to the visible
+            // left neighbor, requiring every hop to share the same `right`.
+            if hops >= 64 {
+                guard_work!(unproved_gaps += 1);
+                return None;
+            }
+            hops += 1;
             let anchors = self.deleted_anchors.get(&id);
             guard_work!(unproved_gaps += usize::from(anchors.is_none()));
             let (previous, next) = anchors?;

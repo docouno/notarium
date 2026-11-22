@@ -6,7 +6,7 @@ use std::{
     future::pending,
     sync::{
         Arc, Weak,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
@@ -49,6 +49,7 @@ pub(crate) enum JoinOutcome {
     Accepted,
     CapacityExceeded,
     Denied,
+    Unavailable,
     RoomClosing,
 }
 
@@ -92,10 +93,13 @@ pub(crate) struct RoomHandle {
     lease: Arc<RoomLease>,
     commands: mpsc::Sender<RoomCommand>,
     stopped: Cancellation,
+    settled: Arc<AtomicBool>,
     slug: watch::Receiver<String>,
     peers_changed: Arc<Notify>,
     storage_changed: Arc<Notify>,
     last_self_seq: Arc<AtomicU64>,
+    pending_note_seq: Arc<AtomicU64>,
+    pending_broad_change: Arc<AtomicBool>,
 }
 
 impl RoomHandle {
@@ -123,8 +127,8 @@ impl RoomHandle {
         &self.stopped
     }
 
-    pub fn last_self_seq(&self) -> u64 {
-        self.last_self_seq.load(Ordering::Acquire)
+    pub fn was_settled(&self) -> bool {
+        self.settled.load(Ordering::Acquire)
     }
 
     pub fn same_lease(&self, other: &Self) -> bool {
@@ -150,7 +154,27 @@ impl RoomHandle {
     }
 
     pub fn storage_changed(&self) {
+        self.pending_broad_change.store(true, Ordering::Release);
         self.storage_changed.notify_one();
+    }
+
+    /// Record a solo commit targeting only this room's note at `seq`.
+    /// If the commit came from this room's own settlement/command, the actor
+    /// updates `last_self_seq` before polling `storage_changed` and skips a
+    /// redundant `revalidate()` read without missing concurrent note commits.
+    pub fn note_solo_committed(&self, seq: u64) {
+        if self.last_self_seq.load(Ordering::Acquire) == seq {
+            return;
+        }
+        self.pending_note_seq.fetch_max(seq, Ordering::AcqRel);
+        self.storage_changed.notify_one();
+    }
+
+    fn take_needs_revalidate(&self) -> bool {
+        let broad = self.pending_broad_change.swap(false, Ordering::AcqRel);
+        let pending_seq = self.pending_note_seq.load(Ordering::Acquire);
+        let self_seq = self.last_self_seq.load(Ordering::Acquire);
+        broad || pending_seq > self_seq
     }
 
     /// Settle or close the room after revocation. Returns `Ok(false)` if the
@@ -211,10 +235,13 @@ impl RoomHandle {
             lease,
             commands,
             stopped: Cancellation::default(),
+            settled: Arc::new(AtomicBool::new(false)),
             slug,
             peers_changed: Arc::new(Notify::new()),
             storage_changed: Arc::new(Notify::new()),
             last_self_seq: Arc::new(AtomicU64::new(0)),
+            pending_note_seq: Arc::new(AtomicU64::new(0)),
+            pending_broad_change: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -265,6 +292,7 @@ pub(crate) struct Room {
 }
 
 impl Room {
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         hub: &Arc<HubInner>,
         slot: Arc<RoomSlot>,
@@ -273,6 +301,7 @@ impl Room {
         record: CollabSessionRecord,
         prepared: PreparedRoom,
         capacity: tokio::sync::OwnedSemaphorePermit,
+        space_capacity: crate::hub::SpaceRoomPermit,
     ) -> RoomHandle {
         let lease = Arc::new(RoomLease {
             scope,
@@ -288,13 +317,16 @@ impl Room {
             lease: lease.clone(),
             commands,
             stopped: Cancellation::default(),
+            settled: Arc::new(AtomicBool::new(false)),
             slug: file,
             peers_changed: Arc::new(Notify::new()),
             storage_changed: Arc::new(Notify::new()),
             last_self_seq: Arc::clone(&last_self_seq),
+            pending_note_seq: Arc::new(AtomicU64::new(0)),
+            pending_broad_change: Arc::new(AtomicBool::new(false)),
         };
         let dirty = record.carrier_dirty.then(Instant::now);
-        let mut room = Self {
+        let room = Self {
             store: hub.store.clone(),
             config: hub.config.clone(),
             hub: Arc::downgrade(hub),
@@ -315,31 +347,46 @@ impl Room {
         let shutdown = hub.shutdown_token();
         hub.room_started(&handle);
         tokio::spawn(async move {
-            // Keep the per-note slot alive for the duration of the actor. Drop
-            // it with the document and presence when the actor exits.
-            let _capacity = capacity;
-            let _slot = slot;
+            // Declare `stop` FIRST so Rust drops `room` (TwinDoc, BodyIndex,
+            // Topology, Presence) and releases `_slot`, `_space_capacity`, and
+            // `_capacity` strictly BEFORE `StopRoom::drop` publishes
+            // `room_stopped` and cancels `stopped`.
             let mut stop = StopRoom {
                 settled: false,
                 hub: room.hub.clone(),
                 handle: lifecycle.clone(),
             };
-            let result = room.run(receiver, &lifecycle, shutdown).await;
-            stop.settled = result.is_ok();
-            for peer in room.peers.values() {
-                if !peer.outbound.guard.stopped().is_cancelled() {
-                    peer.outbound.guard.close(SessionClose::POLICY);
+            let _capacity = capacity;
+            let _space_capacity = space_capacity;
+            let _slot = slot;
+            {
+                let mut room = room;
+                let result = room.run(receiver, &lifecycle, shutdown).await;
+                stop.settled = result.is_ok();
+                for peer in room.peers.values() {
+                    if !peer.outbound.guard.stopped().is_cancelled() {
+                        peer.outbound.guard.close(SessionClose::POLICY);
+                    }
                 }
-            }
-            if let Err(error) = result {
-                tracing::warn!(code = error.code(), "collaboration room stopped");
-                if !scope_has_changed(&error)
-                    && let Err(fence_error) = room.fence().await
-                {
+                if let Err(error) = result {
                     tracing::warn!(
-                        code = fence_error.code(),
-                        "collaboration lease fence failed"
+                        code = error.code(),
+                        space_id = %room.lease.scope.space_id,
+                        note_id = %room.lease.note,
+                        lease_epoch = room.lease.epoch.get(),
+                        "collaboration room stopped"
                     );
+                    if !scope_has_changed(&error)
+                        && let Err(fence_error) = room.fence().await
+                    {
+                        tracing::warn!(
+                            code = fence_error.code(),
+                            space_id = %room.lease.scope.space_id,
+                            note_id = %room.lease.note,
+                            lease_epoch = room.lease.epoch.get(),
+                            "collaboration lease fence failed"
+                        );
+                    }
                 }
             }
         });
@@ -432,7 +479,9 @@ impl Room {
                         return Ok(());
                     }
                     () = handle.storage_changed.notified() => {
-                        self.revalidate().await?;
+                        if handle.take_needs_revalidate() {
+                            self.revalidate().await?;
+                        }
                         continue;
                     }
                     () = handle.peers_changed.notified() => {
@@ -635,8 +684,21 @@ impl Room {
             return JoinOutcome::Denied;
         }
         ctx.budget.remaining = deadline.saturating_duration_since(Instant::now());
-        let Ok(facts) = self.refresh_metadata(&ctx.budget).await else {
-            return JoinOutcome::Denied;
+        let facts = match self.refresh_metadata(&ctx.budget).await {
+            Ok(facts) => facts,
+            Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
+                if matches!(
+                    diagnostic.reason,
+                    ValidationReason::InvalidState
+                        | ValidationReason::InvalidAuthority
+                        | ValidationReason::SourceMismatch
+                        | ValidationReason::HistoryIncarnationMismatch
+                ) =>
+            {
+                return JoinOutcome::RoomClosing;
+            }
+            Err(PortError::Domain(_)) => return JoinOutcome::Denied,
+            Err(_) => return JoinOutcome::Unavailable,
         };
         if Instant::now() >= deadline
             || !is_authorized(&ctx, role, &facts)
@@ -775,10 +837,7 @@ impl Room {
                     .await;
             }
         };
-        let mut bytes: usize = batch
-            .iter()
-            .map(|update| update.original.len() + update.staged.len())
-            .sum();
+        let mut bytes: usize = batch.iter().map(PendingUpdate::mem_bytes).sum();
         for message in messages {
             let Some(peer) = self.peers.get(&id) else {
                 break;
@@ -822,7 +881,7 @@ impl Room {
                         if batch.is_empty() {
                             bytes = 0;
                         }
-                        bytes += staged.original.len() + staged.staged.len();
+                        bytes += staged.mem_bytes();
                         batch.push(staged);
                     } else if batch.is_empty() {
                         bytes = 0;
@@ -842,7 +901,7 @@ impl Room {
                             .await;
                     };
                     if let Some(update) = self.presence.apply(id, update) {
-                        self.broadcast(encode_awareness(&update));
+                        self.broadcast_except(id, encode_awareness(&update));
                     }
                 }
                 InboundMessage::AwarenessQuery => {
@@ -959,12 +1018,13 @@ impl Room {
                         );
                     };
                     peer.write_seq = next;
+                    let staged_diff = (staged.bytes.as_slice() != original).then_some(staged.bytes);
                     return Ok(Some(PendingUpdate {
                         peer: id,
                         peer_seq: next,
                         auth: peer.ctx.auth().clone(),
                         original: original.to_vec(),
-                        staged: staged.bytes,
+                        staged: staged_diff,
                     }));
                 }
                 Err(reason) => {
@@ -989,10 +1049,7 @@ impl Room {
     }
 
     fn reset_staging(&mut self, prefix: &[PendingUpdate]) -> Result<(), PortError> {
-        let updates: Vec<_> = prefix
-            .iter()
-            .map(|update| update.staged.as_slice())
-            .collect();
+        let updates: Vec<_> = prefix.iter().map(PendingUpdate::staged_bytes).collect();
         self.twin.reset_staging(&updates).map_err(invalid_state)
     }
 
@@ -1046,7 +1103,10 @@ impl Room {
                         .send(ack.encode(), self.lease.authority(PeerRole::Editor));
                     continue;
                 }
-                Ok(staged) => update.staged = staged.bytes,
+                Ok(staged) => {
+                    update.staged = (staged.bytes.as_slice() != update.original.as_slice())
+                        .then_some(staged.bytes);
+                }
                 Err(reason) => {
                     peer.outbound.finish(
                         encode_policy_rejected(reason),
@@ -1085,7 +1145,7 @@ impl Room {
             .enumerate()
             .map(|(index, write)| RoomWalEntry {
                 update_seq: self.last_seq + index as u64 + 1,
-                update_bytes: write.staged.clone(),
+                update_bytes: write.staged_bytes().to_vec(),
                 auth: write.auth.clone(),
             })
             .collect())
@@ -1102,12 +1162,13 @@ impl Room {
         let mut current = Vec::new();
         let mut acknowledgments: HashMap<u64, Vec<u8>> = HashMap::new();
         for (index, write) in writes.iter().enumerate() {
-            self.twin.publish(&write.staged).map_err(invalid_state)?;
-            let encoded_len = write.staged.len().saturating_add(12);
+            let staged_bytes = write.staged_bytes();
+            self.twin.publish(staged_bytes).map_err(invalid_state)?;
+            let encoded_len = staged_bytes.len().saturating_add(12);
             if !current.is_empty() && current.len().saturating_add(encoded_len) > MAX_FRAME_BYTES {
                 chunks.push(Arc::new(std::mem::take(&mut current)));
             }
-            encode_update_into(&mut current, &write.staged);
+            encode_update_into(&mut current, staged_bytes);
             let ack = ServerAckWatermark {
                 lease_epoch: self.lease.epoch,
                 peer_write_seq: write.peer_seq,
@@ -1182,6 +1243,18 @@ impl Room {
                 .send(data.clone(), self.lease.authority(peer.role));
         }
     }
+
+    fn broadcast_except(&self, exclude_peer: u64, data: Vec<u8>) {
+        let data = Arc::new(data);
+        for (&peer_id, peer) in &self.peers {
+            if peer_id == exclude_peer {
+                continue;
+            }
+            let _ = peer
+                .outbound
+                .send(data.clone(), self.lease.authority(peer.role));
+        }
+    }
 }
 
 struct StopRoom {
@@ -1192,6 +1265,7 @@ struct StopRoom {
 
 impl Drop for StopRoom {
     fn drop(&mut self) {
+        self.handle.settled.store(self.settled, Ordering::Release);
         if let Some(hub) = self.hub.upgrade() {
             hub.room_stopped(&self.handle, self.settled);
         }

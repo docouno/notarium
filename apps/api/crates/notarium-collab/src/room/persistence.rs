@@ -3,7 +3,7 @@ use std::sync::{Arc, atomic::Ordering};
 use notarium_canonical::{
     AppendCollabUpdates, CanonicalStore, CheckpointCollabSession, CloseCollabSession,
     CollabCarrierSettlement, CollabSessionRecord, CollabSessionSnapshot, CollabSettlementActor,
-    FenceCollabSession, NoteCollabAdmission,
+    FenceCollabSession, NoteCollabAdmissionMeta,
 };
 use notarium_core::{
     DomainError,
@@ -32,11 +32,14 @@ pub(crate) struct PreparedRoom {
 }
 
 impl Room {
-    pub fn prepare(admission: &NoteCollabAdmission) -> Result<PreparedRoom, PortError> {
+    pub fn prepare_from_meta(
+        admission: &NoteCollabAdmissionMeta,
+        carrier: &str,
+    ) -> Result<PreparedRoom, PortError> {
         let (mut carrier, base_body) = RoomCarrierState::from_carrier(
             admission.head_rev_id.clone(),
-            digest(&admission.carrier),
-            &admission.carrier,
+            admission.carrier_digest,
+            carrier,
         )?;
         let twin = restore(&mut carrier, base_body, admission.session.as_ref())?;
         Ok(PreparedRoom { twin, carrier })
@@ -68,7 +71,31 @@ impl Room {
     }
 
     pub async fn close(&mut self, budget: &CallBudget) -> Result<(), PortError> {
+        if self.first_dirty.is_none() {
+            return self.close_clean(budget).await;
+        }
         self.settle(budget, true).await
+    }
+
+    async fn close_clean(&mut self, budget: &CallBudget) -> Result<(), PortError> {
+        self.store
+            .close_collab_session(
+                budget,
+                CloseCollabSession {
+                    scope: self.lease.scope.clone(),
+                    note: self.lease.note.clone(),
+                    owner_id: Some(self.lease.owner.to_string()),
+                    expected_lease: self.lease.epoch,
+                    expected_lineage: self.lease.lineage,
+                    final_yrs_snapshot: None,
+                    compacted_through_update_seq: None,
+                    carrier_settlement: None,
+                    unchanged_carrier_digest: None,
+                },
+            )
+            .await?;
+        self.settled();
+        Ok(())
     }
 
     async fn settle(&mut self, budget: &CallBudget, close: bool) -> Result<(), PortError> {
@@ -78,16 +105,15 @@ impl Room {
         let fm = self.twin.live_overrides().map_err(invalid_state)?;
         let body = self.twin.live_body();
         let final_carrier = self.carrier.materialize(&body, &fm)?;
+        drop(body);
         let final_digest = digest(&final_carrier);
         let same = final_digest == self.carrier.carrier_blob_blake3;
-        let mut snapshot = Some(self.twin.live_snapshot());
 
         let mut last_err = None;
         for attempt in 0..SETTLE_CONFLICT_RETRIES {
             self.refresh_metadata(budget).await?;
             let can_fallback_actor = !same && self.carrier.last_writer_auth.is_some();
             let may_retry_conflict = attempt + 1 < SETTLE_CONFLICT_RETRIES;
-            let keep_snapshot = can_fallback_actor || may_retry_conflict;
             let actor = self
                 .carrier
                 .last_writer_auth
@@ -97,11 +123,7 @@ impl Room {
                 actor,
                 carrier: final_carrier.clone(),
             });
-            let snap_for_call = if keep_snapshot {
-                snapshot.as_ref().expect("retained snapshot").clone()
-            } else {
-                snapshot.take().expect("retained snapshot")
-            };
+            let snap_for_call = self.twin.live_snapshot();
             let applied = self
                 .commit_checkpoint(budget, close, snap_for_call, same, settlement)
                 .await;
@@ -113,11 +135,7 @@ impl Room {
                         actor: recovery(),
                         carrier: final_carrier.clone(),
                     });
-                    let fallback_snap = if may_retry_conflict {
-                        snapshot.as_ref().expect("retained snapshot").clone()
-                    } else {
-                        snapshot.take().expect("retained snapshot")
-                    };
+                    let fallback_snap = self.twin.live_snapshot();
                     self.commit_checkpoint(budget, close, fallback_snap, false, fallback)
                         .await
                 }
@@ -454,5 +472,16 @@ pub(super) struct PendingUpdate {
     pub peer_seq: u64,
     pub auth: EngineAuthContext,
     pub original: Vec<u8>,
-    pub staged: Vec<u8>,
+    /// `None` when the staged bytes are identical to `original` (common fast path).
+    pub staged: Option<Vec<u8>>,
+}
+
+impl PendingUpdate {
+    pub fn staged_bytes(&self) -> &[u8] {
+        self.staged.as_deref().unwrap_or(&self.original)
+    }
+
+    pub fn mem_bytes(&self) -> usize {
+        self.original.len() + self.staged.as_ref().map_or(0, Vec::len)
+    }
 }

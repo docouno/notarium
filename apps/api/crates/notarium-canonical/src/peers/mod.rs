@@ -3,7 +3,9 @@ mod fence;
 mod wal;
 
 pub(crate) use admission::list_fenced_collab_leases_tx;
-pub use admission::{ActiveRoomFacts, FencedCollabRecovery, NoteCollabAdmission};
+pub use admission::{
+    ActiveRoomFacts, FencedCollabRecovery, NoteCollabAdmission, NoteCollabAdmissionMeta,
+};
 use fence::RoomTransition;
 use std::{
     collections::{BTreeSet, VecDeque},
@@ -3321,43 +3323,48 @@ async fn checkpoint_collab_snapshot_impl(
                 )
                 .await?;
 
-                match tx {
-                    BackendConn::Sqlite(conn) => {
-                        sqlx::query(
-                            "UPDATE collab_sessions
-                             SET yrs_snapshot_blob = ?, yrs_snapshot_blake3 = ?
-                             WHERE space_id = ? AND note_id = ? AND lease_epoch = ?",
-                        )
-                        .bind(&spec.yrs_snapshot)
-                        .bind(yrs_digest.as_bytes().as_slice())
-                        .bind(srec.scope.space_id.as_str())
-                        .bind(spec.note.as_str())
-                        .bind(spec.expected_lease.get() as i64)
-                        .execute(&mut **conn)
-                        .await
-                        .map_err(|err| {
-                            internal_not_committed("sqlite_ckpt_collab", err.to_string())
-                        })?;
+                let snapshot_changed = cur.yrs_snapshot_digest != Some(yrs_digest);
+                if snapshot_changed {
+                    match tx {
+                        BackendConn::Sqlite(conn) => {
+                            sqlx::query(
+                                "UPDATE collab_sessions
+                                 SET yrs_snapshot_blob = ?, yrs_snapshot_blake3 = ?
+                                 WHERE space_id = ? AND note_id = ? AND lease_epoch = ?",
+                            )
+                            .bind(&spec.yrs_snapshot)
+                            .bind(yrs_digest.as_bytes().as_slice())
+                            .bind(srec.scope.space_id.as_str())
+                            .bind(spec.note.as_str())
+                            .bind(spec.expected_lease.get() as i64)
+                            .execute(&mut **conn)
+                            .await
+                            .map_err(|err| {
+                                internal_not_committed("sqlite_ckpt_collab", err.to_string())
+                            })?;
+                        }
+                        BackendConn::Postgres(conn) => {
+                            sqlx::query(
+                                "UPDATE collab_sessions
+                                 SET yrs_snapshot_blob = $1, yrs_snapshot_blake3 = $2
+                                 WHERE space_id = $3 AND note_id = $4 AND lease_epoch = $5",
+                            )
+                            .bind(&spec.yrs_snapshot)
+                            .bind(yrs_digest.as_bytes().as_slice())
+                            .bind(srec.scope.space_id.as_str())
+                            .bind(spec.note.as_str())
+                            .bind(spec.expected_lease.get() as i64)
+                            .execute(&mut **conn)
+                            .await
+                            .map_err(|err| {
+                                internal_not_committed("pg_ckpt_collab", err.to_string())
+                            })?;
+                        }
                     }
-                    BackendConn::Postgres(conn) => {
-                        sqlx::query(
-                            "UPDATE collab_sessions
-                             SET yrs_snapshot_blob = $1, yrs_snapshot_blake3 = $2
-                             WHERE space_id = $3 AND note_id = $4 AND lease_epoch = $5",
-                        )
-                        .bind(&spec.yrs_snapshot)
-                        .bind(yrs_digest.as_bytes().as_slice())
-                        .bind(srec.scope.space_id.as_str())
-                        .bind(spec.note.as_str())
-                        .bind(spec.expected_lease.get() as i64)
-                        .execute(&mut **conn)
-                        .await
-                        .map_err(|err| internal_not_committed("pg_ckpt_collab", err.to_string()))?;
-                    }
-                }
 
-                cur.yrs_snapshot_blob = Some(spec.yrs_snapshot);
-                cur.yrs_snapshot_digest = Some(yrs_digest);
+                    cur.yrs_snapshot_blob = Some(spec.yrs_snapshot);
+                    cur.yrs_snapshot_digest = Some(yrs_digest);
+                }
                 Ok(cur)
             })
         })
@@ -3455,17 +3462,18 @@ async fn close_collab_snapshot_impl(
                 )
                 .await?;
                 let new_lease = cur.lease_epoch.max(fence_guard.epoch()).checked_next()?;
-                let (yrs_blob, yrs_digest) = match spec_cl.final_yrs_snapshot {
+                let (yrs_blob, yrs_digest, snapshot_changed) = match spec_cl.final_yrs_snapshot {
                     Some(bytes) => {
                         let d = ContentDigest::from_bytes(*blake3::hash(&bytes).as_bytes());
-                        (Some(bytes), Some(d))
+                        let changed = cur.yrs_snapshot_digest != Some(d);
+                        (Some(bytes), Some(d), changed)
                     }
-                    None => (cur.yrs_snapshot_blob, cur.yrs_snapshot_digest),
+                    None => (cur.yrs_snapshot_blob, cur.yrs_snapshot_digest, false),
                 };
                 let digest_slice = yrs_digest.as_ref().map(|d| d.as_bytes().as_slice());
 
-                match tx {
-                    BackendConn::Sqlite(conn) => {
+                match (tx, snapshot_changed) {
+                    (BackendConn::Sqlite(conn), true) => {
                         sqlx::query(
                             "UPDATE collab_sessions
                              SET room_state = 'closed',
@@ -3486,7 +3494,24 @@ async fn close_collab_snapshot_impl(
                             internal_not_committed("sqlite_close_collab", err.to_string())
                         })?;
                     }
-                    BackendConn::Postgres(conn) => {
+                    (BackendConn::Sqlite(conn), false) => {
+                        sqlx::query(
+                            "UPDATE collab_sessions
+                             SET room_state = 'closed',
+                                 owner_id = NULL,
+                                 lease_epoch = ?
+                             WHERE space_id = ? AND note_id = ?",
+                        )
+                        .bind(new_lease.get() as i64)
+                        .bind(srec.scope.space_id.as_str())
+                        .bind(spec_cl.note.as_str())
+                        .execute(&mut **conn)
+                        .await
+                        .map_err(|err| {
+                            internal_not_committed("sqlite_close_collab", err.to_string())
+                        })?;
+                    }
+                    (BackendConn::Postgres(conn), true) => {
                         sqlx::query(
                             "UPDATE collab_sessions
                              SET room_state = 'closed',
@@ -3499,6 +3524,23 @@ async fn close_collab_snapshot_impl(
                         .bind(new_lease.get() as i64)
                         .bind(yrs_blob.as_deref())
                         .bind(digest_slice)
+                        .bind(srec.scope.space_id.as_str())
+                        .bind(spec_cl.note.as_str())
+                        .execute(&mut **conn)
+                        .await
+                        .map_err(|err| {
+                            internal_not_committed("pg_close_collab", err.to_string())
+                        })?;
+                    }
+                    (BackendConn::Postgres(conn), false) => {
+                        sqlx::query(
+                            "UPDATE collab_sessions
+                             SET room_state = 'closed',
+                                 owner_id = NULL,
+                                 lease_epoch = $1
+                             WHERE space_id = $2 AND note_id = $3",
+                        )
+                        .bind(new_lease.get() as i64)
                         .bind(srec.scope.space_id.as_str())
                         .bind(spec_cl.note.as_str())
                         .execute(&mut **conn)
@@ -3809,13 +3851,15 @@ async fn settle_and_update_collab_session(
                     return Err(DomainError::ResourceNotFound.into());
                 }
 
+                let require_active_folders =
+                    !matches!(settlement.actor, CollabSettlementActor::Recovery { .. });
                 let (facts, anc) = build_resource_facts_tx(
                     tx,
                     &item_ctx.space,
                     &head.parent_folder_id,
                     head.doc_class,
                     head.ability_id.clone(),
-                    true,
+                    require_active_folders,
                 )
                 .await?;
                 settlement.actor.authorize_resource(&facts)?;
@@ -4118,13 +4162,15 @@ impl RoomCarrierTransition {
                     {
                         return Err(DomainError::ResourceNotFound.into());
                     }
+                    let require_active_folders =
+                        !matches!(actor, CollabSettlementActor::Recovery { .. });
                     let (facts, _) = build_resource_facts_tx(
                         tx,
                         &srec.space,
                         &head.parent_folder_id,
                         head.doc_class,
                         head.ability_id.clone(),
-                        true,
+                        require_active_folders,
                     )
                     .await?;
                     actor.authorize_resource(&facts)?;

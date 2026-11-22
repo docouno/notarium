@@ -40,6 +40,20 @@ pub struct NoteCollabAdmission {
     pub verified_base_rev_id: Option<RevisionId>,
 }
 
+/// Authorized collaboration admission metadata read at a single SQL cut without
+/// fetching the carrier blob from CAS/S3.
+#[derive(Debug)]
+pub struct NoteCollabAdmissionMeta {
+    pub scope: HistoryScope,
+    pub head_rev_id: RevisionId,
+    pub doc_class: DocClass,
+    pub slug: String,
+    pub can_write: bool,
+    pub carrier_digest: ContentDigest,
+    pub session: Option<CollabSessionSnapshot>,
+    pub verified_base_rev_id: Option<RevisionId>,
+}
+
 /// Current note metadata and policy facts under an exact active room lease.
 #[derive(Debug)]
 pub struct ActiveRoomFacts {
@@ -135,7 +149,7 @@ ORDER BY a.depth ASC"
 const ROOM_FACTS_CTE_SQLITE: &str = room_facts_cte!("?1", "?2");
 const ROOM_FACTS_CTE_PG: &str = room_facts_cte!("$1", "$2");
 
-struct RawRoomFactsRow {
+pub(super) struct RawRoomFactsRow {
     incarnation: Vec<u8>,
     space_kind: String,
     space_lifecycle: String,
@@ -157,13 +171,13 @@ struct RawRoomFactsRow {
     write_lock_json: Option<String>,
 }
 
-struct ActiveRoomExpectation<'a> {
+pub(super) struct ActiveRoomExpectation<'a> {
     lease: LeaseEpoch,
     lineage: LineageEpoch,
     owner: &'a str,
 }
 
-fn decode_room_facts_rows(
+pub(super) fn decode_room_facts_rows(
     scope: &HistoryScope,
     rows: Vec<RawRoomFactsRow>,
     expected_room: Option<ActiveRoomExpectation<'_>>,
@@ -409,7 +423,7 @@ fn query_room_facts_rusqlite(
     Ok(out)
 }
 
-async fn query_room_facts_pg(
+pub(super) async fn query_room_facts_pg(
     conn: &mut sqlx::PgConnection,
     space_id: &SpaceId,
     note: &NoteId,
@@ -420,30 +434,67 @@ async fn query_room_facts_pg(
         .fetch_all(&mut *conn)
         .await
         .map_err(|err| pg_read_error("pg_room_facts", err))?;
-    Ok(rows
-        .into_iter()
-        .map(|r| RawRoomFactsRow {
-            incarnation: r.get("history_incarnation"),
-            space_kind: r.get("space_kind"),
-            space_lifecycle: r.get("space_lifecycle"),
-            slug: r.get("slug"),
-            doc_class: r.get("doc_class"),
-            ability_id: r.get("ability_id"),
-            head_rev_id: r.get("head_rev_id"),
-            content_blake3: r.get("content_blake3"),
-            note_lifecycle: r.get("note_lifecycle"),
-            purge_fenced: r.get("purge_fenced"),
-            lease_epoch: r.get("lease_epoch"),
-            lineage_epoch: r.get("lineage_epoch"),
-            room_state: r.get("room_state"),
-            room_owner: r.get("room_owner"),
-            depth: r.get("depth"),
-            folder_id: r.get("folder_id"),
-            is_root: r.get("is_root"),
-            folder_lifecycle: r.get("folder_lifecycle"),
-            write_lock_json: r.get("write_lock_json"),
+    rows.into_iter()
+        .map(|r| {
+            let map_col =
+                |col: &'static str, err: sqlx::Error| internal_not_committed(col, err.to_string());
+            Ok(RawRoomFactsRow {
+                incarnation: r
+                    .try_get("history_incarnation")
+                    .map_err(|e| map_col("pg_rf_incarnation", e))?,
+                space_kind: r
+                    .try_get("space_kind")
+                    .map_err(|e| map_col("pg_rf_space_kind", e))?,
+                space_lifecycle: r
+                    .try_get("space_lifecycle")
+                    .map_err(|e| map_col("pg_rf_space_lifecycle", e))?,
+                slug: r.try_get("slug").map_err(|e| map_col("pg_rf_slug", e))?,
+                doc_class: r
+                    .try_get("doc_class")
+                    .map_err(|e| map_col("pg_rf_doc_class", e))?,
+                ability_id: r
+                    .try_get("ability_id")
+                    .map_err(|e| map_col("pg_rf_ability_id", e))?,
+                head_rev_id: r
+                    .try_get("head_rev_id")
+                    .map_err(|e| map_col("pg_rf_head_rev_id", e))?,
+                content_blake3: r
+                    .try_get("content_blake3")
+                    .map_err(|e| map_col("pg_rf_content_blake3", e))?,
+                note_lifecycle: r
+                    .try_get("note_lifecycle")
+                    .map_err(|e| map_col("pg_rf_note_lifecycle", e))?,
+                purge_fenced: r
+                    .try_get("purge_fenced")
+                    .map_err(|e| map_col("pg_rf_purge_fenced", e))?,
+                lease_epoch: r
+                    .try_get("lease_epoch")
+                    .map_err(|e| map_col("pg_rf_lease_epoch", e))?,
+                lineage_epoch: r
+                    .try_get("lineage_epoch")
+                    .map_err(|e| map_col("pg_rf_lineage_epoch", e))?,
+                room_state: r
+                    .try_get("room_state")
+                    .map_err(|e| map_col("pg_rf_room_state", e))?,
+                room_owner: r
+                    .try_get("room_owner")
+                    .map_err(|e| map_col("pg_rf_room_owner", e))?,
+                depth: r.try_get("depth").map_err(|e| map_col("pg_rf_depth", e))?,
+                folder_id: r
+                    .try_get("folder_id")
+                    .map_err(|e| map_col("pg_rf_folder_id", e))?,
+                is_root: r
+                    .try_get("is_root")
+                    .map_err(|e| map_col("pg_rf_is_root", e))?,
+                folder_lifecycle: r
+                    .try_get("folder_lifecycle")
+                    .map_err(|e| map_col("pg_rf_folder_lifecycle", e))?,
+                write_lock_json: r
+                    .try_get("write_lock_json")
+                    .map_err(|e| map_col("pg_rf_write_lock_json", e))?,
+            })
         })
-        .collect())
+        .collect()
 }
 
 impl CanonicalStore {
@@ -456,6 +507,33 @@ impl CanonicalStore {
         verify_base_rev: Option<&RevisionId>,
     ) -> Result<NoteCollabAdmission, PortError> {
         read_note_collab_admission(self, ctx, note, verify_base_rev).await
+    }
+
+    /// Reads note collaboration admission metadata without loading the carrier
+    /// blob from CAS/S3. Call `load_collab_carrier` only when the carrier is
+    /// actually needed (e.g. cold room open after checking lineage/fenced state).
+    pub async fn read_note_collab_admission_meta(
+        &self,
+        ctx: &SpaceContext,
+        note: &NoteId,
+        verify_base_rev: Option<&RevisionId>,
+    ) -> Result<NoteCollabAdmissionMeta, PortError> {
+        read_note_collab_admission_meta(self, ctx, note, verify_base_rev).await
+    }
+
+    /// Loads and UTF-8-decodes a verified collaboration carrier blob by digest.
+    pub async fn load_collab_carrier(
+        &self,
+        scope: &HistoryScope,
+        digest: ContentDigest,
+        budget: Option<&CallBudget>,
+    ) -> Result<String, PortError> {
+        let bytes = self
+            .read_verified_blob_with_budget(scope, digest, budget)
+            .await?;
+        String::from_utf8(bytes).map_err(|err| {
+            internal_not_committed("collab_carrier_utf8", err.utf8_error().to_string())
+        })
     }
 
     /// Reads the current history identifier for a trusted composition caller.
@@ -534,19 +612,9 @@ impl CanonicalStore {
         }
         let scope = scope.clone();
         let note = note.clone();
-        self.with_read_tx_budget(budget, |tx| {
+        self.with_pg_single_read_stmt(budget, |conn| {
             Box::pin(async move {
-                let rows = match tx {
-                    BackendConn::Postgres(conn) => {
-                        query_room_facts_pg(conn, &scope.space_id, &note).await?
-                    }
-                    BackendConn::Sqlite(_) => {
-                        return Err(internal_not_committed(
-                            "unexpected_sqlite_in_pg_room_facts",
-                            "SQLite backend must route via fast_read_pool",
-                        ));
-                    }
-                };
+                let rows = query_room_facts_pg(conn, &scope.space_id, &note).await?;
                 let expectation =
                     expected
                         .as_ref()
@@ -698,7 +766,7 @@ impl CanonicalStore {
                 Box::pin(async move {
                     let srec = load_space_record(tx, &scope_cl.space_id).await?;
                     srec.scope.check(&scope_cl)?;
-                    let (head, _) = load_room_note_facts_tx(tx, &srec.space, &note).await?;
+                    let (head, _) = load_room_note_facts_tx(tx, &srec.space, &note, false).await?;
                     if head.doc_class != DocClass::UserDoc {
                         return Err(DomainError::ResourceNotFound.into());
                     }
@@ -747,13 +815,14 @@ pub(super) async fn load_room_note_facts_tx(
     tx: &mut BackendConn<'_>,
     space: &Space,
     note: &NoteId,
+    require_active_folders: bool,
 ) -> Result<(NoteHeadRow, ResourceFacts), PortError> {
     if space.lifecycle != SpaceLifecycle::Active
         || is_note_purge_fenced_tx(tx, &space.id, note.as_str()).await?
     {
         return Err(DomainError::ResourceNotFound.into());
     }
-    load_room_note_facts_after_purge_tx(tx, space, note).await
+    load_room_note_facts_after_purge_tx(tx, space, note, require_active_folders).await
 }
 
 /// Loads active note head and folder ancestry when purge fence has already been
@@ -762,6 +831,7 @@ pub(super) async fn load_room_note_facts_after_purge_tx(
     tx: &mut BackendConn<'_>,
     space: &Space,
     note: &NoteId,
+    require_active_folders: bool,
 ) -> Result<(NoteHeadRow, ResourceFacts), PortError> {
     if space.lifecycle != SpaceLifecycle::Active {
         return Err(DomainError::ResourceNotFound.into());
@@ -776,19 +846,18 @@ pub(super) async fn load_room_note_facts_after_purge_tx(
         &head.parent_folder_id,
         head.doc_class,
         head.ability_id.clone(),
-        true,
+        require_active_folders,
     )
     .await?;
     Ok((head, facts))
 }
 
-async fn read_note_collab_admission(
+async fn read_note_collab_admission_meta(
     store: &CanonicalStore,
     ctx: &SpaceContext,
     note: &NoteId,
     verify_base_rev: Option<&RevisionId>,
-) -> Result<NoteCollabAdmission, PortError> {
-    let deadline = CommandDeadline::start(&ctx.budget, "collab_admission");
+) -> Result<NoteCollabAdmissionMeta, PortError> {
     let scope = ctx.scope().clone();
     let auth = ctx.auth().clone();
     let note = note.clone();
@@ -798,7 +867,7 @@ async fn read_note_collab_admission(
             Box::pin(async move {
                 let srec = load_space_record(tx, &scope.space_id).await?;
                 srec.scope.check(&scope)?;
-                let (head, facts) = load_room_note_facts_tx(tx, &srec.space, &note).await?;
+                let (head, facts) = load_room_note_facts_tx(tx, &srec.space, &note, true).await?;
                 auth.authorize_read(&facts)?;
                 if head.doc_class != DocClass::UserDoc {
                     return Err(DomainError::validation(ValidationReason::ClassMismatch).into());
@@ -818,24 +887,41 @@ async fn read_note_collab_admission(
             })
         })
         .await?;
-    let digest = note_carrier_digest(&head)?;
-    let mut blob_budget = ctx.budget.clone();
-    blob_budget.remaining = deadline.remaining(&ctx.budget)?;
-    let bytes = store
-        .read_verified_blob_with_budget(ctx.scope(), digest, Some(&blob_budget))
-        .await?;
-    let carrier = String::from_utf8(bytes).map_err(|err| {
-        internal_not_committed("collab_carrier_utf8", err.utf8_error().to_string())
-    })?;
-    Ok(NoteCollabAdmission {
+    let carrier_digest = note_carrier_digest(&head)?;
+    Ok(NoteCollabAdmissionMeta {
         scope: ctx.scope().clone(),
         head_rev_id: head.head_rev_id,
         doc_class: head.doc_class,
         slug: head.slug,
         can_write,
-        carrier,
+        carrier_digest,
         session,
         verified_base_rev_id,
+    })
+}
+
+async fn read_note_collab_admission(
+    store: &CanonicalStore,
+    ctx: &SpaceContext,
+    note: &NoteId,
+    verify_base_rev: Option<&RevisionId>,
+) -> Result<NoteCollabAdmission, PortError> {
+    let deadline = CommandDeadline::start(&ctx.budget, "collab_admission");
+    let meta = read_note_collab_admission_meta(store, ctx, note, verify_base_rev).await?;
+    let mut blob_budget = ctx.budget.clone();
+    blob_budget.remaining = deadline.remaining(&ctx.budget)?;
+    let carrier = store
+        .load_collab_carrier(&meta.scope, meta.carrier_digest, Some(&blob_budget))
+        .await?;
+    Ok(NoteCollabAdmission {
+        scope: meta.scope,
+        head_rev_id: meta.head_rev_id,
+        doc_class: meta.doc_class,
+        slug: meta.slug,
+        can_write: meta.can_write,
+        carrier,
+        session: meta.session,
+        verified_base_rev_id: meta.verified_base_rev_id,
     })
 }
 
@@ -846,12 +932,14 @@ async fn collab_base_revision_exists_tx(
     base: &RevisionId,
 ) -> Result<bool, PortError> {
     const SQL: &str = "SELECT EXISTS(SELECT 1 FROM revisions
-        WHERE space_id = $1 AND rev_id = $2 AND entity_type = 'note' AND entity_key = $3)";
+        WHERE space_id = $1 AND rev_id = $2 AND entity_type = 'note' AND entity_key = $3
+          AND history_incarnation = $4)";
     match tx {
         BackendConn::Sqlite(conn) => sqlx::query_scalar(SQL)
             .bind(scope.space_id.as_str())
             .bind(base.as_str())
             .bind(note.as_str())
+            .bind(scope.incarnation.as_bytes().as_slice())
             .fetch_one(&mut **conn)
             .await
             .map_err(|err| internal_not_committed("collab_verify_base_revision", err.to_string())),
@@ -859,6 +947,7 @@ async fn collab_base_revision_exists_tx(
             .bind(scope.space_id.as_str())
             .bind(base.as_str())
             .bind(note.as_str())
+            .bind(scope.incarnation.as_bytes().as_slice())
             .fetch_one(&mut **conn)
             .await
             .map_err(|err| pg_read_error("pg_collab_verify_base_revision", err)),

@@ -1,17 +1,21 @@
+#![forbid(unsafe_code)]
+
 mod support;
 
 use std::{
     collections::BTreeMap,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, atomic::Ordering},
     time::Duration,
 };
 
 use notarium_canonical::{
-    CanonicalConfig, CanonicalRuntime, CreateFolderSpec, FenceCollabSession, OpenCollabSession,
+    CanonicalConfig, CanonicalRuntime, CollabRoomState, CommittedTargets, CreateFolderSpec,
+    FenceCollabSession, OpenCollabSession, S3BucketModePolicy, SpaceSignal,
+    blobs::s3::admin_ensure_bucket,
 };
 use notarium_collab::{
     CollabConfig, CollabHub, CollabSessionAuth, SessionEvent,
-    wire::{self, LineageHello},
+    wire::{self, LineageHello, PolicyRejectReason},
 };
 use notarium_core::{
     DomainError,
@@ -19,23 +23,26 @@ use notarium_core::{
     classes::DocClass,
     error::{CommitEffect, PortError, ValidationReason},
     ids::*,
-    model::HistoryScope,
+    model::{HistoryScope, Lifecycle},
     patch::{BodyPatchPlan, CarrierEditOrigin, HeaderMutation},
     ports::{
-        BackupParticipantPort, Cancellation, InterceptedMutation, InterceptedPayload,
+        BackupParticipantPort, Cancellation, ChatPort, ChatThreadKind, CreateChat, CreateNote,
+        ExternalObservation, ExternalObservationResult, InterceptedMutation, InterceptedPayload,
         InterceptionResult, LiveCollabInterceptor, MaintenanceContext, MoveFolder, MoveNote,
-        NoteWritePort, PortFuture, Preconditions, RenameNote, RevocationLease, RevocationReason,
-        RevocationSelector, ServicePurpose, SessionRevocationPort, SpaceContext,
+        NoteWritePort, ObservedContent, PortFuture, Preconditions, RenameNote, RevocationLease,
+        RevocationReason, RevocationSelector, ServicePurpose, SessionRevocationPort, SpaceContext,
     },
-    receipt::ChangeCursor,
+    receipt::{ChangeCursor, CommandIdentity},
 };
-use notarium_syntax::carrier::Carrier;
+use notarium_syntax::{carrier::Carrier, content_digest};
+use sqlx::Connection;
 use support::*;
 use tokio::time::timeout;
 use yrs::{
-    Map, ReadTxn, Text, Transact,
+    Any, ClientID, Map, ReadTxn, Text, Transact,
     encoding::write::Write,
-    sync::{Message, SyncMessage},
+    sync::{AwarenessUpdate, Message, SyncMessage, awareness::AwarenessUpdateEntry},
+    updates::encoder::Encode,
 };
 
 async fn open_sqlite_env(
@@ -158,8 +165,8 @@ async fn empty_updates_do_not_write_wal_and_viewer_colliding_sv_is_bounded() {
 #[tokio::test]
 async fn intercept_racing_idle_unload_falls_back_cleanly_without_unknown() {
     let mut cfg = CollabConfig::default();
-    cfg.idle_checkpoint = Duration::from_millis(20);
-    cfg.idle_unload = Duration::from_millis(25);
+    cfg.idle_checkpoint = Duration::from_millis(40);
+    cfg.idle_unload = Duration::from_millis(50);
     let (_root, store, runtime, hub, owner) = open_sqlite_env("intercept-unload", cfg).await;
     let mut text = "Base line.\n".to_owned();
     let seed = create_note(&store, &owner, 2, &text, None).await;
@@ -180,8 +187,8 @@ async fn intercept_racing_idle_unload_falls_back_cleanly_without_unknown() {
         };
         let _step1 = recv(&mut peer_sess).await;
         drop(peer_sess);
-        // Sleep close to the idle_unload timer so intercept races room shutdown.
-        tokio::time::sleep(Duration::from_millis(20 + (i % 8))).await;
+        // Sweep across the 50ms idle_unload boundary so intercept races room shutdown.
+        tokio::time::sleep(Duration::from_millis(35 + (i % 6) * 5)).await;
         let addition = format!("edit-{i}\n");
         let cmd = edit(
             &owner,
@@ -1182,8 +1189,7 @@ async fn duplicate_edit_over_revoked_prefix_is_restaged_and_persisted() {
     let (entered, release) = pause_wal_admission(&store);
     let del_a = peer_a.update(|txn| peer_a.body.remove_range(txn, 6, 5));
     let del_b = peer_b.update(|txn| peer_b.body.remove_range(txn, 6, 5));
-    peer_a.send_update(&del_a).await;
-    peer_b.send_update(&del_b).await;
+    tokio::join!(peer_a.send_update(&del_a), peer_b.send_update(&del_b));
     timeout(WAIT, entered).await.unwrap().unwrap();
 
     // Move the parent folder `branch` out of `folder_a` while `flush_batch([del_a])`
@@ -1334,4 +1340,1312 @@ async fn room_error_exit_drains_buffered_intercept_and_shutdown_reports_stop_tim
     );
     drop((c2, hub));
     runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn search_indexing_principal_rejected_and_local_capacity_caps_enforced() {
+    let mut cfg = fast_config();
+    cfg.max_total_peers = 3;
+    cfg.max_rooms_per_space = 2;
+    let (_root, store, runtime, hub, owner) = open_sqlite_env("search-and-caps", cfg).await;
+
+    let n1 = create_note(&store, &owner, 101, "One.\n", None).await;
+    let n2 = create_note(&store, &owner, 102, "Two.\n", None).await;
+    let n3 = create_note(&store, &owner, 103, "Three.\n", None).await;
+
+    // SearchIndexing internal principal must be rejected at hub.connect().
+    let search_auth = EngineAuthContext::for_search_indexing(
+        PrincipalId::from_bytes([91; 16]),
+        GrantId::from_bytes([92; 16]),
+        owner.scope().space_id.clone(),
+        ProviderResourceId::from_bytes([93; 16]),
+    );
+    let search_ctx = SpaceContext::new(search_auth, owner.scope().clone(), budget()).unwrap();
+    let denied = hub
+        .connect(
+            search_ctx,
+            n1.note.clone(),
+            test_auth(&Cancellation::default(), None),
+        )
+        .await;
+    assert!(matches!(
+        denied,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+
+    // Open 2 rooms in Space A (hits max_rooms_per_space = 2).
+    let (p1, _) = synced_client(&hub, &owner, &n1.note, 901).await;
+    let (p2, _) = synced_client(&hub, &owner, &n2.note, 902).await;
+    assert_eq!(hub.active_room_count(), 2);
+
+    // Joining an ALREADY-open room does NOT consume a per-Space room slot.
+    let (p1_join, _) = synced_client(&hub, &owner, &n1.note, 903).await;
+    assert_eq!(hub.active_room_count(), 2);
+
+    // 4th total peer hits max_total_peers = 3 before admission/DB work.
+    let over_peers = hub
+        .connect(
+            owner.clone(),
+            n1.note.clone(),
+            test_auth(&Cancellation::default(), None),
+        )
+        .await;
+    assert!(matches!(over_peers, Err(PortError::Unavailable(_))));
+
+    // Dropping the extra join frees a peer permit, so connect() succeeds again;
+    // cold-opening a 3rd room in the same Space still hits max_rooms_per_space (1013).
+    drop(p1_join);
+    let mut third_room = open(&hub, &owner, &n3.note).await;
+    third_room.send(LineageHello::Fresh.encode()).await.unwrap();
+    assert_eq!(close_code(&mut third_room).await, 1013);
+    drop(third_room);
+
+    // Cold-opening a room in a DIFFERENT Space still succeeds while Space A is at cap.
+    let space_b = HistoryScope {
+        space_id: SpaceId::from_bytes([119; 16]),
+        incarnation: HistoryIncarnation::from_bytes([120; 16]),
+    };
+    store
+        .create_space(notarium_canonical::CreateSpaceSpec {
+            space_id: space_b.space_id.clone(),
+            incarnation: space_b.incarnation,
+            root_folder_id: FolderId::from_bytes([122; 16]),
+            slug: "collab-tests-b".to_owned(),
+            kind: notarium_core::auth::SpaceKind::Shared,
+            owner: test_owner(),
+            active_epoch: LeaseEpoch::new(1).unwrap(),
+            initial_last_seq: SpaceSeq::ZERO,
+            created_at: None,
+        })
+        .await
+        .unwrap();
+    let owner_b = owner_context(&space_b);
+    let nb = create_note(&store, &owner_b, 104, "Space B.\n", None).await;
+    let (pb, _) = synced_client(&hub, &owner_b, &nb.note, 904).await;
+    assert_eq!(hub.active_room_count(), 3);
+
+    // Unloading one room in Space A frees its per-Space slot for n3.
+    drop((p2, pb));
+    wait_until(async || hub.active_room_count() == 1).await;
+    let (p3, _) = synced_client(&hub, &owner, &n3.note, 905).await;
+    assert_eq!(hub.active_room_count(), 2);
+
+    drop((p1, p3));
+    hub.shutdown(&budget()).await.unwrap();
+    drop(hub);
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn folder_trash_blocked_by_open_or_fenced_room_and_recovery_survives_trashed_ancestor() {
+    let mut cfg = fast_config();
+    cfg.idle_checkpoint = Duration::from_secs(60);
+    cfg.periodic_checkpoint = Duration::from_secs(60);
+    cfg.idle_unload = Duration::from_secs(60);
+    let (root, store, runtime, hub, owner) = open_sqlite_env("folder-trash-recovery", cfg).await;
+
+    let space = store.read_space(&owner.scope().space_id).await.unwrap();
+    let parent_id = FolderId::from_bytes([121; 16]);
+    let child_id = FolderId::from_bytes([122; 16]);
+    let parent_rev = store
+        .create_folder(CreateFolderSpec {
+            scope: owner.scope().clone(),
+            active_epoch: space.active_epoch,
+            folder_id: parent_id.clone(),
+            parent: None,
+            slug: "parent-folder".into(),
+            display_name: "Parent".into(),
+            is_project: false,
+            project_slug: None,
+            actor: test_owner(),
+            timestamp: None,
+        })
+        .await
+        .unwrap()
+        .1;
+    store
+        .create_folder(CreateFolderSpec {
+            scope: owner.scope().clone(),
+            active_epoch: space.active_epoch,
+            folder_id: child_id.clone(),
+            parent: Some(parent_id.clone()),
+            slug: "child-folder".into(),
+            display_name: "Child".into(),
+            is_project: false,
+            project_slug: None,
+            actor: test_owner(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+    let n1 = create_note(&store, &owner, 111, "Nested.\n", Some(child_id)).await;
+    let n2 = create_note(&store, &owner, 112, "Sibling.\n", None).await;
+
+    // 1. Active descendant room blocks trashing the ancestor folder.
+    let (mut c1, _) = synced_client(&hub, &owner, &n1.note, 911).await;
+    c1.send_update(&c1.append("Accepted WAL.\n")).await;
+    c1.ack().await;
+    let err = store
+        .set_folder_lifecycle(
+            owner.scope(),
+            space.active_epoch,
+            &parent_id,
+            &parent_rev,
+            Lifecycle::Trashed,
+            &test_owner(),
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, PortError::Unavailable(_)),
+        "active descendant room must block folder trash, got {err:?}"
+    );
+
+    // 2. Fenced descendant room ALSO blocks trashing the ancestor folder.
+    let sess1 = store
+        .read_collab_session(None, owner.scope(), &n1.note)
+        .await
+        .unwrap()
+        .unwrap()
+        .session;
+    store
+        .fence_collab_session(
+            &budget(),
+            FenceCollabSession {
+                scope: owner.scope().clone(),
+                note: n1.note.clone(),
+                owner_id: sess1.owner_id.expect("owner"),
+                expected_lease: sess1.lease_epoch,
+                expected_lineage: sess1.lineage_epoch,
+            },
+        )
+        .await
+        .unwrap();
+    drop(c1);
+    wait_until(async || hub.active_room_count() == 0).await;
+
+    let err_fenced = store
+        .set_folder_lifecycle(
+            owner.scope(),
+            space.active_epoch,
+            &parent_id,
+            &parent_rev,
+            Lifecycle::Trashed,
+            &test_owner(),
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err_fenced, PortError::Unavailable(_)),
+        "fenced descendant room must block folder trash, got {err_fenced:?}"
+    );
+
+    // Also fence n2 so we confirm recovery handles both rooms in one sweep.
+    let (mut c2, _) = synced_client(&hub, &owner, &n2.note, 912).await;
+    c2.send_update(&c2.append("Sibling WAL.\n")).await;
+    c2.ack().await;
+    let sess2 = store
+        .read_collab_session(None, owner.scope(), &n2.note)
+        .await
+        .unwrap()
+        .unwrap()
+        .session;
+    store
+        .fence_collab_session(
+            &budget(),
+            FenceCollabSession {
+                scope: owner.scope().clone(),
+                note: n2.note.clone(),
+                owner_id: sess2.owner_id.expect("owner"),
+                expected_lease: sess2.lease_epoch,
+                expected_lineage: sess2.lineage_epoch,
+            },
+        )
+        .await
+        .unwrap();
+    drop(c2);
+    wait_until(async || hub.active_room_count() == 0).await;
+
+    // 3. Even if an ancestor folder is already marked trashed in storage,
+    //    `recover_fenced_rooms` must still settle pre-accepted WAL cleanly
+    //    without wedging Space recovery.
+    {
+        let conn = sqlx::SqliteConnection::connect(&format!(
+            "sqlite://{}",
+            root.data_root().canonical().display()
+        ))
+        .await
+        .unwrap();
+        let mut conn = conn;
+        sqlx::query("UPDATE folder_heads SET lifecycle_state = 'trashed' WHERE space_id = ? AND folder_id = ?")
+            .bind(owner.scope().space_id.as_str())
+            .bind(parent_id.as_str())
+            .execute(&mut conn)
+            .await
+            .unwrap();
+    }
+
+    let recovered = hub
+        .recover_fenced_rooms(
+            &maintenance_ctx(ServicePurpose::CollabRecovery),
+            owner.scope(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(recovered, 2);
+    assert_eq!(
+        note_head(&store, &owner, &n2.note).await.1,
+        "Sibling.\nSibling WAL.\n"
+    );
+
+    // Restore parent folder to active so we can read n1 and verify its settled WAL,
+    // then verify trashing now succeeds once rooms are closed.
+    let (restored_rev, _) = store
+        .set_folder_lifecycle(
+            owner.scope(),
+            space.active_epoch,
+            &parent_id,
+            &parent_rev,
+            Lifecycle::Active,
+            &test_owner(),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        note_head(&store, &owner, &n1.note).await.1,
+        "Nested.\nAccepted WAL.\n"
+    );
+    store
+        .set_folder_lifecycle(
+            owner.scope(),
+            space.active_epoch,
+            &parent_id,
+            &restored_rev,
+            Lifecycle::Trashed,
+            &test_owner(),
+            None,
+        )
+        .await
+        .unwrap();
+
+    hub.shutdown(&budget()).await.unwrap();
+    drop(hub);
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn sqlite_savepoint_batch_enforces_idempotency_replay_and_key_reuse() {
+    let (_root, store, runtime, hub, owner) =
+        open_sqlite_env("sqlite-savepoint-idemp", fast_config()).await;
+    let n1 = create_note(&store, &owner, 131, "Alpha.\n", None).await;
+    let n2 = create_note(&store, &owner, 132, "Beta.\n", None).await;
+
+    // Pause the writer briefly so all concurrent requests land in the same
+    // SQLite fast-writer batch, and include a duplicate-slug create pair to
+    // force the batch into `run_savepoint_fallback_sql_stage`.
+    store
+        .writer_faults()
+        .unwrap()
+        .pre_commit_space_delays
+        .lock()
+        .await
+        .insert(owner.scope().space_id.clone(), Duration::from_millis(60));
+
+    // Warm one write so the delay blocks subsequent writers while they queue together.
+    let warmup_store = store.clone();
+    let warmup_owner = owner.clone();
+    let warmup_note = n2.note.clone();
+    let warmup = tokio::spawn(async move {
+        let cmd = edit(
+            &warmup_owner,
+            &warmup_note,
+            "Beta.\n",
+            CarrierEditOrigin::Body,
+            6,
+            6,
+            "0",
+        );
+        warmup_store.edit_note(warmup_owner, cmd).await
+    });
+    tokio::time::sleep(Duration::from_millis(15)).await;
+
+    // 1. Same-note duplicate CommandKey with IDENTICAL payload -> replays same revision.
+    let shared_key_replay = CommandKey::from_bytes([201; 16]);
+    let mut e1 = edit(
+        &owner,
+        &n1.note,
+        "Alpha.\n",
+        CarrierEditOrigin::Body,
+        7,
+        7,
+        "X",
+    );
+    e1.identity.key = shared_key_replay.clone();
+    let e2 = e1.clone();
+
+    // 2. Duplicate CommandKey with DIFFERENT payload (cross-note & same-note) -> IdempotencyKeyReused.
+    let shared_key_reuse = CommandKey::from_bytes([202; 16]);
+    let mut c_ok = mutation(
+        &owner,
+        CreateNote {
+            note: NoteId::from_bytes([133; 16]),
+            parent: None,
+            slug: "idemp-a".into(),
+            class: DocClass::UserDoc,
+            carrier: "A.\n".into(),
+        },
+    );
+    c_ok.identity.key = shared_key_reuse.clone();
+    let mut c_diff = mutation(
+        &owner,
+        CreateNote {
+            note: NoteId::from_bytes([134; 16]),
+            parent: None,
+            slug: "idemp-b".into(),
+            class: DocClass::UserDoc,
+            carrier: "B.\n".into(),
+        },
+    );
+    c_diff.identity.key = shared_key_reuse;
+
+    // 3. Pair of colliding slugs to trigger `run_savepoint_fallback_sql_stage`.
+    let col_a = mutation(
+        &owner,
+        CreateNote {
+            note: NoteId::from_bytes([135; 16]),
+            parent: None,
+            slug: "same-slug-sp".into(),
+            class: DocClass::UserDoc,
+            carrier: "S1.\n".into(),
+        },
+    );
+    let col_b = mutation(
+        &owner,
+        CreateNote {
+            note: NoteId::from_bytes([136; 16]),
+            parent: None,
+            slug: "same-slug-sp".into(),
+            class: DocClass::UserDoc,
+            carrier: "S2.\n".into(),
+        },
+    );
+
+    let (r_e1, r_e2, r_ok, r_diff, r_ca, r_cb) = tokio::join!(
+        store.edit_note(owner.clone(), e1),
+        store.edit_note(owner.clone(), e2),
+        store.create_note(owner.clone(), c_ok),
+        store.create_note(owner.clone(), c_diff),
+        store.create_note(owner.clone(), col_a),
+        store.create_note(owner.clone(), col_b),
+    );
+    warmup.await.unwrap().unwrap();
+    store
+        .writer_faults()
+        .unwrap()
+        .pre_commit_space_delays
+        .lock()
+        .await
+        .clear();
+
+    // Replay: both return the exact same RevisionId.
+    let e1_ok = r_e1.unwrap();
+    let e2_ok = r_e2.unwrap();
+    assert_eq!(e1_ok.value.revision, e2_ok.value.revision);
+    assert_eq!(note_head(&store, &owner, &n1.note).await.1, "Alpha.\nX");
+
+    // Key reuse with different payload: exactly one succeeds, the other gets IdempotencyKeyReused.
+    let reuse_pair = [r_ok.map(|_| ()), r_diff.map(|_| ())];
+    let ok_count = reuse_pair.iter().filter(|r| r.is_ok()).count();
+    let reused_count = reuse_pair
+        .iter()
+        .filter(|r| matches!(r, Err(PortError::Domain(DomainError::IdempotencyKeyReused))))
+        .count();
+    assert_eq!(ok_count, 1, "reuse pair: {reuse_pair:?}");
+    assert_eq!(reused_count, 1, "reuse pair: {reuse_pair:?}");
+
+    // Slug collision: exactly one succeeded, one failed with PathConflict.
+    let col_ok = [r_ca.is_ok(), r_cb.is_ok()]
+        .into_iter()
+        .filter(|&b| b)
+        .count();
+    assert_eq!(col_ok, 1);
+
+    hub.shutdown(&budget()).await.unwrap();
+    drop(hub);
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn awareness_not_echoed_auth_gen_invariance_and_chat_targets() {
+    let mut cfg = fast_config();
+    cfg.idle_checkpoint = Duration::from_secs(60);
+    cfg.periodic_checkpoint = Duration::from_secs(60);
+    cfg.idle_unload = Duration::from_secs(60);
+    let (_root, store, runtime, hub, owner) = open_sqlite_env("awareness-authgen-chat", cfg).await;
+    let note = create_note(&store, &owner, 141, "Hello.\n", None)
+        .await
+        .note;
+    let (mut peer_a, _) = synced_client(&hub, &owner, &note, 941).await;
+    let (mut peer_b, _) = synced_client(&hub, &owner, &note, 942).await;
+
+    // 1. Awareness sent by A reaches B and is NOT echoed back to A.
+    let aw = AwarenessUpdate {
+        clients: std::collections::HashMap::from([(
+            ClientID::new(941),
+            AwarenessUpdateEntry {
+                clock: 1,
+                json: "{\"cursor\":1}".into(),
+            },
+        )]),
+    };
+    peer_a
+        .peer
+        .send(Message::Awareness(aw).encode_v1())
+        .await
+        .unwrap();
+    peer_b.until(|m| matches!(m, Message::Awareness(_))).await;
+    assert!(
+        timeout(Duration::from_millis(80), peer_a.peer.recv())
+            .await
+            .is_err(),
+        "awareness must not echo back to sender"
+    );
+
+    // 2. Pure WAL appends leave sqlite_auth_commit_generation unchanged while
+    //    advancing sqlite_commit_generation; subsequent canonical commits advance both.
+    let auth_g0 = store.sqlite_auth_commit_generation().unwrap();
+    let writer_g0 = store.sqlite_commit_generation().unwrap();
+    for step in 0..3 {
+        peer_a
+            .send_update(&peer_a.append(&format!("More {step}.\n")))
+            .await;
+        peer_a.ack().await;
+    }
+    assert_eq!(store.sqlite_auth_commit_generation().unwrap(), auth_g0);
+    assert!(store.sqlite_commit_generation().unwrap() > writer_g0);
+
+    // 3. Chat creation emits CommittedTargets::Notes([]) rather than All.
+    let mut signals = store.subscribe_space_signals();
+    store
+        .create_chat(
+            owner.clone(),
+            mutation(
+                &owner,
+                CreateChat {
+                    thread: ChatThreadId::from_bytes([142; 16]),
+                    kind: ChatThreadKind::Personal,
+                    owner: test_owner(),
+                    project_folder: None,
+                    title: "Chat".into(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let mut saw_chat_targets = false;
+    while let Ok(Ok(sig)) = timeout(Duration::from_millis(200), signals.recv()).await {
+        if let SpaceSignal::Committed {
+            targets: CommittedTargets::Notes(notes),
+            ..
+        } = sig
+            && notes.is_empty()
+        {
+            saw_chat_targets = true;
+            break;
+        }
+    }
+    assert!(
+        saw_chat_targets,
+        "chat-only commit must emit empty Notes targets, not CommittedTargets::All"
+    );
+
+    drop((peer_a, peer_b));
+    hub.shutdown(&budget()).await.unwrap();
+    drop(hub);
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn explicit_null_and_tagged_yaml_roots_advertise_body_only_and_reject_fm() {
+    let (_root, store, runtime, hub, owner) =
+        open_sqlite_env("yaml-null-tagged", fast_config()).await;
+
+    for (idx, carrier) in [
+        "---\nnull\n---\nbody\n",
+        "---\n~\n---\nbody\n",
+        "---\n!!map {}\n---\nbody\n",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let note = create_note(&store, &owner, 150 + idx as u8, carrier, None)
+            .await
+            .note;
+        let (mut client, ready) = synced_client(&hub, &owner, &note, 950 + idx as u64).await;
+        assert!(
+            !ready.fm_writable,
+            "expected fm_writable=false for {carrier:?}"
+        );
+        client
+            .send_update(&client.update(|txn| {
+                client.fields.insert(txn, "status", "done");
+            }))
+            .await;
+        let Message::Custom(_, payload) = client
+            .until(|m| matches!(m, Message::Custom(wire::POLICY_REJECTED, _)))
+            .await
+        else {
+            unreachable!()
+        };
+        assert_eq!(payload[1], PolicyRejectReason::FrontmatterNotWritable as u8);
+        assert_eq!(close_code(&mut client.peer).await, 1008);
+    }
+
+    let comment_note = create_note(&store, &owner, 155, "---\n# comment\n---\nbody\n", None)
+        .await
+        .note;
+    let (_c, ready) = synced_client(&hub, &owner, &comment_note, 955).await;
+    assert!(
+        ready.fm_writable,
+        "comment-only YAML header must stay writable"
+    );
+
+    hub.shutdown(&budget()).await.unwrap();
+    drop(hub);
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn revoke_recovers_unsettled_room_and_invalid_shutdown_budget_keeps_hub_open() {
+    let mut cfg = fast_config();
+    cfg.idle_checkpoint = Duration::from_millis(250);
+    cfg.periodic_checkpoint = Duration::from_secs(60);
+    cfg.idle_unload = Duration::from_millis(250);
+    let (_root, store, runtime, hub, owner) =
+        open_sqlite_env("revoke-unsettled-shutdown", cfg).await;
+
+    // 1. Invalid shutdown budget (overflow Duration::MAX) must NOT cancel accept_closed.
+    let mut overflow = budget();
+    overflow.remaining = Duration::MAX;
+    let err = hub.shutdown(&overflow).await.unwrap_err();
+    assert!(matches!(
+        err,
+        PortError::Domain(DomainError::ValidationFailed { diagnostic })
+            if diagnostic.reason == ValidationReason::InvalidRange
+    ));
+    let n1 = create_note(&store, &owner, 161, "Alive.\n", None).await;
+    let (p_check, _) = synced_client(&hub, &owner, &n1.note, 961).await;
+    drop(p_check);
+    wait_until(async || hub.active_room_count() == 0).await;
+
+    // 2. Non-SpaceClosed revoke MUST settle/recover even if the room stopped
+    //    with `settled == false` (e.g. room fenced before revoke runs).
+    let n2 = create_note(&store, &owner, 162, "Base.\n", None).await;
+    let session_id = AuthSessionId::from_bytes([162; 16]);
+    let peer_principal = PrincipalId::from_bytes([163; 16]);
+    let grant = SpaceGrant {
+        role: SpaceRole::Editor,
+        read_classes: DocClass::all(),
+        write_classes: DocClass::all(),
+        project_root: None,
+    };
+    let verified = VerifiedHuman::attest(
+        peer_principal,
+        GrantId::from_bytes(random_bytes_16()),
+        BTreeMap::from([(owner.scope().space_id.clone(), grant)]),
+        false,
+    )
+    .with_credential(AuthenticatedCredential::Session(session_id.clone()));
+    let peer_ctx = SpaceContext::new(
+        EngineAuthContext::for_human(verified),
+        owner.scope().clone(),
+        budget(),
+    )
+    .unwrap();
+    let cancel = Cancellation::default();
+    let sess = hub
+        .connect(peer_ctx.clone(), n2.note.clone(), test_auth(&cancel, None))
+        .await
+        .unwrap();
+    let mut client = Client::new(sess, 962);
+    client.ready(LineageHello::Fresh).await;
+    client.sync().await;
+    client
+        .send_update(&client.append("Confirmed edit.\n"))
+        .await;
+    client.ack().await;
+
+    // Fence the room in storage while the peer is still connected, then cancel
+    // the peer's session registration (recording pending_revoke_settlement).
+    // Once idle_unload fires, the room attempts close_collab_snapshot against the
+    // fenced lease and exits with `settled == false`.
+    let stored = store
+        .read_collab_session(None, owner.scope(), &n2.note)
+        .await
+        .unwrap()
+        .unwrap()
+        .session;
+    store
+        .fence_collab_session(
+            &budget(),
+            FenceCollabSession {
+                scope: owner.scope().clone(),
+                note: n2.note.clone(),
+                owner_id: stored.owner_id.expect("owner"),
+                expected_lease: stored.lease_epoch,
+                expected_lineage: stored.lineage_epoch,
+            },
+        )
+        .await
+        .unwrap();
+    cancel.cancel();
+    assert_eq!(close_code(&mut client.peer).await, 1008);
+    wait_until(async || hub.active_room_count() == 0).await;
+
+    // Confirmed WAL is NOT yet materialized in canonical Markdown.
+    assert_eq!(note_head(&store, &owner, &n2.note).await.1, "Base.\n");
+
+    // Non-SpaceClosed revoke MUST recover the unsettled fenced room before Ok(()).
+    hub.revoke(
+        &maintenance_ctx(ServicePurpose::Revocation),
+        &RevocationSelector::Session(session_id),
+        RevocationReason::Logout,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        note_head(&store, &owner, &n2.note).await.1,
+        "Base.\nConfirmed edit.\n"
+    );
+
+    hub.shutdown(&budget()).await.unwrap();
+    drop((client, hub));
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn header_edge_cases_and_fenced_or_pinned_title_renames() {
+    let mut cfg = fast_config();
+    cfg.idle_checkpoint = Duration::from_secs(60);
+    cfg.periodic_checkpoint = Duration::from_secs(60);
+    cfg.idle_unload = Duration::from_secs(60);
+    let (_root, store, runtime, hub, owner) = open_sqlite_env("header-edges-and-rename", cfg).await;
+
+    // 1. Live room + closed note external observation and edit_note on tricky header boundaries.
+    let cases = [
+        (171u8, "---\nstatus: todo\n---", "---\nstatus: done\n---"),
+        (
+            172u8,
+            "---\nstatus: todo\n---\n---\nnot: fm\n---\n",
+            "Plain body.\n",
+        ),
+        (
+            173u8,
+            "---\rstatus: todo\r---\r\nbody",
+            "---\rstatus: done\r---\r\nbody",
+        ),
+    ];
+    for (seed, before, after) in cases {
+        // Open room path:
+        let open_note = create_note(&store, &owner, seed, before, None).await;
+        let (_client, _) =
+            synced_client(&hub, &owner, &open_note.note, 970 + u64::from(seed)).await;
+        let obs = store
+            .accept_external_observation(
+                owner.clone(),
+                mutation(
+                    &owner,
+                    ExternalObservation {
+                        note: open_note.note.clone(),
+                        base_revision: open_note.revision.clone(),
+                        observed_digest: content_digest(after),
+                        disk_identity: content_digest("disk-open"),
+                        content: ObservedContent::Carrier(after.to_owned()),
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(obs, ExternalObservationResult::Committed(_)));
+        assert_eq!(note_head(&store, &owner, &open_note.note).await.1, after);
+
+        // Closed note path (exercises try_closed_room_reservation fast path):
+        let closed_note = create_note(&store, &owner, seed + 10, before, None).await;
+        let obs_closed = store
+            .accept_external_observation(
+                owner.clone(),
+                mutation(
+                    &owner,
+                    ExternalObservation {
+                        note: closed_note.note.clone(),
+                        base_revision: closed_note.revision.clone(),
+                        observed_digest: content_digest(after),
+                        disk_identity: content_digest("disk-closed"),
+                        content: ObservedContent::Carrier(after.to_owned()),
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            obs_closed,
+            ExternalObservationResult::Committed(_)
+        ));
+        assert_eq!(note_head(&store, &owner, &closed_note.note).await.1, after);
+    }
+
+    // 2. rename_note(title: Some) on an active pinned room (same slug!) fails early cleanly.
+    let n_active = create_note(&store, &owner, 185, "# Old\nBody.\n", None).await;
+    let (_active_c, _) = synced_client(&hub, &owner, &n_active.note, 985).await;
+    let pinned_err = store
+        .rename_note(
+            owner.clone(),
+            mutation(
+                &owner,
+                RenameNote {
+                    note: n_active.note.clone(),
+                    slug: "collab-note-185".into(),
+                    title: Some("Blocked Title".into()),
+                },
+            ),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(pinned_err, PortError::Unavailable(_)));
+
+    // 3. rename_note(title: Some) on a fenced room (no revision precondition) recovers
+    //    the WAL first and applies the title onto the recovered content.
+    let n_fenced = create_note(&store, &owner, 186, "# Before\nSeed.\n", None).await;
+    let (mut fc, _) = synced_client(&hub, &owner, &n_fenced.note, 986).await;
+    fc.send_update(&fc.append("Recovered WAL.\n")).await;
+    fc.ack().await;
+    let sess = store
+        .read_collab_session(None, owner.scope(), &n_fenced.note)
+        .await
+        .unwrap()
+        .unwrap()
+        .session;
+    store
+        .fence_collab_session(
+            &budget(),
+            FenceCollabSession {
+                scope: owner.scope().clone(),
+                note: n_fenced.note.clone(),
+                owner_id: sess.owner_id.expect("owner"),
+                expected_lease: sess.lease_epoch,
+                expected_lineage: sess.lineage_epoch,
+            },
+        )
+        .await
+        .unwrap();
+    drop(fc);
+    wait_until(async || hub.active_room_count() == 4).await;
+
+    store
+        .rename_note(
+            owner.clone(),
+            mutation(
+                &owner,
+                RenameNote {
+                    note: n_fenced.note.clone(),
+                    slug: "renamed-after-fence".into(),
+                    title: Some("Fresh Title".into()),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let final_text = note_head(&store, &owner, &n_fenced.note).await.1;
+    assert!(
+        final_text.contains("Fresh Title"),
+        "missing title: {final_text}"
+    );
+    assert!(
+        final_text.contains("Recovered WAL."),
+        "fenced WAL lost on title rename: {final_text}"
+    );
+
+    hub.shutdown(&budget()).await.unwrap();
+    drop(hub);
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn move_pin_unpinned_rejects_room_opened_after_fence_table_eviction() {
+    let root = TempDataRoot::new("unpinned-after-evict");
+    let (store, runtime) = CanonicalRuntime::open(CanonicalConfig::local_default(
+        InstallationId::from_bytes([78; 16]),
+        root.data_root(),
+    ))
+    .await
+    .unwrap();
+    let scope = test_scope();
+    create_space(&store, &scope).await;
+    let owner = owner_context(&scope);
+    let note = create_note(&store, &owner, 191, "Evicted.\n", None).await;
+
+    // Interceptor that opens a room at lease_epoch = 1 right after returning
+    // Unpinned (simulating a race after RoomFenceTable evicted an idle closed slot).
+    struct RaceOpenInterceptor {
+        store: notarium_canonical::CanonicalStore,
+        rev: RevisionId,
+    }
+    impl LiveCollabInterceptor for RaceOpenInterceptor {
+        fn intercept(&self, _req: InterceptedMutation) -> PortFuture<'_, InterceptionResult> {
+            Box::pin(async { Err(DomainError::validation(ValidationReason::InvalidState).into()) })
+        }
+        fn reserve_rollback(
+            &self,
+            _: SpaceContext,
+            _: NoteId,
+            _: CommandIdentity,
+        ) -> PortFuture<'_, notarium_core::ports::RollbackReservation> {
+            Box::pin(async { Err(DomainError::validation(ValidationReason::InvalidState).into()) })
+        }
+        fn filename_pin(
+            &self,
+            ctx: SpaceContext,
+            note: NoteId,
+        ) -> PortFuture<'_, notarium_core::ports::FilenamePin> {
+            let store = self.store.clone();
+            let rev = self.rev.clone();
+            Box::pin(async move {
+                // Ensure the note is NOT in RoomFenceTable when observed_active_lease ran,
+                // then open a durable room at lease_epoch = 1 before rename commits.
+                store
+                    .open_collab_session(
+                        &ctx.budget,
+                        OpenCollabSession {
+                            scope: ctx.scope().clone(),
+                            note,
+                            owner_id: "racer".into(),
+                            expected_carrier_rev: rev,
+                            expected_lease: None,
+                            expected_lineage: None,
+                            initial_yrs_snapshot: Some(vec![0, 0]),
+                            allow_fenced_recovery: false,
+                        },
+                    )
+                    .await?;
+                Ok(notarium_core::ports::FilenamePin::Unpinned)
+            })
+        }
+    }
+
+    store
+        .register_collab_interceptor(Arc::new(RaceOpenInterceptor {
+            store: store.clone(),
+            rev: note.revision.clone(),
+        }))
+        .unwrap();
+    store
+        .room_fences()
+        .remove_note(&owner.scope().space_id, &note.note);
+
+    let err = store
+        .rename_note(
+            owner.clone(),
+            mutation(
+                &owner,
+                RenameNote {
+                    note: note.note.clone(),
+                    slug: "should-fail".into(),
+                    title: None,
+                },
+            ),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, PortError::Unavailable(_)),
+        "rename must reject room opened at lease_epoch=1 after observing None active lease, got {err:?}"
+    );
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn policy_codes_slow_consumer_max_peers_unknown_retry_and_snapshotless_tail() {
+    let mut cfg = fast_config();
+    cfg.idle_checkpoint = Duration::from_secs(60);
+    cfg.periodic_checkpoint = Duration::from_secs(60);
+    cfg.idle_unload = Duration::from_secs(60);
+    let (root, store, runtime, hub, owner) = open_sqlite_env("protocol-edge-matrix", cfg).await;
+
+    // 1. ForbiddenRootOrSubdoc (3) and InvalidFrontmatterValue (8).
+    let n1 = create_note(&store, &owner, 201, "---\nstatus: todo\n---\nBody.\n", None)
+        .await
+        .note;
+    {
+        let (mut bad_root, _) = synced_client(&hub, &owner, &n1, 1001).await;
+        let extra = bad_root.doc.get_or_insert_text("rogue_root");
+        let raw = bad_root.update(|txn| extra.insert(txn, 0, "nope"));
+        bad_root.send_update(&raw).await;
+        let Message::Custom(_, payload) = bad_root
+            .until(|m| matches!(m, Message::Custom(wire::POLICY_REJECTED, _)))
+            .await
+        else {
+            unreachable!()
+        };
+        assert_eq!(payload[1], PolicyRejectReason::ForbiddenRootOrSubdoc as u8);
+        assert_eq!(close_code(&mut bad_root.peer).await, 1008);
+    }
+    {
+        let (mut bad_val, _) = synced_client(&hub, &owner, &n1, 1002).await;
+        let raw = bad_val.update(|txn| {
+            bad_val
+                .fields
+                .insert(txn, "status", Any::Number(yrs::Number::Float(f64::NAN)));
+        });
+        bad_val.send_update(&raw).await;
+        let Message::Custom(_, payload) = bad_val
+            .until(|m| matches!(m, Message::Custom(wire::POLICY_REJECTED, _)))
+            .await
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            payload[1],
+            PolicyRejectReason::InvalidFrontmatterValue as u8
+        );
+        assert_eq!(close_code(&mut bad_val.peer).await, 1008);
+    }
+
+    // 2. SLOW_CONSUMER (1013) when a peer stops draining outbound queue (>8 frames).
+    {
+        let (mut writer, _) = synced_client(&hub, &owner, &n1, 1003).await;
+        let (mut slow, _) = synced_client(&hub, &owner, &n1, 1004).await;
+        for i in 0..16 {
+            writer.send_update(&writer.append(&format!("{i}"))).await;
+            writer.ack().await;
+        }
+        assert_eq!(close_code(&mut slow.peer).await, 1013);
+    }
+
+    // 3. CommitEffect::Unknown retry on Room::append (both committed & rolled-back)
+    //    and Room::apply_command (committed).
+    {
+        let (mut writer, _) = synced_client(&hub, &owner, &n1, 1005).await;
+        store
+            .writer_faults()
+            .unwrap()
+            .drop_commit_response_once
+            .store(true, Ordering::SeqCst);
+        writer.send_update(&writer.append("RetryCommit.\n")).await;
+        writer.ack().await;
+
+        store
+            .writer_faults()
+            .unwrap()
+            .rollback_commit_response_once
+            .store(true, Ordering::SeqCst);
+        writer.send_update(&writer.append("RetryRollback.\n")).await;
+        writer.ack().await;
+
+        // Intercepted edit_note with drop_commit_response_once retries cleanly.
+        let current_text = note_head(&store, &owner, &n1).await.1;
+        store
+            .writer_faults()
+            .unwrap()
+            .drop_commit_response_once
+            .store(true, Ordering::SeqCst);
+        let cmd = edit(
+            &owner,
+            &n1,
+            &current_text,
+            CarrierEditOrigin::Body,
+            current_text.len(),
+            current_text.len(),
+            "",
+        );
+        // Trigger a live checkpoint via body edit mismatch or valid append on live state.
+        let _ = store.edit_note(owner.clone(), cmd).await;
+        let head_after_ckpt = note_head(&store, &owner, &n1).await.1;
+        assert!(head_after_ckpt.contains("RetryCommit."));
+        assert!(head_after_ckpt.contains("RetryRollback."));
+        store
+            .writer_faults()
+            .unwrap()
+            .drop_commit_response_once
+            .store(true, Ordering::SeqCst);
+        let cmd2 = edit(
+            &owner,
+            &n1,
+            &head_after_ckpt,
+            CarrierEditOrigin::Body,
+            head_after_ckpt.len(),
+            head_after_ckpt.len(),
+            "CmdRetry.\n",
+        );
+        store.edit_note(owner.clone(), cmd2).await.unwrap();
+        assert!(note_head(&store, &owner, &n1).await.1.contains("CmdRetry."));
+    }
+
+    // 4. MAX_PEERS (128 peers accepted, 129th gets 1013).
+    {
+        let n_cap = create_note(&store, &owner, 202, "Crowded.\n", None)
+            .await
+            .note;
+        let mut peers = Vec::with_capacity(128);
+        for i in 0..128u64 {
+            let (c, _) = synced_client(&hub, &owner, &n_cap, 2000 + i).await;
+            peers.push(c);
+        }
+        let mut peer_129 = open(&hub, &owner, &n_cap).await;
+        peer_129.send(LineageHello::Fresh.encode()).await.unwrap();
+        assert_eq!(close_code(&mut peer_129).await, 1013);
+        drop(peers);
+    }
+
+    // 5. Snapshotless WAL tail fails admission & recovery with ValidationReason::NotReady.
+    {
+        let n_corrupt = create_note(&store, &owner, 203, "Corrupt.\n", None).await;
+        let (mut c, _) = synced_client(&hub, &owner, &n_corrupt.note, 2500).await;
+        c.send_update(&c.append("Tail.\n")).await;
+        c.ack().await;
+        let sess = store
+            .read_collab_session(None, owner.scope(), &n_corrupt.note)
+            .await
+            .unwrap()
+            .unwrap()
+            .session;
+        store
+            .fence_collab_session(
+                &budget(),
+                FenceCollabSession {
+                    scope: owner.scope().clone(),
+                    note: n_corrupt.note.clone(),
+                    owner_id: sess.owner_id.expect("owner"),
+                    expected_lease: sess.lease_epoch,
+                    expected_lineage: sess.lineage_epoch,
+                },
+            )
+            .await
+            .unwrap();
+        drop(c);
+        wait_until(async || {
+            store
+                .read_collab_session(None, owner.scope(), &n_corrupt.note)
+                .await
+                .unwrap()
+                .unwrap()
+                .session
+                .room_state
+                == CollabRoomState::Fenced
+        })
+        .await;
+        {
+            let mut conn = sqlx::SqliteConnection::connect(&format!(
+                "sqlite://{}",
+                root.data_root().canonical().display()
+            ))
+            .await
+            .unwrap();
+            sqlx::query("UPDATE collab_sessions SET yrs_snapshot_blob = NULL, yrs_snapshot_blake3 = NULL WHERE space_id = ? AND note_id = ?")
+                .bind(owner.scope().space_id.as_str())
+                .bind(n_corrupt.note.as_str())
+                .execute(&mut conn)
+                .await
+                .unwrap();
+        }
+        let rec_err = hub
+            .recover_fenced_rooms(
+                &maintenance_ctx(ServicePurpose::CollabRecovery),
+                owner.scope(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                rec_err,
+                PortError::Domain(DomainError::ValidationFailed { ref diagnostic })
+                    if diagnostic.reason == ValidationReason::NotReady
+            ),
+            "expected NotReady on snapshotless WAL tail, got {rec_err:?}"
+        );
+        // Hub shutdown also tracks unsettled rooms and must surface NotReady
+        // rather than reporting a clean shutdown while the corrupted room remains fenced.
+        let shut_err = hub.shutdown(&budget()).await.unwrap_err();
+        assert!(
+            matches!(
+                shut_err,
+                PortError::Domain(DomainError::ValidationFailed { ref diagnostic })
+                    if diagnostic.reason == ValidationReason::NotReady
+            ),
+            "expected NotReady on hub.shutdown() for unsettled snapshotless room, got {shut_err:?}"
+        );
+    }
+
+    drop(hub);
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_two_owner_takeover_unhosted_pin_and_single_cte_broadcast() {
+    let fixtures = StorageTestFixtures::load_required();
+    let schema = fixtures.fresh_pg_schema();
+    let bucket = fixtures.fresh_s3_bucket("collab-hardening-pg");
+    let s3 = fixtures.s3_config(bucket, S3BucketModePolicy::DetectFromBucket);
+    admin_ensure_bucket(&s3, Some("Enabled")).await.unwrap();
+
+    let installation = InstallationId::from_bytes([171; 16]);
+    let cfg_a = fixtures.pg_s3_config(installation.clone(), &schema, s3.clone());
+    let cfg_b = fixtures.pg_s3_config(installation, &schema, s3);
+    let (store_a, runtime_a) = CanonicalRuntime::open(cfg_a).await.unwrap();
+    let (store_b, runtime_b) = CanonicalRuntime::open(cfg_b).await.unwrap();
+
+    let mut hub_cfg = fast_config();
+    hub_cfg.idle_checkpoint = Duration::from_secs(60);
+    hub_cfg.periodic_checkpoint = Duration::from_secs(60);
+    hub_cfg.idle_unload = Duration::from_secs(60);
+    let hub_a = CollabHub::new(store_a.clone(), hub_cfg.clone()).unwrap();
+    hub_a.register().unwrap();
+    let hub_b = CollabHub::new(store_b.clone(), hub_cfg).unwrap();
+    hub_b.register().unwrap();
+
+    let scope = test_scope();
+    create_space(&store_a, &scope).await;
+    let owner = owner_context(&scope);
+
+    // Create 5-level nested folder tree to exercise 1-RTT PG recursive CTE on WAL & auth.
+    let mut parent = None;
+    for depth in 0..5u8 {
+        let fid = FolderId::from_bytes([210 + depth; 16]);
+        store_a
+            .create_folder(CreateFolderSpec {
+                scope: scope.clone(),
+                active_epoch: LeaseEpoch::new(1).unwrap(),
+                folder_id: fid.clone(),
+                parent,
+                slug: format!("lvl-{depth}"),
+                display_name: format!("Level {depth}"),
+                is_project: false,
+                project_slug: None,
+                actor: test_owner(),
+                timestamp: None,
+            })
+            .await
+            .unwrap();
+        parent = Some(fid);
+    }
+
+    let n1 = create_note(&store_a, &owner, 211, "Note1.\n", parent.clone()).await;
+    let n2 = create_note(&store_a, &owner, 212, "Note2.\n", parent).await;
+
+    // 1. Open n1 on A (A's RoomFenceTable has active=true) and broadcast across
+    //    two split-session peers using PG single-statement autocommit CTE.
+    let (mut a_ed, _) = synced_client(&hub_a, &owner, &n1.note, 3001).await;
+    let (mut a_obs, _) = synced_client(&hub_a, &owner, &n1.note, 3002).await;
+    a_ed.send_update(&a_ed.append("FromA.\n")).await;
+    a_ed.ack().await;
+    a_obs.sync().await;
+    assert_eq!(a_obs.text(), "Note1.\nFromA.\n");
+
+    // Verify unhosted active room on A is visible via `read_active_room_pin_info` on B.
+    let pin_on_b = store_b
+        .read_active_room_pin_info(None, &scope, &n1.note)
+        .await
+        .unwrap();
+    assert!(pin_on_b.is_some(), "PG B must observe A's active room pin");
+
+    // Seed a higher local fence epoch on A for n2 (simulating earlier ownership
+    // with a higher local epoch than PG's post-takeover fenced lease_epoch).
+    {
+        let fence = store_a.room_fences().get_or_init(&scope, &n2.note);
+        let mut guard = fence.lock().await;
+        for _ in 0..5 {
+            guard.open().unwrap();
+            guard.close().unwrap();
+        }
+    }
+
+    // 2. Runtime B takes over Space lease (epoch 2): fences A's n1, recovers & closes n1,
+    //    and opens n2 with uncompacted WAL.
+    store_b
+        .advance_space_lease(
+            &maintenance_ctx(ServicePurpose::Revocation),
+            &scope,
+            LeaseEpoch::new(2).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        store_b
+            .room_fences()
+            .is_room_fenced(&scope.space_id, &n1.note)
+    );
+    let rec_b = hub_b
+        .recover_fenced_rooms(&maintenance_ctx(ServicePurpose::CollabRecovery), &scope)
+        .await
+        .unwrap();
+    assert_eq!(rec_b, 1);
+    assert_eq!(
+        note_head(&store_b, &owner, &n1.note).await.1,
+        "Note1.\nFromA.\n"
+    );
+
+    // Open n2 on B (PG lease_epoch = 1, strictly lower than A's local fence epoch 5!)
+    // and write confirmed WAL, leaving n2 active when A takes back over.
+    let (mut b_n2, _) = synced_client(&hub_b, &owner, &n2.note, 3020).await;
+    b_n2.send_update(&b_n2.append("FromB.\n")).await;
+    b_n2.ack().await;
+
+    // 3. Mode 1A & 1B: Runtime A takes back Space lease (epoch 3):
+    //    - n1 was active on A earlier, now closed on PG -> A must clear stale active=true!
+    //    - n2 is now fenced on PG at lease_epoch 1 -> A must mark n2 fenced even
+    //      though A had a higher local fence epoch (5)!
+    drop((a_ed, a_obs));
+    store_a
+        .advance_space_lease(
+            &maintenance_ctx(ServicePurpose::Revocation),
+            &scope,
+            LeaseEpoch::new(3).unwrap(),
+        )
+        .await
+        .unwrap();
+    wait_until(async || hub_a.active_room_count() == 0).await;
+
+    // Mode 1A check: direct edit_note on n1 via store_a succeeds without stale active block!
+    let n1_cur = note_head(&store_a, &owner, &n1.note).await.1;
+    let edit_n1 = edit(
+        &owner,
+        &n1.note,
+        &n1_cur,
+        CarrierEditOrigin::Body,
+        n1_cur.len(),
+        n1_cur.len(),
+        "AfterTakeover.\n",
+    );
+    store_a.edit_note(owner.clone(), edit_n1).await.unwrap();
+    assert_eq!(
+        note_head(&store_a, &owner, &n1.note).await.1,
+        "Note1.\nFromA.\nAfterTakeover.\n"
+    );
+
+    // Mode 1B check: n2 is marked fenced on A and recovery settles B's WAL.
+    assert!(
+        store_a
+            .room_fences()
+            .is_room_fenced(&scope.space_id, &n2.note),
+        "A must seed fenced state for n2 on PG takeover"
+    );
+    let rec_a = hub_a
+        .recover_fenced_rooms(&maintenance_ctx(ServicePurpose::CollabRecovery), &scope)
+        .await
+        .unwrap();
+    assert_eq!(rec_a, 1);
+    assert_eq!(
+        note_head(&store_a, &owner, &n2.note).await.1,
+        "Note2.\nFromB.\n"
+    );
+
+    drop(b_n2);
+    hub_a.shutdown(&budget()).await.unwrap();
+    let _ = hub_b.shutdown(&budget()).await;
+    drop((hub_a, hub_b));
+    runtime_a.shutdown().await.unwrap();
+    runtime_b.shutdown().await.unwrap();
+    fixtures.drop_pg_schema(&schema).await;
 }

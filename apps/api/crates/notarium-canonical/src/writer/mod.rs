@@ -1956,6 +1956,7 @@ async fn execute_batch_on_conn(
         }
     }
 
+    let wal_only = !intents.is_empty() && intents.iter().all(|it| it.room_wal.is_some());
     let use_savepoints = intents.len() > 1;
 
     for (idx, intent) in intents.into_iter().enumerate() {
@@ -2148,7 +2149,13 @@ async fn execute_batch_on_conn(
     // generation (even->odd before COMMIT, odd->even strictly after COMMIT and
     // BEFORE releasing fence guards or publishing broadcasts) so linearizable
     // generation caches never observe pre-commit authorization.
-    let commit_seq = is_sqlite.then(|| crate::runtime::SqliteCommitSeqGuard::begin(&store.inner));
+    let commit_seq = is_sqlite.then(|| {
+        if wal_only {
+            crate::runtime::SqliteCommitSeqGuard::begin_wal_only(&store.inner)
+        } else {
+            crate::runtime::SqliteCommitSeqGuard::begin(&store.inner)
+        }
+    });
     let commit_res = transaction.commit().await;
     if let Some(seq) = commit_seq {
         store.inner.latch_sqlite_aux_tables_populated();

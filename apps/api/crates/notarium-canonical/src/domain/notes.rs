@@ -444,19 +444,12 @@ fn collab_raw_header(
     class: DocClass,
     identity: HeaderIdentity,
 ) -> Result<HeaderMutation, PortError> {
-    let old = notarium_syntax::frontmatter::analyze(before, class)?
-        .carrier
-        .body;
-    let new = notarium_syntax::frontmatter::analyze(after, class)?
-        .carrier
-        .body;
-    if before[..old.start()] == after[..new.start()] {
-        return Ok(HeaderMutation::Preserve);
-    }
-    let carrier = format!("{}{}", &after[..new.start()], old.slice(before)?);
-    Ok(HeaderMutation::RawHeader(
-        notarium_syntax::live::raw_header_plan(before, &carrier, class, identity)?,
-    ))
+    Ok(
+        match notarium_syntax::live::raw_header_plan_between(before, after, class, identity)? {
+            Some(plan) => HeaderMutation::RawHeader(plan),
+            None => HeaderMutation::Preserve,
+        },
+    )
 }
 
 fn create_note_identity(
@@ -2341,7 +2334,7 @@ enum MovePin {
     NoActiveSource(Arc<super::RoomFenceTable>),
     UnpinnedAt {
         fences: Arc<super::RoomFenceTable>,
-        observed_epoch: LeaseEpoch,
+        observed_active_lease: Option<LeaseEpoch>,
     },
     PinnedAt {
         fences: Arc<super::RoomFenceTable>,
@@ -2357,11 +2350,11 @@ async fn prepare_unpinned_move(
     note: &NoteId,
 ) -> Result<MovePin, PortError> {
     let fences = store.inner.room_fences.clone();
-    let observed_epoch = fences.observed_epoch(ctx.scope(), note).await;
+    let observed_active_lease = fences.observed_active_lease(ctx.scope(), note).await;
     check_move_pin(interceptor, ctx, note).await?;
     Ok(MovePin::UnpinnedAt {
         fences,
-        observed_epoch,
+        observed_active_lease,
     })
 }
 
@@ -2381,13 +2374,13 @@ async fn lock_move_pin_tx(
         }
         MovePin::UnpinnedAt {
             fences,
-            observed_epoch,
-        } => (fences, observed_epoch, None),
+            observed_active_lease,
+        } => (fences, observed_active_lease, None),
         MovePin::PinnedAt {
             fences,
             filename,
             lease,
-        } => (fences, lease, Some(filename)),
+        } => (fences, Some(lease), Some(filename)),
     };
     // Retain the per-note fence through the mutation. Reading the durable lease
     // inside the Space writer transaction covers takeover by another process.
@@ -2416,7 +2409,7 @@ async fn lock_move_pin_tx(
     }
     .map_err(|error| internal_not_committed("move_room_pin_lease", error.to_string()))?;
     if active_lease.is_some_and(|lease| {
-        u64::try_from(lease).ok() != Some(expected_lease.get())
+        expected_lease.is_none_or(|exp| u64::try_from(lease).ok() != Some(exp.get()))
             || expected_slug.is_some_and(|filename| filename != head.slug)
     }) {
         return Err(move_pin_changed());
@@ -2824,7 +2817,7 @@ pub(crate) async fn rename_note_impl(
     }
 
     ctx.budget.remaining = deadline.remaining(&ctx.budget)?;
-    let (space_rec, base_head) = deadline
+    let (mut space_rec, mut base_head) = deadline
         .wait(&ctx.budget, || {
             read_active_note_for_mutation(
                 store,
@@ -2836,24 +2829,28 @@ pub(crate) async fn rename_note_impl(
         })
         .await??;
 
+    let was_fenced = store
+        .inner
+        .room_fences
+        .is_room_fenced(&space_rec.scope.space_id, &request.input.note);
     let move_pin = if let Some(interceptor) = store.inner.collab_interceptor.get() {
         let fences = store.inner.room_fences.clone();
         ctx.budget.remaining = deadline.remaining(&ctx.budget)?;
-        let (observed_epoch, pin) = deadline
+        let (observed_active_lease, pin) = deadline
             .wait(&ctx.budget, || async {
-                let epoch = fences
-                    .observed_epoch(ctx.scope(), &request.input.note)
+                let lease = fences
+                    .observed_active_lease(ctx.scope(), &request.input.note)
                     .await;
                 let pin = interceptor
                     .filename_pin(ctx.clone(), request.input.note.clone())
                     .await?;
-                Ok::<_, PortError>((epoch, pin))
+                Ok::<_, PortError>((lease, pin))
             })
             .await??;
         match pin {
             FilenamePin::Unpinned => MovePin::UnpinnedAt {
                 fences,
-                observed_epoch,
+                observed_active_lease,
             },
             FilenamePin::Pinned {
                 note,
@@ -2882,6 +2879,39 @@ pub(crate) async fn rename_note_impl(
         let trimmed = explicit_title.trim();
         if trimmed.is_empty() || trimmed.contains('\r') || trimmed.contains('\n') {
             return Err(DomainError::validation(ValidationReason::InvalidPathComponent).into());
+        }
+        if matches!(move_pin, MovePin::PinnedAt { .. }) {
+            return Err(unavailable_retryable(
+                "rename_note_blocked_by_filename_pin",
+                "cannot rewrite note title while live room holds filename pin",
+                std::time::Duration::from_millis(50),
+            ));
+        }
+        if was_fenced
+            || store
+                .inner
+                .room_fences
+                .fenced_recovery_revision(
+                    &space_rec.scope.space_id,
+                    &request.input.note,
+                    &base_head.head_rev_id,
+                )
+                .is_some()
+        {
+            ctx.budget.remaining = deadline.remaining(&ctx.budget)?;
+            let refreshed = deadline
+                .wait(&ctx.budget, || {
+                    read_active_note_for_mutation(
+                        store,
+                        &ctx,
+                        &request.input.note,
+                        &request.preconditions,
+                        NoteMutationAccess::Current,
+                    )
+                })
+                .await??;
+            space_rec = refreshed.0;
+            base_head = refreshed.1;
         }
         if base_head.doc_class == DocClass::EncryptedNote && trimmed != request.input.slug {
             return Err(DomainError::UnsafePlaintextOutsideAgeFence.into());
@@ -5085,105 +5115,122 @@ pub(crate) async fn accept_external_observation_impl(
     if let Some(interceptor) = store.inner.collab_interceptor.get()
         && base_head.doc_class == DocClass::UserDoc
     {
-        let (body_plan, header_mut) = match &request.input.content {
-            ObservedContent::Planned(plan) => build_collab_edit_payload(
-                &request.input.note,
-                &base_carrier,
-                &new_carrier,
-                plan,
-                base_head.doc_class,
-                &base_head.head_rev_id,
-            )?,
-            ObservedContent::Carrier(_) => {
-                let old_body =
-                    notarium_syntax::frontmatter::analyze(&base_carrier, base_head.doc_class)?
-                        .carrier
-                        .body;
-                let new_body =
-                    notarium_syntax::frontmatter::analyze(&new_carrier, base_head.doc_class)?
-                        .carrier
-                        .body;
-                let plan = notarium_syntax::patch::plan(
+        if let Some(res) = interceptor.try_closed_room_reservation(
+            ctx.scope(),
+            &request.input.note,
+            &request.identity,
+        ) {
+            reservation_opt = Some(CarrierRoomWrite::Reserved(res));
+        } else {
+            let (body_plan, header_mut) = match &request.input.content {
+                ObservedContent::Planned(plan) => build_collab_edit_payload(
+                    &request.input.note,
                     &base_carrier,
-                    old_body,
-                    vec![(
-                        CarrierEditOrigin::Body,
+                    &new_carrier,
+                    plan,
+                    base_head.doc_class,
+                    &base_head.head_rev_id,
+                )?,
+                ObservedContent::Carrier(_) => {
+                    let old_body =
+                        notarium_syntax::frontmatter::analyze(&base_carrier, base_head.doc_class)?
+                            .carrier
+                            .body;
+                    let new_body =
+                        notarium_syntax::frontmatter::analyze(&new_carrier, base_head.doc_class)?
+                            .carrier
+                            .body;
+                    let plan = notarium_syntax::patch::plan(
+                        &base_carrier,
                         old_body,
-                        new_body.slice(&new_carrier)?.to_owned(),
-                    )],
-                )?;
-                let (body_id, header_id) = derive_body_header_identities(&base_head.head_rev_id);
-                (
-                    notarium_syntax::patch::body_plan(&base_carrier, &plan, body_id)?,
-                    collab_raw_header(&base_carrier, &new_carrier, base_head.doc_class, header_id)?,
-                )
-            }
-        };
-        ctx.budget.remaining = deadline.remaining(&budget)?;
-        let unknown = || {
-            crate::codec::unknown_commit_outcome(
-                "observation_room_outcome_unknown",
-                "the room may have applied the external observation",
-            )
-        };
-        // A ready reply can distinguish a confirmed non-write from a lost room response.
-        let reply = tokio::select! {
-            biased;
-            result = interceptor.intercept(InterceptedMutation {
-                context: ctx.clone(),
-                identity: request.identity.clone(),
-                preconditions: request.preconditions.clone(),
-                payload: InterceptedPayload::ExternalObservation {
-                    observation: request.input.clone(), body: body_plan, header: header_mut,
-                },
-            }) => result?,
-            () = budget.cancellation.cancelled() => return Err(unknown()),
-            () = tokio::time::sleep_until(deadline.at) => return Err(unknown()),
-        };
-        match reply {
-            InterceptionResult::Applied(outcome) => match *outcome {
-                InterceptedOutcome::ExternalObservation(outcome) => match &outcome {
-                    ExternalObservationResult::Committed(committed)
-                        if committed.value.note == request.input.note
-                            && committed.receipt.scope() == ctx.scope() =>
-                    {
-                        return Ok(outcome);
-                    }
-                    ExternalObservationResult::Committed(_) => {
-                        return Err(missing_applied_outcome());
-                    }
-                    _ => return Ok(outcome),
-                },
-                _ => return Err(missing_applied_outcome()),
-            },
-            InterceptionResult::Conflict(DomainError::RevisionConflict { .. }) => {
-                if let Some(replayed) =
-                    replay_external_observation(store, &ctx, deadline, &request.input, &idemp)
-                        .await?
-                {
-                    return Ok(replayed);
+                        vec![(
+                            CarrierEditOrigin::Body,
+                            old_body,
+                            new_body.slice(&new_carrier)?.to_owned(),
+                        )],
+                    )?;
+                    let (body_id, header_id) =
+                        derive_body_header_identities(&base_head.head_rev_id);
+                    (
+                        notarium_syntax::patch::body_plan(&base_carrier, &plan, body_id)?,
+                        collab_raw_header(
+                            &base_carrier,
+                            &new_carrier,
+                            base_head.doc_class,
+                            header_id,
+                        )?,
+                    )
                 }
-                let current =
-                    match current_observation_head(store, &mut ctx, &request, &deadline).await {
+            };
+            ctx.budget.remaining = deadline.remaining(&budget)?;
+            let unknown = || {
+                crate::codec::unknown_commit_outcome(
+                    "observation_room_outcome_unknown",
+                    "the room may have applied the external observation",
+                )
+            };
+            // A ready reply can distinguish a confirmed non-write from a lost room response.
+            let reply = tokio::select! {
+                biased;
+                result = interceptor.intercept(InterceptedMutation {
+                    context: ctx.clone(),
+                    identity: request.identity.clone(),
+                    preconditions: request.preconditions.clone(),
+                    payload: InterceptedPayload::ExternalObservation {
+                        observation: request.input.clone(), body: body_plan, header: header_mut,
+                    },
+                }) => result?,
+                () = budget.cancellation.cancelled() => return Err(unknown()),
+                () = tokio::time::sleep_until(deadline.at) => return Err(unknown()),
+            };
+            match reply {
+                InterceptionResult::Applied(outcome) => match *outcome {
+                    InterceptedOutcome::ExternalObservation(outcome) => match &outcome {
+                        ExternalObservationResult::Committed(committed)
+                            if committed.value.note == request.input.note
+                                && committed.receipt.scope() == ctx.scope() =>
+                        {
+                            return Ok(outcome);
+                        }
+                        ExternalObservationResult::Committed(_) => {
+                            return Err(missing_applied_outcome());
+                        }
+                        _ => return Ok(outcome),
+                    },
+                    _ => return Err(missing_applied_outcome()),
+                },
+                InterceptionResult::Conflict(DomainError::RevisionConflict { .. }) => {
+                    if let Some(replayed) =
+                        replay_external_observation(store, &ctx, deadline, &request.input, &idemp)
+                            .await?
+                    {
+                        return Ok(replayed);
+                    }
+                    let current = match current_observation_head(
+                        store, &mut ctx, &request, &deadline,
+                    )
+                    .await
+                    {
                         Ok((_, head)) => head.head_rev_id,
                         Err(PortError::Domain(DomainError::RevisionConflict {
                             current, ..
                         })) => current,
                         Err(error) => return observation_error(error),
                     };
-                return replay_observation_or_conflict(
-                    store,
-                    &ctx,
-                    deadline,
-                    &request.input,
-                    &idemp,
-                    current,
-                )
-                .await;
-            }
-            InterceptionResult::Conflict(other) => return observation_error(other.into()),
-            InterceptionResult::ClosedRoomReservation(res) => {
-                reservation_opt = Some(CarrierRoomWrite::Reserved(res));
+                    return replay_observation_or_conflict(
+                        store,
+                        &ctx,
+                        deadline,
+                        &request.input,
+                        &idemp,
+                        current,
+                    )
+                    .await;
+                }
+                InterceptionResult::Conflict(other) => return observation_error(other.into()),
+                InterceptionResult::ClosedRoomReservation(res) => {
+                    reservation_opt = Some(CarrierRoomWrite::Reserved(res));
+                }
             }
         }
     }
@@ -6907,48 +6954,17 @@ fn enforce_unchanged_protected_frontmatter(
             }
         }
     } else if !allow_room_separator
-        || !is_room_separator_extension(before, after, &old_hdr.carrier, &new_carrier)
+        || !notarium_syntax::live::is_room_separator_extension(
+            before,
+            after,
+            &old_hdr.carrier,
+            &new_carrier,
+        )
     {
         // An opaque header must keep every original byte of its YAML and fences.
         return Err(DomainError::validation(ValidationReason::FmNotWritable).into());
     }
     Ok(Some((new_hdr.fields, new_hdr.diagnostic, new_end)))
-}
-
-fn is_room_separator_extension(
-    before: &str,
-    after: &str,
-    old: &notarium_syntax::carrier::Carrier,
-    new: &notarium_syntax::carrier::Carrier,
-) -> bool {
-    if old.yaml.is_none() || old.yaml != new.yaml || old.bom_end != new.bom_end {
-        return false;
-    }
-    let old_prefix = &before[..old.body.start()];
-    let new_prefix = &after[..new.body.start()];
-    let new_body = &after[new.body.start()..];
-    if new_body.is_empty() {
-        return false;
-    }
-    let eol = if old_prefix.ends_with(['\r', '\n']) {
-        ""
-    } else {
-        old.eol
-    };
-    let last = if eol.is_empty() {
-        old_prefix.as_bytes().last()
-    } else {
-        eol.as_bytes().last()
-    };
-    let extension = if last == Some(&b'\r') && new_body.starts_with('\n') {
-        "\n"
-    } else {
-        ""
-    };
-    new_prefix
-        .strip_prefix(old_prefix)
-        .and_then(|tail| tail.strip_prefix(eol))
-        == Some(extension)
 }
 
 async fn update_ability_package_slug_tx(
