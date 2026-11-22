@@ -78,7 +78,9 @@ pub fn verify_crate_quarantine(spec: &CrateQuarantine<'_>) {
                 path.display()
             );
             if file_type.is_dir() {
-                if path.file_name().is_some_and(|name| name == "target") {
+                if directory.as_path() == spec.crate_dir
+                    && path.file_name().is_some_and(|name| name == "target")
+                {
                     continue;
                 }
                 directories.push(path);
@@ -160,7 +162,7 @@ pub fn verify_crate_quarantine(spec: &CrateQuarantine<'_>) {
 
             if let Some(leaf) = spec.leaves.iter().find(|leaf| leaf.path == rel_posix) {
                 expected_leaves.remove(leaf.path);
-                verify_audited_leaf(&rel_posix, &contents, &code_only, leaf);
+                verify_audited_leaf(&rel_posix, &contents, &no_comments, &code_only, leaf);
             } else {
                 verify_safe_tokens(&rel_posix, &code_only);
             }
@@ -209,7 +211,13 @@ fn verify_safe_tokens(label: &str, code_only: &str) {
     );
 }
 
-fn verify_audited_leaf(label: &str, raw: &str, code_only: &str, leaf: &AuditedLeaf<'_>) {
+fn verify_audited_leaf(
+    label: &str,
+    raw: &str,
+    no_comments: &str,
+    code_only: &str,
+    leaf: &AuditedLeaf<'_>,
+) {
     let tokens: Vec<&str> = code_tokens(code_only).collect();
     let total_unsafe = tokens.iter().filter(|token| **token == "unsafe").count();
     assert!(
@@ -223,7 +231,7 @@ fn verify_audited_leaf(label: &str, raw: &str, code_only: &str, leaf: &AuditedLe
         );
     }
     if let Some(expected) = leaf.exact_safety_comments {
-        let count = raw.matches("// SAFETY:").count();
+        let count = count_safety_comments(raw);
         assert_eq!(
             count, expected,
             "audited leaf {label} expected exactly {expected} // SAFETY: comments, found {count}"
@@ -247,30 +255,182 @@ fn verify_audited_leaf(label: &str, raw: &str, code_only: &str, leaf: &AuditedLe
             "audited leaf {label} missing required token sequence {pair:?}"
         );
     }
-    verify_safety_comments(label, raw, code_only);
+    verify_safety_comments(label, raw, no_comments, code_only);
 }
 
-fn verify_safety_comments(label: &str, raw: &str, code_only: &str) {
+/// Count real `// SAFETY:` line comments strictly outside string literals,
+/// raw string literals, char literals, and nested `/* ... */` block comments.
+pub fn count_safety_comments(source: &str) -> usize {
+    line_comments_by_line(source)
+        .into_iter()
+        .flatten()
+        .filter(|comment| comment.trim_start().starts_with("SAFETY:"))
+        .count()
+}
+
+fn verify_safety_comments(label: &str, raw: &str, no_comments: &str, code_only: &str) {
+    let line_comments = line_comments_by_line(raw);
     let mut has_safety_comment = false;
-    for (raw_line, code_line) in raw.lines().zip(code_only.lines()) {
-        let trimmed = raw_line.trim();
-        if let Some(rest) = trimmed.strip_prefix("// SAFETY:") {
-            has_safety_comment = !rest.trim().is_empty();
+    for (((raw_line, no_comment_line), code_line), line_comment) in raw
+        .split('\n')
+        .zip(no_comments.split('\n'))
+        .zip(code_only.split('\n'))
+        .zip(line_comments)
+    {
+        if no_comment_line.trim().is_empty()
+            && let Some(comment) = line_comment
+        {
+            if let Some(rest) = comment.trim_start().strip_prefix("SAFETY:") {
+                has_safety_comment = !rest.trim().is_empty();
+            }
             continue;
         }
-        if trimmed.starts_with("//") {
+        if is_attribute_only_line(no_comment_line) {
             continue;
         }
         let blocks = unsafe_block_count(code_line);
-        if trimmed.starts_with("#[") && blocks == 0 {
-            continue;
-        }
         assert!(
             blocks == 0 || (blocks == 1 && has_safety_comment),
             "audited leaf {label} has undocumented unsafe block on line: {raw_line}"
         );
         has_safety_comment = false;
     }
+}
+
+/// Return true only when a comment-stripped line consists exclusively of one or
+/// more outer attributes (`#[...]`) and whitespace with zero trailing code.
+fn is_attribute_only_line(no_comments_line: &str) -> bool {
+    let bytes = no_comments_line.as_bytes();
+    let mut i = 0;
+    let mut saw_attr = false;
+    while i < bytes.len() {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        if bytes[i] != b'#' {
+            return false;
+        }
+        let mut j = i + 1;
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if j >= bytes.len() || bytes[j] != b'[' {
+            return false;
+        }
+        let Ok(end) = find_matching_bracket(no_comments_line, j) else {
+            return false;
+        };
+        saw_attr = true;
+        i = end + 1;
+    }
+    saw_attr
+}
+
+/// Extract the real `// ...` line comment body (after `//`, trimming trailing
+/// `\r`) for every `\n`-delimited line in `source`, ignoring anything inside
+/// string literals, raw string literals, char literals, or nested `/* ... */`
+/// block comments.
+fn line_comments_by_line(source: &str) -> Vec<Option<&str>> {
+    let bytes = source.as_bytes();
+    let mut comments = vec![None];
+    let mut i = 0;
+    while i < bytes.len() {
+        // Line comment `// ...`
+        if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+            let start = i + 2;
+            i = start;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            let body = source[start..i].trim_end_matches('\r');
+            if let Some(slot) = comments.last_mut() {
+                *slot = Some(body);
+            }
+            continue;
+        }
+        // Nested block comment `/* ... */`
+        if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            let mut depth = 1usize;
+            i += 2;
+            while i < bytes.len() && depth > 0 {
+                if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+                    depth += 1;
+                    i += 2;
+                } else if bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    if bytes[i] == b'\n' {
+                        comments.push(None);
+                    }
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        // Raw string literal `r#*"..."#*`, `br#*"..."#*`, `cr#*"..."#*`
+        if let Some((prefix_end, hashes)) = match_raw_string_start(bytes, i) {
+            i = prefix_end;
+            while i < bytes.len() {
+                if bytes[i] == b'"'
+                    && i + 1 + hashes <= bytes.len()
+                    && bytes[i + 1..i + 1 + hashes].iter().all(|&b| b == b'#')
+                {
+                    i += 1 + hashes;
+                    break;
+                }
+                if bytes[i] == b'\n' {
+                    comments.push(None);
+                }
+                i += 1;
+            }
+            continue;
+        }
+        // Regular string literal `"..."`
+        if bytes[i] == b'"' {
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    let ch = source[i + 1..].chars().next().expect("valid utf8");
+                    if ch == '\n' {
+                        comments.push(None);
+                    }
+                    i += 1 + ch.len_utf8();
+                    continue;
+                }
+                if bytes[i] == b'"' {
+                    i += 1;
+                    break;
+                }
+                if bytes[i] == b'\n' {
+                    comments.push(None);
+                    i += 1;
+                } else {
+                    let ch = source[i..].chars().next().expect("valid utf8");
+                    i += ch.len_utf8();
+                }
+            }
+            continue;
+        }
+        // Char literal `'a'`, `'\''`, `'\u{...}'` (not lifetime `'a`)
+        if bytes[i] == b'\''
+            && let Some(end) = match_char_literal(source, i)
+        {
+            i = end;
+            continue;
+        }
+        if bytes[i] == b'\n' {
+            comments.push(None);
+            i += 1;
+        } else {
+            let ch = source[i..].chars().next().expect("valid utf8");
+            i += ch.len_utf8();
+        }
+    }
+    comments
 }
 
 fn is_ident_char(byte: u8) -> bool {
@@ -792,22 +952,26 @@ mod tests {
         assert_eq!(unsafe_block_count("unsafe fn helper() {}"), 0);
 
         let inline_bypass = "#[inline] unsafe { foo() }\n";
+        let no_comments = strip_rust_comments(inline_bypass, false);
         let code_only = strip_rust_comments(inline_bypass, true);
         assert!(
             std::panic::catch_unwind(|| verify_safety_comments(
                 "leaf.rs",
                 inline_bypass,
+                &no_comments,
                 &code_only
             ))
             .is_err()
         );
 
         let block_with_fn = "unsafe { fn _() {} foo() }\n";
+        let no_comments = strip_rust_comments(block_with_fn, false);
         let code_only = strip_rust_comments(block_with_fn, true);
         assert!(
             std::panic::catch_unwind(|| verify_safety_comments(
                 "leaf.rs",
                 block_with_fn,
+                &no_comments,
                 &code_only
             ))
             .is_err()
@@ -815,8 +979,195 @@ mod tests {
 
         let documented_with_attr =
             "// SAFETY: verified invariant\n#[allow(clippy::all)]\nunsafe { foo() }\n";
+        let no_comments = strip_rust_comments(documented_with_attr, false);
         let code_only = strip_rust_comments(documented_with_attr, true);
-        verify_safety_comments("leaf.rs", documented_with_attr, &code_only);
+        verify_safety_comments("leaf.rs", documented_with_attr, &no_comments, &code_only);
+    }
+
+    #[test]
+    fn safety_comment_check_rejects_string_block_comment_and_attr_code_bypasses() {
+        // Fake `// SAFETY:` inside strings, raw strings, or block comments must not count.
+        let fake_counts = concat!(
+            "const A: &str = \"// SAFETY: inside string\";\n",
+            "const B: &str = r#\"// SAFETY: inside raw string\"#;\n",
+            "/* // SAFETY: single-line block comment */\n",
+            "/*\n",
+            "// SAFETY: multi-line block comment\n",
+            "*/\n",
+            "/* outer /* // SAFETY: nested block comment */ */\n",
+            "// SAFETY: real comment\n",
+        );
+        assert_eq!(count_safety_comments(fake_counts), 1);
+
+        let block_comment_bypass =
+            "/*\n// SAFETY: forged inside block comment\n*/\nunsafe { foo() }\n";
+        let no_comments = strip_rust_comments(block_comment_bypass, false);
+        let code_only = strip_rust_comments(block_comment_bypass, true);
+        assert_eq!(count_safety_comments(block_comment_bypass), 0);
+        assert!(
+            std::panic::catch_unwind(|| verify_safety_comments(
+                "leaf.rs",
+                block_comment_bypass,
+                &no_comments,
+                &code_only
+            ))
+            .is_err()
+        );
+
+        let string_literal_bypass =
+            "let _ = \"\n// SAFETY: forged inside string\n\";\nunsafe { foo() }\n";
+        let no_comments = strip_rust_comments(string_literal_bypass, false);
+        let code_only = strip_rust_comments(string_literal_bypass, true);
+        assert_eq!(count_safety_comments(string_literal_bypass), 0);
+        assert!(
+            std::panic::catch_unwind(|| verify_safety_comments(
+                "leaf.rs",
+                string_literal_bypass,
+                &no_comments,
+                &code_only
+            ))
+            .is_err()
+        );
+
+        let raw_string_bypass =
+            "let _ = r#\"\n// SAFETY: forged inside raw string\n\"#;\nunsafe { foo() }\n";
+        let no_comments = strip_rust_comments(raw_string_bypass, false);
+        let code_only = strip_rust_comments(raw_string_bypass, true);
+        assert_eq!(count_safety_comments(raw_string_bypass), 0);
+        assert!(
+            std::panic::catch_unwind(|| verify_safety_comments(
+                "leaf.rs",
+                raw_string_bypass,
+                &no_comments,
+                &code_only
+            ))
+            .is_err()
+        );
+
+        // Trailing code on an attribute line must clear `has_safety_comment`.
+        let attr_with_trailing_code =
+            "// SAFETY: verified invariant\n#[allow(unused)] foo();\nunsafe { bar() }\n";
+        let no_comments = strip_rust_comments(attr_with_trailing_code, false);
+        let code_only = strip_rust_comments(attr_with_trailing_code, true);
+        assert!(
+            std::panic::catch_unwind(|| verify_safety_comments(
+                "leaf.rs",
+                attr_with_trailing_code,
+                &no_comments,
+                &code_only
+            ))
+            .is_err()
+        );
+
+        // Pure attribute-only lines (including multiple attributes and a trailing comment)
+        // still preserve the preceding `// SAFETY:` comment.
+        let valid_multi_attr = concat!(
+            "// SAFETY: verified invariant\n",
+            "#[cfg(unix)] #[allow(clippy::all)] // trailing note\n",
+            "unsafe { foo() }\n",
+        );
+        let no_comments = strip_rust_comments(valid_multi_attr, false);
+        let code_only = strip_rust_comments(valid_multi_attr, true);
+        verify_safety_comments("leaf.rs", valid_multi_attr, &no_comments, &code_only);
+
+        // Audited leaf exact_safety_comments must ignore forged `// SAFETY:` in strings/blocks.
+        let leaf_with_forged = concat!(
+            "const S: &str = \"// SAFETY: fake\";\n",
+            "/*\n// SAFETY: fake block\n*/\n",
+            "// SAFETY: real justification\n",
+            "unsafe { foo() }\n",
+        );
+        let leaf_no_comments = strip_rust_comments(leaf_with_forged, false);
+        let leaf_code_only = strip_rust_comments(leaf_with_forged, true);
+        verify_audited_leaf(
+            "leaf.rs",
+            leaf_with_forged,
+            &leaf_no_comments,
+            &leaf_code_only,
+            &AuditedLeaf {
+                path: "leaf.rs",
+                exact_unsafe_tokens: Some(1),
+                exact_safety_comments: Some(1),
+                require_mmap_options: false,
+                forbid_map_mut: true,
+                required_token_pairs: &[],
+            },
+        );
+    }
+
+    #[test]
+    fn nested_target_modules_are_scanned_while_crate_root_target_is_skipped() {
+        // Plain `mod target;` inside `src/vector/target/mod.rs` must be scanned and rejected.
+        let src_target = TempCrateDir::new("src-vector-target");
+        fs::create_dir_all(src_target.0.join("src/vector/target")).unwrap();
+        fs::write(src_target.0.join("src/lib.rs"), "mod vector;\n").unwrap();
+        fs::write(src_target.0.join("src/vector/mod.rs"), "mod target;\n").unwrap();
+        fs::write(
+            src_target.0.join("src/vector/target/mod.rs"),
+            "pub fn bad() { unsafe {} }\n",
+        )
+        .unwrap();
+        assert!(
+            std::panic::catch_unwind(|| {
+                verify_crate_quarantine(&CrateQuarantine {
+                    crate_dir: &src_target.0,
+                    leaves: &[],
+                    allowed_external_test_paths: &[],
+                });
+            })
+            .is_err()
+        );
+
+        // Plain `mod target;` inside `tests/target/mod.rs` must also be scanned and rejected.
+        let tests_target = TempCrateDir::new("tests-target");
+        fs::create_dir_all(tests_target.0.join("src")).unwrap();
+        fs::create_dir_all(tests_target.0.join("tests/target")).unwrap();
+        fs::write(tests_target.0.join("src/lib.rs"), "pub fn ok() {}\n").unwrap();
+        fs::write(tests_target.0.join("tests/entry.rs"), "mod target;\n").unwrap();
+        fs::write(
+            tests_target.0.join("tests/target/mod.rs"),
+            "pub fn bad() { unsafe {} }\n",
+        )
+        .unwrap();
+        assert!(
+            std::panic::catch_unwind(|| {
+                verify_crate_quarantine(&CrateQuarantine {
+                    crate_dir: &tests_target.0,
+                    leaves: &[],
+                    allowed_external_test_paths: &[],
+                });
+            })
+            .is_err()
+        );
+
+        // Crate-root `target/` build directory is still skipped, while clean nested
+        // `src/vector/target/mod.rs` passes without false positives.
+        let clean_with_root_target = TempCrateDir::new("root-target-skip");
+        fs::create_dir_all(clean_with_root_target.0.join("src/vector/target")).unwrap();
+        fs::create_dir_all(clean_with_root_target.0.join("target/debug/build")).unwrap();
+        fs::write(clean_with_root_target.0.join("src/lib.rs"), "mod vector;\n").unwrap();
+        fs::write(
+            clean_with_root_target.0.join("src/vector/mod.rs"),
+            "mod target;\n",
+        )
+        .unwrap();
+        fs::write(
+            clean_with_root_target.0.join("src/vector/target/mod.rs"),
+            "pub fn clean() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            clean_with_root_target
+                .0
+                .join("target/debug/build/generated.rs"),
+            "unsafe fn build_artifact() {}\n",
+        )
+        .unwrap();
+        verify_crate_quarantine(&CrateQuarantine {
+            crate_dir: &clean_with_root_target.0,
+            leaves: &[],
+            allowed_external_test_paths: &[],
+        });
     }
 
     #[test]

@@ -137,6 +137,7 @@ pub(super) async fn seed_lexical(
             full_sweep_needed: false,
             last_activity: now,
             embedder_last_use: now,
+            embedder_unavailable: false,
         })
     }
     .await;

@@ -52,12 +52,12 @@ const ARCHIVED_IDLE: Duration = Duration::from_secs(30);
 const MAX_CACHED_VECTORS: usize = 4096;
 
 #[derive(Clone, Copy)]
-struct Schedule {
-    tick: Duration,
-    lexical_idle: Duration,
-    embedder_idle: Duration,
-    worker_idle: Duration,
-    archived_idle: Duration,
+pub(crate) struct Schedule {
+    pub(crate) tick: Duration,
+    pub(crate) lexical_idle: Duration,
+    pub(crate) embedder_idle: Duration,
+    pub(crate) worker_idle: Duration,
+    pub(crate) archived_idle: Duration,
 }
 
 impl Default for Schedule {
@@ -238,6 +238,7 @@ struct Disk {
     full_sweep_needed: bool,
     last_activity: Instant,
     embedder_last_use: Instant,
+    embedder_unavailable: bool,
 }
 
 impl Disk {
@@ -296,6 +297,7 @@ impl Disk {
         if self.embedder.is_some() && now.saturating_duration_since(self.embedder_last_use) >= idle
         {
             self.embedder.take();
+            self.embedder_unavailable = false;
             true
         } else {
             false
@@ -423,6 +425,7 @@ impl Publisher<'_> {
             embeddings_pending: disk.manifest.embeddings_pending,
             reopening_vectors: reopening
                 || (disk.manifest.vector_seq.is_some() && disk.epoch.is_none()),
+            embedder_unavailable: disk.embedder_unavailable,
         })));
     }
 
@@ -487,7 +490,7 @@ pub(super) async fn run(
             &mut publisher,
             &workers,
             scope.clone(),
-            Schedule::default(),
+            services.schedule,
         )
         .await
         {
@@ -651,25 +654,14 @@ async fn run_active_loop(
 
     loop {
         let now = Instant::now();
-        let wake_repair = bg.is_none()
-            && disk.as_ref().is_some_and(|d| {
-                d.lexical.is_some()
-                    && d.epoch.is_some()
-                    && d.has_pending_embeddings()
-                    && (d.embedder.is_some() || d.manifest.active_model.is_some())
-            });
-        let wake_model = bg.is_none()
-            && disk.as_ref().is_some_and(|d| {
-                d.lexical.is_some()
-                    && (retry_model
-                        || (d.manifest.embeddings_pending && d.manifest.vector_seq.is_none()))
-            });
-        let next_timer = match (wake_repair, wake_model) {
-            (true, true) => Some(repair_at.min(model_retry_at)),
-            (true, false) => Some(repair_at),
-            (false, true) => Some(model_retry_at),
-            (false, false) => None,
-        };
+        let next_timer = next_maintenance_wake(
+            disk.as_ref(),
+            bg.is_some(),
+            retry_model,
+            model_retry_at,
+            embedder_retry_at,
+            repair_at,
+        );
         let timer_sleep = next_timer
             .map(|at| tokio::time::sleep_until(tokio::time::Instant::from_std(at.max(now))));
 
@@ -759,6 +751,8 @@ async fn run_active_loop(
                     force_seed,
                     scrub,
                     &mut model_check_due,
+                    embedder_retry_at,
+                    schedule.embedder_idle,
                     &mut repair_at,
                     &mut repair_delay,
                     &mut ack_after_embed,
@@ -809,6 +803,8 @@ async fn run_active_loop(
                     false,
                     false,
                     &mut model_check_due,
+                    embedder_retry_at,
+                    schedule.embedder_idle,
                     &mut repair_at,
                     &mut repair_delay,
                     &mut ack_after_embed,
@@ -838,10 +834,14 @@ async fn run_active_loop(
                 }
             }
             LoopEvent::Wake => {
+                let now = Instant::now();
                 cx.handle.touch();
                 if let Some(current) = &mut disk {
-                    current.last_activity = Instant::now();
-                    current.embedder_last_use = Instant::now();
+                    current.last_activity = now;
+                    current.embedder_last_use = now;
+                    if now >= embedder_retry_at {
+                        current.embedder_unavailable = false;
+                    }
                 }
                 let latest = cx.latest(scope).await?;
                 if latest.scope != *scope {
@@ -867,6 +867,8 @@ async fn run_active_loop(
                         false,
                         false,
                         &mut model_check_due,
+                        embedder_retry_at,
+                        schedule.embedder_idle,
                         &mut repair_at,
                         &mut repair_delay,
                         &mut ack_after_embed,
@@ -964,6 +966,15 @@ async fn run_active_loop(
             )?;
             if spawned && bg.as_ref().is_some_and(BgTask::is_reopening) {
                 publisher.publish(current, true);
+            } else if bg.is_none()
+                && cx
+                    .handle
+                    .published
+                    .load()
+                    .as_ref()
+                    .is_some_and(|published| published.reopening_vectors)
+            {
+                publisher.publish(current, false);
             }
         }
         if ack_after_embed
@@ -1100,6 +1111,57 @@ async fn sync_subscription(
     Ok(())
 }
 
+fn next_maintenance_wake(
+    disk: Option<&Disk>,
+    bg_active: bool,
+    retry_model: bool,
+    model_retry_at: Instant,
+    embedder_retry_at: Instant,
+    repair_at: Instant,
+) -> Option<Instant> {
+    if bg_active {
+        return None;
+    }
+    let disk = disk.filter(|d| d.lexical.is_some())?;
+    let repair_wake_at = (disk.epoch.is_some() && disk.has_pending_embeddings())
+        .then(|| {
+            if disk.embedder.is_some() {
+                Some(repair_at)
+            } else if disk.manifest.active_model.is_some() {
+                Some(repair_at.max(embedder_retry_at))
+            } else {
+                None
+            }
+        })
+        .flatten();
+    let model_wake_at = (retry_model
+        || (disk.manifest.embeddings_pending && disk.manifest.vector_seq.is_none()))
+    .then_some(model_retry_at);
+    match (repair_wake_at, model_wake_at) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) | (None, Some(a)) => Some(a),
+        (None, None) => None,
+    }
+}
+
+fn will_load_embedder(
+    disk: &Disk,
+    bg: &Option<BgTask>,
+    now: Instant,
+    embedder_retry_at: Instant,
+    repair_at: Instant,
+    embedder_idle: Duration,
+) -> bool {
+    if bg.is_some() || disk.lexical.is_none() || disk.epoch.is_none() || disk.embedder.is_some() {
+        return false;
+    }
+    if now < embedder_retry_at || disk.manifest.active_model.is_none() {
+        return false;
+    }
+    (disk.has_pending_embeddings() && now >= repair_at)
+        || now.saturating_duration_since(disk.embedder_last_use) < embedder_idle
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn advance_to(
     cx: &Context<'_>,
@@ -1112,6 +1174,8 @@ async fn advance_to(
     force_seed: bool,
     mut scrub: bool,
     model_check_due: &mut bool,
+    embedder_retry_at: Instant,
+    embedder_idle: Duration,
     repair_at: &mut Instant,
     repair_delay: &mut Duration,
     ack_after_embed: &mut bool,
@@ -1142,7 +1206,16 @@ async fn advance_to(
         let resumed = match current.resume_reader(cx).await {
             Ok(reopened) => {
                 if reopened {
-                    publisher.publish(current, bg.as_ref().is_some_and(BgTask::is_reopening));
+                    let reopening = bg.as_ref().is_some_and(BgTask::is_reopening)
+                        || will_load_embedder(
+                            current,
+                            bg,
+                            Instant::now(),
+                            embedder_retry_at,
+                            *repair_at,
+                            embedder_idle,
+                        );
+                    publisher.publish(current, reopening);
                 }
                 true
             }
@@ -1161,7 +1234,15 @@ async fn advance_to(
             Err(error) => return Err(error),
         };
         if resumed && let Some(current) = disk.as_mut() {
-            let reopening = bg.as_ref().is_some_and(BgTask::is_reopening);
+            let reopening = bg.as_ref().is_some_and(BgTask::is_reopening)
+                || will_load_embedder(
+                    current,
+                    bg,
+                    Instant::now(),
+                    embedder_retry_at,
+                    *repair_at,
+                    embedder_idle,
+                );
             let dirty = bg.as_mut().map(|task| &mut task.dirty);
             let catch_up_result = if current.manifest.tantivy_seq < target.after {
                 catch_up(cx, current, publisher, target.clone(), dirty, reopening).await
@@ -1263,12 +1344,7 @@ fn spawn_bg_if_ready(
     }
     // 2. Load active embedder only when embeddings are due or a recent query/wake
     // requested it, avoiding an unload/reload loop on EMBEDDER_IDLE.
-    let embedder_needed = (disk.has_pending_embeddings() && now >= repair_at)
-        || now.saturating_duration_since(disk.embedder_last_use) < embedder_idle;
-    if disk.epoch.is_some()
-        && disk.embedder.is_none()
-        && embedder_needed
-        && now >= embedder_retry_at
+    if will_load_embedder(disk, bg, now, embedder_retry_at, repair_at, embedder_idle)
         && let Some(active) = disk.manifest.active_model.clone()
     {
         let cancel = Cancellation::default();
@@ -1462,12 +1538,14 @@ async fn handle_bg_done(
                     }
                     current.epoch = Some(epoch);
                     current.embedder_last_use = Instant::now();
+                    current.embedder_unavailable = false;
                 }
                 Err(error) => {
                     tracing::warn!(kind = %error, "search vector checkpoint needs rebuilding");
                     current.manifest.vector_seq = None;
                     current.manifest.embeddings_pending = true;
                     current.embedder = None;
+                    current.embedder_unavailable = false;
                     current.publish_manifest().await?;
                     *model_check_due = true;
                 }
@@ -1481,7 +1559,9 @@ async fn handle_bg_done(
             current.embedder = embedder;
             if current.embedder.is_some() {
                 current.embedder_last_use = Instant::now();
+                current.embedder_unavailable = false;
             } else {
+                current.embedder_unavailable = true;
                 *embedder_retry_at = Instant::now() + Duration::from_secs(5);
             }
             publisher.publish(current, false);
@@ -1499,6 +1579,7 @@ async fn handle_bg_done(
                 current.manifest = manifest;
                 current.epoch = None;
                 current.embedder = None;
+                current.embedder_unavailable = false;
                 current.dirty_notes.clear();
                 current.cached_vectors.clear();
                 current.full_sweep_needed = false;
@@ -1516,6 +1597,7 @@ async fn handle_bg_done(
                 current.manifest = manifest;
                 current.epoch = None;
                 current.embedder = None;
+                current.embedder_unavailable = false;
                 current.publish_manifest().await?;
                 publisher.publish(current, false);
                 *retry_model = true;
@@ -1585,6 +1667,7 @@ async fn handle_bg_done(
                 current.epoch = Some(epoch);
                 current.embedder = Some(embedder);
                 current.embedder_last_use = Instant::now();
+                current.embedder_unavailable = false;
                 current.publish_manifest().await?;
                 build::publish_seed(cx, publisher, current).await?;
                 *retry_model = false;
@@ -1976,6 +2059,7 @@ async fn open_disk(
                 full_sweep_needed,
                 last_activity: now,
                 embedder_last_use: now,
+                embedder_unavailable: false,
             }))
         })();
         let disk = match opened {

@@ -22,6 +22,8 @@ pub const L0_FLUSH_CHUNKS: usize = 20_000;
 pub const L0_FLUSH_BYTES: usize = 12 * 1024 * 1024;
 pub const L0_MAX_CHUNKS: usize = 25_000;
 pub const L0_MAX_BYTES: usize = 16 * 1024 * 1024;
+const L0_DELETE_HARD_CHUNKS: usize = L0_MAX_CHUNKS * 2;
+const L0_DELETE_HARD_BYTES: usize = L0_MAX_BYTES * 2;
 const MIN_TIMED_FLUSH_CHUNKS: usize = 4096;
 const TIMED_FLUSH: Duration = Duration::from_secs(60);
 const FRAME_MAGIC: &[u8; 4] = b"L0W1";
@@ -115,7 +117,10 @@ impl MutableBuffer {
         let file = buffer.directory.open_with(WAL_NAME, &options)?;
         let mut input = BufReader::new(file);
         while let Some((seq, operation, frame_bytes)) = read_record(&mut input, dimension)? {
-            buffer.admit(seq, &operation)?;
+            // Replay permits the bounded active-plan Delete headroom so a crash
+            // during background FlushL0 recovers cleanly while still enforcing
+            // hard caps on both Upserts and Deletes.
+            buffer.admit_batch_with_delete_headroom(seq, std::slice::from_ref(&operation), true)?;
             let mem_bytes = operation_mem_bytes(&operation, dimension);
             buffer.apply_memory(seq, operation, frame_bytes, mem_bytes);
         }
@@ -211,13 +216,22 @@ impl MutableBuffer {
         seq: SpaceSeq,
         operations: Vec<MutableOperation>,
     ) -> Result<(), VectorError> {
+        self.apply_batch_with_delete_headroom(seq, operations, false)
+    }
+
+    pub(super) fn apply_batch_with_delete_headroom(
+        &mut self,
+        seq: SpaceSeq,
+        operations: Vec<MutableOperation>,
+        allow_delete_overflow: bool,
+    ) -> Result<(), VectorError> {
         if operations.is_empty() {
             return Ok(());
         }
         if self.failed_write {
             return Err(VectorError::CorruptIndex);
         }
-        self.admit_batch(seq, &operations)?;
+        self.admit_batch_with_delete_headroom(seq, &operations, allow_delete_overflow)?;
         let mut encoded = Vec::new();
         let mut frame_sizes = Vec::with_capacity(operations.len());
         let mut mem_sizes = Vec::with_capacity(operations.len());
@@ -276,18 +290,11 @@ impl MutableBuffer {
         Ok(())
     }
 
-    pub(super) fn admit(
-        &self,
-        seq: SpaceSeq,
-        operation: &MutableOperation,
-    ) -> Result<(), VectorError> {
-        self.admit_batch(seq, std::slice::from_ref(operation))
-    }
-
-    pub(super) fn admit_batch(
+    pub(super) fn admit_batch_with_delete_headroom(
         &self,
         seq: SpaceSeq,
         operations: &[MutableOperation],
+        allow_delete_overflow: bool,
     ) -> Result<(), VectorError> {
         if seq < self.last_seq || seq == SpaceSeq::ZERO {
             return Err(VectorError::CorruptIndex);
@@ -323,13 +330,15 @@ impl MutableBuffer {
                 .saturating_sub(prev_bytes)
                 .saturating_add(op_bytes);
             batch_state.insert(note, (op_chunks, op_bytes));
-            // Keep Delete operations unblocked while background L0 flush runs
-            // (and across crash-recovery replay) so live deletes/updates never
-            // stall on BufferFull or force a duplicate synchronous flush.
-            if !matches!(operation, MutableOperation::Delete(_))
-                && (projected_chunks > L0_MAX_CHUNKS
-                    || projected_entries > L0_MAX_CHUNKS
-                    || projected_bytes > L0_MAX_BYTES)
+            let (max_chunks, max_bytes) =
+                if allow_delete_overflow && matches!(operation, MutableOperation::Delete(_)) {
+                    (L0_DELETE_HARD_CHUNKS, L0_DELETE_HARD_BYTES)
+                } else {
+                    (L0_MAX_CHUNKS, L0_MAX_BYTES)
+                };
+            if projected_chunks > max_chunks
+                || projected_entries > max_chunks
+                || projected_bytes > max_bytes
             {
                 return Err(VectorError::BufferFull);
             }

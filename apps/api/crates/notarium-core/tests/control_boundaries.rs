@@ -1,8 +1,8 @@
 use notarium_core::{
     DomainError,
     auth::{
-        AuthenticatedCredential, Cap, ChatAudience, EngineAuthContext, PrincipalKind, Space,
-        SpaceGrant, SpaceKind, SpaceLifecycle, SpaceRole, VerifiedHuman,
+        AuthenticatedCredential, Cap, ChatAudience, EngineAuthContext, PrincipalKind,
+        ResourceFacts, Space, SpaceGrant, SpaceKind, SpaceLifecycle, SpaceRole, VerifiedHuman,
     },
     classes::DocClass,
     document::{estimate_conservative_tokens, estimate_token_twelfths},
@@ -281,12 +281,12 @@ fn search_indexing_authority_cannot_delegate_or_view_chats_or_cross_intersect() 
         },
     )]);
     let forged_human = EngineAuthContext::for_human(
-        VerifiedHuman::attest(principal, grant, forged_grants, false).with_credential(
-            AuthenticatedCredential::SearchIndexing {
+        VerifiedHuman::attest(principal, grant, forged_grants, true)
+            .with_human_management(true)
+            .with_credential(AuthenticatedCredential::SearchIndexing {
                 space: space_id.clone(),
                 provider,
-            },
-        ),
+            }),
     );
     assert_eq!(
         forged_human.intersect_current(&auth).unwrap_err(),
@@ -303,5 +303,34 @@ fn search_indexing_authority_cannot_delegate_or_view_chats_or_cross_intersect() 
     assert_eq!(
         forged_human.can_view_chat(&personal_space, None, false),
         Err(DomainError::ResourceNotFound)
+    );
+    assert!(!forged_human.human_management());
+    assert_eq!(
+        forged_human.authorize_human_management(),
+        Err(DomainError::AccessDenied)
+    );
+    assert!(!forged_human.has_cap(Cap::AbilityWrite));
+    assert_eq!(
+        forged_human.authorize_ability_mutation(),
+        Err(DomainError::AbilityWriteForbidden)
+    );
+    assert_eq!(
+        forged_human.authorize_write_space_pin(&personal_space),
+        Err(DomainError::SpaceReadOnly)
+    );
+    assert_eq!(
+        forged_human.authorize_space_write(&personal_space),
+        Err(DomainError::SpaceReadOnly)
+    );
+    let facts = ResourceFacts {
+        space: personal_space,
+        class: DocClass::UserDoc,
+        ancestor_folders: vec![],
+        folder_write_locked: false,
+        ability_package: None,
+    };
+    assert_eq!(
+        forged_human.authorize_direct_write(&facts, &facts),
+        Err(DomainError::SpaceReadOnly)
     );
 }

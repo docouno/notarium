@@ -77,6 +77,7 @@ pub(super) struct Services {
     pub writers: WriterPool,
     pub readers: Arc<ReaderCache>,
     pub models: crate::model::LocalModels,
+    pub schedule: crate::indexer::Schedule,
 }
 
 pub(super) struct Published {
@@ -90,6 +91,7 @@ pub(super) struct Published {
     pub embedder: Option<Arc<crate::model::Embedder>>,
     pub embeddings_pending: bool,
     pub reopening_vectors: bool,
+    pub embedder_unavailable: bool,
 }
 
 pub(super) struct SpaceHandle {
@@ -333,6 +335,23 @@ impl SearchEngine {
     }
 
     pub fn start(config: SearchConfig, deps: SearchDependencies) -> Self {
+        Self::start_inner(config, deps, crate::indexer::Schedule::default())
+    }
+
+    #[cfg(test)]
+    pub(super) fn start_with_schedule(
+        config: SearchConfig,
+        deps: SearchDependencies,
+        schedule: crate::indexer::Schedule,
+    ) -> Self {
+        Self::start_inner(config, deps, schedule)
+    }
+
+    fn start_inner(
+        config: SearchConfig,
+        deps: SearchDependencies,
+        schedule: crate::indexer::Schedule,
+    ) -> Self {
         let (local_scheduler, local_worker) = EmbeddingScheduler::start();
         let (remote_scheduler, remote_worker) = EmbeddingScheduler::start();
         let services = Arc::new(Services {
@@ -345,6 +364,7 @@ impl SearchEngine {
             writers: WriterPool::default(),
             readers: Arc::new(ReaderCache::default()),
             models: crate::model::LocalModels::default(),
+            schedule,
         });
         let pool = services.writers.clone();
         let cancellation = services.shutdown.clone();

@@ -449,7 +449,9 @@ impl EngineAuthContext {
         &self.taint
     }
     pub fn human_management(&self) -> bool {
-        self.human_management && self.kind == PrincipalKind::DirectHuman
+        !self.is_search_indexing()
+            && self.human_management
+            && self.kind == PrincipalKind::DirectHuman
     }
     pub fn authorize_human_management(&self) -> DomainResult<()> {
         if self.human_management() {
@@ -654,6 +656,7 @@ impl EngineAuthContext {
             .ok_or(DomainError::ResourceNotFound)?;
         if space.lifecycle != SpaceLifecycle::Active
             || grant.role == SpaceRole::Viewer
+            || self.is_search_indexing()
             || self
                 .write_space
                 .as_ref()

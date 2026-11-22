@@ -717,6 +717,11 @@ impl VectorEpoch {
         self.flush_pending_batch(seq, &mut pending)
     }
 
+    #[cfg(test)]
+    pub(super) fn mutable_entry_count(&self) -> usize {
+        self.mutable.notes().count()
+    }
+
     fn flush_pending_batch(
         &mut self,
         seq: SpaceSeq,
@@ -726,10 +731,18 @@ impl VectorEpoch {
             return Ok(());
         }
         let batch = std::mem::take(pending);
-        match self.mutable.admit_batch(seq, &batch) {
+        let allow_delete_overflow = self.has_active_plan()
+            && batch
+                .iter()
+                .all(|op| matches!(op, MutableOperation::Delete(_)));
+        match self
+            .mutable
+            .admit_batch_with_delete_headroom(seq, &batch, allow_delete_overflow)
+        {
             Ok(()) => {
                 let notes: Vec<NoteId> = batch.iter().map(|op| op.note().clone()).collect();
-                self.mutable.apply_batch(seq, batch)?;
+                self.mutable
+                    .apply_batch_with_delete_headroom(seq, batch, allow_delete_overflow)?;
                 for note in &notes {
                     for segment in &mut self.segments {
                         segment.mark_superseded_note(note);
@@ -746,7 +759,8 @@ impl VectorEpoch {
         for operation in batch {
             current.push(operation);
             if matches!(
-                self.mutable.admit_batch(seq, &current),
+                self.mutable
+                    .admit_batch_with_delete_headroom(seq, &current, false),
                 Err(VectorError::BufferFull)
             ) {
                 let overflow = current.pop().expect("non-empty sub-batch");

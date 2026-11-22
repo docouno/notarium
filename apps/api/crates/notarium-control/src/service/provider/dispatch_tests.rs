@@ -829,6 +829,7 @@ async fn gateway(pg: bool, kind: ProviderWireKind, label: &str) {
     // dispatch and must be rejected across ControlService and non-embedding
     // ProviderService entrypoints without issuing egress or HTTP traffic.
     let before_rejected = requests.lock().unwrap().len();
+    let before_egress = setup.egress.cancellations.lock().unwrap().len();
     let indexing_account = AccountContext::new(indexing.auth().clone(), budget());
     let control = setup.provider.control_service();
     assert!(matches!(
@@ -954,7 +955,79 @@ async fn gateway(pg: bool, kind: ProviderWireKind, label: &str) {
             .await,
         Err(PortError::Domain(DomainError::AccessDenied))
     ));
+    let foreign_provider = ProviderResourceId::from_bytes([99; 16]);
+    let mut foreign_policy = setup.selection.policy.clone();
+    foreign_policy.provider = foreign_provider.clone();
+    let foreign_doc = Arc::new(setup.document.clone());
+    let foreign_part = ContentPart::from_chunk(
+        foreign_doc.clone(),
+        ChunkDescriptor {
+            source: foreign_doc.digest(),
+            model: ModelProfileId::from_bytes([4; 16]),
+            context: vec![],
+            spans: vec![ByteSpan::new(0, 14).unwrap()],
+            text: "private source".into(),
+            tokens: 3,
+            key: ContentDigest::from_bytes([7; 32]),
+        },
+    )
+    .unwrap();
+    let wrong_provider = EmbeddingRequest::parts(
+        CommandKey::from_bytes([127; 16]),
+        ModelProfileId::from_bytes([4; 16]),
+        foreign_provider,
+        None,
+        vec![
+            ClassEgressFence::provider_part(foreign_part, indexing.auth(), &foreign_policy)
+                .unwrap(),
+        ],
+        3,
+    )
+    .with_runtime_epochs(ProviderRuntimeEpochs {
+        resource: std::num::NonZeroU64::new(999).unwrap(),
+        credential: std::num::NonZeroU64::new(999),
+    });
+    assert!(wrong_provider.validate().is_ok());
+    assert!(matches!(
+        setup.provider.embed(indexing.clone(), wrong_provider).await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+    let wrong_space_auth = notarium_core::auth::EngineAuthContext::for_search_indexing(
+        indexing.auth().principal().clone(),
+        indexing.auth().grant().clone(),
+        SpaceId::from_bytes([98; 16]),
+        setup.selection.provider.clone(),
+    );
+    let mut wrong_space_grants = setup.space.auth().spaces().clone();
+    wrong_space_grants.extend(wrong_space_auth.spaces().clone());
+    let wrong_space_forged = notarium_core::auth::EngineAuthContext::for_human(
+        notarium_core::auth::VerifiedHuman::attest(
+            indexing.auth().principal().clone(),
+            indexing.auth().grant().clone(),
+            wrong_space_grants,
+            false,
+        )
+        .with_credential(
+            notarium_core::auth::AuthenticatedCredential::SearchIndexing {
+                space: SpaceId::from_bytes([98; 16]),
+                provider: setup.selection.provider.clone(),
+            },
+        ),
+    );
+    let wrong_space_ctx =
+        SpaceContext::new(wrong_space_forged, setup.space.scope().clone(), budget()).unwrap();
+    assert!(matches!(
+        setup
+            .provider
+            .embed(wrong_space_ctx, setup.embedding(128, &setup.document))
+            .await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
     assert_eq!(requests.lock().unwrap().len(), before_rejected);
+    assert_eq!(
+        setup.egress.cancellations.lock().unwrap().len(),
+        before_egress
+    );
     assert_eq!(setup.egress.active.load(Ordering::SeqCst), 0);
     // Narrowed caller read_classes constrain both query_disclosure and EmbeddingInput::Query.
     let mut narrowed_grants = setup.space.auth().spaces().clone();

@@ -300,17 +300,25 @@ impl SearchEngine {
             ));
         };
         let remaining = clock.remaining()?.remaining;
+        let needs_embedder_reload = state.vectors.is_some()
+            && state.embedder.is_none()
+            && state.active_model.is_some()
+            && !state.embedder_unavailable;
+        let waiting_for_vectors = state.reopening_vectors || needs_embedder_reload;
         // Leave time for lexical hydration when a durable vector mapping or
         // native model is still opening. Fast reopens can serve the first query.
-        let max = if state.reopening_vectors {
+        let max = if waiting_for_vectors {
             remaining / 2
         } else {
             remaining
         };
         let max = max.min(self.services.config.interactive_budget());
         let (state, embedder, vector) = match tokio::time::timeout(max, async {
-            let state = if state.reopening_vectors {
+            let state = if waiting_for_vectors {
                 let mut updated = handle.epoch.subscribe();
+                if needs_embedder_reload {
+                    handle.wake.notify_one();
+                }
                 loop {
                     let Some(current) = handle.published.load_full() else {
                         return Ok(None);
@@ -324,8 +332,16 @@ impl SearchEngine {
                         // of reporting a false ModelUnavailable.
                         return Ok(None);
                     }
-                    if !current.reopening_vectors {
+                    if !current.reopening_vectors
+                        && (current.embedder.is_some()
+                            || current.vectors.is_none()
+                            || current.active_model.is_none()
+                            || current.embedder_unavailable)
+                    {
                         break current;
+                    }
+                    if needs_embedder_reload && !current.reopening_vectors {
+                        handle.wake.notify_one();
                     }
                     updated
                         .changed()

@@ -74,9 +74,13 @@ immediately and evict their worker after 30 seconds (`ARCHIVED_IDLE`). Disk
 indexing shares the bounded four-writer pool, while exact receipt overlays run
 in ephemeral in-memory writers outside that pool.
 
-Vectors use a bounded mutable L0 journal (capped at 16 MiB with batched fsync)
-and read-only, single-pass BLAKE3-checksummed v2 mmap segments (bounded to
-112 MiB per segment build). Each segment contains normalized, per-vector i8
+Vectors use a bounded mutable L0 journal with batched fsync (soft background
+flush threshold at 12 MiB or 20,000 chunks, hard upsert limit at 16 MiB or
+25,000 chunks, and bounded headroom up to 32 MiB or 50,000 entries for
+delete-only batches while a background flush or compaction plan is active;
+without an active plan, delete overflow flushes tombstones and resets the
+journal) and read-only, single-pass BLAKE3-checksummed v2 mmap segments
+(bounded to 112 MiB per segment build). Each segment contains normalized, per-vector i8
 embeddings, a CSR-HNSW graph built in Rust, sorted note-slot and content-key
 indexes, and precomputed class/folder filter bitmaps. Non-blocking partial
 compaction plans and writes replacement segments outside the reader lock before

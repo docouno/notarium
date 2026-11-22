@@ -1019,14 +1019,14 @@ async fn empty_query_preserves_exact_causal_and_stale_incarnation(
             display_name: "Fresh folder".into(),
             is_project: false,
             project_slug: None,
-            actor: owner,
+            actor: owner.clone(),
             timestamp: None,
         })
         .await
         .unwrap();
     let proj_bg = projection.clone();
     let folder_bg = new_folder.clone();
-    let root_bg = root_folder;
+    let root_bg = root_folder.clone();
     let advance_task = tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(40)).await;
         let mut snap = proj_bg.snapshot.write().unwrap();
@@ -1034,23 +1034,57 @@ async fn empty_query_preserves_exact_causal_and_stale_incarnation(
         snap.advance(folder_seq);
     });
     let folder_receipt =
-        ReceiptSet::new([MutationReceiptToken::new(scope, folder_seq).unwrap()]).unwrap();
+        ReceiptSet::new([MutationReceiptToken::new(scope.clone(), folder_seq).unwrap()]).unwrap();
     let mut empty_exact = query("---");
-    empty_exact.folder = Some(new_folder.clone());
-    empty_exact.causal = CausalBasis::Exact(folder_receipt.clone());
+    empty_exact.folder = Some(new_folder);
+    empty_exact.causal = CausalBasis::Exact(folder_receipt);
     let empty_res = engine.search(ctx.clone(), empty_exact).await.unwrap();
     assert!(empty_res.cut.projected_seq >= folder_seq);
     assert!(empty_res.hits.is_empty());
+    advance_task.await.unwrap();
 
+    // Use a separate delayed folder and seq so encrypted_only independently
+    // proves waiting on CausalBasis::Exact rather than reusing the advanced cut.
+    let enc_folder = sample_folder_id(tag + 2);
+    let (_, _, enc_folder_seq) = store
+        .create_folder(CreateFolderSpec {
+            scope: scope.clone(),
+            active_epoch: lease,
+            folder_id: enc_folder.clone(),
+            parent: Some(root_folder.clone()),
+            slug: "fresh-encrypted-folder".into(),
+            display_name: "Fresh encrypted folder".into(),
+            is_project: false,
+            project_slug: None,
+            actor: owner,
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+    assert!(
+        projection.snapshot.read().unwrap().cut().projected_seq < enc_folder_seq,
+        "projection must lag behind enc_folder_seq before enc_exact waits on it"
+    );
+    let enc_proj_bg = projection.clone();
+    let enc_folder_bg = enc_folder.clone();
+    let enc_root_bg = root_folder;
+    let enc_advance_task = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let mut snap = enc_proj_bg.snapshot.write().unwrap();
+        snap.folder(enc_folder_bg, enc_root_bg);
+        snap.advance(enc_folder_seq);
+    });
+    let enc_folder_receipt =
+        ReceiptSet::new([MutationReceiptToken::new(scope, enc_folder_seq).unwrap()]).unwrap();
     let mut enc_exact = query("anything");
-    enc_exact.folder = Some(new_folder);
+    enc_exact.folder = Some(enc_folder);
     enc_exact.classes = BTreeSet::from([DocClass::EncryptedNote]);
-    enc_exact.causal = CausalBasis::Exact(folder_receipt);
+    enc_exact.causal = CausalBasis::Exact(enc_folder_receipt);
     let enc_res = engine.search(ctx, enc_exact).await.unwrap();
-    assert!(enc_res.cut.projected_seq >= folder_seq);
+    assert!(enc_res.cut.projected_seq >= enc_folder_seq);
     assert!(enc_res.hits.is_empty());
 
-    advance_task.await.unwrap();
+    enc_advance_task.await.unwrap();
     engine.shutdown().await;
 }
 

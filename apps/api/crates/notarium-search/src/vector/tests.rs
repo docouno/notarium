@@ -1185,7 +1185,7 @@ fn metadata_caps_context_spans_and_oversized_notes_bypass_wal_limit() {
 }
 
 #[test]
-fn l0_soft_flush_headroom_and_delete_batches_never_block_on_buffer_full() {
+fn l0_soft_flush_headroom_and_bounded_delete_overflow() {
     assert_eq!(L0_FLUSH_CHUNKS, 20_000);
     assert_eq!(L0_FLUSH_BYTES, 12 * 1024 * 1024);
     assert_eq!(L0_MAX_CHUNKS, 25_000);
@@ -1199,8 +1199,10 @@ fn l0_soft_flush_headroom_and_delete_batches_never_block_on_buffer_full() {
     };
 
     // 1. MutableBuffer triggers should_flush at L0_FLUSH_BYTES (12 MiB) while
-    // retaining 4 MiB headroom for Upserts before L0_MAX_BYTES (16 MiB), and
-    // never rejects Delete-only batches on BufferFull (including on reopen).
+    // retaining 4 MiB headroom for Upserts before L0_MAX_BYTES (16 MiB).
+    // Without active-plan headroom, both Upserts and Deletes hit BufferFull at
+    // L0_MAX_BYTES; with active-plan headroom, Delete overflow succeeds up to
+    // 2 * L0_MAX_BYTES and replays cleanly on reopen.
     let scratch = Scratch::new();
     let mut buffer = MutableBuffer::open(&scratch.0, 4096).unwrap();
     let base_chunk = fixture(1, 4096);
@@ -1223,33 +1225,88 @@ fn l0_soft_flush_headroom_and_delete_batches_never_block_on_buffer_full() {
     buffer.apply(seq(2), make_upsert(31, 100)).unwrap();
     assert!(buffer.mem_bytes() < L0_MAX_BYTES);
 
-    // Fill close to L0_MAX_BYTES (39 notes ~= 15.95 MiB) and verify an extra Upsert hits BufferFull.
+    // Fill close to L0_MAX_BYTES (39 notes ~= 15.95 MiB): both Upsert and
+    // unguarded Delete overflow return BufferFull.
     let fill: Vec<_> = (32..=39).map(|i| make_upsert(i, 100)).collect();
     buffer.apply_batch(seq(3), fill).unwrap();
     assert!(matches!(
         buffer.apply(seq(4), make_upsert(40, 100)),
         Err(VectorError::BufferFull)
     ));
+    let deletes = || -> Vec<MutableOperation> {
+        (10_000..15_000)
+            .map(|i| MutableOperation::Delete(note_id(i)))
+            .collect()
+    };
+    assert!(matches!(
+        buffer.apply_batch(seq(4), deletes()),
+        Err(VectorError::BufferFull)
+    ));
 
-    // Delete-only batch pushing mem_bytes above L0_MAX_BYTES still succeeds and replays.
-    let deletes: Vec<_> = (10_000..15_000)
-        .map(|i| MutableOperation::Delete(note_id(i)))
-        .collect();
-    buffer.apply_batch(seq(4), deletes).unwrap();
+    // Active-plan Delete headroom accepts the batch above L0_MAX_BYTES and replays.
+    buffer
+        .apply_batch_with_delete_headroom(seq(4), deletes(), true)
+        .unwrap();
     assert!(buffer.mem_bytes() > L0_MAX_BYTES);
     drop(buffer);
     let reopened = MutableBuffer::open(&scratch.0, 4096).unwrap();
     assert!(reopened.mem_bytes() > L0_MAX_BYTES);
     assert!(reopened.supersedes(&note_id(14_999)));
 
-    // 2. VectorEpoch triggers soft flush at L0_FLUSH_CHUNKS entries while live
-    // Delete-only batches continue above L0_MAX_CHUNKS without a sync flush.
+    // 2. Without an active plan, a Delete-only stream exceeding L0_MAX_CHUNKS
+    // triggers a delete-only flush (tombstones + WAL reset, no new segment),
+    // keeping MutableBuffer strictly bounded.
+    let no_plan_scratch = Scratch::new();
+    let no_plan_scope = HistoryScope {
+        space_id: SpaceId::from_bytes([4; 16]),
+        incarnation: HistoryIncarnation::from_bytes([4; 16]),
+    };
+    let no_plan_layout =
+        Arc::new(SearchLayout::open(&DataRoot::new(&no_plan_scratch.0), no_plan_scope).unwrap());
+    let mut no_plan_epoch = VectorEpoch::open(no_plan_layout, model(), 64).unwrap();
+    let mut seed_builder = SegmentBuilder::new(&model(), 64).unwrap();
+    let kept_chunk = fixture(5, 64);
+    for idx in 1..=5 {
+        seed_builder.push(fixture(idx, 64)).unwrap();
+    }
+    no_plan_epoch.seed(seed_builder, seq(1)).unwrap();
+    for page in 0u32..26 {
+        let start = page * 1_000 + 1;
+        let ops: Vec<_> = (start..start + 1_000)
+            .filter(|&id| id != 5)
+            .map(|id| MutableOperation::Delete(note_id(id)))
+            .collect();
+        no_plan_epoch
+            .apply_batch(seq(u64::from(page) + 2), ops)
+            .unwrap();
+    }
+    assert_eq!(
+        no_plan_epoch.snapshot().manifest().active_segments.len(),
+        1,
+        "delete-only L0 flush must not build a new segment"
+    );
+    assert!(
+        no_plan_epoch.mutable_entry_count() < L0_MAX_CHUNKS,
+        "mass Delete stream without active plan must flush and bound MutableBuffer"
+    );
+    assert!(no_plan_epoch.matches_note_chunks(&note_id(1), &[]));
+    assert!(
+        no_plan_epoch
+            .matches_note_chunks(&kept_chunk.metadata.note, std::slice::from_ref(&kept_chunk),)
+    );
+
+    // 3. With an active FlushL0 plan, Delete-only batches may overflow up to
+    // 2 * L0_MAX_CHUNKS without forcing a duplicate sync flush, and reject
+    // above the 2 * L0_MAX_CHUNKS hard cap with BufferFull.
     let epoch_scratch = Scratch::new();
     let scope = HistoryScope {
         space_id: SpaceId::from_bytes([5; 16]),
         incarnation: HistoryIncarnation::from_bytes([5; 16]),
     };
     let layout = Arc::new(SearchLayout::open(&DataRoot::new(&epoch_scratch.0), scope).unwrap());
+    let epoch_dir = layout
+        .model_epoch(&VectorModel::local(model(), 64))
+        .unwrap();
     let mut epoch = VectorEpoch::open(layout, model(), 64).unwrap();
     let live_chunk = fixture(1, 64);
     let mut ops = Vec::with_capacity(L0_FLUSH_CHUNKS);
@@ -1264,7 +1321,7 @@ fn l0_soft_flush_headroom_and_delete_batches_never_block_on_buffer_full() {
     assert!(epoch.should_flush(Instant::now()));
 
     let plan = epoch.plan_flush_l0().unwrap().expect("flush plan");
-    let concurrent_deletes: Vec<_> = (100_000..106_000)
+    let concurrent_deletes: Vec<_> = (100_000..110_000)
         .map(|i| MutableOperation::Delete(note_id(i)))
         .collect();
     epoch.apply_batch(seq(2), concurrent_deletes).unwrap();
@@ -1272,11 +1329,27 @@ fn l0_soft_flush_headroom_and_delete_batches_never_block_on_buffer_full() {
         epoch.snapshot().manifest().active_segments.is_empty(),
         "Delete-only batch during FlushL0 must not force a duplicate sync flush"
     );
+    assert_eq!(epoch.mutable_entry_count(), 30_000);
+
+    // Crash-recovery replay of the >L0_MAX_CHUNKS WAL written during FlushL0 succeeds.
+    let replayed = MutableBuffer::open(&epoch_dir, 64).unwrap();
+    assert_eq!(replayed.notes().count(), 30_000);
+
+    // Exceeding the 2 * L0_MAX_CHUNKS hard cap during an active plan fails closed.
+    let excessive_deletes: Vec<_> = (200_000..221_000)
+        .map(|i| MutableOperation::Delete(note_id(i)))
+        .collect();
+    assert!(matches!(
+        epoch.apply_batch(seq(3), excessive_deletes),
+        Err(VectorError::BufferFull)
+    ));
+
     let replacement = plan.execute(&Cancellation::default()).unwrap();
     epoch
         .commit_flush_l0(plan, replacement, &HashSet::new())
         .unwrap();
     assert_eq!(epoch.snapshot().manifest().active_segments.len(), 1);
+    assert_eq!(epoch.mutable_entry_count(), 10_000);
     assert!(
         epoch.matches_note_chunks(&live_chunk.metadata.note, std::slice::from_ref(&live_chunk),)
     );

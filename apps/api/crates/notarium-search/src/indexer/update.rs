@@ -85,6 +85,7 @@ pub(super) async fn apply(
                     // when the selected model serves the entire space.
                     disk.manifest.embeddings_pending = true;
                     disk.full_sweep_needed = true;
+                    disk.full_sweep_after = None;
                 }
             }
             EntityId::Ability(_) | EntityId::Job(_) => {}

@@ -109,6 +109,7 @@ async fn idle_space_releases_embedder_and_reopens_checkpointed_wal_after_evictio
         full_sweep_needed: false,
         last_activity: idle_since,
         embedder_last_use: idle_since,
+        embedder_unavailable: false,
     };
     // Embedder idle keeps the lightweight mmap VectorEpoch resident.
     disk.release_idle_embedder(idle_since + EMBEDDER_IDLE, EMBEDDER_IDLE);
@@ -661,6 +662,7 @@ fn reopening_vectors_stays_true_during_reopen_after_live_edit_clears_vector_seq(
         full_sweep_needed: false,
         last_activity: now,
         embedder_last_use: now,
+        embedder_unavailable: false,
     };
     let handle = Arc::new(SpaceHandle::new());
     let mut publisher = Publisher {
@@ -761,6 +763,7 @@ async fn full_sweep_completion_preserves_resweep_when_remote_folders_changed() {
         full_sweep_needed: true,
         last_activity: now,
         embedder_last_use: now,
+        embedder_unavailable: false,
     });
     let handle = Arc::new(SpaceHandle::new());
     let cx = Context {
@@ -1514,4 +1517,670 @@ async fn draining_gate_serializes_replacement_worker_until_evicted_worker_exits(
     assert_eq!(engine.draining_and_bg_count(), (0, 0));
     runtime.shutdown().await.unwrap();
     std::fs::remove_dir_all(path).unwrap();
+}
+
+#[tokio::test]
+async fn failed_embedder_load_respects_retry_backoff_without_busy_spin() {
+    use crate::{
+        SearchDependencies, SearchEngine,
+        config::{SearchConfig, VectorMode},
+        ports::{RemoteIndexingGrant, SearchModelResolverPort},
+    };
+    use notarium_canonical::{CanonicalConfig, CanonicalRuntime, CreateSpaceSpec};
+    use notarium_core::{
+        auth::SpaceKind,
+        ids::{InstallationId, LeaseEpoch, PrincipalId, ProviderResourceId},
+        model::FolderRef,
+        ports::ServiceAuthority,
+    };
+
+    struct FixedTargetResolver(ResolvedEmbeddingTarget);
+    impl SearchModelResolverPort for FixedTargetResolver {
+        fn resolve_model<'a>(
+            &'a self,
+            _: &'a ServiceAuthority,
+            _: &'a HistoryScope,
+            _: Option<&'a ModelProfileId>,
+            _: &'a CallBudget,
+        ) -> PortFuture<'a, Option<ResolvedEmbeddingTarget>> {
+            let target = self.0.clone();
+            Box::pin(async move { Ok(Some(target)) })
+        }
+
+        fn acquire_remote_indexing_grant<'a>(
+            &'a self,
+            _: &'a ServiceAuthority,
+            _: &'a HistoryScope,
+            _: &'a PrincipalId,
+            _: &'a ProviderResourceId,
+            _: Option<&'a FolderRef>,
+            _: CallBudget,
+        ) -> PortFuture<'a, Option<RemoteIndexingGrant>> {
+            Box::pin(async { Ok(None) })
+        }
+    }
+
+    let mut entropy = [0u8; 16];
+    getrandom::fill(&mut entropy).unwrap();
+    let path = std::env::temp_dir().join(format!("search-embed-backoff-{}", hex::encode(entropy)));
+    std::fs::create_dir(&path).unwrap();
+    let root = DataRoot::new(&path);
+    let (store, runtime) = CanonicalRuntime::open(CanonicalConfig::local_default(
+        InstallationId::from_bytes([0xf1; 16]),
+        root.clone(),
+    ))
+    .await
+    .unwrap();
+    let store = Arc::new(store);
+    let owner = PrincipalId::from_bytes([0xf2; 16]);
+    let lease = LeaseEpoch::new(1).unwrap();
+    let scope = store
+        .create_space(CreateSpaceSpec {
+            space_id: SpaceId::from_bytes([0xf3; 16]),
+            incarnation: HistoryIncarnation::from_bytes([0xf3; 16]),
+            root_folder_id: FolderId::from_bytes([0xf4; 16]),
+            slug: "embed-backoff".into(),
+            kind: SpaceKind::Personal,
+            owner,
+            active_epoch: lease,
+            initial_last_seq: SpaceSeq::ZERO,
+            created_at: None,
+        })
+        .await
+        .unwrap()
+        .scope;
+
+    let layout = Arc::new(SearchLayout::open(&root, scope.clone()).unwrap());
+    let lexical =
+        Arc::new(LexicalIndex::create(&layout.create_index_generation(1).unwrap()).unwrap());
+    layout
+        .persist_folder_dictionary(&FolderDictionary::default())
+        .unwrap();
+    let profile = ModelProfileId::from_bytes([0xf5; 16]);
+    let seq = SpaceSeq::ZERO;
+    let mut epoch = VectorEpoch::open(layout.clone(), profile.clone(), 64).unwrap();
+    epoch
+        .seed(SegmentBuilder::new(&profile, 64).unwrap(), seq)
+        .unwrap();
+    let target = ResolvedEmbeddingTarget {
+        model: profile,
+        dimension: 64,
+        max_input_tokens: 512,
+        backend: EmbeddingBackendTarget::LocalOnnx,
+    };
+    let manifest = SearchManifest {
+        scope: scope.clone(),
+        tantivy_seq: seq,
+        tantivy_commit: lexical.commit_id().unwrap(),
+        active_index_dir: crate::layout::index_name(1),
+        tokenizer_version: TOKENIZER_VERSION,
+        active_model: Some(target.clone()),
+        vector_seq: Some(seq),
+        embeddings_pending: true,
+    };
+    layout.publish_search(&manifest).unwrap();
+
+    // Pure timer invariant: when embedder is unloaded with pending embeddings,
+    // next_maintenance_wake must wait until repair_at.max(embedder_retry_at)
+    // instead of returning a past repair_at in a 0ns busy-spin.
+    let now = Instant::now();
+    let disk = Disk {
+        layout,
+        manifest,
+        folders: Arc::new(FolderDictionary::default()),
+        lexical: Some(lexical),
+        epoch: Some(epoch),
+        embedder: None,
+        dirty_notes: BTreeSet::from([NoteId::from_bytes([0xf6; 16])]),
+        cached_vectors: HashMap::new(),
+        full_sweep_after: None,
+        full_sweep_needed: true,
+        last_activity: now,
+        embedder_last_use: now,
+        embedder_unavailable: true,
+    };
+    let embedder_retry_at = now + Duration::from_secs(5);
+    let model_retry_at = now;
+    assert_eq!(
+        next_maintenance_wake(
+            Some(&disk),
+            false,
+            false,
+            model_retry_at,
+            embedder_retry_at,
+            now,
+        ),
+        Some(embedder_retry_at),
+        "failed LoadEmbedder backoff must gate repair wake timer"
+    );
+    let later_repair = now + Duration::from_secs(10);
+    assert_eq!(
+        next_maintenance_wake(
+            Some(&disk),
+            false,
+            false,
+            model_retry_at,
+            embedder_retry_at,
+            later_repair,
+        ),
+        Some(later_repair)
+    );
+    assert_eq!(
+        next_maintenance_wake(
+            Some(&disk),
+            true,
+            false,
+            model_retry_at,
+            embedder_retry_at,
+            now,
+        ),
+        None
+    );
+    drop(disk);
+
+    // End-to-end check: missing ONNX dylib causes LoadEmbedder to fail and set
+    // embedder_unavailable = true without spinning or re-publishing in backoff.
+    let mut deps = SearchDependencies::new(store, Arc::new(UnusedStructural));
+    deps.model_resolver = Some(Arc::new(FixedTargetResolver(target)));
+    let engine = SearchEngine::start_with_schedule(
+        SearchConfig::new(
+            root,
+            VectorMode::DynamicOrt {
+                dylib_path: path.join("missing-onnx.so"),
+                model_dir: path.join("missing-models"),
+            },
+        ),
+        deps,
+        Schedule {
+            tick: Duration::from_millis(200),
+            lexical_idle: Duration::from_secs(30),
+            embedder_idle: Duration::from_secs(60),
+            worker_idle: Duration::from_secs(300),
+            archived_idle: Duration::from_secs(30),
+        },
+    );
+    let handle = engine.space(scope).unwrap();
+    let mut epochs = handle.epoch.subscribe();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(state) = handle.published.load_full()
+                && state.embedder_unavailable
+            {
+                assert!(state.embedder.is_none());
+                assert!(!state.reopening_vectors);
+                assert!(state.vectors.is_some());
+                break;
+            }
+            epochs.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    let epoch_before = *handle.epoch.borrow();
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    assert_eq!(*handle.epoch.borrow(), epoch_before);
+    let after = handle.published.load_full().unwrap();
+    assert!(after.vectors.is_some());
+    assert!(after.embedder_unavailable);
+    assert!(after.embedder.is_none());
+    drop(after);
+
+    engine.shutdown().await;
+    runtime.shutdown().await.unwrap();
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[tokio::test]
+async fn folder_move_between_full_sweep_pages_resets_full_sweep_after() {
+    use crate::{
+        SearchDependencies, SearchEngine,
+        config::{SearchConfig, VectorMode},
+    };
+    use notarium_canonical::{CanonicalConfig, CanonicalRuntime};
+    use notarium_core::{
+        ids::{InstallationId, ProviderResourceId, RevisionId},
+        model::Lifecycle,
+        ports::{Change, ChangeKind, CommandSeqRange, EntityId, ProviderRuntimeEpochs},
+        receipt::MutationEffect,
+    };
+
+    let mut entropy = [0u8; 16];
+    getrandom::fill(&mut entropy).unwrap();
+    let path = std::env::temp_dir().join(format!("search-sweep-move-{}", hex::encode(entropy)));
+    std::fs::create_dir(&path).unwrap();
+    let root = DataRoot::new(&path);
+    let (store, runtime) = CanonicalRuntime::open(CanonicalConfig::local_default(
+        InstallationId::from_bytes([0xf7; 16]),
+        root.clone(),
+    ))
+    .await
+    .unwrap();
+    let engine = SearchEngine::start(
+        SearchConfig::new(root.clone(), VectorMode::RemoteOnly),
+        SearchDependencies::new(Arc::new(store), Arc::new(UnusedStructural)),
+    );
+    let scope = HistoryScope {
+        space_id: SpaceId::from_bytes([0xf8; 16]),
+        incarnation: HistoryIncarnation::from_bytes([0xf8; 16]),
+    };
+    let layout = Arc::new(SearchLayout::open(&root, scope.clone()).unwrap());
+    let lexical =
+        Arc::new(LexicalIndex::create(&layout.create_index_generation(1).unwrap()).unwrap());
+    let now = Instant::now();
+    let seq1 = SpaceSeq::new(1).unwrap();
+    let seq2 = SpaceSeq::new(2).unwrap();
+    let seq3 = SpaceSeq::new(3).unwrap();
+    let mut disk = Disk {
+        layout,
+        manifest: SearchManifest {
+            scope: scope.clone(),
+            tantivy_seq: seq1,
+            tantivy_commit: lexical.commit_id().unwrap(),
+            active_index_dir: crate::layout::index_name(1),
+            tokenizer_version: TOKENIZER_VERSION,
+            active_model: Some(ResolvedEmbeddingTarget {
+                model: ModelProfileId::from_bytes([0xf9; 16]),
+                dimension: 64,
+                max_input_tokens: 512,
+                backend: EmbeddingBackendTarget::Remote {
+                    provider: ProviderResourceId::from_bytes([0xfa; 16]),
+                    runtime_epochs: ProviderRuntimeEpochs {
+                        resource: std::num::NonZeroU64::MIN,
+                        credential: None,
+                    },
+                    project: None,
+                },
+            }),
+            vector_seq: Some(seq1),
+            embeddings_pending: true,
+        },
+        folders: Arc::new(FolderDictionary::default()),
+        lexical: Some(lexical),
+        epoch: None,
+        embedder: None,
+        dirty_notes: BTreeSet::new(),
+        cached_vectors: HashMap::new(),
+        full_sweep_after: Some(NoteId::from_bytes([0x50; 16])),
+        full_sweep_needed: true,
+        last_activity: now,
+        embedder_last_use: now,
+        embedder_unavailable: false,
+    };
+    let handle = Arc::new(SpaceHandle::new());
+    let cx = Context {
+        services: &engine.services,
+        handle: &handle,
+    };
+    let mut publisher = Publisher {
+        handle: &handle,
+        old: Vec::new(),
+    };
+
+    let move_cursor = ChangeCursor {
+        scope: scope.clone(),
+        after: seq2,
+    };
+    let moved_folder = FolderId::from_bytes([0xfb; 16]);
+    update::apply(
+        &cx,
+        &mut disk,
+        &mut publisher,
+        move_cursor.clone(),
+        vec![Change {
+            cursor: move_cursor,
+            command_range: CommandSeqRange::new(seq2, seq2).unwrap(),
+            entity: EntityId::Folder(moved_folder.clone()),
+            kind: ChangeKind::Move,
+            revision: RevisionId::from_bytes([1; 16]),
+            lifecycle: Lifecycle::Active,
+            class: None,
+            effect: MutationEffect::NoRelevantEffect,
+        }],
+        false,
+    )
+    .await
+    .unwrap();
+    assert!(disk.full_sweep_needed);
+    assert!(
+        disk.full_sweep_after.is_none(),
+        "folder move between FullSweep pages must restart sweep from the beginning"
+    );
+    assert!(disk.manifest.embeddings_pending);
+
+    disk.full_sweep_after = Some(NoteId::from_bytes([0x60; 16]));
+    let restore_cursor = ChangeCursor { scope, after: seq3 };
+    update::apply(
+        &cx,
+        &mut disk,
+        &mut publisher,
+        restore_cursor.clone(),
+        vec![Change {
+            cursor: restore_cursor,
+            command_range: CommandSeqRange::new(seq3, seq3).unwrap(),
+            entity: EntityId::Folder(moved_folder),
+            kind: ChangeKind::Restore,
+            revision: RevisionId::from_bytes([2; 16]),
+            lifecycle: Lifecycle::Active,
+            class: None,
+            effect: MutationEffect::NoRelevantEffect,
+        }],
+        false,
+    )
+    .await
+    .unwrap();
+    assert!(disk.full_sweep_needed);
+    assert!(
+        disk.full_sweep_after.is_none(),
+        "folder restore between FullSweep pages must restart sweep from the beginning"
+    );
+
+    publisher.replace(None);
+    drop(publisher);
+    drop(disk);
+    engine.shutdown().await;
+    runtime.shutdown().await.unwrap();
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[tokio::test]
+async fn search_after_embedder_idle_reloads_embedder_without_model_unavailable() {
+    use crate::{
+        SearchDependencies, SearchEngine,
+        config::{SearchConfig, VectorMode},
+        ports::SearchCarrierReadPort,
+    };
+    use notarium_canonical::{
+        CanonicalConfig, CanonicalRuntime, CanonicalStore, CreateSpaceSpec,
+        changes::SyntheticNoteSpec,
+    };
+    use notarium_core::{
+        DomainResult,
+        auth::{EngineAuthContext, SpaceGrant, SpaceKind, SpaceRole, VerifiedHuman},
+        classes::ClassEgressFence,
+        ids::{GrantId, InstallationId, LeaseEpoch, PrincipalId, ProjectionGeneration, RequestId},
+        model::{DenseNodeId, DenseNodeIter, Lifecycle},
+        ports::{SearchPort, SearchQuery, ServiceAuthority, ServicePurpose},
+        query::{FieldFilterAstV1, Predicate},
+        receipt::ReceiptSet,
+    };
+    use std::collections::BTreeMap;
+
+    struct SingleNoteSnapshot {
+        cut: SnapshotCut,
+        note: NoteId,
+        folder: FolderId,
+    }
+    impl StructuralSnapshot for SingleNoteSnapshot {
+        fn cut(&self) -> &SnapshotCut {
+            &self.cut
+        }
+        fn lookup(&self, note: &NoteId) -> DomainResult<Option<DenseNodeId>> {
+            Ok((note == &self.note).then_some(DenseNodeId::new(self.cut.generation, 0)))
+        }
+        fn note_id(&self, node: DenseNodeId) -> DomainResult<NoteId> {
+            if node.index(self.cut.generation)? == 0 {
+                Ok(self.note.clone())
+            } else {
+                Err(DomainError::ResourceNotFound)
+            }
+        }
+        fn doc_class(&self, node: DenseNodeId) -> DomainResult<DocClass> {
+            if node.index(self.cut.generation)? == 0 {
+                Ok(DocClass::UserDoc)
+            } else {
+                Err(DomainError::ResourceNotFound)
+            }
+        }
+        fn folder_subtree<'a>(&'a self, _: &'a FolderId) -> PortFuture<'a, DenseNodeIter<'a>> {
+            Box::pin(async { Ok(DenseNodeIter::from_slice(self.cut.generation, &[0])) })
+        }
+        fn folder_descendants<'a>(&'a self, _: &'a FolderId) -> PortFuture<'a, Vec<FolderId>> {
+            Box::pin(async { Ok(vec![self.folder.clone()]) })
+        }
+        fn enclosing_project<'a>(&'a self, _: &'a FolderId) -> PortFuture<'a, Option<FolderId>> {
+            Box::pin(async { Ok(None) })
+        }
+        fn filter_notes<'a>(
+            &'a self,
+            _: &'a FieldFilterAstV1,
+        ) -> PortFuture<'a, Option<DenseNodeIter<'a>>> {
+            Box::pin(async { Ok(None) })
+        }
+        fn outgoing(&self, _: DenseNodeId) -> DomainResult<DenseNodeIter<'_>> {
+            Ok(DenseNodeIter::from_slice(self.cut.generation, &[]))
+        }
+        fn incoming(&self, _: DenseNodeId) -> DomainResult<DenseNodeIter<'_>> {
+            Ok(DenseNodeIter::from_slice(self.cut.generation, &[]))
+        }
+    }
+
+    struct SingleNoteStructural {
+        store: Arc<CanonicalStore>,
+        cut: SnapshotCut,
+        note: NoteId,
+        folder: FolderId,
+    }
+    impl StructuralReadPort for SingleNoteStructural {
+        fn acquire_snapshot(
+            &self,
+            _: SpaceContext,
+            _: CausalBasis,
+        ) -> PortFuture<'_, Box<dyn StructuralSnapshot>> {
+            let snapshot = SingleNoteSnapshot {
+                cut: self.cut.clone(),
+                note: self.note.clone(),
+                folder: self.folder.clone(),
+            };
+            Box::pin(async move { Ok(Box::new(snapshot) as Box<dyn StructuralSnapshot>) })
+        }
+
+        fn is_live_visible<'a>(
+            &'a self,
+            _: &'a SpaceContext,
+            note: &'a NoteId,
+        ) -> PortFuture<'a, bool> {
+            let visible = note == &self.note;
+            Box::pin(async move { Ok(visible) })
+        }
+
+        fn hydrate(
+            &self,
+            ctx: SpaceContext,
+            cut: SnapshotCut,
+            notes: Vec<NoteId>,
+        ) -> PortFuture<'_, Vec<Option<NoteCard>>> {
+            Box::pin(async move {
+                let carriers = SearchCarrierReadPort::read_note_documents_at_cutoff(
+                    &*self.store,
+                    ServiceAuthority::admit(ServicePurpose::Search),
+                    ctx.budget.clone(),
+                    cut.scope,
+                    cut.projected_seq,
+                    notes,
+                )
+                .await?;
+                Ok(carriers
+                    .into_iter()
+                    .map(|(_, row)| {
+                        let row = row?;
+                        let document =
+                            ClassEgressFence::search_metadata(row.document.metadata(), ctx.auth())
+                                .ok()?;
+                        Some(NoteCard {
+                            document,
+                            title: row.title,
+                            path: String::new(),
+                            preview: String::new(),
+                        })
+                    })
+                    .collect())
+            })
+        }
+    }
+
+    for (lexical_idle, label) in [
+        (Duration::from_secs(5), "lexical_open_embedder_idle"),
+        (Duration::from_millis(30), "lexical_and_embedder_idle"),
+    ] {
+        let mut entropy = [0u8; 16];
+        getrandom::fill(&mut entropy).unwrap();
+        let path =
+            std::env::temp_dir().join(format!("search-ondemand-{label}-{}", hex::encode(entropy)));
+        std::fs::create_dir(&path).unwrap();
+        let root = DataRoot::new(&path);
+        let (store, runtime) = CanonicalRuntime::open(CanonicalConfig::local_default(
+            InstallationId::from_bytes([0xe7; 16]),
+            root.clone(),
+        ))
+        .await
+        .unwrap();
+        let store = Arc::new(store);
+        let owner = PrincipalId::from_bytes([0xe8; 16]);
+        let folder = FolderId::from_bytes([0xe9; 16]);
+        let note_id = NoteId::from_bytes([0xea; 16]);
+        let lease = LeaseEpoch::new(1).unwrap();
+        let space = store
+            .create_space(CreateSpaceSpec {
+                space_id: SpaceId::from_bytes([0xeb; 16]),
+                incarnation: HistoryIncarnation::from_bytes([0xeb; 16]),
+                root_folder_id: folder.clone(),
+                slug: format!("ondemand-{label}"),
+                kind: SpaceKind::Personal,
+                owner: owner.clone(),
+                active_epoch: lease,
+                initial_last_seq: SpaceSeq::ZERO,
+                created_at: None,
+            })
+            .await
+            .unwrap();
+        let (seeded, _) = store
+            .commit_synthetic_note_batch_for_test(
+                &space.scope,
+                lease,
+                &owner,
+                vec![SyntheticNoteSpec {
+                    note_id: note_id.clone(),
+                    parent_folder: Some(folder.clone()),
+                    slug: "needle".into(),
+                    title: "Idle reload note".into(),
+                    doc_class: DocClass::UserDoc,
+                    lifecycle: Lifecycle::Active,
+                    carrier: "# Idle reload note\n\nneedle payload".into(),
+                    fields: BTreeMap::new(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let cut = SnapshotCut {
+            scope: space.scope.clone(),
+            generation: ProjectionGeneration::new(1).unwrap(),
+            canonical_seq: seeded.last_seq,
+            projected_seq: seeded.last_seq,
+        };
+        let structural = Arc::new(SingleNoteStructural {
+            store: store.clone(),
+            cut,
+            note: note_id,
+            folder,
+        });
+        let schedule = Schedule {
+            tick: Duration::from_millis(20),
+            lexical_idle,
+            embedder_idle: Duration::from_millis(50),
+            worker_idle: Duration::from_secs(300),
+            archived_idle: Duration::from_secs(30),
+        };
+        let engine = SearchEngine::start_with_schedule(
+            SearchConfig::new(root, VectorMode::DeterministicTest { dimension: 64 }),
+            SearchDependencies::new(store, structural),
+            schedule,
+        );
+        let handle = engine.space(space.scope.clone()).unwrap();
+        let mut epochs = handle.epoch.subscribe();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(state) = handle.published.load_full()
+                    && state.seq >= seeded.last_seq
+                    && state.vectors.is_some()
+                    && state.embedder.is_some()
+                    && !state.embeddings_pending
+                {
+                    break;
+                }
+                epochs.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+
+        // Wait for idle release: embedder alone (case 1) or both lexical & embedder (case 2).
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match handle.published.load_full() {
+                    None if lexical_idle < Duration::from_secs(1) => break,
+                    Some(state)
+                        if lexical_idle >= Duration::from_secs(1) && state.embedder.is_none() =>
+                    {
+                        break;
+                    }
+                    _ => {}
+                }
+                epochs.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        if lexical_idle < Duration::from_secs(1) {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+        }
+
+        let grant = SpaceGrant {
+            role: SpaceRole::Owner,
+            read_classes: DocClass::all(),
+            write_classes: DocClass::all(),
+            project_root: None,
+        };
+        let auth = EngineAuthContext::for_human(VerifiedHuman::attest(
+            owner,
+            GrantId::from_bytes([0xec; 16]),
+            BTreeMap::from([(space.scope.space_id.clone(), grant)]),
+            true,
+        ));
+        let ctx = SpaceContext::new(
+            auth,
+            space.scope.clone(),
+            CallBudget {
+                request: RequestId::from_bytes([0xed; 16]),
+                cancellation: Cancellation::default(),
+                remaining: Duration::from_secs(5),
+            },
+        )
+        .unwrap();
+        let query = SearchQuery {
+            text: "needle".to_owned(),
+            filter: FieldFilterAstV1 {
+                version: 1,
+                predicate: Predicate::All(Vec::new()),
+            },
+            classes: [DocClass::UserDoc].into_iter().collect(),
+            folder: None,
+            causal: CausalBasis::Exact(ReceiptSet::default()),
+            include_chats: false,
+            top_k: PageLimit::new(10).unwrap(),
+            model: None,
+        };
+        let result = engine.search(ctx, query).await.unwrap();
+        assert!(
+            result.degraded.is_none(),
+            "first search after idle ({label}) must reload embedder, got {:?}",
+            result.degraded
+        );
+        assert_eq!(result.hits.len(), 1);
+        assert_eq!(result.hits[0].card.title, "Idle reload note");
+
+        engine.shutdown().await;
+        runtime.shutdown().await.unwrap();
+        std::fs::remove_dir_all(path).unwrap();
+    }
 }

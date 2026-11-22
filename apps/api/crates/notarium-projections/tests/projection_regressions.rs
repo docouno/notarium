@@ -3368,6 +3368,8 @@ async fn snapshot_outgoing_and_incoming_enforce_live_fence_and_propagate_not_rea
             .await
             .unwrap();
     let (scope, owner) = open_space(&store, SpaceKind::Personal).await;
+    let (temp_folder, temp_folder_rev) =
+        create_folder(&store, &owner, None, "edge-fence-hold", false).await;
     let target = create_note(
         &store,
         &owner,
@@ -3438,8 +3440,12 @@ async fn snapshot_outgoing_and_incoming_enforce_live_fence_and_propagate_not_rea
         vec![source_node]
     );
 
-    // Pause projection and trash `target` so we verify eager neighbor filtering
-    // under the live fence against an older projected cut.
+    // Capture iterators before trashing `target` so removing the post-commit
+    // fail-closed check would leak a trashed edge on subsequent `.next()`.
+    let mut retained_out = snapshot.outgoing(source_node).unwrap();
+    let mut retained_in = snapshot.incoming(target_node).unwrap();
+
+    // Pause projection and trash `target` against the older projected cut.
     let _hold = engine.pause_before_projection_for_test(&scope, 1).unwrap();
     let mut trash = mutation(
         &owner,
@@ -3449,14 +3455,86 @@ async fn snapshot_outgoing_and_incoming_enforce_live_fence_and_propagate_not_rea
         },
     );
     trash.preconditions.revision = Some(target.revision);
-    store.delete_note(owner.clone(), trash).await.unwrap();
+    let trashed = store.delete_note(owner.clone(), trash).await.unwrap();
     assert!(
-        snapshot.outgoing(source_node).unwrap().next().is_none(),
-        "trashed neighbor must be filtered under live fence"
+        retained_out.next().is_none(),
+        "retained outgoing iterator must fail closed after target trash"
+    );
+    assert!(
+        retained_in.next().is_none(),
+        "retained incoming iterator must fail closed after focal trash"
     );
     assert_eq!(
         snapshot.incoming(target_node).err(),
         Some(DomainError::ResourceNotFound)
+    );
+
+    // Eagerly filter neighbors under the single `live_permit()` acquired in
+    // `outgoing()`: an iterator built while `target` is trashed must remain
+    // empty even if `target` is restored before `.next()` runs.
+    let mut out_while_trashed = snapshot.outgoing(source_node).unwrap();
+    let mut restore = mutation(
+        &owner,
+        DeleteNote {
+            note: target.note.clone(),
+            disposition: DeleteDisposition::Restore,
+        },
+    );
+    restore.preconditions.revision = Some(trashed.value.revision);
+    store.delete_note(owner.clone(), restore).await.unwrap();
+    assert_eq!(
+        snapshot.outgoing(source_node).unwrap().collect::<Vec<_>>(),
+        vec![target_node]
+    );
+    assert!(
+        out_while_trashed.next().is_none(),
+        "neighbors filtered out eagerly during outgoing() must not reappear after restore"
+    );
+
+    // Hold the live visibility fence write lock via an in-flight visibility
+    // commit: outgoing/incoming must propagate NotReady instead of dropping
+    // edges, and a retained iterator must fail closed while the lock is held.
+    let mut retained_during_write = snapshot.outgoing(source2_node).unwrap();
+    let (observed_commit, resume) = store.pause_next_visibility_commit_for_test();
+    let writer_store = store.clone();
+    let writer_scope = scope.clone();
+    let writer_actor = owner.auth().principal().clone();
+    let write_task = tokio::spawn(async move {
+        writer_store
+            .set_folder_lifecycle(
+                &writer_scope,
+                LeaseEpoch::new(1).unwrap(),
+                &temp_folder,
+                &temp_folder_rev,
+                Lifecycle::Trashed,
+                &writer_actor,
+                None,
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), observed_commit)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        snapshot.outgoing(source2_node),
+        Err(DomainError::ValidationFailed { ref diagnostic })
+            if diagnostic.reason == ValidationReason::NotReady
+    ));
+    assert!(matches!(
+        snapshot.incoming(target2_node),
+        Err(DomainError::ValidationFailed { ref diagnostic })
+            if diagnostic.reason == ValidationReason::NotReady
+    ));
+    assert!(
+        retained_during_write.next().is_none(),
+        "retained iterator must fail closed while live fence write lock is held"
+    );
+    resume.send(()).unwrap();
+    write_task.await.unwrap().unwrap();
+    assert_eq!(
+        snapshot.outgoing(source2_node).unwrap().collect::<Vec<_>>(),
+        vec![target2_node]
     );
 
     // Once the canonical runtime shuts down (closing the live visibility fence),

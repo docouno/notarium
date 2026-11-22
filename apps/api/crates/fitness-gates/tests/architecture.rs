@@ -231,6 +231,153 @@ fn canonical_fixture_methods_are_only_enabled_for_tests() {
 }
 
 #[test]
+fn fixture_api_gate_rejects_transitive_features_gate_defaults_and_renamed_deps() {
+    let actual = metadata();
+    let packages = actual["packages"].as_array().unwrap();
+
+    // 1. Transitive feature inside a fixture crate (`default -> internal -> test-support`),
+    //    plus indirect dependency / feature forwarding of `internal`.
+    for target_crate in [
+        "notarium-canonical",
+        "notarium-projections",
+        "notarium-search",
+    ] {
+        let index = packages
+            .iter()
+            .position(|p| p["name"] == target_crate)
+            .unwrap();
+
+        let mut transitive_default = actual.clone();
+        let target_features = transitive_default["packages"][index]["features"]
+            .as_object_mut()
+            .unwrap();
+        target_features.insert("default".into(), json!(["internal"]));
+        target_features.insert("internal".into(), json!(["test-support"]));
+        assert!(
+            validate_metadata(&transitive_default, &root())
+                .unwrap_err()
+                .contains("fixture API")
+        );
+
+        let mut indirect_dep = actual.clone();
+        indirect_dep["packages"][index]["features"]
+            .as_object_mut()
+            .unwrap()
+            .insert("internal".into(), json!(["test-support"]));
+        let bin = indirect_dep["packages"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|p| p["name"] == "notarium-bin")
+            .unwrap();
+        let dep = bin["dependencies"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|dep| dep["name"] == target_crate)
+            .unwrap();
+        dep["features"] = json!(["internal"]);
+        assert!(
+            validate_metadata(&indirect_dep, &root())
+                .unwrap_err()
+                .contains("fixture API")
+        );
+
+        let mut indirect_feature = actual.clone();
+        indirect_feature["packages"][index]["features"]
+            .as_object_mut()
+            .unwrap()
+            .insert("internal".into(), json!(["test-support"]));
+        let bin = indirect_feature["packages"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|p| p["name"] == "notarium-bin")
+            .unwrap();
+        bin["features"].as_object_mut().unwrap().insert(
+            "default".into(),
+            json!([format!("{target_crate}/internal")]),
+        );
+        assert!(
+            validate_metadata(&indirect_feature, &root())
+                .unwrap_err()
+                .contains("fixture API")
+        );
+    }
+
+    // 2. `fitness-gates` default feature enabling `storage-bench` directly or transitively.
+    for extra_features in [
+        vec![("default", json!(["storage-bench"]))],
+        vec![
+            ("default", json!(["bench-all"])),
+            ("bench-all", json!(["storage-bench"])),
+        ],
+    ] {
+        let mut altered = actual.clone();
+        let gate_pkg = altered["packages"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|p| p["name"] == "fitness-gates")
+            .unwrap();
+        let features = gate_pkg["features"].as_object_mut().unwrap();
+        for (name, entries) in extra_features {
+            features.insert(name.into(), entries);
+        }
+        assert!(
+            validate_metadata(&altered, &root())
+                .unwrap_err()
+                .contains("fixture API")
+        );
+    }
+
+    // 3. Renamed allowed dependency (`dep["rename"] = "search_alias"`) forwarding `test-support`.
+    let mut renamed_base = actual.clone();
+    let bin = renamed_base["packages"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|p| p["name"] == "notarium-bin")
+        .unwrap();
+    let dep = bin["dependencies"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|dep| dep["name"] == "notarium-search")
+        .unwrap();
+    dep["rename"] = json!("search_alias");
+    // Sanity check: the rename itself is valid when no fixture API is forwarded.
+    validate_metadata(&renamed_base, &root()).unwrap();
+
+    for extra_features in [
+        vec![("default", json!(["search_alias/test-support"]))],
+        vec![("dep-hook", json!(["dep:search_alias/test-support"]))],
+        vec![("weak-hook", json!(["search_alias?/test-support"]))],
+        vec![
+            ("default", json!(["indirect"])),
+            ("indirect", json!(["search_alias/test-support"])),
+        ],
+    ] {
+        let mut altered = renamed_base.clone();
+        let bin = altered["packages"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|p| p["name"] == "notarium-bin")
+            .unwrap();
+        let features = bin["features"].as_object_mut().unwrap();
+        for (name, entries) in extra_features {
+            features.insert(name.into(), entries);
+        }
+        assert!(
+            validate_metadata(&altered, &root())
+                .unwrap_err()
+                .contains("fixture API")
+        );
+    }
+}
+
+#[test]
 fn banned_package_names_are_checked_exactly() {
     for name in BANNED {
         let lock = document(&format!(

@@ -13,6 +13,7 @@ use crate::{
 };
 use notarium_core::{
     DomainError,
+    auth::{AuthenticatedCredential, PrincipalKind},
     classes::DocClass,
     error::{BudgetKind, CommitEffect, PortError, ValidationReason},
     ids::*,
@@ -251,14 +252,35 @@ impl ProviderService {
         sender: Option<&mpsc::Sender<CompletionEvent>>,
         progress: &mut Progress,
     ) -> Result<Output, PortError> {
+        let allow_search_indexing = match (job.ctx.auth().kind(), job.ctx.auth().credential()) {
+            (
+                PrincipalKind::SearchIndexing,
+                Some(AuthenticatedCredential::SearchIndexing { space, provider }),
+            ) => {
+                let binding_ok = provider == job.resource()
+                    && job
+                        .scope
+                        .as_ref()
+                        .is_some_and(|scope| &scope.space_id == space)
+                    && matches!(job.request, Request::Embedding(_))
+                    && !job.embedding_inputs().is_empty()
+                    && job
+                        .embedding_inputs()
+                        .iter()
+                        .all(|input| matches!(input, EmbeddingInput::Part(_)));
+                if !binding_ok {
+                    return Err(DomainError::AccessDenied.into());
+                }
+                true
+            }
+            (PrincipalKind::SearchIndexing, _)
+            | (_, Some(AuthenticatedCredential::SearchIndexing { .. })) => {
+                return Err(DomainError::AccessDenied.into());
+            }
+            _ => false,
+        };
         let hash = job.fingerprint()?;
         let scope_key = job.scope_key()?;
-        let allow_search_indexing = matches!(job.request, Request::Embedding(_))
-            && !job.embedding_inputs().is_empty()
-            && job
-                .embedding_inputs()
-                .iter()
-                .all(|input| matches!(input, EmbeddingInput::Part(_)));
         let (mut tx, auth) = runtime
             .run(
                 async {
