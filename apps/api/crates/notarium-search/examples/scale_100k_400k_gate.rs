@@ -287,6 +287,7 @@ fn build(
         tantivy_commit: index.commit_id()?,
         active_index_dir: index_name(1),
         tokenizer_version: TOKENIZER_VERSION,
+        remote_admission: None,
         active_model: Some(ResolvedEmbeddingTarget {
             model: fixture.model.clone(),
             dimension: DIMENSION as u32,
@@ -294,6 +295,7 @@ fn build(
             backend: EmbeddingBackendTarget::LocalOnnx,
         }),
         vector_seq: Some(cut.projected_seq),
+        vector_replay_after: None,
         embeddings_pending: false,
     })?;
     Ok((index, epoch, built_segments))

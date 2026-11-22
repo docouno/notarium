@@ -45,6 +45,7 @@ use tokio::{
     time::{MissedTickBehavior, interval, sleep},
 };
 
+const REMOTE_ADMISSION_CHECK: Duration = Duration::from_secs(5);
 const MAINTENANCE_TICK: Duration = Duration::from_secs(1);
 const LEXICAL_IDLE: Duration = Duration::from_secs(30);
 const EMBEDDER_IDLE: Duration = Duration::from_secs(60);
@@ -154,6 +155,20 @@ impl IndexError {
         match self {
             Self::Port(PortError::Domain(error)) | Self::Domain(error) => error.requires_resync(),
             _ => false,
+        }
+    }
+
+    fn vector_replay_error(self) -> Self {
+        match self {
+            Self::Port(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
+                if matches!(
+                    diagnostic.reason,
+                    ValidationReason::InvalidCutoff | ValidationReason::InvalidRange
+                ) =>
+            {
+                DomainError::validation(ValidationReason::PurgeResync).into()
+            }
+            other => other,
         }
     }
 
@@ -299,7 +314,7 @@ struct Disk {
     epoch: Option<VectorEpoch>,
     embedder: Option<Arc<crate::model::Embedder>>,
     dirty_notes: BTreeSet<NoteId>,
-    cached_vectors: HashMap<ContentDigest, QuantizedVector>,
+    cached_vectors: HashMap<ContentDigest, Arc<QuantizedVector>>,
     full_sweep_after: Option<NoteId>,
     full_sweep_needed: bool,
     last_activity: Instant,
@@ -315,7 +330,17 @@ impl Disk {
         }
     }
 
-    fn cache_vectors(&mut self, chunks: &[crate::vector::VectorChunk]) {
+    fn cache_note_vectors(&mut self, note: &NoteId) {
+        let Some(chunks) = self
+            .epoch
+            .as_ref()
+            .map(|epoch| epoch.mutable_note_chunks(note))
+        else {
+            return;
+        };
+        if chunks.is_empty() {
+            return;
+        }
         if self.cached_vectors.len() >= MAX_CACHED_VECTORS {
             self.cached_vectors.clear();
         }
@@ -325,7 +350,7 @@ impl Disk {
             }
             self.cached_vectors
                 .entry(chunk.metadata.key)
-                .or_insert_with(|| chunk.vector.clone());
+                .or_insert_with(|| Arc::new(chunk.vector.clone()));
         }
     }
 
@@ -425,7 +450,7 @@ enum BgKind {
 }
 
 enum BgOutcome {
-    ReopenVectors(Result<VectorEpoch, IndexError>),
+    ReopenVectors(Result<(VectorEpoch, BTreeSet<NoteId>), IndexError>),
     LoadEmbedder(Option<Arc<crate::model::Embedder>>),
     ModelRefresh(Result<build::ModelRefreshOutcome, ModelError>),
     EmbedBatch(Result<update::EmbedBatchOutcome, IndexError>),
@@ -492,8 +517,9 @@ impl Publisher<'_> {
             active_model: disk.manifest.active_model.clone(),
             embedder: disk.embedder.clone(),
             embeddings_pending: disk.manifest.embeddings_pending,
-            reopening_vectors: reopening,
-            embedder_unavailable: disk.embedder_unavailable,
+            reopening_vectors: reopening && disk.manifest.vector_replay_after.is_none(),
+            embedder_unavailable: disk.embedder_unavailable
+                || disk.manifest.vector_replay_after.is_some(),
         }
     }
 
@@ -713,6 +739,7 @@ async fn run_active_loop(
     bg: &mut Option<BgTask>,
 ) -> Result<Option<HistoryScope>, IndexError> {
     let mut model_check_due = true;
+    let mut admission_check_at = Instant::now() + REMOTE_ADMISSION_CHECK;
     let mut retry_model = false;
     let mut model_retry_at = Instant::now();
     let mut model_retry_delay = Duration::from_secs(1);
@@ -1043,6 +1070,12 @@ async fn run_active_loop(
                                 drop(disk.take());
                                 return Ok(None);
                             }
+                        }
+                    }
+                    if now >= admission_check_at {
+                        admission_check_at = now + REMOTE_ADMISSION_CHECK;
+                        if now >= model_retry_at && current.manifest.remote_admission.is_some() {
+                            model_check_due = true;
                         }
                     }
                     if now >= model_retry_at
@@ -1457,12 +1490,12 @@ fn spawn_bg_if_ready(
         let cancel = Cancellation::default();
         let layout = disk.layout.clone();
         let manifest = disk.manifest.clone();
+        let services = cx.services.clone();
+        let task_cancel = cancel.clone();
         let handle = tokio::spawn(async move {
-            let result = tokio::task::spawn_blocking(move || open_vector_epoch(layout, &manifest))
-                .await
-                .map_err(|_| IndexError::Inconsistent)
-                .and_then(|inner| inner);
-            BgOutcome::ReopenVectors(result)
+            BgOutcome::ReopenVectors(
+                recover_vector_epoch(&services, &task_cancel, layout, manifest).await,
+            )
         });
         *bg = Some(BgTask {
             kind: BgKind::ReopenVectors,
@@ -1510,6 +1543,7 @@ fn spawn_bg_if_ready(
             base: disk.cursor(),
             folders: disk.folders.clone(),
             active: disk.manifest.active_model.clone(),
+            remote_admission: disk.manifest.remote_admission,
             have_epoch: disk.manifest.vector_seq.is_some(),
             pending: disk.manifest.embeddings_pending,
             cancel: cancel.clone(),
@@ -1588,7 +1622,12 @@ fn spawn_bg_if_ready(
         disk.embedder_last_use = now;
         let cancel = Cancellation::default();
         let mode = if !disk.dirty_notes.is_empty() {
-            let batch: Vec<NoteId> = disk.dirty_notes.iter().take(100).cloned().collect();
+            let batch: Vec<NoteId> = disk
+                .dirty_notes
+                .iter()
+                .take(update::REPAIR_CARRIER_PAGE)
+                .cloned()
+                .collect();
             for id in &batch {
                 disk.dirty_notes.remove(id);
             }
@@ -1599,6 +1638,7 @@ fn spawn_bg_if_ready(
             }
         };
         let input = update::EmbedBatchInput {
+            layout: disk.layout.clone(),
             services: Arc::clone(cx.services),
             cutoff: disk.cursor(),
             folders: disk.folders.clone(),
@@ -1645,8 +1685,8 @@ async fn handle_bg_done(
     match outcome {
         BgOutcome::ReopenVectors(result) => {
             match result {
-                Ok(mut epoch) => {
-                    if !dirty.notes.is_empty() {
+                Ok((mut epoch, replayed)) => {
+                    if !dirty.notes.is_empty() || current.manifest.vector_replay_after.is_some() {
                         let seq = current.manifest.tantivy_seq;
                         let ops: Vec<MutableOperation> = dirty
                             .notes
@@ -1661,8 +1701,10 @@ async fn handle_bg_done(
                         })
                         .await
                         .map_err(|_| IndexError::Inconsistent)??;
+                        current.dirty_notes.extend(replayed);
                         current.dirty_notes.extend(dirty.notes);
                         current.manifest.vector_seq = Some(seq);
+                        current.manifest.vector_replay_after = None;
                         current.manifest.embeddings_pending = true;
                         current.publish_manifest().await?;
                     }
@@ -1670,9 +1712,15 @@ async fn handle_bg_done(
                     current.embedder_last_use = Instant::now();
                     current.embedder_unavailable = false;
                 }
+                Err(error) if error.requires_reseed() => {
+                    drop(disk.take());
+                    build::scrub(cx, publisher, layout).await?;
+                    return Err(error);
+                }
                 Err(error) if error.invalid_checkpoint() => {
                     tracing::warn!(kind = %error, "search vector checkpoint needs rebuilding");
                     current.manifest.vector_seq = None;
+                    current.manifest.vector_replay_after = None;
                     current.manifest.embeddings_pending = true;
                     current.embedder = None;
                     current.embedder_unavailable = false;
@@ -1706,10 +1754,28 @@ async fn handle_bg_done(
                 *retry_model = false;
                 *model_retry_delay = Duration::from_secs(1);
             }
+            Ok(build::ModelRefreshOutcome::AdmissionChanged(revision)) => {
+                current.full_sweep_needed = true;
+                current.full_sweep_after = None;
+                if let Some(replay) = &mut current.manifest.vector_replay_after {
+                    replay.needs_sweep = true;
+                }
+                current.manifest.remote_admission = Some(revision);
+                current.manifest.embeddings_pending = true;
+                // Publish both together: reopening pending work restarts a full sweep.
+                current.publish_manifest().await?;
+                publisher.publish_if_live(current, false);
+                *repair_at = Instant::now();
+                *repair_delay = Duration::from_secs(1);
+                *retry_model = false;
+                *model_retry_delay = Duration::from_secs(1);
+            }
             Ok(build::ModelRefreshOutcome::Cleared) => {
                 let mut manifest = current.manifest.clone();
                 manifest.active_model = None;
+                manifest.remote_admission = None;
                 manifest.vector_seq = None;
+                manifest.vector_replay_after = None;
                 manifest.embeddings_pending = false;
                 current.manifest = manifest;
                 current.epoch = None;
@@ -1727,7 +1793,9 @@ async fn handle_bg_done(
             Ok(build::ModelRefreshOutcome::PendingModel(target)) => {
                 let mut manifest = current.manifest.clone();
                 manifest.active_model = Some(target);
+                manifest.remote_admission = None;
                 manifest.vector_seq = None;
+                manifest.vector_replay_after = None;
                 manifest.embeddings_pending = true;
                 current.manifest = manifest;
                 current.epoch = None;
@@ -1742,6 +1810,7 @@ async fn handle_bg_done(
             Ok(build::ModelRefreshOutcome::Built(built)) => {
                 let build::BuiltModelEpoch {
                     target,
+                    remote_admission,
                     embedder,
                     mut epoch,
                     failed_notes,
@@ -1796,7 +1865,9 @@ async fn handle_bg_done(
                 let was_cold_seed = current.manifest.vector_seq.is_none();
                 let mut manifest = current.manifest.clone();
                 manifest.vector_seq = Some(seq);
+                manifest.vector_replay_after = None;
                 manifest.active_model = Some(target);
+                manifest.remote_admission = remote_admission;
                 manifest.embeddings_pending = pending;
                 current.manifest = manifest;
                 current.epoch = Some(epoch);
@@ -1872,32 +1943,39 @@ async fn handle_bg_done(
                 let seq = current.manifest.tantivy_seq;
                 let mut epoch = current.epoch.take().ok_or(IndexError::Inconsistent)?;
                 let mut ops = Vec::new();
+                let mut staged_note = None;
                 for row in rows {
                     let id = row.note_id;
                     if dirty.notes.contains(&id)
                         || row
-                            .content
-                            .as_ref()
-                            .is_some_and(|content| content.was_under_any_folder(&changed_folders))
+                            .ancestor_folders
+                            .iter()
+                            .any(|id| changed_folders.contains(id))
                     {
                         current.dirty_notes.insert(id);
                         continue;
                     }
-                    if !epoch.matches_note_chunks(&id, &row.chunks) {
-                        if row.chunks.is_empty() {
-                            ops.push(MutableOperation::Delete(id));
-                        } else {
-                            ops.push(MutableOperation::Upsert {
-                                note: id,
-                                chunks: row.chunks,
-                            });
+                    match row.chunks {
+                        update::EmbeddedChunks::Staged(staged) => staged_note = Some((id, staged)),
+                        update::EmbeddedChunks::Inline(chunks)
+                            if !epoch.matches_note_chunks(&id, &chunks) =>
+                        {
+                            if chunks.is_empty() {
+                                ops.push(MutableOperation::Delete(id));
+                            } else {
+                                ops.push(MutableOperation::Upsert { note: id, chunks });
+                            }
                         }
+                        update::EmbeddedChunks::Inline(_) => {}
                     }
                 }
-                let vectors_changed = !ops.is_empty();
+                let vectors_changed = !ops.is_empty() || staged_note.is_some();
                 let commit_result = if vectors_changed {
                     tokio::task::spawn_blocking(move || {
                         epoch.apply_batch(seq, ops)?;
+                        if let Some((id, staged)) = staged_note {
+                            epoch.replace_staged_note(seq, id, staged)?;
+                        }
                         epoch.checkpoint(seq)?;
                         Ok::<_, VectorError>(epoch)
                     })
@@ -2143,13 +2221,30 @@ async fn open_disk(
         .map_err(|_| IndexError::Inconsistent)?;
     let unapplied = manifest_res.as_ref().ok().and_then(|manifest| {
         let manifest = manifest.as_ref()?;
-        (manifest.tantivy_seq < latest).then(|| ChangeCursor {
+        let after = manifest
+            .vector_replay_after
+            .map_or(manifest.tantivy_seq, |replay| replay.after);
+        (after < latest).then(|| ChangeCursor {
             scope: manifest.scope.clone(),
-            after: manifest.tantivy_seq,
+            after,
         })
     });
+    let deferred = manifest_res
+        .as_ref()
+        .ok()
+        .and_then(|value| value.as_ref())
+        .is_some_and(|manifest| manifest.vector_replay_after.is_some());
     if let Some(cursor) = &unapplied
-        && cx.cut_needs_scrub(cursor, true).await?
+        && match cx.cut_needs_scrub(cursor, true).await {
+            Err(error) if deferred => {
+                let error = error.vector_replay_error();
+                if !error.requires_reseed() {
+                    return Err(error);
+                }
+                true
+            }
+            result => result?,
+        }
     {
         build::scrub(cx, publisher, &layout).await?;
         return Ok(None);
@@ -2187,8 +2282,11 @@ async fn open_disk(
                     manifest.embeddings_pending = true;
                     layout_open.publish_search(&manifest)?;
                 }
-                let full_sweep_needed =
-                    manifest.vector_seq.is_some() && manifest.embeddings_pending;
+                let full_sweep_needed = manifest.vector_seq.is_some()
+                    && manifest.embeddings_pending
+                    && manifest
+                        .vector_replay_after
+                        .is_none_or(|replay| replay.needs_sweep);
                 let now = Instant::now();
                 Ok(Some((
                     Disk {
@@ -2288,9 +2386,101 @@ fn open_vector_epoch(
         return Err(IndexError::Inconsistent);
     }
     let opened = VectorEpoch::open_model(layout, model)?;
-    if !opened.is_checkpointed(seq) {
+    let valid = match manifest.vector_replay_after {
+        None => opened.is_checkpointed(seq),
+        Some(replay) => {
+            seq <= replay.after
+                && replay.after < manifest.tantivy_seq
+                && opened.can_replay_checkpoint(seq, manifest.tantivy_seq)
+        }
+    };
+    if !valid {
         return Err(IndexError::Inconsistent);
     }
     opened.collect_obsolete()?;
     Ok(opened)
+}
+
+/// A deferred mask is durable in the search manifest until the epoch and all
+/// intervening live edits have been checkpointed together by the worker.
+async fn recover_vector_epoch(
+    services: &Services,
+    cancel: &Cancellation,
+    layout: Arc<SearchLayout>,
+    manifest: SearchManifest,
+) -> Result<(VectorEpoch, BTreeSet<NoteId>), IndexError> {
+    use notarium_core::{
+        classes::DocClass,
+        model::Lifecycle,
+        ports::{ChangeKind, EntityId},
+    };
+    let replay = manifest.vector_replay_after;
+    let through = manifest.tantivy_seq;
+    let scope = manifest.scope.clone();
+    let mut epoch = tokio::task::spawn_blocking(move || open_vector_epoch(layout, &manifest))
+        .await
+        .map_err(|_| IndexError::Inconsistent)??;
+    let mut dirty = BTreeSet::new();
+    let Some(replay) = replay else {
+        return Ok((epoch, dirty));
+    };
+    let mut after = ChangeCursor {
+        scope,
+        after: replay.after,
+    };
+    let resync = || DomainError::validation(ValidationReason::PurgeResync);
+    while after.after < through {
+        let request = ChangeRead::Log {
+            after: after.clone(),
+            through,
+            limit: PageLimit::new(100)?,
+        };
+        let context = MaintenanceContext {
+            authority: services.authority.clone(),
+            budget: new_budget(cancel),
+        };
+        let ChangeReadResult::Log(page) = services.deps.changes.catch_up(context, request).await?
+        else {
+            return Err(resync().into());
+        };
+        if page.cutoff != through
+            || page.next.scope != after.scope
+            || page.next.after <= after.after
+            || page.next.after > through
+            || page.complete != (page.next.after == through)
+            || (page.complete && page.safe_ack_end != through)
+        {
+            return Err(resync().into());
+        }
+        let mut ops = Vec::new();
+        for change in page.changes {
+            if change.cursor.scope != after.scope
+                || after.after.get().checked_add(1) != Some(change.cursor.after.get())
+                || matches!(change.kind, ChangeKind::Purge | ChangeKind::Redact)
+                || change.lifecycle == Lifecycle::Purged
+                || change.class == Some(DocClass::EncryptedNote)
+            {
+                return Err(resync().into());
+            }
+            after = change.cursor;
+            if let EntityId::Note(note) = change.entity {
+                ops.push(MutableOperation::Delete(note.clone()));
+                dirty.insert(note);
+            }
+        }
+        if after != page.next {
+            return Err(resync().into());
+        }
+        if !ops.is_empty() {
+            // Replaying at the same target is idempotent even after a prior WAL
+            // write or L0 flush reached the target before its search manifest.
+            epoch = tokio::task::spawn_blocking(move || {
+                epoch.apply_batch(through, ops)?;
+                Ok::<_, VectorError>(epoch)
+            })
+            .await
+            .map_err(|_| IndexError::Inconsistent)??;
+        }
+    }
+    Ok((epoch, dirty))
 }

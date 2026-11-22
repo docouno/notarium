@@ -22,6 +22,7 @@ pub use epoch::{
     CompactionPlan, FlushL0Plan, ProjectedVectorFilter, VectorEpoch, VectorHit, VectorSnapshot,
     segment_file_path,
 };
+pub(crate) use epoch::{RepairDirectory, StagedNoteSegments};
 #[cfg(any(test, feature = "test-support"))]
 pub use epoch::{VectorFilter, VectorResults};
 #[cfg(any(test, feature = "test-support"))]

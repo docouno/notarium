@@ -138,7 +138,7 @@ impl Model {
                     };
                     let rank = u32::try_from(index).map_err(|_| EmbeddingError::InvalidModel)?;
                     let (left_id, right_id, merged_id) =
-                        resolve_merge(&vocab, &prefix, left, right, &mut merged_buf)?;
+                        resolve_merge(&vocab, prefix.len(), left, right, &mut merged_buf)?;
                     rank_table.insert((left_id, right_id), (rank, merged_id));
                 }
                 let byte_tokens = byte_fallback.then(|| {
@@ -182,7 +182,7 @@ impl Model {
 
 fn resolve_merge(
     vocab: &HashMap<String, u32>,
-    prefix: &str,
+    prefix_len: usize,
     left: &str,
     right: &str,
     merged_buf: &mut String,
@@ -192,9 +192,14 @@ fn resolve_merge(
     }
     let left_id = *vocab.get(left).ok_or(EmbeddingError::InvalidModel)?;
     let right_id = *vocab.get(right).ok_or(EmbeddingError::InvalidModel)?;
+    // HF BPE removes the configured byte width from every right-hand symbol,
+    // including byte-fallback vocabulary entries such as "<0xA9>".
+    let right_tail = right
+        .get(prefix_len..)
+        .ok_or(EmbeddingError::InvalidModel)?;
     merged_buf.clear();
     merged_buf.push_str(left);
-    merged_buf.push_str(right.strip_prefix(prefix).unwrap_or(right));
+    merged_buf.push_str(right_tail);
     let merged_id = *vocab
         .get(merged_buf.as_str())
         .ok_or(EmbeddingError::InvalidModel)?;

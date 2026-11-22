@@ -426,7 +426,7 @@ fn overlay_ranking_runs_outside_writer_pool_and_separates_fallback() {
     }
 
     hold_all_slots(&pool, &indexes, 0, || {
-        let ranked = LexicalIndex::rank_overlay("alpha beta gamma", &updates, false, budget)
+        let ranked = LexicalIndex::rank_overlay("alpha beta gamma", &updates, None, false, budget)
             .expect("overlay must not contend with WriterPool");
         assert_eq!(ranked.strict.len(), 1);
         assert_eq!(
@@ -439,7 +439,7 @@ fn overlay_ranking_runs_outside_writer_pool_and_separates_fallback() {
             HitKey::Note(NoteId::from_bytes([1; 16]))
         );
 
-        let browse = LexicalIndex::rank_overlay("", &updates, true, budget).unwrap();
+        let browse = LexicalIndex::rank_overlay("", &updates, None, true, budget).unwrap();
         assert!(browse.fallback.is_empty());
         assert_eq!(
             browse

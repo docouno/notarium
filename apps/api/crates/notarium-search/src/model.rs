@@ -13,7 +13,9 @@ use crate::{
         EmbeddingBackendTarget, RemoteIndexingGrant, ResolvedEmbeddingTarget, SearchIndexedNote,
         SearchModelResolverPort,
     },
-    vector::{ChunkMetadata, MAX_DIMENSION, MIN_DIMENSION, QuantizedVector, VectorChunk},
+    vector::{
+        ChunkMetadata, MAX_DIMENSION, MIN_DIMENSION, QuantizedVector, VectorChunk, VectorSnapshot,
+    },
 };
 use notarium_core::{
     DomainError,
@@ -414,20 +416,6 @@ impl Embedder {
         })))
     }
 
-    pub async fn index_note(
-        &self,
-        input: IndexNote<'_>,
-        existing: &(dyn Fn(ContentDigest) -> Option<QuantizedVector> + Sync),
-    ) -> Result<IndexedNoteVectors, DomainError> {
-        Ok(match self.prepare_note(input).await? {
-            NotePreparation::Ready(mut note) => note.index_next(usize::MAX, existing).await,
-            NotePreparation::Finished(outcome) => IndexedNoteVectors {
-                chunks: Vec::new(),
-                outcome,
-            },
-        })
-    }
-
     async fn indexing_grant(
         &self,
         services: &Services,
@@ -575,6 +563,33 @@ pub(super) struct PreparedIndexNote<'a> {
 }
 
 impl PreparedIndexNote<'_> {
+    pub fn descriptor_count(&self) -> usize {
+        self.descriptors.len()
+    }
+
+    /// Admission has already been checked. Equal metadata for this model also
+    /// certifies the embedding keys, even for multiple positions of the same text.
+    pub fn matches_snapshot(&self, snapshot: &VectorSnapshot) -> bool {
+        let expected = self
+            .descriptors
+            .as_slice()
+            .iter()
+            .filter(|d| d.tokens != 0 && d.tokens <= self.embedder.target.max_input_tokens)
+            .map(|d| {
+                chunk_metadata(
+                    &self.document,
+                    self.folder,
+                    d.key,
+                    d.source,
+                    d.tokens,
+                    d.context.clone(),
+                    d.spans.clone(),
+                )
+            })
+            .collect();
+        snapshot.matches_note_metadata(&self.document.reference().note_id, expected)
+    }
+
     pub fn has_more(&self) -> bool {
         self.descriptors.len() != 0
     }
@@ -749,16 +764,36 @@ fn vector_chunk(
     vector: QuantizedVector,
 ) -> VectorChunk {
     VectorChunk {
-        metadata: ChunkMetadata {
-            note: document.reference().note_id.clone(),
-            key: chunk.key,
-            source: chunk.source,
+        metadata: chunk_metadata(
+            document,
             folder,
-            class: document.class(),
-            tokens: chunk.tokens as u16,
-            context: chunk.context,
-            spans: chunk.spans,
-        },
+            chunk.key,
+            chunk.source,
+            chunk.tokens,
+            chunk.context,
+            chunk.spans,
+        ),
         vector,
+    }
+}
+
+fn chunk_metadata(
+    document: &ClassifiedDocument,
+    folder: u32,
+    key: ContentDigest,
+    source: ContentDigest,
+    tokens: u32,
+    context: Vec<notarium_core::span::ByteSpan>,
+    spans: Vec<notarium_core::span::ByteSpan>,
+) -> ChunkMetadata {
+    ChunkMetadata {
+        note: document.reference().note_id.clone(),
+        key,
+        source,
+        folder,
+        class: document.class(),
+        tokens: tokens as u16,
+        context,
+        spans,
     }
 }

@@ -518,6 +518,49 @@ async fn shared_attachment(
         .ok_or_else(unavailable)
 }
 impl ProviderService {
+    /// Scope-wide change witness for background search repair. Membership and Space
+    /// changes advance admission_epoch. Disabling or enabling a member advances
+    /// their auth_version even if no canonical document or provider row changes.
+    pub async fn search_indexing_revision(
+        &self,
+        authority: &ServiceAuthority,
+        space: &SpaceId,
+        call: CallBudget,
+    ) -> Result<ContentDigest, PortError> {
+        authority.require(ServicePurpose::Search)?;
+        let budget = OperationBudget::new(call);
+        let mut tx = self.control.store.read(budget.clone()).await?;
+        let row = budget.run(async {
+            // One snapshot in both dialects. Sum 16-bit limbs so large restored
+            // versions never overflow SQLite SUM; PostgreSQL SUM(integer) is bigint.
+            rows!(tx.inner_mut(), (i64, i64, i64, i64, i64), fetch_optional,
+                "SELECT s.admission_epoch,
+                    COALESCE(SUM(CAST(u.auth_version & 65535 AS INTEGER)),0),
+                    COALESCE(SUM(CAST((u.auth_version >> 16) & 65535 AS INTEGER)),0),
+                    COALESCE(SUM(CAST((u.auth_version >> 32) & 65535 AS INTEGER)),0),
+                    COALESCE(SUM(CAST(u.auth_version >> 48 AS INTEGER)),0)
+                 FROM space_admission s LEFT JOIN space_members m ON m.space_id=s.space_id AND m.admission='active'
+                 LEFT JOIN users u ON u.user_id=m.user_id
+                 WHERE s.space_id=$1 AND s.state='active' GROUP BY s.admission_epoch",
+                "SELECT s.admission_epoch,
+                    COALESCE(SUM(CAST(u.auth_version & 65535 AS INTEGER)),0),
+                    COALESCE(SUM(CAST((u.auth_version >> 16) & 65535 AS INTEGER)),0),
+                    COALESCE(SUM(CAST((u.auth_version >> 32) & 65535 AS INTEGER)),0),
+                    COALESCE(SUM(CAST(u.auth_version >> 48 AS INTEGER)),0)
+                 FROM v1_control.space_admission s LEFT JOIN v1_control.space_members m ON m.space_id=s.space_id AND m.admission='active'
+                 LEFT JOIN v1_control.users u ON u.user_id=m.user_id
+                 WHERE s.space_id=$1 AND s.state='active' GROUP BY s.admission_epoch";
+                space.as_str())?.ok_or_else(|| PortError::from(DomainError::ResourceNotFound))
+        }, CommitEffect::NotCommitted).await?;
+        budget.run(tx.finish(), CommitEffect::NotCommitted).await?;
+        let mut hash =
+            blake3::Hasher::new_derive_key("notarium/search/remote-indexing-admission/v1");
+        for part in [row.0, row.1, row.2, row.3, row.4] {
+            hash.update(&part.to_le_bytes());
+        }
+        Ok(ContentDigest::from_bytes(*hash.finalize().as_bytes()))
+    }
+
     /// Admit the revision author in a Shared Space or the owner of a Personal
     /// Space. An ineligible author or unavailable disclosure returns no grant
     /// for this note. Storage and budget failures propagate to the caller.

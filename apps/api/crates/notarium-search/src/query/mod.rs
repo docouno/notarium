@@ -136,12 +136,17 @@ impl SearchEngine {
         let excluded: Arc<BTreeSet<_>> = Arc::new(aligned.overlay.keys().cloned().collect());
 
         let lexical = async {
-            let overlay =
-                rank_overlay(self, clock, &request, &aligned.overlay, &filter, filtered).await?;
-            let floor = top_k.min(crate::lexical::MAX_FALLBACK_FLOOR);
-            // The base and receipt revisions are disjoint. Count admitted strict
-            // receipt matches before asking the base to relax its quorum.
-            let base = lexical_candidates(
+            let overlay = rank_overlay(
+                self,
+                clock,
+                &request,
+                &aligned.overlay,
+                &filter,
+                state.as_deref(),
+                filtered,
+            )
+            .await?;
+            lexical_candidates(
                 clock,
                 snapshot.clone(),
                 state.clone(),
@@ -149,19 +154,11 @@ impl SearchEngine {
                 excluded.clone(),
                 request.text.clone(),
                 candidate_k,
-                floor.saturating_sub(overlay.strict.len()),
+                top_k,
                 filtered,
+                overlay,
             )
-            .await?;
-            let mut ranked = overlay.strict;
-            ranked.extend(base);
-            if browse {
-                ranked.sort_by(|left, right| note_key(left).cmp(&note_key(right)));
-            } else {
-                let missing = floor.saturating_sub(ranked.len());
-                ranked.extend(overlay.fallback.into_iter().take(missing));
-            }
-            Ok::<_, PortError>(ranked)
+            .await
         };
         let vectors = self.vector_candidates(VectorRequest {
             ctx: &ctx,
@@ -884,9 +881,15 @@ async fn lexical_candidates(
     candidate_k: usize,
     top_k: usize,
     filtered: bool,
+    overlay: OverlayHits,
 ) -> Result<Vec<LexicalHit>, PortError> {
     let Some(state) = state else {
-        return Ok(Vec::new());
+        return Ok(overlay.merge(
+            Vec::new(),
+            Vec::new(),
+            top_k.min(crate::lexical::MAX_FALLBACK_FLOOR),
+            text.trim().is_empty(),
+        ));
     };
     let snapshot_work = snapshot.clone();
     lexical_work_with_retry(clock, &snapshot, move |budget| {
@@ -899,13 +902,14 @@ async fn lexical_candidates(
         )
         .excluding(&excluded)
         .within(budget);
-        state.lexical.search_pinned(
+        state.lexical.search_with_overlay(
             &state.searcher,
             &text,
             &notes_filter,
             candidate_k,
             top_k,
             filtered,
+            &overlay,
         )
     })
     .await
@@ -917,6 +921,7 @@ async fn rank_overlay(
     query: &SearchQuery,
     overlay: &align::Overlay,
     filter: &Eligible,
+    state: Option<&Published>,
     filtered: bool,
 ) -> Result<OverlayHits, PortError> {
     let mut dictionary = crate::layout::FolderDictionary::default();
@@ -938,6 +943,7 @@ async fn rank_overlay(
     if notes.is_empty() {
         return Ok(OverlayHits::default());
     }
+    let base = state.map(|state| state.searcher.clone());
     let text = query.text.clone();
     lexical_work(clock, move |budget| {
         let updates: Vec<_> = notes
@@ -948,16 +954,9 @@ async fn rank_overlay(
                 folder: *folder,
             })
             .collect();
-        LexicalIndex::rank_overlay(&text, &updates, filtered, budget)
+        LexicalIndex::rank_overlay(&text, &updates, base.as_ref(), filtered, budget)
     })
     .await
-}
-
-fn note_key(hit: &LexicalHit) -> Option<&NoteId> {
-    match &hit.key {
-        crate::lexical::HitKey::Note(note) => Some(note),
-        _ => None,
-    }
 }
 
 fn lexical_error(error: LexicalError) -> PortError {

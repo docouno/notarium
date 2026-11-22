@@ -19,7 +19,7 @@ use std::{
 use tantivy::{
     DocAddress, DocId, DocSet, Score, Searcher, SegmentReader, TERMINATED,
     columnar::{BytesColumn, Column},
-    query::{EnableScoring, Query},
+    query::{Bm25StatisticsProvider, EnableScoring, Query},
 };
 
 const SELECTIVE_NOTE_MASK_LIMIT: u64 = 4_096;
@@ -236,6 +236,7 @@ impl Ord for WorstFirst {
 
 pub(super) fn collect_top_scored(
     searcher: &Searcher,
+    statistics: &dyn Bm25StatisticsProvider,
     query: &dyn Query,
     filter: &LexicalFilter<'_>,
     limit: usize,
@@ -245,7 +246,9 @@ pub(super) fn collect_top_scored(
     if limit == 0 {
         return Ok(Vec::new());
     }
-    let weight = query.weight(EnableScoring::enabled_from_searcher(searcher))?;
+    let weight = query.weight(EnableScoring::enabled_from_statistics_provider(
+        statistics, searcher,
+    ))?;
     let mut heap = BinaryHeap::<WorstFirst>::with_capacity(limit);
     for (ord, reader) in searcher.segment_readers().iter().enumerate() {
         check_budget(filter.budget)?;

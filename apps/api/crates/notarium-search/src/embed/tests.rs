@@ -330,6 +330,59 @@ fn bpe_decorated_byte_fallback_and_strict_oov() {
 }
 
 #[test]
+fn bpe_merge_target_uses_the_prefix_byte_width() {
+    // Hugging Face tokenizers 0.23.3, with both plausible merge targets present.
+    let vocab = serde_json::json!({
+        "<0xC3>":1, "<0xA9>":2, "<0xC3><0xA9>":3, "<0xC3>xA9>":4,
+        "<0xC3>0xA9>":5, "<0xC3>A9>":6
+    });
+    for (prefix, merged_id) in [
+        (None, 3),
+        (Some(""), 3),
+        (Some("#"), 5),
+        (Some("##"), 4),
+        (Some("▁"), 6),
+        (Some("▁▁"), 1),
+    ] {
+        let json = serde_json::json!({"model":{
+            "type":"BPE", "byte_fallback":true, "continuing_subword_prefix":prefix,
+            "vocab":vocab, "merges":[["<0xC3>", "<0xA9>"]]
+        }});
+        let tokenizer =
+            LocalTokenizerBudget::from_json(&serde_json::to_vec(&json).unwrap(), profile(), 512)
+                .unwrap();
+        assert_eq!(tokenizer.encode("é").unwrap().ids, [merged_id]);
+        assert_eq!(tokenizer.count("é").unwrap(), 1);
+    }
+
+    for (prefix, suffix) in [("##", "!"), ("▁", "")] {
+        let right = format!("{prefix}b{suffix}");
+        let merged = format!("ab{suffix}");
+        let json = serde_json::json!({"model":{
+            "type":"BPE", "continuing_subword_prefix":prefix, "end_of_word_suffix":suffix,
+            "vocab":{"a":1, (right.as_str()):2, (merged):3}, "merges":[["a", right]]
+        }});
+        let tokenizer =
+            LocalTokenizerBudget::from_json(&serde_json::to_vec(&json).unwrap(), profile(), 512)
+                .unwrap();
+        assert_eq!(tokenizer.encode("ab").unwrap().ids, [3]);
+        assert_eq!(tokenizer.count("ab").unwrap(), 1);
+    }
+
+    for (prefix, right) in [("##", "b"), ("#", "é")] {
+        let concatenated = format!("a{right}");
+        let json = serde_json::json!({"model":{
+            "type":"BPE", "continuing_subword_prefix":prefix,
+            "vocab":{"a":1, (right):2, (concatenated):3}, "merges":[["a", right]]
+        }});
+        assert!(matches!(
+            LocalTokenizerBudget::from_json(&serde_json::to_vec(&json).unwrap(), profile(), 512),
+            Err(EmbeddingError::InvalidModel)
+        ));
+    }
+}
+
+#[test]
 fn bpe_merge_ranks_and_formats_match_hugging_face() {
     // Golden IDs from Hugging Face tokenizers 0.23.3.
     let vocab = serde_json::json!({"a":1,"b":2,"c":3,"ab":4,"bc":5," ":6," b":7,"a b":8});

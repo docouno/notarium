@@ -89,6 +89,16 @@ pub trait SearchModelResolverPort: Send + Sync {
         budget: &'a CallBudget,
     ) -> PortFuture<'a, Option<ResolvedEmbeddingTarget>>;
 
+    /// Durable witness for changes to remote author admission in this Space.
+    /// Read only during background model maintenance. A stable witness lets
+    /// the worker skip revisiting documents whose authors remain ineligible.
+    fn remote_indexing_revision<'a>(
+        &'a self,
+        authority: &'a ServiceAuthority,
+        scope: &'a HistoryScope,
+        budget: CallBudget,
+    ) -> PortFuture<'a, notarium_core::ids::ContentDigest>;
+
     /// Admit the owner of a Personal Space or the revision author in a
     /// Shared Space under current individual and Space/project disclosure.
     /// Return `Ok(None)` if that actor is absent, disabled, no longer a member,

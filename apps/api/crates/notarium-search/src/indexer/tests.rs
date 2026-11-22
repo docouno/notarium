@@ -108,6 +108,7 @@ async fn idle_space_releases_embedder_and_reopens_checkpointed_wal_after_evictio
             tantivy_commit: 1,
             active_index_dir: crate::layout::index_name(1),
             tokenizer_version: TOKENIZER_VERSION,
+            remote_admission: None,
             active_model: Some(ResolvedEmbeddingTarget {
                 model: profile,
                 dimension: 64,
@@ -115,6 +116,7 @@ async fn idle_space_releases_embedder_and_reopens_checkpointed_wal_after_evictio
                 backend: EmbeddingBackendTarget::LocalOnnx,
             }),
             vector_seq: Some(current),
+            vector_replay_after: None,
             embeddings_pending: false,
         },
         folders: Arc::new(FolderDictionary::default()),
@@ -196,6 +198,15 @@ async fn idle_reopen_during_replacement_backoff_restores_active_embedder() {
             _: &'a CallBudget,
         ) -> PortFuture<'a, Option<ResolvedEmbeddingTarget>> {
             Box::pin(async move { Ok(Some(remote_target(self.provider.load(Ordering::SeqCst)))) })
+        }
+
+        fn remote_indexing_revision<'a>(
+            &'a self,
+            _: &'a ServiceAuthority,
+            _: &'a HistoryScope,
+            _: CallBudget,
+        ) -> PortFuture<'a, notarium_core::ids::ContentDigest> {
+            Box::pin(async { Ok(notarium_core::ids::ContentDigest::from_bytes([0; 32])) })
         }
 
         fn acquire_remote_indexing_grant<'a>(
@@ -524,8 +535,10 @@ async fn lexical_checkpoint_is_available_while_the_native_model_is_loading() {
         tantivy_commit: lexical.commit_id().unwrap(),
         active_index_dir: crate::layout::index_name(1),
         tokenizer_version: TOKENIZER_VERSION,
+        remote_admission: None,
         active_model: Some(target.clone()),
         vector_seq: Some(base),
+        vector_replay_after: None,
         embeddings_pending: false,
     };
     layout.publish_search(&manifest).unwrap();
@@ -648,6 +661,235 @@ async fn lexical_checkpoint_is_available_while_the_native_model_is_loading() {
 }
 
 #[tokio::test]
+async fn deferred_edits_replay_after_restart_before_admitting_the_checkpoint() {
+    use crate::{SearchDependencies, SearchEngine, config::SearchConfig};
+    use notarium_canonical::{
+        CanonicalConfig, CanonicalRuntime, CreateSpaceSpec, changes::SyntheticNoteSpec,
+    };
+    use notarium_core::{
+        auth::SpaceKind,
+        ids::{InstallationId, LeaseEpoch, PrincipalId},
+        model::Lifecycle,
+    };
+
+    let mut entropy = [0; 16];
+    getrandom::fill(&mut entropy).unwrap();
+    let path = std::env::temp_dir().join(format!("search-deferred-edits-{}", hex::encode(entropy)));
+    std::fs::create_dir(&path).unwrap();
+    let root = DataRoot::new(&path);
+    let (store, runtime) = CanonicalRuntime::open(CanonicalConfig::local_default(
+        InstallationId::from_bytes([1; 16]),
+        root.clone(),
+    ))
+    .await
+    .unwrap();
+    let store = Arc::new(store);
+    let lease = LeaseEpoch::new(1).unwrap();
+    let owner = PrincipalId::from_bytes([2; 16]);
+    let scope = store
+        .create_space(CreateSpaceSpec {
+            space_id: SpaceId::from_bytes([3; 16]),
+            incarnation: HistoryIncarnation::from_bytes([4; 16]),
+            root_folder_id: FolderId::from_bytes([5; 16]),
+            slug: "deferred".into(),
+            kind: SpaceKind::Personal,
+            owner: owner.clone(),
+            active_epoch: lease,
+            initial_last_seq: SpaceSeq::ZERO,
+            created_at: None,
+        })
+        .await
+        .unwrap()
+        .scope;
+    let note = |id| NoteId::from_bytes([id; 16]);
+    let spec = |id, carrier: &str| SyntheticNoteSpec {
+        note_id: note(id),
+        parent_folder: None,
+        slug: format!("note-{id}"),
+        title: format!("Note {id}"),
+        doc_class: DocClass::UserDoc,
+        lifecycle: Lifecycle::Active,
+        carrier: carrier.into(),
+        fields: Default::default(),
+    };
+    let cut = |after| ChangeCursor {
+        scope: scope.clone(),
+        after,
+    };
+    let (seed, _) = store
+        .commit_synthetic_note_batch_for_test(
+            &scope,
+            lease,
+            &owner,
+            (1..=4).map(|id| spec(id, "seed")).collect(),
+        )
+        .await
+        .unwrap();
+    let layout = Arc::new(SearchLayout::open(&root, scope.clone()).unwrap());
+    let engine = SearchEngine::start(
+        SearchConfig::new(root, VectorMode::DeterministicTest { dimension: 64 }),
+        SearchDependencies::new(store.clone(), Arc::new(UnusedStructural)),
+    );
+    let handle = Arc::new(SpaceHandle::new());
+    let cx = Context {
+        services: &engine.services,
+        handle: &handle,
+    };
+    let mut publisher = Publisher { handle: &handle };
+    let (mut disk, lexical) = build::seed_lexical(&cx, layout.clone(), &cut(seed.last_seq))
+        .await
+        .unwrap();
+    let model = ModelProfileId::from_bytes([6; 16]);
+    let chunk = |id| VectorChunk {
+        metadata: ChunkMetadata {
+            note: note(id),
+            key: ContentDigest::from_bytes([id; 32]),
+            source: ContentDigest::from_bytes([id; 32]),
+            folder: 1,
+            class: DocClass::UserDoc,
+            context: vec![],
+            spans: vec![ByteSpan::new(0, 1).unwrap()],
+            tokens: 1,
+        },
+        vector: QuantizedVector::quantize(&[1.0; 64]).unwrap(),
+    };
+    let mut segments = SegmentBuilder::new(&model, 64).unwrap();
+    for id in 1..=4 {
+        segments.push(chunk(id)).unwrap();
+    }
+    let mut epoch = VectorEpoch::open(layout.clone(), model.clone(), 64).unwrap();
+    epoch.seed(segments, seed.last_seq).unwrap();
+    drop(epoch);
+    disk.manifest.active_model = Some(ResolvedEmbeddingTarget {
+        model,
+        dimension: 64,
+        max_input_tokens: 512,
+        backend: EmbeddingBackendTarget::LocalOnnx,
+    });
+    disk.manifest.vector_seq = Some(seed.last_seq);
+    disk.manifest.embeddings_pending = false;
+    disk.publish_manifest().await.unwrap();
+    disk.embedder_unavailable = true;
+
+    let (edited, _) = store
+        .commit_synthetic_note_batch_for_test(
+            &scope,
+            lease,
+            &owner,
+            vec![spec(1, "edited one"), spec(2, "edited two")],
+        )
+        .await
+        .unwrap();
+    assert!(
+        !catch_up(
+            &cx,
+            &mut disk,
+            &lexical,
+            &mut publisher,
+            cut(edited.last_seq),
+            None,
+            false
+        )
+        .await
+        .unwrap()
+    );
+    let state = handle.published.load_full().unwrap();
+    assert_eq!(state.seq, edited.last_seq);
+    assert!(state.vectors.is_none() && state.embedder_unavailable && !state.reopening_vectors);
+    drop(state);
+    publisher.replace(None);
+    drop((disk, lexical));
+
+    let (mut disk, lexical) = open_disk(&cx, &mut publisher, layout.clone(), edited.last_seq)
+        .await
+        .unwrap()
+        .unwrap();
+    let manifest = layout.search_manifest().unwrap().unwrap();
+    assert_eq!(manifest.vector_seq, Some(seed.last_seq));
+    assert_eq!(manifest.vector_replay_after.unwrap().after, seed.last_seq);
+    assert!(!disk.full_sweep_needed);
+    // Interrupted WAL writes and an epoch checkpoint can each precede the search manifest.
+    let mut interrupted = open_vector_epoch(layout.clone(), &manifest).unwrap();
+    interrupted
+        .apply_batch(edited.last_seq, vec![MutableOperation::Delete(note(1))])
+        .unwrap();
+    drop(interrupted);
+    let recover = || {
+        recover_vector_epoch(
+            &engine.services,
+            &handle.stop,
+            layout.clone(),
+            manifest.clone(),
+        )
+    };
+    let (mut interrupted, _) = recover().await.unwrap();
+    assert!(interrupted.matches_note_chunks(&note(2), &[]));
+    interrupted.checkpoint(edited.last_seq).unwrap();
+    drop(interrupted);
+    let (epoch, replayed) = recover().await.unwrap();
+    assert_eq!(replayed, BTreeSet::from([note(1), note(2)]));
+    assert!(epoch.matches_note_chunks(&note(4), &[chunk(4)]));
+
+    // Advance the lexical cut once more while the recovered epoch is still private.
+    let (live, _) = store
+        .commit_synthetic_note_batch_for_test(&scope, lease, &owner, vec![spec(3, "live edit")])
+        .await
+        .unwrap();
+    let mut dirty = BgDirty::default();
+    assert!(
+        !catch_up(
+            &cx,
+            &mut disk,
+            &lexical,
+            &mut publisher,
+            cut(live.last_seq),
+            Some(&mut dirty),
+            true
+        )
+        .await
+        .unwrap()
+    );
+    assert!(handle.published.load_full().unwrap().vectors.is_none());
+    let mut disk = Some(disk);
+    handle_bg_done(
+        &cx,
+        &mut publisher,
+        &mut disk,
+        &layout,
+        BgOutcome::ReopenVectors(Ok((epoch, replayed))),
+        dirty,
+        &mut false,
+        &mut false,
+        &mut Instant::now(),
+        &mut Duration::from_secs(1),
+        &mut Instant::now(),
+        &mut Instant::now(),
+        &mut Duration::from_secs(1),
+    )
+    .await
+    .unwrap();
+    let disk = disk.unwrap();
+    let epoch = disk.epoch.as_ref().unwrap();
+    assert_eq!(
+        disk.dirty_notes,
+        BTreeSet::from([note(1), note(2), note(3)])
+    );
+    assert!(!disk.full_sweep_needed);
+    for id in 1..=3 {
+        assert!(epoch.matches_note_chunks(&note(id), &[]));
+    }
+    assert!(epoch.matches_note_chunks(&note(4), &[chunk(4)]));
+    let admitted = layout.search_manifest().unwrap().unwrap();
+    assert_eq!(admitted.vector_seq, Some(live.last_seq));
+    assert!(admitted.vector_replay_after.is_none());
+    publisher.replace(None);
+    drop((lexical, disk));
+    engine.shutdown().await;
+    runtime.shutdown().await.unwrap();
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[tokio::test]
 async fn absent_space_worker_exits_before_idempotent_shutdown() {
     use crate::{
         SearchDependencies, SearchEngine,
@@ -692,7 +934,7 @@ async fn absent_space_worker_exits_before_idempotent_shutdown() {
 }
 
 #[test]
-fn reopening_vectors_stays_true_during_reopen_after_live_edit_clears_vector_seq() {
+fn scheduled_reopen_signals_until_retry_backoff() {
     let mut entropy = [0u8; 16];
     getrandom::fill(&mut entropy).unwrap();
     let path = std::env::temp_dir().join(format!("search-reopen-flag-{}", hex::encode(entropy)));
@@ -715,6 +957,7 @@ fn reopening_vectors_stays_true_during_reopen_after_live_edit_clears_vector_seq(
             tantivy_commit: lexical.commit_id().unwrap(),
             active_index_dir: crate::layout::index_name(1),
             tokenizer_version: TOKENIZER_VERSION,
+            remote_admission: None,
             active_model: Some(ResolvedEmbeddingTarget {
                 model: ModelProfileId::from_bytes([0xa2; 16]),
                 dimension: 64,
@@ -722,6 +965,7 @@ fn reopening_vectors_stays_true_during_reopen_after_live_edit_clears_vector_seq(
                 backend: EmbeddingBackendTarget::LocalOnnx,
             }),
             vector_seq: None,
+            vector_replay_after: None,
             embeddings_pending: true,
         },
         folders: Arc::new(FolderDictionary::default()),
@@ -739,8 +983,7 @@ fn reopening_vectors_stays_true_during_reopen_after_live_edit_clears_vector_seq(
     };
     let handle = Arc::new(SpaceHandle::new());
     let mut publisher = Publisher { handle: &handle };
-    // Live edit during BgKind::ReopenVectors clears vector_seq while passing
-    // reopening = true; published state must stay marked reopening_vectors.
+    // A scheduled opener signals its intent until the worker enters backoff.
     publisher.publish_with(&disk, &lexical, true);
     assert!(handle.published.load_full().unwrap().reopening_vectors);
 
@@ -812,6 +1055,7 @@ async fn full_sweep_completion_preserves_resweep_when_remote_folders_changed() {
             tantivy_commit: lexical.commit_id().unwrap(),
             active_index_dir: crate::layout::index_name(1),
             tokenizer_version: TOKENIZER_VERSION,
+            remote_admission: None,
             active_model: Some(ResolvedEmbeddingTarget {
                 model: profile,
                 dimension: 64,
@@ -826,6 +1070,7 @@ async fn full_sweep_completion_preserves_resweep_when_remote_folders_changed() {
                 },
             }),
             vector_seq: Some(seq),
+            vector_replay_after: None,
             embeddings_pending: true,
         },
         folders: Arc::new(FolderDictionary::default()),
@@ -1196,6 +1441,15 @@ async fn purge_resync_acknowledges_before_model_refresh_preventing_lagged_livelo
                     },
                 }))
             })
+        }
+
+        fn remote_indexing_revision<'a>(
+            &'a self,
+            _: &'a ServiceAuthority,
+            _: &'a HistoryScope,
+            _: CallBudget,
+        ) -> PortFuture<'a, notarium_core::ids::ContentDigest> {
+            Box::pin(async { Ok(notarium_core::ids::ContentDigest::from_bytes([0; 32])) })
         }
 
         fn acquire_remote_indexing_grant<'a>(
@@ -1619,6 +1873,15 @@ async fn failed_embedder_load_respects_retry_backoff_without_busy_spin() {
             Box::pin(async move { Ok(Some(target)) })
         }
 
+        fn remote_indexing_revision<'a>(
+            &'a self,
+            _: &'a ServiceAuthority,
+            _: &'a HistoryScope,
+            _: CallBudget,
+        ) -> PortFuture<'a, notarium_core::ids::ContentDigest> {
+            Box::pin(async { Ok(notarium_core::ids::ContentDigest::from_bytes([0; 32])) })
+        }
+
         fn acquire_remote_indexing_grant<'a>(
             &'a self,
             _: &'a ServiceAuthority,
@@ -1686,8 +1949,10 @@ async fn failed_embedder_load_respects_retry_backoff_without_busy_spin() {
         tantivy_commit: lexical.commit_id().unwrap(),
         active_index_dir: crate::layout::index_name(1),
         tokenizer_version: TOKENIZER_VERSION,
+        remote_admission: None,
         active_model: Some(target.clone()),
         vector_seq: Some(seq),
+        vector_replay_after: None,
         embeddings_pending: true,
     };
     layout.publish_search(&manifest).unwrap();
@@ -1854,6 +2119,7 @@ async fn folder_move_between_full_sweep_pages_resets_full_sweep_after() {
             tantivy_commit: lexical.commit_id().unwrap(),
             active_index_dir: crate::layout::index_name(1),
             tokenizer_version: TOKENIZER_VERSION,
+            remote_admission: None,
             active_model: Some(ResolvedEmbeddingTarget {
                 model: ModelProfileId::from_bytes([0xf9; 16]),
                 dimension: 64,
@@ -1868,6 +2134,7 @@ async fn folder_move_between_full_sweep_pages_resets_full_sweep_after() {
                 },
             }),
             vector_seq: Some(seq1),
+            vector_replay_after: None,
             embeddings_pending: true,
         },
         folders: Arc::new(FolderDictionary::default()),
@@ -2031,7 +2298,7 @@ async fn search_after_embedder_idle_reloads_embedder_without_model_unavailable()
 
     struct SingleNoteStructural {
         store: Arc<CanonicalStore>,
-        cut: SnapshotCut,
+        cut: Mutex<SnapshotCut>,
         note: NoteId,
         folder: FolderId,
     }
@@ -2042,7 +2309,7 @@ async fn search_after_embedder_idle_reloads_embedder_without_model_unavailable()
             _: CausalBasis,
         ) -> PortFuture<'_, Box<dyn StructuralSnapshot>> {
             let snapshot = SingleNoteSnapshot {
-                cut: self.cut.clone(),
+                cut: self.cut.lock().unwrap().clone(),
                 note: self.note.clone(),
                 folder: self.folder.clone(),
             };
@@ -2155,8 +2422,8 @@ async fn search_after_embedder_idle_reloads_embedder_without_model_unavailable()
         };
         let structural = Arc::new(SingleNoteStructural {
             store: store.clone(),
-            cut,
-            note: note_id,
+            cut: Mutex::new(cut),
+            note: note_id.clone(),
             folder,
         });
         let schedule = Schedule {
@@ -2223,7 +2490,7 @@ async fn search_after_embedder_idle_reloads_embedder_without_model_unavailable()
             project_root: None,
         };
         let auth = EngineAuthContext::for_human(VerifiedHuman::attest(
-            owner,
+            owner.clone(),
             GrantId::from_bytes([0xec; 16]),
             BTreeMap::from([(space.scope.space_id.clone(), grant)]),
             true,
@@ -2271,7 +2538,7 @@ async fn search_after_embedder_idle_reloads_embedder_without_model_unavailable()
                 .model_epoch(&model)
                 .unwrap()
                 .join("epoch_manifest.json");
-            let bytes = std::fs::read(&checkpoint).unwrap();
+            let original = layout.epoch_manifest(&model).unwrap().unwrap();
             let permissions = std::fs::metadata(&checkpoint).unwrap().permissions();
             std::fs::set_permissions(&checkpoint, std::fs::Permissions::from_mode(0o000)).unwrap();
             if std::fs::read(&checkpoint)
@@ -2304,12 +2571,62 @@ async fn search_after_embedder_idle_reloads_embedder_without_model_unavailable()
                     layout.search_manifest().unwrap().unwrap().vector_seq,
                     manifest.vector_seq
                 );
+                let (edit, _) = store
+                    .commit_synthetic_note_batch_for_test(
+                        &space.scope,
+                        lease,
+                        &owner,
+                        vec![SyntheticNoteSpec {
+                            note_id: note_id.clone(),
+                            parent_folder: None,
+                            slug: "needle".into(),
+                            title: "Edited during backoff".into(),
+                            doc_class: DocClass::UserDoc,
+                            lifecycle: Lifecycle::Active,
+                            carrier: "needle in edited payload".into(),
+                            fields: BTreeMap::new(),
+                        }],
+                    )
+                    .await
+                    .unwrap();
+                {
+                    let mut cut = structural.cut.lock().unwrap();
+                    cut.projected_seq = edit.last_seq;
+                    cut.canonical_seq = edit.last_seq;
+                }
+                tokio::time::timeout(
+                    Duration::from_secs(3),
+                    changed.wait_for(|_| {
+                        handle.published.load().as_ref().is_some_and(|state| {
+                            state.seq == edit.last_seq
+                                && state.vectors.is_none()
+                                && !state.reopening_vectors
+                        })
+                    }),
+                )
+                .await
+                .expect("the edit must publish during vector backoff")
+                .unwrap();
+                let deferred = layout.search_manifest().unwrap().unwrap();
+                assert_eq!(deferred.vector_seq, manifest.vector_seq);
+                assert_eq!(
+                    deferred.vector_replay_after.unwrap().after,
+                    manifest.tantivy_seq
+                );
+                let result = engine.search(ctx.clone(), query.clone()).await.unwrap();
+                assert!(matches!(
+                    result.degraded,
+                    Some(notarium_core::ports::SearchDegradation::ModelUnavailable)
+                ));
+                assert_eq!(result.hits[0].card.title, "Edited during backoff");
                 std::fs::set_permissions(&checkpoint, permissions.clone()).unwrap();
                 tokio::time::timeout(
                     Duration::from_secs(10),
                     changed.wait_for(|_| {
                         handle.published.load().as_ref().is_some_and(|state| {
-                            state.embedder.is_some() && state.vectors.is_some()
+                            state.embedder.is_some()
+                                && state.vectors.is_some()
+                                && !state.embeddings_pending
                         })
                     }),
                 )
@@ -2317,7 +2634,14 @@ async fn search_after_embedder_idle_reloads_embedder_without_model_unavailable()
                 .expect("the worker must retry the retained checkpoint")
                 .unwrap();
                 assert!(engine.search(ctx, query).await.unwrap().degraded.is_none());
-                assert_eq!(std::fs::read(&checkpoint).unwrap(), bytes);
+                assert_eq!(
+                    layout
+                        .epoch_manifest(&model)
+                        .unwrap()
+                        .unwrap()
+                        .active_segments,
+                    original.active_segments
+                );
                 drop(pinned);
                 engine.shutdown().await;
             }
@@ -2358,6 +2682,7 @@ async fn reconcile_reopening_clears_stale_flag_when_non_reopening_bg_task_spawns
             tantivy_commit: lexical.commit_id().unwrap(),
             active_index_dir: crate::layout::index_name(1),
             tokenizer_version: TOKENIZER_VERSION,
+            remote_admission: None,
             active_model: Some(ResolvedEmbeddingTarget {
                 model: profile,
                 dimension: 64,
@@ -2365,6 +2690,7 @@ async fn reconcile_reopening_clears_stale_flag_when_non_reopening_bg_task_spawns
                 backend: EmbeddingBackendTarget::LocalOnnx,
             }),
             vector_seq: Some(seq),
+            vector_replay_after: None,
             embeddings_pending: false,
         },
         folders: Arc::new(FolderDictionary::default()),
@@ -2454,6 +2780,7 @@ fn disabled_vector_mode_never_schedules_maintenance_wake_on_pending_manifest() {
             tantivy_commit: lexical.commit_id().unwrap(),
             active_index_dir: crate::layout::index_name(1),
             tokenizer_version: TOKENIZER_VERSION,
+            remote_admission: None,
             active_model: Some(ResolvedEmbeddingTarget {
                 model: ModelProfileId::from_bytes([0xf3; 16]),
                 dimension: 64,
@@ -2461,6 +2788,7 @@ fn disabled_vector_mode_never_schedules_maintenance_wake_on_pending_manifest() {
                 backend: EmbeddingBackendTarget::LocalOnnx,
             }),
             vector_seq: None,
+            vector_replay_after: None,
             embeddings_pending: true,
         },
         folders: Arc::new(FolderDictionary::default()),
@@ -2651,8 +2979,10 @@ async fn space_handle_idle_eviction_respects_pins_extra_refs_and_replace_if_live
             tantivy_commit: lexical.commit_id().unwrap(),
             active_index_dir: crate::layout::index_name(1),
             tokenizer_version: TOKENIZER_VERSION,
+            remote_admission: None,
             active_model: None,
             vector_seq: None,
+            vector_replay_after: None,
             embeddings_pending: false,
         },
         folders: Arc::new(FolderDictionary::default()),

@@ -8,8 +8,8 @@ use crate::{
     model::{Embedder, IndexNote, NoteIndexOutcome, NotePreparation, PreparedIndexNote},
     ports::{ResolvedEmbeddingTarget, SearchIndexedNote},
     vector::{
-        MmapSegment, QuantizedVector, SegmentBuilder, VectorChunk, VectorEpoch, VectorError,
-        segment_file_path,
+        MmapSegment, QuantizedVector, RepairDirectory, SegmentBuilder, StagedNoteSegments,
+        VectorChunk, VectorEpoch, VectorError, segment_file_path,
     },
 };
 use notarium_canonical::chats::search::HydratedChatHit;
@@ -122,8 +122,10 @@ pub(super) async fn seed_lexical(
             tantivy_commit: commit_id,
             active_index_dir: index_name(generation),
             tokenizer_version: TOKENIZER_VERSION,
+            remote_admission: None,
             active_model: None,
             vector_seq: None,
+            vector_replay_after: None,
             embeddings_pending: !matches!(cx.services.config.vector_mode, VectorMode::Disabled),
         };
         Ok::<_, IndexError>((
@@ -166,6 +168,7 @@ pub(super) struct ModelRefreshInput {
     pub base: ChangeCursor,
     pub folders: Arc<FolderDictionary>,
     pub active: Option<ResolvedEmbeddingTarget>,
+    pub remote_admission: Option<ContentDigest>,
     pub have_epoch: bool,
     pub pending: bool,
     pub cancel: Cancellation,
@@ -173,6 +176,7 @@ pub(super) struct ModelRefreshInput {
 
 pub(super) struct BuiltModelEpoch {
     pub target: ResolvedEmbeddingTarget,
+    pub remote_admission: Option<ContentDigest>,
     pub embedder: Arc<Embedder>,
     pub epoch: VectorEpoch,
     pub failed_notes: BTreeSet<NoteId>,
@@ -181,6 +185,7 @@ pub(super) struct BuiltModelEpoch {
 
 pub(super) enum ModelRefreshOutcome {
     Unchanged,
+    AdmissionChanged(ContentDigest),
     Cleared,
     PendingModel(ResolvedEmbeddingTarget),
     Built(Box<BuiltModelEpoch>),
@@ -196,6 +201,7 @@ pub(super) async fn prepare_model_refresh(
         base,
         folders,
         active,
+        remote_admission,
         have_epoch,
         pending,
         cancel,
@@ -204,7 +210,35 @@ pub(super) async fn prepare_model_refresh(
     let target = services
         .model_target(&base.scope, None, &new_budget(&cancel))
         .await?;
+    let revision = if target.as_ref().is_some_and(|target| {
+        matches!(
+            target.backend,
+            crate::ports::EmbeddingBackendTarget::Remote { .. }
+        )
+    }) {
+        let resolver = services
+            .deps
+            .model_resolver
+            .as_ref()
+            .ok_or(EmbeddingError::ModelUnavailable)?;
+        let budget = new_budget(&cancel);
+        Some(tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Err(EmbeddingError::Cancelled.into()),
+            revision = tokio::time::timeout(budget.remaining,
+                resolver.remote_indexing_revision(&services.authority, &base.scope, budget)) =>
+                revision.map_err(|_| EmbeddingError::BudgetExceeded)??,
+        })
+    } else {
+        None
+    };
     if target == active && (!pending || have_epoch) {
+        if let Some(revision) = revision
+            && have_epoch
+            && Some(revision) != remote_admission
+        {
+            return Ok(ModelRefreshOutcome::AdmissionChanged(revision));
+        }
         return Ok(ModelRefreshOutcome::Unchanged);
     }
     let Some(target) = target else {
@@ -263,6 +297,7 @@ pub(super) async fn prepare_model_refresh(
                 target,
                 embedder,
                 epoch: seeded.epoch,
+                remote_admission: revision,
                 failed_notes: seeded.failed_notes,
                 missing_folders: seeded.missing_folders,
             })))
@@ -342,7 +377,7 @@ async fn seed_vectors(
                 .await?;
             let outcome = match prepared {
                 NotePreparation::Ready(prepared) => {
-                    let (next, outcome) = staged.index(*prepared, cancel).await?;
+                    let (next, outcome) = staged.index(*prepared, &|_| None, cancel).await?;
                     staged = next;
                     outcome
                 }
@@ -394,7 +429,7 @@ async fn seed_vectors(
 
 // At the largest supported dimension this holds at most 1 MiB of pending
 // quantized payload, shared across note and canonical-page boundaries.
-const SEED_VECTOR_ROWS: usize = 256;
+pub(super) const VECTOR_WINDOW_ROWS: usize = 256;
 
 struct SeedSegments {
     #[cfg(test)]
@@ -405,6 +440,48 @@ struct SeedSegments {
     sealed: Vec<(u64, MmapSegment)>,
     pending: Vec<VectorChunk>,
     pending_keys: HashMap<ContentDigest, usize>,
+    repair_directory: Option<Arc<RepairDirectory>>,
+}
+
+/// Build one large warm replacement off-owner. No segment is linked into the
+/// active epoch until the owner checks concurrent edits and folder changes.
+pub(super) async fn stage_repair(
+    note: PreparedIndexNote<'_>,
+    layout: &SearchLayout,
+    model: &VectorModel,
+    existing: &(dyn Fn(ContentDigest) -> Option<QuantizedVector> + Sync),
+    cancel: &Cancellation,
+) -> Result<(Option<StagedNoteSegments>, NoteIndexOutcome), IndexError> {
+    let directory = RepairDirectory::new(&layout.model_epoch(model)?)?;
+    let mut staged = SeedSegments::new(model.clone(), directory.path.clone())?;
+    // A cancelled async caller may leave a blocking seal running briefly.
+    staged.repair_directory = Some(directory.clone());
+    let (mut staged, outcome) = match staged.index(note, existing, cancel).await {
+        Ok(result) => result,
+        Err(ModelError::Index(error)) => return Err(error),
+        Err(ModelError::Embedding(EmbeddingError::IndexingDenied)) => {
+            return Ok((None, NoteIndexOutcome::Denied));
+        }
+        Err(ModelError::Embedding(error)) => return Ok((None, NoteIndexOutcome::Fatal(error))),
+    };
+    if staged.is_empty() || matches!(outcome, NoteIndexOutcome::Denied) {
+        return Ok((None, outcome));
+    }
+    let stop = cancel.clone();
+    let segments = tokio::task::spawn_blocking(move || {
+        staged.build_pending(&stop)?;
+        staged.seal(&stop)?;
+        Ok::<_, VectorError>(staged.sealed)
+    })
+    .await
+    .map_err(|_| IndexError::Inconsistent)??;
+    Ok((
+        Some(StagedNoteSegments {
+            directory,
+            segments,
+        }),
+        outcome,
+    ))
 }
 
 impl SeedSegments {
@@ -416,8 +493,9 @@ impl SeedSegments {
             model,
             path,
             sealed: Vec::new(),
-            pending: Vec::with_capacity(SEED_VECTOR_ROWS),
+            pending: Vec::with_capacity(VECTOR_WINDOW_ROWS),
             pending_keys: HashMap::new(),
+            repair_directory: None,
         })
     }
 
@@ -441,6 +519,7 @@ impl SeedSegments {
     async fn index(
         mut self,
         mut note: PreparedIndexNote<'_>,
+        existing: &(dyn Fn(ContentDigest) -> Option<QuantizedVector> + Sync),
         cancel: &Cancellation,
     ) -> Result<(Self, NoteIndexOutcome), ModelError> {
         let mut has_note_rows = false;
@@ -449,8 +528,10 @@ impl SeedSegments {
             if cancel.is_cancelled() {
                 return Err(EmbeddingError::Cancelled.into());
             }
-            let room = SEED_VECTOR_ROWS - self.pending.len();
-            let window = note.index_next(room, &|key| self.find_vector(key)).await;
+            let room = VECTOR_WINDOW_ROWS - self.pending.len();
+            let window = note
+                .index_next(room, &|key| self.find_vector(key).or_else(|| existing(key)))
+                .await;
             #[cfg(test)]
             {
                 self.peak_pending_rows = self
@@ -475,7 +556,7 @@ impl SeedSegments {
                     .or_insert(self.pending.len());
                 self.pending.push(chunk);
             }
-            if self.pending.len() == SEED_VECTOR_ROWS {
+            if self.pending.len() == VECTOR_WINDOW_ROWS {
                 let stop = cancel.clone();
                 self = tokio::task::spawn_blocking(move || {
                     self.build_pending(&stop)?;
@@ -811,8 +892,47 @@ mod tests {
         ids::{HistoryIncarnation, InstallationId, LeaseEpoch, PrincipalId, SpaceId, SpaceSeq},
     };
 
-    #[tokio::test]
-    async fn cold_seed_bounds_vector_rows_across_notes_and_keeps_every_repeated_chunk() {
+    struct WindowFixture {
+        path: std::path::PathBuf,
+        engine: SearchEngine,
+        runtime: CanonicalRuntime,
+        layout: Arc<SearchLayout>,
+        embedder: Arc<Embedder>,
+        cutoff: ChangeCursor,
+        folders: Arc<FolderDictionary>,
+        seeded: SeededEpoch,
+    }
+
+    impl WindowFixture {
+        async fn shutdown(self) {
+            drop(self.seeded);
+            self.engine.shutdown().await;
+            self.runtime.shutdown().await.unwrap();
+            std::fs::remove_dir_all(self.path).unwrap();
+        }
+
+        async fn repair(
+            &self,
+            folders: Arc<FolderDictionary>,
+            mode: crate::indexer::update::EmbedBatchMode,
+        ) -> crate::indexer::update::EmbedBatchOutcome {
+            crate::indexer::update::run_embed_batch(crate::indexer::update::EmbedBatchInput {
+                layout: self.layout.clone(),
+                services: self.engine.services.clone(),
+                cutoff: self.cutoff.clone(),
+                folders,
+                embedder: self.embedder.clone(),
+                snapshot: self.seeded.epoch.snapshot(),
+                cached_vectors: HashMap::new(),
+                mode,
+                cancel: Cancellation::default(),
+            })
+            .await
+            .unwrap()
+        }
+    }
+
+    async fn window_fixture(rows_per_note: usize) -> WindowFixture {
         let mut entropy = [0u8; 16];
         getrandom::fill(&mut entropy).unwrap();
         let path =
@@ -842,7 +962,6 @@ mod tests {
             })
             .await
             .unwrap();
-        let rows_per_note = SEED_VECTOR_ROWS + 7;
         let notes = (1..=2)
             .map(|id| SyntheticNoteSpec {
                 note_id: NoteId::from_bytes([id; 16]),
@@ -896,8 +1015,28 @@ mod tests {
         )
         .await
         .unwrap();
+        WindowFixture {
+            path,
+            engine,
+            runtime,
+            layout,
+            embedder: Arc::new(embedder),
+            cutoff,
+            folders: Arc::new(folders),
+            seeded,
+        }
+    }
+
+    #[tokio::test]
+    async fn cold_seed_bounds_vector_rows_across_notes_and_keeps_every_repeated_chunk() {
+        let fixture = window_fixture(VECTOR_WINDOW_ROWS + 7).await;
+        let seeded = &fixture.seeded;
+        let rows_per_note = VECTOR_WINDOW_ROWS + 7;
+        let model = fixture.embedder.target.vector_model();
+        let layout = &fixture.layout;
+        let epoch_path = layout.model_epoch(&model).unwrap();
         assert!(seeded.failed_notes.is_empty());
-        assert_eq!(seeded.peak_pending_rows, SEED_VECTOR_ROWS);
+        assert_eq!(seeded.peak_pending_rows, VECTOR_WINDOW_ROWS);
         let manifest = layout.epoch_manifest(&model).unwrap().unwrap();
         let mut counts = HashMap::<NoteId, usize>::new();
         let mut keys = BTreeSet::new();
@@ -913,9 +1052,138 @@ mod tests {
         assert_eq!(counts.len(), 2);
         assert!(counts.values().all(|&count| count == rows_per_note));
         assert_eq!(keys.len(), 1);
-        drop(seeded);
-        engine.shutdown().await;
-        runtime.shutdown().await.unwrap();
-        std::fs::remove_dir_all(path).unwrap();
+        fixture.shutdown().await;
+    }
+
+    fn moved_folder_dictionary() -> Arc<FolderDictionary> {
+        let mut moved = FolderDictionary::default();
+        moved.insert(FolderId::from_bytes([9; 16])).unwrap();
+        moved.insert(FolderId::from_bytes([5; 16])).unwrap();
+        Arc::new(moved)
+    }
+
+    #[tokio::test]
+    async fn warm_repair_yields_before_two_inline_notes_exceed_its_window() {
+        use crate::indexer::update::{EmbedBatchMode, EmbedBatchOutcome, EmbeddedChunks};
+        let per_note = VECTOR_WINDOW_ROWS / 2 + 1;
+        let fixture = window_fixture(per_note).await;
+        let moved = moved_folder_dictionary();
+        let first = NoteId::from_bytes([1; 16]);
+        let second = NoteId::from_bytes([2; 16]);
+        let mut after = None;
+        for expected in [first.clone(), second.clone()] {
+            let result = fixture
+                .repair(moved.clone(), EmbedBatchMode::FullSweep { after })
+                .await;
+            let EmbedBatchOutcome::Applied {
+                rows,
+                next_sweep_after,
+                ..
+            } = result
+            else {
+                panic!("expected inline repair")
+            };
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].note_id, expected);
+            assert!(
+                matches!(&rows[0].chunks, EmbeddedChunks::Inline(chunks) if chunks.len() == per_note)
+            );
+            assert_eq!(
+                next_sweep_after,
+                (expected == first).then_some(first.clone())
+            );
+            after = next_sweep_after;
+        }
+        let dirty = fixture
+            .repair(
+                moved,
+                EmbedBatchMode::DirtyNotes(vec![first.clone(), second.clone()]),
+            )
+            .await;
+        assert!(
+            matches!(dirty, EmbedBatchOutcome::Applied {rows, requeue, ..} if rows.len() == 1 && rows[0].note_id == first && requeue == [second])
+        );
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn warm_repair_skips_unchanged_and_stages_long_notes_without_losing_the_page_tail() {
+        use crate::indexer::update::{EmbedBatchMode, EmbedBatchOutcome, EmbeddedChunks};
+        let mut fixture = window_fixture(VECTOR_WINDOW_ROWS + 7).await;
+        let full = |after| EmbedBatchMode::FullSweep { after };
+        let unchanged = fixture.repair(fixture.folders.clone(), full(None)).await;
+        assert!(
+            matches!(unchanged, EmbedBatchOutcome::Applied {rows, requeue, next_sweep_after: None, ..} if rows.is_empty() && requeue.is_empty())
+        );
+
+        let moved = moved_folder_dictionary();
+        let first = NoteId::from_bytes([1; 16]);
+        let second = NoteId::from_bytes([2; 16]);
+        let dirty = fixture
+            .repair(
+                moved.clone(),
+                EmbedBatchMode::DirtyNotes(vec![first.clone(), second.clone()]),
+            )
+            .await;
+        let EmbedBatchOutcome::Applied {
+            mut rows, requeue, ..
+        } = dirty
+        else {
+            panic!("expected staged repair")
+        };
+        assert_eq!(requeue.as_slice(), std::slice::from_ref(&second));
+        assert_eq!(rows.len(), 1);
+        let EmbeddedChunks::Staged(abandoned) = rows.remove(0).chunks else {
+            panic!("expected a sealed replacement")
+        };
+        let scratch = abandoned.directory.path.clone();
+        drop(abandoned);
+        assert!(!scratch.exists());
+
+        let mut after = None;
+        for (expected_id, expected_next) in [(first.clone(), Some(first)), (second, None)] {
+            let repaired = fixture.repair(moved.clone(), full(after)).await;
+            let EmbedBatchOutcome::Applied {
+                mut rows,
+                requeue,
+                next_sweep_after,
+                ..
+            } = repaired
+            else {
+                panic!("expected staged repair")
+            };
+            assert!(requeue.is_empty());
+            assert_eq!(next_sweep_after, expected_next);
+            after = next_sweep_after;
+            assert_eq!(rows.len(), 1);
+            let row = rows.pop().unwrap();
+            assert_eq!(row.note_id, expected_id);
+            let EmbeddedChunks::Staged(staged) = row.chunks else {
+                panic!("expected a sealed replacement")
+            };
+            assert_eq!(
+                staged
+                    .segments
+                    .iter()
+                    .map(|(_, s)| s.len() as usize)
+                    .sum::<usize>(),
+                VECTOR_WINDOW_ROWS + 7
+            );
+            fixture
+                .seeded
+                .epoch
+                .replace_staged_note(fixture.cutoff.after, row.note_id, staged)
+                .unwrap();
+        }
+        fixture.seeded.epoch = VectorEpoch::open_model(
+            fixture.layout.clone(),
+            fixture.embedder.target.vector_model(),
+        )
+        .unwrap();
+        let final_page = fixture.repair(moved, full(None)).await;
+        assert!(
+            matches!(final_page, EmbedBatchOutcome::Applied { rows, requeue, next_sweep_after: None, .. } if rows.is_empty() && requeue.is_empty())
+        );
+        fixture.shutdown().await;
     }
 }

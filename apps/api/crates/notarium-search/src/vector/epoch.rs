@@ -9,7 +9,8 @@ use super::{
     mmap_segment::SlotMask,
 };
 use crate::layout::{
-    EpochManifest, SearchLayout, SegmentRecovery, VectorModel, remove_path_if_exists, sync_dir,
+    EpochManifest, SearchLayout, SegmentRecovery, VectorModel, remove_dir_all_readonly,
+    remove_path_if_exists, sync_dir,
 };
 use cap_std::{ambient_authority, fs::Dir};
 use croaring::Bitmap;
@@ -117,80 +118,43 @@ impl ProjectedVectorFilter<'_> {
         }
     }
 
-    /// A broad physical posting only needs a materialized intersection if its
-    /// effective scope fits the exact scan. Stop on the first slot beyond the
-    /// crossover; graph traversal still verifies every candidate's visibility.
-    fn selective_slots(
+    fn selective_node_slots(
         &self,
         data: &MmapSegment,
         posting: &SlotMask<'_>,
+        nodes: &Bitmap,
         budget: SearchBudget<'_>,
     ) -> Result<Option<Bitmap>, VectorError> {
-        let Some(nodes) = self.nodes else {
-            return Ok(None);
-        };
-        if posting.cardinality() <= EXACT_SCAN_LIMIT {
-            return Ok(None);
-        }
         let mut selected = Bitmap::new();
-        if nodes.cardinality() <= u64::from(data.num_notes()).min(posting.cardinality()) {
-            // Sparse structural side: map its notes to every admitted slot.
-            let generation = self.snapshot.cut().generation;
-            let mut visited_slots = 0_usize;
-            for (position, index) in nodes.iter().enumerate() {
-                if position.is_multiple_of(64) {
-                    budget.check()?;
-                }
-                let node = DenseNodeId::new(generation, index);
-                match self.snapshot.doc_class(node) {
-                    Ok(class) if self.classes.contains(&class) => {}
-                    Ok(_) | Err(DomainError::ResourceNotFound) => continue,
-                    Err(error) => return Err(error.into()),
-                }
-                let note = match self.snapshot.note_id(node) {
-                    Ok(note) => note,
-                    Err(DomainError::ResourceNotFound) => continue,
-                    Err(error) => return Err(error.into()),
-                };
-                if let Some(slots) = data.note_slots(&note) {
-                    for slot in slots {
-                        if visited_slots.is_multiple_of(256) {
-                            budget.check()?;
-                        }
-                        visited_slots += 1;
-                        if posting.contains(slot) {
-                            selected.add(slot);
-                            if selected.cardinality() > EXACT_SCAN_LIMIT {
-                                return Ok(None);
-                            }
-                        }
-                    }
-                }
+        // Sparse structural side: map its notes to every admitted slot.
+        let generation = self.snapshot.cut().generation;
+        let mut visited_slots = 0_usize;
+        for (position, index) in nodes.iter().enumerate() {
+            if position.is_multiple_of(64) {
+                budget.check()?;
             }
-        } else {
-            // Sparse physical side: read only posted slots, sharing one
-            // projection check for consecutive chunks of the same note.
-            let mut previous = None;
-            for (position, slot) in posting.iter().enumerate() {
-                if position.is_multiple_of(256) {
-                    budget.check()?;
-                }
-                let ord = data
-                    .note_ord_for_slot(slot)
-                    .ok_or(VectorError::CorruptIndex)?;
-                let admitted = match previous {
-                    Some((last, admitted)) if last == ord => admitted,
-                    _ => {
-                        let note = data.note_id(slot).ok_or(VectorError::CorruptIndex)?;
-                        let admitted = self.visible(&note)?;
-                        previous = Some((ord, admitted));
-                        admitted
+            let node = DenseNodeId::new(generation, index);
+            match self.snapshot.doc_class(node) {
+                Ok(class) if self.classes.contains(&class) => {}
+                Ok(_) | Err(DomainError::ResourceNotFound) => continue,
+                Err(error) => return Err(error.into()),
+            }
+            let note = match self.snapshot.note_id(node) {
+                Ok(note) => note,
+                Err(DomainError::ResourceNotFound) => continue,
+                Err(error) => return Err(error.into()),
+            };
+            if let Some(slots) = data.note_slots(&note) {
+                for slot in slots {
+                    if visited_slots.is_multiple_of(256) {
+                        budget.check()?;
                     }
-                };
-                if admitted {
-                    selected.add(slot);
-                    if selected.cardinality() > EXACT_SCAN_LIMIT {
-                        return Ok(None);
+                    visited_slots += 1;
+                    if posting.contains(slot) {
+                        selected.add(slot);
+                        if selected.cardinality() > EXACT_SCAN_LIMIT {
+                            return Ok(None);
+                        }
                     }
                 }
             }
@@ -204,6 +168,55 @@ enum SearchMode<'a> {
     Indexed,
     Exact,
     Projected(&'a ProjectedVectorFilter<'a>),
+}
+
+impl SearchMode<'_> {
+    fn selective_slots(
+        self,
+        data: &MmapSegment,
+        posting: &SlotMask<'_>,
+        budget: SearchBudget<'_>,
+        visible: &mut impl FnMut(&NoteId) -> Result<bool, VectorError>,
+    ) -> Result<Option<Bitmap>, VectorError> {
+        if posting.cardinality() <= EXACT_SCAN_LIMIT {
+            return Ok(None);
+        }
+        if let Self::Projected(projection) = self
+            && let Some(nodes) = projection.nodes
+            && nodes.cardinality() <= u64::from(data.num_notes()).min(posting.cardinality())
+        {
+            return projection.selective_node_slots(data, posting, nodes, budget);
+        }
+        // An absent structural posting still leaves the caller's visibility
+        // predicate. Count admitted slots until graph search is justified,
+        // sharing one check across consecutive chunks of the same note.
+        let mut selected = Vec::new();
+        let mut previous = None;
+        for (position, slot) in posting.iter().enumerate() {
+            if position.is_multiple_of(256) {
+                budget.check()?;
+            }
+            let ord = data
+                .note_ord_for_slot(slot)
+                .ok_or(VectorError::CorruptIndex)?;
+            let admitted = match previous {
+                Some((last, admitted)) if last == ord => admitted,
+                _ => {
+                    let note = data.note_id_by_ord(ord).ok_or(VectorError::CorruptIndex)?;
+                    let admitted = visible(&note)?;
+                    previous = Some((ord, admitted));
+                    admitted
+                }
+            };
+            if admitted {
+                if selected.len() == EXACT_SCAN_LIMIT as usize {
+                    return Ok(None);
+                }
+                selected.push(slot);
+            }
+        }
+        Ok(Some(Bitmap::of(&selected)))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -361,6 +374,34 @@ impl VectorSnapshot {
         )
     }
 
+    pub(crate) fn matches_note_metadata(
+        &self,
+        note: &NoteId,
+        mut expected: Vec<ChunkMetadata>,
+    ) -> bool {
+        let mut existing = Vec::new();
+        if let Some(rows) = self.mutable.get(note) {
+            existing.extend(rows.iter().map(|row| row.metadata.clone()));
+        } else {
+            for segment in &self.segments {
+                if let Some(slots) = segment.data.note_slots(note) {
+                    existing.extend(
+                        slots
+                            .filter(|slot| !segment.tombstones.bitmap().contains(*slot))
+                            .filter_map(|slot| segment.data.metadata(slot)),
+                    );
+                }
+            }
+        }
+        if existing.len() != expected.len() {
+            return false;
+        }
+        let key = |meta: &ChunkMetadata| (meta.spans[0].start(), meta.key);
+        existing.sort_unstable_by_key(key);
+        expected.sort_unstable_by_key(key);
+        existing == expected
+    }
+
     pub fn manifest(&self) -> &EpochManifest {
         &self.epoch
     }
@@ -474,8 +515,8 @@ impl VectorSnapshot {
         for segment in &self.segments {
             budget.check()?;
             let mut allowed = self.allowed_slots(segment, filter, budget)?;
-            if let SearchMode::Projected(projection) = mode
-                && let Some(slots) = projection.selective_slots(&segment.data, &allowed, budget)?
+            if let Some(check) = visible.as_deref_mut()
+                && let Some(slots) = mode.selective_slots(&segment.data, &allowed, budget, check)?
             {
                 allowed = SlotMask::Owned(slots);
             }
@@ -510,11 +551,7 @@ impl VectorSnapshot {
                     if let Some(&cached) = vis_cache.get(&ord) {
                         return Ok(cached);
                     }
-                    let raw = data
-                        .note_bytes_by_ord(ord)
-                        .ok_or(VectorError::CorruptIndex)?;
-                    let raw = std::str::from_utf8(raw).map_err(|_| VectorError::CorruptIndex)?;
-                    let note = NoteId::parse(raw).map_err(|_| VectorError::CorruptIndex)?;
+                    let note = data.note_id_by_ord(ord).ok_or(VectorError::CorruptIndex)?;
                     let ok = check(&note)?;
                     vis_cache.insert(ord, ok);
                     Ok(ok)
@@ -757,6 +794,46 @@ fn find_cached_vector<'a>(
         .iter()
         .rev()
         .find_map(|segment| segment.data.find_vector(key))
+}
+
+/// Private same-filesystem staging for a single atomic note replacement.
+pub(crate) struct RepairDirectory {
+    parent: Dir,
+    name: String,
+    pub(crate) path: PathBuf,
+}
+
+impl RepairDirectory {
+    pub(crate) fn new(epoch: &Path) -> Result<Arc<Self>, VectorError> {
+        static SERIAL: AtomicU64 = AtomicU64::new(0);
+        let parent = Dir::open_ambient_dir(epoch, ambient_authority())?;
+        loop {
+            let serial = SERIAL.fetch_add(1, AtomicOrdering::Relaxed);
+            let name = format!(".repair-{}-{serial}.tmp", std::process::id());
+            match parent.create_dir(&name) {
+                Ok(()) => {
+                    return Ok(Arc::new(Self {
+                        path: epoch.join(&name),
+                        parent,
+                        name,
+                    }));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+}
+
+impl Drop for RepairDirectory {
+    fn drop(&mut self) {
+        let _ = remove_dir_all_readonly(&self.parent, &self.name);
+    }
+}
+
+pub(crate) struct StagedNoteSegments {
+    pub(crate) segments: Vec<(u64, MmapSegment)>,
+    pub(crate) directory: Arc<RepairDirectory>,
 }
 
 /// A single indexing owner mutates an epoch. Queries use immutable snapshots.
@@ -1020,6 +1097,54 @@ impl VectorEpoch {
         }
         segments.extend(self.seal(builder)?);
 
+        self.publish_note_replacement(seq, note, previous, segments)
+    }
+
+    pub(crate) fn replace_staged_note(
+        &mut self,
+        seq: SpaceSeq,
+        note: NoteId,
+        staged: StagedNoteSegments,
+    ) -> Result<(), VectorError> {
+        if seq == SpaceSeq::ZERO
+            || seq < self.manifest.vector_seq.max(self.mutable.last_seq())
+            || staged.segments.is_empty()
+        {
+            return Err(VectorError::InvalidChunk);
+        }
+        self.flush()?;
+        let mut segments = self.segments.clone();
+        let previous = segments.last().map(|s| s.id);
+        for (source_id, data) in staged.segments {
+            if data.num_notes() != 1
+                || data.note_id_by_ord(0).as_ref() != Some(&note)
+                || data.dimension() != self.manifest.model.dimension as usize
+            {
+                return Err(VectorError::InvalidChunk);
+            }
+            let id = self.alloc_segment_id()?;
+            fs::hard_link(
+                segment_file_path(&staged.directory.path, source_id),
+                segment_file_path(&self.path, id),
+            )?;
+            segments.push(Segment {
+                id,
+                data: Arc::new(data),
+                tombstones: Tombstones::default(),
+                superseded: Bitmap::new(),
+            });
+        }
+        sync_dir(&staged.directory.parent)?;
+        self.publish_note_replacement(seq, note, previous, segments)
+    }
+
+    fn publish_note_replacement(
+        &mut self,
+        seq: SpaceSeq,
+        note: NoteId,
+        previous: Option<u64>,
+        mut segments: Vec<Segment>,
+    ) -> Result<(), VectorError> {
         // The manifest publishes all pieces at once. Before the rename the old
         // revision is intact. After it, recovery retires only prior segments.
         let recovery = previous.map_or(SegmentRecovery::Stable, |through_segment| {
@@ -1244,6 +1369,10 @@ impl VectorEpoch {
         self.publish(self.segments.clone(), seq, self.manifest.complete_backfill)
     }
 
+    pub(crate) fn can_replay_checkpoint(&self, base: SpaceSeq, through: SpaceSeq) -> bool {
+        (base..=through).contains(&self.manifest.vector_seq) && self.mutable.last_seq() <= through
+    }
+
     pub fn is_checkpointed(&self, seq: SpaceSeq) -> bool {
         self.manifest.vector_seq == seq && self.mutable.last_seq() <= seq
     }
@@ -1458,6 +1587,7 @@ impl VectorEpoch {
 
     pub fn collect_obsolete(&self) -> Result<(), VectorError> {
         let active: BTreeSet<_> = self.manifest.active_segments.iter().copied().collect();
+        let dir = Dir::open_ambient_dir(&self.path, ambient_authority())?;
         for id in disk_generations(&self.path)? {
             if !active.contains(&id) {
                 remove_path_if_exists(&segment_file_path(&self.path, id))?;
@@ -1466,17 +1596,16 @@ impl VectorEpoch {
         }
         for entry in fs::read_dir(&self.path)? {
             let entry = entry?;
-            if !entry.file_type()?.is_file() {
-                continue;
-            }
+            let kind = entry.file_type()?;
             let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
                 continue;
             };
-            if is_orphan_temp(&name) {
+            if kind.is_dir() && is_repair_directory(&name) {
+                remove_dir_all_readonly(&dir, &name)?;
+            } else if kind.is_file() && is_orphan_temp(&name) {
                 remove_path_if_exists(&entry.path())?;
             }
         }
-        let dir = Dir::open_ambient_dir(&self.path, ambient_authority())?;
         sync_dir(&dir)?;
         Ok(())
     }
@@ -1656,6 +1785,13 @@ pub fn segment_file_path(path: &Path, id: u64) -> PathBuf {
 
 fn tombstone_path(path: &Path, id: u64) -> PathBuf {
     path.join(format!("seg_{id:016x}.tomb"))
+}
+
+fn is_repair_directory(name: &str) -> bool {
+    name.strip_prefix(".repair-")
+        .and_then(|name| name.strip_suffix(".tmp"))
+        .and_then(|name| name.split_once('-'))
+        .is_some_and(|(pid, serial)| pid.parse::<u32>().is_ok() && serial.parse::<u64>().is_ok())
 }
 
 fn is_orphan_temp(name: &str) -> bool {

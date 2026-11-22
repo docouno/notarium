@@ -211,9 +211,16 @@ async fn exact_overlay_zero_grace_and_concurrent_align_convergence(
     let mut view = View::new(scope.clone(), folder.clone());
     let mut live = BTreeSet::from([seed_id.clone()]);
     view.index(seed_id.clone(), folder.clone());
-    for index in 0..10 {
-        let id = sample_note_id(index + 1);
-        let text = if index < 9 { "violet blue" } else { "violet" };
+    // Background documents give a common base term more weight than any term
+    // scored in isolation against the two receipt rows.
+    for index in 1..=40 {
+        let id = sample_note_id(index);
+        let text = match index {
+            1..=9 => "violet blue cedar maple quartz amber silver copper",
+            10 => "violet cedar onyx silver",
+            11 => "quartz amber oldrevisionmarker",
+            _ => "untouched background",
+        };
         corpus.push(note(&id, &folder, "Colour", text));
         view.index(id.clone(), folder.clone());
         live.insert(id);
@@ -246,12 +253,15 @@ async fn exact_overlay_zero_grace_and_concurrent_align_convergence(
             &scope,
             lease,
             &owner,
-            vec![note(
-                &fresh_id,
-                &folder,
-                "Fresh note",
-                "fastoverlaytoken violet blue",
-            )],
+            vec![
+                note(
+                    &fresh_id,
+                    &folder,
+                    "Fresh note",
+                    "fastoverlaytoken violet blue opal quartz",
+                ),
+                note(&sample_note_id(11), &folder, "Colour", "garnet"),
+            ],
         )
         .await
         .unwrap();
@@ -289,6 +299,39 @@ async fn exact_overlay_zero_grace_and_concurrent_align_convergence(
     assert_eq!(overlay_quorum.len(), 10);
     assert!(!overlay_quorum.contains(&sample_note_id(10)));
 
+    // Each query has nine strict matches and one remaining fallback slot.
+    // A rare term wins in a fresh receipt, in the base, and in a replacement
+    // receipt whose old revision would otherwise qualify as a strict hit.
+    let cases = [
+        ("cedar maple opal", fresh_id.clone()),
+        ("quartz amber onyx", sample_note_id(10)),
+        ("silver copper garnet", sample_note_id(11)),
+    ];
+    let check_fallback = async || {
+        for (text, winner) in &cases {
+            let mut request = quorum.clone();
+            request.text = (*text).to_owned();
+            let result = engine.search(ctx.clone(), request).await.unwrap();
+            assert_eq!(result.hits.len(), 10, "{text}");
+            assert_eq!(
+                &result.hits[9]
+                    .card
+                    .document
+                    .provenance()
+                    .reference()
+                    .note_id,
+                winner,
+                "{text}"
+            );
+            let expected: BTreeSet<_> = (1..=9)
+                .map(sample_note_id)
+                .chain([winner.clone()])
+                .collect();
+            assert_eq!(note_ids(result), expected, "{text}");
+        }
+    };
+    check_fallback().await;
+
     // Release catch-up and exercise concurrent writes alongside parallel reads
     // to verify align converges without DeadlineExceeded.
     {
@@ -299,6 +342,7 @@ async fn exact_overlay_zero_grace_and_concurrent_align_convergence(
     pages.release();
     acknowledged(&store, &root, &scope, fresh.last_seq).await;
 
+    check_fallback().await;
     let caught_up_quorum = note_ids(engine.search(ctx.clone(), quorum).await.unwrap());
     assert_eq!(caught_up_quorum, overlay_quorum);
 

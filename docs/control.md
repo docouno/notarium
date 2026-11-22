@@ -514,7 +514,11 @@ catalog change commits. Explicit calls keep their own recipient and consent
 checks. Expiry of the selected attachment bounds the active network deadline.
 Background search indexing supports a narrowly scoped `SearchIndexing`
 credential for the revision actor under current disclosure consent. An
-ineligible author in a shared Space receives no grant for that note. The model
+ineligible author in a shared Space receives no grant for that note. The
+search service can observe changes to author eligibility through a
+Space-scoped revision derived from the admission epoch and the authorization
+versions of its current members. An account disable/enable cycle advances
+that revision even when the personal provider consent stays valid. The model
 token limit applies to the sum across a batch. See [search embeddings](search.md#embeddings).
 
 Supported wire protocols are OpenAI-compatible chat completions/embeddings and

@@ -997,7 +997,7 @@ fn vector_candidates_rank_notes_and_keep_their_best_chunks_across_tiers() {
 }
 
 #[test]
-fn broad_field_and_class_intersection_uses_exact_scan_for_a_single_matching_slot() {
+fn broad_class_posting_uses_effective_visibility_for_exact_crossover() {
     use crate::lexical::tests::Snapshot;
     let scratch = Scratch::new();
     let scope = HistoryScope {
@@ -1007,11 +1007,17 @@ fn broad_field_and_class_intersection_uses_exact_scan_for_a_single_matching_slot
     let layout = Arc::new(SearchLayout::open(&DataRoot::new(&scratch.0), scope).unwrap());
     let mut epoch = VectorEpoch::open(layout, model(), 64).unwrap();
     let count = EXACT_SCAN_LIMIT as u32 + 1;
-    let rows: Vec<_> = (0..count).map(|slot| fixture(slot, 64)).collect();
+    let rows: Vec<_> = (0..count)
+        .map(|slot| {
+            let mut chunk = fixture(slot, 64);
+            chunk.metadata.class = DocClass::Skill;
+            chunk
+        })
+        .collect();
     let selected = rows.last().unwrap().clone();
     let mut docs: Vec<_> = rows
         .iter()
-        .map(|chunk| (chunk.metadata.note.clone(), DocClass::UserDoc))
+        .map(|chunk| (chunk.metadata.note.clone(), DocClass::Skill))
         .collect();
     docs.extend((count..2 * count - 1).map(|index| {
         (
@@ -1032,25 +1038,76 @@ fn broad_field_and_class_intersection_uses_exact_scan_for_a_single_matching_slot
         cancellation: &cancellation,
         deadline: Instant::now() + Duration::from_secs(5),
     };
-    let classes = BTreeSet::from([DocClass::UserDoc]);
-    let result = epoch
-        .snapshot()
-        .search_projected(
-            &selected.vector,
-            ProjectedVectorFilter {
-                snapshot: &structural,
-                classes: &classes,
-                folders: None,
-                nodes: Some(&nodes),
-                excluded: &BTreeSet::new(),
-            },
-            100,
-            budget,
-        )
+    let classes = BTreeSet::from([DocClass::Skill]);
+    let snapshot = epoch.snapshot();
+    let pins = Snapshot::with_classes([(selected.metadata.note.clone(), DocClass::Skill)]);
+    // A field restriction supplies dense nodes. An unfiltered structural
+    // snapshot may itself expose just one pinned skill, with no dense posting.
+    for (view, nodes) in [(&structural, Some(&nodes)), (&pins, None)] {
+        let result = snapshot
+            .search_projected(
+                &selected.vector,
+                ProjectedVectorFilter {
+                    snapshot: view,
+                    classes: &classes,
+                    folders: None,
+                    nodes,
+                    excluded: &BTreeSet::new(),
+                },
+                100,
+                budget,
+            )
+            .unwrap();
+        assert_eq!(result.hnsw_hops, 0);
+        assert_eq!(result.hits.len(), 1);
+        assert_eq!(result.hits[0].metadata, selected.metadata);
+    }
+    let mask = VectorFilter {
+        classes: &classes,
+        folders: None,
+        notes: None,
+        excluded: None,
+    };
+    let callback = snapshot
+        .search_visible(&selected.vector, &mask, 100, budget, |note| {
+            Ok(note == &selected.metadata.note)
+        })
         .unwrap();
-    assert_eq!(result.hnsw_hops, 0);
-    assert_eq!(result.hits.len(), 1);
-    assert_eq!(result.hits[0].metadata, selected.metadata);
+    assert_eq!(callback.hnsw_hops, 0);
+    assert_eq!(callback.hits.len(), 1);
+    assert_eq!(callback.hits[0].metadata, selected.metadata);
+
+    let deadline = Instant::now() + Duration::from_millis(5);
+    let mut checks = 0;
+    let expired = snapshot.search_visible(
+        &selected.vector,
+        &mask,
+        100,
+        SearchBudget {
+            cancellation: &cancellation,
+            deadline,
+        },
+        |_| {
+            checks += 1;
+            if checks == 1 {
+                std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+            }
+            Ok(false)
+        },
+    );
+    assert!(matches!(expired, Err(VectorError::Cancelled)));
+    assert!(checks <= 256);
+
+    let mut checks = 0;
+    let cancelled = snapshot.search_visible(&selected.vector, &mask, 100, budget, |_| {
+        checks += 1;
+        if checks == 4 {
+            cancellation.cancel();
+        }
+        Ok(false)
+    });
+    assert!(matches!(cancelled, Err(VectorError::Cancelled)));
+    assert!((4..=256).contains(&checks));
 }
 
 #[test]
@@ -1451,12 +1508,19 @@ fn collect_obsolete_cleans_orphan_temps_and_ignores_ds_store() {
         fs::write(epoch_dir.join(name), b"orphan").unwrap();
     }
     fs::write(epoch_dir.join(".DS_Store"), b"finder").unwrap();
+    let abandoned = epoch_dir.join(".repair-123-4.tmp");
+    fs::create_dir(&abandoned).unwrap();
+    fs::write(abandoned.join("partial.seg"), b"staged").unwrap();
+    let unrelated = epoch_dir.join(".repair-user-backup.tmp");
+    fs::create_dir(&unrelated).unwrap();
 
     epoch.collect_obsolete().unwrap();
     for name in temps {
         assert!(!epoch_dir.join(name).exists(), "{name} should be removed");
     }
     assert!(epoch_dir.join(".DS_Store").exists());
+    assert!(!abandoned.exists());
+    assert!(unrelated.is_dir());
     drop(epoch);
     assert!(VectorEpoch::open(layout, model(), 64).is_ok());
 }

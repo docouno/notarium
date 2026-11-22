@@ -2,11 +2,14 @@ use super::{Context, Disk, IndexError, Publisher, build, new_budget};
 use crate::{
     embed::{EmbeddingError, Priority},
     engine::Services,
-    layout::{FolderDictionary, FolderOrd},
+    layout::{FolderDictionary, FolderOrd, SearchLayout},
     lexical::{SeedLease, Update},
-    model::{Embedder, IndexNote, NoteIndexOutcome},
+    model::{Embedder, IndexNote, NoteIndexOutcome, NotePreparation},
     ports::SearchIndexedNote,
-    vector::{MutableOperation, QuantizedVector, VectorChunk, VectorError, VectorSnapshot},
+    vector::{
+        MutableOperation, QuantizedVector, StagedNoteSegments, VectorChunk, VectorError,
+        VectorSnapshot,
+    },
 };
 use notarium_canonical::chats::search::SearchChatDeltaPlan;
 use notarium_core::{
@@ -89,6 +92,9 @@ pub(super) async fn apply(
                     // when the selected model serves the entire space.
                     disk.manifest.embeddings_pending = true;
                     disk.full_sweep_needed = true;
+                    if let Some(replay) = &mut disk.manifest.vector_replay_after {
+                        replay.needs_sweep = true;
+                    }
                     disk.full_sweep_after = None;
                 }
             }
@@ -254,22 +260,20 @@ pub(super) async fn apply(
         && disk.manifest.vector_seq.is_some()
         && (!updated_note_ids.is_empty() || !deleted_ids.is_empty())
     {
-        // A concurrent warm reopen will mask the changed slots after validation.
-        // A crash before then must not expose their previous revisions.
-        disk.manifest.vector_seq = None;
+        // Keep the physical checkpoint. Until replay masks every changed note,
+        // only the lexical cut can be published to readers.
+        disk.manifest
+            .vector_replay_after
+            .get_or_insert(crate::layout::VectorReplay {
+                after: previous_cutoff,
+                needs_sweep: disk.manifest.embeddings_pending,
+            });
         disk.manifest.embeddings_pending = true;
     }
 
     if disk.epoch.is_some() && (!updated_note_ids.is_empty() || !deleted_ids.is_empty()) {
         for id in &updated_note_ids {
-            let chunks = disk
-                .epoch
-                .as_ref()
-                .map(|epoch| epoch.mutable_note_chunks(id).to_vec())
-                .unwrap_or_default();
-            if !chunks.is_empty() {
-                disk.cache_vectors(&chunks);
-            }
+            disk.cache_note_vectors(id);
         }
         let mut delete_ops = Vec::with_capacity(updated_note_ids.len() + deleted_ids.len());
         delete_ops.extend(
@@ -319,26 +323,34 @@ pub(super) async fn apply(
     Ok(())
 }
 
+pub(super) const REPAIR_CARRIER_PAGE: usize = 16;
+
 pub(super) enum EmbedBatchMode {
     DirtyNotes(Vec<NoteId>),
     FullSweep { after: Option<NoteId> },
 }
 
 pub(super) struct EmbedBatchInput {
+    pub layout: Arc<SearchLayout>,
     pub services: Arc<Services>,
     pub cutoff: ChangeCursor,
     pub folders: Arc<FolderDictionary>,
     pub embedder: Arc<Embedder>,
     pub snapshot: VectorSnapshot,
-    pub cached_vectors: HashMap<ContentDigest, QuantizedVector>,
+    pub cached_vectors: HashMap<ContentDigest, Arc<QuantizedVector>>,
     pub mode: EmbedBatchMode,
     pub cancel: Cancellation,
 }
 
+pub(super) enum EmbeddedChunks {
+    Inline(Vec<VectorChunk>),
+    Staged(StagedNoteSegments),
+}
+
 pub(super) struct EmbeddedNoteRow {
     pub note_id: NoteId,
-    pub content: Option<SearchContent>,
-    pub chunks: Vec<VectorChunk>,
+    pub ancestor_folders: Vec<FolderId>,
+    pub chunks: EmbeddedChunks,
 }
 
 pub(super) enum EmbedBatchOutcome {
@@ -362,6 +374,7 @@ pub(super) async fn run_embed_batch(
     input: EmbedBatchInput,
 ) -> Result<EmbedBatchOutcome, IndexError> {
     let EmbedBatchInput {
+        layout,
         services,
         cutoff,
         folders,
@@ -394,7 +407,7 @@ pub(super) async fn run_embed_batch(
         }
     }
 
-    let (was_full_sweep, next_sweep_after, items) = match &mode {
+    let (was_full_sweep, mut next_sweep_after, items) = match &mode {
         EmbedBatchMode::DirtyNotes(ids) => {
             let rows = services
                 .deps
@@ -419,7 +432,7 @@ pub(super) async fn run_embed_batch(
                     cutoff.scope.clone(),
                     Some(cutoff.after),
                     after.clone(),
-                    PageLimit::new(100)?,
+                    PageLimit::new(REPAIR_CARRIER_PAGE as u16)?,
                 )
                 .await?;
             if page.cutoff != cutoff {
@@ -444,114 +457,146 @@ pub(super) async fn run_embed_batch(
     let mut requeue = Vec::new();
     let mut missing_folders = BTreeSet::new();
     let mut page_keys = HashMap::<ContentDigest, (usize, usize)>::new();
+    let mut buffered_rows = 0;
     let mut had_transient_failure = false;
-    let mut hit_model_change = false;
-
-    for (idx, (note_id, carrier)) in items.iter().enumerate() {
+    let mut last_processed = None;
+    let mut remaining = items.into_iter();
+    while let Some((note_id, carrier)) = remaining.next() {
         if cancel.is_cancelled() {
-            for (remaining_id, _) in &items[idx..] {
-                requeue.push(remaining_id.clone());
-            }
-            return Ok(EmbedBatchOutcome::Backoff { requeue });
-        }
-        let Some(note) = carrier else {
-            rows.push(EmbeddedNoteRow {
-                note_id: note_id.clone(),
-                content: None,
-                chunks: Vec::new(),
+            return Ok(EmbedBatchOutcome::Backoff {
+                requeue: requeue_all(&mode),
             });
-            continue;
-        };
-        if note.document.lifecycle() != Lifecycle::Active
-            || note.document.class() == DocClass::EncryptedNote
+        }
+        let mut folded = None;
+        if let Some(note) = &carrier
+            && note.document.lifecycle() == Lifecycle::Active
+            && note.document.class() != DocClass::EncryptedNote
+            && let Ok(content) =
+                ClassEgressFence::index_for_search(note.document.clone(), &services.authority)
         {
-            rows.push(EmbeddedNoteRow {
-                note_id: note_id.clone(),
-                content: None,
-                chunks: Vec::new(),
-            });
-            continue;
-        }
-        let Ok(content) =
-            ClassEgressFence::index_for_search(note.document.clone(), &services.authority)
-        else {
-            rows.push(EmbeddedNoteRow {
-                note_id: note_id.clone(),
-                content: None,
-                chunks: Vec::new(),
-            });
-            continue;
-        };
-        let Some(folder) = folders.get(&note.parent_folder_id) else {
-            missing_folders.insert(note.parent_folder_id.clone());
-            requeue.push(note_id.clone());
-            continue;
-        };
-        let indexed = embedder
-            .index_note(
-                IndexNote {
+            let Some(folder) = folders.get(&note.parent_folder_id) else {
+                missing_folders.insert(note.parent_folder_id.clone());
+                requeue.push(note_id.clone());
+                last_processed = Some(note_id);
+                continue;
+            };
+            let prepared = embedder
+                .prepare_note(IndexNote {
                     services: &services,
                     scope: &cutoff.scope,
                     note,
                     folder: folder.get(),
                     budget: new_budget(&cancel),
                     priority,
-                },
-                &|key| {
-                    page_keys
-                        .get(&key)
-                        .map(|&(row, slot)| rows[row].chunks[slot].vector.clone())
-                        .or_else(|| cached_vectors.get(&key).cloned())
-                        .or_else(|| snapshot.find_vector(key))
-                },
-            )
-            .await?;
-        match indexed.outcome {
-            NoteIndexOutcome::Complete | NoteIndexOutcome::Denied => {
-                let row_idx = rows.len();
-                for (slot, chunk) in indexed.chunks.iter().enumerate() {
-                    page_keys
-                        .entry(chunk.metadata.key)
-                        .or_insert((row_idx, slot));
-                }
-                rows.push(EmbeddedNoteRow {
-                    note_id: note_id.clone(),
-                    content: Some(content),
-                    chunks: indexed.chunks,
-                });
-            }
-            NoteIndexOutcome::Pending => {
-                had_transient_failure = true;
-                requeue.push(note_id.clone());
-                if !indexed.chunks.is_empty() {
-                    let row_idx = rows.len();
-                    for (slot, chunk) in indexed.chunks.iter().enumerate() {
-                        page_keys
-                            .entry(chunk.metadata.key)
-                            .or_insert((row_idx, slot));
+                })
+                .await?;
+            let lookup = |key| {
+                page_keys
+                    .get(&key)
+                    .and_then(|&(row, slot)| {
+                        if let EmbeddedChunks::Inline(chunks) = &rows[row].chunks {
+                            Some(chunks[slot].vector.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .or_else(|| cached_vectors.get(&key).map(|v| v.as_ref().clone()))
+                    .or_else(|| snapshot.find_vector(key))
+            };
+            let (chunks, outcome) = match prepared {
+                NotePreparation::Finished(outcome) => (None, outcome),
+                NotePreparation::Ready(mut prepared) => {
+                    if prepared.matches_snapshot(&snapshot) {
+                        last_processed = Some(note_id);
+                        continue;
                     }
-                    rows.push(EmbeddedNoteRow {
-                        note_id: note_id.clone(),
-                        content: Some(content),
-                        chunks: indexed.chunks,
+                    let count = prepared.descriptor_count();
+                    if buffered_rows > 0 && count > build::VECTOR_WINDOW_ROWS - buffered_rows {
+                        // The canonical cursor and the dirty queue describe only the
+                        // consumed prefix. This note starts the next batch.
+                        if was_full_sweep {
+                            next_sweep_after = last_processed;
+                        } else {
+                            requeue.push(note_id);
+                            requeue.extend(remaining.map(|(id, _)| id));
+                        }
+                        break;
+                    }
+                    if count > build::VECTOR_WINDOW_ROWS {
+                        let (staged, outcome) = build::stage_repair(
+                            *prepared,
+                            &layout,
+                            &embedder.target.vector_model(),
+                            &lookup,
+                            &cancel,
+                        )
+                        .await?;
+                        (staged.map(EmbeddedChunks::Staged), outcome)
+                    } else {
+                        let indexed = prepared
+                            .index_next(build::VECTOR_WINDOW_ROWS, &lookup)
+                            .await;
+                        (
+                            (!indexed.chunks.is_empty())
+                                .then_some(EmbeddedChunks::Inline(indexed.chunks)),
+                            indexed.outcome,
+                        )
+                    }
+                }
+            };
+            match outcome {
+                NoteIndexOutcome::Complete | NoteIndexOutcome::Denied => {}
+                NoteIndexOutcome::Pending => {
+                    had_transient_failure = true;
+                    requeue.push(note_id.clone());
+                    if chunks.is_none() {
+                        last_processed = Some(note_id);
+                        continue;
+                    }
+                }
+                NoteIndexOutcome::Fatal(EmbeddingError::ModelUnavailable) => {
+                    return Ok(EmbedBatchOutcome::ModelChanged {
+                        requeue: requeue_all(&mode),
                     });
                 }
-            }
-            NoteIndexOutcome::Fatal(error) => {
-                had_transient_failure = true;
-                for (remaining_id, _) in &items[idx..] {
-                    requeue.push(remaining_id.clone());
+                NoteIndexOutcome::Fatal(_) => {
+                    had_transient_failure = true;
+                    requeue.push(note_id);
+                    requeue.extend(remaining.map(|(id, _)| id));
+                    break;
                 }
-                if matches!(error, EmbeddingError::ModelUnavailable) {
-                    hit_model_change = true;
-                }
-                break;
             }
+            folded = Some((content.into_recorded_ancestor_folders(), chunks));
         }
-    }
-
-    if hit_model_change {
-        return Ok(EmbedBatchOutcome::ModelChanged { requeue });
+        let (ancestor_folders, chunks) = folded.unwrap_or_default();
+        let chunks = chunks.unwrap_or_else(|| EmbeddedChunks::Inline(Vec::new()));
+        match &chunks {
+            EmbeddedChunks::Inline(chunks) => {
+                buffered_rows += chunks.len();
+                for (slot, chunk) in chunks.iter().enumerate() {
+                    page_keys
+                        .entry(chunk.metadata.key)
+                        .or_insert((rows.len(), slot));
+                }
+            }
+            // A staged note is independent of inline WAL operations and must
+            // be adopted or discarded as one unit before starting another.
+            EmbeddedChunks::Staged(_) => buffered_rows = build::VECTOR_WINDOW_ROWS,
+        }
+        rows.push(EmbeddedNoteRow {
+            note_id: note_id.clone(),
+            ancestor_folders,
+            chunks,
+        });
+        if buffered_rows == build::VECTOR_WINDOW_ROWS && !remaining.as_slice().is_empty() {
+            if was_full_sweep {
+                next_sweep_after = Some(note_id);
+            } else {
+                requeue.extend(remaining.map(|(id, _)| id));
+            }
+            break;
+        }
+        last_processed = Some(note_id);
     }
 
     match services

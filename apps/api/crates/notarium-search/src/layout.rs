@@ -145,6 +145,14 @@ fn verify_footer(bytes: &[u8]) -> Result<&[u8], LayoutError> {
     Ok(data)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VectorReplay {
+    pub after: SpaceSeq,
+    /// Repair debt that predates the deferred edits or affects a whole folder.
+    pub needs_sweep: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SearchManifest {
@@ -153,8 +161,15 @@ pub struct SearchManifest {
     pub tantivy_commit: u64,
     pub active_index_dir: String,
     pub tokenizer_version: u32,
+    /// Admission checked by the remote seed or by the most recently scheduled
+    /// full sweep. A pending sweep restarts from its first page after a crash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_admission: Option<notarium_core::ids::ContentDigest>,
     pub active_model: Option<ResolvedEmbeddingTarget>,
     pub vector_seq: Option<SpaceSeq>,
+    /// Lexical cut immediately before the first edit whose vector deletes were deferred.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vector_replay_after: Option<VectorReplay>,
     pub embeddings_pending: bool,
 }
 impl SearchManifest {
@@ -752,8 +767,10 @@ mod tests {
             tantivy_commit: 42,
             active_index_dir: index_name(1),
             tokenizer_version: 1,
+            remote_admission: None,
             active_model: None,
             vector_seq: None,
+            vector_replay_after: None,
             embeddings_pending: false,
         };
         layout.publish_search(&manifest).unwrap();
@@ -862,8 +879,10 @@ mod tests {
             tantivy_commit: 0,
             active_index_dir: index_name(1),
             tokenizer_version: 1,
+            remote_admission: None,
             active_model: None,
             vector_seq: None,
+            vector_replay_after: None,
             embeddings_pending: false,
         };
         assert!(layout.publish_search(&manifest).is_err());

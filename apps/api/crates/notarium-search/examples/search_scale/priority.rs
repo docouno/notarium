@@ -75,6 +75,15 @@ impl SearchModelResolverPort for Probe {
         })
     }
 
+    fn remote_indexing_revision<'a>(
+        &'a self,
+        _: &'a ServiceAuthority,
+        _: &'a HistoryScope,
+        _: CallBudget,
+    ) -> PortFuture<'a, notarium_core::ids::ContentDigest> {
+        Box::pin(async { Ok(notarium_core::ids::ContentDigest::from_bytes([0; 32])) })
+    }
+
     fn acquire_remote_indexing_grant<'a>(
         &'a self,
         _: &'a ServiceAuthority,

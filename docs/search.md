@@ -21,7 +21,11 @@ before shutting down canonical storage.
   `ceil(3 * count / 5)` for 5 or more); queries with more than two clauses fall
   back to single-clause matching only when fewer than `min(top_k, 10)` hits
   satisfy the quorum. Notes count strict matches across the indexed and receipt
-  revisions together. Chats count matches on the currently visible branch.
+  revisions together. When that leaves fallback slots, the highest BM25 scores
+  across both sources fill them. Both use term document frequencies, average field
+  lengths and corpus size across their pinned segments. As with ordinary
+  Tantivy searches, a segment merge can change scores by removing postings
+  for superseded revisions. Chats count matches on the currently visible branch.
   Both paths observe the request deadline and cancellation.
 - Folder and structural filters apply before ranking. A blank query with a
   filter browses notes in stable ID order using per-segment term ordinals.
@@ -67,8 +71,14 @@ watermark without rewriting postings. With a remote provider, the worker also
 rechecks vector membership in the background, since the grant for a note can
 change when its folder moves to another project.
 A manifest identifies the active lexical generation and
-the vector checkpoint. After an edit the worker invalidates the old vector slots
-before publishing the new lexical cut. The pending marker keeps outstanding
+the vector checkpoint. After an edit the worker masks old vector slots before
+admitting vectors at the new lexical cut. If vector files are temporarily
+unavailable, lexical search continues. The manifest retains the physical
+checkpoint and the cursor before the first deferred edit. On reopen the worker
+replays canonical changes from that cursor, masks affected notes, and queues
+their embeddings. A purge, redaction or lost replay history invalidates the
+checkpoint. A mismatch between the committed Tantivy generation and the
+search manifest triggers a rebuild. The pending marker keeps outstanding
 embedding work recoverable after restart. Readers pin a cut through ArcSwap.
 Idle Spaces drop their lexical reader and unpublish their in-memory snapshot
 after 30 seconds without activity (`LEXICAL_IDLE`), release cached embedder
@@ -87,11 +97,15 @@ without an active plan, delete overflow flushes tombstones and resets the
 journal) and read-only, single-pass BLAKE3-checksummed v2 mmap segments
 (112 MiB estimated build budget per segment). A long note can span several
 segments. Backfill and direct replacements publish all its pieces in one
-manifest update. Cold backfill passes at most 256 quantized rows at a time to
-the staged builder, including when a single note crosses that boundary. At
-4,096 dimensions their vector payload is at most 1 MiB. The canonical page,
-Markdown descriptors of the current note, model workspace and mapped segments
-also consume memory. Each segment contains normalized, per-vector i8
+manifest update. Backfill, dirty-note repair and full sweeps process at most
+256 pending quantized rows (1 MiB of i8 payload at 4,096 dimensions). Warm
+repair reads up to 16 carriers per page and checks admitted chunk metadata
+against the current snapshot before copying embeddings. Long replacements use
+private temporary segments. The owner links them into the epoch after checking
+for concurrent edits. Discarded replacements release their files, and recovery
+collects abandoned staging directories. The canonical page, Markdown and
+metadata of the current note, model workspace, L0 cache, segment builder and
+mapped segments also consume memory. Each segment contains normalized, per-vector i8
 embeddings, a CSR-HNSW graph built in Rust, sorted note-slot and content-key
 indexes, and precomputed class/folder filter bitmaps. Non-blocking partial
 compaction plans and writes replacement segments outside the reader lock before
@@ -151,7 +165,13 @@ Space-level embedding targets, composable with
 Background indexing obtains a current disclosure grant for the revision actor
 before reusing a vector or sending a part. Each scheduled part batch rechecks
 the selected target before dispatch. A revision author who has left the Space
-is skipped while other eligible authors continue indexing. Interactive requests
+is skipped while other eligible authors continue indexing. For remote epochs,
+background model maintenance checks a durable witness of the Space admission
+epoch and member account authorization versions. A changed witness schedules a
+paged vector repair that checks each author's current membership and consent.
+The manifest records the witness together with pending work so an interrupted
+repair resumes on restart. Local model epochs and interactive query embedding
+do not read this witness. Interactive requests
 recheck the default recipient when they leave the queue. Control verifies the
 effective default again while admitting interactive queries and background
 parts. Changing the default recipient drains in-flight implicit calls for the

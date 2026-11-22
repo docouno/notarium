@@ -133,6 +133,15 @@ impl SearchModelResolverPort for SwitchingResolver {
         })
     }
 
+    fn remote_indexing_revision<'a>(
+        &'a self,
+        _: &'a ServiceAuthority,
+        _: &'a HistoryScope,
+        _: CallBudget,
+    ) -> PortFuture<'a, notarium_core::ids::ContentDigest> {
+        Box::pin(async { Ok(notarium_core::ids::ContentDigest::from_bytes([0; 32])) })
+    }
+
     fn acquire_remote_indexing_grant<'a>(
         &'a self,
         _: &'a ServiceAuthority,
@@ -1241,6 +1250,15 @@ impl SearchModelResolverPort for Resolver {
                 },
             }))
         })
+    }
+
+    fn remote_indexing_revision<'a>(
+        &'a self,
+        _: &'a ServiceAuthority,
+        _: &'a HistoryScope,
+        _: CallBudget,
+    ) -> PortFuture<'a, notarium_core::ids::ContentDigest> {
+        Box::pin(async { Ok(notarium_core::ids::ContentDigest::from_bytes([0; 32])) })
     }
 
     fn acquire_remote_indexing_grant<'a>(

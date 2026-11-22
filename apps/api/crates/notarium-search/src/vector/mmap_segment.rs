@@ -586,7 +586,10 @@ impl MmapSegment {
     }
 
     pub fn note_id(&self, slot: u32) -> Option<NoteId> {
-        let ord = self.note_ord_for_slot(slot)?;
+        self.note_id_by_ord(self.note_ord_for_slot(slot)?)
+    }
+
+    pub(super) fn note_id_by_ord(&self, ord: u32) -> Option<NoteId> {
         let raw = self.note_bytes_by_ord(ord)?;
         NoteId::parse(std::str::from_utf8(raw).ok()?).ok()
     }

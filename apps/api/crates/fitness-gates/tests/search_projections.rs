@@ -37,7 +37,7 @@ use notarium_core::{
         ProviderModelSpec, ProviderPreferenceScope, ProviderResourceSpec, ProviderWireKind,
         PublishAbilityPackage, PutProviderModel, RecallQuery, RequestProviderAttachment,
         RevocationLease, RevocationReason, RevocationSelector, SearchPort, SearchQuery,
-        SearchResult, ServiceAuthority, ServicePurpose, SessionRevocationPort,
+        SearchResult, ServiceAuthority, ServicePurpose, SessionRevocationPort, SetAccountDisabled,
         SetProviderPreference, SpaceContext, TokenAccountingProfile,
         control::{AccountMutation, ControlPageRequest, RunLimits},
     },
@@ -712,6 +712,18 @@ impl SearchModelResolverPort for ControlSearchModelResolver {
         })
     }
 
+    fn remote_indexing_revision<'a>(
+        &'a self,
+        authority: &'a ServiceAuthority,
+        scope: &'a HistoryScope,
+        budget: CallBudget,
+    ) -> PortFuture<'a, notarium_core::ids::ContentDigest> {
+        Box::pin(
+            self.0
+                .search_indexing_revision(authority, &scope.space_id, budget),
+        )
+    }
+
     fn acquire_remote_indexing_grant<'a>(
         &'a self,
         authority: &'a ServiceAuthority,
@@ -878,7 +890,9 @@ impl ProviderEgressCatalogPort for CanonicalEgress {
     }
 }
 
-async fn spawn_local_ollama_server() -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+async fn spawn_local_ollama_server(
+    author_inputs: Arc<AtomicUsize>,
+) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let requests = Arc::new(AtomicUsize::new(0));
@@ -886,6 +900,7 @@ async fn spawn_local_ollama_server() -> (String, Arc<AtomicUsize>, tokio::task::
     let handle = tokio::spawn(async move {
         while let Ok((mut socket, _)) = listener.accept().await {
             let counter = counter.clone();
+            let author_inputs = author_inputs.clone();
             tokio::spawn(async move {
                 let mut buf = Vec::new();
                 let mut tmp = [0u8; 4096];
@@ -919,7 +934,15 @@ async fn spawn_local_ollama_server() -> (String, Arc<AtomicUsize>, tokio::task::
                 let body: serde_json::Value =
                     serde_json::from_slice(&buf[header_end..header_end + content_length]).unwrap();
                 assert_eq!(body["truncate"], serde_json::json!(false));
-                let inputs = body["input"].as_array().unwrap().len();
+                let inputs = body["input"].as_array().unwrap();
+                if inputs.iter().any(|input| {
+                    input.as_str().is_some_and(|text| {
+                        text.contains("Unique contribution by a former member.")
+                    })
+                }) {
+                    author_inputs.fetch_add(1, Ordering::SeqCst);
+                }
+                let inputs = inputs.len();
                 let mut unit = vec![0.0_f32; 64];
                 unit[0] = 1.0;
                 let embeddings = vec![unit; inputs];
@@ -1104,6 +1127,22 @@ async fn session_user(control: &ControlService, token: &SecretString) -> EngineA
         .unwrap()
 }
 
+async fn wait_remote_sweep(layout: &SearchLayout, revision: ContentDigest) {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if let Ok(Some(manifest)) = layout.search_manifest()
+                && manifest.remote_admission == Some(revision)
+                && !manifest.embeddings_pending
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("remote search must reconcile changed author admission");
+}
+
 async fn exercise_provider_e2e(
     installation_id: InstallationId,
     store: CanonicalStore,
@@ -1132,7 +1171,9 @@ async fn exercise_provider_e2e(
         .unwrap(),
     );
 
-    let (origin, ollama_requests, server_task) = spawn_local_ollama_server().await;
+    let author_inputs = Arc::new(AtomicUsize::new(0));
+    let (origin, ollama_requests, server_task) =
+        spawn_local_ollama_server(author_inputs.clone()).await;
     let resource_id = ProviderResourceId::from_bytes(random_bytes_16());
     let model_id = ModelProfileId::from_bytes(random_bytes_16());
     let loopback: ipnet::IpNet = "127.0.0.1/32".parse().unwrap();
@@ -1259,18 +1300,6 @@ async fn exercise_provider_e2e(
         "Unique contribution by a former member.",
     )
     .await;
-    control
-        .change_membership(
-            owner_space.clone(),
-            MembershipChange {
-                command: CommandKey::from_bytes(random_bytes_16()),
-                member: author.value.id,
-                role: None,
-                expected: membership.revision,
-            },
-        )
-        .await
-        .unwrap();
     let res_commit = provider
         .create_resource(
             account_ctx.clone(),
@@ -1386,7 +1415,7 @@ async fn exercise_provider_e2e(
         .unwrap();
     provider
         .set_preference(
-            account_ctx,
+            account_ctx.clone(),
             AccountMutation {
                 identity: account_command(&owner_id, attached.revision),
                 input: SetProviderPreference {
@@ -1400,6 +1429,41 @@ async fn exercise_provider_e2e(
         .await
         .unwrap();
 
+    let contributor_account = AccountContext::new(contributor.auth().clone(), budget());
+    let contributor_personal = provider
+        .request_attachment(
+            contributor_account.clone(),
+            AccountMutation {
+                identity: account_command(&author.value.id, login.account.revision),
+                input: RequestProviderAttachment {
+                    id: RequestId::from_bytes(random_bytes_16()),
+                    expected: None,
+                    resource: resource_id.clone(),
+                    resource_consent_epoch: reviewed.consent_epoch,
+                    credential_consent_epoch: None,
+                    target: ProviderAttachmentTarget::Personal {
+                        owner: author.value.id.clone(),
+                        space: space_id.clone(),
+                    },
+                    consent: consent(),
+                    expires_at_ms: None,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let removed = control
+        .change_membership(
+            owner_space.clone(),
+            MembershipChange {
+                command: CommandKey::from_bytes(random_bytes_16()),
+                member: author.value.id.clone(),
+                role: None,
+                expected: membership.revision,
+            },
+        )
+        .await
+        .unwrap();
     let space_record = store.read_space(&space_id).await.unwrap();
     let resolved = provider
         .resolve_search_embedding_model(
@@ -1425,14 +1489,18 @@ async fn exercise_provider_e2e(
     )
     .await;
 
-    let mut deps = SearchDependencies::new(store.clone(), projector.engine());
-    deps.model_resolver = Some(Arc::new(ControlSearchModelResolver(provider.clone())));
-    deps.providers = Some(provider.clone());
-    let search = Arc::new(SearchEngine::start(
-        SearchConfig::new(root.clone(), VectorMode::RemoteOnly),
-        deps,
-    ));
-    search.start_space(space_record.scope.clone()).unwrap();
+    let start_search = || {
+        let mut deps = SearchDependencies::new(store.clone(), projector.engine());
+        deps.model_resolver = Some(Arc::new(ControlSearchModelResolver(provider.clone())));
+        deps.providers = Some(provider.clone());
+        let search = Arc::new(SearchEngine::start(
+            SearchConfig::new(root.clone(), VectorMode::RemoteOnly),
+            deps,
+        ));
+        search.start_space(space_record.scope.clone()).unwrap();
+        search
+    };
+    let search = start_search();
 
     let layout = SearchLayout::open(&root, space_record.scope.clone()).unwrap();
     tokio::time::timeout(Duration::from_secs(15), async {
@@ -1468,7 +1536,73 @@ async fn exercise_provider_e2e(
         .await
         .unwrap();
     assert!(ids(&lexical).contains(&&former_note));
+    assert_eq!(author_inputs.load(Ordering::SeqCst), 0);
+    // Rejoin with the preexisting personal consent. Neither Canonical nor the
+    // provider generation changes, so only the admission witness can drive repair.
+    control
+        .change_membership(
+            owner_space.clone(),
+            MembershipChange {
+                command: CommandKey::from_bytes(random_bytes_16()),
+                member: author.value.id.clone(),
+                role: Some(SpaceRole::Editor),
+                expected: removed.revision,
+            },
+        )
+        .await
+        .unwrap();
+    let search_authority = ServiceAuthority::admit(ServicePurpose::Search);
+    let revision = || provider.search_indexing_revision(&search_authority, &space_id, budget());
+    wait_remote_sweep(&layout, revision().await.unwrap()).await;
+    let semantic = || project_query("unrelatedsemanticquery");
+    let found = search
+        .search(owner_space.clone(), semantic())
+        .await
+        .unwrap();
+    assert!(ids(&found).contains(&&former_note));
+    let allowed_inputs = author_inputs.load(Ordering::SeqCst);
+    assert!(allowed_inputs > 0);
+    let disable = |disabled, expected| {
+        let mut identity = account_command(&author.value.id, expected);
+        identity.actor = owner_id.clone();
+        control.set_disabled(
+            account_ctx.clone(),
+            AccountMutation {
+                identity,
+                input: SetAccountDisabled {
+                    account: author.value.id.clone(),
+                    disabled,
+                },
+            },
+        )
+    };
+    let disabled = disable(true, contributor_personal.revision).await.unwrap();
+    wait_remote_sweep(&layout, revision().await.unwrap()).await;
+    assert_eq!(
+        ids(&search
+            .search(owner_space.clone(), semantic())
+            .await
+            .unwrap()),
+        [&note_id]
+    );
+    assert_eq!(author_inputs.load(Ordering::SeqCst), allowed_inputs);
     search.shutdown().await;
+
+    // A worker that missed the account restoration while stopped uses the
+    // persisted witness and reuses the same model epoch and canonical cutoff.
+    disable(false, disabled.revision).await.unwrap();
+    let restarted = start_search();
+    wait_remote_sweep(&layout, revision().await.unwrap()).await;
+    let found = restarted
+        .search(owner_space.clone(), semantic())
+        .await
+        .unwrap();
+    assert!(ids(&found).contains(&&former_note));
+    assert_eq!(
+        layout.search_manifest().unwrap().unwrap().vector_seq,
+        Some(note_receipt.seq())
+    );
+    restarted.shutdown().await;
     verify_moved_query_folder(&store, &provider, &owner_space, &resolved, &ollama_requests).await;
 
     projector.shutdown().await.unwrap();

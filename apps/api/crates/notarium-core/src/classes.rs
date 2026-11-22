@@ -404,6 +404,12 @@ macro_rules! content_wrapper {
 content_wrapper!(ProjectionContent);
 content_wrapper!(SearchContent);
 impl SearchContent {
+    /// Keep the placement needed to validate an off-owner search update,
+    /// releasing the document body before publication.
+    pub fn into_recorded_ancestor_folders(self) -> Vec<FolderId> {
+        self.0.facts.recorded.ancestor_folders
+    }
+
     /// Match a subtree at the canonical cut captured by the indexed carrier.
     pub fn was_under_any_folder(&self, folders: &BTreeSet<FolderId>) -> bool {
         self.0

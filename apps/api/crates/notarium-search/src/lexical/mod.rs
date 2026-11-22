@@ -41,7 +41,8 @@ use tantivy::{
     collector::TopDocs,
     directory::RamDirectory,
     indexer::NoMergePolicy,
-    schema::{IndexRecordOption, Schema},
+    query::Bm25StatisticsProvider,
+    schema::{Field, IndexRecordOption, Schema},
     tokenizer::TokenizerManager,
 };
 
@@ -99,12 +100,63 @@ pub struct LexicalHit {
     pub score: f32,
 }
 
-/// Separates strict overlay matches from 1-term fallback matches so fallback
-/// overlay rows never overtake full matches from the durable corpus.
+/// Receipt matches and the pinned segment used to score them.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct OverlayHits {
-    pub strict: Vec<LexicalHit>,
-    pub fallback: Vec<LexicalHit>,
+    strict: Vec<LexicalHit>,
+    fallback: Vec<LexicalHit>,
+    searcher: Option<Searcher>,
+}
+
+impl OverlayHits {
+    pub(crate) fn merge(
+        &self,
+        mut strict: Vec<LexicalHit>,
+        mut fallback: Vec<LexicalHit>,
+        floor: usize,
+        browse: bool,
+    ) -> Vec<LexicalHit> {
+        if !self.strict.is_empty() {
+            strict.extend_from_slice(&self.strict);
+            if browse {
+                strict.sort_by(|left, right| match (&left.key, &right.key) {
+                    (HitKey::Note(a), HitKey::Note(b)) => a.cmp(b),
+                    _ => Ordering::Equal,
+                });
+            } else {
+                strict.sort_by(|left, right| right.score.total_cmp(&left.score));
+            }
+        }
+        let missing = floor.saturating_sub(strict.len());
+        if missing != 0 {
+            if !self.fallback.is_empty() {
+                fallback.extend_from_slice(&self.fallback);
+                fallback.sort_by(|left, right| right.score.total_cmp(&left.score));
+            }
+            strict.extend(fallback.into_iter().take(missing));
+        }
+        strict
+    }
+}
+
+/// The two searchers share a schema. Read Tantivy's segment statistics as
+/// though their segments belonged to one searcher. Native BM25 counts physical
+/// postings, including superseded revisions until Tantivy merges their segments.
+/// The query filter masks those revisions when selecting hits.
+struct CombinedStatistics<'a>(&'a Searcher, &'a Searcher);
+
+impl Bm25StatisticsProvider for CombinedStatistics<'_> {
+    fn total_num_tokens(&self, field: Field) -> tantivy::Result<u64> {
+        Ok(self.0.total_num_tokens(field)? + self.1.total_num_tokens(field)?)
+    }
+
+    fn total_num_docs(&self) -> tantivy::Result<u64> {
+        Ok(self.0.total_num_docs()? + self.1.total_num_docs()?)
+    }
+
+    fn doc_freq(&self, term: &Term) -> tantivy::Result<u64> {
+        Ok(self.0.doc_freq(term)? + self.1.doc_freq(term)?)
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -357,15 +409,80 @@ impl LexicalIndex {
         top_k: usize,
         filtered: bool,
     ) -> Result<Vec<LexicalHit>, LexicalError> {
-        search_pinned(
+        self.search_with_overlay(
             searcher,
-            &self.fields,
             text,
             filter,
             candidate_limit,
             top_k,
             filtered,
+            &OverlayHits::default(),
         )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn search_with_overlay(
+        &self,
+        searcher: &Searcher,
+        text: &str,
+        filter: &LexicalFilter<'_>,
+        candidate_limit: usize,
+        top_k: usize,
+        filtered: bool,
+        overlay: &OverlayHits,
+    ) -> Result<Vec<LexicalHit>, LexicalError> {
+        if candidate_limit == 0 || (filter.classes == 0 && !filter.include_chats) {
+            return Ok(Vec::new());
+        }
+        let fields = if filter.include_chats {
+            &self.fields.bodies[..]
+        } else {
+            &self.fields.bodies[..2]
+        };
+        let query = QueryPlan::parse(text, fields, filtered)?;
+        if query.browse {
+            return Ok(overlay.merge(
+                collect_browse(searcher, filter, candidate_limit)?,
+                Vec::new(),
+                0,
+                true,
+            ));
+        }
+        let combined = overlay
+            .searcher
+            .as_ref()
+            .map(|receipts| CombinedStatistics(searcher, receipts));
+        let statistics: &dyn Bm25StatisticsProvider = match &combined {
+            Some(combined) => combined,
+            None => searcher,
+        };
+        let collect = |relaxed, limit| {
+            collect_top_scored(
+                searcher,
+                statistics,
+                query.query(relaxed).as_ref(),
+                filter,
+                limit,
+                None,
+            )
+        };
+        let decode = |(score, address)| decode_hit(searcher, address, score);
+        let ranked = collect(false, candidate_limit)?;
+        let floor = top_k.min(candidate_limit).min(MAX_FALLBACK_FLOOR);
+        let missing = floor.saturating_sub(ranked.len() + overlay.strict.len());
+        let fallback = if missing != 0 && query.can_fallback() {
+            let seen: HashSet<_> = ranked.iter().map(|(_, address)| *address).collect();
+            collect(true, seen.len() + missing)?
+                .into_iter()
+                .filter(|(_, address)| !seen.contains(address))
+                .take(missing)
+                .map(decode)
+                .collect::<Result<_, _>>()?
+        } else {
+            Vec::new()
+        };
+        let strict = ranked.into_iter().map(decode).collect::<Result<_, _>>()?;
+        Ok(overlay.merge(strict, fallback, floor, false))
     }
 
     pub(crate) fn chat_page(
@@ -387,8 +504,14 @@ impl LexicalIndex {
         } else {
             plan.query(false)
         };
-        let mut scores =
-            collect_top_scored(searcher, query.as_ref(), filter, limit + 1, cursor.after)?;
+        let mut scores = collect_top_scored(
+            searcher,
+            searcher,
+            query.as_ref(),
+            filter,
+            limit + 1,
+            cursor.after,
+        )?;
         let next = if scores.len() > limit {
             scores.truncate(limit);
             Some(ChatCursor {
@@ -416,6 +539,7 @@ impl LexicalIndex {
     pub(crate) fn rank_overlay(
         text: &str,
         updates: &[Update<'_>],
+        base: Option<&Searcher>,
         filtered: bool,
         budget: crate::vector::SearchBudget<'_>,
     ) -> Result<OverlayHits, LexicalError> {
@@ -444,7 +568,7 @@ impl LexicalIndex {
             });
             return Ok(OverlayHits {
                 strict,
-                fallback: Vec::new(),
+                ..OverlayHits::default()
             });
         }
         if plan.is_empty() {
@@ -475,11 +599,22 @@ impl LexicalIndex {
         let searcher = reader.searcher();
         let size = updates.len();
         let collector = TopDocs::with_limit(size).order_by_score();
-        let strict_scores = searcher.search(plan.query(false).as_ref(), &collector)?;
+        let combined = base.map(|base| CombinedStatistics(base, &searcher));
+        let statistics: &dyn Bm25StatisticsProvider = match &combined {
+            Some(combined) => combined,
+            None => &searcher,
+        };
+        let collect = |relaxed| {
+            searcher.search_with_statistics_provider(
+                plan.query(relaxed).as_ref(),
+                &collector,
+                statistics,
+            )
+        };
+        let strict_scores = collect(false)?;
         let fallback_scores = if strict_scores.len() < size && plan.can_fallback() {
             let seen: HashSet<_> = strict_scores.iter().map(|(_, addr)| *addr).collect();
-            searcher
-                .search(plan.query(true).as_ref(), &collector)?
+            collect(true)?
                 .into_iter()
                 .filter(|(_, addr)| !seen.contains(addr))
                 .collect()
@@ -494,7 +629,11 @@ impl LexicalIndex {
             .into_iter()
             .map(|(score, addr)| decode_hit(&searcher, addr, score))
             .collect::<Result<_, _>>()?;
-        Ok(OverlayHits { strict, fallback })
+        Ok(OverlayHits {
+            strict,
+            fallback,
+            searcher: Some(searcher),
+        })
     }
 }
 
@@ -523,57 +662,6 @@ fn build_mutations(
                 Update::RemoveChat(thread, entry) => (fields.chat_term(thread, *entry), None),
             })
         })
-        .collect()
-}
-
-fn search_pinned(
-    searcher: &Searcher,
-    index_fields: &Fields,
-    text: &str,
-    filter: &LexicalFilter<'_>,
-    candidate_limit: usize,
-    top_k: usize,
-    filtered: bool,
-) -> Result<Vec<LexicalHit>, LexicalError> {
-    if candidate_limit == 0 || (filter.classes == 0 && !filter.include_chats) {
-        return Ok(Vec::new());
-    }
-    let fields = if filter.include_chats {
-        &index_fields.bodies[..]
-    } else {
-        &index_fields.bodies[..2]
-    };
-    let query = QueryPlan::parse(text, fields, filtered)?;
-    if query.browse {
-        return collect_browse(searcher, filter, candidate_limit);
-    }
-    let mut ranked = collect_top_scored(
-        searcher,
-        query.query(false).as_ref(),
-        filter,
-        candidate_limit,
-        None,
-    )?;
-    let fallback_floor = top_k.min(MAX_FALLBACK_FLOOR).min(candidate_limit);
-    if ranked.len() < fallback_floor && query.can_fallback() {
-        let fallback = collect_top_scored(
-            searcher,
-            query.query(true).as_ref(),
-            filter,
-            fallback_floor,
-            None,
-        )?;
-        let seen: HashSet<_> = ranked.iter().map(|(_, addr)| *addr).collect();
-        ranked.extend(
-            fallback
-                .into_iter()
-                .filter(|(_, addr)| !seen.contains(addr))
-                .take(fallback_floor - ranked.len()),
-        );
-    }
-    ranked
-        .into_iter()
-        .map(|(score, address)| decode_hit(searcher, address, score))
         .collect()
 }
 
