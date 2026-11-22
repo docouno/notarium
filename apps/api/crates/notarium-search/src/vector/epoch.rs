@@ -9,8 +9,8 @@ use super::{
     mmap_segment::SlotMask,
 };
 use crate::layout::{
-    EpochManifest, SearchLayout, SegmentRecovery, VectorModel, remove_dir_all_readonly,
-    remove_path_if_exists, sync_dir,
+    EpochManifest, SearchLayout, SegmentRecovery, VectorModel, is_repair_directory,
+    remove_dir_all_readonly, remove_path_if_exists, repair_directory_name, sync_dir,
 };
 use cap_std::{ambient_authority, fs::Dir};
 use croaring::Bitmap;
@@ -809,7 +809,7 @@ impl RepairDirectory {
         let parent = Dir::open_ambient_dir(epoch, ambient_authority())?;
         loop {
             let serial = SERIAL.fetch_add(1, AtomicOrdering::Relaxed);
-            let name = format!(".repair-{}-{serial}.tmp", std::process::id());
+            let name = repair_directory_name(std::process::id(), serial);
             match parent.create_dir(&name) {
                 Ok(()) => {
                     return Ok(Arc::new(Self {
@@ -1785,13 +1785,6 @@ pub fn segment_file_path(path: &Path, id: u64) -> PathBuf {
 
 fn tombstone_path(path: &Path, id: u64) -> PathBuf {
     path.join(format!("seg_{id:016x}.tomb"))
-}
-
-fn is_repair_directory(name: &str) -> bool {
-    name.strip_prefix(".repair-")
-        .and_then(|name| name.strip_suffix(".tmp"))
-        .and_then(|name| name.split_once('-'))
-        .is_some_and(|(pid, serial)| pid.parse::<u32>().is_ok() && serial.parse::<u64>().is_ok())
 }
 
 fn is_orphan_temp(name: &str) -> bool {

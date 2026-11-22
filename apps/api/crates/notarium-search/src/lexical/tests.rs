@@ -441,6 +441,15 @@ fn overlay_ranking_runs_outside_writer_pool_and_separates_fallback() {
 
         let browse = LexicalIndex::rank_overlay("", &updates, None, true, budget).unwrap();
         assert!(browse.fallback.is_empty());
+        let first = browse.merge(Vec::new(), Vec::new(), 1, 0, true);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].key, HitKey::Note(NoteId::from_bytes([1; 16])));
+        let strict_only = ranked.merge(Vec::new(), Vec::new(), 1, 2, false);
+        assert_eq!(strict_only.len(), 1);
+        assert_eq!(
+            strict_only[0].key,
+            HitKey::Note(NoteId::from_bytes([2; 16]))
+        );
         assert_eq!(
             browse
                 .strict
@@ -453,6 +462,109 @@ fn overlay_ranking_runs_outside_writer_pool_and_separates_fallback() {
             ]
         );
     });
+}
+
+#[test]
+fn receipt_and_indexed_candidates_share_the_same_rrf_window() {
+    let scratch = TestDir::new();
+    let index = LexicalIndex::create(&scratch.0).unwrap();
+    let pool = WriterPool::default();
+    let snapshot = Snapshot::new((0..=100).map(ordinal_note_id));
+    let folder = FolderDictionary::default()
+        .insert(FolderId::from_bytes([1; 16]))
+        .unwrap();
+    let docs: Vec<_> = (0..=100)
+        .map(|i| note_with_class("alpha beta", i, DocClass::UserDoc, &snapshot.cut.scope))
+        .collect();
+    // Physical document order deliberately conflicts with the note-ID tie break.
+    let indexed: Vec<_> = docs[1..]
+        .iter()
+        .rev()
+        .map(|content| Update::Note {
+            content,
+            title: "",
+            folder,
+        })
+        .collect();
+    index.apply(&pool, &indexed).unwrap();
+    let receipt = [Update::Note {
+        content: &docs[0],
+        title: "alpha",
+        folder,
+    }];
+    let base = index.reader.searcher();
+    let filter = LexicalFilter::new(&snapshot, None, None, [DocClass::UserDoc], false);
+    let stop = Cancellation::default();
+    let budget = crate::vector::SearchBudget {
+        cancellation: &stop,
+        deadline: Instant::now() + Duration::from_secs(10),
+    };
+    let limit = crate::vector::search_candidate_limit(1);
+    assert_eq!(limit, 100);
+    // Top scoring receipt, tied strict hits, tied fallback hits, and browse.
+    let cases = [
+        ("alpha", 100),
+        ("beta", 100),
+        ("beta gamma delta", 1),
+        ("", 100),
+    ];
+    let mut before = Vec::new();
+    for (query, expected_len) in cases {
+        let browse = query.is_empty();
+        let overlay =
+            LexicalIndex::rank_overlay(query, &receipt, Some(&base), browse, budget).unwrap();
+        let hits = index
+            .search_with_overlay(&base, query, &filter, limit, 1, browse, &overlay)
+            .unwrap();
+        let expected: Vec<_> = (0..expected_len)
+            .map(|i| HitKey::Note(ordinal_note_id(i)))
+            .collect();
+        assert_eq!(
+            hits.iter().map(|hit| hit.key.clone()).collect::<Vec<_>>(),
+            expected
+        );
+        before.push(hits);
+    }
+    // Note 100 ranks 30th in the vector stream. A spurious 101st lexical
+    // vote would put it ahead of the winner of either individual stream.
+    let vectors = (200..229)
+        .chain([100])
+        .map(|i| crate::vector::VectorHit {
+            score: 1.0,
+            metadata: crate::vector::ChunkMetadata {
+                note: ordinal_note_id(i),
+                key: ContentDigest::from_bytes([1; 32]),
+                source: ContentDigest::from_bytes([2; 32]),
+                folder: folder.get(),
+                class: DocClass::UserDoc,
+                tokens: 1,
+                context: Vec::new(),
+                spans: vec![notarium_core::span::ByteSpan::new(0, 1).unwrap()],
+            },
+        })
+        .collect::<Vec<_>>();
+    let winner = |hits| {
+        crate::query::ranking::fuse(hits, vectors.clone(), false)[0]
+            .note
+            .clone()
+    };
+    assert_eq!(winner(before[0].clone()), ordinal_note_id(0));
+
+    index.apply(&pool, &receipt).unwrap();
+    for ((query, _), overlay_hits) in cases.into_iter().zip(before) {
+        let indexed_hits = index
+            .search(query, &filter, limit, 1, query.is_empty())
+            .unwrap();
+        assert!(
+            overlay_hits
+                .iter()
+                .map(|hit| &hit.key)
+                .eq(indexed_hits.iter().map(|hit| &hit.key))
+        );
+        if query == "alpha" {
+            assert_eq!(winner(indexed_hits), ordinal_note_id(0));
+        }
+    }
 }
 
 #[test]

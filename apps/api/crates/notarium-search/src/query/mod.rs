@@ -887,6 +887,7 @@ async fn lexical_candidates(
         return Ok(overlay.merge(
             Vec::new(),
             Vec::new(),
+            candidate_k,
             top_k.min(crate::lexical::MAX_FALLBACK_FLOOR),
             text.trim().is_empty(),
         ));

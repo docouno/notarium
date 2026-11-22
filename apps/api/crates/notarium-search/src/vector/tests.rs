@@ -1498,6 +1498,18 @@ fn collect_obsolete_cleans_orphan_temps_and_ignores_ds_store() {
     builder.push(fixture(1, 64)).unwrap();
     epoch.seed(builder, SpaceSeq::new(1).unwrap()).unwrap();
 
+    let live = RepairDirectory::new(&epoch_dir).unwrap();
+    fs::write(live.path.join("staged.seg"), b"in progress").unwrap();
+    let next = SpaceSeq::new(2).unwrap();
+    epoch.checkpoint(next).unwrap();
+    assert!(
+        VectorEpoch::open(layout.clone(), model(), 64)
+            .unwrap()
+            .is_checkpointed(next)
+    );
+    assert!(live.path.join("staged.seg").is_file());
+    drop(live);
+
     let temps = [
         ".segment-99-0.tmp",
         "l0.wal.99.0.tmp",
@@ -1511,6 +1523,11 @@ fn collect_obsolete_cleans_orphan_temps_and_ignores_ds_store() {
     let abandoned = epoch_dir.join(".repair-123-4.tmp");
     fs::create_dir(&abandoned).unwrap();
     fs::write(abandoned.join("partial.seg"), b"staged").unwrap();
+    // Cold open must reach collection even when the previous process died
+    // after staging a file and before publishing the replacement.
+    drop(epoch);
+    let epoch = VectorEpoch::open(layout.clone(), model(), 64).unwrap();
+    assert!(abandoned.is_dir());
     let unrelated = epoch_dir.join(".repair-user-backup.tmp");
     fs::create_dir(&unrelated).unwrap();
 
@@ -1522,6 +1539,25 @@ fn collect_obsolete_cleans_orphan_temps_and_ignores_ds_store() {
     assert!(!abandoned.exists());
     assert!(unrelated.is_dir());
     drop(epoch);
+    assert!(matches!(
+        VectorEpoch::open(layout.clone(), model(), 64),
+        Err(VectorError::Layout(crate::layout::LayoutError::Corrupt))
+    ));
+    fs::remove_dir(&unrelated).unwrap();
+    #[cfg(unix)]
+    {
+        let fake = epoch_dir.join(".repair-77-1.tmp");
+        let target = scratch.0.join("outside");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("keep"), b"untouched").unwrap();
+        std::os::unix::fs::symlink(&target, &fake).unwrap();
+        assert!(matches!(
+            VectorEpoch::open(layout.clone(), model(), 64),
+            Err(VectorError::Layout(crate::layout::LayoutError::Corrupt))
+        ));
+        fs::remove_file(fake).unwrap();
+        assert_eq!(fs::read(target.join("keep")).unwrap(), b"untouched");
+    }
     assert!(VectorEpoch::open(layout, model(), 64).is_ok());
 }
 

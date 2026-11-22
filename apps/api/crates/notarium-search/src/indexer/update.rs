@@ -90,12 +90,7 @@ pub(super) async fn apply(
                 {
                     // Each remote grant uses the note's actual project, including
                     // when the selected model serves the entire space.
-                    disk.manifest.embeddings_pending = true;
-                    disk.full_sweep_needed = true;
-                    if let Some(replay) = &mut disk.manifest.vector_replay_after {
-                        replay.needs_sweep = true;
-                    }
-                    disk.full_sweep_after = None;
+                    disk.request_full_sweep();
                 }
             }
             EntityId::Ability(_) | EntityId::Job(_) => {}

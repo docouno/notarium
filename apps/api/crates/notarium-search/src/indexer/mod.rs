@@ -305,6 +305,43 @@ pub(super) fn new_budget(cancellation: &Cancellation) -> CallBudget {
     maintenance_budget(cancellation, RequestId::from_bytes(id))
 }
 
+/// The current pass always reaches its tail. Invalidations of an already
+/// visited prefix coalesce into one subsequent pass from the beginning.
+#[derive(Debug, Eq, PartialEq)]
+enum FullSweep {
+    Idle,
+    Requested,
+    Scanning { after: NoteId, repeat: bool },
+}
+
+impl FullSweep {
+    fn from_pending(pending: bool) -> Self {
+        if pending { Self::Requested } else { Self::Idle }
+    }
+
+    fn request(&mut self) {
+        match self {
+            Self::Idle | Self::Requested => *self = Self::Requested,
+            Self::Scanning { repeat, .. } => *repeat = true,
+        }
+    }
+
+    fn after(&self) -> Option<NoteId> {
+        match self {
+            Self::Scanning { after, .. } => Some(after.clone()),
+            Self::Idle | Self::Requested => None,
+        }
+    }
+
+    fn finish_page(&mut self, next: Option<NoteId>) {
+        let repeat = matches!(self, Self::Scanning { repeat: true, .. });
+        *self = match next {
+            Some(after) => Self::Scanning { after, repeat },
+            None => Self::from_pending(repeat),
+        };
+    }
+}
+
 struct Disk {
     layout: Arc<SearchLayout>,
     manifest: SearchManifest,
@@ -315,8 +352,7 @@ struct Disk {
     embedder: Option<Arc<crate::model::Embedder>>,
     dirty_notes: BTreeSet<NoteId>,
     cached_vectors: HashMap<ContentDigest, Arc<QuantizedVector>>,
-    full_sweep_after: Option<NoteId>,
-    full_sweep_needed: bool,
+    sweep: FullSweep,
     last_activity: Instant,
     embedder_last_use: Instant,
     embedder_unavailable: bool,
@@ -354,8 +390,16 @@ impl Disk {
         }
     }
 
+    fn request_full_sweep(&mut self) {
+        self.sweep.request();
+        self.manifest.embeddings_pending = true;
+        if let Some(replay) = &mut self.manifest.vector_replay_after {
+            replay.needs_sweep = true;
+        }
+    }
+
     fn has_pending_embeddings(&self) -> bool {
-        !self.dirty_notes.is_empty() || self.full_sweep_needed
+        !self.dirty_notes.is_empty() || self.sweep != FullSweep::Idle
     }
 
     fn needs_embedding_work(&self) -> bool {
@@ -1634,7 +1678,7 @@ fn spawn_bg_if_ready(
             update::EmbedBatchMode::DirtyNotes(batch)
         } else {
             update::EmbedBatchMode::FullSweep {
-                after: disk.full_sweep_after.clone(),
+                after: disk.sweep.after(),
             }
         };
         let input = update::EmbedBatchInput {
@@ -1755,13 +1799,8 @@ async fn handle_bg_done(
                 *model_retry_delay = Duration::from_secs(1);
             }
             Ok(build::ModelRefreshOutcome::AdmissionChanged(revision)) => {
-                current.full_sweep_needed = true;
-                current.full_sweep_after = None;
-                if let Some(replay) = &mut current.manifest.vector_replay_after {
-                    replay.needs_sweep = true;
-                }
+                current.request_full_sweep();
                 current.manifest.remote_admission = Some(revision);
-                current.manifest.embeddings_pending = true;
                 // Publish both together: reopening pending work restarts a full sweep.
                 current.publish_manifest().await?;
                 publisher.publish_if_live(current, false);
@@ -1783,8 +1822,7 @@ async fn handle_bg_done(
                 current.embedder_unavailable = false;
                 current.dirty_notes.clear();
                 current.cached_vectors.clear();
-                current.full_sweep_needed = false;
-                current.full_sweep_after = None;
+                current.sweep = FullSweep::Idle;
                 current.publish_manifest().await?;
                 build::publish_seed(cx, publisher, current, None).await?;
                 *retry_model = false;
@@ -1859,9 +1897,8 @@ async fn handle_bg_done(
                 current.cached_vectors.clear();
                 current.dirty_notes.extend(dirty.notes);
                 current.dirty_notes.extend(failed_notes);
-                current.full_sweep_after = None;
-                current.full_sweep_needed = remote_folder_dirty;
-                let pending = !current.dirty_notes.is_empty() || current.full_sweep_needed;
+                current.sweep = FullSweep::from_pending(remote_folder_dirty);
+                let pending = current.has_pending_embeddings();
                 let was_cold_seed = current.manifest.vector_seq.is_none();
                 let mut manifest = current.manifest.clone();
                 manifest.vector_seq = Some(seq);
@@ -1989,21 +2026,17 @@ async fn handle_bg_done(
                     Err(error) => return Err(IndexError::Vector(error)),
                 }
                 current.dirty_notes.extend(requeue);
+                let previous_pending = current.manifest.embeddings_pending;
                 if was_full_sweep {
-                    current.full_sweep_after = next_sweep_after;
-                    if current.full_sweep_after.is_none() {
-                        current.full_sweep_needed = false;
-                    }
+                    current.sweep.finish_page(next_sweep_after);
                 }
                 if !changed_folders.is_empty() {
-                    current.full_sweep_needed = true;
-                    current.full_sweep_after = None;
+                    current.request_full_sweep();
                 }
                 if current.dirty_notes.is_empty() {
                     current.cached_vectors.clear();
                 }
-                let previous_pending = current.manifest.embeddings_pending;
-                let pending = !current.dirty_notes.is_empty() || current.full_sweep_needed;
+                let pending = current.has_pending_embeddings();
                 current.manifest.embeddings_pending = pending;
                 if vectors_changed {
                     current.manifest.vector_seq = Some(seq);
@@ -2299,8 +2332,7 @@ async fn open_disk(
                         embedder: None,
                         dirty_notes: BTreeSet::new(),
                         cached_vectors: HashMap::new(),
-                        full_sweep_after: None,
-                        full_sweep_needed,
+                        sweep: FullSweep::from_pending(full_sweep_needed),
                         last_activity: now,
                         embedder_last_use: now,
                         embedder_unavailable: false,

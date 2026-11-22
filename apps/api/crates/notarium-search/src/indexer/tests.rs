@@ -126,8 +126,7 @@ async fn idle_space_releases_embedder_and_reopens_checkpointed_wal_after_evictio
         embedder: None,
         dirty_notes: BTreeSet::new(),
         cached_vectors: HashMap::new(),
-        full_sweep_after: None,
-        full_sweep_needed: false,
+        sweep: FullSweep::Idle,
         last_activity: idle_since,
         embedder_last_use: idle_since,
         embedder_unavailable: false,
@@ -807,7 +806,7 @@ async fn deferred_edits_replay_after_restart_before_admitting_the_checkpoint() {
     let manifest = layout.search_manifest().unwrap().unwrap();
     assert_eq!(manifest.vector_seq, Some(seed.last_seq));
     assert_eq!(manifest.vector_replay_after.unwrap().after, seed.last_seq);
-    assert!(!disk.full_sweep_needed);
+    assert_eq!(disk.sweep, FullSweep::Idle);
     // Interrupted WAL writes and an epoch checkpoint can each precede the search manifest.
     let mut interrupted = open_vector_epoch(layout.clone(), &manifest).unwrap();
     interrupted
@@ -874,7 +873,7 @@ async fn deferred_edits_replay_after_restart_before_admitting_the_checkpoint() {
         disk.dirty_notes,
         BTreeSet::from([note(1), note(2), note(3)])
     );
-    assert!(!disk.full_sweep_needed);
+    assert_eq!(disk.sweep, FullSweep::Idle);
     for id in 1..=3 {
         assert!(epoch.matches_note_chunks(&note(id), &[]));
     }
@@ -975,8 +974,7 @@ fn scheduled_reopen_signals_until_retry_backoff() {
         embedder: None,
         dirty_notes: BTreeSet::new(),
         cached_vectors: HashMap::new(),
-        full_sweep_after: None,
-        full_sweep_needed: false,
+        sweep: FullSweep::Idle,
         last_activity: now,
         embedder_last_use: now,
         embedder_unavailable: false,
@@ -1080,8 +1078,10 @@ async fn full_sweep_completion_preserves_resweep_when_remote_folders_changed() {
         embedder: None,
         dirty_notes: BTreeSet::new(),
         cached_vectors: HashMap::new(),
-        full_sweep_after: Some(NoteId::from_bytes([1; 16])),
-        full_sweep_needed: true,
+        sweep: FullSweep::Scanning {
+            after: NoteId::from_bytes([1; 16]),
+            repeat: false,
+        },
         last_activity: now,
         embedder_last_use: now,
         embedder_unavailable: false,
@@ -1100,101 +1100,72 @@ async fn full_sweep_completion_preserves_resweep_when_remote_folders_changed() {
     let mut repair_at = now;
     let mut repair_delay = Duration::from_secs(1);
 
-    // Final full-sweep page with a concurrent remote folder move must stay scheduled from the start.
-    handle_bg_done(
-        &cx,
-        &mut publisher,
-        &mut disk,
-        &layout,
+    let page = |after: Option<u8>| {
         BgOutcome::EmbedBatch(Ok(update::EmbedBatchOutcome::Applied {
             rows: Vec::new(),
             requeue: Vec::new(),
             missing_folders: BTreeSet::new(),
-            next_sweep_after: None,
+            next_sweep_after: after.map(|id| NoteId::from_bytes([id; 16])),
             was_full_sweep: true,
             had_transient_failure: false,
-        })),
-        BgDirty {
-            notes: HashSet::new(),
-            folders: BTreeSet::from([FolderId::from_bytes([0xb5; 16])]),
-        },
-        &mut model_check_due,
-        &mut retry_model,
-        &mut model_retry_at,
-        &mut model_retry_delay,
-        &mut embedder_retry_at,
-        &mut repair_at,
-        &mut repair_delay,
-    )
-    .await
-    .unwrap();
-    let current = disk.as_ref().unwrap();
-    assert!(current.full_sweep_needed);
-    assert!(current.full_sweep_after.is_none());
-    assert!(current.manifest.embeddings_pending);
-
-    // Intermediate full-sweep page with a folder change must also reset the sweep cursor to None.
-    handle_bg_done(
-        &cx,
-        &mut publisher,
-        &mut disk,
-        &layout,
-        BgOutcome::EmbedBatch(Ok(update::EmbedBatchOutcome::Applied {
-            rows: Vec::new(),
-            requeue: Vec::new(),
-            missing_folders: BTreeSet::new(),
-            next_sweep_after: Some(NoteId::from_bytes([2; 16])),
-            was_full_sweep: true,
-            had_transient_failure: false,
-        })),
-        BgDirty {
-            notes: HashSet::new(),
-            folders: BTreeSet::from([FolderId::from_bytes([0xb6; 16])]),
-        },
-        &mut model_check_due,
-        &mut retry_model,
-        &mut model_retry_at,
-        &mut model_retry_delay,
-        &mut embedder_retry_at,
-        &mut repair_at,
-        &mut repair_delay,
-    )
-    .await
-    .unwrap();
-    let current = disk.as_ref().unwrap();
-    assert!(current.full_sweep_needed);
-    assert!(current.full_sweep_after.is_none());
-    assert!(current.manifest.embeddings_pending);
-
-    // Final page with no folder changes clears full_sweep_needed and embeddings_pending.
-    handle_bg_done(
-        &cx,
-        &mut publisher,
-        &mut disk,
-        &layout,
-        BgOutcome::EmbedBatch(Ok(update::EmbedBatchOutcome::Applied {
-            rows: Vec::new(),
-            requeue: Vec::new(),
-            missing_folders: BTreeSet::new(),
-            next_sweep_after: None,
-            was_full_sweep: true,
-            had_transient_failure: false,
-        })),
-        BgDirty::default(),
-        &mut model_check_due,
-        &mut retry_model,
-        &mut model_retry_at,
-        &mut model_retry_delay,
-        &mut embedder_retry_at,
-        &mut repair_at,
-        &mut repair_delay,
-    )
-    .await
-    .unwrap();
-    let current = disk.as_ref().unwrap();
-    assert!(!current.full_sweep_needed);
-    assert!(current.full_sweep_after.is_none());
-    assert!(!current.manifest.embeddings_pending);
+        }))
+    };
+    let scanning = |id, repeat| FullSweep::Scanning {
+        after: NoteId::from_bytes([id; 16]),
+        repeat,
+    };
+    let admission = |id| {
+        BgOutcome::ModelRefresh(Ok(build::ModelRefreshOutcome::AdmissionChanged(
+            ContentDigest::from_bytes([id; 32]),
+        )))
+    };
+    // Keep moving through distinct pages despite admission and folder changes,
+    // including a change while the final page is in flight. One clean pass
+    // after the latest change must suffice to clear the durable pending bit.
+    for (outcome, moved, expected) in [
+        (page(Some(2)), true, scanning(2, true)),
+        (admission(1), false, scanning(2, true)),
+        (page(Some(3)), false, scanning(3, true)),
+        (admission(2), false, scanning(3, true)),
+        (page(None), true, FullSweep::Requested),
+        (page(Some(2)), false, scanning(2, false)),
+        (page(Some(3)), false, scanning(3, false)),
+        (page(None), false, FullSweep::Idle),
+    ] {
+        let mut dirty = BgDirty::default();
+        if moved {
+            dirty.folders.insert(FolderId::from_bytes([0xb5; 16]));
+        }
+        handle_bg_done(
+            &cx,
+            &mut publisher,
+            &mut disk,
+            &layout,
+            outcome,
+            dirty,
+            &mut model_check_due,
+            &mut retry_model,
+            &mut model_retry_at,
+            &mut model_retry_delay,
+            &mut embedder_retry_at,
+            &mut repair_at,
+            &mut repair_delay,
+        )
+        .await
+        .unwrap();
+        let current = disk.as_ref().unwrap();
+        assert_eq!(current.sweep, expected);
+        assert_eq!(
+            current.manifest.embeddings_pending,
+            expected != FullSweep::Idle
+        );
+    }
+    let saved = layout.search_manifest().unwrap().unwrap();
+    assert!(!saved.embeddings_pending);
+    assert_eq!(
+        saved.remote_admission,
+        Some(ContentDigest::from_bytes([2; 32]))
+    );
 
     publisher.replace(None);
     drop(disk);
@@ -1971,8 +1942,7 @@ async fn failed_embedder_load_respects_retry_backoff_without_busy_spin() {
         embedder: None,
         dirty_notes: BTreeSet::from([NoteId::from_bytes([0xf6; 16])]),
         cached_vectors: HashMap::new(),
-        full_sweep_after: None,
-        full_sweep_needed: true,
+        sweep: FullSweep::Requested,
         last_activity: now,
         embedder_last_use: now,
         embedder_unavailable: true,
@@ -2072,7 +2042,7 @@ async fn failed_embedder_load_respects_retry_backoff_without_busy_spin() {
 }
 
 #[tokio::test]
-async fn folder_move_between_full_sweep_pages_resets_full_sweep_after() {
+async fn folder_moves_preserve_the_current_full_sweep_cursor() {
     use crate::{
         SearchDependencies, SearchEngine,
         config::{SearchConfig, VectorMode},
@@ -2144,8 +2114,10 @@ async fn folder_move_between_full_sweep_pages_resets_full_sweep_after() {
         embedder: None,
         dirty_notes: BTreeSet::new(),
         cached_vectors: HashMap::new(),
-        full_sweep_after: Some(NoteId::from_bytes([0x50; 16])),
-        full_sweep_needed: true,
+        sweep: FullSweep::Scanning {
+            after: NoteId::from_bytes([0x50; 16]),
+            repeat: false,
+        },
         last_activity: now,
         embedder_last_use: now,
         embedder_unavailable: false,
@@ -2182,14 +2154,16 @@ async fn folder_move_between_full_sweep_pages_resets_full_sweep_after() {
     )
     .await
     .unwrap();
-    assert!(disk.full_sweep_needed);
-    assert!(
-        disk.full_sweep_after.is_none(),
-        "folder move between FullSweep pages must restart sweep from the beginning"
+    assert_eq!(
+        disk.sweep,
+        FullSweep::Scanning {
+            after: NoteId::from_bytes([0x50; 16]),
+            repeat: true
+        }
     );
     assert!(disk.manifest.embeddings_pending);
 
-    disk.full_sweep_after = Some(NoteId::from_bytes([0x60; 16]));
+    disk.sweep.finish_page(Some(NoteId::from_bytes([0x60; 16])));
     let restore_cursor = ChangeCursor { scope, after: seq3 };
     update::apply(
         &cx,
@@ -2211,11 +2185,14 @@ async fn folder_move_between_full_sweep_pages_resets_full_sweep_after() {
     )
     .await
     .unwrap();
-    assert!(disk.full_sweep_needed);
-    assert!(
-        disk.full_sweep_after.is_none(),
-        "folder restore between FullSweep pages must restart sweep from the beginning"
+    assert_eq!(
+        disk.sweep,
+        FullSweep::Scanning {
+            after: NoteId::from_bytes([0x60; 16]),
+            repeat: true
+        }
     );
+    assert!(disk.manifest.embeddings_pending);
 
     publisher.replace(None);
     drop(disk);
@@ -2700,8 +2677,7 @@ async fn reconcile_reopening_clears_stale_flag_when_non_reopening_bg_task_spawns
         embedder: None,
         dirty_notes: BTreeSet::new(),
         cached_vectors: HashMap::new(),
-        full_sweep_after: None,
-        full_sweep_needed: false,
+        sweep: FullSweep::Idle,
         last_activity: now,
         embedder_last_use: now,
         embedder_unavailable: true,
@@ -2798,8 +2774,7 @@ fn disabled_vector_mode_never_schedules_maintenance_wake_on_pending_manifest() {
         embedder: None,
         dirty_notes: BTreeSet::from([NoteId::from_bytes([0xf4; 16])]),
         cached_vectors: HashMap::new(),
-        full_sweep_after: None,
-        full_sweep_needed: true,
+        sweep: FullSweep::Requested,
         last_activity: now,
         embedder_last_use: now,
         embedder_unavailable: false,
@@ -2992,8 +2967,7 @@ async fn space_handle_idle_eviction_respects_pins_extra_refs_and_replace_if_live
         embedder: None,
         dirty_notes: BTreeSet::new(),
         cached_vectors: HashMap::new(),
-        full_sweep_after: None,
-        full_sweep_needed: false,
+        sweep: FullSweep::Idle,
         last_activity: now,
         embedder_last_use: now,
         embedder_unavailable: false,

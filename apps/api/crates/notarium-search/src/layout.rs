@@ -459,7 +459,7 @@ impl SearchLayout {
         self.check_scope(&manifest.scope)?;
         manifest.generation()?;
         let path = &manifest.active_index_dir;
-        check_regular_entries(&self.tantivy.open_dir_nofollow(path)?)?;
+        check_entries(&self.tantivy.open_dir_nofollow(path)?, |_| false)?;
         Ok(self.tantivy_path.join(path))
     }
 
@@ -481,7 +481,7 @@ impl SearchLayout {
 
     pub fn model_epoch(&self, model: &VectorModel) -> Result<PathBuf, LayoutError> {
         let name = model_epoch_name(model);
-        check_regular_entries(&open_or_create(&self.vector, &name)?)?;
+        check_entries(&open_or_create(&self.vector, &name)?, is_repair_directory)?;
         Ok(self.vector_path.join(name))
     }
 
@@ -494,7 +494,7 @@ impl SearchLayout {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         };
-        check_regular_entries(&dir)?;
+        check_entries(&dir, is_repair_directory)?;
         let Some(manifest) = read_manifest::<EpochManifest>(&dir, EPOCH_MANIFEST)? else {
             return Ok(None);
         };
@@ -511,7 +511,7 @@ impl SearchLayout {
         self.check_scope(&manifest.scope)?;
         manifest.validate()?;
         let dir = open_or_create(&self.vector, &model_epoch_name(&manifest.model))?;
-        check_regular_entries(&dir)?;
+        check_entries(&dir, is_repair_directory)?;
         write_manifest(&dir, EPOCH_MANIFEST, manifest)
     }
 
@@ -544,11 +544,36 @@ pub fn model_epoch_name(model: &VectorModel) -> String {
     hash.finalize().to_hex()[..16].to_owned()
 }
 
-fn check_regular_entries(dir: &Dir) -> Result<(), LayoutError> {
+pub(crate) fn repair_directory_name(pid: u32, serial: u64) -> String {
+    format!(".repair-{pid}-{serial}.tmp")
+}
+
+pub(crate) fn is_repair_directory(name: &str) -> bool {
+    let Some((pid, serial)) = name
+        .strip_prefix(".repair-")
+        .and_then(|s| s.strip_suffix(".tmp"))
+        .and_then(|s| s.split_once('-'))
+    else {
+        return false;
+    };
+    let (Ok(pid), Ok(serial)) = (pid.parse::<u32>(), serial.parse::<u64>()) else {
+        return false;
+    };
+    pid != 0 && name == repair_directory_name(pid, serial)
+}
+
+fn check_entries(dir: &Dir, allow_directory: fn(&str) -> bool) -> Result<(), LayoutError> {
     for entry in dir.entries()? {
-        if !entry?.file_type()?.is_file() {
-            return Err(LayoutError::Corrupt);
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        // A private staging directory may be publishing or discarding files.
+        // The manifest never references its children, so do not traverse it.
+        if kind.is_file()
+            || (kind.is_dir() && entry.file_name().to_str().is_some_and(allow_directory))
+        {
+            continue;
         }
+        return Err(LayoutError::Corrupt);
     }
     Ok(())
 }
@@ -773,6 +798,16 @@ mod tests {
             vector_replay_after: None,
             embeddings_pending: false,
         };
+        let fake_staging = layout
+            .index_dir(&manifest)
+            .unwrap()
+            .join(repair_directory_name(1, 0));
+        fs::create_dir(&fake_staging).unwrap();
+        assert!(matches!(
+            layout.publish_search(&manifest),
+            Err(LayoutError::Corrupt)
+        ));
+        fs::remove_dir(fake_staging).unwrap();
         layout.publish_search(&manifest).unwrap();
         layout.create_index_generation(2).unwrap();
         drop(layout);
@@ -803,6 +838,28 @@ mod tests {
                 .search_manifest(),
             Err(LayoutError::WrongHistory)
         ));
+    }
+
+    #[test]
+    fn only_canonical_repair_directory_names_are_owned() {
+        for name in [
+            repair_directory_name(1, 0),
+            repair_directory_name(u32::MAX, u64::MAX),
+        ] {
+            assert!(is_repair_directory(&name));
+        }
+        for name in [
+            ".repair-0-0.tmp",
+            ".repair-01-0.tmp",
+            ".repair-1-00.tmp",
+            ".repair-+1-2.tmp",
+            ".repair-1-+2.tmp",
+            ".repair-1-2-3.tmp",
+            ".repair-1-18446744073709551616.tmp",
+            ".repair-user-backup.tmp",
+        ] {
+            assert!(!is_repair_directory(name), "{name}");
+        }
     }
 
     #[test]

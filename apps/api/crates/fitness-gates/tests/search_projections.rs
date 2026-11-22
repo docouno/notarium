@@ -1127,6 +1127,34 @@ async fn session_user(control: &ControlService, token: &SecretString) -> EngineA
         .unwrap()
 }
 
+async fn published_semantic_query(
+    search: &SearchEngine,
+    owner: &SpaceContext,
+    query: SearchQuery,
+) -> SearchResult {
+    // The manifest is durable before the worker publishes the matching reader.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let ctx = SpaceContext::new(
+                owner.auth().clone(),
+                owner.scope().clone(),
+                maintenance_ctx(ServicePurpose::Search).budget,
+            )
+            .unwrap();
+            let result = search.search(ctx, query.clone()).await.unwrap();
+            match result.degraded {
+                Some(notarium_core::ports::SearchDegradation::EmbeddingsPending) => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                None => return result,
+                other => panic!("unexpected remote search degradation: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("remote repair must reach the published reader")
+}
+
 async fn wait_remote_sweep(layout: &SearchLayout, revision: ContentDigest) {
     tokio::time::timeout(Duration::from_secs(20), async {
         loop {
@@ -1520,19 +1548,28 @@ async fn exercise_provider_e2e(
 
     // Semantic query without lexical overlap proves end-to-end vector indexing
     // and query embedding via ProviderService + ControlService.
+    let query_context = || {
+        SpaceContext::new(
+            owner_space.auth().clone(),
+            owner_space.scope().clone(),
+            budget(),
+        )
+        .unwrap()
+    };
     let project_query = |text: &str| SearchQuery {
         folder: Some(project.folder_id.clone()),
         ..query(&space_record.scope, note_receipt.seq(), text)
     };
-    let found = search
-        .search(owner_space.clone(), project_query("unrelatedsemanticquery"))
-        .await
-        .unwrap();
-    assert!(found.degraded.is_none());
+    let found = published_semantic_query(
+        &search,
+        &owner_space,
+        project_query("unrelatedsemanticquery"),
+    )
+    .await;
     assert_eq!(ids(&found), [&note_id]);
     assert!(ollama_requests.load(Ordering::SeqCst) >= 2);
     let lexical = search
-        .search(owner_space.clone(), project_query("contribution"))
+        .search(query_context(), project_query("contribution"))
         .await
         .unwrap();
     assert!(ids(&lexical).contains(&&former_note));
@@ -1555,13 +1592,10 @@ async fn exercise_provider_e2e(
     let revision = || provider.search_indexing_revision(&search_authority, &space_id, budget());
     wait_remote_sweep(&layout, revision().await.unwrap()).await;
     let semantic = || project_query("unrelatedsemanticquery");
-    let found = search
-        .search(owner_space.clone(), semantic())
-        .await
-        .unwrap();
-    assert!(ids(&found).contains(&&former_note));
+    let found = published_semantic_query(&search, &owner_space, semantic()).await;
     let allowed_inputs = author_inputs.load(Ordering::SeqCst);
     assert!(allowed_inputs > 0);
+    assert!(ids(&found).contains(&&former_note));
     let disable = |disabled, expected| {
         let mut identity = account_command(&author.value.id, expected);
         identity.actor = owner_id.clone();
@@ -1578,13 +1612,8 @@ async fn exercise_provider_e2e(
     };
     let disabled = disable(true, contributor_personal.revision).await.unwrap();
     wait_remote_sweep(&layout, revision().await.unwrap()).await;
-    assert_eq!(
-        ids(&search
-            .search(owner_space.clone(), semantic())
-            .await
-            .unwrap()),
-        [&note_id]
-    );
+    let found = published_semantic_query(&search, &owner_space, semantic()).await;
+    assert_eq!(ids(&found), [&note_id]);
     assert_eq!(author_inputs.load(Ordering::SeqCst), allowed_inputs);
     search.shutdown().await;
 
@@ -1593,10 +1622,7 @@ async fn exercise_provider_e2e(
     disable(false, disabled.revision).await.unwrap();
     let restarted = start_search();
     wait_remote_sweep(&layout, revision().await.unwrap()).await;
-    let found = restarted
-        .search(owner_space.clone(), semantic())
-        .await
-        .unwrap();
+    let found = published_semantic_query(&restarted, &owner_space, semantic()).await;
     assert!(ids(&found).contains(&&former_note));
     assert_eq!(
         layout.search_manifest().unwrap().unwrap().vector_seq,

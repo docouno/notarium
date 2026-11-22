@@ -113,25 +113,34 @@ impl OverlayHits {
         &self,
         mut strict: Vec<LexicalHit>,
         mut fallback: Vec<LexicalHit>,
+        candidate_limit: usize,
         floor: usize,
         browse: bool,
     ) -> Vec<LexicalHit> {
+        let note_order = |left: &LexicalHit, right: &LexicalHit| match (&left.key, &right.key) {
+            (HitKey::Note(a), HitKey::Note(b)) => a.cmp(b),
+            _ => Ordering::Equal,
+        };
+        let score_order = |left: &LexicalHit, right: &LexicalHit| {
+            right
+                .score
+                .total_cmp(&left.score)
+                .then_with(|| note_order(left, right))
+        };
         if !self.strict.is_empty() {
             strict.extend_from_slice(&self.strict);
             if browse {
-                strict.sort_by(|left, right| match (&left.key, &right.key) {
-                    (HitKey::Note(a), HitKey::Note(b)) => a.cmp(b),
-                    _ => Ordering::Equal,
-                });
+                strict.sort_by(note_order);
             } else {
-                strict.sort_by(|left, right| right.score.total_cmp(&left.score));
+                strict.sort_by(score_order);
             }
         }
-        let missing = floor.saturating_sub(strict.len());
+        strict.truncate(candidate_limit);
+        let missing = floor.min(candidate_limit).saturating_sub(strict.len());
         if missing != 0 {
             if !self.fallback.is_empty() {
                 fallback.extend_from_slice(&self.fallback);
-                fallback.sort_by(|left, right| right.score.total_cmp(&left.score));
+                fallback.sort_by(score_order);
             }
             strict.extend(fallback.into_iter().take(missing));
         }
@@ -444,6 +453,7 @@ impl LexicalIndex {
             return Ok(overlay.merge(
                 collect_browse(searcher, filter, candidate_limit)?,
                 Vec::new(),
+                candidate_limit,
                 0,
                 true,
             ));
@@ -482,7 +492,7 @@ impl LexicalIndex {
             Vec::new()
         };
         let strict = ranked.into_iter().map(decode).collect::<Result<_, _>>()?;
-        Ok(overlay.merge(strict, fallback, floor, false))
+        Ok(overlay.merge(strict, fallback, candidate_limit, floor, false))
     }
 
     pub(crate) fn chat_page(

@@ -167,17 +167,32 @@ impl SegmentFilter {
                 .is_some_and(|class| class < 64 && filter.classes & (1 << class) != 0)
     }
 
-    fn admits(&mut self, filter: &LexicalFilter<'_>, doc: DocId) -> Result<bool, LexicalError> {
-        if !self.admits_folder(filter, doc) {
-            return Ok(false);
+    fn scored_hit(
+        &mut self,
+        filter: &LexicalFilter<'_>,
+        score: Score,
+        address: DocAddress,
+        tied_floor: Option<&WorstFirst>,
+    ) -> Result<Option<WorstFirst>, LexicalError> {
+        let doc = address.doc_id;
+        if !self.admits_folder(filter, doc)
+            || (filter.include_chats && tied_floor.is_some_and(|worst| address >= worst.address))
+        {
+            return Ok(None);
         }
+        let mut hit = WorstFirst {
+            score,
+            address,
+            note: Vec::new(),
+        };
         match self.kind.first(doc) {
-            Some(CHAT) => Ok(filter.include_chats
+            Some(CHAT) => Ok((filter.include_chats
                 && self
                     .chat_owners
                     .as_ref()
                     .and_then(|column| column.first(doc))
-                    .is_none_or(|owner| self.viewer_ord == Some(owner))),
+                    .is_none_or(|owner| self.viewer_ord == Some(owner)))
+            .then_some(hit)),
             Some(NOTE)
                 if self
                     .class
@@ -185,30 +200,57 @@ impl SegmentFilter {
                     .is_some_and(|class| class < 64 && filter.classes & (1 << class) != 0) =>
             {
                 let Some(column) = &self.notes else {
-                    return Ok(false);
+                    return Ok(None);
                 };
                 let Some(ord) = column.ords().first(doc) else {
-                    return Ok(false);
+                    return Ok(None);
                 };
-                if let Some(mask) = &self.note_mask {
-                    return Ok(u32::try_from(ord).is_ok_and(|ord| mask.contains(ord)));
+                if let Some(mask) = &self.note_mask
+                    && !u32::try_from(ord).is_ok_and(|ord| mask.contains(ord))
+                {
+                    return Ok(None);
                 }
-                if !column.ord_to_bytes(ord, &mut self.note_bytes)? {
-                    return Ok(false);
+                // Within a segment the dictionary ordinal is the note ID sort
+                // order. Prune tied scores before decoding or checking visibility.
+                if !filter.include_chats
+                    && let Some(worst) = tied_floor
+                    && worst.address.segment_ord == address.segment_ord
+                    && column
+                        .ords()
+                        .first(worst.address.doc_id)
+                        .is_some_and(|last| ord >= last)
+                {
+                    return Ok(None);
                 }
-                filter.admits_note(&self.note_bytes)
+                if (!filter.include_chats || self.note_mask.is_none())
+                    && !column.ord_to_bytes(ord, &mut self.note_bytes)?
+                {
+                    return Ok(None);
+                }
+                if !filter.include_chats
+                    && tied_floor.is_some_and(|worst| self.note_bytes >= worst.note)
+                {
+                    return Ok(None);
+                }
+                if self.note_mask.is_none() && !filter.admits_note(&self.note_bytes)? {
+                    return Ok(None);
+                }
+                if !filter.include_chats {
+                    hit.note = self.note_bytes.clone();
+                }
+                Ok(Some(hit))
             }
-            _ => Ok(false),
+            _ => Ok(None),
         }
     }
 }
 
-/// Orders worst candidate first so a `BinaryHeap` maintains the global top-K
-/// floor: higher scores are better, and smaller `DocAddress` breaks ties.
-#[derive(Clone, Copy)]
+/// Higher scores and smaller note IDs win. Chat pagination uses its pinned
+/// document address to break ties.
 struct WorstFirst {
     score: Score,
     address: DocAddress,
+    note: Vec<u8>,
 }
 
 impl PartialEq for WorstFirst {
@@ -230,6 +272,7 @@ impl Ord for WorstFirst {
         other
             .score
             .total_cmp(&self.score)
+            .then_with(|| self.note.cmp(&other.note))
             .then_with(|| self.address.cmp(&other.address))
     }
 }
@@ -273,16 +316,20 @@ pub(super) fn collect_top_scored(
                         || (score.total_cmp(&last_score) == Ordering::Equal
                             && address > last_address)
                 });
-                if after_cursor {
-                    let candidate = WorstFirst { score, address };
-                    let can_enter =
-                        heap.len() < limit || heap.peek().is_some_and(|worst| candidate < *worst);
-                    if can_enter && fields.admits(filter, doc)? {
-                        if heap.len() < limit {
-                            heap.push(candidate);
-                        } else if let Some(mut worst) = heap.peek_mut() {
-                            *worst = candidate;
-                        }
+                let floor = heap.peek().filter(|_| heap.len() == limit);
+                if after_cursor
+                    && floor.is_none_or(|worst| score.total_cmp(&worst.score) != Ordering::Less)
+                    && let Some(candidate) = fields.scored_hit(
+                        filter,
+                        score,
+                        address,
+                        floor.filter(|worst| score.total_cmp(&worst.score) == Ordering::Equal),
+                    )?
+                {
+                    if heap.len() < limit {
+                        heap.push(candidate);
+                    } else if let Some(mut worst) = heap.peek_mut() {
+                        *worst = candidate;
                     }
                 }
             }

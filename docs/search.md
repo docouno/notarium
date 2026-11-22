@@ -22,8 +22,10 @@ before shutting down canonical storage.
   back to single-clause matching only when fewer than `min(top_k, 10)` hits
   satisfy the quorum. Notes count strict matches across the indexed and receipt
   revisions together. When that leaves fallback slots, the highest BM25 scores
-  across both sources fill them. Both use term document frequencies, average field
-  lengths and corpus size across their pinned segments. As with ordinary
+  across both sources fill them. Both sources share one lexical candidate limit
+  before rank fusion. Tied note scores use ascending note ID. Scores use term
+  document frequencies, average field lengths and corpus size across the pinned
+  segments of both sources. As with ordinary
   Tantivy searches, a segment merge can change scores by removing postings
   for superseded revisions. Chats count matches on the currently visible branch.
   Both paths observe the request deadline and cancellation.
@@ -170,9 +172,11 @@ background model maintenance checks a durable witness of the Space admission
 epoch and member account authorization versions. A changed witness schedules a
 paged vector repair that checks each author's current membership and consent.
 The manifest records the witness together with pending work so an interrupted
-repair resumes on restart. Local model epochs and interactive query embedding
-do not read this witness. Interactive requests
-recheck the default recipient when they leave the queue. Control verifies the
+repair resumes on restart. While a pass is running, new admission changes or
+remote folder moves preserve its cursor and schedule one more pass over the
+Space. After a restart, pending repairs start from the first page. Local model
+epochs and interactive query embedding do not read this witness. Interactive
+requests recheck the default recipient when they leave the queue. Control verifies the
 effective default again while admitting interactive queries and background
 parts. Changing the default recipient drains in-flight implicit calls for the
 affected Space before the preference commits. Explicit calls retain their
