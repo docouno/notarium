@@ -9,6 +9,7 @@ mod schema;
 pub(crate) use analysis::ChunkRelevance;
 pub use analysis::{TOKENIZER_VERSION, extract_note_body};
 pub use collector::LexicalFilter;
+pub(crate) use pool::IdleReaderOwner;
 pub use pool::{ReaderCache, SeedLease, WriterPool};
 
 use self::{

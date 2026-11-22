@@ -21,7 +21,10 @@ use std::{
     sync::Arc,
 };
 
-pub(super) async fn requires_scrub(disk: &Disk, changes: &[Change]) -> Result<bool, IndexError> {
+pub(super) async fn requires_scrub(
+    lexical: &Arc<crate::lexical::LexicalIndex>,
+    changes: &[Change],
+) -> Result<bool, IndexError> {
     let mut encrypted_notes = Vec::new();
     for change in changes {
         if change.kind == ChangeKind::Purge || change.lifecycle == Lifecycle::Purged {
@@ -36,7 +39,7 @@ pub(super) async fn requires_scrub(disk: &Disk, changes: &[Change]) -> Result<bo
     if encrypted_notes.is_empty() {
         return Ok(false);
     }
-    let lexical = disk.lexical.clone().ok_or(IndexError::Inconsistent)?;
+    let lexical = lexical.clone();
     tokio::task::spawn_blocking(move || -> Result<bool, IndexError> {
         let searcher = lexical.searcher();
         for note in &encrypted_notes {
@@ -53,6 +56,7 @@ pub(super) async fn requires_scrub(disk: &Disk, changes: &[Change]) -> Result<bo
 pub(super) async fn apply(
     cx: &Context<'_>,
     disk: &mut Disk,
+    lexical: &Arc<crate::lexical::LexicalIndex>,
     publisher: &mut Publisher<'_>,
     cutoff: ChangeCursor,
     changes: Vec<Change>,
@@ -110,11 +114,11 @@ pub(super) async fn apply(
         }
         disk.manifest.tantivy_seq = cutoff.after;
         disk.publish_manifest().await?;
-        publisher.publish(disk, reopening);
+        publisher.publish_with(disk, lexical, reopening);
         return Ok(());
     }
 
-    let lexical = disk.lexical.clone().ok_or(IndexError::Inconsistent)?;
+    let lexical = lexical.clone();
     let folders = Arc::make_mut(&mut disk.folders);
     let old_folder_count = folders.len();
     for folder in active_folders {
@@ -327,7 +331,7 @@ pub(super) async fn apply(
     disk.manifest.tantivy_seq = cutoff.after;
     // Publishing the cut certifies that any redacted files have been removed.
     disk.publish_manifest().await?;
-    publisher.publish(disk, reopening);
+    publisher.publish_with(disk, &lexical, reopening);
     Ok(())
 }
 

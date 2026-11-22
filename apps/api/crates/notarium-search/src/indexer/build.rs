@@ -61,7 +61,7 @@ pub(super) async fn seed_lexical(
     cx: &Context<'_>,
     layout: Arc<SearchLayout>,
     cutoff: &ChangeCursor,
-) -> Result<Disk, IndexError> {
+) -> Result<(Disk, Arc<LexicalIndex>), IndexError> {
     let space = cx
         .services
         .deps
@@ -72,8 +72,9 @@ pub(super) async fn seed_lexical(
 
     let layout_init = layout.clone();
     let readers = cx.services.readers.clone();
+    let owner = cx.reader_owner();
     let root_folder = space.root_folder_id;
-    let (generation, mut folders, lexical) = tokio::task::spawn_blocking(move || {
+    let (generation, mut folders, lexical_path, lexical) = tokio::task::spawn_blocking(move || {
         let generation = layout_init
             .index_generations()?
             .last()
@@ -86,14 +87,14 @@ pub(super) async fn seed_lexical(
         folders.insert(root_folder)?;
         save_new_folders(&layout_init, &folders, before)?;
         let path = layout_init.create_index_generation(generation)?;
-        let lexical = match readers.create(&path) {
+        let lexical = match readers.create_owned(&path, owner) {
             Ok(lexical) => lexical,
             Err(error) => {
                 let _ = layout_init.remove_index_generation(generation);
                 return Err(error.into());
             }
         };
-        Ok::<_, IndexError>((generation, folders, lexical))
+        Ok::<_, IndexError>((generation, folders, path, lexical))
     })
     .await
     .map_err(|_| IndexError::Inconsistent)??;
@@ -124,21 +125,25 @@ pub(super) async fn seed_lexical(
             vector_seq: None,
             embeddings_pending: !matches!(cx.services.config.vector_mode, VectorMode::Disabled),
         };
-        Ok::<_, IndexError>(Disk {
-            layout: layout.clone(),
-            manifest,
-            folders: Arc::new(folders),
-            lexical: Some(lexical),
-            epoch: None,
-            embedder: None,
-            dirty_notes: BTreeSet::new(),
-            cached_vectors: HashMap::new(),
-            full_sweep_after: None,
-            full_sweep_needed: false,
-            last_activity: now,
-            embedder_last_use: now,
-            embedder_unavailable: false,
-        })
+        Ok::<_, IndexError>((
+            Disk {
+                layout: layout.clone(),
+                manifest,
+                folders: Arc::new(folders),
+                lexical_path,
+                lexical_idle_retired: false,
+                epoch: None,
+                embedder: None,
+                dirty_notes: BTreeSet::new(),
+                cached_vectors: HashMap::new(),
+                full_sweep_after: None,
+                full_sweep_needed: false,
+                last_activity: now,
+                embedder_last_use: now,
+                embedder_unavailable: false,
+            },
+            lexical,
+        ))
     }
     .await;
     if result.is_err() {
@@ -450,8 +455,12 @@ pub(super) async fn publish_seed(
     cx: &Context<'_>,
     publisher: &mut Publisher<'_>,
     disk: &Disk,
+    lexical: Option<&Arc<LexicalIndex>>,
 ) -> Result<(), IndexError> {
-    publisher.publish(disk, false);
+    match lexical {
+        Some(lexical) => publisher.publish_with(disk, lexical, false),
+        None => publisher.publish_if_live(disk, false),
+    }
     publisher.drain().await;
     let active = disk.manifest.generation()?;
     let layout = disk.layout.clone();

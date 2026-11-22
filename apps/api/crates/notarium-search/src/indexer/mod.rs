@@ -32,6 +32,7 @@ use notarium_core::{
 };
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
+    path::PathBuf,
     sync::{
         Arc, Mutex, Weak,
         atomic::{AtomicU64, Ordering},
@@ -150,6 +151,10 @@ struct Context<'a> {
 }
 
 impl Context<'_> {
+    fn reader_owner(&self) -> Weak<dyn crate::lexical::IdleReaderOwner> {
+        Arc::downgrade(self.handle) as Weak<dyn crate::lexical::IdleReaderOwner>
+    }
+
     fn budget(&self) -> CallBudget {
         new_budget(&self.handle.stop)
     }
@@ -229,7 +234,8 @@ struct Disk {
     layout: Arc<SearchLayout>,
     manifest: SearchManifest,
     folders: Arc<FolderDictionary>,
-    lexical: Option<Arc<LexicalIndex>>,
+    lexical_path: PathBuf,
+    lexical_idle_retired: bool,
     epoch: Option<VectorEpoch>,
     embedder: Option<Arc<crate::model::Embedder>>,
     dirty_notes: BTreeSet<NoteId>,
@@ -271,26 +277,38 @@ impl Disk {
         self.epoch.is_some() && self.embedder.is_some() && self.has_pending_embeddings()
     }
 
-    async fn resume_reader(&mut self, cx: &Context<'_>) -> Result<bool, IndexError> {
-        if self.lexical.is_some() {
-            return Ok(false);
+    async fn resume_reader(
+        &mut self,
+        cx: &Context<'_>,
+    ) -> Result<(Arc<LexicalIndex>, bool), IndexError> {
+        let owner = cx.reader_owner();
+        if let Some(existing) = cx
+            .services
+            .readers
+            .get_owned(&self.lexical_path, owner.clone())?
+        {
+            self.lexical_idle_retired = false;
+            self.last_activity = Instant::now();
+            let needs_publish = !cx.handle.is_published();
+            return Ok((existing, needs_publish));
         }
         let readers = cx.services.readers.clone();
         let layout = self.layout.clone();
         let manifest = self.manifest.clone();
-        let reader = tokio::task::spawn_blocking(move || {
+        let (dir, reader) = tokio::task::spawn_blocking(move || {
             let dir = layout.index_dir(&manifest)?;
-            let reader = readers.open(&dir)?;
+            let reader = readers.open_owned(&dir, owner)?;
             if reader.commit_id()? != manifest.tantivy_commit {
                 return Err(IndexError::Inconsistent);
             }
-            Ok::<_, IndexError>(reader)
+            Ok::<_, IndexError>((dir, reader))
         })
         .await
         .map_err(|_| IndexError::Inconsistent)??;
-        self.lexical = Some(reader);
+        self.lexical_path = dir;
+        self.lexical_idle_retired = false;
         self.last_activity = Instant::now();
-        Ok(true)
+        Ok((reader, true))
     }
 
     fn release_idle_embedder(&mut self, now: Instant, idle: Duration) -> bool {
@@ -400,20 +418,11 @@ enum AdvanceOutcome {
 
 struct Publisher<'a> {
     handle: &'a SpaceHandle,
-    old: Vec<Weak<Published>>,
 }
 
 impl Publisher<'_> {
-    fn replace(&mut self, next: Option<Arc<Published>>) {
-        self.old.retain(|state| state.strong_count() != 0);
-        if let Some(previous) = self.handle.replace(next) {
-            self.old.push(Arc::downgrade(&previous));
-        }
-    }
-
-    fn publish(&mut self, disk: &Disk, reopening: bool) {
-        let Some(lexical) = &disk.lexical else { return };
-        self.replace(Some(Arc::new(Published {
+    fn snapshot(disk: &Disk, lexical: &Arc<LexicalIndex>, reopening: bool) -> Published {
+        Published {
             scope: disk.manifest.scope.clone(),
             seq: disk.manifest.tantivy_seq,
             lexical: lexical.clone(),
@@ -426,15 +435,28 @@ impl Publisher<'_> {
             reopening_vectors: reopening
                 || (disk.manifest.vector_seq.is_some() && disk.epoch.is_none()),
             embedder_unavailable: disk.embedder_unavailable,
-        })));
+        }
+    }
+
+    fn replace(&mut self, next: Option<Arc<Published>>) {
+        let _ = self.handle.replace(next);
+    }
+
+    fn publish_with(&mut self, disk: &Disk, lexical: &Arc<LexicalIndex>, reopening: bool) {
+        self.replace(Some(Arc::new(Self::snapshot(disk, lexical, reopening))));
+    }
+
+    fn publish_if_live(&mut self, disk: &Disk, reopening: bool) {
+        self.handle
+            .replace_if_live(|lexical| Self::snapshot(disk, lexical, reopening));
+    }
+
+    fn retire_if_idle(&mut self) -> bool {
+        self.handle.retire_if_idle()
     }
 
     async fn drain(&mut self) {
-        self.old.retain(|state| state.strong_count() != 0);
-        while !self.old.is_empty() {
-            sleep(Duration::from_millis(2)).await;
-            self.old.retain(|state| state.strong_count() != 0);
-        }
+        self.handle.drain_published().await;
     }
 }
 
@@ -477,10 +499,7 @@ pub(super) async fn run(
         services: &services,
         handle: &handle,
     };
-    let mut publisher = Publisher {
-        handle: &handle,
-        old: Vec::new(),
-    };
+    let mut publisher = Publisher { handle: &handle };
     loop {
         if handle.stop.is_cancelled() {
             break;
@@ -577,7 +596,11 @@ async fn consume(
         }
     }
 
-    let disk = open_disk(cx, publisher, layout.clone(), record.last_seq).await?;
+    let (disk, initial_lexical) =
+        match open_disk(cx, publisher, layout.clone(), record.last_seq).await? {
+            Some((disk, lexical)) => (Some(disk), Some(lexical)),
+            None => (None, None),
+        };
     let start = disk
         .as_ref()
         .map(Disk::cursor)
@@ -601,6 +624,7 @@ async fn consume(
         &scope,
         schedule,
         disk,
+        initial_lexical,
         subscription,
         delivered,
         &mut bg,
@@ -619,6 +643,7 @@ async fn run_active_loop(
     scope: &HistoryScope,
     schedule: Schedule,
     mut disk: Option<Disk>,
+    mut initial_lexical: Option<Arc<LexicalIndex>>,
     mut subscription: Box<dyn ChangeSubscription>,
     mut delivered: SpaceSeq,
     bg: &mut Option<BgTask>,
@@ -646,7 +671,13 @@ async fn run_active_loop(
             schedule.embedder_idle,
             false,
         )?;
-        publisher.publish(current, bg.as_ref().is_some_and(BgTask::is_reopening));
+        if let Some(lexical) = initial_lexical.take() {
+            publisher.publish_with(
+                current,
+                &lexical,
+                bg.as_ref().is_some_and(BgTask::is_reopening),
+            );
+        }
     }
 
     let mut ticker = interval(schedule.tick);
@@ -854,9 +885,11 @@ async fn run_active_loop(
                         .map_err(|_| IndexError::Inconsistent)??;
                     return Ok(Some(latest.scope));
                 }
-                let needs_advance = disk
-                    .as_ref()
-                    .is_none_or(|d| d.lexical.is_none() || d.manifest.tantivy_seq < latest.after);
+                let needs_advance = disk.as_ref().is_none_or(|d| {
+                    d.lexical_idle_retired
+                        || !cx.handle.is_published()
+                        || d.manifest.tantivy_seq < latest.after
+                });
                 if needs_advance {
                     match advance_to(
                         cx,
@@ -912,32 +945,40 @@ async fn run_active_loop(
                         current.last_activity = now;
                         current.embedder_last_use = now;
                     } else if bg.is_none() {
-                        if current.lexical.is_some()
+                        let mut active_now = false;
+                        if !current.lexical_idle_retired
                             && now.saturating_duration_since(current.last_activity)
                                 >= schedule.lexical_idle
                         {
-                            current.lexical.take();
-                            publisher.replace(None);
+                            if publisher.retire_if_idle() {
+                                current.lexical_idle_retired = true;
+                            } else {
+                                current.last_activity = now;
+                                current.embedder_last_use = now;
+                                active_now = true;
+                            }
                         }
-                        if current.release_idle_embedder(now, schedule.embedder_idle)
-                            && current.lexical.is_some()
-                        {
-                            publisher.publish(current, false);
-                        }
-                        let has_immediate_repair = current.epoch.is_some()
-                            && current.has_pending_embeddings()
-                            && repair_delay < Duration::from_secs(30);
-                        if !has_immediate_repair
-                            && cx.handle.idle_elapsed() >= schedule.worker_idle
-                            && try_evict_idle_worker(
-                                workers,
-                                &scope.space_id,
-                                cx.handle,
-                                schedule.worker_idle,
-                            )
-                        {
-                            drop(disk.take());
-                            return Ok(None);
+                        if !active_now {
+                            if current.release_idle_embedder(now, schedule.embedder_idle)
+                                && !current.lexical_idle_retired
+                            {
+                                publisher.publish_if_live(current, false);
+                            }
+                            let has_immediate_repair = current.epoch.is_some()
+                                && current.has_pending_embeddings()
+                                && repair_delay < Duration::from_secs(30);
+                            if !has_immediate_repair
+                                && cx.handle.idle_elapsed() >= schedule.worker_idle
+                                && try_evict_idle_worker(
+                                    workers,
+                                    &scope.space_id,
+                                    cx.handle,
+                                    schedule.worker_idle,
+                                )
+                            {
+                                drop(disk.take());
+                                return Ok(None);
+                            }
                         }
                     }
                     if now >= model_retry_at
@@ -952,7 +993,7 @@ async fn run_active_loop(
         }
 
         if let Some(current) = &mut disk
-            && current.lexical.is_some()
+            && !current.lexical_idle_retired
             && bg.is_none()
         {
             let spawned = spawn_bg_if_ready(
@@ -1109,15 +1150,9 @@ fn reconcile_reopening(
     spawned: bool,
 ) {
     if spawned && bg.as_ref().is_some_and(BgTask::is_reopening) {
-        publisher.publish(current, true);
-    } else if publisher
-        .handle
-        .published
-        .load()
-        .as_ref()
-        .is_some_and(|published| published.reopening_vectors)
-    {
-        publisher.publish(current, false);
+        publisher.publish_if_live(current, true);
+    } else if publisher.handle.is_reopening_vectors() {
+        publisher.publish_if_live(current, false);
     }
 }
 
@@ -1134,7 +1169,7 @@ fn next_maintenance_wake(
     if bg_active || !vectors_enabled {
         return None;
     }
-    let disk = disk.filter(|d| d.lexical.is_some())?;
+    let disk = disk.filter(|d| !d.lexical_idle_retired)?;
     let repair_wake_at = (disk.epoch.is_some() && disk.has_pending_embeddings())
         .then(|| {
             if disk.embedder.is_some() {
@@ -1164,7 +1199,8 @@ fn will_load_embedder(
     repair_at: Instant,
     embedder_idle: Duration,
 ) -> bool {
-    if bg.is_some() || disk.lexical.is_none() || disk.epoch.is_none() || disk.embedder.is_some() {
+    if bg.is_some() || disk.lexical_idle_retired || disk.epoch.is_none() || disk.embedder.is_some()
+    {
         return false;
     }
     if now < embedder_retry_at || disk.manifest.active_model.is_none() {
@@ -1202,7 +1238,7 @@ async fn advance_to(
 
     if !force_seed
         && let Some(current) = disk.as_ref()
-        && current.lexical.is_none()
+        && !cx.handle.is_published()
         && current.manifest.tantivy_seq < target.after
         && cx.cut_needs_scrub(&current.cursor(), true).await?
     {
@@ -1215,8 +1251,9 @@ async fn advance_to(
     }
 
     if !force_seed && let Some(current) = disk.as_mut() {
+        let mut worker_pin = Some(cx.handle.pin_worker());
         let resumed = match current.resume_reader(cx).await {
-            Ok(reopened) => {
+            Ok((lexical, reopened)) => {
                 if reopened {
                     let reopening = bg.as_ref().is_some_and(BgTask::is_reopening)
                         || will_load_embedder(
@@ -1227,25 +1264,28 @@ async fn advance_to(
                             *repair_at,
                             embedder_idle,
                         );
-                    publisher.publish(current, reopening);
+                    publisher.publish_with(current, &lexical, reopening);
                 }
-                true
+                Some(lexical)
             }
             Err(IndexError::Lexical(LexicalError::ReaderUnavailable))
                 if current.manifest.tantivy_seq < target.after
                     && cx.cut_needs_scrub(&current.cursor(), true).await? =>
             {
+                worker_pin.take();
                 cancel_bg(bg).await;
                 drop(disk.take());
                 build::scrub(cx, publisher, layout).await?;
                 scrubbed = true;
                 seed_at = Some(target.clone());
                 scrub = false;
-                false
+                None
             }
             Err(error) => return Err(error),
         };
-        if resumed && let Some(current) = disk.as_mut() {
+        if let Some(lexical) = resumed
+            && let Some(current) = disk.as_mut()
+        {
             let reopening = bg.as_ref().is_some_and(BgTask::is_reopening)
                 || will_load_embedder(
                     current,
@@ -1257,10 +1297,21 @@ async fn advance_to(
                 );
             let dirty = bg.as_mut().map(|task| &mut task.dirty);
             let catch_up_result = if current.manifest.tantivy_seq < target.after {
-                catch_up(cx, current, publisher, target.clone(), dirty, reopening).await
+                catch_up(
+                    cx,
+                    current,
+                    &lexical,
+                    publisher,
+                    target.clone(),
+                    dirty,
+                    reopening,
+                )
+                .await
             } else {
                 Ok(false)
             };
+            drop(lexical);
+            worker_pin.take();
             match catch_up_result {
                 Ok(false) => {}
                 Ok(true) => {
@@ -1306,10 +1357,17 @@ async fn advance_to(
                 scrubbed = true;
             }
         }
-        let seeded = build::seed_lexical(cx, layout.clone(), &cutoff).await?;
+        let (seeded, lexical) = build::seed_lexical(cx, layout.clone(), &cutoff).await?;
         seeded.publish_manifest().await?;
         *disk = Some(seeded);
-        build::publish_seed(cx, publisher, disk.as_ref().expect("lexical seed")).await?;
+        build::publish_seed(
+            cx,
+            publisher,
+            disk.as_ref().expect("lexical seed"),
+            Some(&lexical),
+        )
+        .await?;
+        drop(lexical);
         *model_check_due = true;
         *repair_at = Instant::now();
         *repair_delay = Duration::from_secs(1);
@@ -1330,7 +1388,7 @@ fn spawn_bg_if_ready(
     embedder_idle: Duration,
     prioritize_embed: bool,
 ) -> Result<bool, IndexError> {
-    if bg.is_some() || disk.lexical.is_none() {
+    if bg.is_some() || disk.lexical_idle_retired {
         return Ok(false);
     }
     let now = Instant::now();
@@ -1565,7 +1623,7 @@ async fn handle_bg_done(
             let will_load_embedder = current.epoch.is_some()
                 && current.embedder.is_none()
                 && current.manifest.active_model.is_some();
-            publisher.publish(current, will_load_embedder);
+            publisher.publish_if_live(current, will_load_embedder);
         }
         BgOutcome::LoadEmbedder(embedder) => {
             current.embedder = embedder;
@@ -1576,7 +1634,7 @@ async fn handle_bg_done(
                 current.embedder_unavailable = true;
                 *embedder_retry_at = Instant::now() + Duration::from_secs(5);
             }
-            publisher.publish(current, false);
+            publisher.publish_if_live(current, false);
         }
         BgOutcome::ModelRefresh(result) => match result {
             Ok(build::ModelRefreshOutcome::Unchanged) => {
@@ -1597,7 +1655,7 @@ async fn handle_bg_done(
                 current.full_sweep_needed = false;
                 current.full_sweep_after = None;
                 current.publish_manifest().await?;
-                build::publish_seed(cx, publisher, current).await?;
+                build::publish_seed(cx, publisher, current, None).await?;
                 *retry_model = false;
                 *model_retry_delay = Duration::from_secs(1);
             }
@@ -1611,7 +1669,7 @@ async fn handle_bg_done(
                 current.embedder = None;
                 current.embedder_unavailable = false;
                 current.publish_manifest().await?;
-                publisher.publish(current, false);
+                publisher.publish_if_live(current, false);
                 *retry_model = true;
                 *model_retry_at = Instant::now() + *model_retry_delay;
                 *model_retry_delay = (*model_retry_delay * 2).min(Duration::from_secs(300));
@@ -1681,7 +1739,7 @@ async fn handle_bg_done(
                 current.embedder_last_use = Instant::now();
                 current.embedder_unavailable = false;
                 current.publish_manifest().await?;
-                build::publish_seed(cx, publisher, current).await?;
+                build::publish_seed(cx, publisher, current, None).await?;
                 *retry_model = false;
                 *model_retry_delay = Duration::from_secs(1);
                 *repair_delay = Duration::from_secs(1);
@@ -1809,7 +1867,7 @@ async fn handle_bg_done(
                 }
                 if vectors_changed || previous_pending != pending {
                     current.publish_manifest().await?;
-                    publisher.publish(current, false);
+                    publisher.publish_if_live(current, false);
                 }
                 if had_transient_failure {
                     *repair_at = Instant::now() + *repair_delay;
@@ -1840,7 +1898,7 @@ async fn handle_bg_done(
                 .await
                 .map_err(|_| IndexError::Inconsistent)??;
                 current.epoch = Some(committed);
-                publisher.publish(current, false);
+                publisher.publish_if_live(current, false);
             }
             Err(VectorError::Cancelled) => {}
             Err(error) => return Err(IndexError::Vector(error)),
@@ -1856,7 +1914,7 @@ async fn handle_bg_done(
                 .await
                 .map_err(|_| IndexError::Inconsistent)??;
                 current.epoch = Some(committed);
-                publisher.publish(current, false);
+                publisher.publish_if_live(current, false);
                 publisher.drain().await;
                 let epoch = current.epoch.take().ok_or(IndexError::Inconsistent)?;
                 let collected = tokio::task::spawn_blocking(move || {
@@ -1878,6 +1936,7 @@ async fn handle_bg_done(
 async fn catch_up(
     cx: &Context<'_>,
     disk: &mut Disk,
+    lexical: &Arc<LexicalIndex>,
     publisher: &mut Publisher<'_>,
     target: ChangeCursor,
     mut dirty: Option<&mut BgDirty>,
@@ -1895,6 +1954,7 @@ async fn catch_up(
         if catch_up_to(
             cx,
             disk,
+            lexical,
             publisher,
             step_target,
             dirty.as_deref_mut(),
@@ -1911,6 +1971,7 @@ async fn catch_up(
 async fn catch_up_to(
     cx: &Context<'_>,
     disk: &mut Disk,
+    lexical: &Arc<LexicalIndex>,
     publisher: &mut Publisher<'_>,
     target: ChangeCursor,
     mut dirty: Option<&mut BgDirty>,
@@ -1941,7 +2002,7 @@ async fn catch_up_to(
         {
             return Err(IndexError::Inconsistent);
         }
-        if update::requires_scrub(disk, &page.changes).await? {
+        if update::requires_scrub(lexical, &page.changes).await? {
             return Ok(true);
         }
         tail.extend(page.changes);
@@ -1950,7 +2011,7 @@ async fn catch_up_to(
         if boundary != 0 {
             let pending = tail.split_off(boundary);
             let complete = std::mem::replace(&mut tail, pending);
-            if update::requires_scrub(disk, &complete).await? {
+            if update::requires_scrub(lexical, &complete).await? {
                 return Ok(true);
             }
             if let Some(bg_dirty) = dirty.as_deref_mut() {
@@ -1976,6 +2037,7 @@ async fn catch_up_to(
             let updated = update::apply(
                 cx,
                 disk,
+                lexical,
                 publisher,
                 ChangeCursor {
                     scope: target.scope.clone(),
@@ -2009,7 +2071,7 @@ async fn open_disk(
     publisher: &mut Publisher<'_>,
     layout: Arc<SearchLayout>,
     latest: SpaceSeq,
-) -> Result<Option<Disk>, IndexError> {
+) -> Result<Option<(Disk, Arc<LexicalIndex>)>, IndexError> {
     let layout_read = layout.clone();
     let manifest_res = tokio::task::spawn_blocking(move || layout_read.search_manifest())
         .await
@@ -2032,88 +2094,98 @@ async fn open_disk(
     let readers = cx.services.readers.clone();
     let writers = cx.services.writers.clone();
     let data_root = cx.services.config.data_root.clone();
-    let opened = tokio::task::spawn_blocking(move || -> Result<Option<Disk>, IndexError> {
-        let opened = (|| -> Result<Option<Disk>, IndexError> {
-            let Some(mut manifest) = manifest_res? else {
-                return Ok(None);
+    let owner = cx.reader_owner();
+    let opened = tokio::task::spawn_blocking(
+        move || -> Result<Option<(Disk, Arc<LexicalIndex>)>, IndexError> {
+            let opened = (|| -> Result<Option<(Disk, Arc<LexicalIndex>)>, IndexError> {
+                let Some(mut manifest) = manifest_res? else {
+                    return Ok(None);
+                };
+                if manifest.tokenizer_version != TOKENIZER_VERSION || manifest.tantivy_seq > latest
+                {
+                    return Err(IndexError::Inconsistent);
+                }
+                let folders = Arc::new(
+                    layout_open
+                        .folder_dictionary()?
+                        .ok_or(IndexError::Inconsistent)?,
+                );
+                let dir = layout_open.index_dir(&manifest)?;
+                let lexical = readers.open_owned(&dir, owner)?;
+                if lexical.commit_id()? != manifest.tantivy_commit {
+                    return Err(IndexError::Inconsistent);
+                }
+                if manifest.active_model.is_some()
+                    && manifest.vector_seq.is_none()
+                    && !manifest.embeddings_pending
+                {
+                    manifest.embeddings_pending = true;
+                    layout_open.publish_search(&manifest)?;
+                }
+                let full_sweep_needed =
+                    manifest.vector_seq.is_some() && manifest.embeddings_pending;
+                let now = Instant::now();
+                Ok(Some((
+                    Disk {
+                        layout: layout_open.clone(),
+                        manifest,
+                        folders,
+                        lexical_path: dir,
+                        lexical_idle_retired: false,
+                        epoch: None,
+                        embedder: None,
+                        dirty_notes: BTreeSet::new(),
+                        cached_vectors: HashMap::new(),
+                        full_sweep_after: None,
+                        full_sweep_needed,
+                        last_activity: now,
+                        embedder_last_use: now,
+                        embedder_unavailable: false,
+                    },
+                    lexical,
+                )))
+            })();
+            let disk = match opened {
+                Ok(disk) => disk,
+                Err(IndexError::Layout(LayoutError::WrongHistory)) => {
+                    layout_open.clear_lexical_manifests()?;
+                    None
+                }
+                Err(error @ IndexError::Lexical(LexicalError::ReaderUnavailable)) => {
+                    return Err(error);
+                }
+                Err(_) => None,
             };
-            if manifest.tokenizer_version != TOKENIZER_VERSION || manifest.tantivy_seq > latest {
-                return Err(IndexError::Inconsistent);
+            let preserve = disk
+                .as_ref()
+                .map(|(disk, _)| disk.manifest.generation())
+                .transpose()?;
+            for generation in layout_open.index_generations()? {
+                if Some(generation) != preserve {
+                    build::remove_generation_parts(
+                        &data_root,
+                        &writers,
+                        &readers,
+                        &layout_open,
+                        generation,
+                    )?;
+                }
             }
-            let folders = Arc::new(
-                layout_open
-                    .folder_dictionary()?
-                    .ok_or(IndexError::Inconsistent)?,
-            );
-            let lexical = readers.open(&layout_open.index_dir(&manifest)?)?;
-            if lexical.commit_id()? != manifest.tantivy_commit {
-                return Err(IndexError::Inconsistent);
-            }
-            if manifest.active_model.is_some()
-                && manifest.vector_seq.is_none()
-                && !manifest.embeddings_pending
-            {
-                manifest.embeddings_pending = true;
-                layout_open.publish_search(&manifest)?;
-            }
-            let full_sweep_needed = manifest.vector_seq.is_some() && manifest.embeddings_pending;
-            let now = Instant::now();
-            Ok(Some(Disk {
-                layout: layout_open.clone(),
-                manifest,
-                folders,
-                lexical: Some(lexical),
-                epoch: None,
-                embedder: None,
-                dirty_notes: BTreeSet::new(),
-                cached_vectors: HashMap::new(),
-                full_sweep_after: None,
-                full_sweep_needed,
-                last_activity: now,
-                embedder_last_use: now,
-                embedder_unavailable: false,
-            }))
-        })();
-        let disk = match opened {
-            Ok(disk) => disk,
-            Err(IndexError::Layout(LayoutError::WrongHistory)) => {
+            let vector_model = disk
+                .as_ref()
+                .and_then(|(disk, _)| {
+                    disk.manifest
+                        .vector_seq
+                        .and(disk.manifest.active_model.as_ref())
+                })
+                .map(ResolvedEmbeddingTarget::vector_model);
+            layout_open.remove_vector_epochs(vector_model.as_ref())?;
+            if disk.is_none() && layout_open.folder_dictionary().is_err() {
                 layout_open.clear_lexical_manifests()?;
-                None
             }
-            Err(error @ IndexError::Lexical(LexicalError::ReaderUnavailable)) => {
-                return Err(error);
-            }
-            Err(_) => None,
-        };
-        let preserve = disk
-            .as_ref()
-            .map(|disk| disk.manifest.generation())
-            .transpose()?;
-        for generation in layout_open.index_generations()? {
-            if Some(generation) != preserve {
-                build::remove_generation_parts(
-                    &data_root,
-                    &writers,
-                    &readers,
-                    &layout_open,
-                    generation,
-                )?;
-            }
-        }
-        let vector_model = disk
-            .as_ref()
-            .and_then(|disk| {
-                disk.manifest
-                    .vector_seq
-                    .and(disk.manifest.active_model.as_ref())
-            })
-            .map(ResolvedEmbeddingTarget::vector_model);
-        layout_open.remove_vector_epochs(vector_model.as_ref())?;
-        if disk.is_none() && layout_open.folder_dictionary().is_err() {
-            layout_open.clear_lexical_manifests()?;
-        }
-        Ok(disk)
-    })
+            Ok(disk)
+        },
+    )
     .await
     .map_err(|_| IndexError::Inconsistent)?;
 

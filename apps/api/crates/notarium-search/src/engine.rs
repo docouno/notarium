@@ -94,14 +94,42 @@ pub(super) struct Published {
     pub embedder_unavailable: bool,
 }
 
+#[derive(Default)]
+struct PublishState {
+    retired: Vec<Weak<Published>>,
+}
+
+impl PublishState {
+    fn record_retired(&mut self, previous: &Arc<Published>) {
+        self.retired.retain(|state| state.strong_count() != 0);
+        self.retired.push(Arc::downgrade(previous));
+    }
+}
+
+/// Per-Space publication state. Lock order is strictly acyclic:
+/// `WorkerTable` -> `SpaceHandle::publish_state` -> `align_waiters` / `last_activity`.
+/// `ReaderCache::indexes` is never held while entering `SpaceHandle`, and
+/// `publish_state` is never held while dropping `Arc<Published>`.
 pub(super) struct SpaceHandle {
     pub published: ArcSwapOption<Published>,
     pub epoch: watch::Sender<u64>,
     pub wake: Notify,
     pub stop: Cancellation,
     pub active_queries: AtomicUsize,
+    worker_pins: AtomicUsize,
     align_waiters: Mutex<BTreeMap<SpaceSeq, Vec<oneshot::Sender<Arc<Published>>>>>,
+    publish_state: Mutex<PublishState>,
     last_activity: Mutex<StdInstant>,
+}
+
+pub(super) struct WorkerPin {
+    handle: Arc<SpaceHandle>,
+}
+
+impl Drop for WorkerPin {
+    fn drop(&mut self) {
+        self.handle.worker_pins.fetch_sub(1, Ordering::Release);
+    }
 }
 
 pub(super) struct PinnedSpace {
@@ -123,15 +151,57 @@ impl SpaceHandle {
             wake: Notify::new(),
             stop: Cancellation::default(),
             active_queries: AtomicUsize::new(0),
+            worker_pins: AtomicUsize::new(0),
             align_waiters: Mutex::new(BTreeMap::new()),
+            publish_state: Mutex::new(PublishState::default()),
             last_activity: Mutex::new(StdInstant::now()),
         }
+    }
+
+    pub(super) fn increment_active_queries(&self) {
+        let _publish_state = self
+            .publish_state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.active_queries.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub(super) fn pin_worker(self: &Arc<Self>) -> WorkerPin {
+        {
+            let _publish_state = self
+                .publish_state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            self.worker_pins.fetch_add(1, Ordering::AcqRel);
+        }
+        WorkerPin {
+            handle: Arc::clone(self),
+        }
+    }
+
+    pub(super) fn is_published(&self) -> bool {
+        let _publish_state = self
+            .publish_state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.published.load().is_some()
+    }
+
+    pub(super) fn is_reopening_vectors(&self) -> bool {
+        let _publish_state = self
+            .publish_state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.published
+            .load()
+            .as_ref()
+            .is_some_and(|published| published.reopening_vectors)
     }
 
     #[cfg(test)]
     pub(super) fn pin_query(self: &Arc<Self>) -> PinnedSpace {
         self.touch();
-        self.active_queries.fetch_add(1, Ordering::AcqRel);
+        self.increment_active_queries();
         PinnedSpace {
             handle: Arc::clone(self),
         }
@@ -218,18 +288,172 @@ impl SpaceHandle {
         }
     }
 
-    pub fn replace(&self, state: Option<Arc<Published>>) -> Option<Arc<Published>> {
-        if state.is_none() {
-            self.clear_align_waiters();
+    pub(super) async fn drain_published(&self) {
+        loop {
+            let empty = {
+                let mut publish_state = self
+                    .publish_state
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                publish_state
+                    .retired
+                    .retain(|state| state.strong_count() != 0);
+                publish_state.retired.is_empty()
+            };
+            if empty {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
         }
+    }
+
+    pub fn replace(&self, state: Option<Arc<Published>>) -> Option<Arc<Published>> {
         let notify = state.clone();
-        let previous = self.published.swap(state);
+        let previous = {
+            let mut publish_state = self
+                .publish_state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if state.is_none() {
+                self.clear_align_waiters();
+            }
+            let previous = self.published.swap(state);
+            if let Some(prev) = &previous {
+                publish_state.record_retired(prev);
+            }
+            previous
+        };
         self.epoch
             .send_modify(|sequence| *sequence = sequence.wrapping_add(1));
         if let Some(published) = notify {
             self.notify_align_waiters(&published);
         }
         previous
+    }
+
+    /// Atomically replace the published snapshot only while a snapshot is still
+    /// live, reusing its lexical reader so background updates can never
+    /// resurrect a reader evicted by `ReaderCache`.
+    pub(super) fn replace_if_live(
+        &self,
+        build: impl FnOnce(&Arc<LexicalIndex>) -> Published,
+    ) -> bool {
+        let (notify, previous, current) = {
+            let mut publish_state = self
+                .publish_state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let Some(current) = self.published.load_full() else {
+                return false;
+            };
+            let next = Arc::new(build(&current.lexical));
+            let previous = self.published.swap(Some(Arc::clone(&next)));
+            if let Some(prev) = &previous {
+                publish_state.record_retired(prev);
+            }
+            (next, previous, current)
+        };
+        drop(previous);
+        drop(current);
+        self.epoch
+            .send_modify(|sequence| *sequence = sequence.wrapping_add(1));
+        self.notify_align_waiters(&notify);
+        true
+    }
+
+    /// Atomically retire the published snapshot for idle timeout only when no
+    /// query, worker pin, or align waiter is active.
+    pub(super) fn retire_if_idle(&self) -> bool {
+        let evicted = {
+            let mut publish_state = self
+                .publish_state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if self.active_queries.load(Ordering::Acquire) != 0
+                || self.worker_pins.load(Ordering::Acquire) != 0
+                || self.has_align_waiters()
+            {
+                return false;
+            }
+            let previous = self.published.swap(None);
+            if let Some(prev) = &previous {
+                publish_state.record_retired(prev);
+            }
+            previous
+        };
+        if evicted.is_some() {
+            drop(evicted);
+            self.epoch
+                .send_modify(|sequence| *sequence = sequence.wrapping_add(1));
+        }
+        true
+    }
+}
+
+impl crate::lexical::IdleReaderOwner for SpaceHandle {
+    fn idle_last_activity(&self, path: &std::path::Path) -> Option<StdInstant> {
+        let _publish_state = self
+            .publish_state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if self.active_queries.load(Ordering::Acquire) != 0
+            || self.worker_pins.load(Ordering::Acquire) != 0
+            || self.has_align_waiters()
+        {
+            return None;
+        }
+        let current = self.published.load_full()?;
+        // `load_full` adds one deterministic strong reference to `Published`
+        // (1 in `self.published` + 1 in `current` == 2) without cloning
+        // `current.lexical` (1 in `ReaderCache` + 1 in `Published` <= 2).
+        let eligible = current.lexical.path() == path
+            && Arc::strong_count(&current) == 2
+            && Arc::strong_count(&current.lexical) <= 2;
+        // `self.published` still holds a strong ref, so dropping `current`
+        // cannot run destructors under `publish_state`.
+        drop(current);
+        eligible.then(|| {
+            *self
+                .last_activity
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+        })
+    }
+
+    fn evict_if_idle(&self, path: &std::path::Path) {
+        let evicted = {
+            let mut publish_state = self
+                .publish_state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if self.active_queries.load(Ordering::Acquire) != 0
+                || self.worker_pins.load(Ordering::Acquire) != 0
+                || self.has_align_waiters()
+            {
+                return;
+            }
+            let can_evict = {
+                let Some(current) = self.published.load_full() else {
+                    return;
+                };
+                current.lexical.path() == path
+                    && Arc::strong_count(&current) == 2
+                    && Arc::strong_count(&current.lexical) <= 2
+            };
+            if !can_evict {
+                return;
+            }
+            let previous = self.published.swap(None);
+            if let Some(prev) = &previous {
+                publish_state.record_retired(prev);
+            }
+            previous
+        };
+        if evicted.is_some() {
+            drop(evicted);
+            self.epoch
+                .send_modify(|sequence| *sequence = sequence.wrapping_add(1));
+        }
     }
 }
 
@@ -462,7 +686,7 @@ impl SearchEngine {
         if let Some(worker) = table.active.get(&scope.space_id) {
             worker.handle.touch();
             if pin_query {
-                worker.handle.active_queries.fetch_add(1, Ordering::AcqRel);
+                worker.handle.increment_active_queries();
             }
             return Ok(worker.handle.clone());
         }

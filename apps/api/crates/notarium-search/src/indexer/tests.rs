@@ -100,7 +100,8 @@ async fn idle_space_releases_embedder_and_reopens_checkpointed_wal_after_evictio
             embeddings_pending: false,
         },
         folders: Arc::new(FolderDictionary::default()),
-        lexical: None,
+        lexical_path: PathBuf::new(),
+        lexical_idle_retired: true,
         epoch: Some(epoch),
         embedder: None,
         dirty_notes: BTreeSet::new(),
@@ -331,7 +332,6 @@ async fn idle_reopen_during_replacement_backoff_restores_active_embedder() {
         };
         let mut publisher = Publisher {
             handle: &worker_handle,
-            old: Vec::new(),
         };
         let schedule = Schedule {
             tick: Duration::from_millis(20),
@@ -653,7 +653,8 @@ fn reopening_vectors_stays_true_during_reopen_after_live_edit_clears_vector_seq(
             embeddings_pending: true,
         },
         folders: Arc::new(FolderDictionary::default()),
-        lexical: Some(lexical),
+        lexical_path: lexical.path().to_path_buf(),
+        lexical_idle_retired: false,
         epoch: None,
         embedder: None,
         dirty_notes: BTreeSet::new(),
@@ -665,24 +666,20 @@ fn reopening_vectors_stays_true_during_reopen_after_live_edit_clears_vector_seq(
         embedder_unavailable: false,
     };
     let handle = Arc::new(SpaceHandle::new());
-    let mut publisher = Publisher {
-        handle: &handle,
-        old: Vec::new(),
-    };
+    let mut publisher = Publisher { handle: &handle };
     // Live edit during BgKind::ReopenVectors clears vector_seq while passing
     // reopening = true; published state must stay marked reopening_vectors.
-    publisher.publish(&disk, true);
+    publisher.publish_with(&disk, &lexical, true);
     assert!(handle.published.load_full().unwrap().reopening_vectors);
 
-    publisher.publish(&disk, false);
+    publisher.publish_with(&disk, &lexical, false);
     assert!(!handle.published.load_full().unwrap().reopening_vectors);
 
     disk.manifest.vector_seq = Some(seq);
-    publisher.publish(&disk, false);
+    publisher.publish_with(&disk, &lexical, false);
     assert!(handle.published.load_full().unwrap().reopening_vectors);
 
     publisher.replace(None);
-    drop(publisher);
     drop(handle);
     drop(disk);
     std::fs::remove_dir_all(path).unwrap();
@@ -754,7 +751,8 @@ async fn full_sweep_completion_preserves_resweep_when_remote_folders_changed() {
             embeddings_pending: true,
         },
         folders: Arc::new(FolderDictionary::default()),
-        lexical: Some(lexical),
+        lexical_path: lexical.path().to_path_buf(),
+        lexical_idle_retired: false,
         epoch: Some(epoch),
         embedder: None,
         dirty_notes: BTreeSet::new(),
@@ -770,10 +768,7 @@ async fn full_sweep_completion_preserves_resweep_when_remote_folders_changed() {
         services: &engine.services,
         handle: &handle,
     };
-    let mut publisher = Publisher {
-        handle: &handle,
-        old: Vec::new(),
-    };
+    let mut publisher = Publisher { handle: &handle };
     let mut model_check_due = false;
     let mut retry_model = false;
     let mut model_retry_at = now;
@@ -879,7 +874,6 @@ async fn full_sweep_completion_preserves_resweep_when_remote_folders_changed() {
     assert!(!current.manifest.embeddings_pending);
 
     publisher.replace(None);
-    drop(publisher);
     drop(disk);
     engine.shutdown().await;
     runtime.shutdown().await.unwrap();
@@ -966,7 +960,6 @@ async fn idle_embedder_stays_unloaded_during_non_embedding_writes_until_wake() {
         };
         let mut publisher = Publisher {
             handle: &worker_handle,
-            old: Vec::new(),
         };
         let schedule = Schedule {
             tick: Duration::from_millis(20),
@@ -1628,7 +1621,8 @@ async fn failed_embedder_load_respects_retry_backoff_without_busy_spin() {
         layout,
         manifest,
         folders: Arc::new(FolderDictionary::default()),
-        lexical: Some(lexical),
+        lexical_path: lexical.path().to_path_buf(),
+        lexical_idle_retired: false,
         epoch: Some(epoch),
         embedder: None,
         dirty_notes: BTreeSet::from([NoteId::from_bytes([0xf6; 16])]),
@@ -1798,7 +1792,8 @@ async fn folder_move_between_full_sweep_pages_resets_full_sweep_after() {
             embeddings_pending: true,
         },
         folders: Arc::new(FolderDictionary::default()),
-        lexical: Some(lexical),
+        lexical_path: lexical.path().to_path_buf(),
+        lexical_idle_retired: false,
         epoch: None,
         embedder: None,
         dirty_notes: BTreeSet::new(),
@@ -1814,10 +1809,7 @@ async fn folder_move_between_full_sweep_pages_resets_full_sweep_after() {
         services: &engine.services,
         handle: &handle,
     };
-    let mut publisher = Publisher {
-        handle: &handle,
-        old: Vec::new(),
-    };
+    let mut publisher = Publisher { handle: &handle };
 
     let move_cursor = ChangeCursor {
         scope: scope.clone(),
@@ -1827,6 +1819,7 @@ async fn folder_move_between_full_sweep_pages_resets_full_sweep_after() {
     update::apply(
         &cx,
         &mut disk,
+        &lexical,
         &mut publisher,
         move_cursor.clone(),
         vec![Change {
@@ -1855,6 +1848,7 @@ async fn folder_move_between_full_sweep_pages_resets_full_sweep_after() {
     update::apply(
         &cx,
         &mut disk,
+        &lexical,
         &mut publisher,
         restore_cursor.clone(),
         vec![Change {
@@ -1878,7 +1872,6 @@ async fn folder_move_between_full_sweep_pages_resets_full_sweep_after() {
     );
 
     publisher.replace(None);
-    drop(publisher);
     drop(disk);
     engine.shutdown().await;
     runtime.shutdown().await.unwrap();
@@ -2228,7 +2221,8 @@ async fn reconcile_reopening_clears_stale_flag_when_non_reopening_bg_task_spawns
             embeddings_pending: false,
         },
         folders: Arc::new(FolderDictionary::default()),
-        lexical: Some(lexical),
+        lexical_path: lexical.path().to_path_buf(),
+        lexical_idle_retired: false,
         epoch: Some(epoch),
         embedder: None,
         dirty_notes: BTreeSet::new(),
@@ -2240,14 +2234,11 @@ async fn reconcile_reopening_clears_stale_flag_when_non_reopening_bg_task_spawns
         embedder_unavailable: true,
     };
     let handle = Arc::new(SpaceHandle::new());
-    let mut publisher = Publisher {
-        handle: &handle,
-        old: Vec::new(),
-    };
+    let mut publisher = Publisher { handle: &handle };
 
     // Simulate stale reopening_vectors = true published during resume_reader
     // followed by spawning a non-reopening BgKind::ModelRefresh task.
-    publisher.publish(&disk, true);
+    publisher.publish_with(&disk, &lexical, true);
     assert!(handle.published.load_full().unwrap().reopening_vectors);
 
     let bg = Some(BgTask {
@@ -2288,7 +2279,6 @@ async fn reconcile_reopening_clears_stale_flag_when_non_reopening_bg_task_spawns
     assert!(!handle.published.load_full().unwrap().reopening_vectors);
 
     publisher.replace(None);
-    drop(publisher);
     drop(handle);
     drop(disk);
     std::fs::remove_dir_all(path).unwrap();
@@ -2327,7 +2317,8 @@ fn disabled_vector_mode_never_schedules_maintenance_wake_on_pending_manifest() {
             embeddings_pending: true,
         },
         folders: Arc::new(FolderDictionary::default()),
-        lexical: Some(lexical),
+        lexical_path: lexical.path().to_path_buf(),
+        lexical_idle_retired: false,
         epoch: None,
         embedder: None,
         dirty_notes: BTreeSet::from([NoteId::from_bytes([0xf4; 16])]),
@@ -2349,6 +2340,239 @@ fn disabled_vector_mode_never_schedules_maintenance_wake_on_pending_manifest() {
         Some(now),
         "enabled vector mode still schedules pending model backfill wake"
     );
+
+    drop(disk);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[tokio::test]
+async fn idle_published_readers_evict_on_demand_across_more_than_32_spaces() {
+    use crate::{
+        SearchDependencies, SearchEngine,
+        config::{SearchConfig, VectorMode},
+    };
+    use notarium_canonical::{
+        CanonicalConfig, CanonicalRuntime, CreateSpaceSpec, changes::SyntheticNoteSpec,
+    };
+    use notarium_core::{
+        auth::SpaceKind,
+        ids::{InstallationId, LeaseEpoch, PrincipalId},
+        model::Lifecycle,
+    };
+    use std::collections::BTreeMap;
+
+    let mut entropy = [0u8; 16];
+    getrandom::fill(&mut entropy).unwrap();
+    let path = std::env::temp_dir().join(format!("search-reader-evict-{}", hex::encode(entropy)));
+    std::fs::create_dir(&path).unwrap();
+    let root = DataRoot::new(&path);
+    let (store, runtime) = CanonicalRuntime::open(CanonicalConfig::local_default(
+        InstallationId::from_bytes([0xc1; 16]),
+        root.clone(),
+    ))
+    .await
+    .unwrap();
+    let store = Arc::new(store);
+    let lease = LeaseEpoch::new(1).unwrap();
+    let engine = SearchEngine::start_with_schedule(
+        SearchConfig::new(root.clone(), VectorMode::Disabled),
+        SearchDependencies::new(store.clone(), Arc::new(UnusedStructural)),
+        Schedule {
+            tick: Duration::from_secs(60),
+            lexical_idle: Duration::from_secs(300),
+            embedder_idle: Duration::from_secs(300),
+            worker_idle: Duration::from_secs(300),
+            archived_idle: Duration::from_secs(300),
+        },
+    );
+
+    let mut scopes = Vec::new();
+    for index in 1u8..=36 {
+        let owner = PrincipalId::from_bytes([index; 16]);
+        let folder = FolderId::from_bytes([index; 16]);
+        let note_id = NoteId::from_bytes([index; 16]);
+        let space = store
+            .create_space(CreateSpaceSpec {
+                space_id: SpaceId::from_bytes([index; 16]),
+                incarnation: HistoryIncarnation::from_bytes([index; 16]),
+                root_folder_id: folder.clone(),
+                slug: format!("evict-{index}"),
+                kind: SpaceKind::Personal,
+                owner: owner.clone(),
+                active_epoch: lease,
+                initial_last_seq: SpaceSeq::ZERO,
+                created_at: None,
+            })
+            .await
+            .unwrap();
+        let (seeded, _) = store
+            .commit_synthetic_note_batch_for_test(
+                &space.scope,
+                lease,
+                &owner,
+                vec![SyntheticNoteSpec {
+                    note_id,
+                    parent_folder: Some(folder),
+                    slug: "n".into(),
+                    title: format!("Note {index}"),
+                    doc_class: DocClass::UserDoc,
+                    lifecycle: Lifecycle::Active,
+                    carrier: format!("# Note {index}\n\nspace{index}token"),
+                    fields: BTreeMap::new(),
+                }],
+            )
+            .await
+            .unwrap();
+        let handle = engine.space(space.scope.clone()).unwrap();
+        let mut epochs = handle.epoch.subscribe();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if store
+                    .min_consumer_watermark(&space.scope.space_id, &space.scope.incarnation)
+                    .is_some_and(|seen| seen >= seeded.last_seq)
+                    && handle
+                        .published
+                        .load()
+                        .as_ref()
+                        .is_some_and(|state| state.seq >= seeded.last_seq)
+                {
+                    break;
+                }
+                let _ = tokio::time::timeout(Duration::from_millis(20), epochs.changed()).await;
+            }
+        })
+        .await
+        .expect("space > 32 must evict idle published readers immediately instead of stalling");
+        scopes.push((space.scope, seeded.last_seq, handle));
+    }
+
+    // The oldest idle space was evicted from published state, and waking it
+    // reopens its reader on demand without stalling.
+    let (first_scope, first_seq, first_handle) = &scopes[0];
+    assert!(
+        first_handle.published.load().is_none(),
+        "oldest idle space should have been evicted under MAX_READERS pressure"
+    );
+    let mut epochs = first_handle.epoch.subscribe();
+    first_handle.wake.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if first_handle
+                .published
+                .load()
+                .as_ref()
+                .is_some_and(|state| state.scope == *first_scope && state.seq >= *first_seq)
+            {
+                break;
+            }
+            epochs.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("evicted idle space must reopen immediately on wake");
+
+    engine.shutdown().await;
+    runtime.shutdown().await.unwrap();
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[tokio::test]
+async fn space_handle_idle_eviction_respects_pins_extra_refs_and_replace_if_live() {
+    use crate::lexical::IdleReaderOwner;
+
+    let mut entropy = [0u8; 16];
+    getrandom::fill(&mut entropy).unwrap();
+    let path = std::env::temp_dir().join(format!("search-handle-evict-{}", hex::encode(entropy)));
+    std::fs::create_dir(&path).unwrap();
+    let root = DataRoot::new(&path);
+    let scope = HistoryScope {
+        space_id: SpaceId::from_bytes([0xd1; 16]),
+        incarnation: HistoryIncarnation::from_bytes([0xd1; 16]),
+    };
+    let layout = Arc::new(SearchLayout::open(&root, scope.clone()).unwrap());
+    let index_dir = layout.create_index_generation(1).unwrap();
+    let cache = crate::lexical::ReaderCache::default();
+    let handle = Arc::new(SpaceHandle::new());
+    let owner = Arc::downgrade(&handle) as Weak<dyn IdleReaderOwner>;
+    let lexical = cache.create_owned(&index_dir, owner).unwrap();
+    let now = Instant::now();
+    let disk = Disk {
+        layout,
+        manifest: SearchManifest {
+            scope,
+            tantivy_seq: SpaceSeq::new(1).unwrap(),
+            tantivy_commit: lexical.commit_id().unwrap(),
+            active_index_dir: crate::layout::index_name(1),
+            tokenizer_version: TOKENIZER_VERSION,
+            active_model: None,
+            vector_seq: None,
+            embeddings_pending: false,
+        },
+        folders: Arc::new(FolderDictionary::default()),
+        lexical_path: lexical.path().to_path_buf(),
+        lexical_idle_retired: false,
+        epoch: None,
+        embedder: None,
+        dirty_notes: BTreeSet::new(),
+        cached_vectors: HashMap::new(),
+        full_sweep_after: None,
+        full_sweep_needed: false,
+        last_activity: now,
+        embedder_last_use: now,
+        embedder_unavailable: false,
+    };
+    let mut publisher = Publisher { handle: &handle };
+    publisher.publish_with(&disk, &lexical, false);
+
+    // 1. Extra local stack Arc<LexicalIndex> (active worker) prevents eviction.
+    assert!(handle.idle_last_activity(&index_dir).is_none());
+    handle.evict_if_idle(&index_dir);
+    assert!(handle.published.load().is_some());
+    drop(lexical);
+
+    // 2. Pinned query, pinned worker, or active align waiter prevents eviction and idle retirement.
+    let pin = handle.pin_query();
+    assert!(handle.idle_last_activity(&index_dir).is_none());
+    handle.evict_if_idle(&index_dir);
+    assert!(!publisher.retire_if_idle());
+    assert!(handle.published.load().is_some());
+    drop(pin);
+
+    let worker_pin = handle.pin_worker();
+    assert!(handle.idle_last_activity(&index_dir).is_none());
+    handle.evict_if_idle(&index_dir);
+    assert!(!publisher.retire_if_idle());
+    assert!(handle.published.load().is_some());
+    drop(worker_pin);
+
+    let align_rx = handle.register_align_waiter(SpaceSeq::new(2).unwrap());
+    assert!(handle.idle_last_activity(&index_dir).is_none());
+    assert!(!publisher.retire_if_idle());
+    assert!(handle.published.load().is_some());
+    drop(align_rx);
+
+    // 3. Extra Arc<Published> clone (e.g. lingering blocking_search) prevents eviction.
+    let lingering = handle.published.load_full().unwrap();
+    assert!(handle.idle_last_activity(&index_dir).is_none());
+    handle.evict_if_idle(&index_dir);
+    assert!(handle.published.load().is_some());
+    drop(lingering);
+
+    // 4. Truly idle snapshot reports last_activity, evicts cleanly, and
+    //    publish_if_live refuses to resurrect after eviction.
+    assert!(handle.idle_last_activity(&index_dir).is_some());
+    handle.evict_if_idle(&index_dir);
+    assert!(handle.published.load().is_none());
+    assert!(
+        cache.release(&index_dir).unwrap(),
+        "evicted reader must be immediately releasable from ReaderCache"
+    );
+    publisher.publish_if_live(&disk, false);
+    assert!(
+        handle.published.load().is_none(),
+        "publish_if_live must never resurrect an evicted snapshot"
+    );
+    handle.drain_published().await;
 
     drop(disk);
     std::fs::remove_dir_all(path).unwrap();

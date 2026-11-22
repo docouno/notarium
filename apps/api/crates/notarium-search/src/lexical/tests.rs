@@ -593,6 +593,102 @@ fn reader_cache_enforces_its_bound_without_evicting_pinned_generations_or_on_fai
 }
 
 #[test]
+fn reader_cache_evicts_idle_owners_lru_without_disturbing_busy_owners_or_failed_opens() {
+    use super::IdleReaderOwner;
+    use std::sync::{Mutex, atomic::AtomicBool};
+
+    struct TestOwner {
+        busy: AtomicBool,
+        held: Mutex<Option<Arc<LexicalIndex>>>,
+        last_activity: Mutex<Instant>,
+    }
+    impl IdleReaderOwner for TestOwner {
+        fn idle_last_activity(&self, path: &Path) -> Option<Instant> {
+            if self.busy.load(Ordering::Acquire) {
+                return None;
+            }
+            let slot = self.held.lock().unwrap();
+            let index = slot.as_ref()?;
+            if index.path() != path || Arc::strong_count(index) > 2 {
+                return None;
+            }
+            Some(*self.last_activity.lock().unwrap())
+        }
+        fn evict_if_idle(&self, path: &Path) {
+            if self.busy.load(Ordering::Acquire) {
+                return;
+            }
+            let mut slot = self.held.lock().unwrap();
+            if slot
+                .as_ref()
+                .is_some_and(|index| index.path() == path && Arc::strong_count(index) <= 2)
+            {
+                slot.take();
+            }
+        }
+    }
+
+    let scratch = TestDir::new();
+    let cache = ReaderCache::default();
+    let path = |number| scratch.0.join(format!("owned-{number}"));
+    let mut owners = Vec::new();
+    let base = Instant::now();
+    for number in 0..32 {
+        fs::create_dir(path(number)).unwrap();
+        let owner = Arc::new(TestOwner {
+            busy: AtomicBool::new(true),
+            held: Mutex::new(None),
+            last_activity: Mutex::new(base),
+        });
+        let weak = Arc::downgrade(&owner) as std::sync::Weak<dyn IdleReaderOwner>;
+        let index = cache.create_owned(&path(number), weak).unwrap();
+        *owner.held.lock().unwrap() = Some(index);
+        owners.push(owner);
+    }
+
+    // All 32 owners are busy: a 33rd creation must fail closed without touching disk.
+    fs::create_dir(path(32)).unwrap();
+    assert!(matches!(
+        cache.create(&path(32)),
+        Err(LexicalError::ReaderUnavailable)
+    ));
+
+    // Mark owners[0] and owners[1] idle, but make owners[0] more recently active
+    // than owners[1]; a failing open must NOT evict either.
+    owners[0].busy.store(false, Ordering::Release);
+    owners[1].busy.store(false, Ordering::Release);
+    *owners[0].last_activity.lock().unwrap() = Instant::now() + Duration::from_secs(10);
+    *owners[1].last_activity.lock().unwrap() = base;
+    assert!(cache.open(&scratch.0.join("missing")).is_err());
+    assert!(
+        owners[0].held.lock().unwrap().is_some() && owners[1].held.lock().unwrap().is_some(),
+        "failed open must leave idle owners intact"
+    );
+
+    // Succeeding 33rd creation evicts the true LRU idle owner (owners[1], not
+    // the FIFO-oldest but recently active owners[0]) and admits path(32).
+    let admitted = cache.create(&path(32)).unwrap();
+    assert!(
+        owners[1].held.lock().unwrap().is_none(),
+        "least recently active idle owner must be evicted first"
+    );
+    assert!(
+        owners[0].held.lock().unwrap().is_some(),
+        "more recently active idle owner must stay cached"
+    );
+    assert!(
+        owners[2..]
+            .iter()
+            .all(|owner| owner.held.lock().unwrap().is_some()),
+        "busy owners must remain untouched"
+    );
+    // An evicted path must not be returned by get_owned.
+    let probe = Arc::downgrade(&owners[1]) as std::sync::Weak<dyn IdleReaderOwner>;
+    assert!(cache.get_owned(&path(1), probe).unwrap().is_none());
+    drop(admitted);
+}
+
+#[test]
 fn collectors_prune_lookups_on_broad_queries_and_browse_and_propagate_not_ready() {
     use crate::vector::SearchBudget;
     let scratch = TestDir::new();
