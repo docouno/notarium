@@ -2818,20 +2818,6 @@ async fn open_collab_session_impl(
                 if head.lifecycle != Lifecycle::Active {
                     return Err(DomainError::ResourceNotFound.into());
                 }
-                if head.doc_class == DocClass::EncryptedNote {
-                    return Err(DomainError::UnsafePlaintextOutsideAgeFence.into());
-                }
-                if head.doc_class != DocClass::UserDoc {
-                    return Err(DomainError::validation(ValidationReason::ClassMismatch).into());
-                }
-                if head.head_rev_id != spec_cl.expected_carrier_rev {
-                    return Err(DomainError::RevisionConflict {
-                        current: head.head_rev_id,
-                        lineage: None,
-                    }
-                    .into());
-                }
-
                 let existing =
                     load_collab_session_opt_tx(tx, &srec.scope.space_id, &spec_cl.note).await?;
                 let is_fenced_recovery = spec_cl.allow_fenced_recovery
@@ -2846,6 +2832,19 @@ async fn open_collab_session_impl(
                     !is_fenced_recovery,
                 )
                 .await?;
+                if head.doc_class == DocClass::EncryptedNote {
+                    return Err(DomainError::UnsafePlaintextOutsideAgeFence.into());
+                }
+                if head.doc_class != DocClass::UserDoc {
+                    return Err(DomainError::validation(ValidationReason::ClassMismatch).into());
+                }
+                if head.head_rev_id != spec_cl.expected_carrier_rev {
+                    return Err(DomainError::RevisionConflict {
+                        current: head.head_rev_id,
+                        lineage: None,
+                    }
+                    .into());
+                }
                 let (base_lease, lineage, preserved_snapshot, preserved_digest, coverage, dirty) = match existing {
                     None => {
                         if let Some(exp_le) = spec_cl.expected_lease

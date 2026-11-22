@@ -327,12 +327,12 @@ impl CanonicalStore {
             let room_fences = &self.inner.room_fences;
             let takeover_sync = {
                 let _gate = self.inner.writer()?.acquire_commit_read_guard().await;
+                let mut visibility = self
+                    .inner
+                    .live_visibility
+                    .for_write(vec![scope.space_id.clone()])
+                    .await;
                 let fenced = {
-                    let mut visibility = self
-                        .inner
-                        .live_visibility
-                        .for_write(vec![scope.space_id.clone()])
-                        .await;
                     let mut connection = pool.acquire().await.map_err(|e| {
                         unavailable_retryable(
                             "pg_acquire_lease",
@@ -389,8 +389,10 @@ impl CanonicalStore {
                 };
                 // Capture all local and fenced slots AFTER releasing the PG
                 // connection (avoiding single-conn pool starvation) while STILL
-                // holding `_gate` so a concurrent Space restore cannot
-                // interleave before `space_sync` records `(sync_gen, inc, epoch)`.
+                // holding `_gate` and per-Space `visibility` so neither a local
+                // Space restore nor a concurrent `advance_space_lease` for a
+                // remote-restored incarnation can interleave before `space_sync`
+                // records `(sync_gen, inc, epoch)`.
                 room_fences.begin_space_takeover_sync(scope, new_epoch, fenced)
             };
             // Lock and update each captured slot AFTER releasing `_gate` so

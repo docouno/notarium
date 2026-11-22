@@ -569,12 +569,8 @@ impl CollabHub {
                 let held = lock_slot(&slot, &rem).await?;
                 let live_replaced = held
                     .as_ref()
-                    .is_some_and(|live| live.scope() == scope && !live.stopped().is_cancelled());
-                if live_replaced {
-                    // Another peer already admitted a fresh room into this slot,
-                    // which completed fenced recovery before spawning.
-                    hub.clear_unsettled(scope, note);
-                } else {
+                    .is_some_and(|live| hub.is_live_replacement(live, scope));
+                if !live_replaced {
                     rem.remaining = deadline.saturating_duration_since(Instant::now());
                     match tokio::time::timeout_at(deadline, hub.recover_unhosted(&rem, scope, note))
                         .await
@@ -654,10 +650,8 @@ impl CollabHub {
                 let held = lock_slot(&slot, &rem).await?;
                 let live_replaced = held
                     .as_ref()
-                    .is_some_and(|live| live.scope() == &scope && !live.stopped().is_cancelled());
-                if live_replaced {
-                    self.0.clear_unsettled(&scope, &key.1);
-                } else {
+                    .is_some_and(|live| self.0.is_live_replacement(live, &scope));
+                if !live_replaced {
                     rem.remaining = deadline.saturating_duration_since(Instant::now());
                     match tokio::time::timeout_at(
                         deadline,
@@ -1001,25 +995,23 @@ impl HubInner {
     pub fn room_stopped(&self, room: &RoomHandle, settled: bool) {
         let key = (room.scope().space_id.clone(), room.note().clone());
         let mut active = self.active.lock().expect("active rooms");
-        if !settled {
-            self.unsettled_shutdown_rooms
-                .lock()
-                .expect("shutdown rooms")
-                .insert((room.scope().clone(), room.note().clone()));
-        } else {
-            self.unsettled_shutdown_rooms
-                .lock()
-                .expect("shutdown rooms")
-                .remove(&(room.scope().clone(), room.note().clone()));
-        }
         if active
             .get(&key)
             .is_some_and(|registered| registered.same_lease(room))
         {
             active.remove(&key);
-            // Keep pending revocation entries intact when the room exited
-            // without settling so `revoke()` knows it must run durable recovery.
-            if settled {
+            if !settled {
+                self.unsettled_shutdown_rooms
+                    .lock()
+                    .expect("shutdown rooms")
+                    .insert((room.scope().clone(), room.note().clone()));
+            } else {
+                self.unsettled_shutdown_rooms
+                    .lock()
+                    .expect("shutdown rooms")
+                    .remove(&(room.scope().clone(), room.note().clone()));
+                // Keep pending revocation entries intact when the room exited
+                // without settling so `revoke()` knows it must run durable recovery.
                 self.pending_revoke_settlement
                     .lock()
                     .expect("pending revoke settlement")
@@ -1031,10 +1023,38 @@ impl HubInner {
 
     pub fn room_started(&self, room: &RoomHandle) {
         let key = (room.scope().space_id.clone(), room.note().clone());
-        self.active
+        let mut active = self.active.lock().expect("active rooms");
+        active.insert(key, room.clone());
+        // `admit()` completes any prior fenced/unhosted recovery before spawning
+        // a replacement room, so clear any stale unsettled record atomically.
+        self.unsettled_shutdown_rooms
             .lock()
-            .expect("active rooms")
-            .insert(key, room.clone());
+            .expect("shutdown rooms")
+            .remove(&(room.scope().clone(), room.note().clone()));
+    }
+
+    /// Atomically checks whether `live` is still the registered active room for
+    /// `scope` (excluding a dying room already removed from `active` before
+    /// `stopped.cancel()`) and clears any stale unsettled marker under the same
+    /// `active -> unsettled_shutdown_rooms` lock order used by `room_stopped`.
+    fn is_live_replacement(&self, live: &RoomHandle, scope: &HistoryScope) -> bool {
+        if live.scope() != scope || live.stopped().is_cancelled() {
+            return false;
+        }
+        let key = (scope.space_id.clone(), live.note().clone());
+        let active = self.active.lock().expect("active rooms");
+        if active
+            .get(&key)
+            .is_some_and(|registered| registered.same_lease(live))
+        {
+            self.unsettled_shutdown_rooms
+                .lock()
+                .expect("shutdown rooms")
+                .remove(&(scope.clone(), live.note().clone()));
+            true
+        } else {
+            false
+        }
     }
 
     fn evict_matching(&self, selector: &RevocationSelector) -> HashSet<RoomKey> {
@@ -1097,6 +1117,17 @@ impl HubInner {
             .remove(&(scope.clone(), note.clone()));
     }
 
+    fn prune_unsettled_for_current_scopes(&self, current_scopes: &HashMap<SpaceId, HistoryScope>) {
+        self.unsettled_shutdown_rooms
+            .lock()
+            .expect("shutdown rooms")
+            .retain(|(scope, _)| {
+                current_scopes
+                    .get(&scope.space_id)
+                    .is_none_or(|current| current == scope)
+            });
+    }
+
     async fn recover_fenced_room(
         &self,
         budget: &CallBudget,
@@ -1104,10 +1135,14 @@ impl HubInner {
         note: &NoteId,
     ) -> Result<bool, PortError> {
         match recover_fenced(&self.store, budget, scope, note).await {
-            Ok(recovered) => {
+            Ok(true) => {
                 self.clear_unsettled(scope, note);
-                Ok(recovered)
+                Ok(true)
             }
+            // Do not clear `unsettled_shutdown_rooms` on `Ok(false)`: `recover_fenced`
+            // also returns `Ok(false)` if the durable row is unhosted `Active` (e.g.
+            // after a failed `room.fence()`), which still requires `recover_unhosted`.
+            Ok(false) => Ok(false),
             Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
                 if diagnostic.reason == ValidationReason::HistoryIncarnationMismatch =>
             {
@@ -1815,8 +1850,8 @@ async fn watch_storage(
                 }
             }
             Err(broadcast::error::RecvError::Lagged(_)) => {
-                // Re-verify all registered peer history incarnations after a
-                // broadcast lag so no peer survives an incarnation change.
+                // Re-verify all registered peer history incarnations and prune
+                // stale unsettled entries after a broadcast lag.
                 let peer_scopes: Vec<(HistoryScope, Arc<PeerGuard>)> = {
                     let peers = hub.peers.lock().expect("peer registry");
                     peers
@@ -1824,10 +1859,14 @@ async fn watch_storage(
                         .filter_map(|peer| Some((peer.ctx.scope().clone(), peer.guard.upgrade()?)))
                         .collect()
                 };
-                let unique_spaces: HashSet<SpaceId> = peer_scopes
+                let mut unique_spaces: HashSet<SpaceId> = peer_scopes
                     .iter()
                     .map(|(scope, _)| scope.space_id.clone())
                     .collect();
+                {
+                    let unsettled = hub.unsettled_shutdown_rooms.lock().expect("shutdown rooms");
+                    unique_spaces.extend(unsettled.iter().map(|(scope, _)| scope.space_id.clone()));
+                }
                 let mut current_scopes = HashMap::with_capacity(unique_spaces.len());
                 for space_id in unique_spaces {
                     let budget = hub.budget();
@@ -1839,6 +1878,7 @@ async fn watch_storage(
                         current_scopes.insert(space_id, current);
                     }
                 }
+                hub.prune_unsettled_for_current_scopes(&current_scopes);
                 for (peer_scope, guard) in peer_scopes {
                     if current_scopes
                         .get(&peer_scope.space_id)
@@ -2219,6 +2259,204 @@ mod tests {
         let mut ok_budget = hub.0.budget();
         ok_budget.remaining = Duration::from_millis(200);
         hub.shutdown(&ok_budget).await.unwrap();
+
+        drop(hub);
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn live_replacement_room_lifecycle_and_unsettled_cleanup_invariants() {
+        let dir = TestDir::new("hub-unsettled-invariants");
+        let (store, runtime) = CanonicalRuntime::open(CanonicalConfig::local_default(
+            InstallationId::from_bytes([92; 16]),
+            notarium_core::epoch::DataRoot::new(&dir.0),
+        ))
+        .await
+        .unwrap();
+        let hub = CollabHub::new(store.clone(), CollabConfig::default()).unwrap();
+        let space_id = SpaceId::from_bytes([35; 16]);
+        let scope_v1 = HistoryScope {
+            space_id: space_id.clone(),
+            incarnation: HistoryIncarnation::from_bytes([36; 16]),
+        };
+        let scope_v2 = HistoryScope {
+            space_id: space_id.clone(),
+            incarnation: HistoryIncarnation::from_bytes([37; 16]),
+        };
+        let note = NoteId::from_bytes([38; 16]);
+        let owner = PrincipalId::from_bytes([39; 16]);
+        store
+            .create_space(notarium_canonical::CreateSpaceSpec {
+                space_id: space_id.clone(),
+                incarnation: scope_v1.incarnation,
+                root_folder_id: notarium_core::ids::FolderId::from_bytes([40; 16]),
+                slug: "hub-inv".to_owned(),
+                kind: notarium_core::auth::SpaceKind::Shared,
+                owner: owner.clone(),
+                active_epoch: notarium_core::ids::LeaseEpoch::new(1).unwrap(),
+                initial_last_seq: notarium_core::ids::SpaceSeq::ZERO,
+                created_at: None,
+            })
+            .await
+            .unwrap();
+
+        // 1. A dying room R1 removed from `active` by `room_stopped(R1, false)`
+        //    BEFORE `R1.stopped.cancel()` must NOT count as `is_live_replacement`
+        //    and must keep `(scope_v1, note)` in `unsettled_shutdown_rooms`.
+        let r1 =
+            RoomHandle::detached_for_test(scope_v1.clone(), note.clone(), Arc::clone(&hub.0.owner));
+        hub.0.room_started(&r1);
+        hub.0.room_stopped(&r1, false);
+        assert!(!r1.stopped().is_cancelled());
+        assert!(!hub.0.is_live_replacement(&r1, &scope_v1));
+        assert!(
+            hub.0
+                .unsettled_shutdown_rooms
+                .lock()
+                .unwrap()
+                .contains(&(scope_v1.clone(), note.clone()))
+        );
+
+        // 2. Starting a genuine replacement R2 clears the stale unsettled marker
+        //    atomically, and `is_live_replacement(&r2, &scope_v1)` returns true.
+        let r2 =
+            RoomHandle::detached_for_test(scope_v1.clone(), note.clone(), Arc::clone(&hub.0.owner));
+        hub.0.room_started(&r2);
+        assert!(
+            !hub.0
+                .unsettled_shutdown_rooms
+                .lock()
+                .unwrap()
+                .contains(&(scope_v1.clone(), note.clone()))
+        );
+        assert!(hub.0.is_live_replacement(&r2, &scope_v1));
+
+        // 3. After R2 exits unsettled, a stale `room_stopped(&r1, true)` must NOT
+        //    erase R2's fresh unsettled entry; and a stale `room_stopped(&r1, false)`
+        //    while R2 is active must NOT re-insert over live R2.
+        hub.0.room_stopped(&r2, false);
+        assert!(
+            hub.0
+                .unsettled_shutdown_rooms
+                .lock()
+                .unwrap()
+                .contains(&(scope_v1.clone(), note.clone()))
+        );
+        hub.0.room_stopped(&r1, true);
+        assert!(
+            hub.0
+                .unsettled_shutdown_rooms
+                .lock()
+                .unwrap()
+                .contains(&(scope_v1.clone(), note.clone())),
+            "stale R1 settled exit must not erase R2's unsettled record"
+        );
+        let r3 =
+            RoomHandle::detached_for_test(scope_v1.clone(), note.clone(), Arc::clone(&hub.0.owner));
+        hub.0.room_started(&r3);
+        hub.0.room_stopped(&r1, false);
+        assert!(
+            !hub.0
+                .unsettled_shutdown_rooms
+                .lock()
+                .unwrap()
+                .contains(&(scope_v1.clone(), note.clone())),
+            "stale R1 unsettled exit must not pollute live R3"
+        );
+        hub.0.room_stopped(&r3, false);
+
+        // 4. `recover_fenced_room` returning `Ok(false)` when the durable row
+        //    is unhosted `Active` rather than `Fenced` must NOT clear `unsettled_shutdown_rooms`.
+        let grant = notarium_core::auth::SpaceGrant {
+            role: notarium_core::auth::SpaceRole::Owner,
+            read_classes: DocClass::all(),
+            write_classes: DocClass::all(),
+            project_root: None,
+        };
+        let verified = notarium_core::auth::VerifiedHuman::attest(
+            owner.clone(),
+            notarium_core::ids::GrantId::from_bytes([43; 16]),
+            std::collections::BTreeMap::from([(space_id.clone(), grant)]),
+            true,
+        );
+        let ctx = SpaceContext::new(
+            notarium_core::auth::EngineAuthContext::for_human(verified),
+            scope_v1.clone(),
+            hub.0.budget(),
+        )
+        .unwrap();
+        let created = notarium_core::ports::NoteWritePort::create_note(
+            &store,
+            ctx,
+            notarium_core::ports::Mutation {
+                identity: notarium_core::receipt::CommandIdentity {
+                    scope: scope_v1.clone(),
+                    actor: owner.clone(),
+                    key: notarium_core::ids::CommandKey::from_bytes([44; 16]),
+                    hash: ContentDigest::from_bytes([45; 32]),
+                },
+                preconditions: notarium_core::ports::Preconditions::default(),
+                input: notarium_core::ports::CreateNote {
+                    note: note.clone(),
+                    parent: None,
+                    slug: "unhosted-active".to_owned(),
+                    class: DocClass::UserDoc,
+                    carrier: "Active.\n".to_owned(),
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+        store
+            .open_collab_session(
+                &hub.0.budget(),
+                notarium_canonical::OpenCollabSession {
+                    scope: scope_v1.clone(),
+                    note: note.clone(),
+                    owner_id: hub.0.owner.to_string(),
+                    expected_carrier_rev: created.revision,
+                    expected_lease: Some(notarium_core::ids::LeaseEpoch::ZERO),
+                    expected_lineage: None,
+                    initial_yrs_snapshot: Some(vec![0, 0]),
+                    allow_fenced_recovery: false,
+                },
+            )
+            .await
+            .unwrap();
+        let budget = hub.0.budget();
+        let rec = hub
+            .0
+            .recover_fenced_room(&budget, &scope_v1, &note)
+            .await
+            .unwrap();
+        assert!(!rec);
+        assert!(
+            hub.0
+                .unsettled_shutdown_rooms
+                .lock()
+                .unwrap()
+                .contains(&(scope_v1.clone(), note.clone())),
+            "recover_fenced_room Ok(false) over unhosted Active must preserve unsettled marker"
+        );
+
+        // 5. `prune_unsettled_for_current_scopes` removes confirmed stale incarnations
+        //    while preserving current scopes and spaces whose scope could not be read.
+        let other_space = SpaceId::from_bytes([41; 16]);
+        let other_scope = HistoryScope {
+            space_id: other_space.clone(),
+            incarnation: HistoryIncarnation::from_bytes([42; 16]),
+        };
+        hub.0
+            .unsettled_shutdown_rooms
+            .lock()
+            .unwrap()
+            .insert((other_scope.clone(), note.clone()));
+        let current = HashMap::from([(space_id.clone(), scope_v2)]);
+        hub.0.prune_unsettled_for_current_scopes(&current);
+        let remaining = hub.0.unsettled_shutdown_rooms.lock().unwrap().clone();
+        assert!(!remaining.contains(&(scope_v1, note.clone())));
+        assert!(remaining.contains(&(other_scope, note)));
 
         drop(hub);
         runtime.shutdown().await.unwrap();
