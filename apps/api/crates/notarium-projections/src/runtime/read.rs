@@ -25,7 +25,7 @@ use notarium_core::{
         SnapshotCut,
     },
     ports::*,
-    query::{CursorPage, EffectiveRead, KeysetCursor, ReadRequest},
+    query::{CursorPage, EffectiveRead, FieldFilterAstV1, KeysetCursor, Predicate, ReadRequest},
     receipt::{CausalBasis, MutationEffect, OverlayDecision, ReceiptSet, plan_overlay},
 };
 
@@ -337,6 +337,10 @@ impl ProjectionEngine {
                     let target = watermarks.required(scope)?;
                     if target <= base.cut.projected_seq {
                         base
+                    } else if query.is_none() {
+                        // A structural snapshot has no partial-page flag.
+                        self.wait_for_cut(scope, target, &ctx.budget, ctx.budget.remaining)
+                            .await?
                     } else {
                         let wait = (ctx.budget.remaining / 2).min(Duration::from_millis(50));
                         match self.wait_for_cut(scope, target, &ctx.budget, wait).await {
@@ -509,29 +513,7 @@ impl ProjectionEngine {
         cut: &PublishedCut,
         folder: &FolderId,
     ) -> Result<Option<records::FolderLocation>, PortError> {
-        self.try_location_at(cut, cut.cut.projected_seq, folder)
-            .await
-    }
-
-    pub(super) async fn try_location_at(
-        &self,
-        cut: &PublishedCut,
-        seq: SpaceSeq,
-        folder: &FolderId,
-    ) -> Result<Option<records::FolderLocation>, PortError> {
-        let mut folders = records::FolderCatalog::default();
-        let mut next = Some(folder.clone());
-        while let Some(id) = next {
-            if folders.rows.len() > MAX_FOLDER_DEPTH || folders.rows.contains_key(&id) {
-                return Ok(None);
-            }
-            let Some(row) = cut.store.folder_by_id(&cut.cut.scope, seq, &id).await? else {
-                return Ok(None);
-            };
-            next = row.parent_folder_id.clone();
-            folders.rows.insert(id, row);
-        }
-        folders.location(folder).map(Some)
+        cut.try_location_at(cut.cut.projected_seq, folder).await
     }
 
     async fn open_read(
@@ -717,7 +699,7 @@ impl ProjectionEngine {
                 .map(|row| row.folder_id);
         }
         let project = if matches!(source.scope, crate::nota::SourceScope::Project) {
-            self.try_location_at(cut, seq, &view.parent_folder_id)
+            cut.try_location_at(seq, &view.parent_folder_id)
                 .await?
                 .and_then(|location| location.project)
         } else {
@@ -1156,7 +1138,7 @@ impl ProjectionEngine {
                 .hydrate_current_cards(ctx.scope(), cut.cut.projected_seq, ids)
                 .await?
         {
-            let permit = cut.live.try_read()?;
+            let permit = cut.live.read(&ctx.budget).await?;
             if let Some(expected_head) = require_head {
                 ensure_active_head(&permit, expected_head)?;
             } else if permit.space().lifecycle != SpaceLifecycle::Active {
@@ -1203,7 +1185,7 @@ impl ProjectionEngine {
             }
         }
         let planned = self.hydration_plan(ctx, cut, ids, overlay).await?;
-        let permit = cut.live.try_read()?;
+        let permit = cut.live.read(&ctx.budget).await?;
         if let Some(expected_head) = require_head {
             ensure_active_head(&permit, expected_head)?;
         } else if permit.space().lifecycle != SpaceLifecycle::Active {
@@ -1434,6 +1416,31 @@ fn authorize_query(
     Ok(entry)
 }
 
+/// Untainted entry-folder visibility check for probes (`is_live_visible`,
+/// `filter_live_visible`) that must not taint cross-space callers before a
+/// live note is confirmed visible.
+fn can_view_query_entry(
+    permit: &LiveReadPermit,
+    ctx: &SpaceContext,
+    root: &FolderId,
+    requested: Option<&FolderId>,
+    active_only: bool,
+) -> Result<FolderId, PortError> {
+    let grant = ctx
+        .auth()
+        .spaces()
+        .get(&ctx.scope().space_id)
+        .ok_or(DomainError::ResourceNotFound)?;
+    let entry = query::entry_folder(grant, root, requested).clone();
+    ctx.check_current(permit.scope())?;
+    let facts = permit
+        .active_folder_facts(&entry, active_only)
+        .ok_or(DomainError::ResourceNotFound)?;
+    ctx.auth()
+        .can_view_folder(permit.space(), &entry, &facts.ancestor_folders)?;
+    Ok(entry)
+}
+
 pub(super) fn ensure_active(
     permit: &LiveReadPermit,
     ctx: &SpaceContext,
@@ -1538,7 +1545,7 @@ async fn next_visibility_batch(
 ) -> Result<LiveReadPermit, PortError> {
     tokio::task::yield_now().await;
     // The same handle validates its history and lease epoch on each acquisition.
-    let permit = cut.live.try_read()?;
+    let permit = cut.live.read(&ctx.budget).await?;
     ctx.check_current(permit.scope())?;
     if permit.space().lifecycle != SpaceLifecycle::Active {
         return Err(DomainError::ResourceNotFound.into());
@@ -1733,9 +1740,40 @@ impl NoteReadPort for ProjectedNoteReadPort {
     }
 }
 
+impl PublishedCut {
+    pub(super) async fn try_location_at(
+        &self,
+        seq: SpaceSeq,
+        folder: &FolderId,
+    ) -> Result<Option<records::FolderLocation>, PortError> {
+        let mut folders = records::FolderCatalog::default();
+        let mut next = Some(folder.clone());
+        while let Some(id) = next {
+            if folders.rows.len() > MAX_FOLDER_DEPTH || folders.rows.contains_key(&id) {
+                return Ok(None);
+            }
+            let Some(row) = self.store.folder_by_id(&self.cut.scope, seq, &id).await? else {
+                return Ok(None);
+            };
+            next = row.parent_folder_id.clone();
+            folders.rows.insert(id, row);
+        }
+        folders.location(folder).map(Some)
+    }
+}
+
+struct FolderScope {
+    ancestors: Vec<FolderId>,
+    project: Option<FolderId>,
+    descendants: Vec<FolderId>,
+}
+
 struct Snapshot {
     cut: SnapshotCut,
-    _published: Arc<PublishedCut>,
+    published: Arc<PublishedCut>,
+    canonical: notarium_canonical::CanonicalStore,
+    authority: ServiceAuthority,
+    request_deadline: Instant,
     index: IndexView,
     visible: Bitmap,
     ctx: SpaceContext,
@@ -1744,10 +1782,223 @@ struct Snapshot {
 }
 
 impl Snapshot {
-    fn live_node(&self, id: u32) -> bool {
-        self.live
-            .try_read()
-            .is_ok_and(|permit| self.visible_under(&permit, id))
+    fn remaining(&self) -> Result<Duration, PortError> {
+        let now = Instant::now();
+        if self.expires <= now {
+            return Err(stale());
+        }
+        let remaining = self
+            .request_deadline
+            .min(self.expires)
+            .saturating_duration_since(now);
+        if self.ctx.budget.cancellation.is_cancelled() {
+            return Err(cancelled_not_committed(
+                "structural_snapshot",
+                "caller cancelled",
+            ));
+        }
+        if remaining.is_zero() {
+            return Err(deadline_not_committed(
+                "structural_snapshot",
+                "caller deadline exhausted",
+            ));
+        }
+        Ok(remaining)
+    }
+
+    async fn within_request<T>(
+        &self,
+        task: impl std::future::Future<Output = Result<T, PortError>>,
+    ) -> Result<T, PortError> {
+        let mut ctx = self.ctx.clone();
+        ctx.budget.remaining = self.remaining()?;
+        let result = within_budget(&ctx, task).await?;
+        self.remaining()?;
+        Ok(result)
+    }
+
+    fn budget(&self) -> Result<CallBudget, PortError> {
+        let mut budget = self.ctx.budget.clone();
+        budget.remaining = self.remaining()?;
+        Ok(budget)
+    }
+
+    async fn read_live(&self) -> Result<LiveReadPermit, PortError> {
+        self.live.read(&self.budget()?).await
+    }
+
+    fn maintenance(&self) -> Result<MaintenanceContext, PortError> {
+        Ok(MaintenanceContext {
+            authority: self.authority.clone(),
+            budget: self.budget()?,
+        })
+    }
+
+    async fn historical_descendants(&self, folder: &FolderId) -> Result<Vec<FolderId>, PortError> {
+        let mut frontier = vec![folder.clone()];
+        let mut descendants = BTreeSet::new();
+        while !frontier.is_empty() {
+            let mut children = Vec::new();
+            for parents in frontier.chunks(200) {
+                let rows = self
+                    .canonical
+                    .read_projection_folder_children_at_cut(
+                        &self.maintenance()?,
+                        &self.cut.scope,
+                        self.cut.projected_seq,
+                        parents,
+                    )
+                    .await?;
+                for child in rows {
+                    if &child == folder || !descendants.insert(child.clone()) {
+                        return Err(DomainError::validation(ValidationReason::InvalidState).into());
+                    }
+                    children.push(child);
+                }
+            }
+            frontier = children;
+        }
+        Ok(descendants.into_iter().collect())
+    }
+
+    async fn folder_scope(
+        &self,
+        folder: &FolderId,
+        include_children: bool,
+    ) -> Result<FolderScope, PortError> {
+        authorize_entry(&self.read_live().await?, &self.ctx, folder)?;
+        if self.index.dense_folder_id(folder).is_none() {
+            return Err(DomainError::ResourceNotFound.into());
+        }
+        let scope = {
+            let derived = async {
+                let location = self
+                    .published
+                    .try_location_at(self.cut.projected_seq, folder)
+                    .await?
+                    .filter(|location| !location.trashed)
+                    .ok_or(DomainError::ResourceNotFound)?;
+                let descendants = if include_children {
+                    self.published
+                        .store
+                        .active_descendants(
+                            &self.cut.scope,
+                            self.cut.projected_seq,
+                            folder,
+                            &location.norm_path,
+                        )
+                        .await?
+                } else {
+                    Vec::new()
+                };
+                Ok(FolderScope {
+                    ancestors: location.ids,
+                    project: location.project,
+                    descendants,
+                })
+            }
+            .await;
+            match derived {
+                Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
+                    if diagnostic.reason == ValidationReason::CursorStale =>
+                {
+                    let (ancestors, project) = self
+                        .canonical
+                        .read_projection_folder_ancestry_at_cut(
+                            &self.maintenance()?,
+                            &self.cut.scope,
+                            self.cut.projected_seq,
+                            folder,
+                        )
+                        .await?
+                        .ok_or(DomainError::ResourceNotFound)?;
+                    let descendants = if include_children {
+                        self.historical_descendants(folder).await?
+                    } else {
+                        Vec::new()
+                    };
+                    FolderScope {
+                        ancestors,
+                        project,
+                        descendants,
+                    }
+                }
+                result => result?,
+            }
+        };
+        let permit = self.read_live().await?;
+        authorize_entry(&permit, &self.ctx, folder)?;
+        self.ctx
+            .auth()
+            .can_view_folder(permit.space(), folder, &scope.ancestors)?;
+        Ok(scope)
+    }
+
+    async fn verify_filter_page(
+        &self,
+        page: Vec<u32>,
+        predicate: &Predicate,
+    ) -> Result<Bitmap, PortError> {
+        let derived = self
+            .published
+            .store
+            .hydrate_query_rows(&self.cut.scope, self.cut.projected_seq, &page)
+            .await;
+        match derived {
+            Ok(rows) if rows.len() == page.len() => {
+                let mut matches = Bitmap::new();
+                let mut complete = true;
+                for (row, expected) in rows.into_iter().zip(&page) {
+                    let Some(row) = row.filter(|row| row.dense_id == *expected) else {
+                        complete = false;
+                        break;
+                    };
+                    if predicate.matches(&row.evaluated_fields()?) {
+                        matches.add(row.dense_id);
+                    }
+                }
+                if complete {
+                    return Ok(matches);
+                }
+            }
+            Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
+                if diagnostic.reason == ValidationReason::CursorStale => {}
+            Err(error) => return Err(error),
+            Ok(_) => {}
+        }
+        let notes = page
+            .iter()
+            .copied()
+            .map(|dense| self.index.note_id(self.index.dense(dense)))
+            .collect::<DomainResult<Vec<_>>>()?;
+        let rows = self
+            .canonical
+            .read_projection_note_metadata_batch(
+                &self.maintenance()?,
+                &self.cut.scope,
+                self.cut.projected_seq,
+                notes,
+            )
+            .await?;
+        let mut matches = Bitmap::new();
+        for (note, row) in rows {
+            if predicate.matches(&records::field_observations(&row, &self.published.fields)) {
+                matches.add(self.index.dense_id(&note).ok_or_else(stale)?);
+            }
+        }
+        Ok(matches)
+    }
+
+    fn live_permit(&self) -> DomainResult<LiveReadPermit> {
+        self.live.try_read().map_err(|error| match error {
+            PortError::Domain(domain) => domain,
+            _ => DomainError::validation(ValidationReason::NotReady),
+        })
+    }
+
+    fn live_node(&self, id: u32) -> DomainResult<bool> {
+        let permit = self.live_permit()?;
+        Ok(self.visible_under(&permit, id))
     }
 
     fn visible_under(&self, permit: &LiveReadPermit, id: u32) -> bool {
@@ -1768,11 +2019,143 @@ impl Snapshot {
             .is_some_and(|note| ensure_active(permit, &self.ctx, &note).is_ok())
     }
 
-    fn live_edge(&self, focal: u32, adjacent: u32) -> bool {
+    fn live_edges<'a>(
+        &'a self,
+        id: u32,
+        edges: impl Iterator<Item = u32> + Send + 'a,
+    ) -> DomainResult<DenseNodeIter<'a>> {
+        let permit = self.live_permit()?;
+        if !self.visible_under(&permit, id) {
+            return Err(DomainError::ResourceNotFound);
+        }
+        let verified_head = permit.head();
+        if verified_head == self.cut.canonical_seq {
+            drop(permit);
+            return Ok(DenseNodeIter::from_iter(
+                self.cut.generation,
+                edges.filter(move |neighbor| {
+                    self.visible.contains(*neighbor)
+                        && self.live_edge_after_commit(id, *neighbor, verified_head)
+                }),
+            ));
+        }
+        let neighbors: Vec<u32> = edges
+            .filter(|&neighbor| self.visible_under(&permit, neighbor))
+            .collect();
+        drop(permit);
+        // Neighbors are verified eagerly under `live_permit()?` so write-lock
+        // contention propagates `NotReady` instead of silently dropping edges.
+        // Keep a fail-closed check on iteration so an iterator retained across
+        // a subsequent trash mutation stops yielding edges.
+        Ok(DenseNodeIter::from_iter(
+            self.cut.generation,
+            neighbors
+                .into_iter()
+                .filter(move |&neighbor| self.live_edge_after_commit(id, neighbor, verified_head)),
+        ))
+    }
+
+    fn live_edge_after_commit(&self, focal: u32, adjacent: u32, verified_head: SpaceSeq) -> bool {
+        if self.expires <= Instant::now() {
+            return false;
+        }
         self.live.try_read().is_ok_and(|permit| {
-            self.visible_under(&permit, focal) && self.visible_under(&permit, adjacent)
+            permit.space().lifecycle == SpaceLifecycle::Active
+                && (permit.head() == verified_head
+                    || (self.visible_under(&permit, focal)
+                        && self.visible_under(&permit, adjacent)))
         })
     }
+
+    /// Filter a dense bitmap against the current live fence in bounded batches,
+    /// waiting for brief writer holds instead of dropping hits under `try_read()`.
+    async fn filter_bitmap_live(
+        &self,
+        rows: Bitmap,
+        entry_folder: Option<&FolderId>,
+    ) -> Result<Bitmap, PortError> {
+        const LIVE_BITMAP_BATCH: usize = 64;
+        'verify: loop {
+            self.remaining()?;
+            let mut permit = self.read_live().await?;
+            if let Some(folder) = entry_folder {
+                authorize_entry(&permit, &self.ctx, folder)?;
+            } else if permit.space().lifecycle != SpaceLifecycle::Active {
+                return Err(DomainError::ResourceNotFound.into());
+            }
+            let head = permit.head();
+            if head == self.cut.canonical_seq {
+                let mut verified = rows;
+                verified.and_inplace(&self.visible);
+                return Ok(verified);
+            }
+            let mut verified = Bitmap::new();
+            let mut next = Some(0u32);
+            let mut batch_index = 0usize;
+            while let Some(start) = next.take() {
+                if batch_index > 0 {
+                    drop(permit);
+                    tokio::task::yield_now().await;
+                    permit = self.read_live().await?;
+                    if let Some(folder) = entry_folder {
+                        authorize_entry(&permit, &self.ctx, folder)?;
+                    } else if permit.space().lifecycle != SpaceLifecycle::Active {
+                        return Err(DomainError::ResourceNotFound.into());
+                    }
+                    if permit.head() != head {
+                        continue 'verify;
+                    }
+                }
+                batch_index += 1;
+                let mut raw = [0u32; LIVE_BITMAP_BATCH];
+                let mut iter = rows.iter();
+                iter.reset_at_or_after(start);
+                let count = iter.next_many(&mut raw);
+                if count == 0 {
+                    break;
+                }
+                next = raw[count - 1].checked_add(1);
+                for &id in &raw[..count] {
+                    if self.visible_under(&permit, id) {
+                        verified.add(id);
+                    }
+                }
+            }
+            return Ok(verified);
+        }
+    }
+}
+
+/// Stop at the visible limit or exhaustion. Otherwise release the live permit
+/// before examining another batch of potentially hidden neighbors.
+fn collect_neighbor_batch(
+    edges: &mut impl Iterator<Item = u32>,
+    found: &mut Vec<DenseNodeId>,
+    end: usize,
+    mut visible: impl FnMut(u32) -> Option<DenseNodeId>,
+) -> bool {
+    for _ in 0..VISIBILITY_BATCH {
+        let Some(id) = edges.next() else { return true };
+        if let Some(node) = visible(id) {
+            found.push(node);
+            if found.len() == end {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[test]
+fn bounded_neighbor_pages_do_not_expand_the_rest_of_a_hub() {
+    let generation = ProjectionGeneration::new(1).unwrap();
+    let mut edges = 0..100_000;
+    let mut found = Vec::new();
+    while !collect_neighbor_batch(&mut edges, &mut found, 64, |id| {
+        (id % 2 == 0).then(|| DenseNodeId::new(generation, id))
+    }) {}
+    assert_eq!(found.len(), 64);
+    assert_eq!(edges.next(), Some(127));
 }
 
 /// Own the compressed posting while the consumer is suspended. Re-seek once
@@ -1805,109 +2188,201 @@ impl StructuralSnapshot for Snapshot {
         &self.cut
     }
 
-    fn lookup(&self, note: &NoteId) -> Option<DenseNodeId> {
-        let id = self.index.dense_id(note)?;
-        self.live_node(id).then(|| self.index.dense(id))
+    fn lookup(&self, note: &NoteId) -> DomainResult<Option<DenseNodeId>> {
+        let Some(id) = self.index.dense_id(note) else {
+            return Ok(None);
+        };
+        Ok(self.live_node(id)?.then(|| self.index.dense(id)))
     }
 
     fn note_id(&self, node: DenseNodeId) -> DomainResult<NoteId> {
-        if !self.live_node(node.index(self.cut.generation)?) {
+        if !self.live_node(node.index(self.cut.generation)?)? {
             return Err(DomainError::ResourceNotFound);
         }
         self.index.note_id(node)
     }
 
-    fn folder_subtree(&self, folder: &FolderId) -> DomainResult<DenseNodeIter<'_>> {
-        let permit = self
-            .live
-            .try_read()
-            .map_err(|_| DomainError::ResourceNotFound)?;
-        authorize_entry(&permit, &self.ctx, folder).map_err(|_| DomainError::ResourceNotFound)?;
-        let initial_head = permit.head();
-        let id = self
-            .index
-            .dense_folder_id(folder)
-            .ok_or(DomainError::ResourceNotFound)?;
-        let mut rows = self
-            .index
-            .posting(&PostingKey::FolderSubtree(id))
-            .map_err(|_| DomainError::ResourceNotFound)?;
-        rows.and_inplace(&self.visible);
-        drop(permit);
-        let folder = folder.clone();
-        // Re-verify once per 64-node batch under a single live permit instead
-        // of acquiring `RwLock::try_read()` on every node.
-        let mut next = Some(0u32);
-        let mut batch = Vec::with_capacity(64);
-        let mut offset = 0usize;
-        let ids = std::iter::from_fn(move || {
-            loop {
-                if offset < batch.len() {
-                    let id = batch[offset];
-                    offset += 1;
-                    return Some(id);
-                }
-                let start = next.take()?;
-                let mut raw = [0u32; 64];
-                let mut iter = rows.iter();
-                iter.reset_at_or_after(start);
-                let count = iter.next_many(&mut raw);
-                if count == 0 {
-                    return None;
-                }
-                next = raw[count - 1].checked_add(1);
-                let Ok(permit) = self.live.try_read() else {
-                    next = None;
-                    return None;
-                };
-                if self.expires <= Instant::now()
-                    || permit.space().lifecycle != SpaceLifecycle::Active
-                    || (permit.head() != initial_head
-                        && authorize_entry(&permit, &self.ctx, &folder).is_err())
-                {
-                    next = None;
-                    return None;
-                }
-                batch.clear();
-                offset = 0;
-                if permit.head() == self.cut.canonical_seq {
-                    batch.extend_from_slice(&raw[..count]);
-                } else {
-                    for &id in &raw[..count] {
-                        if self.visible_under(&permit, id) {
-                            batch.push(id);
+    fn doc_class(&self, node: DenseNodeId) -> DomainResult<DocClass> {
+        let index = node.index(self.cut.generation)?;
+        if !self.live_node(index)? {
+            return Err(DomainError::ResourceNotFound);
+        }
+        self.index
+            .note_header(index)
+            .map(|header| header.doc_class)
+            .ok_or(DomainError::ResourceNotFound)
+    }
+
+    fn folder_descendants<'a>(&'a self, folder: &'a FolderId) -> PortFuture<'a, Vec<FolderId>> {
+        Box::pin(async move {
+            self.within_request(async {
+                let descendants = self.folder_scope(folder, true).await?.descendants;
+                // Yield the live fence between batches. If a writer changes it,
+                // revalidate the prefix under the new head before returning IDs.
+                'verify: loop {
+                    self.remaining()?;
+                    let mut permit = self.read_live().await?;
+                    authorize_entry(&permit, &self.ctx, folder)?;
+                    let head = permit.head();
+                    let mut result = Vec::with_capacity(1 + descendants.len());
+                    result.push(folder.clone());
+                    if head == self.cut.projected_seq {
+                        result.extend(descendants);
+                        return Ok(result);
+                    }
+                    for (i, batch) in descendants.chunks(VISIBILITY_BATCH).enumerate() {
+                        if i > 0 {
+                            drop(permit);
+                            tokio::task::yield_now().await;
+                            permit = self.read_live().await?;
+                            authorize_entry(&permit, &self.ctx, folder)?;
+                            if permit.head() != head {
+                                continue 'verify;
+                            }
+                        }
+                        for child in batch {
+                            if let Some(facts) = permit.folder_facts(child)
+                                && self
+                                    .ctx
+                                    .auth()
+                                    .can_view_folder(permit.space(), child, &facts.ancestor_folders)
+                                    .is_ok()
+                            {
+                                result.push(child.clone());
+                            }
                         }
                     }
+                    return Ok(result);
                 }
-            }
-        });
-        Ok(DenseNodeIter::from_iter(self.cut.generation, ids))
+            })
+            .await
+        })
+    }
+
+    fn enclosing_project<'a>(&'a self, folder: &'a FolderId) -> PortFuture<'a, Option<FolderId>> {
+        Box::pin(async move {
+            self.within_request(async {
+                let location = self.folder_scope(folder, false).await?;
+                if let Some(project) = &location.project {
+                    authorize_entry(&self.read_live().await?, &self.ctx, project)?;
+                }
+                Ok(location.project)
+            })
+            .await
+        })
+    }
+
+    fn filter_notes<'a>(
+        &'a self,
+        filter: &'a FieldFilterAstV1,
+    ) -> PortFuture<'a, Option<DenseNodeIter<'a>>> {
+        Box::pin(async move {
+            self.within_request(async {
+                filter.validate_declared(&self.published.fields)?;
+                if matches!(&filter.predicate, Predicate::All(terms) if terms.is_empty()) {
+                    return Ok(None);
+                }
+                let matches = query::exact_filter_pages(
+                    &self.index,
+                    &self.visible,
+                    &filter.predicate,
+                    |page| self.verify_filter_page(page, &filter.predicate),
+                )
+                .await?;
+                let verified = self.filter_bitmap_live(matches, None).await?;
+                Ok(Some(DenseNodeIter::from_iter(
+                    self.cut.generation,
+                    bitmap_ids(verified),
+                )))
+            })
+            .await
+        })
+    }
+
+    fn folder_subtree<'a>(&'a self, folder: &'a FolderId) -> PortFuture<'a, DenseNodeIter<'a>> {
+        Box::pin(async move {
+            self.within_request(async {
+                let permit = self.read_live().await?;
+                authorize_entry(&permit, &self.ctx, folder)?;
+                let id = self
+                    .index
+                    .dense_folder_id(folder)
+                    .ok_or(DomainError::ResourceNotFound)?;
+                let mut rows = self
+                    .index
+                    .posting(&PostingKey::FolderSubtree(id))
+                    .map_err(|_| DomainError::ResourceNotFound)?;
+                rows.and_inplace(&self.visible);
+                drop(permit);
+                let verified = self.filter_bitmap_live(rows, Some(folder)).await?;
+                Ok(DenseNodeIter::from_iter(
+                    self.cut.generation,
+                    bitmap_ids(verified),
+                ))
+            })
+            .await
+        })
+    }
+
+    fn neighbor_page(
+        &self,
+        node: DenseNodeId,
+        per_direction: PageLimit,
+    ) -> PortFuture<'_, Vec<DenseNodeId>> {
+        Box::pin(async move {
+            self.within_request(async {
+                let focal = node.index(self.cut.generation)?;
+                let limit = usize::from(per_direction.get());
+                'verify: loop {
+                    let mut permit = self.read_live().await?;
+                    if !self.visible_under(&permit, focal) {
+                        return Err(DomainError::ResourceNotFound.into());
+                    }
+                    let head = permit.head();
+                    let mut found = Vec::with_capacity(limit * 2);
+                    for incoming in [false, true] {
+                        let end = found.len() + limit;
+                        let mut neighbors = self.index.neighbors(focal, incoming);
+                        while !collect_neighbor_batch(&mut neighbors, &mut found, end, |id| {
+                            self.visible_under(&permit, id)
+                                .then(|| self.index.dense(id))
+                        }) {
+                            drop(permit);
+                            tokio::task::yield_now().await;
+                            permit = self.read_live().await?;
+                            if permit.head() != head {
+                                continue 'verify;
+                            }
+                            if !self.visible_under(&permit, focal) {
+                                return Err(DomainError::ResourceNotFound.into());
+                            }
+                        }
+                    }
+                    return Ok(found);
+                }
+            })
+            .await
+        })
+    }
+
+    fn wait_ready(&self) -> PortFuture<'_, ()> {
+        Box::pin(async move {
+            self.within_request(async {
+                let _permit = self.read_live().await?;
+                Ok(())
+            })
+            .await
+        })
     }
 
     fn outgoing(&self, node: DenseNodeId) -> DomainResult<DenseNodeIter<'_>> {
         let id = node.index(self.cut.generation)?;
-        if !self.live_node(id) {
-            return Err(DomainError::ResourceNotFound);
-        }
-        Ok(DenseNodeIter::from_iter(
-            self.cut.generation,
-            self.index
-                .outgoing(id)
-                .filter(move |neighbor| self.live_edge(id, *neighbor)),
-        ))
+        self.live_edges(id, self.index.outgoing(id))
     }
 
     fn incoming(&self, node: DenseNodeId) -> DomainResult<DenseNodeIter<'_>> {
         let id = node.index(self.cut.generation)?;
-        if !self.live_node(id) {
-            return Err(DomainError::ResourceNotFound);
-        }
-        Ok(DenseNodeIter::from_iter(
-            self.cut.generation,
-            self.index
-                .incoming(id)
-                .filter(move |neighbor| self.live_edge(id, *neighbor)),
-        ))
+        self.live_edges(id, self.index.incoming(id))
     }
 }
 
@@ -1919,9 +2394,12 @@ impl StructuralReadPort for ProjectionEngine {
     ) -> PortFuture<'_, Box<dyn StructuralSnapshot>> {
         Box::pin(async move {
             within_budget(&ctx, async {
+                let request_deadline = Instant::now()
+                    .checked_add(ctx.budget.remaining)
+                    .ok_or_else(not_ready)?;
                 let cut = self.choose_read(&ctx, &causal, None).await?.cut;
                 let index = self.open_index_async(&cut).await?;
-                let permit = cut.live.try_read()?;
+                let permit = cut.live.read(&ctx.budget).await?;
                 authorize_query(&permit, &ctx, &cut.root_folder_id, None, true)?;
                 let universe = query::structural_universe(&index, permit.space(), ctx.auth())?;
                 let (visible, permit) = current_bitmap(
@@ -1940,7 +2418,10 @@ impl StructuralReadPort for ProjectionEngine {
                 let live = cut.live.clone();
                 let snapshot: Box<dyn StructuralSnapshot> = Box::new(Snapshot {
                     cut: snapshot_cut,
-                    _published: cut,
+                    published: cut,
+                    canonical: self.canonical.clone(),
+                    authority: self.projection_context.authority.clone(),
+                    request_deadline,
                     index,
                     visible,
                     ctx: ctx.clone(),
@@ -1955,68 +2436,68 @@ impl StructuralReadPort for ProjectionEngine {
         })
     }
 
-    fn is_live_visible(&self, ctx: &SpaceContext, note: &NoteId) -> DomainResult<bool> {
-        let generation = self.generation.load().store.generation();
-        let _admission = self
-            .current_admission(generation)
-            .map_err(|_| DomainError::validation(ValidationReason::NotReady))?;
-        let permit = self
-            .live_handle(ctx.scope())
-            .and_then(|handle| handle.try_read())
-            .map_err(|error| match error {
-                PortError::Domain(error) => error,
-                _ => DomainError::ResourceNotFound,
-            })?;
-        authorize_query(&permit, ctx, permit.root_folder_id(), None, true).map_err(|error| {
-            match error {
-                PortError::Domain(error) => error,
-                _ => DomainError::ResourceNotFound,
-            }
-        })?;
-        match permit
-            .classify(ctx, note, true)
-            .map_err(|_| DomainError::ResourceNotFound)?
-        {
-            LiveNoteStatus::ActiveVisible(facts) => {
-                ctx.auth().authorize_read(&facts)?;
-                Ok(true)
-            }
-            _ => Ok(false),
-        }
+    fn is_live_visible<'a>(
+        &'a self,
+        ctx: &'a SpaceContext,
+        note: &'a NoteId,
+    ) -> PortFuture<'a, bool> {
+        Box::pin(async move {
+            within_budget(ctx, async {
+                drop(self.current_admission(self.active_generation())?);
+                let handle = self.live_handle_async(ctx.scope(), &ctx.budget).await?;
+                let permit = handle.read(&ctx.budget).await?;
+                let _admission = self.current_admission(self.active_generation())?;
+                can_view_query_entry(&permit, ctx, permit.root_folder_id(), None, true)?;
+                match permit.classify(ctx, note, true)? {
+                    LiveNoteStatus::ActiveVisible(facts) => {
+                        ctx.auth().authorize_read(&facts)?;
+                        Ok(true)
+                    }
+                    _ => Ok(false),
+                }
+            })
+            .await
+        })
     }
 
-    fn filter_live_visible(&self, ctx: &SpaceContext, notes: &[NoteId]) -> DomainResult<Vec<bool>> {
-        let generation = self.generation.load().store.generation();
-        let _admission = self
-            .current_admission(generation)
-            .map_err(|_| DomainError::validation(ValidationReason::NotReady))?;
-        let permit = self
-            .live_handle(ctx.scope())
-            .and_then(|handle| handle.try_read())
-            .map_err(|error| match error {
-                PortError::Domain(error) => error,
-                _ => DomainError::ResourceNotFound,
-            })?;
-        authorize_query(&permit, ctx, permit.root_folder_id(), None, true).map_err(|error| {
-            match error {
-                PortError::Domain(error) => error,
-                _ => DomainError::ResourceNotFound,
-            }
-        })?;
-        let mut results = Vec::with_capacity(notes.len());
-        for note in notes {
-            match permit
-                .classify(ctx, note, true)
-                .map_err(|_| DomainError::ResourceNotFound)?
-            {
-                LiveNoteStatus::ActiveVisible(facts) => {
-                    ctx.auth().authorize_read(&facts)?;
-                    results.push(true);
+    fn filter_live_visible<'a>(
+        &'a self,
+        ctx: &'a SpaceContext,
+        notes: &'a [NoteId],
+    ) -> PortFuture<'a, Vec<bool>> {
+        Box::pin(async move {
+            within_budget(ctx, async {
+                drop(self.current_admission(self.active_generation())?);
+                let handle = self.live_handle_async(ctx.scope(), &ctx.budget).await?;
+                let mut results = Vec::with_capacity(notes.len());
+                let mut checked_head = None;
+                loop {
+                    {
+                        let permit = handle.read(&ctx.budget).await?;
+                        let _admission = self.current_admission(self.active_generation())?;
+                        can_view_query_entry(&permit, ctx, permit.root_folder_id(), None, true)?;
+                        if checked_head != Some(permit.head()) {
+                            results.clear();
+                            checked_head = Some(permit.head());
+                        }
+                        for note in notes[results.len()..].iter().take(VISIBILITY_BATCH) {
+                            match permit.classify(ctx, note, true)? {
+                                LiveNoteStatus::ActiveVisible(facts) => {
+                                    ctx.auth().authorize_read(&facts)?;
+                                    results.push(true);
+                                }
+                                _ => results.push(false),
+                            }
+                        }
+                        if results.len() == notes.len() {
+                            return Ok(results);
+                        }
+                    }
+                    tokio::task::yield_now().await;
                 }
-                _ => results.push(false),
-            }
-        }
-        Ok(results)
+            })
+            .await
+        })
     }
 
     fn hydrate(
@@ -2031,9 +2512,13 @@ impl StructuralReadPort for ProjectionEngine {
                 drop(self.current_admission(self.active_generation())?);
                 // A retained cut can use canonical hydration while this
                 // Space is still binding the newly selected generation.
-                let live = self.canonical.live_visibility_fence().space(ctx.scope())?;
+                let live = self
+                    .canonical
+                    .live_visibility_fence()
+                    .read_space(ctx.scope(), &ctx.budget)
+                    .await?;
                 let head = {
-                    let permit = live.try_read()?;
+                    let permit = live.read(&ctx.budget).await?;
                     authorize_query(&permit, &ctx, permit.root_folder_id(), None, true)?;
                     permit.head()
                 };
@@ -2071,7 +2556,7 @@ impl StructuralReadPort for ProjectionEngine {
                             .map(|slot| slot.and_then(|_| cards.next().flatten()))
                             .collect();
                         let _admission = self.current_admission(current.cut.generation)?;
-                        let permit = live.try_read()?;
+                        let permit = live.read(&ctx.budget).await?;
                         if permit.space().lifecycle != SpaceLifecycle::Active {
                             return Err(DomainError::ResourceNotFound.into());
                         }
@@ -2106,7 +2591,7 @@ impl StructuralReadPort for ProjectionEngine {
                     );
                 }
                 let _admission = self.current_admission(self.active_generation())?;
-                let permit = live.try_read()?;
+                let permit = live.read(&ctx.budget).await?;
                 if permit.space().lifecycle != SpaceLifecycle::Active {
                     return Err(DomainError::ResourceNotFound.into());
                 }

@@ -396,10 +396,36 @@ async fn is_live_visible_hydrate_and_note_links_enforce_cross_space_taint_and_au
         SpaceContext::new(auth, scope_b.clone(), budget()).unwrap()
     };
 
-    // 1. StructuralReadPort::is_live_visible must taint cross-space reads.
+    // 1. StructuralReadPort::is_live_visible must not taint on Ok(false),
+    // and must taint cross-space reads on Ok(true).
+    let ctx_miss = cross_ctx();
+    let absent_note = NoteId::from_bytes(rand16());
+    assert!(!ctx_miss.auth().taint().is_tainted());
+    assert!(
+        !engine
+            .is_live_visible(&ctx_miss, &absent_note)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !ctx_miss.auth().taint().is_tainted(),
+        "is_live_visible returning false must not taint cross-space branches"
+    );
+    assert_eq!(
+        engine
+            .filter_live_visible(&ctx_miss, std::slice::from_ref(&absent_note))
+            .await
+            .unwrap(),
+        vec![false]
+    );
+    assert!(
+        !ctx_miss.auth().taint().is_tainted(),
+        "filter_live_visible with all-false results must not taint cross-space branches"
+    );
+
     let ctx1 = cross_ctx();
     assert!(!ctx1.auth().taint().is_tainted());
-    assert!(engine.is_live_visible(&ctx1, &note_b.note).unwrap());
+    assert!(engine.is_live_visible(&ctx1, &note_b.note).await.unwrap());
     assert!(
         ctx1.auth().taint().is_tainted(),
         "is_live_visible must taint cross-space branches"
@@ -858,7 +884,7 @@ async fn lagged_folder_visibility_yields_to_writers_and_rejects_a_mixed_head() {
         .acquire_snapshot(reader.clone(), causal.clone())
         .await
         .unwrap();
-    assert_eq!(warm.folder_subtree(&project).unwrap().count(), 40);
+    assert_eq!(warm.folder_subtree(&project).await.unwrap().count(), 40);
 
     let mut projection = engine.pause_before_projection_for_test(&scope, 1).unwrap();
     let mut mv = mutation(
@@ -3003,6 +3029,7 @@ async fn hydrate_older_snapshot_checks_recorded_facts_and_schema_move_updates_fe
             &public_ctx,
             &public_schema_note.note,
         )
+        .await
         .unwrap(),
         "update_space_schema moving an existing note out of project_root must update live fence"
     );
@@ -3327,6 +3354,212 @@ async fn backlink_lookahead_taints_and_tainted_mutation_hides_foreign_personal_c
 
     runtime.shutdown().await.unwrap();
     canonical.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn snapshot_outgoing_and_incoming_enforce_live_fence_and_propagate_not_ready() {
+    use notarium_core::error::ValidationReason;
+
+    let scratch = Scratch::new();
+    let root = scratch.root();
+    let installation = InstallationId::from_bytes(rand16());
+    let (store, canonical) =
+        CanonicalRuntime::open(CanonicalConfig::local_default(installation, root.clone()))
+            .await
+            .unwrap();
+    let (scope, owner) = open_space(&store, SpaceKind::Personal).await;
+    let (temp_folder, temp_folder_rev) =
+        create_folder(&store, &owner, None, "edge-fence-hold", false).await;
+    let target = create_note(
+        &store,
+        &owner,
+        None,
+        "edge-target",
+        DocClass::UserDoc,
+        "Target\n".into(),
+    )
+    .await;
+    let source = create_note(
+        &store,
+        &owner,
+        None,
+        "edge-source",
+        DocClass::UserDoc,
+        format!("See [[{}]]\n", target.note),
+    )
+    .await;
+    let target2 = create_note(
+        &store,
+        &owner,
+        None,
+        "edge-target-2",
+        DocClass::UserDoc,
+        "Target 2\n".into(),
+    )
+    .await;
+    let source2 = create_note(
+        &store,
+        &owner,
+        None,
+        "edge-source-2",
+        DocClass::UserDoc,
+        format!("See [[{}]]\n", target2.note),
+    )
+    .await;
+
+    let runtime = ProjectorRuntime::start_sqlite(
+        store.clone(),
+        projection_ctx(),
+        root,
+        ProjectionGeneration::new(1).unwrap(),
+        ProjectionConfig::default(),
+    )
+    .await
+    .unwrap();
+    sync(&store, &runtime, &scope).await;
+
+    let engine = runtime.engine();
+    let snapshot = engine
+        .acquire_snapshot(
+            owner.clone(),
+            CausalBasis::Await(AwaitWatermarks::default()),
+        )
+        .await
+        .unwrap();
+    let source_node = snapshot.lookup(&source.note).unwrap().unwrap();
+    let target_node = snapshot.lookup(&target.note).unwrap().unwrap();
+    let source2_node = snapshot.lookup(&source2.note).unwrap().unwrap();
+    let target2_node = snapshot.lookup(&target2.note).unwrap().unwrap();
+
+    assert_eq!(
+        snapshot.outgoing(source_node).unwrap().collect::<Vec<_>>(),
+        vec![target_node]
+    );
+    assert_eq!(
+        snapshot.incoming(target_node).unwrap().collect::<Vec<_>>(),
+        vec![source_node]
+    );
+
+    // Capture iterators before trashing `target` so removing the post-commit
+    // fail-closed check would leak a trashed edge on subsequent `.next()`.
+    let mut retained_out = snapshot.outgoing(source_node).unwrap();
+    let mut retained_in = snapshot.incoming(target_node).unwrap();
+
+    // Pause projection and trash `target` against the older projected cut.
+    let _hold = engine.pause_before_projection_for_test(&scope, 1).unwrap();
+    let mut trash = mutation(
+        &owner,
+        DeleteNote {
+            note: target.note.clone(),
+            disposition: DeleteDisposition::Trash,
+        },
+    );
+    trash.preconditions.revision = Some(target.revision);
+    let trashed = store.delete_note(owner.clone(), trash).await.unwrap();
+    assert!(
+        retained_out.next().is_none(),
+        "retained outgoing iterator must fail closed after target trash"
+    );
+    assert!(
+        retained_in.next().is_none(),
+        "retained incoming iterator must fail closed after focal trash"
+    );
+    assert_eq!(
+        snapshot.incoming(target_node).err(),
+        Some(DomainError::ResourceNotFound)
+    );
+
+    // Eagerly filter neighbors under the single `live_permit()` acquired in
+    // `outgoing()`: an iterator built while `target` is trashed must remain
+    // empty even if `target` is restored before `.next()` runs.
+    let mut out_while_trashed = snapshot.outgoing(source_node).unwrap();
+    let mut restore = mutation(
+        &owner,
+        DeleteNote {
+            note: target.note.clone(),
+            disposition: DeleteDisposition::Restore,
+        },
+    );
+    restore.preconditions.revision = Some(trashed.value.revision);
+    store.delete_note(owner.clone(), restore).await.unwrap();
+    assert_eq!(
+        snapshot.outgoing(source_node).unwrap().collect::<Vec<_>>(),
+        vec![target_node]
+    );
+    assert!(
+        out_while_trashed.next().is_none(),
+        "neighbors filtered out eagerly during outgoing() must not reappear after restore"
+    );
+
+    // Hold the live visibility fence write lock via an in-flight visibility
+    // commit: outgoing/incoming must propagate NotReady instead of dropping
+    // edges, and a retained iterator must fail closed while the lock is held.
+    let mut retained_during_write = snapshot.outgoing(source2_node).unwrap();
+    let (observed_commit, resume) = store.pause_next_visibility_commit_for_test();
+    let writer_store = store.clone();
+    let writer_scope = scope.clone();
+    let writer_actor = owner.auth().principal().clone();
+    let write_task = tokio::spawn(async move {
+        writer_store
+            .set_folder_lifecycle(
+                &writer_scope,
+                LeaseEpoch::new(1).unwrap(),
+                &temp_folder,
+                &temp_folder_rev,
+                Lifecycle::Trashed,
+                &writer_actor,
+                None,
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), observed_commit)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        snapshot.outgoing(source2_node),
+        Err(DomainError::ValidationFailed { ref diagnostic })
+            if diagnostic.reason == ValidationReason::NotReady
+    ));
+    assert!(matches!(
+        snapshot.incoming(target2_node),
+        Err(DomainError::ValidationFailed { ref diagnostic })
+            if diagnostic.reason == ValidationReason::NotReady
+    ));
+    assert!(
+        retained_during_write.next().is_none(),
+        "retained iterator must fail closed while live fence write lock is held"
+    );
+    let mut neighbors = snapshot.neighbor_page(source2_node, PageLimit::new(64).unwrap());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), &mut neighbors)
+            .await
+            .is_err()
+    );
+    resume.send(()).unwrap();
+    write_task.await.unwrap().unwrap();
+    assert_eq!(neighbors.await.unwrap(), vec![target2_node]);
+    assert_eq!(
+        snapshot.outgoing(source2_node).unwrap().collect::<Vec<_>>(),
+        vec![target2_node]
+    );
+
+    // Once the canonical runtime shuts down (closing the live visibility fence),
+    // outgoing/incoming must propagate ValidationReason::NotReady instead of
+    // returning empty iterators.
+    drop(_hold);
+    runtime.shutdown().await.unwrap();
+    canonical.shutdown().await.unwrap();
+    assert!(matches!(
+        snapshot.outgoing(source2_node),
+        Err(DomainError::ValidationFailed { ref diagnostic })
+            if diagnostic.reason == ValidationReason::NotReady
+    ));
+    assert!(matches!(
+        snapshot.incoming(target2_node),
+        Err(DomainError::ValidationFailed { ref diagnostic })
+            if diagnostic.reason == ValidationReason::NotReady
+    ));
 }
 
 #[path = "projection_regressions/read_windows.rs"]

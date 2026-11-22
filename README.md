@@ -10,11 +10,13 @@ structural projections. The engine ports support declarative Markdown views,
 board reads and knowledge graphs. Control services cover transport-independent
 authentication, Space access, OAuth issuance, OIDC identity, provider services,
 account context, schedule claims, content-free telemetry and backup snapshots.
-Search, collaboration, agents and product UI arrive in subsequent waves.
+The hybrid search library provides search and recall. Collaboration, agents and
+the product UI arrive in subsequent waves.
 
 ## Start developing
 
-Use Linux x86_64, local Docker Engine, Docker Compose **5.0.0+**, Git and GNU Make.
+Use Linux x86_64, local Docker Engine, Docker Compose **5.0.0+**, Git, GNU Make,
+`curl`, `unzip` and `sha256sum`.
 Host Node **24.22.1** is optional and only needed for `npx` CLI entry points.
 Development tools run in pinned containers; no private services or additional agent
 tooling are needed.
@@ -72,6 +74,8 @@ See [development commands and ownership](docs/development.md) for details.
 The implemented library boundaries are documented in [core contracts](docs/core-contracts.md),
 [document syntax](docs/syntax.md) and [canonical storage](docs/storage.md).
 See [control storage](docs/control.md) for the control-plane primitives.
+See [hybrid search](docs/search.md) for search and recall, model setup, and the
+offline scale gate.
 The [projections guide](docs/projections.md) covers note views, graph queries
 and the SQLite and PostgreSQL acceptance workload.
 

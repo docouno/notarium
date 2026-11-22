@@ -1418,6 +1418,7 @@ dependencies = [
  "blake3",
  "getrandom 0.4.3",
  "hex",
+ "ipnet",
  "mimalloc",
  "notarium-agents",
  "notarium-canonical",
@@ -3035,12 +3036,30 @@ dependencies = [
 name = "notarium-search"
 version = "1.0.0-dev.0"
 dependencies = [
+ "allocation-counter",
+ "arc-swap",
+ "blake3",
+ "cap-fs-ext",
+ "cap-std",
+ "croaring",
+ "getrandom 0.4.3",
+ "hex",
  "memmap2",
  "notarium-canonical",
  "notarium-core",
+ "notarium-search",
  "notarium-syntax",
  "ort",
+ "proptest",
+ "pulldown-cmark",
+ "serde",
+ "serde_json",
+ "sqlx",
  "tantivy",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "unicode-normalization",
 ]
 
 [[package]]

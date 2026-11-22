@@ -20,8 +20,8 @@ use notarium_core::{
     },
     model::{Lifecycle, SnapshotCut},
     ports::{
-        CreateNote, DeleteDisposition, DeleteNote, Mutation, NoteWritePort, PageLimit,
-        Preconditions, PublishAbilityPackage, RenameNote, ServicePurpose, SpaceContext,
+        CreateNote, DeleteDisposition, DeleteNote, MoveFolder, MoveNote, Mutation, NoteWritePort,
+        PageLimit, Preconditions, PublishAbilityPackage, RenameNote, ServicePurpose, SpaceContext,
     },
     query::{FieldObservation, FieldSchema, FieldType, FieldValue, ScalarType},
     receipt::{CommandIdentity, MutationEffect, ReceiptSet},
@@ -323,7 +323,7 @@ async fn run_projection_reads(store: &CanonicalStore) {
             .for_keeper(
                 AgentRunId::from_bytes([4; 16]),
                 scope.space_id.clone(),
-                Some(keeper_project),
+                Some(keeper_project.clone()),
                 BTreeSet::from([ability]),
             )
             .unwrap(),
@@ -342,6 +342,18 @@ async fn run_projection_reads(store: &CanonicalStore) {
             .hydrate_cards(keeper.clone(), cut, vec![skill.clone()])
             .await
             .unwrap();
+        let carriers = store
+            .read_authorized_documents_for_search(
+                keeper.clone(),
+                vec![notarium_canonical::changes::search::SearchDocumentTarget {
+                    note_id: skill.clone(),
+                    revision: old.revision_id.clone(),
+                    projected_at: Some(receipt.seq()),
+                }],
+            )
+            .await
+            .unwrap();
+        assert_eq!(carriers[0].is_some(), visible);
         assert_eq!(
             cards[0].is_some(),
             visible,
@@ -418,7 +430,7 @@ async fn run_projection_reads(store: &CanonicalStore) {
                     parent: None,
                     slug: "later".into(),
                     class: DocClass::UserDoc,
-                    carrier: "# Later".into(),
+                    carrier: "---\npriority: urgent\n---\n# Later".into(),
                 },
             },
         )
@@ -532,6 +544,44 @@ async fn run_projection_reads(store: &CanonicalStore) {
             .unwrap()
             .is_some()
     );
+    let search = maintenance_ctx(ServicePurpose::Search);
+    let receipts = ReceiptSet::new([after_schema.receipt.clone()]).unwrap();
+    for (base, eligible) in [(later.receipt.seq(), false), (schema.receipt.seq(), true)] {
+        let versions = store
+            .plan_search_overlay(&search.authority, &search.budget, scope, base, &receipts)
+            .await
+            .unwrap();
+        assert_eq!(versions.is_some(), eligible);
+    }
+    // Moving a note retains its last evaluation, even if the schema has changed.
+    let moved = store
+        .move_note(
+            human.clone(),
+            Mutation {
+                identity: identity(7),
+                preconditions: Preconditions::default(),
+                input: MoveNote {
+                    note: sample_note_id(13),
+                    parent: None,
+                    slug: "later-moved".into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let overlay = store
+        .read_note_revisions_for_overlay(
+            &search.authority,
+            human.clone(),
+            schema.receipt.seq(),
+            vec![(sample_note_id(13), moved.value.revision)],
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        overlay[0].1.as_ref().unwrap().fields.get("priority"),
+        Some(FieldObservation::Bad { .. })
+    ));
     let before_schema = store
         .read_projection_space_header(&projection, &scope.space_id, Some(later.receipt.seq()))
         .await
@@ -636,6 +686,223 @@ async fn run_projection_reads(store: &CanonicalStore) {
             .iter()
             .any(|row| matches!(row, ProjectionDelta::Ability(ability) if ability.note.is_some())),
         "purged ability delta must not surface a hydrated note snapshot"
+    );
+
+    // Search folder-placement & trashed-folder regressions:
+    // 1. Moving a root folder into a project changes exact enclosing_project,
+    //    so `can_index_remote_search_note(..., None)` flips to `false`.
+    // 2. Trashing the parent folder hides the note from exact & projected search reads
+    //    and returns `None` from `read_projection_folder_ancestry_at_cut`.
+    let movable_folder = sample_folder_id(20);
+    let (_, movable_rev, _) = store
+        .create_folder(CreateFolderSpec {
+            scope: scope.clone(),
+            active_epoch: epoch,
+            folder_id: movable_folder.clone(),
+            parent: None,
+            slug: "movable".into(),
+            display_name: "Movable".into(),
+            is_project: false,
+            project_slug: None,
+            actor: actor.clone(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+    let nested_note = sample_note_id(20);
+    let nested_created = store
+        .create_note(
+            human.clone(),
+            Mutation {
+                identity: identity(100),
+                preconditions: Preconditions::default(),
+                input: CreateNote {
+                    note: nested_note.clone(),
+                    parent: Some(movable_folder.clone()),
+                    slug: "nested-note".into(),
+                    class: DocClass::UserDoc,
+                    carrier: "# Nested\n\nBody text.\n".into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .can_index_remote_search_note(
+                &search.authority,
+                search.budget.clone(),
+                scope.clone(),
+                nested_note.clone(),
+                None,
+            )
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .can_index_remote_search_note(
+                &search.authority,
+                search.budget.clone(),
+                scope.clone(),
+                nested_note.clone(),
+                Some(keeper_project.clone()),
+            )
+            .await
+            .unwrap()
+    );
+    let moved_folder = store
+        .move_folder(
+            human.clone(),
+            Mutation {
+                identity: identity(101),
+                preconditions: Preconditions {
+                    revision: Some(movable_rev),
+                    ..Preconditions::default()
+                },
+                input: MoveFolder {
+                    folder: movable_folder.clone(),
+                    new_parent: Some(keeper_project.clone()),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let after_move_seq = moved_folder.receipt.seq();
+    assert!(
+        !store
+            .can_index_remote_search_note(
+                &search.authority,
+                search.budget.clone(),
+                scope.clone(),
+                nested_note.clone(),
+                None,
+            )
+            .await
+            .unwrap(),
+        "root->project folder move must deny space-wide (project=None) remote indexing"
+    );
+    assert!(
+        store
+            .can_index_remote_search_note(
+                &search.authority,
+                search.budget.clone(),
+                scope.clone(),
+                nested_note.clone(),
+                Some(keeper_project.clone()),
+            )
+            .await
+            .unwrap()
+    );
+    // Historical children include a moved-out folder via its old parent and
+    // exclude a moved-in folder whose head alone would match.
+    let before_move = nested_created.receipt.seq();
+    for (parent, cut, expected) in [
+        (&space.root_folder_id, before_move, true),
+        (&keeper_project, before_move, false),
+        (&space.root_folder_id, after_move_seq, false),
+        (&keeper_project, after_move_seq, true),
+    ] {
+        let children = store
+            .read_projection_folder_children_at_cut(
+                &projection,
+                scope,
+                cut,
+                std::slice::from_ref(parent),
+            )
+            .await
+            .unwrap();
+        assert_eq!(children.contains(&movable_folder), expected);
+    }
+    let active_ancestry = store
+        .read_projection_folder_ancestry_at_cut(&projection, scope, after_move_seq, &movable_folder)
+        .await
+        .unwrap()
+        .expect("active folder ancestry resolves at cut");
+    assert_eq!(active_ancestry.1, Some(keeper_project.clone()));
+    assert_eq!(
+        active_ancestry.0,
+        vec![
+            movable_folder.clone(),
+            keeper_project.clone(),
+            space.root_folder_id.clone()
+        ]
+    );
+    let moved_folder_rev = store
+        .read_projection_folders_page(
+            &projection,
+            scope,
+            after_move_seq,
+            None,
+            PageLimit::new(200).unwrap(),
+        )
+        .await
+        .unwrap()
+        .rows
+        .into_iter()
+        .find(|row| row.metadata.folder_id == movable_folder)
+        .expect("moved folder exists at cut")
+        .revision_id;
+    let (_, trashed_seq) = store
+        .set_folder_lifecycle(
+            scope,
+            epoch,
+            &movable_folder,
+            &moved_folder_rev,
+            Lifecycle::Trashed,
+            &actor,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .read_projection_folder_ancestry_at_cut(
+                &projection,
+                scope,
+                trashed_seq,
+                &movable_folder,
+            )
+            .await
+            .unwrap()
+            .is_none(),
+        "trashed folder ancestry must return None"
+    );
+    let hidden_projected = store
+        .read_authorized_documents_for_search(
+            human.clone(),
+            vec![
+                notarium_canonical::changes::search::SearchDocumentTarget {
+                    note_id: nested_note.clone(),
+                    revision: nested_created.value.revision.clone(),
+                    projected_at: Some(after_move_seq),
+                },
+                notarium_canonical::changes::search::SearchDocumentTarget {
+                    note_id: nested_note.clone(),
+                    revision: nested_created.value.revision.clone(),
+                    projected_at: None,
+                },
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(hidden_projected.len(), 2);
+    assert!(
+        hidden_projected[0].is_none() && hidden_projected[1].is_none(),
+        "notes under a trashed folder must be hidden from search document reads"
+    );
+    let hidden_overlay = store
+        .read_note_revisions_for_overlay(
+            &search.authority,
+            human.clone(),
+            after_move_seq,
+            vec![(nested_note, nested_created.value.revision)],
+        )
+        .await
+        .unwrap();
+    assert!(
+        hidden_overlay[0].1.is_none(),
+        "notes under a trashed folder must be hidden from search overlay reads"
     );
 }
 

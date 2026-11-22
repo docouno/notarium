@@ -572,14 +572,14 @@ fn selected_chunks_reach_embedding_and_recall_with_original_provenance() {
     assert_eq!(selected.provenance().revision(), document.revision());
     assert_eq!(selected.provenance().digest(), document.digest());
     assert!(!format!("{part:?}").contains("hello world"));
-    let request = EmbeddingRequest {
-        project: None,
-        intent: CommandKey::from_bytes([1; 16]),
+    let request = EmbeddingRequest::parts(
+        CommandKey::from_bytes([1; 16]),
         model,
-        provider: policy.provider.clone(),
-        chunks: vec![selected],
-        declared_tokens: descriptor.tokens,
-    };
+        policy.provider.clone(),
+        None,
+        vec![selected],
+        descriptor.tokens,
+    );
     struct EmbeddingFixture {
         expected: String,
     }
@@ -595,9 +595,9 @@ fn selected_chunks_reach_embedding_and_recall_with_original_provenance() {
                     limit: 512,
                     model: 1,
                 };
-                assert_eq!(request.chunks[0].text(), self.expected);
+                assert_eq!(request.inputs[0].text(), self.expected);
                 assert_eq!(
-                    tokenizer.count(request.chunks[0].text())?,
+                    tokenizer.count(request.inputs[0].text())?,
                     request.declared_tokens
                 );
                 assert!(request.declared_tokens <= 512);

@@ -147,7 +147,7 @@ async fn exercise(store: &CanonicalStore, derived: DerivedStore, root: &DataRoot
             .acquire_snapshot(owner.clone(), CausalBasis::Await(Default::default()))
             .await
             .unwrap();
-        assert!(retained.lookup(&target.note).is_some());
+        assert!(retained.lookup(&target.note).unwrap().is_some());
         let other = engine
             .acquire_snapshot(other_owner.clone(), CausalBasis::Await(Default::default()))
             .await
@@ -255,7 +255,7 @@ async fn exercise(store: &CanonicalStore, derived: DerivedStore, root: &DataRoot
             .await
             .expect("the replacement is immediately usable without reading the CAS");
         assert_eq!(repaired.cut().projected_seq, seq);
-        assert!(repaired.lookup(&target.note).is_some());
+        assert!(repaired.lookup(&target.note).unwrap().is_some());
         assert_eq!(
             store.read_space(&scope.space_id).await.unwrap().last_seq,
             seq

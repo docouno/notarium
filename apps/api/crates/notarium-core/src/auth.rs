@@ -49,6 +49,11 @@ pub enum AuthenticatedCredential {
         run: AgentRunId,
         lease: LeaseEpoch,
     },
+    /// Internal, read-only authority scoped to one search indexing destination.
+    SearchIndexing {
+        space: SpaceId,
+        provider: ProviderResourceId,
+    },
     TrustedNone,
 }
 
@@ -86,6 +91,7 @@ pub enum PrincipalKind {
     AgentRun(AgentRunId),
     Keeper(AgentRunId),
     OAuth { source: GrantId, narrowed: bool },
+    SearchIndexing,
 }
 
 #[derive(Clone, Debug)]
@@ -199,6 +205,45 @@ impl EngineAuthContext {
             credential: verified.credential,
         }
     }
+    /// Internal read-only context scoped to one Space for remote search indexing.
+    /// Never carries human management, write privileges, or encrypted-note reads.
+    pub fn for_search_indexing(
+        principal: PrincipalId,
+        grant: GrantId,
+        space: SpaceId,
+        provider: ProviderResourceId,
+    ) -> Self {
+        let mut read_classes = DocClass::all();
+        read_classes.remove(&DocClass::EncryptedNote);
+        Self {
+            principal,
+            grant,
+            kind: PrincipalKind::SearchIndexing,
+            spaces: BTreeMap::from([(
+                space.clone(),
+                SpaceGrant {
+                    role: SpaceRole::Viewer,
+                    read_classes,
+                    write_classes: BTreeSet::new(),
+                    project_root: None,
+                },
+            )]),
+            human_management: false,
+            ability_write: false,
+            write_space: None,
+            chat_audience: None,
+            taint: BranchTaint::default(),
+            readonly_abilities: BTreeSet::new(),
+            credential: Some(AuthenticatedCredential::SearchIndexing { space, provider }),
+        }
+    }
+    fn is_search_indexing(&self) -> bool {
+        self.kind == PrincipalKind::SearchIndexing
+            || matches!(
+                self.credential,
+                Some(AuthenticatedCredential::SearchIndexing { .. })
+            )
+    }
     pub fn for_agent_run(
         &self,
         run: AgentRunId,
@@ -206,6 +251,9 @@ impl EngineAuthContext {
         audience: ChatAudience,
         requested: BTreeMap<SpaceId, SpaceGrant>,
     ) -> DomainResult<Self> {
+        if self.is_search_indexing() {
+            return Err(DomainError::AccessDenied);
+        }
         let mut derived = self.narrow(requested)?;
         if !derived.spaces.contains_key(&thread_space) {
             return Err(DomainError::ResourceNotFound);
@@ -246,6 +294,9 @@ impl EngineAuthContext {
         project_root: Option<FolderId>,
         readonly_abilities: BTreeSet<AbilityId>,
     ) -> DomainResult<Self> {
+        if self.is_search_indexing() {
+            return Err(DomainError::AccessDenied);
+        }
         let mut grant = self
             .spaces
             .get(&space)
@@ -284,6 +335,9 @@ impl EngineAuthContext {
         source: GrantId,
         requested: BTreeMap<SpaceId, SpaceGrant>,
     ) -> DomainResult<Self> {
+        if self.is_search_indexing() {
+            return Err(DomainError::AccessDenied);
+        }
         let mut derived = self.narrow(requested)?;
         derived.kind = PrincipalKind::OAuth {
             source,
@@ -293,6 +347,9 @@ impl EngineAuthContext {
     }
     /// Personal access tokens are delegated credentials, never interactive humans.
     pub fn for_pat(&self, requested: BTreeMap<SpaceId, SpaceGrant>) -> DomainResult<Self> {
+        if self.is_search_indexing() {
+            return Err(DomainError::AccessDenied);
+        }
         let mut derived = self.narrow(requested)?;
         derived.kind = PrincipalKind::Pat;
         Ok(derived)
@@ -345,6 +402,8 @@ impl EngineAuthContext {
             || self.grant != current.grant
             || self.credential != current.credential
             || self.credential.is_none()
+            || (self.kind == PrincipalKind::SearchIndexing)
+                != (current.kind == PrincipalKind::SearchIndexing)
         {
             return Err(DomainError::AuthenticationFailed);
         }
@@ -390,7 +449,9 @@ impl EngineAuthContext {
         &self.taint
     }
     pub fn human_management(&self) -> bool {
-        self.human_management && self.kind == PrincipalKind::DirectHuman
+        !self.is_search_indexing()
+            && self.human_management
+            && self.kind == PrincipalKind::DirectHuman
     }
     pub fn authorize_human_management(&self) -> DomainResult<()> {
         if self.human_management() {
@@ -496,6 +557,9 @@ impl EngineAuthContext {
         project: Option<&FolderId>,
         tainted: bool,
     ) -> DomainResult<()> {
+        if self.is_search_indexing() {
+            return Err(DomainError::ResourceNotFound);
+        }
         let grant = self
             .spaces
             .get(&space.id)
@@ -550,6 +614,23 @@ impl EngineAuthContext {
         project: Option<&FolderId>,
         tainted: bool,
     ) -> DomainResult<()> {
+        self.can_view_chat(space, project, tainted)?;
+        if tainted || self.write_space.as_ref().is_some_and(|id| id != &space.id) {
+            self.taint.mark_external_read();
+        }
+        Ok(())
+    }
+
+    /// Chat visibility check for candidate filtering without recording a read.
+    pub fn can_view_chat(
+        &self,
+        space: &Space,
+        project: Option<&FolderId>,
+        tainted: bool,
+    ) -> DomainResult<()> {
+        if self.is_search_indexing() {
+            return Err(DomainError::ResourceNotFound);
+        }
         let grant = self
             .spaces
             .get(&space.id)
@@ -565,9 +646,6 @@ impl EngineAuthContext {
         if tainted && space.kind == SpaceKind::Shared {
             return Err(DomainError::CrossSpaceTainted);
         }
-        if tainted || self.write_space.as_ref().is_some_and(|id| id != &space.id) {
-            self.taint.mark_external_read();
-        }
         Ok(())
     }
     /// Confines every write, including personal chat, to the run's admitted Space.
@@ -578,6 +656,7 @@ impl EngineAuthContext {
             .ok_or(DomainError::ResourceNotFound)?;
         if space.lifecycle != SpaceLifecycle::Active
             || grant.role == SpaceRole::Viewer
+            || self.is_search_indexing()
             || self
                 .write_space
                 .as_ref()

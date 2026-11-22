@@ -219,8 +219,8 @@ def run_shard(data, members, shard_id):
     # Default test target selection also builds examples such as live_s3_acceptance.
     events = subprocess.check_output(
         [*devkit, "cargo", "test", "--locked", "--offline", "--no-run",
-         # Workspace-wide tests enable these through projections' dev-dependencies.
-         "--features", "notarium-canonical/test-support,notarium-projections/test-support",
+         # Workspace-wide tests enable these through workspace dev-dependencies.
+         "--features", "notarium-canonical/test-support,notarium-projections/test-support,notarium-search/test-support",
          "--message-format=json-render-diagnostics", *package_flags([*shard["crates"], *anchors])],
         cwd=ROOT,
     )

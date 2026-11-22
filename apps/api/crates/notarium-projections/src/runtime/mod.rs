@@ -628,6 +628,8 @@ struct SpaceSlot {
     repair: Notify,
     #[cfg(any(test, feature = "test-support"))]
     benchmark_pause: benchmark::PauseSlot,
+    #[cfg(any(test, feature = "test-support"))]
+    bucketed_list_for_test: Mutex<Option<String>>,
 }
 
 impl SpaceSlot {
@@ -1018,6 +1020,25 @@ impl ProjectionEngine {
             return Err(DomainError::validation(ValidationReason::NotReady).into());
         }
         self.canonical.live_visibility_fence().space(scope)
+    }
+
+    pub(crate) async fn live_handle_async(
+        &self,
+        scope: &HistoryScope,
+        budget: &CallBudget,
+    ) -> Result<LiveSpaceHandle, PortError> {
+        if !self
+            .generation
+            .load()
+            .slot(&scope.space_id)
+            .is_some_and(|slot| slot.lookup_bound.load(Ordering::Acquire))
+        {
+            return Err(DomainError::validation(ValidationReason::NotReady).into());
+        }
+        self.canonical
+            .live_visibility_fence()
+            .read_space(scope, budget)
+            .await
     }
 
     pub(crate) fn published_cut(

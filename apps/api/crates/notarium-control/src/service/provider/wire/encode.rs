@@ -1,6 +1,10 @@
 use super::*;
 use notarium_core::{
+    classes::{DocClass, ProviderOrigin},
+    document::estimate_token_twelfths,
     error::ValidationReason,
+    ids::FolderId,
+    model::FolderRef,
     ports::{control::CompletionRequest, *},
 };
 use serde_json::{Value, json};
@@ -80,35 +84,55 @@ pub(in crate::service::provider) fn embedding_fingerprint(
     request: &EmbeddingRequest,
 ) -> Result<[u8; 32], PortError> {
     request.validate()?;
-    if request.chunks.is_empty() || request.chunks.len() > 256 {
-        return Err(limited());
-    }
     let mut bytes = 0usize;
-    for part in &request.chunks {
-        bytes = bytes.checked_add(part.text().len()).ok_or_else(limited)?;
+    for input in &request.inputs {
+        bytes = bytes.checked_add(input.text().len()).ok_or_else(limited)?;
         if bytes > MAX_PAYLOAD {
             return Err(limited());
         }
     }
+    #[derive(serde::Serialize)]
+    #[serde(untagged)]
+    enum Input<'a> {
+        Part(ProviderOrigin, &'a str, u32),
+        Query(
+            &'a str,
+            u32,
+            &'a BTreeSet<DocClass>,
+            &'a Option<FolderRef>,
+            &'a Option<FolderId>,
+        ),
+    }
     let content: Vec<_> = request
-        .chunks
+        .inputs
         .iter()
-        .map(|part| {
-            (
+        .map(|input| match input {
+            EmbeddingInput::Part(part) => Input::Part(
                 notarium_core::classes::ProviderMessage::Part(part.clone()).origin(),
                 part.text(),
                 part.part().tokens(),
-            )
+            ),
+            EmbeddingInput::Query(query) => Input::Query(
+                &query.text,
+                query.tokens,
+                &query.classes,
+                &query.project_scope,
+                &query.folder,
+            ),
         })
         .collect();
-    fingerprint((
+    let payload = (
         "embedding-v1",
         &request.provider,
         &request.model,
         &request.project,
         request.declared_tokens,
         content,
-    ))
+    );
+    match &request.selection {
+        EmbeddingSelection::Explicit => fingerprint(payload),
+        selection => fingerprint((payload, selection, request.runtime_epochs())),
+    }
 }
 
 pub(in crate::service::provider) fn endpoint(
@@ -337,21 +361,8 @@ fn history(request: &CompletionRequest, wire: ProviderWireKind) -> Result<Vec<Va
     }
     Ok(messages)
 }
-/// Conservative Unicode-aware upper bound (`~1` token per `3` ASCII chars,
-/// `~1` per `2` 2-byte UTF-8 chars such as Cyrillic, `1` per CJK/astral scalar).
-fn text_token_twelfths(value: &str) -> u64 {
-    let mut twelfths = 0u64;
-    for ch in value.chars() {
-        twelfths = twelfths.saturating_add(match ch.len_utf8() {
-            1 => 4,
-            2 => 6,
-            _ => 12,
-        });
-    }
-    twelfths
-}
 fn text_tokens(value: &str) -> u64 {
-    text_token_twelfths(value).div_ceil(12)
+    estimate_token_twelfths(value).div_ceil(12)
 }
 pub(in crate::service::provider) fn estimate_completion_input_tokens(
     request: &CompletionRequest,
@@ -361,10 +372,10 @@ pub(in crate::service::provider) fn estimate_completion_input_tokens(
         total = total.saturating_add(4);
         let mut msg_twelfths = 0u64;
         if let Some(instruction) = &message.instruction {
-            msg_twelfths = msg_twelfths.saturating_add(text_token_twelfths(instruction.text()));
+            msg_twelfths = msg_twelfths.saturating_add(estimate_token_twelfths(instruction.text()));
         }
         for part in &message.parts {
-            msg_twelfths = msg_twelfths.saturating_add(text_token_twelfths(part.text()));
+            msg_twelfths = msg_twelfths.saturating_add(estimate_token_twelfths(part.text()));
         }
         total = total.saturating_add(msg_twelfths.div_ceil(12));
         for call in &message.tool_calls {
@@ -389,8 +400,8 @@ pub(in crate::service::provider) fn estimate_embedding_input_tokens(
     request: &EmbeddingRequest,
 ) -> Result<u32, PortError> {
     let mut estimated = 0u64;
-    for chunk in &request.chunks {
-        estimated = estimated.saturating_add(text_tokens(chunk.text()).max(1));
+    for input in &request.inputs {
+        estimated = estimated.saturating_add(text_tokens(input.text()).max(1));
     }
     let estimated = u32::try_from(estimated.max(1)).map_err(|_| limited())?;
     Ok(request.declared_tokens.max(estimated))
@@ -445,14 +456,10 @@ pub(in crate::service::provider) fn embedding(
     let ProviderModelKind::Embedding { dimension } = model.kind else {
         return Err(invalid());
     };
-    if request.chunks.len().saturating_mul(dimension as usize) > MAX_EMBED_VALUES {
+    if request.inputs.len().saturating_mul(dimension as usize) > MAX_EMBED_VALUES {
         return Err(limited());
     }
-    if !matches!(model.kind, ProviderModelKind::Embedding { .. })
-        || request.model != model.id
-        || request.chunks.is_empty()
-        || request.chunks.len() > 256
-    {
+    if request.model != model.id {
         return Err(invalid());
     }
     if request.declared_tokens > model.max_input_tokens
@@ -461,16 +468,16 @@ pub(in crate::service::provider) fn embedding(
         return Err(DomainError::validation(ValidationReason::TokenBudgetExceeded).into());
     }
     let mut total = 0usize;
-    for chunk in &request.chunks {
-        total = total.checked_add(chunk.text().len()).ok_or_else(limited)?;
+    for input in &request.inputs {
+        total = total.checked_add(input.text().len()).ok_or_else(limited)?;
         if total > MAX_PAYLOAD {
             return Err(limited());
         }
     }
     let input = request
-        .chunks
+        .inputs
         .iter()
-        .map(|part| part.text())
+        .map(EmbeddingInput::text)
         .collect::<Vec<_>>();
     encoded(match wire {
         ProviderWireKind::OpenaiCompatible => {

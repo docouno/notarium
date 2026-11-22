@@ -8,7 +8,7 @@ use std::{
 
 use notarium_core::{
     DomainError, DomainResult,
-    auth::ResourceFacts,
+    auth::{ResourceFacts, SpaceLifecycle},
     classes::{ClassifiedDocument, DocClass},
     error::{PortError, ValidationReason},
     ids::{
@@ -45,6 +45,8 @@ use crate::{
     sql_exec::BackendConn,
     writer::ChangePayloadDraft,
 };
+
+pub mod search;
 
 pub const EFFECT_CODEC_V1: &str = "effect_v1";
 pub const DEFAULT_BROADCAST_CAPACITY: usize = 1024;
@@ -264,6 +266,7 @@ pub fn build_effect_payload_draft(
 pub(crate) enum BroadcastSignal {
     CatalogChanged {
         scope: HistoryScope,
+        lifecycle: SpaceLifecycle,
     },
     Committed {
         scope: HistoryScope,
@@ -290,7 +293,7 @@ impl ProjectionCatalogSubscription {
     pub async fn next(&mut self) -> Option<Option<HistoryScope>> {
         loop {
             match self.receiver.recv().await {
-                Ok(BroadcastSignal::CatalogChanged { scope }) => return Some(Some(scope)),
+                Ok(BroadcastSignal::CatalogChanged { scope, .. }) => return Some(Some(scope)),
                 Ok(BroadcastSignal::IncarnationChanged { new_scope, .. }) => {
                     return Some(Some(new_scope));
                 }
@@ -393,10 +396,12 @@ pub(crate) fn check_change_consumer_authority(auth: &ServiceAuthority) -> Domain
 
 struct CanonicalChangeSubscription {
     store: CanonicalStore,
+    needs_active_space: bool,
     sub_id: u64,
     processed: ChangeCursor,
     delivered_complete_command_end: SpaceSeq,
     pending_initial: Option<ChangeNotice>,
+    pending_lagged: bool,
     rx: broadcast::Receiver<BroadcastSignal>,
     next_durable_poll: tokio::time::Instant,
     durable_checked_through: SpaceSeq,
@@ -409,7 +414,7 @@ impl CanonicalChangeSubscription {
         // A local broadcast can announce a later head without having seen a remote purge.
         // Only a database read can advance this watermark.
         let checked = self.durable_checked_through;
-        let (head, must_reseed) = self.store.with_read_tx(|tx| {
+        let (head, lifecycle, must_reseed) = self.store.with_read_tx(|tx| {
             Box::pin(async move {
                 let rec = load_space_record(tx, &processed.scope.space_id).await?;
                 let start = if lagged { processed.after } else { processed.after.max(checked) };
@@ -426,11 +431,16 @@ impl CanonicalChangeSubscription {
                 } else {
                     false
                 };
-                Ok((ChangeCursor {scope: rec.scope, after: rec.last_seq}, must_reseed))
+                Ok((ChangeCursor {scope: rec.scope, after: rec.last_seq}, rec.space.lifecycle, must_reseed))
             })
         }).await?;
 
-        if head.scope != self.processed.scope {
+        if lagged {
+            self.pending_lagged = false;
+        }
+        if head.scope != self.processed.scope
+            || (self.needs_active_space && lifecycle != SpaceLifecycle::Active)
+        {
             return Ok(Some(ChangeNotice::Resync { scope: head.scope }));
         }
         self.delivered_complete_command_end = delivered.max(head.after);
@@ -466,6 +476,9 @@ impl ChangeSubscription for CanonicalChangeSubscription {
             if let Some(initial) = self.pending_initial.take() {
                 return Ok(Some(initial));
             }
+            if self.pending_lagged {
+                return self.durable_notice(true).await;
+            }
 
             // The broadcast ring is process-local. Check durable PostgreSQL state while
             // a consumer waits, even when other Spaces keep the local ring busy.
@@ -487,7 +500,14 @@ impl ChangeSubscription for CanonicalChangeSubscription {
                     self.rx.recv().await
                 };
                 match signal {
-                    Ok(BroadcastSignal::CatalogChanged { .. }) => continue,
+                    Ok(BroadcastSignal::CatalogChanged { scope, lifecycle }) => {
+                        if self.needs_active_space
+                            && scope.space_id == self.processed.scope.space_id
+                            && lifecycle != SpaceLifecycle::Active
+                        {
+                            return Ok(Some(ChangeNotice::Resync { scope }));
+                        }
+                    }
                     Ok(BroadcastSignal::IncarnationChanged { new_scope, ceiling }) => {
                         if new_scope.space_id == self.processed.scope.space_id {
                             self.delivered_complete_command_end = ceiling;
@@ -535,6 +555,7 @@ impl ChangeSubscription for CanonicalChangeSubscription {
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
+                        self.pending_lagged = true;
                         return self.durable_notice(true).await;
                     }
                     Err(broadcast::error::RecvError::Closed) => {
@@ -595,18 +616,22 @@ impl ChangeBroadcast for CanonicalStore {
         let store = self.clone();
         Box::pin(async move {
             check_change_consumer_authority(&ctx.authority)?;
+            let needs_active_space = ctx.authority.require(ServicePurpose::Search).is_ok();
 
             // Subscribe to broadcast channel BEFORE reading DB state so zero post-read commits are missed!
             let rx = store.inner.broadcast_hub.subscribe_raw();
             let after_cl = after.clone();
 
-            let (space_rec, has_erased) = store
+            let (space_rec, must_resync, has_erased) = store
                 .with_read_tx_budget(Some(&ctx.budget), |tx| {
                     Box::pin(async move {
                         let rec = load_space_record(tx, &after_cl.scope.space_id).await?;
-                        // History mismatch must yield `ChangeNotice::Resync` BEFORE comparing any SpaceSeq!
-                        if rec.scope.incarnation != after_cl.scope.incarnation {
-                            return Ok((rec, false));
+                        // Retire a search subscriber on archive even if the catalog change
+                        // did not advance last_seq. Never compare sequences across histories.
+                        if rec.scope.incarnation != after_cl.scope.incarnation
+                            || (needs_active_space && rec.space.lifecycle != SpaceLifecycle::Active)
+                        {
+                            return Ok((rec, true, false));
                         }
                         if after_cl.after > SpaceSeq::ZERO {
                             let _ =
@@ -625,50 +650,49 @@ impl ChangeBroadcast for CanonicalStore {
                             } else {
                                 false
                             };
-                        Ok((rec, erased))
+                        Ok((rec, false, erased))
                     })
                 })
                 .await?;
 
-            let (pending_initial, delivered_end) =
-                if space_rec.scope.incarnation != after.scope.incarnation {
-                    (
-                        Some(ChangeNotice::Resync {
-                            scope: space_rec.scope.clone(),
-                        }),
-                        SpaceSeq::ZERO,
-                    )
-                } else if after.after == SpaceSeq::ZERO {
-                    (
-                        Some(ChangeNotice::SeedRequired {
-                            cutoff: ChangeCursor {
-                                scope: space_rec.scope.clone(),
-                                after: space_rec.last_seq,
-                            },
-                        }),
-                        space_rec.last_seq,
-                    )
-                } else if has_erased {
-                    (
-                        Some(ChangeNotice::PurgeResync {
-                            cutoff: ChangeCursor {
-                                scope: space_rec.scope.clone(),
-                                after: space_rec.last_seq,
-                            },
-                        }),
-                        space_rec.last_seq,
-                    )
-                } else if space_rec.last_seq > after.after {
-                    (
-                        Some(ChangeNotice::Advanced(ChangeCursor {
+            let (pending_initial, delivered_end) = if must_resync {
+                (
+                    Some(ChangeNotice::Resync {
+                        scope: space_rec.scope.clone(),
+                    }),
+                    SpaceSeq::ZERO,
+                )
+            } else if after.after == SpaceSeq::ZERO {
+                (
+                    Some(ChangeNotice::SeedRequired {
+                        cutoff: ChangeCursor {
                             scope: space_rec.scope.clone(),
                             after: space_rec.last_seq,
-                        })),
-                        space_rec.last_seq,
-                    )
-                } else {
-                    (None, after.after)
-                };
+                        },
+                    }),
+                    space_rec.last_seq,
+                )
+            } else if has_erased {
+                (
+                    Some(ChangeNotice::PurgeResync {
+                        cutoff: ChangeCursor {
+                            scope: space_rec.scope.clone(),
+                            after: space_rec.last_seq,
+                        },
+                    }),
+                    space_rec.last_seq,
+                )
+            } else if space_rec.last_seq > after.after {
+                (
+                    Some(ChangeNotice::Advanced(ChangeCursor {
+                        scope: space_rec.scope.clone(),
+                        after: space_rec.last_seq,
+                    })),
+                    space_rec.last_seq,
+                )
+            } else {
+                (None, after.after)
+            };
 
             let sub_id = store
                 .inner
@@ -680,10 +704,12 @@ impl ChangeBroadcast for CanonicalStore {
 
             Ok(Box::new(CanonicalChangeSubscription {
                 store,
+                needs_active_space,
                 sub_id,
                 processed: after,
                 delivered_complete_command_end: delivered_end,
                 pending_initial,
+                pending_lagged: false,
                 rx,
                 next_durable_poll: tokio::time::Instant::now() + PG_CHANGE_POLL_INTERVAL,
                 durable_checked_through: space_rec.last_seq,
@@ -1007,7 +1033,7 @@ impl CanonicalStore {
                     };
 
                     let effect = match &row.payload_id {
-                        None => default_effect_for_op(&row.op_kind),
+                        None => default_effect_for_op(&row.entity_type, &row.op_kind),
                         Some(pid) => {
                             if let Some(cached) = payload_cache.get(pid) {
                                 cached.clone()
@@ -1553,22 +1579,28 @@ fn parse_change_kind(op_kind: &str) -> Result<ChangeKind, PortError> {
     }
 }
 
-fn default_effect_for_op(op_kind: &str) -> MutationEffect {
-    match op_kind {
-        "purge" | "move" | "rename" => MutationEffect::AwaitProjection {
-            reason: AwaitReason::Structural,
-        },
+fn default_effect_for_op(entity_type: &str, op_kind: &str) -> MutationEffect {
+    match (entity_type, op_kind) {
+        (_, "purge" | "move" | "rename") | ("folder", "create" | "trash" | "restore") => {
+            MutationEffect::AwaitProjection {
+                reason: AwaitReason::Structural,
+            }
+        }
         _ => MutationEffect::NoRelevantEffect,
     }
 }
 
 fn default_effect_without_payload(command_kind: &str) -> MutationEffect {
     match command_kind {
-        "move_folder" | "rename_folder" | "rename_project" | "purge_note" | "mint_and_purge" => {
-            MutationEffect::AwaitProjection {
-                reason: AwaitReason::Structural,
-            }
-        }
+        "create_folder"
+        | "set_folder_lifecycle"
+        | "move_folder"
+        | "rename_folder"
+        | "rename_project"
+        | "purge_note"
+        | "mint_and_purge" => MutationEffect::AwaitProjection {
+            reason: AwaitReason::Structural,
+        },
         "rollback_agent_run" => MutationEffect::AwaitProjection {
             reason: AwaitReason::Bulk,
         },

@@ -511,7 +511,10 @@ pub(crate) fn derive_command_identity_spec(
 pub(crate) fn extract_agent_run_from_auth(auth: &EngineAuthContext) -> Option<AgentRunId> {
     match auth.kind() {
         PrincipalKind::AgentRun(run) | PrincipalKind::Keeper(run) => Some(run.clone()),
-        PrincipalKind::DirectHuman | PrincipalKind::Pat | PrincipalKind::OAuth { .. } => None,
+        PrincipalKind::DirectHuman
+        | PrincipalKind::Pat
+        | PrincipalKind::OAuth { .. }
+        | PrincipalKind::SearchIndexing => None,
     }
 }
 
@@ -1020,6 +1023,7 @@ struct AncestryRow {
     folder_id: FolderId,
     parent_folder_id: Option<FolderId>,
     is_root: bool,
+    is_project: bool,
     slug: String,
     write_locked: bool,
     lifecycle: Lifecycle,
@@ -1031,6 +1035,7 @@ impl From<crate::runtime::FolderHeadRow> for AncestryRow {
             folder_id: row.folder_id,
             parent_folder_id: row.parent_folder_id,
             is_root: row.is_root,
+            is_project: row.is_project,
             slug: row.slug,
             write_locked: row.write_locked,
             lifecycle: row.lifecycle,
@@ -1078,6 +1083,7 @@ impl FolderAncestryCache {
             folder_id: row.folder_id,
             parent_folder_id: row.parent_folder_id,
             is_root: row.is_root,
+            is_project: row.is_project,
             slug: row.slug,
             write_locked: row.write_locked,
             lifecycle: row.lifecycle,
@@ -1238,6 +1244,28 @@ impl FolderAncestryCache {
             ability_package,
         };
         Ok((facts, anc))
+    }
+
+    /// Check the lineage already loaded while resolving the resource facts.
+    pub(crate) fn all_active(&self, ancestors: &[FolderId]) -> bool {
+        ancestors.iter().all(|id| {
+            self.rows
+                .get(id)
+                .is_some_and(|row| row.lifecycle == Lifecycle::Active)
+        })
+    }
+
+    pub(crate) fn enclosing_project(&self, ancestry: &FolderAncestryFacts) -> Option<FolderId> {
+        self.enclosing_project_in(&ancestry.ancestors)
+    }
+
+    pub(crate) fn enclosing_project_in(&self, ancestors: &[FolderId]) -> Option<FolderId> {
+        ancestors.iter().find_map(|id| {
+            self.rows
+                .get(id)
+                .filter(|row| row.is_project && row.lifecycle == Lifecycle::Active)
+                .map(|_| id.clone())
+        })
     }
 }
 

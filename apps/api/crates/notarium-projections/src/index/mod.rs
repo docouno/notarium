@@ -498,7 +498,11 @@ impl IndexView {
         self.neighbors(index, true)
     }
 
-    fn neighbors(&self, index: u32, incoming: bool) -> impl Iterator<Item = u32> + Send + '_ {
+    pub(crate) fn neighbors(
+        &self,
+        index: u32,
+        incoming: bool,
+    ) -> impl Iterator<Item = u32> + Send + '_ {
         let edges = if incoming {
             &self.l0.incoming
         } else {

@@ -251,6 +251,11 @@ record! {
 }
 
 record! {
+    pub(super) struct FolderIdentity = "projected_folders";
+    key(folder_id) { folder_id: FolderId }
+}
+
+record! {
     pub struct ProjectedFolderAlias = "projected_folder_aliases";
     key(space_id, old_parent_folder_id, old_slug_fold, created_seq, target_folder_id) {
         space_id: SpaceId,

@@ -145,7 +145,7 @@ async fn sqlite_purges_file_only_retired_generation_while_neighbor_is_held() {
     assert!(!named.exists() && !temp.exists() && !db.exists());
     assert!(neighbor_file.is_file());
     #[cfg(unix)]
-    assert!(held.lookup(&survivor.value.note).is_some());
+    assert!(held.lookup(&survivor.value.note).unwrap().is_some());
     #[cfg(not(unix))]
     assert!(held_index.dense_id(&survivor.value.note).is_some());
     #[cfg(unix)]

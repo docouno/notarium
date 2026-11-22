@@ -1,6 +1,6 @@
 //! Compile-time contract doubles. No runtime implementation or latency claim.
 use notarium_core::{
-    DomainError, DomainResult,
+    DomainError,
     auth::*,
     ids::*,
     model::*,
@@ -375,8 +375,13 @@ impl StructuralReadPort for RejectingPorts {
             notes: Vec<NoteId>,
         ) -> PortFuture<'_, Vec<Option<NoteCard>>>;
         }
-    fn is_live_visible(&self, _ctx: &SpaceContext, _note: &NoteId) -> DomainResult<bool> {
-        Ok(false)
+    fn is_live_visible<'a>(
+        &'a self,
+        ctx: &'a SpaceContext,
+        note: &'a NoteId,
+    ) -> PortFuture<'a, bool> {
+        let _ = (ctx, note);
+        Box::pin(async { Err(DomainError::ResourceNotFound.into()) })
     }
 }
 impl ChangeBroadcast for RejectingPorts {

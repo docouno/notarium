@@ -43,7 +43,9 @@ jobs:
           version: v5.0.2
       - &configure_cache
         name: Configure the Devkit cache
-        run: echo "DEVKIT_CACHE_DIR=$RUNNER_TEMP/devkit-cache" >> "$GITHUB_ENV"
+        run: |
+          mkdir -p "$RUNNER_TEMP/devkit-cache"
+          echo "DEVKIT_CACHE_DIR=$RUNNER_TEMP/devkit-cache" >> "$GITHUB_ENV"
       - id: pins
         name: Read the pinned desktop recipe
         run: |
@@ -221,6 +223,11 @@ jobs:
         with:
           path: ${{ runner.temp }}/docker-cache/storage-fixtures.tar
           key: docker-storage-fixtures-${{ runner.os }}-${{ steps.fixture-recipes.outputs.digest }}
+      - uses: actions/cache/restore@v6.1.0
+        id: onnx-cache
+        with:
+          path: ${{ env.DEVKIT_CACHE_DIR }}/onnxruntime
+          key: onnxruntime-${{ runner.os }}-${{ hashFiles('scripts/setup-onnxruntime-fixture.sh') }}
       - *validate_vendor
       - name: Load the cached storage fixtures
         if: steps.fixtures-cache.outputs.cache-hit == 'true'
@@ -229,6 +236,11 @@ jobs:
           rm -f "$RUNNER_TEMP/docker-cache/storage-fixtures.tar"
       - run: sh .devkit/runtime/devkit.sh cli doctor .
       - run: make setup app=api
+      - uses: actions/cache/save@v6.1.0
+        if: matrix.saves_fixture_cache && steps.onnx-cache.outputs.cache-hit != 'true'
+        with:
+          path: ${{ env.DEVKIT_CACHE_DIR }}/onnxruntime
+          key: ${{ steps.onnx-cache.outputs.cache-primary-key }}
       - name: Export the storage fixtures
         if: matrix.saves_fixture_cache && steps.fixtures-cache.outputs.cache-hit != 'true'
         shell: bash

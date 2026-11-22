@@ -163,7 +163,7 @@ async fn sqlite_promotes_lookup_before_reclaiming_the_old_checkpoint() {
         .acquire_snapshot(owner.clone(), causal.clone())
         .await
         .unwrap();
-    assert!(old.lookup(&created.note).is_some());
+    assert!(old.lookup(&created.note).unwrap().is_some());
 
     // A held reader permits the catalog seal but blocks lookup replacement
     // for this Space. Other Spaces can still finish serving the new cut.
@@ -185,8 +185,8 @@ async fn sqlite_promotes_lookup_before_reclaiming_the_old_checkpoint() {
     .unwrap()
     .unwrap();
     assert_eq!(current.cut().generation, next);
-    assert!(current.lookup(&created.note).is_some());
-    assert!(old.lookup(&created.note).is_some());
+    assert!(current.lookup(&created.note).unwrap().is_some());
+    assert!(old.lookup(&created.note).unwrap().is_some());
     assert!(
         tokio::time::timeout(
             Duration::from_millis(50),
@@ -207,7 +207,7 @@ async fn sqlite_promotes_lookup_before_reclaiming_the_old_checkpoint() {
         .await
         .unwrap();
     assert_eq!(reopened.cut().generation, next);
-    assert!(reopened.lookup(&delayed.note).is_some());
+    assert!(reopened.lookup(&delayed.note).unwrap().is_some());
     drop(reopened);
     tokio::time::timeout(Duration::from_secs(5), async {
         while old_db.exists() {
@@ -222,8 +222,8 @@ async fn sqlite_promotes_lookup_before_reclaiming_the_old_checkpoint() {
         .await
         .unwrap();
     assert_eq!(current.cut().generation, next);
-    assert!(current.lookup(&created.note).is_some());
-    assert!(engine.is_live_visible(&owner, &created.note).unwrap());
+    assert!(current.lookup(&created.note).unwrap().is_some());
+    assert!(engine.is_live_visible(&owner, &created.note).await.unwrap());
     drop(current);
     runtime.shutdown().await.unwrap();
     canonical.shutdown().await.unwrap();
@@ -483,7 +483,7 @@ async fn postgres_split_owners_backlinks_and_detached_erasure() {
         .await
         .unwrap();
     assert_eq!(held.cut().generation, initial);
-    assert!(held.lookup(&ca.note).is_some());
+    assert!(held.lookup(&ca.note).unwrap().is_some());
     assert_eq!(held.cut().projected_seq, source_checkpoint.snapshot_seq);
     let source_file = find_checkpoint_file(
         &cache_a.root(),
@@ -536,7 +536,7 @@ async fn postgres_split_owners_backlinks_and_detached_erasure() {
     )
     .await
     .unwrap();
-    assert!(held.lookup(&ca.note).is_none());
+    assert!(!matches!(held.lookup(&ca.note), Ok(Some(_))));
     assert!(
         !abandoned_in_serving_generation.exists(),
         "detached purge scrubs a temporary checkpoint in the serving generation"
@@ -572,7 +572,7 @@ async fn postgres_split_owners_backlinks_and_detached_erasure() {
         ),
         "the detached canonical eraser holds the cache without a snapshot"
     );
-    assert!(peer.lookup(&cb.note).is_some());
+    assert!(peer.lookup(&cb.note).unwrap().is_some());
 
     let independent = open_cache_lock(&cache_b);
     drop(engine_b);
@@ -856,7 +856,7 @@ pub(super) async fn exercise(
         .expect("open a current structural snapshot");
     assert_eq!(new.cut().generation, generation);
     assert_eq!(new.cut().projected_seq, renamed.receipt.seq());
-    assert!(new.lookup(&second.note).is_some());
+    assert!(new.lookup(&second.note).unwrap().is_some());
 
     let continued = engine
         .query_view(owner, ReadRequest::Continue { cursor: token })

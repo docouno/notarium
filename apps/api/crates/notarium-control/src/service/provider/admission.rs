@@ -17,7 +17,7 @@ use crate::{
 };
 use notarium_core::{
     DomainError,
-    auth::{AuthenticatedCredential, EngineAuthContext, Space},
+    auth::{AuthenticatedCredential, EngineAuthContext, PrincipalKind, Space},
     classes::{ClassEgressFence, ProviderCurrentContent, ProviderMessage},
     error::{CommitEffect, PortError, ValidationReason},
     ids::*,
@@ -48,8 +48,11 @@ pub(super) struct DispatchAuthority<'a> {
     pub primary: Option<&'a CatalogSpace>,
     pub project: Option<&'a FolderRef>,
     pub parts: &'a [ProviderMessage],
+    pub embedding_inputs: &'a [EmbeddingInput],
+    pub selection: Option<&'a EmbeddingSelection>,
     pub current: &'a [ProviderCurrentContent],
     pub keeper: Option<&'a crate::service::schedules::PrecheckedKeeper>,
+    pub allow_search_indexing: bool,
 }
 impl Snapshot {
     pub fn budgets(
@@ -123,8 +126,11 @@ impl ProviderService {
             primary,
             project,
             parts,
+            embedding_inputs,
+            selection,
             current,
             keeper,
+            allow_search_indexing,
         } = authority;
         let users = rows!(tx,UsersRow,fetch_all,"SELECT * FROM users WHERE user_id IN ($1,$2) ORDER BY user_id","SELECT * FROM v1_control.users WHERE user_id IN ($1,$2) ORDER BY user_id FOR UPDATE";ctx.auth().principal().as_str(),&snapshot.resource.owner_id)?;
         if !users
@@ -133,10 +139,38 @@ impl ProviderService {
         {
             return Err(selection::unavailable());
         }
-        let auth = self
-            .control
-            .revalidate_with_keeper(tx, ctx.auth(), keeper)
-            .await?;
+        let auth = if allow_search_indexing {
+            self.control
+                .revalidate_for_embedding(tx, ctx.auth(), keeper)
+                .await?
+        } else {
+            self.control
+                .revalidate_with_keeper(tx, ctx.auth(), keeper)
+                .await?
+        };
+        let indexing_project = match (auth.kind(), auth.credential()) {
+            (
+                PrincipalKind::SearchIndexing,
+                Some(AuthenticatedCredential::SearchIndexing { space, provider }),
+            ) => {
+                if !allow_search_indexing
+                    || provider.as_str() != snapshot.resource.id
+                    || primary.is_none_or(|primary| &primary.space.id != space)
+                    || embedding_inputs.is_empty()
+                    || embedding_inputs
+                        .iter()
+                        .any(|input| !matches!(input, EmbeddingInput::Part(_)))
+                {
+                    return Err(DomainError::AccessDenied.into());
+                }
+                project
+            }
+            (PrincipalKind::SearchIndexing, _)
+            | (_, Some(AuthenticatedCredential::SearchIndexing { .. })) => {
+                return Err(DomainError::AccessDenied.into());
+            }
+            _ => None,
+        };
         let resource = resource(tx, &snapshot.resource.id).await?;
         if resource.owner_id != snapshot.resource.owner_id
             || resource.runtime_epoch != snapshot.resource.runtime_epoch
@@ -222,6 +256,35 @@ impl ProviderService {
                 .await?,
             );
         }
+        for input in embedding_inputs {
+            let EmbeddingInput::Query(query) = input else {
+                continue;
+            };
+            if auth.taint().is_tainted() {
+                return Err(DomainError::CrossSpaceTainted.into());
+            }
+            let primary = primary.ok_or_else(selection::unavailable)?;
+            let admitted = policies
+                .get(&primary.space.id)
+                .ok_or_else(selection::unavailable)?;
+            let grant = auth
+                .spaces()
+                .get(&primary.space.id)
+                .ok_or_else(selection::unavailable)?;
+            if admitted
+                .project_only
+                .as_ref()
+                .is_some_and(|required| query.project_scope.as_ref() != Some(required))
+            {
+                return Err(DomainError::AccessDenied.into());
+            }
+            if !query.classes.iter().all(|class| {
+                admitted.policy.allowed_classes.contains(class)
+                    && grant.read_classes.contains(class)
+            }) {
+                return Err(invalid(ValidationReason::ClassEgressForbidden));
+            }
+        }
         let mut used = std::collections::BTreeSet::new();
         for part in parts {
             let origin = json(&part.origin())?;
@@ -235,6 +298,7 @@ impl ProviderService {
             if admitted
                 .project_only
                 .as_ref()
+                .or(indexing_project)
                 .is_some_and(|project| !part.in_project(project) || !metadata.in_project(project))
             {
                 return Err(DomainError::AccessDenied.into());
@@ -250,6 +314,21 @@ impl ProviderService {
             RevocationSelector::Grant(auth.grant().clone()),
             RevocationSelector::ProviderResource(ProviderResourceId::parse(&resource.id)?),
         ];
+        if let Some(EmbeddingSelection::SearchDefault {
+            project: selected_project,
+        }) = selection
+        {
+            let space = &primary.ok_or_else(selection::unavailable)?.space;
+            let personal_owner = (space.kind == notarium_core::auth::SpaceKind::Personal)
+                .then(|| auth.principal().as_str());
+            let selected = selection::search_default(tx, space, personal_owner, now).await?;
+            if selected.as_ref().is_none_or(|model| {
+                model.provider.as_str() != resource.id || &model.project != selected_project
+            }) {
+                return Err(invalid(ValidationReason::NotReady));
+            }
+            selectors.push(RevocationSelector::SearchEmbeddingDefault(space.id.clone()));
+        }
         if let Some(credential) = &snapshot.credential {
             selectors.push(RevocationSelector::Credential(CredentialId::parse(
                 &credential.id,
@@ -259,7 +338,7 @@ impl ProviderService {
             AuthenticatedCredential::Session(id)=>{selectors.push(RevocationSelector::Session(id.clone()));Some(rows!(tx,(i64,),fetch_one,"SELECT expires_at FROM sessions WHERE session_id=$1","SELECT expires_at FROM v1_control.sessions WHERE session_id=$1";id.as_str())?.0)},
             AuthenticatedCredential::Pat(id)=>rows!(tx,(Option<i64>,),fetch_one,"SELECT expires_at FROM pats WHERE token_id=$1","SELECT expires_at FROM v1_control.pats WHERE token_id=$1";id.as_str())?.0,
             AuthenticatedCredential::OAuth{token,grant,family}=>{selectors.push(RevocationSelector::OAuthAccess(token.clone()));selectors.push(RevocationSelector::OAuthGrant(grant.clone()));if let Some(family)=family{selectors.push(RevocationSelector::OAuthFamily(family.clone()));}Some(rows!(tx,(i64,),fetch_one,"SELECT expires_at FROM oauth_access_tokens WHERE token_id=$1","SELECT expires_at FROM v1_control.oauth_access_tokens WHERE token_id=$1";token.as_str())?.0)},
-            AuthenticatedCredential::TrustedNone=>None,
+            AuthenticatedCredential::TrustedNone | AuthenticatedCredential::SearchIndexing { .. }=>None,
             AuthenticatedCredential::ScheduledRun{schedule,run,..}=>{
                 selectors.push(RevocationSelector::Schedule(schedule.clone()));
                 selectors.push(RevocationSelector::ScheduledRun(run.clone()));

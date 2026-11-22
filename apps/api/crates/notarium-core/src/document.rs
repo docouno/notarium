@@ -105,6 +105,25 @@ pub fn render_chunk(
     }
     Ok(output)
 }
+/// Conservative Unicode-aware token upper bound in twelfths of a token:
+/// `4/12` for ASCII letters and whitespace, `12/12` for other ASCII and
+/// 2-byte UTF-8 scalars, `18/12` for 3-byte UTF-8, and `24/12` for 4-byte UTF-8.
+pub fn estimate_token_twelfths(text: &str) -> u64 {
+    let mut twelfths = 0u64;
+    for ch in text.chars() {
+        twelfths = twelfths.saturating_add(match ch.len_utf8() {
+            1 if ch.is_ascii_alphabetic() || ch.is_ascii_whitespace() => 4,
+            1 | 2 => 12,
+            3 => 18,
+            _ => 24,
+        });
+    }
+    twelfths
+}
+/// Conservative upper bound on token count derived from [`estimate_token_twelfths`].
+pub fn estimate_conservative_tokens(text: &str) -> usize {
+    usize::try_from(estimate_token_twelfths(text).div_ceil(12)).unwrap_or(usize::MAX)
+}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ChunkPlan {
     Ready {

@@ -405,6 +405,13 @@ impl ProjectionEngine {
         slot.benchmark_pause.arm(point, minimum_events)
     }
 
+    /// Select the packed list representation without seeding 65,537 distinct values.
+    #[doc(hidden)]
+    pub fn bucket_list_at_checkpoint_for_test(&self, scope: &HistoryScope, field: &str) {
+        let slot = self.generation.load().ensure_slot(&scope.space_id);
+        *slot.bucketed_list_for_test.lock().unwrap() = Some(field.to_owned());
+    }
+
     #[doc(hidden)]
     pub async fn checkpoint_for_test(
         &self,

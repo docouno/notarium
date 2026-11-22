@@ -101,6 +101,28 @@ impl DerivedStore {
             .await
     }
 
+    /// Active paths already exclude folders below a trashed ancestor.
+    pub(crate) async fn active_descendants(
+        &self,
+        scope: &HistoryScope,
+        cut: SpaceSeq,
+        folder: &FolderId,
+        path: &str,
+    ) -> Result<Vec<FolderId>, PortError> {
+        let mut filter = "norm_path_prefix IS NOT NULL AND folder_id <> ?".to_owned();
+        let mut args = vec![value(folder)];
+        if !path.is_empty() {
+            let lower = format!("{path}/");
+            let upper = format!("{path}0");
+            filter.push_str(" AND norm_path_prefix >= ? AND norm_path_prefix < ?");
+            args.extend([value(&lower), value(&upper)]);
+        }
+        let rows = self
+            .at_cut::<FolderIdentity>(scope, cut, filter, args, "ORDER BY folder_id")
+            .await?;
+        Ok(rows.into_iter().map(|row| row.folder_id).collect())
+    }
+
     pub async fn folder_alias_page(
         &self,
         scope: &HistoryScope,
@@ -722,4 +744,29 @@ fn in_request_order<R: Clone>(
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod query_plan_tests {
+    #[test]
+    fn sqlite_active_descendants_uses_projected_folder_paths_index() {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch(&super::super::schema::sqlite_ddl())
+            .unwrap();
+        let sql = "EXPLAIN QUERY PLAN SELECT folder_id FROM projected_folders
+            WHERE space_id = ? AND norm_path_prefix IS NOT NULL AND folder_id <> ?
+              AND norm_path_prefix >= ? AND norm_path_prefix < ?
+            ORDER BY folder_id";
+        let mut stmt = db.prepare(sql).unwrap();
+        let mut rows = stmt.raw_query();
+        let mut plan = Vec::new();
+        while let Some(row) = rows.next().unwrap() {
+            plan.push(row.get::<_, String>(3).unwrap());
+        }
+        assert!(
+            plan.iter()
+                .any(|step| step.contains("projected_folder_paths")),
+            "{plan:?}"
+        );
+    }
 }
