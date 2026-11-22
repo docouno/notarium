@@ -248,6 +248,8 @@ pub(super) struct ModelProvider {
     rate_limited: AtomicUsize,
     shared_quota: Mutex<Option<(ProviderResourceId, SharedQuota)>>,
     note_quota: Mutex<Option<note_budget::NoteQuota>>,
+    fail_transient_row: AtomicBool,
+    affected_row_batch_len: AtomicUsize,
     pub(super) block_next_part: AtomicBool,
     pub(super) part_started: Notify,
     pub(super) release_part: Notify,
@@ -341,6 +343,18 @@ impl EmbeddingProviderPort for ModelProvider {
                 .inputs
                 .iter()
                 .map(|input| {
+                    if input.text().contains("atomiczerorow") {
+                        self.affected_row_batch_len
+                            .fetch_max(request.inputs.len(), Ordering::SeqCst);
+                        return Ok(vec![0.0; 64]);
+                    }
+                    if input.text().contains("atomictransientrow")
+                        && self.fail_transient_row.load(Ordering::SeqCst)
+                    {
+                        self.affected_row_batch_len
+                            .fetch_max(request.inputs.len(), Ordering::SeqCst);
+                        return Err(DomainError::AccessDenied);
+                    }
                     let mut row = vector.clone();
                     // Give the atomic-note probe a distinctive semantic match at the end.
                     if input.text() == "semanticbudgetprobe"

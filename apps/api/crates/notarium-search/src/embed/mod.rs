@@ -16,6 +16,22 @@ pub use scheduler::{EmbeddingScheduler, Priority, bounded_batches};
 pub use tokenizer::Encoding;
 pub use tokenizer::{LocalTokenizerBudget, RemoteConservativeTokenizerBudget};
 
+/// A missing vector is terminal for this input and model unless the provider
+/// also reported a retryable row. Keep successful rows available to staging.
+pub(crate) struct EmbeddingBatch {
+    pub rows: Vec<Option<Vec<f32>>>,
+    pub pending: bool,
+}
+
+impl EmbeddingBatch {
+    pub fn complete(rows: Vec<Option<Vec<f32>>>) -> Self {
+        Self {
+            rows,
+            pending: false,
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum EmbeddingError {
     #[error("the embedding model is unavailable")]

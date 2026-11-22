@@ -2,7 +2,7 @@
 //! interactive lane between every batch. Each job runs in a spawned task so
 //! panics cannot take down the scheduler.
 
-use super::EmbeddingError;
+use super::{EmbeddingBatch, EmbeddingError};
 use crate::config::MAX_QUERY_EMBEDDING_BUDGET;
 use notarium_core::ports::{CallBudget, Cancellation};
 use std::{
@@ -40,7 +40,7 @@ impl Priority {
     }
 }
 
-type Output = Result<Vec<Option<Vec<f32>>>, EmbeddingError>;
+type Output = Result<EmbeddingBatch, EmbeddingError>;
 type Execute = Box<dyn FnOnce(CallBudget) -> Pin<Box<dyn Future<Output = Output> + Send>> + Send>;
 
 struct Job {
@@ -105,6 +105,23 @@ impl EmbeddingScheduler {
     }
 
     pub async fn submit<F, R>(
+        &self,
+        priority: Priority,
+        budget: CallBudget,
+        execute: F,
+    ) -> Result<Vec<Option<Vec<f32>>>, EmbeddingError>
+    where
+        F: FnOnce(CallBudget) -> R + Send + 'static,
+        R: Future<Output = Result<Vec<Option<Vec<f32>>>, EmbeddingError>> + Send + 'static,
+    {
+        self.submit_batch(priority, budget, move |budget| async move {
+            execute(budget).await.map(EmbeddingBatch::complete)
+        })
+        .await
+        .map(|batch| batch.rows)
+    }
+
+    pub(crate) async fn submit_batch<F, R>(
         &self,
         priority: Priority,
         mut budget: CallBudget,

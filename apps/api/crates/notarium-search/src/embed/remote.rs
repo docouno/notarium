@@ -1,4 +1,4 @@
-use super::{EmbeddingError, normalize};
+use super::{EmbeddingBatch, EmbeddingError, normalize};
 use crate::ports::RemoteIndexingGrant;
 use notarium_core::{
     DomainError,
@@ -116,6 +116,17 @@ impl RemoteEmbedder {
         project: Option<FolderRef>,
         parts: Vec<ContentPart>,
     ) -> Result<Vec<Option<Vec<f32>>>, EmbeddingError> {
+        self.index_parts(grant, project, parts)
+            .await
+            .map(|batch| batch.rows)
+    }
+
+    pub(crate) async fn index_parts(
+        &self,
+        grant: RemoteIndexingGrant,
+        project: Option<FolderRef>,
+        parts: Vec<ContentPart>,
+    ) -> Result<EmbeddingBatch, EmbeddingError> {
         if parts.len() > 16 || parts.is_empty() {
             return Err(EmbeddingError::BudgetExceeded);
         }
@@ -126,30 +137,23 @@ impl RemoteEmbedder {
             return Err(EmbeddingError::IndexingDenied);
         }
         let mut intent = self.intent(&grant.ctx, b"parts", project.as_ref(), true);
-        let mut positions = Vec::new();
-        let mut admitted = Vec::new();
+        let mut admitted = Vec::with_capacity(parts.len());
         let mut total = 0u32;
-        let mut output = vec![None; parts.len()];
-        for (position, part) in parts.into_iter().enumerate() {
-            if let Ok(part) = ClassEgressFence::provider_part(part, grant.ctx.auth(), &grant.policy)
-            {
-                let content = part.part();
-                let document = part.provenance();
-                hash_field(
-                    &mut intent,
-                    document.reference().note_id.as_str().as_bytes(),
-                );
-                hash_field(&mut intent, document.revision().as_str().as_bytes());
-                hash_field(&mut intent, content.key().as_bytes());
-                total = total
-                    .checked_add(content.tokens())
-                    .ok_or(EmbeddingError::PermanentInputRejected)?;
-                positions.push(position);
-                admitted.push(part);
-            }
-        }
-        if admitted.is_empty() {
-            return Err(EmbeddingError::IndexingDenied);
+        for part in parts {
+            let part = ClassEgressFence::provider_part(part, grant.ctx.auth(), &grant.policy)
+                .map_err(|_| EmbeddingError::IndexingDenied)?;
+            let content = part.part();
+            let document = part.provenance();
+            hash_field(
+                &mut intent,
+                document.reference().note_id.as_str().as_bytes(),
+            );
+            hash_field(&mut intent, document.revision().as_str().as_bytes());
+            hash_field(&mut intent, content.key().as_bytes());
+            total = total
+                .checked_add(content.tokens())
+                .ok_or(EmbeddingError::PermanentInputRejected)?;
+            admitted.push(part);
         }
         if total > self.max_input_tokens {
             return Err(EmbeddingError::PermanentInputRejected);
@@ -165,39 +169,58 @@ impl RemoteEmbedder {
         let result = self
             .dispatch(grant.ctx, request, true, indexing_port_error)
             .await?;
-        let mut permanent_error = None;
-        let mut has_success = false;
-        let mut has_transient_failure = false;
-        for (position, row) in positions.into_iter().zip(result) {
-            match row {
-                Ok(vector) => {
-                    if vector.len() != self.dimension as usize {
-                        return Err(EmbeddingError::ProviderUnavailable);
-                    }
-                    if let Some(normalized) = self.normalized_row(vector) {
-                        output[position] = Some(normalized);
-                        has_success = true;
-                    } else {
-                        permanent_error.get_or_insert(EmbeddingError::PermanentInputRejected);
-                    }
+        self.indexing_rows(result)
+    }
+
+    pub(super) fn indexing_rows(
+        &self,
+        result: Vec<Result<Vec<f32>, DomainError>>,
+    ) -> Result<EmbeddingBatch, EmbeddingError> {
+        let mut output = Vec::with_capacity(result.len());
+        let mut pending = false;
+        let mut invalid_dimension = false;
+        let mut shared_delay: Option<Duration> = None;
+        let mut token_delay: Option<Duration> = None;
+        for row in result {
+            let vector = match row.map_err(indexing_provider_error) {
+                Ok(vector) if vector.len() == self.dimension as usize => normalize(&vector),
+                Ok(_) => {
+                    invalid_dimension = true;
+                    None
                 }
-                Err(error) => {
-                    let mapped = indexing_provider_error(error);
-                    if mapped.is_permanent_note_rejection() {
-                        permanent_error.get_or_insert(mapped);
-                    } else {
-                        has_transient_failure = true;
-                    }
+                Err(EmbeddingError::IndexingDenied) => return Err(EmbeddingError::IndexingDenied),
+                Err(EmbeddingError::PermanentInputRejected) => None,
+                Err(EmbeddingError::IndexingThrottled(delay)) => {
+                    shared_delay = Some(shared_delay.unwrap_or_default().max(delay));
+                    None
                 }
-            }
+                Err(EmbeddingError::IndexingTokenLimit(delay)) => {
+                    token_delay = Some(token_delay.unwrap_or_default().max(delay));
+                    None
+                }
+                Err(_) => {
+                    pending = true;
+                    None
+                }
+            };
+            output.push(vector);
         }
-        if !has_success
-            && !has_transient_failure
-            && let Some(error) = permanent_error
-        {
-            return Err(error);
+        if let Some(delay) = shared_delay {
+            return Err(EmbeddingError::IndexingThrottled(delay));
         }
-        Ok(output)
+        if let Some(delay) = token_delay {
+            return Err(EmbeddingError::IndexingTokenLimit(delay));
+        }
+        if invalid_dimension {
+            return Err(EmbeddingError::ProviderUnavailable);
+        }
+        if !pending && output.iter().all(Option::is_none) {
+            return Err(EmbeddingError::PermanentInputRejected);
+        }
+        Ok(EmbeddingBatch {
+            rows: output,
+            pending,
+        })
     }
 
     async fn dispatch(

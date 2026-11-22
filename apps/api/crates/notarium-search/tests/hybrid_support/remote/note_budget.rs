@@ -70,28 +70,10 @@ pub async fn atomic_note_budget(store: Arc<CanonicalStore>, root: DataRoot) {
     );
     let layout = SearchLayout::open(&root, space.scope.clone()).unwrap();
 
-    // Cold seed, warm segmented replacement, and warm inline replacement.
-    for (revision, parts, allowed_parts) in [(1, 320, 256), (2, 320, 256), (3, 32, 16)] {
+    let commit_revision = async |revision: u8, carrier: String| {
         let healthy = sample_note_id(revision + 1);
-        *provider.note_quota.lock().unwrap() = Some(NoteQuota {
-            note: large.clone(),
-            allowed_parts,
-            paid: BTreeSet::new(),
-            refused: false,
-        });
         let mut doc = note(&large, &folder, "Large", "");
-        doc.carrier = (0..parts)
-            .map(|i| {
-                let marker = if i + 1 == parts {
-                    "atomiclastpiece"
-                } else {
-                    ""
-                };
-                format!(
-                    "# Revision {revision} section {i}\n\nUnique text {revision} {i}. {marker}\n\n"
-                )
-            })
-            .collect();
+        doc.carrier = carrier;
         let (written, _) = store
             .commit_synthetic_note_batch_for_test(
                 &space.scope,
@@ -119,16 +101,62 @@ pub async fn atomic_note_budget(store: Arc<CanonicalStore>, root: DataRoot) {
             view.index(healthy.clone(), folder.clone());
             view.advance(written.last_seq);
         }
+        (healthy, written.last_seq)
+    };
+    let search = async || {
+        engine
+            .search(context(&space.scope, &owner), query("semanticbudgetprobe"))
+            .await
+            .unwrap()
+    };
+    let wait_for_complete = async |sequence: SpaceSeq| {
+        tokio::time::timeout(Duration::from_secs(12), async {
+            loop {
+                let manifest = layout.search_manifest().unwrap().unwrap();
+                if manifest.vector_seq == Some(sequence)
+                    && !manifest.embeddings_pending
+                    && search().await.hits.iter().any(|hit| {
+                        hit.card.document.provenance().reference().note_id == large
+                            && hit
+                                .chunks
+                                .iter()
+                                .any(|chunk| chunk.text().contains("atomiclastpiece"))
+                    })
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the complete revision must become searchable after embedding settles");
+    };
+
+    // Cold seed, warm segmented replacement, and warm inline replacement.
+    for (revision, parts, allowed_parts) in [(1, 320, 256), (2, 320, 256), (3, 32, 16)] {
+        *provider.note_quota.lock().unwrap() = Some(NoteQuota {
+            note: large.clone(),
+            allowed_parts,
+            paid: BTreeSet::new(),
+            refused: false,
+        });
+        let carrier = (0..parts)
+            .map(|i| {
+                let marker = if i + 1 == parts {
+                    "atomiclastpiece"
+                } else {
+                    ""
+                };
+                format!(
+                    "# Revision {revision} section {i}\n\nUnique text {revision} {i}. {marker}\n\n"
+                )
+            })
+            .collect();
+        let (healthy, sequence) = commit_revision(revision, carrier).await;
         if revision == 1 {
             engine.start_space(space.scope.clone()).unwrap();
         }
 
-        let search = async || {
-            engine
-                .search(context(&space.scope, &owner), query("semanticbudgetprobe"))
-                .await
-                .unwrap()
-        };
         tokio::time::timeout(Duration::from_secs(12), async {
             loop {
                 if provider
@@ -172,28 +200,7 @@ pub async fn atomic_note_budget(store: Arc<CanonicalStore>, root: DataRoot) {
             assert_eq!(quota.paid.len(), allowed_parts);
             quota.allowed_parts = usize::MAX;
         }
-        tokio::time::timeout(Duration::from_secs(12), async {
-            loop {
-                if !layout
-                    .search_manifest()
-                    .unwrap()
-                    .unwrap()
-                    .embeddings_pending
-                    && search().await.hits.iter().any(|hit| {
-                        hit.card.document.provenance().reference().note_id == large
-                            && hit
-                                .chunks
-                                .iter()
-                                .any(|chunk| chunk.text().contains("atomiclastpiece"))
-                    })
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("the complete revision must become searchable after the quota recovers");
+        wait_for_complete(sequence).await;
         assert_eq!(
             provider
                 .note_quota
@@ -206,5 +213,67 @@ pub async fn atomic_note_budget(store: Arc<CanonicalStore>, root: DataRoot) {
             parts
         );
     }
+
+    *provider.note_quota.lock().unwrap() = None;
+    // The 17th input is sent alone. In the two-part revision the same terminal
+    // zero vector is returned alongside a valid row in one provider response.
+    for (revision, parts, expected_batch_len) in [(4, 17, 1), (5, 2, 2)] {
+        provider.affected_row_batch_len.store(0, Ordering::SeqCst);
+        let carrier = (0..parts)
+            .map(|i| {
+                let marker = if i + 1 == parts {
+                    "atomiczerorow"
+                } else {
+                    "atomiclastpiece"
+                };
+                format!("# Section {i}\n\nPermanent {revision} {i} {marker}.\n\n")
+            })
+            .collect();
+        let (_, sequence) = commit_revision(revision, carrier).await;
+        wait_for_complete(sequence).await;
+        assert_eq!(
+            provider.affected_row_batch_len.load(Ordering::SeqCst),
+            expected_batch_len
+        );
+    }
+
+    // A transient error on a single row hides the new revision while a
+    // different note in the same commit can already be found.
+    provider.fail_transient_row.store(true, Ordering::SeqCst);
+    provider.affected_row_batch_len.store(0, Ordering::SeqCst);
+    let (healthy, sequence) = commit_revision(
+        6,
+        "# First\n\nTransient healthy prefix.\n\n# Tail\n\natomictransientrow atomiclastpiece."
+            .to_string(),
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            let hits = search().await.hits;
+            if provider.affected_row_batch_len.load(Ordering::SeqCst) == 2
+                && hits
+                    .iter()
+                    .any(|hit| hit.card.document.provenance().reference().note_id == healthy)
+            {
+                assert!(
+                    hits.iter()
+                        .all(|hit| hit.card.document.provenance().reference().note_id != large)
+                );
+                assert!(
+                    layout
+                        .search_manifest()
+                        .unwrap()
+                        .unwrap()
+                        .embeddings_pending
+                );
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("a transient row must defer only its own note");
+    provider.fail_transient_row.store(false, Ordering::SeqCst);
+    wait_for_complete(sequence).await;
     engine.shutdown().await;
 }

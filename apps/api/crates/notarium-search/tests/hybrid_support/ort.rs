@@ -125,7 +125,7 @@ async fn seed(
     store: Arc<CanonicalStore>,
     tag: u8,
     title: &str,
-    text: &str,
+    carrier: &str,
 ) -> (SpaceContext, SpaceSeq, Arc<Projection>) {
     let owner = sample_principal_id(tag);
     let folder = sample_folder_id(tag);
@@ -145,13 +145,10 @@ async fn seed(
         })
         .await
         .unwrap();
+    let mut spec = note(&id, &folder, title, "");
+    spec.carrier = carrier.to_owned();
     let (indexed, _) = store
-        .commit_synthetic_note_batch_for_test(
-            &space.scope,
-            lease,
-            &owner,
-            vec![note(&id, &folder, title, text)],
-        )
+        .commit_synthetic_note_batch_for_test(&space.scope, lease, &owner, vec![spec])
         .await
         .unwrap();
     let mut snapshot = View::new(space.scope.clone(), folder.clone());
@@ -166,9 +163,22 @@ async fn seed(
 }
 
 pub async fn search_with_dynamic_models(store: Arc<CanonicalStore>, root: DataRoot) {
-    let (fast, fast_seq, fast_projection) =
-        seed(store.clone(), 0x70, "Warm palette", "reddish zero").await;
-    let (slow, slow_seq, slow_projection) = seed(store.clone(), 0x71, "Cool palette", "blue").await;
+    // The heading starts a new chunk. The preamble embeds to a zero vector
+    // while the second chunk in the same local batch has a usable red basis.
+    let (fast, fast_seq, fast_projection) = seed(
+        store.clone(),
+        0x70,
+        "Warm palette",
+        "zero\n\n# Warm palette\n\nreddish zero\n",
+    )
+    .await;
+    let (slow, slow_seq, slow_projection) = seed(
+        store.clone(),
+        0x71,
+        "Cool palette",
+        "# Cool palette\n\nblue\n",
+    )
+    .await;
     let fast_model = ModelProfileId::from_bytes([0x70; 16]);
     let slow_model = ModelProfileId::from_bytes([0x71; 16]);
     let resolver = Arc::new(LocalResolver(
@@ -254,6 +264,12 @@ pub async fn search_with_dynamic_models(store: Arc<CanonicalStore>, root: DataRo
             let result = engine.search(fast.clone(), query("red")).await.unwrap();
             if let Some(hit) = result.hits.first() {
                 assert_eq!(hit.card.title, "Warm palette");
+                assert!(
+                    hit.chunks
+                        .iter()
+                        .any(|chunk| chunk.text().contains("reddish"))
+                );
+                assert!(hit.chunks.iter().all(|chunk| chunk.text().trim() != "zero"));
                 assert!(result.degraded.is_none());
                 break;
             }

@@ -952,6 +952,67 @@ async fn remote_parts_distinguish_permanent_denial_from_transient_provider_error
     ));
     assert!(row_permanent.is_permanent_note_rejection());
 
+    // Per-row input rejection is terminal even beside a usable vector, while
+    // an ordinary transient failure preserves that vector for private staging.
+    for reverse in [false, true] {
+        let pair = |first, second| {
+            if reverse {
+                vec![second, first]
+            } else {
+                vec![first, second]
+            }
+        };
+        let success = || Ok(vec![1.0; 64]);
+        let permanent = || {
+            Err(DomainError::validation(
+                ValidationReason::TokenBudgetExceeded,
+            ))
+        };
+        let quota = |budget| {
+            Err(DomainError::RateLimited {
+                budget,
+                retry_after_ms: 1234,
+            })
+        };
+        for (other, expect_pending) in [
+            (Ok(vec![0.0; 64]), false),
+            (permanent(), false),
+            (Err(DomainError::AccessDenied), true),
+        ] {
+            let batch = remote.indexing_rows(pair(success(), other)).unwrap();
+            assert_eq!(batch.pending, expect_pending);
+            assert_eq!(batch.rows[usize::from(reverse)], Some(vec![0.125; 64]));
+            assert!(batch.rows[usize::from(!reverse)].is_none());
+        }
+        for budget in [
+            BudgetKind::Requests,
+            BudgetKind::Concurrency,
+            BudgetKind::Tokens,
+        ] {
+            let result = remote.indexing_rows(pair(success(), quota(budget)));
+            let delay = match (budget, result) {
+                (BudgetKind::Tokens, Err(EmbeddingError::IndexingTokenLimit(delay)))
+                | (
+                    BudgetKind::Requests | BudgetKind::Concurrency,
+                    Err(EmbeddingError::IndexingThrottled(delay)),
+                ) => delay,
+                _ => panic!("per-row provider limits must keep their scope"),
+            };
+            assert_eq!(delay, Duration::from_millis(1234));
+        }
+        for other in [
+            success(),
+            permanent(),
+            quota(BudgetKind::Requests),
+            Ok(vec![1.0; 2]),
+        ] {
+            assert!(matches!(
+                remote.indexing_rows(pair(other, Err(DomainError::ResourceNotFound))),
+                Err(EmbeddingError::IndexingDenied)
+            ));
+        }
+    }
+
     // AccessDenied stays a non-permanent provider error for retry/backoff compatibility.
     *stub.row_error.lock().unwrap() = None;
     *stub.error.lock().unwrap() = Some(DomainError::AccessDenied);

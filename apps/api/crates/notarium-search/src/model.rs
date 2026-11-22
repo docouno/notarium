@@ -5,8 +5,8 @@ pub(super) use loading::LocalModels;
 use crate::{
     config::VectorMode,
     embed::{
-        EmbeddingError, OrtModel, Priority, RemoteConservativeTokenizerBudget, RemoteEmbedder,
-        bounded_batches,
+        EmbeddingBatch, EmbeddingError, OrtModel, Priority, RemoteConservativeTokenizerBudget,
+        RemoteEmbedder, bounded_batches,
     },
     engine::Services,
     ports::{
@@ -476,7 +476,7 @@ impl Embedder {
         batch: &[Vec<ChunkDescriptor>],
         budget: &CallBudget,
         priority: Priority,
-    ) -> Result<Vec<Option<Vec<f32>>>, EmbeddingError> {
+    ) -> Result<EmbeddingBatch, EmbeddingError> {
         let parts = batch
             .iter()
             .map(|group| ContentPart::from_chunk(document.clone(), group[0].clone()))
@@ -489,7 +489,7 @@ impl Embedder {
         let note = document.reference().note_id.clone();
         services
             .remote_scheduler
-            .submit(priority, budget.clone(), move |budget| async move {
+            .submit_batch(priority, budget.clone(), move |budget| async move {
                 // Resolve at the scheduled boundary. A queued batch must not
                 // inherit the project selection from the start of a backfill.
                 let started = std::time::Instant::now();
@@ -535,7 +535,7 @@ impl Embedder {
                 if grant.ctx.budget.remaining.is_zero() {
                     return Err(EmbeddingError::BudgetExceeded);
                 }
-                backend.parts(grant, project, parts).await
+                backend.index_parts(grant, project, parts).await
             })
             .await
     }
@@ -559,7 +559,7 @@ impl RemoteNote<'_> {
         batch: &[Vec<ChunkDescriptor>],
         budget: &mut CallBudget,
         priority: Priority,
-    ) -> Result<Vec<Option<Vec<f32>>>, EmbeddingError> {
+    ) -> Result<EmbeddingBatch, EmbeddingError> {
         let mut retried = false;
         loop {
             let result = embedder
@@ -581,7 +581,7 @@ impl RemoteNote<'_> {
                 // has already embedded content in this attempt.
                 Err(EmbeddingError::IndexingTokenLimit(delay)) if self.embedded_batch => *delay,
                 Ok(rows) => {
-                    self.embedded_batch |= rows.iter().any(Option::is_some);
+                    self.embedded_batch |= rows.rows.iter().any(Option::is_some);
                     return result;
                 }
                 _ => return result,
@@ -739,19 +739,22 @@ impl PreparedIndexNote<'_> {
                         self.budget.clone(),
                     )
                     .await
+                    .map(EmbeddingBatch::complete)
             };
             let rows = match rows {
-                Ok(rows) => rows,
+                Ok(batch) => {
+                    pending |= batch.pending;
+                    batch.rows
+                }
                 Err(EmbeddingError::IndexingDenied) => {
                     return IndexedNoteVectors {
                         chunks: Vec::new(),
                         outcome: NoteIndexOutcome::Denied,
                     };
                 }
-                Err(err) if err.is_permanent_note_rejection() => {
+                Err(EmbeddingError::PermanentInputRejected) => {
                     tracing::warn!(
                         note = %document.reference().note_id,
-                        kind = %err,
                         "skipping permanently rejected note batch for vector indexing"
                     );
                     continue;
@@ -769,27 +772,25 @@ impl PreparedIndexNote<'_> {
                 }
             };
             for (group, row) in batch.into_iter().zip(rows) {
-                match row {
-                    Some(raw) => match QuantizedVector::quantize(&raw) {
-                        Ok(vector) => {
-                            for descriptor in group {
-                                vectors.push(vector_chunk(
-                                    document,
-                                    self.folder,
-                                    descriptor,
-                                    vector.clone(),
-                                ));
-                            }
+                let Some(raw) = row else {
+                    continue;
+                };
+                match QuantizedVector::quantize(&raw) {
+                    Ok(vector) => {
+                        for descriptor in group {
+                            vectors.push(vector_chunk(
+                                document,
+                                self.folder,
+                                descriptor,
+                                vector.clone(),
+                            ));
                         }
-                        Err(_) => {
-                            tracing::warn!(
-                                note = %document.reference().note_id,
-                                "skipping unquantizable embedding chunk"
-                            );
-                        }
-                    },
-                    None => {
-                        pending = true;
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            note = %document.reference().note_id,
+                            "skipping unquantizable embedding chunk"
+                        );
                     }
                 }
             }

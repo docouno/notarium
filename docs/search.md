@@ -102,9 +102,10 @@ without an active plan, delete overflow flushes tombstones and resets the
 journal) and read-only, single-pass BLAKE3-checksummed v2 mmap segments
 (112 MiB estimated build budget per segment). A long note can span several
 segments. Backfill and direct replacements publish all its pieces in one
-manifest update. If an embedding response leaves a note incomplete, its
-partial revision stays out of vector results. Complete notes can still be
-published, and the missing note remains eligible for repair. Backfill,
+manifest update. A temporary failure for any chunk keeps that revision out
+of vector results until repair completes. Other complete notes can still be
+published. A permanently unembeddable chunk, such as an all-zero embedding,
+is skipped regardless of which other chunks share its batch. Backfill,
 dirty-note repair and full sweeps process at most
 256 pending quantized rows (1 MiB of i8 payload at 4,096 dimensions). Warm
 repair reads up to 16 carriers per page and checks admitted chunk metadata
