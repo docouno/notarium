@@ -41,6 +41,13 @@ pub struct HydratedChatHit {
     pub text: String,
 }
 
+/// The current audience, reachable keys and their branch taint share one canonical read.
+pub struct SearchDeliveryAdmission {
+    pub space: Space,
+    pub head: SpaceSeq,
+    pub entries: BTreeMap<(ChatThreadId, ThreadEntrySeq), bool>,
+}
+
 pub struct SearchChatEntriesPage {
     pub entries: Vec<HydratedChatHit>,
     /// An inclusive cursor to the next parent on the pinned chain.
@@ -436,12 +443,85 @@ impl CanonicalStore {
             .collect()
     }
 
+    /// Recheck the supplied keys for final delivery without recording a read.
+    pub async fn admit_search_delivery(
+        &self,
+        authority: &ServiceAuthority,
+        ctx: &SpaceContext,
+        candidates: &[(ChatThreadId, ThreadEntrySeq)],
+    ) -> Result<SearchDeliveryAdmission, PortError> {
+        authority.require(ServicePurpose::Search)?;
+        if candidates.len() > 200 {
+            return Err(DomainError::validation(ValidationReason::InvalidLimit).into());
+        }
+        if candidates.is_empty() {
+            let record = self
+                .read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
+                .await?;
+            ctx.check_current(&record.scope)?;
+            if record.space.lifecycle != SpaceLifecycle::Active {
+                return Err(DomainError::ResourceNotFound.into());
+            }
+            return Ok(SearchDeliveryAdmission {
+                space: record.space,
+                head: record.last_seq,
+                entries: BTreeMap::new(),
+            });
+        }
+        let deadline = CommandDeadline::start(&ctx.budget, "admit_search_delivery");
+        let planned = self
+            .plan_chat_hits(ctx, &deadline, candidates.to_vec(), candidates.len())
+            .await?;
+        let entries = planned
+            .rows
+            .into_iter()
+            .map(|(thread, entry)| {
+                Ok((
+                    (thread.thread_id, entry.seq()?),
+                    thread.tainted_mask != 0 || entry.tainted(),
+                ))
+            })
+            .collect::<Result<_, PortError>>()?;
+        Ok(SearchDeliveryAdmission {
+            space: planned.space,
+            head: planned.head,
+            entries,
+        })
+    }
+
     pub async fn hydrate_live_visible_chat_hits(
         &self,
         ctx: &SpaceContext,
         candidates: &[(ChatThreadId, ThreadEntrySeq)],
         limit: PageLimit,
     ) -> Result<(Vec<HydratedChatHit>, bool), PortError> {
+        let page = self.hydrate_chat_candidates(ctx, candidates, limit).await?;
+        if !page.hits.is_empty() {
+            ctx.auth().mark_chat_read_taint(&page.space, page.tainted);
+        }
+        Ok((page.hits, page.truncated))
+    }
+
+    /// Prepare authorized snippets for the search service. Disclosure and its
+    /// branch taint are committed only when the service delivers its final page.
+    pub async fn prepare_search_chat_hits(
+        &self,
+        authority: &ServiceAuthority,
+        ctx: &SpaceContext,
+        candidates: &[(ChatThreadId, ThreadEntrySeq)],
+        limit: PageLimit,
+    ) -> Result<(Vec<HydratedChatHit>, bool), PortError> {
+        authority.require(ServicePurpose::Search)?;
+        let page = self.hydrate_chat_candidates(ctx, candidates, limit).await?;
+        Ok((page.hits, page.truncated))
+    }
+
+    async fn hydrate_chat_candidates(
+        &self,
+        ctx: &SpaceContext,
+        candidates: &[(ChatThreadId, ThreadEntrySeq)],
+        limit: PageLimit,
+    ) -> Result<HydratedChatPage, PortError> {
         // One additional candidate witnesses truncation at the largest page limit.
         if candidates.len() > 201 {
             return Err(DomainError::validation(ValidationReason::InvalidLimit).into());
@@ -473,17 +553,12 @@ impl CanonicalStore {
             )
             .await?;
         let mut hits = Vec::with_capacity(current.len());
+        let mut any_tainted = false;
         for (thread, row) in current {
             let Some(text) = hydrated.remove(&(thread.thread_id.clone(), row.seq()?)) else {
                 continue;
             };
-            ctx.auth().authorize_chat_thread_read(
-                &space,
-                thread.kind,
-                &thread.owner,
-                thread.project_folder.as_ref(),
-                thread.tainted_mask != 0 || row.tainted(),
-            )?;
+            any_tainted |= thread.tainted_mask != 0 || row.tainted();
             hits.push(make_hit(
                 &thread.thread_id,
                 thread.kind,
@@ -493,7 +568,12 @@ impl CanonicalStore {
                 text,
             )?);
         }
-        Ok((hits, truncated))
+        Ok(HydratedChatPage {
+            space,
+            hits,
+            truncated,
+            tainted: any_tainted,
+        })
     }
 
     async fn plan_chat_hits(
@@ -507,7 +587,8 @@ impl CanonicalStore {
         let auth = ctx.auth().clone();
         self.with_read_tx_budget(Some(&tx_budget(&ctx.budget, deadline)?), |tx| {
             Box::pin(async move {
-                let space = active_space(tx, &scope).await?.space;
+                let record = active_space(tx, &scope).await?;
+                let space = record.space;
                 let mut deduped = Vec::with_capacity(candidates.len());
                 let mut seen = BTreeSet::new();
                 for pair in candidates {
@@ -562,6 +643,8 @@ impl CanonicalStore {
                     verified_tips.insert((head.thread_id.clone(), seq), head.head_leaf_seq);
                     if rows.len() == limit {
                         return Ok(PlannedChatHits {
+                            space,
+                            head: record.last_seq,
                             rows,
                             remaining: deduped[index..].to_vec(),
                             verified_tips,
@@ -570,6 +653,8 @@ impl CanonicalStore {
                     rows.push((head, row));
                 }
                 Ok(PlannedChatHits {
+                    space,
+                    head: record.last_seq,
                     rows,
                     remaining: Vec::new(),
                     verified_tips,
@@ -711,7 +796,16 @@ impl CanonicalStore {
     }
 }
 
+struct HydratedChatPage {
+    space: Space,
+    hits: Vec<HydratedChatHit>,
+    truncated: bool,
+    tainted: bool,
+}
+
 struct PlannedChatHits {
+    space: Space,
+    head: SpaceSeq,
     rows: Vec<(ThreadHeadRow, Entry)>,
     remaining: Vec<(ChatThreadId, ThreadEntrySeq)>,
     verified_tips: BTreeMap<(ChatThreadId, ThreadEntrySeq), ThreadEntrySeq>,

@@ -71,7 +71,7 @@ fn local_wordpiece_bpe_and_remote_counts_match_served_input() {
         br#"{
         "pre_tokenizer":{"type":"WhitespaceSplit"},
         "model":{"type":"BPE","unk_token":"?","vocab":{"?":0,"a":1,"b":2,"c":3,"ab":4,"bc":5},
-        "merges":[["b","c"],"a b"]}
+        "merges":[["b","c"],["a","b"]]}
     }"#,
         profile(),
         512,
@@ -272,7 +272,7 @@ fn tokenizer_matches_reference_on_fallback_controls_and_whitespace() {
             &[1],
         ),
         (
-            r#"{"pre_tokenizer":{"type":"ByteLevel","add_prefix_space":false},
+            r#"{"pre_tokenizer":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":true},
             "model":{"type":"BPE","vocab":{"Ġ":1,"'":2,"Ġ'":3,"s":4,"Ġ's":5},
             "merges":[["Ġ","'"],["Ġ'","s"]]}}"#,
             "  's",
@@ -288,7 +288,7 @@ fn tokenizer_matches_reference_on_fallback_controls_and_whitespace() {
 }
 
 #[test]
-fn bpe_fixes_byte_fallback_oov_duplicate_merges_and_space_splits() {
+fn bpe_decorated_byte_fallback_and_strict_oov() {
     // The decorated symbol must have a vocabulary entry for each byte.
     let prefixed = LocalTokenizerBudget::from_json(
         br###"{
@@ -327,20 +327,44 @@ fn bpe_fixes_byte_fallback_oov_duplicate_merges_and_space_splits() {
         strict.encode("a!b"),
         Err(EmbeddingError::InvalidModel)
     ));
+}
 
-    // Duplicate merge entries keep the earliest rank; text merges resolve tokens containing spaces.
-    let merges = LocalTokenizerBudget::from_json(
-        br#"{
-        "model":{"type":"BPE",
-        "vocab":{"a":1,"b":2,"c":3,"ab":4,"bc":5," b":6,"a b":7},
-        "merges":[["a","b"],["b","c"],["a","b"],"a  b"]}
-    }"#,
-        profile(),
-        512,
-    )
-    .unwrap();
-    // ("a", "b") keeps rank 0 over ("b", "c") at rank 1.
-    assert_eq!(merges.encode("abc").unwrap().ids, [4, 3]);
+#[test]
+fn bpe_merge_ranks_and_formats_match_hugging_face() {
+    // Golden IDs from Hugging Face tokenizers 0.23.3.
+    let vocab = serde_json::json!({"a":1,"b":2,"c":3,"ab":4,"bc":5," ":6," b":7,"a b":8});
+    let load = |merges| {
+        let json = serde_json::json!({"model":{"type":"BPE","vocab":vocab,"merges":merges}});
+        LocalTokenizerBudget::from_json(&serde_json::to_vec(&json).unwrap(), profile(), 512)
+    };
+    for (merges, text, expected) in [
+        (
+            serde_json::json!([["a", "b"], ["b", "c"]]),
+            "abc",
+            &[4, 3][..],
+        ),
+        (
+            serde_json::json!([["a", "b"], ["b", "c"], ["a", "b"]]),
+            "abc",
+            &[1, 5],
+        ),
+        (
+            serde_json::json!(["#version: 0.2", "a b", "b c", "a b"]),
+            "abc",
+            &[1, 5],
+        ),
+        (serde_json::json!([[" ", "b"], ["a", " b"]]), "a b", &[8]),
+    ] {
+        let tokenizer = load(merges).unwrap();
+        assert_eq!(tokenizer.encode(text).unwrap().ids, expected);
+        assert_eq!(tokenizer.count(text).unwrap() as usize, expected.len());
+    }
+    for merges in [
+        serde_json::json!([["b", "c"], "a b"]),
+        serde_json::json!(["a  b"]),
+    ] {
+        assert!(matches!(load(merges), Err(EmbeddingError::InvalidModel)));
+    }
 }
 
 #[test]

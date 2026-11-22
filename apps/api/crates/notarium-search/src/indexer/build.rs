@@ -5,10 +5,11 @@ use crate::{
     engine::{Clock, Services},
     layout::{FolderDictionary, SearchLayout, SearchManifest, VectorModel, index_name},
     lexical::{LexicalIndex, ReaderCache, SeedLease, TOKENIZER_VERSION, Update, WriterPool},
-    model::{Embedder, IndexNote, NoteIndexOutcome},
+    model::{Embedder, IndexNote, NoteIndexOutcome, NotePreparation, PreparedIndexNote},
     ports::{ResolvedEmbeddingTarget, SearchIndexedNote},
     vector::{
-        MmapSegment, SegmentBuilder, VectorChunk, VectorEpoch, VectorError, segment_file_path,
+        MmapSegment, QuantizedVector, SegmentBuilder, VectorChunk, VectorEpoch, VectorError,
+        segment_file_path,
     },
 };
 use notarium_canonical::chats::search::HydratedChatHit;
@@ -16,7 +17,7 @@ use notarium_core::{
     classes::{ClassEgressFence, DocClass, SearchContent},
     epoch::{DataRoot, SearchIndexKind},
     error::{CommitEffect, PortError},
-    ids::{ChatThreadId, FolderId, NoteId, ThreadEntrySeq},
+    ids::{ChatThreadId, ContentDigest, FolderId, NoteId, ThreadEntrySeq},
     model::Lifecycle,
     ports::{Cancellation, PageLimit},
     receipt::ChangeCursor,
@@ -284,6 +285,8 @@ async fn cleanup_staging_epoch(layout: Arc<SearchLayout>, model: VectorModel) {
 }
 
 struct SeededEpoch {
+    #[cfg(test)]
+    peak_pending_rows: usize,
     epoch: VectorEpoch,
     failed_notes: BTreeSet<NoteId>,
     missing_folders: BTreeSet<FolderId>,
@@ -301,12 +304,9 @@ async fn seed_vectors(
     have_epoch: bool,
     cancel: &Cancellation,
 ) -> Result<SeededEpoch, ModelError> {
-    let mut builder = SegmentBuilder::for_model(model)?;
-    let mut sealed: Vec<(u64, MmapSegment)> = Vec::new();
-    let mut next_seg_id = 1u64;
+    let mut staged = SeedSegments::new(model.clone(), epoch_path.to_path_buf())?;
     let mut failed_notes = BTreeSet::new();
     let mut missing_folders = BTreeSet::new();
-    let mut embedded_any = false;
     let mut after = None;
 
     loop {
@@ -314,8 +314,6 @@ async fn seed_vectors(
             return Err(ModelError::Embedding(EmbeddingError::Cancelled));
         }
         let page = note_page_raw(services, cancel, cutoff, after).await?;
-        let mut page_groups: Vec<Vec<VectorChunk>> = Vec::with_capacity(page.notes.len());
-        let mut page_keys = HashMap::<_, (usize, usize)>::new();
         for note in page.notes {
             if cancel.is_cancelled() {
                 return Err(ModelError::Embedding(EmbeddingError::Cancelled));
@@ -332,82 +330,31 @@ async fn seed_vectors(
                 failed_notes.insert(note.note_id);
                 continue;
             };
-            let indexed = embedder
-                .index_note(IndexNote {
+            let prepared = embedder
+                .prepare_note(IndexNote {
                     services,
                     scope: &cutoff.scope,
                     note: &note,
                     folder: folder.get(),
                     budget: new_budget(cancel),
                     priority: Priority::BulkImportBackfill,
-                    existing: &|key| {
-                        page_keys
-                            .get(&key)
-                            .map(|&(group, slot)| page_groups[group][slot].vector.clone())
-                            .or_else(|| builder.find_vector(key))
-                            .or_else(|| {
-                                sealed
-                                    .iter()
-                                    .rev()
-                                    .find_map(|(_, seg)| seg.find_vector(key))
-                            })
-                    },
                 })
                 .await?;
-            match indexed.outcome {
-                NoteIndexOutcome::Complete => {
-                    if !indexed.chunks.is_empty() {
-                        embedded_any = true;
-                    }
+            let outcome = match prepared {
+                NotePreparation::Ready(prepared) => {
+                    let (next, outcome) = staged.index(*prepared, cancel).await?;
+                    staged = next;
+                    outcome
                 }
+                NotePreparation::Finished(outcome) => outcome,
+            };
+            match outcome {
+                NoteIndexOutcome::Complete | NoteIndexOutcome::Denied => {}
                 NoteIndexOutcome::Pending => {
-                    failed_notes.insert(note.note_id.clone());
-                    if !indexed.chunks.is_empty() {
-                        embedded_any = true;
-                    }
+                    failed_notes.insert(note.note_id);
                 }
-                NoteIndexOutcome::Fatal(error) => {
-                    return Err(ModelError::Embedding(error));
-                }
+                NoteIndexOutcome::Fatal(error) => return Err(ModelError::Embedding(error)),
             }
-            if !indexed.chunks.is_empty() {
-                let group_idx = page_groups.len();
-                for (slot, chunk) in indexed.chunks.iter().enumerate() {
-                    page_keys
-                        .entry(chunk.metadata.key)
-                        .or_insert((group_idx, slot));
-                }
-                page_groups.push(indexed.chunks);
-            }
-        }
-        if !page_groups.is_empty() {
-            let model_owned = model.clone();
-            let path_owned = epoch_path.to_path_buf();
-            let cancel_owned = cancel.clone();
-            let (next_builder, newly_sealed, updated_id) =
-                tokio::task::spawn_blocking(move || -> Result<_, VectorError> {
-                    let mut newly_sealed = Vec::new();
-                    let mut seg_id = next_seg_id;
-                    for chunk in page_groups.into_iter().flatten() {
-                        if builder.at_budget() {
-                            let seg_path = segment_file_path(&path_owned, seg_id);
-                            if let Some(segment) =
-                                builder.finish_cancellable(&seg_path, &cancel_owned)?
-                            {
-                                newly_sealed.push((seg_id, segment));
-                                seg_id = seg_id.checked_add(1).ok_or(VectorError::BufferFull)?;
-                            }
-                            builder = SegmentBuilder::for_model(&model_owned)?;
-                        }
-                        builder.push_cancellable(chunk, &cancel_owned)?;
-                    }
-                    Ok((builder, newly_sealed, seg_id))
-                })
-                .await
-                .map_err(|_| ModelError::Index(IndexError::Inconsistent))??;
-            builder = next_builder;
-            sealed.extend(newly_sealed);
-            next_seg_id = updated_id;
         }
         after = page.next_after;
         if after.is_none() {
@@ -417,34 +364,163 @@ async fn seed_vectors(
 
     // Do not swap away from a healthy active epoch when every embeddable note
     // failed transiently during the replacement backfill.
-    if have_epoch && !embedded_any && !failed_notes.is_empty() {
+    if have_epoch && staged.is_empty() && !failed_notes.is_empty() {
         return Err(ModelError::Embedding(EmbeddingError::ModelUnavailable));
     }
 
+    #[cfg(test)]
+    let peak_pending_rows = staged.peak_pending_rows;
     let layout_owned = layout.clone();
-    let model_owned = model.clone();
-    let path_owned = epoch_path.to_path_buf();
     let cancel_owned = cancel.clone();
     let seq = cutoff.after;
     let epoch = tokio::task::spawn_blocking(move || -> Result<VectorEpoch, VectorError> {
-        if !builder.is_empty() {
-            let seg_path = segment_file_path(&path_owned, next_seg_id);
-            if let Some(segment) = builder.finish_cancellable(&seg_path, &cancel_owned)? {
-                sealed.push((next_seg_id, segment));
-            }
-        }
-        let mut epoch = VectorEpoch::open_model(layout_owned, model_owned)?;
-        epoch.seed_segments(sealed, seq)?;
+        staged.build_pending(&cancel_owned)?;
+        staged.seal(&cancel_owned)?;
+        let mut epoch = VectorEpoch::open_model(layout_owned, staged.model)?;
+        epoch.seed_segments(staged.sealed, seq)?;
         Ok(epoch)
     })
     .await
     .map_err(|_| ModelError::Index(IndexError::Inconsistent))??;
 
     Ok(SeededEpoch {
+        #[cfg(test)]
+        peak_pending_rows,
         epoch,
         failed_notes,
         missing_folders,
     })
+}
+
+// At the largest supported dimension this holds at most 1 MiB of pending
+// quantized payload, shared across note and canonical-page boundaries.
+const SEED_VECTOR_ROWS: usize = 256;
+
+struct SeedSegments {
+    #[cfg(test)]
+    peak_pending_rows: usize,
+    model: VectorModel,
+    path: std::path::PathBuf,
+    builder: SegmentBuilder,
+    sealed: Vec<(u64, MmapSegment)>,
+    pending: Vec<VectorChunk>,
+    pending_keys: HashMap<ContentDigest, usize>,
+}
+
+impl SeedSegments {
+    fn new(model: VectorModel, path: std::path::PathBuf) -> Result<Self, VectorError> {
+        Ok(Self {
+            #[cfg(test)]
+            peak_pending_rows: 0,
+            builder: SegmentBuilder::for_model(&model)?,
+            model,
+            path,
+            sealed: Vec::new(),
+            pending: Vec::with_capacity(SEED_VECTOR_ROWS),
+            pending_keys: HashMap::new(),
+        })
+    }
+
+    fn is_empty(&self) -> bool {
+        self.pending.is_empty() && self.builder.is_empty() && self.sealed.is_empty()
+    }
+
+    fn find_vector(&self, key: ContentDigest) -> Option<QuantizedVector> {
+        self.pending_keys
+            .get(&key)
+            .map(|&index| self.pending[index].vector.clone())
+            .or_else(|| self.builder.find_vector(key))
+            .or_else(|| {
+                self.sealed
+                    .iter()
+                    .rev()
+                    .find_map(|(_, segment)| segment.find_vector(key))
+            })
+    }
+
+    async fn index(
+        mut self,
+        mut note: PreparedIndexNote<'_>,
+        cancel: &Cancellation,
+    ) -> Result<(Self, NoteIndexOutcome), ModelError> {
+        let mut has_note_rows = false;
+        let mut pending = false;
+        while note.has_more() {
+            if cancel.is_cancelled() {
+                return Err(EmbeddingError::Cancelled.into());
+            }
+            let room = SEED_VECTOR_ROWS - self.pending.len();
+            let window = note.index_next(room, &|key| self.find_vector(key)).await;
+            #[cfg(test)]
+            {
+                self.peak_pending_rows = self
+                    .peak_pending_rows
+                    .max(self.pending.len() + window.chunks.len());
+            }
+            match window.outcome {
+                NoteIndexOutcome::Denied if has_note_rows => {
+                    // A scheduled grant check revoked a note that already has
+                    // staged rows. Discard this unpublished epoch and retry cleanly.
+                    return Err(EmbeddingError::IndexingDenied.into());
+                }
+                NoteIndexOutcome::Denied => return Ok((self, NoteIndexOutcome::Denied)),
+                NoteIndexOutcome::Fatal(error) => return Err(error.into()),
+                NoteIndexOutcome::Pending => pending = true,
+                NoteIndexOutcome::Complete => {}
+            }
+            has_note_rows |= !window.chunks.is_empty();
+            for chunk in window.chunks {
+                self.pending_keys
+                    .entry(chunk.metadata.key)
+                    .or_insert(self.pending.len());
+                self.pending.push(chunk);
+            }
+            if self.pending.len() == SEED_VECTOR_ROWS {
+                let stop = cancel.clone();
+                self = tokio::task::spawn_blocking(move || {
+                    self.build_pending(&stop)?;
+                    Ok::<_, VectorError>(self)
+                })
+                .await
+                .map_err(|_| IndexError::Inconsistent)??;
+            }
+        }
+        Ok((
+            self,
+            if pending {
+                NoteIndexOutcome::Pending
+            } else {
+                NoteIndexOutcome::Complete
+            },
+        ))
+    }
+
+    fn build_pending(&mut self, stop: &Cancellation) -> Result<(), VectorError> {
+        self.pending_keys.clear();
+        let mut pending = std::mem::take(&mut self.pending);
+        for chunk in pending.drain(..) {
+            if self.builder.at_budget() {
+                self.seal(stop)?;
+            }
+            self.builder.push_cancellable(chunk, stop)?;
+        }
+        self.pending = pending;
+        Ok(())
+    }
+
+    fn seal(&mut self, stop: &Cancellation) -> Result<(), VectorError> {
+        let id = u64::try_from(self.sealed.len())
+            .ok()
+            .and_then(|count| count.checked_add(1))
+            .ok_or(VectorError::BufferFull)?;
+        let builder = std::mem::replace(&mut self.builder, SegmentBuilder::for_model(&self.model)?);
+        if let Some(segment) =
+            builder.finish_cancellable(&segment_file_path(&self.path, id), stop)?
+        {
+            self.sealed.push((id, segment));
+        }
+        Ok(())
+    }
 }
 
 pub(super) async fn publish_seed(
@@ -719,4 +795,127 @@ pub(super) fn remove_generation_parts(
     }
     layout.remove_index_generation(generation)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        SearchDependencies, SearchEngine, config::SearchConfig, indexer::tests::UnusedStructural,
+    };
+    use notarium_canonical::{
+        CanonicalConfig, CanonicalRuntime, CreateSpaceSpec, changes::SyntheticNoteSpec,
+    };
+    use notarium_core::{
+        auth::SpaceKind,
+        ids::{HistoryIncarnation, InstallationId, LeaseEpoch, PrincipalId, SpaceId, SpaceSeq},
+    };
+
+    #[tokio::test]
+    async fn cold_seed_bounds_vector_rows_across_notes_and_keeps_every_repeated_chunk() {
+        let mut entropy = [0u8; 16];
+        getrandom::fill(&mut entropy).unwrap();
+        let path =
+            std::env::temp_dir().join(format!("search-seed-window-{}", hex::encode(entropy)));
+        std::fs::create_dir(&path).unwrap();
+        let root = DataRoot::new(&path);
+        let (store, runtime) = CanonicalRuntime::open(CanonicalConfig::local_default(
+            InstallationId::from_bytes([3; 16]),
+            root.clone(),
+        ))
+        .await
+        .unwrap();
+        let owner = PrincipalId::from_bytes([4; 16]);
+        let folder = FolderId::from_bytes([5; 16]);
+        let lease = LeaseEpoch::new(1).unwrap();
+        let space = store
+            .create_space(CreateSpaceSpec {
+                space_id: SpaceId::from_bytes([6; 16]),
+                incarnation: HistoryIncarnation::from_bytes([6; 16]),
+                root_folder_id: folder.clone(),
+                slug: "seed-window".into(),
+                kind: SpaceKind::Personal,
+                owner: owner.clone(),
+                active_epoch: lease,
+                initial_last_seq: SpaceSeq::ZERO,
+                created_at: None,
+            })
+            .await
+            .unwrap();
+        let rows_per_note = SEED_VECTOR_ROWS + 7;
+        let notes = (1..=2)
+            .map(|id| SyntheticNoteSpec {
+                note_id: NoteId::from_bytes([id; 16]),
+                parent_folder: Some(folder.clone()),
+                slug: format!("note-{id}"),
+                title: format!("Note {id}"),
+                doc_class: DocClass::UserDoc,
+                lifecycle: Lifecycle::Active,
+                carrier: "# Section\n\nSame body.\n\n".repeat(rows_per_note),
+                fields: Default::default(),
+            })
+            .collect();
+        let (range, _) = store
+            .commit_synthetic_note_batch_for_test(&space.scope, lease, &owner, notes)
+            .await
+            .unwrap();
+        let cutoff = ChangeCursor {
+            scope: space.scope.clone(),
+            after: range.last_seq,
+        };
+        let engine = SearchEngine::start(
+            SearchConfig::new(
+                root.clone(),
+                VectorMode::DeterministicTest { dimension: 64 },
+            ),
+            SearchDependencies::new(Arc::new(store), Arc::new(UnusedStructural)),
+        );
+        let cancel = Cancellation::default();
+        let target = engine
+            .services
+            .model_target(&space.scope, None, &new_budget(&cancel))
+            .await
+            .unwrap()
+            .unwrap();
+        let model = target.vector_model();
+        let embedder = engine.services.embedder(target).await.unwrap();
+        let layout = Arc::new(SearchLayout::open(&root, space.scope).unwrap());
+        let epoch_path = layout.model_epoch(&model).unwrap();
+        let mut folders = FolderDictionary::default();
+        folders.insert(folder).unwrap();
+        let seeded = seed_vectors(
+            &engine.services,
+            &layout,
+            &epoch_path,
+            &cutoff,
+            &folders,
+            &embedder,
+            &model,
+            false,
+            &cancel,
+        )
+        .await
+        .unwrap();
+        assert!(seeded.failed_notes.is_empty());
+        assert_eq!(seeded.peak_pending_rows, SEED_VECTOR_ROWS);
+        let manifest = layout.epoch_manifest(&model).unwrap().unwrap();
+        let mut counts = HashMap::<NoteId, usize>::new();
+        let mut keys = BTreeSet::new();
+        for id in manifest.active_segments {
+            let segment =
+                MmapSegment::open(&segment_file_path(&epoch_path, id), &model.hash()).unwrap();
+            for slot in 0..segment.len() {
+                let metadata = segment.metadata(slot).unwrap();
+                *counts.entry(metadata.note).or_default() += 1;
+                keys.insert(metadata.key);
+            }
+        }
+        assert_eq!(counts.len(), 2);
+        assert!(counts.values().all(|&count| count == rows_per_note));
+        assert_eq!(keys.len(), 1);
+        drop(seeded);
+        engine.shutdown().await;
+        runtime.shutdown().await.unwrap();
+        std::fs::remove_dir_all(path).unwrap();
+    }
 }

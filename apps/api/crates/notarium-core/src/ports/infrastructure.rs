@@ -68,7 +68,8 @@ pub trait StructuralReadPort: Send + Sync {
         ctx: &'a SpaceContext,
         note: &'a NoteId,
     ) -> PortFuture<'a, bool>;
-    /// Batch check against the current canonical fence preserving request order.
+    /// Return current visibility in request order. The default reads keys separately.
+    /// Final delivery must verify that the canonical head stayed stable across the batch.
     fn filter_live_visible<'a>(
         &'a self,
         ctx: &'a SpaceContext,

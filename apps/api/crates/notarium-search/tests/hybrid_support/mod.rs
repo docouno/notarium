@@ -108,6 +108,7 @@ pub struct View {
     edges: BTreeMap<u32, Vec<u32>>,
     fields: BTreeMap<NoteId, BTreeMap<String, FieldObservation<FieldValue>>>,
     pub blocked_lookup: Option<(NoteId, Arc<AtomicBool>)>,
+    pub blocked_project: Option<Arc<AtomicBool>>,
 }
 
 impl View {
@@ -125,6 +126,7 @@ impl View {
             edges: BTreeMap::new(),
             fields: BTreeMap::new(),
             blocked_lookup: None,
+            blocked_project: None,
         }
     }
 
@@ -232,6 +234,10 @@ impl StructuralSnapshot for View {
 
     fn enclosing_project<'a>(&'a self, folder: &'a FolderId) -> PortFuture<'a, Option<FolderId>> {
         Box::pin(async move {
+            if let Some(observed) = &self.blocked_project {
+                observed.store(true, Ordering::SeqCst);
+                std::future::pending::<()>().await;
+            }
             Ok(std::iter::successors(Some(folder), |id| {
                 self.parents.get(*id).and_then(Option::as_ref)
             })
@@ -586,8 +592,9 @@ impl SearchCarrierReadPort for ControlledCarriers {
         Box::pin(self.canonical.visible_chat_hit_keys(ctx, candidates))
     }
 
-    fn hydrate_live_visible_chat_hits<'a>(
+    fn prepare_search_chat_hits<'a>(
         &'a self,
+        authority: &'a ServiceAuthority,
         ctx: &'a SpaceContext,
         candidates: &'a [(ChatThreadId, ThreadEntrySeq)],
         limit: PageLimit,
@@ -599,7 +606,7 @@ impl SearchCarrierReadPort for ControlledCarriers {
             }
             let hits = self
                 .canonical
-                .hydrate_live_visible_chat_hits(ctx, candidates, limit)
+                .prepare_search_chat_hits(authority, ctx, candidates, limit)
                 .await?;
             if self.hold_hydrated_chat.swap(false, Ordering::SeqCst) {
                 self.chat_held.notify_one();

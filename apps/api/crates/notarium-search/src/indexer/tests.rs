@@ -31,7 +31,7 @@ fn transient_open_failures_preserve_the_checkpoint() {
     assert!(IndexError::from(VectorError::CorruptIndex).invalid_checkpoint());
 }
 
-struct UnusedStructural;
+pub(super) struct UnusedStructural;
 impl StructuralReadPort for UnusedStructural {
     fn acquire_snapshot(
         &self,
@@ -748,8 +748,14 @@ fn reopening_vectors_stays_true_during_reopen_after_live_edit_clears_vector_seq(
     assert!(!handle.published.load_full().unwrap().reopening_vectors);
 
     disk.manifest.vector_seq = Some(seq);
+    let retry_at = now + Duration::from_secs(5);
+    assert!(next_vector_open(&disk, now, retry_at, now, EMBEDDER_IDLE).is_none());
     publisher.publish_with(&disk, &lexical, false);
-    assert!(handle.published.load_full().unwrap().reopening_vectors);
+    assert!(!handle.published.load_full().unwrap().reopening_vectors);
+    assert!(matches!(
+        next_vector_open(&disk, retry_at, retry_at, now, EMBEDDER_IDLE),
+        Some(BgKind::ReopenVectors)
+    ));
 
     publisher.replace(None);
     drop(handle);
@@ -2160,11 +2166,17 @@ async fn search_after_embedder_idle_reloads_embedder_without_model_unavailable()
             worker_idle: Duration::from_secs(300),
             archived_idle: Duration::from_secs(30),
         };
-        let engine = SearchEngine::start_with_schedule(
-            SearchConfig::new(root, VectorMode::DeterministicTest { dimension: 64 }),
-            SearchDependencies::new(store, structural),
-            schedule,
-        );
+        let start = || {
+            SearchEngine::start_with_schedule(
+                SearchConfig::new(
+                    root.clone(),
+                    VectorMode::DeterministicTest { dimension: 64 },
+                ),
+                SearchDependencies::new(store.clone(), structural.clone()),
+                schedule,
+            )
+        };
+        let engine = start();
         let handle = engine.space(space.scope.clone()).unwrap();
         let mut epochs = handle.epoch.subscribe();
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -2239,7 +2251,7 @@ async fn search_after_embedder_idle_reloads_embedder_without_model_unavailable()
             top_k: PageLimit::new(10).unwrap(),
             model: None,
         };
-        let result = engine.search(ctx, query).await.unwrap();
+        let result = engine.search(ctx.clone(), query.clone()).await.unwrap();
         assert!(
             result.degraded.is_none(),
             "first search after idle ({label}) must reload embedder, got {:?}",
@@ -2249,6 +2261,68 @@ async fn search_after_embedder_idle_reloads_embedder_without_model_unavailable()
         assert_eq!(result.hits[0].card.title, "Idle reload note");
 
         engine.shutdown().await;
+        #[cfg(unix)]
+        if lexical_idle == Duration::from_secs(5) {
+            use std::os::unix::fs::PermissionsExt;
+            let layout = SearchLayout::open(&root, space.scope.clone()).unwrap();
+            let manifest = layout.search_manifest().unwrap().unwrap();
+            let model = manifest.active_model.as_ref().unwrap().vector_model();
+            let checkpoint = layout
+                .model_epoch(&model)
+                .unwrap()
+                .join("epoch_manifest.json");
+            let bytes = std::fs::read(&checkpoint).unwrap();
+            let permissions = std::fs::metadata(&checkpoint).unwrap().permissions();
+            std::fs::set_permissions(&checkpoint, std::fs::Permissions::from_mode(0o000)).unwrap();
+            if std::fs::read(&checkpoint)
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied)
+            {
+                let engine = start();
+                let pinned = engine.pin_space(space.scope.clone()).unwrap();
+                let handle = &pinned.handle;
+                let mut changed = handle.epoch.subscribe();
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    changed.wait_for(|_| {
+                        handle
+                            .published
+                            .load()
+                            .as_ref()
+                            .is_some_and(|state| state.embedder_unavailable)
+                    }),
+                )
+                .await
+                .expect("the failed vector reopen must publish lexical availability")
+                .unwrap();
+                let result = engine.search(ctx.clone(), query.clone()).await.unwrap();
+                assert!(matches!(
+                    result.degraded,
+                    Some(notarium_core::ports::SearchDegradation::ModelUnavailable)
+                ));
+                assert_eq!(result.hits[0].card.title, "Idle reload note");
+                assert_eq!(
+                    layout.search_manifest().unwrap().unwrap().vector_seq,
+                    manifest.vector_seq
+                );
+                std::fs::set_permissions(&checkpoint, permissions.clone()).unwrap();
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    changed.wait_for(|_| {
+                        handle.published.load().as_ref().is_some_and(|state| {
+                            state.embedder.is_some() && state.vectors.is_some()
+                        })
+                    }),
+                )
+                .await
+                .expect("the worker must retry the retained checkpoint")
+                .unwrap();
+                assert!(engine.search(ctx, query).await.unwrap().degraded.is_none());
+                assert_eq!(std::fs::read(&checkpoint).unwrap(), bytes);
+                drop(pinned);
+                engine.shutdown().await;
+            }
+            std::fs::set_permissions(&checkpoint, permissions).unwrap();
+        }
         runtime.shutdown().await.unwrap();
         std::fs::remove_dir_all(path).unwrap();
     }

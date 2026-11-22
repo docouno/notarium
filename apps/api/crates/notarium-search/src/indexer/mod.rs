@@ -492,8 +492,7 @@ impl Publisher<'_> {
             active_model: disk.manifest.active_model.clone(),
             embedder: disk.embedder.clone(),
             embeddings_pending: disk.manifest.embeddings_pending,
-            reopening_vectors: reopening
-                || (disk.manifest.vector_seq.is_some() && disk.epoch.is_none()),
+            reopening_vectors: reopening,
             embedder_unavailable: disk.embedder_unavailable,
         }
     }
@@ -1249,30 +1248,32 @@ fn next_maintenance_wake(
     let model_wake_at = (retry_model
         || (disk.manifest.embeddings_pending && disk.manifest.vector_seq.is_none()))
     .then_some(model_retry_at);
-    match (repair_wake_at, model_wake_at) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (Some(a), None) | (None, Some(a)) => Some(a),
-        (None, None) => None,
-    }
+    let reopen_at =
+        (disk.epoch.is_none() && disk.manifest.vector_seq.is_some()).then_some(embedder_retry_at);
+    [repair_wake_at, model_wake_at, reopen_at]
+        .into_iter()
+        .flatten()
+        .min()
 }
 
-fn will_load_embedder(
+fn next_vector_open(
     disk: &Disk,
-    bg: &Option<BgTask>,
     now: Instant,
     embedder_retry_at: Instant,
     repair_at: Instant,
     embedder_idle: Duration,
-) -> bool {
-    if bg.is_some() || disk.lexical_idle_retired || disk.epoch.is_none() || disk.embedder.is_some()
-    {
-        return false;
+) -> Option<BgKind> {
+    if disk.lexical_idle_retired || now < embedder_retry_at {
+        return None;
     }
-    if now < embedder_retry_at || disk.manifest.active_model.is_none() {
-        return false;
+    if disk.epoch.is_none() {
+        return disk.manifest.vector_seq.map(|_| BgKind::ReopenVectors);
     }
-    (disk.has_pending_embeddings() && now >= repair_at)
-        || now.saturating_duration_since(disk.embedder_last_use) < embedder_idle
+    (disk.embedder.is_none()
+        && disk.manifest.active_model.is_some()
+        && ((disk.has_pending_embeddings() && now >= repair_at)
+            || now.saturating_duration_since(disk.embedder_last_use) < embedder_idle))
+        .then_some(BgKind::LoadEmbedder)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1318,21 +1319,7 @@ async fn advance_to(
     if !force_seed && let Some(current) = disk.as_mut() {
         let mut worker_pin = Some(cx.handle.pin_worker());
         let resumed = match current.resume_reader(cx).await {
-            Ok((lexical, reopened)) => {
-                if reopened {
-                    let reopening = bg.as_ref().is_some_and(BgTask::is_reopening)
-                        || will_load_embedder(
-                            current,
-                            bg,
-                            Instant::now(),
-                            embedder_retry_at,
-                            *repair_at,
-                            embedder_idle,
-                        );
-                    publisher.publish_with(current, &lexical, reopening);
-                }
-                Some(lexical)
-            }
+            Ok(reader) => Some(reader),
             Err(IndexError::Lexical(LexicalError::ReaderUnavailable))
                 if current.manifest.tantivy_seq < target.after
                     && cx.cut_needs_scrub(&current.cursor(), true).await? =>
@@ -1348,18 +1335,25 @@ async fn advance_to(
             }
             Err(error) => return Err(error),
         };
-        if let Some(lexical) = resumed
+        if let Some((lexical, reopened)) = resumed
             && let Some(current) = disk.as_mut()
         {
-            let reopening = bg.as_ref().is_some_and(BgTask::is_reopening)
-                || will_load_embedder(
-                    current,
-                    bg,
-                    Instant::now(),
-                    embedder_retry_at,
-                    *repair_at,
-                    embedder_idle,
-                );
+            let reopening = bg.as_ref().map_or_else(
+                || {
+                    next_vector_open(
+                        current,
+                        Instant::now(),
+                        embedder_retry_at,
+                        *repair_at,
+                        embedder_idle,
+                    )
+                    .is_some()
+                },
+                BgTask::is_reopening,
+            );
+            if reopened {
+                publisher.publish_with(current, &lexical, reopening);
+            }
             let dirty = bg.as_mut().map(|task| &mut task.dirty);
             let catch_up_result = if current.manifest.tantivy_seq < target.after {
                 catch_up(
@@ -1457,8 +1451,9 @@ fn spawn_bg_if_ready(
         return Ok(false);
     }
     let now = Instant::now();
+    let next_open = next_vector_open(disk, now, embedder_retry_at, repair_at, embedder_idle);
     // 1. Reopen checkpointed VectorEpoch off-thread (never blocked by replacement backoff).
-    if disk.epoch.is_none() && disk.manifest.vector_seq.is_some() && now >= embedder_retry_at {
+    if next_open == Some(BgKind::ReopenVectors) {
         let cancel = Cancellation::default();
         let layout = disk.layout.clone();
         let manifest = disk.manifest.clone();
@@ -1479,7 +1474,7 @@ fn spawn_bg_if_ready(
     }
     // 2. Load active embedder only when embeddings are due or a recent query/wake
     // requested it, avoiding an unload/reload loop on EMBEDDER_IDLE.
-    if will_load_embedder(disk, bg, now, embedder_retry_at, repair_at, embedder_idle)
+    if next_open == Some(BgKind::LoadEmbedder)
         && let Some(active) = disk.manifest.active_model.clone()
     {
         let cancel = Cancellation::default();
@@ -1686,6 +1681,7 @@ async fn handle_bg_done(
                 }
                 Err(error) => {
                     tracing::warn!(kind = %error, "search vector checkpoint could not be opened");
+                    current.embedder_unavailable = current.manifest.vector_seq.is_some();
                     *embedder_retry_at = Instant::now() + Duration::from_secs(5);
                 }
             }

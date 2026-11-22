@@ -1013,14 +1013,14 @@ fn broad_field_and_class_intersection_uses_exact_scan_for_a_single_matching_slot
         .iter()
         .map(|chunk| (chunk.metadata.note.clone(), DocClass::UserDoc))
         .collect();
-    docs.extend((count..2 * count).map(|index| {
+    docs.extend((count..2 * count - 1).map(|index| {
         (
             NoteId::from_bytes(u128::from(index).to_be_bytes()),
             DocClass::AgentMemory,
         )
     }));
     let structural = Snapshot::with_classes(docs);
-    let nodes = Bitmap::from_range(count - 1..2 * count);
+    let nodes = Bitmap::from_range(count - 1..2 * count - 1);
     epoch
         .seed(
             SegmentBuilder::with_test_rows(&model(), 64, rows),
@@ -1042,7 +1042,6 @@ fn broad_field_and_class_intersection_uses_exact_scan_for_a_single_matching_slot
                 classes: &classes,
                 folders: None,
                 nodes: Some(&nodes),
-                field_filtered: true,
                 excluded: &BTreeSet::new(),
             },
             100,
@@ -1052,6 +1051,85 @@ fn broad_field_and_class_intersection_uses_exact_scan_for_a_single_matching_slot
     assert_eq!(result.hnsw_hops, 0);
     assert_eq!(result.hits.len(), 1);
     assert_eq!(result.hits[0].metadata, selected.metadata);
+}
+
+#[test]
+fn folder_crossover_counts_current_visible_slots_for_each_note() {
+    use crate::lexical::tests::Snapshot;
+    let scratch = Scratch::new();
+    let scope = HistoryScope {
+        space_id: SpaceId::from_bytes([1; 16]),
+        incarnation: HistoryIncarnation::from_bytes([2; 16]),
+    };
+    let layout = Arc::new(SearchLayout::open(&DataRoot::new(&scratch.0), scope).unwrap());
+    let mut epoch = VectorEpoch::open(layout, model(), 64).unwrap();
+    let hidden = fixture(0, 64);
+    let first = fixture(3, 64);
+    let mut second = fixture(6, 64);
+    second.metadata.note = first.metadata.note.clone();
+    let rows = std::iter::repeat_n(hidden.clone(), EXACT_SCAN_LIMIT as usize + 1)
+        .chain([first.clone(), second.clone()])
+        .collect();
+    epoch
+        .seed(
+            SegmentBuilder::with_test_rows(&model(), 64, rows),
+            SpaceSeq::new(1).unwrap(),
+        )
+        .unwrap();
+    let docs = [
+        hidden.metadata.note.clone(),
+        first.metadata.note.clone(),
+        fixture(7, 64).metadata.note,
+        fixture(8, 64).metadata.note,
+    ];
+    let structural = Snapshot::with_classes(docs.into_iter().map(|note| (note, DocClass::UserDoc)));
+    let snapshot = epoch.snapshot();
+    let classes = BTreeSet::from([DocClass::UserDoc]);
+    let folders = Bitmap::of(&[1]);
+    let excluded = BTreeSet::new();
+    let cancellation = Cancellation::default();
+    let search = |nodes: &Bitmap| {
+        snapshot
+            .search_projected(
+                &first.vector,
+                ProjectedVectorFilter {
+                    snapshot: &structural,
+                    classes: &classes,
+                    folders: Some(&folders),
+                    nodes: Some(nodes),
+                    excluded: &excluded,
+                },
+                100,
+                SearchBudget {
+                    cancellation: &cancellation,
+                    deadline: Instant::now() + Duration::from_secs(5),
+                },
+            )
+            .unwrap()
+    };
+    // With more dense members than segment notes, the planner reads physical
+    // slots instead. Both directions must retain both visible chunks.
+    for nodes in [Bitmap::of(&[1]), Bitmap::of(&[1, 2, 3])] {
+        let result = search(&nodes);
+        assert_eq!(result.hnsw_hops, 0);
+        assert_eq!(
+            result
+                .hits
+                .iter()
+                .map(|hit| hit.metadata.key)
+                .collect::<Vec<_>>(),
+            vec![first.metadata.key, second.metadata.key]
+        );
+    }
+    // A single visible note can itself own more than the exact slot budget.
+    let broad = search(&Bitmap::of(&[0]));
+    assert!(broad.hnsw_hops > 0);
+    assert!(
+        broad
+            .hits
+            .iter()
+            .all(|hit| hit.metadata.note == hidden.metadata.note)
+    );
 }
 
 #[test]

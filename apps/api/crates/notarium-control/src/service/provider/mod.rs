@@ -12,6 +12,7 @@ mod records;
 mod recovery;
 mod selection;
 pub use selection::ResolvedSearchEmbeddingModel;
+pub(super) use selection::SearchDefaultWitness;
 mod wire;
 
 use super::{

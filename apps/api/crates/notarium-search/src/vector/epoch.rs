@@ -89,16 +89,121 @@ pub struct VectorFilter<'a> {
     pub excluded: Option<&'a BTreeSet<NoteId>>,
 }
 
-/// Structural admission for one aligned search cut. Folder postings in the
-/// segment already cover folder-only queries. The dense posting also includes
-/// live structural visibility and any additional field predicate.
+/// Structural admission for one aligned search cut. The dense posting covers
+/// current subtree membership and any additional field predicate.
 pub struct ProjectedVectorFilter<'a> {
     pub snapshot: &'a dyn StructuralSnapshot,
     pub classes: &'a BTreeSet<DocClass>,
     pub folders: Option<&'a Bitmap>,
     pub nodes: Option<&'a Bitmap>,
-    pub field_filtered: bool,
     pub excluded: &'a BTreeSet<NoteId>,
+}
+
+impl ProjectedVectorFilter<'_> {
+    fn visible(&self, note: &NoteId) -> Result<bool, VectorError> {
+        let node = match self.snapshot.lookup(note) {
+            Ok(Some(node)) => node,
+            Ok(None) | Err(DomainError::ResourceNotFound) => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        let index = node.index(self.snapshot.cut().generation)?;
+        if self.nodes.is_some_and(|nodes| !nodes.contains(index)) {
+            return Ok(false);
+        }
+        match self.snapshot.doc_class(node) {
+            Ok(class) => Ok(self.classes.contains(&class)),
+            Err(DomainError::ResourceNotFound) => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// A broad physical posting only needs a materialized intersection if its
+    /// effective scope fits the exact scan. Stop on the first slot beyond the
+    /// crossover; graph traversal still verifies every candidate's visibility.
+    fn selective_slots(
+        &self,
+        data: &MmapSegment,
+        posting: &SlotMask<'_>,
+        budget: SearchBudget<'_>,
+    ) -> Result<Option<Bitmap>, VectorError> {
+        let Some(nodes) = self.nodes else {
+            return Ok(None);
+        };
+        if posting.cardinality() <= EXACT_SCAN_LIMIT {
+            return Ok(None);
+        }
+        let mut selected = Bitmap::new();
+        if nodes.cardinality() <= u64::from(data.num_notes()).min(posting.cardinality()) {
+            // Sparse structural side: map its notes to every admitted slot.
+            let generation = self.snapshot.cut().generation;
+            let mut visited_slots = 0_usize;
+            for (position, index) in nodes.iter().enumerate() {
+                if position.is_multiple_of(64) {
+                    budget.check()?;
+                }
+                let node = DenseNodeId::new(generation, index);
+                match self.snapshot.doc_class(node) {
+                    Ok(class) if self.classes.contains(&class) => {}
+                    Ok(_) | Err(DomainError::ResourceNotFound) => continue,
+                    Err(error) => return Err(error.into()),
+                }
+                let note = match self.snapshot.note_id(node) {
+                    Ok(note) => note,
+                    Err(DomainError::ResourceNotFound) => continue,
+                    Err(error) => return Err(error.into()),
+                };
+                if let Some(slots) = data.note_slots(&note) {
+                    for slot in slots {
+                        if visited_slots.is_multiple_of(256) {
+                            budget.check()?;
+                        }
+                        visited_slots += 1;
+                        if posting.contains(slot) {
+                            selected.add(slot);
+                            if selected.cardinality() > EXACT_SCAN_LIMIT {
+                                return Ok(None);
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            // Sparse physical side: read only posted slots, sharing one
+            // projection check for consecutive chunks of the same note.
+            let mut previous = None;
+            for (position, slot) in posting.iter().enumerate() {
+                if position.is_multiple_of(256) {
+                    budget.check()?;
+                }
+                let ord = data
+                    .note_ord_for_slot(slot)
+                    .ok_or(VectorError::CorruptIndex)?;
+                let admitted = match previous {
+                    Some((last, admitted)) if last == ord => admitted,
+                    _ => {
+                        let note = data.note_id(slot).ok_or(VectorError::CorruptIndex)?;
+                        let admitted = self.visible(&note)?;
+                        previous = Some((ord, admitted));
+                        admitted
+                    }
+                };
+                if admitted {
+                    selected.add(slot);
+                    if selected.cardinality() > EXACT_SCAN_LIMIT {
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+        Ok(Some(selected))
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SearchMode<'a> {
+    Indexed,
+    Exact,
+    Projected(&'a ProjectedVectorFilter<'a>),
 }
 
 #[derive(Clone, Debug)]
@@ -268,7 +373,12 @@ impl VectorSnapshot {
         budget: SearchBudget<'_>,
     ) -> Result<VectorResults, VectorError> {
         self.search_mode::<fn(&NoteId) -> Result<bool, VectorError>>(
-            query, filter, limit, budget, false, None,
+            query,
+            filter,
+            limit,
+            budget,
+            SearchMode::Indexed,
+            None,
         )
     }
 
@@ -279,55 +389,20 @@ impl VectorSnapshot {
         limit: usize,
         budget: SearchBudget<'_>,
     ) -> Result<VectorResults, VectorError> {
-        let snapshot = filter.snapshot;
-        let generation = snapshot.cut().generation;
-        // Materialize an explicit field constraint even when the field alone
-        // is broad: its intersection with a segment's classes can be tiny.
-        let mut field_notes = None;
-        if filter.field_filtered
-            && let Some(nodes) = filter.nodes
-        {
-            let mut ids = BTreeSet::new();
-            for (position, index) in nodes.iter().enumerate() {
-                if position.is_multiple_of(64) {
-                    budget.check()?;
-                }
-                let node = DenseNodeId::new(generation, index);
-                match snapshot.doc_class(node) {
-                    Ok(class) if filter.classes.contains(&class) => {}
-                    Ok(_) | Err(DomainError::ResourceNotFound) => continue,
-                    Err(error) => return Err(error.into()),
-                }
-                match snapshot.note_id(node) {
-                    Ok(note) => {
-                        ids.insert(note);
-                    }
-                    Err(DomainError::ResourceNotFound) => continue,
-                    Err(error) => return Err(error.into()),
-                }
-            }
-            field_notes = Some(ids);
-        }
         let mask = VectorFilter {
             classes: filter.classes,
             folders: filter.folders,
-            notes: field_notes.as_ref(),
+            notes: None,
             excluded: Some(filter.excluded),
         };
-        self.search_visible(query, &mask, limit, budget, |note| {
-            let node = match snapshot.lookup(note) {
-                Ok(Some(node)) => node,
-                Ok(None) | Err(DomainError::ResourceNotFound) => return Ok(false),
-                Err(error) => return Err(error.into()),
-            };
-            let index = node.index(generation)?;
-            match snapshot.doc_class(node) {
-                Ok(class) => Ok(filter.classes.contains(&class)
-                    && filter.nodes.is_none_or(|nodes| nodes.contains(index))),
-                Err(DomainError::ResourceNotFound) => Ok(false),
-                Err(error) => Err(error.into()),
-            }
-        })
+        self.search_mode(
+            query,
+            &mask,
+            limit,
+            budget,
+            SearchMode::Projected(&filter),
+            Some(&mut |note| filter.visible(note)),
+        )
     }
 
     /// Apply snapshot visibility before admitting a candidate into the result heap.
@@ -339,7 +414,14 @@ impl VectorSnapshot {
         budget: SearchBudget<'_>,
         mut visible: impl FnMut(&NoteId) -> Result<bool, VectorError>,
     ) -> Result<VectorResults, VectorError> {
-        self.search_mode(query, filter, limit, budget, false, Some(&mut visible))
+        self.search_mode(
+            query,
+            filter,
+            limit,
+            budget,
+            SearchMode::Indexed,
+            Some(&mut visible),
+        )
     }
 
     /// Exhaustive quantized scoring for callers that need a recall reference.
@@ -351,7 +433,12 @@ impl VectorSnapshot {
         budget: SearchBudget<'_>,
     ) -> Result<VectorResults, VectorError> {
         self.search_mode::<fn(&NoteId) -> Result<bool, VectorError>>(
-            query, filter, limit, budget, true, None,
+            query,
+            filter,
+            limit,
+            budget,
+            SearchMode::Exact,
+            None,
         )
     }
 
@@ -361,7 +448,7 @@ impl VectorSnapshot {
         filter: &VectorFilter<'_>,
         limit: usize,
         budget: SearchBudget<'_>,
-        force_exact: bool,
+        mode: SearchMode<'_>,
         mut visible: Option<&mut F>,
     ) -> Result<VectorResults, VectorError> {
         budget.check()?;
@@ -386,7 +473,12 @@ impl VectorSnapshot {
         let mut active = Vec::with_capacity(self.segments.len());
         for segment in &self.segments {
             budget.check()?;
-            let allowed = self.allowed_slots(segment, filter, budget)?;
+            let mut allowed = self.allowed_slots(segment, filter, budget)?;
+            if let SearchMode::Projected(projection) = mode
+                && let Some(slots) = projection.selective_slots(&segment.data, &allowed, budget)?
+            {
+                allowed = SlotMask::Owned(slots);
+            }
             if !allowed.is_empty() {
                 active.push((segment, allowed));
             }
@@ -397,7 +489,8 @@ impl VectorSnapshot {
         let active_segments = active.len().max(1);
         for (segment, allowed) in active {
             budget.check()?;
-            let exact = force_exact || allowed.cardinality() <= EXACT_SCAN_LIMIT;
+            let exact =
+                matches!(mode, SearchMode::Exact) || allowed.cardinality() <= EXACT_SCAN_LIMIT;
             let data = &segment.data;
             let mut vis_cache: HashMap<u32, bool> = HashMap::new();
             let result = data.search_mode(

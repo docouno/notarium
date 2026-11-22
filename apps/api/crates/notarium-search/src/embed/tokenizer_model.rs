@@ -122,20 +122,24 @@ impl Model {
                 let suffix = end_of_word_suffix.unwrap_or_default();
                 let mut rank_table = HashMap::with_capacity(merges.len());
                 let mut merged_buf = String::new();
+                let legacy = matches!(merges.first(), Some(Merge::Text(_)));
                 for (index, merge) in merges.into_iter().enumerate() {
-                    let rank = u32::try_from(index).map_err(|_| EmbeddingError::InvalidModel)?;
-                    let (left_id, right_id, merged_id) = match merge {
-                        Merge::Pair([left, right]) => {
-                            resolve_merge(&vocab, &prefix, &left, &right, &mut merged_buf)?
+                    let (left, right) = match &merge {
+                        Merge::Pair([left, right]) if !legacy => (left.as_str(), right.as_str()),
+                        Merge::Text(line) if legacy => {
+                            if line.starts_with("#version") {
+                                continue;
+                            }
+                            line.split_once(' ')
+                                .filter(|(_, right)| !right.contains(' '))
+                                .ok_or(EmbeddingError::InvalidModel)?
                         }
-                        Merge::Text(text) => {
-                            resolve_text_merge(&vocab, &prefix, &text, &mut merged_buf)?
-                        }
+                        _ => return Err(EmbeddingError::InvalidModel),
                     };
-                    // Duplicate merges retain their earliest (lowest) rank.
-                    rank_table
-                        .entry((left_id, right_id))
-                        .or_insert((rank, merged_id));
+                    let rank = u32::try_from(index).map_err(|_| EmbeddingError::InvalidModel)?;
+                    let (left_id, right_id, merged_id) =
+                        resolve_merge(&vocab, &prefix, left, right, &mut merged_buf)?;
+                    rank_table.insert((left_id, right_id), (rank, merged_id));
                 }
                 let byte_tokens = byte_fallback.then(|| {
                     std::array::from_fn(|byte| {
@@ -195,29 +199,6 @@ fn resolve_merge(
         .get(merged_buf.as_str())
         .ok_or(EmbeddingError::InvalidModel)?;
     Ok((left_id, right_id, merged_id))
-}
-
-fn resolve_text_merge(
-    vocab: &HashMap<String, u32>,
-    prefix: &str,
-    text: &str,
-    merged_buf: &mut String,
-) -> Result<(u32, u32, u32), EmbeddingError> {
-    let mut found = None;
-    for (offset, byte) in text.bytes().enumerate() {
-        if byte != b' ' || offset == 0 || offset + 1 >= text.len() {
-            continue;
-        }
-        let left = &text[..offset];
-        let right = &text[offset + 1..];
-        if let Ok(resolved) = resolve_merge(vocab, prefix, left, right, merged_buf) {
-            if found.is_some() {
-                return Err(EmbeddingError::InvalidModel);
-            }
-            found = Some(resolved);
-        }
-    }
-    found.ok_or(EmbeddingError::InvalidModel)
 }
 
 impl WordPiece {

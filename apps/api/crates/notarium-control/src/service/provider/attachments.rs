@@ -3,7 +3,7 @@ use super::super::{
     commands::Command,
     spaces::{admission, require_owner},
 };
-use super::{ProviderService, records::*};
+use super::{ProviderService, SearchDefaultWitness, records::*};
 use crate::{
     error::invalid,
     store::{
@@ -15,7 +15,7 @@ use crate::{
 };
 use notarium_core::{
     DomainError,
-    auth::{EngineAuthContext, SpaceKind, SpaceLifecycle},
+    auth::{EngineAuthContext, Space, SpaceKind, SpaceLifecycle},
     classes::DocClass,
     error::{CommitEffect, PortError, ValidationReason},
     ids::*,
@@ -43,6 +43,29 @@ pub(super) async fn lock_space_read(
         "SELECT space_id FROM v1_control.space_admission WHERE space_id=$1 FOR SHARE";
         space.as_str())?;
     Ok(())
+}
+
+/// Growing the set of eligible project preferences can retire another
+/// provider's implicit calls. Serialize activation with final dispatch and
+/// compare the effective recipient in the same transaction as the grant.
+async fn before_attachment(
+    tx: &mut Transaction,
+    target: &ProviderAttachmentTarget,
+    space: &Space,
+    approving: bool,
+    clock: &dyn super::super::ControlClock,
+) -> Result<Option<SearchDefaultWitness>, PortError> {
+    let activates = match target {
+        ProviderAttachmentTarget::Personal { .. } => space.kind == SpaceKind::Personal,
+        _ => approving && space.kind == SpaceKind::Shared,
+    };
+    if activates {
+        admission(tx, &space.id, true).await?;
+        SearchDefaultWitness::capture(tx, space, clock.now_ms()?).await
+    } else {
+        lock_space_read(tx, &space.id).await?;
+        Ok(None)
+    }
 }
 
 /// Check eligibility while the caller holds Space admission from revalidation,
@@ -181,10 +204,12 @@ impl ProviderService {
             ),
         )?;
         let auth = ctx.auth().clone();
+        let clock = self.control.clock.clone();
         ctx.budget = budget.context(ctx.budget.request.clone());
         self.mutate(ctx,command,move |tx,owner,now|Box::pin(async move {
             if input.expires_at_ms.is_some_and(|expires| expires<=now || expires.saturating_sub(now)>365*24*60*60*1000) {return Err(invalid(ValidationReason::InvalidTimestamp));}
-            let space=target_space(&input.target);lock_space_read(tx,space).await?;check_member(tx,&auth,space).await?;
+            let space=target_space(&input.target);
+            let previous=before_attachment(tx, &input.target, &catalog.space, false, clock.as_ref()).await?;check_member(tx,&auth,space).await?;
             let resource=resource(tx,input.resource.as_str()).await?;let credential_epoch=epochs(tx,&resource).await?;
             if input.resource_consent_epoch!=resource.consent_epoch as u64 || input.credential_consent_epoch!=credential_epoch.map(|epoch|epoch as u64) {return Err(DomainError::AccessDenied.into());}
             let (kind,target_owner,target_project,state)=match &input.target {
@@ -212,7 +237,9 @@ impl ProviderService {
                 execute!(tx,"UPDATE provider_attachments SET resource_epoch=$1,credential_epoch=$2,state=$3,disclosure=$4,expires_at=$5,revision=$6 WHERE id=$7","UPDATE v1_control.provider_attachments SET resource_epoch=$1,credential_epoch=$2,state=$3,disclosure=$4,expires_at=$5,revision=$6 WHERE id=$7";row.resource_epoch,row.credential_epoch,&row.state,&row.disclosure,row.expires_at,row.revision,&row.id)?;
             } else {TargetRecord::from(row.clone()).insert_or_conflict(tx).await?;}
             bump(tx,&resource).await?;
-            Ok((attachment_info(&row)?,vec![RevocationSelector::ProviderResource(input.resource)]))
+            let mut selectors = vec![RevocationSelector::ProviderResource(input.resource)];
+            if let Some(previous) = previous { selectors.extend(previous.changed(tx, clock.now_ms()?).await?); }
+            Ok((attachment_info(&row)?,selectors))
         })).await
     }
     pub async fn approve_attachment(
@@ -239,9 +266,11 @@ impl ProviderService {
             ),
         )?;
         let auth = ctx.auth().clone();
+        let clock = self.control.clock.clone();
         ctx.budget = budget.context(ctx.budget.request.clone());
         self.mutate(ctx,command,move |tx,owner,now|Box::pin(async move {
-            lock_space_read(tx,target_space(&target)).await?;check_member(tx,&auth,target_space(&target)).await?;
+            let previous=before_attachment(tx, &target, &catalog.space, true, clock.as_ref()).await?;
+            check_member(tx,&auth,target_space(&target)).await?;
             match &target {ProviderAttachmentTarget::Personal{owner:target_owner,..}=>owned(&owner.user_id,target_owner.as_str())?,_=>require_owner(tx,&auth,target_space(&target)).await?};
             let resource=resource(tx,&observed.resource_id).await?;let credential_epoch=epochs(tx,&resource).await?;
             let mut row=attachment(tx,input.id.as_str()).await?;revision(row.revision,input.expected)?;
@@ -249,7 +278,9 @@ impl ProviderService {
             row.state="approved".into();row.revision=next(row.revision)?;
             execute!(tx,"UPDATE provider_attachments SET state='approved',revision=$1 WHERE id=$2","UPDATE v1_control.provider_attachments SET state='approved',revision=$1 WHERE id=$2";row.revision,&row.id)?;
             bump(tx,&resource).await?;
-            Ok((attachment_info(&row)?,vec![RevocationSelector::ProviderResource(ProviderResourceId::parse(&resource.id)?)]))
+            let mut selectors = vec![RevocationSelector::ProviderResource(ProviderResourceId::parse(&resource.id)?)];
+            if let Some(previous) = previous { selectors.extend(previous.changed(tx, clock.now_ms()?).await?); }
+            Ok((attachment_info(&row)?,selectors))
         })).await
     }
     pub async fn revoke_attachment(

@@ -42,6 +42,14 @@ impl SlotMask<'_> {
         self.cardinality() == 0
     }
 
+    pub(super) fn iter(&self) -> Box<dyn Iterator<Item = u32> + '_> {
+        match self {
+            Self::All(count) => Box::new(0..*count),
+            Self::Ref(bitmap) => Box::new(bitmap.iter()),
+            Self::Owned(bitmap) => Box::new(bitmap.iter()),
+        }
+    }
+
     pub(super) fn contains(&self, slot: u32) -> bool {
         match self {
             Self::All(count) => slot < *count,
@@ -739,7 +747,9 @@ impl MmapSegment {
         mut visible: impl FnMut(u32) -> Result<bool, VectorError>,
     ) -> Result<Vec<Neighbor>, VectorError> {
         let dot = Dot::new(query.values()).ok_or(VectorError::InvalidDimension)?;
-        let mut best = RankedChunks::new(top_k);
+        let panel_size = EXACT_SCAN_LIMIT as usize;
+        let mut scored = Vec::with_capacity((eligible.cardinality() as usize).min(panel_size));
+        let mut merged = None;
         let vectors = signed_bytes(self.section(VECTORS));
         let scales = self.section(SCALES).as_chunks::<4>().0;
         let mut slots = [0u32; 256];
@@ -768,6 +778,15 @@ impl MmapSegment {
             if count == 0 {
                 break;
             }
+            // Exhaustive reference scans can be larger than the production
+            // crossover. Each panel bounds score scratch to 128 KiB.
+            if scored.len() + count > panel_size {
+                let best = merged.get_or_insert_with(|| RankedChunks::new(top_k));
+                for hit in self.select_visible(&mut scored, top_k, budget, &mut visible)? {
+                    best.insert(self.ranked_chunk(hit)?);
+                }
+                scored.clear();
+            }
             let bounded = slots[..count].partition_point(|&slot| (slot as usize) < self.nodes);
             let current = &slots[..bounded];
             let scores = &mut scores[..bounded];
@@ -779,16 +798,80 @@ impl MmapSegment {
                     return Err(VectorError::CorruptIndex);
                 }
                 let score = score as f32 * query.scale() * scale;
-                if best.admits_score(score) && visible(slot)? {
-                    best.insert(self.ranked_chunk(Neighbor { slot, score })?);
-                }
+                scored.push(Neighbor { slot, score });
             }
             if bounded < count {
                 break;
             }
         }
-        budget.check()?;
-        Ok(best.finish())
+        let last = self.select_visible(&mut scored, top_k, budget, &mut visible)?;
+        if let Some(mut best) = merged {
+            for hit in last {
+                best.insert(self.ranked_chunk(hit)?);
+            }
+            return Ok(best.finish());
+        }
+        Ok(last)
+    }
+
+    /// Score ordering only needs metadata for the leading window. Include
+    /// every score tied at its boundary so span/key tie-breaking stays exact.
+    /// When visibility or duplicate notes exhaust a window, consume the next.
+    fn select_visible(
+        &self,
+        mut remaining: &mut [Neighbor],
+        top_k: usize,
+        budget: SearchBudget<'_>,
+        visible: &mut impl FnMut(u32) -> Result<bool, VectorError>,
+    ) -> Result<Vec<Neighbor>, VectorError> {
+        let mut notes = HashSet::with_capacity(top_k);
+        let mut chunks = 0;
+        let mut hits = Vec::with_capacity(top_k);
+        let mut window = top_k * 2;
+        while !remaining.is_empty() {
+            budget.check()?;
+            let mut count = window.min(remaining.len());
+            if count < remaining.len() {
+                let (_, pivot, tail) =
+                    remaining.select_nth_unstable_by(count - 1, |a, b| b.score.total_cmp(&a.score));
+                let tie = pivot.score;
+                let mut tied = 0;
+                for idx in 0..tail.len() {
+                    if tail[idx].score.total_cmp(&tie).is_eq() {
+                        tail.swap(idx, tied);
+                        tied += 1;
+                    }
+                }
+                count += tied;
+            }
+            let (prefix, rest) = remaining.split_at_mut(count);
+            let mut ranked = Vec::with_capacity(prefix.len());
+            for (index, hit) in prefix.iter().enumerate() {
+                if index.is_multiple_of(256) {
+                    budget.check()?;
+                }
+                ranked.push(self.ranked_chunk(*hit)?);
+            }
+            ranked.sort_unstable_by(|left, right| right.cmp(left));
+            for (index, candidate) in ranked.into_iter().enumerate() {
+                if index.is_multiple_of(64) {
+                    budget.check()?;
+                }
+                if visible(candidate.hit.slot)? {
+                    let representative = notes.insert(candidate.note);
+                    if chunks < top_k || representative {
+                        hits.push(candidate.hit);
+                    }
+                    chunks += 1;
+                    if notes.len() == top_k {
+                        return Ok(hits);
+                    }
+                }
+            }
+            remaining = rest;
+            window = window.saturating_mul(2);
+        }
+        Ok(hits)
     }
 
     fn ranked_chunk(&self, hit: Neighbor) -> Result<ExactNeighbor<'_>, VectorError> {

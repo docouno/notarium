@@ -256,7 +256,7 @@ impl SearchEngine {
                 hits,
                 recall,
                 &mut chat_hits,
-                chat_record.map(|record| record.last_seq),
+                aligned.cut.canonical_seq,
             )
             .await?;
         Ok(SearchResult {
@@ -378,6 +378,10 @@ impl SearchEngine {
             } else {
                 state
             };
+            // Lexical results are ready while the worker waits to retry checkpoint I/O.
+            if state.vectors.is_none() && state.embedder_unavailable {
+                return Err(EmbeddingError::ModelUnavailable);
+            }
             let resolve_budget = clock
                 .remaining()
                 .map_err(|_| EmbeddingError::BudgetExceeded)?;
@@ -386,11 +390,19 @@ impl SearchEngine {
                 .model_target(ctx.scope(), query.model.as_ref(), &resolve_budget)
                 .await?
                 .ok_or(EmbeddingError::ModelUnavailable)?;
+            let query_project =
+                if matches!(requested.backend, EmbeddingBackendTarget::Remote { .. }) {
+                    filter
+                        .query_project(snapshot.as_ref(), query.folder.as_ref())
+                        .await?
+                } else {
+                    None
+                };
             if let EmbeddingBackendTarget::Remote {
                 project: Some(expected),
                 ..
             } = &requested.backend
-                && filter.project.as_ref() != Some(expected)
+                && query_project.as_ref() != Some(expected)
             {
                 // A changed default still needs indexing when this request cannot
                 // disclose its query to the newly selected project.
@@ -430,7 +442,7 @@ impl SearchEngine {
                 && (ctx.auth().taint().is_tainted()
                     || project
                         .as_ref()
-                        .is_some_and(|expected| filter.project.as_ref() != Some(expected)))
+                        .is_some_and(|expected| query_project.as_ref() != Some(expected)))
             {
                 return Err(EmbeddingError::ProviderUnavailable);
             }
@@ -448,7 +460,7 @@ impl SearchEngine {
                     context,
                     query,
                     filter.classes.clone(),
-                    filter.project.clone(),
+                    query_project,
                     &requested,
                 )
                 .await?;
@@ -472,11 +484,6 @@ impl SearchEngine {
         let pending = state
             .embeddings_pending
             .then_some(SearchDegradation::EmbeddingsPending);
-        // Folder ordinals already identify the subtree in each sealed segment.
-        // An additional field predicate needs its exact note posting before the
-        // segment chooses between a scan and a graph walk.
-        let has_field_predicate =
-            !matches!(&query.filter.predicate, Predicate::All(terms) if terms.is_empty());
         let vectors = loop {
             clock.remaining()?;
             let snapshot_attempt = snapshot.clone();
@@ -496,7 +503,6 @@ impl SearchEngine {
                         classes: &filter_attempt.classes,
                         folders: filter_attempt.ordinals.as_deref(),
                         nodes: filter_attempt.nodes.as_ref(),
-                        field_filtered: has_field_predicate,
                         excluded: &excluded_attempt,
                     },
                     limit,
@@ -618,7 +624,7 @@ impl VectorCandidates {
 struct Eligible {
     cut: SnapshotCut,
     classes: BTreeSet<DocClass>,
-    project: Option<FolderRef>,
+    project_root: Option<FolderId>,
     folders: Option<BTreeSet<FolderId>>,
     ordinals: Option<Arc<Bitmap>>,
     chat_folders: Option<Arc<Bitmap>>,
@@ -696,17 +702,6 @@ impl Eligible {
             }
             None => ordinals.clone(),
         };
-        // Only label a query as project-scoped when its requested search
-        // domain fits that project. Pinned reads do not widen provider consent.
-        let project = match (note_root, query.folder.as_ref()) {
-            (Some(root), _) => Some(root.clone()),
-            (None, Some(folder)) => snapshot.enclosing_project(folder).await?,
-            (None, None) => None,
-        }
-        .map(|folder_id| FolderRef {
-            space_id: cut.scope.space_id.clone(),
-            folder_id,
-        });
         let mut nodes = snapshot
             .filter_notes(&query.filter)
             .await?
@@ -731,7 +726,7 @@ impl Eligible {
         Ok(Self {
             cut,
             classes,
-            project,
+            project_root: note_root.cloned(),
             folders,
             ordinals,
             chat_folders,
@@ -750,6 +745,30 @@ impl Eligible {
                 .map(|_| ctx.auth().principal().clone()),
             nodes,
         })
+    }
+
+    /// Resolve provider scope only for a remote target, within the vector deadline.
+    /// Pinned reads outside the Keeper's root do not widen provider consent.
+    async fn query_project(
+        &self,
+        snapshot: &dyn StructuralSnapshot,
+        folder: Option<&FolderId>,
+    ) -> Result<Option<FolderRef>, EmbeddingError> {
+        let project = match (&self.project_root, folder) {
+            (Some(root), _) => Some(root.clone()),
+            (None, Some(folder)) => snapshot.enclosing_project(folder).await.map_err(|error| {
+                if matches!(error, PortError::DeadlineExceeded(_)) {
+                    EmbeddingError::BudgetExceeded
+                } else {
+                    EmbeddingError::ProviderUnavailable
+                }
+            })?,
+            (None, None) => None,
+        };
+        Ok(project.map(|folder_id| FolderRef {
+            space_id: self.cut.scope.space_id.clone(),
+            folder_id,
+        }))
     }
 
     fn node_allowed(

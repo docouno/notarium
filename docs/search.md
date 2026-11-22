@@ -26,7 +26,8 @@ before shutting down canonical storage.
 - Folder and structural filters apply before ranking. A blank query with a
   filter browses notes in stable ID order using per-segment term ordinals.
   Personal chat hits enter the ranking only for an authorized personal
-  audience. Hydration rechecks thread access and the live reachable branch. A
+  audience. Final delivery verifies note visibility and chat branch access at
+  a consistent canonical head and applies the current taint of returned chats. A
   project-scoped Keeper can search its explicitly pinned skills outside the
   project when no folder is requested.
 - The hybrid path fuses lexical and vector ranks with reciprocal rank fusion
@@ -86,7 +87,11 @@ without an active plan, delete overflow flushes tombstones and resets the
 journal) and read-only, single-pass BLAKE3-checksummed v2 mmap segments
 (112 MiB estimated build budget per segment). A long note can span several
 segments. Backfill and direct replacements publish all its pieces in one
-manifest update. Each segment contains normalized, per-vector i8
+manifest update. Cold backfill passes at most 256 quantized rows at a time to
+the staged builder, including when a single note crosses that boundary. At
+4,096 dimensions their vector payload is at most 1 MiB. The canonical page,
+Markdown descriptors of the current note, model workspace and mapped segments
+also consume memory. Each segment contains normalized, per-vector i8
 embeddings, a CSR-HNSW graph built in Rust, sorted note-slot and content-key
 indexes, and precomputed class/folder filter bitmaps. Non-blocking partial
 compaction plans and writes replacement segments outside the reader lock before
@@ -167,8 +172,10 @@ chunks; remote provider batches stay within the model's aggregate
 `max_input_tokens` cap, while local ONNX batches pack up to 16 chunks each
 bounded by `max_input_tokens` (up to `max_input_tokens * 16` tokens per batch).
 Interactive vector search has one deadline of at most 150 ms covering model
-selection, queueing, embedding, filter preparation and vector traversal. When
-this deadline expires, the query returns lexical results with `BudgetExceeded`.
+selection, provider project lookup, queueing, embedding, vector filter
+preparation and traversal. Local and lexical searches skip the provider project
+lookup. When this deadline expires, the query returns lexical results with
+`BudgetExceeded`.
 The same deadline bounds waits for projection access during traversal.
 The durable pending state schedules bounded repair when embeddings are missing.
 Each page can finish while unrelated edits arrive. If a note changes during

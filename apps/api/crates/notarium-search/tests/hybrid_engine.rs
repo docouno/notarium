@@ -357,12 +357,16 @@ async fn run_scenario(store: Arc<CanonicalStore>, root: DataRoot, tag: u8) {
     ));
     let mut rooted = query("needle");
     rooted.folder = Some(folder.clone());
+    let project_lookup = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    projection.snapshot.write().unwrap().blocked_project = Some(project_lookup.clone());
     assert_eq!(
         engine.search(ctx.clone(), rooted).await.unwrap().hits[0]
             .card
             .title,
         "Install guide"
     );
+    assert!(!project_lookup.load(Ordering::SeqCst));
+    projection.snapshot.write().unwrap().blocked_project = None;
 
     pages.hold(high);
     let created = sample_note_id(5);
@@ -2592,11 +2596,48 @@ async fn lexical_evidence_and_live_chat_pagination() {
     let mut mixed = query("branchterm");
     mixed.include_chats = true;
     mixed.top_k = PageLimit::new(1).unwrap();
+    let sticky_reader = context(&scope, &owner);
     carriers.hold_hydrated_chat.store(true, Ordering::SeqCst);
-    let (mixed, ()) = tokio::join!(engine.search(ctx.clone(), mixed), async {
+    let (retained, ()) = tokio::join!(engine.search(sticky_reader.clone(), mixed.clone()), async {
         tokio::time::timeout(Duration::from_secs(3), carriers.chat_held.notified())
             .await
             .unwrap();
+        assert!(!sticky_reader.auth().taint().is_tainted());
+        store
+            .append_chat(
+                ctx.clone(),
+                mutation(
+                    &ctx,
+                    AppendChat {
+                        thread: thread.clone(),
+                        parent,
+                        kind: ChatEntryKind::Model,
+                        body: ChatInputBody::Text("External context".into()),
+                        referenced_notes: vec![],
+                        tainted: true,
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        carriers.release_chat.notify_one();
+    });
+    assert_eq!(retained.unwrap().chat_hits.len(), 1);
+    assert!(
+        sticky_reader.auth().taint().is_tainted(),
+        "delivering an earlier message records the new sticky thread taint"
+    );
+
+    let fork_reader = context(&scope, &owner);
+    carriers.hold_hydrated_chat.store(true, Ordering::SeqCst);
+    let (mixed, ()) = tokio::join!(engine.search(fork_reader.clone(), mixed), async {
+        tokio::time::timeout(Duration::from_secs(3), carriers.chat_held.notified())
+            .await
+            .unwrap();
+        assert!(
+            !fork_reader.auth().taint().is_tainted(),
+            "preparing a snippet cannot taint its caller"
+        );
         store
             .fork_chat(
                 ctx.clone(),
@@ -2617,6 +2658,10 @@ async fn lexical_evidence_and_live_chat_pagination() {
     assert!(
         mixed.chat_hits.is_empty(),
         "the admitted chat left the branch before note delivery"
+    );
+    assert!(
+        !fork_reader.auth().taint().is_tainted(),
+        "a withdrawn chat must not taint the delivered note"
     );
     request.top_k = PageLimit::new(1).unwrap();
     let visible = engine.search(ctx.clone(), request.clone()).await.unwrap();

@@ -948,6 +948,31 @@ pub async fn model_epochs_and_repair(store: Arc<CanonicalStore>, root: DataRoot)
         provider.outside_parts.load(Ordering::SeqCst),
         previous_outside_parts
     );
+    let observed = Arc::new(AtomicBool::new(false));
+    projection.snapshot.write().unwrap().blocked_project = Some(observed.clone());
+    let mut lexical_only = query("inside scope");
+    lexical_only.folder = Some(project.clone());
+    let queries_before = provider.queries.lock().unwrap().len();
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        engine.search(ctx.clone(), lexical_only),
+    )
+    .await
+    .expect("a blocked provider scope must leave time for lexical hits")
+    .unwrap();
+    projection.snapshot.write().unwrap().blocked_project = None;
+    assert!(observed.load(Ordering::SeqCst));
+    assert!(matches!(
+        result.degraded,
+        Some(SearchDegradation::BudgetExceeded)
+    ));
+    assert!(
+        result
+            .hits
+            .iter()
+            .any(|hit| hit.card.document.provenance().reference().note_id == scoped_note)
+    );
+    assert_eq!(provider.queries.lock().unwrap().len(), queries_before);
     let keeper = SpaceContext::new(
         ctx.auth()
             .for_keeper(

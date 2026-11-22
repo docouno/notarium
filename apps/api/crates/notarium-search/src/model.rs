@@ -54,6 +54,8 @@ pub(super) struct IndexedNoteVectors {
 pub(super) enum NoteIndexOutcome {
     /// All embeddable chunks completed, or the note was permanently skipped.
     Complete,
+    /// Admission was revoked while a batch was queued. Discard earlier rows of this note.
+    Denied,
     /// At least one chunk failed transiently and should be retried later.
     Pending,
     /// Provider, model, or cancellation failure that should halt backfill.
@@ -327,10 +329,10 @@ impl Embedder {
         }
     }
 
-    pub async fn index_note(
-        &self,
-        input: IndexNote<'_>,
-    ) -> Result<IndexedNoteVectors, DomainError> {
+    pub async fn prepare_note<'a>(
+        &'a self,
+        input: IndexNote<'a>,
+    ) -> Result<NotePreparation<'a>, DomainError> {
         let IndexNote {
             services,
             scope,
@@ -338,29 +340,21 @@ impl Embedder {
             folder,
             mut budget,
             priority,
-            existing,
         } = input;
         let remote = if let Backend::Remote(backend) = &self.backend {
             if !note.remote_indexable {
-                return Ok(IndexedNoteVectors {
-                    chunks: Vec::new(),
-                    outcome: NoteIndexOutcome::Complete,
-                });
+                return Ok(NotePreparation::Finished(NoteIndexOutcome::Complete));
             }
             let Some(resolver) = &services.deps.model_resolver else {
-                return Ok(IndexedNoteVectors {
-                    chunks: Vec::new(),
-                    outcome: NoteIndexOutcome::Fatal(EmbeddingError::ModelUnavailable),
-                });
+                return Ok(NotePreparation::Finished(NoteIndexOutcome::Fatal(
+                    EmbeddingError::ModelUnavailable,
+                )));
             };
             let started = std::time::Instant::now();
             let grant = tokio::select! {
                 biased;
                 () = budget.cancellation.cancelled() => {
-                    return Ok(IndexedNoteVectors {
-                        chunks: Vec::new(),
-                        outcome: NoteIndexOutcome::Fatal(EmbeddingError::Cancelled),
-                    });
+                    return Ok(NotePreparation::Finished(NoteIndexOutcome::Fatal(EmbeddingError::Cancelled)));
                 }
                 grant = tokio::time::timeout(
                     budget.remaining,
@@ -369,30 +363,27 @@ impl Embedder {
             };
             budget.remaining = budget.remaining.saturating_sub(started.elapsed());
             match grant {
-                Ok(Ok(Some((grant, project)))) => Some((backend, resolver, grant, project)),
+                Ok(Ok(Some((grant, project)))) => Some(RemoteNote {
+                    backend: backend.clone(),
+                    resolver: resolver.clone(),
+                    grant,
+                    project,
+                }),
                 Ok(Ok(None)) => {
-                    return Ok(IndexedNoteVectors {
-                        chunks: Vec::new(),
-                        outcome: NoteIndexOutcome::Complete,
-                    });
+                    return Ok(NotePreparation::Finished(NoteIndexOutcome::Complete));
                 }
                 Ok(Err(PortError::Cancelled(_))) => {
-                    return Ok(IndexedNoteVectors {
-                        chunks: Vec::new(),
-                        outcome: NoteIndexOutcome::Fatal(EmbeddingError::Cancelled),
-                    });
+                    return Ok(NotePreparation::Finished(NoteIndexOutcome::Fatal(
+                        EmbeddingError::Cancelled,
+                    )));
                 }
                 Ok(Err(PortError::DeadlineExceeded(_))) | Err(_) => {
-                    return Ok(IndexedNoteVectors {
-                        chunks: Vec::new(),
-                        outcome: NoteIndexOutcome::Pending,
-                    });
+                    return Ok(NotePreparation::Finished(NoteIndexOutcome::Pending));
                 }
                 Ok(Err(_)) => {
-                    return Ok(IndexedNoteVectors {
-                        chunks: Vec::new(),
-                        outcome: NoteIndexOutcome::Fatal(EmbeddingError::ProviderUnavailable),
-                    });
+                    return Ok(NotePreparation::Finished(NoteIndexOutcome::Fatal(
+                        EmbeddingError::ProviderUnavailable,
+                    )));
                 }
             }
         } else {
@@ -406,141 +397,33 @@ impl Embedder {
                 note = %note.note_id,
                 "skipping note that failed markdown chunking for vector indexing"
             );
-            return Ok(IndexedNoteVectors {
-                chunks: Vec::new(),
-                outcome: NoteIndexOutcome::Complete,
-            });
+            return Ok(NotePreparation::Finished(NoteIndexOutcome::Complete));
         };
         if chunks.is_empty() {
-            return Ok(IndexedNoteVectors {
+            return Ok(NotePreparation::Finished(NoteIndexOutcome::Complete));
+        }
+        Ok(NotePreparation::Ready(Box::new(PreparedIndexNote {
+            embedder: self,
+            services,
+            folder,
+            document,
+            budget,
+            priority,
+            remote,
+            descriptors: chunks.into_iter(),
+        })))
+    }
+
+    pub async fn index_note(
+        &self,
+        input: IndexNote<'_>,
+        existing: &(dyn Fn(ContentDigest) -> Option<QuantizedVector> + Sync),
+    ) -> Result<IndexedNoteVectors, DomainError> {
+        Ok(match self.prepare_note(input).await? {
+            NotePreparation::Ready(mut note) => note.index_next(usize::MAX, existing).await,
+            NotePreparation::Finished(outcome) => IndexedNoteVectors {
                 chunks: Vec::new(),
-                outcome: NoteIndexOutcome::Complete,
-            });
-        }
-        let max_per_chunk = self.target.max_input_tokens;
-        let mut missing: Vec<Vec<ChunkDescriptor>> = Vec::new();
-        let mut group_by_key = HashMap::new();
-        let mut vectors = Vec::new();
-        for descriptor in chunks {
-            if descriptor.tokens == 0 || descriptor.tokens > max_per_chunk {
-                continue;
-            }
-            if let Some(vector) = existing(descriptor.key) {
-                vectors.push(vector_chunk(&document, folder, descriptor, vector));
-            } else {
-                let group = *group_by_key.entry(descriptor.key).or_insert_with(|| {
-                    missing.push(Vec::new());
-                    missing.len() - 1
-                });
-                missing[group].push(descriptor);
-            }
-        }
-        if missing.is_empty() {
-            return Ok(IndexedNoteVectors {
-                chunks: vectors,
-                outcome: NoteIndexOutcome::Complete,
-            });
-        }
-        let batch_cap = match &self.backend {
-            Backend::Remote(_) => self.target.max_input_tokens,
-            _ => self
-                .target
-                .max_input_tokens
-                .saturating_mul(LOCAL_BATCH_QUANTUM),
-        };
-        let Ok(batches) = bounded_batches(missing, |group| group[0].tokens, batch_cap) else {
-            tracing::warn!(
-                note = %note.note_id,
-                "skipping note chunks that exceed model batch token cap"
-            );
-            return Ok(IndexedNoteVectors {
-                chunks: vectors,
-                outcome: NoteIndexOutcome::Complete,
-            });
-        };
-        let mut pending = false;
-        for batch in batches {
-            let rows = if let Some((backend, resolver, grant, project)) = &remote {
-                self.remote_index(
-                    services,
-                    &document,
-                    backend,
-                    Arc::clone(resolver),
-                    grant.clone(),
-                    project.clone(),
-                    &batch,
-                    &budget,
-                    priority,
-                )
-                .await
-            } else {
-                self.local(
-                    services,
-                    priority,
-                    batch.iter().map(|group| group[0].text.clone()).collect(),
-                    budget.clone(),
-                )
-                .await
-            };
-            let rows = match rows {
-                Ok(rows) => rows,
-                Err(EmbeddingError::IndexingDenied) => {
-                    return Ok(IndexedNoteVectors {
-                        chunks: Vec::new(),
-                        outcome: NoteIndexOutcome::Complete,
-                    });
-                }
-                Err(err) if err.is_permanent_note_rejection() => {
-                    tracing::warn!(
-                        note = %note.note_id,
-                        kind = %err,
-                        "skipping permanently rejected note batch for vector indexing"
-                    );
-                    continue;
-                }
-                Err(EmbeddingError::BudgetExceeded) => {
-                    pending = true;
-                    break;
-                }
-                Err(err) => {
-                    return Ok(IndexedNoteVectors {
-                        chunks: vectors,
-                        outcome: NoteIndexOutcome::Fatal(err),
-                    });
-                }
-            };
-            for (group, row) in batch.into_iter().zip(rows) {
-                match row {
-                    Some(raw) => match QuantizedVector::quantize(&raw) {
-                        Ok(vector) => {
-                            for descriptor in group {
-                                vectors.push(vector_chunk(
-                                    &document,
-                                    folder,
-                                    descriptor,
-                                    vector.clone(),
-                                ));
-                            }
-                        }
-                        Err(_) => {
-                            tracing::warn!(
-                                note = %note.note_id,
-                                "skipping unquantizable embedding chunk"
-                            );
-                        }
-                    },
-                    None => {
-                        pending = true;
-                    }
-                }
-            }
-        }
-        Ok(IndexedNoteVectors {
-            chunks: vectors,
-            outcome: if pending {
-                NoteIndexOutcome::Pending
-            } else {
-                NoteIndexOutcome::Complete
+                outcome,
             },
         })
     }
@@ -668,6 +551,173 @@ impl Embedder {
     }
 }
 
+struct RemoteNote {
+    backend: Arc<RemoteEmbedder>,
+    resolver: Arc<dyn SearchModelResolverPort>,
+    grant: RemoteIndexingGrant,
+    project: Option<FolderRef>,
+}
+
+pub(super) enum NotePreparation<'a> {
+    Ready(Box<PreparedIndexNote<'a>>),
+    Finished(NoteIndexOutcome),
+}
+
+pub(super) struct PreparedIndexNote<'a> {
+    embedder: &'a Embedder,
+    services: &'a Services,
+    document: Arc<ClassifiedDocument>,
+    folder: u32,
+    budget: CallBudget,
+    priority: Priority,
+    remote: Option<RemoteNote>,
+    descriptors: std::vec::IntoIter<ChunkDescriptor>,
+}
+
+impl PreparedIndexNote<'_> {
+    pub fn has_more(&self) -> bool {
+        self.descriptors.len() != 0
+    }
+
+    pub async fn index_next(
+        &mut self,
+        limit: usize,
+        existing: &(dyn Fn(ContentDigest) -> Option<QuantizedVector> + Sync),
+    ) -> IndexedNoteVectors {
+        let embedder = self.embedder;
+        let document = &self.document;
+        let max_per_chunk = embedder.target.max_input_tokens;
+        let mut missing: Vec<Vec<ChunkDescriptor>> = Vec::new();
+        let mut group_by_key = HashMap::new();
+        let mut vectors = Vec::new();
+        for descriptor in self.descriptors.by_ref().take(limit) {
+            if descriptor.tokens == 0 || descriptor.tokens > max_per_chunk {
+                continue;
+            }
+            if let Some(vector) = existing(descriptor.key) {
+                vectors.push(vector_chunk(document, self.folder, descriptor, vector));
+            } else {
+                let group = *group_by_key.entry(descriptor.key).or_insert_with(|| {
+                    missing.push(Vec::new());
+                    missing.len() - 1
+                });
+                missing[group].push(descriptor);
+            }
+        }
+        if missing.is_empty() {
+            return IndexedNoteVectors {
+                chunks: vectors,
+                outcome: NoteIndexOutcome::Complete,
+            };
+        }
+        let batch_cap = match &embedder.backend {
+            Backend::Remote(_) => embedder.target.max_input_tokens,
+            _ => embedder
+                .target
+                .max_input_tokens
+                .saturating_mul(LOCAL_BATCH_QUANTUM),
+        };
+        let Ok(batches) = bounded_batches(missing, |group| group[0].tokens, batch_cap) else {
+            tracing::warn!(
+                note = %document.reference().note_id,
+                "skipping note chunks that exceed model batch token cap"
+            );
+            return IndexedNoteVectors {
+                chunks: vectors,
+                outcome: NoteIndexOutcome::Complete,
+            };
+        };
+        let mut pending = false;
+        for batch in batches {
+            let rows = if let Some(remote) = &self.remote {
+                embedder
+                    .remote_index(
+                        self.services,
+                        document,
+                        &remote.backend,
+                        remote.resolver.clone(),
+                        remote.grant.clone(),
+                        remote.project.clone(),
+                        &batch,
+                        &self.budget,
+                        self.priority,
+                    )
+                    .await
+            } else {
+                embedder
+                    .local(
+                        self.services,
+                        self.priority,
+                        batch.iter().map(|group| group[0].text.clone()).collect(),
+                        self.budget.clone(),
+                    )
+                    .await
+            };
+            let rows = match rows {
+                Ok(rows) => rows,
+                Err(EmbeddingError::IndexingDenied) => {
+                    return IndexedNoteVectors {
+                        chunks: Vec::new(),
+                        outcome: NoteIndexOutcome::Denied,
+                    };
+                }
+                Err(err) if err.is_permanent_note_rejection() => {
+                    tracing::warn!(
+                        note = %document.reference().note_id,
+                        kind = %err,
+                        "skipping permanently rejected note batch for vector indexing"
+                    );
+                    continue;
+                }
+                Err(EmbeddingError::BudgetExceeded) => {
+                    pending = true;
+                    self.descriptors = Vec::new().into_iter();
+                    break;
+                }
+                Err(err) => {
+                    return IndexedNoteVectors {
+                        chunks: vectors,
+                        outcome: NoteIndexOutcome::Fatal(err),
+                    };
+                }
+            };
+            for (group, row) in batch.into_iter().zip(rows) {
+                match row {
+                    Some(raw) => match QuantizedVector::quantize(&raw) {
+                        Ok(vector) => {
+                            for descriptor in group {
+                                vectors.push(vector_chunk(
+                                    document,
+                                    self.folder,
+                                    descriptor,
+                                    vector.clone(),
+                                ));
+                            }
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                note = %document.reference().note_id,
+                                "skipping unquantizable embedding chunk"
+                            );
+                        }
+                    },
+                    None => {
+                        pending = true;
+                    }
+                }
+            }
+        }
+        IndexedNoteVectors {
+            chunks: vectors,
+            outcome: if pending {
+                NoteIndexOutcome::Pending
+            } else {
+                NoteIndexOutcome::Complete
+            },
+        }
+    }
+}
+
 pub(super) struct IndexNote<'a> {
     pub services: &'a Services,
     pub scope: &'a HistoryScope,
@@ -675,7 +725,6 @@ pub(super) struct IndexNote<'a> {
     pub folder: u32,
     pub budget: CallBudget,
     pub priority: Priority,
-    pub existing: &'a (dyn Fn(ContentDigest) -> Option<QuantizedVector> + Sync),
 }
 
 pub(super) fn chunks_for(

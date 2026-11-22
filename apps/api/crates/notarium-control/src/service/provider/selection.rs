@@ -203,6 +203,104 @@ async fn resolve_search_candidate(
         project,
     }))
 }
+/// Snapshot under exclusive Space admission. Only a selected recipient can
+/// have live implicit calls. Model fallback at that recipient remains valid.
+pub(in crate::service) struct SearchDefaultWitness {
+    space: Space,
+    personal_owner: Option<String>,
+    provider: ProviderResourceId,
+    project: Option<FolderRef>,
+}
+
+impl SearchDefaultWitness {
+    pub(super) async fn capture(
+        tx: &mut Transaction,
+        space: &Space,
+        now: i64,
+    ) -> Result<Option<Self>, PortError> {
+        let personal_owner = if space.kind == SpaceKind::Personal {
+            rows!(tx, (String,), fetch_optional,
+                "SELECT user_id FROM users WHERE personal_space_id=$1",
+                "SELECT user_id FROM v1_control.users WHERE personal_space_id=$1";
+                space.id.as_str())?
+            .map(|row| row.0)
+        } else {
+            None
+        };
+        Self::capture_for_owner(tx, space, personal_owner, now).await
+    }
+
+    async fn capture_for_owner(
+        tx: &mut Transaction,
+        space: &Space,
+        personal_owner: Option<String>,
+        now: i64,
+    ) -> Result<Option<Self>, PortError> {
+        Ok(search_default(tx, space, personal_owner.as_deref(), now)
+            .await?
+            .map(|selected| Self {
+                space: space.clone(),
+                personal_owner,
+                provider: selected.provider,
+                project: selected.project,
+            }))
+    }
+
+    pub(in crate::service) async fn changed(
+        self,
+        tx: &mut Transaction,
+        now: i64,
+    ) -> Result<Option<RevocationSelector>, PortError> {
+        let current = search_default(tx, &self.space, self.personal_owner.as_deref(), now).await?;
+        Ok(current
+            .is_none_or(|current| {
+                current.provider != self.provider || current.project != self.project
+            })
+            .then_some(RevocationSelector::SearchEmbeddingDefault(self.space.id)))
+    }
+
+    /// A disabled owner cannot introduce their resource into a new Space.
+    /// Other principals can only attach it where that owner already offered it.
+    /// Lock those Spaces in the same order as dispatch, before enabling the owner.
+    pub(in crate::service) async fn before_owner_enable(
+        tx: &mut Transaction,
+        owner: &str,
+        clock: &dyn super::super::ControlClock,
+    ) -> Result<Vec<Self>, PortError> {
+        let mut witnesses = Vec::new();
+        let mut after = String::new();
+        loop {
+            let spaces = rows!(tx, (String, Option<String>), fetch_all,
+                "SELECT s.space_id, u.user_id FROM space_admission s LEFT JOIN users u ON u.personal_space_id=s.space_id WHERE s.space_id>$1 AND s.state='active' AND EXISTS (SELECT 1 FROM provider_attachments a JOIN provider_resources r ON r.id=a.resource_id WHERE a.target_space=s.space_id AND r.owner_id=$2) ORDER BY s.space_id LIMIT 64",
+                "SELECT s.space_id, u.user_id FROM v1_control.space_admission s LEFT JOIN v1_control.users u ON u.personal_space_id=s.space_id WHERE s.space_id>$1 AND s.state='active' AND EXISTS (SELECT 1 FROM v1_control.provider_attachments a JOIN v1_control.provider_resources r ON r.id=a.resource_id WHERE a.target_space=s.space_id AND r.owner_id=$2) ORDER BY s.space_id LIMIT 64 FOR UPDATE OF s";
+                &after, owner)?;
+            let count = spaces.len();
+            let now = clock.now_ms()?;
+            for (id, personal_owner) in spaces {
+                let space = Space {
+                    id: SpaceId::parse(&id)?,
+                    kind: if personal_owner.is_some() {
+                        SpaceKind::Personal
+                    } else {
+                        SpaceKind::Shared
+                    },
+                    lifecycle: SpaceLifecycle::Active,
+                };
+                if let Some(witness) =
+                    Self::capture_for_owner(tx, &space, personal_owner, now).await?
+                    && witness.project.is_some()
+                {
+                    witnesses.push(witness);
+                }
+                after = id;
+            }
+            if count < 64 {
+                return Ok(witnesses);
+            }
+        }
+    }
+}
+
 pub(super) async fn search_default(
     tx: &mut Transaction,
     space: &Space,
@@ -807,6 +905,7 @@ impl ProviderService {
         };
         let command = Command::new(request.identity, "set-provider-preference", &input)?;
         let auth = ctx.auth().clone();
+        let clock = self.control.clock.clone();
         ctx.budget = budget.context(ctx.budget.request.clone());
         self.mutate(ctx,command,move |tx,owner,now|Box::pin(async move {
             // A shared default is replaced across resource owners. Serialize
@@ -815,6 +914,19 @@ impl ProviderService {
                 super::super::spaces::admission(tx,&catalog.space.id,true).await?;
                 check_member(tx,&auth,&catalog.space.id).await?;require_owner(tx,&auth,&catalog.space.id).await?;
             }
+            let selection_space = match (&input.kind, &catalog, &owner.personal_space_id) {
+                (PreferenceModelKind::Embedding, Some(catalog), _) => Some(catalog.space.clone()),
+                (PreferenceModelKind::Embedding, None, Some(id)) => {
+                    let id = SpaceId::parse(id)?;
+                    super::super::spaces::admission(tx, &id, true).await?;
+                    Some(Space { id, kind: SpaceKind::Personal, lifecycle: SpaceLifecycle::Active })
+                }
+                _ => None,
+            };
+            let previous = match selection_space {
+                Some(space) => SearchDefaultWitness::capture(tx, &space, clock.now_ms()?).await?,
+                None => None,
+            };
             let resource=resource(tx,input.resource.as_str()).await?;let credential_epoch=epochs(tx,&resource).await?;
             let loaded=model_info(&model(tx,&resource.id,input.model.as_str()).await?)?;
             if !matches_preference_kind(&loaded.model.kind, input.kind) {
@@ -824,20 +936,6 @@ impl ProviderService {
                 let project=match &input.scope{ProviderPreferenceScope::Project(project)=>Some(project),_=>None};
                 shared_attachment(tx,&resource,credential_epoch,&catalog.space.id,project,now,true).await?;
             } else {super::inventory::resource_visible(tx,&owner.user_id,&resource).await?;}
-            let selection_space = match (&input.kind, &catalog, &owner.personal_space_id) {
-                (PreferenceModelKind::Embedding, Some(catalog), _) => Some(catalog.space.clone()),
-                (PreferenceModelKind::Embedding, None, Some(space)) => Some(Space {
-                    id: SpaceId::parse(space)?, kind: SpaceKind::Personal, lifecycle: SpaceLifecycle::Active,
-                }),
-                _ => None,
-            };
-            let personal_owner = selection_space.as_ref()
-                .filter(|space| space.kind == SpaceKind::Personal)
-                .map(|_| owner.user_id.as_str());
-            let previous = match &selection_space {
-                Some(space) => search_default(tx, space, personal_owner, now).await?,
-                None => None,
-            };
             let (kind,id)=preference_scope(&input.scope,auth.principal());
             let wanted_kind = model_kind_name(input.kind);
             // Space/project preferences belong to that scope and model_kind. The
@@ -846,13 +944,8 @@ impl ProviderService {
             else {execute!(tx,"DELETE FROM provider_preferences WHERE scope_kind=$1 AND scope_id=$2 AND model_kind=$3","DELETE FROM v1_control.provider_preferences WHERE scope_kind=$1 AND scope_id=$2 AND model_kind=$3";kind,&id,wanted_kind)?;}
             let row=TargetRecord::from(ProviderPreferencesRow{owner_id:owner.user_id.clone(),scope_kind:kind.into(),scope_id:id,model_kind:wanted_kind.into(),resource_id:resource.id,model_id:input.model.to_string(),revision:super::super::authority::next(owner.revision)?});row.validate()?;row.insert(tx).await?;
             let mut selectors = Vec::new();
-            if let (Some(previous), Some(space)) = (previous, selection_space) {
-                let current = search_default(tx, &space, personal_owner, now).await?;
-                if current.as_ref().is_none_or(|current|
-                    current.provider != previous.provider || current.project != previous.project
-                ) {
-                    selectors.push(RevocationSelector::SearchEmbeddingDefault(space.id));
-                }
+            if let Some(previous) = previous {
+                selectors.extend(previous.changed(tx, clock.now_ms()?).await?);
             }
             Ok((input,selectors))
         })).await

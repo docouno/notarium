@@ -487,9 +487,11 @@ in its own transaction.
 Provider transactions acquire user authority, then Space admission, then resource
 and credential locks before registering calls or revocations. Current membership
 checks do not upgrade a shared Space lock after acquiring a resource. Attachment
-creation, approval and inspection acquire their Space share first. Replacing a
-shared default takes an exclusive Space lock first to serialize edits across
-resource owners. All locks remain subject to the existing transaction budgets.
+inspection and pending offers take a shared Space lock. Embedding preference
+changes and attachment grants that can activate a search candidate take an
+exclusive Space lock before comparing the effective recipient and project.
+Re-enabling a provider owner applies the same comparison in the active Spaces
+where their resources have attachments, locking those Spaces in order. All locks remain subject to the existing transaction budgets.
 
 Every source Space needs the sender's personal attachment consent. Shared content
 also requires a currently approved Space or project attachment. Project-only
@@ -505,6 +507,11 @@ Search embeddings use either a typed query or source-bound parts. Query
 admission checks the caller's taint, requested classes, and project scope.
 For a folder-scoped query with project consent, the canonical egress lease
 pins the requested folder's current membership in that project through dispatch.
+An implicit call registers for changes to the Space's effective search recipient.
+If another project preference becomes eligible and the choice becomes
+ambiguous, Control cancels and drains the old implicit calls before the
+catalog change commits. Explicit calls keep their own recipient and consent
+checks. Expiry of the selected attachment bounds the active network deadline.
 Background search indexing supports a narrowly scoped `SearchIndexing`
 credential for the revision actor under current disclosure consent. An
 ineligible author in a shared Space receives no grant for that note. The model

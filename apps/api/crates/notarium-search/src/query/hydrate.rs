@@ -7,8 +7,6 @@ use crate::{
     ports::SearchDocumentTarget,
 };
 use notarium_core::{
-    DomainError,
-    auth::SpaceLifecycle,
     classes::{ClassEgressFence, ClassifiedDocument, ContentPart, SearchContent, SearchPart},
     error::PortError,
     ids::{NoteId, SpaceSeq},
@@ -228,58 +226,42 @@ impl SearchEngine {
         hits: Vec<SearchHit>,
         recall: Option<Recall>,
         chats: &mut Vec<ChatSearchHit>,
-        mut chat_head: Option<SpaceSeq>,
+        mut visibility_head: SpaceSeq,
     ) -> Result<(Vec<SearchHit>, bool), PortError> {
-        if hits.is_empty() {
+        if hits.is_empty() && chats.is_empty() {
             return Ok((Vec::new(), false));
         }
-        let ids: Vec<NoteId> = hits
+        let ids: Vec<_> = hits
             .iter()
             .map(|hit| hit.card.document.provenance().reference().note_id.clone())
             .collect();
+        let keys: Vec<_> = chats
+            .iter()
+            .map(|chat| (chat.thread.clone(), chat.entry))
+            .collect();
         let mut check_ctx = ctx.clone();
-        let flags = loop {
+        let canonical = &self.services.deps.canonical;
+        let (flags, chat_admission) = loop {
             check_ctx.budget = clock.remaining()?;
-            let flags = self
-                .services
-                .deps
-                .structural
-                .filter_live_visible(&check_ctx, &ids)
-                .await?;
-            if chats.is_empty() {
-                break flags;
-            }
-            // The canonical head covers both note visibility and chat branch/redaction
-            // changes. Recheck only the selected chat keys if it changed since
-            // their admission, then verify the notes at the same head.
-            let current = self
-                .services
-                .deps
-                .canonical
-                .read_space(&ctx.scope().space_id)
-                .await?;
-            ctx.check_current(&current.scope)?;
-            if current.space.lifecycle != SpaceLifecycle::Active {
-                return Err(DomainError::ResourceNotFound.into());
-            }
-            if chat_head == Some(current.last_seq) {
-                break flags;
-            }
-            chat_head = Some(current.last_seq);
-            let keys: Vec<_> = chats
-                .iter()
-                .map(|chat| (chat.thread.clone(), chat.entry))
-                .collect();
+            let flags = if ids.is_empty() {
+                Vec::new()
+            } else {
+                self.services
+                    .deps
+                    .structural
+                    .filter_live_visible(&check_ctx, &ids)
+                    .await?
+            };
             check_ctx.budget = clock.remaining()?;
-            let admitted: HashSet<_> = self
-                .services
-                .deps
-                .carriers
-                .visible_chat_hit_keys(&check_ctx, &keys)
-                .await?
-                .into_iter()
-                .collect();
-            chats.retain(|chat| admitted.contains(&(chat.thread.clone(), chat.entry)));
+            let admission = canonical
+                .admit_search_delivery(&self.services.authority, &check_ctx, &keys)
+                .await?;
+            // A port may read each note separately. An unchanged canonical head
+            // proves all flags and chat admissions refer to the same live state.
+            if ids.is_empty() || visibility_head == admission.head {
+                break (flags, admission);
+            }
+            visibility_head = admission.head;
         };
         if flags.len() != hits.len() {
             return Err(internal("projection_live_batch"));
@@ -290,6 +272,22 @@ impl SearchEngine {
             .filter_map(|(hit, ok)| ok.then_some(hit))
             .collect();
         let truncated = recall.is_some_and(|recall| pack(&mut visible, recall.tokens));
+        let mut any_tainted = false;
+        chats.retain(|chat| {
+            if let Some(&tainted) = chat_admission
+                .entries
+                .get(&(chat.thread.clone(), chat.entry))
+            {
+                any_tainted |= tainted;
+                true
+            } else {
+                false
+            }
+        });
+        if !chats.is_empty() {
+            ctx.auth()
+                .mark_chat_read_taint(&chat_admission.space, any_tainted);
+        }
         Ok((visible, truncated))
     }
 
@@ -392,7 +390,7 @@ impl SearchEngine {
             .services
             .deps
             .carriers
-            .hydrate_live_visible_chat_hits(&context, &selected, request.top_k)
+            .prepare_search_chat_hits(&self.services.authority, &context, &selected, request.top_k)
             .await?;
         let hits = rows
             .into_iter()

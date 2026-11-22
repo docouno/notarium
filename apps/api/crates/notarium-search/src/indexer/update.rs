@@ -488,24 +488,26 @@ pub(super) async fn run_embed_batch(
             continue;
         };
         let indexed = embedder
-            .index_note(IndexNote {
-                services: &services,
-                scope: &cutoff.scope,
-                note,
-                folder: folder.get(),
-                budget: new_budget(&cancel),
-                priority,
-                existing: &|key| {
+            .index_note(
+                IndexNote {
+                    services: &services,
+                    scope: &cutoff.scope,
+                    note,
+                    folder: folder.get(),
+                    budget: new_budget(&cancel),
+                    priority,
+                },
+                &|key| {
                     page_keys
                         .get(&key)
                         .map(|&(row, slot)| rows[row].chunks[slot].vector.clone())
                         .or_else(|| cached_vectors.get(&key).cloned())
                         .or_else(|| snapshot.find_vector(key))
                 },
-            })
+            )
             .await?;
         match indexed.outcome {
-            NoteIndexOutcome::Complete => {
+            NoteIndexOutcome::Complete | NoteIndexOutcome::Denied => {
                 let row_idx = rows.len();
                 for (slot, chunk) in indexed.chunks.iter().enumerate() {
                     page_keys

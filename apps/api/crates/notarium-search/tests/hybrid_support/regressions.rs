@@ -1178,6 +1178,10 @@ struct VanishingProjection {
     vanished: NoteId,
     vanish_doc_class: Arc<AtomicBool>,
     vanish_note_id: Arc<AtomicBool>,
+    hold_after_hydration: AtomicBool,
+    hold_second_note: AtomicBool,
+    second_note_started: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
 }
 
 impl StructuralReadPort for VanishingProjection {
@@ -1203,7 +1207,13 @@ impl StructuralReadPort for VanishingProjection {
         ctx: &'a SpaceContext,
         note: &'a NoteId,
     ) -> PortFuture<'a, bool> {
-        self.inner.is_live_visible(ctx, note)
+        Box::pin(async move {
+            if note == &self.vanished && self.hold_second_note.swap(false, Ordering::SeqCst) {
+                self.second_note_started.notify_one();
+                self.resume.notified().await;
+            }
+            self.inner.is_live_visible(ctx, note).await
+        })
     }
 
     fn hydrate(
@@ -1212,7 +1222,13 @@ impl StructuralReadPort for VanishingProjection {
         cut: SnapshotCut,
         notes: Vec<NoteId>,
     ) -> PortFuture<'_, Vec<Option<NoteCard>>> {
-        self.inner.hydrate(ctx, cut, notes)
+        Box::pin(async move {
+            let cards = self.inner.hydrate(ctx, cut, notes).await?;
+            if self.hold_after_hydration.swap(false, Ordering::SeqCst) {
+                self.hold_second_note.store(true, Ordering::SeqCst);
+            }
+            Ok(cards)
+        })
     }
 }
 
@@ -1242,7 +1258,7 @@ async fn concurrent_trash_during_search_and_recall_skips_vanished_notes(
     let anchor = sample_note_id(tag);
     let vanished = sample_note_id(tag + 1);
     let survivor = sample_note_id(tag + 2);
-    let (seeded, _) = store
+    let (seeded, revisions) = store
         .commit_synthetic_note_batch_for_test(
             &scope,
             lease,
@@ -1278,13 +1294,17 @@ async fn concurrent_trash_during_search_and_recall_skips_vanished_notes(
         vanished: vanished.clone(),
         vanish_doc_class: vanish_doc_class.clone(),
         vanish_note_id: vanish_note_id.clone(),
+        hold_after_hydration: AtomicBool::new(false),
+        hold_second_note: AtomicBool::new(false),
+        second_note_started: tokio::sync::Notify::new(),
+        resume: tokio::sync::Notify::new(),
     });
     let engine = SearchEngine::start(
         SearchConfig::new(
             root.clone(),
             VectorMode::DeterministicTest { dimension: 64 },
         ),
-        SearchDependencies::new(store.clone(), projection),
+        SearchDependencies::new(store.clone(), projection.clone()),
     );
     engine.start_space(scope.clone()).unwrap();
     let initial = acknowledged(&store, &root, &scope, seeded.last_seq).await;
@@ -1325,7 +1345,7 @@ async fn concurrent_trash_during_search_and_recall_skips_vanished_notes(
 
     let recalled = engine
         .recall(
-            ctx,
+            ctx.clone(),
             RecallQuery {
                 query: query("anchorvanishterm"),
                 graph_depth: 2,
@@ -1342,5 +1362,46 @@ async fn concurrent_trash_during_search_and_recall_skips_vanished_notes(
     assert!(recall_ids.contains(&&anchor));
     assert!(recall_ids.contains(&&survivor));
     assert!(!recall_ids.contains(&&vanished));
+    // The alternate port deliberately uses the per-key default. In a blank
+    // filtered browse the anchor sorts first; revoke it while checking the next
+    // key in the final batch, after all note carriers are already hydrated.
+    vanish_note_id.store(false, Ordering::SeqCst);
+    vanish_doc_class.store(false, Ordering::SeqCst);
+    projection
+        .hold_after_hydration
+        .store(true, Ordering::SeqCst);
+    let (page, ()) = tokio::join!(engine.search(ctx.clone(), query("")), async {
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            projection.second_note_started.notified(),
+        )
+        .await
+        .unwrap();
+        let mut trash = mutation(
+            &ctx,
+            DeleteNote {
+                note: anchor.clone(),
+                disposition: DeleteDisposition::Trash,
+            },
+        );
+        trash.preconditions.revision = Some(
+            revisions
+                .iter()
+                .find(|(id, _)| id == &anchor)
+                .unwrap()
+                .1
+                .clone(),
+        );
+        store.delete_note(ctx.clone(), trash).await.unwrap();
+        projection.inner.live.write().unwrap().remove(&anchor);
+        projection.resume.notify_one();
+    });
+    let delivered: BTreeSet<_> = page
+        .unwrap()
+        .hits
+        .into_iter()
+        .map(|hit| hit.card.document.provenance().reference().note_id.clone())
+        .collect();
+    assert_eq!(delivered, BTreeSet::from([vanished, survivor]));
     engine.shutdown().await;
 }

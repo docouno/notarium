@@ -144,8 +144,10 @@ pub trait SearchCarrierReadPort: Send + Sync {
         candidates: &'a [(ChatThreadId, ThreadEntrySeq)],
     ) -> PortFuture<'a, Vec<(ChatThreadId, ThreadEntrySeq)>>;
 
-    fn hydrate_live_visible_chat_hits<'a>(
+    /// Prepare authorized candidate text without marking the caller's branch taint.
+    fn prepare_search_chat_hits<'a>(
         &'a self,
+        authority: &'a ServiceAuthority,
         ctx: &'a SpaceContext,
         candidates: &'a [(ChatThreadId, ThreadEntrySeq)],
         limit: PageLimit,
@@ -215,14 +217,15 @@ impl SearchCarrierReadPort for CanonicalStore {
         Box::pin(CanonicalStore::visible_chat_hit_keys(self, ctx, candidates))
     }
 
-    fn hydrate_live_visible_chat_hits<'a>(
+    fn prepare_search_chat_hits<'a>(
         &'a self,
+        authority: &'a ServiceAuthority,
         ctx: &'a SpaceContext,
         candidates: &'a [(ChatThreadId, ThreadEntrySeq)],
         limit: PageLimit,
     ) -> PortFuture<'a, (Vec<HydratedChatHit>, bool)> {
-        Box::pin(CanonicalStore::hydrate_live_visible_chat_hits(
-            self, ctx, candidates, limit,
+        Box::pin(CanonicalStore::prepare_search_chat_hits(
+            self, authority, ctx, candidates, limit,
         ))
     }
 }
