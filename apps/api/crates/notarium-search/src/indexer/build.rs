@@ -138,6 +138,7 @@ pub(super) async fn seed_lexical(
                 epoch: None,
                 embedder: None,
                 dirty_notes: BTreeSet::new(),
+                repairs: super::RepairTurns::default(),
                 cached_vectors: HashMap::new(),
                 sweep: super::FullSweep::Idle,
                 last_activity: now,

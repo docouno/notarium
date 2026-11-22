@@ -881,6 +881,146 @@ fn collectors_prune_lookups_on_broad_queries_and_browse_and_propagate_not_ready(
 }
 
 #[test]
+fn browse_prunes_across_overlapping_segments_at_the_production_candidate_limit() {
+    const TOP_K: usize = 20;
+    let limit = crate::vector::search_candidate_limit(TOP_K);
+    assert_eq!(limit, 100);
+    // Every segment starts below the final cutoff. Only the first segment
+    // also holds a substantial range of small IDs. Some are invisible.
+    let groups: Vec<Vec<_>> = (0..5)
+        .map(|group| {
+            let start = if group == 0 { 5 } else { group * 200 };
+            std::iter::once(group + 1)
+                .chain(start + 1..=start + 150)
+                .collect()
+        })
+        .collect();
+    let visible: BTreeSet<_> = groups
+        .iter()
+        .flatten()
+        .copied()
+        .filter(|id| id % 7 != 0)
+        .map(ordinal_note_id)
+        .collect();
+    let snapshot = Snapshot::new(visible.iter().cloned());
+    let scratch = TestDir::new();
+    let index = LexicalIndex::create(&scratch.0).unwrap();
+    let pool = WriterPool::default();
+    pool.with_writer(index.path(), &index.index, false, |writer| {
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+        Ok(())
+    })
+    .unwrap();
+    let folder = FolderDictionary::default()
+        .insert(FolderId::from_bytes([1; 16]))
+        .unwrap();
+    for group in groups.iter().rev() {
+        let documents: Vec<_> = group
+            .iter()
+            .map(|&id| note_with_class("note", id, DocClass::UserDoc, &snapshot.cut.scope))
+            .collect();
+        let updates: Vec<_> = documents
+            .iter()
+            .map(|content| Update::Note {
+                content,
+                title: "",
+                folder,
+            })
+            .collect();
+        index.apply(&pool, &updates).unwrap();
+    }
+    assert_eq!(index.searcher().segment_readers().len(), 5);
+    let excluded = BTreeSet::from([ordinal_note_id(2)]);
+    let filter =
+        LexicalFilter::new(&snapshot, None, None, [DocClass::UserDoc], false).excluding(&excluded);
+    let hits = index.search("", &filter, limit, TOP_K, true).unwrap();
+    let expected: Vec<_> = visible
+        .difference(&excluded)
+        .take(limit)
+        .cloned()
+        .map(HitKey::Note)
+        .collect();
+    assert_eq!(
+        hits.into_iter().map(|hit| hit.key).collect::<Vec<_>>(),
+        expected
+    );
+    let probes = snapshot.lookups.load(Ordering::Relaxed);
+    assert!(
+        probes <= (TOP_K * 16).max(256),
+        "browse needed {probes} lookups"
+    );
+}
+
+#[test]
+fn scored_ties_prune_by_note_ordinal_across_segments_before_decoding() {
+    const SEGMENTS: u32 = 4;
+    const PER_SEGMENT: u32 = 256;
+    let limit = 20;
+    let visible: BTreeSet<_> = (0..SEGMENTS * PER_SEGMENT)
+        .filter(|id| id % 11 != 0)
+        .map(ordinal_note_id)
+        .collect();
+    let excluded = BTreeSet::from([ordinal_note_id(1)]);
+    let snapshot = Snapshot::new(visible.iter().cloned());
+    let scratch = TestDir::new();
+    let index = LexicalIndex::create(&scratch.0).unwrap();
+    let pool = WriterPool::default();
+    pool.with_writer(index.path(), &index.index, false, |writer| {
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+        Ok(())
+    })
+    .unwrap();
+    let folder = FolderDictionary::default()
+        .insert(FolderId::from_bytes([1; 16]))
+        .unwrap();
+    // Interleave IDs across segments. Whichever order the readers use, the
+    // winning IDs span all four dictionaries and their floors change.
+    for segment in 0..SEGMENTS {
+        let docs: Vec<_> = (0..PER_SEGMENT)
+            .map(|doc| {
+                note_with_class(
+                    "package",
+                    doc * SEGMENTS + segment,
+                    DocClass::UserDoc,
+                    &snapshot.cut.scope,
+                )
+            })
+            .collect();
+        let updates: Vec<_> = docs
+            .iter()
+            .map(|content| Update::Note {
+                content,
+                title: "",
+                folder,
+            })
+            .collect();
+        index.apply(&pool, &updates).unwrap();
+    }
+    assert_eq!(index.searcher().segment_readers().len(), SEGMENTS as usize);
+    let filter =
+        LexicalFilter::new(&snapshot, None, None, [DocClass::UserDoc], false).excluding(&excluded);
+    collector::SCORED_NOTE_DECODES.set(0);
+    let hits = index.search("package", &filter, limit, 10, false).unwrap();
+    let expected: Vec<_> = visible
+        .difference(&excluded)
+        .take(limit)
+        .cloned()
+        .map(HitKey::Note)
+        .collect();
+    assert_eq!(
+        hits.into_iter().map(|hit| hit.key).collect::<Vec<_>>(),
+        expected
+    );
+    // Each sorted segment needs at most its first 20 visible candidates
+    // plus skipped IDs. Losing ties must never decode the rest of the segment.
+    let decoded = collector::SCORED_NOTE_DECODES.get();
+    assert!(
+        decoded <= SEGMENTS as usize * (limit + 4),
+        "decoded {decoded} tied note IDs"
+    );
+}
+
+#[test]
 fn agent_memory_matches_user_doc_bm25_scores_at_1000_to_10_ratio() {
     let scratch = TestDir::new();
     let scope = HistoryScope {

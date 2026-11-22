@@ -198,6 +198,8 @@ pub(super) struct ModelProvider {
     pub(super) parts: AtomicUsize,
     pub(super) outside_parts: AtomicUsize,
     pub(super) fail_indexing: AtomicBool,
+    token_limit: AtomicU32,
+    rate_limited: AtomicUsize,
     pub(super) block_next_part: AtomicBool,
     pub(super) part_started: Notify,
     pub(super) release_part: Notify,
@@ -261,6 +263,15 @@ impl EmbeddingProviderPort for ModelProvider {
                     self.outside_parts
                         .fetch_add(request.inputs.len(), Ordering::SeqCst);
                 }
+                let limit = self.token_limit.load(Ordering::SeqCst);
+                if limit != 0 && request.declared_tokens > limit {
+                    self.rate_limited.fetch_add(1, Ordering::SeqCst);
+                    return Err(DomainError::RateLimited {
+                        budget: notarium_core::error::BudgetKind::Tokens,
+                        retry_after_ms: 1000,
+                    }
+                    .into());
+                }
                 if self.fail_indexing.load(Ordering::SeqCst) {
                     return Err(DomainError::AccessDenied.into());
                 }
@@ -278,6 +289,120 @@ impl EmbeddingProviderPort for ModelProvider {
             })
         })
     }
+}
+
+pub async fn rate_limited_repair(store: Arc<CanonicalStore>, root: DataRoot) {
+    use crate::storage::{
+        sample_folder_id, sample_incarnation, sample_note_id, sample_principal_id, sample_space_id,
+    };
+    let tag = 0x7b;
+    let owner = sample_principal_id(tag);
+    let folder = sample_folder_id(tag);
+    let lease = LeaseEpoch::new(1).unwrap();
+    let space = store
+        .create_space(CreateSpaceSpec {
+            space_id: sample_space_id(tag),
+            incarnation: sample_incarnation(tag),
+            root_folder_id: folder.clone(),
+            slug: "budget-repair".into(),
+            kind: SpaceKind::Personal,
+            owner: owner.clone(),
+            active_epoch: lease,
+            initial_last_seq: SpaceSeq::ZERO,
+            created_at: None,
+        })
+        .await
+        .unwrap();
+    // The last note is on the second repair page, outside the failing prefix.
+    let notes: Vec<_> = (1..=17).map(sample_note_id).collect();
+    let tail = notes.last().unwrap().clone();
+    let long = "substantial ".repeat(65);
+    let (seeded, _) = store
+        .commit_synthetic_note_batch_for_test(
+            &space.scope,
+            lease,
+            &owner,
+            notes
+                .iter()
+                .map(|id| {
+                    if *id == tail {
+                        note(id, &folder, "Short", "brief text")
+                    } else {
+                        note(id, &folder, "Long", &long)
+                    }
+                })
+                .collect(),
+        )
+        .await
+        .unwrap();
+    let mut view = View::new(space.scope.clone(), folder.clone());
+    for id in &notes {
+        view.index(id.clone(), folder.clone());
+    }
+    view.advance(seeded.last_seq);
+    let projection = Arc::new(Projection {
+        store: store.clone(),
+        snapshot: RwLock::new(view),
+        live: RwLock::new(notes.into_iter().collect()),
+    });
+    let provider = Arc::new(ModelProvider::default());
+    let resolver = Arc::new(SwitchingResolver::new(5, 512));
+    let start = || {
+        let mut deps = SearchDependencies::new(store.clone(), projection.clone());
+        deps.model_resolver = Some(resolver.clone());
+        deps.providers = Some(provider.clone());
+        let engine = SearchEngine::start(
+            SearchConfig::new(root.clone(), VectorMode::RemoteOnly),
+            deps,
+        );
+        engine.start_space(space.scope.clone()).unwrap();
+        engine
+    };
+    provider.token_limit.store(1, Ordering::SeqCst);
+    let engine = start();
+    let layout = SearchLayout::open(&root, space.scope.clone()).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if layout
+                .search_manifest()
+                .unwrap()
+                .is_some_and(|m| m.vector_seq == Some(seeded.last_seq) && m.embeddings_pending)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("seed must persist the incomplete epoch");
+    engine.shutdown().await;
+    let before = provider.rate_limited.load(Ordering::SeqCst);
+    provider.token_limit.store(100, Ordering::SeqCst);
+    let engine = start();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let result = engine
+                .search(context(&space.scope, &owner), query("semanticprobe"))
+                .await
+                .unwrap();
+            if result
+                .hits
+                .iter()
+                .any(|hit| hit.card.document.provenance().reference().note_id == tail)
+            {
+                assert!(matches!(
+                    result.degraded,
+                    Some(SearchDegradation::EmbeddingsPending)
+                ));
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the small tail note must reach semantic search despite the rate-limited prefix");
+    assert!(provider.rate_limited.load(Ordering::SeqCst) >= before + 16);
+    engine.shutdown().await;
 }
 
 pub async fn model_epochs_and_repair(store: Arc<CanonicalStore>, root: DataRoot) {

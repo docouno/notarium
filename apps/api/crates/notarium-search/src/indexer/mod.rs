@@ -342,6 +342,79 @@ impl FullSweep {
     }
 }
 
+/// Share repair slots between live edits and the bounded Space sweep. Retry
+/// deadlines apply to targeted work, so a failed carrier cannot hold a sweep
+/// page for unrelated notes behind its own exponential backoff.
+#[derive(Default)]
+struct RepairTurns {
+    dirty_after: Option<NoteId>,
+    dirty_retry_at: Option<Instant>,
+    dirty_delay: Duration,
+    prefer_sweep: bool,
+}
+
+impl RepairTurns {
+    fn next_batch(
+        &mut self,
+        dirty: &mut BTreeSet<NoteId>,
+        sweep: &FullSweep,
+        now: Instant,
+    ) -> Option<update::EmbedBatchMode> {
+        let dirty_ready = !dirty.is_empty() && self.dirty_retry_at.is_none_or(|at| now >= at);
+        if *sweep != FullSweep::Idle && (self.prefer_sweep || !dirty_ready) {
+            self.prefer_sweep = false;
+            return Some(update::EmbedBatchMode::FullSweep {
+                after: sweep.after(),
+            });
+        }
+        if !dirty_ready {
+            return None;
+        }
+        let mut after = self
+            .dirty_after
+            .as_ref()
+            .map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
+        if dirty
+            .range((after, std::ops::Bound::Unbounded))
+            .next()
+            .is_none()
+        {
+            after = std::ops::Bound::Unbounded;
+        }
+        let ids: Vec<_> = dirty
+            .range((after, std::ops::Bound::Unbounded))
+            .take(update::REPAIR_CARRIER_PAGE)
+            .cloned()
+            .collect();
+        for id in &ids {
+            dirty.remove(id);
+        }
+        self.prefer_sweep = true;
+        Some(update::EmbedBatchMode::DirtyNotes(ids))
+    }
+
+    fn completed(&mut self, sweep: bool, last: Option<NoteId>, failed: bool, now: Instant) {
+        if !sweep {
+            self.dirty_after = last;
+        }
+        if failed && (!sweep || self.dirty_retry_at.is_none()) {
+            self.dirty_delay =
+                (self.dirty_delay * 2).clamp(Duration::from_secs(1), Duration::from_secs(300));
+            self.dirty_retry_at = Some(now + self.dirty_delay);
+        } else if !sweep && !failed {
+            self.dirty_delay = Duration::ZERO;
+            self.dirty_retry_at = None;
+        }
+    }
+
+    fn next_at(&self, sweep: &FullSweep, at: Instant) -> Instant {
+        if *sweep == FullSweep::Idle {
+            return self.dirty_retry_at.map_or(at, |retry| at.max(retry));
+        }
+        at
+    }
+}
+
 struct Disk {
     layout: Arc<SearchLayout>,
     manifest: SearchManifest,
@@ -351,6 +424,7 @@ struct Disk {
     epoch: Option<VectorEpoch>,
     embedder: Option<Arc<crate::model::Embedder>>,
     dirty_notes: BTreeSet<NoteId>,
+    repairs: RepairTurns,
     cached_vectors: HashMap<ContentDigest, Arc<QuantizedVector>>,
     sweep: FullSweep,
     last_activity: Instant,
@@ -1074,8 +1148,14 @@ async fn run_active_loop(
             LoopEvent::Tick => {
                 let now = Instant::now();
                 if let Some(current) = &mut disk {
+                    // Healthy repair pauses briefly between pages. Its reader and
+                    // embedder must stay usable until the next page can start.
+                    let active_repair = !current.lexical_idle_retired
+                        && current.needs_embedding_work()
+                        && repair_delay < Duration::from_secs(30);
                     if cx.handle.active_queries.load(Ordering::Acquire) > 0
                         || cx.handle.has_align_waiters()
+                        || active_repair
                     {
                         current.last_activity = now;
                         current.embedder_last_use = now;
@@ -1099,11 +1179,7 @@ async fn run_active_loop(
                             {
                                 publisher.publish_if_live(current, false);
                             }
-                            let has_immediate_repair = current.epoch.is_some()
-                                && current.has_pending_embeddings()
-                                && repair_delay < Duration::from_secs(30);
-                            if !has_immediate_repair
-                                && cx.handle.idle_elapsed() >= schedule.worker_idle
+                            if cx.handle.idle_elapsed() >= schedule.worker_idle
                                 && try_evict_idle_worker(
                                     workers,
                                     &scope.space_id,
@@ -1311,6 +1387,7 @@ fn next_maintenance_wake(
         return None;
     }
     let disk = disk.filter(|d| !d.lexical_idle_retired)?;
+    let repair_at = disk.repairs.next_at(&disk.sweep, repair_at);
     let repair_wake_at = (disk.epoch.is_some() && disk.has_pending_embeddings())
         .then(|| {
             if disk.embedder.is_some() {
@@ -1340,6 +1417,7 @@ fn next_vector_open(
     repair_at: Instant,
     embedder_idle: Duration,
 ) -> Option<BgKind> {
+    let repair_at = disk.repairs.next_at(&disk.sweep, repair_at);
     if disk.lexical_idle_retired || now < embedder_retry_at {
         return None;
     }
@@ -1656,7 +1734,7 @@ fn spawn_bg_if_ready(
         return Ok(true);
     }
     // 6. Targeted dirty-note embedding batch or bounded full-sweep repair page.
-    if disk.needs_embedding_work() && now >= repair_at {
+    if disk.needs_embedding_work() && now >= disk.repairs.next_at(&disk.sweep, repair_at) {
         let Some(embedder) = disk.embedder.clone() else {
             return Ok(false);
         };
@@ -1665,21 +1743,11 @@ fn spawn_bg_if_ready(
         };
         disk.embedder_last_use = now;
         let cancel = Cancellation::default();
-        let mode = if !disk.dirty_notes.is_empty() {
-            let batch: Vec<NoteId> = disk
-                .dirty_notes
-                .iter()
-                .take(update::REPAIR_CARRIER_PAGE)
-                .cloned()
-                .collect();
-            for id in &batch {
-                disk.dirty_notes.remove(id);
-            }
-            update::EmbedBatchMode::DirtyNotes(batch)
-        } else {
-            update::EmbedBatchMode::FullSweep {
-                after: disk.sweep.after(),
-            }
+        let Some(mode) = disk
+            .repairs
+            .next_batch(&mut disk.dirty_notes, &disk.sweep, now)
+        else {
+            return Ok(false);
         };
         let input = update::EmbedBatchInput {
             layout: disk.layout.clone(),
@@ -1821,6 +1889,7 @@ async fn handle_bg_done(
                 current.embedder = None;
                 current.embedder_unavailable = false;
                 current.dirty_notes.clear();
+                current.repairs = RepairTurns::default();
                 current.cached_vectors.clear();
                 current.sweep = FullSweep::Idle;
                 current.publish_manifest().await?;
@@ -1894,6 +1963,7 @@ async fn handle_bg_done(
                     .map_err(|_| IndexError::Inconsistent)??;
                 }
                 current.dirty_notes.clear();
+                current.repairs = RepairTurns::default();
                 current.cached_vectors.clear();
                 current.dirty_notes.extend(dirty.notes);
                 current.dirty_notes.extend(failed_notes);
@@ -1958,7 +2028,8 @@ async fn handle_bg_done(
                 missing_folders,
                 next_sweep_after,
                 was_full_sweep,
-                had_transient_failure,
+                last_attempted,
+                failure,
             }) => {
                 current.embedder_last_use = Instant::now();
                 if !missing_folders.is_empty() {
@@ -2045,15 +2116,27 @@ async fn handle_bg_done(
                     current.publish_manifest().await?;
                     publisher.publish_if_live(current, false);
                 }
-                if had_transient_failure {
-                    *repair_at = Instant::now() + *repair_delay;
+                let now = Instant::now();
+                current.repairs.completed(
+                    was_full_sweep,
+                    last_attempted,
+                    matches!(failure, Some(update::RepairFailure::Note)),
+                    now,
+                );
+                if matches!(failure, Some(update::RepairFailure::Provider)) {
+                    *repair_at = now + *repair_delay;
                     *repair_delay = (*repair_delay * 2).min(Duration::from_secs(300));
                 } else if pending {
-                    *repair_delay = Duration::from_secs(1);
-                    *repair_at = Instant::now() + Duration::from_millis(25);
+                    *repair_at = now + Duration::from_millis(25);
+                    *repair_delay = current
+                        .repairs
+                        .next_at(&current.sweep, *repair_at)
+                        .saturating_duration_since(now)
+                        .max(Duration::from_secs(1));
                 } else {
+                    current.repairs = RepairTurns::default();
                     *repair_delay = Duration::from_secs(1);
-                    *repair_at = Instant::now();
+                    *repair_at = now;
                 }
             }
             Err(error) if error.requires_scrub() => {
@@ -2331,6 +2414,7 @@ async fn open_disk(
                         epoch: None,
                         embedder: None,
                         dirty_notes: BTreeSet::new(),
+                        repairs: RepairTurns::default(),
                         cached_vectors: HashMap::new(),
                         sweep: FullSweep::from_pending(full_sweep_needed),
                         last_activity: now,

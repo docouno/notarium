@@ -13,16 +13,22 @@ use notarium_core::{
 use std::{
     cmp::Ordering,
     collections::{BTreeSet, BinaryHeap},
+    ops::{Bound, RangeBounds},
     sync::Arc,
     time::Instant,
 };
 use tantivy::{
     DocAddress, DocId, DocSet, Score, Searcher, SegmentReader, TERMINATED,
-    columnar::{BytesColumn, Column},
+    columnar::{BytesColumn, Column, TermOrdHit},
     query::{Bm25StatisticsProvider, EnableScoring, Query},
 };
 
 const SELECTIVE_NOTE_MASK_LIMIT: u64 = 4_096;
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static SCORED_NOTE_DECODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 pub struct LexicalFilter<'a> {
     pub snapshot: &'a dyn StructuralSnapshot,
@@ -81,6 +87,7 @@ struct SegmentFilter {
     viewer_ord: Option<u64>,
     note_bytes: Vec<u8>,
     note_mask: Option<Bitmap>,
+    scored_note_floor: Option<(DocAddress, u64)>,
 }
 
 impl SegmentFilter {
@@ -146,6 +153,7 @@ impl SegmentFilter {
             viewer_ord,
             note_bytes: Vec::new(),
             note_mask,
+            scored_note_floor: None,
         })
     }
 
@@ -210,27 +218,38 @@ impl SegmentFilter {
                 {
                     return Ok(None);
                 }
-                // Within a segment the dictionary ordinal is the note ID sort
-                // order. Prune tied scores before decoding or checking visibility.
                 if !filter.include_chats
                     && let Some(worst) = tied_floor
-                    && worst.address.segment_ord == address.segment_ord
-                    && column
-                        .ords()
-                        .first(worst.address.doc_id)
-                        .is_some_and(|last| ord >= last)
                 {
-                    return Ok(None);
+                    // Equal scores use the note ID. Translate the heap floor into
+                    // this segment's dictionary only when the boundary changes.
+                    let cutoff = match self.scored_note_floor {
+                        Some((address, cutoff)) if address == worst.address => cutoff,
+                        _ => {
+                            let cutoff = if worst.address.segment_ord == address.segment_ord {
+                                column
+                                    .ords()
+                                    .first(worst.address.doc_id)
+                                    .ok_or(LexicalError::CorruptIndex)?
+                            } else {
+                                match column.dictionary().term_ord_or_next(&worst.note)? {
+                                    TermOrdHit::Exact(ord) | TermOrdHit::Next(ord) => ord,
+                                }
+                            };
+                            self.scored_note_floor = Some((worst.address, cutoff));
+                            cutoff
+                        }
+                    };
+                    if ord >= cutoff {
+                        return Ok(None);
+                    }
                 }
-                if (!filter.include_chats || self.note_mask.is_none())
-                    && !column.ord_to_bytes(ord, &mut self.note_bytes)?
-                {
-                    return Ok(None);
-                }
-                if !filter.include_chats
-                    && tied_floor.is_some_and(|worst| self.note_bytes >= worst.note)
-                {
-                    return Ok(None);
+                if !filter.include_chats || self.note_mask.is_none() {
+                    #[cfg(test)]
+                    SCORED_NOTE_DECODES.set(SCORED_NOTE_DECODES.get() + 1);
+                    if !column.ord_to_bytes(ord, &mut self.note_bytes)? {
+                        return Ok(None);
+                    }
                 }
                 if self.note_mask.is_none() && !filter.admits_note(&self.note_bytes)? {
                     return Ok(None);
@@ -353,20 +372,43 @@ pub(super) fn collect_browse(
     if limit == 0 || filter.classes == 0 {
         return Ok(Vec::new());
     }
-    let mut candidates: Vec<(Vec<u8>, DocAddress)> = Vec::new();
-    let mut scratch = Vec::new();
-    for (seg_ord, reader) in searcher.segment_readers().iter().enumerate() {
+    // The first dictionary term bounds every note, including when its own
+    // document is deleted or filtered. Segment order in the reader is arbitrary.
+    let mut segments = Vec::new();
+    for reader in searcher.segment_readers() {
         check_budget(filter.budget)?;
-        if reader.num_docs() == 0 {
-            continue;
+        if reader.num_docs() != 0
+            && let Some(notes) = reader.fast_fields().bytes("note_id_raw")?
+            && notes.num_terms() != 0
+        {
+            let mut first = Vec::new();
+            if !notes.ord_to_bytes(0, &mut first)? {
+                return Err(LexicalError::CorruptIndex);
+            }
+            segments.push((first, reader));
+        }
+    }
+    segments.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    let mut candidates: Vec<Vec<u8>> = Vec::new();
+    let mut scratch = Vec::new();
+    for (first, reader) in segments {
+        check_budget(filter.budget)?;
+        let worst = candidates.last().filter(|_| candidates.len() == limit);
+        if worst.is_some_and(|worst| &first >= worst) {
+            break;
         }
         let fields = SegmentFilter::open(reader, filter)?;
-        let Some(notes) = fields.notes.as_ref() else {
-            continue;
-        };
+        let notes = fields.notes.as_ref().ok_or(LexicalError::CorruptIndex)?;
         let ords = notes.ords();
-        // Term ordinals are strictly ordered by `note_id_raw` within each segment.
-        let mut segment_best = BinaryHeap::<(u64, DocId)>::with_capacity(limit);
+        // Translate the global cutoff once. The local heap can narrow it
+        // further using ordinals without decoding IDs or probing the snapshot.
+        let ord_range = match worst {
+            Some(worst) => notes
+                .dictionary()
+                .term_bounds_to_ord(Bound::Unbounded, Bound::Excluded(worst.as_slice()))?,
+            None => (Bound::Unbounded, Bound::Unbounded),
+        };
+        let mut segment_best = BinaryHeap::<u64>::with_capacity(limit);
         for doc in 0..reader.max_doc() {
             if doc.is_multiple_of(64) {
                 check_budget(filter.budget)?;
@@ -377,10 +419,9 @@ pub(super) fn collect_browse(
             let Some(ord) = ords.first(doc) else {
                 continue;
             };
-            if segment_best.len() == limit
-                && segment_best
-                    .peek()
-                    .is_some_and(|&(worst_ord, _)| ord >= worst_ord)
+            if !ord_range.contains(&ord)
+                || (segment_best.len() == limit
+                    && segment_best.peek().is_some_and(|worst| ord >= *worst))
             {
                 continue;
             }
@@ -393,28 +434,25 @@ pub(super) fn collect_browse(
                 continue;
             }
             if segment_best.len() < limit {
-                segment_best.push((ord, doc));
+                segment_best.push(ord);
             } else if let Some(mut worst) = segment_best.peek_mut() {
-                *worst = (ord, doc);
+                *worst = ord;
             }
         }
-        let winners = segment_best.into_sorted_vec();
-        candidates.reserve(winners.len());
-        for (ord, doc) in winners {
+        for ord in segment_best {
             let mut bytes = Vec::new();
             if !notes.ord_to_bytes(ord, &mut bytes)? {
                 return Err(LexicalError::CorruptIndex);
             }
-            candidates.push((bytes, DocAddress::new(seg_ord as u32, doc)));
+            candidates.push(bytes);
         }
+        candidates.sort_unstable();
+        candidates.truncate(limit);
     }
     check_budget(filter.budget)?;
     candidates
-        .sort_unstable_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
-    candidates.truncate(limit);
-    candidates
         .into_iter()
-        .map(|(bytes, _)| {
+        .map(|bytes| {
             let raw = std::str::from_utf8(&bytes).map_err(|_| LexicalError::CorruptIndex)?;
             let note = NoteId::parse(raw).map_err(|_| LexicalError::CorruptIndex)?;
             Ok(LexicalHit {

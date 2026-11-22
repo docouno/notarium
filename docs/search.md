@@ -86,7 +86,10 @@ Idle Spaces drop their lexical reader and unpublish their in-memory snapshot
 after 30 seconds without activity (`LEXICAL_IDLE`), release cached embedder
 handles after 60 seconds without vector activity (`EMBEDDER_IDLE`) while
 retaining lightweight mmap vector epochs, and evict idle Space workers after
-300 seconds (`WORKER_IDLE`). Archived Spaces scrub their derived data
+300 seconds (`WORKER_IDLE`). A progressing embedding repair keeps its reader,
+embedder and worker active between pages. Idle eviction resumes after repair
+finishes, during prolonged retry backoff or when the embedder is unavailable.
+Archived Spaces scrub their derived data
 immediately and evict their worker after 30 seconds (`ARCHIVED_IDLE`). Disk
 indexing shares the bounded four-writer pool, while exact receipt overlays run
 in ephemeral in-memory writers outside that pool.
@@ -202,6 +205,9 @@ lookup. When this deadline expires, the query returns lexical results with
 `BudgetExceeded`.
 The same deadline bounds waits for projection access during traversal.
 The durable pending state schedules bounded repair when embeddings are missing.
+Ready targeted batches alternate with full-sweep pages. Targeted repair resumes
+after the last attempted note ID and wraps at the end. A note-specific rate
+limit backs off targeted retries while the sweep can advance to other notes.
 Each page can finish while unrelated edits arrive. If a note changes during
 its embedding call, the worker discards that result and retries the new text.
 
@@ -232,9 +238,11 @@ make benchmark-search > .artifacts/search-scale/report.json
 
 The release gate writes 100,000 canonical fixture notes and builds 400,000
 384-dimensional chunks under the writable Cargo target. It measures BM25 at
-the production candidate limit, broad and blank browse query lookup counts,
-hybrid retrieval and fusion, selective SIMD scans, warm vector epoch reopen,
-and non-blocking compaction. The selective timing includes constructing the
+the production candidate limit and reports a separate BM25 latency distribution
+for a term matching the whole corpus. Both BM25 p95 values must be below 40 ms.
+The broad query and blank browse also report their projection lookup counts.
+The gate measures hybrid retrieval and fusion, selective SIMD scans, warm
+vector epoch reopen, and non-blocking compaction. The selective timing includes constructing the
 folder and dense membership bitmaps on the fixture snapshot and querying with
 the same projection checks and candidate limit as the search engine. The
 report includes separate mask preparation and kernel times. Independent RRF over exact quantized search and

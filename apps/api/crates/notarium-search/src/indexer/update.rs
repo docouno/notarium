@@ -348,6 +348,12 @@ pub(super) struct EmbeddedNoteRow {
     pub chunks: EmbeddedChunks,
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum RepairFailure {
+    Note,
+    Provider,
+}
+
 pub(super) enum EmbedBatchOutcome {
     ModelChanged {
         requeue: Vec<NoteId>,
@@ -361,7 +367,8 @@ pub(super) enum EmbedBatchOutcome {
         missing_folders: BTreeSet<FolderId>,
         next_sweep_after: Option<NoteId>,
         was_full_sweep: bool,
-        had_transient_failure: bool,
+        last_attempted: Option<NoteId>,
+        failure: Option<RepairFailure>,
     },
 }
 
@@ -453,7 +460,7 @@ pub(super) async fn run_embed_batch(
     let mut missing_folders = BTreeSet::new();
     let mut page_keys = HashMap::<ContentDigest, (usize, usize)>::new();
     let mut buffered_rows = 0;
-    let mut had_transient_failure = false;
+    let mut failure = None;
     let mut last_processed = None;
     let mut remaining = items.into_iter();
     while let Some((note_id, carrier)) = remaining.next() {
@@ -510,7 +517,7 @@ pub(super) async fn run_embed_batch(
                         // The canonical cursor and the dirty queue describe only the
                         // consumed prefix. This note starts the next batch.
                         if was_full_sweep {
-                            next_sweep_after = last_processed;
+                            next_sweep_after = last_processed.clone();
                         } else {
                             requeue.push(note_id);
                             requeue.extend(remaining.map(|(id, _)| id));
@@ -542,7 +549,7 @@ pub(super) async fn run_embed_batch(
             match outcome {
                 NoteIndexOutcome::Complete | NoteIndexOutcome::Denied => {}
                 NoteIndexOutcome::Pending => {
-                    had_transient_failure = true;
+                    failure = Some(RepairFailure::Note);
                     requeue.push(note_id.clone());
                     if chunks.is_none() {
                         last_processed = Some(note_id);
@@ -555,7 +562,8 @@ pub(super) async fn run_embed_batch(
                     });
                 }
                 NoteIndexOutcome::Fatal(_) => {
-                    had_transient_failure = true;
+                    failure = Some(RepairFailure::Provider);
+                    last_processed = Some(note_id.clone());
                     requeue.push(note_id);
                     requeue.extend(remaining.map(|(id, _)| id));
                     break;
@@ -583,6 +591,7 @@ pub(super) async fn run_embed_batch(
             ancestor_folders,
             chunks,
         });
+        last_processed = Some(note_id.clone());
         if buffered_rows == build::VECTOR_WINDOW_ROWS && !remaining.as_slice().is_empty() {
             if was_full_sweep {
                 next_sweep_after = Some(note_id);
@@ -591,7 +600,6 @@ pub(super) async fn run_embed_batch(
             }
             break;
         }
-        last_processed = Some(note_id);
     }
 
     match services
@@ -617,7 +625,8 @@ pub(super) async fn run_embed_batch(
         missing_folders,
         next_sweep_after,
         was_full_sweep,
-        had_transient_failure,
+        last_attempted: last_processed,
+        failure,
     })
 }
 

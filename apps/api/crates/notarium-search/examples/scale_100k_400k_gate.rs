@@ -97,6 +97,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .and_then(|mem| mem.rss_anon_kib)
         .is_none_or(|kib| kib <= REOPEN_ANON_RSS_LIMIT_KIB);
     let ok = metrics.lexical.p95() < 40.0
+        && metrics.broad_lexical_latency.p95() < 40.0
         && metrics.hybrid.p95() < 95.0
         && metrics.selective.p95() < 1.5
         && metrics.hybrid_recall >= 0.95
@@ -143,6 +144,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "vector_note_candidates": CANDIDATES,
         "selective_chunks": selective_slots,
         "broad_lexical_ms": metrics.broad_lexical_ms,
+        "broad_lexical_latency_ms": metrics.broad_lexical_latency.report(),
         "broad_lexical_lookups": metrics.broad_lexical_lookups,
         "browse_ms": metrics.browse_ms,
         "browse_lookups": metrics.browse_lookups,
@@ -677,10 +679,27 @@ async fn run_samples(
 
     fixture.projection.reset_lookups();
     let started = Instant::now();
-    let browse_hits = index.search("", &filter, TOP_K, TOP_K, true)?;
+    let browse_hits = index.search("", &filter, CANDIDATES, TOP_K, true)?;
     metrics.browse_ms = started.elapsed().as_secs_f64() * 1_000.0;
     metrics.browse_lookups = fixture.projection.lookups();
-    assert_eq!(browse_hits.len(), TOP_K);
+    assert_eq!(browse_hits.len(), CANDIDATES);
+    assert!(
+        browse_hits
+            .iter()
+            .zip(view.notes.iter())
+            .all(|(hit, expected)| matches!(&hit.key, HitKey::Note(actual) if actual == expected))
+    );
+
+    for _ in 0..samples {
+        let started = Instant::now();
+        let hits = index.search("package", &filter, CANDIDATES, TOP_K, false)?;
+        metrics.broad_lexical_latency.push(started.elapsed());
+        assert!(
+            hits.iter()
+                .map(|hit| &hit.key)
+                .eq(broad_hits.iter().map(|hit| &hit.key))
+        );
+    }
 
     Ok(metrics)
 }
@@ -752,6 +771,7 @@ struct Metrics {
     selective_recall: f64,
     quantization_recall: f64,
     broad_lexical_ms: f64,
+    broad_lexical_latency: Latency,
     broad_lexical_lookups: usize,
     browse_ms: f64,
     browse_lookups: usize,

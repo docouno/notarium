@@ -918,6 +918,20 @@ async fn model_epochs_and_repair_while_writes_continue() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rate_limited_prefix_yields_to_the_sweep_tail() {
+    let _guard = INTEGRATION_LOCK.lock().await;
+    let data = TempDataRoot::new("search-budget-repair");
+    let (store, runtime) = CanonicalRuntime::open(CanonicalConfig::local_default(
+        sample_installation_id(0x7b),
+        data.data_root(),
+    ))
+    .await
+    .unwrap();
+    hybrid_support::remote::rate_limited_repair(Arc::new(store), data.data_root()).await;
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lifecycle_overlay_and_resilience_regressions() {
     let _guard = INTEGRATION_LOCK.lock().await;
     let data = TempDataRoot::new("search-regressions");

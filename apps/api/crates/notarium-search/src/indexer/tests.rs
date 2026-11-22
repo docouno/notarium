@@ -14,6 +14,52 @@ use notarium_core::{
 };
 
 #[test]
+fn dirty_repair_rotates_past_rate_limited_notes_without_delaying_the_sweep() {
+    use update::EmbedBatchMode;
+    let now = Instant::now();
+    let mut repairs = RepairTurns::default();
+    let note = |id| NoteId::from_bytes([id; 16]);
+    let mut dirty: BTreeSet<_> = (1..=17).map(note).collect();
+    let Some(EmbedBatchMode::DirtyNotes(prefix)) =
+        repairs.next_batch(&mut dirty, &FullSweep::Requested, now)
+    else {
+        panic!("expected dirty repair")
+    };
+    assert_eq!(prefix.len(), 16);
+    repairs.completed(false, prefix.last().cloned(), true, now);
+    dirty.extend(prefix);
+    assert!(matches!(
+        repairs.next_batch(&mut dirty, &FullSweep::Requested, now),
+        Some(EmbedBatchMode::FullSweep { .. })
+    ));
+    assert!(
+        repairs
+            .next_batch(&mut dirty, &FullSweep::Idle, now)
+            .is_none()
+    );
+    let retry = repairs.next_at(&FullSweep::Idle, now);
+    assert_eq!(retry, now + Duration::from_secs(1));
+    let Some(EmbedBatchMode::DirtyNotes(tail)) =
+        repairs.next_batch(&mut dirty, &FullSweep::Requested, retry)
+    else {
+        panic!("expected ready tail")
+    };
+    assert_eq!(tail, [note(17)]);
+    repairs.completed(false, Some(note(17)), false, retry);
+    assert!(matches!(
+        repairs.next_batch(&mut dirty, &FullSweep::Requested, retry),
+        Some(EmbedBatchMode::FullSweep { .. })
+    ));
+    let Some(EmbedBatchMode::DirtyNotes(wrapped)) =
+        repairs.next_batch(&mut dirty, &FullSweep::Idle, retry)
+    else {
+        panic!("expected retry after one round")
+    };
+    assert_eq!(wrapped.len(), 16);
+    assert_eq!(wrapped[0], note(1));
+}
+
+#[test]
 fn transient_open_failures_preserve_the_checkpoint() {
     use std::io::{Error, ErrorKind};
     let denied = || Error::from(ErrorKind::PermissionDenied);
@@ -125,6 +171,7 @@ async fn idle_space_releases_embedder_and_reopens_checkpointed_wal_after_evictio
         epoch: Some(epoch),
         embedder: None,
         dirty_notes: BTreeSet::new(),
+        repairs: RepairTurns::default(),
         cached_vectors: HashMap::new(),
         sweep: FullSweep::Idle,
         last_activity: idle_since,
@@ -973,6 +1020,7 @@ fn scheduled_reopen_signals_until_retry_backoff() {
         epoch: None,
         embedder: None,
         dirty_notes: BTreeSet::new(),
+        repairs: RepairTurns::default(),
         cached_vectors: HashMap::new(),
         sweep: FullSweep::Idle,
         last_activity: now,
@@ -1001,6 +1049,125 @@ fn scheduled_reopen_signals_until_retry_backoff() {
     publisher.replace(None);
     drop(handle);
     drop(disk);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[tokio::test]
+async fn quiet_worker_finishes_a_paged_sweep_before_idle_eviction() {
+    use crate::{SearchDependencies, SearchEngine, config::SearchConfig};
+    use notarium_canonical::{
+        CanonicalConfig, CanonicalRuntime, CreateSpaceSpec, changes::SyntheticNoteSpec,
+    };
+    use notarium_core::{
+        auth::SpaceKind,
+        ids::{InstallationId, LeaseEpoch, PrincipalId},
+        model::Lifecycle,
+    };
+
+    let mut entropy = [0; 16];
+    getrandom::fill(&mut entropy).unwrap();
+    let path = std::env::temp_dir().join(format!("search-sweep-idle-{}", hex::encode(entropy)));
+    std::fs::create_dir(&path).unwrap();
+    let root = DataRoot::new(&path);
+    let (store, runtime) = CanonicalRuntime::open(CanonicalConfig::local_default(
+        InstallationId::from_bytes([1; 16]),
+        root.clone(),
+    ))
+    .await
+    .unwrap();
+    let store = Arc::new(store);
+    let owner = PrincipalId::from_bytes([2; 16]);
+    let lease = LeaseEpoch::new(1).unwrap();
+    let space = store
+        .create_space(CreateSpaceSpec {
+            space_id: SpaceId::from_bytes([3; 16]),
+            incarnation: HistoryIncarnation::from_bytes([4; 16]),
+            root_folder_id: FolderId::from_bytes([5; 16]),
+            slug: "sweep-idle".into(),
+            kind: SpaceKind::Personal,
+            owner: owner.clone(),
+            active_epoch: lease,
+            initial_last_seq: SpaceSeq::ZERO,
+            created_at: None,
+        })
+        .await
+        .unwrap();
+    let last = u8::try_from(update::REPAIR_CARRIER_PAGE * 2 + 1).unwrap();
+    let notes = (1..=last)
+        .map(|i| SyntheticNoteSpec {
+            note_id: NoteId::from_bytes([i; 16]),
+            parent_folder: None,
+            slug: format!("note-{i}"),
+            title: format!("Note {i}"),
+            doc_class: DocClass::UserDoc,
+            lifecycle: Lifecycle::Active,
+            carrier: format!("Content of note {i}"),
+            fields: Default::default(),
+        })
+        .collect();
+    let (command, _) = store
+        .commit_synthetic_note_batch_for_test(&space.scope, lease, &owner, notes)
+        .await
+        .unwrap();
+    let layout = Arc::new(SearchLayout::open(&root, space.scope.clone()).unwrap());
+    let engine = SearchEngine::start_with_schedule(
+        SearchConfig::new(root, VectorMode::DeterministicTest { dimension: 64 }),
+        SearchDependencies::new(store, Arc::new(UnusedStructural)),
+        Schedule {
+            tick: Duration::from_millis(1),
+            // All three idle thresholds expire inside the normal inter-page pause.
+            lexical_idle: Duration::from_millis(5),
+            embedder_idle: Duration::from_millis(5),
+            worker_idle: Duration::from_millis(10),
+            ..Schedule::default()
+        },
+    );
+
+    // A valid warm checkpoint with clean lexical postings and outstanding vector work.
+    let setup_handle = Arc::new(SpaceHandle::new());
+    let cx = Context {
+        services: &engine.services,
+        handle: &setup_handle,
+    };
+    let cut = ChangeCursor {
+        scope: space.scope.clone(),
+        after: command.last_seq,
+    };
+    let (mut disk, lexical) = build::seed_lexical(&cx, layout.clone(), &cut)
+        .await
+        .unwrap();
+    let target = engine
+        .services
+        .model_target(&space.scope, None, &cx.budget())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut epoch = VectorEpoch::open_model(layout.clone(), target.vector_model()).unwrap();
+    epoch
+        .seed(SegmentBuilder::new(&target.model, 64).unwrap(), cut.after)
+        .unwrap();
+    disk.manifest.active_model = Some(target);
+    disk.manifest.vector_seq = Some(cut.after);
+    disk.manifest.embeddings_pending = true;
+    disk.publish_manifest().await.unwrap();
+    drop((epoch, disk, lexical, setup_handle));
+
+    let handle = engine.space(space.scope).unwrap();
+    let mut epochs = handle.epoch.subscribe();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        epochs.wait_for(|_| engine.worker_count() == 0),
+    )
+    .await
+    .expect("a quiet worker must finish its sweep and evict itself")
+    .unwrap();
+    engine.shutdown().await;
+    let saved = layout.search_manifest().unwrap().unwrap();
+    assert!(!saved.embeddings_pending);
+    let epoch = open_vector_epoch(layout, &saved).unwrap();
+    assert!(!epoch.matches_note_chunks(&NoteId::from_bytes([last; 16]), &[]));
+    drop(epoch);
+    runtime.shutdown().await.unwrap();
     std::fs::remove_dir_all(path).unwrap();
 }
 
@@ -1077,6 +1244,7 @@ async fn full_sweep_completion_preserves_resweep_when_remote_folders_changed() {
         epoch: Some(epoch),
         embedder: None,
         dirty_notes: BTreeSet::new(),
+        repairs: RepairTurns::default(),
         cached_vectors: HashMap::new(),
         sweep: FullSweep::Scanning {
             after: NoteId::from_bytes([1; 16]),
@@ -1107,7 +1275,8 @@ async fn full_sweep_completion_preserves_resweep_when_remote_folders_changed() {
             missing_folders: BTreeSet::new(),
             next_sweep_after: after.map(|id| NoteId::from_bytes([id; 16])),
             was_full_sweep: true,
-            had_transient_failure: false,
+            last_attempted: None,
+            failure: None,
         }))
     };
     let scanning = |id, repeat| FullSweep::Scanning {
@@ -1941,6 +2110,7 @@ async fn failed_embedder_load_respects_retry_backoff_without_busy_spin() {
         epoch: Some(epoch),
         embedder: None,
         dirty_notes: BTreeSet::from([NoteId::from_bytes([0xf6; 16])]),
+        repairs: RepairTurns::default(),
         cached_vectors: HashMap::new(),
         sweep: FullSweep::Requested,
         last_activity: now,
@@ -2004,13 +2174,14 @@ async fn failed_embedder_load_respects_retry_backoff_without_busy_spin() {
         deps,
         Schedule {
             tick: Duration::from_millis(200),
-            lexical_idle: Duration::from_secs(30),
+            lexical_idle: Duration::from_millis(300),
             embedder_idle: Duration::from_secs(60),
-            worker_idle: Duration::from_secs(300),
+            worker_idle: Duration::from_millis(600),
             archived_idle: Duration::from_secs(30),
         },
     );
-    let handle = engine.space(scope).unwrap();
+    let pinned = engine.pin_space(scope).unwrap();
+    let handle = &pinned.handle;
     let mut epochs = handle.epoch.subscribe();
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -2035,6 +2206,14 @@ async fn failed_embedder_load_respects_retry_backoff_without_busy_spin() {
     assert!(after.embedder_unavailable);
     assert!(after.embedder.is_none());
     drop(after);
+    drop(pinned);
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        epochs.wait_for(|_| engine.worker_count() == 0),
+    )
+    .await
+    .expect("an unavailable embedder must allow idle worker eviction")
+    .unwrap();
 
     engine.shutdown().await;
     runtime.shutdown().await.unwrap();
@@ -2113,6 +2292,7 @@ async fn folder_moves_preserve_the_current_full_sweep_cursor() {
         epoch: None,
         embedder: None,
         dirty_notes: BTreeSet::new(),
+        repairs: RepairTurns::default(),
         cached_vectors: HashMap::new(),
         sweep: FullSweep::Scanning {
             after: NoteId::from_bytes([0x50; 16]),
@@ -2676,6 +2856,7 @@ async fn reconcile_reopening_clears_stale_flag_when_non_reopening_bg_task_spawns
         epoch: Some(epoch),
         embedder: None,
         dirty_notes: BTreeSet::new(),
+        repairs: RepairTurns::default(),
         cached_vectors: HashMap::new(),
         sweep: FullSweep::Idle,
         last_activity: now,
@@ -2773,6 +2954,7 @@ fn disabled_vector_mode_never_schedules_maintenance_wake_on_pending_manifest() {
         epoch: None,
         embedder: None,
         dirty_notes: BTreeSet::from([NoteId::from_bytes([0xf4; 16])]),
+        repairs: RepairTurns::default(),
         cached_vectors: HashMap::new(),
         sweep: FullSweep::Requested,
         last_activity: now,
@@ -2966,6 +3148,7 @@ async fn space_handle_idle_eviction_respects_pins_extra_refs_and_replace_if_live
         epoch: None,
         embedder: None,
         dirty_notes: BTreeSet::new(),
+        repairs: RepairTurns::default(),
         cached_vectors: HashMap::new(),
         sweep: FullSweep::Idle,
         last_activity: now,
