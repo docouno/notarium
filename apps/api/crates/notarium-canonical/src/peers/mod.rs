@@ -2834,6 +2834,18 @@ async fn open_collab_session_impl(
 
                 let existing =
                     load_collab_session_opt_tx(tx, &srec.scope.space_id, &spec_cl.note).await?;
+                let is_fenced_recovery = spec_cl.allow_fenced_recovery
+                    && matches!(
+                        existing,
+                        Some(ref cur) if cur.room_state == CollabRoomState::Fenced
+                    );
+                crate::domain::common::load_folder_ancestry_tx(
+                    tx,
+                    &srec.scope.space_id,
+                    &head.parent_folder_id,
+                    !is_fenced_recovery,
+                )
+                .await?;
                 let (base_lease, lineage, preserved_snapshot, preserved_digest, coverage, dirty) = match existing {
                     None => {
                         if let Some(exp_le) = spec_cl.expected_lease

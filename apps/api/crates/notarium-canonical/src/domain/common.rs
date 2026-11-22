@@ -9,8 +9,8 @@ use notarium_core::{
     classes::DocClass,
     error::{PortError, ValidationReason},
     ids::{
-        AbilityId, AgentRunId, ContentDigest, FolderId, LeaseEpoch, LineageEpoch, NoteId,
-        PrincipalId, RevisionId, SpaceId, SpaceSeq,
+        AbilityId, AgentRunId, ContentDigest, FolderId, HistoryIncarnation, LeaseEpoch,
+        LineageEpoch, NoteId, PrincipalId, RevisionId, SpaceId, SpaceSeq,
     },
     model::{FolderRef, HistoryScope, Lifecycle},
     ports::{
@@ -179,6 +179,11 @@ struct RoomFenceMapState {
     /// reservations minted for notes not yet in `entries`; allows deferring
     /// eviction while an untracked reservation is briefly in flight.
     untracked_pin: Arc<u64>,
+    /// Monotonic generation for Space-level takeover / restore / removal
+    /// transitions so stale post-commit takeover loops cannot overwrite a
+    /// newer lease takeover or restored Space incarnation.
+    space_sync_gen: u64,
+    space_sync: HashMap<SpaceId, (u64, HistoryIncarnation, LeaseEpoch)>,
 }
 
 impl Default for RoomFenceMapState {
@@ -188,6 +193,8 @@ impl Default for RoomFenceMapState {
             touch_seq: 0,
             eviction_gen: 0,
             untracked_pin: Arc::new(0),
+            space_sync_gen: 0,
+            space_sync: HashMap::new(),
         }
     }
 }
@@ -405,52 +412,106 @@ impl RoomFenceTable {
         guard.is_active().then(|| guard.epoch())
     }
 
-    /// Returns all notes currently tracked in local `RoomFenceTable` or recovery
-    /// state for `space_id`, and advances `eviction_gen` so pre-takeover
-    /// untracked `ClosedRoomReservation`s cannot match post-takeover slots.
-    pub(crate) fn begin_space_takeover_sync(&self, space_id: &SpaceId) -> Vec<NoteId> {
+    /// Captures all local `RoomFenceState` locks to synchronize for `scope`
+    /// after a PostgreSQL writer-lease takeover at `new_epoch`, while the
+    /// caller still holds the writer commit read guard (excluding concurrent
+    /// Space restores) and WITHOUT holding any SQL connection or locking any
+    /// per-note `Mutex<RoomFenceState>`.
+    ///
+    /// Returns `None` if a newer or equal takeover epoch for the same
+    /// incarnation has already claimed synchronization for this Space.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn begin_space_takeover_sync(
+        &self,
+        scope: &HistoryScope,
+        new_epoch: LeaseEpoch,
+        fenced_leases: Vec<(NoteId, LeaseEpoch)>,
+    ) -> Option<(
+        u64,
+        BTreeMap<NoteId, (Arc<Mutex<RoomFenceState>>, Option<LeaseEpoch>)>,
+    )> {
         let mut fences = self.fences.lock().expect("room fence table mutex");
+        if let Some((_, inc, prev_epoch)) = fences.space_sync.get(&scope.space_id)
+            && *inc == scope.incarnation
+            && *prev_epoch >= new_epoch
+        {
+            return None;
+        }
         fences.advance_eviction_gen();
-        let mut notes: Vec<NoteId> = fences
-            .entries
-            .keys()
-            .filter(|(sid, _)| sid == space_id)
-            .map(|(_, note)| note.clone())
-            .collect();
-        let recovery = self
+        let slot_gen = fences.eviction_gen;
+        fences.space_sync_gen = fences.space_sync_gen.saturating_add(1);
+        let sync_gen = fences.space_sync_gen;
+        fences.space_sync.insert(
+            scope.space_id.clone(),
+            (sync_gen, scope.incarnation, new_epoch),
+        );
+
+        let mut targets: BTreeMap<NoteId, (Arc<Mutex<RoomFenceState>>, Option<LeaseEpoch>)> =
+            BTreeMap::new();
+        for (note, epoch) in fenced_leases {
+            let key = (scope.space_id.clone(), note.clone());
+            let touched = fences.next_touch();
+            let state = if let Some(existing) = fences.entries.get_mut(&key) {
+                existing.touched = touched;
+                Arc::clone(&existing.state)
+            } else {
+                let state = Arc::new(Mutex::new(RoomFenceState::new(
+                    note.clone(),
+                    scope.clone(),
+                    LeaseEpoch::ZERO,
+                )));
+                fences.entries.insert(
+                    key,
+                    RoomFenceEntry {
+                        state: Arc::clone(&state),
+                        pin: Arc::new(slot_gen),
+                        touched,
+                    },
+                );
+                state
+            };
+            targets.insert(note, (state, Some(epoch)));
+        }
+        for ((sid, note), entry) in &fences.entries {
+            if sid == &scope.space_id && !targets.contains_key(note) {
+                targets.insert(note.clone(), (Arc::clone(&entry.state), None));
+            }
+        }
+        // Clean any orphaned recovery markers for this Space that no longer
+        // have a corresponding fence slot.
+        let mut recovery = self
             .recovery
             .lock()
             .expect("room recovery fence table mutex");
-        for (sid, note) in &recovery.fenced {
-            if sid == space_id {
-                notes.push(note.clone());
-            }
-        }
-        for (sid, note) in recovery.recovered.keys() {
-            if sid == space_id {
-                notes.push(note.clone());
-            }
-        }
-        notes
+        recovery
+            .fenced
+            .retain(|(sid, note)| sid != &scope.space_id || targets.contains_key(note));
+        recovery
+            .recovered
+            .retain(|(sid, note), _| sid != &scope.space_id || targets.contains_key(note));
+        Some((sync_gen, targets))
     }
 
-    /// Force-synchronizes one local `RoomFenceState` slot with authoritative
-    /// PostgreSQL writer-lease takeover state while the caller holds `guard`
-    /// (without holding any SQL connection or writer commit guard).
+    /// Force-synchronizes one captured local `RoomFenceState` slot with
+    /// authoritative PostgreSQL writer-lease takeover state while the caller
+    /// holds `guard` (without holding any SQL connection or writer commit guard).
     ///
-    /// Unlike `publish_persisted_transition`, takeover is authoritative for the
-    /// Space and therefore overwrites any stale pre-takeover active state or
-    /// higher local epoch from earlier ownership, and refreshes the slot's
-    /// eviction pin to invalidate pre-takeover `ClosedRoomReservation`s.
+    /// Rejects stale updates superseded by a newer takeover epoch, Space
+    /// restore, or Space removal.
     pub(crate) fn apply_takeover_transition(
         &self,
         scope: &HistoryScope,
+        new_epoch: LeaseEpoch,
+        sync_gen: u64,
         note: &NoteId,
         guard: &mut tokio::sync::OwnedMutexGuard<RoomFenceState>,
         fenced_epoch: Option<LeaseEpoch>,
     ) -> bool {
         let key = (scope.space_id.clone(), note.clone());
         let mut map = self.fences.lock().expect("room fence table mutex");
+        if map.space_sync.get(&scope.space_id) != Some(&(sync_gen, scope.incarnation, new_epoch)) {
+            return false;
+        }
         let current = tokio::sync::OwnedMutexGuard::mutex(guard);
         // Preserve a concurrent Space restore that replaced the slot entirely.
         if !map
@@ -484,18 +545,6 @@ impl RoomFenceTable {
         };
         **guard = next;
         true
-    }
-
-    /// Clears stale recovery markers for a note whose fence slot was already
-    /// evicted before takeover synchronization reached it.
-    pub(crate) fn clear_evicted_takeover_recovery(&self, space_id: &SpaceId, note: &NoteId) {
-        let key = (space_id.clone(), note.clone());
-        let mut recovery = self
-            .recovery
-            .lock()
-            .expect("room recovery fence table mutex");
-        recovery.fenced.remove(&key);
-        recovery.recovered.remove(&key);
     }
 
     pub fn get_or_init(&self, scope: &HistoryScope, note: &NoteId) -> Arc<Mutex<RoomFenceState>> {
@@ -678,6 +727,9 @@ impl RoomFenceTable {
     pub fn remove_space(&self, space_id: &SpaceId) {
         let mut map = self.fences.lock().expect("room fence table mutex");
         map.entries.retain(|(sid, _), _| sid != space_id);
+        map.advance_eviction_gen();
+        map.space_sync_gen = map.space_sync_gen.saturating_add(1);
+        map.space_sync.remove(space_id);
         let mut recovery = self
             .recovery
             .lock()
@@ -693,6 +745,11 @@ impl RoomFenceTable {
     ) {
         let mut fences = self.fences.lock().expect("room fence table mutex");
         fences.entries.retain(|(id, _), _| !spaces.contains(id));
+        fences.advance_eviction_gen();
+        fences.space_sync_gen = fences.space_sync_gen.saturating_add(1);
+        for id in spaces {
+            fences.space_sync.remove(*id);
+        }
         let slot_gen = fences.eviction_gen;
         for (key, entry) in restored
             .fences
@@ -2865,5 +2922,122 @@ mod room_fence_bounds_tests {
             table.recovery.lock().unwrap().recovered.len() <= 4096,
             "recovered fence cache must stay bounded"
         );
+    }
+
+    #[tokio::test]
+    async fn takeover_sync_rejects_stale_restore_and_older_epoch_interleavings() {
+        let table = RoomFenceTable::default();
+        let space_id = SpaceId::from_bytes([0x41; 16]);
+        let scope_i1 = HistoryScope {
+            space_id: space_id.clone(),
+            incarnation: HistoryIncarnation::from_bytes([0x01; 16]),
+        };
+        let scope_i2 = HistoryScope {
+            space_id: space_id.clone(),
+            incarnation: HistoryIncarnation::from_bytes([0x02; 16]),
+        };
+        let n1 = NoteId::from_bytes([0x51; 16]);
+        let n2 = NoteId::from_bytes([0x52; 16]);
+
+        // 1. Stale takeover(I1) paused before apply_takeover_transition must not
+        //    overwrite a concurrent Space restore(I2).
+        let (sync_i1, targets_i1) = table
+            .begin_space_takeover_sync(
+                &scope_i1,
+                LeaseEpoch::new(2).unwrap(),
+                vec![(n1.clone(), LeaseEpoch::new(1).unwrap())],
+            )
+            .expect("initial takeover sync");
+
+        let restored = RoomFenceTable::default();
+        restored.set_room_fenced(&space_id, &n2, true);
+        let restored_lock = restored.get_or_init(&scope_i2, &n2);
+        {
+            let mut g = restored_lock.lock_owned().await;
+            let _ = restored.publish_persisted_transition(
+                &scope_i2,
+                &n2,
+                &mut g,
+                RoomFenceState::new(n2.clone(), scope_i2.clone(), LeaseEpoch::new(4).unwrap()),
+                true,
+                None,
+            );
+        }
+        let spaces = BTreeSet::from([&space_id]);
+        table.replace_restored_spaces(&spaces, restored);
+
+        for (note, (lock, fenced_epoch)) in targets_i1 {
+            let mut guard = lock.lock_owned().await;
+            assert!(
+                !table.apply_takeover_transition(
+                    &scope_i1,
+                    LeaseEpoch::new(2).unwrap(),
+                    sync_i1,
+                    &note,
+                    &mut guard,
+                    fenced_epoch,
+                ),
+                "stale pre-restore takeover must be rejected"
+            );
+        }
+        assert!(table.is_room_fenced(&space_id, &n2));
+        assert!(!table.is_room_fenced(&space_id, &n1));
+
+        // 2. Stale takeover(epoch=2) superseded by takeover(epoch=3) must not
+        //    clobber epoch=3's live active or fenced slots, and a late epoch=2
+        //    begin_space_takeover_sync must return None.
+        let (sync_e2, targets_e2) = table
+            .begin_space_takeover_sync(
+                &scope_i2,
+                LeaseEpoch::new(2).unwrap(),
+                vec![(n1.clone(), LeaseEpoch::new(1).unwrap())],
+            )
+            .expect("epoch 2 sync");
+        let (sync_e3, targets_e3) = table
+            .begin_space_takeover_sync(
+                &scope_i2,
+                LeaseEpoch::new(3).unwrap(),
+                vec![(n2.clone(), LeaseEpoch::new(2).unwrap())],
+            )
+            .expect("epoch 3 sync supersedes epoch 2");
+        assert!(
+            table
+                .begin_space_takeover_sync(
+                    &scope_i2,
+                    LeaseEpoch::new(2).unwrap(),
+                    vec![(n1.clone(), LeaseEpoch::new(1).unwrap())],
+                )
+                .is_none(),
+            "older epoch takeover must not supersede newer epoch sync"
+        );
+        for (note, (lock, fenced_epoch)) in targets_e3 {
+            let mut guard = lock.lock_owned().await;
+            assert!(table.apply_takeover_transition(
+                &scope_i2,
+                LeaseEpoch::new(3).unwrap(),
+                sync_e3,
+                &note,
+                &mut guard,
+                fenced_epoch,
+            ));
+        }
+        table.open_room(&scope_i2, &n1).await.unwrap();
+        for (note, (lock, fenced_epoch)) in targets_e2 {
+            let mut guard = lock.lock_owned().await;
+            assert!(
+                !table.apply_takeover_transition(
+                    &scope_i2,
+                    LeaseEpoch::new(2).unwrap(),
+                    sync_e2,
+                    &note,
+                    &mut guard,
+                    fenced_epoch,
+                ),
+                "superseded epoch 2 takeover must be rejected"
+            );
+        }
+        assert!(table.is_room_active(&scope_i2, &n1).await.unwrap());
+        assert!(table.is_room_fenced(&space_id, &n2));
+        assert!(!table.is_room_fenced(&space_id, &n1));
     }
 }

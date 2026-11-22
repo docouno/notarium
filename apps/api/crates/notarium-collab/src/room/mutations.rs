@@ -61,6 +61,7 @@ impl Room {
         request.context.check_current(&self.lease.scope)?;
         let request_start = tokio::time::Instant::now();
         let facts = self.refresh_metadata(&request.context.budget).await?;
+        self.recheck_peer_access(&facts);
         request
             .context
             .auth()

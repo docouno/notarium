@@ -468,8 +468,7 @@ impl CollabHub {
                 let mut budget = budget.clone();
                 budget.remaining = deadline.saturating_duration_since(Instant::now());
                 let _held = lock_slot(&slot, &budget).await?;
-                recovered +=
-                    usize::from(recover_fenced(&self.0.store, &budget, scope, &note).await?);
+                recovered += usize::from(self.0.recover_fenced_room(&budget, scope, &note).await?);
             }
         }
     }
@@ -567,21 +566,27 @@ impl CollabHub {
                 let slot = hub.slot(scope, note);
                 let mut rem = budget;
                 rem.remaining = deadline.saturating_duration_since(Instant::now());
-                let _held = lock_slot(&slot, &rem).await?;
-                rem.remaining = deadline.saturating_duration_since(Instant::now());
-                match tokio::time::timeout_at(deadline, hub.recover_unhosted(&rem, scope, note))
-                    .await
-                {
-                    Ok(Ok(_)) => {
-                        hub.unsettled_shutdown_rooms
-                            .lock()
-                            .expect("shutdown rooms")
-                            .remove(&(scope.clone(), note.clone()));
+                let held = lock_slot(&slot, &rem).await?;
+                let live_replaced = held
+                    .as_ref()
+                    .is_some_and(|live| live.scope() == scope && !live.stopped().is_cancelled());
+                if live_replaced {
+                    // Another peer already admitted a fresh room into this slot,
+                    // which completed fenced recovery before spawning.
+                    hub.clear_unsettled(scope, note);
+                } else {
+                    rem.remaining = deadline.saturating_duration_since(Instant::now());
+                    match tokio::time::timeout_at(deadline, hub.recover_unhosted(&rem, scope, note))
+                        .await
+                    {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(PortError::Domain(DomainError::ValidationFailed {
+                            diagnostic,
+                        }))) if diagnostic.reason
+                            == ValidationReason::HistoryIncarnationMismatch => {}
+                        Ok(Err(error)) => return Err(error),
+                        Err(_) => return Err(deadline_error(b"collab_revocation_recovery")),
                     }
-                    Ok(Err(PortError::Domain(DomainError::ValidationFailed { diagnostic })))
-                        if diagnostic.reason == ValidationReason::HistoryIncarnationMismatch => {}
-                    Ok(Err(error)) => return Err(error),
-                    Err(_) => return Err(deadline_error(b"collab_revocation_recovery")),
                 }
             }
             hub.clear_pending_revoke_settlement(&key, &selector, snapshot_seq);
@@ -646,25 +651,28 @@ impl CollabHub {
                 let slot = self.0.slot(&scope, &key.1);
                 let mut rem = ctx.budget.clone();
                 rem.remaining = deadline.saturating_duration_since(Instant::now());
-                let _held = lock_slot(&slot, &rem).await?;
-                rem.remaining = deadline.saturating_duration_since(Instant::now());
-                match tokio::time::timeout_at(
-                    deadline,
-                    self.0.recover_unhosted(&rem, &scope, &key.1),
-                )
-                .await
-                {
-                    Ok(Ok(_)) => {
-                        self.0
-                            .unsettled_shutdown_rooms
-                            .lock()
-                            .expect("shutdown rooms")
-                            .remove(&(scope, key.1.clone()));
+                let held = lock_slot(&slot, &rem).await?;
+                let live_replaced = held
+                    .as_ref()
+                    .is_some_and(|live| live.scope() == &scope && !live.stopped().is_cancelled());
+                if live_replaced {
+                    self.0.clear_unsettled(&scope, &key.1);
+                } else {
+                    rem.remaining = deadline.saturating_duration_since(Instant::now());
+                    match tokio::time::timeout_at(
+                        deadline,
+                        self.0.recover_unhosted(&rem, &scope, &key.1),
+                    )
+                    .await
+                    {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(PortError::Domain(DomainError::ValidationFailed {
+                            diagnostic,
+                        }))) if diagnostic.reason
+                            == ValidationReason::HistoryIncarnationMismatch => {}
+                        Ok(Err(error)) => return Err(error),
+                        Err(_) => return Err(deadline_error(b"collab_revocation_recovery")),
                     }
-                    Ok(Err(PortError::Domain(DomainError::ValidationFailed { diagnostic })))
-                        if diagnostic.reason == ValidationReason::HistoryIncarnationMismatch => {}
-                    Ok(Err(error)) => return Err(error),
-                    Err(_) => return Err(deadline_error(b"collab_revocation_recovery")),
                 }
             }
             self.0
@@ -1082,6 +1090,36 @@ impl HubInner {
         Ok(())
     }
 
+    fn clear_unsettled(&self, scope: &HistoryScope, note: &NoteId) {
+        self.unsettled_shutdown_rooms
+            .lock()
+            .expect("shutdown rooms")
+            .remove(&(scope.clone(), note.clone()));
+    }
+
+    async fn recover_fenced_room(
+        &self,
+        budget: &CallBudget,
+        scope: &HistoryScope,
+        note: &NoteId,
+    ) -> Result<bool, PortError> {
+        match recover_fenced(&self.store, budget, scope, note).await {
+            Ok(recovered) => {
+                self.clear_unsettled(scope, note);
+                Ok(recovered)
+            }
+            Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
+                if diagnostic.reason == ValidationReason::HistoryIncarnationMismatch =>
+            {
+                self.clear_unsettled(scope, note);
+                Err(PortError::Domain(DomainError::ValidationFailed {
+                    diagnostic,
+                }))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     pub async fn recover(
         &self,
         budget: &CallBudget,
@@ -1093,7 +1131,7 @@ impl HubInner {
             .room_fences()
             .is_room_fenced(&scope.space_id, note)
         {
-            return recover_fenced(&self.store, budget, scope, note).await;
+            return self.recover_fenced_room(budget, scope, note).await;
         }
         match self.store.room_fences().is_room_active(scope, note).await {
             Ok(false) => Ok(false),
@@ -1110,12 +1148,25 @@ impl HubInner {
         scope: &HistoryScope,
         note: &NoteId,
     ) -> Result<bool, PortError> {
-        let Some(snapshot) = self
+        let snapshot = match self
             .store
             .read_collab_session_after_transition(budget, scope, note)
-            .await?
-        else {
-            return Ok(false);
+            .await
+        {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => {
+                self.clear_unsettled(scope, note);
+                return Ok(false);
+            }
+            Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
+                if diagnostic.reason == ValidationReason::HistoryIncarnationMismatch =>
+            {
+                self.clear_unsettled(scope, note);
+                return Err(PortError::Domain(DomainError::ValidationFailed {
+                    diagnostic,
+                }));
+            }
+            Err(error) => return Err(error),
         };
         let record = snapshot.session;
         if record.room_state == CollabRoomState::Active
@@ -1134,14 +1185,23 @@ impl HubInner {
                     // Another transition (for example, a clean idle close or
                     // concurrent fence) advanced the lease in the meantime.
                     // Finish recovery if it transitioned to `Fenced`.
-                    return recover_fenced(&self.store, budget, scope, note).await;
+                    return self.recover_fenced_room(budget, scope, note).await;
+                }
+                Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
+                    if diagnostic.reason == ValidationReason::HistoryIncarnationMismatch =>
+                {
+                    self.clear_unsettled(scope, note);
+                    return Err(PortError::Domain(DomainError::ValidationFailed {
+                        diagnostic,
+                    }));
                 }
                 Err(error) => return Err(error),
             }
         } else if record.room_state != CollabRoomState::Fenced {
+            self.clear_unsettled(scope, note);
             return Ok(false);
         }
-        recover_fenced(&self.store, budget, scope, note).await
+        self.recover_fenced_room(budget, scope, note).await
     }
 
     async fn admit(
@@ -1338,7 +1398,8 @@ impl HubInner {
             // observe settled head/lineage without wasted CAS/S3 reads.
             budget.remaining = deadline.saturating_duration_since(Instant::now());
             if stored.is_some_and(|record| record.room_state == CollabRoomState::Fenced) {
-                recover_fenced(&self.store, &budget, &admission.scope, note).await?;
+                self.recover_fenced_room(&budget, &admission.scope, note)
+                    .await?;
                 continue;
             }
             if let Some(record) = stored.filter(|record| {
@@ -1356,7 +1417,8 @@ impl HubInner {
                 {
                     Ok(()) => {
                         budget.remaining = deadline.saturating_duration_since(Instant::now());
-                        recover_fenced(&self.store, &budget, &admission.scope, note).await?;
+                        self.recover_fenced_room(&budget, &admission.scope, note)
+                            .await?;
                         continue;
                     }
                     Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
@@ -1728,6 +1790,12 @@ async fn watch_storage(
                 }
             }
             Ok(SpaceSignal::IncarnationChanged { new_scope, .. }) => {
+                hub.unsettled_shutdown_rooms
+                    .lock()
+                    .expect("shutdown rooms")
+                    .retain(|(scope, _)| {
+                        scope.space_id != new_scope.space_id || scope == new_scope
+                    });
                 let stale_guards: Vec<_> = {
                     let peers = hub.peers.lock().expect("peer registry");
                     peers

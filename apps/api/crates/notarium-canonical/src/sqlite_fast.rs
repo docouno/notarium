@@ -7171,3 +7171,205 @@ fn active_occupant_note_id_rusqlite(
         None => Ok(None),
     }
 }
+
+#[cfg(test)]
+mod savepoint_idempotency_tests {
+    use std::sync::atomic::AtomicUsize;
+
+    use notarium_core::{
+        epoch::DataRoot,
+        ids::{InstallationId, NoteId},
+    };
+
+    use super::*;
+    use crate::{CanonicalConfig, CanonicalRuntime, CreateSpaceSpec, writer::BatchEventDraft};
+
+    struct StubIdempotentFastPlan {
+        checked_gen: u64,
+        command_id: String,
+        response: Vec<u8>,
+        fail_post_write: bool,
+        executions: Arc<AtomicUsize>,
+    }
+
+    impl SqliteSyncItemPlan for StubIdempotentFastPlan {
+        fn take_deferred_local_staging(&self) -> Option<DeferredLocalStaging> {
+            None
+        }
+
+        fn phase1_receipt_checked_at_gen(&self) -> Option<u64> {
+            Some(self.checked_gen)
+        }
+
+        fn execute_sqlite_sync(
+            &self,
+            _conn: &rusqlite::Connection,
+            ctx: &mut ItemExecCtx,
+            _cache: &mut FastBatchSqlCache,
+            _batch_now_ts: Timestamp,
+            _batch_now_ms: i64,
+            _defer_append: Option<&mut DeferredAppendRows>,
+        ) -> Result<ItemCommitArtifacts, FastItemExecError> {
+            self.executions.fetch_add(1, Ordering::AcqRel);
+            if self.fail_post_write {
+                return Err(FastItemExecError::PostWrite(
+                    DomainError::validation(ValidationReason::InvalidState).into(),
+                ));
+            }
+            let seq = ctx.alloc_next_seq().map_err(FastItemExecError::PreWrite)?;
+            let rev = RevisionId::from_bytes([seq.get() as u8; 16]);
+            Ok(ItemCommitArtifacts {
+                command_id: self.command_id.clone(),
+                command_kind: "stub_idempotent".to_owned(),
+                events: vec![BatchEventDraft {
+                    space_seq: seq,
+                    entity_type: "note".to_owned(),
+                    entity_id: NoteId::from_bytes([0x62; 16]).as_str().to_owned(),
+                    op_kind: "edit".to_owned(),
+                    rev_id: rev,
+                    lifecycle: Lifecycle::Active,
+                    doc_class: Some(DocClass::UserDoc),
+                }],
+                change_payload: None,
+                receipt_detail_blob: None,
+                receipt_sanitized_blob: self.response.clone(),
+                receipt_owner_note_ids: Vec::new(),
+                response_bytes: self.response.clone(),
+            })
+        }
+
+        fn into_async_exec(self: Box<Self>) -> ItemExecuteFn {
+            unreachable!("savepoint stage test invokes execute_sqlite_sync directly")
+        }
+    }
+
+    #[tokio::test]
+    async fn savepoint_fallback_enforces_in_batch_receipt_replay_reuse_and_rollback() {
+        let dir = std::env::temp_dir().join(format!(
+            "notarium-sqlite-fast-sp-idemp-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let data_root = DataRoot::new(dir.clone());
+        let (store, runtime) = CanonicalRuntime::open(CanonicalConfig::local_default(
+            InstallationId::from_bytes([0x61; 16]),
+            data_root.clone(),
+        ))
+        .await
+        .unwrap();
+
+        let scope = HistoryScope {
+            space_id: SpaceId::from_bytes([0x63; 16]),
+            incarnation: HistoryIncarnation::from_bytes([0x64; 16]),
+        };
+        let actor = PrincipalId::from_bytes([0x65; 16]);
+        let epoch = LeaseEpoch::new(1).unwrap();
+        store
+            .create_space(CreateSpaceSpec {
+                space_id: scope.space_id.clone(),
+                incarnation: scope.incarnation,
+                root_folder_id: FolderId::from_bytes([0x66; 16]),
+                slug: "sp-idemp".to_owned(),
+                kind: SpaceKind::Shared,
+                owner: actor.clone(),
+                active_epoch: epoch,
+                initial_last_seq: SpaceSeq::ZERO,
+                created_at: None,
+            })
+            .await
+            .unwrap();
+
+        let current_writer_gen = store.inner.sqlite_writer_commit_gen.load(Ordering::Acquire);
+        let conn = open_rusqlite_writer_connection(&data_root.canonical()).unwrap();
+
+        let key_1 = CommandKey::from_bytes([0x71; 16]);
+        let key_2 = CommandKey::from_bytes([0x72; 16]);
+        let hash_1 = ContentDigest::from_bytes([0x81; 32]);
+        let hash_2 = ContentDigest::from_bytes([0x82; 32]);
+        let hash_3 = ContentDigest::from_bytes([0x83; 32]);
+        let hash_4 = ContentDigest::from_bytes([0x84; 32]);
+        let executions = Arc::new(AtomicUsize::new(0));
+
+        let make_item = |key: CommandKey,
+                         hash: ContentDigest,
+                         cmd_id: &str,
+                         resp: &[u8],
+                         fail_post_write: bool|
+         -> (FastIntentMeta, Box<dyn SqliteSyncItemPlan>) {
+            (
+                FastIntentMeta {
+                    scope: scope.clone(),
+                    active_epoch: epoch,
+                    idempotency: Some(CommandIdentitySpec::new(actor.clone(), key, hash)),
+                    source_note_ids: Vec::new(),
+                    required_semantic_cut: None,
+                },
+                Box::new(StubIdempotentFastPlan {
+                    checked_gen: current_writer_gen,
+                    command_id: cmd_id.to_owned(),
+                    response: resp.to_vec(),
+                    fail_post_write,
+                    executions: Arc::clone(&executions),
+                }),
+            )
+        };
+
+        let items = vec![
+            // 0: Succeeds and writes receipt (key_1, hash_1) after RELEASE SAVEPOINT.
+            make_item(key_1.clone(), hash_1, "cmd-1", b"ok1", false),
+            // 1: Same (key_1, hash_1) with matching phase1_gen -> must replay b"ok1" without re-running.
+            make_item(key_1.clone(), hash_1, "cmd-2", b"must-not-run", false),
+            // 2: Same key_1 with different hash_2 and matching phase1_gen -> IdempotencyKeyReused.
+            make_item(key_1, hash_2, "cmd-3", b"must-not-run", false),
+            // 3: Fails PostWrite -> savepoint rolls back and must NOT pollute in_batch_receipts.
+            make_item(key_2.clone(), hash_3, "cmd-4", b"rolled-back", true),
+            // 4: Same key_2 with hash_4 -> must execute cleanly and succeed with b"ok2".
+            make_item(key_2, hash_4, "cmd-5", b"ok2", false),
+        ];
+
+        let stage = run_savepoint_fallback_sql_stage(
+            &conn,
+            &items,
+            WriterConfig::default(),
+            None,
+            &store.inner,
+            false,
+            current_writer_gen,
+        );
+        let FastSqlStageResult::CommittedDirectly { slots, .. } = stage else {
+            panic!("expected CommittedDirectly from savepoint fallback stage");
+        };
+        assert_eq!(slots.len(), 5);
+        assert!(matches!(
+            &slots[0],
+            ItemOutcomeSlot::Succeeded { response_bytes, .. } if response_bytes == b"ok1"
+        ));
+        assert!(matches!(
+            &slots[1],
+            ItemOutcomeSlot::Succeeded { response_bytes, .. } if response_bytes == b"ok1"
+        ));
+        assert!(matches!(
+            &slots[2],
+            ItemOutcomeSlot::Failed(PortError::Domain(DomainError::IdempotencyKeyReused))
+        ));
+        assert!(matches!(
+            &slots[3],
+            ItemOutcomeSlot::Failed(PortError::Domain(DomainError::ValidationFailed { .. }))
+        ));
+        assert!(matches!(
+            &slots[4],
+            ItemOutcomeSlot::Succeeded { response_bytes, .. } if response_bytes == b"ok2"
+        ));
+        // Only items 0, 3, and 4 executed; items 1 and 2 resolved from `in_batch_receipts`.
+        assert_eq!(executions.load(Ordering::Acquire), 3);
+
+        drop(conn);
+        drop(store);
+        runtime.shutdown().await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

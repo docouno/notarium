@@ -2649,3 +2649,261 @@ async fn postgres_two_owner_takeover_unhosted_pin_and_single_cte_broadcast() {
     runtime_b.shutdown().await.unwrap();
     fixtures.drop_pg_schema(&schema).await;
 }
+
+#[tokio::test]
+async fn concurrent_move_folder_during_settle_still_evicts_lost_access_peer() {
+    let mut cfg = fast_config();
+    cfg.idle_checkpoint = Duration::from_secs(60);
+    cfg.periodic_checkpoint = Duration::from_secs(60);
+    cfg.idle_unload = Duration::from_secs(60);
+    let (_root, store, runtime, hub, owner) = open_sqlite_env("move-during-settle", cfg).await;
+
+    let project_a = FolderId::from_bytes([221; 16]);
+    let sub_in_project = FolderId::from_bytes([231; 16]);
+    let folder_outside = FolderId::from_bytes([222; 16]);
+    for (fid, parent, slug, is_project) in [
+        (project_a.clone(), None, "proj-a", true),
+        (
+            sub_in_project.clone(),
+            Some(project_a.clone()),
+            "sub",
+            false,
+        ),
+        (folder_outside.clone(), None, "outside", false),
+    ] {
+        store
+            .create_folder(CreateFolderSpec {
+                scope: owner.scope().clone(),
+                active_epoch: LeaseEpoch::new(1).unwrap(),
+                folder_id: fid,
+                parent,
+                slug: slug.into(),
+                display_name: slug.into(),
+                is_project,
+                project_slug: is_project.then(|| slug.into()),
+                actor: test_owner(),
+                timestamp: None,
+            })
+            .await
+            .unwrap();
+    }
+    let note = create_note(
+        &store,
+        &owner,
+        223,
+        "Scoped.\n",
+        Some(sub_in_project.clone()),
+    )
+    .await;
+
+    let scoped_peer_ctx = context(
+        owner.scope(),
+        PrincipalId::from_bytes([224; 16]),
+        SpaceRole::Editor,
+        Some(project_a.clone()),
+    );
+    let (mut owner_client, _) = synced_client(&hub, &owner, &note.note, 3101).await;
+    let (mut scoped_client, _) = synced_client(&hub, &scoped_peer_ctx, &note.note, 3102).await;
+
+    // Make the room dirty so a subsequent intercepted command settlement emits
+    // a self-commit seq right next to `move_folder`.
+    owner_client
+        .send_update(&owner_client.append("Dirty.\n"))
+        .await;
+    owner_client.ack().await;
+
+    let move_cmd = mutation(
+        &owner,
+        MoveFolder {
+            folder: sub_in_project.clone(),
+            new_parent: Some(folder_outside.clone()),
+        },
+    );
+    let head_body = note_head(&store, &owner, &note.note).await.1;
+    let edit_cmd = edit(
+        &owner,
+        &note.note,
+        &head_body,
+        CarrierEditOrigin::Body,
+        head_body.len(),
+        head_body.len(),
+        "Concurrent.\n",
+    );
+    let (move_res, edit_res) = tokio::join!(
+        store.move_folder(owner.clone(), move_cmd),
+        store.edit_note(owner.clone(), edit_cmd),
+    );
+    move_res.unwrap();
+    let _ = edit_res;
+
+    // The project-scoped peer MUST be proactively evicted with 1008 POLICY even
+    // though `move_folder` raced with the room's own settlement/command commit.
+    assert_eq!(close_code(&mut scoped_client.peer).await, 1008);
+
+    drop((owner_client, scoped_client));
+    hub.shutdown(&budget()).await.unwrap();
+    drop(hub);
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn open_collab_session_rejects_trashed_ancestor_even_with_allow_fenced_recovery() {
+    let (_root, store, runtime, hub, owner) =
+        open_sqlite_env("open-trashed-ancestor", fast_config()).await;
+    let folder = FolderId::from_bytes([225; 16]);
+    let f_rev = store
+        .create_folder(CreateFolderSpec {
+            scope: owner.scope().clone(),
+            active_epoch: LeaseEpoch::new(1).unwrap(),
+            folder_id: folder.clone(),
+            parent: None,
+            slug: "trash-me".into(),
+            display_name: "Trash Me".into(),
+            is_project: false,
+            project_slug: None,
+            actor: test_owner(),
+            timestamp: None,
+        })
+        .await
+        .unwrap()
+        .1;
+    let note = create_note(&store, &owner, 226, "Under folder.\n", Some(folder.clone())).await;
+
+    // Trash the folder while no room is open.
+    store
+        .set_folder_lifecycle(
+            owner.scope(),
+            LeaseEpoch::new(1).unwrap(),
+            &folder,
+            &f_rev,
+            Lifecycle::Trashed,
+            &test_owner(),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Direct `open_collab_session` must reject opening a new/closed room under a
+    // trashed ancestor both when `allow_fenced_recovery = false` AND `true`.
+    for allow_fenced_recovery in [false, true] {
+        let err = store
+            .open_collab_session(
+                &budget(),
+                OpenCollabSession {
+                    scope: owner.scope().clone(),
+                    note: note.note.clone(),
+                    owner_id: "direct-open".into(),
+                    expected_carrier_rev: note.revision.clone(),
+                    expected_lease: Some(LeaseEpoch::ZERO),
+                    expected_lineage: None,
+                    initial_yrs_snapshot: Some(vec![0, 0]),
+                    allow_fenced_recovery,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, PortError::Domain(DomainError::ResourceNotFound)),
+            "expected ResourceNotFound for allow_fenced_recovery={allow_fenced_recovery}, got {err:?}"
+        );
+    }
+
+    hub.shutdown(&budget()).await.unwrap();
+    drop(hub);
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn revoke_does_not_fence_live_replacement_room_and_recovery_clears_unsettled() {
+    let mut cfg = fast_config();
+    cfg.idle_checkpoint = Duration::from_millis(200);
+    cfg.periodic_checkpoint = Duration::from_secs(60);
+    cfg.idle_unload = Duration::from_millis(200);
+    let (_root, store, runtime, hub, owner) = open_sqlite_env("revoke-live-replacement", cfg).await;
+    let note = create_note(&store, &owner, 227, "Start.\n", None).await;
+
+    let session_a = AuthSessionId::from_bytes([228; 16]);
+    let peer_a_principal = PrincipalId::from_bytes([229; 16]);
+    let grant = SpaceGrant {
+        role: SpaceRole::Editor,
+        read_classes: DocClass::all(),
+        write_classes: DocClass::all(),
+        project_root: None,
+    };
+    let verified_a = VerifiedHuman::attest(
+        peer_a_principal,
+        GrantId::from_bytes(random_bytes_16()),
+        BTreeMap::from([(owner.scope().space_id.clone(), grant)]),
+        false,
+    )
+    .with_credential(AuthenticatedCredential::Session(session_a.clone()));
+    let ctx_a = SpaceContext::new(
+        EngineAuthContext::for_human(verified_a),
+        owner.scope().clone(),
+        budget(),
+    )
+    .unwrap();
+    let cancel_a = Cancellation::default();
+    let sess_a = hub
+        .connect(ctx_a, note.note.clone(), test_auth(&cancel_a, None))
+        .await
+        .unwrap();
+    let mut client_a = Client::new(sess_a, 3201);
+    client_a.ready(LineageHello::Fresh).await;
+    client_a.sync().await;
+    client_a.send_update(&client_a.append("FromA.\n")).await;
+    client_a.ack().await;
+
+    // Fence R1 while client A is connected, then cancel client A so R1 exits
+    // with `settled == false` (leaving pending_revoke_settlement & unsettled_shutdown_rooms).
+    let stored = store
+        .read_collab_session(None, owner.scope(), &note.note)
+        .await
+        .unwrap()
+        .unwrap()
+        .session;
+    store
+        .fence_collab_session(
+            &budget(),
+            FenceCollabSession {
+                scope: owner.scope().clone(),
+                note: note.note.clone(),
+                owner_id: stored.owner_id.expect("owner"),
+                expected_lease: stored.lease_epoch,
+                expected_lineage: stored.lineage_epoch,
+            },
+        )
+        .await
+        .unwrap();
+    cancel_a.cancel();
+    assert_eq!(close_code(&mut client_a.peer).await, 1008);
+    wait_until(async || hub.active_room_count() == 0).await;
+
+    // Before revoke(session_a) runs, an unrevoked peer B opens a fresh live room R2
+    // on the same note (admit() recovers R1's WAL and spawns R2).
+    let (mut client_b, _) = synced_client(&hub, &owner, &note.note, 3202).await;
+    assert_eq!(client_b.text(), "Start.\nFromA.\n");
+
+    // Revoking session_a must NOT fence or close live replacement room R2!
+    hub.revoke(
+        &maintenance_ctx(ServicePurpose::Revocation),
+        &RevocationSelector::Session(session_a),
+        RevocationReason::Logout,
+    )
+    .await
+    .unwrap();
+
+    // Peer B's live room R2 must remain healthy and continue accepting durable edits.
+    client_b.send_update(&client_b.append("FromB.\n")).await;
+    client_b.ack().await;
+    assert_eq!(hub.active_room_count(), 1);
+
+    drop((client_a, client_b));
+    hub.shutdown(&budget()).await.unwrap();
+    assert_eq!(
+        note_head(&store, &owner, &note.note).await.1,
+        "Start.\nFromA.\nFromB.\n"
+    );
+    drop(hub);
+    runtime.shutdown().await.unwrap();
+}

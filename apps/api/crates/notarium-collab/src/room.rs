@@ -161,20 +161,30 @@ impl RoomHandle {
     /// Record a solo commit targeting only this room's note at `seq`.
     /// If the commit came from this room's own settlement/command, the actor
     /// updates `last_self_seq` before polling `storage_changed` and skips a
-    /// redundant `revalidate()` read without missing concurrent note commits.
+    /// redundant `revalidate()` read without allowing a later self-commit to
+    /// mask an earlier concurrent external commit (such as `move_note`).
     pub fn note_solo_committed(&self, seq: u64) {
         if self.last_self_seq.load(Ordering::Acquire) == seq {
             return;
         }
-        self.pending_note_seq.fetch_max(seq, Ordering::AcqRel);
+        match self
+            .pending_note_seq
+            .compare_exchange(0, seq, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => {}
+            Err(prev) if prev == seq => {}
+            Err(_) => {
+                self.pending_broad_change.store(true, Ordering::Release);
+            }
+        }
         self.storage_changed.notify_one();
     }
 
     fn take_needs_revalidate(&self) -> bool {
         let broad = self.pending_broad_change.swap(false, Ordering::AcqRel);
-        let pending_seq = self.pending_note_seq.load(Ordering::Acquire);
+        let pending_seq = self.pending_note_seq.swap(0, Ordering::AcqRel);
         let self_seq = self.last_self_seq.load(Ordering::Acquire);
-        broad || pending_seq > self_seq
+        broad || (pending_seq != 0 && pending_seq != self_seq)
     }
 
     /// Settle or close the room after revocation. Returns `Ok(false)` if the
@@ -746,13 +756,17 @@ impl Room {
         JoinOutcome::Accepted
     }
 
-    async fn revalidate(&mut self) -> Result<(), PortError> {
-        let facts = self.refresh_metadata(&self.budget()).await?;
+    fn recheck_peer_access(&self, facts: &notarium_core::auth::ResourceFacts) {
         for peer in self.peers.values() {
-            if !is_authorized(&peer.ctx, peer.role, &facts) {
+            if !is_authorized(&peer.ctx, peer.role, facts) {
                 peer.outbound.guard.close(SessionClose::POLICY);
             }
         }
+    }
+
+    async fn revalidate(&mut self) -> Result<(), PortError> {
+        let facts = self.refresh_metadata(&self.budget()).await?;
+        self.recheck_peer_access(&facts);
         if self.reap_peers() {
             self.carrier.last_writer_auth = None;
             self.carrier.last_writer_peer = None;
@@ -1283,5 +1297,74 @@ async fn wait_for(deadline: Option<Instant>) {
         sleep_until(deadline).await;
     } else {
         pending().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use notarium_core::ids::{HistoryIncarnation, SpaceId};
+
+    use super::*;
+
+    fn test_handle() -> RoomHandle {
+        let (commands, _rx) = mpsc::channel(1);
+        let (_slug_tx, slug) = watch::channel(String::new());
+        RoomHandle {
+            lease: Arc::new(RoomLease {
+                scope: HistoryScope {
+                    space_id: SpaceId::from_bytes([1; 16]),
+                    incarnation: HistoryIncarnation::from_bytes([2; 16]),
+                },
+                note: NoteId::from_bytes([3; 16]),
+                epoch: LeaseEpoch::new(1).unwrap(),
+                lineage: LineageEpoch::new(1).unwrap(),
+                owner: Arc::from("owner"),
+            }),
+            commands,
+            stopped: Cancellation::default(),
+            settled: Arc::new(AtomicBool::new(false)),
+            slug,
+            peers_changed: Arc::new(Notify::new()),
+            storage_changed: Arc::new(Notify::new()),
+            last_self_seq: Arc::new(AtomicU64::new(0)),
+            pending_note_seq: Arc::new(AtomicU64::new(0)),
+            pending_broad_change: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    #[test]
+    fn note_solo_committed_never_masks_earlier_external_commit() {
+        // Case 1: external seq=11 arrives, then self-commit seq=12 arrives BEFORE
+        // `last_self_seq` is stored -> escalated to broad change -> revalidate runs.
+        let handle = test_handle();
+        handle.note_solo_committed(11);
+        handle.note_solo_committed(12);
+        handle.last_self_seq.store(12, Ordering::Release);
+        assert!(handle.take_needs_revalidate());
+        assert!(!handle.take_needs_revalidate());
+
+        // Case 2: self-commit seq=12 stored first, then external seq=11 arrives late ->
+        // `pending_seq (11) != self_seq (12)` -> revalidate runs and clears pending_note_seq.
+        let handle = test_handle();
+        handle.last_self_seq.store(12, Ordering::Release);
+        handle.note_solo_committed(12);
+        handle.note_solo_committed(11);
+        assert!(handle.take_needs_revalidate());
+        assert!(!handle.take_needs_revalidate());
+
+        // Case 3: external seq=11 arrives, then self-commit seq=12 stored before signal ->
+        // self signal returns early, pending_seq (11) != self_seq (12) -> revalidate runs.
+        let handle = test_handle();
+        handle.note_solo_committed(11);
+        handle.last_self_seq.store(12, Ordering::Release);
+        handle.note_solo_committed(12);
+        assert!(handle.take_needs_revalidate());
+        assert!(!handle.take_needs_revalidate());
+
+        // Case 4: uncontended self-commit seq=12 arrives before store -> skipped.
+        let handle = test_handle();
+        handle.note_solo_committed(12);
+        handle.last_self_seq.store(12, Ordering::Release);
+        assert!(!handle.take_needs_revalidate());
     }
 }

@@ -1216,10 +1216,12 @@ impl CanonicalStore {
 
         let mut lease = PgTransactionLease::new(&mut pooled);
         if initialize {
-            // A cached reader owns its session settings. An uncached reader resets them before
-            // it returns to the shared pool. Any interrupted checkout is closed.
+            // A cached reader owns its session settings. An uncached reader resets
+            // `statement_timeout` before returning to the shared pool; `after_connect`
+            // keeps `client_connection_check_interval = '20ms'` active session-wide.
+            // Any interrupted checkout is closed.
             let settings = format!(
-                "SET statement_timeout = '{}ms'; SET client_connection_check_interval = '20ms'",
+                "SET statement_timeout = '{}ms'",
                 statement_limit.as_millis().max(1)
             );
             tokio::select! {
@@ -1258,7 +1260,7 @@ impl CanonicalStore {
                 error = &mut cancelled => return Err(error),
                 _ = tokio::time::sleep_until(caller_deadline) => return Err(deadline_not_committed(
                     "pg_read_cleanup_deadline", "PostgreSQL read cleanup exceeded caller deadline")),
-                result = sqlx::raw_sql("RESET statement_timeout; RESET client_connection_check_interval").execute(lease.conn()) =>
+                result = sqlx::raw_sql("RESET statement_timeout").execute(lease.conn()) =>
                     result.map_err(|e| internal_not_committed("pg_read_reset", e.to_string()))?,
             };
             lease.complete();
@@ -1819,7 +1821,9 @@ impl CanonicalStore {
                 let new_rev_cl = new_rev;
                 let cmd_cl_in = cmd_id;
                 writer_owner.check_writer_epoch(&scope_cl.space_id, active_epoch)?;
-                let space_rec = load_space_record(tx, &scope_cl.space_id).await?;
+                let space_rec = load_space_record_for_update_opt(tx, &scope_cl.space_id)
+                    .await?
+                    .ok_or(DomainError::ResourceNotFound)?;
                 space_rec.scope.check(&scope_cl)?;
                 if space_rec.active_epoch != active_epoch {
                     return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
@@ -1850,13 +1854,13 @@ impl CanonicalStore {
                     (Lifecycle::Active, Lifecycle::Trashed) => {
                         let has_open_room: Option<i32> = match tx {
                             BackendConn::Sqlite(conn) => sqlx::query_scalar(
-                                "WITH RECURSIVE sub(folder_id) AS (
-                                     SELECT folder_id FROM folder_heads
+                                "WITH RECURSIVE sub(folder_id, depth) AS (
+                                     SELECT folder_id, 0 FROM folder_heads
                                       WHERE space_id = ?1 AND folder_id = ?2
                                      UNION ALL
-                                     SELECT f.folder_id FROM folder_heads f
+                                     SELECT f.folder_id, s.depth + 1 FROM folder_heads f
                                      JOIN sub s ON f.parent_folder_id = s.folder_id
-                                      WHERE f.space_id = ?1
+                                      WHERE f.space_id = ?1 AND s.depth < 257
                                  )
                                  SELECT 1 FROM sub s
                                  JOIN note_heads n
@@ -1877,13 +1881,13 @@ impl CanonicalStore {
                                 )
                             })?,
                             BackendConn::Postgres(conn) => sqlx::query_scalar(
-                                "WITH RECURSIVE sub(folder_id) AS (
-                                     SELECT folder_id FROM folder_heads
+                                "WITH RECURSIVE sub(folder_id, depth) AS (
+                                     SELECT folder_id, 0 FROM folder_heads
                                       WHERE space_id = $1 AND folder_id = $2
                                      UNION ALL
-                                     SELECT f.folder_id FROM folder_heads f
+                                     SELECT f.folder_id, s.depth + 1 FROM folder_heads f
                                      JOIN sub s ON f.parent_folder_id = s.folder_id
-                                      WHERE f.space_id = $1
+                                      WHERE f.space_id = $1 AND s.depth < 257
                                  )
                                  SELECT 1 FROM sub s
                                  JOIN note_heads n

@@ -111,7 +111,8 @@ impl Room {
 
         let mut last_err = None;
         for attempt in 0..SETTLE_CONFLICT_RETRIES {
-            self.refresh_metadata(budget).await?;
+            let facts = self.refresh_metadata(budget).await?;
+            self.recheck_peer_access(&facts);
             let can_fallback_actor = !same && self.carrier.last_writer_auth.is_some();
             let may_retry_conflict = attempt + 1 < SETTLE_CONFLICT_RETRIES;
             let actor = self

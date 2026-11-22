@@ -612,21 +612,21 @@ impl CanonicalStore {
         }
         let scope = scope.clone();
         let note = note.clone();
-        self.with_pg_single_read_stmt(budget, |conn| {
-            Box::pin(async move {
-                let rows = query_room_facts_pg(conn, &scope.space_id, &note).await?;
-                let expectation =
-                    expected
-                        .as_ref()
-                        .map(|(lease, lineage, owner)| ActiveRoomExpectation {
-                            lease: *lease,
-                            lineage: *lineage,
-                            owner: owner.as_str(),
-                        });
-                decode_room_facts_rows(&scope, rows, expectation)
+        let rows = self
+            .with_pg_single_read_stmt(budget, |conn| {
+                let space_id = scope.space_id.clone();
+                let note = note.clone();
+                Box::pin(async move { query_room_facts_pg(conn, &space_id, &note).await })
             })
-        })
-        .await
+            .await?;
+        let expectation = expected
+            .as_ref()
+            .map(|(lease, lineage, owner)| ActiveRoomExpectation {
+                lease: *lease,
+                lineage: *lineage,
+                owner: owner.as_str(),
+            });
+        decode_room_facts_rows(&scope, rows, expectation)
     }
 
     /// Reads `(slug, lease_epoch)` when `collab_sessions` currently holds an

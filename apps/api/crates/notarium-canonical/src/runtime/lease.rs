@@ -325,94 +325,87 @@ impl CanonicalStore {
     ) -> Result<bool, PortError> {
         if let SqlDriverState::Postgres { pool, .. } = &self.inner.sql {
             let room_fences = &self.inner.room_fences;
-            let fenced = {
+            let takeover_sync = {
                 let _gate = self.inner.writer()?.acquire_commit_read_guard().await;
-                let mut visibility = self
-                    .inner
-                    .live_visibility
-                    .for_write(vec![scope.space_id.clone()])
-                    .await;
-                let mut connection = pool.acquire().await.map_err(|e| {
-                    unavailable_retryable(
-                        "pg_acquire_lease",
-                        e.to_string(),
-                        Duration::from_millis(50),
-                    )
-                })?;
-                let mut lease = PgTransactionLease::new(&mut connection);
-                let timeout_ms = attempt
-                    .remaining()
-                    .saturating_add(Duration::from_secs(1))
-                    .as_millis()
-                    .min(i32::MAX as u128);
-                let begin = format!(
-                    "BEGIN; SET LOCAL statement_timeout='{timeout_ms}ms'; SET LOCAL client_connection_check_interval='10ms'; SELECT pg_advisory_xact_lock_shared(hashtextextended(current_schema(), 7311229))"
-                );
-                let mut tx = lease
-                    .conn()
-                    .begin_with(sqlx::AssertSqlSafe(begin))
-                    .await
-                    .map_err(|e| internal_not_committed("pg_begin_lease", e.to_string()))?;
-                let changed = self
-                    .update_lease_rows(
-                        &mut BackendConn::Postgres(&mut tx),
-                        scope,
-                        new_epoch,
-                        &attempt,
-                    )
-                    .await?;
-                if !changed {
-                    tx.rollback().await.map_err(|e| {
+                let fenced = {
+                    let mut visibility = self
+                        .inner
+                        .live_visibility
+                        .for_write(vec![scope.space_id.clone()])
+                        .await;
+                    let mut connection = pool.acquire().await.map_err(|e| {
                         unavailable_retryable(
-                            "pg_end_lease_recheck",
+                            "pg_acquire_lease",
                             e.to_string(),
                             Duration::from_millis(50),
                         )
                     })?;
+                    let mut lease = PgTransactionLease::new(&mut connection);
+                    let timeout_ms = attempt
+                        .remaining()
+                        .saturating_add(Duration::from_secs(1))
+                        .as_millis()
+                        .min(i32::MAX as u128);
+                    let begin = format!(
+                        "BEGIN; SET LOCAL statement_timeout='{timeout_ms}ms'; SET LOCAL client_connection_check_interval='10ms'; SELECT pg_advisory_xact_lock_shared(hashtextextended(current_schema(), 7311229))"
+                    );
+                    let mut tx = lease
+                        .conn()
+                        .begin_with(sqlx::AssertSqlSafe(begin))
+                        .await
+                        .map_err(|e| internal_not_committed("pg_begin_lease", e.to_string()))?;
+                    let changed = self
+                        .update_lease_rows(
+                            &mut BackendConn::Postgres(&mut tx),
+                            scope,
+                            new_epoch,
+                            &attempt,
+                        )
+                        .await?;
+                    if !changed {
+                        tx.rollback().await.map_err(|e| {
+                            unavailable_retryable(
+                                "pg_end_lease_recheck",
+                                e.to_string(),
+                                Duration::from_millis(50),
+                            )
+                        })?;
+                        lease.complete();
+                        return Ok(false);
+                    }
+                    let fenced = crate::peers::list_fenced_collab_leases_tx(
+                        &mut BackendConn::Postgres(&mut tx),
+                        &scope.space_id,
+                        i64::MAX,
+                    )
+                    .await?;
+                    attempt.submit()?;
+                    visibility.committing();
+                    tx.commit().await.map_err(|e| {
+                        crate::codec::unknown_commit_outcome("pg_commit_lease", e.to_string())
+                    })?;
                     lease.complete();
-                    return Ok(false);
-                }
-                let fenced = crate::peers::list_fenced_collab_leases_tx(
-                    &mut BackendConn::Postgres(&mut tx),
-                    &scope.space_id,
-                    i64::MAX,
-                )
-                .await?;
-                attempt.submit()?;
-                visibility.committing();
-                tx.commit().await.map_err(|e| {
-                    crate::codec::unknown_commit_outcome("pg_commit_lease", e.to_string())
-                })?;
-                lease.complete();
-                fenced
-            };
-            // Synchronize every fenced and previously-cached local slot for this
-            // Space AFTER releasing the PG connection and writer commit guard so
-            // waiting for an in-flight local room fence never starves single-conn
-            // pools or safe points, while still clearing stale pre-takeover active
-            // slots and overwriting any higher local epoch from earlier ownership.
-            let fenced_map: std::collections::BTreeMap<_, _> = fenced.into_iter().collect();
-            let mut all_notes: std::collections::BTreeSet<_> = room_fences
-                .begin_space_takeover_sync(&scope.space_id)
-                .into_iter()
-                .collect();
-            all_notes.extend(fenced_map.keys().cloned());
-            for note in all_notes {
-                let fenced_epoch = fenced_map.get(&note).copied();
-                let lock = match fenced_epoch {
-                    Some(_) => Some(room_fences.get_or_init(scope, &note)),
-                    None => room_fences.existing_fence(scope, &note),
+                    fenced
                 };
-                if let Some(lock) = lock {
+                // Capture all local and fenced slots AFTER releasing the PG
+                // connection (avoiding single-conn pool starvation) while STILL
+                // holding `_gate` so a concurrent Space restore cannot
+                // interleave before `space_sync` records `(sync_gen, inc, epoch)`.
+                room_fences.begin_space_takeover_sync(scope, new_epoch, fenced)
+            };
+            // Lock and update each captured slot AFTER releasing `_gate` so
+            // waiting on an in-flight local room fence never blocks safe points.
+            if let Some((sync_gen, targets)) = takeover_sync {
+                for (note, (lock, fenced_epoch)) in targets {
                     let mut guard = lock.lock_owned().await;
                     let _ = room_fences.apply_takeover_transition(
                         scope,
+                        new_epoch,
+                        sync_gen,
                         &note,
                         &mut guard,
                         fenced_epoch,
                     );
-                } else {
-                    room_fences.clear_evicted_takeover_recovery(&scope.space_id, &note);
                 }
             }
             return Ok(true);
