@@ -35,11 +35,18 @@ use notarium_core::{
     ports::{ChangeBroadcast, ChangeRead, ChangeReadResult, EntityId, PageLimit, ServicePurpose},
     receipt::ChangeCursor,
 };
+use tokio::sync::oneshot;
 
 use crate::support::{
     StorageTestFixtures, TempDataRoot, assert_validation_err, maintenance_ctx, sample_folder_id,
     sample_incarnation, sample_installation_id, sample_principal_id, sample_space_id,
 };
+
+#[derive(Debug)]
+enum VersionReadFault {
+    NotFound,
+    Pause(oneshot::Sender<()>, oneshot::Receiver<()>),
+}
 
 /// Intercepting S3 transport wrapper over live MinIO CE that audits every S3 API call
 /// (enforcing 0 multipart/CopyObject calls and `If-None-Match: *` on all data PUTs)
@@ -54,6 +61,7 @@ struct AuditingFaultS3Transport {
     drop_next_cas_put_response: AtomicBool,
     versioning_on_next_marker: Mutex<Option<notarium_canonical::S3Config>>,
     recorded_cas_put_keys: Mutex<Vec<String>>,
+    version_read_fault: Mutex<Option<(String, VersionReadFault)>>,
 }
 
 impl AuditingFaultS3Transport {
@@ -67,6 +75,7 @@ impl AuditingFaultS3Transport {
             drop_next_cas_put_response: AtomicBool::new(false),
             versioning_on_next_marker: Mutex::new(None),
             recorded_cas_put_keys: Mutex::new(Vec::new()),
+            version_read_fault: Mutex::new(None),
         })
     }
 }
@@ -117,6 +126,26 @@ impl S3Transport for AuditingFaultS3Transport {
                 }
                 if let Some(k) = &req.key {
                     self.recorded_cas_put_keys.lock().unwrap().push(k.clone());
+                }
+            }
+
+            if is_cas_key && req.method == Method::GET {
+                let fault = self.version_read_fault.lock().unwrap().take_if(|(vid, _)| {
+                    req.query.iter().any(|(k, v)| k == "versionId" && v == vid)
+                });
+                match fault {
+                    Some((_, VersionReadFault::NotFound)) => {
+                        return Ok(S3RawResponse {
+                            status: 404,
+                            headers: Default::default(),
+                            body: Bytes::new(),
+                        });
+                    }
+                    Some((_, VersionReadFault::Pause(reached, resume))) => {
+                        reached.send(()).unwrap();
+                        resume.await.unwrap();
+                    }
+                    None => {}
                 }
             }
 
@@ -789,17 +818,57 @@ async fn l2_s3_minio_ce_modes_negative_controls_and_fencing_races() {
             .await
             .unwrap();
 
-        let ret_ids = store
-            .retire_zero_ref_digests(
-                &scope,
-                epoch2,
-                &[secret_prep.digest()],
-                RetirementReason::Purge,
-                None,
-            )
+        let digests = [secret_prep.digest()];
+        let retire = || {
+            store.retire_zero_ref_digests(&scope, epoch2, &digests, RetirementReason::Purge, None)
+        };
+        if expected_mode == S3BucketMode::Enabled {
+            let vid = stale_part0_vid.as_ref().expect("versioned data PUT");
+            *audit_transport.version_read_fault.lock().unwrap() =
+                Some((vid.clone(), VersionReadFault::NotFound));
+            assert!(
+                retire().await.is_err(),
+                "a still-listed unreadable version must block retirement"
+            );
+            let query = format!(
+                "SELECT retirement_id, data_version_ids_json, target_completed
+                 FROM \"{pg_schema}\".blob_retirement_targets WHERE physical_key = $1"
+            );
+            let (ret_id, saved, completed): (String, Option<String>, i32) =
+                sqlx::query_as(sqlx::AssertSqlSafe(query))
+                    .bind(&part0_key)
+                    .fetch_one(&mut fixtures.open_raw_pg().await)
+                    .await
+                    .unwrap();
+            assert_eq!((saved, completed), (None, 0));
+
+            // Pause the first driver at the listed data GET. The peer journals and deletes
+            // that exact version, then the first driver receives the real MinIO 404.
+            let (reached, paused) = oneshot::channel();
+            let (release, resume) = oneshot::channel();
+            *audit_transport.version_read_fault.lock().unwrap() =
+                Some((vid.clone(), VersionReadFault::Pause(reached, resume)));
+            let drive = || store.drive_retirement_to_completion(&scope, epoch2, &ret_id);
+            let peer = async {
+                paused.await.unwrap();
+                drive().await.expect("peer retirement");
+                release.send(()).unwrap();
+            };
+            let (first, ()) = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                tokio::join!(drive(), peer)
+            })
             .await
-            .expect("retire incomplete staging publication under new epoch");
-        assert_eq!(ret_ids.len(), 1);
+            .expect("overlapping retirement drivers");
+            first.expect("retirement after a peer removed the listed version");
+        } else {
+            assert_eq!(
+                retire()
+                    .await
+                    .expect("retire incomplete staging publication")
+                    .len(),
+                1
+            );
+        }
 
         // Now a delayed old-worker data PUT for unsent part 1 arrives AFTER marker: MUST get 412!
         let late_put1_resp = audit_transport

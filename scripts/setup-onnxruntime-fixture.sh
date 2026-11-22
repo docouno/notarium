@@ -4,6 +4,19 @@ umask 022
 
 # Extract the official CPU runtime from the SHA-256 pinned release wheel.
 # This fixture requires neither a Python installation nor a Cargo download feature.
+skip_api_fixtures=${NOTARIUM_SKIP_API_FIXTURES:-0}
+case "$skip_api_fixtures" in
+    0) ;;
+    1)
+        printf 'onnxruntime-fixture: skipping ONNX Runtime setup (NOTARIUM_SKIP_API_FIXTURES=1)\n' >&2
+        exit 0
+        ;;
+    *)
+        echo "invalid NOTARIUM_SKIP_API_FIXTURES value '$skip_api_fixtures' (expected 0 or 1)" >&2
+        exit 1
+        ;;
+esac
+
 os=$(uname -s)
 arch=$(uname -m)
 case "$os:$arch" in
@@ -30,7 +43,7 @@ reject_symlink() {
     fi
 }
 
-repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+repo_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)
 artifacts_dir="$repo_root/.artifacts"
 ort_dir="$artifacts_dir/onnxruntime"
 directory="$ort_dir/current"

@@ -24,11 +24,13 @@ RUN set -eux; \
 
 FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
 
+ARG NOTARIUM_FIXTURE_RECIPE_SHA256
 LABEL org.opencontainers.image.title="notarium-storage-fixture-minio-ce" \
       org.opencontainers.image.source="https://github.com/minio/minio" \
       org.opencontainers.image.version="RELEASE.2025-10-15T17-29-55Z" \
       org.opencontainers.image.revision="9e49d5e7a648f00e26f2246f4dc28e6b07f8c84a" \
-      io.notarium.minio-ce.tarball-sha256="45521908307306e925c98d629e1c17d78c8b72b6ee242b1bfb1409f7d8ee5841"
+      io.notarium.minio-ce.tarball-sha256="45521908307306e925c98d629e1c17d78c8b72b6ee242b1bfb1409f7d8ee5841" \
+      io.notarium.fixture-recipe-sha256="${NOTARIUM_FIXTURE_RECIPE_SHA256}"
 
 COPY --from=build /out/minio /usr/local/bin/minio
 ENTRYPOINT ["/usr/local/bin/minio"]

@@ -4,8 +4,8 @@ include .devkit/runtime/devkit.mk
 devkit_loader := scripts/devkit-with-control-db.sh
 
 # Process tests and desktop packaging consume standalone debug binaries.
-# API setup prepares digest-pinned PostgreSQL 16 and source-built MinIO CE fixtures;
-# API tests execute offline against ephemeral Unix domain socket fixtures.
+# API setup prepares digest-pinned PostgreSQL 16, source-built MinIO CE, and
+# pinned ONNX Runtime fixtures; API tests execute offline against local fixtures.
 setup-api: setup-storage-fixtures setup-onnxruntime-fixture
 test-api: build-api
 test-api: devkit_loader := docker/storage-fixtures/with-storage-fixtures.sh

@@ -308,6 +308,11 @@ retirements and re-uploads never collide:
   registered-but-unsent keys) instead of relying on S3 `DeleteMarker`s, and—on
   `Enabled` buckets—enumerates `ListObjectVersions` to issue exact `versionId`
   `DELETE` calls for prior data versions while preserving the terminal marker.
+  If recovery and a command replay overlap, a data version can disappear between
+  listing and reading it. The writer skips a missing version only after a fresh
+  listing of that key confirms its absence. Before confirming retirement, the
+  writer verifies that every remaining version is a terminal marker, including
+  the latest version.
 
 If versioning changes during retirement, the operation stays pending. After a
 restart with the detected `Enabled` mode, the writer resumes from the durable
@@ -579,11 +584,22 @@ same example against an isolated prefix.
 `make setup` pulls the digest-pinned `postgres:16-bookworm` image, builds the
 pinned MinIO Community image from source (`RELEASE.2025-10-15T17-29-55Z`, commit
 `9e49d5e7a648f00e26f2246f4dc28e6b07f8c84a`) and builds the `#![forbid(unsafe_code)]`
-Unix-socket-to-loopback S3 bridge (`compose.storage-tests.yaml`). `make test`
-starts an isolated per-run fixture stack (`--network none` / internal namespace)
+Unix-socket-to-loopback S3 bridge (`compose.storage-tests.yaml`). Setup reuses
+an image by recipe hash. The hash covers the Compose file, the Dockerfile, its
+local source inputs and the effective Docker ignore file. Each recipe has its
+own tag, so checkouts with different recipes can share a Docker daemon.
+Setup checks the `io.notarium.fixture-recipe-sha256` label before reuse.
+Pass `--force` to request both builds.
+
+```sh
+sh docker/storage-fixtures/with-storage-fixtures.sh setup-images --force
+```
+
+`make test` starts an isolated per-run fixture stack (`--network none` / internal namespace)
 mounted over `.artifacts/storage-tests/<run>/` Unix domain sockets and tears it
-down automatically via signal/exit traps. Integration tests fail closed if
-fixtures are absent.
+down automatically via signal/exit traps. The offline runner rejects missing
+or stale fixture images and starts services by their verified image IDs. Run
+`make setup app=api` to prepare the current recipes.
 
 The test and benchmark commands hold one checkout-wide fixture lock from startup
 through cleanup. Other checkouts can run independently.

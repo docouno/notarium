@@ -45,6 +45,150 @@ fn workspace_has_exactly_the_allowed_package_graph() {
     validate_metadata(&metadata(), &root()).unwrap();
 }
 
+fn assert_json_fields(value: &Value, fields: &[&str]) {
+    let object = value.as_object().expect("expected a JSON object");
+    assert!(
+        object.len() == fields.len() && fields.iter().all(|field| object.contains_key(*field)),
+        "expected fields {fields:?}, found {object:?}"
+    );
+}
+
+fn validate_shards(config: &Value, workspace: &BTreeSet<&str>) {
+    assert_json_fields(
+        config,
+        &["schema_version", "feature_anchor_crates", "shards"],
+    );
+    assert_eq!(config["schema_version"].as_u64(), Some(1));
+    let mut anchors = BTreeSet::new();
+    for anchor in config["feature_anchor_crates"].as_array().unwrap() {
+        let name = anchor.as_str().unwrap();
+        assert!(
+            workspace.contains(name) && anchors.insert(name),
+            "invalid anchor {name}"
+        );
+    }
+    assert!(
+        anchors.contains("notarium-bin"),
+        "missing notarium-bin anchor"
+    );
+
+    let mut ids = BTreeSet::new();
+    let mut assigned = BTreeSet::new();
+    let mut fixture_writers = 0;
+    let mut doc_runners = 0;
+    for shard in config["shards"].as_array().unwrap() {
+        assert_json_fields(
+            shard,
+            &[
+                "id",
+                "crates",
+                "needs_build_api",
+                "saves_fixture_cache",
+                "runs_doc_tests",
+            ],
+        );
+        let id = shard["id"].as_str().unwrap();
+        let valid_id = |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
+        let mut bytes = id.bytes();
+        assert!(
+            bytes.next().is_some_and(valid_id) && bytes.all(|byte| valid_id(byte) || byte == b'-'),
+            "invalid shard ID {id:?}"
+        );
+        assert!(ids.insert(id), "duplicate shard ID {id}");
+        let needs_build_api = shard["needs_build_api"].as_bool().unwrap();
+        fixture_writers += usize::from(shard["saves_fixture_cache"].as_bool().unwrap());
+        doc_runners += usize::from(shard["runs_doc_tests"].as_bool().unwrap());
+        let crates = shard["crates"].as_array().unwrap();
+        for krate in crates {
+            let name = krate.as_str().unwrap();
+            assert!(
+                assigned.insert(name),
+                "crate {name} assigned more than once"
+            );
+        }
+        assert!(!crates.is_empty(), "shard {id} has no crates");
+        assert!(
+            !crates.iter().any(|krate| krate == "fitness-gates") || needs_build_api,
+            "fitness-gates requires build-api"
+        );
+    }
+    assert_eq!(
+        &assigned, workspace,
+        "shards must cover the exact workspace"
+    );
+    assert_eq!(fixture_writers, 1, "expected one fixture cache writer");
+    assert_eq!(doc_runners, 1, "expected one workspace doc test runner");
+}
+
+#[test]
+fn ci_api_shards_cover_all_workspace_members_exactly() {
+    let actual = metadata();
+    let members: BTreeSet<_> = actual["workspace_members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|id| id.as_str().unwrap())
+        .collect();
+    let packages = actual["packages"].as_array().unwrap();
+    let workspace: BTreeSet<_> = packages
+        .iter()
+        .filter(|pkg| members.contains(pkg["id"].as_str().unwrap()))
+        .map(|pkg| pkg["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        workspace,
+        ALLOWED
+            .iter()
+            .map(|(name, _)| *name)
+            .collect::<BTreeSet<_>>()
+    );
+    assert_eq!(members.len(), workspace.len());
+    let config: Value = serde_json::from_slice(
+        &fs::read(root().join("../../scripts/ci-api-shards.json"))
+            .expect("read API shard manifest"),
+    )
+    .expect("parse API shard manifest");
+    validate_shards(&config, &workspace);
+}
+
+#[test]
+fn invalid_ci_api_shards_are_rejected() {
+    let valid = json!({
+        "schema_version": 1,
+        "feature_anchor_crates": ["notarium-bin"],
+        "shards": [
+            {"id": "bin", "crates": ["notarium-bin", "another-crate"], "needs_build_api": false,
+             "saves_fixture_cache": true, "runs_doc_tests": false},
+            {"id": "fitness", "crates": ["fitness-gates"], "needs_build_api": true,
+             "saves_fixture_cache": false, "runs_doc_tests": true}
+        ]
+    });
+    let workspace = BTreeSet::from(["notarium-bin", "another-crate", "fitness-gates"]);
+    validate_shards(&valid, &workspace);
+    let invalid_fields = [
+        ("/shards/0/crates", json!(["notarium-bin"])),
+        (
+            "/shards/0/crates",
+            json!(["notarium-bin", "another-crate", "fitness-gates"]),
+        ),
+        ("/shards/0/id", json!("../bin")),
+        ("/shards/0/id", json!("fitness")),
+        ("/shards/1/needs_build_api", json!(false)),
+        ("/shards/0/saves_fixture_cache", json!(false)),
+        ("/shards/1/saves_fixture_cache", json!(true)),
+        ("/shards/1/runs_doc_tests", json!(false)),
+        ("/shards/0/runs_doc_tests", json!(true)),
+    ];
+    for (field, replacement) in invalid_fields {
+        let mut config = valid.clone();
+        *config.pointer_mut(field).unwrap() = replacement;
+        assert!(
+            std::panic::catch_unwind(|| validate_shards(&config, &workspace)).is_err(),
+            "accepted invalid shard field {field}"
+        );
+    }
+}
+
 #[test]
 fn lock_contains_no_banned_packages() {
     let lock = document(&fs::read_to_string(root().join("Cargo.lock")).unwrap());
@@ -53,6 +197,64 @@ fn lock_contains_no_banned_packages() {
 
 fn document(input: &str) -> toml::Value {
     toml::from_str(input).unwrap_or_else(|error| panic!("{error}"))
+}
+
+fn validate_profile_packages(manifest: &toml::Value, lock: &toml::Value) -> Result<(), String> {
+    let locked: BTreeSet<_> = lock["package"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|pkg| {
+            (
+                pkg["name"].as_str().unwrap(),
+                pkg["version"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    let Some(profiles) = manifest.get("profile").and_then(toml::Value::as_table) else {
+        return Ok(());
+    };
+    for (profile, settings) in profiles {
+        let Some(packages) = settings.get("package").and_then(toml::Value::as_table) else {
+            continue;
+        };
+        for spec in packages.keys().filter(|spec| spec.as_str() != "*") {
+            let matches = match spec.split_once(['@', ':']) {
+                Some(pair) => locked.contains(&pair),
+                None => locked.iter().any(|(name, _)| *name == spec.as_str()),
+            };
+            if !matches {
+                return Err(format!(
+                    "profile.{profile}.package.{spec} does not match Cargo.lock"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn package_profile_overrides_match_locked_versions() {
+    let root = root();
+    let manifest = document(&fs::read_to_string(root.join("Cargo.toml")).unwrap());
+    let lock = document(&fs::read_to_string(root.join("Cargo.lock")).unwrap());
+    validate_profile_packages(&manifest, &lock).unwrap();
+}
+
+#[test]
+fn stale_package_profile_overrides_are_rejected() {
+    let lock = document("[[package]]\nname = 'scrypt'\nversion = '0.12.0'");
+    for spec in ["*", "scrypt", "scrypt@0.12.0", "scrypt:0.12.0"] {
+        let manifest = document(&format!("[profile.dev.package.\"{spec}\"]\nopt-level = 3"));
+        validate_profile_packages(&manifest, &lock).unwrap();
+    }
+    for spec in ["nonexistent-crate", "scrypt@0.0.1", "scrypt:0.0.1"] {
+        let manifest = document(&format!("[profile.test.package.\"{spec}\"]\nopt-level = 3"));
+        assert_eq!(
+            validate_profile_packages(&manifest, &lock).unwrap_err(),
+            format!("profile.test.package.{spec} does not match Cargo.lock")
+        );
+    }
 }
 
 fn bound_dependencies(manifest: &toml::Value, result: &mut BTreeSet<String>) {
