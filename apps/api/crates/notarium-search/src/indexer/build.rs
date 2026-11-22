@@ -339,6 +339,8 @@ async fn seed_vectors(
     cancel: &Cancellation,
 ) -> Result<SeededEpoch, ModelError> {
     let mut staged = SeedSegments::new(model.clone(), epoch_path.to_path_buf())?;
+    let mut has_complete_rows = false;
+    let mut partial_notes = BTreeSet::new();
     let mut failed_notes = BTreeSet::new();
     let mut missing_folders = BTreeSet::new();
     let mut after = None;
@@ -374,17 +376,22 @@ async fn seed_vectors(
                     priority: Priority::BulkImportBackfill,
                 })
                 .await?;
-            let outcome = match prepared {
+            let (outcome, has_rows) = match prepared {
                 NotePreparation::Ready(prepared) => {
-                    let (next, outcome) = staged.index(*prepared, &|_| None, cancel).await?;
+                    let (next, outcome, has_rows) =
+                        staged.index(*prepared, &|_| None, cancel).await?;
                     staged = next;
-                    outcome
+                    (outcome, has_rows)
                 }
-                NotePreparation::Finished(outcome) => outcome,
+                NotePreparation::Finished(outcome) => (outcome, false),
             };
             match outcome {
-                NoteIndexOutcome::Complete | NoteIndexOutcome::Denied => {}
+                NoteIndexOutcome::Complete => has_complete_rows |= has_rows,
+                NoteIndexOutcome::Denied => {}
                 NoteIndexOutcome::Pending => {
+                    if has_rows {
+                        partial_notes.insert(note.note_id.clone());
+                    }
                     failed_notes.insert(note.note_id);
                 }
                 NoteIndexOutcome::Fatal(error) => return Err(ModelError::Embedding(error)),
@@ -398,7 +405,7 @@ async fn seed_vectors(
 
     // Do not swap away from a healthy active epoch when every embeddable note
     // failed transiently during the replacement backfill.
-    if have_epoch && staged.is_empty() && !failed_notes.is_empty() {
+    if have_epoch && !has_complete_rows && !failed_notes.is_empty() {
         return Err(ModelError::Embedding(EmbeddingError::ModelUnavailable));
     }
 
@@ -411,7 +418,7 @@ async fn seed_vectors(
         staged.build_pending(&cancel_owned)?;
         staged.seal(&cancel_owned)?;
         let mut epoch = VectorEpoch::open_model(layout_owned, staged.model)?;
-        epoch.seed_segments(staged.sealed, seq)?;
+        epoch.seed_segments_excluding(staged.sealed, seq, &partial_notes)?;
         Ok(epoch)
     })
     .await
@@ -455,7 +462,7 @@ pub(super) async fn stage_repair(
     let mut staged = SeedSegments::new(model.clone(), directory.path.clone())?;
     // A cancelled async caller may leave a blocking seal running briefly.
     staged.repair_directory = Some(directory.clone());
-    let (mut staged, outcome) = match staged.index(note, existing, cancel).await {
+    let (mut staged, outcome, has_rows) = match staged.index(note, existing, cancel).await {
         Ok(result) => result,
         Err(ModelError::Index(error)) => return Err(error),
         Err(ModelError::Embedding(EmbeddingError::IndexingDenied)) => {
@@ -463,7 +470,7 @@ pub(super) async fn stage_repair(
         }
         Err(ModelError::Embedding(error)) => return Ok((None, NoteIndexOutcome::Fatal(error))),
     };
-    if staged.is_empty() || matches!(outcome, NoteIndexOutcome::Denied) {
+    if !has_rows || !matches!(outcome, NoteIndexOutcome::Complete) {
         return Ok((None, outcome));
     }
     let stop = cancel.clone();
@@ -498,10 +505,6 @@ impl SeedSegments {
         })
     }
 
-    fn is_empty(&self) -> bool {
-        self.pending.is_empty() && self.builder.is_empty() && self.sealed.is_empty()
-    }
-
     fn find_vector(&self, key: ContentDigest) -> Option<QuantizedVector> {
         self.pending_keys
             .get(&key)
@@ -520,7 +523,7 @@ impl SeedSegments {
         mut note: PreparedIndexNote<'_>,
         existing: &(dyn Fn(ContentDigest) -> Option<QuantizedVector> + Sync),
         cancel: &Cancellation,
-    ) -> Result<(Self, NoteIndexOutcome), ModelError> {
+    ) -> Result<(Self, NoteIndexOutcome, bool), ModelError> {
         let mut has_note_rows = false;
         let mut pending = false;
         while note.has_more() {
@@ -543,7 +546,7 @@ impl SeedSegments {
                     // staged rows. Discard this unpublished epoch and retry cleanly.
                     return Err(EmbeddingError::IndexingDenied.into());
                 }
-                NoteIndexOutcome::Denied => return Ok((self, NoteIndexOutcome::Denied)),
+                NoteIndexOutcome::Denied => return Ok((self, NoteIndexOutcome::Denied, false)),
                 NoteIndexOutcome::Fatal(error) => return Err(error.into()),
                 NoteIndexOutcome::Pending => pending = true,
                 NoteIndexOutcome::Complete => {}
@@ -572,6 +575,7 @@ impl SeedSegments {
             } else {
                 NoteIndexOutcome::Complete
             },
+            has_note_rows,
         ))
     }
 

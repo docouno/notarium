@@ -932,6 +932,20 @@ async fn rate_limited_prefix_yields_to_the_sweep_tail() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_partially_embedded_note_stays_out_of_search_until_complete() {
+    let _guard = INTEGRATION_LOCK.lock().await;
+    let data = TempDataRoot::new("search-note-budget");
+    let (store, runtime) = CanonicalRuntime::open(CanonicalConfig::local_default(
+        sample_installation_id(0x7c),
+        data.data_root(),
+    ))
+    .await
+    .unwrap();
+    hybrid_support::remote::atomic_note_budget(Arc::new(store), data.data_root()).await;
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lifecycle_overlay_and_resilience_regressions() {
     let _guard = INTEGRATION_LOCK.lock().await;
     let data = TempDataRoot::new("search-regressions");

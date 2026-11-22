@@ -598,10 +598,16 @@ fn backfill_preserves_note_parts_across_reopen_and_replacement() {
     let mut second = fixture(2, 64);
     second.metadata.note = first.metadata.note.clone();
     let sibling = fixture(3, 64);
+    let partial = fixture(4, 64);
+    let mut partial_tail = fixture(5, 64);
+    partial_tail.metadata.note = partial.metadata.note.clone();
     let mut staged = Vec::new();
     for (id, rows) in [
-        (1, vec![first.clone()]),
-        (2, vec![second.clone(), sibling.clone()]),
+        (1, vec![first.clone(), partial.clone()]),
+        (
+            2,
+            vec![second.clone(), sibling.clone(), partial_tail.clone()],
+        ),
     ] {
         let segment = SegmentBuilder::with_test_rows(&model(), 64, rows)
             .finish(&segment_file_path(&path, id))
@@ -610,10 +616,24 @@ fn backfill_preserves_note_parts_across_reopen_and_replacement() {
         staged.push((id, segment));
     }
     let mut epoch = VectorEpoch::open(layout.clone(), model(), 64).unwrap();
-    epoch.seed_segments(staged, seq(1)).unwrap();
+    epoch
+        .seed_segments_excluding(
+            staged,
+            seq(1),
+            &BTreeSet::from([partial.metadata.note.clone()]),
+        )
+        .unwrap();
+    assert!(epoch.matches_note_chunks(&partial.metadata.note, &[]));
     drop(epoch);
 
     let mut epoch = VectorEpoch::open(layout.clone(), model(), 64).unwrap();
+    assert!(epoch.matches_note_chunks(&partial.metadata.note, &[]));
+    for row in [partial, partial_tail] {
+        assert_eq!(
+            epoch.find_vector(row.metadata.key).unwrap().values(),
+            row.vector.values()
+        );
+    }
     let note = first.metadata.note.clone();
     assert!(epoch.matches_note_chunks(&note, &[first.clone(), second]));
     epoch

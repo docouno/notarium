@@ -367,6 +367,7 @@ impl Embedder {
             match grant {
                 Ok(Ok(Some((grant, project)))) => Some(RemoteNote {
                     backend: backend.clone(),
+                    embedded_batch: false,
                     resolver: resolver.clone(),
                     note,
                     grant,
@@ -541,6 +542,7 @@ impl Embedder {
 }
 
 struct RemoteNote<'a> {
+    embedded_batch: bool,
     note: &'a SearchIndexedNote,
     backend: Arc<RemoteEmbedder>,
     resolver: Arc<dyn SearchModelResolverPort>,
@@ -573,19 +575,27 @@ impl RemoteNote<'_> {
                     priority,
                 )
                 .await;
-            let Err(EmbeddingError::IndexingThrottled(delay)) = &result else {
-                return result;
+            let delay = match &result {
+                Err(EmbeddingError::IndexingThrottled(delay)) => *delay,
+                // A smaller note may fit even now. Wait only for a note that
+                // has already embedded content in this attempt.
+                Err(EmbeddingError::IndexingTokenLimit(delay)) if self.embedded_batch => *delay,
+                Ok(rows) => {
+                    self.embedded_batch |= rows.iter().any(Option::is_some);
+                    return result;
+                }
+                _ => return result,
             };
             // Keep this note private for one Control rate window. A second
             // refusal without progress releases staging to the worker backoff.
-            if retried || *delay > std::time::Duration::from_secs(60) {
+            if retried || delay > std::time::Duration::from_secs(60) {
                 return result;
             }
             // The scheduler has already released its lane to other callers.
             tokio::select! {
                 biased;
                 () = budget.cancellation.cancelled() => return Err(EmbeddingError::Cancelled),
-                () = tokio::time::sleep(*delay) => {}
+                () = tokio::time::sleep(delay) => {}
             }
             *budget = crate::indexer::new_budget(&budget.cancellation);
             let started = std::time::Instant::now();
@@ -746,7 +756,7 @@ impl PreparedIndexNote<'_> {
                     );
                     continue;
                 }
-                Err(EmbeddingError::BudgetExceeded) => {
+                Err(EmbeddingError::BudgetExceeded | EmbeddingError::IndexingTokenLimit(_)) => {
                     pending = true;
                     self.descriptors = Vec::new().into_iter();
                     break;

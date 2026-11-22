@@ -1334,6 +1334,15 @@ impl VectorEpoch {
         staged: Vec<(u64, MmapSegment)>,
         seq: SpaceSeq,
     ) -> Result<(), VectorError> {
+        self.seed_segments_excluding(staged, seq, &BTreeSet::new())
+    }
+
+    pub(crate) fn seed_segments_excluding(
+        &mut self,
+        staged: Vec<(u64, MmapSegment)>,
+        seq: SpaceSeq,
+        partial_notes: &BTreeSet<NoteId>,
+    ) -> Result<(), VectorError> {
         if seq < self.manifest.vector_seq || !self.segments.is_empty() || !self.mutable.is_empty() {
             return Err(VectorError::CorruptIndex);
         }
@@ -1345,10 +1354,29 @@ impl VectorEpoch {
                 return Err(VectorError::InvalidDimension);
             }
             max_id = max_id.max(id);
+            // Persist exclusions before the manifest can name this segment.
+            // Repair can still reuse these paid vectors by their content keys.
+            let mut tombstones = Tombstones::default();
+            if !partial_notes.is_empty() {
+                let first = data.note_id_by_ord(0).ok_or(VectorError::CorruptIndex)?;
+                let last = data
+                    .note_id_by_ord(data.num_notes() - 1)
+                    .ok_or(VectorError::CorruptIndex)?;
+                for note in partial_notes.range(first..=last) {
+                    if let Some(slots) = data.note_slots(note) {
+                        for slot in slots {
+                            tombstones.mark(slot);
+                        }
+                    }
+                }
+                if !tombstones.bitmap().is_empty() {
+                    tombstones.persist(&tombstone_path(&self.path, id))?;
+                }
+            }
             segments.push(Segment {
                 id,
                 data: Arc::new(data),
-                tombstones: Tombstones::default(),
+                tombstones,
                 superseded: Bitmap::new(),
             });
         }

@@ -991,7 +991,9 @@ async fn remote_parts_distinguish_permanent_denial_from_transient_provider_error
             .await
             .unwrap_err();
         if budget == BudgetKind::Tokens {
-            assert!(matches!(error, EmbeddingError::BudgetExceeded));
+            assert!(
+                matches!(error, EmbeddingError::IndexingTokenLimit(delay) if delay == Duration::from_millis(1234))
+            );
         } else {
             assert!(matches!(
                 error,

@@ -102,7 +102,10 @@ without an active plan, delete overflow flushes tombstones and resets the
 journal) and read-only, single-pass BLAKE3-checksummed v2 mmap segments
 (112 MiB estimated build budget per segment). A long note can span several
 segments. Backfill and direct replacements publish all its pieces in one
-manifest update. Backfill, dirty-note repair and full sweeps process at most
+manifest update. If an embedding response leaves a note incomplete, its
+partial revision stays out of vector results. Complete notes can still be
+published, and the missing note remains eligible for repair. Backfill,
+dirty-note repair and full sweeps process at most
 256 pending quantized rows (1 MiB of i8 payload at 4,096 dimensions). Warm
 repair reads up to 16 carriers per page and checks admitted chunk metadata
 against the current snapshot before copying embeddings. Long replacements use
@@ -212,8 +215,10 @@ sweep pages for other notes remain eligible. Failed notes share a retry
 deadline. When a request or concurrency quota is exhausted, the affected
 Space pauses background indexing for that target. The current batch can retry
 once after the reported delay, with fresh admission, while the scheduler
-remains available to queries and other Spaces. Repeated refusals or waits
-longer than a minute return to worker backoff.
+remains available to queries and other Spaces. This bounded retry also applies
+when the provider has already accepted part of a note and its next batch hits
+the token quota. An initial token refusal defers that note immediately.
+Repeated refusals or waits longer than a minute release the private batch.
 Each page can finish while unrelated edits arrive. If a note changes during
 its embedding call, the worker discards that result and retries the new text.
 

@@ -336,6 +336,10 @@ fn indexing_provider_error(error: DomainError) -> EmbeddingError {
             budget: BudgetKind::Requests | BudgetKind::Concurrency,
             retry_after_ms,
         } => EmbeddingError::IndexingThrottled(Duration::from_millis(retry_after_ms)),
+        DomainError::RateLimited {
+            budget: BudgetKind::Tokens,
+            retry_after_ms,
+        } => EmbeddingError::IndexingTokenLimit(Duration::from_millis(retry_after_ms)),
         DomainError::RateLimited { .. } => EmbeddingError::BudgetExceeded,
         DomainError::Provider {
             error: ProviderErrorCode::BudgetMismatch,

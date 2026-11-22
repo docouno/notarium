@@ -1,5 +1,7 @@
 mod folder_privacy;
+mod note_budget;
 pub use folder_privacy::folder_eligibility;
+pub use note_budget::atomic_note_budget;
 
 use super::{ControlledCarriers, Projection, View, context, context_with_grant, status_field};
 use crate::{acknowledged, note, query};
@@ -206,6 +208,7 @@ impl SharedQuota {
         let budget = match self.rejected.len() {
             0 if self.paid_chunks.len() >= 256 => BudgetKind::Requests,
             1 if self.paid_chunks.len() >= 272 => BudgetKind::Concurrency,
+            2 if self.paid_chunks.len() >= 288 => BudgetKind::Tokens,
             _ => {
                 for input in inputs {
                     let EmbeddingInput::Part(part) = input else {
@@ -244,6 +247,7 @@ pub(super) struct ModelProvider {
     token_limit: AtomicU32,
     rate_limited: AtomicUsize,
     shared_quota: Mutex<Option<(ProviderResourceId, SharedQuota)>>,
+    note_quota: Mutex<Option<note_budget::NoteQuota>>,
     pub(super) block_next_part: AtomicBool,
     pub(super) part_started: Notify,
     pub(super) release_part: Notify,
@@ -312,6 +316,9 @@ impl EmbeddingProviderPort for ModelProvider {
                 {
                     quota.admit(&request.inputs)?;
                 }
+                if let Some(quota) = self.note_quota.lock().unwrap().as_mut() {
+                    quota.admit(&request.inputs)?;
+                }
                 let limit = self.token_limit.load(Ordering::SeqCst);
                 if limit != 0 && request.declared_tokens > limit {
                     self.rate_limited.fetch_add(1, Ordering::SeqCst);
@@ -330,10 +337,24 @@ impl EmbeddingProviderPort for ModelProvider {
             let provider_offset =
                 usize::from(request.provider == ProviderResourceId::from_bytes([6; 16]));
             vector[2 * runtime_epoch + provider_offset] = 1.0;
+            let vectors = request
+                .inputs
+                .iter()
+                .map(|input| {
+                    let mut row = vector.clone();
+                    // Give the atomic-note probe a distinctive semantic match at the end.
+                    if input.text() == "semanticbudgetprobe"
+                        || input.text().contains("atomiclastpiece")
+                    {
+                        row[17] = 2.0;
+                    }
+                    Ok(row)
+                })
+                .collect();
             Ok(EmbeddingResult {
                 model: request.model,
                 dimension: 64,
-                vectors: vec![Ok(vector); request.inputs.len()],
+                vectors,
                 usage: ProviderUsage::Unknown,
             })
         })
@@ -474,7 +495,7 @@ pub async fn rate_limited_repair(store: Arc<CanonicalStore>, root: DataRoot) {
     .expect("the original target must have a healthy checkpoint");
     engine.shutdown().await;
 
-    // Both quotas interrupt the first note after its first 256-row window.
+    // All three quotas interrupt the first note after its first 256-row window.
     // The old complete epoch remains visible until the replacement is ready.
     let original = resolver.current_target();
     resolver.provider.store(6, Ordering::SeqCst);
@@ -514,12 +535,12 @@ pub async fn rate_limited_repair(store: Arc<CanonicalStore>, root: DataRoot) {
     })
     .await
     .expect("shared limits must allow the entire replacement epoch to finish");
-    assert_eq!(observed_pauses.len(), 2);
+    assert_eq!(observed_pauses.len(), 3);
     engine.shutdown().await;
     let (_, quota) = provider.shared_quota.lock().unwrap().take().unwrap();
     assert_eq!(quota.admitted_notes.len(), 17);
     assert_eq!(quota.admitted_notes[&sample_note_id(1)], 320);
-    assert_eq!(quota.rejected.len(), 2);
+    assert_eq!(quota.rejected.len(), 3);
     let delay = Duration::from_millis(quota.retry_ms);
     for rejected in quota.rejected {
         assert!(quota.attempts[rejected + 1].duration_since(quota.attempts[rejected]) >= delay);

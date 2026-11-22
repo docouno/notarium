@@ -537,10 +537,8 @@ pub(super) async fn run_embed_batch(
                 NoteIndexOutcome::Complete | NoteIndexOutcome::Denied => {}
                 NoteIndexOutcome::Pending => {
                     retry_notes.push(note_id.clone());
-                    if chunks.is_none() {
-                        last_processed = Some(note_id);
-                        continue;
-                    }
+                    last_processed = Some(note_id);
+                    continue;
                 }
                 NoteIndexOutcome::Fatal(EmbeddingError::ModelUnavailable) => {
                     return Ok(EmbedBatchOutcome::ModelChanged);
