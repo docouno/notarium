@@ -49,7 +49,7 @@ pub struct CommandIdentitySpec {
     pub actor: PrincipalId,
     pub command_key: CommandKey,
     pub command_hash: ContentDigest,
-    legacy: Option<Arc<fingerprint::LegacyFingerprint>>,
+    stored_fingerprints: Option<Arc<fingerprint::StoredFingerprints>>,
     pub(crate) require_receipt_detail: bool,
     pub(crate) authority:
         Option<Arc<(notarium_core::auth::EngineAuthContext, replay::ReplayPolicy)>>,
@@ -61,7 +61,7 @@ impl CommandIdentitySpec {
             command_key,
             command_hash,
             authority: None,
-            legacy: None,
+            stored_fingerprints: None,
             require_receipt_detail: false,
         }
     }
@@ -1280,6 +1280,9 @@ async fn run_batch_worker_loop(
 
     loop {
         let next = if let Some((id, registry)) = &pg_space {
+            if rx.is_empty() {
+                cached_pg_conn = None;
+            }
             match tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
                 Ok(entry) => entry,
                 Err(_) => {
@@ -1357,6 +1360,7 @@ async fn run_batch_worker_loop(
                     break;
                 }
 
+                cached_pg_conn = None;
                 tokio::select! {
                     biased;
                     maybe_entry = rx.recv() => {
@@ -1409,6 +1413,7 @@ async fn run_batch_worker_loop(
         }
         drop(_commit_read_guard);
         if rx.is_empty() {
+            cached_pg_conn = None;
             tokio::task::yield_now().await;
         }
     }
@@ -1423,6 +1428,7 @@ pub(crate) enum SpaceBatchEntry {
         effective_cut: SpaceSeq,
         max_purge_seq: Option<SpaceSeq>,
         targets: crate::changes::CommittedTargetAcc,
+        changes: crate::projection_fence::VisibilityChanges,
     },
 }
 
@@ -1457,6 +1463,37 @@ async fn flush_single_batch(
         inner: Arc::clone(inner),
     };
 
+    let mut visibility_spaces = Vec::with_capacity(batch.len());
+    for entry in &batch {
+        match entry {
+            QueuedWriteEntry::Single { intent, .. } => {
+                visibility_spaces.push(intent.scope.space_id.clone());
+            }
+            QueuedWriteEntry::RoomWal { intent, .. } => {
+                visibility_spaces.push(intent.prepared.scope.space_id.clone());
+            }
+            QueuedWriteEntry::Group {
+                space_id, intents, ..
+            } => {
+                visibility_spaces.push(space_id.clone());
+                visibility_spaces
+                    .extend(intents.iter().map(|intent| intent.scope.space_id.clone()));
+            }
+        }
+    }
+    let mut visibility = match inner
+        .live_visibility
+        .try_for_write(visibility_spaces.clone())
+    {
+        Some(v) => v,
+        None => {
+            // Release any retained PG socket before awaiting gate locks so a
+            // gate holder waiting on pool.acquire() cannot AB-BA deadlock.
+            drop(cached_pg_conn.take());
+            inner.live_visibility.for_write(visibility_spaces).await
+        }
+    };
+
     let mut reserved_list = Vec::with_capacity(batch.len());
     let mut reply_targets = Vec::with_capacity(batch.len());
     let mut group_spaces = Vec::new();
@@ -1467,6 +1504,8 @@ async fn flush_single_batch(
     );
     let mut items: Vec<UnpackedBatchItem> = Vec::with_capacity(batch.len());
 
+    // Mailbox admission can precede a local owner drain. This guard keeps the
+    // execution-time lease check ordered with revocation through SQL commit.
     for entry in batch {
         match entry {
             QueuedWriteEntry::Single {
@@ -1476,6 +1515,12 @@ async fn flush_single_batch(
                 staged_bytes_reserved,
                 reply_tx,
             } => {
+                if let Err(error) =
+                    inner.check_writer_epoch(&intent.scope.space_id, intent.active_epoch)
+                {
+                    let _ = reply_tx.send(Err(error));
+                    continue;
+                }
                 reserved_list.push(staged_bytes_reserved);
                 reply_targets.push(ReplyTarget::Single { reply_tx });
                 items.push((intent.into(), sqlite_fast_plan, pg_fast_plan));
@@ -1486,6 +1531,13 @@ async fn flush_single_batch(
                 staged_bytes_reserved,
                 reply_tx,
             } => {
+                if let Some(expected) = intent.expected_epoch()
+                    && let Err(error) =
+                        inner.check_writer_epoch(&intent.prepared.scope.space_id, expected)
+                {
+                    let _ = reply_tx.send(Err(error));
+                    continue;
+                }
                 reserved_list.push(staged_bytes_reserved);
                 reply_targets.push(ReplyTarget::Single { reply_tx });
                 items.push((intent, sqlite_fast_plan, None));
@@ -1496,6 +1548,12 @@ async fn flush_single_batch(
                 staged_bytes_reserved,
                 reply_tx,
             } => {
+                if let Err(error) = group_intents.iter().try_for_each(|intent| {
+                    inner.check_writer_epoch(&intent.scope.space_id, intent.active_epoch)
+                }) {
+                    let _ = reply_tx.send(Err(error));
+                    continue;
+                }
                 let count = group_intents.len();
                 let all_idempotent = group_intents.iter().all(|it| it.idempotency.is_some());
                 reserved_list.push(staged_bytes_reserved);
@@ -1511,7 +1569,11 @@ async fn flush_single_batch(
         }
     }
 
-    let exec_result = match &inner.sql {
+    if reply_targets.is_empty() {
+        return;
+    }
+    visibility.committing();
+    let mut exec_result = match &inner.sql {
         SqlDriverState::Sqlite { writer, .. } => {
             #[cfg(feature = "test-support")]
             let rollback_fault_armed = faults.rollback_commit_response_once.load(Ordering::Acquire);
@@ -1638,12 +1700,35 @@ async fn flush_single_batch(
         }
     };
 
+    match &exec_result {
+        BatchExecOutcome::Committed {
+            visibility_windows, ..
+        } => {
+            if visibility.needs_storage_read(&store, visibility_windows) {
+                // Release any retained writer socket before visibility refreshes
+                // so concurrent per-Space workers cannot exhaust the PG pool.
+                drop(cached_pg_conn.take());
+            }
+            if let Err(error) = visibility.published(&store, visibility_windows).await {
+                let BatchExecOutcome::Committed { slots, .. } = exec_result else {
+                    unreachable!("checking a committed batch");
+                };
+                exec_result = BatchExecOutcome::UnknownCommit {
+                    slots,
+                    diag_reason: format!("projection erasure pending: {error:?}"),
+                };
+            }
+        }
+        BatchExecOutcome::AbortedBeforeCommit(_) => visibility.aborted(),
+        BatchExecOutcome::UnknownCommit { .. } => visibility.invalidate(),
+    }
     drop(reserved_list);
 
     match exec_result {
         BatchExecOutcome::Committed {
             slots,
             space_effective_cuts,
+            ..
         } => {
             let mut slot_iter = slots.into_iter();
             for target in reply_targets {
@@ -1773,12 +1858,41 @@ pub(crate) enum BatchExecOutcome {
     Committed {
         slots: Vec<ItemOutcomeSlot>,
         space_effective_cuts: BTreeMap<SpaceId, SpaceSeq>,
+        visibility_windows: Vec<crate::projection_fence::VisibilityWindow>,
     },
     UnknownCommit {
         slots: Vec<ItemOutcomeSlot>,
         diag_reason: String,
     },
     AbortedBeforeCommit(PortError),
+}
+
+pub(crate) fn visibility_windows(
+    _store: &crate::CanonicalStore,
+    states: &BTreeMap<SpaceId, SpaceBatchEntry>,
+) -> Vec<crate::projection_fence::VisibilityWindow> {
+    states
+        .values()
+        .filter_map(|entry| match entry {
+            SpaceBatchEntry::Loaded {
+                record,
+                persisted_initial_seq,
+                effective_cut,
+                changes,
+                ..
+            } => Some(crate::projection_fence::VisibilityWindow {
+                scope: record.scope.clone(),
+                after: *persisted_initial_seq,
+                through: *effective_cut,
+                changes: if persisted_initial_seq < effective_cut {
+                    *changes
+                } else {
+                    crate::projection_fence::VisibilityChanges::default()
+                },
+            }),
+            _ => None,
+        })
+        .collect()
 }
 
 async fn execute_batch_on_conn(
@@ -1827,6 +1941,7 @@ async fn execute_batch_on_conn(
                             effective_cut: init_seq,
                             max_purge_seq: None,
                             targets: crate::changes::CommittedTargetAcc::default(),
+                            changes: crate::projection_fence::VisibilityChanges::default(),
                         },
                     );
                 }
@@ -1860,6 +1975,7 @@ async fn execute_batch_on_conn(
                             effective_cut: init_seq,
                             max_purge_seq: None,
                             targets: crate::changes::CommittedTargetAcc::default(),
+                            changes: crate::projection_fence::VisibilityChanges::default(),
                         },
                     );
                 }
@@ -1894,6 +2010,7 @@ async fn execute_batch_on_conn(
                 new_effective_cut,
                 item_purge_seq,
                 committed_events,
+                item_changes,
                 dir_syncs,
                 retained_tickets,
                 retained_guards,
@@ -1907,6 +2024,7 @@ async fn execute_batch_on_conn(
                     effective_cut,
                     max_purge_seq,
                     targets,
+                    changes,
                     ..
                 }) = space_states.get_mut(&space_id)
                 {
@@ -1915,6 +2033,7 @@ async fn execute_batch_on_conn(
                         *max_purge_seq = Some(max_purge_seq.map_or(pseq, |prev| prev.max(pseq)));
                     }
                     targets.record_events(&committed_events);
+                    changes.merge(item_changes);
                 }
                 batch_dir_syncs.merge(&dir_syncs);
                 batch_retained_tickets.extend(retained_tickets);
@@ -1937,6 +2056,7 @@ async fn execute_batch_on_conn(
                     return BatchExecOutcome::Committed {
                         slots: vec![ItemOutcomeSlot::Failed(item_err)],
                         space_effective_cuts,
+                        visibility_windows: visibility_windows(store, &space_states),
                     };
                 }
                 // Rollback ONLY this item's savepoint; virtual `effective_cut` stays unchanged!
@@ -2053,6 +2173,7 @@ async fn execute_batch_on_conn(
                     effective_cut,
                     max_purge_seq,
                     targets,
+                    ..
                 } = entry
                 {
                     space_effective_cuts.insert(sid.clone(), *effective_cut);
@@ -2088,6 +2209,7 @@ async fn execute_batch_on_conn(
             BatchExecOutcome::Committed {
                 slots,
                 space_effective_cuts,
+                visibility_windows: visibility_windows(store, &space_states),
             }
         }
         Err(commit_err) => {
@@ -2106,6 +2228,7 @@ struct SingleItemSuccess {
     new_effective_cut: SpaceSeq,
     item_purge_seq: Option<SpaceSeq>,
     committed_events: Vec<BatchEventDraft>,
+    item_changes: crate::projection_fence::VisibilityChanges,
     dir_syncs: PendingDirSyncs,
     retained_tickets: Vec<StagedBlobTicket>,
     retained_guards: Vec<Box<dyn Send>>,
@@ -2159,6 +2282,7 @@ async fn execute_single_item_in_savepoint(
                 retained_tickets: Vec::new(),
                 retained_guards: Vec::new(),
                 after_commit: None,
+                item_changes: crate::projection_fence::VisibilityChanges::default(),
             }),
             _ => Err(unavailable_retryable(
                 "command_receipt_pending",
@@ -2294,12 +2418,14 @@ async fn execute_single_item_in_savepoint(
         .filter(|ev| ev.op_kind == "purge")
         .map(|ev| ev.space_seq)
         .max();
+    let item_changes = crate::projection_fence::VisibilityChanges::from_events(&artifacts.events);
 
     Ok(SingleItemSuccess {
         response_bytes: artifacts.response_bytes,
         new_effective_cut: last_seq,
         item_purge_seq,
         committed_events: artifacts.events,
+        item_changes,
         dir_syncs: item_ctx.pending_dir_syncs,
         retained_tickets: item_ctx.retained_tickets,
         retained_guards: item_ctx.retained_guards,

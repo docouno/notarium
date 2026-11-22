@@ -76,7 +76,7 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls-no-p
 tonic = { version = "0.14", default-features = false, features = ["transport", "tls-ring", "router", "codegen"] }
 tonic-prost = "0.14"
 prost = "0.14"
-croaring = "2"
+croaring = "=2.9.0"
 memmap2 = "0.9"
 arc-swap = "1"
 tantivy = "0.27"
@@ -98,6 +98,7 @@ unicode-normalization = "0.1"
 saphyr-parser = "0.3"
 
 rustix = { version = "1", features = ["fs"] }
+same-file = "1.0.6"
 rusqlite = { version = "=0.39.0", default-features = false, features = ["backup", "bundled", "cache", "hooks"] }
 base64 = "0.22"
 getrandom = "0.4"
@@ -109,6 +110,74 @@ openidconnect = { version = "=4.1.0", default-features = false }
 cron = "0.15"
 chrono-tz = "0.10"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
+
+[profile.dev]
+debug = "line-tables-only"
+
+# The test profile inherits dev. Optimize dependencies and keep workspace
+# crates easy to debug without full dependency debuginfo.
+[profile.dev.package."*"]
+opt-level = 1
+debug = 0
+
+# SQLite's amalgamation is a single translation unit on the build's critical path.
+[profile.dev.package.libsqlite3-sys]
+opt-level = 2
+
+# Memory-hard KDFs, cryptographic primitives and native storage codecs.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
+
+[profile.dev.package.scrypt]
+opt-level = 3
+
+[profile.dev.package.salsa20]
+opt-level = 3
+
+[profile.dev.package.pbkdf2]
+opt-level = 3
+
+[profile.dev.package.hmac]
+opt-level = 3
+
+[profile.dev.package.sha2]
+opt-level = 3
+
+[profile.dev.package.digest]
+opt-level = 3
+
+[profile.dev.package.block-buffer]
+opt-level = 3
+
+[profile.dev.package.crypto-common]
+opt-level = 3
+
+[profile.dev.package.subtle]
+opt-level = 3
+
+[profile.dev.package.blake3]
+opt-level = 3
+
+[profile.dev.package.aes]
+opt-level = 3
+
+[profile.dev.package.aes-gcm]
+opt-level = 3
+
+[profile.dev.package.ghash]
+opt-level = 3
+
+[profile.dev.package.polyval]
+opt-level = 3
+
+[profile.dev.package.zstd-sys]
+opt-level = 3
+
+[profile.dev.package.croaring-sys]
+opt-level = 3
 
 [patch.crates-io]
 pulldown-cmark = { path = "vendor/pulldown-cmark" }

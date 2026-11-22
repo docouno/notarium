@@ -1304,7 +1304,11 @@ async fn watch_storage(
                     }
                 }
             }
-            Ok(SpaceSignal::Purged { scope, .. } | SpaceSignal::WriterLeaseChanged { scope }) => {
+            Ok(
+                SpaceSignal::CatalogChanged { scope, .. }
+                | SpaceSignal::Purged { scope, .. }
+                | SpaceSignal::WriterLeaseChanged { scope },
+            ) => {
                 for room in hub.active_rooms() {
                     if room.scope().space_id == scope.space_id {
                         room.storage_changed();

@@ -4,17 +4,20 @@ use super::{
     admission::DispatchAuthority,
     execution::{CancelOnDrop, Job, Request, Runtime},
     records::*,
-    wire,
+    selection, wire,
 };
 use crate::{
     error::{invalid, unavailable},
     outbound::{OutboundRequest, OutboundResponse},
-    store::target::ProviderCallLogRow,
+    store::{lease::OperationBudget, target::ProviderCallLogRow},
 };
 use notarium_core::{
     DomainError,
+    auth::{AuthenticatedCredential, PrincipalKind},
+    classes::DocClass,
     error::{BudgetKind, CommitEffect, PortError, ValidationReason},
     ids::*,
+    model::{FolderRef, Lifecycle},
     ports::{control::*, *},
 };
 use reqwest::{
@@ -22,6 +25,7 @@ use reqwest::{
     header::{ACCEPT, CONTENT_TYPE, HeaderValue},
 };
 use std::{
+    collections::BTreeSet,
     future::Future,
     sync::{Arc, Mutex},
 };
@@ -248,15 +252,56 @@ impl ProviderService {
         sender: Option<&mpsc::Sender<CompletionEvent>>,
         progress: &mut Progress,
     ) -> Result<Output, PortError> {
+        let allow_search_indexing = match (job.ctx.auth().kind(), job.ctx.auth().credential()) {
+            (
+                PrincipalKind::SearchIndexing,
+                Some(AuthenticatedCredential::SearchIndexing { space, provider }),
+            ) => {
+                let binding_ok = provider == job.resource()
+                    && job
+                        .scope
+                        .as_ref()
+                        .is_some_and(|scope| &scope.space_id == space)
+                    && matches!(job.request, Request::Embedding(_))
+                    && !job.embedding_inputs().is_empty()
+                    && job
+                        .embedding_inputs()
+                        .iter()
+                        .all(|input| matches!(input, EmbeddingInput::Part(_)));
+                if !binding_ok {
+                    return Err(DomainError::AccessDenied.into());
+                }
+                true
+            }
+            (PrincipalKind::SearchIndexing, _)
+            | (_, Some(AuthenticatedCredential::SearchIndexing { .. })) => {
+                return Err(DomainError::AccessDenied.into());
+            }
+            _ => false,
+        };
         let hash = job.fingerprint()?;
         let scope_key = job.scope_key()?;
         let (mut tx, auth) = runtime
             .run(
-                self.control.open_revalidated_read(
-                    &runtime.budget,
-                    &job.ctx.budget.request,
-                    job.ctx.auth(),
-                ),
+                async {
+                    if allow_search_indexing {
+                        self.control
+                            .open_revalidated_read_for_search_indexing(
+                                &runtime.budget,
+                                &job.ctx.budget.request,
+                                job.ctx.auth(),
+                            )
+                            .await
+                    } else {
+                        self.control
+                            .open_revalidated_read(
+                                &runtime.budget,
+                                &job.ctx.budget.request,
+                                job.ctx.auth(),
+                            )
+                            .await
+                    }
+                },
                 CommitEffect::NotCommitted,
             )
             .await?;
@@ -284,6 +329,12 @@ impl ProviderService {
                 CommitEffect::NotCommitted,
             )
             .await?;
+        if let Request::Embedding(request) = &job.request
+            && let Some(expected) = request.runtime_epochs()
+            && runtime_epochs(&snapshot.resource, snapshot.credential.as_ref())? != expected
+        {
+            return Err(selection::unavailable());
+        }
         let primary = if let Some(scope) = &job.scope {
             let ctx = SpaceContext::new(job.ctx.auth().clone(), scope.clone(), runtime.context())?;
             Some(
@@ -299,18 +350,23 @@ impl ProviderService {
         };
         let parts = job.parts();
         let current = if primary.is_some() {
+            let egress = job.egress(&parts)?;
+            let project_folders = egress.project_folders.clone();
             let lease = runtime
                 .run(
                     self.egress.acquire_egress(
                         AccountContext::new(job.ctx.auth().clone(), runtime.context()),
-                        job.egress(&parts)?,
+                        egress,
                         runtime.cancelled.clone(),
                     ),
                     CommitEffect::NotCommitted,
                 )
                 .await?;
             lease.check()?;
-            if lease.project() != job.project() || lease.current().len() > 4096 {
+            if lease.project() != job.project()
+                || lease.project_folders() != &project_folders
+                || lease.current().len() > 4096
+            {
                 return Err(invalid(ValidationReason::SourceMismatch));
             }
             let current = lease.current().to_vec();
@@ -329,8 +385,14 @@ impl ProviderService {
             primary: primary.as_ref(),
             project: job.project(),
             parts: &parts,
+            embedding_inputs: job.embedding_inputs(),
+            selection: match &job.request {
+                Request::Embedding(request) => Some(&request.selection),
+                _ => None,
+            },
             current: &current,
             keeper: keeper.as_ref(),
+            allow_search_indexing,
         };
         let body = job.encode(&snapshot)?;
         let mut tx = runtime
@@ -450,7 +512,19 @@ impl ProviderService {
             expires,
             self.control.clock.now_ms()?,
         )?;
-        progress.response = Some(self.outbound.start(
+        let query_taint = job
+            .embedding_inputs()
+            .iter()
+            .any(|input| matches!(input, EmbeddingInput::Query(_)))
+            .then(|| job.ctx.auth().taint().clone());
+        let check_query_taint = move || {
+            if query_taint.as_ref().is_some_and(|taint| taint.is_tainted()) {
+                return Err(DomainError::CrossSpaceTainted.into());
+            }
+            Ok(())
+        };
+        check_query_taint()?;
+        progress.response = Some(self.outbound.start_checked(
             network_budget,
             OutboundRequest {
                 scope: scope(
@@ -473,11 +547,13 @@ impl ProviderService {
                     32 * 1024 * 1024
                 },
             },
+            check_query_taint,
         )?);
         progress.submitted = true;
         let response = progress.response.as_mut().expect("started transport");
         if let Err(error) = progress.leases.run(runtime, response.receive_head()).await {
             if matches!(&error,PortError::Unavailable(failure) if failure.effect()==CommitEffect::NotCommitted)
+                || matches!(&error, PortError::Domain(DomainError::CrossSpaceTainted))
             {
                 progress.submitted = false;
             }
@@ -494,6 +570,66 @@ impl ProviderService {
 }
 
 impl EmbeddingProviderPort for ProviderService {
+    fn query_disclosure(
+        &self,
+        mut ctx: SpaceContext,
+        provider: ProviderResourceId,
+        model: ModelProfileId,
+        project: Option<FolderRef>,
+        folder: Option<FolderId>,
+    ) -> PortFuture<'_, BTreeSet<DocClass>> {
+        Box::pin(async move {
+            if ctx.auth().taint().is_tainted() {
+                return Err(DomainError::CrossSpaceTainted.into());
+            }
+            if let (Some(project), Some(folder_id)) = (&project, folder) {
+                let budget = OperationBudget::new(ctx.budget.clone());
+                let reference = FolderRef {
+                    space_id: ctx.scope().space_id.clone(),
+                    folder_id,
+                };
+                let folder = self
+                    .control
+                    .catalog
+                    .folder(
+                        AccountContext::new(ctx.auth().clone(), ctx.budget.clone()),
+                        reference.clone(),
+                    )
+                    .await?;
+                ctx.budget = budget.context(ctx.budget.request.clone());
+                if folder.reference != reference
+                    || folder.lifecycle != Lifecycle::Active
+                    || !folder.ancestor_folders.contains(&project.folder_id)
+                {
+                    return Err(DomainError::AccessDenied.into());
+                }
+            }
+            let caller_classes = ctx
+                .auth()
+                .spaces()
+                .get(&ctx.scope().space_id)
+                .map(|grant| grant.read_classes.clone())
+                .unwrap_or_default();
+            let selected = self
+                .select_provider(
+                    ctx,
+                    SelectProvider {
+                        kind: PreferenceModelKind::Embedding,
+                        resource: Some(provider),
+                        model: Some(model),
+                        project,
+                    },
+                )
+                .await?;
+            Ok(selected
+                .policy
+                .allowed_classes
+                .intersection(&caller_classes)
+                .copied()
+                .collect())
+        })
+    }
+
     fn embed(
         &self,
         ctx: SpaceContext,

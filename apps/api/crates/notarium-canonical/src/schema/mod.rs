@@ -66,7 +66,11 @@ pub fn split_sql_statements(script: &str) -> Vec<String> {
     statements
 }
 
-/// Initializes or validates the SQLite canonical baseline schema inside an exclusive transaction.
+/// Initializes or validates the SQLite canonical baseline schema inside a write transaction.
+///
+/// The caller owns the connection's temporary storage mode and TEMP objects.
+/// To let large index sorts spill to disk, set `PRAGMA temp_store = FILE` on a
+/// fresh connection before creating any TEMP objects or starting a transaction.
 pub async fn bootstrap_sqlite_schema(
     conn: &mut SqliteConnection,
     expected_installation: &InstallationId,
@@ -232,7 +236,9 @@ async fn bootstrap_postgres_inner(
     expected_installation: &InstallationId,
     expected_checksum: ContentDigest,
 ) -> Result<DatabaseWitness, PortError> {
-    sqlx::query("SELECT pg_advisory_xact_lock_shared(hashtextextended($1, 7311229))")
+    // Snapshot live ranks and change the chat writer's representation only after
+    // in-flight writers release the schema-wide writer fence.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 7311229))")
         .bind(schema_name)
         .execute(&mut *conn)
         .await
@@ -276,6 +282,7 @@ async fn bootstrap_postgres_inner(
         migrate::postgres(conn, expected_installation, expected_checksum).await?;
         let witness =
             inspect_postgres_schema_meta(conn, expected_installation, expected_checksum).await?;
+        crate::projection_fence::ensure_postgres_owner_table(conn).await?;
         verify_postgres_catalog(conn, schema_name).await?;
         ensure_postgres_helper_routines(conn).await?;
         return Ok(witness);
@@ -288,6 +295,7 @@ async fn bootstrap_postgres_inner(
             .await
             .map_err(|err| internal_not_committed("pg_ddl_exec", err.to_string()))?;
     }
+    crate::projection_fence::ensure_postgres_owner_table(conn).await?;
     ensure_postgres_helper_routines(conn).await?;
 
     sqlx::query(
@@ -1023,7 +1031,7 @@ BEGIN
             AND NOT EXISTS(SELECT 1 FROM board_move_history WHERE space_id = p_space_id AND agent_run_id = p_run_id)
             AND NOT EXISTS(SELECT 1 FROM board_move_history WHERE space_id = p_space_id AND target_note_id = ANY(p_all_nids))
             AND NOT EXISTS(SELECT 1 FROM revision_purge_fences WHERE space_id = p_space_id AND note_id = ANY(p_all_nids))
-            AND NOT EXISTS(SELECT 1 FROM view_rank_overlays WHERE space_id = p_space_id AND target_note_id = ANY(p_all_nids))
+            AND NOT EXISTS(SELECT 1 FROM view_rank_overlays WHERE space_id = p_space_id AND (target_note_id = ANY(p_all_nids) OR view_note_id = ANY(p_all_nids)))
             AND NOT EXISTS(SELECT 1 FROM space_field_schemas WHERE space_id = p_space_id AND is_current = 1)
             AND EXISTS(SELECT 1 FROM folder_heads WHERE space_id = p_space_id AND folder_id = p_root_folder_id
                 AND is_root = 1 AND lifecycle_state = 'active' AND write_lock_json IS NULL)
@@ -1543,7 +1551,9 @@ pub async fn verify_postgres_catalog(
     .map_err(|err| internal_not_committed("pg_catalog_tables", err.to_string()))?;
 
     let observed_tables: BTreeSet<&str> = observed_tables_vec.iter().map(String::as_str).collect();
-    let expected_tables = expected_table_names();
+    let mut expected_tables = expected_table_names();
+    expected_tables.insert("projection_space_owners");
+    expected_tables.insert("projection_cleanup_registration");
     if observed_tables != expected_tables {
         return Err(internal_not_committed(
             "pg_table_mismatch",

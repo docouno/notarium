@@ -436,6 +436,7 @@ dependencies = [
  "cfg-if",
  "constant_time_eq 0.4.2",
  "cpufeatures 0.3.1",
+ "rayon-core",
 ]
 
 [[package]]
@@ -1417,6 +1418,7 @@ dependencies = [
  "blake3",
  "getrandom 0.4.3",
  "hex",
+ "ipnet",
  "mimalloc",
  "notarium-agents",
  "notarium-canonical",
@@ -1431,11 +1433,13 @@ dependencies = [
  "notarium-vault",
  "proptest",
  "rusqlite",
+ "rustix",
  "serde",
  "serde_json",
  "sqlx",
  "tokio",
  "toml 0.9.12+spec-1.1.0",
+ "tracing-subscriber",
  "yrs",
 ]
 
@@ -3019,23 +3023,56 @@ name = "notarium-projections"
 version = "1.0.0-dev.0"
 dependencies = [
  "arc-swap",
+ "blake3",
  "croaring",
+ "getrandom 0.4.3",
+ "hex",
  "memmap2",
  "notarium-canonical",
  "notarium-core",
+ "notarium-projections",
  "notarium-syntax",
+ "proptest",
+ "rmp-serde",
+ "rusqlite",
+ "rustix",
+ "same-file",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
 name = "notarium-search"
 version = "1.0.0-dev.0"
 dependencies = [
+ "allocation-counter",
+ "arc-swap",
+ "blake3",
+ "cap-fs-ext",
+ "cap-std",
+ "croaring",
+ "getrandom 0.4.3",
+ "hex",
  "memmap2",
  "notarium-canonical",
  "notarium-core",
+ "notarium-search",
  "notarium-syntax",
  "ort",
+ "proptest",
+ "pulldown-cmark",
+ "serde",
+ "serde_json",
+ "sqlx",
  "tantivy",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "unicode-normalization",
 ]
 
 [[package]]

@@ -4,7 +4,7 @@ use notarium_core::{
     DomainError,
     classes::{DocClass, authorize_field_key},
     error::{Diagnostic, PortError, ValidationReason},
-    ids::{AgentRunId, ContentDigest, NoteId, PrincipalId, RevisionId, SpaceId, SpaceSeq},
+    ids::{AgentRunId, ContentDigest, NoteId, PrincipalId, RevisionId, SpaceId, SpaceSeq, ViewKey},
     model::{HistoryScope, Lifecycle},
     ports::{
         BoardMoveFacts, BoardMoveResult, ClosedRoomReservation, Committed, EvaluatedBoardRow,
@@ -60,6 +60,10 @@ pub const RANK_RADIX: u128 = 36;
 pub const RANK_SPACE: u128 = 4_738_381_338_321_616_896; // 36^12
 const BASE36_ALPHABET: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
 const MAX_PLANNER_RETRIES: usize = 4;
+
+pub(super) fn rank_entity_key(view: &NoteId, key: &ViewKey, target: &NoteId) -> String {
+    format!("{view}:{key}:{target}")
+}
 
 pub fn encode_rank_u128(mut value: u128) -> Result<String, PortError> {
     if value == 0 || value >= RANK_SPACE {
@@ -702,12 +706,7 @@ pub(crate) async fn upsert_overlay_and_rank_revision_tx(
         }
     }
 
-    let rank_entity_key = format!(
-        "{}:{}:{}",
-        view.note.as_str(),
-        view.key.as_str(),
-        target_note.as_str()
-    );
+    let rank_entity_key = rank_entity_key(&view.note, &view.key, target_note);
     let rank_meta =
         RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Rank(RankRevisionMetadata {
             view_note_id: view.note.clone(),
@@ -719,6 +718,7 @@ pub(crate) async fn upsert_overlay_and_rank_revision_tx(
             placement_actor_id: placement_actor_id.clone(),
             placement_run_id: placement_run_id.cloned(),
             is_pma_normalization,
+            removed: false,
         }))
         .encode()?;
 
@@ -891,12 +891,7 @@ pub(crate) async fn move_board_card_impl(
         return Ok(replayed.into_committed());
     }
 
-    let (board_authority, provider) = store
-        .inner
-        .board_provider
-        .get()
-        .ok_or_else(|| DomainError::validation(ValidationReason::NotReady))?
-        .clone();
+    let (board_authority, provider) = store.board_facts_provider()?;
 
     for attempt in 0..MAX_PLANNER_RETRIES {
         ctx.budget.remaining = deadline.remaining(&ctx.budget)?;
@@ -999,6 +994,18 @@ pub(crate) async fn move_board_card_impl(
                 {
                     return Ok(replayed.into_committed());
                 }
+                if matches!(
+                    &error,
+                    PortError::Domain(DomainError::ValidationFailed {
+                        diagnostic: Diagnostic {
+                            reason: ValidationReason::CursorStale,
+                            ..
+                        },
+                    })
+                ) && attempt + 1 < MAX_PLANNER_RETRIES
+                {
+                    continue;
+                }
                 return Err(error);
             }
         };
@@ -1071,11 +1078,16 @@ pub(crate) async fn move_board_card_impl(
         }
 
         if base_head.head_rev_id != request.input.expected_note {
-            return Err(DomainError::RevisionConflict {
+            let conflict = DomainError::RevisionConflict {
                 current: base_head.head_rev_id,
                 lineage: None,
+            };
+            if let Some(replayed) =
+                replay_command::<StoredCommittedBoardMoveV1>(store, &ctx, deadline, &idemp).await?
+            {
+                return Ok(replayed.into_committed());
             }
-            .into());
+            return Err(conflict.into());
         }
 
         let base_digest = base_head.content_digest.ok_or_else(|| {
@@ -1413,7 +1425,6 @@ impl CanonicalStore {
                     // Build ordered list of existing members in `input.group` excluding `input.note`.
                     // Unranked members from `eval_group_rows` are materialized deterministically in planner order
                     // after any already-ranked members (or evenly spaced if none are ranked yet).
-                    let (_, target_gk_hex) = group_key_hex(&input.group)?;
                     let mut group_members: Vec<NoteId> = Vec::new();
                     for row in eval_group_rows {
                         if row.note != input.note {
@@ -1423,9 +1434,9 @@ impl CanonicalStore {
 
                     // Separate already-ranked in target group vs unranked in target group.
                     let mut newly_materialized: Vec<(NoteId, String)> = Vec::new();
-                    let all_unranked = group_members.iter().all(|nid| {
-                        overlays.get(nid).map(|o| &o.group_key_hex) != Some(&target_gk_hex)
-                    });
+                    let all_unranked = group_members
+                        .iter()
+                        .all(|nid| overlays.get(nid).map(|o| &o.group) != Some(&input.group));
 
                     let existing_ranked: Vec<ExistingRankedItem> = if group_members.is_empty() {
                         Vec::new()
@@ -1450,7 +1461,7 @@ impl CanonicalStore {
                             .iter()
                             .filter_map(|nid| {
                                 let o = overlays.get(nid)?;
-                                if o.group_key_hex == target_gk_hex {
+                                if o.group == input.group {
                                     Some(ExistingRankedItem {
                                         note_id: nid.clone(),
                                         rank: o.sort_rank_lexo.clone(),
@@ -1468,7 +1479,7 @@ impl CanonicalStore {
                         for nid in &group_members {
                             let in_group = overlays
                                 .get(nid)
-                                .map(|o| o.group_key_hex == target_gk_hex)
+                                .map(|o| o.group == input.group)
                                 .unwrap_or(false);
                             if !in_group {
                                 let tail = compute_rank_placement(&items, nid, items.len())?;
@@ -1545,7 +1556,7 @@ impl CanonicalStore {
                     for (nid, r) in newly_materialized {
                         let was_already_overlay = overlays
                             .get(&nid)
-                            .map(|o| o.group_key_hex == target_gk_hex)
+                            .map(|o| o.group == input.group)
                             .unwrap_or(false);
                         neighbor_final_ranks.insert(nid, (r, was_already_overlay));
                     }
@@ -2046,6 +2057,25 @@ pub(crate) async fn authorized_view_head(
 fn build_move_board_card_identity_spec(
     request: &Mutation<MoveBoardCard>,
 ) -> Result<crate::writer::replay::UnboundCommand, PortError> {
+    let (group, _) = group_key_hex(&request.input.group)?;
+    let current = move_identity_for_group(request, &group)?;
+    if matches!(
+        request.input.group,
+        GroupKey::Value(notarium_core::value::ScalarValue::Number(_))
+    ) {
+        // v6 persisted the caller's original MessagePack number representation.
+        let original = crate::codec::encode_msgpack(&request.input.group)?;
+        if original != group {
+            return Ok(current.with_previous_encoding(move_identity_for_group(request, &original)?));
+        }
+    }
+    Ok(current)
+}
+
+fn move_identity_for_group(
+    request: &Mutation<MoveBoardCard>,
+    group: &[u8],
+) -> Result<crate::writer::replay::UnboundCommand, PortError> {
     let mut fp = blake3::Hasher::new();
     fp.update(request.input.view.note.as_str().as_bytes());
     fp.update(&[0]);
@@ -2053,8 +2083,7 @@ fn build_move_board_card_identity_spec(
     fp.update(&[0]);
     fp.update(request.input.note.as_str().as_bytes());
     fp.update(&[0]);
-    let (gk_bytes, _) = group_key_hex(&request.input.group)?;
-    fp.update(&gk_bytes);
+    fp.update(group);
     fp.update(&[0]);
     let before_fp = request
         .input

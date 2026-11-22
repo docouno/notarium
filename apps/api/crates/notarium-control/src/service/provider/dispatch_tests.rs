@@ -10,7 +10,7 @@ use crate::{
     test_support::*,
 };
 use notarium_core::{
-    auth::{ResourceFacts, SecretString},
+    auth::{BranchTaint, ResourceFacts, SecretString},
     classes::*,
     document::ChunkDescriptor,
     epoch::DataRoot,
@@ -32,6 +32,7 @@ struct Egress {
     cancellations: Mutex<Vec<Cancellation>>,
 }
 struct EgressLease {
+    project_folders: BTreeSet<FolderId>,
     current: Vec<ProviderCurrentContent>,
     project: Option<FolderRef>,
     active: Arc<AtomicUsize>,
@@ -48,6 +49,9 @@ impl ProviderEgressLease for EgressLease {
     }
     fn project(&self) -> Option<&FolderRef> {
         self.project.as_ref()
+    }
+    fn project_folders(&self) -> &BTreeSet<FolderId> {
+        &self.project_folders
     }
     fn check(&self) -> notarium_core::DomainResult<()> {
         if self.cancellation.is_cancelled() {
@@ -82,6 +86,7 @@ impl ProviderEgressCatalogPort for Egress {
                 .unwrap()
                 .push(cancellation.clone());
             Ok(Box::new(EgressLease {
+                project_folders: request.project_folders,
                 current,
                 project: request.project,
                 active: self.active.clone(),
@@ -103,7 +108,59 @@ struct Setup {
     revision: ControlRevision,
     credential: ProviderCredentialInfo,
     session: SecretString,
+    revoker: Arc<TaintOnRegistration>,
 }
+
+struct TaintOnRegistration {
+    inner: Arc<dyn SessionRevocationPort>,
+    next: Mutex<Option<BranchTaint>>,
+}
+
+impl SessionRevocationPort for TaintOnRegistration {
+    fn register_provider(
+        &self,
+        ctx: MaintenanceContext,
+        selectors: Vec<RevocationSelector>,
+        cancellation: Cancellation,
+    ) -> PortFuture<'_, Box<dyn RevocationLease>> {
+        Box::pin(async move {
+            let lease = self
+                .inner
+                .register_provider(ctx, selectors, cancellation)
+                .await?;
+            if let Some(taint) = self.next.lock().unwrap().take() {
+                taint.mark_external_read();
+            }
+            Ok(lease)
+        })
+    }
+
+    fn fence_provider(
+        &self,
+        ctx: MaintenanceContext,
+        selectors: Vec<RevocationSelector>,
+    ) -> PortFuture<'_, Box<dyn RevocationLease>> {
+        self.inner.fence_provider(ctx, selectors)
+    }
+
+    fn fence_inactive_provider(
+        &self,
+        ctx: MaintenanceContext,
+        call: RequestId,
+    ) -> PortFuture<'_, Option<Box<dyn RevocationLease>>> {
+        self.inner.fence_inactive_provider(ctx, call)
+    }
+
+    fn revoke(
+        &self,
+        ctx: MaintenanceContext,
+        selector: RevocationSelector,
+        reason: RevocationReason,
+    ) -> PortFuture<'_, ()> {
+        self.inner.revoke(ctx, selector, reason)
+    }
+}
+
 async fn keys(fixture: &mut Fixture) -> Arc<Keyring> {
     let value: Value =
         serde_json::from_str(include_str!("../../../tests/fixtures/keyring/vectors.json")).unwrap();
@@ -150,7 +207,12 @@ impl Setup {
     async fn new(pg: bool, label: &str, kind: ProviderWireKind, server: &HttpsFixture) -> Self {
         let mut fixture = Fixture::new(pg, label).await;
         let keys = keys(&mut fixture).await;
-        let control = fixture.service(AuthenticationMode::Password).await.unwrap();
+        let mut control = fixture.service(AuthenticationMode::Password).await.unwrap();
+        let revoker = Arc::new(TaintOnRegistration {
+            inner: control.revoker.clone(),
+            next: Mutex::new(None),
+        });
+        Arc::get_mut(&mut control).unwrap().revoker = revoker.clone();
         let bootstrap = control
             .bootstrap(
                 empty(),
@@ -396,6 +458,7 @@ impl Setup {
             revision: attached.revision,
             credential,
             session,
+            revoker,
         }
     }
     fn completion(&self, id: u8) -> CompletionRequest {
@@ -424,8 +487,8 @@ impl Setup {
             },
         }
     }
-    fn embedding(&self, id: u8) -> EmbeddingRequest {
-        let document = Arc::new(self.document.clone());
+    fn embedding(&self, id: u8, document: &ClassifiedDocument) -> EmbeddingRequest {
+        let document = Arc::new(document.clone());
         let part = ContentPart::from_chunk(
             document.clone(),
             ChunkDescriptor {
@@ -439,17 +502,17 @@ impl Setup {
             },
         )
         .unwrap();
-        EmbeddingRequest {
-            intent: CommandKey::from_bytes([id; 16]),
-            model: ModelProfileId::from_bytes([4; 16]),
-            provider: self.selection.provider.clone(),
-            project: None,
-            chunks: vec![
+        EmbeddingRequest::parts(
+            CommandKey::from_bytes([id; 16]),
+            ModelProfileId::from_bytes([4; 16]),
+            self.selection.provider.clone(),
+            None,
+            vec![
                 ClassEgressFence::provider_part(part, self.ctx.auth(), &self.selection.policy)
                     .unwrap(),
             ],
-            declared_tokens: 3,
-        }
+            3,
+        )
     }
     async fn close(self) {
         self.other_store.close().await;
@@ -519,12 +582,9 @@ async fn gateway(pg: bool, kind: ProviderWireKind, label: &str) {
     let mode = Arc::new(AtomicU8::new(0));
     let response_mode = mode.clone();
     let server = HttpsFixture::start(move |request| {
-        assert!(
-            request
-                .headers
-                .to_lowercase()
-                .contains("authorization: bearer fixture-secret")
-        );
+        let headers = request.headers.to_lowercase();
+        let rotated = headers.contains("authorization: bearer replacement");
+        assert!(rotated || headers.contains("authorization: bearer fixture-secret"));
         assert!(
             request
                 .headers
@@ -532,12 +592,13 @@ async fn gateway(pg: bool, kind: ProviderWireKind, label: &str) {
                 .contains("x-tenant-key: fixture-tenant")
         );
         let reply = if request.path.ends_with("embeddings") || request.path.ends_with("api/embed") {
+            let vector = if rotated { [0.5, 0.25] } else { [0.25, -0.5] };
             Reply::json(match kind {
                 ProviderWireKind::OpenaiCompatible => {
-                    json!({"model":"fixture-embedding","data":[{"index":0,"embedding":[0.25,-0.5]}],"usage":{"prompt_tokens":3,"total_tokens":3}})
+                    json!({"model":"fixture-embedding","data":[{"index":0,"embedding":vector}],"usage":{"prompt_tokens":3,"total_tokens":3}})
                 }
                 ProviderWireKind::Ollama => {
-                    json!({"model":"fixture-embedding","embeddings":[[0.25,-0.5]],"prompt_eval_count":3})
+                    json!({"model":"fixture-embedding","embeddings":[vector],"prompt_eval_count":3})
                 }
             })
         } else if request.method == "GET" {
@@ -604,7 +665,7 @@ async fn gateway(pg: bool, kind: ProviderWireKind, label: &str) {
     }
     let embedding = setup
         .provider
-        .embed(setup.space.clone(), setup.embedding(11))
+        .embed(setup.space.clone(), setup.embedding(11, &setup.document))
         .await
         .unwrap();
     assert_eq!(embedding.vectors, vec![Ok(vec![0.25, -0.5])]);
@@ -703,7 +764,509 @@ async fn gateway(pg: bool, kind: ProviderWireKind, label: &str) {
             .is_ok(),
         "budget_mismatch records audit spend without cross-user 60s DoS lockout"
     );
+    let query = |intent, class| {
+        EmbeddingRequest::query(
+            CommandKey::from_bytes([intent; 16]),
+            ModelProfileId::from_bytes([4; 16]),
+            setup.selection.provider.clone(),
+            EmbeddingQueryInput {
+                text: "related search".into(),
+                tokens: 3,
+                classes: BTreeSet::from([class]),
+                project_scope: None,
+                folder: None,
+            },
+        )
+    };
+    let disclosed = setup
+        .provider
+        .query_disclosure(
+            setup.space.clone(),
+            setup.selection.provider.clone(),
+            ModelProfileId::from_bytes([4; 16]),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(disclosed, BTreeSet::from([DocClass::UserDoc]));
+    let result = setup
+        .provider
+        .embed(
+            setup.space.clone(),
+            query(100, DocClass::UserDoc).with_runtime_epochs(setup.selection.runtime_epochs),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.vectors, vec![Ok(vec![0.25, -0.5])]);
+    {
+        let requests = requests.lock().unwrap();
+        let body: Value = serde_json::from_slice(&requests.last().unwrap().body).unwrap();
+        assert_eq!(body["input"], json!(["related search"]));
+    }
+    let (indexing, _) = setup
+        .provider
+        .admit_search_indexing(
+            &ServiceAuthority::admit(ServicePurpose::Search),
+            setup.space.scope().clone(),
+            &PrincipalId::from_bytes([100; 16]),
+            &setup.selection.provider,
+            None,
+            budget(),
+        )
+        .await
+        .unwrap()
+        .expect("personal owner is eligible");
+    assert_eq!(indexing.auth().principal(), setup.space.auth().principal());
+    assert_eq!(
+        indexing.auth().kind(),
+        &notarium_core::auth::PrincipalKind::SearchIndexing
+    );
+    assert!(indexing.auth().authorize_human_management().is_err());
+    assert!(
+        !indexing.auth().spaces()[&indexing.scope().space_id]
+            .read_classes
+            .contains(&DocClass::EncryptedNote)
+    );
+    assert!(
+        indexing.auth().spaces()[&indexing.scope().space_id]
+            .write_classes
+            .is_empty()
+    );
+    // SearchIndexing authority is restricted to internal document embedding
+    // dispatch and must be rejected across ControlService and non-embedding
+    // ProviderService entrypoints without issuing egress or HTTP traffic.
+    let before_rejected = requests.lock().unwrap().len();
+    let before_egress = setup.egress.cancellations.lock().unwrap().len();
+    let indexing_account = AccountContext::new(indexing.auth().clone(), budget());
+    let control = setup.provider.control_service();
+    assert!(matches!(
+        control.whoami(indexing_account.clone()).await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+    assert!(matches!(
+        control
+            .list_spaces(
+                indexing_account.clone(),
+                ControlPageRequest::new(10, None).unwrap(),
+            )
+            .await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+    assert!(matches!(
+        control
+            .list_favorites(
+                indexing_account.clone(),
+                ControlPageRequest::new(10, None).unwrap(),
+            )
+            .await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+    assert!(matches!(
+        control
+            .begin_agent_call(
+                indexing_account.clone(),
+                BeginAgentCall {
+                    call: RequestId::from_bytes([120; 16]),
+                    request: RequestId::from_bytes([121; 16]),
+                    episode: None,
+                    operation: AgentOperation::Search,
+                    transport: AgentTransport::Internal,
+                    effect: AgentEffect::Read,
+                    input_bytes: 0,
+                },
+            )
+            .await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+    assert!(matches!(
+        control
+            .start_or_resume_episode(
+                indexing_account.clone(),
+                AccountMutation {
+                    identity: command(
+                        indexing.auth().principal(),
+                        indexing.auth().principal(),
+                        122,
+                        setup.revision,
+                    ),
+                    input: StartEpisode {
+                        selector: EpisodeSelector::New {
+                            requested: EpisodeId::from_bytes([122; 16]),
+                            name: None,
+                        },
+                        project_hint: None,
+                    },
+                },
+            )
+            .await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+    assert!(matches!(
+        setup
+            .provider
+            .inspect_call(indexing_account.clone(), RequestId::from_bytes([123; 16]))
+            .await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+    assert!(matches!(
+        setup
+            .provider
+            .select_provider(
+                indexing.clone(),
+                SelectProvider {
+                    kind: PreferenceModelKind::Embedding,
+                    resource: Some(setup.selection.provider.clone()),
+                    model: Some(ModelProfileId::from_bytes([4; 16])),
+                    project: None,
+                },
+            )
+            .await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+    assert!(matches!(
+        setup
+            .provider
+            .query_disclosure(
+                indexing.clone(),
+                setup.selection.provider.clone(),
+                ModelProfileId::from_bytes([4; 16]),
+                None,
+                None,
+            )
+            .await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+    assert!(matches!(
+        complete(&setup.provider, indexing.clone(), setup.completion(124)).await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+    assert!(matches!(
+        setup
+            .provider
+            .check_connection(
+                indexing_account,
+                CheckProviderConnection {
+                    resource: setup.selection.provider.clone(),
+                    intent: CommandKey::from_bytes([125; 16]),
+                },
+            )
+            .await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+    assert!(matches!(
+        setup
+            .provider
+            .embed(
+                indexing.clone(),
+                query(126, DocClass::UserDoc).with_runtime_epochs(setup.selection.runtime_epochs),
+            )
+            .await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+    let foreign_provider = ProviderResourceId::from_bytes([99; 16]);
+    let mut foreign_policy = setup.selection.policy.clone();
+    foreign_policy.provider = foreign_provider.clone();
+    let foreign_doc = Arc::new(setup.document.clone());
+    let foreign_part = ContentPart::from_chunk(
+        foreign_doc.clone(),
+        ChunkDescriptor {
+            source: foreign_doc.digest(),
+            model: ModelProfileId::from_bytes([4; 16]),
+            context: vec![],
+            spans: vec![ByteSpan::new(0, 14).unwrap()],
+            text: "private source".into(),
+            tokens: 3,
+            key: ContentDigest::from_bytes([7; 32]),
+        },
+    )
+    .unwrap();
+    let wrong_provider = EmbeddingRequest::parts(
+        CommandKey::from_bytes([127; 16]),
+        ModelProfileId::from_bytes([4; 16]),
+        foreign_provider,
+        None,
+        vec![
+            ClassEgressFence::provider_part(foreign_part, indexing.auth(), &foreign_policy)
+                .unwrap(),
+        ],
+        3,
+    )
+    .with_runtime_epochs(ProviderRuntimeEpochs {
+        resource: std::num::NonZeroU64::new(999).unwrap(),
+        credential: std::num::NonZeroU64::new(999),
+    });
+    assert!(wrong_provider.validate().is_ok());
+    assert!(matches!(
+        setup.provider.embed(indexing.clone(), wrong_provider).await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+    let wrong_space_auth = notarium_core::auth::EngineAuthContext::for_search_indexing(
+        indexing.auth().principal().clone(),
+        indexing.auth().grant().clone(),
+        SpaceId::from_bytes([98; 16]),
+        setup.selection.provider.clone(),
+    );
+    let mut wrong_space_grants = setup.space.auth().spaces().clone();
+    wrong_space_grants.extend(wrong_space_auth.spaces().clone());
+    let wrong_space_forged = notarium_core::auth::EngineAuthContext::for_human(
+        notarium_core::auth::VerifiedHuman::attest(
+            indexing.auth().principal().clone(),
+            indexing.auth().grant().clone(),
+            wrong_space_grants,
+            false,
+        )
+        .with_credential(
+            notarium_core::auth::AuthenticatedCredential::SearchIndexing {
+                space: SpaceId::from_bytes([98; 16]),
+                provider: setup.selection.provider.clone(),
+            },
+        ),
+    );
+    let wrong_space_ctx =
+        SpaceContext::new(wrong_space_forged, setup.space.scope().clone(), budget()).unwrap();
+    assert!(matches!(
+        setup
+            .provider
+            .embed(wrong_space_ctx, setup.embedding(128, &setup.document))
+            .await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+    assert_eq!(requests.lock().unwrap().len(), before_rejected);
+    assert_eq!(
+        setup.egress.cancellations.lock().unwrap().len(),
+        before_egress
+    );
+    assert_eq!(setup.egress.active.load(Ordering::SeqCst), 0);
+    // Narrowed caller read_classes constrain both query_disclosure and EmbeddingInput::Query.
+    let mut narrowed_grants = setup.space.auth().spaces().clone();
+    narrowed_grants
+        .get_mut(&setup.space.scope().space_id)
+        .unwrap()
+        .read_classes = BTreeSet::from([DocClass::AgentMemory]);
+    let narrowed_auth = setup.space.auth().for_pat(narrowed_grants).unwrap();
+    let narrowed_space =
+        SpaceContext::new(narrowed_auth, setup.space.scope().clone(), budget()).unwrap();
+    assert!(
+        setup
+            .provider
+            .query_disclosure(
+                narrowed_space.clone(),
+                setup.selection.provider.clone(),
+                ModelProfileId::from_bytes([4; 16]),
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(matches!(
+        setup
+            .provider
+            .embed(
+                narrowed_space,
+                query(111, DocClass::UserDoc).with_runtime_epochs(setup.selection.runtime_epochs),
+            )
+            .await,
+        Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
+            if diagnostic.reason == ValidationReason::ClassEgressForbidden
+    ));
+    // Deterministic 2-step search embedding resolution for Personal Space.
+    let embedding_model = ModelProfileId::from_bytes([4; 16]);
+    let explicit_resolved = setup
+        .provider
+        .resolve_search_embedding_model(
+            &ServiceAuthority::admit(ServicePurpose::Search),
+            setup.space.scope().clone(),
+            Some(embedding_model.clone()),
+            budget(),
+        )
+        .await
+        .unwrap()
+        .expect("explicit personal embedding model resolves");
+    assert_eq!(explicit_resolved.provider, setup.selection.provider);
+    assert_eq!(explicit_resolved.model, embedding_model);
+    assert_eq!(explicit_resolved.dimension, 2);
+    assert_eq!(explicit_resolved.max_input_tokens, 8192);
+    assert_eq!(explicit_resolved.project, None);
+    assert!(
+        setup
+            .provider
+            .resolve_search_embedding_model(
+                &ServiceAuthority::admit(ServicePurpose::Search),
+                setup.space.scope().clone(),
+                None,
+                budget(),
+            )
+            .await
+            .unwrap()
+            .is_none(),
+        "without an embedding preference, resolution returns Ok(None)"
+    );
+    let pref = setup
+        .provider
+        .set_preference(
+            setup.ctx.clone(),
+            AccountMutation {
+                identity: command(
+                    setup.ctx.auth().principal(),
+                    setup.ctx.auth().principal(),
+                    19,
+                    setup.revision,
+                ),
+                input: SetProviderPreference {
+                    scope: ProviderPreferenceScope::Personal,
+                    kind: PreferenceModelKind::Embedding,
+                    resource: setup.selection.provider.clone(),
+                    model: embedding_model.clone(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    setup.revision = pref.revision;
+    let pref_resolved = setup
+        .provider
+        .resolve_search_embedding_model(
+            &ServiceAuthority::admit(ServicePurpose::Search),
+            setup.space.scope().clone(),
+            None,
+            budget(),
+        )
+        .await
+        .unwrap()
+        .expect("personal owner embedding preference resolves for personal Space");
+    assert_eq!(pref_resolved, explicit_resolved);
+    assert!(
+        setup
+            .provider
+            .embed(indexing.clone(), setup.embedding(101, &setup.document))
+            .await
+            .is_ok()
+    );
+    // Personal consent covers the whole Space. Search still binds a selected
+    // project to both the original part and the metadata held by the lease.
+    let project = FolderRef {
+        space_id: indexing.scope().space_id.clone(),
+        folder_id: FolderId::from_bytes([17; 16]),
+    };
+    setup
+        .fixture
+        .catalog
+        .project_entries
+        .lock()
+        .unwrap()
+        .insert(
+            (project.space_id.clone(), project.folder_id.clone()),
+            ProjectInfo {
+                folder: project.clone(),
+                name: "Selected project".into(),
+            },
+        );
+    let space = setup
+        .fixture
+        .catalog
+        .space(budget(), project.space_id.clone())
+        .await
+        .unwrap();
+    let inside = ClassifiedDocument::from_canonical(
+        setup.document.reference().clone(),
+        setup.document.revision().clone(),
+        ResourceFacts {
+            space: space.space,
+            class: DocClass::UserDoc,
+            ancestor_folders: vec![project.folder_id.clone()],
+            folder_write_locked: false,
+            ability_package: None,
+        },
+        Lifecycle::Active,
+        setup
+            .document
+            .explicit_read(setup.ctx.auth())
+            .unwrap()
+            .to_owned(),
+        setup.document.digest(),
+    )
+    .unwrap();
+    let mut scoped = setup.embedding(109, &inside);
+    scoped.project = Some(project.clone());
+    let before = requests.lock().unwrap().len();
+    assert!(matches!(
+        setup.provider.embed(indexing.clone(), scoped).await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+    assert_eq!(requests.lock().unwrap().len(), before);
+    *setup.egress.current.lock().unwrap() = vec![ProviderCurrentContent::Note(inside.metadata())];
+    let mut scoped = setup.embedding(110, &inside);
+    scoped.project = Some(project);
+    assert!(setup.provider.embed(indexing.clone(), scoped).await.is_ok());
+    *setup.egress.current.lock().unwrap() =
+        vec![ProviderCurrentContent::Note(setup.document.metadata())];
     let count = requests.lock().unwrap().len();
+    let stale_epochs = ProviderRuntimeEpochs {
+        resource: (setup.selection.runtime_epochs.resource.get() + 1)
+            .try_into()
+            .unwrap(),
+        ..setup.selection.runtime_epochs
+    };
+    assert!(
+        setup
+            .provider
+            .embed(
+                setup.space.clone(),
+                query(106, DocClass::UserDoc).with_runtime_epochs(stale_epochs),
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(requests.lock().unwrap().len(), count);
+    assert!(matches!(
+        setup
+            .provider
+            .embed(indexing, query(102, DocClass::UserDoc))
+            .await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+    assert!(
+        setup
+            .provider
+            .embed(setup.space.clone(), query(103, DocClass::Profile))
+            .await
+            .is_err()
+    );
+    let auth = setup
+        .provider
+        .control
+        .resolve(evidence(AuthEvidenceKind::Session, setup.session.expose()))
+        .await
+        .unwrap();
+    auth.taint().mark_external_read();
+    let tainted = SpaceContext::new(auth, setup.space.scope().clone(), budget()).unwrap();
+    assert!(matches!(
+        setup
+            .provider
+            .embed(tainted, query(104, DocClass::UserDoc))
+            .await,
+        Err(PortError::Domain(DomainError::CrossSpaceTainted))
+    ));
+    assert_eq!(requests.lock().unwrap().len(), count);
+    let auth = setup
+        .provider
+        .control
+        .resolve(evidence(AuthEvidenceKind::Session, setup.session.expose()))
+        .await
+        .unwrap();
+    let racing = SpaceContext::new(auth, setup.space.scope().clone(), budget()).unwrap();
+    *setup.revoker.next.lock().unwrap() = Some(racing.auth().taint().clone());
+    assert!(matches!(
+        setup
+            .provider
+            .embed(racing, query(105, DocClass::UserDoc))
+            .await,
+        Err(PortError::Domain(DomainError::CrossSpaceTainted)),
+    ));
+    assert_eq!(requests.lock().unwrap().len(), count);
     // A retry still resolves the old intent after mutable configuration changes.
     let changed = setup
         .other
@@ -730,6 +1293,48 @@ async fn gateway(pg: bool, kind: ProviderWireKind, label: &str) {
         .await
         .unwrap();
     setup.revision = changed.revision;
+    let rotated = setup
+        .provider
+        .select_provider(
+            setup.space.clone(),
+            SelectProvider {
+                kind: PreferenceModelKind::Embedding,
+                resource: Some(setup.selection.provider.clone()),
+                model: Some(ModelProfileId::from_bytes([4; 16])),
+                project: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rotated.runtime_epochs.resource,
+        setup.selection.runtime_epochs.resource
+    );
+    assert_ne!(
+        rotated.runtime_epochs.credential,
+        setup.selection.runtime_epochs.credential
+    );
+    assert!(
+        setup
+            .provider
+            .embed(
+                setup.space.clone(),
+                query(107, DocClass::UserDoc).with_runtime_epochs(setup.selection.runtime_epochs),
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(requests.lock().unwrap().len(), count);
+    let fresh = setup
+        .provider
+        .embed(
+            setup.space.clone(),
+            query(108, DocClass::UserDoc).with_runtime_epochs(rotated.runtime_epochs),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fresh.vectors, vec![Ok(vec![0.5, 0.25])]);
+    assert_eq!(requests.lock().unwrap().len(), count + 1);
     assert!(matches!(
         complete(&setup.provider, setup.space.clone(), setup.completion(10)).await,
         Err(PortError::Domain(DomainError::ProviderCallAlreadyStarted {
@@ -743,7 +1348,7 @@ async fn gateway(pg: bool, kind: ProviderWireKind, label: &str) {
         complete(&setup.provider, setup.space.clone(), modified).await,
         Err(PortError::Domain(DomainError::IdempotencyKeyReused))
     ));
-    assert_eq!(requests.lock().unwrap().len(), count);
+    assert_eq!(requests.lock().unwrap().len(), count + 1);
     assert_eq!(setup.egress.active.load(Ordering::SeqCst), 0);
     setup.close().await;
 }
@@ -766,6 +1371,8 @@ async fn postgres_ollama_gateway() {
 
 #[path = "admission_tests.rs"]
 mod admissions;
+#[path = "default_tests.rs"]
+mod defaults;
 #[path = "lifecycle_tests.rs"]
 mod lifecycle;
 #[path = "shared_tests.rs"]

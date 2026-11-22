@@ -25,7 +25,7 @@ pub struct NoteRef {
     pub space_id: SpaceId,
     pub note_id: NoteId,
 }
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct FolderRef {
     pub space_id: SpaceId,
     pub folder_id: FolderId,

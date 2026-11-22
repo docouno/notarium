@@ -1,0 +1,10 @@
+DROP TABLE IF EXISTS projection_rank_anchor_rows;
+DROP TABLE IF EXISTS projection_rank_anchors;
+DROP TABLE IF EXISTS chat_entry_note_refs;
+DROP INDEX IF EXISTS idx_folder_aliases_projection_seq;
+DROP INDEX IF EXISTS idx_note_aliases_projection_seq;
+DROP INDEX IF EXISTS idx_revisions_projection_rank_key;
+DROP INDEX IF EXISTS idx_revisions_projection_rank_target;
+DROP INDEX IF EXISTS idx_chat_entries_projection;
+DROP INDEX IF EXISTS idx_chat_entries_created_change;
+DROP INDEX IF EXISTS idx_chat_entries_redacted_change;

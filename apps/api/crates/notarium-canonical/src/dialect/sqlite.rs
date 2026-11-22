@@ -18,6 +18,9 @@ use crate::{
     },
 };
 
+#[cfg(test)]
+mod bootstrap_tests;
+
 pub const SQLITE_JOURNAL_SIZE_LIMIT_BYTES: i64 = 64 * 1024 * 1024;
 
 #[cfg(target_os = "linux")]
@@ -58,9 +61,8 @@ pub async fn open_and_bootstrap_sqlite(
         suppress_database_access_times(parent);
     }
 
-    let mut writer_conn = open_sqlite_writer_connection(&db_path).await?;
-    let witness = bootstrap_sqlite_schema(&mut writer_conn, installation_id).await?;
-    verify_writer_pragmas(&mut writer_conn).await?;
+    let writer_conn = open_sqlite_writer_connection(&db_path).await?;
+    let (writer_conn, witness) = bootstrap_new_writer(writer_conn, installation_id).await?;
 
     if let Some(parent) = db_path.parent()
         && let Ok(dir_file) = fs::File::open(parent)
@@ -83,6 +85,25 @@ pub async fn open_and_bootstrap_sqlite(
         read_pool,
         witness,
     ))
+}
+
+// This newly opened connection has no TEMP objects; changing temp_store
+// would drop them on an already-serving connection.
+async fn bootstrap_new_writer(
+    mut conn: SqliteConnection,
+    installation_id: &InstallationId,
+) -> Result<(SqliteConnection, DatabaseWitness), PortError> {
+    sqlx::query("PRAGMA temp_store = FILE")
+        .execute(&mut conn)
+        .await
+        .map_err(|err| internal_not_committed("sqlite_bootstrap_temp_store", err.to_string()))?;
+    let witness = bootstrap_sqlite_schema(&mut conn, installation_id).await?;
+    sqlx::query("PRAGMA temp_store = MEMORY")
+        .execute(&mut conn)
+        .await
+        .map_err(|err| internal_not_committed("sqlite_writer_temp_store", err.to_string()))?;
+    verify_writer_pragmas(&mut conn).await?;
+    Ok((conn, witness))
 }
 
 pub fn open_rusqlite_writer_connection(db_path: &Path) -> Result<rusqlite::Connection, PortError> {

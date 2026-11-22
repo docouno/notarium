@@ -4,18 +4,19 @@ Notarium is a knowledge workspace for people and AI agents. Version 1.0 is being
 built from scratch on `v1` with a Rust backend, React web client and Electron
 desktop client. The `main` branch remains the released v0 showcase.
 
-This branch contains the development foundation, domain contracts,
-byte-preserving document syntax, dual-dialect canonical storage with CAS,
-and transport-independent live collaboration. The control plane includes
-account authentication, Space access, OAuth issuance, OIDC identity,
-provider services, account context, schedule claims, content-free telemetry
-and control backup snapshots. Derived projections, search, agents and the
-product UI arrive in subsequent waves. The greeting screen and its API are
-starter examples.
+This branch contains domain contracts, byte-preserving document syntax,
+dual-dialect canonical storage with CAS, control storage and rebuildable
+structural projections. The engine ports support declarative Markdown views,
+board reads and knowledge graphs. Control services cover transport-independent
+authentication, Space access, OAuth issuance, OIDC identity, provider services,
+account context, schedule claims, content-free telemetry and backup snapshots.
+The hybrid search library provides search and recall. Transport-independent Yrs rooms support live Markdown editing. Agents and
+the product UI arrive in subsequent waves.
 
 ## Start developing
 
-Use Linux x86_64, local Docker Engine, Docker Compose **5.0.0+**, Git and GNU Make.
+Use Linux x86_64, local Docker Engine, Docker Compose **5.0.0+**, Git, GNU Make,
+`curl`, `unzip` and `sha256sum`.
 Host Node **24.22.1** is optional and only needed for `npx` CLI entry points.
 Development tools run in pinned containers; no private services or additional agent
 tooling are needed.
@@ -74,6 +75,10 @@ The implemented library boundaries are documented in [core contracts](docs/core-
 [document syntax](docs/syntax.md), [canonical storage](docs/storage.md) and
 [live collaboration](docs/collab.md).
 See [control storage](docs/control.md) for the control-plane primitives.
+See [hybrid search](docs/search.md) for search and recall, model setup, and the
+offline scale gate.
+The [projections guide](docs/projections.md) covers note views, graph queries
+and the SQLite and PostgreSQL acceptance workload.
 
 ## Contract and delivery
 

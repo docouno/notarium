@@ -12,7 +12,15 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
+    num::NonZeroU64,
 };
+
+/// The configurations that can change the output of a provider model.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub struct ProviderRuntimeEpochs {
+    pub resource: NonZeroU64,
+    pub credential: Option<NonZeroU64>,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -563,12 +571,16 @@ pub trait ProviderEgressLease: Send {
     /// The canonical owner verifies this active project and pins its lifecycle
     /// even when the call contains only trusted orchestration instructions.
     fn project(&self) -> Option<&FolderRef>;
+    /// Scoped query folders verified inside this project. The lease pins their
+    /// active ancestry until dispatch finishes or is cancelled.
+    fn project_folders(&self) -> &BTreeSet<FolderId>;
     fn check(&self) -> DomainResult<()>;
 }
 #[derive(Clone, Debug)]
 pub struct ProviderEgressRequest {
     pub origins: Vec<ProviderOrigin>,
     pub project: Option<FolderRef>,
+    pub project_folders: BTreeSet<FolderId>,
 }
 pub trait ProviderEgressCatalogPort: Send + Sync {
     fn acquire_egress(

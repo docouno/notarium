@@ -8,7 +8,7 @@ use std::{
 
 use notarium_core::{
     DomainError, DomainResult,
-    auth::ResourceFacts,
+    auth::{ResourceFacts, SpaceLifecycle},
     classes::{ClassifiedDocument, DocClass},
     error::{PortError, ValidationReason},
     ids::{
@@ -45,6 +45,8 @@ use crate::{
     sql_exec::BackendConn,
     writer::ChangePayloadDraft,
 };
+
+pub mod search;
 
 pub const EFFECT_CODEC_V1: &str = "effect_v1";
 pub const DEFAULT_BROADCAST_CAPACITY: usize = 1024;
@@ -328,6 +330,10 @@ impl CommittedTargetAcc {
 /// current authority and metadata from the store after receiving a signal.
 #[derive(Clone, Debug)]
 pub enum BroadcastSignal {
+    CatalogChanged {
+        scope: HistoryScope,
+        lifecycle: SpaceLifecycle,
+    },
     Committed {
         scope: HistoryScope,
         new_last_seq: SpaceSeq,
@@ -351,6 +357,32 @@ impl CanonicalStore {
     /// Observes canonical Space changes without registering a change-feed cursor.
     pub fn subscribe_space_signals(&self) -> broadcast::Receiver<BroadcastSignal> {
         self.inner.broadcast_hub.subscribe_raw()
+    }
+}
+
+/// Wakeups for projection-space discovery. The catalog remains authoritative
+/// after a lagged notification or an incarnation change.
+pub struct ProjectionCatalogSubscription {
+    receiver: broadcast::Receiver<BroadcastSignal>,
+}
+
+impl ProjectionCatalogSubscription {
+    pub async fn next(&mut self) -> Option<Option<HistoryScope>> {
+        loop {
+            match self.receiver.recv().await {
+                Ok(BroadcastSignal::CatalogChanged { scope, .. }) => return Some(Some(scope)),
+                Ok(BroadcastSignal::IncarnationChanged { new_scope, .. }) => {
+                    return Some(Some(new_scope));
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => return Some(None),
+                Err(broadcast::error::RecvError::Closed) => return None,
+                Ok(
+                    BroadcastSignal::Committed { .. }
+                    | BroadcastSignal::Purged { .. }
+                    | BroadcastSignal::WriterLeaseChanged { .. },
+                ) => {}
+            }
+        }
     }
 }
 
@@ -445,10 +477,12 @@ pub(crate) fn check_change_consumer_authority(auth: &ServiceAuthority) -> Domain
 
 struct CanonicalChangeSubscription {
     store: CanonicalStore,
+    needs_active_space: bool,
     sub_id: u64,
     processed: ChangeCursor,
     delivered_complete_command_end: SpaceSeq,
     pending_initial: Option<ChangeNotice>,
+    pending_lagged: bool,
     rx: broadcast::Receiver<BroadcastSignal>,
     next_durable_poll: tokio::time::Instant,
     durable_checked_through: SpaceSeq,
@@ -461,7 +495,7 @@ impl CanonicalChangeSubscription {
         // A local broadcast can announce a later head without having seen a remote purge.
         // Only a database read can advance this watermark.
         let checked = self.durable_checked_through;
-        let (head, must_reseed) = self.store.with_read_tx(|tx| {
+        let (head, lifecycle, must_reseed) = self.store.with_read_tx(|tx| {
             Box::pin(async move {
                 let rec = load_space_record(tx, &processed.scope.space_id).await?;
                 let start = if lagged { processed.after } else { processed.after.max(checked) };
@@ -478,11 +512,16 @@ impl CanonicalChangeSubscription {
                 } else {
                     false
                 };
-                Ok((ChangeCursor {scope: rec.scope, after: rec.last_seq}, must_reseed))
+                Ok((ChangeCursor {scope: rec.scope, after: rec.last_seq}, rec.space.lifecycle, must_reseed))
             })
         }).await?;
 
-        if head.scope != self.processed.scope {
+        if lagged {
+            self.pending_lagged = false;
+        }
+        if head.scope != self.processed.scope
+            || (self.needs_active_space && lifecycle != SpaceLifecycle::Active)
+        {
             return Ok(Some(ChangeNotice::Resync { scope: head.scope }));
         }
         self.delivered_complete_command_end = delivered.max(head.after);
@@ -518,6 +557,9 @@ impl ChangeSubscription for CanonicalChangeSubscription {
             if let Some(initial) = self.pending_initial.take() {
                 return Ok(Some(initial));
             }
+            if self.pending_lagged {
+                return self.durable_notice(true).await;
+            }
 
             // The broadcast ring is process-local. Check durable PostgreSQL state while
             // a consumer waits, even when other Spaces keep the local ring busy.
@@ -539,6 +581,14 @@ impl ChangeSubscription for CanonicalChangeSubscription {
                     self.rx.recv().await
                 };
                 match signal {
+                    Ok(BroadcastSignal::CatalogChanged { scope, lifecycle }) => {
+                        if self.needs_active_space
+                            && scope.space_id == self.processed.scope.space_id
+                            && lifecycle != SpaceLifecycle::Active
+                        {
+                            return Ok(Some(ChangeNotice::Resync { scope }));
+                        }
+                    }
                     Ok(BroadcastSignal::IncarnationChanged { new_scope, ceiling }) => {
                         if new_scope.space_id == self.processed.scope.space_id {
                             self.delivered_complete_command_end = ceiling;
@@ -588,6 +638,7 @@ impl ChangeSubscription for CanonicalChangeSubscription {
                     }
                     Ok(BroadcastSignal::WriterLeaseChanged { .. }) => {}
                     Err(broadcast::error::RecvError::Lagged(_)) => {
+                        self.pending_lagged = true;
                         return self.durable_notice(true).await;
                     }
                     Err(broadcast::error::RecvError::Closed) => {
@@ -648,18 +699,22 @@ impl ChangeBroadcast for CanonicalStore {
         let store = self.clone();
         Box::pin(async move {
             check_change_consumer_authority(&ctx.authority)?;
+            let needs_active_space = ctx.authority.require(ServicePurpose::Search).is_ok();
 
             // Subscribe to broadcast channel BEFORE reading DB state so zero post-read commits are missed!
             let rx = store.inner.broadcast_hub.subscribe_raw();
             let after_cl = after.clone();
 
-            let (space_rec, has_erased) = store
+            let (space_rec, must_resync, has_erased) = store
                 .with_read_tx_budget(Some(&ctx.budget), |tx| {
                     Box::pin(async move {
                         let rec = load_space_record(tx, &after_cl.scope.space_id).await?;
-                        // History mismatch must yield `ChangeNotice::Resync` BEFORE comparing any SpaceSeq!
-                        if rec.scope.incarnation != after_cl.scope.incarnation {
-                            return Ok((rec, false));
+                        // Retire a search subscriber on archive even if the catalog change
+                        // did not advance last_seq. Never compare sequences across histories.
+                        if rec.scope.incarnation != after_cl.scope.incarnation
+                            || (needs_active_space && rec.space.lifecycle != SpaceLifecycle::Active)
+                        {
+                            return Ok((rec, true, false));
                         }
                         if after_cl.after > SpaceSeq::ZERO {
                             let _ =
@@ -678,50 +733,49 @@ impl ChangeBroadcast for CanonicalStore {
                             } else {
                                 false
                             };
-                        Ok((rec, erased))
+                        Ok((rec, false, erased))
                     })
                 })
                 .await?;
 
-            let (pending_initial, delivered_end) =
-                if space_rec.scope.incarnation != after.scope.incarnation {
-                    (
-                        Some(ChangeNotice::Resync {
-                            scope: space_rec.scope.clone(),
-                        }),
-                        SpaceSeq::ZERO,
-                    )
-                } else if after.after == SpaceSeq::ZERO {
-                    (
-                        Some(ChangeNotice::SeedRequired {
-                            cutoff: ChangeCursor {
-                                scope: space_rec.scope.clone(),
-                                after: space_rec.last_seq,
-                            },
-                        }),
-                        space_rec.last_seq,
-                    )
-                } else if has_erased {
-                    (
-                        Some(ChangeNotice::PurgeResync {
-                            cutoff: ChangeCursor {
-                                scope: space_rec.scope.clone(),
-                                after: space_rec.last_seq,
-                            },
-                        }),
-                        space_rec.last_seq,
-                    )
-                } else if space_rec.last_seq > after.after {
-                    (
-                        Some(ChangeNotice::Advanced(ChangeCursor {
+            let (pending_initial, delivered_end) = if must_resync {
+                (
+                    Some(ChangeNotice::Resync {
+                        scope: space_rec.scope.clone(),
+                    }),
+                    SpaceSeq::ZERO,
+                )
+            } else if after.after == SpaceSeq::ZERO {
+                (
+                    Some(ChangeNotice::SeedRequired {
+                        cutoff: ChangeCursor {
                             scope: space_rec.scope.clone(),
                             after: space_rec.last_seq,
-                        })),
-                        space_rec.last_seq,
-                    )
-                } else {
-                    (None, after.after)
-                };
+                        },
+                    }),
+                    space_rec.last_seq,
+                )
+            } else if has_erased {
+                (
+                    Some(ChangeNotice::PurgeResync {
+                        cutoff: ChangeCursor {
+                            scope: space_rec.scope.clone(),
+                            after: space_rec.last_seq,
+                        },
+                    }),
+                    space_rec.last_seq,
+                )
+            } else if space_rec.last_seq > after.after {
+                (
+                    Some(ChangeNotice::Advanced(ChangeCursor {
+                        scope: space_rec.scope.clone(),
+                        after: space_rec.last_seq,
+                    })),
+                    space_rec.last_seq,
+                )
+            } else {
+                (None, after.after)
+            };
 
             let sub_id = store
                 .inner
@@ -733,10 +787,12 @@ impl ChangeBroadcast for CanonicalStore {
 
             Ok(Box::new(CanonicalChangeSubscription {
                 store,
+                needs_active_space,
                 sub_id,
                 processed: after,
                 delivered_complete_command_end: delivered_end,
                 pending_initial,
+                pending_lagged: false,
                 rx,
                 next_durable_poll: tokio::time::Instant::now() + PG_CHANGE_POLL_INTERVAL,
                 durable_checked_through: space_rec.last_seq,
@@ -785,6 +841,16 @@ impl<'a> ChangeCaller<'a> {
 }
 
 impl CanonicalStore {
+    pub fn subscribe_projection_catalog(
+        &self,
+        ctx: &MaintenanceContext,
+    ) -> Result<ProjectionCatalogSubscription, PortError> {
+        ctx.authority.require(ServicePurpose::Projection)?;
+        Ok(ProjectionCatalogSubscription {
+            receiver: self.inner.broadcast_hub.subscribe_raw(),
+        })
+    }
+
     #[cfg(feature = "test-support")]
     pub fn reconfigure_broadcast_capacity_for_test(&self, capacity: usize) {
         self.inner.broadcast_hub.reconfigure_capacity(capacity);
@@ -818,73 +884,7 @@ impl CanonicalStore {
 
                 let mut out = Vec::with_capacity(relevant.len());
                 for token in relevant {
-                    let seq_i64 = token.seq().get() as i64;
-                    let cmd_row: Option<(String, Option<String>)> = match tx {
-                        BackendConn::Sqlite(conn) => {
-                            let r = sqlx::query(
-                                "SELECT command_kind, payload_id FROM change_commands
-                                 WHERE space_id = ? AND history_incarnation = ? AND last_seq = ?",
-                            )
-                            .bind(scope_cl.space_id.as_str())
-                            .bind(scope_cl.incarnation.as_bytes().as_slice())
-                            .bind(seq_i64)
-                            .fetch_optional(&mut **conn)
-                            .await
-                            .map_err(|err| {
-                                internal_not_committed("sqlite_resolve_rcpt_cmd", err.to_string())
-                            })?;
-                            r.map(|row| (row.get("command_kind"), row.get("payload_id")))
-                        }
-                        BackendConn::Postgres(conn) => {
-                            let r = sqlx::query(
-                                "SELECT command_kind, payload_id FROM change_commands
-                                 WHERE space_id = $1 AND history_incarnation = $2 AND last_seq = $3",
-                            )
-                            .bind(scope_cl.space_id.as_str())
-                            .bind(scope_cl.incarnation.as_bytes().as_slice())
-                            .bind(seq_i64)
-                            .fetch_optional(&mut **conn)
-                            .await
-                            .map_err(|err| {
-                                crate::runtime::pg_read_error("pg_resolve_rcpt_cmd", err)
-                            })?;
-                            r.map(|row| (row.get("command_kind"), row.get("payload_id")))
-                        }
-                    };
-
-                    let Some((command_kind, payload_id_opt)) = cmd_row else {
-                        out.push(TrustedMutationEffect {
-                            receipt: token,
-                            effect: MutationEffect::AwaitProjection {
-                                reason: AwaitReason::UnknownEffect,
-                            },
-                        });
-                        continue;
-                    };
-
-                    let effect = match payload_id_opt {
-                        None => default_effect_without_payload(&command_kind),
-                        Some(pid) => match load_decoded_effect_tx(tx, &scope_cl.space_id, &pid).await
-                        {
-                            Ok(eff) => verify_overlay_versions_retained_tx(
-                                tx,
-                                &scope_cl,
-                                token.seq(),
-                                &command_kind,
-                                eff,
-                            )
-                            .await?,
-                            Err(PortError::Domain(DomainError::ValidationFailed {
-                                diagnostic,
-                            })) if diagnostic.reason == ValidationReason::PurgeResync => {
-                                MutationEffect::AwaitProjection {
-                                    reason: AwaitReason::UnavailableVersion,
-                                }
-                            }
-                            Err(other) => return Err(other),
-                        },
-                    };
-
+                    let (_, effect) = resolve_receipt_effect_tx(tx, &scope_cl, token.seq()).await?;
                     out.push(TrustedMutationEffect {
                         receipt: token,
                         effect,
@@ -1116,13 +1116,13 @@ impl CanonicalStore {
                     };
 
                     let effect = match &row.payload_id {
-                        None => default_effect_for_op(&row.op_kind),
+                        None => default_effect_for_op(&row.entity_type, &row.op_kind),
                         Some(pid) => {
                             if let Some(cached) = payload_cache.get(pid) {
                                 cached.clone()
                             } else {
                                 let loaded =
-                                    load_decoded_effect_tx(tx, &after.scope.space_id, pid).await?;
+                                    load_decoded_effect_tx(tx, &after.scope, pid, command_range, None).await?;
                                 payload_cache.insert(pid.clone(), loaded.clone());
                                 loaded
                             }
@@ -1266,19 +1266,7 @@ impl CanonicalStore {
                                 break 'notes_scan;
                             }
 
-                            for (idx, note_key) in candidates.iter().enumerate() {
-                                // Check if we already filled `max_items`: if at least one more eligible note
-                                // or thread remains, emit `NotesAfter(last_emitted_note)`!
-                                if collected_notes.len() == max_items {
-                                    let last_id = collected_notes
-                                        .last()
-                                        .expect("non-empty notes")
-                                        .note_id
-                                        .clone();
-                                    next_seed_pos = Some(SeedPosition::NotesAfter(last_id));
-                                    break 'notes_scan;
-                                }
-
+                            for note_key in &candidates {
                                 note_cursor_after = Some(note_key.clone());
 
                                 // Skip notes already purged at or before `valid_cutoff`.
@@ -1355,6 +1343,16 @@ impl CanonicalStore {
                                     continue;
                                 }
 
+                                if collected_notes.len() == max_items {
+                                    let last_id = collected_notes
+                                        .last()
+                                        .expect("non-empty notes")
+                                        .note_id
+                                        .clone();
+                                    next_seed_pos = Some(SeedPosition::NotesAfter(last_id));
+                                    break 'notes_scan;
+                                }
+
                                 let digest = note_meta
                                     .content_digest
                                     .or(rev_rec.content_digest)
@@ -1372,66 +1370,17 @@ impl CanonicalStore {
                                     meta: note_meta,
                                     digest,
                                 });
-
-                                // If we just hit `max_items` and there are uninspected candidates in this batch,
-                                // check whether more notes or threads exist before deciding `next_seed_pos`.
-                                if collected_notes.len() == max_items
-                                    && idx + 1 == candidates.len()
-                                    && (candidates.len() as i64) < batch_size
-                                {
-                                    // Exhausted ALL note candidates right at `max_items`!
-                                    // Check if any thread exists at `valid_cutoff`:
-                                    let any_threads = !list_thread_keys_at_or_below_cutoff_tx(
-                                        tx,
-                                        &scope_in,
-                                        valid_cutoff,
-                                        None,
-                                        1,
-                                    )
-                                    .await?
-                                    .is_empty();
-                                    if any_threads {
-                                        let last_id = collected_notes
-                                            .last()
-                                            .expect("non-empty notes")
-                                            .note_id
-                                            .clone();
-                                        next_seed_pos = Some(SeedPosition::NotesAfter(last_id));
-                                    }
-                                    break 'notes_scan;
-                                }
                             }
-
                             if (candidates.len() as i64) < batch_size {
-                                // All notes scanned! If `collected_notes.len() == max_items`, check if threads exist.
-                                if collected_notes.len() == max_items && next_seed_pos.is_none() {
-                                    let any_threads = !list_thread_keys_at_or_below_cutoff_tx(
-                                        tx,
-                                        &scope_in,
-                                        valid_cutoff,
-                                        None,
-                                        1,
-                                    )
-                                    .await?
-                                    .is_empty();
-                                    if any_threads {
-                                        let last_id = collected_notes
-                                            .last()
-                                            .expect("non-empty notes")
-                                            .note_id
-                                            .clone();
-                                        next_seed_pos = Some(SeedPosition::NotesAfter(last_id));
-                                    }
-                                }
                                 break 'notes_scan;
                             }
                         }
                     }
 
-                    // Transition seamlessly to Threads phase when remaining page capacity > 0
-                    // (including when Notes phase had 0 notes — NO fabricated NoteId needed!).
-                    let remaining_slots = max_items.saturating_sub(collected_notes.len());
-                    if next_seed_pos.is_none() && remaining_slots > 0 {
+                    // Only an authorized next row warrants a continuation, including
+                    // at the boundary between the note and thread phases.
+                    let remaining_slots = max_items - collected_notes.len();
+                    if next_seed_pos.is_none() {
                         let batch_size = (remaining_slots + 16) as i64;
                         'threads_scan: loop {
                             let candidates = list_thread_keys_at_or_below_cutoff_tx(
@@ -1447,16 +1396,6 @@ impl CanonicalStore {
                             }
 
                             for thread_key in &candidates {
-                                if collected_threads.len() == remaining_slots {
-                                    let last_tid = collected_threads
-                                        .last()
-                                        .expect("non-empty threads")
-                                        .id
-                                        .clone();
-                                    next_seed_pos = Some(SeedPosition::ThreadsAfter(last_tid));
-                                    break 'threads_scan;
-                                }
-
                                 thread_cursor_after = Some(thread_key.clone());
 
                                 let Some(rev_rec) = read_immutable_revision_tx(
@@ -1492,8 +1431,10 @@ impl CanonicalStore {
 
                                 if let Some(auth) = &auth_in
                                     && auth
-                                        .authorize_chat_read(
+                                        .can_view_chat_thread(
                                             &space_rec.space,
+                                            kind,
+                                            &owner_id,
                                             project_folder_id.as_ref(),
                                             tainted,
                                         )
@@ -1502,6 +1443,17 @@ impl CanonicalStore {
                                     continue;
                                 }
 
+                                if collected_threads.len() == remaining_slots {
+                                    next_seed_pos = collected_threads
+                                        .last()
+                                        .map(|thread| SeedPosition::ThreadsAfter(thread.id.clone()))
+                                        .or_else(|| {
+                                            collected_notes.last().map(|note| {
+                                                SeedPosition::NotesAfter(note.note_id.clone())
+                                            })
+                                        });
+                                    break 'threads_scan;
+                                }
                                 collected_threads.push(ChatThread {
                                     id: thread_id,
                                     space: scope_in.space_id.clone(),
@@ -1606,6 +1558,7 @@ impl CanonicalStore {
                     note.document.bind_current(facts, lifecycle)?;
                 }
                 if let Some(auth) = &space_auth {
+                    let mut any_tainted = false;
                     for thread in &thread_items {
                         let (project, tainted) = crate::domain::lookup_thread_visibility_tx(
                             tx,
@@ -1614,7 +1567,24 @@ impl CanonicalStore {
                         )
                         .await?
                         .ok_or(DomainError::ResourceNotFound)?;
-                        auth.authorize_chat_read(&space.space, project.as_ref(), tainted)?;
+                        auth.can_view_chat_thread(
+                            &space.space,
+                            thread.kind,
+                            &thread.owner,
+                            project.as_ref(),
+                            tainted,
+                        )?;
+                        auth.can_view_chat_thread(
+                            &space.space,
+                            thread.kind,
+                            &thread.owner,
+                            thread.project_folder.as_ref(),
+                            thread.tainted,
+                        )?;
+                        any_tainted |= tainted || thread.tainted;
+                    }
+                    if !thread_items.is_empty() {
+                        auth.mark_chat_read_taint(&space.space, any_tainted);
                     }
                 }
                 Ok(ChangeSeed {
@@ -1692,22 +1662,28 @@ fn parse_change_kind(op_kind: &str) -> Result<ChangeKind, PortError> {
     }
 }
 
-fn default_effect_for_op(op_kind: &str) -> MutationEffect {
-    match op_kind {
-        "purge" | "move" | "rename" => MutationEffect::AwaitProjection {
-            reason: AwaitReason::Structural,
-        },
+fn default_effect_for_op(entity_type: &str, op_kind: &str) -> MutationEffect {
+    match (entity_type, op_kind) {
+        (_, "purge" | "move" | "rename") | ("folder", "create" | "trash" | "restore") => {
+            MutationEffect::AwaitProjection {
+                reason: AwaitReason::Structural,
+            }
+        }
         _ => MutationEffect::NoRelevantEffect,
     }
 }
 
 fn default_effect_without_payload(command_kind: &str) -> MutationEffect {
     match command_kind {
-        "move_folder" | "rename_folder" | "rename_project" | "purge_note" | "mint_and_purge" => {
-            MutationEffect::AwaitProjection {
-                reason: AwaitReason::Structural,
-            }
-        }
+        "create_folder"
+        | "set_folder_lifecycle"
+        | "move_folder"
+        | "rename_folder"
+        | "rename_project"
+        | "purge_note"
+        | "mint_and_purge" => MutationEffect::AwaitProjection {
+            reason: AwaitReason::Structural,
+        },
         "rollback_agent_run" => MutationEffect::AwaitProjection {
             reason: AwaitReason::Bulk,
         },
@@ -1717,9 +1693,12 @@ fn default_effect_without_payload(command_kind: &str) -> MutationEffect {
 
 async fn load_decoded_effect_tx(
     tx: &mut BackendConn<'_>,
-    space_id: &SpaceId,
+    scope: &HistoryScope,
     payload_id: &str,
+    command_range: CommandSeqRange,
+    command_kind: Option<&str>,
 ) -> Result<MutationEffect, PortError> {
+    let space_id = &scope.space_id;
     let raw: Option<(String, i32, Option<Vec<u8>>)> = match tx {
         BackendConn::Sqlite(conn) => {
             let r = sqlx::query(
@@ -1782,7 +1761,98 @@ async fn load_decoded_effect_tx(
     }
 
     let env = EffectEnvelopeV1::decode(&bytes)?;
+    // Restores rebind the enclosing journal to a new history without rewriting
+    // preserved immutable payloads. The command lookup already checks that history.
+    if env.scope.space_id != scope.space_id
+        || env.command_range != command_range
+        || command_kind.is_some_and(|kind| kind != env.command_kind)
+    {
+        return Err(internal_not_committed(
+            "corrupt_change_payload_scope",
+            "change effect does not match its command",
+        ));
+    }
     Ok(env.to_mutation_effect(bytes.len()))
+}
+
+pub(crate) async fn resolve_receipt_effect_tx(
+    tx: &mut BackendConn<'_>,
+    scope: &HistoryScope,
+    command_end: SpaceSeq,
+) -> Result<(Option<String>, MutationEffect), PortError> {
+    let seq_i64 = command_end.get() as i64;
+    let cmd_row: Option<(String, i64, Option<String>)> = match tx {
+        BackendConn::Sqlite(conn) => {
+            let r = sqlx::query(
+                "SELECT command_kind, first_seq, payload_id FROM change_commands
+                 WHERE space_id = ? AND history_incarnation = ? AND last_seq = ?",
+            )
+            .bind(scope.space_id.as_str())
+            .bind(scope.incarnation.as_bytes().as_slice())
+            .bind(seq_i64)
+            .fetch_optional(&mut **conn)
+            .await
+            .map_err(|err| internal_not_committed("sqlite_resolve_rcpt_cmd", err.to_string()))?;
+            r.map(|row| {
+                (
+                    row.get("command_kind"),
+                    row.get("first_seq"),
+                    row.get("payload_id"),
+                )
+            })
+        }
+        BackendConn::Postgres(conn) => {
+            let r = sqlx::query(
+                "SELECT command_kind, first_seq, payload_id FROM change_commands
+                 WHERE space_id = $1 AND history_incarnation = $2 AND last_seq = $3",
+            )
+            .bind(scope.space_id.as_str())
+            .bind(scope.incarnation.as_bytes().as_slice())
+            .bind(seq_i64)
+            .fetch_optional(&mut **conn)
+            .await
+            .map_err(|err| crate::runtime::pg_read_error("pg_resolve_rcpt_cmd", err))?;
+            r.map(|row| {
+                (
+                    row.get("command_kind"),
+                    row.get("first_seq"),
+                    row.get("payload_id"),
+                )
+            })
+        }
+    };
+
+    let Some((command_kind, first_seq, payload_id_opt)) = cmd_row else {
+        return Ok((
+            None,
+            MutationEffect::AwaitProjection {
+                reason: AwaitReason::UnknownEffect,
+            },
+        ));
+    };
+
+    let range = CommandSeqRange::new(i64_to_space_seq(first_seq)?, command_end)?;
+    let effect = match payload_id_opt {
+        None => default_effect_without_payload(&command_kind),
+        Some(pid) => {
+            match load_decoded_effect_tx(tx, scope, &pid, range, Some(&command_kind)).await {
+                Ok(eff) => {
+                    verify_overlay_versions_retained_tx(tx, scope, command_end, &command_kind, eff)
+                        .await?
+                }
+                Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
+                    if diagnostic.reason == ValidationReason::PurgeResync =>
+                {
+                    MutationEffect::AwaitProjection {
+                        reason: AwaitReason::UnavailableVersion,
+                    }
+                }
+                Err(other) => return Err(other),
+            }
+        }
+    };
+
+    Ok((Some(command_kind), effect))
 }
 
 async fn verify_overlay_versions_retained_tx(
@@ -1968,7 +2038,7 @@ async fn has_erased_change_payload_in_range_tx(
     Ok(found.is_some())
 }
 
-async fn has_post_cutoff_purge_of_prior_note_tx(
+pub(crate) async fn has_post_cutoff_purge_of_prior_note_tx(
     tx: &mut BackendConn<'_>,
     scope: &HistoryScope,
     valid_cutoff: SpaceSeq,
@@ -2039,7 +2109,7 @@ async fn list_note_keys_at_or_below_cutoff_tx(
     }
 }
 
-async fn list_thread_keys_at_or_below_cutoff_tx(
+pub(crate) async fn list_thread_keys_at_or_below_cutoff_tx(
     tx: &mut BackendConn<'_>,
     scope: &HistoryScope,
     cutoff: SpaceSeq,

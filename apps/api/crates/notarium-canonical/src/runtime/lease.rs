@@ -159,6 +159,95 @@ impl CanonicalStore {
             .map_err(|e| crate::codec::unknown_commit_outcome("lease_worker", e.to_string()))?
     }
 
+    pub(crate) fn resume_deferred_projection_purges(&self) {
+        let store = self.clone();
+        let task = self.inner.backup_executor.spawn(async move {
+            let mut backoff = Duration::from_millis(50);
+            let recover = async {
+                loop {
+                    let retry = match store.recover_deferred_projection_purges().await {
+                        Ok(delay) => delay,
+                        Err(error) => {
+                            tracing::warn!(?error, "cannot scan pending projection purges");
+                            crate::blobs::retirement_worker::retry_after(&error)
+                        }
+                    };
+                    let Some(minimum) = retry else { break };
+                    tokio::time::sleep(backoff.max(minimum)).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(5));
+                }
+            };
+            tokio::select! {
+                () = store.inner.backup_shutdown.cancelled() => {}
+                () = recover => {}
+            }
+        });
+        register_cleanup_task(&self.inner, task);
+    }
+
+    async fn recover_deferred_projection_purges(&self) -> Result<Option<Duration>, PortError> {
+        // Walk the Space primary key even across clean pages. A phase-index lookup
+        // per Space avoids traversing its completed purge history on registration.
+        const PAGE: &str = concat!(
+            "SELECT s.space_id, ",
+            include_str!("../domain/purge/has_pending.sql"),
+            " FROM spaces s WHERE s.space_id>$1 ORDER BY s.space_id LIMIT 64"
+        );
+        let mut after = String::new();
+        let mut retry = None;
+        loop {
+            let cursor = after.clone();
+            let page: Vec<(String, bool)> = self
+                .with_read_tx(move |tx| {
+                    Box::pin(async move {
+                        match tx {
+                            BackendConn::Sqlite(c) => {
+                                sqlx::query_as(PAGE).bind(cursor).fetch_all(&mut **c).await
+                            }
+                            BackendConn::Postgres(c) => {
+                                sqlx::query_as(PAGE).bind(cursor).fetch_all(&mut **c).await
+                            }
+                        }
+                        .map_err(|error| pg_read_error("projection_pending_purges", error))
+                    })
+                })
+                .await?;
+            if page.is_empty() {
+                return Ok(retry);
+            }
+            for (id, has_purges) in page {
+                after = id;
+                if !has_purges {
+                    continue;
+                }
+                let result = async {
+                    let space = self.read_space(&SpaceId::parse(&after)?).await?;
+                    if self
+                        .inner
+                        .check_writer_epoch(&space.scope.space_id, space.active_epoch)
+                        .is_ok()
+                    {
+                        // A concurrent takeover scan may already be returning "deferred".
+                        self.resume_pending_storage_for_space(
+                            &space.scope,
+                            space.active_epoch,
+                            RetirementRecovery::Online,
+                        )
+                        .await?;
+                    }
+                    Ok::<_, PortError>(())
+                }
+                .await;
+                if let Err(error) = result {
+                    tracing::warn!(?error, space_id=%after, "projection purge recovery remains pending");
+                    if let Some(minimum) = crate::blobs::retirement_worker::retry_after(&error) {
+                        retry = Some(retry.unwrap_or_default().max(minimum));
+                    }
+                }
+            }
+        }
+    }
+
     async fn lease_recovery(
         &self,
         scope: HistoryScope,
@@ -201,7 +290,7 @@ impl CanonicalStore {
         let mut backoff = Duration::from_millis(50);
         loop {
             let Err(error) = self
-                .resume_pending_storage_for_space(scope, epoch, RetirementRecovery::Lease)
+                .resume_pending_storage_for_space(scope, epoch, RetirementRecovery::Online)
                 .await
             else {
                 return Ok(());
@@ -238,6 +327,11 @@ impl CanonicalStore {
             let room_fences = &self.inner.room_fences;
             let pending: Vec<_> = {
                 let _gate = self.inner.writer()?.acquire_commit_read_guard().await;
+                let mut visibility = self
+                    .inner
+                    .live_visibility
+                    .for_write(vec![scope.space_id.clone()])
+                    .await;
                 let mut connection = pool.acquire().await.map_err(|e| {
                     unavailable_retryable(
                         "pg_acquire_lease",
@@ -285,6 +379,7 @@ impl CanonicalStore {
                 )
                 .await?;
                 attempt.submit()?;
+                visibility.committing();
                 tx.commit().await.map_err(|e| {
                     crate::codec::unknown_commit_outcome("pg_commit_lease", e.to_string())
                 })?;
@@ -310,18 +405,23 @@ impl CanonicalStore {
             return Ok(true);
         }
         let scope = scope.clone();
+        let space = scope.space_id.clone();
         let store = self.clone();
-        self.with_write_tx(move |tx| {
-            Box::pin(async move {
-                let changed = store
-                    .update_lease_rows(tx, &scope, new_epoch, &attempt)
-                    .await?;
-                if changed {
-                    attempt.submit()?;
-                }
-                Ok(changed)
-            })
-        })
+        self.with_visibility_write_tx(
+            Some(space),
+            move |tx| {
+                Box::pin(async move {
+                    let changed = store
+                        .update_lease_rows(tx, &scope, new_epoch, &attempt)
+                        .await?;
+                    if changed {
+                        attempt.submit()?;
+                    }
+                    Ok(changed)
+                })
+            },
+            Ok,
+        )
         .await
     }
 
@@ -348,6 +448,7 @@ impl CanonicalStore {
         if new_epoch <= current.active_epoch {
             return Err(DomainError::validation(ValidationReason::InvalidState).into());
         }
+        self.check_projection_owner_advance(tx, scope).await?;
         let epoch_i64 = new_epoch.get() as i64;
         let affected = match tx {
                     BackendConn::Sqlite(conn) => sqlx::query(

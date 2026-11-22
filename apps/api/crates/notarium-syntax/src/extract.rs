@@ -116,6 +116,8 @@ pub fn finalize_document(
     Ok(result)
 }
 
+const MAX_EXTRACTED_LINKS: usize = 4_096;
+
 fn escaped(source: &str, index: usize) -> bool {
     source[..index]
         .bytes()
@@ -160,7 +162,10 @@ fn links_and_tags(
                     .split_once('|')
                     .map_or((raw, None), |(t, l)| (t, Some(l.to_owned())));
                 let target = target.trim();
-                if !target.is_empty() && !target.contains(['\r', '\n']) {
+                if !target.is_empty()
+                    && !target.contains(['\r', '\n'])
+                    && links.len() < MAX_EXTRACTED_LINKS
+                {
                     let kind = if let Ok(id) = NoteId::parse(target) {
                         WikiTargetKind::StableNoteId(id)
                     } else {

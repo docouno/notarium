@@ -2003,11 +2003,53 @@ async fn sleep_async_interruptible(
     Ok(())
 }
 
+#[cfg(test)]
+#[test]
+fn historical_spool_shapes_match_their_published_manifests() {
+    for version in [6, 7] {
+        let observed = checksum_tables(version, spool_tables(version));
+        assert!(crate::schema::migrate::recognized_predecessor(
+            i64::from(version),
+            observed.as_bytes()
+        ));
+    }
+}
+
 fn spool_tables(schema_version: u32) -> impl Iterator<Item = TableSpec> + Clone {
     CANONICAL_TABLES
         .iter()
         .copied()
         .filter_map(move |mut table| {
+            if schema_version == 7 && table.name == "chat_entry_note_refs" {
+                table.columns = &table.columns[..6];
+                table.indexes = &["idx_chat_entry_note_refs_target"];
+            }
+            if schema_version < 7 {
+                match table.name {
+                    "projection_rank_anchors"
+                    | "projection_rank_anchor_rows"
+                    | "chat_entry_note_refs" => return None,
+                    "folder_aliases" => table.indexes = &["idx_folder_aliases_lookup"],
+                    "note_aliases" => {
+                        table.indexes = &[
+                            "idx_note_aliases_slug_lookup",
+                            "idx_note_aliases_title_lookup",
+                            "idx_note_aliases_target",
+                        ];
+                    }
+                    "revisions" => {
+                        table.indexes = &[
+                            "idx_revisions_entity_vis_seq",
+                            "idx_revisions_agent_run",
+                            "idx_revisions_parent_rev",
+                        ];
+                    }
+                    "chat_entries" => {
+                        table.indexes = &["idx_chat_entries_parent", "idx_chat_entries_compaction"];
+                    }
+                    _ => {}
+                }
+            }
             if schema_version < 5 && table.name == "command_receipts" {
                 table.indexes = &["idx_command_receipts_expires"];
             }
@@ -2039,7 +2081,7 @@ fn spool_tables(schema_version: u32) -> impl Iterator<Item = TableSpec> + Clone 
         })
 }
 
-/// Materializes a verified schema 1 through 6 spool for offline inspection within the default budget.
+/// Materializes a verified canonical spool for offline inspection within the default budget.
 pub fn decode_postgres_spool_v1(path: &Path) -> Result<DecodedPostgresSpoolV1, PortError> {
     decode_postgres_spool_v1_bounded(
         path,
@@ -2111,7 +2153,7 @@ pub fn decode_postgres_spool_v1_bounded(
     let expected_tables = spool_tables(schema_version);
     let expected_checksum = match schema_version {
         CANONICAL_SCHEMA_VERSION => manifest_checksum(),
-        1..=5 => {
+        1..=7 => {
             let digest = checksum_tables(schema_version, expected_tables.clone());
             if !crate::schema::migrate::recognized_predecessor(
                 i64::from(schema_version),
@@ -3395,6 +3437,7 @@ impl BackupParticipantPort for CanonicalStore {
 // ============================================================================
 
 async fn recover_restored_gc(store: CanonicalStore, spaces: Vec<(HistoryScope, LeaseEpoch)>) {
+    use crate::domain::purge::{RetirementRecovery, RetirementSelection};
     use futures_util::StreamExt;
     futures_util::stream::iter(spaces)
         .for_each_concurrent(4, |(scope, epoch)| {
@@ -3406,7 +3449,8 @@ async fn recover_restored_gc(store: CanonicalStore, spaces: Vec<(HistoryScope, L
                         .resume_blob_retirements(
                             &scope,
                             epoch,
-                            crate::domain::purge::RetirementRecovery::RestoredGc,
+                            RetirementRecovery::Online,
+                            RetirementSelection::GcOnly,
                         )
                         .await
                     {
@@ -3905,6 +3949,7 @@ async fn apply_restore_cursor_tx(
         "board_move_history",
         "chat_threads",
         "pending_purges",
+        "projection_rank_anchors",
     ];
 
     match tx {

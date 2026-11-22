@@ -9,8 +9,9 @@ The backend separates control, canonical and rebuildable derived state. Local
 delivery uses independent SQLite files without `ATTACH DATABASE`: control data,
 canonical data with a batch writer and Zstd CAS, and derived generations
 published through ArcSwap. Cloud delivery pairs PostgreSQL 16 with S3-compatible
-CAS. Search targets pure Rust i8 mmap CSR-HNSW with `std::arch` SIMD. ONNX is
-loaded dynamically through `ort`, never downloaded during offline builds.
+CAS. Search combines Tantivy with a pure Rust i8 mmap CSR-HNSW index and
+`std::arch` SIMD. The optional ONNX backend loads the CPU runtime dynamically
+through `ort`. Offline builds use cached dependencies.
 
 The core, syntax, canonical and control libraries implement [domain contracts](core-contracts.md),
 [document syntax](syntax.md) and [control-plane services](control.md), including
@@ -19,9 +20,11 @@ byte-preserving edits, SQLite/PostgreSQL control storage, authentication, OAuth/
 the native keyring, guarded outbound HTTP, the AI provider gateway and the
 [control backup participant](control-backup.md). [Canonical storage](storage.md)
 provides SQLite and PostgreSQL persistence, CAS, chat history and a backup
-participant. [Live collaboration](collab.md) provides transport-independent Yrs
-rooms, durable peer updates and live canonical command interception.
-Projections, search and HTTP/MCP transport integration remain separate work.
+participant. [Structural projections](projections.md) consume canonical
+commands to provide structural snapshots, note lists, declarative note views
+and graph reads. The [search engine](search.md) subscribes independently
+to canonical changes and consumes the structural read port.
+[Live collaboration](collab.md) provides transport-independent Yrs rooms, durable peer updates and live canonical command interception.
 
 ## Internal dependency allowlist
 
@@ -61,12 +64,19 @@ locked for offline setup. `Cargo.lock` must contain none of `openssl-sys`,
 
 TLS uses rustls 0.23 with ring, reqwest 0.13 with `rustls-no-provider`, and tonic
 0.14 with `tls-ring`. Dependencies build in the pinned Rust image without adding
-C++/OpenSSL tools. Core/syntax tests exercise domain and document behavior;
+C++/OpenSSL tools. Core and syntax tests exercise domain and document behavior.
 Canonical tests exercise dual-dialect storage and CAS. Control storage tests its
 SQL schema, target import/export, authentication, Space authority and crash
-recovery. Collaboration tests exercise wire framing, CRDT policy, carrier
-round-trips and dual-dialect room recovery. The other scaffold tests are compile
-smoke checks.
+recovery. Projection tests include the trusted mmap loader and both SQL
+fixtures. The loader is the projection crate's sole narrow unsafe-code scope.
+Search tests exercise lexical analysis, CSR-HNSW, SIMD, dynamic ONNX loading,
+causal alignment and physical erasure. An offline scale gate uses 100,000 notes
+and 400,000 chunks, reporting query latency, recall, warm reopen, compaction
+and resident memory bounds. Search confines unsafe code to the mmap segment and
+SIMD modules (`mmap_segment.rs` and `simd.rs`), forbids unsafe overrides across
+its remaining modules and safe vector submodules, and gates internal test
+helpers behind `test-support` enforced by `fitness-gates`.
+Collaboration tests cover wire framing, CRDT policy, carrier round-trips and dual-dialect room recovery.
 
 `notarium-control` owns a 45-table baseline in SQLite and the PostgreSQL
 `v1_control` schema. Its typed target records support offline import and paged
