@@ -111,6 +111,10 @@ impl RoomHandle {
         self.lease.epoch
     }
 
+    pub fn lineage(&self) -> LineageEpoch {
+        self.lease.lineage
+    }
+
     pub fn slug(&self) -> String {
         self.slug.borrow().clone()
     }
@@ -268,6 +272,7 @@ impl Room {
         slug: String,
         record: CollabSessionRecord,
         prepared: PreparedRoom,
+        capacity: tokio::sync::OwnedSemaphorePermit,
     ) -> RoomHandle {
         let lease = Arc::new(RoomLease {
             scope,
@@ -312,6 +317,7 @@ impl Room {
         tokio::spawn(async move {
             // Keep the per-note slot alive for the duration of the actor. Drop
             // it with the document and presence when the actor exits.
+            let _capacity = capacity;
             let _slot = slot;
             let _stopped = StopRoom {
                 hub: room.hub.clone(),

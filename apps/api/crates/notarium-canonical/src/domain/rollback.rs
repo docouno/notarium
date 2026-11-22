@@ -521,6 +521,8 @@ async fn execute_rollback(
             continue;
         }
 
+        attempt += 1;
+
         // Step 4: If eligible notes have board moves in `input.run`, evaluate rollback board facts.
         let mut affected_views_set: BTreeSet<ViewRef> = BTreeSet::new();
         for bmh in &run_board_moves {
@@ -622,7 +624,7 @@ async fn execute_rollback(
                     {
                         return Ok(replayed.into_committed());
                     }
-                    if attempt + 1 < MAX_PLANNER_RETRIES {
+                    if attempt < MAX_PLANNER_RETRIES {
                         continue;
                     }
                     return Err(err);
@@ -693,8 +695,7 @@ async fn execute_rollback(
                         reason: ValidationReason::CursorStale,
                         ..
                     },
-            })) if attempt + 1 < MAX_PLANNER_RETRIES => {
-                attempt += 1;
+            })) if attempt < MAX_PLANNER_RETRIES => {
                 continue;
             }
             Err(err) => return Err(err),

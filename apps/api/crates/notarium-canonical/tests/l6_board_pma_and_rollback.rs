@@ -153,6 +153,7 @@ struct CanonicalTestBoardPlanner {
     tracked_notes: Mutex<BTreeSet<NoteId>>,
     forge_authority_once: AtomicBool,
     inject_stale_cutoff_once: AtomicBool,
+    stale_rollback_responses: AtomicUsize,
     evaluate_move_calls: AtomicUsize,
     move_waits: Mutex<Option<Vec<std::time::Duration>>>,
     move_pause_once: Mutex<Option<MovePlannerPause>>,
@@ -165,6 +166,7 @@ impl CanonicalTestBoardPlanner {
             tracked_notes: Mutex::new(tracked_notes.into_iter().collect()),
             forge_authority_once: AtomicBool::new(false),
             inject_stale_cutoff_once: AtomicBool::new(false),
+            stale_rollback_responses: AtomicUsize::new(0),
             evaluate_move_calls: AtomicUsize::new(0),
             move_waits: Mutex::new(None),
             move_pause_once: Mutex::new(None),
@@ -404,6 +406,15 @@ impl BoardMutationFactsProvider for CanonicalTestBoardPlanner {
         request: RollbackBoardFactsRequest,
     ) -> PortFuture<'a, RollbackBoardFacts> {
         Box::pin(async move {
+            if self
+                .stale_rollback_responses
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                    count.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(DomainError::validation(ValidationReason::CursorStale).into());
+            }
             let scope = ctx.scope().clone();
             let space_rec = self.store.read_space(&scope.space_id).await?;
             let tracked: Vec<NoteId> = self
@@ -1626,6 +1637,15 @@ async fn run_rollback_agent_run_suite(store: &CanonicalStore) {
             .await,
         Err(PortError::Domain(DomainError::ResourceNotFound))
     ));
+    planner.stale_rollback_responses.store(5, Ordering::SeqCst);
+    assert!(matches!(
+        store.rollback_agent_run(human_ctx.clone(), board_rollback.clone()).await,
+        Err(PortError::Domain(DomainError::ValidationFailed { diagnostic })) if diagnostic.reason == ValidationReason::CursorStale
+    ));
+    assert_eq!(
+        planner.stale_rollback_responses.swap(0, Ordering::SeqCst),
+        1
+    );
     let rollback_committed = store
         .rollback_agent_run(human_ctx.clone(), board_rollback.clone())
         .await

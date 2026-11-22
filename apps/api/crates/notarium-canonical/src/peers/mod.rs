@@ -704,7 +704,8 @@ pub(crate) async fn reconcile_collab_fences_on_startup(
                         let rows = sqlx::query(
                             "SELECT c.space_id, s.history_incarnation, c.note_id, c.lease_epoch, c.room_state
                              FROM collab_sessions c
-                             JOIN spaces s ON s.space_id = c.space_id",
+                             JOIN spaces s ON s.space_id = c.space_id
+                             WHERE c.room_state <> 'closed'",
                         )
                         .fetch_all(&mut **conn)
                         .await
@@ -728,7 +729,8 @@ pub(crate) async fn reconcile_collab_fences_on_startup(
                         let rows = sqlx::query(
                             "SELECT c.space_id, s.history_incarnation, c.note_id, c.lease_epoch, c.room_state
                              FROM collab_sessions c
-                             JOIN spaces s ON s.space_id = c.space_id",
+                             JOIN spaces s ON s.space_id = c.space_id
+                             WHERE c.room_state <> 'closed'",
                         )
                         .fetch_all(&mut **conn)
                         .await

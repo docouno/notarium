@@ -24,7 +24,7 @@ use notarium_core::{
     },
 };
 use tokio::{
-    sync::{Mutex as AsyncMutex, broadcast, mpsc},
+    sync::{Mutex as AsyncMutex, Semaphore, broadcast, mpsc},
     time::{Instant, timeout},
 };
 
@@ -72,7 +72,7 @@ impl CollabConfig {
     fn valid(&self) -> bool {
         let now = Instant::now();
         self.checkpoint_updates > 0
-            && self.max_active_rooms > 0
+            && (1..=Semaphore::MAX_PERMITS).contains(&self.max_active_rooms)
             && !self.idle_checkpoint.is_zero()
             && !self.periodic_checkpoint.is_zero()
             && !self.handshake_timeout.is_zero()
@@ -120,6 +120,7 @@ pub(crate) struct HubInner {
     next_id: AtomicU64,
     slots: Mutex<HashMap<RoomKey, Weak<RoomSlot>>>,
     active: Mutex<HashMap<RoomKey, RoomHandle>>,
+    room_capacity: Arc<Semaphore>,
     peers: Mutex<HashMap<u64, PeerRegistration>>,
     pending_revoke_settlement: Mutex<PendingRevokeSettlement>,
     accept_closed: Cancellation,
@@ -169,6 +170,7 @@ impl CollabHub {
         let signals = store.subscribe_space_signals();
         let inner = Arc::new(HubInner {
             store,
+            room_capacity: Arc::new(Semaphore::new(config.max_active_rooms)),
             config,
             owner,
             entropy,
@@ -270,10 +272,10 @@ impl CollabHub {
                 }
             }
         }
-        self.0.shutdown.cancel();
         if let Some(error) = first_error {
             return Err(error);
         }
+        self.0.shutdown.cancel();
         Ok(())
     }
 
@@ -892,6 +894,51 @@ impl HubInner {
                 .read_current_history_scope(Some(&budget), &ctx.scope().space_id)
                 .await?;
             ctx.check_current(&current)?;
+            if let Some(room) = held.as_ref()
+                && room.scope() == &current
+                && match hello {
+                    LineageHello::Fresh => true,
+                    LineageHello::Reconnect {
+                        client_history_incarnation,
+                        client_lineage_epoch,
+                        ..
+                    } => {
+                        *client_history_incarnation == current.incarnation
+                            && *client_lineage_epoch == room.lineage()
+                    }
+                }
+            {
+                budget.remaining = deadline.saturating_duration_since(Instant::now());
+                match self
+                    .store
+                    .read_active_room_facts(
+                        Some(&budget),
+                        &current,
+                        note,
+                        room.epoch(),
+                        room.lineage(),
+                        &self.owner,
+                    )
+                    .await
+                {
+                    Ok(facts) => {
+                        ctx.auth().authorize_read(&facts.resource)?;
+                        let role = if ctx
+                            .auth()
+                            .authorize_direct_write(&facts.resource, &facts.resource)
+                            .is_ok()
+                        {
+                            PeerRole::Editor
+                        } else {
+                            PeerRole::Viewer
+                        };
+                        return Ok(Some((room.clone(), role)));
+                    }
+                    // A lease or lineage transition needs the durable admission/recovery path.
+                    Err(PortError::Domain(_)) => {}
+                    Err(error) => return Err(error),
+                }
+            }
             let base = match hello {
                 LineageHello::Reconnect {
                     client_history_incarnation,
@@ -1008,10 +1055,10 @@ impl HubInner {
                 send_lineage_mismatch(outbound, admission, role);
                 return Ok(None);
             }
-            if self.active.lock().expect("active rooms").len() >= self.config.max_active_rooms {
+            let Ok(capacity) = self.room_capacity.clone().try_acquire_owned() else {
                 outbound.guard.close(SessionClose::ROOM_CAPACITY);
                 return Ok(None);
-            }
+            };
             let prepared = Room::prepare(&admission)?;
             outbound
                 .guard
@@ -1041,6 +1088,7 @@ impl HubInner {
                         admission.slug,
                         record,
                         prepared,
+                        capacity,
                     );
                     *held = Some(handle.clone());
                     return Ok(Some((handle, role)));
@@ -1735,6 +1783,7 @@ mod tests {
             other => panic!("expected DeadlineExceeded(collab_hub_shutdown_stop), got {other:?}"),
         }
 
+        assert!(!hub.0.shutdown.is_cancelled());
         // Once the closing room cancels `stopped`, shutdown completes cleanly.
         detached.stopped().cancel();
         let mut ok_budget = hub.0.budget();

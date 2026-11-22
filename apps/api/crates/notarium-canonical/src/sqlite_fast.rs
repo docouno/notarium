@@ -2647,6 +2647,7 @@ fn execute_single_fast_item(
             new_effective_cut: current_effective_cut,
             item_purge_seq: None,
             committed_events: Vec::new(),
+            item_changes: Default::default(),
             dir_syncs,
             retained_tickets,
             retained_guards,

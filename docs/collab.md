@@ -12,7 +12,8 @@ and `Y.Map("fm_overrides")` for frontmatter changes.
 Create a `CollabHub` for a canonical runtime inside Tokio and call `register`
 to install the live command interceptor. Keep the hub for the runtime's lifetime,
 stop transport ingress and call `hub.shutdown(&budget)` to settle and close
-active rooms cleanly before shutting down the canonical runtime. After a crash
+active rooms cleanly before shutting down the canonical runtime. If the wait
+expires, retry shutdown with a fresh budget. After a crash
 or lease takeover, room admission or maintenance replays any acknowledged tail
 left to checkpoint. At composition time, wrap the shared
 session registry with `hub.revocations(registry)` for post-commit revocation
@@ -40,7 +41,9 @@ The HTTP layer supplies the WebSocket upgrade and admission credentials.
 The inbound payload limit is 2 MiB and at most 128 concatenated messages per
 frame. The first payload contains exactly one `LineageHello`. After
 `LineageReady`, payloads can concatenate standard y-sync v1 sync and awareness
-messages. The server sends its initial `SyncStep1` after `LineageReady`. The
+messages. Joining a resident room on its current lineage checks the durable lease and
+current note permissions without reloading the Markdown or CRDT snapshot.
+The server sends its initial `SyncStep1` after `LineageReady`. The
 protocol decoder discards Viewer `SyncStep2` and `Update` messages while
 preserving other messages in the same payload, caps `SyncStep1` client counts
 and decodes only clients already known to the live document. Peer updates are
@@ -117,8 +120,10 @@ The write transaction checks the room lease and canonical write authority again.
 Closing a valid `nota` block can assign its ID as part of that same staged
 update. A checkpoint projects the committed CRDT state into Markdown,
 persists the snapshot and compacts the covered log prefix in one transaction.
+A durable peer ACK does not advance the canonical change feed. A checkpoint
+that changes the Markdown publishes the revision consumed by projections and search.
 The defaults checkpoint after 3 seconds idle, 60 seconds periodic, or 128
-updates, with up to 512 active rooms per hub (`CollabConfig` is
+updates, with up to 512 opening or active rooms per hub (`CollabConfig` is
 `#[non_exhaustive]`). An empty room unloads after 30 seconds.
 The actor budgets 2 milliseconds (`wal_coalesce`) by default to group pending
 peer updates when multiple editors are connected; a single active editor flushes

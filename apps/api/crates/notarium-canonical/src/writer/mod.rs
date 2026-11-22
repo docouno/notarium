@@ -2345,6 +2345,7 @@ async fn execute_single_item_in_savepoint(
             new_effective_cut: current_effective_cut,
             item_purge_seq: None,
             committed_events: Vec::new(),
+            item_changes: Default::default(),
             dir_syncs: item_ctx.pending_dir_syncs,
             retained_tickets: item_ctx.retained_tickets,
             retained_guards: item_ctx.retained_guards,

@@ -1,8 +1,9 @@
 //! Exercise search against the production structural reader and control-plane
 //! provider services on both storage backends.
-#[path = "../../notarium-canonical/tests/support/mod.rs"]
-mod support;
+#[path = "../../notarium-collab/tests/support/mod.rs"]
+mod collab_support;
 
+use collab_support::{StorageTestFixtures, TempDataRoot, maintenance_ctx, random_bytes_16};
 use notarium_canonical::{
     CanonicalConfig, CanonicalRuntime, CanonicalStore, CreateFolderSpec, CreateSpaceSpec,
     PgConnectConfig, S3BucketModePolicy, UpdateSpaceSchema, blobs::s3::admin_ensure_bucket,
@@ -69,7 +70,6 @@ use std::{
     },
     time::Duration,
 };
-use support::{StorageTestFixtures, TempDataRoot, maintenance_ctx, random_bytes_16};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
@@ -466,6 +466,45 @@ async fn exercise(store: CanonicalStore, root: DataRoot, projector: ProjectorRun
     assert!(depth2_ids.contains(&&graph_anchor));
     assert!(depth2_ids.contains(&&hop_one));
     assert!(depth2_ids.contains(&&hop_two));
+    // A durable peer ACK uses room sequence numbers. Only the checkpoint
+    // advances the canonical feed and makes the new text searchable.
+    let marker = "livecheckpointmarker";
+    let mut cfg = notarium_collab::CollabConfig::default();
+    cfg.idle_checkpoint = Duration::from_secs(120);
+    cfg.periodic_checkpoint = cfg.idle_checkpoint;
+    cfg.idle_unload = cfg.idle_checkpoint;
+    let hub = notarium_collab::CollabHub::new(store.as_ref().clone(), cfg).unwrap();
+    let (mut peer, _) = collab_support::synced_client(&hub, &owner, &graph_anchor, 410).await;
+    peer.send_update(&peer.append(marker)).await;
+    assert_eq!(peer.ack().await.room_update_seq, 1);
+    assert_eq!(
+        store
+            .read_space(&space.scope.space_id)
+            .await
+            .unwrap()
+            .last_seq,
+        seq
+    );
+    assert!(
+        lexical_search
+            .search(owner.clone(), query(&space.scope, seq, marker))
+            .await
+            .unwrap()
+            .hits
+            .is_empty()
+    );
+    hub.shutdown(&owner.budget).await.unwrap();
+    let checkpoint = store
+        .read_space(&space.scope.space_id)
+        .await
+        .unwrap()
+        .last_seq;
+    assert!(checkpoint > seq);
+    let indexed = lexical_search
+        .search(owner.clone(), query(&space.scope, checkpoint, marker))
+        .await
+        .unwrap();
+    assert_eq!(ids(&indexed), [&graph_anchor]);
     lexical_search.shutdown().await;
 
     // Chat search hits through live projection & canonical hydration.

@@ -395,6 +395,86 @@ async fn split_session_supports_concurrent_send_and_recv() {
 }
 
 #[tokio::test]
+async fn live_join_reuses_memory_and_cold_open_recovers_the_closed_lease() {
+    let (root, store, runtime, hub, owner) =
+        open_sqlite_env("warm-join-cold-open", CollabConfig::default()).await;
+    let text = "Existing carrier.\n";
+    let note = create_note(&store, &owner, 41, text, None).await.note;
+    let (writer, ready) = synced_client(&hub, &owner, &note, 901).await;
+    let digest = ContentDigest::from_bytes(*blake3::hash(text.as_bytes()).as_bytes());
+    let blob = root.data_root().blob(&owner.scope().space_id, digest);
+    let saved = blob.with_extension("held");
+    std::fs::rename(&blob, &saved).unwrap();
+    let (reader, _) = synced_client(&hub, &owner, &note, 902).await;
+    assert_eq!(reader.text(), text);
+    std::fs::rename(saved, blob).unwrap();
+    hub.shutdown(&budget()).await.unwrap();
+    let closed = store
+        .read_collab_session(None, owner.scope(), &note)
+        .await
+        .unwrap()
+        .unwrap()
+        .session;
+    assert!(closed.lease_epoch > ready.lease_epoch);
+    drop((reader, writer, hub, store));
+    runtime.shutdown().await.unwrap();
+
+    let (store, runtime) = CanonicalRuntime::open(CanonicalConfig::local_default(
+        InstallationId::from_bytes([77; 16]),
+        root.data_root(),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        store
+            .room_fences()
+            .get_or_init(owner.scope(), &note)
+            .lock()
+            .await
+            .epoch(),
+        LeaseEpoch::ZERO
+    );
+    let hub = CollabHub::new(store, CollabConfig::default()).unwrap();
+    let (rejoined, reopened) = synced_client(&hub, &owner, &note, 903).await;
+    assert!(reopened.lease_epoch > closed.lease_epoch);
+    assert_eq!(rejoined.text(), text);
+    hub.shutdown(&budget()).await.unwrap();
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn concurrent_hello_on_distinct_notes_respects_room_limit() {
+    let mut cfg = fast_config();
+    cfg.max_active_rooms = 1;
+    let (_root, store, runtime, hub, owner) = open_sqlite_env("concurrent-room-cap", cfg).await;
+    let mut peers = Vec::new();
+    for seed in 1..=8 {
+        let note = create_note(&store, &owner, seed, "Room.\n", None).await;
+        peers.push(open(&hub, &owner, &note.note).await);
+    }
+    for peer in &mut peers {
+        peer.send(LineageHello::Fresh.encode()).await.unwrap();
+    }
+    let mut ready = 0;
+    for peer in &mut peers {
+        match recv(peer).await {
+            SessionEvent::Binary(frame) => {
+                assert!(matches!(
+                    messages(&frame).as_slice(),
+                    [Message::Custom(wire::LINEAGE_READY, _)]
+                ));
+                ready += 1;
+            }
+            SessionEvent::Close(close) => assert_eq!(close.code, 1013),
+        }
+    }
+    assert_eq!(ready, 1);
+    assert_eq!(hub.active_room_count(), 1);
+    hub.shutdown(&budget()).await.unwrap();
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn stale_incarnation_rejected_raw_title_editable_lease_precondition_and_room_capacity() {
     let mut cfg = fast_config();
     cfg.max_active_rooms = 1;
@@ -1169,7 +1249,9 @@ async fn room_error_exit_drains_buffered_intercept_and_shutdown_reports_stop_tim
     // 2. `CollabHub::shutdown` surfaces `DeadlineExceeded(collab_hub_shutdown)`
     //    when a busy room cannot service shutdown within the shutdown budget.
     let n2 = create_note(&store, &owner, 43, "Busy.\n", None).await;
-    let (c2, _) = synced_client(&hub, &owner, &n2.note, 812).await;
+    let (mut c2, _) = synced_client(&hub, &owner, &n2.note, 812).await;
+    c2.send_update(&c2.append("Confirmed.\n")).await;
+    c2.ack().await;
     let (entered2, release2) = pause_wal_admission(&store);
     c2.send_update(&c2.append("Blocked.\n")).await;
     timeout(WAIT, entered2).await.unwrap().unwrap();
@@ -1192,6 +1274,23 @@ async fn room_error_exit_drains_buffered_intercept_and_shutdown_reports_stop_tim
         }
     }
     let _ = release2.send(());
+    hub.shutdown(&budget()).await.unwrap();
+    let settled = store
+        .read_collab_session(None, owner.scope(), &n2.note)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        settled.session.room_state,
+        notarium_canonical::CollabRoomState::Closed
+    );
+    assert!(settled.updates.is_empty());
+    assert!(
+        note_head(&store, &owner, &n2.note)
+            .await
+            .1
+            .contains("Confirmed.")
+    );
     drop((c2, hub));
     runtime.shutdown().await.unwrap();
 }

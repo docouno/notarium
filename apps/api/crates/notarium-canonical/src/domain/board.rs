@@ -1234,12 +1234,8 @@ impl CanonicalStore {
         {
             return Ok(replayed.into_committed());
         }
-        let (authority, _) = self
-            .inner
-            .board_provider
-            .get()
-            .ok_or_else(|| DomainError::validation(ValidationReason::NotReady))?;
-        verify_board_move_facts(authority, &ctx, &request.input, &facts)?;
+        let (authority, _) = self.board_facts_provider()?;
+        verify_board_move_facts(&authority, &ctx, &request.input, &facts)?;
         destination_group_rows(&facts, &request.input)?;
         let work =
             prepare_room_command(self, &mut ctx, deadline, &request.input.note, settlement).await?;

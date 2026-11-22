@@ -4,7 +4,7 @@
 mod storage;
 
 #[allow(unused_imports)]
-pub use self::storage::{StorageTestFixtures, TempDataRoot, maintenance_ctx};
+pub use self::storage::{StorageTestFixtures, TempDataRoot, maintenance_ctx, random_bytes_16};
 
 use std::{collections::BTreeMap, time::Duration};
 

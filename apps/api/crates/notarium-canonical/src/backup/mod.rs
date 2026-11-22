@@ -4088,13 +4088,13 @@ async fn load_restored_room_fences(
     let rows: Vec<(String, i64, String)> =
         match tx {
             BackendConn::Sqlite(conn) => sqlx::query_as(
-                "SELECT note_id, lease_epoch, room_state FROM collab_sessions WHERE space_id = ?",
+                "SELECT note_id, lease_epoch, room_state FROM collab_sessions WHERE space_id = ? AND room_state <> 'closed'",
             )
             .bind(scope.space_id.as_str())
             .fetch_all(&mut **conn)
             .await,
             BackendConn::Postgres(conn) => sqlx::query_as(
-                "SELECT note_id, lease_epoch, room_state FROM collab_sessions WHERE space_id = $1",
+                "SELECT note_id, lease_epoch, room_state FROM collab_sessions WHERE space_id = $1 AND room_state <> 'closed'",
             )
             .bind(scope.space_id.as_str())
             .fetch_all(&mut **conn)
