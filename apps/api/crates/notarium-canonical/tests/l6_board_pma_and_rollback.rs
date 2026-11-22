@@ -1015,7 +1015,23 @@ async fn run_move_board_card_suite(store: &CanonicalStore) -> BoardEffects {
         }
     ));
 
-    applied::check(store, &ctx, &view, view_created.value.revision, &planner).await;
+    // Poll the live-interception scenarios as their own task. Their nested
+    // PostgreSQL futures otherwise share the stack of this entire parity suite.
+    let room_store = store.clone();
+    let room_ctx = ctx.clone();
+    let room_view = view.clone();
+    tokio::spawn(async move {
+        applied::check(
+            &room_store,
+            &room_ctx,
+            &room_view,
+            view_created.value.revision,
+            &planner,
+        )
+        .await
+    })
+    .await
+    .unwrap();
 
     assert_eq!(
         store
