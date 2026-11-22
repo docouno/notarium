@@ -367,7 +367,7 @@ impl Embedder {
             match grant {
                 Ok(Ok(Some((grant, project)))) => Some(RemoteNote {
                     backend: backend.clone(),
-                    embedded_batch: false,
+                    made_batch_progress: false,
                     resolver: resolver.clone(),
                     note,
                     grant,
@@ -542,7 +542,7 @@ impl Embedder {
 }
 
 struct RemoteNote<'a> {
-    embedded_batch: bool,
+    made_batch_progress: bool,
     note: &'a SearchIndexedNote,
     backend: Arc<RemoteEmbedder>,
     resolver: Arc<dyn SearchModelResolverPort>,
@@ -577,11 +577,18 @@ impl RemoteNote<'_> {
                 .await;
             let delay = match &result {
                 Err(EmbeddingError::IndexingThrottled(delay)) => *delay,
-                // A smaller note may fit even now. Wait only for a note that
-                // has already embedded content in this attempt.
-                Err(EmbeddingError::IndexingTokenLimit(delay)) if self.embedded_batch => *delay,
-                Ok(rows) => {
-                    self.embedded_batch |= rows.rows.iter().any(Option::is_some);
+                // A smaller note may fit now. Keep this note's cursor only
+                // after a batch made progress, including a terminal skip.
+                Err(EmbeddingError::IndexingTokenLimit(delay)) if self.made_batch_progress => {
+                    *delay
+                }
+                Err(EmbeddingError::PermanentInputRejected) => {
+                    self.made_batch_progress = true;
+                    return result;
+                }
+                Ok(batch) => {
+                    self.made_batch_progress |=
+                        !batch.pending || batch.rows.iter().any(Option::is_some);
                     return result;
                 }
                 _ => return result,

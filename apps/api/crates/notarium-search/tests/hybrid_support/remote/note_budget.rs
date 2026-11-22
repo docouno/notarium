@@ -7,6 +7,8 @@ pub(super) struct NoteQuota {
     note: NoteId,
     allowed_parts: usize,
     paid: BTreeSet<ContentDigest>,
+    charged_parts: usize,
+    release_on_refusal: bool,
     refused: bool,
 }
 
@@ -20,11 +22,15 @@ impl NoteQuota {
         }
         if self.paid.len() >= self.allowed_parts {
             self.refused = true;
+            if self.release_on_refusal {
+                self.allowed_parts = usize::MAX;
+            }
             return Err(DomainError::RateLimited {
                 budget: BudgetKind::Tokens,
                 retry_after_ms: 50,
             });
         }
+        self.charged_parts += inputs.len();
         for input in inputs {
             let EmbeddingInput::Part(part) = input else {
                 unreachable!()
@@ -138,6 +144,8 @@ pub async fn atomic_note_budget(store: Arc<CanonicalStore>, root: DataRoot) {
             note: large.clone(),
             allowed_parts,
             paid: BTreeSet::new(),
+            charged_parts: 0,
+            release_on_refusal: false,
             refused: false,
         });
         let carrier = (0..parts)
@@ -275,5 +283,36 @@ pub async fn atomic_note_budget(store: Arc<CanonicalStore>, root: DataRoot) {
     .expect("a transient row must defer only its own note");
     provider.fail_transient_row.store(false, Ordering::SeqCst);
     wait_for_complete(sequence).await;
+    // A single TPM refusal separates two batches. In either order each paid
+    // input is sent once, even when the entire first batch is unembeddable.
+    for (revision, zero_prefix) in [(7, true), (8, false)] {
+        *provider.note_quota.lock().unwrap() = Some(NoteQuota {
+            note: large.clone(),
+            allowed_parts: 16,
+            paid: BTreeSet::new(),
+            charged_parts: 0,
+            release_on_refusal: true,
+            refused: false,
+        });
+        let carrier = (0..17)
+            .map(|i| {
+                let marker = if (i < 16) == zero_prefix {
+                    "atomiczerorow"
+                } else {
+                    "atomiclastpiece"
+                };
+                format!("# Section {i}\n\nQuota {revision} {i} {marker}.\n\n")
+            })
+            .collect();
+        let (_, sequence) = commit_revision(revision, carrier).await;
+        wait_for_complete(sequence).await;
+        let quota = provider.note_quota.lock().unwrap().take().unwrap();
+        assert!(quota.refused);
+        assert_eq!(quota.paid.len(), 17);
+        assert_eq!(
+            quota.charged_parts, 17,
+            "paid parts before TPM were replayed"
+        );
+    }
     engine.shutdown().await;
 }

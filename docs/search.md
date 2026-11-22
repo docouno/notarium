@@ -217,8 +217,9 @@ deadline. When a request or concurrency quota is exhausted, the affected
 Space pauses background indexing for that target. The current batch can retry
 once after the reported delay, with fresh admission, while the scheduler
 remains available to queries and other Spaces. This bounded retry also applies
-when the provider has already accepted part of a note and its next batch hits
-the token quota. An initial token refusal defers that note immediately.
+after the provider processes a batch and the next one hits the token quota.
+A batch of terminally unembeddable inputs also advances the note's cursor.
+An initial token refusal defers that note immediately.
 Repeated refusals or waits longer than a minute release the private batch.
 Each page can finish while unrelated edits arrive. If a note changes during
 its embedding call, the worker discards that result and retries the new text.
