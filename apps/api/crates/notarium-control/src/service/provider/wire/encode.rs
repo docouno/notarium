@@ -3,6 +3,7 @@ use notarium_core::{
     classes::{DocClass, ProviderOrigin},
     document::estimate_token_twelfths,
     error::ValidationReason,
+    ids::FolderId,
     model::FolderRef,
     ports::{control::CompletionRequest, *},
 };
@@ -94,7 +95,13 @@ pub(in crate::service::provider) fn embedding_fingerprint(
     #[serde(untagged)]
     enum Input<'a> {
         Part(ProviderOrigin, &'a str, u32),
-        Query(&'a str, u32, &'a BTreeSet<DocClass>, &'a Option<FolderRef>),
+        Query(
+            &'a str,
+            u32,
+            &'a BTreeSet<DocClass>,
+            &'a Option<FolderRef>,
+            &'a Option<FolderId>,
+        ),
     }
     let content: Vec<_> = request
         .inputs
@@ -110,17 +117,22 @@ pub(in crate::service::provider) fn embedding_fingerprint(
                 query.tokens,
                 &query.classes,
                 &query.project_scope,
+                &query.folder,
             ),
         })
         .collect();
-    fingerprint((
+    let payload = (
         "embedding-v1",
         &request.provider,
         &request.model,
         &request.project,
         request.declared_tokens,
         content,
-    ))
+    );
+    match &request.selection {
+        EmbeddingSelection::Explicit => fingerprint(payload),
+        selection => fingerprint((payload, selection, request.runtime_epochs())),
+    }
 }
 
 pub(in crate::service::provider) fn endpoint(

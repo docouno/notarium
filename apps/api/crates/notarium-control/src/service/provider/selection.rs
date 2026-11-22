@@ -121,8 +121,12 @@ async fn resolve_search_candidate(
     if owner_active != 1 {
         return Ok(None);
     }
-    let Ok(credential) = credential_for_selection(tx, &resource).await else {
-        return Ok(None);
+    let credential = match credential_for_selection(tx, &resource).await {
+        Ok(credential) => credential,
+        Err(PortError::Domain(DomainError::AccessDenied | DomainError::ResourceNotFound)) => {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
     };
     let credential_epoch = credential.as_ref().map(|row| row.consent_epoch);
     let Some(model_row) = rows!(
@@ -157,7 +161,7 @@ async fn resolve_search_candidate(
         )?
         .filter(|row| active(row, &resource, credential_epoch, now))
     } else {
-        shared_attachment(
+        match shared_attachment(
             tx,
             &resource,
             credential_epoch,
@@ -167,7 +171,13 @@ async fn resolve_search_candidate(
             false,
         )
         .await
-        .ok()
+        {
+            Ok(attachment) => Some(attachment),
+            Err(PortError::Domain(DomainError::Provider {
+                error: ProviderErrorCode::Unavailable,
+            })) => None,
+            Err(error) => return Err(error),
+        }
     };
     let Some(attachment) = attachment else {
         return Ok(None);
@@ -193,6 +203,108 @@ async fn resolve_search_candidate(
         project,
     }))
 }
+pub(super) async fn search_default(
+    tx: &mut Transaction,
+    space: &Space,
+    personal_owner: Option<&str>,
+    now: i64,
+) -> Result<Option<ResolvedSearchEmbeddingModel>, PortError> {
+    // Step 1: Space-level preference, or Personal Space owner preference fallback.
+    let space_prefs = rows!(
+        tx,
+        ProviderPreferencesRow,
+        fetch_all,
+        "SELECT * FROM provider_preferences WHERE scope_kind='space' AND scope_id=$1 AND model_kind='embedding' ORDER BY owner_id LIMIT 2",
+        "SELECT * FROM v1_control.provider_preferences WHERE scope_kind='space' AND scope_id=$1 AND model_kind='embedding' ORDER BY owner_id LIMIT 2";
+        space.id.as_str()
+    )?;
+    if space_prefs.len() > 1 {
+        return Ok(None);
+    }
+    if let Some(pref) = space_prefs.into_iter().next() {
+        return resolve_search_candidate(
+            tx,
+            space,
+            personal_owner,
+            &pref.resource_id,
+            &pref.model_id,
+            None,
+            now,
+        )
+        .await;
+    }
+    if let Some(owner) = personal_owner
+        && let Some(pref) = rows!(
+            tx,
+            ProviderPreferencesRow,
+            fetch_optional,
+            "SELECT * FROM provider_preferences WHERE owner_id=$1 AND scope_kind='personal' AND scope_id=$1 AND model_kind='embedding'",
+            "SELECT * FROM v1_control.provider_preferences WHERE owner_id=$1 AND scope_kind='personal' AND scope_id=$1 AND model_kind='embedding'";
+            owner
+        )?
+    {
+        return resolve_search_candidate(
+            tx,
+            space,
+            Some(owner),
+            &pref.resource_id,
+            &pref.model_id,
+            None,
+            now,
+        )
+        .await;
+    }
+
+    // Step 2: Unique active project preference within this Space.
+    let prefix = format!("{}:", space.id);
+    let prefix_len =
+        i32::try_from(prefix.len()).map_err(|_| invalid(ValidationReason::InvalidState))?;
+    let suffix_start = prefix_len + 1;
+    let is_shared = if space.kind == SpaceKind::Shared {
+        1_i64
+    } else {
+        0_i64
+    };
+    let project_prefs = rows!(
+        tx,
+        ProviderPreferencesRow,
+        fetch_all,
+        "SELECT p.* FROM provider_preferences p JOIN provider_resources r ON r.id=p.resource_id JOIN users u ON u.user_id=r.owner_id LEFT JOIN credentials c ON c.id=r.credential_id JOIN provider_models m ON m.resource_id=r.id AND m.model_id=p.model_id WHERE p.scope_kind='project' AND substr(p.scope_id, 1, $1)=$2 AND p.model_kind='embedding' AND m.kind='embedding' AND m.dimension IS NOT NULL AND r.disabled_at IS NULL AND u.disabled_at IS NULL AND (r.credential_id IS NULL OR (c.kind='provider-header-v1' AND c.owner_id=r.owner_id AND c.disabled_at IS NULL)) AND EXISTS (SELECT 1 FROM provider_attachments a WHERE a.resource_id=r.id AND a.target_space=$3 AND a.state='approved' AND a.resource_epoch=r.consent_epoch AND ((r.credential_id IS NULL AND a.credential_epoch IS NULL) OR a.credential_epoch=c.consent_epoch) AND (a.expires_at IS NULL OR a.expires_at>$4) AND (($5=0 AND a.target_kind='personal' AND a.target_owner=$6) OR ($5=1 AND (a.target_kind='space' OR (a.target_kind='project' AND a.target_project=substr(p.scope_id, $7)))))) ORDER BY p.scope_id, p.owner_id LIMIT 2",
+        "SELECT p.* FROM v1_control.provider_preferences p JOIN v1_control.provider_resources r ON r.id=p.resource_id JOIN v1_control.users u ON u.user_id=r.owner_id LEFT JOIN v1_control.credentials c ON c.id=r.credential_id JOIN v1_control.provider_models m ON m.resource_id=r.id AND m.model_id=p.model_id WHERE p.scope_kind='project' AND substr(p.scope_id, 1, $1)=$2 AND p.model_kind='embedding' AND m.kind='embedding' AND m.dimension IS NOT NULL AND r.disabled_at IS NULL AND u.disabled_at IS NULL AND (r.credential_id IS NULL OR (c.kind='provider-header-v1' AND c.owner_id=r.owner_id AND c.disabled_at IS NULL)) AND EXISTS (SELECT 1 FROM v1_control.provider_attachments a WHERE a.resource_id=r.id AND a.target_space=$3 AND a.state='approved' AND a.resource_epoch=r.consent_epoch AND ((r.credential_id IS NULL AND a.credential_epoch IS NULL) OR a.credential_epoch=c.consent_epoch) AND (a.expires_at IS NULL OR a.expires_at>$4) AND (($5=0 AND a.target_kind='personal' AND a.target_owner=$6) OR ($5=1 AND (a.target_kind='space' OR (a.target_kind='project' AND a.target_project=substr(p.scope_id, $7)))))) ORDER BY p.scope_id, p.owner_id LIMIT 2";
+        prefix_len,
+        &prefix,
+        space.id.as_str(),
+        now,
+        is_shared,
+        personal_owner,
+        suffix_start
+    )?;
+    if project_prefs.len() != 1 {
+        return Ok(None);
+    }
+    let pref = project_prefs
+        .into_iter()
+        .next()
+        .expect("checked single project preference");
+    let Some(folder_raw) = pref.scope_id.strip_prefix(&prefix) else {
+        return Ok(None);
+    };
+    let project = FolderRef {
+        space_id: space.id.clone(),
+        folder_id: FolderId::parse(folder_raw)?,
+    };
+    resolve_search_candidate(
+        tx,
+        space,
+        personal_owner,
+        &pref.resource_id,
+        &pref.model_id,
+        Some(project),
+        now,
+    )
+    .await
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn policy(
     tx: &mut Transaction,
@@ -309,7 +421,8 @@ async fn shared_attachment(
 }
 impl ProviderService {
     /// Admit the revision author in a Shared Space or the owner of a Personal
-    /// Space. Dispatch rechecks membership and disclosure before sending.
+    /// Space. An ineligible author or unavailable disclosure returns no grant
+    /// for this note. Storage and budget failures propagate to the caller.
     pub async fn admit_search_indexing(
         &self,
         authority: &ServiceAuthority,
@@ -318,8 +431,34 @@ impl ProviderService {
         provider: &ProviderResourceId,
         project: Option<&FolderRef>,
         call: CallBudget,
-    ) -> Result<(SpaceContext, ProviderPolicy), PortError> {
+    ) -> Result<Option<(SpaceContext, ProviderPolicy)>, PortError> {
         authority.require(ServicePurpose::Search)?;
+        match self
+            .search_indexing_policy(authority, scope, revision_actor, provider, project, call)
+            .await
+        {
+            Ok(grant) => Ok(Some(grant)),
+            Err(PortError::Domain(
+                DomainError::AccessDenied
+                | DomainError::AuthenticationFailed
+                | DomainError::ResourceNotFound
+                | DomainError::Provider {
+                    error: ProviderErrorCode::Unavailable,
+                },
+            )) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn search_indexing_policy(
+        &self,
+        authority: &ServiceAuthority,
+        scope: HistoryScope,
+        revision_actor: &PrincipalId,
+        provider: &ProviderResourceId,
+        project: Option<&FolderRef>,
+        call: CallBudget,
+    ) -> Result<(SpaceContext, ProviderPolicy), PortError> {
         let budget = OperationBudget::new(call.clone());
         let space = budget
             .run(
@@ -518,100 +657,7 @@ impl ProviderService {
                         .await;
                     }
 
-                    // Step 1: Space-level preference, or Personal Space owner preference fallback.
-                    let space_prefs = rows!(
-                        tx.inner_mut(),
-                        ProviderPreferencesRow,
-                        fetch_all,
-                        "SELECT * FROM provider_preferences WHERE scope_kind='space' AND scope_id=$1 AND model_kind='embedding' ORDER BY owner_id LIMIT 2",
-                        "SELECT * FROM v1_control.provider_preferences WHERE scope_kind='space' AND scope_id=$1 AND model_kind='embedding' ORDER BY owner_id LIMIT 2";
-                        space.space.id.as_str()
-                    )?;
-                    if space_prefs.len() > 1 {
-                        return Ok(None);
-                    }
-                    if let Some(pref) = space_prefs.into_iter().next() {
-                        return resolve_search_candidate(
-                            tx.inner_mut(),
-                            &space.space,
-                            personal_owner.as_deref(),
-                            &pref.resource_id,
-                            &pref.model_id,
-                            None,
-                            now,
-                        )
-                        .await;
-                    }
-                    if let Some(owner) = personal_owner.as_deref()
-                        && let Some(pref) = rows!(
-                            tx.inner_mut(),
-                            ProviderPreferencesRow,
-                            fetch_optional,
-                            "SELECT * FROM provider_preferences WHERE owner_id=$1 AND scope_kind='personal' AND scope_id=$1 AND model_kind='embedding'",
-                            "SELECT * FROM v1_control.provider_preferences WHERE owner_id=$1 AND scope_kind='personal' AND scope_id=$1 AND model_kind='embedding'";
-                            owner
-                        )?
-                    {
-                        return resolve_search_candidate(
-                            tx.inner_mut(),
-                            &space.space,
-                            Some(owner),
-                            &pref.resource_id,
-                            &pref.model_id,
-                            None,
-                            now,
-                        )
-                        .await;
-                    }
-
-                    // Step 2: Unique active project preference within this Space.
-                    let prefix = format!("{}:", space.space.id);
-                    let prefix_len = i32::try_from(prefix.len())
-                        .map_err(|_| invalid(ValidationReason::InvalidState))?;
-                    let suffix_start = prefix_len + 1;
-                    let is_shared = if space.space.kind == SpaceKind::Shared {
-                        1_i64
-                    } else {
-                        0_i64
-                    };
-                    let project_prefs = rows!(
-                        tx.inner_mut(),
-                        ProviderPreferencesRow,
-                        fetch_all,
-                        "SELECT p.* FROM provider_preferences p JOIN provider_resources r ON r.id=p.resource_id JOIN users u ON u.user_id=r.owner_id LEFT JOIN credentials c ON c.id=r.credential_id JOIN provider_models m ON m.resource_id=r.id AND m.model_id=p.model_id WHERE p.scope_kind='project' AND substr(p.scope_id, 1, $1)=$2 AND p.model_kind='embedding' AND m.kind='embedding' AND m.dimension IS NOT NULL AND r.disabled_at IS NULL AND u.disabled_at IS NULL AND (r.credential_id IS NULL OR (c.kind='provider-header-v1' AND c.owner_id=r.owner_id AND c.disabled_at IS NULL)) AND EXISTS (SELECT 1 FROM provider_attachments a WHERE a.resource_id=r.id AND a.target_space=$3 AND a.state='approved' AND a.resource_epoch=r.consent_epoch AND ((r.credential_id IS NULL AND a.credential_epoch IS NULL) OR a.credential_epoch=c.consent_epoch) AND (a.expires_at IS NULL OR a.expires_at>$4) AND (($5=0 AND a.target_kind='personal' AND a.target_owner=$6) OR ($5=1 AND (a.target_kind='space' OR (a.target_kind='project' AND a.target_project=substr(p.scope_id, $7)))))) ORDER BY p.scope_id, p.owner_id LIMIT 2",
-                        "SELECT p.* FROM v1_control.provider_preferences p JOIN v1_control.provider_resources r ON r.id=p.resource_id JOIN v1_control.users u ON u.user_id=r.owner_id LEFT JOIN v1_control.credentials c ON c.id=r.credential_id JOIN v1_control.provider_models m ON m.resource_id=r.id AND m.model_id=p.model_id WHERE p.scope_kind='project' AND substr(p.scope_id, 1, $1)=$2 AND p.model_kind='embedding' AND m.kind='embedding' AND m.dimension IS NOT NULL AND r.disabled_at IS NULL AND u.disabled_at IS NULL AND (r.credential_id IS NULL OR (c.kind='provider-header-v1' AND c.owner_id=r.owner_id AND c.disabled_at IS NULL)) AND EXISTS (SELECT 1 FROM v1_control.provider_attachments a WHERE a.resource_id=r.id AND a.target_space=$3 AND a.state='approved' AND a.resource_epoch=r.consent_epoch AND ((r.credential_id IS NULL AND a.credential_epoch IS NULL) OR a.credential_epoch=c.consent_epoch) AND (a.expires_at IS NULL OR a.expires_at>$4) AND (($5=0 AND a.target_kind='personal' AND a.target_owner=$6) OR ($5=1 AND (a.target_kind='space' OR (a.target_kind='project' AND a.target_project=substr(p.scope_id, $7)))))) ORDER BY p.scope_id, p.owner_id LIMIT 2";
-                        prefix_len,
-                        &prefix,
-                        space.space.id.as_str(),
-                        now,
-                        is_shared,
-                        personal_owner.as_deref(),
-                        suffix_start
-                    )?;
-                    if project_prefs.len() != 1 {
-                        return Ok(None);
-                    }
-                    let pref = project_prefs
-                        .into_iter()
-                        .next()
-                        .expect("checked single project preference");
-                    let Some(folder_raw) = pref.scope_id.strip_prefix(&prefix) else {
-                        return Ok(None);
-                    };
-                    let project = FolderRef {
-                        space_id: space.space.id.clone(),
-                        folder_id: FolderId::parse(folder_raw)?,
-                    };
-                    resolve_search_candidate(
-                        tx.inner_mut(),
-                        &space.space,
-                        personal_owner.as_deref(),
-                        &pref.resource_id,
-                        &pref.model_id,
-                        Some(project),
-                        now,
-                    )
-                    .await
+                    search_default(tx.inner_mut(), &space.space, personal_owner.as_deref(), now).await
                 },
                 CommitEffect::NotCommitted,
             )
@@ -778,6 +824,20 @@ impl ProviderService {
                 let project=match &input.scope{ProviderPreferenceScope::Project(project)=>Some(project),_=>None};
                 shared_attachment(tx,&resource,credential_epoch,&catalog.space.id,project,now,true).await?;
             } else {super::inventory::resource_visible(tx,&owner.user_id,&resource).await?;}
+            let selection_space = match (&input.kind, &catalog, &owner.personal_space_id) {
+                (PreferenceModelKind::Embedding, Some(catalog), _) => Some(catalog.space.clone()),
+                (PreferenceModelKind::Embedding, None, Some(space)) => Some(Space {
+                    id: SpaceId::parse(space)?, kind: SpaceKind::Personal, lifecycle: SpaceLifecycle::Active,
+                }),
+                _ => None,
+            };
+            let personal_owner = selection_space.as_ref()
+                .filter(|space| space.kind == SpaceKind::Personal)
+                .map(|_| owner.user_id.as_str());
+            let previous = match &selection_space {
+                Some(space) => search_default(tx, space, personal_owner, now).await?,
+                None => None,
+            };
             let (kind,id)=preference_scope(&input.scope,auth.principal());
             let wanted_kind = model_kind_name(input.kind);
             // Space/project preferences belong to that scope and model_kind. The
@@ -785,7 +845,16 @@ impl ProviderService {
             if kind=="personal" {execute!(tx,"DELETE FROM provider_preferences WHERE owner_id=$1 AND scope_kind=$2 AND scope_id=$3 AND model_kind=$4","DELETE FROM v1_control.provider_preferences WHERE owner_id=$1 AND scope_kind=$2 AND scope_id=$3 AND model_kind=$4";&owner.user_id,kind,&id,wanted_kind)?;}
             else {execute!(tx,"DELETE FROM provider_preferences WHERE scope_kind=$1 AND scope_id=$2 AND model_kind=$3","DELETE FROM v1_control.provider_preferences WHERE scope_kind=$1 AND scope_id=$2 AND model_kind=$3";kind,&id,wanted_kind)?;}
             let row=TargetRecord::from(ProviderPreferencesRow{owner_id:owner.user_id.clone(),scope_kind:kind.into(),scope_id:id,model_kind:wanted_kind.into(),resource_id:resource.id,model_id:input.model.to_string(),revision:super::super::authority::next(owner.revision)?});row.validate()?;row.insert(tx).await?;
-            Ok((input,vec![]))
+            let mut selectors = Vec::new();
+            if let (Some(previous), Some(space)) = (previous, selection_space) {
+                let current = search_default(tx, &space, personal_owner, now).await?;
+                if current.as_ref().is_none_or(|current|
+                    current.provider != previous.provider || current.project != previous.project
+                ) {
+                    selectors.push(RevocationSelector::SearchEmbeddingDefault(space.id));
+                }
+            }
+            Ok((input,selectors))
         })).await
     }
 }

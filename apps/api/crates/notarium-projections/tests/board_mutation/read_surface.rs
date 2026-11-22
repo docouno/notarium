@@ -241,10 +241,20 @@ pub(super) async fn exercise(store: &CanonicalStore, runtime: &ProjectorRuntime)
         },
     );
     trash.preconditions.revision = Some(gamma.revision);
+    // Poll through the first visibility batch, then commit while the reader
+    // has yielded its permit for the tail. Every flag must reflect one head.
+    let repeated = vec![gamma.note.clone(); 33];
+    let mut visibility = engine.filter_live_visible(&owner, &repeated);
+    tokio::select! {
+        biased;
+        result = &mut visibility => panic!("visibility check did not yield between batches: {result:?}"),
+        () = std::future::ready(()) => {}
+    }
     let trashed = store
         .delete_note(owner.clone(), trash)
         .await
         .expect("trash the final note");
+    assert_eq!(visibility.await.unwrap(), vec![false; repeated.len()]);
     let mut waiting = owner.clone();
     waiting.budget.remaining = Duration::from_millis(120);
     let watermark = AwaitWatermarks::from_receipts([trashed.receipt]);

@@ -107,6 +107,7 @@ pub struct View {
     projects: BTreeSet<FolderId>,
     edges: BTreeMap<u32, Vec<u32>>,
     fields: BTreeMap<NoteId, BTreeMap<String, FieldObservation<FieldValue>>>,
+    pub blocked_lookup: Option<(NoteId, Arc<AtomicBool>)>,
 }
 
 impl View {
@@ -123,6 +124,7 @@ impl View {
             projects: BTreeSet::new(),
             edges: BTreeMap::new(),
             fields: BTreeMap::new(),
+            blocked_lookup: None,
         }
     }
 
@@ -166,11 +168,26 @@ impl StructuralSnapshot for View {
     }
 
     fn lookup(&self, note: &NoteId) -> DomainResult<Option<DenseNodeId>> {
+        if let Some((blocked, observed)) = &self.blocked_lookup
+            && blocked == note
+        {
+            observed.store(true, Ordering::SeqCst);
+            return Err(DomainError::validation(ValidationReason::NotReady));
+        }
         Ok(self
             .rows
             .iter()
             .position(|(id, _)| id == note)
             .map(|offset| DenseNodeId::new(self.cut.generation, offset as u32)))
+    }
+
+    fn wait_ready(&self) -> PortFuture<'_, ()> {
+        Box::pin(async {
+            if self.blocked_lookup.is_some() {
+                std::future::pending::<()>().await;
+            }
+            Ok(())
+        })
     }
 
     fn note_id(&self, node: DenseNodeId) -> DomainResult<NoteId> {
@@ -372,6 +389,7 @@ pub struct ControlledCarriers {
     pub seed_rejected: Notify,
     pub release_seed: Notify,
     pub hold_chat: AtomicBool,
+    pub hold_hydrated_chat: AtomicBool,
     pub chat_held: Notify,
     pub release_chat: Notify,
     pub hold_note_reads: AtomicBool,
@@ -392,6 +410,7 @@ impl ControlledCarriers {
             seed_rejected: Notify::new(),
             release_seed: Notify::new(),
             hold_chat: AtomicBool::new(false),
+            hold_hydrated_chat: AtomicBool::new(false),
             chat_held: Notify::new(),
             release_chat: Notify::new(),
             hold_note_reads: AtomicBool::new(false),
@@ -578,9 +597,15 @@ impl SearchCarrierReadPort for ControlledCarriers {
                 self.chat_held.notify_one();
                 self.release_chat.notified().await;
             }
-            self.canonical
+            let hits = self
+                .canonical
                 .hydrate_live_visible_chat_hits(ctx, candidates, limit)
-                .await
+                .await?;
+            if self.hold_hydrated_chat.swap(false, Ordering::SeqCst) {
+                self.chat_held.notify_one();
+                self.release_chat.notified().await;
+            }
+            Ok(hits)
         })
     }
 }

@@ -18,12 +18,12 @@ mod tombstone;
 mod wal;
 
 pub use builder::{MAX_SEGMENT_BUILD_BYTES, SegmentBuilder};
-#[cfg(any(test, feature = "test-support"))]
-pub use epoch::VectorResults;
 pub use epoch::{
-    CompactionPlan, FlushL0Plan, VectorEpoch, VectorFilter, VectorHit, VectorSnapshot,
+    CompactionPlan, FlushL0Plan, ProjectedVectorFilter, VectorEpoch, VectorHit, VectorSnapshot,
     segment_file_path,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub use epoch::{VectorFilter, VectorResults};
 #[cfg(any(test, feature = "test-support"))]
 pub use hnsw::Neighbor;
 pub use mmap_segment::MmapSegment;
@@ -53,6 +53,11 @@ pub(super) const GLOBAL_EVAL_BUDGET: usize = 48_000;
 const M: usize = 16;
 const M0: usize = 32;
 const MAX_LEVEL: u8 = 16;
+
+pub const fn search_candidate_limit(top_k: usize) -> usize {
+    let oversampled = top_k.saturating_mul(4);
+    if oversampled < 100 { 100 } else { oversampled }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum VectorError {

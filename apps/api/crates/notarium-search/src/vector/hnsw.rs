@@ -9,7 +9,7 @@ use notarium_core::{
 };
 use std::{
     cmp::{Ordering, Reverse},
-    collections::{BinaryHeap, HashMap, HashSet},
+    collections::{BTreeSet, BinaryHeap, HashMap, HashSet},
 };
 
 const EF_CONSTRUCTION: usize = 128;
@@ -48,6 +48,7 @@ impl Ord for Neighbor {
     }
 }
 
+#[derive(Clone, Copy)]
 pub(super) struct ExactNeighbor<'a> {
     pub hit: Neighbor,
     pub note: &'a [u8],
@@ -75,6 +76,62 @@ impl Ord for ExactNeighbor<'_> {
                 (other.note, other.span, other.key).cmp(&(self.note, self.span, self.key))
             })
             .then_with(|| other.hit.slot.cmp(&self.hit.slot))
+    }
+}
+
+/// Keep the best chunk per distinct note for ranking and the highest-scoring
+/// chunks overall for recall. Their union contains at most twice the limit.
+pub(super) struct RankedChunks<'a> {
+    limit: usize,
+    chunks: BinaryHeap<Reverse<ExactNeighbor<'a>>>,
+    notes: BTreeSet<ExactNeighbor<'a>>,
+    representatives: HashMap<&'a [u8], ExactNeighbor<'a>>,
+    floor: f32,
+}
+
+impl<'a> RankedChunks<'a> {
+    pub fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            chunks: BinaryHeap::with_capacity(limit),
+            notes: BTreeSet::new(),
+            representatives: HashMap::with_capacity(limit),
+            floor: f32::NEG_INFINITY,
+        }
+    }
+
+    pub fn admits_score(&self, score: f32) -> bool {
+        score >= self.floor
+    }
+
+    pub fn insert(&mut self, candidate: ExactNeighbor<'a>) {
+        keep_best(&mut self.chunks, candidate, self.limit);
+        if let Some(previous) = self.representatives.get(candidate.note) {
+            if candidate <= *previous {
+                return;
+            }
+            self.notes.remove(previous);
+        } else if self.notes.len() == self.limit {
+            if self.notes.first().is_some_and(|worst| candidate <= *worst) {
+                return;
+            }
+            let worst = self.notes.pop_first().expect("full note ranking");
+            self.representatives.remove(worst.note);
+        }
+        self.representatives.insert(candidate.note, candidate);
+        self.notes.insert(candidate);
+        if self.notes.len() == self.limit {
+            self.floor = self.notes.first().expect("full note ranking").hit.score;
+        }
+    }
+
+    pub fn finish(mut self) -> Vec<Neighbor> {
+        self.notes.extend(self.chunks.drain().map(|entry| entry.0));
+        self.notes
+            .into_iter()
+            .rev()
+            .map(|candidate| candidate.hit)
+            .collect()
     }
 }
 
@@ -173,7 +230,7 @@ pub(super) fn explore(
     scorer: Similarity<'_>,
     entries: impl IntoIterator<Item = Neighbor>,
     config: Exploration<'_>,
-    mut eligible: impl FnMut(u32) -> Result<bool, VectorError>,
+    mut eligible: impl FnMut(Neighbor) -> Result<bool, VectorError>,
     mut visit: impl FnMut(u32) -> bool,
 ) -> Result<Explored, VectorError> {
     let mut wave = BinaryHeap::new();
@@ -183,7 +240,7 @@ pub(super) fn explore(
         if visit(entry.slot) {
             evaluations += 1;
             wave.push(entry);
-            if eligible(entry.slot)? {
+            if eligible(entry)? {
                 keep_best(&mut best, entry, config.result_capacity);
             }
         }
@@ -210,7 +267,7 @@ pub(super) fn explore(
                 || best.peek().is_some_and(|worst| next > worst.0)
             {
                 wave.push(next);
-                if eligible(slot)? {
+                if eligible(next)? {
                     keep_best(&mut best, next, config.result_capacity);
                 }
             }
@@ -247,7 +304,7 @@ pub(super) fn query_graph(
     top_k: usize,
     active_segments: usize,
     budget: SearchBudget<'_>,
-    eligible: impl FnMut(u32) -> Result<bool, VectorError>,
+    eligible: impl FnMut(Neighbor) -> Result<bool, VectorError>,
 ) -> Result<Explored, VectorError> {
     let active = active_segments.max(1);
     let width = if active <= 2 {

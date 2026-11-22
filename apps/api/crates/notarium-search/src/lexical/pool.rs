@@ -3,7 +3,7 @@ use notarium_core::ports::Cancellation;
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, Weak},
+    sync::{Arc, Condvar, Mutex, Weak},
     time::{Duration, Instant},
 };
 use tantivy::{
@@ -327,17 +327,97 @@ struct ReaderEntry {
 }
 
 #[derive(Default)]
+struct ReaderSlots {
+    entries: HashMap<PathBuf, ReaderEntry>,
+    opening: HashSet<PathBuf>,
+    reserved: usize,
+}
+
+#[derive(Default)]
 pub struct ReaderCache {
-    indexes: Mutex<HashMap<PathBuf, ReaderEntry>>,
+    slots: Mutex<ReaderSlots>,
+    changed: Condvar,
+}
+
+struct ReaderAdmission<'a> {
+    cache: &'a ReaderCache,
+    path: &'a Path,
+    reserved: bool,
+}
+
+impl Drop for ReaderAdmission<'_> {
+    fn drop(&mut self) {
+        let mut slots = self.cache.slots.lock().unwrap_or_else(|e| e.into_inner());
+        slots.opening.remove(self.path);
+        if self.reserved {
+            slots.reserved -= 1;
+        }
+        self.cache.changed.notify_all();
+    }
+}
+
+impl ReaderAdmission<'_> {
+    fn reserve(&mut self) -> Result<(), LexicalError> {
+        let mut tried = HashSet::new();
+        loop {
+            let mut slots = self
+                .cache
+                .slots
+                .lock()
+                .map_err(|_| LexicalError::ReaderUnavailable)?;
+            if slots.entries.len() + slots.reserved < MAX_READERS {
+                slots.reserved += 1;
+                self.reserved = true;
+                return Ok(());
+            }
+            let oldest = slots
+                .entries
+                .iter()
+                .filter(|(_, entry)| Arc::strong_count(&entry.index) == 1)
+                .min_by_key(|(_, entry)| entry.last_use)
+                .map(|(path, _)| path.clone());
+            if let Some(oldest) = oldest {
+                let evicted = slots.entries.remove(&oldest);
+                slots.reserved += 1;
+                self.reserved = true;
+                drop(slots);
+                drop(evicted);
+                return Ok(());
+            }
+            let candidates: Vec<_> = slots
+                .entries
+                .iter()
+                .filter(|(path, _)| !tried.contains(*path))
+                .filter_map(|(path, entry)| {
+                    Some((
+                        path.clone(),
+                        entry.last_use,
+                        entry.owner.as_ref()?.upgrade()?,
+                    ))
+                })
+                .collect();
+            drop(slots);
+            let (_, path, owner) = candidates
+                .into_iter()
+                .filter_map(|(path, last_use, owner)| {
+                    let activity = owner.idle_last_activity(&path)?;
+                    Some((last_use.max(activity), path, owner))
+                })
+                .min_by_key(|(last_use, _, _)| *last_use)
+                .ok_or(LexicalError::ReaderUnavailable)?;
+            owner.evict_if_idle(&path);
+            tried.insert(path);
+        }
+    }
 }
 
 impl ReaderCache {
     pub fn open(&self, path: &Path) -> Result<Arc<LexicalIndex>, LexicalError> {
-        self.acquire(path, None, LexicalIndex::open)
+        self.open_or_create(path, None, false)
     }
 
     pub fn create(&self, path: &Path) -> Result<Arc<LexicalIndex>, LexicalError> {
-        self.acquire(path, None, LexicalIndex::create)
+        self.open_or_create(path, None, true)
     }
 
     pub(crate) fn open_owned(
@@ -345,7 +425,7 @@ impl ReaderCache {
         path: &Path,
         owner: Weak<dyn IdleReaderOwner>,
     ) -> Result<Arc<LexicalIndex>, LexicalError> {
-        self.acquire(path, Some(owner), LexicalIndex::open)
+        self.open_or_create(path, Some(owner), false)
     }
 
     pub(crate) fn create_owned(
@@ -353,184 +433,128 @@ impl ReaderCache {
         path: &Path,
         owner: Weak<dyn IdleReaderOwner>,
     ) -> Result<Arc<LexicalIndex>, LexicalError> {
-        self.acquire(path, Some(owner), LexicalIndex::create)
+        self.open_or_create(path, Some(owner), true)
     }
 
-    /// Return a currently cached reader without opening from disk, refreshing
-    /// its recency and owner registration under the cache mutex.
     pub(crate) fn get_owned(
         &self,
         path: &Path,
         owner: Weak<dyn IdleReaderOwner>,
     ) -> Result<Option<Arc<LexicalIndex>>, LexicalError> {
-        let mut indexes = self
-            .indexes
+        let mut slots = self
+            .slots
             .lock()
             .map_err(|_| LexicalError::ReaderUnavailable)?;
-        let Some(entry) = indexes.get_mut(path) else {
-            return Ok(None);
-        };
+        Ok(Self::cached(&mut slots, path, Some(owner)))
+    }
+
+    fn cached(
+        slots: &mut ReaderSlots,
+        path: &Path,
+        owner: Option<Weak<dyn IdleReaderOwner>>,
+    ) -> Option<Arc<LexicalIndex>> {
+        let entry = slots.entries.get_mut(path)?;
         entry.last_use = Instant::now();
-        entry.owner = Some(owner);
-        Ok(Some(entry.index.clone()))
+        if owner.is_some() {
+            entry.owner = owner;
+        }
+        Some(entry.index.clone())
+    }
+
+    fn open_or_create(
+        &self,
+        path: &Path,
+        owner: Option<Weak<dyn IdleReaderOwner>>,
+        create: bool,
+    ) -> Result<Arc<LexicalIndex>, LexicalError> {
+        self.acquire(path, owner, |admission| {
+            if create {
+                admission.reserve()?;
+                LexicalIndex::create(path)
+            } else {
+                // Validate the index and schema before sacrificing a cached reader.
+                let (index, fields) = LexicalIndex::open_index(path)?;
+                admission.reserve()?;
+                LexicalIndex::from_index(path.to_owned(), index, fields)
+            }
+        })
     }
 
     fn acquire(
         &self,
         path: &Path,
-        mut owner: Option<Weak<dyn IdleReaderOwner>>,
-        admit: impl FnOnce(&Path) -> Result<LexicalIndex, LexicalError>,
+        owner: Option<Weak<dyn IdleReaderOwner>>,
+        open: impl FnOnce(&mut ReaderAdmission<'_>) -> Result<LexicalIndex, LexicalError>,
     ) -> Result<Arc<LexicalIndex>, LexicalError> {
-        let precheck_candidates = {
-            let mut indexes = self
-                .indexes
-                .lock()
+        let mut slots = self
+            .slots
+            .lock()
+            .map_err(|_| LexicalError::ReaderUnavailable)?;
+        while slots.opening.contains(path) {
+            slots = self
+                .changed
+                .wait(slots)
                 .map_err(|_| LexicalError::ReaderUnavailable)?;
-            if let Some(entry) = indexes.get_mut(path) {
-                entry.last_use = Instant::now();
-                if owner.is_some() {
-                    entry.owner = owner;
-                }
-                return Ok(entry.index.clone());
-            }
-            // Reject full pinned caches before opening or creating index files
-            // and never evict a valid reader until `admit` succeeds.
-            if indexes.len() >= MAX_READERS
-                && !indexes
-                    .values()
-                    .any(|entry| Arc::strong_count(&entry.index) == 1)
-            {
-                Some(
-                    indexes
-                        .iter()
-                        .filter_map(|(entry_path, entry)| {
-                            let candidate = entry.owner.as_ref()?.upgrade()?;
-                            Some((entry_path.clone(), candidate))
-                        })
-                        .collect::<Vec<_>>(),
-                )
-            } else {
-                None
-            }
+        }
+        if let Some(index) = Self::cached(&mut slots, path, owner.clone()) {
+            return Ok(index);
+        }
+        slots.opening.insert(path.to_owned());
+        drop(slots);
+        let mut admission = ReaderAdmission {
+            cache: self,
+            path,
+            reserved: false,
         };
-        if let Some(candidates) = precheck_candidates
-            && !candidates
-                .iter()
-                .any(|(entry_path, candidate)| candidate.idle_last_activity(entry_path).is_some())
-        {
-            return Err(LexicalError::ReaderUnavailable);
-        }
-        let mut opened = Some(Arc::new(admit(path)?));
-        let mut tried = HashSet::new();
-        loop {
-            enum Action {
-                Done(
-                    Result<Arc<LexicalIndex>, LexicalError>,
-                    Option<Arc<LexicalIndex>>,
-                ),
-                Evict(Vec<(PathBuf, Instant, Arc<dyn IdleReaderOwner>)>),
-            }
-            let action = {
-                let mut indexes = self
-                    .indexes
-                    .lock()
-                    .map_err(|_| LexicalError::ReaderUnavailable)?;
-                if let Some(entry) = indexes.get_mut(path) {
-                    entry.last_use = Instant::now();
-                    if owner.is_some() {
-                        entry.owner = owner.take();
-                    }
-                    Action::Done(Ok(entry.index.clone()), opened.take())
-                } else if indexes.len() >= MAX_READERS {
-                    let oldest = indexes
-                        .iter()
-                        .filter(|(_, entry)| Arc::strong_count(&entry.index) == 1)
-                        .min_by_key(|(_, entry)| entry.last_use)
-                        .map(|(entry_path, _)| entry_path.clone());
-                    match oldest {
-                        Some(oldest) => {
-                            let evicted = indexes.remove(&oldest).map(|entry| entry.index);
-                            let admitted = opened.take().expect("opened lexical index");
-                            indexes.insert(
-                                path.to_owned(),
-                                ReaderEntry {
-                                    index: admitted.clone(),
-                                    last_use: Instant::now(),
-                                    owner: owner.take(),
-                                },
-                            );
-                            Action::Done(Ok(admitted), evicted)
-                        }
-                        None if tried.len() >= MAX_READERS => {
-                            Action::Done(Err(LexicalError::ReaderUnavailable), opened.take())
-                        }
-                        None => {
-                            let candidates: Vec<_> = indexes
-                                .iter()
-                                .filter(|(entry_path, _)| !tried.contains(*entry_path))
-                                .filter_map(|(entry_path, entry)| {
-                                    let candidate = entry.owner.as_ref()?.upgrade()?;
-                                    Some((entry_path.clone(), entry.last_use, candidate))
-                                })
-                                .collect();
-                            if candidates.is_empty() {
-                                Action::Done(Err(LexicalError::ReaderUnavailable), opened.take())
-                            } else {
-                                Action::Evict(candidates)
-                            }
-                        }
-                    }
-                } else {
-                    let admitted = opened.take().expect("opened lexical index");
-                    indexes.insert(
-                        path.to_owned(),
-                        ReaderEntry {
-                            index: admitted.clone(),
-                            last_use: Instant::now(),
-                            owner: owner.take(),
-                        },
-                    );
-                    Action::Done(Ok(admitted), None)
-                }
-            };
-            match action {
-                Action::Done(result, dropped) => {
-                    drop(dropped);
-                    return result;
-                }
-                Action::Evict(candidates) => {
-                    let victim = candidates
-                        .into_iter()
-                        .filter_map(|(entry_path, entry_last_use, candidate)| {
-                            let owner_last_use = candidate.idle_last_activity(&entry_path)?;
-                            Some((entry_last_use.max(owner_last_use), entry_path, candidate))
-                        })
-                        .min_by_key(|(effective_last_use, _, _)| *effective_last_use);
-                    let Some((_, entry_path, candidate)) = victim else {
-                        drop(opened.take());
-                        return Err(LexicalError::ReaderUnavailable);
-                    };
-                    tried.insert(entry_path.clone());
-                    candidate.evict_if_idle(&entry_path);
-                }
-            }
-        }
+        let index = Arc::new(open(&mut admission)?);
+        let mut slots = self
+            .slots
+            .lock()
+            .map_err(|_| LexicalError::ReaderUnavailable)?;
+        debug_assert!(admission.reserved);
+        slots.reserved -= 1;
+        admission.reserved = false;
+        slots.entries.insert(
+            path.to_owned(),
+            ReaderEntry {
+                index: index.clone(),
+                last_use: Instant::now(),
+                owner,
+            },
+        );
+        drop(slots);
+        Ok(index)
     }
 
     /// Return whether the generation can be removed. Existing users keep it pinned.
     pub fn release(&self, path: &Path) -> Result<bool, LexicalError> {
-        let removed = {
-            let mut indexes = self
-                .indexes
+        let (removed, _release_slot) = {
+            let mut slots = self
+                .slots
                 .lock()
                 .map_err(|_| LexicalError::ReaderUnavailable)?;
-            if indexes
-                .get(path)
-                .is_some_and(|entry| Arc::strong_count(&entry.index) > 1)
+            if slots.opening.contains(path)
+                || slots
+                    .entries
+                    .get(path)
+                    .is_some_and(|entry| Arc::strong_count(&entry.index) > 1)
             {
                 return Ok(false);
             }
-            indexes.remove(path).map(|entry| entry.index)
+            let Some(entry) = slots.entries.remove(path) else {
+                return Ok(true);
+            };
+            // The physical reader still occupies its slot while its handles close.
+            slots.opening.insert(path.to_owned());
+            slots.reserved += 1;
+            (
+                entry,
+                ReaderAdmission {
+                    cache: self,
+                    path,
+                    reserved: true,
+                },
+            )
         };
         drop(removed);
         Ok(true)
@@ -538,11 +562,64 @@ impl ReaderCache {
 
     pub(crate) fn release_all(&self) {
         let removed = {
-            let Ok(mut indexes) = self.indexes.lock() else {
+            let Ok(mut slots) = self.slots.lock() else {
                 return;
             };
-            std::mem::take(&mut *indexes)
+            std::mem::take(&mut slots.entries)
         };
         drop(removed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn in_flight_reader_occupies_the_last_slot_and_failure_returns_it() {
+        let mut entropy = [0; 16];
+        getrandom::fill(&mut entropy).unwrap();
+        let root = std::env::temp_dir().join(format!("reader-admission-{}", hex::encode(entropy)));
+        std::fs::create_dir(&root).unwrap();
+        let cache = ReaderCache::default();
+        let mut pinned = Vec::new();
+        for index in 1..MAX_READERS {
+            let path = root.join(index.to_string());
+            std::fs::create_dir(&path).unwrap();
+            pinned.push(cache.create(&path).unwrap());
+        }
+        let last = root.join("last");
+        let competing = root.join("competing");
+        std::fs::create_dir(&last).unwrap();
+        std::fs::create_dir(&competing).unwrap();
+        std::thread::scope(|scope| {
+            let (ready, opened) = std::sync::mpsc::channel();
+            let (finish, wait) = std::sync::mpsc::channel();
+            let cache = &cache;
+            let attempt = scope.spawn(move || {
+                cache.acquire(&last, None, |admission| {
+                    admission.reserve()?;
+                    let _index = LexicalIndex::create(&last)?;
+                    ready.send(()).unwrap();
+                    wait.recv_timeout(Duration::from_secs(5)).unwrap();
+                    Err(LexicalError::CorruptIndex)
+                })
+            });
+            opened.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(matches!(
+                cache.create(&competing),
+                Err(LexicalError::ReaderUnavailable)
+            ));
+            assert!(!competing.join("meta.json").exists());
+            finish.send(()).unwrap();
+            assert!(matches!(
+                attempt.join().unwrap(),
+                Err(LexicalError::CorruptIndex)
+            ));
+        });
+        assert!(cache.create(&competing).is_ok());
+        drop(pinned);
+        drop(cache);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -9,7 +9,7 @@ use notarium_core::{
     error::PortError,
     ids::NoteId,
     model::DenseNodeId,
-    ports::{SpaceContext, StructuralReadPort, StructuralSnapshot},
+    ports::{PageLimit, SpaceContext, StructuralReadPort, StructuralSnapshot},
     query::Predicate,
 };
 use std::{
@@ -146,15 +146,10 @@ pub(super) async fn expand(
         for (seed_idx, state) in states.iter_mut().enumerate() {
             let frontier = std::mem::take(&mut state.frontier);
             for via in frontier {
-                let Some(nbrs) =
-                    retry_snapshot(snapshot, clock, || match neighbors(snapshot, via) {
-                        Ok(nbrs) => Ok(Some(nbrs)),
-                        Err(DomainError::ResourceNotFound) => Ok(None),
-                        Err(error) => Err(error),
-                    })
-                    .await?
-                else {
-                    continue;
+                let nbrs = match neighbors(snapshot, via, clock).await {
+                    Ok(neighbors) => neighbors,
+                    Err(PortError::Domain(DomainError::ResourceNotFound)) => continue,
+                    Err(error) => return Err(error),
                 };
                 let penalty = 1.0 + (1.0 + nbrs.len() as f64).ln();
                 for neighbor in nbrs {
@@ -249,16 +244,26 @@ async fn resolve_live(
     Ok(())
 }
 
-fn neighbors(
+async fn neighbors(
     snapshot: &dyn StructuralSnapshot,
     node: DenseNodeId,
-) -> DomainResult<Vec<DenseNodeId>> {
+    clock: &Clock,
+) -> Result<Vec<DenseNodeId>, PortError> {
     let generation = snapshot.cut().generation;
     let source = node.index(generation)?;
-    let mut positions = snapshot
-        .outgoing(node)?
-        .take(64)
-        .chain(snapshot.incoming(node)?.take(64))
+    let page = loop {
+        match clock
+            .within(snapshot.neighbor_page(node, PageLimit::new(64)?))
+            .await
+        {
+            Err(PortError::Domain(error)) if super::is_not_ready(&error) => {
+                clock.within(snapshot.wait_ready()).await?;
+            }
+            result => break result?,
+        }
+    };
+    let mut positions = page
+        .into_iter()
         .map(|neighbor| neighbor.index(generation))
         .collect::<DomainResult<Vec<_>>>()?;
     positions.retain(|&position| position != source);

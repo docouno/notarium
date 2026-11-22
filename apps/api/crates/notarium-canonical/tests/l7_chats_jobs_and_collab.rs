@@ -1361,6 +1361,7 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
     assert_eq!(suffix_page.entries[0].entry, fast_appended.value.seq);
     assert_eq!(suffix_page.entries[0].text, "append-only delta message");
     assert_eq!(suffix_page.next_before, None);
+    let previous_tip = cur_a;
     cur_a = fast_appended.value.seq;
     let retained = store.execute_diagnostic_read_sql_for_test(None,
         "SELECT COUNT(*) FROM chat_pending_inputs WHERE status = 'consumed' AND (inline_text <> '' OR payload_blake3 IS NOT NULL)"
@@ -1397,6 +1398,23 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
         .await
         .unwrap();
     let comp_a = appended.value;
+    // A later checkpoint must not turn an earlier append-only interval into a branch scan.
+    assert_eq!(
+        store
+            .plan_searchable_chat_delta(
+                &delta_search,
+                &search_reader.budget,
+                &scope,
+                &thread,
+                before_append_cut,
+                after_append_cut,
+            )
+            .await
+            .unwrap(),
+        notarium_canonical::chats::search::SearchChatDeltaPlan::AppendOnly {
+            stop_at: previous_tip
+        }
+    );
     assert_eq!(
         store
             .plan_searchable_chat_delta(

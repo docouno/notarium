@@ -407,6 +407,7 @@ fn token_estimates_use_shared_conservative_weights_and_preserve_message_framing(
                 tokens: 1,
                 classes: BTreeSet::from([DocClass::UserDoc]),
                 project_scope: None,
+                folder: None,
             },
         )
     };

@@ -7,8 +7,8 @@ use notarium_core::{
     ids::{CommandKey, ModelProfileId, ProviderResourceId},
     model::FolderRef,
     ports::{
-        EmbeddingProviderPort, EmbeddingQueryInput, EmbeddingRequest, ProviderErrorCode,
-        ProviderRuntimeEpochs, SpaceContext,
+        EmbeddingProviderPort, EmbeddingQueryInput, EmbeddingRequest, EmbeddingSelection,
+        ProviderErrorCode, ProviderRuntimeEpochs, SpaceContext,
     },
 };
 use std::{sync::Arc, time::Instant};
@@ -20,6 +20,7 @@ pub struct RemoteEmbedder {
     pub dimension: u32,
     pub max_input_tokens: u32,
     runtime_epochs: ProviderRuntimeEpochs,
+    default_project: Option<FolderRef>,
 }
 
 impl RemoteEmbedder {
@@ -30,6 +31,7 @@ impl RemoteEmbedder {
         dimension: u32,
         max_input_tokens: u32,
         runtime_epochs: ProviderRuntimeEpochs,
+        default_project: Option<FolderRef>,
     ) -> Self {
         Self {
             port,
@@ -38,6 +40,7 @@ impl RemoteEmbedder {
             dimension,
             max_input_tokens,
             runtime_epochs,
+            default_project,
         }
     }
 
@@ -45,6 +48,7 @@ impl RemoteEmbedder {
         &self,
         mut ctx: SpaceContext,
         mut input: EmbeddingQueryInput,
+        implicit: bool,
     ) -> Result<Vec<Option<Vec<f32>>>, EmbeddingError> {
         if ctx.auth().taint().is_tainted()
             || input.classes.is_empty()
@@ -63,6 +67,7 @@ impl RemoteEmbedder {
                 self.provider.clone(),
                 self.model.clone(),
                 input.project_scope.clone(),
+                input.folder.clone(),
             )
             .await
             .map_err(query_port_error)?;
@@ -74,7 +79,10 @@ impl RemoteEmbedder {
         if ctx.budget.remaining.is_zero() {
             return Err(EmbeddingError::BudgetExceeded);
         }
-        let mut intent = self.intent(&ctx, b"query", input.project_scope.as_ref());
+        let mut intent = self.intent(&ctx, b"query", input.project_scope.as_ref(), implicit);
+        if let Some(folder) = &input.folder {
+            hash_field(&mut intent, folder.as_str().as_bytes());
+        }
         hash_field(&mut intent, input.text.as_bytes());
         hash_field(&mut intent, &input.tokens.to_le_bytes());
         for class in &input.classes {
@@ -86,7 +94,9 @@ impl RemoteEmbedder {
             self.provider.clone(),
             input,
         );
-        let mut rows = self.dispatch(ctx, request, query_port_error).await?;
+        let mut rows = self
+            .dispatch(ctx, request, implicit, query_port_error)
+            .await?;
         let vector = rows
             .pop()
             .ok_or(EmbeddingError::ProviderUnavailable)?
@@ -112,7 +122,7 @@ impl RemoteEmbedder {
         if grant.ctx.auth().taint().is_tainted() {
             return Err(EmbeddingError::IndexingDenied);
         }
-        let mut intent = self.intent(&grant.ctx, b"parts", project.as_ref());
+        let mut intent = self.intent(&grant.ctx, b"parts", project.as_ref(), true);
         let mut positions = Vec::new();
         let mut admitted = Vec::new();
         let mut total = 0u32;
@@ -150,7 +160,7 @@ impl RemoteEmbedder {
             total,
         );
         let result = self
-            .dispatch(grant.ctx, request, indexing_port_error)
+            .dispatch(grant.ctx, request, true, indexing_port_error)
             .await?;
         let mut permanent_error = None;
         let mut has_success = false;
@@ -190,11 +200,17 @@ impl RemoteEmbedder {
     async fn dispatch(
         &self,
         ctx: SpaceContext,
-        request: EmbeddingRequest,
+        mut request: EmbeddingRequest,
+        implicit: bool,
         map_error: fn(PortError) -> EmbeddingError,
     ) -> Result<Vec<Result<Vec<f32>, DomainError>>, EmbeddingError> {
         if ctx.budget.cancellation.is_cancelled() {
             return Err(EmbeddingError::Cancelled);
+        }
+        if implicit {
+            request.selection = EmbeddingSelection::SearchDefault {
+                project: self.default_project.clone(),
+            };
         }
         let request = request.with_runtime_epochs(self.runtime_epochs);
         request
@@ -222,10 +238,18 @@ impl RemoteEmbedder {
         ctx: &SpaceContext,
         lane: &[u8],
         project: Option<&FolderRef>,
+        implicit: bool,
     ) -> blake3::Hasher {
         let mut hash =
             blake3::Hasher::new_derive_key("notarium/search/provider-embedding-intent/v1");
         hash_field(&mut hash, lane);
+        if implicit {
+            hash_field(&mut hash, b"search-default");
+            if let Some(scope) = &self.default_project {
+                hash_field(&mut hash, scope.space_id.as_str().as_bytes());
+                hash_field(&mut hash, scope.folder_id.as_str().as_bytes());
+            }
+        }
         hash_field(&mut hash, ctx.scope().space_id.as_str().as_bytes());
         hash_field(&mut hash, ctx.budget.request.as_str().as_bytes());
         hash_field(&mut hash, self.model.as_str().as_bytes());
@@ -265,6 +289,11 @@ fn query_provider_error(error: DomainError) -> EmbeddingError {
             ) =>
         {
             EmbeddingError::BudgetExceeded
+        }
+        DomainError::ValidationFailed { diagnostic }
+            if diagnostic.reason == ValidationReason::NotReady =>
+        {
+            EmbeddingError::TargetChanged
         }
         DomainError::RateLimited { .. } => EmbeddingError::BudgetExceeded,
         DomainError::Provider {

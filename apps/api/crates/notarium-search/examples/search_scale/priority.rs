@@ -105,6 +105,7 @@ impl EmbeddingProviderPort for Probe {
         _: ProviderResourceId,
         _: ModelProfileId,
         _: Option<FolderRef>,
+        _: Option<notarium_core::ids::FolderId>,
     ) -> PortFuture<'_, BTreeSet<DocClass>> {
         Box::pin(async { Ok(BTreeSet::from([DocClass::UserDoc])) })
     }

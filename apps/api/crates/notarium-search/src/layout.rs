@@ -8,7 +8,7 @@ use cap_std::{
 };
 use notarium_core::{
     epoch::{DataRoot, SearchIndexKind},
-    ids::{FolderId, ModelProfileId, ProviderResourceId, SpaceSeq},
+    ids::{FolderId, ModelProfileId, NoteId, ProviderResourceId, SpaceSeq},
     model::{FolderRef, HistoryScope},
     ports::ProviderRuntimeEpochs,
 };
@@ -64,6 +64,15 @@ impl FolderDictionary {
     }
     pub fn folder(&self, ord: FolderOrd) -> Option<&FolderId> {
         self.folders.get(ord.get() as usize - 1)
+    }
+    pub(crate) fn get_or_insert_shared(
+        self: &mut std::sync::Arc<Self>,
+        folder: &FolderId,
+    ) -> Result<FolderOrd, LayoutError> {
+        if let Some(ord) = self.get(folder) {
+            return Ok(ord);
+        }
+        std::sync::Arc::make_mut(self).insert(folder.clone())
     }
     pub fn insert(&mut self, folder: FolderId) -> Result<FolderOrd, LayoutError> {
         if let Some(ord) = self.get(&folder) {
@@ -217,6 +226,27 @@ impl VectorModel {
     }
 }
 
+/// Older manifests inferred supersession from overlapping note IDs. New
+/// manifests permit one revision to span segments and identify a direct
+/// replacement explicitly until its predecessor tombstones are durable.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum SegmentRecovery {
+    #[default]
+    Legacy,
+    Stable,
+    Retire {
+        note: NoteId,
+        through_segment: u64,
+    },
+}
+
+impl SegmentRecovery {
+    fn is_legacy(&self) -> bool {
+        matches!(self, Self::Legacy)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EpochManifest {
@@ -225,6 +255,8 @@ pub struct EpochManifest {
     pub vector_seq: SpaceSeq,
     pub active_segments: Vec<u64>,
     pub complete_backfill: bool,
+    #[serde(default, skip_serializing_if = "SegmentRecovery::is_legacy")]
+    pub(crate) recovery: SegmentRecovery,
 }
 impl EpochManifest {
     fn validate(&self) -> Result<(), LayoutError> {
@@ -235,6 +267,14 @@ impl EpochManifest {
                 .active_segments
                 .windows(2)
                 .any(|pair| pair[0] >= pair[1])
+        {
+            return Err(LayoutError::Corrupt);
+        }
+        if let SegmentRecovery::Retire {
+            through_segment, ..
+        } = &self.recovery
+            && (self.active_segments.binary_search(through_segment).is_err()
+                || self.active_segments.last() == Some(through_segment))
         {
             return Err(LayoutError::Corrupt);
         }
@@ -777,6 +817,7 @@ mod tests {
             vector_seq: SpaceSeq::new(3).unwrap(),
             active_segments: vec![1, 3],
             complete_backfill: true,
+            recovery: SegmentRecovery::Stable,
         };
         let epoch = layout.model_epoch(&model).unwrap();
         layout.publish_epoch(&manifest).unwrap();

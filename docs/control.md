@@ -503,8 +503,11 @@ fails instead of silently switching providers.
 
 Search embeddings use either a typed query or source-bound parts. Query
 admission checks the caller's taint, requested classes, and project scope.
+For a folder-scoped query with project consent, the canonical egress lease
+pins the requested folder's current membership in that project through dispatch.
 Background search indexing supports a narrowly scoped `SearchIndexing`
-credential for the revision actor under current disclosure consent. The model
+credential for the revision actor under current disclosure consent. An
+ineligible author in a shared Space receives no grant for that note. The model
 token limit applies to the sum across a batch. See [search embeddings](search.md#embeddings).
 
 Supported wire protocols are OpenAI-compatible chat completions/embeddings and

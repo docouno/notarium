@@ -20,7 +20,9 @@ before shutting down canonical storage.
   queries require a quorum (`1` clause for 1–2 clauses, `2` for 3–4 clauses, and
   `ceil(3 * count / 5)` for 5 or more); queries with more than two clauses fall
   back to single-clause matching only when fewer than `min(top_k, 10)` hits
-  satisfy the quorum. Both paths observe the request deadline and cancellation.
+  satisfy the quorum. Notes count strict matches across the indexed and receipt
+  revisions together. Chats count matches on the currently visible branch.
+  Both paths observe the request deadline and cancellation.
 - Folder and structural filters apply before ranking. A blank query with a
   filter browses notes in stable ID order using per-segment term ordinals.
   Personal chat hits enter the ranking only for an authorized personal
@@ -28,7 +30,9 @@ before shutting down canonical storage.
   project-scoped Keeper can search its explicitly pinned skills outside the
   project when no folder is requested.
 - The hybrid path fuses lexical and vector ranks with reciprocal rank fusion
-  (`k = 60`). Recall can expand the leading notes through up to two graph hops.
+  (`k = 60`). The vector branch ranks each note by its best matching chunk
+  and also retains the leading chunks for recall. Recall can expand the
+  leading notes through up to two graph hops.
   It serves the best eligible chunk per note first, then fills the remaining
   token budget with ranked chunks. Lexical fallback ranks chunks by matching
   phrases and normalized terms. Each chunk carries canonical source spans.
@@ -80,13 +84,16 @@ flush threshold at 12 MiB or 20,000 chunks, hard upsert limit at 16 MiB or
 delete-only batches while a background flush or compaction plan is active;
 without an active plan, delete overflow flushes tombstones and resets the
 journal) and read-only, single-pass BLAKE3-checksummed v2 mmap segments
-(bounded to 112 MiB per segment build). Each segment contains normalized, per-vector i8
+(112 MiB estimated build budget per segment). A long note can span several
+segments. Backfill and direct replacements publish all its pieces in one
+manifest update. Each segment contains normalized, per-vector i8
 embeddings, a CSR-HNSW graph built in Rust, sorted note-slot and content-key
 indexes, and precomputed class/folder filter bitmaps. Non-blocking partial
 compaction plans and writes replacement segments outside the reader lock before
 committing atomically. An individual upsert that exceeds the journal capacity
-writes a replacement segment directly. SIMD scans serve selective filters up to
-16,384 eligible slots per segment. Epoch identity includes the profile,
+writes its replacement segments directly. SIMD scans serve selective filters up to
+16,384 eligible slots per segment after intersecting field, class and folder
+constraints. Epoch identity includes the profile,
 dimension and input token cap. Remote epochs also bind the provider, its
 resource and credential runtime generations, and the selected project.
 When switching from a local model or changing models within the same remote
@@ -107,7 +114,8 @@ the old generation on disk before waiting to rebuild it. The worker
 discards abandoned epochs and rebuilds invalid cuts. On reopening an archived
 Space the worker retires its derived data before waiting for reactivation.
 Search checks live note visibility after asynchronous hydration and before
-returning results.
+returning results. Mixed results recheck the selected chat entries if the
+canonical head changes during that final check.
 
 ## Embeddings
 
@@ -117,7 +125,12 @@ conservative tokenizer. This mode keeps the ONNX Runtime library unloaded.
 For `VectorMode::DynamicOrt`, install a matching CPU ONNX Runtime with C API 31
 and supply its canonical absolute library path. Under the configured model
 directory, each profile contains `<model-id>/model.onnx` with inline weights
-and `<model-id>/tokenizer.json`. The graph accepts `input_ids` and
+and `<model-id>/tokenizer.json`. Treat each installed model ID as immutable.
+To update the weights or tokenizer, install both files under a new model ID
+and select that profile in the resolver. Search builds a new vector epoch
+before switching queries to the replacement model.
+
+The graph accepts `input_ids` and
 `attention_mask`, and can also accept `token_type_ids`. The output is a pooled
 2D float32 matrix (`sentence_embedding`) or a per-token 3D float32 tensor
 (`last_hidden_state`). For token-level outputs the resolver selects masked mean
@@ -132,9 +145,16 @@ Space-level embedding targets, composable with
 `ProviderService::resolve_search_embedding_model`) and the typed provider port.
 Background indexing obtains a current disclosure grant for the revision actor
 before reusing a vector or sending a part. Each scheduled part batch rechecks
-the selected target before dispatch. Interactive requests require an untainted
+the selected target before dispatch. A revision author who has left the Space
+is skipped while other eligible authors continue indexing. Interactive requests
+recheck the default recipient when they leave the queue. Control verifies the
+effective default again while admitting interactive queries and background
+parts. Changing the default recipient drains in-flight implicit calls for the
+affected Space before the preference commits. Explicit calls retain their
+own provider admission. They require an untainted
 context, a matching project scope, and a nonempty intersection of search
-classes and provider disclosure. Provider admission rechecks current access and
+classes and provider disclosure. For project-scoped queries the canonical
+egress lease pins the requested folder inside that project through dispatch. Provider admission rechecks current access and
 token limits. Dispatch compares both resolved runtime generations and checks
 the shared taint. Remote indexing excludes descendants of trashed folders. Chat
 text stays in the lexical index.
@@ -146,9 +166,10 @@ first, then live edits, then import and backfill. Batches contain at most 16
 chunks; remote provider batches stay within the model's aggregate
 `max_input_tokens` cap, while local ONNX batches pack up to 16 chunks each
 bounded by `max_input_tokens` (up to `max_input_tokens * 16` tokens per batch).
-Interactive embedding work has a deadline of at most
-150 ms, including queueing. On expiry, the query uses lexical ranking and
-cancellation signals the active backend.
+Interactive vector search has one deadline of at most 150 ms covering model
+selection, queueing, embedding, filter preparation and vector traversal. When
+this deadline expires, the query returns lexical results with `BudgetExceeded`.
+The same deadline bounds waits for projection access during traversal.
 The durable pending state schedules bounded repair when embeddings are missing.
 Each page can finish while unrelated edits arrive. If a note changes during
 its embedding call, the worker discards that result and retries the new text.
@@ -182,7 +203,10 @@ The release gate writes 100,000 canonical fixture notes and builds 400,000
 384-dimensional chunks under the writable Cargo target. It measures BM25 at
 the production candidate limit, broad and blank browse query lookup counts,
 hybrid retrieval and fusion, selective SIMD scans, warm vector epoch reopen,
-and non-blocking compaction. Independent RRF over exact quantized search and
+and non-blocking compaction. The selective timing includes constructing the
+folder and dense membership bitmaps on the fixture snapshot and querying with
+the same projection checks and candidate limit as the search engine. The
+report includes separate mask preparation and kernel times. Independent RRF over exact quantized search and
 an unquantized float32 cosine reference measure ANN and quantization recall.
 The report includes sampled peak allocated index bytes, process anonymous RSS
 and HWM across build, reopen and compaction, verified canonical descendants and

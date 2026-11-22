@@ -3,12 +3,12 @@ use crate::{
     embed::{EmbeddingError, Priority},
     engine::Services,
     layout::{FolderDictionary, FolderOrd},
-    lexical::Update,
+    lexical::{SeedLease, Update},
     model::{Embedder, IndexNote, NoteIndexOutcome},
     ports::SearchIndexedNote,
     vector::{MutableOperation, QuantizedVector, VectorChunk, VectorError, VectorSnapshot},
 };
-use notarium_canonical::chats::search::{HydratedChatHit, SearchChatDeltaPlan};
+use notarium_canonical::chats::search::SearchChatDeltaPlan;
 use notarium_core::{
     classes::{ClassEgressFence, DocClass, SearchContent},
     ids::{ChatThreadId, ContentDigest, FolderId, NoteId, SpaceSeq, ThreadEntrySeq},
@@ -95,22 +95,19 @@ pub(super) async fn apply(
             EntityId::Ability(_) | EntityId::Job(_) => {}
         }
     }
+    let old_folder_count = disk.folders.len();
+    for folder in active_folders {
+        disk.folders.get_or_insert_shared(&folder)?;
+    }
     if notes.is_empty() && threads.is_empty() {
-        if !active_folders.is_empty() {
-            let folders = Arc::make_mut(&mut disk.folders);
-            let before = folders.len();
-            for folder in active_folders {
-                folders.insert(folder)?;
-            }
-            if folders.len() != before {
-                let layout = disk.layout.clone();
-                let snapshot_folders = disk.folders.clone();
-                tokio::task::spawn_blocking(move || {
-                    build::save_new_folders(&layout, &snapshot_folders, before)
-                })
-                .await
-                .map_err(|_| IndexError::Inconsistent)??;
-            }
+        if disk.folders.len() != old_folder_count {
+            let layout = disk.layout.clone();
+            let snapshot_folders = disk.folders.clone();
+            tokio::task::spawn_blocking(move || {
+                build::save_new_folders(&layout, &snapshot_folders, old_folder_count)
+            })
+            .await
+            .map_err(|_| IndexError::Inconsistent)??;
         }
         disk.manifest.tantivy_seq = cutoff.after;
         disk.publish_manifest().await?;
@@ -119,11 +116,6 @@ pub(super) async fn apply(
     }
 
     let lexical = lexical.clone();
-    let folders = Arc::make_mut(&mut disk.folders);
-    let old_folder_count = folders.len();
-    for folder in active_folders {
-        folders.insert(folder)?;
-    }
 
     let mut active = Vec::new();
     let mut inactive_candidates = Vec::new();
@@ -170,8 +162,9 @@ pub(super) async fn apply(
             .await?
         {
             if let Some(row) = carrier
-                && let Some((content, folder)) = build::prepare_note(cx, folders, &row)?
+                && let Some(content) = build::prepare_note(cx, &row)
             {
+                let folder = disk.folders.get_or_insert_shared(&row.parent_folder_id)?;
                 updated_notes.push(PreparedNote {
                     row,
                     content,
@@ -200,17 +193,15 @@ pub(super) async fn apply(
     }
 
     let previous_cutoff = disk.manifest.tantivy_seq;
-    let chat = reconcile_chats(cx, &lexical, previous_cutoff, &cutoff, threads).await?;
-    let folders = Arc::make_mut(&mut disk.folders);
-    let mut chat_rows = Vec::with_capacity(chat.added.len());
-    for hit in chat.added {
-        let folder = hit
-            .project_folder
-            .as_ref()
-            .map(|folder| folders.insert(folder.clone()))
-            .transpose()?;
-        chat_rows.push((hit, folder));
-    }
+    let chat = reconcile_chats(
+        cx,
+        &lexical,
+        &mut disk.folders,
+        previous_cutoff,
+        &cutoff,
+        threads,
+    )
+    .await?;
     let has_chat_removed = !chat.removed.is_empty();
     let updated_note_ids: Vec<NoteId> = updated_notes
         .iter()
@@ -218,7 +209,7 @@ pub(super) async fn apply(
         .collect();
     let deleted_ids: Vec<NoteId> = deleted.iter().cloned().collect();
 
-    let needs_folders = folders.len() != old_folder_count;
+    let needs_folders = disk.folders.len() != old_folder_count;
     let folders_snapshot = needs_folders.then(|| disk.folders.clone());
     let layout = disk.layout.clone();
     let writers = cx.services.writers.clone();
@@ -228,15 +219,8 @@ pub(super) async fn apply(
         if let Some(dict) = folders_snapshot {
             build::save_new_folders(&layout, &dict, old_folder_count)?;
         }
-        let mut updates = Vec::with_capacity(
-            chat_rows.len() + chat_removed.len() + deleted.len() + updated_notes.len(),
-        );
-        for (hit, folder) in &chat_rows {
-            updates.push(Update::Chat {
-                hit,
-                folder: *folder,
-            });
-        }
+        let mut updates =
+            Vec::with_capacity(chat_removed.len() + deleted.len() + updated_notes.len());
         for (thread, seq) in &chat_removed {
             updates.push(Update::RemoveChat(thread, *seq));
         }
@@ -250,10 +234,10 @@ pub(super) async fn apply(
                 folder: note.folder,
             });
         }
-        if updates.is_empty() {
+        if updates.is_empty() && chat.staged.is_none() {
             return Ok(None);
         }
-        lexical_apply.apply(&writers, &updates)?;
+        lexical_apply.commit_updates(&writers, &updates, chat.staged)?;
         if !chat_removed.is_empty() {
             lexical_apply.merge_deleted(&writers)?;
         }
@@ -603,13 +587,14 @@ struct PreparedNote {
 
 #[derive(Default)]
 struct ChatChanges {
-    added: Vec<HydratedChatHit>,
+    staged: Option<SeedLease>,
     removed: Vec<(ChatThreadId, ThreadEntrySeq)>,
 }
 
 async fn reconcile_chats(
     cx: &Context<'_>,
     lexical: &Arc<crate::lexical::LexicalIndex>,
+    folders: &mut Arc<FolderDictionary>,
     previous_cutoff: SpaceSeq,
     cutoff: &ChangeCursor,
     threads: BTreeSet<ChatThreadId>,
@@ -629,46 +614,60 @@ async fn reconcile_chats(
                 cutoff.after,
             )
             .await?;
-        match plan {
+        let (stop_at, mut obsolete) = match plan {
             SearchChatDeltaPlan::Unchanged => continue,
-            SearchChatDeltaPlan::AppendOnly { stop_at } => {
-                let mut before = None;
-                loop {
-                    let (page, next) =
-                        build::chat_page_until(cx, cutoff, &thread, before, Some(stop_at)).await?;
-                    changes.added.extend(page);
-                    before = next;
-                    if before.is_none() {
-                        break;
-                    }
-                }
-            }
+            SearchChatDeltaPlan::AppendOnly { stop_at } => (Some(stop_at), BTreeSet::new()),
             SearchChatDeltaPlan::FullReconcile => {
                 let lexical_scan = lexical.clone();
                 let thread_scan = thread.clone();
-                let mut obsolete = tokio::task::spawn_blocking(move || {
-                    let searcher = lexical_scan.searcher();
-                    lexical_scan.live_chat_entries(&searcher, &thread_scan)
+                let existing = tokio::task::spawn_blocking(move || {
+                    lexical_scan.live_chat_entries(&lexical_scan.searcher(), &thread_scan)
                 })
                 .await
                 .map_err(|_| IndexError::Inconsistent)??;
-                let mut before = None;
-                loop {
-                    let (page, next) =
-                        build::chat_page_until(cx, cutoff, &thread, before, None).await?;
-                    changes
-                        .added
-                        .extend(page.into_iter().filter(|hit| !obsolete.remove(&hit.entry)));
-                    before = next;
-                    if before.is_none() {
-                        break;
-                    }
+                (None, existing)
+            }
+        };
+        let mut before = None;
+        loop {
+            let (page, next) = build::chat_page_until(cx, cutoff, &thread, before, stop_at).await?;
+            let mut rows = Vec::new();
+            for hit in page {
+                if obsolete.remove(&hit.entry) {
+                    continue;
                 }
-                changes
-                    .removed
-                    .extend(obsolete.into_iter().map(|seq| (thread.clone(), seq)));
+                let folder = hit
+                    .project_folder
+                    .as_ref()
+                    .map(|folder| folders.get_or_insert_shared(folder))
+                    .transpose()?;
+                rows.push((hit, folder));
+            }
+            if !rows.is_empty() {
+                let lexical = lexical.clone();
+                let writers = cx.services.writers.clone();
+                let lease = tokio::task::spawn_blocking(move || {
+                    let additions = rows
+                        .iter()
+                        .map(|(hit, folder)| Update::Chat {
+                            hit,
+                            folder: *folder,
+                        })
+                        .collect::<Vec<_>>();
+                    lexical.stage_seed(&writers, &additions)
+                })
+                .await
+                .map_err(|_| IndexError::Inconsistent)??;
+                changes.staged = Some(lease);
+            }
+            before = next;
+            if before.is_none() {
+                break;
             }
         }
+        changes
+            .removed
+            .extend(obsolete.into_iter().map(|seq| (thread.clone(), seq)));
     }
     Ok(changes)
 }

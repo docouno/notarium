@@ -26,17 +26,19 @@ use notarium_core::{
     ids::*,
     model::{FolderRef, HistoryScope, Lifecycle},
     ports::{
-        AccountContext, AppendChat, AuthEvidence, AuthEvidenceKind, BootstrapAccount, CallBudget,
-        Cancellation, ChatEntryKind, ChatInputBody, ChatPort, ChatThreadKind, CreateChat,
-        CreateNote, EmptyRootAuthorization, MaintenanceContext, MoveFolder, Mutation,
-        NoteWritePort, PageLimit, PortFuture, PreAuthContext, PreferenceModelKind,
-        ProviderAttachmentTarget, ProviderDisclosure, ProviderDisclosureConsent,
-        ProviderEgressCatalogPort, ProviderEgressLease, ProviderEgressRequest, ProviderLimits,
-        ProviderModelKind, ProviderModelSpec, ProviderPreferenceScope, ProviderResourceSpec,
-        ProviderWireKind, PublishAbilityPackage, PutProviderModel, RecallQuery,
-        RequestProviderAttachment, RevocationLease, RevocationReason, RevocationSelector,
-        SearchPort, SearchQuery, SearchResult, ServiceAuthority, ServicePurpose,
-        SessionRevocationPort, SetProviderPreference, SpaceContext, TokenAccountingProfile,
+        AccountContext, AppendChat, ApproveProviderAttachment, AuthEvidence, AuthEvidenceKind,
+        BootstrapAccount, CallBudget, Cancellation, ChangePassword, ChatEntryKind, ChatInputBody,
+        ChatPort, ChatThreadKind, CreateChat, CreateNote, CreateSpace, EmbeddingProviderPort,
+        EmbeddingQueryInput, EmbeddingRequest, EmptyRootAuthorization, MaintenanceContext,
+        MembershipChange, MoveFolder, Mutation, NewAccount, NoteWritePort, PageLimit,
+        PasswordLogin, PortFuture, PreAuthContext, PreferenceModelKind, ProviderAttachmentTarget,
+        ProviderDisclosure, ProviderDisclosureConsent, ProviderEgressCatalogPort,
+        ProviderEgressLease, ProviderEgressRequest, ProviderLimits, ProviderModelKind,
+        ProviderModelSpec, ProviderPreferenceScope, ProviderResourceSpec, ProviderWireKind,
+        PublishAbilityPackage, PutProviderModel, RecallQuery, RequestProviderAttachment,
+        RevocationLease, RevocationReason, RevocationSelector, SearchPort, SearchQuery,
+        SearchResult, ServiceAuthority, ServicePurpose, SessionRevocationPort,
+        SetProviderPreference, SpaceContext, TokenAccountingProfile,
         control::{AccountMutation, ControlPageRequest, RunLimits},
     },
     query::{FieldFilterAstV1, FieldSchema, FieldType, Predicate, ScalarType},
@@ -720,7 +722,7 @@ impl SearchModelResolverPort for ControlSearchModelResolver {
         budget: CallBudget,
     ) -> PortFuture<'a, Option<RemoteIndexingGrant>> {
         Box::pin(async move {
-            match self
+            Ok(self
                 .0
                 .admit_search_indexing(
                     authority,
@@ -730,16 +732,8 @@ impl SearchModelResolverPort for ControlSearchModelResolver {
                     project,
                     budget,
                 )
-                .await
-            {
-                Ok((ctx, policy)) => Ok(Some(RemoteIndexingGrant { ctx, policy })),
-                Err(PortError::Domain(
-                    DomainError::AccessDenied
-                    | DomainError::ResourceNotFound
-                    | DomainError::Provider { .. },
-                )) => Ok(None),
-                Err(err) => Err(err),
-            }
+                .await?
+                .map(|(ctx, policy)| RemoteIndexingGrant { ctx, policy }))
         })
     }
 }
@@ -791,6 +785,8 @@ impl SessionRevocationPort for TestRevoker {
 }
 
 struct SimpleEgressLease {
+    _folder_permit: Option<notarium_canonical::LiveReadPermit>,
+    project_folders: BTreeSet<FolderId>,
     current: Vec<ProviderCurrentContent>,
     project: Option<FolderRef>,
     cancellation: Cancellation,
@@ -803,6 +799,10 @@ impl ProviderEgressLease for SimpleEgressLease {
 
     fn project(&self) -> Option<&FolderRef> {
         self.project.as_ref()
+    }
+
+    fn project_folders(&self) -> &BTreeSet<FolderId> {
+        &self.project_folders
     }
 
     fn check(&self) -> notarium_core::DomainResult<()> {
@@ -844,7 +844,32 @@ impl ProviderEgressCatalogPort for CanonicalEgress {
                     }
                 }
             }
+            let folder_permit = if !request.project_folders.is_empty() {
+                let project = request.project.as_ref().ok_or(DomainError::AccessDenied)?;
+                let space = self.0.read_space(&project.space_id).await?;
+                let permit = self
+                    .0
+                    .live_visibility_fence()
+                    .space(&space.scope)?
+                    .read(&ctx.budget)
+                    .await?;
+                for folder in &request.project_folders {
+                    let facts = permit
+                        .folder_facts(folder)
+                        .ok_or(DomainError::ResourceNotFound)?;
+                    ctx.auth()
+                        .can_view_folder(permit.space(), folder, &facts.ancestor_folders)?;
+                    if !facts.ancestor_folders.contains(&project.folder_id) {
+                        return Err(DomainError::AccessDenied.into());
+                    }
+                }
+                Some(permit)
+            } else {
+                None
+            };
             Ok(Box::new(SimpleEgressLease {
+                _folder_permit: folder_permit,
+                project_folders: request.project_folders,
                 current,
                 project: request.project,
                 cancellation,
@@ -971,6 +996,114 @@ async fn open_control_keyring(control_store: &ControlStore, native_dir: PathBuf)
     )
 }
 
+async fn provider_fixture_folder(
+    store: &CanonicalStore,
+    ctx: &SpaceContext,
+    parent: Option<FolderId>,
+    slug: &str,
+) -> FolderRef {
+    let scope = ctx.scope();
+    let epoch = store
+        .read_space(&scope.space_id)
+        .await
+        .unwrap()
+        .active_epoch;
+    let folder = FolderRef {
+        space_id: scope.space_id.clone(),
+        folder_id: FolderId::from_bytes(random_bytes_16()),
+    };
+    let is_project = parent.is_none();
+    store
+        .create_folder(CreateFolderSpec {
+            scope: scope.clone(),
+            active_epoch: epoch,
+            folder_id: folder.folder_id.clone(),
+            parent,
+            slug: slug.into(),
+            display_name: slug.into(),
+            is_project,
+            project_slug: is_project.then(|| slug.into()),
+            actor: ctx.auth().principal().clone(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+    folder
+}
+
+async fn verify_moved_query_folder(
+    store: &CanonicalStore,
+    provider: &ProviderService,
+    ctx: &SpaceContext,
+    target: &notarium_control::service::provider::ResolvedSearchEmbeddingModel,
+    requests: &AtomicUsize,
+) {
+    let project = target.project.as_ref().unwrap();
+    let resource = &target.provider;
+    let model = &target.model;
+    let child =
+        provider_fixture_folder(store, ctx, Some(project.folder_id.clone()), "query-folder")
+            .await
+            .folder_id;
+    let destination = provider_fixture_folder(store, ctx, None, "destination").await;
+    let disclosure = || {
+        provider.query_disclosure(
+            ctx.clone(),
+            resource.clone(),
+            model.clone(),
+            Some(project.clone()),
+            Some(child.clone()),
+        )
+    };
+    assert!(disclosure().await.unwrap().contains(&DocClass::UserDoc));
+    let request = EmbeddingRequest::query(
+        CommandKey::from_bytes(random_bytes_16()),
+        model.clone(),
+        resource.clone(),
+        EmbeddingQueryInput {
+            text: "related search".into(),
+            tokens: 5,
+            classes: BTreeSet::from([DocClass::UserDoc]),
+            project_scope: Some(project.clone()),
+            folder: Some(child.clone()),
+        },
+    );
+    store
+        .move_folder(
+            ctx.clone(),
+            mutation(
+                ctx,
+                MoveFolder {
+                    folder: child.clone(),
+                    new_parent: Some(destination.folder_id),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let before = requests.load(Ordering::SeqCst);
+    assert!(matches!(
+        disclosure().await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+    assert!(matches!(
+        provider.embed(ctx.clone(), request).await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+    assert_eq!(requests.load(Ordering::SeqCst), before);
+}
+
+async fn session_user(control: &ControlService, token: &SecretString) -> EngineAuthContext {
+    control
+        .resolve(PreAuthContext {
+            budget: maintenance_ctx(ServicePurpose::Search).budget,
+            evidence: AuthEvidence::new(AuthEvidenceKind::Session, token.expose().to_owned())
+                .with_human_management(),
+        })
+        .await
+        .unwrap()
+}
+
 async fn exercise_provider_e2e(
     installation_id: InstallationId,
     store: CanonicalStore,
@@ -1041,26 +1174,108 @@ async fn exercise_provider_e2e(
         .await
         .unwrap();
     let owner_id = boot.account.id;
-    let space_id = boot.account.personal_space.unwrap();
     let session_token = boot.session.unwrap().token;
-    let auth = control
-        .resolve(PreAuthContext {
-            budget: budget(),
-            evidence: AuthEvidence::new(
-                AuthEvidenceKind::Session,
-                session_token.expose().to_owned(),
-            )
-            .with_human_management(),
-        })
+    let account_ctx = AccountContext::new(session_user(&control, &session_token).await, budget());
+    let author = control
+        .create_account(
+            account_ctx.clone(),
+            AccountMutation {
+                identity: account_command(&owner_id, boot.account.revision),
+                input: NewAccount {
+                    username: "contributor".into(),
+                    display_name: "Contributor".into(),
+                    email: None,
+                },
+            },
+        )
         .await
         .unwrap();
+    let space_id = SpaceId::from_bytes(random_bytes_16());
+    let shared = control
+        .create_space(
+            account_ctx.clone(),
+            AccountMutation {
+                identity: account_command(&owner_id, author.revision),
+                input: CreateSpace {
+                    id: space_id.clone(),
+                    kind: SpaceKind::Shared,
+                    name: "Search".into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let auth = session_user(&control, &session_token).await;
     let account_ctx = AccountContext::new(auth.clone(), budget());
-
+    let owner_space = SpaceContext::new(auth, shared.value.history.clone(), budget()).unwrap();
+    let membership = control
+        .change_membership(
+            owner_space.clone(),
+            MembershipChange {
+                command: CommandKey::from_bytes(random_bytes_16()),
+                member: author.value.id.clone(),
+                role: Some(SpaceRole::Editor),
+                expected: ControlRevision::ZERO,
+            },
+        )
+        .await
+        .unwrap();
+    let password = || SecretString::new("e2e contributor password".into());
+    control
+        .change_password(
+            account_ctx.clone(),
+            ChangePassword {
+                account: author.value.id.clone(),
+                expected: author.value.revision,
+                current: None,
+                replacement: password(),
+            },
+        )
+        .await
+        .unwrap();
+    let login = control
+        .login(
+            budget(),
+            PasswordLogin {
+                identifier: "contributor".into(),
+                password: password(),
+            },
+        )
+        .await
+        .unwrap();
+    let contributor = SpaceContext::new(
+        session_user(&control, &login.token).await,
+        shared.value.history,
+        budget(),
+    )
+    .unwrap();
+    let project = provider_fixture_folder(&store, &owner_space, None, "disclosed-project").await;
+    let (former_note, _) = create_note(
+        &store,
+        &contributor,
+        Some(&project.folder_id),
+        DocClass::UserDoc,
+        "former-author",
+        "Unique contribution by a former member.",
+    )
+    .await;
+    control
+        .change_membership(
+            owner_space.clone(),
+            MembershipChange {
+                command: CommandKey::from_bytes(random_bytes_16()),
+                member: author.value.id,
+                role: None,
+                expected: membership.revision,
+            },
+        )
+        .await
+        .unwrap();
     let res_commit = provider
         .create_resource(
             account_ctx.clone(),
             AccountMutation {
-                identity: account_command(&owner_id, boot.account.revision),
+                identity: account_command(&owner_id, shared.revision),
                 input: ProviderResourceSpec {
                     id: resource_id.clone(),
                     name: "Local Ollama E2E".into(),
@@ -1107,7 +1322,12 @@ async fn exercise_provider_e2e(
         .unwrap()
         .items
         .remove(0);
-    let attached = provider
+    let consent = || {
+        ProviderDisclosureConsent::attest_checked(ProviderDisclosure {
+            classes: BTreeSet::from([DocClass::UserDoc]),
+        })
+    };
+    let offer = provider
         .request_attachment(
             account_ctx.clone(),
             AccountMutation {
@@ -1118,13 +1338,46 @@ async fn exercise_provider_e2e(
                     resource: resource_id.clone(),
                     resource_consent_epoch: reviewed.consent_epoch,
                     credential_consent_epoch: None,
+                    target: ProviderAttachmentTarget::Project(project.clone()),
+                    consent: consent(),
+                    expires_at_ms: None,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let approval = provider
+        .approve_attachment(
+            account_ctx.clone(),
+            AccountMutation {
+                identity: account_command(&owner_id, offer.revision),
+                input: ApproveProviderAttachment {
+                    id: offer.value.id,
+                    expected: offer.value.revision,
+                    resource_consent_epoch: reviewed.consent_epoch,
+                    credential_consent_epoch: None,
+                    consent: consent(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let attached = provider
+        .request_attachment(
+            account_ctx.clone(),
+            AccountMutation {
+                identity: account_command(&owner_id, approval.revision),
+                input: RequestProviderAttachment {
+                    id: RequestId::from_bytes(random_bytes_16()),
+                    expected: None,
+                    resource: resource_id.clone(),
+                    resource_consent_epoch: reviewed.consent_epoch,
+                    credential_consent_epoch: None,
                     target: ProviderAttachmentTarget::Personal {
                         owner: owner_id.clone(),
                         space: space_id.clone(),
                     },
-                    consent: ProviderDisclosureConsent::attest_checked(ProviderDisclosure {
-                        classes: BTreeSet::from([DocClass::UserDoc]),
-                    }),
+                    consent: consent(),
                     expires_at_ms: None,
                 },
             },
@@ -1137,7 +1390,7 @@ async fn exercise_provider_e2e(
             AccountMutation {
                 identity: account_command(&owner_id, attached.revision),
                 input: SetProviderPreference {
-                    scope: ProviderPreferenceScope::Personal,
+                    scope: ProviderPreferenceScope::Project(project.clone()),
                     kind: PreferenceModelKind::Embedding,
                     resource: resource_id.clone(),
                     model: model_id.clone(),
@@ -1162,11 +1415,10 @@ async fn exercise_provider_e2e(
     assert_eq!(resolved.model, model_id);
     assert_eq!(resolved.dimension, 64);
 
-    let owner_space = SpaceContext::new(auth, space_record.scope.clone(), budget()).unwrap();
     let (note_id, note_receipt) = create_note(
         &store,
         &owner_space,
-        None,
+        Some(&project.folder_id),
         DocClass::UserDoc,
         "remote-e2e",
         "---\ntitle: Remote E2E\n---\nIndexed through real control provider service.\n",
@@ -1200,22 +1452,25 @@ async fn exercise_provider_e2e(
 
     // Semantic query without lexical overlap proves end-to-end vector indexing
     // and query embedding via ProviderService + ControlService.
+    let project_query = |text: &str| SearchQuery {
+        folder: Some(project.folder_id.clone()),
+        ..query(&space_record.scope, note_receipt.seq(), text)
+    };
     let found = search
-        .search(
-            owner_space,
-            query(
-                &space_record.scope,
-                note_receipt.seq(),
-                "unrelatedsemanticquery",
-            ),
-        )
+        .search(owner_space.clone(), project_query("unrelatedsemanticquery"))
         .await
         .unwrap();
     assert!(found.degraded.is_none());
     assert_eq!(ids(&found), [&note_id]);
     assert!(ollama_requests.load(Ordering::SeqCst) >= 2);
-
+    let lexical = search
+        .search(owner_space.clone(), project_query("contribution"))
+        .await
+        .unwrap();
+    assert!(ids(&lexical).contains(&&former_note));
     search.shutdown().await;
+    verify_moved_query_folder(&store, &provider, &owner_space, &resolved, &ollama_requests).await;
+
     projector.shutdown().await.unwrap();
     server_task.abort();
     control_store.close().await;

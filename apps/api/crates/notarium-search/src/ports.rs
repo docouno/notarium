@@ -91,6 +91,8 @@ pub trait SearchModelResolverPort: Send + Sync {
 
     /// Admit the owner of a Personal Space or the revision author in a
     /// Shared Space under current individual and Space/project disclosure.
+    /// Return `Ok(None)` if that actor is absent, disabled, no longer a member,
+    /// or lacks consent. Other eligible authors can still be indexed.
     fn acquire_remote_indexing_grant<'a>(
         &'a self,
         authority: &'a ServiceAuthority,

@@ -13,6 +13,24 @@ use notarium_core::{
     span::ByteSpan,
 };
 
+#[test]
+fn transient_open_failures_preserve_the_checkpoint() {
+    use std::io::{Error, ErrorKind};
+    let denied = || Error::from(ErrorKind::PermissionDenied);
+    for error in [
+        IndexError::from(LayoutError::Io(denied())),
+        IndexError::from(VectorError::Io(denied())),
+        IndexError::from(LexicalError::Tantivy(tantivy::TantivyError::IoError(
+            Arc::new(denied()),
+        ))),
+        IndexError::from(LexicalError::ReaderUnavailable),
+    ] {
+        assert!(!error.invalid_checkpoint());
+    }
+    assert!(IndexError::from(LayoutError::Corrupt).invalid_checkpoint());
+    assert!(IndexError::from(VectorError::CorruptIndex).invalid_checkpoint());
+}
+
 struct UnusedStructural;
 impl StructuralReadPort for UnusedStructural {
     fn acquire_snapshot(
@@ -229,6 +247,7 @@ async fn idle_reopen_during_replacement_backoff_restores_active_embedder() {
             _: ProviderResourceId,
             _: ModelProfileId,
             _: Option<FolderRef>,
+            _: Option<notarium_core::ids::FolderId>,
         ) -> PortFuture<'_, BTreeSet<DocClass>> {
             Box::pin(async { Ok(BTreeSet::from([DocClass::UserDoc])) })
         }
@@ -484,9 +503,9 @@ async fn lexical_checkpoint_is_available_while_the_native_model_is_loading() {
         .unwrap();
     let layout = Arc::new(SearchLayout::open(&root, scope.clone()).unwrap());
     let lexical = LexicalIndex::create(&layout.create_index_generation(1).unwrap()).unwrap();
-    layout
-        .persist_folder_dictionary(&FolderDictionary::default())
-        .unwrap();
+    let mut folders = FolderDictionary::default();
+    folders.insert(FolderId::from_bytes([4; 16])).unwrap();
+    layout.persist_folder_dictionary(&folders).unwrap();
     let model = ModelProfileId::from_bytes([6; 16]);
     let mut epoch = VectorEpoch::open(layout.clone(), model.clone(), 64).unwrap();
     epoch
@@ -513,7 +532,7 @@ async fn lexical_checkpoint_is_available_while_the_native_model_is_loading() {
     drop(lexical);
     let engine = SearchEngine::start(
         SearchConfig::new(
-            root,
+            root.clone(),
             VectorMode::DynamicOrt {
                 dylib_path: path.join("runtime"),
                 model_dir: path.join("models"),
@@ -521,6 +540,44 @@ async fn lexical_checkpoint_is_available_while_the_native_model_is_loading() {
         ),
         SearchDependencies::new(store.clone(), Arc::new(UnusedStructural)),
     );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let path = root
+            .search(
+                &scope.space_id,
+                notarium_core::epoch::SearchIndexKind::Tantivy,
+            )
+            .join("search_manifest.json");
+        let original = std::fs::metadata(&path).unwrap().permissions();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&path).is_err_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied) {
+            let handle = Arc::new(SpaceHandle::new());
+            let cx = Context {
+                services: &engine.services,
+                handle: &handle,
+            };
+            let result = open_disk(
+                &cx,
+                &mut Publisher { handle: &handle },
+                layout.clone(),
+                base,
+            )
+            .await;
+            assert!(matches!(
+                result,
+                Err(IndexError::Layout(LayoutError::Io(_)))
+            ));
+            assert_eq!(layout.index_generations().unwrap(), vec![1]);
+            assert!(
+                layout
+                    .epoch_manifest(&target.vector_model())
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        std::fs::set_permissions(path, original).unwrap();
+    }
     let loading = engine
         .services
         .models
@@ -544,6 +601,7 @@ async fn lexical_checkpoint_is_available_while_the_native_model_is_loading() {
         manifest.tantivy_commit
     );
     assert!(published.reopening_vectors);
+    let base_folders = published.folders.clone();
     drop(published);
     let (edit, _) = store
         .commit_synthetic_note_batch_for_test(
@@ -569,6 +627,7 @@ async fn lexical_checkpoint_is_available_while_the_native_model_is_loading() {
                 && state.seq == edit.last_seq
             {
                 assert!(state.embedder.is_none());
+                assert!(Arc::ptr_eq(&base_folders, &state.folders));
                 assert!(
                     state
                         .lexical
@@ -589,7 +648,7 @@ async fn lexical_checkpoint_is_available_while_the_native_model_is_loading() {
 }
 
 #[tokio::test]
-async fn arc_search_engine_shutdown_is_idempotent() {
+async fn absent_space_worker_exits_before_idempotent_shutdown() {
     use crate::{
         SearchDependencies, SearchEngine,
         config::{SearchConfig, VectorMode},
@@ -612,6 +671,19 @@ async fn arc_search_engine_shutdown_is_idempotent() {
         SearchConfig::new(root, VectorMode::Disabled),
         SearchDependencies::new(Arc::new(store), Arc::new(UnusedStructural)),
     ));
+    engine
+        .start_space(HistoryScope {
+            space_id: SpaceId::from_bytes([0x53; 16]),
+            incarnation: HistoryIncarnation::from_bytes([0x54; 16]),
+        })
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while engine.worker_count() != 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("a missing Space must release its worker");
     engine.shutdown().await;
     engine.shutdown().await;
     assert_eq!(engine.worker_count(), 0);
@@ -1169,6 +1241,7 @@ async fn purge_resync_acknowledges_before_model_refresh_preventing_lagged_livelo
             _: ProviderResourceId,
             _: ModelProfileId,
             _: Option<FolderRef>,
+            _: Option<notarium_core::ids::FolderId>,
         ) -> PortFuture<'_, BTreeSet<DocClass>> {
             Box::pin(async { Ok(BTreeSet::from([DocClass::UserDoc])) })
         }

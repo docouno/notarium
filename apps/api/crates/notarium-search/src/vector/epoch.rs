@@ -5,20 +5,24 @@ use super::{
     MutableOperation, QuantizedVector, SearchBudget, SegmentBuilder, Tombstones, VectorChunk,
     VectorError,
     format::class_number,
-    hnsw::{self, ExactNeighbor, Similarity},
+    hnsw::{ExactNeighbor, RankedChunks, Similarity},
     mmap_segment::SlotMask,
 };
-use crate::layout::{EpochManifest, SearchLayout, VectorModel, remove_path_if_exists, sync_dir};
+use crate::layout::{
+    EpochManifest, SearchLayout, SegmentRecovery, VectorModel, remove_path_if_exists, sync_dir,
+};
 use cap_std::{ambient_authority, fs::Dir};
 use croaring::Bitmap;
 use notarium_core::{
+    DomainError,
     classes::DocClass,
     ids::{ContentDigest, ModelProfileId, NoteId, SpaceSeq},
-    ports::Cancellation,
+    model::DenseNodeId,
+    ports::{Cancellation, StructuralSnapshot},
 };
 use std::{
     cmp::Ordering,
-    collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     sync::{
@@ -83,6 +87,18 @@ pub struct VectorFilter<'a> {
     pub folders: Option<&'a Bitmap>,
     pub notes: Option<&'a BTreeSet<NoteId>>,
     pub excluded: Option<&'a BTreeSet<NoteId>>,
+}
+
+/// Structural admission for one aligned search cut. Folder postings in the
+/// segment already cover folder-only queries. The dense posting also includes
+/// live structural visibility and any additional field predicate.
+pub struct ProjectedVectorFilter<'a> {
+    pub snapshot: &'a dyn StructuralSnapshot,
+    pub classes: &'a BTreeSet<DocClass>,
+    pub folders: Option<&'a Bitmap>,
+    pub nodes: Option<&'a Bitmap>,
+    pub field_filtered: bool,
+    pub excluded: &'a BTreeSet<NoteId>,
 }
 
 #[derive(Clone, Debug)]
@@ -256,6 +272,64 @@ impl VectorSnapshot {
         )
     }
 
+    pub fn search_projected(
+        &self,
+        query: &QuantizedVector,
+        filter: ProjectedVectorFilter<'_>,
+        limit: usize,
+        budget: SearchBudget<'_>,
+    ) -> Result<VectorResults, VectorError> {
+        let snapshot = filter.snapshot;
+        let generation = snapshot.cut().generation;
+        // Materialize an explicit field constraint even when the field alone
+        // is broad: its intersection with a segment's classes can be tiny.
+        let mut field_notes = None;
+        if filter.field_filtered
+            && let Some(nodes) = filter.nodes
+        {
+            let mut ids = BTreeSet::new();
+            for (position, index) in nodes.iter().enumerate() {
+                if position.is_multiple_of(64) {
+                    budget.check()?;
+                }
+                let node = DenseNodeId::new(generation, index);
+                match snapshot.doc_class(node) {
+                    Ok(class) if filter.classes.contains(&class) => {}
+                    Ok(_) | Err(DomainError::ResourceNotFound) => continue,
+                    Err(error) => return Err(error.into()),
+                }
+                match snapshot.note_id(node) {
+                    Ok(note) => {
+                        ids.insert(note);
+                    }
+                    Err(DomainError::ResourceNotFound) => continue,
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            field_notes = Some(ids);
+        }
+        let mask = VectorFilter {
+            classes: filter.classes,
+            folders: filter.folders,
+            notes: field_notes.as_ref(),
+            excluded: Some(filter.excluded),
+        };
+        self.search_visible(query, &mask, limit, budget, |note| {
+            let node = match snapshot.lookup(note) {
+                Ok(Some(node)) => node,
+                Ok(None) | Err(DomainError::ResourceNotFound) => return Ok(false),
+                Err(error) => return Err(error.into()),
+            };
+            let index = node.index(generation)?;
+            match snapshot.doc_class(node) {
+                Ok(class) => Ok(filter.classes.contains(&class)
+                    && filter.nodes.is_none_or(|nodes| nodes.contains(index))),
+                Err(DomainError::ResourceNotFound) => Ok(false),
+                Err(error) => Err(error.into()),
+            }
+        })
+    }
+
     /// Apply snapshot visibility before admitting a candidate into the result heap.
     pub fn search_visible(
         &self,
@@ -317,6 +391,9 @@ impl VectorSnapshot {
                 active.push((segment, allowed));
             }
         }
+        // The segment collector already returns the sorted union of its best
+        // chunks and note representatives. Only independent sources need merging.
+        let single_source = hits.is_empty() && active.len() == 1;
         let active_segments = active.len().max(1);
         for (segment, allowed) in active {
             budget.check()?;
@@ -361,6 +438,10 @@ impl VectorSnapshot {
                 });
             }
         }
+        if single_source {
+            budget.check()?;
+            return Ok(VectorResults { hits, hnsw_hops });
+        }
         hits.sort_unstable_by(|left, right| {
             right
                 .score
@@ -378,7 +459,13 @@ impl VectorSnapshot {
                         .cmp(right.metadata.key.as_bytes())
                 })
         });
-        hits.truncate(limit);
+        let mut notes = HashSet::new();
+        let mut rank = 0;
+        hits.retain(|hit| {
+            rank += 1;
+            let representative = notes.len() < limit && notes.insert(hit.metadata.note.clone());
+            rank <= limit || representative
+        });
         budget.check()?;
         Ok(VectorResults { hits, hnsw_hops })
     }
@@ -500,7 +587,7 @@ impl VectorSnapshot {
     ) -> Result<(), VectorError> {
         let scorer = Similarity::new(query.values(), query.scale())?;
         let mut eligible = Vec::new();
-        let mut best = BinaryHeap::<std::cmp::Reverse<ExactNeighbor<'_>>>::with_capacity(limit);
+        let mut best = RankedChunks::new(limit);
         for (position, (note, chunks)) in self.mutable.iter().enumerate() {
             if position.is_multiple_of(128) {
                 budget.check()?;
@@ -531,7 +618,7 @@ impl VectorSnapshot {
                     span: meta.spans[0].start(),
                     key: meta.key.as_bytes(),
                 };
-                if best.len() == limit && best.peek().is_some_and(|worst| candidate <= worst.0) {
+                if !best.admits_score(candidate.hit.score) {
                     continue;
                 }
                 if !checked_visibility {
@@ -543,11 +630,10 @@ impl VectorSnapshot {
                     checked_visibility = true;
                 }
                 eligible.push(chunk);
-                hnsw::keep_best(&mut best, candidate, limit);
+                best.insert(candidate);
             }
         }
-        for neighbor in hnsw::finish(best) {
-            let hit = neighbor.hit;
+        for hit in best.finish() {
             let metadata = eligible[hit.slot as usize].metadata.clone();
             hits.push(VectorHit {
                 metadata,
@@ -608,7 +694,7 @@ impl VectorEpoch {
     ) -> Result<Self, VectorError> {
         let dimension = model.dimension as usize;
         let path = layout.model_epoch(&model)?;
-        let manifest = layout
+        let mut manifest = layout
             .epoch_manifest(&model)?
             .unwrap_or_else(|| EpochManifest {
                 scope: layout.scope().clone(),
@@ -616,6 +702,7 @@ impl VectorEpoch {
                 vector_seq: SpaceSeq::ZERO,
                 active_segments: Vec::new(),
                 complete_backfill: false,
+                recovery: SegmentRecovery::Stable,
             });
         let mutable = MutableBuffer::open(&path, dimension)?;
         let mut segments = Vec::with_capacity(manifest.active_segments.len());
@@ -632,7 +719,25 @@ impl VectorEpoch {
                 superseded: Bitmap::new(),
             });
         }
-        reconcile_superseded_tombstones(&path, &mut segments)?;
+        match &manifest.recovery {
+            SegmentRecovery::Legacy => reconcile_superseded_tombstones(&path, &mut segments)?,
+            SegmentRecovery::Retire {
+                note,
+                through_segment,
+            } => {
+                persist_replaced_note(&path, &mut segments, note, *through_segment)?;
+            }
+            SegmentRecovery::Stable => {}
+        }
+        // A legacy producer could put an entire oversized note in one segment.
+        // Have the indexer rebuild that derived checkpoint in bounded pieces.
+        if segments
+            .iter()
+            .any(|segment| segment.live_build_bytes() > MAX_SEGMENT_BUILD_BYTES)
+        {
+            return Err(VectorError::CorruptIndex);
+        }
+        manifest.recovery = SegmentRecovery::Stable;
         for segment in &mut segments {
             segment.rebuild_superseded(&mutable);
         }
@@ -758,36 +863,24 @@ impl VectorEpoch {
         }
         // Flush existing L0 and apply in bounded sub-batches that fit L0 limits.
         self.flush()?;
-        let mut current = Vec::new();
-        for operation in batch {
-            current.push(operation);
-            if matches!(
-                self.mutable
-                    .admit_batch_with_delete_headroom(seq, &current, false),
-                Err(VectorError::BufferFull)
-            ) {
-                let overflow = current.pop().expect("non-empty sub-batch");
-                if !current.is_empty() {
-                    let sub = std::mem::take(&mut current);
-                    let notes: Vec<NoteId> = sub.iter().map(|op| op.note().clone()).collect();
-                    self.mutable.apply_batch(seq, sub)?;
-                    for note in &notes {
-                        for segment in &mut self.segments {
-                            segment.mark_superseded_note(note);
-                        }
-                    }
-                    self.flush()?;
-                }
-                current.push(overflow);
+        let mut remaining = batch.into_iter();
+        while !remaining.as_slice().is_empty() {
+            let count = self
+                .mutable
+                .admissible_prefix(seq, remaining.as_slice(), false)?;
+            if count == 0 {
+                return Err(VectorError::BufferFull);
             }
-        }
-        if !current.is_empty() {
-            let notes: Vec<NoteId> = current.iter().map(|op| op.note().clone()).collect();
-            self.mutable.apply_batch(seq, current)?;
+            let sub: Vec<_> = remaining.by_ref().take(count).collect();
+            let notes: Vec<_> = sub.iter().map(|op| op.note().clone()).collect();
+            self.mutable.apply_batch(seq, sub)?;
             for note in &notes {
                 for segment in &mut self.segments {
                     segment.mark_superseded_note(note);
                 }
+            }
+            if !remaining.as_slice().is_empty() {
+                self.flush()?;
             }
         }
         Ok(())
@@ -799,6 +892,16 @@ impl VectorEpoch {
         note: NoteId,
         chunks: Vec<VectorChunk>,
     ) -> Result<(), VectorError> {
+        self.replace_large_note(seq, note, chunks, MAX_SEGMENT_BUILD_BYTES)
+    }
+
+    pub(super) fn replace_large_note(
+        &mut self,
+        seq: SpaceSeq,
+        note: NoteId,
+        chunks: Vec<VectorChunk>,
+        segment_budget: usize,
+    ) -> Result<(), VectorError> {
         if chunks.is_empty() {
             return Err(VectorError::InvalidChunk);
         }
@@ -809,15 +912,47 @@ impl VectorEpoch {
             chunk.validate(self.manifest.model.dimension as usize)?;
         }
         self.flush()?;
-        // Keep all chunks of a single note inside one sealed segment so reopen
-        // supersession reconciliation (`seg_new.id > seg_old.id`) never
-        // tombstones an earlier slice of the same note.
+        let mut segments = self.segments.clone();
+        let previous = segments.last().map(|segment| segment.id);
         let mut builder = SegmentBuilder::for_compaction(&self.manifest.model)?;
         for chunk in chunks {
+            if builder.full_for_next_row(segment_budget) {
+                if builder.is_empty() {
+                    return Err(VectorError::BufferFull);
+                }
+                segments.extend(self.seal(builder)?);
+                builder = SegmentBuilder::for_compaction(&self.manifest.model)?;
+            }
             builder.push(chunk)?;
         }
-        let added = self.seal(builder)?;
-        self.append_replacement_segment(added, seq, &[note])
+        segments.extend(self.seal(builder)?);
+
+        // The manifest publishes all pieces at once. Before the rename the old
+        // revision is intact. After it, recovery retires only prior segments.
+        let recovery = previous.map_or(SegmentRecovery::Stable, |through_segment| {
+            SegmentRecovery::Retire {
+                note: note.clone(),
+                through_segment,
+            }
+        });
+        if let Some(through) = previous {
+            for segment in segments
+                .iter_mut()
+                .take_while(|segment| segment.id <= through)
+            {
+                if let Some(slots) = segment.data.note_slots(&note) {
+                    for slot in slots {
+                        segment.tombstones.mark(slot);
+                    }
+                }
+            }
+        }
+        self.publish_with_recovery(segments, seq, self.manifest.complete_backfill, recovery)?;
+        if let Some(through) = previous {
+            persist_replaced_note(&self.path, &mut self.segments, &note, through)?;
+            self.manifest.recovery = SegmentRecovery::Stable;
+        }
+        Ok(())
     }
 
     pub fn should_flush(&self, now: Instant) -> bool {
@@ -966,47 +1101,6 @@ impl VectorEpoch {
         self.commit_flush_l0(plan, replacement, &HashSet::new())
     }
 
-    fn append_replacement_segment(
-        &mut self,
-        added: Option<Segment>,
-        seq: SpaceSeq,
-        replaced: &[NoteId],
-    ) -> Result<(), VectorError> {
-        let mut segments = self.segments.clone();
-        let mut dirty = Vec::new();
-        for (index, segment) in segments.iter_mut().enumerate() {
-            let before = segment.tombstones.bitmap().cardinality();
-            for note in replaced {
-                if let Some(slots) = segment.data.note_slots(note) {
-                    for slot in slots {
-                        segment.tombstones.mark(slot);
-                    }
-                }
-            }
-            if segment.tombstones.bitmap().cardinality() != before {
-                dirty.push(index);
-            }
-        }
-        if let Some(segment) = added {
-            segments.push(segment);
-            segments.sort_unstable_by_key(|segment| segment.id);
-        }
-        self.publish(segments, seq, self.manifest.complete_backfill)?;
-        // Direct large upserts have no WAL backing; publish the replacement segment
-        // first so a pre-publish crash leaves prior tombstones intact, and reopen
-        // reconciles any post-publish crash before these tombstones reach disk.
-        for index in dirty {
-            let segment = &self.segments[index];
-            segment
-                .tombstones
-                .persist(&tombstone_path(&self.path, segment.id))?;
-        }
-        for segment in &mut self.segments {
-            segment.rebuild_superseded(&self.mutable);
-        }
-        Ok(())
-    }
-
     pub fn seed(&mut self, builder: SegmentBuilder, seq: SpaceSeq) -> Result<(), VectorError> {
         if seq < self.manifest.vector_seq || !self.segments.is_empty() || !self.mutable.is_empty() {
             return Err(VectorError::CorruptIndex);
@@ -1016,7 +1110,7 @@ impl VectorEpoch {
     }
 
     /// Publish pre-sealed bounded segments produced during a multi-segment backfill.
-    /// Callers must cut segments on note boundaries so no note spans two segments.
+    /// All staged segments are parts of the same pinned revision set.
     pub fn seed_segments(
         &mut self,
         staged: Vec<(u64, MmapSegment)>,
@@ -1325,10 +1419,30 @@ impl VectorEpoch {
         seq: SpaceSeq,
         complete: bool,
     ) -> Result<(), VectorError> {
+        self.publish_with_recovery(segments, seq, complete, SegmentRecovery::Stable)
+    }
+
+    fn publish_with_recovery(
+        &mut self,
+        mut segments: Vec<Segment>,
+        seq: SpaceSeq,
+        complete: bool,
+        recovery: SegmentRecovery,
+    ) -> Result<(), VectorError> {
+        // A previous direct upsert can have published its manifest but failed
+        // while syncing tombstones. Finish it before replacing its recovery record.
+        if let SegmentRecovery::Retire {
+            note,
+            through_segment,
+        } = &self.manifest.recovery
+        {
+            persist_replaced_note(&self.path, &mut segments, note, *through_segment)?;
+        }
         let manifest = EpochManifest {
             active_segments: segments.iter().map(|segment| segment.id).collect(),
             vector_seq: self.manifest.vector_seq.max(seq),
             complete_backfill: complete,
+            recovery,
             ..self.manifest.clone()
         };
         self.layout.publish_epoch(&manifest)?;
@@ -1336,6 +1450,28 @@ impl VectorEpoch {
         self.segments = segments;
         Ok(())
     }
+}
+
+fn persist_replaced_note(
+    path: &Path,
+    segments: &mut [Segment],
+    note: &NoteId,
+    through: u64,
+) -> Result<(), VectorError> {
+    for segment in segments
+        .iter_mut()
+        .take_while(|segment| segment.id <= through)
+    {
+        if let Some(slots) = segment.data.note_slots(note) {
+            for slot in slots {
+                segment.tombstones.mark(slot);
+            }
+            segment
+                .tombstones
+                .persist(&tombstone_path(path, segment.id))?;
+        }
+    }
+    Ok(())
 }
 
 fn segment_note_has_live_slots(segment: &Segment, note_ord: u32) -> Result<bool, VectorError> {

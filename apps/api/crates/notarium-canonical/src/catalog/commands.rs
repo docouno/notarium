@@ -88,6 +88,7 @@ async fn execute(
                     .broadcast_hub
                     .publish(crate::changes::BroadcastSignal::CatalogChanged {
                         scope: result.history.clone(),
+                        lifecycle: result.space.lifecycle,
                     });
                 Ok(result)
             },

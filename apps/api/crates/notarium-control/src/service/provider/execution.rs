@@ -220,6 +220,16 @@ impl Job {
         Ok(ProviderEgressRequest {
             origins: origins.into_values().collect(),
             project: self.project().cloned(),
+            project_folders: self
+                .embedding_inputs()
+                .iter()
+                .filter_map(|input| match input {
+                    EmbeddingInput::Query(query) if query.project_scope.is_some() => {
+                        query.folder.clone()
+                    }
+                    _ => None,
+                })
+                .collect(),
         })
     }
     pub fn encode(&self, snapshot: &Snapshot) -> Result<Vec<u8>, PortError> {

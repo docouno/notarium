@@ -9,7 +9,7 @@ use crate::{
     lexical::{LexicalError, LexicalFilter, LexicalHit, LexicalIndex, OverlayHits, Update},
     model::Embedder,
     ports::{EmbeddingBackendTarget, ResolvedEmbeddingTarget},
-    vector::{EXACT_SCAN_LIMIT, SearchBudget, VectorFilter, VectorHit},
+    vector::{ProjectedVectorFilter, SearchBudget, VectorHit, search_candidate_limit},
 };
 use croaring::Bitmap;
 use notarium_core::{
@@ -25,8 +25,6 @@ use notarium_core::{
     query::Predicate,
 };
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
-
-const MAX_OVERLAY_FALLBACK_FLOOR: usize = 10;
 
 #[derive(Clone, Copy)]
 struct Recall {
@@ -111,7 +109,7 @@ impl SearchEngine {
         let aligned = self.align(&ctx, &request.causal, handle, clock).await?;
         let snapshot = aligned.snapshot;
         let state = aligned.state;
-        let chat_space = if request.include_chats && recall.is_none() && !browse {
+        let chat_record = if request.include_chats && recall.is_none() && !browse {
             let record = self
                 .services
                 .deps
@@ -119,7 +117,7 @@ impl SearchEngine {
                 .read_space(&ctx.scope().space_id)
                 .await?;
             ctx.check_current(&record.scope)?;
-            Some(record.space)
+            Some(record)
         } else {
             None
         };
@@ -129,25 +127,42 @@ impl SearchEngine {
                 &request,
                 snapshot.as_ref(),
                 state.as_deref(),
-                chat_space.as_ref(),
+                chat_record.as_ref().map(|record| &record.space),
             )
             .await?,
         );
         let top_k = usize::from(request.top_k.get());
-        let candidate_k = (top_k * 4).max(100);
+        let candidate_k = search_candidate_limit(top_k);
         let excluded: Arc<BTreeSet<_>> = Arc::new(aligned.overlay.keys().cloned().collect());
 
-        let lexical = lexical_candidates(
-            clock,
-            snapshot.clone(),
-            state.clone(),
-            filter.clone(),
-            excluded.clone(),
-            request.text.clone(),
-            candidate_k,
-            top_k,
-            filtered,
-        );
+        let lexical = async {
+            let overlay =
+                rank_overlay(self, clock, &request, &aligned.overlay, &filter, filtered).await?;
+            let floor = top_k.min(crate::lexical::MAX_FALLBACK_FLOOR);
+            // The base and receipt revisions are disjoint. Count admitted strict
+            // receipt matches before asking the base to relax its quorum.
+            let base = lexical_candidates(
+                clock,
+                snapshot.clone(),
+                state.clone(),
+                filter.clone(),
+                excluded.clone(),
+                request.text.clone(),
+                candidate_k,
+                floor.saturating_sub(overlay.strict.len()),
+                filtered,
+            )
+            .await?;
+            let mut ranked = overlay.strict;
+            ranked.extend(base);
+            if browse {
+                ranked.sort_by(|left, right| note_key(left).cmp(&note_key(right)));
+            } else {
+                let missing = floor.saturating_sub(ranked.len());
+                ranked.extend(overlay.fallback.into_iter().take(missing));
+            }
+            Ok::<_, PortError>(ranked)
+        };
         let vectors = self.vector_candidates(VectorRequest {
             ctx: &ctx,
             query: &request,
@@ -156,37 +171,11 @@ impl SearchEngine {
             snapshot: snapshot.clone(),
             state: state.clone(),
             handle,
-            excluded,
+            excluded: excluded.clone(),
             limit: candidate_k,
             browse,
         });
-        let (mut notes, vectors) = tokio::try_join!(lexical, vectors)?;
-        let overlay =
-            rank_overlay(self, clock, &request, &aligned.overlay, &filter, filtered).await?;
-        if browse {
-            notes.extend(overlay.strict);
-            notes.sort_by(|left, right| note_key(left).cmp(&note_key(right)));
-        } else {
-            // Receipt-bound strict hits lead the lexical stream. Fallback 1-term
-            // overlay hits only fill behind strict matches below the floor.
-            let mut fresh = overlay.strict;
-            fresh.extend(notes);
-            let fallback_floor = top_k.min(MAX_OVERLAY_FALLBACK_FLOOR);
-            if fresh.len() < fallback_floor && !overlay.fallback.is_empty() {
-                let mut seen: BTreeSet<NoteId> = fresh
-                    .iter()
-                    .filter_map(|hit| note_key(hit).cloned())
-                    .collect();
-                for hit in overlay.fallback {
-                    if let Some(note) = note_key(&hit)
-                        && seen.insert(note.clone())
-                    {
-                        fresh.push(hit);
-                    }
-                }
-            }
-            notes = fresh;
-        }
+        let (notes, vectors) = tokio::try_join!(lexical, vectors)?;
 
         let mut candidates = ranking::fuse(notes, vectors.hits, browse);
         if let Some(recall) = recall.filter(|recall| recall.graph_depth != 0) {
@@ -222,7 +211,7 @@ impl SearchEngine {
                 recall,
             })
             .await?;
-        let (chat_hits, chat_truncated) = if let Some(state) =
+        let (mut chat_hits, chat_truncated) = if let Some(state) =
             state.filter(|_| recall.is_none() && request.include_chats && !browse)
         {
             if hits.is_empty() {
@@ -260,8 +249,16 @@ impl SearchEngine {
         } else {
             (Vec::new(), false)
         };
-        // Chat hydration can yield while canonical access to a selected note changes.
-        let (hits, packing_truncated) = self.finish_note_hits(&ctx, clock, hits, recall).await?;
+        let (hits, packing_truncated) = self
+            .finish_hits(
+                &ctx,
+                clock,
+                hits,
+                recall,
+                &mut chat_hits,
+                chat_record.map(|record| record.last_seq),
+            )
+            .await?;
         Ok(SearchResult {
             hits,
             chat_hits,
@@ -273,33 +270,26 @@ impl SearchEngine {
 
     async fn vector_candidates(
         &self,
-        input: VectorRequest<'_>,
+        mut input: VectorRequest<'_>,
     ) -> Result<VectorCandidates, PortError> {
-        let VectorRequest {
-            ctx,
-            query,
-            clock,
-            filter,
-            snapshot,
-            state,
-            handle,
-            excluded,
-            limit,
-            browse,
-        } = input;
-        if browse
-            || filter.classes.is_empty()
-            || filter.folders.as_ref().is_some_and(BTreeSet::is_empty)
+        if input.browse
+            || input.filter.classes.is_empty()
+            || input
+                .filter
+                .folders
+                .as_ref()
+                .is_some_and(BTreeSet::is_empty)
             || matches!(self.services.config.vector_mode, VectorMode::Disabled)
         {
             return Ok(VectorCandidates::default());
         }
-        let Some(state) = state else {
+        let Some(state) = input.state.take() else {
             return Ok(VectorCandidates::degraded(
                 SearchDegradation::EmbeddingsPending,
             ));
         };
-        let remaining = clock.remaining()?.remaining;
+        let request_clock = input.clock;
+        let remaining = request_clock.remaining()?.remaining;
         let needs_embedder_reload = state.vectors.is_some()
             && state.embedder.is_none()
             && state.active_model.is_some()
@@ -312,8 +302,45 @@ impl SearchEngine {
         } else {
             remaining
         };
-        let max = max.min(self.services.config.interactive_budget());
-        let (state, embedder, vector) = match tokio::time::timeout(max, async {
+        let clock = request_clock.limited(max.min(self.services.config.interactive_budget()));
+        let work = self.search_vector_index(
+            VectorRequest {
+                clock: &clock,
+                ..input
+            },
+            state,
+            needs_embedder_reload,
+        );
+        match clock.within(work).await {
+            Err(PortError::DeadlineExceeded(_)) => {
+                request_clock.remaining()?;
+                Ok(VectorCandidates::degraded(
+                    SearchDegradation::BudgetExceeded,
+                ))
+            }
+            result => result,
+        }
+    }
+
+    async fn search_vector_index(
+        &self,
+        input: VectorRequest<'_>,
+        state: Arc<Published>,
+        needs_embedder_reload: bool,
+    ) -> Result<VectorCandidates, PortError> {
+        let VectorRequest {
+            ctx,
+            query,
+            clock,
+            filter,
+            snapshot,
+            handle,
+            excluded,
+            limit,
+            ..
+        } = input;
+        let waiting_for_vectors = state.reopening_vectors || needs_embedder_reload;
+        let (state, embedder, vector) = match async {
             let state = if waiting_for_vectors {
                 let mut updated = handle.epoch.subscribe();
                 if needs_embedder_reload {
@@ -351,10 +378,9 @@ impl SearchEngine {
             } else {
                 state
             };
-            let mut resolve_budget = clock
+            let resolve_budget = clock
                 .remaining()
                 .map_err(|_| EmbeddingError::BudgetExceeded)?;
-            resolve_budget.remaining = resolve_budget.remaining.min(max);
             let requested = self
                 .services
                 .model_target(ctx.scope(), query.model.as_ref(), &resolve_budget)
@@ -412,7 +438,6 @@ impl SearchEngine {
                 handle.wake.notify_one();
                 return Err(EmbeddingError::ModelUnavailable);
             };
-            let input = query.text.clone();
             let mut context = ctx.clone();
             context.budget = clock
                 .remaining()
@@ -421,50 +446,37 @@ impl SearchEngine {
                 .query(
                     &self.services,
                     context,
-                    input,
+                    query,
                     filter.classes.clone(),
                     filter.project.clone(),
+                    &requested,
                 )
                 .await?;
             Ok::<_, EmbeddingError>(Some((state, embedder, embedding)))
-        })
+        }
         .await
         {
-            Ok(Ok(Some(ready))) => ready,
-            Ok(Ok(None)) => {
+            Ok(Some(ready)) => ready,
+            Ok(None) => {
                 return Ok(VectorCandidates::degraded(
                     SearchDegradation::EmbeddingsPending,
                 ));
             }
-            Ok(Err(error)) => return Ok(VectorCandidates::degraded(error.degradation())),
-            Err(_) => {
-                return Ok(VectorCandidates::degraded(
-                    SearchDegradation::BudgetExceeded,
-                ));
+            Err(error) => {
+                if matches!(error, EmbeddingError::TargetChanged) {
+                    handle.wake.notify_one();
+                }
+                return Ok(VectorCandidates::degraded(error.degradation()));
             }
         };
         let pending = state
             .embeddings_pending
             .then_some(SearchDegradation::EmbeddingsPending);
-        let vector_notes = match &filter.nodes {
-            Some(nodes) if nodes.cardinality() <= EXACT_SCAN_LIMIT => Some(Arc::new(
-                retry_snapshot(snapshot.as_ref(), clock, || {
-                    let mut ids = BTreeSet::new();
-                    for index in nodes.iter() {
-                        match snapshot.note_id(DenseNodeId::new(filter.cut.generation, index)) {
-                            Ok(id) => {
-                                ids.insert(id);
-                            }
-                            Err(DomainError::ResourceNotFound) => continue,
-                            Err(error) => return Err(error),
-                        }
-                    }
-                    Ok(ids)
-                })
-                .await?,
-            )),
-            _ => None,
-        };
+        // Folder ordinals already identify the subtree in each sealed segment.
+        // An additional field predicate needs its exact note posting before the
+        // segment chooses between a scan and a graph walk.
+        let has_field_predicate =
+            !matches!(&query.filter.predicate, Predicate::All(terms) if terms.is_empty());
         let vectors = loop {
             clock.remaining()?;
             let snapshot_attempt = snapshot.clone();
@@ -472,31 +484,24 @@ impl SearchEngine {
             let excluded_attempt = excluded.clone();
             let state_attempt = state.clone();
             let vector_attempt = vector.clone();
-            let notes_attempt = vector_notes.clone();
             let result = blocking_search(clock, "vector_search_worker", move |budget| {
-                let visible = |note: &NoteId| -> Result<bool, crate::vector::VectorError> {
-                    let node = match snapshot_attempt.lookup(note) {
-                        Ok(Some(node)) => node,
-                        Ok(None) | Err(DomainError::ResourceNotFound) => return Ok(false),
-                        Err(error) => return Err(error.into()),
-                    };
-                    match filter_attempt.node_allowed(snapshot_attempt.as_ref(), node) {
-                        Ok(allowed) => Ok(allowed),
-                        Err(DomainError::ResourceNotFound) => Ok(false),
-                        Err(error) => Err(error.into()),
-                    }
-                };
-                let mask = VectorFilter {
-                    classes: &filter_attempt.classes,
-                    folders: filter_attempt.ordinals.as_deref(),
-                    notes: notes_attempt.as_deref(),
-                    excluded: Some(&excluded_attempt),
-                };
                 let index = state_attempt
                     .vectors
                     .as_ref()
                     .ok_or(crate::vector::VectorError::CorruptIndex)?;
-                index.search_visible(&vector_attempt, &mask, limit, budget, visible)
+                index.search_projected(
+                    &vector_attempt,
+                    ProjectedVectorFilter {
+                        snapshot: snapshot_attempt.as_ref(),
+                        classes: &filter_attempt.classes,
+                        folders: filter_attempt.ordinals.as_deref(),
+                        nodes: filter_attempt.nodes.as_ref(),
+                        field_filtered: has_field_predicate,
+                        excluded: &excluded_attempt,
+                    },
+                    limit,
+                    budget,
+                )
             })
             .await?;
             match result {

@@ -1,5 +1,7 @@
 //! Offline release gate for the search index and retrieval kernels.
 
+#![recursion_limit = "256"]
+
 #[path = "search_scale/priority.rs"]
 mod priority;
 #[path = "search_scale/support.rs"]
@@ -22,8 +24,9 @@ use notarium_search::{
     },
     ports::{EmbeddingBackendTarget, ResolvedEmbeddingTarget},
     vector::{
-        ChunkMetadata, EXACT_SCAN_LIMIT, MutableOperation, QuantizedVector, SearchBudget,
-        SegmentBuilder, VectorChunk, VectorEpoch, VectorFilter, VectorHit, segment_file_path,
+        ChunkMetadata, EXACT_SCAN_LIMIT, MutableOperation, ProjectedVectorFilter, QuantizedVector,
+        SearchBudget, SegmentBuilder, VectorChunk, VectorEpoch, VectorFilter, VectorHit,
+        search_candidate_limit, segment_file_path,
         simd::{Kernel, dot_i8_scalar},
     },
 };
@@ -44,7 +47,7 @@ const TOPICS: u32 = 1_024;
 const SAMPLES: u32 = 48;
 const PAGE: u32 = 1_000;
 const TOP_K: usize = 20;
-const CANDIDATES: usize = 100;
+const CANDIDATES: usize = search_candidate_limit(TOP_K);
 const DISK_LIMIT: u64 = 400 * 1024 * 1024;
 const REOPEN_ANON_RSS_LIMIT_KIB: u64 = 512 * 1024;
 
@@ -77,7 +80,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let build_ms = started.elapsed().as_millis();
     let memory_after_build = ProcessMemory::sample();
     let samples = if smoke { 8 } else { SAMPLES };
-    let metrics = run_samples(&fixture, &index, &epoch, samples, selective_slots)?;
+    let metrics = run_samples(&fixture, &index, &epoch, samples, selective_slots).await?;
     drop((epoch, index));
 
     let (reopen_ms, memory_after_reopen) = measure_warm_reopen(&fixture)?;
@@ -135,6 +138,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "lexical_ms": metrics.lexical.report(),
         "hybrid_ms": metrics.hybrid.report(),
         "selective_ms": metrics.selective.report(),
+        "selective_planning_ms": metrics.selective_planning.report(),
+        "selective_kernel_ms": metrics.selective_kernel.report(),
+        "vector_note_candidates": CANDIDATES,
         "selective_chunks": selective_slots,
         "broad_lexical_ms": metrics.broad_lexical_ms,
         "broad_lexical_lookups": metrics.broad_lexical_lookups,
@@ -235,18 +241,17 @@ fn build(
                 vector: embedding(ordinal, part as u32)?,
             })?;
             total_chunks += 1;
-        }
-        // Cut segments strictly on note boundaries once the build RAM budget is reached.
-        if builder.at_budget() || ordinal + 1 == count {
-            let finished = std::mem::replace(
-                &mut builder,
-                SegmentBuilder::new(&fixture.model, DIMENSION)?,
-            );
-            if let Some(segment) =
-                finished.finish(&segment_file_path(&epoch_dir, next_segment_id))?
-            {
-                staged_segments.push((next_segment_id, segment));
-                next_segment_id += 1;
+            if builder.at_budget() || (ordinal + 1 == count && part + 1 == CHUNKS as usize) {
+                let finished = std::mem::replace(
+                    &mut builder,
+                    SegmentBuilder::new(&fixture.model, DIMENSION)?,
+                );
+                if let Some(segment) =
+                    finished.finish(&segment_file_path(&epoch_dir, next_segment_id))?
+                {
+                    staged_segments.push((next_segment_id, segment));
+                    next_segment_id += 1;
+                }
             }
         }
         staged.push((content, title, ordinal_folder));
@@ -458,7 +463,7 @@ fn chunk_line(note: u32, part: u32) -> String {
 fn exact_selective(
     query: &QuantizedVector,
     selective_slots: u32,
-) -> Result<Vec<ContentDigest>, Box<dyn Error>> {
+) -> Result<Vec<u32>, Box<dyn Error>> {
     let mut reference = Vec::with_capacity(selective_slots as usize);
     for slot in 0..selective_slots {
         let vector = embedding(slot / CHUNKS, slot % CHUNKS)?;
@@ -472,14 +477,7 @@ fn exact_selective(
             .total_cmp(&left.1)
             .then_with(|| left.0.cmp(&right.0))
     });
-    Ok(reference
-        .into_iter()
-        .take(10)
-        .map(|(slot, _)| {
-            let text = chunk_line(slot / CHUNKS, slot % CHUNKS);
-            ContentDigest::from_bytes(*blake3::hash(text.as_bytes()).as_bytes())
-        })
-        .collect())
+    Ok(reference.into_iter().map(|(slot, _)| slot).collect())
 }
 
 fn exact_selective_f32(query: &[f32; DIMENSION], selective_slots: u32) -> Vec<ContentDigest> {
@@ -518,7 +516,7 @@ fn next(state: &mut u64) -> u64 {
     state.wrapping_mul(0x2545_f491_4f6c_dd1d)
 }
 
-fn run_samples(
+async fn run_samples(
     fixture: &Fixture,
     index: &LexicalIndex,
     epoch: &VectorEpoch,
@@ -534,21 +532,11 @@ fn run_samples(
         notes: None,
         excluded: None,
     };
-    let mut behind = Bitmap::new();
-    behind.add(2);
-    let folder = VectorFilter {
-        classes: &class,
-        folders: Some(&behind),
-        notes: None,
-        excluded: None,
-    };
+    let dictionary = SearchLayout::open(&fixture.root, view.cut.scope.clone())?
+        .folder_dictionary()?
+        .ok_or("missing folder dictionary")?;
+    let excluded = BTreeSet::new();
     let snapshot = epoch.snapshot();
-    let visible = |id: &NoteId| -> Result<bool, notarium_search::vector::VectorError> {
-        Ok(view.lookup(id)?.is_some_and(|node| {
-            view.doc_class(node)
-                .is_ok_and(|value| class.contains(&value))
-        }))
-    };
     let cancellation = Cancellation::default();
     let budget = || SearchBudget {
         cancellation: &cancellation,
@@ -567,7 +555,19 @@ fn run_samples(
         let lexical_time = started.elapsed();
         assert!(!lexical.is_empty());
 
-        let approx = snapshot.search_visible(&query, &open, CANDIDATES, budget(), visible)?;
+        let approx = snapshot.search_projected(
+            &query,
+            ProjectedVectorFilter {
+                snapshot: &view,
+                classes: &class,
+                folders: None,
+                nodes: None,
+                field_filtered: false,
+                excluded: &excluded,
+            },
+            CANDIDATES,
+            budget(),
+        )?;
         let fused = fuse_search_candidates(lexical.clone(), approx.hits.clone(), false);
         let hybrid_time = started.elapsed();
         if expect_hnsw {
@@ -589,13 +589,41 @@ fn run_samples(
         let local_query_f32 = query_embedding_f32(local_note, sample % CHUNKS);
         let local_query = QuantizedVector::quantize(&local_query_f32)?;
         let started = Instant::now();
-        let local = snapshot.search_visible(&local_query, &folder, TOP_K, budget(), visible)?;
+        let folders: Bitmap = view
+            .folder_descendants(&fixture.selective)
+            .await?
+            .iter()
+            .filter_map(|id| dictionary.get(id).map(|ord| ord.get()))
+            .collect();
+        let nodes: Bitmap = view
+            .folder_subtree(&fixture.selective)
+            .await?
+            .map(|node| node.index(view.cut.generation))
+            .collect::<Result<_, _>>()?;
+        let plan_time = started.elapsed();
+        let kernel = Instant::now();
+        let local = snapshot.search_projected(
+            &local_query,
+            ProjectedVectorFilter {
+                snapshot: &view,
+                classes: &class,
+                folders: Some(&folders),
+                nodes: Some(&nodes),
+                field_filtered: false,
+                excluded: &excluded,
+            },
+            CANDIDATES,
+            budget(),
+        )?;
+        let kernel_time = kernel.elapsed();
         let selective_time = started.elapsed();
         assert_eq!(local.hnsw_hops, 0);
         if sample >= 4 {
             metrics.lexical.push(lexical_time);
             metrics.hybrid.push(hybrid_time);
             metrics.selective.push(selective_time);
+            metrics.selective_planning.push(plan_time);
+            metrics.selective_kernel.push(kernel_time);
             metrics.hybrid_recall += overlap(
                 fused.iter().map(|hit| &hit.note),
                 reference.into_iter().map(|(note, _)| note),
@@ -604,9 +632,31 @@ fn run_samples(
                 approx.hits.iter().map(|hit| hit.metadata.key),
                 exact.iter().map(|hit| hit.metadata.key),
             );
-            let expected = exact_selective(&local_query, selective_slots)?.into_iter();
-            metrics.selective_recall +=
-                overlap(local.hits.iter().map(|hit| hit.metadata.key), expected);
+            let expected = exact_selective(&local_query, selective_slots)?;
+            let expected_chunks = expected.iter().take(10).map(|&slot| {
+                let text = chunk_line(slot / CHUNKS, slot % CHUNKS);
+                ContentDigest::from_bytes(*blake3::hash(text.as_bytes()).as_bytes())
+            });
+            metrics.selective_recall += overlap(
+                local.hits.iter().map(|hit| hit.metadata.key),
+                expected_chunks,
+            );
+            let mut expected_seen = HashSet::new();
+            let expected_notes = expected
+                .iter()
+                .map(|&slot| &view.notes[(slot / CHUNKS) as usize])
+                .filter(|note| expected_seen.insert(*note))
+                .take(CANDIDATES);
+            let mut actual_seen = HashSet::new();
+            let actual_notes = local
+                .hits
+                .iter()
+                .map(|hit| &hit.metadata.note)
+                .filter(|note| actual_seen.insert(*note));
+            assert!(
+                actual_notes.eq(expected_notes),
+                "selective note ranks disagree with exhaustive scalar scoring"
+            );
             let expected_f32 = exact_selective_f32(&local_query_f32, selective_slots).into_iter();
             metrics.quantization_recall +=
                 overlap(local.hits.iter().map(|hit| hit.metadata.key), expected_f32);
@@ -695,6 +745,8 @@ struct Metrics {
     lexical: Latency,
     hybrid: Latency,
     selective: Latency,
+    selective_planning: Latency,
+    selective_kernel: Latency,
     hybrid_recall: f64,
     ann_recall: f64,
     selective_recall: f64,

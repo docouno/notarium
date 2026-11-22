@@ -207,22 +207,26 @@ async fn exact_overlay_zero_grace_and_concurrent_align_convergence(
         .unwrap()
         .scope;
     let seed_id = sample_note_id(tag);
+    let mut corpus = vec![note(&seed_id, &folder, "Base note", "alignbasetoken")];
+    let mut view = View::new(scope.clone(), folder.clone());
+    let mut live = BTreeSet::from([seed_id.clone()]);
+    view.index(seed_id.clone(), folder.clone());
+    for index in 0..10 {
+        let id = sample_note_id(index + 1);
+        let text = if index < 9 { "violet blue" } else { "violet" };
+        corpus.push(note(&id, &folder, "Colour", text));
+        view.index(id.clone(), folder.clone());
+        live.insert(id);
+    }
     let (seeded, _) = store
-        .commit_synthetic_note_batch_for_test(
-            &scope,
-            lease,
-            &owner,
-            vec![note(&seed_id, &folder, "Base note", "alignbasetoken")],
-        )
+        .commit_synthetic_note_batch_for_test(&scope, lease, &owner, corpus)
         .await
         .unwrap();
-    let mut view = View::new(scope.clone(), folder.clone());
-    view.index(seed_id.clone(), folder.clone());
     view.advance(seeded.last_seq);
     let projection = Arc::new(Projection {
         store: store.clone(),
         snapshot: RwLock::new(view),
-        live: RwLock::new(BTreeSet::from([seed_id.clone()])),
+        live: RwLock::new(live),
     });
     let pages = Arc::new(HeldPages::new(store.clone()));
     let mut deps = SearchDependencies::new(store.clone(), projection.clone());
@@ -242,7 +246,12 @@ async fn exact_overlay_zero_grace_and_concurrent_align_convergence(
             &scope,
             lease,
             &owner,
-            vec![note(&fresh_id, &folder, "Fresh note", "fastoverlaytoken")],
+            vec![note(
+                &fresh_id,
+                &folder,
+                "Fresh note",
+                "fastoverlaytoken violet blue",
+            )],
         )
         .await
         .unwrap();
@@ -253,6 +262,9 @@ async fn exact_overlay_zero_grace_and_concurrent_align_convergence(
         ReceiptSet::new([MutationReceiptToken::new(scope.clone(), fresh.last_seq).unwrap()])
             .unwrap(),
     );
+    let mut quorum = query("violet blue orange");
+    quorum.top_k = PageLimit::new(20).unwrap();
+    quorum.causal = exact.causal.clone();
     let started = std::time::Instant::now();
     let res = engine.search(ctx.clone(), exact).await.unwrap();
     assert!(
@@ -266,6 +278,17 @@ async fn exact_overlay_zero_grace_and_concurrent_align_convergence(
         fresh_id
     );
 
+    let note_ids = |result: notarium_core::ports::SearchResult| -> BTreeSet<NoteId> {
+        result
+            .hits
+            .into_iter()
+            .map(|hit| hit.card.document.provenance().reference().note_id.clone())
+            .collect()
+    };
+    let overlay_quorum = note_ids(engine.search(ctx.clone(), quorum.clone()).await.unwrap());
+    assert_eq!(overlay_quorum.len(), 10);
+    assert!(!overlay_quorum.contains(&sample_note_id(10)));
+
     // Release catch-up and exercise concurrent writes alongside parallel reads
     // to verify align converges without DeadlineExceeded.
     {
@@ -275,6 +298,9 @@ async fn exact_overlay_zero_grace_and_concurrent_align_convergence(
     }
     pages.release();
     acknowledged(&store, &root, &scope, fresh.last_seq).await;
+
+    let caught_up_quorum = note_ids(engine.search(ctx.clone(), quorum).await.unwrap());
+    assert_eq!(caught_up_quorum, overlay_quorum);
 
     let writer_store = store.clone();
     let writer_scope = scope.clone();

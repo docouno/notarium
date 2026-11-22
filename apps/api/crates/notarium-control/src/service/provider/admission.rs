@@ -49,6 +49,7 @@ pub(super) struct DispatchAuthority<'a> {
     pub project: Option<&'a FolderRef>,
     pub parts: &'a [ProviderMessage],
     pub embedding_inputs: &'a [EmbeddingInput],
+    pub selection: Option<&'a EmbeddingSelection>,
     pub current: &'a [ProviderCurrentContent],
     pub keeper: Option<&'a crate::service::schedules::PrecheckedKeeper>,
     pub allow_search_indexing: bool,
@@ -126,6 +127,7 @@ impl ProviderService {
             project,
             parts,
             embedding_inputs,
+            selection,
             current,
             keeper,
             allow_search_indexing,
@@ -312,6 +314,21 @@ impl ProviderService {
             RevocationSelector::Grant(auth.grant().clone()),
             RevocationSelector::ProviderResource(ProviderResourceId::parse(&resource.id)?),
         ];
+        if let Some(EmbeddingSelection::SearchDefault {
+            project: selected_project,
+        }) = selection
+        {
+            let space = &primary.ok_or_else(selection::unavailable)?.space;
+            let personal_owner = (space.kind == notarium_core::auth::SpaceKind::Personal)
+                .then(|| auth.principal().as_str());
+            let selected = selection::search_default(tx, space, personal_owner, now).await?;
+            if selected.as_ref().is_none_or(|model| {
+                model.provider.as_str() != resource.id || &model.project != selected_project
+            }) {
+                return Err(invalid(ValidationReason::NotReady));
+            }
+            selectors.push(RevocationSelector::SearchEmbeddingDefault(space.id.clone()));
+        }
         if let Some(credential) = &snapshot.credential {
             selectors.push(RevocationSelector::Credential(CredentialId::parse(
                 &credential.id,

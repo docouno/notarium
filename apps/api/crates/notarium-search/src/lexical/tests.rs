@@ -35,7 +35,7 @@ impl Drop for TestDir {
     }
 }
 
-struct Snapshot {
+pub(crate) struct Snapshot {
     cut: SnapshotCut,
     notes: Vec<(NoteId, DocClass)>,
     lookups: AtomicUsize,
@@ -49,7 +49,7 @@ impl Snapshot {
         Self::with_classes(notes.into_iter().map(|id| (id, DocClass::UserDoc)))
     }
 
-    fn with_classes(notes: impl IntoIterator<Item = (NoteId, DocClass)>) -> Self {
+    pub(crate) fn with_classes(notes: impl IntoIterator<Item = (NoteId, DocClass)>) -> Self {
         Self {
             cut: SnapshotCut {
                 scope: HistoryScope {
@@ -937,6 +937,74 @@ fn fallback_floor_caps_one_term_relaxation_without_flooding_candidates() {
         .search("alpha beta gamma", &narrow, 100, 20, false)
         .unwrap();
     assert_eq!(relaxed.len(), 10);
+}
+
+#[test]
+fn paged_chat_reconciliation_commits_additions_and_removals_together() {
+    let dir = TestDir::new();
+    let index = LexicalIndex::create(&dir.0).unwrap();
+    let pool = WriterPool::default();
+    let thread = ChatThreadId::from_bytes([1; 16]);
+    let seq = |value| ThreadEntrySeq::new(value).unwrap();
+    let entry = |value| HydratedChatHit {
+        thread: thread.clone(),
+        entry: seq(value),
+        kind: ChatThreadKind::SpaceGroup,
+        project_folder: None,
+        owner: PrincipalId::from_bytes([1; 16]),
+        author: PrincipalId::from_bytes([1; 16]),
+        text: format!("message {value}"),
+    };
+    index
+        .apply(
+            &pool,
+            &[Update::Chat {
+                hit: &entry(1),
+                folder: None,
+            }],
+        )
+        .unwrap();
+    let base = index.searcher();
+    let aborted = index
+        .stage_seed(
+            &pool,
+            &[Update::Chat {
+                hit: &entry(9),
+                folder: None,
+            }],
+        )
+        .unwrap();
+    drop(aborted);
+
+    let mut staged = None;
+    for n in 2..=4 {
+        staged = Some(
+            index
+                .stage_seed(
+                    &pool,
+                    &[Update::Chat {
+                        hit: &entry(n),
+                        folder: None,
+                    }],
+                )
+                .unwrap(),
+        );
+        assert_eq!(
+            index.live_chat_entries(&index.searcher(), &thread).unwrap(),
+            [seq(1)].into()
+        );
+    }
+    index
+        .commit_updates(&pool, &[Update::RemoveChat(&thread, seq(1))], staged)
+        .unwrap();
+    assert_eq!(
+        index.live_chat_entries(&base, &thread).unwrap(),
+        [seq(1)].into()
+    );
+    assert_eq!(
+        index.live_chat_entries(&index.searcher(), &thread).unwrap(),
+        [seq(2), seq(3), seq(4)].into()
+    );
 }
 
 #[test]

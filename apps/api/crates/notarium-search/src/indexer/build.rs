@@ -3,7 +3,7 @@ use crate::{
     config::VectorMode,
     embed::{EmbeddingError, Priority},
     engine::{Clock, Services},
-    layout::{FolderDictionary, FolderOrd, SearchLayout, SearchManifest, VectorModel, index_name},
+    layout::{FolderDictionary, SearchLayout, SearchManifest, VectorModel, index_name},
     lexical::{LexicalIndex, ReaderCache, SeedLease, TOKENIZER_VERSION, Update, WriterPool},
     model::{Embedder, IndexNote, NoteIndexOutcome},
     ports::{ResolvedEmbeddingTarget, SearchIndexedNote},
@@ -388,10 +388,8 @@ async fn seed_vectors(
                 tokio::task::spawn_blocking(move || -> Result<_, VectorError> {
                     let mut newly_sealed = Vec::new();
                     let mut seg_id = next_seg_id;
-                    for group in page_groups {
-                        // Cut segments strictly between notes so no note ever
-                        // spans two sealed segments.
-                        if !builder.is_empty() && builder.at_budget() {
+                    for chunk in page_groups.into_iter().flatten() {
+                        if builder.at_budget() {
                             let seg_path = segment_file_path(&path_owned, seg_id);
                             if let Some(segment) =
                                 builder.finish_cancellable(&seg_path, &cancel_owned)?
@@ -401,9 +399,7 @@ async fn seed_vectors(
                             }
                             builder = SegmentBuilder::for_model(&model_owned)?;
                         }
-                        for chunk in group {
-                            builder.push_cancellable(chunk, &cancel_owned)?;
-                        }
+                        builder.push_cancellable(chunk, &cancel_owned)?;
                     }
                     Ok((builder, newly_sealed, seg_id))
                 })
@@ -499,8 +495,8 @@ async fn seed_notes(
         let before = folders.len();
         let mut prepared = Vec::with_capacity(page.notes.len());
         for note in page.notes {
-            if let Some((content, folder)) = prepare_note(cx, folders, &note)? {
-                prepared.push((content, note.title, folder));
+            if let Some(content) = prepare_note(cx, &note) {
+                prepared.push((content, note.title, folders.insert(note.parent_folder_id)?));
             }
         }
         let needs_folders = folders.len() != before;
@@ -687,25 +683,13 @@ pub(super) async fn chat_page_until(
     Ok((page.entries, page.next_before))
 }
 
-pub(super) fn prepare_note(
-    cx: &Context<'_>,
-    folders: &mut FolderDictionary,
-    note: &SearchIndexedNote,
-) -> Result<Option<(SearchContent, FolderOrd)>, IndexError> {
+pub(super) fn prepare_note(cx: &Context<'_>, note: &SearchIndexedNote) -> Option<SearchContent> {
     if note.document.lifecycle() != Lifecycle::Active
         || note.document.class() == DocClass::EncryptedNote
     {
-        return Ok(None);
+        return None;
     }
-    let Ok(content) =
-        ClassEgressFence::index_for_search(note.document.clone(), &cx.services.authority)
-    else {
-        return Ok(None);
-    };
-    Ok(Some((
-        content,
-        folders.insert(note.parent_folder_id.clone())?,
-    )))
+    ClassEgressFence::index_for_search(note.document.clone(), &cx.services.authority).ok()
 }
 
 pub(super) fn save_new_folders(

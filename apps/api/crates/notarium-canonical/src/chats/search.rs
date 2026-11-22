@@ -225,6 +225,7 @@ impl CanonicalStore {
                     &space.space.id,
                     &key,
                     previous_cutoff,
+                    cutoff,
                 )
                 .await?
                 {
@@ -1015,11 +1016,12 @@ async fn thread_has_redaction_or_compaction_after_tx(
     space_id: &SpaceId,
     thread: &ChatThreadId,
     after: SpaceSeq,
+    through: SpaceSeq,
 ) -> Result<bool, PortError> {
     const REDACTION_SQL: &str = "SELECT EXISTS (SELECT 1 FROM chat_entries
         WHERE space_id = $1 AND redacted_at_seq IS NOT NULL AND redacted_at_seq > $2 AND thread_id = $3)";
     const COMPACTION_SQL: &str = "SELECT EXISTS (SELECT 1 FROM chat_entries
-        WHERE space_id = $1 AND thread_id = $2 AND kind = 'compaction' AND created_space_seq > $3)";
+        WHERE space_id = $1 AND thread_id = $2 AND kind = 'compaction' AND created_space_seq > $3 AND created_space_seq <= $4)";
     let after_seq = after.get() as i64;
     let redacted: bool = match tx {
         BackendConn::Sqlite(conn) => sqlx::query_scalar(REDACTION_SQL)
@@ -1047,6 +1049,7 @@ async fn thread_has_redaction_or_compaction_after_tx(
             .bind(space_id.as_str())
             .bind(thread.as_str())
             .bind(after_seq)
+            .bind(through.get() as i64)
             .fetch_one(&mut **conn)
             .await
             .map_err(|err| {
@@ -1056,6 +1059,7 @@ async fn thread_has_redaction_or_compaction_after_tx(
             .bind(space_id.as_str())
             .bind(thread.as_str())
             .bind(after_seq)
+            .bind(through.get() as i64)
             .fetch_one(&mut **conn)
             .await
             .map_err(|err| pg_read_error("pg_search_chat_delta_compact", err)),

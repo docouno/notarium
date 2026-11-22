@@ -46,7 +46,7 @@ use tantivy::{
 };
 
 const OVERLAY_WRITER_BUDGET: usize = 256 * 1024;
-const MAX_FALLBACK_FLOOR: usize = 10;
+pub(crate) const MAX_FALLBACK_FLOOR: usize = 10;
 const MERGE_RACE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, thiserror::Error)]
@@ -109,7 +109,7 @@ pub(crate) struct OverlayHits {
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct ChatCursor {
-    relaxed: bool,
+    pub(crate) relaxed: bool,
     after: Option<(f32, DocAddress)>,
 }
 
@@ -133,12 +133,17 @@ impl LexicalIndex {
     }
 
     pub fn open(path: &Path) -> Result<Self, LexicalError> {
+        let (index, fields) = Self::open_index(path)?;
+        Self::from_index(path.to_owned(), index, fields)
+    }
+
+    fn open_index(path: &Path) -> Result<(Index, Fields), LexicalError> {
         let index = Index::open_in_dir(path)?;
         let fields = Fields::new();
         if index.schema() != fields.schema {
             return Err(LexicalError::CorruptIndex);
         }
-        Self::from_index(path.to_owned(), index, fields)
+        Ok((index, fields))
     }
 
     fn from_index(path: PathBuf, index: Index, fields: Fields) -> Result<Self, LexicalError> {
@@ -173,11 +178,21 @@ impl LexicalIndex {
     }
 
     pub fn apply(&self, pool: &WriterPool, updates: &[Update<'_>]) -> Result<usize, LexicalError> {
-        if updates.is_empty() {
+        self.commit_updates(pool, updates, None)
+    }
+
+    /// Commit all staged additions and the final replacements/deletions together.
+    pub(crate) fn commit_updates(
+        &self,
+        pool: &WriterPool,
+        updates: &[Update<'_>],
+        staged: Option<SeedLease>,
+    ) -> Result<usize, LexicalError> {
+        if staged.is_none() && updates.is_empty() {
             return Ok(0);
         }
         let mutations = build_mutations(&self.fields, updates)?;
-        pool.with_writer(&self.path, &self.index, false, |writer| {
+        pool.with_writer(&self.path, &self.index, staged.is_some(), |writer| {
             let added = mutations.iter().filter(|(_, doc)| doc.is_some()).count();
             for (term, doc) in mutations {
                 writer.delete_term(term);
@@ -191,9 +206,8 @@ impl LexicalIndex {
         })
     }
 
-    /// Append one page to an unpublished, empty generation. Hold the returned
-    /// `SeedLease` until `commit_seed` completes so the writer stays pinned
-    /// between pages and releases automatically if seeding aborts.
+    /// Stage new identities without publishing them. Hold the returned lease across
+    /// pages until the command or cold build commits; dropping it discards pending writes.
     pub fn stage_seed(
         &self,
         pool: &WriterPool,
@@ -375,18 +389,13 @@ impl LexicalIndex {
         };
         let mut scores =
             collect_top_scored(searcher, query.as_ref(), filter, limit + 1, cursor.after)?;
-        let fallback_floor = limit.min(MAX_FALLBACK_FLOOR);
         let next = if scores.len() > limit {
             scores.truncate(limit);
             Some(ChatCursor {
                 relaxed: cursor.relaxed,
                 after: scores.last().copied(),
             })
-        } else if !cursor.relaxed
-            && cursor.after.is_none()
-            && scores.len() < fallback_floor
-            && plan.can_fallback()
-        {
+        } else if !cursor.relaxed && plan.can_fallback() {
             Some(ChatCursor {
                 relaxed: true,
                 after: None,
@@ -667,4 +676,4 @@ fn decode_hit(
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

@@ -1,3 +1,7 @@
+mod loading;
+
+pub(super) use loading::LocalModels;
+
 use crate::{
     config::VectorMode,
     embed::{
@@ -18,84 +22,15 @@ use notarium_core::{
     error::{PortError, ValidationReason},
     ids::{ContentDigest, ModelProfileId},
     model::{FolderRef, HistoryScope},
-    ports::{CallBudget, EmbeddingQueryInput, SpaceContext},
+    ports::{CallBudget, EmbeddingQueryInput, SearchQuery, SpaceContext},
 };
 use notarium_syntax::chunk::TokenizerBudget;
 use std::{
     collections::{BTreeSet, HashMap},
-    path::PathBuf,
-    sync::{Arc, Mutex as StdMutex, Weak},
+    sync::Arc,
 };
 
 const LOCAL_BATCH_QUANTUM: u32 = 16;
-
-#[derive(Default)]
-pub(super) struct LocalModels {
-    models: StdMutex<HashMap<crate::layout::VectorModel, Weak<OrtModel>>>,
-    loading: StdMutex<HashMap<crate::layout::VectorModel, Weak<tokio::sync::Mutex<()>>>>,
-}
-
-impl LocalModels {
-    fn cached(&self, key: &crate::layout::VectorModel) -> Option<Arc<OrtModel>> {
-        let models = self
-            .models
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        models.get(key).and_then(Weak::upgrade)
-    }
-
-    fn loading_gate(&self, key: &crate::layout::VectorModel) -> Arc<tokio::sync::Mutex<()>> {
-        let mut loading = self
-            .loading
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        loading.retain(|_, entry| entry.strong_count() != 0);
-        loading.get(key).and_then(Weak::upgrade).unwrap_or_else(|| {
-            let gate = Arc::new(tokio::sync::Mutex::new(()));
-            loading.insert(key.clone(), Arc::downgrade(&gate));
-            gate
-        })
-    }
-
-    async fn get_or_open(
-        &self,
-        key: crate::layout::VectorModel,
-        library: PathBuf,
-        root: PathBuf,
-        selected: ResolvedEmbeddingTarget,
-    ) -> Result<Arc<OrtModel>, EmbeddingError> {
-        if let Some(model) = self.cached(&key) {
-            return Ok(model);
-        }
-        let gate = self.loading_gate(&key);
-        let _guard = gate.lock().await;
-        if let Some(model) = self.cached(&key) {
-            return Ok(model);
-        }
-        let pooling = key.pooling;
-        let model = tokio::task::spawn_blocking(move || {
-            OrtModel::open(&library, &root, &selected, pooling)
-        })
-        .await
-        .map_err(|_| EmbeddingError::ModelUnavailable)??;
-        let model = Arc::new(model);
-        {
-            let mut models = self
-                .models
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            models.retain(|_, entry| entry.strong_count() != 0);
-            models.insert(key, Arc::downgrade(&model));
-        }
-        Ok(model)
-    }
-
-    #[cfg(test)]
-    pub(super) async fn hold_loading(&self, key: crate::layout::VectorModel) -> impl Drop {
-        let gate = self.loading_gate(&key);
-        gate.lock_owned().await
-    }
-}
 
 pub(super) struct Embedder {
     pub target: ResolvedEmbeddingTarget,
@@ -221,7 +156,7 @@ impl Services {
                     EmbeddingBackendTarget::Remote {
                         provider,
                         runtime_epochs,
-                        ..
+                        project,
                     },
                 ) => {
                     let port = self
@@ -236,6 +171,7 @@ impl Services {
                         target.dimension,
                         target.max_input_tokens,
                         *runtime_epochs,
+                        project.clone(),
                     );
                     (Backend::Remote(Arc::new(backend)), conservative()?)
                 }
@@ -247,9 +183,15 @@ impl Services {
                     EmbeddingBackendTarget::LocalOnnx | EmbeddingBackendTarget::LocalOnnxCls,
                 ) => {
                     let key = target.vector_model();
+                    let pooling = key.pooling;
+                    let library = dylib_path.clone();
+                    let root = model_dir.clone();
+                    let selected = target.clone();
                     let model = self
                         .models
-                        .get_or_open(key, dylib_path.clone(), model_dir.clone(), target.clone())
+                        .get_or_open(key, move || {
+                            OrtModel::open(&library, &root, &selected, pooling)
+                        })
                         .await?;
                     let tokenizer = model.tokenizer();
                     (Backend::Onnx(model), tokenizer)
@@ -276,16 +218,18 @@ impl Embedder {
 
     pub async fn query(
         &self,
-        services: &Services,
+        services: &Arc<Services>,
         mut ctx: SpaceContext,
-        text: String,
+        query: &SearchQuery,
         classes: BTreeSet<DocClass>,
         project_scope: Option<FolderRef>,
+        requested: &ResolvedEmbeddingTarget,
     ) -> Result<QuantizedVector, EmbeddingError> {
         ctx.budget.remaining = ctx
             .budget
             .remaining
             .min(services.config.interactive_budget());
+        let text = query.text.clone();
         let mut row = match &self.backend {
             Backend::Remote(remote) => {
                 if ctx.auth().taint().is_tainted() {
@@ -296,13 +240,30 @@ impl Embedder {
                     .count(&text)
                     .map_err(|_| EmbeddingError::BudgetExceeded)?;
                 let backend = remote.clone();
+                let selection = query.model.is_none().then(|| requested.clone());
+                let folder = query.folder.clone();
+                let models = Arc::clone(services);
                 services
                     .remote_scheduler
                     .submit(
                         Priority::InteractiveSearchQuery,
                         ctx.budget.clone(),
                         move |budget| async move {
+                            let started = std::time::Instant::now();
                             ctx.budget = budget;
+                            let implicit = selection.is_some();
+                            if let Some(expected) = selection {
+                                let current =
+                                    models.model_target(ctx.scope(), None, &ctx.budget).await?;
+                                if current
+                                    .as_ref()
+                                    .is_none_or(|current| current.backend != expected.backend)
+                                {
+                                    return Err(EmbeddingError::TargetChanged);
+                                }
+                            }
+                            ctx.budget.remaining =
+                                ctx.budget.remaining.saturating_sub(started.elapsed());
                             backend
                                 .query(
                                     ctx,
@@ -311,7 +272,9 @@ impl Embedder {
                                         tokens,
                                         classes,
                                         project_scope,
+                                        folder,
                                     },
+                                    implicit,
                                 )
                                 .await
                         },

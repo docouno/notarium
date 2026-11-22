@@ -20,6 +20,8 @@ pub use tokenizer::{LocalTokenizerBudget, RemoteConservativeTokenizerBudget};
 pub enum EmbeddingError {
     #[error("the embedding model is unavailable")]
     ModelUnavailable,
+    #[error("the selected embedding target changed while the query was queued")]
+    TargetChanged,
     #[error("the embedding provider is unavailable")]
     ProviderUnavailable,
     #[error("the document no longer qualifies for remote indexing")]
@@ -84,6 +86,7 @@ impl EmbeddingError {
     pub fn degradation(&self) -> notarium_core::ports::SearchDegradation {
         use notarium_core::ports::SearchDegradation;
         match self {
+            Self::TargetChanged => SearchDegradation::EmbeddingsPending,
             Self::BudgetExceeded | Self::Cancelled => SearchDegradation::BudgetExceeded,
             Self::ProviderUnavailable | Self::IndexingDenied => {
                 SearchDegradation::ProviderUnavailable

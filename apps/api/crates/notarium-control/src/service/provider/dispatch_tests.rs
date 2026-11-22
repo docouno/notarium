@@ -32,6 +32,7 @@ struct Egress {
     cancellations: Mutex<Vec<Cancellation>>,
 }
 struct EgressLease {
+    project_folders: BTreeSet<FolderId>,
     current: Vec<ProviderCurrentContent>,
     project: Option<FolderRef>,
     active: Arc<AtomicUsize>,
@@ -48,6 +49,9 @@ impl ProviderEgressLease for EgressLease {
     }
     fn project(&self) -> Option<&FolderRef> {
         self.project.as_ref()
+    }
+    fn project_folders(&self) -> &BTreeSet<FolderId> {
+        &self.project_folders
     }
     fn check(&self) -> notarium_core::DomainResult<()> {
         if self.cancellation.is_cancelled() {
@@ -82,6 +86,7 @@ impl ProviderEgressCatalogPort for Egress {
                 .unwrap()
                 .push(cancellation.clone());
             Ok(Box::new(EgressLease {
+                project_folders: request.project_folders,
                 current,
                 project: request.project,
                 active: self.active.clone(),
@@ -769,6 +774,7 @@ async fn gateway(pg: bool, kind: ProviderWireKind, label: &str) {
                 tokens: 3,
                 classes: BTreeSet::from([class]),
                 project_scope: None,
+                folder: None,
             },
         )
     };
@@ -778,6 +784,7 @@ async fn gateway(pg: bool, kind: ProviderWireKind, label: &str) {
             setup.space.clone(),
             setup.selection.provider.clone(),
             ModelProfileId::from_bytes([4; 16]),
+            None,
             None,
         )
         .await
@@ -808,7 +815,8 @@ async fn gateway(pg: bool, kind: ProviderWireKind, label: &str) {
             budget(),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .expect("personal owner is eligible");
     assert_eq!(indexing.auth().principal(), setup.space.auth().principal());
     assert_eq!(
         indexing.auth().kind(),
@@ -923,6 +931,7 @@ async fn gateway(pg: bool, kind: ProviderWireKind, label: &str) {
                 indexing.clone(),
                 setup.selection.provider.clone(),
                 ModelProfileId::from_bytes([4; 16]),
+                None,
                 None,
             )
             .await,
@@ -1045,6 +1054,7 @@ async fn gateway(pg: bool, kind: ProviderWireKind, label: &str) {
                 narrowed_space.clone(),
                 setup.selection.provider.clone(),
                 ModelProfileId::from_bytes([4; 16]),
+                None,
                 None,
             )
             .await
@@ -1361,6 +1371,8 @@ async fn postgres_ollama_gateway() {
 
 #[path = "admission_tests.rs"]
 mod admissions;
+#[path = "default_tests.rs"]
+mod defaults;
 #[path = "lifecycle_tests.rs"]
 mod lifecycle;
 #[path = "shared_tests.rs"]

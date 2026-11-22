@@ -8,7 +8,7 @@ use std::{
 
 use notarium_core::{
     DomainError, DomainResult,
-    auth::ResourceFacts,
+    auth::{ResourceFacts, SpaceLifecycle},
     classes::{ClassifiedDocument, DocClass},
     error::{PortError, ValidationReason},
     ids::{
@@ -266,6 +266,7 @@ pub fn build_effect_payload_draft(
 pub(crate) enum BroadcastSignal {
     CatalogChanged {
         scope: HistoryScope,
+        lifecycle: SpaceLifecycle,
     },
     Committed {
         scope: HistoryScope,
@@ -292,7 +293,7 @@ impl ProjectionCatalogSubscription {
     pub async fn next(&mut self) -> Option<Option<HistoryScope>> {
         loop {
             match self.receiver.recv().await {
-                Ok(BroadcastSignal::CatalogChanged { scope }) => return Some(Some(scope)),
+                Ok(BroadcastSignal::CatalogChanged { scope, .. }) => return Some(Some(scope)),
                 Ok(BroadcastSignal::IncarnationChanged { new_scope, .. }) => {
                     return Some(Some(new_scope));
                 }
@@ -395,6 +396,7 @@ pub(crate) fn check_change_consumer_authority(auth: &ServiceAuthority) -> Domain
 
 struct CanonicalChangeSubscription {
     store: CanonicalStore,
+    needs_active_space: bool,
     sub_id: u64,
     processed: ChangeCursor,
     delivered_complete_command_end: SpaceSeq,
@@ -412,7 +414,7 @@ impl CanonicalChangeSubscription {
         // A local broadcast can announce a later head without having seen a remote purge.
         // Only a database read can advance this watermark.
         let checked = self.durable_checked_through;
-        let (head, must_reseed) = self.store.with_read_tx(|tx| {
+        let (head, lifecycle, must_reseed) = self.store.with_read_tx(|tx| {
             Box::pin(async move {
                 let rec = load_space_record(tx, &processed.scope.space_id).await?;
                 let start = if lagged { processed.after } else { processed.after.max(checked) };
@@ -429,14 +431,16 @@ impl CanonicalChangeSubscription {
                 } else {
                     false
                 };
-                Ok((ChangeCursor {scope: rec.scope, after: rec.last_seq}, must_reseed))
+                Ok((ChangeCursor {scope: rec.scope, after: rec.last_seq}, rec.space.lifecycle, must_reseed))
             })
         }).await?;
 
         if lagged {
             self.pending_lagged = false;
         }
-        if head.scope != self.processed.scope {
+        if head.scope != self.processed.scope
+            || (self.needs_active_space && lifecycle != SpaceLifecycle::Active)
+        {
             return Ok(Some(ChangeNotice::Resync { scope: head.scope }));
         }
         self.delivered_complete_command_end = delivered.max(head.after);
@@ -496,7 +500,14 @@ impl ChangeSubscription for CanonicalChangeSubscription {
                     self.rx.recv().await
                 };
                 match signal {
-                    Ok(BroadcastSignal::CatalogChanged { .. }) => continue,
+                    Ok(BroadcastSignal::CatalogChanged { scope, lifecycle }) => {
+                        if self.needs_active_space
+                            && scope.space_id == self.processed.scope.space_id
+                            && lifecycle != SpaceLifecycle::Active
+                        {
+                            return Ok(Some(ChangeNotice::Resync { scope }));
+                        }
+                    }
                     Ok(BroadcastSignal::IncarnationChanged { new_scope, ceiling }) => {
                         if new_scope.space_id == self.processed.scope.space_id {
                             self.delivered_complete_command_end = ceiling;
@@ -605,18 +616,22 @@ impl ChangeBroadcast for CanonicalStore {
         let store = self.clone();
         Box::pin(async move {
             check_change_consumer_authority(&ctx.authority)?;
+            let needs_active_space = ctx.authority.require(ServicePurpose::Search).is_ok();
 
             // Subscribe to broadcast channel BEFORE reading DB state so zero post-read commits are missed!
             let rx = store.inner.broadcast_hub.subscribe_raw();
             let after_cl = after.clone();
 
-            let (space_rec, has_erased) = store
+            let (space_rec, must_resync, has_erased) = store
                 .with_read_tx_budget(Some(&ctx.budget), |tx| {
                     Box::pin(async move {
                         let rec = load_space_record(tx, &after_cl.scope.space_id).await?;
-                        // History mismatch must yield `ChangeNotice::Resync` BEFORE comparing any SpaceSeq!
-                        if rec.scope.incarnation != after_cl.scope.incarnation {
-                            return Ok((rec, false));
+                        // Retire a search subscriber on archive even if the catalog change
+                        // did not advance last_seq. Never compare sequences across histories.
+                        if rec.scope.incarnation != after_cl.scope.incarnation
+                            || (needs_active_space && rec.space.lifecycle != SpaceLifecycle::Active)
+                        {
+                            return Ok((rec, true, false));
                         }
                         if after_cl.after > SpaceSeq::ZERO {
                             let _ =
@@ -635,50 +650,49 @@ impl ChangeBroadcast for CanonicalStore {
                             } else {
                                 false
                             };
-                        Ok((rec, erased))
+                        Ok((rec, false, erased))
                     })
                 })
                 .await?;
 
-            let (pending_initial, delivered_end) =
-                if space_rec.scope.incarnation != after.scope.incarnation {
-                    (
-                        Some(ChangeNotice::Resync {
-                            scope: space_rec.scope.clone(),
-                        }),
-                        SpaceSeq::ZERO,
-                    )
-                } else if after.after == SpaceSeq::ZERO {
-                    (
-                        Some(ChangeNotice::SeedRequired {
-                            cutoff: ChangeCursor {
-                                scope: space_rec.scope.clone(),
-                                after: space_rec.last_seq,
-                            },
-                        }),
-                        space_rec.last_seq,
-                    )
-                } else if has_erased {
-                    (
-                        Some(ChangeNotice::PurgeResync {
-                            cutoff: ChangeCursor {
-                                scope: space_rec.scope.clone(),
-                                after: space_rec.last_seq,
-                            },
-                        }),
-                        space_rec.last_seq,
-                    )
-                } else if space_rec.last_seq > after.after {
-                    (
-                        Some(ChangeNotice::Advanced(ChangeCursor {
+            let (pending_initial, delivered_end) = if must_resync {
+                (
+                    Some(ChangeNotice::Resync {
+                        scope: space_rec.scope.clone(),
+                    }),
+                    SpaceSeq::ZERO,
+                )
+            } else if after.after == SpaceSeq::ZERO {
+                (
+                    Some(ChangeNotice::SeedRequired {
+                        cutoff: ChangeCursor {
                             scope: space_rec.scope.clone(),
                             after: space_rec.last_seq,
-                        })),
-                        space_rec.last_seq,
-                    )
-                } else {
-                    (None, after.after)
-                };
+                        },
+                    }),
+                    space_rec.last_seq,
+                )
+            } else if has_erased {
+                (
+                    Some(ChangeNotice::PurgeResync {
+                        cutoff: ChangeCursor {
+                            scope: space_rec.scope.clone(),
+                            after: space_rec.last_seq,
+                        },
+                    }),
+                    space_rec.last_seq,
+                )
+            } else if space_rec.last_seq > after.after {
+                (
+                    Some(ChangeNotice::Advanced(ChangeCursor {
+                        scope: space_rec.scope.clone(),
+                        after: space_rec.last_seq,
+                    })),
+                    space_rec.last_seq,
+                )
+            } else {
+                (None, after.after)
+            };
 
             let sub_id = store
                 .inner
@@ -690,6 +704,7 @@ impl ChangeBroadcast for CanonicalStore {
 
             Ok(Box::new(CanonicalChangeSubscription {
                 store,
+                needs_active_space,
                 sub_id,
                 processed: after,
                 delivered_complete_command_end: delivered_end,

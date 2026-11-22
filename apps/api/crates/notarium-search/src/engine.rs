@@ -737,6 +737,7 @@ impl SearchEngine {
 
     pub async fn shutdown(&self) {
         self.stop();
+        self.services.models.shutdown().await;
         loop {
             let (workers, bg) = {
                 let mut table = self
@@ -796,6 +797,13 @@ pub(super) struct Clock {
 }
 
 impl Clock {
+    pub fn limited(&self, duration: Duration) -> Self {
+        Self {
+            budget: self.budget.clone(),
+            deadline: self.deadline.min(Instant::now() + duration),
+        }
+    }
+
     pub fn new(budget: &CallBudget) -> Result<Self, PortError> {
         let deadline = Instant::now()
             .checked_add(budget.remaining)

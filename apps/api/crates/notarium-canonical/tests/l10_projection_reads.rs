@@ -794,6 +794,26 @@ async fn run_projection_reads(store: &CanonicalStore) {
             .await
             .unwrap()
     );
+    // Historical children include a moved-out folder via its old parent and
+    // exclude a moved-in folder whose head alone would match.
+    let before_move = nested_created.receipt.seq();
+    for (parent, cut, expected) in [
+        (&space.root_folder_id, before_move, true),
+        (&keeper_project, before_move, false),
+        (&space.root_folder_id, after_move_seq, false),
+        (&keeper_project, after_move_seq, true),
+    ] {
+        let children = store
+            .read_projection_folder_children_at_cut(
+                &projection,
+                scope,
+                cut,
+                std::slice::from_ref(parent),
+            )
+            .await
+            .unwrap();
+        assert_eq!(children.contains(&movable_folder), expected);
+    }
     let active_ancestry = store
         .read_projection_folder_ancestry_at_cut(&projection, scope, after_move_seq, &movable_folder)
         .await

@@ -9,7 +9,7 @@ use super::{
 use crate::{
     error::{invalid, unavailable},
     outbound::{OutboundRequest, OutboundResponse},
-    store::target::ProviderCallLogRow,
+    store::{lease::OperationBudget, target::ProviderCallLogRow},
 };
 use notarium_core::{
     DomainError,
@@ -17,7 +17,7 @@ use notarium_core::{
     classes::DocClass,
     error::{BudgetKind, CommitEffect, PortError, ValidationReason},
     ids::*,
-    model::FolderRef,
+    model::{FolderRef, Lifecycle},
     ports::{control::*, *},
 };
 use reqwest::{
@@ -350,18 +350,23 @@ impl ProviderService {
         };
         let parts = job.parts();
         let current = if primary.is_some() {
+            let egress = job.egress(&parts)?;
+            let project_folders = egress.project_folders.clone();
             let lease = runtime
                 .run(
                     self.egress.acquire_egress(
                         AccountContext::new(job.ctx.auth().clone(), runtime.context()),
-                        job.egress(&parts)?,
+                        egress,
                         runtime.cancelled.clone(),
                     ),
                     CommitEffect::NotCommitted,
                 )
                 .await?;
             lease.check()?;
-            if lease.project() != job.project() || lease.current().len() > 4096 {
+            if lease.project() != job.project()
+                || lease.project_folders() != &project_folders
+                || lease.current().len() > 4096
+            {
                 return Err(invalid(ValidationReason::SourceMismatch));
             }
             let current = lease.current().to_vec();
@@ -381,6 +386,10 @@ impl ProviderService {
             project: job.project(),
             parts: &parts,
             embedding_inputs: job.embedding_inputs(),
+            selection: match &job.request {
+                Request::Embedding(request) => Some(&request.selection),
+                _ => None,
+            },
             current: &current,
             keeper: keeper.as_ref(),
             allow_search_indexing,
@@ -563,14 +572,37 @@ impl ProviderService {
 impl EmbeddingProviderPort for ProviderService {
     fn query_disclosure(
         &self,
-        ctx: SpaceContext,
+        mut ctx: SpaceContext,
         provider: ProviderResourceId,
         model: ModelProfileId,
         project: Option<FolderRef>,
+        folder: Option<FolderId>,
     ) -> PortFuture<'_, BTreeSet<DocClass>> {
         Box::pin(async move {
             if ctx.auth().taint().is_tainted() {
                 return Err(DomainError::CrossSpaceTainted.into());
+            }
+            if let (Some(project), Some(folder_id)) = (&project, folder) {
+                let budget = OperationBudget::new(ctx.budget.clone());
+                let reference = FolderRef {
+                    space_id: ctx.scope().space_id.clone(),
+                    folder_id,
+                };
+                let folder = self
+                    .control
+                    .catalog
+                    .folder(
+                        AccountContext::new(ctx.auth().clone(), ctx.budget.clone()),
+                        reference.clone(),
+                    )
+                    .await?;
+                ctx.budget = budget.context(ctx.budget.request.clone());
+                if folder.reference != reference
+                    || folder.lifecycle != Lifecycle::Active
+                    || !folder.ancestor_folders.contains(&project.folder_id)
+                {
+                    return Err(DomainError::AccessDenied.into());
+                }
             }
             let caller_classes = ctx
                 .auth()

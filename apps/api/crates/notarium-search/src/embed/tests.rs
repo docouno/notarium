@@ -213,6 +213,7 @@ fn tokenizer_uses_scalar_case_mapping_and_prepend_boundaries() {
 
 #[test]
 fn tokenizer_matches_reference_on_fallback_controls_and_whitespace() {
+    // BPE golden IDs from Hugging Face tokenizers 0.23.3.
     let cases = [
         (
             r#"{"model":{"type":"BPE","byte_fallback":true,
@@ -226,21 +227,21 @@ fn tokenizer_matches_reference_on_fallback_controls_and_whitespace() {
             "vocab":{"<unk>":0,"<0xC3>":1,"<0xA9>":2,"a":3},
             "merges":[]}}"#,
             "!éa",
-            &[0, 1, 2, 3],
+            &[1, 2, 0, 3],
         ),
         (
             r#"{"model":{"type":"BPE","byte_fallback":true,"unk_token":"<unk>","fuse_unk":false,
             "vocab":{"<unk>":0,"<0xC3>":1,"<0xA9>":2},
             "merges":[]}}"#,
             "!!é",
-            &[0, 0, 1, 2],
+            &[0, 1, 2, 0],
         ),
         (
             r#"{"model":{"type":"BPE","byte_fallback":true,"unk_token":"<unk>","fuse_unk":true,
             "vocab":{"<unk>":0,"<0xC3>":1,"<0xA9>":2},
             "merges":[]}}"#,
             "!!é",
-            &[0, 1, 2],
+            &[1, 2, 0],
         ),
         (
             r###"{"normalizer":{"type":"StripAccents"},
@@ -288,7 +289,7 @@ fn tokenizer_matches_reference_on_fallback_controls_and_whitespace() {
 
 #[test]
 fn bpe_fixes_byte_fallback_oov_duplicate_merges_and_space_splits() {
-    // Byte fallback encodes only the scalar bytes, not continuing_subword_prefix / end_of_word_suffix.
+    // The decorated symbol must have a vocabulary entry for each byte.
     let prefixed = LocalTokenizerBudget::from_json(
         br###"{
         "model":{"type":"BPE","byte_fallback":true,"continuing_subword_prefix":"##",
@@ -300,7 +301,18 @@ fn bpe_fixes_byte_fallback_oov_duplicate_merges_and_space_splits() {
         512,
     )
     .unwrap();
-    assert_eq!(prefixed.encode("aé").unwrap().ids, [1, 2, 3]);
+    assert_eq!(prefixed.encode("aé").unwrap().ids, [1]);
+    assert_eq!(prefixed.count("aé").unwrap(), 1);
+    let prefixed = LocalTokenizerBudget::from_json(
+        br###"{"model":{"type":"BPE","byte_fallback":true,"continuing_subword_prefix":"##",
+        "end_of_word_suffix":"!","vocab":{"a":1,"<0xC3>":2,"<0xA9>":3,
+        "<0x23>":4,"<0x21>":5},"merges":[]}}"###,
+        profile(),
+        512,
+    )
+    .unwrap();
+    assert_eq!(prefixed.encode("aé").unwrap().ids, [1, 4, 4, 2, 3, 5]);
+    assert_eq!(prefixed.count("aé").unwrap(), 6);
 
     // Missing OOV scalar without unk_token or byte_fallback fails closed instead of dropping chars.
     let strict = LocalTokenizerBudget::from_json(
@@ -584,6 +596,7 @@ async fn remote_queries_are_typed_and_tainted_or_oversize_input_never_dispatches
             _: ProviderResourceId,
             _: ModelProfileId,
             _: Option<FolderRef>,
+            _: Option<notarium_core::ids::FolderId>,
         ) -> PortFuture<'_, BTreeSet<DocClass>> {
             Box::pin(async { Ok(BTreeSet::from([DocClass::UserDoc])) })
         }
@@ -639,35 +652,40 @@ async fn remote_queries_are_typed_and_tainted_or_oversize_input_never_dispatches
             resource: std::num::NonZeroU64::MIN,
             credential: None,
         },
+        None,
     );
     let input = EmbeddingQueryInput {
         text: "literal query".to_owned(),
         tokens: 12,
         classes: BTreeSet::from([DocClass::UserDoc, DocClass::Profile]),
         project_scope: None,
+        folder: None,
     };
     let mut oversized = input.clone();
     oversized.tokens = 17;
     assert!(matches!(
-        remote.query(ctx.clone(), oversized).await,
+        remote.query(ctx.clone(), oversized, false).await,
         Err(EmbeddingError::BudgetExceeded)
     ));
-    let result = remote.query(ctx.clone(), input.clone()).await.unwrap();
+    let result = remote
+        .query(ctx.clone(), input.clone(), false)
+        .await
+        .unwrap();
     assert_eq!(result, [Some(vec![0.125; 64])]);
     let mut excluded = input.clone();
     excluded.classes.remove(&DocClass::UserDoc);
     assert!(matches!(
-        remote.query(ctx.clone(), excluded).await,
+        remote.query(ctx.clone(), excluded, false).await,
         Err(EmbeddingError::ProviderUnavailable)
     ));
     provider.invalid_row.store(true, Ordering::SeqCst);
     assert!(matches!(
-        remote.query(ctx.clone(), input.clone()).await,
+        remote.query(ctx.clone(), input.clone(), false).await,
         Err(EmbeddingError::ProviderUnavailable)
     ));
     ctx.auth().taint().mark_external_read();
     assert!(matches!(
-        remote.query(ctx, input).await,
+        remote.query(ctx, input, false).await,
         Err(EmbeddingError::ProviderUnavailable)
     ));
     let calls = provider.calls.lock().unwrap();
@@ -751,6 +769,7 @@ async fn remote_parts_distinguish_permanent_denial_from_transient_provider_error
             resource: std::num::NonZeroU64::MIN,
             credential: None,
         },
+        None,
     );
 
     let make_part = |class: DocClass| {

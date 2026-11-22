@@ -583,6 +583,57 @@ fn direct_segment_upsert_preserves_unrelated_pending_chunks_on_reopen() {
 }
 
 #[test]
+fn backfill_preserves_note_parts_across_reopen_and_replacement() {
+    let scratch = Scratch::new();
+    let scope = HistoryScope {
+        space_id: SpaceId::from_bytes([3; 16]),
+        incarnation: HistoryIncarnation::from_bytes([5; 16]),
+    };
+    let layout = Arc::new(SearchLayout::open(&DataRoot::new(&scratch.0), scope).unwrap());
+    let path = layout
+        .model_epoch(&VectorModel::local(model(), 64))
+        .unwrap();
+    let seq = |n| SpaceSeq::new(n).unwrap();
+    let first = fixture(1, 64);
+    let mut second = fixture(2, 64);
+    second.metadata.note = first.metadata.note.clone();
+    let sibling = fixture(3, 64);
+    let mut staged = Vec::new();
+    for (id, rows) in [
+        (1, vec![first.clone()]),
+        (2, vec![second.clone(), sibling.clone()]),
+    ] {
+        let segment = SegmentBuilder::with_test_rows(&model(), 64, rows)
+            .finish(&segment_file_path(&path, id))
+            .unwrap()
+            .unwrap();
+        staged.push((id, segment));
+    }
+    let mut epoch = VectorEpoch::open(layout.clone(), model(), 64).unwrap();
+    epoch.seed_segments(staged, seq(1)).unwrap();
+    drop(epoch);
+
+    let mut epoch = VectorEpoch::open(layout.clone(), model(), 64).unwrap();
+    let note = first.metadata.note.clone();
+    assert!(epoch.matches_note_chunks(&note, &[first.clone(), second]));
+    epoch
+        .apply(
+            seq(2),
+            MutableOperation::Upsert {
+                note: note.clone(),
+                chunks: vec![first.clone()],
+            },
+        )
+        .unwrap();
+    epoch.flush().unwrap();
+    drop(epoch);
+
+    let epoch = VectorEpoch::open(layout, model(), 64).unwrap();
+    assert!(epoch.matches_note_chunks(&note, &[first]));
+    assert!(epoch.matches_note_chunks(&sibling.metadata.note, std::slice::from_ref(&sibling)));
+}
+
+#[test]
 fn large_upsert_is_crash_safe_before_and_after_publish() {
     let scratch = Scratch::new();
     let scope = HistoryScope {
@@ -608,6 +659,8 @@ fn large_upsert_is_crash_safe_before_and_after_publish() {
     first.metadata.note = note.clone();
     second.metadata.note = note.clone();
     let replacement = [first, second];
+    // A one-row budget exercises the production rotation at a small scale.
+    let segment_budget = 64 + M0 * 4 + 132;
 
     // Window 1: publishing fails before epoch_manifest.json rotates.
     // Prior segment tombstones must remain untouched on disk.
@@ -615,7 +668,7 @@ fn large_upsert_is_crash_safe_before_and_after_publish() {
     fs::create_dir(&blocker).unwrap();
     assert!(
         epoch
-            .apply_large_upsert(seq(2), note.clone(), replacement.to_vec())
+            .replace_large_note(seq(2), note.clone(), replacement.to_vec(), segment_budget)
             .is_err()
     );
     assert!(
@@ -634,13 +687,14 @@ fn large_upsert_is_crash_safe_before_and_after_publish() {
     // Window 2: crash after epoch_manifest.json publishes, before old .tomb persists.
     // Reopening must reconcile superseded segments and persist the missing tombstone.
     epoch
-        .apply_large_upsert(seq(2), note.clone(), replacement.to_vec())
+        .replace_large_note(seq(2), note.clone(), replacement.to_vec(), segment_budget)
         .unwrap();
+    assert_eq!(epoch.snapshot().manifest().active_segments.len(), 3);
     assert!(seg1_tomb.exists());
     drop(epoch);
     fs::remove_file(&seg1_tomb).unwrap();
 
-    let epoch = VectorEpoch::open(layout, model(), 64).unwrap();
+    let mut epoch = VectorEpoch::open(layout.clone(), model(), 64).unwrap();
     assert!(
         seg1_tomb.exists(),
         "reopen must persist tombstones for superseded segments"
@@ -666,6 +720,21 @@ fn large_upsert_is_crash_safe_before_and_after_publish() {
         .hits;
     assert_eq!(hits.len(), 2);
     assert!(hits.iter().all(|hit| hit.metadata != old.metadata));
+
+    epoch.compact().unwrap();
+    drop(epoch);
+    let mut epoch = VectorEpoch::open(layout.clone(), model(), 64).unwrap();
+    assert!(epoch.matches_note_chunks(&note, &replacement));
+    epoch
+        .apply(seq(3), MutableOperation::Delete(note.clone()))
+        .unwrap();
+    epoch.flush().unwrap();
+    drop(epoch);
+    assert!(
+        VectorEpoch::open(layout, model(), 64)
+            .unwrap()
+            .matches_note_chunks(&note, &[])
+    );
 }
 
 #[test]
@@ -755,7 +824,7 @@ fn hnsw_traverses_but_never_returns_ineligible_slots() {
             cancellation: &cancellation,
             deadline: Instant::now() + Duration::from_secs(1),
         },
-        |slot| Ok(slot % 2 == 1),
+        |hit| Ok(hit.slot % 2 == 1),
     )
     .unwrap();
     assert!(result.evaluations > 1);
@@ -834,6 +903,158 @@ fn invisible_chunks_cannot_displace_visible_sealed_or_mutable_hits() {
 }
 
 #[test]
+fn vector_candidates_rank_notes_and_keep_their_best_chunks_across_tiers() {
+    let scratch = Scratch::new();
+    let scope = HistoryScope {
+        space_id: SpaceId::from_bytes([1; 16]),
+        incarnation: HistoryIncarnation::from_bytes([1; 16]),
+    };
+    let layout = Arc::new(SearchLayout::open(&DataRoot::new(&scratch.0), scope).unwrap());
+    let mut epoch = VectorEpoch::open(layout, model(), 64).unwrap();
+    let dominant = fixture(0, 64);
+    let second = fixture(1, 64);
+    let third = fixture(2, 64);
+    let rows = (0..120)
+        .map(|index| {
+            let mut chunk = dominant.clone();
+            chunk.metadata.spans = vec![ByteSpan::new(index, index + 1).unwrap()];
+            chunk
+        })
+        .chain([second.clone()])
+        .collect();
+    epoch
+        .seed(
+            SegmentBuilder::with_test_rows(&model(), 64, rows),
+            SpaceSeq::new(1).unwrap(),
+        )
+        .unwrap();
+    epoch
+        .apply(
+            SpaceSeq::new(2).unwrap(),
+            MutableOperation::Upsert {
+                note: third.metadata.note.clone(),
+                chunks: vec![third.clone()],
+            },
+        )
+        .unwrap();
+    let cancellation = Cancellation::default();
+    let budget = SearchBudget {
+        cancellation: &cancellation,
+        deadline: Instant::now() + Duration::from_secs(5),
+    };
+    let classes = BTreeSet::from([DocClass::UserDoc]);
+    let mask = VectorFilter {
+        classes: &classes,
+        folders: None,
+        notes: None,
+        excluded: None,
+    };
+    let snapshot = epoch.snapshot();
+    let hits = snapshot
+        .search_visible(&dominant.vector, &mask, 100, budget, |_| Ok(true))
+        .unwrap();
+    let notes = crate::query::ranking::fuse(Vec::new(), hits.hits, false);
+    assert_eq!(
+        notes.iter().map(|row| &row.note).collect::<Vec<_>>(),
+        vec![
+            &dominant.metadata.note,
+            &second.metadata.note,
+            &third.metadata.note
+        ]
+    );
+    assert_eq!(notes[0].chunks.len(), 100);
+    // A dominating note must not consume the graph frontier either.
+    let dir = SearchLayout::open(
+        &DataRoot::new(&scratch.0),
+        snapshot.manifest().scope.clone(),
+    )
+    .unwrap()
+    .model_epoch(&VectorModel::local(model(), 64))
+    .unwrap();
+    let segment = MmapSegment::open(
+        &segment_file_path(&dir, snapshot.manifest().active_segments[0]),
+        &model_hash(&model()),
+    )
+    .unwrap();
+    let neighbors = segment
+        .search_mode(
+            &dominant.vector,
+            &mmap_segment::SlotMask::All(segment.len()),
+            2,
+            1,
+            budget,
+            false,
+            |_| Ok(true),
+        )
+        .unwrap();
+    assert!(neighbors.hnsw_hops > 0);
+    assert!(
+        neighbors
+            .neighbors
+            .iter()
+            .any(|n| segment.note_id(n.slot) == Some(second.metadata.note.clone()))
+    );
+}
+
+#[test]
+fn broad_field_and_class_intersection_uses_exact_scan_for_a_single_matching_slot() {
+    use crate::lexical::tests::Snapshot;
+    let scratch = Scratch::new();
+    let scope = HistoryScope {
+        space_id: SpaceId::from_bytes([1; 16]),
+        incarnation: HistoryIncarnation::from_bytes([2; 16]),
+    };
+    let layout = Arc::new(SearchLayout::open(&DataRoot::new(&scratch.0), scope).unwrap());
+    let mut epoch = VectorEpoch::open(layout, model(), 64).unwrap();
+    let count = EXACT_SCAN_LIMIT as u32 + 1;
+    let rows: Vec<_> = (0..count).map(|slot| fixture(slot, 64)).collect();
+    let selected = rows.last().unwrap().clone();
+    let mut docs: Vec<_> = rows
+        .iter()
+        .map(|chunk| (chunk.metadata.note.clone(), DocClass::UserDoc))
+        .collect();
+    docs.extend((count..2 * count).map(|index| {
+        (
+            NoteId::from_bytes(u128::from(index).to_be_bytes()),
+            DocClass::AgentMemory,
+        )
+    }));
+    let structural = Snapshot::with_classes(docs);
+    let nodes = Bitmap::from_range(count - 1..2 * count);
+    epoch
+        .seed(
+            SegmentBuilder::with_test_rows(&model(), 64, rows),
+            SpaceSeq::new(1).unwrap(),
+        )
+        .unwrap();
+    let cancellation = Cancellation::default();
+    let budget = SearchBudget {
+        cancellation: &cancellation,
+        deadline: Instant::now() + Duration::from_secs(5),
+    };
+    let classes = BTreeSet::from([DocClass::UserDoc]);
+    let result = epoch
+        .snapshot()
+        .search_projected(
+            &selected.vector,
+            ProjectedVectorFilter {
+                snapshot: &structural,
+                classes: &classes,
+                folders: None,
+                nodes: Some(&nodes),
+                field_filtered: true,
+                excluded: &BTreeSet::new(),
+            },
+            100,
+            budget,
+        )
+        .unwrap();
+    assert_eq!(result.hnsw_hops, 0);
+    assert_eq!(result.hits.len(), 1);
+    assert_eq!(result.hits[0].metadata, selected.metadata);
+}
+
+#[test]
 fn ann_returns_oversampled_candidates_above_the_exploration_width() {
     let scratch = Scratch::new();
     let query = fixture(0, 64).vector;
@@ -849,8 +1070,8 @@ fn ann_returns_oversampled_candidates_above_the_exploration_width() {
     };
     let scorer = hnsw::Similarity::new(query.values(), query.scale()).unwrap();
     for top_k in [260, 800] {
-        let result = hnsw::query_graph(&segment, scorer, 0, 0, top_k, 1, budget, |slot| {
-            Ok(slot >= 256)
+        let result = hnsw::query_graph(&segment, scorer, 0, 0, top_k, 1, budget, |hit| {
+            Ok(hit.slot >= 256)
         })
         .unwrap();
         assert_eq!(result.neighbors.len(), top_k);
@@ -1270,16 +1491,19 @@ fn l0_soft_flush_headroom_and_bounded_delete_overflow() {
         seed_builder.push(fixture(idx, 64)).unwrap();
     }
     no_plan_epoch.seed(seed_builder, seq(1)).unwrap();
-    for page in 0u32..26 {
-        let start = page * 1_000 + 1;
-        let ops: Vec<_> = (start..start + 1_000)
-            .filter(|&id| id != 5)
-            .map(|id| MutableOperation::Delete(note_id(id)))
-            .collect();
-        no_plan_epoch
-            .apply_batch(seq(u64::from(page) + 2), ops)
-            .unwrap();
-    }
+    let count = 26_000;
+    let ops = (1..=count)
+        .filter(|&id| id != 5)
+        .map(|id| MutableOperation::Delete(note_id(id)))
+        .collect();
+    wal::ADMISSION_VISITS.with(|visits| visits.set(0));
+    no_plan_epoch.apply_batch(seq(2), ops).unwrap();
+    wal::ADMISSION_VISITS.with(|visits| {
+        assert!(
+            visits.get() <= 4 * count as usize,
+            "admission revisited prefixes"
+        );
+    });
     assert_eq!(
         no_plan_epoch.snapshot().manifest().active_segments.len(),
         1,
@@ -1528,6 +1752,9 @@ fn active_plan_prevents_overlap_and_reopen_skips_fully_tombstoned_newer_notes() 
         reopen_epoch
             .seed_segments(vec![(1, seg1), (2, seg2)], seq(1))
             .unwrap();
+        let mut legacy = reopen_epoch.snapshot().manifest().clone();
+        legacy.recovery = crate::layout::SegmentRecovery::Legacy;
+        reopen_layout.publish_epoch(&legacy).unwrap();
         drop(reopen_epoch);
 
         let reopened = VectorEpoch::open(reopen_layout, model(), 64).unwrap();

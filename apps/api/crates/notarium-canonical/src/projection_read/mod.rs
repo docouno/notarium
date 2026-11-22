@@ -55,6 +55,7 @@ macro_rules! read_rows {
 }
 
 mod aliases;
+mod children;
 mod delta;
 mod exact;
 mod ranks;

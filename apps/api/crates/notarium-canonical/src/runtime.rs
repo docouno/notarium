@@ -1269,6 +1269,7 @@ impl CanonicalStore {
                     .broadcast_hub
                     .publish(BroadcastSignal::CatalogChanged {
                         scope: record.scope.clone(),
+                        lifecycle: record.space.lifecycle,
                     });
                 Ok(record)
             },

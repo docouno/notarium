@@ -338,6 +338,23 @@ async fn run_scenario(store: Arc<CanonicalStore>, root: DataRoot, tag: u8) {
     assert_eq!(initial.hits[0].card.title, "Install guide");
     assert!(initial.hits[0].chunks[0].text().contains("needle"));
     assert!(initial.degraded.is_none());
+    // Only the vector traversal needs to look up the unrelated glossary note.
+    let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    projection.snapshot.write().unwrap().blocked_lookup = Some((b.clone(), observed.clone()));
+    let fallback = tokio::time::timeout(
+        Duration::from_secs(2),
+        engine.search(ctx.clone(), query("needle")),
+    )
+    .await
+    .expect("the vector deadline must release a stalled traversal")
+    .unwrap();
+    projection.snapshot.write().unwrap().blocked_lookup = None;
+    assert!(observed.load(Ordering::SeqCst));
+    assert_eq!(fallback.hits[0].card.title, "Install guide");
+    assert!(matches!(
+        fallback.degraded,
+        Some(notarium_core::ports::SearchDegradation::BudgetExceeded)
+    ));
     let mut rooted = query("needle");
     rooted.folder = Some(folder.clone());
     assert_eq!(
@@ -1447,6 +1464,21 @@ async fn chat_candidate_visibility(store: Arc<CanonicalStore>, root: DataRoot) {
         engine.search(viewer, req).await.unwrap().chat_hits[0].thread,
         shared
     );
+    let lifecycle_ctx = context(&space.scope, &owner);
+    set_space_state(
+        &store,
+        &lifecycle_ctx,
+        notarium_core::auth::SpaceLifecycle::Archived,
+    )
+    .await;
+    wait_for_retirement(&layout).await;
+    set_space_state(
+        &store,
+        &lifecycle_ctx,
+        notarium_core::auth::SpaceLifecycle::Active,
+    )
+    .await;
+    acknowledged(&store, &root, &space.scope, after.tantivy_seq).await;
     engine.shutdown().await;
 
     let thread = store
@@ -2444,7 +2476,7 @@ async fn lexical_evidence_and_live_chat_pagination() {
         .scope;
     let ctx = context(&scope, &owner);
     let id = sample_note_id(32);
-    let text = "## First\n\nUnrelated.\n\n## Second\n\nIntroduction.\n\n## Third\n\nBackground.\n\n## Fourth\n\nRareWidget::dispatch";
+    let text = "## First\n\nbranchterm.\n\n## Second\n\nIntroduction.\n\n## Third\n\nBackground.\n\n## Fourth\n\nRareWidget::dispatch";
     store
         .commit_synthetic_note_batch_for_test(
             &scope,
@@ -2478,7 +2510,7 @@ async fn lexical_evidence_and_live_chat_pagination() {
         let body = if index == 0 {
             format!("pageterm {}", "background ".repeat(16))
         } else {
-            "pageterm pageterm".into()
+            "pageterm pageterm branchterm".into()
         };
         let appended = store
             .append_chat(
@@ -2511,7 +2543,9 @@ async fn lexical_evidence_and_live_chat_pagination() {
         live: RwLock::new([id].into()),
     });
     let pages = Arc::new(HeldPages::new(store.clone()));
+    let carriers = Arc::new(ControlledCarriers::new(store.clone()));
     let mut deps = SearchDependencies::new(store.clone(), projection);
+    deps.carriers = carriers.clone();
     deps.changes = pages.clone();
     let engine = SearchEngine::start(SearchConfig::new(root.clone(), VectorMode::Disabled), deps);
     engine.start_space(scope.clone()).unwrap();
@@ -2555,24 +2589,46 @@ async fn lexical_evidence_and_live_chat_pagination() {
     // higher-scoring entries. The remaining, weaker entry must still be found.
     pages.hold(last);
     let first = first.unwrap();
-    store
-        .fork_chat(
-            ctx.clone(),
-            mutation(
-                &ctx,
-                notarium_core::ports::ForkChat {
-                    thread,
-                    parent: first,
-                },
-            ),
-        )
-        .await
-        .unwrap();
+    let mut mixed = query("branchterm");
+    mixed.include_chats = true;
+    mixed.top_k = PageLimit::new(1).unwrap();
+    carriers.hold_hydrated_chat.store(true, Ordering::SeqCst);
+    let (mixed, ()) = tokio::join!(engine.search(ctx.clone(), mixed), async {
+        tokio::time::timeout(Duration::from_secs(3), carriers.chat_held.notified())
+            .await
+            .unwrap();
+        store
+            .fork_chat(
+                ctx.clone(),
+                mutation(
+                    &ctx,
+                    notarium_core::ports::ForkChat {
+                        thread,
+                        parent: first,
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        carriers.release_chat.notify_one();
+    });
+    let mixed = mixed.unwrap();
+    assert_eq!(mixed.hits.len(), 1);
+    assert!(
+        mixed.chat_hits.is_empty(),
+        "the admitted chat left the branch before note delivery"
+    );
     request.top_k = PageLimit::new(1).unwrap();
-    let visible = engine.search(ctx, request).await.unwrap();
+    let visible = engine.search(ctx.clone(), request.clone()).await.unwrap();
     assert_eq!(visible.chat_hits.len(), 1);
     assert_eq!(visible.chat_hits[0].entry, first);
     assert!(!visible.truncated);
+    // All strict matches left the branch. The one surviving single-term entry
+    // becomes eligible for relaxation even while its old siblings remain indexed.
+    request.text = "pageterm branchterm orangeterm".into();
+    let relaxed = engine.search(ctx, request).await.unwrap();
+    assert_eq!(relaxed.chat_hits.len(), 1);
+    assert_eq!(relaxed.chat_hits[0].entry, first);
     pages.release();
     engine.shutdown().await;
     runtime.shutdown().await.unwrap();

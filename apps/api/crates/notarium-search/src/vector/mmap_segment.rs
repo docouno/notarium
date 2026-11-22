@@ -7,7 +7,7 @@ use super::{
     ChunkMetadata, EXACT_SCAN_LIMIT, M, M0, MAX_CONTEXT_SPANS, MAX_DIMENSION, MAX_LEVEL,
     MIN_DIMENSION, QuantizedVector, SearchBudget, VectorError,
     format::*,
-    hnsw::{self, ExactNeighbor, Graph, Neighbor, Similarity},
+    hnsw::{self, ExactNeighbor, Graph, Neighbor, RankedChunks, Similarity},
     simd::Dot,
 };
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
@@ -21,12 +21,7 @@ use notarium_core::{
     ids::{ContentDigest, NoteId},
     span::ByteSpan,
 };
-use std::{
-    cmp::{Ordering, Reverse},
-    collections::BinaryHeap,
-    ops::Range,
-    path::Path,
-};
+use std::{cmp::Ordering, collections::HashSet, ops::Range, path::Path};
 
 pub(super) enum SlotMask<'a> {
     All(u32),
@@ -699,6 +694,8 @@ impl MmapSegment {
         }
         if !exact {
             let scorer = Similarity::new(query.values(), query.scale())?;
+            let mut ranked = RankedChunks::new(top_k);
+            let mut visited_notes = HashSet::new();
             let explored = hnsw::query_graph(
                 self,
                 scorer,
@@ -707,17 +704,23 @@ impl MmapSegment {
                 top_k,
                 active_segments,
                 budget,
-                |slot| {
-                    if !eligible.contains(slot) {
+                |hit| {
+                    if !eligible.contains(hit.slot) || !visible(hit.slot)? {
                         return Ok(false);
                     }
-                    visible(slot)
+                    let ord = self
+                        .note_ord_for_slot(hit.slot)
+                        .ok_or(VectorError::CorruptIndex)?;
+                    if ranked.admits_score(hit.score) {
+                        ranked.insert(self.ranked_chunk(hit)?);
+                    }
+                    // One frontier admission per note keeps many near-identical
+                    // chunks from stopping the walk before other notes are seen.
+                    Ok(visited_notes.insert(ord))
                 },
             )?;
-            // Never fall back from HNSW to an O(N) scan over >EXACT_SCAN_LIMIT
-            // slots when a selective visibility predicate yields fewer than top-k.
             return Ok(SegmentSearch {
-                neighbors: explored.neighbors,
+                neighbors: ranked.finish(),
                 hnsw_hops: explored.evaluations,
             });
         }
@@ -736,10 +739,9 @@ impl MmapSegment {
         mut visible: impl FnMut(u32) -> Result<bool, VectorError>,
     ) -> Result<Vec<Neighbor>, VectorError> {
         let dot = Dot::new(query.values()).ok_or(VectorError::InvalidDimension)?;
-        let mut best = BinaryHeap::<Reverse<ExactNeighbor<'_>>>::with_capacity(top_k);
+        let mut best = RankedChunks::new(top_k);
         let vectors = signed_bytes(self.section(VECTORS));
         let scales = self.section(SCALES).as_chunks::<4>().0;
-        let spans_section = self.section(SPANS);
         let mut slots = [0u32; 256];
         let mut scores = [0i32; 256];
         let mut range_next = 0u32;
@@ -777,53 +779,39 @@ impl MmapSegment {
                     return Err(VectorError::CorruptIndex);
                 }
                 let score = score as f32 * query.scale() * scale;
-                if best.len() == top_k
-                    && best
-                        .peek()
-                        .is_some_and(|worst| score.total_cmp(&worst.0.hit.score) == Ordering::Less)
-                {
-                    continue;
+                if best.admits_score(score) && visible(slot)? {
+                    best.insert(self.ranked_chunk(Neighbor { slot, score })?);
                 }
-                if !visible(slot)? {
-                    continue;
-                }
-                let meta = self
-                    .row(METADATA, slot as usize, META_BYTES)
-                    .ok_or(VectorError::CorruptIndex)?;
-                let first_body_span =
-                    (read_u32(meta, 72) as usize).saturating_add(usize::from(read_u16(meta, 78)));
-                let span_offset = first_body_span
-                    .checked_mul(8)
-                    .ok_or(VectorError::CorruptIndex)?;
-                let span_bytes = spans_section
-                    .get(
-                        span_offset
-                            ..span_offset
-                                .checked_add(4)
-                                .ok_or(VectorError::CorruptIndex)?,
-                    )
-                    .ok_or(VectorError::CorruptIndex)?;
-                let note = self.note_bytes(meta).ok_or(VectorError::CorruptIndex)?;
-                hnsw::keep_best(
-                    &mut best,
-                    ExactNeighbor {
-                        hit: Neighbor { slot, score },
-                        note,
-                        span: read_u32(span_bytes, 0) as usize,
-                        key: &meta[..32],
-                    },
-                    top_k,
-                );
             }
             if bounded < count {
                 break;
             }
         }
         budget.check()?;
-        Ok(hnsw::finish(best)
-            .into_iter()
-            .map(|neighbor| neighbor.hit)
-            .collect())
+        Ok(best.finish())
+    }
+
+    fn ranked_chunk(&self, hit: Neighbor) -> Result<ExactNeighbor<'_>, VectorError> {
+        let meta = self
+            .row(METADATA, hit.slot as usize, META_BYTES)
+            .ok_or(VectorError::CorruptIndex)?;
+        let first_span = (read_u32(meta, 72) as usize)
+            .checked_add(usize::from(read_u16(meta, 78)))
+            .ok_or(VectorError::CorruptIndex)?;
+        let span_offset = first_span.checked_mul(8).ok_or(VectorError::CorruptIndex)?;
+        let end = span_offset
+            .checked_add(4)
+            .ok_or(VectorError::CorruptIndex)?;
+        let span = self
+            .section(SPANS)
+            .get(span_offset..end)
+            .ok_or(VectorError::CorruptIndex)?;
+        Ok(ExactNeighbor {
+            hit,
+            note: self.note_bytes(meta).ok_or(VectorError::CorruptIndex)?,
+            span: read_u32(span, 0) as usize,
+            key: &meta[..32],
+        })
     }
 }
 

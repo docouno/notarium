@@ -571,12 +571,16 @@ pub trait ProviderEgressLease: Send {
     /// The canonical owner verifies this active project and pins its lifecycle
     /// even when the call contains only trusted orchestration instructions.
     fn project(&self) -> Option<&FolderRef>;
+    /// Scoped query folders verified inside this project. The lease pins their
+    /// active ancestry until dispatch finishes or is cancelled.
+    fn project_folders(&self) -> &BTreeSet<FolderId>;
     fn check(&self) -> DomainResult<()>;
 }
 #[derive(Clone, Debug)]
 pub struct ProviderEgressRequest {
     pub origins: Vec<ProviderOrigin>,
     pub project: Option<FolderRef>,
+    pub project_folders: BTreeSet<FolderId>,
 }
 pub trait ProviderEgressCatalogPort: Send + Sync {
     fn acquire_egress(

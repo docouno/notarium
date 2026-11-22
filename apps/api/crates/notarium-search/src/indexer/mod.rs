@@ -90,6 +90,66 @@ enum IndexError {
 }
 
 impl IndexError {
+    /// Only discard rebuildable files when the checkpoint is demonstrably invalid.
+    fn invalid_checkpoint(&self) -> bool {
+        use std::io::ErrorKind;
+        use tantivy::{
+            TantivyError,
+            directory::error::{OpenDirectoryError, OpenReadError},
+        };
+        let invalid_file = |error: &std::io::Error| {
+            matches!(
+                error.kind(),
+                ErrorKind::NotFound
+                    | ErrorKind::NotADirectory
+                    | ErrorKind::InvalidData
+                    | ErrorKind::UnexpectedEof
+            )
+        };
+        match self {
+            Self::Inconsistent
+            | Self::Layout(LayoutError::Corrupt | LayoutError::WrongHistory)
+            | Self::Vector(
+                VectorError::CorruptIndex
+                | VectorError::InvalidChunk
+                | VectorError::InvalidDimension
+                | VectorError::InvalidVector
+                | VectorError::Layout(LayoutError::Corrupt | LayoutError::WrongHistory),
+            )
+            | Self::Lexical(
+                LexicalError::CorruptIndex
+                | LexicalError::Tantivy(
+                    TantivyError::DataCorruption(_)
+                    | TantivyError::IncompatibleIndex(_)
+                    | TantivyError::DeserializeError(_)
+                    | TantivyError::SchemaError(_)
+                    | TantivyError::OpenDirectoryError(
+                        OpenDirectoryError::DoesNotExist(_) | OpenDirectoryError::NotADirectory(_),
+                    )
+                    | TantivyError::OpenReadError(
+                        OpenReadError::FileDoesNotExist(_) | OpenReadError::IncompatibleIndex(_),
+                    ),
+                ),
+            ) => true,
+            Self::Layout(LayoutError::Io(error))
+            | Self::Lexical(LexicalError::Io(error))
+            | Self::Vector(VectorError::Io(error) | VectorError::Layout(LayoutError::Io(error))) => {
+                invalid_file(error)
+            }
+            Self::Lexical(LexicalError::Tantivy(
+                TantivyError::IoError(error)
+                | TantivyError::OpenDirectoryError(OpenDirectoryError::IoError {
+                    io_error: error,
+                    ..
+                })
+                | TantivyError::OpenReadError(OpenReadError::IoError {
+                    io_error: error, ..
+                }),
+            )) => invalid_file(error),
+            _ => false,
+        }
+    }
+
     fn requires_reseed(&self) -> bool {
         match self {
             Self::Port(PortError::Domain(error)) | Self::Domain(error) => error.requires_resync(),
@@ -540,12 +600,17 @@ async fn consume(
     starting_scope: HistoryScope,
     schedule: Schedule,
 ) -> Result<Option<HistoryScope>, IndexError> {
-    let record = cx
+    let record = match cx
         .services
         .deps
         .canonical
         .read_space(&starting_scope.space_id)
-        .await?;
+        .await
+    {
+        Ok(record) => record,
+        Err(PortError::Domain(DomainError::ResourceNotFound)) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
     let scope = record.scope;
     let data_root = cx.services.config.data_root.clone();
     let layout_scope = scope.clone();
@@ -1393,7 +1458,7 @@ fn spawn_bg_if_ready(
     }
     let now = Instant::now();
     // 1. Reopen checkpointed VectorEpoch off-thread (never blocked by replacement backoff).
-    if disk.epoch.is_none() && disk.manifest.vector_seq.is_some() {
+    if disk.epoch.is_none() && disk.manifest.vector_seq.is_some() && now >= embedder_retry_at {
         let cancel = Cancellation::default();
         let layout = disk.layout.clone();
         let manifest = disk.manifest.clone();
@@ -1610,7 +1675,7 @@ async fn handle_bg_done(
                     current.embedder_last_use = Instant::now();
                     current.embedder_unavailable = false;
                 }
-                Err(error) => {
+                Err(error) if error.invalid_checkpoint() => {
                     tracing::warn!(kind = %error, "search vector checkpoint needs rebuilding");
                     current.manifest.vector_seq = None;
                     current.manifest.embeddings_pending = true;
@@ -1618,6 +1683,10 @@ async fn handle_bg_done(
                     current.embedder_unavailable = false;
                     current.publish_manifest().await?;
                     *model_check_due = true;
+                }
+                Err(error) => {
+                    tracing::warn!(kind = %error, "search vector checkpoint could not be opened");
+                    *embedder_retry_at = Instant::now() + Duration::from_secs(5);
                 }
             }
             let will_load_embedder = current.epoch.is_some()
@@ -2151,11 +2220,18 @@ async fn open_disk(
                     layout_open.clear_lexical_manifests()?;
                     None
                 }
-                Err(error @ IndexError::Lexical(LexicalError::ReaderUnavailable)) => {
+                Err(error) if error.invalid_checkpoint() => None,
+                Err(error) => return Err(error),
+            };
+            if disk.is_none()
+                && let Err(error) = layout_open.folder_dictionary()
+            {
+                let error = IndexError::Layout(error);
+                if !error.invalid_checkpoint() {
                     return Err(error);
                 }
-                Err(_) => None,
-            };
+                layout_open.clear_lexical_manifests()?;
+            }
             let preserve = disk
                 .as_ref()
                 .map(|(disk, _)| disk.manifest.generation())
@@ -2180,9 +2256,6 @@ async fn open_disk(
                 })
                 .map(ResolvedEmbeddingTarget::vector_model);
             layout_open.remove_vector_epochs(vector_model.as_ref())?;
-            if disk.is_none() && layout_open.folder_dictionary().is_err() {
-                layout_open.clear_lexical_manifests()?;
-            }
             Ok(disk)
         },
     )

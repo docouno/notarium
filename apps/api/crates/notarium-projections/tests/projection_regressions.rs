@@ -3530,8 +3530,15 @@ async fn snapshot_outgoing_and_incoming_enforce_live_fence_and_propagate_not_rea
         retained_during_write.next().is_none(),
         "retained iterator must fail closed while live fence write lock is held"
     );
+    let mut neighbors = snapshot.neighbor_page(source2_node, PageLimit::new(64).unwrap());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), &mut neighbors)
+            .await
+            .is_err()
+    );
     resume.send(()).unwrap();
     write_task.await.unwrap().unwrap();
+    assert_eq!(neighbors.await.unwrap(), vec![target2_node]);
     assert_eq!(
         snapshot.outgoing(source2_node).unwrap().collect::<Vec<_>>(),
         vec![target2_node]

@@ -182,6 +182,10 @@ impl SearchModelResolverPort for SwitchingResolver {
 #[derive(Default)]
 pub(super) struct ModelProvider {
     pub(super) queries: Mutex<Vec<ProviderResourceId>>,
+    query_folders: Mutex<Vec<Option<FolderId>>>,
+    hold_query: AtomicBool,
+    query_started: Notify,
+    release_query: Notify,
     pub(super) parts: AtomicUsize,
     pub(super) outside_parts: AtomicUsize,
     pub(super) fail_indexing: AtomicBool,
@@ -201,6 +205,7 @@ impl EmbeddingProviderPort for ModelProvider {
         _: ProviderResourceId,
         _: ModelProfileId,
         _: Option<FolderRef>,
+        _: Option<notarium_core::ids::FolderId>,
     ) -> PortFuture<'_, BTreeSet<DocClass>> {
         Box::pin(async { Ok(BTreeSet::from([DocClass::UserDoc])) })
     }
@@ -211,8 +216,19 @@ impl EmbeddingProviderPort for ModelProvider {
         request: EmbeddingRequest,
     ) -> PortFuture<'_, EmbeddingResult> {
         Box::pin(async move {
-            if matches!(&request.inputs[..], [EmbeddingInput::Query(_)]) {
+            if let [EmbeddingInput::Query(input)] = &request.inputs[..] {
+                self.query_folders
+                    .lock()
+                    .unwrap()
+                    .push(input.folder.clone());
                 self.queries.lock().unwrap().push(request.provider.clone());
+                if self.hold_query.swap(false, Ordering::SeqCst) {
+                    self.query_started.notify_one();
+                    tokio::select! {
+                        () = self.release_query.notified() => {},
+                        () = ctx.budget.cancellation.cancelled() => return Err(DomainError::AccessDenied.into()),
+                    }
+                }
             } else {
                 self.parts.fetch_add(request.inputs.len(), Ordering::SeqCst);
                 if self.block_next_part.swap(false, Ordering::SeqCst) {
@@ -388,6 +404,37 @@ pub async fn model_epochs_and_repair(store: Arc<CanonicalStore>, root: DataRoot)
             .title,
         "Repeated note"
     );
+
+    // The second query resolves A while A's first request occupies the worker.
+    // Replace the default before the queued request is allowed to dispatch.
+    provider.hold_query.store(true, Ordering::SeqCst);
+    let before = provider.queries.lock().unwrap().len();
+    let first = engine.search(ctx.clone(), semantic.clone());
+    let queued = async {
+        provider.query_started.notified().await;
+        let second = engine.search(ctx.clone(), query("identical"));
+        let switch = async {
+            while engine.queued_embeddings()[0] == 0 {
+                tokio::task::yield_now().await;
+            }
+            resolver.provider.store(6, Ordering::SeqCst);
+            provider.release_query.notify_one();
+        };
+        tokio::join!(second, switch).0.unwrap()
+    };
+    let (first, second) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(first, queued)
+    })
+    .await
+    .unwrap();
+    assert!(first.unwrap().degraded.is_none());
+    assert!(matches!(
+        second.degraded,
+        Some(SearchDegradation::EmbeddingsPending)
+    ));
+    assert_eq!(second.hits[0].card.title, "Repeated note");
+    assert_eq!(provider.queries.lock().unwrap().len(), before + 1);
+    resolver.provider.store(5, Ordering::SeqCst);
 
     // Switching models within the same remote provider and runtime epochs keeps
     // serving the previous epoch while the replacement builds.
@@ -926,10 +973,14 @@ pub async fn model_epochs_and_repair(store: Arc<CanonicalStore>, root: DataRoot)
         Some(SearchDegradation::ProviderUnavailable)
     ));
     assert_eq!(provider.queries.lock().unwrap().len(), before);
-    mixed_scope.folder = Some(project);
+    mixed_scope.folder = Some(project.clone());
     let narrow = engine.search(keeper, mixed_scope).await.unwrap();
     assert!(narrow.degraded.is_none());
     assert_eq!(provider.queries.lock().unwrap().len(), before + 1);
+    assert_eq!(
+        provider.query_folders.lock().unwrap().last(),
+        Some(&Some(project))
+    );
     engine.shutdown().await;
 
     let cold_root = DataRoot::new(root.root().join("undersized"));
@@ -1193,6 +1244,7 @@ impl EmbeddingProviderPort for SlowProvider {
         _: ProviderResourceId,
         _: ModelProfileId,
         _: Option<FolderRef>,
+        _: Option<notarium_core::ids::FolderId>,
     ) -> PortFuture<'_, BTreeSet<DocClass>> {
         Box::pin(async { Ok(BTreeSet::from([DocClass::UserDoc])) })
     }

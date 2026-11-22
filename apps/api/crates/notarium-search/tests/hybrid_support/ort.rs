@@ -35,7 +35,7 @@ use std::{
 };
 
 struct LocalResolver(
-    BTreeMap<SpaceId, ModelProfileId>,
+    RwLock<BTreeMap<SpaceId, ModelProfileId>>,
     std::sync::atomic::AtomicBool,
 );
 
@@ -53,6 +53,8 @@ impl SearchModelResolverPort for LocalResolver {
             }
             Ok(self
                 .0
+                .read()
+                .unwrap()
                 .get(&scope.space_id)
                 .filter(|model| explicit.is_none_or(|requested| *model == requested))
                 .map(|model| ResolvedEmbeddingTarget {
@@ -161,10 +163,10 @@ pub async fn search_with_dynamic_models(store: Arc<CanonicalStore>, root: DataRo
     let fast_model = ModelProfileId::from_bytes([0x70; 16]);
     let slow_model = ModelProfileId::from_bytes([0x71; 16]);
     let resolver = Arc::new(LocalResolver(
-        BTreeMap::from([
+        RwLock::new(BTreeMap::from([
             (fast.scope().space_id.clone(), fast_model.clone()),
             (slow.scope().space_id.clone(), slow_model.clone()),
-        ]),
+        ])),
         Default::default(),
     ));
     let projection = Arc::new(Projections(BTreeMap::from([
@@ -312,6 +314,37 @@ pub async fn search_with_dynamic_models(store: Arc<CanonicalStore>, root: DataRo
                 Some(EmbeddingBackendTarget::LocalOnnxCls)
             ) && matches!(result.degraded, Some(SearchDegradation::ModelUnavailable))
             {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    // The replacement graph returns a pooled row even for a zero first token.
+    // Changing only the installed profile ID must publish its own vector epoch.
+    let replacement = ModelProfileId::from_bytes([0x72; 16]);
+    models.install_pooled_2d(&replacement);
+    resolver
+        .0
+        .write()
+        .unwrap()
+        .insert(fast.scope().space_id.clone(), replacement.clone());
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let result = engine
+                .search(fast.clone(), query("zero red"))
+                .await
+                .unwrap();
+            let manifest = layout.search_manifest().unwrap().unwrap();
+            if manifest
+                .active_model
+                .as_ref()
+                .is_some_and(|model| model.model == replacement)
+                && result.degraded.is_none()
+            {
+                assert_eq!(result.hits[0].card.title, "Warm palette");
                 break;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;

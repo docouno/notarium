@@ -290,7 +290,6 @@ impl Bpe {
         let mut first = true;
         let mut unknown = false;
         let mut buf = String::new();
-        let mut utf8 = [0u8; 4];
         let flush_unknown = |symbols: &mut Vec<Symbol>, unknown: &mut bool| {
             if std::mem::take(unknown) {
                 push_symbol(symbols, self.unknown.expect("pending unknown"));
@@ -310,10 +309,10 @@ impl Bpe {
                 flush_unknown(&mut symbols, &mut unknown);
                 push_symbol(&mut symbols, id);
             } else if let Some(table) = &self.byte_tokens
-                && let Some(raw) = byte_fallback_ids(table, c.encode_utf8(&mut utf8).as_bytes())
+                && let Some(raw) = byte_fallback_ids(table, buf.as_bytes())
             {
-                // Byte fallback encodes only the raw scalar bytes, never prefix/suffix.
-                flush_unknown(&mut symbols, &mut unknown);
+                // Hugging Face emits these bytes immediately. A pending unknown
+                // is emitted on the next vocabulary match or at the end.
                 for &byte in raw {
                     push_symbol(&mut symbols, table[usize::from(byte)].expect("byte token"));
                 }
@@ -322,7 +321,7 @@ impl Bpe {
                     push_symbol(&mut symbols, unk_id);
                 }
                 unknown = true;
-            } else {
+            } else if self.byte_tokens.is_none() {
                 return Err(EmbeddingError::InvalidModel);
             }
         }

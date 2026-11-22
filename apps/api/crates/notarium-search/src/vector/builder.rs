@@ -80,6 +80,9 @@ impl SegmentBuilder {
         if cancel.is_some_and(Cancellation::is_cancelled) {
             return Err(VectorError::Cancelled);
         }
+        if self.at_budget() {
+            return Err(VectorError::BufferFull);
+        }
         chunk.validate(self.dimension)?;
         let key = chunk.metadata.key;
         let slot = self.graph.len();
@@ -130,12 +133,21 @@ impl SegmentBuilder {
     }
 
     pub fn estimated_bytes(&self) -> usize {
-        let per_node = self.graph.stride + M0 * 4 + 132 + if self.keys.is_some() { 72 } else { 0 };
-        self.len().saturating_mul(per_node)
+        self.len().saturating_mul(self.row_build_bytes())
+    }
+
+    fn row_build_bytes(&self) -> usize {
+        self.graph.stride + M0 * 4 + 132 + if self.keys.is_some() { 72 } else { 0 }
     }
 
     pub fn at_budget(&self) -> bool {
-        self.estimated_bytes() >= MAX_SEGMENT_BUILD_BYTES
+        self.full_for_next_row(MAX_SEGMENT_BUILD_BYTES)
+    }
+
+    pub(crate) fn full_for_next_row(&self, budget: usize) -> bool {
+        self.estimated_bytes()
+            .saturating_add(self.row_build_bytes())
+            > budget
     }
 
     pub(super) fn matches(&self, model: &VectorModel) -> bool {

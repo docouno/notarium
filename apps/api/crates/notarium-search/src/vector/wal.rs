@@ -18,6 +18,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static ADMISSION_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub const L0_FLUSH_CHUNKS: usize = 20_000;
 pub const L0_FLUSH_BYTES: usize = 12 * 1024 * 1024;
 pub const L0_MAX_CHUNKS: usize = 25_000;
@@ -296,6 +301,19 @@ impl MutableBuffer {
         operations: &[MutableOperation],
         allow_delete_overflow: bool,
     ) -> Result<(), VectorError> {
+        if self.admissible_prefix(seq, operations, allow_delete_overflow)? < operations.len() {
+            return Err(VectorError::BufferFull);
+        }
+        Ok(())
+    }
+
+    /// Size a whole WAL batch in one pass, including overwrites of the same note.
+    pub(super) fn admissible_prefix(
+        &self,
+        seq: SpaceSeq,
+        operations: &[MutableOperation],
+        allow_delete_overflow: bool,
+    ) -> Result<usize, VectorError> {
         if seq < self.last_seq || seq == SpaceSeq::ZERO {
             return Err(VectorError::CorruptIndex);
         }
@@ -303,7 +321,9 @@ impl MutableBuffer {
         let mut projected_bytes = self.mem_bytes;
         let mut projected_entries = self.entries.len();
         let mut batch_state: HashMap<&NoteId, (usize, usize)> = HashMap::new();
-        for operation in operations {
+        for (position, operation) in operations.iter().enumerate() {
+            #[cfg(test)]
+            ADMISSION_VISITS.with(|count| count.set(count.get() + 1));
             if let MutableOperation::Upsert { note, chunks } = operation {
                 for chunk in chunks {
                     if &chunk.metadata.note != note {
@@ -340,10 +360,10 @@ impl MutableBuffer {
                 || projected_entries > max_chunks
                 || projected_bytes > max_bytes
             {
-                return Err(VectorError::BufferFull);
+                return Ok(position);
             }
         }
-        Ok(())
+        Ok(operations.len())
     }
 
     fn apply_memory(
