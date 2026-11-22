@@ -1353,6 +1353,53 @@ fn l0_soft_flush_headroom_and_bounded_delete_overflow() {
     assert!(
         epoch.matches_note_chunks(&live_chunk.metadata.note, std::slice::from_ref(&live_chunk),)
     );
+
+    // 4. When an active plan runs with an empty L0, rejecting an oversized
+    // batch must stay atomic and leave both MutableBuffer and l0.wal empty.
+    let atomic_scratch = Scratch::new();
+    let atomic_scope = HistoryScope {
+        space_id: SpaceId::from_bytes([9; 16]),
+        incarnation: HistoryIncarnation::from_bytes([9; 16]),
+    };
+    let atomic_layout =
+        Arc::new(SearchLayout::open(&DataRoot::new(&atomic_scratch.0), atomic_scope).unwrap());
+    let atomic_dir = atomic_layout
+        .model_epoch(&VectorModel::local(model(), 64))
+        .unwrap();
+    let mut atomic_epoch = VectorEpoch::open(atomic_layout, model(), 64).unwrap();
+    let c1 = fixture(1, 64);
+    let c2 = fixture(2, 64);
+    let mut builder = SegmentBuilder::new(&model(), 64).unwrap();
+    builder.push(c1.clone()).unwrap();
+    builder.push(c2).unwrap();
+    atomic_epoch.seed(builder, seq(1)).unwrap();
+    let mut c1_v2 = c1.clone();
+    c1_v2.metadata.spans = vec![ByteSpan::new(10, 22).unwrap()];
+    atomic_epoch
+        .apply(
+            seq(2),
+            MutableOperation::Upsert {
+                note: c1.metadata.note,
+                chunks: vec![c1_v2],
+            },
+        )
+        .unwrap();
+    atomic_epoch.flush().unwrap();
+    assert_eq!(atomic_epoch.mutable_entry_count(), 0);
+    assert_eq!(fs::metadata(atomic_dir.join("l0.wal")).unwrap().len(), 0);
+
+    let compact_plan = atomic_epoch.plan_compact().expect("compaction plan");
+    let oversized_deletes: Vec<_> = (10_000..60_001)
+        .map(|i| MutableOperation::Delete(note_id(i)))
+        .collect();
+    assert!(matches!(
+        atomic_epoch.apply_batch(seq(3), oversized_deletes),
+        Err(VectorError::BufferFull)
+    ));
+    assert_eq!(atomic_epoch.mutable_entry_count(), 0);
+    assert_eq!(fs::metadata(atomic_dir.join("l0.wal")).unwrap().len(), 0);
+    assert!(MutableBuffer::open(&atomic_dir, 64).unwrap().is_empty());
+    drop(compact_plan);
 }
 
 #[test]

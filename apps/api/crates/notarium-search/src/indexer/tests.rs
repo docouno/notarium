@@ -1645,6 +1645,7 @@ async fn failed_embedder_load_respects_retry_backoff_without_busy_spin() {
         next_maintenance_wake(
             Some(&disk),
             false,
+            true,
             false,
             model_retry_at,
             embedder_retry_at,
@@ -1658,6 +1659,7 @@ async fn failed_embedder_load_respects_retry_backoff_without_busy_spin() {
         next_maintenance_wake(
             Some(&disk),
             false,
+            true,
             false,
             model_retry_at,
             embedder_retry_at,
@@ -1668,6 +1670,7 @@ async fn failed_embedder_load_respects_retry_backoff_without_busy_spin() {
     assert_eq!(
         next_maintenance_wake(
             Some(&disk),
+            true,
             true,
             false,
             model_retry_at,
@@ -2183,4 +2186,170 @@ async fn search_after_embedder_idle_reloads_embedder_without_model_unavailable()
         runtime.shutdown().await.unwrap();
         std::fs::remove_dir_all(path).unwrap();
     }
+}
+
+#[tokio::test]
+async fn reconcile_reopening_clears_stale_flag_when_non_reopening_bg_task_spawns() {
+    let mut entropy = [0u8; 16];
+    getrandom::fill(&mut entropy).unwrap();
+    let path =
+        std::env::temp_dir().join(format!("search-reconcile-reopen-{}", hex::encode(entropy)));
+    std::fs::create_dir(&path).unwrap();
+    let root = DataRoot::new(&path);
+    let scope = HistoryScope {
+        space_id: SpaceId::from_bytes([0xf0; 16]),
+        incarnation: HistoryIncarnation::from_bytes([0xf0; 16]),
+    };
+    let layout = Arc::new(SearchLayout::open(&root, scope.clone()).unwrap());
+    let lexical =
+        Arc::new(LexicalIndex::create(&layout.create_index_generation(1).unwrap()).unwrap());
+    let profile = ModelProfileId::from_bytes([0xf1; 16]);
+    let seq = SpaceSeq::new(1).unwrap();
+    let mut epoch = VectorEpoch::open(layout.clone(), profile.clone(), 64).unwrap();
+    epoch
+        .seed(SegmentBuilder::new(&profile, 64).unwrap(), seq)
+        .unwrap();
+    let now = Instant::now();
+    let disk = Disk {
+        layout,
+        manifest: SearchManifest {
+            scope,
+            tantivy_seq: seq,
+            tantivy_commit: lexical.commit_id().unwrap(),
+            active_index_dir: crate::layout::index_name(1),
+            tokenizer_version: TOKENIZER_VERSION,
+            active_model: Some(ResolvedEmbeddingTarget {
+                model: profile,
+                dimension: 64,
+                max_input_tokens: 512,
+                backend: EmbeddingBackendTarget::LocalOnnx,
+            }),
+            vector_seq: Some(seq),
+            embeddings_pending: false,
+        },
+        folders: Arc::new(FolderDictionary::default()),
+        lexical: Some(lexical),
+        epoch: Some(epoch),
+        embedder: None,
+        dirty_notes: BTreeSet::new(),
+        cached_vectors: HashMap::new(),
+        full_sweep_after: None,
+        full_sweep_needed: false,
+        last_activity: now,
+        embedder_last_use: now,
+        embedder_unavailable: true,
+    };
+    let handle = Arc::new(SpaceHandle::new());
+    let mut publisher = Publisher {
+        handle: &handle,
+        old: Vec::new(),
+    };
+
+    // Simulate stale reopening_vectors = true published during resume_reader
+    // followed by spawning a non-reopening BgKind::ModelRefresh task.
+    publisher.publish(&disk, true);
+    assert!(handle.published.load_full().unwrap().reopening_vectors);
+
+    let bg = Some(BgTask {
+        kind: BgKind::ModelRefresh,
+        cancel: Cancellation::default(),
+        dirty: BgDirty::default(),
+        handle: tokio::spawn(async {
+            BgOutcome::ModelRefresh(Ok(build::ModelRefreshOutcome::Unchanged))
+        }),
+    });
+    reconcile_reopening(&mut publisher, &disk, &bg, true);
+    let published = handle.published.load_full().unwrap();
+    assert!(
+        !published.reopening_vectors,
+        "stale reopening_vectors must clear when a non-reopening BgTask spawns"
+    );
+    assert!(published.embedder_unavailable);
+    drop(published);
+    if let Some(task) = bg {
+        let _ = task.handle.await;
+    }
+
+    // Reopening BgTask (LoadEmbedder) must keep reopening_vectors = true.
+    let reopen_bg = Some(BgTask {
+        kind: BgKind::LoadEmbedder,
+        cancel: Cancellation::default(),
+        dirty: BgDirty::default(),
+        handle: tokio::spawn(async { BgOutcome::LoadEmbedder(None) }),
+    });
+    reconcile_reopening(&mut publisher, &disk, &reopen_bg, true);
+    assert!(handle.published.load_full().unwrap().reopening_vectors);
+    if let Some(task) = reopen_bg {
+        let _ = task.handle.await;
+    }
+
+    // When nothing spawned, stale reopening_vectors must also clear.
+    reconcile_reopening(&mut publisher, &disk, &None, false);
+    assert!(!handle.published.load_full().unwrap().reopening_vectors);
+
+    publisher.replace(None);
+    drop(publisher);
+    drop(handle);
+    drop(disk);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn disabled_vector_mode_never_schedules_maintenance_wake_on_pending_manifest() {
+    let mut entropy = [0u8; 16];
+    getrandom::fill(&mut entropy).unwrap();
+    let path = std::env::temp_dir().join(format!("search-disabled-wake-{}", hex::encode(entropy)));
+    std::fs::create_dir(&path).unwrap();
+    let root = DataRoot::new(&path);
+    let scope = HistoryScope {
+        space_id: SpaceId::from_bytes([0xf2; 16]),
+        incarnation: HistoryIncarnation::from_bytes([0xf2; 16]),
+    };
+    let layout = Arc::new(SearchLayout::open(&root, scope.clone()).unwrap());
+    let lexical =
+        Arc::new(LexicalIndex::create(&layout.create_index_generation(1).unwrap()).unwrap());
+    let now = Instant::now();
+    let disk = Disk {
+        layout,
+        manifest: SearchManifest {
+            scope,
+            tantivy_seq: SpaceSeq::new(1).unwrap(),
+            tantivy_commit: lexical.commit_id().unwrap(),
+            active_index_dir: crate::layout::index_name(1),
+            tokenizer_version: TOKENIZER_VERSION,
+            active_model: Some(ResolvedEmbeddingTarget {
+                model: ModelProfileId::from_bytes([0xf3; 16]),
+                dimension: 64,
+                max_input_tokens: 512,
+                backend: EmbeddingBackendTarget::LocalOnnx,
+            }),
+            vector_seq: None,
+            embeddings_pending: true,
+        },
+        folders: Arc::new(FolderDictionary::default()),
+        lexical: Some(lexical),
+        epoch: None,
+        embedder: None,
+        dirty_notes: BTreeSet::from([NoteId::from_bytes([0xf4; 16])]),
+        cached_vectors: HashMap::new(),
+        full_sweep_after: None,
+        full_sweep_needed: true,
+        last_activity: now,
+        embedder_last_use: now,
+        embedder_unavailable: false,
+    };
+
+    assert_eq!(
+        next_maintenance_wake(Some(&disk), false, false, true, now, now, now),
+        None,
+        "VectorMode::Disabled must never schedule a 0ns maintenance wake timer"
+    );
+    assert_eq!(
+        next_maintenance_wake(Some(&disk), false, true, false, now, now, now),
+        Some(now),
+        "enabled vector mode still schedules pending model backfill wake"
+    );
+
+    drop(disk);
+    std::fs::remove_dir_all(path).unwrap();
 }

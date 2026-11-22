@@ -285,10 +285,10 @@ fn verify_safety_comments(label: &str, raw: &str, no_comments: &str, code_only: 
             }
             continue;
         }
-        if is_attribute_only_line(no_comment_line) {
+        let blocks = unsafe_block_count(code_line);
+        if is_attribute_only_line(no_comment_line) && blocks == 0 {
             continue;
         }
-        let blocks = unsafe_block_count(code_line);
         assert!(
             blocks == 0 || (blocks == 1 && has_safety_comment),
             "audited leaf {label} has undocumented unsafe block on line: {raw_line}"
@@ -1069,6 +1069,41 @@ mod tests {
         let no_comments = strip_rust_comments(valid_multi_attr, false);
         let code_only = strip_rust_comments(valid_multi_attr, true);
         verify_safety_comments("leaf.rs", valid_multi_attr, &no_comments, &code_only);
+
+        // Rust 2024 `#[unsafe(...)]` attributes require their own `// SAFETY:` comment
+        // and consume it so a subsequent `unsafe` block cannot reuse it.
+        let unsafe_attr_undocumented = "#[unsafe(no_mangle)]\npub extern \"C\" fn f() {}\n";
+        let no_comments = strip_rust_comments(unsafe_attr_undocumented, false);
+        let code_only = strip_rust_comments(unsafe_attr_undocumented, true);
+        assert!(
+            std::panic::catch_unwind(|| verify_safety_comments(
+                "leaf.rs",
+                unsafe_attr_undocumented,
+                &no_comments,
+                &code_only
+            ))
+            .is_err()
+        );
+
+        let unsafe_attr_documented =
+            "// SAFETY: unique symbol\n#[unsafe(no_mangle)]\npub extern \"C\" fn f() {}\n";
+        let no_comments = strip_rust_comments(unsafe_attr_documented, false);
+        let code_only = strip_rust_comments(unsafe_attr_documented, true);
+        verify_safety_comments("leaf.rs", unsafe_attr_documented, &no_comments, &code_only);
+
+        let unsafe_attr_piggyback =
+            "// SAFETY: unique symbol\n#[unsafe(no_mangle)]\nunsafe { foo() }\n";
+        let no_comments = strip_rust_comments(unsafe_attr_piggyback, false);
+        let code_only = strip_rust_comments(unsafe_attr_piggyback, true);
+        assert!(
+            std::panic::catch_unwind(|| verify_safety_comments(
+                "leaf.rs",
+                unsafe_attr_piggyback,
+                &no_comments,
+                &code_only
+            ))
+            .is_err()
+        );
 
         // Audited leaf exact_safety_comments must ignore forged `// SAFETY:` in strings/blocks.
         let leaf_with_forged = concat!(

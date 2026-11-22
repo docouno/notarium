@@ -654,9 +654,11 @@ async fn run_active_loop(
 
     loop {
         let now = Instant::now();
+        let vectors_enabled = !matches!(cx.services.config.vector_mode, VectorMode::Disabled);
         let next_timer = next_maintenance_wake(
             disk.as_ref(),
             bg.is_some(),
+            vectors_enabled,
             retry_model,
             model_retry_at,
             embedder_retry_at,
@@ -964,18 +966,7 @@ async fn run_active_loop(
                 schedule.embedder_idle,
                 ack_after_embed,
             )?;
-            if spawned && bg.as_ref().is_some_and(BgTask::is_reopening) {
-                publisher.publish(current, true);
-            } else if bg.is_none()
-                && cx
-                    .handle
-                    .published
-                    .load()
-                    .as_ref()
-                    .is_some_and(|published| published.reopening_vectors)
-            {
-                publisher.publish(current, false);
-            }
+            reconcile_reopening(publisher, current, bg, spawned);
         }
         if ack_after_embed
             && !bg
@@ -1111,15 +1102,36 @@ async fn sync_subscription(
     Ok(())
 }
 
+fn reconcile_reopening(
+    publisher: &mut Publisher<'_>,
+    current: &Disk,
+    bg: &Option<BgTask>,
+    spawned: bool,
+) {
+    if spawned && bg.as_ref().is_some_and(BgTask::is_reopening) {
+        publisher.publish(current, true);
+    } else if publisher
+        .handle
+        .published
+        .load()
+        .as_ref()
+        .is_some_and(|published| published.reopening_vectors)
+    {
+        publisher.publish(current, false);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn next_maintenance_wake(
     disk: Option<&Disk>,
     bg_active: bool,
+    vectors_enabled: bool,
     retry_model: bool,
     model_retry_at: Instant,
     embedder_retry_at: Instant,
     repair_at: Instant,
 ) -> Option<Instant> {
-    if bg_active {
+    if bg_active || !vectors_enabled {
         return None;
     }
     let disk = disk.filter(|d| d.lexical.is_some())?;

@@ -750,6 +750,9 @@ impl VectorEpoch {
                 }
                 return Ok(());
             }
+            Err(VectorError::BufferFull) if self.has_active_plan() => {
+                return Err(VectorError::BufferFull);
+            }
             Err(VectorError::BufferFull) => {}
             Err(error) => return Err(error),
         }
