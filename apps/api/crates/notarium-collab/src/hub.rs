@@ -123,6 +123,7 @@ pub(crate) struct HubInner {
     room_capacity: Arc<Semaphore>,
     peers: Mutex<HashMap<u64, PeerRegistration>>,
     pending_revoke_settlement: Mutex<PendingRevokeSettlement>,
+    unsettled_shutdown_rooms: Mutex<HashSet<(HistoryScope, NoteId)>>,
     accept_closed: Cancellation,
     shutdown: Cancellation,
 }
@@ -179,6 +180,7 @@ impl CollabHub {
             active: Mutex::default(),
             peers: Mutex::default(),
             pending_revoke_settlement: Mutex::default(),
+            unsettled_shutdown_rooms: Mutex::default(),
             accept_closed: Cancellation::default(),
             shutdown: Cancellation::default(),
         });
@@ -274,6 +276,38 @@ impl CollabHub {
         }
         if let Some(error) = first_error {
             return Err(error);
+        }
+        // A failed close can outlive its actor. Confirm its durable outcome
+        // before a later shutdown call reports success.
+        let unsettled = self
+            .0
+            .unsettled_shutdown_rooms
+            .lock()
+            .expect("shutdown rooms")
+            .clone();
+        for (scope, note) in unsettled {
+            let slot = self.0.slot(&scope, &note);
+            let mut remaining = budget.clone();
+            remaining.remaining = deadline.saturating_duration_since(Instant::now());
+            let _held = lock_slot(&slot, &remaining).await?;
+            remaining.remaining = deadline.saturating_duration_since(Instant::now());
+            match tokio::time::timeout_at(
+                deadline,
+                self.0.recover_unhosted(&remaining, &scope, &note),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(PortError::Domain(DomainError::ValidationFailed { diagnostic })))
+                    if diagnostic.reason == ValidationReason::HistoryIncarnationMismatch => {}
+                Ok(Err(error)) => return Err(error),
+                Err(_) => return Err(deadline_error(b"collab_shutdown_recovery")),
+            }
+            self.0
+                .unsettled_shutdown_rooms
+                .lock()
+                .expect("shutdown rooms")
+                .remove(&(scope, note));
         }
         self.0.shutdown.cancel();
         Ok(())
@@ -712,9 +746,15 @@ impl HubInner {
             .collect()
     }
 
-    pub fn room_stopped(&self, room: &RoomHandle) {
+    pub fn room_stopped(&self, room: &RoomHandle, settled: bool) {
         let key = (room.scope().space_id.clone(), room.note().clone());
         let mut active = self.active.lock().expect("active rooms");
+        if !settled && self.accept_closed.is_cancelled() {
+            self.unsettled_shutdown_rooms
+                .lock()
+                .expect("shutdown rooms")
+                .insert((room.scope().clone(), room.note().clone()));
+        }
         if active
             .get(&key)
             .is_some_and(|registered| registered.same_lease(room))
@@ -887,7 +927,6 @@ impl HubInner {
             {
                 *held = None;
             }
-            let had_live_room = held.is_some();
             budget.remaining = deadline.saturating_duration_since(Instant::now());
             let current = self
                 .store
@@ -939,6 +978,17 @@ impl HubInner {
                     Err(error) => return Err(error),
                 }
             }
+            // Existing actors and their reconnect handshakes do not need a
+            // second permit. A cold open reserves before loading any payloads.
+            let capacity = if held.is_some() {
+                None
+            } else {
+                let Ok(permit) = self.room_capacity.clone().try_acquire_owned() else {
+                    outbound.guard.close(SessionClose::ROOM_CAPACITY);
+                    return Ok(None);
+                };
+                Some(permit)
+            };
             let base = match hello {
                 LineageHello::Reconnect {
                     client_history_incarnation,
@@ -962,10 +1012,9 @@ impl HubInner {
             // If the previously-live local room stopped while `admission` was
             // being read, `admission.session` may reflect its pre-close `Active`
             // row. Clear `held` and re-read fresh storage state.
-            if had_live_room
-                && held
-                    .as_ref()
-                    .is_some_and(|room| room.stopped().is_cancelled())
+            if held
+                .as_ref()
+                .is_some_and(|room| room.stopped().is_cancelled())
             {
                 *held = None;
                 continue;
@@ -978,9 +1027,7 @@ impl HubInner {
             };
             // Always retire stale local actors (including from a previous
             // incarnation) before deciding on reuse or reconnect lineage.
-            if let Some(room) = held.as_ref()
-                && !room.stopped().is_cancelled()
-            {
+            if let Some(room) = held.as_ref() {
                 if room.scope() == &admission.scope
                     && stored.is_some_and(|record| room.matches_durable_lease(record))
                 {
@@ -1055,10 +1102,6 @@ impl HubInner {
                 send_lineage_mismatch(outbound, admission, role);
                 return Ok(None);
             }
-            let Ok(capacity) = self.room_capacity.clone().try_acquire_owned() else {
-                outbound.guard.close(SessionClose::ROOM_CAPACITY);
-                return Ok(None);
-            };
             let prepared = Room::prepare(&admission)?;
             outbound
                 .guard
@@ -1088,7 +1131,7 @@ impl HubInner {
                         admission.slug,
                         record,
                         prepared,
-                        capacity,
+                        capacity.expect("a cold open reserves room capacity"),
                     );
                     *held = Some(handle.clone());
                     return Ok(Some((handle, role)));

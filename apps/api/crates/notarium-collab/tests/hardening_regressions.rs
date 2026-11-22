@@ -330,6 +330,40 @@ async fn graceful_hub_shutdown_settles_dirty_rooms_and_closes_waiting_peers() {
 }
 
 #[tokio::test]
+async fn shutdown_retry_settles_durable_state_after_the_actor_exits() {
+    let (_root, store, runtime, hub, owner) =
+        open_sqlite_env("shutdown-close-fence", CollabConfig::default()).await;
+    let seed = create_note(&store, &owner, 39, "Start.\n", None).await;
+    let (mut peer, _) = synced_client(&hub, &owner, &seed.note, 903).await;
+    peer.send_update(&peer.append("Confirmed.\n")).await;
+    peer.ack().await;
+    let held = store
+        .room_fences()
+        .get_or_init(owner.scope(), &seed.note)
+        .lock_owned()
+        .await;
+    assert!(hub.shutdown(&budget()).await.is_err());
+    wait_until(async || hub.active_room_count() == 0).await;
+    drop(held);
+    hub.shutdown(&budget()).await.unwrap();
+    let state = store
+        .read_collab_session(None, owner.scope(), &seed.note)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        state.session.room_state,
+        notarium_canonical::CollabRoomState::Closed
+    );
+    assert!(state.updates.is_empty());
+    assert_eq!(
+        note_head(&store, &owner, &seed.note).await.1,
+        "Start.\nConfirmed.\n"
+    );
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn split_session_supports_concurrent_send_and_recv() {
     let (_root, store, runtime, hub, owner) = open_sqlite_env("split-session", fast_config()).await;
     let seed = create_note(&store, &owner, 6, "Split base.\n", None).await;
@@ -478,7 +512,7 @@ async fn concurrent_hello_on_distinct_notes_respects_room_limit() {
 async fn stale_incarnation_rejected_raw_title_editable_lease_precondition_and_room_capacity() {
     let mut cfg = fast_config();
     cfg.max_active_rooms = 1;
-    let (_root, store, runtime, hub, owner) = open_sqlite_env("policy-and-cap", cfg).await;
+    let (root, store, runtime, hub, owner) = open_sqlite_env("policy-and-cap", cfg).await;
 
     let base = "---\ntitle: Before\nstatus: todo\n---\nBody text.\n";
     let n1 = create_note(&store, &owner, 7, base, None).await;
@@ -507,10 +541,17 @@ async fn stale_incarnation_rejected_raw_title_editable_lease_precondition_and_ro
 
     // 2. Open room on n1; verify max_active_rooms=1 closes n2 with 1013.
     let (mut c1, ready) = synced_client(&hub, &owner, &n1.note, 901).await;
+    let blob = root.data_root().blob(
+        &owner.scope().space_id,
+        ContentDigest::from_bytes(*blake3::hash(b"Second note.\n").as_bytes()),
+    );
+    let saved = blob.with_extension("held");
+    std::fs::rename(&blob, &saved).unwrap();
     let mut over_cap = open(&hub, &owner, &n2.note).await;
     over_cap.send(LineageHello::Fresh.encode()).await.unwrap();
     assert_eq!(close_code(&mut over_cap).await, 1013);
     drop(over_cap);
+    std::fs::rename(saved, blob).unwrap();
 
     // 3. preconditions.lease mismatch returns ValidationReason::InvalidAuthority
     //    in both Phase 1 (`edit_note`) and open-room interception (`intercept`),

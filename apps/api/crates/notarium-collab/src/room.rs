@@ -319,11 +319,13 @@ impl Room {
             // it with the document and presence when the actor exits.
             let _capacity = capacity;
             let _slot = slot;
-            let _stopped = StopRoom {
+            let mut stop = StopRoom {
+                settled: false,
                 hub: room.hub.clone(),
                 handle: lifecycle.clone(),
             };
             let result = room.run(receiver, &lifecycle, shutdown).await;
+            stop.settled = result.is_ok();
             for peer in room.peers.values() {
                 if !peer.outbound.guard.stopped().is_cancelled() {
                     peer.outbound.guard.close(SessionClose::POLICY);
@@ -1183,6 +1185,7 @@ impl Room {
 }
 
 struct StopRoom {
+    settled: bool,
     hub: Weak<HubInner>,
     handle: RoomHandle,
 }
@@ -1190,7 +1193,7 @@ struct StopRoom {
 impl Drop for StopRoom {
     fn drop(&mut self) {
         if let Some(hub) = self.hub.upgrade() {
-            hub.room_stopped(&self.handle);
+            hub.room_stopped(&self.handle, self.settled);
         }
         self.handle.stopped.cancel();
     }
