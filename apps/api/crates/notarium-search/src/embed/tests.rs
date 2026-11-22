@@ -8,7 +8,7 @@ use notarium_core::{
     },
     classes::{ClassifiedDocument, ContentPart, DocClass, ProviderAudience, ProviderPolicy},
     document::ChunkDescriptor,
-    error::ValidationReason,
+    error::{BudgetKind, ValidationReason},
     ids::{
         ContentDigest, GrantId, HistoryIncarnation, ModelProfileId, NoteId, PrincipalId,
         ProviderResourceId, RequestId, RevisionId, SpaceId,
@@ -780,6 +780,17 @@ async fn remote_parts_distinguish_permanent_denial_from_transient_provider_error
         calls: Mutex<usize>,
     }
     impl EmbeddingProviderPort for StubProvider {
+        fn query_disclosure(
+            &self,
+            _: SpaceContext,
+            _: ProviderResourceId,
+            _: ModelProfileId,
+            _: Option<FolderRef>,
+            _: Option<notarium_core::ids::FolderId>,
+        ) -> PortFuture<'_, BTreeSet<DocClass>> {
+            Box::pin(async { Ok(BTreeSet::from([DocClass::UserDoc])) })
+        }
+
         fn embed(
             &self,
             _: SpaceContext,
@@ -945,9 +956,51 @@ async fn remote_parts_distinguish_permanent_denial_from_transient_provider_error
     *stub.row_error.lock().unwrap() = None;
     *stub.error.lock().unwrap() = Some(DomainError::AccessDenied);
     let transient = remote
-        .parts(indexing_grant, None, vec![make_part(DocClass::UserDoc)])
+        .parts(
+            indexing_grant.clone(),
+            None,
+            vec![make_part(DocClass::UserDoc)],
+        )
         .await
         .unwrap_err();
     assert!(matches!(transient, EmbeddingError::ProviderUnavailable));
     assert!(!transient.is_permanent_note_rejection());
+
+    let query = EmbeddingQueryInput {
+        text: "query".into(),
+        tokens: 2,
+        classes: BTreeSet::from([DocClass::UserDoc]),
+        project_scope: None,
+        folder: None,
+    };
+    for budget in [
+        BudgetKind::Requests,
+        BudgetKind::Concurrency,
+        BudgetKind::Tokens,
+    ] {
+        *stub.error.lock().unwrap() = Some(DomainError::RateLimited {
+            budget,
+            retry_after_ms: 1234,
+        });
+        let error = remote
+            .parts(
+                indexing_grant.clone(),
+                None,
+                vec![make_part(DocClass::UserDoc)],
+            )
+            .await
+            .unwrap_err();
+        if budget == BudgetKind::Tokens {
+            assert!(matches!(error, EmbeddingError::BudgetExceeded));
+        } else {
+            assert!(matches!(
+                error,
+                EmbeddingError::IndexingThrottled(delay) if delay == Duration::from_millis(1234)
+            ));
+        }
+        assert!(matches!(
+            remote.query(ctx.clone(), query.clone(), false).await,
+            Err(EmbeddingError::BudgetExceeded)
+        ));
+    }
 }

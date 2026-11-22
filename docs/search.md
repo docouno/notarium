@@ -207,7 +207,13 @@ The same deadline bounds waits for projection access during traversal.
 The durable pending state schedules bounded repair when embeddings are missing.
 Ready targeted batches alternate with full-sweep pages. Targeted repair resumes
 after the last attempted note ID and wraps at the end. A note-specific rate
-limit backs off targeted retries while the sweep can advance to other notes.
+limit delays only carriers that failed. Fresh revisions, unattempted notes and
+sweep pages for other notes remain eligible. Failed notes share a retry
+deadline. When a request or concurrency quota is exhausted, the affected
+Space pauses background indexing for that target. The current batch can retry
+once after the reported delay, with fresh admission, while the scheduler
+remains available to queries and other Spaces. Repeated refusals or waits
+longer than a minute return to worker backoff.
 Each page can finish while unrelated edits arrive. If a note changes during
 its embedding call, the worker discards that result and retries the new text.
 

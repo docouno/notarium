@@ -3,7 +3,7 @@ use crate::ports::RemoteIndexingGrant;
 use notarium_core::{
     DomainError,
     classes::{ClassEgressFence, ContentPart, DocClass},
-    error::{PortError, ValidationReason},
+    error::{BudgetKind, PortError, ValidationReason},
     ids::{CommandKey, ModelProfileId, ProviderResourceId},
     model::FolderRef,
     ports::{
@@ -11,7 +11,10 @@ use notarium_core::{
         ProviderErrorCode, ProviderRuntimeEpochs, SpaceContext,
     },
 };
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 pub struct RemoteEmbedder {
     port: Arc<dyn EmbeddingProviderPort>,
@@ -327,6 +330,12 @@ fn indexing_provider_error(error: DomainError) -> EmbeddingError {
             ValidationReason::BudgetExceeded => EmbeddingError::BudgetExceeded,
             _ => EmbeddingError::ProviderUnavailable,
         },
+        // Every note in this Space targets the same resource and credential.
+        // Only the number of requested tokens can make a smaller note fit.
+        DomainError::RateLimited {
+            budget: BudgetKind::Requests | BudgetKind::Concurrency,
+            retry_after_ms,
+        } => EmbeddingError::IndexingThrottled(Duration::from_millis(retry_after_ms)),
         DomainError::RateLimited { .. } => EmbeddingError::BudgetExceeded,
         DomainError::Provider {
             error: ProviderErrorCode::BudgetMismatch,

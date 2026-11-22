@@ -137,7 +137,6 @@ pub(super) async fn seed_lexical(
                 lexical_idle_retired: false,
                 epoch: None,
                 embedder: None,
-                dirty_notes: BTreeSet::new(),
                 repairs: super::RepairTurns::default(),
                 cached_vectors: HashMap::new(),
                 sweep: super::FullSweep::Idle,
@@ -924,6 +923,7 @@ mod tests {
                 embedder: self.embedder.clone(),
                 snapshot: self.seeded.epoch.snapshot(),
                 cached_vectors: HashMap::new(),
+                deferred: Default::default(),
                 mode,
                 cancel: Cancellation::default(),
             })

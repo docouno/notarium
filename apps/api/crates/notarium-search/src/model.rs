@@ -368,6 +368,7 @@ impl Embedder {
                 Ok(Ok(Some((grant, project)))) => Some(RemoteNote {
                     backend: backend.clone(),
                     resolver: resolver.clone(),
+                    note,
                     grant,
                     project,
                 }),
@@ -539,11 +540,75 @@ impl Embedder {
     }
 }
 
-struct RemoteNote {
+struct RemoteNote<'a> {
+    note: &'a SearchIndexedNote,
     backend: Arc<RemoteEmbedder>,
     resolver: Arc<dyn SearchModelResolverPort>,
     grant: RemoteIndexingGrant,
     project: Option<FolderRef>,
+}
+
+impl RemoteNote<'_> {
+    async fn index_batch(
+        &mut self,
+        embedder: &Embedder,
+        services: &Services,
+        document: &Arc<ClassifiedDocument>,
+        batch: &[Vec<ChunkDescriptor>],
+        budget: &mut CallBudget,
+        priority: Priority,
+    ) -> Result<Vec<Option<Vec<f32>>>, EmbeddingError> {
+        let mut retried = false;
+        loop {
+            let result = embedder
+                .remote_index(
+                    services,
+                    document,
+                    &self.backend,
+                    self.resolver.clone(),
+                    self.grant.clone(),
+                    self.project.clone(),
+                    batch,
+                    budget,
+                    priority,
+                )
+                .await;
+            let Err(EmbeddingError::IndexingThrottled(delay)) = &result else {
+                return result;
+            };
+            // Keep this note private for one Control rate window. A second
+            // refusal without progress releases staging to the worker backoff.
+            if retried || *delay > std::time::Duration::from_secs(60) {
+                return result;
+            }
+            // The scheduler has already released its lane to other callers.
+            tokio::select! {
+                biased;
+                () = budget.cancellation.cancelled() => return Err(EmbeddingError::Cancelled),
+                () = tokio::time::sleep(*delay) => {}
+            }
+            *budget = crate::indexer::new_budget(&budget.cancellation);
+            let started = std::time::Instant::now();
+            let grant = tokio::select! {
+                biased;
+                () = budget.cancellation.cancelled() => return Err(EmbeddingError::Cancelled),
+                grant = tokio::time::timeout(
+                    budget.remaining,
+                    embedder.indexing_grant(
+                        services, self.resolver.as_ref(), self.grant.ctx.scope(), self.note, budget.clone(),
+                    ),
+                ) => grant,
+            };
+            (self.grant, self.project) = match grant {
+                Ok(Ok(Some(grant))) => grant,
+                Ok(Ok(None)) => return Err(EmbeddingError::IndexingDenied),
+                Ok(Err(PortError::Cancelled(_))) => return Err(EmbeddingError::Cancelled),
+                _ => return Err(EmbeddingError::ProviderUnavailable),
+            };
+            budget.remaining = budget.remaining.saturating_sub(started.elapsed());
+            retried = true;
+        }
+    }
 }
 
 pub(super) enum NotePreparation<'a> {
@@ -558,7 +623,7 @@ pub(super) struct PreparedIndexNote<'a> {
     folder: u32,
     budget: CallBudget,
     priority: Priority,
-    remote: Option<RemoteNote>,
+    remote: Option<RemoteNote<'a>>,
     descriptors: std::vec::IntoIter<ChunkDescriptor>,
 }
 
@@ -644,17 +709,14 @@ impl PreparedIndexNote<'_> {
         };
         let mut pending = false;
         for batch in batches {
-            let rows = if let Some(remote) = &self.remote {
-                embedder
-                    .remote_index(
+            let rows = if let Some(remote) = &mut self.remote {
+                remote
+                    .index_batch(
+                        embedder,
                         self.services,
                         document,
-                        &remote.backend,
-                        remote.resolver.clone(),
-                        remote.grant.clone(),
-                        remote.project.clone(),
                         &batch,
-                        &self.budget,
+                        &mut self.budget,
                         self.priority,
                     )
                     .await

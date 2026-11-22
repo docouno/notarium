@@ -24,6 +24,8 @@ pub enum EmbeddingError {
     TargetChanged,
     #[error("the embedding provider is unavailable")]
     ProviderUnavailable,
+    #[error("the embedding provider rate-limited indexing")]
+    IndexingThrottled(std::time::Duration),
     #[error("the document no longer qualifies for remote indexing")]
     IndexingDenied,
     #[error("the input cannot be embedded by this model")]
@@ -87,7 +89,9 @@ impl EmbeddingError {
         use notarium_core::ports::SearchDegradation;
         match self {
             Self::TargetChanged => SearchDegradation::EmbeddingsPending,
-            Self::BudgetExceeded | Self::Cancelled => SearchDegradation::BudgetExceeded,
+            Self::BudgetExceeded | Self::IndexingThrottled(_) | Self::Cancelled => {
+                SearchDegradation::BudgetExceeded
+            }
             Self::ProviderUnavailable | Self::IndexingDenied => {
                 SearchDegradation::ProviderUnavailable
             }

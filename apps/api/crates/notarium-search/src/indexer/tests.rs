@@ -13,50 +13,278 @@ use notarium_core::{
     span::ByteSpan,
 };
 
+fn targeted_batch(repairs: &mut RepairTurns, sweep: &FullSweep, now: Instant) -> Vec<NoteId> {
+    let Some(update::EmbedBatchMode::DirtyNotes(ids)) = repairs.next_batch(sweep, now) else {
+        panic!("expected targeted repair")
+    };
+    repairs.finish_targeted(ids.clone(), &HashSet::new(), ids.last().cloned());
+    ids
+}
+
 #[test]
-fn dirty_repair_rotates_past_rate_limited_notes_without_delaying_the_sweep() {
-    use update::EmbedBatchMode;
+fn deferred_notes_share_their_deadline_while_sweeps_and_live_edits_progress() {
     let now = Instant::now();
-    let mut repairs = RepairTurns::default();
     let note = |id| NoteId::from_bytes([id; 16]);
-    let mut dirty: BTreeSet<_> = (1..=17).map(note).collect();
-    let Some(EmbedBatchMode::DirtyNotes(prefix)) =
-        repairs.next_batch(&mut dirty, &FullSweep::Requested, now)
-    else {
-        panic!("expected dirty repair")
-    };
-    assert_eq!(prefix.len(), 16);
-    repairs.completed(false, prefix.last().cloned(), true, now);
-    dirty.extend(prefix);
-    assert!(matches!(
-        repairs.next_batch(&mut dirty, &FullSweep::Requested, now),
-        Some(EmbedBatchMode::FullSweep { .. })
-    ));
-    assert!(
-        repairs
-            .next_batch(&mut dirty, &FullSweep::Idle, now)
-            .is_none()
+    let mut repairs = RepairTurns::default();
+    repairs.edit(note(1));
+    repairs.edit(note(2));
+    let ids = targeted_batch(&mut repairs, &FullSweep::Requested, now);
+    repairs.defer(ids.into_iter(), now);
+    for id in 3..=9 {
+        repairs.edit(note(id));
+        assert!(matches!(
+            repairs.next_batch(&FullSweep::Requested, now),
+            Some(update::EmbedBatchMode::FullSweep { .. })
+        ));
+        assert_eq!(
+            targeted_batch(&mut repairs, &FullSweep::Requested, now),
+            [note(id)]
+        );
+    }
+    assert!(repairs.next_batch(&FullSweep::Idle, now).is_none());
+    let due = now + Duration::from_secs(1);
+    assert_eq!(repairs.next_at(&FullSweep::Idle, now), due);
+    assert_eq!(
+        targeted_batch(&mut repairs, &FullSweep::Idle, due),
+        [note(1), note(2)]
     );
-    let retry = repairs.next_at(&FullSweep::Idle, now);
-    assert_eq!(retry, now + Duration::from_secs(1));
-    let Some(EmbedBatchMode::DirtyNotes(tail)) =
-        repairs.next_batch(&mut dirty, &FullSweep::Requested, retry)
-    else {
-        panic!("expected ready tail")
+}
+
+#[tokio::test]
+async fn live_edits_reach_the_warm_epoch_while_a_failed_note_waits() {
+    use crate::{SearchDependencies, SearchEngine, config::SearchConfig};
+    use notarium_canonical::{
+        CanonicalConfig, CanonicalRuntime, CreateSpaceSpec, changes::SyntheticNoteSpec,
     };
-    assert_eq!(tail, [note(17)]);
-    repairs.completed(false, Some(note(17)), false, retry);
-    assert!(matches!(
-        repairs.next_batch(&mut dirty, &FullSweep::Requested, retry),
-        Some(EmbedBatchMode::FullSweep { .. })
+    use notarium_core::{
+        auth::SpaceKind,
+        ids::{InstallationId, LeaseEpoch, PrincipalId},
+        model::Lifecycle,
+    };
+
+    let mut entropy = [0; 16];
+    getrandom::fill(&mut entropy).unwrap();
+    let path = std::env::temp_dir().join(format!("search-ready-notes-{}", hex::encode(entropy)));
+    std::fs::create_dir(&path).unwrap();
+    let root = DataRoot::new(&path);
+    let (store, runtime) = CanonicalRuntime::open(CanonicalConfig::local_default(
+        InstallationId::from_bytes([1; 16]),
+        root.clone(),
+    ))
+    .await
+    .unwrap();
+    let store = Arc::new(store);
+    let owner = PrincipalId::from_bytes([2; 16]);
+    let lease = LeaseEpoch::new(1).unwrap();
+    let scope = store
+        .create_space(CreateSpaceSpec {
+            space_id: SpaceId::from_bytes([3; 16]),
+            incarnation: HistoryIncarnation::from_bytes([4; 16]),
+            root_folder_id: FolderId::from_bytes([5; 16]),
+            slug: "ready-notes".into(),
+            kind: SpaceKind::Personal,
+            owner: owner.clone(),
+            active_epoch: lease,
+            initial_last_seq: SpaceSeq::ZERO,
+            created_at: None,
+        })
+        .await
+        .unwrap()
+        .scope;
+    let note = |id| NoteId::from_bytes([id; 16]);
+    let spec = |id, text: &str| SyntheticNoteSpec {
+        note_id: note(id),
+        parent_folder: None,
+        slug: format!("note-{id}"),
+        title: format!("Note {id}"),
+        doc_class: DocClass::UserDoc,
+        lifecycle: Lifecycle::Active,
+        carrier: text.into(),
+        fields: Default::default(),
+    };
+    let write = async |specs| {
+        let (range, _) = store
+            .commit_synthetic_note_batch_for_test(&scope, lease, &owner, specs)
+            .await
+            .unwrap();
+        ChangeCursor {
+            scope: scope.clone(),
+            after: range.last_seq,
+        }
+    };
+    let seed = write(vec![spec(254, "seed")]).await;
+    let layout = Arc::new(SearchLayout::open(&root, scope.clone()).unwrap());
+    let engine = SearchEngine::start(
+        SearchConfig::new(root, VectorMode::DeterministicTest { dimension: 64 }),
+        SearchDependencies::new(store.clone(), Arc::new(UnusedStructural)),
+    );
+    let handle = Arc::new(SpaceHandle::new());
+    let cx = Context {
+        services: &engine.services,
+        handle: &handle,
+    };
+    let mut publisher = Publisher { handle: &handle };
+    let (mut disk, lexical) = build::seed_lexical(&cx, layout.clone(), &seed)
+        .await
+        .unwrap();
+    let target = engine
+        .services
+        .model_target(&scope, None, &cx.budget())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut epoch = VectorEpoch::open_model(layout.clone(), target.vector_model()).unwrap();
+    epoch
+        .seed(SegmentBuilder::new(&target.model, 64).unwrap(), seed.after)
+        .unwrap();
+    disk.embedder = Some(Arc::new(
+        engine.services.embedder(target.clone()).await.unwrap(),
     ));
-    let Some(EmbedBatchMode::DirtyNotes(wrapped)) =
-        repairs.next_batch(&mut dirty, &FullSweep::Idle, retry)
-    else {
-        panic!("expected retry after one round")
+    disk.epoch = Some(epoch);
+    disk.manifest.active_model = Some(target);
+    disk.manifest.vector_seq = Some(seed.after);
+    disk.manifest.embeddings_pending = false;
+    disk.publish_manifest().await.unwrap();
+
+    let write_edits = async |disk: &mut Disk, publisher: &mut Publisher<'_>, specs| {
+        let cut = write(specs).await;
+        assert!(
+            !catch_up(&cx, disk, &lexical, publisher, cut, None, false)
+                .await
+                .unwrap()
+        );
+        assert_eq!(disk.sweep, FullSweep::Idle);
     };
-    assert_eq!(wrapped.len(), 16);
-    assert_eq!(wrapped[0], note(1));
+    write_edits(
+        &mut disk,
+        &mut publisher,
+        (1..=97).map(|id| spec(id, "initial note")).collect(),
+    )
+    .await;
+    let mut at = Instant::now();
+    for first in (1..=96).step_by(16) {
+        let ids = targeted_batch(&mut disk.repairs, &disk.sweep, at);
+        assert_eq!(ids, (first..first + 16).map(note).collect::<Vec<_>>());
+        disk.repairs.defer(ids.into_iter(), at);
+    }
+    assert_eq!(
+        targeted_batch(&mut disk.repairs, &disk.sweep, at),
+        [note(97)]
+    );
+    // Once the cohort is due, all but A recover. Advance only this scheduler's
+    // clock to reach the sixth consecutive note-specific refusal.
+    at = disk.repairs.next_at(&disk.sweep, at);
+    for first in (1..=96).step_by(16) {
+        let ids = targeted_batch(&mut disk.repairs, &disk.sweep, at);
+        assert_eq!(ids, (first..first + 16).map(note).collect::<Vec<_>>());
+        disk.repairs
+            .defer(ids.into_iter().filter(|id| *id == note(1)), at);
+    }
+    for _ in 2..6 {
+        at = disk.repairs.next_at(&disk.sweep, at);
+        let ids = targeted_batch(&mut disk.repairs, &disk.sweep, at);
+        assert_eq!(ids, [note(1)]);
+        disk.repairs.defer(ids.into_iter(), at);
+    }
+    let retry_at = at + Duration::from_secs(32);
+    assert_eq!(disk.repairs.next_at(&disk.sweep, at), retry_at);
+    assert!(
+        layout
+            .search_manifest()
+            .unwrap()
+            .unwrap()
+            .embeddings_pending
+    );
+
+    // Drive a new canonical command through the normal catch-up path while
+    // A is beyond the default lexical idle threshold. B must reach the embedder.
+    write_edits(&mut disk, &mut publisher, vec![spec(100, "short text")]).await;
+    assert_eq!(disk.repairs.next_at(&disk.sweep, at), at);
+    let now = Instant::now();
+    let mut job = None;
+    assert!(
+        spawn_bg_if_ready(
+            &cx,
+            &mut disk,
+            &mut job,
+            &mut false,
+            now,
+            now,
+            now,
+            EMBEDDER_IDLE,
+            false
+        )
+        .unwrap()
+    );
+    let job = job.unwrap();
+    let result = job.handle.await.unwrap();
+    let BgOutcome::EmbedBatch(Ok(update::EmbedBatchOutcome::Applied {
+        ref selected,
+        ref rows,
+        ..
+    })) = result
+    else {
+        panic!("expected an embedded live edit")
+    };
+    assert_eq!(selected, &[note(100)]);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].note_id, note(100));
+    let mut disk = Some(disk);
+    handle_bg_done(
+        &cx,
+        &mut publisher,
+        &mut disk,
+        &layout,
+        result,
+        job.dirty,
+        &mut false,
+        &mut false,
+        &mut Instant::now(),
+        &mut Duration::from_secs(1),
+        &mut Instant::now(),
+        &mut Instant::now(),
+        &mut Duration::from_secs(1),
+    )
+    .await
+    .unwrap();
+    let mut disk = disk.unwrap();
+    assert!(
+        !disk
+            .epoch
+            .as_ref()
+            .unwrap()
+            .matches_note_chunks(&note(100), &[])
+    );
+    assert!(disk.repairs.next_batch(&disk.sweep, at).is_none());
+    assert_eq!(disk.repairs.next_at(&disk.sweep, at), retry_at);
+
+    write_edits(&mut disk, &mut publisher, vec![spec(1, "shorter revision")]).await;
+    assert_eq!(disk.repairs.next_at(&disk.sweep, at), at);
+    let updated = targeted_batch(&mut disk.repairs, &disk.sweep, at);
+    assert_eq!(updated, [note(1)]);
+    disk.repairs.defer(updated.into_iter(), at);
+    write_edits(
+        &mut disk,
+        &mut publisher,
+        vec![SyntheticNoteSpec {
+            lifecycle: Lifecycle::Trashed,
+            ..spec(1, "shorter revision")
+        }],
+    )
+    .await;
+    assert!(!disk.has_pending_embeddings());
+    assert!(
+        !layout
+            .search_manifest()
+            .unwrap()
+            .unwrap()
+            .embeddings_pending
+    );
+    publisher.replace(None);
+    drop((disk, lexical));
+    engine.shutdown().await;
+    runtime.shutdown().await.unwrap();
+    std::fs::remove_dir_all(path).unwrap();
 }
 
 #[test]
@@ -170,7 +398,6 @@ async fn idle_space_releases_embedder_and_reopens_checkpointed_wal_after_evictio
         lexical_idle_retired: true,
         epoch: Some(epoch),
         embedder: None,
-        dirty_notes: BTreeSet::new(),
         repairs: RepairTurns::default(),
         cached_vectors: HashMap::new(),
         sweep: FullSweep::Idle,
@@ -917,7 +1144,7 @@ async fn deferred_edits_replay_after_restart_before_admitting_the_checkpoint() {
     let disk = disk.unwrap();
     let epoch = disk.epoch.as_ref().unwrap();
     assert_eq!(
-        disk.dirty_notes,
+        disk.repairs.ready,
         BTreeSet::from([note(1), note(2), note(3)])
     );
     assert_eq!(disk.sweep, FullSweep::Idle);
@@ -1019,7 +1246,6 @@ fn scheduled_reopen_signals_until_retry_backoff() {
         lexical_idle_retired: false,
         epoch: None,
         embedder: None,
-        dirty_notes: BTreeSet::new(),
         repairs: RepairTurns::default(),
         cached_vectors: HashMap::new(),
         sweep: FullSweep::Idle,
@@ -1243,7 +1469,6 @@ async fn full_sweep_completion_preserves_resweep_when_remote_folders_changed() {
         lexical_idle_retired: false,
         epoch: Some(epoch),
         embedder: None,
-        dirty_notes: BTreeSet::new(),
         repairs: RepairTurns::default(),
         cached_vectors: HashMap::new(),
         sweep: FullSweep::Scanning {
@@ -1276,7 +1501,9 @@ async fn full_sweep_completion_preserves_resweep_when_remote_folders_changed() {
             next_sweep_after: after.map(|id| NoteId::from_bytes([id; 16])),
             was_full_sweep: true,
             last_attempted: None,
-            failure: None,
+            selected: Vec::new(),
+            retry_notes: Vec::new(),
+            provider_backoff: None,
         }))
     };
     let scanning = |id, repeat| FullSweep::Scanning {
@@ -2109,8 +2336,10 @@ async fn failed_embedder_load_respects_retry_backoff_without_busy_spin() {
         lexical_idle_retired: false,
         epoch: Some(epoch),
         embedder: None,
-        dirty_notes: BTreeSet::from([NoteId::from_bytes([0xf6; 16])]),
-        repairs: RepairTurns::default(),
+        repairs: RepairTurns {
+            ready: BTreeSet::from([NoteId::from_bytes([0xf6; 16])]),
+            ..Default::default()
+        },
         cached_vectors: HashMap::new(),
         sweep: FullSweep::Requested,
         last_activity: now,
@@ -2291,7 +2520,6 @@ async fn folder_moves_preserve_the_current_full_sweep_cursor() {
         lexical_idle_retired: false,
         epoch: None,
         embedder: None,
-        dirty_notes: BTreeSet::new(),
         repairs: RepairTurns::default(),
         cached_vectors: HashMap::new(),
         sweep: FullSweep::Scanning {
@@ -2855,7 +3083,6 @@ async fn reconcile_reopening_clears_stale_flag_when_non_reopening_bg_task_spawns
         lexical_idle_retired: false,
         epoch: Some(epoch),
         embedder: None,
-        dirty_notes: BTreeSet::new(),
         repairs: RepairTurns::default(),
         cached_vectors: HashMap::new(),
         sweep: FullSweep::Idle,
@@ -2953,8 +3180,10 @@ fn disabled_vector_mode_never_schedules_maintenance_wake_on_pending_manifest() {
         lexical_idle_retired: false,
         epoch: None,
         embedder: None,
-        dirty_notes: BTreeSet::from([NoteId::from_bytes([0xf4; 16])]),
-        repairs: RepairTurns::default(),
+        repairs: RepairTurns {
+            ready: BTreeSet::from([NoteId::from_bytes([0xf4; 16])]),
+            ..Default::default()
+        },
         cached_vectors: HashMap::new(),
         sweep: FullSweep::Requested,
         last_activity: now,
@@ -3147,7 +3376,6 @@ async fn space_handle_idle_eviction_respects_pins_extra_refs_and_replace_if_live
         lexical_idle_retired: false,
         epoch: None,
         embedder: None,
-        dirty_notes: BTreeSet::new(),
         repairs: RepairTurns::default(),
         cached_vectors: HashMap::new(),
         sweep: FullSweep::Idle,

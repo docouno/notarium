@@ -342,74 +342,102 @@ impl FullSweep {
     }
 }
 
-/// Share repair slots between live edits and the bounded Space sweep. Retry
-/// deadlines apply to targeted work, so a failed carrier cannot hold a sweep
-/// page for unrelated notes behind its own exponential backoff.
+/// Fresh revisions and unattempted carriers stay ready. Only notes that failed
+/// share a retry deadline. Both kinds of work rotate alongside the Space sweep.
 #[derive(Default)]
 struct RepairTurns {
+    ready: BTreeSet<NoteId>,
+    retry: Arc<BTreeSet<NoteId>>,
     dirty_after: Option<NoteId>,
-    dirty_retry_at: Option<Instant>,
-    dirty_delay: Duration,
+    retry_at: Option<Instant>,
+    retry_delay: Duration,
     prefer_sweep: bool,
 }
 
 impl RepairTurns {
-    fn next_batch(
-        &mut self,
-        dirty: &mut BTreeSet<NoteId>,
-        sweep: &FullSweep,
-        now: Instant,
-    ) -> Option<update::EmbedBatchMode> {
-        let dirty_ready = !dirty.is_empty() && self.dirty_retry_at.is_none_or(|at| now >= at);
-        if *sweep != FullSweep::Idle && (self.prefer_sweep || !dirty_ready) {
+    fn forget(&mut self, id: &NoteId) {
+        self.ready.remove(id);
+        if self.retry.contains(id) {
+            Arc::make_mut(&mut self.retry).remove(id);
+            if self.retry.is_empty() {
+                self.retry_at = None;
+                self.retry_delay = Duration::ZERO;
+            }
+        }
+    }
+
+    fn edit(&mut self, id: NoteId) {
+        self.forget(&id);
+        self.ready.insert(id);
+    }
+
+    fn next_batch(&mut self, sweep: &FullSweep, now: Instant) -> Option<update::EmbedBatchMode> {
+        if self.retry_at.is_some_and(|at| now >= at) {
+            self.ready.append(Arc::make_mut(&mut self.retry));
+            self.retry_at = None;
+        }
+        if *sweep != FullSweep::Idle && (self.prefer_sweep || self.ready.is_empty()) {
             self.prefer_sweep = false;
             return Some(update::EmbedBatchMode::FullSweep {
                 after: sweep.after(),
             });
         }
-        if !dirty_ready {
+        if self.ready.is_empty() {
             return None;
         }
         let mut after = self
             .dirty_after
             .as_ref()
             .map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
-        if dirty
+        if self
+            .ready
             .range((after, std::ops::Bound::Unbounded))
             .next()
             .is_none()
         {
             after = std::ops::Bound::Unbounded;
         }
-        let ids: Vec<_> = dirty
+        let ids: Vec<_> = self
+            .ready
             .range((after, std::ops::Bound::Unbounded))
             .take(update::REPAIR_CARRIER_PAGE)
             .cloned()
             .collect();
-        for id in &ids {
-            dirty.remove(id);
-        }
+        // Keep selected IDs pending until the result arrives. A concurrent edit
+        // or deletion can supersede the selected revision in the meantime.
         self.prefer_sweep = true;
         Some(update::EmbedBatchMode::DirtyNotes(ids))
     }
 
-    fn completed(&mut self, sweep: bool, last: Option<NoteId>, failed: bool, now: Instant) {
-        if !sweep {
-            self.dirty_after = last;
+    fn finish_targeted(
+        &mut self,
+        selected: Vec<NoteId>,
+        changed: &HashSet<NoteId>,
+        last: Option<NoteId>,
+    ) {
+        for id in selected {
+            if !changed.contains(&id) {
+                self.ready.remove(&id);
+            }
         }
-        if failed && (!sweep || self.dirty_retry_at.is_none()) {
-            self.dirty_delay =
-                (self.dirty_delay * 2).clamp(Duration::from_secs(1), Duration::from_secs(300));
-            self.dirty_retry_at = Some(now + self.dirty_delay);
-        } else if !sweep && !failed {
-            self.dirty_delay = Duration::ZERO;
-            self.dirty_retry_at = None;
+        self.dirty_after = last;
+    }
+
+    fn defer(&mut self, ids: impl Iterator<Item = NoteId>, now: Instant) {
+        for id in ids {
+            self.ready.remove(&id);
+            Arc::make_mut(&mut self.retry).insert(id);
+        }
+        if !self.retry.is_empty() && self.retry_at.is_none() {
+            self.retry_delay =
+                (self.retry_delay * 2).clamp(Duration::from_secs(1), Duration::from_secs(300));
+            self.retry_at = Some(now + self.retry_delay);
         }
     }
 
     fn next_at(&self, sweep: &FullSweep, at: Instant) -> Instant {
-        if *sweep == FullSweep::Idle {
-            return self.dirty_retry_at.map_or(at, |retry| at.max(retry));
+        if self.ready.is_empty() && *sweep == FullSweep::Idle {
+            return self.retry_at.map_or(at, |retry| at.max(retry));
         }
         at
     }
@@ -423,7 +451,6 @@ struct Disk {
     lexical_idle_retired: bool,
     epoch: Option<VectorEpoch>,
     embedder: Option<Arc<crate::model::Embedder>>,
-    dirty_notes: BTreeSet<NoteId>,
     repairs: RepairTurns,
     cached_vectors: HashMap<ContentDigest, Arc<QuantizedVector>>,
     sweep: FullSweep,
@@ -473,7 +500,9 @@ impl Disk {
     }
 
     fn has_pending_embeddings(&self) -> bool {
-        !self.dirty_notes.is_empty() || self.sweep != FullSweep::Idle
+        !self.repairs.ready.is_empty()
+            || !self.repairs.retry.is_empty()
+            || self.sweep != FullSweep::Idle
     }
 
     fn needs_embedding_work(&self) -> bool {
@@ -1152,7 +1181,10 @@ async fn run_active_loop(
                     // embedder must stay usable until the next page can start.
                     let active_repair = !current.lexical_idle_retired
                         && current.needs_embedding_work()
-                        && repair_delay < Duration::from_secs(30);
+                        && repair_delay < Duration::from_secs(30)
+                        && (current.repairs.retry_delay < Duration::from_secs(30)
+                            || !current.repairs.ready.is_empty()
+                            || current.sweep != FullSweep::Idle);
                     if cx.handle.active_queries.load(Ordering::Acquire) > 0
                         || cx.handle.has_align_waiters()
                         || active_repair
@@ -1743,10 +1775,7 @@ fn spawn_bg_if_ready(
         };
         disk.embedder_last_use = now;
         let cancel = Cancellation::default();
-        let Some(mode) = disk
-            .repairs
-            .next_batch(&mut disk.dirty_notes, &disk.sweep, now)
-        else {
+        let Some(mode) = disk.repairs.next_batch(&disk.sweep, now) else {
             return Ok(false);
         };
         let input = update::EmbedBatchInput {
@@ -1757,6 +1786,7 @@ fn spawn_bg_if_ready(
             embedder,
             snapshot: epoch.snapshot(),
             cached_vectors: disk.cached_vectors.clone(),
+            deferred: disk.repairs.retry.clone(),
             mode,
             cancel: cancel.clone(),
         };
@@ -1813,8 +1843,9 @@ async fn handle_bg_done(
                         })
                         .await
                         .map_err(|_| IndexError::Inconsistent)??;
-                        current.dirty_notes.extend(replayed);
-                        current.dirty_notes.extend(dirty.notes);
+                        for id in replayed.into_iter().chain(dirty.notes) {
+                            current.repairs.edit(id);
+                        }
                         current.manifest.vector_seq = Some(seq);
                         current.manifest.vector_replay_after = None;
                         current.manifest.embeddings_pending = true;
@@ -1888,7 +1919,6 @@ async fn handle_bg_done(
                 current.epoch = None;
                 current.embedder = None;
                 current.embedder_unavailable = false;
-                current.dirty_notes.clear();
                 current.repairs = RepairTurns::default();
                 current.cached_vectors.clear();
                 current.sweep = FullSweep::Idle;
@@ -1962,11 +1992,10 @@ async fn handle_bg_done(
                     .await
                     .map_err(|_| IndexError::Inconsistent)??;
                 }
-                current.dirty_notes.clear();
                 current.repairs = RepairTurns::default();
                 current.cached_vectors.clear();
-                current.dirty_notes.extend(dirty.notes);
-                current.dirty_notes.extend(failed_notes);
+                current.repairs.ready.extend(dirty.notes);
+                current.repairs.ready.extend(failed_notes);
                 current.sweep = FullSweep::from_pending(remote_folder_dirty);
                 let pending = current.has_pending_embeddings();
                 let was_cold_seed = current.manifest.vector_seq.is_none();
@@ -2004,21 +2033,25 @@ async fn handle_bg_done(
             Err(error) => {
                 tracing::warn!(kind = %error, "search model refresh will retry");
                 *retry_model = true;
-                *model_retry_at = Instant::now() + *model_retry_delay;
+                let delay = match error {
+                    ModelError::Embedding(EmbeddingError::IndexingThrottled(delay)) => {
+                        delay.max(*model_retry_delay)
+                    }
+                    _ => *model_retry_delay,
+                };
+                *model_retry_at = Instant::now() + delay;
                 *model_retry_delay = (*model_retry_delay * 2).min(Duration::from_secs(300));
             }
         },
         BgOutcome::EmbedBatch(result) => match result {
-            Ok(update::EmbedBatchOutcome::ModelChanged { requeue }) => {
+            Ok(update::EmbedBatchOutcome::ModelChanged) => {
                 current.embedder_last_use = Instant::now();
-                current.dirty_notes.extend(requeue);
                 *model_check_due = true;
                 *repair_at = Instant::now() + *repair_delay;
                 *repair_delay = (*repair_delay * 2).min(Duration::from_secs(300));
             }
-            Ok(update::EmbedBatchOutcome::Backoff { requeue }) => {
+            Ok(update::EmbedBatchOutcome::Backoff) => {
                 current.embedder_last_use = Instant::now();
-                current.dirty_notes.extend(requeue);
                 *repair_at = Instant::now() + *repair_delay;
                 *repair_delay = (*repair_delay * 2).min(Duration::from_secs(300));
             }
@@ -2029,8 +2062,15 @@ async fn handle_bg_done(
                 next_sweep_after,
                 was_full_sweep,
                 last_attempted,
-                failure,
+                selected,
+                retry_notes,
+                provider_backoff,
             }) => {
+                if !was_full_sweep {
+                    current
+                        .repairs
+                        .finish_targeted(selected, &dirty.notes, last_attempted);
+                }
                 current.embedder_last_use = Instant::now();
                 if !missing_folders.is_empty() {
                     let folders = Arc::make_mut(&mut current.folders);
@@ -2054,15 +2094,18 @@ async fn handle_bg_done(
                 let mut staged_note = None;
                 for row in rows {
                     let id = row.note_id;
-                    if dirty.notes.contains(&id)
-                        || row
-                            .ancestor_folders
-                            .iter()
-                            .any(|id| changed_folders.contains(id))
-                    {
-                        current.dirty_notes.insert(id);
+                    if dirty.notes.contains(&id) {
                         continue;
                     }
+                    if row
+                        .ancestor_folders
+                        .iter()
+                        .any(|id| changed_folders.contains(id))
+                    {
+                        current.repairs.edit(id);
+                        continue;
+                    }
+                    current.repairs.forget(&id);
                     match row.chunks {
                         update::EmbeddedChunks::Staged(staged) => staged_note = Some((id, staged)),
                         update::EmbeddedChunks::Inline(chunks)
@@ -2096,7 +2139,11 @@ async fn handle_bg_done(
                     Ok(epoch) => current.epoch = Some(epoch),
                     Err(error) => return Err(IndexError::Vector(error)),
                 }
-                current.dirty_notes.extend(requeue);
+                current.repairs.ready.extend(
+                    requeue.into_iter().filter(|id| {
+                        !dirty.notes.contains(id) && !current.repairs.retry.contains(id)
+                    }),
+                );
                 let previous_pending = current.manifest.embeddings_pending;
                 if was_full_sweep {
                     current.sweep.finish_page(next_sweep_after);
@@ -2104,8 +2151,16 @@ async fn handle_bg_done(
                 if !changed_folders.is_empty() {
                     current.request_full_sweep();
                 }
-                if current.dirty_notes.is_empty() {
+                let now = Instant::now();
+                current.repairs.defer(
+                    retry_notes
+                        .into_iter()
+                        .filter(|id| !dirty.notes.contains(id)),
+                    now,
+                );
+                if current.repairs.ready.is_empty() && current.repairs.retry.is_empty() {
                     current.cached_vectors.clear();
+                    current.repairs.retry_delay = Duration::ZERO;
                 }
                 let pending = current.has_pending_embeddings();
                 current.manifest.embeddings_pending = pending;
@@ -2116,23 +2171,12 @@ async fn handle_bg_done(
                     current.publish_manifest().await?;
                     publisher.publish_if_live(current, false);
                 }
-                let now = Instant::now();
-                current.repairs.completed(
-                    was_full_sweep,
-                    last_attempted,
-                    matches!(failure, Some(update::RepairFailure::Note)),
-                    now,
-                );
-                if matches!(failure, Some(update::RepairFailure::Provider)) {
-                    *repair_at = now + *repair_delay;
+                if let Some(minimum) = provider_backoff {
+                    *repair_at = now + (*repair_delay).max(minimum);
                     *repair_delay = (*repair_delay * 2).min(Duration::from_secs(300));
                 } else if pending {
                     *repair_at = now + Duration::from_millis(25);
-                    *repair_delay = current
-                        .repairs
-                        .next_at(&current.sweep, *repair_at)
-                        .saturating_duration_since(now)
-                        .max(Duration::from_secs(1));
+                    *repair_delay = Duration::from_secs(1);
                 } else {
                     current.repairs = RepairTurns::default();
                     *repair_delay = Duration::from_secs(1);
@@ -2413,7 +2457,6 @@ async fn open_disk(
                         lexical_idle_retired: false,
                         epoch: None,
                         embedder: None,
-                        dirty_notes: BTreeSet::new(),
                         repairs: RepairTurns::default(),
                         cached_vectors: HashMap::new(),
                         sweep: FullSweep::from_pending(full_sweep_needed),

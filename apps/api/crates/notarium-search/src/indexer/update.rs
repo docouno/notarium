@@ -22,6 +22,7 @@ use notarium_core::{
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     sync::Arc,
+    time::Duration,
 };
 
 pub(super) async fn requires_scrub(
@@ -289,16 +290,18 @@ pub(super) async fn apply(
         .map_err(|_| IndexError::Inconsistent)??;
         disk.epoch = Some(epoch);
         disk.manifest.vector_seq = Some(seq);
-        disk.manifest.embeddings_pending |= !updated_note_ids.is_empty();
     }
 
     for id in &deleted_ids {
-        disk.dirty_notes.remove(id);
+        disk.repairs.forget(id);
     }
-    if !updated_note_ids.is_empty() && (disk.epoch.is_some() || disk.manifest.vector_seq.is_some())
-    {
-        disk.dirty_notes.extend(updated_note_ids);
-        disk.manifest.embeddings_pending = true;
+    if disk.epoch.is_some() || disk.manifest.vector_seq.is_some() {
+        for id in updated_note_ids {
+            disk.repairs.edit(id);
+        }
+        if disk.epoch.is_some() {
+            disk.manifest.embeddings_pending = disk.has_pending_embeddings();
+        }
     }
 
     if has_chat_removed {
@@ -333,6 +336,7 @@ pub(super) struct EmbedBatchInput {
     pub embedder: Arc<Embedder>,
     pub snapshot: VectorSnapshot,
     pub cached_vectors: HashMap<ContentDigest, Arc<QuantizedVector>>,
+    pub deferred: Arc<BTreeSet<NoteId>>,
     pub mode: EmbedBatchMode,
     pub cancel: Cancellation,
 }
@@ -348,19 +352,9 @@ pub(super) struct EmbeddedNoteRow {
     pub chunks: EmbeddedChunks,
 }
 
-#[derive(Clone, Copy)]
-pub(super) enum RepairFailure {
-    Note,
-    Provider,
-}
-
 pub(super) enum EmbedBatchOutcome {
-    ModelChanged {
-        requeue: Vec<NoteId>,
-    },
-    Backoff {
-        requeue: Vec<NoteId>,
-    },
+    ModelChanged,
+    Backoff,
     Applied {
         rows: Vec<EmbeddedNoteRow>,
         requeue: Vec<NoteId>,
@@ -368,7 +362,9 @@ pub(super) enum EmbedBatchOutcome {
         next_sweep_after: Option<NoteId>,
         was_full_sweep: bool,
         last_attempted: Option<NoteId>,
-        failure: Option<RepairFailure>,
+        selected: Vec<NoteId>,
+        retry_notes: Vec<NoteId>,
+        provider_backoff: Option<Duration>,
     },
 }
 
@@ -383,14 +379,10 @@ pub(super) async fn run_embed_batch(
         embedder,
         snapshot,
         cached_vectors,
+        deferred,
         mode,
         cancel,
     } = input;
-
-    let requeue_all = |mode: &EmbedBatchMode| match mode {
-        EmbedBatchMode::DirtyNotes(ids) => ids.clone(),
-        EmbedBatchMode::FullSweep { .. } => Vec::new(),
-    };
 
     match services
         .model_target(&cutoff.scope, None, &new_budget(&cancel))
@@ -398,14 +390,10 @@ pub(super) async fn run_embed_batch(
     {
         Ok(selected) if selected.as_ref() == Some(&embedder.target) => {}
         Ok(_) => {
-            return Ok(EmbedBatchOutcome::ModelChanged {
-                requeue: requeue_all(&mode),
-            });
+            return Ok(EmbedBatchOutcome::ModelChanged);
         }
         Err(_) => {
-            return Ok(EmbedBatchOutcome::Backoff {
-                requeue: requeue_all(&mode),
-            });
+            return Ok(EmbedBatchOutcome::Backoff);
         }
     }
 
@@ -460,14 +448,13 @@ pub(super) async fn run_embed_batch(
     let mut missing_folders = BTreeSet::new();
     let mut page_keys = HashMap::<ContentDigest, (usize, usize)>::new();
     let mut buffered_rows = 0;
-    let mut failure = None;
+    let mut retry_notes = Vec::new();
+    let mut provider_backoff = None;
     let mut last_processed = None;
     let mut remaining = items.into_iter();
     while let Some((note_id, carrier)) = remaining.next() {
         if cancel.is_cancelled() {
-            return Ok(EmbedBatchOutcome::Backoff {
-                requeue: requeue_all(&mode),
-            });
+            return Ok(EmbedBatchOutcome::Backoff);
         }
         let mut folded = None;
         if let Some(note) = &carrier
@@ -508,7 +495,7 @@ pub(super) async fn run_embed_batch(
             let (chunks, outcome) = match prepared {
                 NotePreparation::Finished(outcome) => (None, outcome),
                 NotePreparation::Ready(mut prepared) => {
-                    if prepared.matches_snapshot(&snapshot) {
+                    if deferred.contains(&note_id) || prepared.matches_snapshot(&snapshot) {
                         last_processed = Some(note_id);
                         continue;
                     }
@@ -549,20 +536,20 @@ pub(super) async fn run_embed_batch(
             match outcome {
                 NoteIndexOutcome::Complete | NoteIndexOutcome::Denied => {}
                 NoteIndexOutcome::Pending => {
-                    failure = Some(RepairFailure::Note);
-                    requeue.push(note_id.clone());
+                    retry_notes.push(note_id.clone());
                     if chunks.is_none() {
                         last_processed = Some(note_id);
                         continue;
                     }
                 }
                 NoteIndexOutcome::Fatal(EmbeddingError::ModelUnavailable) => {
-                    return Ok(EmbedBatchOutcome::ModelChanged {
-                        requeue: requeue_all(&mode),
-                    });
+                    return Ok(EmbedBatchOutcome::ModelChanged);
                 }
-                NoteIndexOutcome::Fatal(_) => {
-                    failure = Some(RepairFailure::Provider);
+                NoteIndexOutcome::Fatal(error) => {
+                    provider_backoff = Some(match error {
+                        EmbeddingError::IndexingThrottled(delay) => delay,
+                        _ => Duration::ZERO,
+                    });
                     last_processed = Some(note_id.clone());
                     requeue.push(note_id);
                     requeue.extend(remaining.map(|(id, _)| id));
@@ -608,14 +595,10 @@ pub(super) async fn run_embed_batch(
     {
         Ok(selected) if selected.as_ref() == Some(&embedder.target) => {}
         Ok(_) => {
-            return Ok(EmbedBatchOutcome::ModelChanged {
-                requeue: requeue_all(&mode),
-            });
+            return Ok(EmbedBatchOutcome::ModelChanged);
         }
         Err(_) => {
-            return Ok(EmbedBatchOutcome::Backoff {
-                requeue: requeue_all(&mode),
-            });
+            return Ok(EmbedBatchOutcome::Backoff);
         }
     }
 
@@ -626,7 +609,12 @@ pub(super) async fn run_embed_batch(
         next_sweep_after,
         was_full_sweep,
         last_attempted: last_processed,
-        failure,
+        selected: match mode {
+            EmbedBatchMode::DirtyNotes(ids) => ids,
+            EmbedBatchMode::FullSweep { .. } => Vec::new(),
+        },
+        retry_notes,
+        provider_backoff,
     })
 }
 

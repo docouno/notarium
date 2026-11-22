@@ -9,8 +9,11 @@ use notarium_core::{
     auth::{SpaceGrant, SpaceKind, SpaceRole},
     classes::{DocClass, ProviderAudience, ProviderPolicy},
     epoch::{DataRoot, SearchIndexKind},
-    error::ValidationReason,
-    ids::{FolderId, LeaseEpoch, ModelProfileId, PrincipalId, ProviderResourceId, SpaceSeq},
+    error::{BudgetKind, ValidationReason},
+    ids::{
+        ContentDigest, FolderId, LeaseEpoch, ModelProfileId, NoteId, PrincipalId,
+        ProviderResourceId, SpaceSeq,
+    },
     model::{FolderRef, HistoryScope},
     ports::{
         CallBudget, EmbeddingInput, EmbeddingProviderPort, EmbeddingRequest, EmbeddingResult,
@@ -28,7 +31,7 @@ use notarium_search::{
     },
 };
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     sync::{
         Arc, Mutex, RwLock,
         atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering},
@@ -189,6 +192,46 @@ impl SearchModelResolverPort for SwitchingResolver {
 }
 
 #[derive(Default)]
+struct SharedQuota {
+    retry_ms: u64,
+    attempts: Vec<Instant>,
+    paid_chunks: BTreeSet<ContentDigest>,
+    admitted_notes: BTreeMap<NoteId, usize>,
+    rejected: Vec<usize>,
+}
+
+impl SharedQuota {
+    fn admit(&mut self, inputs: &[EmbeddingInput]) -> Result<(), DomainError> {
+        self.attempts.push(Instant::now());
+        let budget = match self.rejected.len() {
+            0 if self.paid_chunks.len() >= 256 => BudgetKind::Requests,
+            1 if self.paid_chunks.len() >= 272 => BudgetKind::Concurrency,
+            _ => {
+                for input in inputs {
+                    let EmbeddingInput::Part(part) = input else {
+                        unreachable!()
+                    };
+                    assert!(
+                        self.paid_chunks.insert(part.part().key()),
+                        "paid twice for a chunk"
+                    );
+                    *self
+                        .admitted_notes
+                        .entry(part.provenance().reference().note_id.clone())
+                        .or_default() += 1;
+                }
+                return Ok(());
+            }
+        };
+        self.rejected.push(self.attempts.len() - 1);
+        Err(DomainError::RateLimited {
+            budget,
+            retry_after_ms: self.retry_ms,
+        })
+    }
+}
+
+#[derive(Default)]
 pub(super) struct ModelProvider {
     pub(super) queries: Mutex<Vec<ProviderResourceId>>,
     query_folders: Mutex<Vec<Option<FolderId>>>,
@@ -200,6 +243,7 @@ pub(super) struct ModelProvider {
     pub(super) fail_indexing: AtomicBool,
     token_limit: AtomicU32,
     rate_limited: AtomicUsize,
+    shared_quota: Mutex<Option<(ProviderResourceId, SharedQuota)>>,
     pub(super) block_next_part: AtomicBool,
     pub(super) part_started: Notify,
     pub(super) release_part: Notify,
@@ -263,11 +307,16 @@ impl EmbeddingProviderPort for ModelProvider {
                     self.outside_parts
                         .fetch_add(request.inputs.len(), Ordering::SeqCst);
                 }
+                if let Some((resource, quota)) = self.shared_quota.lock().unwrap().as_mut()
+                    && resource == &request.provider
+                {
+                    quota.admit(&request.inputs)?;
+                }
                 let limit = self.token_limit.load(Ordering::SeqCst);
                 if limit != 0 && request.declared_tokens > limit {
                     self.rate_limited.fetch_add(1, Ordering::SeqCst);
                     return Err(DomainError::RateLimited {
-                        budget: notarium_core::error::BudgetKind::Tokens,
+                        budget: BudgetKind::Tokens,
                         retry_after_ms: 1000,
                     }
                     .into());
@@ -325,10 +374,18 @@ pub async fn rate_limited_repair(store: Arc<CanonicalStore>, root: DataRoot) {
             notes
                 .iter()
                 .map(|id| {
-                    if *id == tail {
+                    if id == &notes[0] {
+                        let mut large = note(id, &folder, "Large", "");
+                        large.carrier = (0..320)
+                            .map(|i| {
+                                format!("# Section {i}\n\nUnique paragraph for section {i}.\n\n")
+                            })
+                            .collect();
+                        large
+                    } else if *id == tail {
                         note(id, &folder, "Short", "brief text")
                     } else {
-                        note(id, &folder, "Long", &long)
+                        note(id, &folder, "Long", &format!("{long}{id}"))
                     }
                 })
                 .collect(),
@@ -402,7 +459,107 @@ pub async fn rate_limited_repair(store: Arc<CanonicalStore>, root: DataRoot) {
     .await
     .expect("the small tail note must reach semantic search despite the rate-limited prefix");
     assert!(provider.rate_limited.load(Ordering::SeqCst) >= before + 16);
+    provider.token_limit.store(0, Ordering::SeqCst);
+    tokio::time::timeout(Duration::from_secs(12), async {
+        while layout
+            .search_manifest()
+            .unwrap()
+            .unwrap()
+            .embeddings_pending
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the original target must have a healthy checkpoint");
     engine.shutdown().await;
+
+    // Both quotas interrupt the first note after its first 256-row window.
+    // The old complete epoch remains visible until the replacement is ready.
+    let original = resolver.current_target();
+    resolver.provider.store(6, Ordering::SeqCst);
+    *provider.shared_quota.lock().unwrap() = Some((
+        ProviderResourceId::from_bytes([6; 16]),
+        SharedQuota {
+            retry_ms: 1250,
+            ..Default::default()
+        },
+    ));
+    let engine = start();
+    let target = resolver.current_target();
+    let mut observed_pauses = BTreeSet::new();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let paused = {
+                let quota = provider.shared_quota.lock().unwrap();
+                let quota = &quota.as_ref().unwrap().1;
+                quota
+                    .rejected
+                    .last()
+                    .copied()
+                    .filter(|at| *at + 1 == quota.attempts.len())
+            };
+            let manifest = layout.search_manifest().unwrap().unwrap();
+            if manifest.active_model.as_ref() == Some(&target) {
+                assert!(!manifest.embeddings_pending);
+                break;
+            }
+            if let Some(rejected) = paused {
+                assert_eq!(manifest.active_model.as_ref(), Some(&original));
+                assert!(!manifest.embeddings_pending);
+                observed_pauses.insert(rejected);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("shared limits must allow the entire replacement epoch to finish");
+    assert_eq!(observed_pauses.len(), 2);
+    engine.shutdown().await;
+    let (_, quota) = provider.shared_quota.lock().unwrap().take().unwrap();
+    assert_eq!(quota.admitted_notes.len(), 17);
+    assert_eq!(quota.admitted_notes[&sample_note_id(1)], 320);
+    assert_eq!(quota.rejected.len(), 2);
+    let delay = Duration::from_millis(quota.retry_ms);
+    for rejected in quota.rejected {
+        assert!(quota.attempts[rejected + 1].duration_since(quota.attempts[rejected]) >= delay);
+    }
+
+    resolver.provider.store(7, Ordering::SeqCst);
+    *provider.shared_quota.lock().unwrap() = Some((
+        ProviderResourceId::from_bytes([7; 16]),
+        SharedQuota {
+            retry_ms: 30_000,
+            ..Default::default()
+        },
+    ));
+    let engine = start();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if !provider
+                .shared_quota
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .1
+                .rejected
+                .is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the new target must enter its quota wait");
+    tokio::time::timeout(Duration::from_secs(3), engine.shutdown())
+        .await
+        .expect("shutdown must interrupt the 30-second quota wait");
+    assert_eq!(
+        layout.search_manifest().unwrap().unwrap().active_model,
+        Some(target)
+    );
 }
 
 pub async fn model_epochs_and_repair(store: Arc<CanonicalStore>, root: DataRoot) {
