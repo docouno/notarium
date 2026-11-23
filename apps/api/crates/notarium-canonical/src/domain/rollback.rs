@@ -295,15 +295,16 @@ pub(crate) async fn rollback_agent_run_by_id(
     let deadline = super::common::CommandDeadline::start(&ctx.budget, "rollback").at;
     validate_mutation_identity(&ctx, &request.identity)?;
     super::common::require_empty_preconditions(&request.preconditions)?;
-    let identity = |policy| {
-        super::common::derive_command_identity_spec(
-            &request.identity,
-            "rollback_agent_run_by_id_v1",
-            request.input.as_str().as_bytes(),
-        )
-        .with_canonical_effect(&ctx)
-        .with_policy(ctx.auth(), policy)
-    };
+    let idemp = super::common::derive_command_identity_spec(
+        &request.identity,
+        "rollback_agent_run_by_id_v1",
+        request.input.as_str().as_bytes(),
+    )
+    .with_canonical_effect(&ctx)
+    .with_policy(
+        ctx.auth(),
+        crate::writer::replay::ReplayPolicy::RollbackRun(request.input.clone()),
+    );
     let direct_by_id = ctx.canonical_effect().is_some()
         && (store.is_postgres()
             || (store.is_sqlite_local() && ctx.confirmed_chat_step().is_none()))
@@ -312,14 +313,11 @@ pub(crate) async fn rollback_agent_run_by_id(
         let scope = ctx.scope();
         let guard = store.enter_write_op(&scope.space_id)?;
         let epoch = rollback_writer_epoch(store, &ctx, None, deadline).await?;
-        let idemp = identity(crate::writer::replay::ReplayPolicy::RollbackRun(
-            request.input.clone(),
-        ));
         let (intent, sqlite_plan) = direct_rollback_intent(
             store,
             &ctx,
             epoch,
-            idemp,
+            idemp.clone(),
             &request.identity,
             DirectRollbackTarget::ById(request.input.clone()),
         );
@@ -343,13 +341,6 @@ pub(crate) async fn rollback_agent_run_by_id(
     read_ctx.budget.remaining = rollback_time_left(&ctx.budget, deadline)?;
     let (input, prepared_epoch) =
         prepare_agent_run_rollback(store, read_ctx, request.input.clone()).await?;
-    let idemp = if direct_by_id {
-        identity(crate::writer::replay::ReplayPolicy::RollbackRun(
-            input.run.clone(),
-        ))
-    } else {
-        identity(rollback_policy(&input))
-    };
     let prepared = Mutation {
         identity: request.identity,
         preconditions: request.preconditions,

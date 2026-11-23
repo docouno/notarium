@@ -30,7 +30,6 @@ async fn exercise(pg: bool) {
     );
     let ctx = fixture.personal_scope().await;
     Box::pin(check_missing_publication(&fixture, &supervisor, &ctx)).await;
-    Box::pin(check_late_source_folder(&fixture, &supervisor, &ctx)).await;
     Box::pin(check_edit_before_rollback_admission(
         &fixture,
         &supervisor,
@@ -44,6 +43,7 @@ async fn exercise(pg: bool) {
     ] {
         Box::pin(check_receipt(&fixture, &supervisor, &ctx, tag, form)).await;
     }
+    Box::pin(check_late_source_folder(&fixture, &supervisor, &ctx)).await;
     fixture.close().await;
 }
 
@@ -356,50 +356,99 @@ async fn check_late_source_folder(
             CommandKey::from_bytes([147; 16]),
         )
     };
-    let initial = rollback().await.unwrap();
-    assert_eq!(initial.value.trashed.len(), 1);
-    assert_eq!(initial.value.trashed[0].note, first_note);
-    // Only a current-source check sees this note. The original receipt cannot mention it.
-    store
-        .create_note(
-            agent.clone(),
-            Mutation {
-                identity: CommandIdentity {
-                    scope: scope.clone(),
-                    actor: agent.auth().principal().clone(),
-                    key: CommandKey::from_bytes([148; 16]),
-                    hash: ContentDigest::from_bytes([148; 32]),
-                },
-                preconditions: Preconditions::default(),
-                input: CreateNote {
-                    note: NoteId::from_bytes([148; 16]),
-                    parent: Some(folder.clone()),
-                    slug: "late-note".into(),
-                    class: DocClass::UserDoc,
-                    carrier: "# Late note\n".into(),
-                    folder_page: false,
-                },
+    let room_note = append_note(fixture, ctx, 149).await;
+    let cancellation = Cancellation::default();
+    let lease = fixture
+        .revocations
+        .register_viewer(
+            MaintenanceContext {
+                authority: ServiceAuthority::admit(ServicePurpose::Revocation),
+                budget: budget(),
             },
+            ctx.auth(),
+            &scope.space_id,
+            cancellation.clone(),
+        )
+        .unwrap();
+    let mut peer = fixture
+        .collab
+        .connect(
+            ctx.clone(),
+            room_note,
+            notarium_collab::CollabSessionAuth::new(Box::new(lease), cancellation, None),
         )
         .await
         .unwrap();
-    let healthy = rollback().await.unwrap();
-    assert_eq!(healthy.value, initial.value);
-    assert_eq!(healthy.receipt, initial.receipt);
-    let (trashed_rev, before_denial) = store
-        .set_folder_lifecycle(
-            scope,
-            epoch,
-            &folder,
-            &folder_rev,
-            Lifecycle::Trashed,
-            actor,
-            None,
-        )
+    peer.send(notarium_collab::wire::LineageHello::Fresh.encode())
         .await
         .unwrap();
+    assert!(matches!(
+        peer.recv().await,
+        Some(notarium_collab::SessionEvent::Binary(_))
+    ));
+    assert_eq!(fixture.collab.active_room_count(), 1);
+
+    // One copy already has a general plan when the other commits the receipt.
+    let (waiting, release) = pause_guarded_admission(store);
+    let complete_and_change_sources = async {
+        waiting.await.unwrap();
+        let initial = rollback().await.unwrap();
+        assert_eq!(initial.value.trashed.len(), 1);
+        assert_eq!(initial.value.trashed[0].note, first_note);
+        // Only a current-source check sees this note. The original receipt cannot mention it.
+        store
+            .create_note(
+                agent.clone(),
+                Mutation {
+                    identity: CommandIdentity {
+                        scope: scope.clone(),
+                        actor: agent.auth().principal().clone(),
+                        key: CommandKey::from_bytes([148; 16]),
+                        hash: ContentDigest::from_bytes([148; 32]),
+                    },
+                    preconditions: Preconditions::default(),
+                    input: CreateNote {
+                        note: NoteId::from_bytes([148; 16]),
+                        parent: Some(folder.clone()),
+                        slug: "late-note".into(),
+                        class: DocClass::UserDoc,
+                        carrier: "# Late note\n".into(),
+                        folder_page: false,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        let healthy = rollback().await.unwrap();
+        assert_eq!(healthy.value, initial.value);
+        assert_eq!(healthy.receipt, initial.receipt);
+        let (trashed_rev, before_denial) = store
+            .set_folder_lifecycle(
+                scope,
+                epoch,
+                &folder,
+                &folder_rev,
+                Lifecycle::Trashed,
+                actor,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rollback().await.unwrap_err(),
+            PortError::Domain(DomainError::ResourceNotFound)
+        );
+        release.send(()).unwrap();
+        (initial, trashed_rev, before_denial)
+    };
+    let (pending, (initial, trashed_rev, before_denial)) =
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(rollback(), complete_and_change_sources)
+        })
+        .await
+        .expect("both copies of the planned rollback must settle");
     assert_eq!(
-        rollback().await.unwrap_err(),
+        pending.unwrap_err(),
         PortError::Domain(DomainError::ResourceNotFound)
     );
     assert_eq!(
@@ -432,7 +481,6 @@ async fn check_edit_before_rollback_admission(
     supervisor: &AgentRunSupervisor,
     ctx: &SpaceContext,
 ) {
-    use notarium_canonical::writer::TestPauseGate;
     let store = &fixture.canonical;
     let scope = ctx.scope();
     let run = AgentRunId::from_bytes([120; 16]);
@@ -453,24 +501,18 @@ async fn check_edit_before_rollback_admission(
             CommandKey::from_bytes([123; 16]),
         )
     };
-    let (entered, waiting) = tokio::sync::oneshot::channel();
-    let (release, resume) = tokio::sync::oneshot::channel();
-    *store
-        .writer_faults()
-        .unwrap()
-        .guarded_admission_pause_once
-        .lock()
-        .unwrap() = Some(TestPauseGate {
-        entered,
-        release: resume,
-    });
+    let (waiting, release) = pause_guarded_admission(store);
     // Persist a second source after the rollback was prepared but before the writer admits it.
     let intervening_edit = async {
         waiting.await.unwrap();
         rename(fixture, &agent, &late, 124).await;
         release.send(()).unwrap();
     };
-    let (undo_result, ()) = tokio::join!(undo(), intervening_edit);
+    let (undo_result, ()) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::join!(undo(), intervening_edit)
+    })
+    .await
+    .expect("edit and rollback must settle across writer admission");
     let done = undo_result.unwrap();
     assert_eq!(done.value.trashed.len(), 1);
     assert_eq!(done.value.trashed[0].note, created);
@@ -491,4 +533,25 @@ async fn check_edit_before_rollback_admission(
         store.read_space(space).await.unwrap().last_seq,
         done.receipt.seq()
     );
+}
+
+fn pause_guarded_admission(
+    store: &CanonicalStore,
+) -> (
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    use notarium_canonical::writer::TestPauseGate;
+    let (entered, waiting) = tokio::sync::oneshot::channel();
+    let (release, resume) = tokio::sync::oneshot::channel();
+    *store
+        .writer_faults()
+        .unwrap()
+        .guarded_admission_pause_once
+        .lock()
+        .unwrap() = Some(TestPauseGate {
+        entered,
+        release: resume,
+    });
+    (waiting, release)
 }
