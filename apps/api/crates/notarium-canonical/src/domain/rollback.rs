@@ -901,97 +901,27 @@ pub(crate) fn build_rollback_direct_single_tx_exec(
                 DirectRollbackTarget::ById(run) => (run, None),
             };
             let mut folder_cache = FolderAncestryCache::default();
-            // 1. Consolidated Space + Run + RootFolder state probe (1 single query on PostgreSQL!).
-            type RollbackStateProbeTuple = (bool, bool, bool, bool, Option<(Vec<u8>, String)>);
-            let (has_bmh, has_note_states, has_ov, has_schema, run_head_opt): RollbackStateProbeTuple =
+            type RollbackStateProbe = (bool, bool, Option<bool>, bool, Option<(Vec<u8>, String)>);
+            let (has_bmh, has_note_states, known_overlays, read_schema, run_head_opt): RollbackStateProbe =
                 match tx {
                 BackendConn::Postgres(conn) => {
-                    let r = sqlx::query(
-                        "SELECT
-                            EXISTS(SELECT 1 FROM board_move_history WHERE space_id = $1) AS has_bmh,
-                            (EXISTS(SELECT 1 FROM revision_purge_fences WHERE space_id = $1) OR
-                             EXISTS(SELECT 1 FROM collab_sessions WHERE space_id = $1)) AS has_note_states,
-                            EXISTS(SELECT 1 FROM view_rank_overlays WHERE space_id = $1) AS has_ov,
-                            EXISTS(SELECT 1 FROM space_field_schemas WHERE space_id = $1 AND is_current = 1) AS has_schema,
-                            arh.history_incarnation AS run_inc,
-                            arh.run_revision AS run_rev,
-                            rf.folder_id AS rf_id,
-                            rf.parent_folder_id AS rf_parent,
-                            rf.is_root AS rf_is_root,
-                            rf.slug AS rf_slug,
-                            rf.slug_fold AS rf_slug_fold,
-                            rf.display_name AS rf_display_name,
-                            rf.is_project AS rf_is_project,
-                            rf.project_slug AS rf_project_slug,
-                            rf.project_slug_fold AS rf_project_slug_fold,
-                            rf.description AS rf_description,
-                            rf.cover_note_id AS rf_cover,
-                            rf.write_lock_json AS rf_write_lock,
-                            rf.lifecycle_state AS rf_lc,
-                            rf.head_rev_id AS rf_head_rev
-                         FROM (SELECT 1) AS probe
-                         LEFT JOIN agent_run_heads arh ON arh.space_id = $1 AND arh.run_id = $2
-                         LEFT JOIN folder_heads rf ON rf.space_id = $1 AND rf.folder_id = $3",
+                    // Folder ancestry and the current schema use the same reads as ordinary note writes.
+                    let row = sqlx::query(
+                        "SELECT EXISTS(SELECT 1 FROM board_move_history WHERE space_id = $1) AS has_bmh,
+                                (EXISTS(SELECT 1 FROM revision_purge_fences WHERE space_id = $1) OR
+                                 EXISTS(SELECT 1 FROM collab_sessions WHERE space_id = $1)) AS has_note_states,
+                                history_incarnation, run_revision
+                         FROM agent_run_heads WHERE space_id = $1 AND run_id = $2",
                     )
                     .bind(scope_cl.space_id.as_str())
                     .bind(run.as_str())
-                    .bind(item_ctx.root_folder_id.as_str())
-                    .fetch_one(&mut **conn)
+                    .fetch_optional(&mut **conn)
                     .await
-                    .map_err(|err| internal_not_committed("pg_rb_combined_probe", err.to_string()))?;
-
-                    let rf_id_opt: Option<String> = r.get("rf_id");
-                    if rf_id_opt.is_some() {
-                        let parent_raw: Option<String> = r.get("rf_parent");
-                        let cover_raw: Option<String> = r.get("rf_cover");
-                        let lc_raw: String = r.get("rf_lc");
-                        let head_rev_raw: String = r.get("rf_head_rev");
-                        let write_lock_json: Option<String> = r.get("rf_write_lock");
-                        let is_root_raw: i32 = r.get("rf_is_root");
-                        let is_proj_raw: i32 = r.get("rf_is_project");
-
-                        let parent_folder_id = match parent_raw {
-                            Some(s) => Some(FolderId::parse(&s).map_err(|_| {
-                                internal_not_committed("corrupt_parent_folder", "invalid FolderId")
-                            })?),
-                            None => None,
-                        };
-                        let cover_note_id = match cover_raw {
-                            Some(s) => Some(NoteId::parse(&s).map_err(|_| {
-                                internal_not_committed("corrupt_cover_note", "invalid NoteId")
-                            })?),
-                            None => None,
-                        };
-                        let head_rev_id = RevisionId::parse(&head_rev_raw).map_err(|_| {
-                            internal_not_committed("corrupt_folder_rev", "invalid RevisionId")
-                        })?;
-                        let lifecycle = lifecycle_from_db(&lc_raw)?;
-                        folder_cache.insert_preloaded_row(FolderHeadRow {
-                            folder_id: item_ctx.root_folder_id.clone(),
-                            parent_folder_id,
-                            is_root: is_root_raw != 0,
-                            slug: r.get("rf_slug"),
-                            slug_fold: r.get("rf_slug_fold"),
-                            display_name: r.get("rf_display_name"),
-                            is_project: is_proj_raw != 0,
-                            project_slug: r.get("rf_project_slug"),
-                            project_slug_fold: r.get("rf_project_slug_fold"),
-                            description: r.get("rf_description"),
-                            cover_note_id,
-                            write_locked: write_lock_json.is_some(),
-                            lifecycle,
-                            head_rev_id,
-                        });
-                    }
-
-                    let run_inc: Option<Vec<u8>> = r.get("run_inc");
-                    let run_rev: Option<String> = r.get("run_rev");
+                    .map_err(|err| internal_not_committed("pg_rb_combined_probe", err.to_string()))?
+                    .ok_or(DomainError::ResourceNotFound)?;
                     (
-                        r.get("has_bmh"),
-                        r.get("has_note_states"),
-                        r.get("has_ov"),
-                        r.get("has_schema"),
-                        run_inc.zip(run_rev),
+                        row.get("has_bmh"), row.get("has_note_states"), None, true,
+                        Some((row.get("history_incarnation"), row.get("run_revision"))),
                     )
                 }
                 BackendConn::Sqlite(conn) => {
@@ -1014,7 +944,7 @@ pub(crate) fn build_rollback_direct_single_tx_exec(
                     (
                         row.get("has_bmh"),
                         row.get("has_note_states"),
-                        row.get("has_ov"),
+                        Some(row.get("has_ov")),
                         row.get("has_schema"),
                         incarnation.zip(row.get("run_revision")),
                     )
@@ -1028,16 +958,7 @@ pub(crate) fn build_rollback_direct_single_tx_exec(
             let Some((inc_bytes, run_rev_raw)) = run_head_opt else {
                 return Err(DomainError::ResourceNotFound.into());
             };
-            let inc_arr: [u8; 16] = inc_bytes
-                .try_into()
-                .map_err(|_| internal_not_committed("corrupt_run_inc", "incarnation != 16B"))?;
-            scope_cl.check(&HistoryScope {
-                space_id: scope_cl.space_id.clone(),
-                incarnation: HistoryIncarnation::from_bytes(inc_arr),
-            })?;
-
-            let actual_run_rev = RevisionId::parse(&run_rev_raw)
-                .map_err(|_| internal_not_committed("corrupt_run_rev", "invalid run_revision"))?;
+            let actual_run_rev = scoped_run_revision(&scope_cl, &inc_bytes, &run_rev_raw)?;
 
             let histories = load_direct_rollback_histories(tx, &scope_cl.space_id, run).await?;
             let touched: Vec<NoteId> = histories.keys().cloned().collect();
@@ -1270,7 +1191,7 @@ pub(crate) fn build_rollback_direct_single_tx_exec(
 
             stage_rollback_fences(item_ctx, locked_fences, &req_id)?;
 
-            let current_schema = if has_schema {
+            let current_schema = if read_schema {
                 load_current_space_schema_tx(tx, &scope_cl.space_id).await?
             } else {
                 None
@@ -1300,6 +1221,15 @@ pub(crate) fn build_rollback_direct_single_tx_exec(
                     )
                 })
                 .count() as u64;
+            let has_ov = match known_overlays {
+                Some(present) => present,
+                None => {
+                    final_eligible
+                        .values()
+                        .any(|action| rank_removal::removes_ranks(Some(action)))
+                        && has_any_overlays_in_space_tx(tx, &scope_cl.space_id).await?
+                }
+            };
             let rank_removals = if has_ov {
                 rank_removal::plan_tx(tx, &scope_cl.space_id, &final_eligible, &[]).await?
             } else {
