@@ -214,19 +214,52 @@ and lost acknowledgements. Canonical and control tests cover database receipts,
 schema upgrades and recovery. HTTP transport and production cluster authority have separate
 integration requirements.
 
-The Keeper integration test reports the latency of the first supervisor rollback
-of nine changed memory notes with the collaboration hub registered, including
-live authorization and the durable commit. It checks all nine restored
-digests and the replayed receipt outside the timer. For acceptance, run one
-warmup followed by 20 fresh first calls per backend, in release mode on a
-quiet host. Every measured call must take less than 5,000 microseconds.
-The command below puts PostgreSQL data and its WAL on a disposable Docker
-volume. Verify the volume is disk-backed and keep synchronous commit enabled
-when recording latency. The regular integration fixture uses a memory
-filesystem.
+### First Keeper rollback
+
+The release integration test times the first public supervisor rollback of nine
+changed memory notes. It includes live authorization, the registered collaboration
+hub and the durable commit. Each test also verifies all nine restored digests
+and the receipt returned by a retry after the timer stops.
+
+Choose the [High or Medium reference](storage-performance.md#reference-configurations-and-results)
+before running the benchmark. The table gives the time limit for **each** measured
+call and the observed distribution used to select it. All values are milliseconds.
+
+| Reference | Database | Median | p95 | Slowest call | Per-call limit |
+| --- | --- | ---: | ---: | ---: | ---: |
+| High | SQLite | 2.571 | 6.352 | 61.359 | <74 |
+| High | PostgreSQL | 4.547 | 10.652 | 90.519 | <109 |
+| Medium | SQLite | 6.180 | 9.006 | 15.333 | <19 |
+| Medium | PostgreSQL | 11.523 | 17.250 | 122.331 | <147 |
+
+Calibration used four series of 20 fresh calls per database on each reference
+(runtime `1dc5daf1`). Each limit is the observed maximum plus 20% headroom,
+rounded up to a whole millisecond. One High series had several long calls on
+both databases during elevated host I/O pressure. One Medium PostgreSQL call
+took 122.331 ms. Compare median and p95 across
+runs to detect shifts in ordinary latency. The per-call limit covers observed
+tail variation on these reference systems. The component benchmark measures
+the p95 of 1,000 canonical storage commands separately.
+
+Run the following command from the checkout root on a quiet reference system.
+Use a disk-backed Cargo target for SQLite WAL with `synchronous=FULL` and a
+disk-backed Docker data volume for PostgreSQL 16 with `fsync`, `full_page_writes`
+and `synchronous_commit` enabled. Each invocation starts a new PostgreSQL volume
+and runs both backends sequentially. Sample 0 warms the fixture. Samples 1–20
+use fresh state and must each finish strictly below the selected limit for their
+database. Qualify a reference with three complete invocations, retaining all
+individual timings and test outcomes.
 
 ```sh
 sh scripts/control-db-fixture.sh run-durable sh .devkit/runtime/devkit.sh cli exec \
-  --component apps/api --network none -- cargo test --release --locked --offline \
-  -p fitness-gates --test agents_runtime keeper_turn_cases:: -- --nocapture --test-threads=1
+  --component apps/api --network none -- sh -ec '
+    for sample in $(seq 0 20); do
+      echo "ROLLBACK_SAMPLE $sample"
+      cargo test --release --locked --offline -p fitness-gates --test agents_runtime \
+        keeper_turn_cases:: -- --nocapture --test-threads=1
+    done'
 ```
+
+Each sample must report two passing tests and a `Product rollback sample` in
+microseconds for each database with nine restored memories. Cargo checks the
+restored state and replay. Compare the reported times with the selected row.
