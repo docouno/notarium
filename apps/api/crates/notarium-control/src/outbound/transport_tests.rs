@@ -945,3 +945,104 @@ async fn early_http_response_during_upload_closes_socket_before_close_returns() 
     server_task.await.unwrap();
     released(&client).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn early_multi_chunk_http_response_during_upload_does_not_deadlock_wait_uploaded() {
+    let _serial = crate::TEST_RESOURCE_LOCK.lock().await;
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.set_recv_buffer_size(8 * 1024).unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let listener = socket.listen(4).unwrap();
+    let origin = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let client = transport(&origin, &[1], Dns::new(&[&["127.0.0.1:0"]]));
+
+    let close_done = Arc::new(Notify::new());
+    let close_done_srv = close_done.clone();
+    let server_task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            head.push(stream.read_u8().await.unwrap());
+        }
+        // Send an early 401 with >128 KiB across multiple chunks (exceeding the
+        // bounded mpsc::channel(1) capacity) while the 6 MiB upload is stalled.
+        let chunk_payload = vec![b'e'; 48 * 1024];
+        let mut early = b"HTTP/1.1 401 Unauthorized\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        for _ in 0..4 {
+            early.extend_from_slice(format!("{:x}\r\n", chunk_payload.len()).as_bytes());
+            early.extend_from_slice(&chunk_payload);
+            early.extend_from_slice(b"\r\n");
+        }
+        early.extend_from_slice(b"0\r\n\r\n");
+        stream.write_all(&early).await.unwrap();
+        close_done_srv.notified().await;
+        let mut drained = 0usize;
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            match tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf)).await {
+                Ok(Ok(0)) | Ok(Err(_)) => break,
+                Ok(Ok(n)) => drained += n,
+                Err(_) => panic!("client left upload socket open after response.close()"),
+            }
+        }
+        assert!(
+            drained < 6 * 1024 * 1024,
+            "aborted early-response upload must not stream the full 6 MiB payload (got {drained})"
+        );
+    });
+
+    let mut big_req = request(1, 1, &format!("{origin}/early-401-chunked"), "secret");
+    big_req.body = vec![b'x'; 6 * 1024 * 1024];
+    let mut response = client.start(budget(), big_req).unwrap();
+    // wait_uploaded() must resolve immediately as Ok(false) rather than
+    // deadlocking against chunks_tx backpressure until IDLE_CHUNK_TIMEOUT.
+    assert!(
+        !tokio::time::timeout(Duration::from_secs(3), response.wait_uploaded())
+            .await
+            .unwrap()
+            .unwrap(),
+        "early multi-chunk response before body flush must return Ok(false)"
+    );
+    assert!(
+        !response.wait_uploaded().await.unwrap(),
+        "repeated wait_uploaded() calls must preserve Ok(false)"
+    );
+    response.receive_head().await.unwrap();
+    assert_eq!(response.status(), 401);
+    response.close().await.unwrap();
+    close_done.notify_one();
+    server_task.await.unwrap();
+    released(&client).await;
+}
+
+#[test]
+fn response_keep_alive_framing_checks_rfc_9112_and_header_encoding() {
+    let non_utf8_conn = http::Response::builder()
+        .status(200)
+        .header(header::CONTENT_LENGTH, "0")
+        .header(
+            header::CONNECTION,
+            HeaderValue::from_bytes(b"\xff").unwrap(),
+        )
+        .body(())
+        .unwrap();
+    assert!(!response_allows_keep_alive(&non_utf8_conn));
+
+    let te_without_chunked_and_cl = http::Response::builder()
+        .status(200)
+        .header(header::TRANSFER_ENCODING, "gzip")
+        .header(header::CONTENT_LENGTH, "4")
+        .body(())
+        .unwrap();
+    assert!(!response_allows_keep_alive(&te_without_chunked_and_cl));
+
+    let te_chunked = http::Response::builder()
+        .status(200)
+        .header(header::TRANSFER_ENCODING, "gzip, chunked")
+        .body(())
+        .unwrap();
+    assert!(response_allows_keep_alive(&te_chunked));
+
+    let no_content = http::Response::builder().status(204).body(()).unwrap();
+    assert!(response_allows_keep_alive(&no_content));
+}

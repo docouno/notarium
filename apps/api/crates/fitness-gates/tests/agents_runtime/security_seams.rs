@@ -1391,7 +1391,7 @@ async fn episode_mutation_blocked_for_read_and_shared_agents(fixture: &RuntimeFi
 
 async fn exact_causal_graph_and_control_replay_seams(
     fixture: &RuntimeFixture,
-    _personal: &SpaceContext,
+    personal: &SpaceContext,
 ) {
     // Tainted caller must be rejected on episode mutations.
     let ep_id = EpisodeId::from_bytes([123; 16]);
@@ -1682,26 +1682,166 @@ async fn exact_causal_graph_and_control_replay_seams(
             "tainted caller must fail closed with CrossSpaceTainted: {result:?}"
         );
     }
-    // Verify tainted MCP write attempts did NOT commit any mcp_dedup rows.
-    for (tag, op) in [(129u8, "invocation"), (133u8, "start-episode")] {
-        let hit = fixture
+    // Verify tainted MCP write attempts did NOT commit any mcp_dedup rows:
+    // clean `owner` shares the same TrustedNone grant as `tainted_owner`, so
+    // reusing caller tags 129 and 133 with different arguments would fail with
+    // IdempotencyKeyReused if any journal row had been persisted.
+    assert_eq!(owner.auth().grant(), tainted_owner.auth().grant());
+    call(
+        fixture,
+        owner,
+        129,
+        "edit_ability",
+        json!({
+            "ref": owned_ability.id,
+            "enabled": true,
+        }),
+    )
+    .await
+    .expect("clean edit_ability reusing tag 129 must not hit a tainted mcp_dedup row");
+    call(
+        fixture,
+        owner,
+        133,
+        "start_session",
+        json!({"task": "clean-start"}),
+    )
+    .await
+    .expect("clean start_session reusing tag 133 must not hit a tainted mcp_dedup row");
+    let direct_hit = fixture
+        .control
+        .lookup_mcp_dedup(
+            owner.clone(),
+            McpDedupKey {
+                actor: tainted_owner.auth().principal().to_string(),
+                request_key: CommandKey::from_bytes([134; 16]),
+                request_hash: ContentDigest::from_bytes([134; 32]),
+                operation: "invocation".into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        direct_hit.is_none(),
+        "tainted direct record_mcp_dedup must not persist tag 134"
+    );
+
+    // begin_agent_call with AgentTransport::Mcp must NOT mutate agent_episodes
+    // via touch_active for tainted callers, AgentRun, or Keeper principals.
+    let saved_clock = fixture
+        .storage
+        .clock
+        .0
+        .load(std::sync::atomic::Ordering::SeqCst);
+    fixture
+        .storage
+        .clock
+        .0
+        .fetch_add(20 * 60_000, std::sync::atomic::Ordering::SeqCst);
+    call(
+        fixture,
+        tainted_owner,
+        135,
+        "whoami",
+        json!({"session": ep_id.to_string()}),
+    )
+    .await
+    .expect("tainted read tool remains allowed while skipping episode heartbeat");
+    let tainted_write_with_session = call(
+        fixture,
+        tainted_owner,
+        136,
+        "edit_ability",
+        json!({
+            "ref": owned_ability.id,
+            "enabled": false,
+            "session": ep_id.to_string(),
+        }),
+    )
+    .await;
+    assert!(matches!(
+        tainted_write_with_session,
+        Err(PortError::Domain(DomainError::CrossSpaceTainted))
+    ));
+    let personal_space = personal.scope().space_id.clone();
+    let agent_run_ctx = AccountContext::new(
+        owner
+            .auth()
+            .for_agent_run(
+                AgentRunId::from_bytes([137; 16]),
+                personal_space.clone(),
+                ChatAudience::Shared,
+                owner.auth().spaces().clone(),
+            )
+            .unwrap(),
+        budget(),
+    );
+    let keeper_call_ctx = AccountContext::new(
+        owner
+            .auth()
+            .for_keeper(
+                AgentRunId::from_bytes([138; 16]),
+                personal_space,
+                None,
+                std::collections::BTreeSet::new(),
+            )
+            .unwrap(),
+        budget(),
+    );
+    for (tag, caller) in [(137u8, agent_run_ctx), (138u8, keeper_call_ctx)] {
+        fixture
             .control
-            .lookup_mcp_dedup(
-                owner.clone(),
-                McpDedupKey {
-                    actor: format!("direct:{}", owner.auth().principal()),
-                    request_key: CommandKey::from_bytes([tag; 16]),
-                    request_hash: ContentDigest::from_bytes([tag; 32]),
-                    operation: op.into(),
+            .begin_agent_call(
+                caller,
+                BeginAgentCall {
+                    call: RequestId::from_bytes([tag; 16]),
+                    request: RequestId::from_bytes([tag; 16]),
+                    episode: Some(ep_id.clone()),
+                    operation: AgentOperation::Context,
+                    transport: AgentTransport::Mcp,
+                    effect: AgentEffect::Read,
+                    input_bytes: 0,
                 },
             )
             .await
             .unwrap();
-        assert!(
-            hit.is_none(),
-            "tainted MCP call must not persist mcp_dedup row for {op}"
-        );
     }
+    // Advance +15 min (35 min since ep_id creation, only 15 min since the
+    // forbidden heartbeat attempts). Because none updated last_seen_at, ep_id
+    // must be treated as idle (>= 30 min) and Resumed rather than Forked.
+    fixture
+        .storage
+        .clock
+        .0
+        .fetch_add(15 * 60_000, std::sync::atomic::Ordering::SeqCst);
+    let resumed_after_idle = fixture
+        .control
+        .start_or_resume_episode(
+            owner.clone(),
+            AccountMutation {
+                identity: identity(fixture, owner, 139).await,
+                input: StartEpisode {
+                    selector: EpisodeSelector::Id(ep_id.clone()),
+                    project_hint: None,
+                    guard: EpisodeRevisionGuard::default(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            resumed_after_idle.value,
+            EpisodeStartResult::Resumed(ref resumed) if resumed.id == ep_id
+        ),
+        "tainted/AgentRun/Keeper begin_agent_call must not extend episode idle window: {:?}",
+        resumed_after_idle.value
+    );
+    fixture
+        .storage
+        .clock
+        .0
+        .store(saved_clock, std::sync::atomic::Ordering::SeqCst);
 
     // set_folder_write_lock must honor SpaceContext::canonical_effect inside
     // the canonical writer savepoint on both SQLite and PostgreSQL.

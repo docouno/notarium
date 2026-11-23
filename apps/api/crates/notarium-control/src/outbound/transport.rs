@@ -113,14 +113,15 @@ fn response_allows_keep_alive<B>(response: &http::Response<B>) -> bool {
     let mut saw_close = false;
     let mut saw_keep_alive = false;
     for value in response.headers().get_all(header::CONNECTION) {
-        if let Ok(text) = value.to_str() {
-            for token in text.split(',') {
-                let token = token.trim();
-                if token.eq_ignore_ascii_case("close") {
-                    saw_close = true;
-                } else if token.eq_ignore_ascii_case("keep-alive") {
-                    saw_keep_alive = true;
-                }
+        let Ok(text) = value.to_str() else {
+            return false;
+        };
+        for token in text.split(',') {
+            let token = token.trim();
+            if token.eq_ignore_ascii_case("close") {
+                saw_close = true;
+            } else if token.eq_ignore_ascii_case("keep-alive") {
+                saw_keep_alive = true;
             }
         }
     }
@@ -135,12 +136,16 @@ fn response_allows_keep_alive<B>(response: &http::Response<B>) -> bool {
     if !version_allows {
         return false;
     }
-    // RFC 9112 §6.3: close-delimited responses (without explicit Content-Length
-    // or Transfer-Encoding ending in chunked) terminate the connection at EOF
-    // and must never be returned to the keep-alive pool.
-    matches!(status, 204 | 304)
-        || response.headers().contains_key(header::CONTENT_LENGTH)
-        || transfer_encoding_ends_with_chunked(response.headers())
+    // RFC 9112 §6.3: close-delimited responses terminate the connection at EOF
+    // and must never be returned to the keep-alive pool. When Transfer-Encoding
+    // is present, it takes precedence over Content-Length.
+    if matches!(status, 204 | 304) {
+        return true;
+    }
+    if response.headers().contains_key(header::TRANSFER_ENCODING) {
+        return transfer_encoding_ends_with_chunked(response.headers());
+    }
+    response.headers().contains_key(header::CONTENT_LENGTH)
 }
 
 /// Deliberately not Debug: URLs, headers and bodies may contain confidential
@@ -402,6 +407,13 @@ struct PooledConn {
     last_used: Instant,
 }
 impl PooledConn {
+    fn finish_upload_wait(&self) {
+        if let Ok(mut guard) = self.tracker.lock()
+            && let Some(tracker) = guard.as_mut()
+        {
+            tracker.uploaded = None;
+        }
+    }
     fn finish_tracker(&self) -> bool {
         if let Ok(mut guard) = self.tracker.lock() {
             guard.take().is_some_and(|tracker| tracker.flushed)
@@ -841,6 +853,11 @@ impl OutboundTransport {
                         CommitEffect::Unknown,
                     )
                     .await?;
+                // If response headers arrived before the request body finished
+                // flushing, release wait_uploaded() immediately so the caller
+                // cannot deadlock against the bounded response chunk channel,
+                // while keeping `tracker.flushed` intact for socket teardown.
+                conn.finish_upload_wait();
                 keep_alive = response_allows_keep_alive(&response);
                 header_bytes(response.headers()).map_err(|_| failed())?;
                 if let Some(len) = response
@@ -944,7 +961,7 @@ impl OutboundTransport {
             status: 0,
             headers: HeaderMap::new(),
             head: Some(head_rx),
-            uploaded: Some(uploaded_rx),
+            uploaded: UploadWait::Pending(uploaded_rx),
             budget,
             closed: closed_rx,
             chunks: chunks_rx,
@@ -1147,6 +1164,11 @@ impl Worker {
     }
 }
 
+enum UploadWait {
+    Pending(oneshot::Receiver<()>),
+    Done(bool),
+}
+
 /// A bounded stream whose producer owns cancellation, sockets and admission.
 /// Dropping it stops the worker; retaining it without polling cannot suspend
 /// absolute/idle deadlines. Headers are marked sensitive and are not Debugged.
@@ -1154,7 +1176,7 @@ pub struct OutboundResponse {
     status: u16,
     headers: HeaderMap,
     head: Option<oneshot::Receiver<Result<(u16, HeaderMap), PortError>>>,
-    uploaded: Option<oneshot::Receiver<()>>,
+    uploaded: UploadWait,
     budget: OperationBudget,
     closed: oneshot::Receiver<()>,
     chunks: mpsc::Receiver<Vec<u8>>,
@@ -1167,15 +1189,17 @@ impl OutboundResponse {
     /// to the underlying socket complete (`Ok(true)`), or the request fails
     /// before upload finishes (`Ok(false)`).
     pub(crate) async fn wait_uploaded(&mut self) -> Result<bool, PortError> {
-        if let Some(uploaded) = self.uploaded.as_mut() {
-            let sent = self
-                .budget
-                .run(async { Ok(uploaded.await.is_ok()) }, CommitEffect::Unknown)
-                .await?;
-            self.uploaded = None;
-            return Ok(sent);
+        match &mut self.uploaded {
+            UploadWait::Done(sent) => Ok(*sent),
+            UploadWait::Pending(uploaded) => {
+                let sent = self
+                    .budget
+                    .run(async { Ok(uploaded.await.is_ok()) }, CommitEffect::Unknown)
+                    .await?;
+                self.uploaded = UploadWait::Done(sent);
+                Ok(sent)
+            }
         }
-        Ok(true)
     }
     pub(crate) async fn receive_head(&mut self) -> Result<(), PortError> {
         if let Some(head) = self.head.as_mut() {

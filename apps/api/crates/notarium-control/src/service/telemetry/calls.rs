@@ -93,8 +93,16 @@ impl ControlService {
                 {
                     return Err(DomainError::IdempotencyKeyReused.into());
                 }
-            } else if let Some(episode) = episode && matches!(request.transport, AgentTransport::Mcp) {
-                super::super::episodes::touch_active(tx.inner_mut(), &episode, raw_row.started_at).await?;
+            } else if let Some(episode) = episode
+                && matches!(request.transport, AgentTransport::Mcp)
+                && !auth.taint().is_tainted()
+                && !matches!(
+                    auth.kind(),
+                    PrincipalKind::Keeper(_) | PrincipalKind::AgentRun(_)
+                )
+            {
+                super::super::episodes::touch_active(tx.inner_mut(), &episode, raw_row.started_at)
+                    .await?;
             }
             Ok(())
         },CommitEffect::NotCommitted).await?;
