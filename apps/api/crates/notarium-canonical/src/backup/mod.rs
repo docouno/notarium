@@ -3202,7 +3202,7 @@ impl PreparedBackup for CanonicalPreparedBackup {
                 &self.caller_cancel,
                 &self.store.inner.backup_shutdown,
                 async {
-                    let guard = self.store.inner.writer()?.acquire_safe_point().await;
+                    let guard = self.store.inner.writer_safe_point().await?;
                     let mut barrier = match &mut drv {
                         PreparedBackendDriver::Postgres(pg) => pg.barrier.take(),
                         PreparedBackendDriver::Sqlite(_) => None,

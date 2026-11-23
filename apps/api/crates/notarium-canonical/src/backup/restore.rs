@@ -146,7 +146,7 @@ async fn rotate(
         SqlDriverState::Sqlite { disclosures, .. } => Some(disclosures.unscoped_mutation().await),
         SqlDriverState::Postgres { .. } => None,
     };
-    let _safe_point = store.inner.writer()?.acquire_safe_point().await;
+    let _safe_point = store.inner.writer_safe_point().await?;
     let Rotation {
         fences,
         epochs,

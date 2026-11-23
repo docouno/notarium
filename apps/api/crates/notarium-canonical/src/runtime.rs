@@ -125,7 +125,6 @@ pub(crate) enum SqlDriverState {
     },
     Postgres {
         pool: StorePgPool,
-        fast_write_conn: std::sync::Mutex<Option<StorePgConnection>>,
         fast_read_conn: std::sync::Mutex<Option<StorePgConnection>>,
         can_cache_fast_conn: bool,
         #[allow(dead_code)]
@@ -348,6 +347,20 @@ impl CanonicalInner {
         Ok(())
     }
 
+    pub(crate) fn yield_pg_writer(&self) -> Option<crate::dialect::postgres::WriterSlotWait<'_>> {
+        match &self.sql {
+            SqlDriverState::Postgres { pool, .. } => Some(pool.yield_writer()),
+            SqlDriverState::Sqlite { .. } => None,
+        }
+    }
+
+    pub(crate) async fn writer_safe_point(
+        &self,
+    ) -> Result<crate::writer::WriterSafePointGuard, PortError> {
+        let _waiting = self.yield_pg_writer();
+        Ok(self.writer()?.acquire_safe_point().await)
+    }
+
     pub(crate) fn writer(&self) -> Result<&Arc<WriteCoordinator>, PortError> {
         self.writer_coord.get().ok_or_else(|| {
             internal_not_committed(
@@ -565,7 +578,6 @@ impl CanonicalRuntime {
                     (
                         SqlDriverState::Postgres {
                             pool,
-                            fast_write_conn: std::sync::Mutex::new(None),
                             fast_read_conn: std::sync::Mutex::new(None),
                             can_cache_fast_conn: *pool_size > 2,
                             schema: validated_schema,
@@ -690,6 +702,7 @@ impl CanonicalRuntime {
     }
 
     async fn drain_shutdown(self) -> Result<(), PortError> {
+        let _draining = self.inner.yield_pg_writer();
         self.inner.live_visibility.close_and_drain().await;
         // Closing a backup phase can schedule a final join or artifact cleanup.
         // Admission already closed when shutdown was requested.
@@ -742,19 +755,13 @@ impl CanonicalRuntime {
             }
             SqlDriverState::Postgres {
                 pool,
-                fast_write_conn,
                 fast_read_conn,
                 ..
             } => {
-                let cached_w = fast_write_conn
-                    .lock()
-                    .expect("pg fast_write_conn mutex")
-                    .take();
                 let cached_r = fast_read_conn
                     .lock()
                     .expect("pg fast_read_conn mutex")
                     .take();
-                drop(cached_w);
                 drop(cached_r);
                 pool.close().await;
             }

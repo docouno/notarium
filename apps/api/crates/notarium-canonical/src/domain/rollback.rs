@@ -4552,21 +4552,8 @@ fn park_pg_rollback_connection(
     store: &CanonicalStore,
     connection: crate::dialect::postgres::StorePgConnection,
 ) {
-    if let crate::runtime::SqlDriverState::Postgres {
-        fast_write_conn,
-        can_cache_fast_conn: true,
-        ..
-    } = &store.inner.sql
-    {
-        let mut slot = fast_write_conn.lock().expect("pg fast_write_conn mutex");
-        if slot.is_none()
-            && !store
-                .inner
-                .shutting_down
-                .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            *slot = Some(connection);
-        }
+    if let crate::runtime::SqlDriverState::Postgres { pool, .. } = &store.inner.sql {
+        pool.park_writer(connection);
     }
 }
 
@@ -4617,7 +4604,6 @@ async fn try_execute_pg_root_rollback(
 
     let SqlDriverState::Postgres {
         pool,
-        fast_write_conn,
         statement_timeout,
         ..
     } = &store.inner.sql
@@ -4650,26 +4636,26 @@ async fn try_execute_pg_root_rollback(
     let _commit_gate = match writer.try_acquire_commit_read_guard() {
         Some(g) => g,
         None => {
-            {
-                let _ = fast_write_conn
-                    .lock()
-                    .expect("pg fast_write_conn mutex")
-                    .take();
-            }
+            let _waiting = pool.yield_writer();
             match rollback_wait(&ctx.budget, deadline, writer.acquire_commit_read_guard()).await {
                 Ok(guard) => guard,
                 Err(err) => return Some(Err(err)),
             }
         }
     };
-    let visibility = match rollback_wait(
-        &ctx.budget,
-        deadline,
-        store
-            .inner
-            .live_visibility
-            .for_write(vec![scope.space_id.clone()]),
-    )
+    let visibility = match rollback_wait(&ctx.budget, deadline, async {
+        let mut admission = std::pin::pin!(
+            store
+                .inner
+                .live_visibility
+                .for_write(vec![scope.space_id.clone()])
+        );
+        if let std::task::Poll::Ready(visibility) = futures_util::poll!(admission.as_mut()) {
+            return visibility;
+        }
+        let _waiting = pool.yield_writer();
+        admission.await
+    })
     .await
     {
         Ok(visibility) => visibility,
@@ -4701,12 +4687,7 @@ async fn try_execute_pg_root_rollback(
         )));
     }
 
-    let cached_conn = {
-        fast_write_conn
-            .lock()
-            .expect("pg fast_write_conn mutex")
-            .take()
-    };
+    let cached_conn = pool.take_idle_writer();
     let read_deadline = deadline.min(crate::runtime::deadline_after(
         Instant::now(),
         *statement_timeout,

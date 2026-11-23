@@ -1319,7 +1319,7 @@ impl crate::CanonicalStore {
 
     #[cfg(feature = "test-support")]
     pub async fn acquire_writer_safe_point(&self) -> Result<WriterSafePointGuard, PortError> {
-        Ok(self.inner.writer()?.acquire_safe_point().await)
+        self.inner.writer_safe_point().await
     }
 
     /// Enables or resets opt-in Phase-2 batch commit latency collection (`(duration_ns, logical_items)`).
@@ -1369,17 +1369,12 @@ async fn run_batch_worker_loop(
 ) {
     let max_items = cfg.max_batch_items.max(1);
     let flush_window = cfg.batch_flush_window;
-    let mut cached_pg_conn: Option<crate::dialect::postgres::StorePgConnection> = None;
 
     loop {
         let next = if let Some((id, registry)) = &pg_space {
-            if rx.is_empty() {
-                cached_pg_conn = None;
-            }
             match tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
                 Ok(entry) => entry,
                 Err(_) => {
-                    cached_pg_conn = None;
                     let Some(spaces) = registry.upgrade() else {
                         break;
                     };
@@ -1453,7 +1448,6 @@ async fn run_batch_worker_loop(
                     break;
                 }
 
-                cached_pg_conn = None;
                 tokio::select! {
                     biased;
                     maybe_entry = rx.recv() => {
@@ -1489,7 +1483,7 @@ async fn run_batch_worker_loop(
         let _commit_read_guard = match commit_gate.try_read() {
             Ok(g) => g,
             Err(_) => {
-                cached_pg_conn = None;
+                let _waiting = inner.yield_pg_writer();
                 commit_gate.read().await
             }
         };
@@ -1498,7 +1492,7 @@ async fn run_batch_worker_loop(
         let logical_items_u32 = u32::try_from(item_count).unwrap_or(u32::MAX);
         tracker.in_phase2_items.store(item_count, Ordering::Release);
         tracker.phase1_drained_notify.notify_waiters();
-        flush_single_batch(&inner, batch, cfg, &faults, &mut cached_pg_conn).await;
+        flush_single_batch(&inner, batch, cfg, &faults).await;
         tracker.in_phase2_items.store(0, Ordering::Release);
         if let Some(t0) = phase2_start {
             let dur_ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
@@ -1506,7 +1500,6 @@ async fn run_batch_worker_loop(
         }
         drop(_commit_read_guard);
         if rx.is_empty() {
-            cached_pg_conn = None;
             tokio::task::yield_now().await;
         }
     }
@@ -1550,7 +1543,6 @@ async fn flush_single_batch(
     batch: Vec<QueuedWriteEntry>,
     cfg: WriterConfig,
     faults: &WriterFaultState,
-    cached_pg_conn: &mut Option<crate::dialect::postgres::StorePgConnection>,
 ) {
     let store = crate::CanonicalStore {
         inner: Arc::clone(inner),
@@ -1580,9 +1572,7 @@ async fn flush_single_batch(
     {
         Some(v) => v,
         None => {
-            // Release any retained PG socket before awaiting gate locks so a
-            // gate holder waiting on pool.acquire() cannot AB-BA deadlock.
-            drop(cached_pg_conn.take());
+            let _waiting = inner.yield_pg_writer();
             inner.live_visibility.for_write(visibility_spaces).await
         }
     };
@@ -1666,6 +1656,7 @@ async fn flush_single_batch(
         return;
     }
     visibility.committing();
+    let mut clean_pg_connection = None;
     let mut exec_result = match &inner.sql {
         SqlDriverState::Sqlite { writer, .. } => {
             #[cfg(feature = "test-support")]
@@ -1740,7 +1731,7 @@ async fn flush_single_batch(
                 && items.len() == 1
                 && items[0].2.is_some()
                 && faults.pre_commit_space_delays.lock().await.is_empty();
-            let conn_res = match cached_pg_conn.take() {
+            let conn_res = match pool.take_idle_writer() {
                 Some(c) => Ok(c),
                 None => pool.acquire().await,
             };
@@ -1798,7 +1789,7 @@ async fn flush_single_batch(
                         }
                     ) {
                         lease.complete();
-                        *cached_pg_conn = Some(pooled);
+                        clean_pg_connection = Some(pooled);
                     }
                     out
                 }
@@ -1818,7 +1809,7 @@ async fn flush_single_batch(
             if visibility.needs_storage_read(&store, visibility_windows) {
                 // Release any retained writer socket before visibility refreshes
                 // so concurrent per-Space workers cannot exhaust the PG pool.
-                drop(cached_pg_conn.take());
+                drop(clean_pg_connection.take());
             }
             if let Err(error) = visibility.published(&store, visibility_windows).await {
                 let BatchExecOutcome::Committed { slots, .. } = exec_result else {
@@ -1841,6 +1832,11 @@ async fn flush_single_batch(
             space_effective_cuts,
             ..
         } => {
+            if let Some(connection) = clean_pg_connection
+                && let SqlDriverState::Postgres { pool, .. } = &inner.sql
+            {
+                pool.park_writer(connection);
+            }
             let mut slot_iter = slots.into_iter();
             for target in reply_targets {
                 match target {
