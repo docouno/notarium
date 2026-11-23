@@ -20,7 +20,7 @@ use notarium_core::{
     model::{HistoryScope, Lifecycle, NoteRef, PathTarget},
     ports::{
         CallBudget, ClosedRoomReservation, CommandSeqRange, CreateNote, GetNote, NoteRevision,
-        NoteSnapshot, Preconditions, RevocationLease, RollbackAgentRun, SpaceContext,
+        NoteSnapshot, Preconditions, RevocationLease, SpaceContext,
     },
     query::{FieldObservation, FieldSchema, FieldValue},
     receipt::{CausalBasis, CommandIdentity, MutationReceiptToken},
@@ -63,9 +63,9 @@ use crate::{
             revision_fields,
         },
         rollback::{
-            CandidateAction, RollbackRevision, build_rollback_direct_single_tx_exec,
-            decode_rollback_note, encode_rollback_note, rank_removal,
-            rollback_fallback_board_present_err, rollback_fallback_cover_change_err,
+            CandidateAction, DirectRollbackTarget, RollbackRevision,
+            build_rollback_direct_single_tx_exec, decode_rollback_note, encode_rollback_note,
+            rank_removal, rollback_fallback_board_present_err, rollback_fallback_cover_change_err,
         },
     },
     runtime::{FolderHeadRow, SqlDriverState},
@@ -4254,6 +4254,23 @@ fn authorize_replay_rusqlite(
     };
     let srec = load_space_record_rusqlite(conn, &scope.space_id)?;
     srec.scope.check(scope)?;
+    if let ReplayPolicy::RollbackRun(run) = policy {
+        if has_rollback_board_history_rusqlite(conn, &scope.space_id, run)? {
+            return Err(rollback_fallback_board_present_err());
+        }
+        // The receipt may refer to a different set than the run's current sources.
+        // Its own disclosures are checked after this source authorization succeeds.
+        verify_run_and_entity_preconditions_note_only_rusqlite(
+            conn,
+            &mut FastBatchSqlCache::default(),
+            scope,
+            &srec.space,
+            auth,
+            &DirectRollbackTarget::ById(run.clone()),
+            true,
+        )?;
+        return Ok(());
+    }
     let (ReplayPolicy::Documents(targets) | ReplayPolicy::RollbackDocuments(targets)) = policy
     else {
         return Err(internal_not_committed(
@@ -6010,7 +6027,7 @@ struct RollbackDirectSqliteFastPlan {
     scope: HistoryScope,
     auth: EngineAuthContext,
     request_identity: CommandIdentity,
-    input: RollbackAgentRun,
+    target: DirectRollbackTarget,
     room_fences: Arc<RoomFenceTable>,
 }
 
@@ -6021,7 +6038,7 @@ pub(crate) fn build_rollback_direct_sqlite_fast_intent(
     idemp: CommandIdentitySpec,
     auth: EngineAuthContext,
     request_identity: CommandIdentity,
-    input: RollbackAgentRun,
+    target: DirectRollbackTarget,
     room_fences: Arc<RoomFenceTable>,
 ) -> (PreparedWriteIntent, Box<dyn SqliteSyncItemPlan>) {
     let intent = PreparedWriteIntent {
@@ -6044,7 +6061,7 @@ pub(crate) fn build_rollback_direct_sqlite_fast_intent(
         scope: scope.clone(),
         auth,
         request_identity,
-        input,
+        target,
         room_fences,
     });
     (intent, plan)
@@ -6069,7 +6086,7 @@ impl SqliteSyncItemPlan for RollbackDirectSqliteFastPlan {
             me.scope,
             me.auth,
             me.request_identity,
-            me.input,
+            me.target,
             me.room_fences,
         )
     }
@@ -6085,10 +6102,10 @@ impl SqliteSyncItemPlan for RollbackDirectSqliteFastPlan {
     ) -> Result<ItemCommitArtifacts, FastItemExecError> {
         let scope_cl = &self.scope;
         let auth = &self.auth;
-        let input = &self.input;
+        let (run, _) = self.target.parts();
 
         // --- 1. Read-only preconditions & pure validation (zero SQL mutations) ---
-        if has_rollback_board_history_rusqlite(conn, &scope_cl.space_id, &input.run)
+        if has_rollback_board_history_rusqlite(conn, &scope_cl.space_id, run)
             .map_err(FastItemExecError::PreWrite)?
         {
             return Err(FastItemExecError::PreWrite(
@@ -6102,7 +6119,8 @@ impl SqliteSyncItemPlan for RollbackDirectSqliteFastPlan {
             scope_cl,
             &item_ctx.space,
             auth,
-            input,
+            &self.target,
+            false,
         )
         .map_err(FastItemExecError::PreWrite)?;
 
@@ -6154,7 +6172,7 @@ impl SqliteSyncItemPlan for RollbackDirectSqliteFastPlan {
             FastItemExecError::PreWrite(map_interrupt_or_internal(err, "sqlite_rollback_history"))
         };
         let mut rows = history
-            .query(params![scope_cl.space_id.as_str(), input.run.as_str()])
+            .query(params![scope_cl.space_id.as_str(), run.as_str()])
             .map_err(map_history_error)?;
         while let Some(row) = rows.next().map_err(map_history_error)? {
             let key: &str = row
@@ -6962,7 +6980,7 @@ impl SqliteSyncItemPlan for RollbackDirectSqliteFastPlan {
             let new_run_rev = upsert_agent_run_head_rusqlite_deferred(
                 conn,
                 scope_cl,
-                &input.run,
+                run,
                 auth.principal(),
                 visibility_seq,
                 visibility_seq,
@@ -7114,7 +7132,7 @@ impl SqliteSyncItemPlan for RollbackDirectSqliteFastPlan {
             let new_run_rev = upsert_agent_run_head_rusqlite(
                 conn,
                 scope_cl,
-                &input.run,
+                run,
                 auth.principal(),
                 visibility_seq,
                 visibility_seq,
@@ -7192,8 +7210,10 @@ fn verify_run_and_entity_preconditions_note_only_rusqlite(
     scope: &HistoryScope,
     space: &Space,
     auth: &EngineAuthContext,
-    input: &RollbackAgentRun,
+    target: &DirectRollbackTarget,
+    require_active_folders: bool,
 ) -> Result<BTreeMap<NoteId, NoteHeadRow>, PortError> {
+    let (run, expected) = target.parts();
     auth.authorize_space_write(space)?;
     let run_row: Option<(Vec<u8>, String)> = {
         let mut stmt = conn
@@ -7202,7 +7222,7 @@ fn verify_run_and_entity_preconditions_note_only_rusqlite(
                  WHERE space_id = ?1 AND run_id = ?2",
             )
             .map_err(|err| internal_not_committed("sqlite_load_run_head", err.to_string()))?;
-        stmt.query_row(params![scope.space_id.as_str(), input.run.as_str()], |r| {
+        stmt.query_row(params![scope.space_id.as_str(), run.as_str()], |r| {
             Ok((r.get(0)?, r.get(1)?))
         })
         .optional()
@@ -7224,18 +7244,20 @@ fn verify_run_and_entity_preconditions_note_only_rusqlite(
     let actual_run_rev = RevisionId::parse(&run_rev_raw)
         .map_err(|_| internal_not_committed("corrupt_run_rev", "invalid run_revision"))?;
 
-    let mut caller_notes: BTreeMap<NoteId, RevisionId> = BTreeMap::new();
-    for exp in &input.expected_entities {
-        if is_note_purge_fenced_cached(conn, cache, &scope.space_id, exp.note.as_str())? {
-            return Err(DomainError::ResourceNotFound.into());
+    let expected_notes = if let Some(input) = expected {
+        let mut notes = BTreeSet::new();
+        for entry in &input.expected_entities {
+            if is_note_purge_fenced_cached(conn, cache, &scope.space_id, entry.note.as_str())? {
+                return Err(DomainError::ResourceNotFound.into());
+            }
+            if !notes.insert(&entry.note) {
+                return Err(DomainError::validation(ValidationReason::InvalidState).into());
+            }
         }
-        if caller_notes
-            .insert(exp.note.clone(), exp.revision.clone())
-            .is_some()
-        {
-            return Err(DomainError::validation(ValidationReason::InvalidState).into());
-        }
-    }
+        Some(notes)
+    } else {
+        None
+    };
 
     let mut touched_set: BTreeSet<NoteId> = BTreeSet::new();
     {
@@ -7246,7 +7268,7 @@ fn verify_run_and_entity_preconditions_note_only_rusqlite(
             )
             .map_err(|err| internal_not_committed("sqlite_run_touched_notes", err.to_string()))?;
         let rows = stmt
-            .query_map(params![scope.space_id.as_str(), input.run.as_str()], |r| {
+            .query_map(params![scope.space_id.as_str(), run.as_str()], |r| {
                 r.get::<_, String>(0)
             })
             .map_err(|err| map_interrupt_or_internal(err, "sqlite_run_touched_notes"))?;
@@ -7258,13 +7280,20 @@ fn verify_run_and_entity_preconditions_note_only_rusqlite(
             touched_set.insert(nid);
         }
     }
-    let caller_set: BTreeSet<NoteId> = caller_notes.keys().cloned().collect();
-    if caller_set != touched_set {
-        return Err(DomainError::validation(ValidationReason::SourceMismatch).into());
+    if let Some(notes) = expected_notes {
+        if notes.into_iter().ne(touched_set.iter()) {
+            return Err(DomainError::validation(ValidationReason::SourceMismatch).into());
+        }
+    } else {
+        for note in &touched_set {
+            if is_note_purge_fenced_cached(conn, cache, &scope.space_id, note.as_str())? {
+                return Err(DomainError::ResourceNotFound.into());
+            }
+        }
     }
 
     let mut heads_map = BTreeMap::new();
-    for nid in caller_notes.keys() {
+    for nid in &touched_set {
         let head = load_note_head_row_rusqlite(conn, &scope.space_id, nid)?;
         let (rfacts, _) = build_resource_facts_cached(
             conn,
@@ -7273,15 +7302,19 @@ fn verify_run_and_entity_preconditions_note_only_rusqlite(
             &head.parent_folder_id,
             head.doc_class,
             head.ability_id.clone(),
-            false,
+            require_active_folders,
         )?;
         auth.authorize_direct_write(&rfacts, &rfacts)?;
         heads_map.insert(nid.clone(), head);
     }
 
-    crate::domain::rollback::verify_authorized_rollback_revisions(actual_run_rev, input, |nid| {
-        heads_map.get(nid).map(|head| &head.head_rev_id)
-    })?;
+    if let Some(input) = expected {
+        crate::domain::rollback::verify_authorized_rollback_revisions(
+            actual_run_rev,
+            input,
+            |nid| heads_map.get(nid).map(|head| &head.head_rev_id),
+        )?;
+    }
     Ok(heads_map)
 }
 

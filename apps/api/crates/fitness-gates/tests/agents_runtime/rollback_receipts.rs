@@ -30,6 +30,13 @@ async fn exercise(pg: bool) {
     );
     let ctx = fixture.personal_scope().await;
     Box::pin(check_missing_publication(&fixture, &supervisor, &ctx)).await;
+    Box::pin(check_late_source_folder(&fixture, &supervisor, &ctx)).await;
+    Box::pin(check_edit_before_rollback_admission(
+        &fixture,
+        &supervisor,
+        &ctx,
+    ))
+    .await;
     for (tag, form) in [
         (80, ReceiptForm::HistoricalDetail),
         (90, ReceiptForm::HistoricalSanitized),
@@ -299,6 +306,185 @@ async fn check_missing_publication(
          AND payload_id='{actor}:{key}' AND note_id IN ('{restored}', '{trashed}')"
     )).await.unwrap(), 2);
     let replay = rollback().await.unwrap();
+    assert_eq!(replay.receipt, done.receipt);
+    assert_eq!(replay.value, done.value);
+    assert_eq!(
+        store.read_space(space).await.unwrap().last_seq,
+        done.receipt.seq()
+    );
+}
+
+async fn check_late_source_folder(
+    fixture: &RuntimeFixture,
+    supervisor: &AgentRunSupervisor,
+    ctx: &SpaceContext,
+) {
+    use notarium_canonical::CreateFolderSpec;
+    use notarium_core::{classes::DocClass, model::Lifecycle};
+    let store = &fixture.canonical;
+    let scope = ctx.scope();
+    let actor = ctx.auth().principal();
+    let epoch = store
+        .read_space(&scope.space_id)
+        .await
+        .unwrap()
+        .active_epoch;
+    let folder = FolderId::from_bytes([144; 16]);
+    let (_, folder_rev, _) = store
+        .create_folder(CreateFolderSpec {
+            scope: scope.clone(),
+            active_epoch: epoch,
+            folder_id: folder.clone(),
+            parent: None,
+            slug: "late-source".into(),
+            display_name: "Late source".into(),
+            is_project: false,
+            project_slug: None,
+            actor: actor.clone(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+    let run = AgentRunId::from_bytes([145; 16]);
+    let agent = run_context(ctx, &run);
+    let first_note = append_note(fixture, &agent, 146).await;
+    let rollback = || {
+        supervisor.rollback_run(
+            fixture.human.clone(),
+            scope.clone(),
+            run.clone(),
+            CommandKey::from_bytes([147; 16]),
+        )
+    };
+    let initial = rollback().await.unwrap();
+    assert_eq!(initial.value.trashed.len(), 1);
+    assert_eq!(initial.value.trashed[0].note, first_note);
+    // Only a current-source check sees this note. The original receipt cannot mention it.
+    store
+        .create_note(
+            agent.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: scope.clone(),
+                    actor: agent.auth().principal().clone(),
+                    key: CommandKey::from_bytes([148; 16]),
+                    hash: ContentDigest::from_bytes([148; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: CreateNote {
+                    note: NoteId::from_bytes([148; 16]),
+                    parent: Some(folder.clone()),
+                    slug: "late-note".into(),
+                    class: DocClass::UserDoc,
+                    carrier: "# Late note\n".into(),
+                    folder_page: false,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let healthy = rollback().await.unwrap();
+    assert_eq!(healthy.value, initial.value);
+    assert_eq!(healthy.receipt, initial.receipt);
+    let (trashed_rev, before_denial) = store
+        .set_folder_lifecycle(
+            scope,
+            epoch,
+            &folder,
+            &folder_rev,
+            Lifecycle::Trashed,
+            actor,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rollback().await.unwrap_err(),
+        PortError::Domain(DomainError::ResourceNotFound)
+    );
+    assert_eq!(
+        store.read_space(&scope.space_id).await.unwrap().last_seq,
+        before_denial
+    );
+    let (_, before_replay) = store
+        .set_folder_lifecycle(
+            scope,
+            epoch,
+            &folder,
+            &trashed_rev,
+            Lifecycle::Active,
+            actor,
+            None,
+        )
+        .await
+        .unwrap();
+    let healthy = rollback().await.unwrap();
+    assert_eq!(healthy.value, initial.value);
+    assert_eq!(healthy.receipt, initial.receipt);
+    assert_eq!(
+        store.read_space(&scope.space_id).await.unwrap().last_seq,
+        before_replay
+    );
+}
+
+async fn check_edit_before_rollback_admission(
+    fixture: &RuntimeFixture,
+    supervisor: &AgentRunSupervisor,
+    ctx: &SpaceContext,
+) {
+    use notarium_canonical::writer::TestPauseGate;
+    let store = &fixture.canonical;
+    let scope = ctx.scope();
+    let run = AgentRunId::from_bytes([120; 16]);
+    let agent = run_context(ctx, &run);
+    let created = append_note(fixture, &agent, 121).await;
+    let late = append_note(fixture, ctx, 122).await;
+    let prior = store
+        .read_entity_revision_at_cutoff(scope, "note", late.as_str(), None)
+        .await
+        .unwrap()
+        .unwrap()
+        .revision_id;
+    let undo = || {
+        supervisor.rollback_run(
+            fixture.human.clone(),
+            scope.clone(),
+            run.clone(),
+            CommandKey::from_bytes([123; 16]),
+        )
+    };
+    let (entered, waiting) = tokio::sync::oneshot::channel();
+    let (release, resume) = tokio::sync::oneshot::channel();
+    *store
+        .writer_faults()
+        .unwrap()
+        .guarded_admission_pause_once
+        .lock()
+        .unwrap() = Some(TestPauseGate {
+        entered,
+        release: resume,
+    });
+    // Persist a second source after the rollback was prepared but before the writer admits it.
+    let intervening_edit = async {
+        waiting.await.unwrap();
+        rename(fixture, &agent, &late, 124).await;
+        release.send(()).unwrap();
+    };
+    let (undo_result, ()) = tokio::join!(undo(), intervening_edit);
+    let done = undo_result.unwrap();
+    assert_eq!(done.value.trashed.len(), 1);
+    assert_eq!(done.value.trashed[0].note, created);
+    assert_eq!(done.value.restored.len(), 1);
+    assert_eq!(done.value.restored[0].note, late);
+    let space = &scope.space_id;
+    let restored = store
+        .read_entity_revision_at_cutoff(scope, "note", late.as_str(), None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(restored.revision_id, done.value.restored[0].revision);
+    assert_eq!(restored.restored_from_rev_id.as_ref(), Some(&prior));
+    let replay = undo().await.unwrap();
     assert_eq!(replay.receipt, done.receipt);
     assert_eq!(replay.value, done.value);
     assert_eq!(

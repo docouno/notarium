@@ -388,6 +388,8 @@ pub struct WriterFaultState {
     #[cfg(feature = "test-support")]
     pub room_wal_admission_pause_once: std::sync::Mutex<Option<RoomWalAdmissionPause>>,
     #[cfg(feature = "test-support")]
+    pub guarded_admission_pause_once: std::sync::Mutex<Option<TestPauseGate>>,
+    #[cfg(feature = "test-support")]
     pub planned_observation_pause_once: std::sync::Mutex<Option<PlannedObservationPause>>,
     pub pre_commit_space_delays: Mutex<HashMap<SpaceId, Duration>>,
 }
@@ -626,14 +628,11 @@ impl<'a> WriterWait<'a> {
     }
 
     #[cfg(feature = "test-support")]
-    async fn pause_room_wal_admission(
-        &self,
-        pause: RoomWalAdmissionPause,
-    ) -> Result<(), PortError> {
+    async fn pause_admission(&self, pause: TestPauseGate) -> Result<(), PortError> {
         let abandoned = || {
             cancelled_not_committed(
-                "writer_wal_admission_pause_abandoned",
-                "room WAL admission pause was abandoned before enqueue",
+                "writer_admission_pause_abandoned",
+                "writer admission pause was abandoned before enqueue",
             )
         };
         pause.entered.send(()).map_err(|_| abandoned())?;
@@ -641,7 +640,7 @@ impl<'a> WriterWait<'a> {
             biased;
             _ = self.budget.cancellation.cancelled() => Err(abandoned()),
             _ = tokio::time::sleep_until(self.deadline) => Err(deadline_not_committed(
-                "writer_wal_admission_pause_deadline", "room WAL admission pause expired before enqueue",
+                "writer_admission_pause_deadline", "writer admission pause expired before enqueue",
             )),
             result = pause.release => result.map_err(|_| abandoned()),
         }
@@ -873,15 +872,17 @@ impl WriteCoordinator {
             )
             .await?;
         #[cfg(feature = "test-support")]
-        if intent.room_wal.is_some() {
-            let pause = self
-                .faults
-                .room_wal_admission_pause_once
-                .lock()
-                .expect("room WAL admission pause mutex")
-                .take();
+        {
+            let gate = if intent.room_wal.is_some() {
+                Some(&self.faults.room_wal_admission_pause_once)
+            } else if guarded {
+                Some(&self.faults.guarded_admission_pause_once)
+            } else {
+                None
+            };
+            let pause = gate.and_then(|g| g.lock().expect("writer admission pause mutex").take());
             if let Some(pause) = pause {
-                wait.pause_room_wal_admission(pause).await?;
+                wait.pause_admission(pause).await?;
             }
         }
         let is_idempotent = intent.replay_safe();

@@ -5,8 +5,8 @@ use notarium_core::{
     classes::DocClass,
     error::{Diagnostic, PortError, ValidationReason},
     ids::{
-        AbilityId, AgentRunId, ContentDigest, FolderId, HistoryIncarnation, NoteId, RevisionId,
-        SpaceId, SpaceSeq,
+        AbilityId, AgentRunId, ContentDigest, FolderId, HistoryIncarnation, LeaseEpoch, NoteId,
+        RevisionId, SpaceId, SpaceSeq,
     },
     model::{HistoryScope, Lifecycle, PathTarget},
     ports::{
@@ -304,31 +304,31 @@ pub(crate) async fn rollback_agent_run_by_id(
         .with_canonical_effect(&ctx)
         .with_policy(ctx.auth(), policy)
     };
-    let direct_by_id = store.is_postgres()
-        && ctx.canonical_effect().is_some()
+    let direct_by_id = ctx.canonical_effect().is_some()
+        && (store.is_postgres()
+            || (store.is_sqlite_local() && ctx.confirmed_chat_step().is_none()))
         && !rollback_needs_room_planning(store, &ctx.scope().space_id);
     if direct_by_id {
         let scope = ctx.scope();
         let guard = store.enter_write_op(&scope.space_id)?;
-        let epoch = store.inner.writer_epoch(&scope.space_id)?;
+        let epoch = rollback_writer_epoch(store, &ctx, None, deadline).await?;
         let idemp = identity(crate::writer::replay::ReplayPolicy::RollbackRun(
             request.input.clone(),
         ));
-        let intent = build_rollback_direct_single_tx_intent(
-            scope.clone(),
+        let (intent, sqlite_plan) = direct_rollback_intent(
+            store,
+            &ctx,
             epoch,
             idemp,
-            ctx.auth().clone(),
-            request.identity.clone(),
+            &request.identity,
             DirectRollbackTarget::ById(request.input.clone()),
-            store.inner.room_fences.clone(),
         );
         let result = store
             .submit_write_command_until::<StoredCommittedRollbackV1>(
                 &ctx.budget,
                 deadline,
                 intent,
-                None,
+                sqlite_plan,
                 None,
                 Some(guard),
             )
@@ -343,7 +343,13 @@ pub(crate) async fn rollback_agent_run_by_id(
     read_ctx.budget.remaining = rollback_time_left(&ctx.budget, deadline)?;
     let (input, prepared_epoch) =
         prepare_agent_run_rollback(store, read_ctx, request.input.clone()).await?;
-    let idemp = identity(rollback_policy(&input));
+    let idemp = if direct_by_id {
+        identity(crate::writer::replay::ReplayPolicy::RollbackRun(
+            input.run.clone(),
+        ))
+    } else {
+        identity(rollback_policy(&input))
+    };
     let prepared = Mutation {
         identity: request.identity,
         preconditions: request.preconditions,
@@ -362,6 +368,64 @@ pub(crate) async fn rollback_agent_run_by_id(
         deadline,
     )
     .await
+}
+
+async fn rollback_writer_epoch(
+    store: &CanonicalStore,
+    ctx: &SpaceContext,
+    prepared: Option<LeaseEpoch>,
+    deadline: Instant,
+) -> Result<LeaseEpoch, PortError> {
+    if store.is_postgres() {
+        return store.inner.writer_epoch(&ctx.scope().space_id);
+    }
+    if let Some(epoch) = prepared {
+        return Ok(epoch);
+    }
+    Ok(rollback_wait(
+        &ctx.budget,
+        deadline,
+        store.read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget)),
+    )
+    .await??
+    .active_epoch)
+}
+
+fn direct_rollback_intent(
+    store: &CanonicalStore,
+    ctx: &SpaceContext,
+    epoch: LeaseEpoch,
+    idemp: crate::writer::CommandIdentitySpec,
+    identity: &notarium_core::receipt::CommandIdentity,
+    target: DirectRollbackTarget,
+) -> (
+    PreparedWriteIntent,
+    Option<Box<dyn crate::sqlite_fast::SqliteSyncItemPlan>>,
+) {
+    let fences = store.inner.room_fences.clone();
+    if store.is_sqlite_local() && !idemp.has_confirmed_chat_step() {
+        let (intent, plan) = crate::sqlite_fast::build_rollback_direct_sqlite_fast_intent(
+            ctx.scope(),
+            epoch,
+            idemp,
+            ctx.auth().clone(),
+            identity.clone(),
+            target,
+            fences,
+        );
+        (intent, Some(plan))
+    } else {
+        let intent = build_rollback_direct_single_tx_intent(
+            ctx.scope().clone(),
+            epoch,
+            idemp,
+            ctx.auth().clone(),
+            identity.clone(),
+            target,
+            fences,
+        );
+        (intent, None)
+    }
 }
 
 fn rollback_policy(input: &RollbackAgentRun) -> crate::writer::replay::ReplayPolicy {
@@ -401,21 +465,7 @@ async fn execute_rollback(
         && !rollback_needs_room_planning(store, &ctx.scope().space_id)
     {
         let active_op_guard = store.enter_write_op(&ctx.scope().space_id)?;
-        let writer_epoch = match (&store.inner.sql, prepared_epoch) {
-            (crate::runtime::SqlDriverState::Postgres { .. }, _) => {
-                store.inner.writer_epoch(&ctx.scope().space_id)?
-            }
-            (crate::runtime::SqlDriverState::Sqlite { .. }, Some(epoch)) => epoch,
-            (crate::runtime::SqlDriverState::Sqlite { .. }, None) => {
-                rollback_wait(
-                    &ctx.budget,
-                    deadline,
-                    store.read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget)),
-                )
-                .await??
-                .active_epoch
-            }
-        };
+        let writer_epoch = rollback_writer_epoch(store, ctx, prepared_epoch, deadline).await?;
         let mut try_pg_batch_plan = true;
         let standard_writer = idemp.requires_standard_writer();
         if !standard_writer
@@ -437,60 +487,35 @@ async fn execute_rollback(
             return outcome;
         }
         ctx.budget.remaining = rollback_time_left(&ctx.budget, deadline)?;
-        let single_res: Result<StoredCommittedRollbackV1, PortError> = if store.is_sqlite_local()
-            && !idemp.has_confirmed_chat_step()
-        {
-            let (intent, fast_plan) = crate::sqlite_fast::build_rollback_direct_sqlite_fast_intent(
-                ctx.scope(),
-                writer_epoch,
-                idemp.clone(),
-                ctx.auth().clone(),
-                request.identity.clone(),
-                request.input.clone(),
-                store.inner.room_fences.clone(),
-            );
-            store
-                .submit_write_command_until(
-                    &ctx.budget,
-                    deadline,
-                    intent,
-                    Some(fast_plan),
-                    None,
-                    Some(active_op_guard),
-                )
-                .await
-        } else {
-            let pg_fast = (try_pg_batch_plan && !standard_writer).then(|| {
-                build_rollback_pg_single_item_fast(
-                    ctx.scope().clone(),
-                    idemp.clone(),
-                    ctx.auth().clone(),
-                    request.identity.clone(),
-                    request.input.clone(),
-                    store.inner.room_fences.clone(),
-                    writer_epoch,
-                )
-            });
-            let intent = build_rollback_direct_single_tx_intent(
+        let pg_fast = (store.is_postgres() && try_pg_batch_plan && !standard_writer).then(|| {
+            build_rollback_pg_single_item_fast(
                 ctx.scope().clone(),
-                writer_epoch,
                 idemp.clone(),
                 ctx.auth().clone(),
                 request.identity.clone(),
                 request.input.clone(),
                 store.inner.room_fences.clone(),
-            );
-            store
-                .submit_write_command_until(
-                    &ctx.budget,
-                    deadline,
-                    intent,
-                    None,
-                    pg_fast,
-                    Some(active_op_guard),
-                )
-                .await
-        };
+                writer_epoch,
+            )
+        });
+        let (intent, sqlite_plan) = direct_rollback_intent(
+            store,
+            ctx,
+            writer_epoch,
+            idemp.clone(),
+            &request.identity,
+            DirectRollbackTarget::Prepared(request.input.clone()),
+        );
+        let single_res = store
+            .submit_write_command_until::<StoredCommittedRollbackV1>(
+                &ctx.budget,
+                deadline,
+                intent,
+                sqlite_plan,
+                pg_fast,
+                Some(active_op_guard),
+            )
+            .await;
 
         match single_res {
             Ok(decoded) => return Ok(decoded.into_committed()),
@@ -858,20 +883,23 @@ pub(crate) enum DirectRollbackTarget {
     ById(AgentRunId),
 }
 
-impl From<RollbackAgentRun> for DirectRollbackTarget {
-    fn from(input: RollbackAgentRun) -> Self {
-        Self::Prepared(input)
+impl DirectRollbackTarget {
+    pub(crate) fn parts(&self) -> (&AgentRunId, Option<&RollbackAgentRun>) {
+        match self {
+            Self::Prepared(input) => (&input.run, Some(input)),
+            Self::ById(run) => (run, None),
+        }
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn build_rollback_direct_single_tx_intent(
+fn build_rollback_direct_single_tx_intent(
     scope: HistoryScope,
     active_epoch: notarium_core::ids::LeaseEpoch,
     idemp: crate::writer::CommandIdentitySpec,
     auth: notarium_core::auth::EngineAuthContext,
     req_id: notarium_core::receipt::CommandIdentity,
-    input: impl Into<DirectRollbackTarget>,
+    target: DirectRollbackTarget,
     room_fences: std::sync::Arc<crate::domain::RoomFenceTable>,
 ) -> PreparedWriteIntent {
     PreparedWriteIntent {
@@ -881,7 +909,7 @@ pub(crate) fn build_rollback_direct_single_tx_intent(
         source_note_ids: Vec::new(),
         staged_bytes: 0,
         required_semantic_cut: None,
-        execute: build_rollback_direct_single_tx_exec(scope, auth, req_id, input, room_fences),
+        execute: build_rollback_direct_single_tx_exec(scope, auth, req_id, target, room_fences),
     }
 }
 
@@ -889,17 +917,13 @@ pub(crate) fn build_rollback_direct_single_tx_exec(
     scope_cl: HistoryScope,
     auth: notarium_core::auth::EngineAuthContext,
     req_id: notarium_core::receipt::CommandIdentity,
-    input: impl Into<DirectRollbackTarget>,
+    target: DirectRollbackTarget,
     room_fences: std::sync::Arc<crate::domain::RoomFenceTable>,
 ) -> crate::writer::ItemExecuteFn {
-    let target = input.into();
     Box::new(move |tx, item_ctx| {
         Box::pin(async move {
             auth.authorize_space_write(&item_ctx.space)?;
-            let (run, expected) = match &target {
-                DirectRollbackTarget::Prepared(input) => (&input.run, Some(input)),
-                DirectRollbackTarget::ById(run) => (run, None),
-            };
+            let (run, expected) = target.parts();
             let mut folder_cache = FolderAncestryCache::default();
             type RollbackStateProbe = (bool, bool, Option<bool>, bool, Option<(Vec<u8>, String)>);
             let (has_bmh, has_note_states, known_overlays, read_schema, run_head_opt): RollbackStateProbe =

@@ -270,6 +270,12 @@ job cancellation lease belong to their typed inputs.
 `rollback_agent_run_by_id` resolves those rollback expectations inside the
 canonical owner. Its command identity binds the run independently of the
 derived plan, so a retry can reach the original receipt after revisions advance.
+For supervised note-only rollbacks, PostgreSQL and local SQLite with local
+blob storage select the run's current notes in the writer transaction. This
+includes edits committed while the command was waiting for admission. Active
+rooms and board history can require a separate planning step. Before replay,
+Canonical checks current access to the run's sources and to the items in the
+stored result.
 
 ## Complete mutation intent across live rooms
 
