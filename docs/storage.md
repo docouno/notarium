@@ -33,9 +33,13 @@ same behavioral parity suites:
   issuer. Local PostgreSQL fixtures connect through a Unix socket.
 
 `CanonicalRuntime::open` acquires lifetime `DataRootOwnerLock` guards where
-local storage is used, verifies or bootstraps the schema transactionally,
-reconciles interrupted collaboration room fences and resumes any interrupted
-purge closure before returning `(CanonicalStore, CanonicalRuntime)`.
+local storage is used, verifies or bootstraps the schema transactionally and
+reconciles interrupted collaboration room fences. SQLite resumes pending blob
+retirements on open. If the installation has used projections, a purge that
+still requires derived cleanup stays pending until its handler is available.
+While the exclusive SQLite opener waits for that handler, it can still reclaim
+unbound S3 uploads left by the previous process, including uploads from the
+current lease epoch. Online recovery protects uploads owned by a live writer.
 If recovery fails, opening cancels its workers and releases local ownership
 before returning the error. Dropping an opening future schedules the same
 shutdown on its Tokio runtime. The DataRoot stays locked until the workers and
@@ -81,6 +85,13 @@ page at its current folder and reserved stem. Activity omits erased note
 metadata and can still report other changes in the same window. Delta
 consumers crossing an erased command payload must resync.
 
+Search uses read-only carriers for paged seeds, complete-command increments,
+exact receipt revisions, and current authorized hydration. Chat search reads
+the active reachable branch and hydrates ranked candidates against live facts.
+An independent `ChangeBroadcast` acknowledgement advances only after the
+derived cut is durable. Purge and redaction also retire old derived index
+files before acknowledgement. See [search index storage](search.md#storage).
+
 In PostgreSQL, creating a Space grants its initial writer epoch to the
 provisioning runtime when storage receives the commit acknowledgement, even if
 the caller has already left. If the database acknowledgement itself is lost,
@@ -111,10 +122,44 @@ recovers writes under its exclusive DataRoot owner lock.
 ## Dual-dialect schema and history model
 
 Both SQL dialects materialize the same ordinary B-tree tables in schema
-version `8` and verify live database catalogs (`sqlite_master` / `pg_catalog`)
+version `9` and verify live database catalogs (`sqlite_master` / `pg_catalog`)
 against a shared typed manifest checksum (`schema_meta`) on every startup.
 Unknown newer schema versions, mismatched manifest checksums or unfinished
 migration states fail closed.
+
+Schema version 8 records each chat reference's immutable source entry creation
+sequence in the same transaction as the entry. One index orders occurrences by
+source Space and creation sequence. The incoming-reference index first selects
+the source and target Spaces, then orders by the same sequence. Both continue
+by thread, entry and ordinal within a sequence. A fixed-cut scan can seek past
+its last occurrence and stop at the cutoff even while writers append. Readers
+check current entry visibility and purge fences before returning references.
+Redaction and stale-summary cleanup remove the indexed occurrences atomically.
+
+The upgrade from version 7 copies the surviving normalized references and their
+original ordinals, looking up the creation sequence on each parent entry.
+SQLite streams the old on-disk table into the indexed destination. PostgreSQL
+backfills the new column in place, preserving the existing foreign key and
+avoiding a pending trigger event for every reference.
+Earlier versions populate the sequence while normalizing the legacy arrays.
+When opening a local database, including a restored SQLite snapshot, the runtime
+uses file-backed temporary storage during schema bootstrap. This allows large
+index-build sorts to spill to disk. After bootstrap commits, the serving writer
+returns to in-memory temporary storage.
+Stop preceding-version PostgreSQL writers before upgrading. Bootstrap installs
+the data, indexes and schema witness in one transaction.
+
+Schema version 7 records a rank anchor at each existing Space's committed head.
+The anchor preserves exactly the live view-rank overlays at upgrade. Rank
+revisions after that head include deletion tombstones, so a projection rebuild
+can distinguish an absent rank from an older live revision. The migration also
+builds a covering chat-entry lookup. It reads one legacy reference array at
+a time and stores one indexed row per distinct target and entry, retaining
+the first occurrence's ordinal. Projection readers page through those keys
+and validate each source entry and target before returning its backlink.
+Startup copies the live anchor rows under the migration fence in one transaction.
+PostgreSQL copies Space markers and placements in primary-key pages of 1,024
+rows so foreign-key trigger memory stays bounded during the upgrade.
 
 The canonical store implements `ControlCatalogPort`. Account provisioning and
 lifecycle changes store a compact receipt keyed by owner, actor and command key
@@ -124,11 +169,13 @@ The caller can replay a pending control operation after losing the canonical
 response. Reusing the key with a different payload is rejected. Rebinding a
 Space's history invalidates receipts issued for its earlier incarnation.
 
-Schema version 8 allows multiple canonical packages to share a folded name.
+Version 9 unifies the projection and agent layouts that independently used
+versions 7 and 8. Startup selects the upgrade by version and exact manifest
+checksum. The unified schema allows multiple canonical packages to share a folded name.
 Control binding policy selects the visible package and serializes live
 authoring operations. Canonical package identity and version remain exact.
 
-Schema version 7 stores the active chat run's writer generation, distinguishes
+The same upgrade stores the active chat run's writer generation, distinguishes
 human turns from derived turns after redaction, and records the source proof of
 derived turns. A legacy redaction with unknown origin counts as a peer
 intervention when its author differs from the queued sender.
@@ -225,6 +272,16 @@ rule under their writer savepoints.
   final column so room-state and lease precondition checks read inline tuple
   headers without traversing overflow pages.
 
+Projection readers use purpose-scoped canonical pagination and the current
+Space owner's lifecycle fence. PostgreSQL installations additionally maintain
+two non-portable runtime coordination tables excluded from backups
+(`projection_space_owners` for single-Space writer ownership/draining and
+`projection_cleanup_registration` for persistent derived cleanup binding). Chat
+thread reads enforce a single unified `Personal`-thread owner and
+`ChatAudience::Shared` policy across `ChatPort::read_chat`, change visibility,
+and projection backlinks. They maintain a separate derived database and
+checkpoint cache. See [structural projections](projections.md).
+
 ## Content-addressed storage and crash-safe purge
 
 Logical blob identities are 32-byte `BLAKE3` digests over raw uncompressed
@@ -287,6 +344,11 @@ retirements and re-uploads never collide:
   registered-but-unsent keys) instead of relying on S3 `DeleteMarker`s, and—on
   `Enabled` buckets—enumerates `ListObjectVersions` to issue exact `versionId`
   `DELETE` calls for prior data versions while preserving the terminal marker.
+  If recovery and a command replay overlap, a data version can disappear between
+  listing and reading it. The writer skips a missing version only after a fresh
+  listing of that key confirms its absence. Before confirming retirement, the
+  writer verifies that every remaining version is a terminal marker, including
+  the latest version.
 
 If versioning changes during retirement, the operation stays pending. After a
 restart with the detected `Enabled` mode, the writer resumes from the durable
@@ -313,7 +375,11 @@ Irreversible erasure executes as a crash-recoverable 3-phase protocol:
    enforced ahead of historical reads, cold seeds and card hydration). SQLite
    startup resumes pending purges and standalone blob retirements. For an
    existing PostgreSQL Space, the incoming writer must acquire a higher epoch
-   with `advance_space_lease`. The caller waits for recovery within its budget.
+   with `advance_space_lease`. An installation with projections completes a
+   pending purge after its registered handler has erased the derived data.
+   Recovery reads pending commands in bounded batches and checks out a new
+   read transaction for each batch. A caller that loses the acknowledgement
+   can retry with the original key.
 
 Shared blobs that remain referenced by independent live notes or chat entries
 retain their active references, and historical external backups created prior to
@@ -445,20 +511,23 @@ same example against an isolated prefix.
   heads, root permissions and live publications.
 - **Collaboration room ownership.** A PostgreSQL writer takeover fences active
   rooms in the same transaction that advances the Space writer epoch. The
-  successor can reopen a fenced room with its new lease and replay its durable
-  updates. Checkpoint and close compact the update log only when the caller
-  supplies a snapshot and its inclusive `compacted_through_update_seq`. Omitting
-  the watermark preserves the log, including updates accepted before a close.
-  A watermark advances in lease and update sequence order. An equal watermark
-  accepts only the same snapshot bytes. Reopening preserves the stored snapshot.
-  After recovery, sequence zero in the new lease can cover all updates from
-  earlier leases. The room owner must first replay those updates into its snapshot.
-  Direct carrier changes, including schema-note changes, wait until an authorized
-  settlement pairs the snapshot with the canonical carrier and covers the last
-  pending update. A clean close permits direct changes to start a new lineage.
-  The storage executor owns admitted work. If the database loses a COMMIT reply,
-  it retains the affected room lock until a fresh transaction verifies the durable
-  lease under the Space lock. Unrelated rooms keep their own fences.
+  successor recovers the stored snapshot and durable updates under the room
+  fence. A new room installs its initial snapshot when opening its lease.
+  The batch writer checks the active lease, lineage and writer authority
+  when adding peer updates to `collab_update_log`. The room waits for a
+  known durable append before publishing the update and ACK. Retrying an
+  uncertain append uses the same scope, lease, sequences and bytes.
+  Checkpoint and close compact the log when given a snapshot and inclusive
+  `compacted_through_update_seq`. The watermark advances in lease and update
+  sequence order. Sequence zero in the new lease can cover earlier leases
+  after their tail has been replayed. An ordinary checkpoint at an equal
+  watermark accepts the same snapshot bytes. A room-owned canonical command
+  may commit a changed snapshot with its revision at the existing watermark.
+  Direct carrier changes, including schema-note changes, wait for an
+  authorized settlement covering the pending updates. A clean close permits
+  direct changes to advance the lineage. The storage executor owns admitted
+  work and reconciles ambiguous room transitions under the Space lock.
+  [Live collaboration](collab.md#carrier-and-durability)
 - **Job pagination.** `list_jobs` binds each cursor to the original Space cut.
   Continuation returns `CursorStale` if the cut advances or a heartbeat changes
   progress visible to the query. Consumers can open a new read at the current cut.
@@ -523,17 +592,27 @@ same example against an isolated prefix.
   volume, where lookup checks file size and BLAKE3 before returning the path.
   Startup reconciles abandoned holds and pending local artifacts.
   The offline `notarium_canonical::backup::decode_postgres_spool_v1_bounded`
-  API verifies the trailer and recognizes the exact manifests for schemas 1 through 8.
+  API verifies the trailer and recognizes the exact manifests for schemas 1 through 9,
+  including both layouts of versions 7 and 8.
   It returns typed rows in the original table and column order within the
   caller's byte budget. To materialize a historical spool, create an empty
-  target with `schema::POSTGRES_BASELINE_DDL`. For versions 1 through 7,
-  replace `idx_ability_packages_active_slug` with the unique predecessor index
-  `uq_ability_packages_active_slug` on `(space_id, slug_fold)` where
-  `lifecycle_state = 'active'`. For versions 1 through 6,
-  remove the chat columns and index added in version 7 using
-  `tests/fixtures/chat-schema-v6-only.sql` in the canonical crate.
-  For versions 1 through 5, rebuild `idx_blob_retirements_status` on
-  `(space_id, status)`.
+  target with `schema::POSTGRES_BASELINE_DDL`. Match the version and manifest
+  checksum in the spool header to its source layout. The following SQL
+  fixtures live in the canonical crate's `tests/fixtures/` directory.
+
+  | Historical layout (manifest checksum prefix) | Apply to the empty version 9 target in order |
+  | --- | --- |
+  | Projection v8 (`085e724d`) | `schema-v8-remove-agents.sql` |
+  | Projection v7 (`1a3cfcfe`) | `schema-v8-remove-agents.sql`, then `schema-v7-chat-refs.sql` |
+  | Agent v8 (`ee1c8ead`) | `schema-v6-remove-projection.sql` |
+  | Agent v7 (`244ce610`) | `schema-v6-remove-projection.sql`, then restore the unique ability slug index described below |
+  | Common v1–v6 | `schema-v8-remove-agents.sql`, then `schema-v6-remove-projection.sql`, followed by the version-specific steps below |
+
+  To restore the agent v7 index, replace `idx_ability_packages_active_slug`
+  with a unique index named `uq_ability_packages_active_slug` on
+  `ability_packages(space_id,slug_fold)` where `lifecycle_state = 'active'`.
+  For versions 1 through 5, drop `idx_blob_retirements_status` and recreate it
+  on `(space_id, status)`.
   For versions 1 and 2, drop
   `collab_checkpoints` and `backup_holds.owner_generation`. For version 1,
   also drop `account_catalog_receipts` and `chat_pending_inputs.ext_space_tainted`.
@@ -548,8 +627,7 @@ same example against an isolated prefix.
   temporary table, then inserts the full set in one statement so foreign keys
   can resolve parents that appear later in the archive.
   Opening the target with the original installation ID applies the remaining
-  migrations through version 8. The canonical L4 backup suite exercises this
-  procedure with archives from versions 1 through 6.
+  migrations through version 9.
   Before serving the restored database, call `restore_cursors` with each
   original cutoff and a fresh history incarnation. The same transaction
   rotates the writer epoch and fences active rooms, retaining their snapshots,
@@ -564,11 +642,22 @@ same example against an isolated prefix.
 `make setup` pulls the digest-pinned `postgres:16-bookworm` image, builds the
 pinned MinIO Community image from source (`RELEASE.2025-10-15T17-29-55Z`, commit
 `9e49d5e7a648f00e26f2246f4dc28e6b07f8c84a`) and builds the `#![forbid(unsafe_code)]`
-Unix-socket-to-loopback S3 bridge (`compose.storage-tests.yaml`). `make test`
-starts an isolated per-run fixture stack (`--network none` / internal namespace)
+Unix-socket-to-loopback S3 bridge (`compose.storage-tests.yaml`). Setup reuses
+an image by recipe hash. The hash covers the Compose file, the Dockerfile, its
+local source inputs and the effective Docker ignore file. Each recipe has its
+own tag, so checkouts with different recipes can share a Docker daemon.
+Setup checks the `io.notarium.fixture-recipe-sha256` label before reuse.
+Pass `--force` to request both builds.
+
+```sh
+sh docker/storage-fixtures/with-storage-fixtures.sh setup-images --force
+```
+
+`make test` starts an isolated per-run fixture stack (`--network none` / internal namespace)
 mounted over `.artifacts/storage-tests/<run>/` Unix domain sockets and tears it
-down automatically via signal/exit traps. Integration tests fail closed if
-fixtures are absent.
+down automatically via signal/exit traps. The offline runner rejects missing
+or stale fixture images and starts services by their verified image IDs. Run
+`make setup app=api` to prepare the current recipes.
 
 The test and benchmark commands hold one checkout-wide fixture lock from startup
 through cleanup. Other checkouts can run independently.

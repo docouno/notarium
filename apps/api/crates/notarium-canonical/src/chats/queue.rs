@@ -106,6 +106,7 @@ pub(super) async fn claim(
     store
         .with_guarded_auxiliary_command(
             ctx.scope().space_id.clone(),
+            None,
             Some((&budget, deadline)),
             effect,
             Ok,
@@ -235,6 +236,7 @@ pub(super) async fn finish(
     store
         .with_guarded_auxiliary_command(
             ctx.scope().space_id.clone(),
+            None,
             Some((&budget, deadline)),
             effect,
             move |(outcome, cleanup)| {

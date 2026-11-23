@@ -43,8 +43,8 @@ fn rollback_board_history_includes_run_moves_and_both_ends_of_foreign_moves() {
     }
 }
 
-#[test]
-fn native_rollback_checks_the_lease_before_publishing_sql_and_room_state() {
+#[tokio::test]
+async fn native_rollback_checks_the_lease_before_publishing_sql_and_room_state() {
     struct Lease(bool);
     impl RevocationLease for Lease {
         fn check(&self) -> Result<(), PortError> {
@@ -56,14 +56,16 @@ fn native_rollback_checks_the_lease_before_publishing_sql_and_room_state() {
         }
     }
 
+    let (store, runtime, _, path) = fixture().await;
     for admitted in [false, true] {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let conn = open_rusqlite_writer_connection(&path.join("v1/canonical.sqlite")).unwrap();
         conn.execute_batch(
-            "CREATE TABLE changes (n INTEGER); BEGIN IMMEDIATE; INSERT INTO changes VALUES (1)",
+            "CREATE TEMP TABLE changes (n INTEGER); BEGIN IMMEDIATE; INSERT INTO changes VALUES (1)",
         )
         .unwrap();
         let published = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let room_state = published.clone();
+        let committed = Arc::new(AtomicBool::new(false));
         let result = finish_fast_sql_stage(
             &conn,
             BTreeMap::new(),
@@ -73,10 +75,13 @@ fn native_rollback_checks_the_lease_before_publishing_sql_and_room_state() {
             vec![CommitAction::ConfirmedOrUnknown(Box::new(move || {
                 room_state.store(true, Ordering::SeqCst);
             }))],
+            Arc::clone(&committed),
             Vec::new(),
             None,
+            &store.inner,
             false,
             Some(&Lease(admitted)),
+            false,
         );
         assert!(match result {
             FastSqlStageResult::CommittedDirectly { .. } => admitted,
@@ -89,7 +94,10 @@ fn native_rollback_checks_the_lease_before_publishing_sql_and_room_state() {
             .unwrap();
         assert_eq!(rows, i64::from(admitted));
         assert_eq!(published.load(Ordering::SeqCst), admitted);
+        assert_eq!(committed.load(Ordering::Acquire), admitted);
     }
+    runtime.shutdown().await.unwrap();
+    std::fs::remove_dir_all(path).unwrap();
 }
 
 async fn fixture() -> (

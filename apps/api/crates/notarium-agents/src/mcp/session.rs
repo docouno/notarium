@@ -135,6 +135,7 @@ async fn whoami(call: &mut ToolCallContext<'_>) -> Result<Value, PortError> {
         PrincipalKind::OAuth { .. } => "oauth",
         PrincipalKind::AgentRun(_) => "agent_run",
         PrincipalKind::Keeper(_) => "keeper",
+        PrincipalKind::SearchIndexing => return Err(DomainError::AccessDenied.into()),
     };
     let external = matches!(call.target, EgressTarget::ExternalMcp);
     let mut spaces = Vec::new();

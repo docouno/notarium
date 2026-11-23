@@ -488,19 +488,22 @@ impl ToolRegistry {
 }
 
 fn check_target(auth: &EngineAuthContext, target: &EgressTarget) -> Result<(), PortError> {
-    let run = matches!(
-        auth.kind(),
-        PrincipalKind::AgentRun(_) | PrincipalKind::Keeper(_)
-    );
-    if run == matches!(target, EgressTarget::InAppProvider { .. }) {
-        Ok(())
-    } else {
-        Err(DomainError::AccessDenied.into())
+    match (auth.kind(), target) {
+        (
+            PrincipalKind::DirectHuman | PrincipalKind::Pat | PrincipalKind::OAuth { .. },
+            EgressTarget::ExternalMcp,
+        )
+        | (
+            PrincipalKind::AgentRun(_) | PrincipalKind::Keeper(_),
+            EgressTarget::InAppProvider { .. },
+        ) => Ok(()),
+        _ => Err(DomainError::AccessDenied.into()),
     }
 }
 
 fn allowed(auth: &EngineAuthContext, tool: ToolName) -> bool {
     match auth.kind() {
+        PrincipalKind::SearchIndexing => false,
         PrincipalKind::DirectHuman => true,
         PrincipalKind::Pat | PrincipalKind::OAuth { .. } => {
             !tool.writes() || auth.bearer_scope() == Some(BearerScope::Write)

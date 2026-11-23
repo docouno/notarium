@@ -194,14 +194,17 @@ for the durable claim and credential contracts.
 `make test` runs unit tests for tool schemas, cursor boundaries, stream framing,
 permission fences and calendar behavior. The
 `fitness-gates` integration suite in `tests/agents_runtime.rs` composes the
-registry and runtimes with real SQLite and PostgreSQL 16 storage, typed
-projection/search fixtures and offline loopback provider responses. Canonical
-and control tests exercise database receipts, upgrades and recovery at their
-own boundaries. HTTP transport and production cluster authority have separate
+registry and runtimes with SQLite and PostgreSQL 16 storage and offline
+loopback providers. The project-scoped MCP test runs the projection and
+search engines against SQLite, then checks listing, inline views, search
+and recall after canonical writes. Fault-injection fixtures exercise retries
+and lost acknowledgements. Canonical and control tests cover database receipts,
+schema upgrades and recovery. HTTP transport and production cluster authority have separate
 integration requirements.
 
 The Keeper integration test reports the latency of the first supervisor rollback
-of nine changed memory notes, including live authorization and the commit. It
+of nine changed memory notes with the collaboration hub registered, including
+live authorization and the durable commit. It
 checks all nine restored digests and the replayed receipt outside the timer.
 Use a release build on a quiet host to measure the five-millisecond target.
 The command below puts PostgreSQL data and its WAL on a disposable Docker

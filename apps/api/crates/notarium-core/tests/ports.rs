@@ -1200,24 +1200,49 @@ impl StructuralSnapshot for PinnedGraph {
     fn cut(&self) -> &SnapshotCut {
         &self.0.cut
     }
-    fn lookup(&self, note: &NoteId) -> Option<DenseNodeId> {
-        self.0
+    fn lookup(&self, note: &NoteId) -> notarium_core::DomainResult<Option<DenseNodeId>> {
+        Ok(self
+            .0
             .notes
             .iter()
             .position(|n| n == note)
-            .map(|i| DenseNodeId::new(self.0.cut.generation, i as u32))
+            .map(|i| DenseNodeId::new(self.0.cut.generation, i as u32)))
     }
-    fn note_id(&self, node: DenseNodeId) -> notarium_core::DomainResult<&NoteId> {
+    fn note_id(&self, node: DenseNodeId) -> notarium_core::DomainResult<NoteId> {
         self.0
             .notes
             .get(node.index(self.0.cut.generation)? as usize)
+            .cloned()
             .ok_or(DomainError::ResourceNotFound)
     }
-    fn folder_subtree(&self, _: &FolderId) -> notarium_core::DomainResult<DenseNodeIter<'_>> {
-        Ok(DenseNodeIter::from_iter(
-            self.0.cut.generation,
-            self.0.neighbors.iter().copied(),
-        ))
+    fn doc_class(&self, node: DenseNodeId) -> notarium_core::DomainResult<DocClass> {
+        self.note_id(node)?;
+        Ok(DocClass::UserDoc)
+    }
+    fn folder_descendants<'a>(&'a self, folder: &'a FolderId) -> PortFuture<'a, Vec<FolderId>> {
+        Box::pin(async move { Ok(vec![folder.clone()]) })
+    }
+    fn enclosing_project<'a>(&'a self, _: &'a FolderId) -> PortFuture<'a, Option<FolderId>> {
+        Box::pin(async move { Ok(None) })
+    }
+    fn filter_notes<'a>(
+        &'a self,
+        filter: &'a FieldFilterAstV1,
+    ) -> PortFuture<'a, Option<DenseNodeIter<'a>>> {
+        Box::pin(async move {
+            match &filter.predicate {
+                Predicate::All(predicates) if predicates.is_empty() => Ok(None),
+                _ => Ok(Some(DenseNodeIter::from_slice(self.0.cut.generation, &[]))),
+            }
+        })
+    }
+    fn folder_subtree<'a>(&'a self, _: &'a FolderId) -> PortFuture<'a, DenseNodeIter<'a>> {
+        Box::pin(async move {
+            Ok(DenseNodeIter::from_iter(
+                self.0.cut.generation,
+                self.0.neighbors.iter().copied(),
+            ))
+        })
     }
     fn outgoing(&self, node: DenseNodeId) -> notarium_core::DomainResult<DenseNodeIter<'_>> {
         self.note_id(node)?;
@@ -1246,9 +1271,11 @@ impl StructuralReadPort for StructuralFixture {
             Ok(Box::new(PinnedGraph(current)) as Box<dyn StructuralSnapshot>)
         })
     }
-    fn is_live_visible(&self, ctx: &SpaceContext, _: &NoteId) -> notarium_core::DomainResult<bool> {
-        ctx.check_current(&self.current.lock().unwrap().cut.scope)?;
-        Ok(self.visible.load(std::sync::atomic::Ordering::SeqCst))
+    fn is_live_visible<'a>(&'a self, ctx: &'a SpaceContext, _: &'a NoteId) -> PortFuture<'a, bool> {
+        Box::pin(async move {
+            ctx.check_current(&self.current.lock().unwrap().cut.scope)?;
+            Ok(self.visible.load(std::sync::atomic::Ordering::SeqCst))
+        })
     }
     fn hydrate(
         &self,
@@ -1263,7 +1290,7 @@ impl StructuralReadPort for StructuralFixture {
             let current = self.current.lock().unwrap().clone();
             let mut cards = Vec::new();
             for note in notes {
-                if !self.is_live_visible(&ctx, &note)? || !current.notes.contains(&note) {
+                if !self.is_live_visible(&ctx, &note).await? || !current.notes.contains(&note) {
                     cards.push(None);
                     continue;
                 }
@@ -1340,16 +1367,16 @@ fn pinned_graph_survives_a_swap_but_visibility_uses_the_current_fence() {
         id
     );
     assert_eq!(page[1].as_ref().unwrap().preview, "preview");
-    let node = old.lookup(&id).unwrap();
+    let node = old.lookup(&id).unwrap().unwrap();
     let mut neighbors = old.outgoing(node).unwrap();
     *port.current.lock().unwrap() = graph(2);
     port.visible
         .store(false, std::sync::atomic::Ordering::SeqCst);
     let new =
         ready(port.acquire_snapshot(context(), CausalBasis::Exact(ReceiptSet::default()))).unwrap();
-    assert_eq!(old.note_id(neighbors.next().unwrap()).unwrap(), &id);
+    assert_eq!(old.note_id(neighbors.next().unwrap()).unwrap(), id);
     assert!(new.note_id(node).is_err());
-    assert!(!port.is_live_visible(&context(), &id).unwrap());
+    assert!(!ready(port.is_live_visible(&context(), &id)).unwrap());
     assert_eq!(
         ready(port.hydrate(context(), old.cut().clone(), vec![id.clone(), id]))
             .unwrap()

@@ -27,6 +27,8 @@ mod moved_note_cases;
 mod proposal_cases;
 #[path = "agents_runtime/proposal_notes.rs"]
 mod proposal_note_cases;
+#[path = "agents_runtime/real_reads.rs"]
+mod real_reads;
 #[path = "agents_runtime/rollback_receipts.rs"]
 mod rollback_receipts;
 #[path = "agents_runtime/runtime_abilities.rs"]

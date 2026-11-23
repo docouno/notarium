@@ -22,6 +22,9 @@ use notarium_core::{
 use serde::Deserialize;
 use sqlx::{Connection, PgConnection, SqliteConnection, sqlite::SqliteConnectOptions};
 
+pub const CANONICAL_V6_HASH: &str =
+    "f91526e264d8000bf5d72a4efcb4e9701b350636c37da24d2b34bb19f50a8772";
+
 #[derive(Clone, Debug, Deserialize)]
 struct RawFixtureManifest {
     run_id: String,

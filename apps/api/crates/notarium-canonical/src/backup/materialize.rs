@@ -1,8 +1,5 @@
-use super::{BackupWitness, DecodedPostgresSpoolV1, PostgresSpoolValue, spool_tables};
-use crate::{
-    codec::internal_not_committed,
-    schema::manifest::{CANONICAL_SCHEMA_VERSION, checksum_tables},
-};
+use super::{BackupWitness, DecodedPostgresSpoolV1, PostgresSpoolValue, verified_spool_tables};
+use crate::codec::internal_not_committed;
 use notarium_core::{
     DomainError,
     error::{PortError, ValidationReason},
@@ -16,10 +13,8 @@ impl DecodedPostgresSpoolV1 {
         self,
         target: &mut Transaction<'_, Postgres>,
     ) -> Result<BackupWitness, PortError> {
-        let specs = spool_tables(self.schema_version);
-        if !(1..=CANONICAL_SCHEMA_VERSION).contains(&self.schema_version)
-            || self.witness.schema_version != self.schema_version
-            || self.manifest_checksum != checksum_tables(self.schema_version, specs.clone())
+        let specs = verified_spool_tables(self.schema_version, self.manifest_checksum)?;
+        if self.witness.schema_version != self.schema_version
             || specs.clone().count() != self.tables.len()
         {
             return Err(DomainError::validation(ValidationReason::InvalidState).into());

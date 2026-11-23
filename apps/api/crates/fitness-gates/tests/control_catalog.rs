@@ -792,6 +792,7 @@ async fn empty_folder_disclosure(
         primary: space.scope.clone(),
         project: Some(project.clone()),
         secondary_projects: vec![],
+        project_folders: Default::default(),
     };
     let mut lease = canonical
         .acquire_egress(account.clone(), request.clone(), Cancellation::default())
@@ -948,6 +949,7 @@ async fn builtins_after_owned_page(
         origins,
         project: None,
         secondary_projects: vec![],
+        project_folders: Default::default(),
     };
     let lease = catalog
         .acquire_egress(

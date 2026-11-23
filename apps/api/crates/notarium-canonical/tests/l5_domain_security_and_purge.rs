@@ -1746,6 +1746,7 @@ async fn run_domain_and_security_suite(
                 origins: vec![authorized.origin()],
                 primary: scope.clone(),
                 project: Some(current_project.clone()),
+                project_folders: BTreeSet::new(),
                 secondary_projects: vec![],
             },
             Cancellation::default(),

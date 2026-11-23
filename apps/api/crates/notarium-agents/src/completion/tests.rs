@@ -4,7 +4,7 @@ use notarium_core::{
     ids::{ModelProfileId, PrincipalId, ProviderResourceId, RequestId},
     ports::{
         CompletionMessage, CompletionModelLimits, CompletionRole, ProviderInstruction,
-        ProviderRevocationScope, ProviderSelection,
+        ProviderRevocationScope, ProviderRuntimeEpochs, ProviderSelection,
     },
 };
 
@@ -32,6 +32,10 @@ fn request() -> CompletionRequest {
         selection: ProviderSelection {
             provider: provider.clone(),
             model: ModelProfileId::from_bytes([4; 16]),
+            runtime_epochs: ProviderRuntimeEpochs {
+                resource: std::num::NonZeroU64::MIN,
+                credential: None,
+            },
             project: None,
             project_only: None,
             policy: ProviderPolicy {

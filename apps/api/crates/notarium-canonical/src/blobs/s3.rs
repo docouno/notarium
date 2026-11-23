@@ -83,6 +83,17 @@ pub struct S3RawResponse {
 }
 
 impl S3RawResponse {
+    fn into_object_bytes(self, physical_key: &str) -> Result<Bytes, PortError> {
+        if self.status != 200 {
+            return Err(unavailable_retryable(
+                "s3_get_object_failed",
+                format!("S3 GET '{}' returned HTTP {}", physical_key, self.status),
+                Duration::from_millis(50),
+            ));
+        }
+        Ok(self.body)
+    }
+
     pub fn version_id(&self) -> Option<String> {
         self.headers
             .get("x-amz-version-id")
@@ -742,7 +753,10 @@ impl S3BlobStore {
                     ));
                 }
                 // Verify origin GET returns the terminal marker (never data bytes or 404).
-                let head_bytes = self.get_object_bytes(&target.physical_key, None).await?;
+                let head_bytes = self
+                    .get_object(&target.physical_key, None)
+                    .await?
+                    .into_object_bytes(&target.physical_key)?;
                 if !TerminalMarkerMeta::is_terminal_marker(&head_bytes) {
                     return Err(unavailable_retryable(
                         "s3_marker_verify_failed",
@@ -778,8 +792,9 @@ impl S3BlobStore {
                 let latest_is_marker = match versions.iter().find(|v| v.is_latest) {
                     Some(latest) if !latest.is_delete_marker => {
                         let body = self
-                            .get_object_bytes(&target.physical_key, Some(&latest.version_id))
-                            .await?;
+                            .get_object(&target.physical_key, Some(&latest.version_id))
+                            .await?
+                            .into_object_bytes(&target.physical_key)?;
                         TerminalMarkerMeta::is_terminal_marker(&body)
                     }
                     _ => false,
@@ -804,9 +819,21 @@ impl S3BlobStore {
                             ),
                         ));
                     }
-                    let body = self
-                        .get_object_bytes(&target.physical_key, Some(&entry.version_id))
+                    let response = self
+                        .get_object(&target.physical_key, Some(&entry.version_id))
                         .await?;
+                    // A peer can journal and delete this version between LIST and GET.
+                    // Confirm its absence before saving the deletion plan.
+                    if response.status == 404
+                        && !self
+                            .list_exact_key_versions(&target.physical_key)
+                            .await?
+                            .iter()
+                            .any(|v| v.version_id == entry.version_id)
+                    {
+                        continue;
+                    }
+                    let body = response.into_object_bytes(&target.physical_key)?;
                     if !TerminalMarkerMeta::is_terminal_marker(&body)
                         && !data_vids.contains(&entry.version_id)
                     {
@@ -862,8 +889,9 @@ impl S3BlobStore {
                         ));
                     }
                     let body = self
-                        .get_object_bytes(&target.physical_key, Some(&entry.version_id))
-                        .await?;
+                        .get_object(&target.physical_key, Some(&entry.version_id))
+                        .await?
+                        .into_object_bytes(&target.physical_key)?;
                     if !TerminalMarkerMeta::is_terminal_marker(&body) {
                         return Err(unavailable_retryable(
                             "s3_data_version_survived_delete",
@@ -939,17 +967,16 @@ impl S3BlobStore {
         Ok(resp.version_id())
     }
 
-    async fn get_object_bytes(
+    async fn get_object(
         &self,
         physical_key: &str,
         version_id: Option<&str>,
-    ) -> Result<Bytes, PortError> {
+    ) -> Result<S3RawResponse, PortError> {
         let mut query = Vec::new();
         if let Some(vid) = version_id {
             query.push(("versionId".to_owned(), vid.to_owned()));
         }
-        let resp = self
-            .transport
+        self.transport
             .send(S3RawRequest {
                 method: Method::GET,
                 key: Some(physical_key.to_owned()),
@@ -957,16 +984,7 @@ impl S3BlobStore {
                 headers: Vec::new(),
                 body: Bytes::new(),
             })
-            .await?;
-
-        if resp.status != 200 {
-            return Err(unavailable_retryable(
-                "s3_get_object_failed",
-                format!("S3 GET '{}' returned HTTP {}", physical_key, resp.status),
-                Duration::from_millis(50),
-            ));
-        }
-        Ok(resp.body)
+            .await
     }
 
     async fn delete_exact_version(

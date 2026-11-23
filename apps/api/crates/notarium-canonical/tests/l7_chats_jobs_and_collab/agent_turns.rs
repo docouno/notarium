@@ -366,6 +366,15 @@ async fn model_payloads(store: &CanonicalStore) {
             ClassEgressFence::chat_transcript(&item.content, interactive().auth()).unwrap(),
             text
         );
+        let (hits, _) = store
+            .hydrate_live_visible_chat_hits(
+                &interactive(),
+                &[(thread.clone(), parent)],
+                PageLimit::new(1).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(hits[0].text, text);
         assert_eq!(item.tool_calls.len(), usize::from(include_call));
         if include_call {
             assert_eq!(item.tool_calls[0].id.as_str(), id.as_str());
@@ -882,6 +891,16 @@ async fn confirmed_source_fence(store: &CanonicalStore) {
         .unwrap()
         .value;
 
+    let (hits, _) = store
+        .hydrate_live_visible_chat_hits(
+            &owner_ctx(&source, owner.clone()),
+            &[(thread.clone(), tool.seq)],
+            PageLimit::new(1).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(hits[0].text, "Confirmation is required");
+
     let role = SpaceGrant {
         role: SpaceRole::Owner,
         read_classes: DocClass::all(),
@@ -1257,6 +1276,7 @@ async fn nested_chat_egress_dependencies(store: &CanonicalStore) {
         origins: [vec![compact_origin], proof.origins].concat(),
         primary: scope.clone(),
         project: None,
+        project_folders: BTreeSet::new(),
         secondary_projects: proof.projects,
     };
     let first = store
@@ -1383,6 +1403,7 @@ async fn legacy_proof_chain(
         origins: vec![tail, metadata.clone()],
         primary: ctx.scope().clone(),
         project: None,
+        project_folders: BTreeSet::new(),
         secondary_projects: vec![],
     };
     assert_eq!(

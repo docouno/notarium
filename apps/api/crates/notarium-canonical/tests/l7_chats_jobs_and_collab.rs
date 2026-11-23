@@ -6,8 +6,12 @@ mod agent_turns;
 mod authority;
 #[path = "l7_chats_jobs_and_collab/pg_read_cancellation.rs"]
 mod pg_read_cancellation;
+#[path = "l7_chats_jobs_and_collab/projection_refs.rs"]
+mod projection_refs;
 #[path = "l7_chats_jobs_and_collab/retirement.rs"]
 mod retirement;
+#[path = "l7_chats_jobs_and_collab/room_wal.rs"]
+mod room_wal;
 mod support;
 
 use std::{
@@ -47,7 +51,8 @@ use notarium_core::{
         EditNote, EntityId, FilenamePin, FinishChatRunOutcome, ForkChat, GetNote,
         InterceptedMutation, InterceptionResult, JobQuery, JobState, LiveCollabInterceptor,
         Mutation, NoteWritePort, PageLimit, PendingChatInput, PortFuture, Preconditions,
-        QueueInputOutcome, RedactChatEntry, RollbackReservation, SpaceContext, StagedChatBlob,
+        QueueInputOutcome, RedactChatEntry, RollbackReservation, ServiceAuthority, ServicePurpose,
+        SpaceContext, StagedChatBlob,
     },
     query::ReadRequest,
     receipt::{CausalBasis, ChangeCursor, CommandIdentity, ReceiptSet},
@@ -1394,6 +1399,155 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
     );
     assert!(replay_reader.auth().taint().is_tainted());
     cur_a = inline_entry.seq;
+    let search_reader = owner_ctx(&scope, owner.clone());
+    let (hits, truncated) = store
+        .hydrate_live_visible_chat_hits(
+            &search_reader,
+            &[(thread.clone(), e1.seq), (thread.clone(), inline_entry.seq)],
+            PageLimit::new(1).unwrap(),
+        )
+        .await
+        .expect("hydrate the top-ranked live chat entry");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].text, exact_512);
+    assert!(truncated);
+    // Parity with `read_chat`: a tainted thread head (`ext_space_tainted_mask != 0`)
+    // taints the caller even when the matched entry itself was untainted.
+    assert!(search_reader.auth().taint().is_tainted());
+
+    // Conversely, hydrating an untainted hit from a clean thread while using a tainted
+    // candidate only as the truncation witness must NOT taint the caller.
+    let clean_thread = sample_thread_id(0xcc);
+    store
+        .create_chat(
+            owner_ctx(&scope, owner.clone()),
+            next_mutation(
+                &scope,
+                &owner,
+                CreateChat {
+                    thread: clean_thread.clone(),
+                    kind: ChatThreadKind::Personal,
+                    owner: owner.clone(),
+                    project_folder: None,
+                    title: "Clean Search Thread".into(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let clean_entry = store
+        .append_chat(
+            owner_ctx(&scope, owner.clone()),
+            next_mutation(
+                &scope,
+                &owner,
+                AppendChat {
+                    tool_calls: Vec::new(),
+                    provenance: None,
+                    interruption: None,
+                    proposed_diff: None,
+                    thread: clean_thread.clone(),
+                    parent: ThreadEntrySeq::ZERO,
+                    kind: ChatEntryKind::Human,
+                    body: ChatInputBody::Text("untainted search entry".into()),
+                    referenced_notes: vec![],
+                    tainted: false,
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .value;
+    let clean_reader = owner_ctx(&scope, owner.clone());
+    let (clean_hits, clean_truncated) = store
+        .hydrate_live_visible_chat_hits(
+            &clean_reader,
+            &[
+                (clean_thread.clone(), clean_entry.seq),
+                (thread.clone(), inline_entry.seq),
+            ],
+            PageLimit::new(1).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(clean_hits.len(), 1);
+    assert_eq!(clean_hits[0].text, "untainted search entry");
+    assert!(clean_truncated);
+    assert!(!clean_reader.auth().taint().is_tainted());
+    // `plan_searchable_chat_delta` fast-path: append-only returns `AppendOnly { stop_at }`
+    // and `read_searchable_chat_entries_page_until` stops cleanly at `stop_at`.
+    let before_append_cut = store.read_space(&scope.space_id).await.unwrap().last_seq;
+    let delta_search = ServiceAuthority::admit(ServicePurpose::Search);
+    assert_eq!(
+        store
+            .plan_searchable_chat_delta(
+                &delta_search,
+                &search_reader.budget,
+                &scope,
+                &thread,
+                before_append_cut,
+                before_append_cut,
+            )
+            .await
+            .unwrap(),
+        notarium_canonical::chats::search::SearchChatDeltaPlan::FullReconcile
+    );
+    let fast_appended = store
+        .append_chat(
+            owner_ctx(&scope, owner.clone()),
+            next_mutation(
+                &scope,
+                &owner,
+                AppendChat {
+                    tool_calls: Vec::new(),
+                    provenance: None,
+                    interruption: None,
+                    proposed_diff: None,
+                    thread: thread.clone(),
+                    parent: cur_a,
+                    kind: ChatEntryKind::Human,
+                    body: ChatInputBody::Text("append-only delta message".into()),
+                    referenced_notes: vec![],
+                    tainted: false,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let after_append_cut = fast_appended.receipt.seq();
+    assert_eq!(
+        store
+            .plan_searchable_chat_delta(
+                &delta_search,
+                &search_reader.budget,
+                &scope,
+                &thread,
+                before_append_cut,
+                after_append_cut,
+            )
+            .await
+            .unwrap(),
+        notarium_canonical::chats::search::SearchChatDeltaPlan::AppendOnly { stop_at: cur_a }
+    );
+    let suffix_page = store
+        .read_searchable_chat_entries_page_until(
+            &delta_search,
+            &search_reader.budget,
+            &scope,
+            &thread,
+            after_append_cut,
+            None,
+            Some(cur_a),
+            PageLimit::new(10).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(suffix_page.entries.len(), 1);
+    assert_eq!(suffix_page.entries[0].entry, fast_appended.value.seq);
+    assert_eq!(suffix_page.entries[0].text, "append-only delta message");
+    assert_eq!(suffix_page.next_before, None);
+    let previous_tip = cur_a;
+    cur_a = fast_appended.value.seq;
     let retained = store.execute_diagnostic_read_sql_for_test(None,
         "SELECT COUNT(*) FROM chat_pending_inputs WHERE status = 'consumed' AND (inline_text <> '' OR payload_blake3 IS NOT NULL)"
     ).await.unwrap();
@@ -1466,6 +1620,37 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
         .await
         .unwrap();
     let comp_a = appended.value;
+    // A later checkpoint must not turn an earlier append-only interval into a branch scan.
+    assert_eq!(
+        store
+            .plan_searchable_chat_delta(
+                &delta_search,
+                &search_reader.budget,
+                &scope,
+                &thread,
+                before_append_cut,
+                after_append_cut,
+            )
+            .await
+            .unwrap(),
+        notarium_canonical::chats::search::SearchChatDeltaPlan::AppendOnly {
+            stop_at: previous_tip
+        }
+    );
+    assert_eq!(
+        store
+            .plan_searchable_chat_delta(
+                &delta_search,
+                &search_reader.budget,
+                &scope,
+                &thread,
+                after_append_cut,
+                appended.receipt.seq(),
+            )
+            .await
+            .unwrap(),
+        notarium_canonical::chats::search::SearchChatDeltaPlan::FullReconcile
+    );
     let child = store
         .append_chat(
             owner_ctx(&scope, owner.clone()),
@@ -1553,6 +1738,47 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
     assert_eq!(redacted.parent, Some(e1.seq));
     // ONLY descendant `comp_a.seq` is invalidated — sibling `comp_b.seq` MUST NOT be invalidated!
     assert_eq!(redacted.invalidated_contexts, vec![comp_a.seq]);
+    let search = ServiceAuthority::admit(ServicePurpose::Search);
+    let cutoff = store.read_space(&scope.space_id).await.unwrap().last_seq;
+    let (threads, _) = store
+        .list_searchable_threads_seed_page(
+            &search,
+            &search_reader.budget,
+            &scope,
+            cutoff,
+            None,
+            PageLimit::new(20).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(threads.contains(&thread));
+    let page = store
+        .read_searchable_chat_entries_page(
+            &search,
+            &search_reader.budget,
+            &scope,
+            &thread,
+            cutoff,
+            None,
+            PageLimit::new(10).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !page
+            .entries
+            .iter()
+            .any(|hit| hit.entry == e2.seq || hit.entry == comp_a.seq)
+    );
+    let (hits, _) = store
+        .hydrate_live_visible_chat_hits(
+            &search_reader,
+            &[(thread.clone(), e2.seq), (thread.clone(), comp_a.seq)],
+            PageLimit::new(2).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(hits.is_empty());
 
     let stale = StaleCompactionCase {
         scope: scope.clone(),
@@ -1766,9 +1992,17 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
             break;
         }
     }
-    assert_eq!(seeded_threads.len(), 1);
-    assert_eq!(seeded_threads[0].id, thread);
-    assert!(seeded_threads[0].tainted);
+    assert_eq!(seeded_threads.len(), 2);
+    let tainted_seed = seeded_threads
+        .iter()
+        .find(|summary| summary.id == thread)
+        .expect("primary thread present in seed");
+    assert!(tainted_seed.tainted);
+    let clean_seed = seeded_threads
+        .iter()
+        .find(|summary| summary.id == clean_thread)
+        .expect("clean thread present in seed");
+    assert!(!clean_seed.tainted);
 
     // Shared Space + `SpaceGroup` thread rejects tainted entries!
     let shared_scope = HistoryScope {
@@ -2240,6 +2474,7 @@ async fn check_reopened_room_concurrency(
         .await
         .unwrap();
     let close = CloseCollabSession {
+        unchanged_carrier_digest: None,
         scope: scope.clone(),
         note: note.clone(),
         owner_id: Some(writer.clone()),
@@ -2313,6 +2548,7 @@ async fn check_reopened_room_concurrency(
     );
 
     let checkpoint = || CheckpointCollabSession {
+        unchanged_carrier_digest: None,
         scope: scope.clone(),
         note: note.clone(),
         owner_id: "writer-c".into(),
@@ -2321,7 +2557,9 @@ async fn check_reopened_room_concurrency(
         yrs_snapshot: vec![1, 2],
         compacted_through_update_seq: Some(0),
         carrier_settlement: Some(CollabCarrierSettlement {
-            auth: owner_ctx(scope, owner.clone()).auth().clone(),
+            actor: notarium_canonical::CollabSettlementActor::writer(
+                owner_ctx(scope, owner.clone()).auth().clone(),
+            ),
             carrier: "# Collab Doc\n\nClosed settled.\n".into(),
         }),
     };
@@ -2335,6 +2573,7 @@ async fn check_reopened_room_concurrency(
     .expect("overlapping settlements must release the writer");
     assert!(completed.0.is_ok() || completed.1.is_ok());
     let close = CloseCollabSession {
+        unchanged_carrier_digest: None,
         scope: scope.clone(),
         note: note.clone(),
         owner_id: Some("writer-c".into()),
@@ -2881,6 +3120,7 @@ async fn run_jobs_and_collab_lifecycle_suite(store: &CanonicalStore, sqlite: boo
     assert!(bad_lease_upd.is_err());
 
     let locked_checkpoint = CheckpointCollabSession {
+        unchanged_carrier_digest: None,
         scope: scope.clone(),
         note: collab_note.clone(),
         owner_id: "room-worker-1".into(),
@@ -2889,7 +3129,9 @@ async fn run_jobs_and_collab_lifecycle_suite(store: &CanonicalStore, sqlite: boo
         yrs_snapshot: vec![9],
         compacted_through_update_seq: Some(1),
         carrier_settlement: Some(CollabCarrierSettlement {
-            auth: owner_ctx(&scope, owner.clone()).auth().clone(),
+            actor: notarium_canonical::CollabSettlementActor::writer(
+                owner_ctx(&scope, owner.clone()).auth().clone(),
+            ),
             carrier: "# Locked settlement\n".into(),
         }),
     };
@@ -2913,7 +3155,9 @@ async fn run_jobs_and_collab_lifecycle_suite(store: &CanonicalStore, sqlite: boo
         ),
     ] {
         let settlement = CollabCarrierSettlement {
-            auth: owner_ctx(&scope, owner.clone()).auth().clone(),
+            actor: notarium_canonical::CollabSettlementActor::writer(
+                owner_ctx(&scope, owner.clone()).auth().clone(),
+            ),
             carrier: format!("---\n{field}\n---\nChanged carrier\n"),
         };
         let denied = store
@@ -2930,6 +3174,7 @@ async fn run_jobs_and_collab_lifecycle_suite(store: &CanonicalStore, sqlite: boo
             .close_collab_session(
                 &make_budget(),
                 CloseCollabSession {
+                    unchanged_carrier_digest: None,
                     scope: scope.clone(),
                     note: collab_note.clone(),
                     owner_id: Some("room-worker-1".into()),
@@ -2960,9 +3205,10 @@ async fn run_jobs_and_collab_lifecycle_suite(store: &CanonicalStore, sqlite: boo
         let pause = store.acquire_writer_safe_point().await.unwrap();
         let mut late = locked_checkpoint.clone();
         let settlement = late.carrier_settlement.as_mut().unwrap();
-        settlement.auth = owner_ctx(&scope, owner.clone()).auth().clone();
+        let writer = owner_ctx(&scope, owner.clone()).auth().clone();
+        let taint = writer.taint().clone();
+        settlement.actor = notarium_canonical::CollabSettlementActor::writer(writer);
         settlement.carrier = "# Settlement revoked after staging\n".into();
-        let taint = settlement.auth.taint().clone();
         let task_store = store.clone();
         let pending = tokio::spawn(async move {
             task_store
@@ -3014,6 +3260,7 @@ async fn run_jobs_and_collab_lifecycle_suite(store: &CanonicalStore, sqlite: boo
         .checkpoint_collab_session(
             &make_budget(),
             CheckpointCollabSession {
+                unchanged_carrier_digest: None,
                 scope: scope.clone(),
                 note: collab_note.clone(),
                 owner_id: "room-worker-1".to_owned(),
@@ -3022,7 +3269,9 @@ async fn run_jobs_and_collab_lifecycle_suite(store: &CanonicalStore, sqlite: boo
                 yrs_snapshot: vec![9, 9, 9],
                 compacted_through_update_seq: Some(1),
                 carrier_settlement: Some(CollabCarrierSettlement {
-                    auth: owner_ctx(&scope, owner.clone()).auth().clone(),
+                    actor: notarium_canonical::CollabSettlementActor::writer(
+                        owner_ctx(&scope, owner.clone()).auth().clone(),
+                    ),
                     carrier: settled_carrier_1.clone(),
                 }),
             },
@@ -3040,6 +3289,7 @@ async fn run_jobs_and_collab_lifecycle_suite(store: &CanonicalStore, sqlite: boo
     assert_eq!(snap_after_ckpt.updates[0].update_seq, 2);
 
     let newest = CheckpointCollabSession {
+        unchanged_carrier_digest: None,
         scope: scope.clone(),
         note: collab_note.clone(),
         owner_id: "room-worker-1".into(),
@@ -3069,6 +3319,7 @@ async fn run_jobs_and_collab_lifecycle_suite(store: &CanonicalStore, sqlite: boo
         );
     }
     let stale_close = CloseCollabSession {
+        unchanged_carrier_digest: None,
         scope: scope.clone(),
         note: collab_note.clone(),
         owner_id: Some("room-worker-1".into()),
@@ -3077,7 +3328,9 @@ async fn run_jobs_and_collab_lifecycle_suite(store: &CanonicalStore, sqlite: boo
         final_yrs_snapshot: Some(vec![9, 9, 9]),
         compacted_through_update_seq: Some(1),
         carrier_settlement: Some(CollabCarrierSettlement {
-            auth: owner_ctx(&scope, owner.clone()).auth().clone(),
+            actor: notarium_canonical::CollabSettlementActor::writer(
+                owner_ctx(&scope, owner.clone()).auth().clone(),
+            ),
             carrier: "# Stale snapshot\n".to_owned(),
         }),
     };
@@ -3101,6 +3354,7 @@ async fn run_jobs_and_collab_lifecycle_suite(store: &CanonicalStore, sqlite: boo
         .close_collab_session(
             &make_budget(),
             CloseCollabSession {
+                unchanged_carrier_digest: None,
                 scope: scope.clone(),
                 note: collab_note.clone(),
                 owner_id: Some("room-worker-1".to_owned()),
@@ -3109,7 +3363,9 @@ async fn run_jobs_and_collab_lifecycle_suite(store: &CanonicalStore, sqlite: boo
                 final_yrs_snapshot: Some(vec![7, 7]),
                 compacted_through_update_seq: Some(2),
                 carrier_settlement: Some(CollabCarrierSettlement {
-                    auth: owner_ctx(&scope, owner.clone()).auth().clone(),
+                    actor: notarium_canonical::CollabSettlementActor::writer(
+                        owner_ctx(&scope, owner.clone()).auth().clone(),
+                    ),
                     carrier: settled_carrier_2.clone(),
                 }),
             },
@@ -3404,6 +3660,11 @@ async fn l7_sqlite_chats_jobs_collab_and_crash_fenced_recovery() {
     assert_eq!(fenced_snap.session.room_state, CollabRoomState::Fenced);
     assert_eq!(fenced_snap.session.owner_id, None);
     assert_eq!(fenced_snap.session.lease_epoch, LeaseEpoch::new(2).unwrap());
+    assert!(
+        store2
+            .room_fences()
+            .is_room_fenced(&crash_scope.space_id, &crash_note)
+    );
 
     // Direct `edit_note` (even WITHOUT registering a `LiveCollabInterceptor`!) MUST be blocked while `'fenced'`!
     let base = "# Crash Doc\n\nInitial.\n";
@@ -3459,6 +3720,7 @@ async fn l7_sqlite_chats_jobs_collab_and_crash_fenced_recovery() {
         .close_collab_session(
             &make_budget(),
             CloseCollabSession {
+                unchanged_carrier_digest: None,
                 scope: crash_scope.clone(),
                 note: crash_note.clone(),
                 owner_id: Some("recovery-worker".to_owned()),
@@ -3467,7 +3729,9 @@ async fn l7_sqlite_chats_jobs_collab_and_crash_fenced_recovery() {
                 final_yrs_snapshot: Some(vec![42, 43]),
                 compacted_through_update_seq: Some(0),
                 carrier_settlement: Some(CollabCarrierSettlement {
-                    auth: owner_ctx(&crash_scope, owner.clone()).auth().clone(),
+                    actor: notarium_canonical::CollabSettlementActor::writer(
+                        owner_ctx(&crash_scope, owner.clone()).auth().clone(),
+                    ),
                     carrier: "# Crash Doc\n\nRecovered cleanly.\n".to_owned(),
                 }),
             },
@@ -3604,6 +3868,11 @@ async fn l7_postgres_s3_chats_jobs_and_collab_parity() {
         .unwrap();
     assert_eq!(persisted.session.room_state, CollabRoomState::Fenced);
     assert_eq!(persisted.updates.last().unwrap().update_bytes, vec![42]);
+    assert!(
+        successor
+            .room_fences()
+            .is_room_fenced(&scope.space_id, &note)
+    );
     successor
         .open_collab_session(
             &make_budget(),
@@ -4060,6 +4329,315 @@ async fn chat_receipts_preserve_body_and_reference_boundaries() {
                 appended.receipt.seq()
             );
         }
+        runtime.shutdown().await.unwrap();
+    }
+    fixtures.drop_pg_schema(&schema).await;
+}
+
+#[tokio::test]
+async fn batched_chat_search_hydration_handles_multi_thread_deep_chains_and_branches() {
+    let fixtures = StorageTestFixtures::load_required();
+    let schema = fixtures.fresh_pg_schema();
+    for postgres in [false, true] {
+        let root = TempDataRoot::new("chat-search-batched-hydration");
+        let installation = sample_installation_id(0x65);
+        let cfg = if postgres {
+            fixtures.pg_local_config(installation, &schema, root.data_root())
+        } else {
+            CanonicalConfig::local_default(installation, root.data_root())
+        };
+        let (store, runtime) = CanonicalRuntime::open(cfg).await.unwrap();
+        let scope = HistoryScope {
+            space_id: sample_space_id(0x65),
+            incarnation: sample_incarnation(0x65),
+        };
+        let owner = sample_principal_id(0x65);
+        store
+            .create_space(CreateSpaceSpec {
+                space_id: scope.space_id.clone(),
+                incarnation: scope.incarnation,
+                root_folder_id: sample_folder_id(0x65),
+                slug: "batched-chat-search".into(),
+                kind: SpaceKind::Personal,
+                owner: owner.clone(),
+                active_epoch: LeaseEpoch::new(1).unwrap(),
+                initial_last_seq: SpaceSeq::ZERO,
+                created_at: None,
+            })
+            .await
+            .unwrap();
+        let ctx = owner_ctx(&scope, owner.clone());
+
+        let t1 = sample_thread_id(0x71);
+        let t2 = sample_thread_id(0x72);
+        let t3 = sample_thread_id(0x73);
+        for (thread, title) in [
+            (&t1, "Deep Thread"),
+            (&t2, "Redacted Thread"),
+            (&t3, "Short Thread"),
+        ] {
+            store
+                .create_chat(
+                    ctx.clone(),
+                    next_mutation(
+                        &scope,
+                        &owner,
+                        CreateChat {
+                            thread: thread.clone(),
+                            kind: ChatThreadKind::Personal,
+                            owner: owner.clone(),
+                            project_folder: None,
+                            title: title.into(),
+                        },
+                    ),
+                )
+                .await
+                .unwrap();
+        }
+
+        // Thread 1: build depth 0..=19 (crossing anc_16_seq) plus an orphaned
+        // sibling branch off entry 3 so active head_leaf_seq is entry 20.
+        let mut parent = ThreadEntrySeq::ZERO;
+        let mut t1_e1 = ThreadEntrySeq::ZERO;
+        let mut t1_e3 = ThreadEntrySeq::ZERO;
+        for step in 1..=3u32 {
+            let entry = store
+                .append_chat(
+                    ctx.clone(),
+                    next_mutation(
+                        &scope,
+                        &owner,
+                        AppendChat {
+                            tool_calls: Vec::new(),
+                            provenance: None,
+                            interruption: None,
+                            proposed_diff: None,
+                            thread: t1.clone(),
+                            parent,
+                            kind: ChatEntryKind::Human,
+                            body: ChatInputBody::Text(format!("t1 entry {step}")),
+                            referenced_notes: Vec::new(),
+                            tainted: false,
+                        },
+                    ),
+                )
+                .await
+                .unwrap()
+                .value;
+            if step == 1 {
+                t1_e1 = entry.seq;
+            }
+            if step == 3 {
+                t1_e3 = entry.seq;
+            }
+            parent = entry.seq;
+        }
+        let t1_orphan = store
+            .append_chat(
+                ctx.clone(),
+                next_mutation(
+                    &scope,
+                    &owner,
+                    AppendChat {
+                        tool_calls: Vec::new(),
+                        provenance: None,
+                        interruption: None,
+                        proposed_diff: None,
+                        thread: t1.clone(),
+                        parent: t1_e3,
+                        kind: ChatEntryKind::Model,
+                        body: ChatInputBody::Text("t1 orphaned sibling".into()),
+                        referenced_notes: Vec::new(),
+                        tainted: false,
+                    },
+                ),
+            )
+            .await
+            .unwrap()
+            .value
+            .seq;
+        parent = t1_e3;
+        for step in 4..=20u32 {
+            parent = store
+                .append_chat(
+                    ctx.clone(),
+                    next_mutation(
+                        &scope,
+                        &owner,
+                        AppendChat {
+                            tool_calls: Vec::new(),
+                            provenance: None,
+                            interruption: None,
+                            proposed_diff: None,
+                            thread: t1.clone(),
+                            parent,
+                            kind: ChatEntryKind::Human,
+                            body: ChatInputBody::Text(format!("t1 entry {step}")),
+                            referenced_notes: Vec::new(),
+                            tainted: false,
+                        },
+                    ),
+                )
+                .await
+                .unwrap()
+                .value
+                .seq;
+        }
+
+        // Thread 2: 5 entries with entry 2 redacted.
+        let mut t2_parent = ThreadEntrySeq::ZERO;
+        let mut t2_e1 = ThreadEntrySeq::ZERO;
+        let mut t2_e2 = ThreadEntrySeq::ZERO;
+        for step in 1..=5u32 {
+            let entry = store
+                .append_chat(
+                    ctx.clone(),
+                    next_mutation(
+                        &scope,
+                        &owner,
+                        AppendChat {
+                            tool_calls: Vec::new(),
+                            provenance: None,
+                            interruption: None,
+                            proposed_diff: None,
+                            thread: t2.clone(),
+                            parent: t2_parent,
+                            kind: ChatEntryKind::Human,
+                            body: ChatInputBody::Text(format!("t2 entry {step}")),
+                            referenced_notes: Vec::new(),
+                            tainted: false,
+                        },
+                    ),
+                )
+                .await
+                .unwrap()
+                .value;
+            if step == 1 {
+                t2_e1 = entry.seq;
+            }
+            if step == 2 {
+                t2_e2 = entry.seq;
+            }
+            t2_parent = entry.seq;
+        }
+        let t2_head = store
+            .read_chat(
+                ctx.clone(),
+                ChatRead {
+                    thread: t2.clone(),
+                    leaf: t2_parent,
+                    before: None,
+                    max_entries: PageLimit::new(2).unwrap(),
+                },
+            )
+            .await
+            .unwrap()
+            .thread;
+        store
+            .redact_chat_entry(
+                ctx.clone(),
+                next_mutation(
+                    &scope,
+                    &owner,
+                    RedactChatEntry {
+                        thread: t2.clone(),
+                        entry: t2_e2,
+                        expected_thread_revision: t2_head.revision,
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+
+        // Thread 3: 4 entries.
+        let mut t3_parent = ThreadEntrySeq::ZERO;
+        let mut t3_e2 = ThreadEntrySeq::ZERO;
+        for step in 1..=4u32 {
+            let entry = store
+                .append_chat(
+                    ctx.clone(),
+                    next_mutation(
+                        &scope,
+                        &owner,
+                        AppendChat {
+                            tool_calls: Vec::new(),
+                            provenance: None,
+                            interruption: None,
+                            proposed_diff: None,
+                            thread: t3.clone(),
+                            parent: t3_parent,
+                            kind: ChatEntryKind::Model,
+                            body: ChatInputBody::Text(format!("t3 entry {step}")),
+                            referenced_notes: Vec::new(),
+                            tainted: false,
+                        },
+                    ),
+                )
+                .await
+                .unwrap()
+                .value;
+            if step == 2 {
+                t3_e2 = entry.seq;
+            }
+            t3_parent = entry.seq;
+        }
+        let t3_tip = t3_parent;
+
+        let candidates = vec![
+            (t1.clone(), t1_e1),
+            (t1.clone(), t1_orphan),
+            (t2.clone(), t2_e2),
+            (t2.clone(), t2_e1),
+            (t3.clone(), t3_tip),
+            (t3.clone(), t3_e2),
+        ];
+
+        let visible = store
+            .visible_chat_hit_keys(&ctx, &candidates)
+            .await
+            .unwrap();
+        assert_eq!(
+            visible,
+            vec![
+                (t1.clone(), t1_e1),
+                (t2.clone(), t2_e1),
+                (t3.clone(), t3_tip),
+                (t3.clone(), t3_e2),
+            ]
+        );
+
+        let (page, truncated) = store
+            .hydrate_live_visible_chat_hits(&ctx, &candidates, PageLimit::new(2).unwrap())
+            .await
+            .unwrap();
+        assert!(truncated);
+        assert_eq!(page.len(), 2);
+        assert_eq!(
+            (&page[0].thread, page[0].entry, page[0].text.as_str()),
+            (&t1, t1_e1, "t1 entry 1")
+        );
+        assert_eq!(
+            (&page[1].thread, page[1].entry, page[1].text.as_str()),
+            (&t2, t2_e1, "t2 entry 1")
+        );
+
+        let (full, truncated_full) = store
+            .hydrate_live_visible_chat_hits(&ctx, &candidates, PageLimit::new(4).unwrap())
+            .await
+            .unwrap();
+        assert!(!truncated_full);
+        assert_eq!(
+            full.iter()
+                .map(|hit| (hit.thread.clone(), hit.entry, hit.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (t1.clone(), t1_e1, "t1 entry 1"),
+                (t2.clone(), t2_e1, "t2 entry 1"),
+                (t3.clone(), t3_tip, "t3 entry 4"),
+                (t3.clone(), t3_e2, "t3 entry 2"),
+            ]
+        );
+
         runtime.shutdown().await.unwrap();
     }
     fixtures.drop_pg_schema(&schema).await;

@@ -1,6 +1,7 @@
 mod compaction;
 mod content;
 mod queue;
+pub mod search;
 mod staging;
 mod submission;
 
@@ -719,49 +720,23 @@ fn forbid_keeper_chat_mutation(auth: &EngineAuthContext) -> Result<(), PortError
     Ok(())
 }
 
-pub(crate) fn authorize_thread_read(
-    auth: &EngineAuthContext,
-    space: &Space,
-    thread: &ChatThreadId,
-    kind: ChatThreadKind,
-    owner: &PrincipalId,
-    project: Option<&FolderId>,
-    tainted: bool,
-) -> Result<(), PortError> {
-    if kind != ChatThreadKind::SpaceGroup && owner != auth.principal() {
-        return Err(DomainError::ResourceNotFound.into());
-    }
-    if (matches!(auth.kind(), PrincipalKind::Keeper(_)) || auth.keeper_log().is_some())
-        && (kind != ChatThreadKind::KeeperLog
-            || auth.keeper_log() != Some(thread)
-            || auth
-                .spaces()
-                .get(&space.id)
-                .and_then(|grant| grant.project_root.as_ref())
-                != project)
-    {
-        return Err(DomainError::ResourceNotFound.into());
-    }
-    Ok(auth.authorize_chat_read(space, project, tainted)?)
-}
-
 /// Change listings have no selected leaf, so use the live thread audit state.
-pub(crate) async fn authorize_live_thread_read_tx(
+pub(crate) async fn can_view_live_thread_tx(
     tx: &mut BackendConn<'_>,
     space: &Space,
     auth: &EngineAuthContext,
     thread: &ChatThreadId,
-) -> Result<(), PortError> {
+) -> Result<bool, PortError> {
     let head = load_thread_head_tx(tx, &space.id, thread).await?;
-    authorize_thread_read(
-        auth,
+    auth.can_view_chat_thread(
         space,
         thread,
         head.kind,
         &head.owner,
         head.project_folder.as_ref(),
         head.tainted_mask != 0,
-    )
+    )?;
+    Ok(head.tainted_mask != 0)
 }
 
 pub(crate) async fn authorize_chat_replay_tx(
@@ -800,20 +775,23 @@ fn authorize_thread_mutation(
     {
         return Err(DomainError::SpaceReadOnly.into());
     }
-    if (auth.taint().is_tainted() || tainted)
-        && (th.kind == ChatThreadKind::SpaceGroup || space.kind == SpaceKind::Shared)
-    {
-        return Err(DomainError::CrossSpaceTainted.into());
-    }
-    authorize_thread_read(
-        auth,
+    // Verify visibility and Personal-chat ownership before taint checks so a
+    // tainted caller cannot distinguish a foreign Personal thread from absent.
+    auth.can_view_chat_thread(
         space,
         &th.thread_id,
         th.kind,
         &th.owner,
         th.project_folder.as_ref(),
         tainted,
-    )
+    )?;
+    if (auth.taint().is_tainted() || tainted)
+        && (th.kind == ChatThreadKind::SpaceGroup || space.kind == SpaceKind::Shared)
+    {
+        return Err(DomainError::CrossSpaceTainted.into());
+    }
+    auth.mark_chat_read_taint(space, tainted);
+    Ok(())
 }
 
 async fn read_leaf_taint(
@@ -845,6 +823,215 @@ struct ThreadHeadRow {
     active_run_epoch: Option<LeaseEpoch>,
     active_run_generation: Option<String>,
     tainted_mask: i64,
+}
+
+#[allow(clippy::type_complexity)]
+fn parse_thread_head_row(
+    thread_id: ChatThreadId,
+    raw: (
+        String,
+        String,
+        Option<String>,
+        String,
+        i64,
+        String,
+        i64,
+        Option<String>,
+        i64,
+        Option<i64>,
+        Option<String>,
+    ),
+) -> Result<ThreadHeadRow, PortError> {
+    let (
+        kind_raw,
+        owner_raw,
+        proj_opt,
+        title,
+        head_leaf_raw,
+        head_rev_raw,
+        next_entry_raw,
+        run_opt,
+        tainted_mask,
+        raw_epoch,
+        active_run_generation,
+    ) = raw;
+    let kind = chat_thread_kind_from_db(&kind_raw)?;
+    let owner = PrincipalId::parse(&owner_raw)
+        .map_err(|_| internal_not_committed("corrupt_thread_owner", "invalid owner_id"))?;
+    let project_folder = match proj_opt {
+        Some(s) => Some(
+            FolderId::parse(&s)
+                .map_err(|_| internal_not_committed("corrupt_thread_proj", "invalid FolderId"))?,
+        ),
+        None => None,
+    };
+    let head_leaf_seq = ThreadEntrySeq::new(
+        u64::try_from(head_leaf_raw)
+            .map_err(|_| internal_not_committed("corrupt_head_leaf", "negative head_leaf_seq"))?,
+    )?;
+    let head_rev_id = RevisionId::parse(&head_rev_raw)
+        .map_err(|_| internal_not_committed("corrupt_thread_rev", "invalid head_rev_id"))?;
+    let next_entry_seq =
+        ThreadEntrySeq::new(u64::try_from(next_entry_raw).map_err(|_| {
+            internal_not_committed("corrupt_next_entry", "negative next_entry_seq")
+        })?)?;
+    let active_run_id = match run_opt {
+        Some(s) => Some(
+            AgentRunId::parse(&s)
+                .map_err(|_| internal_not_committed("corrupt_thread_run", "invalid AgentRunId"))?,
+        ),
+        None => None,
+    };
+
+    Ok(ThreadHeadRow {
+        thread_id,
+        kind,
+        owner,
+        project_folder,
+        title,
+        head_leaf_seq,
+        head_rev_id,
+        next_entry_seq,
+        active_run_id,
+        active_run_epoch: raw_epoch
+            .map(|epoch| LeaseEpoch::new(epoch as u64))
+            .transpose()?,
+        active_run_generation,
+        tainted_mask,
+    })
+}
+
+async fn load_thread_heads_batch_tx(
+    tx: &mut BackendConn<'_>,
+    space_id: &SpaceId,
+    thread_ids: &[ChatThreadId],
+) -> Result<std::collections::BTreeMap<ChatThreadId, ThreadHeadRow>, PortError> {
+    let mut out = std::collections::BTreeMap::new();
+    if thread_ids.is_empty() {
+        return Ok(out);
+    }
+    #[allow(clippy::type_complexity)]
+    let rows: Vec<(
+        String,
+        String,
+        String,
+        Option<String>,
+        String,
+        i64,
+        String,
+        i64,
+        Option<String>,
+        i64,
+        Option<i64>,
+        Option<String>,
+    )> = match tx {
+        BackendConn::Sqlite(conn) => {
+            let mut acc = Vec::with_capacity(thread_ids.len());
+            for chunk in thread_ids.chunks(200) {
+                let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+                    "SELECT thread_id, kind, owner_id, project_folder_id, title, head_leaf_seq,
+                            head_rev_id, next_entry_seq, active_run_id, ext_space_tainted_mask,
+                            active_run_epoch, active_run_generation
+                     FROM chat_threads WHERE space_id = ",
+                );
+                qb.push_bind(space_id.as_str());
+                qb.push(" AND thread_id IN (");
+                let mut sep = qb.separated(", ");
+                for id in chunk {
+                    sep.push_bind(id.as_str());
+                }
+                qb.push(")");
+                let part = qb.build().fetch_all(&mut **conn).await.map_err(|err| {
+                    internal_not_committed("sqlite_load_threads_batch", err.to_string())
+                })?;
+                for row in part {
+                    acc.push((
+                        row.get("thread_id"),
+                        row.get("kind"),
+                        row.get("owner_id"),
+                        row.get("project_folder_id"),
+                        row.get("title"),
+                        row.get("head_leaf_seq"),
+                        row.get("head_rev_id"),
+                        row.get("next_entry_seq"),
+                        row.get("active_run_id"),
+                        row.get("ext_space_tainted_mask"),
+                        row.get("active_run_epoch"),
+                        row.get("active_run_generation"),
+                    ));
+                }
+            }
+            acc
+        }
+        BackendConn::Postgres(conn) => {
+            let id_strs: Vec<&str> = thread_ids.iter().map(ChatThreadId::as_str).collect();
+            let part = sqlx::query(
+                "SELECT thread_id, kind, owner_id, project_folder_id, title, head_leaf_seq,
+                        head_rev_id, next_entry_seq, active_run_id, ext_space_tainted_mask::BIGINT AS tainted_mask,
+                        active_run_epoch, active_run_generation
+                 FROM chat_threads WHERE space_id = $1 AND thread_id = ANY($2)",
+            )
+            .bind(space_id.as_str())
+            .bind(&id_strs)
+            .fetch_all(&mut **conn)
+            .await
+            .map_err(|err| crate::runtime::pg_read_error("pg_load_threads_batch", err))?;
+            part.into_iter()
+                .map(|row| {
+                    (
+                        row.get("thread_id"),
+                        row.get("kind"),
+                        row.get("owner_id"),
+                        row.get("project_folder_id"),
+                        row.get("title"),
+                        row.get("head_leaf_seq"),
+                        row.get("head_rev_id"),
+                        row.get("next_entry_seq"),
+                        row.get("active_run_id"),
+                        row.get("tainted_mask"),
+                        row.get("active_run_epoch"),
+                        row.get("active_run_generation"),
+                    )
+                })
+                .collect()
+        }
+    };
+    for (
+        thread_raw,
+        kind_raw,
+        owner_raw,
+        proj_opt,
+        title,
+        head_leaf_raw,
+        head_rev_raw,
+        next_entry_raw,
+        run_opt,
+        tainted_mask,
+        raw_epoch,
+        active_run_generation,
+    ) in rows
+    {
+        let thread_id = ChatThreadId::parse(&thread_raw)
+            .map_err(|_| internal_not_committed("corrupt_thread_id", "invalid thread_id"))?;
+        let head = parse_thread_head_row(
+            thread_id.clone(),
+            (
+                kind_raw,
+                owner_raw,
+                proj_opt,
+                title,
+                head_leaf_raw,
+                head_rev_raw,
+                next_entry_raw,
+                run_opt,
+                tainted_mask,
+                raw_epoch,
+                active_run_generation,
+            ),
+        )?;
+        out.insert(thread_id, head);
+    }
+    Ok(out)
 }
 
 async fn load_thread_head_opt_tx(
@@ -924,69 +1111,8 @@ async fn load_thread_head_opt_tx(
         }
     };
 
-    let Some((
-        kind_raw,
-        owner_raw,
-        proj_opt,
-        title,
-        head_leaf_raw,
-        head_rev_raw,
-        next_entry_raw,
-        run_opt,
-        tainted_mask,
-        raw_epoch,
-        active_run_generation,
-    )) = raw
-    else {
-        return Ok(None);
-    };
-
-    let kind = chat_thread_kind_from_db(&kind_raw)?;
-    let owner = PrincipalId::parse(&owner_raw)
-        .map_err(|_| internal_not_committed("corrupt_thread_owner", "invalid owner_id"))?;
-    let project_folder = match proj_opt {
-        Some(s) => Some(
-            FolderId::parse(&s)
-                .map_err(|_| internal_not_committed("corrupt_thread_proj", "invalid FolderId"))?,
-        ),
-        None => None,
-    };
-    let head_leaf_seq = ThreadEntrySeq::new(
-        u64::try_from(head_leaf_raw)
-            .map_err(|_| internal_not_committed("corrupt_head_leaf", "negative head_leaf_seq"))?,
-    )?;
-    let head_rev_id = RevisionId::parse(&head_rev_raw)
-        .map_err(|_| internal_not_committed("corrupt_thread_rev", "invalid head_rev_id"))?;
-    let next_entry_seq =
-        ThreadEntrySeq::new(u64::try_from(next_entry_raw).map_err(|_| {
-            internal_not_committed("corrupt_next_entry", "negative next_entry_seq")
-        })?)?;
-    let active_run_id = match run_opt {
-        Some(s) => Some(
-            AgentRunId::parse(&s)
-                .map_err(|_| internal_not_committed("corrupt_thread_run", "invalid AgentRunId"))?,
-        ),
-        None => None,
-    };
-
-    let active_run_epoch = raw_epoch
-        .map(|epoch| LeaseEpoch::new(epoch as u64))
-        .transpose()?;
-
-    Ok(Some(ThreadHeadRow {
-        thread_id: thread_id.clone(),
-        kind,
-        owner,
-        project_folder,
-        title,
-        head_leaf_seq,
-        head_rev_id,
-        next_entry_seq,
-        active_run_id,
-        active_run_epoch,
-        active_run_generation,
-        tainted_mask,
-    }))
+    raw.map(|row| parse_thread_head_row(thread_id.clone(), row))
+        .transpose()
 }
 
 async fn load_thread_head_tx(
@@ -1465,10 +1591,10 @@ async fn read_chat_impl(
                 srec.scope.check(&scope)?;
 
                 let th = load_thread_head_tx(tx, &scope.space_id, &request.thread).await?;
-                authorize_thread_read(&auth, &srec.space, &request.thread, th.kind,
+                auth.can_view_chat_thread(&srec.space, &request.thread, th.kind,
                     &th.owner, th.project_folder.as_ref(), false)?;
                 let thread_tainted = read_leaf_taint(tx, &scope.space_id, &request.thread, request.leaf).await?;
-                authorize_thread_read(&auth, &srec.space, &request.thread, th.kind,
+                auth.authorize_chat_thread_read(&srec.space, &request.thread, th.kind,
                     &th.owner, th.project_folder.as_ref(), thread_tainted)?;
 
                 let thread_out = ChatThread {
@@ -1775,7 +1901,14 @@ async fn read_chat_impl(
                     })?;
                     let entry_taint = taint_raw != 0;
                     if entry_taint {
-                        auth.authorize_chat_read(&srec.space, thread_out.project_folder.as_ref(), true)?;
+                        auth.authorize_chat_thread_read(
+                            &srec.space,
+                            &thread_out.id,
+                            thread_out.kind,
+                            &thread_out.owner,
+                            thread_out.project_folder.as_ref(),
+                            true,
+                        )?;
                     }
 
                     entries.push(ChatEntry {
@@ -1965,8 +2098,7 @@ async fn read_chat_pg_single_query(
     )?;
     let th_rev = RevisionId::parse(ct_head_rev_raw)
         .map_err(|_| internal_not_committed("corrupt_thread_rev", "invalid head_rev_id"))?;
-    authorize_thread_read(
-        auth,
+    auth.can_view_chat_thread(
         &space,
         &request.thread,
         th_kind,
@@ -1981,8 +2113,7 @@ async fn read_chat_pg_single_query(
     }
 
     let thread_tainted = hdr.get::<i32, usize>(19) != 0;
-    authorize_thread_read(
-        auth,
+    auth.authorize_chat_thread_read(
         &space,
         &request.thread,
         th_kind,
@@ -2088,7 +2219,14 @@ async fn read_chat_pg_single_query(
             .map_err(|_| internal_not_committed("corrupt_chat_depth", "invalid depth"))?;
         let entry_taint = taint_raw != 0;
         if entry_taint {
-            auth.authorize_chat_read(&space, thread_out.project_folder.as_ref(), true)?;
+            auth.authorize_chat_thread_read(
+                &space,
+                &thread_out.id,
+                thread_out.kind,
+                &thread_out.owner,
+                thread_out.project_folder.as_ref(),
+                true,
+            )?;
         }
 
         Ok(ChatEntry {
@@ -2201,8 +2339,7 @@ fn read_chat_rusqlite(
             }
         };
 
-    authorize_thread_read(
-        auth,
+    auth.can_view_chat_thread(
         &srec.space,
         &request.thread,
         th.kind,
@@ -2234,8 +2371,7 @@ fn read_chat_rusqlite(
         .ok_or(DomainError::ResourceNotFound)?
             != 0
     };
-    authorize_thread_read(
-        auth,
+    auth.authorize_chat_thread_read(
         &srec.space,
         &request.thread,
         th.kind,
@@ -2503,7 +2639,14 @@ fn read_chat_rusqlite(
             .map_err(|_| internal_not_committed("corrupt_chat_depth", "invalid depth"))?;
         let entry_taint = taint_raw != 0;
         if entry_taint {
-            auth.authorize_chat_read(&srec.space, thread_out.project_folder.as_ref(), true)?;
+            auth.authorize_chat_thread_read(
+                &srec.space,
+                &thread_out.id,
+                thread_out.kind,
+                &thread_out.owner,
+                thread_out.project_folder.as_ref(),
+                true,
+            )?;
         }
 
         entries.push(ChatEntry {
@@ -2610,8 +2753,7 @@ async fn create_chat_impl(
                 {
                     return Err(DomainError::SpaceReadOnly.into());
                 }
-                authorize_thread_read(
-                    &auth,
+                auth.authorize_chat_thread_read(
                     &live_space.space,
                     &input.thread,
                     input.kind,
@@ -3667,7 +3809,15 @@ async fn insert_chat_entry_row_tx(
             .map_err(|err| internal_not_committed("pg_insert_chat_entry", err.to_string()))?;
         }
     }
-    Ok(())
+    crate::projection_chat::write_chat_note_refs_json_tx(
+        tx,
+        space_id.as_str(),
+        thread_id.as_str(),
+        e_i64,
+        cseq_i64,
+        refs_json,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4536,8 +4686,11 @@ async fn consume_chat_input_impl(
                     return Err(DomainError::CrossSpaceTainted.into());
                 }
 
-                auth.authorize_chat_read(
+                auth.authorize_chat_thread_read(
                     &live_space.space,
+                    &th.thread_id,
+                    th.kind,
+                    &th.owner,
                     th.project_folder.as_ref(),
                     effective_tainted,
                 )?;
@@ -4780,6 +4933,22 @@ async fn wait_for_redaction_gc(
     }
 }
 
+async fn finish_redacted_projection_replay(
+    store: &CanonicalStore,
+    committed: &Committed<RedactedChat>,
+    budget: &notarium_core::ports::CallBudget,
+    deadline: &crate::domain::common::CommandDeadline,
+) -> Result<(), PortError> {
+    deadline
+        .wait(budget, || {
+            store.retry_redacted_chat_cleanup(committed, budget)
+        })
+        .await
+        .map_err(|error| {
+            crate::codec::unknown_commit_outcome("redaction_projection_cleanup", error.to_string())
+        })?
+}
+
 async fn redact_chat_entry_impl(
     store: &CanonicalStore,
     ctx: SpaceContext,
@@ -4826,6 +4995,7 @@ async fn redact_chat_entry_impl(
             .await?
     {
         let (committed, zero_refs) = replayed.into_committed();
+        finish_redacted_projection_replay(store, &committed, &ctx.budget, &deadline).await?;
         if !zero_refs.is_empty() {
             // A receipt from an older writer can refer to bytes released before
             // it gained transactional GC. Reconciliation on open/lease also covers these.
@@ -4853,6 +5023,8 @@ async fn redact_chat_entry_impl(
 
     let cleanup_store = store.clone();
     let (attempted, first_attempt) = tokio::sync::oneshot::channel();
+    let committed_in_writer = Arc::new(AtomicBool::new(false));
+    let observe_commit = Arc::clone(&committed_in_writer);
     let intent = PreparedWriteIntent {
         scope: scope.clone(),
         active_epoch,
@@ -4936,7 +5108,7 @@ async fn redact_chat_entry_impl(
                              SET kind = 'redacted', tool_call_id = NULL, inline_text = NULL,
                                  payload_blake3 = NULL, referenced_notes_json = '[]',
                                  provenance_json = NULL, body_format = 0,
-                                 is_chain_node = 1, redacted_at_seq = ?
+                                 is_chain_node = 1, redacted_at_seq = COALESCE(redacted_at_seq, ?)
                              WHERE space_id = ? AND thread_id = ? AND entry_seq = ?",
                         )
                         .bind(seq_i64)
@@ -4955,7 +5127,7 @@ async fn redact_chat_entry_impl(
                              SET kind = 'redacted', tool_call_id = NULL, inline_text = NULL,
                                  payload_blake3 = NULL, referenced_notes_json = '[]',
                                  provenance_json = NULL, body_format = 0,
-                                 is_chain_node = 1, redacted_at_seq = $1
+                                 is_chain_node = 1, redacted_at_seq = COALESCE(redacted_at_seq, $1)
                              WHERE space_id = $2 AND thread_id = $3 AND entry_seq = $4",
                         )
                         .bind(seq_i64)
@@ -4970,7 +5142,15 @@ async fn redact_chat_entry_impl(
                     }
                 }
 
-                // Release CAS reference owned by this chat entry!
+                crate::projection_chat::clear_chat_note_refs_tx(
+                    tx,
+                    &scope.space_id,
+                    &input.thread,
+                    entry_i64,
+                )
+                .await?;
+
+                // Release the CAS reference owned by this chat entry.
                 let entry_owner = format!("{}:{}", input.thread.as_str(), input.entry.get());
                 let mut zero_ref_digests = release_owner_blob_refs_tx(
                     tx,
@@ -5131,6 +5311,7 @@ async fn redact_chat_entry_impl(
                     Vec::new(),
                 )?;
 
+                item_ctx.on_commit(move || observe_commit.store(true, Ordering::Release));
                 Ok(ItemCommitArtifacts {
                     command_id: cmd_id,
                     command_kind: "redact_chat_entry".to_owned(),
@@ -5155,6 +5336,9 @@ async fn redact_chat_entry_impl(
 
     let stored: StoredCommittedRedactedChatV1 = deadline.submit(store, &ctx.budget, intent).await?;
     let (committed, zero_refs) = stored.into_committed();
+    if !committed_in_writer.load(Ordering::Acquire) {
+        finish_redacted_projection_replay(store, &committed, &ctx.budget, &deadline).await?;
+    }
     if !zero_refs.is_empty() {
         wait_for_redaction_gc(
             &ctx.budget,
@@ -5382,7 +5566,7 @@ async fn mark_descendant_compactions_stale_tx(
             BackendConn::Sqlite(conn) => {
                 sqlx::query_scalar(
                     "UPDATE chat_entries SET checkpoint_stale = 1, kind='redacted', inline_text=NULL,
-                            payload_blake3=NULL, referenced_notes_json='[]', provenance_json=NULL, body_format=0, redacted_at_seq=?4
+                            payload_blake3=NULL, referenced_notes_json='[]', provenance_json=NULL, body_format=0, redacted_at_seq=COALESCE(redacted_at_seq, ?4)
                      WHERE space_id = ?1 AND thread_id = ?2 AND entry_seq = ?3 RETURNING created_space_seq",
                 )
                 .bind(space_id.as_str())
@@ -5398,7 +5582,7 @@ async fn mark_descendant_compactions_stale_tx(
             BackendConn::Postgres(conn) => {
                 sqlx::query_scalar(
                     "UPDATE chat_entries SET checkpoint_stale = 1, kind='redacted', inline_text=NULL,
-                            payload_blake3=NULL, referenced_notes_json='[]', provenance_json=NULL, body_format=0, redacted_at_seq=$4
+                            payload_blake3=NULL, referenced_notes_json='[]', provenance_json=NULL, body_format=0, redacted_at_seq=COALESCE(redacted_at_seq, $4)
                      WHERE space_id = $1 AND thread_id = $2 AND entry_seq = $3 RETURNING created_space_seq",
                 )
                 .bind(space_id.as_str())
@@ -5412,6 +5596,7 @@ async fn mark_descendant_compactions_stale_tx(
                 })?
             }
         };
+        crate::projection_chat::clear_chat_note_refs_tx(tx, space_id, thread_id, raw).await?;
         let owner = format!("{}:{raw}", thread_id.as_str());
         zero_refs.extend(
             release_owner_blob_refs_tx(tx, space_id, BlobOwnerKind::ChatEntry, &owner).await?,

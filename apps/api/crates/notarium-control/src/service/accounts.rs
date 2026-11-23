@@ -2,6 +2,7 @@ use super::{
     ControlService,
     authority::*,
     commands::{Command, SavedResult},
+    provider::SearchDefaultWitness,
 };
 use crate::store::{lease::OperationBudget, statements::execute};
 use notarium_core::{
@@ -31,11 +32,21 @@ impl ControlService {
             let now=self.clock.now_ms()?;
             let mut events=super::outbox::pending(tx.inner_mut(),RevocationSelector::Principal(request.input.account.clone())).await?;
             if request.input.disabled!=target.disabled_at.is_some() {
+                let defaults = if request.input.disabled {
+                    Vec::new()
+                } else {
+                    SearchDefaultWitness::before_owner_enable(tx.inner_mut(), &target.user_id, self.clock.as_ref()).await?
+                };
                 events.push(self.revoke_principal(tx.inner_mut(),&target,now).await?);
                 target.disabled_at=request.input.disabled.then_some(now);
                 target.revision=next(target.revision)?;
                 target.auth_version=next(target.auth_version)?;
                 execute!(tx.inner_mut(),"UPDATE users SET disabled_at=$1,revision=$2,auth_version=$3 WHERE user_id=$4","UPDATE v1_control.users SET disabled_at=$1,revision=$2,auth_version=$3 WHERE user_id=$4";target.disabled_at,target.revision,target.auth_version,&target.user_id)?;
+                for previous in defaults {
+                    if let Some(selector) = previous.changed(tx.inner_mut(), self.clock.now_ms()?).await? {
+                        events.push(super::outbox::enqueue(tx.inner_mut(), selector, RevocationReason::PermissionChanged, target.auth_version, now).await?);
+                    }
+                }
             }
             let value=account_info(&target)?;
             let revision=value.revision;

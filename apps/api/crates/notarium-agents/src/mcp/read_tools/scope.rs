@@ -3,6 +3,7 @@ use notarium_core::{
     error::PortError,
     ids::{EpisodeId, SpaceId, SpaceSeq},
     model::{FolderRef, HistoryScope},
+    receipt::{AwaitWatermarks, CausalBasis},
 };
 
 pub(super) struct ReadTarget {
@@ -10,6 +11,12 @@ pub(super) struct ReadTarget {
     pub slug: String,
     pub project: Option<FolderRef>,
     pub last_seq: SpaceSeq,
+}
+
+impl ReadTarget {
+    pub(super) fn causal(&self) -> CausalBasis {
+        CausalBasis::Await(AwaitWatermarks::at(self.scope.clone(), self.last_seq))
+    }
 }
 
 pub(super) async fn targets(

@@ -1,6 +1,6 @@
 use notarium_core::{
     ids::EpisodeId,
-    ports::{AgentOperation, ProviderToolDefinition, ProviderToolSchema},
+    ports::{AgentOperation, ProviderToolDefinition, ProviderToolSchema, RecallQuery},
 };
 use serde::Serialize;
 use serde_json::{Map, Value, json};
@@ -213,7 +213,7 @@ impl ToolName {
                 req("query", string(1, 8192)),
                 opt("project", key()),
                 opt("budgetTokens", integer(200, 32000)),
-                opt("depth", integer(0, 3)),
+                opt("depth", integer(0, i64::from(RecallQuery::MAX_GRAPH_DEPTH))),
                 opt("maxPerSource", integer(1, 32000)),
             ],
             CreateNote => {

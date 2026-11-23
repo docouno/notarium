@@ -48,7 +48,12 @@ async fn postgres_keeper_turn_reconsent() {
 
 async fn exercise(postgres: bool) {
     let mut fixture = RuntimeFixture::open_named(postgres, "keeper_turn").await;
+    let hub =
+        notarium_collab::CollabHub::new(fixture.canonical.clone(), Default::default()).unwrap();
+    hub.register().unwrap();
     Box::pin(keeper_turn_reconsent(&mut fixture)).await;
+    hub.shutdown(&budget()).await.unwrap();
+    drop(hub);
     fixture.close().await;
 }
 

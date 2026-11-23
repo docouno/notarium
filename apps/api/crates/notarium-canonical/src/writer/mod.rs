@@ -143,6 +143,21 @@ impl CommitAction {
     }
 }
 
+impl ItemCommitArtifacts {
+    pub(crate) fn unsequenced(response_bytes: Vec<u8>) -> Self {
+        Self {
+            command_id: String::new(),
+            command_kind: String::new(),
+            events: Vec::new(),
+            change_payload: None,
+            receipt_detail_blob: None,
+            receipt_sanitized_blob: Vec::new(),
+            receipt_owner_note_ids: Vec::new(),
+            response_bytes,
+        }
+    }
+}
+
 pub struct ItemExecCtx {
     pub scope: HistoryScope,
     pub space: notarium_core::auth::Space,
@@ -304,6 +319,40 @@ pub struct PreparedWriteIntent {
     pub execute: ItemExecuteFn,
 }
 
+struct BatchWriteIntent {
+    prepared: PreparedWriteIntent,
+    room_wal: Option<RoomWalMode>,
+}
+
+struct RoomWalMode {
+    /// PostgreSQL uses the expected writer lease. SQLite already owns the data root.
+    check_space_lease: bool,
+    replay_safe: bool,
+}
+
+impl From<PreparedWriteIntent> for BatchWriteIntent {
+    fn from(prepared: PreparedWriteIntent) -> Self {
+        Self {
+            prepared,
+            room_wal: None,
+        }
+    }
+}
+
+impl BatchWriteIntent {
+    fn expected_epoch(&self) -> Option<LeaseEpoch> {
+        match &self.room_wal {
+            Some(mode) if !mode.check_space_lease => None,
+            _ => Some(self.prepared.active_epoch),
+        }
+    }
+
+    fn replay_safe(&self) -> bool {
+        self.prepared.idempotency.is_some()
+            || self.room_wal.as_ref().is_some_and(|mode| mode.replay_safe)
+    }
+}
+
 type BatchGroupReply = Result<(Vec<Result<Vec<u8>, PortError>>, SpaceSeq), PortError>;
 
 enum QueuedWriteEntry {
@@ -311,6 +360,12 @@ enum QueuedWriteEntry {
         intent: PreparedWriteIntent,
         sqlite_fast_plan: Option<Box<dyn crate::sqlite_fast::SqliteSyncItemPlan>>,
         pg_fast_plan: Option<PgSingleItemFastFn>,
+        reservation: QueueReservation,
+        reply_tx: oneshot::Sender<Result<Vec<u8>, PortError>>,
+    },
+    RoomWal {
+        intent: BatchWriteIntent,
+        sqlite_fast_plan: Option<Box<dyn crate::sqlite_fast::SqliteSyncItemPlan>>,
         reservation: QueueReservation,
         reply_tx: oneshot::Sender<Result<Vec<u8>, PortError>>,
     },
@@ -322,12 +377,35 @@ enum QueuedWriteEntry {
     },
 }
 
-/// Deterministic fault hooks used only by L3/L5 adversarial tests; zero overhead in production.
+/// Deterministic fault hooks for storage tests.
 #[derive(Default)]
 pub struct WriterFaultState {
     pub drop_commit_response_once: AtomicBool,
+    #[cfg(feature = "test-support")]
+    pub rollback_commit_response_once: AtomicBool,
+    #[cfg(feature = "test-support")]
+    pub drop_room_open_response_once: AtomicBool,
+    #[cfg(feature = "test-support")]
+    pub room_wal_admission_pause_once: std::sync::Mutex<Option<RoomWalAdmissionPause>>,
+    #[cfg(feature = "test-support")]
+    pub planned_observation_pause_once: std::sync::Mutex<Option<PlannedObservationPause>>,
     pub pre_commit_space_delays: Mutex<HashMap<SpaceId, Duration>>,
 }
+
+#[cfg(feature = "test-support")]
+pub struct TestPauseGate {
+    pub entered: oneshot::Sender<()>,
+    pub release: oneshot::Receiver<()>,
+}
+
+#[cfg(feature = "test-support")]
+pub type RoomWalAdmissionPause = TestPauseGate;
+
+#[cfg(feature = "test-support")]
+pub type PlannedObservationPause = TestPauseGate;
+
+/// Holds the authors' live registrations while invoking the synchronous enqueue.
+pub type RoomWalAdmission<'a> = dyn Fn(&mut dyn FnMut()) -> Result<(), PortError> + Sync + 'a;
 
 /// Opt-in Phase-2 batch commit latency recorder (`(duration_ns, logical_items)`).
 #[derive(Default)]
@@ -535,6 +613,7 @@ pub struct WriteCoordinator {
 struct WriterWait<'a> {
     budget: &'a CallBudget,
     deadline: tokio::time::Instant,
+    room_wal_admission: Option<&'a RoomWalAdmission<'a>>,
 }
 
 impl<'a> WriterWait<'a> {
@@ -542,6 +621,29 @@ impl<'a> WriterWait<'a> {
         Self {
             budget,
             deadline: crate::runtime::deadline_after(tokio::time::Instant::now(), budget.remaining),
+            room_wal_admission: None,
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    async fn pause_room_wal_admission(
+        &self,
+        pause: RoomWalAdmissionPause,
+    ) -> Result<(), PortError> {
+        let abandoned = || {
+            cancelled_not_committed(
+                "writer_wal_admission_pause_abandoned",
+                "room WAL admission pause was abandoned before enqueue",
+            )
+        };
+        pause.entered.send(()).map_err(|_| abandoned())?;
+        tokio::select! {
+            biased;
+            _ = self.budget.cancellation.cancelled() => Err(abandoned()),
+            _ = tokio::time::sleep_until(self.deadline) => Err(deadline_not_committed(
+                "writer_wal_admission_pause_deadline", "room WAL admission pause expired before enqueue",
+            )),
+            result = pause.release => result.map_err(|_| abandoned()),
         }
     }
 
@@ -712,7 +814,7 @@ impl WriteCoordinator {
         self.submit_raw_opt_fast(
             inner,
             WriterWait::from_budget(budget),
-            intent,
+            intent.into(),
             None,
             None,
             None,
@@ -724,24 +826,29 @@ impl WriteCoordinator {
         &self,
         inner: &Arc<CanonicalInner>,
         wait: WriterWait<'_>,
-        mut intent: PreparedWriteIntent,
+        mut intent: BatchWriteIntent,
         sqlite_fast_plan: Option<Box<dyn crate::sqlite_fast::SqliteSyncItemPlan>>,
         pg_fast_plan: Option<PgSingleItemFastFn>,
         pretracked_guard: Option<ActiveWriteOpGuard>,
     ) -> Result<Vec<u8>, PortError> {
-        inner.check_writer_epoch(&intent.scope.space_id, intent.active_epoch)?;
+        let space = &intent.prepared.scope.space_id;
+        if let Some(expected) = intent.expected_epoch() {
+            inner.check_writer_epoch(space, expected)?;
+        }
         let confirmed_step = intent
+            .prepared
             .idempotency
             .as_ref()
             .is_some_and(CommandIdentitySpec::has_confirmed_chat_step);
         let guarded = intent
+            .prepared
             .idempotency
             .as_ref()
             .and_then(CommandIdentitySpec::canonical_effect)
             .is_some();
         let sqlite_fast_plan = sqlite_fast_plan.and_then(|plan| {
             if confirmed_step || (guarded && !plan.supports_canonical_effect()) {
-                intent.execute = plan.into_async_exec();
+                intent.prepared.execute = plan.into_async_exec();
                 None
             } else {
                 Some(plan)
@@ -754,28 +861,68 @@ impl WriteCoordinator {
         };
         let _active_guard = match pretracked_guard {
             Some(g) => g,
-            None => self.enter_write_op(&intent.scope.space_id, 1),
+            None => self.enter_write_op(space, 1),
         };
         let (permit, reserved_bytes) = self
             .reserve_entry(
                 inner,
-                &intent.scope.space_id,
+                space,
                 wait.budget,
                 wait.deadline,
-                intent.staged_bytes,
+                intent.prepared.staged_bytes,
             )
             .await?;
-        let is_idempotent = intent.idempotency.is_some();
+        #[cfg(feature = "test-support")]
+        if intent.room_wal.is_some() {
+            let pause = self
+                .faults
+                .room_wal_admission_pause_once
+                .lock()
+                .expect("room WAL admission pause mutex")
+                .take();
+            if let Some(pause) = pause {
+                wait.pause_room_wal_admission(pause).await?;
+            }
+        }
+        let is_idempotent = intent.replay_safe();
 
         let (reply_tx, reply_rx) = oneshot::channel();
         // Once sent through `permit.send(...)`, the item is admitted: caller drop/cancel NEVER aborts commit!
-        permit.send(QueuedWriteEntry::Single {
-            intent,
-            sqlite_fast_plan,
-            pg_fast_plan,
-            reservation: reserved_bytes,
-            reply_tx,
-        });
+        let entry = if intent.room_wal.is_some() {
+            debug_assert!(pg_fast_plan.is_none());
+            QueuedWriteEntry::RoomWal {
+                intent,
+                sqlite_fast_plan,
+                reservation: reserved_bytes,
+                reply_tx,
+            }
+        } else {
+            QueuedWriteEntry::Single {
+                intent: intent.prepared,
+                sqlite_fast_plan,
+                pg_fast_plan,
+                reservation: reserved_bytes,
+                reply_tx,
+            }
+        };
+        if let Some(admit) = wait.room_wal_admission {
+            let mut pending = Some((permit, entry));
+            let result = admit(&mut || {
+                if let Some((permit, entry)) = pending.take() {
+                    permit.send(entry);
+                }
+            });
+            // The durable writer reply owns the outcome once enqueue succeeds.
+            if pending.is_some() {
+                result?;
+                return Err(internal_not_committed(
+                    "writer_room_wal_not_enqueued",
+                    "room WAL admission returned without enqueueing",
+                ));
+            }
+        } else {
+            permit.send(entry);
+        }
 
         match wait.acknowledgement(reply_rx).await {
             Some(outcome) => outcome,
@@ -1052,8 +1199,12 @@ impl crate::CanonicalStore {
         let raw_bytes = writer
             .submit_raw_opt_fast(
                 &self.inner,
-                WriterWait { budget, deadline },
-                intent,
+                WriterWait {
+                    budget,
+                    deadline,
+                    room_wal_admission: None,
+                },
+                intent.into(),
                 sqlite_fast_plan,
                 pg_fast_plan,
                 pretracked_guard,
@@ -1064,6 +1215,50 @@ impl crate::CanonicalStore {
                 unknown_commit_outcome("decode_writer_command_outcome", err.to_string())
             } else {
                 unknown_commit_non_idempotent("decode_writer_command_outcome", err.to_string())
+            }
+        })
+    }
+
+    pub(crate) async fn submit_room_wal(
+        &self,
+        budget: &CallBudget,
+        deadline: tokio::time::Instant,
+        mut intent: PreparedWriteIntent,
+        replay_safe: bool,
+        sqlite_fast_plan: Option<Box<dyn crate::sqlite_fast::SqliteSyncItemPlan>>,
+        room_wal_admission: Option<&RoomWalAdmission<'_>>,
+    ) -> Result<u64, PortError> {
+        let check_space_lease = matches!(&self.inner.sql, SqlDriverState::Postgres { .. });
+        if check_space_lease {
+            intent.active_epoch = self.inner.writer_epoch(&intent.scope.space_id)?;
+        }
+        let raw = self
+            .inner
+            .writer()?
+            .submit_raw_opt_fast(
+                &self.inner,
+                WriterWait {
+                    budget,
+                    deadline,
+                    room_wal_admission,
+                },
+                BatchWriteIntent {
+                    prepared: intent,
+                    room_wal: Some(RoomWalMode {
+                        check_space_lease,
+                        replay_safe,
+                    }),
+                },
+                sqlite_fast_plan,
+                None,
+                None,
+            )
+            .await?;
+        rmp_serde::from_slice(&raw).map_err(|error| {
+            if replay_safe {
+                unknown_commit_outcome("decode_room_wal_outcome", error.to_string())
+            } else {
+                unknown_commit_non_idempotent("decode_room_wal_outcome", error.to_string())
             }
         })
     }
@@ -1141,14 +1336,14 @@ impl crate::CanonicalStore {
 
 fn entry_logical_len(entry: &QueuedWriteEntry) -> usize {
     match entry {
-        QueuedWriteEntry::Single { .. } => 1,
+        QueuedWriteEntry::Single { .. } | QueuedWriteEntry::RoomWal { .. } => 1,
         QueuedWriteEntry::Group { intents, .. } => intents.len().max(1),
     }
 }
 
 fn reject_queued_entry(entry: QueuedWriteEntry, err: PortError) {
     match entry {
-        QueuedWriteEntry::Single { reply_tx, .. } => {
+        QueuedWriteEntry::Single { reply_tx, .. } | QueuedWriteEntry::RoomWal { reply_tx, .. } => {
             let _ = reply_tx.send(Err(err));
         }
         QueuedWriteEntry::Group { reply_tx, .. } => {
@@ -1178,6 +1373,9 @@ async fn run_batch_worker_loop(
 
     loop {
         let next = if let Some((id, registry)) = &pg_space {
+            if rx.is_empty() {
+                cached_pg_conn = None;
+            }
             match tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
                 Ok(entry) => entry,
                 Err(_) => {
@@ -1255,6 +1453,7 @@ async fn run_batch_worker_loop(
                     break;
                 }
 
+                cached_pg_conn = None;
                 tokio::select! {
                     biased;
                     maybe_entry = rx.recv() => {
@@ -1307,6 +1506,7 @@ async fn run_batch_worker_loop(
         }
         drop(_commit_read_guard);
         if rx.is_empty() {
+            cached_pg_conn = None;
             tokio::task::yield_now().await;
         }
     }
@@ -1320,6 +1520,8 @@ pub(crate) enum SpaceBatchEntry {
         persisted_initial_seq: SpaceSeq,
         effective_cut: SpaceSeq,
         max_purge_seq: Option<SpaceSeq>,
+        targets: crate::changes::CommittedTargetAcc,
+        changes: crate::projection_fence::VisibilityChanges,
     },
 }
 
@@ -1354,16 +1556,49 @@ async fn flush_single_batch(
         inner: Arc::clone(inner),
     };
 
+    let mut visibility_spaces = Vec::with_capacity(batch.len());
+    for entry in &batch {
+        match entry {
+            QueuedWriteEntry::Single { intent, .. } => {
+                visibility_spaces.push(intent.scope.space_id.clone());
+            }
+            QueuedWriteEntry::RoomWal { intent, .. } => {
+                visibility_spaces.push(intent.prepared.scope.space_id.clone());
+            }
+            QueuedWriteEntry::Group {
+                space_id, intents, ..
+            } => {
+                visibility_spaces.push(space_id.clone());
+                visibility_spaces
+                    .extend(intents.iter().map(|intent| intent.scope.space_id.clone()));
+            }
+        }
+    }
+    let mut visibility = match inner
+        .live_visibility
+        .try_for_write(visibility_spaces.clone())
+    {
+        Some(v) => v,
+        None => {
+            // Release any retained PG socket before awaiting gate locks so a
+            // gate holder waiting on pool.acquire() cannot AB-BA deadlock.
+            drop(cached_pg_conn.take());
+            inner.live_visibility.for_write(visibility_spaces).await
+        }
+    };
+
     let mut reserved_list = Vec::with_capacity(batch.len());
     let mut reply_targets = Vec::with_capacity(batch.len());
     let mut group_spaces = Vec::new();
     type UnpackedBatchItem = (
-        PreparedWriteIntent,
+        BatchWriteIntent,
         Option<Box<dyn crate::sqlite_fast::SqliteSyncItemPlan>>,
         Option<PgSingleItemFastFn>,
     );
     let mut items: Vec<UnpackedBatchItem> = Vec::with_capacity(batch.len());
 
+    // Mailbox admission can precede a local owner drain. This guard keeps the
+    // execution-time lease check ordered with revocation through SQL commit.
     for entry in batch {
         match entry {
             QueuedWriteEntry::Single {
@@ -1373,9 +1608,32 @@ async fn flush_single_batch(
                 reservation,
                 reply_tx,
             } => {
+                if let Err(error) =
+                    inner.check_writer_epoch(&intent.scope.space_id, intent.active_epoch)
+                {
+                    let _ = reply_tx.send(Err(error));
+                    continue;
+                }
                 reserved_list.push(reservation);
                 reply_targets.push(ReplyTarget::Single { reply_tx });
-                items.push((intent, sqlite_fast_plan, pg_fast_plan));
+                items.push((intent.into(), sqlite_fast_plan, pg_fast_plan));
+            }
+            QueuedWriteEntry::RoomWal {
+                intent,
+                sqlite_fast_plan,
+                reservation,
+                reply_tx,
+            } => {
+                if let Some(expected) = intent.expected_epoch()
+                    && let Err(error) =
+                        inner.check_writer_epoch(&intent.prepared.scope.space_id, expected)
+                {
+                    let _ = reply_tx.send(Err(error));
+                    continue;
+                }
+                reserved_list.push(reservation);
+                reply_targets.push(ReplyTarget::Single { reply_tx });
+                items.push((intent, sqlite_fast_plan, None));
             }
             QueuedWriteEntry::Group {
                 space_id,
@@ -1383,6 +1641,12 @@ async fn flush_single_batch(
                 reservation,
                 reply_tx,
             } => {
+                if let Err(error) = group_intents.iter().try_for_each(|intent| {
+                    inner.check_writer_epoch(&intent.scope.space_id, intent.active_epoch)
+                }) {
+                    let _ = reply_tx.send(Err(error));
+                    continue;
+                }
                 let count = group_intents.len();
                 let all_idempotent = group_intents.iter().all(|it| it.idempotency.is_some());
                 reserved_list.push(reservation);
@@ -1393,18 +1657,27 @@ async fn flush_single_batch(
                     all_idempotent,
                     reply_tx,
                 });
-                items.extend(group_intents.into_iter().map(|it| (it, None, None)));
+                items.extend(group_intents.into_iter().map(|it| (it.into(), None, None)));
             }
         }
     }
 
-    let exec_result = match &inner.sql {
+    if reply_targets.is_empty() {
+        return;
+    }
+    visibility.committing();
+    let mut exec_result = match &inner.sql {
         SqlDriverState::Sqlite { writer, .. } => {
+            #[cfg(feature = "test-support")]
+            let rollback_fault_armed = faults.rollback_commit_response_once.load(Ordering::Acquire);
+            #[cfg(not(feature = "test-support"))]
+            let rollback_fault_armed = false;
             // The native guarded rollback owns one transaction. Preserve the ordinary
             // per-item admission and rollback protocol in a mixed batch.
             let standalone_or_unguarded = items.len() == 1
                 || items.iter().all(|(intent, _, _)| {
                     intent
+                        .prepared
                         .idempotency
                         .as_ref()
                         .and_then(CommandIdentitySpec::canonical_effect)
@@ -1412,29 +1685,39 @@ async fn flush_single_batch(
                 });
             let can_fast = group_spaces.is_empty()
                 && standalone_or_unguarded
+                && !rollback_fault_armed
                 && items.iter().all(|(_, fp, _)| fp.is_some())
                 && faults.pre_commit_space_delays.lock().await.is_empty();
             let mut guard = writer.lock().await;
             match guard.as_mut() {
                 Some(pair) => {
-                    if can_fast {
-                        let sq_items = items.into_iter().map(|(it, fp, _)| (it, fp)).collect();
+                    if let Err(err) = store
+                        .inner
+                        .drain_pending_sqlite_commit_if_needed(pair)
+                        .await
+                    {
+                        BatchExecOutcome::AbortedBeforeCommit(err)
+                    } else if can_fast {
+                        let sq_items = items
+                            .into_iter()
+                            .map(|(it, fp, _)| (it.prepared, fp))
+                            .collect();
                         crate::sqlite_fast::execute_sqlite_fast_batch(
                             &store, pair, sq_items, cfg, faults,
                         )
                         .await
                     } else {
-                        let intents: Vec<PreparedWriteIntent> = items
+                        let intents = items
                             .into_iter()
                             .map(|(mut intent, fp_opt, _)| {
                                 if let Some(fp) = fp_opt {
-                                    intent.execute = fp.into_async_exec();
+                                    intent.prepared.execute = fp.into_async_exec();
                                 }
                                 intent
                             })
                             .collect();
                         let mut backend = BackendConn::Sqlite(&mut pair.sqlx_conn);
-                        let out = execute_batch_on_conn(
+                        execute_batch_on_conn(
                             &store,
                             &mut backend,
                             intents,
@@ -1442,12 +1725,7 @@ async fn flush_single_batch(
                             cfg,
                             faults,
                         )
-                        .await;
-                        inner.latch_sqlite_aux_tables_populated();
-                        inner
-                            .sqlite_writer_commit_gen
-                            .fetch_add(1, Ordering::Release);
-                        out
+                        .await
                     }
                 }
                 None => BatchExecOutcome::AbortedBeforeCommit(unavailable_retryable(
@@ -1473,7 +1751,7 @@ async fn flush_single_batch(
                     let out = if can_pg_fast {
                         let (mut intent, fp_opt, pg_fast_opt) = items.pop().expect("len == 1");
                         if let Some(fp) = fp_opt {
-                            intent.execute = fp.into_async_exec();
+                            intent.prepared.execute = fp.into_async_exec();
                         }
                         let pg_fast = pg_fast_opt.expect("is_some");
                         match pg_fast(&store, conn, cfg, faults).await {
@@ -1492,11 +1770,11 @@ async fn flush_single_batch(
                             }
                         }
                     } else {
-                        let intents: Vec<PreparedWriteIntent> = items
+                        let intents = items
                             .into_iter()
                             .map(|(mut intent, fp_opt, _)| {
                                 if let Some(fp) = fp_opt {
-                                    intent.execute = fp.into_async_exec();
+                                    intent.prepared.execute = fp.into_async_exec();
                                 }
                                 intent
                             })
@@ -1533,6 +1811,28 @@ async fn flush_single_batch(
         }
     };
 
+    match &exec_result {
+        BatchExecOutcome::Committed {
+            visibility_windows, ..
+        } => {
+            if visibility.needs_storage_read(&store, visibility_windows) {
+                // Release any retained writer socket before visibility refreshes
+                // so concurrent per-Space workers cannot exhaust the PG pool.
+                drop(cached_pg_conn.take());
+            }
+            if let Err(error) = visibility.published(&store, visibility_windows).await {
+                let BatchExecOutcome::Committed { slots, .. } = exec_result else {
+                    unreachable!("checking a committed batch");
+                };
+                exec_result = BatchExecOutcome::UnknownCommit {
+                    slots,
+                    diag_reason: format!("projection erasure pending: {error:?}"),
+                };
+            }
+        }
+        BatchExecOutcome::AbortedBeforeCommit(_) => visibility.aborted(),
+        BatchExecOutcome::UnknownCommit { .. } => visibility.invalidate(),
+    }
     drop(reserved_list);
 
     match exec_result {
@@ -1670,6 +1970,7 @@ pub(crate) enum BatchExecOutcome {
         slots: Vec<ItemOutcomeSlot>,
         space_effective_cuts: BTreeMap<SpaceId, SpaceSeq>,
         conn_clean: bool,
+        visibility_windows: Vec<crate::projection_fence::VisibilityWindow>,
     },
     UnknownCommit {
         slots: Vec<ItemOutcomeSlot>,
@@ -1678,14 +1979,43 @@ pub(crate) enum BatchExecOutcome {
     AbortedBeforeCommit(PortError),
 }
 
+pub(crate) fn visibility_windows(
+    _store: &crate::CanonicalStore,
+    states: &BTreeMap<SpaceId, SpaceBatchEntry>,
+) -> Vec<crate::projection_fence::VisibilityWindow> {
+    states
+        .values()
+        .filter_map(|entry| match entry {
+            SpaceBatchEntry::Loaded {
+                record,
+                persisted_initial_seq,
+                effective_cut,
+                changes,
+                ..
+            } => Some(crate::projection_fence::VisibilityWindow {
+                scope: record.scope.clone(),
+                after: *persisted_initial_seq,
+                through: *effective_cut,
+                changes: if persisted_initial_seq < effective_cut {
+                    *changes
+                } else {
+                    crate::projection_fence::VisibilityChanges::default()
+                },
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
 async fn execute_batch_on_conn(
     store: &crate::CanonicalStore,
     tx: &mut BackendConn<'_>,
-    intents: Vec<PreparedWriteIntent>,
+    intents: Vec<BatchWriteIntent>,
     group_spaces: &[SpaceId],
     cfg: WriterConfig,
     faults: &WriterFaultState,
 ) -> BatchExecOutcome {
+    let is_sqlite = matches!(tx, BackendConn::Sqlite(_));
     let mut transaction = match WriteTransaction::begin(tx).await {
         Ok(transaction) => transaction,
         Err(err) => return BatchExecOutcome::AbortedBeforeCommit(err),
@@ -1717,6 +2047,7 @@ async fn execute_batch_on_conn(
     let initial_spaces = if store.is_postgres()
         && intents.iter().any(|intent| {
             intent
+                .prepared
                 .idempotency
                 .as_ref()
                 .and_then(CommandIdentitySpec::canonical_effect)
@@ -1724,7 +2055,7 @@ async fn execute_batch_on_conn(
         }) {
         all_spaces = intents
             .iter()
-            .map(|intent| intent.scope.space_id.clone())
+            .map(|intent| intent.prepared.scope.space_id.clone())
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
@@ -1744,6 +2075,8 @@ async fn execute_batch_on_conn(
                             persisted_initial_seq: init_seq,
                             effective_cut: init_seq,
                             max_purge_seq: None,
+                            targets: crate::changes::CommittedTargetAcc::default(),
+                            changes: crate::projection_fence::VisibilityChanges::default(),
                         },
                     );
                 }
@@ -1758,10 +2091,11 @@ async fn execute_batch_on_conn(
         }
     }
 
+    let wal_only = !intents.is_empty() && intents.iter().all(|it| it.room_wal.is_some());
     let use_savepoints = intents.len() > 1;
 
     for (idx, intent) in intents.into_iter().enumerate() {
-        let space_id = intent.scope.space_id.clone();
+        let space_id = intent.prepared.scope.space_id.clone();
 
         // Lock Space row OUTSIDE item savepoint on first encounter in this batch so a rolled-back
         // item savepoint on PostgreSQL never drops the batch's `SELECT ... FOR UPDATE` row lock!
@@ -1776,6 +2110,8 @@ async fn execute_batch_on_conn(
                             persisted_initial_seq: init_seq,
                             effective_cut: init_seq,
                             max_purge_seq: None,
+                            targets: crate::changes::CommittedTargetAcc::default(),
+                            changes: crate::projection_fence::VisibilityChanges::default(),
                         },
                     );
                 }
@@ -1794,7 +2130,7 @@ async fn execute_batch_on_conn(
             return BatchExecOutcome::AbortedBeforeCommit(err);
         }
 
-        let has_idemp = intent.idempotency.is_some();
+        let has_idemp = intent.replay_safe();
         let mut active_effect = None;
         let item_res = execute_single_item_in_savepoint(
             tx,
@@ -1811,6 +2147,8 @@ async fn execute_batch_on_conn(
                 response_bytes,
                 new_effective_cut,
                 item_purge_seq,
+                committed_events,
+                item_changes,
                 dir_syncs,
                 retained_tickets,
                 retained_guards,
@@ -1823,6 +2161,8 @@ async fn execute_batch_on_conn(
                 if let Some(SpaceBatchEntry::Loaded {
                     effective_cut,
                     max_purge_seq,
+                    targets,
+                    changes,
                     ..
                 }) = space_states.get_mut(&space_id)
                 {
@@ -1830,6 +2170,8 @@ async fn execute_batch_on_conn(
                     if let Some(pseq) = item_purge_seq {
                         *max_purge_seq = Some(max_purge_seq.map_or(pseq, |prev| prev.max(pseq)));
                     }
+                    targets.record_events(&committed_events);
+                    changes.merge(item_changes);
                 }
                 batch_dir_syncs.merge(&dir_syncs);
                 batch_retained_tickets.extend(retained_tickets);
@@ -1857,6 +2199,7 @@ async fn execute_batch_on_conn(
                         slots: vec![ItemOutcomeSlot::Failed(item_err)],
                         space_effective_cuts,
                         conn_clean,
+                        visibility_windows: visibility_windows(store, &space_states),
                     };
                 }
                 // Rollback ONLY this item's savepoint; virtual `effective_cut` stays unchanged!
@@ -1869,6 +2212,17 @@ async fn execute_batch_on_conn(
         }
     }
 
+    #[cfg(feature = "test-support")]
+    if faults
+        .rollback_commit_response_once
+        .swap(false, Ordering::SeqCst)
+    {
+        transaction.rollback().await;
+        return BatchExecOutcome::UnknownCommit {
+            slots,
+            diag_reason: "fault_injected_commit_rollback".to_owned(),
+        };
+    }
     // Optional test-only per-Space pre-commit delay (proves Space B progresses while Space A is slow,
     // and allows deterministic epoch takeover right before Space A's coalesced `spaces.last_seq` bump).
     for space_id in space_states.keys() {
@@ -1960,25 +2314,42 @@ async fn execute_batch_on_conn(
             }
         }
         let mut space_effective_cuts = BTreeMap::new();
-        for (sid, entry) in &space_states {
+        for (sid, entry) in &mut space_states {
             if let SpaceBatchEntry::Loaded {
                 persisted_initial_seq,
+                effective_cut,
                 ..
             } = entry
             {
-                space_effective_cuts.insert(sid.clone(), *persisted_initial_seq);
+                *effective_cut = *persisted_initial_seq;
+                space_effective_cuts.insert(sid.clone(), *effective_cut);
             }
         }
         return BatchExecOutcome::Committed {
             slots,
             space_effective_cuts,
             conn_clean,
+            visibility_windows: visibility_windows(store, &space_states),
         };
     }
-    // Keep active effects through durable settlement, including a lost waiter.
-    let committed = transaction.commit().await;
+    // Commit outer SQL transaction bracketed by SQLite's seqlock commit
+    // generation (even->odd before COMMIT, odd->even strictly after COMMIT and
+    // BEFORE releasing fence guards or publishing broadcasts) so linearizable
+    // generation caches never observe pre-commit authorization.
+    let commit_seq = is_sqlite.then(|| {
+        if wal_only {
+            crate::runtime::SqliteCommitSeqGuard::begin_wal_only(&store.inner)
+        } else {
+            crate::runtime::SqliteCommitSeqGuard::begin(&store.inner)
+        }
+    });
+    let commit_res = transaction.commit().await;
+    if let Some(seq) = commit_seq {
+        store.inner.latch_sqlite_aux_tables_populated();
+        seq.finish();
+    }
     drop(active_effects);
-    match committed {
+    match commit_res {
         Ok(()) => {
             for action in after_commit {
                 action.settle(true);
@@ -1996,6 +2367,8 @@ async fn execute_batch_on_conn(
                     persisted_initial_seq,
                     effective_cut,
                     max_purge_seq,
+                    targets,
+                    ..
                 } = entry
                 {
                     space_effective_cuts.insert(sid.clone(), *effective_cut);
@@ -2013,6 +2386,7 @@ async fn execute_batch_on_conn(
                             crate::changes::BroadcastSignal::Committed {
                                 scope: record.scope.clone(),
                                 new_last_seq: *effective_cut,
+                                targets: targets.to_targets(),
                             },
                         );
                     }
@@ -2031,6 +2405,7 @@ async fn execute_batch_on_conn(
                 slots,
                 space_effective_cuts,
                 conn_clean: true,
+                visibility_windows: visibility_windows(store, &space_states),
             }
         }
         Err(commit_err) => {
@@ -2051,6 +2426,8 @@ struct SingleItemSuccess {
     response_bytes: Vec<u8>,
     new_effective_cut: SpaceSeq,
     item_purge_seq: Option<SpaceSeq>,
+    committed_events: Vec<BatchEventDraft>,
+    item_changes: crate::projection_fence::VisibilityChanges,
     dir_syncs: PendingDirSyncs,
     retained_tickets: Vec<StagedBlobTicket>,
     retained_guards: Vec<Box<dyn Send>>,
@@ -2060,7 +2437,7 @@ struct SingleItemSuccess {
 async fn execute_single_item_in_savepoint(
     tx: &mut BackendConn<'_>,
     space_entry: &SpaceBatchEntry,
-    intent: PreparedWriteIntent,
+    intent: BatchWriteIntent,
     committed_at_ms: i64,
     expires_at_ms: i64,
     active_effect: &mut Option<Box<dyn RevocationLease>>,
@@ -2075,11 +2452,16 @@ async fn execute_single_item_in_savepoint(
     };
 
     // 1. HistoryIncarnation + LeaseEpoch authority check BEFORE receipt lookup and head CAS!
+    let expected_active_epoch = intent.expected_epoch();
+    let BatchWriteIntent {
+        prepared: intent,
+        room_wal,
+    } = intent;
     space_rec.scope.check(&intent.scope)?;
-    if space_rec.active_epoch != intent.active_epoch {
+    if expected_active_epoch.is_some_and(|epoch| epoch != space_rec.active_epoch) {
         return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
     }
-    let effective_epoch = intent.active_epoch;
+    let effective_epoch = space_rec.active_epoch;
 
     if let Some(idemp) = &intent.idempotency {
         *active_effect = idemp.begin_canonical_effect().await?;
@@ -2102,10 +2484,12 @@ async fn execute_single_item_in_savepoint(
                 // Replay consumes ZERO new sequence numbers!
                 new_effective_cut: current_effective_cut,
                 item_purge_seq: None,
+                committed_events: Vec::new(),
                 dir_syncs: PendingDirSyncs::default(),
                 retained_tickets: Vec::new(),
                 retained_guards: Vec::new(),
                 after_commit: None,
+                item_changes: crate::projection_fence::VisibilityChanges::default(),
             }),
             _ => Err(unavailable_retryable(
                 "command_receipt_pending",
@@ -2151,6 +2535,30 @@ async fn execute_single_item_in_savepoint(
     };
 
     let artifacts = (intent.execute)(tx, &mut item_ctx).await?;
+
+    if room_wal.is_some() {
+        if item_ctx.allocated_count != 0
+            || !artifacts.events.is_empty()
+            || artifacts.change_payload.is_some()
+            || intent.idempotency.is_some()
+        {
+            return Err(internal_not_committed(
+                "writer_unsequenced_item_effects",
+                "room WAL item cannot allocate sequence numbers or publish change events",
+            ));
+        }
+        return Ok(SingleItemSuccess {
+            response_bytes: artifacts.response_bytes,
+            new_effective_cut: current_effective_cut,
+            item_purge_seq: None,
+            committed_events: Vec::new(),
+            item_changes: Default::default(),
+            dir_syncs: item_ctx.pending_dir_syncs,
+            retained_tickets: item_ctx.retained_tickets,
+            retained_guards: item_ctx.retained_guards,
+            after_commit: item_ctx.after_commit,
+        });
+    }
 
     if item_ctx.allocated_count == 0 || artifacts.events.is_empty() {
         return Err(internal_not_committed(
@@ -2218,11 +2626,14 @@ async fn execute_single_item_in_savepoint(
         .filter(|ev| ev.op_kind == "purge")
         .map(|ev| ev.space_seq)
         .max();
+    let item_changes = crate::projection_fence::VisibilityChanges::from_events(&artifacts.events);
 
     Ok(SingleItemSuccess {
         response_bytes: artifacts.response_bytes,
         new_effective_cut: last_seq,
         item_purge_seq,
+        committed_events: artifacts.events,
+        item_changes,
         dir_syncs: item_ctx.pending_dir_syncs,
         retained_tickets: item_ctx.retained_tickets,
         retained_guards: item_ctx.retained_guards,

@@ -76,7 +76,9 @@ pub(super) async fn retrieve(
             classes: classes.clone(),
             top_k,
             model: None,
-            project: target
+            causal: target.causal(),
+            include_chats: false,
+            folder: target
                 .project
                 .as_ref()
                 .map(|project| project.folder_id.clone()),

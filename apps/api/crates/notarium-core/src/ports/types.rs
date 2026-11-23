@@ -939,7 +939,8 @@ pub enum GroupKey {
 pub struct ViewQuery {
     pub view: ViewRef,
     pub filter: FieldFilterAstV1,
-    pub sort: SortSpec,
+    /// A client override. An absent value uses the view author's ordering.
+    pub sort: Option<SortSpec>,
     pub group_by: Option<String>,
     pub limit: PageLimit,
 }
@@ -1045,14 +1046,64 @@ pub struct GraphResult {
     pub truncated: bool,
     pub cut: SnapshotCut,
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NoteLinkDirection {
+    Outgoing,
+    Incoming,
+}
+/// Outgoing authored links include unresolved targets. Incoming links are
+/// emitted only when the source and focal target both pass visibility checks.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NoteLink {
+    pub source: NoteId,
+    pub ordinal: u32,
+    pub raw_target: String,
+    pub target: Option<NoteId>,
+    pub resolved_tier: Option<u32>,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NoteLinkCursor {
+    pub cut: SnapshotCut,
+    pub note: NoteId,
+    pub direction: NoteLinkDirection,
+    pub src_dense_id: u32,
+    pub link_ord: u32,
+}
+#[derive(Clone, Debug)]
+pub struct NoteLinkPage {
+    pub cut: SnapshotCut,
+    pub links: Vec<NoteLink>,
+    pub next: Option<NoteLinkCursor>,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChatBacklink {
+    pub thread: ChatThread,
+    pub title: String,
+    pub entry: ThreadEntrySeq,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChatBacklinkCursor {
+    pub scope: HistoryScope,
+    pub generation: ProjectionGeneration,
+    pub note: NoteId,
+    pub after: (SpaceId, ChatThreadId, ThreadEntrySeq),
+}
+#[derive(Clone, Debug)]
+pub struct ChatBacklinkPage {
+    pub links: Vec<ChatBacklink>,
+    /// A continuation refers only to a visible occurrence already returned.
+    pub next: Option<ChatBacklinkCursor>,
+}
 #[derive(Clone, Debug)]
 pub struct SearchQuery {
     pub text: String,
     pub filter: FieldFilterAstV1,
     pub classes: BTreeSet<DocClass>,
+    pub folder: Option<FolderId>,
+    pub causal: CausalBasis,
+    pub include_chats: bool,
     pub top_k: PageLimit,
     pub model: Option<ModelProfileId>,
-    pub project: Option<FolderId>,
 }
 #[derive(Clone, Debug)]
 pub struct RecallQuery {
@@ -1062,6 +1113,9 @@ pub struct RecallQuery {
     /// Maximum sum of admitted chunk tokens from one note.
     pub max_per_source: Option<u16>,
 }
+impl RecallQuery {
+    pub const MAX_GRAPH_DEPTH: u8 = 3;
+}
 #[derive(Clone, Debug)]
 pub struct SearchHit {
     pub card: NoteCard,
@@ -1069,8 +1123,19 @@ pub struct SearchHit {
     pub chunks: Vec<SearchPart>,
 }
 #[derive(Clone, Debug)]
+pub struct ChatSearchHit {
+    pub thread: ChatThreadId,
+    pub entry: ThreadEntrySeq,
+    pub kind: ChatThreadKind,
+    pub project_folder: Option<FolderId>,
+    pub author: PrincipalId,
+    pub snippet: String,
+    pub score: f64,
+}
+#[derive(Clone, Debug)]
 pub struct SearchResult {
     pub hits: Vec<SearchHit>,
+    pub chat_hits: Vec<ChatSearchHit>,
     pub cut: SnapshotCut,
     pub degraded: Option<SearchDegradation>,
     pub truncated: bool,

@@ -143,11 +143,13 @@ pub(crate) struct CanonicalInner {
     pub chat_run_generation: String,
     pub writer_coord: OnceLock<Arc<WriteCoordinator>>,
     pub wal_coord: OnceLock<Arc<SqliteWalCoordinator>>,
+    #[cfg(feature = "test-support")]
+    pub(crate) projection_read_metrics: crate::projection_read::ProjectionReadMetrics,
     pub broadcast_hub: BroadcastHub,
-    pub board_provider: OnceLock<(
-        notarium_core::ports::BoardPlannerAuthority,
-        Arc<dyn notarium_core::ports::BoardMutationFactsProvider>,
-    )>,
+    pub live_visibility: crate::projection_fence::LiveLifecycleFence,
+    #[cfg(feature = "test-support")]
+    visibility_commit_pause: std::sync::Mutex<Option<auxiliary::VisibilityCommitPause>>,
+    pub board_provider: std::sync::RwLock<Option<crate::domain::BoardProviderBinding>>,
     pub collab_interceptor: OnceLock<Arc<dyn notarium_core::ports::LiveCollabInterceptor>>,
     pub room_fences: Arc<crate::domain::RoomFenceTable>,
     pub job_reads: crate::peers::JobReadRegistry,
@@ -165,7 +167,20 @@ pub(crate) struct CanonicalInner {
     pub last_backup_memory_stats:
         std::sync::Mutex<Option<crate::backup::BackupExporterMemoryStats>>,
     pub backup_step_delay_us: std::sync::atomic::AtomicU64,
+    /// Seqlock-style SQLite writer commit generation: even when idle, odd while
+    /// a SQLite `COMMIT` is in flight (or a cancelled `sqlx` commit is draining).
     pub sqlite_writer_commit_gen: std::sync::atomic::AtomicU64,
+    /// Seqlock-style SQLite commit generation covering mutations that can alter
+    /// authorization, ancestry, note lifecycle, or room leases (not bumped by
+    /// pure unsequenced room WAL appends).
+    pub sqlite_auth_commit_gen: std::sync::atomic::AtomicU64,
+    /// Set when a direct SQLite write future is dropped mid-commit, leaving
+    /// `sqlite_writer_commit_gen` odd until the next writer lock holder drains
+    /// `pair.sqlx_conn` FIFO.
+    pub sqlite_commit_drain_needed: AtomicBool,
+    /// Set alongside `sqlite_commit_drain_needed` when the cancelled commit
+    /// also advanced `sqlite_auth_commit_gen`.
+    pub sqlite_auth_commit_drain_needed: AtomicBool,
     pub sqlite_has_any_purge_fences: AtomicBool,
     pub sqlite_has_any_space_schemas: AtomicBool,
     pub sqlite_has_any_collab_sessions: AtomicBool,
@@ -173,7 +188,125 @@ pub(crate) struct CanonicalInner {
     pub owner_locks: Mutex<Vec<DataRootOwnerLock>>,
 }
 
+/// RAII seqlock guard around every SQLite `COMMIT`.
+///
+/// Advances `sqlite_writer_commit_gen` (and `sqlite_auth_commit_gen` unless
+/// created with `begin_wal_only`) from even to odd strictly BEFORE issuing
+/// `COMMIT` and from odd to even strictly AFTER `COMMIT` returns. If dropped
+/// before `finish()` (for example, when a caller cancels a direct
+/// `with_write_tx` future mid-commit), leaves the counters odd and flags
+/// drain state so readers bypass generation caches until the next writer lock
+/// holder drains the connection worker FIFO.
+pub(crate) struct SqliteCommitSeqGuard<'a> {
+    inner: &'a CanonicalInner,
+    advance_auth: bool,
+    finished: bool,
+}
+
+impl<'a> SqliteCommitSeqGuard<'a> {
+    pub(crate) fn begin(inner: &'a CanonicalInner) -> Self {
+        let prev = inner
+            .sqlite_writer_commit_gen
+            .fetch_add(1, Ordering::AcqRel);
+        debug_assert_eq!(prev & 1, 0, "nested SQLite commit seqlock");
+        let auth_prev = inner.sqlite_auth_commit_gen.fetch_add(1, Ordering::AcqRel);
+        debug_assert_eq!(auth_prev & 1, 0, "nested SQLite auth commit seqlock");
+        Self {
+            inner,
+            advance_auth: true,
+            finished: false,
+        }
+    }
+
+    pub(crate) fn begin_wal_only(inner: &'a CanonicalInner) -> Self {
+        let prev = inner
+            .sqlite_writer_commit_gen
+            .fetch_add(1, Ordering::AcqRel);
+        debug_assert_eq!(prev & 1, 0, "nested SQLite commit seqlock");
+        Self {
+            inner,
+            advance_auth: false,
+            finished: false,
+        }
+    }
+
+    pub(crate) fn finish(mut self) {
+        self.finished = true;
+        if self.advance_auth {
+            let auth_prev = self
+                .inner
+                .sqlite_auth_commit_gen
+                .fetch_add(1, Ordering::Release);
+            debug_assert_eq!(auth_prev & 1, 1, "unbalanced SQLite auth commit seqlock");
+        }
+        let prev = self
+            .inner
+            .sqlite_writer_commit_gen
+            .fetch_add(1, Ordering::Release);
+        debug_assert_eq!(prev & 1, 1, "unbalanced SQLite commit seqlock");
+    }
+}
+
+impl Drop for SqliteCommitSeqGuard<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            if self.advance_auth {
+                self.inner
+                    .sqlite_auth_commit_drain_needed
+                    .store(true, Ordering::Release);
+            }
+            self.inner
+                .sqlite_commit_drain_needed
+                .store(true, Ordering::Release);
+        }
+    }
+}
+
 impl CanonicalInner {
+    /// If an earlier direct SQLite write future was cancelled mid-commit, drain
+    /// the `sqlx-sqlite` connection worker FIFO before the next write and
+    /// restore `sqlite_writer_commit_gen` (and `sqlite_auth_commit_gen` if
+    /// needed) from odd back to even.
+    pub(crate) async fn drain_pending_sqlite_commit_if_needed(
+        &self,
+        pair: &mut crate::sqlite_fast::SqliteWriterPair,
+    ) -> Result<(), PortError> {
+        if !self.sqlite_commit_drain_needed.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        sqlx::query("SELECT 1")
+            .execute(&mut pair.sqlx_conn)
+            .await
+            .map_err(|err| {
+                unavailable_retryable(
+                    "sqlite_writer_commit_drain",
+                    err.to_string(),
+                    Duration::from_millis(50),
+                )
+            })?;
+        if self
+            .sqlite_auth_commit_drain_needed
+            .swap(false, Ordering::AcqRel)
+        {
+            let auth_prev = self.sqlite_auth_commit_gen.fetch_add(1, Ordering::Release);
+            debug_assert_eq!(
+                auth_prev & 1,
+                1,
+                "unbalanced SQLite auth commit seqlock drain"
+            );
+        }
+        if self
+            .sqlite_commit_drain_needed
+            .swap(false, Ordering::AcqRel)
+        {
+            let prev = self
+                .sqlite_writer_commit_gen
+                .fetch_add(1, Ordering::Release);
+            debug_assert_eq!(prev & 1, 1, "unbalanced SQLite commit seqlock drain");
+        }
+        Ok(())
+    }
+
     /// PostgreSQL write authority is granted only by provisioning, takeover, or restore.
     pub(crate) fn grant_writer_epoch(&self, space: &SpaceId, epoch: LeaseEpoch) {
         if matches!(&self.sql, SqlDriverState::Postgres { .. }) {
@@ -193,6 +326,13 @@ impl CanonicalInner {
             .get(space)
             .copied()
             .ok_or_else(|| DomainError::validation(ValidationReason::InvalidAuthority).into())
+    }
+
+    pub(crate) fn revoke_writer_epoch(&self, space: &SpaceId) {
+        self.writer_leases
+            .lock()
+            .expect("writer leases")
+            .remove(space);
     }
 
     pub(crate) fn check_writer_epoch(
@@ -448,8 +588,13 @@ impl CanonicalRuntime {
             chat_run_generation: crate::codec::new_prefixed_hex_id("crg_")?,
             writer_coord: OnceLock::new(),
             wal_coord: OnceLock::new(),
+            #[cfg(feature = "test-support")]
+            projection_read_metrics: crate::projection_read::ProjectionReadMetrics::default(),
             broadcast_hub: BroadcastHub::new(DEFAULT_BROADCAST_CAPACITY),
-            board_provider: OnceLock::new(),
+            live_visibility: crate::projection_fence::LiveLifecycleFence::new()?,
+            #[cfg(feature = "test-support")]
+            visibility_commit_pause: Default::default(),
+            board_provider: std::sync::RwLock::new(None),
             collab_interceptor: OnceLock::new(),
             room_fences: Arc::new(crate::domain::RoomFenceTable::default()),
             job_reads: crate::peers::JobReadRegistry::default(),
@@ -464,6 +609,9 @@ impl CanonicalRuntime {
             last_backup_memory_stats: std::sync::Mutex::new(None),
             backup_step_delay_us: std::sync::atomic::AtomicU64::new(0),
             sqlite_writer_commit_gen: std::sync::atomic::AtomicU64::new(0),
+            sqlite_auth_commit_gen: std::sync::atomic::AtomicU64::new(0),
+            sqlite_commit_drain_needed: AtomicBool::new(false),
+            sqlite_auth_commit_drain_needed: AtomicBool::new(false),
             sqlite_has_any_purge_fences: AtomicBool::new(init_has_purge_fences),
             sqlite_has_any_space_schemas: AtomicBool::new(init_has_space_schemas),
             sqlite_has_any_collab_sessions: AtomicBool::new(init_has_collab_sessions),
@@ -542,6 +690,7 @@ impl CanonicalRuntime {
     }
 
     async fn drain_shutdown(self) -> Result<(), PortError> {
+        self.inner.live_visibility.close_and_drain().await;
         // Closing a backup phase can schedule a final join or artifact cleanup.
         // Admission already closed when shutdown was requested.
         loop {
@@ -629,6 +778,34 @@ impl CanonicalStore {
             (&self.inner.sql, &self.inner.blobs),
             (SqlDriverState::Sqlite { .. }, BlobBackendDriver::Local(_))
         )
+    }
+
+    /// Returns `true` when this store uses the single-writer local SQLite
+    /// backend rather than a multi-writer PostgreSQL database.
+    pub fn is_local_sqlite(&self) -> bool {
+        matches!(self.inner.sql, SqlDriverState::Sqlite { .. })
+    }
+
+    /// Monotonic SQLite writer commit generation, or `None` on multi-writer
+    /// backends or while a SQLite `COMMIT` is in flight (odd seqlock parity).
+    pub fn sqlite_commit_generation(&self) -> Option<u64> {
+        if !matches!(self.inner.sql, SqlDriverState::Sqlite { .. }) {
+            return None;
+        }
+        let commit_gen = self.inner.sqlite_writer_commit_gen.load(Ordering::Acquire);
+        (commit_gen & 1 == 0).then_some(commit_gen)
+    }
+
+    /// Monotonic SQLite commit generation covering writes that can alter
+    /// authorization, folder ancestry, note lifecycle, or room leases (not
+    /// bumped by pure unsequenced room WAL appends), or `None` on multi-writer
+    /// backends or while a commit is in flight.
+    pub fn sqlite_auth_commit_generation(&self) -> Option<u64> {
+        if !matches!(self.inner.sql, SqlDriverState::Sqlite { .. }) {
+            return None;
+        }
+        let commit_gen = self.inner.sqlite_auth_commit_gen.load(Ordering::Acquire);
+        (commit_gen & 1 == 0).then_some(commit_gen)
     }
 
     pub async fn read_space(&self, space_id: &SpaceId) -> Result<SpaceRecord, PortError> {
@@ -806,6 +983,19 @@ impl CanonicalStore {
     where
         F: for<'c> FnOnce(&'c mut BackendConn<'_>) -> crate::BoxFuture<'c, Result<T, PortError>>,
     {
+        self.with_visibility_write_tx(space, None, op, Ok).await
+    }
+
+    pub(crate) async fn with_visibility_write_tx<F, T, R>(
+        &self,
+        space: Option<SpaceId>,
+        visible_space: Option<SpaceId>,
+        op: F,
+        after_commit: impl FnOnce(T) -> Result<R, PortError>,
+    ) -> Result<R, PortError>
+    where
+        F: for<'c> FnOnce(&'c mut BackendConn<'_>) -> crate::BoxFuture<'c, Result<T, PortError>>,
+    {
         self.ensure_open()?;
         // Never hold the writer safe point or a database connection while waiting
         // for a provider that has already pinned this Space.
@@ -822,14 +1012,24 @@ impl CanonicalStore {
         } else {
             None
         };
-        self.with_write_tx_unfenced(op).await
+        self.with_write_tx_unfenced(visible_space.map(|space| vec![space]), op, after_commit)
+            .await
     }
 
-    pub(crate) async fn with_write_tx_unfenced<F, T>(&self, op: F) -> Result<T, PortError>
+    pub(crate) async fn with_write_tx_unfenced<F, T, R>(
+        &self,
+        spaces: Option<Vec<SpaceId>>,
+        op: F,
+        after_commit: impl FnOnce(T) -> Result<R, PortError>,
+    ) -> Result<R, PortError>
     where
         F: for<'c> FnOnce(&'c mut BackendConn<'_>) -> crate::BoxFuture<'c, Result<T, PortError>>,
     {
         self.ensure_open()?;
+        let mut visibility = match spaces {
+            Some(spaces) => Some(self.inner.live_visibility.for_write(spaces).await),
+            None => None,
+        };
         let value = match &self.inner.sql {
             SqlDriverState::Sqlite { writer, .. } => {
                 let mut guard = writer.lock().await;
@@ -840,6 +1040,9 @@ impl CanonicalStore {
                         Duration::from_millis(100),
                     )
                 })?;
+                self.inner
+                    .drain_pending_sqlite_commit_if_needed(pair)
+                    .await?;
                 let mut conn = BackendConn::Sqlite(&mut pair.sqlx_conn);
                 let mut transaction = WriteTransaction::begin(&mut conn).await?;
                 let value = match op(&mut transaction.conn()).await {
@@ -849,10 +1052,13 @@ impl CanonicalStore {
                         return Err(error);
                     }
                 };
-                transaction.commit().await?;
-                self.inner
-                    .sqlite_writer_commit_gen
-                    .fetch_add(1, Ordering::Release);
+                if let Some(visibility) = visibility.as_mut() {
+                    visibility.committing();
+                }
+                let commit_seq = SqliteCommitSeqGuard::begin(&self.inner);
+                let commit_res = transaction.commit().await;
+                commit_seq.finish();
+                commit_res?;
                 if let Some(wal) = self.inner.wal_coord.get() {
                     wal.note_writer_commit();
                 }
@@ -878,12 +1084,33 @@ impl CanonicalStore {
                         return Err(err);
                     }
                 };
+                if let Some(visibility) = visibility.as_mut() {
+                    visibility.committing();
+                }
                 transaction.commit().await?;
                 lease.complete();
                 value
             }
         };
-        Ok(value)
+        #[cfg(feature = "test-support")]
+        if visibility.is_some() {
+            self.pause_after_visibility_commit_for_test().await;
+        }
+        let visibility_result = if let Some(visibility) = visibility {
+            visibility.published(self, &[]).await.map_err(|error| {
+                crate::codec::unknown_commit_non_idempotent(
+                    "projection_erase_after_commit",
+                    error.to_string(),
+                )
+            })
+        } else {
+            Ok(())
+        };
+        // A projection publication failure withholds a successful reply.
+        // The durable write still needs its local notification for repair.
+        let published = after_commit(value);
+        visibility_result?;
+        published
     }
 
     pub fn wal_telemetry(&self) -> Option<WalTelemetrySnapshot> {
@@ -1028,10 +1255,12 @@ impl CanonicalStore {
 
         let mut lease = PgTransactionLease::new(&mut pooled);
         if initialize {
-            // A cached reader owns its session settings. An uncached reader resets them before
-            // it returns to the shared pool. Any interrupted checkout is closed.
+            // A cached reader owns its session settings. An uncached reader resets
+            // `statement_timeout` before returning to the shared pool; `after_connect`
+            // keeps `client_connection_check_interval = '20ms'` active session-wide.
+            // Any interrupted checkout is closed.
             let settings = format!(
-                "SET statement_timeout = '{}ms'; SET client_connection_check_interval = '20ms'",
+                "SET statement_timeout = '{}ms'",
                 statement_limit.as_millis().max(1)
             );
             tokio::select! {
@@ -1070,11 +1299,83 @@ impl CanonicalStore {
                 error = &mut cancelled => return Err(error),
                 _ = tokio::time::sleep_until(caller_deadline) => return Err(deadline_not_committed(
                     "pg_read_cleanup_deadline", "PostgreSQL read cleanup exceeded caller deadline")),
-                result = sqlx::raw_sql("RESET statement_timeout; RESET client_connection_check_interval").execute(lease.conn()) =>
+                result = sqlx::raw_sql("RESET statement_timeout").execute(lease.conn()) =>
                     result.map_err(|e| internal_not_committed("pg_read_reset", e.to_string()))?,
             };
             lease.complete();
         }
+        Ok(val)
+    }
+
+    /// Executes a single read-only PostgreSQL statement in autocommit mode
+    /// (one network round-trip on a single consistent MVCC snapshot) without
+    /// mutating connection session settings. On cancellation or deadline
+    /// expiry, the underlying connection is closed on drop so PostgreSQL
+    /// cancels the in-flight statement via `client_connection_check_interval`.
+    pub(crate) async fn with_pg_single_read_stmt<F, T>(
+        &self,
+        budget: Option<&CallBudget>,
+        op: F,
+    ) -> Result<T, PortError>
+    where
+        F: for<'c> FnOnce(&'c mut sqlx::PgConnection) -> crate::BoxFuture<'c, Result<T, PortError>>,
+    {
+        self.ensure_open()?;
+        let SqlDriverState::Postgres {
+            pool,
+            statement_timeout,
+            ..
+        } = &self.inner.sql
+        else {
+            return Err(internal_not_committed(
+                "pg_single_read_wrong_backend",
+                "expected PostgreSQL backend",
+            ));
+        };
+
+        let caller_deadline = pg_read_caller_deadline(pool, budget)?;
+        if statement_timeout.is_zero() {
+            return Err(deadline_not_committed(
+                "pg_read_statement_deadline",
+                "PostgreSQL read statement exceeded deadline",
+            ));
+        }
+        let cancelled = pg_read_cancelled(budget);
+        tokio::pin!(cancelled);
+
+        let mut pooled = tokio::select! {
+            biased;
+            error = &mut cancelled => return Err(error),
+            _ = tokio::time::sleep_until(caller_deadline) => {
+                return Err(deadline_not_committed(
+                    "pg_acquire_read_deadline",
+                    "deadline exceeded acquiring PostgreSQL read connection",
+                ));
+            }
+            res = pool.acquire() => res.map_err(|err| {
+                unavailable_retryable(
+                    "pg_acquire_read",
+                    err.to_string(),
+                    Duration::from_millis(50),
+                )
+            })?,
+        };
+
+        let statement_limit = (*statement_timeout).min(PG_READ_SNAPSHOT_LIMIT);
+        let statement_deadline = caller_deadline.min(tokio::time::Instant::now() + statement_limit);
+        let mut lease = PgTransactionLease::new(&mut pooled);
+        let val = tokio::select! {
+            biased;
+            error = &mut cancelled => return Err(error),
+            _ = tokio::time::sleep_until(statement_deadline) => {
+                return Err(deadline_not_committed(
+                    "pg_read_statement_deadline",
+                    "PostgreSQL read statement exceeded deadline",
+                ));
+            }
+            result = op(lease.conn()) => result?,
+        };
+        lease.complete();
         Ok(val)
     }
 
@@ -1098,6 +1399,35 @@ impl CanonicalStore {
     }
 
     pub(crate) async fn with_read_tx_budget_pg_local_sql<F, T>(
+        &self,
+        budget: Option<&CallBudget>,
+        extra_pg_sql: Option<&'static str>,
+        op: F,
+    ) -> Result<T, PortError>
+    where
+        F: for<'c> FnOnce(&'c mut BackendConn<'_>) -> crate::BoxFuture<'c, Result<T, PortError>>,
+    {
+        #[cfg(feature = "test-support")]
+        {
+            // Owner fence pages also use this transaction boundary.
+            let mut measurement = self
+                .inner
+                .projection_read_metrics
+                .measure(std::any::type_name::<F>());
+            let result = self
+                .execute_read_transaction(budget, extra_pg_sql, op)
+                .await;
+            if let Some(measurement) = &mut measurement {
+                measurement.complete(result.as_ref().err().map(PortError::code));
+            }
+            result
+        }
+        #[cfg(not(feature = "test-support"))]
+        self.execute_read_transaction(budget, extra_pg_sql, op)
+            .await
+    }
+
+    async fn execute_read_transaction<F, T>(
         &self,
         budget: Option<&CallBudget>,
         extra_pg_sql: Option<&'static str>,
@@ -1214,6 +1544,12 @@ impl CanonicalStore {
             None,
             move |record: SpaceRecord| {
                 inner.grant_writer_epoch(&record.space.id, record.active_epoch);
+                inner
+                    .broadcast_hub
+                    .publish(BroadcastSignal::CatalogChanged {
+                        scope: record.scope.clone(),
+                        lifecycle: record.space.lifecycle,
+                    });
                 Ok(record)
             },
             move |tx| Box::pin(create_space_tx(tx, spec)),
@@ -1252,14 +1588,28 @@ impl CanonicalStore {
         let rev_id = new_revision_id()?;
         let cmd_id = new_prefixed_hex_id("cmd_")?;
 
-        let out = self
-            .with_write_tx_for_space(Some(spec.scope.space_id.clone()), |tx| {
-                let spec_cl = spec.clone();
-                let slug_fold_cl = slug_fold.clone();
-                let proj_fold_cl = project_slug_fold.clone();
-                let rev_cl = rev_id.clone();
-                let cmd_cl = cmd_id.clone();
-                Box::pin(async move {
+        let inner = Arc::clone(&self.inner);
+        let writer_owner = Arc::clone(&inner);
+        let broadcast_scope = spec.scope.clone();
+        self.with_auxiliary_visibility_command(
+            spec.scope.space_id.clone(),
+            Some(spec.scope.space_id.clone()),
+            None,
+            move |out: (FolderRef, RevisionId, SpaceSeq)| {
+                inner.broadcast_hub.publish(BroadcastSignal::Committed {
+                    scope: broadcast_scope,
+                    new_last_seq: out.2,
+                    targets: crate::changes::CommittedTargets::All,
+                });
+                Ok(out)
+            },
+            move |tx| Box::pin(async move {
+                let spec_cl = spec;
+                let slug_fold_cl = slug_fold;
+                let proj_fold_cl = project_slug_fold;
+                let rev_cl = rev_id;
+                let cmd_cl = cmd_id;
+                writer_owner.check_writer_epoch(&spec_cl.scope.space_id, spec_cl.active_epoch)?;
                 let space_rec = load_space_record(tx, &spec_cl.scope.space_id).await?;
                 space_rec.scope.check(&spec_cl.scope)?;
                 if space_rec.active_epoch != spec_cl.active_epoch {
@@ -1460,17 +1810,9 @@ impl CanonicalStore {
                     rev_cl,
                     next_seq,
                 ))
-            })
-        })
-        .await?;
-
-        self.inner
-            .broadcast_hub
-            .publish(BroadcastSignal::Committed {
-                scope: spec.scope,
-                new_last_seq: out.2,
-            });
-        Ok(out)
+            }),
+        )
+        .await
     }
 
     /// Sets a non-root folder's lifecycle (`Trash` or `Restore`), preserving active-sibling uniqueness.
@@ -1503,13 +1845,28 @@ impl CanonicalStore {
         let expected_cl = expected_revision.clone();
         let actor_cl = actor.clone();
 
+        let inner = Arc::clone(&self.inner);
+        let writer_owner = Arc::clone(&inner);
         let broadcast_scope = scope.clone();
-        let out = self
-            .with_write_tx_for_space(Some(scope.space_id.clone()), |tx| {
-                let new_rev_cl = new_rev.clone();
-                let cmd_cl_in = cmd_id.clone();
-                Box::pin(async move {
-                let space_rec = load_space_record(tx, &scope_cl.space_id).await?;
+        self.with_auxiliary_visibility_command(
+            scope.space_id.clone(),
+            Some(scope.space_id.clone()),
+            None,
+            move |out: (RevisionId, SpaceSeq)| {
+                inner.broadcast_hub.publish(BroadcastSignal::Committed {
+                    scope: broadcast_scope,
+                    new_last_seq: out.1,
+                    targets: crate::changes::CommittedTargets::All,
+                });
+                Ok(out)
+            },
+            move |tx| Box::pin(async move {
+                let new_rev_cl = new_rev;
+                let cmd_cl_in = cmd_id;
+                writer_owner.check_writer_epoch(&scope_cl.space_id, active_epoch)?;
+                let space_rec = load_space_record_for_update_opt(tx, &scope_cl.space_id)
+                    .await?
+                    .ok_or(DomainError::ResourceNotFound)?;
                 space_rec.scope.check(&scope_cl)?;
                 if space_rec.active_epoch != active_epoch {
                     return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
@@ -1537,7 +1894,72 @@ impl CanonicalStore {
                 })?;
 
                 let op_kind = match (folder_row.lifecycle, target_lifecycle) {
-                    (Lifecycle::Active, Lifecycle::Trashed) => "trash",
+                    (Lifecycle::Active, Lifecycle::Trashed) => {
+                        let has_open_room: Option<i32> = match tx {
+                            BackendConn::Sqlite(conn) => sqlx::query_scalar(
+                                "WITH RECURSIVE sub(folder_id, depth) AS (
+                                     SELECT folder_id, 0 FROM folder_heads
+                                      WHERE space_id = ?1 AND folder_id = ?2
+                                     UNION ALL
+                                     SELECT f.folder_id, s.depth + 1 FROM folder_heads f
+                                     JOIN sub s ON f.parent_folder_id = s.folder_id
+                                      WHERE f.space_id = ?1 AND s.depth < 257
+                                 )
+                                 SELECT 1 FROM sub s
+                                 JOIN note_heads n
+                                   ON n.space_id = ?1 AND n.parent_folder_id = s.folder_id
+                                 JOIN collab_sessions c
+                                   ON c.space_id = ?1 AND c.note_id = n.note_id
+                                 WHERE c.room_state IN ('active', 'fenced')
+                                 LIMIT 1",
+                            )
+                            .bind(scope_cl.space_id.as_str())
+                            .bind(folder_cl.as_str())
+                            .fetch_optional(&mut **conn)
+                            .await
+                            .map_err(|err| {
+                                internal_not_committed(
+                                    "sqlite_check_folder_rooms",
+                                    err.to_string(),
+                                )
+                            })?,
+                            BackendConn::Postgres(conn) => sqlx::query_scalar(
+                                "WITH RECURSIVE sub(folder_id, depth) AS (
+                                     SELECT folder_id, 0 FROM folder_heads
+                                      WHERE space_id = $1 AND folder_id = $2
+                                     UNION ALL
+                                     SELECT f.folder_id, s.depth + 1 FROM folder_heads f
+                                     JOIN sub s ON f.parent_folder_id = s.folder_id
+                                      WHERE f.space_id = $1 AND s.depth < 257
+                                 )
+                                 SELECT 1 FROM sub s
+                                 JOIN note_heads n
+                                   ON n.space_id = $1 AND n.parent_folder_id = s.folder_id
+                                 JOIN collab_sessions c
+                                   ON c.space_id = $1 AND c.note_id = n.note_id
+                                 WHERE c.room_state IN ('active', 'fenced')
+                                 LIMIT 1",
+                            )
+                            .bind(scope_cl.space_id.as_str())
+                            .bind(folder_cl.as_str())
+                            .fetch_optional(&mut **conn)
+                            .await
+                            .map_err(|err| {
+                                internal_not_committed(
+                                    "pg_check_folder_rooms",
+                                    err.to_string(),
+                                )
+                            })?,
+                        };
+                        if has_open_room.is_some() {
+                            return Err(unavailable_retryable(
+                                "trash_folder_blocked_by_active_room",
+                                "cannot trash folder while a descendant note has an active or fenced collaboration room",
+                                Duration::from_millis(50),
+                            ));
+                        }
+                        "trash"
+                    }
                     (Lifecycle::Trashed, Lifecycle::Active) => {
                         ensure_active_folder_in_space(tx, &scope_cl.space_id, &parent_id).await?;
                         if active_folder_sibling_exists(
@@ -1679,17 +2101,9 @@ impl CanonicalStore {
                 .await?;
 
                 Ok((new_rev_cl, next_seq))
-            })
-        })
-        .await?;
-
-        self.inner
-            .broadcast_hub
-            .publish(BroadcastSignal::Committed {
-                scope: broadcast_scope,
-                new_last_seq: out.1,
-            });
-        Ok(out)
+            }),
+        )
+        .await
     }
 
     /// Reads an entity's immutable revision snapshot at a validated command-end cutoff (`visibility_seq <= cutoff`).
@@ -3019,9 +3433,9 @@ pub(crate) async fn are_any_notes_purge_fenced_tx(
     if note_ids.len() == 1 {
         return is_note_purge_fenced_tx(tx, space_id, note_ids[0].as_str()).await;
     }
-    for chunk in note_ids.chunks(200) {
-        let found = match tx {
-            BackendConn::Sqlite(conn) => {
+    match tx {
+        BackendConn::Sqlite(conn) => {
+            for chunk in note_ids.chunks(200) {
                 let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
                     "SELECT 1 FROM revision_purge_fences WHERE space_id = ",
                 );
@@ -3038,31 +3452,76 @@ pub(crate) async fn are_any_notes_purge_fenced_tx(
                     .map_err(|err| {
                         internal_not_committed("sqlite_check_purge_fence_batch", err.to_string())
                     })?;
-                row.is_some()
+                if row.is_some() {
+                    return Ok(true);
+                }
             }
-            BackendConn::Postgres(conn) => {
-                let mut qb = sqlx::QueryBuilder::<sqlx::Postgres>::new(
-                    "SELECT 1::BIGINT FROM revision_purge_fences WHERE space_id = ",
+            Ok(false)
+        }
+        BackendConn::Postgres(conn) => {
+            let ids: Vec<&str> = note_ids.iter().map(NoteId::as_str).collect();
+            let row: Option<i64> = sqlx::query_scalar(
+                "SELECT 1::BIGINT FROM revision_purge_fences WHERE space_id = $1 AND note_id = ANY($2) LIMIT 1",
+            )
+            .bind(space_id.as_str())
+            .bind(&ids)
+            .fetch_optional(&mut **conn)
+            .await
+            .map_err(|err| pg_read_error("pg_check_purge_fence_batch", err))?;
+            Ok(row.is_some())
+        }
+    }
+}
+
+pub(crate) async fn purge_fenced_note_ids_tx(
+    tx: &mut BackendConn<'_>,
+    space_id: &SpaceId,
+    note_ids: &[NoteId],
+) -> Result<std::collections::HashSet<NoteId>, PortError> {
+    let mut out = std::collections::HashSet::new();
+    if note_ids.is_empty() {
+        return Ok(out);
+    }
+    match tx {
+        BackendConn::Sqlite(conn) => {
+            for chunk in note_ids.chunks(200) {
+                let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+                    "SELECT note_id FROM revision_purge_fences WHERE space_id = ",
                 );
                 qb.push_bind(space_id.as_str()).push(" AND note_id IN (");
                 let mut sep = qb.separated(", ");
                 for nid in chunk {
                     sep.push_bind(nid.as_str());
                 }
-                sep.push_unseparated(") LIMIT 1");
-                let row: Option<i64> = qb
+                sep.push_unseparated(")");
+                let rows: Vec<String> = qb
                     .build_query_scalar()
-                    .fetch_optional(&mut **conn)
+                    .fetch_all(&mut **conn)
                     .await
-                    .map_err(|err| pg_read_error("pg_check_purge_fence_batch", err))?;
-                row.is_some()
+                    .map_err(|err| {
+                        internal_not_committed("sqlite_purge_fence_ids_batch", err.to_string())
+                    })?;
+                for raw in rows {
+                    out.insert(NoteId::parse(&raw)?);
+                }
             }
-        };
-        if found {
-            return Ok(true);
+        }
+        BackendConn::Postgres(conn) => {
+            let ids: Vec<&str> = note_ids.iter().map(NoteId::as_str).collect();
+            let rows: Vec<String> = sqlx::query_scalar(
+                "SELECT note_id FROM revision_purge_fences WHERE space_id = $1 AND note_id = ANY($2)",
+            )
+            .bind(space_id.as_str())
+            .bind(&ids)
+            .fetch_all(&mut **conn)
+            .await
+            .map_err(|err| pg_read_error("pg_purge_fence_ids_batch", err))?;
+            for raw in rows {
+                out.insert(NoteId::parse(&raw)?);
+            }
         }
     }
-    Ok(false)
+    Ok(out)
 }
 
 #[allow(clippy::type_complexity)]
@@ -3214,4 +3673,81 @@ pub(crate) async fn read_immutable_revision_tx(
         restored_from_rev_id,
         created_at,
     }))
+}
+
+#[cfg(test)]
+mod seqlock_tests {
+    use super::*;
+
+    struct TestDir(std::path::PathBuf);
+    impl TestDir {
+        fn new(tag: &str) -> Self {
+            let mut rnd = [0u8; 8];
+            let _ = getrandom::fill(&mut rnd);
+            let path = std::env::temp_dir()
+                .join(format!("notarium-{tag}-{:016x}", u64::from_le_bytes(rnd)));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlite_commit_seqlock_brackets_commit_and_drains_on_drop() {
+        let dir = TestDir::new("seqlock");
+        let (store, runtime) = CanonicalRuntime::open(CanonicalConfig::local_default(
+            InstallationId::from_bytes([88; 16]),
+            notarium_core::epoch::DataRoot::new(&dir.0),
+        ))
+        .await
+        .unwrap();
+
+        let g0 = store.sqlite_commit_generation().expect("even idle gen");
+        assert_eq!(g0 & 1, 0);
+
+        // Normal bracket: even -> None (odd) -> even (+2).
+        let guard = SqliteCommitSeqGuard::begin(&store.inner);
+        assert_eq!(store.sqlite_commit_generation(), None);
+        guard.finish();
+        let g1 = store
+            .sqlite_commit_generation()
+            .expect("even gen after finish");
+        assert_eq!(g1, g0 + 2);
+
+        // Dropped mid-commit: stays odd (None) and sets drain flag until next
+        // writer transaction drains `sqlx_conn` FIFO and commits.
+        {
+            let _dropped = SqliteCommitSeqGuard::begin(&store.inner);
+            assert_eq!(store.sqlite_commit_generation(), None);
+        }
+        assert_eq!(store.sqlite_commit_generation(), None);
+        assert!(
+            store
+                .inner
+                .sqlite_commit_drain_needed
+                .load(Ordering::Acquire)
+        );
+
+        store
+            .with_write_tx(|_tx| Box::pin(async { Ok(()) }))
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .inner
+                .sqlite_commit_drain_needed
+                .load(Ordering::Acquire)
+        );
+        let g2 = store
+            .sqlite_commit_generation()
+            .expect("even gen restored after drain + commit");
+        // +1 from drain (odd->even) and +2 from the write tx commit bracket.
+        assert_eq!(g2, g1 + 4);
+
+        runtime.shutdown().await.unwrap();
+    }
 }

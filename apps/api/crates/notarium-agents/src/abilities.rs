@@ -25,7 +25,7 @@ use notarium_core::{
     },
 };
 use serde::Serialize;
-use std::sync::Arc;
+use std::{collections::BTreeSet, sync::Arc};
 
 use builtins::{BUILTINS, Builtin, digest};
 
@@ -368,6 +368,10 @@ impl ProviderEgressLease for SystemEgressLease {
 
     fn secondary_projects(&self) -> &[FolderRef] {
         self.inner.secondary_projects()
+    }
+
+    fn project_folders(&self) -> &BTreeSet<FolderId> {
+        self.inner.project_folders()
     }
 
     fn mark_dispatched(&mut self) {

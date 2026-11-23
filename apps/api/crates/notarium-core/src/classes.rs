@@ -9,7 +9,7 @@ use crate::{
         ProviderResourceId, RevisionId, SpaceId, ThreadEntrySeq,
     },
     model::{AbilityResourceRef, FolderRef, HistoryScope, Lifecycle, NoteRef},
-    ports::{AbilityPlacement, ChatProvenance},
+    ports::{AbilityPlacement, ChatProvenance, ServiceAuthority, ServicePurpose},
     span::ByteSpan,
 };
 use serde::{Deserialize, Serialize};
@@ -109,7 +109,7 @@ impl DocumentFacts {
         auth.authorize_read(&self.recorded)
     }
 
-    fn allow_egress(&self, lifecycle: Lifecycle, auth: &EngineAuthContext) -> DomainResult<()> {
+    fn check_egress(&self, lifecycle: Lifecycle) -> DomainResult<()> {
         if self
             .iter()
             .any(|facts| facts.class == DocClass::EncryptedNote)
@@ -126,6 +126,11 @@ impl DocumentFacts {
         {
             return Err(DomainError::ResourceNotFound);
         }
+        Ok(())
+    }
+
+    fn allow_egress(&self, lifecycle: Lifecycle, auth: &EngineAuthContext) -> DomainResult<()> {
+        self.check_egress(lifecycle)?;
         self.authorize(auth)
     }
 
@@ -506,6 +511,23 @@ macro_rules! content_wrapper {
 }
 content_wrapper!(ProjectionContent);
 content_wrapper!(SearchContent);
+impl SearchContent {
+    /// Keep the placement needed to validate an off-owner search update,
+    /// releasing the document body before publication.
+    pub fn into_recorded_ancestor_folders(self) -> Vec<FolderId> {
+        self.0.facts.recorded.ancestor_folders
+    }
+
+    /// Match a subtree at the canonical cut captured by the indexed carrier.
+    pub fn was_under_any_folder(&self, folders: &BTreeSet<FolderId>) -> bool {
+        self.0
+            .facts
+            .recorded
+            .ancestor_folders
+            .iter()
+            .any(|id| folders.contains(id))
+    }
+}
 
 /// A source-bound extraction result, preserving the original canonical identity.
 /// Token count/key/model are assertions of the trusted tokenizer owner; text and
@@ -1437,6 +1459,14 @@ impl ClassEgressFence {
         auth: &EngineAuthContext,
     ) -> DomainResult<SearchContent> {
         Self::check(&document, auth)?;
+        Ok(SearchContent(document))
+    }
+    pub fn index_for_search(
+        document: ClassifiedDocument,
+        authority: &ServiceAuthority,
+    ) -> DomainResult<SearchContent> {
+        authority.require(ServicePurpose::Search)?;
+        document.facts.check_egress(document.lifecycle)?;
         Ok(SearchContent(document))
     }
     pub fn provider(

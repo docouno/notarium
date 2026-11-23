@@ -15,13 +15,19 @@ use crate::{
     sql_exec::BackendConn,
 };
 
+#[derive(Clone, Debug, Default)]
+pub(super) struct StoredFingerprints {
+    previous_encoding: Option<ContentDigest>,
+    legacy: Option<LegacyFingerprint>,
+}
+
 #[derive(Clone, Debug)]
 #[expect(
     clippy::large_enum_variant,
     reason = "The writer shares proofs with one Arc allocation per command"
 )]
 pub(super) enum CommandProof {
-    Legacy(LegacyFingerprint),
+    Stored(StoredFingerprints),
     Confirmed {
         step: Arc<ConfirmedChatStep>,
         kind: &'static str,
@@ -29,7 +35,7 @@ pub(super) enum CommandProof {
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct LegacyFingerprint {
+struct LegacyFingerprint {
     hash: ContentDigest,
     entity_type: &'static str,
     entity_key: String,
@@ -93,6 +99,17 @@ impl UnboundCommand {
         self
     }
 
+    pub(crate) fn with_previous_encoding(mut self, original: Self) -> Self {
+        let mut stored = original
+            .0
+            .stored_fingerprints()
+            .cloned()
+            .unwrap_or_default();
+        stored.previous_encoding = Some(original.0.command_hash);
+        self.0.fingerprint_proof = Some(Arc::new(CommandProof::Stored(stored)));
+        self
+    }
+
     pub(crate) fn with_preconditions(
         mut self,
         pre: &Preconditions,
@@ -106,15 +123,18 @@ impl UnboundCommand {
         let old = self.0.command_hash;
         self.0.command_hash = hash_parts(old, &[revision.as_bytes(), &lease, &lineage]);
         if pre.lease.is_none() && pre.lineage.is_none() && !self.0.has_confirmed_chat_step() {
-            self.0.fingerprint_proof = Some(Arc::new(CommandProof::Legacy(LegacyFingerprint {
-                hash: old,
-                entity_type,
-                entity_key: entity_key.to_owned(),
-                revision: pre.revision.clone(),
-                rename_kind: None,
-                schema: None,
-                chat_refs: None,
-                staged_size: None,
+            self.0.fingerprint_proof = Some(Arc::new(CommandProof::Stored(StoredFingerprints {
+                previous_encoding: None,
+                legacy: Some(LegacyFingerprint {
+                    hash: old,
+                    entity_type,
+                    entity_key: entity_key.to_owned(),
+                    revision: pre.revision.clone(),
+                    rename_kind: None,
+                    schema: None,
+                    chat_refs: None,
+                    staged_size: None,
+                }),
             })));
         }
         self
@@ -199,23 +219,24 @@ impl UnboundCommand {
 }
 
 impl CommandIdentitySpec {
-    fn legacy_proof(&self) -> Option<&LegacyFingerprint> {
+    fn stored_fingerprints(&self) -> Option<&StoredFingerprints> {
         match self.fingerprint_proof.as_deref()? {
-            CommandProof::Legacy(proof) => Some(proof),
+            CommandProof::Stored(stored) => Some(stored),
             CommandProof::Confirmed { .. } => None,
         }
     }
 
     fn legacy_proof_mut(&mut self) -> Option<&mut LegacyFingerprint> {
         match Arc::make_mut(self.fingerprint_proof.as_mut()?) {
-            CommandProof::Legacy(proof) => Some(proof),
+            CommandProof::Stored(stored) => stored.legacy.as_mut(),
             CommandProof::Confirmed { .. } => None,
         }
     }
 
     pub(super) fn matches_legacy_detail(&self, stored: &[u8], detail: &[u8]) -> bool {
         let Some(refs) = self
-            .legacy_proof()
+            .stored_fingerprints()
+            .and_then(|s| s.legacy.as_ref())
             .filter(|proof| proof.hash.as_bytes() == stored)
             .and_then(|proof| proof.chat_refs)
         else {
@@ -232,10 +253,19 @@ impl CommandIdentitySpec {
         seq: i64,
         stored: &[u8],
     ) -> Result<bool, PortError> {
-        if self.command_hash.as_bytes() == stored {
+        if self.command_hash.as_bytes() == stored
+            || self
+                .stored_fingerprints()
+                .and_then(|stored| stored.previous_encoding)
+                .is_some_and(|hash| hash.as_bytes() == stored)
+        {
             return Ok(true);
         }
-        let Some(proof) = self.legacy_proof().filter(|p| p.hash.as_bytes() == stored) else {
+        let Some(proof) = self
+            .stored_fingerprints()
+            .and_then(|s| s.legacy.as_ref())
+            .filter(|p| p.hash.as_bytes() == stored)
+        else {
             return Ok(false);
         };
         macro_rules! fetch {

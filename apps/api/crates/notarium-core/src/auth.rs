@@ -56,6 +56,11 @@ pub enum AuthenticatedCredential {
         run: AgentRunId,
         lease: LeaseEpoch,
     },
+    /// Internal, read-only authority scoped to one search indexing destination.
+    SearchIndexing {
+        space: SpaceId,
+        provider: ProviderResourceId,
+    },
     TrustedNone,
 }
 
@@ -93,6 +98,7 @@ pub enum PrincipalKind {
     AgentRun(AgentRunId),
     Keeper(AgentRunId),
     OAuth { source: GrantId, narrowed: bool },
+    SearchIndexing,
 }
 
 /// Independent authority used for explicit human confirmation of a proposal.
@@ -217,6 +223,7 @@ pub struct EngineAuthContext {
     proposal_read: bool,
     ability_write: bool,
     write_space: Option<SpaceId>,
+    chat_audience: Option<ChatAudience>,
     taint: BranchTaint,
     readonly_abilities: BTreeSet<AbilityId>,
     keeper_log: Option<ChatThreadId>,
@@ -254,6 +261,7 @@ impl EngineAuthContext {
             proposal_read: false,
             ability_write: verified.human_management && verified.ability_write,
             write_space: None,
+            chat_audience: None,
             taint: BranchTaint::default(),
             readonly_abilities: BTreeSet::new(),
             keeper_log: None,
@@ -297,6 +305,7 @@ impl EngineAuthContext {
             human_management: false,
             proposal_read: false,
             write_space: None,
+            chat_audience: None,
             taint: BranchTaint::default(),
             readonly_abilities: BTreeSet::new(),
             keeper_log: None,
@@ -309,6 +318,48 @@ impl EngineAuthContext {
             .values()
             .any(|grant| grant.role != SpaceRole::Viewer && !grant.write_classes.is_empty())
     }
+    /// Internal read-only context scoped to one Space for remote search indexing.
+    /// Never carries human management, write privileges, or encrypted-note reads.
+    pub fn for_search_indexing(
+        principal: PrincipalId,
+        grant: GrantId,
+        space: SpaceId,
+        provider: ProviderResourceId,
+    ) -> Self {
+        let mut read_classes = DocClass::all();
+        read_classes.remove(&DocClass::EncryptedNote);
+        Self {
+            principal,
+            grant,
+            kind: PrincipalKind::SearchIndexing,
+            spaces: BTreeMap::from([(
+                space.clone(),
+                SpaceGrant {
+                    role: SpaceRole::Viewer,
+                    read_classes,
+                    write_classes: BTreeSet::new(),
+                    project_root: None,
+                },
+            )]),
+            human_management: false,
+            proposal_read: false,
+            ability_write: false,
+            write_space: None,
+            chat_audience: None,
+            taint: BranchTaint::default(),
+            readonly_abilities: BTreeSet::new(),
+            keeper_log: None,
+            bearer_scope: None,
+            credential: Some(AuthenticatedCredential::SearchIndexing { space, provider }),
+        }
+    }
+    fn is_search_indexing(&self) -> bool {
+        self.kind == PrincipalKind::SearchIndexing
+            || matches!(
+                self.credential,
+                Some(AuthenticatedCredential::SearchIndexing { .. })
+            )
+    }
     pub fn for_agent_run(
         &self,
         run: AgentRunId,
@@ -319,11 +370,20 @@ impl EngineAuthContext {
         if self.keeper_log.is_some() {
             return Err(DomainError::validation(ValidationReason::ScopeMismatch));
         }
+        if self.is_search_indexing() {
+            return Err(DomainError::AccessDenied);
+        }
         let mut derived = self.narrow(requested)?;
         if !derived.spaces.contains_key(&thread_space) {
             return Err(DomainError::ResourceNotFound);
         }
-        if audience == ChatAudience::Shared {
+        // A nested run derived from a Shared-audience run cannot widen back to Personal.
+        let effective_audience = if self.chat_audience == Some(ChatAudience::Shared) {
+            ChatAudience::Shared
+        } else {
+            audience
+        };
+        if effective_audience == ChatAudience::Shared {
             derived.spaces.retain(|space, _| space == &thread_space);
             for grant in derived.spaces.values_mut() {
                 grant.read_classes.remove(&DocClass::Profile);
@@ -340,6 +400,7 @@ impl EngineAuthContext {
         }
         derived.kind = PrincipalKind::AgentRun(run);
         derived.write_space = Some(thread_space);
+        derived.chat_audience = Some(effective_audience);
         if self.kind == PrincipalKind::DirectHuman {
             derived.taint = BranchTaint::default();
         }
@@ -352,6 +413,9 @@ impl EngineAuthContext {
         project_root: Option<FolderId>,
         readonly_abilities: BTreeSet<AbilityId>,
     ) -> DomainResult<Self> {
+        if self.is_search_indexing() {
+            return Err(DomainError::AccessDenied);
+        }
         let mut grant = self
             .spaces
             .get(&space)
@@ -393,6 +457,9 @@ impl EngineAuthContext {
         if self.keeper_log.is_some() {
             return Err(DomainError::validation(ValidationReason::ScopeMismatch));
         }
+        if self.is_search_indexing() {
+            return Err(DomainError::AccessDenied);
+        }
         let mut derived = self.narrow(requested)?;
         derived.kind = PrincipalKind::OAuth {
             source,
@@ -413,6 +480,9 @@ impl EngineAuthContext {
     pub fn for_pat(&self, requested: BTreeMap<SpaceId, SpaceGrant>) -> DomainResult<Self> {
         if self.keeper_log.is_some() {
             return Err(DomainError::validation(ValidationReason::ScopeMismatch));
+        }
+        if self.is_search_indexing() {
+            return Err(DomainError::AccessDenied);
         }
         let mut derived = self.narrow(requested)?;
         derived.kind = PrincipalKind::Pat;
@@ -514,6 +584,8 @@ impl EngineAuthContext {
             || self.credential != current.credential
             || self.credential.is_none()
             || self.keeper_log != current.keeper_log
+            || (self.kind == PrincipalKind::SearchIndexing)
+                != (current.kind == PrincipalKind::SearchIndexing)
         {
             return Err(DomainError::AuthenticationFailed);
         }
@@ -553,7 +625,13 @@ impl EngineAuthContext {
             && (result.human_management
                 || (result.bearer_scope == Some(BearerScope::Write)
                     && Self::has_writable_space(&result.spaces)));
+        if current.chat_audience == Some(ChatAudience::Shared) {
+            result.chat_audience = Some(ChatAudience::Shared);
+        }
         Ok(result)
+    }
+    pub fn chat_audience(&self) -> Option<ChatAudience> {
+        self.chat_audience
     }
     pub fn grant(&self) -> &GrantId {
         &self.grant
@@ -621,7 +699,9 @@ impl EngineAuthContext {
                 selectors.insert(RevocationSelector::Schedule(schedule.clone()));
                 selectors.insert(RevocationSelector::ScheduledRun(run.clone()));
             }
-            AuthenticatedCredential::Pat(_) | AuthenticatedCredential::TrustedNone => (),
+            AuthenticatedCredential::Pat(_)
+            | AuthenticatedCredential::SearchIndexing { .. }
+            | AuthenticatedCredential::TrustedNone => (),
         }
         for space in spaces {
             if !self.spaces.contains_key(space) {
@@ -642,7 +722,9 @@ impl EngineAuthContext {
         &self.taint
     }
     pub fn human_management(&self) -> bool {
-        self.human_management && self.kind == PrincipalKind::DirectHuman
+        !self.is_search_indexing()
+            && self.human_management
+            && self.kind == PrincipalKind::DirectHuman
     }
     pub fn authorize_human_management(&self) -> DomainResult<()> {
         if self.human_management() {
@@ -702,7 +784,8 @@ impl EngineAuthContext {
     pub fn has_cap(&self, cap: Cap) -> bool {
         match cap {
             Cap::AbilityWrite => {
-                self.ability_write
+                !self.is_search_indexing()
+                    && self.ability_write
                     && matches!(
                         self.kind,
                         PrincipalKind::DirectHuman
@@ -799,6 +882,75 @@ impl EngineAuthContext {
         }
         Ok(())
     }
+    /// Candidate filter for the current principal's personal threads, before a
+    /// search result supplies a specific thread identity.
+    pub fn can_view_own_personal_chat(
+        &self,
+        space: &Space,
+        project: Option<&FolderId>,
+        tainted: bool,
+    ) -> DomainResult<()> {
+        if self.chat_audience == Some(ChatAudience::Shared)
+            || matches!(self.kind, PrincipalKind::Keeper(_))
+            || self.keeper_log.is_some()
+        {
+            return Err(DomainError::ResourceNotFound);
+        }
+        self.can_view_chat(space, project, tainted)
+    }
+
+    /// Check thread visibility without marking a candidate as a delivered read.
+    pub fn can_view_chat_thread(
+        &self,
+        space: &Space,
+        thread: &ChatThreadId,
+        kind: crate::ports::ChatThreadKind,
+        owner: &PrincipalId,
+        project: Option<&FolderId>,
+        tainted: bool,
+    ) -> DomainResult<()> {
+        use crate::ports::ChatThreadKind;
+        if kind != ChatThreadKind::SpaceGroup && owner != &self.principal {
+            return Err(DomainError::ResourceNotFound);
+        }
+        if kind == ChatThreadKind::Personal {
+            return self.can_view_own_personal_chat(space, project, tainted);
+        }
+        if (matches!(self.kind, PrincipalKind::Keeper(_)) || self.keeper_log.is_some())
+            && (kind != ChatThreadKind::KeeperLog
+                || self.keeper_log.as_ref() != Some(thread)
+                || self
+                    .spaces
+                    .get(&space.id)
+                    .and_then(|grant| grant.project_root.as_ref())
+                    != project)
+        {
+            return Err(DomainError::ResourceNotFound);
+        }
+        self.can_view_chat(space, project, tainted)
+    }
+    /// Marks branch taint after a chat thread has passed visibility checks and is
+    /// actually delivered to the caller.
+    pub fn mark_chat_read_taint(&self, space: &Space, tainted: bool) {
+        if tainted || self.write_space.as_ref().is_some_and(|id| id != &space.id) {
+            self.taint.mark_external_read();
+        }
+    }
+    /// Full chat thread read authorization, enforcing Space membership, Personal
+    /// thread ownership, ChatAudience::Shared isolation, project pin and taint.
+    pub fn authorize_chat_thread_read(
+        &self,
+        space: &Space,
+        thread: &ChatThreadId,
+        kind: crate::ports::ChatThreadKind,
+        owner: &PrincipalId,
+        project: Option<&FolderId>,
+        tainted: bool,
+    ) -> DomainResult<()> {
+        self.can_view_chat_thread(space, thread, kind, owner, project, tainted)?;
+        self.mark_chat_read_taint(space, tainted);
+        Ok(())
+    }
     /// Chat provenance is separate from document classes. Project-scoped grants
     /// may read only chat transcripts explicitly pinned to their exact project.
     pub fn authorize_chat_read(
@@ -807,6 +959,23 @@ impl EngineAuthContext {
         project: Option<&FolderId>,
         tainted: bool,
     ) -> DomainResult<()> {
+        self.can_view_chat(space, project, tainted)?;
+        if tainted || self.write_space.as_ref().is_some_and(|id| id != &space.id) {
+            self.taint.mark_external_read();
+        }
+        Ok(())
+    }
+
+    /// Chat visibility check for candidate filtering without recording a read.
+    pub fn can_view_chat(
+        &self,
+        space: &Space,
+        project: Option<&FolderId>,
+        tainted: bool,
+    ) -> DomainResult<()> {
+        if self.is_search_indexing() {
+            return Err(DomainError::ResourceNotFound);
+        }
         let grant = self
             .spaces
             .get(&space.id)
@@ -822,9 +991,6 @@ impl EngineAuthContext {
         if tainted && space.kind == SpaceKind::Shared {
             return Err(DomainError::CrossSpaceTainted);
         }
-        if tainted || self.write_space.as_ref().is_some_and(|id| id != &space.id) {
-            self.taint.mark_external_read();
-        }
         Ok(())
     }
     /// Confines every write, including personal chat, to the run's admitted Space.
@@ -838,6 +1004,7 @@ impl EngineAuthContext {
             || self.bearer_scope == Some(BearerScope::Read)
             || (matches!(self.kind, PrincipalKind::Pat | PrincipalKind::OAuth { .. })
                 && self.bearer_scope != Some(BearerScope::Write))
+            || self.is_search_indexing()
             || self
                 .write_space
                 .as_ref()

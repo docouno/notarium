@@ -365,6 +365,7 @@ pub use super::schedules::*;
 pub struct ProviderSelection {
     pub provider: ProviderResourceId,
     pub model: ModelProfileId,
+    pub runtime_epochs: ProviderRuntimeEpochs,
     pub project: Option<FolderRef>,
     pub project_only: Option<FolderRef>,
     pub policy: ProviderPolicy,

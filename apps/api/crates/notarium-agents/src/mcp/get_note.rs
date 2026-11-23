@@ -7,7 +7,7 @@ use notarium_core::{
     ports::{
         GetNote, GraphNodeId, GraphQuery, GraphTier, PageLimit, SpaceContext, ViewQuery, ViewRef,
     },
-    query::{Direction, FieldFilterAstV1, Predicate, ReadRequest, SortColumn, SortKey, SortSpec},
+    query::{FieldFilterAstV1, Predicate, ReadRequest},
     receipt::CausalBasis,
     value::YamlValue,
 };
@@ -189,10 +189,7 @@ async fn describe_view(
                         key: key.clone(),
                     },
                     filter: unconstrained(),
-                    sort: SortSpec::new(vec![SortKey {
-                        column: SortColumn::UpdatedAt,
-                        direction: Direction::Desc,
-                    }])?,
+                    sort: None,
                     group_by: None,
                     limit: PageLimit::new(limit)?,
                 },

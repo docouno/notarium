@@ -33,8 +33,8 @@ impl BodyFormat {
 }
 
 #[derive(Serialize, Deserialize)]
-struct ModelTurn {
-    text: String,
+pub(super) struct ModelTurn {
+    pub(super) text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     interruption: Option<CompletionFinish>,
     tool_calls: Vec<ProviderToolCall>,
@@ -424,8 +424,7 @@ pub(super) async fn checkpoint_boundary(
                 if row.kind != "compaction" {
                     return Err(DomainError::validation(ValidationReason::SourceMismatch).into());
                 }
-                authorize_thread_read(
-                    ctx.auth(),
+                ctx.auth().authorize_chat_thread_read(
                     &space.space,
                     &thread.id,
                     head.kind,
@@ -478,8 +477,7 @@ pub(crate) async fn chat_source_tx(
     entry: ThreadEntrySeq,
 ) -> Result<ChatSource, PortError> {
     let thread = load_thread_head_tx(tx, &space.scope.space_id, thread_id).await?;
-    authorize_thread_read(
-        auth,
+    auth.can_view_chat_thread(
         &space.space,
         thread_id,
         thread.kind,
@@ -491,8 +489,7 @@ pub(crate) async fn chat_source_tx(
     if row.is_redacted() {
         return Err(DomainError::ResourceNotFound.into());
     }
-    authorize_thread_read(
-        auth,
+    auth.authorize_chat_thread_read(
         &space.space,
         thread_id,
         thread.kind,
@@ -601,6 +598,26 @@ fn decode_proposal(text: &str) -> Result<ProposalTurn, PortError> {
         .map_err(|error| internal_not_committed("decode_chat_proposal", error.to_string()))
 }
 
+/// Decode the durable body before exposing transcript or search text.
+pub(super) fn decode_turn(format: i32, kind: &str, body: String) -> Result<ModelTurn, PortError> {
+    let text = match (format, kind) {
+        (0, _) => body,
+        (1, "model") => return decode_model(&body),
+        (2, "tool") => decode_proposal(&body)?.text,
+        _ => {
+            return Err(internal_not_committed(
+                "chat_body_format",
+                "wrong chat payload format",
+            ));
+        }
+    };
+    Ok(ModelTurn {
+        text,
+        tool_calls: Vec::new(),
+        interruption: None,
+    })
+}
+
 pub(super) async fn read_chat_contents(
     store: &CanonicalStore,
     ctx: SpaceContext,
@@ -620,8 +637,7 @@ pub(super) async fn read_chat_contents(
                 let space = load_space_record(tx, &scope.space_id).await?;
                 space.scope.check(&scope)?;
                 let thread = load_thread_head_tx(tx, &scope.space_id, &request.thread).await?;
-                authorize_thread_read(
-                    &auth,
+                auth.can_view_chat_thread(
                     &space.space,
                     &request.thread,
                     thread.kind,
@@ -631,8 +647,7 @@ pub(super) async fn read_chat_contents(
                 )?;
                 let tainted =
                     read_leaf_taint(tx, &scope.space_id, &request.thread, request.leaf).await?;
-                authorize_thread_read(
-                    &auth,
+                auth.authorize_chat_thread_read(
                     &space.space,
                     &request.thread,
                     thread.kind,
@@ -658,24 +673,11 @@ pub(super) async fn read_chat_contents(
             started,
         )
         .await?;
-        let (text, tool_calls, interruption) = match row.body_format {
-            0 => (body, Vec::new(), None),
-            1 if row.kind == "model" => {
-                let ModelTurn {
-                    text,
-                    tool_calls,
-                    interruption,
-                } = decode_model(&body)?;
-                (text, tool_calls, interruption)
-            }
-            2 if row.kind == "tool" => (decode_proposal(&body)?.text, Vec::new(), None),
-            _ => {
-                return Err(internal_not_committed(
-                    "chat_body_format",
-                    "wrong chat payload format",
-                ));
-            }
-        };
+        let ModelTurn {
+            text,
+            tool_calls,
+            interruption,
+        } = decode_turn(row.body_format, &row.kind, body)?;
         let content = transcript(ctx.auth(), &space.space, &thread, &row, text)?;
         results.push(HydratedChatEntry {
             seq: row.seq()?,
@@ -713,8 +715,7 @@ pub(super) async fn read_chat_proposal(
                 {
                     return Err(DomainError::ResourceNotFound.into());
                 }
-                authorize_thread_read(
-                    &writer_auth,
+                writer_auth.authorize_chat_thread_read(
                     &space.space,
                     &request.thread,
                     thread.kind,

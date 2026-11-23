@@ -14,6 +14,14 @@ pub mod config;
 mod dialect;
 pub mod domain;
 pub mod peers;
+pub mod projection_chat;
+pub use projection_chat::{
+    ProjectionChatChange, ProjectionChatChangePage, ProjectionChatChangePosition,
+    ProjectionChatEntryKey, ProjectionChatHead, ProjectionChatPage, ProjectionChatPosition,
+    ProjectionChatRef, ProjectionChatRefLimits, ProjectionChatRefLocator,
+};
+mod projection_fence;
+pub mod projection_read;
 pub mod runtime;
 pub mod schema;
 pub(crate) mod sql_exec;
@@ -30,7 +38,8 @@ pub use backup::{
 };
 
 pub use changes::{
-    ChangedNoteSummaryV1, EFFECT_CODEC_V1, EffectBodyV1, EffectEnvelopeV1, StoredAwaitReasonV1,
+    BroadcastSignal as SpaceSignal, ChangedNoteSummaryV1, CommittedTargets, EFFECT_CODEC_V1,
+    EffectBodyV1, EffectEnvelopeV1, ProjectionCatalogSubscription, StoredAwaitReasonV1,
     build_effect_payload_draft,
 };
 pub use config::{
@@ -41,11 +50,23 @@ pub use config::{
 #[cfg(feature = "test-support")]
 pub use dialect::postgres::build_pg_connect_options;
 pub use dialect::{DataRootOwnerLock, sqlite::observe_sqlite_canonical_witness};
-pub use domain::{RoomFenceTable, SpaceSchemaRevision, UpdateSpaceSchema};
+pub use domain::{RoomCommandSettlement, RoomFenceTable, SpaceSchemaRevision, UpdateSpaceSchema};
+#[cfg(any(test, feature = "test-support"))]
+pub use peers::AppendCollabUpdate;
 pub use peers::{
-    AppendCollabUpdate, CheckpointCollabSession, ClaimedContentJob, CloseCollabSession,
-    CollabCarrierSettlement, CollabRoomState, CollabSessionRecord, CollabSessionSnapshot,
-    CollabUpdateEntry, JobCompletionOutcome, OpenCollabSession,
+    ActiveRoomFacts, AppendCollabUpdates, CheckpointCollabSession, ClaimedContentJob,
+    CloseCollabSession, CollabCarrierSettlement, CollabRoomState, CollabSessionRecord,
+    CollabSessionSnapshot, CollabSettlementActor, CollabUpdateEntry, FenceCollabSession,
+    FencedCollabRecovery, JobCompletionOutcome, NoteCollabAdmission, NoteCollabAdmissionMeta,
+    OpenCollabSession, RoomWalEntry,
+};
+#[cfg(feature = "test-support")]
+pub use projection_fence::FenceCensusFixture;
+pub use projection_fence::{
+    FenceMemoryUsage, LiveDenseLookup, LiveLifecycleFence, LiveNoteStatus, LiveReadPermit,
+    LiveSpaceHandle, ProjectionCleanupRegistration, ProjectionErasures, ProjectionOwnerIdentity,
+    ProjectionOwnerWitness, ProjectionRedactedEntry, ProjectionVisibilityCleanup,
+    StoppedProjectionDeployment, StoppedProjectionOwner,
 };
 pub use runtime::{
     CanonicalRuntime, CanonicalStore, CreateFolderSpec, CreateSpaceSpec, SpaceRecord,

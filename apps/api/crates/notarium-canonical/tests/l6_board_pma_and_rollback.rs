@@ -10,6 +10,8 @@ mod historical_deadline;
 mod note_states;
 #[path = "l6_board_pma_and_rollback/pg_deadline.rs"]
 mod pg_deadline;
+#[path = "l6_board_pma_and_rollback/projection_rank_history.rs"]
+mod projection_rank_history;
 #[path = "l6_board_pma_and_rollback/rollback_deadline.rs"]
 mod rollback_deadline;
 mod support;
@@ -139,6 +141,11 @@ async fn seed_space(
     (rec.scope, root)
 }
 
+type MovePlannerPause = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
+
 /// Real canonical-reading test `BoardMutationFactsProvider` that evaluates board membership by reading
 /// `status` frontmatter from canonical notes (excluding `status == "archived"` as `OutsideView`),
 /// sorts each column by `(overlay_rank_or_unranked, slug, note_id)`, and supports deterministic
@@ -148,8 +155,10 @@ struct CanonicalTestBoardPlanner {
     tracked_notes: Mutex<BTreeSet<NoteId>>,
     forge_authority_once: AtomicBool,
     inject_stale_cutoff_once: AtomicBool,
+    stale_rollback_responses: AtomicUsize,
     evaluate_move_calls: AtomicUsize,
     move_waits: Mutex<Option<Vec<std::time::Duration>>>,
+    move_pause_once: Mutex<Option<MovePlannerPause>>,
 }
 
 impl CanonicalTestBoardPlanner {
@@ -159,8 +168,10 @@ impl CanonicalTestBoardPlanner {
             tracked_notes: Mutex::new(tracked_notes.into_iter().collect()),
             forge_authority_once: AtomicBool::new(false),
             inject_stale_cutoff_once: AtomicBool::new(false),
+            stale_rollback_responses: AtomicUsize::new(0),
             evaluate_move_calls: AtomicUsize::new(0),
             move_waits: Mutex::new(None),
+            move_pause_once: Mutex::new(None),
         })
     }
 
@@ -191,6 +202,11 @@ impl BoardMutationFactsProvider for CanonicalTestBoardPlanner {
     ) -> PortFuture<'a, BoardMoveFacts> {
         Box::pin(async move {
             self.evaluate_move_calls.fetch_add(1, Ordering::SeqCst);
+            let pause = self.move_pause_once.lock().unwrap().take();
+            if let Some((entered, release)) = pause {
+                entered.send(()).unwrap();
+                release.await.unwrap();
+            }
             let wait_number = self.move_waits.lock().unwrap().as_mut().map(|waits| {
                 waits.push(ctx.budget.remaining);
                 waits.len()
@@ -235,7 +251,7 @@ impl BoardMutationFactsProvider for CanonicalTestBoardPlanner {
             let mut target_cur_group: Option<GroupKey> = None;
 
             for nid in tracked {
-                let Ok(snap) = self
+                let snap = match self
                     .store
                     .get_note(
                         ctx.clone(),
@@ -246,8 +262,12 @@ impl BoardMutationFactsProvider for CanonicalTestBoardPlanner {
                         },
                     )
                     .await
-                else {
-                    continue;
+                {
+                    Ok(snap) => snap,
+                    Err(PortError::Domain(
+                        DomainError::ResourceNotFound | DomainError::AccessDenied,
+                    )) => continue,
+                    Err(error) => return Err(error),
                 };
                 let listing = snap.document.listing(ctx.auth())?;
                 if listing.lifecycle() != Lifecycle::Active {
@@ -258,13 +278,15 @@ impl BoardMutationFactsProvider for CanonicalTestBoardPlanner {
                 if nid == intent.note {
                     target_slug = slug.clone();
                 }
-                let status_opt = match snap.fields.get("status") {
+                let grp_opt = match snap.fields.get("status") {
                     Some(FieldObservation::Ok(FieldValue::Scalar(ScalarValue::String(s)))) => {
-                        Some(s.as_str())
+                        Self::group_from_status_str(Some(s))
                     }
-                    _ => None,
+                    Some(FieldObservation::Ok(FieldValue::Scalar(
+                        number @ ScalarValue::Number(_),
+                    ))) => Some(GroupKey::Value(number.clone())),
+                    _ => Self::group_from_status_str(None),
                 };
-                let grp_opt = Self::group_from_status_str(status_opt);
                 if nid == intent.note {
                     target_cur_group = grp_opt.clone();
                 }
@@ -362,7 +384,14 @@ impl BoardMutationFactsProvider for CanonicalTestBoardPlanner {
                     schema_revision: None,
                     descriptor_fingerprint: ContentDigest::from_bytes([0u8; 32]),
                     group_field: "status".to_owned(),
-                    group_field_kind: BoardGroupFieldKind::String,
+                    group_field_kind: if matches!(
+                        intent.group,
+                        GroupKey::Value(ScalarValue::Number(_))
+                    ) {
+                        BoardGroupFieldKind::Number
+                    } else {
+                        BoardGroupFieldKind::String
+                    },
                     groups,
                     before_placement,
                     base_order_binding: Self::binding_for(&target_slug, &intent.note),
@@ -379,6 +408,15 @@ impl BoardMutationFactsProvider for CanonicalTestBoardPlanner {
         request: RollbackBoardFactsRequest,
     ) -> PortFuture<'a, RollbackBoardFacts> {
         Box::pin(async move {
+            if self
+                .stale_rollback_responses
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                    count.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(DomainError::validation(ValidationReason::CursorStale).into());
+            }
             let scope = ctx.scope().clone();
             let space_rec = self.store.read_space(&scope.space_id).await?;
             let tracked: Vec<NoteId> = self
@@ -435,7 +473,7 @@ impl BoardMutationFactsProvider for CanonicalTestBoardPlanner {
                 }
 
                 for nid in &tracked {
-                    let Ok(snap) = self
+                    let snap = match self
                         .store
                         .get_note(
                             ctx.clone(),
@@ -446,8 +484,12 @@ impl BoardMutationFactsProvider for CanonicalTestBoardPlanner {
                             },
                         )
                         .await
-                    else {
-                        continue;
+                    {
+                        Ok(snap) => snap,
+                        Err(PortError::Domain(
+                            DomainError::ResourceNotFound | DomainError::AccessDenied,
+                        )) => continue,
+                        Err(error) => return Err(error),
                     };
                     let listing = snap.document.listing(ctx.auth())?;
                     if listing.lifecycle() != Lifecycle::Active {
@@ -978,7 +1020,23 @@ async fn run_move_board_card_suite(store: &CanonicalStore) -> BoardEffects {
         }
     ));
 
-    applied::check(store, &ctx, &view, view_created.value.revision, &planner).await;
+    // Poll the live-interception scenarios as their own task. Their nested
+    // PostgreSQL futures otherwise share the stack of this entire parity suite.
+    let room_store = store.clone();
+    let room_ctx = ctx.clone();
+    let room_view = view.clone();
+    tokio::spawn(async move {
+        applied::check(
+            &room_store,
+            &room_ctx,
+            &room_view,
+            view_created.value.revision,
+            &planner,
+        )
+        .await
+    })
+    .await
+    .unwrap();
 
     assert_eq!(
         store
@@ -1606,6 +1664,15 @@ async fn run_rollback_agent_run_suite(store: &CanonicalStore) {
             .await,
         Err(PortError::Domain(DomainError::ResourceNotFound))
     ));
+    planner.stale_rollback_responses.store(5, Ordering::SeqCst);
+    assert!(matches!(
+        store.rollback_agent_run(human_ctx.clone(), board_rollback.clone()).await,
+        Err(PortError::Domain(DomainError::ValidationFailed { diagnostic })) if diagnostic.reason == ValidationReason::CursorStale
+    ));
+    assert_eq!(
+        planner.stale_rollback_responses.swap(0, Ordering::SeqCst),
+        1
+    );
     let rollback_committed = store
         .rollback_agent_run(human_ctx.clone(), board_rollback.clone())
         .await
@@ -1672,6 +1739,72 @@ async fn run_rollback_agent_run_suite(store: &CanonicalStore) {
     assert!(
         !post_overlays.contains_key(&n_created),
         "trashed run-created note overlay must be deleted"
+    );
+    let key = format!("{}:{}:{}", view.note, view.key, n_created);
+    let rank_tombstone = store
+        .read_entity_revision_at_cutoff(
+            &scope,
+            "rank",
+            &key,
+            Some(rollback_committed.receipt.seq()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        rank_tombstone.visibility_seq,
+        rollback_committed.receipt.seq()
+    );
+    assert_ne!(
+        rank_tombstone.revision_id,
+        cur_overlays[&n_created].rank_rev_id
+    );
+    let notarium_canonical::codec::RevisionMetadataPayload::Rank(removed) =
+        rank_tombstone.metadata.payload
+    else {
+        panic!("expected rank tombstone");
+    };
+    assert!(removed.removed);
+    assert_eq!(removed.view_note_id, view.note);
+    assert_eq!(removed.view_key, view.key);
+    assert_eq!(removed.target_note_id, n_created);
+    let old = store
+        .read_entity_revision_at_cutoff(
+            &scope,
+            "rank",
+            &key,
+            Some(cur_overlays[&n_created].updated_seq),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(old.revision_id, cur_overlays[&n_created].rank_rev_id);
+    assert!(matches!(
+        old.metadata.payload,
+        notarium_canonical::codec::RevisionMetadataPayload::Rank(rank) if !rank.removed
+    ));
+    let projection = support::maintenance_ctx(notarium_core::ports::ServicePurpose::Projection);
+    let ranked = store
+        .read_projection_overlays_page(
+            &projection,
+            &scope,
+            rollback_committed.receipt.seq(),
+            None,
+            notarium_core::ports::PageLimit::new(200).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        ranked
+            .rows
+            .iter()
+            .all(|row| row.metadata.target_note_id != n_created)
+    );
+    assert!(
+        ranked
+            .rows
+            .iter()
+            .any(|row| row.metadata.target_note_id == n_pre)
     );
     assert_eq!(post_overlays[&n_pre].group, todo_grp);
     assert!(
@@ -1798,6 +1931,15 @@ async fn run_rollback_agent_run_suite(store: &CanonicalStore) {
         seq_before_abort, seq_after_abort,
         "aborted RollbackAgentRun must leave last_seq untouched"
     );
+    projection_rank_history::check_board_exit_tombstones_rank(
+        store,
+        &scope,
+        &owner,
+        &planner,
+        &view,
+        view_c.value.revision,
+    )
+    .await;
     check_rollback_destination_authority(store, &scope, &owner).await;
 }
 
@@ -1807,7 +1949,7 @@ async fn l6_move_board_card_planner_cutoff_and_pma_dual_dialect_parity() {
         let root = TempDataRoot::new("l6-move-sqlite");
         let cfg = CanonicalConfig::local_default(sample_installation_id(1), root.data_root());
         let (store, runtime) = CanonicalRuntime::open(cfg).await.expect("open sqlite");
-        let evidence = run_move_board_card_suite(&store).await;
+        let evidence = Box::pin(run_move_board_card_suite(&store)).await;
         let mut conn = root.open_raw_sqlite().await;
         let bytes: Vec<u8> = sqlx::query_scalar(
             "SELECT effect_msgpack FROM change_payloads WHERE created_seq=? AND codec='effect_v1'",
@@ -1835,7 +1977,7 @@ async fn l6_move_board_card_planner_cutoff_and_pma_dual_dialect_parity() {
             .expect("ensure S3 bucket");
         let cfg = fixtures.pg_s3_config(sample_installation_id(2), &schema, s3_cfg);
         let (store, runtime) = CanonicalRuntime::open(cfg).await.expect("open pg+s3");
-        let evidence = run_move_board_card_suite(&store).await;
+        let evidence = Box::pin(run_move_board_card_suite(&store)).await;
         let mut conn = fixtures.open_raw_pg().await;
         let bytes: Vec<u8> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT effect_msgpack FROM {schema}.change_payloads WHERE created_seq=$1 AND codec='effect_v1'")))
             .bind(evidence.column_change.get() as i64).fetch_one(&mut conn).await.unwrap();
@@ -2090,6 +2232,7 @@ async fn check_rollback_with_dirty_room(
         .close_collab_session(
             &make_budget(),
             CloseCollabSession {
+                unchanged_carrier_digest: None,
                 scope: scope.clone(),
                 note: note.clone(),
                 owner_id: Some("room-owner".into()),
@@ -2377,6 +2520,7 @@ async fn run_note_only_rollback_suite(
         .close_collab_session(
             &make_budget(),
             notarium_canonical::peers::CloseCollabSession {
+                unchanged_carrier_digest: None,
                 scope: scope.clone(),
                 note: n_ed.clone(),
                 owner_id: Some("room-owner".into()),

@@ -10,15 +10,18 @@ use notarium_core::{
         ClassEgressFence, ClassifiedDocument, ClassifiedMetadata, DocClass, authorize_field_key,
     },
     error::{Diagnostic, PortError, ValidationReason},
-    ids::{BodyIdentity, ContentDigest, HeaderIdentity, NoteId, RevisionId, SpaceId, SpaceSeq},
+    ids::{
+        BodyIdentity, ContentDigest, HeaderIdentity, LeaseEpoch, LineageEpoch, NoteId, RevisionId,
+        SpaceId, SpaceSeq,
+    },
     model::{FolderRef, Lifecycle, NoteRef, PathTarget, SnapshotCut},
     patch::{CarrierEditOrigin, CarrierPatchPlan, HeaderMutation},
     ports::{
         AcceptBatch, BatchItem, BatchResult, Committed, CreateNote, DeleteDisposition, DeleteNote,
         EditNote, ExternalObservation, ExternalObservationResult, FilenamePin, GetNote,
-        InterceptedMutation, InterceptedPayload, InterceptionResult, Link, LinkBatch, LinkTarget,
-        MoveNote, Mutation, NoteCard, NoteRevision, NoteSnapshot, ObservedContent, Preconditions,
-        RenameNote, RollbackReservation, SpaceContext,
+        InterceptedMutation, InterceptedOutcome, InterceptedPayload, InterceptionResult, Link,
+        LinkBatch, LinkTarget, MoveNote, Mutation, NoteCard, NoteRevision, NoteSnapshot,
+        ObservedContent, Preconditions, RenameNote, RollbackReservation, SpaceContext,
     },
     query::{FieldObservation, FieldValue},
     receipt::{CausalBasis, CommandIdentity, MutationReceiptToken},
@@ -43,13 +46,14 @@ use crate::{
         normalize_title_key, now_utc_timestamp, unavailable_retryable,
     },
     domain::common::{
-        FolderAncestryCache, SpaceSchemaRevision, StoredCommittedLinkV1, StoredCommittedNoteRevV1,
-        StoredCommittedSchemaRevV1, StoredExternalObsOutcomeV1, UpdateSpaceSchema,
-        active_note_sibling_exists_tx, build_resource_facts_tx, check_collab_preconditions_tx,
-        derive_command_identity_spec, extract_agent_run_from_auth, extract_note_preview,
-        extract_note_title, insert_note_alias_tx, is_note_room_active_tx,
-        load_current_space_schema_tx, load_folder_ancestry_tx, load_note_head_row_opt_tx,
-        load_note_head_row_tx, note_rank_version_digest, schema_descriptor_bytes_and_fingerprint,
+        CommandDeadline, FolderAncestryCache, NoteHeadRow, SpaceSchemaRevision,
+        StoredCommittedLinkV1, StoredCommittedNoteRevV1, StoredCommittedSchemaRevV1,
+        StoredExternalObsOutcomeV1, UpdateSpaceSchema, active_note_sibling_exists_tx,
+        build_resource_facts_tx, check_collab_preconditions_tx, derive_command_identity_spec,
+        extract_agent_run_from_auth, extract_note_preview, extract_note_title,
+        insert_note_alias_tx, is_note_room_active_tx, load_current_space_schema_tx,
+        load_folder_ancestry_tx, load_note_head_row_opt_tx, load_note_head_row_tx,
+        note_rank_version_digest, schema_descriptor_bytes_and_fingerprint,
         upsert_agent_run_head_tx, validate_mutation_identity,
     },
     runtime::{
@@ -71,6 +75,179 @@ pub(crate) struct PreparedCarrierInfo {
 }
 
 pub(crate) type EvaluatedFields = BTreeMap<String, FieldObservation<FieldValue>>;
+
+/// Canonical carrier and CRDT snapshot prepared by the actor owning this room lease.
+#[derive(Clone)]
+pub struct RoomCommandSettlement {
+    pub owner_id: String,
+    pub expected_lease: LeaseEpoch,
+    pub expected_lineage: LineageEpoch,
+    pub expected_base_rev: RevisionId,
+    pub final_carrier: String,
+    pub yrs_snapshot: Vec<u8>,
+    pub compacted_through_update_seq: Option<u64>,
+}
+
+pub(super) struct PreparedRoomCommand {
+    pub space: crate::SpaceRecord,
+    pub head: NoteHeadRow,
+    pub base_carrier: String,
+    pub final_carrier: String,
+    pub transition: crate::peers::RoomCarrierTransition,
+}
+
+pub(super) async fn prepare_room_command(
+    store: &CanonicalStore,
+    ctx: &mut SpaceContext,
+    deadline: CommandDeadline,
+    note: &NoteId,
+    settlement: RoomCommandSettlement,
+) -> Result<PreparedRoomCommand, PortError> {
+    let transition = crate::peers::RoomCarrierTransition::for_room_command(
+        settlement.owner_id,
+        settlement.expected_lease,
+        settlement.expected_lineage,
+        settlement.yrs_snapshot,
+        settlement.compacted_through_update_seq,
+    );
+    ctx.budget.remaining = deadline.remaining(&ctx.budget)?;
+    let (space, head) = deadline
+        .prepare(&ctx.budget, || {
+            transition.check_before_staging(
+                store,
+                &ctx.budget,
+                ctx.scope(),
+                note,
+                ctx.auth(),
+                Some(&settlement.expected_base_rev),
+            )
+        })
+        .await?;
+    if head.doc_class != DocClass::UserDoc {
+        return Err(DomainError::validation(ValidationReason::ClassMismatch).into());
+    }
+    let digest = head.content_digest.ok_or_else(|| {
+        internal_not_committed(
+            "room_missing_digest",
+            "active room note lacks content_blake3",
+        )
+    })?;
+    ctx.budget.remaining = deadline.remaining(&ctx.budget)?;
+    let bytes = deadline
+        .prepare(&ctx.budget, || {
+            store.read_verified_blob_with_budget(&space.scope, digest, Some(&ctx.budget))
+        })
+        .await?;
+    let base_carrier = String::from_utf8(bytes).map_err(|_| {
+        internal_not_committed(
+            "room_corrupt_utf8",
+            "active room carrier is not valid UTF-8",
+        )
+    })?;
+    Ok(PreparedRoomCommand {
+        space,
+        head,
+        base_carrier,
+        final_carrier: settlement.final_carrier,
+        transition,
+    })
+}
+
+impl PreparedRoomCommand {
+    pub async fn stage_carrier(
+        &self,
+        store: &CanonicalStore,
+        budget: &notarium_core::ports::CallBudget,
+        deadline: CommandDeadline,
+    ) -> Result<(PreparedCarrierInfo, crate::blobs::StagedBlobTicket), PortError> {
+        let header = enforce_room_frontmatter_unchanged_with_header(
+            &self.base_carrier,
+            &self.final_carrier,
+            self.head.doc_class,
+        )?;
+        let info = analyze_and_prepare_carrier_opt_preparsed(
+            &self.final_carrier,
+            self.head.doc_class,
+            &self.head.note_id,
+            &self.head.slug,
+            store.blob_codec(),
+            header,
+        )?;
+        let ticket = deadline
+            .prepare(budget, || {
+                store.stage_blob_for_batch_prechecked(
+                    &self.space.scope,
+                    self.space.active_epoch,
+                    &info.prepared_blob,
+                )
+            })
+            .await?;
+        Ok((info, ticket))
+    }
+}
+
+impl CanonicalStore {
+    pub fn derive_carrier_identities(revision: &RevisionId) -> (BodyIdentity, HeaderIdentity) {
+        derive_body_header_identities(revision)
+    }
+
+    /// Commit the original edit and its complete room state in the same writer transaction.
+    pub async fn commit_intercepted_edit_note(
+        &self,
+        mut ctx: SpaceContext,
+        identity: CommandIdentity,
+        preconditions: Preconditions,
+        input: EditNote,
+        settlement: RoomCommandSettlement,
+    ) -> Result<Committed<NoteRevision>, PortError> {
+        let deadline = CommandDeadline::start(&ctx.budget, "edit_room");
+        let active_op = self.enter_write_op(&ctx.scope().space_id)?;
+        validate_mutation_identity(&ctx, &identity)?;
+        let idemp = edit_note_identity(&ctx, &identity, &input, &preconditions);
+        if let Some(replayed) = deadline
+            .prepare(&ctx.budget, || {
+                try_replay_completed_receipt::<StoredCommittedNoteRevV1>(
+                    self,
+                    ctx.scope(),
+                    &idemp,
+                    Some(&ctx.budget),
+                )
+            })
+            .await?
+        {
+            return Ok(replayed.into_committed());
+        }
+        let work = prepare_room_command(self, &mut ctx, deadline, &input.note, settlement).await?;
+        let (info, ticket) = work.stage_carrier(self, &ctx.budget, deadline).await?;
+        let intent = build_carrier_replacement_intent(
+            self,
+            &work.space.scope,
+            work.space.active_epoch,
+            Some(idemp),
+            "edit_note",
+            ctx.auth().clone(),
+            identity,
+            preconditions,
+            input.note,
+            work.head.head_rev_id,
+            CarrierReplacement::Edit,
+            info,
+            ticket,
+            Some(CarrierRoomWrite::Accepted(work.transition)),
+        );
+        let stored: StoredCommittedNoteRevV1 = self
+            .submit_write_command_until(
+                &ctx.budget,
+                deadline.at,
+                intent,
+                None,
+                None,
+                Some(active_op),
+            )
+            .await?;
+        Ok(stored.into_committed())
+    }
+}
 
 pub(crate) fn revision_fields(bytes: &[u8]) -> Result<EvaluatedFields, PortError> {
     match RevisionMetadataEnvelope::decode(bytes)?.payload {
@@ -266,19 +443,12 @@ fn collab_raw_header(
     class: DocClass,
     identity: HeaderIdentity,
 ) -> Result<HeaderMutation, PortError> {
-    let old = notarium_syntax::frontmatter::analyze(before, class)?
-        .carrier
-        .body;
-    let new = notarium_syntax::frontmatter::analyze(after, class)?
-        .carrier
-        .body;
-    if before[..old.start()] == after[..new.start()] {
-        return Ok(HeaderMutation::Preserve);
-    }
-    let carrier = format!("{}{}", &after[..new.start()], old.slice(before)?);
-    Ok(HeaderMutation::RawHeader(
-        notarium_syntax::live::raw_header_plan(before, &carrier, class, identity)?,
-    ))
+    Ok(
+        match notarium_syntax::live::raw_header_plan_between(before, after, class, identity)? {
+            Some(plan) => HeaderMutation::RawHeader(plan),
+            None => HeaderMutation::Preserve,
+        },
+    )
 }
 
 fn create_note_identity(
@@ -1084,109 +1254,100 @@ pub(crate) async fn edit_note_impl(
 
     let mut reservation_opt = None;
     if let Some(interceptor) = store.inner.collab_interceptor.get()
-        && idemp.requires_standard_writer()
-        && base_head.doc_class != DocClass::EncryptedNote
+        && base_head.doc_class == DocClass::UserDoc
     {
-        // An Applied interceptor reply bypasses the guarded writer. A reservation
-        // lets this edit retain authority until the canonical transaction settles.
-        ctx.budget.remaining = deadline.remaining(&budget)?;
-        let reserve = deadline
-            .wait(&budget, || {
-                interceptor.reserve_rollback(
-                    ctx.clone(),
-                    request.input.note.clone(),
-                    request.identity.clone(),
-                )
-            })
-            .await??;
-        match reserve {
-            RollbackReservation::Closed(reservation) => {
-                reservation_opt = Some(CarrierRoomWrite::Reserved(reservation));
-            }
-            RollbackReservation::SkippedRoomActive => {
-                return Err(unavailable_retryable(
-                    "confirmed_edit_room_active",
-                    "close the collaborative room before applying the confirmed edit",
-                    std::time::Duration::from_millis(50),
-                ));
-            }
-        }
-    } else if let Some(interceptor) = store.inner.collab_interceptor.get()
-        && base_head.doc_class != DocClass::EncryptedNote
-    {
-        let (body_plan, header_mut) = build_collab_edit_payload(
+        if let Some(res) = interceptor.try_closed_room_reservation(
+            ctx.scope(),
             &request.input.note,
-            &base_carrier,
-            &new_carrier,
-            &request.input.plan,
-            base_head.doc_class,
-            &base_head.head_rev_id,
-        )?;
-        ctx.budget.remaining = deadline.remaining(&budget)?;
-        let mut dispatched = false;
-        let response = deadline
-            .wait(&budget, || async {
-                dispatched = true;
-                interceptor
-                    .intercept(InterceptedMutation {
-                        context: ctx.clone(),
-                        identity: request.identity.clone(),
-                        preconditions: request.preconditions.clone(),
-                        payload: InterceptedPayload::EditNote {
-                            note: request.input.note.clone(),
-                            body: body_plan,
-                            header: header_mut,
-                        },
-                    })
-                    .await
-            })
-            .await;
-        let unknown = || {
-            crate::codec::unknown_commit_outcome(
-                "edit_room_outcome_unknown",
-                "the room may have applied the note edit",
-            )
-        };
-        match response.map_err(|err| if dispatched { unknown() } else { err })?? {
-            InterceptionResult::Applied(receipt) => {
-                ctx.budget.remaining = deadline.remaining(&budget).map_err(|_| unknown())?;
-                let outcome = deadline
-                    .wait(&budget, || {
-                        applied_outcome(
-                            store,
-                            &ctx,
-                            &idemp,
-                            receipt,
-                            |row: StoredCommittedNoteRevV1| {
-                                (row.value.note == request.input.note).then(|| row.into_committed())
+            &request.identity,
+        ) {
+            reservation_opt = Some(CarrierRoomWrite::Reserved(res));
+        } else if idemp.requires_standard_writer() {
+            // An Applied interceptor reply bypasses the guarded writer. A reservation
+            // lets this edit retain authority until the canonical transaction settles.
+            ctx.budget.remaining = deadline.remaining(&budget)?;
+            let reserve = deadline
+                .wait(&budget, || {
+                    interceptor.reserve_rollback(
+                        ctx.clone(),
+                        request.input.note.clone(),
+                        request.identity.clone(),
+                    )
+                })
+                .await??;
+            match reserve {
+                RollbackReservation::Closed(reservation) => {
+                    reservation_opt = Some(CarrierRoomWrite::Reserved(reservation));
+                }
+                RollbackReservation::SkippedRoomActive => {
+                    return Err(unavailable_retryable(
+                        "confirmed_edit_room_active",
+                        "close the collaborative room before applying the confirmed edit",
+                        std::time::Duration::from_millis(50),
+                    ));
+                }
+            }
+        } else {
+            let (body_plan, header_mut) = build_collab_edit_payload(
+                &request.input.note,
+                &base_carrier,
+                &new_carrier,
+                &request.input.plan,
+                base_head.doc_class,
+                &base_head.head_rev_id,
+            )?;
+            ctx.budget.remaining = deadline.remaining(&budget)?;
+            let mut dispatched = false;
+            let response = deadline
+                .wait(&budget, || async {
+                    dispatched = true;
+                    interceptor
+                        .intercept(InterceptedMutation {
+                            context: ctx.clone(),
+                            identity: request.identity.clone(),
+                            preconditions: request.preconditions.clone(),
+                            payload: InterceptedPayload::EditNote {
+                                note: request.input.note.clone(),
+                                plan: request.input.plan.clone(),
+                                body: body_plan,
+                                header: header_mut,
                             },
+                        })
+                        .await
+                })
+                .await;
+            let unknown = || {
+                crate::codec::unknown_commit_outcome(
+                    "edit_room_outcome_unknown",
+                    "the room may have applied the note edit",
+                )
+            };
+            match response.map_err(|err| if dispatched { unknown() } else { err })?? {
+                InterceptionResult::Applied(outcome) => match *outcome {
+                    InterceptedOutcome::NoteRevision(committed)
+                        if committed.value.note == request.input.note
+                            && committed.receipt.scope() == ctx.scope() =>
+                    {
+                        return Ok(committed);
+                    }
+                    _ => return Err(missing_applied_outcome()),
+                },
+                InterceptionResult::Conflict(err) => {
+                    // A concurrent attempt can commit after phase one and before the room
+                    // checks this request's original body identity.
+                    if matches!(err, DomainError::RevisionConflict { .. })
+                        && let Some(replayed) = replay_command::<StoredCommittedNoteRevV1>(
+                            store, &ctx, deadline, &idemp,
                         )
-                    })
-                    .await
-                    .map_err(|_| unknown())?;
-                deadline.remaining(&budget).map_err(|_| unknown())?;
-                return outcome?.ok_or_else(missing_applied_outcome);
-            }
-            InterceptionResult::SettleCarrier(accepted) => {
-                let transition = crate::peers::RoomCarrierTransition::from(accepted);
-                ctx.budget.remaining = deadline.remaining(&budget)?;
-                deadline
-                    .wait(&budget, || {
-                        transition.check_before_staging(
-                            store,
-                            &ctx.budget,
-                            ctx.scope(),
-                            &request.input.note,
-                            ctx.auth(),
-                            Some(&base_head.head_rev_id),
-                        )
-                    })
-                    .await??;
-                reservation_opt = Some(CarrierRoomWrite::Accepted(transition));
-            }
-            InterceptionResult::Conflict(err) => return Err(err.into()),
-            InterceptionResult::ClosedRoomReservation(res) => {
-                reservation_opt = Some(CarrierRoomWrite::Reserved(res));
+                        .await?
+                    {
+                        return Ok(replayed.into_committed());
+                    }
+                    return Err(err.into());
+                }
+                InterceptionResult::ClosedRoomReservation(res) => {
+                    reservation_opt = Some(CarrierRoomWrite::Reserved(res));
+                }
             }
         }
     }
@@ -1209,7 +1370,14 @@ pub(crate) async fn edit_note_impl(
         })
         .await??;
 
-    if store.is_sqlite_local() && reservation_opt.is_none() && !idemp.requires_standard_writer() {
+    if store.is_sqlite_local()
+        && !idemp.requires_standard_writer()
+        && !matches!(reservation_opt, Some(CarrierRoomWrite::Accepted(_)))
+    {
+        let closed_reservation = match reservation_opt {
+            Some(CarrierRoomWrite::Reserved(res)) => Some(res),
+            _ => None,
+        };
         let phase1_cached = base_anc.map(|anc| (base_head.clone(), anc));
         let (intent, fast_plan) = crate::sqlite_fast::build_carrier_replacement_fast_intent(
             store,
@@ -1225,6 +1393,7 @@ pub(crate) async fn edit_note_impl(
             None,
             info,
             ticket,
+            closed_reservation,
             phase1_receipt_checked_gen,
             phase1_cached,
         )?;
@@ -1280,7 +1449,7 @@ pub(crate) enum CarrierRoomWrite {
 
 // Room receipts preserve the grant that admitted the mutation alongside its normal
 // typed outcome. Purge can erase this detail and retain the ordinary sanitized reply.
-fn room_receipt_detail<T: serde::Serialize>(
+pub(super) fn room_receipt_detail<T: serde::Serialize>(
     grant: Option<&notarium_core::ids::GrantId>,
     outcome: &T,
 ) -> Result<Option<Vec<u8>>, PortError> {
@@ -2337,7 +2506,7 @@ pub(crate) async fn move_note_impl(
         &request.preconditions,
     );
 
-    let space_rec = if let Some(interceptor) = store.inner.collab_interceptor.get() {
+    let (space_rec, pin) = if let Some(interceptor) = store.inner.collab_interceptor.get() {
         if let Some(replayed) = deadline
             .prepare(&ctx.budget, || {
                 try_replay_completed_receipt::<StoredCommittedNoteRevV1>(
@@ -2363,12 +2532,12 @@ pub(crate) async fn move_note_impl(
             })
             .await?;
         ctx.budget.remaining = deadline.remaining(&ctx.budget)?;
-        deadline
-            .wait(&ctx.budget, || {
-                check_move_pin(interceptor.as_ref(), &ctx, &request.input.note)
+        let pin = deadline
+            .prepare(&ctx.budget, || {
+                prepare_unpinned_move(store, interceptor.as_ref(), &ctx, &request.input.note)
             })
-            .await??;
-        space
+            .await?;
+        (space, pin)
     } else {
         let space = deadline
             .prepare(&ctx.budget, || {
@@ -2376,7 +2545,7 @@ pub(crate) async fn move_note_impl(
             })
             .await?;
         space.scope.check(ctx.scope())?;
-        space
+        (space, MovePin::Checked)
     };
 
     let intent = build_move_note_intent(
@@ -2387,7 +2556,7 @@ pub(crate) async fn move_note_impl(
         request.preconditions,
         MetadataChange::Move(request.input),
         new_slug_fold,
-        Ok(MovePin::Checked),
+        Ok(pin),
     );
 
     ctx.budget.remaining = deadline.remaining(&ctx.budget)?;
@@ -2399,6 +2568,97 @@ pub(crate) async fn move_note_impl(
 enum MovePin {
     Checked,
     NoActiveSource(Arc<super::RoomFenceTable>),
+    UnpinnedAt {
+        fences: Arc<super::RoomFenceTable>,
+        observed_active_lease: Option<LeaseEpoch>,
+    },
+    PinnedAt {
+        fences: Arc<super::RoomFenceTable>,
+        filename: String,
+        lease: LeaseEpoch,
+    },
+}
+
+async fn prepare_unpinned_move(
+    store: &CanonicalStore,
+    interceptor: &dyn notarium_core::ports::LiveCollabInterceptor,
+    ctx: &SpaceContext,
+    note: &NoteId,
+) -> Result<MovePin, PortError> {
+    let fences = store.inner.room_fences.clone();
+    let observed_active_lease = fences.observed_active_lease(ctx.scope(), note).await;
+    check_move_pin(interceptor, ctx, note).await?;
+    Ok(MovePin::UnpinnedAt {
+        fences,
+        observed_active_lease,
+    })
+}
+
+async fn lock_move_pin_tx(
+    tx: &mut BackendConn<'_>,
+    scope: &notarium_core::model::HistoryScope,
+    head: &NoteHeadRow,
+    pin: MovePin,
+) -> Result<Option<tokio::sync::OwnedMutexGuard<notarium_core::ports::RoomFenceState>>, PortError> {
+    let (fences, expected_lease, expected_slug) = match pin {
+        MovePin::Checked => return Ok(None),
+        MovePin::NoActiveSource(fences) => {
+            if is_note_room_active_tx(tx, &fences, scope, &head.note_id).await? {
+                return Err(move_pin_changed());
+            }
+            return Ok(None);
+        }
+        MovePin::UnpinnedAt {
+            fences,
+            observed_active_lease,
+        } => (fences, observed_active_lease, None),
+        MovePin::PinnedAt {
+            fences,
+            filename,
+            lease,
+        } => (fences, Some(lease), Some(filename)),
+    };
+    // Retain the per-note fence through the mutation. Reading the durable lease
+    // inside the Space writer transaction covers takeover by another process.
+    let guard = fences.lock_for_write(scope, &head.note_id)?;
+    let active_lease = match tx {
+        BackendConn::Sqlite(conn) => {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT lease_epoch FROM collab_sessions
+             WHERE space_id = ? AND note_id = ? AND room_state = 'active'",
+            )
+            .bind(scope.space_id.as_str())
+            .bind(head.note_id.as_str())
+            .fetch_optional(&mut **conn)
+            .await
+        }
+        BackendConn::Postgres(conn) => {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT lease_epoch FROM collab_sessions
+             WHERE space_id = $1 AND note_id = $2 AND room_state = 'active'",
+            )
+            .bind(scope.space_id.as_str())
+            .bind(head.note_id.as_str())
+            .fetch_optional(&mut **conn)
+            .await
+        }
+    }
+    .map_err(|error| internal_not_committed("move_room_pin_lease", error.to_string()))?;
+    if active_lease.is_some_and(|lease| {
+        expected_lease.is_none_or(|exp| u64::try_from(lease).ok() != Some(exp.get()))
+            || expected_slug.is_some_and(|filename| filename != head.slug)
+    }) {
+        return Err(move_pin_changed());
+    }
+    Ok(Some(guard))
+}
+
+fn move_pin_changed() -> PortError {
+    unavailable_retryable(
+        "move_note_pin_changed",
+        "retry the move after checking the newly active room",
+        std::time::Duration::from_millis(50),
+    )
 }
 
 async fn prepare_batch_move_pin(
@@ -2418,10 +2678,7 @@ async fn prepare_batch_move_pin(
     )
     .await
     {
-        Ok(_) => {
-            check_move_pin(interceptor.as_ref(), ctx, &input.note).await?;
-            Ok(MovePin::Checked)
-        }
+        Ok(_) => prepare_unpinned_move(store, interceptor.as_ref(), ctx, &input.note).await,
         Err(PortError::Domain(DomainError::ResourceNotFound)) => {
             Ok(MovePin::NoActiveSource(store.inner.room_fences.clone()))
         }
@@ -2513,15 +2770,7 @@ fn build_move_note_intent(
                 check_collab_preconditions_tx(tx, &scope_cl.space_id, &note_id, &preconditions)
                     .await?;
 
-                if let MovePin::NoActiveSource(fences) = pin?
-                    && is_note_room_active_tx(tx, &fences, &scope_cl, &note_id).await?
-                {
-                    return Err(unavailable_retryable(
-                        "move_note_pin_changed",
-                        "retry the move after checking the newly active room",
-                        std::time::Duration::from_millis(50),
-                    ));
-                }
+                let _pin_guard = lock_move_pin_tx(tx, &scope_cl, &head, pin?).await?;
 
                 let folder_page = if head.slug_fold == super::folder_cover::SLUG {
                     crate::runtime::load_folder_head_row(
@@ -2871,7 +3120,7 @@ pub(crate) async fn rename_note_impl(
     }
 
     ctx.budget.remaining = deadline.remaining(&ctx.budget)?;
-    let (space_rec, base_head) = deadline
+    let (mut space_rec, mut base_head) = deadline
         .wait(&ctx.budget, || {
             read_active_note_for_mutation(
                 store,
@@ -2883,28 +3132,89 @@ pub(crate) async fn rename_note_impl(
         })
         .await??;
 
-    if let Some(interceptor) = store.inner.collab_interceptor.get() {
+    let was_fenced = store
+        .inner
+        .room_fences
+        .is_room_fenced(&space_rec.scope.space_id, &request.input.note);
+    let move_pin = if let Some(interceptor) = store.inner.collab_interceptor.get() {
+        let fences = store.inner.room_fences.clone();
         ctx.budget.remaining = deadline.remaining(&ctx.budget)?;
-        let pin = deadline
-            .wait(&ctx.budget, || {
-                interceptor.filename_pin(ctx.clone(), request.input.note.clone())
+        let (observed_active_lease, pin) = deadline
+            .wait(&ctx.budget, || async {
+                let lease = fences
+                    .observed_active_lease(ctx.scope(), &request.input.note)
+                    .await;
+                let pin = interceptor
+                    .filename_pin(ctx.clone(), request.input.note.clone())
+                    .await?;
+                Ok::<_, PortError>((lease, pin))
             })
             .await??;
-        if let FilenamePin::Pinned { filename, .. } = pin
-            && filename != request.input.slug
-        {
-            return Err(unavailable_retryable(
-                "rename_note_blocked_by_filename_pin",
-                "cannot rename note slug while live room holds filename pin",
-                std::time::Duration::from_millis(50),
-            ));
+        match pin {
+            FilenamePin::Unpinned => MovePin::UnpinnedAt {
+                fences,
+                observed_active_lease,
+            },
+            FilenamePin::Pinned {
+                note,
+                filename,
+                lease,
+            } if note == request.input.note && filename == request.input.slug => {
+                MovePin::PinnedAt {
+                    fences,
+                    filename,
+                    lease,
+                }
+            }
+            FilenamePin::Pinned { .. } => {
+                return Err(unavailable_retryable(
+                    "rename_note_blocked_by_filename_pin",
+                    "cannot rename note slug while live room holds filename pin",
+                    std::time::Duration::from_millis(50),
+                ));
+            }
         }
-    }
+    } else {
+        MovePin::Checked
+    };
 
     if let Some(explicit_title) = &request.input.title {
         let trimmed = explicit_title.trim();
         if trimmed.is_empty() || trimmed.contains('\r') || trimmed.contains('\n') {
             return Err(DomainError::validation(ValidationReason::InvalidPathComponent).into());
+        }
+        if matches!(move_pin, MovePin::PinnedAt { .. }) {
+            return Err(unavailable_retryable(
+                "rename_note_blocked_by_filename_pin",
+                "cannot rewrite note title while live room holds filename pin",
+                std::time::Duration::from_millis(50),
+            ));
+        }
+        if was_fenced
+            || store
+                .inner
+                .room_fences
+                .fenced_recovery_revision(
+                    &space_rec.scope.space_id,
+                    &request.input.note,
+                    &base_head.head_rev_id,
+                )
+                .is_some()
+        {
+            ctx.budget.remaining = deadline.remaining(&ctx.budget)?;
+            let refreshed = deadline
+                .wait(&ctx.budget, || {
+                    read_active_note_for_mutation(
+                        store,
+                        &ctx,
+                        &request.input.note,
+                        &request.preconditions,
+                        NoteMutationAccess::Current,
+                    )
+                })
+                .await??;
+            space_rec = refreshed.0;
+            base_head = refreshed.1;
         }
         if base_head.doc_class == DocClass::EncryptedNote && trimmed != request.input.slug {
             return Err(DomainError::UnsafePlaintextOutsideAgeFence.into());
@@ -2971,7 +3281,7 @@ pub(crate) async fn rename_note_impl(
         request.preconditions,
         MetadataChange::Rename(request.input),
         new_slug_fold,
-        Ok(MovePin::Checked),
+        Ok(move_pin),
     );
     let stored: StoredCommittedNoteRevV1 = store
         .submit_write_command_until(&ctx.budget, deadline.at, intent, None, None, None)
@@ -4696,6 +5006,164 @@ async fn current_observation_head(
     result
 }
 
+fn external_observation_identity(
+    ctx: &SpaceContext,
+    request: &Mutation<ExternalObservation>,
+) -> crate::writer::CommandIdentitySpec {
+    let mut fp = blake3::Hasher::new();
+    fp.update(request.input.note.as_str().as_bytes());
+    fp.update(&[0]);
+    fp.update(request.input.observed_digest.as_bytes());
+    fp.update(&[0]);
+    fp.update(request.input.base_revision.as_str().as_bytes());
+    fp.update(&[0]);
+    fp.update(request.input.disk_identity.as_bytes());
+    derive_command_identity_spec(
+        &request.identity,
+        "accept_external_observation",
+        fp.finalize().as_bytes(),
+    )
+    .with_preconditions(&request.preconditions, "note", request.input.note.as_str())
+    .with_known_base(&request.input.base_revision)
+    .for_note(ctx.auth(), &request.input.note)
+}
+
+fn external_observation_result(outcome: StoredExternalObsOutcomeV1) -> ExternalObservationResult {
+    match outcome {
+        StoredExternalObsOutcomeV1::Committed { result, .. } => {
+            ExternalObservationResult::Committed(result.into_committed())
+        }
+        StoredExternalObsOutcomeV1::NoChange { revision } => {
+            ExternalObservationResult::NoChange { revision }
+        }
+        StoredExternalObsOutcomeV1::Conflict { current } => {
+            ExternalObservationResult::Conflict { current }
+        }
+    }
+}
+
+async fn replay_external_observation(
+    store: &CanonicalStore,
+    ctx: &SpaceContext,
+    deadline: CommandDeadline,
+    observation: &ExternalObservation,
+    idemp: &crate::writer::CommandIdentitySpec,
+) -> Result<Option<ExternalObservationResult>, PortError> {
+    let Some(replayed) =
+        replay_command::<StoredExternalObsOutcomeV1>(store, ctx, deadline, idemp).await?
+    else {
+        return Ok(None);
+    };
+    deadline
+        .prepare(&ctx.budget, || {
+            Box::pin(verify_observation_replay(
+                store,
+                ctx.clone(),
+                &deadline,
+                observation,
+                &replayed,
+                idemp,
+            ))
+        })
+        .await?;
+    Ok(Some(external_observation_result(replayed)))
+}
+
+async fn replay_observation_or_conflict(
+    store: &CanonicalStore,
+    ctx: &SpaceContext,
+    deadline: CommandDeadline,
+    observation: &ExternalObservation,
+    idemp: &crate::writer::CommandIdentitySpec,
+    current: RevisionId,
+) -> Result<ExternalObservationResult, PortError> {
+    Ok(
+        replay_external_observation(store, ctx, deadline, observation, idemp)
+            .await?
+            .unwrap_or(ExternalObservationResult::Conflict { current }),
+    )
+}
+
+impl CanonicalStore {
+    /// Record the verified filesystem observation alongside its merged live carrier and snapshot.
+    pub async fn commit_intercepted_external_observation(
+        &self,
+        mut ctx: SpaceContext,
+        identity: CommandIdentity,
+        preconditions: Preconditions,
+        input: ExternalObservation,
+        settlement: RoomCommandSettlement,
+    ) -> Result<ExternalObservationResult, PortError> {
+        let deadline = CommandDeadline::start(&ctx.budget, "observation_room");
+        let active_op = self.enter_write_op(&ctx.scope().space_id)?;
+        let request = Mutation {
+            identity,
+            preconditions,
+            input,
+        };
+        validate_mutation_identity(&ctx, &request.identity)?;
+        let idemp = external_observation_identity(&ctx, &request);
+        if let Some(replayed) =
+            replay_external_observation(self, &ctx, deadline, &request.input, &idemp).await?
+        {
+            return Ok(replayed);
+        }
+        let work =
+            match prepare_room_command(self, &mut ctx, deadline, &request.input.note, settlement)
+                .await
+            {
+                Ok(work) => work,
+                Err(error) => return observation_error(error),
+            };
+        if work.head.head_rev_id != request.input.base_revision {
+            return Ok(ExternalObservationResult::Conflict {
+                current: work.head.head_rev_id,
+            });
+        }
+        let (observed_bytes, verified_plan) = match &request.input.content {
+            ObservedContent::Carrier(carrier) => {
+                check_observed_digest(carrier, request.input.observed_digest)?;
+                (carrier.len() as u64, None)
+            }
+            ObservedContent::Planned(plan) => {
+                let carrier = notarium_syntax::patch::apply(&work.base_carrier, plan)?;
+                check_observed_digest(&carrier, request.input.observed_digest)?;
+                (
+                    carrier.len() as u64,
+                    Some(observation_plan_fingerprint(plan)),
+                )
+            }
+        };
+        let (info, ticket) = work.stage_carrier(self, &ctx.budget, deadline).await?;
+        let intent = build_observation_intent(
+            self,
+            &ctx,
+            &work.space,
+            request,
+            idemp,
+            info,
+            ticket,
+            observed_bytes,
+            verified_plan,
+            Some(CarrierRoomWrite::Accepted(work.transition)),
+        );
+        match self
+            .submit_write_command_until::<StoredExternalObsOutcomeV1>(
+                &ctx.budget,
+                deadline.at,
+                intent,
+                None,
+                None,
+                Some(active_op),
+            )
+            .await
+        {
+            Ok(outcome) => Ok(external_observation_result(outcome)),
+            Err(error) => observation_error(error),
+        }
+    }
+}
+
 pub(crate) async fn accept_external_observation_impl(
     store: &CanonicalStore,
     mut ctx: SpaceContext,
@@ -4705,71 +5173,41 @@ pub(crate) async fn accept_external_observation_impl(
         super::common::CommandDeadline::start(&ctx.budget, "accept_external_observation");
     let budget = ctx.budget.clone();
     validate_mutation_identity(&ctx, &request.identity)?;
-    let mut fp = blake3::Hasher::new();
-    fp.update(request.input.note.as_str().as_bytes());
-    fp.update(&[0]);
-    fp.update(request.input.observed_digest.as_bytes());
-    fp.update(&[0]);
-    fp.update(request.input.base_revision.as_str().as_bytes());
-    fp.update(&[0]);
-    fp.update(request.input.disk_identity.as_bytes());
-    let idemp = derive_command_identity_spec(
-        &request.identity,
-        "accept_external_observation",
-        fp.finalize().as_bytes(),
-    )
-    .with_preconditions(&request.preconditions, "note", request.input.note.as_str())
-    .with_known_base(&request.input.base_revision)
-    .for_note(ctx.auth(), &request.input.note);
+    let idemp = external_observation_identity(&ctx, &request);
 
-    ctx.budget.remaining = deadline.remaining(&budget)?;
-    if let Some(replayed) = deadline
-        .wait(&budget, || {
-            try_replay_completed_receipt::<StoredExternalObsOutcomeV1>(
-                store,
-                ctx.scope(),
-                &idemp,
-                Some(&ctx.budget),
-            )
-        })
-        .await??
+    if let Some(replayed) =
+        replay_external_observation(store, &ctx, deadline, &request.input, &idemp).await?
     {
-        deadline
-            .wait(&budget, || {
-                Box::pin(verify_observation_replay(
-                    store,
-                    ctx.clone(),
-                    &deadline,
-                    &request.input,
-                    &replayed,
-                    &idemp,
-                ))
-            })
-            .await??;
-        deadline.remaining(&budget)?;
-        return Ok(match replayed {
-            StoredExternalObsOutcomeV1::Committed { result: c, .. } => {
-                ExternalObservationResult::Committed(c.into_committed())
-            }
-            StoredExternalObsOutcomeV1::NoChange { revision } => {
-                ExternalObservationResult::NoChange { revision }
-            }
-            StoredExternalObsOutcomeV1::Conflict { current } => {
-                ExternalObservationResult::Conflict { current }
-            }
-        });
+        return Ok(replayed);
     }
 
     let current = current_observation_head(store, &mut ctx, &request, &deadline).await;
     let (space_rec, base_head) = match current {
         Ok(head) => head,
+        Err(PortError::Domain(DomainError::RevisionConflict { current, .. })) => {
+            return replay_observation_or_conflict(
+                store,
+                &ctx,
+                deadline,
+                &request.input,
+                &idemp,
+                current,
+            )
+            .await;
+        }
         Err(error) => return observation_error(error),
     };
 
     if base_head.head_rev_id != request.input.base_revision {
-        return Ok(ExternalObservationResult::Conflict {
-            current: base_head.head_rev_id,
-        });
+        return replay_observation_or_conflict(
+            store,
+            &ctx,
+            deadline,
+            &request.input,
+            &idemp,
+            base_head.head_rev_id,
+        )
+        .await;
     }
     let same_digest = base_head.content_digest == Some(request.input.observed_digest);
     if let ObservedContent::Carrier(carrier) = &request.input.content {
@@ -4799,17 +5237,43 @@ pub(crate) async fn accept_external_observation_impl(
             let carrier = notarium_syntax::patch::apply(&base_carrier, plan)?;
             check_observed_digest(&carrier, request.input.observed_digest)?;
             if same_digest {
-                return match current_observation_head(store, &mut ctx, &request, &deadline).await {
-                    Ok((_, head)) if head.head_rev_id == base_head.head_rev_id => {
-                        Ok(ExternalObservationResult::NoChange {
-                            revision: head.head_rev_id,
-                        })
+                #[cfg(feature = "test-support")]
+                {
+                    let pause = store
+                        .writer_faults()?
+                        .planned_observation_pause_once
+                        .lock()
+                        .expect("planned observation test pause")
+                        .take();
+                    if let Some(pause) = pause {
+                        deadline
+                            .wait(&budget, || async {
+                                let _ = pause.entered.send(());
+                                let _ = pause.release.await;
+                            })
+                            .await?;
                     }
-                    Ok((_, head)) => Ok(ExternalObservationResult::Conflict {
-                        current: head.head_rev_id,
-                    }),
-                    Err(error) => observation_error(error),
-                };
+                }
+                let current =
+                    match current_observation_head(store, &mut ctx, &request, &deadline).await {
+                        Ok((_, head)) => head.head_rev_id,
+                        Err(PortError::Domain(DomainError::RevisionConflict {
+                            current, ..
+                        })) => current,
+                        Err(error) => return observation_error(error),
+                    };
+                if current == base_head.head_rev_id {
+                    return Ok(ExternalObservationResult::NoChange { revision: current });
+                }
+                return replay_observation_or_conflict(
+                    store,
+                    &ctx,
+                    deadline,
+                    &request.input,
+                    &idemp,
+                    current,
+                )
+                .await;
             }
             (carrier, Some(observation_plan_fingerprint(plan)))
         }
@@ -4826,119 +5290,124 @@ pub(crate) async fn accept_external_observation_impl(
 
     let mut reservation_opt = None;
     if let Some(interceptor) = store.inner.collab_interceptor.get()
-        && base_head.doc_class != DocClass::EncryptedNote
+        && base_head.doc_class == DocClass::UserDoc
     {
-        let (body_plan, header_mut) = match &request.input.content {
-            ObservedContent::Planned(plan) => build_collab_edit_payload(
-                &request.input.note,
-                &base_carrier,
-                &new_carrier,
-                plan,
-                base_head.doc_class,
-                &base_head.head_rev_id,
-            )?,
-            ObservedContent::Carrier(_) => {
-                let old_body =
-                    notarium_syntax::frontmatter::analyze(&base_carrier, base_head.doc_class)?
-                        .carrier
-                        .body;
-                let new_body =
-                    notarium_syntax::frontmatter::analyze(&new_carrier, base_head.doc_class)?
-                        .carrier
-                        .body;
-                let plan = notarium_syntax::patch::plan(
+        if let Some(res) = interceptor.try_closed_room_reservation(
+            ctx.scope(),
+            &request.input.note,
+            &request.identity,
+        ) {
+            reservation_opt = Some(CarrierRoomWrite::Reserved(res));
+        } else {
+            let (body_plan, header_mut) = match &request.input.content {
+                ObservedContent::Planned(plan) => build_collab_edit_payload(
+                    &request.input.note,
                     &base_carrier,
-                    old_body,
-                    vec![(
-                        CarrierEditOrigin::Body,
+                    &new_carrier,
+                    plan,
+                    base_head.doc_class,
+                    &base_head.head_rev_id,
+                )?,
+                ObservedContent::Carrier(_) => {
+                    let old_body =
+                        notarium_syntax::frontmatter::analyze(&base_carrier, base_head.doc_class)?
+                            .carrier
+                            .body;
+                    let new_body =
+                        notarium_syntax::frontmatter::analyze(&new_carrier, base_head.doc_class)?
+                            .carrier
+                            .body;
+                    let plan = notarium_syntax::patch::plan(
+                        &base_carrier,
                         old_body,
-                        new_body.slice(&new_carrier)?.to_owned(),
-                    )],
-                )?;
-                let (body_id, header_id) = derive_body_header_identities(&base_head.head_rev_id);
-                (
-                    notarium_syntax::patch::body_plan(&base_carrier, &plan, body_id)?,
-                    collab_raw_header(&base_carrier, &new_carrier, base_head.doc_class, header_id)?,
-                )
-            }
-        };
-        ctx.budget.remaining = deadline.remaining(&budget)?;
-        let unknown = || {
-            crate::codec::unknown_commit_outcome(
-                "observation_room_outcome_unknown",
-                "the room may have applied the external observation",
-            )
-        };
-        // A ready reply can distinguish a confirmed non-write from a lost room response.
-        let reply = tokio::select! {
-            biased;
-            result = interceptor.intercept(InterceptedMutation {
-                context: ctx.clone(),
-                identity: request.identity.clone(),
-                preconditions: request.preconditions.clone(),
-                payload: InterceptedPayload::ExternalObservation {
-                    observation: request.input.clone(), body: body_plan, header: header_mut,
-                },
-            }) => result?,
-            () = budget.cancellation.cancelled() => return Err(unknown()),
-            () = tokio::time::sleep_until(deadline.at) => return Err(unknown()),
-        };
-        match reply {
-            InterceptionResult::Applied(receipt) => {
-                ctx.budget.remaining = deadline.remaining(&budget).map_err(|_| unknown())?;
-                let committed = deadline
-                    .wait(&budget, || {
-                        applied_outcome(
-                            store,
-                            &ctx,
-                            &idemp,
-                            receipt,
-                            |row: StoredExternalObsOutcomeV1| match row {
-                                StoredExternalObsOutcomeV1::Committed { result, .. }
-                                    if result.value.note == request.input.note =>
-                                {
-                                    Some(result.into_committed())
-                                }
-                                _ => None,
-                            },
-                        )
-                    })
-                    .await
-                    .map_err(|_| unknown())??
-                    .ok_or_else(missing_applied_outcome)?;
-                deadline.remaining(&budget).map_err(|_| unknown())?;
-                return Ok(ExternalObservationResult::Committed(committed));
-            }
-            InterceptionResult::SettleCarrier(accepted) => {
-                let transition = crate::peers::RoomCarrierTransition::from(accepted);
-                ctx.budget.remaining = deadline.remaining(&budget)?;
-                if let Err(error) = deadline
-                    .wait(&budget, || {
-                        transition.check_before_staging(
-                            store,
-                            &ctx.budget,
-                            ctx.scope(),
-                            &request.input.note,
-                            ctx.auth(),
-                            Some(&base_head.head_rev_id),
-                        )
-                    })
-                    .await?
-                {
-                    return observation_error(error);
+                        vec![(
+                            CarrierEditOrigin::Body,
+                            old_body,
+                            new_body.slice(&new_carrier)?.to_owned(),
+                        )],
+                    )?;
+                    let (body_id, header_id) =
+                        derive_body_header_identities(&base_head.head_rev_id);
+                    (
+                        notarium_syntax::patch::body_plan(&base_carrier, &plan, body_id)?,
+                        collab_raw_header(
+                            &base_carrier,
+                            &new_carrier,
+                            base_head.doc_class,
+                            header_id,
+                        )?,
+                    )
                 }
-                reservation_opt = Some(CarrierRoomWrite::Accepted(transition));
-            }
-            InterceptionResult::Conflict(_) => {
-                let current =
-                    match current_observation_head(store, &mut ctx, &request, &deadline).await {
+            };
+            ctx.budget.remaining = deadline.remaining(&budget)?;
+            let unknown = || {
+                crate::codec::unknown_commit_outcome(
+                    "observation_room_outcome_unknown",
+                    "the room may have applied the external observation",
+                )
+            };
+            // A ready reply can distinguish a confirmed non-write from a lost room response.
+            let reply = tokio::select! {
+                biased;
+                result = interceptor.intercept(InterceptedMutation {
+                    context: ctx.clone(),
+                    identity: request.identity.clone(),
+                    preconditions: request.preconditions.clone(),
+                    payload: InterceptedPayload::ExternalObservation {
+                        observation: request.input.clone(), body: body_plan, header: header_mut,
+                    },
+                }) => result?,
+                () = budget.cancellation.cancelled() => return Err(unknown()),
+                () = tokio::time::sleep_until(deadline.at) => return Err(unknown()),
+            };
+            match reply {
+                InterceptionResult::Applied(outcome) => match *outcome {
+                    InterceptedOutcome::ExternalObservation(outcome) => match &outcome {
+                        ExternalObservationResult::Committed(committed)
+                            if committed.value.note == request.input.note
+                                && committed.receipt.scope() == ctx.scope() =>
+                        {
+                            return Ok(outcome);
+                        }
+                        ExternalObservationResult::Committed(_) => {
+                            return Err(missing_applied_outcome());
+                        }
+                        _ => return Ok(outcome),
+                    },
+                    _ => return Err(missing_applied_outcome()),
+                },
+                InterceptionResult::Conflict(DomainError::RevisionConflict { .. }) => {
+                    if let Some(replayed) =
+                        replay_external_observation(store, &ctx, deadline, &request.input, &idemp)
+                            .await?
+                    {
+                        return Ok(replayed);
+                    }
+                    let current = match current_observation_head(
+                        store, &mut ctx, &request, &deadline,
+                    )
+                    .await
+                    {
                         Ok((_, head)) => head.head_rev_id,
+                        Err(PortError::Domain(DomainError::RevisionConflict {
+                            current, ..
+                        })) => current,
                         Err(error) => return observation_error(error),
                     };
-                return Ok(ExternalObservationResult::Conflict { current });
-            }
-            InterceptionResult::ClosedRoomReservation(res) => {
-                reservation_opt = Some(CarrierRoomWrite::Reserved(res));
+                    return replay_observation_or_conflict(
+                        store,
+                        &ctx,
+                        deadline,
+                        &request.input,
+                        &idemp,
+                        current,
+                    )
+                    .await;
+                }
+                InterceptionResult::Conflict(other) => return observation_error(other.into()),
+                InterceptionResult::ClosedRoomReservation(res) => {
+                    reservation_opt = Some(CarrierRoomWrite::Reserved(res));
+                }
             }
         }
     }
@@ -4961,15 +5430,52 @@ pub(crate) async fn accept_external_observation_impl(
         })
         .await??;
 
+    let intent = build_observation_intent(
+        store,
+        &ctx,
+        &space_rec,
+        request,
+        idemp,
+        info,
+        ticket,
+        new_carrier.len() as u64,
+        verified_plan,
+        reservation_opt,
+    );
+    ctx.budget.remaining = deadline.remaining(&budget)?;
+    match deadline
+        .submit::<StoredExternalObsOutcomeV1>(store, &ctx.budget, intent)
+        .await
+    {
+        Ok(outcome) => Ok(external_observation_result(outcome)),
+        Err(error) => observation_error(error),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_observation_intent(
+    store: &CanonicalStore,
+    ctx: &SpaceContext,
+    space_rec: &crate::SpaceRecord,
+    request: Mutation<ExternalObservation>,
+    idemp: crate::writer::CommandIdentitySpec,
+    info: PreparedCarrierInfo,
+    ticket: crate::blobs::StagedBlobTicket,
+    observed_bytes: u64,
+    verified_plan: Option<ContentDigest>,
+    reservation_opt: Option<CarrierRoomWrite>,
+) -> PreparedWriteIntent {
     let scope_cl = space_rec.scope.clone();
     let staged_bytes = ticket.compressed_size;
     let auth = ctx.auth().clone();
-    let identity = request.identity.clone();
-    let preconditions = request.preconditions.clone();
-    let obs_input = request.input.clone();
+    let Mutation {
+        identity,
+        preconditions,
+        input: obs_input,
+    } = request;
     let room_store = store.clone();
 
-    let intent = PreparedWriteIntent {
+    PreparedWriteIntent {
         scope: scope_cl.clone(),
         active_epoch: space_rec.active_epoch,
         idempotency: Some(idemp),
@@ -5098,8 +5604,8 @@ pub(crate) async fn accept_external_observation_impl(
                         .bind(scope_cl.space_id.as_str())
                         .bind(obs_input.note.as_str())
                         .bind(&rel_path)
-                        .bind(info.byte_size as i64)
-                        .bind(digest.as_bytes().as_slice())
+                        .bind(observed_bytes as i64)
+                        .bind(obs_input.observed_digest.as_bytes().as_slice())
                         .bind(obs_input.disk_identity.as_bytes().as_slice())
                         .bind(new_rev.as_str())
                         .bind(seq_i64)
@@ -5161,8 +5667,8 @@ pub(crate) async fn accept_external_observation_impl(
                         .bind(scope_cl.space_id.as_str())
                         .bind(obs_input.note.as_str())
                         .bind(&rel_path)
-                        .bind(info.byte_size as i64)
-                        .bind(digest.as_bytes().as_slice())
+                        .bind(observed_bytes as i64)
+                        .bind(obs_input.observed_digest.as_bytes().as_slice())
                         .bind(obs_input.disk_identity.as_bytes().as_slice())
                         .bind(new_rev.as_str())
                         .bind(seq_i64)
@@ -5319,30 +5825,6 @@ pub(crate) async fn accept_external_observation_impl(
                 })
             })
         }),
-    };
-
-    ctx.budget.remaining = deadline.remaining(&budget)?;
-    match store
-        .submit_write_command_until::<StoredExternalObsOutcomeV1>(
-            &ctx.budget,
-            deadline.at,
-            intent,
-            None,
-            None,
-            None,
-        )
-        .await
-    {
-        Ok(StoredExternalObsOutcomeV1::Committed { result: c, .. }) => {
-            Ok(ExternalObservationResult::Committed(c.into_committed()))
-        }
-        Ok(StoredExternalObsOutcomeV1::NoChange { revision }) => {
-            Ok(ExternalObservationResult::NoChange { revision })
-        }
-        Ok(StoredExternalObsOutcomeV1::Conflict { current }) => {
-            Ok(ExternalObservationResult::Conflict { current })
-        }
-        Err(error) => observation_error(error),
     }
 }
 
@@ -5640,7 +6122,7 @@ pub(crate) async fn update_space_schema_impl(
                 )
                 .await?;
 
-                let op_kind = if existing_note.is_some() {
+                let op_kind = if let Some(ex) = &existing_note {
                     match tx {
                         BackendConn::Sqlite(conn) => {
                             sqlx::query(
@@ -5699,7 +6181,11 @@ pub(crate) async fn update_space_schema_impl(
                             })?;
                         }
                     }
-                    "edit"
+                    if ex.parent_folder_id != parent_id {
+                        "move"
+                    } else {
+                        "edit"
+                    }
                 } else {
                     match tx {
                         BackendConn::Sqlite(conn) => {
@@ -6334,18 +6820,14 @@ pub(crate) async fn hydrate_cards_impl(
                         continue;
                     };
 
-                    let Some(hist_rev) = super::common::optional_read(
-                        read_immutable_revision_tx(tx, &scope, "note", nid.as_str(), valid_cut)
-                            .await,
+                    let Some(historical_note) = super::common::optional_read(
+                        crate::projection_read::note_at(tx, &scope, valid_cut, &nid).await,
                     )?
                     .flatten() else {
                         out.push(None);
                         continue;
                     };
-                    let RevisionMetadataPayload::Note(nm) = hist_rev.metadata.payload else {
-                        out.push(None);
-                        continue;
-                    };
+                    let nm = historical_note.metadata;
                     if nm.lifecycle != Lifecycle::Active || nm.doc_class == DocClass::EncryptedNote
                     {
                         out.push(None);
@@ -6385,7 +6867,7 @@ pub(crate) async fn hydrate_cards_impl(
                             space_id: scope.space_id.clone(),
                             note_id: nid.clone(),
                         },
-                        hist_rev.revision_id,
+                        historical_note.revision_id,
                         snap_facts,
                         Lifecycle::Active,
                         digest,
@@ -6563,33 +7045,6 @@ pub(crate) fn missing_applied_outcome() -> PortError {
     )
 }
 
-pub(crate) async fn applied_outcome<R: serde::de::DeserializeOwned, T>(
-    store: &CanonicalStore,
-    ctx: &SpaceContext,
-    idemp: &crate::writer::CommandIdentitySpec,
-    token: MutationReceiptToken,
-    committed: impl FnOnce(R) -> Option<Committed<T>>,
-) -> Result<Option<Committed<T>>, PortError> {
-    ctx.scope().check(token.scope())?;
-    let saved = try_replay_completed_receipt(store, ctx.scope(), idemp, Some(&ctx.budget))
-        .await
-        .map_err(applied_read_error)?;
-    saved
-        .map(|row| {
-            committed(row)
-                .filter(|result| result.receipt == token)
-                .ok_or_else(missing_applied_outcome)
-        })
-        .transpose()
-}
-
-fn applied_read_error(error: PortError) -> PortError {
-    match error {
-        PortError::Domain(_) => error,
-        other => batch_error(other, true),
-    }
-}
-
 pub(crate) async fn try_replay_completed_receipt<R: serde::de::DeserializeOwned>(
     store: &CanonicalStore,
     scope: &notarium_core::model::HistoryScope,
@@ -6599,6 +7054,21 @@ pub(crate) async fn try_replay_completed_receipt<R: serde::de::DeserializeOwned>
     read_space_and_receipt(store, scope, idemp, budget)
         .await
         .map(|(_, receipt)| receipt)
+}
+
+pub(super) async fn replay_command<R: serde::de::DeserializeOwned>(
+    store: &CanonicalStore,
+    ctx: &SpaceContext,
+    deadline: CommandDeadline,
+    idemp: &crate::writer::CommandIdentitySpec,
+) -> Result<Option<R>, PortError> {
+    let mut budget = ctx.budget.clone();
+    budget.remaining = deadline.remaining(&budget)?;
+    deadline
+        .prepare(&budget, || {
+            try_replay_completed_receipt(store, ctx.scope(), idemp, Some(&budget))
+        })
+        .await
 }
 
 pub(crate) async fn read_space_and_receipt<R: serde::de::DeserializeOwned>(
@@ -6655,27 +7125,54 @@ pub(crate) fn enforce_protected_frontmatter_unchanged_with_header(
     after: &str,
     class: DocClass,
 ) -> Result<Option<PreparsedHeaderTuple>, PortError> {
+    enforce_unchanged_protected_frontmatter(before, after, class, false)
+}
+
+pub(crate) fn enforce_room_frontmatter_unchanged_with_header(
+    before: &str,
+    after: &str,
+    class: DocClass,
+) -> Result<Option<PreparsedHeaderTuple>, PortError> {
+    enforce_unchanged_protected_frontmatter(before, after, class, true)
+}
+
+fn enforce_unchanged_protected_frontmatter(
+    before: &str,
+    after: &str,
+    class: DocClass,
+    allow_room_separator: bool,
+) -> Result<Option<PreparsedHeaderTuple>, PortError> {
     let old_hdr = notarium_syntax::frontmatter::analyze(before, class)?;
-    let hdr_end = old_hdr.carrier.body.start();
-    if hdr_end > 0
-        && after.len() >= hdr_end
-        && before.as_bytes()[..hdr_end] == after.as_bytes()[..hdr_end]
+    notarium_syntax::unicode::validate_content(after)?;
+    let new_carrier = notarium_syntax::carrier::Carrier::scan(after)?;
+    let old_end = old_hdr.carrier.body.start();
+    let new_end = new_carrier.body.start();
+    if old_hdr.carrier.bom_end == new_carrier.bom_end
+        && old_hdr.carrier.header.is_some() == new_carrier.header.is_some()
+        && old_end == new_end
+        && before.as_bytes()[..old_end] == after.as_bytes()[..new_end]
     {
-        return Ok(Some((old_hdr.fields, old_hdr.diagnostic, hdr_end)));
+        return Ok(Some((old_hdr.fields, old_hdr.diagnostic, new_end)));
     }
     let new_hdr = notarium_syntax::frontmatter::analyze(after, class)?;
-    // Equal opaque headers took the byte-identical path above. A changed
-    // opaque header cannot establish whether protected keys were preserved.
-    let (Some(old_map), Some(new_map)) = (&old_hdr.fields, &new_hdr.fields) else {
-        return Err(DomainError::validation(ValidationReason::FmNotWritable).into());
-    };
-    for key in old_map.keys().chain(new_map.keys()) {
-        if old_map.get(key) != new_map.get(key) {
-            authorize_field_key(key)?;
+    if let (Some(old_map), Some(new_map)) = (&old_hdr.fields, &new_hdr.fields) {
+        for key in old_map.keys().chain(new_map.keys()) {
+            if old_map.get(key) != new_map.get(key) {
+                authorize_field_key(key)?;
+            }
         }
+    } else if !allow_room_separator
+        || !notarium_syntax::live::is_room_separator_extension(
+            before,
+            after,
+            &old_hdr.carrier,
+            &new_carrier,
+        )
+    {
+        // An opaque header must keep every original byte of its YAML and fences.
+        return Err(DomainError::validation(ValidationReason::FmNotWritable).into());
     }
-    let new_body_start = new_hdr.carrier.body.start();
-    Ok(Some((new_hdr.fields, new_hdr.diagnostic, new_body_start)))
+    Ok(Some((new_hdr.fields, new_hdr.diagnostic, new_end)))
 }
 
 async fn update_ability_package_slug_tx(
@@ -6730,4 +7227,96 @@ async fn update_ability_package_slug_tx(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod protected_frontmatter_tests {
+    use super::*;
+
+    #[test]
+    fn header_analysis_always_describes_the_after_carrier() {
+        for (before, after) in [
+            ("\u{feff}draft", "\u{feff}---\nstatus: done\n---\ndraft"),
+            ("---\n---\ndraft", "---\nstatus: done\n---\ndraft"),
+            (
+                "---\nstatus: todo\n---\ndraft",
+                "---\nstatus: done\n---\ndraft",
+            ),
+            ("\u{feff}draft", "\u{feff}new draft"),
+            ("draft", "---\n---\n\u{feff}draft"),
+            (
+                "---\nstatus: todo\nstatus: done\n---",
+                "---\nstatus: todo\nstatus: done\n---\nbody",
+            ),
+            (
+                "---\r\nstatus: todo\r\nstatus: done\r\n... \r",
+                "---\r\nstatus: todo\r\nstatus: done\r\n... \r\n\nbody",
+            ),
+        ] {
+            let got =
+                enforce_room_frontmatter_unchanged_with_header(before, after, DocClass::UserDoc)
+                    .unwrap()
+                    .unwrap();
+            let parsed = notarium_syntax::frontmatter::analyze(after, DocClass::UserDoc).unwrap();
+            assert_eq!(
+                got,
+                (
+                    parsed.fields,
+                    parsed.diagnostic,
+                    parsed.carrier.body.start()
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn opaque_yaml_allows_only_room_generated_separators() {
+        let before = "---\nstatus: todo\nstatus: done\n---";
+        let after = "---\nstatus: todo\nstatus: done\n---\nbody";
+        let changed_yaml = "---\nstatus: active\nstatus: done\n---\nbody";
+        let changed_fence = "---\nstatus: todo\nstatus: done\n...\nbody";
+        let isolated_separator = "---\nstatus: todo\nstatus: done\n---\n";
+        for result in [
+            enforce_protected_frontmatter_unchanged_with_header(before, after, DocClass::UserDoc),
+            enforce_room_frontmatter_unchanged_with_header(before, changed_yaml, DocClass::UserDoc),
+            enforce_room_frontmatter_unchanged_with_header(
+                before,
+                changed_fence,
+                DocClass::UserDoc,
+            ),
+            enforce_room_frontmatter_unchanged_with_header(
+                before,
+                isolated_separator,
+                DocClass::UserDoc,
+            ),
+        ] {
+            assert!(matches!(
+                result,
+                Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
+                    if diagnostic.reason == ValidationReason::FmNotWritable
+            ));
+        }
+    }
+
+    #[test]
+    fn matching_prefix_cannot_hide_new_invalid_content() {
+        let before = "\u{feff}draft";
+        for (after, reason) in [
+            (
+                "\u{feff}---\nclass: skill\n---\ndraft",
+                ValidationReason::ClassMismatch,
+            ),
+            (
+                "\u{feff}---\nstatus: done\ndraft",
+                ValidationReason::UnterminatedFrontmatter,
+            ),
+            ("\u{feff}draft\0", ValidationReason::DisallowedCodePoint),
+        ] {
+            assert!(matches!(
+                enforce_protected_frontmatter_unchanged_with_header(before, after, DocClass::UserDoc),
+                Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
+                    if diagnostic.reason == reason
+            ));
+        }
+    }
 }

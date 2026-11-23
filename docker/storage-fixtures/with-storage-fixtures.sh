@@ -7,8 +7,6 @@ umask 022
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd -P)
 COMPOSE_FILE="$ROOT/compose.storage-tests.yaml"
 PG_IMAGE="postgres:16-bookworm@sha256:a49f7438ba03589f9b1ca062f2da82e899b48ea1dc50d2449fa09a70be83ebca"
-MINIO_IMAGE="notarium-storage-fixture-minio-ce:9e49d5e7a648"
-BRIDGE_IMAGE="notarium-storage-fixture-uds-bridge:local"
 
 CHECKOUT_HASH=$(printf '%s' "$ROOT" | sha256sum | cut -c1-12)
 FIXTURES_BASE="$ROOT/.artifacts/storage-tests"
@@ -50,37 +48,112 @@ sweep_stale_runs() {
   fi
 }
 
+recipe_sha256() {
+  # Dockerfile-specific ignore rules take precedence over the context-wide file.
+  if [ -f "$ROOT/$1.dockerignore" ]; then
+    set -- "$@" "$1.dockerignore"
+  elif [ -f "$ROOT/.dockerignore" ]; then
+    set -- "$@" .dockerignore
+  fi
+  set -- compose.storage-tests.yaml "$@"
+  recipe=
+  for input in "$@"; do
+    digest=$(sha256sum <"$ROOT/$input") || fail "cannot hash fixture recipe input: $input"
+    recipe="$recipe$input
+${digest%% *}
+"
+  done
+  digest=$(printf '%s' "$recipe" | sha256sum) || fail "cannot hash fixture recipe"
+  printf '%s\n' "${digest%% *}"
+}
+
+export_recipe_shas() {
+  NOTARIUM_MINIO_RECIPE_SHA256=$(recipe_sha256 docker/storage-fixtures/minio-ce.Dockerfile)
+  NOTARIUM_BRIDGE_RECIPE_SHA256=$(recipe_sha256 docker/storage-fixtures/uds-bridge.Dockerfile docker/storage-fixtures/uds_tcp_bridge.rs)
+  export NOTARIUM_MINIO_RECIPE_SHA256 NOTARIUM_BRIDGE_RECIPE_SHA256
+  MINIO_IMAGE="notarium-storage-fixture-minio-ce:$NOTARIUM_MINIO_RECIPE_SHA256"
+  BRIDGE_IMAGE="notarium-storage-fixture-uds-bridge:$NOTARIUM_BRIDGE_RECIPE_SHA256"
+}
+
+fixture_image_id() {
+  [ -n "$2" ] || return 1
+  observed=$(docker image inspect --format '{{.Id}} {{index .Config.Labels "io.notarium.fixture-recipe-sha256"}}' "$1" 2>/dev/null) || return 1
+  [ "${observed#* }" = "$2" ] || return 1
+  case "${observed%% *}" in
+    sha256:*) printf '%s\n' "${observed%% *}" ;;
+    *) return 1 ;;
+  esac
+}
+
+ensure_fixture_image() {
+  image=$1 dockerfile=$2 expected=$3 force=$4
+  if [ "$force" = 0 ] && fixture_image_id "$image" "$expected" >/dev/null; then
+    printf 'storage-fixtures: reusing %s\n' "$image"
+    return
+  fi
+  # Compose's service network dependency would also build MinIO for the bridge.
+  docker build -f "$ROOT/$dockerfile" --build-arg "NOTARIUM_FIXTURE_RECIPE_SHA256=$expected" -t "$image" "$ROOT"
+  fixture_image_id "$image" "$expected" >/dev/null || fail "built fixture image '$image' did not match its recipe"
+}
+
 setup_images() {
+  case "$#:${1:-}" in
+    0:) force=0 ;;
+    1:--force) force=1 ;;
+    *) fail "usage: setup-images [--force]" ;;
+  esac
+  if [ "$skip_api_fixtures" = 1 ]; then
+    [ "$force" = 0 ] || fail "NOTARIUM_SKIP_API_FIXTURES=1 cannot be used with --force"
+    printf 'storage-fixtures: skipping fixture image setup (NOTARIUM_SKIP_API_FIXTURES=1)\n' >&2
+    return
+  fi
+  export_recipe_shas
   if ! docker image inspect "$PG_IMAGE" >/dev/null 2>&1; then
     docker pull "$PG_IMAGE"
   fi
-  NOTARIUM_FIXTURE_UID=$(id -u) \
-  NOTARIUM_FIXTURE_GID=$(id -g) \
-  NOTARIUM_FIXTURE_CHECKOUT_HASH="$CHECKOUT_HASH" \
-  NOTARIUM_FIXTURE_RUN_ID="setup" \
-  NOTARIUM_FIXTURE_RUN_DIR="/tmp" \
-  NOTARIUM_FIXTURE_PG_USER="setup" \
-  NOTARIUM_FIXTURE_PG_PASSWORD="setup" \
-  NOTARIUM_FIXTURE_PG_DB="setup" \
-  NOTARIUM_FIXTURE_S3_ACCESS_KEY="setupaccesskey" \
-  NOTARIUM_FIXTURE_S3_SECRET_KEY="setupsecretkey1234" \
-    docker compose -f "$COMPOSE_FILE" build minio s3-bridge
+  ensure_fixture_image "$MINIO_IMAGE" docker/storage-fixtures/minio-ce.Dockerfile "$NOTARIUM_MINIO_RECIPE_SHA256" "$force"
+  ensure_fixture_image "$BRIDGE_IMAGE" docker/storage-fixtures/uds-bridge.Dockerfile "$NOTARIUM_BRIDGE_RECIPE_SHA256" "$force"
 }
 
-if [ "${1:-}" = "setup-images" ]; then
-  setup_images
-  exit 0
-fi
+skip_api_fixtures=${NOTARIUM_SKIP_API_FIXTURES:-0}
+case "$skip_api_fixtures" in
+  0|1) ;;
+  *) fail "NOTARIUM_SKIP_API_FIXTURES must be 0 or 1" ;;
+esac
 
-if [ "${1:-}" != "test" ] && [ "${1:-}" != "exec-custom" ] && [ "${1:-}" != "benchmark" ]; then
-  exec sh "$ROOT/.devkit/runtime/devkit.sh" "$@"
-fi
+case "${1:-}" in
+  setup-images)
+    shift
+    setup_images "$@"
+    exit 0
+    ;;
+  fixture-images)
+    [ "$#" -eq 1 ] || fail "usage: fixture-images"
+    export_recipe_shas
+    printf '%s\n' "$MINIO_IMAGE" "$BRIDGE_IMAGE"
+    exit 0
+    ;;
+  test|exec-custom|benchmark) projection_benchmark=0 ;;
+  projection-benchmark)
+    [ "$#" -eq 1 ] || fail "usage: projection-benchmark"
+    projection_benchmark=1
+    ;;
+  *) exec sh "$ROOT/.devkit/runtime/devkit.sh" "$@" ;;
+esac
 
-# Verify all pinned fixture images exist locally (offline --pull never enforcement).
-for required_image in "$PG_IMAGE" "$MINIO_IMAGE" "$BRIDGE_IMAGE"; do
-  docker image inspect "$required_image" >/dev/null 2>&1 || \
-    fail "missing fixture image '$required_image'; run 'make setup app=api' first"
-done
+[ "$skip_api_fixtures" = 0 ] || fail "NOTARIUM_SKIP_API_FIXTURES=1 is permitted only for setup"
+export_recipe_shas
+
+docker image inspect "$PG_IMAGE" >/dev/null 2>&1 || \
+  fail "missing fixture image '$PG_IMAGE'; run 'make setup app=api' first"
+if [ "$projection_benchmark" = 0 ]; then
+  # A forced rebuild can retag the same recipe while this run waits for the lock.
+  NOTARIUM_MINIO_FIXTURE_IMAGE=$(fixture_image_id "$MINIO_IMAGE" "$NOTARIUM_MINIO_RECIPE_SHA256") || \
+    fail "missing or stale fixture image '$MINIO_IMAGE'; run 'make setup app=api' first"
+  NOTARIUM_BRIDGE_FIXTURE_IMAGE=$(fixture_image_id "$BRIDGE_IMAGE" "$NOTARIUM_BRIDGE_RECIPE_SHA256") || \
+    fail "missing or stale fixture image '$BRIDGE_IMAGE'; run 'make setup app=api' first"
+  export NOTARIUM_MINIO_FIXTURE_IMAGE NOTARIUM_BRIDGE_FIXTURE_IMAGE
+fi
 
 mkdir -p -- "$FIXTURES_BASE"
 # The manifest and stale-run sweep belong to one checkout. Keep ownership
@@ -107,12 +180,20 @@ if [ "$1" = "benchmark" ]; then
   tree=$(source_tree)
   sh "$ROOT/.devkit/runtime/devkit.sh" cli exec --component apps/api --network none -- \
     cargo build --offline --locked --release -p fitness-gates --features storage-bench --example d3_benchmarks
+elif [ "$projection_benchmark" = 1 ]; then
+  commit=$(git -C "$ROOT" rev-parse HEAD)
+  head_tree=$(git -C "$ROOT" rev-parse 'HEAD^{tree}')
+  tree=$(source_tree)
+  sh "$ROOT/.devkit/runtime/devkit.sh" cli exec --component apps/api --network none -- \
+    cargo build --offline --locked --release -p fitness-gates --features storage-bench --example projection_benchmarks
 fi
 sweep_stale_runs
 
 RUN_ID="run-$$-$(date +%s)"
 RUN_DIR="$FIXTURES_BASE/$RUN_ID"
 COMPOSE_PROJECT="notarium-st-${CHECKOUT_HASH}-$$"
+projection_artifacts=".artifacts/5-projections-graph"
+projection_work="$projection_artifacts/$RUN_ID"
 
 UID_VAL=$(id -u)
 GID_VAL=$(id -g)
@@ -152,13 +233,20 @@ cleanup() {
   rm -f -- "$ACTIVE_MANIFEST"
   docker compose --progress plain -f "$COMPOSE_FILE" -p "$COMPOSE_PROJECT" down -v --remove-orphans </dev/null >/dev/null 2>&1 || true
   rm -rf -- "$RUN_DIR" 2>/dev/null || true
+  if [ "$projection_benchmark" = 1 ]; then
+    rm -rf -- "$ROOT/$projection_work" 2>/dev/null || true
+  fi
 }
 trap cleanup EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-docker compose --progress plain -f "$COMPOSE_FILE" -p "$COMPOSE_PROJECT" up -d --pull never --no-build </dev/null
+if [ "$projection_benchmark" = 1 ]; then
+  docker compose --progress plain -f "$COMPOSE_FILE" -p "$COMPOSE_PROJECT" up -d --pull never --no-build postgres </dev/null
+else
+  docker compose --progress plain -f "$COMPOSE_FILE" -p "$COMPOSE_PROJECT" up -d --pull never --no-build </dev/null
+fi
 
 # Wait for PostgreSQL 16 UDS readiness (bounded 30s).
 pg_ready=0
@@ -181,7 +269,7 @@ done
 # Give the startup refusal test a separate cluster and socket in the pinned PG
 # container. Its temporary data directory disappears with the fixture.
 pg_fsync_off_port=null
-if [ "$1" != "benchmark" ]; then
+if [ "$1" != "benchmark" ] && [ "$projection_benchmark" = 0 ]; then
   pg_fsync_off_port=5433
   docker compose -f "$COMPOSE_FILE" -p "$COMPOSE_PROJECT" exec -T postgres \
     sh -eu -s -- "$pg_fsync_off_port" <<'PG_FIXTURE'
@@ -194,22 +282,24 @@ PG_FIXTURE
 fi
 
 # Wait for MinIO Community Edition + UDS bridge readiness (bounded 30s).
-s3_ready=0
-attempt=0
-while [ "$attempt" -lt 150 ]; do
-  if [ -S "$RUN_DIR/s3sock/s3.sock" ] && \
-     docker compose -f "$COMPOSE_FILE" -p "$COMPOSE_PROJECT" exec -T s3-bridge \
-       /usr/local/bin/uds-tcp-bridge probe-http /s3sock/s3.sock /minio/health/live >/dev/null 2>&1; then
-    s3_ready=1
-    break
-  fi
-  attempt=$((attempt + 1))
-  sleep 0.2
-done
-[ "$s3_ready" = 1 ] || {
-  docker compose -f "$COMPOSE_FILE" -p "$COMPOSE_PROJECT" logs >&2 || true
-  fail "MinIO CE UDS fixture failed readiness within 30s"
-}
+if [ "$projection_benchmark" = 0 ]; then
+  s3_ready=0
+  attempt=0
+  while [ "$attempt" -lt 150 ]; do
+    if [ -S "$RUN_DIR/s3sock/s3.sock" ] && \
+       docker compose -f "$COMPOSE_FILE" -p "$COMPOSE_PROJECT" exec -T s3-bridge \
+         /usr/local/bin/uds-tcp-bridge probe-http /s3sock/s3.sock /minio/health/live >/dev/null 2>&1; then
+      s3_ready=1
+      break
+    fi
+    attempt=$((attempt + 1))
+    sleep 0.2
+  done
+  [ "$s3_ready" = 1 ] || {
+    docker compose -f "$COMPOSE_FILE" -p "$COMPOSE_PROJECT" logs >&2 || true
+    fail "MinIO CE UDS fixture failed readiness within 30s"
+  }
+fi
 
 TMP_MANIFEST="$RUN_DIR/current.json.tmp"
 cat >"$TMP_MANIFEST" <<EOF
@@ -236,7 +326,25 @@ EOF
 chmod 0644 "$TMP_MANIFEST"
 mv -f "$TMP_MANIFEST" "$ACTIVE_MANIFEST"
 
-if [ "$1" = "benchmark" ]; then
+if [ "$projection_benchmark" = 1 ]; then
+  mkdir -p "$ROOT/$projection_work"
+  caller_cpu=$(cat /sys/fs/cgroup/cpu.max 2>/dev/null || printf unknown)
+  caller_memory=$(cat /sys/fs/cgroup/memory.max 2>/dev/null || printf unknown)
+  sh "$ROOT/.devkit/runtime/devkit.sh" cli exec --component apps/api --write --network none -- \
+    ./target/release/examples/projection_benchmarks --git-base "$commit" --head-tree "$head_tree" \
+    --git-tree "$tree" --caller-cgroup-cpu "$caller_cpu" --caller-cgroup-memory "$caller_memory" \
+    --work-root "/workspace/$projection_work" --output "/workspace/$projection_work/report.json"
+  [ "$tree" = "$(source_tree)" ] || fail "benchmark source changed during measurement"
+  [ "$commit" = "$(git -C "$ROOT" rev-parse HEAD)" ] || fail "benchmark HEAD changed during measurement"
+  [ -s "$ROOT/$projection_work/report.json" ] || fail "projection benchmark produced no report"
+  mv -f "$ROOT/$projection_work/report.json" "$ROOT/$projection_artifacts/metrics.json"
+  printf '%s\n' "$ROOT/$projection_artifacts/metrics.json"
+  sh "$ROOT/.devkit/runtime/devkit.sh" cli exec --component apps/api --network none -- \
+    env NOTARIUM_REQUIRE_PROJECTION_SAMPLES=1 NOTARIUM_PROJECTION_GIT_COMMIT="$commit" \
+    NOTARIUM_PROJECTION_HEAD_TREE="$head_tree" NOTARIUM_PROJECTION_SOURCE_TREE="$tree" \
+    cargo test --offline --locked --release -p fitness-gates --features storage-bench \
+    --test projection_samples -- --nocapture
+elif [ "$1" = "benchmark" ]; then
   shift
   mkdir -p "$ROOT/.artifacts/3-storage-cas"
   status=0

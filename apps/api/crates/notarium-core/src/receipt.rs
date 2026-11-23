@@ -101,6 +101,10 @@ impl From<ReceiptSet> for Vec<MutationReceiptToken> {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct AwaitWatermarks(BTreeMap<HistoryScope, SpaceSeq>);
 impl AwaitWatermarks {
+    /// Wait for an observed history position without claiming a mutation receipt.
+    pub fn at(scope: HistoryScope, seq: SpaceSeq) -> Self {
+        Self(BTreeMap::from([(scope, seq)]))
+    }
     pub fn from_receipts(receipts: impl IntoIterator<Item = MutationReceiptToken>) -> Self {
         let mut values = BTreeMap::new();
         for receipt in receipts {

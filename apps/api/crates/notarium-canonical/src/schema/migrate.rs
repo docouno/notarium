@@ -1,6 +1,8 @@
 //! Schema upgrades run inside the bootstrap transaction. The incoming witness
 //! must identify the exact schema this migration understands.
+mod chat_refs;
 mod compactions;
+mod rank_anchors;
 
 use super::{POSTGRES_BASELINE_DDL, SQLITE_BASELINE_DDL, split_sql_statements};
 use crate::codec::internal_not_committed;
@@ -21,22 +23,38 @@ pub(crate) const V3_HASH: &str = "ca79d3e2db2eed95fb8b0e503340139b3fd166b51340e6
 pub(crate) const V4_HASH: &str = "23fda6322e7820fdb9b60bd67192098e3d472c074f655a9d0edceaa7e3fb66e0";
 
 pub(crate) const V5_HASH: &str = "e32b31f85aeb41b99c19c355bad2f9103eac552a0fe4b9c1ebb149892a7d9774";
-
 pub(crate) const V6_HASH: &str = "f91526e264d8000bf5d72a4efcb4e9701b350636c37da24d2b34bb19f50a8772";
+pub(crate) const PROJECTION_V7_HASH: &str =
+    "1a3cfcfe1c2d78948310fb1dafb04dba99e243ea821626e2de4d7009c3aa22b9";
+pub(crate) const PROJECTION_V8_HASH: &str =
+    "085e724d4cf969a85265d36b616fe04bc78a51c3beadf86dee7f1664bee2dcd7";
+pub(crate) const AGENT_V7_HASH: &str =
+    "244ce610feed9e389063805c0c36190633a082df2b743fbf340c40418797e2a0";
+pub(crate) const AGENT_V8_HASH: &str =
+    "ee1c8eada40f5ad7575b1fdf463b4e31961897dacfb81fd9aa549145d768100f";
 
-pub(crate) const V7_HASH: &str = "244ce610feed9e389063805c0c36190633a082df2b743fbf340c40418797e2a0";
+// Two independently produced layouts used versions 7 and 8. Their exact
+// manifest identifies which upgrades are already present, on disk and in backups.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SchemaLayout {
+    pub projections: i64,
+    pub agents: i64,
+}
 
-pub(crate) fn recognized_predecessor(version: i64, hash: &[u8]) -> bool {
-    match version {
-        1 => hex::encode(hash) == V1_HASH,
-        2 => hex::encode(hash) == V2_HASH,
-        3 => hex::encode(hash) == V3_HASH,
-        4 => hex::encode(hash) == V4_HASH,
-        5 => hex::encode(hash) == V5_HASH,
-        6 => hex::encode(hash) == V6_HASH,
-        7 => hex::encode(hash) == V7_HASH,
-        _ => false,
-    }
+pub(crate) fn predecessor(version: i64, hash: &[u8]) -> Option<SchemaLayout> {
+    let hash = hex::encode(hash);
+    let (projections, agents) = match (version, hash.as_str()) {
+        (1, V1_HASH) | (2, V2_HASH) | (3, V3_HASH) | (4, V4_HASH) | (5, V5_HASH) | (6, V6_HASH) => {
+            (version, version)
+        }
+        (7, PROJECTION_V7_HASH) | (8, PROJECTION_V8_HASH) => (version, 6),
+        (7, AGENT_V7_HASH) | (8, AGENT_V8_HASH) => (6, version),
+        _ => return None,
+    };
+    Some(SchemaLayout {
+        projections,
+        agents,
+    })
 }
 
 const READ_WITNESS: &str = "SELECT CAST(schema_version AS BIGINT), manifest_checksum
@@ -103,6 +121,23 @@ fn create_new_table(ddl: &str, table: &str) -> Result<String, PortError> {
     let prefix = format!("CREATE TABLE IF NOT EXISTS {table} (");
     Ok(baseline_statement(ddl, &prefix)?.replacen("CREATE TABLE IF NOT EXISTS", "CREATE TABLE", 1))
 }
+
+const PROJECTION_RANK_DDL: [&str; 7] = [
+    "CREATE TABLE IF NOT EXISTS projection_rank_anchors (",
+    "CREATE TABLE IF NOT EXISTS projection_rank_anchor_rows (",
+    "CREATE INDEX IF NOT EXISTS idx_projection_rank_anchor_target",
+    "CREATE INDEX IF NOT EXISTS idx_revisions_projection_rank_key",
+    "CREATE INDEX IF NOT EXISTS idx_revisions_projection_rank_target",
+    "CREATE INDEX IF NOT EXISTS idx_folder_aliases_projection_seq",
+    "CREATE INDEX IF NOT EXISTS idx_note_aliases_projection_seq",
+];
+const CHECK_RANK_ANCHOR: &str = "SELECT
+    (SELECT COUNT(*) FROM projection_rank_anchors) = (SELECT COUNT(*) FROM spaces)
+    AND (SELECT COUNT(*) FROM projection_rank_anchor_rows) = (SELECT COUNT(*) FROM view_rank_overlays)
+    AND NOT EXISTS (
+        SELECT 1 FROM projection_rank_anchor_rows r JOIN projection_rank_anchors a USING (space_id)
+        WHERE r.updated_seq > a.anchor_seq
+    )";
 
 async fn upgrade_sqlite_catalog(conn: &mut SqliteConnection) -> Result<(), PortError> {
     let create = create_new_table(SQLITE_BASELINE_DDL, "blob_catalog")?;
@@ -201,9 +236,9 @@ macro_rules! upgrade {
             let Some((version, hash)) = previous else {
                 return Ok(());
             };
-            if !recognized_predecessor(version, &hash) {
+            let Some(layout) = predecessor(version, &hash) else {
                 return Ok(());
-            }
+            };
             if version == 1 {
                 sqlx::query(sqlx::AssertSqlSafe(create_new_table(
                     $ddl,
@@ -263,7 +298,7 @@ macro_rules! upgrade {
                 sqlx::query(sqlx::AssertSqlSafe(index)).execute(&mut *conn).await
                     .map_err(|e| internal_not_committed("migration_v6_retirement_index", e.to_string()))?;
             }
-            if version < 7 {
+            if layout.agents < 7 {
                 let add_epoch = if stringify!($variant) == "Sqlite" {
                     "ALTER TABLE chat_threads ADD COLUMN active_run_epoch INTEGER CHECK (active_run_epoch IS NULL OR active_run_epoch >= 0)"
                 } else {
@@ -282,17 +317,43 @@ macro_rules! upgrade {
                 .await
                 .map_err(|e| internal_not_committed("migration_v7_chat_handoff_index", e.to_string()))?;
             }
-            sqlx::query("DROP INDEX IF EXISTS uq_ability_packages_active_slug")
+            if layout.agents < 8 {
+                sqlx::query("DROP INDEX IF EXISTS uq_ability_packages_active_slug")
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(|e| internal_not_committed("migration_v8_ability_slot_drop", e.to_string()))?;
+                sqlx::query(sqlx::AssertSqlSafe(baseline_statement(
+                    $ddl,
+                    "CREATE INDEX IF NOT EXISTS idx_ability_packages_active_slug",
+                )?))
                 .execute(&mut *conn)
                 .await
-                .map_err(|e| internal_not_committed("migration_v8_ability_slot_drop", e.to_string()))?;
-            sqlx::query(sqlx::AssertSqlSafe(baseline_statement(
-                $ddl,
-                "CREATE INDEX IF NOT EXISTS idx_ability_packages_active_slug",
-            )?))
-            .execute(&mut *conn)
-            .await
-            .map_err(|e| internal_not_committed("migration_v8_ability_slot_index", e.to_string()))?;
+                .map_err(|e| internal_not_committed("migration_v8_ability_slot_index", e.to_string()))?;
+            }
+            if layout.projections < 7 {
+                let rank_error = |e: sqlx::Error| {
+                    internal_not_committed("migration_v7_rank_anchor", e.to_string())
+                };
+                for prefix in PROJECTION_RANK_DDL {
+                    let sql = baseline_statement($ddl, prefix)?;
+                    sqlx::query(sqlx::AssertSqlSafe(sql)).execute(&mut *conn).await.map_err(rank_error)?;
+                }
+                // Capture actual overlays without advancing SpaceSeq or reviving a placement
+                // deleted before rank tombstones were available.
+                rank_anchors::copy(&mut crate::sql_exec::BackendConn::$variant(conn))
+                    .await.map_err(rank_error)?;
+                if !sqlx::query_scalar::<_, bool>(CHECK_RANK_ANCHOR)
+                    .fetch_one(&mut *conn).await.map_err(rank_error)?
+                {
+                    return Err(internal_not_committed(
+                        "migration_v7_rank_anchor",
+                        "the rank anchor does not capture all live view ranks at the Space command end",
+                    ));
+                }
+            }
+            if layout.projections < 8 {
+                chat_refs::$name(&mut *conn, layout.projections).await?;
+            }
             let (sec, nsec) =
                 crate::codec::encode_timestamp_parts(crate::codec::now_utc_timestamp()?);
             sqlx::query(WRITE_WITNESS)
@@ -329,47 +390,71 @@ mod tests {
     use crate::schema::bootstrap_sqlite_schema;
     use sqlx::{Connection, Row};
 
-    async fn restore_chat_schema_v6(db: &mut SqliteConnection) {
-        sqlx::raw_sql(include_str!("../../tests/fixtures/chat-schema-v6-only.sql"))
-            .execute(db)
-            .await
-            .unwrap();
+    async fn restore_schema_v6(db: &mut SqliteConnection) {
+        sqlx::raw_sql(concat!(
+            include_str!("../../tests/fixtures/schema-v6-remove-projection.sql"),
+            include_str!("../../tests/fixtures/schema-v8-remove-agents.sql")
+        ))
+        .execute(db)
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
-    async fn v7_upgrades_only_the_ability_slot_index() {
-        let mut db = SqliteConnection::connect(":memory:").await.unwrap();
-        let installation = InstallationId::from_bytes([7; 16]);
-        bootstrap_sqlite_schema(&mut db, &installation)
-            .await
-            .unwrap();
-        sqlx::raw_sql(
-            "DROP INDEX idx_ability_packages_active_slug;
-             CREATE UNIQUE INDEX uq_ability_packages_active_slug
-                ON ability_packages(space_id,slug_fold) WHERE lifecycle_state='active'",
-        )
-        .execute(&mut db)
-        .await
-        .unwrap();
-        sqlx::query("UPDATE schema_meta SET schema_version=7, manifest_checksum=$1")
-            .bind(hex::decode(V7_HASH).unwrap())
-            .execute(&mut db)
-            .await
-            .unwrap();
-        bootstrap_sqlite_schema(&mut db, &installation)
-            .await
-            .unwrap();
-        let index_state: (i64, i64) = sqlx::query_as(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='uq_ability_packages_active_slug'),
-                    EXISTS(SELECT 1 FROM pragma_index_list('ability_packages')
-                           WHERE name='idx_ability_packages_active_slug' AND [unique]=0)",
-        ).fetch_one(&mut db).await.unwrap();
-        assert_eq!(index_state, (0, 1));
-        let version: i64 = sqlx::query_scalar("SELECT schema_version FROM schema_meta")
-            .fetch_one(&mut db)
-            .await
-            .unwrap();
-        assert_eq!(version, i64::from(CANONICAL_SCHEMA_VERSION));
+    async fn both_divergent_layouts_upgrade_using_the_manifest_witness() {
+        for (version, hash) in [
+            (7, AGENT_V7_HASH),
+            (8, AGENT_V8_HASH),
+            (7, PROJECTION_V7_HASH),
+            (8, PROJECTION_V8_HASH),
+        ] {
+            let mut db = SqliteConnection::connect(":memory:").await.unwrap();
+            let installation = InstallationId::from_bytes([7; 16]);
+            bootstrap_sqlite_schema(&mut db, &installation)
+                .await
+                .unwrap();
+            let ddl = match hash {
+                AGENT_V7_HASH => concat!(
+                    include_str!("../../tests/fixtures/schema-v6-remove-projection.sql"),
+                    "DROP INDEX idx_ability_packages_active_slug;
+                     CREATE UNIQUE INDEX uq_ability_packages_active_slug
+                        ON ability_packages(space_id,slug_fold) WHERE lifecycle_state='active';"
+                ),
+                AGENT_V8_HASH => {
+                    include_str!("../../tests/fixtures/schema-v6-remove-projection.sql")
+                }
+                PROJECTION_V7_HASH => concat!(
+                    include_str!("../../tests/fixtures/schema-v7-chat-refs.sql"),
+                    include_str!("../../tests/fixtures/schema-v8-remove-agents.sql"),
+                ),
+                PROJECTION_V8_HASH => {
+                    include_str!("../../tests/fixtures/schema-v8-remove-agents.sql")
+                }
+                _ => unreachable!(),
+            };
+            sqlx::raw_sql(ddl).execute(&mut db).await.unwrap();
+            sqlx::query("UPDATE schema_meta SET schema_version=$1, manifest_checksum=$2")
+                .bind(version)
+                .bind(hex::decode(hash).unwrap())
+                .execute(&mut db)
+                .await
+                .unwrap();
+            bootstrap_sqlite_schema(&mut db, &installation)
+                .await
+                .unwrap();
+            let witness: (i64, Vec<u8>) =
+                sqlx::query_as("SELECT schema_version, manifest_checksum FROM schema_meta")
+                    .fetch_one(&mut db)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                witness,
+                (
+                    i64::from(CANONICAL_SCHEMA_VERSION),
+                    crate::manifest_checksum().as_bytes().to_vec()
+                )
+            );
+        }
     }
 
     #[tokio::test]
@@ -379,7 +464,7 @@ mod tests {
         bootstrap_sqlite_schema(&mut db, &installation)
             .await
             .unwrap();
-        restore_chat_schema_v6(&mut db).await;
+        restore_schema_v6(&mut db).await;
         sqlx::query("UPDATE schema_meta SET schema_version=6, manifest_checksum=$1")
             .bind(hex::decode(V6_HASH).unwrap())
             .execute(&mut db)
@@ -420,7 +505,7 @@ mod tests {
         bootstrap_sqlite_schema(&mut db, &installation)
             .await
             .unwrap();
-        restore_chat_schema_v6(&mut db).await;
+        restore_schema_v6(&mut db).await;
         sqlx::raw_sql(
             "DROP INDEX idx_blob_retirements_status;
              CREATE INDEX idx_blob_retirements_status ON blob_retirements(space_id, status);
@@ -491,7 +576,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        restore_chat_schema_v6(&mut db).await;
+        restore_schema_v6(&mut db).await;
         sqlx::query("INSERT INTO schema_meta VALUES(1,4,1,$1,'ready',$2,0,0,0,0)")
             .bind(installation.as_str())
             .bind(hex::decode(V4_HASH).unwrap())
@@ -549,7 +634,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        restore_chat_schema_v6(&mut db).await;
+        restore_schema_v6(&mut db).await;
         sqlx::raw_sql(include_str!(
             "../../tests/fixtures/schema-v3-reference-index.sql"
         ))
@@ -662,7 +747,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        restore_chat_schema_v6(&mut db).await;
+        restore_schema_v6(&mut db).await;
         let install = InstallationId::from_bytes([4; 16]);
         sqlx::query("INSERT INTO schema_meta VALUES(1,1,1,$1,'ready',$2,0,0,0,0)")
             .bind(install.as_str())

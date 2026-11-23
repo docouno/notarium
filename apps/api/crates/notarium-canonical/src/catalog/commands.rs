@@ -77,14 +77,25 @@ async fn execute(
     let inner = store.inner.clone();
     let grants = store.inner.clone();
     let work_budget = budget.clone();
+    let visible_space = match &command {
+        Command::Lifecycle { scope, .. } => Some(scope.space_id.clone()),
+        Command::Provision { .. } => None,
+    };
     store
-        .with_auxiliary_command(
+        .with_auxiliary_visibility_command(
             space_id,
+            visible_space,
             Some((&budget, deadline)),
-            move |(result, grant)| {
+            move |(result, grant): (CatalogSpace, Option<(SpaceId, LeaseEpoch)>)| {
                 if let Some((space, epoch)) = grant {
                     grants.grant_writer_epoch(&space, epoch);
                 }
+                grants
+                    .broadcast_hub
+                    .publish(crate::changes::BroadcastSignal::CatalogChanged {
+                        scope: result.history.clone(),
+                        lifecycle: result.space.lifecycle,
+                    });
                 Ok(result)
             },
             move |tx| {

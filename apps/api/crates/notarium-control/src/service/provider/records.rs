@@ -10,7 +10,23 @@ use notarium_core::{
     ports::*,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, num::NonZeroU64};
+
+pub(super) fn runtime_epochs(
+    resource: &ProviderResourcesRow,
+    credential: Option<&CredentialsRow>,
+) -> Result<ProviderRuntimeEpochs, PortError> {
+    let epoch = |value| {
+        u64::try_from(value)
+            .ok()
+            .and_then(NonZeroU64::new)
+            .ok_or_else(super::selection::unavailable)
+    };
+    Ok(ProviderRuntimeEpochs {
+        resource: epoch(resource.runtime_epoch)?,
+        credential: credential.map(|row| epoch(row.runtime_epoch)).transpose()?,
+    })
+}
 
 pub(super) fn json(value: &impl Serialize) -> Result<String, PortError> {
     serde_json::to_string(value).map_err(|_| invalid(ValidationReason::InvalidQuery))

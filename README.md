@@ -4,17 +4,20 @@ Notarium is a knowledge workspace for people and AI agents. Version 1.0 is being
 built from scratch on `v1` with a Rust backend, React web client and Electron
 desktop client. The `main` branch remains the released v0 showcase.
 
-This branch contains the development foundation, domain contracts,
-byte-preserving document syntax, dual-dialect canonical storage with CAS,
-control storage, authentication and provider services. The agent library
-implements the MCP tool registry, chat supervision and scheduled Keepers.
-The runnable API and greeting screen still serve development examples.
-Product transport wiring, derived projections, search, collaboration and the
-product UI are separate integrations.
+This branch contains domain contracts, byte-preserving document syntax,
+dual-dialect canonical storage with CAS, control storage and rebuildable
+structural projections. The engine ports support declarative Markdown views,
+board reads and knowledge graphs. Control services cover transport-independent
+authentication, Space access, OAuth issuance, OIDC identity, provider services,
+account context, schedule claims, content-free telemetry and backup snapshots.
+The hybrid search library provides search and recall. Transport-independent Yrs rooms support live Markdown editing. The agent library shares one MCP tool registry across external clients,
+supervised chat runs and scheduled Keepers. The runnable API and greeting
+screen still serve development examples.
 
 ## Start developing
 
-Use Linux x86_64, local Docker Engine, Docker Compose **5.0.0+**, Git and GNU Make.
+Use Linux x86_64, local Docker Engine, Docker Compose **5.0.0+**, Git, GNU Make,
+`curl`, `unzip` and `sha256sum`.
 Host Node **24.22.1** is optional and only needed for `npx` CLI entry points.
 Development tools run in pinned containers; no private services or additional agent
 tooling are needed.
@@ -70,9 +73,14 @@ HTTP and agents consume core ports instead of directly importing engine storage
 or search. Native tests enforce the [crate matrix](docs/architecture.md).
 See [development commands and ownership](docs/development.md) for details.
 The implemented library boundaries are documented in [core contracts](docs/core-contracts.md),
-[document syntax](docs/syntax.md) and [canonical storage](docs/storage.md).
-See [control storage](docs/control.md) for account authority and
+[document syntax](docs/syntax.md), [canonical storage](docs/storage.md) and
+[live collaboration](docs/collab.md).
+See [control storage](docs/control.md) for the control-plane primitives and
 [MCP tools, chat runs and Keepers](docs/agents.md) for the agent services.
+See [hybrid search](docs/search.md) for search and recall, model setup, and the
+offline scale gate.
+The [projections guide](docs/projections.md) covers note views, graph queries
+and the SQLite and PostgreSQL acceptance workload.
 
 ## Contract and delivery
 

@@ -192,12 +192,20 @@ impl Job {
                 .flat_map(|message| message.parts.iter().cloned())
                 .collect(),
             Request::Embedding(request) => request
-                .chunks
+                .inputs
                 .iter()
-                .cloned()
-                .map(ProviderMessage::Part)
+                .filter_map(|input| match input {
+                    EmbeddingInput::Part(part) => Some(ProviderMessage::Part(part.clone())),
+                    EmbeddingInput::Query(_) => None,
+                })
                 .collect(),
             Request::Check(_) => vec![],
+        }
+    }
+    pub fn embedding_inputs(&self) -> &[EmbeddingInput] {
+        match &self.request {
+            Request::Embedding(request) => &request.inputs,
+            _ => &[],
         }
     }
     pub fn egress(
@@ -281,6 +289,16 @@ impl Job {
             primary,
             project: self.project().cloned(),
             secondary_projects: projects.into_values().collect(),
+            project_folders: self
+                .embedding_inputs()
+                .iter()
+                .filter_map(|input| match input {
+                    EmbeddingInput::Query(query) if query.project_scope.is_some() => {
+                        query.folder.clone()
+                    }
+                    _ => None,
+                })
+                .collect(),
         })
     }
     pub fn encode(&self, snapshot: &Snapshot) -> Result<Vec<u8>, PortError> {

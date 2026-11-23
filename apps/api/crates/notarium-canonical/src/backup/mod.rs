@@ -2003,22 +2003,55 @@ async fn sleep_async_interruptible(
     Ok(())
 }
 
-fn spool_tables(schema_version: u32) -> impl Iterator<Item = TableSpec> + Clone {
+fn spool_tables(
+    schema_version: u32,
+    layout: crate::schema::migrate::SchemaLayout,
+) -> impl Iterator<Item = TableSpec> + Clone {
     CANONICAL_TABLES
         .iter()
         .copied()
         .filter_map(move |mut table| {
-            if schema_version < 8 && table.name == "ability_packages" {
+            if layout.agents < 8 && table.name == "ability_packages" {
                 table.indexes = &[
                     "uq_ability_packages_active_slug",
                     "idx_ability_packages_entrypoint",
                 ];
             }
-            if schema_version < 7 {
+            if layout.agents < 7 {
                 match table.name {
                     "chat_threads" => table.columns = &table.columns[..18],
                     "chat_entries" => table.columns = &table.columns[..20],
                     "chat_pending_inputs" => table.indexes = &table.indexes[..2],
+                    _ => {}
+                }
+            }
+            if layout.projections == 7 && table.name == "chat_entry_note_refs" {
+                table.columns = &table.columns[..6];
+                table.indexes = &["idx_chat_entry_note_refs_target"];
+            }
+            if layout.projections < 7 {
+                match table.name {
+                    "projection_rank_anchors"
+                    | "projection_rank_anchor_rows"
+                    | "chat_entry_note_refs" => return None,
+                    "folder_aliases" => table.indexes = &["idx_folder_aliases_lookup"],
+                    "note_aliases" => {
+                        table.indexes = &[
+                            "idx_note_aliases_slug_lookup",
+                            "idx_note_aliases_title_lookup",
+                            "idx_note_aliases_target",
+                        ];
+                    }
+                    "revisions" => {
+                        table.indexes = &[
+                            "idx_revisions_entity_vis_seq",
+                            "idx_revisions_agent_run",
+                            "idx_revisions_parent_rev",
+                        ];
+                    }
+                    "chat_entries" => {
+                        table.indexes = &["idx_chat_entries_parent", "idx_chat_entries_compaction"];
+                    }
                     _ => {}
                 }
             }
@@ -2053,19 +2086,54 @@ fn spool_tables(schema_version: u32) -> impl Iterator<Item = TableSpec> + Clone 
         })
 }
 
+fn verified_spool_tables(
+    version: u32,
+    digest: ContentDigest,
+) -> Result<impl Iterator<Item = TableSpec> + Clone, PortError> {
+    use crate::schema::migrate::{SchemaLayout, predecessor};
+
+    let layout = match version {
+        CANONICAL_SCHEMA_VERSION if digest == manifest_checksum() => SchemaLayout {
+            projections: i64::from(version),
+            agents: i64::from(version),
+        },
+        1..CANONICAL_SCHEMA_VERSION => predecessor(i64::from(version), digest.as_bytes())
+            .ok_or_else(|| DomainError::validation(ValidationReason::InvalidDigest))?,
+        CANONICAL_SCHEMA_VERSION => {
+            return Err(DomainError::validation(ValidationReason::InvalidDigest).into());
+        }
+        _ => return Err(DomainError::validation(ValidationReason::InvalidState).into()),
+    };
+    let tables = spool_tables(version, layout);
+    if version < CANONICAL_SCHEMA_VERSION && checksum_tables(version, tables.clone()) != digest {
+        return Err(DomainError::validation(ValidationReason::InvalidDigest).into());
+    }
+    Ok(tables)
+}
+
 #[cfg(test)]
 #[test]
-fn historical_postgres_spool_manifests_match_startup_migrations() {
-    for version in 1..CANONICAL_SCHEMA_VERSION {
-        let checksum = checksum_tables(version, spool_tables(version));
-        assert!(
-            crate::schema::migrate::recognized_predecessor(i64::from(version), checksum.as_bytes()),
-            "unrecognized manifest for canonical schema {version}"
-        );
+fn historical_spool_shapes_match_their_published_manifests() {
+    use crate::schema::migrate::*;
+    for (version, hash) in [
+        (1, V1_HASH),
+        (2, V2_HASH),
+        (3, V3_HASH),
+        (4, V4_HASH),
+        (5, V5_HASH),
+        (6, V6_HASH),
+        (7, PROJECTION_V7_HASH),
+        (7, AGENT_V7_HASH),
+        (8, PROJECTION_V8_HASH),
+        (8, AGENT_V8_HASH),
+    ] {
+        let digest = ContentDigest::from_bytes(hex::decode(hash).unwrap().try_into().unwrap());
+        let tables = verified_spool_tables(version, digest).unwrap();
+        assert_eq!(checksum_tables(version, tables), digest);
     }
 }
 
-/// Materializes a verified spool for offline inspection within the default budget.
+/// Materializes a verified canonical spool for offline inspection within the default budget.
 pub fn decode_postgres_spool_v1(path: &Path) -> Result<DecodedPostgresSpoolV1, PortError> {
     decode_postgres_spool_v1_bounded(
         path,
@@ -2134,27 +2202,10 @@ pub fn decode_postgres_spool_v1_bounded(
     let mut u32_buf = [0u8; 4];
     reader.read_exact_body(&mut u32_buf, body_limit)?;
     let schema_version = u32::from_be_bytes(u32_buf);
-    let expected_tables = spool_tables(schema_version);
-    let expected_checksum = match schema_version {
-        CANONICAL_SCHEMA_VERSION => manifest_checksum(),
-        1..CANONICAL_SCHEMA_VERSION => {
-            let digest = checksum_tables(schema_version, expected_tables.clone());
-            if !crate::schema::migrate::recognized_predecessor(
-                i64::from(schema_version),
-                digest.as_bytes(),
-            ) {
-                return Err(DomainError::validation(ValidationReason::InvalidDigest).into());
-            }
-            digest
-        }
-        _ => return Err(DomainError::validation(ValidationReason::InvalidState).into()),
-    };
     let mut checksum_buf = [0u8; 32];
     reader.read_exact_body(&mut checksum_buf, body_limit)?;
     let observed_checksum = ContentDigest::from_bytes(checksum_buf);
-    if observed_checksum != expected_checksum {
-        return Err(DomainError::validation(ValidationReason::InvalidDigest).into());
-    }
+    let expected_tables = verified_spool_tables(schema_version, observed_checksum)?;
 
     reader.read_exact_body(&mut u32_buf, body_limit)?;
     let witness_len = u32::from_be_bytes(u32_buf) as usize;
@@ -3421,6 +3472,7 @@ impl BackupParticipantPort for CanonicalStore {
 // ============================================================================
 
 async fn recover_restored_gc(store: CanonicalStore, spaces: Vec<(HistoryScope, LeaseEpoch)>) {
+    use crate::domain::purge::{RetirementRecovery, RetirementSelection};
     use futures_util::StreamExt;
     futures_util::stream::iter(spaces)
         .for_each_concurrent(4, |(scope, epoch)| {
@@ -3432,7 +3484,8 @@ async fn recover_restored_gc(store: CanonicalStore, spaces: Vec<(HistoryScope, L
                         .resume_blob_retirements(
                             &scope,
                             epoch,
-                            crate::domain::purge::RetirementRecovery::RestoredGc,
+                            RetirementRecovery::Online,
+                            RetirementSelection::GcOnly,
                         )
                         .await
                     {
@@ -3931,6 +3984,7 @@ async fn apply_restore_cursor_tx(
         "board_move_history",
         "chat_threads",
         "pending_purges",
+        "projection_rank_anchors",
     ];
 
     match tx {
@@ -4069,13 +4123,13 @@ async fn load_restored_room_fences(
     let rows: Vec<(String, i64, String)> =
         match tx {
             BackendConn::Sqlite(conn) => sqlx::query_as(
-                "SELECT note_id, lease_epoch, room_state FROM collab_sessions WHERE space_id = ?",
+                "SELECT note_id, lease_epoch, room_state FROM collab_sessions WHERE space_id = ? AND room_state <> 'closed'",
             )
             .bind(scope.space_id.as_str())
             .fetch_all(&mut **conn)
             .await,
             BackendConn::Postgres(conn) => sqlx::query_as(
-                "SELECT note_id, lease_epoch, room_state FROM collab_sessions WHERE space_id = $1",
+                "SELECT note_id, lease_epoch, room_state FROM collab_sessions WHERE space_id = $1 AND room_state <> 'closed'",
             )
             .bind(scope.space_id.as_str())
             .fetch_all(&mut **conn)
@@ -4092,6 +4146,7 @@ async fn load_restored_room_fences(
         fences
             .seed_persisted_room(scope, &note, epoch, state == "active")
             .await?;
+        fences.set_room_fenced(&scope.space_id, &note, state == "fenced");
     }
     Ok(())
 }

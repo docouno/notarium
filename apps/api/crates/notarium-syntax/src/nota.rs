@@ -362,6 +362,217 @@ pub fn analyze(
         plan: patch::plan(source, body, edits)?,
     })
 }
+/// Best-effort identity recovery in incomplete or malformed nota YAML.
+/// Only a unique top-level scalar identity is accepted, and this never
+/// certifies the rest of the authored block as parseable.
+pub fn recover_top_level_id(raw: &str) -> Option<ViewKey> {
+    let mut root: Option<usize> = None;
+    let mut found: Option<ViewKey> = None;
+    let mut block_scalar_indent: Option<usize> = None;
+    let mut open_quote: Option<char> = None;
+    let mut flow_depth: usize = 0;
+
+    for raw_line in raw.split('\n') {
+        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+        let trimmed_spaces = line.trim_start_matches(' ');
+        let indent = line.len() - trimmed_spaces.len();
+        let trimmed = trimmed_spaces.trim_end_matches([' ', '\t']);
+
+        // Stop at YAML document end or a subsequent document header once content started.
+        if open_quote.is_none() && block_scalar_indent.is_none() && flow_depth == 0 {
+            if trimmed == "..." {
+                break;
+            }
+            if trimmed == "---" {
+                if root.is_some() {
+                    break;
+                }
+                continue;
+            }
+        }
+
+        if let Some(parent_indent) = block_scalar_indent {
+            if trimmed.is_empty() || indent > parent_indent {
+                continue;
+            }
+            block_scalar_indent = None;
+            // Re-check document boundary after exiting a block scalar.
+            if trimmed == "..." || trimmed == "---" {
+                break;
+            }
+        }
+
+        if open_quote.is_some() || flow_depth > 0 {
+            advance_yaml_inline_state(line, &mut open_quote, &mut flow_depth);
+            continue;
+        }
+
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        let root_indent = match root {
+            Some(r) => r,
+            None => {
+                if trimmed_spaces.starts_with(['[', '{', '|', '>'])
+                    || trimmed_spaces.starts_with("- ")
+                    || trimmed == "-"
+                {
+                    return None;
+                }
+                root = Some(indent);
+                indent
+            }
+        };
+
+        // Lines indented deeper than root belong to a nested value; still track
+        // multiline quotes/flow/block scalars so an inner `id:` cannot masquerade
+        // as a top-level key when its continuation starts at column `root_indent`.
+        if indent != root_indent
+            || !line
+                .as_bytes()
+                .get(..root_indent)
+                .is_some_and(|prefix| prefix.iter().all(|&byte| byte == b' '))
+        {
+            if let Some((_, rest)) = split_yaml_mapping_colon(trimmed_spaces) {
+                if starts_block_scalar(rest) {
+                    block_scalar_indent = Some(indent);
+                } else {
+                    advance_yaml_inline_state(rest, &mut open_quote, &mut flow_depth);
+                }
+            } else {
+                advance_yaml_inline_state(trimmed_spaces, &mut open_quote, &mut flow_depth);
+            }
+            continue;
+        }
+
+        let Some(at_root) = line.get(root_indent..) else {
+            continue;
+        };
+        if at_root.starts_with(char::is_whitespace) {
+            continue;
+        }
+        let Some((key, rest)) = split_yaml_mapping_colon(at_root) else {
+            advance_yaml_inline_state(at_root, &mut open_quote, &mut flow_depth);
+            continue;
+        };
+
+        let is_id_key = matches!(key.trim_end(), "id" | "\"id\"" | "'id'");
+        if starts_block_scalar(rest) {
+            if is_id_key {
+                // Multiline block-scalar `id:` is not recovered as a simple scalar.
+                return None;
+            }
+            block_scalar_indent = Some(root_indent);
+            continue;
+        }
+        advance_yaml_inline_state(rest, &mut open_quote, &mut flow_depth);
+        if !is_id_key {
+            continue;
+        }
+        if open_quote.is_some() || flow_depth > 0 || found.is_some() {
+            return None;
+        }
+        let YamlValue::Mapping(fields) = yaml::parse(at_root).ok()? else {
+            return None;
+        };
+        let YamlValue::String(value) = fields.get("id")? else {
+            return None;
+        };
+        found = Some(ViewKey::parse(value).ok()?);
+    }
+    found
+}
+
+fn starts_block_scalar(rest: &str) -> bool {
+    let trimmed = rest.trim_start_matches([' ', '\t']);
+    let Some(indicator) = trimmed.chars().next() else {
+        return false;
+    };
+    if indicator != '|' && indicator != '>' {
+        return false;
+    }
+    let after = &trimmed[1..];
+    let after = after
+        .split_once('#')
+        .map_or(after, |(before, _)| before)
+        .trim();
+    after
+        .bytes()
+        .all(|b| matches!(b, b'+' | b'-' | b'1'..=b'9'))
+}
+
+fn split_yaml_mapping_colon(text: &str) -> Option<(&str, &str)> {
+    let mut quote: Option<char> = None;
+    let mut prev: Option<char> = None;
+    let mut chars = text.char_indices().peekable();
+    while let Some((idx, ch)) = chars.next() {
+        if let Some(q) = quote {
+            if q == '"' {
+                if ch == '\\' {
+                    prev = chars.next().map(|(_, c)| c).or(Some(ch));
+                    continue;
+                } else if ch == '"' {
+                    quote = None;
+                }
+            } else if ch == '\'' {
+                if chars.peek().is_some_and(|(_, next)| *next == '\'') {
+                    let _ = chars.next();
+                    prev = Some('\'');
+                    continue;
+                } else {
+                    quote = None;
+                }
+            }
+            prev = Some(ch);
+            continue;
+        }
+        match ch {
+            '"' | '\'' => quote = Some(ch),
+            '#' if prev.is_none_or(|c| c == ' ' || c == '\t') => return None,
+            ':' => return Some((&text[..idx], &text[idx + 1..])),
+            _ => {}
+        }
+        prev = Some(ch);
+    }
+    None
+}
+
+fn advance_yaml_inline_state(text: &str, open_quote: &mut Option<char>, flow_depth: &mut usize) {
+    let mut prev: Option<char> = None;
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if let Some(quote) = *open_quote {
+            if quote == '"' {
+                if ch == '\\' {
+                    prev = chars.next().or(Some(ch));
+                    continue;
+                } else if ch == '"' {
+                    *open_quote = None;
+                }
+            } else if ch == '\'' {
+                if chars.peek() == Some(&'\'') {
+                    let _ = chars.next();
+                    prev = Some('\'');
+                    continue;
+                } else {
+                    *open_quote = None;
+                }
+            }
+            prev = Some(ch);
+            continue;
+        }
+        match ch {
+            '#' if prev.is_none_or(|c| c == ' ' || c == '\t') => break,
+            '"' | '\'' => *open_quote = Some(ch),
+            '[' | '{' => *flow_depth = flow_depth.saturating_add(1),
+            ']' | '}' => *flow_depth = flow_depth.saturating_sub(1),
+            _ => {}
+        }
+        prev = Some(ch);
+    }
+}
+
 fn map_insertion(
     fence: &FencedBlock,
     span: ByteSpan,
@@ -410,4 +621,46 @@ fn map_insertion(
         .map(|line| format!("{}{line}", fence.continuation_prefix))
         .collect();
     Ok((ByteSpan::new(offset, offset)?, replacement))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::recover_top_level_id;
+    use notarium_core::ids::ViewKey;
+
+    #[test]
+    fn recover_top_level_id_requires_leading_spaces_only() {
+        let key = ViewKey::from_bytes([1; 16]);
+        let valid = format!("  kind: list\n  id: {}\n  bad: [", key.as_str());
+        assert_eq!(recover_top_level_id(&valid), Some(key.clone()));
+
+        let non_space_prefix = format!("  kind: list\nabid: {}\n  bad: [", key.as_str());
+        assert_eq!(recover_top_level_id(&non_space_prefix), None);
+    }
+
+    #[test]
+    fn recover_top_level_id_ignores_multiline_scalars_and_document_boundaries() {
+        let key = ViewKey::from_bytes([2; 16]);
+        let in_block_scalar = format!("title: |\n  id: {}\nbad: [", key.as_str());
+        assert_eq!(recover_top_level_id(&in_block_scalar), None);
+
+        let in_quoted = format!("title: \"hello\nid: {}\"\nbad: [", key.as_str());
+        assert_eq!(recover_top_level_id(&in_quoted), None);
+
+        let quoted_key_with_colon =
+            format!("\"title: x\": \"hello\nid: {}\"\nbad: [", key.as_str());
+        assert_eq!(recover_top_level_id(&quoted_key_with_colon), None);
+
+        let hash_inside_key = format!("foo#bar: \"hello\nid: {}\"\nbad: [", key.as_str());
+        assert_eq!(recover_top_level_id(&hash_inside_key), None);
+
+        let after_doc_end = format!("kind: list\n...\nid: {}", key.as_str());
+        assert_eq!(recover_top_level_id(&after_doc_end), None);
+
+        let after_second_doc = format!("kind: list\n---\nid: {}", key.as_str());
+        assert_eq!(recover_top_level_id(&after_second_doc), None);
+
+        let after_leading_doc_start = format!("---\nkind: list\nid: {}\nbad: [", key.as_str());
+        assert_eq!(recover_top_level_id(&after_leading_doc_start), Some(key));
+    }
 }

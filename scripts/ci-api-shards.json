@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "feature_anchor_crates": ["notarium-bin"],
+  "shards": [
+    {
+      "id": "control",
+      "crates": ["notarium-control"],
+      "needs_build_api": false,
+      "saves_fixture_cache": false,
+      "runs_doc_tests": false
+    },
+    {
+      "id": "canonical",
+      "crates": ["notarium-canonical"],
+      "needs_build_api": false,
+      "saves_fixture_cache": true,
+      "runs_doc_tests": false
+    },
+    {
+      "id": "projections",
+      "crates": ["notarium-projections"],
+      "needs_build_api": false,
+      "saves_fixture_cache": false,
+      "runs_doc_tests": false
+    },
+    {
+      "id": "engine",
+      "crates": ["notarium-search", "notarium-collab", "notarium-vault"],
+      "needs_build_api": false,
+      "saves_fixture_cache": false,
+      "runs_doc_tests": false
+    },
+    {
+      "id": "platform",
+      "crates": [
+        "notarium-core",
+        "notarium-syntax",
+        "notarium-jobs",
+        "notarium-agents",
+        "notarium-http",
+        "notarium-bin",
+        "notarium-migrate",
+        "fitness-gates"
+      ],
+      "needs_build_api": true,
+      "saves_fixture_cache": false,
+      "runs_doc_tests": true
+    }
+  ]
+}

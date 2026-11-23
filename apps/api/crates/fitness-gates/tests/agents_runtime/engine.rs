@@ -16,7 +16,7 @@ use notarium_core::{
 use std::{
     collections::BTreeMap,
     sync::atomic::{AtomicUsize, Ordering},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
 };
 use tokio::sync::oneshot;
 
@@ -114,6 +114,7 @@ impl SessionRevocationPort for TestRevocations {
 
 #[derive(Default)]
 pub struct ProjectionFixtures {
+    pub(super) real: OnceLock<super::real_reads::DerivedReads>,
     pub admitted_sql_effects: AtomicUsize,
     seed: Mutex<Option<ProjectionFixture>>,
     directory: Mutex<BTreeMap<EffectiveReadId, NoteQuery>>,
@@ -587,10 +588,13 @@ impl NoteReadPort for TestEngine {
 
     fn project_note_counts(
         &self,
-        _: SpaceContext,
-        _: FolderRef,
-        _: CausalBasis,
+        ctx: SpaceContext,
+        project: FolderRef,
+        causal: CausalBasis,
     ) -> PortFuture<'_, ProjectNoteCounts> {
+        if let Some(real) = self.1.real.get() {
+            return real.notes.project_note_counts(ctx, project, causal);
+        }
         unavailable()
     }
 
@@ -611,6 +615,9 @@ impl NoteReadPort for TestEngine {
     }
 
     fn get_note(&self, ctx: SpaceContext, request: GetNote) -> PortFuture<'_, NoteSnapshot> {
+        if let Some(real) = self.1.real.get() {
+            return real.notes.get_note(ctx, request);
+        }
         Box::pin(self.0.get_note(ctx, request))
     }
 
@@ -619,6 +626,9 @@ impl NoteReadPort for TestEngine {
         ctx: SpaceContext,
         request: ReadRequest<NoteQuery>,
     ) -> PortFuture<'_, FolderPage> {
+        if let Some(real) = self.1.real.get() {
+            return real.notes.list_notes(ctx, request);
+        }
         Box::pin(async move { self.directory_page(&ctx, request).await })
     }
 
@@ -645,6 +655,9 @@ impl ViewGraphPort for TestEngine {
         ctx: SpaceContext,
         request: ReadRequest<ViewQuery>,
     ) -> PortFuture<'_, ViewResult> {
+        if let Some(real) = self.1.real.get() {
+            return real.projection.query_view(ctx, request);
+        }
         Box::pin(async move {
             let fixture = self.1.current(&ctx).ok_or(DomainError::ResourceNotFound)?;
             let ReadRequest::Open { query, .. } = request else {
@@ -709,6 +722,9 @@ impl ViewGraphPort for TestEngine {
     }
 
     fn query_graph(&self, ctx: SpaceContext, request: GraphQuery) -> PortFuture<'_, GraphResult> {
+        if let Some(real) = self.1.real.get() {
+            return real.projection.query_graph(ctx, request);
+        }
         Box::pin(async move {
             let fixture = self.1.current(&ctx).ok_or(DomainError::ResourceNotFound)?;
             let GraphTier::Neighborhood { note, hops: 1 } = request.tier else {
@@ -746,10 +762,16 @@ impl ViewGraphPort for TestEngine {
 
 impl SearchPort for TestEngine {
     fn search(&self, ctx: SpaceContext, request: SearchQuery) -> PortFuture<'_, SearchResult> {
+        if let Some(real) = self.1.real.get() {
+            return real.search.search(ctx, request);
+        }
         Box::pin(async move { self.retrieve(&ctx, request).await })
     }
 
     fn recall(&self, ctx: SpaceContext, request: RecallQuery) -> PortFuture<'_, SearchResult> {
+        if let Some(real) = self.1.real.get() {
+            return real.search.recall(ctx, request);
+        }
         Box::pin(async move { self.retrieve(&ctx, request.query).await })
     }
 }
@@ -943,12 +965,11 @@ impl TestEngine {
         if request.text == "runtime fixture" {
             for note in fixture.notes {
                 let (card, snapshot) = self.card(ctx, note).await?;
-                if request.project.as_ref().is_some_and(|project| {
-                    snapshot
-                        .provenance
-                        .as_ref()
-                        .and_then(|value| value.project.as_ref())
-                        != Some(project)
+                if request.folder.as_ref().is_some_and(|folder| {
+                    !snapshot.document.in_project(&FolderRef {
+                        space_id: ctx.scope().space_id.clone(),
+                        folder_id: folder.clone(),
+                    })
                 }) {
                     continue;
                 }
@@ -978,6 +999,7 @@ impl TestEngine {
         }
         Ok(SearchResult {
             hits,
+            chat_hits: Vec::new(),
             cut: self.cut(ctx).await?,
             degraded: None,
             truncated: false,

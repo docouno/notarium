@@ -12,7 +12,15 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
+    num::NonZeroU64,
 };
+
+/// The configurations that can change the output of a provider model.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub struct ProviderRuntimeEpochs {
+    pub resource: NonZeroU64,
+    pub credential: Option<NonZeroU64>,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -606,6 +614,9 @@ pub trait ProviderEgressLease: Send {
     /// The transport received a successful final response head. A database
     /// read barrier can be released; keep revocation registration until close.
     fn mark_dispatched(&mut self);
+    /// Scoped query folders verified inside this project. The lease pins their
+    /// active ancestry until dispatch finishes or is cancelled.
+    fn project_folders(&self) -> &BTreeSet<FolderId>;
     fn check(&self) -> DomainResult<()>;
 }
 #[derive(Clone, Debug)]
@@ -614,6 +625,7 @@ pub struct ProviderEgressRequest {
     pub primary: crate::model::HistoryScope,
     pub project: Option<FolderRef>,
     pub secondary_projects: Vec<FolderRef>,
+    pub project_folders: BTreeSet<FolderId>,
 }
 pub const MAX_PROVIDER_ORIGINS: usize = 4096;
 pub const MAX_PROVIDER_SECONDARY_PROJECTS: usize = 64;

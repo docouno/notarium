@@ -143,6 +143,7 @@ struct EgressLease {
     current: Vec<ProviderCurrentContent>,
     project: Option<FolderRef>,
     secondary_projects: Vec<FolderRef>,
+    project_folders: BTreeSet<FolderId>,
 }
 
 impl ProviderEgressLease for EgressLease {
@@ -156,6 +157,10 @@ impl ProviderEgressLease for EgressLease {
 
     fn secondary_projects(&self) -> &[FolderRef] {
         &self.secondary_projects
+    }
+
+    fn project_folders(&self) -> &BTreeSet<FolderId> {
+        &self.project_folders
     }
 
     fn mark_dispatched(&mut self) {
@@ -195,6 +200,7 @@ impl ProviderEgressCatalogPort for CanonicalStore {
         Box::pin(async move {
             if request.origins.len() > MAX_PROVIDER_ORIGINS
                 || request.secondary_projects.len() > MAX_PROVIDER_SECONDARY_PROJECTS
+                || request.project_folders.len() > MAX_PROVIDER_ORIGINS
             {
                 return Err(DomainError::validation(ValidationReason::InvalidLimit).into());
             }
@@ -249,6 +255,7 @@ impl ProviderEgressCatalogPort for CanonicalStore {
                 current,
                 project: request.project,
                 secondary_projects: request.secondary_projects,
+                project_folders: request.project_folders,
             }) as Box<dyn ProviderEgressLease>)
         })
     }
@@ -414,6 +421,24 @@ async fn snapshot(
         let (_, row) = folder_metadata(tx, ctx.auth(), record, project.clone()).await?;
         if !row.is_project {
             return Err(DomainError::ResourceNotFound.into());
+        }
+    }
+
+    if !request.project_folders.is_empty() {
+        let project = request.project.as_ref().ok_or(DomainError::AccessDenied)?;
+        let record = records
+            .get(&project.space_id)
+            .ok_or(DomainError::ResourceNotFound)?;
+        let mut ancestry = FolderAncestryCache::default();
+        for folder in &request.project_folders {
+            let facts = ancestry
+                .load_ancestry_tx(tx, &project.space_id, folder, true)
+                .await?;
+            ctx.auth()
+                .can_view_folder(&record.space, folder, &facts.ancestors)?;
+            if !facts.ancestors.contains(&project.folder_id) {
+                return Err(DomainError::AccessDenied.into());
+            }
         }
     }
 

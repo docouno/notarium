@@ -1,8 +1,9 @@
 use std::{collections::BTreeMap, time::Duration};
 
 use notarium_core::{
+    DomainError,
     classes::DocClass,
-    error::PortError,
+    error::{Diagnostic, PortError, ValidationReason},
     ids::{
         ChatThreadId, ContentDigest, FolderId, HistoryIncarnation, LeaseEpoch, NoteId, PrincipalId,
         RequestId, RevisionId, SpaceSeq, ThreadEntrySeq,
@@ -53,12 +54,33 @@ impl CanonicalStore {
     ) -> Result<(CommandSeqRange, Vec<(NoteId, RevisionId)>), PortError> {
         let mut staged_items = Vec::with_capacity(notes.len());
         let mut total_staged_bytes = 0u64;
+        let space = self.read_space(&scope.space_id).await?;
+        space.scope.check(scope)?;
+        if space.active_epoch != active_epoch {
+            return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
+        }
 
         for spec in notes {
+            let (raw_fields, diagnostics) = if spec.doc_class == DocClass::EncryptedNote {
+                (None, Vec::new())
+            } else {
+                let header = notarium_syntax::frontmatter::analyze(&spec.carrier, spec.doc_class)?;
+                let diagnostics = header
+                    .diagnostic
+                    .map(|reason| Diagnostic {
+                        reason,
+                        location: None,
+                    })
+                    .into_iter()
+                    .collect();
+                (header.fields, diagnostics)
+            };
             let prep = self.prepare_blob(spec.carrier.as_bytes())?;
-            let ticket = self.stage_blob(scope, active_epoch, &prep).await?;
+            let ticket = self
+                .stage_blob_for_batch_prechecked(scope, active_epoch, &prep)
+                .await?;
             total_staged_bytes = total_staged_bytes.saturating_add(ticket.compressed_size);
-            staged_items.push((spec, prep.digest, ticket));
+            staged_items.push((spec, prep.digest, ticket, raw_fields, diagnostics));
         }
 
         let budget = CallBudget {
@@ -75,7 +97,7 @@ impl CanonicalStore {
             idempotency: None,
             source_note_ids: staged_items
                 .iter()
-                .map(|(s, _, _)| s.note_id.clone())
+                .map(|(spec, ..)| spec.note_id.clone())
                 .collect(),
             staged_bytes: total_staged_bytes,
             required_semantic_cut: None,
@@ -95,7 +117,7 @@ impl CanonicalStore {
                     let mut pairs_raw: Vec<(String, String)> =
                         Vec::with_capacity(staged_items.len());
 
-                    for (spec, digest, ticket) in staged_items {
+                    for (spec, digest, ticket, raw_fields, diagnostics) in staged_items {
                         let seq = ctx.alloc_next_seq()?;
                         let rev_id = new_revision_id()?;
                         let is_root_child = spec
@@ -306,9 +328,9 @@ impl CanonicalStore {
                                 byte_size,
                                 content_digest: Some(digest),
                                 schema_revision: None,
-                                raw_fields: None,
+                                raw_fields,
                                 evaluated_fields: spec.fields.clone(),
-                                diagnostics: Vec::new(),
+                                diagnostics,
                             },
                         ))
                         .encode()?;
@@ -953,6 +975,7 @@ impl CanonicalStore {
             .publish(crate::changes::BroadcastSignal::Committed {
                 scope: scope.clone(),
                 new_last_seq: target_seq,
+                targets: crate::changes::CommittedTargets::All,
             });
         Ok(())
     }

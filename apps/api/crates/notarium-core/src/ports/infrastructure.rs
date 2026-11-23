@@ -1,18 +1,60 @@
-use super::{PortFuture, PortStream, context::*, types::*};
+use super::{PortFuture, PortStream, context::*, provider::ProviderRuntimeEpochs, types::*};
 use crate::{
-    DomainError, DomainResult, classes::ProviderPart, error::ValidationReason, ids::*, model::*,
-    patch::*, receipt::*, value::YamlValue,
+    DomainError, DomainResult,
+    classes::{DocClass, ProviderPart},
+    error::{Diagnostic, ValidationReason},
+    ids::*,
+    model::*,
+    patch::*,
+    query::FieldFilterAstV1,
+    receipt::*,
+    value::YamlValue,
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+    time::Duration,
+};
 
 pub trait StructuralSnapshot: Send + Sync {
     fn cut(&self) -> &SnapshotCut;
-    fn lookup(&self, note: &NoteId) -> Option<DenseNodeId>;
-    fn note_id(&self, node: DenseNodeId) -> DomainResult<&NoteId>;
-    fn folder_subtree(&self, folder: &FolderId) -> DomainResult<DenseNodeIter<'_>>;
+    fn lookup(&self, note: &NoteId) -> DomainResult<Option<DenseNodeId>>;
+    fn note_id(&self, node: DenseNodeId) -> DomainResult<NoteId>;
+    fn doc_class(&self, node: DenseNodeId) -> DomainResult<DocClass>;
+    fn folder_subtree<'a>(&'a self, folder: &'a FolderId) -> PortFuture<'a, DenseNodeIter<'a>>;
+    /// Return the active folder itself followed by its active descendants.
+    fn folder_descendants<'a>(&'a self, folder: &'a FolderId) -> PortFuture<'a, Vec<FolderId>>;
+    /// Include the folder itself when it is an active project root.
+    fn enclosing_project<'a>(&'a self, folder: &'a FolderId) -> PortFuture<'a, Option<FolderId>>;
+    /// Validate against the snapshot's field schema. Return `None` when the
+    /// predicate does not restrict the note set.
+    fn filter_notes<'a>(
+        &'a self,
+        filter: &'a FieldFilterAstV1,
+    ) -> PortFuture<'a, Option<DenseNodeIter<'a>>>;
     fn outgoing(&self, node: DenseNodeId) -> DomainResult<DenseNodeIter<'_>>;
     fn incoming(&self, node: DenseNodeId) -> DomainResult<DenseNodeIter<'_>>;
+    /// Collect the first visible neighbors in each direction, outgoing first.
+    /// A live projection waits out writer holds before returning the bounded page.
+    fn neighbor_page(
+        &self,
+        node: DenseNodeId,
+        per_direction: PageLimit,
+    ) -> PortFuture<'_, Vec<DenseNodeId>> {
+        Box::pin(async move {
+            let limit = usize::from(per_direction.get());
+            Ok(self
+                .outgoing(node)?
+                .take(limit)
+                .chain(self.incoming(node)?.take(limit))
+                .collect())
+        })
+    }
+    /// Wait for the live visibility fence to become readable within the snapshot's budget.
+    fn wait_ready(&self) -> PortFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
 }
 pub trait StructuralReadPort: Send + Sync {
     fn acquire_snapshot(
@@ -21,7 +63,26 @@ pub trait StructuralReadPort: Send + Sync {
         causal: CausalBasis,
     ) -> PortFuture<'_, Box<dyn StructuralSnapshot>>;
     /// Current canonical fence, including class changes; never the pinned snapshot bit.
-    fn is_live_visible(&self, ctx: &SpaceContext, note: &NoteId) -> DomainResult<bool>;
+    fn is_live_visible<'a>(
+        &'a self,
+        ctx: &'a SpaceContext,
+        note: &'a NoteId,
+    ) -> PortFuture<'a, bool>;
+    /// Return current visibility in request order. The default reads keys separately.
+    /// Final delivery must verify that the canonical head stayed stable across the batch.
+    fn filter_live_visible<'a>(
+        &'a self,
+        ctx: &'a SpaceContext,
+        notes: &'a [NoteId],
+    ) -> PortFuture<'a, Vec<bool>> {
+        Box::pin(async move {
+            let mut results = Vec::with_capacity(notes.len());
+            for note in notes {
+                results.push(self.is_live_visible(ctx, note).await?);
+            }
+            Ok(results)
+        })
+    }
     /// Preserve request ordering, including absent/hidden rows.
     fn hydrate(
         &self,
@@ -57,26 +118,153 @@ pub trait ChangeBroadcast: Send + Sync {
     ) -> PortFuture<'_, ChangeReadResult>;
 }
 
+#[derive(Clone)]
+pub struct EmbeddingQueryInput {
+    pub text: String,
+    pub tokens: u32,
+    pub classes: BTreeSet<DocClass>,
+    pub project_scope: Option<FolderRef>,
+    /// The requested search folder, whose live placement constrains project consent.
+    pub folder: Option<FolderId>,
+}
+impl std::fmt::Debug for EmbeddingQueryInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EmbeddingQueryInput")
+            .field("tokens", &self.tokens)
+            .field("classes", &self.classes)
+            .field("project_scope", &self.project_scope)
+            .field("folder", &self.folder)
+            .finish_non_exhaustive()
+    }
+}
+#[derive(Clone, Debug)]
+pub enum EmbeddingInput {
+    Part(ProviderPart),
+    Query(EmbeddingQueryInput),
+}
+impl EmbeddingInput {
+    pub fn text(&self) -> &str {
+        match self {
+            Self::Part(part) => part.text(),
+            Self::Query(query) => &query.text,
+        }
+    }
+}
+/// How the recipient of an embedding request was selected.
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub enum EmbeddingSelection {
+    #[default]
+    Explicit,
+    /// Pin the configured scope of the Space default even when the query itself
+    /// is narrower. Model fallback can use another model at the same recipient.
+    SearchDefault { project: Option<FolderRef> },
+}
+
 #[derive(Clone, Debug)]
 pub struct EmbeddingRequest {
     pub intent: CommandKey,
     pub model: ModelProfileId,
     pub provider: ProviderResourceId,
     pub project: Option<FolderRef>,
-    pub chunks: Vec<ProviderPart>,
+    pub inputs: Vec<EmbeddingInput>,
     pub declared_tokens: u32,
+    pub selection: EmbeddingSelection,
+    runtime_epochs: Option<ProviderRuntimeEpochs>,
 }
 impl EmbeddingRequest {
+    pub fn parts(
+        intent: CommandKey,
+        model: ModelProfileId,
+        provider: ProviderResourceId,
+        project: Option<FolderRef>,
+        chunks: Vec<ProviderPart>,
+        declared_tokens: u32,
+    ) -> Self {
+        Self {
+            intent,
+            model,
+            provider,
+            project,
+            inputs: chunks.into_iter().map(EmbeddingInput::Part).collect(),
+            declared_tokens,
+            selection: EmbeddingSelection::Explicit,
+            runtime_epochs: None,
+        }
+    }
+
+    pub fn query(
+        intent: CommandKey,
+        model: ModelProfileId,
+        provider: ProviderResourceId,
+        input: EmbeddingQueryInput,
+    ) -> Self {
+        Self {
+            intent,
+            model,
+            provider,
+            project: input.project_scope.clone(),
+            declared_tokens: input.tokens,
+            inputs: vec![EmbeddingInput::Query(input)],
+            selection: EmbeddingSelection::Explicit,
+            runtime_epochs: None,
+        }
+    }
+
+    /// Bind an indexed vector's input to the resolved provider configuration.
+    pub fn with_runtime_epochs(mut self, epochs: ProviderRuntimeEpochs) -> Self {
+        self.runtime_epochs = Some(epochs);
+        self
+    }
+
+    pub fn runtime_epochs(&self) -> Option<ProviderRuntimeEpochs> {
+        self.runtime_epochs
+    }
+
     /// Provider owners check this before dispatch, then enforce their real model
     /// tokenizer and service budget. Declared tokens never replace actual counting.
     pub fn validate(&self) -> DomainResult<()> {
+        if let EmbeddingSelection::SearchDefault {
+            project: Some(expected),
+        } = &self.selection
+            && self.project.as_ref() != Some(expected)
+        {
+            return Err(DomainError::validation(ValidationReason::ScopeMismatch));
+        }
+        if !(1..=256).contains(&self.inputs.len()) {
+            return Err(DomainError::validation(ValidationReason::InvalidLimit));
+        }
         let mut total = 0u32;
-        for chunk in &self.chunks {
-            if chunk.provider() != &self.provider || chunk.part().model() != &self.model {
-                return Err(DomainError::validation(ValidationReason::ScopeMismatch));
-            }
+        for input in &self.inputs {
+            let tokens = match input {
+                EmbeddingInput::Part(part) => {
+                    if part.provider() != &self.provider || part.part().model() != &self.model {
+                        return Err(DomainError::validation(ValidationReason::ScopeMismatch));
+                    }
+                    part.part().tokens()
+                }
+                EmbeddingInput::Query(query) => {
+                    if query.project_scope != self.project {
+                        return Err(DomainError::validation(ValidationReason::ScopeMismatch));
+                    }
+                    if query.text.trim().is_empty() || query.text.len() > 32 * 1024 {
+                        return Err(DomainError::validation(ValidationReason::InvalidLimit));
+                    }
+                    if query.classes.is_empty() || query.classes.contains(&DocClass::EncryptedNote)
+                    {
+                        return Err(DomainError::validation(
+                            ValidationReason::ClassEgressForbidden,
+                        ));
+                    }
+                    if query.tokens == 0 {
+                        return Err(DomainError::validation(
+                            ValidationReason::TokenBudgetExceeded,
+                        ));
+                    }
+                    query.tokens
+                }
+            };
             total = total
-                .checked_add(chunk.part().tokens())
+                .checked_add(tokens)
                 .ok_or_else(|| DomainError::validation(ValidationReason::TokenBudgetExceeded))?;
         }
         if total != self.declared_tokens {
@@ -95,6 +283,18 @@ pub struct EmbeddingResult {
     pub usage: super::provider::ProviderUsage,
 }
 pub trait EmbeddingProviderPort: Send + Sync {
+    /// Resolve current disclosure for the exact provider, model and query scope.
+    fn query_disclosure(
+        &self,
+        _ctx: SpaceContext,
+        _provider: ProviderResourceId,
+        _model: ModelProfileId,
+        _project: Option<FolderRef>,
+        _folder: Option<FolderId>,
+    ) -> PortFuture<'_, BTreeSet<DocClass>> {
+        Box::pin(async { Err(DomainError::AccessDenied.into()) })
+    }
+
     fn embed(
         &self,
         ctx: SpaceContext,
@@ -102,7 +302,7 @@ pub trait EmbeddingProviderPort: Send + Sync {
     ) -> PortFuture<'_, EmbeddingResult>;
 }
 
-/// Trusted planner capability minted on single-registration by composition root.
+/// Trusted capability for the planner currently registered by the composition root.
 /// ```compile_fail
 /// use notarium_core::ports::BoardPlannerAuthority;
 /// let _: BoardPlannerAuthority = serde_json::from_str("{}").unwrap();
@@ -277,6 +477,11 @@ pub struct PlannedNoteRestoration {
     pub current_revision: RevisionId,
     pub restored_from_revision: Option<RevisionId>,
     pub planned_lifecycle: Lifecycle,
+    /// Exact placement prepared by the canonical rollback command.
+    pub planned_parent_folder: FolderId,
+    pub planned_class: DocClass,
+    pub planned_ability: Option<AbilityId>,
+    pub planned_header_diagnostic: Option<Diagnostic>,
     pub planned_carrier: Option<String>,
     pub planned_fields: BTreeMap<String, Option<YamlValue>>,
 }
@@ -361,6 +566,7 @@ pub trait BoardMutationFactsProvider: Send + Sync {
 pub enum InterceptedPayload {
     EditNote {
         note: NoteId,
+        plan: crate::patch::CarrierPatchPlan,
         body: BodyPatchPlan,
         header: HeaderMutation,
     },
@@ -381,26 +587,18 @@ pub struct InterceptedMutation {
     pub preconditions: Preconditions,
     pub payload: InterceptedPayload,
 }
-/// Room state to install atomically with the intercepted edit or observation.
-/// Canonical retains the original mutation, carrier, grant and command identity.
+/// Committed canonical outcome returned directly by a live room after it applies
+/// an intercepted mutation, avoiding a redundant receipt read-back.
 #[derive(Debug)]
-pub struct AcceptedRoomCarrier {
-    pub owner_id: String,
-    pub expected_lease: LeaseEpoch,
-    pub expected_lineage: LineageEpoch,
-    pub compacted_through_update_seq: Option<u64>,
-    pub action: RoomCarrierAction,
-}
-#[derive(Debug)]
-pub enum RoomCarrierAction {
-    Checkpoint { yrs_snapshot: Vec<u8> },
-    Close { final_yrs_snapshot: Option<Vec<u8>> },
+pub enum InterceptedOutcome {
+    NoteRevision(Committed<NoteRevision>),
+    ExternalObservation(ExternalObservationResult),
+    BoardMove(Committed<BoardMoveResult>),
 }
 #[derive(Debug)]
 pub enum InterceptionResult {
-    /// Identifies the exact canonical commit that applied the intercepted mutation.
-    Applied(MutationReceiptToken),
-    SettleCarrier(AcceptedRoomCarrier),
+    /// Exact canonical outcome applied by the live room.
+    Applied(Box<InterceptedOutcome>),
     ClosedRoomReservation(ClosedRoomReservation),
     Conflict(DomainError),
 }
@@ -427,6 +625,24 @@ pub trait LiveCollabInterceptor: Send + Sync {
         identity: CommandIdentity,
     ) -> PortFuture<'_, RollbackReservation>;
     fn filename_pin(&self, ctx: SpaceContext, note: NoteId) -> PortFuture<'_, FilenamePin>;
+
+    /// Non-blocking fast check returning a closed-room reservation when no local
+    /// room slot is open, opening, or fenced. Returning `None` falls back to
+    /// the full async `intercept` path.
+    fn try_closed_room_reservation(
+        &self,
+        _scope: &HistoryScope,
+        _note: &NoteId,
+        _identity: &CommandIdentity,
+    ) -> Option<ClosedRoomReservation> {
+        None
+    }
+
+    /// Non-blocking hint indicating whether this interceptor currently tracks any
+    /// active or opening room in `space`. Defaults to `true` (conservative).
+    fn space_has_live_rooms(&self, _space: &SpaceId) -> bool {
+        true
+    }
 }
 
 /// Linear reservation. The runtime owns the lock that protects the corresponding fence.
@@ -435,6 +651,23 @@ pub struct ClosedRoomReservation {
     note: NoteId,
     identity: CommandIdentity,
     epoch: LeaseEpoch,
+    table_pin: Option<Arc<u64>>,
+}
+impl ClosedRoomReservation {
+    /// Attaches the runtime fence table's slot/eviction generation pin while
+    /// this reservation is in flight.
+    pub fn attach_table_pin(&mut self, pin: Arc<u64>) {
+        self.table_pin = Some(pin);
+    }
+    /// Returns the runtime fence table generation recorded when this
+    /// reservation was minted (`0` if minted directly outside a table).
+    pub fn table_gen(&self) -> u64 {
+        self.table_pin.as_deref().copied().unwrap_or(0)
+    }
+    /// Releases the runtime eviction pin once the fence lock is held.
+    pub fn release_pin(&mut self) {
+        self.table_pin = None;
+    }
 }
 #[derive(Debug)]
 pub struct CommitPermit {
@@ -463,6 +696,9 @@ impl RoomFenceState {
     pub fn epoch(&self) -> LeaseEpoch {
         self.epoch
     }
+    pub fn is_active(&self) -> bool {
+        self.active
+    }
     pub fn open(&mut self) -> DomainResult<()> {
         self.epoch = self.epoch.checked_next()?;
         self.active = true;
@@ -482,6 +718,7 @@ impl RoomFenceState {
                 note: self.note.clone(),
                 identity,
                 epoch: self.epoch,
+                table_pin: None,
             }))
         }
     }
@@ -545,6 +782,7 @@ pub enum RevocationSelector {
     Session(AuthSessionId),
     Credential(CredentialId),
     ProviderResource(ProviderResourceId),
+    SearchEmbeddingDefault(SpaceId),
     ProviderCall(RequestId),
     Schedule(ScheduleId),
     ScheduledRun(AgentRunId),

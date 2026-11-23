@@ -136,8 +136,9 @@ mod tests {
         bootstrap_sqlite_schema(&mut db, &installation)
             .await
             .unwrap();
-        sqlx::raw_sql(include_str!(
-            "../../../tests/fixtures/chat-schema-v6-only.sql"
+        sqlx::raw_sql(concat!(
+            include_str!("../../../tests/fixtures/schema-v6-remove-projection.sql"),
+            include_str!("../../../tests/fixtures/schema-v8-remove-agents.sql")
         ))
         .execute(&mut db)
         .await

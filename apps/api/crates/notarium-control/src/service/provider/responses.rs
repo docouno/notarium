@@ -90,7 +90,7 @@ pub(super) async fn receive(
                 bytes.extend(chunk);
             }
             let model = snapshot.model.as_ref().ok_or_else(protocol)?;
-            let decoded = wire::decode_embedding(kind, model, request.chunks.len(), &bytes)?;
+            let decoded = wire::decode_embedding(kind, model, request.inputs.len(), &bytes)?;
             progress.usage = decoded.usage;
             if job.usage_mismatch(Some(model), progress.usage) {
                 progress.mismatch = true;

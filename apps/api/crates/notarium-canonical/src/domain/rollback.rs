@@ -26,7 +26,7 @@ use crate::{
     codec::{
         MAX_MSGPACK_DECODE_BYTES, NoteRevisionMetadata, RevisionMetadataEnvelope,
         RevisionMetadataPayload, decode_msgpack_bounded, doc_class_to_db, encode_msgpack,
-        encode_timestamp_parts, evaluate_fields_with_schema, group_key_hex, i64_to_space_seq,
+        encode_timestamp_parts, evaluate_fields_with_schema, i64_to_space_seq,
         internal_not_committed, lifecycle_from_db, lifecycle_to_db, new_prefixed_hex_id,
         new_revision_id, normalize_title_key, now_unix_ms, now_utc_timestamp,
         unavailable_retryable,
@@ -53,6 +53,7 @@ use crate::{
 
 mod ability;
 mod fingerprint;
+pub(crate) mod rank_removal;
 
 const MAX_PLANNER_RETRIES: usize = 4;
 
@@ -305,7 +306,7 @@ pub(crate) async fn rollback_agent_run_by_id(
     };
     let direct_by_id = store.is_postgres()
         && ctx.canonical_effect().is_some()
-        && store.inner.collab_interceptor.get().is_none();
+        && !rollback_needs_room_planning(store, &ctx.scope().space_id);
     if direct_by_id {
         let scope = ctx.scope();
         let guard = store.enter_write_op(&scope.space_id)?;
@@ -381,6 +382,12 @@ fn rollback_policy(input: &RollbackAgentRun) -> crate::writer::replay::ReplayPol
     )
 }
 
+fn rollback_needs_room_planning(store: &CanonicalStore, space: &SpaceId) -> bool {
+    store.inner.collab_interceptor.get().is_some_and(|rooms| {
+        rooms.space_has_live_rooms(space) || store.inner.room_fences.has_any_fenced_in_space(space)
+    })
+}
+
 async fn execute_rollback(
     store: &CanonicalStore,
     ctx: &mut SpaceContext,
@@ -391,7 +398,7 @@ async fn execute_rollback(
 ) -> Result<Committed<RollbackResult>, PortError> {
     ctx.budget.remaining = rollback_time_left(&ctx.budget, deadline)?;
     if request.input.associated_board_expectations.is_empty()
-        && store.inner.collab_interceptor.get().is_none()
+        && !rollback_needs_room_planning(store, &ctx.scope().space_id)
     {
         let active_op_guard = store.enter_write_op(&ctx.scope().space_id)?;
         let writer_epoch = match (&store.inner.sql, prepared_epoch) {
@@ -520,11 +527,14 @@ async fn execute_general_rollback(
         return Ok(replayed.into_committed());
     }
 
-    for attempt in 0..MAX_PLANNER_RETRIES {
+    let mut effective_input = request.input.clone();
+    let mut attempt = 0;
+    let mut replanned_after_recovery = false;
+    while attempt < MAX_PLANNER_RETRIES {
         // Step 1 & 2: Read run head, touched set, caller expectations, and classify `skipped_manual_edits`.
         ctx.budget.remaining = rollback_time_left(&ctx.budget, deadline)?;
         let ctx_read = ctx.clone();
-        let input_read = request.input.clone();
+        let input_read = effective_input.clone();
         let (
             space_rec,
             skipped_manual_edits,
@@ -578,15 +588,30 @@ async fn execute_general_rollback(
         let mut skipped_room_active = Vec::new();
         let mut eligible_notes: BTreeMap<NoteId, CandidateAction> = BTreeMap::new();
         let mut eligible_reservations: BTreeMap<NoteId, ClosedRoomReservation> = BTreeMap::new();
+        let mut recovered_revisions = BTreeMap::new();
+        let interceptor = store.inner.collab_interceptor.get();
+        let fences = &store.inner.room_fences;
+        let space_id = ctx.scope().space_id.clone();
 
         for (nid, action) in candidates_with_carriers {
-            if durable_active_rooms.contains(&nid) {
+            let current = match &action {
+                CandidateAction::TrashCreated { current_rev, .. }
+                | CandidateAction::RestorePreExisting { current_rev, .. } => current_rev,
+            };
+            let was_blocked = durable_active_rooms.contains(&nid);
+            if was_blocked
+                && (interceptor.is_none()
+                    || (!fences.is_room_fenced(&space_id, &nid)
+                        && fences
+                            .fenced_recovery_revision(&space_id, &nid, current)
+                            .is_none()))
+            {
                 skipped_room_active.push(nid);
                 continue;
             }
             ctx.budget.remaining = rollback_time_left(&ctx.budget, deadline)?;
             let reservation = rollback_wait(&ctx.budget, deadline, async {
-                if let Some(interceptor) = store.inner.collab_interceptor.get() {
+                if let Some(interceptor) = interceptor {
                     interceptor
                         .reserve_rollback(ctx.clone(), nid.clone(), request.identity.clone())
                         .await
@@ -604,11 +629,39 @@ async fn execute_general_rollback(
                     skipped_room_active.push(nid);
                 }
                 RollbackReservation::Closed(closed_res) => {
+                    if was_blocked
+                        && let Some(recovered) =
+                            fences.fenced_recovery_revision(&space_id, &nid, current)
+                    {
+                        recovered_revisions.insert(nid, recovered);
+                        continue;
+                    }
                     eligible_reservations.insert(nid.clone(), closed_res);
                     eligible_notes.insert(nid, action);
                 }
             }
         }
+        if !recovered_revisions.is_empty() {
+            if replanned_after_recovery {
+                return Err(unavailable_retryable(
+                    "rollback_room_revision_contention",
+                    "additional rooms recovered while planning the rollback",
+                    std::time::Duration::from_millis(10),
+                ));
+            }
+            // Only substitute a recovery of the exact, already-authorized revision.
+            // The next discovery detects concurrent changes and counts recovered
+            // human edits as foreign to the rolled-back agent run.
+            for expected in &mut effective_input.expected_entities {
+                if let Some(revision) = recovered_revisions.remove(&expected.note) {
+                    expected.revision = revision;
+                }
+            }
+            replanned_after_recovery = true;
+            continue;
+        }
+
+        attempt += 1;
 
         // Step 4: If eligible notes have board moves in `input.run`, evaluate rollback board facts.
         let mut affected_views_set: BTreeSet<ViewRef> = BTreeSet::new();
@@ -619,22 +672,27 @@ async fn execute_general_rollback(
         }
 
         let rb_facts_opt = if !affected_views_set.is_empty() {
-            let (board_authority, provider) = store
-                .inner
-                .board_provider
-                .get()
-                .ok_or_else(|| DomainError::validation(ValidationReason::NotReady))?
-                .clone();
+            let (board_authority, provider) = store.board_facts_provider()?;
 
             let mut planned_list = Vec::with_capacity(eligible_notes.len());
             for (nid, action) in &eligible_notes {
                 match action {
-                    CandidateAction::TrashCreated { current_rev, .. } => {
+                    CandidateAction::TrashCreated {
+                        current_rev,
+                        parent_folder_id,
+                        doc_class,
+                        ability_id,
+                        ..
+                    } => {
                         planned_list.push(PlannedNoteRestoration {
                             note: nid.clone(),
                             current_revision: current_rev.clone(),
                             restored_from_revision: None,
                             planned_lifecycle: Lifecycle::Trashed,
+                            planned_parent_folder: parent_folder_id.clone(),
+                            planned_class: *doc_class,
+                            planned_ability: ability_id.clone(),
+                            planned_header_diagnostic: None,
                             planned_carrier: None,
                             planned_fields: BTreeMap::new(),
                         });
@@ -657,6 +715,10 @@ async fn execute_general_rollback(
                             current_revision: current_rev.clone(),
                             restored_from_revision: Some(pre_rev_id.clone()),
                             planned_lifecycle: pre_meta.lifecycle,
+                            planned_parent_folder: pre_meta.parent_folder_id.clone(),
+                            planned_class: pre_meta.doc_class,
+                            planned_ability: pre_meta.ability_id.clone(),
+                            planned_header_diagnostic: pre_meta.diagnostics.first().cloned(),
                             planned_carrier: pre_carrier.clone(),
                             planned_fields: pfields,
                         });
@@ -670,12 +732,45 @@ async fn execute_general_rollback(
                 eligible_notes: planned_list,
             };
             ctx.budget.remaining = rollback_time_left(&ctx.budget, deadline)?;
-            let facts = rollback_wait(
+            let facts = match rollback_wait(
                 &ctx.budget,
                 deadline,
                 provider.evaluate_rollback(&board_authority, ctx.clone(), req),
             )
-            .await??;
+            .await?
+            {
+                Ok(facts) => facts,
+                Err(
+                    err @ PortError::Domain(DomainError::ValidationFailed {
+                        diagnostic:
+                            Diagnostic {
+                                reason: ValidationReason::CursorStale,
+                                ..
+                            },
+                    }),
+                ) => {
+                    ctx.budget.remaining = rollback_time_left(&ctx.budget, deadline)?;
+                    if let Some(replayed) = rollback_wait(
+                        &ctx.budget,
+                        deadline,
+                        try_replay_completed_receipt::<StoredCommittedRollbackV1>(
+                            store,
+                            ctx.scope(),
+                            idemp,
+                            Some(&ctx.budget),
+                        ),
+                    )
+                    .await??
+                    {
+                        return Ok(replayed.into_committed());
+                    }
+                    if attempt < MAX_PLANNER_RETRIES {
+                        continue;
+                    }
+                    return Err(err);
+                }
+                Err(err) => return Err(err),
+            };
             facts.verify_authority(&board_authority)?;
             ctx.scope().check(facts.scope())?;
             Some(facts)
@@ -711,7 +806,7 @@ async fn execute_general_rollback(
                 space_rec.scope.clone(),
                 ctx.auth().clone(),
                 request.identity.clone(),
-                request.input.clone(),
+                effective_input.clone(),
                 store.inner.room_fences.clone(),
                 eligible_notes,
                 eligible_reservations,
@@ -744,7 +839,7 @@ async fn execute_general_rollback(
                         reason: ValidationReason::CursorStale,
                         ..
                     },
-            })) if attempt + 1 < MAX_PLANNER_RETRIES => {
+            })) if attempt < MAX_PLANNER_RETRIES => {
                 continue;
             }
             Err(err) => return Err(err),
@@ -1205,7 +1300,13 @@ pub(crate) fn build_rollback_direct_single_tx_exec(
                     )
                 })
                 .count() as u64;
-            let total_seqs = (trash_note_count + restore_note_count).max(1);
+            let rank_removals = if has_ov {
+                rank_removal::plan_tx(tx, &scope_cl.space_id, &final_eligible, &[]).await?
+            } else {
+                Vec::new()
+            };
+            let total_seqs =
+                (trash_note_count + restore_note_count + rank_removals.len() as u64).max(1);
             let (first_seq, visibility_seq) = item_ctx.preview_seq_range(total_seqs)?;
             let vis_i64 = visibility_seq.get() as i64;
             let now_ts = now_utc_timestamp()?;
@@ -1248,9 +1349,6 @@ pub(crate) fn build_rollback_direct_single_tx_exec(
                     continue;
                 };
 
-                if has_ov {
-                    delete_all_target_overlays_tx(tx, &scope_cl.space_id, nid).await?;
-                }
                 owner_notes_for_receipt.insert(nid.clone());
 
                 if *current_lifecycle == Lifecycle::Trashed {
@@ -1403,10 +1501,6 @@ pub(crate) fn build_rollback_direct_single_tx_exec(
                     .await?;
                 }
 
-                if has_ov && pre_meta.lifecycle != Lifecycle::Active {
-                    delete_all_target_overlays_tx(tx, &scope_cl.space_id, nid).await?;
-                }
-
                 let meta = encode_rollback_note(
                     pre_meta,
                     None,
@@ -1526,6 +1620,24 @@ pub(crate) fn build_rollback_direct_single_tx_exec(
                     nsec,
                 )
                 .await?;
+            }
+
+            for removal in rank_removals {
+                let seq = item_ctx.alloc_next_seq()?;
+                let revision = new_revision_id()?;
+                removal
+                    .write_tx(
+                        tx,
+                        &scope_cl,
+                        seq,
+                        visibility_seq,
+                        &revision,
+                        auth.principal(),
+                        now_ts,
+                    )
+                    .await?;
+                owner_notes_for_receipt.extend(removal.owners().into_iter().cloned());
+                events.push(removal.event(seq, revision));
             }
 
             if events.is_empty() {
@@ -1766,7 +1878,6 @@ fn build_rollback_execute_fn(
                         BTreeMap::new();
 
                     for eg in &view_facts.groups {
-                        let (_, gk_hex) = group_key_hex(&eg.group)?;
                         let kept_notes: Vec<NoteId> = eg
                             .rows
                             .iter()
@@ -1777,9 +1888,9 @@ fn build_rollback_execute_fn(
                             working_groups.push((eg.group.clone(), Vec::new()));
                             continue;
                         }
-                        let all_unranked = kept_notes.iter().all(|nid| {
-                            overlays.get(nid).map(|o| &o.group_key_hex) != Some(&gk_hex)
-                        });
+                        let all_unranked = kept_notes
+                            .iter()
+                            .all(|nid| overlays.get(nid).map(|o| &o.group) != Some(&eg.group));
                         let mut items = Vec::with_capacity(kept_notes.len());
                         if all_unranked {
                             let init = evenly_spaced_ranks(kept_notes.len())?;
@@ -1798,7 +1909,7 @@ fn build_rollback_execute_fn(
                                 .iter()
                                 .filter_map(|nid| {
                                     let o = overlays.get(nid)?;
-                                    if o.group_key_hex == gk_hex {
+                                    if o.group == eg.group {
                                         Some(ExistingRankedItem {
                                             note_id: nid.clone(),
                                             rank: o.sort_rank_lexo.clone(),
@@ -1815,7 +1926,7 @@ fn build_rollback_execute_fn(
                             for nid in &kept_notes {
                                 let in_grp = overlays
                                     .get(nid)
-                                    .map(|o| o.group_key_hex == gk_hex)
+                                    .map(|o| o.group == eg.group)
                                     .unwrap_or(false);
                                 if !in_grp {
                                     let tail = compute_rank_placement(&items, nid, items.len())?;
@@ -2031,8 +2142,35 @@ fn build_rollback_execute_fn(
                     )
                 })
                 .count() as u64;
+            // A normalization must not recreate a rank whose view or card is being retired.
+            planned_neighbor_updates.retain(|update| {
+                !rank_removal::removes_view_or_target(
+                    &eligible_notes,
+                    &update.view,
+                    &update.neighbor_note,
+                )
+            });
+            planned_target_restores.retain(|restore| {
+                !rank_removal::removes_view_or_target(
+                    &eligible_notes,
+                    &restore.view,
+                    &restore.target_note,
+                )
+            });
+            let rank_removals = if has_any_overlays_in_space_tx(tx, &scope_cl.space_id).await? {
+                rank_removal::plan_tx(
+                    tx,
+                    &scope_cl.space_id,
+                    &eligible_notes,
+                    &planned_overlay_deletes,
+                )
+                .await?
+            } else {
+                Vec::new()
+            };
             let entity_event_seqs = trash_note_count
                 + restore_note_count
+                + (rank_removals.len() as u64)
                 + (planned_neighbor_updates.len() as u64)
                 + (planned_target_restores.len() as u64);
             let total_seqs = entity_event_seqs.max(1);
@@ -2041,7 +2179,6 @@ fn build_rollback_execute_fn(
             let now_ts = now_utc_timestamp()?;
             let (sec, nsec) = encode_timestamp_parts(now_ts);
             let current_schema = load_current_space_schema_tx(tx, &scope_cl.space_id).await?;
-            let space_has_overlays = has_any_overlays_in_space_tx(tx, &scope_cl.space_id).await?;
 
             let mut events = Vec::with_capacity(total_seqs as usize);
             let mut trashed_out = Vec::new();
@@ -2063,7 +2200,7 @@ fn build_rollback_execute_fn(
             let mut pending_trash_heads: Vec<(NoteId, RevisionId)> =
                 Vec::with_capacity(trash_note_count as usize);
 
-            // 6a. Trash run-created eligible notes FIRST & remove their overlays across ALL views.
+            // 6a. Trash run-created eligible notes first.
             for (nid, action) in &eligible_notes {
                 let CandidateAction::TrashCreated {
                     metadata,
@@ -2078,9 +2215,6 @@ fn build_rollback_execute_fn(
                     continue;
                 };
 
-                if space_has_overlays {
-                    delete_all_target_overlays_tx(tx, &scope_cl.space_id, nid).await?;
-                }
                 owner_notes_for_receipt.insert(nid.clone());
 
                 if *current_lifecycle == Lifecycle::Trashed {
@@ -2238,10 +2372,6 @@ fn build_rollback_execute_fn(
                     .await?;
                 }
 
-                if space_has_overlays && pre_meta.lifecycle != Lifecycle::Active {
-                    delete_all_target_overlays_tx(tx, &scope_cl.space_id, nid).await?;
-                }
-
                 let meta = encode_rollback_note(
                     pre_meta,
                     None,
@@ -2367,9 +2497,22 @@ fn build_rollback_execute_fn(
             }
 
             // 6c. Apply planned board overlay deletes, neighbor normalizations, and target restores.
-            for del in &planned_overlay_deletes {
-                delete_single_overlay_tx(tx, &scope_cl.space_id, &del.view, &del.target_note)
+            for removal in rank_removals {
+                let seq = item_ctx.alloc_next_seq()?;
+                let revision = new_revision_id()?;
+                removal
+                    .write_tx(
+                        tx,
+                        &scope_cl,
+                        seq,
+                        visibility_seq,
+                        &revision,
+                        auth.principal(),
+                        now_ts,
+                    )
                     .await?;
+                owner_notes_for_receipt.extend(removal.owners().into_iter().cloned());
+                events.push(removal.event(seq, revision));
             }
 
             for nbr in &planned_neighbor_updates {
@@ -3986,75 +4129,6 @@ async fn bump_closed_collab_session_lineage_tx(
     .await
 }
 
-async fn delete_all_target_overlays_tx(
-    tx: &mut BackendConn<'_>,
-    space_id: &SpaceId,
-    target_note: &NoteId,
-) -> Result<(), PortError> {
-    match tx {
-        BackendConn::Sqlite(conn) => {
-            sqlx::query("DELETE FROM view_rank_overlays WHERE space_id = ? AND target_note_id = ?")
-                .bind(space_id.as_str())
-                .bind(target_note.as_str())
-                .execute(&mut **conn)
-                .await
-                .map_err(|err| {
-                    internal_not_committed("sqlite_rb_del_all_overlays", err.to_string())
-                })?;
-        }
-        BackendConn::Postgres(conn) => {
-            sqlx::query(
-                "DELETE FROM view_rank_overlays WHERE space_id = $1 AND target_note_id = $2",
-            )
-            .bind(space_id.as_str())
-            .bind(target_note.as_str())
-            .execute(&mut **conn)
-            .await
-            .map_err(|err| internal_not_committed("pg_rb_del_all_overlays", err.to_string()))?;
-        }
-    }
-    Ok(())
-}
-
-async fn delete_single_overlay_tx(
-    tx: &mut BackendConn<'_>,
-    space_id: &SpaceId,
-    view: &ViewRef,
-    target_note: &NoteId,
-) -> Result<(), PortError> {
-    match tx {
-        BackendConn::Sqlite(conn) => {
-            sqlx::query(
-                "DELETE FROM view_rank_overlays
-                 WHERE space_id = ? AND view_note_id = ? AND view_key = ? AND target_note_id = ?",
-            )
-            .bind(space_id.as_str())
-            .bind(view.note.as_str())
-            .bind(view.key.as_str())
-            .bind(target_note.as_str())
-            .execute(&mut **conn)
-            .await
-            .map_err(|err| {
-                internal_not_committed("sqlite_rb_del_single_overlay", err.to_string())
-            })?;
-        }
-        BackendConn::Postgres(conn) => {
-            sqlx::query(
-                "DELETE FROM view_rank_overlays
-                 WHERE space_id = $1 AND view_note_id = $2 AND view_key = $3 AND target_note_id = $4",
-            )
-            .bind(space_id.as_str())
-            .bind(view.note.as_str())
-            .bind(view.key.as_str())
-            .bind(target_note.as_str())
-            .execute(&mut **conn)
-            .await
-            .map_err(|err| internal_not_committed("pg_rb_del_single_overlay", err.to_string()))?;
-        }
-    }
-    Ok(())
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn execute_pg_rollback_domain_writes_cte(
     conn: &mut sqlx::PgConnection,
@@ -4344,6 +4418,7 @@ enum PgFastInnerResult {
     },
     Committed {
         response_bytes: Vec<u8>,
+        initial_cut: SpaceSeq,
         new_effective_cut: SpaceSeq,
     },
     UnknownCommit {
@@ -4385,18 +4460,27 @@ async fn execute_pg_fast_rollback_on_conn(
         PgFastInnerResult::FallbackToStandard => PgSingleFastAttempt::FallbackToStandard,
         PgFastInnerResult::Failed { err, effective_cut } => {
             let mut cuts = BTreeMap::new();
+            let mut windows = Vec::new();
             if let Some(c) = effective_cut {
                 cuts.insert(scope_cl.space_id.clone(), c);
+                windows.push(crate::projection_fence::VisibilityWindow {
+                    scope: scope_cl.clone(),
+                    after: c,
+                    through: c,
+                    changes: crate::projection_fence::VisibilityChanges::default(),
+                });
             }
             let conn_clean = matches!(&err, PortError::Domain(_));
             PgSingleFastAttempt::Handled(BatchExecOutcome::Committed {
                 slots: vec![ItemOutcomeSlot::Failed(err)],
                 space_effective_cuts: cuts,
                 conn_clean,
+                visibility_windows: windows,
             })
         }
         PgFastInnerResult::Committed {
             response_bytes,
+            initial_cut,
             new_effective_cut,
         } => {
             store
@@ -4405,6 +4489,7 @@ async fn execute_pg_fast_rollback_on_conn(
                 .publish(crate::changes::BroadcastSignal::Committed {
                     scope: scope_cl.clone(),
                     new_last_seq: new_effective_cut,
+                    targets: crate::changes::CommittedTargets::All,
                 });
             if faults
                 .drop_commit_response_once
@@ -4427,6 +4512,16 @@ async fn execute_pg_fast_rollback_on_conn(
                 }],
                 space_effective_cuts: cuts,
                 conn_clean: true,
+                visibility_windows: vec![crate::projection_fence::VisibilityWindow {
+                    scope: scope_cl.clone(),
+                    after: initial_cut,
+                    through: new_effective_cut,
+                    changes: crate::projection_fence::VisibilityChanges {
+                        notes: true,
+                        folders: true,
+                        erasures: false,
+                    },
+                }],
             })
         }
         PgFastInnerResult::UnknownCommit {
@@ -4597,6 +4692,30 @@ async fn try_execute_pg_root_rollback(
             }
         }
     };
+    let visibility = match rollback_wait(
+        &ctx.budget,
+        deadline,
+        store
+            .inner
+            .live_visibility
+            .for_write(vec![scope.space_id.clone()]),
+    )
+    .await
+    {
+        Ok(visibility) => visibility,
+        Err(err) => return Some(Err(err)),
+    };
+    if let Err(error) = store
+        .inner
+        .check_writer_epoch(&scope.space_id, writer_epoch)
+    {
+        return Some(Err(error));
+    }
+    if visibility.has_live_state() {
+        // The shared actor updates visibility for the standard and optimized
+        // batch paths. Keep this direct fast path for unprojected Spaces.
+        return None;
+    }
 
     if !writer.is_accepting() || store.inner.shutting_down.load(Ordering::SeqCst) {
         return Some(Err(unavailable_retryable(
@@ -5529,6 +5648,7 @@ async fn try_execute_pg_root_rollback(
             .publish(crate::changes::BroadcastSignal::Committed {
                 scope: scope.clone(),
                 new_last_seq: visibility_seq,
+                targets: crate::changes::CommittedTargets::All,
             });
 
         if writer
@@ -6718,6 +6838,7 @@ async fn execute_pg_fast_rollback_inner(
             }
             PgFastInnerResult::Committed {
                 response_bytes,
+                initial_cut: current_effective_cut,
                 new_effective_cut,
             }
         }

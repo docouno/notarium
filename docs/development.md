@@ -1,6 +1,6 @@
 # Development
 
-Use Linux x86_64, a local Docker Engine, Docker Compose **5.0.0+**, Git and GNU
+Use Linux x86_64 or aarch64, a local Docker Engine, Docker Compose **5.0.0+**, Git and GNU
 Make. Devkit `0.5.1` pins the container toolchains (`Rust 1.99.1`, `Node 24.22.1`,
 static `pnpm 12.21.0`). Host Node/Rust SDKs do not replace them; host Node is only
 needed for optional `npx` CLI entry points.
@@ -8,14 +8,15 @@ needed for optional `npx` CLI entry points.
 `make setup` downloads images and caches dependencies — including the pinned
 `pnpm 12.21.0` binary, shared caches under `DEVKIT_CACHE_DIR` (default
 `~/.cache/docouno/devkit`, with hardlinked `pnpm-store` and reusable derived
-container images), the digest-pinned PostgreSQL 16 image and the source-built
-MinIO Community storage test fixture (`compose.storage-tests.yaml`) — and requires
-networking. Subsequent check/test/build commands use `--network none`, read-only
-sources, manifests, lockfiles and `node_modules/.pnpm`, with writable declared
-cache/output paths. `make test` automatically launches and tears down isolated
-Unix-domain-socket PostgreSQL 16 and MinIO Community fixtures for `apps/api`
-without network access; integration tests fail closed if fixtures are absent
-(see [canonical storage](storage.md)).
+container images), the digest-pinned PostgreSQL 16 image, the source-built
+MinIO Community storage test fixture (`compose.storage-tests.yaml`), and the
+SHA-256-pinned ONNX Runtime 1.31 CPU test library (using host `curl`, `unzip`
+and `sha256sum`) — and requires networking. Subsequent check/test/build commands
+use `--network none`, read-only sources, manifests, lockfiles and
+`node_modules/.pnpm`, with writable declared cache/output paths. `make test`
+automatically launches and tears down isolated Unix-domain-socket PostgreSQL 16
+and MinIO Community fixtures for `apps/api` without network access; integration
+tests fail closed if fixtures are absent (see [canonical storage](storage.md)).
 
 | Command | Purpose |
 | --- | --- |
@@ -26,6 +27,7 @@ without network access; integration tests fail closed if fixtures are absent
 | `make check` | Formatting, lint and types, including all Cargo targets |
 | `make fix` | Apply Prettier, ESLint `--fix` and `rustfmt` explicitly |
 | `make test` | All component tests, architecture rules and process smoke tests |
+| `make benchmark-search` | Offline release gate on 100,000 notes and 400,000 chunks |
 | `make build` | Build all components offline |
 | `make check app=api` | Select the Rust app |
 | `make test package=api-contract` | Select the contract library |
@@ -52,6 +54,11 @@ configuration fails the database suite. The project wrapper serializes fixture
 runs within one checkout and removes its container and scratch directory on
 clean exit; logs remain in `.artifacts/control-db-fixture/` when a run fails.
 No host PostgreSQL installation is required.
+
+API setup also prepares the pinned dynamic ONNX Runtime CPU fixture. The search
+tests use both canonical storage dialects and exercise the native runtime with
+a small embedded test graph. The scale gate needs a writable Cargo target mount
+and emits a JSON report to standard output. See [search verification](search.md#verification).
 
 ## Dependencies and ownership
 
@@ -143,6 +150,40 @@ old worktree and remove it with `wt remove --no-hooks <branch>`, because `0.4.1`
 Use `umask 022` so container mounts can read new source files. Keep temporary
 evidence in ignored `.artifacts/<task>/`, respect real cgroup quotas and run heavy
 checks sequentially. Stop only this checkout's services.
+
+## Continuous integration
+
+Pull requests against `v1` and pushes to `v1` run public documentation and shard
+configuration checks first. For a verified docs-only PR, the workflow skips
+the code jobs. The allowlist covers `docs/**`, `README.md`, `AGENTS.md`, and
+`LICENSE`. Every push and every other PR runs the full workflow.
+
+- `node` checks, tests and builds the four Node components in their workspace.
+- `api-check` checks Rust formatting, lints all targets and runs
+  `make build app=api`.
+- `api-discovery` enumerates tests across the Cargo workspace and rejects
+  ignored tests. It runs independently of lint and the build.
+- Five `api-test` shards run the offline Rust tests with isolated fixture
+  stacks. Each workspace crate belongs to exactly one shard. The platform
+  shard also runs all workspace doc tests. [Shard manifest](../scripts/ci-api-shards.json)
+- The required `verify` job passes only when the planning job and all required
+  jobs succeed, or when planning confirms a docs-only PR and all code jobs
+  were skipped. For a code run, it also checks the latest result of each shard
+  through the GitHub Actions jobs API.
+
+CI caches Node and Rust tooling separately. Only `api-check` saves the pruned
+Cargo dependency artifacts, which the shards can restore. The desktop image, storage fixture images and ONNX Runtime test library have
+separate recipe-keyed caches. The Rust check and discovery jobs set
+`NOTARIUM_SKIP_API_FIXTURES=1` on `make setup app=api` to omit fixture images
+and the ONNX Runtime test library. Test runs require the regular setup.
+
+Shard builds include the storage and search test-support features enabled by
+the full workspace. When changing Cargo features or shard membership, compare
+the test executables with those selected by `cargo test --workspace --no-run`.
+
+After making changes, run `make setup`, `make check`, `make test`, and
+`make build` locally. To reproduce one CI shard after setup, run
+`sh scripts/ci-run-api-shard.sh canonical` with Python 3.11 or newer on the host.
 
 ## Core and syntax gates
 

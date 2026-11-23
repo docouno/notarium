@@ -231,6 +231,16 @@ fn data_root_never_branches_on_delivery_profile_and_rejects_traversal_inputs() {
     assert_eq!(root.canonical().to_str(), Some("/data/v1/canonical.sqlite"));
     assert_eq!(root.manifest().to_str(), Some("/data/v1-epoch.json"));
     let space = SpaceId::parse("LegacySpace1").unwrap();
+    let generation = ProjectionGeneration::new(2).unwrap();
+    assert_eq!(
+        root.space_fast_index(generation, &space, SpaceSeq::new(19).unwrap())
+            .to_str(),
+        Some("/data/v1/derived_gen_2/spaces/LegacySpace1/fast_index_19.mmap")
+    );
+    assert_eq!(
+        root.active_projection_generation().to_str(),
+        Some("/data/v1/active_projection_generation.json")
+    );
     let digest = ContentDigest::from_bytes([0xab; 32]);
     assert_eq!(
         root.blob(&space, digest),

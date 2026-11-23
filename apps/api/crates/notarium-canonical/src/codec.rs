@@ -257,7 +257,15 @@ pub fn decode_msgpack_bounded<T: DeserializeOwned>(
 }
 
 pub fn group_key_hex(group: &GroupKey) -> Result<(Vec<u8>, String), PortError> {
-    let encoded = encode_msgpack(group)?;
+    let canonical = match group {
+        GroupKey::Value(notarium_core::value::ScalarValue::Number(number)) => {
+            std::borrow::Cow::Owned(GroupKey::Value(notarium_core::value::ScalarValue::Number(
+                number.canonicalize(),
+            )))
+        }
+        other => std::borrow::Cow::Borrowed(other),
+    };
+    let encoded = encode_msgpack(canonical.as_ref())?;
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"notarium-group-key-v1:");
     hasher.update(&encoded);
@@ -485,6 +493,8 @@ pub struct RankRevisionMetadata {
     pub placement_actor_id: PrincipalId,
     pub placement_run_id: Option<AgentRunId>,
     pub is_pma_normalization: bool,
+    #[serde(default)]
+    pub removed: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

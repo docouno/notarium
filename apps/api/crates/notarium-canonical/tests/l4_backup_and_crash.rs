@@ -488,21 +488,23 @@ impl BackendCase {
                 .execute(&mut *tx)
                 .await
                 .unwrap();
-            if decoded.schema_version < 7 {
-                sqlx::raw_sql(include_str!("fixtures/chat-schema-v6-only.sql"))
+            if decoded.schema_version <= 8 {
+                sqlx::raw_sql(include_str!("fixtures/schema-v8-remove-agents.sql"))
                     .execute(&mut *tx)
                     .await
                     .unwrap();
             }
-            if decoded.schema_version < 8 {
-                sqlx::raw_sql(
-                    "DROP INDEX idx_ability_packages_active_slug;
-                     CREATE UNIQUE INDEX uq_ability_packages_active_slug
-                        ON ability_packages(space_id,slug_fold) WHERE lifecycle_state='active'",
-                )
-                .execute(&mut *tx)
-                .await
-                .unwrap();
+            if decoded.schema_version == 7 {
+                sqlx::raw_sql(include_str!("fixtures/schema-v7-chat-refs.sql"))
+                    .execute(&mut *tx)
+                    .await
+                    .unwrap();
+            }
+            if decoded.schema_version <= 6 {
+                sqlx::raw_sql(include_str!("fixtures/schema-v6-remove-projection.sql"))
+                    .execute(&mut *tx)
+                    .await
+                    .unwrap();
             }
             if decoded.schema_version <= 5 {
                 sqlx::raw_sql(
@@ -1102,6 +1104,7 @@ async fn restores_historical_postgres_spools_and_rejects_invalid_headers() {
         (4, 0x62, 0xB2, "backup-178", 36, 14),
         (5, 0x62, 0xB2, "backup-178", 36, 14),
         (6, 0x62, 0xB2, "backup-178", 36, 14),
+        (7, 0x62, 0xB2, "backup-178", 39, 14),
     ] {
         let fixture = directory.join(format!("schema-v{version}.pgspool"));
         let decoded = decode_postgres_spool_v1(&fixture).unwrap();
@@ -2687,6 +2690,7 @@ async fn l4_paired_backup_cut_holds_budgets_cleanup_and_restore_cursors_dual_dia
             .close_collab_session(
                 &make_budget(),
                 notarium_canonical::CloseCollabSession {
+                    unchanged_carrier_digest: None,
                     scope: scope.clone(),
                     note: secret_note.clone(),
                     owner_id: Some("collab-sec".to_owned()),

@@ -5,6 +5,7 @@ use std::sync::{
 
 use notarium_core::{
     error::PortError,
+    ids::SpaceId,
     ports::{CallBudget, CanonicalEffectAdmission, RevocationLease},
 };
 use tokio::task::JoinHandle;
@@ -15,6 +16,12 @@ use crate::{
     domain::common::CommandDeadline,
     sql_exec::BackendConn,
 };
+
+#[cfg(feature = "test-support")]
+pub(super) struct VisibilityCommitPause {
+    committed: tokio::sync::oneshot::Sender<()>,
+    resume: tokio::sync::oneshot::Receiver<()>,
+}
 
 // Caller cancellation and COMMIT contend for one permission. Once COMMIT owns
 // it, the storage executor owns both the SQL result and its local publication.
@@ -76,9 +83,48 @@ impl AuxiliaryEffect {
 }
 
 impl CanonicalStore {
+    #[cfg(feature = "test-support")]
+    pub fn pause_next_visibility_commit_for_test(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (committed, observed) = tokio::sync::oneshot::channel();
+        let (resume, waiting) = tokio::sync::oneshot::channel();
+        let previous = self
+            .inner
+            .visibility_commit_pause
+            .lock()
+            .expect("visibility test pause")
+            .replace(VisibilityCommitPause {
+                committed,
+                resume: waiting,
+            });
+        assert!(
+            previous.is_none(),
+            "one pending visibility commit pause per runtime"
+        );
+        (observed, resume)
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(super) async fn pause_after_visibility_commit_for_test(&self) {
+        let pause = self
+            .inner
+            .visibility_commit_pause
+            .lock()
+            .expect("visibility test pause")
+            .take();
+        if let Some(pause) = pause {
+            let _ = pause.committed.send(());
+            let _ = pause.resume.await;
+        }
+    }
+
     pub(crate) async fn with_auxiliary_command<T, R, F>(
         &self,
-        space: notarium_core::ids::SpaceId,
+        space: SpaceId,
         timing: Option<(&CallBudget, CommandDeadline)>,
         after_commit: impl FnOnce(T) -> Result<R, PortError> + Send + 'static,
         op: F,
@@ -90,13 +136,40 @@ impl CanonicalStore {
         T: Send + 'static,
         R: Send + 'static,
     {
-        self.with_guarded_auxiliary_command(space, timing, None, after_commit, move |tx, _| op(tx))
+        self.with_auxiliary_visibility_command(space, None, timing, after_commit, op)
             .await
+    }
+
+    pub(crate) async fn with_auxiliary_visibility_command<T, R, F>(
+        &self,
+        space: SpaceId,
+        visible_space: Option<SpaceId>,
+        timing: Option<(&CallBudget, CommandDeadline)>,
+        after_commit: impl FnOnce(T) -> Result<R, PortError> + Send + 'static,
+        op: F,
+    ) -> Result<R, PortError>
+    where
+        F: for<'c> FnOnce(&'c mut BackendConn<'_>) -> crate::BoxFuture<'c, Result<T, PortError>>
+            + Send
+            + 'static,
+        T: Send + 'static,
+        R: Send + 'static,
+    {
+        self.with_guarded_auxiliary_command(
+            space,
+            visible_space,
+            timing,
+            None,
+            after_commit,
+            move |tx, _| op(tx),
+        )
+        .await
     }
 
     pub(crate) async fn with_guarded_auxiliary_command<T, R, F>(
         &self,
-        space: notarium_core::ids::SpaceId,
+        space: SpaceId,
+        visible_space: Option<SpaceId>,
         timing: Option<(&CallBudget, CommandDeadline)>,
         registration: Option<CanonicalEffectAdmission>,
         after_commit: impl FnOnce(T) -> Result<R, PortError> + Send + 'static,
@@ -136,30 +209,35 @@ impl CanonicalStore {
             // while the connection acknowledges COMMIT or ROLLBACK.
             let operation_effect = active.clone();
             let result = store
-                .with_write_tx_for_space(Some(space), move |tx| {
-                    Box::pin(async move {
-                        check()?;
-                        if !commit.load(Ordering::Acquire) {
-                            return Err(cancelled_not_committed(
-                                "auxiliary_write_revoked",
-                                "caller left before SQL execution",
-                            ));
-                        }
-                        let result = op(tx, operation_effect.clone()).await?;
-                        check()?;
-                        operation_effect.check()?;
-                        if !commit.swap(false, Ordering::AcqRel) {
-                            return Err(cancelled_not_committed(
-                                "auxiliary_write_revoked",
-                                "caller left before commit",
-                            ));
-                        }
-                        Ok(result)
-                    })
-                })
-                .await?;
+                .with_visibility_write_tx(
+                    Some(space),
+                    visible_space,
+                    move |tx| {
+                        Box::pin(async move {
+                            check()?;
+                            if !commit.load(Ordering::Acquire) {
+                                return Err(cancelled_not_committed(
+                                    "auxiliary_write_revoked",
+                                    "caller left before SQL execution",
+                                ));
+                            }
+                            let result = op(tx, operation_effect.clone()).await?;
+                            check()?;
+                            operation_effect.check()?;
+                            if !commit.swap(false, Ordering::AcqRel) {
+                                return Err(cancelled_not_committed(
+                                    "auxiliary_write_revoked",
+                                    "caller left before commit",
+                                ));
+                            }
+                            Ok(result)
+                        })
+                    },
+                    after_commit,
+                )
+                .await;
             drop(active);
-            after_commit(result)
+            result
         });
         let mut pending = PendingWrite {
             permission,

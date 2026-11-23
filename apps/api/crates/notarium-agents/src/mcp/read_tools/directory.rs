@@ -118,7 +118,7 @@ pub(super) async fn list(call: &mut ToolCallContext<'_>, args: Value) -> Result<
                 sort: SortSpec::default(),
                 limit,
             },
-            causal: CausalBasis::Await(Default::default()),
+            causal: target.causal(),
         })
     };
     let external = matches!(call.target, EgressTarget::ExternalMcp);
