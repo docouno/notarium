@@ -39,10 +39,14 @@ before shutting down canonical storage.
 - For provider-recipient search and recall, the output limit counts notes
   admitted for that recipient. A single lexical and vector collection can
   inspect up to 800 distinct ranked notes per branch before graph expansion.
+  Strict lexical matches take priority within that window. The single-clause
+  fallback counts recipient-admitted strict notes, then fills the remaining
+  slots up to `min(top_k, 10)` with admitted weaker matches before rank
+  fusion and graph expansion. Both tiers share the same 800-note limit.
   When present, the existing structural mask plus the receipt overlay bounds
-  this collection without reducing its ordinary chunk depth. One additional
-  distinct note in either branch marks the typed result truncated even when
-  no inspected note is admissible. Provider-facing tools omit this flag and
+  this collection without reducing its ordinary chunk depth. An additional
+  distinct strict or vector match marks the typed result truncated. An extra
+  weak match marks it truncated while the fallback floor is still unfilled. Provider-facing tools omit this flag and
   hidden counts. The larger window reuses the same query embedding. Ordinary
   search and recall retain their `max(100, 4 * top_k)` candidate limits.
 - The hybrid path fuses lexical and vector ranks with reciprocal rank fusion

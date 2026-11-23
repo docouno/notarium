@@ -50,15 +50,9 @@ impl Candidate {
 // Each collector was asked for limit + 1. Vector results contain both the
 // leading chunks and a representative per distinct note; only another note
 // witnesses an unfinished note window.
-pub(crate) fn trim_recipient_window(
-    lexical: &mut Vec<LexicalHit>,
-    vectors: &mut Vec<VectorHit>,
-    limit: usize,
-) -> bool {
-    let lexical_overflow = lexical.len() > limit;
-    lexical.truncate(limit);
+pub(crate) fn trim_vector_window(vectors: &mut Vec<VectorHit>, limit: usize) -> bool {
     if vectors.len() <= limit {
-        return lexical_overflow;
+        return false;
     }
     let mut notes = HashSet::new();
     let mut rank = 0;
@@ -67,7 +61,7 @@ pub(crate) fn trim_recipient_window(
         let first = notes.insert(hit.metadata.note.clone());
         rank <= limit || (first && notes.len() <= limit)
     });
-    lexical_overflow || notes.len() > limit
+    notes.len() > limit
 }
 
 #[doc(hidden)]

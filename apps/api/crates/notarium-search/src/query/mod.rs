@@ -6,7 +6,10 @@ use crate::{
     config::VectorMode,
     embed::{EmbeddingError, RemoteConservativeTokenizerBudget},
     engine::{Clock, Published, SearchEngine, internal, invalid},
-    lexical::{LexicalError, LexicalFilter, LexicalHit, LexicalIndex, OverlayHits, Update},
+    lexical::{
+        LexicalError, LexicalFilter, LexicalIndex, MAX_FALLBACK_FLOOR, OverlayHits, RankedLexical,
+        Update,
+    },
     model::Embedder,
     ports::{EmbeddingBackendTarget, ResolvedEmbeddingTarget},
     vector::{ProjectedVectorFilter, SearchBudget, VectorHit, search_candidate_limit},
@@ -162,10 +165,19 @@ impl SearchEngine {
         );
         let top_k = usize::from(request.top_k.get());
         let ordinary_limit = search_candidate_limit(top_k);
+        let floor = top_k.min(MAX_FALLBACK_FLOOR);
+        let mut admission = hydrate::NoteAdmission {
+            context: &ctx,
+            clock,
+            cut: &aligned.base_cut,
+            overlay: &aligned.overlay,
+            recipient: delivery.recipient.filter(|r| r.filters_notes()),
+            checked: Default::default(),
+        };
         // A recipient may reject an entire ranked prefix. Collect once, with
         // one extra distinct note per branch to witness an unfinished window.
         const RECIPIENT_LIMIT: usize = search_candidate_limit(PageLimit::MAX as usize);
-        let candidate_k = if delivery.recipient.is_some_and(|r| r.filters_notes()) {
+        let candidate_k = if admission.recipient.is_some() {
             let probe_limit = RECIPIENT_LIMIT + 1;
             filter.nodes.as_ref().map_or(probe_limit, |nodes| {
                 // The base mask bounds distinct indexed notes. Receipts may
@@ -180,6 +192,11 @@ impl SearchEngine {
         };
         let excluded: Arc<BTreeSet<_>> = Arc::new(aligned.overlay.keys().cloned().collect());
 
+        let fallback_window = if admission.recipient.is_some() {
+            candidate_k
+        } else {
+            floor
+        };
         let lexical = async {
             let overlay = rank_overlay(
                 self,
@@ -199,7 +216,7 @@ impl SearchEngine {
                 excluded.clone(),
                 request.text.clone(),
                 candidate_k,
-                top_k,
+                fallback_window,
                 filtered,
                 overlay,
             )
@@ -218,10 +235,23 @@ impl SearchEngine {
             browse,
         });
         let (mut notes, mut vectors) = tokio::try_join!(lexical, vectors)?;
-        let window_truncated = candidate_k > RECIPIENT_LIMIT
-            && ranking::trim_recipient_window(&mut notes, &mut vectors.hits, RECIPIENT_LIMIT);
+        let strict_overflow = notes.strict_len > RECIPIENT_LIMIT;
+        let weak_overflow = !strict_overflow && notes.hits.len() > RECIPIENT_LIMIT;
+        notes.hits.truncate(RECIPIENT_LIMIT);
+        notes.strict_len = notes.strict_len.min(RECIPIENT_LIMIT);
+        let vector_overflow = candidate_k > RECIPIENT_LIMIT
+            && ranking::trim_vector_window(&mut vectors.hits, RECIPIENT_LIMIT);
+        let floor_filled = if admission.recipient.is_some()
+            && (notes.hits.len() > notes.strict_len || weak_overflow)
+        {
+            admission.fill_fallback(self, &mut notes, floor).await?
+        } else {
+            false
+        };
+        let window_truncated =
+            strict_overflow || vector_overflow || (weak_overflow && !floor_filled);
 
-        let mut candidates = ranking::fuse(notes, vectors.hits, browse);
+        let mut candidates = ranking::fuse(notes.hits, vectors.hits, browse);
         let graph_truncated = if let Some(recall) = recall.filter(|recall| recall.graph_depth != 0)
         {
             ranking::expand(
@@ -247,11 +277,8 @@ impl SearchEngine {
             .unwrap_or(&fallback);
         let (hits, notes_truncated) = self
             .hydrate_notes(hydrate::Hydration {
-                context: &ctx,
+                admission,
                 text: &request.text,
-                clock,
-                cut: &aligned.base_cut,
-                overlay: &aligned.overlay,
                 candidates,
                 tokenizer,
                 top_k,
@@ -927,16 +954,16 @@ async fn lexical_candidates(
     excluded: Arc<BTreeSet<NoteId>>,
     text: String,
     candidate_k: usize,
-    top_k: usize,
+    fallback_window: usize,
     filtered: bool,
     overlay: OverlayHits,
-) -> Result<Vec<LexicalHit>, PortError> {
+) -> Result<RankedLexical, PortError> {
     let Some(state) = state else {
         return Ok(overlay.merge(
             Vec::new(),
             Vec::new(),
             candidate_k,
-            top_k.min(crate::lexical::MAX_FALLBACK_FLOOR),
+            fallback_window,
             text.trim().is_empty(),
         ));
     };
@@ -956,7 +983,7 @@ async fn lexical_candidates(
             &text,
             &notes_filter,
             candidate_k,
-            top_k,
+            fallback_window,
             filtered,
             &overlay,
         )

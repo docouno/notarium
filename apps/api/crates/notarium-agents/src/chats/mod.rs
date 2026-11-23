@@ -796,6 +796,9 @@ impl AgentRunSupervisor {
                 )
             }
         };
+        if self.inner.shutdown.is_cancelled() {
+            return Ok(LaunchOutcome::Settled(owner_unavailable()));
+        }
         lease.check()?;
         let account = self
             .live_account(AccountContext::new(
@@ -876,6 +879,10 @@ impl AgentRunSupervisor {
         });
         let previous = {
             let mut threads = self.inner.threads.lock().expect("thread registry lock");
+            // Shutdown cancels every published candidate under this same lock.
+            if self.inner.shutdown.is_cancelled() {
+                return Ok(LaunchOutcome::Settled(owner_unavailable()));
+            }
             threads
                 .streams
                 .entry((request.scope.clone(), request.thread.clone()))
@@ -1019,6 +1026,9 @@ impl AgentRunSupervisor {
     fn restore_predecessor(&self, key: ThreadKey, predecessor: Option<Arc<ActiveRun>>) {
         let mut threads = self.inner.threads.lock().expect("thread registry lock");
         if let Some(predecessor) = predecessor {
+            if self.inner.shutdown.is_cancelled() {
+                predecessor.cancellation.cancel();
+            }
             threads.active.insert(key, predecessor);
         } else {
             threads.active.remove(&key);

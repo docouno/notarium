@@ -164,7 +164,8 @@ impl AgentRunSupervisor {
                     {
                         Ok(LaunchOutcome::Started(id)) => run = Some(id),
                         Err(error)
-                            if !sender.cancellation().is_cancelled()
+                            if !self.inner.shutdown.is_cancelled()
+                                && !sender.cancellation().is_cancelled()
                                 && let Some(retry) = retry_handoff(&error) =>
                         {
                             return Err(retry);
@@ -368,7 +369,10 @@ impl AgentRunSupervisor {
                                         *unsettled = None;
                                         return Ok(());
                                     }
-                                    Err(error) if retry_handoff(&error).is_some() => {
+                                    Err(error)
+                                        if !self.inner.shutdown.is_cancelled()
+                                            && retry_handoff(&error).is_some() =>
+                                    {
                                         return Err(error);
                                     }
                                     _ => (),

@@ -442,10 +442,10 @@ fn overlay_ranking_runs_outside_writer_pool_and_separates_fallback() {
 
         let browse = LexicalIndex::rank_overlay("", &updates, None, true, budget).unwrap();
         assert!(browse.fallback.is_empty());
-        let first = browse.merge(Vec::new(), Vec::new(), 1, 0, true);
+        let first = browse.merge(Vec::new(), Vec::new(), 1, 0, true).hits;
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].key, HitKey::Note(NoteId::from_bytes([1; 16])));
-        let strict_only = ranked.merge(Vec::new(), Vec::new(), 1, 2, false);
+        let strict_only = ranked.merge(Vec::new(), Vec::new(), 1, 2, false).hits;
         assert_eq!(strict_only.len(), 1);
         assert_eq!(
             strict_only[0].key,
@@ -516,7 +516,8 @@ fn receipt_and_indexed_candidates_share_the_same_rrf_window() {
             LexicalIndex::rank_overlay(query, &receipt, Some(&base), browse, budget).unwrap();
         let hits = index
             .search_with_overlay(&base, query, &filter, limit, 1, browse, &overlay)
-            .unwrap();
+            .unwrap()
+            .hits;
         let expected: Vec<_> = (0..expected_len)
             .map(|i| HitKey::Note(ordinal_note_id(i)))
             .collect();
@@ -526,6 +527,26 @@ fn receipt_and_indexed_candidates_share_the_same_rrf_window() {
         );
         before.push(hits);
     }
+    // Before recipient admission, a strict receipt and weaker disk matches
+    // share the same bounded lexical window and keep the strict boundary.
+    let strict_receipt = [Update::Note {
+        content: &docs[0],
+        title: "strongmarker",
+        folder,
+    }];
+    let query = "beta strongmarker absentterm";
+    let overlay =
+        LexicalIndex::rank_overlay(query, &strict_receipt, Some(&base), false, budget).unwrap();
+    let window = index
+        .search_with_overlay(&base, query, &filter, limit, limit, false, &overlay)
+        .unwrap();
+    assert_eq!(window.strict_len, 1);
+    assert_eq!(window.hits.len(), limit);
+    assert_eq!(window.hits[0].key, HitKey::Note(ordinal_note_id(0)));
+    assert_eq!(
+        window.hits[limit - 1].key,
+        HitKey::Note(ordinal_note_id(99))
+    );
     // Note 100 ranks 30th in the vector stream. A spurious 101st lexical
     // vote would put it ahead of the winner of either individual stream.
     let vectors = (200..229)

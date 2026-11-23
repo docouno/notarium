@@ -582,7 +582,7 @@ async fn fenced_ownership_recovers_pending_inputs(
     )
     .await;
     let successor = AgentRunSupervisor::new_clustered(
-        local.registry,
+        local.registry.clone(),
         fixture.revocations.clone(),
         authority.clone(),
     );
@@ -591,6 +591,34 @@ async fn fenced_ownership_recovers_pending_inputs(
         model: Some(local.model),
         ..ChatRunOptions::default()
     };
+    let stopping = AgentRunSupervisor::new_clustered(
+        local.registry,
+        fixture.revocations.clone(),
+        authority.clone(),
+    );
+    let (entered, resume) = authority.pause_next_owner();
+    let recovery = tokio::spawn({
+        let supervisor = stopping.clone();
+        let account = fixture.human.clone();
+        let request = request(live.head, options.clone());
+        async move { supervisor.start(account, request).await }
+    });
+    let token = timeout(Duration::from_secs(10), entered)
+        .await
+        .unwrap()
+        .unwrap();
+    stopping.shutdown();
+    resume.send(()).unwrap();
+    assert!(recovery.await.unwrap().is_err());
+    assert!(token.is_cancelled());
+    assert_eq!(
+        thread(&fixture, reader, &thread_id)
+            .await
+            .active_run
+            .as_ref(),
+        Some(&abandoned)
+    );
+
     let next = successor
         .start(fixture.human.clone(), request(live.head, options.clone()))
         .await
@@ -717,7 +745,7 @@ async fn takeover_case(pg: bool) {
     fixture.close().await;
 }
 
-pub(super) async fn revoked_handoffs(
+pub(super) async fn interrupted_handoffs(
     fixture: &RuntimeFixture,
     registry: Arc<ToolRegistry>,
     scope: &SpaceContext,
@@ -727,11 +755,24 @@ pub(super) async fn revoked_handoffs(
     listener: &TcpListener,
 ) -> ControlRevision {
     let authority = Arc::new(SharedAuthority::new(fixture.revocations.clone(), None));
-    let supervisor =
-        AgentRunSupervisor::new_clustered(registry, fixture.revocations.clone(), authority.clone());
+    let replay_owner = AgentRunSupervisor::new_clustered(
+        registry.clone(),
+        fixture.revocations.clone(),
+        authority.clone(),
+    );
     let owner = AccountContext::new(scope.auth().clone(), budget());
     let editor = AccountContext::new(peer.auth().clone(), budget());
-    for (tag, queued) in [(210, false), (220, true)] {
+    for (tag, queued, shutdown) in [
+        (210, false, false),
+        (220, true, false),
+        (230, false, true),
+        (240, true, true),
+    ] {
+        let supervisor = AgentRunSupervisor::new_clustered(
+            registry.clone(),
+            fixture.revocations.clone(),
+            authority.clone(),
+        );
         let thread = ChatThreadId::from_bytes([tag; 16]);
         let identity = |actor: &AccountContext, offset| CommandIdentity {
             scope: scope.scope().clone(),
@@ -820,25 +861,42 @@ pub(super) async fn revoked_handoffs(
             .await
             .unwrap()
             .unwrap();
-        for (offset, role) in [(3, SpaceRole::Viewer), (4, SpaceRole::Editor)] {
-            membership = fixture
-                .control
-                .change_membership(
-                    scope.clone(),
-                    MembershipChange {
-                        command: CommandKey::from_bytes([tag + offset; 16]),
-                        member: editor.auth().principal().clone(),
-                        role: Some(role),
-                        expected: membership,
-                    },
-                )
+        // Cover shutdown both while the owner acknowledgement is outstanding
+        // and after it returns, while the next branch read is still in flight.
+        let resume = if shutdown && queued {
+            let (reading, release) = fixture.projections.pause_chat_read();
+            resume.send(()).unwrap();
+            timeout(Duration::from_secs(10), reading)
                 .await
                 .unwrap()
-                .revision;
-            assert!(
-                token.is_cancelled(),
-                "the completed membership change must fence the registering owner"
-            );
+                .unwrap();
+            release
+        } else {
+            resume
+        };
+        if shutdown {
+            supervisor.shutdown();
+        } else {
+            for (offset, role) in [(3, SpaceRole::Viewer), (4, SpaceRole::Editor)] {
+                membership = fixture
+                    .control
+                    .change_membership(
+                        scope.clone(),
+                        MembershipChange {
+                            command: CommandKey::from_bytes([tag + offset; 16]),
+                            member: editor.auth().principal().clone(),
+                            role: Some(role),
+                            expected: membership,
+                        },
+                    )
+                    .await
+                    .unwrap()
+                    .revision;
+                assert!(
+                    token.is_cancelled(),
+                    "the completed membership change must fence the registering owner"
+                );
+            }
         }
         resume.send(()).unwrap();
         if let Some(enqueue) = direct {
@@ -850,6 +908,7 @@ pub(super) async fn revoked_handoffs(
             assert!(submission.run.is_none());
         }
         let head = supervised_chat_cases::idle_leaf(fixture, scope, &thread).await;
+        assert!(token.is_cancelled());
         let branch = supervised_chat_cases::branch(fixture, scope, &thread, head).await;
         assert_eq!(
             branch
@@ -865,7 +924,7 @@ pub(super) async fn revoked_handoffs(
                 .iter()
                 .all(|e| e.kind == ChatEntryKind::Human)
         );
-        let replay = supervisor
+        let replay = replay_owner
             .enqueue_input(editor.clone(), post, options.clone())
             .await
             .unwrap();
@@ -875,8 +934,9 @@ pub(super) async fn revoked_handoffs(
                 .await
                 .is_err()
         );
+        supervisor.shutdown();
     }
-    supervisor.shutdown();
+    replay_owner.shutdown();
     membership
 }
 

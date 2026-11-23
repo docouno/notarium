@@ -219,7 +219,7 @@ async fn group_turn(
         model: Some(local.model),
         ..ChatRunOptions::default()
     };
-    let membership = Box::pin(super::supervised_takeover_cases::revoked_handoffs(
+    let membership = Box::pin(super::supervised_takeover_cases::interrupted_handoffs(
         fixture,
         local.registry.clone(),
         scope,

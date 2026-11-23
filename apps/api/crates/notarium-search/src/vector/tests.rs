@@ -978,7 +978,7 @@ fn vector_candidates_rank_notes_and_keep_their_best_chunks_across_tiers() {
     for (limit, overflow) in [(3, false), (2, true)] {
         let mut window = hits.hits.clone();
         assert_eq!(
-            crate::query::ranking::trim_recipient_window(&mut Vec::new(), &mut window, limit),
+            crate::query::ranking::trim_vector_window(&mut window, limit),
             overflow,
         );
         let kept = crate::query::ranking::fuse(Vec::new(), window, false);

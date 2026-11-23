@@ -266,18 +266,25 @@ async fn recall_packs_after_recipient_consent(
             71,
             DocClass::AgentMemory,
             "Recallrank triorank alpha",
-            "triorank",
+            "triorank closedquorum",
         ),
         (
             72,
             DocClass::AgentMemory,
             "Recallrank triorank bravo",
-            "triorank",
+            "triorank closedquorum",
         ),
         (73, DocClass::UserDoc, "Available evidence", "triorank"),
     ]
     .into_iter()
-    .chain((100..198).map(|tag| (tag, DocClass::AgentMemory, "Recallrank memory", "")))
+    .chain((100..198).map(|tag| {
+        let extra = match tag {
+            100..110 => "tenquorum",
+            110 => "onlyweaklink [[ranked-00000000000000000000000000000001]]",
+            _ => "",
+        };
+        (tag, DocClass::AgentMemory, "Recallrank memory", extra)
+    }))
     .map(|(tag, class, title, extra)| {
         let body = format!(
             "recallrank {extra} windowprobe exactprobe {}",
@@ -394,6 +401,76 @@ async fn recall_packs_after_recipient_consent(
         top_k: PageLimit::new(1).unwrap(),
         ..query
     };
+    for text in [
+        "recallrank neverpresentz neverpresentq",
+        "recallrank closedquorum neverpresentq",
+    ] {
+        // The best admitted one-clause match ranks behind 100 closed notes.
+        let recipient = OnlyClass::new(DocClass::UserDoc);
+        let relaxed = reads
+            .search
+            .search_for(
+                space.clone(),
+                SearchQuery {
+                    text: text.into(),
+                    ..first.clone()
+                },
+                Some(&recipient),
+            )
+            .await
+            .unwrap();
+        assert_eq!(relaxed.hits.len(), 1, "{text}");
+        assert_eq!(
+            relaxed.hits[0]
+                .card
+                .document
+                .provenance()
+                .reference()
+                .note_id,
+            allowed
+        );
+        assert!(!relaxed.truncated);
+        assert_eq!(recipient.inspected.into_inner(), 101);
+    }
+    for (term, depth) in [("neverpresentz", 0), ("closedquorum", 0), ("tenquorum", 1)] {
+        let recipient = OnlyClass::new(DocClass::AgentMemory);
+        let mixed = reads
+            .search
+            .recall_for(
+                space.clone(),
+                RecallQuery {
+                    query: SearchQuery {
+                        text: format!("recallrank {term} neverpresentq"),
+                        top_k: PageLimit::new(20).unwrap(),
+                        ..first.clone()
+                    },
+                    graph_depth: depth,
+                    token_budget: 32_768,
+                    max_per_source: None,
+                },
+                Some(&recipient),
+            )
+            .await
+            .unwrap();
+        // Zero, two, or ten strict notes fill the same floor. Once full,
+        // additional weak matches cannot contribute RRF votes or graph seeds.
+        assert_eq!(mixed.hits.len(), 10, "{term}");
+        assert!(!mixed.truncated, "{term}");
+        if term == "tenquorum" {
+            let ids: BTreeSet<_> = mixed
+                .hits
+                .iter()
+                .map(|hit| hit.card.document.provenance().reference().note_id.clone())
+                .collect();
+            assert_eq!(
+                ids,
+                (100..110)
+                    .map(|tag| NoteId::from_bytes([tag; 16]))
+                    .collect()
+            );
+            assert_eq!(recipient.inspected.into_inner(), 10);
+        }
+    }
     let recalled = reads
         .search
         .recall_for(
@@ -492,9 +569,9 @@ async fn recall_packs_after_recipient_consent(
         .unwrap();
     for (tag, name, field) in [(82, "search", "results"), (83, "recall", "sources")] {
         let args = if name == "recall" {
-            json!({"query":"recallrank", "project":project, "depth":0, "budgetTokens":200, "maxPerSource":100})
+            json!({"query":"recallrank closedquorum neverpresentq", "project":project, "depth":0, "budgetTokens":200, "maxPerSource":100})
         } else {
-            json!({"query":"recallrank", "project":project, "limit":1})
+            json!({"query":"recallrank neverpresentz neverpresentq", "project":project, "limit":1})
         };
         let result = local
             .registry

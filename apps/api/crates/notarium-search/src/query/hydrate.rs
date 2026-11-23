@@ -4,7 +4,7 @@ use super::{
 use crate::{
     embed::RemoteConservativeTokenizerBudget,
     engine::{Clock, Published, SearchEngine, internal},
-    lexical::{ChatCursor, ChunkRelevance, HitKey, LexicalFilter},
+    lexical::{ChatCursor, ChunkRelevance, HitKey, LexicalFilter, RankedLexical},
     model::chunks_for,
     ports::SearchDocumentTarget,
 };
@@ -13,7 +13,10 @@ use notarium_core::{
     error::PortError,
     ids::{NoteId, SpaceSeq},
     model::SnapshotCut,
-    ports::{ChatSearchHit, NoteCard, SearchHit, SearchQuery, SpaceContext, StructuralSnapshot},
+    ports::{
+        ChatSearchHit, NoteCard, SearchHit, SearchQuery, SearchRecipient, SpaceContext,
+        StructuralSnapshot,
+    },
 };
 use notarium_syntax::chunk::TokenizerBudget;
 use std::{
@@ -24,12 +27,139 @@ use std::{
 
 const MAX_CHAT_PAGES: usize = 8;
 
-pub(super) struct Hydration<'a> {
+pub(super) struct NoteAdmission<'a> {
     pub context: &'a SpaceContext,
-    pub text: &'a str,
     pub clock: &'a Clock,
     pub cut: &'a SnapshotCut,
     pub overlay: &'a Overlay,
+    pub recipient: Option<&'a dyn SearchRecipient>,
+    /// Decisions made while filling the lexical floor, within this one query.
+    pub checked: HashMap<NoteId, bool>,
+}
+
+impl NoteAdmission<'_> {
+    /// Only the admitted weak matches needed to complete the floor contribute
+    /// lexical votes and graph seeds. Strict and independent vector votes keep
+    /// their original rank.
+    pub(super) async fn fill_fallback(
+        &mut self,
+        engine: &SearchEngine,
+        ranked: &mut RankedLexical,
+        floor: usize,
+    ) -> Result<bool, PortError> {
+        let notes = ranked.hits.iter().filter_map(|hit| match &hit.key {
+            HitKey::Note(note) => Some(note),
+            HitKey::Chat { .. } => None,
+        });
+        let admitted = self
+            .select(engine, notes, |note| *note, floor, true)
+            .await?;
+        let filled = admitted.len() == floor;
+        let mut pos = 0;
+        let checked = &self.checked;
+        ranked.hits.retain(|hit| {
+            pos += 1;
+            pos <= ranked.strict_len
+                || matches!(&hit.key, HitKey::Note(note) if checked.get(note) == Some(&true))
+        });
+        Ok(filled)
+    }
+
+    async fn select<T>(
+        &mut self,
+        engine: &SearchEngine,
+        ranked: impl Iterator<Item = T>,
+        note: impl Fn(&T) -> &NoteId,
+        limit: usize,
+        remember: bool,
+    ) -> Result<Vec<T>, PortError> {
+        let structural = &engine.services.deps.structural;
+        let mut unmasked =
+            ranked.filter(|item| !self.overlay.get(note(item)).is_some_and(Option::is_none));
+        let mut selected = Vec::with_capacity(limit);
+        let batch_size = if self.recipient.is_some() {
+            limit.clamp(32, 200)
+        } else {
+            limit.clamp(32, 256)
+        };
+        loop {
+            let batch: Vec<_> = unmasked.by_ref().take(batch_size).collect();
+            if batch.is_empty() {
+                return Ok(selected);
+            }
+            let ids: Vec<_> = batch.iter().map(&note).cloned().collect();
+            let mut check_ctx = self.context.clone();
+            check_ctx.budget = self.clock.remaining()?;
+            let flags = structural.filter_live_visible(&check_ctx, &ids).await?;
+            if flags.len() != ids.len() {
+                return Err(internal("projection_live_batch"));
+            }
+            let visible: Vec<_> = batch
+                .into_iter()
+                .zip(flags)
+                .filter_map(|(candidate, visible)| visible.then_some(candidate))
+                .collect();
+            let mut metadata = BTreeMap::new();
+            if self.recipient.is_some() {
+                let projected: Vec<_> = visible
+                    .iter()
+                    .map(&note)
+                    .filter(|id| !self.overlay.contains_key(*id) && !self.checked.contains_key(*id))
+                    .cloned()
+                    .collect();
+                if !projected.is_empty() {
+                    check_ctx.budget = self.clock.remaining()?;
+                    metadata = engine
+                        .services
+                        .deps
+                        .canonical
+                        .read_search_candidate_metadata(
+                            &check_ctx,
+                            self.cut.projected_seq,
+                            projected,
+                        )
+                        .await?;
+                }
+            }
+            for candidate in visible {
+                if let Some(recipient) = self.recipient {
+                    let id = note(&candidate);
+                    let allowed = if let Some(allowed) = self.checked.get(id) {
+                        *allowed
+                    } else {
+                        let card = match self.overlay.get(id) {
+                            Some(Some(row)) => ClassEgressFence::search_metadata(
+                                row.document.metadata(),
+                                self.context.auth(),
+                            )
+                            .ok(),
+                            _ => metadata.remove(id),
+                        };
+                        let allowed = match card {
+                            Some(card) => recipient.admit(card.provenance()).await?,
+                            None => false,
+                        };
+                        if remember {
+                            self.checked.insert(id.clone(), allowed);
+                        }
+                        allowed
+                    };
+                    if !allowed {
+                        continue;
+                    }
+                }
+                selected.push(candidate);
+                if selected.len() == limit {
+                    return Ok(selected);
+                }
+            }
+        }
+    }
+}
+
+pub(super) struct Hydration<'a> {
+    pub admission: NoteAdmission<'a>,
+    pub text: &'a str,
     pub candidates: Vec<Candidate>,
     pub tokenizer: &'a (dyn TokenizerBudget + Send + Sync),
     pub top_k: usize,
@@ -42,89 +172,32 @@ impl SearchEngine {
         task: Hydration<'_>,
     ) -> Result<(Vec<SearchHit>, bool), PortError> {
         let Hydration {
-            context,
+            mut admission,
             text,
-            clock,
-            cut,
-            overlay,
             candidates,
             tokenizer,
             top_k,
             delivery,
         } = task;
+        let mut selected = admission
+            .select(
+                self,
+                candidates.into_iter(),
+                |candidate| &candidate.note,
+                top_k + 1,
+                false,
+            )
+            .await?;
+        let truncated = selected.len() > top_k;
+        selected.truncate(top_k);
+        let NoteAdmission {
+            context,
+            clock,
+            cut,
+            overlay,
+            ..
+        } = admission;
         let structural = &self.services.deps.structural;
-        let recipient = delivery
-            .recipient
-            .filter(|recipient| recipient.filters_notes());
-        let mut unmasked = candidates
-            .into_iter()
-            .filter(|candidate| !overlay.get(&candidate.note).is_some_and(Option::is_none));
-        let mut selected = Vec::with_capacity(top_k);
-        let mut truncated = false;
-        let batch_size = if recipient.is_some() {
-            (top_k + 1).clamp(32, 200)
-        } else {
-            (top_k + 1).clamp(32, 256)
-        };
-        'pages: loop {
-            let batch: Vec<_> = unmasked.by_ref().take(batch_size).collect();
-            if batch.is_empty() {
-                break;
-            }
-            let ids: Vec<_> = batch
-                .iter()
-                .map(|candidate| candidate.note.clone())
-                .collect();
-            let mut check_ctx = context.clone();
-            check_ctx.budget = clock.remaining()?;
-            let flags = structural.filter_live_visible(&check_ctx, &ids).await?;
-            if flags.len() != ids.len() {
-                return Err(internal("projection_live_batch"));
-            }
-            let visible: Vec<_> = batch
-                .into_iter()
-                .zip(flags)
-                .filter_map(|(candidate, visible)| visible.then_some(candidate))
-                .collect();
-            let mut metadata = BTreeMap::new();
-            if recipient.is_some() {
-                let projected: Vec<_> = visible
-                    .iter()
-                    .filter(|candidate| !overlay.contains_key(&candidate.note))
-                    .map(|candidate| candidate.note.clone())
-                    .collect();
-                if !projected.is_empty() {
-                    check_ctx.budget = clock.remaining()?;
-                    metadata = self
-                        .services
-                        .deps
-                        .canonical
-                        .read_search_candidate_metadata(&check_ctx, cut.projected_seq, projected)
-                        .await?;
-                }
-            }
-            for candidate in visible {
-                if let Some(recipient) = recipient {
-                    let card = match overlay.get(&candidate.note) {
-                        Some(Some(row)) => ClassEgressFence::search_metadata(
-                            row.document.metadata(),
-                            context.auth(),
-                        )
-                        .ok(),
-                        _ => metadata.remove(&candidate.note),
-                    };
-                    let Some(card) = card else { continue };
-                    if !recipient.admit(card.provenance()).await? {
-                        continue;
-                    }
-                }
-                if selected.len() == top_k {
-                    truncated = true;
-                    break 'pages;
-                }
-                selected.push(candidate);
-            }
-        }
         if selected.is_empty() {
             return Ok((Vec::new(), truncated));
         }
