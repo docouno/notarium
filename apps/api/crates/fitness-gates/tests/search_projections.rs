@@ -4,6 +4,7 @@
 mod collab_support;
 
 use collab_support::{StorageTestFixtures, TempDataRoot, maintenance_ctx, random_bytes_16};
+use notarium_agents::abilities::SystemAbilityCatalog;
 use notarium_canonical::{
     CanonicalConfig, CanonicalRuntime, CanonicalStore, CreateFolderSpec, CreateSpaceSpec,
     PgConnectConfig, S3BucketModePolicy, UpdateSpaceSchema, blobs::s3::admin_ensure_bucket,
@@ -14,30 +15,35 @@ use notarium_control::{
     outbound::{NetworkPolicy, OutboundTransport, PrivateNetworkRule},
     service::{
         AuthenticationMode, ControlConfig, ControlService, SystemClock,
-        provider::{ProviderConfig, ProviderService},
+        provider::{ProviderConfig, ProviderService, ResolvedSearchEmbeddingModel},
     },
     store::{ControlStore, PostgresConfig, TargetRecord},
 };
 use notarium_core::{
     DomainError,
-    auth::{EngineAuthContext, SecretString, SpaceGrant, SpaceKind, SpaceRole, VerifiedHuman},
+    auth::{
+        BearerScope, ChatAudience, EngineAuthContext, SecretString, SpaceGrant, SpaceKind,
+        SpaceRole, VerifiedHuman,
+    },
     classes::{AbilityKind, DocClass},
     epoch::{DataRoot, EpochClassification, EpochReason, StorageEpochState},
     error::PortError,
     ids::*,
     model::{FolderRef, HistoryScope, Lifecycle},
     ports::{
-        AccountContext, AppendChat, ApproveProviderAttachment, AuthEvidence, AuthEvidenceKind,
-        BootstrapAccount, CallBudget, ChangePassword, ChatEntryKind, ChatInputBody, ChatPort,
-        ChatThreadKind, CreateChat, CreateNote, CreateSpace, EmbeddingProviderPort,
+        AbilityPreferenceUpdate, AbilityResolution, AbilitySelection, AccountContext, AppendChat,
+        ApproveProviderAttachment, AuthEvidence, AuthEvidenceKind, BootstrapAccount, CallBudget,
+        ChangePassword, ChatEntryKind, ChatInputBody, ChatPort, ChatThreadKind, ClaimSchedule,
+        CreateChat, CreateNote, CreatePat, CreateSchedule, CreateSpace, EmbeddingProviderPort,
         EmbeddingQueryInput, EmbeddingRequest, EmptyRootAuthorization, MaintenanceContext,
         MembershipChange, MoveFolder, Mutation, NewAccount, NoteWritePort, PageLimit,
         PasswordLogin, PortFuture, PreAuthContext, PreferenceModelKind, ProviderAttachmentTarget,
         ProviderDisclosure, ProviderDisclosureConsent, ProviderLimits, ProviderModelKind,
         ProviderModelSpec, ProviderPreferenceScope, ProviderResourceSpec, ProviderWireKind,
         PublishAbilityPackage, PutProviderModel, RecallQuery, RequestProviderAttachment,
-        SearchPort, SearchQuery, SearchResult, ServiceAuthority, ServicePurpose,
-        SetAccountDisabled, SetProviderPreference, SpaceContext, TokenAccountingProfile,
+        ScheduleClaim, ScheduleDefinition, SearchDegradation, SearchPort, SearchQuery,
+        SearchResult, ServiceAuthority, ServicePurpose, SetAccountDisabled, SetProviderPreference,
+        SpaceContext, TokenAccountingProfile,
         control::{AccountMutation, ControlPageRequest, RunLimits},
     },
     query::{FieldFilterAstV1, FieldSchema, FieldType, Predicate, ScalarType},
@@ -45,7 +51,7 @@ use notarium_core::{
         AccountCommandIdentity, AwaitWatermarks, CausalBasis, CommandIdentity,
         MutationReceiptToken, ReceiptSet,
     },
-    value::ScalarValue,
+    value::{ScalarValue, Timestamp},
 };
 use notarium_projections::{ProjectionConfig, ProjectorRuntime};
 use notarium_search::{
@@ -63,7 +69,7 @@ use std::{
     fs,
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
@@ -822,6 +828,7 @@ impl SearchModelResolverPort for ControlSearchModelResolver {
 
 async fn spawn_local_ollama_server(
     author_inputs: Arc<AtomicUsize>,
+    wire_inputs: Arc<Mutex<Vec<Vec<String>>>>,
 ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -831,6 +838,7 @@ async fn spawn_local_ollama_server(
         while let Ok((mut socket, _)) = listener.accept().await {
             let counter = counter.clone();
             let author_inputs = author_inputs.clone();
+            let wire_inputs = wire_inputs.clone();
             tokio::spawn(async move {
                 let mut buf = Vec::new();
                 let mut tmp = [0u8; 4096];
@@ -872,6 +880,12 @@ async fn spawn_local_ollama_server(
                 }) {
                     author_inputs.fetch_add(1, Ordering::SeqCst);
                 }
+                wire_inputs.lock().unwrap().push(
+                    inputs
+                        .iter()
+                        .map(|input| input.as_str().unwrap().to_owned())
+                        .collect(),
+                );
                 let inputs = inputs.len();
                 let mut unit = vec![0.0_f32; 64];
                 unit[0] = 1.0;
@@ -1085,6 +1099,234 @@ async fn published_semantic_query(
     .expect("remote repair must reach the published reader")
 }
 
+async fn claim_search_keeper(
+    control: &ControlService,
+    account: &AccountContext,
+    project: &FolderRef,
+) -> (
+    SpaceContext,
+    notarium_core::ports::AbilityRef,
+    ControlRevision,
+) {
+    let role = control
+        .resolve_ability(
+            account.clone(),
+            AbilitySelection::Name {
+                name: "research".into(),
+                kind: AbilityKind::Role,
+                project: Some(project.clone()),
+            },
+        )
+        .await
+        .unwrap();
+    let AbilityResolution::Resolved(role) = role else {
+        panic!("expected the built-in research role")
+    };
+    let approval = control
+        .schedule_ability_candidate(
+            account.clone(),
+            notarium_core::ports::ScheduleAbilitySelection {
+                space: project.space_id.clone(),
+                project: Some(project.clone()),
+                role: role.reference.identity(),
+            },
+        )
+        .await
+        .unwrap();
+    let skill = approval.approved_skills.first().unwrap().clone();
+    // A single past occurrence stays due until claimed, independent of the test clock.
+    let slot = Timestamp::parse("2020-01-01T00:00:00Z").unwrap();
+    let scheduled = control
+        .create_schedule(
+            account.clone(),
+            AccountMutation {
+                identity: account_command(account.auth().principal(), approval.account_revision),
+                input: CreateSchedule {
+                    id: ScheduleId::from_bytes(random_bytes_16()),
+                    definition: ScheduleDefinition {
+                        space: project.space_id.clone(),
+                        project: Some(project.clone()),
+                        title: "Search fixture".into(),
+                        init_prompt: "Search in the approved project.".into(),
+                        cron: "0 0 0 1 1 * 2020".into(),
+                        timezone: "UTC".into(),
+                        approved_role: approval.approved_role.clone(),
+                        limits: RunLimits::default(),
+                    },
+                    approved_skills: approval.approved_skills,
+                    next_slot: slot,
+                    paused: false,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let claim = control
+        .claim_schedule(
+            maintenance_ctx(ServicePurpose::Scheduler),
+            ClaimSchedule {
+                schedule: scheduled.value.id,
+                slot,
+                current_role: approval.approved_role,
+                expected: scheduled.value.revision,
+                next_slot: None,
+            },
+        )
+        .await
+        .unwrap();
+    let ScheduleClaim::Claimed { context, .. } = claim else {
+        panic!("expected an admitted Keeper")
+    };
+    (*context, skill, scheduled.revision)
+}
+
+async fn verify_run_query_disclosure(
+    search: &SearchEngine,
+    provider: &ProviderService,
+    control: &ControlService,
+    owner: &SpaceContext,
+    target: &ResolvedSearchEmbeddingModel,
+    base_query: SearchQuery,
+    wire_inputs: &Mutex<Vec<Vec<String>>>,
+) {
+    let account = AccountContext::new(owner.auth().clone(), owner.budget.clone());
+    let project = target.project.as_ref().unwrap();
+    let owner_info = control
+        .account(account.clone(), owner.auth().principal().clone())
+        .await
+        .unwrap();
+    let issued = control
+        .create_pat(
+            account.clone(),
+            CreatePat {
+                name: "External MCP search".into(),
+                scope: BearerScope::Read,
+                ability_write: false,
+                selected_spaces: Some(vec![project.space_id.clone()]),
+                expires_at_ms: None,
+                expected: owner_info.revision,
+            },
+        )
+        .await
+        .unwrap();
+    let bearer = control
+        .resolve(PreAuthContext {
+            budget: owner.budget.clone(),
+            evidence: AuthEvidence::new(
+                AuthEvidenceKind::Pat,
+                issued.value.token.expose().to_owned(),
+            ),
+        })
+        .await
+        .unwrap();
+    let external = SpaceContext::new(bearer, owner.scope().clone(), owner.budget.clone()).unwrap();
+    let (keeper, skill, revision) = claim_search_keeper(control, &account, project).await;
+    let query = |text: &str| SearchQuery {
+        text: text.into(),
+        ..base_query.clone()
+    };
+    let run = |pin, audience| {
+        let auth = owner
+            .auth()
+            .for_agent_run(
+                AgentRunId::from_bytes(random_bytes_16()),
+                pin,
+                audience,
+                owner.auth().spaces().clone(),
+            )
+            .unwrap();
+        SpaceContext::new(auth, owner.scope().clone(), owner.budget.clone()).unwrap()
+    };
+    let shared = run(owner.scope().space_id.clone(), ChatAudience::Shared);
+    let foreign_pin = owner
+        .auth()
+        .spaces()
+        .keys()
+        .find(|space| *space != &owner.scope().space_id)
+        .expect("the owner also has a Personal Space")
+        .clone();
+    let foreign = run(foreign_pin, ChatAudience::Personal);
+    let initial = wire_inputs.lock().unwrap().len();
+    for (actor, text) in [
+        (&external, "externalmcpquery"),
+        (&shared, "cleanrunquery"),
+        (&keeper, "approvedkeeperquery"),
+    ] {
+        let result = published_semantic_query(search, actor, query(text)).await;
+        assert!(!result.hits.is_empty());
+    }
+    assert_eq!(
+        &wire_inputs.lock().unwrap()[initial..],
+        &[
+            vec!["externalmcpquery".to_owned()],
+            vec!["cleanrunquery".to_owned()],
+            vec!["approvedkeeperquery".to_owned()]
+        ]
+    );
+
+    // Exercise direct admission before a projection can mark the branch as read.
+    let before = wire_inputs.lock().unwrap().len();
+    assert!(!foreign.auth().taint().is_tainted());
+    assert!(matches!(
+        provider
+            .query_disclosure(
+                foreign.clone(),
+                target.provider.clone(),
+                target.model.clone(),
+                Some(project.clone()),
+                Some(project.folder_id.clone())
+            )
+            .await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+    let request = EmbeddingRequest::query(
+        CommandKey::from_bytes(random_bytes_16()),
+        target.model.clone(),
+        target.provider.clone(),
+        EmbeddingQueryInput {
+            text: "directforeignquery".into(),
+            tokens: 5,
+            classes: [DocClass::UserDoc].into(),
+            project_scope: Some(project.clone()),
+            folder: Some(project.folder_id.clone()),
+        },
+    );
+    assert!(matches!(
+        provider.embed(foreign.clone(), request).await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+    let result = search
+        .search(foreign.clone(), query("Indexed"))
+        .await
+        .unwrap();
+    assert!(foreign.auth().taint().is_tainted());
+    assert!(matches!(
+        result.degraded,
+        Some(SearchDegradation::ProviderUnavailable)
+    ));
+    assert!(!result.hits.is_empty());
+
+    control
+        .set_ability_preference(
+            account.clone(),
+            AccountMutation {
+                identity: account_command(account.auth().principal(), revision),
+                input: AbilityPreferenceUpdate {
+                    ability: skill,
+                    enabled: false,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let result = search.search(keeper, query("Indexed")).await.unwrap();
+    assert!(matches!(
+        result.degraded,
+        Some(SearchDegradation::ProviderUnavailable)
+    ));
+    assert_eq!(wire_inputs.lock().unwrap().len(), before);
+}
+
 async fn wait_remote_sweep(layout: &SearchLayout, revision: ContentDigest) {
     tokio::time::timeout(Duration::from_secs(20), async {
         loop {
@@ -1111,10 +1353,11 @@ async fn exercise_provider_e2e(
 ) {
     let store = Arc::new(store);
     let budget = || maintenance_ctx(ServicePurpose::Search).budget;
+    let catalog = Arc::new(SystemAbilityCatalog::new(store.clone()));
     let control = Arc::new(
         ControlService::open(
             control_store.clone(),
-            store.clone(),
+            catalog.clone(),
             Arc::new(notarium_agents::revocation::RevocationHub::new_local()),
             Arc::new(SystemClock),
             ControlConfig {
@@ -1130,8 +1373,9 @@ async fn exercise_provider_e2e(
     );
 
     let author_inputs = Arc::new(AtomicUsize::new(0));
+    let wire_inputs = Arc::new(Mutex::new(Vec::new()));
     let (origin, ollama_requests, server_task) =
-        spawn_local_ollama_server(author_inputs.clone()).await;
+        spawn_local_ollama_server(author_inputs.clone(), wire_inputs.clone()).await;
     let resource_id = ProviderResourceId::from_bytes(random_bytes_16());
     let model_id = ModelProfileId::from_bytes(random_bytes_16());
     let loopback: ipnet::IpNet = "127.0.0.1/32".parse().unwrap();
@@ -1145,7 +1389,7 @@ async fn exercise_provider_e2e(
             control.clone(),
             keyring,
             outbound,
-            store.clone(),
+            catalog,
             ProviderConfig::default(),
         )
         .unwrap(),
@@ -1558,6 +1802,16 @@ async fn exercise_provider_e2e(
         layout.search_manifest().unwrap().unwrap().vector_seq,
         Some(note_receipt.seq())
     );
+    verify_run_query_disclosure(
+        &restarted,
+        &provider,
+        &control,
+        &owner_space,
+        &resolved,
+        semantic(),
+        &wire_inputs,
+    )
+    .await;
     restarted.shutdown().await;
     verify_moved_query_folder(&store, &provider, &owner_space, &resolved, &ollama_requests).await;
 

@@ -194,8 +194,12 @@ context, a matching project scope, and a nonempty intersection of search
 classes and provider disclosure. For project-scoped queries the canonical
 egress lease pins the requested folder inside that project through dispatch. Provider admission rechecks current access and
 token limits. Dispatch compares both resolved runtime generations and checks
-the shared taint. Remote indexing excludes descendants of trashed folders. Chat
-text stays in the lexical index.
+the shared taint. Chat runs and Keepers can disclose a query only in their
+pinned Space. Reading another Space marks the branch before remote vector
+search, so the lexical path can serve the query locally. A scheduled Keeper
+also needs a live lease and current approval of its role and skills. Query
+embedding sends the query text alone. Remote indexing excludes descendants of
+trashed folders. Chat transcript indexing stays lexical.
 
 Local CPU ONNX inference and remote provider calls run on separate bounded
 priority schedulers so remote network latency never starves local inference.

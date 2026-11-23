@@ -1412,6 +1412,7 @@ async fn seed_rollback_microfixture(store: &CanonicalStore) -> PreparedRollbackT
                     final_yrs_snapshot: None,
                     compacted_through_update_seq: None,
                     carrier_settlement: None,
+                    unchanged_carrier_digest: None,
                 },
             )
             .await

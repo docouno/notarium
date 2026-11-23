@@ -53,7 +53,10 @@ impl RemoteEmbedder {
         mut input: EmbeddingQueryInput,
         implicit: bool,
     ) -> Result<Vec<Option<Vec<f32>>>, EmbeddingError> {
-        if ctx.auth().taint().is_tainted()
+        if ctx
+            .auth()
+            .authorize_remote_embedding_query(&ctx.scope().space_id)
+            .is_err()
             || input.classes.is_empty()
             || input.classes.contains(&DocClass::EncryptedNote)
         {

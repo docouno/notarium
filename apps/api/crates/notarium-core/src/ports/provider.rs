@@ -603,7 +603,9 @@ impl ProviderRevocationScope {
 
 /// The canonical owner pins current metadata and excludes class, lifecycle and
 /// provenance changes until dispatch releases this lease. Mutations may cancel
-/// the supplied operation and wait for its lease to drop. No body crosses this port.
+/// the supplied operation and wait for its lease to drop. The lease also holds
+/// current ability revisions in the primary Space stable, so a scheduled caller
+/// can revalidate its approved packages before sending a query. No body crosses this port.
 pub trait ProviderEgressLease: Send {
     /// Exactly one result per requested origin, in the original request order.
     fn current(&self) -> &[ProviderCurrentContent];

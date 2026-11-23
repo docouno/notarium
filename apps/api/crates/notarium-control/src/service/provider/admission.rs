@@ -308,10 +308,8 @@ impl ProviderService {
             let EmbeddingInput::Query(query) = input else {
                 continue;
             };
-            if auth.taint().is_tainted() {
-                return Err(DomainError::CrossSpaceTainted.into());
-            }
             let primary = primary.ok_or_else(selection::unavailable)?;
+            auth.authorize_remote_embedding_query(&primary.space.id)?;
             let admitted = policies
                 .get(&primary.space.id)
                 .ok_or_else(selection::unavailable)?;
@@ -395,7 +393,13 @@ impl ProviderService {
         if used.len() != metadata.len() {
             return Err(invalid(ValidationReason::SourceMismatch));
         }
-        if let Some(keeper) = keeper {
+        // Query-only embeddings carry no instructions. The credential recheck above
+        // validates the approved packages under the primary Space's egress lease.
+        let query_only = !embedding_inputs.is_empty()
+            && embedding_inputs
+                .iter()
+                .all(|input| matches!(input, EmbeddingInput::Query(_)));
+        if let Some(keeper) = keeper.filter(|_| !query_only) {
             for approved in keeper.approved() {
                 if !parts.iter().any(|part| {
                     let Ok(key) = json(&part.origin()) else {

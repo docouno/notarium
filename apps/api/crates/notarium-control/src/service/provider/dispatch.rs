@@ -177,6 +177,14 @@ impl ProviderService {
         ctx: SpaceContext,
         request: EmbeddingRequest,
     ) -> Result<EmbeddingResult, PortError> {
+        if request
+            .inputs
+            .iter()
+            .any(|input| matches!(input, EmbeddingInput::Query(_)))
+        {
+            ctx.auth()
+                .authorize_remote_embedding_query(&ctx.scope().space_id)?;
+        }
         match self.unary(Job::embedding(ctx, request)).await? {
             Output::Embedding(result) => Ok(result),
             _ => Err(protocol()),
@@ -619,9 +627,8 @@ impl EmbeddingProviderPort for ProviderService {
         folder: Option<FolderId>,
     ) -> PortFuture<'_, BTreeSet<DocClass>> {
         Box::pin(async move {
-            if ctx.auth().taint().is_tainted() {
-                return Err(DomainError::CrossSpaceTainted.into());
-            }
+            ctx.auth()
+                .authorize_remote_embedding_query(&ctx.scope().space_id)?;
             if let (Some(project), Some(folder_id)) = (&project, folder) {
                 let budget = OperationBudget::new(ctx.budget.clone());
                 let reference = FolderRef {

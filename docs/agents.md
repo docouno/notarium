@@ -65,6 +65,14 @@ External results use the current class and read fences. Provider results also
 require consent for the actual source and its project placement. Encrypted
 notes are excluded from both surfaces.
 
+Search and recall use the configured embedding provider for clean query text
+within a run's pinned Space under the same provider, project and class consent
+as external MCP calls. Opening a projection in another Space taints the branch
+before vector search runs. An unavailable remote embedding leaves full-text
+matches available and reports `provider_unavailable`. A scheduled Keeper's
+approved role and skills must still be current at dispatch. The embedding
+request carries only the query text.
+
 ## Chat runs and confirmation
 
 `AgentRunSupervisor` drives completion and tool calls for a canonical branch.
@@ -204,9 +212,10 @@ integration requirements.
 
 The Keeper integration test reports the latency of the first supervisor rollback
 of nine changed memory notes with the collaboration hub registered, including
-live authorization and the durable commit. It
-checks all nine restored digests and the replayed receipt outside the timer.
-Use a release build on a quiet host to measure the five-millisecond target.
+live authorization and the durable commit. It checks all nine restored
+digests and the replayed receipt outside the timer. For acceptance, run one
+warmup followed by 20 fresh first calls per backend, in release mode on a
+quiet host. Every measured call must take less than 5,000 microseconds.
 The command below puts PostgreSQL data and its WAL on a disposable Docker
 volume. Verify the volume is disk-backed and keep synchronous commit enabled
 when recording latency. The regular integration fixture uses a memory

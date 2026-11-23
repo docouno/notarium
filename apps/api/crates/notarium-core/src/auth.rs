@@ -718,6 +718,16 @@ impl EngineAuthContext {
     pub fn pinned_write_space(&self) -> Option<&SpaceId> {
         self.write_space.as_ref()
     }
+    /// A remote query uses the caller's active Space and cannot carry external reads.
+    pub fn authorize_remote_embedding_query(&self, space: &SpaceId) -> DomainResult<()> {
+        if self.taint.is_tainted() {
+            return Err(DomainError::CrossSpaceTainted);
+        }
+        if self.write_space.as_ref().is_some_and(|pin| pin != space) {
+            return Err(DomainError::AccessDenied);
+        }
+        Ok(())
+    }
     pub fn taint(&self) -> &BranchTaint {
         &self.taint
     }
