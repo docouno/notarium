@@ -220,6 +220,7 @@ pub(super) async fn check(store: &CanonicalStore) {
                 provenance: None,
                 interruption: None,
                 proposed_diff: None,
+                proposed_effect: None,
                 thread: thread.clone(),
                 parent: ThreadEntrySeq::ZERO,
                 kind: ChatEntryKind::Human,

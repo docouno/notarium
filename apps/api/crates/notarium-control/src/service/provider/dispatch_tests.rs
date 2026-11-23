@@ -61,9 +61,13 @@ impl ProviderEgressLease for EgressLease {
     fn secondary_projects(&self) -> &[FolderRef] {
         &self.secondary_projects
     }
-    fn mark_dispatched(&mut self) {
+    fn mark_dispatched(&mut self) -> PortFuture<'_, ()> {
         assert!(!std::mem::replace(&mut self.dispatched, true));
         self.admitted.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Ok(()) })
+    }
+    fn close(&mut self) -> PortFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
     }
     fn check(&self) -> notarium_core::DomainResult<()> {
         if self.cancellation.is_cancelled() {
@@ -162,6 +166,16 @@ impl SessionRevocationPort for TaintOnRegistration {
             }
             Ok(lease)
         })
+    }
+
+    fn register_canonical_effect(
+        &self,
+        ctx: MaintenanceContext,
+        selectors: Vec<RevocationSelector>,
+        cancellation: Cancellation,
+    ) -> PortFuture<'_, Arc<dyn CanonicalEffectRegistration>> {
+        self.inner
+            .register_canonical_effect(ctx, selectors, cancellation)
     }
 
     fn fence_provider(
@@ -995,6 +1009,7 @@ async fn gateway(pg: bool, kind: ProviderWireKind, label: &str) {
                             name: None,
                         },
                         project_hint: None,
+                        guard: EpisodeRevisionGuard::Account,
                     },
                 },
             )

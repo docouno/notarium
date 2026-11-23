@@ -527,6 +527,7 @@ async fn timed_neighborhood(engine: &ProjectionEngine, fixture: &Corpus) -> Timi
                 version: 1,
                 predicate: Predicate::All(Vec::new()),
             },
+            causal: None,
         };
         let ctx = fixture.ctx();
         let started = Instant::now();

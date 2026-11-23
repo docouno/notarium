@@ -136,6 +136,7 @@ async fn episode(
                         name: None,
                     },
                     project_hint: project,
+                    guard: EpisodeRevisionGuard::Account,
                 },
             },
         )

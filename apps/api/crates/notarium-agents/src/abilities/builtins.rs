@@ -88,6 +88,7 @@ impl Builtin {
         AbilityDescriptor {
             reference: self.reference(),
             name: self.name.to_owned(),
+            description: Some(self.instructions.to_owned()),
             kind: self.kind,
             enabled: true,
             healthy: true,

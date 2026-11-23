@@ -45,7 +45,7 @@ impl<C: ?Sized> SystemAbilityCatalog<C> {
 }
 
 /// Whether a name is reserved for a built-in package.
-pub fn is_reserved_ability_name(name: &str) -> bool {
+pub(crate) fn is_reserved_ability_name(name: &str) -> bool {
     let key = notarium_syntax::unicode::lookup_key(name);
     BUILTINS.iter().any(|builtin| builtin.name == key)
 }
@@ -286,6 +286,10 @@ impl<C: ControlCatalogPort + ?Sized> ControlCatalogPort for SystemAbilityCatalog
         self.owned.note(ctx, note)
     }
 
+    fn locate_note(&self, ctx: AccountContext, note: NoteId) -> PortFuture<'_, CatalogNote> {
+        self.owned.locate_note(ctx, note)
+    }
+
     fn folder(&self, ctx: AccountContext, folder: FolderRef) -> PortFuture<'_, CatalogFolder> {
         self.owned.folder(ctx, folder)
     }
@@ -374,8 +378,12 @@ impl ProviderEgressLease for SystemEgressLease {
         self.inner.project_folders()
     }
 
-    fn mark_dispatched(&mut self) {
-        self.inner.mark_dispatched();
+    fn mark_dispatched(&mut self) -> PortFuture<'_, ()> {
+        self.inner.mark_dispatched()
+    }
+
+    fn close(&mut self) -> PortFuture<'_, ()> {
+        self.inner.close()
     }
 
     fn check(&self) -> notarium_core::DomainResult<()> {

@@ -38,7 +38,7 @@ use super::{
     common::{
         CommandDeadline, FolderAncestryCache, MAX_FOLDER_DEPTH, StoredCommittedFolderRefV1,
         derive_command_identity_spec, extract_agent_run_from_auth, load_current_space_schema_tx,
-        load_note_head_row_tx, require_empty_preconditions, validate_mutation_identity,
+        load_note_head_row_tx, require_empty_preconditions,
     },
     folders::{folder_mutation_class, is_note_live_readable_tx, resolve_folder_component_tx},
 };
@@ -112,7 +112,7 @@ async fn resolve_with_components(
                     return Ok(None);
                 };
                 if auth
-                    .can_view_folder(&space.space, &base, &ancestry.ancestors)
+                    .authorize_folder_read(&space.space, &base, &ancestry.ancestors)
                     .is_err()
                 {
                     return Ok(None);
@@ -280,7 +280,7 @@ pub(super) async fn space_schema(
                 let facts = FolderAncestryCache::default()
                     .load_ancestry_tx(tx, &scope.space_id, base, true)
                     .await?;
-                auth.can_view_folder(&space.space, base, &facts.ancestors)?;
+                auth.authorize_folder_read(&space.space, base, &facts.ancestors)?;
                 Ok(load_current_space_schema_tx(tx, &scope.space_id)
                     .await?
                     .map_or_else(BTreeMap::new, |schema| schema.fields))
@@ -294,7 +294,7 @@ pub(super) async fn ensure(
     mut ctx: SpaceContext,
     request: Mutation<EnsureFolderPath>,
 ) -> Result<FolderRef, PortError> {
-    validate_mutation_identity(&ctx, &request.identity)?;
+    super::common::validate_confirmable_mutation_identity(&ctx, &request.identity)?;
     require_empty_preconditions(&request.preconditions)?;
     let parts = components(&request.input.path)?;
     let budget = ctx.budget.clone();
@@ -315,20 +315,23 @@ pub(super) async fn ensure(
         if approved.anchor.folder_id != base
             || approved.missing_suffix != request.input.path
             || parts.is_empty()
-            || (step.witness().tool_name() == "move_note") != approved.move_source.is_some()
+            || step.witness().effect_kind().is_move() != approved.move_source.is_some()
         {
             return Err(invalid_destination());
         }
     }
     let hash = format!("{}\0{}", base.as_str(), request.input.path);
-    let idemp =
-        derive_command_identity_spec(&request.identity, "ensure_folder_path", hash.as_bytes())
-            .with_canonical_effect(&ctx)
-            .with_confirmed_chat_step(&ctx, "ensure_folder_path")
-            .with_policy(
-                ctx.auth(),
-                ReplayPolicy::Documents(vec![ReplayResource::WriteFolder(Some(base.clone()))]),
-            );
+    let idemp = derive_command_identity_spec(
+        &ctx,
+        &request.identity,
+        "ensure_folder_path",
+        hash.as_bytes(),
+    )
+    .with_confirmed_chat_step(&ctx, "ensure_folder_path")
+    .with_policy(
+        ctx.auth(),
+        ReplayPolicy::Documents(vec![ReplayResource::WriteFolder(Some(base.clone()))]),
+    );
     let replay = deadline
         .prepare(&budget, || {
             super::notes::try_replay_completed_receipt::<StoredCommittedFolderRefV1>(

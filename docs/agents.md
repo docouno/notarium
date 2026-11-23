@@ -46,13 +46,25 @@ Confirmed creation proposals persist the title links shown during review.
 returned `session.id` on subsequent calls to keep the episode active.
 Folder listing, moves and renames resolve relative paths using the explicit
 project, then the project bound to the episode. Follow `delta.nextAction` to
-drain the bootstrap delta. Continuations bind the caller, episode and original
-Space cuts.
+drain the bootstrap delta. Continuations and `list_notes` cursors bind the
+caller, episode and original Space cuts in bounded per-instance memory with
+per-principal quotas inside the global cap. Multi-instance MCP deployments
+should use sticky session routing; when a continuation or cursor misses after
+failover or expiry, callers receive `cursor_stale` and restart from the last
+acknowledged boundary or page start.
 When acknowledgement is enabled, the next continuation or final
 `deliveryReceipt` advances only to the last delivered complete command.
+Read-scoped bearer tokens (`BearerScope::Read`) may acknowledge only their own
+named `session` episode cursor (`AckOwner::Episode`); without `session` they
+behave as `acknowledge: false` and never advance the account-wide baseline.
 Pass `acknowledge: false` to inspect without advancing the saved cursor.
-After a continuation expires, resume the episode from its last acknowledged
-boundary.
+Tools return `versionToken` for optimistic-concurrency preconditions on
+subsequent mutations (`edit_note`, `edit_ability`, `remember_*`), while
+read-only provenance records (`start_session` profile/delta, `recent_activity`,
+`get_note.links`) report the observed `revision`.
+`edit_note.view` accepts nested YAML mappings (such as `nota` `filter:` trees)
+and validates the resulting `nota` view specification against the Space schema
+before committing.
 
 `SystemAbilityCatalog` exposes the shipped `research` and `grooming` roles and
 their supporting skills. Supply the same decorated catalog to control inventory
@@ -83,10 +95,14 @@ interactive owner has permission on the target. The tool entry records the
 action and observed revision or expected absence. The supervisor emits an
 approval event without applying the action.
 
-The owner inspects and applies the proposal with current interactive authority.
-Confirmation identifies its thread, entry and digest. Control revalidates
+The owner inspects and applies the proposal with current interactive authority
+through typed `ProposedDiffPreview` and `ConfirmedDiffOutcome` responses.
+Confirmation identifies its thread, entry and digest, and enforces the typed
+canonical effect kind recorded on the tool entry. Control revalidates
 the credential independently for read and write, so reading the tainted
-branch cannot taint the write context. Canonical storage checks the exact
+branch cannot taint the write context. Under `InAppProvider`, proposal
+preparation verifies live provider consent before reading target bodies or
+titles and marks external taint prior to planning. Canonical storage checks the exact
 proposal and its model turn before applying each step. The observed revision
 or absence guards the effect and a repeated confirmation returns its receipt.
 Applying a proposal requires no provider call. Revocation covers the

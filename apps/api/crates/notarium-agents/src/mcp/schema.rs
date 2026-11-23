@@ -1,12 +1,53 @@
+use std::sync::LazyLock;
+
 use notarium_core::{
     ids::EpisodeId,
-    ports::{AgentOperation, ProviderToolDefinition, ProviderToolSchema, RecallQuery},
+    ports::{
+        AgentOperation, ConfirmedEffectKind, ProviderToolDefinition, ProviderToolSchema,
+        RecallQuery,
+    },
 };
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
 use super::invalid;
 use notarium_core::error::{PortError, ValidationReason};
+
+const MAX_YAML_VALUE_DEPTH: usize = 8;
+
+struct CachedTool {
+    input: Input,
+    descriptor: ToolDescriptor,
+    provider_definition: ProviderToolDefinition,
+}
+
+static TOOL_CACHE: LazyLock<[CachedTool; 28]> = LazyLock::new(|| {
+    std::array::from_fn(|index| {
+        let tool = ToolName::ALL[index];
+        let input = tool.build_input();
+        let mut input_schema = input.json_schema();
+        input_schema["$schema"] = json!("https://json-schema.org/draft/2020-12/schema");
+        let descriptor = ToolDescriptor {
+            name: tool.name(),
+            description: tool.description(),
+            input_schema,
+            annotations: ToolAnnotations {
+                open_world_hint: false,
+                read_only_hint: !tool.writes(),
+            },
+        };
+        let provider_definition = ProviderToolDefinition {
+            name: tool.name().into(),
+            description: tool.description().into(),
+            parameters: input.provider_schema(),
+        };
+        CachedTool {
+            input,
+            descriptor,
+            provider_definition,
+        }
+    })
+});
 
 macro_rules! tools {
     ($($variant:ident ($name:literal, $description:literal, $operation:ident, $write:expr)),+ $(,)?) => {
@@ -86,30 +127,20 @@ pub struct ToolAnnotations {
 }
 
 impl ToolName {
+    fn cached(self) -> &'static CachedTool {
+        &TOOL_CACHE[self as usize]
+    }
+
     pub(super) fn descriptor(self) -> ToolDescriptor {
-        let mut input_schema = self.input().json_schema();
-        input_schema["$schema"] = json!("https://json-schema.org/draft/2020-12/schema");
-        ToolDescriptor {
-            name: self.name(),
-            description: self.description(),
-            input_schema,
-            annotations: ToolAnnotations {
-                open_world_hint: false,
-                read_only_hint: !self.writes(),
-            },
-        }
+        self.cached().descriptor.clone()
     }
 
     pub(super) fn provider_definition(self) -> ProviderToolDefinition {
-        ProviderToolDefinition {
-            name: self.name().into(),
-            description: self.description().into(),
-            parameters: self.input().provider_schema(),
-        }
+        self.cached().provider_definition.clone()
     }
 
     pub(super) fn validate(self, args: &mut Value) -> Result<(), PortError> {
-        if self.input().validate(args) {
+        if self.cached().input.validate(args) {
             Ok(())
         } else {
             Err(invalid(ValidationReason::InvalidQuery))
@@ -123,7 +154,22 @@ impl ToolName {
         )
     }
 
-    fn input(self) -> Input {
+    pub(super) const fn confirmed_effect_kind(self) -> Option<ConfirmedEffectKind> {
+        match self {
+            Self::CreateNote | Self::CreateNotes => Some(ConfirmedEffectKind::CreateNote),
+            Self::EditNote => Some(ConfirmedEffectKind::EditNote),
+            Self::DeleteNote => Some(ConfirmedEffectKind::TrashNote),
+            Self::MoveNote => Some(ConfirmedEffectKind::MoveNote),
+            Self::RenameNote => Some(ConfirmedEffectKind::RenameNote),
+            Self::Link | Self::LinkMany => Some(ConfirmedEffectKind::Link),
+            Self::RememberAboutUser | Self::RememberAboutProject => {
+                Some(ConfirmedEffectKind::AppendMemory)
+            }
+            _ => None,
+        }
+    }
+
+    fn build_input(self) -> Input {
         use ToolName::*;
 
         let fields = match self {
@@ -314,7 +360,6 @@ enum Input {
         min: i64,
         max: i64,
     },
-    Number,
     Boolean,
     True,
     Null,
@@ -326,6 +371,9 @@ enum Input {
     Object(Vec<Field>),
     Map(Box<Input>),
     AnyOf(Vec<Input>),
+    YamlValue {
+        max_depth: usize,
+    },
 }
 
 struct Field {
@@ -334,7 +382,71 @@ struct Field {
     required: bool,
 }
 
+fn valid_yaml_value(value: &Value, depth: usize) -> bool {
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) => true,
+        Value::String(text) => {
+            text.len() <= 524_288_usize.saturating_mul(4) && text.chars().count() <= 524_288
+        }
+        Value::Array(items) => {
+            depth > 0
+                && items.len() <= 256
+                && items.iter().all(|item| valid_yaml_value(item, depth - 1))
+        }
+        Value::Object(map) => {
+            depth > 0
+                && map.len() <= 128
+                && map.values().all(|item| valid_yaml_value(item, depth - 1))
+        }
+    }
+}
+
 impl Input {
+    fn matches(&self, value: &Value) -> bool {
+        match self {
+            Self::Text { min, max } => value.as_str().is_some_and(|text| {
+                text.len() <= max.saturating_mul(4) && (*min..=*max).contains(&text.chars().count())
+            }),
+            Self::Episode => value
+                .as_str()
+                .is_some_and(|id| EpisodeId::parse(id).is_ok()),
+            Self::Choice(choices) => value.as_str().is_some_and(|text| choices.contains(&text)),
+            Self::Integer { min, max } => value
+                .as_i64()
+                .or_else(|| {
+                    value.as_f64().and_then(|n| {
+                        (n.fract() == 0.0 && n >= *min as f64 && n <= *max as f64)
+                            .then_some(n as i64)
+                    })
+                })
+                .is_some_and(|number| (*min..=*max).contains(&number)),
+            Self::Boolean => value.is_boolean(),
+            Self::True => value.as_bool() == Some(true),
+            Self::Null => value.is_null(),
+            Self::Array { item, min, max } => value.as_array().is_some_and(|items| {
+                (*min..=*max).contains(&items.len()) && items.iter().all(|v| item.matches(v))
+            }),
+            Self::Object(fields) => value.as_object().is_some_and(|object| {
+                if object.len() > fields.len()
+                    || !object
+                        .keys()
+                        .all(|name| fields.iter().any(|field| field.name == name))
+                {
+                    return false;
+                }
+                fields.iter().all(|field| match object.get(field.name) {
+                    Some(value) => field.input.matches(value),
+                    None => !field.required,
+                })
+            }),
+            Self::Map(rule) => value.as_object().is_some_and(|object| {
+                object.len() <= 128 && object.values().all(|value| rule.matches(value))
+            }),
+            Self::AnyOf(choices) => choices.iter().any(|input| input.matches(value)),
+            Self::YamlValue { max_depth } => valid_yaml_value(value, *max_depth),
+        }
+    }
+
     fn validate(&self, value: &mut Value) -> bool {
         match self {
             Self::Text { min, max } => value.as_str().is_some_and(|text| {
@@ -360,7 +472,6 @@ impl Input {
                 *value = Value::from(number);
                 true
             }
-            Self::Number => value.is_number(),
             Self::Boolean => value.is_boolean(),
             Self::True => value.as_bool() == Some(true),
             Self::Null => value.is_null(),
@@ -384,15 +495,11 @@ impl Input {
             Self::Map(rule) => value.as_object_mut().is_some_and(|object| {
                 object.len() <= 128 && object.values_mut().all(|value| rule.validate(value))
             }),
-            Self::AnyOf(choices) => choices.iter().any(|input| {
-                let mut candidate = value.clone();
-                if input.validate(&mut candidate) {
-                    *value = candidate;
-                    true
-                } else {
-                    false
-                }
-            }),
+            Self::AnyOf(choices) => choices
+                .iter()
+                .find(|input| input.matches(value))
+                .is_some_and(|input| input.validate(value)),
+            Self::YamlValue { max_depth } => valid_yaml_value(value, *max_depth),
         }
     }
 
@@ -405,7 +512,6 @@ impl Input {
             }),
             Self::Choice(values) => json!({"type":"string","enum":values}),
             Self::Integer { min, max } => json!({"type":"integer","minimum":min,"maximum":max}),
-            Self::Number => json!({"type":"number"}),
             Self::Boolean => json!({"type":"boolean"}),
             Self::True => json!({"type":"boolean","const":true}),
             Self::Null => json!({"type":"null"}),
@@ -430,6 +536,9 @@ impl Input {
             Self::AnyOf(choices) => {
                 json!({"anyOf":choices.iter().map(Self::json_schema).collect::<Vec<_>>()})
             }
+            Self::YamlValue { .. } => {
+                json!({"type":["string","number","boolean","null","array","object"]})
+            }
         }
     }
 
@@ -440,7 +549,6 @@ impl Input {
                 choices: values.iter().map(|value| (*value).to_owned()).collect(),
             },
             Self::Integer { .. } => ProviderToolSchema::Integer,
-            Self::Number => ProviderToolSchema::Number,
             Self::Boolean | Self::True => ProviderToolSchema::Boolean,
             Self::Null => ProviderToolSchema::Null,
             Self::Array { item, max, .. } => ProviderToolSchema::Array {
@@ -463,6 +571,31 @@ impl Input {
             },
             Self::AnyOf(choices) => {
                 ProviderToolSchema::AnyOf(choices.iter().map(Self::provider_schema).collect())
+            }
+            Self::YamlValue { .. } => {
+                let scalar = || {
+                    ProviderToolSchema::AnyOf(vec![
+                        ProviderToolSchema::String { choices: vec![] },
+                        ProviderToolSchema::Number,
+                        ProviderToolSchema::Boolean,
+                        ProviderToolSchema::Null,
+                    ])
+                };
+                ProviderToolSchema::AnyOf(vec![
+                    scalar(),
+                    ProviderToolSchema::Map {
+                        values: Box::new(scalar()),
+                    },
+                    ProviderToolSchema::Array {
+                        items: Box::new(ProviderToolSchema::AnyOf(vec![
+                            scalar(),
+                            ProviderToolSchema::Map {
+                                values: Box::new(scalar()),
+                            },
+                        ])),
+                        maximum: 256,
+                    },
+                ])
             }
         }
     }
@@ -562,14 +695,14 @@ fn note_input() -> Vec<Field> {
         opt("idempotencyKey", key()),
     ]
 }
-fn view_scalar() -> Input {
-    any_of(vec![content(), Input::Number, Input::Boolean, Input::Null])
-}
 fn view_patch() -> Input {
-    let item = any_of(vec![view_scalar(), map(view_scalar())]);
-    let value = any_of(vec![view_scalar(), map(view_scalar()), array(item, 0, 256)]);
     object(vec![
-        opt("set", map(value)),
+        opt(
+            "set",
+            map(Input::YamlValue {
+                max_depth: MAX_YAML_VALUE_DEPTH,
+            }),
+        ),
         opt("remove", array(key(), 0, 128)),
     ])
 }

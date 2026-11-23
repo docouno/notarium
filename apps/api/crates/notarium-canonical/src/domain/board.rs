@@ -821,7 +821,7 @@ fn verify_board_move_request(
         return Err(DomainError::validation(ValidationReason::InvalidState).into());
     }
 
-    let mut idemp = build_move_board_card_identity_spec(request)?.with_policy(
+    let mut idemp = build_move_board_card_identity_spec(ctx, request)?.with_policy(
         ctx.auth(),
         crate::writer::replay::ReplayPolicy::Documents(vec![
             crate::writer::replay::ReplayResource::Write(request.input.note.clone()),
@@ -2052,10 +2052,11 @@ pub(crate) async fn authorized_view_head(
 }
 
 fn build_move_board_card_identity_spec(
+    ctx: &SpaceContext,
     request: &Mutation<MoveBoardCard>,
 ) -> Result<crate::writer::replay::UnboundCommand, PortError> {
     let (group, _) = group_key_hex(&request.input.group)?;
-    let current = move_identity_for_group(request, &group)?;
+    let current = move_identity_for_group(ctx, request, &group)?;
     if matches!(
         request.input.group,
         GroupKey::Value(notarium_core::value::ScalarValue::Number(_))
@@ -2063,13 +2064,16 @@ fn build_move_board_card_identity_spec(
         // v6 persisted the caller's original MessagePack number representation.
         let original = crate::codec::encode_msgpack(&request.input.group)?;
         if original != group {
-            return Ok(current.with_previous_encoding(move_identity_for_group(request, &original)?));
+            return Ok(
+                current.with_previous_encoding(move_identity_for_group(ctx, request, &original)?)
+            );
         }
     }
     Ok(current)
 }
 
 fn move_identity_for_group(
+    ctx: &SpaceContext,
     request: &Mutation<MoveBoardCard>,
     group: &[u8],
 ) -> Result<crate::writer::replay::UnboundCommand, PortError> {
@@ -2103,6 +2107,7 @@ fn move_identity_for_group(
     .map_err(|err| internal_not_committed("board_move_fp_json", err.to_string()))?;
     fp.update(&prec_bytes);
     Ok(derive_command_identity_spec(
+        ctx,
         &request.identity,
         "move_board_card",
         fp.finalize().as_bytes(),

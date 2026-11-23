@@ -67,11 +67,11 @@ pub(super) fn identity(
     fingerprint.update(&[u8::from(request.mentions_agent)]);
     fingerprint.update(request.body.as_bytes());
     Ok(derive_command_identity_spec(
+        ctx,
         &request.identity,
         COMMAND,
         fingerprint.finalize().as_bytes(),
     )
-    .with_canonical_effect(ctx)
     .for_chat_leaf(ctx.auth(), &request.thread, request.expected_leaf))
 }
 
@@ -261,6 +261,7 @@ async fn submit_tx(
                 provenance: None,
                 interruption: None,
                 proposed_diff: None,
+                proposed_effect: None,
                 referenced_notes: Vec::new(),
                 tainted: false,
             },

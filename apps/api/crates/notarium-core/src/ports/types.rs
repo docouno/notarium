@@ -58,6 +58,13 @@ pub struct NoteSnapshot {
     pub diagnostics: Vec<Diagnostic>,
     pub provenance: Option<NoteProvenance>,
 }
+/// Metadata-only view of one committed note revision without hydrating its body blob.
+#[derive(Clone, Debug)]
+pub struct NoteMetadataSnapshot {
+    pub metadata: ClassifiedMetadata,
+    pub parent: Option<FolderId>,
+    pub provenance: Option<NoteProvenance>,
+}
 /// Metadata associated with the exact note revision returned by the store.
 #[derive(Clone, Debug)]
 pub struct NoteProvenance {
@@ -657,6 +664,7 @@ pub struct AppendChat {
     /// Provider interruption retained with a partial Model body.
     pub interruption: Option<super::CompletionFinish>,
     pub proposed_diff: Option<String>,
+    pub proposed_effect: Option<ConfirmedEffectKind>,
     pub referenced_notes: Vec<NoteRef>,
     pub tainted: bool,
 }
@@ -773,6 +781,40 @@ pub struct ChatProposalEntryWitness {
     pub revision: RevisionId,
     pub digest: ContentDigest,
 }
+/// Typed canonical effect family attested for a confirmed chat proposal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfirmedEffectKind {
+    CreateNote,
+    MoveNote,
+    EditNote,
+    RenameNote,
+    TrashNote,
+    Link,
+    AppendMemory,
+}
+impl ConfirmedEffectKind {
+    pub fn allows_canonical_command(self, kind: &str) -> bool {
+        matches!(
+            (self, kind),
+            (Self::CreateNote, "create_note" | "ensure_folder_path")
+                | (Self::MoveNote, "move_note" | "ensure_folder_path")
+                | (Self::EditNote, "edit_note")
+                | (Self::RenameNote, "rename_note")
+                | (Self::TrashNote, "trash_note")
+                | (Self::Link, "link")
+                | (Self::AppendMemory, "append_memory")
+        )
+    }
+
+    pub fn is_create(self) -> bool {
+        self == Self::CreateNote
+    }
+
+    pub fn is_move(self) -> bool {
+        self == Self::MoveNote
+    }
+}
 /// The chat owner attests these facts after verifying the immutable carrier
 /// pair. No request decoder can mint the witness.
 ///
@@ -788,18 +830,21 @@ pub struct ChatProposalWitness {
     thread: ChatThreadId,
     call_id: CommandKey,
     tool_name: String,
+    effect_kind: ConfirmedEffectKind,
     model: ChatProposalEntryWitness,
     tool: ChatProposalEntryWitness,
 }
 impl ChatProposalWitness {
     /// Called by the canonical owner only after verifying authority and both
     /// carrier digests, including the tool call in the Model envelope.
+    #[allow(clippy::too_many_arguments)]
     pub fn attest_canonical(
         source: HistoryScope,
         reader: &EngineAuthContext,
         thread: ChatThreadId,
         call_id: CommandKey,
         tool_name: String,
+        effect_kind: ConfirmedEffectKind,
         model: ChatProposalEntryWitness,
         tool: ChatProposalEntryWitness,
     ) -> DomainResult<Self> {
@@ -821,6 +866,7 @@ impl ChatProposalWitness {
             thread,
             call_id,
             tool_name,
+            effect_kind,
             model,
             tool,
         })
@@ -851,6 +897,9 @@ impl ChatProposalWitness {
     }
     pub fn tool_name(&self) -> &str {
         &self.tool_name
+    }
+    pub fn effect_kind(&self) -> ConfirmedEffectKind {
+        self.effect_kind
     }
     pub fn model(&self) -> &ChatProposalEntryWitness {
         &self.model
@@ -1006,6 +1055,7 @@ pub enum GraphTier {
 pub struct GraphQuery {
     pub tier: GraphTier,
     pub filter: FieldFilterAstV1,
+    pub causal: Option<CausalBasis>,
 }
 impl GraphQuery {
     pub fn validate(&self) -> DomainResult<()> {

@@ -56,12 +56,21 @@ impl NoteAdmission<'_> {
             .await?;
         let filled = admitted.len() == floor;
         let mut pos = 0;
+        let mut kept_strict = 0;
         let checked = &self.checked;
         ranked.hits.retain(|hit| {
             pos += 1;
-            pos <= ranked.strict_len
-                || matches!(&hit.key, HitKey::Note(note) if checked.get(note) == Some(&true))
+            let keep = if pos <= ranked.strict_len {
+                !matches!(&hit.key, HitKey::Note(note) if checked.get(note) == Some(&false))
+            } else {
+                matches!(&hit.key, HitKey::Note(note) if checked.get(note) == Some(&true))
+            };
+            if keep && pos <= ranked.strict_len {
+                kept_strict += 1;
+            }
+            keep
         });
+        ranked.strict_len = kept_strict;
         Ok(filled)
     }
 
@@ -166,7 +175,7 @@ impl NoteAdmission<'_> {
 pub(super) struct Hydration<'a> {
     pub admission: NoteAdmission<'a>,
     pub text: &'a str,
-    pub candidates: Vec<Candidate>,
+    pub selected: Vec<Candidate>,
     pub tokenizer: &'a (dyn TokenizerBudget + Send + Sync),
     pub top_k: usize,
     pub delivery: QueryDelivery<'a>,
@@ -178,22 +187,13 @@ impl SearchEngine {
         task: Hydration<'_>,
     ) -> Result<(Vec<SearchHit>, bool), PortError> {
         let Hydration {
-            mut admission,
+            admission,
             text,
-            candidates,
+            mut selected,
             tokenizer,
             top_k,
             delivery,
         } = task;
-        let mut selected = admission
-            .select(
-                self,
-                candidates.into_iter(),
-                |candidate| &candidate.note,
-                top_k + 1,
-                false,
-            )
-            .await?;
         let truncated = selected.len() > top_k;
         selected.truncate(top_k);
         let NoteAdmission {

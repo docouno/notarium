@@ -1,3 +1,6 @@
+#[path = "nota_spec.rs"]
+pub mod spec;
+
 use crate::{
     frontmatter::{self, FieldEdit},
     markdown::{FencedBlock, MarkdownAnalysis},
@@ -11,6 +14,7 @@ use notarium_core::{
     ids::{NoteId, ViewKey},
     patch::{CarrierEditOrigin, CarrierPatchPlan},
     ports::ViewRef,
+    query::FieldSchema,
     span::ByteSpan,
     value::YamlValue,
 };
@@ -29,13 +33,15 @@ pub struct ViewBlockPatch {
     pub options: Vec<FieldEdit>,
 }
 
-/// Edit one ready block. The stable view ID and the bytes outside the target
-/// block are preserved, including when the fence is nested in Markdown.
+/// Edit one ready block and validate the resulting specification against `schema`.
+/// The stable view ID and the bytes outside the target block are preserved,
+/// including when the fence is nested in Markdown.
 pub fn patch_view_block(
     source: &str,
     class: DocClass,
     view: &ViewRef,
     edits: &ViewBlockPatch,
+    schema: &BTreeMap<String, FieldSchema>,
 ) -> DomainResult<CarrierPatchPlan> {
     let header = frontmatter::analyze(source, class)?;
     let body = header.carrier.body;
@@ -55,14 +61,15 @@ pub fn patch_view_block(
         .iter()
         .find(|fence| fence.span == target.span)
         .ok_or_else(invalid_view)?;
-    let mut mapping_edits = edits.common.clone();
-    if mapping_edits
+    if edits
+        .common
         .iter()
         .any(|edit| matches!(edit.key(), "id" | "source" | "options"))
     {
         return Err(invalid_view());
     }
 
+    let mut nested_expected = Vec::new();
     for (key, group) in [("source", &edits.source), ("options", &edits.options)] {
         if group.is_empty() {
             continue;
@@ -74,25 +81,33 @@ pub fn patch_view_block(
         };
         apply_fields(&mut fields, group)?;
         if expected.contains_key(key) || !fields.is_empty() {
-            mapping_edits.push(FieldEdit::Set {
-                key: key.to_owned(),
-                value: YamlValue::Mapping(fields),
-            });
+            nested_expected.push((key, fields));
         }
     }
-    apply_fields(&mut expected, &mapping_edits)?;
+    apply_fields(&mut expected, &edits.common)?;
+    for (key, fields) in nested_expected {
+        expected.insert(key.to_owned(), YamlValue::Mapping(fields));
+    }
+    let expected_value = YamlValue::Mapping(expected);
+    spec::validate_view_config(&expected_value, &view.key, schema)?;
+
     let eol = if target.span.slice(source)?.contains("\r\n") {
         "\r\n"
     } else {
         "\n"
     };
-    let physical = frontmatter::edit_mapping(&fence.text, &mapping_edits, "\n")?
-        .into_iter()
-        .map(|(span, text)| {
-            let (span, replacement) = map_view_edit(fence, span, &text.replace('\n', eol))?;
-            Ok((CarrierEditOrigin::Body, span, replacement))
-        })
-        .collect::<DomainResult<Vec<_>>>()?;
+    let physical = frontmatter::edit_nested_mapping(
+        &fence.text,
+        &edits.common,
+        &[("source", &edits.source), ("options", &edits.options)],
+        "\n",
+    )?
+    .into_iter()
+    .map(|(span, text)| {
+        let (span, replacement) = map_view_edit(fence, span, &text.replace('\n', eol))?;
+        Ok((CarrierEditOrigin::Body, span, replacement))
+    })
+    .collect::<DomainResult<Vec<_>>>()?;
     let plan = patch::plan(source, body, physical)?;
     let changed = patch::apply(source, &plan)?;
     let changed_body = crate::carrier::Carrier::scan(&changed)?.body;
@@ -107,7 +122,7 @@ pub fn patch_view_block(
             .any(|(i, (before, after))| {
                 if i == index {
                     after.state != ViewState::Ready
-                        || after.config.as_ref() != Some(&YamlValue::Mapping(expected.clone()))
+                        || after.config.as_ref() != Some(&expected_value)
                 } else {
                     before.raw_yaml != after.raw_yaml || before.state != after.state
                 }
@@ -588,6 +603,37 @@ fn map_insertion(
     // stay before the inserted inline YAML, never in the middle of its value.
     if position < fence.text.len() {
         if text.contains(['\r', '\n']) {
+            if position > 0 && fence.text[..position].ends_with(['\r', '\n']) {
+                if !text.ends_with(['\r', '\n']) {
+                    return Err(DomainError::validation(ValidationReason::InvalidView));
+                }
+                for (logical, physical) in &fence.lines {
+                    if position == logical.end() {
+                        let offset = physical.end();
+                        let replacement = crate::lines::with_endings(text)
+                            .map(|line| format!("{}{line}", fence.continuation_prefix))
+                            .collect();
+                        return Ok((ByteSpan::new(offset, offset)?, replacement));
+                    }
+                }
+                return Err(DomainError::validation(ValidationReason::InvalidView));
+            }
+            if text.ends_with(['\r', '\n']) {
+                return Err(DomainError::validation(ValidationReason::InvalidView));
+            }
+            for (logical, physical) in &fence.lines {
+                if position >= logical.start() && position < logical.end() {
+                    let offset = physical.start() + position - logical.start();
+                    let mut replacement = String::new();
+                    for (index, line) in crate::lines::with_endings(text).enumerate() {
+                        if index > 0 {
+                            replacement.push_str(&fence.continuation_prefix);
+                        }
+                        replacement.push_str(line);
+                    }
+                    return Ok((ByteSpan::new(offset, offset)?, replacement));
+                }
+            }
             return Err(DomainError::validation(ValidationReason::InvalidView));
         }
         for (logical, physical) in &fence.lines {

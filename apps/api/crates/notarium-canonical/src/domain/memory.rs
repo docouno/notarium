@@ -35,7 +35,6 @@ use crate::{
 use super::{
     common::{
         CommandDeadline, NoteHeadRow, StoredCommittedNoteRevV1, derive_command_identity_spec,
-        validate_mutation_identity,
     },
     notes::{
         CarrierReplacement, analyze_and_prepare_carrier, build_carrier_replacement_intent,
@@ -82,7 +81,7 @@ pub(super) async fn append(
 ) -> Result<Committed<MemoryAppendResult>, PortError> {
     let budget = ctx.budget.clone();
     let deadline = CommandDeadline::start(&budget, "append_memory");
-    validate_mutation_identity(&ctx, &request.identity)?;
+    super::common::validate_confirmable_mutation_identity(&ctx, &request.identity)?;
     let input = &request.input;
     let target = &input.target;
     let note = &target.note.note_id;
@@ -107,9 +106,8 @@ pub(super) async fn append(
         ))?
     };
     let idempotency =
-        derive_command_identity_spec(&request.identity, "append_memory", &fingerprint)
+        derive_command_identity_spec(&ctx, &request.identity, "append_memory", &fingerprint)
             .with_preconditions(&request.preconditions, "note", note.as_str())
-            .with_canonical_effect(&ctx)
             .with_confirmed_chat_step(&ctx, "append_memory")
             .with_policy(ctx.auth(), ReplayPolicy::Memory(target.clone()));
     if let Some(replayed) = deadline

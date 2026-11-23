@@ -220,6 +220,7 @@ async fn descriptor(
         reference,
         kind: meta.kind,
         name,
+        description: meta.description,
         enabled: true,
         healthy: entrypoint_matches_manifest,
         lifecycle: meta.lifecycle,
@@ -402,7 +403,7 @@ pub(super) async fn pin_schedule(
         abilities.push(current);
     }
     guard.check()?;
-    guard.finish_snapshot();
+    guard.finish_snapshot().await;
     Ok(Box::new(SchedulePin {
         _guard: guard,
         history: space.scope,

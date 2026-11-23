@@ -17,18 +17,13 @@ use crate::{
 };
 use notarium_core::{
     DomainError,
+    auth::{ChatAudience, PrincipalKind},
     error::{CommitEffect, PortError, ValidationReason},
     ids::*,
     model::FolderRef,
     ports::{control::*, *},
 };
 use serde::{Deserialize, Serialize};
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum EpisodeGuard {
-    Account,
-    Target,
-}
 
 #[derive(Serialize, Deserialize)]
 enum Started {
@@ -273,21 +268,17 @@ impl ControlService {
         ctx: AccountContext,
         request: AccountMutation<StartEpisode>,
     ) -> Result<ControlCommit<EpisodeStartResult>, PortError> {
-        self.start_or_resume_episode_under_guard(ctx, request, EpisodeGuard::Account)
-            .await
-    }
-    pub(super) async fn start_or_resume_episode_under_guard(
-        &self,
-        ctx: AccountContext,
-        request: AccountMutation<StartEpisode>,
-        guard: EpisodeGuard,
-    ) -> Result<ControlCommit<EpisodeStartResult>, PortError> {
+        let guard = request.input.guard;
         match &request.input.selector {
             EpisodeSelector::New { name: value, .. } => name(value.as_deref())?,
             EpisodeSelector::Name(value) => name(Some(value))?,
             EpisodeSelector::Id(_) => (),
         }
-        let command = Command::new(request.identity, "start-episode", &request.input)?;
+        let command = Command::new(
+            request.identity,
+            "start-episode",
+            (&request.input.selector, &request.input.project_hint),
+        )?;
         command.require(ctx.auth().principal(), ctx.auth().principal())?;
         let budget = OperationBudget::new(ctx.budget.clone());
         let keeper = self
@@ -301,7 +292,7 @@ impl ControlService {
             if let Some((revision, saved)) = command.replay::<Started>(tx.inner_mut()).await? {
                 return Ok((revision, current, saved.value));
             }
-            if guard == EpisodeGuard::Account {
+            if guard == EpisodeRevisionGuard::Account {
                 expect_revision(&owner, command.identity.expected)?;
             }
             let now = self.clock.now_ms()?;
@@ -324,7 +315,7 @@ impl ControlService {
                 },
             };
             let started = if let Some(mut old) = existing {
-                if guard == EpisodeGuard::Target && let Some(project) = &request.input.project_hint
+                if guard == EpisodeRevisionGuard::Target && let Some(project) = &request.input.project_hint
                     && (old.project_space.as_deref() != Some(project.space_id.as_str())
                         || old.project_folder.as_deref() != Some(project.folder_id.as_str())) {
                     return Err(invalid(ValidationReason::ScopeMismatch));
@@ -389,24 +380,60 @@ impl ControlService {
     pub async fn update_episode(
         &self,
         ctx: AccountContext,
-        request: AccountMutation<EpisodeUpdate>,
+        request: AccountMutation<EpisodeMutation>,
     ) -> Result<ControlCommit<AgentEpisode>, PortError> {
-        self.update_episode_under_guard(ctx, request, EpisodeGuard::Account)
-            .await
-    }
-    pub(super) async fn update_episode_under_guard(
-        &self,
-        ctx: AccountContext,
-        request: AccountMutation<EpisodeUpdate>,
-        guard: EpisodeGuard,
-    ) -> Result<ControlCommit<AgentEpisode>, PortError> {
-        name(request.input.name.as_deref())?;
-        let command = Command::new(request.identity, "update-episode", &request.input)?;
+        let (episode_id, expected, project_hint, active_role, full_fields) = match &request.input {
+            EpisodeMutation::Full(update) => {
+                if ctx.auth().bearer_scope() == Some(BearerScope::Read) {
+                    return Err(DomainError::SpaceReadOnly.into());
+                }
+                if matches!(
+                    ctx.auth().kind(),
+                    PrincipalKind::AgentRun(_) | PrincipalKind::Keeper(_)
+                ) {
+                    return Err(DomainError::AccessDenied.into());
+                }
+                name(update.name.as_deref())?;
+                (
+                    update.episode.clone(),
+                    update.expected,
+                    update.project_hint.clone(),
+                    update.active_role.clone(),
+                    Some((update.name.clone(), update.lifecycle)),
+                )
+            }
+            EpisodeMutation::BindRole(bind) => {
+                if matches!(ctx.auth().kind(), PrincipalKind::Keeper(_))
+                    || ctx.auth().chat_audience() == Some(ChatAudience::Shared)
+                    || ctx.auth().bearer_scope() == Some(BearerScope::Read)
+                {
+                    return Err(DomainError::AccessDenied.into());
+                }
+                if ctx.auth().taint().is_tainted() {
+                    return Err(DomainError::CrossSpaceTainted.into());
+                }
+                (
+                    bind.episode.clone(),
+                    bind.expected,
+                    bind.project_hint.clone(),
+                    Some(bind.active_role.clone()),
+                    None,
+                )
+            }
+        };
+        let command = match &request.input {
+            EpisodeMutation::Full(update) => {
+                Command::new(request.identity, "update-episode", update)?
+            }
+            EpisodeMutation::BindRole(bind) => {
+                Command::new(request.identity, "update-episode", ("bind-role", bind))?
+            }
+        };
         command.require(ctx.auth().principal(), ctx.auth().principal())?;
         let budget = OperationBudget::new(ctx.budget.clone());
         let prechecked_role = {
             let current = self.current_account(&ctx, &budget).await?;
-            if let Some(project) = &request.input.project_hint {
+            if let Some(project) = &project_hint {
                 budget
                     .run(
                         self.catalog_project(&current, project),
@@ -414,7 +441,7 @@ impl ControlService {
                     )
                     .await?;
             }
-            if let Some(role) = &request.input.active_role {
+            if let Some(role) = &active_role {
                 let raw = match budget
                     .run(
                         self.raw_ability(&current, role.identity()),
@@ -440,40 +467,58 @@ impl ControlService {
         let mut tx = self.store.write(budget.clone()).await?;
         let (revision, current, saved_id) = budget.run(async {
             let auth = self.revalidate_with_keeper(tx.inner_mut(), ctx.auth(), keeper.as_ref()).await?;
+            if full_fields.is_some() {
+                if auth.bearer_scope() == Some(BearerScope::Read) {
+                    return Err(DomainError::SpaceReadOnly.into());
+                }
+                if matches!(auth.kind(), PrincipalKind::AgentRun(_) | PrincipalKind::Keeper(_)) {
+                    return Err(DomainError::AccessDenied.into());
+                }
+            } else {
+                if matches!(auth.kind(), PrincipalKind::Keeper(_))
+                    || auth.chat_audience() == Some(ChatAudience::Shared)
+                    || auth.bearer_scope() == Some(BearerScope::Read)
+                {
+                    return Err(DomainError::AccessDenied.into());
+                }
+                if auth.taint().is_tainted() {
+                    return Err(DomainError::CrossSpaceTainted.into());
+                }
+            }
             let current = AccountContext::new(auth, budget.context(ctx.budget.request.clone()));
             let owner = user(tx.inner_mut(), current.auth().principal().as_str()).await?;
             if let Some((revision, saved)) = command.replay::<EpisodeId>(tx.inner_mut()).await? {
                 return Ok((revision, current, saved.value));
             }
-            if guard == EpisodeGuard::Account {
+            if full_fields.is_some() {
                 expect_revision(&owner, command.identity.expected)?;
             }
-            let old = episode(tx.inner_mut(), current.auth().principal(), &request.input.episode).await?;
-            if old.revision as u64 != request.input.expected.get() {
+            let old = episode(tx.inner_mut(), current.auth().principal(), &episode_id).await?;
+            if old.revision as u64 != expected.get() {
                 return Err(DomainError::ControlRevisionConflict { current: ControlRevision::new(old.revision as u64)? }.into());
-            }
-            if guard == EpisodeGuard::Target && (request.input.active_role.is_none()
-                || request.input.name != old.name || request.input.lifecycle != lifecycle(&old.lifecycle)?) {
-                return Err(invalid(ValidationReason::InvalidState));
             }
             if old.lifecycle == "closed" { return Err(invalid(ValidationReason::InvalidState)); }
             if let Some(raw) = prechecked_role
-                && !self.current_role_db_only(tx.inner_mut(), &current, raw, request.input.project_hint.as_ref()).await? {
+                && !self.current_role_db_only(tx.inner_mut(), &current, raw, project_hint.as_ref()).await? {
                 return Err(DomainError::ResourceNotFound.into());
             }
-            let active_role = request.input.active_role.as_ref().map(serde_json::to_string).transpose().map_err(|_| invalid(ValidationReason::InvalidQuery))?;
-            let project_space = request.input.project_hint.as_ref().map(|p| p.space_id.to_string());
-            let project_folder = request.input.project_hint.as_ref().map(|p| p.folder_id.to_string());
-            let state = match request.input.lifecycle { EpisodeLifecycle::Active => "active", EpisodeLifecycle::Sleeping => "sleeping", EpisodeLifecycle::Closed => "closed" };
+            let (next_name, next_lifecycle) = match full_fields {
+                Some((name, lc)) => (name, lc),
+                None => (old.name.clone(), lifecycle(&old.lifecycle)?),
+            };
+            let active_role = active_role.as_ref().map(serde_json::to_string).transpose().map_err(|_| invalid(ValidationReason::InvalidQuery))?;
+            let project_space = project_hint.as_ref().map(|p| p.space_id.to_string());
+            let project_folder = project_hint.as_ref().map(|p| p.folder_id.to_string());
+            let state = match next_lifecycle { EpisodeLifecycle::Active => "active", EpisodeLifecycle::Sleeping => "sleeping", EpisodeLifecycle::Closed => "closed" };
             let now = self.clock.now_ms()?;
             let closed_at = (state == "closed").then_some(now);
             let episode_revision = next(old.revision)?;
             execute!(tx.inner_mut(),
                 "UPDATE agent_episodes SET name=$1,active_role=$2,project_space=$3,project_folder=$4,lifecycle=$5,revision=$6,last_seen_at=$7,closed_at=$8 WHERE episode_id=$9",
                 "UPDATE v1_control.agent_episodes SET name=$1,active_role=$2,project_space=$3,project_folder=$4,lifecycle=$5,revision=$6,last_seen_at=$7,closed_at=$8 WHERE episode_id=$9";
-                &request.input.name,&active_role,&project_space,&project_folder,state,episode_revision,now,closed_at,&old.episode_id)?;
+                &next_name,&active_role,&project_space,&project_folder,state,episode_revision,now,closed_at,&old.episode_id)?;
             let revision = bump_owner(tx.inner_mut(), &owner).await?;
-            let saved = SavedResult { value: request.input.episode.clone(), events: vec![] };
+            let saved = SavedResult { value: episode_id.clone(), events: vec![] };
             command.save(tx.inner_mut(), revision, &saved, now).await?;
             Ok((revision, current, saved.value))
         }, CommitEffect::NotCommitted).await?;

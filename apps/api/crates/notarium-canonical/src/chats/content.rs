@@ -6,13 +6,14 @@ use notarium_core::{
     classes::{CanonicalChatContent, ProviderCurrentContent, ProviderOrigin},
     ports::{
         CallBudget, ChatProposalEntryWitness, ChatProposalWitness, ChatProvenance,
-        CompletionFinish, ConfirmedChatStep, ProviderToolCall,
+        CompletionFinish, ConfirmedChatStep, ConfirmedEffectKind, ProviderToolCall,
     },
 };
 
 use super::*;
 use crate::{domain::common::CommandDeadline, runtime::SpaceRecord};
 use checkpoint::PageReader;
+pub(crate) use checkpoint::ProofFoldCache;
 
 const MODEL_MARKER: &str = "\u{FDD0}notarium_model_turn_v1\n";
 const PROPOSAL_MARKER: &str = "\u{FDD0}notarium_proposed_diff_v1\n";
@@ -51,6 +52,8 @@ pub(super) struct ModelTurn {
 struct ProposalTurn {
     text: String,
     envelope: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    effect_kind: Option<ConfirmedEffectKind>,
 }
 
 pub(super) fn prepare(input: &mut AppendChat) -> Result<BodyFormat, PortError> {
@@ -80,6 +83,9 @@ pub(super) fn prepare(input: &mut AppendChat) -> Result<BodyFormat, PortError> {
         return Err(DomainError::validation(ValidationReason::InvalidState).into());
     }
     if let Some(envelope) = input.proposed_diff.take() {
+        let Some(effect_kind) = input.proposed_effect.take() else {
+            return Err(DomainError::validation(ValidationReason::InvalidState).into());
+        };
         if !matches!(input.kind, ChatEntryKind::Tool { .. })
             || !input.tainted
             || input.provenance.is_none()
@@ -94,9 +100,13 @@ pub(super) fn prepare(input: &mut AppendChat) -> Result<BodyFormat, PortError> {
         let encoded = serde_json::to_string(&ProposalTurn {
             text: text.clone(),
             envelope,
+            effect_kind: Some(effect_kind),
         })
         .map_err(|error| internal_not_committed("encode_chat_proposal", error.to_string()))?;
         return encode(input, PROPOSAL_MARKER, encoded, BodyFormat::Proposal);
+    }
+    if input.proposed_effect.is_some() {
+        return Err(DomainError::validation(ValidationReason::InvalidState).into());
     }
     if let ChatInputBody::Text(text) = &input.body {
         if input.kind == ChatEntryKind::Model
@@ -192,19 +202,19 @@ pub(super) fn authorize_recorded_sources(
 }
 
 #[derive(sqlx::FromRow)]
-struct PayloadRow {
-    entry_seq: i64,
-    parent_seq: Option<i64>,
-    revision_id: String,
-    kind: String,
-    author_id: String,
-    agent_run_id: Option<String>,
-    tool_call_id: Option<String>,
-    inline_text: Option<String>,
-    payload_blake3: Option<Vec<u8>>,
-    ext_space_tainted: i32,
-    body_format: i32,
-    provenance_json: Option<String>,
+pub(super) struct PayloadRow {
+    pub(super) entry_seq: i64,
+    pub(super) parent_seq: Option<i64>,
+    pub(super) revision_id: String,
+    pub(super) kind: String,
+    pub(super) author_id: String,
+    pub(super) agent_run_id: Option<String>,
+    pub(super) tool_call_id: Option<String>,
+    pub(super) inline_text: Option<String>,
+    pub(super) payload_blake3: Option<Vec<u8>>,
+    pub(super) ext_space_tainted: i32,
+    pub(super) body_format: i32,
+    pub(super) provenance_json: Option<String>,
 }
 
 impl PayloadRow {
@@ -230,8 +240,8 @@ impl PayloadRow {
         ))
     }
 
-    fn provenance(&self) -> Result<Option<ChatProvenance>, PortError> {
-        decode_proof(self.provenance_json.as_deref())
+    fn provenance(&self, redaction_epoch: i64) -> Result<Option<ChatProvenance>, PortError> {
+        decode_proof(self.provenance_json.as_deref(), redaction_epoch)
     }
 
     fn group_author(
@@ -263,13 +273,21 @@ struct StoredProvenance {
     compacts_through: Option<ThreadEntrySeq>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     folded: Option<ChatProvenance>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    folded_epoch: Option<i64>,
 }
 
-fn decode_proof(raw: Option<&str>) -> Result<Option<ChatProvenance>, PortError> {
+pub(super) fn decode_proof(
+    raw: Option<&str>,
+    thread_redaction_epoch: i64,
+) -> Result<Option<ChatProvenance>, PortError> {
     raw.map(|raw| {
         let value: StoredProvenance = serde_json::from_str(raw)
             .map_err(|e| internal_not_committed("decode_chat_proof", e.to_string()))?;
-        Ok(value.folded.unwrap_or(ChatProvenance {
+        let folded = value
+            .folded
+            .filter(|_| value.folded_epoch.unwrap_or(0) == thread_redaction_epoch);
+        Ok(folded.unwrap_or(ChatProvenance {
             origins: value.origins,
             projects: value.projects,
             compacts_through: value.compacts_through,
@@ -328,8 +346,17 @@ pub(super) async fn prepare_proof(
     #[cfg(feature = "test-support")]
     super::preparation_test::pause().await;
     let reader = PageReader::PrepareAppend(store, &ctx.budget, deadline);
-    let Some(folded) =
-        checkpoint::fold(reader, ctx.scope(), &thread, parent, tainted, proof).await?
+    let Some(folded) = checkpoint::fold(
+        reader,
+        ctx.scope(),
+        &thread,
+        None,
+        parent,
+        tainted,
+        proof,
+        None,
+    )
+    .await?
     else {
         return Ok(direct_json);
     };
@@ -339,6 +366,7 @@ pub(super) async fn prepare_proof(
         projects: proof.projects,
         compacts_through: proof.compacts_through,
         folded: Some(folded),
+        folded_epoch: Some(thread.redaction_epoch),
     })
     .map(Some)
     .map_err(|e| internal_not_committed("encode_folded_chat_proof", e.to_string()))
@@ -351,58 +379,25 @@ async fn fold_stored_proof(
     scope: &HistoryScope,
     thread: &ThreadHeadRow,
     row: &mut PayloadRow,
+    memo: Option<&mut ProofFoldCache>,
 ) -> Result<(), PortError> {
     if let Some(parent) = row.parent_seq
-        && let Some(proof) = row.provenance()?
+        && let Some(proof) = row.provenance(thread.redaction_epoch)?
         && let Some(folded) = checkpoint::fold(
             reader,
             scope,
             thread,
+            Some(row.seq()?),
             queue::seq_from_db(parent)?,
             row.ext_space_tainted != 0,
             &proof,
+            memo,
         )
         .await?
     {
         row.provenance_json = proof_json(Some(&folded))?;
     }
     Ok(())
-}
-
-/// A provenance edge always points to an earlier entry in the same thread,
-/// including edges to a sibling branch. Keep the direct proof so independent
-/// entries can still be admitted after redaction.
-pub(super) async fn invalidate_folded_proofs(
-    tx: &mut BackendConn<'_>,
-    space: &SpaceId,
-    thread: &ChatThreadId,
-    redacted: i64,
-) -> Result<(), PortError> {
-    match tx {
-        BackendConn::Sqlite(conn) => sqlx::query(
-            "UPDATE chat_entries SET provenance_json=json_remove(provenance_json,'$.folded')
-             WHERE space_id=$1 AND thread_id=$2 AND entry_seq>$3
-             AND json_type(provenance_json,'$.folded') IS NOT NULL",
-        )
-        .bind(space.as_str())
-        .bind(thread.as_str())
-        .bind(redacted)
-        .execute(&mut **conn)
-        .await
-        .map(|_| ()),
-        BackendConn::Postgres(conn) => sqlx::query(
-            "UPDATE chat_entries SET provenance_json=(provenance_json::jsonb - 'folded')::text
-             WHERE space_id=$1 AND thread_id=$2 AND entry_seq>$3
-             AND provenance_json::jsonb ? 'folded'",
-        )
-        .bind(space.as_str())
-        .bind(thread.as_str())
-        .bind(redacted)
-        .execute(&mut **conn)
-        .await
-        .map(|_| ()),
-    }
-    .map_err(|error| internal_not_committed("invalidate_chat_proof", error.to_string()))
 }
 
 pub(super) async fn checkpoint_boundary(
@@ -439,7 +434,9 @@ pub(super) async fn checkpoint_boundary(
                     head.project_folder.as_ref(),
                     row.ext_space_tainted != 0,
                 )?;
-                Ok(row.provenance()?.and_then(|proof| proof.compacts_through))
+                Ok(row
+                    .provenance(head.redaction_epoch)?
+                    .and_then(|proof| proof.compacts_through))
             })
         })
         .await
@@ -461,7 +458,7 @@ fn transcript(
         row.digest()?,
         thread.project_folder.clone(),
     );
-    content = content.with_provenance(row.provenance()?);
+    content = content.with_provenance(row.provenance(thread.redaction_epoch)?);
     if let Some(author) = row.group_author(auth, thread)? {
         content = content.with_group_author(author);
     }
@@ -518,19 +515,25 @@ impl ChatSource {
         auth: &EngineAuthContext,
         budget: &CallBudget,
         deadline: CommandDeadline,
+        memo: &mut ProofFoldCache,
     ) -> Result<ProviderCurrentContent, PortError> {
-        self.current(PageReader::Snapshots(store, budget, deadline), auth)
-            .await
+        self.current(
+            PageReader::Snapshots(store, budget, deadline),
+            auth,
+            Some(memo),
+        )
+        .await
     }
 
     async fn current(
         mut self,
         reader: PageReader<'_, '_>,
         auth: &EngineAuthContext,
+        memo: Option<&mut ProofFoldCache>,
     ) -> Result<ProviderCurrentContent, PortError> {
         let Self { space, thread, row } = &mut self;
-        fold_stored_proof(reader, &space.scope, thread, row).await?;
-        let provenance = row.provenance()?;
+        fold_stored_proof(reader, &space.scope, thread, row, memo).await?;
+        let provenance = row.provenance(thread.redaction_epoch)?;
         if row.kind != "human" && provenance.is_none() {
             return Err(DomainError::validation(ValidationReason::ClassEgressForbidden).into());
         }
@@ -554,9 +557,12 @@ pub(crate) async fn load_current_chat_for_egress_tx(
     space: &SpaceRecord,
     thread_id: &ChatThreadId,
     entry: ThreadEntrySeq,
+    memo: &mut ProofFoldCache,
 ) -> Result<ProviderCurrentContent, PortError> {
     let source = chat_source_tx(tx, auth, space, thread_id, entry).await?;
-    source.current(PageReader::Pinned(tx), auth).await
+    source
+        .current(PageReader::Pinned(tx), auth, Some(memo))
+        .await
 }
 
 pub(super) async fn hydrate_body(
@@ -667,16 +673,41 @@ pub(super) async fn read_chat_contents(
             })
         })
         .await?;
+    hydrate_payloads(
+        store,
+        ctx.auth(),
+        &space,
+        &thread,
+        payloads,
+        &budget,
+        started,
+        deadline,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn hydrate_payloads(
+    store: &CanonicalStore,
+    auth: &EngineAuthContext,
+    space: &SpaceRecord,
+    thread: &ThreadHeadRow,
+    payloads: Vec<PayloadRow>,
+    budget: &CallBudget,
+    started: tokio::time::Instant,
+    deadline: CommandDeadline,
+) -> Result<Vec<HydratedChatEntry>, PortError> {
     let mut results = Vec::with_capacity(payloads.len());
+    let mut memo = ProofFoldCache::new();
     for mut row in payloads {
-        let reader = PageReader::Snapshots(store, &budget, deadline);
-        fold_stored_proof(reader, &space.scope, &thread, &mut row).await?;
+        let reader = PageReader::Snapshots(store, budget, deadline);
+        fold_stored_proof(reader, &space.scope, thread, &mut row, Some(&mut memo)).await?;
         let body = hydrate_body(
             store,
             &space.scope,
             row.inline_text.clone(),
             row.payload_blake3.clone(),
-            &budget,
+            budget,
             started,
         )
         .await?;
@@ -685,7 +716,7 @@ pub(super) async fn read_chat_contents(
             tool_calls,
             interruption,
         } = decode_turn(row.body_format, &row.kind, body)?;
-        let content = transcript(ctx.auth(), &space.space, &thread, &row, text)?;
+        let content = transcript(auth, &space.space, thread, &row, text)?;
         results.push(HydratedChatEntry {
             seq: row.seq()?,
             content,
@@ -693,7 +724,7 @@ pub(super) async fn read_chat_contents(
             tool_calls,
         });
     }
-    deadline.remaining(&budget)?;
+    deadline.remaining(budget)?;
     Ok(results)
 }
 
@@ -799,7 +830,14 @@ pub(super) async fn read_chat_proposal(
         started,
     )
     .await?;
-    let ProposalTurn { text, envelope } = decode_proposal(&raw_tool)?;
+    let ProposalTurn {
+        text,
+        envelope,
+        effect_kind,
+    } = decode_proposal(&raw_tool)?;
+    let effect_kind = effect_kind
+        .or_else(|| legacy_effect_kind(&tool_name))
+        .ok_or_else(|| DomainError::validation(ValidationReason::InvalidAuthority))?;
     let content = transcript(ctx.auth(), &space.space, &thread, &tool, text)?;
     let witness = ChatProposalWitness::attest_canonical(
         space.scope.clone(),
@@ -807,12 +845,26 @@ pub(super) async fn read_chat_proposal(
         thread.thread_id,
         call_id,
         tool_name,
+        effect_kind,
         proposal_entry(&model)?,
         proposal_entry(&tool)?,
     )?;
     Ok(CanonicalChatProposal::from_canonical(
         content, envelope, witness,
     ))
+}
+
+fn legacy_effect_kind(tool_name: &str) -> Option<ConfirmedEffectKind> {
+    match tool_name {
+        "create_note" | "create_notes" => Some(ConfirmedEffectKind::CreateNote),
+        "move_note" => Some(ConfirmedEffectKind::MoveNote),
+        "edit_note" => Some(ConfirmedEffectKind::EditNote),
+        "rename_note" => Some(ConfirmedEffectKind::RenameNote),
+        "delete_note" => Some(ConfirmedEffectKind::TrashNote),
+        "link" | "link_many" => Some(ConfirmedEffectKind::Link),
+        "remember_about_user" | "remember_about_project" => Some(ConfirmedEffectKind::AppendMemory),
+        _ => None,
+    }
 }
 
 fn proposal_entry(row: &PayloadRow) -> Result<ChatProposalEntryWitness, PortError> {
@@ -836,21 +888,7 @@ pub(crate) async fn verify_confirmed_chat_step_tx(
     let witness = step.witness();
     target.check(&step.identity().scope)?;
     witness.authorize_writer(auth)?;
-    if !matches!(
-        (witness.tool_name(), kind),
-        (
-            "create_note" | "create_notes",
-            "create_note" | "ensure_folder_path"
-        ) | ("move_note", "move_note" | "ensure_folder_path")
-            | ("edit_note", "edit_note")
-            | ("rename_note", "rename_note")
-            | ("delete_note", "trash_note")
-            | ("link" | "link_many", "link")
-            | (
-                "remember_about_user" | "remember_about_project",
-                "append_memory"
-            )
-    ) {
+    if !witness.effect_kind().allows_canonical_command(kind) {
         return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
     }
 

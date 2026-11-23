@@ -82,6 +82,7 @@ fn add(
             reference: reference.clone(),
             kind: AbilityKind::Role,
             name: name.into(),
+            description: None,
             enabled: true,
             healthy: true,
             lifecycle: Lifecycle::Active,
@@ -299,7 +300,7 @@ async fn resolution_and_preferences(
         input: AbilityBindingUpdate {
             ability: scoped.clone(),
             enabled: false,
-            expected: ControlRevision::ZERO,
+            expected: AbilityOverlayGuard::Account(ControlRevision::ZERO),
             projects: AbilityProjects::All,
         },
     };
@@ -307,7 +308,7 @@ async fn resolution_and_preferences(
         .update_ability_binding(ctx.clone(), disabled.clone())
         .await
         .unwrap();
-    assert!(!value.value.enabled);
+    assert!(!value.value.descriptor.unwrap().enabled);
     assert_eq!(
         service
             .update_ability_binding(ctx.clone(), disabled)
@@ -342,7 +343,7 @@ async fn resolution_and_preferences(
                     input: AbilityBindingUpdate {
                         ability: scoped.clone(),
                         enabled: true,
-                        expected: ControlRevision::new(1).unwrap(),
+                        expected: AbilityOverlayGuard::Account(ControlRevision::new(1).unwrap()),
                         projects: AbilityProjects::All
                     }
                 }
@@ -358,7 +359,7 @@ async fn resolution_and_preferences(
                 input: AbilityBindingUpdate {
                     ability: scoped.clone(),
                     enabled: true,
-                    expected: ControlRevision::new(1).unwrap(),
+                    expected: AbilityOverlayGuard::Account(ControlRevision::new(1).unwrap()),
                     projects: AbilityProjects::Selected(vec![project.clone()]),
                 },
             },
@@ -393,6 +394,7 @@ async fn resolution_and_preferences(
                         name: None,
                     },
                     project_hint: Some(project.clone()),
+                    guard: EpisodeRevisionGuard::Account,
                 },
             },
         )
@@ -407,14 +409,14 @@ async fn resolution_and_preferences(
             ctx.clone(),
             AccountMutation {
                 identity: identity(service, ctx, 151).await,
-                input: EpisodeUpdate {
+                input: EpisodeMutation::Full(EpisodeUpdate {
                     episode: selected_episode.id,
                     expected: selected_episode.revision,
                     name: None,
                     active_role: Some(scoped.clone()),
                     project_hint: Some(project.clone()),
                     lifecycle: EpisodeLifecycle::Active,
-                },
+                }),
             },
         )
         .await
@@ -460,9 +462,12 @@ async fn resolution_and_preferences(
             plain.clone(),
             AccountMutation {
                 identity: identity(service, &plain, 13).await,
-                input: AbilityPreferenceUpdate {
-                    ability: system.clone(),
-                    enabled: false,
+                input: AbilityPreferenceChange {
+                    preference: AbilityPreferenceUpdate {
+                        ability: system.clone(),
+                        enabled: false,
+                    },
+                    expected: AbilityPreferenceGuard::Account,
                 },
             },
         )
@@ -486,9 +491,12 @@ async fn resolution_and_preferences(
             plain.clone(),
             AccountMutation {
                 identity: identity(service, &plain, 14).await,
-                input: AbilityPreferenceUpdate {
-                    ability: system.clone(),
-                    enabled: true,
+                input: AbilityPreferenceChange {
+                    preference: AbilityPreferenceUpdate {
+                        ability: system.clone(),
+                        enabled: true,
+                    },
+                    expected: AbilityPreferenceGuard::Account,
                 },
             },
         )
@@ -525,11 +533,11 @@ async fn resolution_and_preferences(
             ctx.clone(),
             AccountMutation {
                 identity: identity(service, ctx, 20).await,
-                input: AbilityTrailUpdate {
+                input: AbilityTrailMutation::Set(AbilityTrailUpdate {
                     source: personal.clone(),
                     expected_destination: None,
                     destination: Some(destination.clone()),
-                },
+                }),
             },
         )
         .await
@@ -556,11 +564,11 @@ async fn resolution_and_preferences(
                 ctx.clone(),
                 AccountMutation {
                     identity: identity(service, ctx, 21).await,
-                    input: AbilityTrailUpdate {
+                    input: AbilityTrailMutation::Set(AbilityTrailUpdate {
                         source: destination.clone(),
                         expected_destination: None,
                         destination: Some(personal.clone())
-                    }
+                    })
                 }
             )
             .await
@@ -571,11 +579,11 @@ async fn resolution_and_preferences(
             ctx.clone(),
             AccountMutation {
                 identity: identity(service, ctx, 22).await,
-                input: AbilityTrailUpdate {
+                input: AbilityTrailMutation::Set(AbilityTrailUpdate {
                     source: personal.clone(),
                     expected_destination: Some(destination),
                     destination: None,
-                },
+                }),
             },
         )
         .await
@@ -944,7 +952,7 @@ async fn bearer_authoring(pg: bool) {
             input: AbilityBindingUpdate {
                 ability: package.clone(),
                 enabled: false,
-                expected: inspection.binding_revision,
+                expected: AbilityOverlayGuard::Account(inspection.binding_revision),
                 projects: AbilityProjects::All,
             },
         };
@@ -952,7 +960,7 @@ async fn bearer_authoring(pg: bool) {
             .update_ability_binding(caller.clone(), request.clone())
             .await;
         if opt_in {
-            assert!(!result.unwrap().value.enabled);
+            assert!(!result.unwrap().value.descriptor.unwrap().enabled);
             assert!(
                 !service
                     .inspect_ability(caller.clone(), package.identity())
@@ -1089,7 +1097,7 @@ async fn selected_project_bindings_and_paged_bulk_discovery(pg: bool) {
                 input: AbilityBindingUpdate {
                     ability: selected_role.clone(),
                     enabled: true,
-                    expected: ControlRevision::ZERO,
+                    expected: AbilityOverlayGuard::Account(ControlRevision::ZERO),
                     projects: AbilityProjects::Selected(vec![project_ok.clone()]),
                 },
             },
@@ -1226,6 +1234,7 @@ async fn selected_project_bindings_and_paged_bulk_discovery(pg: bool) {
                 reference: reference.clone(),
                 kind: AbilityKind::Skill,
                 name: "dup-skill".into(),
+                description: None,
                 enabled: true,
                 healthy: true,
                 lifecycle: Lifecycle::Active,
@@ -1394,7 +1403,7 @@ async fn concurrent_authored_preferences_and_promotion_merge_cas(pg: bool) {
     let mut editor_pref_rev: Option<ControlRevision> = None;
     for round in 0..8_u8 {
         let enabled = round % 2 == 0;
-        let owner_call = service.compare_authored_ability_preference(
+        let owner_call = service.set_ability_preference(
             owner_ctx.clone(),
             AccountMutation {
                 identity: command(
@@ -1408,11 +1417,11 @@ async fn concurrent_authored_preferences_and_promotion_merge_cas(pg: bool) {
                         ability: shared_ability.clone(),
                         enabled,
                     },
-                    expected: owner_pref_rev,
+                    expected: AbilityPreferenceGuard::Authored(owner_pref_rev),
                 },
             },
         );
-        let editor_call = service.compare_authored_ability_preference(
+        let editor_call = service.set_ability_preference(
             editor_ctx.clone(),
             AccountMutation {
                 identity: command(
@@ -1426,7 +1435,7 @@ async fn concurrent_authored_preferences_and_promotion_merge_cas(pg: bool) {
                         ability: shared_ability.clone(),
                         enabled: !enabled,
                     },
-                    expected: editor_pref_rev,
+                    expected: AbilityPreferenceGuard::Authored(editor_pref_rev),
                 },
             },
         );
@@ -1505,6 +1514,7 @@ async fn concurrent_authored_preferences_and_promotion_merge_cas(pg: bool) {
             reference: src_ref.clone(),
             kind: AbilityKind::Role,
             name: "merge-guide".into(),
+            description: None,
             enabled: true,
             healthy: true,
             lifecycle: Lifecycle::Active,
@@ -1512,7 +1522,7 @@ async fn concurrent_authored_preferences_and_promotion_merge_cas(pg: bool) {
             auxiliary_files: vec![],
         });
     service
-        .compare_authored_ability_preference(
+        .set_ability_preference(
             owner_ctx.clone(),
             AccountMutation {
                 identity: command(
@@ -1526,7 +1536,7 @@ async fn concurrent_authored_preferences_and_promotion_merge_cas(pg: bool) {
                         ability: src_ref.clone(),
                         enabled: false,
                     },
-                    expected: None,
+                    expected: AbilityPreferenceGuard::Authored(None),
                 },
             },
         )
@@ -1542,6 +1552,7 @@ async fn concurrent_authored_preferences_and_promotion_merge_cas(pg: bool) {
             reference: dst_ref.clone(),
             kind: AbilityKind::Role,
             name: "merge-guide".into(),
+            description: None,
             enabled: true,
             healthy: true,
             lifecycle: Lifecycle::Active,
@@ -1555,9 +1566,12 @@ async fn concurrent_authored_preferences_and_promotion_merge_cas(pg: bool) {
             owner_ctx.clone(),
             AccountMutation {
                 identity: identity(&service, &owner_ctx, 51).await,
-                input: AbilityPreferenceUpdate {
-                    ability: dst_ref.clone(),
-                    enabled: true,
+                input: AbilityPreferenceChange {
+                    preference: AbilityPreferenceUpdate {
+                        ability: dst_ref.clone(),
+                        enabled: true,
+                    },
+                    expected: AbilityPreferenceGuard::Account,
                 },
             },
         )
@@ -1581,6 +1595,7 @@ async fn concurrent_authored_preferences_and_promotion_merge_cas(pg: bool) {
                 },
                 kind: AbilityKind::Role,
                 name: "merge-guide".into(),
+                description: None,
                 enabled: true,
                 healthy: true,
                 lifecycle: Lifecycle::Active,
@@ -1592,7 +1607,7 @@ async fn concurrent_authored_preferences_and_promotion_merge_cas(pg: bool) {
     // Promote via the peer editor so the owner's account revision stays behind
     // the merged destination preference revision.
     let _promoted = service
-        .adopt_authored_ability_promotion(
+        .set_ability_trail(
             editor_ctx.clone(),
             AccountMutation {
                 identity: command(
@@ -1601,10 +1616,10 @@ async fn concurrent_authored_preferences_and_promotion_merge_cas(pg: bool) {
                     52,
                     ControlRevision::ZERO,
                 ),
-                input: AdoptAbilityPromotion {
+                input: AbilityTrailMutation::AdoptPromotion(AdoptAbilityPromotion {
                     source: src_ref.clone(),
                     destination: dst_ref.clone(),
-                },
+                }),
             },
         )
         .await
@@ -1621,7 +1636,7 @@ async fn concurrent_authored_preferences_and_promotion_merge_cas(pg: bool) {
         "merged destination preference revision must strictly advance past {stale_dst_rev:?}: {merged_rev:?}",
     );
     let conflict = service
-        .compare_authored_ability_preference(
+        .set_ability_preference(
             owner_ctx.clone(),
             AccountMutation {
                 identity: command(
@@ -1635,7 +1650,7 @@ async fn concurrent_authored_preferences_and_promotion_merge_cas(pg: bool) {
                         ability: dst_ref.clone(),
                         enabled: true,
                     },
-                    expected: Some(stale_dst_rev),
+                    expected: AbilityPreferenceGuard::Authored(Some(stale_dst_rev)),
                 },
             },
         )
@@ -1650,7 +1665,7 @@ async fn concurrent_authored_preferences_and_promotion_merge_cas(pg: bool) {
     );
     // Two concurrent CAS writes by the owner against `merged_rev`: exactly one
     // succeeds with a strictly higher revision and the second hits conflict.
-    let cas_a = service.compare_authored_ability_preference(
+    let cas_a = service.set_ability_preference(
         owner_ctx.clone(),
         AccountMutation {
             identity: command(
@@ -1664,11 +1679,11 @@ async fn concurrent_authored_preferences_and_promotion_merge_cas(pg: bool) {
                     ability: dst_ref.clone(),
                     enabled: true,
                 },
-                expected: Some(merged_rev),
+                expected: AbilityPreferenceGuard::Authored(Some(merged_rev)),
             },
         },
     );
-    let cas_b = service.compare_authored_ability_preference(
+    let cas_b = service.set_ability_preference(
         owner_ctx.clone(),
         AccountMutation {
             identity: command(
@@ -1682,7 +1697,7 @@ async fn concurrent_authored_preferences_and_promotion_merge_cas(pg: bool) {
                     ability: dst_ref,
                     enabled: false,
                 },
-                expected: Some(merged_rev),
+                expected: AbilityPreferenceGuard::Authored(Some(merged_rev)),
             },
         },
     );
@@ -1711,7 +1726,7 @@ async fn concurrent_authored_preferences_and_promotion_merge_cas(pg: bool) {
         .revision;
     assert!(owner_account_rev >= winner.revision);
 
-    // Exact replay of `compare_authored_ability_binding` succeeds even after a
+    // Exact replay of authored `update_ability_binding` succeeds even after a
     // selected project is removed from the catalog.
     let bind_req = AccountMutation {
         identity: command(
@@ -1720,18 +1735,18 @@ async fn concurrent_authored_preferences_and_promotion_merge_cas(pg: bool) {
             54,
             ControlRevision::ZERO,
         ),
-        input: AbilityBindingChange {
+        input: AbilityBindingUpdate {
             ability: shared_ability.clone(),
             enabled: true,
             projects: AbilityProjects::Selected(vec![project.clone()]),
-            expected: None,
+            expected: AbilityOverlayGuard::Authored(None),
         },
     };
     let bind_committed = service
-        .compare_authored_ability_binding(owner_ctx.clone(), bind_req.clone())
+        .update_ability_binding(owner_ctx.clone(), bind_req.clone())
         .await
         .unwrap();
-    assert_eq!(bind_committed.value, shared_ability);
+    assert_eq!(bind_committed.value.reference, shared_ability);
     fixture
         .catalog
         .project_entries
@@ -1739,11 +1754,11 @@ async fn concurrent_authored_preferences_and_promotion_merge_cas(pg: bool) {
         .unwrap()
         .remove(&(project.space_id.clone(), project.folder_id.clone()));
     let bind_replayed = service
-        .compare_authored_ability_binding(owner_ctx.clone(), bind_req)
+        .update_ability_binding(owner_ctx.clone(), bind_req)
         .await
         .unwrap();
     assert_eq!(bind_replayed.revision, bind_committed.revision);
-    assert_eq!(bind_replayed.value, shared_ability);
+    assert_eq!(bind_replayed.value.reference, shared_ability);
 
     drop(service);
     fixture.close().await;

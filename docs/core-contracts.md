@@ -449,7 +449,9 @@ may select a cluster, intersecting its members with the existing project, tag
 and field filters. An unknown or unauthorized cluster returns
 `ResourceNotFound`, without widening the query to the whole Space.
 `GraphResult.hidden_count` counts active non-encrypted notes excluded by filters
-or node caps, never unauthorized notes. Clustering, identity matching and
+or node caps, never unauthorized notes. `GraphQuery` also accepts an optional
+`causal` basis so callers such as `get_note` can wait briefly for recent
+canonical edits before reading graph neighbors. Clustering, identity matching and
 membership lookup remain projection owner responsibilities. The existing
 500/2000 node caps and 1–2 hop bound remain. `Personal` chat thread reads,
 backlinks, and event delivery share one centralized authorization rule enforcing

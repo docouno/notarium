@@ -15,6 +15,13 @@ use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
 
 pub struct NoEgress;
 impl ProviderEgressCatalogPort for NoEgress {
+    fn chat_dependencies(
+        &self,
+        _: AccountContext,
+        _: Vec<notarium_core::classes::ProviderOrigin>,
+    ) -> PortFuture<'_, ProviderEgressDependencies> {
+        Box::pin(async { Err(DomainError::AccessDenied.into()) })
+    }
     fn acquire_egress(
         &self,
         _: AccountContext,

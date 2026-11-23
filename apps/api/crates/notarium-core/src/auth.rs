@@ -402,7 +402,9 @@ impl EngineAuthContext {
         derived.write_space = Some(thread_space);
         derived.chat_audience = Some(effective_audience);
         if self.kind == PrincipalKind::DirectHuman {
-            derived.taint = BranchTaint::default();
+            let taint = BranchTaint::default();
+            taint.merge(&self.taint);
+            derived.taint = taint;
         }
         Ok(derived)
     }
@@ -514,8 +516,11 @@ impl EngineAuthContext {
             return Err(DomainError::SpaceReadOnly);
         }
         grant.project_root = Some(project.folder_id.clone());
+        let spaces = BTreeMap::from([(project.space_id.clone(), grant)]);
+        let ability_write = self.ability_write && Self::has_writable_space(&spaces);
         Ok(Self {
-            spaces: BTreeMap::from([(project.space_id.clone(), grant)]),
+            spaces,
+            ability_write,
             ..self.clone()
         })
     }

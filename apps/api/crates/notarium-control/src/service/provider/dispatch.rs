@@ -98,7 +98,12 @@ impl PortStream<CompletionEvent> for CompletionStream {
             if let Some(event) = self.receiver.recv().await {
                 return Ok(Some(event));
             }
-            if let Some(error) = self.error.lock().expect("provider stream result").take() {
+            if let Some(error) = self
+                .error
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+            {
                 return Err(error);
             }
             Ok(None)
@@ -149,7 +154,9 @@ impl ProviderService {
             }
             .await;
             if let Err(error) = result {
-                *terminal.lock().expect("provider stream result") = Some(error);
+                *terminal
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error);
             }
         });
         Ok(Box::new(CompletionStream {
@@ -225,6 +232,9 @@ impl ProviderService {
         {
             result = Err(error);
         }
+        if let Some(lease) = &mut progress.leases.canonical {
+            let _ = lease.close().await;
+        }
         drop(progress.leases);
         if progress.reserved {
             let outcome = match &result {
@@ -244,14 +254,31 @@ impl ProviderService {
                 Ok(_) if progress.mismatch => Some(ProviderErrorCode::BudgetMismatch),
                 _ => None,
             };
-            self.finalize(
-                &progress.call,
-                Some(&self.dispatcher),
-                progress.usage,
-                outcome,
-                diagnostic,
-            )
-            .await?;
+            if let Err(finalize_err) = self
+                .finalize(
+                    &progress.call,
+                    Some(&self.dispatcher),
+                    progress.usage,
+                    outcome,
+                    diagnostic,
+                )
+                .await
+                && result.is_ok()
+            {
+                result = Err(
+                    if progress.submitted
+                        && matches!(
+                            &finalize_err,
+                            PortError::Unavailable(failure)
+                                if failure.effect() == CommitEffect::NotCommitted
+                        )
+                    {
+                        unavailable("provider settlement", CommitEffect::Unknown)
+                    } else {
+                        finalize_err
+                    },
+                );
+            }
         }
         result
     }
@@ -411,9 +438,15 @@ impl ProviderService {
         } else {
             Vec::new()
         };
-        let keeper = self
-            .control
-            .precheck_keeper_catalog(job.ctx.auth(), &runtime.budget, &job.ctx.budget.request)
+        let keeper = runtime
+            .run(
+                self.control.precheck_keeper_catalog(
+                    job.ctx.auth(),
+                    &runtime.budget,
+                    &job.ctx.budget.request,
+                ),
+                CommitEffect::NotCommitted,
+            )
             .await?;
         let authority = || DispatchAuthority {
             snapshot: &snapshot,
@@ -592,6 +625,13 @@ impl ProviderService {
             check_query_taint,
         )?);
         progress.submitted = true;
+        // Payload encoding, live revocation registration and transport handoff
+        // have succeeded under the pinned canonical snapshot. Release canonical
+        // locks/snapshot cleanly before awaiting upstream response headers so
+        // concurrent chat writers are never stalled on upstream TTFB.
+        if let Some(lease) = &mut progress.leases.canonical {
+            let _ = lease.mark_dispatched().await;
+        }
         let response = progress.response.as_mut().expect("started transport");
         if let Err(error) = progress.leases.run(runtime, response.receive_head()).await {
             if matches!(&error,PortError::Unavailable(failure) if failure.effect()==CommitEffect::NotCommitted)
@@ -606,12 +646,6 @@ impl ProviderService {
             401 | 403 => return Err(provider_error(ProviderErrorCode::UpstreamAuthentication)),
             429 => return Err(provider_error(ProviderErrorCode::UpstreamRateLimit)),
             _ => return Err(provider_error(ProviderErrorCode::Unavailable)),
-        }
-        // Reqwest exposes the final HTTP response head after request
-        // dispatch. The body was submitted under the pinned snapshot.
-        // Do not hold canonical writers during generation or consumer replay.
-        if let Some(lease) = &mut progress.leases.canonical {
-            lease.mark_dispatched();
         }
         responses::receive(runtime, job, &snapshot, progress, sender).await
     }

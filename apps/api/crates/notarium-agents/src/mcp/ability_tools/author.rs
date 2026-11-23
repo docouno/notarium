@@ -422,17 +422,11 @@ pub(super) async fn create(
             let skills = resolve_skills(call, attachments).await?;
             let availability =
                 select_projects(call, args.availability.as_ref(), &home.scope.space_id).await?;
-            let account_revision = call
-                .registry
-                .control
-                .whoami(call.account())
-                .await?
-                .account_revision;
             Ok(CreatePlan {
                 home,
                 skills,
                 availability,
-                account_revision,
+                account_revision: ControlRevision::ZERO,
             })
         })
         .await?;
@@ -493,7 +487,7 @@ pub(super) async fn create(
     };
     call.registry
         .control
-        .compare_authored_ability_binding(
+        .update_ability_binding(
             call.account(),
             AccountMutation {
                 identity: call.account_identity(
@@ -501,11 +495,11 @@ pub(super) async fn create(
                     "initial-ability-binding",
                     0,
                 ),
-                input: AbilityBindingChange {
+                input: AbilityBindingUpdate {
                     ability: reference.clone(),
                     enabled: true,
                     projects: plan.availability,
-                    expected: None,
+                    expected: AbilityOverlayGuard::Authored(None),
                 },
             },
         )
@@ -615,29 +609,23 @@ async fn edit_plan(call: &ToolCallContext<'_>, args: &EditArgs) -> Result<EditPl
     let note = call
         .registry
         .engine
-        .get_note(
+        .get_note_metadata(
             scope.clone(),
             read_note_request(entry.note_id.clone(), None),
         )
         .await?;
-    ClassEgressFence::mcp_note(&note.document, scope.auth())?;
-    let account_revision = call
-        .registry
-        .control
-        .whoami(call.account())
-        .await?
-        .account_revision;
+    ClassEgressFence::mcp_note_metadata(&note.metadata, scope.auth())?;
     Ok(EditPlan {
         scope: scope.scope().clone(),
         entrypoint: entry.note_id.clone(),
         original: descriptor.reference,
-        previous_note: note.document.revision().clone(),
+        previous_note: note.metadata.revision().clone(),
         kind: kind_value(descriptor.kind),
         slug: descriptor.name,
         overlays: inspection.overlays,
         requested_skills,
         requested_availability,
-        account_revision,
+        account_revision: ControlRevision::ZERO,
         promote,
     })
 }
@@ -721,14 +709,26 @@ fn is_partial_step_error(error: &PortError) -> bool {
     )
 }
 
-fn edit_result(
+async fn edit_result(
+    call: &ToolCallContext<'_>,
     reference: &AbilityRef,
     steps: Vec<Value>,
     error: Option<&PortError>,
 ) -> Result<Value, PortError> {
-    Ok(
-        json!({"ref":reference_token(reference)?,"steps":steps,"outcome":if error.is_some() {"partial"} else {"updated"}}),
-    )
+    let mut output = json!({
+        "ref": reference_token(reference)?,
+        "steps": steps,
+        "outcome": if error.is_some() { "partial" } else { "updated" },
+    });
+    if let Ok(inspection) = call
+        .registry
+        .control
+        .inspect_ability(call.account(), reference.identity())
+        .await
+    {
+        output["versionToken"] = json!(Version::from_inspection(&inspection).encode()?);
+    }
+    Ok(output)
 }
 
 pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<Value, PortError> {
@@ -866,7 +866,7 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
             let result = call
                 .registry
                 .control
-                .adopt_authored_ability_promotion(
+                .set_ability_trail(
                     call.account(),
                     AccountMutation {
                         identity: call.account_identity(
@@ -874,14 +874,17 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
                             "adopt-promoted-ability",
                             0,
                         ),
-                        input: AdoptAbilityPromotion {
+                        input: AbilityTrailMutation::AdoptPromotion(AdoptAbilityPromotion {
                             source: plan.original.clone(),
                             destination,
-                        },
+                        }),
                     },
                 )
                 .await?;
-            promotion = Some(result.value);
+            let AbilityTrailResult::Promoted(promoted) = result.value else {
+                return Err(invalid(ValidationReason::InvalidState));
+            };
+            promotion = Some(promoted);
         }
         Ok(())
     }
@@ -900,7 +903,7 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
                 change_step(step, "skipped", None)
             });
         }
-        return edit_result(&reference, steps, Some(&error));
+        return edit_result(call, &reference, steps, Some(&error)).await;
     }
     let mut applied_any = authored_changed || promotion.is_some();
     steps.push(change_step(
@@ -939,7 +942,7 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
         } else {
             call.registry
                 .control
-                .compare_authored_ability_binding(
+                .update_ability_binding(
                     call.account(),
                     AccountMutation {
                         identity: call.account_identity(
@@ -947,11 +950,11 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
                             "edit-ability-binding",
                             0,
                         ),
-                        input: AbilityBindingChange {
+                        input: AbilityBindingUpdate {
                             ability: reference.clone(),
                             enabled: overlays.binding_enabled,
                             projects: availability,
-                            expected: overlays.binding_revision,
+                            expected: AbilityOverlayGuard::Authored(overlays.binding_revision),
                         },
                     },
                 )
@@ -968,7 +971,7 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
                 }
                 steps.push(change_step("availability", "failed", Some(&error)));
                 steps.push(change_step("enabled", "skipped", None));
-                return edit_result(&reference, steps, Some(&error));
+                return edit_result(call, &reference, steps, Some(&error)).await;
             }
         }
     } else {
@@ -993,7 +996,7 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
             }
             call.registry
                 .control
-                .compare_authored_ability_preference(
+                .set_ability_preference(
                     call.account(),
                     AccountMutation {
                         identity: call.account_identity(
@@ -1006,7 +1009,9 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
                                 ability: reference.clone(),
                                 enabled,
                             },
-                            expected: overlays.preference_revision,
+                            expected: AbilityPreferenceGuard::Authored(
+                                overlays.preference_revision,
+                            ),
                         },
                     },
                 )
@@ -1020,7 +1025,7 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
                     return Err(error);
                 }
                 steps.push(change_step("enabled", "failed", Some(&error)));
-                return edit_result(&reference, steps, Some(&error));
+                return edit_result(call, &reference, steps, Some(&error)).await;
             }
         }
     } else {
@@ -1060,17 +1065,17 @@ pub(super) async fn trash(
             let note = call
                 .registry
                 .engine
-                .get_note(
+                .get_note_metadata(
                     scope.clone(),
                     read_note_request(entrypoint.note_id.clone(), None),
                 )
                 .await?;
-            ClassEgressFence::mcp_note(&note.document, scope.auth())?;
+            ClassEgressFence::mcp_note_metadata(&note.metadata, scope.auth())?;
             Ok(TrashPlan {
                 scope: scope.scope().clone(),
                 reference: descriptor.reference,
                 entrypoint,
-                note_revision: note.document.revision().clone(),
+                note_revision: note.metadata.revision().clone(),
             })
         })
         .await?;

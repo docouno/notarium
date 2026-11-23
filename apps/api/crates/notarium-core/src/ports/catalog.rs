@@ -95,6 +95,8 @@ pub trait ControlCatalogPort: Send + Sync {
         refs: Vec<AbilityRef>,
     ) -> PortFuture<'_, Box<dyn ScheduleAbilityLease>>;
     fn note(&self, ctx: AccountContext, note: NoteRef) -> PortFuture<'_, CatalogNote>;
+    /// Locate a single note across the caller's authorized Spaces in one read.
+    fn locate_note(&self, ctx: AccountContext, note: NoteId) -> PortFuture<'_, CatalogNote>;
     fn folder(&self, ctx: AccountContext, folder: FolderRef) -> PortFuture<'_, CatalogFolder>;
     fn ensure_space(
         &self,

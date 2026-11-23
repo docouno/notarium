@@ -1762,6 +1762,7 @@ async fn seed_chat_windows(
                         provenance: None,
                         interruption: None,
                         proposed_diff: None,
+                        proposed_effect: None,
                         thread: thread.clone(),
                         parent,
                         kind: if turn % 2 == 0 {

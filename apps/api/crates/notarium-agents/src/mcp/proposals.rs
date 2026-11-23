@@ -47,10 +47,161 @@ pub struct ConfirmProposedDiff {
     pub proposal: ContentDigest,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProposedDiffPreview {
+    pub proposal_id: ContentDigest,
+    pub tool: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub change: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unified_preview: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory: Option<Value>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfirmedDiffOutcome {
+    pub proposal_id: ContentDigest,
+    pub tool: String,
+    pub result: Value,
+}
+
 pub(super) struct Draft {
     pub(crate) id: ContentDigest,
     pub(crate) envelope: String,
     pub(super) payload: Value,
+}
+
+async fn admit_proposal_targets(
+    call: &ToolCallContext<'_>,
+    planning: &ToolCallContext<'_>,
+    args: &Value,
+) -> Result<(), PortError> {
+    let collapse = |error: PortError| {
+        if corpus::hidden(&error) {
+            DomainError::ResourceNotFound.into()
+        } else {
+            error
+        }
+    };
+    match call.tool {
+        ToolName::EditNote | ToolName::DeleteNote | ToolName::MoveNote | ToolName::RenameNote => {
+            let note_id = reference(args, "ref")?;
+            let (scope, note) = corpus::locate_note(call, &note_id)
+                .await
+                .map_err(collapse)?;
+            corpus::admit_provider_note_read(call, &scope, &note)
+                .await
+                .map_err(collapse)?;
+        }
+        ToolName::CreateNote | ToolName::CreateNotes => {
+            let handle = args["project"]
+                .as_str()
+                .ok_or_else(|| invalid(ValidationReason::InvalidQuery))?;
+            let project = session::resolve_project(call, handle)
+                .await
+                .map_err(collapse)?;
+            let scope = session::space(call, &project.folder.space_id)
+                .await
+                .map_err(collapse)?;
+            let folder = call
+                .registry
+                .catalog
+                .folder(call.account(), project.folder.clone())
+                .await
+                .map_err(collapse)?;
+            corpus::admit_folder_write(
+                call,
+                &scope,
+                &project.folder,
+                Some(project.folder.clone()),
+                &folder.ancestor_folders,
+                notarium_core::classes::DocClass::UserDoc,
+            )
+            .await
+            .map_err(collapse)?;
+        }
+        ToolName::Link => {
+            let note_id = reference(args, "from")?;
+            let (scope, note) = corpus::locate_note(call, &note_id)
+                .await
+                .map_err(collapse)?;
+            corpus::admit_provider_note_read(call, &scope, &note)
+                .await
+                .map_err(collapse)?;
+        }
+        ToolName::LinkMany => {
+            let items = args["links"]
+                .as_array()
+                .ok_or_else(|| invalid(ValidationReason::InvalidQuery))?;
+            if items.is_empty() || items.len() > 100 {
+                return Err(invalid(ValidationReason::InvalidLimit));
+            }
+        }
+        ToolName::RememberAboutUser => {
+            let target = MemoryTarget::User {
+                owner: call.auth.principal().clone(),
+            };
+            let category = args
+                .get("category")
+                .and_then(Value::as_str)
+                .unwrap_or("general")
+                .to_owned();
+            let snapshot = call
+                .registry
+                .control
+                .inspect_memory_target(planning.account(), target, category)
+                .await
+                .map_err(collapse)?;
+            let scope = call.space(snapshot.scope).map_err(collapse)?;
+            let folder_ref = notarium_core::model::FolderRef {
+                space_id: scope.scope().space_id.clone(),
+                folder_id: snapshot.parent,
+            };
+            let required_class = args
+                .get("versionToken")
+                .filter(|v| !v.is_null())
+                .map(|_| notarium_core::classes::DocClass::AgentMemory);
+            corpus::admit_folder_boundary(call, &scope, &folder_ref, None, &[], required_class)
+                .await
+                .map_err(collapse)?;
+        }
+        ToolName::RememberAboutProject => {
+            let handle = args["project"]
+                .as_str()
+                .ok_or_else(|| invalid(ValidationReason::InvalidQuery))?;
+            let project = session::resolve_project(call, handle)
+                .await
+                .map_err(collapse)?;
+            let scope = session::space(call, &project.folder.space_id)
+                .await
+                .map_err(collapse)?;
+            let folder = call
+                .registry
+                .catalog
+                .folder(call.account(), project.folder.clone())
+                .await
+                .map_err(collapse)?;
+            let required_class = args
+                .get("versionToken")
+                .filter(|v| !v.is_null())
+                .map(|_| notarium_core::classes::DocClass::AgentMemory);
+            corpus::admit_folder_boundary(
+                call,
+                &scope,
+                &project.folder,
+                Some(project.folder.clone()),
+                &folder.ancestor_folders,
+                required_class,
+            )
+            .await
+            .map_err(collapse)?;
+        }
+        _ => return Err(invalid(ValidationReason::InvalidQuery)),
+    }
+    Ok(())
 }
 
 pub(super) async fn prepare(
@@ -60,6 +211,9 @@ pub(super) async fn prepare(
     args: Value,
 ) -> Result<Draft, PortError> {
     personal_source(call, binding).await?;
+    // Mark external-read taint before probing or planning via detached human
+    // authority so failed probes cannot remain untainted.
+    call.auth.taint().mark_external_read();
     let owner = call
         .registry
         .control
@@ -69,16 +223,20 @@ pub(super) async fn prepare(
         )
         .await?;
     let planning = call.detached_human(owner);
+    // Enforce live InAppProvider consent before reading any note content,
+    // titles, or running find/replace under detached human authority.
+    admit_proposal_targets(call, &planning, &args).await?;
     let action = match call.tool {
         ToolName::Link | ToolName::LinkMany => {
-            ProposedAction::Links(organize::plan_links(&planning, call.tool, args).await?)
+            ProposedAction::Links(organize::plan_links(&planning, call, call.tool, args).await?)
         }
         ToolName::RememberAboutUser | ToolName::RememberAboutProject => {
             ProposedAction::Memory(plan_memory(&planning, call.tool, args).await?)
         }
-        _ => ProposedAction::Notes(note_tools::plan_proposal(&planning, call.tool, args).await?),
+        _ => ProposedAction::Notes(
+            note_tools::plan_proposal(&planning, call, call.tool, args).await?,
+        ),
     };
-    call.auth.taint().mark_external_read();
     let id = proposal_id(&binding.thread, call_id, &action)?;
     let preview = if let ProposedAction::Notes(notes) = &action {
         note_tools::preview_proposal(call, notes).await?
@@ -111,7 +269,7 @@ pub(super) async fn confirm(
     registry: &ToolRegistry,
     account: AccountContext,
     request: ConfirmProposedDiff,
-) -> Result<Value, PortError> {
+) -> Result<ConfirmedDiffOutcome, PortError> {
     let (source, envelope, mut owner) = resolve_for_human(registry, account, &request).await?;
     let tool = owner.tool;
     let step_auth = owner.auth.clone();
@@ -127,9 +285,9 @@ pub(super) async fn confirm(
             .with_confirmed_chat_step(source.witness().clone(), &identity)?;
         Ok((ctx, identity))
     };
-    match envelope.action {
+    let result = match envelope.action {
         ProposedAction::Notes(notes) => {
-            note_tools::apply_proposal(&mut owner, notes, &authority).await
+            note_tools::apply_proposal(&mut owner, notes, &authority).await?
         }
         ProposedAction::Links(links) => {
             organize::apply_links(&owner, tool, &links, source.witness(), |ordinal, scope| {
@@ -141,24 +299,34 @@ pub(super) async fn confirm(
                     request.proposal,
                 ))
             })
-            .await
+            .await?
         }
-        ProposedAction::Memory(memory) => commit_memory(&owner, authority, memory).await,
-    }
+        ProposedAction::Memory(memory) => commit_memory(&owner, authority, memory).await?,
+    };
+    Ok(ConfirmedDiffOutcome {
+        proposal_id: request.proposal,
+        tool: tool.name().to_owned(),
+        result,
+    })
 }
 
 pub(super) async fn preview(
     registry: &ToolRegistry,
     account: AccountContext,
     request: ConfirmProposedDiff,
-) -> Result<Value, PortError> {
+) -> Result<ProposedDiffPreview, PortError> {
     let (_, envelope, mut owner) = resolve_for_human(registry, account, &request).await?;
-    let mut payload = json!({ "proposalId": request.proposal, "tool": owner.tool.name() });
+    let mut preview = ProposedDiffPreview {
+        proposal_id: request.proposal,
+        tool: owner.tool.name().to_owned(),
+        change: None,
+        unified_preview: None,
+        memory: None,
+    };
     match &envelope.action {
         ProposedAction::Notes(notes) => {
-            payload["change"] = note_tools::describe_proposal(&mut owner, notes).await?;
-            payload["unifiedPreview"] =
-                json!(note_tools::preview_proposal(&mut owner, notes).await?);
+            preview.change = Some(note_tools::describe_proposal(&mut owner, notes).await?);
+            preview.unified_preview = note_tools::preview_proposal(&mut owner, notes).await?;
         }
         ProposedAction::Memory(plan) => {
             let current = registry
@@ -166,14 +334,18 @@ pub(super) async fn preview(
                 .inspect_memory_target(owner.account(), plan.target.clone(), plan.category.clone())
                 .await?;
             check_memory_target(plan, &current)?;
-            payload["memory"] = json!({ "category": plan.category, "observation": plan.observation,
-                "summary": plan.summary, "versionToken": plan.expected_revision });
+            preview.memory = Some(json!({
+                "category": plan.category,
+                "observation": plan.observation,
+                "summary": plan.summary,
+                "versionToken": plan.expected_revision,
+            }));
         }
         ProposedAction::Links(links) => {
-            payload["change"] = organize::describe_links(&owner, links).await?;
+            preview.change = Some(organize::describe_links(&owner, links).await?);
         }
     }
-    Ok(payload)
+    Ok(preview)
 }
 
 async fn resolve_for_human<'a>(
@@ -223,6 +395,7 @@ async fn resolve_for_human<'a>(
         || envelope.thread != request.thread
         || &envelope.call_id != source.witness().call_id()
         || source.witness().tool_name() != tool.name()
+        || Some(source.witness().effect_kind()) != tool.confirmed_effect_kind()
         || request.proposal
             != proposal_id(
                 &request.thread,

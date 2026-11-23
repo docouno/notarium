@@ -208,7 +208,7 @@ async fn project_scoped_mcp_reads_follow_committed_changes() {
         assert_eq!(calls.len(), 3, "two views followed by a graph request");
         assert_eq!(calls[0].1, Some(held.last_seq));
         assert_eq!(calls[1].1, Some(held.last_seq));
-        assert_eq!(calls[2].1, None);
+        assert_eq!(calls[2].1, Some(held.last_seq));
         assert!(
             calls.windows(2).all(|pair| pair[1].0 < pair[0].0),
             "each read must receive only the remaining call budget"
@@ -802,4 +802,333 @@ async fn recipient_graph_paths(
             );
         }
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sqlite_incremental_folder_cover_and_predicates() {
+    let _guard = support::AUTH_TEST_LOCK.lock().await;
+    exercise_incremental_folder_cover_and_predicates(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_incremental_folder_cover_and_predicates() {
+    let _guard = support::AUTH_TEST_LOCK.lock().await;
+    exercise_incremental_folder_cover_and_predicates(true).await;
+}
+
+async fn exercise_incremental_folder_cover_and_predicates(pg: bool) {
+    let fixture = RuntimeFixture::open_named(pg, "mcp_incremental_cover").await;
+    let space = fixture.personal_scope().await;
+    let root = DataRoot::new(
+        fixture
+            .storage
+            .root
+            .as_ref()
+            .or(fixture.temporary_blob_root.as_ref())
+            .unwrap(),
+    );
+    let mut pg_pool = None;
+    let projector = if pg {
+        let descriptor = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../../.artifacts/control-db-fixture/active.json");
+        let desc: Value = serde_json::from_slice(&std::fs::read(descriptor).unwrap()).unwrap();
+        let socket = desc["socket"].as_str().unwrap();
+        let options = sqlx::postgres::PgConnectOptions::new_without_pgpass()
+            .socket(socket)
+            .port(5432)
+            .username("postgres")
+            .database("auth_mcp_incremental_cover");
+        let pool = sqlx::PgPool::connect_with(options).await.unwrap();
+        let proj = ProjectorRuntime::start_postgres_ephemeral(
+            fixture.canonical.clone(),
+            MaintenanceContext {
+                authority: ServiceAuthority::admit(ServicePurpose::Projection),
+                budget: budget(),
+            },
+            pool.clone(),
+            "proj_inc_cover",
+            root.clone(),
+            ProjectionGeneration::new(1).unwrap(),
+            ProjectionConfig::default(),
+        )
+        .await
+        .unwrap();
+        pg_pool = Some(pool);
+        proj
+    } else {
+        ProjectorRuntime::start_sqlite(
+            fixture.canonical.clone(),
+            MaintenanceContext {
+                authority: ServiceAuthority::admit(ServicePurpose::Projection),
+                budget: budget(),
+            },
+            root.clone(),
+            ProjectionGeneration::new(1).unwrap(),
+            ProjectionConfig::default(),
+        )
+        .await
+        .unwrap()
+    };
+    let projection = projector.engine();
+    let search = Arc::new(SearchEngine::start(
+        SearchConfig::new(root, VectorMode::Disabled),
+        SearchDependencies::new(Arc::new(fixture.canonical.clone()), projection.clone()),
+    ));
+    search.start_space(space.scope().clone()).unwrap();
+    assert!(
+        fixture
+            .projections
+            .real
+            .set(DerivedReads {
+                projection_calls: Default::default(),
+                notes: projection.note_reads(),
+                projection: projection.clone(),
+                search: search.clone(),
+            })
+            .is_ok()
+    );
+
+    let home = fixture
+        .canonical
+        .read_space(&space.scope().space_id)
+        .await
+        .unwrap();
+    let project_id = FolderId::from_bytes([71; 16]);
+    fixture
+        .canonical
+        .create_folder(CreateFolderSpec {
+            scope: space.scope().clone(),
+            active_epoch: home.active_epoch,
+            folder_id: project_id.clone(),
+            parent: None,
+            slug: "atlas".into(),
+            display_name: "Atlas".into(),
+            is_project: true,
+            project_slug: Some("atlas".into()),
+            actor: fixture.human.auth().principal().clone(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+    let project = format!("{}/atlas", home.slug);
+
+    // 1. Space-root cover note must surface `folderPage.status == "present"` in `get_note`.
+    let root_cover_id = NoteId::from_bytes([72; 16]);
+    fixture
+        .canonical
+        .create_note(
+            space.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: space.scope().clone(),
+                    actor: fixture.human.auth().principal().clone(),
+                    key: CommandKey::from_bytes([72; 16]),
+                    hash: ContentDigest::from_bytes([72; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: CreateNote {
+                    note: root_cover_id.clone(),
+                    parent: None,
+                    slug: "index".into(),
+                    class: notarium_core::classes::DocClass::UserDoc,
+                    carrier: "# Space Home\n\nRoot cover.\n".into(),
+                    folder_page: true,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let root_get = call(
+        &fixture,
+        &fixture.human,
+        72,
+        "get_note",
+        json!({"ref": root_cover_id}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        root_get.structured_content["folderPage"]["status"],
+        "present"
+    );
+
+    // 2. Project folder page assignment must propagate incrementally via `"folder"` change_log event.
+    let cover = call(
+        &fixture,
+        &fixture.human,
+        73,
+        "create_note",
+        json!({
+            "project": project,
+            "path": "docs",
+            "title": "Docs Cover",
+            "body": "# Docs Cover\n",
+            "folderPage": true,
+        }),
+    )
+    .await
+    .unwrap();
+    let cover_id = cover.structured_content["noteId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let listed = call(
+        &fixture,
+        &fixture.human,
+        74,
+        "list_notes",
+        json!({"project": project, "path": "docs"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        listed.structured_content["folderPage"]["status"], "present",
+        "{}",
+        listed.structured_content
+    );
+    assert_eq!(listed.structured_content["folderPage"]["noteId"], cover_id);
+    assert_eq!(listed.structured_content["items"], json!([]));
+    assert_eq!(listed.structured_content["total"], 0);
+
+    // Trashing the cover note clears projected_folders.cover_note_id incrementally.
+    call(
+        &fixture,
+        &fixture.human,
+        75,
+        "delete_note",
+        json!({"ref": cover_id}),
+    )
+    .await
+    .unwrap();
+    let after_trash = call(
+        &fixture,
+        &fixture.human,
+        76,
+        "list_notes",
+        json!({"project": project, "path": "docs"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        after_trash.structured_content["folderPage"]["status"],
+        "missing"
+    );
+
+    // 3. Real #5 field predicates + keyset pagination cursors on both SQLite and PG16.
+    fixture
+        .canonical
+        .update_space_schema(
+            space.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: space.scope().clone(),
+                    actor: fixture.human.auth().principal().clone(),
+                    key: CommandKey::from_bytes([76; 16]),
+                    hash: ContentDigest::from_bytes([76; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: notarium_canonical::UpdateSpaceSchema {
+                    schema_note: NoteId::from_bytes([76; 16]),
+                    parent: None,
+                    slug: "schema".into(),
+                    carrier: "---\ntitle: Schema\n---\n".into(),
+                    schema: std::collections::BTreeMap::from([(
+                        "status".into(),
+                        notarium_core::query::FieldSchema {
+                            kind: notarium_core::query::FieldType::Scalar(
+                                notarium_core::query::ScalarType::String,
+                            ),
+                            nullable: false,
+                        },
+                    )]),
+                    expected_schema_revision: None,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let n1 = create(
+        &fixture,
+        77,
+        &project,
+        "Alpha",
+        "---\nstatus: open\n---\nAlpha body.\n",
+    )
+    .await;
+    let n2 = create(
+        &fixture,
+        78,
+        &project,
+        "Beta",
+        "---\nstatus: open\n---\nBeta body.\n",
+    )
+    .await;
+    let _n3 = create(
+        &fixture,
+        79,
+        &project,
+        "Gamma",
+        "---\nstatus: closed\n---\nGamma body.\n",
+    )
+    .await;
+    let page1 = call(
+        &fixture,
+        &fixture.human,
+        80,
+        "list_notes",
+        json!({"project": project, "field": ["note.status:open"], "limit": 1}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(page1.structured_content["total"], 2);
+    assert_eq!(
+        page1.structured_content["items"].as_array().unwrap().len(),
+        1
+    );
+    let next_cursor = page1.structured_content["nextCursor"].as_str().unwrap();
+    let page2 = call(
+        &fixture,
+        &fixture.human,
+        81,
+        "list_notes",
+        json!({"project": project, "field": ["note.status:open"], "limit": 1, "cursor": next_cursor}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        page2.structured_content["items"].as_array().unwrap().len(),
+        1
+    );
+    let collected: BTreeSet<String> = [
+        page1.structured_content["items"][0]["noteId"]
+            .as_str()
+            .unwrap()
+            .to_owned(),
+        page2.structured_content["items"][0]["noteId"]
+            .as_str()
+            .unwrap()
+            .to_owned(),
+    ]
+    .into_iter()
+    .collect();
+    let expected_ids: BTreeSet<String> = [
+        n1.as_str().unwrap().to_owned(),
+        n2.as_str().unwrap().to_owned(),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(collected, expected_ids);
+
+    search.shutdown().await;
+    projector.shutdown().await.unwrap();
+    if let Some(pool) = pg_pool {
+        for stmt in [
+            "DROP SCHEMA IF EXISTS \"proj_inc_cover_g1\" CASCADE",
+            "DROP SCHEMA IF EXISTS \"proj_inc_cover_ctrl\" CASCADE",
+        ] {
+            let _ = sqlx::query(stmt).execute(&pool).await;
+        }
+        pool.close().await;
+    }
+    fixture.close().await;
 }

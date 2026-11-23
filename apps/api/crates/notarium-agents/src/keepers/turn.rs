@@ -162,6 +162,7 @@ pub(super) async fn run_keeper_turn(
                     provenance: Some(proof),
                     interruption: settled.finish.interruption(),
                     proposed_diff: None,
+                    proposed_effect: None,
                     referenced_notes: vec![],
                     tainted: false,
                 },
@@ -198,6 +199,7 @@ pub(super) async fn run_keeper_turn(
                         provenance: Some(proof),
                         interruption: None,
                         proposed_diff: None,
+                        proposed_effect: None,
                         referenced_notes: vec![],
                         tainted: false,
                     },
@@ -451,6 +453,11 @@ impl KeeperTurn<'_> {
                 Value::Object(call.arguments.into_iter().collect()),
             )
             .await;
+        if let Err(error) = &result
+            && unknown(error)
+        {
+            return Err(error.clone());
+        }
         self.lease.check()?;
         match result {
             Ok(result) if result.proposal().is_none() => Ok((
@@ -458,7 +465,6 @@ impl KeeperTurn<'_> {
                 result.provenance,
             )),
             Ok(_) => Err(invalid(ValidationReason::InvalidAuthority)),
-            Err(error) if unknown(&error) => Err(error),
             Err(error) => Ok((
                 json!({"error":error.code()}).to_string(),
                 ChatProvenance::default(),

@@ -143,6 +143,7 @@ pub struct AbilityDescriptor {
     pub reference: AbilityRef,
     pub kind: AbilityKind,
     pub name: String,
+    pub description: Option<String>,
     pub enabled: bool,
     pub healthy: bool,
     pub lifecycle: Lifecycle,
@@ -199,30 +200,41 @@ pub struct AbilityInspection {
     pub binding_revision: ControlRevision,
     pub overlays: AbilityOverlayState,
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum AbilityOverlayGuard {
+    /// Enforce the account revision alongside the target binding revision.
+    Account(ControlRevision),
+    /// Authored per-overlay CAS (`None` requires absence of a binding row).
+    Authored(Option<ControlRevision>),
+}
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct AbilityBindingUpdate {
     pub ability: AbilityRef,
     pub enabled: bool,
-    pub expected: ControlRevision,
+    pub expected: AbilityOverlayGuard,
     pub projects: AbilityProjects,
 }
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct AbilityBindingChange {
-    pub ability: AbilityRef,
-    pub enabled: bool,
-    pub expected: Option<ControlRevision>,
-    pub projects: AbilityProjects,
+#[derive(Clone, Debug)]
+pub struct AbilityBindingResult {
+    pub reference: AbilityRef,
+    pub descriptor: Option<AbilityDescriptor>,
 }
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct AbilityPreferenceUpdate {
     pub ability: AbilityRef,
     pub enabled: bool,
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum AbilityPreferenceGuard {
+    /// Enforce the owner's account revision; allows human management without `Cap::AbilityWrite`.
+    Account,
+    /// Authored per-overlay CAS (`None` requires absence of a preference row); requires `Cap::AbilityWrite`.
+    Authored(Option<ControlRevision>),
+}
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct AbilityPreferenceChange {
     pub preference: AbilityPreferenceUpdate,
-    /// `None` requires the absence of a preference row for this owner.
-    pub expected: Option<ControlRevision>,
+    pub expected: AbilityPreferenceGuard,
 }
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct AbilityTrailUpdate {
@@ -230,13 +242,16 @@ pub struct AbilityTrailUpdate {
     pub expected_destination: Option<AbilityRef>,
     pub destination: Option<AbilityRef>,
 }
-
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct AdoptAbilityPromotion {
     pub source: AbilityRef,
     pub destination: AbilityRef,
 }
-
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub enum AbilityTrailMutation {
+    Set(AbilityTrailUpdate),
+    AdoptPromotion(AdoptAbilityPromotion),
+}
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct AbilityOverlayState {
     pub binding_revision: Option<ControlRevision>,
@@ -244,11 +259,15 @@ pub struct AbilityOverlayState {
     pub preference_revision: Option<ControlRevision>,
     pub preference_enabled: bool,
 }
-
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct AbilityPromotionResult {
     pub source: AbilityOverlayState,
     pub destination: AbilityOverlayState,
+}
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub enum AbilityTrailResult {
+    Updated(Box<AbilityTrailUpdate>),
+    Promoted(AbilityPromotionResult),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -289,12 +308,20 @@ pub enum EpisodeSelector {
     Id(EpisodeId),
     Name(String),
 }
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum EpisodeRevisionGuard {
+    #[default]
+    Account,
+    Target,
+}
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct StartEpisode {
     pub selector: EpisodeSelector,
     /// Initial hint for a new episode. Resume/fork retains the stored selection;
     /// changing an existing selection requires EpisodeUpdate and its CAS.
     pub project_hint: Option<FolderRef>,
+    #[serde(default)]
+    pub guard: EpisodeRevisionGuard,
 }
 #[derive(Clone, Debug)]
 pub enum EpisodeStartResult {
@@ -311,6 +338,18 @@ pub struct EpisodeUpdate {
     pub active_role: Option<AbilityRef>,
     pub project_hint: Option<FolderRef>,
     pub lifecycle: EpisodeLifecycle,
+}
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct BindEpisodeRole {
+    pub episode: EpisodeId,
+    pub expected: ControlRevision,
+    pub active_role: AbilityRef,
+    pub project_hint: Option<FolderRef>,
+}
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub enum EpisodeMutation {
+    Full(EpisodeUpdate),
+    BindRole(BindEpisodeRole),
 }
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum AckOwner {
@@ -420,21 +459,17 @@ pub trait ControlPort: Send + Sync {
     /// its replay. The original grants also cover a proposal's source Space.
     fn fence_canonical_effect(
         &self,
-        _authority: EngineAuthContext,
-        _ctx: SpaceContext,
-        _effect: CanonicalEffect,
-    ) -> PortFuture<'_, SpaceContext> {
-        Box::pin(async { Err(crate::DomainError::AccessDenied.into()) })
-    }
+        authority: EngineAuthContext,
+        ctx: SpaceContext,
+        effect: CanonicalEffect,
+    ) -> PortFuture<'_, SpaceContext>;
     /// Rebuilds independent authority from the same live interactive credential.
     /// The read variant grants proposal admission without management or write authority.
     fn revalidate_proposal_human(
         &self,
-        _ctx: AccountContext,
-        _access: ProposalHumanAccess,
-    ) -> PortFuture<'_, EngineAuthContext> {
-        Box::pin(async { Err(crate::DomainError::AccessDenied.into()) })
-    }
+        ctx: AccountContext,
+        access: ProposalHumanAccess,
+    ) -> PortFuture<'_, EngineAuthContext>;
     fn whoami(&self, ctx: AccountContext) -> PortFuture<'_, PrincipalInfo>;
     fn list_spaces(
         &self,
@@ -474,23 +509,11 @@ pub trait ControlPort: Send + Sync {
         ctx: AccountContext,
         request: AccountMutation<StartEpisode>,
     ) -> PortFuture<'_, ControlCommit<EpisodeStartResult>>;
-    /// Start using the current owner state; the command identity remains stable on replay.
-    fn start_agent_episode(
-        &self,
-        ctx: AccountContext,
-        request: AccountMutation<StartEpisode>,
-    ) -> PortFuture<'_, ControlCommit<EpisodeStartResult>>;
     fn get_episode(&self, ctx: AccountContext, episode: EpisodeId) -> PortFuture<'_, AgentEpisode>;
     fn update_episode(
         &self,
         ctx: AccountContext,
-        request: AccountMutation<EpisodeUpdate>,
-    ) -> PortFuture<'_, ControlCommit<AgentEpisode>>;
-    /// Bind a role with episode revision CAS, preserving its name and lifecycle.
-    fn bind_episode_role(
-        &self,
-        ctx: AccountContext,
-        request: AccountMutation<EpisodeUpdate>,
+        request: AccountMutation<EpisodeMutation>,
     ) -> PortFuture<'_, ControlCommit<AgentEpisode>>;
     fn touch_episode(&self, ctx: AccountContext, episode: EpisodeId) -> PortFuture<'_, ()>;
     fn acknowledge_delta(
@@ -532,46 +555,27 @@ pub trait ControlPort: Send + Sync {
         &self,
         ctx: AccountContext,
         request: AccountMutation<AbilityBindingUpdate>,
-    ) -> PortFuture<'_, ControlCommit<AbilityDescriptor>>;
+    ) -> PortFuture<'_, ControlCommit<AbilityBindingResult>>;
     fn set_ability_preference(
-        &self,
-        ctx: AccountContext,
-        request: AccountMutation<AbilityPreferenceUpdate>,
-    ) -> PortFuture<'_, ControlCommit<AbilityPreferenceUpdate>>;
-    fn set_ability_trail(
-        &self,
-        ctx: AccountContext,
-        request: AccountMutation<AbilityTrailUpdate>,
-    ) -> PortFuture<'_, ControlCommit<AbilityTrailUpdate>>;
-    /// Authoring carries a stable command identity and exact overlay revision.
-    fn compare_authored_ability_binding(
-        &self,
-        ctx: AccountContext,
-        request: AccountMutation<AbilityBindingChange>,
-    ) -> PortFuture<'_, ControlCommit<AbilityRef>>;
-    fn compare_authored_ability_preference(
         &self,
         ctx: AccountContext,
         request: AccountMutation<AbilityPreferenceChange>,
     ) -> PortFuture<'_, ControlCommit<AbilityPreferenceUpdate>>;
-    /// Adopt an exact canonical project-to-Space promotion at an absent trail.
-    fn adopt_authored_ability_promotion(
+    fn set_ability_trail(
         &self,
         ctx: AccountContext,
-        request: AccountMutation<AdoptAbilityPromotion>,
-    ) -> PortFuture<'_, ControlCommit<AbilityPromotionResult>>;
+        request: AccountMutation<AbilityTrailMutation>,
+    ) -> PortFuture<'_, ControlCommit<AbilityTrailResult>>;
     fn lookup_mcp_dedup(
         &self,
         ctx: AccountContext,
         key: McpDedupKey,
     ) -> PortFuture<'_, Option<McpDedupHit>>;
-    fn record_mcp_dedup(&self, ctx: AccountContext, record: McpDedupRecord) -> PortFuture<'_, ()>;
-    fn resolve_memory_target(
+    fn record_mcp_dedup(
         &self,
         ctx: AccountContext,
-        target: MemoryTarget,
-        category: String,
-    ) -> PortFuture<'_, ResolvedMemoryTarget>;
+        record: McpDedupRecord,
+    ) -> PortFuture<'_, McpDedupHit>;
     fn inspect_memory_target(
         &self,
         ctx: AccountContext,

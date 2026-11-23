@@ -79,6 +79,7 @@ pub(super) async fn exercise(store: &CanonicalStore, runtime: &ProjectorRuntime)
                     hops: 2,
                 },
                 filter: filter(),
+                causal: None,
             },
         )
         .await
@@ -540,6 +541,7 @@ async fn scoped_graph(store: &CanonicalStore, runtime: &ProjectorRuntime) {
                     hops: 2,
                 },
                 filter: filter(),
+                causal: None,
             },
         )
         .await
@@ -572,6 +574,7 @@ async fn scoped_graph(store: &CanonicalStore, runtime: &ProjectorRuntime) {
                     version: 1,
                     predicate: Predicate::IsAbsent { key: "tags".into() },
                 },
+                causal: None,
             },
         )
         .await
@@ -589,6 +592,7 @@ async fn scoped_graph(store: &CanonicalStore, runtime: &ProjectorRuntime) {
                     tags: vec!["RUST".into()],
                 },
                 filter: filter(),
+                causal: None,
             },
         )
         .await
@@ -640,6 +644,7 @@ async fn scoped_graph(store: &CanonicalStore, runtime: &ProjectorRuntime) {
             GraphQuery {
                 tier: GraphTier::Superclusters,
                 filter: filter(),
+                causal: None,
             },
         )
         .await;
@@ -659,6 +664,7 @@ async fn scoped_graph(store: &CanonicalStore, runtime: &ProjectorRuntime) {
                     GraphQuery {
                         tier: GraphTier::Superclusters,
                         filter: filter(),
+                        causal: None,
                     },
                 )
                 .await
@@ -698,6 +704,7 @@ async fn scoped_graph(store: &CanonicalStore, runtime: &ProjectorRuntime) {
                     hops: 2,
                 },
                 filter: filter(),
+                causal: None,
             },
         )
         .await

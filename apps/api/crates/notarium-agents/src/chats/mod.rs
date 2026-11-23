@@ -209,7 +209,10 @@ struct RunAdmission<'a> {
 
 impl Drop for RunAdmission<'_> {
     fn drop(&mut self) {
-        let mut threads = self.threads.lock().expect("thread registry lock");
+        let mut threads = self
+            .threads
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         threads.admitting.remove(self.run);
     }
 }
@@ -522,7 +525,7 @@ impl AgentRunSupervisor {
                     .inner
                     .threads
                     .lock()
-                    .expect("thread registry lock")
+                    .unwrap_or_else(|error| error.into_inner())
                     .streams
                     .get(&(scope.clone(), thread.clone()))
             {
@@ -563,7 +566,11 @@ impl AgentRunSupervisor {
 
     pub fn shutdown(&self) {
         self.inner.shutdown.cancel();
-        let state = self.inner.threads.lock().expect("thread registry lock");
+        let state = self
+            .inner
+            .threads
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         for cancellation in state.admitting.values() {
             cancellation.cancel();
         }
@@ -708,7 +715,11 @@ impl AgentRunSupervisor {
     }
 
     fn thread_gate(&self, scope: &HistoryScope, thread: &ChatThreadId) -> Arc<AsyncMutex<()>> {
-        let mut state = self.inner.threads.lock().expect("thread registry lock");
+        let mut state = self
+            .inner
+            .threads
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         state.gates.retain(|_, gate| gate.strong_count() != 0);
         state.streams.retain(|_, streams| {
             streams.retain(|stream| stream.strong_count() != 0);
@@ -727,7 +738,7 @@ impl AgentRunSupervisor {
         self.inner
             .threads
             .lock()
-            .expect("thread registry lock")
+            .unwrap_or_else(|error| error.into_inner())
             .active
             .get(&(scope.space_id.clone(), thread.clone()))
             .cloned()
@@ -741,9 +752,10 @@ impl AgentRunSupervisor {
         predecessor: Option<&AgentRunId>,
         sender: Option<(&PendingCredentialKey, &PendingCredential)>,
     ) -> Result<LaunchOutcome, PortError> {
-        if self.inner.shutdown.is_cancelled()
-            || !request.options.limits.fits(RunLimits::HARD_CEILING)
-        {
+        if self.inner.shutdown.is_cancelled() {
+            return Err(owner_unavailable());
+        }
+        if !request.options.limits.fits(RunLimits::HARD_CEILING) {
             return Err(invalid(ValidationReason::BudgetExceeded));
         }
         if thread.head != request.expected_leaf
@@ -764,10 +776,20 @@ impl AgentRunSupervisor {
         }
         let run = new_run()?;
         let mut requested = account.auth().spaces().clone();
-        for grant in requested.values_mut() {
+        for (space_id, grant) in &mut requested {
             grant
                 .write_classes
                 .retain(|class| matches!(class, DocClass::UserDoc | DocClass::AgentMemory));
+            if space_id == &request.scope.space_id
+                && let Some(project) = &thread.project_folder
+            {
+                if let Some(existing) = &grant.project_root
+                    && existing != project
+                {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+                grant.project_root = Some(project.clone());
+            }
         }
         let auth = account.auth().for_agent_run(
             run.clone(),
@@ -775,7 +797,6 @@ impl AgentRunSupervisor {
             audience,
             requested,
         )?;
-        auth.taint().merge(account.auth().taint());
         let cancellation = Cancellation::default();
         let admission = bounded(&account.budget, MAINTENANCE_BUDGET, cancellation.clone());
         let lease = self.inner.revocations.register_run_with_sender(
@@ -786,7 +807,11 @@ impl AgentRunSupervisor {
             sender,
         )?;
         let registration = {
-            let mut threads = self.inner.threads.lock().expect("thread registry lock");
+            let mut threads = self
+                .inner
+                .threads
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
             if self.inner.shutdown.is_cancelled() {
                 return Ok(LaunchOutcome::Settled(owner_unavailable()));
             }
@@ -906,7 +931,11 @@ impl AgentRunSupervisor {
             admitted: AtomicBool::new(false),
         });
         let previous = {
-            let mut threads = self.inner.threads.lock().expect("thread registry lock");
+            let mut threads = self
+                .inner
+                .threads
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
             // Shutdown cancels every published candidate under this same lock.
             if self.inner.shutdown.is_cancelled() {
                 return Ok(LaunchOutcome::Settled(owner_unavailable()));
@@ -1048,12 +1077,38 @@ impl AgentRunSupervisor {
     }
 
     fn spawn_run(&self, run: Arc<ActiveRun>, start: RunTaskStart) {
+        struct RunTaskGuard {
+            worker: AgentRunSupervisor,
+            run: Arc<ActiveRun>,
+            completed: bool,
+        }
+        impl Drop for RunTaskGuard {
+            fn drop(&mut self) {
+                if !self.completed {
+                    self.run.cancellation.cancel();
+                    self.worker
+                        .finish_and_remove_run(&self.run, Some(owner_unavailable()));
+                }
+            }
+        }
         let worker = self.clone();
-        tokio::spawn(async move { worker.run_task(run, start).await });
+        tokio::spawn(async move {
+            let mut guard = RunTaskGuard {
+                worker: worker.clone(),
+                run: Arc::clone(&run),
+                completed: false,
+            };
+            worker.run_task(run, start).await;
+            guard.completed = true;
+        });
     }
 
     fn restore_predecessor(&self, key: ThreadKey, predecessor: Option<Arc<ActiveRun>>) {
-        let mut threads = self.inner.threads.lock().expect("thread registry lock");
+        let mut threads = self
+            .inner
+            .threads
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         if let Some(predecessor) = predecessor {
             if self.inner.shutdown.is_cancelled() {
                 predecessor.cancellation.cancel();
@@ -1066,7 +1121,11 @@ impl AgentRunSupervisor {
 
     fn remove_run(&self, run: &ActiveRun) {
         let key = (run.scope.space_id.clone(), run.thread.clone());
-        let mut state = self.inner.threads.lock().expect("thread registry lock");
+        let mut state = self
+            .inner
+            .threads
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         if state
             .active
             .get(&key)

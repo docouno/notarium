@@ -376,3 +376,49 @@ async fn every_selector_participates_in_exact_matching() {
         }
     }
 }
+
+#[tokio::test]
+async fn cancelled_revoke_cleans_applying_entry_for_clean_retry() {
+    let hub = RevocationHub::new_local();
+    let space = SpaceId::from_bytes([7; 16]);
+    let selector = RevocationSelector::Space(space);
+    let token = Cancellation::default();
+    let effect = hub
+        .register_canonical_effect(context(1), vec![selector.clone()], token.clone())
+        .await
+        .unwrap();
+    let active = effect.begin().await.unwrap();
+
+    // Start a revoke that blocks on the active canonical effect, then drop/cancel it.
+    let mut stalled_revoke = Box::pin(hub.revoke(
+        context(2),
+        selector.clone(),
+        RevocationReason::PermissionChanged,
+    ));
+    assert!(
+        std::future::poll_fn(|cx| std::task::Poll::Ready(
+            stalled_revoke.as_mut().poll(cx).is_pending()
+        ))
+        .await
+    );
+    assert!(token.is_cancelled());
+    assert!(active.check().is_err());
+    drop(stalled_revoke);
+    assert!(
+        !hub.inner
+            .lock()
+            .events
+            .contains_key(&RequestId::from_bytes([2; 16])),
+        "dropping a stalled revoke must release its EventDelivery::Applying entry"
+    );
+
+    // Release the active effect and retry the exact same event RequestId.
+    drop(active);
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        hub.revoke(context(2), selector, RevocationReason::PermissionChanged),
+    )
+    .await
+    .expect("retry after cancelled revoke must complete promptly")
+    .unwrap();
+}

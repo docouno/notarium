@@ -98,7 +98,10 @@ atomically. Authentication, protected metadata and encrypted-carrier checks
 remain strict.
 
 `patch_view_block` addresses a ready block by its stable view key. It can
-edit source fields, common view fields and options. The block keeps its ID,
+edit source fields, common view fields and options (preserving sibling keys
+and comments inside `source:` and `options:` mappings) and validates the
+resulting `nota` view specification via `notarium_syntax::nota::spec` against
+the Space field schema before returning a patch. The block keeps its ID,
 and the surrounding Markdown retains its original bytes. The proposed carrier
 is reparsed before the patch is returned, including fences inside quotations
 and lists. MCP exposes this operation through `edit_note.view`. Its ordinary

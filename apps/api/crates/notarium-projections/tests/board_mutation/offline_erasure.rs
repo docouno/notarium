@@ -372,6 +372,7 @@ async fn append(
                     interruption: None,
                     provenance: None,
                     proposed_diff: None,
+                    proposed_effect: None,
                     thread: thread.clone(),
                     parent,
                     kind,

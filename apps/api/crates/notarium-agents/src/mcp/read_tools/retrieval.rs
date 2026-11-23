@@ -46,7 +46,6 @@ struct Recipient<'a, 'registry> {
     scope: &'a SpaceContext,
     classes: &'a BTreeSet<DocClass>,
     project: Option<&'a FolderRef>,
-    policies: corpus::CandidatePolicies,
 }
 
 impl SearchRecipient for Recipient<'_, '_> {
@@ -59,7 +58,8 @@ impl SearchRecipient for Recipient<'_, '_> {
             if !matches_target(card, self.classes, self.project) {
                 return Ok(false);
             }
-            match corpus::admit_search_card(self.call, self.scope, card, &self.policies).await {
+            match corpus::admit_search_card(self.call, self.scope, card, &self.call.policies).await
+            {
                 Ok(()) => Ok(true),
                 Err(error) if corpus::hidden(&error) => Ok(false),
                 Err(error) => Err(error),
@@ -140,7 +140,6 @@ pub(super) async fn retrieve(
             scope: &scope,
             classes: &classes,
             project: target.project.as_ref(),
-            policies: Default::default(),
         };
         let result = if recall {
             call.registry
@@ -231,8 +230,15 @@ pub(super) async fn retrieve(
         }
         let origin_count = call.provenance.origins.len();
         let project_count = call.provenance.projects.len();
+        let selection = match corpus::note_metadata_selection(call, &scope, metadata).await {
+            Ok(selection) => selection,
+            Err(error) if corpus::hidden(&error) => continue,
+            Err(error) => return Err(error),
+        };
         if !recall {
-            match corpus::note_metadata(call, &scope, metadata).await {
+            match corpus::admit_metadata_with_selection(call, &scope, metadata, selection.as_ref())
+                .await
+            {
                 Ok(()) => (),
                 Err(error) if corpus::hidden(&error) => continue,
                 Err(error) => return Err(error),
@@ -255,7 +261,15 @@ pub(super) async fn retrieve(
                 truncated = true;
                 continue;
             }
-            let text = match corpus::search_part(call, &scope, metadata, chunk).await {
+            let text = match corpus::search_part_with_selection(
+                call,
+                &scope,
+                metadata,
+                chunk,
+                selection.as_ref(),
+            )
+            .await
+            {
                 Ok(text) => text,
                 Err(error) if corpus::hidden(&error) => continue,
                 Err(error) => return Err(error),

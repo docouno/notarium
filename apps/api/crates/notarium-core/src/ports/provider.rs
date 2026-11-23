@@ -613,9 +613,13 @@ pub trait ProviderEgressLease: Send {
     /// even when the call contains only trusted orchestration instructions.
     fn project(&self) -> Option<&FolderRef>;
     fn secondary_projects(&self) -> &[FolderRef];
-    /// The transport received a successful final response head. A database
-    /// read barrier can be released; keep revocation registration until close.
-    fn mark_dispatched(&mut self);
+    /// The transport accepted the encoded request body. Release database read
+    /// locks/snapshots cleanly before waiting for upstream response headers;
+    /// keep revocation registration active until socket close.
+    fn mark_dispatched(&mut self) -> PortFuture<'_, ()>;
+    /// Cleanly release any remaining database snapshot/locks on teardown without
+    /// marking the call dispatched (for example, on pre-send validation failure).
+    fn close(&mut self) -> PortFuture<'_, ()>;
     /// Scoped query folders verified inside this project. The lease pins their
     /// active ancestry until dispatch finishes or is cancelled.
     fn project_folders(&self) -> &BTreeSet<FolderId>;
@@ -642,14 +646,11 @@ pub struct ProviderEgressDependencies {
 pub trait ProviderEgressCatalogPort: Send + Sync {
     /// Discover additional identities and projects reachable from exact chat
     /// origins. The dispatch snapshot will revalidate every root and edge.
-    /// Adapters without chat storage can leave the dependency set empty.
     fn chat_dependencies(
         &self,
-        _ctx: AccountContext,
-        _roots: Vec<ProviderOrigin>,
-    ) -> PortFuture<'_, ProviderEgressDependencies> {
-        Box::pin(async { Ok(ProviderEgressDependencies::default()) })
-    }
+        ctx: AccountContext,
+        roots: Vec<ProviderOrigin>,
+    ) -> PortFuture<'_, ProviderEgressDependencies>;
 
     fn acquire_egress(
         &self,

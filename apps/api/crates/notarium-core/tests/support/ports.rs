@@ -26,9 +26,9 @@ impl NoteReadPort for RejectingPorts {
     fn resolve_note_target(&self, ctx: SpaceContext, parent: Option<FolderId>, slug_title_or_id: String) -> PortFuture<'_, Option<NoteRef>>;
     fn space_schema(&self, ctx: SpaceContext) -> PortFuture<'_, std::collections::BTreeMap<String, FieldSchema>>;
     fn project_note_counts(&self, ctx: SpaceContext, project: FolderRef, causal: CausalBasis) -> PortFuture<'_, ProjectNoteCounts>;
-    fn prepare_agent_run_rollback(&self, ctx: SpaceContext, run: AgentRunId) -> PortFuture<'_, RollbackAgentRun>;
     fn read_ability_resource(&self, ctx: SpaceContext, request: ReadAbilityResource) -> PortFuture<'_, notarium_core::classes::ClassifiedAbilityResource>;
     fn get_note(&self, ctx: SpaceContext, request: GetNote) -> PortFuture<'_, NoteSnapshot>;
+    fn get_note_metadata(&self, ctx: SpaceContext, request: GetNote) -> PortFuture<'_, NoteMetadataSnapshot>;
     fn list_notes(
             &self,
             ctx: SpaceContext,
@@ -243,6 +243,17 @@ impl ControlPort for RejectingPorts {
         &self,
         ctx: AccountContext,
     ) -> PortFuture<'_, (EngineAuthContext, Option<std::time::Instant>)>;
+    fn fence_canonical_effect(
+        &self,
+        authority: EngineAuthContext,
+        ctx: SpaceContext,
+        effect: CanonicalEffect,
+    ) -> PortFuture<'_, SpaceContext>;
+    fn revalidate_proposal_human(
+        &self,
+        ctx: AccountContext,
+        access: ProposalHumanAccess,
+    ) -> PortFuture<'_, EngineAuthContext>;
     fn whoami(&self, ctx: AccountContext) -> PortFuture<'_, PrincipalInfo>;
     fn list_spaces(&self, ctx: AccountContext, page: ControlPageRequest) -> PortFuture<'_, ControlPage<AccessibleSpace>>;
     fn list_projects(&self, ctx: AccountContext, page: ControlPageRequest) -> PortFuture<'_, ControlPage<ProjectInfo>>;
@@ -272,21 +283,11 @@ impl ControlPort for RejectingPorts {
             ctx: AccountContext,
             request: AccountMutation<StartEpisode>,
         ) -> PortFuture<'_, ControlCommit<EpisodeStartResult>>;
-    fn start_agent_episode(
-            &self,
-            ctx: AccountContext,
-            request: AccountMutation<StartEpisode>,
-        ) -> PortFuture<'_, ControlCommit<EpisodeStartResult>>;
     fn get_episode(&self, ctx: AccountContext, episode: EpisodeId) -> PortFuture<'_, AgentEpisode>;
     fn update_episode(
             &self,
             ctx: AccountContext,
-            request: AccountMutation<EpisodeUpdate>,
-        ) -> PortFuture<'_, ControlCommit<AgentEpisode>>;
-    fn bind_episode_role(
-            &self,
-            ctx: AccountContext,
-            request: AccountMutation<EpisodeUpdate>,
+            request: AccountMutation<EpisodeMutation>,
         ) -> PortFuture<'_, ControlCommit<AgentEpisode>>;
     fn touch_episode(&self, ctx: AccountContext, episode: EpisodeId) -> PortFuture<'_, ()>;
     fn acknowledge_delta(
@@ -326,32 +327,17 @@ impl ControlPort for RejectingPorts {
             &self,
             ctx: AccountContext,
             request: AccountMutation<AbilityBindingUpdate>,
-        ) -> PortFuture<'_, ControlCommit<AbilityDescriptor>>;
+        ) -> PortFuture<'_, ControlCommit<AbilityBindingResult>>;
     fn set_ability_preference(
-            &self,
-            ctx: AccountContext,
-            request: AccountMutation<AbilityPreferenceUpdate>,
-        ) -> PortFuture<'_, ControlCommit<AbilityPreferenceUpdate>>;
-    fn set_ability_trail(
-            &self,
-            ctx: AccountContext,
-            request: AccountMutation<AbilityTrailUpdate>,
-        ) -> PortFuture<'_, ControlCommit<AbilityTrailUpdate>>;
-    fn compare_authored_ability_binding(
-            &self,
-            ctx: AccountContext,
-            request: AccountMutation<AbilityBindingChange>,
-        ) -> PortFuture<'_, ControlCommit<AbilityRef>>;
-    fn compare_authored_ability_preference(
             &self,
             ctx: AccountContext,
             request: AccountMutation<AbilityPreferenceChange>,
         ) -> PortFuture<'_, ControlCommit<AbilityPreferenceUpdate>>;
-    fn adopt_authored_ability_promotion(
+    fn set_ability_trail(
             &self,
             ctx: AccountContext,
-            request: AccountMutation<AdoptAbilityPromotion>,
-        ) -> PortFuture<'_, ControlCommit<AbilityPromotionResult>>;
+            request: AccountMutation<AbilityTrailMutation>,
+        ) -> PortFuture<'_, ControlCommit<AbilityTrailResult>>;
     fn lookup_mcp_dedup(
             &self,
             ctx: AccountContext,
@@ -361,13 +347,7 @@ impl ControlPort for RejectingPorts {
             &self,
             ctx: AccountContext,
             record: McpDedupRecord,
-        ) -> PortFuture<'_, ()>;
-    fn resolve_memory_target(
-            &self,
-            ctx: AccountContext,
-            target: MemoryTarget,
-            category: String,
-        ) -> PortFuture<'_, ResolvedMemoryTarget>;
+        ) -> PortFuture<'_, McpDedupHit>;
     fn inspect_memory_target(
         &self,
         ctx: AccountContext,
@@ -536,6 +516,12 @@ impl SessionRevocationPort for RejectingPorts {
             selectors: Vec<RevocationSelector>,
             cancellation: Cancellation,
         ) -> PortFuture<'_, Box<dyn RevocationLease>>;
+    fn register_canonical_effect(
+            &self,
+            ctx: MaintenanceContext,
+            selectors: Vec<RevocationSelector>,
+            cancellation: Cancellation,
+        ) -> PortFuture<'_, std::sync::Arc<dyn CanonicalEffectRegistration>>;
     fn fence_provider(
             &self,
             ctx: MaintenanceContext,

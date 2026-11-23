@@ -345,6 +345,7 @@ async fn persist_summary(
         }),
         interruption: None,
         proposed_diff: None,
+        proposed_effect: None,
         referenced_notes: vec![],
         tainted: false,
     };

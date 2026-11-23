@@ -1042,6 +1042,16 @@ pub(crate) fn validate_mutation_identity(
     ctx: &SpaceContext,
     identity: &CommandIdentity,
 ) -> Result<(), PortError> {
+    if ctx.confirmed_chat_step().is_some() {
+        return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
+    }
+    validate_confirmable_mutation_identity(ctx, identity)
+}
+
+pub(crate) fn validate_confirmable_mutation_identity(
+    ctx: &SpaceContext,
+    identity: &CommandIdentity,
+) -> Result<(), PortError> {
     ctx.scope().check(&identity.scope)?;
     if identity.actor != *ctx.auth().principal() {
         return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
@@ -1070,15 +1080,11 @@ pub(crate) fn require_revision_only(pre: &Preconditions) -> Result<(), PortError
     Ok(())
 }
 
-/// Derives a forged-hash-safe internal command hash binding `command_kind`, caller `identity.hash`,
-/// and the canonicalized mutation input fingerprint. Even if two requests share a forged `identity.hash`
-/// with the same `CommandKey`, distinct inputs produce distinct `CommandIdentitySpec.command_hash` values
-/// and trigger `DomainError::IdempotencyKeyReused`.
-pub(crate) fn derive_command_identity_spec(
+pub(crate) fn command_identity_hash(
     identity: &CommandIdentity,
     command_kind: &str,
     canonical_payload_fingerprint: &[u8],
-) -> crate::writer::replay::UnboundCommand {
+) -> ContentDigest {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"notarium-cmd-v1:");
     hasher.update(command_kind.as_bytes());
@@ -1086,11 +1092,28 @@ pub(crate) fn derive_command_identity_spec(
     hasher.update(identity.hash.as_bytes());
     hasher.update(&[0]);
     hasher.update(canonical_payload_fingerprint);
-    crate::writer::replay::UnboundCommand::new(CommandIdentitySpec::new(
-        identity.actor.clone(),
-        identity.key.clone(),
-        ContentDigest::from_bytes(*hasher.finalize().as_bytes()),
-    ))
+    ContentDigest::from_bytes(*hasher.finalize().as_bytes())
+}
+
+/// Derives a forged-hash-safe internal command hash binding `command_kind`, caller `identity.hash`,
+/// and the canonicalized mutation input fingerprint, and attaches any live canonical effect
+/// admission from `ctx`. Even if two requests share a forged `identity.hash` with the same
+/// `CommandKey`, distinct inputs produce distinct `CommandIdentitySpec.command_hash` values and
+/// trigger `DomainError::IdempotencyKeyReused`.
+pub(crate) fn derive_command_identity_spec(
+    ctx: &SpaceContext,
+    identity: &CommandIdentity,
+    command_kind: &str,
+    canonical_payload_fingerprint: &[u8],
+) -> crate::writer::replay::UnboundCommand {
+    crate::writer::replay::UnboundCommand::new(
+        CommandIdentitySpec::new(
+            identity.actor.clone(),
+            identity.key.clone(),
+            command_identity_hash(identity, command_kind, canonical_payload_fingerprint),
+        ),
+        ctx.canonical_effect().cloned(),
+    )
 }
 
 pub(crate) fn extract_agent_run_from_auth(auth: &EngineAuthContext) -> Option<AgentRunId> {

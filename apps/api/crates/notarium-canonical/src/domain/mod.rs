@@ -347,6 +347,29 @@ impl CanonicalStore {
         result
     }
 
+    pub async fn get_note_metadata(
+        &self,
+        ctx: SpaceContext,
+        request: GetNote,
+    ) -> Result<notarium_core::ports::NoteMetadataSnapshot, PortError> {
+        let budget = ctx.budget.clone();
+        let deadline = common::CommandDeadline::start(&budget, "get_note_metadata");
+        if self.is_postgres() {
+            return Self::run_pg_read_request(
+                budget,
+                notes::get_note_metadata_impl(self, ctx, request, &deadline),
+            )
+            .await;
+        }
+        let result = deadline
+            .wait(&budget, || {
+                notes::get_note_metadata_impl(self, ctx, request, &deadline)
+            })
+            .await?;
+        deadline.remaining(&budget)?;
+        result
+    }
+
     pub async fn read_ability_resource(
         &self,
         ctx: SpaceContext,

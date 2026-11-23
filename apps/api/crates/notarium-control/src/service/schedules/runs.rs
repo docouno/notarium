@@ -154,8 +154,7 @@ impl ControlService {
                     Some(ScheduleClaim::SkippedDuplicate(receipt(&previous)?))
                 } else if civil_slot != slot {
                     match slot_receipt(tx.inner_mut(), &request.schedule, civil_slot).await? {
-                        Some(early) if early.config_revision == row.config_revision =>
-                            Some(ScheduleClaim::SkippedDuplicate(receipt(&early)?)),
+                        Some(early) => Some(ScheduleClaim::SkippedDuplicate(receipt(&early)?)),
                         None if observed_at.saturating_sub(civil_slot.max(row.created_at))
                             >= super::super::telemetry::MIN_COMPACT_MS &&
                             missing_cursor_history(tx.inner_mut(), &row, request.expected).await? =>

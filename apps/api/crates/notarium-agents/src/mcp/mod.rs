@@ -11,7 +11,10 @@ pub mod runtime_abilities;
 mod schema;
 mod session;
 
-pub use proposals::{ConfirmProposedDiff, PersonalToolInvocation};
+pub(crate) use ability_tools::bind_chat_role;
+pub use proposals::{
+    ConfirmProposedDiff, ConfirmedDiffOutcome, PersonalToolInvocation, ProposedDiffPreview,
+};
 pub use schema::{ToolAnnotations, ToolDescriptor};
 
 use notarium_core::{
@@ -71,6 +74,7 @@ pub struct McpToolResult {
 pub struct RecordableProposedDiff {
     id: ContentDigest,
     envelope: String,
+    effect: ConfirmedEffectKind,
 }
 
 impl RecordableProposedDiff {
@@ -80,6 +84,10 @@ impl RecordableProposedDiff {
 
     pub fn envelope(&self) -> &str {
         &self.envelope
+    }
+
+    pub fn effect(&self) -> ConfirmedEffectKind {
+        self.effect
     }
 }
 
@@ -159,9 +167,13 @@ impl McpToolResult {
         if encoded.len() > AppendChat::MAX_STRUCTURED_BODY_BYTES - 64 {
             return Err(invalid(ValidationReason::BudgetExceeded));
         }
+        let effect = tool
+            .confirmed_effect_kind()
+            .ok_or_else(|| invalid(ValidationReason::InvalidState))?;
         result.proposal = Some(RecordableProposedDiff {
             id: draft.id,
             envelope: draft.envelope,
+            effect,
         });
         Ok(result)
     }
@@ -180,6 +192,10 @@ pub struct ToolRegistry {
 impl ToolRegistry {
     pub(crate) fn control(&self) -> &dyn ControlPort {
         self.control.as_ref()
+    }
+
+    pub(crate) fn catalog(&self) -> &dyn ControlCatalogPort {
+        self.catalog.as_ref()
     }
 
     pub(crate) fn engine(&self) -> &dyn EnginePort {
@@ -294,7 +310,7 @@ impl ToolRegistry {
         &self,
         account: AccountContext,
         request: ConfirmProposedDiff,
-    ) -> Result<Value, PortError> {
+    ) -> Result<ConfirmedDiffOutcome, PortError> {
         proposals::confirm(self, account, request).await
     }
 
@@ -303,7 +319,7 @@ impl ToolRegistry {
         &self,
         account: AccountContext,
         request: ConfirmProposedDiff,
-    ) -> Result<Value, PortError> {
+    ) -> Result<ProposedDiffPreview, PortError> {
         proposals::preview(self, account, request).await
     }
 
@@ -381,6 +397,7 @@ impl ToolRegistry {
             deadline,
             cancellation,
             provenance: ChatProvenance::default(),
+            policies: corpus::CandidatePolicies::default(),
         };
         self.telemetry
             .begin_agent_call(
@@ -545,6 +562,7 @@ struct ToolCallContext<'a> {
     deadline: Instant,
     cancellation: Cancellation,
     provenance: ChatProvenance,
+    policies: corpus::CandidatePolicies,
 }
 
 impl<'a> ToolCallContext<'a> {
@@ -561,6 +579,7 @@ impl<'a> ToolCallContext<'a> {
             deadline: self.deadline,
             cancellation: self.cancellation.clone(),
             provenance: ChatProvenance::default(),
+            policies: corpus::CandidatePolicies::default(),
         }
     }
 
@@ -583,6 +602,7 @@ impl<'a> ToolCallContext<'a> {
             deadline: Instant::now() + budget.remaining,
             cancellation: budget.cancellation,
             provenance: ChatProvenance::default(),
+            policies: corpus::CandidatePolicies::default(),
         })
     }
 
@@ -671,12 +691,12 @@ impl<'a> ToolCallContext<'a> {
             request_hash,
             operation: self.tool.name().to_owned(),
         };
-        let lookup = || {
-            self.registry
-                .control
-                .lookup_mcp_dedup(self.account(), key.clone())
-        };
-        let hit = match lookup().await? {
+        let hit = match self
+            .registry
+            .control
+            .lookup_mcp_dedup(self.account(), key.clone())
+            .await?
+        {
             Some(hit) => hit,
             None => {
                 let plan = build().await?;
@@ -687,16 +707,13 @@ impl<'a> ToolCallContext<'a> {
                     .record_mcp_dedup(
                         self.account(),
                         McpDedupRecord {
-                            key: key.clone(),
+                            key,
                             safe_result,
                             effect: AgentEffect::None,
                             ttl_ms: JOURNAL_TTL_MS,
                         },
                     )
-                    .await?;
-                lookup()
                     .await?
-                    .ok_or_else(|| invalid(ValidationReason::InvalidState))?
             }
         };
         serde_json::from_str(&hit.safe_result).map_err(|_| invalid(ValidationReason::InvalidState))
@@ -909,7 +926,7 @@ mod tests {
         let payload = json!({
             "versionToken": "revision_example",
             "instructions": "Follow the sources.\nReview the results.",
-            "nextAction": {"name":"list_abilities","arguments":{"cursor":"second-page"}},
+            "nextAction": {"tool":"list_abilities","arguments":{"cursor":"second-page"}},
             "steps": [{"step":"authored","outcome":"applied"}]
         });
         let result = McpToolResult::new(

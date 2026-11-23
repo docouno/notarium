@@ -19,8 +19,7 @@ fn cursor(page: &ControlPageRequest, scope: ContentDigest) -> Result<Option<Curs
     Ok(cursor)
 }
 impl ControlService {
-    async fn readable_schedule(
-        &self,
+    fn readable_schedule_in_space(
         ctx: &AccountContext,
         row: &AgentSchedulesRow,
     ) -> Result<AgentSchedule, PortError> {
@@ -40,6 +39,14 @@ impl ControlService {
         {
             return Err(DomainError::ResourceNotFound.into());
         }
+        Ok(value)
+    }
+    async fn readable_schedule(
+        &self,
+        ctx: &AccountContext,
+        row: &AgentSchedulesRow,
+    ) -> Result<AgentSchedule, PortError> {
+        let value = Self::readable_schedule_in_space(ctx, row)?;
         self.catalog_space(ctx, &value.definition.space).await?;
         // Stored owner configuration remains editable after its target project
         // disappears. It does not expose canonical titles or package content.
@@ -117,7 +124,7 @@ impl ControlService {
                     let mut last = None;
                     for row in rows.into_iter().take(usize::from(page.limit())) {
                         last = Some(row.schedule_id.clone());
-                        match self.readable_schedule(&current, &row).await {
+                        match Self::readable_schedule_in_space(&current, &row) {
                             Ok(value) => items.push(value),
                             Err(e) if hidden(&e) => (),
                             Err(e) => return Err(e),

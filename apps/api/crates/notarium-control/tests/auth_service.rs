@@ -1621,6 +1621,7 @@ async fn interactive_management_and_account_guards(pg: bool) {
             reference: ability_ref.clone(),
             kind: AbilityKind::Role,
             name: "selected-guide".into(),
+            description: None,
             enabled: true,
             healthy: true,
             lifecycle: Lifecycle::Active,
@@ -1692,7 +1693,7 @@ async fn interactive_management_and_account_guards(pg: bool) {
                     input: AbilityBindingUpdate {
                         ability: ability_ref,
                         enabled: true,
-                        expected: ControlRevision::ZERO,
+                        expected: AbilityOverlayGuard::Account(ControlRevision::ZERO),
                         projects: AbilityProjects::Selected(vec![project_ok]),
                     },
                 },

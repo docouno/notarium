@@ -60,14 +60,14 @@ async fn update(
             ctx.clone(),
             AccountMutation {
                 identity: identity(service, ctx, key).await,
-                input: EpisodeUpdate {
+                input: EpisodeMutation::Full(EpisodeUpdate {
                     episode: episode.id.clone(),
                     expected: episode.revision,
                     name: episode.name.clone(),
                     active_role: episode.active_role.clone(),
                     project_hint: episode.project_hint.clone(),
                     lifecycle: state,
-                },
+                }),
             },
         )
         .await
@@ -124,6 +124,7 @@ async fn exercise(pg: bool) {
                 name: Some("working".into()),
             },
             project_hint: Some(project.clone()),
+            guard: EpisodeRevisionGuard::Account,
         },
     };
     let (one, replay) = tokio::join!(
@@ -196,6 +197,7 @@ async fn exercise(pg: bool) {
         input: StartEpisode {
             selector: EpisodeSelector::Id(original.id.clone()),
             project_hint: None,
+            guard: EpisodeRevisionGuard::Account,
         },
     };
     let forked = service
@@ -235,6 +237,7 @@ async fn exercise(pg: bool) {
                 input: StartEpisode {
                     selector: EpisodeSelector::Id(fork.id.clone()),
                     project_hint: None,
+                    guard: EpisodeRevisionGuard::Account,
                 },
             },
         )
@@ -251,6 +254,7 @@ async fn exercise(pg: bool) {
                 input: StartEpisode {
                     selector: EpisodeSelector::Name("working".into()),
                     project_hint: None,
+                    guard: EpisodeRevisionGuard::Account,
                 },
             },
         )
@@ -274,6 +278,7 @@ async fn exercise(pg: bool) {
         reference: role.clone(),
         kind: AbilityKind::Role,
         name: "fixture-role".into(),
+        description: None,
         enabled: true,
         healthy: true,
         lifecycle: Lifecycle::Active,
@@ -395,7 +400,8 @@ async fn exercise(pg: bool) {
                     identity: identity(&service, &ctx, 42).await,
                     input: StartEpisode {
                         selector: EpisodeSelector::Id(fork.id.clone()),
-                        project_hint: None
+                        project_hint: None,
+                        guard: EpisodeRevisionGuard::Account,
                     }
                 }
             )
@@ -412,6 +418,7 @@ async fn exercise(pg: bool) {
                 input: StartEpisode {
                     selector: EpisodeSelector::Id(original.id.clone()),
                     project_hint: None,
+                    guard: EpisodeRevisionGuard::Account,
                 },
             },
         )

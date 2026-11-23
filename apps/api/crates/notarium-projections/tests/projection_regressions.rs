@@ -563,6 +563,7 @@ async fn is_live_visible_hydrate_and_note_links_enforce_cross_space_taint_and_au
                         GraphQuery {
                             tier: GraphTier::Superclusters,
                             filter,
+                            causal: None,
                         },
                     )
                     .await
@@ -963,6 +964,7 @@ async fn lagged_folder_visibility_yields_to_writers_and_rejects_a_mixed_head() {
             GraphQuery {
                 tier: GraphTier::Superclusters,
                 filter: empty_filter(),
+                causal: None,
             },
         )
         .await
@@ -979,6 +981,7 @@ async fn lagged_folder_visibility_yields_to_writers_and_rejects_a_mixed_head() {
             tags: Vec::new(),
         },
         filter: empty_filter(),
+        causal: None,
     };
     let cancelled = SpaceContext::new(reader.auth().clone(), scope.clone(), budget()).unwrap();
     let mut pending = engine.query_graph(cancelled.clone(), graph.clone());
@@ -1642,6 +1645,7 @@ async fn shared_space_personal_chat_does_not_leak_and_exact_number_board_parity(
                     interruption: None,
                     provenance: None,
                     proposed_diff: None,
+                    proposed_effect: None,
                     thread: thread.clone(),
                     parent: ThreadEntrySeq::ZERO,
                     kind: ChatEntryKind::Human,
@@ -1991,6 +1995,7 @@ async fn personal_chat_audience_isolation_and_deferred_backlink_taint() {
                     interruption: None,
                     provenance: None,
                     proposed_diff: None,
+                    proposed_effect: None,
                     thread: thread.clone(),
                     parent: ThreadEntrySeq::ZERO,
                     kind: ChatEntryKind::Human,
@@ -2067,6 +2072,7 @@ async fn personal_chat_audience_isolation_and_deferred_backlink_taint() {
                     interruption: None,
                     provenance: None,
                     proposed_diff: None,
+                    proposed_effect: None,
                     thread: cross_thread,
                     parent: ThreadEntrySeq::ZERO,
                     kind: ChatEntryKind::Human,
@@ -2393,6 +2399,7 @@ async fn event_scrub_on_redact_chat_and_restricted_subscriber_floor() {
                     interruption: None,
                     provenance: None,
                     proposed_diff: None,
+                    proposed_effect: None,
                     thread: thread.clone(),
                     parent: ThreadEntrySeq::ZERO,
                     kind: ChatEntryKind::Human,
@@ -2804,6 +2811,7 @@ async fn root_non_recursive_listing_supercluster_csprng_and_decommission_gate() 
             GraphQuery {
                 tier: GraphTier::Superclusters,
                 filter: empty_filter(),
+                causal: None,
             },
         )
         .await
@@ -2819,6 +2827,7 @@ async fn root_non_recursive_listing_supercluster_csprng_and_decommission_gate() 
             GraphQuery {
                 tier: GraphTier::Superclusters,
                 filter: empty_filter(),
+                causal: None,
             },
         )
         .await
@@ -2838,6 +2847,7 @@ async fn root_non_recursive_listing_supercluster_csprng_and_decommission_gate() 
             GraphQuery {
                 tier: GraphTier::Superclusters,
                 filter: empty_filter(),
+                causal: None,
             },
         )
         .await
@@ -3179,6 +3189,7 @@ async fn backlink_lookahead_taints_and_tainted_mutation_hides_foreign_personal_c
                     interruption: None,
                     provenance: None,
                     proposed_diff: None,
+                    proposed_effect: None,
                     thread: local_thread,
                     parent: ThreadEntrySeq::ZERO,
                     kind: ChatEntryKind::Human,
@@ -3249,6 +3260,7 @@ async fn backlink_lookahead_taints_and_tainted_mutation_hides_foreign_personal_c
                     interruption: None,
                     provenance: None,
                     proposed_diff: None,
+                    proposed_effect: None,
                     thread: foreign_thread,
                     parent: ThreadEntrySeq::ZERO,
                     kind: ChatEntryKind::Human,
@@ -3404,6 +3416,7 @@ async fn backlink_lookahead_taints_and_tainted_mutation_hides_foreign_personal_c
                     interruption: None,
                     provenance: None,
                     proposed_diff: None,
+                    proposed_effect: None,
                     thread: private_in_shared,
                     parent: ThreadEntrySeq::ZERO,
                     kind: ChatEntryKind::Human,

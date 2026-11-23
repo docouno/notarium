@@ -301,16 +301,22 @@ impl ControlCatalogPort for Catalog {
                 .continuation()
                 .map(|v| v.parse::<usize>().unwrap())
                 .unwrap_or(0);
-            let values: Vec<_> = self
-                .ability_entries
-                .lock()
-                .unwrap()
+            let entries = self.ability_entries.lock().unwrap();
+            let mut latest_indices = std::collections::BTreeMap::new();
+            for (idx, value) in entries.iter().enumerate() {
+                let key = serde_json::to_string(&value.reference.identity()).unwrap();
+                latest_indices.insert(key, idx);
+            }
+            let tip_set: std::collections::BTreeSet<usize> = latest_indices.into_values().collect();
+            let values: Vec<_> = entries
                 .iter()
-                .filter(|value| {
-                    query.kind.is_none_or(|kind| value.kind == kind)
+                .enumerate()
+                .filter(|(idx, value)| {
+                    tip_set.contains(idx)
+                        && query.kind.is_none_or(|kind| value.kind == kind)
                         && query.name.as_ref().is_none_or(|name| value.name == *name)
                 })
-                .cloned()
+                .map(|(_, value)| value.clone())
                 .collect();
             let end = offset
                 .saturating_add(usize::from(query.page.limit()))
@@ -416,6 +422,19 @@ impl ControlCatalogPort for Catalog {
                 .ok_or(DomainError::ResourceNotFound)?;
             ctx.auth().can_view_resource(&value.facts)?;
             Ok(value)
+        })
+    }
+    fn locate_note(&self, ctx: AccountContext, note: NoteId) -> PortFuture<'_, CatalogNote> {
+        Box::pin(async move {
+            let entries = self.note_entries.lock().unwrap();
+            for space_id in ctx.auth().spaces().keys() {
+                if let Some(value) = entries.get(&(space_id.clone(), note.clone()))
+                    && ctx.auth().can_view_resource(&value.facts).is_ok()
+                {
+                    return Ok(value.clone());
+                }
+            }
+            Err(DomainError::ResourceNotFound.into())
         })
     }
     fn folder(&self, ctx: AccountContext, folder: FolderRef) -> PortFuture<'_, CatalogFolder> {
@@ -624,6 +643,29 @@ impl SessionRevocationPort for Revoker {
             }
         })
     }
+    fn register_canonical_effect(
+        &self,
+        ctx: MaintenanceContext,
+        selectors: Vec<RevocationSelector>,
+        cancellation: Cancellation,
+    ) -> PortFuture<'_, Arc<dyn CanonicalEffectRegistration>> {
+        Box::pin(async move {
+            ctx.authority.require(ServicePurpose::Revocation)?;
+            let keys = selector_keys(selectors);
+            {
+                let registry = self.provider_registry.lock().unwrap();
+                if registry.fences.values().any(|other| overlaps(&keys, other)) {
+                    return Err(DomainError::AccessDenied.into());
+                }
+            }
+            Ok(Arc::new(TestCanonicalEffectRegistration {
+                registry: self.provider_registry.clone(),
+                keys,
+                cancellation,
+                deadline: Mutex::new(None),
+            }) as Arc<dyn CanonicalEffectRegistration>)
+        })
+    }
     fn fence_provider(
         &self,
         ctx: MaintenanceContext,
@@ -720,6 +762,58 @@ impl RevocationLease for ProviderRegistryLease {
         } else {
             Ok(())
         }
+    }
+}
+struct TestCanonicalEffectRegistration {
+    registry: Arc<Mutex<ProviderRegistry>>,
+    keys: Vec<String>,
+    cancellation: Cancellation,
+    deadline: Mutex<Option<std::time::Instant>>,
+}
+impl CanonicalEffectRegistration for TestCanonicalEffectRegistration {
+    fn restrict_until(&self, deadline: std::time::Instant) -> Result<(), PortError> {
+        let mut slot = self.deadline.lock().unwrap();
+        *slot = Some(match *slot {
+            Some(existing) => existing.min(deadline),
+            None => deadline,
+        });
+        self.check()
+    }
+    fn check(&self) -> Result<(), PortError> {
+        if self.cancellation.is_cancelled()
+            || self
+                .deadline
+                .lock()
+                .unwrap()
+                .is_some_and(|d| std::time::Instant::now() >= d)
+        {
+            return Err(DomainError::AccessDenied.into());
+        }
+        Ok(())
+    }
+    fn begin(self: Arc<Self>) -> PortFuture<'static, Box<dyn RevocationLease>> {
+        Box::pin(async move {
+            self.check()?;
+            let mut registry = self.registry.lock().unwrap();
+            if registry
+                .fences
+                .values()
+                .any(|other| overlaps(&self.keys, other))
+            {
+                return Err(DomainError::AccessDenied.into());
+            }
+            let id = registry.next;
+            registry.next += 1;
+            registry
+                .calls
+                .insert(id, (self.keys.clone(), self.cancellation.clone()));
+            Ok(Box::new(ProviderRegistryLease {
+                registry: self.registry.clone(),
+                id,
+                fence: false,
+                cancellation: self.cancellation.clone(),
+            }) as Box<dyn RevocationLease>)
+        })
     }
 }
 impl Drop for ProviderRegistryLease {

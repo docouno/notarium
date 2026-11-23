@@ -113,6 +113,7 @@ pub(super) async fn secondary_project_abilities_reach_the_wire(
                         name: None,
                     },
                     project_hint: Some(project.clone()),
+                    guard: EpisodeRevisionGuard::Account,
                 },
             },
         )

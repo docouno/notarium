@@ -24,37 +24,22 @@ pub(crate) const V4_HASH: &str = "23fda6322e7820fdb9b60bd67192098e3d472c074f655a
 
 pub(crate) const V5_HASH: &str = "e32b31f85aeb41b99c19c355bad2f9103eac552a0fe4b9c1ebb149892a7d9774";
 pub(crate) const V6_HASH: &str = "f91526e264d8000bf5d72a4efcb4e9701b350636c37da24d2b34bb19f50a8772";
-pub(crate) const PROJECTION_V7_HASH: &str =
-    "1a3cfcfe1c2d78948310fb1dafb04dba99e243ea821626e2de4d7009c3aa22b9";
-pub(crate) const PROJECTION_V8_HASH: &str =
-    "085e724d4cf969a85265d36b616fe04bc78a51c3beadf86dee7f1664bee2dcd7";
-pub(crate) const AGENT_V7_HASH: &str =
-    "244ce610feed9e389063805c0c36190633a082df2b743fbf340c40418797e2a0";
-pub(crate) const AGENT_V8_HASH: &str =
-    "ee1c8eada40f5ad7575b1fdf463b4e31961897dacfb81fd9aa549145d768100f";
+pub(crate) const V7_HASH: &str = "1a3cfcfe1c2d78948310fb1dafb04dba99e243ea821626e2de4d7009c3aa22b9";
+pub(crate) const V8_HASH: &str = "085e724d4cf969a85265d36b616fe04bc78a51c3beadf86dee7f1664bee2dcd7";
 
-// Two independently produced layouts used versions 7 and 8. Their exact
-// manifest identifies which upgrades are already present, on disk and in backups.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct SchemaLayout {
-    pub projections: i64,
-    pub agents: i64,
-}
-
-pub(crate) fn predecessor(version: i64, hash: &[u8]) -> Option<SchemaLayout> {
+pub(crate) fn predecessor(version: i64, hash: &[u8]) -> Option<i64> {
     let hash = hex::encode(hash);
-    let (projections, agents) = match (version, hash.as_str()) {
-        (1, V1_HASH) | (2, V2_HASH) | (3, V3_HASH) | (4, V4_HASH) | (5, V5_HASH) | (6, V6_HASH) => {
-            (version, version)
-        }
-        (7, PROJECTION_V7_HASH) | (8, PROJECTION_V8_HASH) => (version, 6),
-        (7, AGENT_V7_HASH) | (8, AGENT_V8_HASH) => (6, version),
-        _ => return None,
-    };
-    Some(SchemaLayout {
-        projections,
-        agents,
-    })
+    match (version, hash.as_str()) {
+        (1, V1_HASH)
+        | (2, V2_HASH)
+        | (3, V3_HASH)
+        | (4, V4_HASH)
+        | (5, V5_HASH)
+        | (6, V6_HASH)
+        | (7, V7_HASH)
+        | (8, V8_HASH) => Some(version),
+        _ => None,
+    }
 }
 
 const READ_WITNESS: &str = "SELECT CAST(schema_version AS BIGINT), manifest_checksum
@@ -236,7 +221,7 @@ macro_rules! upgrade {
             let Some((version, hash)) = previous else {
                 return Ok(());
             };
-            let Some(layout) = predecessor(version, &hash) else {
+            let Some(version) = predecessor(version, &hash) else {
                 return Ok(());
             };
             if version == 1 {
@@ -298,39 +283,7 @@ macro_rules! upgrade {
                 sqlx::query(sqlx::AssertSqlSafe(index)).execute(&mut *conn).await
                     .map_err(|e| internal_not_committed("migration_v6_retirement_index", e.to_string()))?;
             }
-            if layout.agents < 7 {
-                let add_epoch = if stringify!($variant) == "Sqlite" {
-                    "ALTER TABLE chat_threads ADD COLUMN active_run_epoch INTEGER CHECK (active_run_epoch IS NULL OR active_run_epoch >= 0)"
-                } else {
-                    "ALTER TABLE chat_threads ADD COLUMN active_run_epoch BIGINT CHECK (active_run_epoch IS NULL OR active_run_epoch >= 0)"
-                };
-                for sql in std::iter::once(add_epoch).chain(MIGRATE_CHAT_HISTORY) {
-                    sqlx::query(sql).execute(&mut *conn).await.map_err(|e| {
-                        internal_not_committed("migration_v7_chat_history", e.to_string())
-                    })?;
-                }
-                sqlx::query(sqlx::AssertSqlSafe(baseline_statement(
-                    $ddl,
-                    "CREATE INDEX IF NOT EXISTS idx_chat_pending_inputs_consumed",
-                )?))
-                .execute(&mut *conn)
-                .await
-                .map_err(|e| internal_not_committed("migration_v7_chat_handoff_index", e.to_string()))?;
-            }
-            if layout.agents < 8 {
-                sqlx::query("DROP INDEX IF EXISTS uq_ability_packages_active_slug")
-                    .execute(&mut *conn)
-                    .await
-                    .map_err(|e| internal_not_committed("migration_v8_ability_slot_drop", e.to_string()))?;
-                sqlx::query(sqlx::AssertSqlSafe(baseline_statement(
-                    $ddl,
-                    "CREATE INDEX IF NOT EXISTS idx_ability_packages_active_slug",
-                )?))
-                .execute(&mut *conn)
-                .await
-                .map_err(|e| internal_not_committed("migration_v8_ability_slot_index", e.to_string()))?;
-            }
-            if layout.projections < 7 {
+            if version < 7 {
                 let rank_error = |e: sqlx::Error| {
                     internal_not_committed("migration_v7_rank_anchor", e.to_string())
                 };
@@ -351,8 +304,48 @@ macro_rules! upgrade {
                     ));
                 }
             }
-            if layout.projections < 8 {
-                chat_refs::$name(&mut *conn, layout.projections).await?;
+            if version < 8 {
+                chat_refs::$name(&mut *conn, version).await?;
+            }
+            if version < 9 {
+                let (add_epoch, add_redaction_epoch) = if stringify!($variant) == "Sqlite" {
+                    (
+                        "ALTER TABLE chat_threads ADD COLUMN active_run_epoch INTEGER CHECK (active_run_epoch IS NULL OR active_run_epoch >= 0)",
+                        "ALTER TABLE chat_threads ADD COLUMN redaction_epoch INTEGER NOT NULL DEFAULT 0 CHECK (redaction_epoch >= 0)",
+                    )
+                } else {
+                    (
+                        "ALTER TABLE chat_threads ADD COLUMN active_run_epoch BIGINT CHECK (active_run_epoch IS NULL OR active_run_epoch >= 0)",
+                        "ALTER TABLE chat_threads ADD COLUMN redaction_epoch BIGINT NOT NULL DEFAULT 0 CHECK (redaction_epoch >= 0)",
+                    )
+                };
+                for sql in [add_epoch]
+                    .into_iter()
+                    .chain(MIGRATE_CHAT_HISTORY)
+                    .chain([add_redaction_epoch])
+                {
+                    sqlx::query(sql).execute(&mut *conn).await.map_err(|e| {
+                        internal_not_committed("migration_v9_chat_history", e.to_string())
+                    })?;
+                }
+                sqlx::query("DROP INDEX IF EXISTS uq_ability_packages_active_slug")
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(|e| internal_not_committed("migration_v9_ability_slot_drop", e.to_string()))?;
+                for prefix in [
+                    "CREATE INDEX IF NOT EXISTS idx_chat_pending_inputs_consumed",
+                    "CREATE INDEX IF NOT EXISTS idx_ability_packages_active_slug",
+                    "CREATE INDEX IF NOT EXISTS idx_spaces_personal_owner",
+                    "CREATE INDEX IF NOT EXISTS idx_folder_heads_active_projects_id",
+                    "CREATE INDEX IF NOT EXISTS idx_command_receipts_seq",
+                ] {
+                    sqlx::query(sqlx::AssertSqlSafe(baseline_statement($ddl, prefix)?))
+                        .execute(&mut *conn)
+                        .await
+                        .map_err(|e| {
+                            internal_not_committed("migration_v9_indexes", e.to_string())
+                        })?;
+                }
             }
             let (sec, nsec) =
                 crate::codec::encode_timestamp_parts(crate::codec::now_utc_timestamp()?);
@@ -405,13 +398,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn both_divergent_layouts_upgrade_using_the_manifest_witness() {
-        for (version, hash) in [
-            (7, AGENT_V7_HASH),
-            (8, AGENT_V8_HASH),
-            (7, PROJECTION_V7_HASH),
-            (8, PROJECTION_V8_HASH),
-        ] {
+    async fn linear_v7_and_v8_upgrade_using_the_manifest_witness() {
+        for (version, hash) in [(7, V7_HASH), (8, V8_HASH)] {
             let mut db = SqliteConnection::connect(":memory:").await.unwrap();
             let installation = InstallationId::from_bytes([7; 16]);
             bootstrap_sqlite_schema(&mut db, &installation)

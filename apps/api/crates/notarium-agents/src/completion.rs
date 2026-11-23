@@ -7,7 +7,7 @@ use notarium_core::{
     error::{CommitEffect, OperationalFailure, PortError, RetryAdvice, ValidationReason},
     ids::{AgentRunId, CommandKey, ContentDigest, EpisodeId},
     ports::{
-        CallBudget, Cancellation, CompletionBudget, CompletionEvent, CompletionFinish,
+        AppendChat, CallBudget, Cancellation, CompletionBudget, CompletionEvent, CompletionFinish,
         CompletionRequest, ControlPort, ProviderErrorCode, ProviderToolCall, ProviderToolCallId,
         ProviderUsage, RunLimits, SpaceContext,
     },
@@ -17,8 +17,19 @@ use tokio::time::Instant;
 use crate::mcp::{ToolRegistry, derive_key};
 
 const MAX_MODEL_TEXT_BYTES: usize = 200 * 1024;
+const MAX_TURN_PAYLOAD_BYTES: usize = AppendChat::MAX_STRUCTURED_BODY_BYTES - 1024;
 const TOOL_DISPLAY_BYTES: usize = 32 * 1024;
 const MAX_CALL_TIME: Duration = Duration::from_secs(120);
+
+fn json_escaped_len(text: &str) -> usize {
+    text.chars().fold(0usize, |used, ch| {
+        used + match ch {
+            '"' | '\\' | '\u{8}' | '\t' | '\n' | '\u{c}' | '\r' => 2,
+            '\0'..='\u{1f}' => 6,
+            ch => ch.len_utf8(),
+        }
+    })
+}
 
 pub(crate) struct CompletionRunBudget {
     next_step: u32,
@@ -173,6 +184,8 @@ pub(crate) async fn complete_step(
     let cancellation = ctx.budget.cancellation.clone();
     let mut stream = within(&reservation, &cancellation, control.complete(ctx, request)).await?;
     let mut text = String::new();
+    let mut escaped_text_bytes = 0usize;
+    let mut tool_calls_bytes = 0usize;
     let mut calls = Vec::new();
     let mut raw_ids = BTreeSet::new();
     let mut usage = None;
@@ -186,11 +199,18 @@ pub(crate) async fn complete_step(
                 if usage.is_some() || !calls.is_empty() {
                     return Err(protocol());
                 }
-                if delta.len() > MAX_MODEL_TEXT_BYTES.saturating_sub(text.len()) {
+                let delta_escaped = json_escaped_len(&delta);
+                if delta.len() > MAX_MODEL_TEXT_BYTES.saturating_sub(text.len())
+                    || escaped_text_bytes
+                        .saturating_add(delta_escaped)
+                        .saturating_add(tool_calls_bytes)
+                        > MAX_TURN_PAYLOAD_BYTES
+                {
                     return Err(invalid(ValidationReason::BudgetExceeded));
                 }
                 text_delta(&delta)?;
                 text.push_str(&delta);
+                escaped_text_bytes += delta_escaped;
             }
             CompletionEvent::ToolCall(mut call) => {
                 if usage.is_some()
@@ -212,6 +232,18 @@ pub(crate) async fn complete_step(
                     ],
                 );
                 call.id = ProviderToolCallId::new(stable.to_string())?;
+                let call_bytes = serde_json::to_vec(&call)
+                    .map_err(|_| protocol())?
+                    .len()
+                    .saturating_add(2);
+                if escaped_text_bytes
+                    .saturating_add(tool_calls_bytes)
+                    .saturating_add(call_bytes)
+                    > MAX_TURN_PAYLOAD_BYTES
+                {
+                    return Err(invalid(ValidationReason::BudgetExceeded));
+                }
+                tool_calls_bytes += call_bytes;
                 calls.push(call);
             }
             CompletionEvent::Usage(measured) if usage.is_none() => usage = Some(measured),

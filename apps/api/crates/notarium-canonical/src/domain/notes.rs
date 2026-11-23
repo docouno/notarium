@@ -21,7 +21,7 @@ use notarium_core::{
         EditNote, ExternalObservation, ExternalObservationResult, FilenamePin, GetNote,
         InterceptedMutation, InterceptedOutcome, InterceptedPayload, InterceptionResult, Link,
         LinkBatch, LinkTarget, MoveNote, Mutation, NoteCard, NoteRevision, NoteSnapshot,
-        ObservedContent, Preconditions, RenameNote, RollbackReservation, SpaceContext,
+        ObservedContent, Preconditions, RenameNote, SpaceContext,
     },
     query::{FieldObservation, FieldValue},
     receipt::{CausalBasis, CommandIdentity, MutationReceiptToken},
@@ -202,7 +202,7 @@ impl CanonicalStore {
     ) -> Result<Committed<NoteRevision>, PortError> {
         let deadline = CommandDeadline::start(&ctx.budget, "edit_room");
         let active_op = self.enter_write_op(&ctx.scope().space_id)?;
-        validate_mutation_identity(&ctx, &identity)?;
+        super::common::validate_confirmable_mutation_identity(&ctx, &identity)?;
         let idemp = edit_note_identity(&ctx, &identity, &input, &preconditions);
         if let Some(replayed) = deadline
             .prepare(&ctx.budget, || {
@@ -477,8 +477,7 @@ fn create_note_identity(
     if input.folder_page {
         hash.update(b"folder-page");
     }
-    derive_command_identity_spec(identity, "create_note", hash.finalize().as_bytes())
-        .with_canonical_effect(ctx)
+    derive_command_identity_spec(ctx, identity, "create_note", hash.finalize().as_bytes())
         .with_confirmed_chat_step(ctx, "create_note")
         .for_create(ctx.auth(), &input.note, input.parent.as_ref(), input.class)
 }
@@ -493,8 +492,7 @@ fn edit_note_identity(
     hash.update(input.note.as_str().as_bytes());
     hash_carrier_plan(&mut hash, &input.plan);
     hash_preconditions(&mut hash, preconditions);
-    derive_command_identity_spec(identity, "edit_note", hash.finalize().as_bytes())
-        .with_canonical_effect(ctx)
+    derive_command_identity_spec(ctx, identity, "edit_note", hash.finalize().as_bytes())
         .with_confirmed_chat_step(ctx, "edit_note")
         .for_note(ctx.auth(), &input.note)
 }
@@ -598,7 +596,7 @@ pub(crate) async fn create_note_impl(
     let budget = ctx.budget.clone();
     let deadline = super::common::CommandDeadline::start(&budget, "create_note");
     let active_op_guard = store.enter_write_op(&ctx.scope().space_id)?;
-    validate_mutation_identity(&ctx, &request.identity)?;
+    super::common::validate_confirmable_mutation_identity(&ctx, &request.identity)?;
     crate::domain::common::require_empty_preconditions(&request.preconditions)?;
     if let Some(step) = ctx.confirmed_chat_step()
         && (request.input.class != DocClass::UserDoc
@@ -731,7 +729,7 @@ pub(crate) fn build_create_note_intent(
     let confirmed = idemp
         .as_ref()
         .and_then(|id| id.confirmed_chat_step())
-        .filter(|step| matches!(step.witness().tool_name(), "create_note" | "create_notes"))
+        .filter(|step| step.witness().effect_kind().is_create())
         .cloned();
 
     PreparedWriteIntent {
@@ -817,11 +815,14 @@ pub(crate) fn build_create_note_intent(
                     .into());
                 }
 
+                let total_seqs = if input.folder_page { 2 } else { 1 };
+                let (_first_seq, visibility_seq) = item_ctx.preview_seq_range(total_seqs)?;
                 let seq = item_ctx.alloc_next_seq()?;
                 let rev_id = new_revision_id()?;
                 let now_ts = now_utc_timestamp()?;
                 let (sec, nsec) = encode_timestamp_parts(now_ts);
                 let seq_i64 = seq.get() as i64;
+                let vis_i64 = visibility_seq.get() as i64;
                 let digest = info.prepared_blob.digest;
 
                 item_ctx.record_staged_ticket(ticket.clone());
@@ -864,7 +865,7 @@ pub(crate) fn build_create_note_intent(
                         .bind(digest.as_bytes().as_slice())
                         .bind(info.byte_size as i64)
                         .bind(seq_i64)
-                        .bind(seq_i64)
+                        .bind(vis_i64)
                         .bind(sec)
                         .bind(nsec)
                         .bind(sec)
@@ -884,7 +885,7 @@ pub(crate) fn build_create_note_intent(
                                 content_blake3, byte_size, lifecycle_state, visibility_mask,
                                 settlement_successor_id, created_seq, updated_seq,
                                 created_at_sec, created_at_nsec, updated_at_sec, updated_at_nsec, last_actor_id
-                             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, $9, $10, $11, 'active', 0, NULL, $12, $12, $13, $14, $13, $14, $15)",
+                             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, $9, $10, $11, 'active', 0, NULL, $12, $13, $14, $15, $14, $15, $16)",
                         )
                         .bind(scope_cl.space_id.as_str())
                         .bind(input.note.as_str())
@@ -898,6 +899,7 @@ pub(crate) fn build_create_note_intent(
                         .bind(digest.as_bytes().as_slice())
                         .bind(info.byte_size as i64)
                         .bind(seq_i64)
+                        .bind(vis_i64)
                         .bind(sec)
                         .bind(nsec)
                         .bind(auth.principal().as_str())
@@ -921,20 +923,23 @@ pub(crate) fn build_create_note_intent(
                 };
 
                 let run_opt = extract_agent_run_from_auth(&auth);
-                if input.folder_page {
+                let cover_event = if input.folder_page {
+                    let cover_seq = item_ctx.alloc_next_seq()?;
                     super::folder_cover::assign(
                         tx,
                         &scope_cl,
                         &parent_id,
                         Some(&input.note),
-                        seq,
-                        seq,
+                        cover_seq,
+                        visibility_seq,
                         auth.principal(),
                         run_opt.as_ref(),
                         now_ts,
                     )
-                    .await?;
-                }
+                    .await?
+                } else {
+                    None
+                };
                 let changed_fields = changed_note_fields(&EvaluatedFields::new(), &eval_fields);
                 let meta = RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Note(
                     NoteRevisionMetadata {
@@ -966,7 +971,7 @@ pub(crate) fn build_create_note_intent(
                     "note",
                     input.note.as_str(),
                     seq,
-                    seq,
+                    visibility_seq,
                     None,
                     None,
                     Some(digest),
@@ -984,7 +989,7 @@ pub(crate) fn build_create_note_intent(
                         run_id,
                         auth.principal(),
                         seq,
-                        seq,
+                        visibility_seq,
                         now_ts,
                     )
                     .await?;
@@ -992,7 +997,7 @@ pub(crate) fn build_create_note_intent(
 
                 let cmd_id = new_prefixed_hex_id("cmd_")?;
                 let payload_id = format!("eff:{cmd_id}");
-                let range = notarium_core::ports::CommandSeqRange::new(seq, seq)?;
+                let range = notarium_core::ports::CommandSeqRange::new(seq, visibility_seq)?;
                 let cp = build_effect_payload_draft(
                     payload_id,
                     scope_cl.clone(),
@@ -1011,7 +1016,7 @@ pub(crate) fn build_create_note_intent(
                     vec![input.note.clone()],
                 )?;
 
-                let receipt = MutationReceiptToken::new(scope_cl.clone(), seq)?;
+                let receipt = MutationReceiptToken::new(scope_cl.clone(), visibility_seq)?;
                 let stored_resp = StoredCommittedNoteRevV1 {
                     value: NoteRevision {
                         note: input.note.clone(),
@@ -1020,19 +1025,24 @@ pub(crate) fn build_create_note_intent(
                     receipt,
                 };
                 let resp_bytes = CanonicalStore::encode_command_outcome(&stored_resp)?;
+                let mut events = Vec::with_capacity(if cover_event.is_some() { 2 } else { 1 });
+                events.push(BatchEventDraft {
+                    space_seq: seq,
+                    entity_type: "note".to_owned(),
+                    entity_id: input.note.as_str().to_owned(),
+                    op_kind: "create".to_owned(),
+                    rev_id,
+                    lifecycle: Lifecycle::Active,
+                    doc_class: Some(input.class),
+                });
+                if let Some(event) = cover_event {
+                    events.push(event);
+                }
 
                 Ok(ItemCommitArtifacts {
                     command_id: cmd_id,
                     command_kind: "create_note".to_owned(),
-                    events: vec![BatchEventDraft {
-                        space_seq: seq,
-                        entity_type: "note".to_owned(),
-                        entity_id: input.note.as_str().to_owned(),
-                        op_kind: "create".to_owned(),
-                        rev_id,
-                        lifecycle: Lifecycle::Active,
-                        doc_class: Some(input.class),
-                    }],
+                    events,
                     change_payload: Some(cp),
                     receipt_detail_blob: None,
                     receipt_sanitized_blob: resp_bytes.clone(),
@@ -1054,7 +1064,7 @@ pub(crate) async fn edit_note_impl(
     let budget = ctx.budget.clone();
     let deadline = super::common::CommandDeadline::start(&budget, "edit_note");
     let active_op_guard = store.enter_write_op(&ctx.scope().space_id)?;
-    validate_mutation_identity(&ctx, &request.identity)?;
+    super::common::validate_confirmable_mutation_identity(&ctx, &request.identity)?;
     let idemp = edit_note_identity(
         &ctx,
         &request.identity,
@@ -1262,31 +1272,6 @@ pub(crate) async fn edit_note_impl(
             &request.identity,
         ) {
             reservation_opt = Some(CarrierRoomWrite::Reserved(res));
-        } else if idemp.requires_standard_writer() {
-            // An Applied interceptor reply bypasses the guarded writer. A reservation
-            // lets this edit retain authority until the canonical transaction settles.
-            ctx.budget.remaining = deadline.remaining(&budget)?;
-            let reserve = deadline
-                .wait(&budget, || {
-                    interceptor.reserve_rollback(
-                        ctx.clone(),
-                        request.input.note.clone(),
-                        request.identity.clone(),
-                    )
-                })
-                .await??;
-            match reserve {
-                RollbackReservation::Closed(reservation) => {
-                    reservation_opt = Some(CarrierRoomWrite::Reserved(reservation));
-                }
-                RollbackReservation::SkippedRoomActive => {
-                    return Err(unavailable_retryable(
-                        "confirmed_edit_room_active",
-                        "close the collaborative room before applying the confirmed edit",
-                        std::time::Duration::from_millis(50),
-                    ));
-                }
-            }
         } else {
             let (body_plan, header_mut) = build_collab_edit_payload(
                 &request.input.note,
@@ -1982,7 +1967,14 @@ async fn delete_impl(
 ) -> Result<Committed<NoteRevision>, PortError> {
     let deadline = crate::domain::common::CommandDeadline::start(&ctx.budget, "delete_note");
 
-    validate_mutation_identity(&ctx, &request.identity)?;
+    if matches!(
+        &request.input,
+        DeleteTarget::Note(note) if note.disposition == DeleteDisposition::Trash
+    ) {
+        super::common::validate_confirmable_mutation_identity(&ctx, &request.identity)?;
+    } else {
+        validate_mutation_identity(&ctx, &request.identity)?;
+    }
     let space_rec = deadline
         .prepare(&ctx.budget, || {
             store.read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
@@ -2003,9 +1995,8 @@ async fn delete_impl(
             guard.ability, guard.package_revision
         ),
     };
-    let idemp = derive_command_identity_spec(&request.identity, disp_tag, fp.as_bytes())
+    let idemp = derive_command_identity_spec(&ctx, &request.identity, disp_tag, fp.as_bytes())
         .with_preconditions(&request.preconditions, "note", note.as_str())
-        .with_canonical_effect(&ctx)
         .with_confirmed_chat_step(&ctx, disp_tag)
         .for_note(ctx.auth(), note);
 
@@ -2205,11 +2196,21 @@ fn build_trash_or_restore_intent(
                     }
                 };
 
+                let was_bound = anc.cover_note.as_ref() == Some(&note_id);
+                let folder_page = was_bound || prev.folder_page;
+                let cover_target = if was_bound || (folder_page && target_lc == Lifecycle::Active) {
+                    let target = (target_lc == Lifecycle::Active).then_some(&note_id);
+                    (anc.cover_note.as_ref() != target).then_some(target)
+                } else {
+                    None
+                };
+                let total_seqs = if cover_target.is_some() { 2 } else { 1 };
+                let (_first_seq, visibility_seq) = item_ctx.preview_seq_range(total_seqs)?;
                 let seq = item_ctx.alloc_next_seq()?;
                 let new_rev = new_revision_id()?;
                 let now_ts = now_utc_timestamp()?;
                 let (sec, nsec) = encode_timestamp_parts(now_ts);
-                let seq_i64 = seq.get() as i64;
+                let vis_i64 = visibility_seq.get() as i64;
                 let lc_str = lifecycle_to_db(target_lc);
 
                 bind_existing_active_blob_ref_tx(
@@ -2244,7 +2245,7 @@ fn build_trash_or_restore_intent(
                         )
                         .bind(lc_str)
                         .bind(new_rev.as_str())
-                        .bind(seq_i64)
+                        .bind(vis_i64)
                         .bind(sec)
                         .bind(nsec)
                         .bind(auth.principal().as_str())
@@ -2265,7 +2266,7 @@ fn build_trash_or_restore_intent(
                         )
                         .bind(lc_str)
                         .bind(new_rev.as_str())
-                        .bind(seq_i64)
+                        .bind(vis_i64)
                         .bind(sec)
                         .bind(nsec)
                         .bind(auth.principal().as_str())
@@ -2288,7 +2289,7 @@ fn build_trash_or_restore_intent(
                                  WHERE space_id = ? AND ability_id = ?",
                             )
                             .bind(lc_str)
-                            .bind(seq_i64)
+                            .bind(vis_i64)
                             .bind(scope_cl.space_id.as_str())
                             .bind(ab_id.as_str())
                             .execute(&mut **conn)
@@ -2304,7 +2305,7 @@ fn build_trash_or_restore_intent(
                                  WHERE space_id = $3 AND ability_id = $4",
                             )
                             .bind(lc_str)
-                            .bind(seq_i64)
+                            .bind(vis_i64)
                             .bind(scope_cl.space_id.as_str())
                             .bind(ab_id.as_str())
                             .execute(&mut **conn)
@@ -2317,23 +2318,23 @@ fn build_trash_or_restore_intent(
                 }
 
                 let run_opt = extract_agent_run_from_auth(&auth);
-                let was_bound = anc.cover_note.as_ref() == Some(&note_id);
-                let folder_page = was_bound || prev.folder_page;
-                if was_bound || (folder_page && target_lc == Lifecycle::Active) {
-                    let cover = (target_lc == Lifecycle::Active).then_some(&note_id);
+                let cover_event = if let Some(cover) = cover_target {
+                    let cover_seq = item_ctx.alloc_next_seq()?;
                     super::folder_cover::assign(
                         tx,
                         &scope_cl,
                         &head.parent_folder_id,
                         cover,
-                        seq,
-                        seq,
+                        cover_seq,
+                        visibility_seq,
                         auth.principal(),
                         run_opt.as_ref(),
                         now_ts,
                     )
-                    .await?;
-                }
+                    .await?
+                } else {
+                    None
+                };
                 let meta = RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Note(
                     NoteRevisionMetadata {
                         folder_page,
@@ -2364,7 +2365,7 @@ fn build_trash_or_restore_intent(
                     "note",
                     note_id.as_str(),
                     seq,
-                    seq,
+                    visibility_seq,
                     Some(&head.head_rev_id),
                     None,
                     Some(digest),
@@ -2382,7 +2383,7 @@ fn build_trash_or_restore_intent(
                         run_id,
                         auth.principal(),
                         seq,
-                        seq,
+                        visibility_seq,
                         now_ts,
                     )
                     .await?;
@@ -2390,7 +2391,7 @@ fn build_trash_or_restore_intent(
 
                 let cmd_id = new_prefixed_hex_id("cmd_")?;
                 let payload_id = format!("eff:{cmd_id}");
-                let range = notarium_core::ports::CommandSeqRange::new(seq, seq)?;
+                let range = notarium_core::ports::CommandSeqRange::new(seq, visibility_seq)?;
                 let cp = build_effect_payload_draft(
                     payload_id,
                     scope_cl.clone(),
@@ -2409,7 +2410,7 @@ fn build_trash_or_restore_intent(
                     vec![note_id.clone()],
                 )?;
 
-                let receipt = MutationReceiptToken::new(scope_cl.clone(), seq)?;
+                let receipt = MutationReceiptToken::new(scope_cl.clone(), visibility_seq)?;
                 let stored_resp = StoredCommittedNoteRevV1 {
                     value: NoteRevision {
                         note: note_id.clone(),
@@ -2418,19 +2419,24 @@ fn build_trash_or_restore_intent(
                     receipt,
                 };
                 let resp_bytes = CanonicalStore::encode_command_outcome(&stored_resp)?;
+                let mut events = Vec::with_capacity(if cover_event.is_some() { 2 } else { 1 });
+                events.push(BatchEventDraft {
+                    space_seq: seq,
+                    entity_type: "note".to_owned(),
+                    entity_id: note_id.as_str().to_owned(),
+                    op_kind: op_kind.to_owned(),
+                    rev_id: new_rev,
+                    lifecycle: target_lc,
+                    doc_class: Some(head.doc_class),
+                });
+                if let Some(event) = cover_event {
+                    events.push(event);
+                }
 
                 Ok(ItemCommitArtifacts {
                     command_id: cmd_id,
                     command_kind: cmd_kind.to_owned(),
-                    events: vec![BatchEventDraft {
-                        space_seq: seq,
-                        entity_type: "note".to_owned(),
-                        entity_id: note_id.as_str().to_owned(),
-                        op_kind: op_kind.to_owned(),
-                        rev_id: new_rev,
-                        lifecycle: target_lc,
-                        doc_class: Some(head.doc_class),
-                    }],
+                    events,
                     change_payload: Some(cp),
                     receipt_detail_blob: None,
                     receipt_sanitized_blob: resp_bytes.clone(),
@@ -2458,9 +2464,8 @@ fn move_note_identity(
             .unwrap_or("<root>"),
         input.slug
     );
-    derive_command_identity_spec(identity, "move_note", fp.as_bytes())
+    derive_command_identity_spec(ctx, identity, "move_note", fp.as_bytes())
         .with_preconditions(preconditions, "note", input.note.as_str())
-        .with_canonical_effect(ctx)
         .with_confirmed_chat_step(ctx, "move_note")
         .for_move(ctx.auth(), &input.note, input.parent.as_ref())
 }
@@ -2486,7 +2491,7 @@ pub(crate) async fn move_note_impl(
     request: Mutation<MoveNote>,
 ) -> Result<Committed<NoteRevision>, PortError> {
     let deadline = super::common::CommandDeadline::start(&ctx.budget, "move_note");
-    validate_mutation_identity(&ctx, &request.identity)?;
+    super::common::validate_confirmable_mutation_identity(&ctx, &request.identity)?;
     if let Some(step) = ctx.confirmed_chat_step() {
         let source = step
             .destination()
@@ -2856,11 +2861,16 @@ fn build_move_note_intent(
                 };
                 let final_title_fold = normalize_title_key(&final_title);
 
+                let move_cover = folder_page && dest_parent != head.parent_folder_id;
+                let dest_cover_changes =
+                    move_cover && after_anc.cover_note.as_ref() != Some(&note_id);
+                let total_seqs = 1 + u64::from(move_cover) + u64::from(dest_cover_changes);
+                let (_first_seq, visibility_seq) = item_ctx.preview_seq_range(total_seqs)?;
                 let seq = item_ctx.alloc_next_seq()?;
                 let new_rev = new_revision_id()?;
                 let now_ts = now_utc_timestamp()?;
                 let (sec, nsec) = encode_timestamp_parts(now_ts);
-                let seq_i64 = seq.get() as i64;
+                let vis_i64 = visibility_seq.get() as i64;
 
                 bind_existing_active_blob_ref_tx(
                     tx,
@@ -2899,7 +2909,7 @@ fn build_move_note_intent(
                         .bind(&final_title)
                         .bind(&final_title_fold)
                         .bind(new_rev.as_str())
-                        .bind(seq_i64)
+                        .bind(vis_i64)
                         .bind(sec)
                         .bind(nsec)
                         .bind(auth.principal().as_str())
@@ -2923,7 +2933,7 @@ fn build_move_note_intent(
                         .bind(&final_title)
                         .bind(&final_title_fold)
                         .bind(new_rev.as_str())
-                        .bind(seq_i64)
+                        .bind(vis_i64)
                         .bind(sec)
                         .bind(nsec)
                         .bind(auth.principal().as_str())
@@ -2949,31 +2959,42 @@ fn build_move_note_intent(
                 }
 
                 let run_opt = extract_agent_run_from_auth(&auth);
-                if folder_page && dest_parent != head.parent_folder_id {
-                    super::folder_cover::assign(
+                let mut cover_events = Vec::new();
+                if move_cover {
+                    let src_seq = item_ctx.alloc_next_seq()?;
+                    if let Some(event) = super::folder_cover::assign(
                         tx,
                         &scope_cl,
                         &head.parent_folder_id,
                         None,
-                        seq,
-                        seq,
+                        src_seq,
+                        visibility_seq,
                         auth.principal(),
                         run_opt.as_ref(),
                         now_ts,
                     )
-                    .await?;
-                    super::folder_cover::assign(
-                        tx,
-                        &scope_cl,
-                        &dest_parent,
-                        Some(&note_id),
-                        seq,
-                        seq,
-                        auth.principal(),
-                        run_opt.as_ref(),
-                        now_ts,
-                    )
-                    .await?;
+                    .await?
+                    {
+                        cover_events.push(event);
+                    }
+                    if dest_cover_changes {
+                        let dst_seq = item_ctx.alloc_next_seq()?;
+                        if let Some(event) = super::folder_cover::assign(
+                            tx,
+                            &scope_cl,
+                            &dest_parent,
+                            Some(&note_id),
+                            dst_seq,
+                            visibility_seq,
+                            auth.principal(),
+                            run_opt.as_ref(),
+                            now_ts,
+                        )
+                        .await?
+                        {
+                            cover_events.push(event);
+                        }
+                    }
                 }
                 let meta = RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Note(
                     NoteRevisionMetadata {
@@ -3005,7 +3026,7 @@ fn build_move_note_intent(
                     "note",
                     note_id.as_str(),
                     seq,
-                    seq,
+                    visibility_seq,
                     Some(&head.head_rev_id),
                     None,
                     Some(digest),
@@ -3023,7 +3044,7 @@ fn build_move_note_intent(
                         run_id,
                         auth.principal(),
                         seq,
-                        seq,
+                        visibility_seq,
                         now_ts,
                     )
                     .await?;
@@ -3031,7 +3052,7 @@ fn build_move_note_intent(
 
                 let cmd_id = new_prefixed_hex_id("cmd_")?;
                 let payload_id = format!("eff:{cmd_id}");
-                let range = notarium_core::ports::CommandSeqRange::new(seq, seq)?;
+                let range = notarium_core::ports::CommandSeqRange::new(seq, visibility_seq)?;
                 let cp = build_effect_payload_draft(
                     payload_id,
                     scope_cl.clone(),
@@ -3050,7 +3071,7 @@ fn build_move_note_intent(
                     vec![note_id.clone()],
                 )?;
 
-                let receipt = MutationReceiptToken::new(scope_cl.clone(), seq)?;
+                let receipt = MutationReceiptToken::new(scope_cl.clone(), visibility_seq)?;
                 let stored_resp = StoredCommittedNoteRevV1 {
                     value: NoteRevision {
                         note: note_id.clone(),
@@ -3059,19 +3080,22 @@ fn build_move_note_intent(
                     receipt,
                 };
                 let resp_bytes = CanonicalStore::encode_command_outcome(&stored_resp)?;
+                let mut events = Vec::with_capacity(1 + cover_events.len());
+                events.push(BatchEventDraft {
+                    space_seq: seq,
+                    entity_type: "note".to_owned(),
+                    entity_id: note_id.as_str().to_owned(),
+                    op_kind: "move".to_owned(),
+                    rev_id: new_rev,
+                    lifecycle: Lifecycle::Active,
+                    doc_class: Some(head.doc_class),
+                });
+                events.extend(cover_events);
 
                 Ok(ItemCommitArtifacts {
                     command_id: cmd_id,
                     command_kind: "move_note".to_owned(),
-                    events: vec![BatchEventDraft {
-                        space_seq: seq,
-                        entity_type: "note".to_owned(),
-                        entity_id: note_id.as_str().to_owned(),
-                        op_kind: "move".to_owned(),
-                        rev_id: new_rev,
-                        lifecycle: Lifecycle::Active,
-                        doc_class: Some(head.doc_class),
-                    }],
+                    events,
                     change_payload: Some(cp),
                     receipt_detail_blob: None,
                     receipt_sanitized_blob: resp_bytes.clone(),
@@ -3089,7 +3113,7 @@ pub(crate) async fn rename_note_impl(
     request: Mutation<RenameNote>,
 ) -> Result<Committed<NoteRevision>, PortError> {
     let deadline = super::common::CommandDeadline::start(&ctx.budget, "rename_note");
-    validate_mutation_identity(&ctx, &request.identity)?;
+    super::common::validate_confirmable_mutation_identity(&ctx, &request.identity)?;
     let new_slug_fold = normalize_slug_key(&request.input.slug)?;
 
     let fp = format!(
@@ -3098,10 +3122,9 @@ pub(crate) async fn rename_note_impl(
         request.input.slug,
         request.input.title.as_deref().unwrap_or("<none>")
     );
-    let idemp = derive_command_identity_spec(&request.identity, "rename_note", fp.as_bytes())
+    let idemp = derive_command_identity_spec(&ctx, &request.identity, "rename_note", fp.as_bytes())
         .with_preconditions(&request.preconditions, "note", request.input.note.as_str())
         .with_rename_title(request.input.title.as_deref())
-        .with_canonical_effect(&ctx)
         .with_confirmed_chat_step(&ctx, "rename_note")
         .for_note(ctx.auth(), &request.input.note);
 
@@ -3439,7 +3462,21 @@ async fn batch_receipt_hashes(
 }
 
 fn validate_batch_item(ctx: &SpaceContext, item: &Mutation<BatchItem>) -> Result<(), PortError> {
-    validate_mutation_identity(ctx, &item.identity)?;
+    let confirmable = matches!(
+        &item.input,
+        BatchItem::Create(_)
+            | BatchItem::Edit(_)
+            | BatchItem::Move(_)
+            | BatchItem::Delete(DeleteNote {
+                disposition: DeleteDisposition::Trash,
+                ..
+            })
+    );
+    if confirmable {
+        super::common::validate_confirmable_mutation_identity(ctx, &item.identity)?;
+    } else {
+        validate_mutation_identity(ctx, &item.identity)?;
+    }
     if matches!(item.input, BatchItem::Create(_)) {
         super::common::require_empty_preconditions(&item.preconditions)?;
     }
@@ -3786,8 +3823,9 @@ async fn prepare_batch_intents(
                 };
                 let fp = format!("{disp_tag}={}", del.note.as_str());
                 let idemp =
-                    derive_command_identity_spec(&item_mut.identity, disp_tag, fp.as_bytes())
+                    derive_command_identity_spec(ctx, &item_mut.identity, disp_tag, fp.as_bytes())
                         .with_preconditions(&item_mut.preconditions, "note", del.note.as_str())
+                        .with_confirmed_chat_step(ctx, disp_tag)
                         .for_note(ctx.auth(), &del.note);
                 intents.push(build_trash_or_restore_intent(
                     store,
@@ -4202,8 +4240,7 @@ fn link_identity(
         hash.update(&[0]);
     }
     hash_preconditions(&mut hash, &item.preconditions);
-    derive_command_identity_spec(&item.identity, "link", hash.finalize().as_bytes())
-        .with_canonical_effect(ctx)
+    derive_command_identity_spec(ctx, &item.identity, "link", hash.finalize().as_bytes())
         .with_confirmed_chat_step(ctx, "link")
         .for_link(ctx.auth(), &item.input.source, &item.input.target)
 }
@@ -4214,7 +4251,7 @@ pub(crate) async fn link_impl(
     request: Mutation<Link>,
 ) -> Result<Committed<Link>, PortError> {
     let deadline = crate::domain::common::CommandDeadline::start(&ctx.budget, "link");
-    validate_mutation_identity(&ctx, &request.identity)?;
+    super::common::validate_confirmable_mutation_identity(&ctx, &request.identity)?;
     let link_line = validate_and_format_link_line(&request.input)?;
 
     let idemp = link_identity(&ctx, &request, &link_line);
@@ -4517,7 +4554,7 @@ async fn prepare_link_batch_item(
     item: Mutation<Link>,
     receipts: &HashMap<String, Vec<u8>>,
 ) -> Result<PreparedWriteIntent, PortError> {
-    validate_mutation_identity(ctx, &item.identity)?;
+    super::common::validate_confirmable_mutation_identity(ctx, &item.identity)?;
     let line = validate_and_format_link_line(&item.input)?;
     let spec = link_identity(ctx, &item, &line);
     if let Some(hash) = receipts.get(item.identity.key.as_str()) {
@@ -5019,6 +5056,7 @@ fn external_observation_identity(
     fp.update(&[0]);
     fp.update(request.input.disk_identity.as_bytes());
     derive_command_identity_spec(
+        ctx,
         &request.identity,
         "accept_external_observation",
         fp.finalize().as_bytes(),
@@ -5939,6 +5977,7 @@ pub(crate) async fn update_space_schema_impl(
     fp_hasher.update(&[0]);
     fp_hasher.update(info.prepared_blob.digest.as_bytes());
     let idemp = derive_command_identity_spec(
+        &ctx,
         &request.identity,
         "update_space_schema",
         fp_hasher.finalize().as_bytes(),
@@ -6685,6 +6724,197 @@ pub(super) async fn get_note_impl(
         byte_size,
         fields,
         diagnostics,
+        provenance: Some(provenance),
+    })
+}
+
+pub(super) async fn get_note_metadata_impl(
+    store: &CanonicalStore,
+    mut ctx: SpaceContext,
+    request: GetNote,
+    deadline: &super::common::CommandDeadline,
+) -> Result<notarium_core::ports::NoteMetadataSnapshot, PortError> {
+    let scope = ctx.scope().clone();
+    let auth = ctx.auth().clone();
+    let req_note = request.note.clone();
+    let req_rev_opt = request.revision.clone();
+    let causal = request.causal.clone();
+
+    ctx.budget.remaining = deadline.remaining(&ctx.budget)?;
+    let (
+        rev_id,
+        recorded_facts,
+        live_facts,
+        recorded_lifecycle,
+        live_lifecycle,
+        digest,
+        parent_opt,
+        provenance,
+    ) = store
+        .with_read_tx_budget(Some(&ctx.budget), |tx| {
+            Box::pin(async move {
+                let space_rec = load_space_record(tx, &scope.space_id).await?;
+                space_rec.scope.check(&scope)?;
+                if space_rec.space.lifecycle != SpaceLifecycle::Active {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+
+                let required_seq = match &causal {
+                    CausalBasis::Exact(receipts) => {
+                        let mut max_s = SpaceSeq::ZERO;
+                        for r in receipts.for_scope(&scope)? {
+                            match tx {
+                                BackendConn::Postgres(_) => {
+                                    crate::runtime::require_command_end_tx(tx, &scope, r.seq())
+                                        .await?;
+                                }
+                                BackendConn::Sqlite(_) => {
+                                    validate_snapshot_cutoff_tx(tx, &scope, Some(r.seq())).await?;
+                                }
+                            }
+                            max_s = max_s.max(r.seq());
+                        }
+                        max_s
+                    }
+                    CausalBasis::Await(wm) => {
+                        let s = wm.required(&scope)?;
+                        if s > space_rec.last_seq {
+                            return Err(
+                                DomainError::validation(ValidationReason::InvalidCutoff).into(),
+                            );
+                        }
+                        s
+                    }
+                };
+                if required_seq > space_rec.last_seq {
+                    return Err(DomainError::validation(ValidationReason::InvalidCutoff).into());
+                }
+
+                if is_note_purge_fenced_tx(tx, &scope.space_id, req_note.as_str()).await? {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+
+                let live_head = load_note_head_row_tx(tx, &scope.space_id, &req_note).await?;
+                if live_head.lifecycle == Lifecycle::Purged {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+
+                let (live_facts, live_ancestry) = build_resource_facts_tx(
+                    tx,
+                    &space_rec.space,
+                    &live_head.parent_folder_id,
+                    live_head.doc_class,
+                    live_head.ability_id.clone(),
+                    false,
+                )
+                .await?;
+                auth.authorize_read(&live_facts)?;
+
+                let historical = req_rev_opt.is_some();
+                let target_rev_id = req_rev_opt.unwrap_or_else(|| live_head.head_rev_id.clone());
+                let revision: Option<(Vec<u8>, i64, String, i64, i32)> = match tx {
+                    BackendConn::Sqlite(conn) => sqlx::query_as(
+                        "SELECT metadata_msgpack, visibility_seq, actor_id, created_at_sec, created_at_nsec FROM revisions
+                         WHERE space_id = ? AND rev_id = ? AND entity_type = 'note' AND entity_key = ?",
+                    )
+                    .bind(scope.space_id.as_str())
+                    .bind(target_rev_id.as_str())
+                    .bind(req_note.as_str())
+                    .fetch_optional(&mut **conn)
+                    .await
+                    .map_err(|err| {
+                        internal_not_committed("sqlite_get_note_meta_rev", err.to_string())
+                    })?,
+                    BackendConn::Postgres(conn) => sqlx::query_as(
+                        "SELECT metadata_msgpack, visibility_seq, actor_id, created_at_sec, created_at_nsec FROM revisions
+                         WHERE space_id = $1 AND rev_id = $2 AND entity_type = 'note' AND entity_key = $3",
+                    )
+                    .bind(scope.space_id.as_str())
+                    .bind(target_rev_id.as_str())
+                    .bind(req_note.as_str())
+                    .fetch_optional(&mut **conn)
+                    .await
+                    .map_err(|err| crate::runtime::pg_read_error("pg_get_note_meta_rev", err))?,
+                };
+
+                let Some((raw_meta, visibility_seq, actor, seconds, nanos)) = revision else {
+                    return Err(DomainError::ResourceNotFound.into());
+                };
+                let env = RevisionMetadataEnvelope::decode(&raw_meta)?;
+                let RevisionMetadataPayload::Note(nm) = env.payload else {
+                    return Err(internal_not_committed(
+                        "corrupt_note_rev_payload",
+                        "expected Note metadata payload",
+                    ));
+                };
+                if nm.lifecycle == Lifecycle::Purged {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+                let digest = nm.content_digest.ok_or_else(|| {
+                    internal_not_committed("note_rev_missing_digest", "note revision lacks digest")
+                })?;
+                let (recorded_facts, ancestry) = if historical {
+                    let cutoff = crate::codec::i64_to_space_seq(visibility_seq)?;
+                    let (facts, ancestry) = FolderAncestryCache::at_cut(&scope, cutoff)
+                        .build_resource_facts_tx(
+                            tx,
+                            &space_rec.space,
+                            &nm.parent_folder_id,
+                            nm.doc_class,
+                            nm.ability_id.clone(),
+                            false,
+                        )
+                        .await?;
+                    auth.authorize_read(&facts)?;
+                    (facts, ancestry)
+                } else {
+                    (live_facts.clone(), live_ancestry)
+                };
+                let provenance = ancestry.note_provenance(
+                    &req_note,
+                    &nm.slug,
+                    nm.title,
+                    notarium_core::ids::PrincipalId::parse(&actor)?,
+                    crate::codec::decode_timestamp_parts(seconds, nanos)?,
+                );
+                let parent_opt =
+                    (nm.parent_folder_id != space_rec.root_folder_id).then_some(nm.parent_folder_id);
+                let effective_lc = if target_rev_id == live_head.head_rev_id {
+                    live_head.lifecycle
+                } else {
+                    nm.lifecycle
+                };
+
+                Ok((
+                    target_rev_id,
+                    recorded_facts,
+                    live_facts,
+                    effective_lc,
+                    live_head.lifecycle,
+                    digest,
+                    parent_opt,
+                    provenance,
+                ))
+            })
+        })
+        .await?;
+
+    let mut metadata = ClassifiedMetadata::from_canonical(
+        NoteRef {
+            space_id: ctx.scope().space_id.clone(),
+            note_id: request.note,
+        },
+        rev_id,
+        recorded_facts,
+        recorded_lifecycle,
+        digest,
+    )?;
+    metadata.bind_current(live_facts, live_lifecycle)?;
+
+    deadline.remaining(&ctx.budget)?;
+    Ok(notarium_core::ports::NoteMetadataSnapshot {
+        metadata,
+        parent: parent_opt,
         provenance: Some(provenance),
     })
 }

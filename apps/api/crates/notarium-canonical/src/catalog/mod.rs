@@ -356,6 +356,75 @@ impl ControlCatalogPort for CanonicalStore {
             .await
         })
     }
+    fn locate_note(&self, ctx: AccountContext, note: NoteId) -> PortFuture<'_, CatalogNote> {
+        Box::pin(async move {
+            let spaces: Vec<String> = ctx
+                .auth()
+                .spaces()
+                .keys()
+                .map(|id| id.as_str().to_owned())
+                .collect();
+            if spaces.is_empty() {
+                return Err(DomainError::ResourceNotFound.into());
+            }
+            let budget = ctx.budget.clone();
+            self.with_read_tx_budget(Some(&budget), move |tx| {
+                Box::pin(async move {
+                    let matched: Vec<String> = match tx {
+                        BackendConn::Sqlite(conn) => {
+                            let encoded = serde_json::to_string(&spaces).map_err(|err| {
+                                internal_not_committed("encode_locate_note_spaces", err.to_string())
+                            })?;
+                            sqlx::query_scalar(
+                                "SELECT space_id FROM note_heads
+                                 WHERE space_id IN (SELECT value FROM json_each($1))
+                                   AND note_id = $2
+                                   AND lifecycle_state = 'active'
+                                 ORDER BY space_id",
+                            )
+                            .bind(encoded)
+                            .bind(note.as_str())
+                            .fetch_all(&mut **conn)
+                            .await
+                        }
+                        BackendConn::Postgres(conn) => {
+                            sqlx::query_scalar(
+                                "SELECT space_id FROM note_heads
+                                 WHERE space_id = ANY($1)
+                                   AND note_id = $2
+                                   AND lifecycle_state = 'active'
+                                 ORDER BY space_id",
+                            )
+                            .bind(&spaces)
+                            .bind(note.as_str())
+                            .fetch_all(&mut **conn)
+                            .await
+                        }
+                    }
+                    .map_err(|err| crate::runtime::pg_read_error("locate_note", err))?;
+                    for raw_space in matched {
+                        let space_id = SpaceId::parse(&raw_space)?;
+                        let rec = match load_space_record(tx, &space_id).await {
+                            Ok(rec) => rec,
+                            Err(PortError::Domain(DomainError::ResourceNotFound)) => continue,
+                            Err(err) => return Err(err),
+                        };
+                        let reference = NoteRef {
+                            space_id,
+                            note_id: note.clone(),
+                        };
+                        match note_metadata(tx, ctx.auth(), &rec, reference).await {
+                            Ok(found) => return Ok(found),
+                            Err(PortError::Domain(DomainError::ResourceNotFound)) => continue,
+                            Err(err) => return Err(err),
+                        }
+                    }
+                    Err(DomainError::ResourceNotFound.into())
+                })
+            })
+            .await
+        })
+    }
     fn abilities(
         &self,
         ctx: AccountContext,

@@ -10,7 +10,7 @@ use notarium_core::{
         SpaceContext,
     },
 };
-use notarium_syntax::unicode::{lookup_key, validate_component};
+use notarium_syntax::unicode::validate_component;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -126,26 +126,38 @@ impl FolderAddress {
         let path = path.trim_start_matches('/');
         let (base, relative) = match &self.project {
             Some(project) => {
-                if let Some(suffix) = path_from_project(path, &project.path) {
+                if let Some(suffix) = corpus::strip_folder_prefix(path, &project.path) {
                     (Some(project.reference.folder_id.clone()), suffix)
                 } else if root_relative {
-                    (None, path)
+                    (None, path.to_owned())
                 } else {
-                    (Some(project.reference.folder_id.clone()), path)
+                    (Some(project.reference.folder_id.clone()), path.to_owned())
                 }
             }
-            None => (None, path),
+            None => (None, path.to_owned()),
         };
-        resolve_snapshot(call, &self.scope, base, relative).await
+        resolve_snapshot(call, &self.scope, base, &relative).await
     }
 }
 
-fn path_from_project<'a>(path: &'a str, project_path: &str) -> Option<&'a str> {
-    // Active project roots are canonical children of the Space root. Resolve
-    // the suffix directly by FolderId so a project-scoped grant still works.
-    let (first, suffix) = path.split_once('/').unwrap_or((path, ""));
-    (!first.is_empty() && lookup_key(first) == lookup_key(project_path.trim_matches('/')))
-        .then_some(suffix)
+async fn admit_folder_snapshot(
+    call: &ToolCallContext<'_>,
+    scope: &SpaceContext,
+    folder: &FolderSnapshot,
+) -> Result<(), PortError> {
+    let project = folder.project.clone().map(|folder_id| FolderRef {
+        space_id: scope.scope().space_id.clone(),
+        folder_id,
+    });
+    corpus::admit_folder_write(
+        call,
+        scope,
+        &folder.reference,
+        project,
+        &folder.ancestor_folders,
+        DocClass::UserDoc,
+    )
+    .await
 }
 
 async fn resolve_snapshot(
@@ -190,7 +202,9 @@ async fn plan(
             let address =
                 FolderAddress::open(call, args.project.as_deref(), args.session.as_ref()).await?;
             let source = address.resolve(call, &args.folder).await?;
+            admit_folder_snapshot(call, &address.scope, &source).await?;
             let dest = address.resolve(call, &args.to_folder).await?;
+            admit_folder_snapshot(call, &address.scope, &dest).await?;
             let parent = dest.reference.folder_id;
             let operation = if source.parent.as_ref() == Some(&parent) {
                 FolderOperation::Unchanged
@@ -205,6 +219,7 @@ async fn plan(
             let address =
                 FolderAddress::open(call, args.project.as_deref(), args.session.as_ref()).await?;
             let source = address.resolve(call, &args.folder).await?;
+            admit_folder_snapshot(call, &address.scope, &source).await?;
             let operation = if same_name(&source, &args.name, &args.name) {
                 FolderOperation::Unchanged
             } else {
@@ -218,6 +233,7 @@ async fn plan(
             let project = session::resolve_project(call, &args.project).await?;
             let scope = session::space(call, &project.folder.space_id).await?;
             let source = snapshot_by_id(call, &scope, &project.folder.folder_id).await?;
+            admit_folder_snapshot(call, &scope, &source).await?;
             let display_name = args.display_name.unwrap_or_else(|| source.name.clone());
             if display_name.trim().is_empty() || display_name.chars().any(char::is_control) {
                 return Err(invalid(ValidationReason::InvalidPathComponent));
@@ -406,16 +422,16 @@ pub(super) async fn handle(
 
 #[cfg(test)]
 mod tests {
-    use super::path_from_project;
+    use super::corpus::strip_folder_prefix;
 
     #[test]
     fn pasted_space_relative_path_has_a_component_boundary() {
         assert_eq!(
-            path_from_project("SHARED/notes/a", "Shared"),
-            Some("notes/a")
+            strip_folder_prefix("SHARED/notes/a", "Shared"),
+            Some("notes/a".to_owned())
         );
-        assert_eq!(path_from_project("shared", "Shared"), Some(""));
-        assert_eq!(path_from_project("shared-other/a", "Shared"), None);
-        assert_eq!(path_from_project("", "Shared"), None);
+        assert_eq!(strip_folder_prefix("shared", "Shared"), Some(String::new()));
+        assert_eq!(strip_folder_prefix("shared-other/a", "Shared"), None);
+        assert_eq!(strip_folder_prefix("", "Shared"), None);
     }
 }

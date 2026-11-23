@@ -647,10 +647,19 @@ pub(crate) fn edit_mapping(
         }
     }
     let result = composed;
+    verify_mapping_splices(source, &result, desired)?;
+    Ok(result)
+}
+
+fn verify_mapping_splices(
+    source: &str,
+    splices: &[(ByteSpan, String)],
+    desired: BTreeMap<String, YamlValue>,
+) -> DomainResult<()> {
     let test_plan = patch::plan(
         source,
         span(0, source.len())?,
-        result
+        splices
             .iter()
             .map(|(s, v)| (CarrierEditOrigin::Body, *s, v.clone()))
             .collect(),
@@ -665,7 +674,200 @@ pub(crate) fn edit_mapping(
     if actual != YamlValue::Mapping(desired) {
         return Err(failure(ValidationReason::FmNotWritable));
     }
-    Ok(result)
+    Ok(())
+}
+
+/// Edit top-level keys alongside nested sub-mappings (e.g. `source:` / `options:`
+/// inside `nota` blocks) in place, preserving block YAML style and comments on
+/// untouched sibling keys inside those sub-mappings.
+pub(crate) fn edit_nested_mapping(
+    source: &str,
+    top_edits: &[FieldEdit],
+    nested: &[(&str, &[FieldEdit])],
+    eol: &str,
+) -> DomainResult<Vec<(ByteSpan, String)>> {
+    let parsed = yaml::parse(source)?;
+    let is_null_root = matches!(parsed, YamlValue::Null);
+    let mut desired = match parsed {
+        YamlValue::Mapping(fields) => fields,
+        YamlValue::Null => BTreeMap::new(),
+        _ => return Err(failure(ValidationReason::FmNotWritable)),
+    };
+    let concrete = cst(source)?;
+    if is_null_root && concrete.has_tokens {
+        return Err(failure(ValidationReason::FmNotWritable));
+    }
+    let keys: BTreeSet<_> = concrete.entries.iter().map(|e| e.key.clone()).collect();
+    if keys.len() != concrete.entries.len() || keys != desired.keys().cloned().collect() {
+        return Err(failure(ValidationReason::FmNotWritable));
+    }
+    let entries: BTreeMap<_, _> = concrete
+        .entries
+        .iter()
+        .map(|entry| (entry.key.as_str(), entry))
+        .collect();
+
+    let mut effective_top = top_edits.to_vec();
+    let mut nested_splices: Vec<(ByteSpan, String)> = Vec::new();
+    let mut block_insertions: Vec<String> = Vec::new();
+
+    for (parent_key, child_edits) in nested {
+        if child_edits.is_empty() {
+            continue;
+        }
+        let mut child_desired = match desired.get(*parent_key) {
+            Some(YamlValue::Mapping(fields)) => fields.clone(),
+            None => BTreeMap::new(),
+            Some(_) => return Err(failure(ValidationReason::FmNotWritable)),
+        };
+        let mut child_seen = BTreeSet::new();
+        for edit in *child_edits {
+            if !child_seen.insert(edit.key()) {
+                return Err(failure(ValidationReason::InvalidQuery));
+            }
+            match edit {
+                FieldEdit::Set { key, value } => {
+                    value.validate_keys()?;
+                    child_desired.insert(key.clone(), value.clone());
+                }
+                FieldEdit::Unset { key } => {
+                    child_desired.remove(key);
+                }
+            }
+        }
+        let had_parent = desired.contains_key(*parent_key);
+        if !had_parent && child_desired.is_empty() {
+            continue;
+        }
+        if desired.get(*parent_key) == Some(&YamlValue::Mapping(child_desired.clone())) {
+            continue;
+        }
+
+        // Try in-place surgery on an existing non-empty sub-mapping when the
+        // resulting sub-mapping remains non-empty.
+        let mut patched_in_place = false;
+        if let Some(entry) = entries.get(*parent_key).copied()
+            && !child_desired.is_empty()
+            && entry.values.len() == 1
+            && !entry.values[0].is_empty()
+        {
+            let val_span = entry.values[0];
+            let range = if source[val_span.start()..].starts_with('{') {
+                Some((val_span.start(), val_span.end()))
+            } else if concrete.flow_close.is_none() && leading(source, val_span.start()).is_some() {
+                let sub_start = line_start(source, val_span.start());
+                let mut sub_end = val_span.end();
+                let rest = &source[sub_end..];
+                if let Some(line_len) = crate::lines::with_endings(rest).next().map(str::len) {
+                    let trimmed = rest[..line_len]
+                        .trim_end_matches(['\r', '\n'])
+                        .trim_start_matches([' ', '\t']);
+                    if trimmed.is_empty() || trimmed.starts_with('#') {
+                        sub_end += line_len;
+                    }
+                }
+                Some((sub_start, sub_end))
+            } else {
+                None
+            };
+            if let Some((sub_start, sub_end)) = range
+                && let Ok(sub_splices) = edit_mapping(&source[sub_start..sub_end], child_edits, eol)
+            {
+                for (s, text) in sub_splices {
+                    nested_splices.push((span(sub_start + s.start(), sub_start + s.end())?, text));
+                }
+                desired.insert(
+                    (*parent_key).to_owned(),
+                    YamlValue::Mapping(child_desired.clone()),
+                );
+                patched_in_place = true;
+            }
+        }
+        if patched_in_place {
+            continue;
+        }
+
+        // When inserting a brand-new non-empty sub-mapping into a block-style root,
+        // emit readable block YAML instead of inline JSON.
+        if !had_parent && concrete.flow_close.is_none() && !child_desired.is_empty() {
+            let child_indent = " ".repeat(concrete.indent + 2);
+            let mut block = format!(
+                "{}:",
+                yaml::encode(&YamlValue::String((*parent_key).to_owned()), None, false)?
+            );
+            for (k, v) in &child_desired {
+                block.push_str(eol);
+                block.push_str(&child_indent);
+                block.push_str(&yaml::encode(&YamlValue::String(k.clone()), None, false)?);
+                block.push_str(": ");
+                block.push_str(&yaml::encode(v, None, false)?);
+            }
+            block_insertions.push(block);
+            desired.insert((*parent_key).to_owned(), YamlValue::Mapping(child_desired));
+            continue;
+        }
+
+        effective_top.push(FieldEdit::Set {
+            key: (*parent_key).to_owned(),
+            value: YamlValue::Mapping(child_desired),
+        });
+    }
+
+    // Apply `effective_top` to `desired` so final verification compares the full mapping.
+    for edit in &effective_top {
+        match edit {
+            FieldEdit::Set { key, value } => {
+                value.validate_keys()?;
+                desired.insert(key.clone(), value.clone());
+            }
+            FieldEdit::Unset { key } => {
+                desired.remove(key);
+            }
+        }
+    }
+
+    let top_splices = if effective_top.is_empty() {
+        Vec::new()
+    } else {
+        edit_mapping(source, &effective_top, eol)?
+    };
+
+    // Place in-place nested splices before top-level/new-block EOF insertions so
+    // an insertion at the end of a trailing sub-mapping precedes new top-level keys.
+    let mut combined = nested_splices;
+    combined.extend(top_splices);
+    if !block_insertions.is_empty() {
+        let mut text = String::new();
+        if !source.is_empty() && !source.ends_with(['\r', '\n']) {
+            text.push_str(eol);
+        }
+        for block in block_insertions {
+            text.push_str(&" ".repeat(concrete.indent));
+            text.push_str(&block);
+            text.push_str(eol);
+        }
+        combined.push((span(source.len(), source.len())?, text));
+    }
+    combined.sort_by_key(|(s, _)| (s.start(), s.end()));
+
+    let mut composed: Vec<(ByteSpan, String)> = Vec::with_capacity(combined.len());
+    for (bytes, text) in combined {
+        if let Some((previous, replacement)) = composed.last_mut()
+            && previous.end() == bytes.start()
+        {
+            *previous = span(previous.start(), bytes.end())?;
+            let appended = if replacement.ends_with(['\r', '\n']) {
+                text.strip_prefix(eol).unwrap_or(&text)
+            } else {
+                &text
+            };
+            replacement.push_str(appended);
+        } else {
+            composed.push((bytes, text));
+        }
+    }
+    verify_mapping_splices(source, &composed, desired)?;
+    Ok(composed)
 }
 
 pub fn patch_frontmatter(

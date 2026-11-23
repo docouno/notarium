@@ -607,14 +607,6 @@ impl NoteReadPort for TestEngine {
         unavailable()
     }
 
-    fn prepare_agent_run_rollback(
-        &self,
-        ctx: SpaceContext,
-        run: AgentRunId,
-    ) -> PortFuture<'_, RollbackAgentRun> {
-        Box::pin(self.0.prepare_agent_run_rollback(ctx, run))
-    }
-
     fn read_ability_resource(
         &self,
         ctx: SpaceContext,
@@ -628,6 +620,17 @@ impl NoteReadPort for TestEngine {
             return real.notes.get_note(ctx, request);
         }
         Box::pin(self.0.get_note(ctx, request))
+    }
+
+    fn get_note_metadata(
+        &self,
+        ctx: SpaceContext,
+        request: GetNote,
+    ) -> PortFuture<'_, NoteMetadataSnapshot> {
+        if let Some(real) = self.1.real.get() {
+            return real.notes.get_note_metadata(ctx, request);
+        }
+        Box::pin(self.0.get_note_metadata(ctx, request))
     }
 
     fn list_notes(
@@ -743,10 +746,14 @@ impl ViewGraphPort for TestEngine {
 
     fn query_graph(&self, ctx: SpaceContext, request: GraphQuery) -> PortFuture<'_, GraphResult> {
         if let Some(real) = self.1.real.get() {
+            let required = match request.causal.as_ref() {
+                Some(CausalBasis::Await(watermarks)) => watermarks.required(ctx.scope()).ok(),
+                _ => None,
+            };
             real.projection_calls
                 .lock()
                 .unwrap()
-                .push((ctx.budget.remaining, None));
+                .push((ctx.budget.remaining, required));
             return real.projection.query_graph(ctx, request);
         }
         Box::pin(async move {

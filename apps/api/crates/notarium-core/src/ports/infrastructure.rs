@@ -821,12 +821,10 @@ pub trait SessionRevocationPort: Send + Sync {
     /// queued effects without waiting for them to acquire Canonical locks.
     fn register_canonical_effect(
         &self,
-        _ctx: MaintenanceContext,
-        _selectors: Vec<RevocationSelector>,
-        _cancellation: Cancellation,
-    ) -> PortFuture<'_, Arc<dyn CanonicalEffectRegistration>> {
-        Box::pin(async { Err(crate::DomainError::AccessDenied.into()) })
-    }
+        ctx: MaintenanceContext,
+        selectors: Vec<RevocationSelector>,
+        cancellation: Cancellation,
+    ) -> PortFuture<'_, Arc<dyn CanonicalEffectRegistration>>;
     /// Close matching admissions, cancel provider calls and canonical effects,
     /// and drain active effects and sockets. The caller holds Control authority
     /// locks and retains this fence through COMMIT/ROLLBACK.

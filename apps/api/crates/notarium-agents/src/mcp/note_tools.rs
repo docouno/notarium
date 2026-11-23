@@ -7,7 +7,8 @@ use notarium_core::{
     model::{FolderRef, HistoryScope, Lifecycle, NoteRef},
     ports::{
         Committed, DeleteDisposition, DeleteNote, EnsureFolderPath, FolderSnapshot, GetNote,
-        MoveNote, Mutation, NoteRevision, NoteSnapshot, Preconditions, RenameNote, SpaceContext,
+        MoveNote, Mutation, NoteMetadataSnapshot, NoteRevision, NoteSnapshot, Preconditions,
+        RenameNote, SpaceContext,
     },
     receipt::{CausalBasis, CommandIdentity, ReceiptSet},
 };
@@ -78,8 +79,9 @@ pub(super) async fn observe_note(
     expected: Option<&RevisionId>,
 ) -> Result<NoteRoute, PortError> {
     let (scope, catalog) = corpus::locate_note(call, note).await?;
+    corpus::admit_note_write(call, &scope, &catalog).await?;
     authorize_note_write(&scope, &catalog.facts)?;
-    let current = snapshot(
+    let current = metadata_snapshot(
         call,
         &scope,
         note,
@@ -87,10 +89,10 @@ pub(super) async fn observe_note(
         CausalBasis::Await(Default::default()),
     )
     .await?;
-    if current.document.lifecycle() != Lifecycle::Active {
+    if current.metadata.lifecycle() != Lifecycle::Active {
         return Err(DomainError::ResourceNotFound.into());
     }
-    let revision = current.document.revision().clone();
+    let revision = current.metadata.revision().clone();
     if expected.is_some_and(|expected| expected != &revision) {
         return Err(DomainError::RevisionConflict {
             current: revision,
@@ -164,6 +166,58 @@ async fn snapshot(
     Ok(read)
 }
 
+async fn metadata_snapshot(
+    call: &ToolCallContext<'_>,
+    scope: &SpaceContext,
+    note: &NoteId,
+    revision: Option<RevisionId>,
+    causal: CausalBasis,
+) -> Result<NoteMetadataSnapshot, PortError> {
+    let read = call
+        .registry
+        .engine
+        .get_note_metadata(
+            scope.clone(),
+            GetNote {
+                note: note.clone(),
+                revision: revision.clone(),
+                causal,
+            },
+        )
+        .await?;
+    let reference = NoteRef {
+        space_id: scope.scope().space_id.clone(),
+        note_id: note.clone(),
+    };
+    if read.metadata.reference() != &reference
+        || revision
+            .as_ref()
+            .is_some_and(|revision| revision != read.metadata.revision())
+    {
+        return Err(invalid(ValidationReason::SourceMismatch));
+    }
+    if read.metadata.class() == DocClass::EncryptedNote {
+        return Err(DomainError::ResourceNotFound.into());
+    }
+    Ok(read)
+}
+
+async fn route_metadata_snapshot(
+    call: &ToolCallContext<'_>,
+    route: &NoteRoute,
+) -> Result<(SpaceContext, NoteMetadataSnapshot), PortError> {
+    let scope = call.space(route.scope.clone())?;
+    let observed = metadata_snapshot(
+        call,
+        &scope,
+        &route.note,
+        Some(route.revision.clone()),
+        CausalBasis::Await(Default::default()),
+    )
+    .await?;
+    Ok((scope, observed))
+}
+
 async fn route_snapshot(
     call: &ToolCallContext<'_>,
     route: &NoteRoute,
@@ -217,20 +271,6 @@ pub(super) fn clean_path(input: &str) -> Result<String, PortError> {
     Ok(path.to_owned())
 }
 
-/// Resolve a pasted canonical path below a known base. A similar folder name
-/// without a path separator is an ordinary relative component.
-fn relative_to(path: &str, base: &str) -> Option<String> {
-    if base.is_empty() {
-        Some(path.to_owned())
-    } else if path == base {
-        Some(String::new())
-    } else {
-        path.strip_prefix(base)?
-            .strip_prefix('/')
-            .map(str::to_owned)
-    }
-}
-
 fn separator_after(text: &str, eol: &str) -> &'static str {
     if text.is_empty() {
         return "";
@@ -270,15 +310,66 @@ async fn folder_base(
     Ok(snapshot)
 }
 
+async fn admit_destination_anchor(
+    call: &ToolCallContext<'_>,
+    scope: &SpaceContext,
+    base: &Option<FolderId>,
+    path: &str,
+    class: DocClass,
+) -> Result<(), PortError> {
+    if matches!(call.target, EgressTarget::ExternalMcp) {
+        return Ok(());
+    }
+    let anchor = if let Some(exact) = call
+        .registry
+        .engine
+        .resolve_folder_path(scope.clone(), base.clone(), path.to_owned())
+        .await?
+    {
+        exact
+    } else if base.is_none()
+        && let Some(first) = path.split('/').next().filter(|seg| !seg.is_empty())
+        && let Some(top) = call
+            .registry
+            .engine
+            .resolve_folder_path(scope.clone(), None, first.to_owned())
+            .await?
+    {
+        top
+    } else {
+        call.registry
+            .engine
+            .resolve_folder_path(scope.clone(), base.clone(), String::new())
+            .await?
+            .ok_or(DomainError::ResourceNotFound)?
+    };
+    let project = anchor.project.clone().map(|folder_id| FolderRef {
+        space_id: scope.scope().space_id.clone(),
+        folder_id,
+    });
+    corpus::admit_folder_write(
+        call,
+        scope,
+        &anchor.reference,
+        project,
+        &anchor.ancestor_folders,
+        class,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn ensure_destination(
     call: &ToolCallContext<'_>,
     scope: &SpaceContext,
     base: Option<FolderId>,
     path: String,
+    class: DocClass,
     content_command: &CommandIdentity,
     label: &str,
     expected_source: Option<&NoteRoute>,
 ) -> Result<FolderRef, PortError> {
+    admit_destination_anchor(call, scope, &base, &path, class).await?;
     let destination: FolderRef = call
         .journal_with_key(
             label,
@@ -286,7 +377,7 @@ async fn ensure_destination(
             content_command.hash,
             || async {
                 if let Some(route) = expected_source {
-                    let live = snapshot(
+                    let live = metadata_snapshot(
                         call,
                         scope,
                         &route.note,
@@ -294,12 +385,12 @@ async fn ensure_destination(
                         CausalBasis::Await(Default::default()),
                     )
                     .await?;
-                    if live.document.lifecycle() != Lifecycle::Active {
+                    if live.metadata.lifecycle() != Lifecycle::Active {
                         return Err(DomainError::ResourceNotFound.into());
                     }
-                    if live.document.revision() != &route.revision {
+                    if live.metadata.revision() != &route.revision {
                         return Err(DomainError::RevisionConflict {
-                            current: live.document.revision().clone(),
+                            current: live.metadata.revision().clone(),
                             lineage: None,
                         }
                         .into());
@@ -344,14 +435,31 @@ async fn ensure_destination(
     scope
         .auth()
         .can_view_folder(&live.space, &destination.folder_id, &live.ancestor_folders)?;
+    if matches!(call.target, EgressTarget::InAppProvider { .. }) {
+        let resolved = folder_base(call, scope, &destination.folder_id).await?;
+        let project = resolved.project.map(|folder_id| FolderRef {
+            space_id: destination.space_id.clone(),
+            folder_id,
+        });
+        corpus::admit_folder_write(
+            call,
+            scope,
+            &destination,
+            project,
+            &live.ancestor_folders,
+            class,
+        )
+        .await?;
+    }
     Ok(destination)
 }
 
 async fn move_note(call: &mut ToolCallContext<'_>, input: MoveInput) -> Result<Value, PortError> {
     let folder = clean_path(&input.to_folder)?;
     let route = route(call, &input.target.note, None).await?;
-    let (scope, before) = route_snapshot(call, &route).await?;
-    let slug = note_slug(&before)?;
+    let (scope, before) = route_metadata_snapshot(call, &route).await?;
+    let slug = note_slug(before.provenance.as_ref())?;
+    let class = before.metadata.class();
     let base = scope
         .auth()
         .spaces()
@@ -359,7 +467,7 @@ async fn move_note(call: &mut ToolCallContext<'_>, input: MoveInput) -> Result<V
         .and_then(|grant| grant.project_root.clone());
     let path = if let Some(base) = &base {
         let root = folder_base(call, &scope, base).await?;
-        relative_to(&folder, &root.path).ok_or(DomainError::SpaceReadOnly)?
+        corpus::strip_folder_prefix(&folder, &root.path).ok_or(DomainError::SpaceReadOnly)?
     } else {
         folder
     };
@@ -369,6 +477,7 @@ async fn move_note(call: &mut ToolCallContext<'_>, input: MoveInput) -> Result<V
         &scope,
         base,
         path,
+        class,
         &identity,
         "move_destination",
         Some(&route),
@@ -393,11 +502,10 @@ async fn move_note(call: &mut ToolCallContext<'_>, input: MoveInput) -> Result<V
     receipt_result(call, scope, &route.note, committed, "moved").await
 }
 
-fn note_slug(before: &NoteSnapshot) -> Result<String, PortError> {
-    let provenance = before
-        .provenance
-        .as_ref()
-        .ok_or_else(|| invalid(ValidationReason::NotReady))?;
+fn note_slug(
+    provenance: Option<&notarium_core::ports::NoteProvenance>,
+) -> Result<String, PortError> {
+    let provenance = provenance.ok_or_else(|| invalid(ValidationReason::NotReady))?;
     let basename = provenance
         .path
         .rsplit('/')
@@ -442,7 +550,7 @@ fn generated_slug(title: &str, note: &NoteId) -> String {
 async fn rename(call: &mut ToolCallContext<'_>, input: RenameInput) -> Result<Value, PortError> {
     let title = validated_title(&input.title)?;
     let route = route(call, &input.target.note, None).await?;
-    let (scope, before) = route_snapshot(call, &route).await?;
+    let (scope, before) = route_metadata_snapshot(call, &route).await?;
     let metadata = before
         .provenance
         .as_ref()
@@ -490,7 +598,7 @@ async fn receipt_result(
             return Ok(json!({ "outcome": outcome }));
         }
         let read = async {
-            let observed = snapshot(
+            let observed = metadata_snapshot(
                 call,
                 &scope,
                 note,
@@ -498,7 +606,7 @@ async fn receipt_result(
                 CausalBasis::Exact(ReceiptSet::new([committed.receipt])?),
             )
             .await?;
-            corpus::note_metadata(call, &scope, &observed.document.metadata()).await
+            corpus::note_metadata(call, &scope, &observed.metadata).await
         }
         .await;
         if let Err(error) = read {

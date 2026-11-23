@@ -2003,33 +2003,46 @@ async fn sleep_async_interruptible(
     Ok(())
 }
 
-fn spool_tables(
-    schema_version: u32,
-    layout: crate::schema::migrate::SchemaLayout,
-) -> impl Iterator<Item = TableSpec> + Clone {
+fn spool_tables(schema_version: u32) -> impl Iterator<Item = TableSpec> + Clone {
     CANONICAL_TABLES
         .iter()
         .copied()
         .filter_map(move |mut table| {
-            if layout.agents < 8 && table.name == "ability_packages" {
-                table.indexes = &[
-                    "uq_ability_packages_active_slug",
-                    "idx_ability_packages_entrypoint",
-                ];
-            }
-            if layout.agents < 7 {
+            if schema_version < 9 {
                 match table.name {
+                    "spaces" => table.indexes = &["uq_spaces_slug_fold"],
+                    "folder_heads" => {
+                        table.indexes = &[
+                            "uq_folder_heads_root",
+                            "uq_folder_heads_active_sibling",
+                            "uq_folder_heads_active_project",
+                            "idx_folder_heads_parent_lifecycle",
+                            "idx_folder_heads_cover",
+                        ];
+                    }
+                    "command_receipts" => {
+                        table.indexes = &[
+                            "idx_command_receipts_expires",
+                            "idx_receipt_exception_pointer",
+                        ];
+                    }
+                    "ability_packages" => {
+                        table.indexes = &[
+                            "uq_ability_packages_active_slug",
+                            "idx_ability_packages_entrypoint",
+                        ];
+                    }
                     "chat_threads" => table.columns = &table.columns[..18],
                     "chat_entries" => table.columns = &table.columns[..20],
                     "chat_pending_inputs" => table.indexes = &table.indexes[..2],
                     _ => {}
                 }
             }
-            if layout.projections == 7 && table.name == "chat_entry_note_refs" {
+            if schema_version == 7 && table.name == "chat_entry_note_refs" {
                 table.columns = &table.columns[..6];
                 table.indexes = &["idx_chat_entry_note_refs_target"];
             }
-            if layout.projections < 7 {
+            if schema_version < 7 {
                 match table.name {
                     "projection_rank_anchors"
                     | "projection_rank_anchor_rows"
@@ -2090,21 +2103,20 @@ fn verified_spool_tables(
     version: u32,
     digest: ContentDigest,
 ) -> Result<impl Iterator<Item = TableSpec> + Clone, PortError> {
-    use crate::schema::migrate::{SchemaLayout, predecessor};
+    use crate::schema::migrate::predecessor;
 
-    let layout = match version {
-        CANONICAL_SCHEMA_VERSION if digest == manifest_checksum() => SchemaLayout {
-            projections: i64::from(version),
-            agents: i64::from(version),
-        },
-        1..CANONICAL_SCHEMA_VERSION => predecessor(i64::from(version), digest.as_bytes())
-            .ok_or_else(|| DomainError::validation(ValidationReason::InvalidDigest))?,
+    match version {
+        CANONICAL_SCHEMA_VERSION if digest == manifest_checksum() => {}
+        1..CANONICAL_SCHEMA_VERSION => {
+            predecessor(i64::from(version), digest.as_bytes())
+                .ok_or_else(|| DomainError::validation(ValidationReason::InvalidDigest))?;
+        }
         CANONICAL_SCHEMA_VERSION => {
             return Err(DomainError::validation(ValidationReason::InvalidDigest).into());
         }
         _ => return Err(DomainError::validation(ValidationReason::InvalidState).into()),
     };
-    let tables = spool_tables(version, layout);
+    let tables = spool_tables(version);
     if version < CANONICAL_SCHEMA_VERSION && checksum_tables(version, tables.clone()) != digest {
         return Err(DomainError::validation(ValidationReason::InvalidDigest).into());
     }
@@ -2122,10 +2134,8 @@ fn historical_spool_shapes_match_their_published_manifests() {
         (4, V4_HASH),
         (5, V5_HASH),
         (6, V6_HASH),
-        (7, PROJECTION_V7_HASH),
-        (7, AGENT_V7_HASH),
-        (8, PROJECTION_V8_HASH),
-        (8, AGENT_V8_HASH),
+        (7, V7_HASH),
+        (8, V8_HASH),
     ] {
         let digest = ContentDigest::from_bytes(hex::decode(hash).unwrap().try_into().unwrap());
         let tables = verified_spool_tables(version, digest).unwrap();

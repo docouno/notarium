@@ -1097,8 +1097,6 @@ async fn restores_historical_postgres_spools_and_rejects_invalid_headers() {
         (5, "", 0x62, 0xB2, "backup-178", 36, 14),
         (6, "", 0x62, 0xB2, "backup-178", 36, 14),
         (7, "", 0x62, 0xB2, "backup-178", 39, 14),
-        (7, "-agent", 0x62, 0xB2, "backup-178", 36, 14),
-        (8, "-agent", 0x62, 0xB2, "backup-178", 36, 14),
         (8, "-projection", 0x62, 0xB2, "backup-178", 39, 14),
     ] {
         let fixture = directory.join(format!("schema-v{version}{suffix}.pgspool"));

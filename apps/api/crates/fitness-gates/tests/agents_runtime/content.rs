@@ -601,6 +601,7 @@ async fn session_relative_folder_mutations_target_the_listed_folder() {
                         space_id: space.scope().space_id.clone(),
                         folder_id: project,
                     }),
+                    guard: EpisodeRevisionGuard::Account,
                 },
             },
         )

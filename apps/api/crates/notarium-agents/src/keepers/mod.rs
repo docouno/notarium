@@ -123,7 +123,7 @@ impl Drop for LocalSlot {
     fn drop(&mut self) {
         self.slots
             .lock()
-            .expect("keeper slot registry lock")
+            .unwrap_or_else(|error| error.into_inner())
             .remove(&self.schedule);
     }
 }
@@ -131,7 +131,7 @@ impl Drop for LocalSlot {
 fn acquire_local(slots: &LocalSlots, schedule: ScheduleId) -> Option<Box<dyn RevocationLease>> {
     slots
         .lock()
-        .expect("keeper slot registry lock")
+        .unwrap_or_else(|error| error.into_inner())
         .insert(schedule.clone())
         .then(|| {
             Box::new(LocalSlot {

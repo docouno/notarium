@@ -220,13 +220,6 @@ impl NoteReadPort for ReadFixture {
     ) -> PortFuture<'_, ProjectNoteCounts> {
         support::RejectingPorts.project_note_counts(ctx, project, causal)
     }
-    fn prepare_agent_run_rollback(
-        &self,
-        ctx: SpaceContext,
-        run: AgentRunId,
-    ) -> PortFuture<'_, RollbackAgentRun> {
-        support::RejectingPorts.prepare_agent_run_rollback(ctx, run)
-    }
     fn get_note(&self, ctx: SpaceContext, request: GetNote) -> PortFuture<'_, NoteSnapshot> {
         Box::pin(async move {
             ctx.check_current(&scope(1))?;
@@ -237,6 +230,20 @@ impl NoteReadPort for ReadFixture {
                 .ok_or(DomainError::ResourceNotFound)?;
             note.document.explicit_read(ctx.auth())?;
             Ok(note.clone())
+        })
+    }
+    fn get_note_metadata(
+        &self,
+        ctx: SpaceContext,
+        request: GetNote,
+    ) -> PortFuture<'_, NoteMetadataSnapshot> {
+        Box::pin(async move {
+            let snapshot = self.get_note(ctx, request).await?;
+            Ok(NoteMetadataSnapshot {
+                metadata: snapshot.document.metadata(),
+                parent: snapshot.parent,
+                provenance: snapshot.provenance,
+            })
         })
     }
     fn list_notes(
@@ -959,7 +966,7 @@ fn mcp_coverage_has_28_named_operations_and_typed_method_witnesses() {
         <dyn ControlPort>::list_projects,
         <dyn ControlPort>::get_ability,
         <dyn ControlPort>::update_ability_binding,
-        <dyn ControlPort>::resolve_memory_target,
+        <dyn ControlPort>::inspect_memory_target,
     );
     let _ = (
         <dyn EnginePort>::list_notes,
@@ -1090,6 +1097,7 @@ fn cluster_identity_survives_membership_changes_and_selects_a_typed_lens() {
             version: 1,
             predicate: Predicate::All(vec![]),
         },
+        causal: None,
     };
     let old = ClusterGraphFixture {
         cut: fixture_read().cut,

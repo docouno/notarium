@@ -25,10 +25,10 @@ use notarium_syntax::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::super::{command_actor, derive_digest, derive_key, organize};
+use super::super::{command_actor, corpus, derive_digest, derive_key, organize};
 use super::{
     EgressTarget, ToolCallContext, clean_path, decode, folder_base, generated_slug, invalid,
-    receipt_result, relative_to, separator_after, session, validated_title,
+    receipt_result, separator_after, session, validated_title,
 };
 
 pub(super) mod proposal;
@@ -139,6 +139,15 @@ async fn project_placement(
     {
         return Err(DomainError::ResourceNotFound.into());
     }
+    corpus::admit_folder_write(
+        call,
+        &read_scope,
+        &project.reference,
+        Some(project.reference.clone()),
+        &folder.ancestor_folders,
+        DocClass::UserDoc,
+    )
+    .await?;
     let facts = ResourceFacts {
         space: folder.space,
         class: DocClass::UserDoc,
@@ -193,7 +202,7 @@ impl PreparedDraft {
             slug
         };
         let path = clean_path(draft.path.as_deref().unwrap_or_default())?;
-        let relative_path = relative_to(&path, &placement.path).unwrap_or(path);
+        let relative_path = corpus::strip_folder_prefix(&path, &placement.path).unwrap_or(path);
         let plan = finalize_document(
             &draft.body,
             DocClass::UserDoc,
@@ -321,14 +330,20 @@ struct PreparedLink {
 
 async fn prepare_links(
     call: &ToolCallContext<'_>,
+    provider: Option<&ToolCallContext<'_>>,
     scope: &SpaceContext,
     draft: &PreparedDraft,
 ) -> Result<Vec<PreparedLink>, PortError> {
     let mut links = Vec::with_capacity(draft.draft.links.len());
     for link in &draft.draft.links {
-        let (target, _) =
-            organize::resolve_target(call, scope, link.to.as_deref(), link.to_title.as_deref())
-                .await?;
+        let (target, _) = organize::resolve_target(
+            call,
+            provider,
+            scope,
+            link.to.as_deref(),
+            link.to_title.as_deref(),
+        )
+        .await?;
         links.push(PreparedLink {
             relation: link.relation.clone(),
             target,
@@ -395,10 +410,11 @@ fn carrier_with_links(
 
 async fn prepare_carrier(
     call: &ToolCallContext<'_>,
+    provider: Option<&ToolCallContext<'_>>,
     scope: &SpaceContext,
     draft: &PreparedDraft,
 ) -> Result<String, PortError> {
-    let links = prepare_links(call, scope, draft).await?;
+    let links = prepare_links(call, provider, scope, draft).await?;
     let (carrier, _) = carrier_with_links(&draft.carrier, link_lines(&links, &BTreeMap::new())?)?;
     Ok(carrier)
 }
@@ -415,6 +431,7 @@ async fn execute(
         &scope,
         Some(placement.project.reference.folder_id.clone()),
         prepared.relative_path.clone(),
+        DocClass::UserDoc,
         &prepared.command,
         "create_destination",
         None,
@@ -474,7 +491,7 @@ pub(super) async fn create_one(
     let input: CreateInput = decode(raw)?;
     let placement = placement(call, &input.project).await?;
     let prepared = PreparedDraft::new(call, &placement, input.draft, input.folder_page, 0, None)?;
-    let carrier = prepare_carrier(call, &placement.read_scope, &prepared).await?;
+    let carrier = prepare_carrier(call, None, &placement.read_scope, &prepared).await?;
     let (committed, parent) = execute(call, &placement, &prepared, carrier).await?;
     result(call, &placement, &prepared, committed, parent).await
 }
@@ -497,7 +514,7 @@ async fn create_draft(
     let bytes = serde_json::to_vec(&raw).map_err(|_| invalid(ValidationReason::InvalidQuery))?;
     let hash = derive_digest("notarium.mcp.create-note-item-arguments.v1", &[&bytes]);
     let prepared = PreparedDraft::new(call, placement, decode(raw)?, false, index, Some(hash))?;
-    let links = prepare_links(call, &placement.read_scope, &prepared).await?;
+    let links = prepare_links(call, None, &placement.read_scope, &prepared).await?;
     let (carrier, link_block) =
         carrier_with_links(&prepared.carrier, link_lines(&links, &BTreeMap::new())?)?;
     let (committed, parent) = execute(call, placement, &prepared, carrier.clone()).await?;

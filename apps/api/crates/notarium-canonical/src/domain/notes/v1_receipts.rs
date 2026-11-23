@@ -42,7 +42,7 @@ impl RecordedNote {
         kind: &str,
         payload: &blake3::Hasher,
     ) -> bool {
-        derive_command_identity_spec(identity, kind, payload.finalize().as_bytes()).command_hash()
+        crate::domain::common::command_identity_hash(identity, kind, payload.finalize().as_bytes())
             == self.hash
     }
 
@@ -275,7 +275,7 @@ pub(super) async fn link_identity(
     let link = item.input.clone();
     let single = format!("src={}\0line={line}", item.input.source.as_str());
     let single_hash =
-        derive_command_identity_spec(&item.identity, "link", single.as_bytes()).command_hash();
+        crate::domain::common::command_identity_hash(&item.identity, "link", single.as_bytes());
     let expected_parent = item.preconditions.revision.clone();
     let (stored_hash, base): (ContentDigest, Option<Vec<u8>>) = store.with_read_tx_budget(Some(&ctx.budget), |tx| Box::pin(async move {
         let mismatch = || PortError::from(DomainError::IdempotencyKeyReused);
@@ -315,7 +315,7 @@ pub(super) async fn link_identity(
             item.input.source.as_str(),
             hex::encode(base)
         );
-        if derive_command_identity_spec(&item.identity, "link", batch.as_bytes()).command_hash()
+        if crate::domain::common::command_identity_hash(&item.identity, "link", batch.as_bytes())
             != stored_hash
         {
             return Err(DomainError::IdempotencyKeyReused.into());

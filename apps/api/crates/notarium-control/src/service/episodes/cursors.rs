@@ -101,9 +101,19 @@ impl ControlService {
             ),
         )?;
         command.require(ctx.auth().principal(), ctx.auth().principal())?;
+        if matches!(request.input.owner, AckOwner::Account)
+            && ctx.auth().bearer_scope() == Some(BearerScope::Read)
+        {
+            return Err(DomainError::SpaceReadOnly.into());
+        }
         let budget = OperationBudget::new(ctx.budget.clone());
         let delivered = &request.input.delivered;
         let current_pre = self.current_account(&ctx, &budget).await?;
+        if matches!(request.input.owner, AckOwner::Account)
+            && current_pre.auth().bearer_scope() == Some(BearerScope::Read)
+        {
+            return Err(DomainError::SpaceReadOnly.into());
+        }
         if current_pre
             .auth()
             .spaces()
@@ -128,6 +138,11 @@ impl ControlService {
         let mut tx = self.store.write(budget.clone()).await?;
         let (revision, saved) = budget.run(async {
             let auth = self.revalidate_with_keeper(tx.inner_mut(), ctx.auth(), keeper.as_ref()).await?;
+            if matches!(request.input.owner, AckOwner::Account)
+                && auth.bearer_scope() == Some(BearerScope::Read)
+            {
+                return Err(DomainError::SpaceReadOnly.into());
+            }
             if auth.spaces().get(&delivered.scope.space_id).is_none_or(|g| g.read_classes.is_empty()) {
                 return Err(DomainError::ResourceNotFound.into());
             }
@@ -238,7 +253,7 @@ impl ControlService {
         &self,
         ctx: AccountContext,
         record: McpDedupRecord,
-    ) -> Result<(), PortError> {
+    ) -> Result<McpDedupHit, PortError> {
         validate_dedup_key(&record.key)?;
         if record.safe_result.len() > 65536
             || record.safe_result.contains('\0')
@@ -258,7 +273,7 @@ impl ControlService {
             .precheck_keeper_catalog(ctx.auth(), &budget, &ctx.budget.request)
             .await?;
         let mut tx = self.store.write(budget.clone()).await?;
-        budget
+        let hit = budget
             .run(
                 async {
                     let auth = self
@@ -291,7 +306,15 @@ impl ControlService {
                             {
                                 return Err(DomainError::IdempotencyKeyReused.into());
                             }
-                            return Ok(());
+                            let effect: AgentEffect = serde_json::from_value(
+                                serde_json::Value::String(existing.effect),
+                            )
+                            .map_err(|_| invalid(ValidationReason::InvalidState))?;
+                            return Ok(McpDedupHit {
+                                operation: existing.operation,
+                                safe_result: existing.safe_result,
+                                effect,
+                            });
                         }
                         execute!(
                             tx.inner_mut(),
@@ -343,13 +366,26 @@ impl ControlService {
                         {
                             return Err(DomainError::IdempotencyKeyReused.into());
                         }
+                        let effect: AgentEffect =
+                            serde_json::from_value(serde_json::Value::String(raced.effect))
+                                .map_err(|_| invalid(ValidationReason::InvalidState))?;
+                        return Ok(McpDedupHit {
+                            operation: raced.operation,
+                            safe_result: raced.safe_result,
+                            effect,
+                        });
                     }
-                    Ok(())
+                    Ok(McpDedupHit {
+                        operation: raw_row.operation,
+                        safe_result: raw_row.safe_result,
+                        effect: record.effect,
+                    })
                 },
                 CommitEffect::NotCommitted,
             )
             .await?;
-        budget.run(tx.commit(), CommitEffect::Unknown).await
+        budget.run(tx.commit(), CommitEffect::Unknown).await?;
+        Ok(hit)
     }
 }
 

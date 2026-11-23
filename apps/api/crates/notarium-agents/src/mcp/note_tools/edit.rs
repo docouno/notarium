@@ -7,6 +7,7 @@ use notarium_core::{
     ids::{NoteId, RevisionId, ViewKey},
     patch::{CarrierEditOrigin, CarrierPatchPlan},
     ports::{EditNote, Mutation, ViewRef},
+    query::FieldSchema,
     span::ByteSpan,
     value::{ExactNumber, YamlValue},
 };
@@ -38,6 +39,12 @@ pub(in crate::mcp) struct EditInput {
     fields: BTreeMap<String, FrontmatterValue>,
     view: Option<ViewInput>,
     pub(super) version_token: Option<RevisionId>,
+}
+
+impl EditInput {
+    pub(super) fn edits_view(&self) -> bool {
+        self.view.is_some()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -99,38 +106,37 @@ impl FieldChanges {
     }
 }
 
+const MAX_VIEW_VALUE_DEPTH: usize = 8;
+
 fn view_value(value: &Value) -> Result<YamlValue, PortError> {
-    if let Value::Array(items) = value {
-        return items
-            .iter()
-            .map(view_item)
-            .collect::<Result<Vec<_>, _>>()
-            .map(YamlValue::Sequence);
-    }
-    view_item(value)
+    view_value_at(value, 0)
 }
 
-fn view_item(value: &Value) -> Result<YamlValue, PortError> {
-    if let Value::Object(fields) = value {
-        let fields = fields
-            .iter()
-            .map(|(key, value)| {
-                corpus::validate_field_key(key)?;
-                Ok((key.clone(), view_scalar(value)?))
-            })
-            .collect::<Result<BTreeMap<_, _>, PortError>>()?;
-        return Ok(YamlValue::Mapping(fields));
+fn view_value_at(value: &Value, depth: usize) -> Result<YamlValue, PortError> {
+    if depth > MAX_VIEW_VALUE_DEPTH {
+        return Err(invalid(ValidationReason::InvalidQuery));
     }
-    view_scalar(value)
-}
-
-fn view_scalar(value: &Value) -> Result<YamlValue, PortError> {
     Ok(match value {
         Value::Null => YamlValue::Null,
         Value::String(text) => YamlValue::String(text.clone()),
         Value::Bool(value) => YamlValue::Bool(*value),
         Value::Number(number) => YamlValue::Number(ExactNumber::new(number.clone())),
-        _ => return Err(invalid(ValidationReason::InvalidQuery)),
+        Value::Array(items) => YamlValue::Sequence(
+            items
+                .iter()
+                .map(|item| view_value_at(item, depth + 1))
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        Value::Object(fields) => {
+            let mapped = fields
+                .iter()
+                .map(|(key, value)| {
+                    corpus::validate_field_key(key)?;
+                    Ok((key.clone(), view_value_at(value, depth + 1)?))
+                })
+                .collect::<Result<BTreeMap<_, _>, PortError>>()?;
+            YamlValue::Mapping(mapped)
+        }
     })
 }
 
@@ -209,6 +215,7 @@ impl EditInput {
         original: &str,
         class: DocClass,
         route: &NoteRoute,
+        schema: &BTreeMap<String, FieldSchema>,
     ) -> Result<CarrierPatchPlan, PortError> {
         if route.note != self.note
             || self
@@ -224,6 +231,7 @@ impl EditInput {
                 class,
                 &view.reference(&self.note)?,
                 &view.patch()?,
+                schema,
             )?);
         }
         let carrier = Carrier::scan(original)?;
@@ -349,7 +357,12 @@ pub(super) async fn edit_note(
     let route = route(call, &input.note, input.version_token.as_ref()).await?;
     let (scope, observed) = route_snapshot(call, &route).await?;
     let source = corpus::note_document(call, &scope, &observed.document).await?;
-    let plan = input.plan(&source, observed.document.class(), &route)?;
+    let schema = if input.edits_view() {
+        call.registry.engine.space_schema(scope.clone()).await?
+    } else {
+        BTreeMap::new()
+    };
+    let plan = input.plan(&source, observed.document.class(), &route, &schema)?;
     let committed = call
         .registry
         .engine
@@ -401,14 +414,21 @@ mod tests {
             "find": "type: table", "content": "type: board",
         }))
         .unwrap();
-        assert!(replace.plan(&source, DocClass::UserDoc, &route).is_err());
+        let schema = BTreeMap::new();
+        assert!(
+            replace
+                .plan(&source, DocClass::UserDoc, &route, &schema)
+                .is_err()
+        );
         let append: EditInput = decode(json!({
             "ref": route.note, "operation": "append", "content": "Another paragraph.",
         }))
         .unwrap();
         let appended = patch::apply(
             &source,
-            &append.plan(&source, DocClass::UserDoc, &route).unwrap(),
+            &append
+                .plan(&source, DocClass::UserDoc, &route, &schema)
+                .unwrap(),
         )
         .unwrap();
         assert!(appended.starts_with(&source));
@@ -417,14 +437,16 @@ mod tests {
             "ref": route.note,
             "view": {
                 "viewRef": format!("{}:{key}", route.note),
-                "common": { "set": { "type": "board" } },
+                "common": { "set": { "type": "board", "group_by": "status" } },
                 "options": { "set": { "compact": true, "sort": [{ "field": "title", "priority": 1 }] } },
             },
         })).unwrap();
         structural.validate().unwrap();
         let changed = patch::apply(
             &source,
-            &structural.plan(&source, DocClass::UserDoc, &route).unwrap(),
+            &structural
+                .plan(&source, DocClass::UserDoc, &route, &schema)
+                .unwrap(),
         )
         .unwrap();
         let body = Carrier::scan(&changed).unwrap().body;
@@ -486,7 +508,9 @@ mod tests {
         input.validate().unwrap();
         let output = patch::apply(
             source,
-            &input.plan(source, DocClass::UserDoc, &route).unwrap(),
+            &input
+                .plan(source, DocClass::UserDoc, &route, &BTreeMap::new())
+                .unwrap(),
         )
         .unwrap();
         let fields = frontmatter::analyze(&output, DocClass::UserDoc)
@@ -515,7 +539,9 @@ mod tests {
             "ref": route.note, "operation": "append", "content": "First paragraph.",
         }))
         .unwrap();
-        let plan = input.plan(source, DocClass::UserDoc, &route).unwrap();
+        let plan = input
+            .plan(source, DocClass::UserDoc, &route, &BTreeMap::new())
+            .unwrap();
         assert_eq!(plan.edits[0].origin, CarrierEditOrigin::Header);
         assert_eq!(plan.edits[1].origin, CarrierEditOrigin::Body);
         let changed = patch::apply(source, &plan).unwrap();
@@ -527,5 +553,75 @@ mod tests {
                 .unwrap(),
             "First paragraph."
         );
+    }
+
+    #[test]
+    fn nested_view_filter_edits_validate_against_schema_and_depth_limit() {
+        let route = note_route();
+        let key = ViewKey::from_bytes([7; 16]);
+        let source = format!("Intro.\n\n```nota\nid: {key}\ntype: table\n```\n");
+        let string_schema = BTreeMap::from([(
+            "status".to_owned(),
+            FieldSchema {
+                kind: notarium_core::query::FieldType::Scalar(
+                    notarium_core::query::ScalarType::String,
+                ),
+                nullable: false,
+            },
+        )]);
+        let nested_filter: EditInput = decode(json!({
+            "ref": route.note,
+            "view": {
+                "viewRef": format!("{}:{key}", route.note),
+                "common": {
+                    "set": {
+                        "filter": {
+                            "all": [{ "eq": { "key": "status", "value": "open" } }]
+                        }
+                    }
+                }
+            }
+        }))
+        .unwrap();
+        nested_filter.validate().unwrap();
+        let patched = patch::apply(
+            &source,
+            &nested_filter
+                .plan(&source, DocClass::UserDoc, &route, &string_schema)
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(patched.contains("status"));
+
+        // Schema type mismatch fails pre-commit validation instead of storing an invalid nota block.
+        let number_schema = BTreeMap::from([(
+            "status".to_owned(),
+            FieldSchema {
+                kind: notarium_core::query::FieldType::Scalar(
+                    notarium_core::query::ScalarType::Number,
+                ),
+                nullable: false,
+            },
+        )]);
+        assert!(
+            nested_filter
+                .plan(&source, DocClass::UserDoc, &route, &number_schema)
+                .is_err()
+        );
+
+        // Excessively nested JSON values beyond MAX_VIEW_VALUE_DEPTH are rejected.
+        let mut deep = json!("leaf");
+        for _ in 0..10 {
+            deep = json!({ "nested": deep });
+        }
+        let too_deep: EditInput = decode(json!({
+            "ref": route.note,
+            "view": {
+                "viewRef": format!("{}:{key}", route.note),
+                "options": { "set": { "deep": deep } }
+            }
+        }))
+        .unwrap();
+        assert!(too_deep.validate().is_err());
     }
 }

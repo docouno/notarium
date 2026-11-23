@@ -236,6 +236,10 @@ preparation and traversal. Local and lexical searches skip the provider project
 lookup. When this deadline expires, the query returns lexical results with
 `BudgetExceeded`.
 The same deadline bounds waits for projection access during traversal.
+Recipient-filtered provider queries start at the ordinary candidate depth and
+widen progressively to the full recipient probe budget only when recipient
+filtering rejects candidates and leaves too few hits, reusing prepared query
+vectors and overlay hits across passes.
 The durable pending state schedules bounded repair when embeddings are missing.
 Ready targeted batches alternate with full-sweep pages. Targeted repair resumes
 after the last attempted note ID and wraps at the end. A note-specific rate

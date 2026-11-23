@@ -26,7 +26,9 @@ use std::{
 const PAGE_SIZE: u16 = 20;
 const TICKET_TTL: Duration = Duration::from_secs(15 * 60);
 const MAX_TICKETS: usize = 256;
+const MAX_TICKETS_PER_PRINCIPAL: usize = 32;
 const MAX_STARTS: usize = 128;
+const MAX_STARTS_PER_PRINCIPAL: usize = 16;
 const CONTINUATION_PREFIX: &str = "continue_";
 const DELIVERY_PREFIX: &str = "delivery_";
 
@@ -54,6 +56,7 @@ struct Ticket {
 }
 
 struct Batch {
+    principal: notarium_core::ids::PrincipalId,
     episode: EpisodeId,
     owner: AckOwner,
     project: Option<FolderRef>,
@@ -96,6 +99,22 @@ impl BootstrapContinuations {
         tickets.retain(|(_, current)| current.opened.elapsed() < TICKET_TTL);
         if tickets.iter().any(|(existing, _)| *existing == id) {
             return Err(invalid(ValidationReason::InvalidState));
+        }
+        let principal = &ticket.batch.principal;
+        while tickets
+            .iter()
+            .filter(|(_, current)| &current.batch.principal == principal)
+            .count()
+            >= MAX_TICKETS_PER_PRINCIPAL
+        {
+            if let Some(pos) = tickets
+                .iter()
+                .position(|(_, current)| &current.batch.principal == principal)
+            {
+                tickets.remove(pos);
+            } else {
+                break;
+            }
         }
         if tickets.len() == MAX_TICKETS {
             tickets.pop_front();
@@ -145,6 +164,22 @@ impl BootstrapContinuations {
             .find(|entry| entry.key == start.key && entry.batch.authority == start.batch.authority)
         {
             return previous.clone();
+        }
+        let principal = &start.batch.principal;
+        while starts
+            .iter()
+            .filter(|entry| &entry.batch.principal == principal)
+            .count()
+            >= MAX_STARTS_PER_PRINCIPAL
+        {
+            if let Some(pos) = starts
+                .iter()
+                .position(|entry| &entry.batch.principal == principal)
+            {
+                starts.remove(pos);
+            } else {
+                break;
+            }
         }
         if starts.len() == MAX_STARTS {
             starts.pop_front();
@@ -217,6 +252,7 @@ pub(super) async fn open(
         return page(call, start.opened, start.batch, next_space(0), acknowledge).await;
     }
     let batch = Arc::new(Batch {
+        principal: account.auth().principal().clone(),
         episode,
         owner,
         project,
@@ -475,7 +511,7 @@ async fn page(
                     ClassEgressFence::mcp_note_metadata(&document.metadata(), context.auth())
                 {
                     let error = PortError::from(error);
-                    if super::hidden(&error) {
+                    if super::super::corpus::hidden(&error) {
                         continue;
                     }
                     return Err(error);
@@ -675,6 +711,7 @@ mod tests {
         let first = scope(1);
         let second = scope(2);
         let batch = Arc::new(Batch {
+            principal: PrincipalId::from_bytes([9; 16]),
             episode: EpisodeId::from_bytes([7; 16]),
             owner: AckOwner::Account,
             project: None,

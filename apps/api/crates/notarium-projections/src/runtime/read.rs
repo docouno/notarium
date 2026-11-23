@@ -860,110 +860,194 @@ impl ProjectionEngine {
         project: FolderRef,
         causal: CausalBasis,
     ) -> Result<ProjectNoteCounts, PortError> {
+        const PROJECT_COUNTS_WAIT_CAP: Duration = Duration::from_millis(250);
+        const MAX_FALLBACK_TAG_SCAN_NOTES: usize = 1_000;
         if project.space_id != ctx.scope().space_id {
             return Err(DomainError::ResourceNotFound.into());
         }
         within_budget(&ctx, async {
-            let initial = self.choose_read(&ctx, &causal, None).await?.cut;
-            let head = {
-                let permit = initial.live.read(&ctx.budget).await?;
-                authorize_entry(&permit, &ctx, &project.folder_id)?;
-                permit.head()
-            };
-            // Moving a subtree can change thousands of memberships at once. Use the
-            // current published cut before consulting its project and class postings.
-            let cut = self
-                .wait_for_cut(ctx.scope(), head, &ctx.budget, ctx.budget.remaining)
-                .await?;
-            let seq = cut.cut.projected_seq;
-            let folder = cut
-                .store
-                .folder_by_id(ctx.scope(), seq, &project.folder_id)
-                .await?
-                .filter(|row| row.is_project)
-                .ok_or(DomainError::ResourceNotFound)?;
-            let path = folder
-                .norm_path_prefix
-                .ok_or(DomainError::ResourceNotFound)?;
-            let index = self.open_index_async(&cut).await?;
-            let mut members = query::folder_notes(&index, &project.folder_id, true)?;
-            for nested in cut
-                .store
-                .active_descendants_of_kind(ctx.scope(), seq, &project.folder_id, &path, true)
-                .await?
-            {
-                members.andnot_inplace(&query::folder_notes(&index, &nested, true)?);
+            if !ctx.auth().spaces().contains_key(&ctx.scope().space_id) {
+                return Err(DomainError::ResourceNotFound.into());
             }
-            {
-                let permit = cut.live.read(&ctx.budget).await?;
-                ensure_active_head(&permit, seq)?;
-                authorize_entry(&permit, &ctx, &project.folder_id)?;
-                members.and_inplace(&query::note_universe(
-                    &index,
-                    permit.space(),
-                    ctx.auth(),
-                    LifecycleMask::Active,
-                )?);
-            }
-            let mut counts = BTreeMap::new();
-            for class in DocClass::all() {
-                let rows = index
-                    .posting(&PostingKey::DocClass(class))
-                    .map_err(super::checkpoint_error)?;
-                let n = members.and_cardinality(&rows);
-                if n > 0 {
-                    counts.insert(class, n);
-                }
-            }
-            let memory = index
-                .posting(&PostingKey::DocClass(DocClass::AgentMemory))
-                .map_err(super::checkpoint_error)?;
-            let encrypted = index
-                .posting(&PostingKey::Encrypted)
-                .map_err(super::checkpoint_error)?;
-            members.andnot_inplace(&encrypted);
-            let indexed_tags = index
-                .visible_tags(&members, MAX_PROJECT_BOOTSTRAP_VALUES)
-                .map_err(super::checkpoint_error)?;
-            let mut tags = BTreeSet::new();
-            let mut categories = BTreeSet::new();
-            if indexed_tags.is_some() {
-                members.and_inplace(&memory);
-            }
-            for page in query::dense_pages(&members) {
-                for row in cut
-                    .store
-                    .hydrate_list_rows(ctx.scope(), seq, &page)
-                    .await?
+            let required = match &causal {
+                CausalBasis::Await(watermarks) => watermarks.required(ctx.scope())?,
+                CausalBasis::Exact(receipts) => receipts
+                    .for_scope(ctx.scope())?
                     .into_iter()
-                    .flatten()
-                {
-                    if indexed_tags.is_none() {
-                        for tag in row.tags {
-                            remember_value(&mut tags, tag);
+                    .map(|receipt| receipt.seq())
+                    .max()
+                    .unwrap_or(SpaceSeq::ZERO),
+            };
+            let grace_wait = (ctx.budget.remaining / 4).min(PROJECT_COUNTS_WAIT_CAP);
+            for attempt in 0..3 {
+                let attempt_result: Result<ProjectNoteCounts, PortError> = async {
+                    let initial = match self.published_cut(ctx.scope()) {
+                        Ok(cut) => cut,
+                        Err(error) if registration_gap(&error) => match self
+                            .wait_for_cut(ctx.scope(), SpaceSeq::ZERO, &ctx.budget, grace_wait)
+                            .await
+                        {
+                            Ok(cut) => cut,
+                            Err(PortError::DeadlineExceeded(_)) => return Err(not_ready()),
+                            Err(error) => return Err(error),
+                        },
+                        Err(error) => return Err(error),
+                    };
+                    let head = {
+                        let permit = initial.live.read(&ctx.budget).await?;
+                        authorize_entry(&permit, &ctx, &project.folder_id)?;
+                        permit.head()
+                    };
+                    let target = head.max(required);
+                    // Moving a subtree can change thousands of memberships at once. Wait
+                    // within a bounded grace window for the current cut, then degrade
+                    // promptly to `NotReady` when the projector is lagging.
+                    let cut = if initial.cut.projected_seq >= target {
+                        initial
+                    } else {
+                        match self
+                            .wait_for_cut(ctx.scope(), target, &ctx.budget, grace_wait)
+                            .await
+                        {
+                            Ok(cut) => cut,
+                            Err(PortError::DeadlineExceeded(_)) => return Err(not_ready()),
+                            Err(error) => return Err(error),
+                        }
+                    };
+                    let seq = cut.cut.projected_seq;
+                    let folder = cut
+                        .store
+                        .folder_by_id(ctx.scope(), seq, &project.folder_id)
+                        .await?
+                        .filter(|row| row.is_project)
+                        .ok_or(DomainError::ResourceNotFound)?;
+                    let path = folder
+                        .norm_path_prefix
+                        .ok_or(DomainError::ResourceNotFound)?;
+                    let index = self.open_index_async(&cut).await?;
+                    let mut members = query::folder_notes(&index, &project.folder_id, true)?;
+                    for nested in cut
+                        .store
+                        .active_descendants_of_kind(
+                            ctx.scope(),
+                            seq,
+                            &project.folder_id,
+                            &path,
+                            true,
+                        )
+                        .await?
+                    {
+                        members.andnot_inplace(&query::folder_notes(&index, &nested, true)?);
+                    }
+                    {
+                        let permit = cut.live.read(&ctx.budget).await?;
+                        ensure_active_head(&permit, seq)?;
+                        authorize_entry(&permit, &ctx, &project.folder_id)?;
+                        members.and_inplace(&query::note_universe(
+                            &index,
+                            permit.space(),
+                            ctx.auth(),
+                            LifecycleMask::Active,
+                        )?);
+                    }
+                    let mut counts = BTreeMap::new();
+                    for class in DocClass::all() {
+                        let rows = index
+                            .posting(&PostingKey::DocClass(class))
+                            .map_err(super::checkpoint_error)?;
+                        let n = members.and_cardinality(&rows);
+                        if n > 0 {
+                            counts.insert(class, n);
                         }
                     }
-                    if row.doc_class == DocClass::AgentMemory
-                        && let Some(category) = row.slug.strip_prefix("memory-")
-                    {
-                        remember_value(&mut categories, category.to_owned());
+                    let memory = index
+                        .posting(&PostingKey::DocClass(DocClass::AgentMemory))
+                        .map_err(super::checkpoint_error)?;
+                    let encrypted = index
+                        .posting(&PostingKey::Encrypted)
+                        .map_err(super::checkpoint_error)?;
+                    members.andnot_inplace(&encrypted);
+                    let indexed_tags = index
+                        .visible_tags(&members, MAX_PROJECT_BOOTSTRAP_VALUES)
+                        .map_err(super::checkpoint_error)?;
+                    let mut tags = BTreeSet::new();
+                    let mut categories = BTreeSet::new();
+                    let memory_members = &members & &memory;
+                    let mut scanned_memory = 0usize;
+                    for page in query::dense_pages(&memory_members) {
+                        if scanned_memory >= MAX_FALLBACK_TAG_SCAN_NOTES {
+                            break;
+                        }
+                        scanned_memory += page.len();
+                        for row in cut
+                            .store
+                            .hydrate_list_rows(ctx.scope(), seq, &page)
+                            .await?
+                            .into_iter()
+                            .flatten()
+                        {
+                            if indexed_tags.is_none() {
+                                for tag in row.tags {
+                                    remember_value(&mut tags, tag);
+                                }
+                            }
+                            if let Some(category) = row.slug.strip_prefix("memory-") {
+                                remember_value(&mut categories, category.to_owned());
+                            }
+                        }
                     }
+                    if indexed_tags.is_none() {
+                        members.andnot_inplace(&memory_members);
+                        let mut scanned = 0usize;
+                        for page in query::dense_pages(&members) {
+                            if scanned >= MAX_FALLBACK_TAG_SCAN_NOTES {
+                                break;
+                            }
+                            scanned += page.len();
+                            for row in cut
+                                .store
+                                .hydrate_list_rows(ctx.scope(), seq, &page)
+                                .await?
+                                .into_iter()
+                                .flatten()
+                            {
+                                for tag in row.tags {
+                                    remember_value(&mut tags, tag);
+                                }
+                            }
+                        }
+                    }
+                    let permit = cut.live.read(&ctx.budget).await?;
+                    ensure_active_head(&permit, seq)?;
+                    authorize_entry(&permit, &ctx, &project.folder_id)?;
+                    let _generation = self.current_admission(cut.cut.generation)?;
+                    Ok(ProjectNoteCounts {
+                        project: project.clone(),
+                        cut: SnapshotCut {
+                            canonical_seq: seq,
+                            ..cut.cut.clone()
+                        },
+                        counts,
+                        known_tags: indexed_tags.unwrap_or_else(|| tags.into_iter().collect()),
+                        known_categories: categories.into_iter().collect(),
+                    })
+                }
+                .await;
+                match attempt_result {
+                    Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
+                        if attempt < 2
+                            && matches!(
+                                diagnostic.reason,
+                                ValidationReason::CursorStale
+                                    | ValidationReason::GenerationMismatch
+                            ) =>
+                    {
+                        continue;
+                    }
+                    result => return result,
                 }
             }
-            let permit = cut.live.read(&ctx.budget).await?;
-            ensure_active_head(&permit, seq)?;
-            authorize_entry(&permit, &ctx, &project.folder_id)?;
-            let _generation = self.current_admission(cut.cut.generation)?;
-            Ok(ProjectNoteCounts {
-                project,
-                cut: SnapshotCut {
-                    canonical_seq: seq,
-                    ..cut.cut.clone()
-                },
-                counts,
-                known_tags: indexed_tags.unwrap_or_else(|| tags.into_iter().collect()),
-                known_categories: categories.into_iter().collect(),
-            })
+            Err(stale())
         })
         .await
     }
@@ -1897,14 +1981,6 @@ impl NoteReadPort for ProjectedNoteReadPort {
         Box::pin(self.0.project_counts(ctx, project, causal))
     }
 
-    fn prepare_agent_run_rollback(
-        &self,
-        ctx: SpaceContext,
-        run: AgentRunId,
-    ) -> PortFuture<'_, RollbackAgentRun> {
-        Box::pin(self.0.canonical.prepare_agent_run_rollback(ctx, run))
-    }
-
     fn read_ability_resource(
         &self,
         ctx: SpaceContext,
@@ -1914,6 +1990,13 @@ impl NoteReadPort for ProjectedNoteReadPort {
     }
     fn get_note(&self, ctx: SpaceContext, request: GetNote) -> PortFuture<'_, NoteSnapshot> {
         Box::pin(self.0.canonical.get_note(ctx, request))
+    }
+    fn get_note_metadata(
+        &self,
+        ctx: SpaceContext,
+        request: GetNote,
+    ) -> PortFuture<'_, NoteMetadataSnapshot> {
+        Box::pin(self.0.canonical.get_note_metadata(ctx, request))
     }
     fn list_notes(
         &self,

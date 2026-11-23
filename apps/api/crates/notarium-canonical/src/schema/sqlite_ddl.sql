@@ -33,6 +33,10 @@ CREATE TABLE IF NOT EXISTS spaces (
 CREATE UNIQUE INDEX IF NOT EXISTS uq_spaces_slug_fold
     ON spaces (slug_fold);
 
+CREATE INDEX IF NOT EXISTS idx_spaces_personal_owner
+    ON spaces (owner_id)
+    WHERE space_kind = 'personal' AND lifecycle_state = 'active';
+
 CREATE TABLE IF NOT EXISTS folder_heads (
     space_id TEXT NOT NULL,
     folder_id TEXT NOT NULL,
@@ -85,6 +89,10 @@ CREATE INDEX IF NOT EXISTS idx_folder_heads_parent_lifecycle
 CREATE INDEX IF NOT EXISTS idx_folder_heads_cover
     ON folder_heads (space_id, cover_note_id)
     WHERE cover_note_id IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_folder_heads_active_projects_id
+    ON folder_heads (space_id, folder_id)
+    WHERE lifecycle_state = 'active' AND is_project = 1;
 
 CREATE TABLE IF NOT EXISTS folder_aliases (
     space_id TEXT NOT NULL,
@@ -489,6 +497,9 @@ CREATE TABLE IF NOT EXISTS command_receipts (
 CREATE INDEX IF NOT EXISTS idx_command_receipts_expires
     ON command_receipts (space_id, expires_at_ms);
 
+CREATE INDEX IF NOT EXISTS idx_command_receipts_seq
+    ON command_receipts (space_id, history_incarnation, canonical_seq);
+
 CREATE INDEX IF NOT EXISTS idx_receipt_exception_pointer ON command_receipts (space_id, response_payload_id) WHERE response_payload_id IS NOT NULL AND
             (response_payload_id <> 'rcpt_pay:' || actor_id || ':' || idempotency_key
              OR actor_id LIKE '%:%');
@@ -618,6 +629,7 @@ CREATE TABLE IF NOT EXISTS chat_threads (
     updated_at_nsec INTEGER NOT NULL CHECK (updated_at_nsec >= 0 AND updated_at_nsec < 1000000000),
     active_run_epoch INTEGER CHECK (active_run_epoch IS NULL OR active_run_epoch >= 0),
     active_run_generation TEXT,
+    redaction_epoch INTEGER NOT NULL DEFAULT 0 CHECK (redaction_epoch >= 0),
     PRIMARY KEY (space_id, thread_id),
     FOREIGN KEY (space_id) REFERENCES spaces (space_id),
     FOREIGN KEY (space_id, project_folder_id) REFERENCES folder_heads (space_id, folder_id)

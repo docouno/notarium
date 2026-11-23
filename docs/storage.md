@@ -62,10 +62,10 @@ to enable the `test-support` Cargo feature for raw diagnostics and fault injecti
 The store implements
 `NoteWritePort`, `ChatPort`, `ContentJobPort`,
 `ChangeBroadcast` and `BackupParticipantPort`, alongside canonical point reads
-(`get_note`, `hydrate_cards`, `read_ability_resource`, `read_changes`,
+(`get_note`, `get_note_metadata`, `hydrate_cards`, `read_ability_resource`, `read_changes`,
 `recent_activity`, `resolve_note_target`, `resolve_folder_path`,
 `list_child_folders`, `space_schema`), `move_board_card`,
-`prepare_agent_run_rollback`, `rollback_agent_run`,
+`rollback_agent_run`,
 `accept_external_observation`, and peer session/job persistence. Full query
 planning (`NoteReadPort::list_notes`), `ViewGraphPort` and `SearchPort` remain
 owned by downstream projection and search crates.
@@ -592,8 +592,11 @@ same example against an isolated prefix.
   volume, where lookup checks file size and BLAKE3 before returning the path.
   Startup reconciles abandoned holds and pending local artifacts.
   The offline `notarium_canonical::backup::decode_postgres_spool_v1_bounded`
-  API verifies the trailer and recognizes the exact manifests for schemas 1 through 9,
-  including both layouts of versions 7 and 8.
+  API verifies the trailer and recognizes the exact linear manifests for schemas 1 through 9.
+  Schema version 9 adds `chat_threads.redaction_epoch` for O(1) folded-proof invalidation,
+  typed `proposed_effect` columns on `chat_entries`, and secondary indexes for personal
+  Space lookup (`idx_spaces_personal_owner`), receipt sequence scans
+  (`idx_command_receipts_seq`), and active project roots (`idx_folder_heads_active_project`).
   It returns typed rows in the original table and column order within the
   caller's byte budget. To materialize a historical spool, create an empty
   target with `schema::POSTGRES_BASELINE_DDL`. Match the version and manifest
@@ -602,15 +605,10 @@ same example against an isolated prefix.
 
   | Historical layout (manifest checksum prefix) | Apply to the empty version 9 target in order |
   | --- | --- |
-  | Projection v8 (`085e724d`) | `schema-v8-remove-agents.sql` |
-  | Projection v7 (`1a3cfcfe`) | `schema-v8-remove-agents.sql`, then `schema-v7-chat-refs.sql` |
-  | Agent v8 (`ee1c8ead`) | `schema-v6-remove-projection.sql` |
-  | Agent v7 (`244ce610`) | `schema-v6-remove-projection.sql`, then restore the unique ability slug index described below |
+  | Schema v8 (`085e724d`) | `schema-v8-remove-agents.sql` |
+  | Schema v7 (`1a3cfcfe`) | `schema-v8-remove-agents.sql`, then `schema-v7-chat-refs.sql` |
   | Common v1–v6 | `schema-v8-remove-agents.sql`, then `schema-v6-remove-projection.sql`, followed by the version-specific steps below |
 
-  To restore the agent v7 index, replace `idx_ability_packages_active_slug`
-  with a unique index named `uq_ability_packages_active_slug` on
-  `ability_packages(space_id,slug_fold)` where `lifecycle_state = 'active'`.
   For versions 1 through 5, drop `idx_blob_retirements_status` and recreate it
   on `(space_id, status)`.
   For versions 1 and 2, drop
@@ -628,7 +626,7 @@ same example against an isolated prefix.
   can resolve parents that appear later in the archive.
   Opening the target with the original installation ID applies the remaining
   migrations through version 9. The PostgreSQL restore suite imports archives
-  for all ten predecessor manifests and checks chat authorship and normalized
+  for all eight predecessor manifests (v1–v8) and checks chat authorship and normalized
   references after startup.
   Before serving the restored database, call `restore_cursors` with each
   original cutoff and a fresh history incarnation. The same transaction

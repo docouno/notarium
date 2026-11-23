@@ -400,11 +400,11 @@ pub(crate) async fn publish_ability_package_impl(
         fp_hasher.update(b"\0require-explicit-binding-v1\0");
     }
     let idemp = derive_command_identity_spec(
+        &ctx,
         &request.identity,
         "publish_ability_package",
         fp_hasher.finalize().as_bytes(),
     )
-    .with_canonical_effect(&ctx)
     .for_note(ctx.auth(), &request.input.entrypoint);
 
     let auth = ctx.auth().clone();
@@ -692,6 +692,26 @@ pub(crate) async fn publish_ability_package_impl(
                     }
                 }
 
+                let description = crate::runtime::read_immutable_revision_tx(
+                    tx,
+                    &scope,
+                    "note",
+                    input_entrypoint.as_str(),
+                    entry_head.updated_seq,
+                )
+                .await?
+                .and_then(|entry| match entry.metadata.payload {
+                    RevisionMetadataPayload::Note(note) => note.raw_fields,
+                    _ => None,
+                })
+                .and_then(|fields| match fields.get("description") {
+                    Some(notarium_core::value::YamlValue::String(text)) => {
+                        let trimmed = text.trim();
+                        (!trimmed.is_empty()).then(|| trimmed.chars().take(4096).collect())
+                    }
+                    _ => None,
+                });
+
                 let meta = RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Ability(
                     AbilityRevisionMetadata {
                         ability_id: input_ability.clone(),
@@ -703,6 +723,7 @@ pub(crate) async fn publish_ability_package_impl(
                         resources: manifest.clone(),
                         total_bytes: entry_head.byte_size.saturating_add(aux_raw_bytes),
                         attached_skills,
+                        description,
                         promoted_from,
                         requires_explicit_binding,
                     },

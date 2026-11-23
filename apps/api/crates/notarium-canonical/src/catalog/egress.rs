@@ -5,10 +5,11 @@ use notarium_core::classes::{
     CanonicalMetadataContent, ClassEgressFence, ClassifiedMetadata, ProviderCurrentContent,
     ProviderOrigin,
 };
-use tokio::{sync::OwnedMutexGuard, time::Instant};
+use tokio::time::Instant;
 
 use super::*;
 use crate::{
+    chats::ProofFoldCache,
     codec::{
         RevisionMetadataEnvelope, RevisionMetadataPayload, cancelled_not_committed,
         deadline_not_committed, i64_to_space_seq,
@@ -16,15 +17,62 @@ use crate::{
     dialect::postgres::StorePgConnection,
     domain::common::FolderAncestryCache,
     runtime::{SqlDriverState, pg_read_error},
-    sqlite_fast::SqliteWriterPair,
 };
+
+struct ClosePgOnAbort(Option<StorePgConnection>);
+
+impl ClosePgOnAbort {
+    fn new(conn: StorePgConnection) -> Self {
+        Self(Some(conn))
+    }
+
+    fn as_mut(&mut self) -> &mut StorePgConnection {
+        self.0.as_mut().expect("active PostgreSQL connection")
+    }
+
+    fn disarm(mut self) -> StorePgConnection {
+        self.0.take().expect("active PostgreSQL connection")
+    }
+}
+
+impl Drop for ClosePgOnAbort {
+    fn drop(&mut self) {
+        if let Some(mut conn) = self.0.take() {
+            conn.close_on_drop();
+        }
+    }
+}
+
+struct CloseSqliteOnAbort(Option<sqlx::pool::PoolConnection<sqlx::Sqlite>>);
+
+impl CloseSqliteOnAbort {
+    fn new(conn: sqlx::pool::PoolConnection<sqlx::Sqlite>) -> Self {
+        Self(Some(conn))
+    }
+
+    fn as_mut(&mut self) -> &mut sqlx::pool::PoolConnection<sqlx::Sqlite> {
+        self.0.as_mut().expect("active SQLite connection")
+    }
+
+    fn disarm(mut self) -> sqlx::pool::PoolConnection<sqlx::Sqlite> {
+        self.0.take().expect("active SQLite connection")
+    }
+}
+
+impl Drop for CloseSqliteOnAbort {
+    fn drop(&mut self) {
+        if let Some(mut conn) = self.0.take() {
+            conn.close_on_drop();
+        }
+    }
+}
 
 enum DisclosureConnection {
     Sqlite {
-        snapshot: Option<OwnedMutexGuard<Option<SqliteWriterPair>>>,
+        snapshot: Option<sqlx::pool::PoolConnection<sqlx::Sqlite>>,
         _pin: crate::runtime::disclosure::DisclosurePin,
     },
-    Postgres(StorePgConnection),
+    Postgres(Option<StorePgConnection>),
 }
 
 pub(crate) struct CanonicalDisclosureGuard {
@@ -33,24 +81,76 @@ pub(crate) struct CanonicalDisclosureGuard {
     cancellation: Cancellation,
 }
 
+impl Drop for CanonicalDisclosureGuard {
+    fn drop(&mut self) {
+        match &mut self.connection {
+            DisclosureConnection::Sqlite { snapshot, .. } => {
+                if let Some(mut conn) = snapshot.take() {
+                    conn.close_on_drop();
+                }
+            }
+            DisclosureConnection::Postgres(conn) => {
+                if let Some(mut conn) = conn.take() {
+                    conn.close_on_drop();
+                }
+            }
+        }
+    }
+}
+
 impl CanonicalDisclosureGuard {
     pub(crate) fn connection(&mut self) -> BackendConn<'_> {
         match &mut self.connection {
-            DisclosureConnection::Sqlite { snapshot, .. } => BackendConn::Sqlite(
-                &mut snapshot
-                    .as_mut()
-                    .expect("open snapshot")
-                    .as_mut()
-                    .expect("pinned canonical writer")
-                    .sqlx_conn,
-            ),
-            DisclosureConnection::Postgres(conn) => BackendConn::Postgres(conn),
+            DisclosureConnection::Sqlite { snapshot, .. } => {
+                BackendConn::Sqlite(snapshot.as_mut().expect("open SQLite disclosure snapshot"))
+            }
+            DisclosureConnection::Postgres(conn) => {
+                BackendConn::Postgres(conn.as_mut().expect("open PostgreSQL disclosure snapshot"))
+            }
         }
     }
 
-    pub(super) fn finish_snapshot(&mut self) {
-        if let DisclosureConnection::Sqlite { snapshot, .. } = &mut self.connection {
-            drop(snapshot.take());
+    pub(super) async fn finish_snapshot(&mut self) {
+        if let DisclosureConnection::Sqlite { snapshot, .. } = &mut self.connection
+            && let Some(conn) = snapshot.take()
+        {
+            let mut guarded = CloseSqliteOnAbort::new(conn);
+            if sqlx::raw_sql("ROLLBACK")
+                .execute(&mut **guarded.as_mut())
+                .await
+                .is_ok()
+            {
+                drop(guarded.disarm());
+            }
+        }
+    }
+
+    pub(super) async fn release_clean(mut self) {
+        match &mut self.connection {
+            DisclosureConnection::Sqlite { snapshot, .. } => {
+                if let Some(conn) = snapshot.take() {
+                    let mut guarded = CloseSqliteOnAbort::new(conn);
+                    if sqlx::raw_sql("ROLLBACK")
+                        .execute(&mut **guarded.as_mut())
+                        .await
+                        .is_ok()
+                    {
+                        drop(guarded.disarm());
+                    }
+                }
+            }
+            DisclosureConnection::Postgres(conn) => {
+                if let Some(conn) = conn.take() {
+                    let mut guarded = ClosePgOnAbort::new(conn);
+                    if sqlx::raw_sql("ROLLBACK")
+                        .execute(&mut **guarded.as_mut())
+                        .await
+                        .is_ok()
+                    {
+                        drop(guarded.disarm());
+                    }
+                }
+            }
         }
     }
 
@@ -82,30 +182,35 @@ impl CanonicalStore {
         let acquire = async {
             let connection = match &self.inner.sql {
                 SqlDriverState::Sqlite {
-                    writer,
+                    read_pool,
                     disclosures,
                     ..
                 } => {
                     let pin = disclosures.pin(spaces).await;
-                    let writer = writer.clone().lock_owned().await;
-                    if writer.is_none() {
-                        return Err(DomainError::ResourceNotFound.into());
-                    }
+                    self.ensure_open()?;
+                    let conn = read_pool
+                        .acquire()
+                        .await
+                        .map_err(|e| internal_not_committed("egress_acquire", e.to_string()))?;
+                    let mut guarded = CloseSqliteOnAbort::new(conn);
+                    sqlx::raw_sql("BEGIN DEFERRED")
+                        .execute(&mut **guarded.as_mut())
+                        .await
+                        .map_err(|e| internal_not_committed("egress_begin", e.to_string()))?;
                     DisclosureConnection::Sqlite {
-                        snapshot: Some(writer),
+                        snapshot: Some(guarded.disarm()),
                         _pin: pin,
                     }
                 }
                 SqlDriverState::Postgres { pool, .. } => {
-                    let mut conn = pool
+                    let conn = pool
                         .acquire()
                         .await
                         .map_err(|e| pg_read_error("egress_acquire", e))?;
-                    // A canceled acquisition may leave a partially opened transaction.
-                    // Discarding the dedicated connection releases its locks in all paths.
-                    conn.close_on_drop();
+                    // Discard only if cancelled/failed mid-setup; clean release runs ROLLBACK and reuses the connection.
+                    let mut guarded = ClosePgOnAbort::new(conn);
                     sqlx::raw_sql("BEGIN; SELECT pg_advisory_xact_lock_shared(hashtextextended(current_schema(), 7311229))")
-                        .execute(&mut *conn)
+                        .execute(&mut **guarded.as_mut())
                         .await
                         .map_err(|e| pg_read_error("egress_begin", e))?;
                     for space in spaces {
@@ -113,12 +218,12 @@ impl CanonicalStore {
                             "SELECT space_id FROM spaces WHERE space_id=$1 FOR SHARE",
                         )
                         .bind(space.as_str())
-                        .fetch_optional(&mut *conn)
+                        .fetch_optional(&mut **guarded.as_mut())
                         .await
                         .map_err(|e| pg_read_error("egress_lock_space", e))?
                         .ok_or(DomainError::ResourceNotFound)?;
                     }
-                    DisclosureConnection::Postgres(conn)
+                    DisclosureConnection::Postgres(Some(guarded.disarm()))
                 }
             };
             Ok(CanonicalDisclosureGuard {
@@ -163,8 +268,24 @@ impl ProviderEgressLease for EgressLease {
         &self.project_folders
     }
 
-    fn mark_dispatched(&mut self) {
-        drop(self.guard.take());
+    fn mark_dispatched(&mut self) -> PortFuture<'_, ()> {
+        let guard = self.guard.take();
+        Box::pin(async move {
+            if let Some(guard) = guard {
+                guard.release_clean().await;
+            }
+            Ok(())
+        })
+    }
+
+    fn close(&mut self) -> PortFuture<'_, ()> {
+        let guard = self.guard.take();
+        Box::pin(async move {
+            if let Some(guard) = guard {
+                guard.release_clean().await;
+            }
+            Ok(())
+        })
     }
 
     fn check(&self) -> notarium_core::DomainResult<()> {
@@ -240,15 +361,17 @@ impl ProviderEgressCatalogPort for CanonicalStore {
                 .pin_disclosure(&ctx.budget, &spaces, &cancellation)
                 .await?;
             let deadline = guard.deadline;
-            let mut connection = guard.connection();
-            let current = tokio::select! {
-                biased;
-                _ = cancellation.cancelled() => return Err(cancelled()),
-                _ = ctx.budget.cancellation.cancelled() => return Err(cancelled()),
-                _ = tokio::time::sleep_until(deadline) => return Err(expired()),
-                rows = snapshot(&mut connection, &ctx, &request, spaces) => rows?,
+            let current = {
+                let mut connection = guard.connection();
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => return Err(cancelled()),
+                    _ = ctx.budget.cancellation.cancelled() => return Err(cancelled()),
+                    _ = tokio::time::sleep_until(deadline) => return Err(expired()),
+                    rows = snapshot(&mut connection, &ctx, &request, spaces) => rows?,
+                }
             };
-            guard.finish_snapshot();
+            guard.finish_snapshot().await;
             Ok(Box::new(EgressLease {
                 guard: Some(guard),
                 cancellation,
@@ -282,6 +405,7 @@ async fn discover_chat_dependencies(
         }
     }
     let mut origins = Vec::new();
+    let mut proof_memo = ProofFoldCache::new();
     while !work.is_empty() {
         let batch = work.split_off(work.len().saturating_sub(16));
         let auth = ctx.auth().clone();
@@ -336,7 +460,7 @@ async fn discover_chat_dependencies(
                 return Err(DomainError::validation(ValidationReason::InvalidLimit).into());
             }
             let current = source
-                .discover(store, ctx.auth(), &ctx.budget, deadline)
+                .discover(store, ctx.auth(), &ctx.budget, deadline, &mut proof_memo)
                 .await?;
             if current.origin() != origin {
                 return Err(DomainError::validation(ValidationReason::SourceMismatch).into());
@@ -424,14 +548,18 @@ async fn snapshot(
         }
     }
 
+    let mut live_ancestry = FolderAncestryCache::default();
+    let mut historical_ancestry: BTreeMap<(SpaceId, SpaceSeq), FolderAncestryCache> =
+        BTreeMap::new();
+    let mut proof_memo = ProofFoldCache::new();
+
     if !request.project_folders.is_empty() {
         let project = request.project.as_ref().ok_or(DomainError::AccessDenied)?;
         let record = records
             .get(&project.space_id)
             .ok_or(DomainError::ResourceNotFound)?;
-        let mut ancestry = FolderAncestryCache::default();
         for folder in &request.project_folders {
-            let facts = ancestry
+            let facts = live_ancestry
                 .load_ancestry_tx(tx, &project.space_id, folder, true)
                 .await?;
             ctx.auth()
@@ -452,7 +580,18 @@ async fn snapshot(
                 reference,
                 revision,
                 ..
-            } => note_current(tx, ctx.auth(), record, reference, revision).await?,
+            } => {
+                note_current(
+                    tx,
+                    ctx.auth(),
+                    record,
+                    reference,
+                    revision,
+                    &mut live_ancestry,
+                    &mut historical_ancestry,
+                )
+                .await?
+            }
             ProviderOrigin::Ability { reference, .. } => {
                 abilities::egress_current(tx, ctx.auth(), record, reference).await?
             }
@@ -463,15 +602,20 @@ async fn snapshot(
                     record,
                     thread,
                     *entry,
+                    &mut proof_memo,
                 )
                 .await?
             }
-            ProviderOrigin::Folder { reference, .. } => {
-                folder_content(tx, ctx.auth(), record, reference.clone())
-                    .await?
-                    .current()
-                    .clone()
-            }
+            ProviderOrigin::Folder { reference, .. } => folder_content(
+                tx,
+                ctx.auth(),
+                record,
+                reference.clone(),
+                &mut live_ancestry,
+            )
+            .await?
+            .current()
+            .clone(),
             ProviderOrigin::Space { .. } => space_content(ctx.auth(), record)?.current().clone(),
             ProviderOrigin::SystemAbility { .. } => {
                 return Err(DomainError::ResourceNotFound.into());
@@ -491,8 +635,32 @@ async fn note_current(
     space: &SpaceRecord,
     reference: &NoteRef,
     revision: &RevisionId,
+    live_ancestry: &mut FolderAncestryCache,
+    historical_ancestry: &mut BTreeMap<(SpaceId, SpaceSeq), FolderAncestryCache>,
 ) -> Result<ProviderCurrentContent, PortError> {
-    let live = note_metadata(tx, auth, space, reference.clone()).await?;
+    if !auth.spaces().contains_key(&reference.space_id) || reference.space_id != space.space.id {
+        return Err(DomainError::ResourceNotFound.into());
+    }
+    if crate::runtime::is_note_purge_fenced_tx(tx, &reference.space_id, reference.note_id.as_str())
+        .await?
+    {
+        return Err(DomainError::ResourceNotFound.into());
+    }
+    let live_row = load_note_head_row_tx(tx, &reference.space_id, &reference.note_id).await?;
+    if live_row.lifecycle != Lifecycle::Active {
+        return Err(DomainError::ResourceNotFound.into());
+    }
+    let (live_facts, _) = live_ancestry
+        .build_resource_facts_tx(
+            tx,
+            &space.space,
+            &live_row.parent_folder_id,
+            live_row.doc_class,
+            live_row.ability_id,
+            true,
+        )
+        .await?;
+    auth.can_view_resource(&live_facts)?;
     let (raw_metadata, visible): (Vec<u8>, i64) = db!(
         read tx,
         sqlx::query_as(
@@ -516,7 +684,10 @@ async fn note_current(
         .content_digest
         .ok_or(DomainError::ResourceNotFound)?;
     let visibility = i64_to_space_seq(visible)?;
-    let (recorded, _) = FolderAncestryCache::at_cut(&space.scope, visibility)
+    let cut_cache = historical_ancestry
+        .entry((space.space.id.clone(), visibility))
+        .or_insert_with(|| FolderAncestryCache::at_cut(&space.scope, visibility));
+    let (recorded, _) = cut_cache
         .build_resource_facts_tx(
             tx,
             &space.space,
@@ -533,7 +704,7 @@ async fn note_current(
         snapshot.lifecycle,
         digest,
     )?;
-    metadata.bind_current(live.facts, live.lifecycle)?;
+    metadata.bind_current(live_facts, live_row.lifecycle)?;
     ClassEgressFence::search_metadata(metadata.clone(), auth)?;
     Ok(ProviderCurrentContent::Note(metadata))
 }
@@ -550,7 +721,8 @@ pub(super) async fn metadata(
                 match source {
                     CatalogDisclosure::Folder(reference) => {
                         let space = load_space_record(tx, &reference.space_id).await?;
-                        folder_content(tx, ctx.auth(), &space, reference).await
+                        let mut ancestry = FolderAncestryCache::default();
+                        folder_content(tx, ctx.auth(), &space, reference, &mut ancestry).await
                     }
                     CatalogDisclosure::Space(scope) => {
                         let space = load_space_record(tx, &scope.space_id).await?;
@@ -568,13 +740,15 @@ async fn folder_content(
     auth: &EngineAuthContext,
     space: &SpaceRecord,
     reference: FolderRef,
+    ancestry_cache: &mut FolderAncestryCache,
 ) -> Result<CanonicalMetadataContent, PortError> {
     if reference.space_id != space.space.id {
         return Err(DomainError::ResourceNotFound.into());
     }
     let row = load_folder_head_row(tx, &reference.space_id, &reference.folder_id).await?;
-    let ancestry =
-        load_folder_ancestry_tx(tx, &reference.space_id, &reference.folder_id, true).await?;
+    let ancestry = ancestry_cache
+        .load_ancestry_tx(tx, &reference.space_id, &reference.folder_id, true)
+        .await?;
     auth.authorize_folder_read(&space.space, &reference.folder_id, &ancestry.ancestors)?;
     let text = serde_json::json!({
         "id": reference.folder_id,

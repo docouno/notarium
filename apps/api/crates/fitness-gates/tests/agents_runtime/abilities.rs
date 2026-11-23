@@ -116,9 +116,12 @@ async fn exercise_authoring_settlement(fixture: &RuntimeFixture) {
                     owner.clone(),
                     AccountMutation {
                         identity: runtime_ability_cases::identity(fixture, owner, 4).await,
-                        input: AbilityPreferenceUpdate {
-                            ability: current.descriptor.reference,
-                            enabled: false,
+                        input: AbilityPreferenceChange {
+                            preference: AbilityPreferenceUpdate {
+                                ability: current.descriptor.reference,
+                                enabled: false,
+                            },
+                            expected: AbilityPreferenceGuard::Account,
                         },
                     },
                 )
@@ -175,7 +178,7 @@ async fn exercise_authoring_settlement(fixture: &RuntimeFixture) {
                 input: AbilityBindingUpdate {
                     ability: current.descriptor.reference,
                     enabled: true,
-                    expected: current.binding_revision,
+                    expected: AbilityOverlayGuard::Account(current.binding_revision),
                     projects: AbilityProjects::Selected(vec![]),
                 },
             },
@@ -210,7 +213,7 @@ async fn exercise_authoring_settlement(fixture: &RuntimeFixture) {
                         input: AbilityBindingUpdate {
                             ability: current.descriptor.reference,
                             enabled: false,
-                            expected: current.binding_revision,
+                            expected: AbilityOverlayGuard::Account(current.binding_revision),
                             projects: AbilityProjects::Selected(vec![]),
                         },
                     },
@@ -405,6 +408,7 @@ pub(super) async fn overrides_and_promotion(fixture: &RuntimeFixture) {
                         name: None,
                     },
                     project_hint: Some(first.clone()),
+                    guard: EpisodeRevisionGuard::Account,
                 },
             },
         )
@@ -697,19 +701,19 @@ async fn binding_replay_after_advance_and_trash(
             key: CommandKey::from_bytes([0xe2; 16]),
             hash: ContentDigest::from_bytes([0xe2; 32]),
         },
-        input: AbilityBindingChange {
+        input: AbilityBindingUpdate {
             ability: r1_ref.clone(),
             enabled: true,
             projects: AbilityProjects::Selected(vec![first_project.clone()]),
-            expected: current_binding_rev,
+            expected: AbilityOverlayGuard::Authored(current_binding_rev),
         },
     };
     let direct_committed = fixture
         .control
-        .compare_authored_ability_binding(human.clone(), direct_req.clone())
+        .update_ability_binding(human.clone(), direct_req.clone())
         .await
         .unwrap();
-    assert_eq!(direct_committed.value, r1_ref);
+    assert_eq!(direct_committed.value.reference, r1_ref);
     // Advance package R1 -> R2.
     let current_view = call(
         fixture,
@@ -731,13 +735,13 @@ async fn binding_replay_after_advance_and_trash(
         .unwrap()
         .structured_content;
     assert_eq!(r2["outcome"], "updated", "{r2}");
-    // Direct compare_authored_ability_binding replay returns exact R1 AbilityRef even at R2.
+    // Direct update_ability_binding replay returns exact R1 AbilityRef even at R2.
     let replayed_direct_r2 = fixture
         .control
-        .compare_authored_ability_binding(human.clone(), direct_req.clone())
+        .update_ability_binding(human.clone(), direct_req.clone())
         .await
         .unwrap();
-    assert_eq!(replayed_direct_r2.value, r1_ref);
+    assert_eq!(replayed_direct_r2.value.reference, r1_ref);
     assert_eq!(replayed_direct_r2.revision, direct_committed.revision);
     // MCP edit_ability(availability) replay fails cleanly at bound_ability with RevisionConflict (never Ok(partial)).
     let replayed_avail_r2 = call(fixture, human, 0xe1, "edit_ability", avail_edit.clone())
@@ -763,10 +767,10 @@ async fn binding_replay_after_advance_and_trash(
     .unwrap();
     let replayed_direct_trashed = fixture
         .control
-        .compare_authored_ability_binding(human.clone(), direct_req)
+        .update_ability_binding(human.clone(), direct_req)
         .await
         .unwrap();
-    assert_eq!(replayed_direct_trashed.value, r1_ref);
+    assert_eq!(replayed_direct_trashed.value.reference, r1_ref);
     let replayed_avail_trashed = call(fixture, human, 0xe1, "edit_ability", avail_edit)
         .await
         .err()
@@ -849,9 +853,12 @@ async fn promotion_concurrent_source_overlay_conflicts(
                     human.clone(),
                     AccountMutation {
                         identity: runtime_ability_cases::identity(fixture, human, 0xe8).await,
-                        input: AbilityPreferenceUpdate {
-                            ability: pref_desc.reference.clone(),
-                            enabled: false,
+                        input: AbilityPreferenceChange {
+                            preference: AbilityPreferenceUpdate {
+                                ability: pref_desc.reference.clone(),
+                                enabled: false,
+                            },
+                            expected: AbilityPreferenceGuard::Account,
                         },
                     },
                 )
@@ -949,7 +956,7 @@ async fn promotion_concurrent_source_overlay_conflicts(
                         input: AbilityBindingUpdate {
                             ability: inspected.descriptor.reference,
                             enabled: false,
-                            expected: inspected.binding_revision,
+                            expected: AbilityOverlayGuard::Account(inspected.binding_revision),
                             projects: AbilityProjects::Selected(vec![]),
                         },
                     },
@@ -1167,7 +1174,7 @@ async fn restricted_publication_waits_for_binding(
                         revision: publication.value.revision,
                     },
                     enabled: true,
-                    expected: ControlRevision::ZERO,
+                    expected: AbilityOverlayGuard::Account(ControlRevision::ZERO),
                     projects: AbilityProjects::Selected(vec![project]),
                 },
             },

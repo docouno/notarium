@@ -352,6 +352,7 @@ async fn exercise(store: CanonicalStore, root: DataRoot, projector: ProjectorRun
                     interruption: None,
                     provenance: None,
                     proposed_diff: None,
+                    proposed_effect: None,
                     thread,
                     parent: ThreadEntrySeq::ZERO,
                     kind: ChatEntryKind::Human,
@@ -1334,9 +1335,12 @@ async fn verify_run_query_disclosure(
             account.clone(),
             AccountMutation {
                 identity: account_command(account.auth().principal(), revision),
-                input: AbilityPreferenceUpdate {
-                    ability: skill,
-                    enabled: false,
+                input: notarium_core::ports::AbilityPreferenceChange {
+                    preference: AbilityPreferenceUpdate {
+                        ability: skill,
+                        enabled: false,
+                    },
+                    expected: notarium_core::ports::AbilityPreferenceGuard::Account,
                 },
             },
         )

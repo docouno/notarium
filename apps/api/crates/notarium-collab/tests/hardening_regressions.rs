@@ -835,6 +835,15 @@ impl SessionRevocationPort for MiniRevocationRegistry {
         Box::pin(async move { Ok(Box::new(MiniLease(cancellation)) as Box<dyn RevocationLease>) })
     }
 
+    fn register_canonical_effect(
+        &self,
+        _ctx: MaintenanceContext,
+        _selectors: Vec<RevocationSelector>,
+        _cancellation: Cancellation,
+    ) -> PortFuture<'_, Arc<dyn notarium_core::ports::CanonicalEffectRegistration>> {
+        Box::pin(async { Err(DomainError::AccessDenied.into()) })
+    }
+
     fn fence_provider(
         &self,
         _ctx: MaintenanceContext,

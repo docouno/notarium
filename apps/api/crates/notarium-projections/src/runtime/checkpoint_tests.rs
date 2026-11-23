@@ -338,6 +338,7 @@ async fn cluster_lens_survives_forced_compaction_and_generation_rotation() {
                             version: 1,
                             predicate: Predicate::All(Vec::new()),
                         },
+                        causal: None,
                     },
                 )
                 .await

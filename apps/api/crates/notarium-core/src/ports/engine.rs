@@ -31,11 +31,6 @@ pub trait NoteReadPort: Send + Sync {
         project: FolderRef,
         causal: crate::receipt::CausalBasis,
     ) -> PortFuture<'_, ProjectNoteCounts>;
-    fn prepare_agent_run_rollback(
-        &self,
-        ctx: SpaceContext,
-        run: AgentRunId,
-    ) -> PortFuture<'_, RollbackAgentRun>;
     /// Read exactly one committed protected package resource. The canonical owner
     /// checks Space/history, live package visibility and authorization before
     /// returning bytes; a missing revision/resource never falls back to latest.
@@ -45,6 +40,11 @@ pub trait NoteReadPort: Send + Sync {
         request: ReadAbilityResource,
     ) -> PortFuture<'_, crate::classes::ClassifiedAbilityResource>;
     fn get_note(&self, ctx: SpaceContext, request: GetNote) -> PortFuture<'_, NoteSnapshot>;
+    fn get_note_metadata(
+        &self,
+        ctx: SpaceContext,
+        request: GetNote,
+    ) -> PortFuture<'_, NoteMetadataSnapshot>;
     fn list_notes(
         &self,
         ctx: SpaceContext,

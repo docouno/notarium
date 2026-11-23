@@ -31,6 +31,7 @@ pub(super) async fn stored_legacy_episodes_and_notes_round_trip_through_mcp(
                             name: None,
                         },
                         project_hint: None,
+                        guard: EpisodeRevisionGuard::Account,
                     },
                 },
             )
@@ -48,14 +49,14 @@ pub(super) async fn stored_legacy_episodes_and_notes_round_trip_through_mcp(
                 owner.clone(),
                 AccountMutation {
                     identity: identity(fixture, owner, 252 + index as u8).await,
-                    input: EpisodeUpdate {
+                    input: EpisodeMutation::Full(EpisodeUpdate {
                         episode: seeded.id,
                         expected: seeded.revision,
                         name: seeded.name,
                         active_role: seeded.active_role,
                         project_hint: seeded.project_hint,
                         lifecycle: EpisodeLifecycle::Sleeping,
-                    },
+                    }),
                 },
             )
             .await
@@ -161,6 +162,7 @@ async fn episode_target_commands_replay_old_receipts_and_survive_account_changes
                 name: None,
             },
             project_hint: None,
+            guard: EpisodeRevisionGuard::Account,
         },
     };
     let saved = fixture
@@ -168,8 +170,10 @@ async fn episode_target_commands_replay_old_receipts_and_survive_account_changes
         .start_or_resume_episode(human.clone(), start.clone())
         .await
         .unwrap();
+    let mut replay_target = start.clone();
+    replay_target.input.guard = EpisodeRevisionGuard::Target;
     let replayed = plane
-        .start_agent_episode(human.clone(), start.clone())
+        .start_or_resume_episode(human.clone(), replay_target)
         .await
         .unwrap();
     assert_eq!(saved.revision, replayed.revision);
@@ -192,8 +196,9 @@ async fn episode_target_commands_replay_old_receipts_and_survive_account_changes
             DomainError::ControlRevisionConflict { .. }
         ))
     ));
+    second.input.guard = EpisodeRevisionGuard::Target;
     plane
-        .start_agent_episode(human.clone(), second)
+        .start_or_resume_episode(human.clone(), second)
         .await
         .unwrap();
 
@@ -213,43 +218,50 @@ async fn episode_target_commands_replay_old_receipts_and_survive_account_changes
         .items;
     let first_role = roles.iter().find(|entry| entry.name == "research").unwrap();
     let next_role = roles.iter().find(|entry| entry.name == "grooming").unwrap();
-    let mut binding = AccountMutation {
+    let full_update = AccountMutation {
         identity: identity(&fixture, human, 112).await,
-        input: EpisodeUpdate {
-            episode: ep.id,
+        input: EpisodeMutation::Full(EpisodeUpdate {
+            episode: ep.id.clone(),
             expected: ep.revision,
             name: ep.name,
             active_role: Some(first_role.reference.clone()),
             project_hint: None,
             lifecycle: EpisodeLifecycle::Active,
-        },
+        }),
     };
     let saved = fixture
         .control
-        .update_episode(human.clone(), binding.clone())
+        .update_episode(human.clone(), full_update.clone())
         .await
         .unwrap();
     let replay = plane
-        .bind_episode_role(human.clone(), binding.clone())
+        .update_episode(human.clone(), full_update)
         .await
         .unwrap();
     assert_eq!(saved.revision, replay.revision);
 
-    binding.identity.key = CommandKey::from_bytes([113; 16]);
-    binding.input.active_role = Some(next_role.reference.clone());
+    let mut binding = AccountMutation {
+        identity: notarium_core::receipt::AccountCommandIdentity {
+            key: CommandKey::from_bytes([113; 16]),
+            ..identity(&fixture, human, 113).await
+        },
+        input: EpisodeMutation::BindRole(BindEpisodeRole {
+            episode: ep.id,
+            expected: ep.revision,
+            active_role: next_role.reference.clone(),
+            project_hint: None,
+        }),
+    };
     assert!(matches!(
-        plane
-            .bind_episode_role(human.clone(), binding.clone())
-            .await,
+        plane.update_episode(human.clone(), binding.clone()).await,
         Err(PortError::Domain(
             DomainError::ControlRevisionConflict { .. }
         ))
     ));
-    binding.input.expected = saved.value.revision;
-    let rebound = plane
-        .bind_episode_role(human.clone(), binding)
-        .await
-        .unwrap();
+    if let EpisodeMutation::BindRole(ref mut inner) = binding.input {
+        inner.expected = saved.value.revision;
+    }
+    let rebound = plane.update_episode(human.clone(), binding).await.unwrap();
     assert_eq!(rebound.value.active_role, Some(next_role.reference.clone()));
     fixture.close().await;
 }

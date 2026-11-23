@@ -1036,3 +1036,73 @@ fn read_only_bearer_scope_survives_narrowing_delegation_and_intersection() {
         );
     }
 }
+
+#[test]
+fn agent_run_preserves_parent_taint_and_project_pin_clears_read_only_ability_write() {
+    let space1 = SpaceId::from_bytes([1; 16]);
+    let space2 = SpaceId::from_bytes([2; 16]);
+    let project_folder = FolderId::from_bytes([3; 16]);
+
+    // Tainted human context must propagate taint monotonically into a child AgentRun
+    // without aliasing the parent taint handle.
+    let owner = human(SpaceRole::Owner, true);
+    owner.taint().mark_external_read();
+    let run = owner
+        .for_agent_run(
+            AgentRunId::from_bytes([9; 16]),
+            space1.clone(),
+            ChatAudience::Personal,
+            grants(SpaceRole::Owner),
+        )
+        .unwrap();
+    assert!(run.taint().is_tainted());
+    let local = facts(1, DocClass::AgentMemory);
+    assert_eq!(
+        run.authorize_direct_write(&local, &local),
+        Err(DomainError::CrossSpaceTainted)
+    );
+
+    // Restricting a mixed Owner/Viewer context to a Viewer Space's project must
+    // clear `Cap::AbilityWrite`.
+    let mixed = BTreeMap::from([
+        (
+            space1,
+            SpaceGrant {
+                role: SpaceRole::Owner,
+                read_classes: DocClass::all(),
+                write_classes: DocClass::all(),
+                project_root: None,
+            },
+        ),
+        (
+            space2.clone(),
+            SpaceGrant {
+                role: SpaceRole::Viewer,
+                read_classes: DocClass::all(),
+                write_classes: BTreeSet::new(),
+                project_root: None,
+            },
+        ),
+    ]);
+    let mixed_human = EngineAuthContext::for_human(
+        VerifiedHuman::attest(
+            PrincipalId::from_bytes([1; 16]),
+            GrantId::from_bytes([1; 16]),
+            mixed,
+            true,
+        )
+        .with_human_management(true),
+    );
+    assert!(mixed_human.has_cap(Cap::AbilityWrite));
+    let pinned_viewer = mixed_human
+        .restrict_to_project(&FolderRef {
+            space_id: space2,
+            folder_id: project_folder,
+        })
+        .unwrap();
+    assert!(!pinned_viewer.has_cap(Cap::AbilityWrite));
+    assert_eq!(
+        pinned_viewer.authorize_ability_mutation(),
+        Err(DomainError::AbilityWriteForbidden)
+    );
+}

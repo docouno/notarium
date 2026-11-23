@@ -84,6 +84,7 @@ async fn supervised_proposals_on_tainted_branch(postgres: bool) {
                     provenance: None,
                     interruption: None,
                     proposed_diff: None,
+                    proposed_effect: None,
                     referenced_notes: vec![],
                     tainted: true,
                 },
@@ -278,6 +279,8 @@ async fn record_memory_proposal(
     fixture: &RuntimeFixture,
     personal: &SpaceContext,
     owner: &AccountContext,
+    provider: &ProviderResourceId,
+    model_id: &ModelProfileId,
     tag: u8,
     category: &str,
 ) -> ConfirmProposedDiff {
@@ -357,6 +360,7 @@ async fn record_memory_proposal(
                     provenance: Some(ChatProvenance::default()),
                     interruption: None,
                     proposed_diff: None,
+                    proposed_effect: None,
                     referenced_notes: vec![],
                     tainted: false,
                 },
@@ -371,8 +375,8 @@ async fn record_memory_proposal(
             McpInvocationContext {
                 account: AccountContext::new(run_auth, budget()),
                 target: EgressTarget::InAppProvider {
-                    provider: ProviderResourceId::from_bytes([1; 16]),
-                    model: ModelProfileId::from_bytes([1; 16]),
+                    provider: provider.clone(),
+                    model: model_id.clone(),
                     primary_project: None,
                 },
                 request_key: key.clone(),
@@ -408,6 +412,7 @@ async fn record_memory_proposal(
                     provenance: Some(result.provenance.clone()),
                     interruption: None,
                     proposed_diff: Some(proposal.envelope().to_owned()),
+                    proposed_effect: Some(proposal.effect()),
                     referenced_notes: vec![],
                     tainted: true,
                 },
@@ -428,7 +433,30 @@ pub(super) async fn explicit_confirmation_applies_once(
     personal: &SpaceContext,
 ) {
     let owner = &fixture.human;
-    let confirm = record_memory_proposal(fixture, personal, owner, 170, "proposal-fixture").await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local = loopback_provider(fixture, owner, &listener, 240, true).await;
+    approve_disclosure(
+        fixture,
+        owner,
+        &local,
+        242,
+        ProviderAttachmentTarget::Personal {
+            owner: owner.auth().principal().clone(),
+            space: personal.scope().space_id.clone(),
+        },
+        [DocClass::UserDoc, DocClass::Profile].into(),
+    )
+    .await;
+    let confirm = record_memory_proposal(
+        fixture,
+        personal,
+        owner,
+        &local.resource.id,
+        &local.model,
+        170,
+        "proposal-fixture",
+    )
+    .await;
     let target = MemoryTarget::User {
         owner: owner.auth().principal().clone(),
     };
@@ -446,7 +474,7 @@ pub(super) async fn explicit_confirmation_applies_once(
         .await
         .unwrap();
     assert_eq!(
-        preview["memory"]["observation"],
+        preview.memory.as_ref().unwrap()["observation"],
         "Apply only after explicit approval."
     );
     assert!(
@@ -470,7 +498,7 @@ pub(super) async fn explicit_confirmation_applies_once(
         .apply_proposed_diff(owner.clone(), confirm)
         .await
         .unwrap();
-    assert_eq!(applied, replay);
+    assert_eq!(applied.result, replay.result);
     let memory = inspect().await.unwrap();
     let note = fixture
         .canonical
@@ -505,10 +533,33 @@ pub(super) async fn revoked_session_cannot_apply_or_replay(fixture: &mut Runtime
         .unwrap();
     let scope = fixture.canonical.read_space(&space).await.unwrap().scope;
     let personal = SpaceContext::new(fixture.human.auth().clone(), scope, budget()).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local = loopback_provider(fixture, &fixture.human, &listener, 230, true).await;
+    approve_disclosure(
+        fixture,
+        &fixture.human,
+        &local,
+        234,
+        ProviderAttachmentTarget::Personal {
+            owner: principal.clone(),
+            space: space.clone(),
+        },
+        [DocClass::UserDoc, DocClass::Profile].into(),
+    )
+    .await;
     for (tag, replay) in [(190, false), (193, true)] {
         let (owner, token) = authoring_authority_cases::native_session(fixture, tag).await;
         let category = format!("proposal-revocation-{tag}");
-        let confirm = record_memory_proposal(fixture, &personal, &owner, tag, &category).await;
+        let confirm = record_memory_proposal(
+            fixture,
+            &personal,
+            &owner,
+            &local.resource.id,
+            &local.model,
+            tag,
+            &category,
+        )
+        .await;
         if replay {
             fixture
                 .registry

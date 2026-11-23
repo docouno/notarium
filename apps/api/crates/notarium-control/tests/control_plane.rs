@@ -195,6 +195,7 @@ async fn run_concurrent_load_pool_isolation_and_untainted_metadata(pg: bool) {
             reference: ability_ref.clone(),
             kind: AbilityKind::Role,
             name: "shared-role".into(),
+            description: None,
             enabled: true,
             healthy: true,
             lifecycle: Lifecycle::Active,
@@ -229,6 +230,7 @@ async fn run_concurrent_load_pool_isolation_and_untainted_metadata(pg: bool) {
                         name: Some("concurrency-ep".into()),
                     },
                     project_hint: None,
+                    guard: EpisodeRevisionGuard::Account,
                 },
             },
         )
@@ -605,6 +607,7 @@ async fn run_concurrent_load_pool_isolation_and_untainted_metadata(pg: bool) {
                 },
             )
             .await
+            .map(|_| ())
         }));
     }
     for task in race_tasks {

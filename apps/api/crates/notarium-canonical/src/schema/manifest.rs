@@ -72,7 +72,7 @@ pub const CANONICAL_TABLES: &[TableSpec] = &[
             col("created_at_sec", Int, false),
             col("created_at_nsec", Int, false),
         ],
-        indexes: &["uq_spaces_slug_fold"],
+        indexes: &["uq_spaces_slug_fold", "idx_spaces_personal_owner"],
     },
     TableSpec {
         name: "folder_heads",
@@ -105,6 +105,7 @@ pub const CANONICAL_TABLES: &[TableSpec] = &[
             "uq_folder_heads_active_project",
             "idx_folder_heads_parent_lifecycle",
             "idx_folder_heads_cover",
+            "idx_folder_heads_active_projects_id",
         ],
     },
     TableSpec {
@@ -490,6 +491,7 @@ pub const CANONICAL_TABLES: &[TableSpec] = &[
         indexes: &[
             "idx_command_receipts_expires",
             "idx_receipt_exception_pointer",
+            "idx_command_receipts_seq",
         ],
     },
     TableSpec {
@@ -621,6 +623,7 @@ pub const CANONICAL_TABLES: &[TableSpec] = &[
             col("updated_at_nsec", Int, false),
             col("active_run_epoch", Int, true),
             col("active_run_generation", Text, true),
+            col("redaction_epoch", Int, false),
         ],
         indexes: &["idx_chat_threads_created_seq"],
     },

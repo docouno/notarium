@@ -14,6 +14,7 @@ use crate::{
     },
     runtime::{insert_revision_row, load_folder_head_row},
     sql_exec::BackendConn,
+    writer::{BatchEventDraft, ItemExecCtx},
 };
 
 pub(crate) const SLUG: &str = "index";
@@ -43,7 +44,7 @@ pub(super) fn validate_slug_change(
 }
 
 /// The covering note and the induced folder revision share the note mutation's
-/// visibility boundary. The note event and its effect still own that boundary.
+/// visibility boundary while each receives its own `SpaceSeq` and `change_log` event.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn assign(
     tx: &mut BackendConn<'_>,
@@ -55,10 +56,10 @@ pub(super) async fn assign(
     actor: &PrincipalId,
     run: Option<&AgentRunId>,
     now: Timestamp,
-) -> Result<(), PortError> {
+) -> Result<Option<BatchEventDraft>, PortError> {
     let row = load_folder_head_row(tx, &scope.space_id, folder).await?;
     if row.cover_note_id.as_ref() == cover {
-        return Ok(());
+        return Ok(None);
     }
 
     let revision = new_revision_id()?;
@@ -93,6 +94,7 @@ pub(super) async fn assign(
             "folder disappeared during write",
         ));
     }
+    let lifecycle = row.lifecycle;
     let payload =
         RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Folder(FolderRevisionMetadata {
             confirmation: None,
@@ -107,7 +109,7 @@ pub(super) async fn assign(
             description: row.description,
             cover_note_id: cover.cloned(),
             write_locked: row.write_locked,
-            lifecycle: row.lifecycle,
+            lifecycle,
         }))
         .encode()?;
     insert_revision_row(
@@ -126,51 +128,66 @@ pub(super) async fn assign(
         run,
         now,
     )
-    .await
+    .await?;
+    Ok(Some(BatchEventDraft {
+        space_seq: seq,
+        entity_type: "folder".to_owned(),
+        entity_id: folder.as_str().to_owned(),
+        op_kind: "edit".to_owned(),
+        rev_id: revision,
+        lifecycle,
+        doc_class: None,
+    }))
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn clear_purged(
+pub(super) async fn find_cover_folders(
     tx: &mut BackendConn<'_>,
-    scope: &HistoryScope,
+    space_id: &notarium_core::ids::SpaceId,
     note: &NoteId,
-    seq: SpaceSeq,
-    visibility: SpaceSeq,
-    actor: &PrincipalId,
-    run: Option<&AgentRunId>,
-    now: Timestamp,
-) -> Result<(), PortError> {
+) -> Result<Vec<FolderId>, PortError> {
     let select = "SELECT folder_id FROM folder_heads WHERE space_id=$1 AND cover_note_id=$2 ORDER BY folder_id";
     let folders: Vec<String> = match tx {
         BackendConn::Sqlite(conn) => {
             sqlx::query_scalar(select)
-                .bind(scope.space_id.as_str())
+                .bind(space_id.as_str())
                 .bind(note.as_str())
                 .fetch_all(&mut **conn)
                 .await
         }
         BackendConn::Postgres(conn) => {
             sqlx::query_scalar(select)
-                .bind(scope.space_id.as_str())
+                .bind(space_id.as_str())
                 .bind(note.as_str())
                 .fetch_all(&mut **conn)
                 .await
         }
     }
     .map_err(|err| internal_not_committed("find_purged_folder_cover", err.to_string()))?;
+    folders
+        .into_iter()
+        .map(|folder| FolderId::parse(&folder).map_err(Into::into))
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn clear_folders(
+    tx: &mut BackendConn<'_>,
+    item_ctx: &mut ItemExecCtx,
+    scope: &HistoryScope,
+    folders: &[FolderId],
+    visibility: SpaceSeq,
+    actor: &PrincipalId,
+    run: Option<&AgentRunId>,
+    now: Timestamp,
+) -> Result<Vec<BatchEventDraft>, PortError> {
+    let mut events = Vec::with_capacity(folders.len());
     for folder in folders {
-        assign(
-            tx,
-            scope,
-            &FolderId::parse(&folder)?,
-            None,
-            seq,
-            visibility,
-            actor,
-            run,
-            now,
-        )
-        .await?;
+        let seq = item_ctx.alloc_next_seq()?;
+        if let Some(event) =
+            assign(tx, scope, folder, None, seq, visibility, actor, run, now).await?
+        {
+            events.push(event);
+        }
     }
-    Ok(())
+    Ok(events)
 }

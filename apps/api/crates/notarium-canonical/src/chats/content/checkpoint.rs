@@ -179,16 +179,22 @@ async fn load_page(
     .map_err(|error| crate::runtime::pg_read_error("chat_proof_page", error))
 }
 
+pub(crate) type ProofFoldCache =
+    BTreeMap<(SpaceId, ChatThreadId, RevisionId, ThreadEntrySeq, bool), Option<ChatProvenance>>;
+
 /// A chat edge carries the same live Space, thread and project checks as the
 /// derived entry. Its digest is immutable until redaction. Other origins retain
 /// their full identity and are admitted against current policy at every dispatch.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn fold(
     mut reader: PageReader<'_, '_>,
     scope: &HistoryScope,
     thread: &ThreadHeadRow,
+    entry_seq: Option<ThreadEntrySeq>,
     parent: ThreadEntrySeq,
     tainted: bool,
     proof: &ChatProvenance,
+    memo: Option<&mut ProofFoldCache>,
 ) -> Result<Option<ChatProvenance>, PortError> {
     if !proof
         .origins
@@ -197,9 +203,26 @@ pub(super) async fn fold(
     {
         return Ok(None);
     }
+    let cache_key = entry_seq.map(|seq| {
+        (
+            scope.space_id.clone(),
+            thread.thread_id.clone(),
+            thread.head_rev_id.clone(),
+            seq,
+            tainted,
+        )
+    });
+    if let (Some(key), Some(cache)) = (&cache_key, memo.as_deref())
+        && let Some(cached) = cache.get(key)
+    {
+        return Ok(cached.clone());
+    }
     let space = &scope.space_id;
     let mut sources = Sources::default();
     if !sources.add(proof, space, thread, None)? {
+        if let (Some(key), Some(cache)) = (cache_key, memo) {
+            cache.insert(key, None);
+        }
         return Ok(None);
     }
     // All edges point backwards. Visiting the greatest sequence first allows
@@ -212,9 +235,32 @@ pub(super) async fn fold(
     } else {
         PAGE_ROWS
     };
+    let mut cache_hit = false;
     while let Some((entry, digest)) = sources.pending.pop_last() {
         if entry > parent {
+            if let (Some(key), Some(cache)) = (cache_key, memo) {
+                cache.insert(key, None);
+            }
             return Ok(None);
+        }
+        if let Some(cache) = memo.as_deref() {
+            let sub_key = (
+                space.clone(),
+                thread.thread_id.clone(),
+                thread.head_rev_id.clone(),
+                entry,
+                tainted,
+            );
+            if let Some(Some(cached_child)) = cache.get(&sub_key) {
+                if !sources.add(cached_child, space, thread, Some(entry))? {
+                    if let (Some(key), Some(cache)) = (cache_key, memo) {
+                        cache.insert(key, None);
+                    }
+                    return Ok(None);
+                }
+                cache_hit = true;
+                continue;
+            }
         }
         while page.last().is_some_and(|row| row.0 > entry.get() as i64) {
             page.pop();
@@ -234,6 +280,9 @@ pub(super) async fn fold(
             return Ok(None);
         };
         if seq != entry.get() as i64 || kind == "redacted" || (source_taint != 0 && !tainted) {
+            if let (Some(key), Some(cache)) = (cache_key, memo) {
+                cache.insert(key, None);
+            }
             return Ok(None);
         }
         let matches = match blob {
@@ -242,18 +291,30 @@ pub(super) async fn fold(
                 .is_some_and(|text| blake3::hash(text.as_bytes()).as_bytes() == digest.as_bytes()),
         };
         if !matches {
+            if let (Some(key), Some(cache)) = (cache_key, memo) {
+                cache.insert(key, None);
+            }
             return Ok(None);
         }
-        match decode_proof(proof.as_deref())? {
+        match decode_proof(proof.as_deref(), thread.redaction_epoch)? {
             Some(child) => {
                 if !sources.add(&child, space, thread, Some(entry))? {
+                    if let (Some(key), Some(cache)) = (cache_key, memo) {
+                        cache.insert(key, None);
+                    }
                     return Ok(None);
                 }
             }
-            None if kind != "human" => return Ok(None),
+            None if kind != "human" => {
+                if let (Some(key), Some(cache)) = (cache_key, memo) {
+                    cache.insert(key, None);
+                }
+                return Ok(None);
+            }
             None => {}
         }
     }
+    let _ = cache_hit;
     let folded = ChatProvenance {
         origins: sources.retained.into_values().collect(),
         projects: sources.projects.into_values().collect(),
@@ -261,5 +322,9 @@ pub(super) async fn fold(
     };
     let bytes = serde_json::to_vec(&folded)
         .map_err(|e| internal_not_committed("encode_checkpoint_proof", e.to_string()))?;
-    Ok((bytes.len() <= ChatProvenance::MAX_BYTES).then_some(folded))
+    let result = (bytes.len() <= ChatProvenance::MAX_BYTES).then_some(folded);
+    if let (Some(key), Some(cache)) = (cache_key, memo) {
+        cache.insert(key, result.clone());
+    }
+    Ok(result)
 }

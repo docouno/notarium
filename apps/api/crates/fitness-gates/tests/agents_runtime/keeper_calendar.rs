@@ -634,6 +634,16 @@ impl SessionRevocationPort for SharedAuthority {
             .register_provider(ctx, selectors, cancellation)
     }
 
+    fn register_canonical_effect(
+        &self,
+        ctx: MaintenanceContext,
+        selectors: Vec<RevocationSelector>,
+        cancellation: Cancellation,
+    ) -> PortFuture<'_, Arc<dyn CanonicalEffectRegistration>> {
+        self.revocations
+            .register_canonical_effect(ctx, selectors, cancellation)
+    }
+
     fn fence_provider(
         &self,
         ctx: MaintenanceContext,

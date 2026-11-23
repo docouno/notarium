@@ -10,14 +10,14 @@ use notarium_core::{
     ids::{AgentRunId, ChatThreadId, CommandKey, ContentDigest, ThreadEntrySeq},
     ports::{ChatEntry, ChatEntryKind, ProviderToolCall},
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
 pub const STREAM_WINDOW_BYTES: usize = 64 * 1024;
 pub const STREAM_FRAME_BYTES: usize = 16 * 1024;
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StreamCursor {
     pub run: AgentRunId,
     pub byte_offset: u64,
@@ -214,13 +214,13 @@ impl State {
 }
 
 fn lock(state: &Mutex<State>) -> MutexGuard<'_, State> {
-    state.lock().expect("stream lock poisoned")
+    state.lock().unwrap_or_else(|error| error.into_inner())
 }
 
 /// There is one retained frame deque for a run. Watch carries only a wakeup.
 /// A subscriber holds the current frame while its transport writes it.
 #[derive(Clone)]
-pub struct StepStreamBuffer {
+pub(crate) struct StepStreamBuffer {
     run: AgentRunId,
     thread: ChatThreadId,
     state: Arc<Mutex<State>>,

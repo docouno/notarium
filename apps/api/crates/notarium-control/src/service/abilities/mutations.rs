@@ -136,50 +136,44 @@ impl ControlService {
         &self,
         ctx: AccountContext,
         request: AccountMutation<AbilityBindingUpdate>,
-    ) -> Result<ControlCommit<AbilityDescriptor>, PortError> {
-        let command = Command::new(request.identity, "update-ability-binding", &request.input)?;
-        let input = AbilityBindingChange {
-            ability: request.input.ability,
-            enabled: request.input.enabled,
-            expected: Some(request.input.expected),
-            projects: request.input.projects,
+    ) -> Result<ControlCommit<AbilityBindingResult>, PortError> {
+        let (authoring, expected, op) = match request.input.expected {
+            AbilityOverlayGuard::Account(rev) => (false, Some(rev), "update-ability-binding"),
+            AbilityOverlayGuard::Authored(rev) => (true, rev, "compare-authored-ability-binding"),
         };
-        let (revision, _, descriptor) = self
-            .write_ability_binding(ctx, command, input, false)
+        let command = Command::new(request.identity, op, &request.input)?;
+        let (revision, reference, descriptor) = self
+            .write_ability_binding(
+                ctx,
+                command,
+                request.input.ability,
+                request.input.enabled,
+                expected,
+                request.input.projects,
+                authoring,
+            )
             .await?;
         Ok(ControlCommit {
             revision,
-            value: descriptor.ok_or(DomainError::ResourceNotFound)?,
+            value: AbilityBindingResult {
+                reference,
+                descriptor,
+            },
         })
     }
 
-    pub async fn compare_authored_ability_binding(
-        &self,
-        ctx: AccountContext,
-        request: AccountMutation<AbilityBindingChange>,
-    ) -> Result<ControlCommit<AbilityRef>, PortError> {
-        let command = Command::new(
-            request.identity,
-            "compare-authored-ability-binding",
-            &request.input,
-        )?;
-        let (revision, reference, _) = self
-            .write_ability_binding(ctx, command, request.input, true)
-            .await?;
-        Ok(ControlCommit {
-            revision,
-            value: reference,
-        })
-    }
-
+    #[allow(clippy::too_many_arguments)]
     async fn write_ability_binding(
         &self,
         ctx: AccountContext,
         command: Command,
-        input: AbilityBindingChange,
+        ability: AbilityRef,
+        enabled: bool,
+        expected: Option<ControlRevision>,
+        projects: AbilityProjects,
         authoring: bool,
     ) -> Result<(ControlRevision, AbilityRef, Option<AbilityDescriptor>), PortError> {
-        if matches!(&input.projects, AbilityProjects::Selected(values) if values.len() > 200) {
+        if matches!(&projects, AbilityProjects::Selected(values) if values.len() > 200) {
             return Err(invalid(ValidationReason::InvalidLimit));
         }
         command.require(ctx.auth().principal(), ctx.auth().principal())?;
@@ -192,14 +186,14 @@ impl ControlService {
         > = async {
             let value = budget
                 .run(
-                    self.raw_ability(&current, input.ability.identity()),
+                    self.raw_ability(&current, ability.identity()),
                     CommitEffect::NotCommitted,
                 )
                 .await?;
-            if value.reference != input.ability {
+            if value.reference != ability {
                 return Err(DomainError::ResourceNotFound.into());
             }
-            if let AbilityProjects::Selected(projects) = &input.projects {
+            if let AbilityProjects::Selected(projects) = &projects {
                 let mut seen = BTreeSet::new();
                 for project in projects {
                     if !seen.insert((project.space_id.clone(), project.folder_id.clone())) {
@@ -239,9 +233,9 @@ impl ControlService {
         }
         let (revision, reference, descriptor) = budget.run(async {
             let owner = user(tx.inner_mut(), ctx.auth().principal().as_str()).await?;
-            let spaces = self.lock_ability_spaces(tx.inner_mut(), &ctx, &owner, &[&input.ability]).await?;
-            let key = placement(&input.ability.placement)?;
-            let project = match &input.ability.placement { AbilityPlacement::OwnedProject(project) => Some(project), _ => None };
+            let spaces = self.lock_ability_spaces(tx.inner_mut(), &ctx, &owner, &[&ability]).await?;
+            let key = placement(&ability.placement)?;
+            let project = match &ability.placement { AbilityPlacement::OwnedProject(project) => Some(project), _ => None };
             if let Some((revision, saved)) = command.replay::<AbilityRef>(tx.inner_mut()).await? {
                 let descriptor = if authoring {
                     None
@@ -254,18 +248,18 @@ impl ControlService {
             let value = prechecked?;
             self.ensure_current_ability_mutation(tx.inner_mut(), &ctx, &value).await?;
             if !authoring { expect_revision(&owner, command.identity.expected)?; }
-            let old = rows!(tx.inner_mut(),AbilityAvailabilityRow,fetch_optional,"SELECT * FROM ability_availability WHERE placement=$1 AND ability_id=$2","SELECT * FROM v1_control.ability_availability WHERE placement=$1 AND ability_id=$2";&key,input.ability.id.as_str())?;
+            let old = rows!(tx.inner_mut(),AbilityAvailabilityRow,fetch_optional,"SELECT * FROM ability_availability WHERE placement=$1 AND ability_id=$2","SELECT * FROM v1_control.ability_availability WHERE placement=$1 AND ability_id=$2";&key,ability.id.as_str())?;
             let previous = old.as_ref().map_or(0, |row| row.revision);
             let current = ControlRevision::new(previous as u64)?;
             let actual = (old.is_some() || !authoring).then_some(current);
-            if actual != input.expected { return Err(DomainError::ControlRevisionConflict { current }.into()); }
-            let mode = match &input.projects { AbilityProjects::All => "all-projects", AbilityProjects::Selected(_) => "selected-projects" };
-            let row = AbilityAvailabilityRow { placement: key.clone(), ability_id: input.ability.id.to_string(), mode: mode.into(), enabled: i64::from(input.enabled), revision: next(previous)? };
+            if actual != expected { return Err(DomainError::ControlRevisionConflict { current }.into()); }
+            let mode = match &projects { AbilityProjects::All => "all-projects", AbilityProjects::Selected(_) => "selected-projects" };
+            let row = AbilityAvailabilityRow { placement: key.clone(), ability_id: ability.id.to_string(), mode: mode.into(), enabled: i64::from(enabled), revision: next(previous)? };
             TargetRecord::from(row.clone()).validate()?;
             execute!(tx.inner_mut(),"INSERT INTO ability_availability(placement,ability_id,mode,enabled,revision) VALUES($1,$2,$3,$4,$5) ON CONFLICT(placement,ability_id) DO UPDATE SET mode=excluded.mode,enabled=excluded.enabled,revision=excluded.revision",
                 "INSERT INTO v1_control.ability_availability(placement,ability_id,mode,enabled,revision) VALUES($1,$2,$3,$4,$5) ON CONFLICT(placement,ability_id) DO UPDATE SET mode=excluded.mode,enabled=excluded.enabled,revision=excluded.revision";&key,&row.ability_id,mode,row.enabled,row.revision)?;
             execute!(tx.inner_mut(),"DELETE FROM ability_project_bindings WHERE placement=$1 AND ability_id=$2","DELETE FROM v1_control.ability_project_bindings WHERE placement=$1 AND ability_id=$2";&key,&row.ability_id)?;
-            if let AbilityProjects::Selected(projects) = &input.projects {
+            if let AbilityProjects::Selected(projects) = &projects {
                 let mut seen = BTreeSet::new();
                 for project in projects {
                     if !spaces.contains(&project.space_id) || !seen.insert((project.space_id.clone(), project.folder_id.clone())) { return Err(invalid(ValidationReason::ScopeMismatch)); }
@@ -274,13 +268,13 @@ impl ControlService {
                 }
             }
             let revision = self.bump_ability_state(tx.inner_mut(), &owner, &spaces).await?;
-            command.save(tx.inner_mut(), revision, &SavedResult { value: input.ability.clone(), events: vec![] }, self.clock.now_ms()?).await?;
+            command.save(tx.inner_mut(), revision, &SavedResult { value: ability.clone(), events: vec![] }, self.clock.now_ms()?).await?;
             let descriptor = if authoring {
                 None
             } else {
                 Some(self.overlay(tx.inner_mut(), &ctx, value, project).await?)
             };
-            Ok((revision, input.ability, descriptor))
+            Ok((revision, ability, descriptor))
         }, CommitEffect::NotCommitted).await?;
         budget.run(tx.commit(), CommitEffect::Unknown).await?;
         Ok((revision, reference, descriptor))
@@ -288,31 +282,23 @@ impl ControlService {
     pub async fn set_ability_preference(
         &self,
         ctx: AccountContext,
-        request: AccountMutation<AbilityPreferenceUpdate>,
-    ) -> Result<ControlCommit<AbilityPreferenceUpdate>, PortError> {
-        let command = Command::new(request.identity, "set-ability-preference", &request.input)?;
-        self.write_ability_preference(ctx, command, request.input, PreferencePrecondition::Account)
-            .await
-    }
-
-    pub async fn compare_authored_ability_preference(
-        &self,
-        ctx: AccountContext,
         request: AccountMutation<AbilityPreferenceChange>,
     ) -> Result<ControlCommit<AbilityPreferenceUpdate>, PortError> {
-        ctx.auth().authorize_ability_mutation()?;
-        let command = Command::new(
-            request.identity,
-            "compare-authored-ability-preference",
-            &request.input,
-        )?;
-        self.write_ability_preference(
-            ctx,
-            command,
-            request.input.preference,
-            PreferencePrecondition::Target(request.input.expected),
-        )
-        .await
+        let (op, precondition) = match request.input.expected {
+            AbilityPreferenceGuard::Account => {
+                ("set-ability-preference", PreferencePrecondition::Account)
+            }
+            AbilityPreferenceGuard::Authored(expected) => {
+                ctx.auth().authorize_ability_mutation()?;
+                (
+                    "compare-authored-ability-preference",
+                    PreferencePrecondition::Target(expected),
+                )
+            }
+        };
+        let command = Command::new(request.identity, op, &request.input)?;
+        self.write_ability_preference(ctx, command, request.input.preference, precondition)
+            .await
     }
 
     async fn write_ability_preference(
@@ -424,48 +410,50 @@ impl ControlService {
     pub async fn set_ability_trail(
         &self,
         ctx: AccountContext,
-        request: AccountMutation<AbilityTrailUpdate>,
-    ) -> Result<ControlCommit<AbilityTrailUpdate>, PortError> {
-        let command = Command::new(request.identity, "set-ability-trail", &request.input)?;
-        let result = self
-            .write_ability_trail(ctx, command, request.input.clone(), false)
-            .await?;
-        Ok(ControlCommit {
-            revision: result.revision,
-            value: request.input,
-        })
-    }
-
-    pub async fn adopt_authored_ability_promotion(
-        &self,
-        ctx: AccountContext,
-        request: AccountMutation<AdoptAbilityPromotion>,
-    ) -> Result<ControlCommit<AbilityPromotionResult>, PortError> {
-        let AdoptAbilityPromotion {
-            source,
-            destination,
-        } = request.input;
-        if !matches!(
-            (&source.placement, &destination.placement),
-            (AbilityPlacement::OwnedProject(project), AbilityPlacement::OwnedSpace(space))
-                if &project.space_id == space && source.id == destination.id
-                    && source.revision != destination.revision
-        ) {
-            return Err(invalid(ValidationReason::ScopeMismatch));
+        request: AccountMutation<AbilityTrailMutation>,
+    ) -> Result<ControlCommit<AbilityTrailResult>, PortError> {
+        match request.input {
+            AbilityTrailMutation::Set(input) => {
+                let command = Command::new(request.identity, "set-ability-trail", &input)?;
+                let result = self
+                    .write_ability_trail(ctx, command, input.clone(), false)
+                    .await?;
+                Ok(ControlCommit {
+                    revision: result.revision,
+                    value: AbilityTrailResult::Updated(Box::new(input)),
+                })
+            }
+            AbilityTrailMutation::AdoptPromotion(AdoptAbilityPromotion {
+                source,
+                destination,
+            }) => {
+                if !matches!(
+                    (&source.placement, &destination.placement),
+                    (AbilityPlacement::OwnedProject(project), AbilityPlacement::OwnedSpace(space))
+                        if &project.space_id == space
+                            && source.id == destination.id
+                            && source.revision != destination.revision
+                ) {
+                    return Err(invalid(ValidationReason::ScopeMismatch));
+                }
+                let input = AbilityTrailUpdate {
+                    source,
+                    expected_destination: None,
+                    destination: Some(destination),
+                };
+                let command =
+                    Command::new(request.identity, "adopt-authored-ability-promotion", &input)?;
+                let result = self.write_ability_trail(ctx, command, input, true).await?;
+                Ok(ControlCommit {
+                    revision: result.revision,
+                    value: AbilityTrailResult::Promoted(
+                        result
+                            .value
+                            .ok_or_else(|| invalid(ValidationReason::InvalidState))?,
+                    ),
+                })
+            }
         }
-        let input = AbilityTrailUpdate {
-            source,
-            expected_destination: None,
-            destination: Some(destination),
-        };
-        let command = Command::new(request.identity, "adopt-authored-ability-promotion", &input)?;
-        let result = self.write_ability_trail(ctx, command, input, true).await?;
-        Ok(ControlCommit {
-            revision: result.revision,
-            value: result
-                .value
-                .ok_or_else(|| invalid(ValidationReason::InvalidState))?,
-        })
     }
 
     async fn write_ability_trail(

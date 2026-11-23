@@ -110,15 +110,10 @@ pub(super) async fn recent(
         let target = &targets[index];
         let facts = {
             let scope = call.space(target.scope.clone())?;
-            match corpus::note_in_space(call, &scope, &id).await {
-                Ok(_) => (),
-                Err(error) if corpus::hidden(&error) => continue,
-                Err(error) => return Err(error),
-            }
             let snapshot = match call
                 .registry
                 .engine
-                .get_note(
+                .get_note_metadata(
                     scope.clone(),
                     GetNote {
                         note: id.clone(),
@@ -132,9 +127,12 @@ pub(super) async fn recent(
                 Err(error) if corpus::hidden(&error) => continue,
                 Err(error) => return Err(error),
             };
-            let metadata = snapshot.document.metadata();
+            let metadata = &snapshot.metadata;
             if metadata.reference().note_id != id || metadata.revision() != &change.revision {
                 return Err(invalid(ValidationReason::SourceMismatch));
+            }
+            if metadata.class() == DocClass::EncryptedNote {
+                continue;
             }
             let facts = snapshot
                 .provenance
@@ -146,7 +144,7 @@ pub(super) async fn recent(
             {
                 continue;
             }
-            match corpus::note_metadata(call, &scope, &metadata).await {
+            match corpus::note_metadata(call, &scope, metadata).await {
                 Ok(()) => (),
                 Err(error) if corpus::hidden(&error) => continue,
                 Err(error) => return Err(error),

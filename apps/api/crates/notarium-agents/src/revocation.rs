@@ -17,6 +17,7 @@ use notarium_core::{
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{Arc, Mutex},
+    time::Duration,
 };
 use tokio::{sync::watch, time::Instant};
 
@@ -26,6 +27,8 @@ type Selectors = BTreeSet<RevocationSelector>;
 type RegistrationId = u64;
 const MAX_SELECTORS: usize = 512;
 const RECENT_EVENTS: usize = 4096;
+const MAX_PENDING_CREDENTIALS: usize = 4096;
+const PENDING_CREDENTIAL_TTL: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Clone)]
 pub struct RevocationHub {
@@ -64,7 +67,10 @@ struct CanonicalRegistration {
 }
 
 enum EventDelivery {
-    Applying(Vec<Cancellation>),
+    Applying {
+        cancellations: Vec<Cancellation>,
+        waiters: usize,
+    },
     Applied,
 }
 
@@ -84,6 +90,7 @@ pub struct PendingCredential {
     cancellation: Cancellation,
     pub(crate) handoff: Arc<tokio::sync::Mutex<()>>,
     registration: RegistrationId,
+    registered_at: Instant,
     command_key: CommandKey,
     command_hash: ContentDigest,
     selectors: Selectors,
@@ -106,7 +113,7 @@ impl PendingCredential {
 /// A failed new enqueue may remove only the entry it installed. The supervisor
 /// serializes admissions for one thread and retains the credential if commit
 /// status is unknown. Successful consume or dismissal removes by stable key.
-pub struct PendingRegistration {
+pub(crate) struct PendingRegistration {
     key: PendingCredentialKey,
     id: RegistrationId,
     inserted: bool,
@@ -176,22 +183,57 @@ impl State {
         cancellations
     }
 
+    fn sweep_expired_pending(&mut self, now: Instant) -> Vec<Cancellation> {
+        let mut expired = Vec::new();
+        self.pending.retain(|_, entry| {
+            if now.saturating_duration_since(entry.registered_at) >= PENDING_CREDENTIAL_TTL {
+                expired.push(entry.cancellation.clone());
+                false
+            } else {
+                true
+            }
+        });
+        expired
+    }
+
     fn event_targets(
         &mut self,
         event: &RequestId,
         selector: &RevocationSelector,
     ) -> Vec<Cancellation> {
-        match self.events.get(event) {
-            Some(EventDelivery::Applying(cancellations)) => return cancellations.clone(),
+        match self.events.get_mut(event) {
+            Some(EventDelivery::Applying {
+                cancellations,
+                waiters,
+            }) => {
+                *waiters += 1;
+                return cancellations.clone();
+            }
             Some(EventDelivery::Applied) => return Vec::new(),
             None => (),
         }
         let cancellations = self.take_matching(|other| other.contains(selector), true);
         self.events.insert(
             event.clone(),
-            EventDelivery::Applying(cancellations.clone()),
+            EventDelivery::Applying {
+                cancellations: cancellations.clone(),
+                waiters: 1,
+            },
         );
         cancellations
+    }
+
+    fn release_applying_event(&mut self, event: &RequestId) {
+        let should_remove = match self.events.get_mut(event) {
+            Some(EventDelivery::Applying { waiters, .. }) => {
+                *waiters = waiters.saturating_sub(1);
+                *waiters == 0
+            }
+            _ => false,
+        };
+        if should_remove {
+            self.events.remove(event);
+        }
     }
 
     fn apply_event(&mut self, event: RequestId) {
@@ -244,7 +286,7 @@ impl RevocationHub {
         self.inner.notify();
     }
 
-    pub fn register_run(
+    pub(crate) fn register_run(
         &self,
         ctx: MaintenanceContext,
         auth: &EngineAuthContext,
@@ -352,7 +394,7 @@ impl RevocationHub {
 
     /// A run chooses a provider after the durable claim. Track that selection
     /// before dispatch and revalidate it in Control after adjoining selectors.
-    pub fn bind_run_provider(
+    pub(crate) fn bind_run_provider(
         &self,
         lease: &RunRevocationLease,
         selection: &ProviderSelection,
@@ -375,7 +417,7 @@ impl RevocationHub {
         Ok(())
     }
 
-    pub fn register_pending(
+    pub(crate) fn register_pending(
         &self,
         ctx: MaintenanceContext,
         key: PendingCredentialKey,
@@ -396,53 +438,64 @@ impl RevocationHub {
             return Err(invalid(ValidationReason::InvalidAuthority));
         }
         let selectors = auth.selectors_for_revocation(std::iter::once(&key.scope.space_id))?;
-        let mut state = self.inner.lock();
-        state.ensure_open()?;
-        if state.fenced(&selectors) {
-            return Err(revocation_unavailable());
-        }
-        if let Some(existing) = state.pending.get(&key) {
-            if existing.command_key != identity.key
-                || existing.command_hash != identity.hash
-                || existing.options != options
-                || existing.auth.principal() != auth.principal()
-                || existing.auth.grant() != auth.grant()
-                || existing.auth.credential() != auth.credential()
-            {
-                return Err(DomainError::IdempotencyKeyReused.into());
-            }
-            return Ok(PendingRegistration {
-                key,
-                id: existing.registration,
-                inserted: false,
-            });
-        }
-        let registration = state.allocate()?;
-        state.pending.insert(
-            key.clone(),
-            PendingCredential {
-                auth,
-                options,
-                selectors,
-                command_key: identity.key.clone(),
-                command_hash: identity.hash,
-                registration,
-                cancellation: Cancellation::default(),
-                handoff: Arc::default(),
-            },
-        );
-        Ok(PendingRegistration {
-            key,
-            id: registration,
-            inserted: true,
-        })
+        let now = Instant::now();
+        let (expired, result) = {
+            let mut state = self.inner.lock();
+            state.ensure_open()?;
+            let expired = state.sweep_expired_pending(now);
+            let outcome = if state.fenced(&selectors) {
+                Err(revocation_unavailable())
+            } else if let Some(existing) = state.pending.get(&key) {
+                if existing.command_key != identity.key
+                    || existing.command_hash != identity.hash
+                    || existing.options != options
+                    || existing.auth.principal() != auth.principal()
+                    || existing.auth.grant() != auth.grant()
+                    || existing.auth.credential() != auth.credential()
+                {
+                    Err(DomainError::IdempotencyKeyReused.into())
+                } else {
+                    Ok(PendingRegistration {
+                        key,
+                        id: existing.registration,
+                        inserted: false,
+                    })
+                }
+            } else if state.pending.len() >= MAX_PENDING_CREDENTIALS {
+                Err(invalid(ValidationReason::BudgetExceeded))
+            } else {
+                let registration = state.allocate()?;
+                state.pending.insert(
+                    key.clone(),
+                    PendingCredential {
+                        auth,
+                        options,
+                        selectors,
+                        command_key: identity.key.clone(),
+                        command_hash: identity.hash,
+                        registration,
+                        registered_at: now,
+                        cancellation: Cancellation::default(),
+                        handoff: Arc::default(),
+                    },
+                );
+                Ok(PendingRegistration {
+                    key,
+                    id: registration,
+                    inserted: true,
+                })
+            };
+            (expired, outcome)
+        };
+        cancel_all(expired);
+        result
     }
 
     pub fn pending(&self, key: &PendingCredentialKey) -> Option<PendingCredential> {
         self.inner.lock().pending.get(key).cloned()
     }
 
-    pub fn finish_pending(&self, key: &PendingCredentialKey) {
+    pub(crate) fn finish_pending(&self, key: &PendingCredentialKey) {
         self.remove_pending_when(key, |_| true);
     }
 
@@ -530,21 +583,22 @@ impl RevocationHub {
         cancel_all(removed);
     }
 
-    pub fn rollback_pending(&self, registration: PendingRegistration) {
+    pub(crate) fn rollback_pending(&self, registration: PendingRegistration) {
         if registration.inserted {
             self.finish_registered_pending(registration);
         }
     }
 }
 
-pub struct RunRevocationLease {
+pub(crate) struct RunRevocationLease {
     hub: RevocationHub,
     run: AgentRunId,
     cancellation: Cancellation,
 }
 
+#[cfg(test)]
 impl RunRevocationLease {
-    pub fn cancellation(&self) -> &Cancellation {
+    pub(crate) fn cancellation(&self) -> &Cancellation {
         &self.cancellation
     }
 }
@@ -876,17 +930,37 @@ impl SessionRevocationPort for RevocationHub {
         _reason: RevocationReason,
     ) -> PortFuture<'_, ()> {
         Box::pin(async move {
+            struct ApplyingEventGuard {
+                hub: RevocationHub,
+                request: RequestId,
+                applied: bool,
+            }
+            impl Drop for ApplyingEventGuard {
+                fn drop(&mut self) {
+                    if !self.applied {
+                        self.hub.inner.lock().release_applying_event(&self.request);
+                    }
+                }
+            }
             let request = ctx.budget.request.clone();
             let budget = RevocationBudget::new(ctx)?;
             budget.check()?;
             let mut changes = self.inner.changed.subscribe();
-            let cancellations = {
+            let (cancellations, mut guard) = {
                 let mut state = self.inner.lock();
                 state.ensure_open()?;
                 if matches!(state.events.get(&request), Some(EventDelivery::Applied)) {
                     return Ok(());
                 }
-                state.event_targets(&request, &selector)
+                let cancellations = state.event_targets(&request, &selector);
+                (
+                    cancellations,
+                    ApplyingEventGuard {
+                        hub: self.clone(),
+                        request: request.clone(),
+                        applied: false,
+                    },
+                )
             };
             // An in-flight duplicate repeats the same signals. A completed
             // duplicate cannot cancel a newly authorized registration.
@@ -902,6 +976,7 @@ impl SessionRevocationPort for RevocationHub {
                             && effect.entry.selectors.contains(&selector)
                     }) {
                         state.apply_event(request);
+                        guard.applied = true;
                         return Ok(());
                     }
                 }

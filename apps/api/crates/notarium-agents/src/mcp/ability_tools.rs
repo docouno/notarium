@@ -1,11 +1,13 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use notarium_core::{
     DomainError,
+    auth::{ChatAudience, PrincipalKind},
     classes::{AbilityKind, ClassEgressFence, ClassifiedAbilityResource, DocClass, ProviderOrigin},
     error::{PortError, ValidationReason},
     ids::*,
     model::{AbilityResourceName, FolderRef},
     ports::*,
+    receipt::AccountCommandIdentity,
     value::YamlValue,
 };
 use notarium_syntax::frontmatter;
@@ -101,7 +103,14 @@ pub(super) async fn handle(
         ToolName::ListAbilities => {
             let args: ListArgs = decode(args)?;
             let episode = load_episode(call, args.session.as_ref()).await?;
-            let project = active_project(call, args.project.as_deref(), episode.as_ref()).await?;
+            let project = session::selected_project_for_hint(
+                call,
+                args.project.as_deref(),
+                episode
+                    .as_ref()
+                    .and_then(|value| value.project_hint.as_ref()),
+            )
+            .await?;
             list(call, args, project).await
         }
         ToolName::GetAbility => get(call, decode(args)?).await,
@@ -178,37 +187,58 @@ async fn load_episode(
     }
 }
 
-async fn active_project(
-    call: &ToolCallContext<'_>,
-    explicit: Option<&str>,
-    episode: Option<&AgentEpisode>,
-) -> Result<Option<FolderRef>, PortError> {
-    if let Some(project) = explicit {
-        return Ok(Some(session::resolve_project(call, project).await?.folder));
-    }
-    if let Some(project) = episode.and_then(|value| value.project_hint.as_ref()) {
-        return Ok(Some(project.clone()));
-    }
-    Ok(match &call.target {
-        EgressTarget::ExternalMcp => None,
-        EgressTarget::InAppProvider {
-            primary_project, ..
-        } => primary_project.clone(),
-    })
-}
-
-async fn raw_reference(
-    call: &ToolCallContext<'_>,
+async fn raw_reference_for_account(
+    registry: &ToolRegistry,
+    account: &AccountContext,
     id: AbilityId,
 ) -> Result<Option<AbilityRef>, PortError> {
-    let mut continuation = None;
+    let mut candidates = vec![
+        AbilityPlacement::System,
+        AbilityPlacement::OwnedPersonal(account.auth().principal().clone()),
+    ];
+    for (space_id, grant) in account.auth().spaces() {
+        if grant.read_classes.is_empty() {
+            continue;
+        }
+        candidates.push(AbilityPlacement::OwnedSpace(space_id.clone()));
+        if let Some(folder_id) = &grant.project_root {
+            candidates.push(AbilityPlacement::OwnedProject(FolderRef {
+                space_id: space_id.clone(),
+                folder_id: folder_id.clone(),
+            }));
+        }
+    }
     let mut result = None;
+    for placement in candidates {
+        match registry
+            .control
+            .inspect_ability(
+                account.clone(),
+                AbilityIdentity {
+                    id: id.clone(),
+                    placement,
+                },
+            )
+            .await
+        {
+            Ok(inspection) => {
+                if result.replace(inspection.descriptor.reference).is_some() {
+                    return Err(invalid(ValidationReason::ScopeMismatch));
+                }
+            }
+            Err(error) if visible_error(&error) => (),
+            Err(error) => return Err(error),
+        }
+    }
+    if result.is_some() {
+        return Ok(result);
+    }
+    let mut continuation = None;
     for _ in 0..MAX_ID_PAGES {
-        let page = call
-            .registry
+        let page = registry
             .control
             .discover_abilities(
-                call.account(),
+                account.clone(),
                 AbilityQuery {
                     page: ControlPageRequest::new(200, continuation)?,
                     project: None,
@@ -229,6 +259,13 @@ async fn raw_reference(
         }
     }
     Err(invalid(ValidationReason::BudgetExceeded))
+}
+
+async fn raw_reference(
+    call: &ToolCallContext<'_>,
+    id: AbilityId,
+) -> Result<Option<AbilityRef>, PortError> {
+    raw_reference_for_account(call.registry, &call.account(), id).await
 }
 
 async fn inspect(call: &ToolCallContext<'_>, text: &str) -> Result<AbilityInspection, PortError> {
@@ -466,12 +503,12 @@ fn availability(value: &AbilityProjects) -> Value {
 
 fn summary(
     inspection: &AbilityInspection,
-    body: &AbilityBody,
+    description: &str,
     enabled: bool,
     external: bool,
 ) -> Result<Value, PortError> {
     let descriptor = &inspection.descriptor;
-    let description: String = body.description.chars().take(4096).collect();
+    let description: String = description.chars().take(4096).collect();
     let mut output = json!({
         "ref": reference_token(&descriptor.reference)?,
         "versionToken": Version::from_inspection(inspection).encode()?,
@@ -489,10 +526,53 @@ fn summary(
     Ok(output)
 }
 
-fn unbound_provider_source(call: &ToolCallContext<'_>, inspection: &AbilityInspection) -> bool {
-    matches!(call.target, EgressTarget::InAppProvider { .. })
-        && inspection.descriptor.requires_explicit_binding
+fn provider_ability_allowed(
+    call: &ToolCallContext<'_>,
+    inspection: &AbilityInspection,
+    project: Option<&FolderRef>,
+) -> bool {
+    let EgressTarget::InAppProvider {
+        primary_project, ..
+    } = &call.target
+    else {
+        return true;
+    };
+    if inspection.descriptor.requires_explicit_binding
         && inspection.binding_revision == ControlRevision::ZERO
+    {
+        return false;
+    }
+    if matches!(
+        inspection.descriptor.reference.placement,
+        AbilityPlacement::OwnedSpace(_)
+    ) && !inspection.binding_enabled
+    {
+        return false;
+    }
+    if let AbilityProjects::Selected(projects) = &inspection.availability {
+        if !project.is_some_and(|p| projects.contains(p)) {
+            return false;
+        }
+        if let Some(primary) = primary_project
+            && inspection
+                .descriptor
+                .entrypoint
+                .as_ref()
+                .is_some_and(|entry| entry.space_id == primary.space_id)
+            && !projects.contains(primary)
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn collapse_provider_error(call: &ToolCallContext<'_>, error: PortError) -> PortError {
+    if matches!(call.target, EgressTarget::InAppProvider { .. }) && visible_error(&error) {
+        DomainError::ResourceNotFound.into()
+    } else {
+        error
+    }
 }
 
 fn visible_error(error: &PortError) -> bool {
@@ -572,17 +652,24 @@ async fn list(
             Err(error) if visible_error(&error) => continue,
             Err(error) => return Err(error),
         };
-        if unbound_provider_source(call, &inspection) {
+        if !provider_ability_allowed(call, &inspection, project.as_ref()) {
             continue;
         }
-        let body = match read_body(call, &descriptor, project.as_ref()).await {
-            Ok(body) => body,
-            Err(error) if visible_error(&error) => continue,
-            Err(error) => return Err(error),
-        };
+        let external = matches!(call.target, EgressTarget::ExternalMcp);
+        let (description, origin_record) =
+            if external && let Some(desc) = descriptor.description.as_ref() {
+                (desc.clone(), None)
+            } else {
+                let body = match read_body(call, &descriptor, project.as_ref()).await {
+                    Ok(body) => body,
+                    Err(error) if visible_error(&error) => continue,
+                    Err(error) => return Err(error),
+                };
+                (body.description, Some((body.origin, body.project)))
+            };
         if query.as_ref().is_some_and(|query| {
             !notarium_syntax::unicode::lookup_key(&descriptor.name).contains(query)
-                && !notarium_syntax::unicode::lookup_key(&body.description).contains(query)
+                && !notarium_syntax::unicode::lookup_key(&description).contains(query)
         }) {
             continue;
         }
@@ -591,13 +678,10 @@ async fn list(
         } else {
             inspection.binding_enabled && inspection.preference_enabled
         };
-        items.push(summary(
-            &inspection,
-            &body,
-            enabled,
-            matches!(call.target, EgressTarget::ExternalMcp),
-        )?);
-        call.record_origin(body.origin, body.project)?;
+        items.push(summary(&inspection, &description, enabled, external)?);
+        if let Some((origin, proj)) = origin_record {
+            call.record_origin(origin, proj)?;
+        }
     }
     let next = page
         .continuation
@@ -606,6 +690,8 @@ async fn list(
     if next.as_ref().is_some_and(|next| next.len() > 4096) {
         return Err(invalid(ValidationReason::InvalidLimit));
     }
+    let filtered =
+        args.kind.is_some() || args.source.is_some() || args.project.is_some() || args.q.is_some();
     let next_action = match &next {
         Some(cursor) => {
             let mut arguments = json!({"view":view,"cursor":cursor,"limit":limit});
@@ -622,7 +708,7 @@ async fn list(
             }
             Some(json!({"tool":"list_abilities","reason":"next_page","arguments":arguments}))
         }
-        None if items.is_empty() => {
+        None if items.is_empty() && filtered => {
             Some(json!({"tool":"list_abilities","reason":"zero_results","arguments":{"view":view}}))
         }
         None => None,
@@ -653,12 +739,23 @@ pub(super) async fn session_ability_summaries(
 
 async fn get(call: &mut ToolCallContext<'_>, args: GetArgs) -> Result<Value, PortError> {
     let episode = load_episode(call, args.session.as_ref()).await?;
-    let project = active_project(call, None, episode.as_ref()).await?;
-    let inspection = inspect(call, &args.reference).await?;
-    if unbound_provider_source(call, &inspection) {
+    let project = session::selected_project_for_hint(
+        call,
+        None,
+        episode
+            .as_ref()
+            .and_then(|value| value.project_hint.as_ref()),
+    )
+    .await?;
+    let inspection = inspect(call, &args.reference)
+        .await
+        .map_err(|error| collapse_provider_error(call, error))?;
+    if !provider_ability_allowed(call, &inspection, project.as_ref()) {
         return Err(DomainError::ResourceNotFound.into());
     }
-    let body = read_body(call, &inspection.descriptor, project.as_ref()).await?;
+    let body = read_body(call, &inspection.descriptor, project.as_ref())
+        .await
+        .map_err(|error| collapse_provider_error(call, error))?;
     let mut bytes = body.instructions.len();
     let in_app = matches!(call.target, EgressTarget::InAppProvider { .. });
     if in_app && bytes > MAX_IN_APP_PACKAGE_BODY_BYTES {
@@ -666,7 +763,7 @@ async fn get(call: &mut ToolCallContext<'_>, args: GetArgs) -> Result<Value, Por
     }
     let mut result = summary(
         &inspection,
-        &body,
+        &body.description,
         inspection.binding_enabled && inspection.preference_enabled,
         matches!(call.target, EgressTarget::ExternalMcp),
     )?;
@@ -754,7 +851,7 @@ async fn current_skill(
         Err(error) => return Err(error),
     };
     let mut inspection = inspection;
-    if unbound_provider_source(call, &inspection) {
+    if !provider_ability_allowed(call, &inspection, project) {
         return Ok(None);
     }
     if let AbilityProjects::Selected(projects) = &inspection.availability
@@ -783,24 +880,132 @@ async fn resolve(
         None
     };
     let selection = match reference {
-        Some(reference) => AbilitySelection::Exact { reference, project },
+        Some(reference) => AbilitySelection::Exact {
+            reference,
+            project: project.clone(),
+        },
         None => AbilitySelection::Name {
             name: notarium_syntax::unicode::lookup_key(selector),
             kind,
-            project,
+            project: project.clone(),
         },
     };
-    match call
+    let resolved = call
         .registry
         .control
         .resolve_ability(call.account(), selection)
+        .await
+        .map_err(|error| collapse_provider_error(call, error))?;
+    let in_app = matches!(call.target, EgressTarget::InAppProvider { .. });
+    let ability = match resolved {
+        AbilityResolution::Resolved(ability) if ability.kind == kind => *ability,
+        AbilityResolution::Disabled if !in_app => {
+            return Err(invalid(ValidationReason::InvalidState));
+        }
+        AbilityResolution::Stale if !in_app => {
+            return Err(invalid(ValidationReason::SourceMismatch));
+        }
+        _ => return Err(DomainError::ResourceNotFound.into()),
+    };
+    if in_app {
+        let inspection = call
+            .registry
+            .control
+            .inspect_ability(call.account(), ability.reference.identity())
+            .await
+            .map_err(|error| collapse_provider_error(call, error))?;
+        if !provider_ability_allowed(call, &inspection, project.as_ref()) {
+            return Err(DomainError::ResourceNotFound.into());
+        }
+    }
+    Ok(ability)
+}
+
+pub(crate) async fn bind_chat_role(
+    registry: &ToolRegistry,
+    account: AccountContext,
+    episode_id: &EpisodeId,
+    selector: &str,
+    project: Option<&FolderRef>,
+    run: &AgentRunId,
+) -> Result<(), PortError> {
+    let reference = if selector.starts_with("ar1:") {
+        Some(parse_token(selector, "ar1:", MAX_TOKEN_BYTES)?)
+    } else if let Ok(id) = AbilityId::parse(selector) {
+        let found = raw_reference_for_account(registry, &account, id).await?;
+        if found.is_none() && selector.starts_with("ab_") {
+            return Err(DomainError::ResourceNotFound.into());
+        }
+        found
+    } else {
+        None
+    };
+    let selection = match reference {
+        Some(reference) => AbilitySelection::Exact {
+            reference,
+            project: project.cloned(),
+        },
+        None => AbilitySelection::Name {
+            name: notarium_syntax::unicode::lookup_key(selector),
+            kind: AbilityKind::Role,
+            project: project.cloned(),
+        },
+    };
+    let ability = match registry
+        .control
+        .resolve_ability(account.clone(), selection)
         .await?
     {
-        AbilityResolution::Resolved(ability) if ability.kind == kind => Ok(*ability),
-        AbilityResolution::Disabled => Err(invalid(ValidationReason::InvalidState)),
-        AbilityResolution::Stale => Err(invalid(ValidationReason::SourceMismatch)),
-        _ => Err(DomainError::ResourceNotFound.into()),
+        AbilityResolution::Resolved(ability)
+            if ability.kind == AbilityKind::Role && ability.healthy && ability.enabled =>
+        {
+            *ability
+        }
+        AbilityResolution::Disabled => return Err(invalid(ValidationReason::InvalidState)),
+        AbilityResolution::Stale => return Err(invalid(ValidationReason::SourceMismatch)),
+        _ => return Err(DomainError::ResourceNotFound.into()),
+    };
+    let episode = registry
+        .control
+        .get_episode(account.clone(), episode_id.clone())
+        .await?;
+    if episode.active_role.as_ref() == Some(&ability.reference)
+        && episode.project_hint.as_ref() == project
+    {
+        return Ok(());
     }
+    let key = super::derive_key(
+        "notarium.chats.bind-role.v1",
+        &[run.as_str().as_bytes(), episode_id.as_str().as_bytes()],
+    );
+    let mutation = EpisodeMutation::BindRole(BindEpisodeRole {
+        episode: episode.id,
+        expected: episode.revision,
+        active_role: ability.reference,
+        project_hint: project.cloned(),
+    });
+    let hash = super::derive_digest(
+        "notarium.chats.bind-role-input.v1",
+        &[&serde_json::to_vec(&mutation).map_err(|_| invalid(ValidationReason::InvalidState))?],
+    );
+    let principal = account.auth().principal().clone();
+    registry
+        .control
+        .update_episode(
+            account,
+            AccountMutation {
+                identity: AccountCommandIdentity {
+                    owner: principal.clone(),
+                    actor: principal,
+                    expected: ControlRevision::ZERO,
+                    key,
+                    hash,
+                },
+                input: mutation,
+            },
+        )
+        .await?;
+    Ok(())
 }
 
 async fn use_ability(
@@ -818,7 +1023,14 @@ async fn use_ability(
         _ => return Err(invalid(ValidationReason::InvalidQuery)),
     };
     let episode = load_episode(call, args.session.as_ref()).await?;
-    let project = active_project(call, args.project.as_deref(), episode.as_ref()).await?;
+    let project = session::selected_project_for_hint(
+        call,
+        args.project.as_deref(),
+        episode
+            .as_ref()
+            .and_then(|value| value.project_hint.as_ref()),
+    )
+    .await?;
     let descriptor = resolve(call, &selector, kind, project.clone()).await?;
     let rendered = activation(
         call,
@@ -840,7 +1052,8 @@ pub(super) async fn activate_session_role(
     episode: &AgentEpisode,
     explicit: Option<&str>,
 ) -> Result<Option<Value>, PortError> {
-    let project = active_project(call, None, Some(episode)).await?;
+    let project =
+        session::selected_project_for_hint(call, None, episode.project_hint.as_ref()).await?;
     let descriptor = if let Some(selector) = explicit {
         resolve(call, selector, AbilityKind::Role, project.clone()).await?
     } else {
@@ -859,7 +1072,7 @@ pub(super) async fn activate_session_role(
         DEFAULT_ACTIVATION_TOKENS,
     )
     .await?;
-    if explicit.is_some() {
+    if explicit.is_some() && call.auth.bearer_scope() != Some(BearerScope::Read) {
         save_active_role(call, episode, &descriptor.reference, project).await?;
     }
     Ok(Some(rendered))
@@ -880,6 +1093,15 @@ async fn save_active_role(
 ) -> Result<(), PortError> {
     if episode.active_role.as_ref() == Some(role) && episode.project_hint == project {
         return Ok(());
+    }
+    if matches!(call.auth.kind(), PrincipalKind::Keeper(_))
+        || call.auth.chat_audience() == Some(ChatAudience::Shared)
+        || call.auth.bearer_scope() == Some(BearerScope::Read)
+    {
+        return Err(DomainError::AccessDenied.into());
+    }
+    if call.auth.taint().is_tainted() {
+        return Err(DomainError::CrossSpaceTainted.into());
     }
     let plan: EpisodeRolePlan = call
         .journal("activate-role", || async {
@@ -904,11 +1126,16 @@ async fn save_active_role(
     }
     call.registry
         .control
-        .bind_episode_role(
+        .update_episode(
             call.account(),
             AccountMutation {
                 identity: call.account_identity(plan.account_revision, "activate-role-effect", 0),
-                input: plan.update,
+                input: EpisodeMutation::BindRole(BindEpisodeRole {
+                    episode: plan.update.episode,
+                    expected: plan.update.expected,
+                    active_role: role.clone(),
+                    project_hint: plan.update.project_hint,
+                }),
             },
         )
         .await?;

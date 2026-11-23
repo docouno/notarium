@@ -842,13 +842,13 @@ async fn empty_folder_disclosure(
     .await
     .expect("independent Space can commit during disclosure")
     .unwrap();
-    lease.mark_dispatched();
+    lease.mark_dispatched().await.unwrap();
     assert!(
         tokio::time::timeout(std::time::Duration::from_millis(20), &mut rename)
             .await
             .is_err()
     );
-    second.mark_dispatched();
+    second.mark_dispatched().await.unwrap();
     rename.await.unwrap();
     assert!(matches!(
         canonical
@@ -858,6 +858,8 @@ async fn empty_folder_disclosure(
             if diagnostic.reason == notarium_core::error::ValidationReason::SourceMismatch
     ));
     lease.check().unwrap();
+    lease.close().await.unwrap();
+    second.close().await.unwrap();
 }
 
 async fn builtins_after_owned_page(

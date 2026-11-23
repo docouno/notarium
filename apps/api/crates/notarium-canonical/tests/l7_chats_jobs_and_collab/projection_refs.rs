@@ -101,6 +101,7 @@ async fn append_refs(
                     provenance: None,
                     interruption: None,
                     proposed_diff: None,
+                    proposed_effect: None,
                     thread: thread.clone(),
                     parent,
                     kind: ChatEntryKind::Human,

@@ -435,6 +435,7 @@ async fn interrupted_tool_group(
                         tool_calls: calls,
                         interruption: None,
                         proposed_diff: None,
+                        proposed_effect: None,
                         provenance: Some(ChatProvenance::default()),
                         referenced_notes: vec![],
                         tainted: false,

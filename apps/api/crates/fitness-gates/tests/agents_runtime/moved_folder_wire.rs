@@ -378,6 +378,7 @@ pub(super) async fn relocated_empty_folder_blocks_old_and_compacted_history(
                     }),
                     interruption: None,
                     proposed_diff: None,
+                    proposed_effect: None,
                     referenced_notes: vec![],
                     tainted: context.auth().taint().is_tainted(),
                 },

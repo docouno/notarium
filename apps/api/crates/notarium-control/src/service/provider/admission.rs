@@ -217,7 +217,6 @@ impl ProviderService {
                 reference,
                 provenance,
                 promoted_from,
-                requires_explicit_binding,
                 ..
             } = item
             {
@@ -229,11 +228,6 @@ impl ProviderService {
                     .control
                     .promotion_is_committed(tx, promoted_from.as_ref(), &identity)
                     .await?
-                {
-                    return Err(DomainError::ResourceNotFound.into());
-                }
-                if *requires_explicit_binding
-                    && !self.control.has_ability_binding(tx, &identity).await?
                 {
                     return Err(DomainError::ResourceNotFound.into());
                 }
@@ -356,6 +350,41 @@ impl ProviderService {
             {
                 return Err(DomainError::AccessDenied.into());
             }
+            if let ProviderCurrentContent::Ability {
+                reference,
+                provenance,
+                requires_explicit_binding,
+                ..
+            } = metadata
+            {
+                let identity = AbilityIdentity {
+                    id: reference.ability.clone(),
+                    placement: provenance.current.placement.clone(),
+                };
+                let ability_project = match &identity.placement {
+                    AbilityPlacement::OwnedProject(folder) => Some(folder),
+                    AbilityPlacement::OwnedSpace(space) => admitted
+                        .project_only
+                        .as_ref()
+                        .or(indexing_project)
+                        .or_else(|| project_by_space.get(space).copied().flatten()),
+                    AbilityPlacement::OwnedPersonal(_) | AbilityPlacement::System => {
+                        admitted.project_only.as_ref().or(project)
+                    }
+                };
+                if !self
+                    .control
+                    .ability_admitted_for_provider(
+                        tx,
+                        &identity,
+                        ability_project,
+                        *requires_explicit_binding,
+                    )
+                    .await?
+                {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+            }
             ClassEgressFence::revalidate(part, &auth, &admitted.policy, metadata)?;
             dependencies.push(*metadata);
         }
@@ -383,6 +412,41 @@ impl ProviderService {
                     .is_some_and(|project| !dependency.in_project(project))
                 {
                     return Err(DomainError::AccessDenied.into());
+                }
+                if let ProviderCurrentContent::Ability {
+                    reference,
+                    provenance,
+                    requires_explicit_binding,
+                    ..
+                } = dependency
+                {
+                    let identity = AbilityIdentity {
+                        id: reference.ability.clone(),
+                        placement: provenance.current.placement.clone(),
+                    };
+                    let ability_project = match &identity.placement {
+                        AbilityPlacement::OwnedProject(folder) => Some(folder),
+                        AbilityPlacement::OwnedSpace(space) => admitted
+                            .project_only
+                            .as_ref()
+                            .or(indexing_project)
+                            .or_else(|| project_by_space.get(space).copied().flatten()),
+                        AbilityPlacement::OwnedPersonal(_) | AbilityPlacement::System => {
+                            admitted.project_only.as_ref().or(project)
+                        }
+                    };
+                    if !self
+                        .control
+                        .ability_admitted_for_provider(
+                            tx,
+                            &identity,
+                            ability_project,
+                            *requires_explicit_binding,
+                        )
+                        .await?
+                    {
+                        return Err(DomainError::ResourceNotFound.into());
+                    }
                 }
                 ClassEgressFence::revalidate_origin(&auth, &admitted.policy, dependency)?;
                 if used.insert(key) {

@@ -98,6 +98,7 @@ async fn exercise(pg: bool) {
             reference: role.clone(),
             kind: AbilityKind::Role,
             name: "scheduled-guide".into(),
+            description: None,
             enabled: true,
             healthy: true,
             lifecycle: Lifecycle::Active,
@@ -1020,6 +1021,7 @@ async fn role_placement_scope_and_run_inspection_access(pg: bool) {
                 reference: reference.clone(),
                 kind: AbilityKind::Role,
                 name: name.into(),
+                description: None,
                 enabled: true,
                 healthy: true,
                 lifecycle: Lifecycle::Active,
@@ -1072,6 +1074,7 @@ async fn role_placement_scope_and_run_inspection_access(pg: bool) {
                         name: Some("scope-ep".into()),
                     },
                     project_hint: None,
+                    guard: EpisodeRevisionGuard::Account,
                 },
             },
         )
@@ -1084,14 +1087,14 @@ async fn role_placement_scope_and_run_inspection_access(pg: bool) {
                 ctx.clone(),
                 AccountMutation {
                     identity: identity(&control, &ctx, 4).await,
-                    input: EpisodeUpdate {
+                    input: EpisodeMutation::Full(EpisodeUpdate {
                         episode: ep_id.clone(),
                         expected: ControlRevision::new(1).unwrap(),
                         name: Some("scope-ep".into()),
                         active_role: Some(role_pa1.clone()),
                         project_hint: bad_project,
                         lifecycle: EpisodeLifecycle::Active,
-                    },
+                    }),
                 },
             )
             .await
@@ -1106,14 +1109,14 @@ async fn role_placement_scope_and_run_inspection_access(pg: bool) {
             ctx.clone(),
             AccountMutation {
                 identity: identity(&control, &ctx, 5).await,
-                input: EpisodeUpdate {
+                input: EpisodeMutation::Full(EpisodeUpdate {
                     episode: ep_id.clone(),
                     expected: ControlRevision::new(1).unwrap(),
                     name: Some("scope-ep".into()),
                     active_role: Some(role_space_a.clone()),
                     project_hint: Some(project_b),
                     lifecycle: EpisodeLifecycle::Active,
-                },
+                }),
             },
         )
         .await
@@ -1128,14 +1131,14 @@ async fn role_placement_scope_and_run_inspection_access(pg: bool) {
             ctx.clone(),
             AccountMutation {
                 identity: identity(&control, &ctx, 6).await,
-                input: EpisodeUpdate {
+                input: EpisodeMutation::Full(EpisodeUpdate {
                     episode: ep_id,
                     expected: ControlRevision::new(1).unwrap(),
                     name: Some("scope-ep".into()),
                     active_role: Some(role_pa1.clone()),
                     project_hint: Some(project_a1.clone()),
                     lifecycle: EpisodeLifecycle::Active,
-                },
+                }),
             },
         )
         .await
@@ -1603,6 +1606,7 @@ async fn terminal_slots_and_migrated_folds(pg: bool) {
             reference: role.clone(),
             kind: AbilityKind::Role,
             name: "calendar-test".into(),
+            description: None,
             enabled: true,
             healthy: true,
             lifecycle: Lifecycle::Active,
@@ -1853,16 +1857,16 @@ async fn terminal_slots_and_migrated_folds(pg: bool) {
                 .await
                 .unwrap();
             match schedule.definition.title.as_str() {
-                "Retained fold" => assert!(
+                "Retained fold" | "Reconfigured fold" => assert!(
                     matches!(result, ScheduleClaim::SkippedDuplicate(previous) if previous.slot == first)
                 ),
                 "Expired history" => {
                     assert!(matches!(result, ScheduleClaim::SkippedUnverifiedFold))
                 }
-                "Complete history" | "Reconfigured fold" if attempt == 0 => {
+                "Complete history" if attempt == 0 => {
                     assert!(matches!(result, ScheduleClaim::Claimed { .. }))
                 }
-                "Complete history" | "Reconfigured fold" => {
+                "Complete history" => {
                     assert!(matches!(result, ScheduleClaim::AlreadyClaimed(_)))
                 }
                 _ => unreachable!(),

@@ -52,7 +52,16 @@ pub(super) async fn list(call: &mut ToolCallContext<'_>, args: Value) -> Result<
         }
         return Ok(empty());
     };
-    let folder_info = corpus::folder_metadata(call, &scope, &folder).await?;
+    let folder_info = match corpus::folder_metadata(call, &scope, &folder).await {
+        Ok(info) => info,
+        Err(error) if corpus::hidden(&error) => {
+            if args.cursor.is_some() {
+                return Err(invalid(ValidationReason::CursorStale));
+            }
+            return Ok(empty());
+        }
+        Err(error) => return Err(error),
+    };
     let schema = if args.fields.is_empty() {
         BTreeMap::new()
     } else {
@@ -214,14 +223,17 @@ pub(super) async fn list(call: &mut ToolCallContext<'_>, args: Value) -> Result<
         output["total"] = json!(total);
     }
     if next_notes.is_some() || next_folders.is_some() {
-        let token = call.registry.note_cursors.insert(NoteContinuation {
-            folder: folder.reference.clone(),
-            scope: folder.history.clone(),
-            fingerprint,
-            notes: next_notes,
-            folders: next_folders,
-            total,
-        })?;
+        let token = call.registry.note_cursors.insert(
+            call.auth.principal().clone(),
+            NoteContinuation {
+                folder: folder.reference.clone(),
+                scope: folder.history.clone(),
+                fingerprint,
+                notes: next_notes,
+                folders: next_folders,
+                total,
+            },
+        )?;
         output["nextCursor"] = json!(token);
     }
     let handle = if let Some(handle) = args.project {
@@ -267,7 +279,7 @@ async fn directory(
     if path.is_empty() {
         return Ok(Some(home));
     }
-    if let Some(relative) = suffix(&path, &home.path) {
+    if let Some(relative) = corpus::strip_folder_prefix(&path, &home.path) {
         return engine
             .resolve_folder_path(scope.clone(), base, relative)
             .await;
@@ -287,19 +299,6 @@ async fn directory(
         return Ok(Some(folder));
     }
     engine.resolve_folder_path(scope.clone(), base, path).await
-}
-
-fn suffix(path: &str, parent: &str) -> Option<String> {
-    if parent.is_empty() {
-        return Some(path.to_owned());
-    }
-    let mut parts = path.split('/');
-    for part in parent.split('/') {
-        if lookup_key(parts.next()?) != lookup_key(part) {
-            return None;
-        }
-    }
-    Some(parts.collect::<Vec<_>>().join("/"))
 }
 
 async fn folder_page(
@@ -326,7 +325,7 @@ async fn folder_page(
         let note = call
             .registry
             .engine
-            .get_note(
+            .get_note_metadata(
                 scope.clone(),
                 GetNote {
                     note: id.clone(),
@@ -340,7 +339,7 @@ async fn folder_page(
             Err(error) if corpus::hidden(&error) => return Ok(None),
             Err(error) => return Err(error),
         };
-        let metadata = note.document.metadata();
+        let metadata = &note.metadata;
         if metadata.reference().note_id != *id
             || metadata.class() != DocClass::UserDoc
             || (note.parent.as_ref() != Some(&folder.reference.folder_id)
@@ -348,7 +347,7 @@ async fn folder_page(
         {
             return Err(invalid(ValidationReason::InvalidState));
         }
-        match corpus::note_metadata(call, scope, &metadata).await {
+        match corpus::note_metadata(call, scope, metadata).await {
             Ok(()) => {
                 let mut page = marker("present");
                 page["noteId"] = json!(id);

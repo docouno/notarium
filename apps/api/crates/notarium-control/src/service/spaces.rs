@@ -85,6 +85,45 @@ pub(super) async fn admission(
     };
     row.ok_or(DomainError::ResourceNotFound.into())
 }
+pub(super) async fn admission_revisions(
+    tx: &mut Transaction,
+    spaces: &[&SpaceId],
+) -> Result<Vec<(SpaceId, i64)>, PortError> {
+    if spaces.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids: Vec<String> = spaces.iter().map(|space| space.to_string()).collect();
+    let fetched: Vec<(String, i64)> = match tx {
+        Transaction::Sqlite(tx) => {
+            let encoded =
+                serde_json::to_string(&ids).map_err(|_| invalid(ValidationReason::InvalidState))?;
+            sqlx::query_as(
+                "SELECT space_id, revision FROM space_admission WHERE space_id IN (SELECT value FROM json_each($1))",
+            )
+            .bind(encoded)
+            .fetch_all(&mut **tx)
+            .await
+            .map_err(crate::error::database)?
+        }
+        Transaction::Postgres(tx) => sqlx::query_as(
+            "SELECT space_id, revision FROM v1_control.space_admission WHERE space_id = ANY($1)",
+        )
+        .bind(&ids)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(crate::error::database)?,
+    };
+    let map: std::collections::BTreeMap<String, i64> = fetched.into_iter().collect();
+    let mut out = Vec::with_capacity(spaces.len());
+    for space in spaces {
+        let rev = map
+            .get(space.as_str())
+            .copied()
+            .ok_or(DomainError::ResourceNotFound)?;
+        out.push(((*space).clone(), rev));
+    }
+    Ok(out)
+}
 pub(super) async fn require_owner_read(
     tx: &mut Transaction,
     auth: &EngineAuthContext,

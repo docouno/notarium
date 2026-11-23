@@ -1,10 +1,15 @@
-use super::*;
+use super::{
+    runtime_ability_cases::{approve_disclosure, loopback_provider},
+    *,
+};
 use notarium_agents::mcp::{ConfirmProposedDiff, PersonalToolInvocation};
 use notarium_canonical::CreateFolderSpec;
 use notarium_core::{
     auth::ChatAudience,
+    classes::DocClass,
     ports::provider::{ProviderToolCall, ProviderToolCallId},
 };
+use tokio::net::TcpListener;
 
 #[tokio::test]
 async fn sqlite_confirmed_notes_use_fixed_destinations_and_revisions() {
@@ -71,7 +76,23 @@ async fn confirmed_notes_use_fixed_destinations_and_revisions(
         )
     };
     assert!(destination().await.unwrap().is_none());
-    let (create, _) = pending_note_action(fixture, personal, 178, "create_notes", json!({
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let consented = loopback_provider(fixture, owner, &listener, 210, true).await;
+    approve_disclosure(
+        fixture,
+        owner,
+        &consented,
+        214,
+        ProviderAttachmentTarget::Personal {
+            owner: owner.auth().principal().clone(),
+            space: scope.space_id.clone(),
+        },
+        [DocClass::UserDoc].into(),
+    )
+    .await;
+    let provider_id = &consented.resource.id;
+    let model_id = &consented.model;
+    let (create, _) = pending_note_action(fixture, personal, provider_id, model_id, 178, "create_notes", json!({
         "project": project,
         "notes": [
             {"title":"Approved draft", "body":"# Approved draft\n\nOriginal paragraph.", "path":path,
@@ -87,7 +108,7 @@ async fn confirmed_notes_use_fixed_destinations_and_revisions(
         .preview_proposed_diff(owner.clone(), create.clone())
         .await
         .unwrap();
-    let draft = &review["change"]["notes"][0];
+    let draft = &review.change.as_ref().unwrap()["notes"][0];
     assert_eq!(
         draft["destination"]["folderPath"],
         "proposal-corpus/drafts/nested"
@@ -109,8 +130,8 @@ async fn confirmed_notes_use_fixed_destinations_and_revisions(
         .apply_proposed_diff(owner.clone(), create)
         .await
         .unwrap();
-    assert_eq!(first, replay);
-    let results = first["results"].as_array().unwrap();
+    assert_eq!(first.result, replay.result);
+    let results = first.result["results"].as_array().unwrap();
     assert_eq!(results[0]["ok"], true);
     assert_eq!(results[1]["ok"], false);
     assert_eq!(results[1]["error"], "path_conflict");
@@ -138,6 +159,8 @@ async fn confirmed_notes_use_fixed_destinations_and_revisions(
     let (additive, _) = pending_note_action(
         fixture,
         personal,
+        provider_id,
+        model_id,
         181,
         "create_note",
         json!({
@@ -151,11 +174,13 @@ async fn confirmed_notes_use_fixed_destinations_and_revisions(
         .apply_proposed_diff(owner.clone(), additive)
         .await
         .unwrap();
-    assert_eq!(additive["outcome"], "created");
+    assert_eq!(additive.result["outcome"], "created");
 
     let (occupied, _) = pending_note_action(
         fixture,
         personal,
+        provider_id,
+        model_id,
         46,
         "create_note",
         json!({
@@ -192,6 +217,8 @@ async fn confirmed_notes_use_fixed_destinations_and_revisions(
     let (displaced, _) = pending_note_action(
         fixture,
         personal,
+        provider_id,
+        model_id,
         50,
         "create_note",
         json!({
@@ -247,6 +274,8 @@ async fn confirmed_notes_use_fixed_destinations_and_revisions(
     let (edit, display) = pending_note_action(
         fixture,
         personal,
+        provider_id,
+        model_id,
         184,
         "edit_note",
         json!({
@@ -255,19 +284,25 @@ async fn confirmed_notes_use_fixed_destinations_and_revisions(
         }),
     )
     .await;
-    assert!(display["unifiedPreview"].is_null());
+    assert!(
+        display["unifiedPreview"]
+            .as_str()
+            .is_some_and(|text| text.contains("+Only if the approved revision is current."))
+    );
     let preview = fixture
         .registry
         .preview_proposed_diff(owner.clone(), edit.clone())
         .await
         .unwrap();
-    let unified = preview["unifiedPreview"].as_str().unwrap();
+    let unified = preview.unified_preview.as_deref().unwrap();
     assert!(unified.contains("Original paragraph."));
     assert!(unified.contains("+Only if the approved revision is current."));
     let missing_move_path = "proposal-corpus/stale-move/nested";
     let (stale_move, _) = pending_note_action(
         fixture,
         personal,
+        provider_id,
+        model_id,
         54,
         "move_note",
         json!({"ref":note, "toFolder":missing_move_path}),
@@ -335,6 +370,8 @@ async fn confirmed_notes_use_fixed_destinations_and_revisions(
 async fn pending_note_action(
     fixture: &RuntimeFixture,
     personal: &SpaceContext,
+    provider: &ProviderResourceId,
+    model_id: &ModelProfileId,
     tag: u8,
     tool: &str,
     arguments: Value,
@@ -415,6 +452,7 @@ async fn pending_note_action(
                     provenance: Some(ChatProvenance::default()),
                     interruption: None,
                     proposed_diff: None,
+                    proposed_effect: None,
                     referenced_notes: vec![],
                     tainted: false,
                 },
@@ -429,8 +467,8 @@ async fn pending_note_action(
             McpInvocationContext {
                 account: AccountContext::new(run_auth, budget()),
                 target: EgressTarget::InAppProvider {
-                    provider: ProviderResourceId::from_bytes([1; 16]),
-                    model: ModelProfileId::from_bytes([1; 16]),
+                    provider: provider.clone(),
+                    model: model_id.clone(),
                     primary_project: None,
                 },
                 request_key: key.clone(),
@@ -464,6 +502,7 @@ async fn pending_note_action(
                     provenance: Some(result.provenance.clone()),
                     interruption: None,
                     proposed_diff: Some(proposal.envelope().to_owned()),
+                    proposed_effect: Some(proposal.effect()),
                     referenced_notes: vec![],
                     tainted: true,
                 },

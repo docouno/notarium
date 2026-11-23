@@ -39,6 +39,7 @@ fn proposal_class(class: DocClass) -> Result<(), PortError> {
 
 pub(in crate::mcp) async fn plan_links(
     call: &ToolCallContext<'_>,
+    provider: &ToolCallContext<'_>,
     name: ToolName,
     args: Value,
 ) -> Result<Vec<ProposalLink>, PortError> {
@@ -56,7 +57,25 @@ pub(in crate::mcp) async fn plan_links(
     for link in links {
         let attempted = async {
             let source = NoteId::parse(&link.source)?;
-            let plan = plan_link(call, source, &link.edge, true).await?;
+            let (provider_scope, provider_note) = corpus::locate_note(provider, &source)
+                .await
+                .map_err(|error| {
+                    if corpus::hidden(&error) {
+                        DomainError::ResourceNotFound.into()
+                    } else {
+                        error
+                    }
+                })?;
+            corpus::admit_provider_note_read(provider, &provider_scope, &provider_note)
+                .await
+                .map_err(|error| {
+                    if corpus::hidden(&error) {
+                        DomainError::ResourceNotFound.into()
+                    } else {
+                        error
+                    }
+                })?;
+            let plan = plan_link(call, Some(provider), source, &link.edge, true).await?;
             let scope = call.space(plan.scope.clone())?;
             proposal_class(authorize(call, &scope, &plan).await?)?;
             let revision = plan

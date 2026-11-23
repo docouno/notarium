@@ -351,7 +351,7 @@ async fn purge_note_inner(
     space_rec.scope.check(ctx.scope())?;
 
     let fp = format!("purge_note={}", request.input.note.as_str());
-    let idemp = derive_command_identity_spec(&request.identity, "purge_note", fp.as_bytes())
+    let idemp = derive_command_identity_spec(&ctx, &request.identity, "purge_note", fp.as_bytes())
         .with_preconditions(&request.preconditions, "note", request.input.note.as_str())
         .for_note(ctx.auth(), &request.input.note);
 
@@ -418,6 +418,10 @@ async fn purge_note_inner(
                     ));
                 }
 
+                let cover_folders =
+                    super::folder_cover::find_cover_folders(tx, &scope.space_id, &old_note).await?;
+                let (_first_seq, visibility_seq) =
+                    item_ctx.preview_seq_range(1 + cover_folders.len() as u64)?;
                 let purge_seq = item_ctx.alloc_next_seq()?;
                 let tombstone_rev = new_revision_id()?;
                 let purge_id = new_prefixed_hex_id("prg_")?;
@@ -440,12 +444,12 @@ async fn purge_note_inner(
                 .await?;
 
                 let run_opt = extract_agent_run_from_auth(&auth);
-                super::folder_cover::clear_purged(
+                let cover_events = super::folder_cover::clear_folders(
                     tx,
+                    item_ctx,
                     &scope,
-                    &old_note,
-                    purge_seq,
-                    purge_seq,
+                    &cover_folders,
+                    visibility_seq,
                     auth.principal(),
                     run_opt.as_ref(),
                     now_ts,
@@ -458,13 +462,13 @@ async fn purge_note_inner(
                         run_id,
                         auth.principal(),
                         purge_seq,
-                        purge_seq,
+                        visibility_seq,
                         now_ts,
                     )
                     .await?;
                 }
 
-                let receipt = MutationReceiptToken::new(scope.clone(), purge_seq)?;
+                let receipt = MutationReceiptToken::new(scope.clone(), visibility_seq)?;
                 let stored_resp = StoredCommittedNoteRevV1 {
                     value: NoteRevision {
                         note: old_note.clone(),
@@ -482,7 +486,7 @@ async fn purge_note_inner(
                     &old_note,
                     None,
                     None,
-                    purge_seq,
+                    visibility_seq,
                     &retirement_ids,
                     &sanitized_bytes,
                     now_ms,
@@ -498,23 +502,27 @@ async fn purge_note_inner(
                         actor_id: idemp_cl.actor.as_str().to_owned(),
                         idempotency_key: idemp_cl.command_key.as_str().to_owned(),
                         old_note_id: old_note.clone(),
-                        canonical_seq: purge_seq,
+                        canonical_seq: visibility_seq,
                         retirement_ids,
                     });
+
+                let mut events = Vec::with_capacity(1 + cover_events.len());
+                events.push(BatchEventDraft {
+                    space_seq: purge_seq,
+                    entity_type: "note".to_owned(),
+                    entity_id: old_note.as_str().to_owned(),
+                    op_kind: "purge".to_owned(),
+                    rev_id: tombstone_rev,
+                    lifecycle: Lifecycle::Purged,
+                    doc_class: Some(old_head.doc_class),
+                });
+                events.extend(cover_events);
 
                 let cmd_id = new_prefixed_hex_id("cmd_")?;
                 Ok(ItemCommitArtifacts {
                     command_id: cmd_id,
                     command_kind: "purge_note".to_owned(),
-                    events: vec![BatchEventDraft {
-                        space_seq: purge_seq,
-                        entity_type: "note".to_owned(),
-                        entity_id: old_note.as_str().to_owned(),
-                        op_kind: "purge".to_owned(),
-                        rev_id: tombstone_rev,
-                        lifecycle: Lifecycle::Purged,
-                        doc_class: Some(old_head.doc_class),
-                    }],
+                    events,
                     change_payload: None,
                     receipt_detail_blob: None,
                     receipt_sanitized_blob: sanitized_bytes.clone(),
@@ -646,6 +654,7 @@ pub(crate) async fn mint_and_purge_impl(
     fp_hasher.update(&[0]);
     fp_hasher.update(encrypted_digest.as_bytes());
     let idemp = derive_command_identity_spec(
+        &ctx,
         &request.identity,
         "mint_and_purge",
         fp_hasher.finalize().as_bytes(),
@@ -874,8 +883,12 @@ pub(crate) async fn mint_and_purge_impl(
                     .into());
                 }
 
-                // Preview 2 contiguous SpaceSeq allocations (`purge_seq`, `create_seq`).
-                let _ = item_ctx.preview_seq_range(2)?;
+                let cover_folders =
+                    super::folder_cover::find_cover_folders(tx, &scope.space_id, &input.old_note)
+                        .await?;
+                // Preview contiguous SpaceSeq allocations (`purge_seq`, `create_seq`, and cleared folder covers).
+                let (_first_seq, visibility_seq) =
+                    item_ctx.preview_seq_range(2 + cover_folders.len() as u64)?;
                 let purge_seq = item_ctx.alloc_next_seq()?;
                 let create_seq = item_ctx.alloc_next_seq()?;
                 let tombstone_rev = new_revision_id()?;
@@ -922,6 +935,7 @@ pub(crate) async fn mint_and_purge_impl(
                 let succ_title = succ_slug.clone();
                 let succ_title_fold = normalize_title_key(&succ_title);
                 let create_i64 = create_seq.get() as i64;
+                let vis_i64 = visibility_seq.get() as i64;
                 let enc_class_str = doc_class_to_db(DocClass::EncryptedNote);
 
                 match tx {
@@ -947,7 +961,7 @@ pub(crate) async fn mint_and_purge_impl(
                         .bind(encrypted_digest.as_bytes().as_slice())
                         .bind(encrypted_byte_size as i64)
                         .bind(create_i64)
-                        .bind(create_i64)
+                        .bind(vis_i64)
                         .bind(sec)
                         .bind(nsec)
                         .bind(sec)
@@ -967,7 +981,7 @@ pub(crate) async fn mint_and_purge_impl(
                                 content_blake3, byte_size, lifecycle_state, visibility_mask,
                                 settlement_successor_id, created_seq, updated_seq,
                                 created_at_sec, created_at_nsec, updated_at_sec, updated_at_nsec, last_actor_id
-                             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, $9, $10, $11, 'active', 0, NULL, $12, $12, $13, $14, $13, $14, $15)",
+                             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, $9, $10, $11, 'active', 0, NULL, $12, $13, $14, $15, $14, $15, $16)",
                         )
                         .bind(scope.space_id.as_str())
                         .bind(input.new_note.as_str())
@@ -981,6 +995,7 @@ pub(crate) async fn mint_and_purge_impl(
                         .bind(encrypted_digest.as_bytes().as_slice())
                         .bind(encrypted_byte_size as i64)
                         .bind(create_i64)
+                        .bind(vis_i64)
                         .bind(sec)
                         .bind(nsec)
                         .bind(auth.principal().as_str())
@@ -1024,7 +1039,7 @@ pub(crate) async fn mint_and_purge_impl(
                     "note",
                     input.new_note.as_str(),
                     create_seq,
-                    create_seq,
+                    visibility_seq,
                     None,
                     None,
                     Some(encrypted_digest),
@@ -1035,12 +1050,12 @@ pub(crate) async fn mint_and_purge_impl(
                 )
                 .await?;
 
-                super::folder_cover::clear_purged(
+                let cover_events = super::folder_cover::clear_folders(
                     tx,
+                    item_ctx,
                     &scope,
-                    &input.old_note,
-                    purge_seq,
-                    create_seq,
+                    &cover_folders,
+                    visibility_seq,
                     auth.principal(),
                     run_opt.as_ref(),
                     now_ts,
@@ -1052,8 +1067,8 @@ pub(crate) async fn mint_and_purge_impl(
                         &scope,
                         run_id,
                         auth.principal(),
-                        create_seq,
-                        create_seq,
+                        purge_seq,
+                        visibility_seq,
                         now_ts,
                     )
                     .await?;
@@ -1061,7 +1076,7 @@ pub(crate) async fn mint_and_purge_impl(
 
                 let cmd_id = new_prefixed_hex_id("cmd_")?;
                 let payload_id = format!("eff:{cmd_id}");
-                let range = notarium_core::ports::CommandSeqRange::new(purge_seq, create_seq)?;
+                let range = notarium_core::ports::CommandSeqRange::new(purge_seq, visibility_seq)?;
                 // Effect payload references ONLY `new_note`, never `old_note`!
                 let cp = build_effect_payload_draft(
                     payload_id,
@@ -1081,7 +1096,7 @@ pub(crate) async fn mint_and_purge_impl(
                     vec![input.new_note.clone()],
                 )?;
 
-                let receipt = MutationReceiptToken::new(scope.clone(), create_seq)?;
+                let receipt = MutationReceiptToken::new(scope.clone(), visibility_seq)?;
                 let stored_resp = StoredCommittedMintAndPurgeV1 {
                     old_note: input.old_note.clone(),
                     new_note: NoteRevision {
@@ -1100,7 +1115,7 @@ pub(crate) async fn mint_and_purge_impl(
                     &input.old_note,
                     Some(&input.new_note),
                     Some(&new_note_rev),
-                    create_seq,
+                    visibility_seq,
                     &retirement_ids,
                     &sanitized_bytes,
                     now_ms,
@@ -1116,33 +1131,35 @@ pub(crate) async fn mint_and_purge_impl(
                         actor_id: idemp_cl.actor.as_str().to_owned(),
                         idempotency_key: idemp_cl.command_key.as_str().to_owned(),
                         old_note_id: input.old_note.clone(),
-                        canonical_seq: create_seq,
+                        canonical_seq: visibility_seq,
                         retirement_ids,
                     });
+
+                let mut events = Vec::with_capacity(2 + cover_events.len());
+                events.push(BatchEventDraft {
+                    space_seq: purge_seq,
+                    entity_type: "note".to_owned(),
+                    entity_id: input.old_note.as_str().to_owned(),
+                    op_kind: "purge".to_owned(),
+                    rev_id: tombstone_rev,
+                    lifecycle: Lifecycle::Purged,
+                    doc_class: Some(old_head.doc_class),
+                });
+                events.push(BatchEventDraft {
+                    space_seq: create_seq,
+                    entity_type: "note".to_owned(),
+                    entity_id: input.new_note.as_str().to_owned(),
+                    op_kind: "create".to_owned(),
+                    rev_id: new_note_rev,
+                    lifecycle: Lifecycle::Active,
+                    doc_class: Some(DocClass::EncryptedNote),
+                });
+                events.extend(cover_events);
 
                 Ok(ItemCommitArtifacts {
                     command_id: cmd_id,
                     command_kind: "mint_and_purge".to_owned(),
-                    events: vec![
-                        BatchEventDraft {
-                            space_seq: purge_seq,
-                            entity_type: "note".to_owned(),
-                            entity_id: input.old_note.as_str().to_owned(),
-                            op_kind: "purge".to_owned(),
-                            rev_id: tombstone_rev,
-                            lifecycle: Lifecycle::Purged,
-                            doc_class: Some(old_head.doc_class),
-                        },
-                        BatchEventDraft {
-                            space_seq: create_seq,
-                            entity_type: "note".to_owned(),
-                            entity_id: input.new_note.as_str().to_owned(),
-                            op_kind: "create".to_owned(),
-                            rev_id: new_note_rev,
-                            lifecycle: Lifecycle::Active,
-                            doc_class: Some(DocClass::EncryptedNote),
-                        },
-                    ],
+                    events,
                     change_payload: Some(cp),
                     receipt_detail_blob: None,
                     receipt_sanitized_blob: sanitized_bytes.clone(),

@@ -11,8 +11,8 @@ use notarium_core::{
     ids::{NoteId, RevisionId, SpaceId},
     model::{HistoryScope, Lifecycle},
     ports::{
-        Committed, GetNote, Link, LinkBatch, LinkTarget, Mutation, NoteSnapshot, Preconditions,
-        SpaceContext,
+        Committed, GetNote, Link, LinkBatch, LinkTarget, Mutation, NoteMetadataSnapshot,
+        Preconditions, SpaceContext,
     },
     receipt::{CausalBasis, CommandIdentity, ReceiptSet},
 };
@@ -144,18 +144,18 @@ pub(in super::super) fn format_link_line(
     }
 }
 
-async fn snapshot(
+async fn metadata_snapshot(
     call: &ToolCallContext<'_>,
     scope: &SpaceContext,
     note: &NoteId,
     revision: Option<RevisionId>,
     receipts: ReceiptSet,
-) -> Result<NoteSnapshot, PortError> {
+) -> Result<NoteMetadataSnapshot, PortError> {
     let expected = revision.clone();
     let found = call
         .registry
         .engine
-        .get_note(
+        .get_note_metadata(
             scope.clone(),
             GetNote {
                 note: note.clone(),
@@ -164,13 +164,13 @@ async fn snapshot(
             },
         )
         .await?;
-    if found.document.reference().space_id != scope.scope().space_id
-        || found.document.reference().note_id != *note
+    if found.metadata.reference().space_id != scope.scope().space_id
+        || found.metadata.reference().note_id != *note
         || expected
             .as_ref()
-            .is_some_and(|rev| found.document.revision() != rev)
-        || found.document.lifecycle() != Lifecycle::Active
-        || found.document.class() == DocClass::EncryptedNote
+            .is_some_and(|rev| found.metadata.revision() != rev)
+        || found.metadata.lifecycle() != Lifecycle::Active
+        || found.metadata.class() == DocClass::EncryptedNote
     {
         return Err(DomainError::ResourceNotFound.into());
     }
@@ -179,6 +179,7 @@ async fn snapshot(
 
 async fn resolve(
     call: &ToolCallContext<'_>,
+    provider: Option<&ToolCallContext<'_>>,
     scope: &SpaceContext,
     to: Option<&str>,
     to_title: Option<&str>,
@@ -191,15 +192,22 @@ async fn resolve(
             let note = NoteId::parse(id)?;
             corpus::note_in_space(call, scope, &note).await?;
             let alias: Result<Option<TargetAlias>, PortError> = async {
-                let current = snapshot(call, scope, &note, None, ReceiptSet::default()).await?;
-                corpus::note_metadata_origin(call, scope, &current).await?;
+                let current =
+                    metadata_snapshot(call, scope, &note, None, ReceiptSet::default()).await?;
+                if let Some(provider) = provider {
+                    let provider_scope = provider.space(scope.scope().clone())?;
+                    corpus::note_metadata_origin(provider, &provider_scope, &current.metadata)
+                        .await?;
+                } else {
+                    corpus::note_metadata_origin(call, scope, &current.metadata).await?;
+                }
                 Ok(current
                     .provenance
                     .as_ref()
                     .filter(|data| valid_title(&data.title))
                     .map(|data| TargetAlias {
                         title: data.title.trim().to_owned(),
-                        revision: current.document.revision().clone(),
+                        revision: current.metadata.revision().clone(),
                     }))
             }
             .await;
@@ -216,28 +224,40 @@ async fn resolve(
 
 pub(in super::super) async fn resolve_target(
     call: &ToolCallContext<'_>,
+    provider: Option<&ToolCallContext<'_>>,
     scope: &SpaceContext,
     to: Option<&str>,
     to_title: Option<&str>,
 ) -> Result<(LinkTarget, Option<String>), PortError> {
-    Ok(resolve(call, scope, to, to_title).await?.link_parts())
+    Ok(resolve(call, provider, scope, to, to_title)
+        .await?
+        .link_parts())
 }
 
 /// Normalize a link without writing. Confirmation can request a source revision
 /// even when the live batch execution normally uses the canonical implicit base.
 pub(in super::super) async fn plan_link(
     call: &ToolCallContext<'_>,
+    provider: Option<&ToolCallContext<'_>>,
     source: NoteId,
     edge: &LinkArgs,
     observe_revision: bool,
 ) -> Result<LinkPlan, PortError> {
     let (scope, note) = corpus::locate_note(call, &source).await?;
-    let target = resolve(call, &scope, edge.to.as_deref(), edge.to_title.as_deref()).await?;
+    corpus::admit_note_write(call, &scope, &note).await?;
+    let target = resolve(
+        call,
+        provider,
+        &scope,
+        edge.to.as_deref(),
+        edge.to_title.as_deref(),
+    )
+    .await?;
     let (link_target, title) = target.link_parts();
     format_link_line(&edge.relation, &link_target, title.as_deref())?;
     let source_snapshot = if observe_revision || matches!(target, Target::Authored { .. }) {
         Some(
-            snapshot(
+            metadata_snapshot(
                 call,
                 &scope,
                 &note.reference.note_id,
@@ -277,7 +297,7 @@ pub(in super::super) async fn plan_link(
         expected_revision: if observe_revision {
             source_snapshot
                 .as_ref()
-                .map(|snapshot| snapshot.document.revision().clone())
+                .map(|snapshot| snapshot.metadata.revision().clone())
         } else {
             None
         },
@@ -292,13 +312,14 @@ async fn authorize(
     plan: &LinkPlan,
 ) -> Result<DocClass, PortError> {
     let source = corpus::note_in_space(call, scope, &plan.source).await?;
+    corpus::admit_note_write(call, scope, &source).await?;
     scope
         .auth()
         .authorize_direct_write(&source.facts, &source.facts)?;
     if let Target::Stable { note, alias } = &plan.target {
         corpus::note_in_space(call, scope, note).await?;
         if let Some(alias) = alias {
-            let current = snapshot(
+            let current = metadata_snapshot(
                 call,
                 scope,
                 note,
@@ -313,7 +334,7 @@ async fn authorize(
             if title != Some(alias.title.as_str()) {
                 return Err(invalid(ValidationReason::SourceMismatch));
             }
-            corpus::note_metadata_origin(call, scope, &current).await?;
+            corpus::note_metadata_origin(call, scope, &current.metadata).await?;
         }
     }
     Ok(source.facts.class)
@@ -330,7 +351,7 @@ async fn render(
         return Err(invalid(ValidationReason::SourceMismatch));
     }
     let info: Result<Value, PortError> = async {
-        let current = snapshot(
+        let current = metadata_snapshot(
             call,
             scope,
             &plan.source,
@@ -338,9 +359,10 @@ async fn render(
             ReceiptSet::new([committed.receipt])?,
         )
         .await?;
-        let (origin, project) = corpus::note_metadata_origin(call, scope, &current).await?;
+        let (origin, project) =
+            corpus::note_metadata_origin(call, scope, &current.metadata).await?;
         call.record_origin(origin, project)?;
-        Ok(json!({"ok": true, "noteId": plan.source, "versionToken": current.document.revision()}))
+        Ok(json!({"ok": true, "noteId": plan.source, "versionToken": current.metadata.revision()}))
     }
     .await;
     match info {
@@ -356,7 +378,7 @@ async fn single(call: &mut ToolCallContext<'_>, input: LinkInput) -> Result<Valu
     let plan = call
         .journal("link-route", || async {
             let source = NoteId::parse(&input.source)?;
-            plan_link(call, source, &input.edge, true).await
+            plan_link(call, None, source, &input.edge, true).await
         })
         .await?;
     let scope = call.space(plan.scope.clone())?;
@@ -388,7 +410,7 @@ async fn many(call: &mut ToolCallContext<'_>, inputs: Vec<LinkInput>) -> Result<
             let plan = call
                 .journal(&label, || async {
                     let source = NoteId::parse(&input.source)?;
-                    plan_link(call, source, &input.edge, false).await
+                    plan_link(call, None, source, &input.edge, false).await
                 })
                 .await?;
             let scope = call.space(plan.scope.clone())?;

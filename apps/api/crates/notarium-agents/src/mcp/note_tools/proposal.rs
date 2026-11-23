@@ -20,8 +20,8 @@ use serde_json::{Value, json};
 use super::{
     EgressTarget, MoveInput, NoteInput, NoteRoute, RenameInput, ToolCallContext, ToolName,
     authorize_note_write, clean_path, corpus, create, decode, edit::EditInput, folder_base,
-    generated_slug, invalid, note_slug, observe_note, preconditions, receipt_result, relative_to,
-    snapshot, validated_title,
+    generated_slug, invalid, metadata_snapshot, note_slug, observe_note, preconditions,
+    receipt_result, snapshot, validated_title,
 };
 
 pub(in crate::mcp) type ConfirmedStep<'a> = dyn Fn(&HistoryScope, &'static str, u16) -> Result<(SpaceContext, CommandIdentity), PortError>
@@ -128,7 +128,7 @@ pub(in crate::mcp) async fn describe_proposal(
     if matches!(action, PreparedNoteAction::Edit { .. }) {
         return Ok(change);
     }
-    let before = snapshot(
+    let before = metadata_snapshot(
         reviewer,
         &scope,
         &route.note,
@@ -136,7 +136,7 @@ pub(in crate::mcp) async fn describe_proposal(
         CausalBasis::Await(Default::default()),
     )
     .await?;
-    corpus::note_metadata(reviewer, &scope, &before.document.metadata()).await?;
+    corpus::note_metadata(reviewer, &scope, &before.metadata).await?;
     let metadata = before
         .provenance
         .ok_or_else(|| invalid(ValidationReason::NotReady))?;
@@ -179,7 +179,12 @@ pub(in crate::mcp) async fn preview_proposal(
         )
         .await?;
         let original = corpus::note_document(viewer, &scope, &before.document).await?;
-        let plan = input.plan(&original, before.document.class(), route)?;
+        let schema = if input.edits_view() {
+            viewer.registry.engine.space_schema(scope.clone()).await?
+        } else {
+            std::collections::BTreeMap::new()
+        };
+        let plan = input.plan(&original, before.document.class(), route, &schema)?;
         let updated = notarium_syntax::patch::apply(&original, &plan)?;
         Ok(unified_preview(&original, &updated))
     }
@@ -439,13 +444,14 @@ impl Destination {
 
 pub(in crate::mcp) async fn plan_proposal(
     owner: &ToolCallContext<'_>,
+    provider: &ToolCallContext<'_>,
     tool: ToolName,
     arguments: Value,
 ) -> Result<PreparedNoteAction, PortError> {
     Ok(match tool {
-        ToolName::CreateNote | ToolName::CreateNotes => {
-            PreparedNoteAction::Create(create::proposal::prepare(owner, tool, arguments).await?)
-        }
+        ToolName::CreateNote | ToolName::CreateNotes => PreparedNoteAction::Create(
+            create::proposal::prepare(owner, provider, tool, arguments).await?,
+        ),
         ToolName::EditNote => {
             let input: EditInput = decode(arguments)?;
             input.validate()?;
@@ -460,7 +466,12 @@ pub(in crate::mcp) async fn plan_proposal(
             )
             .await?;
             let original = ClassEgressFence::mcp_note(&before.document, scope.auth())?;
-            input.plan(original, before.document.class(), &route)?;
+            let schema = if input.edits_view() {
+                owner.registry.engine.space_schema(scope.clone()).await?
+            } else {
+                std::collections::BTreeMap::new()
+            };
+            input.plan(original, before.document.class(), &route, &schema)?;
             PreparedNoteAction::Edit { route, input }
         }
         ToolName::DeleteNote => {
@@ -472,7 +483,7 @@ pub(in crate::mcp) async fn plan_proposal(
             let input: MoveInput = decode(arguments)?;
             let route = observe_note(owner, &input.target.note, None).await?;
             let scope = owner.space(route.scope.clone())?;
-            let before = snapshot(
+            let before = metadata_snapshot(
                 owner,
                 &scope,
                 &route.note,
@@ -480,8 +491,8 @@ pub(in crate::mcp) async fn plan_proposal(
                 CausalBasis::Await(Default::default()),
             )
             .await?;
-            let slug = note_slug(&before)?;
-            let class = before.document.class();
+            let slug = note_slug(before.provenance.as_ref())?;
+            let class = before.metadata.class();
             let base = scope
                 .auth()
                 .spaces()
@@ -490,11 +501,28 @@ pub(in crate::mcp) async fn plan_proposal(
             let path = clean_path(&input.to_folder)?;
             let path = if let Some(base) = &base {
                 let root = folder_base(owner, &scope, base).await?;
-                relative_to(&path, &root.path).ok_or(DomainError::SpaceReadOnly)?
+                corpus::strip_folder_prefix(&path, &root.path).ok_or(DomainError::SpaceReadOnly)?
             } else {
                 path
             };
             let destination = observe_destination(owner, &scope, base, &path, class).await?;
+            let provider_scope = provider.space(route.scope.clone())?;
+            let dest_project = folder_base(owner, &scope, &destination.anchor.folder_id)
+                .await?
+                .project
+                .map(|folder_id| FolderRef {
+                    space_id: route.scope.space_id.clone(),
+                    folder_id,
+                });
+            corpus::admit_folder_write(
+                provider,
+                &provider_scope,
+                &destination.anchor,
+                dest_project,
+                &destination.ancestors,
+                class,
+            )
+            .await?;
             PreparedNoteAction::Move {
                 route,
                 destination,
@@ -507,7 +535,7 @@ pub(in crate::mcp) async fn plan_proposal(
             let title = validated_title(&input.title)?;
             let route = observe_note(owner, &input.target.note, None).await?;
             let scope = owner.space(route.scope.clone())?;
-            let before = snapshot(
+            let before = metadata_snapshot(
                 owner,
                 &scope,
                 &route.note,
@@ -545,7 +573,7 @@ pub(super) async fn assert_absent_id(
         Err(PortError::Domain(DomainError::ResourceNotFound)) => Ok(()),
         Err(error) => Err(error),
         Ok(_) => {
-            let current = snapshot(
+            let current = metadata_snapshot(
                 call,
                 scope,
                 note,
@@ -554,7 +582,7 @@ pub(super) async fn assert_absent_id(
             )
             .await?;
             Err(DomainError::RevisionConflict {
-                current: current.document.revision().clone(),
+                current: current.metadata.revision().clone(),
                 lineage: None,
             }
             .into())
@@ -581,7 +609,12 @@ pub(in crate::mcp) async fn apply_proposal(
             )
             .await?;
             let original = ClassEgressFence::mcp_note(&before.document, scope.auth())?;
-            let plan = input.plan(original, before.document.class(), &route)?;
+            let schema = if input.edits_view() {
+                owner.registry.engine.space_schema(scope.clone()).await?
+            } else {
+                std::collections::BTreeMap::new()
+            };
+            let plan = input.plan(original, before.document.class(), &route, &schema)?;
             let result = owner
                 .registry
                 .engine

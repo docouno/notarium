@@ -330,17 +330,50 @@ impl ControlService {
             && row.destination_placement == placement(&destination.placement)?)
     }
 
-    pub(super) async fn has_ability_binding(
+    pub(super) async fn ability_admitted_for_provider(
         &self,
         tx: &mut Transaction,
         identity: &AbilityIdentity,
+        effective_project: Option<&FolderRef>,
+        requires_explicit_binding: bool,
     ) -> Result<bool, PortError> {
         let key = placement(&identity.placement)?;
-        let row = rows!(tx,(i64,),fetch_optional,
-            "SELECT CAST(1 AS BIGINT) FROM ability_availability WHERE placement=$1 AND ability_id=$2",
-            "SELECT CAST(1 AS BIGINT) FROM v1_control.ability_availability WHERE placement=$1 AND ability_id=$2";
-            &key,identity.id.as_str())?;
-        Ok(row.is_some())
+        let row = rows!(
+            tx,
+            AbilityAvailabilityRow,
+            fetch_optional,
+            "SELECT * FROM ability_availability WHERE placement=$1 AND ability_id=$2",
+            "SELECT * FROM v1_control.ability_availability WHERE placement=$1 AND ability_id=$2";
+            &key,
+            identity.id.as_str()
+        )?;
+        let Some(row) = row else {
+            return Ok(!requires_explicit_binding);
+        };
+        if row.enabled != 1 {
+            return Ok(false);
+        }
+        match row.mode.as_str() {
+            "all-projects" => Ok(true),
+            "selected-projects" => {
+                let Some(project) = effective_project else {
+                    return Ok(false);
+                };
+                Ok(rows!(
+                    tx,
+                    AbilityProjectBindingsRow,
+                    fetch_optional,
+                    "SELECT * FROM ability_project_bindings WHERE placement=$1 AND ability_id=$2 AND target_space=$3 AND project_id=$4",
+                    "SELECT * FROM v1_control.ability_project_bindings WHERE placement=$1 AND ability_id=$2 AND target_space=$3 AND project_id=$4";
+                    &key,
+                    identity.id.as_str(),
+                    project.space_id.as_str(),
+                    project.folder_id.as_str()
+                )?
+                .is_some())
+            }
+            _ => Err(invalid(ValidationReason::InvalidState)),
+        }
     }
     async fn select_overlaid_winner(
         &self,
@@ -779,13 +812,8 @@ impl ControlService {
         query: &AbilityQuery,
     ) -> Result<ContentDigest, PortError> {
         let owner = user_read(tx, ctx.auth().principal().as_str()).await?;
-        let mut revisions = Vec::with_capacity(ctx.auth().spaces().len());
-        for space in ctx.auth().spaces().keys() {
-            revisions.push((
-                space,
-                super::spaces::admission(tx, space, false).await?.revision,
-            ));
-        }
+        let spaces: Vec<&SpaceId> = ctx.auth().spaces().keys().collect();
+        let revisions = super::spaces::admission_revisions(tx, &spaces).await?;
         digest(
             ctx.auth(),
             (
@@ -798,6 +826,68 @@ impl ControlService {
                 query.authoring,
             ),
         )
+    }
+    async fn validate_listed_ability(
+        &self,
+        ctx: &AccountContext,
+        candidate: AbilityDescriptor,
+        checked_spaces: &mut BTreeSet<SpaceId>,
+        checked_projects: &mut BTreeSet<(SpaceId, FolderId)>,
+    ) -> Result<Option<AbilityDescriptor>, PortError> {
+        if valid_name(&candidate.name).is_err()
+            || candidate.auxiliary_files.len() > MAX_ABILITY_AUX_FILES
+            || candidate.auxiliary_files.iter().any(|name| {
+                name.is_empty() || name.len() > MAX_ABILITY_AUX_PATH_BYTES || name.contains('\0')
+            })
+        {
+            return Err(invalid(ValidationReason::InvalidState));
+        }
+        if candidate.lifecycle != Lifecycle::Active {
+            return Ok(None);
+        }
+        match &candidate.reference.placement {
+            AbilityPlacement::System => {
+                if candidate.entrypoint.is_some() {
+                    return Err(invalid(ValidationReason::InvalidState));
+                }
+            }
+            AbilityPlacement::OwnedSpace(space) => {
+                let entrypoint = candidate
+                    .entrypoint
+                    .as_ref()
+                    .ok_or_else(|| invalid(ValidationReason::InvalidState))?;
+                if &entrypoint.space_id != space {
+                    return Err(invalid(ValidationReason::InvalidState));
+                }
+            }
+            AbilityPlacement::OwnedProject(project) => {
+                let entrypoint = candidate
+                    .entrypoint
+                    .as_ref()
+                    .ok_or_else(|| invalid(ValidationReason::InvalidState))?;
+                if entrypoint.space_id != project.space_id {
+                    return Err(invalid(ValidationReason::InvalidState));
+                }
+            }
+            AbilityPlacement::OwnedPersonal(_) => {
+                if candidate.entrypoint.is_none() {
+                    return Err(invalid(ValidationReason::InvalidState));
+                }
+            }
+        }
+        match self
+            .ability_placement_cached(
+                ctx,
+                &candidate.reference.placement,
+                checked_spaces,
+                checked_projects,
+            )
+            .await
+        {
+            Ok(()) => Ok(Some(candidate)),
+            Err(error) if hidden(&error) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
     pub async fn discover_abilities(
         &self,
@@ -825,7 +915,6 @@ impl ControlService {
                 async {
                     let mut checked_spaces = BTreeSet::new();
                     let mut checked_projects = BTreeSet::new();
-                    let mut raw_cache = BTreeMap::new();
                     if let Some(project) = &query.project {
                         self.catalog_project(&current, project).await?;
                         checked_projects
@@ -889,20 +978,16 @@ impl ControlService {
                             continue;
                         }
                         let Some(value) = self
-                            .raw_ability_cached(
+                            .validate_listed_ability(
                                 &current,
-                                candidate.reference.identity(),
+                                candidate,
                                 &mut checked_spaces,
                                 &mut checked_projects,
-                                &mut raw_cache,
                             )
                             .await?
                         else {
                             continue;
                         };
-                        if value.reference != candidate.reference {
-                            continue;
-                        }
                         page_candidates.push(value);
                     }
                     let mut by_name_candidates: BTreeMap<String, Vec<AbilityDescriptor>> =
@@ -946,23 +1031,16 @@ impl ControlService {
                                             continue;
                                         }
                                         let Some(actual) = self
-                                            .raw_ability_cached(
+                                            .validate_listed_ability(
                                                 &current,
-                                                candidate.reference.identity(),
+                                                candidate,
                                                 &mut checked_spaces,
                                                 &mut checked_projects,
-                                                &mut raw_cache,
                                             )
                                             .await?
                                         else {
                                             continue;
                                         };
-                                        if actual.reference != candidate.reference {
-                                            continue;
-                                        }
-                                        if actual.name != candidate.name {
-                                            return Err(invalid(ValidationReason::InvalidState));
-                                        }
                                         by_name_candidates
                                             .entry(actual.name.clone())
                                             .or_default()
@@ -1003,23 +1081,16 @@ impl ControlService {
                                             continue;
                                         }
                                         let Some(actual) = self
-                                            .raw_ability_cached(
+                                            .validate_listed_ability(
                                                 &current,
-                                                candidate.reference.identity(),
+                                                candidate,
                                                 &mut checked_spaces,
                                                 &mut checked_projects,
-                                                &mut raw_cache,
                                             )
                                             .await?
                                         else {
                                             continue;
                                         };
-                                        if actual.reference != candidate.reference {
-                                            continue;
-                                        }
-                                        if actual.name != item.name {
-                                            return Err(invalid(ValidationReason::InvalidState));
-                                        }
                                         group.push(actual);
                                     }
                                     by_name_candidates.insert(item.name.clone(), group);

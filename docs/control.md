@@ -559,10 +559,12 @@ A repeated accepted intent reports its existing call state, even after configura
 changes; different input rejects the reused key. No stream is replayed or resent.
 After reservation, the service rechecks current authority/configuration/consent,
 changes intent to sending and acquires its live registration in one SQL transaction.
-SQLite pins the participating canonical Spaces through dispatch. It releases the
-database writer after reading their metadata, so unrelated Spaces can commit
-while a provider is still sending its response headers. Restore waits for
-outstanding disclosures before switching generations.
+Canonical egress pins the participating Spaces while revalidating sources,
+encoding the request body, and starting the outbound transport; `mark_dispatched`
+releases the canonical Space locks and cleanly rolls back the PostgreSQL
+disclosure read transaction before waiting on upstream response headers (TTFB),
+while `RevocationHub` cancels in-flight HTTP calls on concurrent revocation.
+Restore waits for outstanding disclosures before switching generations.
 The transport handle exists before awaiting response headers. Shutdown acknowledgement
 precedes release of canonical/registry leases and the independent five-second audit
 finalizer. `ProviderConfig.max_active_calls` (default 64 per `ProviderService`

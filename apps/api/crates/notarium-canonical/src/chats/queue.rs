@@ -95,6 +95,9 @@ pub(super) async fn claim(
     ctx: SpaceContext,
     request: ClaimChatRun,
 ) -> Result<ClaimChatRunOutcome, PortError> {
+    if ctx.confirmed_chat_step().is_some() {
+        return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
+    }
     forbid_keeper_chat_mutation(ctx.auth())?;
     if ctx.auth().kind() != &PrincipalKind::AgentRun(request.run.clone()) {
         return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
@@ -220,6 +223,9 @@ pub(super) async fn finish(
     request: ChatRunRequest,
     recover: bool,
 ) -> Result<FinishChatRunOutcome, PortError> {
+    if ctx.confirmed_chat_step().is_some() {
+        return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
+    }
     forbid_keeper_chat_mutation(ctx.auth())?;
     let authenticated = if recover {
         ctx.auth().kind() == &PrincipalKind::DirectHuman
@@ -360,21 +366,28 @@ pub(super) async fn dismiss_pending(
     ctx: SpaceContext,
     request: DismissPending,
 ) -> Result<bool, PortError> {
+    if ctx.confirmed_chat_step().is_some() {
+        return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
+    }
     forbid_keeper_chat_mutation(ctx.auth())?;
     let deadline = crate::domain::common::CommandDeadline::start(&ctx.budget, "dismiss_chat_input");
     let budget = ctx.budget.clone();
     let owned = store.clone();
+    let effect = ctx.canonical_effect().cloned();
     store
-        .with_auxiliary_command(
+        .with_guarded_auxiliary_command(
             ctx.scope().space_id.clone(),
+            None,
             Some((&budget, deadline)),
+            effect,
             |(changed, cleanup)| {
                 drop(cleanup);
                 Ok(changed)
             },
-            move |tx| {
+            move |tx, effect| {
                 Box::pin(async move {
                     let space = lock_space(&owned, tx, &ctx).await?;
+                    effect.begin().await?;
                     authorize_chat_write_on_space(ctx.auth(), &space.space)?;
                     let thread =
                         load_thread_head_tx(tx, &space.scope.space_id, &request.thread).await?;

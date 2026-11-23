@@ -6,7 +6,7 @@ use notarium_core::{
     error::PortError,
     ids::{AgentRunId, ChatThreadId, FolderId, JobId, NoteId, ThreadEntrySeq},
     model::{HistoryScope, NoteRef},
-    ports::{CanonicalEffectAdmission, LinkTarget, ResolvedMemoryTarget, SpaceContext},
+    ports::{CanonicalEffectAdmission, LinkTarget, ResolvedMemoryTarget},
 };
 
 use super::CommandIdentitySpec;
@@ -55,15 +55,14 @@ pub(crate) struct UnboundCommand(
 );
 
 impl UnboundCommand {
-    pub(crate) fn new(spec: CommandIdentitySpec) -> Self {
-        Self(spec, None)
+    pub(crate) fn new(
+        spec: CommandIdentitySpec,
+        canonical_effect: Option<CanonicalEffectAdmission>,
+    ) -> Self {
+        Self(spec, canonical_effect)
     }
 
-    pub(crate) fn with_canonical_effect(mut self, ctx: &SpaceContext) -> Self {
-        self.1 = ctx.canonical_effect().cloned();
-        self
-    }
-
+    #[cfg(test)]
     pub(crate) fn command_hash(&self) -> notarium_core::ids::ContentDigest {
         self.0.command_hash
     }

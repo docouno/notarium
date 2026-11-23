@@ -119,37 +119,15 @@ impl ControlPort for ControlPlane {
     ) -> PortFuture<'_, ControlCommit<EpisodeStartResult>> {
         Box::pin(self.control.start_or_resume_episode(ctx, request))
     }
-    fn start_agent_episode(
-        &self,
-        ctx: AccountContext,
-        request: AccountMutation<StartEpisode>,
-    ) -> PortFuture<'_, ControlCommit<EpisodeStartResult>> {
-        Box::pin(self.control.start_or_resume_episode_under_guard(
-            ctx,
-            request,
-            super::episodes::EpisodeGuard::Target,
-        ))
-    }
     fn get_episode(&self, ctx: AccountContext, episode: EpisodeId) -> PortFuture<'_, AgentEpisode> {
         Box::pin(self.control.get_episode(ctx, episode))
     }
     fn update_episode(
         &self,
         ctx: AccountContext,
-        request: AccountMutation<EpisodeUpdate>,
+        request: AccountMutation<EpisodeMutation>,
     ) -> PortFuture<'_, ControlCommit<AgentEpisode>> {
         Box::pin(self.control.update_episode(ctx, request))
-    }
-    fn bind_episode_role(
-        &self,
-        ctx: AccountContext,
-        request: AccountMutation<EpisodeUpdate>,
-    ) -> PortFuture<'_, ControlCommit<AgentEpisode>> {
-        Box::pin(self.control.update_episode_under_guard(
-            ctx,
-            request,
-            super::episodes::EpisodeGuard::Target,
-        ))
     }
     fn touch_episode(&self, ctx: AccountContext, episode: EpisodeId) -> PortFuture<'_, ()> {
         Box::pin(self.control.touch_episode(ctx, episode))
@@ -205,46 +183,22 @@ impl ControlPort for ControlPlane {
         &self,
         ctx: AccountContext,
         request: AccountMutation<AbilityBindingUpdate>,
-    ) -> PortFuture<'_, ControlCommit<AbilityDescriptor>> {
+    ) -> PortFuture<'_, ControlCommit<AbilityBindingResult>> {
         Box::pin(self.control.update_ability_binding(ctx, request))
     }
     fn set_ability_preference(
         &self,
         ctx: AccountContext,
-        request: AccountMutation<AbilityPreferenceUpdate>,
+        request: AccountMutation<AbilityPreferenceChange>,
     ) -> PortFuture<'_, ControlCommit<AbilityPreferenceUpdate>> {
         Box::pin(self.control.set_ability_preference(ctx, request))
     }
     fn set_ability_trail(
         &self,
         ctx: AccountContext,
-        request: AccountMutation<AbilityTrailUpdate>,
-    ) -> PortFuture<'_, ControlCommit<AbilityTrailUpdate>> {
+        request: AccountMutation<AbilityTrailMutation>,
+    ) -> PortFuture<'_, ControlCommit<AbilityTrailResult>> {
         Box::pin(self.control.set_ability_trail(ctx, request))
-    }
-    fn compare_authored_ability_binding(
-        &self,
-        ctx: AccountContext,
-        request: AccountMutation<AbilityBindingChange>,
-    ) -> PortFuture<'_, ControlCommit<AbilityRef>> {
-        Box::pin(self.control.compare_authored_ability_binding(ctx, request))
-    }
-    fn compare_authored_ability_preference(
-        &self,
-        ctx: AccountContext,
-        request: AccountMutation<AbilityPreferenceChange>,
-    ) -> PortFuture<'_, ControlCommit<AbilityPreferenceUpdate>> {
-        Box::pin(
-            self.control
-                .compare_authored_ability_preference(ctx, request),
-        )
-    }
-    fn adopt_authored_ability_promotion(
-        &self,
-        ctx: AccountContext,
-        request: AccountMutation<AdoptAbilityPromotion>,
-    ) -> PortFuture<'_, ControlCommit<AbilityPromotionResult>> {
-        Box::pin(self.control.adopt_authored_ability_promotion(ctx, request))
     }
     fn lookup_mcp_dedup(
         &self,
@@ -253,16 +207,12 @@ impl ControlPort for ControlPlane {
     ) -> PortFuture<'_, Option<McpDedupHit>> {
         Box::pin(self.control.lookup_mcp_dedup(ctx, key))
     }
-    fn record_mcp_dedup(&self, ctx: AccountContext, record: McpDedupRecord) -> PortFuture<'_, ()> {
-        Box::pin(self.control.record_mcp_dedup(ctx, record))
-    }
-    fn resolve_memory_target(
+    fn record_mcp_dedup(
         &self,
         ctx: AccountContext,
-        target: MemoryTarget,
-        category: String,
-    ) -> PortFuture<'_, ResolvedMemoryTarget> {
-        Box::pin(self.control.resolve_memory_target(ctx, target, category))
+        record: McpDedupRecord,
+    ) -> PortFuture<'_, McpDedupHit> {
+        Box::pin(self.control.record_mcp_dedup(ctx, record))
     }
     fn inspect_memory_target(
         &self,

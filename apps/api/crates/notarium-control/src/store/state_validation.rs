@@ -23,6 +23,9 @@ fn canonical<T: DeserializeOwned + Serialize>(s: &str) -> Result<T, PortError> {
 }
 
 fn skill_pins(value: &str) -> Result<(), PortError> {
+    if value.len() > 65_536 {
+        return Err(invalid(ValidationReason::InvalidState));
+    }
     let refs: Vec<AbilityRef> = parse(value)?;
     if refs.len() > MAX_ATTACHED_SKILLS
         || refs.iter().enumerate().any(|(index, reference)| {

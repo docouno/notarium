@@ -2,7 +2,7 @@
 mod address;
 mod delta;
 
-use super::{EgressTarget, ToolCallContext, ToolName, ability_tools, decode, invalid};
+use super::{EgressTarget, ToolCallContext, ToolName, ability_tools, corpus, decode, invalid};
 use address::visible_projects;
 pub(super) use address::{
     project_for_folder, readable_space, readable_spaces, resolve_project, resolve_space, space,
@@ -17,9 +17,10 @@ use notarium_core::{
     ids::{ControlRevision, EpisodeId},
     model::{FolderRef, NoteRef},
     ports::{
-        AccountMutation, AckOwner, AgentEpisode, CatalogDisclosure, ControlPageRequest,
-        EpisodeSelector, EpisodeStartResult, GetNote, MAX_PROJECT_BOOTSTRAP_VALUES, NoteSnapshot,
-        PageLimit, ProviderErrorCode, SpaceContext, StartEpisode,
+        AccountMutation, AckOwner, AgentEpisode, BearerScope, CatalogDisclosure,
+        ControlPageRequest, EpisodeRevisionGuard, EpisodeSelector, EpisodeStartResult, GetNote,
+        MAX_PROJECT_BOOTSTRAP_VALUES, NoteSnapshot, PageLimit, ProviderErrorCode, SpaceContext,
+        StartEpisode,
     },
     receipt::CausalBasis,
 };
@@ -99,6 +100,24 @@ pub(super) async fn handle(
     }
 }
 
+pub(super) async fn selected_project_for_hint(
+    call: &ToolCallContext<'_>,
+    project: Option<&str>,
+    hint: Option<&FolderRef>,
+) -> Result<Option<FolderRef>, PortError> {
+    let target = match project {
+        Some(handle) => Some(resolve_project(call, handle).await?.folder),
+        None => hint.cloned(),
+    };
+    let target = match &call.target {
+        EgressTarget::InAppProvider {
+            primary_project, ..
+        } => target.or_else(|| primary_project.clone()),
+        EgressTarget::ExternalMcp => target,
+    };
+    Ok(target)
+}
+
 pub(super) async fn selected_project(
     call: &ToolCallContext<'_>,
     project: Option<&str>,
@@ -114,17 +133,7 @@ pub(super) async fn selected_project(
         }
         None => None,
     };
-    let target = match project {
-        Some(handle) => Some(resolve_project(call, handle).await?.folder),
-        None => episode_project,
-    };
-    let target = match &call.target {
-        EgressTarget::InAppProvider {
-            primary_project, ..
-        } => target.or_else(|| primary_project.clone()),
-        EgressTarget::ExternalMcp => target,
-    };
-    Ok(target)
+    selected_project_for_hint(call, project, episode_project.as_ref()).await
 }
 
 async fn whoami(call: &mut ToolCallContext<'_>) -> Result<Value, PortError> {
@@ -245,7 +254,7 @@ async fn project_metadata(
         })) => {
             return Ok(None);
         }
-        Err(error) if hidden(&error) => return Ok(None),
+        Err(error) if corpus::hidden(&error) => return Ok(None),
         Err(error) => return Err(error),
     };
     let proof = match call
@@ -255,7 +264,7 @@ async fn project_metadata(
         .await
     {
         Ok(proof) => proof,
-        Err(error) if hidden(&error) => return Ok(None),
+        Err(error) if corpus::hidden(&error) => return Ok(None),
         Err(error) => return Err(error),
     };
     if let Some(selection) = selection {
@@ -270,7 +279,11 @@ async fn project_metadata(
             ClassEgressFence::provider_metadata(proof.clone(), scope.auth(), &selection.policy)
         {
             let error = PortError::from(error);
-            return if hidden(&error) { Ok(None) } else { Err(error) };
+            return if corpus::hidden(&error) {
+                Ok(None)
+            } else {
+                Err(error)
+            };
         }
         call.record_origin(proof.current().origin(), selection.project_only)?;
     }
@@ -347,13 +360,14 @@ async fn start(call: &mut ToolCallContext<'_>, args: StartArgs) -> Result<Value,
     let opened = call
         .registry
         .control
-        .start_agent_episode(
+        .start_or_resume_episode(
             call.account(),
             AccountMutation {
                 identity: call.account_identity(plan.expected, "start-episode", 0),
                 input: StartEpisode {
                     selector,
                     project_hint: plan.project.clone(),
+                    guard: EpisodeRevisionGuard::Target,
                 },
             },
         )
@@ -438,13 +452,21 @@ async fn start(call: &mut ToolCallContext<'_>, args: StartArgs) -> Result<Value,
     if let Some(project) = &episode.project_hint {
         output["project"] = project_bundle(call, project).await?;
     }
-    let (owner, acknowledgements) = if args.session.is_some() {
+    let (owner, acknowledgements, allow_ack) = if args.session.is_some() {
         (
             AckOwner::Episode(episode.id.clone()),
             &context.episode.acknowledgements,
+            args.acknowledge,
         )
     } else {
-        (AckOwner::Account, &context.owner_acknowledgements)
+        // Read-scoped bearers may acknowledge only their own episode cursor,
+        // never advancing the account-wide baseline.
+        let allow_ack = args.acknowledge && call.auth.bearer_scope() != Some(BearerScope::Read);
+        (
+            AckOwner::Account,
+            &context.owner_acknowledgements,
+            allow_ack,
+        )
     };
     output["delta"] = delta::open(
         call,
@@ -452,7 +474,7 @@ async fn start(call: &mut ToolCallContext<'_>, args: StartArgs) -> Result<Value,
         owner,
         episode.project_hint,
         acknowledgements,
-        args.acknowledge,
+        allow_ack,
     )
     .await?;
     Ok(output)
@@ -585,8 +607,17 @@ async fn project_bundle(
             });
         }
         Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
-            if diagnostic.reason == ValidationReason::NotReady =>
+            if matches!(
+                diagnostic.reason,
+                ValidationReason::NotReady | ValidationReason::CursorStale
+            ) =>
         {
+            output["index"]["countsAvailable"] = json!(false);
+        }
+        Err(PortError::Unavailable(_)) => {
+            output["index"]["countsAvailable"] = json!(false);
+        }
+        Err(PortError::DeadlineExceeded(_)) if !call.budget().remaining.is_zero() => {
             output["index"]["countsAvailable"] = json!(false);
         }
         Err(error) => return Err(error),
@@ -628,7 +659,7 @@ async fn bootstrap_note(
         .await
     {
         Ok(snapshot) => snapshot,
-        Err(error) if hidden(&error) => return Ok(None),
+        Err(error) if corpus::hidden(&error) => return Ok(None),
         Err(error) => return Err(error),
     };
     if snapshot.document.reference() != reference {
@@ -638,24 +669,13 @@ async fn bootstrap_note(
         .map_err(PortError::from)
     {
         Ok(_) => Ok(Some(snapshot)),
-        Err(error) if hidden(&error) => Ok(None),
+        Err(error) if corpus::hidden(&error) => Ok(None),
         Err(error) => Err(error),
     }
 }
 
 fn causal() -> CausalBasis {
     CausalBasis::Await(Default::default())
-}
-
-fn hidden(error: &PortError) -> bool {
-    match error {
-        PortError::Domain(DomainError::ResourceNotFound | DomainError::AccessDenied) => true,
-        PortError::Domain(DomainError::ValidationFailed { diagnostic }) => matches!(
-            diagnostic.reason,
-            ValidationReason::ClassEgressForbidden | ValidationReason::ProviderConsentRequired
-        ),
-        _ => false,
-    }
 }
 
 fn bounded_text(value: &str, limit: usize) -> &str {

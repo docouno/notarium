@@ -92,13 +92,12 @@ async fn read(call: &mut ToolCallContext<'_>, args: Value) -> Result<NoteOutput,
             "modifiedAt": provenance.modified_at,
         });
         if provenance.folder_page
-            && let Some(parent) = snapshot.parent
             && let Some(folder) = call
                 .registry
                 .engine
                 .resolve_folder_path(
                     call.space(ctx.scope().clone())?,
-                    Some(parent),
+                    snapshot.parent,
                     String::new(),
                 )
                 .await?
@@ -204,68 +203,104 @@ async fn describe_view(
         item["rowsTruncated"] = json!(true);
         return Ok(item);
     }
-    let limit = *remaining as u16;
-    let result = call
-        .registry
-        .engine
-        .query_view(
-            call.space(ctx.scope().clone())?,
-            ReadRequest::Open {
-                query: ViewQuery {
-                    view: ViewRef {
-                        note: note.clone(),
-                        key: key.clone(),
-                    },
-                    filter: unconstrained(),
-                    sort: None,
-                    group_by: None,
-                    limit: PageLimit::new(limit)?,
-                },
-                causal: CausalBasis::Await(AwaitWatermarks::at(ctx.scope().clone(), head)),
-            },
-        )
-        .await;
-    let page = match result {
-        Ok(page) => page,
-        Err(error) if optional_projection(&error) => {
-            item["status"] = json!("incomplete");
-            return Ok(item);
-        }
-        Err(error) => return Err(error),
-    };
-    ctx.scope().check(&page.rows.scope)?;
+    const MAX_VIEW_SCAN_PAGES: usize = 8;
+    let budget = *remaining;
     let external = matches!(call.target, EgressTarget::ExternalMcp);
+    let page_limit = PageLimit::new(if external {
+        budget as u16
+    } else {
+        (budget as u16).max(MAX_VIEW_ROWS as u16)
+    })?;
+    let mut request = ReadRequest::Open {
+        query: ViewQuery {
+            view: ViewRef {
+                note: note.clone(),
+                key: key.clone(),
+            },
+            filter: unconstrained(),
+            sort: None,
+            group_by: None,
+            limit: page_limit,
+        },
+        causal: CausalBasis::Await(AwaitWatermarks::at(ctx.scope().clone(), head)),
+    };
     let mut rows = Vec::new();
-    let truncated =
-        external && (page.rows.next.is_some() || page.rows.items.len() > usize::from(limit));
-    for row in page.rows.items.into_iter().take(usize::from(limit)) {
-        let proof = row.card.document.provenance();
-        match corpus::note_metadata(call, ctx, proof).await {
-            Ok(()) => {
-                rows.push(json!({
-                    "id": proof.reference().note_id,
-                    "title": row.card.title,
-                    "filePath": row.card.path,
-                    "group": row.group,
-                }));
-                *remaining -= 1;
+    let mut rows_truncated = false;
+    let mut page_incomplete = false;
+    let mut projected_seq = head;
+    let mut canonical_seq = head;
+    let mut groups = None;
+    for page_idx in 0..MAX_VIEW_SCAN_PAGES {
+        let result = call
+            .registry
+            .engine
+            .query_view(call.space(ctx.scope().clone())?, request)
+            .await;
+        let page = match result {
+            Ok(page) => page,
+            Err(error) if optional_projection(&error) => {
+                item["status"] = json!("incomplete");
+                return Ok(item);
             }
-            Err(error) if corpus::hidden(&error) => (),
             Err(error) => return Err(error),
+        };
+        ctx.scope().check(&page.rows.scope)?;
+        if page_idx == 0 {
+            projected_seq = page.rows.projected_seq;
+            canonical_seq = page.rows.canonical_seq;
+            if external {
+                groups = Some(page.groups);
+            }
         }
+        page_incomplete |= page.rows.incomplete;
+        for row in page.rows.items {
+            let proof = row.card.document.provenance();
+            match corpus::note_metadata(call, ctx, proof).await {
+                Ok(()) => {
+                    if *remaining == 0 {
+                        rows_truncated = true;
+                        break;
+                    }
+                    rows.push(json!({
+                        "id": proof.reference().note_id,
+                        "title": row.card.title,
+                        "filePath": row.card.path,
+                        "group": row.group,
+                    }));
+                    *remaining -= 1;
+                }
+                Err(error) if corpus::hidden(&error) => (),
+                Err(error) => return Err(error),
+            }
+        }
+        if rows_truncated {
+            break;
+        }
+        let Some(next_cursor) = page.rows.next else {
+            break;
+        };
+        if external {
+            rows_truncated = true;
+            break;
+        }
+        if page_idx + 1 == MAX_VIEW_SCAN_PAGES {
+            rows_truncated = true;
+            break;
+        }
+        request = ReadRequest::Continue {
+            cursor: next_cursor,
+        };
     }
-    let incomplete = page.rows.incomplete
-        || page.rows.projected_seq < head.max(page.rows.canonical_seq)
-        || truncated;
+    let incomplete = page_incomplete || projected_seq < head.max(canonical_seq) || rows_truncated;
     item["status"] = json!(if incomplete { "incomplete" } else { "ready" });
     item["rows"] = Value::Array(rows);
-    if truncated {
+    if rows_truncated {
         item["rowsTruncated"] = json!(true);
     }
-    if external {
-        let total_groups = page.groups.len();
+    if let Some(page_groups) = groups {
+        let total_groups = page_groups.len();
         item["groups"] = Value::Array(
-            page.groups
+            page_groups
                 .into_iter()
                 .take(MAX_VIEW_ROWS)
                 .map(|group| {
@@ -299,6 +334,10 @@ async fn graph(
                     hops: 1,
                 },
                 filter: unconstrained(),
+                causal: Some(CausalBasis::Await(AwaitWatermarks::at(
+                    ctx.scope().clone(),
+                    head,
+                ))),
             },
         )
         .await;

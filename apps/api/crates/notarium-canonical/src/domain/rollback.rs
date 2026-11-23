@@ -254,8 +254,7 @@ pub(crate) async fn rollback_agent_run_impl(
     let deadline = super::common::CommandDeadline::start(&ctx.budget, "rollback").at;
     validate_mutation_identity(&ctx, &request.identity)?;
     crate::domain::common::require_empty_preconditions(&request.preconditions)?;
-    let idemp = fingerprint::current(&request)?
-        .with_canonical_effect(&ctx)
+    let idemp = fingerprint::current(&ctx, &request)?
         .with_policy(ctx.auth(), rollback_policy(&request.input));
 
     let result = execute_rollback(store, &mut ctx, &request, &idemp, None, deadline).await;
@@ -296,11 +295,11 @@ pub(crate) async fn rollback_agent_run_by_id(
     validate_mutation_identity(&ctx, &request.identity)?;
     super::common::require_empty_preconditions(&request.preconditions)?;
     let idemp = super::common::derive_command_identity_spec(
+        &ctx,
         &request.identity,
         "rollback_agent_run_by_id_v1",
         request.input.as_str().as_bytes(),
     )
-    .with_canonical_effect(&ctx)
     .with_policy(
         ctx.auth(),
         crate::writer::replay::ReplayPolicy::RollbackRun(request.input.clone()),
@@ -2102,8 +2101,46 @@ fn build_rollback_execute_fn(
             } else {
                 Vec::new()
             };
+            let mut planned_covers = BTreeMap::new();
+            let mut restored_covers = Vec::new();
+            for (note, action) in &eligible_notes {
+                match action {
+                    CandidateAction::TrashCreated {
+                        current_lifecycle: Lifecycle::Active,
+                        metadata,
+                        parent_folder_id,
+                        ..
+                    } if metadata.folder_page => {
+                        planned_covers.insert(parent_folder_id, None);
+                    }
+                    CandidateAction::RestorePreExisting {
+                        pre_meta,
+                        current_cover_parent,
+                        needs_note_mutation: true,
+                        ..
+                    } => {
+                        if let Some(folder) = current_cover_parent {
+                            planned_covers.insert(folder, None);
+                        }
+                        if pre_meta.folder_page && pre_meta.lifecycle == Lifecycle::Active {
+                            restored_covers.push((&pre_meta.parent_folder_id, Some(note)));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            planned_covers.extend(restored_covers);
+            let mut cover_changes = Vec::with_capacity(planned_covers.len());
+            for (folder, cover) in planned_covers {
+                let row =
+                    crate::runtime::load_folder_head_row(tx, &scope_cl.space_id, folder).await?;
+                if row.cover_note_id.as_ref() != cover {
+                    cover_changes.push((folder, cover));
+                }
+            }
             let entity_event_seqs = trash_note_count
                 + restore_note_count
+                + (cover_changes.len() as u64)
                 + (rank_removals.len() as u64)
                 + (planned_neighbor_updates.len() as u64)
                 + (planned_target_restores.len() as u64);
@@ -2386,48 +2423,23 @@ fn build_rollback_execute_fn(
                 insert_revision_rows_batch_tx(tx, &scope_cl, &rev_items).await?;
             }
 
-            let mut cover_changes = BTreeMap::new();
-            let mut restored_covers = Vec::new();
-            for (note, action) in &eligible_notes {
-                match action {
-                    CandidateAction::TrashCreated {
-                        current_lifecycle: Lifecycle::Active,
-                        metadata,
-                        parent_folder_id,
-                        ..
-                    } if metadata.folder_page => {
-                        cover_changes.insert(parent_folder_id, None);
-                    }
-                    CandidateAction::RestorePreExisting {
-                        pre_meta,
-                        current_cover_parent,
-                        needs_note_mutation: true,
-                        ..
-                    } => {
-                        if let Some(folder) = current_cover_parent {
-                            cover_changes.insert(folder, None);
-                        }
-                        if pre_meta.folder_page && pre_meta.lifecycle == Lifecycle::Active {
-                            restored_covers.push((&pre_meta.parent_folder_id, Some(note)));
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            cover_changes.extend(restored_covers);
             for (folder, cover) in cover_changes {
-                super::folder_cover::assign(
+                let cseq = item_ctx.alloc_next_seq()?;
+                if let Some(event) = super::folder_cover::assign(
                     tx,
                     &scope_cl,
                     folder,
                     cover,
-                    visibility_seq,
+                    cseq,
                     visibility_seq,
                     auth.principal(),
                     None,
                     now_ts,
                 )
-                .await?;
+                .await?
+                {
+                    events.push(event);
+                }
             }
 
             // 6c. Apply planned board overlay deletes, neighbor normalizations, and target restores.

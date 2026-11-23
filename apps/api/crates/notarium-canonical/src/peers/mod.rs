@@ -1140,7 +1140,7 @@ async fn create_job_impl(
         ContentJobKind::Export { notes, .. } => notes.as_slice(),
         _ => &[],
     };
-    let idemp = derive_command_identity_spec(&request.identity, "create_job", &payload_bytes)
+    let idemp = derive_command_identity_spec(&ctx, &request.identity, "create_job", &payload_bytes)
         .for_job(ctx.auth(), None, export_notes);
 
     let scope = space_rec.scope.clone();
@@ -1851,7 +1851,7 @@ async fn cancel_job_impl(
         request.input.job.as_str(),
         request.input.expected_lease.get()
     );
-    let idemp = derive_command_identity_spec(&request.identity, "cancel_job", fp.as_bytes())
+    let idemp = derive_command_identity_spec(&ctx, &request.identity, "cancel_job", fp.as_bytes())
         .for_job(ctx.auth(), Some(&request.input.job), &[]);
 
     let scope = space_rec.scope.clone();

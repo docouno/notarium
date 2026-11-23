@@ -463,6 +463,7 @@ async fn redaction_incomplete_cleanup_during_model_refresh_blocks_ack(
                     interruption: None,
                     provenance: None,
                     proposed_diff: None,
+                    proposed_effect: None,
                     thread: thread.clone(),
                     parent: ThreadEntrySeq::ZERO,
                     kind: ChatEntryKind::Human,

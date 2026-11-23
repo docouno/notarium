@@ -68,6 +68,80 @@ impl AgentRunSupervisor {
                 if latest.thread.kind == ChatThreadKind::KeeperLog {
                     return Err(DomainError::SpaceReadOnly.into());
                 }
+                if let Some(orphaned) = latest.thread.active_run.as_ref()
+                    && self.active(&scope, &thread).is_none()
+                {
+                    let (can_recover, recovery_owner) = match &self.inner.coordination {
+                        Coordination::Local => (true, None),
+                        Coordination::Clustered(authority) => {
+                            let probe_run = new_run()?;
+                            match authority
+                                .register_owner(
+                                    maintenance(account.budget.clone()),
+                                    RunOwnershipRequest {
+                                        scope: scope.clone(),
+                                        thread: thread.clone(),
+                                        run: probe_run,
+                                        transition: RunOwnershipTransition::Recover {
+                                            previous: orphaned.clone(),
+                                        },
+                                    },
+                                    ownership_lost.clone(),
+                                )
+                                .await
+                            {
+                                Ok(owner)
+                                    if owner.is_current() && owner.prior_owner_fenced(orphaned) =>
+                                {
+                                    (true, Some(owner))
+                                }
+                                Ok(_) | Err(_) => (false, None),
+                            }
+                        }
+                    };
+                    if can_recover {
+                        if let Some(owner) = &recovery_owner
+                            && !owner.is_current()
+                        {
+                            return Err(owner_unavailable());
+                        }
+                        let human = self.detached_input_writer(&account, &scope).await?;
+                        let recovery = ChatRunRequest {
+                            thread: thread.clone(),
+                            expected_run: orphaned.clone(),
+                        };
+                        let mut recovered = engine
+                            .recover_active_run(human.clone(), recovery.clone())
+                            .await;
+                        if recovered.as_ref().is_err_and(unknown_commit)
+                            && !ownership_lost.is_cancelled()
+                            && route.as_ref().is_none_or(|lease| lease.check().is_ok())
+                            && recovery_owner
+                                .as_ref()
+                                .is_none_or(|owner| owner.is_current())
+                        {
+                            if let Some(effect) = human.canonical_effect() {
+                                effect.check()?;
+                            }
+                            recovered = engine.recover_active_run(human, recovery).await;
+                        }
+                        match recovered {
+                            Ok(FinishChatRunOutcome::Cleared) => {
+                                self.inner
+                                    .revocations
+                                    .finish_thread_pending(&scope, &thread);
+                            }
+                            Ok(FinishChatRunOutcome::Changed | FinishChatRunOutcome::Pending) => {}
+                            Err(PortError::Domain(DomainError::ValidationFailed {
+                                diagnostic,
+                            })) if diagnostic.reason == ValidationReason::InvalidAuthority => {
+                                // The claim still belongs to this live writer generation or epoch;
+                                // fall through to queue input onto the active run.
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
+                }
                 let pending = self.inner.revocations.register_pending(
                     maintenance(account.budget.clone()),
                     key.clone(),
@@ -130,50 +204,66 @@ impl AgentRunSupervisor {
                     .map_err(after_append)
             };
             if sender_live()? {
-                let active = self.active(&scope, &thread);
-                let branch = if active.is_none() && may_start {
-                    Some(
-                        self.thread_at(ctx, &thread, entry.value.seq)
-                            .await
-                            .map_err(after_append)?,
-                    )
-                } else {
-                    None
-                };
-                if let Some(active) = active {
-                    active.stream.committed(&entry.value, None)?;
-                } else if let Some(branch) = branch
-                    && branch.thread.active_run.is_none()
-                    && branch.thread.head == entry.value.seq
-                    && (branch.thread.kind == ChatThreadKind::Personal || mentions_agent)
-                    && branch.entries.iter().any(|current| {
-                        current.seq == entry.value.seq && current.kind == ChatEntryKind::Human
-                    })
-                    && sender_live()?
-                {
-                    let start = StartChatRun {
-                        scope,
-                        thread,
-                        expected_leaf: entry.value.seq,
-                        options: sender.options().clone(),
+                let handoff_result: Result<(), PortError> = async {
+                    let active = self.active(&scope, &thread);
+                    let branch = if active.is_none() && may_start {
+                        Some(
+                            self.thread_at(ctx, &thread, entry.value.seq)
+                                .await
+                                .map_err(after_append)?,
+                        )
+                    } else {
+                        None
                     };
-                    let owner = AccountContext::new(sender.auth().clone(), account.budget);
-                    match self
-                        .launch(owner, start, branch.thread, None, Some((&key, &sender)))
-                        .await
+                    if let Some(active) = active {
+                        active.stream.committed(&entry.value, None)?;
+                    } else if let Some(branch) = branch
+                        && branch.thread.active_run.is_none()
+                        && branch.thread.head == entry.value.seq
+                        && (branch.thread.kind == ChatThreadKind::Personal || mentions_agent)
+                        && branch.entries.iter().any(|current| {
+                            current.seq == entry.value.seq && current.kind == ChatEntryKind::Human
+                        })
+                        && sender_live()?
                     {
-                        Ok(LaunchOutcome::Started(id)) => run = Some(id),
-                        Err(error)
-                            if !self.inner.shutdown.is_cancelled()
-                                && !sender.cancellation().is_cancelled()
-                                && let Some(retry) = retry_handoff(&error) =>
+                        let start = StartChatRun {
+                            scope,
+                            thread,
+                            expected_leaf: entry.value.seq,
+                            options: sender.options().clone(),
+                        };
+                        let owner = AccountContext::new(sender.auth().clone(), account.budget);
+                        match self
+                            .launch(owner, start, branch.thread, None, Some((&key, &sender)))
+                            .await
                         {
-                            return Err(retry);
+                            Ok(LaunchOutcome::Started(id)) => run = Some(id),
+                            Err(error)
+                                if !self.inner.shutdown.is_cancelled()
+                                    && !sender.cancellation().is_cancelled()
+                                    && let Some(retry) = retry_handoff(&error) =>
+                            {
+                                return Err(retry);
+                            }
+                            _ => (),
                         }
-                        _ => (),
+                    }
+                    Ok(())
+                }
+                .await;
+                match handoff_result {
+                    Ok(()) => {
+                        self.inner.revocations.finish_submission(&key, &sender);
+                    }
+                    Err(error) => {
+                        // Only retain the pending sender when the caller can
+                        // retry the same command to claim the run.
+                        if !unknown_commit(&error) && concurrency_retry_delay(&error).is_none() {
+                            self.inner.revocations.finish_submission(&key, &sender);
+                        }
+                        return Err(error);
                     }
                 }
-                self.inner.revocations.finish_submission(&key, &sender);
             }
         }
         Ok(ChatSubmission { outcome, run })
@@ -269,12 +359,21 @@ impl AgentRunSupervisor {
             // Resolve that same command before consulting the now-shorter FIFO.
             let attempt = unsettled.as_ref().expect("an input was selected");
             let pending = self.inner.revocations.pending(&attempt.key);
-            let account =
-                if let Some(credential) = pending.filter(|_| !self.inner.shutdown.is_cancelled()) {
-                    self.live_pending(run, &attempt.item, credential).await?
-                } else {
-                    None
-                };
+            let account = if let Some(credential) =
+                pending.filter(|_| !self.inner.shutdown.is_cancelled())
+            {
+                match self.live_pending(run, &attempt.item, credential).await {
+                    Ok(account) => account,
+                    Err(error)
+                        if !retry_cleanup(&error) && concurrency_retry_delay(&error).is_none() =>
+                    {
+                        None
+                    }
+                    Err(error) => return Err(error),
+                }
+            } else {
+                None
+            };
             let Some((account, sender)) = account else {
                 self.dismiss(run, &attempt.key).await?;
                 *unsettled = None;
@@ -282,7 +381,11 @@ impl AgentRunSupervisor {
             };
             let writer = match self.detached_input_writer(&account, &run.scope).await {
                 Ok(writer) => writer,
-                Err(error) if no_authority(&error) => {
+                Err(error)
+                    if no_authority(&error)
+                        || (!retry_cleanup(&error)
+                            && concurrency_retry_delay(&error).is_none()) =>
+                {
                     self.dismiss(run, &attempt.key).await?;
                     *unsettled = None;
                     continue;
@@ -314,11 +417,22 @@ impl AgentRunSupervisor {
                         .first()
                         .is_some_and(|item| item.id == attempt.item.id)
                     {
-                        return Err(error);
+                        self.dismiss(run, &attempt.key).await?;
+                        *unsettled = None;
+                        continue;
                     }
                     if remaining.iter().all(|item| item.id != attempt.item.id) {
                         self.inner.revocations.finish_pending(&attempt.key);
                     }
+                    *unsettled = None;
+                    continue;
+                }
+                Err(error)
+                    if !retry_cleanup(&error) && concurrency_retry_delay(&error).is_none() =>
+                {
+                    // Dismiss a definitely rejected head-of-line item so it
+                    // cannot livelock the thread's FIFO queue.
+                    self.dismiss(run, &attempt.key).await?;
                     *unsettled = None;
                     continue;
                 }
@@ -429,42 +543,27 @@ impl AgentRunSupervisor {
             Err(error) if no_authority(&error) => return Ok(None),
             Err(error) => return Err(error),
         };
-        let mut after = None;
-        for _ in 0..128 {
-            let page = self
-                .inner
-                .registry
-                .control()
-                .list_spaces(
-                    account.clone(),
-                    ControlPageRequest::new(100, after.clone())?,
-                )
-                .await;
-            let page = match page {
-                Ok(page) => page,
-                Err(error) if no_authority(&error) => return Ok(None),
-                Err(error) => return Err(error),
-            };
-            if let Some(access) = page
-                .items
-                .into_iter()
-                .find(|space| space.space.id == run.scope.space_id)
-            {
-                return Ok((access.history == run.scope
-                    && access.space.lifecycle == SpaceLifecycle::Active
-                    && matches!(access.role, SpaceRole::Owner | SpaceRole::Editor)
-                    && !credential.cancellation().is_cancelled())
-                .then_some((account, credential)));
-            }
-            let Some(next) = page.continuation else {
-                return Ok(None);
-            };
-            if after.as_ref() == Some(&next) {
-                return Err(invalid(ValidationReason::InvalidState));
-            }
-            after = Some(next);
+        let Some(grant) = account.auth().spaces().get(&run.scope.space_id) else {
+            return Ok(None);
+        };
+        if !matches!(grant.role, SpaceRole::Owner | SpaceRole::Editor) {
+            return Ok(None);
         }
-        Err(invalid(ValidationReason::BudgetExceeded))
+        let space = match self
+            .inner
+            .registry
+            .catalog()
+            .space(account.budget.clone(), run.scope.space_id.clone())
+            .await
+        {
+            Ok(space) => space,
+            Err(error) if no_authority(&error) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        Ok((space.history == run.scope
+            && space.space.lifecycle == SpaceLifecycle::Active
+            && !credential.cancellation().is_cancelled())
+        .then_some((account, credential)))
     }
 }
 

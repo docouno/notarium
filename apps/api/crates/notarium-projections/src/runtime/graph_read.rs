@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, future::Future};
+use std::{collections::BTreeMap, future::Future, time::Duration};
 
 use croaring::Bitmap;
 use notarium_canonical::{
@@ -8,7 +8,7 @@ use notarium_canonical::{
 use notarium_core::{
     DomainError,
     error::{PortError, ValidationReason},
-    ids::NoteId,
+    ids::{NoteId, SpaceSeq},
     model::LifecycleMask,
     ports::{
         CallBudget, ChatBacklink, ChatBacklinkCursor, ChatBacklinkPage, GraphQuery, GraphResult,
@@ -97,7 +97,50 @@ impl ProjectionEngine {
         ctx: &SpaceContext,
         query: &GraphQuery,
     ) -> Result<GraphResult, PortError> {
-        let cut = self.published_cut(ctx.scope())?;
+        let cut = if let Some(causal) = &query.causal {
+            if !ctx.auth().spaces().contains_key(&ctx.scope().space_id) {
+                return Err(DomainError::ResourceNotFound.into());
+            }
+            let scope = ctx.scope();
+            let grace = (ctx.budget.remaining / 2).min(Duration::from_millis(50));
+            let base = match self.published_cut(scope) {
+                Ok(cut) => cut,
+                Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
+                    if matches!(
+                        diagnostic.reason,
+                        ValidationReason::CursorStale
+                            | ValidationReason::NotReady
+                            | ValidationReason::GenerationMismatch
+                    ) =>
+                {
+                    self.wait_for_cut(scope, SpaceSeq::ZERO, &ctx.budget, grace)
+                        .await?
+                }
+                Err(error) => return Err(error),
+            };
+            let target = match causal {
+                CausalBasis::Await(watermarks) => watermarks.required(scope)?,
+                CausalBasis::Exact(receipts) => receipts
+                    .for_scope(scope)?
+                    .into_iter()
+                    .map(|receipt| receipt.seq())
+                    .max()
+                    .unwrap_or(SpaceSeq::ZERO),
+            };
+            if target <= base.cut.projected_seq {
+                base
+            } else {
+                match self.wait_for_cut(scope, target, &ctx.budget, grace).await {
+                    Ok(cut) => cut,
+                    Err(PortError::DeadlineExceeded(_)) => {
+                        self.published_cut(scope).unwrap_or(base)
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        } else {
+            self.published_cut(ctx.scope())?
+        };
         let index = self.open_index_async(&cut).await?;
         let (head, authorized, lens, lens_tags_need_exact) = {
             let permit = cut.live.try_read()?;

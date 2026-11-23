@@ -34,7 +34,7 @@ use std::sync::{
 };
 
 pub(crate) use content::{
-    chat_source_tx, load_current_chat_for_egress_tx, verify_confirmed_chat_step_tx,
+    ProofFoldCache, chat_source_tx, load_current_chat_for_egress_tx, verify_confirmed_chat_step_tx,
 };
 use notarium_core::{
     DomainError,
@@ -611,6 +611,9 @@ impl CanonicalStore {
         ctx: SpaceContext,
         raw: &str,
     ) -> Result<StagedChatBlob, PortError> {
+        if ctx.confirmed_chat_step().is_some() {
+            return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
+        }
         let deadline =
             crate::domain::common::CommandDeadline::start(&ctx.budget, "stage_chat_blob");
         let byte_len = raw.len() as u64;
@@ -823,6 +826,7 @@ struct ThreadHeadRow {
     active_run_epoch: Option<LeaseEpoch>,
     active_run_generation: Option<String>,
     tainted_mask: i64,
+    redaction_epoch: i64,
 }
 
 #[allow(clippy::type_complexity)]
@@ -840,6 +844,7 @@ fn parse_thread_head_row(
         i64,
         Option<i64>,
         Option<String>,
+        i64,
     ),
 ) -> Result<ThreadHeadRow, PortError> {
     let (
@@ -854,6 +859,7 @@ fn parse_thread_head_row(
         tainted_mask,
         raw_epoch,
         active_run_generation,
+        redaction_epoch,
     ) = raw;
     let kind = chat_thread_kind_from_db(&kind_raw)?;
     let owner = PrincipalId::parse(&owner_raw)
@@ -898,6 +904,7 @@ fn parse_thread_head_row(
             .transpose()?,
         active_run_generation,
         tainted_mask,
+        redaction_epoch,
     })
 }
 
@@ -924,6 +931,7 @@ async fn load_thread_heads_batch_tx(
         i64,
         Option<i64>,
         Option<String>,
+        i64,
     )> = match tx {
         BackendConn::Sqlite(conn) => {
             let mut acc = Vec::with_capacity(thread_ids.len());
@@ -931,7 +939,7 @@ async fn load_thread_heads_batch_tx(
                 let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
                     "SELECT thread_id, kind, owner_id, project_folder_id, title, head_leaf_seq,
                             head_rev_id, next_entry_seq, active_run_id, ext_space_tainted_mask,
-                            active_run_epoch, active_run_generation
+                            active_run_epoch, active_run_generation, redaction_epoch
                      FROM chat_threads WHERE space_id = ",
                 );
                 qb.push_bind(space_id.as_str());
@@ -958,6 +966,7 @@ async fn load_thread_heads_batch_tx(
                         row.get("ext_space_tainted_mask"),
                         row.get("active_run_epoch"),
                         row.get("active_run_generation"),
+                        row.get("redaction_epoch"),
                     ));
                 }
             }
@@ -968,7 +977,7 @@ async fn load_thread_heads_batch_tx(
             let part = sqlx::query(
                 "SELECT thread_id, kind, owner_id, project_folder_id, title, head_leaf_seq,
                         head_rev_id, next_entry_seq, active_run_id, ext_space_tainted_mask::BIGINT AS tainted_mask,
-                        active_run_epoch, active_run_generation
+                        active_run_epoch, active_run_generation, redaction_epoch
                  FROM chat_threads WHERE space_id = $1 AND thread_id = ANY($2)",
             )
             .bind(space_id.as_str())
@@ -991,6 +1000,7 @@ async fn load_thread_heads_batch_tx(
                         row.get("tainted_mask"),
                         row.get("active_run_epoch"),
                         row.get("active_run_generation"),
+                        row.get("redaction_epoch"),
                     )
                 })
                 .collect()
@@ -1009,6 +1019,7 @@ async fn load_thread_heads_batch_tx(
         tainted_mask,
         raw_epoch,
         active_run_generation,
+        redaction_epoch,
     ) in rows
     {
         let thread_id = ChatThreadId::parse(&thread_raw)
@@ -1027,6 +1038,7 @@ async fn load_thread_heads_batch_tx(
                 tainted_mask,
                 raw_epoch,
                 active_run_generation,
+                redaction_epoch,
             ),
         )?;
         out.insert(thread_id, head);
@@ -1052,12 +1064,13 @@ async fn load_thread_head_opt_tx(
         i64,
         Option<i64>,
         Option<String>,
+        i64,
     )> = match tx {
         BackendConn::Sqlite(conn) => {
             let r = sqlx::query(
                 "SELECT kind, owner_id, project_folder_id, title, head_leaf_seq,
                         head_rev_id, next_entry_seq, active_run_id, ext_space_tainted_mask,
-                        active_run_epoch, active_run_generation
+                        active_run_epoch, active_run_generation, redaction_epoch
                  FROM chat_threads WHERE space_id = ? AND thread_id = ?",
             )
             .bind(space_id.as_str())
@@ -1078,6 +1091,7 @@ async fn load_thread_head_opt_tx(
                     row.get("ext_space_tainted_mask"),
                     row.get("active_run_epoch"),
                     row.get("active_run_generation"),
+                    row.get("redaction_epoch"),
                 )
             })
         }
@@ -1085,7 +1099,7 @@ async fn load_thread_head_opt_tx(
             let r = sqlx::query(
                 "SELECT kind, owner_id, project_folder_id, title, head_leaf_seq,
                         head_rev_id, next_entry_seq, active_run_id, ext_space_tainted_mask::BIGINT AS tainted_mask,
-                        active_run_epoch, active_run_generation
+                        active_run_epoch, active_run_generation, redaction_epoch
                  FROM chat_threads WHERE space_id = $1 AND thread_id = $2",
             )
             .bind(space_id.as_str())
@@ -1106,6 +1120,7 @@ async fn load_thread_head_opt_tx(
                     row.get("tainted_mask"),
                     row.get("active_run_epoch"),
                     row.get("active_run_generation"),
+                    row.get("redaction_epoch"),
                 )
             })
         }
@@ -2336,6 +2351,7 @@ fn read_chat_rusqlite(
                 active_run_epoch: None,
                 active_run_generation: None,
                 tainted_mask: raw.8,
+                redaction_epoch: 0,
             }
         };
 
@@ -2711,9 +2727,13 @@ async fn create_chat_impl(
     }
     fp.update(&[0]);
     fp.update(request.input.title.as_bytes());
-    let idemp =
-        derive_command_identity_spec(&request.identity, "create_chat", fp.finalize().as_bytes())
-            .for_chat(ctx.auth(), &request.input.thread, Vec::new());
+    let idemp = derive_command_identity_spec(
+        &ctx,
+        &request.identity,
+        "create_chat",
+        fp.finalize().as_bytes(),
+    )
+    .for_chat(ctx.auth(), &request.input.thread, Vec::new());
 
     let scope = space_rec.scope.clone();
     let active_epoch = space_rec.active_epoch;
@@ -2954,7 +2974,7 @@ async fn fork_chat_impl(
         request.input.thread.as_str(),
         request.input.parent.get()
     );
-    let idemp = derive_command_identity_spec(&request.identity, "fork_chat", fp.as_bytes())
+    let idemp = derive_command_identity_spec(&ctx, &request.identity, "fork_chat", fp.as_bytes())
         .with_preconditions(
             &request.preconditions,
             "thread",
@@ -3248,23 +3268,27 @@ async fn append_chat_impl(
     }
     let legacy_staged =
         matches!(&request.input.body,ChatInputBody::Staged(st) if st.lease().is_none());
-    let idemp =
-        derive_command_identity_spec(&request.identity, "append_chat", fp.finalize().as_bytes())
-            .with_preconditions(
-                &request.preconditions,
-                "thread",
-                request.input.thread.as_str(),
-            )
-            .with_chat_body(&request.input.body, &request.input.referenced_notes)
-            .with_policy(
-                ctx.auth(),
-                crate::writer::replay::ReplayPolicy::Chat(
-                    request.input.thread.clone(),
-                    Some(request.input.parent),
-                    request.input.referenced_notes.clone(),
-                    legacy_staged,
-                ),
-            );
+    let idemp = derive_command_identity_spec(
+        &ctx,
+        &request.identity,
+        "append_chat",
+        fp.finalize().as_bytes(),
+    )
+    .with_preconditions(
+        &request.preconditions,
+        "thread",
+        request.input.thread.as_str(),
+    )
+    .with_chat_body(&request.input.body, &request.input.referenced_notes)
+    .with_policy(
+        ctx.auth(),
+        crate::writer::replay::ReplayPolicy::Chat(
+            request.input.thread.clone(),
+            Some(request.input.parent),
+            request.input.referenced_notes.clone(),
+            legacy_staged,
+        ),
+    );
 
     let (space_rec, replayed) = deadline
         .prepare_read(&ctx.budget, || {
@@ -3986,6 +4010,7 @@ async fn queue_chat_input_impl(
     fp.update(request.input.in_flight_run.as_str().as_bytes());
     fp.update(&[u8::from(request.input.mentions_agent)]);
     let idemp = derive_command_identity_spec(
+        &ctx,
         &request.identity,
         "queue_chat_input",
         fp.finalize().as_bytes(),
@@ -4375,8 +4400,7 @@ async fn consume_chat_input_impl(
         fp.push_str(request.input.expected_active_run.as_str());
     }
     let idemp =
-        derive_command_identity_spec(&request.identity, "consume_chat_input", fp.as_bytes())
-            .with_canonical_effect(&ctx)
+        derive_command_identity_spec(&ctx, &request.identity, "consume_chat_input", fp.as_bytes())
             .with_preconditions(
                 &request.preconditions,
                 "thread",
@@ -4979,15 +5003,15 @@ async fn redact_chat_entry_impl(
         request.input.entry.get(),
         request.input.expected_thread_revision.as_str()
     );
-    let idemp = derive_command_identity_spec(&request.identity, "redact_chat_entry", fp.as_bytes())
-        .with_preconditions(
-            &request.preconditions,
-            "thread",
-            request.input.thread.as_str(),
-        )
-        .with_known_base(&request.input.expected_thread_revision)
-        .with_canonical_effect(&ctx)
-        .for_chat(ctx.auth(), &request.input.thread, Vec::new());
+    let idemp =
+        derive_command_identity_spec(&ctx, &request.identity, "redact_chat_entry", fp.as_bytes())
+            .with_preconditions(
+                &request.preconditions,
+                "thread",
+                request.input.thread.as_str(),
+            )
+            .with_known_base(&request.input.expected_thread_revision)
+            .for_chat(ctx.auth(), &request.input.thread, Vec::new());
 
     if idemp.canonical_effect().is_none()
         && let Some(replayed) = deadline
@@ -5185,8 +5209,7 @@ async fn redact_chat_entry_impl(
                 };
 
                 // Mark ONLY true descendant `compaction` checkpoints stale along `parent_seq` (sibling forks untouched)!
-                content::invalidate_folded_proofs(tx, &scope.space_id, &input.thread, entry_i64)
-                    .await?;
+                // Advancing `chat_threads.redaction_epoch` below invalidates cached folded proofs in O(1).
                 let invalidated_contexts = mark_descendant_compactions_stale_tx(
                     tx,
                     &scope,
@@ -5228,7 +5251,8 @@ async fn redact_chat_entry_impl(
                     BackendConn::Sqlite(conn) => {
                         sqlx::query(
                             "UPDATE chat_threads
-                             SET head_rev_id = ?, updated_seq = ?, updated_at_sec = ?, updated_at_nsec = ?
+                             SET head_rev_id = ?, updated_seq = ?, updated_at_sec = ?, updated_at_nsec = ?,
+                                 redaction_epoch = redaction_epoch + 1
                              WHERE space_id = ? AND thread_id = ?",
                         )
                         .bind(new_thread_rev.as_str())
@@ -5244,7 +5268,8 @@ async fn redact_chat_entry_impl(
                     BackendConn::Postgres(conn) => {
                         sqlx::query(
                             "UPDATE chat_threads
-                             SET head_rev_id = $1, updated_seq = $2, updated_at_sec = $3, updated_at_nsec = $4
+                             SET head_rev_id = $1, updated_seq = $2, updated_at_sec = $3, updated_at_nsec = $4,
+                                 redaction_epoch = redaction_epoch + 1
                              WHERE space_id = $5 AND thread_id = $6",
                         )
                         .bind(new_thread_rev.as_str())

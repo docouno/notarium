@@ -33,6 +33,8 @@ mod real_reads;
 mod rollback_receipts;
 #[path = "agents_runtime/runtime_abilities.rs"]
 mod runtime_ability_cases;
+#[path = "agents_runtime/security_seams.rs"]
+mod security_seams;
 #[path = "agents_runtime/supervised_chat.rs"]
 mod supervised_chat_cases;
 #[path = "agents_runtime/supervised_takeover.rs"]
@@ -666,6 +668,7 @@ async fn session_delivery_is_lossless(fixture: &RuntimeFixture, scope: &SpaceCon
         .unwrap();
     let second = SpaceContext::new(authority, second.history, budget()).unwrap();
     let reader = &fixture.pat(BearerScope::Read, false).await;
+    let writer = &fixture.pat(BearerScope::Write, false).await;
     let mut expected = BTreeSet::new();
     for tag in 20..=42 {
         expected.insert(append_note(fixture, scope, tag).await.to_string());
@@ -683,9 +686,134 @@ async fn session_delivery_is_lossless(fixture: &RuntimeFixture, scope: &SpaceCon
         .await
         .unwrap()
         .last_seq;
-    let mut page = call(
+
+    // A read-scoped bearer without `session` never advances `AckOwner::Account`
+    // (it behaves like `acknowledge: false`), while with `session` it advances only
+    // its own `AckOwner::Episode`.
+    let read_no_session = call(
         fixture,
         reader,
+        56,
+        "start_session",
+        json!({"task": "Read-only baseline check"}),
+    )
+    .await
+    .unwrap();
+    let read_ep = EpisodeId::parse(
+        read_no_session.structured_content["session"]["id"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    if let Some(receipt) = read_no_session.structured_content["delta"]["deliveryReceipt"].as_str() {
+        let acked = call(
+            fixture,
+            reader,
+            149,
+            "start_session",
+            json!({"deliveryReceipt": receipt}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(acked.structured_content["acknowledged"], false);
+    }
+    assert_eq!(
+        owner_ack(fixture, reader, read_ep.clone(), scope).await,
+        SpaceSeq::ZERO
+    );
+    assert_eq!(
+        owner_ack(fixture, reader, read_ep.clone(), &second).await,
+        SpaceSeq::ZERO
+    );
+    let mut read_page = call(
+        fixture,
+        reader,
+        57,
+        "start_session",
+        json!({"session": {"name": "read-scoped-ep"}}),
+    )
+    .await
+    .unwrap();
+    let named_ep = EpisodeId::parse(
+        read_page.structured_content["session"]["id"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    let mut read_key = 150u8;
+    loop {
+        let delta = read_page.structured_content["delta"].clone();
+        if let Some(next) = delta["continuation"].as_str() {
+            read_page = call(
+                fixture,
+                reader,
+                read_key,
+                "start_session",
+                json!({"continuation": next}),
+            )
+            .await
+            .unwrap();
+            read_key += 1;
+            continue;
+        }
+        if let Some(receipt) = delta["deliveryReceipt"].as_str() {
+            let acked = call(
+                fixture,
+                reader,
+                read_key,
+                "start_session",
+                json!({"deliveryReceipt": receipt}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(acked.structured_content["acknowledged"], true);
+        }
+        break;
+    }
+    let read_ctx = fixture
+        .control
+        .bootstrap_context(
+            reader.clone(),
+            named_ep,
+            None,
+            ControlPageRequest::new(1, None).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        read_ctx
+            .episode
+            .acknowledgements
+            .get(&scope.scope().space_id)
+            .map_or(SpaceSeq::ZERO, |ack| ack.seq),
+        cutoff
+    );
+    assert_eq!(
+        read_ctx
+            .episode
+            .acknowledgements
+            .get(&second.scope().space_id)
+            .map_or(SpaceSeq::ZERO, |ack| ack.seq),
+        second_cutoff
+    );
+    assert_eq!(
+        read_ctx
+            .owner_acknowledgements
+            .get(&scope.scope().space_id)
+            .map_or(SpaceSeq::ZERO, |ack| ack.seq),
+        SpaceSeq::ZERO
+    );
+    assert_eq!(
+        read_ctx
+            .owner_acknowledgements
+            .get(&second.scope().space_id)
+            .map_or(SpaceSeq::ZERO, |ack| ack.seq),
+        SpaceSeq::ZERO
+    );
+
+    let mut page = call(
+        fixture,
+        writer,
         60,
         "start_session",
         json!({"task":"Verify deliveries"}),
@@ -695,8 +823,8 @@ async fn session_delivery_is_lossless(fixture: &RuntimeFixture, scope: &SpaceCon
     let episode =
         EpisodeId::parse(page.structured_content["session"]["id"].as_str().unwrap()).unwrap();
     assert!(page.content[0].text.contains("continue_"));
-    assert!(owner_ack(fixture, reader, episode.clone(), scope).await < cutoff);
-    assert!(owner_ack(fixture, reader, episode.clone(), &second).await < second_cutoff);
+    assert!(owner_ack(fixture, writer, episode.clone(), scope).await < cutoff);
+    assert!(owner_ack(fixture, writer, episode.clone(), &second).await < second_cutoff);
     let late = append_note(fixture, scope, 43).await.to_string();
 
     let mut seen = BTreeSet::new();
@@ -719,11 +847,11 @@ async fn session_delivery_is_lossless(fixture: &RuntimeFixture, scope: &SpaceCon
             }
         }
         if let Some(receipt) = delta["deliveryReceipt"].as_str() {
-            let before = owner_ack(fixture, reader, episode.clone(), scope).await;
-            let other_before = owner_ack(fixture, reader, episode.clone(), &second).await;
+            let before = owner_ack(fixture, writer, episode.clone(), scope).await;
+            let other_before = owner_ack(fixture, writer, episode.clone(), &second).await;
             let preview = call(
                 fixture,
-                reader,
+                writer,
                 preview_key,
                 "start_session",
                 json!({
@@ -735,18 +863,18 @@ async fn session_delivery_is_lossless(fixture: &RuntimeFixture, scope: &SpaceCon
             preview_key += 1;
             assert_eq!(preview.structured_content["acknowledged"], false);
             assert_eq!(
-                owner_ack(fixture, reader, episode.clone(), scope).await,
+                owner_ack(fixture, writer, episode.clone(), scope).await,
                 before
             );
             assert_eq!(
-                owner_ack(fixture, reader, episode.clone(), &second).await,
+                owner_ack(fixture, writer, episode.clone(), &second).await,
                 other_before
             );
         }
         if let Some(next) = delta["continuation"].as_str() {
             page = call(
                 fixture,
-                reader,
+                writer,
                 key,
                 "start_session",
                 json!({"continuation":next}),
@@ -762,13 +890,13 @@ async fn session_delivery_is_lossless(fixture: &RuntimeFixture, scope: &SpaceCon
     };
     assert_eq!(seen, expected);
     assert!(
-        owner_ack(fixture, reader, episode.clone(), scope).await < cutoff
-            || owner_ack(fixture, reader, episode.clone(), &second).await < second_cutoff
+        owner_ack(fixture, writer, episode.clone(), scope).await < cutoff
+            || owner_ack(fixture, writer, episode.clone(), &second).await < second_cutoff
     );
     for key in [71, 72] {
         call(
             fixture,
-            reader,
+            writer,
             key,
             "start_session",
             json!({"deliveryReceipt":final_receipt}),
@@ -777,11 +905,11 @@ async fn session_delivery_is_lossless(fixture: &RuntimeFixture, scope: &SpaceCon
         .unwrap();
     }
     assert_eq!(
-        owner_ack(fixture, reader, episode.clone(), scope).await,
+        owner_ack(fixture, writer, episode.clone(), scope).await,
         cutoff
     );
     assert_eq!(
-        owner_ack(fixture, reader, episode, &second).await,
+        owner_ack(fixture, writer, episode, &second).await,
         second_cutoff
     );
 }

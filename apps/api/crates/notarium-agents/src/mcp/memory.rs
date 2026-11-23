@@ -14,7 +14,7 @@ use notarium_core::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::{EgressTarget, ToolCallContext, ToolName, decode, invalid, session};
+use super::{EgressTarget, ToolCallContext, ToolName, corpus, decode, invalid, session};
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -149,6 +149,32 @@ pub(super) async fn handle(
     let target = snapshot.resolved.target.clone();
     let category = snapshot.resolved.category.clone();
     let note = snapshot.resolved.note.clone();
+    if matches!(call.target, EgressTarget::InAppProvider { .. }) {
+        let folder_ref = notarium_core::model::FolderRef {
+            space_id: snapshot.scope.space_id.clone(),
+            folder_id: snapshot.parent.clone(),
+        };
+        let (target_project, ancestors) = match &target {
+            MemoryTarget::User { .. } => (None, Vec::new()),
+            MemoryTarget::Project { folder } => {
+                let info = call
+                    .registry
+                    .catalog
+                    .folder(call.account(), folder.clone())
+                    .await?;
+                (Some(folder.clone()), info.ancestor_folders)
+            }
+        };
+        corpus::admit_folder_boundary(
+            call,
+            &scope,
+            &folder_ref,
+            target_project,
+            &ancestors,
+            input.version_token.as_ref().map(|_| DocClass::AgentMemory),
+        )
+        .await?;
+    }
     let identity = call.command_identity(&snapshot.scope, "append_memory", 0);
     let mutation = input.into_mutation(
         snapshot.resolved,
@@ -211,10 +237,10 @@ async fn admit_receipt_metadata(
         .await?
         .ok_or(DomainError::AccessDenied)?;
     let revision = &committed.value.revision.revision;
-    let doc = call
+    let metadata = call
         .registry
         .engine
-        .get_note(
+        .get_note_metadata(
             scope.clone(),
             GetNote {
                 note: note.note_id.clone(),
@@ -223,22 +249,24 @@ async fn admit_receipt_metadata(
             },
         )
         .await?
-        .document;
-    if doc.reference() != note || doc.revision() != revision || doc.class() != DocClass::AgentMemory
+        .metadata;
+    if metadata.reference() != note
+        || metadata.revision() != revision
+        || metadata.class() != DocClass::AgentMemory
     {
         return Err(invalid(ValidationReason::SourceMismatch));
     }
     if target_project
         .as_ref()
-        .is_some_and(|project| !doc.in_project(project))
+        .is_some_and(|project| !metadata.in_project(project))
         || selection
             .project_only
             .as_ref()
-            .is_some_and(|project| !doc.in_project(project))
+            .is_some_and(|project| !metadata.in_project(project))
     {
         return Err(DomainError::AccessDenied.into());
     }
     let proof =
-        ClassEgressFence::provider_note_metadata(&doc.metadata(), scope.auth(), &selection.policy)?;
+        ClassEgressFence::provider_note_metadata(&metadata, scope.auth(), &selection.policy)?;
     call.record_origin(proof, project)
 }

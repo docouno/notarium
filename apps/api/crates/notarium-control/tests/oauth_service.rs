@@ -323,6 +323,7 @@ fn personal_ability(fixture: &Fixture, space: &Space, owner: &PrincipalId, tag: 
         .push(AbilityDescriptor {
             reference: reference.clone(),
             name: format!("guide-{tag}"),
+            description: None,
             kind: AbilityKind::Role,
             enabled: true,
             healthy: true,
@@ -462,11 +463,11 @@ async fn oauth_authoring_concurrent_family_revocation(pg: bool) {
         if trail {
             let request = AccountMutation {
                 identity,
-                input: AbilityTrailUpdate {
+                input: AbilityTrailMutation::Set(AbilityTrailUpdate {
                     source: source.clone(),
                     expected_destination: None,
                     destination: Some(destination.clone()),
-                },
+                }),
             };
             if replay {
                 control
@@ -488,7 +489,7 @@ async fn oauth_authoring_concurrent_family_revocation(pg: bool) {
                 input: AbilityBindingUpdate {
                     ability: binding.clone(),
                     enabled: false,
-                    expected: ControlRevision::ZERO,
+                    expected: AbilityOverlayGuard::Account(ControlRevision::ZERO),
                     projects: AbilityProjects::All,
                 },
             };
@@ -497,7 +498,7 @@ async fn oauth_authoring_concurrent_family_revocation(pg: bool) {
                     .update_ability_binding(account.clone(), request.clone())
                     .await
                     .unwrap();
-                assert!(!saved.value.enabled);
+                assert!(!saved.value.descriptor.unwrap().enabled);
             }
             revoke_between_authoring_checks(
                 &mut fixture,

@@ -9,8 +9,8 @@ use notarium_core::{
     ids::{FolderId, NoteId, SpaceId},
     model::{FolderRef, Lifecycle, NoteRef},
     ports::{
-        CatalogDisclosure, CatalogNote, FolderSnapshot, NoteSnapshot, ProviderErrorCode,
-        ProviderSelection, SpaceContext,
+        CatalogDisclosure, CatalogNote, FolderSnapshot, ProviderErrorCode, ProviderSelection,
+        SpaceContext,
     },
 };
 use serde_json::Value;
@@ -62,24 +62,37 @@ pub(super) async fn locate_note(
     call: &ToolCallContext<'_>,
     id: &NoteId,
 ) -> Result<(SpaceContext, CatalogNote), PortError> {
-    let mut found = None;
-    for space in call.auth.spaces().keys() {
-        match catalog_note(call, space, id).await {
-            Ok(note) if found.is_none() => found = Some(note),
-            Ok(_) => return Err(DomainError::ResourceNotFound.into()),
-            Err(error) if hidden(&error) => (),
-            Err(error) => return Err(error),
-        }
+    let note = call
+        .registry
+        .catalog
+        .locate_note(call.account(), id.clone())
+        .await?;
+    if note.reference.note_id != *id || note.facts.space.id != note.reference.space_id {
+        return Err(invalid(ValidationReason::SourceMismatch));
     }
-    let note = found.ok_or(DomainError::ResourceNotFound)?;
+    if note.lifecycle != Lifecycle::Active || note.facts.class == DocClass::EncryptedNote {
+        return Err(DomainError::ResourceNotFound.into());
+    }
+    if call
+        .auth
+        .spaces()
+        .get(&note.reference.space_id)
+        .is_none_or(|grant| grant.read_classes.is_empty())
+    {
+        return Err(DomainError::ResourceNotFound.into());
+    }
+    call.auth.can_view_resource(&note.facts)?;
     let scope = session::space(call, &note.reference.space_id).await?;
     scope.auth().authorize_read(&note.facts)?;
     Ok((scope, note))
 }
 
-/// Reuse project consent only while ranking candidates within one Space.
+type PolicyCacheKey = (SpaceId, Option<FolderId>);
+type PolicyCacheMap = BTreeMap<PolicyCacheKey, Option<ProviderSelection>>;
+
+/// Reuse project consent decisions within one tool call across Spaces.
 #[derive(Default)]
-pub(super) struct CandidatePolicies(Mutex<BTreeMap<Option<FolderId>, Option<ProviderSelection>>>);
+pub(super) struct CandidatePolicies(Mutex<PolicyCacheMap>);
 
 async fn select_source(
     call: &ToolCallContext<'_>,
@@ -90,7 +103,10 @@ async fn select_source(
     let Some(cache) = candidates else {
         return call.provider_selection(scope, project).await;
     };
-    let key = project.as_ref().map(|project| project.folder_id.clone());
+    let key = (
+        scope.scope().space_id.clone(),
+        project.as_ref().map(|project| project.folder_id.clone()),
+    );
     if let Some(hit) = cache
         .0
         .lock()
@@ -114,6 +130,114 @@ async fn select_source(
     }
     policies.insert(key, entry);
     result
+}
+
+pub(super) async fn admit_provider_note_read(
+    call: &ToolCallContext<'_>,
+    scope: &SpaceContext,
+    note: &CatalogNote,
+) -> Result<Option<ProviderSelection>, PortError> {
+    if note.reference.space_id != scope.scope().space_id {
+        return Err(invalid(ValidationReason::SourceMismatch));
+    }
+    if matches!(call.target, EgressTarget::ExternalMcp) {
+        return Ok(None);
+    }
+    let project = note.facts.project.clone().map(|folder_id| FolderRef {
+        space_id: scope.scope().space_id.clone(),
+        folder_id,
+    });
+    let admitted = match source_policy(call, scope, project, Some(&call.policies), |project| {
+        note.facts.ancestor_folders.contains(&project.folder_id)
+    })
+    .await
+    {
+        Ok(admitted) => admitted,
+        Err(error) if hidden(&error) => return Err(DomainError::ResourceNotFound.into()),
+        Err(error) => return Err(error),
+    };
+    if admitted
+        .as_ref()
+        .is_some_and(|rule| !rule.policy.allowed_classes.contains(&note.facts.class))
+    {
+        return Err(DomainError::ResourceNotFound.into());
+    }
+    Ok(admitted)
+}
+
+pub(super) async fn admit_note_write(
+    call: &ToolCallContext<'_>,
+    scope: &SpaceContext,
+    note: &CatalogNote,
+) -> Result<(), PortError> {
+    let _ = admit_provider_note_read(call, scope, note).await?;
+    Ok(())
+}
+
+pub(super) async fn admit_folder_write(
+    call: &ToolCallContext<'_>,
+    scope: &SpaceContext,
+    folder: &FolderRef,
+    project: Option<FolderRef>,
+    ancestors: &[FolderId],
+    class: DocClass,
+) -> Result<(), PortError> {
+    admit_folder_boundary(call, scope, folder, project, ancestors, Some(class)).await
+}
+
+pub(super) async fn admit_folder_boundary(
+    call: &ToolCallContext<'_>,
+    scope: &SpaceContext,
+    folder: &FolderRef,
+    project: Option<FolderRef>,
+    ancestors: &[FolderId],
+    required_class: Option<DocClass>,
+) -> Result<(), PortError> {
+    if folder.space_id != scope.scope().space_id {
+        return Err(invalid(ValidationReason::SourceMismatch));
+    }
+    if matches!(call.target, EgressTarget::ExternalMcp) {
+        return Ok(());
+    }
+    let admitted = match source_policy(call, scope, project, Some(&call.policies), |boundary| {
+        folder.space_id == boundary.space_id
+            && (folder.folder_id == boundary.folder_id || ancestors.contains(&boundary.folder_id))
+    })
+    .await
+    {
+        Ok(admitted) => admitted,
+        Err(error) if hidden(&error) => return Err(DomainError::ResourceNotFound.into()),
+        Err(error) => return Err(error),
+    };
+    if let Some(class) = required_class
+        && admitted
+            .as_ref()
+            .is_some_and(|rule| !rule.policy.allowed_classes.contains(&class))
+    {
+        return Err(DomainError::ResourceNotFound.into());
+    }
+    Ok(())
+}
+
+pub(super) fn strip_folder_prefix(path: &str, prefix: &str) -> Option<String> {
+    let path = path.trim_matches('/');
+    let prefix = prefix.trim_matches('/');
+    if prefix.is_empty() {
+        return Some(path.to_owned());
+    }
+    if path.is_empty() {
+        return None;
+    }
+    let mut parts = path.split('/');
+    for segment in prefix.split('/') {
+        let next = parts.next()?;
+        if notarium_syntax::unicode::lookup_key(next)
+            != notarium_syntax::unicode::lookup_key(segment)
+        {
+            return None;
+        }
+    }
+    Some(parts.collect::<Vec<_>>().join("/"))
 }
 
 async fn source_policy(
@@ -174,7 +298,7 @@ async fn note_policy(
         space_id: scope.scope().space_id.clone(),
         folder_id,
     });
-    let admitted = source_policy(call, scope, project, None, |project| {
+    let admitted = source_policy(call, scope, project, Some(&call.policies), |project| {
         current.facts.ancestor_folders.contains(&project.folder_id) && in_project(project)
     })
     .await?;
@@ -235,9 +359,9 @@ async fn admit_metadata(
 pub(super) async fn note_metadata_origin(
     call: &ToolCallContext<'_>,
     scope: &SpaceContext,
-    note: &NoteSnapshot,
+    metadata: &ClassifiedMetadata,
 ) -> Result<(ProviderOrigin, Option<FolderRef>), PortError> {
-    admit_metadata(call, scope, &note.document.metadata()).await
+    admit_metadata(call, scope, metadata).await
 }
 
 pub(super) async fn note_metadata(
@@ -268,24 +392,55 @@ pub(super) async fn note_document(
     }
 }
 
-pub(super) async fn search_part(
+pub(super) async fn note_metadata_selection(
+    call: &ToolCallContext<'_>,
+    scope: &SpaceContext,
+    metadata: &ClassifiedMetadata,
+) -> Result<Option<ProviderSelection>, PortError> {
+    note_policy(call, scope, metadata.reference(), |project| {
+        metadata.in_project(project)
+    })
+    .await
+}
+
+pub(super) async fn admit_metadata_with_selection(
+    call: &mut ToolCallContext<'_>,
+    scope: &SpaceContext,
+    metadata: &ClassifiedMetadata,
+    selection: Option<&ProviderSelection>,
+) -> Result<(), PortError> {
+    if let Some(selection) = selection {
+        let origin =
+            ClassEgressFence::provider_note_metadata(metadata, scope.auth(), &selection.policy)?;
+        call.record_origin(origin, selection.project_only.clone())
+    } else {
+        let _ = ClassEgressFence::mcp_note_metadata(metadata, scope.auth())?;
+        Ok(())
+    }
+}
+
+pub(super) async fn search_part_with_selection(
     call: &mut ToolCallContext<'_>,
     scope: &SpaceContext,
     card: &ClassifiedMetadata,
     part: &SearchPart,
+    selection: Option<&ProviderSelection>,
 ) -> Result<String, PortError> {
     let document = part.provenance();
-    if let Some(selection) = note_policy(call, scope, document.reference(), |project| {
-        card.in_project(project) && part.in_project(project)
-    })
-    .await?
-    {
+    if let Some(selection) = selection {
+        if selection
+            .project_only
+            .as_ref()
+            .is_some_and(|project| !card.in_project(project) || !part.in_project(project))
+        {
+            return Err(DomainError::ResourceNotFound.into());
+        }
         let origin =
             ClassEgressFence::provider_note_metadata(card, scope.auth(), &selection.policy)?;
         let content =
             ClassEgressFence::provider_part(part.part().clone(), scope.auth(), &selection.policy)?;
         call.record_origin(origin, selection.project_only.clone())?;
-        call.record_origin(document.origin(), selection.project_only)?;
+        call.record_origin(document.origin(), selection.project_only.clone())?;
         Ok(content.text().to_owned())
     } else {
         ClassEgressFence::mcp_note_metadata(card, scope.auth())?;
@@ -320,7 +475,7 @@ pub(super) async fn folder_metadata(
         space_id: scope.scope().space_id.clone(),
         folder_id,
     });
-    if let Some(selection) = source_policy(call, scope, project, None, |project| {
+    if let Some(selection) = source_policy(call, scope, project, Some(&call.policies), |project| {
         proof.current().in_project(project)
     })
     .await?
@@ -360,6 +515,8 @@ fn control_tags(text: &str) -> impl Iterator<Item = Range<usize>> {
     const TAGS: &[&str] = &[
         "system",
         "systemprompt",
+        "system_prompt",
+        "group_participant_message",
         "instruction",
         "instructions",
         "assistant",
@@ -384,7 +541,10 @@ fn control_tags(text: &str) -> impl Iterator<Item = Range<usize>> {
                 return None;
             }
             let after = &text[start + 1..];
-            let tag = after.strip_prefix('/').unwrap_or(after);
+            let trimmed = after.trim_start_matches(|c: char| c.is_ascii_whitespace());
+            let tag = trimmed.strip_prefix('/').map_or(trimmed, |rest| {
+                rest.trim_start_matches(|c: char| c.is_ascii_whitespace())
+            });
             let name_end = tag.find(|c: char| !c.is_ascii_alphanumeric() && c != '_')?;
             let name = &tag[..name_end];
             if TAGS
@@ -424,7 +584,19 @@ pub(super) fn sanitize_display(display: &mut Value) {
             }
         }
         Value::Array(items) => items.iter_mut().for_each(sanitize_display),
-        Value::Object(fields) => fields.values_mut().for_each(sanitize_display),
+        Value::Object(fields) => {
+            let needs_key_rename = fields.keys().any(|key| control_tags(key).next().is_some());
+            if needs_key_rename {
+                let entries = std::mem::take(fields);
+                for (key, mut value) in entries {
+                    sanitize_display(&mut value);
+                    let safe_key = sanitize_text(&key).unwrap_or(key);
+                    fields.insert(safe_key, value);
+                }
+            } else {
+                fields.values_mut().for_each(sanitize_display);
+            }
+        }
         _ => (),
     }
 }
@@ -442,5 +614,27 @@ pub(super) fn sanitize_activation(display: &mut Value) {
             ("skills", Value::Array(skills)) => skills.iter_mut().for_each(sanitize_activation),
             (_, value) => sanitize_display(value),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_display;
+    use serde_json::json;
+
+    #[test]
+    fn sanitize_display_escapes_group_system_whitespace_and_object_keys() {
+        let mut payload = json!({
+            "msg": "<group_participant_message>hi</group_participant_message> <system_prompt>x</system_prompt> < system>y</ system>",
+            "<system>": "nested",
+        });
+        sanitize_display(&mut payload);
+        let msg = payload["msg"].as_str().unwrap();
+        assert!(!msg.contains("<group_participant_message>"));
+        assert!(!msg.contains("<system_prompt>"));
+        assert!(!msg.contains("< system>"));
+        assert!(!msg.contains("</ system>"));
+        assert!(payload.get("<system>").is_none());
+        assert_eq!(payload["‹system›"], "nested");
     }
 }

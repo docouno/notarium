@@ -1,15 +1,19 @@
 use notarium_core::{
     error::PortError,
     ids::{ContentDigest, NoteId, RevisionId, ViewKey},
-    ports::{Mutation, RollbackAgentRun},
+    ports::{Mutation, RollbackAgentRun, SpaceContext},
 };
 
 use crate::{
-    codec::internal_not_committed, domain::common::derive_command_identity_spec,
+    codec::internal_not_committed,
+    domain::common::{command_identity_hash, derive_command_identity_spec},
     writer::replay::UnboundCommand,
 };
 
-pub(super) fn current(request: &Mutation<RollbackAgentRun>) -> Result<UnboundCommand, PortError> {
+pub(super) fn current(
+    ctx: &SpaceContext,
+    request: &Mutation<RollbackAgentRun>,
+) -> Result<UnboundCommand, PortError> {
     // MessagePack frames each ID, nested tuple and ordered list, including the
     // three optional envelope predicates. Historical IDs have variable lengths.
     let input = &request.input;
@@ -39,6 +43,7 @@ pub(super) fn current(request: &Mutation<RollbackAgentRun>) -> Result<UnboundCom
     ))
     .map_err(|err| internal_not_committed("rollback_fingerprint", err.to_string()))?;
     Ok(derive_command_identity_spec(
+        ctx,
         &request.identity,
         "rollback_agent_run_v2",
         &encoded,
@@ -101,40 +106,66 @@ pub(super) fn legacy(
         fp.update(&er);
         fp.update(assoc.expected_placement_revision.as_str().as_bytes());
     }
-    Ok(Some(
-        derive_command_identity_spec(
-            &request.identity,
-            "rollback_agent_run",
-            fp.finalize().as_bytes(),
-        )
-        .command_hash(),
-    ))
+    Ok(Some(command_identity_hash(
+        &request.identity,
+        "rollback_agent_run",
+        fp.finalize().as_bytes(),
+    )))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use notarium_core::{
-        ids::{AgentRunId, CommandKey, HistoryIncarnation, PrincipalId, SpaceId},
+        auth::{EngineAuthContext, SpaceGrant},
+        ids::{
+            AgentRunId, CommandKey, GrantId, HistoryIncarnation, PrincipalId, RequestId, SpaceId,
+        },
         model::HistoryScope,
         ports::{
-            AssociatedBoardExpectation, NoteRevision, Preconditions, RankExpectation, ViewRef,
+            AssociatedBoardExpectation, CallBudget, Cancellation, NoteRevision, Preconditions,
+            RankExpectation, ViewRef,
         },
         receipt::CommandIdentity,
     };
+    use std::{collections::BTreeMap, time::Duration};
 
     #[test]
     fn fingerprints_frame_legacy_rollback_ids() {
         let short = "aaaaaaaaaaaa";
         let long = "aaaaaaaaaaaaaaaa";
         let revision = RevisionId::from_bytes([2; 16]);
+        let scope = HistoryScope {
+            space_id: SpaceId::from_bytes([3; 16]),
+            incarnation: HistoryIncarnation::from_bytes([4; 16]),
+        };
+        let actor = PrincipalId::from_bytes([5; 16]);
+        let mut spaces = BTreeMap::new();
+        spaces.insert(
+            scope.space_id.clone(),
+            SpaceGrant {
+                role: notarium_core::auth::SpaceRole::Owner,
+                read_classes: notarium_core::classes::DocClass::all(),
+                write_classes: notarium_core::classes::DocClass::all(),
+                project_root: None,
+            },
+        );
+        let auth = EngineAuthContext::for_human(notarium_core::auth::VerifiedHuman::attest(
+            actor.clone(),
+            GrantId::from_bytes([9; 16]),
+            spaces,
+            false,
+        ));
+        let budget = CallBudget {
+            remaining: Duration::from_secs(5),
+            request: RequestId::from_bytes([10; 16]),
+            cancellation: Cancellation::default(),
+        };
+        let ctx = SpaceContext::new(auth, scope.clone(), budget).unwrap();
         let command = Mutation {
             identity: CommandIdentity {
-                scope: HistoryScope {
-                    space_id: SpaceId::from_bytes([3; 16]),
-                    incarnation: HistoryIncarnation::from_bytes([4; 16]),
-                },
-                actor: PrincipalId::from_bytes([5; 16]),
+                scope,
+                actor,
                 key: CommandKey::from_bytes([6; 16]),
                 hash: ContentDigest::from_bytes([7; 32]),
             },
@@ -157,8 +188,8 @@ mod tests {
             revision: RevisionId::parse(short).unwrap(),
         });
         assert_ne!(
-            current(&a).unwrap().command_hash(),
-            current(&b).unwrap().command_hash()
+            current(&ctx, &a).unwrap().command_hash(),
+            current(&ctx, &b).unwrap().command_hash()
         );
         assert_eq!(legacy(&a).unwrap(), None);
         assert_eq!(legacy(&b).unwrap(), None);
@@ -180,8 +211,8 @@ mod tests {
             .associated_board_expectations
             .push(board(long, short));
         assert_ne!(
-            current(&a).unwrap().command_hash(),
-            current(&b).unwrap().command_hash()
+            current(&ctx, &a).unwrap().command_hash(),
+            current(&ctx, &b).unwrap().command_hash()
         );
         assert_eq!(legacy(&a).unwrap(), None);
         assert_eq!(legacy(&b).unwrap(), None);
