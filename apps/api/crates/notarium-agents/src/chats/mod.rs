@@ -31,7 +31,10 @@ use tokio::{
 
 use crate::{
     mcp::{ToolRegistry, derive_digest, derive_key},
-    revocation::{RevocationHub, RunRevocationLease, ViewerRevocationLease},
+    revocation::{
+        PendingCredential, PendingCredentialKey, RevocationHub, RunRevocationLease,
+        ViewerRevocationLease,
+    },
 };
 use stream::{RunFailure, StepStreamBuffer, StepSubscription, StreamCursor, StreamRead};
 
@@ -299,6 +302,7 @@ impl AgentRunSupervisor {
                     AccountContext::new(owner, account.budget),
                     request,
                     branch.thread,
+                    None,
                     None,
                 )
                 .await?
@@ -718,6 +722,7 @@ impl AgentRunSupervisor {
         request: StartChatRun,
         thread: ChatThread,
         predecessor: Option<&AgentRunId>,
+        sender: Option<(&PendingCredentialKey, &PendingCredential)>,
     ) -> Result<LaunchOutcome, PortError> {
         if self.inner.shutdown.is_cancelled()
             || !request.options.limits.fits(RunLimits::HARD_CEILING)
@@ -756,6 +761,13 @@ impl AgentRunSupervisor {
         auth.taint().merge(account.auth().taint());
         let cancellation = Cancellation::default();
         let admission = bounded(&account.budget, MAINTENANCE_BUDGET, cancellation.clone());
+        let lease = self.inner.revocations.register_run_with_sender(
+            maintenance(admission.clone()),
+            &auth,
+            None,
+            cancellation.clone(),
+            sender,
+        )?;
         let owner = match &self.inner.coordination {
             Coordination::Local => OwnerLease::Local,
             Coordination::Clustered(authority) => {
@@ -784,12 +796,7 @@ impl AgentRunSupervisor {
                 )
             }
         };
-        let lease = self.inner.revocations.register_run(
-            maintenance(admission.clone()),
-            &auth,
-            None,
-            cancellation.clone(),
-        )?;
+        lease.check()?;
         let account = self
             .live_account(AccountContext::new(
                 account.auth().clone(),

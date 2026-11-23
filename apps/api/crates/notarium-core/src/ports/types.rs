@@ -20,8 +20,10 @@ use std::{
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PageLimit(u16);
 impl PageLimit {
+    pub const MAX: u16 = 200;
+
     pub fn new(value: u16) -> DomainResult<Self> {
-        if value == 0 || value > 200 {
+        if value == 0 || value > Self::MAX {
             return Err(DomainError::validation(ValidationReason::InvalidLimit));
         }
         Ok(Self(value))

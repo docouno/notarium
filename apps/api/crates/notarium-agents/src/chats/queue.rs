@@ -1,5 +1,4 @@
 use super::*;
-use crate::revocation::{PendingCredential, PendingCredentialKey};
 use notarium_core::auth::{SpaceLifecycle, SpaceRole};
 
 pub(super) struct ConsumeAttempt {
@@ -159,7 +158,10 @@ impl AgentRunSupervisor {
                         options: sender.options().clone(),
                     };
                     let owner = AccountContext::new(sender.auth().clone(), account.budget);
-                    match self.launch(owner, start, branch.thread, None).await {
+                    match self
+                        .launch(owner, start, branch.thread, None, Some((&key, &sender)))
+                        .await
+                    {
                         Ok(LaunchOutcome::Started(id)) => run = Some(id),
                         Err(error)
                             if !sender.cancellation().is_cancelled()
@@ -272,7 +274,7 @@ impl AgentRunSupervisor {
                 } else {
                     None
                 };
-            let Some((account, options)) = account else {
+            let Some((account, sender)) = account else {
                 self.dismiss(run, &attempt.key).await?;
                 *unsettled = None;
                 continue;
@@ -341,7 +343,7 @@ impl AgentRunSupervisor {
                             scope: run.scope.clone(),
                             thread: run.thread.clone(),
                             expected_leaf: entry.seq,
-                            options,
+                            options: sender.options().clone(),
                         };
                         let follow = AccountContext::new(
                             account.auth().clone(),
@@ -352,7 +354,13 @@ impl AgentRunSupervisor {
                         match self.thread_at(next_context, &run.thread, entry.seq).await {
                             Ok(branch) => {
                                 match self
-                                    .launch(follow, next, branch.thread, Some(&run.id))
+                                    .launch(
+                                        follow,
+                                        next,
+                                        branch.thread,
+                                        Some(&run.id),
+                                        Some((&attempt.key, &sender)),
+                                    )
                                     .await
                                 {
                                     Ok(LaunchOutcome::Started(_) | LaunchOutcome::Draining(_)) => {
@@ -400,7 +408,7 @@ impl AgentRunSupervisor {
         run: &ActiveRun,
         item: &QueuedChatInput,
         credential: PendingCredential,
-    ) -> Result<Option<(AccountContext, ChatRunOptions)>, PortError> {
+    ) -> Result<Option<(AccountContext, PendingCredential)>, PortError> {
         if credential.auth().principal() != &item.sender || credential.cancellation().is_cancelled()
         {
             return Ok(None);
@@ -442,7 +450,7 @@ impl AgentRunSupervisor {
                     && access.space.lifecycle == SpaceLifecycle::Active
                     && matches!(access.role, SpaceRole::Owner | SpaceRole::Editor)
                     && !credential.cancellation().is_cancelled())
-                .then(|| (account, credential.options().clone())));
+                .then_some((account, credential)));
             }
             let Some(next) = page.continuation else {
                 return Ok(None);
@@ -476,6 +484,9 @@ fn no_authority(error: &PortError) -> bool {
 }
 
 fn retry_handoff(error: &PortError) -> Option<PortError> {
+    if concurrency_retry_delay(error).is_some() {
+        return Some(error.clone());
+    }
     let (PortError::Unavailable(failure) | PortError::DeadlineExceeded(failure)) = error else {
         return None;
     };
@@ -512,4 +523,14 @@ pub(super) fn retry_cleanup(error: &PortError) -> bool {
             error,
             PortError::Unavailable(_) | PortError::DeadlineExceeded(_) | PortError::Internal(_)
         )
+}
+
+pub(super) fn concurrency_retry_delay(error: &PortError) -> Option<Duration> {
+    match error {
+        PortError::Domain(DomainError::RateLimited {
+            budget: notarium_core::error::BudgetKind::Concurrency,
+            retry_after_ms,
+        }) => Some(Duration::from_millis(*retry_after_ms)),
+        _ => None,
+    }
 }

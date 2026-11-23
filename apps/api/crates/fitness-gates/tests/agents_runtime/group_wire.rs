@@ -214,16 +214,26 @@ async fn group_turn(
         [DocClass::UserDoc].into(),
     )
     .await;
-    let supervisor = AgentRunSupervisor::new_local(
-        local.registry,
-        fixture.revocations.clone(),
-        ExclusiveDataRoot::attest_open_writer(),
-    );
     let options = ChatRunOptions {
         provider: Some(local.resource.id),
         model: Some(local.model),
         ..ChatRunOptions::default()
     };
+    let membership = Box::pin(super::supervised_takeover_cases::revoked_handoffs(
+        fixture,
+        local.registry.clone(),
+        scope,
+        peer,
+        membership,
+        &options,
+        &listener,
+    ))
+    .await;
+    let supervisor = AgentRunSupervisor::new_local(
+        local.registry,
+        fixture.revocations.clone(),
+        ExclusiveDataRoot::attest_open_writer(),
+    );
     let submission = super::supervised_chat_cases::retry_unacknowledged_append(
         fixture,
         &supervisor,

@@ -261,7 +261,7 @@ async fn recall_packs_after_recipient_consent(
     use runtime_ability_cases::{approve_disclosure, loopback_provider};
     let allowed = NoteId::from_bytes([73; 16]);
     let mut creates = Vec::new();
-    for (tag, class, title, extra) in [
+    let ranked = [
         (
             71,
             DocClass::AgentMemory,
@@ -278,24 +278,43 @@ async fn recall_packs_after_recipient_consent(
     ]
     .into_iter()
     .chain((100..198).map(|tag| (tag, DocClass::AgentMemory, "Recallrank memory", "")))
-    {
+    .map(|(tag, class, title, extra)| {
+        let body = format!(
+            "recallrank {extra} windowprobe exactprobe {}",
+            "evidence ".repeat(18)
+        );
+        ([tag; 16], class, title, body)
+    });
+    // Of 801 notes matching windowprobe, exactly 800 also match exactprobe.
+    let boundary = (1_u128..=700).map(|index| {
+        let body = if index < 700 {
+            "windowprobe exactprobe"
+        } else {
+            "windowprobe"
+        };
+        (
+            index.to_be_bytes(),
+            DocClass::AgentMemory,
+            "Memory",
+            body.to_owned(),
+        )
+    });
+    for (key, class, title, body) in ranked.chain(boundary) {
+        let note = NoteId::from_bytes(key);
         creates.push(Mutation {
             identity: CommandIdentity {
                 scope: space.scope().clone(),
                 actor: space.auth().principal().clone(),
-                key: CommandKey::from_bytes([tag; 16]),
-                hash: ContentDigest::from_bytes([tag; 32]),
+                key: CommandKey::from_bytes(key),
+                hash: ContentDigest::from_bytes(*blake3::hash(&key).as_bytes()),
             },
             preconditions: Preconditions::default(),
             input: BatchItem::Create(CreateNote {
-                note: NoteId::from_bytes([tag; 16]),
+                slug: format!("ranked-{:032x}", u128::from_be_bytes(key)),
+                note,
                 parent: Some(project_id.clone()),
-                slug: format!("ranked-{tag}"),
                 class,
-                carrier: format!(
-                    "# {title}\n\nrecallrank {extra} {}\n",
-                    "evidence ".repeat(18)
-                ),
+                carrier: format!("# {title}\n\n{body}\n"),
                 folder_page: false,
             }),
         });
@@ -349,24 +368,84 @@ async fn recall_packs_after_recipient_consent(
     );
     assert!(!all.truncated);
 
-    struct OnlyClass(DocClass);
+    struct OnlyClass {
+        class: DocClass,
+        inspected: std::sync::atomic::AtomicUsize,
+    }
+    impl OnlyClass {
+        fn new(class: DocClass) -> Self {
+            Self {
+                class,
+                inspected: Default::default(),
+            }
+        }
+    }
     impl SearchRecipient for OnlyClass {
         fn admit<'a>(
             &'a self,
             card: &'a notarium_core::classes::ClassifiedMetadata,
         ) -> PortFuture<'a, bool> {
-            Box::pin(async move { Ok(card.class() == self.0) })
+            self.inspected
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Box::pin(async move { Ok(card.class() == self.class) })
         }
     }
     let first = SearchQuery {
-        text: "triorank".into(),
         top_k: PageLimit::new(1).unwrap(),
         ..query
+    };
+    let recalled = reads
+        .search
+        .recall_for(
+            space.clone(),
+            RecallQuery {
+                query: first.clone(),
+                graph_depth: 0,
+                token_budget: 4096,
+                max_per_source: None,
+            },
+            Some(&OnlyClass::new(DocClass::UserDoc)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(recalled.hits.len(), 1);
+    assert_eq!(
+        recalled.hits[0]
+            .card
+            .document
+            .provenance()
+            .reference()
+            .note_id,
+        allowed
+    );
+    assert!(!recalled.truncated);
+    for (text, overflow) in [("exactprobe", false), ("windowprobe", true)] {
+        // The extra note is only a rank witness and never reaches admission.
+        let recipient = OnlyClass::new(DocClass::Skill);
+        let denied = reads
+            .search
+            .search_for(
+                space.clone(),
+                SearchQuery {
+                    text: text.into(),
+                    ..first.clone()
+                },
+                Some(&recipient),
+            )
+            .await
+            .unwrap();
+        assert!(denied.hits.is_empty());
+        assert_eq!(denied.truncated, overflow, "{text}");
+        assert_eq!(recipient.inspected.into_inner(), 800);
+    }
+    let first = SearchQuery {
+        text: "triorank".into(),
+        ..first
     };
     for (class, has_more) in [(DocClass::UserDoc, false), (DocClass::AgentMemory, true)] {
         let admitted = reads
             .search
-            .search_for(space.clone(), first.clone(), Some(&OnlyClass(class)))
+            .search_for(space.clone(), first.clone(), Some(&OnlyClass::new(class)))
             .await
             .unwrap();
         assert_eq!(admitted.hits.len(), 1);
@@ -415,7 +494,7 @@ async fn recall_packs_after_recipient_consent(
         let args = if name == "recall" {
             json!({"query":"recallrank", "project":project, "depth":0, "budgetTokens":200, "maxPerSource":100})
         } else {
-            json!({"query":"triorank", "project":project, "limit":1})
+            json!({"query":"recallrank", "project":project, "limit":1})
         };
         let result = local
             .registry
@@ -435,6 +514,7 @@ async fn recall_packs_after_recipient_consent(
             .await
             .unwrap()
             .structured_content;
+        assert!(result.get("truncated").is_none());
         let hits = result[field].as_array().unwrap();
         assert_eq!(hits.len(), 1, "{result}");
         assert_eq!(hits[0]["noteId"], json!(allowed));

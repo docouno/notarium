@@ -2,7 +2,7 @@ use super::{Eligible, align::Overlay, retry_snapshot};
 use crate::{
     engine::{Clock, internal},
     lexical::{HitKey, LexicalHit},
-    vector::ChunkMetadata,
+    vector::{ChunkMetadata, VectorHit},
 };
 use notarium_core::{
     DomainError, DomainResult,
@@ -45,6 +45,29 @@ impl Candidate {
         self.score += 1.0 / (60.0 + rank as f64);
         self.best_rank = self.best_rank.min(rank);
     }
+}
+
+// Each collector was asked for limit + 1. Vector results contain both the
+// leading chunks and a representative per distinct note; only another note
+// witnesses an unfinished note window.
+pub(crate) fn trim_recipient_window(
+    lexical: &mut Vec<LexicalHit>,
+    vectors: &mut Vec<VectorHit>,
+    limit: usize,
+) -> bool {
+    let lexical_overflow = lexical.len() > limit;
+    lexical.truncate(limit);
+    if vectors.len() <= limit {
+        return lexical_overflow;
+    }
+    let mut notes = HashSet::new();
+    let mut rank = 0;
+    vectors.retain(|hit| {
+        rank += 1;
+        let first = notes.insert(hit.metadata.note.clone());
+        rank <= limit || (first && notes.len() <= limit)
+    });
+    lexical_overflow || notes.len() > limit
 }
 
 #[doc(hidden)]

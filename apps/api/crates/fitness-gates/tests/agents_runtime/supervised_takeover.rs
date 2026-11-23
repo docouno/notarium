@@ -7,9 +7,9 @@ use notarium_agents::chats::{
     RunOwnershipTransition, StartChatRun,
 };
 use notarium_core::{
-    auth::{ChatAudience, SpaceKind},
+    auth::{ChatAudience, SpaceKind, SpaceRole},
     classes::DocClass,
-    error::{CommitEffect, OperationalFailure, RetryAdvice},
+    error::{BudgetKind, CommitEffect, OperationalFailure, RetryAdvice},
     ids::ThreadEntrySeq,
     model::HistoryScope,
 };
@@ -17,6 +17,7 @@ use std::{sync::Mutex, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
+    sync::oneshot,
     time::{sleep, timeout},
 };
 
@@ -30,7 +31,9 @@ struct SharedAuthority {
 #[derive(Default)]
 struct Generation {
     lost: bool,
-    reject_next_owner: bool,
+    reject_owner: std::collections::VecDeque<PortError>,
+    pause_owner: Option<(oneshot::Sender<Cancellation>, oneshot::Receiver<()>)>,
+    handoff_retry_after: Option<tokio::time::Instant>,
     registrations: Vec<(RunOwnershipTransition, Cancellation)>,
     inputs: Vec<Cancellation>,
 }
@@ -71,8 +74,26 @@ impl SharedAuthority {
             .any(|(saved, _)| saved == transition)
     }
 
-    fn reject_next_owner(&self) {
-        self.generation.lock().unwrap().reject_next_owner = true;
+    fn reject_next_owner(&self, error: PortError) {
+        self.generation
+            .lock()
+            .unwrap()
+            .reject_owner
+            .push_back(error);
+    }
+
+    fn pause_next_owner(&self) -> (oneshot::Receiver<Cancellation>, oneshot::Sender<()>) {
+        let (entered, observed) = oneshot::channel();
+        let (resume, release) = oneshot::channel();
+        assert!(
+            self.generation
+                .lock()
+                .unwrap()
+                .pause_owner
+                .replace((entered, release))
+                .is_none()
+        );
+        (observed, resume)
     }
 }
 
@@ -122,17 +143,27 @@ impl ClusterRunAuthority for SharedAuthority {
         cancellation: Cancellation,
     ) -> PortFuture<'_, Box<dyn LiveRunOwner>> {
         Box::pin(async move {
+            let pause = self.generation.lock().unwrap().pause_owner.take();
+            if let Some((entered, release)) = pause {
+                entered.send(cancellation.clone()).unwrap();
+                release.await.unwrap();
+            }
             let mut generation = self.generation.lock().unwrap();
-            if std::mem::take(&mut generation.reject_next_owner) {
-                return Err(PortError::Unavailable(
-                    OperationalFailure::new(
-                        ContentDigest::from_bytes([0xfa; 32]),
-                        CommitEffect::NotCommitted,
-                        RetryAdvice::Never,
-                        false,
-                    )
-                    .unwrap(),
-                ));
+            if let Some(deadline) = generation.handoff_retry_after.take() {
+                assert!(
+                    tokio::time::Instant::now() >= deadline,
+                    "FIFO retried before admission reopened"
+                );
+            }
+            if let Some(error) = generation.reject_owner.pop_front() {
+                if matches!(request.transition, RunOwnershipTransition::Handoff { .. })
+                    && let PortError::Domain(DomainError::RateLimited { retry_after_ms, .. }) =
+                        &error
+                {
+                    generation.handoff_retry_after =
+                        Some(tokio::time::Instant::now() + Duration::from_millis(*retry_after_ms));
+                }
+                return Err(error);
             }
             if generation.lost {
                 cancellation.cancel();
@@ -336,7 +367,16 @@ async fn fenced_ownership_recovers_pending_inputs(
         old_authority.clone(),
     );
     let initial = input(1, ThreadEntrySeq::ZERO, "An active writer".into());
-    old_authority.reject_next_owner();
+    let unavailable = PortError::Unavailable(
+        OperationalFailure::new(
+            ContentDigest::from_bytes([0xfa; 32]),
+            CommitEffect::NotCommitted,
+            RetryAdvice::Never,
+            false,
+        )
+        .unwrap(),
+    );
+    old_authority.reject_next_owner(unavailable.clone());
     assert!(matches!(
         primary.enqueue_input(fixture.human.clone(), initial.clone(), options.clone()).await,
         Err(PortError::Unavailable(failure))
@@ -347,6 +387,15 @@ async fn fenced_ownership_recovers_pending_inputs(
     assert!(saved.thread.active_run.is_none());
     assert_eq!(saved.entries.len(), 1);
     assert_eq!(saved.entries[0].kind, ChatEntryKind::Human);
+    let rate_limit = DomainError::RateLimited {
+        retry_after_ms: 60,
+        budget: BudgetKind::Concurrency,
+    };
+    old_authority.reject_next_owner(rate_limit.clone().into());
+    assert!(
+        matches!(primary.enqueue_input(fixture.human.clone(), initial.clone(), options.clone()).await,
+        Err(PortError::Domain(error)) if error == rate_limit)
+    );
     let first = primary
         .enqueue_input(
             fixture.human.clone(),
@@ -618,7 +667,8 @@ async fn fenced_ownership_recovers_pending_inputs(
             .unwrap();
         assert!(matches!(queued.outcome, SubmitUserChatOutcome::Queued(_)));
     }
-    authority.reject_next_owner();
+    authority.reject_next_owner(unavailable);
+    authority.reject_next_owner(rate_limit.into());
     wire.get_mut().write_all(reply.as_bytes()).await.unwrap();
     for message in messages {
         let (mut wire, prompt) = timeout(Duration::from_secs(15), read_request(&listener))
@@ -665,6 +715,169 @@ async fn takeover_case(pg: bool) {
         SpaceContext::new(fixture.human.auth().clone(), personal.history, budget()).unwrap();
     let fixture = Box::pin(fenced_ownership_recovers_pending_inputs(fixture, &reader)).await;
     fixture.close().await;
+}
+
+pub(super) async fn revoked_handoffs(
+    fixture: &RuntimeFixture,
+    registry: Arc<ToolRegistry>,
+    scope: &SpaceContext,
+    peer: &SpaceContext,
+    mut membership: ControlRevision,
+    options: &ChatRunOptions,
+    listener: &TcpListener,
+) -> ControlRevision {
+    let authority = Arc::new(SharedAuthority::new(fixture.revocations.clone(), None));
+    let supervisor =
+        AgentRunSupervisor::new_clustered(registry, fixture.revocations.clone(), authority.clone());
+    let owner = AccountContext::new(scope.auth().clone(), budget());
+    let editor = AccountContext::new(peer.auth().clone(), budget());
+    for (tag, queued) in [(210, false), (220, true)] {
+        let thread = ChatThreadId::from_bytes([tag; 16]);
+        let identity = |actor: &AccountContext, offset| CommandIdentity {
+            scope: scope.scope().clone(),
+            actor: actor.auth().principal().clone(),
+            key: CommandKey::from_bytes([tag + offset; 16]),
+            hash: ContentDigest::from_bytes([tag + offset; 32]),
+        };
+        fixture
+            .canonical
+            .create_chat(
+                scope.clone(),
+                Mutation {
+                    identity: identity(&owner, 0),
+                    preconditions: Preconditions::default(),
+                    input: CreateChat {
+                        thread: thread.clone(),
+                        kind: ChatThreadKind::SpaceGroup,
+                        owner: owner.auth().principal().clone(),
+                        title: "Revoked sender".into(),
+                        project_folder: None,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        let input = |account: &AccountContext, offset, leaf, text: &str| SubmitUserChatInput {
+            identity: identity(account, offset),
+            id: PendingInputId::from_bytes([tag + offset; 16]),
+            thread: thread.clone(),
+            expected_leaf: leaf,
+            body: text.into(),
+            mentions_agent: true,
+        };
+        let mut leaf = ThreadEntrySeq::ZERO;
+        let predecessor = if queued {
+            let (hydrating, resume) = fixture.projections.pause_chat_hydration();
+            let first = supervisor
+                .enqueue_input(
+                    owner.clone(),
+                    input(&owner, 1, leaf, "Hold this turn"),
+                    options.clone(),
+                )
+                .await
+                .unwrap();
+            let SubmitUserChatOutcome::Appended(saved) = first.outcome else {
+                panic!("expected initial post")
+            };
+            leaf = saved.value.seq;
+            timeout(Duration::from_secs(10), hydrating)
+                .await
+                .unwrap()
+                .unwrap();
+            Some((first.run.unwrap(), resume))
+        } else {
+            None
+        };
+        let post = input(&editor, 2, leaf, "An editor mentions the agent");
+        let (entered, resume) = authority.pause_next_owner();
+        let enqueue = tokio::spawn({
+            let supervisor = supervisor.clone();
+            let account = editor.clone();
+            let post = post.clone();
+            let options = options.clone();
+            async move {
+                supervisor
+                    .enqueue_input(account, post, options)
+                    .await
+                    .unwrap()
+            }
+        });
+        let direct = if let Some((run, release)) = predecessor {
+            assert!(matches!(
+                enqueue.await.unwrap().outcome,
+                SubmitUserChatOutcome::Queued(_)
+            ));
+            supervisor
+                .stop(owner.clone(), scope.scope().clone(), thread.clone(), run)
+                .await
+                .unwrap();
+            release.send(()).unwrap();
+            None
+        } else {
+            Some(enqueue)
+        };
+        let token = timeout(Duration::from_secs(10), entered)
+            .await
+            .unwrap()
+            .unwrap();
+        for (offset, role) in [(3, SpaceRole::Viewer), (4, SpaceRole::Editor)] {
+            membership = fixture
+                .control
+                .change_membership(
+                    scope.clone(),
+                    MembershipChange {
+                        command: CommandKey::from_bytes([tag + offset; 16]),
+                        member: editor.auth().principal().clone(),
+                        role: Some(role),
+                        expected: membership,
+                    },
+                )
+                .await
+                .unwrap()
+                .revision;
+            assert!(
+                token.is_cancelled(),
+                "the completed membership change must fence the registering owner"
+            );
+        }
+        resume.send(()).unwrap();
+        if let Some(enqueue) = direct {
+            let submission = enqueue.await.unwrap();
+            assert!(matches!(
+                submission.outcome,
+                SubmitUserChatOutcome::Appended(_)
+            ));
+            assert!(submission.run.is_none());
+        }
+        let head = supervised_chat_cases::idle_leaf(fixture, scope, &thread).await;
+        let branch = supervised_chat_cases::branch(fixture, scope, &thread, head).await;
+        assert_eq!(
+            branch
+                .entries
+                .iter()
+                .filter(|e| e.author == *editor.auth().principal())
+                .count(),
+            1
+        );
+        assert!(
+            branch
+                .entries
+                .iter()
+                .all(|e| e.kind == ChatEntryKind::Human)
+        );
+        let replay = supervisor
+            .enqueue_input(editor.clone(), post, options.clone())
+            .await
+            .unwrap();
+        assert!(replay.run.is_none());
+        assert!(
+            timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+    supervisor.shutdown();
+    membership
 }
 
 #[tokio::test]

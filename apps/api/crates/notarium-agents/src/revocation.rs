@@ -251,6 +251,17 @@ impl RevocationHub {
         selection: Option<&ProviderSelection>,
         cancellation: Cancellation,
     ) -> Result<RunRevocationLease, PortError> {
+        self.register_run_with_sender(ctx, auth, selection, cancellation, None)
+    }
+
+    pub(crate) fn register_run_with_sender(
+        &self,
+        ctx: MaintenanceContext,
+        auth: &EngineAuthContext,
+        selection: Option<&ProviderSelection>,
+        cancellation: Cancellation,
+        sender: Option<(&PendingCredentialKey, &PendingCredential)>,
+    ) -> Result<RunRevocationLease, PortError> {
         let budget = RevocationBudget::new(ctx)?;
         budget.check()?;
         let run = match auth.kind() {
@@ -272,6 +283,16 @@ impl RevocationHub {
         }
         let mut state = self.inner.lock();
         state.ensure_open()?;
+        // A regrant must never revive a revoked input. Validate its original
+        // registration and publish the run to revocation under the same lock.
+        if let Some((key, sender)) = sender
+            && state
+                .pending
+                .get(key)
+                .is_none_or(|entry| entry.registration != sender.registration)
+        {
+            return Err(cancelled());
+        }
         if state.fenced(&selectors) || state.runs.contains_key(run) {
             return Err(revocation_unavailable());
         }

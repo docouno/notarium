@@ -31,9 +31,14 @@ impl AgentRunSupervisor {
             let gate = self.thread_gate(&run.scope, &run.thread);
             loop {
                 let admission = gate.lock().await;
-                match self.drain_locked(&run, &mut unsettled).await {
+                let drained = self.drain_locked(&run, &mut unsettled).await;
+                let advised = drained
+                    .as_ref()
+                    .err()
+                    .and_then(queue::concurrency_retry_delay);
+                match drained {
                     Err(error)
-                        if queue::retry_cleanup(&error)
+                        if (advised.is_some() || queue::retry_cleanup(&error))
                             && run.owner.check().is_ok()
                             && !self.inner.shutdown.is_cancelled()
                             && (!drain_only || unsettled.is_some()) =>
@@ -60,9 +65,15 @@ impl AgentRunSupervisor {
                         return;
                     }
                 }
-                tokio::select! {
-                    () = tokio::time::sleep(delay) => (),
-                    () = self.inner.shutdown.cancelled() => (),
+                let mut remaining = delay.max(advised.unwrap_or_default());
+                while !remaining.is_zero() && run.owner.check().is_ok() {
+                    // A shared owner may advise a longer wait. Release a lost
+                    // route promptly without retrying the input before then.
+                    let interval = remaining.min(Duration::from_secs(2));
+                    tokio::select! {
+                        () = tokio::time::sleep(interval) => remaining -= interval,
+                        () = self.inner.shutdown.cancelled() => break,
+                    }
                 }
                 delay = (delay * 2).min(Duration::from_secs(2));
             }

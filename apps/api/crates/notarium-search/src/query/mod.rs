@@ -19,8 +19,8 @@ use notarium_core::{
     ids::{FolderId, NoteId, PrincipalId},
     model::{DenseNodeId, FolderRef, SnapshotCut},
     ports::{
-        PortFuture, RecallQuery, SearchDegradation, SearchPort, SearchQuery, SearchRecipient,
-        SearchResult, SpaceContext, StructuralSnapshot,
+        PageLimit, PortFuture, RecallQuery, SearchDegradation, SearchPort, SearchQuery,
+        SearchRecipient, SearchResult, SpaceContext, StructuralSnapshot,
     },
     query::Predicate,
 };
@@ -161,7 +161,23 @@ impl SearchEngine {
             .await?,
         );
         let top_k = usize::from(request.top_k.get());
-        let candidate_k = search_candidate_limit(top_k);
+        let ordinary_limit = search_candidate_limit(top_k);
+        // A recipient may reject an entire ranked prefix. Collect once, with
+        // one extra distinct note per branch to witness an unfinished window.
+        const RECIPIENT_LIMIT: usize = search_candidate_limit(PageLimit::MAX as usize);
+        let candidate_k = if delivery.recipient.is_some_and(|r| r.filters_notes()) {
+            let probe_limit = RECIPIENT_LIMIT + 1;
+            filter.nodes.as_ref().map_or(probe_limit, |nodes| {
+                // The base mask bounds distinct indexed notes. Receipts may
+                // introduce new ones. Preserve the ordinary vector chunk depth.
+                nodes
+                    .cardinality()
+                    .saturating_add(aligned.overlay.len() as u64)
+                    .clamp(ordinary_limit as u64, probe_limit as u64) as usize
+            })
+        } else {
+            ordinary_limit
+        };
         let excluded: Arc<BTreeSet<_>> = Arc::new(aligned.overlay.keys().cloned().collect());
 
         let lexical = async {
@@ -201,7 +217,9 @@ impl SearchEngine {
             limit: candidate_k,
             browse,
         });
-        let (notes, vectors) = tokio::try_join!(lexical, vectors)?;
+        let (mut notes, mut vectors) = tokio::try_join!(lexical, vectors)?;
+        let window_truncated = candidate_k > RECIPIENT_LIMIT
+            && ranking::trim_recipient_window(&mut notes, &mut vectors.hits, RECIPIENT_LIMIT);
 
         let mut candidates = ranking::fuse(notes, vectors.hits, browse);
         let graph_truncated = if let Some(recall) = recall.filter(|recall| recall.graph_depth != 0)
@@ -293,7 +311,11 @@ impl SearchEngine {
             chat_hits,
             cut: aligned.cut,
             degraded: vectors.degraded,
-            truncated: graph_truncated || notes_truncated || chat_truncated || packing_truncated,
+            truncated: window_truncated
+                || graph_truncated
+                || notes_truncated
+                || chat_truncated
+                || packing_truncated,
         })
     }
 

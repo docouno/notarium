@@ -1255,12 +1255,35 @@ async fn verify_run_query_disclosure(
         let result = published_semantic_query(search, actor, query(text)).await;
         assert!(!result.hits.is_empty());
     }
+    struct DenyNotes;
+    impl notarium_core::ports::SearchRecipient for DenyNotes {
+        fn admit<'a>(
+            &'a self,
+            _: &'a notarium_core::classes::ClassifiedMetadata,
+        ) -> PortFuture<'a, bool> {
+            Box::pin(async { Ok(false) })
+        }
+    }
+    let rejected = search
+        .search_for(
+            shared.clone(),
+            SearchQuery {
+                top_k: PageLimit::new(1).unwrap(),
+                ..query("recipientquery")
+            },
+            Some(&DenyNotes),
+        )
+        .await
+        .unwrap();
+    assert!(rejected.hits.is_empty());
+    assert!(rejected.degraded.is_none());
     assert_eq!(
         &wire_inputs.lock().unwrap()[initial..],
         &[
             vec!["externalmcpquery".to_owned()],
             vec!["cleanrunquery".to_owned()],
-            vec!["approvedkeeperquery".to_owned()]
+            vec!["approvedkeeperquery".to_owned()],
+            vec!["recipientquery".to_owned()]
         ]
     );
 

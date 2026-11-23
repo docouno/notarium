@@ -974,6 +974,17 @@ fn vector_candidates_rank_notes_and_keep_their_best_chunks_across_tiers() {
     let hits = snapshot
         .search_visible(&dominant.vector, &mask, 100, budget, |_| Ok(true))
         .unwrap();
+    // Chunk overflow from the dominant note alone does not truncate a note window.
+    for (limit, overflow) in [(3, false), (2, true)] {
+        let mut window = hits.hits.clone();
+        assert_eq!(
+            crate::query::ranking::trim_recipient_window(&mut Vec::new(), &mut window, limit),
+            overflow,
+        );
+        let kept = crate::query::ranking::fuse(Vec::new(), window, false);
+        assert_eq!(kept.len(), limit);
+        assert_eq!(kept[0].chunks.len(), limit);
+    }
     let notes = crate::query::ranking::fuse(Vec::new(), hits.hits, false);
     assert_eq!(
         notes.iter().map(|row| &row.note).collect::<Vec<_>>(),

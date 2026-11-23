@@ -36,12 +36,22 @@ before shutting down canonical storage.
   a consistent canonical head and applies the current taint of returned chats. A
   project-scoped Keeper can search its explicitly pinned skills outside the
   project when no folder is requested.
+- For provider-recipient search and recall, the output limit counts notes
+  admitted for that recipient. A single lexical and vector collection can
+  inspect up to 800 distinct ranked notes per branch before graph expansion.
+  When present, the existing structural mask plus the receipt overlay bounds
+  this collection without reducing its ordinary chunk depth. One additional
+  distinct note in either branch marks the typed result truncated even when
+  no inspected note is admissible. Provider-facing tools omit this flag and
+  hidden counts. The larger window reuses the same query embedding. Ordinary
+  search and recall retain their `max(100, 4 * top_k)` candidate limits.
 - The hybrid path fuses lexical and vector ranks with reciprocal rank fusion
   (`k = 60`). The vector branch ranks each note by its best matching chunk
   and also retains the leading chunks for recall. Recall can expand the
-  top 16 notes through up to three graph hops. Each visit reads up to 64
-  neighbors. The traversal shares a budget of 1,040 visits across all seeds
-  and marks the result truncated if a frontier remains. Recall serves the best
+  top 16 notes through up to three graph hops. Each visit reads bounded
+  incoming and outgoing pages and expands at most 64 distinct neighbors.
+  All seeds and hops share 1,040 node visits and the request deadline.
+  An unfinished frontier marks the result truncated. Recall serves the best
   eligible chunk per note first, then fills the remaining token budget while
   respecting the optional per-note token limit. Lexical fallback ranks chunks by matching
   phrases and normalized terms. Each chunk carries canonical source spans.
