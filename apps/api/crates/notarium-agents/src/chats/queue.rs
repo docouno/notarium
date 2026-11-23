@@ -261,16 +261,7 @@ impl AgentRunSupervisor {
                 *unsettled = None;
                 continue;
             };
-            let reader = self.independent_chat_human(&account).await?;
-            let writer =
-                SpaceContext::new(reader.clone(), run.scope.clone(), account.budget.clone())?;
-            let writer = match self
-                .inner
-                .registry
-                .control()
-                .fence_canonical_effect(account.auth().clone(), writer, CanonicalEffect::ChatInput)
-                .await
-            {
+            let writer = match self.detached_input_writer(&account, &run.scope).await {
                 Ok(writer) => writer,
                 Err(error) if no_authority(&error) => {
                     self.dismiss(run, &attempt.key).await?;
@@ -279,6 +270,7 @@ impl AgentRunSupervisor {
                 }
                 Err(error) => return Err(error),
             };
+            let reader = writer.auth().clone();
             run.owner.check()?;
             let status = match engine
                 .consume_chat_input(writer, attempt.command.clone())

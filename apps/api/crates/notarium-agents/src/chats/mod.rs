@@ -581,6 +581,23 @@ impl AgentRunSupervisor {
             .await
     }
 
+    async fn detached_input_writer(
+        &self,
+        owner: &AccountContext,
+        scope: &HistoryScope,
+    ) -> Result<SpaceContext, PortError> {
+        let writer = SpaceContext::new(
+            self.independent_chat_human(owner).await?,
+            scope.clone(),
+            owner.budget.clone(),
+        )?;
+        self.inner
+            .registry
+            .control()
+            .fence_canonical_effect(owner.auth().clone(), writer, CanonicalEffect::ChatInput)
+            .await
+    }
+
     async fn admit_chat_route(
         &self,
         scope: &HistoryScope,
@@ -790,20 +807,7 @@ impl AgentRunSupervisor {
                 return Err(owner_unavailable());
             }
             let engine = self.inner.registry.engine();
-            let human = self
-                .inner
-                .registry
-                .control()
-                .fence_canonical_effect(
-                    account.auth().clone(),
-                    SpaceContext::new(
-                        self.independent_chat_human(&account).await?,
-                        request.scope.clone(),
-                        account.budget.clone(),
-                    )?,
-                    CanonicalEffect::ChatInput,
-                )
-                .await?;
+            let human = self.detached_input_writer(&account, &request.scope).await?;
             let recovery = ChatRunRequest {
                 thread: request.thread.clone(),
                 expected_run: previous.clone(),
