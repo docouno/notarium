@@ -668,6 +668,10 @@ impl CanonicalStore {
                                 .ok_or(DomainError::ResourceNotFound)?;
                         effect.begin().await?;
                         live_space.scope.check(&scope)?;
+                        publisher.inner.check_writer_epoch(
+                            &live_space.scope.space_id,
+                            live_space.active_epoch,
+                        )?;
                         authorize_chat_write_on_space(&auth_cl, &live_space.space)?;
                         if live_space.active_epoch != staged_epoch {
                             return Err(crate::codec::unavailable_retryable(

@@ -298,9 +298,14 @@ fn worker_for_completion_test(remaining: Duration) -> (OutboundTransport, Worker
 async fn operation_completion_preserves_current_deadline_and_cancellation() {
     let _serial = crate::TEST_RESOURCE_LOCK.lock().await;
     let (client, worker) = worker_for_completion_test(Duration::from_secs(1));
-    worker.run(async { Ok(()) }).await.unwrap();
+    worker
+        .run(async { Ok(()) }, CommitEffect::Unknown)
+        .await
+        .unwrap();
     assert!(matches!(
-        worker.run(async { Err::<(), _>(failed()) }).await,
+        worker
+            .run(async { Err::<(), _>(failed()) }, CommitEffect::Unknown)
+            .await,
         Err(PortError::Unavailable(_))
     ));
     drop(worker);
@@ -310,13 +315,16 @@ async fn operation_completion_preserves_current_deadline_and_cancellation() {
         let (client, worker) = worker_for_completion_test(Duration::from_millis(20));
         let mut entered = false;
         let result = worker
-            .run(async {
-                entered = true;
-                // Complete in one poll after expiry, before the watchdog can
-                // poll its timer again. Exercise both successful and failed I/O.
-                std::thread::sleep(Duration::from_millis(40));
-                if success { Ok(()) } else { Err(failed()) }
-            })
+            .run(
+                async {
+                    entered = true;
+                    // Complete in one poll after expiry, before the watchdog can
+                    // poll its timer again. Exercise both successful and failed I/O.
+                    std::thread::sleep(Duration::from_millis(40));
+                    if success { Ok(()) } else { Err(failed()) }
+                },
+                CommitEffect::Unknown,
+            )
             .await;
         assert!(entered, "the operation must reach its completion boundary");
         assert!(
@@ -335,10 +343,13 @@ async fn operation_completion_preserves_current_deadline_and_cancellation() {
             worker.dropped.clone()
         };
         let result = worker
-            .run(async {
-                cancelled.cancel();
-                Ok(())
-            })
+            .run(
+                async {
+                    cancelled.cancel();
+                    Ok(())
+                },
+                CommitEffect::Unknown,
+            )
             .await;
         assert!(matches!(result, Err(PortError::Cancelled(_))), "{result:?}");
         drop(worker);
@@ -664,4 +675,188 @@ async fn active_call_limit_survives_caller_drop_and_idle_pool_cache_is_bounded()
         Err(PortError::Domain(DomainError::RateLimited { .. }))
     ));
     drop(active);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wait_uploaded_waits_for_socket_flush_under_backpressure_and_releases_before_ttfb() {
+    let _serial = crate::TEST_RESOURCE_LOCK.lock().await;
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.set_recv_buffer_size(8 * 1024).unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let listener = socket.listen(4).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let origin = format!("http://127.0.0.1:{}", addr.port());
+    let client = transport(&origin, &[1], Dns::new(&[&["127.0.0.1:0"]]));
+
+    let drain_body = Arc::new(Notify::new());
+    let send_reply = Arc::new(Notify::new());
+    let body_received = Arc::new(Notify::new());
+    let drain_body_srv = drain_body.clone();
+    let send_reply_srv = send_reply.clone();
+    let body_received_srv = body_received.clone();
+
+    let server_task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        // Hold accepted TCP connection without reading so upload stalls on TCP backpressure.
+        drain_body_srv.notified().await;
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            head.push(stream.read_u8().await.unwrap());
+        }
+        let head = String::from_utf8(head).unwrap();
+        let len: usize = head
+            .lines()
+            .find_map(|line| {
+                line.to_ascii_lowercase()
+                    .strip_prefix("content-length:")
+                    .map(|n| n.trim().parse().unwrap())
+            })
+            .unwrap();
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut remaining = len;
+        while remaining > 0 {
+            let take = remaining.min(buf.len());
+            let n = stream.read(&mut buf[..take]).await.unwrap();
+            assert!(n > 0, "unexpected EOF while draining request body");
+            remaining -= n;
+        }
+        body_received_srv.notify_one();
+        // Deliberately stall before writing response headers (TTFB).
+        send_reply_srv.notified().await;
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            .await
+            .unwrap();
+    });
+
+    let mut req = request(1, 1, &format!("{origin}/upload"), "secret");
+    // 6 MiB comfortably exceeds hyper's ~408 KiB WriteBuf plus Linux loopback socket buffers.
+    req.body = vec![b'a'; 6 * 1024 * 1024];
+    let mut response = client.start(budget(), req).unwrap();
+
+    // While server refuses to read, upload MUST remain pending.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), response.wait_uploaded())
+            .await
+            .is_err(),
+        "wait_uploaded must not resolve before the request body flushes to the socket"
+    );
+
+    // Let server drain request body, but keep response headers stalled (TTFB).
+    drain_body.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), body_received.notified())
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), response.wait_uploaded())
+            .await
+            .unwrap()
+            .unwrap(),
+        "wait_uploaded must resolve Ok(true) once body flushes and before TTFB"
+    );
+
+    // Release response headers and verify complete roundtrip.
+    send_reply.notify_one();
+    response.receive_head().await.unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(body(response).await, b"ok");
+    server_task.await.unwrap();
+    released(&client).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wait_uploaded_returns_false_on_connect_preflight_and_mid_upload_failures() {
+    let _serial = crate::TEST_RESOURCE_LOCK.lock().await;
+    // 1. Connect/DNS failure on both GET and POST -> wait_uploaded() returns Ok(false).
+    let blocked_origin = "http://blocked.invalid:49999";
+    let blocked_client = transport(blocked_origin, &[1], Dns::new(&[&["169.254.169.254:0"]]));
+    for method in [Method::GET, Method::POST] {
+        let mut req = request(1, 1, blocked_origin, "secret");
+        req.method = method.clone();
+        if method == Method::GET {
+            req.body.clear();
+        }
+        let mut response = blocked_client.start(budget(), req).unwrap();
+        assert!(!response.wait_uploaded().await.unwrap());
+        assert!(matches!(
+            response.receive_head().await,
+            Err(PortError::Unavailable(failure)) if failure.effect() == CommitEffect::NotCommitted
+        ));
+        response.close().await.unwrap();
+    }
+    released(&blocked_client).await;
+
+    // 2. Failing preflight on both GET and POST -> wait_uploaded() returns Ok(false), 0 requests hit server.
+    let server = Server::new(Reply::StallHeaders).await;
+    let origin = server.origin("127.0.0.1");
+    let client = transport(&origin, &[1], Dns::new(&[&["127.0.0.1:0"]]));
+    for method in [Method::GET, Method::POST] {
+        let mut req = request(1, 1, &origin, "secret");
+        req.method = method.clone();
+        if method == Method::GET {
+            req.body.clear();
+        }
+        let mut response = client
+            .start_checked(budget(), req, || Err(DomainError::CrossSpaceTainted.into()))
+            .unwrap();
+        assert!(!response.wait_uploaded().await.unwrap());
+        assert!(matches!(
+            response.receive_head().await,
+            Err(PortError::Domain(DomainError::CrossSpaceTainted))
+        ));
+        response.close().await.unwrap();
+    }
+    assert_eq!(server.requests.lock().unwrap().len(), 0);
+
+    // 3. Empty GET against a server that stalls headers -> wait_uploaded() returns Ok(true) after headers flush.
+    let mut get_req = request(1, 1, &origin, "secret");
+    get_req.method = Method::GET;
+    get_req.body.clear();
+    let mut response = client.start(budget(), get_req).unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), response.wait_uploaded())
+            .await
+            .unwrap()
+            .unwrap()
+    );
+    server.count(1).await;
+    response.close().await.unwrap();
+    released(&client).await;
+
+    // 4. Mid-upload cancellation via invalidate_provider -> wait_uploaded() returns Ok(false), never Ok(true).
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.set_recv_buffer_size(8 * 1024).unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let listener = socket.listen(4).unwrap();
+    let stall_origin = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let stall_client = transport(&stall_origin, &[1], Dns::new(&[&["127.0.0.1:0"]]));
+    let hold_conn = tokio::spawn(async move {
+        let (_stream, _) = listener.accept().await.unwrap();
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    });
+    let mut big_req = request(1, 1, &format!("{stall_origin}/abort"), "secret");
+    big_req.body = vec![b'z'; 6 * 1024 * 1024];
+    let mut response = stall_client.start(budget(), big_req).unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(120), response.wait_uploaded())
+            .await
+            .is_err()
+    );
+    stall_client
+        .invalidate_provider(&ProviderResourceId::from_bytes([1; 16]))
+        .unwrap();
+    assert!(
+        !tokio::time::timeout(Duration::from_secs(5), response.wait_uploaded())
+            .await
+            .unwrap()
+            .unwrap(),
+        "aborted mid-upload request must return Ok(false)"
+    );
+    assert!(matches!(
+        response.receive_head().await,
+        Err(PortError::Cancelled(_))
+    ));
+    response.close().await.unwrap();
+    hold_conn.abort();
+    released(&stall_client).await;
 }

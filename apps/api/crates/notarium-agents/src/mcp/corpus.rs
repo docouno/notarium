@@ -284,28 +284,29 @@ async fn source_policy(
 async fn note_policy(
     call: &ToolCallContext<'_>,
     scope: &SpaceContext,
-    reference: &NoteRef,
-    in_project: impl Fn(&FolderRef) -> bool,
+    metadata: &ClassifiedMetadata,
 ) -> Result<Option<ProviderSelection>, PortError> {
-    if reference.space_id != scope.scope().space_id {
+    if metadata.reference().space_id != scope.scope().space_id {
         return Err(invalid(ValidationReason::SourceMismatch));
     }
-    let current = note_in_space(call, scope, &reference.note_id).await?;
     if matches!(call.target, EgressTarget::ExternalMcp) {
         return Ok(None);
     }
-    let project = current.facts.project.clone().map(|folder_id| FolderRef {
-        space_id: scope.scope().space_id.clone(),
-        folder_id,
-    });
-    let admitted = source_policy(call, scope, project, Some(&call.policies), |project| {
-        current.facts.ancestor_folders.contains(&project.folder_id) && in_project(project)
-    })
+    let admitted = source_policy(
+        call,
+        scope,
+        metadata.current_project(),
+        Some(&call.policies),
+        |project| metadata.in_project(project),
+    )
     .await?;
-    if admitted
-        .as_ref()
-        .is_some_and(|rule| !rule.policy.allowed_classes.contains(&current.facts.class))
-    {
+    if admitted.as_ref().is_some_and(|rule| {
+        !rule
+            .policy
+            .allowed_classes
+            .contains(&metadata.current_class())
+            || !rule.policy.allowed_classes.contains(&metadata.class())
+    }) {
         return Err(invalid(ValidationReason::ClassEgressForbidden));
     }
     Ok(admitted)
@@ -340,11 +341,7 @@ async fn admit_metadata(
     scope: &SpaceContext,
     metadata: &ClassifiedMetadata,
 ) -> Result<(ProviderOrigin, Option<FolderRef>), PortError> {
-    if let Some(selection) = note_policy(call, scope, metadata.reference(), |project| {
-        metadata.in_project(project)
-    })
-    .await?
-    {
+    if let Some(selection) = note_policy(call, scope, metadata).await? {
         let origin =
             ClassEgressFence::provider_note_metadata(metadata, scope.auth(), &selection.policy)?;
         Ok((origin, selection.project_only))
@@ -378,11 +375,8 @@ pub(super) async fn note_document(
     scope: &SpaceContext,
     document: &ClassifiedDocument,
 ) -> Result<String, PortError> {
-    if let Some(selection) = note_policy(call, scope, document.reference(), |project| {
-        document.in_project(project)
-    })
-    .await?
-    {
+    let metadata = document.metadata();
+    if let Some(selection) = note_policy(call, scope, &metadata).await? {
         let content =
             ClassEgressFence::provider(document.clone(), scope.auth(), &selection.policy)?;
         call.record_origin(document.origin(), selection.project_only)?;
@@ -397,10 +391,7 @@ pub(super) async fn note_metadata_selection(
     scope: &SpaceContext,
     metadata: &ClassifiedMetadata,
 ) -> Result<Option<ProviderSelection>, PortError> {
-    note_policy(call, scope, metadata.reference(), |project| {
-        metadata.in_project(project)
-    })
-    .await
+    note_policy(call, scope, metadata).await
 }
 
 pub(super) async fn admit_metadata_with_selection(
@@ -466,6 +457,61 @@ pub(super) async fn folder_metadata(
             CatalogDisclosure::Folder(folder.reference.clone()),
         )
         .await?;
+    admit_folder_disclosure(call, scope, folder, proof).await
+}
+
+pub(super) async fn folder_metadata_batch(
+    call: &mut ToolCallContext<'_>,
+    scope: &SpaceContext,
+    folders: &[FolderSnapshot],
+) -> Result<Vec<Value>, PortError> {
+    if folders.is_empty() {
+        return Ok(Vec::new());
+    }
+    let refs = folders
+        .iter()
+        .map(|folder| {
+            scope.scope().check(&folder.history)?;
+            Ok(folder.reference.clone())
+        })
+        .collect::<Result<Vec<_>, PortError>>()?;
+    let proofs = call
+        .registry
+        .catalog
+        .folder_disclosures(call.account(), refs)
+        .await?;
+    let mut by_ref = std::collections::BTreeMap::new();
+    for proof in proofs {
+        if let ProviderCurrentContent::Folder { reference, .. } = proof.current() {
+            by_ref.insert(
+                (reference.space_id.clone(), reference.folder_id.clone()),
+                proof,
+            );
+        }
+    }
+    let mut out = Vec::with_capacity(folders.len());
+    for folder in folders {
+        let Some(proof) = by_ref.remove(&(
+            folder.reference.space_id.clone(),
+            folder.reference.folder_id.clone(),
+        )) else {
+            continue;
+        };
+        match admit_folder_disclosure(call, scope, folder, proof).await {
+            Ok(card) => out.push(card),
+            Err(error) if hidden(&error) => (),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(out)
+}
+
+async fn admit_folder_disclosure(
+    call: &mut ToolCallContext<'_>,
+    scope: &SpaceContext,
+    folder: &FolderSnapshot,
+    proof: notarium_core::classes::CanonicalMetadataContent,
+) -> Result<Value, PortError> {
     if !matches!(proof.current(), ProviderCurrentContent::Folder { reference, history, revision, .. }
         if reference == &folder.reference && history == scope.scope() && revision == &folder.revision)
     {

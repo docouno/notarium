@@ -35,6 +35,9 @@ impl ControlService {
         references: &[&AbilityRef],
     ) -> Result<BTreeSet<SpaceId>, PortError> {
         let auth = ctx.auth();
+        if auth.taint().is_tainted() {
+            return Err(DomainError::CrossSpaceTainted.into());
+        }
         let authority = self
             .credential_authority(
                 tx,
@@ -206,6 +209,9 @@ impl ControlService {
         }
         command.require(ctx.auth().principal(), ctx.auth().principal())?;
         ctx.auth().authorize_ability_mutation()?;
+        if ctx.auth().taint().is_tainted() {
+            return Err(DomainError::CrossSpaceTainted.into());
+        }
         let budget = OperationBudget::new(ctx.budget.clone());
         let current = self.current_account(&ctx, &budget).await?;
         let prechecked: Result<
@@ -250,12 +256,20 @@ impl ControlService {
             Ok((value, pin))
         }
         .await;
-        let (prechecked, pin) = match prechecked {
+        let (prechecked, mut pin) = match prechecked {
             Ok((value, pin)) => (Ok(value), pin),
             Err(error) if authoring => (Err(error), None),
             Err(error) => return Err(error),
         };
-        let mut tx = self.store.write(budget.clone()).await?;
+        let mut tx = match self.store.write(budget.clone()).await {
+            Ok(tx) => tx,
+            Err(error) => {
+                if let Some(mut lease) = pin.take() {
+                    let _ = lease.close().await;
+                }
+                return Err(error);
+            }
+        };
         if let Some(pin) = pin {
             tx.hold_schedule_pin(pin);
         }
@@ -355,6 +369,9 @@ impl ControlService {
         if !(ctx.auth().human_management() || ctx.auth().has_cap(Cap::AbilityWrite)) {
             return Err(DomainError::AbilityWriteForbidden.into());
         }
+        if ctx.auth().taint().is_tainted() {
+            return Err(DomainError::CrossSpaceTainted.into());
+        }
         let budget = OperationBudget::new(ctx.budget.clone());
         let current = self.current_account(&ctx, &budget).await?;
         let authoring = matches!(precondition, AbilityPreferenceGuard::Authored(_));
@@ -389,12 +406,20 @@ impl ControlService {
             Ok((value, pin))
         }
         .await;
-        let (prechecked, pin) = match prechecked {
+        let (prechecked, mut pin) = match prechecked {
             Ok((value, pin)) => (Ok(value), pin),
             Err(error) if authoring => (Err(error), None),
             Err(error) => return Err(error),
         };
-        let mut tx = self.store.write(budget.clone()).await?;
+        let mut tx = match self.store.write(budget.clone()).await {
+            Ok(tx) => tx,
+            Err(error) => {
+                if let Some(mut lease) = pin.take() {
+                    let _ = lease.close().await;
+                }
+                return Err(error);
+            }
+        };
         if let Some(pin) = pin {
             tx.hold_schedule_pin(pin);
         }
@@ -405,6 +430,9 @@ impl ControlService {
                 (owner, ctx.clone())
             } else {
                 let auth = self.revalidate(tx.inner_mut(), ctx.auth()).await?;
+                if auth.taint().is_tainted() {
+                    return Err(DomainError::CrossSpaceTainted.into());
+                }
                 if !(auth.human_management() || auth.has_cap(Cap::AbilityWrite)) {
                     return Err(DomainError::AbilityWriteForbidden.into());
                 }
@@ -508,6 +536,9 @@ impl ControlService {
     ) -> Result<ControlCommit<Option<AbilityPromotionResult>>, PortError> {
         command.require(ctx.auth().principal(), ctx.auth().principal())?;
         ctx.auth().authorize_ability_mutation()?;
+        if ctx.auth().taint().is_tainted() {
+            return Err(DomainError::CrossSpaceTainted.into());
+        }
         let budget = OperationBudget::new(ctx.budget.clone());
         type PrecheckedTrail = (
             Option<(AbilityDescriptor, AbilityDescriptor)>,
@@ -596,7 +627,7 @@ impl ControlService {
                         current.auth().restrict_to_space(space)?,
                         budget.context(ctx.budget.request.clone()),
                     );
-                    let pin = budget
+                    let mut pin = budget
                         .run(
                             self.catalog
                                 .pin_schedule_abilities(scoped, vec![target.reference.clone()]),
@@ -609,6 +640,7 @@ impl ControlService {
                                 && pinned.promoted_from == target.promoted_from
                                 && pinned.healthy)
                     {
+                        let _ = pin.close().await;
                         return Err(DomainError::ResourceNotFound.into());
                     }
                     Some(pin)
@@ -621,13 +653,21 @@ impl ControlService {
         } else {
             Ok((None, None))
         };
-        let (prechecked, promotion_pin) = match prechecked {
+        let (prechecked, mut promotion_pin) = match prechecked {
             Ok((pair, pin)) => (Ok(pair), pin),
             Err(error) if promotion => (Err(error), None),
             Err(error) => return Err(error),
         };
         let has_promotion_pin = promotion_pin.is_some();
-        let mut tx = self.store.write(budget.clone()).await?;
+        let mut tx = match self.store.write(budget.clone()).await {
+            Ok(tx) => tx,
+            Err(error) => {
+                if let Some(mut lease) = promotion_pin.take() {
+                    let _ = lease.close().await;
+                }
+                return Err(error);
+            }
+        };
         if let Some(pin) = promotion_pin {
             tx.hold_schedule_pin(pin);
         }

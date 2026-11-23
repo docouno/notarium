@@ -54,6 +54,7 @@ async fn resolve(
     space: &SpaceRecord,
     id: &AbilityId,
     exact: Option<&RevisionId>,
+    live_ancestry: &mut crate::domain::common::FolderAncestryCache,
 ) -> Result<ResolvedAbility, PortError> {
     let (entry, tip, state, current_name): (String, String, String, String) = db!(
         read tx,
@@ -70,7 +71,8 @@ async fn resolve(
         space_id: space.space.id.clone(),
         note_id: NoteId::parse(&entry)?,
     };
-    let note = note_metadata(tx, auth, space, entrypoint.clone()).await?;
+    let (note, current_digest) =
+        note_metadata_with_digest(tx, auth, space, entrypoint.clone(), live_ancestry).await?;
     if note.facts.class != DocClass::Skill || note.facts.ability_package.as_ref() != Some(id) {
         return Err(DomainError::ResourceNotFound.into());
     }
@@ -141,19 +143,13 @@ async fn resolve(
     } else {
         meta.slug_fold.clone()
     };
-    let current_entrypoint =
-        load_note_head_row_tx(tx, &space.space.id, &entrypoint.note_id).await?;
     // A placement-only note revision leaves the published instructions intact.
     // A dirty carrier requires a package publication before runtime activation.
-    let entrypoint_matches_manifest =
-        current_entrypoint
-            .content_digest
-            .as_ref()
-            .is_some_and(|digest| {
-                meta.resources
-                    .get(crate::domain::packages::ABILITY_ENTRYPOINT_KEY)
-                    == Some(digest)
-            });
+    let entrypoint_matches_manifest = current_digest.as_ref().is_some_and(|digest| {
+        meta.resources
+            .get(crate::domain::packages::ABILITY_ENTRYPOINT_KEY)
+            == Some(digest)
+    });
     let current = AbilityResourceLocation {
         placement: placement.clone(),
         facts: note.facts,
@@ -207,6 +203,18 @@ async fn descriptor(
     id: &AbilityId,
     exact: Option<&RevisionId>,
 ) -> Result<AbilityDescriptor, PortError> {
+    let mut live_ancestry = crate::domain::common::FolderAncestryCache::default();
+    descriptor_with_cache(tx, auth, space, id, exact, &mut live_ancestry).await
+}
+
+async fn descriptor_with_cache(
+    tx: &mut BackendConn<'_>,
+    auth: &EngineAuthContext,
+    space: &SpaceRecord,
+    id: &AbilityId,
+    exact: Option<&RevisionId>,
+    live_ancestry: &mut crate::domain::common::FolderAncestryCache,
+) -> Result<AbilityDescriptor, PortError> {
     let ResolvedAbility {
         reference,
         entrypoint,
@@ -215,7 +223,7 @@ async fn descriptor(
         entrypoint_matches_manifest,
         promoted_from,
         ..
-    } = resolve(tx, auth, space, id, exact).await?;
+    } = resolve(tx, auth, space, id, exact, live_ancestry).await?;
     Ok(AbilityDescriptor {
         reference,
         kind: meta.kind,
@@ -243,7 +251,8 @@ pub(crate) async fn authorize_change_tx(
     id: &AbilityId,
     revision: &RevisionId,
 ) -> Result<(), PortError> {
-    let package = resolve(tx, auth, space, id, Some(revision)).await?;
+    let mut live_ancestry = crate::domain::common::FolderAncestryCache::default();
+    let package = resolve(tx, auth, space, id, Some(revision), &mut live_ancestry).await?;
     Ok(auth.authorize_read(&package.provenance.published.facts)?)
 }
 
@@ -255,12 +264,14 @@ pub(crate) async fn resource_digest_tx(
 ) -> Result<(ContentDigest, AbilityResourceProvenance), PortError> {
     let space = load_space_record(tx, &ctx.scope().space_id).await?;
     space.scope.check(ctx.scope())?;
+    let mut live_ancestry = crate::domain::common::FolderAncestryCache::default();
     let package = resolve(
         tx,
         ctx.auth(),
         &space,
         &request.ability,
         Some(&request.package_revision),
+        &mut live_ancestry,
     )
     .await?;
     if package.metadata.lifecycle != Lifecycle::Active {
@@ -283,7 +294,16 @@ pub(super) async fn egress_current(
     space: &SpaceRecord,
     reference: &AbilityResourceRef,
 ) -> Result<notarium_core::classes::ProviderCurrentContent, PortError> {
-    let package = resolve(tx, auth, space, &reference.ability, None).await?;
+    let mut live_ancestry = crate::domain::common::FolderAncestryCache::default();
+    let package = resolve(
+        tx,
+        auth,
+        space,
+        &reference.ability,
+        None,
+        &mut live_ancestry,
+    )
+    .await?;
     if package.reference.revision != reference.package_revision
         || package.metadata.lifecycle != Lifecycle::Active
         || !package.entrypoint_matches_manifest
@@ -578,8 +598,21 @@ pub(super) async fn page(
                     None
                 };
                 let mut items = Vec::new();
+                let mut space_caches: Vec<crate::domain::common::FolderAncestryCache> = (0..live
+                    .len())
+                    .map(|_| crate::domain::common::FolderAncestryCache::default())
+                    .collect();
                 for (index, id, _) in keys {
-                    match descriptor(tx, ctx.auth(), &live[index], &id, None).await {
+                    match descriptor_with_cache(
+                        tx,
+                        ctx.auth(),
+                        &live[index],
+                        &id,
+                        None,
+                        &mut space_caches[index],
+                    )
+                    .await
+                    {
                         Ok(value) => {
                             let visible = (query.authoring && query.project.is_none())
                                 || match &value.reference.placement {

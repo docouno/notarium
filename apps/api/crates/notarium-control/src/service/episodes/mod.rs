@@ -124,6 +124,16 @@ impl ControlService {
         ctx: &AccountContext,
         loaded: LoadedEpisodeDb,
     ) -> Result<(AgentEpisode, Option<(AbilityRef, AbilityDescriptor)>), PortError> {
+        let mut space_cache = std::collections::BTreeMap::new();
+        self.resolve_episode_catalog_cached(ctx, loaded, &mut space_cache)
+            .await
+    }
+    pub(in super::super) async fn resolve_episode_catalog_cached(
+        &self,
+        ctx: &AccountContext,
+        loaded: LoadedEpisodeDb,
+        space_cache: &mut std::collections::BTreeMap<SpaceId, Option<CatalogSpace>>,
+    ) -> Result<(AgentEpisode, Option<(AbilityRef, AbilityDescriptor)>), PortError> {
         let LoadedEpisodeDb {
             row,
             ack_rows,
@@ -166,7 +176,9 @@ impl ControlService {
             None
         };
         let id = EpisodeId::parse(&row.episode_id)?;
-        let acknowledgements = self.resolve_acknowledgements(ctx, ack_rows).await?;
+        let acknowledgements = self
+            .resolve_acknowledgements_cached(ctx, ack_rows, space_cache)
+            .await?;
         Ok((
             AgentEpisode {
                 id,
@@ -567,6 +579,15 @@ impl ControlService {
     }
     /// Trusted accepted-call path. It cannot change role, project or acknowledgements.
     pub async fn touch_episode(&self, ctx: AccountContext, id: EpisodeId) -> Result<(), PortError> {
+        if matches!(
+            ctx.auth().kind(),
+            PrincipalKind::Keeper(_) | PrincipalKind::AgentRun(_)
+        ) {
+            return Err(access_denied());
+        }
+        if ctx.auth().taint().is_tainted() {
+            return Err(DomainError::CrossSpaceTainted.into());
+        }
         let budget = OperationBudget::new(ctx.budget.clone());
         let keeper = self
             .precheck_keeper_catalog(ctx.auth(), &budget, &ctx.budget.request)
@@ -578,6 +599,15 @@ impl ControlService {
                     let auth = self
                         .revalidate_with_keeper(tx.inner_mut(), ctx.auth(), keeper.as_ref())
                         .await?;
+                    if matches!(
+                        auth.kind(),
+                        PrincipalKind::Keeper(_) | PrincipalKind::AgentRun(_)
+                    ) {
+                        return Err(access_denied());
+                    }
+                    if auth.taint().is_tainted() {
+                        return Err(DomainError::CrossSpaceTainted.into());
+                    }
                     let row = episode(tx.inner_mut(), auth.principal(), &id).await?;
                     if row.lifecycle != "active" {
                         return Err(invalid(ValidationReason::InvalidState));

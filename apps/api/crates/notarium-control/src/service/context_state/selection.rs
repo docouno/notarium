@@ -233,8 +233,10 @@ impl ControlService {
         let (mut episode, role_to_overlay, selected, personal, owner_acknowledgements) = budget
             .run(
                 async {
-                    let (episode, role_to_overlay) =
-                        self.resolve_episode_catalog(&current, loaded_ep).await?;
+                    let mut space_cache = std::collections::BTreeMap::new();
+                    let (episode, role_to_overlay) = self
+                        .resolve_episode_catalog_cached(&current, loaded_ep, &mut space_cache)
+                        .await?;
                     let selected = if let Some(space) = space {
                         if current
                             .auth()
@@ -244,7 +246,10 @@ impl ControlService {
                         {
                             return Err(DomainError::ResourceNotFound.into());
                         }
-                        self.catalog_space(&current, &space).await?;
+                        if !matches!(space_cache.get(&space), Some(Some(_))) {
+                            let info = self.catalog_space(&current, &space).await?;
+                            space_cache.insert(space.clone(), Some(info));
+                        }
                         if episode
                             .project_hint
                             .as_ref()
@@ -271,8 +276,11 @@ impl ControlService {
                     } else {
                         None
                     };
-                    if let Some(space) = &selected {
-                        self.catalog_space(&current, space).await?;
+                    if let Some(space) = &selected
+                        && !matches!(space_cache.get(space), Some(Some(_)))
+                    {
+                        let info = self.catalog_space(&current, space).await?;
+                        space_cache.insert(space.clone(), Some(info));
                     }
                     let personal = if let Some(value) = &owner.personal_space_id {
                         let space = SpaceId::parse(value)?;
@@ -282,10 +290,20 @@ impl ControlService {
                             .get(&space)
                             .is_some_and(|grant| !grant.read_classes.is_empty())
                         {
-                            match self.catalog_space(&current, &space).await {
-                                Ok(_) => owner.user_id.clone(),
-                                Err(error) if hidden(&error) => String::new(),
-                                Err(error) => return Err(error),
+                            match space_cache.get(&space) {
+                                Some(Some(_)) => owner.user_id.clone(),
+                                Some(None) => String::new(),
+                                None => match self.catalog_space(&current, &space).await {
+                                    Ok(info) => {
+                                        space_cache.insert(space, Some(info));
+                                        owner.user_id.clone()
+                                    }
+                                    Err(error) if hidden(&error) => {
+                                        space_cache.insert(space, None);
+                                        String::new()
+                                    }
+                                    Err(error) => return Err(error),
+                                },
                             }
                         } else {
                             String::new()
@@ -294,7 +312,7 @@ impl ControlService {
                         String::new()
                     };
                     let owner_acknowledgements = self
-                        .resolve_acknowledgements(&current, owner_ack_rows)
+                        .resolve_acknowledgements_cached(&current, owner_ack_rows, &mut space_cache)
                         .await?;
                     Ok::<_, PortError>((
                         episode,

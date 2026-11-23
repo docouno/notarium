@@ -327,6 +327,14 @@ impl<C: ControlCatalogPort + ?Sized> ControlCatalogPort for SystemAbilityCatalog
         self.owned.disclosure(ctx, source)
     }
 
+    fn folder_disclosures(
+        &self,
+        ctx: AccountContext,
+        folders: Vec<FolderRef>,
+    ) -> PortFuture<'_, Vec<CanonicalMetadataContent>> {
+        self.owned.folder_disclosures(ctx, folders)
+    }
+
     fn ensure_space(
         &self,
         budget: CallBudget,

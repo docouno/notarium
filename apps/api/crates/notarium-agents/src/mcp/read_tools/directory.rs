@@ -202,18 +202,14 @@ pub(super) async fn list(call: &mut ToolCallContext<'_>, args: Value) -> Result<
             return Err(invalid(ValidationReason::InvalidState));
         }
         next_folders = page.next;
-        for child in page.items {
+        for child in &page.items {
             if child.history != folder.history
                 || child.parent.as_ref() != Some(&folder.reference.folder_id)
             {
                 return Err(invalid(ValidationReason::InvalidState));
             }
-            match corpus::folder_metadata(call, &scope, &child).await {
-                Ok(card) => folders.push(card),
-                Err(error) if corpus::hidden(&error) => (),
-                Err(error) => return Err(error),
-            }
         }
+        folders = corpus::folder_metadata_batch(call, &scope, &page.items).await?;
     }
     let mut output = json!({ "items": items, "folders": folders });
     if incomplete {
@@ -316,12 +312,6 @@ async fn folder_page(
         })
     };
     if let Some(id) = &folder.cover_note {
-        match corpus::note_in_space(call, scope, id).await {
-            Ok(note) if note.facts.class == DocClass::UserDoc => (),
-            Ok(_) => return Ok(None),
-            Err(error) if corpus::hidden(&error) => return Ok(None),
-            Err(error) => return Err(error),
-        }
         let note = call
             .registry
             .engine
@@ -340,8 +330,10 @@ async fn folder_page(
             Err(error) => return Err(error),
         };
         let metadata = &note.metadata;
+        if metadata.class() != DocClass::UserDoc {
+            return Ok(None);
+        }
         if metadata.reference().note_id != *id
-            || metadata.class() != DocClass::UserDoc
             || (note.parent.as_ref() != Some(&folder.reference.folder_id)
                 && (note.parent.is_some() || folder.parent.is_some()))
         {

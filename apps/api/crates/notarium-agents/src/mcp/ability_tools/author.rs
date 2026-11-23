@@ -403,6 +403,9 @@ pub(super) async fn create(
     args: CreateArgs,
 ) -> Result<Value, PortError> {
     call.auth.authorize_ability_mutation()?;
+    if call.auth.taint().is_tainted() {
+        return Err(DomainError::CrossSpaceTainted.into());
+    }
     load_episode(call, args.session.as_ref()).await?;
     let kind = AbilityKind::from(args.kind);
     let slug = unicode::lookup_key(&args.name);
@@ -733,6 +736,9 @@ async fn edit_result(
 
 pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<Value, PortError> {
     call.auth.authorize_ability_mutation()?;
+    if call.auth.taint().is_tainted() {
+        return Err(DomainError::CrossSpaceTainted.into());
+    }
     load_episode(call, args.session.as_ref()).await?;
     let plan: EditPlan = call
         .journal("edit-ability-plan", || edit_plan(call, &args))
@@ -1049,6 +1055,9 @@ pub(super) async fn trash(
     args: DeleteArgs,
 ) -> Result<Value, PortError> {
     call.auth.authorize_ability_mutation()?;
+    if call.auth.taint().is_tainted() {
+        return Err(DomainError::CrossSpaceTainted.into());
+    }
     load_episode(call, args.session.as_ref()).await?;
     let plan: TrashPlan = call
         .journal("trash-ability-plan", || async {

@@ -1,7 +1,9 @@
 //! Metadata-only canonical ownership consumed by control. No document bodies or SQL.
 use super::{PortFuture, context::*, control::*, types::*};
 use crate::classes::CanonicalMetadataContent;
-use crate::{auth::*, ids::*, model::*, receipt::AccountCommandIdentity};
+use crate::{
+    DomainError, auth::*, error::PortError, ids::*, model::*, receipt::AccountCommandIdentity,
+};
 
 #[derive(Clone, Debug)]
 pub struct CatalogSpace {
@@ -61,6 +63,30 @@ pub trait ControlCatalogPort: Send + Sync {
         ctx: AccountContext,
         source: CatalogDisclosure,
     ) -> PortFuture<'_, CanonicalMetadataContent>;
+    /// Load folder disclosure proofs for a batch of folders in one Space in a
+    /// single read transaction, skipping hidden/inaccessible entries.
+    fn folder_disclosures(
+        &self,
+        ctx: AccountContext,
+        folders: Vec<FolderRef>,
+    ) -> PortFuture<'_, Vec<CanonicalMetadataContent>> {
+        Box::pin(async move {
+            let mut out = Vec::with_capacity(folders.len());
+            for folder in folders {
+                match self
+                    .disclosure(ctx.clone(), CatalogDisclosure::Folder(folder))
+                    .await
+                {
+                    Ok(proof) => out.push(proof),
+                    Err(PortError::Domain(
+                        DomainError::ResourceNotFound | DomainError::AccessDenied,
+                    )) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(out)
+        })
+    }
     fn space(&self, budget: CallBudget, space: SpaceId) -> PortFuture<'_, CatalogSpace>;
     fn projects(
         &self,

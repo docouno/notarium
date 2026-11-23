@@ -1254,7 +1254,27 @@ async fn episode_mutation_blocked_for_read_and_shared_agents(fixture: &RuntimeFi
         .descriptor
         .reference
         .clone();
+    let keeper_ctx = AccountContext::new(
+        owner
+            .auth()
+            .for_keeper(
+                AgentRunId::from_bytes([109; 16]),
+                personal_space.clone(),
+                None,
+                std::collections::BTreeSet::new(),
+            )
+            .unwrap(),
+        budget(),
+    );
     for result in [
+        fixture
+            .control
+            .touch_episode(shared_ctx.clone(), episode_id.clone())
+            .await,
+        fixture
+            .control
+            .touch_episode(keeper_ctx, episode_id.clone())
+            .await,
         fixture
             .control
             .update_episode(
@@ -1324,7 +1344,7 @@ async fn episode_mutation_blocked_for_read_and_shared_agents(fixture: &RuntimeFi
     ] {
         assert!(
             matches!(result, Err(PortError::Domain(DomainError::AccessDenied))),
-            "shared AgentRun episode mutation must be denied: {result:?}"
+            "shared AgentRun/Keeper episode mutation must be denied: {result:?}"
         );
     }
 
@@ -1444,7 +1464,7 @@ async fn exact_causal_graph_and_control_replay_seams(
                 identity: ep_identity,
                 input: StartEpisode {
                     selector: EpisodeSelector::New {
-                        requested: ep_id,
+                        requested: ep_id.clone(),
                         name: Some("replay-guard-compat".into()),
                     },
                     project_hint: None,
@@ -1525,7 +1545,7 @@ async fn exact_causal_graph_and_control_replay_seams(
                 identity: pref_identity,
                 input: AbilityPreferenceChange {
                     preference: AbilityPreferenceUpdate {
-                        ability: owned_ability,
+                        ability: owned_ability.clone(),
                         enabled: true,
                     },
                     expected: AbilityPreferenceGuard::Account,
@@ -1535,4 +1555,261 @@ async fn exact_causal_graph_and_control_replay_seams(
         .await
         .unwrap();
     assert_eq!(first_pref.revision, replayed_pref.revision);
+
+    // Tainted caller must be rejected on touch_episode, ability overlay mutations,
+    // and overlay-only edit_ability before any control DB write or journal entry.
+    let tainted_owner = &fixture.human;
+    assert!(
+        tainted_owner.auth().taint().is_tainted(),
+        "fixture.human must be tainted at this stage"
+    );
+    let tainted_results = [
+        fixture
+            .control
+            .touch_episode(tainted_owner.clone(), ep_id.clone())
+            .await,
+        fixture
+            .control
+            .update_ability_binding(
+                tainted_owner.clone(),
+                AccountMutation {
+                    identity: identity(fixture, tainted_owner, 125).await,
+                    input: AbilityBindingUpdate {
+                        ability: owned_ability.clone(),
+                        enabled: true,
+                        expected: AbilityOverlayGuard::Authored(None),
+                        projects: AbilityProjects::All,
+                    },
+                },
+            )
+            .await
+            .map(|_| ()),
+        fixture
+            .control
+            .set_ability_preference(
+                tainted_owner.clone(),
+                AccountMutation {
+                    identity: identity(fixture, tainted_owner, 126).await,
+                    input: AbilityPreferenceChange {
+                        preference: AbilityPreferenceUpdate {
+                            ability: owned_ability.clone(),
+                            enabled: false,
+                        },
+                        expected: AbilityPreferenceGuard::Account,
+                    },
+                },
+            )
+            .await
+            .map(|_| ()),
+        fixture
+            .control
+            .set_ability_preference(
+                tainted_owner.clone(),
+                AccountMutation {
+                    identity: identity(fixture, tainted_owner, 127).await,
+                    input: AbilityPreferenceChange {
+                        preference: AbilityPreferenceUpdate {
+                            ability: owned_ability.clone(),
+                            enabled: false,
+                        },
+                        expected: AbilityPreferenceGuard::Authored(Some(first_pref.revision)),
+                    },
+                },
+            )
+            .await
+            .map(|_| ()),
+        fixture
+            .control
+            .set_ability_trail(
+                tainted_owner.clone(),
+                AccountMutation {
+                    identity: identity(fixture, tainted_owner, 128).await,
+                    input: AbilityTrailMutation::Set(AbilityTrailUpdate {
+                        source: owned_ability.clone(),
+                        expected_destination: None,
+                        destination: Some(owned_ability.clone()),
+                    }),
+                },
+            )
+            .await
+            .map(|_| ()),
+        call(
+            fixture,
+            tainted_owner,
+            129,
+            "edit_ability",
+            json!({
+                "ref": owned_ability.id,
+                "enabled": false,
+            }),
+        )
+        .await
+        .map(|_| ()),
+    ];
+    for result in tainted_results {
+        assert!(
+            matches!(
+                result,
+                Err(PortError::Domain(DomainError::CrossSpaceTainted))
+            ),
+            "tainted caller must fail closed with CrossSpaceTainted: {result:?}"
+        );
+    }
+
+    // set_folder_write_lock must honor SpaceContext::canonical_effect inside
+    // the canonical writer savepoint on both SQLite and PostgreSQL.
+    struct CountingEffect {
+        begins: Arc<std::sync::atomic::AtomicUsize>,
+        reject_on_begin: bool,
+    }
+    struct NoopLease;
+    impl RevocationLease for NoopLease {
+        fn check(&self) -> Result<(), PortError> {
+            Ok(())
+        }
+    }
+    impl CanonicalEffectRegistration for CountingEffect {
+        fn restrict_until(&self, _deadline: std::time::Instant) -> Result<(), PortError> {
+            Ok(())
+        }
+        fn check(&self) -> Result<(), PortError> {
+            Ok(())
+        }
+        fn begin(self: Arc<Self>) -> PortFuture<'static, Box<dyn RevocationLease>> {
+            let begins = self.begins.clone();
+            let reject = self.reject_on_begin;
+            Box::pin(async move {
+                begins.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if reject {
+                    return Err(DomainError::AccessDenied.into());
+                }
+                Ok(Box::new(NoopLease) as Box<dyn RevocationLease>)
+            })
+        }
+    }
+    let personal_scope = fixture.personal_scope().await;
+    let scope = personal_scope.scope().clone();
+    let actor = owner.auth().principal().clone();
+    let fresh_personal = SpaceContext::new(owner.auth().clone(), scope.clone(), budget()).unwrap();
+    let lock_folder = FolderId::from_bytes([130; 16]);
+    fixture
+        .canonical
+        .create_folder(notarium_canonical::CreateFolderSpec {
+            scope: scope.clone(),
+            active_epoch: LeaseEpoch::new(1).unwrap(),
+            folder_id: lock_folder.clone(),
+            parent: None,
+            slug: "fenced-write-lock".into(),
+            display_name: "Fenced Write Lock".into(),
+            is_project: false,
+            project_slug: None,
+            actor: actor.clone(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+
+    let reject_begins = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let rejected_ctx = fresh_personal
+        .clone()
+        .with_canonical_effect(
+            owner,
+            Arc::new(CountingEffect {
+                begins: reject_begins.clone(),
+                reject_on_begin: true,
+            }),
+        )
+        .unwrap();
+    let denied = fixture
+        .canonical
+        .set_folder_write_lock(rejected_ctx, lock_folder.clone(), true)
+        .await;
+    assert!(
+        matches!(denied, Err(PortError::Domain(DomainError::AccessDenied))),
+        "revoked canonical_effect must abort set_folder_write_lock: {denied:?}"
+    );
+    assert_eq!(
+        reject_begins.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "set_folder_write_lock must invoke canonical_effect.begin()"
+    );
+    // Folder must remain unlocked after the aborted write-lock mutation.
+    fixture
+        .canonical
+        .create_note(
+            fresh_personal.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: scope.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([131; 16]),
+                    hash: ContentDigest::from_bytes([131; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: CreateNote {
+                    note: NoteId::from_bytes([131; 16]),
+                    parent: Some(lock_folder.clone()),
+                    slug: "unlocked-after-abort".into(),
+                    class: DocClass::UserDoc,
+                    carrier: "# Still unlocked\n".into(),
+                    folder_page: false,
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+    let allow_begins = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let allowed_ctx = fresh_personal
+        .clone()
+        .with_canonical_effect(
+            owner,
+            Arc::new(CountingEffect {
+                begins: allow_begins.clone(),
+                reject_on_begin: false,
+            }),
+        )
+        .unwrap();
+    fixture
+        .canonical
+        .set_folder_write_lock(allowed_ctx, lock_folder.clone(), true)
+        .await
+        .unwrap();
+    assert_eq!(
+        allow_begins.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "admitted set_folder_write_lock must still enter canonical_effect.begin()"
+    );
+    let blocked = fixture
+        .canonical
+        .create_note(
+            fresh_personal.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope,
+                    actor,
+                    key: CommandKey::from_bytes([132; 16]),
+                    hash: ContentDigest::from_bytes([132; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: CreateNote {
+                    note: NoteId::from_bytes([132; 16]),
+                    parent: Some(lock_folder.clone()),
+                    slug: "blocked-after-lock".into(),
+                    class: DocClass::UserDoc,
+                    carrier: "# Locked\n".into(),
+                    folder_page: false,
+                },
+            },
+        )
+        .await;
+    assert!(
+        matches!(blocked, Err(PortError::Domain(DomainError::SpaceReadOnly))),
+        "folder must be write-locked after admitted set_folder_write_lock: {blocked:?}"
+    );
+    fixture
+        .canonical
+        .set_folder_write_lock(fresh_personal, lock_folder, false)
+        .await
+        .unwrap();
 }

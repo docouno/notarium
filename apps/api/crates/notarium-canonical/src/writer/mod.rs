@@ -368,7 +368,7 @@ type BatchGroupReply = Result<(Vec<Result<Vec<u8>, PortError>>, SpaceSeq), PortE
 
 enum QueuedWriteEntry {
     Single {
-        intent: PreparedWriteIntent,
+        intent: BatchWriteIntent,
         sqlite_fast_plan: Option<Box<dyn crate::sqlite_fast::SqliteSyncItemPlan>>,
         pg_fast_plan: Option<PgSingleItemFastFn>,
         reservation: QueueReservation,
@@ -851,8 +851,12 @@ impl WriteCoordinator {
             .as_ref()
             .is_some_and(CommandIdentitySpec::has_confirmed_chat_step);
         let guarded = intent.canonical_effect().is_some();
+        let has_standalone_effect = intent.canonical_effect.is_some();
         let sqlite_fast_plan = sqlite_fast_plan.and_then(|plan| {
-            if confirmed_step || (guarded && !plan.supports_canonical_effect()) {
+            if confirmed_step
+                || has_standalone_effect
+                || (guarded && !plan.supports_canonical_effect())
+            {
                 intent.prepared.execute = plan.into_async_exec();
                 None
             } else {
@@ -905,7 +909,7 @@ impl WriteCoordinator {
             }
         } else {
             QueuedWriteEntry::Single {
-                intent: intent.prepared,
+                intent,
                 sqlite_fast_plan,
                 pg_fast_plan,
                 reservation: reserved_bytes,
@@ -1588,7 +1592,7 @@ async fn flush_single_batch(
     for entry in &batch {
         match entry {
             QueuedWriteEntry::Single { intent, .. } => {
-                visibility_spaces.push(intent.scope.space_id.clone());
+                visibility_spaces.push(intent.prepared.scope.space_id.clone());
             }
             QueuedWriteEntry::RoomWal { intent, .. } => {
                 visibility_spaces.push(intent.prepared.scope.space_id.clone());
@@ -1634,15 +1638,16 @@ async fn flush_single_batch(
                 reservation,
                 reply_tx,
             } => {
-                if let Err(error) =
-                    inner.check_writer_epoch(&intent.scope.space_id, intent.active_epoch)
-                {
+                if let Err(error) = inner.check_writer_epoch(
+                    &intent.prepared.scope.space_id,
+                    intent.prepared.active_epoch,
+                ) {
                     let _ = reply_tx.send(Err(error));
                     continue;
                 }
                 reserved_list.push(reservation);
                 reply_targets.push(ReplyTarget::Single { reply_tx });
-                items.push((intent.into(), sqlite_fast_plan, pg_fast_plan));
+                items.push((intent, sqlite_fast_plan, pg_fast_plan));
             }
             QueuedWriteEntry::RoomWal {
                 intent,
@@ -2489,6 +2494,11 @@ async fn execute_single_item_in_savepoint(
 
     if let Some(idemp) = &intent.idempotency {
         *active_effect = idemp.begin_canonical_effect().await?;
+        if active_effect.is_none()
+            && let Some(effect) = &canonical_effect
+        {
+            *active_effect = Some(effect.begin().await?);
+        }
         idemp
             .authorize_confirmed_chat_step(tx, &intent.scope, true)
             .await?;

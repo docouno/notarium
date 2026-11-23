@@ -238,7 +238,7 @@ impl ControlService {
         {
             return Ok(None);
         }
-        let lease = match self
+        let mut lease = match self
             .catalog
             .pin_schedule_abilities(ctx, package_refs(role, skills))
             .await
@@ -252,6 +252,7 @@ impl ControlService {
         {
             Ok(Some(lease))
         } else {
+            let _ = lease.close().await;
             Ok(None)
         }
     }

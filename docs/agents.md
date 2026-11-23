@@ -188,10 +188,12 @@ Space writer. Enroll each serving instance's local hub in the shared
 revocation authority, and use that authority for control's provider fences.
 `RunOwnershipRequest.transition` distinguishes `Vacant` admission from
 `Handoff` to a successor under the current writer and `Recover` after the
-predecessor is fenced. Losing the writer lease cancels the run and closes the
-writer's viewer subscriptions. `ClusterRunAuthority::admit_chat_write` checks
-the active run owner or the idle Space writer before looking up an existing
-input receipt or committing a durable chat write. Losing the route cancels the
+predecessor is fenced via `ClusterRunAuthority::fence_orphan` (which returns
+positive ownership evidence before orphan takeover). Losing the writer lease
+cancels the run and closes the writer's viewer subscriptions.
+`ClusterRunAuthority::admit_chat_write` checks the active run owner or the idle
+Space writer before looking up an existing input receipt or committing a
+durable chat write (`AgentRuntimeWrite`), and losing the route cancels the
 command.
 
 ## Scheduled Keepers

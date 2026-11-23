@@ -736,6 +736,51 @@ pub(super) async fn metadata(
         .await
 }
 
+pub(super) async fn folder_disclosures(
+    store: &CanonicalStore,
+    ctx: AccountContext,
+    folders: Vec<FolderRef>,
+) -> Result<Vec<CanonicalMetadataContent>, PortError> {
+    if folders.is_empty() {
+        return Ok(Vec::new());
+    }
+    let budget = ctx.budget.clone();
+    store
+        .with_read_tx_budget(Some(&budget), move |tx| {
+            Box::pin(async move {
+                let mut spaces = std::collections::BTreeMap::<SpaceId, SpaceRecord>::new();
+                let mut ancestry = FolderAncestryCache::default();
+                let mut out = Vec::with_capacity(folders.len());
+                for reference in folders {
+                    if !ctx.auth().spaces().contains_key(&reference.space_id) {
+                        continue;
+                    }
+                    let space = if let Some(cached) = spaces.get(&reference.space_id) {
+                        cached
+                    } else {
+                        match load_space_record(tx, &reference.space_id).await {
+                            Ok(record) => {
+                                spaces.insert(reference.space_id.clone(), record);
+                                spaces.get(&reference.space_id).expect("inserted space")
+                            }
+                            Err(PortError::Domain(DomainError::ResourceNotFound)) => continue,
+                            Err(error) => return Err(error),
+                        }
+                    };
+                    match folder_content(tx, ctx.auth(), space, reference, &mut ancestry).await {
+                        Ok(proof) => out.push(proof),
+                        Err(PortError::Domain(
+                            DomainError::ResourceNotFound | DomainError::AccessDenied,
+                        )) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+                Ok(out)
+            })
+        })
+        .await
+}
+
 async fn folder_content(
     tx: &mut BackendConn<'_>,
     auth: &EngineAuthContext,

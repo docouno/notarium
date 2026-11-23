@@ -1054,9 +1054,6 @@ async fn save_active_role(
     role: &AbilityRef,
     project: Option<FolderRef>,
 ) -> Result<(), PortError> {
-    if episode.active_role.as_ref() == Some(role) && episode.project_hint == project {
-        return Ok(());
-    }
     if matches!(call.auth.kind(), PrincipalKind::Keeper(_))
         || call.auth.chat_audience() == Some(ChatAudience::Shared)
         || call.auth.bearer_scope() == Some(BearerScope::Read)
@@ -1065,6 +1062,9 @@ async fn save_active_role(
     }
     if call.auth.taint().is_tainted() {
         return Err(DomainError::CrossSpaceTainted.into());
+    }
+    if episode.active_role.as_ref() == Some(role) && episode.project_hint == project {
+        return Ok(());
     }
     let plan: EpisodeRolePlan = call
         .journal("activate-role", || async {

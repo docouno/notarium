@@ -97,7 +97,7 @@ impl ControlService {
             let fingerprint = blake3::hash(json(&(1, &request))?.as_bytes()).as_bytes().to_vec();
             let budget = OperationBudget::new(ctx.budget.clone());
             let observed = self.observe_schedule(&budget, &request.schedule).await?;
-            let mut prechecked = if observed.deleted_at.is_none()
+            let prechecked = if observed.deleted_at.is_none()
                 && observed.paused_reason.is_none()
                 && observed.next_slot_utc_ms == Some(slot)
             {
@@ -106,7 +106,32 @@ impl ControlService {
                 Ok(None)
             };
 
-            let mut tx = self.store.write(budget.clone()).await?;
+            let (prechecked_claim, mut schedule_pin) = match prechecked {
+                Ok(Some(ClaimedApproval::Ready(pin))) => {
+                    let snapshot = (pin.abilities().to_vec(), pin.history().clone());
+                    (Ok(Some(Ok(snapshot))), Some(pin))
+                }
+                Ok(Some(ClaimedApproval::SpaceUnavailable)) => {
+                    (Ok(Some(Err(SchedulePauseReason::SpaceUnavailable))), None)
+                }
+                Ok(Some(ClaimedApproval::RoleChanged)) => {
+                    (Ok(Some(Err(SchedulePauseReason::RoleChanged))), None)
+                }
+                Ok(None) => (Ok(None), None),
+                Err(error) => (Err(error), None),
+            };
+            let mut tx = match self.store.write(budget.clone()).await {
+                Ok(tx) => tx,
+                Err(error) => {
+                    if let Some(mut pin) = schedule_pin.take() {
+                        let _ = pin.close().await;
+                    }
+                    return Err(error);
+                }
+            };
+            if let Some(pin) = schedule_pin.take() {
+                tx.hold_schedule_pin(pin);
+            }
             let (result, events) = budget.run(async {
                 let owner = user(tx.inner_mut(), &observed.owner_id).await?;
                 let run = AgentRunId::from_bytes(crate::auth::token::random()?);
@@ -192,18 +217,17 @@ impl ControlService {
                     if observed.config_revision != row.config_revision {
                         return Err(DomainError::ControlRevisionConflict { current: info.revision }.into());
                     }
-                    match prechecked.as_mut().map_err(|error| error.clone())? {
+                    match prechecked_claim.as_ref().map_err(|error| error.clone())? {
                         None => return Err(DomainError::ControlRevisionConflict { current: info.revision }.into()),
-                        Some(ClaimedApproval::SpaceUnavailable) => (Some(SchedulePauseReason::SpaceUnavailable), None),
-                        Some(ClaimedApproval::RoleChanged) => (Some(SchedulePauseReason::RoleChanged), None),
-                        Some(ClaimedApproval::Ready(pin)) => {
+                        Some(Err(reason)) => (Some(*reason), None),
+                        Some(Ok((abilities, history))) => {
                             let keeper = scope.keeper(
                                 &auth, run.clone(),
                                 package_ids(&info.definition.approved_role, &info.approved_skills),
                             )?.with_verified_keeper_log(log_id.clone())?;
                             let current = AccountContext::new(keeper.clone(), budget.context(ctx.budget.request.clone()));
-                            if self.verify_schedule_approval_db(tx.inner_mut(), &current, scope, pin.abilities()).await? {
-                                (None, Some((keeper, admission, pin.history().clone())))
+                            if self.verify_schedule_approval_db(tx.inner_mut(), &current, scope, abilities).await? {
+                                (None, Some((keeper, admission, history.clone())))
                             } else {
                                 (Some(SchedulePauseReason::RoleChanged), None)
                             }
@@ -270,9 +294,6 @@ impl ControlService {
                     run, lease, schedule: Box::new(info), context: Box::new(context),
                 }, Vec::new()))
             }, CommitEffect::NotCommitted).await?;
-            if let Ok(Some(ClaimedApproval::Ready(pin))) = prechecked {
-                tx.hold_schedule_pin(pin);
-            }
             self.commit_revocations(tx, &budget, &events).await?;
             for event in &events {
                 self.flush_event(&budget, event).await?;

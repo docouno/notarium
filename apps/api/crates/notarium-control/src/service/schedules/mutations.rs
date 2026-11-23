@@ -57,10 +57,23 @@ impl ControlService {
                 }
                 Change::Delete(_) => Ok(None),
             };
-            let approved = prechecked
-                .as_ref()
-                .map(|pin| pin.as_deref().map(ScheduleAbilityLease::abilities));
-            let mut tx = self.store.write(budget.clone()).await?;
+            let (approved, mut schedule_pin) = match prechecked {
+                Ok(Some(pin)) => (Ok(Some(pin.abilities().to_vec())), Some(pin)),
+                Ok(None) => (Ok(None), None),
+                Err(error) => (Err(error), None),
+            };
+            let mut tx = match self.store.write(budget.clone()).await {
+                Ok(tx) => tx,
+                Err(error) => {
+                    if let Some(mut pin) = schedule_pin.take() {
+                        let _ = pin.close().await;
+                    }
+                    return Err(error);
+                }
+            };
+            if let Some(pin) = schedule_pin.take() {
+                tx.hold_schedule_pin(pin);
+            }
             let (revision,saved) = budget.run(async {
             let (owner,_) = self.manager(tx.inner_mut(),ctx.auth(),ctx.auth().principal()).await?;
             if let Some(replay) = command.replay::<ScheduleId>(tx.inner_mut()).await? {return Ok(replay);}
@@ -73,7 +86,10 @@ impl ControlService {
                     validate(&input.definition,Some(input.next_slot),self.config.schedule_limits,false)?;
                     let scope = ScheduleScope::from(&input.definition);
                     scope.check(current.auth())?;
-                    let descriptors = approved.map_err(Clone::clone)?
+                    let descriptors = approved
+                        .as_ref()
+                        .map_err(Clone::clone)?
+                        .as_deref()
                         .ok_or_else(|| invalid(ValidationReason::InvalidState))?;
                     if !self.verify_schedule_approval_db(tx.inner_mut(),&current,scope,descriptors).await? {
                         return Err(invalid(ValidationReason::InvalidState));
@@ -135,7 +151,10 @@ impl ControlService {
                                 return Err(invalid(ValidationReason::InvalidTimestamp));
                             }
                         }
-                        let descriptors = approved.map_err(Clone::clone)?
+                        let descriptors = approved
+                            .as_ref()
+                            .map_err(Clone::clone)?
+                            .as_deref()
                             .ok_or_else(|| invalid(ValidationReason::InvalidState))?;
                         if !self.verify_schedule_approval_db(tx.inner_mut(),&current,scope,descriptors).await? {
                             return Err(invalid(ValidationReason::InvalidState));
@@ -174,9 +193,6 @@ impl ControlService {
             command.save(tx.inner_mut(),revision,&saved,now).await?;
             Ok((revision,saved))
         },CommitEffect::NotCommitted).await?;
-            if let Ok(Some(pin)) = prechecked {
-                tx.hold_schedule_pin(pin);
-            }
             self.commit_revocations(tx, &budget, &saved.events).await?;
             for event in &saved.events {
                 self.flush_event(&budget, event).await?;

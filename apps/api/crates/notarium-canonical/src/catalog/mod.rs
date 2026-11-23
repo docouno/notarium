@@ -104,6 +104,19 @@ async fn note_metadata(
     space: &SpaceRecord,
     reference: NoteRef,
 ) -> Result<CatalogNote, PortError> {
+    let mut ancestry = crate::domain::common::FolderAncestryCache::default();
+    note_metadata_with_digest(tx, auth, space, reference, &mut ancestry)
+        .await
+        .map(|(note, _)| note)
+}
+
+async fn note_metadata_with_digest(
+    tx: &mut BackendConn<'_>,
+    auth: &EngineAuthContext,
+    space: &SpaceRecord,
+    reference: NoteRef,
+    ancestry: &mut crate::domain::common::FolderAncestryCache,
+) -> Result<(CatalogNote, Option<ContentDigest>), PortError> {
     if !auth.spaces().contains_key(&reference.space_id) || reference.space_id != space.space.id {
         return Err(DomainError::ResourceNotFound.into());
     }
@@ -116,21 +129,25 @@ async fn note_metadata(
     if row.lifecycle != Lifecycle::Active {
         return Err(DomainError::ResourceNotFound.into());
     }
-    let (facts, _) = build_resource_facts_tx(
-        tx,
-        &space.space,
-        &row.parent_folder_id,
-        row.doc_class,
-        row.ability_id,
-        true,
-    )
-    .await?;
+    let (facts, _) = ancestry
+        .build_resource_facts_tx(
+            tx,
+            &space.space,
+            &row.parent_folder_id,
+            row.doc_class,
+            row.ability_id,
+            true,
+        )
+        .await?;
     auth.can_view_resource(&facts)?;
-    Ok(CatalogNote {
-        reference,
-        lifecycle: row.lifecycle,
-        facts,
-    })
+    Ok((
+        CatalogNote {
+            reference,
+            lifecycle: row.lifecycle,
+            facts,
+        },
+        row.content_digest,
+    ))
 }
 
 #[derive(Serialize, Deserialize)]
@@ -191,6 +208,13 @@ impl ControlCatalogPort for CanonicalStore {
         source: CatalogDisclosure,
     ) -> PortFuture<'_, notarium_core::classes::CanonicalMetadataContent> {
         Box::pin(egress::metadata(self, ctx, source))
+    }
+    fn folder_disclosures(
+        &self,
+        ctx: AccountContext,
+        folders: Vec<FolderRef>,
+    ) -> PortFuture<'_, Vec<notarium_core::classes::CanonicalMetadataContent>> {
+        Box::pin(egress::folder_disclosures(self, ctx, folders))
     }
     fn space(&self, budget: CallBudget, id: SpaceId) -> PortFuture<'_, CatalogSpace> {
         Box::pin(async move {

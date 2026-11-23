@@ -347,7 +347,9 @@ impl AgentRunSupervisor {
         };
         match control.get_episode(account()?, id.clone()).await {
             Ok(episode) if episode.id == id && &episode.owner == run.auth.principal() => {
-                control.touch_episode(account()?, id.clone()).await?;
+                if !run.owner_auth.taint().is_tainted() {
+                    control.touch_episode(account()?, id.clone()).await?;
+                }
                 return Ok(id);
             }
             Ok(_) => return Err(invalid(ValidationReason::SourceMismatch)),

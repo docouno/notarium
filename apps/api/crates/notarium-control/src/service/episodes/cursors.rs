@@ -37,36 +37,69 @@ impl ControlService {
         ctx: &AccountContext,
         episode: Option<&EpisodeId>,
     ) -> Result<Vec<(SpaceId, Vec<u8>, i64)>, PortError> {
-        let mut rows_out = Vec::new();
-        for (space, grant) in ctx.auth().spaces() {
-            if grant.read_classes.is_empty() {
-                continue;
-            }
-            let row = match episode {
-                Some(id) => {
-                    rows!(tx,CursorRow,fetch_optional,"SELECT history_incarnation,acked_space_seq FROM mcp_delta_session_cursors WHERE episode_id=$1 AND space_id=$2","SELECT history_incarnation,acked_space_seq FROM v1_control.mcp_delta_session_cursors WHERE episode_id=$1 AND space_id=$2";id.as_str(),space.as_str())?
-                }
-                None => {
-                    rows!(tx,CursorRow,fetch_optional,"SELECT history_incarnation,acked_space_seq FROM mcp_delta_owner_cursors WHERE owner_id=$1 AND space_id=$2","SELECT history_incarnation,acked_space_seq FROM v1_control.mcp_delta_owner_cursors WHERE owner_id=$1 AND space_id=$2";ctx.auth().principal().as_str(),space.as_str())?
-                }
-            };
-            if let Some(row) = row {
-                rows_out.push((space.clone(), row.history_incarnation, row.acked_space_seq));
+        #[derive(sqlx::FromRow)]
+        struct ScopedCursorRow {
+            space_id: String,
+            history_incarnation: Vec<u8>,
+            acked_space_seq: i64,
+        }
+        let fetched = match episode {
+            Some(id) => rows!(
+                tx,
+                ScopedCursorRow,
+                fetch_all,
+                "SELECT space_id, history_incarnation, acked_space_seq FROM mcp_delta_session_cursors WHERE episode_id=$1 ORDER BY space_id",
+                "SELECT space_id, history_incarnation, acked_space_seq FROM v1_control.mcp_delta_session_cursors WHERE episode_id=$1 ORDER BY space_id";
+                id.as_str()
+            )?,
+            None => rows!(
+                tx,
+                ScopedCursorRow,
+                fetch_all,
+                "SELECT space_id, history_incarnation, acked_space_seq FROM mcp_delta_owner_cursors WHERE owner_id=$1 ORDER BY space_id",
+                "SELECT space_id, history_incarnation, acked_space_seq FROM v1_control.mcp_delta_owner_cursors WHERE owner_id=$1 ORDER BY space_id";
+                ctx.auth().principal().as_str()
+            )?,
+        };
+        let mut rows_out = Vec::with_capacity(fetched.len());
+        for row in fetched {
+            let space = SpaceId::parse(&row.space_id)?;
+            if ctx
+                .auth()
+                .spaces()
+                .get(&space)
+                .is_some_and(|grant| !grant.read_classes.is_empty())
+            {
+                rows_out.push((space, row.history_incarnation, row.acked_space_seq));
             }
         }
         Ok(rows_out)
     }
-    pub(in super::super) async fn resolve_acknowledgements(
+    pub(in super::super) async fn resolve_acknowledgements_cached(
         &self,
         ctx: &AccountContext,
         rows_in: Vec<(SpaceId, Vec<u8>, i64)>,
+        space_cache: &mut BTreeMap<SpaceId, Option<CatalogSpace>>,
     ) -> Result<BTreeMap<SpaceId, AcknowledgedCursor>, PortError> {
         let mut result = BTreeMap::new();
         for (space, history_incarnation, acked_space_seq) in rows_in {
-            let current = match self.catalog_space(ctx, &space).await {
-                Ok(value) => value,
-                Err(error) if hidden(&error) => continue,
-                Err(error) => return Err(error),
+            let current = if let Some(cached) = space_cache.get(&space) {
+                let Some(value) = cached else {
+                    continue;
+                };
+                value.clone()
+            } else {
+                match self.catalog_space(ctx, &space).await {
+                    Ok(value) => {
+                        space_cache.insert(space.clone(), Some(value.clone()));
+                        value
+                    }
+                    Err(error) if hidden(&error) => {
+                        space_cache.insert(space.clone(), None);
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
             };
             let scope = HistoryScope {
                 space_id: space.clone(),

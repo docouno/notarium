@@ -560,9 +560,10 @@ changes; different input rejects the reused key. No stream is replayed or resent
 After reservation, the service rechecks current authority/configuration/consent,
 changes intent to sending and acquires its live registration in one SQL transaction.
 Canonical egress pins the participating Spaces while revalidating sources,
-encoding the request body, and starting the outbound transport; `mark_dispatched`
-releases the canonical Space locks and cleanly rolls back the PostgreSQL
-disclosure read transaction before waiting on upstream response headers (TTFB),
+encoding the request body, and completing outbound preflight and request-body
+upload; `mark_dispatched` releases the canonical Space locks and cleanly rolls
+back the PostgreSQL disclosure read transaction before waiting on upstream
+response headers (TTFB),
 while `RevocationHub` cancels in-flight HTTP calls on concurrent revocation.
 Restore waits for outstanding disclosures before switching generations.
 The transport handle exists before awaiting response headers. Shutdown acknowledgement

@@ -170,7 +170,7 @@ response. Reusing the key with a different payload is rejected. Rebinding a
 Space's history invalidates receipts issued for its earlier incarnation.
 
 Version 9 extends the linear schema sequence from version 8 with chat runtime
-and ability package tables. Startup selects the upgrade by version and exact
+columns and updated ability-package and lookup indexes. Startup selects the upgrade by version and exact
 manifest checksum. Schema version 9 allows multiple canonical packages to share
 a folded name. Control binding policy selects the visible package and serializes
 live authoring operations. Canonical package identity and version remain exact.
