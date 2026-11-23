@@ -587,7 +587,7 @@ async fn begin_ollama_stream(stream: &mut tokio::io::BufReader<tokio::net::TcpSt
     stream
         .get_mut()
         .write_all(
-            b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nTransfer-Encoding: chunked\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
         )
         .await
         .unwrap();
@@ -1089,9 +1089,7 @@ async fn queue_conflicts_and_lost_ack(
     let (mut wire, _) = timeout(Duration::from_secs(15), read_request(listener))
         .await
         .unwrap();
-    wire.get_mut().write_all(
-        b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nTransfer-Encoding: chunked\r\n\r\n",
-    ).await.unwrap();
+    begin_ollama_stream(&mut wire).await;
     let mut observer = supervisor
         .subscribe(owner.clone(), scope.clone(), thread.clone(), None)
         .await

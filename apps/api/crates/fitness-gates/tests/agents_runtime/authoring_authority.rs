@@ -768,9 +768,8 @@ pub(super) async fn revoked_rollback(
 }
 
 async fn check(pg: bool) {
-    let mut fixture = RuntimeFixture::open_named(pg, "agents_authoring_authority").await;
+    let mut fixture = Box::pin(RuntimeFixture::open_named(pg, "agents_authoring_authority")).await;
     let owner = &fixture.human;
-    let principal = owner.auth().principal();
     let space_id = fixture
         .control
         .whoami(owner.clone())
@@ -778,15 +777,30 @@ async fn check(pg: bool) {
         .unwrap()
         .personal_space
         .unwrap();
+    let scope = fixture.canonical.read_space(&space_id).await.unwrap().scope;
+    Box::pin(revoked_ability_deletion(&fixture, &space_id)).await;
+    Box::pin(revoked_ability_edit_replay(&fixture, &scope)).await;
+    Box::pin(proposal_cases::revoked_session_cannot_apply_or_replay(
+        &mut fixture,
+    ))
+    .await;
+    Box::pin(revoked_chat_receipt(&mut fixture, &scope)).await;
+    Box::pin(revoked_root_userdoc_rollback(&mut fixture, &scope)).await;
+    fixture.close().await;
+}
+
+async fn revoked_ability_deletion(fixture: &RuntimeFixture, space_id: &SpaceId) {
+    let owner = &fixture.human;
+    let principal = owner.auth().principal();
     for (key, replay) in [(181, false), (183, true)] {
-        let created = call(&fixture, owner, key, "create_ability", json!({
+        let created = call(fixture, owner, key, "create_ability", json!({
             "kind":"role", "name":format!("authoring-fixture-{key}"), "description":"Runtime role",
             "instructions":"Use the recorded procedure.", "placement":{"home":"personal"},
         })).await.unwrap();
         let input = json!({"ref":created.structured_content["ref"]});
         let author = fixture.pat(BearerScope::Write, true).await;
         if replay {
-            call(&fixture, &author, key + 1, "delete_ability", input.clone())
+            call(fixture, &author, key + 1, "delete_ability", input.clone())
                 .await
                 .unwrap();
         }
@@ -795,24 +809,24 @@ async fn check(pg: bool) {
         };
         let before = fixture
             .canonical
-            .read_space(&space_id)
+            .read_space(space_id)
             .await
             .unwrap()
             .last_seq;
         let revocation = AccountMutation {
-            identity: runtime_ability_cases::identity(&fixture, owner, key + 1).await,
+            identity: runtime_ability_cases::identity(fixture, owner, key + 1).await,
             input: RevokePat {
                 account: principal.clone(),
                 token: token.clone(),
             },
         };
-        let mutation = call(&fixture, &author, key + 1, "delete_ability", input.clone());
+        let mutation = call(fixture, &author, key + 1, "delete_ability", input.clone());
         let revocation = fixture.control.revoke_pat(owner.clone(), revocation);
         let pinned_writer = !replay;
         let denied = if pinned_writer {
             revoke_while_writer_pinned(
-                &fixture,
-                &space_id,
+                fixture,
+                space_id,
                 fixture.projections.pause_ability_trash(),
                 mutation,
                 revocation,
@@ -836,14 +850,14 @@ async fn check(pg: bool) {
         assert_eq!(
             fixture
                 .canonical
-                .read_space(&space_id)
+                .read_space(space_id)
                 .await
                 .unwrap()
                 .last_seq,
             before
         );
         assert!(matches!(
-            call(&fixture, &author, key + 1, "delete_ability", input.clone()).await,
+            call(fixture, &author, key + 1, "delete_ability", input.clone()).await,
             Err(PortError::Domain(DomainError::AuthenticationFailed))
         ));
         if pinned_writer {
@@ -856,16 +870,16 @@ async fn check(pg: bool) {
                 panic!("expected an opt-in PAT");
             };
             let active_revocation = AccountMutation {
-                identity: runtime_ability_cases::identity(&fixture, owner, 187).await,
+                identity: runtime_ability_cases::identity(fixture, owner, 187).await,
                 input: RevokePat {
                     account: principal.clone(),
                     token: active_token.clone(),
                 },
             };
             let active_denied = revoke_during_active_sql(
-                &fixture,
+                fixture,
                 call(
-                    &fixture,
+                    fixture,
                     &active_author,
                     188,
                     "delete_ability",
@@ -883,7 +897,7 @@ async fn check(pg: bool) {
             assert_eq!(
                 fixture
                     .canonical
-                    .read_space(&space_id)
+                    .read_space(space_id)
                     .await
                     .unwrap()
                     .last_seq,
@@ -891,16 +905,20 @@ async fn check(pg: bool) {
             );
             // The same writer processes this new authorized command after the
             // queued and active revoked commands. It can trash the live package once.
-            call(&fixture, owner, 186, "delete_ability", input)
+            call(fixture, owner, 186, "delete_ability", input)
                 .await
                 .unwrap();
         }
     }
+}
+
+async fn revoked_ability_edit_replay(fixture: &RuntimeFixture, scope: &HistoryScope) {
+    let owner = &fixture.human;
+    let principal = owner.auth().principal();
     // Exact replay of a fenced `edit_note` (`CanonicalEffect::AbilityAuthoring`)
     // must enter the guarded receipt-replay transaction (`begin_canonical_effect`)
     // and fail closed under synchronous PAT revocation on both SQLite and
     // PostgreSQL, rather than returning a Phase-1 SQLite receipt without fencing.
-    let scope = fixture.canonical.read_space(&space_id).await.unwrap().scope;
     let edit_author = fixture.pat(BearerScope::Write, true).await;
     let Some(AuthenticatedCredential::Pat(edit_pat_id)) = edit_author.auth().credential().cloned()
     else {
@@ -992,7 +1010,7 @@ async fn check(pg: bool) {
         .unwrap();
     let edit_seq_before = fixture
         .canonical
-        .read_space(&space_id)
+        .read_space(&scope.space_id)
         .await
         .unwrap()
         .last_seq;
@@ -1006,12 +1024,12 @@ async fn check(pg: bool) {
         .await
         .unwrap();
     let edit_replay_denied = revoke_during_fenced_replay(
-        &fixture,
+        fixture,
         fixture.canonical.edit_note(fenced_replay, edit_mutation),
         fixture.control.revoke_pat(
             owner.clone(),
             AccountMutation {
-                identity: runtime_ability_cases::identity(&fixture, owner, 222).await,
+                identity: runtime_ability_cases::identity(fixture, owner, 222).await,
                 input: RevokePat {
                     account: principal.clone(),
                     token: edit_pat_id,
@@ -1027,19 +1045,12 @@ async fn check(pg: bool) {
     assert_eq!(
         fixture
             .canonical
-            .read_space(&space_id)
+            .read_space(&scope.space_id)
             .await
             .unwrap()
             .last_seq,
         edit_seq_before
     );
-    Box::pin(proposal_cases::revoked_session_cannot_apply_or_replay(
-        &mut fixture,
-    ))
-    .await;
-    Box::pin(revoked_chat_receipt(&mut fixture, &scope)).await;
-    Box::pin(revoked_root_userdoc_rollback(&mut fixture, &scope)).await;
-    fixture.close().await;
 }
 
 async fn revoked_root_userdoc_rollback(fixture: &mut RuntimeFixture, personal: &HistoryScope) {

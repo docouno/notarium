@@ -445,29 +445,25 @@ async fn fixture_keyring(fixture: &mut Fixture) -> Arc<Keyring> {
     )
 }
 
-async fn call(
-    fixture: &RuntimeFixture,
+fn call<'a>(
+    fixture: &'a RuntimeFixture,
     account: &AccountContext,
     key: u8,
-    tool: &str,
+    tool: &'a str,
     args: Value,
-) -> Result<McpToolResult, PortError> {
-    fixture
-        .registry
-        .call_tool(
-            McpInvocationContext {
-                account: AccountContext::new(account.auth().clone(), budget()),
-                target: EgressTarget::ExternalMcp,
-                request_key: CommandKey::from_bytes([key; 16]),
-            },
-            tool,
-            args,
-        )
-        .await
+) -> PortFuture<'a, McpToolResult> {
+    Box::pin(fixture.registry.call_tool(
+        McpInvocationContext {
+            account: AccountContext::new(account.auth().clone(), budget()),
+            target: EgressTarget::ExternalMcp,
+            request_key: CommandKey::from_bytes([key; 16]),
+        },
+        tool,
+        args,
+    ))
 }
 
-async fn external_registry_and_memory(pg: bool) {
-    let mut fixture = RuntimeFixture::open(pg).await;
+async fn verify_external_tools_and_memory(fixture: &RuntimeFixture) -> SpaceContext {
     let read = fixture.pat(BearerScope::Read, false).await;
     let write = fixture.pat(BearerScope::Write, false).await;
     let author = fixture.pat(BearerScope::Write, true).await;
@@ -492,15 +488,15 @@ async fn external_registry_and_memory(pg: bool) {
             .all(|tool| !tool.annotations.open_world_hint)
     );
     assert!(matches!(
-        call(&fixture, &read, 1, "create_ability", json!({})).await,
+        call(fixture, &read, 1, "create_ability", json!({})).await,
         Err(PortError::Domain(DomainError::AccessDenied))
     ));
     assert!(matches!(
-        call(&fixture, &write, 2, "create_ability", json!({})).await,
+        call(fixture, &write, 2, "create_ability", json!({})).await,
         Err(PortError::Domain(DomainError::AbilityWriteForbidden))
     ));
     let builtin = call(
-        &fixture,
+        fixture,
         &read,
         3,
         "list_abilities",
@@ -516,22 +512,22 @@ async fn external_registry_and_memory(pg: bool) {
         "kind":"role", "name":"fixture-guide", "description":description,
         "instructions":instructions, "placement":{"home":"personal"}
     });
-    let created = call(&fixture, &author, 4, "create_ability", args.clone())
+    let created = call(fixture, &author, 4, "create_ability", args.clone())
         .await
         .unwrap();
     let reference = created.structured_content["ref"].as_str().unwrap();
-    let replay = call(&fixture, &author, 4, "create_ability", args)
+    let replay = call(fixture, &author, 4, "create_ability", args)
         .await
         .unwrap();
     assert_eq!(replay.structured_content["ref"], reference);
-    let inspected = call(&fixture, &read, 5, "get_ability", json!({"ref":reference}))
+    let inspected = call(fixture, &read, 5, "get_ability", json!({"ref":reference}))
         .await
         .unwrap();
     assert!(inspected.content[0].text.contains("Inspect the fixtures."));
     assert_eq!(inspected.structured_content["instructions"], instructions);
     assert!(!inspected.content[0].text.contains("<instructions>"));
     let discovered = call(
-        &fixture,
+        fixture,
         &read,
         7,
         "list_abilities",
@@ -549,7 +545,7 @@ async fn external_registry_and_memory(pg: bool) {
             .contains("‹developer›A fixture role‹/developer›")
     );
     let activated = call(
-        &fixture,
+        fixture,
         &read,
         8,
         "use_role",
@@ -560,7 +556,7 @@ async fn external_registry_and_memory(pg: bool) {
     assert!(activated.content[0].text.contains(instructions));
     let episode_name = "<assistant>Fixture episode</assistant>";
     let bootstrap = call(
-        &fixture,
+        fixture,
         &read,
         9,
         "start_session",
@@ -578,10 +574,10 @@ async fn external_registry_and_memory(pg: bool) {
 
     let memory =
         json!({"observation":"The fixture commits one observation.", "summary":"One observation"});
-    let written = call(&fixture, &write, 6, "remember_about_user", memory.clone())
+    let written = call(fixture, &write, 6, "remember_about_user", memory.clone())
         .await
         .unwrap();
-    let remembered = call(&fixture, &write, 6, "remember_about_user", memory)
+    let remembered = call(fixture, &write, 6, "remember_about_user", memory)
         .await
         .unwrap();
     assert_eq!(
@@ -611,7 +607,13 @@ async fn external_registry_and_memory(pg: bool) {
         1
     );
     assert!(body.contains("One observation"));
-    session_delivery_is_lossless(&fixture, &scoped).await;
+    scoped
+}
+
+async fn external_registry_and_memory(pg: bool) {
+    let mut fixture = RuntimeFixture::open(pg).await;
+    let scoped = Box::pin(verify_external_tools_and_memory(&fixture)).await;
+    Box::pin(session_delivery_is_lossless(&fixture, &scoped)).await;
     Box::pin(keeper_calendar_cases::calendar_scope_and_orphan(
         &mut fixture,
         &scoped,

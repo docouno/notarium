@@ -1,6 +1,8 @@
 use super::*;
 use super::{
-    runtime_ability_cases::{approve_disclosure, loopback_provider, read_request, send_ollama},
+    runtime_ability_cases::{
+        approve_disclosure, begin_ollama_response, loopback_provider, read_request, send_ollama,
+    },
     supervised_chat_cases::{branch, idle_leaf},
 };
 use notarium_agents::chats::{AgentRunSupervisor, ChatRunOptions, ExclusiveDataRoot, StartChatRun};
@@ -11,7 +13,7 @@ use notarium_core::{
     ports::provider::{ProviderToolCall, ProviderToolCallId},
 };
 use std::time::Duration;
-use tokio::{net::TcpListener, time::timeout};
+use tokio::{io::AsyncWriteExt, net::TcpListener, time::timeout};
 
 #[tokio::test]
 async fn sqlite_supervised_proposals_on_tainted_branch() {
@@ -153,6 +155,18 @@ async fn supervised_proposals_on_tainted_branch(postgres: bool) {
         let (mut wire, _) = timeout(Duration::from_secs(15), read_request(&listener))
             .await
             .unwrap();
+        let category = format!("supervised-proposal-{turn}");
+        // Acknowledge dispatch so Canonical can admit the queued write while the model streams.
+        let reply = begin_ollama_response(
+            &mut wire,
+            json!({"role":"assistant","tool_calls":[{"function":{
+                "index":0,"name":"remember_about_user","arguments":{
+                    "category":category,"observation":"Only after my approval."
+                }
+            }}]}),
+            "tool_calls",
+        )
+        .await;
         let head = branch(&fixture, &personal, &thread, ThreadEntrySeq::ZERO)
             .await
             .thread
@@ -172,17 +186,7 @@ async fn supervised_proposals_on_tainted_branch(postgres: bool) {
                 .unwrap();
             assert!(matches!(queued.outcome, SubmitUserChatOutcome::Queued(_)));
         }
-        let category = format!("supervised-proposal-{turn}");
-        send_ollama(
-            &mut wire,
-            json!({"role":"assistant","tool_calls":[{"function":{
-                "index":0,"name":"remember_about_user","arguments":{
-                    "category":category,"observation":"Only after my approval."
-                }
-            }}]}),
-            "tool_calls",
-        )
-        .await;
+        wire.get_mut().write_all(reply.as_bytes()).await.unwrap();
         drop(wire);
         let (mut wire, _) = timeout(Duration::from_secs(15), read_request(&listener))
             .await
