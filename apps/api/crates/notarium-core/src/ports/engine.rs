@@ -300,8 +300,6 @@ pub trait SearchRecipient: Send + Sync {
     }
 }
 
-pub use SearchRecipient as RecallRecipient;
-
 pub trait SearchPort: Send + Sync {
     fn search(&self, ctx: SpaceContext, request: SearchQuery) -> PortFuture<'_, SearchResult> {
         self.search_for(ctx, request, None)

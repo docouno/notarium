@@ -56,8 +56,12 @@ before shutting down canonical storage.
   only admitted notes with graph nodes count toward the 16 seeds. Each
   visit reads up to 64 neighbors per direction. Up to 64 distinct admitted
   neighbors determine the degree penalty and can receive a boost or become
-  the next frontier. Across all hops, the provider search checks up to 1,040
-  additional distinct neighbors for admission. All seeds and hops share
+  the next frontier. All visits in a layer check their first 64 candidates
+  before requesting replacements. Each subsequent batch checks at most as
+  many candidates per visit as there are open slots. A full visit skips
+  the rest of its page.
+  Across all hops, the provider search checks up to 1,040 additional
+  distinct neighbors for admission. All seeds and hops share
   1,040 node visits and the request deadline. Work beyond either cap marks
   the typed result truncated. Recall serves the best
   eligible chunk per note first, then fills the remaining token budget while

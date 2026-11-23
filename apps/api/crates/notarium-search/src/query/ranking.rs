@@ -242,14 +242,27 @@ pub(super) async fn expand(
         if layer_edges.is_empty() {
             break;
         }
-        truncated |= resolve_graph_notes(
-            engine,
-            admission,
-            &mut live_cache,
-            layer_edges.iter().map(|(_, note)| note),
-            &mut new_notes_left,
-        )
-        .await?;
+        truncated |= if filtered {
+            resolve_recipient_visits(
+                engine,
+                admission,
+                &mut live_cache,
+                visits
+                    .iter()
+                    .map(|(_, _, range)| &layer_edges[range.clone()]),
+                &mut new_notes_left,
+            )
+            .await?
+        } else {
+            resolve_graph_notes(
+                engine,
+                admission,
+                &mut live_cache,
+                layer_edges.iter().map(|(_, note)| note),
+                &mut new_notes_left,
+            )
+            .await?
+        };
         for (seed_idx, raw_degree, range) in visits {
             let admitted = layer_edges[range]
                 .iter()
@@ -283,6 +296,46 @@ pub(super) async fn expand(
         ..Candidate::new(note)
     }));
     candidates.sort_by(order);
+    Ok(truncated)
+}
+
+async fn resolve_recipient_visits<'a>(
+    engine: &SearchEngine,
+    admission: &mut NoteAdmission<'_>,
+    cache: &mut HashMap<NoteId, bool>,
+    pages: impl Iterator<Item = &'a [(DenseNodeId, NoteId)]>,
+    remaining: &mut usize,
+) -> Result<bool, PortError> {
+    // All visits get a first pass before any visit can spend the shared
+    // metadata budget on its second half. Keep the unexamined slice and the
+    // number of admitted neighbors still needed for each visit.
+    let mut pending: Vec<_> = pages
+        .filter(|page| !page.is_empty())
+        .map(|page| (page, usize::from(GRAPH_FANOUT)))
+        .collect();
+    let mut truncated = false;
+    fn edge_note(edge: &(DenseNodeId, NoteId)) -> &NoteId {
+        &edge.1
+    }
+    while !pending.is_empty() {
+        let notes = pending
+            .iter()
+            .flat_map(|(page, slots)| page.iter().take(*slots).map(edge_note));
+        truncated |= resolve_graph_notes(engine, admission, cache, notes, remaining).await?;
+        pending.retain_mut(|(page, slots)| {
+            let (checked, rest) = page.split_at(page.len().min(*slots));
+            if rest.is_empty() {
+                return false;
+            }
+            let accepted = checked
+                .iter()
+                .filter(|(_, id)| cache.get(id) == Some(&true))
+                .count();
+            *slots -= accepted;
+            *page = rest;
+            *slots != 0
+        });
+    }
     Ok(truncated)
 }
 

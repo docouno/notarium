@@ -931,6 +931,203 @@ async fn run_scenario(store: Arc<CanonicalStore>, root: DataRoot, tag: u8) {
     engine.shutdown().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn graph_admission_checks_only_neighbors_needed_for_each_visit() {
+    use notarium_core::ports::{PortFuture, SearchRecipient};
+    use std::sync::atomic::AtomicUsize;
+    struct Recipient {
+        denied: BTreeSet<NoteId>,
+        calls: AtomicUsize,
+    }
+    impl SearchRecipient for Recipient {
+        fn admit<'a>(
+            &'a self,
+            card: &'a notarium_core::classes::ClassifiedMetadata,
+        ) -> PortFuture<'a, bool> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async move { Ok(!self.denied.contains(&card.reference().note_id)) })
+        }
+    }
+
+    let _guard = INTEGRATION_LOCK.lock().await;
+    let data = TempDataRoot::new("graph-admission");
+    let (store, runtime) = CanonicalRuntime::open(CanonicalConfig::local_default(
+        sample_installation_id(93),
+        data.data_root(),
+    ))
+    .await
+    .unwrap();
+    let store = Arc::new(store);
+    let owner = sample_principal_id(93);
+    let folder = sample_folder_id(93);
+    let epoch = LeaseEpoch::new(1).unwrap();
+    let scope = store
+        .create_space(CreateSpaceSpec {
+            space_id: sample_space_id(93),
+            incarnation: sample_incarnation(93),
+            root_folder_id: folder.clone(),
+            slug: "graph-admission".into(),
+            kind: SpaceKind::Personal,
+            owner: owner.clone(),
+            active_epoch: epoch,
+            initial_last_seq: SpaceSeq::ZERO,
+            created_at: None,
+        })
+        .await
+        .unwrap()
+        .scope;
+    let id = |index: u32| NoteId::from_bytes(u128::from(index).to_be_bytes());
+    let mut view = View::new(scope.clone(), folder.clone());
+    let narrow = 16 + 8 * 128;
+    let last = narrow + 32;
+    let mut batch = Vec::new();
+    let mut live = BTreeSet::new();
+    let mut cutoff = SpaceSeq::ZERO;
+    for i in 0..last + 7 {
+        let note_id = id(i);
+        view.index(note_id.clone(), folder.clone());
+        live.insert(note_id.clone());
+        let title = if i < 16 {
+            "Graphfanoutmarker"
+        } else {
+            "Neighbor"
+        };
+        batch.push(note(&note_id, &folder, title, "Evidence."));
+        if batch.len() == 64 || i + 1 == last + 7 {
+            let (written, _) = store
+                .commit_synthetic_note_batch_for_test(
+                    &scope,
+                    epoch,
+                    &owner,
+                    std::mem::take(&mut batch),
+                )
+                .await
+                .unwrap();
+            cutoff = written.last_seq;
+            view.advance(cutoff);
+        }
+    }
+    // Eight seeds have 64 outgoing and 64 different incoming neighbors.
+    // Their second half matters only when admission rejects a prefix match.
+    for seed in 0..8 {
+        for offset in 0..128 {
+            let neighbor = 16 + seed * 128 + offset;
+            if offset < 64 {
+                view.link(seed, neighbor);
+            } else {
+                view.link(neighbor, seed);
+            }
+        }
+    }
+    for neighbor in narrow..last {
+        view.link(8, neighbor);
+    }
+    for i in 0..7 {
+        view.link(9 + i, last + i);
+    }
+    // One leaf is reachable from two seeds and in both directions for seed 9.
+    view.link(9, last + 1);
+    view.link(last + 1, 9);
+    let projection = Arc::new(Projection {
+        store: store.clone(),
+        snapshot: RwLock::new(view),
+        live: RwLock::new(live),
+    });
+    let engine = SearchEngine::start(
+        SearchConfig::new(data.data_root(), VectorMode::Disabled),
+        SearchDependencies::new(store.clone(), projection),
+    );
+    let ctx = context(&scope, &owner);
+    let request = |depth| RecallQuery {
+        query: SearchQuery {
+            top_k: PageLimit::new(200).unwrap(),
+            causal: CausalBasis::Await(AwaitWatermarks::at(scope.clone(), cutoff)),
+            ..query("graphfanoutmarker")
+        },
+        graph_depth: depth,
+        token_budget: 131_072,
+        max_per_source: None,
+    };
+    let scores = |result: &notarium_core::ports::SearchResult| {
+        result
+            .hits
+            .iter()
+            .map(|hit| {
+                (
+                    hit.card.document.provenance().reference().note_id.clone(),
+                    hit.score,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    for depth in [1, 2] {
+        let ordinary = engine.recall(ctx.clone(), request(depth)).await.unwrap();
+        let baseline = scores(&ordinary);
+        assert!(baseline.iter().any(|(note, _)| note == &id(last + 6)));
+        let all = Recipient {
+            denied: BTreeSet::new(),
+            calls: AtomicUsize::new(0),
+        };
+        let full = engine
+            .recall_for(ctx.clone(), request(depth), Some(&all))
+            .await
+            .unwrap();
+        let actual = scores(&full);
+        for i in 0..baseline.len().max(actual.len()) {
+            let expected = baseline.get(i);
+            let found = actual.get(i);
+            assert!(
+                found == expected,
+                "all sources admitted at depth {depth}, rank {}: expected {expected:?}, actual {found:?} (ordinary length {}, recipient length {})",
+                i + 1,
+                baseline.len(),
+                actual.len()
+            );
+        }
+        assert_eq!(all.calls.into_inner(), 16 + 8 * 64 + 32 + 7);
+        if depth == 1 {
+            let shared = baseline
+                .iter()
+                .find(|(note, _)| note == &id(last + 1))
+                .unwrap()
+                .1;
+            let expected =
+                0.25 / (70.0 * (1.0 + 3.0_f64.ln())) + 0.25 / (71.0 * (1.0 + 2.0_f64.ln()));
+            assert!((shared - expected).abs() < 1e-9);
+        }
+    }
+    // The second case leaves one slot open over three consecutive tail
+    // denials. The next allowed note fills it without spending later slots.
+    for (denied, replacements) in [
+        (vec![16, 17], vec![80, 81]),
+        (vec![16, 80, 81, 82], vec![83]),
+    ] {
+        let partial = Recipient {
+            denied: denied.iter().copied().map(id).collect(),
+            calls: AtomicUsize::new(0),
+        };
+        let found = engine
+            .recall_for(ctx.clone(), request(1), Some(&partial))
+            .await
+            .unwrap();
+        let hits: BTreeSet<_> = scores(&found).into_iter().map(|(note, _)| note).collect();
+        assert!(hits.contains(&id(last + 6)));
+        for accepted in &replacements {
+            assert!(hits.contains(&id(*accepted)));
+        }
+        for skipped in &denied {
+            assert!(!hits.contains(&id(*skipped)));
+        }
+        assert!(!hits.contains(&id(replacements.last().unwrap() + 1)));
+        assert_eq!(
+            partial.calls.into_inner(),
+            16 + 8 * 64 + 32 + 7 + denied.len()
+        );
+    }
+    engine.shutdown().await;
+    runtime.shutdown().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sqlite_hybrid_seed_causal_boundaries_and_scrub() {
     let _guard = INTEGRATION_LOCK.lock().await;
