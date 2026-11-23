@@ -187,14 +187,17 @@ Clustered composition supplies `ClusterRunAuthority` tied to the active
 Space writer. Enroll each serving instance's local hub in the shared
 revocation authority, and use that authority for control's provider fences.
 `RunOwnershipRequest.transition` distinguishes `Vacant` admission from
-`Handoff` to a successor under the current writer and `Recover` after the
-predecessor is fenced via `ClusterRunAuthority::fence_orphan` (which returns
-positive ownership evidence before orphan takeover). Losing the writer lease
-cancels the run and closes the writer's viewer subscriptions.
-`ClusterRunAuthority::admit_chat_write` checks the active run owner or the idle
-Space writer before looking up an existing input receipt or committing a
-durable chat write (`AgentRuntimeWrite`), and losing the route cancels the
-command.
+`Handoff` to a successor under the current writer and `Recover` after
+`LiveRunOwner::prior_owner_fenced` confirms the predecessor is fenced during
+`register_owner`. When human chat input arrives for an orphaned `active_run`,
+`ClusterRunAuthority::fence_orphan` returns positive ownership evidence and
+blocks replacement ownership while the orphan is cleared before recording the
+input. Losing the writer lease cancels the run and closes the writer's viewer
+subscriptions. `ClusterRunAuthority::admit_chat_write` checks the active run
+owner or the idle Space writer before looking up an existing input receipt or
+committing human chat input (`ChatInput`) or redaction (`ChatRedaction`), and
+losing the route cancels the command. Active chat runs and scheduled Keepers
+fence their runtime chat and corpus writes with `AgentRuntimeWrite`.
 
 ## Scheduled Keepers
 

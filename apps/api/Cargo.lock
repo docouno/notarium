@@ -2960,7 +2960,6 @@ dependencies = [
  "libsqlite3-sys",
  "notarium-core",
  "openidconnect",
- "reqwest",
  "rusqlite",
  "rustls",
  "rustls-native-certs",

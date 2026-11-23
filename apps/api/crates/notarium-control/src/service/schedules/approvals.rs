@@ -147,7 +147,7 @@ impl ControlService {
         let run = AgentRunId::from_bytes([0; 16]);
         let role_auth = scope.keeper(&auth, run.clone(), [selection.role.id.clone()].into())?;
         let role_ctx = AccountContext::new(role_auth, budget.context(ctx.budget.request.clone()));
-        let (role, skills, lease) = budget
+        let (role, skills, mut lease) = budget
             .run(
                 async {
                     self.schedule_history(&role_ctx, scope).await?;
@@ -181,9 +181,16 @@ impl ControlService {
                 CommitEffect::NotCommitted,
             )
             .await?;
-        let (mut rtx, fresh) = self
+        let (mut rtx, fresh) = match self
             .open_revalidated_read(&budget, &ctx.budget.request, ctx.auth())
-            .await?;
+            .await
+        {
+            Ok(pair) => pair,
+            Err(error) => {
+                let _ = lease.close().await;
+                return Err(error);
+            }
+        };
         let fresh_ctx = AccountContext::new(fresh, budget.context(ctx.budget.request.clone()));
         let approved = lease.abilities();
         let candidate = budget
@@ -207,7 +214,9 @@ impl ControlService {
                 CommitEffect::NotCommitted,
             )
             .await;
-        budget.run(rtx.finish(), CommitEffect::NotCommitted).await?;
+        let finish = budget.run(rtx.finish(), CommitEffect::NotCommitted).await;
+        let _ = lease.close().await;
+        finish?;
         candidate
     }
 

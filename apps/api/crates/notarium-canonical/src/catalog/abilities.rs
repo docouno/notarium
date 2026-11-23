@@ -79,12 +79,18 @@ async fn resolve(
     // Projects are root children. A descendant package belongs to that exact
     // project regardless of folder/path renames.
     let mut current_project = None;
-    if let Some(folder) = note.facts.ancestor_folders.iter().rev().nth(1)
-        && load_folder_head_row(tx, &space.space.id, folder)
-            .await?
-            .is_project
-    {
-        current_project = Some(folder.clone());
+    if let Some(folder) = note.facts.ancestor_folders.iter().rev().nth(1) {
+        let is_project = match live_ancestry.is_project_cached(&space.space.id, folder) {
+            Some(flag) => flag,
+            None => {
+                load_folder_head_row(tx, &space.space.id, folder)
+                    .await?
+                    .is_project
+            }
+        };
+        if is_project {
+            current_project = Some(folder.clone());
+        }
     }
     let placement = proven_placement(space, current_project);
     if matches!(&placement,AbilityPlacement::OwnedPersonal(owner) if owner!=auth.principal()) {
@@ -491,34 +497,57 @@ pub(super) async fn pin_schedule(
             &ctx.budget.cancellation,
         )
         .await?;
-    let mut tx = guard.connection();
-    let space = load_space_record(&mut tx, space).await?;
-    if space.space.lifecycle != SpaceLifecycle::Active || grant.read_classes.is_empty() {
-        return Err(DomainError::ResourceNotFound.into());
-    }
-    if let Some(project) = &grant.project_root {
-        let reference = FolderRef {
-            space_id: space.space.id.clone(),
-            folder_id: project.clone(),
+    let pinned = async {
+        let (history, abilities) = {
+            let mut tx = guard.connection();
+            let space = load_space_record(&mut tx, space).await?;
+            if space.space.lifecycle != SpaceLifecycle::Active || grant.read_classes.is_empty() {
+                return Err(DomainError::ResourceNotFound.into());
+            }
+            if let Some(project) = &grant.project_root {
+                let reference = FolderRef {
+                    space_id: space.space.id.clone(),
+                    folder_id: project.clone(),
+                };
+                let (_, row) = folder_metadata(&mut tx, ctx.auth(), &space, reference).await?;
+                if !row.is_project {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+            }
+            let mut abilities = Vec::with_capacity(refs.len());
+            let mut live_ancestry = crate::domain::common::FolderAncestryCache::default();
+            for reference in refs {
+                let current = descriptor_with_cache(
+                    &mut tx,
+                    ctx.auth(),
+                    &space,
+                    &reference.id,
+                    None,
+                    &mut live_ancestry,
+                )
+                .await?;
+                if current.reference != reference {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+                abilities.push(current);
+            }
+            (space.scope, abilities)
         };
-        let (_, row) = folder_metadata(&mut tx, ctx.auth(), &space, reference).await?;
-        if !row.is_project {
-            return Err(DomainError::ResourceNotFound.into());
-        }
+        guard.check()?;
+        Ok::<_, PortError>((history, abilities))
     }
-    let mut abilities = Vec::with_capacity(refs.len());
-    for reference in refs {
-        let current = descriptor(&mut tx, ctx.auth(), &space, &reference.id, None).await?;
-        if current.reference != reference {
-            return Err(DomainError::ResourceNotFound.into());
+    .await;
+    let (history, abilities) = match pinned {
+        Ok(pair) => pair,
+        Err(error) => {
+            guard.release_clean().await;
+            return Err(error);
         }
-        abilities.push(current);
-    }
-    guard.check()?;
+    };
     guard.finish_snapshot().await;
     Ok(Box::new(SchedulePin {
         guard: Some(guard),
-        history: space.scope,
+        history,
         abilities,
     }))
 }

@@ -51,7 +51,7 @@ impl EnvelopeAddress {
         if header.len() > 256 {
             return Err(invalid(ValidationReason::InvalidLimit));
         }
-        let name = reqwest::header::HeaderName::from_bytes(header.as_bytes())
+        let name = http::header::HeaderName::from_bytes(header.as_bytes())
             .map_err(|_| invalid(ValidationReason::InvalidQuery))?;
         Ok(Self {
             facet: "resource".into(),

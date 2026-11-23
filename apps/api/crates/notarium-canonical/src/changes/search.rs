@@ -452,8 +452,9 @@ impl CanonicalStore {
                 Ok(live_search_facts(tx, &space, &note, &mut live)
                     .await?
                     .is_some_and(|facts| {
-                        live.all_active(&facts.ancestor_folders)
-                            && live.enclosing_project_in(&facts.ancestor_folders) == project
+                        live.all_active(&space.space.id, &facts.ancestor_folders)
+                            && live.enclosing_project_in(&space.space.id, &facts.ancestor_folders)
+                                == project
                     }))
             })
         })
@@ -628,8 +629,9 @@ impl CanonicalStore {
                             actor: revision.revision_actor,
                             digest,
                             facts,
-                            project: historical.enclosing_project(&ancestry),
-                            active_ancestry: historical.all_active(&ancestry.ancestors),
+                            project: historical.enclosing_project(&space.space.id, &ancestry),
+                            active_ancestry: historical
+                                .all_active(&space.space.id, &ancestry.ancestors),
                         });
                     }
                     Ok((cutoff, keys, pending, next_after))
@@ -828,7 +830,9 @@ async fn load_exact_note(
             false,
         )
         .await?;
-    if !history.all_active(&ancestry.ancestors) || auth.can_view_resource(&facts).is_err() {
+    if !history.all_active(&space.space.id, &ancestry.ancestors)
+        || auth.can_view_resource(&facts).is_err()
+    {
         return Ok(None);
     }
     let path = if ancestry.folder_path.is_empty() {
@@ -836,7 +840,7 @@ async fn load_exact_note(
     } else {
         format!("{}/{}.md", ancestry.folder_path, meta.slug)
     };
-    let project = history.enclosing_project(&ancestry);
+    let project = history.enclosing_project(&space.space.id, &ancestry);
     Ok(Some((
         PendingNote {
             meta,
@@ -879,10 +883,12 @@ async fn load_projected_search_rows(
                 false,
             )
             .await?;
-        if !historical.all_active(&ancestry.ancestors) || auth.can_view_resource(&facts).is_err() {
+        if !historical.all_active(&space.space.id, &ancestry.ancestors)
+            || auth.can_view_resource(&facts).is_err()
+        {
             continue;
         }
-        let project = historical.enclosing_project(&ancestry);
+        let project = historical.enclosing_project(&space.space.id, &ancestry);
         rows.insert(
             (cutoff, note_id),
             PendingNote {
@@ -959,8 +965,8 @@ async fn live_search_batch(
             id,
             (
                 facts,
-                folders.all_active(&ancestry.ancestors),
-                folders.enclosing_project(&ancestry),
+                folders.all_active(&space.space.id, &ancestry.ancestors),
+                folders.enclosing_project(&space.space.id, &ancestry),
             ),
         );
     }
@@ -979,7 +985,7 @@ async fn live_search_facts(
         .and_then(|(facts, lifecycle)| {
             (lifecycle == Lifecycle::Active
                 && facts.class != DocClass::EncryptedNote
-                && live.all_active(&facts.ancestor_folders))
+                && live.all_active(&space.space.id, &facts.ancestor_folders))
             .then_some(facts)
         }))
 }

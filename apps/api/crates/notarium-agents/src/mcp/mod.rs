@@ -426,6 +426,9 @@ impl ToolRegistry {
                 return McpToolResult::proposed(tool, draft, std::mem::take(&mut call.provenance));
             }
             if tool.writes() {
+                if call.auth.taint().is_tainted() {
+                    return Err(DomainError::CrossSpaceTainted.into());
+                }
                 // Reserve the digest before any effect. Canonical receipts own
                 // replay, including concurrent calls that share the same plan.
                 call.journal("invocation", || async { Ok(true) }).await?;

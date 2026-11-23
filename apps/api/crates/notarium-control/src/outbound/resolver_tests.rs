@@ -55,18 +55,13 @@ async fn cancelled_dns_jobs_remain_bounded_and_each_connection_checks_the_entire
     let source = Arc::new(Source::default());
     let release = Release(source.clone());
     let resolver = Arc::new(GuardedResolver::with_lookup(endpoint, source.clone()));
-    assert!(
-        resolver
-            .resolve("other.example".parse().unwrap())
-            .await
-            .is_err()
-    );
+    assert!(resolver.resolve_addrs("other.example").await.is_err());
     assert_eq!(source.calls.load(Ordering::SeqCst), 0);
     let mut jobs = Vec::new();
     for _ in 0..4 {
         let resolver = resolver.clone();
         jobs.push(tokio::spawn(async move {
-            resolver.resolve("public.example".parse().unwrap()).await
+            resolver.resolve_addrs("public.example").await
         }));
     }
     tokio::time::timeout(Duration::from_secs(5), source.entered.acquire_many(4))
@@ -89,16 +84,11 @@ async fn cancelled_dns_jobs_remain_bounded_and_each_connection_checks_the_entire
     ));
     assert!(
         tiny_queue_resolver
-            .resolve("public.example".parse().unwrap())
+            .resolve_addrs("public.example")
             .await
             .is_err()
     );
-    assert!(
-        resolver
-            .resolve("public.example".parse().unwrap())
-            .await
-            .is_err()
-    );
+    assert!(resolver.resolve_addrs("public.example").await.is_err());
     assert_eq!(source.calls.load(Ordering::SeqCst), 4);
     drop(release);
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -108,25 +98,16 @@ async fn cancelled_dns_jobs_remain_bounded_and_each_connection_checks_the_entire
     })
     .await
     .unwrap();
-    let addresses: Vec<_> = resolver
-        .resolve("public.example".parse().unwrap())
-        .await
-        .unwrap()
-        .collect();
+    let addresses = resolver.resolve_addrs("public.example").await.unwrap();
     assert_eq!(
         addresses,
         vec![
             "1.1.1.1:0".parse::<SocketAddr>().unwrap(),
-            "8.8.8.8:0".parse().unwrap()
+            "8.8.8.8:0".parse::<SocketAddr>().unwrap()
         ]
     );
     // The next connection sees a changed DNS answer. A single private address
     // rejects the complete set, including its otherwise valid public candidate.
-    assert!(
-        resolver
-            .resolve("public.example".parse().unwrap())
-            .await
-            .is_err()
-    );
+    assert!(resolver.resolve_addrs("public.example").await.is_err());
     assert_eq!(source.calls.load(Ordering::SeqCst), 6);
 }

@@ -9,14 +9,14 @@ use crate::{
         target::*,
     },
 };
+use http::{
+    Method,
+    header::{ACCEPT, CONTENT_TYPE, HeaderMap},
+};
 use notarium_core::{
     DomainError,
     error::{BudgetKind, CommitEffect, PortError},
     ports::*,
-};
-use reqwest::{
-    Method,
-    header::{ACCEPT, CONTENT_TYPE, HeaderMap},
 };
 use serde::Deserialize;
 use std::{
@@ -262,7 +262,7 @@ impl OAuthService {
         let mut headers = HeaderMap::new();
         headers.insert(
             ACCEPT,
-            reqwest::header::HeaderValue::from_static("application/json"),
+            http::header::HeaderValue::from_static("application/json"),
         );
         let mut response = self
             .outbound
@@ -406,7 +406,7 @@ impl OAuthService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use reqwest::header::CACHE_CONTROL;
+    use http::header::CACHE_CONTROL;
     #[test]
     fn cache_control_caps_age_duplicates_and_invalid_directives() {
         let mut headers = HeaderMap::new();
@@ -424,7 +424,7 @@ mod tests {
             assert_eq!(cache_millis(&headers), expected, "{value}");
         }
         headers.insert(CACHE_CONTROL, "max-age=600".parse().unwrap());
-        headers.insert(reqwest::header::AGE, "550".parse().unwrap());
+        headers.insert(http::header::AGE, "550".parse().unwrap());
         assert_eq!(cache_millis(&headers), 50_000);
     }
 }

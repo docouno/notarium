@@ -63,8 +63,8 @@ pub trait ControlCatalogPort: Send + Sync {
         ctx: AccountContext,
         source: CatalogDisclosure,
     ) -> PortFuture<'_, CanonicalMetadataContent>;
-    /// Load folder disclosure proofs for a batch of folders in one Space in a
-    /// single read transaction, skipping hidden/inaccessible entries.
+    /// Load folder disclosure proofs for a batch of folders across admitted
+    /// Spaces in a single read transaction, skipping hidden/inaccessible entries.
     fn folder_disclosures(
         &self,
         ctx: AccountContext,
@@ -78,6 +78,65 @@ pub trait ControlCatalogPort: Send + Sync {
                     .await
                 {
                     Ok(proof) => out.push(proof),
+                    Err(PortError::Domain(
+                        DomainError::ResourceNotFound | DomainError::AccessDenied,
+                    )) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(out)
+        })
+    }
+    /// Verify a batch of candidate project references across admitted Spaces in
+    /// a single read transaction, returning only active visible projects.
+    fn existing_projects(
+        &self,
+        ctx: AccountContext,
+        projects: Vec<FolderRef>,
+    ) -> PortFuture<'_, Vec<FolderRef>> {
+        Box::pin(async move {
+            let mut spaces = std::collections::BTreeMap::new();
+            let mut out = Vec::with_capacity(projects.len());
+            for reference in projects {
+                if !ctx.auth().spaces().contains_key(&reference.space_id) {
+                    continue;
+                }
+                let space = if let Some(cached) = spaces.get(&reference.space_id) {
+                    let Some(space) = cached else {
+                        continue;
+                    };
+                    space
+                } else {
+                    match self
+                        .space(ctx.budget.clone(), reference.space_id.clone())
+                        .await
+                    {
+                        Ok(space) => {
+                            spaces.insert(reference.space_id.clone(), Some(space));
+                            spaces
+                                .get(&reference.space_id)
+                                .and_then(Option::as_ref)
+                                .expect("cached space")
+                        }
+                        Err(PortError::Domain(
+                            DomainError::ResourceNotFound | DomainError::AccessDenied,
+                        )) => {
+                            spaces.insert(reference.space_id.clone(), None);
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                };
+                if space.space.lifecycle != SpaceLifecycle::Active {
+                    continue;
+                }
+                let scope_ctx = SpaceContext::new(
+                    ctx.auth().clone(),
+                    space.history.clone(),
+                    ctx.budget.clone(),
+                )?;
+                match self.project(scope_ctx, reference.clone()).await {
+                    Ok(_) => out.push(reference),
                     Err(PortError::Domain(
                         DomainError::ResourceNotFound | DomainError::AccessDenied,
                     )) => {}

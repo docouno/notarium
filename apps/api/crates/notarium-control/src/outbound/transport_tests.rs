@@ -860,3 +860,88 @@ async fn wait_uploaded_returns_false_on_connect_preflight_and_mid_upload_failure
     hold_conn.abort();
     released(&stall_client).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn early_http_response_during_upload_closes_socket_before_close_returns() {
+    let _serial = crate::TEST_RESOURCE_LOCK.lock().await;
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.set_recv_buffer_size(8 * 1024).unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let listener = socket.listen(4).unwrap();
+    let origin = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let client = transport(&origin, &[1], Dns::new(&[&["127.0.0.1:0"]]));
+
+    let close_done = Arc::new(Notify::new());
+    let close_done_srv = close_done.clone();
+    let server_task = tokio::spawn(async move {
+        // Connection 1: read request headers ONLY, immediately return 401 with
+        // Content-Length: 0 and NO Connection: close while 6 MiB upload stalls.
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            head.push(stream.read_u8().await.unwrap());
+        }
+        stream
+            .write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+        // Wait until client finishes response.close(), then verify the peer
+        // closed the socket instead of parking a still-writing upload in slot.idle.
+        close_done_srv.notified().await;
+        let mut drained = 0usize;
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            match tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf)).await {
+                Ok(Ok(0)) | Ok(Err(_)) => break,
+                Ok(Ok(n)) => drained += n,
+                Err(_) => panic!("client left upload socket open after response.close()"),
+            }
+        }
+        assert!(
+            drained < 6 * 1024 * 1024,
+            "aborted early-response upload must not stream the full 6 MiB payload (got {drained})"
+        );
+        // Connection 2: follow-up request must arrive on a fresh TCP connection cleanly.
+        let (mut second, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut head2 = Vec::new();
+        while !head2.ends_with(b"\r\n\r\n") {
+            head2.push(second.read_u8().await.unwrap());
+        }
+        let mut body2 = vec![0u8; b"fixture request".len()];
+        second.read_exact(&mut body2).await.unwrap();
+        second
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            .await
+            .unwrap();
+    });
+
+    let mut big_req = request(1, 1, &format!("{origin}/early-401"), "secret");
+    big_req.body = vec![b'x'; 6 * 1024 * 1024];
+    let mut response = client.start(budget(), big_req).unwrap();
+    // Because the server replies immediately without reading the 6 MiB body,
+    // wait_uploaded() must resolve Ok(false) (NOT Ok(true)).
+    assert!(
+        !tokio::time::timeout(Duration::from_secs(5), response.wait_uploaded())
+            .await
+            .unwrap()
+            .unwrap(),
+        "early response before body flush must return wait_uploaded() == Ok(false)"
+    );
+    response.receive_head().await.unwrap();
+    assert_eq!(response.status(), 401);
+    response.close().await.unwrap();
+    close_done.notify_one();
+
+    // A follow-up request on the same Slot must succeed immediately on a fresh socket.
+    let followup = client
+        .send(budget(), request(1, 1, &format!("{origin}/next"), "secret"))
+        .await
+        .unwrap();
+    assert_eq!(followup.status(), 200);
+    assert_eq!(body(followup).await, b"ok");
+    server_task.await.unwrap();
+    released(&client).await;
+}

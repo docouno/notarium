@@ -11,6 +11,10 @@ use crate::{
     outbound::{OutboundRequest, OutboundResponse},
     store::{lease::OperationBudget, target::ProviderCallLogRow},
 };
+use http::{
+    Method,
+    header::{ACCEPT, CONTENT_TYPE, HeaderValue},
+};
 use notarium_core::{
     DomainError,
     auth::{AuthenticatedCredential, PrincipalKind},
@@ -19,10 +23,6 @@ use notarium_core::{
     ids::*,
     model::{FolderRef, Lifecycle},
     ports::{control::*, *},
-};
-use reqwest::{
-    Method,
-    header::{ACCEPT, CONTENT_TYPE, HeaderValue},
 };
 use std::{
     collections::BTreeSet,
@@ -472,6 +472,12 @@ impl ProviderService {
                     CommitEffect::NotCommitted,
                 )
                 .await?;
+            progress.leases.canonical = Some(lease);
+            let lease = progress
+                .leases
+                .canonical
+                .as_ref()
+                .expect("stored canonical lease");
             lease.check()?;
             if lease.project() != job.project()
                 || lease.project_folders() != &project_folders
@@ -480,9 +486,7 @@ impl ProviderService {
             {
                 return Err(invalid(ValidationReason::SourceMismatch));
             }
-            let current = lease.current().to_vec();
-            progress.leases.canonical = Some(lease);
-            current
+            lease.current().to_vec()
         } else {
             Vec::new()
         };

@@ -1,5 +1,4 @@
 use super::CheckedEndpoint;
-use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use std::{
     io,
     net::{SocketAddr, ToSocketAddrs},
@@ -41,8 +40,8 @@ impl Drop for CancelOnDrop {
     }
 }
 
-/// A resolver bound to one checked origin. Pass it to ClientBuilder::dns_resolver
-/// so the connector uses these exact verified addresses without another lookup.
+/// A resolver bound to one checked origin. The outbound connector resolves the
+/// host once per fresh TCP connection and dials only these verified addresses.
 /// System jobs own one of four transport-scoped slots until they actually finish.
 pub(super) struct GuardedResolver {
     endpoint: CheckedEndpoint,
@@ -118,20 +117,6 @@ impl GuardedResolver {
             endpoint.addresses(values).map_err(|_| rejected())
         });
         worker.await.map_err(|_| rejected())?
-    }
-}
-impl Resolve for GuardedResolver {
-    fn resolve(&self, name: Name) -> Resolving {
-        let resolver = Self {
-            endpoint: self.endpoint.clone(),
-            lookup: self.lookup.clone(),
-            dns_admission: self.dns_admission.clone(),
-            dns_queue: self.dns_queue.clone(),
-        };
-        Box::pin(async move {
-            let checked = resolver.resolve_addrs(name.as_str()).await?;
-            Ok(Box::new(checked.into_iter()) as Addrs)
-        })
     }
 }
 

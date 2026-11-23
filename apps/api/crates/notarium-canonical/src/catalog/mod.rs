@@ -9,7 +9,7 @@ const LIST_PROJECTS: &str = "SELECT folder_id, created_seq
 use crate::{
     CanonicalStore, SpaceRecord,
     codec::{internal_not_committed, normalize_slug_key},
-    domain::common::{build_resource_facts_tx, load_folder_ancestry_tx, load_note_head_row_tx},
+    domain::common::{build_resource_facts_tx, load_note_head_row_tx},
     runtime::{load_folder_head_row, load_space_record},
     sql_exec::BackendConn,
 };
@@ -62,12 +62,25 @@ async fn folder_metadata(
     space: &SpaceRecord,
     reference: FolderRef,
 ) -> Result<(CatalogFolder, crate::runtime::FolderHeadRow), PortError> {
+    let mut ancestry = crate::domain::common::FolderAncestryCache::default();
+    folder_metadata_cached(tx, auth, space, reference, &mut ancestry).await
+}
+
+async fn folder_metadata_cached(
+    tx: &mut BackendConn<'_>,
+    auth: &EngineAuthContext,
+    space: &SpaceRecord,
+    reference: FolderRef,
+    ancestry_cache: &mut crate::domain::common::FolderAncestryCache,
+) -> Result<(CatalogFolder, crate::runtime::FolderHeadRow), PortError> {
     if !auth.spaces().contains_key(&reference.space_id) || reference.space_id != space.space.id {
         return Err(DomainError::ResourceNotFound.into());
     }
     let row = load_folder_head_row(tx, &reference.space_id, &reference.folder_id).await?;
-    let ancestry =
-        load_folder_ancestry_tx(tx, &reference.space_id, &reference.folder_id, true).await?;
+    ancestry_cache.insert_preloaded_row(space.space.id.clone(), row.clone());
+    let ancestry = ancestry_cache
+        .load_ancestry_tx(tx, &reference.space_id, &reference.folder_id, true)
+        .await?;
     auth.can_view_folder(&space.space, &reference.folder_id, &ancestry.ancestors)?;
     Ok((
         CatalogFolder {
@@ -215,6 +228,81 @@ impl ControlCatalogPort for CanonicalStore {
         folders: Vec<FolderRef>,
     ) -> PortFuture<'_, Vec<notarium_core::classes::CanonicalMetadataContent>> {
         Box::pin(egress::folder_disclosures(self, ctx, folders))
+    }
+    fn existing_projects(
+        &self,
+        ctx: AccountContext,
+        projects: Vec<FolderRef>,
+    ) -> PortFuture<'_, Vec<FolderRef>> {
+        Box::pin(async move {
+            if projects.is_empty() {
+                return Ok(Vec::new());
+            }
+            let budget = ctx.budget.clone();
+            self.with_read_tx_budget(Some(&budget), move |tx| {
+                Box::pin(async move {
+                    let mut spaces =
+                        std::collections::BTreeMap::<SpaceId, Option<SpaceRecord>>::new();
+                    let mut ancestry = crate::domain::common::FolderAncestryCache::default();
+                    let mut out = Vec::with_capacity(projects.len());
+                    for reference in projects {
+                        if ctx
+                            .auth()
+                            .spaces()
+                            .get(&reference.space_id)
+                            .is_none_or(|grant| grant.read_classes.is_empty())
+                        {
+                            continue;
+                        }
+                        let space = if let Some(cached) = spaces.get(&reference.space_id) {
+                            let Some(record) = cached else {
+                                continue;
+                            };
+                            record
+                        } else {
+                            match load_space_record(tx, &reference.space_id).await {
+                                Ok(record) if record.space.lifecycle == SpaceLifecycle::Active => {
+                                    spaces.insert(reference.space_id.clone(), Some(record));
+                                    spaces
+                                        .get(&reference.space_id)
+                                        .and_then(Option::as_ref)
+                                        .expect("inserted space")
+                                }
+                                Ok(_)
+                                | Err(PortError::Domain(
+                                    DomainError::ResourceNotFound | DomainError::AccessDenied,
+                                )) => {
+                                    spaces.insert(reference.space_id.clone(), None);
+                                    continue;
+                                }
+                                Err(error) => return Err(error),
+                            }
+                        };
+                        match folder_metadata_cached(
+                            tx,
+                            ctx.auth(),
+                            space,
+                            reference.clone(),
+                            &mut ancestry,
+                        )
+                        .await
+                        {
+                            Ok((folder, row)) => {
+                                if project_info(folder, row).is_ok() {
+                                    out.push(reference);
+                                }
+                            }
+                            Err(PortError::Domain(
+                                DomainError::ResourceNotFound | DomainError::AccessDenied,
+                            )) => {}
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    Ok(out)
+                })
+            })
+            .await
+        })
     }
     fn space(&self, budget: CallBudget, id: SpaceId) -> PortFuture<'_, CatalogSpace> {
         Box::pin(async move {

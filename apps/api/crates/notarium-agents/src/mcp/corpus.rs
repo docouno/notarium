@@ -472,6 +472,9 @@ pub(super) async fn folder_metadata_batch(
         .iter()
         .map(|folder| {
             scope.scope().check(&folder.history)?;
+            if folder.reference.space_id != scope.scope().space_id {
+                return Err(invalid(ValidationReason::ScopeMismatch));
+            }
             Ok(folder.reference.clone())
         })
         .collect::<Result<Vec<_>, PortError>>()?;

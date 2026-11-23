@@ -1645,6 +1645,33 @@ async fn exact_causal_graph_and_control_replay_seams(
         )
         .await
         .map(|_| ()),
+        call(
+            fixture,
+            tainted_owner,
+            133,
+            "start_session",
+            json!({"task": "tainted-start"}),
+        )
+        .await
+        .map(|_| ()),
+        fixture
+            .control
+            .record_mcp_dedup(
+                tainted_owner.clone(),
+                McpDedupRecord {
+                    key: McpDedupKey {
+                        actor: tainted_owner.auth().principal().to_string(),
+                        request_key: CommandKey::from_bytes([134; 16]),
+                        request_hash: ContentDigest::from_bytes([134; 32]),
+                        operation: "invocation".into(),
+                    },
+                    safe_result: "true".into(),
+                    effect: AgentEffect::Write,
+                    ttl_ms: 60_000,
+                },
+            )
+            .await
+            .map(|_| ()),
     ];
     for result in tainted_results {
         assert!(
@@ -1653,6 +1680,26 @@ async fn exact_causal_graph_and_control_replay_seams(
                 Err(PortError::Domain(DomainError::CrossSpaceTainted))
             ),
             "tainted caller must fail closed with CrossSpaceTainted: {result:?}"
+        );
+    }
+    // Verify tainted MCP write attempts did NOT commit any mcp_dedup rows.
+    for (tag, op) in [(129u8, "invocation"), (133u8, "start-episode")] {
+        let hit = fixture
+            .control
+            .lookup_mcp_dedup(
+                owner.clone(),
+                McpDedupKey {
+                    actor: format!("direct:{}", owner.auth().principal()),
+                    request_key: CommandKey::from_bytes([tag; 16]),
+                    request_hash: ContentDigest::from_bytes([tag; 32]),
+                    operation: op.into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            hit.is_none(),
+            "tainted MCP call must not persist mcp_dedup row for {op}"
         );
     }
 
@@ -1786,8 +1833,8 @@ async fn exact_causal_graph_and_control_replay_seams(
             fresh_personal.clone(),
             Mutation {
                 identity: CommandIdentity {
-                    scope,
-                    actor,
+                    scope: scope.clone(),
+                    actor: actor.clone(),
                     key: CommandKey::from_bytes([132; 16]),
                     hash: ContentDigest::from_bytes([132; 32]),
                 },
@@ -1809,7 +1856,143 @@ async fn exact_causal_graph_and_control_replay_seams(
     );
     fixture
         .canonical
-        .set_folder_write_lock(fresh_personal, lock_folder, false)
+        .set_folder_write_lock(fresh_personal.clone(), lock_folder, false)
         .await
         .unwrap();
+
+    // Cross-Space FolderAncestryCache isolation: identical FolderId in two Spaces
+    // (inside project p1 in personal, outside project p1 in shared) must never
+    // poison folder_disclosures or acquire_egress under a project_root-scoped caller.
+    let shared_space_id = SpaceId::from_bytes([1; 16]);
+    let shared_rec = fixture
+        .canonical
+        .read_space(&shared_space_id)
+        .await
+        .unwrap();
+    let shared_p1 = FolderId::from_bytes([2; 16]);
+    let colliding_folder = FolderId::from_bytes([135; 16]);
+    fixture
+        .canonical
+        .create_folder(notarium_canonical::CreateFolderSpec {
+            scope: scope.clone(),
+            active_epoch: LeaseEpoch::new(1).unwrap(),
+            folder_id: shared_p1.clone(),
+            parent: None,
+            slug: "personal-p1".into(),
+            display_name: "Personal P1".into(),
+            is_project: true,
+            project_slug: Some("personal-p1".into()),
+            actor: actor.clone(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+    fixture
+        .canonical
+        .create_folder(notarium_canonical::CreateFolderSpec {
+            scope: scope.clone(),
+            active_epoch: LeaseEpoch::new(1).unwrap(),
+            folder_id: colliding_folder.clone(),
+            parent: Some(shared_p1.clone()),
+            slug: "colliding-in-p1".into(),
+            display_name: "Colliding In P1".into(),
+            is_project: false,
+            project_slug: None,
+            actor: actor.clone(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+    fixture
+        .canonical
+        .create_folder(notarium_canonical::CreateFolderSpec {
+            scope: shared_rec.scope.clone(),
+            active_epoch: shared_rec.active_epoch,
+            folder_id: colliding_folder.clone(),
+            parent: None,
+            slug: "colliding-outside-p1".into(),
+            display_name: "Colliding Outside P1".into(),
+            is_project: false,
+            project_slug: None,
+            actor: actor.clone(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+
+    let personal_ref = FolderRef {
+        space_id: scope.space_id.clone(),
+        folder_id: colliding_folder.clone(),
+    };
+    let shared_ref = FolderRef {
+        space_id: shared_space_id.clone(),
+        folder_id: colliding_folder.clone(),
+    };
+    let shared_full_proof = fixture
+        .canonical
+        .disclosure(owner.clone(), CatalogDisclosure::Folder(shared_ref.clone()))
+        .await
+        .unwrap();
+
+    let mut scoped_grants = owner.auth().spaces().clone();
+    scoped_grants
+        .get_mut(&shared_space_id)
+        .expect("shared grant")
+        .project_root = Some(shared_p1);
+    let scoped_auth = owner
+        .auth()
+        .for_agent_run(
+            AgentRunId::from_bytes([135; 16]),
+            scope.space_id.clone(),
+            ChatAudience::Personal,
+            scoped_grants,
+        )
+        .unwrap();
+    let scoped_ctx = AccountContext::new(scoped_auth, budget());
+
+    let proofs = fixture
+        .canonical
+        .folder_disclosures(
+            scoped_ctx.clone(),
+            vec![personal_ref.clone(), shared_ref.clone()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        proofs.len(),
+        1,
+        "out-of-project folder in Space B must not inherit Space A ancestry in folder_disclosures"
+    );
+    assert_eq!(
+        proofs[0].current().origin().space_id(),
+        Some(&scope.space_id)
+    );
+
+    let egress_result = fixture
+        .canonical
+        .acquire_egress(
+            scoped_ctx,
+            ProviderEgressRequest {
+                primary: scope.clone(),
+                project: None,
+                secondary_projects: vec![],
+                project_folders: std::collections::BTreeSet::new(),
+                origins: vec![
+                    proofs[0].current().origin(),
+                    shared_full_proof.current().origin(),
+                ],
+            },
+            Cancellation::default(),
+        )
+        .await
+        .map(|_| ());
+    assert!(
+        matches!(
+            egress_result,
+            Err(PortError::Domain(
+                DomainError::AccessDenied | DomainError::ResourceNotFound
+            ))
+        ),
+        "out-of-project folder in Space B must not inherit Space A ancestry in acquire_egress: {egress_result:?}"
+    );
 }

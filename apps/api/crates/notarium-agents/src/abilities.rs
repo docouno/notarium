@@ -335,6 +335,14 @@ impl<C: ControlCatalogPort + ?Sized> ControlCatalogPort for SystemAbilityCatalog
         self.owned.folder_disclosures(ctx, folders)
     }
 
+    fn existing_projects(
+        &self,
+        ctx: AccountContext,
+        projects: Vec<FolderRef>,
+    ) -> PortFuture<'_, Vec<FolderRef>> {
+        self.owned.existing_projects(ctx, projects)
+    }
+
     fn ensure_space(
         &self,
         budget: CallBudget,
@@ -479,21 +487,32 @@ impl<C: ProviderEgressCatalogPort + ?Sized> ProviderEgressCatalogPort for System
                     }
                 }
             }
-            let inner = self
+            let mut inner = self
                 .owned
                 .acquire_egress(ctx, request, cancellation)
                 .await?;
-            let mut owned = inner.current().iter().cloned();
-            let current = system
-                .into_iter()
-                .map(|item| {
-                    item.or_else(|| owned.next())
-                        .ok_or_else(|| invalid(ValidationReason::InvalidState))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            if owned.next().is_some() {
-                return Err(invalid(ValidationReason::InvalidState));
-            }
+            let current = {
+                let mut owned = inner.current().iter().cloned();
+                let mapped = system
+                    .into_iter()
+                    .map(|item| {
+                        item.or_else(|| owned.next())
+                            .ok_or_else(|| invalid(ValidationReason::InvalidState))
+                    })
+                    .collect::<Result<Vec<_>, _>>();
+                match mapped {
+                    Ok(current) if owned.next().is_none() => Ok(current),
+                    Ok(_) => Err(invalid(ValidationReason::InvalidState)),
+                    Err(error) => Err(error),
+                }
+            };
+            let current = match current {
+                Ok(current) => current,
+                Err(error) => {
+                    let _ = inner.close().await;
+                    return Err(error);
+                }
+            };
             Ok(Box::new(SystemEgressLease { inner, current }) as Box<dyn ProviderEgressLease>)
         })
     }

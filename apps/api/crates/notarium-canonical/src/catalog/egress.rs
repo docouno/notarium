@@ -366,10 +366,17 @@ impl ProviderEgressCatalogPort for CanonicalStore {
                 let mut connection = guard.connection();
                 tokio::select! {
                     biased;
-                    _ = cancellation.cancelled() => return Err(cancelled()),
-                    _ = ctx.budget.cancellation.cancelled() => return Err(cancelled()),
-                    _ = tokio::time::sleep_until(deadline) => return Err(expired()),
-                    rows = snapshot(&mut connection, &ctx, &request, spaces) => rows?,
+                    _ = cancellation.cancelled() => Err(cancelled()),
+                    _ = ctx.budget.cancellation.cancelled() => Err(cancelled()),
+                    _ = tokio::time::sleep_until(deadline) => Err(expired()),
+                    rows = snapshot(&mut connection, &ctx, &request, spaces) => rows,
+                }
+            };
+            let current = match current {
+                Ok(current) => current,
+                Err(error) => {
+                    guard.release_clean().await;
+                    return Err(error);
                 }
             };
             guard.finish_snapshot().await;
@@ -792,6 +799,7 @@ async fn folder_content(
         return Err(DomainError::ResourceNotFound.into());
     }
     let row = load_folder_head_row(tx, &reference.space_id, &reference.folder_id).await?;
+    ancestry_cache.insert_preloaded_row(space.space.id.clone(), row.clone());
     let ancestry = ancestry_cache
         .load_ancestry_tx(tx, &reference.space_id, &reference.folder_id, true)
         .await?;

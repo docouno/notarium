@@ -15,6 +15,7 @@ use crate::{
         target::*,
     },
 };
+use http::header::{HeaderMap, HeaderName, HeaderValue};
 use notarium_core::{
     DomainError,
     auth::{AuthenticatedCredential, EngineAuthContext, PrincipalKind, Space},
@@ -24,7 +25,6 @@ use notarium_core::{
     model::FolderRef,
     ports::*,
 };
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub(super) struct Snapshot {

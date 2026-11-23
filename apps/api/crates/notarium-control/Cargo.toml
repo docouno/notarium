@@ -22,7 +22,6 @@ cap-fs-ext = { workspace = true }
 ipnet = { workspace = true }
 sha2 = { workspace = true }
 aes-gcm = { workspace = true }
-reqwest = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }
 hyper = { workspace = true }

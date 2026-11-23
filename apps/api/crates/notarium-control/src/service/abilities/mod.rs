@@ -114,11 +114,127 @@ fn overlay_state(
     })
 }
 
+fn trail_matches_promotion(
+    row: Option<&AbilityPlacementTrailRow>,
+    source: Option<&AbilityRef>,
+    destination: &AbilityIdentity,
+) -> Result<bool, PortError> {
+    let Some(source) = source else {
+        return Ok(true);
+    };
+    let Some(row) = row else {
+        return Ok(false);
+    };
+    let trail: Trail = serde_json::from_str(&row.manifest_ref)
+        .map_err(|_| invalid(ValidationReason::InvalidState))?;
+    Ok(trail.source == *source
+        && trail.destination.identity() == *destination
+        && trail.destination.revision != source.revision
+        && row.destination_id == destination.id.as_str()
+        && row.destination_placement == placement(&destination.placement)?)
+}
+
+fn apply_overlay(
+    mut value: AbilityDescriptor,
+    promotion_committed: bool,
+    availability: Option<&AbilityAvailabilityRow>,
+    preference: Option<&AbilityPreferencesRow>,
+    project_selected: bool,
+) -> Result<AbilityDescriptor, PortError> {
+    if !promotion_committed {
+        value.enabled = false;
+    }
+    if value.requires_explicit_binding && availability.is_none() {
+        value.enabled = false;
+    }
+    if let Some(row) = availability {
+        value.enabled &= row.enabled == 1;
+        if row.mode == "selected-projects" {
+            value.enabled &= project_selected;
+        } else if row.mode != "all-projects" {
+            return Err(invalid(ValidationReason::InvalidState));
+        }
+    }
+    if let Some(row) = preference {
+        value.enabled &= row.enabled == 1;
+    }
+    Ok(value)
+}
+
+#[derive(sqlx::FromRow)]
+struct MatchedBindingKey {
+    placement: String,
+    ability_id: String,
+}
+
+async fn load_project_bindings_batch(
+    tx: &mut Transaction,
+    selected_keys: &[(String, String)],
+) -> Result<BTreeMap<(String, String), Vec<AbilityProjectBindingsRow>>, PortError> {
+    let mut project_bindings: BTreeMap<(String, String), Vec<AbilityProjectBindingsRow>> =
+        BTreeMap::new();
+    if selected_keys.is_empty() {
+        return Ok(project_bindings);
+    }
+    let unique: Vec<(String, String)> = selected_keys
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let binding_rows = match tx {
+        Transaction::Sqlite(conn) => {
+            let keys_json = serde_json::to_string(&unique)
+                .map_err(|_| invalid(ValidationReason::InvalidState))?;
+            sqlx::query_as::<_, AbilityProjectBindingsRow>(
+                "SELECT placement, ability_id, target_space, project_id FROM ( \
+                   SELECT b.placement, b.ability_id, b.target_space, b.project_id, \
+                          ROW_NUMBER() OVER (PARTITION BY b.placement, b.ability_id ORDER BY b.target_space, b.project_id) AS rn \
+                   FROM (SELECT json_extract(value, '$[0]') AS pl, json_extract(value, '$[1]') AS id FROM json_each($1)) k \
+                   CROSS JOIN ability_project_bindings b \
+                   WHERE b.placement = k.pl AND b.ability_id = k.id \
+                 ) WHERE rn <= 201 ORDER BY placement, ability_id, target_space, project_id",
+            )
+            .bind(keys_json)
+            .fetch_all(&mut **conn)
+            .await
+            .map_err(crate::error::database)?
+        }
+        Transaction::Postgres(conn) => {
+            let (pls, ids): (Vec<String>, Vec<String>) = unique.into_iter().unzip();
+            sqlx::query_as::<_, AbilityProjectBindingsRow>(
+                "SELECT b.placement, b.ability_id, b.target_space, b.project_id \
+                 FROM unnest($1::text[], $2::text[]) AS k(pl, id) \
+                 CROSS JOIN LATERAL ( \
+                   SELECT b.placement, b.ability_id, b.target_space, b.project_id \
+                   FROM v1_control.ability_project_bindings b \
+                   WHERE b.placement = k.pl AND b.ability_id = k.id \
+                   ORDER BY b.target_space, b.project_id \
+                   LIMIT 201 \
+                 ) b \
+                 ORDER BY b.placement, b.ability_id, b.target_space, b.project_id",
+            )
+            .bind(pls)
+            .bind(ids)
+            .fetch_all(&mut **conn)
+            .await
+            .map_err(crate::error::database)?
+        }
+    };
+    for row in binding_rows {
+        project_bindings
+            .entry((row.placement.clone(), row.ability_id.clone()))
+            .or_default()
+            .push(row);
+    }
+    Ok(project_bindings)
+}
+
 struct BatchedAbilityControl {
     availability: BTreeMap<(String, String), AbilityAvailabilityRow>,
     preferences: BTreeMap<(String, String), AbilityPreferencesRow>,
     trails: BTreeMap<(String, String), AbilityPlacementTrailRow>,
-    project_bindings: BTreeMap<(String, String), Vec<AbilityProjectBindingsRow>>,
+    matched_projects: BTreeSet<(String, String)>,
 }
 
 impl BatchedAbilityControl {
@@ -127,134 +243,121 @@ impl BatchedAbilityControl {
         owner: &PrincipalId,
         candidates: &[(String, String)],
         trail_sources: &[(String, String)],
+        project: Option<&FolderRef>,
     ) -> Result<Self, PortError> {
         let mut availability = BTreeMap::new();
         let mut preferences = BTreeMap::new();
         let mut trails = BTreeMap::new();
-        let mut project_bindings: BTreeMap<(String, String), Vec<AbilityProjectBindingsRow>> =
-            BTreeMap::new();
+        let mut matched_projects = BTreeSet::new();
         if !candidates.is_empty() {
-            let avail_rows = match tx {
+            let (avail_rows, pref_rows) = match tx {
                 Transaction::Sqlite(conn) => {
                     let keys_json = serde_json::to_string(candidates)
                         .map_err(|_| invalid(ValidationReason::InvalidState))?;
-                    sqlx::query_as::<_, AbilityAvailabilityRow>(
+                    let avail = sqlx::query_as::<_, AbilityAvailabilityRow>(
                         "SELECT a.placement, a.ability_id, a.mode, a.enabled, a.revision \
-                         FROM ability_availability a \
-                         JOIN (SELECT json_extract(value, '$[0]') AS pl, json_extract(value, '$[1]') AS id FROM json_each($1)) k \
-                           ON a.placement = k.pl AND a.ability_id = k.id",
+                         FROM (SELECT json_extract(value, '$[0]') AS pl, json_extract(value, '$[1]') AS id FROM json_each($1)) k \
+                         CROSS JOIN ability_availability a \
+                         WHERE a.placement = k.pl AND a.ability_id = k.id",
                     )
-                    .bind(keys_json)
+                    .bind(&keys_json)
                     .fetch_all(&mut **conn)
                     .await
-                    .map_err(crate::error::database)?
+                    .map_err(crate::error::database)?;
+                    let prefs = sqlx::query_as::<_, AbilityPreferencesRow>(
+                        "SELECT p.owner_id, p.ability_id, p.placement, p.enabled, p.revision \
+                         FROM (SELECT json_extract(value, '$[0]') AS pl, json_extract(value, '$[1]') AS id FROM json_each($2)) k \
+                         CROSS JOIN ability_preferences p \
+                         WHERE p.owner_id = $1 AND p.ability_id = k.id AND p.placement = k.pl",
+                    )
+                    .bind(owner.as_str())
+                    .bind(&keys_json)
+                    .fetch_all(&mut **conn)
+                    .await
+                    .map_err(crate::error::database)?;
+                    (avail, prefs)
                 }
                 Transaction::Postgres(conn) => {
                     let (pls, ids): (Vec<String>, Vec<String>) = candidates.iter().cloned().unzip();
-                    sqlx::query_as::<_, AbilityAvailabilityRow>(
+                    let avail = sqlx::query_as::<_, AbilityAvailabilityRow>(
                         "SELECT a.placement, a.ability_id, a.mode, a.enabled, a.revision \
-                         FROM v1_control.ability_availability a \
-                         JOIN unnest($1::text[], $2::text[]) AS k(pl, id) \
+                         FROM unnest($1::text[], $2::text[]) AS k(pl, id) \
+                         JOIN v1_control.ability_availability a \
                            ON a.placement = k.pl AND a.ability_id = k.id",
                     )
-                    .bind(pls)
-                    .bind(ids)
+                    .bind(&pls)
+                    .bind(&ids)
                     .fetch_all(&mut **conn)
                     .await
-                    .map_err(crate::error::database)?
+                    .map_err(crate::error::database)?;
+                    let prefs = sqlx::query_as::<_, AbilityPreferencesRow>(
+                        "SELECT p.owner_id, p.ability_id, p.placement, p.enabled, p.revision \
+                         FROM unnest($2::text[], $3::text[]) AS k(pl, id) \
+                         JOIN v1_control.ability_preferences p \
+                           ON p.owner_id = $1 AND p.ability_id = k.id AND p.placement = k.pl",
+                    )
+                    .bind(owner.as_str())
+                    .bind(&pls)
+                    .bind(&ids)
+                    .fetch_all(&mut **conn)
+                    .await
+                    .map_err(crate::error::database)?;
+                    (avail, prefs)
                 }
             };
             let mut selected_keys = Vec::new();
             for row in avail_rows {
                 let key = (row.placement.clone(), row.ability_id.clone());
-                if row.mode == "selected-projects" {
-                    selected_keys.push(key.clone());
+                let is_selected = row.mode == "selected-projects";
+                if availability.insert(key.clone(), row).is_none() && is_selected {
+                    selected_keys.push(key);
                 }
-                availability.insert(key, row);
             }
-            let pref_rows = match tx {
-                Transaction::Sqlite(conn) => {
-                    let keys_json = serde_json::to_string(candidates)
-                        .map_err(|_| invalid(ValidationReason::InvalidState))?;
-                    sqlx::query_as::<_, AbilityPreferencesRow>(
-                        "SELECT p.owner_id, p.ability_id, p.placement, p.enabled, p.revision \
-                         FROM ability_preferences p \
-                         JOIN (SELECT json_extract(value, '$[0]') AS pl, json_extract(value, '$[1]') AS id FROM json_each($2)) k \
-                           ON p.placement = k.pl AND p.ability_id = k.id \
-                         WHERE p.owner_id = $1",
-                    )
-                    .bind(owner.as_str())
-                    .bind(keys_json)
-                    .fetch_all(&mut **conn)
-                    .await
-                    .map_err(crate::error::database)?
-                }
-                Transaction::Postgres(conn) => {
-                    let (pls, ids): (Vec<String>, Vec<String>) = candidates.iter().cloned().unzip();
-                    sqlx::query_as::<_, AbilityPreferencesRow>(
-                        "SELECT p.owner_id, p.ability_id, p.placement, p.enabled, p.revision \
-                         FROM v1_control.ability_preferences p \
-                         JOIN unnest($2::text[], $3::text[]) AS k(pl, id) \
-                           ON p.placement = k.pl AND p.ability_id = k.id \
-                         WHERE p.owner_id = $1",
-                    )
-                    .bind(owner.as_str())
-                    .bind(pls)
-                    .bind(ids)
-                    .fetch_all(&mut **conn)
-                    .await
-                    .map_err(crate::error::database)?
-                }
-            };
             for row in pref_rows {
                 preferences.insert((row.placement.clone(), row.ability_id.clone()), row);
             }
-            if !selected_keys.is_empty() {
-                let binding_rows = match tx {
+            if let Some(project) = project
+                && !selected_keys.is_empty()
+            {
+                let matched_rows = match tx {
                     Transaction::Sqlite(conn) => {
                         let keys_json = serde_json::to_string(&selected_keys)
                             .map_err(|_| invalid(ValidationReason::InvalidState))?;
-                        sqlx::query_as::<_, AbilityProjectBindingsRow>(
-                            "SELECT placement, ability_id, target_space, project_id FROM ( \
-                               SELECT b.placement, b.ability_id, b.target_space, b.project_id, \
-                                      ROW_NUMBER() OVER (PARTITION BY b.placement, b.ability_id ORDER BY b.target_space, b.project_id) AS rn \
-                               FROM ability_project_bindings b \
-                               JOIN (SELECT json_extract(value, '$[0]') AS pl, json_extract(value, '$[1]') AS id FROM json_each($1)) k \
-                                 ON b.placement = k.pl AND b.ability_id = k.id \
-                             ) WHERE rn <= 201 ORDER BY placement, ability_id, target_space, project_id",
+                        sqlx::query_as::<_, MatchedBindingKey>(
+                            "SELECT b.placement, b.ability_id \
+                             FROM (SELECT json_extract(value, '$[0]') AS pl, json_extract(value, '$[1]') AS id FROM json_each($1)) k \
+                             CROSS JOIN ability_project_bindings b \
+                             WHERE b.placement = k.pl AND b.ability_id = k.id \
+                               AND b.target_space = $2 AND b.project_id = $3",
                         )
                         .bind(keys_json)
+                        .bind(project.space_id.as_str())
+                        .bind(project.folder_id.as_str())
                         .fetch_all(&mut **conn)
                         .await
                         .map_err(crate::error::database)?
                     }
                     Transaction::Postgres(conn) => {
                         let (pls, ids): (Vec<String>, Vec<String>) =
-                            selected_keys.iter().cloned().unzip();
-                        sqlx::query_as::<_, AbilityProjectBindingsRow>(
-                            "SELECT b.placement, b.ability_id, b.target_space, b.project_id \
+                            selected_keys.into_iter().unzip();
+                        sqlx::query_as::<_, MatchedBindingKey>(
+                            "SELECT b.placement, b.ability_id \
                              FROM unnest($1::text[], $2::text[]) AS k(pl, id) \
-                             CROSS JOIN LATERAL ( \
-                               SELECT b.placement, b.ability_id, b.target_space, b.project_id \
-                               FROM v1_control.ability_project_bindings b \
-                               WHERE b.placement = k.pl AND b.ability_id = k.id \
-                               ORDER BY b.target_space, b.project_id \
-                               LIMIT 201 \
-                             ) b \
-                             ORDER BY b.placement, b.ability_id, b.target_space, b.project_id",
+                             JOIN v1_control.ability_project_bindings b \
+                               ON b.placement = k.pl AND b.ability_id = k.id \
+                              AND b.target_space = $3 AND b.project_id = $4",
                         )
                         .bind(pls)
                         .bind(ids)
+                        .bind(project.space_id.as_str())
+                        .bind(project.folder_id.as_str())
                         .fetch_all(&mut **conn)
                         .await
                         .map_err(crate::error::database)?
                     }
                 };
-                for row in binding_rows {
-                    project_bindings
-                        .entry((row.placement.clone(), row.ability_id.clone()))
-                        .or_default()
-                        .push(row);
+                for row in matched_rows {
+                    matched_projects.insert((row.placement, row.ability_id));
                 }
             }
         }
@@ -265,9 +368,9 @@ impl BatchedAbilityControl {
                         .map_err(|_| invalid(ValidationReason::InvalidState))?;
                     sqlx::query_as::<_, AbilityPlacementTrailRow>(
                         "SELECT t.source_placement, t.ability_id, t.destination_placement, t.destination_id, t.manifest_ref, t.created_at \
-                         FROM ability_placement_trail t \
-                         JOIN (SELECT json_extract(value, '$[0]') AS pl, json_extract(value, '$[1]') AS id FROM json_each($1)) k \
-                           ON t.source_placement = k.pl AND t.ability_id = k.id",
+                         FROM (SELECT json_extract(value, '$[0]') AS pl, json_extract(value, '$[1]') AS id FROM json_each($1)) k \
+                         CROSS JOIN ability_placement_trail t \
+                         WHERE t.source_placement = k.pl AND t.ability_id = k.id",
                     )
                     .bind(keys_json)
                     .fetch_all(&mut **conn)
@@ -279,8 +382,8 @@ impl BatchedAbilityControl {
                         trail_sources.iter().cloned().unzip();
                     sqlx::query_as::<_, AbilityPlacementTrailRow>(
                         "SELECT t.source_placement, t.ability_id, t.destination_placement, t.destination_id, t.manifest_ref, t.created_at \
-                         FROM v1_control.ability_placement_trail t \
-                         JOIN unnest($1::text[], $2::text[]) AS k(pl, id) \
+                         FROM unnest($1::text[], $2::text[]) AS k(pl, id) \
+                         JOIN v1_control.ability_placement_trail t \
                            ON t.source_placement = k.pl AND t.ability_id = k.id",
                     )
                     .bind(pls)
@@ -298,7 +401,7 @@ impl BatchedAbilityControl {
             availability,
             preferences,
             trails,
-            project_bindings,
+            matched_projects,
         })
     }
 
@@ -307,74 +410,43 @@ impl BatchedAbilityControl {
         source: Option<&AbilityRef>,
         destination: &AbilityIdentity,
     ) -> Result<bool, PortError> {
-        let Some(source) = source else {
-            return Ok(true);
+        let row = match source {
+            Some(source) => {
+                let key = (placement(&source.placement)?, source.id.to_string());
+                self.trails.get(&key)
+            }
+            None => None,
         };
-        let key = (placement(&source.placement)?, source.id.to_string());
-        let Some(row) = self.trails.get(&key) else {
-            return Ok(false);
-        };
-        let trail: Trail = serde_json::from_str(&row.manifest_ref)
-            .map_err(|_| invalid(ValidationReason::InvalidState))?;
-        Ok(trail.source == *source
-            && trail.destination.identity() == *destination
-            && trail.destination.revision != source.revision
-            && row.destination_id == destination.id.as_str()
-            && row.destination_placement == placement(&destination.placement)?)
+        trail_matches_promotion(row, source, destination)
     }
 
-    fn overlay(
-        &self,
-        mut value: AbilityDescriptor,
-        project: Option<&FolderRef>,
-    ) -> Result<AbilityDescriptor, PortError> {
-        if !self
-            .promotion_is_committed(value.promoted_from.as_ref(), &value.reference.identity())?
-        {
-            value.enabled = false;
-        }
+    fn overlay(&self, value: AbilityDescriptor) -> Result<AbilityDescriptor, PortError> {
+        let promotion_committed =
+            self.promotion_is_committed(value.promoted_from.as_ref(), &value.reference.identity())?;
         let key = (
             placement(&value.reference.placement)?,
             value.reference.id.to_string(),
         );
         let availability = self.availability.get(&key);
         let preference = self.preferences.get(&key);
-        if value.requires_explicit_binding && availability.is_none() {
-            value.enabled = false;
-        }
-        if let Some(row) = availability {
-            value.enabled &= row.enabled == 1;
-            if row.mode == "selected-projects" {
-                let selected = if let Some(project) = project {
-                    self.project_bindings.get(&key).is_some_and(|rows| {
-                        rows.iter().any(|b| {
-                            b.target_space == project.space_id.as_str()
-                                && b.project_id == project.folder_id.as_str()
-                        })
-                    })
-                } else {
-                    false
-                };
-                value.enabled &= selected;
-            } else if row.mode != "all-projects" {
-                return Err(invalid(ValidationReason::InvalidState));
-            }
-        }
-        if let Some(row) = preference {
-            value.enabled &= row.enabled == 1;
-        }
-        Ok(value)
+        let project_selected = self.matched_projects.contains(&key);
+        apply_overlay(
+            value,
+            promotion_committed,
+            availability,
+            preference,
+            project_selected,
+        )
     }
 
     fn select_overlaid_winner(
         &self,
-        project: Option<&FolderRef>,
         candidates: Vec<AbilityDescriptor>,
     ) -> Result<Option<AbilityDescriptor>, PortError> {
         let mut winner: Option<AbilityDescriptor> = None;
         let mut ambiguous = false;
         for current in candidates {
-            let candidate = self.overlay(current, project)?;
+            let candidate = self.overlay(current)?;
             if let Some(previous) = &winner {
                 let level = candidate
                     .reference
@@ -418,31 +490,80 @@ impl ControlService {
             _ => Ok(()),
         }
     }
+    async fn prefetch_projects(
+        &self,
+        ctx: &AccountContext,
+        candidates: impl IntoIterator<Item = FolderRef>,
+        checked_projects: &mut BTreeMap<(SpaceId, FolderId), bool>,
+    ) -> Result<(), PortError> {
+        let mut missing = Vec::new();
+        let mut seen = BTreeSet::new();
+        for project in candidates {
+            let key = (project.space_id.clone(), project.folder_id.clone());
+            if !checked_projects.contains_key(&key) && seen.insert(key) {
+                missing.push(project);
+            }
+        }
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let existing: BTreeSet<(SpaceId, FolderId)> = self
+            .catalog
+            .existing_projects(ctx.clone(), missing.clone())
+            .await?
+            .into_iter()
+            .map(|project| (project.space_id, project.folder_id))
+            .collect();
+        for project in missing {
+            let key = (project.space_id, project.folder_id);
+            let exists = existing.contains(&key);
+            checked_projects.insert(key, exists);
+        }
+        Ok(())
+    }
     async fn ability_placement_cached(
         &self,
         ctx: &AccountContext,
         value: &AbilityPlacement,
-        checked_spaces: &mut BTreeSet<SpaceId>,
-        checked_projects: &mut BTreeSet<(SpaceId, FolderId)>,
+        checked_spaces: &mut BTreeMap<SpaceId, bool>,
+        checked_projects: &mut BTreeMap<(SpaceId, FolderId), bool>,
     ) -> Result<(), PortError> {
         match value {
             AbilityPlacement::OwnedPersonal(owner) if owner != ctx.auth().principal() => {
                 Err(DomainError::ResourceNotFound.into())
             }
-            AbilityPlacement::OwnedSpace(space) => {
-                if !checked_spaces.contains(space) {
-                    self.catalog_space(ctx, space).await?;
-                    checked_spaces.insert(space.clone());
-                }
-                Ok(())
-            }
+            AbilityPlacement::OwnedSpace(space) => match checked_spaces.get(space) {
+                Some(true) => Ok(()),
+                Some(false) => Err(DomainError::ResourceNotFound.into()),
+                None => match self.catalog_space(ctx, space).await {
+                    Ok(_) => {
+                        checked_spaces.insert(space.clone(), true);
+                        Ok(())
+                    }
+                    Err(error) if hidden(&error) => {
+                        checked_spaces.insert(space.clone(), false);
+                        Err(error)
+                    }
+                    Err(error) => Err(error),
+                },
+            },
             AbilityPlacement::OwnedProject(project) => {
                 let key = (project.space_id.clone(), project.folder_id.clone());
-                if !checked_projects.contains(&key) {
-                    self.catalog_project(ctx, project).await?;
-                    checked_projects.insert(key);
+                match checked_projects.get(&key) {
+                    Some(true) => Ok(()),
+                    Some(false) => Err(DomainError::ResourceNotFound.into()),
+                    None => match self.catalog_project(ctx, project).await {
+                        Ok(_) => {
+                            checked_projects.insert(key, true);
+                            Ok(())
+                        }
+                        Err(error) if hidden(&error) => {
+                            checked_projects.insert(key, false);
+                            Err(error)
+                        }
+                        Err(error) => Err(error),
+                    },
                 }
-                Ok(())
             }
             _ => Ok(()),
         }
@@ -452,8 +573,8 @@ impl ControlService {
         ctx: &AccountContext,
         identity: AbilityIdentity,
     ) -> Result<AbilityDescriptor, PortError> {
-        let mut spaces = BTreeSet::new();
-        let mut projects = BTreeSet::new();
+        let mut spaces = BTreeMap::new();
+        let mut projects = BTreeMap::new();
         self.raw_ability_uncached(ctx, identity, &mut spaces, &mut projects)
             .await
     }
@@ -461,8 +582,8 @@ impl ControlService {
         &self,
         ctx: &AccountContext,
         identity: AbilityIdentity,
-        checked_spaces: &mut BTreeSet<SpaceId>,
-        checked_projects: &mut BTreeSet<(SpaceId, FolderId)>,
+        checked_spaces: &mut BTreeMap<SpaceId, bool>,
+        checked_projects: &mut BTreeMap<(SpaceId, FolderId), bool>,
     ) -> Result<AbilityDescriptor, PortError> {
         self.ability_placement_cached(ctx, &identity.placement, checked_spaces, checked_projects)
             .await?;
@@ -530,8 +651,8 @@ impl ControlService {
         &self,
         ctx: &AccountContext,
         identity: AbilityIdentity,
-        checked_spaces: &mut BTreeSet<SpaceId>,
-        checked_projects: &mut BTreeSet<(SpaceId, FolderId)>,
+        checked_spaces: &mut BTreeMap<SpaceId, bool>,
+        checked_projects: &mut BTreeMap<(SpaceId, FolderId), bool>,
         cache: &mut BTreeMap<(String, AbilityId), Option<AbilityDescriptor>>,
     ) -> Result<Option<AbilityDescriptor>, PortError> {
         let key = (placement(&identity.placement)?, identity.id.clone());
@@ -553,43 +674,39 @@ impl ControlService {
         &self,
         tx: &mut Transaction,
         ctx: &AccountContext,
-        mut value: AbilityDescriptor,
+        value: AbilityDescriptor,
         project: Option<&FolderRef>,
     ) -> Result<AbilityDescriptor, PortError> {
-        if !self
+        let promotion_committed = self
             .promotion_is_committed(
                 tx,
                 value.promoted_from.as_ref(),
                 &value.reference.identity(),
             )
-            .await?
-        {
-            value.enabled = false;
-        }
+            .await?;
         let key = placement(&value.reference.placement)?;
         let id = &value.reference.id;
         let (availability, preference) =
             ability_control_state(tx, ctx.auth().principal(), &key, id).await?;
-        if value.requires_explicit_binding && availability.is_none() {
-            value.enabled = false;
-        }
-        if let Some(row) = availability {
-            value.enabled &= row.enabled == 1;
-            if row.mode == "selected-projects" {
-                let selected = if let Some(project) = project {
-                    rows!(tx,AbilityProjectBindingsRow,fetch_optional,"SELECT * FROM ability_project_bindings WHERE placement=$1 AND ability_id=$2 AND target_space=$3 AND project_id=$4","SELECT * FROM v1_control.ability_project_bindings WHERE placement=$1 AND ability_id=$2 AND target_space=$3 AND project_id=$4";&key,id.as_str(),project.space_id.as_str(),project.folder_id.as_str())?.is_some()
-                } else {
-                    false
-                };
-                value.enabled &= selected;
-            } else if row.mode != "all-projects" {
-                return Err(invalid(ValidationReason::InvalidState));
+        let project_selected = if availability
+            .as_ref()
+            .is_some_and(|row| row.mode == "selected-projects")
+        {
+            if let Some(project) = project {
+                rows!(tx,AbilityProjectBindingsRow,fetch_optional,"SELECT * FROM ability_project_bindings WHERE placement=$1 AND ability_id=$2 AND target_space=$3 AND project_id=$4","SELECT * FROM v1_control.ability_project_bindings WHERE placement=$1 AND ability_id=$2 AND target_space=$3 AND project_id=$4";&key,id.as_str(),project.space_id.as_str(),project.folder_id.as_str())?.is_some()
+            } else {
+                false
             }
-        }
-        if let Some(row) = preference {
-            value.enabled &= row.enabled == 1;
-        }
-        Ok(value)
+        } else {
+            false
+        };
+        apply_overlay(
+            value,
+            promotion_committed,
+            availability.as_ref(),
+            preference.as_ref(),
+            project_selected,
+        )
     }
 
     pub(super) async fn promotion_is_committed(
@@ -605,16 +722,7 @@ impl ControlService {
         let row = rows!(tx,AbilityPlacementTrailRow,fetch_optional,
             "SELECT * FROM ability_placement_trail WHERE source_placement=$1 AND ability_id=$2",
             "SELECT * FROM v1_control.ability_placement_trail WHERE source_placement=$1 AND ability_id=$2";&key,source.id.as_str())?;
-        let Some(row) = row else {
-            return Ok(false);
-        };
-        let trail: Trail = serde_json::from_str(&row.manifest_ref)
-            .map_err(|_| invalid(ValidationReason::InvalidState))?;
-        Ok(trail.source == *source
-            && trail.destination.identity() == *destination
-            && trail.destination.revision != source.revision
-            && row.destination_id == destination.id.as_str()
-            && row.destination_placement == placement(&destination.placement)?)
+        trail_matches_promotion(row.as_ref(), Some(source), destination)
     }
 
     pub(super) async fn ability_admitted_for_provider(
@@ -882,14 +990,16 @@ impl ControlService {
                 let candidates = budget
                     .run(
                         async {
-                            let mut checked_spaces = BTreeSet::new();
-                            let mut checked_projects = BTreeSet::new();
+                            let mut checked_spaces = BTreeMap::new();
+                            let mut checked_projects = BTreeMap::new();
                             let mut raw_cache = BTreeMap::new();
                             if let Some(project) = &project {
                                 self.catalog_project(&current, project).await?;
-                                checked_projects
-                                    .insert((project.space_id.clone(), project.folder_id.clone()));
-                                checked_spaces.insert(project.space_id.clone());
+                                checked_projects.insert(
+                                    (project.space_id.clone(), project.folder_id.clone()),
+                                    true,
+                                );
+                                checked_spaces.insert(project.space_id.clone(), true);
                             }
                             let page = self
                                 .catalog
@@ -968,9 +1078,10 @@ impl ControlService {
                                 current.auth().principal(),
                                 &candidate_keys,
                                 &trail_keys,
+                                project.as_ref(),
                             )
                             .await?;
-                            batched.select_overlaid_winner(project.as_ref(), candidates)
+                            batched.select_overlaid_winner(candidates)
                         },
                         CommitEffect::NotCommitted,
                     )
@@ -1047,18 +1158,29 @@ impl ControlService {
                             AbilityProjects::All
                         });
                     };
-                    let mut projects = Vec::new();
-                    for row in selected {
-                        let project = FolderRef {
-                            space_id: SpaceId::parse(&row.target_space)?,
-                            folder_id: FolderId::parse(&row.project_id)?,
-                        };
-                        match self.catalog_project(&current, &project).await {
-                            Ok(_) => projects.push(project),
-                            Err(error) if hidden(&error) => (),
-                            Err(error) => return Err(error),
-                        }
-                    }
+                    let parsed: Vec<FolderRef> = selected
+                        .into_iter()
+                        .map(|row| {
+                            Ok(FolderRef {
+                                space_id: SpaceId::parse(&row.target_space)?,
+                                folder_id: FolderId::parse(&row.project_id)?,
+                            })
+                        })
+                        .collect::<Result<Vec<_>, PortError>>()?;
+                    let existing: BTreeSet<(SpaceId, FolderId)> = self
+                        .catalog
+                        .existing_projects(current.clone(), parsed.clone())
+                        .await?
+                        .into_iter()
+                        .map(|project| (project.space_id, project.folder_id))
+                        .collect();
+                    let projects = parsed
+                        .into_iter()
+                        .filter(|project| {
+                            existing
+                                .contains(&(project.space_id.clone(), project.folder_id.clone()))
+                        })
+                        .collect();
                     Ok(AbilityProjects::Selected(projects))
                 },
                 CommitEffect::NotCommitted,
@@ -1100,8 +1222,8 @@ impl ControlService {
         &self,
         ctx: &AccountContext,
         candidate: AbilityDescriptor,
-        checked_spaces: &mut BTreeSet<SpaceId>,
-        checked_projects: &mut BTreeSet<(SpaceId, FolderId)>,
+        checked_spaces: &mut BTreeMap<SpaceId, bool>,
+        checked_projects: &mut BTreeMap<(SpaceId, FolderId), bool>,
     ) -> Result<Option<AbilityDescriptor>, PortError> {
         if valid_name(&candidate.name).is_err()
             || candidate.auxiliary_files.len() > MAX_ABILITY_AUX_FILES
@@ -1182,13 +1304,13 @@ impl ControlService {
         let (page_candidates, by_name_candidates, continuation, mut checked_projects) = budget
             .run(
                 async {
-                    let mut checked_spaces = BTreeSet::new();
-                    let mut checked_projects = BTreeSet::new();
+                    let mut checked_spaces = BTreeMap::new();
+                    let mut checked_projects = BTreeMap::new();
                     if let Some(project) = &query.project {
                         self.catalog_project(&current, project).await?;
                         checked_projects
-                            .insert((project.space_id.clone(), project.folder_id.clone()));
-                        checked_spaces.insert(project.space_id.clone());
+                            .insert((project.space_id.clone(), project.folder_id.clone()), true);
+                        checked_spaces.insert(project.space_id.clone(), true);
                     }
                     let inner = query
                         .page
@@ -1226,6 +1348,17 @@ impl ControlService {
                     {
                         return Err(invalid(ValidationReason::InvalidState));
                     }
+                    self.prefetch_projects(
+                        &current,
+                        raw.items.iter().filter_map(|candidate| {
+                            match &candidate.reference.placement {
+                                AbilityPlacement::OwnedProject(project) => Some(project.clone()),
+                                _ => None,
+                            }
+                        }),
+                        &mut checked_projects,
+                    )
+                    .await?;
                     let complete_unfiltered_page =
                         inner.is_none() && raw.continuation.is_none() && query.kind.is_none();
                     let mut page_candidates = Vec::with_capacity(raw.items.len());
@@ -1289,6 +1422,19 @@ impl ControlService {
                                     .await?;
                                 if all.items.len() <= 200 && all.continuation.is_none() {
                                     bulk_complete = true;
+                                    self.prefetch_projects(
+                                        &current,
+                                        all.items.iter().filter_map(|candidate| {
+                                            match &candidate.reference.placement {
+                                                AbilityPlacement::OwnedProject(project) => {
+                                                    Some(project.clone())
+                                                }
+                                                _ => None,
+                                            }
+                                        }),
+                                        &mut checked_projects,
+                                    )
+                                    .await?;
                                     for candidate in all.items {
                                         if !page_names.contains(&candidate.name) {
                                             continue;
@@ -1338,6 +1484,20 @@ impl ControlService {
                                     if page.items.len() > 200 || page.continuation.is_some() {
                                         return Err(invalid(ValidationReason::BudgetExceeded));
                                     }
+                                    self.prefetch_projects(
+                                        &current,
+                                        page.items.iter().filter_map(|candidate| match &candidate
+                                            .reference
+                                            .placement
+                                        {
+                                            AbilityPlacement::OwnedProject(project) => {
+                                                Some(project.clone())
+                                            }
+                                            _ => None,
+                                        }),
+                                        &mut checked_projects,
+                                    )
+                                    .await?;
                                     let mut group = Vec::new();
                                     for candidate in page.items {
                                         if candidate.name != item.name {
@@ -1420,6 +1580,7 @@ impl ControlService {
                         current.auth().principal(),
                         &candidate_keys,
                         &trail_keys,
+                        query.project.as_ref(),
                     )
                     .await?;
                     let mut selected_descriptors = Vec::new();
@@ -1431,15 +1592,13 @@ impl ControlService {
                             )? {
                                 continue;
                             }
-                            selected_descriptors
-                                .push(batched.overlay(value, query.project.as_ref())?);
+                            selected_descriptors.push(batched.overlay(value)?);
                         }
                     } else {
                         let mut winners: BTreeMap<String, Option<AbilityDescriptor>> =
                             BTreeMap::new();
                         for (name, candidates) in by_name_candidates {
-                            let winner = batched
-                                .select_overlaid_winner(query.project.as_ref(), candidates)?;
+                            let winner = batched.select_overlaid_winner(candidates)?;
                             winners.insert(name, winner.filter(|w| w.enabled && w.healthy));
                         }
                         for candidate in page_candidates {
@@ -1452,6 +1611,23 @@ impl ControlService {
                             }
                         }
                     }
+                    let mut selected_binding_keys = Vec::new();
+                    for descriptor in &selected_descriptors {
+                        let key = (
+                            placement(&descriptor.reference.placement)?,
+                            descriptor.reference.id.to_string(),
+                        );
+                        if batched
+                            .availability
+                            .get(&key)
+                            .is_some_and(|row| row.mode == "selected-projects")
+                        {
+                            selected_binding_keys.push(key);
+                        }
+                    }
+                    let project_bindings =
+                        load_project_bindings_batch(rtx.inner_mut(), &selected_binding_keys)
+                            .await?;
                     let mut out = Vec::with_capacity(selected_descriptors.len());
                     for mut descriptor in selected_descriptors {
                         let key = (
@@ -1463,11 +1639,7 @@ impl ControlService {
                         let selected = match binding.map(|row| row.mode.as_str()) {
                             None | Some("all-projects") => None,
                             Some("selected-projects") => {
-                                let rows = batched
-                                    .project_bindings
-                                    .get(&key)
-                                    .cloned()
-                                    .unwrap_or_default();
+                                let rows = project_bindings.get(&key).cloned().unwrap_or_default();
                                 if rows.len() > 200 {
                                     return Err(invalid(ValidationReason::BudgetExceeded));
                                 }
@@ -1493,33 +1665,39 @@ impl ControlService {
         let items = budget
             .run(
                 async {
-                    let mut hidden_projects = BTreeSet::new();
-                    let mut items = Vec::with_capacity(rows_with_state.len());
+                    let mut to_prefetch = Vec::new();
+                    let mut parsed_rows = Vec::with_capacity(rows_with_state.len());
                     for (descriptor, binding_pending, selected, state) in rows_with_state {
+                        let selected = selected
+                            .map(|rows| {
+                                rows.into_iter()
+                                    .map(|row| {
+                                        let project = FolderRef {
+                                            space_id: SpaceId::parse(&row.target_space)?,
+                                            folder_id: FolderId::parse(&row.project_id)?,
+                                        };
+                                        to_prefetch.push(project.clone());
+                                        Ok(project)
+                                    })
+                                    .collect::<Result<Vec<_>, PortError>>()
+                            })
+                            .transpose()?;
+                        parsed_rows.push((descriptor, binding_pending, selected, state));
+                    }
+                    self.prefetch_projects(&current, to_prefetch, &mut checked_projects)
+                        .await?;
+                    let mut items = Vec::with_capacity(parsed_rows.len());
+                    for (descriptor, binding_pending, selected, state) in parsed_rows {
                         let availability = if let Some(selected) = selected {
-                            let mut projects = Vec::new();
-                            for row in selected {
-                                let project = FolderRef {
-                                    space_id: SpaceId::parse(&row.target_space)?,
-                                    folder_id: FolderId::parse(&row.project_id)?,
-                                };
-                                let proj_key =
-                                    (project.space_id.clone(), project.folder_id.clone());
-                                if checked_projects.contains(&proj_key) {
-                                    projects.push(project);
-                                } else if !hidden_projects.contains(&proj_key) {
-                                    match self.catalog_project(&current, &project).await {
-                                        Ok(_) => {
-                                            checked_projects.insert(proj_key);
-                                            projects.push(project);
-                                        }
-                                        Err(error) if hidden(&error) => {
-                                            hidden_projects.insert(proj_key);
-                                        }
-                                        Err(error) => return Err(error),
-                                    }
-                                }
-                            }
+                            let projects = selected
+                                .into_iter()
+                                .filter(|project| {
+                                    checked_projects
+                                        .get(&(project.space_id.clone(), project.folder_id.clone()))
+                                        .copied()
+                                        .unwrap_or(false)
+                                })
+                                .collect();
                             AbilityProjects::Selected(projects)
                         } else if binding_pending {
                             AbilityProjects::Selected(Vec::new())

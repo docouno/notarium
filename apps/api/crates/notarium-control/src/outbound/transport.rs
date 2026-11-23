@@ -89,7 +89,27 @@ fn header_bytes(headers: &HeaderMap) -> Result<usize, PortError> {
     Ok(total)
 }
 
+fn transfer_encoding_ends_with_chunked(headers: &HeaderMap) -> bool {
+    let mut last_token: Option<String> = None;
+    for value in headers.get_all(header::TRANSFER_ENCODING) {
+        let Ok(text) = value.to_str() else {
+            return false;
+        };
+        for token in text.split(',') {
+            let token = token.trim();
+            if !token.is_empty() {
+                last_token = Some(token.to_ascii_lowercase());
+            }
+        }
+    }
+    last_token.as_deref() == Some("chunked")
+}
+
 fn response_allows_keep_alive<B>(response: &http::Response<B>) -> bool {
+    let status = response.status().as_u16();
+    if status == 101 || (100..200).contains(&status) {
+        return false;
+    }
     let mut saw_close = false;
     let mut saw_keep_alive = false;
     for value in response.headers().get_all(header::CONNECTION) {
@@ -107,11 +127,20 @@ fn response_allows_keep_alive<B>(response: &http::Response<B>) -> bool {
     if saw_close {
         return false;
     }
-    match response.version() {
+    let version_allows = match response.version() {
         Version::HTTP_11 => true,
         Version::HTTP_10 => saw_keep_alive,
         _ => false,
+    };
+    if !version_allows {
+        return false;
     }
+    // RFC 9112 §6.3: close-delimited responses (without explicit Content-Length
+    // or Transfer-Encoding ending in chunked) terminate the connection at EOF
+    // and must never be returned to the keep-alive pool.
+    matches!(status, 204 | 304)
+        || response.headers().contains_key(header::CONTENT_LENGTH)
+        || transfer_encoding_ends_with_chunked(response.headers())
 }
 
 /// Deliberately not Debug: URLs, headers and bodies may contain confidential
@@ -180,6 +209,7 @@ impl OutboundRequest {
 struct UploadTracker {
     body_done: bool,
     wrote_bytes: bool,
+    flushed: bool,
     uploaded: Option<oneshot::Sender<()>>,
 }
 
@@ -305,9 +335,11 @@ impl<S> TrackedIo<S> {
             && let Some(tracker) = guard.as_mut()
             && tracker.body_done
             && tracker.wrote_bytes
-            && let Some(tx) = tracker.uploaded.take()
         {
-            let _ = tx.send(());
+            tracker.flushed = true;
+            if let Some(tx) = tracker.uploaded.take() {
+                let _ = tx.send(());
+            }
         }
     }
 }
@@ -370,13 +402,15 @@ struct PooledConn {
     last_used: Instant,
 }
 impl PooledConn {
-    fn clear_tracker(&self) {
+    fn finish_tracker(&self) -> bool {
         if let Ok(mut guard) = self.tracker.lock() {
-            *guard = None;
+            guard.take().is_some_and(|tracker| tracker.flushed)
+        } else {
+            false
         }
     }
     async fn close(mut self) {
-        self.clear_tracker();
+        let _ = self.finish_tracker();
         self.conn_cancel.cancel();
         if let Some(done) = self.conn_done.take() {
             let _ = done.await;
@@ -385,7 +419,7 @@ impl PooledConn {
 }
 impl Drop for PooledConn {
     fn drop(&mut self) {
-        self.clear_tracker();
+        let _ = self.finish_tracker();
         self.conn_cancel.cancel();
     }
 }
@@ -418,15 +452,19 @@ impl Slot {
         }
         None
     }
-    fn push_idle(&self, conn: PooledConn) {
+    fn push_idle(&self, conn: PooledConn) -> Option<PooledConn> {
+        let Ok(mut idle) = self.idle.lock() else {
+            return Some(conn);
+        };
         if self.cancelled.is_cancelled() || conn.sender.is_closed() {
-            return;
+            return Some(conn);
         }
-        if let Ok(mut idle) = self.idle.lock() {
-            idle.retain(|c| c.last_used.elapsed() < POOL_IDLE_TIMEOUT && !c.sender.is_closed());
-            if idle.len() < MAX_IDLE_PER_SLOT {
-                idle.push(conn);
-            }
+        idle.retain(|c| c.last_used.elapsed() < POOL_IDLE_TIMEOUT && !c.sender.is_closed());
+        if idle.len() < MAX_IDLE_PER_SLOT {
+            idle.push(conn);
+            None
+        } else {
+            Some(conn)
         }
     }
 }
@@ -448,6 +486,7 @@ struct Shared {
     dns_admission: Arc<Semaphore>,
     dns_queue: Arc<Semaphore>,
     lookup: Option<Arc<dyn Lookup>>,
+    roots: OnceCell<Arc<rustls::RootCertStore>>,
     #[cfg(test)]
     fixture: Option<(String, Vec<u8>)>,
 }
@@ -502,6 +541,7 @@ impl OutboundTransport {
                 dns_admission: Arc::new(Semaphore::new(DEFAULT_DNS_PERMITS)),
                 dns_queue: Arc::new(Semaphore::new(DEFAULT_DNS_QUEUE)),
                 lookup,
+                roots: OnceCell::new(),
                 #[cfg(test)]
                 fixture: None,
             }),
@@ -680,6 +720,7 @@ impl OutboundTransport {
             dropped,
             _permit: permit,
         };
+        let shared = self.shared.clone();
         let lookup = self.shared.lookup.clone();
         let dns_admission = self.shared.dns_admission.clone();
         let dns_queue = self.shared.dns_queue.clone();
@@ -691,25 +732,32 @@ impl OutboundTransport {
             let mut active_conn: Option<PooledConn> = None;
             let mut keep_alive = false;
             let result = async {
-                // Certificate loading may touch the filesystem. The owner keeps
-                // its active slot through actual blocking construction even if
-                // the caller has already timed out or dropped the future.
+                // Certificate loading may touch the filesystem once per
+                // transport. Keep the active slot through blocking load even if
+                // the caller has already timed out or dropped the future, while
+                // keeping a separate ClientConfig per Slot for TLS session isolation.
                 let tls_config = context
                     .slot
                     .tls
                     .get_or_try_init(|| async {
                         if context.slot.endpoint.url().scheme() != "https" {
-                            return Ok(None);
+                            return Ok::<Option<Arc<rustls::ClientConfig>>, PortError>(None);
                         }
-                        tokio::task::spawn_blocking(move || {
-                            build_tls_config(
-                                #[cfg(test)]
-                                fixture_ca,
-                            )
-                        })
-                        .await
-                        .map_err(|_| connect_failed())?
-                        .map(Some)
+                        let roots = shared
+                            .roots
+                            .get_or_try_init(|| async {
+                                tokio::task::spawn_blocking(move || {
+                                    load_root_certs(
+                                        #[cfg(test)]
+                                        fixture_ca,
+                                    )
+                                })
+                                .await
+                                .map_err(|_| connect_failed())?
+                            })
+                            .await?
+                            .clone();
+                        Ok(Some(build_tls_config(roots)))
                     })
                     .await?
                     .clone();
@@ -771,6 +819,7 @@ impl OutboundTransport {
                     *guard = Some(UploadTracker {
                         body_done: body_empty,
                         wrote_bytes: false,
+                        flushed: false,
                         uploaded: uploaded_tx.take(),
                     });
                 }
@@ -866,14 +915,17 @@ impl OutboundTransport {
             .await;
             drop(uploaded_tx);
             if let Some(mut conn) = active_conn.take() {
-                conn.clear_tracker();
+                let upload_flushed = conn.finish_tracker();
                 if result.is_ok()
+                    && upload_flushed
                     && keep_alive
                     && !context.slot.cancelled.is_cancelled()
                     && !conn.sender.is_closed()
                 {
                     conn.last_used = Instant::now();
-                    context.slot.push_idle(conn);
+                    if let Some(rejected) = context.slot.push_idle(conn) {
+                        rejected.close().await;
+                    }
                 } else {
                     conn.close().await;
                 }
@@ -924,9 +976,9 @@ fn host_header(endpoint: &CheckedEndpoint) -> Result<HeaderValue, PortError> {
     HeaderValue::from_str(&value).map_err(|_| connect_failed())
 }
 
-fn build_tls_config(
+fn load_root_certs(
     #[cfg(test)] fixture_ca: Option<Vec<u8>>,
-) -> Result<Arc<rustls::ClientConfig>, PortError> {
+) -> Result<Arc<rustls::RootCertStore>, PortError> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let mut roots = rustls::RootCertStore::empty();
     #[cfg(test)]
@@ -945,12 +997,17 @@ fn build_tls_config(
         let _ = roots.add_parsable_certificates(native.certs);
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     }
+    Ok(Arc::new(roots))
+}
+
+fn build_tls_config(roots: Arc<rustls::RootCertStore>) -> Arc<rustls::ClientConfig> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let mut config = rustls::ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
     config.key_log = Arc::new(rustls::NoKeyLog {});
-    Ok(Arc::new(config))
+    Arc::new(config)
 }
 
 async fn connect_fresh(

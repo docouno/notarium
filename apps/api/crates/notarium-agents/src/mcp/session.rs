@@ -326,6 +326,9 @@ async fn start(call: &mut ToolCallContext<'_>, args: StartArgs) -> Result<Value,
         args.task.as_deref(),
         requested.clone(),
     )?;
+    if call.auth.taint().is_tainted() {
+        return Err(DomainError::CrossSpaceTainted.into());
+    }
     let plan: StartPlan = call
         .journal("start-episode", || async {
             let project = match args.project.as_deref() {

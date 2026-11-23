@@ -317,6 +317,9 @@ impl ControlService {
         record: McpDedupRecord,
     ) -> Result<McpDedupHit, PortError> {
         validate_dedup_key(&record.key)?;
+        if ctx.auth().taint().is_tainted() {
+            return Err(DomainError::CrossSpaceTainted.into());
+        }
         if record.safe_result.len() > 65536
             || record.safe_result.contains('\0')
             || record.ttl_ms == 0
@@ -341,6 +344,9 @@ impl ControlService {
                     let auth = self
                         .revalidate_with_keeper(tx.inner_mut(), ctx.auth(), keeper.as_ref())
                         .await?;
+                    if auth.taint().is_tainted() {
+                        return Err(DomainError::CrossSpaceTainted.into());
+                    }
                     let owner = auth.principal().as_str();
                     if owner.len() + record.key.actor.len() + record.key.request_key.as_str().len()
                         > 2048

@@ -5826,22 +5826,25 @@ async fn execute_pg_fast_rollback_inner(
         {
             let parent_folder_id = parent_raw.and_then(|s| FolderId::parse(&s).ok());
             let cover_note_id = cover_raw.and_then(|s| NoteId::parse(&s).ok());
-            folder_cache.insert_preloaded_row(FolderHeadRow {
-                folder_id: root_folder_id.clone(),
-                parent_folder_id,
-                is_root: (flags & 64) != 0,
-                slug: r1.get::<Option<String>, usize>(9).unwrap_or_default(),
-                slug_fold: r1.get::<Option<String>, usize>(10).unwrap_or_default(),
-                display_name: r1.get::<Option<String>, usize>(11).unwrap_or_default(),
-                is_project: (flags & 128) != 0,
-                project_slug: r1.get::<Option<String>, usize>(12),
-                project_slug_fold: r1.get::<Option<String>, usize>(13),
-                description: r1.get::<Option<String>, usize>(14),
-                cover_note_id,
-                write_locked: write_lock_json.is_some(),
-                lifecycle,
-                head_rev_id,
-            });
+            folder_cache.insert_preloaded_row(
+                scope_cl.space_id.clone(),
+                FolderHeadRow {
+                    folder_id: root_folder_id.clone(),
+                    parent_folder_id,
+                    is_root: (flags & 64) != 0,
+                    slug: r1.get::<Option<String>, usize>(9).unwrap_or_default(),
+                    slug_fold: r1.get::<Option<String>, usize>(10).unwrap_or_default(),
+                    display_name: r1.get::<Option<String>, usize>(11).unwrap_or_default(),
+                    is_project: (flags & 128) != 0,
+                    project_slug: r1.get::<Option<String>, usize>(12),
+                    project_slug_fold: r1.get::<Option<String>, usize>(13),
+                    description: r1.get::<Option<String>, usize>(14),
+                    cover_note_id,
+                    write_locked: write_lock_json.is_some(),
+                    lifecycle,
+                    head_rev_id,
+                },
+            );
         }
     }
 

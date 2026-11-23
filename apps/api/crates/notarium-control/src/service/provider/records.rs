@@ -85,7 +85,7 @@ pub(super) fn owned(owner: &str, actual: &str) -> Result<(), PortError> {
     Ok(())
 }
 pub(super) fn header(value: &str) -> Result<String, PortError> {
-    let name = reqwest::header::HeaderName::from_bytes(value.as_bytes())
+    let name = http::header::HeaderName::from_bytes(value.as_bytes())
         .map_err(|_| invalid(ValidationReason::InvalidQuery))?;
     let name = name.as_str();
     if name.len() > 128
@@ -123,9 +123,7 @@ pub(super) fn injection(value: &mut CredentialInjection) -> Result<(), PortError
     Ok(())
 }
 pub(super) fn secret(value: &str) -> Result<(), PortError> {
-    if value.is_empty()
-        || value.len() > 8192
-        || reqwest::header::HeaderValue::from_str(value).is_err()
+    if value.is_empty() || value.len() > 8192 || http::header::HeaderValue::from_str(value).is_err()
     {
         return Err(invalid(ValidationReason::InvalidQuery));
     }

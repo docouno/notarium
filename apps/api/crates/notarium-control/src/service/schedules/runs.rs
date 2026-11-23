@@ -68,8 +68,11 @@ impl ControlService {
                         .await?
                     {
                         None => Ok(Some(ClaimedApproval::RoleChanged)),
-                        Some(pin) => {
-                            history.check(pin.history())?;
+                        Some(mut pin) => {
+                            if let Err(error) = history.check(pin.history()) {
+                                let _ = pin.close().await;
+                                return Err(error.into());
+                            }
                             Ok(Some(ClaimedApproval::Ready(pin)))
                         }
                     }

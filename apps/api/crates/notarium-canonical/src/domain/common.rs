@@ -1670,9 +1670,9 @@ impl FolderAncestryFacts {
 /// resolve 256-deep folder chains in `O(unique folders)` instead of `O(items * depth)` SQL queries.
 #[derive(Default)]
 pub(crate) struct FolderAncestryCache {
-    rows: HashMap<FolderId, AncestryRow>,
+    rows: HashMap<(SpaceId, FolderId), AncestryRow>,
     snapshot: Option<(HistoryScope, SpaceSeq)>,
-    resolved: HashMap<(FolderId, bool), FolderAncestryFacts>,
+    resolved: HashMap<(SpaceId, FolderId, bool), FolderAncestryFacts>,
 }
 
 #[derive(Clone)]
@@ -1710,8 +1710,23 @@ impl FolderAncestryCache {
         }
     }
 
-    pub(crate) fn insert_preloaded_row(&mut self, row: crate::runtime::FolderHeadRow) {
-        self.rows.insert(row.folder_id.clone(), row.into());
+    pub(crate) fn insert_preloaded_row(
+        &mut self,
+        space_id: SpaceId,
+        row: crate::runtime::FolderHeadRow,
+    ) {
+        self.rows
+            .insert((space_id, row.folder_id.clone()), row.into());
+    }
+
+    pub(crate) fn is_project_cached(
+        &self,
+        space_id: &SpaceId,
+        folder_id: &FolderId,
+    ) -> Option<bool> {
+        self.rows
+            .get(&(space_id.clone(), folder_id.clone()))
+            .map(|row| row.is_project)
     }
 
     async fn load_row(
@@ -1723,6 +1738,9 @@ impl FolderAncestryCache {
         let Some((scope, cutoff)) = &self.snapshot else {
             return Ok(load_folder_head_row(tx, space, folder).await?.into());
         };
+        if &scope.space_id != space {
+            return Err(DomainError::validation(ValidationReason::ScopeMismatch).into());
+        }
         let rev = crate::runtime::read_immutable_revision_tx(
             tx,
             scope,
@@ -1757,7 +1775,15 @@ impl FolderAncestryCache {
         folder_id: &FolderId,
         require_all_active: bool,
     ) -> Result<FolderAncestryFacts, PortError> {
-        if let Some(cached) = self.resolved.get(&(folder_id.clone(), require_all_active)) {
+        if let Some((scope, _)) = &self.snapshot
+            && &scope.space_id != space_id
+        {
+            return Err(DomainError::validation(ValidationReason::ScopeMismatch).into());
+        }
+        if let Some(cached) =
+            self.resolved
+                .get(&(space_id.clone(), folder_id.clone(), require_all_active))
+        {
             return Ok(cached.clone());
         }
 
@@ -1772,7 +1798,10 @@ impl FolderAncestryCache {
                     "folder tree exceeded MAX_FOLDER_DEPTH",
                 ));
             }
-            if let Some(cached) = self.resolved.get(&(current.clone(), require_all_active)) {
+            if let Some(cached) =
+                self.resolved
+                    .get(&(space_id.clone(), current.clone(), require_all_active))
+            {
                 break cached.clone();
             }
             if !visited.insert(current.clone()) {
@@ -1782,11 +1811,12 @@ impl FolderAncestryCache {
                 ));
             }
 
-            let row = if let Some(existing) = self.rows.get(&current) {
+            let row = if let Some(existing) = self.rows.get(&(space_id.clone(), current.clone())) {
                 existing.clone()
             } else {
                 let fetched = self.load_row(tx, space_id, &current).await?;
-                self.rows.insert(current.clone(), fetched.clone());
+                self.rows
+                    .insert((space_id.clone(), current.clone()), fetched.clone());
                 fetched
             };
 
@@ -1804,7 +1834,7 @@ impl FolderAncestryCache {
                     cover_note: row.cover_note,
                 };
                 self.resolved.insert(
-                    (row.folder_id.clone(), require_all_active),
+                    (space_id.clone(), row.folder_id.clone(), require_all_active),
                     root_facts.clone(),
                 );
                 break root_facts;
@@ -1854,8 +1884,10 @@ impl FolderAncestryCache {
                 },
                 cover_note: child_row.cover_note,
             };
-            self.resolved
-                .insert((child_row.folder_id, require_all_active), acc.clone());
+            self.resolved.insert(
+                (space_id.clone(), child_row.folder_id, require_all_active),
+                acc.clone(),
+            );
         }
 
         Ok(acc)
@@ -1916,22 +1948,30 @@ impl FolderAncestryCache {
     }
 
     /// Check the lineage already loaded while resolving the resource facts.
-    pub(crate) fn all_active(&self, ancestors: &[FolderId]) -> bool {
+    pub(crate) fn all_active(&self, space_id: &SpaceId, ancestors: &[FolderId]) -> bool {
         ancestors.iter().all(|id| {
             self.rows
-                .get(id)
+                .get(&(space_id.clone(), id.clone()))
                 .is_some_and(|row| row.lifecycle == Lifecycle::Active)
         })
     }
 
-    pub(crate) fn enclosing_project(&self, ancestry: &FolderAncestryFacts) -> Option<FolderId> {
-        self.enclosing_project_in(&ancestry.ancestors)
+    pub(crate) fn enclosing_project(
+        &self,
+        space_id: &SpaceId,
+        ancestry: &FolderAncestryFacts,
+    ) -> Option<FolderId> {
+        self.enclosing_project_in(space_id, &ancestry.ancestors)
     }
 
-    pub(crate) fn enclosing_project_in(&self, ancestors: &[FolderId]) -> Option<FolderId> {
+    pub(crate) fn enclosing_project_in(
+        &self,
+        space_id: &SpaceId,
+        ancestors: &[FolderId],
+    ) -> Option<FolderId> {
         ancestors.iter().find_map(|id| {
             self.rows
-                .get(id)
+                .get(&(space_id.clone(), id.clone()))
                 .filter(|row| row.is_project && row.lifecycle == Lifecycle::Active)
                 .map(|_| id.clone())
         })
