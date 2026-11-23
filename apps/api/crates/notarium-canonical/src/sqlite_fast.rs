@@ -2277,6 +2277,10 @@ fn try_run_optimistic_fast_sql_stage(
     ))
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "uses the same writer context and transaction fences as the optimistic stage"
+)]
 fn run_savepoint_fallback_sql_stage(
     conn: &rusqlite::Connection,
     items: &[(FastIntentMeta, Box<dyn SqliteSyncItemPlan>)],

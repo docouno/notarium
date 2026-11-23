@@ -28,7 +28,7 @@ pub(super) async fn get(
     call: &mut ToolCallContext<'_>,
     args: Value,
 ) -> Result<NoteOutput, PortError> {
-    tokio::time::timeout_at(call.deadline.into(), read(call, args))
+    tokio::time::timeout_at(call.deadline, read(call, args))
         .await
         .map_err(|_| {
             PortError::DeadlineExceeded(
