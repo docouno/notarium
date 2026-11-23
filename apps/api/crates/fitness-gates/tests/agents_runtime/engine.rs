@@ -200,6 +200,10 @@ impl ProjectionFixtures {
         MutationPause::install(&self.before_chat_rollback)
     }
 
+    pub fn pause_chat_read(&self) -> (oneshot::Receiver<Cancellation>, oneshot::Sender<()>) {
+        MutationPause::install(&self.before_chat_read)
+    }
+
     pub fn fail_chat_submit_unknown_then_not_committed(&self) {
         *self.submit_unknown_then_not_committed.lock().unwrap() = 2;
     }

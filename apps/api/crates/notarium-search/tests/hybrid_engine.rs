@@ -101,6 +101,16 @@ async fn acknowledged(
     scope: &HistoryScope,
     seq: SpaceSeq,
 ) -> SearchManifest {
+    acknowledged_when(store, root, scope, seq, |_| true).await
+}
+
+async fn acknowledged_when(
+    store: &CanonicalStore,
+    root: &DataRoot,
+    scope: &HistoryScope,
+    seq: SpaceSeq,
+    ready: impl Fn(&SearchManifest) -> bool,
+) -> SearchManifest {
     let layout = SearchLayout::open(root, scope.clone()).unwrap();
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
@@ -109,6 +119,7 @@ async fn acknowledged(
                 .is_some_and(|seen| seen >= seq)
                 && let Ok(Some(manifest)) = layout.search_manifest()
                 && manifest.tantivy_seq >= seq
+                && ready(&manifest)
             {
                 return manifest;
             }
@@ -140,6 +151,28 @@ fn files(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     let mut result = BTreeMap::new();
     walk(root, root, &mut result);
     result
+}
+
+fn assert_files_unchanged(before: &BTreeMap<PathBuf, Vec<u8>>, root: &Path) {
+    let after = files(root);
+    assert_eq!(
+        before.keys().collect::<Vec<_>>(),
+        after.keys().collect::<Vec<_>>(),
+        "file set changed under {}",
+        root.display()
+    );
+    for (name, old) in before {
+        let new = &after[name];
+        assert!(
+            old == new,
+            "{} changed from {} bytes ({}) to {} bytes ({})",
+            root.join(name).display(),
+            old.len(),
+            blake3::hash(old),
+            new.len(),
+            blake3::hash(new)
+        );
+    }
 }
 
 fn assert_absent(path: &Path, marker: &str) {
@@ -298,7 +331,13 @@ async fn run_scenario(store: Arc<CanonicalStore>, root: DataRoot, tag: u8) {
     let vector_mode = VectorMode::DeterministicTest { dimension: 64 };
     let engine = SearchEngine::start(SearchConfig::new(root.clone(), vector_mode.clone()), deps);
     engine.start_space(scope.clone()).unwrap();
-    let before_lag = acknowledged(&store, &root, scope, seeded.last_seq).await;
+    // The lexical cut can be published while the background worker still appends vectors.
+    let vectors_ready = |manifest: &SearchManifest| {
+        manifest.vector_seq == Some(manifest.tantivy_seq)
+            && !manifest.embeddings_pending
+            && manifest.vector_replay_after.is_none()
+    };
+    let before_lag = acknowledged_when(&store, &root, scope, seeded.last_seq, vectors_ready).await;
     let attempts = carriers
         .seed_deadline_attempts
         .lock()
@@ -338,7 +377,9 @@ async fn run_scenario(store: Arc<CanonicalStore>, root: DataRoot, tag: u8) {
         .expect("the search subscriber observed a broadcast overrun");
     let after_lag = acknowledged(&store, &root, scope, high).await;
     assert_eq!(after_lag.tantivy_commit, before_lag.tantivy_commit);
-    assert_eq!(old_vectors, files(&vectors));
+    assert_eq!(before_lag.vector_seq, after_lag.vector_seq);
+    assert!(!after_lag.embeddings_pending);
+    assert_files_unchanged(&old_vectors, &vectors);
 
     let initial = engine.search(ctx.clone(), query("needle")).await.unwrap();
     assert_eq!(initial.hits[0].card.title, "Install guide");
@@ -541,7 +582,7 @@ async fn run_scenario(store: Arc<CanonicalStore>, root: DataRoot, tag: u8) {
         snapshot.advance(range.last_seq);
     }
     pages.release();
-    let before_move = acknowledged(&store, &root, scope, range.last_seq).await;
+    let before_move = acknowledged_when(&store, &root, scope, range.last_seq, vectors_ready).await;
     let tantivy = root.search(&scope.space_id, SearchIndexKind::Tantivy);
     let old_vectors = files(&vectors);
     let viewer = context_with_grant(
@@ -587,7 +628,9 @@ async fn run_scenario(store: Arc<CanonicalStore>, root: DataRoot, tag: u8) {
         .advance(moved.receipt.seq());
     let after_move = acknowledged(&store, &root, scope, moved.receipt.seq()).await;
     assert_eq!(before_move.tantivy_commit, after_move.tantivy_commit);
-    assert_eq!(old_vectors, files(&vectors));
+    assert_eq!(before_move.vector_seq, after_move.vector_seq);
+    assert!(!after_move.embeddings_pending);
+    assert_files_unchanged(&old_vectors, &vectors);
     let mut scoped = query("laterrevisiontoken");
     scoped.folder = Some(archive.clone());
     let contained = engine.search(ctx.clone(), scoped).await.unwrap();
@@ -1545,7 +1588,7 @@ async fn chat_candidate_visibility(store: Arc<CanonicalStore>, root: DataRoot) {
     }
     let after = acknowledged(&store, &root, &space.scope, moved.receipt.seq()).await;
     assert_eq!(before.tantivy_commit, after.tantivy_commit);
-    assert_eq!(old_files, files(&index));
+    assert_files_unchanged(&old_files, &index);
     let moved = engine
         .search(owner_ctx, moved_request.clone())
         .await

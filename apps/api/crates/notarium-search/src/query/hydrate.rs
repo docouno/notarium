@@ -83,7 +83,13 @@ impl NoteAdmission<'_> {
             limit.clamp(32, 256)
         };
         loop {
-            let batch: Vec<_> = unmasked.by_ref().take(batch_size).collect();
+            // A cached rejection cannot contribute to this query. Positive
+            // decisions still pass the live visibility check below.
+            let batch: Vec<_> = unmasked
+                .by_ref()
+                .filter(|item| self.checked.get(note(item)) != Some(&false))
+                .take(batch_size)
+                .collect();
             if batch.is_empty() {
                 return Ok(selected);
             }
