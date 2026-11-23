@@ -8,9 +8,10 @@ use notarium_core::{
     classes::{ClassifiedMetadata, DocClass},
     error::{PortError, ValidationReason},
     ids::{EpisodeId, NoteId},
+    model::FolderRef,
     ports::{
-        AgentRetrieval, PageLimit, PortFuture, RecallQuery, RecallRecipient, RetrievalKind,
-        SearchDegradation, SearchHit, SearchQuery, SpaceContext,
+        AgentRetrieval, PageLimit, PortFuture, RecallQuery, RetrievalKind, SearchDegradation,
+        SearchHit, SearchQuery, SearchRecipient, SpaceContext,
     },
 };
 use serde::Deserialize;
@@ -43,16 +44,23 @@ enum Format {
 struct Recipient<'a, 'registry> {
     call: &'a ToolCallContext<'registry>,
     scope: &'a SpaceContext,
+    classes: &'a BTreeSet<DocClass>,
+    project: Option<&'a FolderRef>,
+    policies: corpus::CandidatePolicies,
 }
 
-impl RecallRecipient for Recipient<'_, '_> {
+impl SearchRecipient for Recipient<'_, '_> {
+    fn filters_notes(&self) -> bool {
+        !matches!(self.call.target, EgressTarget::ExternalMcp)
+    }
+
     fn admit<'a>(&'a self, card: &'a ClassifiedMetadata) -> PortFuture<'a, bool> {
         Box::pin(async move {
-            if matches!(self.call.target, EgressTarget::ExternalMcp) {
-                return Ok(true);
+            if !matches_target(card, self.classes, self.project) {
+                return Ok(false);
             }
-            match corpus::admit_metadata(self.call, self.scope, card).await {
-                Ok(_) => Ok(true),
+            match corpus::admit_search_card(self.call, self.scope, card, &self.policies).await {
+                Ok(()) => Ok(true),
                 Err(error) if corpus::hidden(&error) => Ok(false),
                 Err(error) => Err(error),
             }
@@ -62,6 +70,16 @@ impl RecallRecipient for Recipient<'_, '_> {
     fn framing_tokens(&self, note: &NoteId, first_chunk: bool) -> u32 {
         framing_tokens(note, first_chunk)
     }
+}
+
+fn matches_target(
+    card: &ClassifiedMetadata,
+    classes: &BTreeSet<DocClass>,
+    project: Option<&FolderRef>,
+) -> bool {
+    classes.contains(&card.class())
+        && classes.contains(&card.current_class())
+        && project.is_none_or(|project| card.in_project(project))
 }
 
 fn framing_tokens(note: &NoteId, first_chunk: bool) -> u32 {
@@ -117,6 +135,13 @@ pub(super) async fn retrieve(
                 .as_ref()
                 .map(|project| project.folder_id.clone()),
         };
+        let recipient = Recipient {
+            call,
+            scope: &scope,
+            classes: &classes,
+            project: target.project.as_ref(),
+            policies: Default::default(),
+        };
         let result = if recall {
             call.registry
                 .engine
@@ -131,14 +156,15 @@ pub(super) async fn retrieve(
                                 .map_err(|_| invalid(ValidationReason::InvalidLimit))?,
                         ),
                     },
-                    Some(&Recipient {
-                        call,
-                        scope: &scope,
-                    }),
+                    Some(&recipient),
                 )
                 .await?
         } else {
-            call.registry.engine.search(scope, query).await?
+            let recipient = (!external).then_some(&recipient as &dyn SearchRecipient);
+            call.registry
+                .engine
+                .search_for(scope.clone(), query, recipient)
+                .await?
         };
         target.scope.check(&result.cut.scope)?;
         if result.hits.len() > usize::from(top_k.get()) {
@@ -153,12 +179,7 @@ pub(super) async fn retrieve(
             if metadata.reference().space_id != target.scope.space_id || !hit.score.is_finite() {
                 return Err(invalid(ValidationReason::SourceMismatch));
             }
-            if !classes.contains(&metadata.class())
-                || target
-                    .project
-                    .as_ref()
-                    .is_some_and(|project| !metadata.in_project(project))
-            {
+            if !matches_target(metadata, &classes, target.project.as_ref()) {
                 continue;
             }
             candidates.push(Candidate { index, hit });

@@ -286,15 +286,32 @@ pub trait LinkReadPort: Send + Sync {
         limit: PageLimit,
     ) -> PortFuture<'_, ChatBacklinkPage>;
 }
-/// Recipient-specific admission of ranked cards before loading and budgeting their chunks.
+/// Admit ranked note metadata before counting a result or loading its chunks.
 /// The final consumer still validates the exact source when disclosing its content.
-pub trait RecallRecipient: Send + Sync {
+pub trait SearchRecipient: Send + Sync {
+    /// A recipient that supplies only recall framing can skip metadata preflight.
+    fn filters_notes(&self) -> bool {
+        true
+    }
     fn admit<'a>(&'a self, card: &'a crate::classes::ClassifiedMetadata) -> PortFuture<'a, bool>;
-    fn framing_tokens(&self, note: &NoteId, first_chunk: bool) -> u32;
+    /// Additional context tokens charged by recall for a delivered chunk.
+    fn framing_tokens(&self, _note: &NoteId, _first_chunk: bool) -> u32 {
+        0
+    }
 }
 
+pub use SearchRecipient as RecallRecipient;
+
 pub trait SearchPort: Send + Sync {
-    fn search(&self, ctx: SpaceContext, request: SearchQuery) -> PortFuture<'_, SearchResult>;
+    fn search(&self, ctx: SpaceContext, request: SearchQuery) -> PortFuture<'_, SearchResult> {
+        self.search_for(ctx, request, None)
+    }
+    fn search_for<'a>(
+        &'a self,
+        ctx: SpaceContext,
+        request: SearchQuery,
+        recipient: Option<&'a dyn SearchRecipient>,
+    ) -> PortFuture<'a, SearchResult>;
     fn recall(&self, ctx: SpaceContext, request: RecallQuery) -> PortFuture<'_, SearchResult> {
         self.recall_for(ctx, request, None)
     }
@@ -302,7 +319,7 @@ pub trait SearchPort: Send + Sync {
         &'a self,
         ctx: SpaceContext,
         request: RecallQuery,
-        recipient: Option<&'a dyn RecallRecipient>,
+        recipient: Option<&'a dyn SearchRecipient>,
     ) -> PortFuture<'a, SearchResult>;
 }
 pub trait ContentJobPort: Send + Sync {

@@ -19,7 +19,7 @@ use crate::{
 use notarium_core::{
     DomainError,
     auth::{EngineAuthContext, ResourceFacts, SpaceLifecycle},
-    classes::{ClassEgressFence, ClassifiedDocument, DocClass},
+    classes::{ClassEgressFence, ClassifiedDocument, ClassifiedMetadata, DocClass, SearchMetadata},
     error::{PortError, ValidationReason},
     ids::{ContentDigest, FolderId, NoteId, PrincipalId, RevisionId, SpaceSeq},
     model::{HistoryScope, Lifecycle, NoteRef},
@@ -199,6 +199,55 @@ impl CanonicalStore {
             .collect()
     }
 
+    /// Recipient preflight needs the projected and current facts, without opening CAS for previews.
+    pub async fn read_search_candidate_metadata(
+        &self,
+        ctx: &SpaceContext,
+        cutoff: SpaceSeq,
+        notes: Vec<NoteId>,
+    ) -> Result<BTreeMap<NoteId, SearchMetadata>, PortError> {
+        if notes.len() > 200 {
+            return Err(DomainError::validation(ValidationReason::InvalidLimit).into());
+        }
+        let scope = ctx.scope().clone();
+        let auth = ctx.auth().clone();
+        self.with_read_tx_budget(Some(&ctx.budget), |tx| {
+            Box::pin(async move {
+                let space = active_space(tx, &scope).await?;
+                validate_snapshot_cutoff_tx(tx, &scope, Some(cutoff)).await?;
+                let mut live = live_search_batch(tx, &space, &notes).await?;
+                live.retain(|_, (facts, active, _)| {
+                    *active && auth.can_view_resource(facts).is_ok()
+                });
+                let ids: Vec<_> = live.keys().cloned().collect();
+                let mut projected = BTreeMap::new();
+                load_projected_search_rows(tx, &space, cutoff, &ids, &auth, &mut projected).await?;
+                let mut metadata = BTreeMap::new();
+                for ((_, id), row) in projected {
+                    let Some((current, _, _)) = live.remove(&id) else {
+                        continue;
+                    };
+                    let mut card = ClassifiedMetadata::from_canonical(
+                        NoteRef {
+                            space_id: scope.space_id.clone(),
+                            note_id: id.clone(),
+                        },
+                        row.revision,
+                        row.facts,
+                        Lifecycle::Active,
+                        row.digest,
+                    )?;
+                    card.bind_current(current, Lifecycle::Active)?;
+                    if let Ok(card) = ClassEgressFence::search_metadata(card, &auth) {
+                        metadata.insert(id, card);
+                    }
+                }
+                Ok(metadata)
+            })
+        })
+        .await
+    }
+
     pub async fn read_authorized_documents_for_search(
         &self,
         ctx: SpaceContext,
@@ -279,51 +328,15 @@ impl CanonicalStore {
                         validate_snapshot_cutoff_tx(tx, &scope_for_tx, Some(cutoff)).await?;
                         note_ids.sort();
                         note_ids.dedup();
-                        let revisions =
-                            notes_at_batch(tx, &scope_for_tx, cutoff, &note_ids).await?;
-                        let mut historical = FolderAncestryCache::at_cut(&scope_for_tx, cutoff);
-                        for (note_id, revision) in revisions {
-                            let meta = revision.metadata;
-                            if meta.lifecycle != Lifecycle::Active
-                                || meta.doc_class == DocClass::EncryptedNote
-                            {
-                                continue;
-                            }
-                            let digest = meta.content_digest.ok_or_else(|| {
-                                internal_not_committed(
-                                    "search_note_revision",
-                                    "active note is missing its carrier",
-                                )
-                            })?;
-                            let (facts, ancestry) = historical
-                                .build_resource_facts_tx(
-                                    tx,
-                                    &space.space,
-                                    &meta.parent_folder_id,
-                                    meta.doc_class,
-                                    meta.ability_id.clone(),
-                                    false,
-                                )
-                                .await?;
-                            if !historical.all_active(&ancestry.ancestors)
-                                || auth_for_tx.can_view_resource(&facts).is_err()
-                            {
-                                continue;
-                            }
-                            let project = historical.enclosing_project(&ancestry);
-                            projected_rows.insert(
-                                (cutoff, note_id),
-                                PendingNote {
-                                    meta,
-                                    revision: revision.revision_id,
-                                    actor: revision.revision_actor,
-                                    digest,
-                                    facts,
-                                    project,
-                                    active_ancestry: true,
-                                },
-                            );
-                        }
+                        load_projected_search_rows(
+                            tx,
+                            &space,
+                            cutoff,
+                            &note_ids,
+                            &auth_for_tx,
+                            &mut projected_rows,
+                        )
+                        .await?;
                     }
 
                     let mut slots = Vec::with_capacity(targets.len());
@@ -836,6 +849,54 @@ async fn load_exact_note(
         },
         path,
     )))
+}
+
+async fn load_projected_search_rows(
+    tx: &mut BackendConn<'_>,
+    space: &SpaceRecord,
+    cutoff: SpaceSeq,
+    notes: &[NoteId],
+    auth: &EngineAuthContext,
+    rows: &mut BTreeMap<(SpaceSeq, NoteId), PendingNote>,
+) -> Result<(), PortError> {
+    let revisions = notes_at_batch(tx, &space.scope, cutoff, notes).await?;
+    let mut historical = FolderAncestryCache::at_cut(&space.scope, cutoff);
+    for (note_id, revision) in revisions {
+        let meta = revision.metadata;
+        if meta.lifecycle != Lifecycle::Active || meta.doc_class == DocClass::EncryptedNote {
+            continue;
+        }
+        let digest = meta.content_digest.ok_or_else(|| {
+            internal_not_committed("search_note_revision", "active note is missing its carrier")
+        })?;
+        let (facts, ancestry) = historical
+            .build_resource_facts_tx(
+                tx,
+                &space.space,
+                &meta.parent_folder_id,
+                meta.doc_class,
+                meta.ability_id.clone(),
+                false,
+            )
+            .await?;
+        if !historical.all_active(&ancestry.ancestors) || auth.can_view_resource(&facts).is_err() {
+            continue;
+        }
+        let project = historical.enclosing_project(&ancestry);
+        rows.insert(
+            (cutoff, note_id),
+            PendingNote {
+                meta,
+                revision: revision.revision_id,
+                actor: revision.revision_actor,
+                digest,
+                facts,
+                project,
+                active_ancestry: true,
+            },
+        );
+    }
+    Ok(())
 }
 
 async fn active_space(

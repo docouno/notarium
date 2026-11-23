@@ -82,6 +82,7 @@ pub struct PendingCredential {
     auth: EngineAuthContext,
     options: ChatRunOptions,
     cancellation: Cancellation,
+    pub(crate) handoff: Arc<tokio::sync::Mutex<()>>,
     registration: RegistrationId,
     command_key: CommandKey,
     command_hash: ContentDigest,
@@ -406,6 +407,7 @@ impl RevocationHub {
                 command_hash: identity.hash,
                 registration,
                 cancellation: Cancellation::default(),
+                handoff: Arc::default(),
             },
         );
         Ok(PendingRegistration {
@@ -439,24 +441,34 @@ impl RevocationHub {
         })
     }
 
-    /// Claim the admitted sender's one post-append handoff after re-reading the
-    /// branch. A stale receipt cannot settle another use of the same input ID.
-    pub(crate) fn take_pending_submission(
+    /// Recheck the registration after acquiring its handoff lock. Concurrent
+    /// receipt readers and revocation can settle it while the caller waits.
+    pub(crate) fn submission_live(
         &self,
         key: &PendingCredentialKey,
         selected: &PendingCredential,
-    ) -> Option<PendingCredential> {
-        let mut state = self.inner.lock();
-        let entry = state.pending.get(key)?;
-        if entry.registration != selected.registration
-            || state.fenced(&entry.selectors)
-            || state.closed
+    ) -> Result<bool, PortError> {
+        let state = self.inner.lock();
+        if !state
+            .pending
+            .get(key)
+            .is_some_and(|entry| entry.registration == selected.registration)
         {
-            return None;
+            return Ok(false);
         }
-        let removed = state.pending.remove(key)?;
-        removed.cancellation.cancel();
-        Some(removed)
+        state.ensure_open()?;
+        if state.fenced(&selected.selectors) {
+            return Err(revocation_unavailable());
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn finish_submission(
+        &self,
+        key: &PendingCredentialKey,
+        selected: &PendingCredential,
+    ) {
+        self.remove_pending_when(key, |entry| entry.registration == selected.registration);
     }
 
     pub(crate) fn finish_registered_pending(&self, registration: PendingRegistration) {

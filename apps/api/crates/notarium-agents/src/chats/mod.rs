@@ -218,6 +218,8 @@ struct ActiveRun {
 enum LaunchOutcome {
     Started(AgentRunId),
     Draining(PortError),
+    /// A conflicting or already settled claim ends this automatic handoff.
+    Settled(PortError),
 }
 
 enum ClaimSettlement {
@@ -302,7 +304,7 @@ impl AgentRunSupervisor {
                 .await?
             {
                 LaunchOutcome::Started(run) => Ok(run),
-                LaunchOutcome::Draining(error) => Err(error),
+                LaunchOutcome::Draining(error) | LaunchOutcome::Settled(error) => Err(error),
             }
         })
         .await
@@ -736,7 +738,7 @@ impl AgentRunSupervisor {
         if let Some(existing) = self.active(&request.scope, &request.thread)
             && Some(&existing.id) != predecessor
         {
-            return Err(owner_unavailable());
+            return Ok(LaunchOutcome::Settled(owner_unavailable()));
         }
         let run = new_run()?;
         let mut requested = account.auth().spaces().clone();
@@ -803,8 +805,8 @@ impl AgentRunSupervisor {
         if let Some(previous) = leaf.thread.active_run.as_ref()
             && predecessor.is_none()
         {
-            if !owner.can_recover(previous) {
-                return Err(owner_unavailable());
+            if thread.active_run.as_ref() != Some(previous) || !owner.can_recover(previous) {
+                return Ok(LaunchOutcome::Settled(owner_unavailable()));
             }
             let engine = self.inner.registry.engine();
             let human = self.detached_input_writer(&account, &request.scope).await?;
@@ -908,9 +910,13 @@ impl AgentRunSupervisor {
                 }
             }
             Err(error) if queue::unknown_commit(&error) => error,
-            rejected => {
+            Ok(ClaimChatRunOutcome::Busy(_) | ClaimChatRunOutcome::Changed) => {
                 self.restore_predecessor(key, previous);
-                return Err(rejected.err().unwrap_or_else(owner_unavailable));
+                return Ok(LaunchOutcome::Settled(owner_unavailable()));
+            }
+            Err(error) => {
+                self.restore_predecessor(key, previous);
+                return Err(error);
             }
         };
 
@@ -922,11 +928,11 @@ impl AgentRunSupervisor {
             }
             ClaimSettlement::Changed => {
                 self.restore_predecessor(key, previous);
-                Err(error)
+                Ok(LaunchOutcome::Settled(error))
             }
             ClaimSettlement::Retired => {
                 self.remove_run(&state);
-                Err(error)
+                Ok(LaunchOutcome::Settled(error))
             }
         }
     }

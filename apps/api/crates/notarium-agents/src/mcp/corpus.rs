@@ -6,7 +6,7 @@ use notarium_core::{
         ProviderOrigin, SearchPart, authorize_field_key,
     },
     error::{PortError, ValidationReason},
-    ids::{NoteId, SpaceId},
+    ids::{FolderId, NoteId, SpaceId},
     model::{FolderRef, Lifecycle, NoteRef},
     ports::{
         CatalogDisclosure, CatalogNote, FolderSnapshot, NoteSnapshot, ProviderErrorCode,
@@ -14,7 +14,7 @@ use notarium_core::{
     },
 };
 use serde_json::Value;
-use std::ops::Range;
+use std::{collections::BTreeMap, ops::Range, sync::Mutex};
 
 async fn catalog_note(
     call: &ToolCallContext<'_>,
@@ -77,13 +77,53 @@ pub(super) async fn locate_note(
     Ok((scope, note))
 }
 
+/// Reuse project consent only while ranking candidates within one Space.
+#[derive(Default)]
+pub(super) struct CandidatePolicies(Mutex<BTreeMap<Option<FolderId>, Option<ProviderSelection>>>);
+
+async fn select_source(
+    call: &ToolCallContext<'_>,
+    scope: &SpaceContext,
+    project: Option<FolderRef>,
+    candidates: Option<&CandidatePolicies>,
+) -> Result<Option<ProviderSelection>, PortError> {
+    let Some(cache) = candidates else {
+        return call.provider_selection(scope, project).await;
+    };
+    let key = project.as_ref().map(|project| project.folder_id.clone());
+    if let Some(hit) = cache
+        .0
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .get(&key)
+        .cloned()
+    {
+        return hit
+            .map(Some)
+            .ok_or_else(|| DomainError::ResourceNotFound.into());
+    }
+    let result = call.provider_selection(scope, project).await;
+    let entry = match &result {
+        Ok(Some(selection)) => Some(selection.clone()),
+        Err(error) if hidden(error) => None,
+        _ => return result,
+    };
+    let mut policies = cache.0.lock().unwrap_or_else(|err| err.into_inner());
+    if policies.len() >= 200 {
+        policies.clear();
+    }
+    policies.insert(key, entry);
+    result
+}
+
 async fn source_policy(
     call: &ToolCallContext<'_>,
     scope: &SpaceContext,
     project: Option<FolderRef>,
+    candidates: Option<&CandidatePolicies>,
     in_project: impl Fn(&FolderRef) -> bool,
 ) -> Result<Option<ProviderSelection>, PortError> {
-    let Some(mut selection) = call.provider_selection(scope, project.clone()).await? else {
+    let Some(mut selection) = select_source(call, scope, project.clone(), candidates).await? else {
         return Ok(None);
     };
     if let EgressTarget::InAppProvider {
@@ -93,8 +133,7 @@ async fn source_policy(
         && primary.space_id == scope.scope().space_id
         && Some(primary) != project.as_ref()
     {
-        let admission = call
-            .provider_selection(scope, Some(primary.clone()))
+        let admission = select_source(call, scope, Some(primary.clone()), candidates)
             .await?
             .ok_or_else(|| invalid(ValidationReason::InvalidState))?;
         selection
@@ -135,7 +174,7 @@ async fn note_policy(
         space_id: scope.scope().space_id.clone(),
         folder_id,
     });
-    let admitted = source_policy(call, scope, project, |project| {
+    let admitted = source_policy(call, scope, project, None, |project| {
         current.facts.ancestor_folders.contains(&project.folder_id) && in_project(project)
     })
     .await?;
@@ -148,7 +187,31 @@ async fn note_policy(
     Ok(admitted)
 }
 
-pub(super) async fn admit_metadata(
+pub(super) async fn admit_search_card(
+    call: &ToolCallContext<'_>,
+    scope: &SpaceContext,
+    card: &ClassifiedMetadata,
+    candidates: &CandidatePolicies,
+) -> Result<(), PortError> {
+    if card.reference().space_id != scope.scope().space_id {
+        return Err(invalid(ValidationReason::SourceMismatch));
+    }
+    // Hydration already bound current facts. Disclosure rechecks the source at delivery.
+    if let Some(selection) = source_policy(
+        call,
+        scope,
+        card.current_project(),
+        Some(candidates),
+        |project| card.in_project(project),
+    )
+    .await?
+    {
+        ClassEgressFence::provider_note_metadata(card, scope.auth(), &selection.policy)?;
+    }
+    Ok(())
+}
+
+async fn admit_metadata(
     call: &ToolCallContext<'_>,
     scope: &SpaceContext,
     metadata: &ClassifiedMetadata,
@@ -257,7 +320,7 @@ pub(super) async fn folder_metadata(
         space_id: scope.scope().space_id.clone(),
         folder_id,
     });
-    if let Some(selection) = source_policy(call, scope, project, |project| {
+    if let Some(selection) = source_policy(call, scope, project, None, |project| {
         proof.current().in_project(project)
     })
     .await?

@@ -92,14 +92,20 @@ impl ProviderEgressCatalogPort for Egress {
             if self.deny.load(Ordering::SeqCst) {
                 return Err(DomainError::AccessDenied.into());
             }
-            let current = self
-                .current
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|item| request.origins.contains(&item.origin()))
-                .cloned()
-                .collect();
+            let current = {
+                let catalog = self.current.lock().unwrap();
+                request
+                    .origins
+                    .iter()
+                    .map(|origin| {
+                        catalog
+                            .iter()
+                            .find(|item| item.origin() == *origin)
+                            .cloned()
+                            .ok_or_else(|| invalid(ValidationReason::SourceMismatch))
+                    })
+                    .collect::<Result<_, _>>()?
+            };
             self.active.fetch_add(1, Ordering::SeqCst);
             self.cancellations
                 .lock()
@@ -1264,17 +1270,19 @@ async fn gateway(pg: bool, kind: ProviderWireKind, label: &str) {
         .space(budget(), project.space_id.clone())
         .await
         .unwrap();
+    let nested = FolderId::from_bytes([18; 16]);
+    let inside_facts = ResourceFacts {
+        space: space.space,
+        class: DocClass::UserDoc,
+        project: Some(nested.clone()),
+        ancestor_folders: vec![nested.clone(), project.folder_id.clone()],
+        folder_write_locked: false,
+        ability_package: None,
+    };
     let inside = ClassifiedDocument::from_canonical(
         setup.document.reference().clone(),
         setup.document.revision().clone(),
-        ResourceFacts {
-            space: space.space,
-            class: DocClass::UserDoc,
-            project: Some(project.folder_id.clone()),
-            ancestor_folders: vec![project.folder_id.clone()],
-            folder_write_locked: false,
-            ability_package: None,
-        },
+        inside_facts.clone(),
         Lifecycle::Active,
         setup
             .document
@@ -1284,18 +1292,48 @@ async fn gateway(pg: bool, kind: ProviderWireKind, label: &str) {
         setup.document.digest(),
     )
     .unwrap();
-    let mut scoped = setup.embedding(109, &inside);
-    scoped.project = Some(project.clone());
+    let scoped = |id| {
+        let mut request = setup.embedding(id, &inside);
+        request.project = Some(project.clone());
+        request
+    };
     let before = requests.lock().unwrap().len();
-    assert!(matches!(
-        setup.provider.embed(indexing.clone(), scoped).await,
-        Err(PortError::Domain(DomainError::AccessDenied))
-    ));
+    // A change to the nearest project invalidates the original disclosure witness.
+    let stale = setup.provider.embed(indexing.clone(), scoped(109)).await;
+    assert!(
+        matches!(&stale,
+            Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
+                if diagnostic.reason == ValidationReason::SourceMismatch
+        ),
+        "{stale:?}"
+    );
+
+    // Moving the whole nested project preserves its identity while its notes
+    // cease to belong to the selected outer project.
+    let mut moved = inside.metadata();
+    moved
+        .bind_current(
+            ResourceFacts {
+                ancestor_folders: vec![nested],
+                ..inside_facts
+            },
+            Lifecycle::Active,
+        )
+        .unwrap();
+    assert_eq!(inside.origin(), moved.origin());
+    assert!(inside.in_project(&project));
+    assert!(!moved.in_project(&project));
+    *setup.egress.current.lock().unwrap() = vec![ProviderCurrentContent::Note(moved)];
+    let outside = setup.provider.embed(indexing.clone(), scoped(130)).await;
+    assert!(
+        matches!(outside, Err(PortError::Domain(DomainError::AccessDenied))),
+        "{outside:?}"
+    );
     assert_eq!(requests.lock().unwrap().len(), before);
     *setup.egress.current.lock().unwrap() = vec![ProviderCurrentContent::Note(inside.metadata())];
-    let mut scoped = setup.embedding(110, &inside);
-    scoped.project = Some(project);
-    assert!(setup.provider.embed(indexing.clone(), scoped).await.is_ok());
+    let admitted = setup.provider.embed(indexing.clone(), scoped(110)).await;
+    assert!(admitted.is_ok(), "{admitted:?}");
+    assert_eq!(requests.lock().unwrap().len(), before + 1);
     *setup.egress.current.lock().unwrap() =
         vec![ProviderCurrentContent::Note(setup.document.metadata())];
     let count = requests.lock().unwrap().len();

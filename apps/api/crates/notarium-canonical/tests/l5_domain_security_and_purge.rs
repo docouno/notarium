@@ -239,22 +239,13 @@ impl S3Transport for PausedObjectRead {
     }
 }
 
-async fn run_domain_and_security_suite(
+async fn check_folder_and_note_history(
     store: &CanonicalStore,
-    gate: Option<&PausedObjectRead>,
-    local: Option<&TempDataRoot>,
-) {
-    let owner = sample_principal_id(10);
-    let viewer = sample_principal_id(11);
-    let (scope, _root_folder) = seed_default_space(
-        store,
-        sample_space_id(1),
-        sample_incarnation(1),
-        owner.clone(),
-    )
-    .await;
-    let epoch = LeaseEpoch::new(1).expect("epoch 1");
-    let ctx = owner_ctx(&scope, owner.clone(), true, true);
+    ctx: &SpaceContext,
+    epoch: LeaseEpoch,
+) -> (FolderId, FolderId, NoteId) {
+    let scope = ctx.scope();
+    let owner = ctx.auth().principal();
 
     // 1. Folder & project invariants: root-child project check, depth <= 256, cycle check, O(1) subtree move.
     let proj_a = sample_folder_id(10);
@@ -330,8 +321,8 @@ async fn run_domain_and_security_suite(
         .move_folder(
             ctx.clone(),
             next_mutation(
-                &scope,
-                &owner,
+                scope,
+                owner,
                 MoveFolder {
                     folder: docs_folder.clone(),
                     new_parent: Some(sub_folder.clone()),
@@ -363,8 +354,8 @@ async fn run_domain_and_security_suite(
         .move_folder(
             ctx.clone(),
             next_mutation(
-                &scope,
-                &owner,
+                scope,
+                owner,
                 MoveFolder {
                     folder: proj_a.clone(),
                     new_parent: Some(archive_root.clone()),
@@ -421,8 +412,8 @@ async fn run_domain_and_security_suite(
         .move_folder(
             ctx.clone(),
             next_mutation(
-                &scope,
-                &owner,
+                scope,
+                owner,
                 MoveFolder {
                     folder: docs_folder.clone(),
                     new_parent: Some(tip),
@@ -437,8 +428,8 @@ async fn run_domain_and_security_suite(
         .rename_project(
             ctx.clone(),
             next_mutation(
-                &scope,
-                &owner,
+                scope,
+                owner,
                 RenameProject {
                     folder: proj_a.clone(),
                     name: "alpha-prime".to_owned(),
@@ -453,8 +444,8 @@ async fn run_domain_and_security_suite(
         .rename_project(
             ctx.clone(),
             next_mutation(
-                &scope,
-                &owner,
+                scope,
+                owner,
                 RenameProject {
                     folder: docs_folder.clone(),
                     name: "not-a-proj".to_owned(),
@@ -472,8 +463,8 @@ async fn run_domain_and_security_suite(
         .create_note(
             ctx.clone(),
             next_mutation(
-                &scope,
-                &owner,
+                scope,
+                owner,
                 CreateNote {
                     folder_page: false,
                     note: note_1.clone(),
@@ -506,8 +497,8 @@ async fn run_domain_and_security_suite(
             .create_note(
                 ctx.clone(),
                 next_mutation(
-                    &scope,
-                    &owner,
+                    scope,
+                    owner,
                     CreateNote {
                         folder_page: false,
                         note: note.clone(),
@@ -569,8 +560,8 @@ async fn run_domain_and_security_suite(
         .move_folder(
             ctx.clone(),
             next_mutation(
-                &scope,
-                &owner,
+                scope,
+                owner,
                 MoveFolder {
                     folder: docs_folder.clone(),
                     new_parent: Some(archive_root.clone()),
@@ -667,7 +658,7 @@ async fn run_domain_and_security_suite(
     let live_origin = ProviderCurrentContent::Note(current);
     for root in [&proj_a, &archive_root] {
         let pinned = make_human_ctx(
-            &scope,
+            scope,
             owner.clone(),
             SpaceGrant {
                 role: SpaceRole::Viewer,
@@ -772,8 +763,8 @@ async fn run_domain_and_security_suite(
         .rename_folder(
             ctx.clone(),
             next_mutation(
-                &scope,
-                &owner,
+                scope,
+                owner,
                 RenameFolder {
                     folder: docs_folder.clone(),
                     name: "handbook".to_owned(),
@@ -808,8 +799,8 @@ async fn run_domain_and_security_suite(
         .edit_note(
             ctx.clone(),
             next_mutation_rev(
-                &scope,
-                &owner,
+                scope,
+                owner,
                 rev_1.clone(),
                 EditNote {
                     note: note_1.clone(),
@@ -866,8 +857,8 @@ async fn run_domain_and_security_suite(
         .move_note(
             ctx.clone(),
             next_mutation(
-                &scope,
-                &owner,
+                scope,
+                owner,
                 MoveNote {
                     note: note_1.clone(),
                     parent: Some(proj_a.clone()),
@@ -882,8 +873,8 @@ async fn run_domain_and_security_suite(
         .rename_note(
             ctx.clone(),
             next_mutation(
-                &scope,
-                &owner,
+                scope,
+                owner,
                 RenameNote {
                     note: note_1.clone(),
                     slug: "arch-final".to_owned(),
@@ -907,18 +898,13 @@ async fn run_domain_and_security_suite(
     assert_eq!(alias_from_proj.map(|r| r.note_id), Some(note_1.clone()));
 
     // Trash & Restore + `is_live_visible`.
-    assert!(
-        store
-            .is_live_visible(&ctx, &note_1)
-            .await
-            .expect("live vis")
-    );
+    assert!(store.is_live_visible(ctx, &note_1).await.expect("live vis"));
     store
         .delete_note(
             ctx.clone(),
             next_mutation(
-                &scope,
-                &owner,
+                scope,
+                owner,
                 DeleteNote {
                     note: note_1.clone(),
                     disposition: DeleteDisposition::Trash,
@@ -981,7 +967,7 @@ async fn run_domain_and_security_suite(
 
     assert!(
         !store
-            .is_live_visible(&ctx, &note_1)
+            .is_live_visible(ctx, &note_1)
             .await
             .expect("trashed vis")
     );
@@ -990,8 +976,8 @@ async fn run_domain_and_security_suite(
         .delete_note(
             ctx.clone(),
             next_mutation(
-                &scope,
-                &owner,
+                scope,
+                owner,
                 DeleteNote {
                     note: note_1.clone(),
                     disposition: DeleteDisposition::Restore,
@@ -1002,10 +988,23 @@ async fn run_domain_and_security_suite(
         .expect("restore note_1");
     assert!(
         store
-            .is_live_visible(&ctx, &note_1)
+            .is_live_visible(ctx, &note_1)
             .await
             .expect("restored vis")
     );
+
+    (proj_a, archive_root, note_1)
+}
+
+async fn check_batch_and_document_mutations(
+    store: &CanonicalStore,
+    ctx: &SpaceContext,
+    proj_a: &FolderId,
+    note_1: &NoteId,
+    postgres: bool,
+) -> RevisionId {
+    let scope = ctx.scope();
+    let owner = ctx.auth().principal();
 
     // 3. EncryptedNote validation & hydrate_cards non-leakage + order preservation.
     let enc_note = sample_note_id(21);
@@ -1017,8 +1016,8 @@ async fn run_domain_and_security_suite(
         .create_note(
             ctx.clone(),
             next_mutation(
-                &scope,
-                &owner,
+                scope,
+                owner,
                 CreateNote {
                     folder_page: false,
                     note: enc_note.clone(),
@@ -1041,8 +1040,8 @@ async fn run_domain_and_security_suite(
         .create_note(
             ctx.clone(),
             next_mutation(
-                &scope,
-                &owner,
+                scope,
+                owner,
                 CreateNote {
                     folder_page: false,
                     note: enc_note.clone(),
@@ -1092,8 +1091,8 @@ async fn run_domain_and_security_suite(
     let idemp_note_b = sample_note_id(23);
 
     let mut m_first = next_mutation(
-        &scope,
-        &owner,
+        scope,
+        owner,
         CreateNote {
             folder_page: false,
             note: idemp_note_a.clone(),
@@ -1118,8 +1117,8 @@ async fn run_domain_and_security_suite(
     assert_eq!(first_ok.receipt, replay_ok.receipt);
 
     let mut m_forged = next_mutation(
-        &scope,
-        &owner,
+        scope,
+        owner,
         CreateNote {
             folder_page: false,
             note: idemp_note_b,
@@ -1140,7 +1139,7 @@ async fn run_domain_and_security_suite(
         "forged identical caller hash on distinct input must trigger IdempotencyKeyReused, got {forged_res:?}"
     );
 
-    batch::check(store, &ctx, &scope, &owner, gate.is_some()).await;
+    batch::check(store, ctx, scope, owner, postgres).await;
 
     // 5. `accept_batch`: intra-batch `Create(N) -> Edit(N)` + per-item savepoint isolation.
     let batch_note = sample_note_id(24);
@@ -1162,8 +1161,8 @@ async fn run_domain_and_security_suite(
             AcceptBatch {
                 items: vec![
                     next_mutation(
-                        &scope,
-                        &owner,
+                        scope,
+                        owner,
                         BatchItem::Create(CreateNote {
                             folder_page: false,
                             note: batch_note.clone(),
@@ -1175,8 +1174,8 @@ async fn run_domain_and_security_suite(
                     ),
                     // Bad middle item: edits non-existent note -> rolls back ONLY its savepoint!
                     next_mutation(
-                        &scope,
-                        &owner,
+                        scope,
+                        owner,
                         BatchItem::Edit(EditNote {
                             note: sample_note_id(98),
                             plan: batch_plan.clone(),
@@ -1184,8 +1183,8 @@ async fn run_domain_and_security_suite(
                     ),
                     // Subsequent item in SAME batch sees `batch_note` created by item 0!
                     next_mutation(
-                        &scope,
-                        &owner,
+                        scope,
+                        owner,
                         BatchItem::Edit(EditNote {
                             note: batch_note.clone(),
                             plan: batch_plan,
@@ -1246,8 +1245,8 @@ async fn run_domain_and_security_suite(
         .append_memory(
             ctx.clone(),
             next_mutation(
-                &scope,
-                &owner,
+                scope,
+                owner,
                 AppendMemory {
                     summary: None,
                     mode: MemoryWriteMode::RequireExisting,
@@ -1264,8 +1263,8 @@ async fn run_domain_and_security_suite(
         .append_memory(
             ctx.clone(),
             next_mutation(
-                &scope,
-                &owner,
+                scope,
+                owner,
                 AppendMemory {
                     summary: None,
                     mode: MemoryWriteMode::RequireExisting,
@@ -1294,8 +1293,8 @@ async fn run_domain_and_security_suite(
         .link(
             ctx.clone(),
             next_mutation(
-                &scope,
-                &owner,
+                scope,
+                owner,
                 Link {
                     target_title: None,
                     source: note_1.clone(),
@@ -1313,8 +1312,8 @@ async fn run_domain_and_security_suite(
             LinkBatch {
                 items: vec![
                     next_mutation(
-                        &scope,
-                        &owner,
+                        scope,
+                        owner,
                         Link {
                             target_title: None,
                             source: note_1.clone(),
@@ -1323,8 +1322,8 @@ async fn run_domain_and_security_suite(
                         },
                     ),
                     next_mutation(
-                        &scope,
-                        &owner,
+                        scope,
+                        owner,
                         Link {
                             target_title: None,
                             source: note_1.clone(),
@@ -1362,8 +1361,8 @@ async fn run_domain_and_security_suite(
         .accept_external_observation(
             ctx.clone(),
             next_mutation(
-                &scope,
-                &owner,
+                scope,
+                owner,
                 ExternalObservation {
                     note: batch_note.clone(),
                     observed_digest: ext_digest,
@@ -1384,8 +1383,8 @@ async fn run_domain_and_security_suite(
         .accept_external_observation(
             ctx.clone(),
             next_mutation(
-                &scope,
-                &owner,
+                scope,
+                owner,
                 ExternalObservation {
                     note: batch_note.clone(),
                     observed_digest: ext_digest,
@@ -1408,8 +1407,8 @@ async fn run_domain_and_security_suite(
         .accept_external_observation(
             ctx.clone(),
             next_mutation(
-                &scope,
-                &owner,
+                scope,
+                owner,
                 ExternalObservation {
                     note: batch_note.clone(),
                     observed_digest: notarium_syntax::content_digest(diverged_carrier),
@@ -1445,10 +1444,10 @@ async fn run_domain_and_security_suite(
         expected_schema_revision: None,
     };
     let schema_committed =
-        collab_schema::write_and_reconcile_schema(store, &ctx, &scope, &owner, schema_input).await;
+        collab_schema::write_and_reconcile_schema(store, ctx, scope, owner, schema_input).await;
     let resolved_eff = store
         .resolve_receipt_effects(
-            &scope,
+            scope,
             &ReceiptSet::new([schema_committed.receipt.clone()]).expect("receipt set"),
         )
         .await
@@ -1467,8 +1466,8 @@ async fn run_domain_and_security_suite(
         .create_note(
             ctx.clone(),
             next_mutation(
-                &scope,
-                &owner,
+                scope,
+                owner,
                 CreateNote {
                     folder_page: false,
                     note: typed_note.clone(),
@@ -1499,6 +1498,21 @@ async fn run_domain_and_security_suite(
         )))
     );
 
+    schema_committed.value.schema_revision
+}
+
+async fn check_ability_packages(
+    store: &CanonicalStore,
+    ctx: &SpaceContext,
+    proj_a: &FolderId,
+    viewer: &PrincipalId,
+    gate: Option<&PausedObjectRead>,
+    local: Option<&TempDataRoot>,
+    epoch: LeaseEpoch,
+) -> (AbilityId, NoteId, RevisionId) {
+    let scope = ctx.scope();
+    let owner = ctx.auth().principal();
+
     // 7. `publish_ability_package` & `read_ability_resource` (Cap::AbilityWrite + exact revision pinning).
     let ability_id = AbilityId::from_bytes([0x31; 16]);
     let skill_entry_note = sample_note_id(28);
@@ -1509,8 +1523,8 @@ async fn run_domain_and_security_suite(
         .create_note(
             ctx.clone(),
             next_mutation(
-                &scope,
-                &owner,
+                scope,
+                owner,
                 CreateNote {
                     folder_page: false,
                     note: skill_entry_note.clone(),
@@ -1526,8 +1540,8 @@ async fn run_domain_and_security_suite(
 
     staging::verify_write_admission(
         store,
-        &scope,
-        &owner,
+        scope,
+        owner,
         &skill_entry_note,
         &ability_id,
         gate,
@@ -1539,10 +1553,10 @@ async fn run_domain_and_security_suite(
     for (ability_write, human_management) in [(false, true), (true, false)] {
         let denied_pub = store
             .publish_ability_package(
-                owner_ctx(&scope, owner.clone(), ability_write, human_management),
+                owner_ctx(scope, owner.clone(), ability_write, human_management),
                 next_mutation(
-                    &scope,
-                    &owner,
+                    scope,
+                    owner,
                     PublishAbilityPackage {
                         attached_skills: vec![],
                         ability: ability_id.clone(),
@@ -1567,8 +1581,8 @@ async fn run_domain_and_security_suite(
         .publish_ability_package(
             ctx.clone(),
             next_mutation(
-                &scope,
-                &owner,
+                scope,
+                owner,
                 PublishAbilityPackage {
                     attached_skills: vec![],
                     ability: ability_id.clone(),
@@ -1592,8 +1606,8 @@ async fn run_domain_and_security_suite(
         .publish_ability_package(
             ctx.clone(),
             next_mutation(
-                &scope,
-                &owner,
+                scope,
+                owner,
                 PublishAbilityPackage {
                     attached_skills: vec![],
                     ability: ability_id.clone(),
@@ -1628,8 +1642,8 @@ async fn run_domain_and_security_suite(
         .clone();
     let guarded_trash = |package_revision| {
         next_mutation(
-            &scope,
-            &owner,
+            scope,
+            owner,
             TrashAbilityPackage {
                 ability: ability_id.clone(),
                 entrypoint: skill_entry_note.clone(),
@@ -1664,8 +1678,8 @@ async fn run_domain_and_security_suite(
         store.move_note(
             ctx.clone(),
             next_mutation(
-                &scope,
-                &owner,
+                scope,
+                owner,
                 MoveNote {
                     note: skill_entry_note.clone(),
                     parent: Some(parent.clone()),
@@ -1680,8 +1694,8 @@ async fn run_domain_and_security_suite(
             .publish_ability_package(
                 ctx.clone(),
                 next_mutation(
-                    &scope,
-                    &owner,
+                    scope,
+                    owner,
                     PublishAbilityPackage {
                         attached_skills: vec![],
                         ability: ability_id.clone(),
@@ -1700,7 +1714,7 @@ async fn run_domain_and_security_suite(
 
     let project_reader = |project: &FolderId| {
         make_human_ctx(
-            &scope,
+            scope,
             viewer.clone(),
             SpaceGrant {
                 role: SpaceRole::Viewer,
@@ -1741,7 +1755,7 @@ async fn run_domain_and_security_suite(
     assert!(!authorized.in_project(&current_project));
     let lease = store
         .acquire_egress(
-            account(&ctx),
+            account(ctx),
             ProviderEgressRequest {
                 origins: vec![authorized.origin()],
                 primary: scope.clone(),
@@ -1755,7 +1769,7 @@ async fn run_domain_and_security_suite(
         .unwrap();
     assert!(!lease.current()[0].in_project(&current_project));
     drop(lease);
-    for reader in [project_reader(&proj_a), b_reader.clone()] {
+    for reader in [project_reader(proj_a), b_reader.clone()] {
         let descriptor = notarium_core::ports::ControlCatalogPort::ability(
             store,
             account(&reader),
@@ -1783,8 +1797,8 @@ async fn run_domain_and_security_suite(
         .publish_ability_package(
             ctx.clone(),
             next_mutation(
-                &scope,
-                &owner,
+                scope,
+                owner,
                 PublishAbilityPackage {
                     attached_skills: vec![],
                     ability: ability_id.clone(),
@@ -1824,7 +1838,7 @@ async fn run_domain_and_security_suite(
         .await
         .unwrap();
     assert_eq!(current.explicit_read(b_reader.auth()).unwrap(), skill_md_v1);
-    relocate(&proj_a).await.unwrap();
+    relocate(proj_a).await.unwrap();
 
     // Exact package_revision read: v1 serves Entrypoint + `scripts/helper.py`, while v2 returns `ResourceNotFound` for `scripts/helper.py`!
     let res_v1_entry = store
@@ -1874,9 +1888,23 @@ async fn run_domain_and_security_suite(
         Err(PortError::Domain(DomainError::ResourceNotFound))
     ));
 
+    (ability_id, skill_entry_note, pkg_v1.value.revision)
+}
+
+async fn check_mutation_authority(
+    store: &CanonicalStore,
+    ctx: &SpaceContext,
+    viewer: &PrincipalId,
+    proj_a: &FolderId,
+    archive_root: &FolderId,
+    schema_revision: &RevisionId,
+) -> SpaceContext {
+    let scope = ctx.scope();
+    let owner = ctx.auth().principal();
+
     // 8. Authorization fences: Viewer role, folder_write_lock, project_root scope, CrossSpaceTainted.
     let viewer_ctx = make_human_ctx(
-        &scope,
+        scope,
         viewer.clone(),
         SpaceGrant {
             role: SpaceRole::Viewer,
@@ -1891,8 +1919,8 @@ async fn run_domain_and_security_suite(
         .create_note(
             viewer_ctx.clone(),
             next_mutation(
-                &scope,
-                &viewer,
+                scope,
+                viewer,
                 CreateNote {
                     folder_page: false,
                     note: sample_note_id(40),
@@ -1908,8 +1936,8 @@ async fn run_domain_and_security_suite(
 
     let replay_note = NoteId::from_bytes(*b"receipt-authz-v1");
     let create_again = next_mutation(
-        &scope,
-        &owner,
+        scope,
+        owner,
         CreateNote {
             folder_page: false,
             note: replay_note.clone(),
@@ -1924,8 +1952,8 @@ async fn run_domain_and_security_suite(
         .await
         .unwrap();
     let rename_again = next_mutation(
-        &scope,
-        &owner,
+        scope,
+        owner,
         RenameNote {
             note: replay_note.clone(),
             slug: "receipt-authority-updated".into(),
@@ -1953,7 +1981,7 @@ async fn run_domain_and_security_suite(
         renamed.receipt
     );
     let reduced = make_human_ctx(
-        &scope,
+        scope,
         owner.clone(),
         SpaceGrant {
             role: SpaceRole::Viewer,
@@ -1976,8 +2004,8 @@ async fn run_domain_and_security_suite(
     ));
 
     let stale_edit = next_mutation_rev(
-        &scope,
-        &owner,
+        scope,
+        owner,
         original.value.revision.clone(),
         EditNote {
             note: replay_note.clone(),
@@ -1998,11 +2026,11 @@ async fn run_domain_and_security_suite(
 
     conflict_authority::check(
         store,
-        &ctx,
+        ctx,
         &replay_note,
         &original.value.revision,
         &renamed.value.revision,
-        &proj_a,
+        proj_a,
         false,
     )
     .await;
@@ -2013,11 +2041,11 @@ async fn run_domain_and_security_suite(
         .expect("lock proj_a");
     conflict_authority::check(
         store,
-        &ctx,
+        ctx,
         &replay_note,
         &original.value.revision,
         &renamed.value.revision,
-        &proj_a,
+        proj_a,
         true,
     )
     .await;
@@ -2031,8 +2059,8 @@ async fn run_domain_and_security_suite(
             ctx.clone(),
             AcceptBatch {
                 items: vec![next_mutation_rev(
-                    &scope,
-                    &owner,
+                    scope,
+                    owner,
                     original.value.revision.clone(),
                     BatchItem::Edit(stale_edit.input),
                 )],
@@ -2050,15 +2078,15 @@ async fn run_domain_and_security_suite(
         Err(PortError::Domain(DomainError::SpaceReadOnly))
     ));
     let schema_relocation = next_mutation(
-        &scope,
-        &owner,
+        scope,
+        owner,
         UpdateSpaceSchema {
             schema_note: replay_note.clone(),
             parent: None,
             slug: "schema-relocation".into(),
             carrier: "# Schema relocation\n".into(),
             schema: BTreeMap::new(),
-            expected_schema_revision: Some(schema_committed.value.schema_revision.clone()),
+            expected_schema_revision: Some(schema_revision.clone()),
         },
     );
     assert!(matches!(
@@ -2071,8 +2099,8 @@ async fn run_domain_and_security_suite(
         .create_note(
             ctx.clone(),
             next_mutation(
-                &scope,
-                &owner,
+                scope,
+                owner,
                 CreateNote {
                     folder_page: false,
                     note: sample_note_id(41),
@@ -2098,7 +2126,7 @@ async fn run_domain_and_security_suite(
 
     // Project-pinned context cannot read or write outside `proj_a` (`archive_root`).
     let pinned_ctx = make_human_ctx(
-        &scope,
+        scope,
         owner.clone(),
         SpaceGrant {
             role: SpaceRole::Editor,
@@ -2121,8 +2149,8 @@ async fn run_domain_and_security_suite(
         .create_note(
             pinned_ctx,
             next_mutation(
-                &scope,
-                &owner,
+                scope,
+                owner,
                 CreateNote {
                     folder_page: false,
                     note: sample_note_id(42),
@@ -2153,8 +2181,8 @@ async fn run_domain_and_security_suite(
         .move_note(
             SpaceContext::new(move_auth, scope.clone(), make_budget()).unwrap(),
             next_mutation(
-                &scope,
-                &owner,
+                scope,
+                owner,
                 MoveNote {
                     note: replay_note,
                     parent: Some(archive_root.clone()),
@@ -2170,8 +2198,8 @@ async fn run_domain_and_security_suite(
         .unwrap()
         .unwrap();
     let rollback = next_mutation(
-        &scope,
-        &owner,
+        scope,
+        owner,
         notarium_core::ports::RollbackAgentRun {
             run: mover,
             expected_run_revision: revision,
@@ -2227,8 +2255,8 @@ async fn run_domain_and_security_suite(
         .create_note(
             tainted_ctx,
             next_mutation(
-                &scope,
-                &owner,
+                scope,
+                owner,
                 CreateNote {
                     folder_page: false,
                     note: sample_note_id(43),
@@ -2244,6 +2272,42 @@ async fn run_domain_and_security_suite(
         tainted_write,
         Err(PortError::Domain(DomainError::CrossSpaceTainted))
     ));
+
+    viewer_ctx
+}
+
+async fn run_domain_and_security_suite(
+    store: &CanonicalStore,
+    gate: Option<&PausedObjectRead>,
+    local: Option<&TempDataRoot>,
+) {
+    let owner = sample_principal_id(10);
+    let viewer = sample_principal_id(11);
+    let (scope, _root_folder) = seed_default_space(
+        store,
+        sample_space_id(1),
+        sample_incarnation(1),
+        owner.clone(),
+    )
+    .await;
+    let epoch = LeaseEpoch::new(1).expect("epoch 1");
+    let ctx = owner_ctx(&scope, owner.clone(), true, true);
+
+    let (proj_a, archive_root, note_1) = check_folder_and_note_history(store, &ctx, epoch).await;
+    let schema_revision =
+        check_batch_and_document_mutations(store, &ctx, &proj_a, &note_1, gate.is_some()).await;
+
+    let (ability_id, skill_entry_note, package_revision) =
+        check_ability_packages(store, &ctx, &proj_a, &viewer, gate, local, epoch).await;
+    let viewer_ctx = check_mutation_authority(
+        store,
+        &ctx,
+        &viewer,
+        &proj_a,
+        &archive_root,
+        &schema_revision,
+    )
+    .await;
 
     // `recent_activity` / `read_changes` filters unauthorized classes for `viewer_ctx` (only `UserDoc` granted).
     let latest_space = store.read_space(&scope.space_id).await.expect("read_space");
@@ -2352,7 +2416,7 @@ async fn run_domain_and_security_suite(
                             restricted.clone(),
                             ReadAbilityResource {
                                 ability: ability_id.clone(),
-                                package_revision: pkg_v1.value.revision.clone(),
+                                package_revision: package_revision.clone(),
                                 resource: AbilityResourceName::Auxiliary(
                                     "scripts/helper.py".into(),
                                 ),
@@ -2487,13 +2551,7 @@ async fn run_domain_and_security_suite(
         assert_validation_err(&result, ValidationReason::CursorStale);
     }
     folder_authority::check(store, &scope, &owner).await;
-    Box::pin(folder_pages::check(
-        store,
-        &scope,
-        &owner,
-        &schema_committed.value.schema_revision,
-    ))
-    .await;
+    Box::pin(folder_pages::check(store, &scope, &owner, &schema_revision)).await;
     Box::pin(memory_writes::check(store, &scope, &owner, proj_a)).await;
 }
 

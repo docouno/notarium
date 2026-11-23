@@ -117,21 +117,30 @@ impl AgentRunSupervisor {
                     .revocations
                     .pending_submission(&key, &identity, account.auth())
         {
-            let active = self.active(&scope, &thread);
-            let branch = if active.is_none() && may_start {
-                Some(self.thread_at(ctx, &thread, entry.value.seq).await?)
-            } else {
-                None
-            };
             if let Some(lease) = &route {
-                lease.check()?;
+                lease.check().map_err(after_append)?;
             }
             drop(route);
-            if let Some(credential) = self
-                .inner
-                .revocations
-                .take_pending_submission(&key, &sender)
-            {
+            // A peer can resolve the same receipt through the shared hub. Keep
+            // its sender revocable until the claim has a definitive outcome.
+            let _handoff = sender.handoff.lock().await;
+            let sender_live = || {
+                self.inner
+                    .revocations
+                    .submission_live(&key, &sender)
+                    .map_err(after_append)
+            };
+            if sender_live()? {
+                let active = self.active(&scope, &thread);
+                let branch = if active.is_none() && may_start {
+                    Some(
+                        self.thread_at(ctx, &thread, entry.value.seq)
+                            .await
+                            .map_err(after_append)?,
+                    )
+                } else {
+                    None
+                };
                 if let Some(active) = active {
                     active.stream.committed(&entry.value, None)?;
                 } else if let Some(branch) = branch
@@ -141,20 +150,27 @@ impl AgentRunSupervisor {
                     && branch.entries.iter().any(|current| {
                         current.seq == entry.value.seq && current.kind == ChatEntryKind::Human
                     })
+                    && sender_live()?
                 {
                     let start = StartChatRun {
                         scope,
                         thread,
                         expected_leaf: entry.value.seq,
-                        options: credential.options().clone(),
+                        options: sender.options().clone(),
                     };
-                    let owner = AccountContext::new(credential.auth().clone(), account.budget);
-                    if let Ok(LaunchOutcome::Started(id)) =
-                        self.launch(owner, start, branch.thread, None).await
-                    {
-                        run = Some(id);
+                    let owner = AccountContext::new(sender.auth().clone(), account.budget);
+                    match self.launch(owner, start, branch.thread, None).await {
+                        Ok(LaunchOutcome::Started(id)) => run = Some(id),
+                        Err(error)
+                            if !sender.cancellation().is_cancelled()
+                                && let Some(retry) = retry_handoff(&error) =>
+                        {
+                            return Err(retry);
+                        }
+                        _ => (),
                     }
                 }
+                self.inner.revocations.finish_submission(&key, &sender);
             }
         }
         Ok(ChatSubmission { outcome, run })
@@ -335,14 +351,19 @@ impl AgentRunSupervisor {
                             SpaceContext::new(reader, run.scope.clone(), follow.budget.clone())?;
                         match self.thread_at(next_context, &run.thread, entry.seq).await {
                             Ok(branch) => {
-                                if self
+                                match self
                                     .launch(follow, next, branch.thread, Some(&run.id))
                                     .await
-                                    .is_ok()
                                 {
-                                    self.inner.revocations.finish_pending(&attempt.key);
-                                    *unsettled = None;
-                                    return Ok(());
+                                    Ok(LaunchOutcome::Started(_) | LaunchOutcome::Draining(_)) => {
+                                        self.inner.revocations.finish_pending(&attempt.key);
+                                        *unsettled = None;
+                                        return Ok(());
+                                    }
+                                    Err(error) if retry_handoff(&error).is_some() => {
+                                        return Err(error);
+                                    }
+                                    _ => (),
                                 }
                             }
                             Err(error) if no_authority(&error) => (),
@@ -452,6 +473,30 @@ fn no_authority(error: &PortError) -> bool {
                     | DomainError::SpaceReadOnly
             )
     )
+}
+
+fn retry_handoff(error: &PortError) -> Option<PortError> {
+    let (PortError::Unavailable(failure) | PortError::DeadlineExceeded(failure)) = error else {
+        return None;
+    };
+    if failure.effect() != CommitEffect::NotCommitted {
+        return None;
+    }
+    // The input is already durable. The public retry resolves its same receipt
+    // and may retry only the unclaimed run with the retained sender.
+    Some(PortError::Unavailable(
+        OperationalFailure::new(
+            failure.diagnostic_ref(),
+            CommitEffect::Unknown,
+            RetryAdvice::RetrySameCommand,
+            true,
+        )
+        .expect("the input has a durable receipt"),
+    ))
+}
+
+fn after_append(error: PortError) -> PortError {
+    retry_handoff(&error).unwrap_or(error)
 }
 
 pub(super) fn unknown_commit(error: &PortError) -> bool {

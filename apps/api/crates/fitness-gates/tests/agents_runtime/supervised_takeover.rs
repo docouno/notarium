@@ -1,6 +1,6 @@
 use super::*;
 use crate::runtime_ability_cases::{
-    approve_disclosure, loopback_provider, read_request, send_ollama,
+    approve_disclosure, begin_ollama_response, loopback_provider, read_request, send_ollama,
 };
 use notarium_agents::chats::{
     AgentRunSupervisor, ChatRunOptions, ClusterRunAuthority, LiveRunOwner, RunOwnershipRequest,
@@ -9,6 +9,7 @@ use notarium_agents::chats::{
 use notarium_core::{
     auth::{ChatAudience, SpaceKind},
     classes::DocClass,
+    error::{CommitEffect, OperationalFailure, RetryAdvice},
     ids::ThreadEntrySeq,
     model::HistoryScope,
 };
@@ -29,6 +30,7 @@ struct SharedAuthority {
 #[derive(Default)]
 struct Generation {
     lost: bool,
+    reject_next_owner: bool,
     registrations: Vec<(RunOwnershipTransition, Cancellation)>,
     inputs: Vec<Cancellation>,
 }
@@ -67,6 +69,10 @@ impl SharedAuthority {
             .registrations
             .iter()
             .any(|(saved, _)| saved == transition)
+    }
+
+    fn reject_next_owner(&self) {
+        self.generation.lock().unwrap().reject_next_owner = true;
     }
 }
 
@@ -117,6 +123,17 @@ impl ClusterRunAuthority for SharedAuthority {
     ) -> PortFuture<'_, Box<dyn LiveRunOwner>> {
         Box::pin(async move {
             let mut generation = self.generation.lock().unwrap();
+            if std::mem::take(&mut generation.reject_next_owner) {
+                return Err(PortError::Unavailable(
+                    OperationalFailure::new(
+                        ContentDigest::from_bytes([0xfa; 32]),
+                        CommitEffect::NotCommitted,
+                        RetryAdvice::Never,
+                        false,
+                    )
+                    .unwrap(),
+                ));
+            }
             if generation.lost {
                 cancellation.cancel();
             }
@@ -318,11 +335,23 @@ async fn fenced_ownership_recovers_pending_inputs(
         fixture.revocations.clone(),
         old_authority.clone(),
     );
+    let initial = input(1, ThreadEntrySeq::ZERO, "An active writer".into());
+    old_authority.reject_next_owner();
+    assert!(matches!(
+        primary.enqueue_input(fixture.human.clone(), initial.clone(), options.clone()).await,
+        Err(PortError::Unavailable(failure))
+            if failure.effect() == CommitEffect::Unknown && failure.retry() == RetryAdvice::RetrySameCommand
+    ));
+    let head = thread(&fixture, reader, &thread_id).await.head;
+    let saved = supervised_chat_cases::branch(&fixture, reader, &thread_id, head).await;
+    assert!(saved.thread.active_run.is_none());
+    assert_eq!(saved.entries.len(), 1);
+    assert_eq!(saved.entries[0].kind, ChatEntryKind::Human);
     let first = primary
         .enqueue_input(
             fixture.human.clone(),
-            input(1, ThreadEntrySeq::ZERO, "An active writer".into()),
-            options.clone(),
+            initial.clone(),
+            ChatRunOptions::default(),
         )
         .await
         .unwrap();
@@ -330,6 +359,7 @@ async fn fenced_ownership_recovers_pending_inputs(
         panic!("expected a committed initiating message");
     };
     let first_run = first.run.unwrap();
+    assert_eq!(saved.thread.head, first_post.value.seq);
     let (mut blocked, _) = timeout(Duration::from_secs(15), read_request(&listener))
         .await
         .unwrap();
@@ -367,6 +397,14 @@ async fn fenced_ownership_recovers_pending_inputs(
     drop(fence);
     let live = wait_idle(&fixture, &primary, reader, &thread_id).await;
     assert_eq!(live.head, first_post.value.seq);
+    let replay = peer
+        .enqueue_input(fixture.human.clone(), initial, options.clone())
+        .await
+        .unwrap();
+    assert!(
+        matches!(replay.outcome, SubmitUserChatOutcome::Appended(saved) if saved.receipt == first_post.receipt)
+    );
+    assert!(replay.run.is_none());
 
     let (hydrating, resume) = fixture.projections.pause_chat_hydration();
     let abandoned = primary
@@ -499,18 +537,13 @@ async fn fenced_ownership_recovers_pending_inputs(
         fixture.revocations.clone(),
         authority.clone(),
     );
+    let options = ChatRunOptions {
+        provider: Some(local.resource.id),
+        model: Some(local.model),
+        ..ChatRunOptions::default()
+    };
     let next = successor
-        .start(
-            fixture.human.clone(),
-            request(
-                live.head,
-                ChatRunOptions {
-                    provider: Some(local.resource.id),
-                    model: Some(local.model),
-                    ..ChatRunOptions::default()
-                },
-            ),
-        )
+        .start(fixture.human.clone(), request(live.head, options.clone()))
         .await
         .unwrap();
     assert!(authority.observed(&RunOwnershipTransition::Recover {
@@ -519,6 +552,12 @@ async fn fenced_ownership_recovers_pending_inputs(
     let (mut wire, _) = timeout(Duration::from_secs(15), read_request(&listener))
         .await
         .unwrap();
+    let reply = begin_ollama_response(
+        &mut wire,
+        json!({"role":"assistant", "content":"Recovered without replaying queued inputs."}),
+        "stop",
+    )
+    .await;
 
     let replay = successor
         .enqueue_input(
@@ -536,7 +575,7 @@ async fn fenced_ownership_recovers_pending_inputs(
     let run = SpaceContext::new(
         direct
             .for_agent_run(
-                next,
+                next.clone(),
                 scope.space_id.clone(),
                 ChatAudience::Personal,
                 direct.spaces().clone(),
@@ -567,15 +606,43 @@ async fn fenced_ownership_recovers_pending_inputs(
     .await
     .unwrap();
 
-    send_ollama(
-        &mut wire,
-        json!({"role":"assistant", "content":"Recovered without replaying queued inputs."}),
-        "stop",
-    )
-    .await;
+    let messages = ["First after recovery", "Second after recovery"];
+    for (index, message) in [21, 22].into_iter().zip(messages) {
+        let queued = successor
+            .enqueue_input(
+                fixture.human.clone(),
+                input(index, live.head, message.into()),
+                options.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(queued.outcome, SubmitUserChatOutcome::Queued(_)));
+    }
+    authority.reject_next_owner();
+    wire.get_mut().write_all(reply.as_bytes()).await.unwrap();
+    for message in messages {
+        let (mut wire, prompt) = timeout(Duration::from_secs(15), read_request(&listener))
+            .await
+            .unwrap();
+        let latest = prompt["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|part| part["role"] == "user")
+            .unwrap();
+        assert_eq!(latest["content"], message);
+        send_ollama(
+            &mut wire,
+            json!({"role":"assistant", "content":"Received."}),
+            "stop",
+        )
+        .await;
+    }
+    assert!(authority.observed(&RunOwnershipTransition::Handoff { previous: next }));
     let clean = SpaceContext::new(fixture.human.auth().clone(), scope, budget()).unwrap();
     let final_thread = wait_idle(&fixture, &successor, &clean, &thread_id).await;
-    assert_eq!(final_thread.head, live.head.checked_next().unwrap());
+    assert_eq!(final_thread.head.get(), live.head.get() + 5);
     successor.shutdown();
     fixture
 }

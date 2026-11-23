@@ -260,40 +260,129 @@ async fn recall_packs_after_recipient_consent(
     use notarium_core::{auth::ChatAudience, classes::DocClass};
     use runtime_ability_cases::{approve_disclosure, loopback_provider};
     let allowed = NoteId::from_bytes([73; 16]);
-    for (tag, class, title) in [
-        (71, DocClass::AgentMemory, "Recallrank alpha"),
-        (72, DocClass::AgentMemory, "Recallrank bravo"),
-        (73, DocClass::UserDoc, "Available evidence"),
-    ] {
-        fixture
+    let mut creates = Vec::new();
+    for (tag, class, title, extra) in [
+        (
+            71,
+            DocClass::AgentMemory,
+            "Recallrank triorank alpha",
+            "triorank",
+        ),
+        (
+            72,
+            DocClass::AgentMemory,
+            "Recallrank triorank bravo",
+            "triorank",
+        ),
+        (73, DocClass::UserDoc, "Available evidence", "triorank"),
+    ]
+    .into_iter()
+    .chain((100..198).map(|tag| (tag, DocClass::AgentMemory, "Recallrank memory", "")))
+    {
+        creates.push(Mutation {
+            identity: CommandIdentity {
+                scope: space.scope().clone(),
+                actor: space.auth().principal().clone(),
+                key: CommandKey::from_bytes([tag; 16]),
+                hash: ContentDigest::from_bytes([tag; 32]),
+            },
+            preconditions: Preconditions::default(),
+            input: BatchItem::Create(CreateNote {
+                note: NoteId::from_bytes([tag; 16]),
+                parent: Some(project_id.clone()),
+                slug: format!("ranked-{tag}"),
+                class,
+                carrier: format!(
+                    "# {title}\n\nrecallrank {extra} {}\n",
+                    "evidence ".repeat(18)
+                ),
+                folder_page: false,
+            }),
+        });
+    }
+    let mut head = SpaceSeq::ZERO;
+    for items in creates.chunks(50) {
+        let batch = fixture
             .canonical
-            .create_note(
+            .accept_batch(
                 space.clone(),
-                Mutation {
-                    identity: CommandIdentity {
-                        scope: space.scope().clone(),
-                        actor: space.auth().principal().clone(),
-                        key: CommandKey::from_bytes([tag; 16]),
-                        hash: ContentDigest::from_bytes([tag; 32]),
-                    },
-                    preconditions: Preconditions::default(),
-                    input: CreateNote {
-                        note: NoteId::from_bytes([tag; 16]),
-                        parent: Some(project_id.clone()),
-                        slug: format!("ranked-{tag}"),
-                        class,
-                        carrier: format!("# {title}\n\nrecallrank {}\n", "evidence ".repeat(22)),
-                        folder_page: false,
-                    },
+                AcceptBatch {
+                    items: items.to_vec(),
                 },
             )
             .await
             .unwrap();
+        assert!(batch.items.iter().all(Result::is_ok), "{:?}", batch.items);
+        head = batch.committed_high_watermark;
     }
-    let query = json!({"query":"recallrank", "project":project});
-    let all = call(fixture, &fixture.human, 74, "search", query.clone())
+    let reads = fixture.projections.real.get().unwrap();
+    reads
+        .projection
+        .wait_for_projected(space.scope(), head, &budget())
         .await
         .unwrap();
+    let query = SearchQuery {
+        text: "recallrank".into(),
+        filter: notarium_core::query::FieldFilterAstV1 {
+            version: 1,
+            predicate: notarium_core::query::Predicate::All(vec![]),
+        },
+        classes: [DocClass::AgentMemory, DocClass::UserDoc].into(),
+        folder: Some(project_id.clone()),
+        causal: CausalBasis::Await(notarium_core::receipt::AwaitWatermarks::at(
+            space.scope().clone(),
+            head,
+        )),
+        include_chats: false,
+        top_k: PageLimit::new(200).unwrap(),
+        model: None,
+    };
+    let all = reads
+        .search
+        .search(space.clone(), query.clone())
+        .await
+        .unwrap();
+    assert_eq!(all.hits.len(), 101);
+    assert_eq!(
+        all.hits[100].card.document.provenance().reference().note_id,
+        allowed
+    );
+    assert!(!all.truncated);
+
+    struct OnlyClass(DocClass);
+    impl SearchRecipient for OnlyClass {
+        fn admit<'a>(
+            &'a self,
+            card: &'a notarium_core::classes::ClassifiedMetadata,
+        ) -> PortFuture<'a, bool> {
+            Box::pin(async move { Ok(card.class() == self.0) })
+        }
+    }
+    let first = SearchQuery {
+        text: "triorank".into(),
+        top_k: PageLimit::new(1).unwrap(),
+        ..query
+    };
+    for (class, has_more) in [(DocClass::UserDoc, false), (DocClass::AgentMemory, true)] {
+        let admitted = reads
+            .search
+            .search_for(space.clone(), first.clone(), Some(&OnlyClass(class)))
+            .await
+            .unwrap();
+        assert_eq!(admitted.hits.len(), 1);
+        assert_eq!(admitted.hits[0].card.document.provenance().class(), class);
+        assert_eq!(admitted.truncated, has_more);
+    }
+
+    let all = call(
+        fixture,
+        &fixture.human,
+        74,
+        "search",
+        json!({"query":"triorank", "project":project}),
+    )
+    .await
+    .unwrap();
     let ranked = all.structured_content["results"].as_array().unwrap();
     assert_eq!(ranked.len(), 3);
     assert_eq!(ranked[2]["noteId"], json!(allowed));
@@ -323,12 +412,11 @@ async fn recall_packs_after_recipient_consent(
         )
         .unwrap();
     for (tag, name, field) in [(82, "search", "results"), (83, "recall", "sources")] {
-        let mut args = query.clone();
-        if name == "recall" {
-            args["depth"] = json!(0);
-            args["budgetTokens"] = json!(200);
-            args["maxPerSource"] = json!(100);
-        }
+        let args = if name == "recall" {
+            json!({"query":"recallrank", "project":project, "depth":0, "budgetTokens":200, "maxPerSource":100})
+        } else {
+            json!({"query":"triorank", "project":project, "limit":1})
+        };
         let result = local
             .registry
             .call_tool(
@@ -361,4 +449,38 @@ async fn recall_packs_after_recipient_consent(
             assert!((100..=200).contains(&tokens), "{result}");
         }
     }
+
+    // A retained search cut still applies the current folder boundary after a move.
+    fixture
+        .canonical
+        .move_note(
+            space.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: space.scope().clone(),
+                    actor: space.auth().principal().clone(),
+                    key: CommandKey::from_bytes([84; 16]),
+                    hash: ContentDigest::from_bytes([84; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: MoveNote {
+                    note: allowed.clone(),
+                    parent: None,
+                    slug: "moved-evidence".into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let metadata = fixture
+        .canonical
+        .read_search_candidate_metadata(space, head, vec![allowed.clone()])
+        .await
+        .unwrap();
+    let moved = metadata[&allowed].provenance();
+    assert_eq!(moved.current_project(), None);
+    assert!(!moved.in_project(&FolderRef {
+        space_id: space.scope().space_id.clone(),
+        folder_id: project_id.clone()
+    }));
 }

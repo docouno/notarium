@@ -14,11 +14,17 @@ use notarium_canonical::{
     runtime::{CreateFolderSpec, CreateSpaceSpec},
 };
 use notarium_core::{
-    auth::{SpaceGrant, SpaceKind, SpaceRole},
+    auth::{
+        AuthenticatedCredential, ChatAudience, EngineAuthContext, SpaceGrant, SpaceKind, SpaceRole,
+        VerifiedHuman,
+    },
     classes::DocClass,
     epoch::{DataRoot, SearchIndexKind},
     error::PortError,
-    ids::{ChatThreadId, FolderId, LeaseEpoch, NoteId, SpaceSeq, ThreadEntrySeq},
+    ids::{
+        AgentRunId, ChatThreadId, FolderId, LeaseEpoch, NoteId, ScheduleId, SpaceSeq,
+        ThreadEntrySeq,
+    },
     model::{HistoryScope, Lifecycle},
     ports::{
         AppendChat, ChatEntryKind, ChatInputBody, ChatPort, ChatRead, ChatThreadKind, CreateChat,
@@ -1315,6 +1321,36 @@ async fn chat_candidate_visibility(store: Arc<CanonicalStore>, root: DataRoot) {
     );
     let shared = ChatThreadId::from_bytes([0x67; 16]);
     let movable = ChatThreadId::from_bytes([0x6a; 16]);
+    let log = ChatThreadId::from_bytes([0x6b; 16]);
+    let run = AgentRunId::from_bytes([0x59; 16]);
+    let keeper = EngineAuthContext::for_human(
+        VerifiedHuman::attest(
+            other.clone(),
+            other_ctx.auth().grant().clone(),
+            other_ctx.auth().spaces().clone(),
+            false,
+        )
+        .with_credential(AuthenticatedCredential::ScheduledRun {
+            schedule: ScheduleId::from_bytes([0x59; 16]),
+            run: run.clone(),
+            lease,
+        }),
+    )
+    .for_keeper(
+        run.clone(),
+        space.scope.space_id.clone(),
+        None,
+        BTreeSet::new(),
+    )
+    .unwrap()
+    .with_verified_keeper_log(log.clone())
+    .unwrap();
+    let keeper = notarium_core::ports::SpaceContext::new(
+        keeper,
+        space.scope.clone(),
+        other_ctx.budget.clone(),
+    )
+    .unwrap();
     let mut last = SpaceSeq::ZERO;
     for (thread, ctx, kind, folder, body) in [
         (
@@ -1345,7 +1381,15 @@ async fn chat_candidate_visibility(store: Arc<CanonicalStore>, root: DataRoot) {
             Some(destination.clone()),
             "moveterm".to_owned(),
         ),
+        (
+            log.clone(),
+            &keeper,
+            ChatThreadKind::KeeperLog,
+            None,
+            "logterm".to_owned(),
+        ),
     ] {
+        let keeper_entry = kind == ChatThreadKind::KeeperLog;
         store
             .create_chat(
                 ctx.clone(),
@@ -1370,11 +1414,15 @@ async fn chat_candidate_visibility(store: Arc<CanonicalStore>, root: DataRoot) {
                     AppendChat {
                         tool_calls: Vec::new(),
                         interruption: None,
-                        provenance: None,
+                        provenance: keeper_entry.then(Default::default),
                         proposed_diff: None,
                         thread,
                         parent: ThreadEntrySeq::ZERO,
-                        kind: ChatEntryKind::Human,
+                        kind: if keeper_entry {
+                            ChatEntryKind::Model
+                        } else {
+                            ChatEntryKind::Human
+                        },
                         body: ChatInputBody::Text(body),
                         referenced_notes: Vec::new(),
                         tainted: false,
@@ -1410,28 +1458,22 @@ async fn chat_candidate_visibility(store: Arc<CanonicalStore>, root: DataRoot) {
     let other_results = engine.search(other_ctx.clone(), req.clone()).await.unwrap();
     assert_eq!(other_results.chat_hits[0].kind, ChatThreadKind::Personal);
     let private = &other_results.chat_hits[0];
-    let run = notarium_core::ids::AgentRunId::from_bytes([0x59; 16]);
-    for confined in [
-        other_ctx
-            .auth()
-            .for_agent_run(
-                run.clone(),
-                space.scope.space_id.clone(),
-                notarium_core::auth::ChatAudience::Shared,
-                other_ctx.auth().spaces().clone(),
-            )
-            .unwrap(),
-        other_ctx
-            .auth()
-            .for_keeper(run, space.scope.space_id.clone(), None, BTreeSet::new())
-            .unwrap(),
-    ] {
-        let ctx = notarium_core::ports::SpaceContext::new(
-            confined,
-            space.scope.clone(),
-            other_ctx.budget.clone(),
+    let shared_run = other_ctx
+        .auth()
+        .for_agent_run(
+            run,
+            space.scope.space_id.clone(),
+            ChatAudience::Shared,
+            other_ctx.auth().spaces().clone(),
         )
         .unwrap();
+    let shared_run = notarium_core::ports::SpaceContext::new(
+        shared_run,
+        space.scope.clone(),
+        other_ctx.budget.clone(),
+    )
+    .unwrap();
+    for (ctx, expected) in [(shared_run, Some(&shared)), (keeper.clone(), None)] {
         let (rows, _) = store
             .hydrate_live_visible_chat_hits(
                 &ctx,
@@ -1442,10 +1484,20 @@ async fn chat_candidate_visibility(store: Arc<CanonicalStore>, root: DataRoot) {
             .unwrap();
         assert!(rows.is_empty());
         let results = engine.search(ctx, req.clone()).await.unwrap();
-        assert_eq!(results.chat_hits.len(), 1);
-        assert_eq!(results.chat_hits[0].thread, shared);
+        assert!(results.chat_hits.iter().map(|hit| &hit.thread).eq(expected));
         assert!(!results.truncated);
     }
+    let log_hits = engine
+        .search(
+            keeper,
+            SearchQuery {
+                text: "logterm".into(),
+                ..req.clone()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(log_hits.chat_hits.iter().map(|hit| &hit.thread).eq([&log]));
     let viewer = context_with_grant(
         &space.scope,
         &other,
@@ -2714,7 +2766,23 @@ async fn lexical_evidence_and_live_chat_pagination() {
         "delivering an earlier message records the new sticky thread taint"
     );
 
+    let fork = |actor: &notarium_core::ports::SpaceContext| {
+        mutation(
+            actor,
+            notarium_core::ports::ForkChat {
+                thread: thread.clone(),
+                parent: first,
+            },
+        )
+    };
+    assert!(ctx.auth().taint().is_tainted());
+    assert!(matches!(
+        store.fork_chat(ctx.clone(), fork(&ctx)).await,
+        Err(PortError::Domain(notarium_core::DomainError::ValidationFailed { diagnostic }))
+            if diagnostic.reason == notarium_core::error::ValidationReason::InvalidState
+    ));
     let fork_reader = context(&scope, &owner);
+    let fork_owner = context(&scope, &owner);
     carriers.hold_hydrated_chat.store(true, Ordering::SeqCst);
     let (mixed, ()) = tokio::join!(engine.search(fork_reader.clone(), mixed), async {
         tokio::time::timeout(Duration::from_secs(3), carriers.chat_held.notified())
@@ -2725,16 +2793,7 @@ async fn lexical_evidence_and_live_chat_pagination() {
             "preparing a snippet cannot taint its caller"
         );
         store
-            .fork_chat(
-                ctx.clone(),
-                mutation(
-                    &ctx,
-                    notarium_core::ports::ForkChat {
-                        thread,
-                        parent: first,
-                    },
-                ),
-            )
+            .fork_chat(fork_owner.clone(), fork(&fork_owner))
             .await
             .unwrap();
         carriers.release_chat.notify_one();

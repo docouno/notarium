@@ -157,17 +157,75 @@ async fn exercise(pg: bool) {
             name: "Project".into(),
         },
     );
-    let system = add(
+    let specific = Box::pin(resolution_and_preferences(
+        &fixture, &service, &ctx, &space, &project, &token,
+    ))
+    .await;
+    Box::pin(memory_targets_and_favorites(
+        &fixture, &service, &ctx, &space, &project,
+    ))
+    .await;
+
+    // Unhealthy and wrong-kind winners never fall back to a broader package.
+    fixture
+        .catalog
+        .ability_entries
+        .lock()
+        .unwrap()
+        .iter_mut()
+        .find(|v| v.reference == specific)
+        .unwrap()
+        .healthy = false;
+    assert!(matches!(
+        service
+            .resolve_ability(ctx.clone(), by_name(Some(project.clone())))
+            .await
+            .unwrap(),
+        AbilityResolution::Unhealthy
+    ));
+    {
+        let mut entries = fixture.catalog.ability_entries.lock().unwrap();
+        let value = entries
+            .iter_mut()
+            .find(|v| v.reference == specific)
+            .unwrap();
+        value.healthy = true;
+        value.kind = AbilityKind::Skill;
+    }
+    assert!(matches!(
+        service
+            .resolve_ability(ctx.clone(), by_name(Some(project.clone())))
+            .await
+            .unwrap(),
+        AbilityResolution::WrongKind
+    ));
+    add(
         &fixture,
         &space,
-        AbilityPlacement::System,
-        1,
+        AbilityPlacement::OwnedProject(project.clone()),
+        6,
         "guide",
-        vec![],
+        vec![project.folder_id.clone()],
     );
+    assert!(
+        matches!(service.resolve_ability(ctx.clone(), by_name(Some(project))).await, Err(PortError::Domain(DomainError::ValidationFailed { diagnostic })) if diagnostic.reason == ValidationReason::InvalidState)
+    );
+    drop(service);
+    fixture.close().await;
+}
+
+async fn resolution_and_preferences(
+    fixture: &Fixture,
+    service: &ControlService,
+    ctx: &AccountContext,
+    space: &Space,
+    project: &FolderRef,
+    token: &SecretString,
+) -> AbilityRef {
+    let system = add(fixture, space, AbilityPlacement::System, 1, "guide", vec![]);
     let personal = add(
-        &fixture,
-        &space,
+        fixture,
+        space,
         AbilityPlacement::OwnedPersonal(ctx.auth().principal().clone()),
         2,
         "guide",
@@ -175,24 +233,24 @@ async fn exercise(pg: bool) {
     );
     // Ambiguity below the effective winning level must not hide that winner.
     add(
-        &fixture,
-        &space,
+        fixture,
+        space,
         AbilityPlacement::OwnedPersonal(ctx.auth().principal().clone()),
         7,
         "guide",
         vec![],
     );
     let scoped = add(
-        &fixture,
-        &space,
+        fixture,
+        space,
         AbilityPlacement::OwnedSpace(space.id.clone()),
         3,
         "guide",
         vec![],
     );
     let specific = add(
-        &fixture,
-        &space,
+        fixture,
+        space,
         AbilityPlacement::OwnedProject(project.clone()),
         4,
         "guide",
@@ -237,7 +295,7 @@ async fn exercise(pg: bool) {
     }
     assert_eq!(found, vec![scoped.clone()]);
     let disabled = AccountMutation {
-        identity: identity(&service, &ctx, 10).await,
+        identity: identity(service, ctx, 10).await,
         input: AbilityBindingUpdate {
             ability: scoped.clone(),
             enabled: false,
@@ -280,7 +338,7 @@ async fn exercise(pg: bool) {
             .update_ability_binding(
                 plain.clone(),
                 AccountMutation {
-                    identity: identity(&service, &plain, 11).await,
+                    identity: identity(service, &plain, 11).await,
                     input: AbilityBindingUpdate {
                         ability: scoped.clone(),
                         enabled: true,
@@ -296,7 +354,7 @@ async fn exercise(pg: bool) {
         .update_ability_binding(
             ctx.clone(),
             AccountMutation {
-                identity: identity(&service, &ctx, 12).await,
+                identity: identity(service, ctx, 12).await,
                 input: AbilityBindingUpdate {
                     ability: scoped.clone(),
                     enabled: true,
@@ -328,7 +386,7 @@ async fn exercise(pg: bool) {
         .start_or_resume_episode(
             ctx.clone(),
             AccountMutation {
-                identity: identity(&service, &ctx, 150).await,
+                identity: identity(service, ctx, 150).await,
                 input: StartEpisode {
                     selector: EpisodeSelector::New {
                         requested: EpisodeId::from_bytes([150; 16]),
@@ -348,7 +406,7 @@ async fn exercise(pg: bool) {
         .update_episode(
             ctx.clone(),
             AccountMutation {
-                identity: identity(&service, &ctx, 151).await,
+                identity: identity(service, ctx, 151).await,
                 input: EpisodeUpdate {
                     episode: selected_episode.id,
                     expected: selected_episode.revision,
@@ -401,7 +459,7 @@ async fn exercise(pg: bool) {
         .set_ability_preference(
             plain.clone(),
             AccountMutation {
-                identity: identity(&service, &plain, 13).await,
+                identity: identity(service, &plain, 13).await,
                 input: AbilityPreferenceUpdate {
                     ability: system.clone(),
                     enabled: false,
@@ -427,7 +485,7 @@ async fn exercise(pg: bool) {
         .set_ability_preference(
             plain.clone(),
             AccountMutation {
-                identity: identity(&service, &plain, 14).await,
+                identity: identity(service, &plain, 14).await,
                 input: AbilityPreferenceUpdate {
                     ability: system.clone(),
                     enabled: true,
@@ -455,8 +513,8 @@ async fn exercise(pg: bool) {
     );
 
     let destination = add(
-        &fixture,
-        &space,
+        fixture,
+        space,
         AbilityPlacement::OwnedPersonal(ctx.auth().principal().clone()),
         5,
         "moved",
@@ -466,7 +524,7 @@ async fn exercise(pg: bool) {
         .set_ability_trail(
             ctx.clone(),
             AccountMutation {
-                identity: identity(&service, &ctx, 20).await,
+                identity: identity(service, ctx, 20).await,
                 input: AbilityTrailUpdate {
                     source: personal.clone(),
                     expected_destination: None,
@@ -497,7 +555,7 @@ async fn exercise(pg: bool) {
             .set_ability_trail(
                 ctx.clone(),
                 AccountMutation {
-                    identity: identity(&service, &ctx, 21).await,
+                    identity: identity(service, ctx, 21).await,
                     input: AbilityTrailUpdate {
                         source: destination.clone(),
                         expected_destination: None,
@@ -512,7 +570,7 @@ async fn exercise(pg: bool) {
         .set_ability_trail(
             ctx.clone(),
             AccountMutation {
-                identity: identity(&service, &ctx, 22).await,
+                identity: identity(service, ctx, 22).await,
                 input: AbilityTrailUpdate {
                     source: personal.clone(),
                     expected_destination: Some(destination),
@@ -553,7 +611,16 @@ async fn exercise(pg: bool) {
             .unwrap(),
         AbilityResolution::Stale
     ));
+    specific
+}
 
+async fn memory_targets_and_favorites(
+    fixture: &Fixture,
+    service: &ControlService,
+    ctx: &AccountContext,
+    space: &Space,
+    project: &FolderRef,
+) {
     // Fixed memory targets are idempotent, scoped and checked before canonical creation.
     let target = MemoryTarget::User {
         owner: ctx.auth().principal().clone(),
@@ -641,7 +708,7 @@ async fn exercise(pg: bool) {
             .set_favorite(
                 ctx.clone(),
                 AccountMutation {
-                    identity: identity(&service, &ctx, key).await,
+                    identity: identity(service, ctx, key).await,
                     input: SetFavorite {
                         reference,
                         saved: true,
@@ -674,7 +741,7 @@ async fn exercise(pg: bool) {
         .acknowledge_delta(
             ctx.clone(),
             AccountMutation {
-                identity: identity(&service, &ctx, 34).await,
+                identity: identity(service, ctx, 34).await,
                 input: AcknowledgeDelta {
                     owner: AckOwner::Account,
                     delivered: ChangeCursor {
@@ -760,7 +827,7 @@ async fn exercise(pg: bool) {
         .set_favorite(
             ctx.clone(),
             AccountMutation {
-                identity: identity(&service, &ctx, 33).await,
+                identity: identity(service, ctx, 33).await,
                 input: SetFavorite {
                     reference: FavoriteRef::Note(one.note),
                     saved: false,
@@ -774,53 +841,6 @@ async fn exercise(pg: bool) {
         matches!(service.list_favorites(ctx.clone(), ControlPageRequest::new(1, old_page.continuation).unwrap()).await,
         Err(PortError::Domain(DomainError::ValidationFailed { diagnostic })) if diagnostic.reason == ValidationReason::CursorStale)
     );
-
-    // Unhealthy and wrong-kind winners never fall back to a broader package.
-    fixture
-        .catalog
-        .ability_entries
-        .lock()
-        .unwrap()
-        .iter_mut()
-        .find(|v| v.reference == specific)
-        .unwrap()
-        .healthy = false;
-    assert!(matches!(
-        service
-            .resolve_ability(ctx.clone(), by_name(Some(project.clone())))
-            .await
-            .unwrap(),
-        AbilityResolution::Unhealthy
-    ));
-    {
-        let mut entries = fixture.catalog.ability_entries.lock().unwrap();
-        let value = entries
-            .iter_mut()
-            .find(|v| v.reference == specific)
-            .unwrap();
-        value.healthy = true;
-        value.kind = AbilityKind::Skill;
-    }
-    assert!(matches!(
-        service
-            .resolve_ability(ctx.clone(), by_name(Some(project.clone())))
-            .await
-            .unwrap(),
-        AbilityResolution::WrongKind
-    ));
-    add(
-        &fixture,
-        &space,
-        AbilityPlacement::OwnedProject(project.clone()),
-        6,
-        "guide",
-        vec![project.folder_id.clone()],
-    );
-    assert!(
-        matches!(service.resolve_ability(ctx.clone(), by_name(Some(project))).await, Err(PortError::Domain(DomainError::ValidationFailed { diagnostic })) if diagnostic.reason == ValidationReason::InvalidState)
-    );
-    drop(service);
-    fixture.close().await;
 }
 #[tokio::test]
 async fn sqlite_ability_resolution_and_memory() {

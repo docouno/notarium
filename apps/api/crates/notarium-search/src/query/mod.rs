@@ -19,7 +19,7 @@ use notarium_core::{
     ids::{FolderId, NoteId, PrincipalId},
     model::{DenseNodeId, FolderRef, SnapshotCut},
     ports::{
-        PortFuture, RecallQuery, RecallRecipient, SearchDegradation, SearchPort, SearchQuery,
+        PortFuture, RecallQuery, SearchDegradation, SearchPort, SearchQuery, SearchRecipient,
         SearchResult, SpaceContext, StructuralSnapshot,
     },
     query::Predicate,
@@ -27,23 +27,40 @@ use notarium_core::{
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 #[derive(Clone, Copy)]
-struct Recall<'a> {
-    recipient: Option<&'a dyn RecallRecipient>,
+struct Recall {
     graph_depth: u8,
     tokens: u32,
     max_per_source: Option<u16>,
 }
 
+#[derive(Clone, Copy)]
+struct QueryDelivery<'a> {
+    recall: Option<Recall>,
+    recipient: Option<&'a dyn SearchRecipient>,
+}
+
 impl SearchPort for SearchEngine {
-    fn search(&self, ctx: SpaceContext, request: SearchQuery) -> PortFuture<'_, SearchResult> {
-        Box::pin(self.run_query(ctx, request, None))
+    fn search_for<'a>(
+        &'a self,
+        ctx: SpaceContext,
+        request: SearchQuery,
+        recipient: Option<&'a dyn SearchRecipient>,
+    ) -> PortFuture<'a, SearchResult> {
+        Box::pin(self.run_query(
+            ctx,
+            request,
+            QueryDelivery {
+                recall: None,
+                recipient,
+            },
+        ))
     }
 
     fn recall_for<'a>(
         &'a self,
         ctx: SpaceContext,
         request: RecallQuery,
-        recipient: Option<&'a dyn RecallRecipient>,
+        recipient: Option<&'a dyn SearchRecipient>,
     ) -> PortFuture<'a, SearchResult> {
         Box::pin(async move {
             if request.graph_depth > RecallQuery::MAX_GRAPH_DEPTH {
@@ -55,12 +72,14 @@ impl SearchPort for SearchEngine {
             self.run_query(
                 ctx,
                 request.query,
-                Some(Recall {
+                QueryDelivery {
+                    recall: Some(Recall {
+                        graph_depth: request.graph_depth,
+                        tokens: request.token_budget,
+                        max_per_source: request.max_per_source,
+                    }),
                     recipient,
-                    graph_depth: request.graph_depth,
-                    tokens: request.token_budget,
-                    max_per_source: request.max_per_source,
-                }),
+                },
             )
             .await
         })
@@ -72,11 +91,11 @@ impl SearchEngine {
         &self,
         ctx: SpaceContext,
         request: SearchQuery,
-        recall: Option<Recall<'_>>,
+        delivery: QueryDelivery<'_>,
     ) -> Result<SearchResult, PortError> {
         let clock = Clock::new(&ctx.budget)?;
         clock
-            .within(self.query_at_cut(ctx, request, recall, &clock))
+            .within(self.query_at_cut(ctx, request, delivery, &clock))
             .await
     }
 
@@ -84,9 +103,10 @@ impl SearchEngine {
         &self,
         mut ctx: SpaceContext,
         request: SearchQuery,
-        recall: Option<Recall<'_>>,
+        delivery: QueryDelivery<'_>,
         clock: &Clock,
     ) -> Result<SearchResult, PortError> {
+        let recall = delivery.recall;
         let browse = request.text.trim().is_empty();
         let filtered = request.folder.is_some()
             || (!request.classes.is_empty() && request.classes != DocClass::all())
@@ -217,7 +237,7 @@ impl SearchEngine {
                 candidates,
                 tokenizer,
                 top_k,
-                recall,
+                delivery,
             })
             .await?;
         let (mut chat_hits, chat_truncated) = if let Some(state) =
@@ -263,7 +283,7 @@ impl SearchEngine {
                 &ctx,
                 clock,
                 hits,
-                recall,
+                delivery,
                 &mut chat_hits,
                 aligned.cut.canonical_seq,
             )

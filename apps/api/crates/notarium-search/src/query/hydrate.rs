@@ -1,4 +1,6 @@
-use super::{Eligible, Recall, align::Overlay, lexical_work_with_retry, ranking::Candidate};
+use super::{
+    Eligible, QueryDelivery, Recall, align::Overlay, lexical_work_with_retry, ranking::Candidate,
+};
 use crate::{
     embed::RemoteConservativeTokenizerBudget,
     engine::{Clock, Published, SearchEngine, internal},
@@ -31,7 +33,7 @@ pub(super) struct Hydration<'a> {
     pub candidates: Vec<Candidate>,
     pub tokenizer: &'a (dyn TokenizerBudget + Send + Sync),
     pub top_k: usize,
-    pub recall: Option<Recall<'a>>,
+    pub delivery: QueryDelivery<'a>,
 }
 
 impl SearchEngine {
@@ -48,23 +50,30 @@ impl SearchEngine {
             candidates,
             tokenizer,
             top_k,
-            recall,
+            delivery,
         } = task;
         let structural = &self.services.deps.structural;
-        let mut unmasked: Vec<Option<Candidate>> = candidates
+        let recipient = delivery
+            .recipient
+            .filter(|recipient| recipient.filters_notes());
+        let mut unmasked = candidates
             .into_iter()
-            .filter(|candidate| !overlay.get(&candidate.note).is_some_and(Option::is_none))
-            .map(Some)
-            .collect();
-        let mut selected_indices = Vec::with_capacity(top_k);
+            .filter(|candidate| !overlay.get(&candidate.note).is_some_and(Option::is_none));
+        let mut selected = Vec::with_capacity(top_k);
         let mut truncated = false;
-        let batch_size = (top_k.saturating_add(1)).clamp(32, 256);
-        let mut cursor = 0;
-        while cursor < unmasked.len() && !truncated {
-            let end = (cursor + batch_size).min(unmasked.len());
-            let ids: Vec<NoteId> = unmasked[cursor..end]
+        let batch_size = if recipient.is_some() {
+            (top_k + 1).clamp(32, 200)
+        } else {
+            (top_k + 1).clamp(32, 256)
+        };
+        'pages: loop {
+            let batch: Vec<_> = unmasked.by_ref().take(batch_size).collect();
+            if batch.is_empty() {
+                break;
+            }
+            let ids: Vec<_> = batch
                 .iter()
-                .filter_map(|slot| slot.as_ref().map(|candidate| candidate.note.clone()))
+                .map(|candidate| candidate.note.clone())
                 .collect();
             let mut check_ctx = context.clone();
             check_ctx.budget = clock.remaining()?;
@@ -72,22 +81,50 @@ impl SearchEngine {
             if flags.len() != ids.len() {
                 return Err(internal("projection_live_batch"));
             }
-            for (offset, visible) in flags.into_iter().enumerate() {
-                if !visible {
-                    continue;
+            let visible: Vec<_> = batch
+                .into_iter()
+                .zip(flags)
+                .filter_map(|(candidate, visible)| visible.then_some(candidate))
+                .collect();
+            let mut metadata = BTreeMap::new();
+            if recipient.is_some() {
+                let projected: Vec<_> = visible
+                    .iter()
+                    .filter(|candidate| !overlay.contains_key(&candidate.note))
+                    .map(|candidate| candidate.note.clone())
+                    .collect();
+                if !projected.is_empty() {
+                    check_ctx.budget = clock.remaining()?;
+                    metadata = self
+                        .services
+                        .deps
+                        .canonical
+                        .read_search_candidate_metadata(&check_ctx, cut.projected_seq, projected)
+                        .await?;
                 }
-                if selected_indices.len() == top_k {
-                    truncated = true;
-                    break;
-                }
-                selected_indices.push(cursor + offset);
             }
-            cursor = end;
+            for candidate in visible {
+                if let Some(recipient) = recipient {
+                    let card = match overlay.get(&candidate.note) {
+                        Some(Some(row)) => ClassEgressFence::search_metadata(
+                            row.document.metadata(),
+                            context.auth(),
+                        )
+                        .ok(),
+                        _ => metadata.remove(&candidate.note),
+                    };
+                    let Some(card) = card else { continue };
+                    if !recipient.admit(card.provenance()).await? {
+                        continue;
+                    }
+                }
+                if selected.len() == top_k {
+                    truncated = true;
+                    break 'pages;
+                }
+                selected.push(candidate);
+            }
         }
-        let selected: Vec<Candidate> = selected_indices
-            .into_iter()
-            .filter_map(|index| unmasked[index].take())
-            .collect();
         if selected.is_empty() {
             return Ok((Vec::new(), truncated));
         }
@@ -141,11 +178,6 @@ impl SearchEngine {
             let Some(card) = cards.remove(&candidate.note) else {
                 continue;
             };
-            if let Some(recipient) = recall.and_then(|recall| recall.recipient)
-                && !recipient.admit(card.document.provenance()).await?
-            {
-                continue;
-            }
             ordered.push((candidate, card));
         }
         if ordered.is_empty() {
@@ -209,7 +241,11 @@ impl SearchEngine {
                 continue;
             };
             let descriptors = hit_chunks(&candidate, &content, tokenizer, &mut relevance, clock)?;
-            let maximum = if recall.is_some() { usize::MAX } else { 3 };
+            let maximum = if delivery.recall.is_some() {
+                usize::MAX
+            } else {
+                3
+            };
             let chunks = descriptors
                 .into_iter()
                 .take(maximum)
@@ -232,7 +268,7 @@ impl SearchEngine {
         ctx: &SpaceContext,
         clock: &Clock,
         hits: Vec<SearchHit>,
-        recall: Option<Recall<'_>>,
+        delivery: QueryDelivery<'_>,
         chats: &mut Vec<ChatSearchHit>,
         mut visibility_head: SpaceSeq,
     ) -> Result<(Vec<SearchHit>, bool), PortError> {
@@ -279,7 +315,9 @@ impl SearchEngine {
             .zip(flags)
             .filter_map(|(hit, ok)| ok.then_some(hit))
             .collect();
-        let truncated = recall.is_some_and(|recall| pack(&mut visible, recall));
+        let truncated = delivery
+            .recall
+            .is_some_and(|recall| pack(&mut visible, recall, delivery.recipient));
         let mut any_tainted = false;
         chats.retain(|chat| {
             if let Some(&tainted) = chat_admission
@@ -455,7 +493,11 @@ fn hit_chunks(
     Ok(ranked.into_iter().map(|(_, chunk)| chunk).collect())
 }
 
-fn pack(hits: &mut Vec<SearchHit>, recall: Recall<'_>) -> bool {
+fn pack(
+    hits: &mut Vec<SearchHit>,
+    recall: Recall,
+    recipient: Option<&dyn notarium_core::ports::SearchRecipient>,
+) -> bool {
     let had_chunks: Vec<bool> = hits.iter().map(|hit| !hit.chunks.is_empty()).collect();
     let mut remaining = recall.tokens;
     let cap = recall.max_per_source.map_or(remaining, u32::from);
@@ -465,7 +507,7 @@ fn pack(hits: &mut Vec<SearchHit>, recall: Recall<'_>) -> bool {
         .map(|hit| vec![false; hit.chunks.len()])
         .collect();
     let framing = |hit: &SearchHit, first| {
-        recall.recipient.map_or(0, |recipient| {
+        recipient.map_or(0, |recipient| {
             recipient.framing_tokens(&hit.card.document.provenance().reference().note_id, first)
         })
     };

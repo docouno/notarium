@@ -781,35 +781,28 @@ impl ViewGraphPort for TestEngine {
 }
 
 impl SearchPort for TestEngine {
-    fn search(&self, ctx: SpaceContext, request: SearchQuery) -> PortFuture<'_, SearchResult> {
+    fn search_for<'a>(
+        &'a self,
+        ctx: SpaceContext,
+        request: SearchQuery,
+        recipient: Option<&'a dyn SearchRecipient>,
+    ) -> PortFuture<'a, SearchResult> {
         if let Some(real) = self.1.real.get() {
-            return real.search.search(ctx, request);
+            return real.search.search_for(ctx, request, recipient);
         }
-        Box::pin(async move { self.retrieve(&ctx, request).await })
+        Box::pin(async move { self.retrieve(&ctx, request, recipient).await })
     }
 
     fn recall_for<'a>(
         &'a self,
         ctx: SpaceContext,
         request: RecallQuery,
-        recipient: Option<&'a dyn RecallRecipient>,
+        recipient: Option<&'a dyn SearchRecipient>,
     ) -> PortFuture<'a, SearchResult> {
         if let Some(real) = self.1.real.get() {
             return real.search.recall_for(ctx, request, recipient);
         }
-        Box::pin(async move {
-            let mut result = self.retrieve(&ctx, request.query).await?;
-            if let Some(recipient) = recipient {
-                let mut admitted = Vec::new();
-                for hit in result.hits {
-                    if recipient.admit(hit.card.document.provenance()).await? {
-                        admitted.push(hit);
-                    }
-                }
-                result.hits = admitted;
-            }
-            Ok(result)
-        })
+        Box::pin(async move { self.retrieve(&ctx, request.query, recipient).await })
     }
 }
 
@@ -996,9 +989,11 @@ impl TestEngine {
         &self,
         ctx: &SpaceContext,
         request: SearchQuery,
+        recipient: Option<&dyn SearchRecipient>,
     ) -> Result<SearchResult, notarium_core::error::PortError> {
         let fixture = self.1.current(ctx).ok_or(DomainError::ResourceNotFound)?;
         let mut hits = Vec::new();
+        let recipient = recipient.filter(|recipient| recipient.filters_notes());
         if request.text == "runtime fixture" {
             for note in fixture.notes {
                 let (card, snapshot) = self.card(ctx, note).await?;
@@ -1008,6 +1003,11 @@ impl TestEngine {
                         folder_id: folder.clone(),
                     })
                 }) {
+                    continue;
+                }
+                if let Some(recipient) = recipient
+                    && !recipient.admit(card.document.provenance()).await?
+                {
                     continue;
                 }
                 let carrier = snapshot.document.explicit_read(ctx.auth())?.to_owned();

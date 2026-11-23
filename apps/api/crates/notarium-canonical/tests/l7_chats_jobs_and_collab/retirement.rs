@@ -1210,6 +1210,16 @@ async fn detached_sqlite_startup_retires_an_interrupted_current_epoch_upload() {
         )
         .await
         .unwrap();
+    let run = sample_run_id(0xea);
+    claim_run(
+        &store,
+        ctx.clone(),
+        ChatAudience::Personal,
+        &thread,
+        &run,
+        ThreadEntrySeq::ZERO,
+    )
+    .await;
     let body = "current-epoch private queue upload ".repeat(32);
     let prepared = store.prepare_blob(body.as_bytes()).unwrap();
     let (reached, uploaded) = tokio::sync::oneshot::channel();
@@ -1231,7 +1241,7 @@ async fn detached_sqlite_startup_retires_an_interrupted_current_epoch_upload() {
                 sender: actor.clone(),
                 body,
                 queued_base_leaf: ThreadEntrySeq::ZERO,
-                in_flight_run: sample_run_id(0xea),
+                in_flight_run: run,
                 mentions_agent: false,
             },
         ),

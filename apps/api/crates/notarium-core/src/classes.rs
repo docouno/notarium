@@ -59,16 +59,19 @@ impl DocumentFacts {
         std::iter::once(&self.recorded).chain(self.current.as_deref().map(|(facts, _)| facts))
     }
 
+    fn current(&self) -> &ResourceFacts {
+        self.current
+            .as_deref()
+            .map_or(&self.recorded, |(facts, _)| facts)
+    }
+
     fn note_origin(
         &self,
         reference: &NoteRef,
         revision: &RevisionId,
         digest: ContentDigest,
     ) -> ProviderOrigin {
-        let current = self
-            .current
-            .as_deref()
-            .map_or(&self.recorded, |(facts, _)| facts);
+        let current = self.current();
         ProviderOrigin::Note {
             reference: reference.clone(),
             revision: revision.clone(),
@@ -204,6 +207,20 @@ impl ClassifiedMetadata {
     pub fn origin(&self) -> ProviderOrigin {
         self.facts
             .note_origin(&self.reference, &self.revision, self.digest)
+    }
+    pub fn current_class(&self) -> DocClass {
+        self.facts.current().class
+    }
+    /// The nearest project in the current facts bound by the canonical reader.
+    pub fn current_project(&self) -> Option<FolderRef> {
+        self.facts
+            .current()
+            .project
+            .clone()
+            .map(|folder_id| FolderRef {
+                space_id: self.reference.space_id.clone(),
+                folder_id,
+            })
     }
     pub fn in_project(&self, project: &FolderRef) -> bool {
         self.facts.in_project(project)
