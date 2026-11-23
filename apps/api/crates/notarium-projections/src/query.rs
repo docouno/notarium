@@ -627,6 +627,7 @@ pub struct Selection {
     pub has_more: bool,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub async fn select_window(input: WindowInput<'_>) -> Result<Selection, PortError> {
     select_view_window(input, None, None).await
 }

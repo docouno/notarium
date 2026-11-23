@@ -2549,6 +2549,7 @@ async fn folder_moves_preserve_the_current_full_sweep_cursor() {
         &mut publisher,
         move_cursor.clone(),
         vec![Change {
+            provenance: None,
             cursor: move_cursor,
             command_range: CommandSeqRange::new(seq2, seq2).unwrap(),
             entity: EntityId::Folder(moved_folder.clone()),
@@ -2580,6 +2581,7 @@ async fn folder_moves_preserve_the_current_full_sweep_cursor() {
         &mut publisher,
         restore_cursor.clone(),
         vec![Change {
+            provenance: None,
             cursor: restore_cursor,
             command_range: CommandSeqRange::new(seq3, seq3).unwrap(),
             entity: EntityId::Folder(moved_folder),
