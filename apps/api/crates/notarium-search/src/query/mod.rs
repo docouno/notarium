@@ -257,12 +257,10 @@ impl SearchEngine {
             ranking::expand(
                 &mut candidates,
                 snapshot.as_ref(),
-                self.services.deps.structural.as_ref(),
-                &ctx,
-                clock,
+                self,
+                &mut admission,
                 &filter,
                 &request.filter.predicate,
-                &aligned.overlay,
                 recall.graph_depth,
             )
             .await?

@@ -591,33 +591,68 @@ async fn fenced_ownership_recovers_pending_inputs(
         model: Some(local.model),
         ..ChatRunOptions::default()
     };
-    let stopping = AgentRunSupervisor::new_clustered(
-        local.registry,
-        fixture.revocations.clone(),
-        authority.clone(),
-    );
-    let (entered, resume) = authority.pause_next_owner();
-    let recovery = tokio::spawn({
-        let supervisor = stopping.clone();
-        let account = fixture.human.clone();
-        let request = request(live.head, options.clone());
-        async move { supervisor.start(account, request).await }
-    });
-    let token = timeout(Duration::from_secs(10), entered)
-        .await
-        .unwrap()
-        .unwrap();
-    stopping.shutdown();
-    resume.send(()).unwrap();
-    assert!(recovery.await.unwrap().is_err());
-    assert!(token.is_cancelled());
-    assert_eq!(
-        thread(&fixture, reader, &thread_id)
+    enum StopDuring {
+        RegisterOwner,
+        ReadBranch,
+        RecoverInSql,
+    }
+    for phase in [
+        StopDuring::RegisterOwner,
+        StopDuring::ReadBranch,
+        StopDuring::RecoverInSql,
+    ] {
+        let stopping = AgentRunSupervisor::new_clustered(
+            local.registry.clone(),
+            fixture.revocations.clone(),
+            authority.clone(),
+        );
+        let (entered, resume) = authority.pause_next_owner();
+        let recovery = tokio::spawn({
+            let supervisor = stopping.clone();
+            let account = fixture.human.clone();
+            let request = request(live.head, options.clone());
+            async move { supervisor.start(account, request).await }
+        });
+        let owner_token = timeout(Duration::from_secs(10), entered)
             .await
-            .active_run
-            .as_ref(),
-        Some(&abandoned)
-    );
+            .unwrap()
+            .unwrap();
+        let next_pause = match phase {
+            StopDuring::RegisterOwner => None,
+            StopDuring::ReadBranch => Some(fixture.projections.pause_chat_read()),
+            StopDuring::RecoverInSql => Some(fixture.projections.pause_active_sql_effect()),
+        };
+        let (operation_token, release) = if let Some((entered, release)) = next_pause {
+            resume.send(()).unwrap();
+            let token = timeout(Duration::from_secs(10), entered)
+                .await
+                .unwrap()
+                .unwrap();
+            (token, release)
+        } else {
+            (owner_token.clone(), resume)
+        };
+        stopping.shutdown();
+        assert!(owner_token.is_cancelled());
+        assert!(operation_token.is_cancelled());
+        release.send(()).unwrap();
+        assert!(recovery.await.unwrap().is_err());
+        assert_eq!(
+            thread(&fixture, reader, &thread_id)
+                .await
+                .active_run
+                .as_ref(),
+            Some(&abandoned)
+        );
+        assert_eq!(
+            fixture
+                .canonical
+                .read_verified_blob(&scope, digest)
+                .await
+                .unwrap(),
+            body.as_bytes()
+        );
+    }
 
     let next = successor
         .start(fixture.human.clone(), request(live.head, options.clone()))

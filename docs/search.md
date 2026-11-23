@@ -46,16 +46,20 @@ before shutting down canonical storage.
   When present, the existing structural mask plus the receipt overlay bounds
   this collection without reducing its ordinary chunk depth. An additional
   distinct strict or vector match marks the typed result truncated. An extra
-  weak match marks it truncated while the fallback floor is still unfilled. Provider-facing tools omit this flag and
-  hidden counts. The larger window reuses the same query embedding. Ordinary
+  weak match marks it truncated while the fallback floor is still unfilled.
+  Provider-facing tools omit this flag and hidden counts. The larger window reuses the same query embedding. Ordinary
   search and recall retain their `max(100, 4 * top_k)` candidate limits.
 - The hybrid path fuses lexical and vector ranks with reciprocal rank fusion
   (`k = 60`). The vector branch ranks each note by its best matching chunk
   and also retains the leading chunks for recall. Recall can expand the
-  top 16 notes through up to three graph hops. Each visit reads bounded
-  incoming and outgoing pages and expands at most 64 distinct neighbors.
-  All seeds and hops share 1,040 node visits and the request deadline.
-  An unfinished frontier marks the result truncated. Recall serves the best
+  top 16 notes through up to three graph hops. For a provider recipient,
+  only admitted notes with graph nodes count toward the 16 seeds. Each
+  visit reads up to 64 neighbors per direction. Up to 64 distinct admitted
+  neighbors determine the degree penalty and can receive a boost or become
+  the next frontier. Across all hops, the provider search checks up to 1,040
+  additional distinct neighbors for admission. All seeds and hops share
+  1,040 node visits and the request deadline. Work beyond either cap marks
+  the typed result truncated. Recall serves the best
   eligible chunk per note first, then fills the remaining token budget while
   respecting the optional per-note token limit. Lexical fallback ranks chunks by matching
   phrases and normalized terms. Each chunk carries canonical source spans.

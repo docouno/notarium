@@ -196,8 +196,22 @@ struct SupervisorState {
 #[derive(Default)]
 struct ThreadRuns {
     gates: BTreeMap<ThreadKey, Weak<AsyncMutex<()>>>,
+    admitting: BTreeMap<AgentRunId, Cancellation>,
     active: BTreeMap<ThreadKey, Arc<ActiveRun>>,
     streams: BTreeMap<ScopedThreadKey, Vec<Weak<StepStreamBuffer>>>,
+}
+
+/// Track the candidate while its predecessor remains active during admission.
+struct RunAdmission<'a> {
+    threads: &'a Mutex<ThreadRuns>,
+    run: &'a AgentRunId,
+}
+
+impl Drop for RunAdmission<'_> {
+    fn drop(&mut self) {
+        let mut threads = self.threads.lock().expect("thread registry lock");
+        threads.admitting.remove(self.run);
+    }
 }
 
 struct ActiveRun {
@@ -550,6 +564,9 @@ impl AgentRunSupervisor {
     pub fn shutdown(&self) {
         self.inner.shutdown.cancel();
         let state = self.inner.threads.lock().expect("thread registry lock");
+        for cancellation in state.admitting.values() {
+            cancellation.cancel();
+        }
         for run in state.active.values() {
             run.cancellation.cancel();
         }
@@ -768,6 +785,17 @@ impl AgentRunSupervisor {
             cancellation.clone(),
             sender,
         )?;
+        let registration = {
+            let mut threads = self.inner.threads.lock().expect("thread registry lock");
+            if self.inner.shutdown.is_cancelled() {
+                return Ok(LaunchOutcome::Settled(owner_unavailable()));
+            }
+            threads.admitting.insert(run.clone(), cancellation.clone());
+            RunAdmission {
+                threads: &self.inner.threads,
+                run: &run,
+            }
+        };
         let owner = match &self.inner.coordination {
             Coordination::Local => OwnerLease::Local,
             Coordination::Clustered(authority) => {
@@ -890,6 +918,7 @@ impl AgentRunSupervisor {
                 .push(Arc::downgrade(&state.stream));
             threads.active.insert(key.clone(), state.clone())
         };
+        drop(registration);
         let claim_request = ClaimChatRun {
             thread: request.thread,
             run: run.clone(),

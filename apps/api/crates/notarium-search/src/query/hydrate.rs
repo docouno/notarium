@@ -33,7 +33,7 @@ pub(super) struct NoteAdmission<'a> {
     pub cut: &'a SnapshotCut,
     pub overlay: &'a Overlay,
     pub recipient: Option<&'a dyn SearchRecipient>,
-    /// Decisions made while filling the lexical floor, within this one query.
+    /// Recipient decisions made for lexical fallback and graph expansion in this query.
     pub checked: HashMap<NoteId, bool>,
 }
 
@@ -65,7 +65,7 @@ impl NoteAdmission<'_> {
         Ok(filled)
     }
 
-    async fn select<T>(
+    pub(super) async fn select<T>(
         &mut self,
         engine: &SearchEngine,
         ranked: impl Iterator<Item = T>,

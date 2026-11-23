@@ -397,6 +397,14 @@ async fn recall_packs_after_recipient_consent(
             Box::pin(async move { Ok(card.class() == self.class) })
         }
     }
+    recipient_graph_paths(
+        fixture,
+        space,
+        project_id,
+        &query,
+        &OnlyClass::new(DocClass::UserDoc),
+    )
+    .await;
     let first = SearchQuery {
         top_k: PageLimit::new(1).unwrap(),
         ..query
@@ -640,4 +648,158 @@ async fn recall_packs_after_recipient_consent(
         space_id: space.scope().space_id.clone(),
         folder_id: project_id.clone()
     }));
+}
+
+async fn recipient_graph_paths(
+    fixture: &RuntimeFixture,
+    space: &SpaceContext,
+    folder: &FolderId,
+    base: &SearchQuery,
+    recipient: &dyn SearchRecipient,
+) {
+    use notarium_core::classes::DocClass::{AgentMemory, UserDoc};
+    let id = |n: u8| NoteId::from_bytes((10_000 + u128::from(n)).to_be_bytes());
+    let nodes = [
+        (1, UserDoc, "exit", "End", ""),
+        (
+            2,
+            AgentMemory,
+            "hidden-seed",
+            "Hiddenseedmarker",
+            "[[gated-exit]]",
+        ),
+        (3, UserDoc, "deep-exit", "Deep exit", ""),
+        (4, AgentMemory, "bridge", "Bridge", "[[gated-deep-exit]]"),
+        (5, UserDoc, "friend", "Friend", ""),
+        (
+            6,
+            UserDoc,
+            "start",
+            "Visiblepathmarker",
+            "[[gated-bridge]] [[gated-friend]]",
+        ),
+        (7, UserDoc, "late-exit", "Late exit", ""),
+        (
+            8,
+            UserDoc,
+            "late-start",
+            "Late start",
+            "lateseedmarker latecontrol [[gated-late-exit]]",
+        ),
+    ];
+    let notes = nodes
+        .into_iter()
+        .map(|(n, class, slug, title, body)| (n, class, slug.to_owned(), title, body))
+        .chain((16..32).map(|n| {
+            (
+                n,
+                AgentMemory,
+                format!("closed-{n}"),
+                "Lateseedmarker",
+                "lateseedmarker",
+            )
+        }));
+    let items = notes
+        .map(|(n, class, slug, title, body)| {
+            let key = (10_000 + u128::from(n)).to_be_bytes();
+            Mutation {
+                identity: CommandIdentity {
+                    scope: space.scope().clone(),
+                    actor: space.auth().principal().clone(),
+                    key: CommandKey::from_bytes(key),
+                    hash: ContentDigest::from_bytes(*blake3::hash(&key).as_bytes()),
+                },
+                preconditions: Preconditions::default(),
+                input: BatchItem::Create(CreateNote {
+                    note: id(n),
+                    parent: Some(folder.clone()),
+                    slug: format!("gated-{slug}"),
+                    class,
+                    carrier: format!("---\ntitle: {title}\n---\n{body}\n"),
+                    folder_page: false,
+                }),
+            }
+        })
+        .collect();
+    let committed = fixture
+        .canonical
+        .accept_batch(space.clone(), AcceptBatch { items })
+        .await
+        .unwrap();
+    assert!(
+        committed.items.iter().all(Result::is_ok),
+        "{:?}",
+        committed.items
+    );
+    let engine = &fixture.projections.real.get().unwrap().search;
+    let query = |text: &str| SearchQuery {
+        text: text.into(),
+        causal: CausalBasis::Await(notarium_core::receipt::AwaitWatermarks::at(
+            space.scope().clone(),
+            committed.committed_high_watermark,
+        )),
+        ..base.clone()
+    };
+    let ranked = engine
+        .search(space.clone(), query("lateseedmarker"))
+        .await
+        .unwrap();
+    assert_eq!(ranked.hits.len(), 17);
+    assert_eq!(
+        ranked.hits[16]
+            .card
+            .document
+            .provenance()
+            .reference()
+            .note_id,
+        id(8)
+    );
+    for (text, depth, ordinary_goal, expected) in [
+        ("hiddenseedmarker", 1, 1, vec![]),
+        ("visiblepathmarker", 2, 3, vec![5, 6]),
+        ("visiblepathmarker", 3, 3, vec![5, 6]),
+        ("latecontrol", 1, 7, vec![7, 8]),
+        ("lateseedmarker", 1, 8, vec![7, 8]),
+    ] {
+        let request = RecallQuery {
+            query: query(text),
+            graph_depth: depth,
+            token_budget: 16_384,
+            max_per_source: None,
+        };
+        let ordinary = engine.recall(space.clone(), request.clone()).await.unwrap();
+        assert!(
+            ordinary
+                .hits
+                .iter()
+                .any(|hit| hit.card.document.provenance().reference().note_id == id(ordinary_goal)),
+            "ordinary {text}"
+        );
+        let delivered = engine
+            .recall_for(space.clone(), request, Some(recipient))
+            .await
+            .unwrap();
+        let ids: BTreeSet<_> = delivered
+            .hits
+            .iter()
+            .map(|hit| hit.card.document.provenance().reference().note_id.clone())
+            .collect();
+        assert_eq!(
+            ids,
+            expected.into_iter().map(id).collect(),
+            "{text} at depth {depth}"
+        );
+        if text == "visiblepathmarker" {
+            let friend = delivered
+                .hits
+                .iter()
+                .find(|hit| hit.card.document.provenance().reference().note_id == id(5))
+                .unwrap();
+            let expected_score = 0.25_f64 / (61.0 * (1.0 + 2.0_f64.ln()));
+            assert!(
+                (friend.score - expected_score).abs() < 1e-9,
+                "a denied neighbor must not affect the boost"
+            );
+        }
+    }
 }
