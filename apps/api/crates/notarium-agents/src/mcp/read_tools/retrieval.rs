@@ -5,12 +5,12 @@ use super::{
 };
 use notarium_core::{
     DomainError,
-    classes::DocClass,
+    classes::{ClassifiedMetadata, DocClass},
     error::{PortError, ValidationReason},
-    ids::EpisodeId,
+    ids::{EpisodeId, NoteId},
     ports::{
-        AgentRetrieval, PageLimit, RecallQuery, RetrievalKind, SearchDegradation, SearchHit,
-        SearchQuery,
+        AgentRetrieval, PageLimit, PortFuture, RecallQuery, RecallRecipient, RetrievalKind,
+        SearchDegradation, SearchHit, SearchQuery, SpaceContext,
     },
 };
 use serde::Deserialize;
@@ -38,6 +38,40 @@ struct Args {
 enum Format {
     Concise,
     Detailed,
+}
+
+struct Recipient<'a, 'registry> {
+    call: &'a ToolCallContext<'registry>,
+    scope: &'a SpaceContext,
+}
+
+impl RecallRecipient for Recipient<'_, '_> {
+    fn admit<'a>(&'a self, card: &'a ClassifiedMetadata) -> PortFuture<'a, bool> {
+        Box::pin(async move {
+            if matches!(self.call.target, EgressTarget::ExternalMcp) {
+                return Ok(true);
+            }
+            match corpus::admit_metadata(self.call, self.scope, card).await {
+                Ok(_) => Ok(true),
+                Err(error) if corpus::hidden(&error) => Ok(false),
+                Err(error) => Err(error),
+            }
+        })
+    }
+
+    fn framing_tokens(&self, note: &NoteId, first_chunk: bool) -> u32 {
+        framing_tokens(note, first_chunk)
+    }
+}
+
+fn framing_tokens(note: &NoteId, first_chunk: bool) -> u32 {
+    // The heading is "## <note>\n" and each chunk ends with two newlines.
+    let heading = if first_chunk {
+        4 + note.as_str().len() as u32
+    } else {
+        0
+    };
+    heading + 2
 }
 
 pub(super) async fn retrieve(
@@ -86,8 +120,8 @@ pub(super) async fn retrieve(
         let result = if recall {
             call.registry
                 .engine
-                .recall(
-                    scope,
+                .recall_for(
+                    scope.clone(),
                     RecallQuery {
                         query,
                         graph_depth: args.depth.unwrap_or(1),
@@ -97,6 +131,10 @@ pub(super) async fn retrieve(
                                 .map_err(|_| invalid(ValidationReason::InvalidLimit))?,
                         ),
                     },
+                    Some(&Recipient {
+                        call,
+                        scope: &scope,
+                    }),
                 )
                 .await?
         } else {
@@ -158,11 +196,11 @@ pub(super) async fn retrieve(
         };
         let mut source_remaining = source_budget;
         let heading = format!("## {}\n", reference.note_id);
-        let overhead = u32::try_from(heading.len()).unwrap_or(u32::MAX);
         if recall
             && !hit.chunks.iter().any(|chunk| {
                 let tokens = chunk.part().tokens();
-                tokens <= source_remaining && tokens.saturating_add(overhead + 2) <= remaining
+                tokens <= source_remaining
+                    && tokens.saturating_add(framing_tokens(&reference.note_id, true)) <= remaining
             })
         {
             if !hit.chunks.is_empty() {
@@ -172,10 +210,12 @@ pub(super) async fn retrieve(
         }
         let origin_count = call.provenance.origins.len();
         let project_count = call.provenance.projects.len();
-        match corpus::note_metadata(call, &scope, metadata).await {
-            Ok(()) => (),
-            Err(error) if corpus::hidden(&error) => continue,
-            Err(error) => return Err(error),
+        if !recall {
+            match corpus::note_metadata(call, &scope, metadata).await {
+                Ok(()) => (),
+                Err(error) if corpus::hidden(&error) => continue,
+                Err(error) => return Err(error),
+            }
         }
         let mut parts = Vec::new();
         for chunk in &hit.chunks {
@@ -189,12 +229,12 @@ pub(super) async fn retrieve(
                 break;
             }
             let tokens = chunk.part().tokens();
-            let charge = tokens + 2 + if parts.is_empty() { overhead } else { 0 };
+            let charge = tokens + framing_tokens(&reference.note_id, parts.is_empty());
             if recall && (tokens > source_remaining || charge > remaining) {
                 truncated = true;
                 continue;
             }
-            let text = match corpus::search_part(call, &scope, chunk).await {
+            let text = match corpus::search_part(call, &scope, metadata, chunk).await {
                 Ok(text) => text,
                 Err(error) if corpus::hidden(&error) => continue,
                 Err(error) => return Err(error),

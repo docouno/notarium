@@ -627,7 +627,9 @@ same example against an isolated prefix.
   temporary table, then inserts the full set in one statement so foreign keys
   can resolve parents that appear later in the archive.
   Opening the target with the original installation ID applies the remaining
-  migrations through version 9.
+  migrations through version 9. The PostgreSQL restore suite imports archives
+  for all ten predecessor manifests and checks chat authorship and normalized
+  references after startup.
   Before serving the restored database, call `restore_cursors` with each
   original cutoff and a fresh history incarnation. The same transaction
   rotates the writer epoch and fences active rooms, retaining their snapshots,

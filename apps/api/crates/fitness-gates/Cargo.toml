@@ -43,6 +43,7 @@ hex.workspace = true
 ipnet.workspace = true
 mimalloc.workspace = true
 notarium-canonical = { workspace = true, features = ["test-support"] }
+notarium-projections = { workspace = true, features = ["test-support"] }
 notarium-search = { workspace = true, features = ["test-support"] }
 rusqlite.workspace = true
 serde.workspace = true

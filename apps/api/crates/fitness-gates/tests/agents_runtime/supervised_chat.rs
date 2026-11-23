@@ -71,6 +71,31 @@ async fn supervised_chat_case(postgres: bool) {
     fixture.close().await;
 }
 
+pub(super) async fn retry_unacknowledged_append(
+    fixture: &RuntimeFixture,
+    supervisor: &AgentRunSupervisor,
+    account: &AccountContext,
+    input: SubmitUserChatInput,
+    options: &ChatRunOptions,
+) -> notarium_agents::chats::ChatSubmission {
+    fixture
+        .projections
+        .fail_chat_submit_unknown_then_not_committed();
+    let enqueue = || supervisor.enqueue_input(account.clone(), input.clone(), options.clone());
+    assert!(matches!(enqueue().await, Err(PortError::Unavailable(error))
+        if error.effect() == notarium_core::error::CommitEffect::Unknown));
+    let (left, right) = tokio::join!(enqueue(), enqueue());
+    let (left, right) = (left.unwrap(), right.unwrap());
+    let (SubmitUserChatOutcome::Appended(a), SubmitUserChatOutcome::Appended(b)) =
+        (&left.outcome, &right.outcome)
+    else {
+        panic!("both retries must resolve the durable append");
+    };
+    assert_eq!(a.receipt, b.receipt);
+    assert_ne!(left.run.is_some(), right.run.is_some());
+    if left.run.is_some() { left } else { right }
+}
+
 struct LogoutClaimant {
     account: AccountContext,
     logout: PreAuthContext,
@@ -164,10 +189,9 @@ async fn supervised_turn_survives_disconnect_and_stops_cleanly(
         .pat_with_expiry(BearerScope::Read, false, Some(expiry))
         .await;
     let former_input = input(242, ThreadEntrySeq::ZERO, "Start a detached turn.");
-    let first = supervisor
-        .enqueue_input(owner.clone(), former_input.clone(), options.clone())
-        .await
-        .unwrap();
+    let first =
+        retry_unacknowledged_append(fixture, &supervisor, owner, former_input.clone(), &options)
+            .await;
     let SubmitUserChatOutcome::Appended(human) = first.outcome else {
         panic!("expected immediate human append")
     };
@@ -428,21 +452,27 @@ async fn supervised_turn_survives_disconnect_and_stops_cleanly(
     let current = branch(fixture, personal, &thread, ThreadEntrySeq::ZERO)
         .await
         .thread;
-    supervisor
-        .redact_chat_entry(
-            owner.clone(),
-            Mutation {
-                identity: mutation(244),
-                preconditions: Preconditions::default(),
-                input: RedactChatEntry {
-                    thread: thread.clone(),
-                    entry: head,
-                    expected_thread_revision: current.revision,
-                },
-            },
-        )
+    let redact = Mutation {
+        identity: mutation(244),
+        preconditions: Preconditions::default(),
+        input: RedactChatEntry {
+            thread: thread.clone(),
+            entry: head,
+            expected_thread_revision: current.revision,
+        },
+    };
+    *fixture.projections.lose_redaction_acks.lock().unwrap() = 2;
+    let lost_redaction_ack = || supervisor.redact_chat_entry(owner.clone(), redact.clone());
+    assert!(
+        matches!(lost_redaction_ack().await, Err(PortError::Unavailable(error))
+        if error.effect() == notarium_core::error::CommitEffect::Unknown)
+    );
+    let redacted_at = fixture
+        .canonical
+        .read_space(&scope.space_id)
         .await
-        .unwrap();
+        .unwrap()
+        .last_seq;
     let StreamRead::CatchUpRequired(reset) = retained.next().await else {
         panic!("a retained viewer must refresh canonical history after redaction");
     };
@@ -455,6 +485,92 @@ async fn supervised_turn_survives_disconnect_and_stops_cleanly(
             .iter()
             .any(|entry| { entry.seq == head && matches!(entry.body, ChatBody::Redacted) })
     );
+    fixture
+        .canonical
+        .fork_chat(
+            personal.clone(),
+            Mutation {
+                identity: mutation(248),
+                preconditions: Preconditions::default(),
+                input: ForkChat {
+                    thread: thread.clone(),
+                    parent: ThreadEntrySeq::ZERO,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let clean = supervisor
+        .enqueue_input(
+            owner.clone(),
+            input(249, ThreadEntrySeq::ZERO, "A fresh branch"),
+            options.clone(),
+        )
+        .await
+        .unwrap();
+    let clean_run = clean.run.unwrap();
+    let (mut wire, _) = timeout(Duration::from_secs(15), read_request(&listener))
+        .await
+        .unwrap();
+    let mut witness = supervisor
+        .subscribe(owner.clone(), scope.clone(), thread.clone(), None)
+        .await
+        .unwrap()
+        .unwrap();
+    let StreamRead::CatchUpRequired(fresh) = witness.next().await else {
+        panic!("expected the fresh stream checkpoint");
+    };
+    assert_eq!(fresh.cursor.run, clean_run);
+    let mut lagging = supervisor
+        .subscribe(
+            owner.clone(),
+            scope.clone(),
+            thread.clone(),
+            Some(&fresh.cursor),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    begin_ollama_stream(&mut wire).await;
+    let part = format!(
+        "{}\n",
+        json!({"model":runtime_ability_cases::MODEL, "message":{"role":"assistant","content":"Fresh response"}, "done":false})
+    );
+    wire.get_mut()
+        .write_all(format!("{:x}\r\n{part}\r\n", part.len()).as_bytes())
+        .await
+        .unwrap();
+    let StreamRead::Frame(frame) = timeout(Duration::from_secs(10), witness.next())
+        .await
+        .unwrap()
+    else {
+        panic!("expected fresh response delta");
+    };
+    assert!(
+        matches!(lost_redaction_ack().await, Err(PortError::Unavailable(error))
+        if error.effect() == notarium_core::error::CommitEffect::Unknown)
+    );
+    let replay = supervisor
+        .redact_chat_entry(owner.clone(), redact)
+        .await
+        .unwrap();
+    assert_eq!(replay.receipt.seq(), redacted_at);
+    let StreamRead::Frame(saved) = timeout(Duration::from_secs(10), lagging.next())
+        .await
+        .unwrap()
+    else {
+        panic!("redaction replay discarded fresh frames");
+    };
+    assert_eq!(saved.payload(), frame.payload());
+    finish_ollama_stream(
+        &mut wire,
+        json!({"role":"assistant","content":" complete"}),
+        "stop",
+    )
+    .await;
+    let events = stream_events(lagging).await;
+    assert_eq!(events.last().unwrap()["type"], "run_finished");
+    idle_leaf(fixture, personal, &thread).await;
     Box::pin(resilience_submit_gate_and_archival(
         fixture,
         personal,
@@ -1404,7 +1520,7 @@ async fn revoked_admission_cannot_publish(
     }
 }
 
-async fn branch(
+pub(super) async fn branch(
     fixture: &RuntimeFixture,
     scope: &SpaceContext,
     thread: &ChatThreadId,
@@ -1425,7 +1541,7 @@ async fn branch(
         .unwrap()
 }
 
-async fn idle_leaf(
+pub(super) async fn idle_leaf(
     fixture: &RuntimeFixture,
     scope: &SpaceContext,
     thread: &ChatThreadId,

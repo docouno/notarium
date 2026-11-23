@@ -129,6 +129,7 @@ pub struct ProjectionFixtures {
     before_chat_submit: Mutex<Option<MutationPause>>,
     before_chat_lookup: Mutex<Option<MutationPause>>,
     before_chat_redact: Mutex<Option<MutationPause>>,
+    pub lose_redaction_acks: Mutex<usize>,
     before_chat_rollback: Mutex<Option<MutationPause>>,
     before_chat_claim: Mutex<Option<MutationPause>>,
     after_chat_claim: Mutex<Option<MutationPause>>,
@@ -421,7 +422,11 @@ canonical_port!(ChatPort;
     ) -> PortFuture<'_, Committed<RedactedChat>> {
         Box::pin(async move {
             MutationPause::enter(&self.1.before_chat_redact, ctx.budget.cancellation.clone()).await;
-            ChatPort::redact_chat_entry(&self.0, ctx, request).await
+            let result = ChatPort::redact_chat_entry(&self.0, ctx, request).await?;
+            if lose_ack(&self.1.lose_redaction_acks) {
+                return Err(lost_chat_ack());
+            }
+            Ok(result)
         })
     }
     fn lookup_user_chat_input(
@@ -458,7 +463,7 @@ canonical_port!(ChatPort;
                 ));
             }
             let outcome = ChatPort::submit_user_chat_input(&self.0, ctx, request).await?;
-            if fault_stage == 2 && matches!(outcome, SubmitUserChatOutcome::Queued(_)) {
+            if fault_stage == 2 {
                 return Err(lost_chat_ack());
             }
             Ok(outcome)
@@ -656,6 +661,17 @@ impl ViewGraphPort for TestEngine {
         request: ReadRequest<ViewQuery>,
     ) -> PortFuture<'_, ViewResult> {
         if let Some(real) = self.1.real.get() {
+            let required = match &request {
+                ReadRequest::Open {
+                    causal: CausalBasis::Await(watermarks),
+                    ..
+                } => Some(watermarks.required(ctx.scope()).unwrap()),
+                _ => None,
+            };
+            real.projection_calls
+                .lock()
+                .unwrap()
+                .push((ctx.budget.remaining, required));
             return real.projection.query_view(ctx, request);
         }
         Box::pin(async move {
@@ -723,6 +739,10 @@ impl ViewGraphPort for TestEngine {
 
     fn query_graph(&self, ctx: SpaceContext, request: GraphQuery) -> PortFuture<'_, GraphResult> {
         if let Some(real) = self.1.real.get() {
+            real.projection_calls
+                .lock()
+                .unwrap()
+                .push((ctx.budget.remaining, None));
             return real.projection.query_graph(ctx, request);
         }
         Box::pin(async move {
@@ -768,11 +788,28 @@ impl SearchPort for TestEngine {
         Box::pin(async move { self.retrieve(&ctx, request).await })
     }
 
-    fn recall(&self, ctx: SpaceContext, request: RecallQuery) -> PortFuture<'_, SearchResult> {
+    fn recall_for<'a>(
+        &'a self,
+        ctx: SpaceContext,
+        request: RecallQuery,
+        recipient: Option<&'a dyn RecallRecipient>,
+    ) -> PortFuture<'a, SearchResult> {
         if let Some(real) = self.1.real.get() {
-            return real.search.recall(ctx, request);
+            return real.search.recall_for(ctx, request, recipient);
         }
-        Box::pin(async move { self.retrieve(&ctx, request.query).await })
+        Box::pin(async move {
+            let mut result = self.retrieve(&ctx, request.query).await?;
+            if let Some(recipient) = recipient {
+                let mut admitted = Vec::new();
+                for hit in result.hits {
+                    if recipient.admit(hit.card.document.provenance()).await? {
+                        admitted.push(hit);
+                    }
+                }
+                result.hits = admitted;
+            }
+            Ok(result)
+        })
     }
 }
 

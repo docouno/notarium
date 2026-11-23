@@ -1,9 +1,274 @@
 use super::*;
+use super::{
+    runtime_ability_cases::{approve_disclosure, loopback_provider, read_request, send_ollama},
+    supervised_chat_cases::{branch, idle_leaf},
+};
+use notarium_agents::chats::{AgentRunSupervisor, ChatRunOptions, ExclusiveDataRoot, StartChatRun};
 use notarium_agents::mcp::{ConfirmProposedDiff, PersonalToolInvocation};
 use notarium_core::{
-    auth::ChatAudience,
+    auth::{ChatAudience, ProposalHumanAccess},
+    classes::DocClass,
     ports::provider::{ProviderToolCall, ProviderToolCallId},
 };
+use std::time::Duration;
+use tokio::{net::TcpListener, time::timeout};
+
+#[tokio::test]
+async fn sqlite_supervised_proposals_on_tainted_branch() {
+    let _guard = support::AUTH_TEST_LOCK.lock().await;
+    Box::pin(supervised_proposals_on_tainted_branch(false)).await;
+}
+
+#[tokio::test]
+async fn postgres_supervised_proposals_on_tainted_branch() {
+    let _guard = support::AUTH_TEST_LOCK.lock().await;
+    Box::pin(supervised_proposals_on_tainted_branch(true)).await;
+}
+
+async fn supervised_proposals_on_tainted_branch(postgres: bool) {
+    let fixture = RuntimeFixture::open_named(postgres, "supervised_proposals").await;
+    let personal = fixture.personal_scope().await;
+    let scope = personal.scope().clone();
+    let fresh_owner = || async {
+        let auth = fixture
+            .control
+            .trusted_none(
+                PerimeterAttestation::attest_checked().with_human_management(),
+                budget(),
+            )
+            .await
+            .unwrap();
+        AccountContext::new(auth, budget())
+    };
+    let owner = fresh_owner().await;
+    let thread = ChatThreadId::from_bytes([10; 16]);
+    let mutation = |tag| CommandIdentity {
+        scope: scope.clone(),
+        actor: owner.auth().principal().clone(),
+        key: CommandKey::from_bytes([tag; 16]),
+        hash: ContentDigest::from_bytes([tag; 32]),
+    };
+    fixture
+        .canonical
+        .create_chat(
+            personal.clone(),
+            Mutation {
+                identity: mutation(10),
+                preconditions: Preconditions::default(),
+                input: CreateChat {
+                    thread: thread.clone(),
+                    kind: ChatThreadKind::Personal,
+                    owner: owner.auth().principal().clone(),
+                    project_folder: None,
+                    title: "Personal proposals".into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let leaf = fixture
+        .canonical
+        .append_chat(
+            personal.clone(),
+            Mutation {
+                identity: mutation(11),
+                preconditions: Preconditions::default(),
+                input: AppendChat {
+                    thread: thread.clone(),
+                    parent: ThreadEntrySeq::ZERO,
+                    kind: ChatEntryKind::Human,
+                    body: ChatInputBody::Text("Review changes to my memory.".into()),
+                    tool_calls: vec![],
+                    provenance: None,
+                    interruption: None,
+                    proposed_diff: None,
+                    referenced_notes: vec![],
+                    tainted: true,
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    assert!(leaf.tainted);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local = loopback_provider(&fixture, &owner, &listener, 20, true).await;
+    approve_disclosure(
+        &fixture,
+        &owner,
+        &local,
+        24,
+        ProviderAttachmentTarget::Personal {
+            owner: owner.auth().principal().clone(),
+            space: scope.space_id.clone(),
+        },
+        [DocClass::UserDoc, DocClass::Profile].into(),
+    )
+    .await;
+    let supervisor = AgentRunSupervisor::new_local(
+        local.registry.clone(),
+        fixture.revocations.clone(),
+        ExclusiveDataRoot::attest_open_writer(),
+    );
+    let options = ChatRunOptions {
+        provider: Some(local.resource.id.clone()),
+        model: Some(local.model.clone()),
+        ..Default::default()
+    };
+    supervisor
+        .start(
+            owner.clone(),
+            StartChatRun {
+                scope: scope.clone(),
+                thread: thread.clone(),
+                expected_leaf: leaf.seq,
+                options: options.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(owner.auth().taint().is_tainted());
+
+    let input = |tag, head| SubmitUserChatInput {
+        identity: mutation(tag),
+        id: PendingInputId::from_bytes([tag; 16]),
+        thread: thread.clone(),
+        expected_leaf: head,
+        body: "Review my next observation.".into(),
+        mentions_agent: false,
+    };
+    let mut proposals = Vec::new();
+    for turn in 0..4 {
+        if turn == 3 {
+            let head = idle_leaf(&fixture, &personal, &thread).await;
+            let direct = supervisor
+                .enqueue_input(fresh_owner().await, input(33, head), options.clone())
+                .await
+                .unwrap();
+            assert!(
+                matches!(direct.outcome, SubmitUserChatOutcome::Appended(_))
+                    && direct.run.is_some()
+            );
+        }
+        let (mut wire, _) = timeout(Duration::from_secs(15), read_request(&listener))
+            .await
+            .unwrap();
+        let head = branch(&fixture, &personal, &thread, ThreadEntrySeq::ZERO)
+            .await
+            .thread
+            .head;
+        if turn < 2 {
+            // The third turn's sender has already read the tainted branch independently.
+            let sender = fresh_owner().await;
+            if turn == 1 {
+                let reader =
+                    SpaceContext::new(sender.auth().clone(), scope.clone(), budget()).unwrap();
+                branch(&fixture, &reader, &thread, head).await;
+                assert!(sender.auth().taint().is_tainted());
+            }
+            let queued = supervisor
+                .enqueue_input(sender, input(30 + turn, head), options.clone())
+                .await
+                .unwrap();
+            assert!(matches!(queued.outcome, SubmitUserChatOutcome::Queued(_)));
+        }
+        let category = format!("supervised-proposal-{turn}");
+        send_ollama(
+            &mut wire,
+            json!({"role":"assistant","tool_calls":[{"function":{
+                "index":0,"name":"remember_about_user","arguments":{
+                    "category":category,"observation":"Only after my approval."
+                }
+            }}]}),
+            "tool_calls",
+        )
+        .await;
+        drop(wire);
+        let (mut wire, _) = timeout(Duration::from_secs(15), read_request(&listener))
+            .await
+            .unwrap();
+        let head = branch(&fixture, &personal, &thread, ThreadEntrySeq::ZERO)
+            .await
+            .thread
+            .head;
+        let history = branch(&fixture, &personal, &thread, head).await;
+        let tool = history.entries.iter().find(|row| row.seq == head).unwrap();
+        assert!(matches!(tool.kind, ChatEntryKind::Tool { .. }) && tool.tainted);
+        let interactive = fresh_owner().await;
+        let reader = fixture
+            .control_plane
+            .revalidate_proposal_human(interactive.clone(), ProposalHumanAccess::ReadOnly)
+            .await
+            .unwrap();
+        let proposal = fixture
+            .canonical
+            .read_chat_proposal(
+                SpaceContext::new(reader, scope.clone(), budget()).unwrap(),
+                ChatProposalRead {
+                    thread: thread.clone(),
+                    entry: head,
+                },
+            )
+            .await;
+        assert_eq!(
+            fixture
+                .control
+                .inspect_memory_target(
+                    interactive,
+                    MemoryTarget::User {
+                        owner: owner.auth().principal().clone(),
+                    },
+                    category
+                )
+                .await
+                .unwrap()
+                .revision,
+            None
+        );
+        if turn != 2 {
+            let envelope: Value = serde_json::from_str(&proposal.unwrap().envelope).unwrap();
+            proposals.push(ConfirmProposedDiff {
+                source: scope.clone(),
+                thread: thread.clone(),
+                entry: head,
+                proposal: serde_json::from_value(envelope["proposal_id"].clone()).unwrap(),
+            });
+        } else {
+            assert!(matches!(
+                proposal,
+                Err(PortError::Domain(DomainError::ResourceNotFound))
+            ));
+            assert!(
+                matches!(&tool.body, ChatBody::Inline(body) if body.contains("cross_space_tainted")),
+                "{:?}",
+                tool.body
+            );
+        }
+        send_ollama(
+            &mut wire,
+            json!({"role":"assistant","content":"Finished."}),
+            "stop",
+        )
+        .await;
+    }
+    idle_leaf(&fixture, &personal, &thread).await;
+    for proposal in proposals {
+        assert!(
+            fixture
+                .registry
+                .apply_proposed_diff(owner.clone(), proposal.clone())
+                .await
+                .is_err()
+        );
+        fixture
+            .registry
+            .apply_proposed_diff(fresh_owner().await, proposal)
+            .await
+            .unwrap();
+    }
+    supervisor.shutdown();
+    fixture.close().await;
+}
 
 async fn record_memory_proposal(
     fixture: &RuntimeFixture,

@@ -1,14 +1,14 @@
-use super::{EgressTarget, ToolCallContext, corpus, invalid};
+use super::{EgressTarget, ToolCallContext, corpus, invalid, session};
 use notarium_core::{
     DomainError,
     document::{ViewBlock, ViewState},
-    error::{PortError, ValidationReason},
-    ids::NoteId,
+    error::{CommitEffect, OperationalFailure, PortError, RetryAdvice, ValidationReason},
+    ids::{ContentDigest, NoteId, SpaceSeq},
     ports::{
         GetNote, GraphNodeId, GraphQuery, GraphTier, PageLimit, SpaceContext, ViewQuery, ViewRef,
     },
     query::{FieldFilterAstV1, Predicate, ReadRequest},
-    receipt::CausalBasis,
+    receipt::{AwaitWatermarks, CausalBasis},
     value::YamlValue,
 };
 use notarium_syntax::{frontmatter, markdown, nota};
@@ -28,6 +28,22 @@ pub(super) async fn get(
     call: &mut ToolCallContext<'_>,
     args: Value,
 ) -> Result<NoteOutput, PortError> {
+    tokio::time::timeout_at(call.deadline.into(), read(call, args))
+        .await
+        .map_err(|_| {
+            PortError::DeadlineExceeded(
+                OperationalFailure::new(
+                    ContentDigest::from_bytes(*blake3::hash(b"mcp get_note deadline").as_bytes()),
+                    CommitEffect::NotCommitted,
+                    RetryAdvice::Never,
+                    false,
+                )
+                .expect("read-only deadline"),
+            )
+        })?
+}
+
+async fn read(call: &mut ToolCallContext<'_>, args: Value) -> Result<NoteOutput, PortError> {
     let note = NoteId::parse(
         args["ref"]
             .as_str()
@@ -43,7 +59,7 @@ pub(super) async fn get(
             GetNote {
                 note: note.clone(),
                 revision: None,
-                causal: causal(),
+                causal: CausalBasis::Await(Default::default()),
             },
         )
         .await
@@ -80,7 +96,11 @@ pub(super) async fn get(
             && let Some(folder) = call
                 .registry
                 .engine
-                .resolve_folder_path(ctx.clone(), Some(parent), String::new())
+                .resolve_folder_path(
+                    call.space(ctx.scope().clone())?,
+                    Some(parent),
+                    String::new(),
+                )
                 .await?
             && folder.cover_note.as_ref() == Some(&note)
         {
@@ -99,6 +119,15 @@ pub(super) async fn get(
         }
     }
 
+    // Observe the Space after reading the carrier so the derived reads include
+    // both the returned view definition and writes to its candidate notes.
+    let head = if detailed {
+        let space = session::readable_space(call, &ctx.scope().space_id).await?;
+        ctx.scope().check(&space.history)?;
+        Some(space.last_seq)
+    } else {
+        None
+    };
     let mut display_body = String::new();
     let mut offset = header.carrier.body.start();
     let mut views_out = Vec::with_capacity(views.len());
@@ -106,8 +135,7 @@ pub(super) async fn get(
     let mut view_rows_truncated = false;
     for (index, view) in views.into_iter().enumerate() {
         display_body.push_str(&carrier[offset..view.span.start()]);
-        let result =
-            describe_view(call, &ctx, &note, &view, index, detailed, &mut view_budget).await?;
+        let result = describe_view(call, &ctx, &note, &view, index, head, &mut view_budget).await?;
         view_rows_truncated |= result["rowsTruncated"] == true;
         display_body.push_str("\n[nota view] ");
         display_body.push_str(
@@ -120,7 +148,7 @@ pub(super) async fn get(
         }
     }
     display_body.push_str(&carrier[offset..header.carrier.body.end()]);
-    if detailed {
+    if let Some(head) = head {
         payload["outline"] = Value::Array(
             markdown
                 .headings
@@ -132,7 +160,7 @@ pub(super) async fn get(
                 })
                 .collect(),
         );
-        payload["links"] = graph(call, &ctx, &note).await?;
+        payload["links"] = graph(call, &ctx, &note, head).await?;
         if !views_out.is_empty() {
             payload["views"] = Value::Array(views_out);
             if view_rows_truncated {
@@ -155,7 +183,7 @@ async fn describe_view(
     note: &NoteId,
     view: &ViewBlock,
     index: usize,
-    detailed: bool,
+    head: Option<SpaceSeq>,
     remaining: &mut usize,
 ) -> Result<Value, PortError> {
     let mut item = json!({"block": index + 1});
@@ -168,9 +196,9 @@ async fn describe_view(
         return Ok(item);
     }
     item["viewRef"] = json!(format!("{note}:{key}"));
-    if !detailed {
+    let Some(head) = head else {
         return Ok(item);
-    }
+    };
     if index >= MAX_VIEW_QUERIES || *remaining == 0 {
         item["status"] = json!("incomplete");
         item["rowsTruncated"] = json!(true);
@@ -181,7 +209,7 @@ async fn describe_view(
         .registry
         .engine
         .query_view(
-            ctx.clone(),
+            call.space(ctx.scope().clone())?,
             ReadRequest::Open {
                 query: ViewQuery {
                     view: ViewRef {
@@ -193,7 +221,7 @@ async fn describe_view(
                     group_by: None,
                     limit: PageLimit::new(limit)?,
                 },
-                causal: causal(),
+                causal: CausalBasis::Await(AwaitWatermarks::at(ctx.scope().clone(), head)),
             },
         )
         .await;
@@ -226,7 +254,9 @@ async fn describe_view(
             Err(error) => return Err(error),
         }
     }
-    let incomplete = page.rows.incomplete || truncated;
+    let incomplete = page.rows.incomplete
+        || page.rows.projected_seq < head.max(page.rows.canonical_seq)
+        || truncated;
     item["status"] = json!(if incomplete { "incomplete" } else { "ready" });
     item["rows"] = Value::Array(rows);
     if truncated {
@@ -256,12 +286,13 @@ async fn graph(
     call: &mut ToolCallContext<'_>,
     ctx: &SpaceContext,
     note: &NoteId,
+    head: SpaceSeq,
 ) -> Result<Value, PortError> {
     let result = call
         .registry
         .engine
         .query_graph(
-            ctx.clone(),
+            call.space(ctx.scope().clone())?,
             GraphQuery {
                 tier: GraphTier::Neighborhood {
                     note: note.clone(),
@@ -280,8 +311,9 @@ async fn graph(
     };
     ctx.scope().check(&graph.cut.scope)?;
     let mut admitted = BTreeSet::from([note.clone()]);
-    let incomplete = matches!(call.target, EgressTarget::ExternalMcp)
-        && (graph.truncated || graph.nodes.len() > MAX_LINK_NODES);
+    let incomplete = graph.cut.projected_seq < head.max(graph.cut.canonical_seq)
+        || (matches!(call.target, EgressTarget::ExternalMcp)
+            && (graph.truncated || graph.nodes.len() > MAX_LINK_NODES));
     for node in graph.nodes.into_iter().take(MAX_LINK_NODES) {
         let (GraphNodeId::Note(id), Some(card)) = (node.id, node.card) else {
             continue;
@@ -368,8 +400,4 @@ fn unconstrained() -> FieldFilterAstV1 {
         version: 1,
         predicate: Predicate::All(Vec::new()),
     }
-}
-
-fn causal() -> CausalBasis {
-    CausalBasis::Await(Default::default())
 }

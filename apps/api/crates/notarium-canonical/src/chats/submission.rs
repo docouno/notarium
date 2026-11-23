@@ -114,6 +114,7 @@ pub(super) async fn submit(
     if let Some(receipt) = receipt {
         return Ok(receipt.into_outcome(ctx.auth()));
     }
+    content::require_human_text(&request.body)?;
     authorize_chat_write_on_space(ctx.auth(), &space.space)?;
     let staged = if request.body.len() as u64 > StagedChatBlob::INLINE_MAX_BYTES {
         // An unauthorized request must not publish even a provisional blob.

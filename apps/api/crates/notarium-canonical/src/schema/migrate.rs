@@ -400,6 +400,10 @@ mod tests {
         .unwrap();
     }
 
+    mod fixture {
+        include!("../../tests/fixtures/schema-history.rs");
+    }
+
     #[tokio::test]
     async fn both_divergent_layouts_upgrade_using_the_manifest_witness() {
         for (version, hash) in [
@@ -413,28 +417,11 @@ mod tests {
             bootstrap_sqlite_schema(&mut db, &installation)
                 .await
                 .unwrap();
-            let ddl = match hash {
-                AGENT_V7_HASH => concat!(
-                    include_str!("../../tests/fixtures/schema-v6-remove-projection.sql"),
-                    "DROP INDEX idx_ability_packages_active_slug;
-                     CREATE UNIQUE INDEX uq_ability_packages_active_slug
-                        ON ability_packages(space_id,slug_fold) WHERE lifecycle_state='active';"
-                ),
-                AGENT_V8_HASH => {
-                    include_str!("../../tests/fixtures/schema-v6-remove-projection.sql")
-                }
-                PROJECTION_V7_HASH => concat!(
-                    include_str!("../../tests/fixtures/schema-v7-chat-refs.sql"),
-                    include_str!("../../tests/fixtures/schema-v8-remove-agents.sql"),
-                ),
-                PROJECTION_V8_HASH => {
-                    include_str!("../../tests/fixtures/schema-v8-remove-agents.sql")
-                }
-                _ => unreachable!(),
-            };
-            sqlx::raw_sql(ddl).execute(&mut db).await.unwrap();
+            for ddl in fixture::remove_later_features(version, hash) {
+                sqlx::raw_sql(*ddl).execute(&mut db).await.unwrap();
+            }
             sqlx::query("UPDATE schema_meta SET schema_version=$1, manifest_checksum=$2")
-                .bind(version)
+                .bind(i64::from(version))
                 .bind(hex::decode(hash).unwrap())
                 .execute(&mut db)
                 .await

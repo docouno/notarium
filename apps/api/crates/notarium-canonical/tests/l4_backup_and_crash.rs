@@ -2,6 +2,8 @@
 
 #[path = "l4_backup_and_crash/restore.rs"]
 mod restore;
+#[path = "fixtures/schema-history.rs"]
+mod schema_history;
 mod support;
 
 use std::{
@@ -488,23 +490,13 @@ impl BackendCase {
                 .execute(&mut *tx)
                 .await
                 .unwrap();
-            if decoded.schema_version <= 8 {
-                sqlx::raw_sql(include_str!("fixtures/schema-v8-remove-agents.sql"))
-                    .execute(&mut *tx)
-                    .await
-                    .unwrap();
-            }
-            if decoded.schema_version == 7 {
-                sqlx::raw_sql(include_str!("fixtures/schema-v7-chat-refs.sql"))
-                    .execute(&mut *tx)
-                    .await
-                    .unwrap();
-            }
-            if decoded.schema_version <= 6 {
-                sqlx::raw_sql(include_str!("fixtures/schema-v6-remove-projection.sql"))
-                    .execute(&mut *tx)
-                    .await
-                    .unwrap();
+            if decoded.schema_version < CANONICAL_SCHEMA_VERSION {
+                for ddl in schema_history::remove_later_features(
+                    decoded.schema_version,
+                    &decoded.manifest_checksum.to_hex(),
+                ) {
+                    sqlx::raw_sql(*ddl).execute(&mut *tx).await.unwrap();
+                }
             }
             if decoded.schema_version <= 5 {
                 sqlx::raw_sql(
@@ -1093,20 +1085,23 @@ async fn failed_temp_unlink_retains_its_recovery_marker() {
 
 #[tokio::test]
 async fn restores_historical_postgres_spools_and_rejects_invalid_headers() {
-    // Each file came from its version's PostgreSQL participant with a single synthetic Space.
-    // The v6 archive also carries a chat from commit 0e943be5.
+    // The common archives and projection v7 are snapshots from the original participants.
+    // The three suffixed archives contain rows exported from their historical PostgreSQL DDL.
     let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
     let case = BackendCase::open_pg_s3().await;
-    for (version, install, space_id, slug, table_count, queue_columns) in [
-        (1, 1, 11, "review-space", 34, 13),
-        (2, 0x62, 0xB2, "backup-178", 35, 14),
-        (3, 0x62, 0xB2, "backup-178", 36, 14),
-        (4, 0x62, 0xB2, "backup-178", 36, 14),
-        (5, 0x62, 0xB2, "backup-178", 36, 14),
-        (6, 0x62, 0xB2, "backup-178", 36, 14),
-        (7, 0x62, 0xB2, "backup-178", 39, 14),
+    for (version, suffix, install, space_id, slug, table_count, queue_columns) in [
+        (1, "", 1, 11, "review-space", 34, 13),
+        (2, "", 0x62, 0xB2, "backup-178", 35, 14),
+        (3, "", 0x62, 0xB2, "backup-178", 36, 14),
+        (4, "", 0x62, 0xB2, "backup-178", 36, 14),
+        (5, "", 0x62, 0xB2, "backup-178", 36, 14),
+        (6, "", 0x62, 0xB2, "backup-178", 36, 14),
+        (7, "", 0x62, 0xB2, "backup-178", 39, 14),
+        (7, "-agent", 0x62, 0xB2, "backup-178", 36, 14),
+        (8, "-agent", 0x62, 0xB2, "backup-178", 36, 14),
+        (8, "-projection", 0x62, 0xB2, "backup-178", 39, 14),
     ] {
-        let fixture = directory.join(format!("schema-v{version}.pgspool"));
+        let fixture = directory.join(format!("schema-v{version}{suffix}.pgspool"));
         let decoded = decode_postgres_spool_v1(&fixture).unwrap();
         assert_eq!(decoded.schema_version, version);
         assert_eq!(
@@ -1186,7 +1181,7 @@ async fn restores_historical_postgres_spools_and_rejects_invalid_headers() {
             CanonicalRuntime::open(config.clone())
                 .await
                 .unwrap_or_else(|error| {
-                    panic!("open materialized PostgreSQL v{version} archive: {error:?}")
+                    panic!("open materialized PostgreSQL v{version}{suffix} archive: {error:?}")
                 });
         if let SqlBackendConfig::Postgres { schema, .. } = &config.sql {
             let mut db = case.pg_cleanup.as_ref().unwrap().0.open_raw_pg().await;
@@ -1199,7 +1194,7 @@ async fn restores_historical_postgres_spools_and_rejects_invalid_headers() {
             .await
             .unwrap();
             assert_eq!(key, ("status".to_owned(), "space_id".to_owned()));
-            if version == 6 {
+            if version == 6 || !suffix.is_empty() {
                 sqlx::query(sqlx::AssertSqlSafe(format!("SET search_path TO {schema}")))
                     .execute(&mut db)
                     .await
@@ -1224,10 +1219,19 @@ async fn restores_historical_postgres_spools_and_rejects_invalid_headers() {
                     entries,
                     [
                         (1, Some(1), 0, None),
-                        (2, None, 0, None),
+                        (2, (suffix == "-agent").then_some(1), 0, None),
                         (3, Some(0), 0, None)
                     ]
                 );
+                if !suffix.is_empty() {
+                    let references: Vec<(i64, String, i64)> = sqlx::query_as(
+                        "SELECT entry_seq, target_note_id, created_space_seq FROM chat_entry_note_refs",
+                    )
+                    .fetch_all(&mut db)
+                    .await
+                    .unwrap();
+                    assert_eq!(references, [(1, sample_note_id(0x45).to_string(), 2)]);
+                }
                 let branch = restored
                     .read_chat(
                         owner_ctx(&cut.scope, sample_principal_id(space_id)),

@@ -99,9 +99,14 @@ async fn compact_prefix_preserving_recent_context(
         .unwrap();
     let mut entries = Vec::new();
     let mut leaf = ThreadEntrySeq::ZERO;
+    let mut legacy_empty = None;
     for ordinal in 1..=10 {
         let label = format!("ordered segment {ordinal}");
-        let body = format!("{label} {}", "a".repeat(900 - label.len() - 1));
+        let body = if ordinal == 2 {
+            label.clone()
+        } else {
+            format!("{label} {}", "a".repeat(900 - label.len() - 1))
+        };
         let SubmitUserChatOutcome::Appended(entry) = fixture
             .canonical
             .submit_user_chat_input(
@@ -122,6 +127,15 @@ async fn compact_prefix_preserving_recent_context(
         };
         leaf = entry.value.seq;
         entries.push((leaf, label));
+        if ordinal == 2 {
+            // Recreate the inline representation written by older admissions.
+            let changed = fixture.canonical.execute_diagnostic_write_sql_for_test(&format!(
+                "UPDATE chat_entries SET inline_text='' WHERE space_id='{}' AND thread_id='{thread}' AND entry_seq={}",
+                scope.space_id, leaf.get()
+            )).await.unwrap();
+            assert_eq!(changed, 1);
+            legacy_empty = Some(leaf);
+        }
         if ordinal == 1 {
             let interrupted =
                 interrupted_tool_group(fixture, personal, &thread, leaf, &identity).await;
@@ -147,7 +161,28 @@ async fn compact_prefix_preserving_recent_context(
         .await
         .unwrap();
     assert!(independent_redaction.value.invalidated_contexts.is_empty());
-    let live_entries = &entries[1..];
+    let legacy_empty = legacy_empty.unwrap();
+    let live_entries: Vec<_> = entries[1..]
+        .iter()
+        .filter(|(seq, _)| *seq != legacy_empty)
+        .cloned()
+        .collect();
+    let prefix = fixture
+        .canonical
+        .read_chat_compaction_prefix(
+            personal.clone(),
+            ChatRead {
+                thread: thread.clone(),
+                leaf,
+                before: None,
+                max_entries: PageLimit::new(5).unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(prefix.has_tail);
+    assert_eq!(prefix.contents.len(), 5);
+    assert!(prefix.contents.iter().all(|item| item.seq != legacy_empty));
 
     let supervisor = AgentRunSupervisor::new_local(
         provider.registry,
@@ -197,7 +232,7 @@ async fn compact_prefix_preserving_recent_context(
     assert!(shown[2].contains("Unpaired result"));
     let covered = shown.len();
     assert!((2..live_entries.len()).contains(&covered));
-    for (text, (_, label)) in shown.iter().zip(live_entries) {
+    for (text, (_, label)) in shown.iter().zip(&live_entries) {
         assert!(text.starts_with(label));
     }
     send_ollama(
@@ -237,6 +272,13 @@ async fn compact_prefix_preserving_recent_context(
         .read_chat(personal.clone(), read())
         .await
         .unwrap();
+    let historical = audit
+        .entries
+        .iter()
+        .find(|entry| entry.seq == legacy_empty)
+        .unwrap();
+    assert_eq!(historical.kind, ChatEntryKind::Human);
+    assert_eq!(historical.body, ChatBody::Inline(String::new()));
     assert_eq!(audit.entries.len(), entries.len() + 2);
     assert_eq!(audit.entries[0].kind, ChatEntryKind::Redacted);
     assert_eq!(

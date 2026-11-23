@@ -31,7 +31,7 @@ pub(super) struct Hydration<'a> {
     pub candidates: Vec<Candidate>,
     pub tokenizer: &'a (dyn TokenizerBudget + Send + Sync),
     pub top_k: usize,
-    pub recall: Option<Recall>,
+    pub recall: Option<Recall<'a>>,
 }
 
 impl SearchEngine {
@@ -136,10 +136,18 @@ impl SearchEngine {
                 },
             );
         }
-        let ordered: Vec<_> = selected
-            .into_iter()
-            .filter_map(|candidate| cards.remove(&candidate.note).map(|card| (candidate, card)))
-            .collect();
+        let mut ordered = Vec::with_capacity(selected.len());
+        for candidate in selected {
+            let Some(card) = cards.remove(&candidate.note) else {
+                continue;
+            };
+            if let Some(recipient) = recall.and_then(|recall| recall.recipient)
+                && !recipient.admit(card.document.provenance()).await?
+            {
+                continue;
+            }
+            ordered.push((candidate, card));
+        }
         if ordered.is_empty() {
             return Ok((Vec::new(), truncated));
         }
@@ -224,7 +232,7 @@ impl SearchEngine {
         ctx: &SpaceContext,
         clock: &Clock,
         hits: Vec<SearchHit>,
-        recall: Option<Recall>,
+        recall: Option<Recall<'_>>,
         chats: &mut Vec<ChatSearchHit>,
         mut visibility_head: SpaceSeq,
     ) -> Result<(Vec<SearchHit>, bool), PortError> {
@@ -447,7 +455,7 @@ fn hit_chunks(
     Ok(ranked.into_iter().map(|(_, chunk)| chunk).collect())
 }
 
-fn pack(hits: &mut Vec<SearchHit>, recall: Recall) -> bool {
+fn pack(hits: &mut Vec<SearchHit>, recall: Recall<'_>) -> bool {
     let had_chunks: Vec<bool> = hits.iter().map(|hit| !hit.chunks.is_empty()).collect();
     let mut remaining = recall.tokens;
     let cap = recall.max_per_source.map_or(remaining, u32::from);
@@ -456,10 +464,21 @@ fn pack(hits: &mut Vec<SearchHit>, recall: Recall) -> bool {
         .iter()
         .map(|hit| vec![false; hit.chunks.len()])
         .collect();
+    let framing = |hit: &SearchHit, first| {
+        recall.recipient.map_or(0, |recipient| {
+            recipient.framing_tokens(&hit.card.document.provenance().reference().note_id, first)
+        })
+    };
     let mut truncated = false;
     for ((hit, mask), source) in hits.iter().zip(&mut selected).zip(&mut source_remaining) {
         if let Some(part) = hit.chunks.first() {
-            truncated |= !choose(part, &mut mask[0], &mut remaining, source);
+            truncated |= !choose(
+                part,
+                framing(hit, true),
+                &mut mask[0],
+                &mut remaining,
+                source,
+            );
         }
     }
     let mut tail = Vec::new();
@@ -477,6 +496,7 @@ fn pack(hits: &mut Vec<SearchHit>, recall: Recall) -> bool {
     for (_, note, rank) in tail {
         truncated |= !choose(
             &hits[note].chunks[rank],
+            framing(&hits[note], source_remaining[note] == cap),
             &mut selected[note][rank],
             &mut remaining,
             &mut source_remaining[note],
@@ -493,12 +513,21 @@ fn pack(hits: &mut Vec<SearchHit>, recall: Recall) -> bool {
     truncated
 }
 
-fn choose(chunk: &SearchPart, selected: &mut bool, remaining: &mut u32, source: &mut u32) -> bool {
+fn choose(
+    chunk: &SearchPart,
+    framing: u32,
+    selected: &mut bool,
+    remaining: &mut u32,
+    source: &mut u32,
+) -> bool {
     let cost = chunk.part().tokens();
-    if cost > *source || cost > *remaining {
+    let Some(charge) = cost.checked_add(framing) else {
+        return false;
+    };
+    if cost > *source || charge > *remaining {
         return false;
     }
-    *remaining -= cost;
+    *remaining -= charge;
     *source -= cost;
     *selected = true;
     true

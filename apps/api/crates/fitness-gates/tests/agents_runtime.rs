@@ -51,6 +51,7 @@ use notarium_canonical::{
     CanonicalConfig, CanonicalRuntime, CanonicalStore, PgConnectConfig, PgTransport,
     SqlBackendConfig,
 };
+use notarium_collab::CollabHub;
 use notarium_control::{
     keyring::{Keyring, KeyringLocation},
     outbound::{NetworkPolicy, OutboundTransport},
@@ -81,6 +82,7 @@ struct RuntimeFixture {
     canonical_config: CanonicalConfig,
     keyring: Arc<Keyring>,
     runtime: CanonicalRuntime,
+    collab: CollabHub,
     control: Arc<ControlService>,
     control_plane: Arc<ControlPlane>,
     revocations: Arc<RevocationHub>,
@@ -132,7 +134,7 @@ impl RuntimeFixture {
         let (canonical, runtime) = CanonicalRuntime::open(config.clone()).await.unwrap();
         let revocations = Arc::new(RevocationHub::new_local());
         let projections = Arc::new(ProjectionFixtures::default());
-        let (control, control_plane, registry, human) = Self::bind_owners(
+        let (control, control_plane, registry, human, collab) = Self::bind_owners(
             &storage,
             &canonical,
             keyring.clone(),
@@ -147,6 +149,7 @@ impl RuntimeFixture {
             canonical_config: config,
             keyring,
             runtime,
+            collab,
             control,
             control_plane,
             revocations,
@@ -169,14 +172,20 @@ impl RuntimeFixture {
         Arc<ControlPlane>,
         Arc<ToolRegistry>,
         AccountContext,
+        CollabHub,
     ) {
         let catalog = Arc::new(SystemAbilityCatalog::new(Arc::new(canonical.clone())));
         let owner = PrincipalId::from_bytes([4; 16]);
+        let collab = CollabHub::new(canonical.clone(), Default::default()).unwrap();
+        collab.register().unwrap();
         let control = Arc::new(
             ControlService::open(
                 storage.store.clone(),
                 catalog.clone(),
-                Arc::new(engine::TestRevocations(revocations, projections.clone())),
+                collab.revocations(Arc::new(engine::TestRevocations(
+                    revocations,
+                    projections.clone(),
+                ))),
                 storage.clock.clone(),
                 ControlConfig {
                     authentication: AuthenticationMode::TrustedNone { owner },
@@ -231,7 +240,7 @@ impl RuntimeFixture {
             Arc::new(TestEngine(canonical.clone(), projections)),
             control.clone(),
         ));
-        (control, control_plane, registry, human)
+        (control, control_plane, registry, human, collab)
     }
 
     async fn reopen_fenced(self, scope: &notarium_core::model::HistoryScope) -> Self {
@@ -241,6 +250,7 @@ impl RuntimeFixture {
             canonical_config,
             keyring,
             runtime,
+            collab,
             control,
             control_plane,
             revocations,
@@ -254,6 +264,8 @@ impl RuntimeFixture {
             .await
             .unwrap()
             .active_epoch;
+        collab.shutdown(&budget()).await.unwrap();
+        drop(collab);
         revocations.close();
         drop(registry);
         drop(control_plane);
@@ -277,7 +289,7 @@ impl RuntimeFixture {
                 .unwrap();
         }
         let revocations = Arc::new(RevocationHub::new_local());
-        let (control, control_plane, registry, human) = Self::bind_owners(
+        let (control, control_plane, registry, human, collab) = Self::bind_owners(
             &storage,
             &canonical,
             keyring.clone(),
@@ -292,6 +304,7 @@ impl RuntimeFixture {
             canonical_config,
             keyring,
             runtime,
+            collab,
             control,
             control_plane,
             revocations,
@@ -368,12 +381,15 @@ impl RuntimeFixture {
             storage,
             canonical,
             runtime,
+            collab,
             control,
             control_plane,
             registry,
             temporary_blob_root,
             ..
         } = self;
+        collab.shutdown(&budget()).await.unwrap();
+        drop(collab);
         drop(registry);
         drop(control_plane);
         drop(control);

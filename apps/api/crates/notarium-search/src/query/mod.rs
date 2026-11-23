@@ -19,15 +19,16 @@ use notarium_core::{
     ids::{FolderId, NoteId, PrincipalId},
     model::{DenseNodeId, FolderRef, SnapshotCut},
     ports::{
-        PortFuture, RecallQuery, SearchDegradation, SearchPort, SearchQuery, SearchResult,
-        SpaceContext, StructuralSnapshot,
+        PortFuture, RecallQuery, RecallRecipient, SearchDegradation, SearchPort, SearchQuery,
+        SearchResult, SpaceContext, StructuralSnapshot,
     },
     query::Predicate,
 };
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 #[derive(Clone, Copy)]
-struct Recall {
+struct Recall<'a> {
+    recipient: Option<&'a dyn RecallRecipient>,
     graph_depth: u8,
     tokens: u32,
     max_per_source: Option<u16>,
@@ -38,7 +39,12 @@ impl SearchPort for SearchEngine {
         Box::pin(self.run_query(ctx, request, None))
     }
 
-    fn recall(&self, ctx: SpaceContext, request: RecallQuery) -> PortFuture<'_, SearchResult> {
+    fn recall_for<'a>(
+        &'a self,
+        ctx: SpaceContext,
+        request: RecallQuery,
+        recipient: Option<&'a dyn RecallRecipient>,
+    ) -> PortFuture<'a, SearchResult> {
         Box::pin(async move {
             if request.graph_depth > RecallQuery::MAX_GRAPH_DEPTH {
                 return Err(invalid(ValidationReason::InvalidLimit));
@@ -50,6 +56,7 @@ impl SearchPort for SearchEngine {
                 ctx,
                 request.query,
                 Some(Recall {
+                    recipient,
                     graph_depth: request.graph_depth,
                     tokens: request.token_budget,
                     max_per_source: request.max_per_source,
@@ -65,7 +72,7 @@ impl SearchEngine {
         &self,
         ctx: SpaceContext,
         request: SearchQuery,
-        recall: Option<Recall>,
+        recall: Option<Recall<'_>>,
     ) -> Result<SearchResult, PortError> {
         let clock = Clock::new(&ctx.budget)?;
         clock
@@ -77,7 +84,7 @@ impl SearchEngine {
         &self,
         mut ctx: SpaceContext,
         request: SearchQuery,
-        recall: Option<Recall>,
+        recall: Option<Recall<'_>>,
         clock: &Clock,
     ) -> Result<SearchResult, PortError> {
         let browse = request.text.trim().is_empty();

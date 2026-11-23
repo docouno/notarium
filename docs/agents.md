@@ -97,11 +97,15 @@ effect enters the transaction, it holds the authority lease through settlement.
 A SpaceGroup run is confined to its shared Space. The queue admits up to 16
 pending inputs per thread. Enqueue and run completion serialize on the current
 run, so an accepted input remains reachable during handoff. The supervisor
-revalidates the queued sender and preserves their selected run options. A
+revalidates the queued sender and preserves their selected run options. If the
+first append to an idle thread loses its acknowledgement, a retry with the same
+identity can start the reply once while the original sender registration is
+live. Completed submissions return their original receipt. A
 queued input after an intervening peer message is materialized as an ordinary
 Human entry from its sender. Starting a new run requires a separate activation.
 Redaction erases the peer body and retains the minimum author and turn
-classification needed for this rule. Peer messages reach the model with their
+classification needed for this rule. Repeating a committed redaction preserves
+streams opened against the updated history. Peer messages reach the model with their
 canonical author and an untrusted-content marker. The initiating principal
 can stop its run. Stopping another participant's run requires current Owner
 or Editor access to the Space. The supervisor holds the authority lease through

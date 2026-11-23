@@ -200,8 +200,15 @@ impl ViewGraphPort for RejectingPorts {
 impl SearchPort for RejectingPorts {
     reject! {
     fn search(&self, ctx: SpaceContext, request: SearchQuery) -> PortFuture<'_, SearchResult>;
-    fn recall(&self, ctx: SpaceContext, request: RecallQuery) -> PortFuture<'_, SearchResult>;
         }
+    fn recall_for<'a>(
+        &'a self,
+        _: SpaceContext,
+        _: RecallQuery,
+        _: Option<&'a dyn RecallRecipient>,
+    ) -> PortFuture<'a, SearchResult> {
+        Box::pin(async { Err(DomainError::ResourceNotFound.into()) })
+    }
 }
 impl ContentJobPort for RejectingPorts {
     reject! {

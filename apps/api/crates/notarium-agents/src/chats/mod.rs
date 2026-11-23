@@ -16,7 +16,7 @@ use std::{
 
 use notarium_core::{
     DomainError,
-    auth::{ChatAudience, EngineAuthContext, PrincipalKind},
+    auth::{ChatAudience, EngineAuthContext, PrincipalKind, ProposalHumanAccess},
     classes::DocClass,
     error::{CommitEffect, OperationalFailure, PortError, RetryAdvice, ValidationReason},
     ids::*,
@@ -283,6 +283,7 @@ impl AgentRunSupervisor {
             }
             let gate = service.thread_gate(&request.scope, &request.thread);
             let _admission = gate.lock().await;
+            let owner = service.independent_chat_human(&account).await?;
             let ctx = SpaceContext::new(
                 account.auth().clone(),
                 request.scope.clone(),
@@ -292,7 +293,12 @@ impl AgentRunSupervisor {
                 .thread_at(ctx, &request.thread, request.expected_leaf)
                 .await?;
             match service
-                .launch(account, request, branch.thread, None)
+                .launch(
+                    AccountContext::new(owner, account.budget),
+                    request,
+                    branch.thread,
+                    None,
+                )
                 .await?
             {
                 LaunchOutcome::Started(run) => Ok(run),
@@ -483,18 +489,30 @@ impl AgentRunSupervisor {
                 .control()
                 .fence_canonical_effect(account.auth().clone(), ctx, CanonicalEffect::ChatRedaction)
                 .await?;
-            let mut holds = service
-                .inner
-                .threads
-                .lock()
-                .expect("thread registry lock")
-                .streams
-                .get(&(scope.clone(), thread.clone()))
-                .into_iter()
-                .flatten()
-                .filter_map(Weak::upgrade)
-                .map(|stream| stream.pause_for_redaction())
-                .collect::<Vec<_>>();
+            // A redaction changes the thread revision. Once this precondition
+            // is stale, the writer can only replay a receipt or reject the
+            // command. Runs admitted since that commit use the scrubbed history.
+            let current = service
+                .thread_at(ctx.clone(), &thread, ThreadEntrySeq::ZERO)
+                .await?;
+            let can_change = current.thread.revision == request.input.expected_thread_revision;
+            let mut holds = Vec::new();
+            if can_change
+                && let Some(streams) = service
+                    .inner
+                    .threads
+                    .lock()
+                    .expect("thread registry lock")
+                    .streams
+                    .get(&(scope.clone(), thread.clone()))
+            {
+                holds.extend(
+                    streams
+                        .iter()
+                        .filter_map(Weak::upgrade)
+                        .map(|stream| stream.pause_for_redaction()),
+                );
+            }
             let result = match route.as_ref().map_or(Ok(()), |lease| lease.check()) {
                 Ok(()) => {
                     service
@@ -506,7 +524,7 @@ impl AgentRunSupervisor {
                 }
                 Err(error) => Err(error),
             };
-            if result.is_ok() || result.as_ref().is_err_and(queue::unknown_commit) {
+            if can_change && (result.is_ok() || result.as_ref().is_err_and(queue::unknown_commit)) {
                 if let Some(active) = service.active(&scope, &thread)
                     && active.scope == scope
                 {
@@ -545,6 +563,22 @@ impl AgentRunSupervisor {
             return Err(DomainError::AccessDenied.into());
         }
         Ok(AccountContext::new(auth, account.budget))
+    }
+
+    // A detached turn may prepare a proposal on behalf of its interactive owner.
+    // Keep that credential separate from reads that observe the branch's taint.
+    async fn independent_chat_human(
+        &self,
+        account: &AccountContext,
+    ) -> Result<EngineAuthContext, PortError> {
+        if account.auth().authorize_proposal_confirmation().is_err() {
+            return Ok(account.auth().clone());
+        }
+        self.inner
+            .registry
+            .control()
+            .revalidate_proposal_human(account.clone(), ProposalHumanAccess::Write)
+            .await
     }
 
     async fn admit_chat_route(
@@ -700,6 +734,7 @@ impl AgentRunSupervisor {
             audience,
             requested,
         )?;
+        auth.taint().merge(account.auth().taint());
         let cancellation = Cancellation::default();
         let admission = bounded(&account.budget, MAINTENANCE_BUDGET, cancellation.clone());
         let owner = match &self.inner.coordination {
@@ -762,7 +797,7 @@ impl AgentRunSupervisor {
                 .fence_canonical_effect(
                     account.auth().clone(),
                     SpaceContext::new(
-                        account.auth().clone(),
+                        self.independent_chat_human(&account).await?,
                         request.scope.clone(),
                         account.budget.clone(),
                     )?,

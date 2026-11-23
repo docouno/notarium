@@ -19,6 +19,13 @@ const PROPOSAL_MARKER: &str = "\u{FDD0}notarium_proposed_diff_v1\n";
 pub(super) const MAX_TURN_BYTES: usize = AppendChat::MAX_STRUCTURED_BODY_BYTES;
 const MAX_TURN_CALLS: usize = 64;
 
+pub(super) fn require_human_text(text: &str) -> Result<(), PortError> {
+    if text.is_empty() {
+        return Err(DomainError::validation(ValidationReason::InvalidRange).into());
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(super) enum BodyFormat {
     Plain = 0,

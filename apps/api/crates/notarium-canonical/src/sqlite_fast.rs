@@ -6107,7 +6107,7 @@ impl SqliteSyncItemPlan for RollbackDirectSqliteFastPlan {
         let mut skipped_room_active = Vec::new();
         let mut candidates = BTreeMap::new();
         let mut original_metadata = HashMap::with_capacity(heads_map.len());
-        // Command ends are monotonic. Within each command space_seq orders its events.
+        // The latest non-run revision is either a later human/foreign change or the predecessor.
         let mut history = conn.prepare_cached(
             "WITH touched AS (
                  SELECT entity_key, MIN(space_seq) AS first_run_seq
@@ -6115,12 +6115,8 @@ impl SqliteSyncItemPlan for RollbackDirectSqliteFastPlan {
                  WHERE space_id = ?1 AND entity_type = 'note' AND agent_run_id = ?2
                  GROUP BY entity_key
              )
-             SELECT t.entity_key, EXISTS (
-                        SELECT 1 FROM revisions r
-                        WHERE r.space_id = ?1 AND r.entity_type = 'note' AND r.entity_key = t.entity_key
-                          AND r.visibility_seq > t.first_run_seq AND r.space_seq > t.first_run_seq
-                          AND r.agent_run_id IS NOT ?2
-                    ), pre.rev_id, pre.metadata_msgpack,
+             SELECT t.entity_key, COALESCE(pre.space_seq > t.first_run_seq, FALSE), pre.rev_id,
+                    CASE WHEN pre.space_seq < t.first_run_seq THEN pre.metadata_msgpack END,
                     CASE WHEN s.note_id IS NOT NULL THEN
                         s.room_state <> 'closed' OR COALESCE(c.carrier_dirty, 0) <> 0 OR EXISTS (
                             SELECT 1 FROM collab_update_log u
@@ -6145,7 +6141,7 @@ impl SqliteSyncItemPlan for RollbackDirectSqliteFastPlan {
              LEFT JOIN revisions pre ON pre.rowid = (
                  SELECT r.rowid FROM revisions r
                  WHERE r.space_id = ?1 AND r.entity_type = 'note' AND r.entity_key = t.entity_key
-                   AND r.space_seq < t.first_run_seq
+                   AND r.agent_run_id IS NOT ?2
                  ORDER BY r.visibility_seq DESC, r.space_seq DESC LIMIT 1
              )
              ORDER BY t.entity_key"

@@ -1316,8 +1316,6 @@ pub(crate) fn build_rollback_direct_single_tx_exec(
             let mut trashed_out = Vec::with_capacity(trash_note_count as usize);
             let mut restored_out = Vec::with_capacity(restore_note_count as usize);
             let mut owner_notes_for_receipt: BTreeSet<NoteId> = BTreeSet::new();
-            let mut pending_blob_rebinds: Vec<ExistingBlobRefItem> =
-                Vec::with_capacity(final_eligible.len());
             struct PendingSingleRev {
                 rev_id: RevisionId,
                 entity_type: &'static str,
@@ -1375,17 +1373,6 @@ pub(crate) fn build_rollback_direct_single_tx_exec(
                         vis_i64,
                     )
                     .await?;
-                }
-
-                if let Some(digest) = *content_digest {
-                    pending_blob_rebinds.push(ExistingBlobRefItem {
-                        owner_kind: BlobOwnerKind::NoteRevision,
-                        owner_id: nid.as_str().to_owned(),
-                        owner_rev_id: trev.as_str().to_owned(),
-                        resource_key: "carrier",
-                        digest,
-                        created_seq: tseq,
-                    });
                 }
 
                 let meta = encode_rollback_note(
@@ -1456,17 +1443,6 @@ pub(crate) fn build_rollback_direct_single_tx_exec(
                 let rseq = item_ctx.alloc_next_seq()?;
                 let rrev = new_revision_id()?;
                 let is_root_child = restored_ancestries.get(nid).copied().unwrap_or(false);
-
-                if let Some(digest) = pre_meta.content_digest {
-                    pending_blob_rebinds.push(ExistingBlobRefItem {
-                        owner_kind: BlobOwnerKind::NoteRevision,
-                        owner_id: nid.as_str().to_owned(),
-                        owner_rev_id: rrev.as_str().to_owned(),
-                        resource_key: "carrier",
-                        digest,
-                        created_seq: rseq,
-                    });
-                }
 
                 let title_fold = if pre_meta.doc_class == DocClass::EncryptedNote {
                     normalize_title_key(&pre_meta.slug)
@@ -1585,7 +1561,6 @@ pub(crate) fn build_rollback_direct_single_tx_exec(
                     nsec,
                     auth.principal().as_str(),
                     &pending_restore_heads,
-                    &pending_blob_rebinds,
                     &rev_items,
                 )
                 .await?;
@@ -1601,6 +1576,20 @@ pub(crate) fn build_rollback_direct_single_tx_exec(
                 )
                 .await?;
 
+                let pending_blob_rebinds: Vec<_> = rev_items
+                    .iter()
+                    .filter(|revision| revision.entity_type == "note")
+                    .filter_map(|revision| {
+                        Some(ExistingBlobRefItem {
+                            owner_kind: BlobOwnerKind::NoteRevision,
+                            owner_id: revision.entity_key.to_owned(),
+                            owner_rev_id: revision.rev_id.as_str().to_owned(),
+                            resource_key: "carrier",
+                            digest: revision.content_blake3?,
+                            created_seq: revision.space_seq,
+                        })
+                    })
+                    .collect();
                 bind_existing_active_blob_refs_batch_tx(
                     tx,
                     &scope_cl.space_id,
@@ -4140,7 +4129,6 @@ async fn execute_pg_rollback_domain_writes_cte(
     nsec: i32,
     actor_str: &str,
     restore_heads: &[RestoredHeadUpdateItem<'_>],
-    blob_rebinds: &[ExistingBlobRefItem],
     rev_items: &[RevisionInsertItem<'_>],
 ) -> Result<(), PortError> {
     let mut rh_note_ids: Vec<&str> = Vec::with_capacity(restore_heads.len());
@@ -4173,30 +4161,6 @@ async fn execute_pg_rollback_domain_writes_cte(
         rh_vis_masks.push(i.visibility_mask);
     }
 
-    let mut seen_refs = BTreeSet::new();
-    let mut br_owner_kinds: Vec<&str> = Vec::with_capacity(blob_rebinds.len());
-    let mut br_owner_ids: Vec<&str> = Vec::with_capacity(blob_rebinds.len());
-    let mut br_owner_rev_ids: Vec<&str> = Vec::with_capacity(blob_rebinds.len());
-    let mut br_res_keys: Vec<&str> = Vec::with_capacity(blob_rebinds.len());
-    let mut br_digests: Vec<&[u8]> = Vec::with_capacity(blob_rebinds.len());
-    let mut br_created_seqs: Vec<i64> = Vec::with_capacity(blob_rebinds.len());
-    for it in blob_rebinds {
-        let key = (
-            it.owner_kind.as_db_str(),
-            it.owner_id.as_str(),
-            it.owner_rev_id.as_str(),
-            it.resource_key,
-        );
-        if seen_refs.insert(key) {
-            br_owner_kinds.push(it.owner_kind.as_db_str());
-            br_owner_ids.push(&it.owner_id);
-            br_owner_rev_ids.push(&it.owner_rev_id);
-            br_res_keys.push(it.resource_key);
-            br_digests.push(it.digest.as_bytes().as_slice());
-            br_created_seqs.push(it.created_seq.get() as i64);
-        }
-    }
-
     let mut rv_ids: Vec<&str> = Vec::with_capacity(rev_items.len());
     let mut rv_entity_types: Vec<&str> = Vec::with_capacity(rev_items.len());
     let mut rv_entity_keys: Vec<&str> = Vec::with_capacity(rev_items.len());
@@ -4219,7 +4183,18 @@ async fn execute_pg_rollback_domain_writes_cte(
         rv_runs.push(it.agent_run_id.map(AgentRunId::as_str));
     }
 
-    let expected_refs = br_digests.len() as i64;
+    let carrier_digests = || {
+        rev_items
+            .iter()
+            .filter(|revision| revision.entity_type == "note")
+            .filter_map(|revision| {
+                revision
+                    .content_blake3
+                    .as_ref()
+                    .map(|digest| digest.as_bytes().as_slice())
+            })
+    };
+    let expected_refs = carrier_digests().count() as i64;
     let inserted_refs: i64 = sqlx::query_scalar(
         "WITH upd_restore AS (
             UPDATE note_heads AS nh
@@ -4250,29 +4225,6 @@ async fn execute_pg_rollback_domain_writes_cte(
             )
             WHERE nh.space_id = $1 AND nh.note_id = v.note_id
         ),
-        ref_inputs AS (
-            SELECT * FROM UNNEST($22::TEXT[], $23::TEXT[], $24::TEXT[], $25::TEXT[],
-                                 $26::BYTEA[], $27::BIGINT[])
-                AS u(owner_kind, owner_id, owner_rev_id, res_key, digest, cseq)
-        ),
-        rebound AS (
-            UPDATE blob_catalog AS bc SET ref_count = bc.ref_count + v.delta
-            FROM (SELECT digest, COUNT(*) AS delta FROM ref_inputs GROUP BY digest) AS v
-            WHERE bc.space_id = $1 AND bc.content_blake3 = v.digest
-              AND bc.admission_state = 'open' AND bc.blob_state = 'active'
-              AND bc.current_publication_id IS NOT NULL
-            RETURNING bc.content_blake3, bc.current_publication_id
-        ),
-        ins_refs AS (
-            INSERT INTO blob_references (
-                space_id, owner_kind, owner_id, owner_rev_id, resource_key,
-                content_blake3, publication_id, created_seq
-            )
-            SELECT $1, u.owner_kind, u.owner_id, u.owner_rev_id, u.res_key,
-                   u.digest, r.current_publication_id, u.cseq
-            FROM ref_inputs u JOIN rebound r ON r.content_blake3 = u.digest
-            RETURNING 1
-        ),
         ins_revs AS (
             INSERT INTO revisions (
                 space_id, history_incarnation, rev_id, entity_type, entity_key,
@@ -4288,15 +4240,39 @@ async fn execute_pg_rollback_domain_writes_cte(
                 NULL, $6, NULL, u.agent_run_id,
                 NULL, $4, $5
             FROM UNNEST(
-                $28::TEXT[], $29::TEXT[], $30::TEXT[], $31::BIGINT[],
-                $32::TEXT[], $33::TEXT[], $34::BYTEA[], $35::BYTEA[],
-                $36::TEXT[]
+                $22::TEXT[], $23::TEXT[], $24::TEXT[], $25::BIGINT[],
+                $26::TEXT[], $27::TEXT[], $28::BYTEA[], $29::BYTEA[],
+                $30::TEXT[]
             ) AS u(
                 rev_id, entity_type, entity_key, space_seq,
                 parent_rev_id, restored_rev_id, content_blake3, metadata_msgpack,
                 agent_run_id
             )
-        ), upsert_run AS (
+            RETURNING entity_type, entity_key, rev_id, content_blake3, space_seq
+        ),
+        ref_inputs AS (
+            SELECT entity_key, rev_id, content_blake3 AS digest, space_seq
+            FROM ins_revs WHERE entity_type = 'note' AND content_blake3 IS NOT NULL
+        ),
+        rebound AS (
+            UPDATE blob_catalog AS bc SET ref_count = bc.ref_count + v.delta
+            FROM (SELECT digest, COUNT(*) AS delta FROM ref_inputs GROUP BY digest) AS v
+            WHERE bc.space_id = $1 AND bc.content_blake3 = v.digest
+              AND bc.admission_state = 'open' AND bc.blob_state = 'active'
+              AND bc.current_publication_id IS NOT NULL
+            RETURNING bc.content_blake3, bc.current_publication_id
+        ),
+        ins_refs AS (
+            INSERT INTO blob_references (
+                space_id, owner_kind, owner_id, owner_rev_id, resource_key,
+                content_blake3, publication_id, created_seq
+            )
+            SELECT $1, 'note_revision', u.entity_key, u.rev_id, 'carrier',
+                   u.digest, r.current_publication_id, u.space_seq
+            FROM ref_inputs u JOIN rebound r ON r.content_blake3 = u.digest
+            RETURNING 1
+        ),
+        upsert_run AS (
         INSERT INTO agent_run_heads (
             space_id, history_incarnation, run_id, run_revision, last_seq, updated_at_sec, updated_at_nsec
         ) VALUES ($1, $2, $7, $8, $3, $4, $5)
@@ -4329,12 +4305,6 @@ async fn execute_pg_rollback_domain_writes_cte(
     .bind(rh_byte_sizes)
     .bind(rh_lifecycles)
     .bind(rh_vis_masks)
-    .bind(br_owner_kinds)
-    .bind(br_owner_ids)
-    .bind(br_owner_rev_ids)
-    .bind(br_res_keys)
-    .bind(&br_digests)
-    .bind(br_created_seqs)
     .bind(rv_ids)
     .bind(rv_entity_types)
     .bind(rv_entity_keys)
@@ -4357,7 +4327,7 @@ async fn execute_pg_rollback_domain_writes_cte(
              AND (admission_state <> 'open' OR blob_state <> 'active'))",
         )
         .bind(scope.space_id.as_str())
-        .bind(&br_digests)
+        .bind(carrier_digests().collect::<Vec<_>>())
         .fetch_one(&mut *conn)
         .await
         .map_err(|err| internal_not_committed("pg_rb_rebind_status", err.to_string()))?;

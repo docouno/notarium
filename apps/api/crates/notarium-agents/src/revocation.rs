@@ -423,20 +423,40 @@ impl RevocationHub {
         self.remove_pending_when(key, |_| true);
     }
 
-    /// A direct append receipt settles one submitted command. A different
-    /// command may since have queued this input ID.
-    pub(crate) fn finish_pending_submission(
+    pub(crate) fn pending_submission(
         &self,
         key: &PendingCredentialKey,
         identity: &CommandIdentity,
-    ) {
-        if key.scope == identity.scope {
-            self.remove_pending_when(key, |entry| {
-                entry.auth.principal() == &identity.actor
-                    && entry.command_key == identity.key
-                    && entry.command_hash == identity.hash
-            });
+        auth: &EngineAuthContext,
+    ) -> Option<PendingCredential> {
+        self.pending(key).filter(|entry| {
+            key.scope == identity.scope
+                && entry.auth.principal() == &identity.actor
+                && entry.command_key == identity.key
+                && entry.command_hash == identity.hash
+                && entry.auth.credential() == auth.credential()
+                && entry.auth.grant() == auth.grant()
+        })
+    }
+
+    /// Claim the admitted sender's one post-append handoff after re-reading the
+    /// branch. A stale receipt cannot settle another use of the same input ID.
+    pub(crate) fn take_pending_submission(
+        &self,
+        key: &PendingCredentialKey,
+        selected: &PendingCredential,
+    ) -> Option<PendingCredential> {
+        let mut state = self.inner.lock();
+        let entry = state.pending.get(key)?;
+        if entry.registration != selected.registration
+            || state.fenced(&entry.selectors)
+            || state.closed
+        {
+            return None;
         }
+        let removed = state.pending.remove(key)?;
+        removed.cancellation.cancel();
+        Some(removed)
     }
 
     pub(crate) fn finish_registered_pending(&self, registration: PendingRegistration) {

@@ -148,7 +148,7 @@ async fn note_policy(
     Ok(admitted)
 }
 
-async fn admit_metadata(
+pub(super) async fn admit_metadata(
     call: &ToolCallContext<'_>,
     scope: &SpaceContext,
     metadata: &ClassifiedMetadata,
@@ -208,19 +208,24 @@ pub(super) async fn note_document(
 pub(super) async fn search_part(
     call: &mut ToolCallContext<'_>,
     scope: &SpaceContext,
+    card: &ClassifiedMetadata,
     part: &SearchPart,
 ) -> Result<String, PortError> {
     let document = part.provenance();
     if let Some(selection) = note_policy(call, scope, document.reference(), |project| {
-        part.in_project(project)
+        card.in_project(project) && part.in_project(project)
     })
     .await?
     {
+        let origin =
+            ClassEgressFence::provider_note_metadata(card, scope.auth(), &selection.policy)?;
         let content =
             ClassEgressFence::provider_part(part.part().clone(), scope.auth(), &selection.policy)?;
+        call.record_origin(origin, selection.project_only.clone())?;
         call.record_origin(document.origin(), selection.project_only)?;
         Ok(content.text().to_owned())
     } else {
+        ClassEgressFence::mcp_note_metadata(card, scope.auth())?;
         Ok(
             ClassEgressFence::search_part(part.part().clone(), scope.auth())?
                 .text()

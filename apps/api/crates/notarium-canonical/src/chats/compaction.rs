@@ -4,12 +4,20 @@ use notarium_core::ports::PageLimit;
 
 use super::*;
 
+// Historical empty human entries remain readable in the audit branch. Omit them
+// from both live prompts and compaction proofs before hydration adds group attribution.
+fn empty_human(entry: &ChatEntry) -> bool {
+    entry.kind == ChatEntryKind::Human
+        && matches!(&entry.body, ChatBody::Inline(text) if text.is_empty())
+}
+
 pub(super) async fn context(
     store: &CanonicalStore,
     ctx: SpaceContext,
     request: ChatRead,
 ) -> Result<ChatBranch, PortError> {
     let mut branch = store.read_chat(ctx.clone(), request).await?;
+    branch.entries.retain(|entry| !empty_human(entry));
     let Some(index) = branch
         .entries
         .iter()
@@ -91,7 +99,7 @@ async fn oldest_prefix(
                         .unwrap_or(entry.seq);
                     checkpoint = Some((page_tip, entry));
                 }
-            } else if entry.kind != ChatEntryKind::Redacted {
+            } else if entry.kind != ChatEntryKind::Redacted && !empty_human(&entry) {
                 retained.push_front((page_tip, entry));
                 if retained.len() > limit {
                     retained.pop_back();

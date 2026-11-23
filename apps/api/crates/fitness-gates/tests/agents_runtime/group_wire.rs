@@ -224,21 +224,21 @@ async fn group_turn(
         model: Some(local.model),
         ..ChatRunOptions::default()
     };
-    let submission = supervisor
-        .enqueue_input(
-            human.clone(),
-            SubmitUserChatInput {
-                identity: command(scope, 2),
-                id: PendingInputId::from_bytes([tag; 16]),
-                thread: thread.clone(),
-                expected_leaf: peer_entry.seq,
-                body: OWNER_TEXT.into(),
-                mentions_agent: true,
-            },
-            options.clone(),
-        )
-        .await
-        .unwrap();
+    let submission = super::supervised_chat_cases::retry_unacknowledged_append(
+        fixture,
+        &supervisor,
+        human,
+        SubmitUserChatInput {
+            identity: command(scope, 2),
+            id: PendingInputId::from_bytes([tag; 16]),
+            thread: thread.clone(),
+            expected_leaf: peer_entry.seq,
+            body: OWNER_TEXT.into(),
+            mentions_agent: true,
+        },
+        &options,
+    )
+    .await;
     let SubmitUserChatOutcome::Appended(sender) = submission.outcome else {
         panic!("expected the sender's turn to append");
     };

@@ -56,73 +56,104 @@ impl AgentRunSupervisor {
                 CanonicalEffect::ChatInput,
             )
             .await?;
-        if let Some(outcome) = engine.lookup_user_chat_input(lookup, &input).await? {
-            if matches!(outcome, SubmitUserChatOutcome::Appended(_)) {
+        let identity = input.identity.clone();
+        let mentions_agent = input.mentions_agent;
+        let (outcome, may_start) =
+            if let Some(outcome) = engine.lookup_user_chat_input(lookup, &input).await? {
+                (outcome, true)
+            } else {
+                let owner = self.independent_chat_human(&account).await?;
+                let latest = self
+                    .thread_at(ctx.clone(), &thread, ThreadEntrySeq::ZERO)
+                    .await?;
+                if latest.thread.kind == ChatThreadKind::KeeperLog {
+                    return Err(DomainError::SpaceReadOnly.into());
+                }
+                let pending = self.inner.revocations.register_pending(
+                    maintenance(account.budget.clone()),
+                    key.clone(),
+                    owner,
+                    &input.identity,
+                    options,
+                )?;
+                let mut submitted = self
+                    .publish_input(ctx.clone(), input.clone(), &mut route)
+                    .await;
+                if let Err(first) = &submitted
+                    && unknown_commit(first)
+                    && !ownership_lost.is_cancelled()
+                    && route.as_ref().is_none_or(|lease| lease.check().is_ok())
+                {
+                    match self.publish_input(ctx.clone(), input, &mut route).await {
+                        Ok(outcome) => submitted = Ok(outcome),
+                        Err(retry) if unknown_commit(&retry) => submitted = Err(retry),
+                        Err(_) => (),
+                    }
+                }
+                let outcome = match submitted {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        if !unknown_commit(&error) {
+                            self.inner.revocations.rollback_pending(pending);
+                        }
+                        return Err(error);
+                    }
+                };
+                if matches!(
+                    outcome,
+                    SubmitUserChatOutcome::Full { .. } | SubmitUserChatOutcome::Changed
+                ) {
+                    self.inner.revocations.finish_registered_pending(pending);
+                }
+                (
+                    outcome,
+                    latest.thread.kind == ChatThreadKind::Personal || mentions_agent,
+                )
+            };
+        let mut run = None;
+        if let SubmitUserChatOutcome::Appended(entry) = &outcome
+            && let Some(sender) =
                 self.inner
                     .revocations
-                    .finish_pending_submission(&key, &input.identity);
-            }
-            return Ok(ChatSubmission { outcome, run: None });
-        }
-        let latest = self
-            .thread_at(ctx.clone(), &thread, ThreadEntrySeq::ZERO)
-            .await?;
-        if latest.thread.kind == ChatThreadKind::KeeperLog {
-            return Err(DomainError::SpaceReadOnly.into());
-        }
-        let pending = self.inner.revocations.register_pending(
-            maintenance(account.budget.clone()),
-            key,
-            account.auth().clone(),
-            &input.identity,
-            options.clone(),
-        )?;
-        let mentions_agent = input.mentions_agent;
-        let mut submitted = self
-            .publish_input(ctx.clone(), input.clone(), &mut route)
-            .await;
-        if let Err(first) = &submitted
-            && unknown_commit(first)
-            && !ownership_lost.is_cancelled()
-            && route.as_ref().is_none_or(|lease| lease.check().is_ok())
+                    .pending_submission(&key, &identity, account.auth())
         {
-            match self.publish_input(ctx.clone(), input, &mut route).await {
-                Ok(outcome) => submitted = Ok(outcome),
-                Err(retry) if unknown_commit(&retry) => submitted = Err(retry),
-                Err(_) => (),
+            let active = self.active(&scope, &thread);
+            let branch = if active.is_none() && may_start {
+                Some(self.thread_at(ctx, &thread, entry.value.seq).await?)
+            } else {
+                None
+            };
+            if let Some(lease) = &route {
+                lease.check()?;
             }
-        }
-        drop(route);
-        let outcome = match submitted {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                if !unknown_commit(&error) {
-                    self.inner.revocations.rollback_pending(pending);
-                }
-                return Err(error);
-            }
-        };
-        if matches!(outcome, SubmitUserChatOutcome::Queued(_)) {
-            return Ok(ChatSubmission { outcome, run: None });
-        }
-        self.inner.revocations.finish_registered_pending(pending);
-        let mut run = None;
-        if let SubmitUserChatOutcome::Appended(entry) = &outcome {
-            if let Some(active) = self.active(&scope, &thread) {
-                active.stream.committed(&entry.value, None)?;
-            }
-            if latest.thread.kind == ChatThreadKind::Personal || mentions_agent {
-                let start = StartChatRun {
-                    scope,
-                    thread: thread.clone(),
-                    expected_leaf: entry.value.seq,
-                    options,
-                };
-                if let Ok(branch) = self.thread_at(ctx, &thread, entry.value.seq).await
-                    && let Ok(LaunchOutcome::Started(id)) =
-                        self.launch(account, start, branch.thread, None).await
+            drop(route);
+            if let Some(credential) = self
+                .inner
+                .revocations
+                .take_pending_submission(&key, &sender)
+            {
+                if let Some(active) = active {
+                    active.stream.committed(&entry.value, None)?;
+                } else if let Some(branch) = branch
+                    && branch.thread.active_run.is_none()
+                    && branch.thread.head == entry.value.seq
+                    && (branch.thread.kind == ChatThreadKind::Personal || mentions_agent)
+                    && branch.entries.iter().any(|current| {
+                        current.seq == entry.value.seq && current.kind == ChatEntryKind::Human
+                    })
                 {
-                    run = Some(id);
+                    let start = StartChatRun {
+                        scope,
+                        thread,
+                        expected_leaf: entry.value.seq,
+                        options: credential.options().clone(),
+                    };
+                    let owner = AccountContext::new(credential.auth().clone(), account.budget);
+                    if let Ok(LaunchOutcome::Started(id)) =
+                        self.launch(owner, start, branch.thread, None).await
+                    {
+                        run = Some(id);
+                    }
                 }
             }
         }
@@ -230,11 +261,9 @@ impl AgentRunSupervisor {
                 *unsettled = None;
                 continue;
             };
-            let writer = SpaceContext::new(
-                account.auth().clone(),
-                run.scope.clone(),
-                account.budget.clone(),
-            )?;
+            let reader = self.independent_chat_human(&account).await?;
+            let writer =
+                SpaceContext::new(reader.clone(), run.scope.clone(), account.budget.clone())?;
             let writer = match self
                 .inner
                 .registry
@@ -310,11 +339,8 @@ impl AgentRunSupervisor {
                             account.auth().clone(),
                             cleanup_budget(&run.request),
                         );
-                        let next_context = SpaceContext::new(
-                            follow.auth().clone(),
-                            run.scope.clone(),
-                            follow.budget.clone(),
-                        )?;
+                        let next_context =
+                            SpaceContext::new(reader, run.scope.clone(), follow.budget.clone())?;
                         match self.thread_at(next_context, &run.thread, entry.seq).await {
                             Ok(branch) => {
                                 if self

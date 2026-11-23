@@ -713,11 +713,13 @@ impl<'a> ToolCallContext<'a> {
         else {
             return Ok(None);
         };
+        let mut source = source.clone();
+        source.budget = self.budget();
         let selection = self
             .registry
             .control
             .select_provider(
-                source.clone(),
+                source,
                 SelectProvider {
                     kind: PreferenceModelKind::Completion,
                     resource: Some(provider.clone()),

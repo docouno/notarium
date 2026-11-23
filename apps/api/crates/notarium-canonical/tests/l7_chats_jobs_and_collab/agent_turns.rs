@@ -89,6 +89,14 @@ async fn original_human_classifier(store: &CanonicalStore) {
     };
     let bob_pending = pending(&bob, 0xa2, ThreadEntrySeq::ZERO);
     let carol_pending = pending(&carol, 0xa3, ThreadEntrySeq::ZERO);
+    let mut empty = bob_pending.clone();
+    empty.body.clear();
+    assert_validation_err(
+        &store
+            .queue_chat_input(thread_ctx(&bob), next_mutation(&scope, &bob, empty))
+            .await,
+        ValidationReason::InvalidRange,
+    );
     for item in [&bob_pending, &carol_pending] {
         assert!(matches!(
             store
@@ -677,6 +685,36 @@ async fn submitted_input_replays_across_route_changes(store: &CanonicalStore) {
     };
 
     let direct = input(0xe5, ThreadEntrySeq::ZERO);
+    let mut empty = direct.clone();
+    empty.body.clear();
+    assert_validation_err(
+        &store.submit_user_chat_input(human(), empty).await,
+        ValidationReason::InvalidRange,
+    );
+    assert_validation_err(
+        &store
+            .append_chat(
+                human(),
+                next_mutation(
+                    &scope,
+                    &owner,
+                    AppendChat {
+                        thread: thread.clone(),
+                        parent: ThreadEntrySeq::ZERO,
+                        kind: ChatEntryKind::Human,
+                        body: ChatInputBody::Text(String::new()),
+                        tool_calls: vec![],
+                        interruption: None,
+                        provenance: None,
+                        proposed_diff: None,
+                        referenced_notes: vec![],
+                        tainted: false,
+                    },
+                ),
+            )
+            .await,
+        ValidationReason::InvalidRange,
+    );
     lose_ack();
     assert!(matches!(
         store.submit_user_chat_input(human(), direct.clone()).await,

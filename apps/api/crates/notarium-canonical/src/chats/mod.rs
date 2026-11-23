@@ -3307,6 +3307,12 @@ async fn append_chat_impl(
         return Ok(replayed.into_committed());
     }
 
+    if request.input.kind == ChatEntryKind::Human
+        && let ChatInputBody::Text(text) = &request.input.body
+    {
+        content::require_human_text(text)?;
+    }
+
     let prefix = deadline
         .prepare(&ctx.budget, || {
             compaction::verify_prefix(store, ctx.clone(), &request)
@@ -4032,6 +4038,7 @@ async fn queue_chat_input_impl(
         return Ok(QueueInputOutcome::Queued(replayed.into_committed()));
     }
 
+    content::require_human_text(&request.input.body)?;
     let Some(admission) = admission? else {
         return Ok(QueueInputOutcome::Changed);
     };

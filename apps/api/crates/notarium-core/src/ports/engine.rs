@@ -157,6 +157,8 @@ pub trait ChatPort: Send + Sync {
     fn read_chat(&self, ctx: SpaceContext, request: ChatRead) -> PortFuture<'_, ChatBranch>;
     /// A bounded prompt window. A live prefix checkpoint is presented before
     /// its retained original suffix, with its durable sequence unchanged.
+    /// Prompt windows omit historical empty human entries, which remain available
+    /// through the audit reader.
     fn read_chat_context(&self, ctx: SpaceContext, request: ChatRead)
     -> PortFuture<'_, ChatBranch>;
     /// Read the oldest logical window when the suffix extends beyond a single page.
@@ -284,9 +286,24 @@ pub trait LinkReadPort: Send + Sync {
         limit: PageLimit,
     ) -> PortFuture<'_, ChatBacklinkPage>;
 }
+/// Recipient-specific admission of ranked cards before loading and budgeting their chunks.
+/// The final consumer still validates the exact source when disclosing its content.
+pub trait RecallRecipient: Send + Sync {
+    fn admit<'a>(&'a self, card: &'a crate::classes::ClassifiedMetadata) -> PortFuture<'a, bool>;
+    fn framing_tokens(&self, note: &NoteId, first_chunk: bool) -> u32;
+}
+
 pub trait SearchPort: Send + Sync {
     fn search(&self, ctx: SpaceContext, request: SearchQuery) -> PortFuture<'_, SearchResult>;
-    fn recall(&self, ctx: SpaceContext, request: RecallQuery) -> PortFuture<'_, SearchResult>;
+    fn recall(&self, ctx: SpaceContext, request: RecallQuery) -> PortFuture<'_, SearchResult> {
+        self.recall_for(ctx, request, None)
+    }
+    fn recall_for<'a>(
+        &'a self,
+        ctx: SpaceContext,
+        request: RecallQuery,
+        recipient: Option<&'a dyn RecallRecipient>,
+    ) -> PortFuture<'a, SearchResult>;
 }
 pub trait ContentJobPort: Send + Sync {
     fn create_job(
