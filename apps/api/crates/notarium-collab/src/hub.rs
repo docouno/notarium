@@ -757,7 +757,8 @@ impl HubInner {
     }
 
     /// Lock order across `HubInner` is strictly:
-    /// `peers` -> `active` -> `pending_revoke_settlement`.
+    /// `peers` -> `active` -> `{pending_revoke_settlement, unsettled_shutdown_rooms}`
+    /// (the two leaf mutexes under `active` are never nested inside each other).
     pub fn unregister_peer(&self, id: u64, revoked: bool) {
         let mut peers = self.peers.lock().expect("peer registry");
         if revoked && let Some(peer) = peers.get(&id) {
@@ -1117,15 +1118,28 @@ impl HubInner {
             .remove(&(scope.clone(), note.clone()));
     }
 
-    fn prune_unsettled_for_current_scopes(&self, current_scopes: &HashMap<SpaceId, HistoryScope>) {
-        self.unsettled_shutdown_rooms
+    /// Prunes only pre-snapshotted `candidates` whose Space has since moved to
+    /// a confirmed different incarnation in `current_scopes`. Snapshotting
+    /// candidates BEFORE the linearizable `read_current_history_scope` call
+    /// guarantees a stale scope snapshot can never erase an entry inserted for
+    /// a newer incarnation after the read began.
+    fn prune_unsettled_for_current_scopes(
+        &self,
+        candidates: &[(HistoryScope, NoteId)],
+        current_scopes: &HashMap<SpaceId, HistoryScope>,
+    ) {
+        let mut unsettled = self
+            .unsettled_shutdown_rooms
             .lock()
-            .expect("shutdown rooms")
-            .retain(|(scope, _)| {
-                current_scopes
-                    .get(&scope.space_id)
-                    .is_none_or(|current| current == scope)
-            });
+            .expect("shutdown rooms");
+        for key @ (scope, _) in candidates {
+            if current_scopes
+                .get(&scope.space_id)
+                .is_some_and(|current| current != scope)
+            {
+                unsettled.remove(key);
+            }
+        }
     }
 
     async fn recover_fenced_room(
@@ -1825,12 +1839,30 @@ async fn watch_storage(
                 }
             }
             Ok(SpaceSignal::IncarnationChanged { new_scope, .. }) => {
-                hub.unsettled_shutdown_rooms
-                    .lock()
-                    .expect("shutdown rooms")
-                    .retain(|(scope, _)| {
-                        scope.space_id != new_scope.space_id || scope == new_scope
-                    });
+                let unsettled_candidates: Vec<(HistoryScope, NoteId)> = {
+                    let unsettled = hub.unsettled_shutdown_rooms.lock().expect("shutdown rooms");
+                    unsettled
+                        .iter()
+                        .filter(|(scope, _)| {
+                            scope.space_id == new_scope.space_id && scope != new_scope
+                        })
+                        .cloned()
+                        .collect()
+                };
+                if !unsettled_candidates.is_empty() {
+                    let budget = hub.budget();
+                    if let Ok(current) = hub
+                        .store
+                        .read_current_history_scope(Some(&budget), &new_scope.space_id)
+                        .await
+                    {
+                        let current_scopes = HashMap::from([(new_scope.space_id.clone(), current)]);
+                        hub.prune_unsettled_for_current_scopes(
+                            &unsettled_candidates,
+                            &current_scopes,
+                        );
+                    }
+                }
                 let stale_guards: Vec<_> = {
                     let peers = hub.peers.lock().expect("peer registry");
                     peers
@@ -1859,14 +1891,19 @@ async fn watch_storage(
                         .filter_map(|peer| Some((peer.ctx.scope().clone(), peer.guard.upgrade()?)))
                         .collect()
                 };
+                let unsettled_candidates: Vec<(HistoryScope, NoteId)> = {
+                    let unsettled = hub.unsettled_shutdown_rooms.lock().expect("shutdown rooms");
+                    unsettled.iter().cloned().collect()
+                };
                 let mut unique_spaces: HashSet<SpaceId> = peer_scopes
                     .iter()
                     .map(|(scope, _)| scope.space_id.clone())
                     .collect();
-                {
-                    let unsettled = hub.unsettled_shutdown_rooms.lock().expect("shutdown rooms");
-                    unique_spaces.extend(unsettled.iter().map(|(scope, _)| scope.space_id.clone()));
-                }
+                unique_spaces.extend(
+                    unsettled_candidates
+                        .iter()
+                        .map(|(scope, _)| scope.space_id.clone()),
+                );
                 let mut current_scopes = HashMap::with_capacity(unique_spaces.len());
                 for space_id in unique_spaces {
                     let budget = hub.budget();
@@ -1878,7 +1915,7 @@ async fn watch_storage(
                         current_scopes.insert(space_id, current);
                     }
                 }
-                hub.prune_unsettled_for_current_scopes(&current_scopes);
+                hub.prune_unsettled_for_current_scopes(&unsettled_candidates, &current_scopes);
                 for (peer_scope, guard) in peer_scopes {
                     if current_scopes
                         .get(&peer_scope.space_id)
@@ -2440,23 +2477,49 @@ mod tests {
             "recover_fenced_room Ok(false) over unhosted Active must preserve unsettled marker"
         );
 
-        // 5. `prune_unsettled_for_current_scopes` removes confirmed stale incarnations
-        //    while preserving current scopes and spaces whose scope could not be read.
+        // 5. `prune_unsettled_for_current_scopes` removes only pre-snapshotted
+        //    confirmed stale incarnations while preserving current scopes,
+        //    spaces whose scope could not be read, and entries inserted for a
+        //    newer incarnation AFTER the candidate snapshot.
         let other_space = SpaceId::from_bytes([41; 16]);
         let other_scope = HistoryScope {
             space_id: other_space.clone(),
             incarnation: HistoryIncarnation::from_bytes([42; 16]),
         };
+        let scope_v3 = HistoryScope {
+            space_id: space_id.clone(),
+            incarnation: HistoryIncarnation::from_bytes([46; 16]),
+        };
+        let note_b = NoteId::from_bytes([47; 16]);
+        let note_c = NoteId::from_bytes([48; 16]);
+        {
+            let mut unsettled = hub.0.unsettled_shutdown_rooms.lock().unwrap();
+            unsettled.insert((other_scope.clone(), note.clone()));
+            unsettled.insert((scope_v2.clone(), note_b.clone()));
+        }
+        let candidates: Vec<_> = hub
+            .0
+            .unsettled_shutdown_rooms
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect();
+        // Simulate a concurrent restore to `scope_v3` + unsettled exit AFTER
+        // candidates were snapshotted and `current_scopes` read `scope_v2`.
         hub.0
             .unsettled_shutdown_rooms
             .lock()
             .unwrap()
-            .insert((other_scope.clone(), note.clone()));
-        let current = HashMap::from([(space_id.clone(), scope_v2)]);
-        hub.0.prune_unsettled_for_current_scopes(&current);
+            .insert((scope_v3.clone(), note_c.clone()));
+        let current = HashMap::from([(space_id.clone(), scope_v2.clone())]);
+        hub.0
+            .prune_unsettled_for_current_scopes(&candidates, &current);
         let remaining = hub.0.unsettled_shutdown_rooms.lock().unwrap().clone();
         assert!(!remaining.contains(&(scope_v1, note.clone())));
+        assert!(remaining.contains(&(scope_v2, note_b)));
         assert!(remaining.contains(&(other_scope, note)));
+        assert!(remaining.contains(&(scope_v3, note_c)));
 
         drop(hub);
         runtime.shutdown().await.unwrap();
