@@ -255,6 +255,7 @@ pub enum ServicePurpose {
     Telemetry,
     Backup,
     Restore,
+    CollabRecovery,
 }
 #[derive(Clone, Debug)]
 /// Service authority is never parsed from an external request.

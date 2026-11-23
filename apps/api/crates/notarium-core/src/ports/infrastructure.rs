@@ -566,6 +566,7 @@ pub trait BoardMutationFactsProvider: Send + Sync {
 pub enum InterceptedPayload {
     EditNote {
         note: NoteId,
+        plan: crate::patch::CarrierPatchPlan,
         body: BodyPatchPlan,
         header: HeaderMutation,
     },
@@ -586,26 +587,18 @@ pub struct InterceptedMutation {
     pub preconditions: Preconditions,
     pub payload: InterceptedPayload,
 }
-/// Room state to install atomically with the intercepted edit or observation.
-/// Canonical retains the original mutation, carrier, grant and command identity.
+/// Committed canonical outcome returned directly by a live room after it applies
+/// an intercepted mutation, avoiding a redundant receipt read-back.
 #[derive(Debug)]
-pub struct AcceptedRoomCarrier {
-    pub owner_id: String,
-    pub expected_lease: LeaseEpoch,
-    pub expected_lineage: LineageEpoch,
-    pub compacted_through_update_seq: Option<u64>,
-    pub action: RoomCarrierAction,
-}
-#[derive(Debug)]
-pub enum RoomCarrierAction {
-    Checkpoint { yrs_snapshot: Vec<u8> },
-    Close { final_yrs_snapshot: Option<Vec<u8>> },
+pub enum InterceptedOutcome {
+    NoteRevision(Committed<NoteRevision>),
+    ExternalObservation(ExternalObservationResult),
+    BoardMove(Committed<BoardMoveResult>),
 }
 #[derive(Debug)]
 pub enum InterceptionResult {
-    /// Identifies the exact canonical commit that applied the intercepted mutation.
-    Applied(MutationReceiptToken),
-    SettleCarrier(AcceptedRoomCarrier),
+    /// Exact canonical outcome applied by the live room.
+    Applied(Box<InterceptedOutcome>),
     ClosedRoomReservation(ClosedRoomReservation),
     Conflict(DomainError),
 }
@@ -632,6 +625,24 @@ pub trait LiveCollabInterceptor: Send + Sync {
         identity: CommandIdentity,
     ) -> PortFuture<'_, RollbackReservation>;
     fn filename_pin(&self, ctx: SpaceContext, note: NoteId) -> PortFuture<'_, FilenamePin>;
+
+    /// Non-blocking fast check returning a closed-room reservation when no local
+    /// room slot is open, opening, or fenced. Returning `None` falls back to
+    /// the full async `intercept` path.
+    fn try_closed_room_reservation(
+        &self,
+        _scope: &HistoryScope,
+        _note: &NoteId,
+        _identity: &CommandIdentity,
+    ) -> Option<ClosedRoomReservation> {
+        None
+    }
+
+    /// Non-blocking hint indicating whether this interceptor currently tracks any
+    /// active or opening room in `space`. Defaults to `true` (conservative).
+    fn space_has_live_rooms(&self, _space: &SpaceId) -> bool {
+        true
+    }
 }
 
 /// Linear reservation. The runtime owns the lock that protects the corresponding fence.
@@ -640,6 +651,23 @@ pub struct ClosedRoomReservation {
     note: NoteId,
     identity: CommandIdentity,
     epoch: LeaseEpoch,
+    table_pin: Option<Arc<u64>>,
+}
+impl ClosedRoomReservation {
+    /// Attaches the runtime fence table's slot/eviction generation pin while
+    /// this reservation is in flight.
+    pub fn attach_table_pin(&mut self, pin: Arc<u64>) {
+        self.table_pin = Some(pin);
+    }
+    /// Returns the runtime fence table generation recorded when this
+    /// reservation was minted (`0` if minted directly outside a table).
+    pub fn table_gen(&self) -> u64 {
+        self.table_pin.as_deref().copied().unwrap_or(0)
+    }
+    /// Releases the runtime eviction pin once the fence lock is held.
+    pub fn release_pin(&mut self) {
+        self.table_pin = None;
+    }
 }
 #[derive(Debug)]
 pub struct CommitPermit {
@@ -668,6 +696,9 @@ impl RoomFenceState {
     pub fn epoch(&self) -> LeaseEpoch {
         self.epoch
     }
+    pub fn is_active(&self) -> bool {
+        self.active
+    }
     pub fn open(&mut self) -> DomainResult<()> {
         self.epoch = self.epoch.checked_next()?;
         self.active = true;
@@ -687,6 +718,7 @@ impl RoomFenceState {
                 note: self.note.clone(),
                 identity,
                 epoch: self.epoch,
+                table_pin: None,
             }))
         }
     }

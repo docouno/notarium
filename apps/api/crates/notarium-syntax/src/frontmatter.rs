@@ -47,6 +47,7 @@ struct MappingCst {
     commas: Vec<ByteSpan>,
     flow_close: Option<usize>,
     indent: usize,
+    has_tokens: bool,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Kind {
@@ -292,7 +293,11 @@ fn cst(source: &str) -> DomainResult<MappingCst> {
             commas: vec![],
             flow_close: None,
             indent: 0,
+            has_tokens: false,
         });
+    }
+    if ts[0].kind == Kind::Property {
+        return Err(failure(ValidationReason::FmNotWritable));
     }
     let flow = ts[0].kind == Kind::Open && ts[0].span.slice(source)? == "{";
     let indent = ts
@@ -394,6 +399,7 @@ fn cst(source: &str) -> DomainResult<MappingCst> {
         commas,
         flow_close,
         indent,
+        has_tokens: true,
     })
 }
 
@@ -479,12 +485,16 @@ pub(crate) fn edit_mapping(
     eol: &str,
 ) -> DomainResult<Vec<(ByteSpan, String)>> {
     let parsed = yaml::parse(source)?;
+    let is_null_root = matches!(parsed, YamlValue::Null);
     let mut desired = match parsed {
         YamlValue::Mapping(fields) => fields,
         YamlValue::Null => BTreeMap::new(),
         _ => return Err(failure(ValidationReason::FmNotWritable)),
     };
     let concrete = cst(source)?;
+    if is_null_root && concrete.has_tokens {
+        return Err(failure(ValidationReason::FmNotWritable));
+    }
     let keys: BTreeSet<_> = concrete.entries.iter().map(|e| e.key.clone()).collect();
     if keys.len() != concrete.entries.len() || keys != desired.keys().cloned().collect() {
         return Err(failure(ValidationReason::FmNotWritable));
@@ -726,4 +736,57 @@ pub fn set_field(
 }
 pub fn unset_field(source: &str, expected: DocClass, key: &str) -> DomainResult<CarrierPatchPlan> {
     patch_frontmatter(source, expected, &[FieldEdit::Unset { key: key.into() }])
+}
+
+#[cfg(test)]
+mod root_writeability_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_null_tilde_and_tagged_roots_are_not_writable() {
+        for opaque in [
+            "---\nnull\n---\nbody\n",
+            "---\n~\n---\nbody\n",
+            "---\n!!map {}\n---\nbody\n",
+            "---\n!!map\nstatus: todo\n---\nbody\n",
+        ] {
+            let err = patch_frontmatter(
+                opaque,
+                DocClass::UserDoc,
+                &[FieldEdit::Set {
+                    key: "status".into(),
+                    value: YamlValue::String("done".into()),
+                }],
+            )
+            .unwrap_err();
+            assert_eq!(
+                err,
+                DomainError::validation(ValidationReason::FmNotWritable),
+                "expected FmNotWritable for {opaque:?}"
+            );
+            assert_eq!(
+                patch_frontmatter(opaque, DocClass::UserDoc, &[]).unwrap_err(),
+                DomainError::validation(ValidationReason::FmNotWritable),
+                "empty edit probe must also reject {opaque:?}"
+            );
+        }
+        for writable in [
+            "---\n# comment only\n---\nbody\n",
+            "---\n{}\n---\nbody\n",
+            "---\n---\nbody\n",
+        ] {
+            assert!(
+                patch_frontmatter(
+                    writable,
+                    DocClass::UserDoc,
+                    &[FieldEdit::Set {
+                        key: "status".into(),
+                        value: YamlValue::String("done".into()),
+                    }],
+                )
+                .is_ok(),
+                "expected writable header for {writable:?}"
+            );
+        }
+    }
 }

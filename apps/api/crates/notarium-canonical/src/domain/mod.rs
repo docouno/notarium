@@ -31,6 +31,7 @@ pub mod purge;
 pub mod rollback;
 
 pub use common::{RoomFenceTable, SpaceSchemaRevision, UpdateSpaceSchema};
+pub use notes::RoomCommandSettlement;
 
 pub(crate) type BoardProviderBinding = (BoardPlannerAuthority, Arc<dyn BoardMutationFactsProvider>);
 

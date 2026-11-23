@@ -1,6 +1,6 @@
 use notarium_core::{
     error::PortError,
-    ids::{LeaseEpoch, NoteId},
+    ids::{LeaseEpoch, NoteId, RevisionId},
     model::HistoryScope,
     ports::RoomFenceState,
 };
@@ -16,6 +16,8 @@ pub(super) struct RoomTransition {
     scope: HistoryScope,
     note: NoteId,
     pending: Option<(OwnedMutexGuard<RoomFenceState>, RoomFenceState)>,
+    fenced: bool,
+    recovery: Option<(RevisionId, RevisionId)>,
 }
 
 impl RoomTransition {
@@ -36,6 +38,8 @@ impl RoomTransition {
             scope: scope.clone(),
             note: record.note.clone(),
             pending: Some((guard, state)),
+            fenced: record.room_state == CollabRoomState::Fenced,
+            recovery: None,
         })
     }
 
@@ -58,8 +62,20 @@ impl RoomTransition {
 
     pub(super) fn publish(mut self) {
         if let Some((mut guard, next)) = self.pending.take() {
-            *guard = next;
+            publish_lookup_state(
+                &self.store,
+                &self.scope,
+                &self.note,
+                &mut guard,
+                next,
+                self.fenced,
+                self.recovery.take(),
+            );
         }
+    }
+
+    pub(super) fn record_recovery(&mut self, base: RevisionId, recovered: RevisionId) {
+        self.recovery = Some((base, recovered));
     }
 }
 
@@ -71,6 +87,7 @@ impl Drop for RoomTransition {
         let store = self.store.clone();
         let scope = self.scope.clone();
         let note = self.note.clone();
+        let mut recovery = self.recovery.take();
         let task = self.store.inner.backup_executor.spawn(async move {
             let mut delay = std::time::Duration::from_millis(25);
             loop {
@@ -81,8 +98,11 @@ impl Drop for RoomTransition {
                     result = query => result,
                 };
                 match result {
-                    Ok(Some(state)) => {
-                        *guard = state;
+                    Ok(Some((state, fenced, durable_revision))) => {
+                        let recovery = recovery.take().filter(|(_, rev)| *rev == durable_revision);
+                        publish_lookup_state(
+                            &store, &scope, &note, &mut guard, state, fenced, recovery,
+                        );
                         return;
                     }
                     Ok(None) => return, // The attempted transition rolled back.
@@ -99,12 +119,38 @@ impl Drop for RoomTransition {
     }
 }
 
+fn publish_lookup_state(
+    store: &CanonicalStore,
+    scope: &HistoryScope,
+    note: &NoteId,
+    guard: &mut OwnedMutexGuard<RoomFenceState>,
+    next: RoomFenceState,
+    fenced: bool,
+    recovery: Option<(RevisionId, RevisionId)>,
+) {
+    if !store
+        .inner
+        .room_fences
+        .publish_persisted_transition(scope, note, guard, next, fenced, recovery)
+    {
+        return;
+    }
+    store
+        .inner
+        .sqlite_has_any_collab_sessions
+        .store(true, std::sync::atomic::Ordering::Release);
+    store
+        .inner
+        .sqlite_writer_commit_gen
+        .fetch_add(2, std::sync::atomic::Ordering::Release);
+}
+
 async fn read_durable_fence(
     store: &CanonicalStore,
     scope: &HistoryScope,
     note: &NoteId,
     minimum: LeaseEpoch,
-) -> Result<Option<RoomFenceState>, PortError> {
+) -> Result<Option<(RoomFenceState, bool, RevisionId)>, PortError> {
     let scope = scope.clone();
     let note = note.clone();
     store
@@ -116,18 +162,19 @@ async fn read_durable_fence(
                 if !space.is_some_and(|space| space.scope == scope) {
                     return Ok(None);
                 }
-                const SQL: &str = "SELECT lease_epoch, room_state FROM collab_sessions
+                const SQL: &str =
+                    "SELECT lease_epoch, room_state, carrier_rev_id FROM collab_sessions
                                WHERE space_id = $1 AND note_id = $2";
                 let row = match tx {
                     BackendConn::Sqlite(conn) => {
-                        sqlx::query_as::<_, (i64, String)>(SQL)
+                        sqlx::query_as::<_, (i64, String, String)>(SQL)
                             .bind(scope.space_id.as_str())
                             .bind(note.as_str())
                             .fetch_optional(&mut **conn)
                             .await
                     }
                     BackendConn::Postgres(conn) => {
-                        sqlx::query_as::<_, (i64, String)>(SQL)
+                        sqlx::query_as::<_, (i64, String, String)>(SQL)
                             .bind(scope.space_id.as_str())
                             .bind(note.as_str())
                             .fetch_optional(&mut **conn)
@@ -137,7 +184,7 @@ async fn read_durable_fence(
                 .map_err(|err| {
                     crate::codec::internal_not_committed("resolve_room_commit", err.to_string())
                 })?;
-                let Some((epoch, state)) = row else {
+                let Some((epoch, state, carrier_rev)) = row else {
                     return Ok(None);
                 };
                 let epoch = u64::try_from(epoch).map_err(|err| {
@@ -147,8 +194,17 @@ async fn read_durable_fence(
                 if epoch < minimum {
                     return Ok(None);
                 }
-                let active = CollabRoomState::from_db(&state)? == CollabRoomState::Active;
-                crate::domain::common::persisted_room_fence(note, scope, epoch, active).map(Some)
+                let room_state = CollabRoomState::from_db(&state)?;
+                let rev = RevisionId::parse(&carrier_rev).map_err(|err| {
+                    crate::codec::internal_not_committed("corrupt_room_revision", err.to_string())
+                })?;
+                let state = crate::domain::common::persisted_room_fence(
+                    note,
+                    scope,
+                    epoch,
+                    room_state == CollabRoomState::Active,
+                )?;
+                Ok(Some((state, room_state == CollabRoomState::Fenced, rev)))
             })
         })
         .await

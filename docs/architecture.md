@@ -24,6 +24,7 @@ participant. [Structural projections](projections.md) consume canonical
 commands to provide structural snapshots, note lists, declarative note views
 and graph reads. The [search engine](search.md) subscribes independently
 to canonical changes and consumes the structural read port.
+[Live collaboration](collab.md) provides transport-independent Yrs rooms, durable peer updates and live canonical command interception.
 
 ## Internal dependency allowlist
 
@@ -52,7 +53,7 @@ tests invoke compiled binaries as external processes. HTTP cannot directly impor
 canonical/projections/search/jobs. Agents cannot directly depend on `tantivy`,
 `ort` or `yrs`. Core has no internal dependencies or I/O behavior. A separate
 native gate rejects parser, storage and runtime dependencies in core, including
-renamed, optional, target, development and build declarations. Core, syntax and canonical all use `forbid(unsafe_code)` so inner modules cannot
+renamed, optional, target, development and build declarations. Core, syntax, canonical and collab all use `forbid(unsafe_code)` so inner modules cannot
 override the workspace rule.
 
 Native tests inspect `cargo metadata --no-deps` using package identities and paths,
@@ -75,6 +76,7 @@ and resident memory bounds. Search confines unsafe code to the mmap segment and
 SIMD modules (`mmap_segment.rs` and `simd.rs`), forbids unsafe overrides across
 its remaining modules and safe vector submodules, and gates internal test
 helpers behind `test-support` enforced by `fitness-gates`.
+Collaboration tests cover wire framing, CRDT policy, carrier round-trips and dual-dialect room recovery.
 
 `notarium-control` owns a 45-table baseline in SQLite and the PostgreSQL
 `v1_control` schema. Its typed target records support offline import and paged

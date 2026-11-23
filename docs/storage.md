@@ -475,20 +475,23 @@ same example against an isolated prefix.
   heads, root permissions and live publications.
 - **Collaboration room ownership.** A PostgreSQL writer takeover fences active
   rooms in the same transaction that advances the Space writer epoch. The
-  successor can reopen a fenced room with its new lease and replay its durable
-  updates. Checkpoint and close compact the update log only when the caller
-  supplies a snapshot and its inclusive `compacted_through_update_seq`. Omitting
-  the watermark preserves the log, including updates accepted before a close.
-  A watermark advances in lease and update sequence order. An equal watermark
-  accepts only the same snapshot bytes. Reopening preserves the stored snapshot.
-  After recovery, sequence zero in the new lease can cover all updates from
-  earlier leases. The room owner must first replay those updates into its snapshot.
-  Direct carrier changes, including schema-note changes, wait until an authorized
-  settlement pairs the snapshot with the canonical carrier and covers the last
-  pending update. A clean close permits direct changes to start a new lineage.
-  The storage executor owns admitted work. If the database loses a COMMIT reply,
-  it retains the affected room lock until a fresh transaction verifies the durable
-  lease under the Space lock. Unrelated rooms keep their own fences.
+  successor recovers the stored snapshot and durable updates under the room
+  fence. A new room installs its initial snapshot when opening its lease.
+  The batch writer checks the active lease, lineage and writer authority
+  when adding peer updates to `collab_update_log`. The room waits for a
+  known durable append before publishing the update and ACK. Retrying an
+  uncertain append uses the same scope, lease, sequences and bytes.
+  Checkpoint and close compact the log when given a snapshot and inclusive
+  `compacted_through_update_seq`. The watermark advances in lease and update
+  sequence order. Sequence zero in the new lease can cover earlier leases
+  after their tail has been replayed. An ordinary checkpoint at an equal
+  watermark accepts the same snapshot bytes. A room-owned canonical command
+  may commit a changed snapshot with its revision at the existing watermark.
+  Direct carrier changes, including schema-note changes, wait for an
+  authorized settlement covering the pending updates. A clean close permits
+  direct changes to advance the lineage. The storage executor owns admitted
+  work and reconciles ambiguous room transitions under the Space lock.
+  [Live collaboration](collab.md#carrier-and-durability)
 - **Job pagination.** `list_jobs` binds each cursor to the original Space cut.
   Continuation returns `CursorStale` if the cut advances or a heartbeat changes
   progress visible to the query. Consumers can open a new read at the current cut.

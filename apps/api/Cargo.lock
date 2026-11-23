@@ -1440,6 +1440,7 @@ dependencies = [
  "tokio",
  "toml 0.9.12+spec-1.1.0",
  "tracing-subscriber",
+ "yrs",
 ]
 
 [[package]]
@@ -2910,9 +2911,21 @@ dependencies = [
 name = "notarium-collab"
 version = "1.0.0-dev.0"
 dependencies = [
+ "allocation-counter",
+ "blake3",
+ "getrandom 0.4.3",
+ "hex",
+ "mimalloc",
  "notarium-canonical",
  "notarium-core",
  "notarium-syntax",
+ "proptest",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
  "yrs",
 ]
 

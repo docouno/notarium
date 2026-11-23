@@ -10,7 +10,7 @@ structural projections. The engine ports support declarative Markdown views,
 board reads and knowledge graphs. Control services cover transport-independent
 authentication, Space access, OAuth issuance, OIDC identity, provider services,
 account context, schedule claims, content-free telemetry and backup snapshots.
-The hybrid search library provides search and recall. Collaboration, agents and
+The hybrid search library provides search and recall. Transport-independent Yrs rooms support live Markdown editing. Agents and
 the product UI arrive in subsequent waves.
 
 ## Start developing
@@ -72,7 +72,8 @@ HTTP and agents consume core ports instead of directly importing engine storage
 or search. Native tests enforce the [crate matrix](docs/architecture.md).
 See [development commands and ownership](docs/development.md) for details.
 The implemented library boundaries are documented in [core contracts](docs/core-contracts.md),
-[document syntax](docs/syntax.md) and [canonical storage](docs/storage.md).
+[document syntax](docs/syntax.md), [canonical storage](docs/storage.md) and
+[live collaboration](docs/collab.md).
 See [control storage](docs/control.md) for the control-plane primitives.
 See [hybrid search](docs/search.md) for search and recall, model setup, and the
 offline scale gate.

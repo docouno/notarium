@@ -139,6 +139,11 @@ async fn seed_space(
     (rec.scope, root)
 }
 
+type MovePlannerPause = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
+
 /// Real canonical-reading test `BoardMutationFactsProvider` that evaluates board membership by reading
 /// `status` frontmatter from canonical notes (excluding `status == "archived"` as `OutsideView`),
 /// sorts each column by `(overlay_rank_or_unranked, slug, note_id)`, and supports deterministic
@@ -148,8 +153,10 @@ struct CanonicalTestBoardPlanner {
     tracked_notes: Mutex<BTreeSet<NoteId>>,
     forge_authority_once: AtomicBool,
     inject_stale_cutoff_once: AtomicBool,
+    stale_rollback_responses: AtomicUsize,
     evaluate_move_calls: AtomicUsize,
     move_waits: Mutex<Option<Vec<std::time::Duration>>>,
+    move_pause_once: Mutex<Option<MovePlannerPause>>,
 }
 
 impl CanonicalTestBoardPlanner {
@@ -159,8 +166,10 @@ impl CanonicalTestBoardPlanner {
             tracked_notes: Mutex::new(tracked_notes.into_iter().collect()),
             forge_authority_once: AtomicBool::new(false),
             inject_stale_cutoff_once: AtomicBool::new(false),
+            stale_rollback_responses: AtomicUsize::new(0),
             evaluate_move_calls: AtomicUsize::new(0),
             move_waits: Mutex::new(None),
+            move_pause_once: Mutex::new(None),
         })
     }
 
@@ -191,6 +200,11 @@ impl BoardMutationFactsProvider for CanonicalTestBoardPlanner {
     ) -> PortFuture<'a, BoardMoveFacts> {
         Box::pin(async move {
             self.evaluate_move_calls.fetch_add(1, Ordering::SeqCst);
+            let pause = self.move_pause_once.lock().unwrap().take();
+            if let Some((entered, release)) = pause {
+                entered.send(()).unwrap();
+                release.await.unwrap();
+            }
             let wait_number = self.move_waits.lock().unwrap().as_mut().map(|waits| {
                 waits.push(ctx.budget.remaining);
                 waits.len()
@@ -392,6 +406,15 @@ impl BoardMutationFactsProvider for CanonicalTestBoardPlanner {
         request: RollbackBoardFactsRequest,
     ) -> PortFuture<'a, RollbackBoardFacts> {
         Box::pin(async move {
+            if self
+                .stale_rollback_responses
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                    count.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(DomainError::validation(ValidationReason::CursorStale).into());
+            }
             let scope = ctx.scope().clone();
             let space_rec = self.store.read_space(&scope.space_id).await?;
             let tracked: Vec<NoteId> = self
@@ -992,7 +1015,23 @@ async fn run_move_board_card_suite(store: &CanonicalStore) -> BoardEffects {
         }
     ));
 
-    applied::check(store, &ctx, &view, view_created.value.revision, &planner).await;
+    // Poll the live-interception scenarios as their own task. Their nested
+    // PostgreSQL futures otherwise share the stack of this entire parity suite.
+    let room_store = store.clone();
+    let room_ctx = ctx.clone();
+    let room_view = view.clone();
+    tokio::spawn(async move {
+        applied::check(
+            &room_store,
+            &room_ctx,
+            &room_view,
+            view_created.value.revision,
+            &planner,
+        )
+        .await
+    })
+    .await
+    .unwrap();
 
     assert_eq!(
         store
@@ -1614,6 +1653,15 @@ async fn run_rollback_agent_run_suite(store: &CanonicalStore) {
             .await,
         Err(PortError::Domain(DomainError::ResourceNotFound))
     ));
+    planner.stale_rollback_responses.store(5, Ordering::SeqCst);
+    assert!(matches!(
+        store.rollback_agent_run(human_ctx.clone(), board_rollback.clone()).await,
+        Err(PortError::Domain(DomainError::ValidationFailed { diagnostic })) if diagnostic.reason == ValidationReason::CursorStale
+    ));
+    assert_eq!(
+        planner.stale_rollback_responses.swap(0, Ordering::SeqCst),
+        1
+    );
     let rollback_committed = store
         .rollback_agent_run(human_ctx.clone(), board_rollback.clone())
         .await
@@ -1889,7 +1937,7 @@ async fn l6_move_board_card_planner_cutoff_and_pma_dual_dialect_parity() {
         let root = TempDataRoot::new("l6-move-sqlite");
         let cfg = CanonicalConfig::local_default(sample_installation_id(1), root.data_root());
         let (store, runtime) = CanonicalRuntime::open(cfg).await.expect("open sqlite");
-        let evidence = run_move_board_card_suite(&store).await;
+        let evidence = Box::pin(run_move_board_card_suite(&store)).await;
         let mut conn = root.open_raw_sqlite().await;
         let bytes: Vec<u8> = sqlx::query_scalar(
             "SELECT effect_msgpack FROM change_payloads WHERE created_seq=? AND codec='effect_v1'",
@@ -1917,7 +1965,7 @@ async fn l6_move_board_card_planner_cutoff_and_pma_dual_dialect_parity() {
             .expect("ensure S3 bucket");
         let cfg = fixtures.pg_s3_config(sample_installation_id(2), &schema, s3_cfg);
         let (store, runtime) = CanonicalRuntime::open(cfg).await.expect("open pg+s3");
-        let evidence = run_move_board_card_suite(&store).await;
+        let evidence = Box::pin(run_move_board_card_suite(&store)).await;
         let mut conn = fixtures.open_raw_pg().await;
         let bytes: Vec<u8> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT effect_msgpack FROM {schema}.change_payloads WHERE created_seq=$1 AND codec='effect_v1'")))
             .bind(evidence.column_change.get() as i64).fetch_one(&mut conn).await.unwrap();
@@ -2170,6 +2218,7 @@ async fn check_rollback_with_dirty_room(
         .close_collab_session(
             &make_budget(),
             CloseCollabSession {
+                unchanged_carrier_digest: None,
                 scope: scope.clone(),
                 note: note.clone(),
                 owner_id: Some("room-owner".into()),
@@ -2453,6 +2502,7 @@ async fn run_note_only_rollback_suite(
         .close_collab_session(
             &make_budget(),
             notarium_canonical::peers::CloseCollabSession {
+                unchanged_carrier_digest: None,
                 scope: scope.clone(),
                 note: n_ed.clone(),
                 owner_id: Some("room-owner".into()),
