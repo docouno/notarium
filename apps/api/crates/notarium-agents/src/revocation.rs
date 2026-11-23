@@ -28,7 +28,7 @@ type RegistrationId = u64;
 const MAX_SELECTORS: usize = 512;
 const RECENT_EVENTS: usize = 4096;
 const MAX_PENDING_CREDENTIALS: usize = 4096;
-const PENDING_CREDENTIAL_TTL: Duration = Duration::from_secs(30 * 60);
+const PENDING_CREDENTIAL_TTL: Duration = Duration::from_secs(90 * 60);
 
 #[derive(Clone)]
 pub struct RevocationHub {
@@ -57,6 +57,7 @@ struct State {
 struct Registered {
     selectors: Selectors,
     cancellation: Cancellation,
+    thread: Option<(HistoryScope, ChatThreadId)>,
 }
 
 struct CanonicalRegistration {
@@ -75,16 +76,16 @@ enum EventDelivery {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub struct PendingCredentialKey {
-    pub scope: HistoryScope,
-    pub thread: ChatThreadId,
-    pub input: PendingInputId,
+pub(crate) struct PendingCredentialKey {
+    pub(crate) scope: HistoryScope,
+    pub(crate) thread: ChatThreadId,
+    pub(crate) input: PendingInputId,
 }
 
 /// Store the durable enqueue fingerprint alongside the credential. The same
 /// input ID cannot be rebound to a new sender or credentials during replay.
 #[derive(Clone)]
-pub struct PendingCredential {
+pub(crate) struct PendingCredential {
     auth: EngineAuthContext,
     options: ChatRunOptions,
     cancellation: Cancellation,
@@ -97,11 +98,11 @@ pub struct PendingCredential {
 }
 
 impl PendingCredential {
-    pub fn auth(&self) -> &EngineAuthContext {
+    pub(crate) fn auth(&self) -> &EngineAuthContext {
         &self.auth
     }
 
-    pub fn cancellation(&self) -> &Cancellation {
+    pub(crate) fn cancellation(&self) -> &Cancellation {
         &self.cancellation
     }
 
@@ -185,8 +186,18 @@ impl State {
 
     fn sweep_expired_pending(&mut self, now: Instant) -> Vec<Cancellation> {
         let mut expired = Vec::new();
-        self.pending.retain(|_, entry| {
-            if now.saturating_duration_since(entry.registered_at) >= PENDING_CREDENTIAL_TTL {
+        let active_threads: BTreeSet<(&HistoryScope, &ChatThreadId)> = self
+            .runs
+            .values()
+            .filter_map(|run| run.thread.as_ref().map(|(scope, thread)| (scope, thread)))
+            .collect();
+        self.pending.retain(|key, entry| {
+            let live_handoff = entry.handoff.try_lock().is_err();
+            let active_thread = active_threads.contains(&(&key.scope, &key.thread));
+            if !live_handoff
+                && !active_thread
+                && now.saturating_duration_since(entry.registered_at) >= PENDING_CREDENTIAL_TTL
+            {
                 expired.push(entry.cancellation.clone());
                 false
             } else {
@@ -293,7 +304,7 @@ impl RevocationHub {
         selection: Option<&ProviderSelection>,
         cancellation: Cancellation,
     ) -> Result<RunRevocationLease, PortError> {
-        self.register_run_with_sender(ctx, auth, selection, cancellation, None)
+        self.register_run_with_sender(ctx, auth, selection, cancellation, None, None)
     }
 
     pub(crate) fn register_run_with_sender(
@@ -302,6 +313,7 @@ impl RevocationHub {
         auth: &EngineAuthContext,
         selection: Option<&ProviderSelection>,
         cancellation: Cancellation,
+        thread: Option<(HistoryScope, ChatThreadId)>,
         sender: Option<(&PendingCredentialKey, &PendingCredential)>,
     ) -> Result<RunRevocationLease, PortError> {
         let budget = RevocationBudget::new(ctx)?;
@@ -343,6 +355,7 @@ impl RevocationHub {
             Registered {
                 selectors,
                 cancellation: cancellation.clone(),
+                thread,
             },
         );
         Ok(RunRevocationLease {
@@ -383,6 +396,7 @@ impl RevocationHub {
             Registered {
                 selectors,
                 cancellation: cancellation.clone(),
+                thread: None,
             },
         );
         Ok(ViewerRevocationLease {
@@ -491,8 +505,24 @@ impl RevocationHub {
         result
     }
 
-    pub fn pending(&self, key: &PendingCredentialKey) -> Option<PendingCredential> {
+    pub(crate) fn pending(&self, key: &PendingCredentialKey) -> Option<PendingCredential> {
         self.inner.lock().pending.get(key).cloned()
+    }
+
+    pub fn has_pending(
+        &self,
+        scope: &HistoryScope,
+        thread: &ChatThreadId,
+        input: &PendingInputId,
+    ) -> bool {
+        self.inner
+            .lock()
+            .pending
+            .contains_key(&PendingCredentialKey {
+                scope: scope.clone(),
+                thread: thread.clone(),
+                input: input.clone(),
+            })
     }
 
     pub(crate) fn finish_pending(&self, key: &PendingCredentialKey) {
@@ -794,6 +824,7 @@ impl SessionRevocationPort for RevocationHub {
                                 entry: Registered {
                                     selectors,
                                     cancellation: cancellation.clone(),
+                                    thread: None,
                                 },
                                 deadline: budget.deadline,
                                 active: 0,
@@ -843,6 +874,7 @@ impl SessionRevocationPort for RevocationHub {
                             Registered {
                                 selectors,
                                 cancellation: cancellation.clone(),
+                                thread: None,
                             },
                         );
                         return Ok(Box::new(RegistryLease {

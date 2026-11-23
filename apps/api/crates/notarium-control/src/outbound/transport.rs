@@ -392,6 +392,7 @@ impl OutboundTransport {
         let dropped = Cancellation::default();
         let guard = CancelOnDrop(dropped.clone());
         let (head_tx, head_rx) = oneshot::channel();
+        let (uploaded_tx, uploaded_rx) = oneshot::channel();
         let (chunks_tx, chunks_rx) = mpsc::channel(1);
         let (end_tx, end_rx) = oneshot::channel();
         let (closed_tx, closed_rx) = oneshot::channel();
@@ -408,6 +409,7 @@ impl OutboundTransport {
         let fixture_ca = self.shared.fixture.as_ref().map(|(_, ca)| ca.clone());
         tokio::spawn(async move {
             let mut head_tx = Some(head_tx);
+            let mut uploaded_tx = Some(uploaded_tx);
             let result = async {
                 // Certificate loading may touch the filesystem. The owner keeps
                 // its active slot through actual blocking construction even if
@@ -432,16 +434,29 @@ impl OutboundTransport {
                     })
                     .await?;
                 context.check()?;
-                let outgoing = client
+                let is_get = request.method == Method::GET;
+                let content_len = request.body.len();
+                let mut builder = client
                     .request(request.method, endpoint.url().clone())
                     .headers(request.headers)
-                    .body(request.body)
-                    .timeout(context.budget.context(request_id).remaining)
-                    .build()
-                    .map_err(|_| failed())?;
+                    .timeout(context.budget.context(request_id).remaining);
+                if !is_get && !request.body.is_empty() {
+                    let body_signal = uploaded_tx.take();
+                    builder = builder
+                        .header(reqwest::header::CONTENT_LENGTH, content_len)
+                        .body(reqwest::Body::wrap_stream(TrackedBody {
+                            chunk: Some(request.body),
+                            polled: false,
+                            uploaded: body_signal,
+                        }));
+                }
+                let outgoing = builder.build().map_err(|_| failed())?;
                 let mut response = context
                     .run(async {
                         preflight()?;
+                        if let Some(tx) = uploaded_tx.take() {
+                            let _ = tx.send(());
+                        }
                         client.execute(outgoing).await.map_err(send_failed)
                     })
                     .await?;
@@ -505,6 +520,7 @@ impl OutboundTransport {
             status: 0,
             headers: HeaderMap::new(),
             head: Some(head_rx),
+            uploaded: Some(uploaded_rx),
             budget,
             closed: closed_rx,
             chunks: chunks_rx,
@@ -598,6 +614,38 @@ impl Worker {
     }
 }
 
+struct TrackedBody {
+    chunk: Option<Vec<u8>>,
+    polled: bool,
+    uploaded: Option<oneshot::Sender<()>>,
+}
+impl Drop for TrackedBody {
+    fn drop(&mut self) {
+        if self.polled
+            && self.chunk.is_none()
+            && let Some(tx) = self.uploaded.take()
+        {
+            let _ = tx.send(());
+        }
+    }
+}
+impl futures_util::Stream for TrackedBody {
+    type Item = Result<Vec<u8>, std::io::Error>;
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.polled = true;
+        if let Some(chunk) = self.chunk.take() {
+            return std::task::Poll::Ready(Some(Ok(chunk)));
+        }
+        if let Some(tx) = self.uploaded.take() {
+            let _ = tx.send(());
+        }
+        std::task::Poll::Ready(None)
+    }
+}
+
 /// A bounded stream whose producer owns cancellation, sockets and admission.
 /// Dropping it stops the worker; retaining it without polling cannot suspend
 /// absolute/idle deadlines. Headers are marked sensitive and are not Debugged.
@@ -605,6 +653,7 @@ pub struct OutboundResponse {
     status: u16,
     headers: HeaderMap,
     head: Option<oneshot::Receiver<Result<(u16, HeaderMap), PortError>>>,
+    uploaded: Option<oneshot::Receiver<()>>,
     budget: OperationBudget,
     closed: oneshot::Receiver<()>,
     chunks: mpsc::Receiver<Vec<u8>>,
@@ -613,6 +662,19 @@ pub struct OutboundResponse {
     _guard: CancelOnDrop,
 }
 impl OutboundResponse {
+    /// Wait until preflight, connection establishment, and request-body write
+    /// complete (`Ok(true)`), or the request fails before upload (`Ok(false)`).
+    pub(crate) async fn wait_uploaded(&mut self) -> Result<bool, PortError> {
+        if let Some(uploaded) = self.uploaded.as_mut() {
+            let sent = self
+                .budget
+                .run(async { Ok(uploaded.await.is_ok()) }, CommitEffect::Unknown)
+                .await?;
+            self.uploaded = None;
+            return Ok(sent);
+        }
+        Ok(true)
+    }
     pub(crate) async fn receive_head(&mut self) -> Result<(), PortError> {
         if let Some(head) = self.head.as_mut() {
             let (status, headers) = self

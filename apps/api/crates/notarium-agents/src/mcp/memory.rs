@@ -118,17 +118,46 @@ impl MemoryInput {
     }
 }
 
+pub(super) async fn admit_project_boundary(
+    call: &ToolCallContext<'_>,
+    folder: &notarium_core::model::FolderRef,
+    has_version_token: bool,
+) -> Result<SpaceContext, PortError> {
+    let scope = session::space(call, &folder.space_id).await?;
+    let info = call
+        .registry
+        .catalog
+        .folder(call.account(), folder.clone())
+        .await?;
+    corpus::admit_folder_boundary(
+        call,
+        &scope,
+        folder,
+        Some(folder.clone()),
+        &info.ancestor_folders,
+        has_version_token.then_some(DocClass::AgentMemory),
+    )
+    .await?;
+    Ok(scope)
+}
+
 pub(super) async fn handle(
     call: &mut ToolCallContext<'_>,
     name: ToolName,
     args: Value,
 ) -> Result<Value, PortError> {
     let args = MemoryArgs::parse(args)?;
+    let has_version_token = args.version_token.is_some();
     // A retry must follow the authorized identity even if a project handle
     // has been reassigned since the original call.
     let route: MemoryRoute = call
         .journal("memory_route", || async {
             let target = args.resolve_target(call, name).await?;
+            if matches!(call.target, EgressTarget::InAppProvider { .. })
+                && let MemoryTarget::Project { folder } = &target
+            {
+                admit_project_boundary(call, folder, has_version_token).await?;
+            }
             let snapshot = call
                 .registry
                 .control
@@ -140,6 +169,11 @@ pub(super) async fn handle(
             })
         })
         .await?;
+    if matches!(call.target, EgressTarget::InAppProvider { .. })
+        && let MemoryTarget::Project { folder } = &route.target
+    {
+        admit_project_boundary(call, folder, has_version_token).await?;
+    }
     let input = args.into_input(route.target);
     let snapshot = input
         .inspect(call.registry.control.as_ref(), call.account())
@@ -149,28 +183,27 @@ pub(super) async fn handle(
     let target = snapshot.resolved.target.clone();
     let category = snapshot.resolved.category.clone();
     let note = snapshot.resolved.note.clone();
-    if matches!(call.target, EgressTarget::InAppProvider { .. }) {
+    if matches!(call.target, EgressTarget::InAppProvider { .. })
+        && matches!(target, MemoryTarget::User { .. })
+    {
+        if call
+            .auth
+            .spaces()
+            .get(&snapshot.scope.space_id)
+            .is_some_and(|grant| grant.project_root.is_some())
+        {
+            return Err(DomainError::ResourceNotFound.into());
+        }
         let folder_ref = notarium_core::model::FolderRef {
             space_id: snapshot.scope.space_id.clone(),
             folder_id: snapshot.parent.clone(),
-        };
-        let (target_project, ancestors) = match &target {
-            MemoryTarget::User { .. } => (None, Vec::new()),
-            MemoryTarget::Project { folder } => {
-                let info = call
-                    .registry
-                    .catalog
-                    .folder(call.account(), folder.clone())
-                    .await?;
-                (Some(folder.clone()), info.ancestor_folders)
-            }
         };
         corpus::admit_folder_boundary(
             call,
             &scope,
             &folder_ref,
-            target_project,
-            &ancestors,
+            None,
+            &[],
             input.version_token.as_ref().map(|_| DocClass::AgentMemory),
         )
         .await?;

@@ -216,15 +216,21 @@ async fn episode_target_commands_replay_old_receipts_and_survive_account_changes
         .await
         .unwrap()
         .items;
-    let first_role = roles.iter().find(|entry| entry.name == "research").unwrap();
-    let next_role = roles.iter().find(|entry| entry.name == "grooming").unwrap();
+    let first_role = roles
+        .iter()
+        .find(|entry| entry.descriptor.name == "research")
+        .unwrap();
+    let next_role = roles
+        .iter()
+        .find(|entry| entry.descriptor.name == "grooming")
+        .unwrap();
     let full_update = AccountMutation {
         identity: identity(&fixture, human, 112).await,
         input: EpisodeMutation::Full(EpisodeUpdate {
             episode: ep.id.clone(),
             expected: ep.revision,
             name: ep.name,
-            active_role: Some(first_role.reference.clone()),
+            active_role: Some(first_role.descriptor.reference.clone()),
             project_hint: None,
             lifecycle: EpisodeLifecycle::Active,
         }),
@@ -248,7 +254,7 @@ async fn episode_target_commands_replay_old_receipts_and_survive_account_changes
         input: EpisodeMutation::BindRole(BindEpisodeRole {
             episode: ep.id,
             expected: ep.revision,
-            active_role: next_role.reference.clone(),
+            active_role: next_role.descriptor.reference.clone(),
             project_hint: None,
         }),
     };
@@ -262,7 +268,10 @@ async fn episode_target_commands_replay_old_receipts_and_survive_account_changes
         inner.expected = saved.value.revision;
     }
     let rebound = plane.update_episode(human.clone(), binding).await.unwrap();
-    assert_eq!(rebound.value.active_role, Some(next_role.reference.clone()));
+    assert_eq!(
+        rebound.value.active_role,
+        Some(next_role.descriptor.reference.clone())
+    );
     fixture.close().await;
 }
 

@@ -5,11 +5,11 @@ use notarium_core::{
     error::{CommitEffect, PortError, ValidationReason},
     ids::{AgentRunId, ChatThreadId, CommandKey, ThreadEntrySeq},
     ports::{
-        AccountContext, AgentSchedule, AppendChat, ChatBody, ChatEntry, ChatEntryKind,
-        ChatInputBody, ChatProvenance, ChatRead, ChatThread, ChatThreadKind, CompletionBudget,
-        CompletionMessage, CompletionRequest, CompletionRole, CreateChat, Mutation, PageLimit,
-        Preconditions, PreferenceModelKind, ProviderInstruction, ProviderSelection,
-        ProviderToolCall, RevocationLease, SelectProvider, SpaceContext,
+        AccountContext, AgentSchedule, AppendChat, CanonicalEffect, ChatBody, ChatEntry,
+        ChatEntryKind, ChatInputBody, ChatProvenance, ChatRead, ChatThread, ChatThreadKind,
+        CompletionBudget, CompletionMessage, CompletionRequest, CompletionRole, CreateChat,
+        Mutation, PageLimit, Preconditions, PreferenceModelKind, ProviderInstruction,
+        ProviderSelection, ProviderToolCall, RevocationLease, SelectProvider, SpaceContext,
     },
     receipt::CommandIdentity,
 };
@@ -309,6 +309,18 @@ impl KeeperTurn<'_> {
         Ok(())
     }
 
+    async fn fenced_writer(&self, budget: &CompletionRunBudget) -> Result<SpaceContext, PortError> {
+        let context = self.live_context(budget).await?;
+        self.registry
+            .control()
+            .fence_canonical_effect(
+                context.auth().clone(),
+                context,
+                CanonicalEffect::AgentRuntimeWrite,
+            )
+            .await
+    }
+
     async fn read_log(&self, context: SpaceContext) -> Result<ChatThread, PortError> {
         let branch = self
             .registry
@@ -363,7 +375,7 @@ impl KeeperTurn<'_> {
         let created = self
             .registry
             .engine()
-            .create_chat(self.live_context(budget).await?, mutation)
+            .create_chat(self.fenced_writer(budget).await?, mutation)
             .await;
         match created {
             Ok(value) => {
@@ -406,12 +418,15 @@ impl KeeperTurn<'_> {
         };
         let engine = self.registry.engine();
         let written = engine
-            .append_chat(self.live_context(budget).await?, mutation.clone())
+            .append_chat(self.fenced_writer(budget).await?, mutation.clone())
             .await;
         let value = match written {
             Ok(value) => value,
             Err(error) if unknown(&error) => {
-                let context = self.live_context(budget).await.map_err(|_| error.clone())?;
+                let context = self
+                    .fenced_writer(budget)
+                    .await
+                    .map_err(|_| error.clone())?;
                 engine
                     .append_chat(context, mutation)
                     .await
@@ -512,6 +527,7 @@ fn unknown(error: &PortError) -> bool {
         | PortError::DeadlineExceeded(failure)
         | PortError::Unavailable(failure)
         | PortError::Internal(failure) => failure.effect() == CommitEffect::Unknown,
+        PortError::Domain(DomainError::ProviderCallAlreadyStarted { .. }) => true,
         PortError::Domain(_) => false,
     }
 }

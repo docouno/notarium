@@ -127,6 +127,9 @@ impl ScheduleAbilityLease for TestSchedulePin {
     fn abilities(&self) -> &[AbilityDescriptor] {
         &self.descriptors
     }
+    fn close(&mut self) -> PortFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 impl ControlCatalogPort for Catalog {
@@ -365,6 +368,23 @@ impl ControlCatalogPort for Catalog {
                 .find(|value| value.reference.identity() == identity)
                 .cloned()
                 .ok_or(DomainError::ResourceNotFound.into())
+        })
+    }
+    fn locate_ability(
+        &self,
+        _ctx: AccountContext,
+        id: AbilityId,
+    ) -> PortFuture<'_, Vec<AbilityDescriptor>> {
+        Box::pin(async move {
+            Ok(self
+                .ability_entries
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|value| value.reference.id == id)
+                .take(2)
+                .cloned()
+                .collect())
         })
     }
     fn pin_schedule_abilities(

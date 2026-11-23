@@ -288,12 +288,11 @@ impl SearchEngine {
                 can_widen,
             )
             .await?;
-        let any_rejected = admission.checked.values().any(|&admitted| !admitted);
         let mut window_truncated = if can_widen { false } else { pass1_overflow };
         let mut embedder = vectors.embedder;
         let mut degraded = vectors.degraded;
 
-        if can_widen && any_rejected && selected.len() <= top_k && pass1_overflow {
+        if can_widen && selected.len() <= top_k && pass1_overflow {
             let wide_lexical = lexical_candidates(
                 clock,
                 snapshot.clone(),

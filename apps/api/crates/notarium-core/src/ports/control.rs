@@ -534,7 +534,7 @@ pub trait ControlPort: Send + Sync {
         &self,
         ctx: AccountContext,
         request: AbilityQuery,
-    ) -> PortFuture<'_, ControlPage<AbilityDescriptor>>;
+    ) -> PortFuture<'_, ControlPage<AbilityInspection>>;
     fn resolve_ability(
         &self,
         ctx: AccountContext,

@@ -704,13 +704,13 @@ pub(crate) async fn publish_ability_package_impl(
                     RevisionMetadataPayload::Note(note) => note.raw_fields,
                     _ => None,
                 })
-                .and_then(|fields| match fields.get("description") {
+                .map(|fields| match fields.get("description") {
                     Some(notarium_core::value::YamlValue::String(text)) => {
-                        let trimmed = text.trim();
-                        (!trimmed.is_empty()).then(|| trimmed.chars().take(4096).collect())
+                        text.trim().chars().take(4096).collect()
                     }
-                    _ => None,
-                });
+                    _ => String::new(),
+                })
+                .or_else(|| Some(String::new()));
 
                 let meta = RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Ability(
                     AbilityRevisionMetadata {

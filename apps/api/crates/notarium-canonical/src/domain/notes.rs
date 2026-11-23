@@ -3660,6 +3660,7 @@ async fn prepare_batch_intents(
             // The writer checks the current move fingerprint. Only carrier
             // commands need historical evidence to recognize old hashes.
             let checked = if matches!(item_mut.input, BatchItem::Move(_))
+                || spec.has_confirmed_chat_step()
                 || spec.command_hash.as_bytes().as_slice() == stored_hash
             {
                 Ok(spec.clone())
@@ -3700,6 +3701,14 @@ async fn prepare_batch_intents(
         }
         match item_mut.input {
             BatchItem::Create(cr) => {
+                if let Some(step) = ctx.confirmed_chat_step()
+                    && (cr.class != DocClass::UserDoc
+                        || step
+                            .destination()
+                            .is_none_or(|destination| destination.move_source.is_some()))
+                {
+                    return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
+                }
                 let res: Result<PreparedWriteIntent, PortError> = async {
                     let slug_fold = super::folder_cover::validate_create(&cr)?;
                     if cr.class == DocClass::Skill {
@@ -3837,28 +3846,43 @@ async fn prepare_batch_intents(
                     DeleteTarget::Note(del),
                 ));
             }
-            BatchItem::Move(mv) => match normalize_slug_key(&mv.slug) {
-                Ok(sf) => {
-                    let pin = deadline
-                        .wait(&ctx.budget, || prepare_batch_move_pin(store, ctx, &mv))
-                        .await?;
-                    intents.push(build_move_note_intent(
+            BatchItem::Move(mv) => {
+                if let Some(step) = ctx.confirmed_chat_step() {
+                    let source = step
+                        .destination()
+                        .and_then(|destination| destination.move_source.as_ref());
+                    if !source.is_some_and(|(note, revision)| {
+                        note == &mv.note
+                            && item_mut.preconditions.revision.as_ref() == Some(revision)
+                    }) {
+                        return Err(
+                            DomainError::validation(ValidationReason::InvalidAuthority).into()
+                        );
+                    }
+                }
+                match normalize_slug_key(&mv.slug) {
+                    Ok(sf) => {
+                        let pin = deadline
+                            .wait(&ctx.budget, || prepare_batch_move_pin(store, ctx, &mv))
+                            .await?;
+                        intents.push(build_move_note_intent(
+                            &space_rec.scope,
+                            space_rec.active_epoch,
+                            idemp,
+                            ctx.auth().clone(),
+                            item_mut.preconditions,
+                            MetadataChange::Move(mv),
+                            sf,
+                            pin,
+                        ));
+                    }
+                    Err(err) => intents.push(build_failing_item_intent(
                         &space_rec.scope,
                         space_rec.active_epoch,
-                        idemp,
-                        ctx.auth().clone(),
-                        item_mut.preconditions,
-                        MetadataChange::Move(mv),
-                        sf,
-                        pin,
-                    ));
+                        err.into(),
+                    )),
                 }
-                Err(err) => intents.push(build_failing_item_intent(
-                    &space_rec.scope,
-                    space_rec.active_epoch,
-                    err.into(),
-                )),
-            },
+            }
         }
     }
 

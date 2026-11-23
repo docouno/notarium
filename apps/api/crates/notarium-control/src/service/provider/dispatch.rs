@@ -51,6 +51,39 @@ struct Leases {
     canonical: Option<Box<dyn ProviderEgressLease>>,
     registration: Option<Box<dyn RevocationLease>>,
 }
+fn is_unknown_effect(error: &PortError) -> bool {
+    match error {
+        PortError::Cancelled(failure)
+        | PortError::DeadlineExceeded(failure)
+        | PortError::Unavailable(failure)
+        | PortError::Internal(failure) => failure.effect() == CommitEffect::Unknown,
+        PortError::Domain(_) => false,
+    }
+}
+
+fn unknown_failure(label: &str) -> notarium_core::error::OperationalFailure {
+    notarium_core::error::OperationalFailure::new(
+        ContentDigest::from_bytes(*blake3::hash(label.as_bytes()).as_bytes()),
+        CommitEffect::Unknown,
+        notarium_core::error::RetryAdvice::Never,
+        false,
+    )
+    .expect("non-retryable failure")
+}
+
+fn unknown_lease_error(error: PortError) -> PortError {
+    match error {
+        PortError::Cancelled(_) => {
+            PortError::Cancelled(unknown_failure("provider lease cancelled"))
+        }
+        PortError::DeadlineExceeded(_) => {
+            PortError::DeadlineExceeded(unknown_failure("provider lease expired"))
+        }
+        PortError::Unavailable(_) => unavailable("provider lease revoked", CommitEffect::Unknown),
+        _ => PortError::Cancelled(unknown_failure("provider lease revoked")),
+    }
+}
+
 impl Leases {
     fn check(&mut self) -> Result<(), PortError> {
         if let Some(lease) = &self.canonical {
@@ -66,9 +99,16 @@ impl Leases {
         runtime: &Runtime,
         operation: impl Future<Output = Result<T, PortError>>,
     ) -> Result<T, PortError> {
-        self.check()?;
+        if let Err(error) = self.check() {
+            return Err(unknown_lease_error(error));
+        }
         let result = runtime.run(operation, CommitEffect::Unknown).await;
-        self.check()?;
+        if let Err(error) = self.check() {
+            return Err(match result {
+                Err(existing) if is_unknown_effect(&existing) => existing,
+                _ => unknown_lease_error(error),
+            });
+        }
         result
     }
 }
@@ -223,10 +263,9 @@ impl ProviderService {
             response: None,
         };
         let mut result = self.perform(runtime, job, sender, &mut progress).await;
-        // Cancellation/drop only signals the transport. Before a response
-        // head, keep the source snapshot through actual network shutdown.
-        // Credential and consent registration remains active through shutdown
-        // even after the accepted upload releases the canonical snapshot.
+        // Cancellation/drop only signals the transport. Keep any un-released
+        // source snapshot and live credential/consent registration active until
+        // actual network shutdown completes.
         if let Some(response) = progress.response.take()
             && let Err(error) = response.close().await
         {
@@ -265,19 +304,28 @@ impl ProviderService {
                 .await
                 && result.is_ok()
             {
-                result = Err(
-                    if progress.submitted
-                        && matches!(
-                            &finalize_err,
-                            PortError::Unavailable(failure)
-                                if failure.effect() == CommitEffect::NotCommitted
-                        )
-                    {
-                        unavailable("provider settlement", CommitEffect::Unknown)
-                    } else {
-                        finalize_err
-                    },
-                );
+                result = Err(if progress.submitted {
+                    match finalize_err {
+                        PortError::Unavailable(failure) | PortError::Internal(failure)
+                            if failure.effect() == CommitEffect::NotCommitted =>
+                        {
+                            unavailable("provider settlement", CommitEffect::Unknown)
+                        }
+                        PortError::DeadlineExceeded(failure)
+                            if failure.effect() == CommitEffect::NotCommitted =>
+                        {
+                            PortError::DeadlineExceeded(unknown_failure("provider settlement"))
+                        }
+                        PortError::Cancelled(failure)
+                            if failure.effect() == CommitEffect::NotCommitted =>
+                        {
+                            PortError::Cancelled(unknown_failure("provider settlement"))
+                        }
+                        other => other,
+                    }
+                } else {
+                    finalize_err
+                });
             }
         }
         result
@@ -625,14 +673,18 @@ impl ProviderService {
             check_query_taint,
         )?);
         progress.submitted = true;
-        // Payload encoding, live revocation registration and transport handoff
-        // have succeeded under the pinned canonical snapshot. Release canonical
-        // locks/snapshot cleanly before awaiting upstream response headers so
-        // concurrent chat writers are never stalled on upstream TTFB.
-        if let Some(lease) = &mut progress.leases.canonical {
+        // Keep the pinned canonical snapshot across DNS/TCP/TLS, preflight(),
+        // and request-body upload so concurrent purge/redaction cannot race
+        // before bytes hit the socket, then release cleanly before waiting on
+        // upstream TTFB so same-Space chat writes stay unblocked.
+        let response = progress.response.as_mut().expect("started transport");
+        let uploaded = progress
+            .leases
+            .run(runtime, response.wait_uploaded())
+            .await?;
+        if uploaded && let Some(lease) = &mut progress.leases.canonical {
             let _ = lease.mark_dispatched().await;
         }
-        let response = progress.response.as_mut().expect("started transport");
         if let Err(error) = progress.leases.run(runtime, response.receive_head()).await {
             if matches!(&error,PortError::Unavailable(failure) if failure.effect()==CommitEffect::NotCommitted)
                 || matches!(&error, PortError::Domain(DomainError::CrossSpaceTainted))

@@ -115,7 +115,8 @@ deterministic collision handling. Existing IDs are never silently repaired or
 regenerated after moving a block. Duplicate explicit IDs invalidate all affected
 occurrences. If existing IDs cannot be reserved unambiguously, insertion is
 deferred with diagnostics while raw save remains allowed. Unknown options are
-preserved; semantic query compilation belongs to projections.
+preserved; semantic view-spec compilation lives in `notarium_syntax::nota::spec`
+while execution against projected rows belongs to projections.
 The unchanged hash prefix is prepared once per missing ID; reservation retries
 clone its state and append the counter, without rehashing the whole YAML payload.
 If concrete ID insertion is unsupported, the block receives a local diagnostic

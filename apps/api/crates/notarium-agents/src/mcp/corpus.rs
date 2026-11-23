@@ -541,10 +541,10 @@ fn control_tags(text: &str) -> impl Iterator<Item = Range<usize>> {
                 return None;
             }
             let after = &text[start + 1..];
-            let trimmed = after.trim_start_matches(|c: char| c.is_ascii_whitespace());
-            let tag = trimmed.strip_prefix('/').map_or(trimmed, |rest| {
-                rest.trim_start_matches(|c: char| c.is_ascii_whitespace())
-            });
+            let trimmed = after.trim_start_matches(char::is_whitespace);
+            let tag = trimmed
+                .strip_prefix('/')
+                .map_or(trimmed, |rest| rest.trim_start_matches(char::is_whitespace));
             let name_end = tag.find(|c: char| !c.is_ascii_alphanumeric() && c != '_')?;
             let name = &tag[..name_end];
             if TAGS

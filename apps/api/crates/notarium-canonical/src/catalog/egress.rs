@@ -19,51 +19,73 @@ use crate::{
     runtime::{SqlDriverState, pg_read_error},
 };
 
-struct ClosePgOnAbort(Option<StorePgConnection>);
+const ROLLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
-impl ClosePgOnAbort {
-    fn new(conn: StorePgConnection) -> Self {
-        Self(Some(conn))
-    }
+trait CloseOnDropConn {
+    fn close_conn_on_drop(&mut self);
+}
 
-    fn as_mut(&mut self) -> &mut StorePgConnection {
-        self.0.as_mut().expect("active PostgreSQL connection")
-    }
-
-    fn disarm(mut self) -> StorePgConnection {
-        self.0.take().expect("active PostgreSQL connection")
+impl CloseOnDropConn for StorePgConnection {
+    fn close_conn_on_drop(&mut self) {
+        self.close_on_drop();
     }
 }
 
-impl Drop for ClosePgOnAbort {
+impl CloseOnDropConn for sqlx::pool::PoolConnection<sqlx::Sqlite> {
+    fn close_conn_on_drop(&mut self) {
+        self.close_on_drop();
+    }
+}
+
+struct CloseOnAbort<C: CloseOnDropConn>(Option<C>);
+
+impl<C: CloseOnDropConn> CloseOnAbort<C> {
+    fn new(conn: C) -> Self {
+        Self(Some(conn))
+    }
+
+    fn as_mut(&mut self) -> &mut C {
+        self.0.as_mut().expect("active database connection")
+    }
+
+    fn disarm(mut self) -> C {
+        self.0.take().expect("active database connection")
+    }
+}
+
+impl<C: CloseOnDropConn> Drop for CloseOnAbort<C> {
     fn drop(&mut self) {
         if let Some(mut conn) = self.0.take() {
-            conn.close_on_drop();
+            conn.close_conn_on_drop();
         }
     }
 }
 
-struct CloseSqliteOnAbort(Option<sqlx::pool::PoolConnection<sqlx::Sqlite>>);
-
-impl CloseSqliteOnAbort {
-    fn new(conn: sqlx::pool::PoolConnection<sqlx::Sqlite>) -> Self {
-        Self(Some(conn))
-    }
-
-    fn as_mut(&mut self) -> &mut sqlx::pool::PoolConnection<sqlx::Sqlite> {
-        self.0.as_mut().expect("active SQLite connection")
-    }
-
-    fn disarm(mut self) -> sqlx::pool::PoolConnection<sqlx::Sqlite> {
-        self.0.take().expect("active SQLite connection")
+async fn rollback_sqlite_clean(conn: sqlx::pool::PoolConnection<sqlx::Sqlite>) {
+    let mut guarded = CloseOnAbort::new(conn);
+    if matches!(
+        tokio::time::timeout(
+            ROLLBACK_TIMEOUT,
+            sqlx::raw_sql("ROLLBACK").execute(&mut **guarded.as_mut()),
+        )
+        .await,
+        Ok(Ok(_))
+    ) {
+        drop(guarded.disarm());
     }
 }
 
-impl Drop for CloseSqliteOnAbort {
-    fn drop(&mut self) {
-        if let Some(mut conn) = self.0.take() {
-            conn.close_on_drop();
-        }
+async fn rollback_pg_clean(conn: StorePgConnection) {
+    let mut guarded = CloseOnAbort::new(conn);
+    if matches!(
+        tokio::time::timeout(
+            ROLLBACK_TIMEOUT,
+            sqlx::raw_sql("ROLLBACK").execute(&mut **guarded.as_mut()),
+        )
+        .await,
+        Ok(Ok(_))
+    ) {
+        drop(guarded.disarm());
     }
 }
 
@@ -114,14 +136,7 @@ impl CanonicalDisclosureGuard {
         if let DisclosureConnection::Sqlite { snapshot, .. } = &mut self.connection
             && let Some(conn) = snapshot.take()
         {
-            let mut guarded = CloseSqliteOnAbort::new(conn);
-            if sqlx::raw_sql("ROLLBACK")
-                .execute(&mut **guarded.as_mut())
-                .await
-                .is_ok()
-            {
-                drop(guarded.disarm());
-            }
+            rollback_sqlite_clean(conn).await;
         }
     }
 
@@ -129,26 +144,12 @@ impl CanonicalDisclosureGuard {
         match &mut self.connection {
             DisclosureConnection::Sqlite { snapshot, .. } => {
                 if let Some(conn) = snapshot.take() {
-                    let mut guarded = CloseSqliteOnAbort::new(conn);
-                    if sqlx::raw_sql("ROLLBACK")
-                        .execute(&mut **guarded.as_mut())
-                        .await
-                        .is_ok()
-                    {
-                        drop(guarded.disarm());
-                    }
+                    rollback_sqlite_clean(conn).await;
                 }
             }
             DisclosureConnection::Postgres(conn) => {
                 if let Some(conn) = conn.take() {
-                    let mut guarded = ClosePgOnAbort::new(conn);
-                    if sqlx::raw_sql("ROLLBACK")
-                        .execute(&mut **guarded.as_mut())
-                        .await
-                        .is_ok()
-                    {
-                        drop(guarded.disarm());
-                    }
+                    rollback_pg_clean(conn).await;
                 }
             }
         }
@@ -192,7 +193,7 @@ impl CanonicalStore {
                         .acquire()
                         .await
                         .map_err(|e| internal_not_committed("egress_acquire", e.to_string()))?;
-                    let mut guarded = CloseSqliteOnAbort::new(conn);
+                    let mut guarded = CloseOnAbort::new(conn);
                     sqlx::raw_sql("BEGIN DEFERRED")
                         .execute(&mut **guarded.as_mut())
                         .await
@@ -208,7 +209,7 @@ impl CanonicalStore {
                         .await
                         .map_err(|e| pg_read_error("egress_acquire", e))?;
                     // Discard only if cancelled/failed mid-setup; clean release runs ROLLBACK and reuses the connection.
-                    let mut guarded = ClosePgOnAbort::new(conn);
+                    let mut guarded = CloseOnAbort::new(conn);
                     sqlx::raw_sql("BEGIN; SELECT pg_advisory_xact_lock_shared(hashtextextended(current_schema(), 7311229))")
                         .execute(&mut **guarded.as_mut())
                         .await

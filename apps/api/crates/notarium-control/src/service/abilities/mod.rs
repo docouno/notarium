@@ -893,7 +893,7 @@ impl ControlService {
         &self,
         ctx: AccountContext,
         query: AbilityQuery,
-    ) -> Result<ControlPage<AbilityDescriptor>, PortError> {
+    ) -> Result<ControlPage<AbilityInspection>, PortError> {
         if let Some(name) = &query.name {
             valid_name(name)?;
         }
@@ -910,7 +910,7 @@ impl ControlService {
             .await;
         budget.run(rtx.finish(), CommitEffect::NotCommitted).await?;
         let scope = scope_result?;
-        let (page_candidates, by_name_candidates, continuation) = budget
+        let (page_candidates, by_name_candidates, continuation, mut checked_projects) = budget
             .run(
                 async {
                     let mut checked_spaces = BTreeSet::new();
@@ -1110,7 +1110,12 @@ impl ControlService {
                         })
                         .transpose()?;
                     ControlPageRequest::new(query.page.limit(), continuation.clone())?;
-                    Ok((page_candidates, by_name_candidates, continuation))
+                    Ok((
+                        page_candidates,
+                        by_name_candidates,
+                        continuation,
+                        checked_projects,
+                    ))
                 },
                 CommitEffect::NotCommitted,
             )
@@ -1122,13 +1127,23 @@ impl ControlService {
             });
         }
         let mut rtx = self.store.read(budget.clone()).await?;
-        let items = budget
+        let rows_with_state = budget
             .run(
                 async {
-                    let mut items = Vec::new();
+                    let mut selected_descriptors = Vec::new();
                     if query.authoring {
                         for value in page_candidates {
-                            items.push(
+                            if !self
+                                .promotion_is_committed(
+                                    rtx.inner_mut(),
+                                    value.promoted_from.as_ref(),
+                                    &value.reference.identity(),
+                                )
+                                .await?
+                            {
+                                continue;
+                            }
+                            selected_descriptors.push(
                                 self.overlay(
                                     rtx.inner_mut(),
                                     &current,
@@ -1158,18 +1173,108 @@ impl ControlService {
                                 && winner.kind == candidate.kind
                                 && winner.reference == candidate.reference
                             {
-                                items.push(winner);
+                                selected_descriptors.push(winner);
                             }
                         }
                     }
-                    Ok::<_, PortError>(items)
+                    let mut out = Vec::with_capacity(selected_descriptors.len());
+                    for mut descriptor in selected_descriptors {
+                        let key = placement(&descriptor.reference.placement)?;
+                        let (binding, preference) = ability_control_state(
+                            rtx.inner_mut(),
+                            current.auth().principal(),
+                            &key,
+                            &descriptor.reference.id,
+                        )
+                        .await?;
+                        let selected = match binding.as_ref().map(|row| row.mode.as_str()) {
+                            None | Some("all-projects") => None,
+                            Some("selected-projects") => {
+                                let rows = rows!(
+                                    rtx.inner_mut(),
+                                    AbilityProjectBindingsRow,
+                                    fetch_all,
+                                    "SELECT * FROM ability_project_bindings WHERE placement=$1 AND ability_id=$2 ORDER BY target_space,project_id LIMIT 201",
+                                    "SELECT * FROM v1_control.ability_project_bindings WHERE placement=$1 AND ability_id=$2 ORDER BY target_space,project_id LIMIT 201";
+                                    &key,
+                                    descriptor.reference.id.as_str()
+                                )?;
+                                if rows.len() > 200 {
+                                    return Err(invalid(ValidationReason::BudgetExceeded));
+                                }
+                                Some(rows)
+                            }
+                            _ => return Err(invalid(ValidationReason::InvalidState)),
+                        };
+                        let binding_pending =
+                            descriptor.requires_explicit_binding && binding.is_none();
+                        if binding_pending {
+                            descriptor.enabled = false;
+                        }
+                        let state = overlay_state(binding.as_ref(), preference.as_ref())?;
+                        out.push((descriptor, binding_pending, selected, state));
+                    }
+                    Ok::<_, PortError>(out)
                 },
                 CommitEffect::NotCommitted,
             )
             .await;
         budget.run(rtx.finish(), CommitEffect::NotCommitted).await?;
+        let rows_with_state = rows_with_state?;
+        let items = budget
+            .run(
+                async {
+                    let mut hidden_projects = BTreeSet::new();
+                    let mut items = Vec::with_capacity(rows_with_state.len());
+                    for (descriptor, binding_pending, selected, state) in rows_with_state {
+                        let availability = if let Some(selected) = selected {
+                            let mut projects = Vec::new();
+                            for row in selected {
+                                let project = FolderRef {
+                                    space_id: SpaceId::parse(&row.target_space)?,
+                                    folder_id: FolderId::parse(&row.project_id)?,
+                                };
+                                let proj_key =
+                                    (project.space_id.clone(), project.folder_id.clone());
+                                if checked_projects.contains(&proj_key) {
+                                    projects.push(project);
+                                } else if !hidden_projects.contains(&proj_key) {
+                                    match self.catalog_project(&current, &project).await {
+                                        Ok(_) => {
+                                            checked_projects.insert(proj_key);
+                                            projects.push(project);
+                                        }
+                                        Err(error) if hidden(&error) => {
+                                            hidden_projects.insert(proj_key);
+                                        }
+                                        Err(error) => return Err(error),
+                                    }
+                                }
+                            }
+                            AbilityProjects::Selected(projects)
+                        } else if binding_pending {
+                            AbilityProjects::Selected(Vec::new())
+                        } else {
+                            AbilityProjects::All
+                        };
+                        items.push(AbilityInspection {
+                            descriptor,
+                            availability,
+                            binding_enabled: state.binding_enabled,
+                            preference_enabled: state.preference_enabled,
+                            binding_revision: state
+                                .binding_revision
+                                .unwrap_or(ControlRevision::ZERO),
+                            overlays: state,
+                        });
+                    }
+                    Ok::<_, PortError>(items)
+                },
+                CommitEffect::NotCommitted,
+            )
+            .await?;
         Ok(ControlPage {
-            items: items?,
+            items,
             continuation,
         })
     }

@@ -54,7 +54,7 @@ async fn exercise_authoring_settlement(fixture: &RuntimeFixture) {
     .await
     .unwrap()
     .structured_content;
-    let [ability]: [AbilityDescriptor; 1] = fixture
+    let [ability]: [AbilityInspection; 1] = fixture
         .control
         .discover_abilities(
             owner.clone(),
@@ -71,7 +71,7 @@ async fn exercise_authoring_settlement(fixture: &RuntimeFixture) {
         .items
         .try_into()
         .unwrap();
-    let identity = ability.reference.identity();
+    let identity = ability.descriptor.reference.identity();
     let inspect = || {
         fixture
             .control
@@ -659,7 +659,7 @@ async fn binding_replay_after_advance_and_trash(
     .await
     .unwrap()
     .structured_content;
-    let [desc]: [AbilityDescriptor; 1] = fixture
+    let [desc]: [AbilityInspection; 1] = fixture
         .control
         .discover_abilities(
             human.clone(),
@@ -676,7 +676,7 @@ async fn binding_replay_after_advance_and_trash(
         .items
         .try_into()
         .unwrap();
-    let r1_ref = desc.reference.clone();
+    let r1_ref = desc.descriptor.reference.clone();
     let avail_edit = json!({
         "ref":created["ref"],
         "availability":{"mode":"selected-projects","projects":[first_handle]},
@@ -819,7 +819,7 @@ async fn promotion_concurrent_source_overlay_conflicts(
     .await
     .unwrap()
     .structured_content;
-    let [pref_desc]: [AbilityDescriptor; 1] = fixture
+    let [pref_desc]: [AbilityInspection; 1] = fixture
         .control
         .discover_abilities(
             human.clone(),
@@ -855,7 +855,7 @@ async fn promotion_concurrent_source_overlay_conflicts(
                         identity: runtime_ability_cases::identity(fixture, human, 0xe8).await,
                         input: AbilityPreferenceChange {
                             preference: AbilityPreferenceUpdate {
-                                ability: pref_desc.reference.clone(),
+                                ability: pref_desc.descriptor.reference.clone(),
                                 enabled: false,
                             },
                             expected: AbilityPreferenceGuard::Account,
@@ -914,7 +914,7 @@ async fn promotion_concurrent_source_overlay_conflicts(
     .await
     .unwrap()
     .structured_content;
-    let [bind_desc]: [AbilityDescriptor; 1] = fixture
+    let [bind_desc]: [AbilityInspection; 1] = fixture
         .control
         .discover_abilities(
             human.clone(),
@@ -944,7 +944,7 @@ async fn promotion_concurrent_source_overlay_conflicts(
         async {
             let inspected = fixture
                 .control
-                .inspect_ability(human.clone(), bind_desc.reference.identity())
+                .inspect_ability(human.clone(), bind_desc.descriptor.reference.identity())
                 .await
                 .unwrap();
             fixture
@@ -976,7 +976,7 @@ async fn promotion_concurrent_source_overlay_conflicts(
         "control_revision_conflict"
     );
     let dst_identity = AbilityIdentity {
-        id: bind_desc.reference.id.clone(),
+        id: bind_desc.descriptor.reference.id.clone(),
         placement: AbilityPlacement::OwnedSpace(first_project.space_id.clone()),
     };
     let dst_state = fixture

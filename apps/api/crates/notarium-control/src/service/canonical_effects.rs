@@ -35,6 +35,12 @@ impl ControlService {
                             | PrincipalKind::Pat
                             | PrincipalKind::OAuth { .. }
                     ) => {}
+            CanonicalEffect::AgentRuntimeWrite
+                if authority.kind() == ctx.auth().kind()
+                    && matches!(
+                        authority.kind(),
+                        PrincipalKind::Keeper(_) | PrincipalKind::AgentRun(_)
+                    ) => {}
             CanonicalEffect::AbilityAuthoring => authority.authorize_ability_mutation()?,
             CanonicalEffect::ConfirmedProposal => authority.authorize_proposal_confirmation()?,
             CanonicalEffect::ChatRollback => authority.authorize_human_management()?,
@@ -52,6 +58,7 @@ impl ControlService {
                 if authority.kind() == &PrincipalKind::DirectHuman
                     && matches!(ctx.auth().kind(), PrincipalKind::AgentRun(_)) => {}
             CanonicalEffect::ExternalCorpusWrite
+            | CanonicalEffect::AgentRuntimeWrite
             | CanonicalEffect::ChatInput
             | CanonicalEffect::ChatStop
             | CanonicalEffect::ChatRedaction

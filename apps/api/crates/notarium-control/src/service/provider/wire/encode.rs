@@ -232,6 +232,9 @@ fn schema(
         ProviderToolSchema::Map { values } => {
             json!({"type":"object","additionalProperties":schema(values, depth + 1, nodes, bytes)?})
         }
+        ProviderToolSchema::JsonValue => {
+            json!({"type":["string","number","boolean","null","array","object"]})
+        }
         ProviderToolSchema::AnyOf(options) => {
             if !(1..=8).contains(&options.len()) {
                 return Err(limited());

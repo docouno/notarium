@@ -401,17 +401,26 @@ impl AgentRunSupervisor {
         expected_revision: RevisionId,
         input: AppendChat,
     ) -> Result<ChatEntry, PortError> {
+        let control = self.inner.registry.control();
         let engine = self.inner.registry.engine();
         let mut mutation = run.command(label, step, input);
         mutation.preconditions.revision = Some(expected_revision);
-        let committed = engine
-            .append_chat(run.context(budget.remaining())?, mutation.clone())
-            .await;
+        let ctx = run.context(budget.remaining())?;
+        let writer = control
+            .fence_canonical_effect(ctx.auth().clone(), ctx, CanonicalEffect::AgentRuntimeWrite)
+            .await?;
+        let committed = engine.append_chat(writer, mutation.clone()).await;
         let result = match committed {
             Err(error) if queue::unknown_commit(&error) => {
-                engine
-                    .append_chat(run.context(budget.remaining())?, mutation)
-                    .await?
+                let ctx = run.context(budget.remaining())?;
+                let writer = control
+                    .fence_canonical_effect(
+                        ctx.auth().clone(),
+                        ctx,
+                        CanonicalEffect::AgentRuntimeWrite,
+                    )
+                    .await?;
+                engine.append_chat(writer, mutation).await?
             }
             result => result?,
         };

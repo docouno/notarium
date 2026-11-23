@@ -154,7 +154,7 @@ impl ControlPort for ControlPlane {
         &self,
         ctx: AccountContext,
         request: AbilityQuery,
-    ) -> PortFuture<'_, ControlPage<AbilityDescriptor>> {
+    ) -> PortFuture<'_, ControlPage<AbilityInspection>> {
         Box::pin(self.control.discover_abilities(ctx, request))
     }
     fn resolve_ability(

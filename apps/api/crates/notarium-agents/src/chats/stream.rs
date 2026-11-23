@@ -431,7 +431,7 @@ impl StepStreamBuffer {
         self.finish_with(RunTerminal::Failed { code })
     }
 
-    pub fn subscribe(&self, cursor: Option<&StreamCursor>) -> StepSubscription {
+    pub(crate) fn subscribe(&self, cursor: Option<&StreamCursor>) -> StepSubscription {
         let state = lock(&self.state);
         let changed = self.changed.subscribe();
         let resume = cursor
@@ -558,7 +558,7 @@ impl Drop for StreamRedaction {
     }
 }
 
-pub struct StepSubscription {
+pub(crate) struct StepSubscription {
     state: Arc<Mutex<State>>,
     run: AgentRunId,
     changed: watch::Receiver<u64>,
@@ -567,7 +567,7 @@ pub struct StepSubscription {
 }
 
 impl StepSubscription {
-    pub async fn next(&mut self) -> StreamRead {
+    pub(crate) async fn next(&mut self) -> StreamRead {
         loop {
             {
                 let state = lock(&self.state);

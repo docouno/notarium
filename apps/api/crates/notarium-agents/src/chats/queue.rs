@@ -25,6 +25,9 @@ impl AgentRunSupervisor {
         let thread = input.thread.clone();
         let gate = self.thread_gate(&scope, &thread);
         let _admission = gate.lock().await;
+        if self.inner.shutdown.is_cancelled() {
+            return Err(owner_unavailable());
+        }
         account = self.live_account(account).await?;
         if account.auth().kind() != &PrincipalKind::DirectHuman {
             return Err(DomainError::AccessDenied.into());
@@ -71,67 +74,42 @@ impl AgentRunSupervisor {
                 if let Some(orphaned) = latest.thread.active_run.as_ref()
                     && self.active(&scope, &thread).is_none()
                 {
-                    let (can_recover, recovery_owner) = match &self.inner.coordination {
+                    let (can_recover, mut recovery_fence) = match &self.inner.coordination {
                         Coordination::Local => (true, None),
-                        Coordination::Clustered(authority) => {
-                            let probe_run = new_run()?;
-                            match authority
-                                .register_owner(
-                                    maintenance(account.budget.clone()),
-                                    RunOwnershipRequest {
-                                        scope: scope.clone(),
-                                        thread: thread.clone(),
-                                        run: probe_run,
-                                        transition: RunOwnershipTransition::Recover {
-                                            previous: orphaned.clone(),
-                                        },
-                                    },
-                                    ownership_lost.clone(),
-                                )
-                                .await
-                            {
-                                Ok(owner)
-                                    if owner.is_current() && owner.prior_owner_fenced(orphaned) =>
-                                {
-                                    (true, Some(owner))
-                                }
-                                Ok(_) | Err(_) => (false, None),
-                            }
-                        }
+                        Coordination::Clustered(authority) => match authority
+                            .fence_orphan(
+                                maintenance(account.budget.clone()),
+                                scope.clone(),
+                                thread.clone(),
+                                orphaned.clone(),
+                            )
+                            .await
+                        {
+                            Ok(Some(fence)) if fence.check().is_ok() => (true, Some(fence)),
+                            Ok(_) | Err(_) => (false, None),
+                        },
                     };
                     if can_recover {
-                        if let Some(owner) = &recovery_owner
-                            && !owner.is_current()
-                        {
-                            return Err(owner_unavailable());
-                        }
-                        let human = self.detached_input_writer(&account, &scope).await?;
-                        let recovery = ChatRunRequest {
-                            thread: thread.clone(),
-                            expected_run: orphaned.clone(),
-                        };
-                        let mut recovered = engine
-                            .recover_active_run(human.clone(), recovery.clone())
+                        let recovered = self
+                            .recover_orphaned_run(&account, &scope, &thread, orphaned, || {
+                                if ownership_lost.is_cancelled() {
+                                    return Err(owner_unavailable());
+                                }
+                                if let Some(lease) = route.as_mut() {
+                                    lease.check()?;
+                                }
+                                if let Some(fence) = recovery_fence.as_mut() {
+                                    fence.check()?;
+                                }
+                                Ok(())
+                            })
                             .await;
-                        if recovered.as_ref().is_err_and(unknown_commit)
-                            && !ownership_lost.is_cancelled()
-                            && route.as_ref().is_none_or(|lease| lease.check().is_ok())
-                            && recovery_owner
-                                .as_ref()
-                                .is_none_or(|owner| owner.is_current())
-                        {
-                            if let Some(effect) = human.canonical_effect() {
-                                effect.check()?;
-                            }
-                            recovered = engine.recover_active_run(human, recovery).await;
-                        }
                         match recovered {
-                            Ok(FinishChatRunOutcome::Cleared) => {
-                                self.inner
-                                    .revocations
-                                    .finish_thread_pending(&scope, &thread);
-                            }
-                            Ok(FinishChatRunOutcome::Changed | FinishChatRunOutcome::Pending) => {}
+                            Ok(
+                                FinishChatRunOutcome::Cleared
+                                | FinishChatRunOutcome::Changed
+                                | FinishChatRunOutcome::Pending,
+                            ) => {}
                             Err(PortError::Domain(DomainError::ValidationFailed {
                                 diagnostic,
                             })) if diagnostic.reason == ValidationReason::InvalidAuthority => {
@@ -190,8 +168,13 @@ impl AgentRunSupervisor {
                     .revocations
                     .pending_submission(&key, &identity, account.auth())
         {
-            if let Some(lease) = &route {
-                lease.check().map_err(after_append)?;
+            if let Some(lease) = &route
+                && let Err(error) = lease.check().map_err(after_append)
+            {
+                if !unknown_commit(&error) && concurrency_retry_delay(&error).is_none() {
+                    self.inner.revocations.finish_submission(&key, &sender);
+                }
+                return Err(error);
             }
             drop(route);
             // A peer can resolve the same receipt through the shared hub. Keep

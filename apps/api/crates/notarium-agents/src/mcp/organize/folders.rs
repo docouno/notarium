@@ -311,6 +311,17 @@ pub(super) async fn handle(
         .journal("folder-route", || plan(call, name, args))
         .await?;
     let scope = call.space(route.scope.clone())?;
+    if matches!(
+        call.target,
+        super::super::EgressTarget::InAppProvider { .. }
+    ) {
+        let live_source = snapshot_by_id(call, &scope, &route.folder).await?;
+        admit_folder_snapshot(call, &scope, &live_source).await?;
+        if let FolderOperation::Move { parent } = &route.operation {
+            let live_dest = snapshot_by_id(call, &scope, parent).await?;
+            admit_folder_snapshot(call, &scope, &live_dest).await?;
+        }
+    }
     let identity = call.command_identity(&route.scope, name.name(), 0);
     let preconditions = Preconditions {
         revision: Some(route.revision.clone()),

@@ -46,22 +46,27 @@ Confirmed creation proposals persist the title links shown during review.
 returned `session.id` on subsequent calls to keep the episode active.
 Folder listing, moves and renames resolve relative paths using the explicit
 project, then the project bound to the episode. Follow `delta.nextAction` to
-drain the bootstrap delta. Continuations and `list_notes` cursors bind the
-caller, episode and original Space cuts in bounded per-instance memory with
-per-principal quotas inside the global cap. Multi-instance MCP deployments
-should use sticky session routing; when a continuation or cursor misses after
-failover or expiry, callers receive `cursor_stale` and restart from the last
-acknowledged boundary or page start.
+drain the bootstrap delta. Bootstrap continuations bind the caller, episode and
+original Space cuts (`cursor_stale` on expiry or failover), while `list_notes`
+cursors bind the caller, folder, filter criteria and cut (`cursor_scope_mismatch`
+on scope mismatch, `cursor_stale` on expiry or failover); both live in bounded
+per-instance memory with per-principal quotas inside the global cap.
+Multi-instance MCP deployments should use sticky session routing; when a
+continuation or cursor misses after failover or expiry, callers receive
+`cursor_stale` and restart from the last acknowledged boundary or page start.
 When acknowledgement is enabled, the next continuation or final
 `deliveryReceipt` advances only to the last delivered complete command.
 Read-scoped bearer tokens (`BearerScope::Read`) may acknowledge only their own
-named `session` episode cursor (`AckOwner::Episode`); without `session` they
-behave as `acknowledge: false` and never advance the account-wide baseline.
+explicit `session` (`{id}` or `{name}`) episode cursor (`AckOwner::Episode`);
+without `session` they behave as `acknowledge: false` and never advance the
+account-wide baseline. Passing `role` to `start_session` with a read-scoped
+bearer renders the role inline without persisting an episode role binding, and
+`use_role` with `session` returns `AccessDenied`.
 Pass `acknowledge: false` to inspect without advancing the saved cursor.
 Tools return `versionToken` for optimistic-concurrency preconditions on
 subsequent mutations (`edit_note`, `edit_ability`, `remember_*`), while
-read-only provenance records (`start_session` profile/delta, `recent_activity`,
-`get_note.links`) report the observed `revision`.
+read-only provenance records (`start_session` profile/delta, `recent_activity`)
+report the observed `revision`.
 `edit_note.view` accepts nested YAML mappings (such as `nota` `filter:` trees)
 and validates the resulting `nota` view specification against the Space schema
 before committing.

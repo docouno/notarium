@@ -144,6 +144,17 @@ pub trait ClusterRunAuthority: SessionRevocationPort {
         request: RunOwnershipRequest,
         cancellation: Cancellation,
     ) -> PortFuture<'_, Box<dyn LiveRunOwner>>;
+
+    /// Give positive evidence that no live owner can still act for `previous`
+    /// on this thread and prevent replacement ownership until the returned
+    /// fence drops. Return None when the prior owner is still live or uncertain.
+    fn fence_orphan(
+        &self,
+        ctx: MaintenanceContext,
+        scope: HistoryScope,
+        thread: ChatThreadId,
+        previous: AgentRunId,
+    ) -> PortFuture<'_, Option<Box<dyn RevocationLease>>>;
 }
 
 pub trait LiveRunOwner: Send + Sync {
@@ -804,6 +815,7 @@ impl AgentRunSupervisor {
             &auth,
             None,
             cancellation.clone(),
+            Some((request.scope.clone(), request.thread.clone())),
             sender,
         )?;
         let registration = {
@@ -871,29 +883,15 @@ impl AgentRunSupervisor {
             if thread.active_run.as_ref() != Some(previous) || !owner.can_recover(previous) {
                 return Ok(LaunchOutcome::Settled(owner_unavailable()));
             }
-            let engine = self.inner.registry.engine();
-            let human = self.detached_input_writer(&account, &request.scope).await?;
-            let recovery = ChatRunRequest {
-                thread: request.thread.clone(),
-                expected_run: previous.clone(),
-            };
-            let mut recovered = engine
-                .recover_active_run(human.clone(), recovery.clone())
-                .await;
-            if recovered.as_ref().is_err_and(queue::unknown_commit) {
-                owner.check()?;
-                lease.check()?;
-                if let Some(effect) = human.canonical_effect() {
-                    effect.check()?;
-                }
-                recovered = engine.recover_active_run(human, recovery).await;
-            }
-            if recovered? != FinishChatRunOutcome::Cleared {
+            let recovered = self
+                .recover_orphaned_run(&account, &request.scope, &request.thread, previous, || {
+                    owner.check()?;
+                    lease.check()
+                })
+                .await?;
+            if recovered != FinishChatRunOutcome::Cleared {
                 return Err(owner_unavailable());
             }
-            self.inner
-                .revocations
-                .finish_thread_pending(&request.scope, &request.thread);
             owner.check()?;
             lease.check()?;
         }
@@ -1074,6 +1072,38 @@ impl AgentRunSupervisor {
             }
             delay = (delay * 2).min(Duration::from_secs(2));
         }
+    }
+
+    pub(super) async fn recover_orphaned_run(
+        &self,
+        account: &AccountContext,
+        scope: &HistoryScope,
+        thread: &ChatThreadId,
+        previous: &AgentRunId,
+        mut check_live: impl FnMut() -> Result<(), PortError>,
+    ) -> Result<FinishChatRunOutcome, PortError> {
+        check_live()?;
+        let engine = self.inner.registry.engine();
+        let human = self.detached_input_writer(account, scope).await?;
+        check_live()?;
+        let recovery = ChatRunRequest {
+            thread: thread.clone(),
+            expected_run: previous.clone(),
+        };
+        let mut recovered = engine
+            .recover_active_run(human.clone(), recovery.clone())
+            .await;
+        if recovered.as_ref().is_err_and(queue::unknown_commit) {
+            check_live()?;
+            if let Some(effect) = human.canonical_effect() {
+                effect.check()?;
+            }
+            recovered = engine.recover_active_run(human, recovery).await;
+        }
+        if matches!(recovered, Ok(FinishChatRunOutcome::Cleared)) {
+            self.inner.revocations.finish_thread_pending(scope, thread);
+        }
+        recovered
     }
 
     fn spawn_run(&self, run: Arc<ActiveRun>, start: RunTaskStart) {

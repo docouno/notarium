@@ -291,7 +291,7 @@ async fn resolution_and_preferences(
             .discover_abilities(ctx.clone(), query(Some(next), None, 1))
             .await
             .unwrap();
-        found.extend(page.items.into_iter().map(|v| v.reference));
+        found.extend(page.items.into_iter().map(|v| v.descriptor.reference));
         cursor = page.continuation;
     }
     assert_eq!(found, vec![scoped.clone()]);
@@ -437,7 +437,7 @@ async fn resolution_and_preferences(
         inventory
             .items
             .iter()
-            .any(|v| v.reference == scoped && !v.enabled)
+            .any(|v| v.descriptor.reference == scoped && !v.descriptor.enabled)
     );
     let read_inventory = service
         .discover_abilities(
@@ -453,7 +453,7 @@ async fn resolution_and_preferences(
         read_inventory
             .items
             .iter()
-            .any(|value| value.reference == scoped)
+            .any(|value| value.descriptor.reference == scoped)
     );
 
     // A personal preference can only narrow availability, including System packages.
@@ -940,7 +940,12 @@ async fn bearer_authoring(pg: bool) {
             )
             .await
             .unwrap();
-        assert!(available.items.iter().any(|card| card.reference == package));
+        assert!(
+            available
+                .items
+                .iter()
+                .any(|card| card.descriptor.reference == package)
+        );
         let inspection = service
             .inspect_ability(caller.clone(), package.identity())
             .await

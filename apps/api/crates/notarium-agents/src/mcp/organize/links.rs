@@ -190,32 +190,41 @@ async fn resolve(
         }),
         (Some(id), None) => {
             let note = NoteId::parse(id)?;
-            corpus::note_in_space(call, scope, &note).await?;
-            let alias: Result<Option<TargetAlias>, PortError> = async {
-                let current =
-                    metadata_snapshot(call, scope, &note, None, ReceiptSet::default()).await?;
-                if let Some(provider) = provider {
-                    let provider_scope = provider.space(scope.scope().clone())?;
-                    corpus::note_metadata_origin(provider, &provider_scope, &current.metadata)
-                        .await?;
+            let collapse = |error: PortError| {
+                if corpus::hidden(&error) {
+                    DomainError::ResourceNotFound.into()
                 } else {
-                    corpus::note_metadata_origin(call, scope, &current.metadata).await?;
+                    error
                 }
-                Ok(current
-                    .provenance
-                    .as_ref()
-                    .filter(|data| valid_title(&data.title))
-                    .map(|data| TargetAlias {
-                        title: data.title.trim().to_owned(),
-                        revision: current.metadata.revision().clone(),
-                    }))
-            }
-            .await;
-            let alias = match alias {
-                Ok(alias) => alias,
-                Err(error) if corpus::hidden(&error) => None,
-                Err(error) => return Err(error),
             };
+            let check = provider.unwrap_or(call);
+            let check_scope = if provider.is_some() {
+                check.space(scope.scope().clone()).map_err(collapse)?
+            } else {
+                scope.clone()
+            };
+            let target_note = corpus::note_in_space(check, &check_scope, &note)
+                .await
+                .map_err(collapse)?;
+            corpus::admit_provider_note_read(check, &check_scope, &target_note)
+                .await
+                .map_err(collapse)?;
+            if provider.is_some() {
+                corpus::note_in_space(call, scope, &note).await?;
+            }
+            let current =
+                metadata_snapshot(call, scope, &note, None, ReceiptSet::default()).await?;
+            corpus::note_metadata_origin(check, &check_scope, &current.metadata)
+                .await
+                .map_err(collapse)?;
+            let alias = current
+                .provenance
+                .as_ref()
+                .filter(|data| valid_title(&data.title))
+                .map(|data| TargetAlias {
+                    title: data.title.trim().to_owned(),
+                    revision: current.metadata.revision().clone(),
+                });
             Ok(Target::Stable { note, alias })
         }
         _ => Err(invalid(ValidationReason::InvalidQuery)),
@@ -244,6 +253,18 @@ pub(in super::super) async fn plan_link(
     observe_revision: bool,
 ) -> Result<LinkPlan, PortError> {
     let (scope, note) = corpus::locate_note(call, &source).await?;
+    plan_link_located(call, provider, scope, note, edge, observe_revision).await
+}
+
+async fn plan_link_located(
+    call: &ToolCallContext<'_>,
+    provider: Option<&ToolCallContext<'_>>,
+    scope: SpaceContext,
+    note: notarium_core::ports::CatalogNote,
+    edge: &LinkArgs,
+    observe_revision: bool,
+) -> Result<LinkPlan, PortError> {
+    let source = note.reference.note_id.clone();
     corpus::admit_note_write(call, &scope, &note).await?;
     let target = resolve(
         call,
@@ -317,7 +338,8 @@ async fn authorize(
         .auth()
         .authorize_direct_write(&source.facts, &source.facts)?;
     if let Target::Stable { note, alias } = &plan.target {
-        corpus::note_in_space(call, scope, note).await?;
+        let target_note = corpus::note_in_space(call, scope, note).await?;
+        corpus::admit_provider_note_read(call, scope, &target_note).await?;
         if let Some(alias) = alias {
             let current = metadata_snapshot(
                 call,

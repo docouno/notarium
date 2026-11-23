@@ -729,12 +729,7 @@ async fn resilience_submit_gate_and_archival(
     assert!(
         fixture
             .revocations
-            .pending(&notarium_agents::revocation::PendingCredentialKey {
-                scope: scope.clone(),
-                thread: thread.clone(),
-                input: PendingInputId::from_bytes([0xd1; 16]),
-            })
-            .is_some(),
+            .has_pending(scope, thread, &PendingInputId::from_bytes([0xd1; 16])),
         "pending credential must survive Unknown+NotCommitted retry"
     );
     finish_ollama_stream(

@@ -54,6 +54,12 @@ impl CanonicalStore {
         ctx: SpaceContext,
         staged: StagedChatBlob,
     ) -> Result<(), PortError> {
+        if ctx.confirmed_chat_step().is_some() {
+            return Err(DomainError::validation(
+                notarium_core::error::ValidationReason::InvalidAuthority,
+            )
+            .into());
+        }
         let deadline = CommandDeadline::start(&ctx.budget, "discard_chat_stage");
         if staged.lease().is_none()
             || staged.space() != &ctx.scope().space_id
@@ -63,19 +69,23 @@ impl CanonicalStore {
         }
         let budget = ctx.budget.clone();
         let store = self.clone();
+        let effect = ctx.canonical_effect().cloned();
         let result = self
-            .with_auxiliary_command(
+            .with_guarded_auxiliary_command(
                 ctx.scope().space_id.clone(),
+                None,
                 Some((&budget, deadline)),
+                effect,
                 |handoff| {
                     drop(handoff);
                     Ok(())
                 },
-                move |tx| {
+                move |tx, effect| {
                     Box::pin(async move {
                         let space = load_space_record_for_update_opt(tx, &ctx.scope().space_id)
                             .await?
                             .ok_or(DomainError::ResourceNotFound)?;
+                        effect.begin().await?;
                         space.scope.check(ctx.scope())?;
                         super::authorize_chat_write_on_space(ctx.auth(), &space.space)?;
                         store

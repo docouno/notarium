@@ -322,6 +322,7 @@ pub struct PreparedWriteIntent {
 struct BatchWriteIntent {
     prepared: PreparedWriteIntent,
     room_wal: Option<RoomWalMode>,
+    canonical_effect: Option<CanonicalEffectAdmission>,
 }
 
 struct RoomWalMode {
@@ -335,11 +336,21 @@ impl From<PreparedWriteIntent> for BatchWriteIntent {
         Self {
             prepared,
             room_wal: None,
+            canonical_effect: None,
         }
     }
 }
 
 impl BatchWriteIntent {
+    fn canonical_effect(&self) -> Option<&CanonicalEffectAdmission> {
+        self.canonical_effect.as_ref().or_else(|| {
+            self.prepared
+                .idempotency
+                .as_ref()
+                .and_then(CommandIdentitySpec::canonical_effect)
+        })
+    }
+
     fn expected_epoch(&self) -> Option<LeaseEpoch> {
         match &self.room_wal {
             Some(mode) if !mode.check_space_lease => None,
@@ -839,12 +850,7 @@ impl WriteCoordinator {
             .idempotency
             .as_ref()
             .is_some_and(CommandIdentitySpec::has_confirmed_chat_step);
-        let guarded = intent
-            .prepared
-            .idempotency
-            .as_ref()
-            .and_then(CommandIdentitySpec::canonical_effect)
-            .is_some();
+        let guarded = intent.canonical_effect().is_some();
         let sqlite_fast_plan = sqlite_fast_plan.and_then(|plan| {
             if confirmed_step || (guarded && !plan.supports_canonical_effect()) {
                 intent.prepared.execute = plan.into_async_exec();
@@ -1195,8 +1201,36 @@ impl crate::CanonicalStore {
     where
         R: Serialize + DeserializeOwned + Send + 'static,
     {
+        self.submit_write_command_until_with_effect(
+            budget,
+            deadline,
+            intent,
+            None,
+            sqlite_fast_plan,
+            pg_fast_plan,
+            pretracked_guard,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn submit_write_command_until_with_effect<R>(
+        &self,
+        budget: &CallBudget,
+        deadline: tokio::time::Instant,
+        intent: PreparedWriteIntent,
+        canonical_effect: Option<notarium_core::ports::CanonicalEffectAdmission>,
+        sqlite_fast_plan: Option<Box<dyn crate::sqlite_fast::SqliteSyncItemPlan>>,
+        pg_fast_plan: Option<PgSingleItemFastFn>,
+        pretracked_guard: Option<ActiveWriteOpGuard>,
+    ) -> Result<R, PortError>
+    where
+        R: Serialize + DeserializeOwned + Send + 'static,
+    {
         let is_idempotent = intent.idempotency.is_some();
         let writer = self.inner.writer()?;
+        let mut batch_intent: BatchWriteIntent = intent.into();
+        batch_intent.canonical_effect = canonical_effect;
         let raw_bytes = writer
             .submit_raw_opt_fast(
                 &self.inner,
@@ -1205,7 +1239,7 @@ impl crate::CanonicalStore {
                     deadline,
                     room_wal_admission: None,
                 },
-                intent.into(),
+                batch_intent,
                 sqlite_fast_plan,
                 pg_fast_plan,
                 pretracked_guard,
@@ -1249,6 +1283,7 @@ impl crate::CanonicalStore {
                         check_space_lease,
                         replay_safe,
                     }),
+                    canonical_effect: None,
                 },
                 sqlite_fast_plan,
                 None,
@@ -1667,14 +1702,9 @@ async fn flush_single_batch(
             // The native guarded rollback owns one transaction. Preserve the ordinary
             // per-item admission and rollback protocol in a mixed batch.
             let standalone_or_unguarded = items.len() == 1
-                || items.iter().all(|(intent, _, _)| {
-                    intent
-                        .prepared
-                        .idempotency
-                        .as_ref()
-                        .and_then(CommandIdentitySpec::canonical_effect)
-                        .is_none()
-                });
+                || items
+                    .iter()
+                    .all(|(intent, _, _)| intent.canonical_effect().is_none());
             let can_fast = group_spaces.is_empty()
                 && standalone_or_unguarded
                 && !rollback_fault_armed
@@ -2042,14 +2072,10 @@ async fn execute_batch_on_conn(
     // can hold up a concurrent Control revocation.
     let all_spaces;
     let initial_spaces = if store.is_postgres()
-        && intents.iter().any(|intent| {
-            intent
-                .prepared
-                .idempotency
-                .as_ref()
-                .and_then(CommandIdentitySpec::canonical_effect)
-                .is_some()
-        }) {
+        && intents
+            .iter()
+            .any(|intent| intent.canonical_effect().is_some())
+    {
         all_spaces = intents
             .iter()
             .map(|intent| intent.prepared.scope.space_id.clone())
@@ -2453,6 +2479,7 @@ async fn execute_single_item_in_savepoint(
     let BatchWriteIntent {
         prepared: intent,
         room_wal,
+        canonical_effect,
     } = intent;
     space_rec.scope.check(&intent.scope)?;
     if expected_active_epoch.is_some_and(|epoch| epoch != space_rec.active_epoch) {
@@ -2465,6 +2492,8 @@ async fn execute_single_item_in_savepoint(
         idemp
             .authorize_confirmed_chat_step(tx, &intent.scope, true)
             .await?;
+    } else if let Some(effect) = &canonical_effect {
+        *active_effect = Some(effect.begin().await?);
     }
 
     // 2. Idempotent command receipt lookup (`command_receipts`) BEFORE purge fence and stale head CAS

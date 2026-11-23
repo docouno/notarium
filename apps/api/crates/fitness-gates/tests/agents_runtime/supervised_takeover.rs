@@ -174,6 +174,22 @@ impl ClusterRunAuthority for SharedAuthority {
             Ok(Box::new(self.clone()) as Box<dyn LiveRunOwner>)
         })
     }
+
+    fn fence_orphan(
+        &self,
+        _ctx: MaintenanceContext,
+        _scope: HistoryScope,
+        _thread: ChatThreadId,
+        previous: AgentRunId,
+    ) -> PortFuture<'_, Option<Box<dyn RevocationLease>>> {
+        Box::pin(async move {
+            if self.is_current() && self.prior_owner_fenced(&previous) {
+                Ok(Some(Box::new(self.clone()) as Box<dyn RevocationLease>))
+            } else {
+                Ok(None)
+            }
+        })
+    }
 }
 
 impl SessionRevocationPort for SharedAuthority {

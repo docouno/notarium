@@ -1014,7 +1014,7 @@ async fn exercise_incremental_folder_cover_and_predicates(pg: bool) {
         "missing"
     );
 
-    // 3. Real #5 field predicates + keyset pagination cursors on both SQLite and PG16.
+    // 3. Space schema field predicates + keyset pagination cursors on both SQLite and PG16.
     fixture
         .canonical
         .update_space_schema(
@@ -1118,6 +1118,74 @@ async fn exercise_incremental_folder_cover_and_predicates(pg: bool) {
     .into_iter()
     .collect();
     assert_eq!(collected, expected_ids);
+
+    // 4. CausalBasis::Exact on query_graph waits for exact visibility and fails
+    // closed instead of returning a stale cut when the target seq is absent.
+    let n1_id = NoteId::parse(n1.as_str().unwrap()).unwrap();
+    let exact_ok = notarium_core::ports::ViewGraphPort::query_graph(
+        &*projection,
+        space.clone(),
+        GraphQuery {
+            tier: GraphTier::Neighborhood {
+                note: n1_id.clone(),
+                hops: 1,
+            },
+            filter: notarium_core::query::FieldFilterAstV1 {
+                version: 1,
+                predicate: notarium_core::query::Predicate::All(Vec::new()),
+            },
+            causal: Some(CausalBasis::Exact(
+                notarium_core::receipt::ReceiptSet::new([
+                    notarium_core::receipt::MutationReceiptToken::new(
+                        space.scope().clone(),
+                        SpaceSeq::new(1).unwrap(),
+                    )
+                    .unwrap(),
+                ])
+                .unwrap(),
+            )),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        exact_ok
+            .nodes
+            .iter()
+            .any(|node| node.id == GraphNodeId::Note(n1_id.clone())),
+        "CausalBasis::Exact query_graph must include committed note"
+    );
+    let mut short_space = space.clone();
+    short_space.budget.remaining = std::time::Duration::from_millis(60);
+    let exact_miss = notarium_core::ports::ViewGraphPort::query_graph(
+        &*projection,
+        short_space,
+        GraphQuery {
+            tier: GraphTier::Neighborhood {
+                note: n1_id,
+                hops: 1,
+            },
+            filter: notarium_core::query::FieldFilterAstV1 {
+                version: 1,
+                predicate: notarium_core::query::Predicate::All(Vec::new()),
+            },
+            causal: Some(CausalBasis::Exact(
+                notarium_core::receipt::ReceiptSet::new([
+                    notarium_core::receipt::MutationReceiptToken::new(
+                        space.scope().clone(),
+                        SpaceSeq::new(500_000).unwrap(),
+                    )
+                    .unwrap(),
+                ])
+                .unwrap(),
+            )),
+        },
+    )
+    .await;
+    assert!(
+        matches!(exact_miss, Err(PortError::DeadlineExceeded(_))),
+        "CausalBasis::Exact with unreachable receipt must fail instead of returning stale cut: {exact_miss:?}"
+    );
 
     search.shutdown().await;
     projector.shutdown().await.unwrap();

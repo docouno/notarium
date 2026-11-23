@@ -127,6 +127,11 @@ async fn route(
     if &route.note != note || expected.is_some_and(|revision| revision != &route.revision) {
         return Err(invalid(ValidationReason::SourceMismatch));
     }
+    if matches!(call.target, EgressTarget::InAppProvider { .. }) {
+        let scope = call.space(route.scope.clone())?;
+        let catalog = corpus::note_in_space(call, &scope, &route.note).await?;
+        corpus::admit_note_write(call, &scope, &catalog).await?;
+    }
     Ok(route)
 }
 

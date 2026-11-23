@@ -101,6 +101,15 @@ impl ControlService {
             ),
         )?;
         command.require(ctx.auth().principal(), ctx.auth().principal())?;
+        if matches!(
+            ctx.auth().kind(),
+            PrincipalKind::Keeper(_) | PrincipalKind::AgentRun(_)
+        ) {
+            return Err(DomainError::AccessDenied.into());
+        }
+        if ctx.auth().taint().is_tainted() {
+            return Err(DomainError::CrossSpaceTainted.into());
+        }
         if matches!(request.input.owner, AckOwner::Account)
             && ctx.auth().bearer_scope() == Some(BearerScope::Read)
         {
@@ -109,6 +118,15 @@ impl ControlService {
         let budget = OperationBudget::new(ctx.budget.clone());
         let delivered = &request.input.delivered;
         let current_pre = self.current_account(&ctx, &budget).await?;
+        if matches!(
+            current_pre.auth().kind(),
+            PrincipalKind::Keeper(_) | PrincipalKind::AgentRun(_)
+        ) {
+            return Err(DomainError::AccessDenied.into());
+        }
+        if current_pre.auth().taint().is_tainted() {
+            return Err(DomainError::CrossSpaceTainted.into());
+        }
         if matches!(request.input.owner, AckOwner::Account)
             && current_pre.auth().bearer_scope() == Some(BearerScope::Read)
         {
@@ -138,6 +156,12 @@ impl ControlService {
         let mut tx = self.store.write(budget.clone()).await?;
         let (revision, saved) = budget.run(async {
             let auth = self.revalidate_with_keeper(tx.inner_mut(), ctx.auth(), keeper.as_ref()).await?;
+            if matches!(auth.kind(), PrincipalKind::Keeper(_) | PrincipalKind::AgentRun(_)) {
+                return Err(DomainError::AccessDenied.into());
+            }
+            if auth.taint().is_tainted() {
+                return Err(DomainError::CrossSpaceTainted.into());
+            }
             if matches!(request.input.owner, AckOwner::Account)
                 && auth.bearer_scope() == Some(BearerScope::Read)
             {
@@ -146,7 +170,12 @@ impl ControlService {
             if auth.spaces().get(&delivered.scope.space_id).is_none_or(|g| g.read_classes.is_empty()) {
                 return Err(DomainError::ResourceNotFound.into());
             }
-            if let AckOwner::Episode(id) = &request.input.owner { episode(tx.inner_mut(), auth.principal(), id).await?; }
+            if let AckOwner::Episode(id) = &request.input.owner {
+                let row = episode(tx.inner_mut(), auth.principal(), id).await?;
+                if row.lifecycle == "closed" {
+                    return Err(invalid(ValidationReason::InvalidState));
+                }
+            }
             if let Some(replay) = command.replay::<SavedAck>(tx.inner_mut()).await? { return Ok(replay); }
             let owner = user(tx.inner_mut(), auth.principal().as_str()).await?;
             let space = delivered.scope.space_id.as_str();

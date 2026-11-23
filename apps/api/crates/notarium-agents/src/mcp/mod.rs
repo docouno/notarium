@@ -163,8 +163,8 @@ impl McpToolResult {
             "envelope": draft.envelope,
         }))
         .map_err(|_| invalid(ValidationReason::InvalidState))?;
-        // Leave space for the canonical framing marker.
-        if encoded.len() > AppendChat::MAX_STRUCTURED_BODY_BYTES - 64 {
+        // Leave space for the canonical framing wrapper around the structured body.
+        if encoded.len() > AppendChat::MAX_STRUCTURED_BODY_BYTES - 256 {
             return Err(invalid(ValidationReason::BudgetExceeded));
         }
         let effect = tool
@@ -616,18 +616,14 @@ impl<'a> ToolCallContext<'a> {
 
     async fn corpus_writer(&self, mut scope: SpaceContext) -> Result<SpaceContext, PortError> {
         scope.budget = self.budget();
-        if matches!(self.target, EgressTarget::ExternalMcp) {
-            self.registry
-                .control
-                .fence_canonical_effect(
-                    self.auth.clone(),
-                    scope,
-                    CanonicalEffect::ExternalCorpusWrite,
-                )
-                .await
-        } else {
-            Ok(scope)
-        }
+        let effect = match self.target {
+            EgressTarget::ExternalMcp => CanonicalEffect::ExternalCorpusWrite,
+            EgressTarget::InAppProvider { .. } => CanonicalEffect::AgentRuntimeWrite,
+        };
+        self.registry
+            .control
+            .fence_canonical_effect(self.auth.clone(), scope, effect)
+            .await
     }
 
     fn budget(&self) -> CallBudget {

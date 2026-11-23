@@ -512,7 +512,11 @@ async fn exercise(pg: bool) {
             .discover_abilities(pinned.clone(), query(cursor.take()))
             .await
             .unwrap();
-        discovered.extend(page.items.into_iter().map(|item| item.reference.id));
+        discovered.extend(
+            page.items
+                .into_iter()
+                .map(|item| item.descriptor.reference.id),
+        );
         cursor = page.continuation;
         if cursor.is_none() {
             break;

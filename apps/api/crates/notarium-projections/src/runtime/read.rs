@@ -268,7 +268,7 @@ fn stale() -> PortError {
     DomainError::validation(ValidationReason::CursorStale).into()
 }
 
-fn not_ready() -> PortError {
+pub(super) fn not_ready() -> PortError {
     DomainError::validation(ValidationReason::NotReady).into()
 }
 

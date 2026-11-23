@@ -155,6 +155,14 @@ async fn admit_proposal_targets(
                 .inspect_memory_target(planning.account(), target, category)
                 .await
                 .map_err(collapse)?;
+            if call
+                .auth
+                .spaces()
+                .get(&snapshot.scope.space_id)
+                .is_some_and(|grant| grant.project_root.is_some())
+            {
+                return Err(DomainError::ResourceNotFound.into());
+            }
             let scope = call.space(snapshot.scope).map_err(collapse)?;
             let folder_ref = notarium_core::model::FolderRef {
                 space_id: scope.scope().space_id.clone(),
@@ -175,29 +183,10 @@ async fn admit_proposal_targets(
             let project = session::resolve_project(call, handle)
                 .await
                 .map_err(collapse)?;
-            let scope = session::space(call, &project.folder.space_id)
+            let has_version_token = args.get("versionToken").is_some_and(|v| !v.is_null());
+            super::memory::admit_project_boundary(call, &project.folder, has_version_token)
                 .await
                 .map_err(collapse)?;
-            let folder = call
-                .registry
-                .catalog
-                .folder(call.account(), project.folder.clone())
-                .await
-                .map_err(collapse)?;
-            let required_class = args
-                .get("versionToken")
-                .filter(|v| !v.is_null())
-                .map(|_| notarium_core::classes::DocClass::AgentMemory);
-            corpus::admit_folder_boundary(
-                call,
-                &scope,
-                &project.folder,
-                Some(project.folder.clone()),
-                &folder.ancestor_folders,
-                required_class,
-            )
-            .await
-            .map_err(collapse)?;
         }
         _ => return Err(invalid(ValidationReason::InvalidQuery)),
     }

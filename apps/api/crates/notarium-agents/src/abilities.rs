@@ -261,6 +261,31 @@ impl<C: ControlCatalogPort + ?Sized> ControlCatalogPort for SystemAbilityCatalog
         Box::pin(async move { Ok(get_builtin(&ctx, &identity)?.descriptor()) })
     }
 
+    fn locate_ability(
+        &self,
+        ctx: AccountContext,
+        id: AbilityId,
+    ) -> PortFuture<'_, Vec<AbilityDescriptor>> {
+        Box::pin(async move {
+            let mut found = Vec::new();
+            let system_id = AbilityIdentity {
+                id: id.clone(),
+                placement: AbilityPlacement::System,
+            };
+            if let Ok(item) = get_builtin(&ctx, &system_id) {
+                found.push(item.descriptor());
+            }
+            let owned = self.owned.locate_ability(ctx, id).await?;
+            for item in owned {
+                found.push(item);
+                if found.len() >= 2 {
+                    break;
+                }
+            }
+            Ok(found)
+        })
+    }
+
     fn pin_schedule_abilities(
         &self,
         ctx: AccountContext,
@@ -353,6 +378,10 @@ impl ScheduleAbilityLease for SystemScheduleLease {
 
     fn history(&self) -> &HistoryScope {
         self.inner.history()
+    }
+
+    fn close(&mut self) -> PortFuture<'_, ()> {
+        self.inner.close()
     }
 }
 

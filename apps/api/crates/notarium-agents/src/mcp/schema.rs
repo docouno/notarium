@@ -572,31 +572,7 @@ impl Input {
             Self::AnyOf(choices) => {
                 ProviderToolSchema::AnyOf(choices.iter().map(Self::provider_schema).collect())
             }
-            Self::YamlValue { .. } => {
-                let scalar = || {
-                    ProviderToolSchema::AnyOf(vec![
-                        ProviderToolSchema::String { choices: vec![] },
-                        ProviderToolSchema::Number,
-                        ProviderToolSchema::Boolean,
-                        ProviderToolSchema::Null,
-                    ])
-                };
-                ProviderToolSchema::AnyOf(vec![
-                    scalar(),
-                    ProviderToolSchema::Map {
-                        values: Box::new(scalar()),
-                    },
-                    ProviderToolSchema::Array {
-                        items: Box::new(ProviderToolSchema::AnyOf(vec![
-                            scalar(),
-                            ProviderToolSchema::Map {
-                                values: Box::new(scalar()),
-                            },
-                        ])),
-                        maximum: 256,
-                    },
-                ])
-            }
+            Self::YamlValue { .. } => ProviderToolSchema::JsonValue,
         }
     }
 }

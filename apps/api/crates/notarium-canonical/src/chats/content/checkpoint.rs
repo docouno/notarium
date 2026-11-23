@@ -179,8 +179,10 @@ async fn load_page(
     .map_err(|error| crate::runtime::pg_read_error("chat_proof_page", error))
 }
 
-pub(crate) type ProofFoldCache =
-    BTreeMap<(SpaceId, ChatThreadId, RevisionId, ThreadEntrySeq, bool), Option<ChatProvenance>>;
+pub(crate) type ProofFoldCache = BTreeMap<
+    (SpaceId, ChatThreadId, RevisionId, ThreadEntrySeq, bool),
+    Option<(ContentDigest, ChatProvenance)>,
+>;
 
 /// A chat edge carries the same live Space, thread and project checks as the
 /// derived entry. Its digest is immutable until redaction. Other origins retain
@@ -190,7 +192,7 @@ pub(super) async fn fold(
     mut reader: PageReader<'_, '_>,
     scope: &HistoryScope,
     thread: &ThreadHeadRow,
-    entry_seq: Option<ThreadEntrySeq>,
+    entry_identity: Option<(ThreadEntrySeq, ContentDigest)>,
     parent: ThreadEntrySeq,
     tainted: bool,
     proof: &ChatProvenance,
@@ -203,19 +205,19 @@ pub(super) async fn fold(
     {
         return Ok(None);
     }
-    let cache_key = entry_seq.map(|seq| {
+    let cache_key = entry_identity.as_ref().map(|(seq, _)| {
         (
             scope.space_id.clone(),
             thread.thread_id.clone(),
             thread.head_rev_id.clone(),
-            seq,
+            *seq,
             tainted,
         )
     });
     if let (Some(key), Some(cache)) = (&cache_key, memo.as_deref())
         && let Some(cached) = cache.get(key)
     {
-        return Ok(cached.clone());
+        return Ok(cached.as_ref().map(|(_, folded)| folded.clone()));
     }
     let space = &scope.space_id;
     let mut sources = Sources::default();
@@ -235,7 +237,6 @@ pub(super) async fn fold(
     } else {
         PAGE_ROWS
     };
-    let mut cache_hit = false;
     while let Some((entry, digest)) = sources.pending.pop_last() {
         if entry > parent {
             if let (Some(key), Some(cache)) = (cache_key, memo) {
@@ -251,14 +252,15 @@ pub(super) async fn fold(
                 entry,
                 tainted,
             );
-            if let Some(Some(cached_child)) = cache.get(&sub_key) {
-                if !sources.add(cached_child, space, thread, Some(entry))? {
+            if let Some(Some((cached_digest, cached_child))) = cache.get(&sub_key) {
+                if *cached_digest != digest
+                    || !sources.add(cached_child, space, thread, Some(entry))?
+                {
                     if let (Some(key), Some(cache)) = (cache_key, memo) {
                         cache.insert(key, None);
                     }
                     return Ok(None);
                 }
-                cache_hit = true;
                 continue;
             }
         }
@@ -314,7 +316,6 @@ pub(super) async fn fold(
             None => {}
         }
     }
-    let _ = cache_hit;
     let folded = ChatProvenance {
         origins: sources.retained.into_values().collect(),
         projects: sources.projects.into_values().collect(),
@@ -323,8 +324,87 @@ pub(super) async fn fold(
     let bytes = serde_json::to_vec(&folded)
         .map_err(|e| internal_not_committed("encode_checkpoint_proof", e.to_string()))?;
     let result = (bytes.len() <= ChatProvenance::MAX_BYTES).then_some(folded);
-    if let (Some(key), Some(cache)) = (cache_key, memo) {
-        cache.insert(key, result.clone());
+    if let (Some(key), Some((_, entry_digest)), Some(cache)) = (cache_key, entry_identity, memo) {
+        cache.insert(key, result.clone().map(|folded| (entry_digest, folded)));
     }
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use notarium_core::ids::HistoryIncarnation;
+    use sqlx::Connection as _;
+
+    #[tokio::test]
+    async fn proof_fold_cache_rejects_mismatched_child_digest() {
+        let space = SpaceId::from_bytes([1; 16]);
+        let scope = HistoryScope {
+            space_id: space.clone(),
+            incarnation: HistoryIncarnation::from_bytes([2; 16]),
+        };
+        let thread = ThreadHeadRow {
+            thread_id: ChatThreadId::from_bytes([3; 16]),
+            kind: ChatThreadKind::Personal,
+            owner: PrincipalId::from_bytes([4; 16]),
+            project_folder: None,
+            title: "t".into(),
+            head_leaf_seq: ThreadEntrySeq::new(3).unwrap(),
+            head_rev_id: RevisionId::from_bytes([5; 16]),
+            next_entry_seq: ThreadEntrySeq::new(4).unwrap(),
+            active_run_id: None,
+            active_run_epoch: None,
+            active_run_generation: None,
+            tainted_mask: 0,
+            redaction_epoch: 0,
+        };
+        let real_digest = ContentDigest::from_bytes([0xaa; 32]);
+        let forged_digest = ContentDigest::from_bytes([0xbb; 32]);
+        let child_seq = ThreadEntrySeq::new(1).unwrap();
+        let mut cache = ProofFoldCache::new();
+        cache.insert(
+            (
+                space.clone(),
+                thread.thread_id.clone(),
+                thread.head_rev_id.clone(),
+                child_seq,
+                false,
+            ),
+            Some((real_digest, ChatProvenance::default())),
+        );
+        let proof = ChatProvenance {
+            origins: vec![ProviderOrigin::Chat {
+                space,
+                thread: thread.thread_id.clone(),
+                entry: child_seq,
+                digest: forged_digest,
+                project: None,
+            }],
+            projects: Vec::new(),
+            compacts_through: None,
+        };
+        let mut conn = sqlx::SqliteConnection::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let mut backend = BackendConn::Sqlite(&mut conn);
+        let folded = fold(
+            PageReader::Pinned(&mut backend),
+            &scope,
+            &thread,
+            Some((
+                ThreadEntrySeq::new(2).unwrap(),
+                ContentDigest::from_bytes([0xcc; 32]),
+            )),
+            ThreadEntrySeq::new(1).unwrap(),
+            false,
+            &proof,
+            Some(&mut cache),
+        )
+        .await
+        .unwrap();
+        assert!(
+            folded.is_none(),
+            "forged child digest must reject cached child proof"
+        );
+    }
 }

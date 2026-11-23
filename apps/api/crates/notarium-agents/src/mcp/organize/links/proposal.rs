@@ -57,27 +57,28 @@ pub(in crate::mcp) async fn plan_links(
     for link in links {
         let attempted = async {
             let source = NoteId::parse(&link.source)?;
+            let collapse = |error: PortError| {
+                if corpus::hidden(&error) {
+                    DomainError::ResourceNotFound.into()
+                } else {
+                    error
+                }
+            };
             let (provider_scope, provider_note) = corpus::locate_note(provider, &source)
                 .await
-                .map_err(|error| {
-                    if corpus::hidden(&error) {
-                        DomainError::ResourceNotFound.into()
-                    } else {
-                        error
-                    }
-                })?;
+                .map_err(collapse)?;
             corpus::admit_provider_note_read(provider, &provider_scope, &provider_note)
                 .await
-                .map_err(|error| {
-                    if corpus::hidden(&error) {
-                        DomainError::ResourceNotFound.into()
-                    } else {
-                        error
-                    }
-                })?;
-            let plan = plan_link(call, Some(provider), source, &link.edge, true).await?;
-            let scope = call.space(plan.scope.clone())?;
-            proposal_class(authorize(call, &scope, &plan).await?)?;
+                .map_err(collapse)?;
+            let scope = call.space(provider_scope.scope().clone())?;
+            let source_note = corpus::note_in_space(call, &scope, &source).await?;
+            scope
+                .auth()
+                .authorize_direct_write(&source_note.facts, &source_note.facts)?;
+            proposal_class(source_note.facts.class)?;
+            let plan =
+                plan_link_located(call, Some(provider), scope, source_note, &link.edge, true)
+                    .await?;
             let revision = plan
                 .expected_revision
                 .clone()

@@ -249,6 +249,7 @@ impl CanonicalStore {
         folder_paths::space_schema(self, ctx).await
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn prepare_agent_run_rollback(
         &self,
         ctx: SpaceContext,

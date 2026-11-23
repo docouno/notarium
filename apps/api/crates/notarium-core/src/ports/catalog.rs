@@ -44,6 +44,8 @@ pub struct EnsureCatalogSpace {
 pub trait ScheduleAbilityLease: Send {
     fn history(&self) -> &HistoryScope;
     fn abilities(&self) -> &[AbilityDescriptor];
+    /// Explicitly roll back and recycle any pinned storage snapshot connection.
+    fn close(&mut self) -> PortFuture<'_, ()>;
 }
 
 /// Implementations check exact identity/placement and return only admitted metadata.
@@ -85,6 +87,14 @@ pub trait ControlCatalogPort: Send + Sync {
         ctx: AccountContext,
         identity: AbilityIdentity,
     ) -> PortFuture<'_, AbilityDescriptor>;
+    /// Locate up to two active owned ability packages matching `id` across the
+    /// caller's authorized Spaces in a single read (used for O(1) raw-ID lookup
+    /// and ambiguity detection).
+    fn locate_ability(
+        &self,
+        ctx: AccountContext,
+        id: AbilityId,
+    ) -> PortFuture<'_, Vec<AbilityDescriptor>>;
     /// Pin current exact package tips together with the context's single Space
     /// and its optional project. A missing project or changed or unreadable
     /// package makes the entire acquisition fail. Empty references still pin

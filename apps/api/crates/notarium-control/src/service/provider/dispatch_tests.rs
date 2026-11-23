@@ -1517,6 +1517,34 @@ async fn postgres_ollama_gateway() {
     gateway(true, ProviderWireKind::Ollama, "dispatch_ollama").await;
 }
 
+#[tokio::test]
+async fn leases_run_preserves_unknown_commit_effect_on_revocation() {
+    let runtime = Runtime::new(budget());
+    let revoked = Cancellation::default();
+    revoked.cancel();
+    let mut leases = Leases {
+        canonical: Some(Box::new(EgressLease {
+            project_folders: BTreeSet::new(),
+            current: Vec::new(),
+            project: None,
+            secondary_projects: Vec::new(),
+            active: Arc::new(AtomicUsize::new(1)),
+            admitted: Arc::new(AtomicUsize::new(0)),
+            dispatched: false,
+            cancellation: revoked,
+        })),
+        registration: None,
+    };
+    let err = leases
+        .run(&runtime, async { Ok::<(), PortError>(()) })
+        .await
+        .expect_err("revoked canonical lease must reject");
+    assert!(
+        is_unknown_effect(&err),
+        "post-submit revocation must report CommitEffect::Unknown, got {err:?}"
+    );
+}
+
 #[path = "admission_tests.rs"]
 mod admissions;
 #[path = "default_tests.rs"]

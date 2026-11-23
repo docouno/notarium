@@ -21,7 +21,6 @@ mod author;
 
 const MAX_TOKEN_BYTES: usize = 2048;
 const DEFAULT_ACTIVATION_TOKENS: usize = 4000;
-const MAX_ID_PAGES: usize = 64;
 const MAX_IN_APP_PACKAGE_BODY_BYTES: usize = 32 * 1024;
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
@@ -192,37 +191,22 @@ async fn raw_reference_for_account(
     account: &AccountContext,
     id: AbilityId,
 ) -> Result<Option<AbilityRef>, PortError> {
-    let mut candidates = vec![
-        AbilityPlacement::System,
-        AbilityPlacement::OwnedPersonal(account.auth().principal().clone()),
-    ];
-    for (space_id, grant) in account.auth().spaces() {
-        if grant.read_classes.is_empty() {
-            continue;
-        }
-        candidates.push(AbilityPlacement::OwnedSpace(space_id.clone()));
-        if let Some(folder_id) = &grant.project_root {
-            candidates.push(AbilityPlacement::OwnedProject(FolderRef {
-                space_id: space_id.clone(),
-                folder_id: folder_id.clone(),
-            }));
-        }
+    let candidates = registry.catalog.locate_ability(account.clone(), id).await?;
+    if candidates.is_empty() {
+        return Ok(None);
     }
-    let mut result = None;
-    for placement in candidates {
+    if candidates.len() == 1 {
+        return Ok(Some(candidates.into_iter().next().unwrap().reference));
+    }
+    let mut visible = None;
+    for candidate in candidates {
         match registry
             .control
-            .inspect_ability(
-                account.clone(),
-                AbilityIdentity {
-                    id: id.clone(),
-                    placement,
-                },
-            )
+            .inspect_ability(account.clone(), candidate.reference.identity())
             .await
         {
             Ok(inspection) => {
-                if result.replace(inspection.descriptor.reference).is_some() {
+                if visible.replace(inspection.descriptor.reference).is_some() {
                     return Err(invalid(ValidationReason::ScopeMismatch));
                 }
             }
@@ -230,35 +214,65 @@ async fn raw_reference_for_account(
             Err(error) => return Err(error),
         }
     }
-    if result.is_some() {
-        return Ok(result);
-    }
-    let mut continuation = None;
-    for _ in 0..MAX_ID_PAGES {
-        let page = registry
+    Ok(visible)
+}
+
+async fn resolve_selector_for_account(
+    registry: &ToolRegistry,
+    account: &AccountContext,
+    selector: &str,
+    kind: AbilityKind,
+    project: Option<FolderRef>,
+) -> Result<AbilityResolution, PortError> {
+    if selector.starts_with("ar1:") {
+        let reference = parse_token(selector, "ar1:", MAX_TOKEN_BYTES)?;
+        return registry
             .control
-            .discover_abilities(
+            .resolve_ability(
                 account.clone(),
-                AbilityQuery {
-                    page: ControlPageRequest::new(200, continuation)?,
-                    project: None,
-                    kind: None,
-                    name: None,
-                    authoring: true,
-                },
+                AbilitySelection::Exact { reference, project },
             )
-            .await?;
-        for entry in page.items {
-            if entry.reference.id == id && result.replace(entry.reference).is_some() {
-                return Err(invalid(ValidationReason::ScopeMismatch));
-            }
-        }
-        continuation = page.continuation;
-        if continuation.is_none() {
-            return Ok(result);
-        }
+            .await;
     }
-    Err(invalid(ValidationReason::BudgetExceeded))
+    if selector.starts_with("ab_") {
+        let id = AbilityId::parse(selector)?;
+        let Some(reference) = raw_reference_for_account(registry, account, id).await? else {
+            return Ok(AbilityResolution::Missing);
+        };
+        return registry
+            .control
+            .resolve_ability(
+                account.clone(),
+                AbilitySelection::Exact { reference, project },
+            )
+            .await;
+    }
+    let by_name = registry
+        .control
+        .resolve_ability(
+            account.clone(),
+            AbilitySelection::Name {
+                name: notarium_syntax::unicode::lookup_key(selector),
+                kind,
+                project: project.clone(),
+            },
+        )
+        .await?;
+    if !matches!(by_name, AbilityResolution::Missing) {
+        return Ok(by_name);
+    }
+    if let Ok(id) = AbilityId::parse(selector)
+        && let Some(reference) = raw_reference_for_account(registry, account, id).await?
+    {
+        return registry
+            .control
+            .resolve_ability(
+                account.clone(),
+                AbilitySelection::Exact { reference, project },
+            )
+            .await;
+    }
+    Ok(by_name)
 }
 
 async fn raw_reference(
@@ -542,11 +556,7 @@ fn provider_ability_allowed(
     {
         return false;
     }
-    if matches!(
-        inspection.descriptor.reference.placement,
-        AbilityPlacement::OwnedSpace(_)
-    ) && !inspection.binding_enabled
-    {
+    if !inspection.binding_enabled {
         return false;
     }
     if let AbilityProjects::Selected(projects) = &inspection.availability {
@@ -634,24 +644,14 @@ async fn list(
         .await?;
     let query = args.q.as_deref().map(notarium_syntax::unicode::lookup_key);
     let mut items = Vec::new();
-    for descriptor in page.items {
+    for inspection in page.items {
+        let descriptor = &inspection.descriptor;
         if args
             .source
             .is_some_and(|expected| source(&descriptor.reference) != expected)
         {
             continue;
         }
-        let inspection = match call
-            .registry
-            .control
-            .inspect_ability(call.account(), descriptor.reference.identity())
-            .await
-        {
-            Ok(inspection) if inspection.descriptor.reference == descriptor.reference => inspection,
-            Ok(_) => return Err(invalid(ValidationReason::CursorStale)),
-            Err(error) if visible_error(&error) => continue,
-            Err(error) => return Err(error),
-        };
         if !provider_ability_allowed(call, &inspection, project.as_ref()) {
             continue;
         }
@@ -660,7 +660,7 @@ async fn list(
             if external && let Some(desc) = descriptor.description.as_ref() {
                 (desc.clone(), None)
             } else {
-                let body = match read_body(call, &descriptor, project.as_ref()).await {
+                let body = match read_body(call, descriptor, project.as_ref()).await {
                     Ok(body) => body,
                     Err(error) if visible_error(&error) => continue,
                     Err(error) => return Err(error),
@@ -868,34 +868,15 @@ async fn resolve(
     kind: AbilityKind,
     project: Option<FolderRef>,
 ) -> Result<AbilityDescriptor, PortError> {
-    let reference = if selector.starts_with("ar1:") {
-        Some(parse_token(selector, "ar1:", MAX_TOKEN_BYTES)?)
-    } else if let Ok(id) = AbilityId::parse(selector) {
-        let found = raw_reference(call, id).await?;
-        if found.is_none() && selector.starts_with("ab_") {
-            return Err(DomainError::ResourceNotFound.into());
-        }
-        found
-    } else {
-        None
-    };
-    let selection = match reference {
-        Some(reference) => AbilitySelection::Exact {
-            reference,
-            project: project.clone(),
-        },
-        None => AbilitySelection::Name {
-            name: notarium_syntax::unicode::lookup_key(selector),
-            kind,
-            project: project.clone(),
-        },
-    };
-    let resolved = call
-        .registry
-        .control
-        .resolve_ability(call.account(), selection)
-        .await
-        .map_err(|error| collapse_provider_error(call, error))?;
+    let resolved = resolve_selector_for_account(
+        call.registry,
+        &call.account(),
+        selector,
+        kind,
+        project.clone(),
+    )
+    .await
+    .map_err(|error| collapse_provider_error(call, error))?;
     let in_app = matches!(call.target, EgressTarget::InAppProvider { .. });
     let ability = match resolved {
         AbilityResolution::Resolved(ability) if ability.kind == kind => *ability,
@@ -929,32 +910,14 @@ pub(crate) async fn bind_chat_role(
     project: Option<&FolderRef>,
     run: &AgentRunId,
 ) -> Result<(), PortError> {
-    let reference = if selector.starts_with("ar1:") {
-        Some(parse_token(selector, "ar1:", MAX_TOKEN_BYTES)?)
-    } else if let Ok(id) = AbilityId::parse(selector) {
-        let found = raw_reference_for_account(registry, &account, id).await?;
-        if found.is_none() && selector.starts_with("ab_") {
-            return Err(DomainError::ResourceNotFound.into());
-        }
-        found
-    } else {
-        None
-    };
-    let selection = match reference {
-        Some(reference) => AbilitySelection::Exact {
-            reference,
-            project: project.cloned(),
-        },
-        None => AbilitySelection::Name {
-            name: notarium_syntax::unicode::lookup_key(selector),
-            kind: AbilityKind::Role,
-            project: project.cloned(),
-        },
-    };
-    let ability = match registry
-        .control
-        .resolve_ability(account.clone(), selection)
-        .await?
+    let ability = match resolve_selector_for_account(
+        registry,
+        &account,
+        selector,
+        AbilityKind::Role,
+        project.cloned(),
+    )
+    .await?
     {
         AbilityResolution::Resolved(ability)
             if ability.kind == AbilityKind::Role && ability.healthy && ability.enabled =>

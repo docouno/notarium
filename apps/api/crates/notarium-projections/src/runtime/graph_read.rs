@@ -113,29 +113,56 @@ impl ProjectionEngine {
                             | ValidationReason::GenerationMismatch
                     ) =>
                 {
-                    self.wait_for_cut(scope, SpaceSeq::ZERO, &ctx.budget, grace)
-                        .await?
+                    let wait = match causal {
+                        CausalBasis::Exact(_) => ctx.budget.remaining,
+                        CausalBasis::Await(_) => grace,
+                    };
+                    match self
+                        .wait_for_cut(scope, SpaceSeq::ZERO, &ctx.budget, wait)
+                        .await
+                    {
+                        Ok(cut) => cut,
+                        Err(PortError::DeadlineExceeded(_))
+                            if matches!(causal, CausalBasis::Await(_))
+                                && !ctx.budget.remaining.is_zero() =>
+                        {
+                            return Err(super::read::not_ready());
+                        }
+                        Err(error) => return Err(error),
+                    }
                 }
                 Err(error) => return Err(error),
             };
-            let target = match causal {
-                CausalBasis::Await(watermarks) => watermarks.required(scope)?,
-                CausalBasis::Exact(receipts) => receipts
-                    .for_scope(scope)?
-                    .into_iter()
-                    .map(|receipt| receipt.seq())
-                    .max()
-                    .unwrap_or(SpaceSeq::ZERO),
-            };
-            if target <= base.cut.projected_seq {
-                base
-            } else {
-                match self.wait_for_cut(scope, target, &ctx.budget, grace).await {
-                    Ok(cut) => cut,
-                    Err(PortError::DeadlineExceeded(_)) => {
-                        self.published_cut(scope).unwrap_or(base)
+            match causal {
+                CausalBasis::Exact(receipts) => {
+                    let target = receipts
+                        .for_scope(scope)?
+                        .into_iter()
+                        .map(|receipt| receipt.seq())
+                        .max()
+                        .unwrap_or(SpaceSeq::ZERO);
+                    if target <= base.cut.projected_seq {
+                        base
+                    } else {
+                        self.wait_for_cut(scope, target, &ctx.budget, ctx.budget.remaining)
+                            .await?
                     }
-                    Err(error) => return Err(error),
+                }
+                CausalBasis::Await(watermarks) => {
+                    let target = watermarks.required(scope)?;
+                    if target <= base.cut.projected_seq {
+                        base
+                    } else {
+                        match self.wait_for_cut(scope, target, &ctx.budget, grace).await {
+                            Ok(cut) => cut,
+                            Err(PortError::DeadlineExceeded(_))
+                                if !ctx.budget.remaining.is_zero() =>
+                            {
+                                self.published_cut(scope).unwrap_or(base)
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
                 }
             }
         } else {

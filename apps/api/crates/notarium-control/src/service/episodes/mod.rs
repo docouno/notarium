@@ -268,16 +268,33 @@ impl ControlService {
         ctx: AccountContext,
         request: AccountMutation<StartEpisode>,
     ) -> Result<ControlCommit<EpisodeStartResult>, PortError> {
+        if matches!(
+            ctx.auth().kind(),
+            PrincipalKind::Keeper(_) | PrincipalKind::AgentRun(_)
+        ) {
+            return Err(DomainError::AccessDenied.into());
+        }
+        if ctx.auth().taint().is_tainted() {
+            return Err(DomainError::CrossSpaceTainted.into());
+        }
         let guard = request.input.guard;
         match &request.input.selector {
             EpisodeSelector::New { name: value, .. } => name(value.as_deref())?,
             EpisodeSelector::Name(value) => name(Some(value))?,
             EpisodeSelector::Id(_) => (),
         }
+        #[derive(Serialize)]
+        struct StartEpisodeHash<'a> {
+            selector: &'a EpisodeSelector,
+            project_hint: &'a Option<FolderRef>,
+        }
         let command = Command::new(
             request.identity,
             "start-episode",
-            (&request.input.selector, &request.input.project_hint),
+            &StartEpisodeHash {
+                selector: &request.input.selector,
+                project_hint: &request.input.project_hint,
+            },
         )?;
         command.require(ctx.auth().principal(), ctx.auth().principal())?;
         let budget = OperationBudget::new(ctx.budget.clone());
@@ -287,6 +304,12 @@ impl ControlService {
         let mut tx = self.store.write(budget.clone()).await?;
         let (revision, current, started_value) = budget.run(async {
             let auth = self.revalidate_with_keeper(tx.inner_mut(), ctx.auth(), keeper.as_ref()).await?;
+            if matches!(auth.kind(), PrincipalKind::Keeper(_) | PrincipalKind::AgentRun(_)) {
+                return Err(DomainError::AccessDenied.into());
+            }
+            if auth.taint().is_tainted() {
+                return Err(DomainError::CrossSpaceTainted.into());
+            }
             let current = AccountContext::new(auth, budget.context(ctx.budget.request.clone()));
             let owner = user(tx.inner_mut(), current.auth().principal().as_str()).await?;
             if let Some((revision, saved)) = command.replay::<Started>(tx.inner_mut()).await? {
@@ -393,6 +416,9 @@ impl ControlService {
                 ) {
                     return Err(DomainError::AccessDenied.into());
                 }
+                if ctx.auth().taint().is_tainted() {
+                    return Err(DomainError::CrossSpaceTainted.into());
+                }
                 name(update.name.as_deref())?;
                 (
                     update.episode.clone(),
@@ -473,6 +499,9 @@ impl ControlService {
                 }
                 if matches!(auth.kind(), PrincipalKind::AgentRun(_) | PrincipalKind::Keeper(_)) {
                     return Err(DomainError::AccessDenied.into());
+                }
+                if auth.taint().is_tainted() {
+                    return Err(DomainError::CrossSpaceTainted.into());
                 }
             } else {
                 if matches!(auth.kind(), PrincipalKind::Keeper(_))

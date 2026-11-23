@@ -1505,7 +1505,9 @@ pub(crate) async fn set_folder_write_lock_impl(
     };
 
     let _ = active_note_sibling_exists_tx;
-    deadline.submit(store, &ctx.budget, intent).await
+    deadline
+        .submit_with_effect(store, &ctx.budget, intent, ctx.canonical_effect().cloned())
+        .await
 }
 
 /// Memory and ability grants apply to those documents only. Neither grants authority

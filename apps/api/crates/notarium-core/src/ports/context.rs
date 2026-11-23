@@ -344,6 +344,7 @@ impl fmt::Debug for CanonicalEffectAdmission {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CanonicalEffect {
     ExternalCorpusWrite,
+    AgentRuntimeWrite,
     AbilityAuthoring,
     ConfirmedProposal,
     ChatInput,

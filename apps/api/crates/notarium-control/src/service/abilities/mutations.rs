@@ -4,11 +4,6 @@ use crate::store::statements::execute;
 use notarium_core::auth::SpaceRole;
 use std::collections::BTreeSet;
 
-enum PreferencePrecondition {
-    Account,
-    Target(Option<ControlRevision>),
-}
-
 impl ControlService {
     async fn ensure_current_ability_mutation(
         &self,
@@ -120,13 +115,14 @@ impl ControlService {
             current.auth().restrict_to_space(&entry.space_id)?,
             budget.context(current.budget.request.clone()),
         );
-        let pin = self
+        let mut pin = self
             .catalog
             .pin_schedule_abilities(scope, vec![target.reference.clone()])
             .await?;
         if pin.history().space_id != entry.space_id
             || !matches!(pin.abilities(), [pinned] if pinned.reference == target.reference)
         {
+            let _ = pin.close().await;
             return Err(DomainError::ResourceNotFound.into());
         }
         Ok(pin)
@@ -137,11 +133,43 @@ impl ControlService {
         ctx: AccountContext,
         request: AccountMutation<AbilityBindingUpdate>,
     ) -> Result<ControlCommit<AbilityBindingResult>, PortError> {
-        let (authoring, expected, op) = match request.input.expected {
-            AbilityOverlayGuard::Account(rev) => (false, Some(rev), "update-ability-binding"),
-            AbilityOverlayGuard::Authored(rev) => (true, rev, "compare-authored-ability-binding"),
+        #[derive(Serialize)]
+        struct BindingHash<'a, E: Serialize> {
+            ability: &'a AbilityRef,
+            enabled: bool,
+            expected: E,
+            projects: &'a AbilityProjects,
+        }
+        let (authoring, expected, command) = match request.input.expected {
+            AbilityOverlayGuard::Account(rev) => (
+                false,
+                Some(rev),
+                Command::new(
+                    request.identity,
+                    "update-ability-binding",
+                    &BindingHash {
+                        ability: &request.input.ability,
+                        enabled: request.input.enabled,
+                        expected: rev,
+                        projects: &request.input.projects,
+                    },
+                )?,
+            ),
+            AbilityOverlayGuard::Authored(rev) => (
+                true,
+                rev,
+                Command::new(
+                    request.identity,
+                    "compare-authored-ability-binding",
+                    &BindingHash {
+                        ability: &request.input.ability,
+                        enabled: request.input.enabled,
+                        expected: rev,
+                        projects: &request.input.projects,
+                    },
+                )?,
+            ),
         };
-        let command = Command::new(request.identity, op, &request.input)?;
         let (revision, reference, descriptor) = self
             .write_ability_binding(
                 ctx,
@@ -284,21 +312,36 @@ impl ControlService {
         ctx: AccountContext,
         request: AccountMutation<AbilityPreferenceChange>,
     ) -> Result<ControlCommit<AbilityPreferenceUpdate>, PortError> {
-        let (op, precondition) = match request.input.expected {
-            AbilityPreferenceGuard::Account => {
-                ("set-ability-preference", PreferencePrecondition::Account)
-            }
+        #[derive(Serialize)]
+        struct AuthoredPreferenceHash<'a> {
+            preference: &'a AbilityPreferenceUpdate,
+            expected: Option<ControlRevision>,
+        }
+        let command = match request.input.expected {
+            AbilityPreferenceGuard::Account => Command::new(
+                request.identity,
+                "set-ability-preference",
+                &request.input.preference,
+            )?,
             AbilityPreferenceGuard::Authored(expected) => {
                 ctx.auth().authorize_ability_mutation()?;
-                (
+                Command::new(
+                    request.identity,
                     "compare-authored-ability-preference",
-                    PreferencePrecondition::Target(expected),
-                )
+                    &AuthoredPreferenceHash {
+                        preference: &request.input.preference,
+                        expected,
+                    },
+                )?
             }
         };
-        let command = Command::new(request.identity, op, &request.input)?;
-        self.write_ability_preference(ctx, command, request.input.preference, precondition)
-            .await
+        self.write_ability_preference(
+            ctx,
+            command,
+            request.input.preference,
+            request.input.expected,
+        )
+        .await
     }
 
     async fn write_ability_preference(
@@ -306,7 +349,7 @@ impl ControlService {
         ctx: AccountContext,
         command: Command,
         input: AbilityPreferenceUpdate,
-        precondition: PreferencePrecondition,
+        precondition: AbilityPreferenceGuard,
     ) -> Result<ControlCommit<AbilityPreferenceUpdate>, PortError> {
         command.require(ctx.auth().principal(), ctx.auth().principal())?;
         if !(ctx.auth().human_management() || ctx.auth().has_cap(Cap::AbilityWrite)) {
@@ -314,7 +357,7 @@ impl ControlService {
         }
         let budget = OperationBudget::new(ctx.budget.clone());
         let current = self.current_account(&ctx, &budget).await?;
-        let authoring = matches!(precondition, PreferencePrecondition::Target(_));
+        let authoring = matches!(precondition, AbilityPreferenceGuard::Authored(_));
         if authoring {
             ctx.auth().authorize_ability_mutation()?;
         }
@@ -387,7 +430,7 @@ impl ControlService {
             self.ensure_current_ability_mutation(tx.inner_mut(), &live_ctx, &value).await?;
             let key = placement(&input.ability.placement)?;
             let existing = ability_preference(tx.inner_mut(), live_ctx.auth().principal(), &key, &input.ability.id).await?;
-            if let PreferencePrecondition::Target(expected) = precondition {
+            if let AbilityPreferenceGuard::Authored(expected) = precondition {
                 let actual = existing.as_ref().map(|row| ControlRevision::new(row.revision as u64)).transpose()?;
                 if actual != expected { return Err(DomainError::ControlRevisionConflict { current: actual.unwrap_or(ControlRevision::ZERO) }.into()); }
             } else {

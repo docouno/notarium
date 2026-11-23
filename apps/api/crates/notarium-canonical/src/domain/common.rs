@@ -123,6 +123,28 @@ impl CommandDeadline {
             .await
     }
 
+    pub(crate) async fn submit_with_effect<
+        T: Serialize + serde::de::DeserializeOwned + Send + 'static,
+    >(
+        &self,
+        store: &crate::CanonicalStore,
+        budget: &notarium_core::ports::CallBudget,
+        intent: crate::writer::PreparedWriteIntent,
+        canonical_effect: Option<notarium_core::ports::CanonicalEffectAdmission>,
+    ) -> Result<T, PortError> {
+        store
+            .submit_write_command_until_with_effect(
+                budget,
+                self.at,
+                intent,
+                canonical_effect,
+                None,
+                None,
+                None,
+            )
+            .await
+    }
+
     pub(crate) async fn wait<F: Future>(
         &self,
         budget: &notarium_core::ports::CallBudget,

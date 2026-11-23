@@ -631,6 +631,9 @@ impl CanonicalStore {
             .await?;
         space_rec.scope.check(ctx.scope())?;
         authorize_chat_write_on_space(ctx.auth(), &space_rec.space)?;
+        if let Some(effect) = ctx.canonical_effect() {
+            effect.check()?;
+        }
 
         let prepared = PreparedBlobSource::prepare(raw.as_bytes(), self.blob_codec())?;
         let ticket = deadline
@@ -649,17 +652,21 @@ impl CanonicalStore {
         let resource_key = staging::request_key(ctx.auth(), &ctx.budget.request);
         let publish_ticket = ticket.clone();
         let publisher = self.clone();
+        let effect = ctx.canonical_effect().cloned();
         let value = self
-            .with_auxiliary_command(
+            .with_guarded_auxiliary_command(
                 ctx.scope().space_id.clone(),
+                None,
                 Some((&ctx.budget, deadline)),
+                effect,
                 Ok,
-                move |tx| {
+                move |tx, effect| {
                     Box::pin(async move {
                         let live_space =
                             crate::runtime::load_space_record_for_update_opt(tx, &scope.space_id)
                                 .await?
                                 .ok_or(DomainError::ResourceNotFound)?;
+                        effect.begin().await?;
                         live_space.scope.check(&scope)?;
                         authorize_chat_write_on_space(&auth_cl, &live_space.space)?;
                         if live_space.active_epoch != staged_epoch {

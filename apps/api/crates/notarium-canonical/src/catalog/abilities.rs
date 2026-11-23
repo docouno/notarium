@@ -343,7 +343,7 @@ pub(super) async fn lookup(
 }
 
 struct SchedulePin {
-    _guard: super::egress::CanonicalDisclosureGuard,
+    guard: Option<super::egress::CanonicalDisclosureGuard>,
     history: HistoryScope,
     abilities: Vec<AbilityDescriptor>,
 }
@@ -356,6 +356,98 @@ impl ScheduleAbilityLease for SchedulePin {
     fn abilities(&self) -> &[AbilityDescriptor] {
         &self.abilities
     }
+
+    fn close(&mut self) -> PortFuture<'_, ()> {
+        let guard = self.guard.take();
+        Box::pin(async move {
+            if let Some(guard) = guard {
+                guard.release_clean().await;
+            }
+            Ok(())
+        })
+    }
+}
+
+pub(super) async fn locate(
+    store: &CanonicalStore,
+    ctx: AccountContext,
+    id: AbilityId,
+) -> Result<Vec<AbilityDescriptor>, PortError> {
+    let spaces: Vec<String> = ctx
+        .auth()
+        .spaces()
+        .iter()
+        .filter(|(_, grant)| !grant.read_classes.is_empty())
+        .map(|(space_id, _)| space_id.as_str().to_owned())
+        .collect();
+    if spaces.is_empty() {
+        return Ok(Vec::new());
+    }
+    let budget = ctx.budget.clone();
+    store
+        .with_read_tx_budget(Some(&budget), move |tx| {
+            Box::pin(async move {
+                let matched: Vec<String> = match tx {
+                    BackendConn::Sqlite(conn) => {
+                        let encoded = serde_json::to_string(&spaces).map_err(|err| {
+                            crate::codec::internal_not_committed(
+                                "encode_locate_ability_spaces",
+                                err.to_string(),
+                            )
+                        })?;
+                        sqlx::query_scalar(
+                            "SELECT space_id FROM ability_packages
+                             WHERE space_id IN (SELECT value FROM json_each($1))
+                               AND ability_id = $2
+                               AND lifecycle_state = 'active'
+                             ORDER BY space_id",
+                        )
+                        .bind(encoded)
+                        .bind(id.as_str())
+                        .fetch_all(&mut **conn)
+                        .await
+                    }
+                    BackendConn::Postgres(conn) => {
+                        sqlx::query_scalar(
+                            "SELECT space_id FROM ability_packages
+                             WHERE space_id = ANY($1)
+                               AND ability_id = $2
+                               AND lifecycle_state = 'active'
+                             ORDER BY space_id",
+                        )
+                        .bind(&spaces)
+                        .bind(id.as_str())
+                        .fetch_all(&mut **conn)
+                        .await
+                    }
+                }
+                .map_err(|err| crate::runtime::pg_read_error("locate_ability", err))?;
+                let mut found = Vec::new();
+                for raw_space in matched {
+                    let space_id = SpaceId::parse(&raw_space)?;
+                    let space = match load_space_record(tx, &space_id).await {
+                        Ok(rec) => rec,
+                        Err(PortError::Domain(DomainError::ResourceNotFound)) => continue,
+                        Err(err) => return Err(err),
+                    };
+                    if space.space.lifecycle != SpaceLifecycle::Active {
+                        continue;
+                    }
+                    match descriptor(tx, ctx.auth(), &space, &id, None).await {
+                        Ok(desc) => {
+                            found.push(desc);
+                            if found.len() >= 2 {
+                                break;
+                            }
+                        }
+                        Err(PortError::Domain(DomainError::ResourceNotFound)) => continue,
+                        Err(err) => return Err(err),
+                    }
+                }
+                Ok(found)
+            })
+        })
+        .await
 }
 
 pub(super) async fn pin_schedule(
@@ -405,7 +497,7 @@ pub(super) async fn pin_schedule(
     guard.check()?;
     guard.finish_snapshot().await;
     Ok(Box::new(SchedulePin {
-        _guard: guard,
+        guard: Some(guard),
         history: space.scope,
         abilities,
     }))

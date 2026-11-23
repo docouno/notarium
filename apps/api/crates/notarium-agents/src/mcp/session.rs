@@ -19,8 +19,8 @@ use notarium_core::{
     ports::{
         AccountMutation, AckOwner, AgentEpisode, BearerScope, CatalogDisclosure,
         ControlPageRequest, EpisodeRevisionGuard, EpisodeSelector, EpisodeStartResult, GetNote,
-        MAX_PROJECT_BOOTSTRAP_VALUES, NoteSnapshot, PageLimit, ProviderErrorCode, SpaceContext,
-        StartEpisode,
+        MAX_PROJECT_BOOTSTRAP_VALUES, NoteMetadataSnapshot, NoteSnapshot, PageLimit,
+        ProviderErrorCode, SpaceContext, StartEpisode,
     },
     receipt::CausalBasis,
 };
@@ -426,11 +426,11 @@ async fn start(call: &mut ToolCallContext<'_>, args: StartArgs) -> Result<Value,
         }
     }
     for reference in &context.selection.favorites {
-        if let Some(note) = bootstrap_note(call, reference).await? {
+        if let Some(note) = bootstrap_note_metadata(call, reference).await? {
             favorites.push(json!({
                 "noteId": reference.note_id,
                 "spaceId": reference.space_id,
-                "revision": note.document.revision(),
+                "revision": note.metadata.revision(),
                 "title": note.provenance.as_ref().map(|facts| &facts.title),
             }));
         }
@@ -609,7 +609,9 @@ async fn project_bundle(
         Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
             if matches!(
                 diagnostic.reason,
-                ValidationReason::NotReady | ValidationReason::CursorStale
+                ValidationReason::NotReady
+                    | ValidationReason::CursorStale
+                    | ValidationReason::GenerationMismatch
             ) =>
         {
             output["index"]["countsAvailable"] = json!(false);
@@ -627,7 +629,7 @@ async fn project_bundle(
             space_id: reference.space_id.clone(),
             note_id,
         };
-        if let Some(note) = bootstrap_note(call, &cover).await? {
+        if let Some(note) = bootstrap_note_metadata(call, &cover).await? {
             output["folderPage"] = json!({
                 "status": "present",
                 "folderId": reference.folder_id,
@@ -638,6 +640,40 @@ async fn project_bundle(
         }
     }
     Ok(output)
+}
+
+async fn bootstrap_note_metadata(
+    call: &ToolCallContext<'_>,
+    reference: &NoteRef,
+) -> Result<Option<NoteMetadataSnapshot>, PortError> {
+    let scope = space(call, &reference.space_id).await?;
+    let snapshot = match call
+        .registry
+        .engine
+        .get_note_metadata(
+            scope.clone(),
+            GetNote {
+                note: reference.note_id.clone(),
+                revision: None,
+                causal: causal(),
+            },
+        )
+        .await
+    {
+        Ok(snapshot) => snapshot,
+        Err(error) if corpus::hidden(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if snapshot.metadata.reference() != reference {
+        return Err(invalid(ValidationReason::InvalidState));
+    }
+    match ClassEgressFence::mcp_note_metadata(&snapshot.metadata, scope.auth())
+        .map_err(PortError::from)
+    {
+        Ok(_) => Ok(Some(snapshot)),
+        Err(error) if corpus::hidden(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 async fn bootstrap_note(

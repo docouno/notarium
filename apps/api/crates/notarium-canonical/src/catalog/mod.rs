@@ -442,6 +442,13 @@ impl ControlCatalogPort for CanonicalStore {
     ) -> PortFuture<'_, AbilityDescriptor> {
         Box::pin(abilities::lookup(self, ctx, id, None))
     }
+    fn locate_ability(
+        &self,
+        ctx: AccountContext,
+        id: AbilityId,
+    ) -> PortFuture<'_, Vec<AbilityDescriptor>> {
+        Box::pin(abilities::locate(self, ctx, id))
+    }
     fn pin_schedule_abilities(
         &self,
         ctx: AccountContext,

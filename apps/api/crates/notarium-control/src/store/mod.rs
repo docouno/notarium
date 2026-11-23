@@ -718,7 +718,9 @@ impl WriteResources {
             Ok(())
         };
         drop(revocation_fences);
-        drop(schedule_pin);
+        if let Some(mut pin) = schedule_pin {
+            let _ = pin.close().await;
+        }
         drop(_guard);
         drop(_admission);
         result?;
@@ -751,7 +753,9 @@ impl WriteResources {
             Ok(())
         };
         drop(revocation_fences);
-        drop(schedule_pin);
+        if let Some(mut pin) = schedule_pin {
+            let _ = pin.close().await;
+        }
         drop(_guard);
         drop(_admission);
         result?;

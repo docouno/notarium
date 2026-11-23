@@ -369,6 +369,7 @@ pub enum ProviderToolSchema {
     Map {
         values: Box<ProviderToolSchema>,
     },
+    JsonValue,
     AnyOf(Vec<ProviderToolSchema>),
 }
 #[derive(Clone, Serialize, Deserialize)]

@@ -284,12 +284,11 @@ async fn authorize_folder(
     Ok(())
 }
 
-pub(super) async fn observe_destination(
+async fn resolve_destination(
     call: &ToolCallContext<'_>,
     scope: &SpaceContext,
     base: Option<FolderId>,
     path: &str,
-    class: DocClass,
 ) -> Result<Destination, PortError> {
     let resolve = |path: String| {
         call.registry
@@ -326,7 +325,6 @@ pub(super) async fn observe_destination(
     if anchor.reference.space_id != scope.scope().space_id {
         return Err(invalid(ValidationReason::ScopeMismatch));
     }
-    authorize_folder(call, scope, &anchor.reference, class).await?;
     Ok(Destination {
         anchor: anchor.reference,
         revision: anchor.revision,
@@ -334,6 +332,18 @@ pub(super) async fn observe_destination(
         path: anchor.path,
         ancestors: anchor.ancestor_folders,
     })
+}
+
+pub(super) async fn observe_destination(
+    call: &ToolCallContext<'_>,
+    scope: &SpaceContext,
+    base: Option<FolderId>,
+    path: &str,
+    class: DocClass,
+) -> Result<Destination, PortError> {
+    let destination = resolve_destination(call, scope, base, path).await?;
+    authorize_folder(call, scope, &destination.anchor, class).await?;
+    Ok(destination)
 }
 
 impl Destination {
@@ -493,7 +503,15 @@ pub(in crate::mcp) async fn plan_proposal(
             .await?;
             let slug = note_slug(before.provenance.as_ref())?;
             let class = before.metadata.class();
-            let base = scope
+            let collapse = |error: PortError| {
+                if corpus::hidden(&error) {
+                    DomainError::ResourceNotFound.into()
+                } else {
+                    error
+                }
+            };
+            let provider_scope = provider.space(route.scope.clone()).map_err(collapse)?;
+            let base = provider_scope
                 .auth()
                 .spaces()
                 .get(&route.scope.space_id)
@@ -505,8 +523,7 @@ pub(in crate::mcp) async fn plan_proposal(
             } else {
                 path
             };
-            let destination = observe_destination(owner, &scope, base, &path, class).await?;
-            let provider_scope = provider.space(route.scope.clone())?;
+            let destination = resolve_destination(owner, &scope, base, &path).await?;
             let dest_project = folder_base(owner, &scope, &destination.anchor.folder_id)
                 .await?
                 .project
@@ -522,7 +539,9 @@ pub(in crate::mcp) async fn plan_proposal(
                 &destination.ancestors,
                 class,
             )
-            .await?;
+            .await
+            .map_err(collapse)?;
+            authorize_folder(owner, &scope, &destination.anchor, class).await?;
             PreparedNoteAction::Move {
                 route,
                 destination,

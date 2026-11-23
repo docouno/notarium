@@ -430,7 +430,13 @@ fn optional_projection(error: &PortError) -> bool {
         || corpus::hidden(error)
         || matches!(
             error, PortError::Domain(DomainError::ValidationFailed { diagnostic })
-                if matches!(diagnostic.reason, ValidationReason::NotReady | ValidationReason::InvalidView)
+                if matches!(
+                    diagnostic.reason,
+                    ValidationReason::NotReady
+                        | ValidationReason::InvalidView
+                        | ValidationReason::CursorStale
+                        | ValidationReason::GenerationMismatch
+                )
         )
 }
 

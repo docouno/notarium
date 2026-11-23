@@ -91,6 +91,16 @@ impl ClusterRunAuthority for CountingClusterAuthority {
         self.register_owner_calls.fetch_add(1, Ordering::SeqCst);
         Box::pin(async { Err(DomainError::AccessDenied.into()) })
     }
+
+    fn fence_orphan(
+        &self,
+        _ctx: MaintenanceContext,
+        _scope: HistoryScope,
+        _thread: ChatThreadId,
+        _previous: AgentRunId,
+    ) -> PortFuture<'_, Option<Box<dyn RevocationLease>>> {
+        Box::pin(async { Ok(None) })
+    }
 }
 
 pub(super) async fn bump_account_after_publication<T>(

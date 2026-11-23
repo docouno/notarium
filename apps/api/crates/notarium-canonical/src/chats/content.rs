@@ -387,7 +387,7 @@ async fn fold_stored_proof(
             reader,
             scope,
             thread,
-            Some(row.seq()?),
+            Some((row.seq()?, row.digest()?)),
             queue::seq_from_db(parent)?,
             row.ext_space_tainted != 0,
             &proof,

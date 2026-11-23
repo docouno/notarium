@@ -169,11 +169,11 @@ The caller can replay a pending control operation after losing the canonical
 response. Reusing the key with a different payload is rejected. Rebinding a
 Space's history invalidates receipts issued for its earlier incarnation.
 
-Version 9 unifies the projection and agent layouts that independently used
-versions 7 and 8. Startup selects the upgrade by version and exact manifest
-checksum. The unified schema allows multiple canonical packages to share a folded name.
-Control binding policy selects the visible package and serializes live
-authoring operations. Canonical package identity and version remain exact.
+Version 9 extends the linear schema sequence from version 8 with chat runtime
+and ability package tables. Startup selects the upgrade by version and exact
+manifest checksum. Schema version 9 allows multiple canonical packages to share
+a folded name. Control binding policy selects the visible package and serializes
+live authoring operations. Canonical package identity and version remain exact.
 
 The same upgrade stores the active chat run's writer generation, distinguishes
 human turns from derived turns after redaction, and records the source proof of
@@ -594,9 +594,10 @@ same example against an isolated prefix.
   The offline `notarium_canonical::backup::decode_postgres_spool_v1_bounded`
   API verifies the trailer and recognizes the exact linear manifests for schemas 1 through 9.
   Schema version 9 adds `chat_threads.redaction_epoch` for O(1) folded-proof invalidation,
-  typed `proposed_effect` columns on `chat_entries`, and secondary indexes for personal
-  Space lookup (`idx_spaces_personal_owner`), receipt sequence scans
-  (`idx_command_receipts_seq`), and active project roots (`idx_folder_heads_active_project`).
+  `chat_entries.{human_origin, body_format, provenance_json}` (with typed `effect_kind`
+  inside the structured proposal JSON body), and secondary indexes for personal Space
+  lookup (`idx_spaces_personal_owner`), receipt sequence scans
+  (`idx_command_receipts_seq`), and active project roots (`idx_folder_heads_active_projects_id`).
   It returns typed rows in the original table and column order within the
   caller's byte budget. To materialize a historical spool, create an empty
   target with `schema::POSTGRES_BASELINE_DDL`. Match the version and manifest
