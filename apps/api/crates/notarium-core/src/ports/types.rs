@@ -221,7 +221,7 @@ pub struct RenameFolder {
 pub struct RenameProject {
     pub folder: FolderId,
     pub name: String,
-    pub display_name: String,
+    pub display_name: Option<String>,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct NoteRevision {

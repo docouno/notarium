@@ -355,8 +355,12 @@ pub enum ProviderToolSchema {
         choices: Vec<String>,
     },
     Number,
-    Integer,
+    Integer {
+        minimum: Option<i64>,
+        maximum: Option<i64>,
+    },
     Boolean,
+    ConstBool(bool),
     Null,
     Array {
         items: Box<ProviderToolSchema>,

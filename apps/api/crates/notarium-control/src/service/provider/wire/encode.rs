@@ -200,8 +200,24 @@ fn schema(
             }
         }
         ProviderToolSchema::Number => json!({"type":"number"}),
-        ProviderToolSchema::Integer => json!({"type":"integer"}),
+        ProviderToolSchema::Integer { minimum, maximum } => {
+            if let (Some(min), Some(max)) = (minimum, maximum)
+                && min > max
+            {
+                return Err(invalid());
+            }
+            let mut obj = serde_json::Map::new();
+            obj.insert("type".into(), json!("integer"));
+            if let Some(min) = minimum {
+                obj.insert("minimum".into(), json!(min));
+            }
+            if let Some(max) = maximum {
+                obj.insert("maximum".into(), json!(max));
+            }
+            Value::Object(obj)
+        }
         ProviderToolSchema::Boolean => json!({"type":"boolean"}),
+        ProviderToolSchema::ConstBool(expected) => json!({"type":"boolean", "const":expected}),
         ProviderToolSchema::Null => json!({"type":"null"}),
         ProviderToolSchema::Array { items, maximum } => {
             if *maximum > 4096 {

@@ -75,54 +75,139 @@ struct PrefixChainRow {
     provenance_json: Option<String>,
 }
 
-async fn load_prefix_chunk_tx(
+struct PrefixScanResult {
+    checkpoint_seq: Option<i64>,
+    any_tainted: bool,
+    oldest_seqs: Vec<i64>,
+    has_tail: bool,
+}
+
+struct PrefixScanQuery<'a> {
+    space_id: &'a SpaceId,
+    thread_id: &'a ChatThreadId,
+    leaf: ThreadEntrySeq,
+    min_exclusive: ThreadEntrySeq,
+    keeper: Option<&'a AgentRunId>,
+    stop_at_compaction: bool,
+    limit: usize,
+}
+
+async fn jump_to_depth_tx(
     tx: &mut BackendConn<'_>,
     space_id: &SpaceId,
     thread_id: &ChatThreadId,
-    tip: ThreadEntrySeq,
-    min_exclusive: ThreadEntrySeq,
-    chunk_limit: i64,
-) -> Result<Vec<PrefixChainRow>, PortError> {
-    const SQL: &str = "WITH RECURSIVE win(
-            entry_seq, parent_seq, revision_id, kind, tool_call_id, author_id,
-            agent_run_id, inline_text, payload_blake3, referenced_notes_json,
-            ext_space_tainted, is_chain_node, branch_depth, anc_16_seq, anc_256_seq,
-            body_format, provenance_json, n
-        ) AS (
-            SELECT entry_seq, parent_seq, revision_id,
-                   CASE WHEN checkpoint_stale <> 0 THEN 'redacted' ELSE kind END,
-                   tool_call_id, author_id, agent_run_id, inline_text, payload_blake3,
-                   referenced_notes_json, CAST(ext_space_tainted AS INTEGER),
-                   CAST(is_chain_node AS INTEGER), CAST(branch_depth AS INTEGER),
-                   anc_16_seq, anc_256_seq, CAST(body_format AS INTEGER), provenance_json, 1
+    start_seq: ThreadEntrySeq,
+    target_depth: i32,
+) -> Result<Option<i64>, PortError> {
+    const SQLITE_SQL: &str = "WITH RECURSIVE jump(entry_seq, branch_depth, parent_seq, anc_16_seq, anc_256_seq, hops) AS (
+            SELECT entry_seq, CAST(branch_depth AS INTEGER), parent_seq, anc_16_seq, anc_256_seq, 0
             FROM chat_entries
-            WHERE space_id = $1 AND thread_id = $2 AND entry_seq = $3 AND entry_seq > $4
+            WHERE space_id = $1 AND thread_id = $2 AND entry_seq = $3
             UNION ALL
-            SELECT e.entry_seq, e.parent_seq, e.revision_id,
-                   CASE WHEN e.checkpoint_stale <> 0 THEN 'redacted' ELSE e.kind END,
-                   e.tool_call_id, e.author_id, e.agent_run_id, e.inline_text, e.payload_blake3,
-                   e.referenced_notes_json, CAST(e.ext_space_tainted AS INTEGER),
-                   CAST(e.is_chain_node AS INTEGER), CAST(e.branch_depth AS INTEGER),
-                   e.anc_16_seq, e.anc_256_seq, CAST(e.body_format AS INTEGER), e.provenance_json, w.n + 1
-            FROM win w
-            JOIN chat_entries e
-              ON e.space_id = $1 AND e.thread_id = $2 AND e.entry_seq = w.parent_seq
-            WHERE w.parent_seq IS NOT NULL AND w.parent_seq > $4 AND w.n < $5
+            SELECT e.entry_seq, CAST(e.branch_depth AS INTEGER), e.parent_seq, e.anc_16_seq, e.anc_256_seq, j.hops + 1
+            FROM jump j
+            CROSS JOIN chat_entries e
+            WHERE e.space_id = $1 AND e.thread_id = $2
+              AND e.entry_seq = CASE
+                  WHEN j.branch_depth - $4 >= 256 AND j.anc_256_seq IS NOT NULL THEN j.anc_256_seq
+                  WHEN j.branch_depth - $4 >= 16 AND j.anc_16_seq IS NOT NULL THEN j.anc_16_seq
+                  ELSE j.parent_seq
+              END
+              AND j.branch_depth > $4 AND j.hops < 100000
         )
-        SELECT entry_seq, parent_seq, revision_id, kind, tool_call_id, author_id,
-               agent_run_id, inline_text, payload_blake3, referenced_notes_json,
-               ext_space_tainted, is_chain_node, branch_depth, anc_16_seq, anc_256_seq,
-               body_format, provenance_json
-        FROM win
-        ORDER BY n ASC";
+        SELECT entry_seq FROM jump WHERE branch_depth = $4 LIMIT 1";
+    const PG_SQL: &str = "WITH RECURSIVE jump(entry_seq, branch_depth, parent_seq, anc_16_seq, anc_256_seq, hops) AS (
+            SELECT entry_seq, CAST(branch_depth AS INTEGER), parent_seq, anc_16_seq, anc_256_seq, 0
+            FROM chat_entries
+            WHERE space_id = $1 AND thread_id = $2 AND entry_seq = $3
+            UNION ALL
+            SELECT e.entry_seq, CAST(e.branch_depth AS INTEGER), e.parent_seq, e.anc_16_seq, e.anc_256_seq, j.hops + 1
+            FROM jump j
+            JOIN LATERAL (
+                SELECT entry_seq, branch_depth, parent_seq, anc_16_seq, anc_256_seq
+                FROM chat_entries
+                WHERE space_id = $1 AND thread_id = $2
+                  AND entry_seq = CASE
+                      WHEN j.branch_depth - $4 >= 256 AND j.anc_256_seq IS NOT NULL THEN j.anc_256_seq
+                      WHEN j.branch_depth - $4 >= 16 AND j.anc_16_seq IS NOT NULL THEN j.anc_16_seq
+                      ELSE j.parent_seq
+                  END
+                LIMIT 1
+            ) e ON true
+            WHERE j.branch_depth > $4 AND j.hops < 100000
+        )
+        SELECT entry_seq FROM jump WHERE branch_depth = $4 LIMIT 1";
+    match tx {
+        BackendConn::Sqlite(conn) => {
+            sqlx::query_scalar(SQLITE_SQL)
+                .bind(space_id.as_str())
+                .bind(thread_id.as_str())
+                .bind(start_seq.get() as i64)
+                .bind(target_depth)
+                .fetch_optional(&mut **conn)
+                .await
+        }
+        BackendConn::Postgres(conn) => {
+            sqlx::query_scalar(PG_SQL)
+                .bind(space_id.as_str())
+                .bind(thread_id.as_str())
+                .bind(start_seq.get() as i64)
+                .bind(target_depth)
+                .fetch_optional(&mut **conn)
+                .await
+        }
+    }
+    .map_err(|error| crate::runtime::pg_read_error("chat_compaction_jump", error))
+}
+
+async fn entry_depth_tx(
+    tx: &mut BackendConn<'_>,
+    space_id: &SpaceId,
+    thread_id: &ChatThreadId,
+    seq: ThreadEntrySeq,
+) -> Result<Option<i32>, PortError> {
+    const SQL: &str = "SELECT CAST(branch_depth AS INTEGER) FROM chat_entries
+                       WHERE space_id = $1 AND thread_id = $2 AND entry_seq = $3";
+    match tx {
+        BackendConn::Sqlite(conn) => {
+            sqlx::query_scalar(SQL)
+                .bind(space_id.as_str())
+                .bind(thread_id.as_str())
+                .bind(seq.get() as i64)
+                .fetch_optional(&mut **conn)
+                .await
+        }
+        BackendConn::Postgres(conn) => {
+            sqlx::query_scalar(SQL)
+                .bind(space_id.as_str())
+                .bind(thread_id.as_str())
+                .bind(seq.get() as i64)
+                .fetch_optional(&mut **conn)
+                .await
+        }
+    }
+    .map_err(|error| crate::runtime::pg_read_error("chat_compaction_depth", error))
+}
+
+async fn latest_compaction_candidates_tx(
+    tx: &mut BackendConn<'_>,
+    space_id: &SpaceId,
+    thread_id: &ChatThreadId,
+    max_seq: ThreadEntrySeq,
+) -> Result<Vec<(i64, i32)>, PortError> {
+    const SQL: &str = "SELECT entry_seq, CAST(branch_depth AS INTEGER)
+                       FROM chat_entries
+                       WHERE space_id = $1 AND thread_id = $2
+                         AND kind = 'compaction' AND checkpoint_stale = 0
+                         AND entry_seq <= $3
+                       ORDER BY entry_seq DESC
+                       LIMIT 65";
     match tx {
         BackendConn::Sqlite(conn) => {
             sqlx::query_as(SQL)
                 .bind(space_id.as_str())
                 .bind(thread_id.as_str())
-                .bind(tip.get() as i64)
-                .bind(min_exclusive.get() as i64)
-                .bind(chunk_limit)
+                .bind(max_seq.get() as i64)
                 .fetch_all(&mut **conn)
                 .await
         }
@@ -130,14 +215,263 @@ async fn load_prefix_chunk_tx(
             sqlx::query_as(SQL)
                 .bind(space_id.as_str())
                 .bind(thread_id.as_str())
-                .bind(tip.get() as i64)
-                .bind(min_exclusive.get() as i64)
-                .bind(chunk_limit)
+                .bind(max_seq.get() as i64)
                 .fetch_all(&mut **conn)
                 .await
         }
     }
-    .map_err(|error| crate::runtime::pg_read_error("chat_compaction_prefix_chunk", error))
+    .map_err(|error| crate::runtime::pg_read_error("chat_compaction_candidates", error))
+}
+
+async fn thread_has_tainted_in_range_tx(
+    tx: &mut BackendConn<'_>,
+    space_id: &SpaceId,
+    thread_id: &ChatThreadId,
+    min_exclusive: ThreadEntrySeq,
+    max_inclusive: ThreadEntrySeq,
+) -> Result<bool, PortError> {
+    const SQL: &str = "SELECT 1 FROM chat_entries
+                       WHERE space_id = $1 AND thread_id = $2
+                         AND ext_space_tainted <> 0
+                         AND entry_seq > $3 AND entry_seq <= $4
+                       LIMIT 1";
+    let found: Option<i32> = match tx {
+        BackendConn::Sqlite(conn) => {
+            sqlx::query_scalar(SQL)
+                .bind(space_id.as_str())
+                .bind(thread_id.as_str())
+                .bind(min_exclusive.get() as i64)
+                .bind(max_inclusive.get() as i64)
+                .fetch_optional(&mut **conn)
+                .await
+        }
+        BackendConn::Postgres(conn) => {
+            sqlx::query_scalar(SQL)
+                .bind(space_id.as_str())
+                .bind(thread_id.as_str())
+                .bind(min_exclusive.get() as i64)
+                .bind(max_inclusive.get() as i64)
+                .fetch_optional(&mut **conn)
+                .await
+        }
+    }
+    .map_err(|error| crate::runtime::pg_read_error("chat_compaction_taint_check", error))?;
+    Ok(found.is_some())
+}
+
+async fn scan_prefix_chain_tx(
+    tx: &mut BackendConn<'_>,
+    query: PrefixScanQuery<'_>,
+) -> Result<PrefixScanResult, PortError> {
+    let PrefixScanQuery {
+        space_id,
+        thread_id,
+        leaf,
+        min_exclusive,
+        keeper,
+        stop_at_compaction,
+        limit,
+    } = query;
+    const SQLITE_SQL: &str = "WITH RECURSIVE chain(
+            entry_seq, parent_seq, kind, is_empty_human, ext_space_tainted, n
+        ) AS MATERIALIZED (
+            SELECT entry_seq, parent_seq,
+                   CASE WHEN checkpoint_stale <> 0 THEN 'redacted' ELSE kind END,
+                   CASE WHEN checkpoint_stale = 0 AND kind = 'human' AND inline_text = '' THEN 1 ELSE 0 END,
+                   CAST(ext_space_tainted AS INTEGER),
+                   1
+            FROM chat_entries
+            WHERE space_id = $1 AND thread_id = $2 AND entry_seq = $3
+              AND entry_seq > $4
+              AND ($5 = '' OR agent_run_id = $5)
+            UNION ALL
+            SELECT e.entry_seq, e.parent_seq,
+                   CASE WHEN e.checkpoint_stale <> 0 THEN 'redacted' ELSE e.kind END,
+                   CASE WHEN e.checkpoint_stale = 0 AND e.kind = 'human' AND e.inline_text = '' THEN 1 ELSE 0 END,
+                   CAST(e.ext_space_tainted AS INTEGER),
+                   c.n + 1
+            FROM chain c
+            CROSS JOIN chat_entries e
+            WHERE e.space_id = $1 AND e.thread_id = $2 AND e.entry_seq = c.parent_seq
+              AND c.parent_seq IS NOT NULL
+              AND c.parent_seq > $4
+              AND ($6 = 0 OR c.kind <> 'compaction')
+              AND ($5 = '' OR e.agent_run_id = $5)
+        )
+        SELECT 0 AS tag,
+               COALESCE(MAX(CASE WHEN kind = 'compaction' THEN entry_seq END), 0) AS val,
+               COALESCE(MAX(ext_space_tainted), 0) AS extra
+        FROM chain
+        UNION ALL
+        SELECT 1 AS tag, entry_seq AS val, n AS extra
+        FROM (
+            SELECT entry_seq, n
+            FROM chain
+            WHERE kind <> 'redacted' AND kind <> 'compaction' AND is_empty_human = 0
+            ORDER BY n DESC
+            LIMIT $7
+        ) oldest";
+    const PG_SQL: &str = "WITH RECURSIVE chain(
+            entry_seq, parent_seq, kind, is_empty_human, ext_space_tainted, n
+        ) AS MATERIALIZED (
+            SELECT entry_seq, parent_seq,
+                   CASE WHEN checkpoint_stale <> 0 THEN 'redacted' ELSE kind END,
+                   CASE WHEN checkpoint_stale = 0 AND kind = 'human' AND inline_text = '' THEN 1 ELSE 0 END,
+                   CAST(ext_space_tainted AS INTEGER),
+                   1
+            FROM chat_entries
+            WHERE space_id = $1 AND thread_id = $2 AND entry_seq = $3
+              AND entry_seq > $4
+              AND ($5 = '' OR agent_run_id = $5)
+            UNION ALL
+            SELECT e.entry_seq, e.parent_seq,
+                   CASE WHEN e.checkpoint_stale <> 0 THEN 'redacted' ELSE e.kind END,
+                   CASE WHEN e.checkpoint_stale = 0 AND e.kind = 'human' AND e.inline_text = '' THEN 1 ELSE 0 END,
+                   CAST(e.ext_space_tainted AS INTEGER),
+                   c.n + 1
+            FROM chain c
+            JOIN LATERAL (
+                SELECT entry_seq, parent_seq, checkpoint_stale, kind, inline_text, ext_space_tainted, agent_run_id
+                FROM chat_entries
+                WHERE space_id = $1 AND thread_id = $2 AND entry_seq = c.parent_seq
+                LIMIT 1
+            ) e ON true
+            WHERE c.parent_seq IS NOT NULL
+              AND c.parent_seq > $4
+              AND ($6 = 0 OR c.kind <> 'compaction')
+              AND ($5 = '' OR e.agent_run_id = $5)
+        )
+        SELECT 0 AS tag,
+               COALESCE(MAX(CASE WHEN kind = 'compaction' THEN entry_seq END), 0) AS val,
+               COALESCE(MAX(ext_space_tainted), 0) AS extra
+        FROM chain
+        UNION ALL
+        SELECT 1 AS tag, entry_seq AS val, n AS extra
+        FROM (
+            SELECT entry_seq, n
+            FROM chain
+            WHERE kind <> 'redacted' AND kind <> 'compaction' AND is_empty_human = 0
+            ORDER BY n DESC
+            LIMIT $7
+        ) oldest";
+    let keeper_str = keeper.map_or("", AgentRunId::as_str);
+    let stop_flag: i32 = i32::from(stop_at_compaction);
+    let fetch_limit = i64::try_from(limit + 1)
+        .map_err(|_| DomainError::validation(ValidationReason::InvalidLimit))?;
+    let rows: Vec<(i32, i64, i32)> = match tx {
+        BackendConn::Sqlite(conn) => {
+            sqlx::query_as(SQLITE_SQL)
+                .bind(space_id.as_str())
+                .bind(thread_id.as_str())
+                .bind(leaf.get() as i64)
+                .bind(min_exclusive.get() as i64)
+                .bind(keeper_str)
+                .bind(stop_flag)
+                .bind(fetch_limit)
+                .fetch_all(&mut **conn)
+                .await
+        }
+        BackendConn::Postgres(conn) => {
+            sqlx::query_as(PG_SQL)
+                .bind(space_id.as_str())
+                .bind(thread_id.as_str())
+                .bind(leaf.get() as i64)
+                .bind(min_exclusive.get() as i64)
+                .bind(keeper_str)
+                .bind(stop_flag)
+                .bind(fetch_limit)
+                .fetch_all(&mut **conn)
+                .await
+        }
+    }
+    .map_err(|error| crate::runtime::pg_read_error("chat_compaction_prefix_scan", error))?;
+
+    let mut checkpoint_seq = None;
+    let mut any_tainted = false;
+    let mut seqs_with_depth: Vec<(i64, i32)> = Vec::with_capacity(limit + 1);
+    for (tag, val, extra) in rows {
+        if tag == 0 {
+            if val > 0 {
+                checkpoint_seq = Some(val);
+            }
+            if extra != 0 {
+                any_tainted = true;
+            }
+        } else {
+            seqs_with_depth.push((val, extra));
+        }
+    }
+    // Sort oldest-first (highest recursion depth `n` first) to keep ordering
+    // independent of SQL UNION ALL row emission order.
+    seqs_with_depth.sort_by_key(|a| std::cmp::Reverse(a.1));
+    let has_tail = seqs_with_depth.len() > limit;
+    seqs_with_depth.truncate(limit);
+    let oldest_seqs = seqs_with_depth.into_iter().map(|(seq, _)| seq).collect();
+    Ok(PrefixScanResult {
+        checkpoint_seq,
+        any_tainted,
+        oldest_seqs,
+        has_tail,
+    })
+}
+
+async fn load_prefix_rows_by_seq_tx(
+    tx: &mut BackendConn<'_>,
+    space_id: &SpaceId,
+    thread_id: &ChatThreadId,
+    seqs: &[i64],
+) -> Result<std::collections::HashMap<i64, PrefixChainRow>, PortError> {
+    if seqs.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let rows: Vec<PrefixChainRow> = match tx {
+        BackendConn::Sqlite(conn) => {
+            let mut qb = sqlx::QueryBuilder::new(
+                "SELECT entry_seq, parent_seq, revision_id,
+                        CASE WHEN checkpoint_stale <> 0 THEN 'redacted' ELSE kind END AS kind,
+                        tool_call_id, author_id, agent_run_id, inline_text, payload_blake3,
+                        referenced_notes_json, CAST(ext_space_tainted AS INTEGER) AS ext_space_tainted,
+                        CAST(is_chain_node AS INTEGER) AS is_chain_node,
+                        CAST(branch_depth AS INTEGER) AS branch_depth,
+                        anc_16_seq, anc_256_seq, CAST(body_format AS INTEGER) AS body_format,
+                        provenance_json
+                 FROM chat_entries
+                 WHERE space_id = ",
+            );
+            qb.push_bind(space_id.as_str());
+            qb.push(" AND thread_id = ");
+            qb.push_bind(thread_id.as_str());
+            qb.push(" AND entry_seq IN (");
+            let mut sep = qb.separated(", ");
+            for seq in seqs {
+                sep.push_bind(*seq);
+            }
+            qb.push(")");
+            qb.build_query_as::<PrefixChainRow>()
+                .fetch_all(&mut **conn)
+                .await
+        }
+        BackendConn::Postgres(conn) => {
+            const PG_SQL: &str = "SELECT entry_seq, parent_seq, revision_id,
+                        CASE WHEN checkpoint_stale <> 0 THEN 'redacted' ELSE kind END AS kind,
+                        tool_call_id, author_id, agent_run_id, inline_text, payload_blake3,
+                        referenced_notes_json, CAST(ext_space_tainted AS INTEGER) AS ext_space_tainted,
+                        CAST(is_chain_node AS INTEGER) AS is_chain_node,
+                        CAST(branch_depth AS INTEGER) AS branch_depth,
+                        anc_16_seq, anc_256_seq, CAST(body_format AS INTEGER) AS body_format,
+                        provenance_json
+                 FROM chat_entries
+                 WHERE space_id = $1 AND thread_id = $2 AND entry_seq = ANY($3)";
+            sqlx::query_as(PG_SQL)
+                .bind(space_id.as_str())
+                .bind(thread_id.as_str())
+                .bind(seqs)
+                .fetch_all(&mut **conn)
+                .await
+        }
+    }
+    .map_err(|error| crate::runtime::pg_read_error("chat_compaction_prefix_rows", error))?;
+    Ok(rows.into_iter().map(|row| (row.entry_seq, row)).collect())
 }
 
 fn decode_prefix_row(
@@ -218,8 +552,6 @@ async fn oldest_prefix(
     ctx: SpaceContext,
     request: ChatRead,
 ) -> Result<PrefixWindow, PortError> {
-    use std::collections::VecDeque;
-
     if request.before.is_some() || request.leaf == ThreadEntrySeq::ZERO {
         return Err(DomainError::validation(ValidationReason::InvalidRange).into());
     }
@@ -233,7 +565,6 @@ async fn oldest_prefix(
         PrincipalKind::Keeper(run) => Some(run.clone()),
         _ => None,
     };
-    const CHUNK_ROWS: i64 = 256;
 
     store
         .with_read_tx_budget(Some(&tx_budget), move |tx| {
@@ -260,78 +591,260 @@ async fn oldest_prefix(
                     thread_tainted,
                 )?;
 
-                let mut retained: VecDeque<(ChatEntry, content::PayloadRow)> =
-                    VecDeque::with_capacity(limit + 1);
+                deadline.remaining(&budget)?;
+                let mut any_tainted = thread_tainted;
                 let mut checkpoint: Option<(ChatEntry, content::PayloadRow)> = None;
-                let mut through = ThreadEntrySeq::ZERO;
-                let mut has_tail = false;
-                let mut cursor = Some(request.leaf);
+                let leaf_depth = if keeper.is_none() {
+                    entry_depth_tx(tx, &scope.space_id, &request.thread, request.leaf).await?
+                } else {
+                    None
+                };
 
-                'chunks: while let Some(tip) = cursor {
-                    deadline.remaining(&budget)?;
-                    if tip <= through {
-                        break;
-                    }
-                    let rows = load_prefix_chunk_tx(
+                // Fast skip-list path using anc_256_seq / anc_16_seq for long non-keeper
+                // branches: avoids walking tens of thousands of rows step-by-step while
+                // preserving exact checkpoint, taint, redaction, and empty-human semantics.
+                let fast_plan = if let Some(leaf_depth) = leaf_depth
+                    && leaf_depth > (limit as i32) + 64
+                {
+                    let candidates = latest_compaction_candidates_tx(
                         tx,
                         &scope.space_id,
                         &request.thread,
-                        tip,
-                        through,
-                        CHUNK_ROWS,
+                        request.leaf,
                     )
                     .await?;
-                    if rows.is_empty() {
-                        break;
-                    }
-                    let mut next_cursor = None;
-                    for raw in rows {
-                        let (entry, payload) = decode_prefix_row(&request.thread, raw)?;
-                        if entry.tainted {
-                            auth.authorize_chat_thread_read(
-                                &space.space,
-                                &request.thread,
-                                th.kind,
-                                &th.owner,
-                                th.project_folder.as_ref(),
-                                true,
-                            )?;
+                    if candidates.len() <= 64 {
+                        let mut matched_cp: Option<(i64, i32)> = None;
+                        for (cand_seq, cand_depth) in candidates {
+                            if cand_depth <= leaf_depth
+                                && jump_to_depth_tx(
+                                    tx,
+                                    &scope.space_id,
+                                    &request.thread,
+                                    request.leaf,
+                                    cand_depth,
+                                )
+                                .await?
+                                    == Some(cand_seq)
+                            {
+                                matched_cp = Some((cand_seq, cand_depth));
+                                break;
+                            }
                         }
-                        if entry.seq <= through
-                            || keeper
-                                .as_ref()
-                                .is_some_and(|run| entry.run.as_ref() != Some(run))
+                        let (through, through_depth) = if let Some((cp_seq, cp_depth)) = matched_cp
                         {
-                            break 'chunks;
-                        }
-                        next_cursor = entry.parent;
-                        if entry.kind == ChatEntryKind::Compaction {
-                            if checkpoint.is_none() {
-                                through = content::decode_proof(
-                                    payload.provenance_json.as_deref(),
-                                    th.redaction_epoch,
-                                )?
-                                .and_then(|proof| proof.compacts_through)
-                                .unwrap_or(entry.seq);
-                                checkpoint = Some((entry, payload));
+                            deadline.remaining(&budget)?;
+                            let mut cp_map = load_prefix_rows_by_seq_tx(
+                                tx,
+                                &scope.space_id,
+                                &request.thread,
+                                &[cp_seq],
+                            )
+                            .await?;
+                            let cp_raw = cp_map.remove(&cp_seq).ok_or_else(|| {
+                                internal_not_committed(
+                                    "missing_compaction_checkpoint",
+                                    "compaction checkpoint disappeared inside read snapshot",
+                                )
+                            })?;
+                            let (cp_entry, cp_payload) =
+                                decode_prefix_row(&request.thread, cp_raw)?;
+                            if cp_entry.tainted {
+                                any_tainted = true;
                             }
-                        } else if entry.kind != ChatEntryKind::Redacted && !empty_human(&entry) {
-                            retained.push_front((entry, payload));
-                            if retained.len() > limit {
-                                retained.pop_back();
-                                has_tail = true;
+                            let through = content::decode_proof(
+                                cp_payload.provenance_json.as_deref(),
+                                th.redaction_epoch,
+                            )?
+                            .and_then(|proof| proof.compacts_through)
+                            .unwrap_or(cp_entry.seq);
+                            let through_depth = if through == cp_entry.seq {
+                                cp_depth
+                            } else {
+                                entry_depth_tx(tx, &scope.space_id, &request.thread, through)
+                                    .await?
+                                    .unwrap_or(-1)
+                            };
+                            checkpoint = Some((cp_entry, cp_payload));
+                            (through, through_depth)
+                        } else {
+                            (ThreadEntrySeq::ZERO, -1)
+                        };
+                        let need_full_taint_scan = !any_tainted
+                            && thread_has_tainted_in_range_tx(
+                                tx,
+                                &scope.space_id,
+                                &request.thread,
+                                through,
+                                request.leaf,
+                            )
+                            .await?;
+                        if need_full_taint_scan {
+                            checkpoint = None;
+                            None
+                        } else {
+                            let mut window: i32 = (limit as i32) + 64;
+                            loop {
+                                deadline.remaining(&budget)?;
+                                let target_depth =
+                                    through_depth.saturating_add(window).min(leaf_depth);
+                                let anchor = if target_depth >= leaf_depth {
+                                    request.leaf
+                                } else {
+                                    let Some(seq) = jump_to_depth_tx(
+                                        tx,
+                                        &scope.space_id,
+                                        &request.thread,
+                                        request.leaf,
+                                        target_depth,
+                                    )
+                                    .await?
+                                    else {
+                                        checkpoint = None;
+                                        break None;
+                                    };
+                                    queue::seq_from_db(seq)?
+                                };
+                                let scan = scan_prefix_chain_tx(
+                                    tx,
+                                    PrefixScanQuery {
+                                        space_id: &scope.space_id,
+                                        thread_id: &request.thread,
+                                        leaf: anchor,
+                                        min_exclusive: through,
+                                        keeper: None,
+                                        stop_at_compaction: false,
+                                        limit,
+                                    },
+                                )
+                                .await?;
+                                if scan.any_tainted {
+                                    any_tainted = true;
+                                }
+                                if (scan.oldest_seqs.len() >= limit && scan.has_tail)
+                                    || target_depth >= leaf_depth
+                                {
+                                    break Some((scan.oldest_seqs, scan.has_tail));
+                                }
+                                window = window.saturating_mul(2);
                             }
                         }
+                    } else {
+                        None
                     }
-                    cursor = next_cursor.filter(|next| *next > through);
+                } else {
+                    None
+                };
+
+                let (selected_seqs, mut has_tail) = if let Some(pair) = fast_plan {
+                    pair
+                } else {
+                    let first_scan = scan_prefix_chain_tx(
+                        tx,
+                        PrefixScanQuery {
+                            space_id: &scope.space_id,
+                            thread_id: &request.thread,
+                            leaf: request.leaf,
+                            min_exclusive: ThreadEntrySeq::ZERO,
+                            keeper: keeper.as_ref(),
+                            stop_at_compaction: true,
+                            limit,
+                        },
+                    )
+                    .await?;
+                    if first_scan.any_tainted {
+                        any_tainted = true;
+                    }
+                    if let Some(cp_seq) = first_scan.checkpoint_seq {
+                        deadline.remaining(&budget)?;
+                        let mut cp_map = load_prefix_rows_by_seq_tx(
+                            tx,
+                            &scope.space_id,
+                            &request.thread,
+                            &[cp_seq],
+                        )
+                        .await?;
+                        let cp_raw = cp_map.remove(&cp_seq).ok_or_else(|| {
+                            internal_not_committed(
+                                "missing_compaction_checkpoint",
+                                "compaction checkpoint disappeared inside read snapshot",
+                            )
+                        })?;
+                        let (cp_entry, cp_payload) = decode_prefix_row(&request.thread, cp_raw)?;
+                        if cp_entry.tainted {
+                            any_tainted = true;
+                        }
+                        let through = content::decode_proof(
+                            cp_payload.provenance_json.as_deref(),
+                            th.redaction_epoch,
+                        )?
+                        .and_then(|proof| proof.compacts_through)
+                        .unwrap_or(cp_entry.seq);
+                        let cp_entry_seq = cp_entry.seq;
+                        checkpoint = Some((cp_entry, cp_payload));
+                        if through < cp_entry_seq {
+                            deadline.remaining(&budget)?;
+                            let second_scan = scan_prefix_chain_tx(
+                                tx,
+                                PrefixScanQuery {
+                                    space_id: &scope.space_id,
+                                    thread_id: &request.thread,
+                                    leaf: request.leaf,
+                                    min_exclusive: through,
+                                    keeper: keeper.as_ref(),
+                                    stop_at_compaction: false,
+                                    limit,
+                                },
+                            )
+                            .await?;
+                            if second_scan.any_tainted {
+                                any_tainted = true;
+                            }
+                            (second_scan.oldest_seqs, second_scan.has_tail)
+                        } else {
+                            (first_scan.oldest_seqs, first_scan.has_tail)
+                        }
+                    } else {
+                        (first_scan.oldest_seqs, first_scan.has_tail)
+                    }
+                };
+
+                if any_tainted {
+                    auth.authorize_chat_thread_read(
+                        &space.space,
+                        &request.thread,
+                        th.kind,
+                        &th.owner,
+                        th.project_folder.as_ref(),
+                        true,
+                    )?;
                 }
 
-                if let Some(checkpoint) = checkpoint {
-                    retained.push_front(checkpoint);
-                    if retained.len() > limit {
-                        retained.pop_back();
-                        has_tail = true;
-                    }
+                deadline.remaining(&budget)?;
+                let mut row_map = load_prefix_rows_by_seq_tx(
+                    tx,
+                    &scope.space_id,
+                    &request.thread,
+                    &selected_seqs,
+                )
+                .await?;
+                let mut retained: Vec<(ChatEntry, content::PayloadRow)> =
+                    Vec::with_capacity(selected_seqs.len() + usize::from(checkpoint.is_some()));
+                if let Some(cp) = checkpoint {
+                    retained.push(cp);
+                }
+                for seq in selected_seqs {
+                    let raw = row_map.remove(&seq).ok_or_else(|| {
+                        internal_not_committed(
+                            "missing_prefix_entry",
+                            "chat prefix entry disappeared inside read snapshot",
+                        )
+                    })?;
+                    retained.push(decode_prefix_row(&request.thread, raw)?);
+                }
+                if retained.len() > limit {
+                    retained.truncate(limit);
+                    has_tail = true;
                 }
                 let thread = ChatThread {
                     id: th.thread_id.clone(),

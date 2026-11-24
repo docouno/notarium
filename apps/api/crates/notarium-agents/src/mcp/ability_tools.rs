@@ -14,6 +14,12 @@ use notarium_syntax::frontmatter;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 
+use std::{
+    collections::VecDeque,
+    sync::Mutex,
+    time::{Duration, Instant},
+};
+
 use super::{EgressTarget, ToolCallContext, ToolName, ToolRegistry, decode, invalid, session};
 use crate::abilities::read_system_ability;
 
@@ -21,7 +27,98 @@ mod author;
 
 const MAX_TOKEN_BYTES: usize = 2048;
 const DEFAULT_ACTIVATION_TOKENS: usize = 4000;
+const MAX_ACTIVATION_TOKENS: usize = 16_000;
 const MAX_IN_APP_PACKAGE_BODY_BYTES: usize = 32 * 1024;
+const ABILITY_CURSOR_PREFIX: &str = "ac1:";
+const ABILITY_CURSOR_TTL: Duration = Duration::from_secs(15 * 60);
+const MAX_ABILITY_CURSORS: usize = 512;
+const MAX_ABILITY_CURSORS_PER_PRINCIPAL: usize = 64;
+
+/// Keep ability pagination positions server-side so unconsented Space IDs and
+/// sequence numbers are never encoded into tokens returned to callers or models.
+#[derive(Default)]
+pub(super) struct AbilityCursors {
+    entries: Mutex<VecDeque<AbilityCursorEntry>>,
+}
+
+struct AbilityCursorEntry {
+    id: u128,
+    principal: PrincipalId,
+    opened: Instant,
+    scope: ContentDigest,
+    inner: String,
+}
+
+impl AbilityCursors {
+    fn insert(
+        &self,
+        principal: PrincipalId,
+        scope: ContentDigest,
+        inner: String,
+    ) -> Result<String, PortError> {
+        let mut bytes = [0_u8; 16];
+        getrandom::fill(&mut bytes).map_err(|_| invalid(ValidationReason::InvalidState))?;
+        let id = u128::from_be_bytes(bytes);
+        let mut entries = self.entries.lock().unwrap_or_else(|err| err.into_inner());
+        entries.retain(|entry| entry.opened.elapsed() < ABILITY_CURSOR_TTL);
+        if entries.iter().any(|entry| entry.id == id) {
+            return Err(invalid(ValidationReason::InvalidState));
+        }
+        let mut owned = entries
+            .iter()
+            .filter(|entry| entry.principal == principal)
+            .count();
+        while owned >= MAX_ABILITY_CURSORS_PER_PRINCIPAL {
+            if let Some(pos) = entries
+                .iter()
+                .position(|entry| entry.principal == principal)
+            {
+                entries.remove(pos);
+                owned -= 1;
+            } else {
+                break;
+            }
+        }
+        if entries.len() == MAX_ABILITY_CURSORS {
+            entries.pop_front();
+        }
+        entries.push_back(AbilityCursorEntry {
+            id,
+            principal,
+            opened: Instant::now(),
+            scope,
+            inner,
+        });
+        Ok(format!("{ABILITY_CURSOR_PREFIX}{id:032x}"))
+    }
+
+    fn lookup(
+        &self,
+        principal: &PrincipalId,
+        token: &str,
+        expected_scope: &ContentDigest,
+    ) -> Result<String, PortError> {
+        let raw = token
+            .strip_prefix(ABILITY_CURSOR_PREFIX)
+            .ok_or_else(|| invalid(ValidationReason::InvalidId))?;
+        if raw.len() != 32 || !raw.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+            return Err(invalid(ValidationReason::InvalidId));
+        }
+        let id = u128::from_str_radix(raw, 16).map_err(|_| invalid(ValidationReason::InvalidId))?;
+        let mut entries = self.entries.lock().unwrap_or_else(|err| err.into_inner());
+        entries.retain(|entry| entry.opened.elapsed() < ABILITY_CURSOR_TTL);
+        let Some(entry) = entries
+            .iter()
+            .find(|entry| entry.id == id && &entry.principal == principal)
+        else {
+            return Err(invalid(ValidationReason::CursorStale));
+        };
+        if &entry.scope != expected_scope {
+            return Err(invalid(ValidationReason::CursorStale));
+        }
+        Ok(entry.inner.clone())
+    }
+}
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -102,12 +199,10 @@ pub(super) async fn handle(
         ToolName::ListAbilities => {
             let args: ListArgs = decode(args)?;
             let episode = load_episode(call, args.session.as_ref()).await?;
-            let project = session::selected_project_for_hint(
+            let project = session::selected_project_for_episode(
                 call,
                 args.project.as_deref(),
-                episode
-                    .as_ref()
-                    .and_then(|value| value.project_hint.as_ref()),
+                episode.as_ref(),
             )
             .await?;
             list(call, args, project).await
@@ -124,7 +219,7 @@ pub(super) async fn handle(
 fn token<T: Serialize>(prefix: &str, value: &T) -> Result<String, PortError> {
     let bytes = serde_json::to_vec(value).map_err(|_| invalid(ValidationReason::InvalidState))?;
     let result = format!("{prefix}{}", URL_SAFE_NO_PAD.encode(bytes));
-    if result.len() > MAX_TOKEN_BYTES && prefix != "ac1:" {
+    if result.len() > MAX_TOKEN_BYTES {
         return Err(invalid(ValidationReason::InvalidLimit));
     }
     Ok(result)
@@ -592,12 +687,6 @@ fn visible_error(error: &PortError) -> bool {
         || matches!(error, PortError::Domain(DomainError::Provider { .. }))
 }
 
-#[derive(Serialize, Deserialize)]
-struct ListCursor {
-    scope: ContentDigest,
-    inner: String,
-}
-
 async fn list(
     call: &mut ToolCallContext<'_>,
     args: ListArgs,
@@ -605,8 +694,19 @@ async fn list(
 ) -> Result<Value, PortError> {
     let view = args.view.unwrap_or(View::Runtime);
     let limit = args.limit.unwrap_or(20);
+    let receiver = match &call.target {
+        EgressTarget::ExternalMcp => None,
+        EgressTarget::InAppProvider {
+            provider,
+            model,
+            primary_project,
+        } => Some((provider, model, primary_project)),
+    };
     let filters = serde_json::to_vec(&(
         call.auth.principal(),
+        super::command_actor(&call.auth),
+        call.auth.bearer_scope(),
+        receiver,
         &project,
         view,
         args.source,
@@ -617,13 +717,11 @@ async fn list(
     .map_err(|_| invalid(ValidationReason::InvalidState))?;
     let scope = ContentDigest::from_bytes(*blake3::hash(&filters).as_bytes());
     let inner = match &args.cursor {
-        Some(cursor) => {
-            let cursor: ListCursor = parse_token(cursor, "ac1:", 4096)?;
-            if cursor.scope != scope {
-                return Err(invalid(ValidationReason::CursorStale));
-            }
-            Some(cursor.inner)
-        }
+        Some(cursor) => Some(call.registry.ability_cursors.lookup(
+            call.auth.principal(),
+            cursor,
+            &scope,
+        )?),
         None => None,
     };
     let page = call
@@ -683,11 +781,12 @@ async fn list(
     }
     let next = page
         .continuation
-        .map(|inner| token("ac1:", &ListCursor { scope, inner }))
+        .map(|inner| {
+            call.registry
+                .ability_cursors
+                .insert(call.auth.principal().clone(), scope, inner)
+        })
         .transpose()?;
-    if next.as_ref().is_some_and(|next| next.len() > 4096) {
-        return Err(invalid(ValidationReason::InvalidLimit));
-    }
     let filtered =
         args.kind.is_some() || args.source.is_some() || args.project.is_some() || args.q.is_some();
     let next_action = match &next {
@@ -737,14 +836,7 @@ pub(super) async fn session_ability_summaries(
 
 async fn get(call: &mut ToolCallContext<'_>, args: GetArgs) -> Result<Value, PortError> {
     let episode = load_episode(call, args.session.as_ref()).await?;
-    let project = session::selected_project_for_hint(
-        call,
-        None,
-        episode
-            .as_ref()
-            .and_then(|value| value.project_hint.as_ref()),
-    )
-    .await?;
+    let project = session::selected_project_for_episode(call, None, episode.as_ref()).await?;
     let inspection = inspect(call, &args.reference)
         .await
         .map_err(|error| collapse_provider_error(call, error))?;
@@ -984,14 +1076,9 @@ async fn use_ability(
         _ => return Err(invalid(ValidationReason::InvalidQuery)),
     };
     let episode = load_episode(call, args.session.as_ref()).await?;
-    let project = session::selected_project_for_hint(
-        call,
-        args.project.as_deref(),
-        episode
-            .as_ref()
-            .and_then(|value| value.project_hint.as_ref()),
-    )
-    .await?;
+    let project =
+        session::selected_project_for_episode(call, args.project.as_deref(), episode.as_ref())
+            .await?;
     let descriptor = resolve(call, &selector, kind, project.clone()).await?;
     let rendered = activation(
         call,
@@ -1014,8 +1101,11 @@ pub(super) async fn activate_session_role(
     episode: &AgentEpisode,
     explicit: Option<&str>,
 ) -> Result<Option<Value>, PortError> {
-    let project =
-        session::selected_project_for_hint(call, None, episode.project_hint.as_ref()).await?;
+    let project = if explicit.is_some() {
+        session::selected_project_for_episode(call, None, Some(episode)).await?
+    } else {
+        session::selected_project_for_hint(call, None, episode.project_hint.as_ref()).await?
+    };
     let descriptor = if let Some(selector) = explicit {
         resolve(call, selector, AbilityKind::Role, project.clone()).await?
     } else {
@@ -1027,13 +1117,15 @@ pub(super) async fn activate_session_role(
             .get_ability(call.account(), reference.clone(), project.clone())
             .await?
     };
-    let rendered = activation(
-        call,
-        &descriptor,
-        project.as_ref(),
-        DEFAULT_ACTIVATION_TOKENS,
-    )
-    .await?;
+    let body = read_body(call, &descriptor, project.as_ref()).await?;
+    let budget = if body.instructions.len() <= MAX_ACTIVATION_TOKENS {
+        DEFAULT_ACTIVATION_TOKENS.max(body.instructions.len())
+    } else if explicit.is_some() {
+        return Err(invalid(ValidationReason::BudgetExceeded));
+    } else {
+        return Ok(None);
+    };
+    let rendered = activation_with_body(call, &descriptor, project.as_ref(), body, budget).await?;
     if explicit.is_some() && call.auth.bearer_scope() != Some(BearerScope::Read) {
         save_active_role(call, episode, &descriptor.reference, project).await?;
     }
@@ -1111,6 +1203,16 @@ async fn activation(
     budget: usize,
 ) -> Result<Value, PortError> {
     let body = read_body(call, descriptor, project).await?;
+    activation_with_body(call, descriptor, project, body, budget).await
+}
+
+async fn activation_with_body(
+    call: &mut ToolCallContext<'_>,
+    descriptor: &AbilityDescriptor,
+    project: Option<&FolderRef>,
+    body: AbilityBody,
+    budget: usize,
+) -> Result<Value, PortError> {
     // Each UTF-8 byte can be a token in a byte-fallback tokenizer.
     let mut remaining = budget
         .checked_sub(body.instructions.len())

@@ -193,8 +193,16 @@ impl KeeperScheduler {
     pub async fn tick(&self, now: Timestamp) -> Result<TickSummary, PortError> {
         let mut jobs = JoinSet::new();
         let mut summary = TickSummary::default();
+        let started = Instant::now();
         let pages = self
-            .enqueue_due(now, None, &Cancellation::default(), &mut jobs, &mut summary)
+            .enqueue_due(
+                now,
+                None,
+                Some(started),
+                &Cancellation::default(),
+                &mut jobs,
+                &mut summary,
+            )
             .await;
         // Drain admitted work even if a later list page failed.
         while let Some(result) = jobs.join_next().await {
@@ -241,8 +249,15 @@ impl KeeperScheduler {
                 }
                 let result = match clock_now(clock.as_ref()) {
                     Ok(now) => {
-                        self.enqueue_due(now, Some(&clock), &cancellation, &mut jobs, &mut summary)
-                            .await
+                        self.enqueue_due(
+                            now,
+                            Some(&clock),
+                            None,
+                            &cancellation,
+                            &mut jobs,
+                            &mut summary,
+                        )
+                        .await
                     }
                     Err(error) => Err(error),
                 };
@@ -281,6 +296,7 @@ impl KeeperScheduler {
         &self,
         now: Timestamp,
         clock: Option<&Arc<dyn ControlClock>>,
+        tick_started: Option<Instant>,
         cancellation: &Cancellation,
         jobs: &mut JoinSet<Result<SlotAttempt, PortError>>,
         summary: &mut TickSummary,
@@ -320,7 +336,7 @@ impl KeeperScheduler {
                 jobs.spawn(async move {
                     let _permit = permit;
                     worker
-                        .process_schedule(schedule, now, clock, shutdown)
+                        .process_schedule(schedule, now, clock, tick_started, shutdown)
                         .await
                 });
             }
@@ -337,6 +353,7 @@ impl KeeperScheduler {
         schedule: AgentSchedule,
         now: Timestamp,
         clock: Option<Arc<dyn ControlClock>>,
+        tick_started: Option<Instant>,
         shutdown: Cancellation,
     ) -> Result<SlotAttempt, PortError> {
         let cancellation = Cancellation::default();
@@ -345,6 +362,7 @@ impl KeeperScheduler {
             schedule,
             now,
             clock.as_deref(),
+            tick_started,
             &cancellation,
             &ownership_lost,
         );
@@ -368,6 +386,7 @@ impl KeeperScheduler {
         schedule: AgentSchedule,
         now: Timestamp,
         clock: Option<&dyn ControlClock>,
+        tick_started: Option<Instant>,
         cancellation: &Cancellation,
         ownership_lost: &Cancellation,
     ) -> Result<SlotAttempt, PortError> {
@@ -427,23 +446,41 @@ impl KeeperScheduler {
         let control = self.inner.registry.control();
         let mut started = Instant::now();
         let mut result = control.claim_schedule(ctx.clone(), claim.clone()).await;
-        if matches!(&result, Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
-            if diagnostic.reason == ValidationReason::InvalidTimestamp)
-            && let Some(clock) = clock
-        {
-            // A trusted clock crossing a cron boundary between calculation
-            // and Control admission is a definite rejection. Try its new
-            // witness once, under the same slot ownership fence.
-            let refreshed = next(clock_now(clock)?.max(now))?;
-            if refreshed != claim.next_slot
-                && !cancellation.is_cancelled()
-                && !ownership_lost.is_cancelled()
+        for _ in 0..2 {
+            if !matches!(&result, Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
+                if diagnostic.reason == ValidationReason::InvalidTimestamp)
             {
-                owner.check()?;
-                claim.next_slot = refreshed;
-                started = Instant::now();
-                result = control.claim_schedule(ctx, claim).await;
+                break;
             }
+            // A clock crossing a cron boundary while waiting for a worker slot
+            // or during Control admission is a definite rejection. Recompute
+            // the next-slot witness from the latest clock/elapsed time under
+            // the same slot ownership fence.
+            let mut observed = if let Some(clock) = clock {
+                clock_now(clock)?.max(now)
+            } else if let Some(tick_started) = tick_started {
+                advance_timestamp(now, tick_started.elapsed())?
+            } else {
+                break;
+            };
+            let mut refreshed = next(observed)?;
+            if clock.is_none()
+                && refreshed == claim.next_slot
+                && let Some(prev_next) = claim.next_slot
+            {
+                observed = observed.max(prev_next);
+                refreshed = next(observed)?;
+            }
+            if refreshed == claim.next_slot
+                || cancellation.is_cancelled()
+                || ownership_lost.is_cancelled()
+            {
+                break;
+            }
+            owner.check()?;
+            claim.next_slot = refreshed;
+            started = Instant::now();
+            result = control.claim_schedule(ctx.clone(), claim.clone()).await;
         }
         match result {
             Ok(ScheduleClaim::Claimed {
@@ -730,12 +767,25 @@ fn claim_raced(error: &PortError) -> bool {
             | DomainError::IdempotencyKeyReused
             | DomainError::ResourceNotFound,
         ) => true,
-        PortError::Domain(DomainError::ValidationFailed { diagnostic }) => matches!(
-            diagnostic.reason,
-            ValidationReason::InvalidTimestamp | ValidationReason::ScopeMismatch
-        ),
+        PortError::Domain(DomainError::ValidationFailed { diagnostic }) => {
+            matches!(diagnostic.reason, ValidationReason::ScopeMismatch)
+        }
         _ => false,
     }
+}
+
+fn advance_timestamp(base: Timestamp, elapsed: Duration) -> Result<Timestamp, PortError> {
+    let added_secs = i64::try_from(elapsed.as_secs())
+        .map_err(|_| invalid(ValidationReason::InvalidTimestamp))?;
+    let total_nanos = u64::from(base.nanosecond()) + u64::from(elapsed.subsec_nanos());
+    let carry = (total_nanos / 1_000_000_000) as i64;
+    let nanos = (total_nanos % 1_000_000_000) as u32;
+    let secs = base
+        .unix_seconds()
+        .checked_add(added_secs)
+        .and_then(|s| s.checked_add(carry))
+        .ok_or_else(|| invalid(ValidationReason::InvalidTimestamp))?;
+    Ok(Timestamp::from_unix_parts(secs, nanos)?)
 }
 
 fn unknown_effect(error: &PortError) -> bool {

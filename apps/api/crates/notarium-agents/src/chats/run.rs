@@ -353,10 +353,57 @@ impl AgentRunSupervisor {
         };
         match control.get_episode(account()?, id.clone()).await {
             Ok(episode) if episode.id == id && &episode.owner == run.auth.principal() => {
-                if !run.owner_auth.taint().is_tainted() {
-                    control.touch_episode(account()?, id.clone()).await?;
+                match episode.lifecycle {
+                    EpisodeLifecycle::Active => {
+                        if run.owner_auth.taint().is_tainted() {
+                            return Ok(id);
+                        }
+                        match control.touch_episode(account()?, id.clone()).await {
+                            Ok(()) => return Ok(id),
+                            Err(PortError::Domain(DomainError::ValidationFailed {
+                                diagnostic,
+                            })) if diagnostic.reason == ValidationReason::InvalidState => {}
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    EpisodeLifecycle::Sleeping => {}
+                    EpisodeLifecycle::Closed => {
+                        return Err(invalid(ValidationReason::InvalidState));
+                    }
                 }
-                return Ok(id);
+                let resume_key = derive_key(
+                    "notarium.chats.resume-episode.v1",
+                    &[run.id.as_str().as_bytes()],
+                );
+                let resume_input = StartEpisode {
+                    selector: EpisodeSelector::Resume(id.clone()),
+                    project_hint: None,
+                    guard: EpisodeRevisionGuard::Target,
+                };
+                let principal = run.auth.principal().clone();
+                let resumed = control
+                    .start_or_resume_episode(
+                        account()?,
+                        AccountMutation {
+                            identity: AccountCommandIdentity {
+                                owner: principal.clone(),
+                                actor: principal,
+                                expected: ControlRevision::ZERO,
+                                key: resume_key,
+                                hash: bytes,
+                            },
+                            input: resume_input,
+                        },
+                    )
+                    .await?;
+                return match resumed.value {
+                    EpisodeStartResult::Resumed(episode)
+                        if episode.id == id && &episode.owner == run.auth.principal() =>
+                    {
+                        Ok(id)
+                    }
+                    _ => Err(invalid(ValidationReason::SourceMismatch)),
+                };
             }
             Ok(_) => return Err(invalid(ValidationReason::SourceMismatch)),
             Err(PortError::Domain(DomainError::ResourceNotFound)) => (),

@@ -306,6 +306,9 @@ pub enum EpisodeSelector {
         name: Option<String>,
     },
     Id(EpisodeId),
+    /// Resume an existing episode in place if sleeping or idle, or touch it if
+    /// already active, without ever forking a new episode.
+    Resume(EpisodeId),
     Name(String),
 }
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]

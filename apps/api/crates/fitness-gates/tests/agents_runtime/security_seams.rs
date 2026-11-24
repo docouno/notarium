@@ -10,7 +10,7 @@ use notarium_canonical::CreateFolderSpec;
 use notarium_collab::CollabSessionAuth;
 use notarium_core::{
     auth::{ChatAudience, SpaceKind},
-    classes::DocClass,
+    classes::{AbilityKind, DocClass},
     model::FolderRef,
     ports::provider::{ProviderToolCall, ProviderToolCallId},
 };
@@ -36,7 +36,7 @@ async fn postgres_security_seams_collab_ttfb_and_orphan_recovery() {
 }
 
 async fn exercise(pg: bool) {
-    let fixture = Box::pin(RuntimeFixture::open_named(pg, "agents_security_seams")).await;
+    let mut fixture = Box::pin(RuntimeFixture::open_named(pg, "agents_security_seams")).await;
     let personal = fixture.personal_scope().await;
     Box::pin(project_only_mutations_and_owned_space_abilities(&fixture)).await;
     Box::pin(unconsented_proposal_fails_closed_with_taint(
@@ -60,6 +60,12 @@ async fn exercise(pg: bool) {
     ))
     .await;
     Box::pin(contract_and_seams_regressions(&fixture, &personal)).await;
+    Box::pin(episode_project_and_folder_journal_regressions(
+        &mut fixture,
+        &personal,
+    ))
+    .await;
+    Box::pin(role_cursor_and_schema_regressions(&fixture, &personal)).await;
     let fixture = Box::pin(orphan_active_run_recovered_on_enqueue(fixture, &personal)).await;
     Box::pin(fixture.close()).await;
 }
@@ -2592,5 +2598,1166 @@ async fn contract_and_seams_regressions(fixture: &RuntimeFixture, personal: &Spa
     assert!(
         matches!(expired_start, Err(PortError::DeadlineExceeded(_))),
         "expired CallBudget on start must return DeadlineExceeded: {expired_start:?}"
+    );
+}
+
+async fn episode_project_and_folder_journal_regressions(
+    fixture: &mut RuntimeFixture,
+    personal: &SpaceContext,
+) {
+    let owner = AccountContext::new(
+        fixture
+            .control
+            .trusted_none(
+                PerimeterAttestation::attest_checked()
+                    .with_human_management()
+                    .with_ability_write(),
+                budget(),
+            )
+            .await
+            .unwrap(),
+        budget(),
+    );
+    let actor = owner.auth().principal().clone();
+    let active_epoch = fixture
+        .canonical
+        .read_space(&personal.scope().space_id)
+        .await
+        .unwrap()
+        .active_epoch;
+    let call_tool = |account: &AccountContext, seq: u8, tool: &str, args: Value| {
+        let mut key = [0xE4; 16];
+        key[15] = seq;
+        let registry = fixture.registry.clone();
+        let account = account.clone();
+        let tool = tool.to_owned();
+        async move {
+            registry
+                .call_tool(
+                    McpInvocationContext {
+                        account,
+                        target: EgressTarget::ExternalMcp,
+                        request_key: CommandKey::from_bytes(key),
+                    },
+                    &tool,
+                    args,
+                )
+                .await
+        }
+    };
+
+    // 1. ProjectUnavailable episode binding must fail closed on relative folder/read/ability
+    //    calls (including start_session with explicit role) instead of falling back to the
+    //    personal Space, broadening to all Spaces, or clearing the stored project binding.
+    let proj_gone = FolderId::from_bytes([0xE4, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    let proj_gone_docs = FolderId::from_bytes([0xE4, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+    let personal_docs = FolderId::from_bytes([0xE4, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3]);
+    for (id, parent, slug, display, is_project) in [
+        (&proj_gone, None, "proj-gone", "Project Gone", true),
+        (
+            &proj_gone_docs,
+            Some(proj_gone.clone()),
+            "docs-rel",
+            "Docs Inside Project",
+            false,
+        ),
+        (
+            &personal_docs,
+            None,
+            "docs-rel",
+            "Docs In Personal Root",
+            false,
+        ),
+    ] {
+        fixture
+            .canonical
+            .create_folder(CreateFolderSpec {
+                scope: personal.scope().clone(),
+                active_epoch,
+                folder_id: id.clone(),
+                parent,
+                slug: slug.into(),
+                display_name: display.into(),
+                is_project,
+                project_slug: is_project.then(|| slug.into()),
+                actor: actor.clone(),
+                timestamp: None,
+            })
+            .await
+            .unwrap();
+    }
+    let projects = call_tool(&owner, 10, "get_my_projects", json!({}))
+        .await
+        .unwrap();
+    assert!(
+        projects.structured_content["projects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["slug"].as_str() == Some("proj-gone")),
+        "proj-gone must be listed before binding"
+    );
+    let proj_gone_ref = FolderRef {
+        space_id: personal.scope().space_id.clone(),
+        folder_id: proj_gone.clone(),
+    };
+    let ep_gone = EpisodeId::from_bytes([0xE4, 0x11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    let started_ep = fixture
+        .control
+        .start_or_resume_episode(
+            owner.clone(),
+            AccountMutation {
+                identity: notarium_core::receipt::AccountCommandIdentity {
+                    owner: actor.clone(),
+                    actor: actor.clone(),
+                    expected: ControlRevision::ZERO,
+                    key: CommandKey::from_bytes([
+                        0xE4, 0x11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xE4; 32]),
+                },
+                input: StartEpisode {
+                    selector: EpisodeSelector::New {
+                        requested: ep_gone.clone(),
+                        name: Some("gone-project-guard".into()),
+                    },
+                    project_hint: Some(proj_gone_ref.clone()),
+                    guard: EpisodeRevisionGuard::Target,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let EpisodeStartResult::New(initial_ep) = started_ep.value else {
+        panic!("expected new episode for gone-project-guard");
+    };
+    assert_eq!(initial_ep.project_hint, Some(proj_gone_ref));
+    // Mark the bound project trashed so Control reports EpisodeDiagnostic::ProjectUnavailable.
+    let trashed = fixture
+        .canonical
+        .execute_diagnostic_write_sql_for_test(&format!(
+            "UPDATE folder_heads SET lifecycle_state='trashed' WHERE space_id='{}' AND folder_id='{}'",
+            personal.scope().space_id.as_str(),
+            proj_gone.as_str(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(trashed, 1);
+    let observed_ep = fixture
+        .control
+        .get_episode(owner.clone(), ep_gone.clone())
+        .await
+        .unwrap();
+    assert!(observed_ep.project_hint.is_none());
+    assert!(
+        observed_ep
+            .diagnostics
+            .contains(&EpisodeDiagnostic::ProjectUnavailable),
+        "trashed project must produce ProjectUnavailable diagnostic: {:?}",
+        observed_ep.diagnostics
+    );
+
+    // Passing an explicit role to start_session on a ProjectUnavailable episode must fail
+    // closed instead of clearing the episode's stored project binding in Control DB.
+    let explicit_role_reopen = call_tool(
+        &owner,
+        11,
+        "start_session",
+        json!({"session": {"id": ep_gone.to_string()}, "role": "research"}),
+    )
+    .await
+    .map(|_| ());
+    assert!(
+        matches!(
+            explicit_role_reopen,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ),
+        "start_session with explicit role on ProjectUnavailable episode must fail closed: {explicit_role_reopen:?}"
+    );
+    let still_unavailable = fixture
+        .control
+        .get_episode(owner.clone(), ep_gone.clone())
+        .await
+        .unwrap();
+    assert!(
+        still_unavailable
+            .diagnostics
+            .contains(&EpisodeDiagnostic::ProjectUnavailable),
+        "failed start_session with explicit role must preserve ProjectUnavailable diagnostic"
+    );
+
+    // Direct Control BindRole { project_hint: None } on a ProjectUnavailable episode must
+    // also fail closed with ResourceNotFound while keeping ProjectUnavailable intact.
+    let research_role = match fixture
+        .control
+        .resolve_ability(
+            owner.clone(),
+            AbilitySelection::Name {
+                name: "research".into(),
+                kind: AbilityKind::Role,
+                project: None,
+            },
+        )
+        .await
+        .unwrap()
+    {
+        AbilityResolution::Resolved(desc) => desc.reference,
+        other => panic!("expected system research role, got {other:?}"),
+    };
+    let direct_gone_bind = fixture
+        .control
+        .update_episode(
+            owner.clone(),
+            AccountMutation {
+                identity: notarium_core::receipt::AccountCommandIdentity {
+                    owner: actor.clone(),
+                    actor: actor.clone(),
+                    expected: ControlRevision::ZERO,
+                    key: CommandKey::from_bytes([
+                        0xE4, 0x11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xE4; 32]),
+                },
+                input: EpisodeMutation::BindRole(BindEpisodeRole {
+                    episode: ep_gone.clone(),
+                    expected: still_unavailable.revision,
+                    active_role: research_role,
+                    project_hint: None,
+                }),
+            },
+        )
+        .await;
+    assert!(
+        matches!(
+            direct_gone_bind,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ),
+        "direct BindRole with project_hint: None on ProjectUnavailable episode must fail closed: {direct_gone_bind:?}"
+    );
+    let after_direct_gone = fixture
+        .control
+        .get_episode(owner.clone(), ep_gone.clone())
+        .await
+        .unwrap();
+    assert!(
+        after_direct_gone
+            .diagnostics
+            .contains(&EpisodeDiagnostic::ProjectUnavailable),
+        "direct BindRole failure must preserve ProjectUnavailable diagnostic"
+    );
+
+    for (tag, tool, args) in [
+        (
+            12u8,
+            "rename_folder",
+            json!({"folder": "docs-rel", "name": "hijacked-rel", "session": ep_gone.to_string()}),
+        ),
+        (
+            13,
+            "move_folder",
+            json!({"folder": "docs-rel", "toFolder": "", "session": ep_gone.to_string()}),
+        ),
+        (14, "list_notes", json!({"session": ep_gone.to_string()})),
+        (
+            15,
+            "list_abilities",
+            json!({"view": "runtime", "session": ep_gone.to_string()}),
+        ),
+    ] {
+        let res = call_tool(&owner, tag, tool, args).await.map(|_| ());
+        assert!(
+            matches!(res, Err(PortError::Domain(DomainError::ResourceNotFound))),
+            "{tool} with ProjectUnavailable episode must fail closed with ResourceNotFound: {res:?}"
+        );
+    }
+    assert!(
+        fixture
+            .canonical
+            .resolve_folder_path(personal.clone(), None, "docs-rel".into())
+            .await
+            .unwrap()
+            .is_some(),
+        "personal root docs-rel must remain intact"
+    );
+    assert!(
+        fixture
+            .canonical
+            .resolve_folder_path(personal.clone(), None, "hijacked-rel".into())
+            .await
+            .unwrap()
+            .is_none(),
+        "hijacked-rel must never be created in personal Space"
+    );
+
+    // 2. Content-free FolderRoute journal: rename_folder and rename_project (including
+    //    omitted displayName and rejected conflicts) must not persist user folder/project
+    //    names or slugs into Control's mcp_dedup.safe_result, and replaying rename_project
+    //    with displayName omitted must remain idempotent after a subsequent display-name edit.
+    let target_folder = FolderId::from_bytes([0xE4, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4]);
+    let target_proj = FolderId::from_bytes([0xE4, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5]);
+    for (id, slug, display, is_project) in [
+        (&target_folder, "folder-orig-rel", "Folder Orig Rel", false),
+        (
+            &target_proj,
+            "proj-orig-rel",
+            "Secret Display Name Rel",
+            true,
+        ),
+    ] {
+        fixture
+            .canonical
+            .create_folder(CreateFolderSpec {
+                scope: personal.scope().clone(),
+                active_epoch,
+                folder_id: id.clone(),
+                parent: None,
+                slug: slug.into(),
+                display_name: display.into(),
+                is_project,
+                project_slug: is_project.then(|| slug.into()),
+                actor: actor.clone(),
+                timestamp: None,
+            })
+            .await
+            .unwrap();
+    }
+    let listed_projects = call_tool(&owner, 16, "get_my_projects", json!({}))
+        .await
+        .unwrap();
+    let target_proj_handle = listed_projects.structured_content["projects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["slug"].as_str() == Some("proj-orig-rel"))
+        .expect("proj-orig-rel listed")["handle"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let renamed_folder = call_tool(
+        &owner,
+        17,
+        "rename_folder",
+        json!({"folder": "folder-orig-rel", "name": "secret-folder-name-rel"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(renamed_folder.structured_content["outcome"], "applied");
+    let renamed_proj = call_tool(
+        &owner,
+        18,
+        "rename_project",
+        json!({"project": target_proj_handle, "slug": "secret-proj-slug-rel"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(renamed_proj.structured_content["outcome"], "applied");
+    assert_eq!(
+        renamed_proj.structured_content["displayName"],
+        "Secret Display Name Rel"
+    );
+    // Change the display name with a second command, then replay the first rename_project
+    // (same key 18, displayName omitted): canonical receipt replay must still succeed
+    // without failing with IdempotencyKeyReused.
+    let updated_projects = call_tool(&owner, 24, "get_my_projects", json!({}))
+        .await
+        .unwrap();
+    let renamed_proj_handle = updated_projects.structured_content["projects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["slug"].as_str() == Some("secret-proj-slug-rel"))
+        .expect("secret-proj-slug-rel listed")["handle"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let updated_display = call_tool(
+        &owner,
+        25,
+        "rename_project",
+        json!({
+            "project": renamed_proj_handle,
+            "slug": "secret-proj-slug-rel",
+            "displayName": "Updated Display Later",
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        updated_display.structured_content["displayName"],
+        "Updated Display Later"
+    );
+    let replayed_proj = call_tool(
+        &owner,
+        18,
+        "rename_project",
+        json!({"project": target_proj_handle, "slug": "secret-proj-slug-rel"}),
+    )
+    .await
+    .expect("replaying rename_project with omitted displayName after later display edit must replay cleanly");
+    assert_eq!(replayed_proj.structured_content["outcome"], "applied");
+
+    // Direct BindRole { project_hint: None } on an episode bound to a live project must
+    // validate against the preserved project: reject an OwnedSpace role from another Space,
+    // accept an OwnedProject role in the preserved project, and retain the project binding.
+    let live_proj_ref = FolderRef {
+        space_id: personal.scope().space_id.clone(),
+        folder_id: target_proj.clone(),
+    };
+    let ep_live_proj =
+        EpisodeId::from_bytes([0xE4, 0x11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4]);
+    let started_live = fixture
+        .control
+        .start_or_resume_episode(
+            owner.clone(),
+            AccountMutation {
+                identity: notarium_core::receipt::AccountCommandIdentity {
+                    owner: actor.clone(),
+                    actor: actor.clone(),
+                    expected: ControlRevision::ZERO,
+                    key: CommandKey::from_bytes([
+                        0xE4, 0x11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xE4; 32]),
+                },
+                input: StartEpisode {
+                    selector: EpisodeSelector::New {
+                        requested: ep_live_proj.clone(),
+                        name: Some("live-project-bind-guard".into()),
+                    },
+                    project_hint: Some(live_proj_ref.clone()),
+                    guard: EpisodeRevisionGuard::Target,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let EpisodeStartResult::New(live_ep) = started_live.value else {
+        panic!("expected new episode for live-project-bind-guard");
+    };
+    let shared_space_id = SpaceId::from_bytes([1; 16]);
+    call_tool(
+        &owner,
+        27,
+        "create_ability",
+        json!({
+            "kind": "role",
+            "name": "other-space-bind-role",
+            "description": "Role confined to shared Space",
+            "instructions": "# Shared Space Role\n",
+            "placement": {"home": "space", "space": shared_space_id.as_str()},
+        }),
+    )
+    .await
+    .unwrap();
+    call_tool(
+        &owner,
+        28,
+        "create_ability",
+        json!({
+            "kind": "role",
+            "name": "same-project-bind-role",
+            "description": "Role confined to preserved project",
+            "instructions": "# Same Project Role\n",
+            "placement": {"home": "project", "project": renamed_proj_handle},
+        }),
+    )
+    .await
+    .unwrap();
+    let other_space_role = match fixture
+        .control
+        .resolve_ability(
+            owner.clone(),
+            AbilitySelection::Name {
+                name: "other-space-bind-role".into(),
+                kind: AbilityKind::Role,
+                project: None,
+            },
+        )
+        .await
+        .unwrap()
+    {
+        AbilityResolution::Resolved(desc) => desc.reference,
+        other => panic!("expected other-space-bind-role, got {other:?}"),
+    };
+    let same_proj_role = match fixture
+        .control
+        .resolve_ability(
+            owner.clone(),
+            AbilitySelection::Name {
+                name: "same-project-bind-role".into(),
+                kind: AbilityKind::Role,
+                project: Some(live_proj_ref.clone()),
+            },
+        )
+        .await
+        .unwrap()
+    {
+        AbilityResolution::Resolved(desc) => desc.reference,
+        other => panic!("expected same-project-bind-role, got {other:?}"),
+    };
+    let cross_space_bind = fixture
+        .control
+        .update_episode(
+            owner.clone(),
+            AccountMutation {
+                identity: notarium_core::receipt::AccountCommandIdentity {
+                    owner: actor.clone(),
+                    actor: actor.clone(),
+                    expected: ControlRevision::ZERO,
+                    key: CommandKey::from_bytes([
+                        0xE4, 0x11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xE4; 32]),
+                },
+                input: EpisodeMutation::BindRole(BindEpisodeRole {
+                    episode: ep_live_proj.clone(),
+                    expected: live_ep.revision,
+                    active_role: other_space_role,
+                    project_hint: None,
+                }),
+            },
+        )
+        .await;
+    assert!(
+        matches!(
+            cross_space_bind,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ),
+        "BindRole with project_hint: None must reject cross-Space role against preserved project: {cross_space_bind:?}"
+    );
+    let same_proj_bind = fixture
+        .control
+        .update_episode(
+            owner.clone(),
+            AccountMutation {
+                identity: notarium_core::receipt::AccountCommandIdentity {
+                    owner: actor.clone(),
+                    actor: actor.clone(),
+                    expected: ControlRevision::ZERO,
+                    key: CommandKey::from_bytes([
+                        0xE4, 0x11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xE4; 32]),
+                },
+                input: EpisodeMutation::BindRole(BindEpisodeRole {
+                    episode: ep_live_proj.clone(),
+                    expected: live_ep.revision,
+                    active_role: same_proj_role.clone(),
+                    project_hint: None,
+                }),
+            },
+        )
+        .await
+        .expect(
+            "BindRole with project_hint: None must accept OwnedProject role for preserved project",
+        );
+    assert_eq!(
+        same_proj_bind.value.project_hint,
+        Some(live_proj_ref.clone())
+    );
+    assert_eq!(
+        same_proj_bind.value.active_role,
+        Some(same_proj_role.clone())
+    );
+    let explicit_proj_bind = fixture
+        .control
+        .update_episode(
+            owner.clone(),
+            AccountMutation {
+                identity: notarium_core::receipt::AccountCommandIdentity {
+                    owner: actor.clone(),
+                    actor: actor.clone(),
+                    expected: ControlRevision::ZERO,
+                    key: CommandKey::from_bytes([
+                        0xE4, 0x11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xE5; 32]),
+                },
+                input: EpisodeMutation::BindRole(BindEpisodeRole {
+                    episode: ep_live_proj.clone(),
+                    expected: same_proj_bind.value.revision,
+                    active_role: same_proj_role.clone(),
+                    project_hint: Some(live_proj_ref.clone()),
+                }),
+            },
+        )
+        .await
+        .expect("BindRole with explicit project_hint must accept matching OwnedProject role");
+    assert_eq!(
+        explicit_proj_bind.value.project_hint,
+        Some(live_proj_ref.clone())
+    );
+    assert_eq!(
+        explicit_proj_bind.value.active_role,
+        Some(same_proj_role.clone())
+    );
+
+    let conflicted = call_tool(
+        &owner,
+        19,
+        "rename_folder",
+        json!({"folder": "secret-folder-name-rel", "name": "docs-rel"}),
+    )
+    .await;
+    assert!(matches!(
+        conflicted,
+        Err(PortError::Domain(DomainError::PathConflict { .. }))
+    ));
+    let leaked_rows = fixture
+        .storage
+        .observer
+        .count(
+            "SELECT COUNT(*) FROM mcp_dedup \
+             WHERE safe_result LIKE '%secret-folder-name-rel%' \
+                OR safe_result LIKE '%secret-proj-slug-rel%' \
+                OR safe_result LIKE '%Secret Display Name Rel%' \
+                OR safe_result LIKE '%Updated Display Later%' \
+                OR safe_result LIKE '%docs-rel%'",
+        )
+        .await;
+    assert_eq!(
+        leaked_rows, 0,
+        "mcp_dedup.safe_result must stay content-free for folder/project renames"
+    );
+
+    // Replaying an already-committed BindRole { project_hint: None } with an OwnedProject
+    // role must still replay the committed receipt after the preserved project is trashed.
+    let trashed_live_proj = fixture
+        .canonical
+        .execute_diagnostic_write_sql_for_test(&format!(
+            "UPDATE folder_heads SET lifecycle_state='trashed' WHERE space_id='{}' AND folder_id='{}'",
+            personal.scope().space_id.as_str(),
+            target_proj.as_str(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(trashed_live_proj, 1);
+    let replayed_bind = fixture
+        .control
+        .update_episode(
+            owner.clone(),
+            AccountMutation {
+                identity: notarium_core::receipt::AccountCommandIdentity {
+                    owner: actor.clone(),
+                    actor: actor.clone(),
+                    expected: ControlRevision::ZERO,
+                    key: CommandKey::from_bytes([
+                        0xE4, 0x11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xE4; 32]),
+                },
+                input: EpisodeMutation::BindRole(BindEpisodeRole {
+                    episode: ep_live_proj.clone(),
+                    expected: live_ep.revision,
+                    active_role: same_proj_role.clone(),
+                    project_hint: None,
+                }),
+            },
+        )
+        .await
+        .expect("replaying committed BindRole after project trash must return original receipt");
+    assert_eq!(replayed_bind.revision, same_proj_bind.revision);
+    assert_eq!(replayed_bind.value.id, ep_live_proj);
+    assert!(
+        replayed_bind
+            .value
+            .diagnostics
+            .contains(&EpisodeDiagnostic::ProjectUnavailable),
+        "replayed BindRole projection after project trash must report ProjectUnavailable"
+    );
+    let replayed_explicit = fixture
+        .control
+        .update_episode(
+            owner.clone(),
+            AccountMutation {
+                identity: notarium_core::receipt::AccountCommandIdentity {
+                    owner: actor.clone(),
+                    actor: actor.clone(),
+                    expected: ControlRevision::ZERO,
+                    key: CommandKey::from_bytes([
+                        0xE4, 0x11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xE5; 32]),
+                },
+                input: EpisodeMutation::BindRole(BindEpisodeRole {
+                    episode: ep_live_proj.clone(),
+                    expected: same_proj_bind.value.revision,
+                    active_role: same_proj_role,
+                    project_hint: Some(live_proj_ref),
+                }),
+            },
+        )
+        .await
+        .expect(
+            "replaying committed BindRole with explicit project_hint after trash must return original receipt",
+        );
+    assert_eq!(replayed_explicit.revision, explicit_proj_bind.revision);
+    assert_eq!(replayed_explicit.value.id, ep_live_proj);
+    assert!(
+        replayed_explicit
+            .value
+            .diagnostics
+            .contains(&EpisodeDiagnostic::ProjectUnavailable),
+        "replayed explicit BindRole projection after project trash must report ProjectUnavailable"
+    );
+}
+
+async fn role_cursor_and_schema_regressions(fixture: &RuntimeFixture, personal: &SpaceContext) {
+    let owner = AccountContext::new(
+        fixture
+            .control
+            .trusted_none(
+                PerimeterAttestation::attest_checked()
+                    .with_human_management()
+                    .with_ability_write(),
+                budget(),
+            )
+            .await
+            .unwrap(),
+        budget(),
+    );
+    let actor = owner.auth().principal().clone();
+    let call_tool = |account: &AccountContext, seq: u8, tool: &str, args: Value| {
+        let mut key = [0xE4; 16];
+        key[15] = seq;
+        let registry = fixture.registry.clone();
+        let account = account.clone();
+        let tool = tool.to_owned();
+        async move {
+            registry
+                .call_tool(
+                    McpInvocationContext {
+                        account,
+                        target: EgressTarget::ExternalMcp,
+                        request_key: CommandKey::from_bytes(key),
+                    },
+                    &tool,
+                    args,
+                )
+                .await
+        }
+    };
+
+    // 3. Large role bound via use_role(budgetTokens=8000) must reopen cleanly in start_session.
+    let big_body = format!("# Big Role\n\n{}", "R".repeat(5_000));
+    call_tool(
+        &owner,
+        20,
+        "create_ability",
+        json!({
+            "kind": "role",
+            "name": "large-bound-role",
+            "description": "Large role body",
+            "instructions": big_body,
+            "placement": {"home": "personal"},
+        }),
+    )
+    .await
+    .unwrap();
+    let large_ep_started = call_tool(
+        &owner,
+        21,
+        "start_session",
+        json!({"task": "big-role-reopen"}),
+    )
+    .await
+    .unwrap();
+    let large_ep = large_ep_started.structured_content["session"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    call_tool(
+        &owner,
+        22,
+        "use_role",
+        json!({"name": "large-bound-role", "budgetTokens": 8000, "session": large_ep}),
+    )
+    .await
+    .unwrap();
+    let reopened = call_tool(
+        &owner,
+        23,
+        "start_session",
+        json!({"session": {"id": large_ep}}),
+    )
+    .await
+    .expect("start_session must reopen episode with 5000B role bound via budgetTokens=8000");
+    assert_eq!(
+        reopened.structured_content["activeRole"]["name"],
+        "large-bound-role"
+    );
+    assert!(
+        reopened.structured_content["activeRole"]["instructions"]
+            .as_str()
+            .unwrap()
+            .len()
+            >= 5_000
+    );
+    assert!(reopened.structured_content.get("delta").is_some());
+
+    // 4. list_abilities cursor:
+    //    (a) opaque server-side token ("ac1:<32-hex>") hides unconsented Space IDs from providers;
+    //    (b) cursor is bound to caller actor/egress target (cannot be reused across targets);
+    //    (c) unrelated chat writes in the same Space do NOT invalidate ability pagination;
+    //    (d) actual ability mutations DO invalidate the cursor with CursorStale.
+    call_tool(
+        &owner,
+        1,
+        "create_ability",
+        json!({
+            "kind": "skill",
+            "name": "cursor-skill-alpha",
+            "description": "Cursor skill A",
+            "instructions": "# Cursor A\n",
+            "placement": {"home": "personal"},
+        }),
+    )
+    .await
+    .unwrap();
+    let page1 = call_tool(
+        &owner,
+        2,
+        "list_abilities",
+        json!({"view": "authoring", "limit": 1}),
+    )
+    .await
+    .unwrap();
+    let cursor1 = page1.structured_content["nextCursor"]
+        .as_str()
+        .expect("owned abilities page 1 must emit continuation")
+        .to_owned();
+    assert!(
+        cursor1.starts_with("ac1:")
+            && cursor1.len() == 36
+            && cursor1[4..]
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+        "ability cursor must be an opaque lowercase hex token, got {cursor1:?}"
+    );
+    assert!(
+        !cursor1.contains(personal.scope().space_id.as_str()),
+        "ability cursor must not expose SpaceId"
+    );
+
+    // Deterministically reject uppercase/non-canonical hex token.
+    let upper_cursor = format!("ac1:A{}", &cursor1[5..]);
+    let bad_hex = call_tool(
+        &owner,
+        26,
+        "list_abilities",
+        json!({"view": "authoring", "limit": 1, "cursor": upper_cursor}),
+    )
+    .await
+    .map(|_| ());
+    assert!(
+        matches!(
+            bad_hex,
+            Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
+                if diagnostic.reason == notarium_core::error::ValidationReason::InvalidId
+        ),
+        "uppercase hex cursor must fail with InvalidId: {bad_hex:?}"
+    );
+
+    // Verify unconsented InAppProvider receives only an opaque token, never SpaceId,
+    // even when the underlying catalog continuation points into an unconsented Space, and
+    // verify cursor scope binding on the SAME ToolRegistry instance in both directions.
+    let unconsented_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let unconsented = loopback_provider(fixture, &owner, &unconsented_listener, 195, true).await;
+    let same_reg_ext_page = unconsented
+        .registry
+        .call_tool(
+            McpInvocationContext {
+                account: owner.clone(),
+                target: EgressTarget::ExternalMcp,
+                request_key: CommandKey::from_bytes([
+                    0xE4, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10,
+                ]),
+            },
+            "list_abilities",
+            json!({"view": "authoring", "limit": 1}),
+        )
+        .await
+        .unwrap();
+    let same_reg_ext_cursor = same_reg_ext_page.structured_content["nextCursor"]
+        .as_str()
+        .expect("ExternalMcp page on unconsented.registry must emit cursor")
+        .to_owned();
+    // Confirm the cursor is live in `unconsented.registry.ability_cursors` under ExternalMcp.
+    let same_reg_ext_next = unconsented
+        .registry
+        .call_tool(
+            McpInvocationContext {
+                account: owner.clone(),
+                target: EgressTarget::ExternalMcp,
+                request_key: CommandKey::from_bytes([
+                    0xE4, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 11,
+                ]),
+            },
+            "list_abilities",
+            json!({"view": "authoring", "limit": 1, "cursor": same_reg_ext_cursor}),
+        )
+        .await
+        .expect("cursor must redeem on the same registry under the same ExternalMcp target");
+    assert_eq!(
+        same_reg_ext_next.structured_content["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let unconsented_run_auth = owner
+        .auth()
+        .for_agent_run(
+            AgentRunId::from_bytes([195; 16]),
+            personal.scope().space_id.clone(),
+            ChatAudience::Personal,
+            owner.auth().spaces().clone(),
+        )
+        .unwrap();
+    let cross_target = unconsented
+        .registry
+        .call_tool(
+            McpInvocationContext {
+                account: AccountContext::new(unconsented_run_auth.clone(), budget()),
+                target: EgressTarget::InAppProvider {
+                    provider: unconsented.resource.id.clone(),
+                    model: unconsented.model.clone(),
+                    primary_project: None,
+                },
+                request_key: CommandKey::from_bytes([
+                    0xE4, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9,
+                ]),
+            },
+            "list_abilities",
+            json!({"view": "authoring", "limit": 1, "cursor": same_reg_ext_cursor}),
+        )
+        .await
+        .map(|_| ());
+    assert!(
+        matches!(
+            cross_target,
+            Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
+                if diagnostic.reason == notarium_core::error::ValidationReason::CursorStale
+        ),
+        "ability cursor minted for ExternalMcp must be rejected by InAppProvider on same registry: {cross_target:?}"
+    );
+    let provider_page = unconsented
+        .registry
+        .call_tool(
+            McpInvocationContext {
+                account: AccountContext::new(unconsented_run_auth, budget()),
+                target: EgressTarget::InAppProvider {
+                    provider: unconsented.resource.id.clone(),
+                    model: unconsented.model.clone(),
+                    primary_project: None,
+                },
+                request_key: CommandKey::from_bytes([
+                    0xE4, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3,
+                ]),
+            },
+            "list_abilities",
+            json!({"view": "authoring", "limit": 1}),
+        )
+        .await
+        .unwrap();
+    assert!(
+        provider_page.structured_content["items"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "unconsented Space abilities must be filtered from provider page"
+    );
+    let prov_cursor = provider_page.structured_content["nextCursor"]
+        .as_str()
+        .expect("authoring page over unconsented owned abilities must emit continuation");
+    assert!(
+        prov_cursor.starts_with("ac1:")
+            && prov_cursor.len() == 36
+            && prov_cursor[4..]
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+        "provider ability cursor must stay opaque: {prov_cursor:?}"
+    );
+    assert!(
+        !prov_cursor.contains(personal.scope().space_id.as_str()),
+        "provider ability cursor must not leak unconsented SpaceId"
+    );
+    let reverse_cross_target = unconsented
+        .registry
+        .call_tool(
+            McpInvocationContext {
+                account: owner.clone(),
+                target: EgressTarget::ExternalMcp,
+                request_key: CommandKey::from_bytes([
+                    0xE4, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 12,
+                ]),
+            },
+            "list_abilities",
+            json!({"view": "authoring", "limit": 1, "cursor": prov_cursor}),
+        )
+        .await
+        .map(|_| ());
+    assert!(
+        matches!(
+            reverse_cross_target,
+            Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
+                if diagnostic.reason == notarium_core::error::ValidationReason::CursorStale
+        ),
+        "ability cursor minted for InAppProvider must be rejected by ExternalMcp on same registry: {reverse_cross_target:?}"
+    );
+
+    // Write a chat message in the same Space (advances space.last_seq) and confirm cursor1 still works.
+    let seq_before_chat = fixture
+        .canonical
+        .read_space(&personal.scope().space_id)
+        .await
+        .unwrap()
+        .last_seq;
+    let chat_thread = ChatThreadId::from_bytes([0xE4; 16]);
+    fixture
+        .canonical
+        .create_chat(
+            personal.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: personal.scope().clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([
+                        0xE4, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xE4; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: CreateChat {
+                    thread: chat_thread.clone(),
+                    kind: ChatThreadKind::Personal,
+                    owner: actor.clone(),
+                    project_folder: None,
+                    title: "Pagination survival chat".into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    fixture
+        .canonical
+        .submit_user_chat_input(
+            personal.clone(),
+            SubmitUserChatInput {
+                identity: CommandIdentity {
+                    scope: personal.scope().clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([
+                        0xE4, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xE5; 32]),
+                },
+                id: PendingInputId::from_bytes([0xE5; 16]),
+                thread: chat_thread,
+                expected_leaf: ThreadEntrySeq::ZERO,
+                body: "Chat write advancing space.last_seq".into(),
+                mentions_agent: false,
+            },
+        )
+        .await
+        .unwrap();
+    let seq_after_chat = fixture
+        .canonical
+        .read_space(&personal.scope().space_id)
+        .await
+        .unwrap()
+        .last_seq;
+    assert!(seq_after_chat > seq_before_chat);
+
+    let page2 = call_tool(
+        &owner,
+        6,
+        "list_abilities",
+        json!({"view": "authoring", "limit": 1, "cursor": cursor1}),
+    )
+    .await
+    .expect("chat write in same Space must not invalidate list_abilities cursor");
+    assert_eq!(
+        page2.structured_content["items"].as_array().unwrap().len(),
+        1
+    );
+    assert_ne!(
+        page2.structured_content["items"][0]["ref"],
+        page1.structured_content["items"][0]["ref"]
+    );
+
+    // An actual ability mutation in the Space must invalidate cursor1 with CursorStale.
+    call_tool(
+        &owner,
+        7,
+        "create_ability",
+        json!({
+            "kind": "skill",
+            "name": "cursor-skill-beta",
+            "description": "Invalidates cursor",
+            "instructions": "# Cursor B\n",
+            "placement": {"home": "personal"},
+        }),
+    )
+    .await
+    .unwrap();
+    let stale_after_ability = call_tool(
+        &owner,
+        8,
+        "list_abilities",
+        json!({"view": "authoring", "limit": 1, "cursor": cursor1}),
+    )
+    .await
+    .map(|_| ());
+    assert!(
+        matches!(
+            stale_after_ability,
+            Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
+                if diagnostic.reason == notarium_core::error::ValidationReason::CursorStale
+        ),
+        "ability mutation must invalidate ability cursor with CursorStale: {stale_after_ability:?}"
+    );
+
+    // 5. Provider tool schemas preserve integer bounds and const boolean constraints.
+    let provider_run_auth = owner
+        .auth()
+        .for_agent_run(
+            AgentRunId::from_bytes([196; 16]),
+            personal.scope().space_id.clone(),
+            ChatAudience::Personal,
+            owner.auth().spaces().clone(),
+        )
+        .unwrap();
+    let tools = fixture.registry.provider_tools(&provider_run_auth);
+    let list_notes_tool = tools
+        .iter()
+        .find(|t| t.name == "list_notes")
+        .expect("list_notes published");
+    let ProviderToolSchema::Object { properties, .. } = &list_notes_tool.parameters else {
+        panic!("list_notes parameters must be an object");
+    };
+    assert!(
+        matches!(
+            properties.get("limit"),
+            Some(ProviderToolSchema::Integer {
+                minimum: Some(1),
+                maximum: Some(100),
+            })
+        ),
+        "list_notes.limit must publish integer bounds 1..=100"
+    );
+    let create_note_tool = tools
+        .iter()
+        .find(|t| t.name == "create_note")
+        .expect("create_note published");
+    let ProviderToolSchema::Object { properties, .. } = &create_note_tool.parameters else {
+        panic!("create_note parameters must be an object");
+    };
+    assert!(
+        matches!(
+            properties.get("folderPage"),
+            Some(ProviderToolSchema::ConstBool(true))
+        ),
+        "create_note.folderPage must publish const true"
     );
 }

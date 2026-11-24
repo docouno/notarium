@@ -606,10 +606,70 @@ pub(crate) async fn create_note_impl(
     {
         return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
     }
-    let slug_fold = super::folder_cover::validate_create(&request.input)?;
     if request.input.class == DocClass::Skill {
         ctx.auth().authorize_ability_mutation()?;
     }
+    let slug_fold = match super::folder_cover::validate_create(&request.input) {
+        Ok(slug_fold) => slug_fold,
+        Err(validate_err) => {
+            // Historical v1 spaces allowed ordinary notes with slug `index`.
+            // Preserve idempotent replay for those legacy receipts before
+            // rejecting new `index` writes without `folder_page: true`.
+            if !request.input.folder_page
+                && crate::codec::normalize_slug_key(&request.input.slug)
+                    .ok()
+                    .as_deref()
+                    == Some(super::folder_cover::SLUG)
+                && let Ok(info) = analyze_and_prepare_carrier(
+                    &request.input.carrier,
+                    request.input.class,
+                    &request.input.note,
+                    &request.input.slug,
+                    store.blob_codec(),
+                )
+            {
+                ctx.budget.remaining = deadline.remaining(&budget)?;
+                if let Ok(Ok(space_rec)) = deadline
+                    .wait(&budget, || {
+                        authorize_create_placement(
+                            store,
+                            &ctx,
+                            request.input.parent.clone(),
+                            request.input.class,
+                        )
+                    })
+                    .await
+                {
+                    let created = v1_receipts::CreatedNote::from_input(
+                        &request.input,
+                        &space_rec.root_folder_id,
+                        info.prepared_blob.digest,
+                    );
+                    let idemp = create_note_identity(
+                        &ctx,
+                        &request.identity,
+                        &request.input,
+                        &space_rec.root_folder_id,
+                        info.prepared_blob.digest,
+                    );
+                    if !idemp.has_confirmed_chat_step() {
+                        ctx.budget.remaining = deadline.remaining(&budget)?;
+                        let legacy = v1_receipts::LegacyNoteCommand::Create(created);
+                        if let Some(committed) = deadline
+                            .wait(&budget, || {
+                                legacy.replay_if_present(store, &ctx, &request.identity, &idemp)
+                            })
+                            .await??
+                        {
+                            deadline.remaining(&budget)?;
+                            return Ok(committed);
+                        }
+                    }
+                }
+            }
+            return Err(validate_err);
+        }
+    };
 
     let info = analyze_and_prepare_carrier(
         &request.input.carrier,

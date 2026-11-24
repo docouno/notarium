@@ -551,8 +551,12 @@ impl Input {
             Self::Choice(values) => ProviderToolSchema::String {
                 choices: values.iter().map(|value| (*value).to_owned()).collect(),
             },
-            Self::Integer { .. } => ProviderToolSchema::Integer,
-            Self::Boolean | Self::True => ProviderToolSchema::Boolean,
+            Self::Integer { min, max } => ProviderToolSchema::Integer {
+                minimum: Some(*min),
+                maximum: Some(*max),
+            },
+            Self::Boolean => ProviderToolSchema::Boolean,
+            Self::True => ProviderToolSchema::ConstBool(true),
             Self::Null => ProviderToolSchema::Null,
             Self::Array { item, max, .. } => ProviderToolSchema::Array {
                 items: Box::new(item.provider_schema()),

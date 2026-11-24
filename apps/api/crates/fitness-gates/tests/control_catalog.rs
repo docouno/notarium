@@ -246,7 +246,7 @@ async fn exercise(pg: bool) {
                 RenameProject {
                     folder: FolderId::from_bytes([2; 16]),
                     name: "renamed-project".into(),
-                    display_name: "Renamed project".into(),
+                    display_name: Some("Renamed project".into()),
                 },
             ),
         )

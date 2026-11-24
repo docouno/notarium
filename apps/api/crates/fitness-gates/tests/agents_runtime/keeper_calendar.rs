@@ -207,7 +207,7 @@ pub(super) async fn calendar_scope_and_orphan(fixture: &mut RuntimeFixture, spac
         .unwrap()
         .active_epoch;
     let project = FolderRef {
-        space_id: personal,
+        space_id: personal.clone(),
         folder_id: FolderId::from_bytes([119; 16]),
     };
     fixture
@@ -243,7 +243,7 @@ pub(super) async fn calendar_scope_and_orphan(fixture: &mut RuntimeFixture, spac
                     schedule: weekly.id.clone(),
                     expected: schedule.revision,
                     definition: schedule.definition,
-                    approved_skills: Some(approval.approved_skills),
+                    approved_skills: Some(approval.approved_skills.clone()),
                     next_slot: schedule.next_slot,
                     paused: false,
                 },
@@ -424,8 +424,11 @@ pub(super) async fn calendar_scope_and_orphan(fixture: &mut RuntimeFixture, spac
     // The reconciler shares the writer-slot registry with the previous owner.
     // An expired receipt alone cannot prove that the registered owner is gone.
     let shared = Arc::new(SharedAuthority::new(fixture.revocations.clone()));
-    let other =
-        KeeperScheduler::new_clustered(registry, fixture.revocations.clone(), shared.clone());
+    let other = KeeperScheduler::new_clustered(
+        registry.clone(),
+        fixture.revocations.clone(),
+        shared.clone(),
+    );
     set_clock(orphan_slot);
     let live = shared
         .acquire_slot(
@@ -495,6 +498,167 @@ pub(super) async fn calendar_scope_and_orphan(fixture: &mut RuntimeFixture, spac
             .await
             .is_err()
     );
+
+    // One-shot tick(now) with 9 due minute schedules crossing a minute boundary while
+    // the 9th schedule waits behind the 8-worker semaphore must refresh its next-slot
+    // witness and execute all 9 runs instead of dropping the 9th as `raced`.
+    let minute_slot = parse("2026-12-02T12:00:00Z");
+    let tick_before_boundary = parse("2026-12-02T12:00:59Z");
+    let clock_after_boundary = parse("2026-12-02T12:01:01Z");
+    set_clock(minute_slot);
+    let mut queued_ids = Vec::new();
+    for idx in 0..9u8 {
+        let tag = 200 + idx;
+        let created = create(
+            fixture,
+            tag,
+            new_schedule(
+                tag,
+                &format!("Minute rollover keeper {idx}"),
+                "0 * * * * * *",
+                "UTC",
+                minute_slot,
+            ),
+        )
+        .await;
+        queued_ids.push(created.id);
+    }
+    set_clock(tick_before_boundary);
+    let rollover_provider = async {
+        let mut first_eight = Vec::with_capacity(8);
+        for _ in 0..8 {
+            let (socket, _) = timeout(Duration::from_secs(10), read_request(&listener))
+                .await
+                .expect("expected first 8 concurrent keeper requests");
+            first_eight.push(socket);
+        }
+        // Hold all 8 worker permits past the minute boundary so the 9th schedule
+        // acquires its permit after Control's clock has entered 12:01:01Z.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        set_clock(clock_after_boundary);
+        for mut socket in first_eight {
+            send_ollama(
+                &mut socket,
+                json!({"role": "assistant", "content": "Batch worker done"}),
+                "stop",
+            )
+            .await;
+        }
+        let (mut ninth_socket, _) = timeout(Duration::from_secs(10), read_request(&listener))
+            .await
+            .expect("9th keeper must refresh next_slot after waiting past minute boundary");
+        send_ollama(
+            &mut ninth_socket,
+            json!({"role": "assistant", "content": "Ninth worker done"}),
+            "stop",
+        )
+        .await;
+    };
+    let rollover_scheduler = KeeperScheduler::new_local(
+        registry.clone(),
+        fixture.revocations.clone(),
+        ExclusiveDataRoot::attest_open_writer(),
+    );
+    let (rollover_summary, ()) = tokio::join!(
+        rollover_scheduler.tick(tick_before_boundary),
+        rollover_provider
+    );
+    let rollover_summary = rollover_summary.unwrap();
+    assert_eq!(
+        (
+            rollover_summary.claimed,
+            rollover_summary.succeeded,
+            rollover_summary.raced,
+            rollover_summary.errors
+        ),
+        (9, 9, 0, 0),
+        "all 9 minute schedules must claim and succeed across minute rollover: {rollover_summary:?}"
+    );
+    for (idx, id) in queued_ids.into_iter().enumerate() {
+        let current = fixture
+            .control
+            .get_schedule(space.clone(), id.clone())
+            .await
+            .unwrap();
+        fixture
+            .control
+            .delete_schedule(
+                fixture.human.clone(),
+                AccountMutation {
+                    identity: identity(fixture, &fixture.human, 210 + idx as u8).await,
+                    input: DeleteSchedule {
+                        schedule: id,
+                        expected: current.revision,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    // One-shot tick(now) where caller's `now` lags Control's clock across a cron boundary
+    // without waiting a full wall-clock second must still step the witness past the
+    // rejected slot and execute cleanly with zero errors.
+    let lag_slot = parse("2026-12-02T12:10:00Z");
+    let lag_now = parse("2026-12-02T12:10:59Z");
+    let lag_control_clock = parse("2026-12-02T12:11:01Z");
+    set_clock(lag_slot);
+    let lag_schedule = create(
+        fixture,
+        219,
+        new_schedule(
+            219,
+            "Lagging witness minute keeper",
+            "0 * * * * * *",
+            "UTC",
+            lag_slot,
+        ),
+    )
+    .await;
+    set_clock(lag_control_clock);
+    let lag_provider = async {
+        let (mut socket, _) = timeout(Duration::from_secs(10), read_request(&listener))
+            .await
+            .expect("lagging tick(now) must refresh witness past minute boundary");
+        send_ollama(
+            &mut socket,
+            json!({"role": "assistant", "content": "Lagging witness done"}),
+            "stop",
+        )
+        .await;
+    };
+    let (lag_summary, ()) = tokio::join!(rollover_scheduler.tick(lag_now), lag_provider);
+    let lag_summary = lag_summary.unwrap();
+    assert_eq!(
+        (
+            lag_summary.claimed,
+            lag_summary.succeeded,
+            lag_summary.raced,
+            lag_summary.errors
+        ),
+        (1, 1, 0, 0),
+        "tick(now) lagging Control's clock across cron boundary must still claim and succeed: {lag_summary:?}"
+    );
+    let lag_current = fixture
+        .control
+        .get_schedule(space.clone(), lag_schedule.id.clone())
+        .await
+        .unwrap();
+    fixture
+        .control
+        .delete_schedule(
+            fixture.human.clone(),
+            AccountMutation {
+                identity: identity(fixture, &fixture.human, 220).await,
+                input: DeleteSchedule {
+                    schedule: lag_schedule.id,
+                    expected: lag_current.revision,
+                },
+            },
+        )
+        .await
+        .unwrap();
+
     // Personal defaults take precedence over project settings. Retire this
     // fixture's preference before the next provider scenario.
     fixture.storage.observer.execute(

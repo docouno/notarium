@@ -678,7 +678,9 @@ pub(crate) async fn rename_project_impl(
     validate_mutation_identity(&ctx, &request.identity)?;
     crate::domain::common::require_revision_only(&request.preconditions)?;
     let new_slug_fold = normalize_slug_key(&request.input.name)?;
-    if request.input.display_name.trim().is_empty() {
+    if let Some(display_name) = &request.input.display_name
+        && (display_name.trim().is_empty() || display_name.chars().any(char::is_control))
+    {
         return Err(DomainError::validation(ValidationReason::InvalidPathComponent).into());
     }
     let target_write_class = folder_mutation_class(ctx.auth(), &ctx.scope().space_id)?;
@@ -689,12 +691,18 @@ pub(crate) async fn rename_project_impl(
         .await?;
     space_rec.scope.check(ctx.scope())?;
 
-    let fp = format!(
-        "folder={}\0name={}\0display={}",
-        request.input.folder.as_str(),
-        request.input.name,
-        request.input.display_name
-    );
+    let fp = match &request.input.display_name {
+        Some(display_name) => format!(
+            "folder={}\0name={}\0display={display_name}",
+            request.input.folder.as_str(),
+            request.input.name,
+        ),
+        None => format!(
+            "folder={}\0name={}\0display_keep=1",
+            request.input.folder.as_str(),
+            request.input.name,
+        ),
+    };
     let idemp =
         derive_command_identity_spec(&ctx, &request.identity, "rename_project", fp.as_bytes())
             .with_preconditions(
@@ -791,6 +799,20 @@ pub(crate) async fn rename_project_impl(
                     .into());
                 }
 
+                let effective_display_name = match &input.display_name {
+                    Some(name) => name.clone(),
+                    None => {
+                        if folder_row.display_name.trim().is_empty()
+                            || folder_row.display_name.chars().any(char::is_control)
+                        {
+                            return Err(DomainError::validation(
+                                ValidationReason::InvalidPathComponent,
+                            )
+                            .into());
+                        }
+                        folder_row.display_name.clone()
+                    }
+                };
                 let seq = item_ctx.alloc_next_seq()?;
                 let new_rev = new_revision_id()?;
                 let now_ts = now_utc_timestamp()?;
@@ -809,7 +831,7 @@ pub(crate) async fn rename_project_impl(
                         )
                         .bind(&input.name)
                         .bind(&new_slug_fold)
-                        .bind(&input.display_name)
+                        .bind(&effective_display_name)
                         .bind(&input.name)
                         .bind(&new_slug_fold)
                         .bind(new_rev.as_str())
@@ -835,7 +857,7 @@ pub(crate) async fn rename_project_impl(
                         )
                         .bind(&input.name)
                         .bind(&new_slug_fold)
-                        .bind(&input.display_name)
+                        .bind(&effective_display_name)
                         .bind(&input.name)
                         .bind(&new_slug_fold)
                         .bind(new_rev.as_str())
@@ -873,7 +895,7 @@ pub(crate) async fn rename_project_impl(
                         is_root: false,
                         slug: input.name.clone(),
                         slug_fold: new_slug_fold,
-                        display_name: input.display_name,
+                        display_name: effective_display_name,
                         is_project: true,
                         project_slug: Some(input.name),
                         description: folder_row.description,

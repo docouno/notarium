@@ -213,7 +213,12 @@ impl ControlService {
                 validate(&info.definition, request.next_slot, RunLimits::HARD_CEILING, false)?;
 
                 let scope = ScheduleScope::from(&info.definition);
-                let log_id = schedule_log_id(&request.schedule, &space, scope.project.map(|p| &p.folder_id));
+                let log_id = schedule_log_id(
+                    &request.schedule,
+                    &row.owner_id,
+                    &space,
+                    scope.project.map(|p| &p.folder_id),
+                );
                 let (reason, admitted) = if !info.definition.limits.fits(self.config.schedule_limits) {
                     (Some(SchedulePauseReason::BudgetExceeded), None)
                 } else if let Some((auth, admission)) = source {

@@ -187,6 +187,7 @@ pub struct ToolRegistry {
     vector_search: bool,
     bootstrap: session::BootstrapContinuations,
     note_cursors: read_tools::NoteCursors,
+    ability_cursors: ability_tools::AbilityCursors,
 }
 
 impl ToolRegistry {
@@ -246,6 +247,7 @@ impl ToolRegistry {
             vector_search: false,
             bootstrap: Default::default(),
             note_cursors: Default::default(),
+            ability_cursors: Default::default(),
         }
     }
 

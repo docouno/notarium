@@ -53,8 +53,36 @@ struct FolderRoute {
 enum FolderOperation {
     Unchanged,
     Move { parent: FolderId },
-    Rename { name: String },
-    RenameProject { slug: String, display_name: String },
+    Rename,
+    RenameProject,
+}
+
+enum ParsedFolderArgs {
+    Move(MoveArgs),
+    Rename(RenameArgs),
+    RenameProject(RenameProjectArgs),
+}
+
+fn parse_args(name: ToolName, args: Value) -> Result<ParsedFolderArgs, PortError> {
+    match name {
+        ToolName::MoveFolder => Ok(ParsedFolderArgs::Move(decode(args)?)),
+        ToolName::RenameFolder => {
+            let args: RenameArgs = decode(args)?;
+            validate_component(&args.name)?;
+            Ok(ParsedFolderArgs::Rename(args))
+        }
+        ToolName::RenameProject => {
+            let args: RenameProjectArgs = decode(args)?;
+            validate_component(&args.slug)?;
+            if let Some(display_name) = &args.display_name
+                && (display_name.trim().is_empty() || display_name.chars().any(char::is_control))
+            {
+                return Err(invalid(ValidationReason::InvalidPathComponent));
+            }
+            Ok(ParsedFolderArgs::RenameProject(args))
+        }
+        _ => Err(DomainError::ResourceNotFound.into()),
+    }
 }
 
 impl FolderRoute {
@@ -193,12 +221,10 @@ async fn snapshot_by_id(
 
 async fn plan(
     call: &ToolCallContext<'_>,
-    name: ToolName,
-    args: Value,
+    parsed: &ParsedFolderArgs,
 ) -> Result<FolderRoute, PortError> {
-    match name {
-        ToolName::MoveFolder => {
-            let args: MoveArgs = decode(args)?;
+    match parsed {
+        ParsedFolderArgs::Move(args) => {
             let address =
                 FolderAddress::open(call, args.project.as_deref(), args.session.as_ref()).await?;
             let source = address.resolve(call, &args.folder).await?;
@@ -213,9 +239,7 @@ async fn plan(
             };
             FolderRoute::new(source, operation)
         }
-        ToolName::RenameFolder => {
-            let args: RenameArgs = decode(args)?;
-            validate_component(&args.name)?;
+        ParsedFolderArgs::Rename(args) => {
             let address =
                 FolderAddress::open(call, args.project.as_deref(), args.session.as_ref()).await?;
             let source = address.resolve(call, &args.folder).await?;
@@ -223,34 +247,28 @@ async fn plan(
             let operation = if same_name(&source, &args.name, &args.name) {
                 FolderOperation::Unchanged
             } else {
-                FolderOperation::Rename { name: args.name }
+                FolderOperation::Rename
             };
             FolderRoute::new(source, operation)
         }
-        ToolName::RenameProject => {
-            let args: RenameProjectArgs = decode(args)?;
-            validate_component(&args.slug)?;
+        ParsedFolderArgs::RenameProject(args) => {
             let project = session::resolve_project(call, &args.project).await?;
             let scope = session::space(call, &project.folder.space_id).await?;
             let source = snapshot_by_id(call, &scope, &project.folder.folder_id).await?;
             admit_folder_snapshot(call, &scope, &source).await?;
-            let display_name = args.display_name.unwrap_or_else(|| source.name.clone());
+            let display_name = args.display_name.as_deref().unwrap_or(&source.name);
             if display_name.trim().is_empty() || display_name.chars().any(char::is_control) {
                 return Err(invalid(ValidationReason::InvalidPathComponent));
             }
             let operation = if project.project_slug == args.slug
-                && same_name(&source, &args.slug, &display_name)
+                && same_name(&source, &args.slug, display_name)
             {
                 FolderOperation::Unchanged
             } else {
-                FolderOperation::RenameProject {
-                    slug: args.slug,
-                    display_name,
-                }
+                FolderOperation::RenameProject
             };
             FolderRoute::new(source, operation)
         }
-        _ => Err(DomainError::ResourceNotFound.into()),
     }
 }
 
@@ -307,16 +325,15 @@ pub(super) async fn handle(
     name: ToolName,
     args: Value,
 ) -> Result<Value, PortError> {
-    let route = call
-        .journal("folder-route", || plan(call, name, args))
-        .await?;
+    let parsed = parse_args(name, args)?;
+    let route = call.journal("folder-route", || plan(call, &parsed)).await?;
     let scope = call.space(route.scope.clone())?;
     if matches!(
         call.target,
         super::super::EgressTarget::InAppProvider { .. }
     ) {
-        let live_source = snapshot_by_id(call, &scope, &route.folder).await?;
-        admit_folder_snapshot(call, &scope, &live_source).await?;
+        let source = snapshot_by_id(call, &scope, &route.folder).await?;
+        admit_folder_snapshot(call, &scope, &source).await?;
         if let FolderOperation::Move { parent } = &route.operation {
             let live_dest = snapshot_by_id(call, &scope, parent).await?;
             admit_folder_snapshot(call, &scope, &live_dest).await?;
@@ -328,8 +345,8 @@ pub(super) async fn handle(
         ..Preconditions::default()
     };
     let folder = route.folder;
-    let committed = match route.operation {
-        FolderOperation::Move { parent } => Some(
+    let committed = match (route.operation, parsed) {
+        (FolderOperation::Move { parent }, ParsedFolderArgs::Move(_)) => Some(
             call.registry
                 .engine
                 .move_folder(
@@ -345,7 +362,7 @@ pub(super) async fn handle(
                 )
                 .await?,
         ),
-        FolderOperation::Rename { name } => Some(
+        (FolderOperation::Rename, ParsedFolderArgs::Rename(args)) => Some(
             call.registry
                 .engine
                 .rename_folder(
@@ -355,13 +372,13 @@ pub(super) async fn handle(
                         preconditions,
                         input: RenameFolder {
                             folder: folder.clone(),
-                            name,
+                            name: args.name,
                         },
                     },
                 )
                 .await?,
         ),
-        FolderOperation::RenameProject { slug, display_name } => Some(
+        (FolderOperation::RenameProject, ParsedFolderArgs::RenameProject(args)) => Some(
             call.registry
                 .engine
                 .rename_project(
@@ -371,14 +388,15 @@ pub(super) async fn handle(
                         preconditions,
                         input: RenameProject {
                             folder: folder.clone(),
-                            name: slug,
-                            display_name,
+                            name: args.slug,
+                            display_name: args.display_name,
                         },
                     },
                 )
                 .await?,
         ),
-        FolderOperation::Unchanged => None,
+        (FolderOperation::Unchanged, _) => None,
+        _ => return Err(invalid(ValidationReason::SourceMismatch)),
     };
     if let Some(committed) = &committed {
         route.scope.check(committed.receipt.scope())?;

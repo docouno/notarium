@@ -18,9 +18,9 @@ use notarium_core::{
     model::{FolderRef, NoteRef},
     ports::{
         AccountMutation, AckOwner, AgentEpisode, BearerScope, CatalogDisclosure,
-        ControlPageRequest, EpisodeRevisionGuard, EpisodeSelector, EpisodeStartResult, GetNote,
-        MAX_PROJECT_BOOTSTRAP_VALUES, NoteMetadataSnapshot, NoteSnapshot, PageLimit,
-        ProviderErrorCode, SpaceContext, StartEpisode,
+        ControlPageRequest, EpisodeDiagnostic, EpisodeRevisionGuard, EpisodeSelector,
+        EpisodeStartResult, GetNote, MAX_PROJECT_BOOTSTRAP_VALUES, NoteMetadataSnapshot,
+        NoteSnapshot, PageLimit, ProviderErrorCode, SpaceContext, StartEpisode,
     },
     receipt::CausalBasis,
 };
@@ -118,22 +118,43 @@ pub(super) async fn selected_project_for_hint(
     Ok(target)
 }
 
+pub(super) async fn selected_project_for_episode(
+    call: &ToolCallContext<'_>,
+    project: Option<&str>,
+    episode: Option<&AgentEpisode>,
+) -> Result<Option<FolderRef>, PortError> {
+    if project.is_none()
+        && episode.is_some_and(|value| {
+            value
+                .diagnostics
+                .contains(&EpisodeDiagnostic::ProjectUnavailable)
+        })
+    {
+        return Err(DomainError::ResourceNotFound.into());
+    }
+    selected_project_for_hint(
+        call,
+        project,
+        episode.and_then(|value| value.project_hint.as_ref()),
+    )
+    .await
+}
+
 pub(super) async fn selected_project(
     call: &ToolCallContext<'_>,
     project: Option<&str>,
     episode: Option<&EpisodeId>,
 ) -> Result<Option<FolderRef>, PortError> {
-    let episode_project = match episode {
-        Some(id) => {
+    let loaded = match episode {
+        Some(id) => Some(
             call.registry
                 .control
                 .get_episode(call.account(), id.clone())
-                .await?
-                .project_hint
-        }
+                .await?,
+        ),
         None => None,
     };
-    selected_project_for_hint(call, project, episode_project.as_ref()).await
+    selected_project_for_episode(call, project, loaded.as_ref()).await
 }
 
 async fn whoami(call: &mut ToolCallContext<'_>) -> Result<Value, PortError> {

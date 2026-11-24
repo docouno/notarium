@@ -42,7 +42,176 @@ async fn exercise(pg: bool) {
         .expect("the fixture owner has a Personal Space");
     let ctx = SpaceContext::new(fixture.human.auth().clone(), personal.history, budget()).unwrap();
     Box::pin(compact_prefix_preserving_recent_context(&fixture, &ctx)).await;
+    Box::pin(long_branch_compaction_prefix_stays_within_snapshot_budget(
+        &fixture, &ctx, pg,
+    ))
+    .await;
     fixture.close().await;
+}
+
+async fn long_branch_compaction_prefix_stays_within_snapshot_budget(
+    fixture: &RuntimeFixture,
+    personal: &SpaceContext,
+    pg: bool,
+) {
+    let scope = personal.scope();
+    let actor = fixture.human.auth().principal();
+    let thread = ChatThreadId::from_bytes([139; 16]);
+    fixture
+        .canonical
+        .create_chat(
+            personal.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: scope.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([139; 16]),
+                    hash: ContentDigest::from_bytes([139; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: CreateChat {
+                    thread: thread.clone(),
+                    kind: ChatThreadKind::Personal,
+                    owner: actor.clone(),
+                    project_folder: None,
+                    title: "Long branch compaction".into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+    const TOTAL: u64 = 25_600;
+    let insert_sql = if pg {
+        format!(
+            "INSERT INTO chat_entries(
+                space_id, thread_id, entry_seq, parent_seq, revision_id, kind,
+                tool_call_id, author_id, agent_run_id, inline_text, payload_blake3,
+                referenced_notes_json, ext_space_tainted, is_chain_node, branch_depth,
+                anc_16_seq, anc_256_seq, created_space_seq, redacted_at_seq,
+                checkpoint_stale, human_origin, body_format, provenance_json
+            )
+            SELECT '{space}', '{thread}', g, CASE WHEN g = 1 THEN NULL ELSE g - 1 END,
+                   'rev_' || lpad(to_hex(g), 32, '0'), 'human',
+                   NULL, '{actor}', NULL, 'msg-' || g::text, NULL,
+                   '[]', 0, 1, g - 1,
+                   CASE WHEN g > 16 THEN g - 16 ELSE NULL END,
+                   CASE WHEN g > 256 THEN g - 256 ELSE NULL END,
+                   1, NULL, 0, 1, 0, NULL
+            FROM generate_series(1, {TOTAL}) AS g",
+            space = scope.space_id.as_str(),
+            thread = thread.as_str(),
+            actor = actor.as_str(),
+        )
+    } else {
+        format!(
+            "WITH RECURSIVE seq(g) AS (
+                SELECT 1
+                UNION ALL
+                SELECT g + 1 FROM seq WHERE g < {TOTAL}
+            )
+            INSERT INTO chat_entries(
+                space_id, thread_id, entry_seq, parent_seq, revision_id, kind,
+                tool_call_id, author_id, agent_run_id, inline_text, payload_blake3,
+                referenced_notes_json, ext_space_tainted, is_chain_node, branch_depth,
+                anc_16_seq, anc_256_seq, created_space_seq, redacted_at_seq,
+                checkpoint_stale, human_origin, body_format, provenance_json
+            )
+            SELECT '{space}', '{thread}', g, CASE WHEN g = 1 THEN NULL ELSE g - 1 END,
+                   'rev_' || printf('%032x', g), 'human',
+                   NULL, '{actor}', NULL, 'msg-' || g, NULL,
+                   '[]', 0, 1, g - 1,
+                   CASE WHEN g > 16 THEN g - 16 ELSE NULL END,
+                   CASE WHEN g > 256 THEN g - 256 ELSE NULL END,
+                   1, NULL, 0, 1, 0, NULL
+            FROM seq",
+            space = scope.space_id.as_str(),
+            thread = thread.as_str(),
+            actor = actor.as_str(),
+        )
+    };
+    let inserted = fixture
+        .canonical
+        .execute_diagnostic_write_sql_for_test(&insert_sql)
+        .await
+        .unwrap();
+    assert_eq!(inserted, TOTAL);
+    fixture
+        .canonical
+        .execute_diagnostic_write_sql_for_test(&format!(
+            "UPDATE chat_threads SET head_leaf_seq={TOTAL} WHERE space_id='{}' AND thread_id='{}'",
+            scope.space_id.as_str(),
+            thread.as_str(),
+        ))
+        .await
+        .unwrap();
+
+    let prefix = fixture
+        .canonical
+        .read_chat_compaction_prefix(
+            personal.clone(),
+            ChatRead {
+                thread: thread.clone(),
+                leaf: ThreadEntrySeq::new(TOTAL).unwrap(),
+                before: None,
+                max_entries: PageLimit::new(200).unwrap(),
+            },
+        )
+        .await
+        .expect("25,600-entry thread must resolve oldest compaction prefix within snapshot budget");
+    assert!(prefix.has_tail);
+    assert_eq!(prefix.branch.entries.len(), 200);
+    assert_eq!(
+        prefix.branch.entries[0].seq,
+        ThreadEntrySeq::new(1).unwrap()
+    );
+    assert_eq!(
+        prefix.branch.entries[199].seq,
+        ThreadEntrySeq::new(200).unwrap()
+    );
+
+    // Place a prefix compaction checkpoint at seq 25,500 covering through seq 200,
+    // and verify the second pass resumes accurately at seq 201..=399.
+    let cp_prov = r#"{"origins":[],"projects":[],"compacts_through":200}"#;
+    let updated = fixture
+        .canonical
+        .execute_diagnostic_write_sql_for_test(&format!(
+            "UPDATE chat_entries SET kind='compaction', provenance_json='{cp_prov}' WHERE space_id='{}' AND thread_id='{}' AND entry_seq=25500",
+            scope.space_id.as_str(),
+            thread.as_str(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(updated, 1);
+
+    let after_cp = fixture
+        .canonical
+        .read_chat_compaction_prefix(
+            personal.clone(),
+            ChatRead {
+                thread,
+                leaf: ThreadEntrySeq::new(TOTAL).unwrap(),
+                before: None,
+                max_entries: PageLimit::new(200).unwrap(),
+            },
+        )
+        .await
+        .expect("prefix scan with compacts_through must succeed within snapshot budget");
+    assert!(after_cp.has_tail);
+    assert_eq!(after_cp.branch.entries.len(), 200);
+    assert_eq!(
+        after_cp.branch.entries[0].seq,
+        ThreadEntrySeq::new(25_500).unwrap()
+    );
+    assert_eq!(after_cp.branch.entries[0].kind, ChatEntryKind::Compaction);
+    assert_eq!(
+        after_cp.branch.entries[1].seq,
+        ThreadEntrySeq::new(201).unwrap()
+    );
+    assert_eq!(
+        after_cp.branch.entries[199].seq,
+        ThreadEntrySeq::new(399).unwrap()
+    );
 }
 
 async fn compact_prefix_preserving_recent_context(

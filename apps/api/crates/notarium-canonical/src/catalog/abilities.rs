@@ -572,9 +572,24 @@ pub(super) async fn page(
                         Ok(_) | Err(PortError::Domain(DomainError::ResourceNotFound)) => continue,
                         Err(e) => return Err(e),
                     };
+                    let catalog_version: (i64, i64, i64, i64) = db!(
+                        read tx,
+                        sqlx::query_as(
+                            "SELECT \
+                                (SELECT COALESCE(MAX(updated_seq), 0) FROM ability_packages WHERE space_id = $1), \
+                                (SELECT COUNT(*) FROM ability_packages WHERE space_id = $1), \
+                                (SELECT COALESCE(MAX(nh.updated_seq), 0) \
+                                 FROM ability_packages ap \
+                                 JOIN note_heads nh ON nh.space_id = ap.space_id AND nh.note_id = ap.entrypoint_note_id \
+                                 WHERE ap.space_id = $1), \
+                                (SELECT COALESCE(MAX(updated_seq), 0) FROM folder_heads WHERE space_id = $1)"
+                        ),
+                        fetch_one,
+                        space.space.id.as_str()
+                    )?;
                     versions.push((
                         space.scope.clone(),
-                        space.last_seq,
+                        catalog_version,
                         grant.project_root.clone(),
                     ));
                     live.push(space);

@@ -162,11 +162,15 @@ fn scoped_receipt(
 
 fn schedule_log_id(
     schedule: &ScheduleId,
+    owner: &str,
     space: &SpaceId,
     project: Option<&FolderId>,
 ) -> ChatThreadId {
     let mut hash = blake3::Hasher::new_derive_key("notarium-v1-keeper-log-scope");
     hash.update(schedule.as_str().as_bytes());
+    hash.update(&[0]);
+    hash.update(owner.as_bytes());
+    hash.update(&[0]);
     hash.update(space.as_str().as_bytes());
     match project {
         Some(folder) => {
@@ -241,7 +245,12 @@ impl ControlService {
             return Err(denied());
         }
         let (space, grant) = auth.spaces().iter().next().ok_or_else(denied)?;
-        let expected_log = schedule_log_id(schedule, space, grant.project_root.as_ref());
+        let expected_log = schedule_log_id(
+            schedule,
+            auth.principal().as_str(),
+            space,
+            grant.project_root.as_ref(),
+        );
         if auth.keeper_log() != Some(&expected_log) {
             return Err(denied());
         }
@@ -424,7 +433,7 @@ impl ControlService {
         let info = schedule_info(&current)?;
         let scope = ScheduleScope::from(&info.definition);
         let project_folder = scope.project.map(|project| project.folder_id.clone());
-        let log = schedule_log_id(id, &space, project_folder.as_ref());
+        let log = schedule_log_id(id, &current.owner_id, &space, project_folder.as_ref());
         if running.keeper_log_id.as_deref() != Some(log.as_str())
             || running.keeper_project_folder_id.as_deref()
                 != project_folder.as_ref().map(FolderId::as_str)

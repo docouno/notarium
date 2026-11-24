@@ -472,6 +472,211 @@ async fn supervised_turn_survives_disconnect_and_stops_cleanly(
         "Partial before truncated tool"
     );
 
+    // Sleeping deterministic chat episode must be resumed automatically on the next turn
+    // (preserving its episode_id) rather than failing touch_episode with InvalidState.
+    let ep_bytes = {
+        let mut h = blake3::Hasher::new_derive_key("notarium.chats.episode.v1");
+        for part in [
+            scope.space_id.as_str().as_bytes(),
+            thread.as_str().as_bytes(),
+            owner.auth().principal().as_str().as_bytes(),
+        ] {
+            h.update(&(part.len() as u64).to_be_bytes());
+            h.update(part);
+        }
+        *h.finalize().as_bytes()
+    };
+    let chat_episode = EpisodeId::from_bytes(ep_bytes[..16].try_into().unwrap());
+    let before_sleep = fixture
+        .control
+        .get_episode(owner.clone(), chat_episode.clone())
+        .await
+        .unwrap();
+    assert_eq!(before_sleep.lifecycle, EpisodeLifecycle::Active);
+    fixture
+        .control
+        .update_episode(
+            owner.clone(),
+            AccountMutation {
+                identity: super::runtime_ability_cases::identity(fixture, owner, 211).await,
+                input: EpisodeMutation::Full(EpisodeUpdate {
+                    episode: before_sleep.id.clone(),
+                    expected: before_sleep.revision,
+                    name: before_sleep.name.clone(),
+                    active_role: before_sleep.active_role.clone(),
+                    project_hint: before_sleep.project_hint.clone(),
+                    lifecycle: EpisodeLifecycle::Sleeping,
+                }),
+            },
+        )
+        .await
+        .unwrap();
+    let sleeping = fixture
+        .control
+        .get_episode(owner.clone(), chat_episode.clone())
+        .await
+        .unwrap();
+    assert_eq!(sleeping.lifecycle, EpisodeLifecycle::Sleeping);
+
+    let after_sleep = supervisor
+        .enqueue_input(
+            owner.clone(),
+            input(212, partial_head, "Wake up the sleeping chat episode."),
+            options.clone(),
+        )
+        .await
+        .unwrap();
+    assert!(after_sleep.run.is_some());
+    let (mut wake_conn, _) = timeout(Duration::from_secs(10), read_request(&listener))
+        .await
+        .unwrap();
+    let wake_stream = supervisor
+        .subscribe(owner.clone(), scope.clone(), thread.clone(), None)
+        .await
+        .unwrap()
+        .unwrap();
+    send_ollama(
+        &mut wake_conn,
+        json!({"role": "assistant", "content": "Resumed after sleep"}),
+        "stop",
+    )
+    .await;
+    let wake_events = stream_events(wake_stream).await;
+    assert_eq!(
+        wake_events.last().unwrap()["type"],
+        "run_finished",
+        "chat turn must resume sleeping episode instead of failing: {wake_events:?}"
+    );
+    let resumed = fixture
+        .control
+        .get_episode(owner.clone(), chat_episode.clone())
+        .await
+        .unwrap();
+    assert_eq!(resumed.lifecycle, EpisodeLifecycle::Active);
+    // EpisodeSelector::Resume on an already-Active episode must touch/resume in place
+    // without forking a new episode (prevents orphaned forks under concurrent wake races).
+    let in_place = fixture
+        .control
+        .start_or_resume_episode(
+            owner.clone(),
+            AccountMutation {
+                identity: super::runtime_ability_cases::identity(fixture, owner, 161).await,
+                input: StartEpisode {
+                    selector: EpisodeSelector::Resume(chat_episode.clone()),
+                    project_hint: None,
+                    guard: EpisodeRevisionGuard::Target,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let EpisodeStartResult::Resumed(in_place_ep) = in_place.value else {
+        panic!("EpisodeSelector::Resume on Active episode must never fork");
+    };
+    assert_eq!(in_place_ep.id, chat_episode);
+    assert!(in_place_ep.parent.is_none());
+
+    // Tainted owner waking a Sleeping episode must fail fast with CrossSpaceTainted
+    // rather than falling through to a misleading ResourceNotFound in runtime_abilities.
+    fixture
+        .control
+        .update_episode(
+            owner.clone(),
+            AccountMutation {
+                identity: super::runtime_ability_cases::identity(fixture, owner, 162).await,
+                input: EpisodeMutation::Full(EpisodeUpdate {
+                    episode: in_place_ep.id.clone(),
+                    expected: in_place_ep.revision,
+                    name: in_place_ep.name.clone(),
+                    active_role: in_place_ep.active_role.clone(),
+                    project_hint: in_place_ep.project_hint.clone(),
+                    lifecycle: EpisodeLifecycle::Sleeping,
+                }),
+            },
+        )
+        .await
+        .unwrap();
+    let tainted_auth = fixture
+        .control
+        .trusted_none(
+            PerimeterAttestation::attest_checked().with_human_management(),
+            budget(),
+        )
+        .await
+        .unwrap();
+    tainted_auth.taint().mark_external_read();
+    let tainted_owner = AccountContext::new(tainted_auth, budget());
+    let tainted_resume = fixture
+        .control
+        .start_or_resume_episode(
+            tainted_owner.clone(),
+            AccountMutation {
+                identity: super::runtime_ability_cases::identity(fixture, owner, 163).await,
+                input: StartEpisode {
+                    selector: EpisodeSelector::Resume(chat_episode.clone()),
+                    project_hint: None,
+                    guard: EpisodeRevisionGuard::Target,
+                },
+            },
+        )
+        .await;
+    assert!(
+        matches!(
+            tainted_resume,
+            Err(PortError::Domain(DomainError::CrossSpaceTainted))
+        ),
+        "tainted resume of sleeping episode must fail with CrossSpaceTainted: {tainted_resume:?}"
+    );
+    // Also verify end-to-end through supervisor.start() that open_episode surfaces
+    // CrossSpaceTainted (not ResourceNotFound from runtime_abilities) on a Sleeping episode.
+    supervisor
+        .start(
+            tainted_owner.clone(),
+            StartChatRun {
+                scope: scope.clone(),
+                thread: thread.clone(),
+                expected_leaf: idle_leaf(fixture, personal, &thread).await,
+                options: options.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    let tainted_stream = supervisor
+        .subscribe(owner.clone(), scope.clone(), thread.clone(), None)
+        .await
+        .unwrap()
+        .expect("retained failed run stream on tainted sleeping episode");
+    let events = stream_events(tainted_stream).await;
+    let failed = events
+        .iter()
+        .find(|event| event["type"] == "run_failed")
+        .unwrap_or_else(|| panic!("expected run_failed on tainted sleeping episode: {events:?}"));
+    // DomainError::ResourceNotFound maps to "history_unavailable", whereas
+    // DomainError::CrossSpaceTainted maps to "internal".
+    assert_eq!(
+        failed["code"], "internal",
+        "tainted sleeping episode must fail fast with CrossSpaceTainted (internal), not ResourceNotFound (history_unavailable): {failed:?}"
+    );
+    let _ = idle_leaf(fixture, personal, &thread).await;
+    // Wake the episode back so subsequent chat turns proceed normally.
+    let woken = fixture
+        .control
+        .start_or_resume_episode(
+            owner.clone(),
+            AccountMutation {
+                identity: super::runtime_ability_cases::identity(fixture, owner, 164).await,
+                input: StartEpisode {
+                    selector: EpisodeSelector::Resume(chat_episode),
+                    project_hint: None,
+                    guard: EpisodeRevisionGuard::Target,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(woken.value, EpisodeStartResult::Resumed(_)));
+    let partial_head = idle_leaf(fixture, personal, &thread).await;
+
     let second = supervisor
         .enqueue_input(
             owner.clone(),

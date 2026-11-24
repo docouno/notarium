@@ -433,7 +433,7 @@ async fn check_folder_and_note_history(
                 RenameProject {
                     folder: proj_a.clone(),
                     name: "alpha-prime".to_owned(),
-                    display_name: "Alpha Prime".to_owned(),
+                    display_name: Some("Alpha Prime".to_owned()),
                 },
             ),
         )
@@ -449,7 +449,7 @@ async fn check_folder_and_note_history(
                 RenameProject {
                     folder: docs_folder.clone(),
                     name: "not-a-proj".to_owned(),
-                    display_name: "Not A Project".to_owned(),
+                    display_name: Some("Not A Project".to_owned()),
                 },
             ),
         )
@@ -2551,7 +2551,14 @@ async fn run_domain_and_security_suite(
         assert_validation_err(&result, ValidationReason::CursorStale);
     }
     folder_authority::check(store, &scope, &owner).await;
-    Box::pin(folder_pages::check(store, &scope, &owner, &schema_revision)).await;
+    Box::pin(folder_pages::check(
+        store,
+        &scope,
+        &owner,
+        &schema_revision,
+        local.is_none(),
+    ))
+    .await;
     Box::pin(memory_writes::check(store, &scope, &owner, proj_a)).await;
 }
 

@@ -248,33 +248,36 @@ hub and the durable commit. Each test also verifies all nine restored digests
 and the receipt returned by a retry after the timer stops.
 
 Choose the [High or Medium reference](storage-performance.md#reference-configurations-and-results)
-before running the benchmark. The table gives the time limit for **each** measured
-call and the observed distribution used to select it. All values are milliseconds.
+before running the benchmark. The table gives the per-series latency limits for
+each 20-sample run (`p95` detects ordinary regressions while tolerating a single
+host I/O spike; `max` bounds worst-case tail latency on a quiet host) alongside
+the observed distribution. All values are milliseconds.
 
-| Reference | Database | Median | p95 | Slowest call | Per-call limit |
+| Reference | Database | Observed median | Observed p95 | Series p95 limit | Series max limit |
 | --- | --- | ---: | ---: | ---: | ---: |
-| High | SQLite | 2.571 | 6.352 | 61.359 | <74 |
-| High | PostgreSQL | 4.547 | 10.652 | 90.519 | <109 |
-| Medium | SQLite | 6.180 | 9.006 | 15.333 | <19 |
-| Medium | PostgreSQL | 11.523 | 17.250 | 122.331 | <147 |
+| High | SQLite | 2.685 | 3.295 | <6 | <25 |
+| High | PostgreSQL | 4.716 | 5.650 | <10 | <35 |
+| Medium | SQLite | 5.817 | 8.398 | <13 | <20 |
+| Medium | PostgreSQL | 11.054 | 15.379 | <24 | <50 |
 
-Calibration used four series of 20 fresh calls per database on each reference
-(runtime `1dc5daf1`). Each limit is the observed maximum plus 20% headroom,
-rounded up to a whole millisecond. One High series had several long calls on
-both databases during elevated host I/O pressure. One Medium PostgreSQL call
-took 122.331 ms. Compare median and p95 across
-runs to detect shifts in ordinary latency. The per-call limit covers observed
-tail variation on these reference systems. The component benchmark measures
-the p95 of 1,000 canonical storage commands separately.
+The observed medians and p95 values come from three quiet 20-call series per
+database on each reference (runtime `3e554991`; max observed `3.409 ms` High
+SQLite, `7.700 ms` High PostgreSQL, `9.963 ms` Medium SQLite, `20.515 ms` Medium
+PostgreSQL). Earlier four-series calibration on `1dc5daf1` measured similar
+medians (`2.571 / 4.547 ms` High, `6.180 / 11.523 ms` Medium) with isolated host
+I/O spikes (`61–122 ms`); a series affected by external host I/O pressure should
+be rerun on a quiet host rather than loosening regression budgets. Compare
+median and p95 across runs to detect shifts in ordinary latency. The component
+benchmark measures the p95 of 1,000 canonical storage commands separately.
 
 Run the following command from the checkout root on a quiet reference system.
 Use a disk-backed Cargo target for SQLite WAL with `synchronous=FULL` and a
 disk-backed Docker data volume for PostgreSQL 16 with `fsync`, `full_page_writes`
 and `synchronous_commit` enabled. Each invocation starts a new PostgreSQL volume
 and runs both backends sequentially. Sample 0 warms the fixture. Samples 1–20
-use fresh state and must each finish strictly below the selected limit for their
-database. Qualify a reference with three complete invocations, retaining all
-individual timings and test outcomes.
+use fresh state; each 20-sample series must stay strictly below both the `p95`
+(19th fastest of 20) and `max` limits for its database. Qualify a reference with
+three complete invocations, retaining all individual timings and test outcomes.
 
 ```sh
 sh scripts/control-db-fixture.sh run-durable sh .devkit/runtime/devkit.sh cli exec \

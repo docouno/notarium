@@ -1,11 +1,11 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use notarium_core::{
     DomainError,
     auth::{EngineAuthContext, SpaceLifecycle},
     classes::DocClass,
     error::{PortError, ValidationReason},
-    ids::{ContentDigest, FolderId, NoteId, RevisionId, SpaceSeq},
+    ids::{AbilityId, ContentDigest, FolderId, NoteId, RevisionId, SpaceSeq},
     model::{FolderRef, Lifecycle, NoteRef, PathTarget},
     ports::{
         ChildFolders, CommandSeqRange, ConfirmedChatStep, EnsureFolderPath, FolderSnapshot,
@@ -21,11 +21,12 @@ use crate::{
     changes::{EffectBodyV1, StoredAwaitReasonV1, build_effect_payload_draft},
     codec::{
         FolderRevisionMetadata, RevisionMetadataEnvelope, RevisionMetadataPayload,
-        encode_timestamp_parts, internal_not_committed, new_prefixed_hex_id, new_revision_id,
-        normalize_slug_key, now_utc_timestamp, ordered_id_16,
+        doc_class_from_db, encode_timestamp_parts, internal_not_committed, lifecycle_from_db,
+        new_prefixed_hex_id, new_revision_id, normalize_slug_key, now_utc_timestamp, ordered_id_16,
     },
     runtime::{
-        insert_revision_row, load_folder_head_row, load_space_record, read_immutable_revision_tx,
+        FolderHeadRow, insert_revision_row, load_folder_head_row, load_space_record,
+        read_immutable_revision_tx,
     },
     sql_exec::BackendConn,
     writer::{
@@ -191,25 +192,153 @@ pub(super) async fn list_children(
                     space.last_seq
                 };
 
-                let sql = "SELECT folder_id FROM folder_heads
+                let sql = "SELECT folder_id, parent_folder_id, CAST(is_root AS INTEGER), slug,
+                        slug_fold, display_name, CAST(is_project AS INTEGER), project_slug,
+                        project_slug_fold, description, cover_note_id, write_lock_json,
+                        lifecycle_state, head_rev_id
+                    FROM folder_heads
                     WHERE space_id=$1 AND parent_folder_id=$2 AND folder_id>$3 AND lifecycle_state='active'
                     ORDER BY folder_id LIMIT $4";
                 let after = after.as_ref().map_or("", FolderId::as_str);
                 let size = usize::from(limit.get());
-                let raw: Vec<String> = match tx {
-                    BackendConn::Sqlite(conn) => sqlx::query_scalar(sql)
+                #[allow(clippy::type_complexity)]
+                let raw: Vec<(
+                    String,
+                    Option<String>,
+                    i32,
+                    String,
+                    String,
+                    String,
+                    i32,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                    String,
+                    String,
+                )> = match tx {
+                    BackendConn::Sqlite(conn) => sqlx::query_as(sql)
                         .bind(scope.space_id.as_str()).bind(base.as_str()).bind(after)
                         .bind(i64::from(limit.get()) + 1).fetch_all(&mut **conn).await,
-                    BackendConn::Postgres(conn) => sqlx::query_scalar(sql)
+                    BackendConn::Postgres(conn) => sqlx::query_as(sql)
                         .bind(scope.space_id.as_str()).bind(base.as_str()).bind(after)
                         .bind(i64::from(limit.get()) + 1).fetch_all(&mut **conn).await,
                 }.map_err(|err| crate::runtime::pg_read_error("list_child_folders", err))?;
-                let mut items = Vec::with_capacity(raw.len().min(size));
-                for entry in raw.iter().take(size) {
-                    let id = FolderId::parse(entry)?;
-                    items.push(snapshot(tx, &space, &auth, &mut folders, &id, Some(&base)).await?);
+
+                let has_more = raw.len() > size;
+                let mut rows = Vec::with_capacity(raw.len().min(size));
+                let mut cover_ids = Vec::new();
+                for (
+                    folder_raw,
+                    parent_raw,
+                    is_root_raw,
+                    slug,
+                    slug_fold,
+                    display_name,
+                    is_proj_raw,
+                    project_slug,
+                    project_slug_fold,
+                    description,
+                    cover_raw,
+                    write_lock_json,
+                    lc_raw,
+                    head_rev_raw,
+                ) in raw.into_iter().take(size)
+                {
+                    let folder_id = FolderId::parse(&folder_raw)?;
+                    let parent_folder_id = match parent_raw {
+                        Some(s) => Some(FolderId::parse(&s).map_err(|_| {
+                            internal_not_committed(
+                                "corrupt_parent_folder",
+                                "invalid parent_folder_id",
+                            )
+                        })?),
+                        None => None,
+                    };
+                    let cover_note_id = match cover_raw {
+                        Some(s) => {
+                            let id = NoteId::parse(&s).map_err(|_| {
+                                internal_not_committed(
+                                    "corrupt_cover_note",
+                                    "invalid cover_note_id",
+                                )
+                            })?;
+                            cover_ids.push(id.clone());
+                            Some(id)
+                        }
+                        None => None,
+                    };
+                    let head_rev_id = RevisionId::parse(&head_rev_raw).map_err(|_| {
+                        internal_not_committed("corrupt_folder_rev", "invalid head_rev_id")
+                    })?;
+                    let lifecycle = lifecycle_from_db(&lc_raw)?;
+                    let row = FolderHeadRow {
+                        folder_id,
+                        parent_folder_id,
+                        is_root: is_root_raw != 0,
+                        slug,
+                        slug_fold,
+                        display_name,
+                        is_project: is_proj_raw != 0,
+                        project_slug,
+                        project_slug_fold,
+                        description,
+                        cover_note_id,
+                        write_locked: write_lock_json.is_some(),
+                        lifecycle,
+                        head_rev_id,
+                    };
+                    folders.insert_preloaded_row(scope.space_id.clone(), row.clone());
+                    rows.push(row);
                 }
-                let next = if raw.len() > size {
+
+                let mut resolved_children = Vec::with_capacity(rows.len());
+                for row in rows {
+                    let child_ancestry = folders
+                        .load_ancestry_tx(tx, &scope.space_id, &row.folder_id, true)
+                        .await?;
+                    if !child_ancestry.ancestors.contains(&base) {
+                        return Err(DomainError::ResourceNotFound.into());
+                    }
+                    auth.authorize_folder_read(
+                        &space.space,
+                        &row.folder_id,
+                        &child_ancestry.ancestors,
+                    )?;
+                    resolved_children.push((row, child_ancestry));
+                }
+
+                let readable_covers = batch_readable_cover_notes_tx(
+                    tx,
+                    &space.space,
+                    &auth,
+                    &mut folders,
+                    &cover_ids,
+                )
+                .await?;
+
+                let mut items = Vec::with_capacity(resolved_children.len());
+                for (row, child_ancestry) in resolved_children {
+                    let cover_note = row
+                        .cover_note_id
+                        .filter(|note| readable_covers.contains(note));
+                    items.push(FolderSnapshot {
+                        reference: FolderRef {
+                            space_id: space.scope.space_id.clone(),
+                            folder_id: row.folder_id,
+                        },
+                        history: space.scope.clone(),
+                        revision: row.head_rev_id,
+                        path: child_ancestry.folder_path,
+                        ancestor_folders: child_ancestry.ancestors,
+                        name: row.display_name,
+                        parent: row.parent_folder_id,
+                        project: child_ancestry.project,
+                        cover_note,
+                    });
+                }
+                let next = if has_more {
                     items.last().map(|last| last.reference.folder_id.clone())
                 } else {
                     None
@@ -218,6 +347,92 @@ pub(super) async fn list_children(
             })
         })
         .await
+}
+
+async fn batch_readable_cover_notes_tx(
+    tx: &mut BackendConn<'_>,
+    space: &notarium_core::auth::Space,
+    auth: &EngineAuthContext,
+    folders: &mut FolderAncestryCache,
+    cover_ids: &[NoteId],
+) -> Result<BTreeSet<NoteId>, PortError> {
+    if cover_ids.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let unique: Vec<String> = cover_ids
+        .iter()
+        .map(|id| id.as_str().to_owned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let rows: Vec<(String, String, String, Option<String>)> = match tx {
+        BackendConn::Sqlite(conn) => {
+            let mut qb = sqlx::QueryBuilder::new(
+                "SELECT n.note_id, n.parent_folder_id, n.doc_class, n.ability_id
+                 FROM note_heads n
+                 WHERE n.space_id = ",
+            );
+            qb.push_bind(space.id.as_str());
+            qb.push(" AND n.lifecycle_state = 'active' AND n.note_id IN (");
+            let mut sep = qb.separated(", ");
+            for id in &unique {
+                sep.push_bind(id.as_str());
+            }
+            qb.push(
+                ") AND NOT EXISTS (
+                    SELECT 1 FROM revision_purge_fences f
+                    WHERE f.space_id = n.space_id AND f.note_id = n.note_id
+                )",
+            );
+            qb.build_query_as::<(String, String, String, Option<String>)>()
+                .fetch_all(&mut **conn)
+                .await
+        }
+        BackendConn::Postgres(conn) => {
+            const PG_SQL: &str = "SELECT n.note_id, n.parent_folder_id, n.doc_class, n.ability_id
+                FROM note_heads n
+                WHERE n.space_id = $1 AND n.lifecycle_state = 'active' AND n.note_id = ANY($2)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM revision_purge_fences f
+                      WHERE f.space_id = n.space_id AND f.note_id = n.note_id
+                  )";
+            sqlx::query_as(PG_SQL)
+                .bind(space.id.as_str())
+                .bind(&unique)
+                .fetch_all(&mut **conn)
+                .await
+        }
+    }
+    .map_err(|err| crate::runtime::pg_read_error("list_child_folders_covers", err))?;
+
+    let mut readable = BTreeSet::new();
+    for (note_raw, parent_raw, class_raw, ability_raw) in rows {
+        let note_id = NoteId::parse(&note_raw)
+            .map_err(|_| internal_not_committed("corrupt_cover_note", "invalid cover note_id"))?;
+        let parent_folder_id = FolderId::parse(&parent_raw).map_err(|_| {
+            internal_not_committed("corrupt_cover_parent", "invalid cover parent_folder_id")
+        })?;
+        let doc_class = doc_class_from_db(&class_raw)?;
+        let ability_id = ability_raw
+            .as_deref()
+            .map(AbilityId::parse)
+            .transpose()
+            .map_err(|_| {
+                internal_not_committed("corrupt_cover_ability", "invalid cover ability_id")
+            })?;
+        let Some((facts, _)) = super::common::optional_read(
+            folders
+                .build_resource_facts_tx(tx, space, &parent_folder_id, doc_class, ability_id, true)
+                .await,
+        )?
+        else {
+            continue;
+        };
+        if auth.authorize_read(&facts).is_ok() {
+            readable.insert(note_id);
+        }
+    }
+    Ok(readable)
 }
 
 async fn snapshot(

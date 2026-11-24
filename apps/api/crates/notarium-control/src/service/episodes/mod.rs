@@ -32,6 +32,17 @@ enum Started {
     Forked(EpisodeId),
     Ambiguous(Vec<EpisodeId>),
 }
+fn stored_project_ref(row: &AgentEpisodesRow) -> Result<Option<FolderRef>, PortError> {
+    match (&row.project_space, &row.project_folder) {
+        (Some(space), Some(folder)) => Ok(Some(FolderRef {
+            space_id: SpaceId::parse(space)?,
+            folder_id: FolderId::parse(folder)?,
+        })),
+        (None, None) => Ok(None),
+        _ => Err(invalid(ValidationReason::InvalidState)),
+    }
+}
+
 fn name(value: Option<&str>) -> Result<(), PortError> {
     if value.is_some_and(|value| {
         value.is_empty() || value.chars().count() > 128 || value.contains('\0')
@@ -293,7 +304,7 @@ impl ControlService {
         match &request.input.selector {
             EpisodeSelector::New { name: value, .. } => name(value.as_deref())?,
             EpisodeSelector::Name(value) => name(Some(value))?,
-            EpisodeSelector::Id(_) => (),
+            EpisodeSelector::Id(_) | EpisodeSelector::Resume(_) => (),
         }
         #[derive(Serialize)]
         struct StartEpisodeHash<'a> {
@@ -333,7 +344,7 @@ impl ControlService {
             let now = self.clock.now_ms()?;
             let (existing, requested, chosen_name) = match &request.input.selector {
                 EpisodeSelector::New { requested, name } => (None, requested.clone(), name.clone()),
-                EpisodeSelector::Id(id) => (Some(episode(tx.inner_mut(), current.auth().principal(), id).await?), EpisodeId::from_bytes(crate::auth::token::random()?), None),
+                EpisodeSelector::Id(id) | EpisodeSelector::Resume(id) => (Some(episode(tx.inner_mut(), current.auth().principal(), id).await?), EpisodeId::from_bytes(crate::auth::token::random()?), None),
                 EpisodeSelector::Name(name) => {
                     let matches = rows!(tx.inner_mut(),AgentEpisodesRow,fetch_all,
                         "SELECT * FROM agent_episodes WHERE owner_id=$1 AND name=$2 AND lifecycle<>'closed' ORDER BY episode_id LIMIT 201",
@@ -356,9 +367,11 @@ impl ControlService {
                     return Err(invalid(ValidationReason::ScopeMismatch));
                 }
                 if old.lifecycle == "closed" { return Err(invalid(ValidationReason::InvalidState)); }
-                // An idle episode can resume without requiring an always-on timer.
+                // An idle episode can resume without requiring an always-on timer;
+                // EpisodeSelector::Resume always wakes or touches in place without forking.
                 let idle = now.checked_sub(old.last_seen_at).is_some_and(|age| age >= 30 * 60 * 1000);
-                if old.lifecycle == "sleeping" || idle {
+                let resume_in_place = matches!(request.input.selector, EpisodeSelector::Resume(_));
+                if old.lifecycle == "sleeping" || idle || resume_in_place {
                     old.revision = next(old.revision)?;
                     execute!(tx.inner_mut(),"UPDATE agent_episodes SET lifecycle='active',last_seen_at=$1,revision=$2 WHERE episode_id=$3","UPDATE v1_control.agent_episodes SET lifecycle='active',last_seen_at=$1,revision=$2 WHERE episode_id=$3";now,old.revision,&old.episode_id)?;
                     Started::Resumed(EpisodeId::parse(&old.episode_id)?)
@@ -469,35 +482,74 @@ impl ControlService {
         };
         command.require(ctx.auth().principal(), ctx.auth().principal())?;
         let budget = OperationBudget::new(ctx.budget.clone());
-        let prechecked_role = {
+        let (prechecked_project, prechecked_role, prechecked_preserved) = {
             let current = self.current_account(&ctx, &budget).await?;
-            if let Some(project) = &project_hint {
+            let project_check = if let Some(project) = &project_hint {
                 budget
                     .run(
                         self.catalog_project(&current, project),
                         CommitEffect::NotCommitted,
                     )
-                    .await?;
-            }
-            if let Some(role) = &active_role {
-                let raw = match budget
+                    .await
+                    .map(|_| ())
+            } else {
+                Ok(())
+            };
+            let preserved = if full_fields.is_none() && project_hint.is_none() {
+                let mut rtx = self.store.read(budget.clone()).await?;
+                let existing = budget
+                    .run(
+                        episode(rtx.inner_mut(), current.auth().principal(), &episode_id),
+                        CommitEffect::NotCommitted,
+                    )
+                    .await;
+                budget.run(rtx.finish(), CommitEffect::NotCommitted).await?;
+                match existing {
+                    Ok(row) => match stored_project_ref(&row) {
+                        Ok(Some(reference)) => {
+                            let checked = match budget
+                                .run(
+                                    self.catalog_project(&current, &reference),
+                                    CommitEffect::NotCommitted,
+                                )
+                                .await
+                            {
+                                Ok(_) => Ok(reference),
+                                Err(error) if hidden(&error) => {
+                                    Err(DomainError::ResourceNotFound.into())
+                                }
+                                Err(error) => Err(error),
+                            };
+                            Some(checked)
+                        }
+                        Ok(None) => None,
+                        Err(error) => Some(Err(error)),
+                    },
+                    Err(PortError::Domain(DomainError::ResourceNotFound)) => None,
+                    Err(error) => return Err(error),
+                }
+            } else {
+                None
+            };
+            let role = if project_check.is_ok()
+                && let Some(role) = &active_role
+            {
+                match budget
                     .run(
                         self.raw_ability(&current, role.identity()),
                         CommitEffect::NotCommitted,
                     )
                     .await
                 {
-                    Ok(raw) if raw.reference == *role => raw,
-                    Ok(_) => return Err(DomainError::ResourceNotFound.into()),
-                    Err(error) if hidden(&error) => {
-                        return Err(DomainError::ResourceNotFound.into());
-                    }
-                    Err(error) => return Err(error),
-                };
-                Some(raw)
+                    Ok(raw) if raw.reference == *role => Ok(Some(raw)),
+                    Ok(_) => Err(DomainError::ResourceNotFound.into()),
+                    Err(error) if hidden(&error) => Err(DomainError::ResourceNotFound.into()),
+                    Err(error) => Err(error),
+                }
             } else {
-                None
-            }
+                Ok(None)
+            };
+            (project_check, role, preserved)
         };
         let keeper = self
             .precheck_keeper_catalog(ctx.auth(), &budget, &ctx.budget.request)
@@ -531,6 +583,8 @@ impl ControlService {
             if let Some((revision, saved)) = command.replay::<EpisodeId>(tx.inner_mut()).await? {
                 return Ok((revision, current, saved.value));
             }
+            prechecked_project?;
+            let prechecked_role = prechecked_role?;
             if full_fields.is_some() {
                 expect_revision(&owner, command.identity.expected)?;
             }
@@ -539,8 +593,29 @@ impl ControlService {
                 return Err(DomainError::ControlRevisionConflict { current: ControlRevision::new(old.revision as u64)? }.into());
             }
             if old.lifecycle == "closed" { return Err(invalid(ValidationReason::InvalidState)); }
+            let is_full = full_fields.is_some();
+            let effective_project = if !is_full && project_hint.is_none() {
+                match stored_project_ref(&old)? {
+                    Some(preserved) => match prechecked_preserved {
+                        Some(Ok(checked)) if checked == preserved => Some(preserved),
+                        Some(Ok(_)) | None => return Err(DomainError::ResourceNotFound.into()),
+                        Some(Err(error)) => return Err(error),
+                    },
+                    None => None,
+                }
+            } else {
+                project_hint.clone()
+            };
             if let Some(raw) = prechecked_role
-                && !self.current_role_db_only(tx.inner_mut(), &current, raw, project_hint.as_ref()).await? {
+                && !self
+                    .current_role_db_only(
+                        tx.inner_mut(),
+                        &current,
+                        raw,
+                        effective_project.as_ref(),
+                    )
+                    .await?
+            {
                 return Err(DomainError::ResourceNotFound.into());
             }
             let (next_name, next_lifecycle) = match full_fields {
@@ -548,8 +623,8 @@ impl ControlService {
                 None => (old.name.clone(), lifecycle(&old.lifecycle)?),
             };
             let active_role = active_role.as_ref().map(serde_json::to_string).transpose().map_err(|_| invalid(ValidationReason::InvalidQuery))?;
-            let project_space = project_hint.as_ref().map(|p| p.space_id.to_string());
-            let project_folder = project_hint.as_ref().map(|p| p.folder_id.to_string());
+            let project_space = effective_project.as_ref().map(|p| p.space_id.to_string());
+            let project_folder = effective_project.as_ref().map(|p| p.folder_id.to_string());
             let state = match next_lifecycle { EpisodeLifecycle::Active => "active", EpisodeLifecycle::Sleeping => "sleeping", EpisodeLifecycle::Closed => "closed" };
             let now = self.clock.now_ms()?;
             let closed_at = (state == "closed").then_some(now);

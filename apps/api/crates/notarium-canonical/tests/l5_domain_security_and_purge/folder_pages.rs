@@ -6,6 +6,7 @@ pub(super) async fn check(
     scope: &HistoryScope,
     owner: &PrincipalId,
     schema_revision: &RevisionId,
+    postgres: bool,
 ) {
     let ctx = owner_ctx(scope, owner.clone(), true, true);
     let before_covers = store.read_space(&scope.space_id).await.unwrap().last_seq;
@@ -294,7 +295,8 @@ pub(super) async fn check(
         &store.read_changes(ctx.clone(), query.clone()).await,
         ValidationReason::PurgeResync,
     );
-    let ChangeReadResult::Log(activity) = store.recent_activity(ctx, query).await.unwrap() else {
+    let ChangeReadResult::Log(activity) = store.recent_activity(ctx.clone(), query).await.unwrap()
+    else {
         panic!("expected activity log");
     };
     assert!(activity.changes.iter().any(|row| row.entity
@@ -303,4 +305,300 @@ pub(super) async fn check(
     assert!(activity.changes.iter().all(|row| row.entity
         != notarium_core::ports::EntityId::Note(right_note.clone())
         || row.provenance.is_none()));
+
+    // Legacy v1 ordinary `index` receipt replay on the single CreateNote path,
+    // and refusal to match a `folder_page: true` request against a v1 ordinary receipt.
+    let legacy_dir = store
+        .ensure_folder_path(
+            ctx.clone(),
+            next_mutation(
+                scope,
+                owner,
+                EnsureFolderPath {
+                    base: None,
+                    path: "covers/LegacyIndex".into(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let legacy_note = sample_note_id(238);
+    let legacy_carrier = "# Legacy index\n\nOrdinary v1 body\n";
+    let legacy_mutation = next_mutation(
+        scope,
+        owner,
+        CreateNote {
+            parent: Some(legacy_dir.folder_id.clone()),
+            note: legacy_note.clone(),
+            slug: "index".into(),
+            folder_page: true,
+            class: DocClass::UserDoc,
+            carrier: legacy_carrier.into(),
+        },
+    );
+    let legacy_created = store
+        .create_note(ctx.clone(), legacy_mutation.clone())
+        .await
+        .unwrap();
+    // Simulate a pre-upgrade v1 database row where `index` was an ordinary note
+    // (no cover link, and v1 command hash without the `folder-page` suffix).
+    let cleared = store
+        .execute_diagnostic_write_sql_for_test(&format!(
+            "UPDATE folder_heads SET cover_note_id=NULL WHERE space_id='{}' AND folder_id='{}'",
+            scope.space_id.as_str(),
+            legacy_dir.folder_id.as_str()
+        ))
+        .await
+        .unwrap();
+    assert_eq!(cleared, 1);
+    let mut v1_payload = blake3::Hasher::new();
+    for part in [
+        legacy_note.as_str(),
+        legacy_dir.folder_id.as_str(),
+        "index",
+        "user-doc",
+    ] {
+        v1_payload.update(part.as_bytes());
+        v1_payload.update(&[0]);
+    }
+    v1_payload.update(notarium_syntax::content_digest(legacy_carrier).as_bytes());
+    let mut v1_cmd_hash = blake3::Hasher::new();
+    v1_cmd_hash.update(b"notarium-cmd-v1:create_note\0");
+    v1_cmd_hash.update(legacy_mutation.identity.hash.as_bytes());
+    v1_cmd_hash.update(&[0]);
+    v1_cmd_hash.update(v1_payload.finalize().as_bytes());
+    let hex_hash = v1_cmd_hash.finalize().to_hex();
+    let hash_literal = if postgres {
+        format!("decode('{hex_hash}', 'hex')")
+    } else {
+        format!("X'{hex_hash}'")
+    };
+    let patched = store
+        .execute_diagnostic_write_sql_for_test(&format!(
+            "UPDATE command_receipts SET command_hash={hash_literal} WHERE space_id='{}' AND idempotency_key='{}'",
+            scope.space_id.as_str(),
+            legacy_mutation.identity.key.as_str()
+        ))
+        .await
+        .unwrap();
+    assert_eq!(patched, 1);
+
+    let legacy_ordinary_retry = Mutation {
+        input: CreateNote {
+            folder_page: false,
+            ..legacy_mutation.input.clone()
+        },
+        ..legacy_mutation.clone()
+    };
+    let replayed = store
+        .create_note(ctx.clone(), legacy_ordinary_retry)
+        .await
+        .expect("single CreateNote must replay historical v1 ordinary `index` receipt");
+    assert_eq!(replayed.receipt, legacy_created.receipt);
+    assert_eq!(replayed.value, legacy_created.value);
+
+    let false_cover_retry = store.create_note(ctx.clone(), legacy_mutation).await;
+    assert_eq!(
+        false_cover_retry.unwrap_err(),
+        PortError::Domain(DomainError::IdempotencyKeyReused),
+        "folder_page=true must never match a legacy v1 ordinary note receipt"
+    );
+    assert_eq!(cover_at(&legacy_dir).await, None);
+
+    let fresh_ordinary_index = store
+        .create_note(
+            ctx.clone(),
+            next_mutation(
+                scope,
+                owner,
+                CreateNote {
+                    parent: Some(legacy_dir.folder_id.clone()),
+                    note: sample_note_id(239),
+                    slug: "index".into(),
+                    folder_page: false,
+                    class: DocClass::UserDoc,
+                    carrier: "# New index\n".into(),
+                },
+            ),
+        )
+        .await;
+    assert_validation_err(
+        &fresh_ordinary_index,
+        ValidationReason::InvalidPathComponent,
+    );
+
+    // Space-root (`parent: None` / `Some(root)`) historical v1 ordinary `index`
+    // receipts normalized parent to `""` in command_hash; single CreateNote must
+    // replay both `parent: None` and `parent: Some(root)` cleanly while still
+    // rejecting `folder_page: true`.
+    let root_folder_id = store
+        .read_space(&scope.space_id)
+        .await
+        .unwrap()
+        .root_folder_id;
+    let root_legacy_note = sample_note_id(240);
+    let root_legacy_carrier = "# Legacy root index\n\nRoot content.\n";
+    let root_legacy_mutation = next_mutation(
+        scope,
+        owner,
+        CreateNote {
+            parent: None,
+            note: root_legacy_note.clone(),
+            slug: "index".into(),
+            folder_page: true,
+            class: DocClass::UserDoc,
+            carrier: root_legacy_carrier.into(),
+        },
+    );
+    let root_legacy_created = store
+        .create_note(ctx.clone(), root_legacy_mutation.clone())
+        .await
+        .unwrap();
+    let cleared_root = store
+        .execute_diagnostic_write_sql_for_test(&format!(
+            "UPDATE folder_heads SET cover_note_id=NULL WHERE space_id='{}' AND folder_id='{}'",
+            scope.space_id.as_str(),
+            root_folder_id.as_str()
+        ))
+        .await
+        .unwrap();
+    assert_eq!(cleared_root, 1);
+    let mut root_v1_payload = blake3::Hasher::new();
+    for part in [root_legacy_note.as_str(), "", "index", "user-doc"] {
+        root_v1_payload.update(part.as_bytes());
+        root_v1_payload.update(&[0]);
+    }
+    root_v1_payload.update(notarium_syntax::content_digest(root_legacy_carrier).as_bytes());
+    let mut root_v1_cmd_hash = blake3::Hasher::new();
+    root_v1_cmd_hash.update(b"notarium-cmd-v1:create_note\0");
+    root_v1_cmd_hash.update(root_legacy_mutation.identity.hash.as_bytes());
+    root_v1_cmd_hash.update(&[0]);
+    root_v1_cmd_hash.update(root_v1_payload.finalize().as_bytes());
+    let root_hex_hash = root_v1_cmd_hash.finalize().to_hex();
+    let root_hash_literal = if postgres {
+        format!("decode('{root_hex_hash}', 'hex')")
+    } else {
+        format!("X'{root_hex_hash}'")
+    };
+    let patched_root = store
+        .execute_diagnostic_write_sql_for_test(&format!(
+            "UPDATE command_receipts SET command_hash={root_hash_literal} WHERE space_id='{}' AND idempotency_key='{}'",
+            scope.space_id.as_str(),
+            root_legacy_mutation.identity.key.as_str()
+        ))
+        .await
+        .unwrap();
+    assert_eq!(patched_root, 1);
+
+    for retry_parent in [None, Some(root_folder_id.clone())] {
+        let retry = Mutation {
+            input: CreateNote {
+                parent: retry_parent,
+                folder_page: false,
+                ..root_legacy_mutation.input.clone()
+            },
+            ..root_legacy_mutation.clone()
+        };
+        let replayed = store
+            .create_note(ctx.clone(), retry)
+            .await
+            .expect("Space-root historical v1 ordinary `index` receipt must replay");
+        assert_eq!(replayed.receipt, root_legacy_created.receipt);
+        assert_eq!(replayed.value, root_legacy_created.value);
+    }
+    let root_false_cover = store.create_note(ctx.clone(), root_legacy_mutation).await;
+    assert_eq!(
+        root_false_cover.unwrap_err(),
+        PortError::Domain(DomainError::IdempotencyKeyReused),
+        "folder_page=true must not match Space-root legacy v1 ordinary index receipt"
+    );
+
+    // Batch child-folder listing with 100 active children (including cover notes)
+    // must return all 100 snapshots accurately inside the single read transaction.
+    let batch_parent = store
+        .ensure_folder_path(
+            ctx.clone(),
+            next_mutation(
+                scope,
+                owner,
+                EnsureFolderPath {
+                    base: None,
+                    path: "covers/BatchChildren".into(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let active_epoch = store
+        .read_space(&scope.space_id)
+        .await
+        .unwrap()
+        .active_epoch;
+    let mut covered_folders = BTreeMap::new();
+    for idx in 0..100u16 {
+        let mut raw = [0u8; 16];
+        raw[0] = 0xB8;
+        raw[14..16].copy_from_slice(&idx.to_be_bytes());
+        let child_id = FolderId::from_bytes(raw);
+        store
+            .create_folder(notarium_canonical::CreateFolderSpec {
+                scope: scope.clone(),
+                active_epoch,
+                folder_id: child_id.clone(),
+                parent: Some(batch_parent.folder_id.clone()),
+                slug: format!("child-{idx:03}"),
+                display_name: format!("Child {idx:03}"),
+                is_project: false,
+                project_slug: None,
+                actor: owner.clone(),
+                timestamp: None,
+            })
+            .await
+            .unwrap();
+        if idx < 5 {
+            let mut nraw = [0u8; 16];
+            nraw[0] = 0xC8;
+            nraw[14..16].copy_from_slice(&idx.to_be_bytes());
+            let note_id = NoteId::from_bytes(nraw);
+            store
+                .create_note(
+                    ctx.clone(),
+                    next_mutation(
+                        scope,
+                        owner,
+                        CreateNote {
+                            parent: Some(child_id.clone()),
+                            note: note_id.clone(),
+                            slug: "index".into(),
+                            folder_page: true,
+                            class: DocClass::UserDoc,
+                            carrier: format!("# Cover {idx}\n"),
+                        },
+                    ),
+                )
+                .await
+                .unwrap();
+            covered_folders.insert(child_id, note_id);
+        }
+    }
+    let listed = store
+        .list_child_folders(
+            ctx,
+            Some(batch_parent.folder_id.clone()),
+            None,
+            None,
+            PageLimit::new(100).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(listed.items.len(), 100);
+    assert!(listed.next.is_none());
+    for item in &listed.items {
+        assert!(item.path.starts_with("covers/BatchChildren/child-"));
+        assert!(item.ancestor_folders.contains(&batch_parent.folder_id));
+        assert_eq!(
+            item.cover_note.as_ref(),
+            covered_folders.get(&item.reference.folder_id)
+        );
+    }
 }
