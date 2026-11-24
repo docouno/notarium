@@ -64,6 +64,9 @@ impl AgentRunSupervisor {
                                     .await
                             {
                                 for item in items {
+                                    if self.inner.shutdown.is_cancelled() {
+                                        break;
+                                    }
                                     let key = PendingCredentialKey {
                                         scope: run.scope.clone(),
                                         thread: run.thread.clone(),
@@ -72,8 +75,10 @@ impl AgentRunSupervisor {
                                     let _ = self.dismiss(&run, &key).await;
                                 }
                             }
-                            let _ = self.settle_unpublished_claim(&run).await;
-                            let _ = self.refresh_current_head(&run, !own_reconciled).await;
+                            if !self.inner.shutdown.is_cancelled() {
+                                let _ = self.settle_unpublished_claim(&run).await;
+                                let _ = self.refresh_current_head(&run, !own_reconciled).await;
+                            }
                             self.finish_and_remove_run(&run, result.err().or(Some(error)));
                             drop(admission);
                             return;

@@ -122,8 +122,11 @@ impl SearchEngine {
                 .classes
                 .iter()
                 .all(|class| *class == DocClass::EncryptedNote);
+        let preflight = delivery.recipient.is_some_and(|r| r.filters_notes());
         if empty_query || encrypted_only {
-            let snapshot = self.projection(&ctx, request.causal, clock).await?;
+            let snapshot = self
+                .projection(&ctx, request.causal, clock, preflight)
+                .await?;
             let _ = snapshot.filter_notes(&request.filter).await?;
             if let Some(folder) = &request.folder {
                 let _ = snapshot.folder_descendants(folder).await?;
@@ -138,7 +141,9 @@ impl SearchEngine {
         }
         let pinned = self.pin_space(ctx.scope().clone())?;
         let handle = &pinned.handle;
-        let aligned = self.align(&ctx, &request.causal, handle, clock).await?;
+        let aligned = self
+            .align(&ctx, &request.causal, handle, clock, preflight)
+            .await?;
         let snapshot = aligned.snapshot;
         let state = aligned.state;
         let chat_record = if request.include_chats && recall.is_none() && !browse {

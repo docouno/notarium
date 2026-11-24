@@ -147,7 +147,7 @@ async fn admit_in_app_address(
         super::super::EgressTarget::InAppProvider {
             primary_project, ..
         } if call.auth.pinned_write_space() == Some(&scope.scope().space_id) => {
-            primary_project.clone()
+            primary_project.clone().or_else(|| project.cloned())
         }
         _ => project.cloned(),
     };
@@ -223,6 +223,7 @@ pub(in super::super) async fn project_for_folder(
     project: &FolderRef,
 ) -> Result<ProjectInfo, PortError> {
     let scope = space(call, &project.space_id).await?;
+    admit_in_app_address(call, &scope, Some(project)).await?;
     let item = call
         .registry
         .catalog

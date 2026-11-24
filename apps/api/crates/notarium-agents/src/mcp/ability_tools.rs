@@ -543,7 +543,11 @@ async fn read_owned_resource(
             return Err(DomainError::validation(ValidationReason::ClassEgressForbidden).into());
         }
         if let Some(required) = &sel.project_only
-            && !matches!(&reference.placement, AbilityPlacement::OwnedProject(p) if p == required)
+            && (!reference.placement.in_project(required)
+                || descriptor
+                    .promoted_from
+                    .as_ref()
+                    .is_some_and(|prev| !prev.placement.in_project(required)))
         {
             return Err(DomainError::AccessDenied.into());
         }

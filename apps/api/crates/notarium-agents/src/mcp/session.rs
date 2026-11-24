@@ -108,7 +108,10 @@ pub(super) async fn selected_project_for_hint(
 ) -> Result<Option<FolderRef>, PortError> {
     let target = match project {
         Some(handle) => Some(resolve_project(call, handle).await?.folder),
-        None => hint.cloned(),
+        None => match hint {
+            Some(folder) => Some(project_for_folder(call, folder).await?.folder),
+            None => None,
+        },
     };
     let target = match &call.target {
         EgressTarget::InAppProvider {
@@ -423,7 +426,11 @@ async fn start(call: &mut ToolCallContext<'_>, args: StartArgs) -> Result<Value,
                     .map_err(map_session_err)?
                 {
                     NamedEpisodePreview::NoMatch => Some(None),
-                    NamedEpisodePreview::Unique(project) => Some(project),
+                    NamedEpisodePreview::Unique(project) => Some(
+                        selected_project_for_hint(call, None, project.as_ref())
+                            .await
+                            .map_err(map_session_err)?,
+                    ),
                     NamedEpisodePreview::ProjectUnavailable => {
                         return Err(map_session_err(DomainError::ResourceNotFound.into()));
                     }

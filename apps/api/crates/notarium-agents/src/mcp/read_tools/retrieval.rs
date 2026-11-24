@@ -148,19 +148,8 @@ pub(super) async fn retrieve(
                 .try_into()
                 .expect("fixed digest"),
         );
-        let query = SearchQuery {
-            text: args.query.clone(),
-            filter: unrestricted(),
-            classes: classes.clone(),
-            top_k,
-            model: None,
-            causal: target.causal(),
-            include_chats: false,
-            folder: target
-                .project
-                .as_ref()
-                .map(|project| project.folder_id.clone()),
-        };
+        let mut effective_classes = classes.clone();
+        let mut effective_project = target.project.clone();
         let (source_classes, source_project) = if let EgressTarget::InAppProvider {
             primary_project,
             ..
@@ -179,32 +168,67 @@ pub(super) async fn retrieve(
                         .collect()
                 })
                 .unwrap_or_default();
-            let selection_project = primary_project
-                .as_ref()
-                .filter(|project| project.space_id == target.scope.space_id)
-                .cloned();
-            let (allowed, confined_project) =
-                match call.provider_selection(&scope, selection_project).await {
-                    Ok(Some(selection)) => (
-                        selection
-                            .policy
-                            .allowed_classes
-                            .into_iter()
-                            .filter(|class| grant_readable.contains(class))
-                            .collect(),
-                        selection.project_only,
-                    ),
-                    _ => (grant_readable, None),
+            let selection_project = target.project.clone().or_else(|| {
+                primary_project
+                    .as_ref()
+                    .filter(|project| project.space_id == target.scope.space_id)
+                    .cloned()
+            });
+            let selection = match call.provider_selection(&scope, selection_project).await {
+                Ok(Some(selection)) => selection,
+                Ok(None) => continue,
+                Err(error) if corpus::hidden(&error) => continue,
+                Err(error) => return Err(error),
+            };
+            let allowed: BTreeSet<DocClass> = selection
+                .policy
+                .allowed_classes
+                .into_iter()
+                .filter(|class| grant_readable.contains(class))
+                .collect();
+            effective_classes.retain(|class| allowed.contains(class));
+            if effective_classes.is_empty() {
+                continue;
+            }
+            if let Some(confined) = &selection.project_only {
+                if let Some(existing) = &effective_project
+                    && existing != confined
+                {
+                    continue;
+                }
+                effective_project = Some(confined.clone());
+            }
+            scope = match scope.restrict_read_classes(&effective_classes) {
+                Ok(narrowed) => narrowed,
+                Err(_) => continue,
+            };
+            if let Some(project) = &effective_project {
+                scope = match scope.restrict_to_project(project) {
+                    Ok(narrowed) => narrowed,
+                    Err(_) => continue,
                 };
-            (Some(allowed), Some(confined_project))
+            }
+            (Some(allowed), Some(selection.project_only))
         } else {
             (None, None)
+        };
+        let query = SearchQuery {
+            text: args.query.clone(),
+            filter: unrestricted(),
+            classes: effective_classes.clone(),
+            top_k,
+            model: None,
+            causal: target.causal(),
+            include_chats: false,
+            folder: effective_project
+                .as_ref()
+                .map(|project| project.folder_id.clone()),
         };
         let recipient = Recipient {
             call,
             scope: &scope,
-            classes: &classes,
-            project: target.project.as_ref(),
+            classes: &effective_classes,
+            project: effective_project.as_ref(),
             source_classes,
             source_project,
         };

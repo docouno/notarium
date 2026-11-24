@@ -113,6 +113,14 @@ impl AbilityPlacement {
             Self::System => 3,
         }
     }
+
+    pub fn in_project(&self, project: &FolderRef) -> bool {
+        match self {
+            Self::OwnedProject(folder) => folder == project,
+            Self::OwnedSpace(space) => space == &project.space_id,
+            Self::OwnedPersonal(_) | Self::System => false,
+        }
+    }
 }
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AbilityIdentity {

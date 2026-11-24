@@ -468,7 +468,7 @@ impl AbilityResourceProvenance {
     fn in_project(&self, project: &FolderRef) -> bool {
         self.locations()
             .into_iter()
-            .all(|location| ability_in_project(&location.placement, project))
+            .all(|location| location.placement.in_project(project))
     }
 }
 
@@ -483,14 +483,6 @@ fn ability_placement_matches(placement: &AbilityPlacement, facts: &ResourceFacts
         }
         AbilityPlacement::OwnedPersonal(_) => facts.space.kind == SpaceKind::Personal,
         AbilityPlacement::System => false,
-    }
-}
-
-fn ability_in_project(placement: &AbilityPlacement, project: &FolderRef) -> bool {
-    match placement {
-        AbilityPlacement::OwnedProject(folder) => folder == project,
-        AbilityPlacement::OwnedSpace(space) => space == &project.space_id,
-        AbilityPlacement::OwnedPersonal(_) | AbilityPlacement::System => false,
     }
 }
 impl fmt::Debug for ClassifiedAbilityResource {

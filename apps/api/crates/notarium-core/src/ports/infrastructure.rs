@@ -62,6 +62,16 @@ pub trait StructuralReadPort: Send + Sync {
         ctx: SpaceContext,
         causal: CausalBasis,
     ) -> PortFuture<'_, Box<dyn StructuralSnapshot>>;
+    /// Untainted snapshot acquisition used when a `SearchRecipient` filters
+    /// candidates prior to hydration so rejected hits do not flip cross-space
+    /// `BranchTaint`. Every admitted hit is still tainted during `hydrate`.
+    fn acquire_snapshot_preflight(
+        &self,
+        ctx: SpaceContext,
+        causal: CausalBasis,
+    ) -> PortFuture<'_, Box<dyn StructuralSnapshot>> {
+        self.acquire_snapshot(ctx, causal)
+    }
     /// Current canonical fence, including class changes; never the pinned snapshot bit.
     fn is_live_visible<'a>(
         &'a self,

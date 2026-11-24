@@ -32,6 +32,7 @@ impl SearchEngine {
         causal: &CausalBasis,
         handle: &SpaceHandle,
         clock: &Clock,
+        preflight: bool,
     ) -> Result<Aligned, PortError> {
         let required = match causal {
             CausalBasis::Await(watermarks) => watermarks.required(ctx.scope())?,
@@ -48,7 +49,9 @@ impl SearchEngine {
             CausalBasis::Await(_) => causal.clone(),
             CausalBasis::Exact(_) => CausalBasis::Exact(Default::default()),
         };
-        let mut snapshot = self.projection(ctx, structural_causal, clock).await?;
+        let mut snapshot = self
+            .projection(ctx, structural_causal, clock, preflight)
+            .await?;
         let mut state = current(handle, ctx.scope());
         // Exact queries skip initial grace so receipt overlays run immediately
         // when the published index already matches the structural cut.
@@ -84,7 +87,7 @@ impl SearchEngine {
                 let cause = CausalBasis::Await(AwaitWatermarks::from_receipts(waiting));
                 // Release the old structural snapshot before awaiting a newer cut.
                 drop(snapshot);
-                snapshot = self.projection(ctx, cause, clock).await?;
+                snapshot = self.projection(ctx, cause, clock, preflight).await?;
                 if snapshot.cut().projected_seq < indexed {
                     return Err(unavailable("projection_behind_search"));
                 }
@@ -194,15 +197,23 @@ impl SearchEngine {
         ctx: &SpaceContext,
         causal: CausalBasis,
         clock: &Clock,
+        preflight: bool,
     ) -> Result<Arc<dyn StructuralSnapshot>, PortError> {
         let mut context = ctx.clone();
         context.budget = clock.remaining()?;
-        let snapshot = self
-            .services
-            .deps
-            .structural
-            .acquire_snapshot(context, causal)
-            .await?;
+        let snapshot = if preflight {
+            self.services
+                .deps
+                .structural
+                .acquire_snapshot_preflight(context, causal)
+                .await?
+        } else {
+            self.services
+                .deps
+                .structural
+                .acquire_snapshot(context, causal)
+                .await?
+        };
         ctx.check_current(&snapshot.cut().scope)?;
         Ok(Arc::from(snapshot))
     }

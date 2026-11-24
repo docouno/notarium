@@ -38,6 +38,22 @@ async fn authorize_current_leaf(
     authorize_thread_mutation(auth, &space.space, thread, tainted)
 }
 
+async fn authorize_claim_lifecycle_leaf(
+    tx: &mut BackendConn<'_>,
+    auth: &EngineAuthContext,
+    space: &SpaceRecord,
+    thread: &ThreadHeadRow,
+) -> Result<(), PortError> {
+    let tainted = read_leaf_taint(
+        tx,
+        &space.scope.space_id,
+        &thread.thread_id,
+        thread.head_leaf_seq,
+    )
+    .await?;
+    authorize_thread_claim_lifecycle(auth, &space.space, thread, tainted)
+}
+
 async fn lock_space(
     store: &CanonicalStore,
     tx: &mut BackendConn<'_>,
@@ -287,6 +303,8 @@ pub(super) async fn finish(
                         {
                             return Err(DomainError::ResourceNotFound.into());
                         }
+                    } else if !recover {
+                        authorize_claim_lifecycle_leaf(tx, ctx.auth(), &space, &thread).await?;
                     } else {
                         authorize_current_leaf(tx, ctx.auth(), &space, &thread).await?;
                     }
@@ -364,7 +382,7 @@ pub(super) async fn list_pending(
                     .check_writer_epoch(&scope.space_id, space.active_epoch)?;
                 authorize_chat_write_on_space(ctx.auth(), &space.space)?;
                 let thread = load_thread_head_tx(tx, &scope.space_id, &thread_id).await?;
-                authorize_current_leaf(tx, ctx.auth(), &space, &thread).await?;
+                authorize_claim_lifecycle_leaf(tx, ctx.auth(), &space, &thread).await?;
                 authorize_run_claim(&owned, &space, &thread, &run)?;
                 pending_rows(tx, &scope.space_id, &thread_id).await
             })
@@ -413,7 +431,11 @@ pub(super) async fn dismiss_pending(
                     authorize_chat_write_on_space(ctx.auth(), &space.space)?;
                     let thread =
                         load_thread_head_tx(tx, &space.scope.space_id, &request.thread).await?;
-                    authorize_current_leaf(tx, ctx.auth(), &space, &thread).await?;
+                    if matches!(ctx.auth().kind(), PrincipalKind::AgentRun(_)) {
+                        authorize_claim_lifecycle_leaf(tx, ctx.auth(), &space, &thread).await?;
+                    } else {
+                        authorize_current_leaf(tx, ctx.auth(), &space, &thread).await?;
+                    }
                     let Some((_, author, _, run, _)) =
                         pending_rows(tx, &space.scope.space_id, &request.thread)
                             .await?

@@ -443,13 +443,13 @@ impl KeeperScheduler {
         let control = self.inner.registry.control();
         let mut result = control.claim_schedule(ctx.clone(), claim.clone()).await;
         let mut tried = std::collections::BTreeSet::from([claim.next_slot]);
-        let mut forward_cursor = fresh.max(now);
+        let mut forward_cursor = fresh;
         // Track exact backward frontier `(anchor, upper)` where `next(anchor) == upper`.
         // Rewinding uses bounded O(log(gap)) exponential backoff + binary search to
         // locate the exact immediately preceding occurrence without skipping irregular
         // slots or spinning across long misfire gaps.
         let mut backward_state: Option<(Timestamp, Option<Timestamp>)> =
-            (slot < forward_cursor).then_some((forward_cursor, claim.next_slot));
+            (slot < fresh).then_some((fresh, claim.next_slot));
         let mut tried_now_probe = now == fresh;
         const MAX_NEXT_SLOT_RETRIES: usize = 20;
         let advance_untried = |cursor: &mut Timestamp,
@@ -1151,6 +1151,43 @@ mod tests {
             fin_calls.get() <= 16,
             "too many probes: {}",
             fin_calls.get()
+        );
+    }
+
+    #[test]
+    fn backward_ntp_jump_fresh_before_now_reaches_both_backward_and_intervening_slots() {
+        // If NTP steps the clock backward mid-poll (`fresh < now`), both `forward_cursor`
+        // and `backward_state` must anchor at `fresh` where `next(fresh) == claim.next_slot`,
+        // so rewinding finds slots < fresh and advancing visits slots in (fresh, now).
+        let cron = "0 * * * * * *";
+        let slot = Timestamp::parse("2026-03-05T10:00:00Z").unwrap();
+        let now = Timestamp::parse("2026-03-05T10:05:30Z").unwrap();
+        let fresh = Timestamp::parse("2026-03-05T10:03:30Z").unwrap();
+        assert!(fresh < now);
+        let next = |ts: Timestamp| compute_next_slot(cron, "UTC", slot, ts);
+        let initial = next(fresh).unwrap();
+        assert_eq!(
+            initial,
+            Some(Timestamp::parse("2026-03-05T10:04:00Z").unwrap())
+        );
+
+        // Rewinding from `(fresh, initial)` finds 10:03:00 (would return None if anchored at `now`).
+        let (prev, _) = find_previous_slot(slot, fresh, initial, &next)
+            .unwrap()
+            .expect("backward search anchored at fresh must find 10:03:00");
+        assert_eq!(prev, Timestamp::parse("2026-03-05T10:03:00Z").unwrap());
+
+        // Advancing from `forward_cursor = fresh` visits 10:05:00 in (fresh, now) without skipping it.
+        let mut cursor = fresh;
+        let tried = std::collections::BTreeSet::from([initial]);
+        let mut candidate = next(cursor).unwrap();
+        while tried.contains(&candidate) {
+            cursor = cursor.max(candidate.unwrap());
+            candidate = next(cursor).unwrap();
+        }
+        assert_eq!(
+            candidate,
+            Some(Timestamp::parse("2026-03-05T10:05:00Z").unwrap())
         );
     }
 }

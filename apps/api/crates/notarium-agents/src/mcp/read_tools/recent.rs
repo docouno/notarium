@@ -51,13 +51,27 @@ pub(super) async fn recent(
             };
             if let Some(sel) = selection {
                 read_scope = read_scope.restrict_read_classes(&sel.policy.allowed_classes)?;
+                if read_scope
+                    .auth()
+                    .spaces()
+                    .get(&target.scope.space_id)
+                    .is_none_or(|grant| grant.read_classes.is_empty())
+                {
+                    continue;
+                }
                 if let Some(required) = sel.project_only {
-                    read_scope = read_scope.restrict_to_project(&required)?;
+                    read_scope = match read_scope.restrict_to_project(&required) {
+                        Ok(narrowed) => narrowed,
+                        Err(_) => continue,
+                    };
                 }
             }
         }
         if let Some(project) = &target.project {
-            read_scope = read_scope.restrict_to_project(project)?;
+            read_scope = match read_scope.restrict_to_project(project) {
+                Ok(narrowed) => narrowed,
+                Err(_) => continue,
+            };
         }
         let after = SpaceSeq::new(
             target
@@ -147,13 +161,27 @@ pub(super) async fn recent(
                         continue;
                     }
                     scope = scope.restrict_read_classes(&sel.policy.allowed_classes)?;
+                    if scope
+                        .auth()
+                        .spaces()
+                        .get(&target.scope.space_id)
+                        .is_none_or(|grant| grant.read_classes.is_empty())
+                    {
+                        continue;
+                    }
                     if let Some(required) = sel.project_only {
-                        scope = scope.restrict_to_project(&required)?;
+                        scope = match scope.restrict_to_project(&required) {
+                            Ok(narrowed) => narrowed,
+                            Err(_) => continue,
+                        };
                     }
                 }
             }
             if let Some(project) = &target.project {
-                scope = scope.restrict_to_project(project)?;
+                scope = match scope.restrict_to_project(project) {
+                    Ok(narrowed) => narrowed,
+                    Err(_) => continue,
+                };
             }
             let snapshot = match call
                 .registry

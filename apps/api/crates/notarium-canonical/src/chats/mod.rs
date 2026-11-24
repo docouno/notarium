@@ -795,6 +795,31 @@ fn authorize_thread_mutation(
     th: &ThreadHeadRow,
     tainted: bool,
 ) -> Result<(), PortError> {
+    authorize_thread_mutation_inner(auth, space, th, tainted, true)
+}
+
+/// Active-run claim lifecycle check (`finish_run_if_queue_empty`,
+/// `list_pending_chat_inputs`, `dismiss_chat_input` by the live claim owner):
+/// enforces all space/thread/grant/project/audience/ownership/leaf-taint gates
+/// without rejecting a run whose own `auth.taint()` flipped cross-space during
+/// a turn, so a tainted Personal chat in a Shared Space can still release its
+/// `active_run_id` claim cleanly instead of wedging the thread.
+fn authorize_thread_claim_lifecycle(
+    auth: &EngineAuthContext,
+    space: &Space,
+    th: &ThreadHeadRow,
+    tainted: bool,
+) -> Result<(), PortError> {
+    authorize_thread_mutation_inner(auth, space, th, tainted, false)
+}
+
+fn authorize_thread_mutation_inner(
+    auth: &EngineAuthContext,
+    space: &Space,
+    th: &ThreadHeadRow,
+    tainted: bool,
+    enforce_caller_taint: bool,
+) -> Result<(), PortError> {
     if space.lifecycle != SpaceLifecycle::Active || !auth.spaces().contains_key(&space.id) {
         return Err(DomainError::ResourceNotFound.into());
     }
@@ -838,7 +863,7 @@ fn authorize_thread_mutation(
         th.project_folder.as_ref(),
         tainted,
     )?;
-    if (auth.taint().is_tainted() || tainted)
+    if ((enforce_caller_taint && auth.taint().is_tainted()) || tainted)
         && (th.kind == ChatThreadKind::SpaceGroup || space.kind == SpaceKind::Shared)
     {
         return Err(DomainError::CrossSpaceTainted.into());

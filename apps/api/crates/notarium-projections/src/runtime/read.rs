@@ -306,6 +306,16 @@ impl ProjectionEngine {
         causal: &CausalBasis,
         query: Option<&RetainedQuery>,
     ) -> Result<ChosenRead, PortError> {
+        self.choose_read_with_taint(ctx, causal, query, true).await
+    }
+
+    async fn choose_read_with_taint(
+        &self,
+        ctx: &SpaceContext,
+        causal: &CausalBasis,
+        query: Option<&RetainedQuery>,
+        mark_taint: bool,
+    ) -> Result<ChosenRead, PortError> {
         let scope = ctx.scope();
         // Fail closed on unauthorized callers before waiting on projector lag
         // so `wait_for_cut` cannot act as a timing/existence oracle.
@@ -320,8 +330,11 @@ impl ProjectionEngine {
                     authorize_notes(&permit, ctx, permit.root_folder_id(), notes)?;
                 }
                 Some(RetainedQuery::View(view)) => ensure_active(&permit, ctx, &view.view.note)?,
-                None => {
+                None if mark_taint => {
                     authorize_query(&permit, ctx, permit.root_folder_id(), None, true)?;
+                }
+                None => {
+                    can_view_query_entry(&permit, ctx, permit.root_folder_id(), None, true)?;
                 }
             }
         }
@@ -1635,6 +1648,20 @@ pub(super) fn authorize_entry(
     Ok(())
 }
 
+fn can_view_entry(
+    permit: &LiveReadPermit,
+    ctx: &SpaceContext,
+    folder: &FolderId,
+) -> Result<(), PortError> {
+    ctx.check_current(permit.scope())?;
+    let facts = permit
+        .folder_facts(folder)
+        .ok_or(DomainError::ResourceNotFound)?;
+    ctx.auth()
+        .can_view_folder(permit.space(), folder, &facts.ancestor_folders)?;
+    Ok(())
+}
+
 fn authorize_query(
     permit: &LiveReadPermit,
     ctx: &SpaceContext,
@@ -2073,9 +2100,18 @@ struct Snapshot {
     ctx: SpaceContext,
     live: LiveSpaceHandle,
     expires: Instant,
+    mark_taint: bool,
 }
 
 impl Snapshot {
+    fn check_entry(&self, permit: &LiveReadPermit, folder: &FolderId) -> Result<(), PortError> {
+        if self.mark_taint {
+            authorize_entry(permit, &self.ctx, folder)
+        } else {
+            can_view_entry(permit, &self.ctx, folder)
+        }
+    }
+
     fn remaining(&self) -> Result<Duration, PortError> {
         let now = Instant::now();
         if self.expires <= now {
@@ -2160,7 +2196,7 @@ impl Snapshot {
         folder: &FolderId,
         include_children: bool,
     ) -> Result<FolderScope, PortError> {
-        authorize_entry(&self.read_live().await?, &self.ctx, folder)?;
+        self.check_entry(&self.read_live().await?, folder)?;
         if self.index.dense_folder_id(folder).is_none() {
             return Err(DomainError::ResourceNotFound.into());
         }
@@ -2221,7 +2257,7 @@ impl Snapshot {
             }
         };
         let permit = self.read_live().await?;
-        authorize_entry(&permit, &self.ctx, folder)?;
+        self.check_entry(&permit, folder)?;
         self.ctx
             .auth()
             .can_view_folder(permit.space(), folder, &scope.ancestors)?;
@@ -2310,7 +2346,16 @@ impl Snapshot {
         self.index
             .note_id(self.index.dense(id))
             .ok()
-            .is_some_and(|note| ensure_active(permit, &self.ctx, &note).is_ok())
+            .is_some_and(|note| {
+                if self.mark_taint {
+                    ensure_active(permit, &self.ctx, &note).is_ok()
+                } else {
+                    matches!(
+                        permit.classify(&self.ctx, &note, true),
+                        Ok(LiveNoteStatus::ActiveVisible(_))
+                    )
+                }
+            })
     }
 
     fn live_edges<'a>(
@@ -2373,7 +2418,7 @@ impl Snapshot {
             self.remaining()?;
             let mut permit = self.read_live().await?;
             if let Some(folder) = entry_folder {
-                authorize_entry(&permit, &self.ctx, folder)?;
+                self.check_entry(&permit, folder)?;
             } else if permit.space().lifecycle != SpaceLifecycle::Active {
                 return Err(DomainError::ResourceNotFound.into());
             }
@@ -2392,7 +2437,7 @@ impl Snapshot {
                     tokio::task::yield_now().await;
                     permit = self.read_live().await?;
                     if let Some(folder) = entry_folder {
-                        authorize_entry(&permit, &self.ctx, folder)?;
+                        self.check_entry(&permit, folder)?;
                     } else if permit.space().lifecycle != SpaceLifecycle::Active {
                         return Err(DomainError::ResourceNotFound.into());
                     }
@@ -2516,7 +2561,7 @@ impl StructuralSnapshot for Snapshot {
                 'verify: loop {
                     self.remaining()?;
                     let mut permit = self.read_live().await?;
-                    authorize_entry(&permit, &self.ctx, folder)?;
+                    self.check_entry(&permit, folder)?;
                     let head = permit.head();
                     let mut result = Vec::with_capacity(1 + descendants.len());
                     result.push(folder.clone());
@@ -2529,7 +2574,7 @@ impl StructuralSnapshot for Snapshot {
                             drop(permit);
                             tokio::task::yield_now().await;
                             permit = self.read_live().await?;
-                            authorize_entry(&permit, &self.ctx, folder)?;
+                            self.check_entry(&permit, folder)?;
                             if permit.head() != head {
                                 continue 'verify;
                             }
@@ -2558,7 +2603,7 @@ impl StructuralSnapshot for Snapshot {
             self.within_request(async {
                 let location = self.folder_scope(folder, false).await?;
                 if let Some(project) = &location.project {
-                    authorize_entry(&self.read_live().await?, &self.ctx, project)?;
+                    self.check_entry(&self.read_live().await?, project)?;
                 }
                 Ok(location.project)
             })
@@ -2597,7 +2642,7 @@ impl StructuralSnapshot for Snapshot {
         Box::pin(async move {
             self.within_request(async {
                 let permit = self.read_live().await?;
-                authorize_entry(&permit, &self.ctx, folder)?;
+                self.check_entry(&permit, folder)?;
                 let id = self
                     .index
                     .dense_folder_id(folder)
@@ -2681,6 +2726,64 @@ impl StructuralSnapshot for Snapshot {
 }
 
 impl ProjectionEngine {
+    fn acquire_snapshot_inner(
+        &self,
+        ctx: SpaceContext,
+        causal: CausalBasis,
+        mark_taint: bool,
+    ) -> PortFuture<'_, Box<dyn StructuralSnapshot>> {
+        Box::pin(async move {
+            within_budget(&ctx, async {
+                let request_deadline = Instant::now()
+                    .checked_add(ctx.budget.remaining)
+                    .ok_or_else(not_ready)?;
+                let cut = self
+                    .choose_read_with_taint(&ctx, &causal, None, mark_taint)
+                    .await?
+                    .cut;
+                let index = self.open_index_async(&cut).await?;
+                let permit = cut.live.read(&ctx.budget).await?;
+                if mark_taint {
+                    authorize_query(&permit, &ctx, &cut.root_folder_id, None, true)?;
+                } else {
+                    can_view_query_entry(&permit, &ctx, &cut.root_folder_id, None, true)?;
+                }
+                let universe = query::structural_universe(&index, permit.space(), ctx.auth())?;
+                let (visible, permit) = current_bitmap(
+                    &index,
+                    &cut,
+                    &ctx,
+                    permit,
+                    universe,
+                    LifecycleMask::Active,
+                    true,
+                )
+                .await?;
+                let _admission = self.current_admission(cut.cut.generation)?;
+                let mut snapshot_cut = cut.cut.clone();
+                snapshot_cut.canonical_seq = permit.head();
+                let live = cut.live.clone();
+                let snapshot: Box<dyn StructuralSnapshot> = Box::new(Snapshot {
+                    cut: snapshot_cut,
+                    published: cut,
+                    canonical: self.canonical.clone(),
+                    authority: self.projection_context.authority.clone(),
+                    request_deadline,
+                    index,
+                    visible,
+                    ctx: ctx.clone(),
+                    live,
+                    expires: Instant::now()
+                        .checked_add(self.reads.lifetime)
+                        .ok_or_else(not_ready)?,
+                    mark_taint,
+                });
+                Ok(snapshot)
+            })
+            .await
+        })
+    }
+
     fn filter_live_visible_inner<'a>(
         &'a self,
         ctx: &'a SpaceContext,
@@ -2731,48 +2834,15 @@ impl StructuralReadPort for ProjectionEngine {
         ctx: SpaceContext,
         causal: CausalBasis,
     ) -> PortFuture<'_, Box<dyn StructuralSnapshot>> {
-        Box::pin(async move {
-            within_budget(&ctx, async {
-                let request_deadline = Instant::now()
-                    .checked_add(ctx.budget.remaining)
-                    .ok_or_else(not_ready)?;
-                let cut = self.choose_read(&ctx, &causal, None).await?.cut;
-                let index = self.open_index_async(&cut).await?;
-                let permit = cut.live.read(&ctx.budget).await?;
-                authorize_query(&permit, &ctx, &cut.root_folder_id, None, true)?;
-                let universe = query::structural_universe(&index, permit.space(), ctx.auth())?;
-                let (visible, permit) = current_bitmap(
-                    &index,
-                    &cut,
-                    &ctx,
-                    permit,
-                    universe,
-                    LifecycleMask::Active,
-                    true,
-                )
-                .await?;
-                let _admission = self.current_admission(cut.cut.generation)?;
-                let mut snapshot_cut = cut.cut.clone();
-                snapshot_cut.canonical_seq = permit.head();
-                let live = cut.live.clone();
-                let snapshot: Box<dyn StructuralSnapshot> = Box::new(Snapshot {
-                    cut: snapshot_cut,
-                    published: cut,
-                    canonical: self.canonical.clone(),
-                    authority: self.projection_context.authority.clone(),
-                    request_deadline,
-                    index,
-                    visible,
-                    ctx: ctx.clone(),
-                    live,
-                    expires: Instant::now()
-                        .checked_add(self.reads.lifetime)
-                        .ok_or_else(not_ready)?,
-                });
-                Ok(snapshot)
-            })
-            .await
-        })
+        self.acquire_snapshot_inner(ctx, causal, true)
+    }
+
+    fn acquire_snapshot_preflight(
+        &self,
+        ctx: SpaceContext,
+        causal: CausalBasis,
+    ) -> PortFuture<'_, Box<dyn StructuralSnapshot>> {
+        self.acquire_snapshot_inner(ctx, causal, false)
     }
 
     fn is_live_visible<'a>(
