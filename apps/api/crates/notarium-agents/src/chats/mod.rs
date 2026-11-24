@@ -469,6 +469,17 @@ impl AgentRunSupervisor {
         let service = self.clone();
         detached(async move {
             account.auth().authorize_human_management()?;
+            let _drain = service
+                .inner
+                .revocations
+                .stop_and_drain_run(&run, &account.budget)
+                .await?;
+            service
+                .inner
+                .registry
+                .control()
+                .ensure_run_inactive(account.clone(), run.clone())
+                .await?;
             let ctx = SpaceContext::new(
                 account.auth().clone(),
                 scope.clone(),

@@ -1,0 +1,3230 @@
+//! End-to-end public-API regressions covering cross-layer seams on SQLite and PostgreSQL.
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
+
+use notarium_agents::{
+    chats::{AgentRunSupervisor, ChatRunOptions, ExclusiveDataRoot, StartChatRun},
+    keepers::KeeperScheduler,
+    mcp::{
+        ConfirmProposedDiff, EgressTarget, McpInvocationContext, PersonalToolInvocation,
+        ToolRegistry,
+    },
+};
+use notarium_canonical::{CreateFolderSpec, SqlBackendConfig, build_pg_connect_options};
+use notarium_control::{
+    outbound::{NetworkPolicy, OutboundTransport, PrivateNetworkRule},
+    service::{
+        ControlPlane,
+        provider::{ProviderConfig, ProviderService},
+    },
+};
+use notarium_core::{
+    DomainError,
+    auth::{ChatAudience, SpaceKind},
+    classes::{AbilityKind, DocClass},
+    error::{CommitEffect, PortError, RetryAdvice, ValidationReason},
+    ids::*,
+    model::{FolderRef, HistoryScope},
+    ports::{schedules::*, *},
+    receipt::{CausalBasis, CommandIdentity},
+    value::Timestamp,
+};
+use notarium_projections::{ProjectionConfig, ProjectorRuntime};
+use notarium_search::{
+    SearchDependencies, SearchEngine,
+    config::{SearchConfig, VectorMode},
+    layout::SearchLayout,
+    ports::{
+        EmbeddingBackendTarget, RemoteIndexingGrant, ResolvedEmbeddingTarget,
+        SearchModelResolverPort,
+    },
+};
+use serde_json::{Value, json};
+use sqlx::Connection as _;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+    time::timeout,
+};
+
+use super::{
+    real_reads::DerivedReads,
+    runtime_ability_cases::{
+        approve_disclosure, identity, loopback_provider, loopback_provider_with_limits,
+        read_request, send_ollama,
+    },
+    supervised_chat_cases::idle_leaf,
+    *,
+};
+
+struct SeamSearchModelResolver(Arc<ProviderService>);
+
+impl SearchModelResolverPort for SeamSearchModelResolver {
+    fn resolve_model<'a>(
+        &'a self,
+        authority: &'a ServiceAuthority,
+        scope: &'a HistoryScope,
+        explicit: Option<&'a ModelProfileId>,
+        budget: &'a CallBudget,
+    ) -> PortFuture<'a, Option<ResolvedEmbeddingTarget>> {
+        Box::pin(async move {
+            let resolved = self
+                .0
+                .resolve_search_embedding_model(
+                    authority,
+                    scope.clone(),
+                    explicit.cloned(),
+                    budget.clone(),
+                )
+                .await?;
+            Ok(resolved.map(|item| ResolvedEmbeddingTarget {
+                model: item.model,
+                dimension: item.dimension,
+                max_input_tokens: item.max_input_tokens,
+                backend: EmbeddingBackendTarget::Remote {
+                    provider: item.provider,
+                    runtime_epochs: item.runtime_epochs,
+                    project: item.project,
+                },
+            }))
+        })
+    }
+
+    fn remote_indexing_revision<'a>(
+        &'a self,
+        authority: &'a ServiceAuthority,
+        scope: &'a HistoryScope,
+        budget: CallBudget,
+    ) -> PortFuture<'a, ContentDigest> {
+        Box::pin(
+            self.0
+                .search_indexing_revision(authority, &scope.space_id, budget),
+        )
+    }
+
+    fn acquire_remote_indexing_grant<'a>(
+        &'a self,
+        authority: &'a ServiceAuthority,
+        scope: &'a HistoryScope,
+        revision_actor: &'a PrincipalId,
+        provider: &'a ProviderResourceId,
+        project: Option<&'a FolderRef>,
+        budget: CallBudget,
+    ) -> PortFuture<'a, Option<RemoteIndexingGrant>> {
+        Box::pin(async move {
+            Ok(self
+                .0
+                .admit_search_indexing(
+                    authority,
+                    scope.clone(),
+                    revision_actor,
+                    provider,
+                    project,
+                    budget,
+                )
+                .await?
+                .map(|(ctx, policy)| RemoteIndexingGrant { ctx, policy }))
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sqlite_seam_hardening() {
+    let _guard = support::AUTH_TEST_LOCK.lock().await;
+    Box::pin(exercise_seams(false)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_seam_hardening() {
+    let _guard = support::AUTH_TEST_LOCK.lock().await;
+    Box::pin(exercise_seams(true)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_keeper_single_connection_pool_no_deadlock() {
+    let _guard = support::AUTH_TEST_LOCK.lock().await;
+    let fixture =
+        RuntimeFixture::open_named_with_pg_pool(true, "keeper_pg_pool_one", Some(1)).await;
+    assert!(matches!(
+        fixture.canonical_config.sql,
+        SqlBackendConfig::Postgres { pool_size: 1, .. }
+    ));
+    Box::pin(run_single_pool_keeper(&fixture)).await;
+    fixture.close().await;
+}
+
+async fn exercise_seams(pg: bool) {
+    let fixture = Box::pin(RuntimeFixture::open_named(pg, "seam_hardening")).await;
+    let personal = fixture.personal_scope().await;
+
+    Box::pin(project_scoped_chat_starts_ai_and_blocks_foreign_project(
+        &fixture, &personal,
+    ))
+    .await;
+    Box::pin(remote_embedding_query_blocks_unconsented_model_sources(
+        &fixture, &personal, pg,
+    ))
+    .await;
+    Box::pin(cross_space_same_named_roles_keep_start_session_working(
+        &fixture,
+    ))
+    .await;
+    Box::pin(four_large_tool_results_do_not_wedge_32k_branch(
+        &fixture, &personal,
+    ))
+    .await;
+    Box::pin(composite_writes_upgrade_post_partial_commit_errors(
+        &fixture, &personal,
+    ))
+    .await;
+    Box::pin(rollback_run_stops_active_keeper_and_rejects_unsettled_runs(
+        &fixture, &personal,
+    ))
+    .await;
+    Box::pin(project_memory_proposal_preview_shows_destination(
+        &fixture, &personal,
+    ))
+    .await;
+    Box::pin(closed_chat_episode_recovers_and_role_typo_leaves_no_orphan(
+        &fixture, &personal,
+    ))
+    .await;
+    Box::pin(in_app_delete_note_replay_succeeds_with_same_key(
+        &fixture, &personal,
+    ))
+    .await;
+    Box::pin(keeper_one_shot_tick_handles_multi_boundary_clock_skew(
+        &fixture,
+    ))
+    .await;
+    Box::pin(folder_heads_space_updated_index_present(&fixture, pg)).await;
+
+    fixture.close().await;
+}
+
+async fn fresh_owner(fixture: &RuntimeFixture) -> AccountContext {
+    AccountContext::new(
+        fixture
+            .control
+            .trusted_none(
+                PerimeterAttestation::attest_checked()
+                    .with_human_management()
+                    .with_ability_write(),
+                budget(),
+            )
+            .await
+            .unwrap(),
+        budget(),
+    )
+}
+
+async fn create_project_folder(
+    fixture: &RuntimeFixture,
+    scope: &HistoryScope,
+    owner: &PrincipalId,
+    folder_id: FolderId,
+    slug: &str,
+) -> FolderRef {
+    let active_epoch = fixture
+        .canonical
+        .read_space(&scope.space_id)
+        .await
+        .unwrap()
+        .active_epoch;
+    fixture
+        .canonical
+        .create_folder(CreateFolderSpec {
+            scope: scope.clone(),
+            active_epoch,
+            folder_id: folder_id.clone(),
+            parent: None,
+            slug: slug.into(),
+            display_name: slug.into(),
+            is_project: true,
+            project_slug: Some(slug.into()),
+            actor: owner.clone(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+    FolderRef {
+        space_id: scope.space_id.clone(),
+        folder_id,
+    }
+}
+
+async fn call_mcp(
+    registry: &ToolRegistry,
+    account: &AccountContext,
+    key: [u8; 16],
+    tool: &str,
+    args: Value,
+) -> Result<McpToolResult, PortError> {
+    registry
+        .call_tool(
+            McpInvocationContext {
+                account: account.clone(),
+                target: EgressTarget::ExternalMcp,
+                request_key: CommandKey::from_bytes(key),
+            },
+            tool,
+            args,
+        )
+        .await
+}
+
+/// P1 #1: Project-scoped chats must start AI normally, while still preventing a
+/// project-scoped AgentRun from mutating threads in another project or root.
+async fn project_scoped_chat_starts_ai_and_blocks_foreign_project(
+    fixture: &RuntimeFixture,
+    personal: &SpaceContext,
+) {
+    let owner = fresh_owner(fixture).await;
+    let actor = owner.auth().principal().clone();
+    let scope = personal.scope().clone();
+    let project_a = create_project_folder(
+        fixture,
+        &scope,
+        &actor,
+        FolderId::from_bytes([0x61; 16]),
+        "chat-alpha",
+    )
+    .await;
+    let project_b = create_project_folder(
+        fixture,
+        &scope,
+        &actor,
+        FolderId::from_bytes([0x62; 16]),
+        "chat-beta",
+    )
+    .await;
+
+    let cmd = |tag: u8| CommandIdentity {
+        scope: scope.clone(),
+        actor: actor.clone(),
+        key: CommandKey::from_bytes([0x61, tag, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, tag]),
+        hash: ContentDigest::from_bytes([0x61; 32]),
+    };
+    let thread_a = ChatThreadId::from_bytes([0x61; 16]);
+    let thread_b = ChatThreadId::from_bytes([0x62; 16]);
+    for (tag, tid, pf) in [
+        (1, &thread_a, Some(project_a.folder_id.clone())),
+        (2, &thread_b, Some(project_b.folder_id.clone())),
+    ] {
+        fixture
+            .canonical
+            .create_chat(
+                personal.clone(),
+                Mutation {
+                    identity: cmd(tag),
+                    preconditions: Preconditions::default(),
+                    input: CreateChat {
+                        thread: tid.clone(),
+                        kind: ChatThreadKind::Personal,
+                        owner: actor.clone(),
+                        project_folder: pf,
+                        title: format!("Project thread {tag}"),
+                    },
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local = loopback_provider(fixture, &owner, &listener, 0x61, true).await;
+    approve_disclosure(
+        fixture,
+        &owner,
+        &local,
+        0x63,
+        ProviderAttachmentTarget::Personal {
+            owner: actor.clone(),
+            space: scope.space_id.clone(),
+        },
+        [DocClass::UserDoc, DocClass::AgentMemory].into(),
+    )
+    .await;
+    let supervisor = AgentRunSupervisor::new_local(
+        local.registry.clone(),
+        fixture.revocations.clone(),
+        ExclusiveDataRoot::attest_open_writer(),
+    );
+    let options = ChatRunOptions {
+        provider: Some(local.resource.id.clone()),
+        model: Some(local.model.clone()),
+        limits: RunLimits {
+            max_steps: 2,
+            max_tokens: 16_000,
+            timeout_ms: 15_000,
+        },
+        ..ChatRunOptions::default()
+    };
+
+    // Normal enqueue_input on a project chat must both persist the human input
+    // AND start the AI run (returning run = Some(_)).
+    let submitted = supervisor
+        .enqueue_input(
+            owner.clone(),
+            SubmitUserChatInput {
+                identity: cmd(3),
+                id: PendingInputId::from_bytes([0x61; 16]),
+                thread: thread_a.clone(),
+                expected_leaf: ThreadEntrySeq::ZERO,
+                body: "Hello project chat!".into(),
+                mentions_agent: false,
+            },
+            options.clone(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        submitted.run.is_some(),
+        "project chat submission must start an AI run"
+    );
+    let (mut wire, _prompt) = timeout(Duration::from_secs(15), read_request(&listener))
+        .await
+        .expect("project chat run must reach provider");
+    send_ollama(
+        &mut wire,
+        json!({"role": "assistant", "content": "Project reply ok."}),
+        "stop",
+    )
+    .await;
+    let leaf = idle_leaf(fixture, personal, &thread_a).await;
+    assert_eq!(leaf.get(), 2);
+
+    // Explicit `start` on the same project chat must also succeed.
+    let explicit_run = supervisor
+        .start(
+            owner.clone(),
+            StartChatRun {
+                scope: scope.clone(),
+                thread: thread_a.clone(),
+                expected_leaf: leaf,
+                options,
+            },
+        )
+        .await
+        .expect("explicit start on project chat must not return SpaceReadOnly");
+    let (mut wire, _) = timeout(Duration::from_secs(15), read_request(&listener))
+        .await
+        .expect("explicit start on project chat must reach provider");
+    send_ollama(
+        &mut wire,
+        json!({"role": "assistant", "content": "Second project reply."}),
+        "stop",
+    )
+    .await;
+    let _ = idle_leaf(fixture, personal, &thread_a).await;
+    assert_ne!(explicit_run, submitted.run.unwrap());
+
+    // Security invariant: an AgentRun pinned to project A must STILL be
+    // rejected with SpaceReadOnly if it tries to claim or mutate project B's thread.
+    let mut grants = owner.auth().spaces().clone();
+    grants.get_mut(&scope.space_id).unwrap().project_root = Some(project_a.folder_id.clone());
+    let run_a_id = AgentRunId::from_bytes([0x64; 16]);
+    let run_a_auth = owner
+        .auth()
+        .for_agent_run(
+            run_a_id.clone(),
+            scope.space_id.clone(),
+            ChatAudience::Personal,
+            grants,
+        )
+        .unwrap();
+    let run_a_ctx = SpaceContext::new(run_a_auth, scope.clone(), budget()).unwrap();
+    let foreign_claim = fixture
+        .canonical
+        .claim_active_run(
+            run_a_ctx.clone(),
+            ClaimChatRun {
+                thread: thread_b.clone(),
+                run: run_a_id.clone(),
+                expected_leaf: ThreadEntrySeq::ZERO,
+                previous_run: None,
+            },
+        )
+        .await;
+    assert!(
+        matches!(
+            foreign_claim,
+            Err(PortError::Domain(DomainError::SpaceReadOnly))
+        ),
+        "project-A AgentRun must be rejected with SpaceReadOnly on project-B thread, got {foreign_claim:?}"
+    );
+    let foreign_create = fixture
+        .canonical
+        .create_chat(
+            run_a_ctx,
+            Mutation {
+                identity: cmd(9),
+                preconditions: Preconditions::default(),
+                input: CreateChat {
+                    thread: ChatThreadId::from_bytes([0x69; 16]),
+                    kind: ChatThreadKind::Personal,
+                    owner: actor,
+                    project_folder: Some(project_a.folder_id),
+                    title: "Disallowed agent create".into(),
+                },
+            },
+        )
+        .await;
+    assert!(
+        matches!(
+            foreign_create,
+            Err(PortError::Domain(DomainError::SpaceReadOnly))
+        ),
+        "project-scoped AgentRun must not create chats, got {foreign_create:?}"
+    );
+}
+
+/// P1 #2: An AgentRun whose completion provider is consented to AgentMemory must
+/// not send model-authored search queries to a remote embedding provider that is
+/// only consented to UserDoc (falling back cleanly to lexical search), whereas a
+/// narrow completion provider consented only to UserDoc may use it.
+async fn remote_embedding_query_blocks_unconsented_model_sources(
+    fixture: &RuntimeFixture,
+    personal: &SpaceContext,
+    pg: bool,
+) {
+    let owner = fresh_owner(fixture).await;
+    let actor = owner.auth().principal().clone();
+    let scope = personal.scope().clone();
+    let emb_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let emb_addr = emb_listener.local_addr().unwrap();
+    let emb_hits = Arc::new(AtomicUsize::new(0));
+    let emb_hits_srv = Arc::clone(&emb_hits);
+    let emb_server = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = emb_listener.accept().await {
+            let emb_hits_srv = Arc::clone(&emb_hits_srv);
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                let header_end = loop {
+                    let read = stream.read(&mut tmp).await.unwrap_or(0);
+                    if read == 0 {
+                        return;
+                    }
+                    buf.extend_from_slice(&tmp[..read]);
+                    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&buf[..header_end]);
+                let content_length: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (k, v) = line.split_once(':')?;
+                        k.eq_ignore_ascii_case("content-length")
+                            .then(|| v.trim().parse().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                while buf.len() < header_end + content_length {
+                    let read = stream.read(&mut tmp).await.unwrap_or(0);
+                    if read == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&tmp[..read]);
+                }
+                let parsed: Value =
+                    serde_json::from_slice(&buf[header_end..header_end + content_length])
+                        .unwrap_or(Value::Null);
+                let count = match parsed.get("input") {
+                    Some(Value::Array(items)) => items.len().max(1),
+                    _ => 1,
+                };
+                emb_hits_srv.fetch_add(1, Ordering::SeqCst);
+                let mut unit = vec![0.0_f32; 64];
+                unit[0] = 1.0;
+                let embeddings = vec![unit; count];
+                let body = serde_json::to_vec(&json!({
+                    "model": "embed-fixture",
+                    "embeddings": embeddings,
+                    "prompt_eval_count": 8,
+                }))
+                .unwrap();
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes()).await;
+                let _ = stream.write_all(&body).await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+
+    let chat_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let chat_addr = chat_listener.local_addr().unwrap();
+    let emb_res = ProviderResourceId::from_bytes([0x71; 16]);
+    let emb_model = ModelProfileId::from_bytes([0x71; 16]);
+    let chat_wide_res = ProviderResourceId::from_bytes([0x74; 16]);
+    let chat_wide_model = ModelProfileId::from_bytes([0x74; 16]);
+    let chat_narrow_res = ProviderResourceId::from_bytes([0x77; 16]);
+    let chat_narrow_model = ModelProfileId::from_bytes([0x77; 16]);
+    let emb_origin = format!("http://127.0.0.1:{}", emb_addr.port());
+    let chat_origin = format!("http://127.0.0.1:{}", chat_addr.port());
+    let loopback: ipnet::IpNet = "127.0.0.1/32".parse().unwrap();
+    let network = NetworkPolicy::new(vec![
+        PrivateNetworkRule::new(emb_res.clone(), &emb_origin, vec![loopback]).unwrap(),
+        PrivateNetworkRule::new(chat_wide_res.clone(), &chat_origin, vec![loopback]).unwrap(),
+        PrivateNetworkRule::new(chat_narrow_res.clone(), &chat_origin, vec![loopback]).unwrap(),
+    ])
+    .unwrap();
+    let catalog = Arc::new(notarium_agents::abilities::SystemAbilityCatalog::new(
+        Arc::new(fixture.canonical.clone()),
+    ));
+    let provider_svc = Arc::new(
+        ProviderService::new(
+            fixture.control.clone(),
+            fixture.keyring.clone(),
+            Arc::new(OutboundTransport::new(network)),
+            catalog.clone(),
+            ProviderConfig::default(),
+        )
+        .unwrap(),
+    );
+
+    // Resource 1: remote embedding provider consented ONLY to UserDoc.
+    let saved_emb = provider_svc
+        .create_resource(
+            owner.clone(),
+            AccountMutation {
+                identity: identity(fixture, &owner, 0x71).await,
+                input: ProviderResourceSpec {
+                    id: emb_res.clone(),
+                    name: "UserDoc-only embedder".into(),
+                    wire: ProviderWireKind::Ollama,
+                    base_url: emb_origin,
+                    credential: None,
+                    headers: vec![],
+                    limits: ProviderLimits::default(),
+                    timeout_ms: 5_000,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    provider_svc
+        .put_model(
+            owner.clone(),
+            AccountMutation {
+                identity: identity(fixture, &owner, 0x72).await,
+                input: PutProviderModel {
+                    resource: emb_res.clone(),
+                    expected: saved_emb.value.revision,
+                    default: false,
+                    model: ProviderModelSpec {
+                        id: emb_model.clone(),
+                        wire_name: "embed-fixture".into(),
+                        kind: ProviderModelKind::Embedding { dimension: 64 },
+                        accounting: TokenAccountingProfile::ConservativeModelCapV1,
+                        max_input_tokens: 4096,
+                        max_output_tokens: 0,
+                        tools: false,
+                    },
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let emb_info = provider_svc
+        .list_resources(owner.clone(), ControlPageRequest::new(50, None).unwrap())
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .find(|item| item.id == emb_res)
+        .unwrap();
+    let att = provider_svc
+        .request_attachment(
+            owner.clone(),
+            AccountMutation {
+                identity: identity(fixture, &owner, 0x73).await,
+                input: RequestProviderAttachment {
+                    id: RequestId::from_bytes([0x73; 16]),
+                    expected: None,
+                    resource: emb_info.id.clone(),
+                    resource_consent_epoch: emb_info.consent_epoch,
+                    credential_consent_epoch: None,
+                    target: ProviderAttachmentTarget::Personal {
+                        owner: actor.clone(),
+                        space: scope.space_id.clone(),
+                    },
+                    consent: ProviderDisclosureConsent::attest_checked(ProviderDisclosure {
+                        classes: [DocClass::UserDoc].into(),
+                    }),
+                    expires_at_ms: None,
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    if att.state != ProviderAttachmentState::Approved {
+        provider_svc
+            .approve_attachment(
+                owner.clone(),
+                AccountMutation {
+                    identity: identity(fixture, &owner, 0x6F).await,
+                    input: ApproveProviderAttachment {
+                        id: att.id,
+                        expected: att.revision,
+                        resource_consent_epoch: att.resource_consent_epoch,
+                        credential_consent_epoch: att.credential_consent_epoch,
+                        consent: ProviderDisclosureConsent::attest_checked(ProviderDisclosure {
+                            classes: [DocClass::UserDoc].into(),
+                        }),
+                    },
+                },
+            )
+            .await
+            .unwrap();
+    }
+    provider_svc
+        .set_preference(
+            owner.clone(),
+            AccountMutation {
+                identity: identity(fixture, &owner, 0x70).await,
+                input: SetProviderPreference {
+                    scope: ProviderPreferenceScope::Personal,
+                    kind: PreferenceModelKind::Embedding,
+                    resource: emb_res.clone(),
+                    model: emb_model.clone(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+    // Resource 2: wide chat provider consented to UserDoc + AgentMemory.
+    let saved_wide = provider_svc
+        .create_resource(
+            owner.clone(),
+            AccountMutation {
+                identity: identity(fixture, &owner, 0x74).await,
+                input: ProviderResourceSpec {
+                    id: chat_wide_res.clone(),
+                    name: "Wide chat provider".into(),
+                    wire: ProviderWireKind::Ollama,
+                    base_url: chat_origin.clone(),
+                    credential: None,
+                    headers: vec![],
+                    limits: ProviderLimits::default(),
+                    timeout_ms: 5_000,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    provider_svc
+        .put_model(
+            owner.clone(),
+            AccountMutation {
+                identity: identity(fixture, &owner, 0x75).await,
+                input: PutProviderModel {
+                    resource: chat_wide_res.clone(),
+                    expected: saved_wide.value.revision,
+                    default: false,
+                    model: ProviderModelSpec {
+                        id: chat_wide_model.clone(),
+                        wire_name: "chat-wide".into(),
+                        kind: ProviderModelKind::Completion,
+                        accounting: TokenAccountingProfile::ConservativeModelCapV1,
+                        max_input_tokens: 16_384,
+                        max_output_tokens: 1024,
+                        tools: true,
+                    },
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let wide_info = provider_svc
+        .list_resources(owner.clone(), ControlPageRequest::new(50, None).unwrap())
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .find(|item| item.id == chat_wide_res)
+        .unwrap();
+    provider_svc
+        .request_attachment(
+            owner.clone(),
+            AccountMutation {
+                identity: identity(fixture, &owner, 0x76).await,
+                input: RequestProviderAttachment {
+                    id: RequestId::from_bytes([0x76; 16]),
+                    expected: None,
+                    resource: wide_info.id.clone(),
+                    resource_consent_epoch: wide_info.consent_epoch,
+                    credential_consent_epoch: None,
+                    target: ProviderAttachmentTarget::Personal {
+                        owner: actor.clone(),
+                        space: scope.space_id.clone(),
+                    },
+                    consent: ProviderDisclosureConsent::attest_checked(ProviderDisclosure {
+                        classes: [DocClass::UserDoc, DocClass::AgentMemory].into(),
+                    }),
+                    expires_at_ms: None,
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+    // Resource 3: narrow chat provider consented ONLY to UserDoc.
+    let saved_narrow = provider_svc
+        .create_resource(
+            owner.clone(),
+            AccountMutation {
+                identity: identity(fixture, &owner, 0x77).await,
+                input: ProviderResourceSpec {
+                    id: chat_narrow_res.clone(),
+                    name: "Narrow chat provider".into(),
+                    wire: ProviderWireKind::Ollama,
+                    base_url: chat_origin,
+                    credential: None,
+                    headers: vec![],
+                    limits: ProviderLimits::default(),
+                    timeout_ms: 5_000,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    provider_svc
+        .put_model(
+            owner.clone(),
+            AccountMutation {
+                identity: identity(fixture, &owner, 0x78).await,
+                input: PutProviderModel {
+                    resource: chat_narrow_res.clone(),
+                    expected: saved_narrow.value.revision,
+                    default: false,
+                    model: ProviderModelSpec {
+                        id: chat_narrow_model.clone(),
+                        wire_name: "chat-narrow".into(),
+                        kind: ProviderModelKind::Completion,
+                        accounting: TokenAccountingProfile::ConservativeModelCapV1,
+                        max_input_tokens: 16_384,
+                        max_output_tokens: 1024,
+                        tools: true,
+                    },
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let narrow_info = provider_svc
+        .list_resources(owner.clone(), ControlPageRequest::new(50, None).unwrap())
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .find(|item| item.id == chat_narrow_res)
+        .unwrap();
+    provider_svc
+        .request_attachment(
+            owner.clone(),
+            AccountMutation {
+                identity: identity(fixture, &owner, 0x79).await,
+                input: RequestProviderAttachment {
+                    id: RequestId::from_bytes([0x79; 16]),
+                    expected: None,
+                    resource: narrow_info.id.clone(),
+                    resource_consent_epoch: narrow_info.consent_epoch,
+                    credential_consent_epoch: None,
+                    target: ProviderAttachmentTarget::Personal {
+                        owner: actor.clone(),
+                        space: scope.space_id.clone(),
+                    },
+                    consent: ProviderDisclosureConsent::attest_checked(ProviderDisclosure {
+                        classes: [DocClass::UserDoc].into(),
+                    }),
+                    expires_at_ms: None,
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+    // Run one real completion step for `wide_run` on `chat_wide_res` and one for
+    // `narrow_run` on `chat_narrow_res` so `provider_call_log` binds each run.
+    let run_one_completion = |run_id: AgentRunId,
+                              res_id: ProviderResourceId,
+                              model_id: ModelProfileId,
+                              intent_tag: u8| {
+        let provider_svc = provider_svc.clone();
+        let owner = owner.clone();
+        let scope = scope.clone();
+        let listener = &chat_listener;
+        async move {
+            let auth = owner
+                .auth()
+                .for_agent_run(
+                    run_id,
+                    scope.space_id.clone(),
+                    ChatAudience::Personal,
+                    owner.auth().spaces().clone(),
+                )
+                .unwrap();
+            let ctx = SpaceContext::new(auth.clone(), scope.clone(), budget()).unwrap();
+            let selection = provider_svc
+                .select_provider(
+                    ctx.clone(),
+                    SelectProvider {
+                        kind: PreferenceModelKind::Completion,
+                        resource: Some(res_id),
+                        model: Some(model_id),
+                        project: None,
+                    },
+                )
+                .await
+                .unwrap();
+            let req = CompletionRequest {
+                intent: CommandKey::from_bytes([intent_tag; 16]),
+                selection,
+                secondary_projects: vec![],
+                messages: vec![CompletionMessage {
+                    role: CompletionRole::User,
+                    instruction: Some(
+                        ProviderInstruction::from_orchestrator("Plan search".into()).unwrap(),
+                    ),
+                    parts: vec![],
+                    tool_calls: vec![],
+                    result_for: None,
+                }],
+                tools: vec![],
+                budget: CompletionBudget {
+                    max_input_tokens: 4096,
+                    max_output_tokens: 128,
+                    max_tool_calls: 0,
+                },
+            };
+            let call_fut = provider_svc.complete(ctx.clone(), req);
+            let serve_fut = async {
+                let (mut wire, _) = timeout(Duration::from_secs(10), read_request(listener))
+                    .await
+                    .unwrap();
+                send_ollama(
+                    &mut wire,
+                    json!({"role": "assistant", "content": "done"}),
+                    "stop",
+                )
+                .await;
+            };
+            let (stream_res, ()) = tokio::join!(call_fut, serve_fut);
+            let mut stream = stream_res.unwrap();
+            while let Some(ev) = stream.next().await.unwrap() {
+                if matches!(ev, CompletionEvent::Finished(_)) {
+                    break;
+                }
+            }
+            ctx
+        }
+    };
+
+    let wide_run_ctx = run_one_completion(
+        AgentRunId::from_bytes([0x7A; 16]),
+        chat_wide_res.clone(),
+        chat_wide_model.clone(),
+        0x7A,
+    )
+    .await;
+    let narrow_run_ctx = run_one_completion(
+        AgentRunId::from_bytes([0x7B; 16]),
+        chat_narrow_res.clone(),
+        chat_narrow_model.clone(),
+        0x7B,
+    )
+    .await;
+
+    // 1. Direct query_disclosure + direct embed for `wide_run` MUST refuse UserDoc-only embedder.
+    let disclosed_wide = EmbeddingProviderPort::query_disclosure(
+        provider_svc.as_ref(),
+        wide_run_ctx.clone(),
+        emb_res.clone(),
+        emb_model.clone(),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(
+        disclosed_wide.is_empty(),
+        "query_disclosure must return empty when AgentRun completion provider had AgentMemory consent but embedder allows only UserDoc"
+    );
+    let direct_wide = provider_svc
+        .embed(
+            wide_run_ctx.clone(),
+            EmbeddingRequest::query(
+                CommandKey::from_bytes([0x7C; 16]),
+                emb_model.clone(),
+                emb_res.clone(),
+                EmbeddingQueryInput {
+                    text: "secret copied from AgentMemory".into(),
+                    tokens: 8,
+                    classes: [DocClass::UserDoc].into(),
+                    project_scope: None,
+                    folder: None,
+                },
+            ),
+        )
+        .await;
+    assert!(
+        matches!(
+            direct_wide,
+            Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
+                if diagnostic.reason == ValidationReason::ClassEgressForbidden
+        ),
+        "direct embed for wide AgentRun must fail with ClassEgressForbidden, got {direct_wide:?}"
+    );
+    assert_eq!(
+        emb_hits.load(Ordering::SeqCst),
+        0,
+        "no HTTP bytes may reach the UserDoc-only embedding provider for wide AgentRun"
+    );
+
+    // 2. Control positive case: `narrow_run` (whose completion provider only allowed
+    //    UserDoc) IS allowed to query the UserDoc-only embedding provider!
+    let disclosed_narrow = EmbeddingProviderPort::query_disclosure(
+        provider_svc.as_ref(),
+        narrow_run_ctx.clone(),
+        emb_res.clone(),
+        emb_model.clone(),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(disclosed_narrow, [DocClass::UserDoc].into());
+    let direct_narrow = provider_svc
+        .embed(
+            narrow_run_ctx,
+            EmbeddingRequest::query(
+                CommandKey::from_bytes([0x7E; 16]),
+                emb_model.clone(),
+                emb_res.clone(),
+                EmbeddingQueryInput {
+                    text: "strictly UserDoc query".into(),
+                    tokens: 6,
+                    classes: [DocClass::UserDoc].into(),
+                    project_scope: None,
+                    folder: None,
+                },
+            ),
+        )
+        .await
+        .expect("narrow UserDoc-only AgentRun must be allowed to query UserDoc-only embedder");
+    assert_eq!(direct_narrow.vectors.len(), 1);
+    assert_eq!(emb_hits.load(Ordering::SeqCst), 1);
+
+    // 3. On SQLite, wire real SearchEngine (VectorMode::RemoteOnly) + ToolRegistry
+    //    against `provider_svc` and verify BOTH:
+    //    (a) `wide_run_ctx` degrades to ProviderUnavailable + lexical hit with 0 query calls;
+    //    (b) an unlogged AgentRun using `InAppProvider(chat_wide_res)` is ALSO blocked from
+    //        sending query text to the UserDoc-only embedder (0 query calls, lexical hit ok);
+    //    (c) an unlogged AgentRun using `InAppProvider(chat_narrow_res)` DOES invoke the
+    //        remote embedder (+1 query call).
+    if !pg {
+        let resolved_model = provider_svc
+            .resolve_search_embedding_model(
+                &ServiceAuthority::admit(ServicePurpose::Search),
+                scope.clone(),
+                None,
+                budget(),
+            )
+            .await
+            .unwrap()
+            .expect("resolve_search_embedding_model must resolve personal embedding provider");
+        assert_eq!(resolved_model.provider, emb_res);
+        let root = DataRoot::new(fixture.storage.root.as_ref().unwrap());
+        let projector = ProjectorRuntime::start_sqlite(
+            fixture.canonical.clone(),
+            MaintenanceContext {
+                authority: ServiceAuthority::admit(ServicePurpose::Projection),
+                budget: budget(),
+            },
+            root.clone(),
+            ProjectionGeneration::new(1).unwrap(),
+            ProjectionConfig::default(),
+        )
+        .await
+        .unwrap();
+        let proj = projector.engine();
+        let mut deps = SearchDependencies::new(Arc::new(fixture.canonical.clone()), proj.clone());
+        deps.model_resolver = Some(Arc::new(SeamSearchModelResolver(provider_svc.clone())));
+        deps.providers = Some(provider_svc.clone());
+        let search = Arc::new(SearchEngine::start(
+            SearchConfig::new(root.clone(), VectorMode::RemoteOnly),
+            deps,
+        ));
+        search.start_space(scope.clone()).unwrap();
+        let _ = fixture.projections.real.set(DerivedReads {
+            projection_calls: Default::default(),
+            notes: proj.note_reads(),
+            projection: proj.clone(),
+            search: search.clone(),
+        });
+        let doc_id = NoteId::from_bytes([0x7F; 16]);
+        let root_folder = fixture
+            .canonical
+            .read_space(&scope.space_id)
+            .await
+            .unwrap()
+            .root_folder_id;
+        let created_note = fixture
+            .canonical
+            .create_note(
+                personal.clone(),
+                Mutation {
+                    identity: CommandIdentity {
+                        scope: scope.clone(),
+                        actor: actor.clone(),
+                        key: CommandKey::from_bytes([0x7F; 16]),
+                        hash: ContentDigest::from_bytes([0x7F; 32]),
+                    },
+                    preconditions: Preconditions::default(),
+                    input: CreateNote {
+                        note: doc_id.clone(),
+                        parent: Some(root_folder),
+                        slug: "lexical-fallback-note".into(),
+                        class: DocClass::UserDoc,
+                        carrier: "# Lexical\n\nquasar telemetry beacon\n".into(),
+                        folder_page: false,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        let layout = SearchLayout::open(&root, scope.clone()).unwrap();
+        timeout(Duration::from_secs(15), async {
+            loop {
+                if let Ok(Some(manifest)) = layout.search_manifest()
+                    && manifest.tantivy_seq >= created_note.receipt.seq()
+                    && manifest.vector_seq.is_some()
+                    && !manifest.embeddings_pending
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("remote vector indexing must finish before query disclosure check");
+
+        let hits_after_index = emb_hits.load(Ordering::SeqCst);
+        assert!(
+            hits_after_index >= 2,
+            "expected remote indexing to hit embedder, got {hits_after_index}"
+        );
+
+        // (a) Direct SearchEngine query for `wide_run_ctx`: degrades cleanly to lexical, 0 wire calls.
+        let res = search
+            .search(
+                wide_run_ctx,
+                SearchQuery {
+                    text: "quasar telemetry beacon".into(),
+                    filter: notarium_core::query::FieldFilterAstV1 {
+                        version: 1,
+                        predicate: notarium_core::query::Predicate::All(vec![]),
+                    },
+                    classes: [DocClass::UserDoc].into(),
+                    folder: None,
+                    causal: CausalBasis::Await(Default::default()),
+                    include_chats: false,
+                    top_k: PageLimit::new(10).unwrap(),
+                    model: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            res.hits
+                .iter()
+                .any(|h| h.card.document.provenance().reference().note_id == doc_id),
+            "lexical fallback must still return matching UserDoc hits"
+        );
+        assert!(
+            matches!(res.degraded, Some(SearchDegradation::ProviderUnavailable)),
+            "wide_run_ctx must degrade vector search instead of disclosing query text, got {:?}",
+            res.degraded
+        );
+        assert_eq!(
+            emb_hits.load(Ordering::SeqCst),
+            hits_after_index,
+            "zero HTTP calls may reach UserDoc-only embedder for wide_run_ctx"
+        );
+
+        // (b) Unlogged AgentRun calling MCP `search` through InAppProvider(chat_wide_res)
+        //     must STILL be blocked by SearchRecipient::query_source_classes().
+        let emb_registry = ToolRegistry::new(
+            Arc::new(ControlPlane::new(provider_svc.as_ref().clone())),
+            catalog,
+            Arc::new(TestEngine(
+                fixture.canonical.clone(),
+                fixture.projections.clone(),
+            )),
+            fixture.control.clone(),
+        )
+        .with_vector_search(true);
+        let fresh_agent_auth = owner
+            .auth()
+            .for_agent_run(
+                AgentRunId::from_bytes([0x7D; 16]),
+                scope.space_id.clone(),
+                ChatAudience::Personal,
+                owner.auth().spaces().clone(),
+            )
+            .unwrap();
+        let fresh_agent_account = AccountContext::new(fresh_agent_auth, budget());
+        let wide_tool_res = emb_registry
+            .call_tool(
+                McpInvocationContext {
+                    account: fresh_agent_account.clone(),
+                    target: EgressTarget::InAppProvider {
+                        provider: chat_wide_res.clone(),
+                        model: chat_wide_model.clone(),
+                        primary_project: None,
+                    },
+                    request_key: CommandKey::from_bytes([0x7D; 16]),
+                },
+                "search",
+                json!({ "query": "quasar telemetry beacon" }),
+            )
+            .await
+            .unwrap();
+        assert!(
+            serde_json::to_string(&wide_tool_res.structured_content)
+                .unwrap()
+                .contains(doc_id.as_str()),
+            "unlogged wide InAppProvider search must still return lexical hits"
+        );
+        assert_eq!(
+            emb_hits.load(Ordering::SeqCst),
+            hits_after_index,
+            "unlogged wide InAppProvider search must NOT send query text to UserDoc-only embedder"
+        );
+
+        // (c) Positive control: same unlogged AgentRun with narrow UserDoc-only completion
+        //     provider IS allowed to execute semantic query (+1 embedder HTTP call).
+        let narrow_tool_res = emb_registry
+            .call_tool(
+                McpInvocationContext {
+                    account: fresh_agent_account,
+                    target: EgressTarget::InAppProvider {
+                        provider: chat_narrow_res.clone(),
+                        model: chat_narrow_model.clone(),
+                        primary_project: None,
+                    },
+                    request_key: CommandKey::from_bytes([0x7E; 16]),
+                },
+                "search",
+                json!({ "query": "quasar telemetry beacon" }),
+            )
+            .await
+            .unwrap();
+        assert!(
+            serde_json::to_string(&narrow_tool_res.structured_content)
+                .unwrap()
+                .contains(doc_id.as_str())
+        );
+        assert_eq!(
+            emb_hits.load(Ordering::SeqCst),
+            hits_after_index + 1,
+            "narrow UserDoc-only InAppProvider search must reach the UserDoc-only embedder"
+        );
+
+        search.shutdown().await;
+        projector.shutdown().await.unwrap();
+    }
+
+    emb_server.abort();
+}
+
+/// P1 #3: Two same-named roles in two different Shared Spaces must NOT break
+/// `start_session({})` or runtime `list_abilities`, while bare `use_role` still
+/// refuses ambiguous name resolution and exact `ref` succeeds.
+async fn cross_space_same_named_roles_keep_start_session_working(fixture: &RuntimeFixture) {
+    let owner = fresh_owner(fixture).await;
+    let space_a = fixture
+        .control
+        .create_space(
+            owner.clone(),
+            AccountMutation {
+                identity: identity(fixture, &owner, 0x81).await,
+                input: CreateSpace {
+                    id: SpaceId::from_bytes([0x81; 16]),
+                    kind: SpaceKind::Shared,
+                    name: "Shared Alpha".into(),
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    let space_b = fixture
+        .control
+        .create_space(
+            owner.clone(),
+            AccountMutation {
+                identity: identity(fixture, &owner, 0x82).await,
+                input: CreateSpace {
+                    id: SpaceId::from_bytes([0x82; 16]),
+                    kind: SpaceKind::Shared,
+                    name: "Shared Beta".into(),
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    let owner = fresh_owner(fixture).await;
+    let role_a = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0x83; 16],
+        "create_ability",
+        json!({
+            "kind": "role",
+            "name": "reviewer",
+            "description": "Alpha reviewer",
+            "instructions": "Review alpha docs.",
+            "placement": { "home": "space", "space": space_a.slug },
+        }),
+    )
+    .await
+    .unwrap();
+    let role_b = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0x84; 16],
+        "create_ability",
+        json!({
+            "kind": "role",
+            "name": "reviewer",
+            "description": "Beta reviewer",
+            "instructions": "Review beta docs.",
+            "placement": { "home": "space", "space": space_b.slug },
+        }),
+    )
+    .await
+    .unwrap();
+    let ref_a = role_a.structured_content["ref"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let ref_b = role_b.structured_content["ref"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(ref_a, ref_b);
+
+    let started = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0x85; 16],
+        "start_session",
+        json!({}),
+    )
+    .await
+    .expect("start_session({}) must succeed despite same-named roles in two Shared Spaces");
+    assert!(started.structured_content["session"]["id"].is_string());
+    assert!(started.structured_content.get("delta").is_some());
+
+    let listed = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0x86; 16],
+        "list_abilities",
+        json!({ "view": "runtime", "limit": 50 }),
+    )
+    .await
+    .expect("runtime list_abilities must succeed with cross-Space same-named roles");
+    let reviewer_refs: BTreeSet<&str> = listed.structured_content["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| item["name"] == "reviewer")
+        .filter_map(|item| item["ref"].as_str())
+        .collect();
+    assert!(reviewer_refs.contains(ref_a.as_str()));
+    assert!(reviewer_refs.contains(ref_b.as_str()));
+
+    let ambiguous = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0x87; 16],
+        "use_role",
+        json!({ "name": "reviewer" }),
+    )
+    .await;
+    assert!(
+        matches!(
+            ambiguous,
+            Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
+                if diagnostic.reason == ValidationReason::InvalidState
+        ),
+        "ambiguous bare-name use_role must still reject instead of guessing, got {:?}",
+        ambiguous.err()
+    );
+    let exact = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0x88; 16],
+        "use_role",
+        json!({ "name": ref_a }),
+    )
+    .await
+    .expect("exact ref use_role must succeed");
+    assert_eq!(exact.structured_content["name"], "reviewer");
+}
+
+/// P1 #4: PostgreSQL with canonical `pool_size = 1` must execute a Keeper turn
+/// through its first provider call without deadlocking on canonical pool reuse.
+async fn run_single_pool_keeper(fixture: &RuntimeFixture) {
+    let owner = fresh_owner(fixture).await;
+    let actor = owner.auth().principal().clone();
+    let shared = fixture
+        .control
+        .create_space(
+            owner.clone(),
+            AccountMutation {
+                identity: identity(fixture, &owner, 0x91).await,
+                input: CreateSpace {
+                    id: SpaceId::from_bytes([0x91; 16]),
+                    kind: SpaceKind::Shared,
+                    name: "Pool-one Keeper".into(),
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    let owner = fresh_owner(fixture).await;
+    let project = create_project_folder(
+        fixture,
+        &shared.history,
+        &actor,
+        FolderId::from_bytes([0x92; 16]),
+        "pool-one",
+    )
+    .await;
+    let project_handle = format!("{}/pool-one", shared.slug);
+    call_mcp(
+        &fixture.registry,
+        &owner,
+        [0x93; 16],
+        "create_ability",
+        json!({
+            "kind": "role",
+            "name": "pool-one-keeper-role",
+            "description": "Role for single-conn pool test",
+            "instructions": "Record one project observation.",
+            "placement": { "home": "space", "space": shared.slug },
+        }),
+    )
+    .await
+    .unwrap();
+    let AbilityResolution::Resolved(role) = fixture
+        .control
+        .resolve_ability(
+            owner.clone(),
+            AbilitySelection::Name {
+                name: "pool-one-keeper-role".into(),
+                kind: AbilityKind::Role,
+                project: Some(project.clone()),
+            },
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("missing pool-one role");
+    };
+    let candidate = fixture
+        .control
+        .schedule_ability_candidate(
+            owner.clone(),
+            ScheduleAbilitySelection {
+                space: project.space_id.clone(),
+                project: Some(project.clone()),
+                role: role.reference.identity(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local = loopback_provider(fixture, &owner, &listener, 0x94, true).await;
+    let classes: BTreeSet<DocClass> =
+        [DocClass::Skill, DocClass::AgentMemory, DocClass::UserDoc].into();
+    approve_disclosure(
+        fixture,
+        &owner,
+        &local,
+        0x96,
+        ProviderAttachmentTarget::Personal {
+            owner: actor.clone(),
+            space: project.space_id.clone(),
+        },
+        classes.clone(),
+    )
+    .await;
+    approve_disclosure(
+        fixture,
+        &owner,
+        &local,
+        0x97,
+        ProviderAttachmentTarget::Project(project.clone()),
+        classes,
+    )
+    .await;
+    local
+        .provider
+        .set_preference(
+            owner.clone(),
+            AccountMutation {
+                identity: identity(fixture, &owner, 0x98).await,
+                input: SetProviderPreference {
+                    scope: ProviderPreferenceScope::Project(project.clone()),
+                    kind: PreferenceModelKind::Completion,
+                    resource: local.resource.id.clone(),
+                    model: local.model.clone(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+    let due = Timestamp::parse("2025-01-05T03:00:00Z").unwrap();
+    fixture
+        .storage
+        .clock
+        .0
+        .store(due.unix_seconds() * 1000, Ordering::SeqCst);
+    let schedule = fixture
+        .control
+        .create_schedule(
+            owner.clone(),
+            AccountMutation {
+                identity: identity(fixture, &owner, 0x99).await,
+                input: CreateSchedule {
+                    id: ScheduleId::from_bytes([0x99; 16]),
+                    definition: ScheduleDefinition {
+                        space: project.space_id.clone(),
+                        project: Some(project.clone()),
+                        title: "PG pool=1 Keeper".into(),
+                        init_prompt: "Record observation".into(),
+                        cron: "0 0 3 * * Sun *".into(),
+                        timezone: "UTC".into(),
+                        approved_role: candidate.approved_role,
+                        limits: RunLimits {
+                            max_steps: 3,
+                            max_tokens: 64_000,
+                            timeout_ms: 15_000,
+                        },
+                    },
+                    approved_skills: candidate.approved_skills,
+                    next_slot: due,
+                    paused: false,
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+
+    let scheduler = KeeperScheduler::new_local(
+        local.registry,
+        fixture.revocations.clone(),
+        ExclusiveDataRoot::attest_open_writer(),
+    );
+    let mut worker = tokio::spawn({
+        let scheduler = scheduler.clone();
+        async move { scheduler.tick(due).await.unwrap() }
+    });
+    let (mut wire1, _) = tokio::select! {
+        req = timeout(Duration::from_secs(12), read_request(&listener)) => {
+            req.expect("PG pool_size=1 Keeper must reach first provider call without deadlock")
+        }
+        res = &mut worker => panic!("Keeper exited before provider call: {res:?}"),
+    };
+    send_ollama(
+        &mut wire1,
+        json!({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "function": {
+                    "name": "remember_about_project",
+                    "arguments": {
+                        "project": project_handle,
+                        "category": "progress",
+                        "observation": "Single PG pool connection worked."
+                    }
+                }
+            }]
+        }),
+        "tool_calls",
+    )
+    .await;
+    let (mut wire2, _) = timeout(Duration::from_secs(12), read_request(&listener))
+        .await
+        .expect("PG pool_size=1 Keeper must reach second provider call");
+    send_ollama(
+        &mut wire2,
+        json!({"role": "assistant", "content": "Done."}),
+        "stop",
+    )
+    .await;
+    let report = timeout(Duration::from_secs(12), worker)
+        .await
+        .expect("PG pool_size=1 tick must finish")
+        .unwrap();
+    assert_eq!(report.succeeded, 1);
+    let runs = fixture
+        .control
+        .list_schedule_runs(
+            ScheduleRunContext::Owner(Box::new(owner)),
+            schedule.id,
+            ControlPageRequest::new(10, None).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(runs.items.len(), 1);
+    assert_eq!(
+        runs.items[0].status,
+        ScheduleRunStatus::Terminal(ScheduleOutcome::Succeeded)
+    );
+}
+
+/// P2 #2: Four 36 KiB `get_note` tool results in a single assistant step must not
+/// wedge a 32,768-token model branch on the next turn.
+async fn four_large_tool_results_do_not_wedge_32k_branch(
+    fixture: &RuntimeFixture,
+    personal: &SpaceContext,
+) {
+    let owner = fresh_owner(fixture).await;
+    let actor = owner.auth().principal().clone();
+    let scope = personal.scope().clone();
+    let root_folder = fixture
+        .canonical
+        .read_space(&scope.space_id)
+        .await
+        .unwrap()
+        .root_folder_id;
+    let mut note_ids = Vec::new();
+    let big_body = format!("# Big Note\n\n{}", "alpha beta gamma delta ".repeat(1_800));
+    assert!(big_body.len() > 36 * 1024);
+    for i in 0..4_u8 {
+        let nid = NoteId::from_bytes([0xA1, i, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, i]);
+        fixture
+            .canonical
+            .create_note(
+                personal.clone(),
+                Mutation {
+                    identity: CommandIdentity {
+                        scope: scope.clone(),
+                        actor: actor.clone(),
+                        key: CommandKey::from_bytes([
+                            0xA1, i, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, i,
+                        ]),
+                        hash: ContentDigest::from_bytes([0xA1; 32]),
+                    },
+                    preconditions: Preconditions::default(),
+                    input: CreateNote {
+                        note: nid.clone(),
+                        parent: Some(root_folder.clone()),
+                        slug: format!("big-tool-note-{i}"),
+                        class: DocClass::UserDoc,
+                        carrier: big_body.clone(),
+                        folder_page: false,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        note_ids.push(nid);
+    }
+
+    let thread = ChatThreadId::from_bytes([0xA2; 16]);
+    fixture
+        .canonical
+        .create_chat(
+            personal.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: scope.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([0xA2; 16]),
+                    hash: ContentDigest::from_bytes([0xA2; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: CreateChat {
+                    thread: thread.clone(),
+                    kind: ChatThreadKind::Personal,
+                    owner: actor.clone(),
+                    project_folder: None,
+                    title: "32k 4-tool branch".into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local =
+        loopback_provider_with_limits(fixture, &owner, &listener, 0xA3, true, 32_768, 1024).await;
+    approve_disclosure(
+        fixture,
+        &owner,
+        &local,
+        0xA5,
+        ProviderAttachmentTarget::Personal {
+            owner: actor.clone(),
+            space: scope.space_id.clone(),
+        },
+        [DocClass::UserDoc].into(),
+    )
+    .await;
+    let supervisor = AgentRunSupervisor::new_local(
+        local.registry.clone(),
+        fixture.revocations.clone(),
+        ExclusiveDataRoot::attest_open_writer(),
+    );
+    let options = ChatRunOptions {
+        provider: Some(local.resource.id.clone()),
+        model: Some(local.model.clone()),
+        limits: RunLimits {
+            max_steps: 4,
+            max_tokens: 120_000,
+            timeout_ms: 20_000,
+        },
+        ..ChatRunOptions::default()
+    };
+
+    // Turn 1: model invokes 4 × get_note on >36 KiB notes in one step.
+    supervisor
+        .enqueue_input(
+            owner.clone(),
+            SubmitUserChatInput {
+                identity: CommandIdentity {
+                    scope: scope.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([0xA6; 16]),
+                    hash: ContentDigest::from_bytes([0xA6; 32]),
+                },
+                id: PendingInputId::from_bytes([0xA6; 16]),
+                thread: thread.clone(),
+                expected_leaf: ThreadEntrySeq::ZERO,
+                body: "Read all four notes.".into(),
+                mentions_agent: false,
+            },
+            options.clone(),
+        )
+        .await
+        .unwrap();
+    let (mut wire1, _) = timeout(Duration::from_secs(15), read_request(&listener))
+        .await
+        .unwrap();
+    let tool_calls: Vec<Value> = note_ids
+        .iter()
+        .map(|nid| {
+            json!({
+                "function": {
+                    "name": "get_note",
+                    "arguments": { "ref": nid }
+                }
+            })
+        })
+        .collect();
+    send_ollama(
+        &mut wire1,
+        json!({"role": "assistant", "content": "Reading 4 notes.", "tool_calls": tool_calls}),
+        "tool_calls",
+    )
+    .await;
+    let (mut wire2, prompt2) = timeout(Duration::from_secs(15), read_request(&listener))
+        .await
+        .expect("step 2 after 4 large tool results must fit in 32k window");
+    let tool_msgs: Vec<&Value> = prompt2["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["role"] == "tool")
+        .collect();
+    assert_eq!(tool_msgs.len(), 4);
+    send_ollama(
+        &mut wire2,
+        json!({"role": "assistant", "content": "Summarized all four."}),
+        "stop",
+    )
+    .await;
+    let leaf1 = idle_leaf(fixture, personal, &thread).await;
+
+    // Turn 2: follow-up turn on the SAME branch must succeed without TokenBudgetExceeded.
+    supervisor
+        .enqueue_input(
+            owner.clone(),
+            SubmitUserChatInput {
+                identity: CommandIdentity {
+                    scope: scope.clone(),
+                    actor,
+                    key: CommandKey::from_bytes([0xA7; 16]),
+                    hash: ContentDigest::from_bytes([0xA7; 32]),
+                },
+                id: PendingInputId::from_bytes([0xA7; 16]),
+                thread: thread.clone(),
+                expected_leaf: leaf1,
+                body: "Short follow-up question.".into(),
+                mentions_agent: false,
+            },
+            options,
+        )
+        .await
+        .unwrap();
+    let (mut wire3, _) = timeout(Duration::from_secs(15), read_request(&listener))
+        .await
+        .expect("follow-up turn on 32k branch after 4 large tool outputs must not wedge");
+    send_ollama(
+        &mut wire3,
+        json!({"role": "assistant", "content": "Follow-up ok."}),
+        "stop",
+    )
+    .await;
+    let leaf2 = idle_leaf(fixture, personal, &thread).await;
+    assert!(leaf2 > leaf1);
+}
+
+/// P2 #3: Composite writes (`link_many` across two Spaces; `create_note` into a
+/// new subfolder) must upgrade post-partial-commit operational errors to
+/// `CommitEffect::Unknown` with `RetryAdvice::RetrySameCommand`.
+async fn composite_writes_upgrade_post_partial_commit_errors(
+    fixture: &RuntimeFixture,
+    personal: &SpaceContext,
+) {
+    let owner = fresh_owner(fixture).await;
+    let actor = owner.auth().principal().clone();
+    let personal_scope = personal.scope().clone();
+    let personal_slug = fixture
+        .canonical
+        .read_space(&personal_scope.space_id)
+        .await
+        .unwrap()
+        .slug;
+    let _proj = create_project_folder(
+        fixture,
+        &personal_scope,
+        &actor,
+        FolderId::from_bytes([0xB1; 16]),
+        "comp-writes",
+    )
+    .await;
+    let project_handle = format!("{personal_slug}/comp-writes");
+
+    // 1a. create_note into a NEW subfolder fails operationally after ensure_folder_path
+    //     durably creates the subfolder -> must return Unknown + RetrySameCommand.
+    fixture.projections.fail_next_create_note_not_committed();
+    let err = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xB2; 16],
+        "create_note",
+        json!({
+            "project": project_handle,
+            "path": "brand-new-sub",
+            "title": "Composite create",
+            "body": "Body text",
+        }),
+    )
+    .await
+    .err()
+    .expect("create_note after subfolder creation must return injected deadline error");
+    assert!(
+        matches!(
+            err,
+            PortError::DeadlineExceeded(ref f)
+                if f.effect() == CommitEffect::Unknown && f.retry() == RetryAdvice::RetrySameCommand
+        ),
+        "create_note failing after creating subfolder must return Unknown+RetrySameCommand, got {err:?}"
+    );
+    // Retrying with the exact same request key succeeds cleanly.
+    let created = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xB2; 16],
+        "create_note",
+        json!({
+            "project": project_handle,
+            "path": "brand-new-sub",
+            "title": "Composite create",
+            "body": "Body text",
+        }),
+    )
+    .await
+    .expect("retry of create_note with same key must succeed");
+    assert!(created.structured_content["noteId"].is_string());
+
+    // 1b. Control: create_note directly in existing project root (no folder created)
+    //     failing operationally preserves CommitEffect::NotCommitted.
+    fixture.projections.fail_next_create_note_not_committed();
+    let err_existing = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xB3; 16],
+        "create_note",
+        json!({
+            "project": project_handle,
+            "title": "Existing folder create",
+            "body": "Body text",
+        }),
+    )
+    .await
+    .err()
+    .expect("create_note in existing folder must return injected deadline error");
+    assert!(
+        matches!(
+            err_existing,
+            PortError::DeadlineExceeded(ref f) if f.effect() == CommitEffect::NotCommitted
+        ),
+        "create_note without creating a folder must preserve NotCommitted, got {err_existing:?}"
+    );
+
+    // 2. link_many spanning two Spaces: Space 1 commits, Space 2 fails operationally
+    //    -> must upgrade to Unknown + RetrySameCommand, and retry replays Space 1 + completes Space 2.
+    let shared = fixture
+        .control
+        .create_space(
+            owner.clone(),
+            AccountMutation {
+                identity: identity(fixture, &owner, 0xB4).await,
+                input: CreateSpace {
+                    id: SpaceId::from_bytes([0xB4; 16]),
+                    kind: SpaceKind::Shared,
+                    name: "Links Space B".into(),
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    let owner = fresh_owner(fixture).await;
+    let _proj_b = create_project_folder(
+        fixture,
+        &shared.history,
+        &actor,
+        FolderId::from_bytes([0xB5; 16]),
+        "links-b",
+    )
+    .await;
+    let proj_b_handle = format!("{}/links-b", shared.slug);
+    let n1 = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xB6; 16],
+        "create_note",
+        json!({"project": project_handle, "title": "Link A1", "body": "A1"}),
+    )
+    .await
+    .unwrap()
+    .structured_content["noteId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let n2 = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xB7; 16],
+        "create_note",
+        json!({"project": project_handle, "title": "Link A2", "body": "A2"}),
+    )
+    .await
+    .unwrap()
+    .structured_content["noteId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let n3 = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xB8; 16],
+        "create_note",
+        json!({"project": proj_b_handle, "title": "Link B1", "body": "B1"}),
+    )
+    .await
+    .unwrap()
+    .structured_content["noteId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let n4 = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xB9; 16],
+        "create_note",
+        json!({"project": proj_b_handle, "title": "Link B2", "body": "B2"}),
+    )
+    .await
+    .unwrap()
+    .structured_content["noteId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let link_args = json!({
+        "links": [
+            {"from": n1, "to": n2, "relation": "related"},
+            {"from": n3, "to": n4, "relation": "related"},
+        ]
+    });
+    fixture.projections.fail_nth_link_many_not_committed(2);
+    let link_err = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xBA; 16],
+        "link_many",
+        link_args.clone(),
+    )
+    .await
+    .err()
+    .expect("link_many failing on second Space must return injected deadline error");
+    assert!(
+        matches!(
+            link_err,
+            PortError::DeadlineExceeded(ref f)
+                if f.effect() == CommitEffect::Unknown && f.retry() == RetryAdvice::RetrySameCommand
+        ),
+        "link_many failing on 2nd Space after 1st committed must return Unknown+RetrySameCommand, got {link_err:?}"
+    );
+    let retried = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xBA; 16],
+        "link_many",
+        link_args,
+    )
+    .await
+    .expect("retrying link_many with same key must succeed across both Spaces");
+    let items = retried.structured_content["results"].as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0]["ok"], true);
+    assert_eq!(items[1]["ok"], true);
+}
+
+/// P2 #4: `rollback_run` must stop & drain an active local Keeper so step 2
+/// cannot write after rollback, reject unsettled remote active schedule runs,
+/// and canonical must reject rolling back an active chat run.
+async fn rollback_run_stops_active_keeper_and_rejects_unsettled_runs(
+    fixture: &RuntimeFixture,
+    personal: &SpaceContext,
+) {
+    let owner = fresh_owner(fixture).await;
+    let actor = owner.auth().principal().clone();
+    let shared = fixture
+        .control
+        .create_space(
+            owner.clone(),
+            AccountMutation {
+                identity: identity(fixture, &owner, 0xC1).await,
+                input: CreateSpace {
+                    id: SpaceId::from_bytes([0xC1; 16]),
+                    kind: SpaceKind::Shared,
+                    name: "Rollback Keeper".into(),
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    let owner = fresh_owner(fixture).await;
+    let project = create_project_folder(
+        fixture,
+        &shared.history,
+        &actor,
+        FolderId::from_bytes([0xC2; 16]),
+        "rb-proj",
+    )
+    .await;
+    let project_handle = format!("{}/rb-proj", shared.slug);
+    call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xC3; 16],
+        "create_ability",
+        json!({
+            "kind": "role",
+            "name": "rb-keeper-role",
+            "description": "Rollback race role",
+            "instructions": "Write memory in two steps.",
+            "placement": { "home": "space", "space": shared.slug },
+        }),
+    )
+    .await
+    .unwrap();
+    let AbilityResolution::Resolved(role) = fixture
+        .control
+        .resolve_ability(
+            owner.clone(),
+            AbilitySelection::Name {
+                name: "rb-keeper-role".into(),
+                kind: AbilityKind::Role,
+                project: Some(project.clone()),
+            },
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("missing rb-keeper-role");
+    };
+    let candidate = fixture
+        .control
+        .schedule_ability_candidate(
+            owner.clone(),
+            ScheduleAbilitySelection {
+                space: project.space_id.clone(),
+                project: Some(project.clone()),
+                role: role.reference.identity(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local = loopback_provider(fixture, &owner, &listener, 0xC4, true).await;
+    let classes: BTreeSet<DocClass> =
+        [DocClass::Skill, DocClass::AgentMemory, DocClass::UserDoc].into();
+    approve_disclosure(
+        fixture,
+        &owner,
+        &local,
+        0xC6,
+        ProviderAttachmentTarget::Personal {
+            owner: actor.clone(),
+            space: project.space_id.clone(),
+        },
+        classes.clone(),
+    )
+    .await;
+    approve_disclosure(
+        fixture,
+        &owner,
+        &local,
+        0xC7,
+        ProviderAttachmentTarget::Project(project.clone()),
+        classes,
+    )
+    .await;
+    local
+        .provider
+        .set_preference(
+            owner.clone(),
+            AccountMutation {
+                identity: identity(fixture, &owner, 0xC8).await,
+                input: SetProviderPreference {
+                    scope: ProviderPreferenceScope::Project(project.clone()),
+                    kind: PreferenceModelKind::Completion,
+                    resource: local.resource.id.clone(),
+                    model: local.model.clone(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+    let due = Timestamp::parse("2025-02-02T03:00:00Z").unwrap();
+    fixture
+        .storage
+        .clock
+        .0
+        .store(due.unix_seconds() * 1000, Ordering::SeqCst);
+    let schedule = fixture
+        .control
+        .create_schedule(
+            owner.clone(),
+            AccountMutation {
+                identity: identity(fixture, &owner, 0xC9).await,
+                input: CreateSchedule {
+                    id: ScheduleId::from_bytes([0xC9; 16]),
+                    definition: ScheduleDefinition {
+                        space: project.space_id.clone(),
+                        project: Some(project.clone()),
+                        title: "Active rollback Keeper".into(),
+                        init_prompt: "Write step 1 and step 2".into(),
+                        cron: "0 0 3 * * Sun *".into(),
+                        timezone: "UTC".into(),
+                        approved_role: candidate.approved_role,
+                        limits: RunLimits {
+                            max_steps: 4,
+                            max_tokens: 64_000,
+                            timeout_ms: 20_000,
+                        },
+                    },
+                    approved_skills: candidate.approved_skills,
+                    next_slot: due,
+                    paused: false,
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+
+    let scheduler = KeeperScheduler::new_local(
+        local.registry.clone(),
+        fixture.revocations.clone(),
+        ExclusiveDataRoot::attest_open_writer(),
+    );
+    let supervisor = AgentRunSupervisor::new_local(
+        local.registry.clone(),
+        fixture.revocations.clone(),
+        ExclusiveDataRoot::attest_open_writer(),
+    );
+    let worker = tokio::spawn({
+        let scheduler = scheduler.clone();
+        async move { scheduler.tick(due).await.unwrap() }
+    });
+
+    // Step 1: Keeper calls `remember_about_project` ("step1-obs").
+    let (mut wire1, _) = timeout(Duration::from_secs(12), read_request(&listener))
+        .await
+        .unwrap();
+    send_ollama(
+        &mut wire1,
+        json!({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "function": {
+                    "name": "remember_about_project",
+                    "arguments": {
+                        "project": project_handle,
+                        "category": "decisions",
+                        "observation": "step1-obs"
+                    }
+                }
+            }]
+        }),
+        "tool_calls",
+    )
+    .await;
+
+    // Wait for step 2's provider call to arrive and HOLD the socket open (Keeper active between step 1 & step 2!).
+    let (_wire2, _) = timeout(Duration::from_secs(12), read_request(&listener))
+        .await
+        .unwrap();
+    let runs = fixture
+        .control
+        .list_schedule_runs(
+            ScheduleRunContext::Owner(Box::new(owner.clone())),
+            schedule.id.clone(),
+            ControlPageRequest::new(10, None).unwrap(),
+        )
+        .await
+        .unwrap();
+    let active_keeper_run = runs.items[0].run.clone();
+    assert!(matches!(
+        runs.items[0].status,
+        ScheduleRunStatus::Claimed | ScheduleRunStatus::Running
+    ));
+
+    // Now invoke `rollback_run` while Keeper is mid-run! It must cancel & drain Keeper,
+    // settle `agent_schedule_runs`, and roll back step 1's memory cleanly.
+    let rolled = timeout(
+        Duration::from_secs(15),
+        supervisor.rollback_run(
+            owner.clone(),
+            shared.history.clone(),
+            active_keeper_run.clone(),
+            CommandKey::from_bytes([0xCA; 16]),
+        ),
+    )
+    .await
+    .expect("rollback_run must not hang waiting on active local Keeper")
+    .expect("rollback_run must cancel active local Keeper and roll back step 1");
+    assert_eq!(rolled.value.trashed.len(), 1);
+    let _ = timeout(Duration::from_secs(10), worker)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Verify schedule run is terminal (never completed step 2) and memory was rolled back.
+    let settled = fixture
+        .control
+        .get_schedule_run(
+            ScheduleRunContext::Owner(Box::new(owner.clone())),
+            schedule.id.clone(),
+            active_keeper_run.clone(),
+        )
+        .await
+        .unwrap();
+    assert!(!matches!(
+        settled.status,
+        ScheduleRunStatus::Claimed
+            | ScheduleRunStatus::Running
+            | ScheduleRunStatus::Terminal(ScheduleOutcome::Succeeded)
+    ));
+    let mem_target = fixture
+        .control
+        .inspect_memory_target(
+            owner.clone(),
+            MemoryTarget::Project {
+                folder: project.clone(),
+            },
+            "decisions".into(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        mem_target.revision.is_none(),
+        "step 1 memory note must be rolled back (trashed) with no step 2 writes"
+    );
+
+    // 2. Remote/unsettled active Keeper: a second claimed slot with NO local RevocationHub
+    //    entry must be rejected by `rollback_run` with ValidationReason::InvalidState.
+    let next_due = Timestamp::parse("2025-02-09T03:00:00Z").unwrap();
+    let after_next = Timestamp::parse("2025-02-16T03:00:00Z").unwrap();
+    fixture
+        .storage
+        .clock
+        .0
+        .store(next_due.unix_seconds() * 1000, Ordering::SeqCst);
+    let shared_ctx =
+        SpaceContext::new(owner.auth().clone(), shared.history.clone(), budget()).unwrap();
+    let live_sched = fixture
+        .control
+        .get_schedule(shared_ctx, schedule.id.clone())
+        .await
+        .unwrap();
+    let claim = fixture
+        .control
+        .claim_schedule(
+            MaintenanceContext {
+                authority: ServiceAuthority::admit(ServicePurpose::Scheduler),
+                budget: budget(),
+            },
+            ClaimSchedule {
+                schedule: live_sched.id.clone(),
+                slot: next_due,
+                expected: live_sched.revision,
+                current_role: live_sched.definition.approved_role.clone(),
+                next_slot: Some(after_next),
+            },
+        )
+        .await
+        .unwrap();
+    let ScheduleClaim::Claimed {
+        run: remote_run, ..
+    } = claim
+    else {
+        panic!("expected claimed remote schedule run, got {claim:?}");
+    };
+    let remote_rb = supervisor
+        .rollback_run(
+            owner.clone(),
+            shared.history.clone(),
+            remote_run,
+            CommandKey::from_bytes([0xCB; 16]),
+        )
+        .await;
+    assert!(
+        matches!(
+            remote_rb,
+            Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
+                if diagnostic.reason == ValidationReason::InvalidState
+        ),
+        "rollback_run must reject unsettled remote active schedule run with InvalidState, got {remote_rb:?}"
+    );
+
+    // 3. Direct canonical rollback while `chat_threads.active_run_id = run` must reject with InvalidState.
+    let chat_tid = ChatThreadId::from_bytes([0xCC; 16]);
+    let chat_run = AgentRunId::from_bytes([0xCC; 16]);
+    let pscope = personal.scope().clone();
+    fixture
+        .canonical
+        .create_chat(
+            personal.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: pscope.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([0xCC; 16]),
+                    hash: ContentDigest::from_bytes([0xCC; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: CreateChat {
+                    thread: chat_tid.clone(),
+                    kind: ChatThreadKind::Personal,
+                    owner: actor.clone(),
+                    project_folder: None,
+                    title: "Active chat rollback guard".into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let run_auth = owner
+        .auth()
+        .for_agent_run(
+            chat_run.clone(),
+            pscope.space_id.clone(),
+            ChatAudience::Personal,
+            owner.auth().spaces().clone(),
+        )
+        .unwrap();
+    let run_ctx = SpaceContext::new(run_auth, pscope.clone(), budget()).unwrap();
+    let claim_res = fixture
+        .canonical
+        .claim_active_run(
+            run_ctx.clone(),
+            ClaimChatRun {
+                thread: chat_tid.clone(),
+                run: chat_run.clone(),
+                expected_leaf: ThreadEntrySeq::ZERO,
+                previous_run: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(claim_res, ClaimChatRunOutcome::Claimed));
+    let root_folder = fixture
+        .canonical
+        .read_space(&pscope.space_id)
+        .await
+        .unwrap()
+        .root_folder_id;
+    fixture
+        .canonical
+        .create_note(
+            run_ctx,
+            Mutation {
+                identity: CommandIdentity {
+                    scope: pscope.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([0xCD; 16]),
+                    hash: ContentDigest::from_bytes([0xCD; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: CreateNote {
+                    note: NoteId::from_bytes([0xCD; 16]),
+                    parent: Some(root_folder),
+                    slug: "active-chat-run-note".into(),
+                    class: DocClass::UserDoc,
+                    carrier: "# Active run note\n".into(),
+                    folder_page: false,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let fenced_rb = fixture
+        .control_plane
+        .fence_canonical_effect(
+            owner.auth().clone(),
+            personal.clone(),
+            CanonicalEffect::ChatRollback,
+        )
+        .await
+        .unwrap();
+    let active_chat_rb = fixture
+        .canonical
+        .rollback_agent_run_by_id(
+            fenced_rb,
+            Mutation {
+                identity: CommandIdentity {
+                    scope: pscope,
+                    actor,
+                    key: CommandKey::from_bytes([0xCE; 16]),
+                    hash: ContentDigest::from_bytes([0xCE; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: chat_run,
+            },
+        )
+        .await;
+    assert!(
+        matches!(
+            active_chat_rb,
+            Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
+                if diagnostic.reason == ValidationReason::InvalidState
+        ),
+        "canonical rollback must reject an active chat run, got {active_chat_rb:?}"
+    );
+}
+
+/// P2 #5: `remember_about_project` and `remember_about_user` proposal previews
+/// must expose `target`, `spaceId`, and (for project memory) `projectFolder` so
+/// humans can disambiguate destination projects.
+async fn project_memory_proposal_preview_shows_destination(
+    fixture: &RuntimeFixture,
+    personal: &SpaceContext,
+) {
+    let owner = fresh_owner(fixture).await;
+    let actor = owner.auth().principal().clone();
+    let scope = personal.scope().clone();
+    let personal_slug = fixture
+        .canonical
+        .read_space(&scope.space_id)
+        .await
+        .unwrap()
+        .slug;
+    let project = create_project_folder(
+        fixture,
+        &scope,
+        &actor,
+        FolderId::from_bytes([0xD1; 16]),
+        "mem-preview",
+    )
+    .await;
+    let project_handle = format!("{personal_slug}/mem-preview");
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local = loopback_provider(fixture, &owner, &listener, 0xD3, true).await;
+    approve_disclosure(
+        fixture,
+        &owner,
+        &local,
+        0xD5,
+        ProviderAttachmentTarget::Personal {
+            owner: actor.clone(),
+            space: scope.space_id.clone(),
+        },
+        [DocClass::UserDoc, DocClass::AgentMemory, DocClass::Profile].into(),
+    )
+    .await;
+
+    let propose_and_preview = |tag: u8, tool_name: &'static str, args: Value| {
+        let personal = personal.clone();
+        let owner = owner.clone();
+        let actor = actor.clone();
+        let scope = scope.clone();
+        let local_registry = local.registry.clone();
+        let res_id = local.resource.id.clone();
+        let model_id = local.model.clone();
+        async move {
+            let thread = ChatThreadId::from_bytes([tag; 16]);
+            let run = AgentRunId::from_bytes([tag; 16]);
+            let cmd = |sub: u8| CommandIdentity {
+                scope: scope.clone(),
+                actor: actor.clone(),
+                key: CommandKey::from_bytes([tag, sub, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, sub]),
+                hash: ContentDigest::from_bytes([tag; 32]),
+            };
+            fixture
+                .canonical
+                .create_chat(
+                    personal.clone(),
+                    Mutation {
+                        identity: cmd(1),
+                        preconditions: Preconditions::default(),
+                        input: CreateChat {
+                            thread: thread.clone(),
+                            kind: ChatThreadKind::Personal,
+                            owner: actor.clone(),
+                            project_folder: None,
+                            title: format!("Memory preview {tag}"),
+                        },
+                    },
+                )
+                .await
+                .unwrap();
+            let run_auth = owner
+                .auth()
+                .for_agent_run(
+                    run.clone(),
+                    scope.space_id.clone(),
+                    ChatAudience::Personal,
+                    owner.auth().spaces().clone(),
+                )
+                .unwrap();
+            let run_scope = SpaceContext::new(run_auth.clone(), scope.clone(), budget()).unwrap();
+            fixture
+                .canonical
+                .claim_active_run(
+                    run_scope.clone(),
+                    ClaimChatRun {
+                        thread: thread.clone(),
+                        run,
+                        expected_leaf: ThreadEntrySeq::ZERO,
+                        previous_run: None,
+                    },
+                )
+                .await
+                .unwrap();
+            let key = CommandKey::from_bytes([tag, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9]);
+            let model_entry = fixture
+                .canonical
+                .append_chat(
+                    run_scope.clone(),
+                    Mutation {
+                        identity: cmd(2),
+                        preconditions: Preconditions::default(),
+                        input: AppendChat {
+                            thread: thread.clone(),
+                            parent: ThreadEntrySeq::ZERO,
+                            kind: ChatEntryKind::Model,
+                            body: ChatInputBody::Text("Propose memory update.".into()),
+                            tool_calls: vec![ProviderToolCall {
+                                id: ProviderToolCallId::new(key.as_str().into()).unwrap(),
+                                name: tool_name.into(),
+                                arguments: args.as_object().unwrap().clone().into_iter().collect(),
+                            }],
+                            provenance: Some(ChatProvenance::default()),
+                            interruption: None,
+                            proposed_diff: None,
+                            proposed_effect: None,
+                            referenced_notes: vec![],
+                            tainted: false,
+                        },
+                    },
+                )
+                .await
+                .unwrap();
+            run_auth.taint().mark_external_read();
+            let tool_res = local_registry
+                .call_personal_tool(
+                    McpInvocationContext {
+                        account: AccountContext::new(run_auth, budget()),
+                        target: EgressTarget::InAppProvider {
+                            provider: res_id,
+                            model: model_id,
+                            primary_project: None,
+                        },
+                        request_key: key.clone(),
+                    },
+                    PersonalToolInvocation {
+                        source: scope.clone(),
+                        thread: thread.clone(),
+                        leaf: model_entry.value.seq,
+                        owner: owner.clone(),
+                    },
+                    tool_name,
+                    args,
+                )
+                .await
+                .unwrap();
+            assert_eq!(tool_res.structured_content["outcome"], "approvalRequired");
+            let proposal = tool_res.proposal().expect("typed memory proposal");
+            let tool_entry = fixture
+                .canonical
+                .append_chat(
+                    run_scope,
+                    Mutation {
+                        identity: cmd(3),
+                        preconditions: Preconditions::default(),
+                        input: AppendChat {
+                            thread: thread.clone(),
+                            parent: model_entry.value.seq,
+                            kind: ChatEntryKind::Tool { call_id: key },
+                            body: ChatInputBody::Text(tool_res.content[0].text.clone()),
+                            tool_calls: vec![],
+                            provenance: Some(tool_res.provenance.clone()),
+                            interruption: None,
+                            proposed_diff: Some(proposal.envelope().to_owned()),
+                            proposed_effect: Some(proposal.effect()),
+                            referenced_notes: vec![],
+                            tainted: true,
+                        },
+                    },
+                )
+                .await
+                .unwrap();
+            local_registry
+                .preview_proposed_diff(
+                    owner,
+                    ConfirmProposedDiff {
+                        source: scope,
+                        thread,
+                        entry: tool_entry.value.seq,
+                        proposal: proposal.id(),
+                    },
+                )
+                .await
+                .unwrap()
+        }
+    };
+
+    let proj_preview = propose_and_preview(
+        0xD6,
+        "remember_about_project",
+        json!({
+            "project": project_handle,
+            "category": "architecture",
+            "observation": "Uses SQLite and PG parity."
+        }),
+    )
+    .await;
+    let proj_mem = proj_preview.memory.expect("project memory preview");
+    assert_eq!(proj_mem["target"], "project");
+    assert_eq!(proj_mem["spaceId"], json!(scope.space_id));
+    assert_eq!(proj_mem["projectFolder"], json!(project.folder_id));
+    assert_eq!(proj_mem["category"], "architecture");
+
+    let user_preview = propose_and_preview(
+        0xD7,
+        "remember_about_user",
+        json!({
+            "category": "preferences",
+            "observation": "Prefers concise summaries."
+        }),
+    )
+    .await;
+    let user_mem = user_preview.memory.expect("user memory preview");
+    assert_eq!(user_mem["target"], "user");
+    assert_eq!(user_mem["spaceId"], json!(scope.space_id));
+    assert!(user_mem.get("projectFolder").is_none());
+    assert_eq!(user_mem["category"], "preferences");
+}
+
+/// Narrow #1: Closing a chat thread's deterministic episode must not permanently
+/// disable AI in that thread; and a typo in `start_session.role` must not leave
+/// an orphan active named episode behind.
+async fn closed_chat_episode_recovers_and_role_typo_leaves_no_orphan(
+    fixture: &RuntimeFixture,
+    personal: &SpaceContext,
+) {
+    let owner = fresh_owner(fixture).await;
+    let actor = owner.auth().principal().clone();
+    let scope = personal.scope().clone();
+    let thread = ChatThreadId::from_bytes([0xE1; 16]);
+    fixture
+        .canonical
+        .create_chat(
+            personal.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: scope.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([0xE1; 16]),
+                    hash: ContentDigest::from_bytes([0xE1; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: CreateChat {
+                    thread: thread.clone(),
+                    kind: ChatThreadKind::Personal,
+                    owner: actor.clone(),
+                    project_folder: None,
+                    title: "Closed episode recovery".into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local = loopback_provider(fixture, &owner, &listener, 0xE2, true).await;
+    approve_disclosure(
+        fixture,
+        &owner,
+        &local,
+        0xE4,
+        ProviderAttachmentTarget::Personal {
+            owner: actor.clone(),
+            space: scope.space_id.clone(),
+        },
+        [DocClass::UserDoc].into(),
+    )
+    .await;
+    let supervisor = AgentRunSupervisor::new_local(
+        local.registry.clone(),
+        fixture.revocations.clone(),
+        ExclusiveDataRoot::attest_open_writer(),
+    );
+    let options = ChatRunOptions {
+        provider: Some(local.resource.id.clone()),
+        model: Some(local.model.clone()),
+        limits: RunLimits {
+            max_steps: 2,
+            max_tokens: 16_000,
+            timeout_ms: 15_000,
+        },
+        ..ChatRunOptions::default()
+    };
+
+    // Turn 1 opens generation-0 deterministic episode.
+    supervisor
+        .enqueue_input(
+            owner.clone(),
+            SubmitUserChatInput {
+                identity: CommandIdentity {
+                    scope: scope.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([0xE5; 16]),
+                    hash: ContentDigest::from_bytes([0xE5; 32]),
+                },
+                id: PendingInputId::from_bytes([0xE5; 16]),
+                thread: thread.clone(),
+                expected_leaf: ThreadEntrySeq::ZERO,
+                body: "First turn".into(),
+                mentions_agent: false,
+            },
+            options.clone(),
+        )
+        .await
+        .unwrap();
+    let (mut wire1, _) = timeout(Duration::from_secs(12), read_request(&listener))
+        .await
+        .unwrap();
+    send_ollama(
+        &mut wire1,
+        json!({"role": "assistant", "content": "First reply."}),
+        "stop",
+    )
+    .await;
+    let leaf1 = idle_leaf(fixture, personal, &thread).await;
+
+    // Close the deterministic generation-0 episode directly in Control.
+    let mut h = blake3::Hasher::new_derive_key("notarium.chats.episode.v1");
+    for part in [
+        scope.space_id.as_str().as_bytes(),
+        thread.as_str().as_bytes(),
+        actor.as_str().as_bytes(),
+    ] {
+        h.update(&(part.len() as u64).to_be_bytes());
+        h.update(part);
+    }
+    let ep0 = EpisodeId::from_bytes(h.finalize().as_bytes()[..16].try_into().unwrap());
+    let loaded = fixture
+        .control
+        .get_episode(owner.clone(), ep0.clone())
+        .await
+        .unwrap();
+    fixture
+        .control
+        .update_episode(
+            owner.clone(),
+            AccountMutation {
+                identity: identity(fixture, &owner, 0xE6).await,
+                input: EpisodeMutation::Full(EpisodeUpdate {
+                    episode: loaded.id,
+                    expected: loaded.revision,
+                    name: loaded.name,
+                    active_role: loaded.active_role,
+                    project_hint: loaded.project_hint,
+                    lifecycle: EpisodeLifecycle::Closed,
+                }),
+            },
+        )
+        .await
+        .unwrap();
+
+    // Turn 2 on the SAME thread must cleanly open generation-1 episode and succeed!
+    supervisor
+        .enqueue_input(
+            owner.clone(),
+            SubmitUserChatInput {
+                identity: CommandIdentity {
+                    scope: scope.clone(),
+                    actor,
+                    key: CommandKey::from_bytes([0xE7; 16]),
+                    hash: ContentDigest::from_bytes([0xE7; 32]),
+                },
+                id: PendingInputId::from_bytes([0xE7; 16]),
+                thread: thread.clone(),
+                expected_leaf: leaf1,
+                body: "Second turn after episode close".into(),
+                mentions_agent: false,
+            },
+            options,
+        )
+        .await
+        .unwrap();
+    let (mut wire2, _) = timeout(Duration::from_secs(12), read_request(&listener))
+        .await
+        .expect("chat turn after closing deterministic episode must reach provider");
+    send_ollama(
+        &mut wire2,
+        json!({"role": "assistant", "content": "Recovered after close."}),
+        "stop",
+    )
+    .await;
+    let leaf2 = idle_leaf(fixture, personal, &thread).await;
+    assert!(leaf2 > leaf1);
+
+    // Part B: Named `start_session` with a typo in `role` fails WITHOUT creating
+    // an orphan active episode, so the corrected retry creates a `"new"` session (not `"forked"`).
+    let typo = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xE8; 16],
+        "start_session",
+        json!({
+            "session": { "name": "no-orphan-named-session" },
+            "role": "nonexistent-role-typo",
+        }),
+    )
+    .await;
+    assert!(
+        matches!(typo, Err(PortError::Domain(DomainError::ResourceNotFound))),
+        "role typo must fail with ResourceNotFound, got {:?}",
+        typo.err()
+    );
+    let fixed = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xE9; 16],
+        "start_session",
+        json!({ "session": { "name": "no-orphan-named-session" } }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        fixed.structured_content["session"]["state"], "new",
+        "corrected named start_session must be 'new', not 'forked' from an orphan episode"
+    );
+}
+
+/// Narrow #2: Retrying a committed `delete_note` through in-app `ToolRegistry`
+/// with the same `request_key` must replay cleanly instead of returning
+/// `ResourceNotFound`.
+async fn in_app_delete_note_replay_succeeds_with_same_key(
+    fixture: &RuntimeFixture,
+    personal: &SpaceContext,
+) {
+    let owner = fresh_owner(fixture).await;
+    let actor = owner.auth().principal().clone();
+    let scope = personal.scope().clone();
+    let root_folder = fixture
+        .canonical
+        .read_space(&scope.space_id)
+        .await
+        .unwrap()
+        .root_folder_id;
+    let note_id = NoteId::from_bytes([0xF1; 16]);
+    fixture
+        .canonical
+        .create_note(
+            personal.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: scope.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([0xF1; 16]),
+                    hash: ContentDigest::from_bytes([0xF1; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: CreateNote {
+                    note: note_id.clone(),
+                    parent: Some(root_folder),
+                    slug: "delete-replay-note".into(),
+                    class: DocClass::UserDoc,
+                    carrier: "# Delete replay\n".into(),
+                    folder_page: false,
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local = loopback_provider(fixture, &owner, &listener, 0xF2, true).await;
+    approve_disclosure(
+        fixture,
+        &owner,
+        &local,
+        0xF4,
+        ProviderAttachmentTarget::Personal {
+            owner: actor.clone(),
+            space: scope.space_id.clone(),
+        },
+        [DocClass::UserDoc].into(),
+    )
+    .await;
+    let run_auth = owner
+        .auth()
+        .for_agent_run(
+            AgentRunId::from_bytes([0xF5; 16]),
+            scope.space_id.clone(),
+            ChatAudience::Personal,
+            owner.auth().spaces().clone(),
+        )
+        .unwrap();
+    let run_account = AccountContext::new(run_auth, budget());
+    let target = EgressTarget::InAppProvider {
+        provider: local.resource.id.clone(),
+        model: local.model.clone(),
+        primary_project: None,
+    };
+    let same_key = CommandKey::from_bytes([0xF6; 16]);
+    let first = local
+        .registry
+        .call_tool(
+            McpInvocationContext {
+                account: run_account.clone(),
+                target: target.clone(),
+                request_key: same_key.clone(),
+            },
+            "delete_note",
+            json!({ "ref": note_id }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.structured_content["outcome"], "trashed");
+
+    let replayed = local
+        .registry
+        .call_tool(
+            McpInvocationContext {
+                account: run_account.clone(),
+                target: target.clone(),
+                request_key: same_key,
+            },
+            "delete_note",
+            json!({ "ref": note_id }),
+        )
+        .await
+        .expect("retrying committed in-app delete_note with same key must replay cleanly");
+    assert_eq!(replayed.structured_content["outcome"], "trashed");
+
+    // A brand-new key on the already-trashed note must still fail with ResourceNotFound.
+    let fresh = local
+        .registry
+        .call_tool(
+            McpInvocationContext {
+                account: run_account,
+                target,
+                request_key: CommandKey::from_bytes([0xF7; 16]),
+            },
+            "delete_note",
+            json!({ "ref": note_id }),
+        )
+        .await;
+    assert!(
+        matches!(fresh, Err(PortError::Domain(DomainError::ResourceNotFound))),
+        "fresh delete_note on trashed note must still fail with ResourceNotFound, got {:?}",
+        fresh.err()
+    );
+}
+
+/// Narrow #3: One-shot `KeeperScheduler::tick(now)` must succeed even when
+/// Control's clock is ahead of `now` by more than two cron boundaries.
+async fn keeper_one_shot_tick_handles_multi_boundary_clock_skew(fixture: &RuntimeFixture) {
+    let owner = fresh_owner(fixture).await;
+    let actor = owner.auth().principal().clone();
+    let shared = fixture
+        .control
+        .create_space(
+            owner.clone(),
+            AccountMutation {
+                identity: identity(fixture, &owner, 0x51).await,
+                input: CreateSpace {
+                    id: SpaceId::from_bytes([0x51; 16]),
+                    kind: SpaceKind::Shared,
+                    name: "Skew Keeper".into(),
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    let owner = fresh_owner(fixture).await;
+    let project = create_project_folder(
+        fixture,
+        &shared.history,
+        &actor,
+        FolderId::from_bytes([0x52; 16]),
+        "skew-proj",
+    )
+    .await;
+    call_mcp(
+        &fixture.registry,
+        &owner,
+        [0x53; 16],
+        "create_ability",
+        json!({
+            "kind": "role",
+            "name": "skew-keeper-role",
+            "description": "Skew role",
+            "instructions": "Finish cleanly.",
+            "placement": { "home": "space", "space": shared.slug },
+        }),
+    )
+    .await
+    .unwrap();
+    let AbilityResolution::Resolved(role) = fixture
+        .control
+        .resolve_ability(
+            owner.clone(),
+            AbilitySelection::Name {
+                name: "skew-keeper-role".into(),
+                kind: AbilityKind::Role,
+                project: Some(project.clone()),
+            },
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("missing skew role");
+    };
+    let candidate = fixture
+        .control
+        .schedule_ability_candidate(
+            owner.clone(),
+            ScheduleAbilitySelection {
+                space: project.space_id.clone(),
+                project: Some(project.clone()),
+                role: role.reference.identity(),
+            },
+        )
+        .await
+        .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local = loopback_provider(fixture, &owner, &listener, 0x54, true).await;
+    let classes: BTreeSet<DocClass> =
+        [DocClass::Skill, DocClass::AgentMemory, DocClass::UserDoc].into();
+    approve_disclosure(
+        fixture,
+        &owner,
+        &local,
+        0x56,
+        ProviderAttachmentTarget::Personal {
+            owner: actor.clone(),
+            space: project.space_id.clone(),
+        },
+        classes.clone(),
+    )
+    .await;
+    approve_disclosure(
+        fixture,
+        &owner,
+        &local,
+        0x57,
+        ProviderAttachmentTarget::Project(project.clone()),
+        classes,
+    )
+    .await;
+    local
+        .provider
+        .set_preference(
+            owner.clone(),
+            AccountMutation {
+                identity: identity(fixture, &owner, 0x58).await,
+                input: SetProviderPreference {
+                    scope: ProviderPreferenceScope::Project(project.clone()),
+                    kind: PreferenceModelKind::Completion,
+                    resource: local.resource.id.clone(),
+                    model: local.model.clone(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+    let t0 = Timestamp::parse("2025-03-01T10:00:00Z").unwrap();
+    let tick_now = Timestamp::parse("2025-03-01T10:01:00Z").unwrap();
+    let control_now = Timestamp::parse("2025-03-01T10:05:30Z").unwrap();
+    fixture
+        .storage
+        .clock
+        .0
+        .store(t0.unix_seconds() * 1000, Ordering::SeqCst);
+    let _schedule = fixture
+        .control
+        .create_schedule(
+            owner,
+            AccountMutation {
+                identity: identity(fixture, &fresh_owner(fixture).await, 0x59).await,
+                input: CreateSchedule {
+                    id: ScheduleId::from_bytes([0x59; 16]),
+                    definition: ScheduleDefinition {
+                        space: project.space_id.clone(),
+                        project: Some(project.clone()),
+                        title: "Multi-boundary skew".into(),
+                        init_prompt: "Check skew".into(),
+                        cron: "0 * * * * * *".into(),
+                        timezone: "UTC".into(),
+                        approved_role: candidate.approved_role,
+                        limits: RunLimits {
+                            max_steps: 2,
+                            max_tokens: 32_000,
+                            timeout_ms: 15_000,
+                        },
+                    },
+                    approved_skills: candidate.approved_skills,
+                    next_slot: t0,
+                    paused: false,
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+    // Advance Control's clock 5 cron boundaries ahead of the one-shot `tick(tick_now)` timestamp.
+    fixture
+        .storage
+        .clock
+        .0
+        .store(control_now.unix_seconds() * 1000, Ordering::SeqCst);
+    let scheduler = KeeperScheduler::new_local(
+        local.registry,
+        fixture.revocations.clone(),
+        ExclusiveDataRoot::attest_open_writer(),
+    );
+    let worker = tokio::spawn({
+        let scheduler = scheduler.clone();
+        async move { scheduler.tick(tick_now).await.unwrap() }
+    });
+    let (mut wire, _) = timeout(Duration::from_secs(12), read_request(&listener))
+        .await
+        .expect("one-shot tick must advance past 5 cron boundaries and claim");
+    send_ollama(
+        &mut wire,
+        json!({"role": "assistant", "content": "Skew ok."}),
+        "stop",
+    )
+    .await;
+    let report = timeout(Duration::from_secs(12), worker)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(report.succeeded, 1);
+}
+
+/// Verify `idx_folder_heads_space_updated` is installed on both SQLite and PG.
+async fn folder_heads_space_updated_index_present(fixture: &RuntimeFixture, pg: bool) {
+    let found: i64 = match &fixture.canonical_config.sql {
+        SqlBackendConfig::Postgres {
+            connect, schema, ..
+        } => {
+            assert!(pg);
+            let mut conn = sqlx::PgConnection::connect_with(&build_pg_connect_options(connect))
+                .await
+                .unwrap();
+            let count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pg_indexes
+                 WHERE schemaname = $1
+                   AND tablename = 'folder_heads'
+                   AND indexname = 'idx_folder_heads_space_updated'",
+            )
+            .bind(schema)
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+            conn.close().await.unwrap();
+            count
+        }
+        SqlBackendConfig::Sqlite { data_root, .. } => {
+            assert!(!pg);
+            let url = format!("sqlite:{}", data_root.canonical().display());
+            let mut conn = sqlx::SqliteConnection::connect(&url).await.unwrap();
+            let count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index'
+                   AND tbl_name = 'folder_heads'
+                   AND name = 'idx_folder_heads_space_updated'",
+            )
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+            conn.close().await.unwrap();
+            count
+        }
+    };
+    assert_eq!(found, 1, "idx_folder_heads_space_updated must exist");
+}

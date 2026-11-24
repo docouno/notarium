@@ -445,7 +445,9 @@ impl KeeperScheduler {
         owner.check()?;
         let control = self.inner.registry.control();
         let mut result = control.claim_schedule(ctx.clone(), claim.clone()).await;
-        for _ in 0..2 {
+        let mut cursor = fresh;
+        const MAX_NEXT_SLOT_RETRIES: usize = 64;
+        for _ in 0..MAX_NEXT_SLOT_RETRIES {
             if !matches!(&result, Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
                 if diagnostic.reason == ValidationReason::InvalidTimestamp)
             {
@@ -455,20 +457,20 @@ impl KeeperScheduler {
             // or during Control admission is a definite rejection. Recompute
             // the next-slot witness from the latest clock/elapsed time under
             // the same slot ownership fence.
-            let mut observed = if let Some(clock) = clock {
+            let latest = if let Some(clock) = clock {
                 clock_now(clock)?.max(now)
             } else if let Some(tick_started) = tick_started {
                 advance_timestamp(now, tick_started.elapsed())?
             } else {
-                break;
+                now
             };
-            let mut refreshed = next(observed)?;
-            if clock.is_none()
-                && refreshed == claim.next_slot
-                && let Some(prev_next) = claim.next_slot
+            cursor = cursor.max(latest);
+            let mut refreshed = next(cursor)?;
+            if let Some(prev_next) = claim.next_slot
+                && refreshed.is_some_and(|candidate| candidate <= prev_next)
             {
-                observed = observed.max(prev_next);
-                refreshed = next(observed)?;
+                cursor = cursor.max(prev_next);
+                refreshed = next(cursor)?;
             }
             if refreshed == claim.next_slot
                 || cancellation.is_cancelled()
@@ -488,12 +490,51 @@ impl KeeperScheduler {
                 schedule,
             }) => {
                 let mut context = *context;
-                context.budget.cancellation = cancellation.clone();
-                let outcome = self
-                    .run_claimed(&schedule, &run, lease, context, owner.as_mut())
-                    .await;
+                let turn_cancellation = Cancellation::default();
+                if cancellation.is_cancelled() {
+                    turn_cancellation.cancel();
+                }
+                context.budget.cancellation = turn_cancellation.clone();
+                let run_lease = validate_claim(&schedule, &run, lease, &context)
+                    .and_then(|()| {
+                        self.inner.revocations.register_run(
+                            maintenance(
+                                ServicePurpose::Revocation,
+                                context.budget.request.clone(),
+                                turn_cancellation.clone(),
+                            ),
+                            context.auth(),
+                            None,
+                            turn_cancellation.clone(),
+                        )
+                    })
+                    .ok();
+                let outcome = match &run_lease {
+                    Some(run_lease) => {
+                        let work = self.run_claimed(
+                            &schedule,
+                            &run,
+                            lease,
+                            context,
+                            owner.as_mut(),
+                            run_lease,
+                        );
+                        tokio::pin!(work);
+                        tokio::select! {
+                            biased;
+                            () = cancellation.cancelled() => {
+                                turn_cancellation.cancel();
+                                work.await
+                            }
+                            outcome = &mut work => outcome,
+                        }
+                    }
+                    None => ScheduleOutcome::Failed,
+                };
                 // A lost writer cannot terminalize the claim. The current
-                // owner reconciles it after durable expiry.
+                // owner reconciles it after durable expiry. Keep `run_lease`
+                // alive until `record_result` settles durable status so any
+                // waiting `rollback_run` sees the finalized schedule run.
                 let result = match owner.check() {
                     Ok(()) if !ownership_lost.is_cancelled() => self
                         .record_result(
@@ -511,6 +552,7 @@ impl KeeperScheduler {
                     Ok(()) => Err(unavailable()),
                     Err(error) => Err(error),
                 };
+                drop(run_lease);
                 Ok(SlotAttempt::Claimed(result))
             }
             Ok(ScheduleClaim::AlreadyClaimed(_)) => Ok(SlotAttempt::Raced),
@@ -529,21 +571,11 @@ impl KeeperScheduler {
         lease: LeaseEpoch,
         mut context: SpaceContext,
         owner: &mut dyn RevocationLease,
+        run_lease: &crate::revocation::RunRevocationLease,
     ) -> ScheduleOutcome {
         let result = async move {
             owner.check()?;
             validate_claim(schedule, run, lease, &context)?;
-            let cancellation = context.budget.cancellation.clone();
-            let run_lease = self.inner.revocations.register_run(
-                maintenance(
-                    ServicePurpose::Revocation,
-                    context.budget.request.clone(),
-                    cancellation.clone(),
-                ),
-                context.auth(),
-                None,
-                cancellation,
-            )?;
             let checked_at = Instant::now();
             let auth = self
                 .inner
@@ -563,7 +595,7 @@ impl KeeperScheduler {
             turn::run_keeper_turn(
                 &self.inner.registry,
                 &self.inner.revocations,
-                &run_lease,
+                run_lease,
                 schedule,
                 run,
                 context,

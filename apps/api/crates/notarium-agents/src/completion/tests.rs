@@ -137,3 +137,29 @@ fn actual_usage_above_either_cap_invalidates_the_step() {
     );
     assert_eq!(charge(&limit, ProviderUsage::Unknown).unwrap(), 30);
 }
+
+#[test]
+fn four_large_tool_outputs_fit_within_32k_model_window() {
+    let calls: Vec<ProviderToolCall> = (0..4)
+        .map(|i| ProviderToolCall {
+            id: ProviderToolCallId::new(format!("call-{i}")).unwrap(),
+            name: "get_note".into(),
+            arguments: Default::default(),
+        })
+        .collect();
+    let (max_bytes, max_tokens) = step_tool_display_budget(32_768, 2_000, "Reading notes.", &calls);
+    let large_ascii = "alpha beta gamma delta ".repeat(2_000);
+    assert!(large_ascii.len() > TOOL_DISPLAY_BYTES);
+    let large_utf8 =
+        "caf\u{00E9} na\u{00EF}ve r\u{00E9}sum\u{00E9} \u{2014} \u{1F4D3} ".repeat(1_500);
+    let bounded_ascii = bounded_tool_text_within(&large_ascii, max_bytes, max_tokens);
+    let bounded_utf8 = bounded_tool_text_within(&large_utf8, max_bytes, max_tokens);
+    assert!(bounded_ascii.ends_with("\n…[truncated]"));
+    assert!(bounded_utf8.ends_with("\n…[truncated]"));
+    assert!(bounded_ascii.len() <= max_bytes);
+    assert!(bounded_utf8.len() <= max_bytes);
+    assert!(completion_text_estimate(&bounded_ascii) <= max_tokens);
+    assert!(completion_text_estimate(&bounded_utf8) <= max_tokens);
+    // All 4 tool outputs plus fixed prompt overhead stay well under 32,768 tokens.
+    assert!(2_000 + 4 * (completion_text_estimate(&bounded_ascii) + 8) < 32_768);
+}

@@ -721,7 +721,19 @@ impl CanonicalStore {
 
 fn authorize_chat_write_on_space(auth: &EngineAuthContext, space: &Space) -> Result<(), PortError> {
     auth.authorize_write_space_pin(space)?;
-    if auth.spaces()[&space.id].project_root.is_some() && auth.keeper_log().is_none() {
+    if auth.spaces()[&space.id].project_root.is_some()
+        && auth.keeper_log().is_none()
+        && !matches!(auth.kind(), PrincipalKind::AgentRun(_))
+    {
+        return Err(DomainError::SpaceReadOnly.into());
+    }
+    Ok(())
+}
+
+fn forbid_project_agent_run(auth: &EngineAuthContext, space: &Space) -> Result<(), PortError> {
+    if matches!(auth.kind(), PrincipalKind::AgentRun(_))
+        && auth.spaces()[&space.id].project_root.is_some()
+    {
         return Err(DomainError::SpaceReadOnly.into());
     }
     Ok(())
@@ -786,6 +798,16 @@ fn authorize_thread_mutation(
                 .get(&space.id)
                 .and_then(|grant| grant.project_root.as_ref())
                 != th.project_folder.as_ref())
+    {
+        return Err(DomainError::SpaceReadOnly.into());
+    }
+    if matches!(auth.kind(), PrincipalKind::AgentRun(_))
+        && (th.kind == ChatThreadKind::KeeperLog
+            || auth
+                .spaces()
+                .get(&space.id)
+                .and_then(|grant| grant.project_root.as_ref())
+                .is_some_and(|root| th.project_folder.as_ref() != Some(root)))
     {
         return Err(DomainError::SpaceReadOnly.into());
     }
@@ -2762,6 +2784,7 @@ async fn create_chat_impl(
             Box::pin(async move {
                 let live_space = load_space_record(tx, &scope.space_id).await?;
                 authorize_chat_write_on_space(&auth, &live_space.space)?;
+                forbid_project_agent_run(&auth, &live_space.space)?;
 
                 let tainted = auth.taint().is_tainted();
                 if tainted
@@ -3010,6 +3033,7 @@ async fn fork_chat_impl(
             Box::pin(async move {
                 let live_space = load_space_record(tx, &scope.space_id).await?;
                 authorize_chat_write_on_space(&auth, &live_space.space)?;
+                forbid_project_agent_run(&auth, &live_space.space)?;
 
                 let th = load_thread_head_tx(tx, &scope.space_id, &input.thread).await?;
                 authorize_thread_mutation(&auth, &live_space.space, &th, false)?;
@@ -5078,6 +5102,7 @@ async fn redact_chat_entry_impl(
             Box::pin(async move {
                 let live_space = load_space_record(tx, &scope.space_id).await?;
                 authorize_chat_write_on_space(&auth, &live_space.space)?;
+                forbid_project_agent_run(&auth, &live_space.space)?;
 
                 let th = load_thread_head_tx(tx, &scope.space_id, &input.thread).await?;
                 authorize_thread_mutation(&auth, &live_space.space, &th, false)?;

@@ -179,18 +179,32 @@ async fn apply_one(
     draft: ProposedDraft,
     step: &ConfirmedStep<'_>,
     index: u16,
+    committed_any: &mut bool,
 ) -> Result<Value, PortError> {
+    const LABEL: &str = "notarium.mcp.confirmed-create-notes-batch.v1";
+    let creates_folder = draft.destination.exact().is_none();
     let (folder_ctx, folder_identity) = step(&project.scope, "create_destination", index)?;
     let folder_scope = folder_ctx.restrict_to_project(&project.reference)?;
     let parent = draft
         .destination
         .apply(owner, folder_scope, folder_identity, None)
         .await?;
-    let (write_ctx, identity) = step(&project.scope, "create_note", index)?;
-    let scope = write_ctx.restrict_to_project(&project.reference)?;
+    if creates_folder {
+        *committed_any = true;
+    }
+    let (write_ctx, identity) = step(&project.scope, "create_note", index)
+        .map_err(|error| batch_operational_error(LABEL, error, *committed_any))?;
+    let scope = write_ctx
+        .restrict_to_project(&project.reference)
+        .map_err(|error| batch_operational_error(LABEL, error.into(), *committed_any))?;
+    let bound = draft
+        .destination
+        .bind(scope.clone(), None)
+        .map_err(|error| batch_operational_error(LABEL, error, *committed_any))?;
     let leased = owner
-        .fence_confirmed_effect(draft.destination.bind(scope.clone(), None)?)
-        .await?;
+        .fence_confirmed_effect(bound)
+        .await
+        .map_err(|error| batch_operational_error(LABEL, error, *committed_any))?;
     let committed = owner
         .registry
         .engine
@@ -209,12 +223,15 @@ async fn apply_one(
                 },
             },
         )
-        .await?;
+        .await
+        .map_err(|error| match error {
+            PortError::Domain(domain) => PortError::Domain(domain),
+            operational => batch_operational_error(LABEL, operational, *committed_any),
+        })?;
+    *committed_any = true;
     let mut result = receipt_result(owner, scope, &draft.note, committed, "created")
         .await
-        .map_err(|error| {
-            batch_operational_error("notarium.mcp.confirmed-create-notes-batch.v1", error, true)
-        })?;
+        .map_err(|error| batch_operational_error(LABEL, error, true))?;
     if result.get("noteId").is_some() {
         result["bodyBytes"] = json!(draft.body_bytes);
         result["bodyHash"] = json!(draft.body_hash);
@@ -239,7 +256,8 @@ pub(in crate::mcp::note_tools) async fn apply(
         else {
             return Err(invalid(ValidationReason::InvalidState));
         };
-        return apply_one(owner, &plan.project, *draft, step, 0).await;
+        let mut committed_any = false;
+        return apply_one(owner, &plan.project, *draft, step, 0, &mut committed_any).await;
     }
     const LABEL: &str = "notarium.mcp.confirmed-create-notes-batch.v1";
     let mut results = Vec::with_capacity(plan.steps.len());
@@ -247,7 +265,15 @@ pub(in crate::mcp::note_tools) async fn apply(
     for (index, row) in plan.steps.into_iter().enumerate() {
         let result = match row {
             CreateStep::Ready(draft) => {
-                apply_one(owner, &plan.project, *draft, step, index as u16).await
+                apply_one(
+                    owner,
+                    &plan.project,
+                    *draft,
+                    step,
+                    index as u16,
+                    &mut committed_any,
+                )
+                .await
             }
             CreateStep::Invalid { code } => {
                 results.push(json!({"index":index, "ok":false, "error":code}));

@@ -235,6 +235,7 @@ async fn authorize_input_thread_tx(
     leaf: ThreadEntrySeq,
 ) -> Result<ThreadHeadRow, PortError> {
     authorize_chat_write_on_space(auth, &space.space)?;
+    forbid_project_agent_run(auth, &space.space)?;
     let head = load_thread_head_tx(tx, &space.scope.space_id, thread).await?;
     authorize_thread_mutation(auth, &space.space, &head, false)?;
     if head.kind == ChatThreadKind::KeeperLog {

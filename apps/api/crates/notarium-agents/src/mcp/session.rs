@@ -374,6 +374,29 @@ async fn start(call: &mut ToolCallContext<'_>, args: StartArgs) -> Result<Value,
     if let Some(project) = &plan.project {
         project_for_folder(call, project).await?;
     }
+    if let Some(role_selector) = args.role.as_deref() {
+        let preview_project = if plan.project.is_some() {
+            plan.project.clone()
+        } else {
+            match &selector {
+                EpisodeSelector::Id(id) | EpisodeSelector::Resume(id) => {
+                    call.registry
+                        .control
+                        .get_episode(call.account(), id.clone())
+                        .await?
+                        .project_hint
+                }
+                EpisodeSelector::Name(name) => {
+                    call.registry
+                        .control
+                        .named_episode_project_hint(call.account(), name.clone())
+                        .await?
+                }
+                EpisodeSelector::New { .. } => None,
+            }
+        };
+        ability_tools::validate_session_role(call, role_selector, preview_project.as_ref()).await?;
+    }
     let selector = match selector {
         EpisodeSelector::New { name, .. } => EpisodeSelector::New {
             name,

@@ -1,8 +1,6 @@
 use super::*;
 use crate::{
-    completion::{
-        CompletionActor, CompletionRunBudget, bounded_tool_text, call_key, complete_step,
-    },
+    completion::{CompletionActor, CompletionRunBudget, call_key, complete_step},
     mcp::{EgressTarget, McpInvocationContext, PersonalToolInvocation, runtime_abilities},
 };
 use notarium_core::receipt::AccountCommandIdentity;
@@ -188,6 +186,9 @@ impl AgentRunSupervisor {
                     max_tool_calls: if model.supports_tools { 64 } else { 0 },
                 },
             };
+            let fixed_tokens =
+                notarium_control::service::provider::completion_input_estimate(&request)?;
+            let step_input_ceiling = model.max_input_tokens.min(budget.input_ceiling());
             let (branch, request, proof) = history.plan(request, budget.input_ceiling())?;
             if proof.compacts_through.is_some() {
                 let target_tokens = request.budget.max_output_tokens;
@@ -251,6 +252,12 @@ impl AgentRunSupervisor {
             for call in &settled.calls {
                 run.stream.tool_call(step, call)?;
             }
+            let tool_display_budget = crate::completion::step_tool_display_budget(
+                step_input_ceiling,
+                fixed_tokens,
+                &settled.text,
+                &settled.calls,
+            );
             let model_entry = self
                 .append(
                     run,
@@ -289,7 +296,15 @@ impl AgentRunSupervisor {
                     return Err(invalid(ValidationReason::SourceMismatch));
                 }
                 let result = self
-                    .invoke_tool(run, &budget, &selection, leaf, call, call_id.clone())
+                    .invoke_tool(
+                        run,
+                        &budget,
+                        &selection,
+                        leaf,
+                        call,
+                        call_id.clone(),
+                        tool_display_budget,
+                    )
                     .await?;
                 let envelope = result.proposal.as_ref().map(|draft| draft.envelope.clone());
                 let proposed_effect = result.proposal.as_ref().map(|draft| draft.effect);
@@ -335,115 +350,154 @@ impl AgentRunSupervisor {
         budget: &CompletionRunBudget,
     ) -> Result<EpisodeId, PortError> {
         let control = self.inner.registry.control();
-        let bytes = derive_digest(
-            "notarium.chats.episode.v1",
-            &[
-                run.scope.space_id.as_str().as_bytes(),
-                run.thread.as_str().as_bytes(),
-                run.auth.principal().as_str().as_bytes(),
-            ],
-        );
-        let id = EpisodeId::from_bytes(bytes.as_bytes()[..16].try_into().expect("sixteen bytes"));
         let account = || -> Result<AccountContext, PortError> {
             Ok(AccountContext::new(
                 run.owner_auth.clone(),
                 run.context(budget.remaining())?.budget,
             ))
         };
-        match control.get_episode(account()?, id.clone()).await {
-            Ok(episode) if episode.id == id && &episode.owner == run.auth.principal() => {
-                match episode.lifecycle {
-                    EpisodeLifecycle::Active => {
-                        if run.owner_auth.taint().is_tainted() {
-                            return Ok(id);
+        const MAX_EPISODE_GENERATIONS: u32 = 64;
+        for generation in 0..MAX_EPISODE_GENERATIONS {
+            let gen_bytes = generation.to_be_bytes();
+            let bytes = if generation == 0 {
+                derive_digest(
+                    "notarium.chats.episode.v1",
+                    &[
+                        run.scope.space_id.as_str().as_bytes(),
+                        run.thread.as_str().as_bytes(),
+                        run.auth.principal().as_str().as_bytes(),
+                    ],
+                )
+            } else {
+                derive_digest(
+                    "notarium.chats.episode.v1",
+                    &[
+                        run.scope.space_id.as_str().as_bytes(),
+                        run.thread.as_str().as_bytes(),
+                        run.auth.principal().as_str().as_bytes(),
+                        &gen_bytes,
+                    ],
+                )
+            };
+            let id =
+                EpisodeId::from_bytes(bytes.as_bytes()[..16].try_into().expect("sixteen bytes"));
+            match control.get_episode(account()?, id.clone()).await {
+                Ok(episode) if episode.id == id && &episode.owner == run.auth.principal() => {
+                    match episode.lifecycle {
+                        EpisodeLifecycle::Active => {
+                            if run.owner_auth.taint().is_tainted() {
+                                return Ok(id);
+                            }
+                            match control.touch_episode(account()?, id.clone()).await {
+                                Ok(()) => return Ok(id),
+                                Err(PortError::Domain(DomainError::ValidationFailed {
+                                    diagnostic,
+                                })) if diagnostic.reason == ValidationReason::InvalidState => {}
+                                Err(error) => return Err(error),
+                            }
                         }
-                        match control.touch_episode(account()?, id.clone()).await {
-                            Ok(()) => return Ok(id),
-                            Err(PortError::Domain(DomainError::ValidationFailed {
-                                diagnostic,
-                            })) if diagnostic.reason == ValidationReason::InvalidState => {}
-                            Err(error) => return Err(error),
+                        EpisodeLifecycle::Sleeping => {}
+                        EpisodeLifecycle::Closed => {
+                            // A closed chat episode must not permanently disable AI in this thread.
+                            continue;
                         }
                     }
-                    EpisodeLifecycle::Sleeping => {}
-                    EpisodeLifecycle::Closed => {
-                        return Err(invalid(ValidationReason::InvalidState));
+                    let resume_key = derive_key(
+                        "notarium.chats.resume-episode.v1",
+                        &[run.id.as_str().as_bytes(), &gen_bytes],
+                    );
+                    let resume_input = StartEpisode {
+                        selector: EpisodeSelector::Resume(id.clone()),
+                        project_hint: None,
+                        guard: EpisodeRevisionGuard::Target,
+                    };
+                    let principal = run.auth.principal().clone();
+                    let resumed = control
+                        .start_or_resume_episode(
+                            account()?,
+                            AccountMutation {
+                                identity: AccountCommandIdentity {
+                                    owner: principal.clone(),
+                                    actor: principal,
+                                    expected: ControlRevision::ZERO,
+                                    key: resume_key,
+                                    hash: bytes,
+                                },
+                                input: resume_input,
+                            },
+                        )
+                        .await;
+                    match resumed {
+                        Ok(resumed) => {
+                            return match resumed.value {
+                                EpisodeStartResult::Resumed(episode)
+                                    if episode.id == id
+                                        && &episode.owner == run.auth.principal() =>
+                                {
+                                    Ok(id)
+                                }
+                                _ => Err(invalid(ValidationReason::SourceMismatch)),
+                            };
+                        }
+                        Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
+                            if diagnostic.reason == ValidationReason::InvalidState =>
+                        {
+                            // Episode closed concurrently between read and resume.
+                            continue;
+                        }
+                        Err(error) => return Err(error),
                     }
                 }
-                let resume_key = derive_key(
-                    "notarium.chats.resume-episode.v1",
-                    &[run.id.as_str().as_bytes()],
-                );
-                let resume_input = StartEpisode {
-                    selector: EpisodeSelector::Resume(id.clone()),
-                    project_hint: None,
-                    guard: EpisodeRevisionGuard::Target,
-                };
-                let principal = run.auth.principal().clone();
-                let resumed = control
-                    .start_or_resume_episode(
-                        account()?,
-                        AccountMutation {
-                            identity: AccountCommandIdentity {
-                                owner: principal.clone(),
-                                actor: principal,
-                                expected: ControlRevision::ZERO,
-                                key: resume_key,
-                                hash: bytes,
-                            },
-                            input: resume_input,
+                Ok(_) => return Err(invalid(ValidationReason::SourceMismatch)),
+                Err(PortError::Domain(DomainError::ResourceNotFound)) => {
+                    let request_key = if generation == 0 {
+                        derive_key(
+                            "notarium.chats.open-episode.v1",
+                            &[run.id.as_str().as_bytes()],
+                        )
+                    } else {
+                        derive_key(
+                            "notarium.chats.open-episode.v1",
+                            &[run.id.as_str().as_bytes(), &gen_bytes],
+                        )
+                    };
+                    let input = StartEpisode {
+                        selector: EpisodeSelector::New {
+                            requested: id.clone(),
+                            name: None,
                         },
-                    )
-                    .await?;
-                return match resumed.value {
-                    EpisodeStartResult::Resumed(episode)
-                        if episode.id == id && &episode.owner == run.auth.principal() =>
-                    {
-                        Ok(id)
-                    }
-                    _ => Err(invalid(ValidationReason::SourceMismatch)),
-                };
+                        project_hint: run.project.clone(),
+                        guard: EpisodeRevisionGuard::Target,
+                    };
+                    let principal = run.auth.principal().clone();
+                    let opened = control
+                        .start_or_resume_episode(
+                            account()?,
+                            AccountMutation {
+                                identity: AccountCommandIdentity {
+                                    owner: principal.clone(),
+                                    actor: principal,
+                                    expected: ControlRevision::ZERO,
+                                    key: request_key,
+                                    hash: bytes,
+                                },
+                                input,
+                            },
+                        )
+                        .await?;
+                    return match opened.value {
+                        EpisodeStartResult::New(episode) | EpisodeStartResult::Resumed(episode)
+                            if episode.id == id && &episode.owner == run.auth.principal() =>
+                        {
+                            Ok(id)
+                        }
+                        _ => Err(invalid(ValidationReason::SourceMismatch)),
+                    };
+                }
+                Err(error) => return Err(error),
             }
-            Ok(_) => return Err(invalid(ValidationReason::SourceMismatch)),
-            Err(PortError::Domain(DomainError::ResourceNotFound)) => (),
-            Err(error) => return Err(error),
         }
-        let request_key = derive_key(
-            "notarium.chats.open-episode.v1",
-            &[run.id.as_str().as_bytes()],
-        );
-        let input = StartEpisode {
-            selector: EpisodeSelector::New {
-                requested: id.clone(),
-                name: None,
-            },
-            project_hint: run.project.clone(),
-            guard: EpisodeRevisionGuard::Target,
-        };
-        let principal = run.auth.principal().clone();
-        let opened = control
-            .start_or_resume_episode(
-                account()?,
-                AccountMutation {
-                    identity: AccountCommandIdentity {
-                        owner: principal.clone(),
-                        actor: principal,
-                        expected: ControlRevision::ZERO,
-                        key: request_key,
-                        hash: bytes,
-                    },
-                    input,
-                },
-            )
-            .await?;
-        match opened.value {
-            EpisodeStartResult::New(episode) | EpisodeStartResult::Resumed(episode)
-                if episode.id == id && &episode.owner == run.auth.principal() =>
-            {
-                Ok(id)
-            }
-            _ => Err(invalid(ValidationReason::SourceMismatch)),
-        }
+        Err(invalid(ValidationReason::BudgetExceeded))
     }
 
     async fn append(
@@ -481,6 +535,7 @@ impl AgentRunSupervisor {
         Ok(result.value)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn invoke_tool(
         &self,
         run: &ActiveRun,
@@ -489,6 +544,7 @@ impl AgentRunSupervisor {
         leaf: ThreadEntrySeq,
         call: ProviderToolCall,
         key: CommandKey,
+        display_budget: (usize, u64),
     ) -> Result<ToolReply, PortError> {
         let registry = &self.inner.registry;
         let ctx = run.context(budget.remaining())?;
@@ -531,7 +587,11 @@ impl AgentRunSupervisor {
         run.context(budget.remaining())?;
         match result {
             Ok(result) => Ok(ToolReply {
-                display: bounded_tool_text(&result.content[0].text),
+                display: crate::completion::bounded_tool_text_within(
+                    &result.content[0].text,
+                    display_budget.0,
+                    display_budget.1,
+                ),
                 proposal: result.proposal().map(|draft| ToolProposal {
                     id: draft.id(),
                     envelope: draft.envelope().to_owned(),

@@ -284,6 +284,11 @@ impl ControlPort for RejectingPorts {
             request: AccountMutation<StartEpisode>,
         ) -> PortFuture<'_, ControlCommit<EpisodeStartResult>>;
     fn get_episode(&self, ctx: AccountContext, episode: EpisodeId) -> PortFuture<'_, AgentEpisode>;
+    fn named_episode_project_hint(
+            &self,
+            ctx: AccountContext,
+            name: String,
+        ) -> PortFuture<'_, Option<FolderRef>>;
     fn update_episode(
             &self,
             ctx: AccountContext,
@@ -418,6 +423,11 @@ impl ControlPort for RejectingPorts {
         ctx: MaintenanceContext,
         result: ScheduleResult,
     ) -> PortFuture<'_, ScheduleRunReceipt>;
+    fn ensure_run_inactive(
+        &self,
+        ctx: AccountContext,
+        run: AgentRunId,
+    ) -> PortFuture<'_, ()>;
     fn select_provider(
             &self,
             ctx: SpaceContext,

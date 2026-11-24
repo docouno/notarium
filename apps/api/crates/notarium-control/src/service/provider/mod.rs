@@ -34,10 +34,18 @@ use serde::{Serialize, de::DeserializeOwned};
 use std::{collections::BTreeMap, sync::Arc};
 use tokio::sync::Semaphore;
 
+/// Wire payload ceiling enforced by the bounded provider codec.
+pub const MAX_COMPLETION_WIRE_BYTES: usize = wire::MAX_PAYLOAD;
+
 /// Estimate the request with the same bounded codec used by admission and
 /// provider accounting. This helper performs no authority or network work.
 pub fn completion_input_estimate(request: &CompletionRequest) -> Result<u32, PortError> {
     wire::estimate_completion_input_tokens(request)
+}
+
+/// Conservatively estimate serialized wire payload bytes for prompt planning.
+pub fn completion_wire_bytes_estimate(request: &CompletionRequest) -> Result<usize, PortError> {
+    wire::estimate_completion_wire_bytes(request)
 }
 
 /// Price generated text when it becomes input to a later completion.

@@ -46,6 +46,7 @@ struct Recipient<'a, 'registry> {
     scope: &'a SpaceContext,
     classes: &'a BTreeSet<DocClass>,
     project: Option<&'a FolderRef>,
+    source_classes: Option<BTreeSet<DocClass>>,
 }
 
 impl SearchRecipient for Recipient<'_, '_> {
@@ -69,6 +70,10 @@ impl SearchRecipient for Recipient<'_, '_> {
 
     fn framing_tokens(&self, note: &NoteId, first_chunk: bool) -> u32 {
         framing_tokens(note, first_chunk)
+    }
+
+    fn query_source_classes(&self) -> Option<BTreeSet<DocClass>> {
+        self.source_classes.clone()
     }
 }
 
@@ -135,11 +140,47 @@ pub(super) async fn retrieve(
                 .as_ref()
                 .map(|project| project.folder_id.clone()),
         };
+        let source_classes = if let EgressTarget::InAppProvider {
+            primary_project, ..
+        } = &call.target
+        {
+            let grant_readable: BTreeSet<DocClass> = scope
+                .auth()
+                .spaces()
+                .get(&target.scope.space_id)
+                .map(|grant| {
+                    grant
+                        .read_classes
+                        .iter()
+                        .copied()
+                        .filter(|class| *class != DocClass::EncryptedNote)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let selection_project = primary_project
+                .as_ref()
+                .filter(|project| project.space_id == target.scope.space_id)
+                .cloned()
+                .or_else(|| target.project.clone());
+            let allowed = match call.provider_selection(&scope, selection_project).await {
+                Ok(Some(selection)) => selection
+                    .policy
+                    .allowed_classes
+                    .into_iter()
+                    .filter(|class| grant_readable.contains(class))
+                    .collect(),
+                _ => grant_readable,
+            };
+            Some(allowed)
+        } else {
+            None
+        };
         let recipient = Recipient {
             call,
             scope: &scope,
             classes: &classes,
             project: target.project.as_ref(),
+            source_classes,
         };
         let result = if recall {
             call.registry

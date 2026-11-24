@@ -405,6 +405,50 @@ fn history(request: &CompletionRequest, wire: ProviderWireKind) -> Result<Vec<Va
 pub(in crate::service::provider) fn text_tokens(value: &str) -> u64 {
     estimate_token_twelfths(value).div_ceil(12)
 }
+fn json_escaped_len(value: &str) -> usize {
+    value.chars().fold(0usize, |total, ch| {
+        total
+            + match ch {
+                '"' | '\\' | '\u{8}' | '\t' | '\n' | '\u{c}' | '\r' => 2,
+                '\0'..='\u{1f}' => 6,
+                ch => ch.len_utf8(),
+            }
+    })
+}
+pub(in crate::service::provider) fn estimate_completion_wire_bytes(
+    request: &CompletionRequest,
+) -> Result<usize, PortError> {
+    let mut total = 512usize;
+    for message in &request.messages {
+        total = total.saturating_add(96);
+        if let Some(id) = &message.result_for {
+            total = total.saturating_add(json_escaped_len(id.as_str()));
+        }
+        if let Some(instruction) = &message.instruction {
+            total = total.saturating_add(json_escaped_len(instruction.text()) + 2);
+        }
+        for part in &message.parts {
+            total = total.saturating_add(json_escaped_len(part.text()) + 2);
+        }
+        for call in &message.tool_calls {
+            let args = serde_json::to_string(&call.arguments).map_err(|_| invalid())?;
+            total = total
+                .saturating_add(128)
+                .saturating_add(json_escaped_len(call.id.as_str()))
+                .saturating_add(json_escaped_len(&call.name))
+                .saturating_add(json_escaped_len(&args));
+        }
+    }
+    if !request.tools.is_empty() {
+        let definitions = tools(&request.tools)?;
+        total = total.saturating_add(
+            serde_json::to_vec(&definitions)
+                .map_err(|_| invalid())?
+                .len(),
+        );
+    }
+    Ok(total)
+}
 pub(in crate::service::provider) fn estimate_completion_input_tokens(
     request: &CompletionRequest,
 ) -> Result<u32, PortError> {

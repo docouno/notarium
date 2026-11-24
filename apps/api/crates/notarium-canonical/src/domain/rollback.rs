@@ -972,6 +972,7 @@ pub(crate) fn build_rollback_direct_single_tx_exec(
             let Some((inc_bytes, run_rev_raw)) = run_head_opt else {
                 return Err(DomainError::ResourceNotFound.into());
             };
+            ensure_chat_run_not_active_tx(tx, &scope_cl.space_id, run).await?;
             let actual_run_rev = scoped_run_revision(&scope_cl, &inc_bytes, &run_rev_raw)?;
 
             let histories = load_direct_rollback_histories(tx, &scope_cl.space_id, run).await?;
@@ -2873,11 +2874,41 @@ pub(crate) fn verify_authorized_rollback_revisions<'a>(
     Ok(())
 }
 
+async fn ensure_chat_run_not_active_tx(
+    tx: &mut BackendConn<'_>,
+    space_id: &SpaceId,
+    run: &AgentRunId,
+) -> Result<(), PortError> {
+    let active: bool = match tx {
+        BackendConn::Sqlite(conn) => sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM chat_threads WHERE space_id = ? AND active_run_id = ?)",
+        )
+        .bind(space_id.as_str())
+        .bind(run.as_str())
+        .fetch_one(&mut **conn)
+        .await
+        .map_err(|err| internal_not_committed("sqlite_rollback_active_chat", err.to_string()))?,
+        BackendConn::Postgres(conn) => sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM chat_threads WHERE space_id = $1 AND active_run_id = $2)",
+        )
+        .bind(space_id.as_str())
+        .bind(run.as_str())
+        .fetch_one(&mut **conn)
+        .await
+        .map_err(|err| crate::runtime::pg_read_error("pg_rollback_active_chat", err))?,
+    };
+    if active {
+        return Err(DomainError::validation(ValidationReason::InvalidState).into());
+    }
+    Ok(())
+}
+
 async fn load_run_revision(
     tx: &mut BackendConn<'_>,
     scope: &HistoryScope,
     run: &AgentRunId,
 ) -> Result<RevisionId, PortError> {
+    ensure_chat_run_not_active_tx(tx, &scope.space_id, run).await?;
     let run_row: Option<(Vec<u8>, String)> = match tx {
         BackendConn::Sqlite(conn) => {
             let row = sqlx::query(

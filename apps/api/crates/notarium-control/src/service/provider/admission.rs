@@ -18,14 +18,126 @@ use crate::{
 use http::header::{HeaderMap, HeaderName, HeaderValue};
 use notarium_core::{
     DomainError,
-    auth::{AuthenticatedCredential, EngineAuthContext, PrincipalKind, Space},
-    classes::{ClassEgressFence, ProviderCurrentContent, ProviderMessage},
+    auth::{AuthenticatedCredential, EngineAuthContext, PrincipalKind, Space, SpaceGrant},
+    classes::{ClassEgressFence, DocClass, ProviderCurrentContent, ProviderMessage},
     error::{CommitEffect, PortError, ValidationReason},
     ids::*,
     model::FolderRef,
     ports::*,
 };
 use std::collections::{BTreeMap, BTreeSet};
+
+/// Model-authored search queries may reflect any non-encrypted class disclosed
+/// to the calling run in this Space. Require the embedding provider to cover
+/// every such class (failing closed to the run's non-encrypted Space grant if
+/// prior completion providers cannot be proved narrower).
+pub(super) async fn required_query_source_classes(
+    tx: &mut Transaction,
+    auth: &EngineAuthContext,
+    space: &Space,
+    query_project: Option<&FolderRef>,
+    grant: &SpaceGrant,
+    now: i64,
+) -> Result<BTreeSet<DocClass>, PortError> {
+    let run = match auth.kind() {
+        PrincipalKind::AgentRun(run) | PrincipalKind::Keeper(run) => run,
+        _ => return Ok(BTreeSet::new()),
+    };
+    let grant_readable: BTreeSet<DocClass> = grant
+        .read_classes
+        .iter()
+        .copied()
+        .filter(|class| *class != DocClass::EncryptedNote)
+        .collect();
+    let prior_resources = rows!(
+        tx,
+        (String,),
+        fetch_all,
+        "SELECT DISTINCT resource_id FROM provider_call_log WHERE run_id=$1 ORDER BY resource_id LIMIT 65",
+        "SELECT DISTINCT resource_id FROM v1_control.provider_call_log WHERE run_id=$1 ORDER BY resource_id LIMIT 65";
+        run.as_str()
+    )?;
+    if prior_resources.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    if prior_resources.len() > 64 {
+        return Ok(grant_readable);
+    }
+    let run_project = grant.project_root.as_ref().map(|folder_id| FolderRef {
+        space_id: space.id.clone(),
+        folder_id: folder_id.clone(),
+    });
+    let mut required = BTreeSet::new();
+    for (resource_id,) in prior_resources {
+        let Some(res) = rows!(
+            tx,
+            ProviderResourcesRow,
+            fetch_optional,
+            "SELECT * FROM provider_resources WHERE id=$1",
+            "SELECT * FROM v1_control.provider_resources WHERE id=$1";
+            &resource_id
+        )?
+        else {
+            return Ok(grant_readable);
+        };
+        let credential_epoch = if let Some(cred_id) = &res.credential_id {
+            let Some(cred) = rows!(
+                tx,
+                CredentialsRow,
+                fetch_optional,
+                "SELECT * FROM credentials WHERE id=$1",
+                "SELECT * FROM v1_control.credentials WHERE id=$1";
+                cred_id
+            )?
+            else {
+                return Ok(grant_readable);
+            };
+            Some(cred.consent_epoch)
+        } else {
+            None
+        };
+        let primary_policy = selection::policy(
+            tx,
+            auth,
+            &res,
+            credential_epoch,
+            space,
+            run_project.as_ref(),
+            now,
+            false,
+        )
+        .await;
+        let admitted = match primary_policy {
+            Ok(policy) => policy,
+            Err(_) if run_project.is_none() && query_project.is_some() => {
+                match selection::policy(
+                    tx,
+                    auth,
+                    &res,
+                    credential_epoch,
+                    space,
+                    query_project,
+                    now,
+                    false,
+                )
+                .await
+                {
+                    Ok(policy) => policy,
+                    Err(_) => return Ok(grant_readable),
+                }
+            }
+            Err(_) => return Ok(grant_readable),
+        };
+        required.extend(
+            admitted
+                .policy
+                .allowed_classes
+                .into_iter()
+                .filter(|class| grant_readable.contains(class)),
+        );
+    }
+    Ok(required)
+}
 
 pub(super) struct Snapshot {
     pub resource: ProviderResourcesRow,
@@ -318,10 +430,24 @@ impl ProviderService {
             {
                 return Err(DomainError::AccessDenied.into());
             }
-            if !query.classes.iter().all(|class| {
-                admitted.policy.allowed_classes.contains(class)
-                    && grant.read_classes.contains(class)
-            }) {
+            let source_classes = required_query_source_classes(
+                tx,
+                &auth,
+                &primary.space,
+                query.project_scope.as_ref(),
+                grant,
+                now,
+            )
+            .await?;
+            if !query
+                .classes
+                .iter()
+                .chain(source_classes.iter())
+                .all(|class| {
+                    admitted.policy.allowed_classes.contains(class)
+                        && grant.read_classes.contains(class)
+                })
+            {
                 return Err(invalid(ValidationReason::ClassEgressForbidden));
             }
         }

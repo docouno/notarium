@@ -424,9 +424,11 @@ async fn execute(
     placement: &CreatePlacement,
     prepared: &PreparedDraft,
     carrier: String,
+    committed_any: &mut bool,
 ) -> Result<(Committed<NoteRevision>, FolderId), PortError> {
+    const LABEL: &str = "notarium.mcp.create-note.v1";
     let scope = placement.write_scope.clone();
-    let parent = super::ensure_destination(
+    let (parent, created_folder) = super::ensure_destination(
         call,
         &scope,
         Some(placement.project.reference.folder_id.clone()),
@@ -437,6 +439,9 @@ async fn execute(
         None,
     )
     .await?;
+    if created_folder {
+        *committed_any = true;
+    }
     let write = Mutation {
         identity: prepared.command.clone(),
         preconditions: Preconditions::default(),
@@ -449,11 +454,20 @@ async fn execute(
             folder_page: prepared.folder_page,
         },
     };
+    let writer = call
+        .corpus_writer(scope)
+        .await
+        .map_err(|error| batch_operational_error(LABEL, error, *committed_any))?;
     let committed = call
         .registry
         .engine
-        .create_note(call.corpus_writer(scope).await?, write)
-        .await?;
+        .create_note(writer, write)
+        .await
+        .map_err(|error| match error {
+            PortError::Domain(domain) => PortError::Domain(domain),
+            operational => batch_operational_error(LABEL, operational, *committed_any),
+        })?;
+    *committed_any = true;
     Ok((committed, parent.folder_id))
 }
 
@@ -492,8 +506,12 @@ pub(super) async fn create_one(
     let placement = placement(call, &input.project).await?;
     let prepared = PreparedDraft::new(call, &placement, input.draft, input.folder_page, 0, None)?;
     let carrier = prepare_carrier(call, None, &placement.read_scope, &prepared).await?;
-    let (committed, parent) = execute(call, &placement, &prepared, carrier).await?;
-    result(call, &placement, &prepared, committed, parent).await
+    let mut committed_any = false;
+    let (committed, parent) =
+        execute(call, &placement, &prepared, carrier, &mut committed_any).await?;
+    result(call, &placement, &prepared, committed, parent)
+        .await
+        .map_err(|error| batch_operational_error("notarium.mcp.create-note.v1", error, true))
 }
 
 struct CreatedDraft {
@@ -510,6 +528,7 @@ async fn create_draft(
     placement: &CreatePlacement,
     index: u16,
     raw: Value,
+    committed_any: &mut bool,
 ) -> Result<CreatedDraft, PortError> {
     let bytes = serde_json::to_vec(&raw).map_err(|_| invalid(ValidationReason::InvalidQuery))?;
     let hash = derive_digest("notarium.mcp.create-note-item-arguments.v1", &[&bytes]);
@@ -517,7 +536,8 @@ async fn create_draft(
     let links = prepare_links(call, None, &placement.read_scope, &prepared).await?;
     let (carrier, link_block) =
         carrier_with_links(&prepared.carrier, link_lines(&links, &BTreeMap::new())?)?;
-    let (committed, parent) = execute(call, placement, &prepared, carrier.clone()).await?;
+    let (committed, parent) =
+        execute(call, placement, &prepared, carrier.clone(), committed_any).await?;
     placement
         .write_scope
         .scope()
@@ -631,7 +651,7 @@ async fn resolve_batch_links(
         .map(Some)
 }
 
-pub(super) fn batch_operational_error(
+pub(in crate::mcp) fn batch_operational_error(
     label: &str,
     error: PortError,
     committed_any: bool,
@@ -689,7 +709,7 @@ pub(super) async fn create_many(
     let mut committed_any = false;
     // Commit independently before treating any generated ID as a valid target.
     for (index, raw) in input.notes.into_iter().enumerate() {
-        match create_draft(call, &placement, index as u16, raw).await {
+        match create_draft(call, &placement, index as u16, raw, &mut committed_any).await {
             Ok(item) => {
                 committed_any = true;
                 titles

@@ -323,12 +323,21 @@ pub(super) async fn preview(
                 .inspect_memory_target(owner.account(), plan.target.clone(), plan.category.clone())
                 .await?;
             check_memory_target(plan, &current)?;
-            preview.memory = Some(json!({
+            let mut memory = json!({
+                "target": match &plan.target {
+                    MemoryTarget::User { .. } => "user",
+                    MemoryTarget::Project { .. } => "project",
+                },
+                "spaceId": plan.scope.space_id,
                 "category": plan.category,
                 "observation": plan.observation,
                 "summary": plan.summary,
                 "versionToken": plan.expected_revision,
-            }));
+            });
+            if let MemoryTarget::Project { folder } = &plan.target {
+                memory["projectFolder"] = json!(folder.folder_id);
+            }
+            preview.memory = Some(memory);
         }
         ProposedAction::Links(links) => {
             preview.change = Some(organize::describe_links(&owner, links).await?);

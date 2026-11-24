@@ -1,6 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use notarium_control::service::provider::{completion_input_estimate, completion_text_estimate};
+use notarium_control::service::provider::{
+    MAX_COMPLETION_WIRE_BYTES, completion_input_estimate, completion_text_estimate,
+    completion_wire_bytes_estimate,
+};
 use notarium_core::{
     DomainError,
     classes::{ClassEgressFence, ProviderMessage, ProviderOrigin},
@@ -21,6 +24,9 @@ const HISTORY_WINDOW: u16 = 200;
 
 const COMPACTION_ENTRIES: usize = 80;
 const MAX_SUMMARY_TOKENS: u32 = 2048;
+/// Leave headroom below the codec's 8 MiB hard wire ceiling so compaction runs
+/// before wire serialization can reject an otherwise token-eligible branch.
+const WIRE_CEILING_BYTES: usize = MAX_COMPLETION_WIRE_BYTES - 128 * 1024;
 
 pub(crate) fn validate_summary(
     finish: CompletionFinish,
@@ -67,16 +73,21 @@ impl History {
         let input_ceiling = request.budget.max_input_tokens.min(run_input_ceiling);
         let base = request.messages.len();
         let fixed_tokens = completion_input_estimate(&request)?;
-        if fixed_tokens > input_ceiling {
+        let fixed_bytes = completion_wire_bytes_estimate(&request)?;
+        if fixed_tokens > input_ceiling || fixed_bytes > WIRE_CEILING_BYTES {
             return Err(invalid(ValidationReason::TokenBudgetExceeded));
         }
         let mut summary = request.clone();
         request.messages.extend(messages);
         let full = completion_input_estimate(&request)?;
+        let full_bytes = completion_wire_bytes_estimate(&request)?;
         let wants_summary = has_tail
             || full > input_ceiling
+            || full_bytes > WIRE_CEILING_BYTES
             || branch.entries.len() >= COMPACTION_ENTRIES
-            || (branch.entries.len() > 8 && full > input_ceiling.saturating_mul(3) / 4);
+            || (branch.entries.len() > 8
+                && (full > input_ceiling.saturating_mul(3) / 4
+                    || full_bytes > WIRE_CEILING_BYTES.saturating_mul(3) / 4));
         if wants_summary
             && let Some(through) = Self::prefix(
                 &groups,
@@ -84,12 +95,13 @@ impl History {
                 &request.messages[base..],
                 input_ceiling,
                 fixed_tokens,
+                fixed_bytes,
             )?
         {
             let proof = provenance(&mut summary, Some(through))?;
             return Ok((branch, summary, proof));
         }
-        if has_tail || full > input_ceiling {
+        if has_tail || full > input_ceiling || full_bytes > WIRE_CEILING_BYTES {
             return Err(invalid(ValidationReason::TokenBudgetExceeded));
         }
         let proof = provenance(&mut request, None)?;
@@ -102,6 +114,7 @@ impl History {
         messages: &[CompletionMessage],
         input_ceiling: u32,
         normal_fixed_tokens: u32,
+        normal_fixed_bytes: usize,
     ) -> Result<Option<ThreadEntrySeq>, PortError> {
         let Some(latest_message) = groups.iter().position(|group| group.end == messages.len())
         else {
@@ -122,9 +135,11 @@ impl History {
         )?);
         let fixed = summary.messages.len();
         let fixed_tokens = completion_input_estimate(summary)?;
+        let fixed_bytes = completion_wire_bytes_estimate(summary)?;
         let mut selected = None;
         let mut from = 0;
         let mut total = fixed_tokens;
+        let mut total_bytes = fixed_bytes;
         let mut eligible = true;
         for (index, group) in groups.iter().enumerate() {
             // Estimation is additive across whole messages. Price each group
@@ -134,13 +149,18 @@ impl History {
                 .messages
                 .extend_from_slice(&messages[from..group.end]);
             let tokens = completion_input_estimate(summary)?.saturating_sub(fixed_tokens);
-            if tokens.saturating_add(fixed_tokens.min(normal_fixed_tokens)) > input_ceiling {
+            let group_bytes = completion_wire_bytes_estimate(summary)?.saturating_sub(fixed_bytes);
+            if tokens.saturating_add(fixed_tokens.min(normal_fixed_tokens)) > input_ceiling
+                || group_bytes.saturating_add(fixed_bytes.min(normal_fixed_bytes))
+                    > WIRE_CEILING_BYTES
+            {
                 // A single unsplittable group cannot fit even by itself.
                 return Ok(None);
             }
             from = group.end;
             total = total.saturating_add(tokens);
-            eligible &= total <= input_ceiling;
+            total_bytes = total_bytes.saturating_add(group_bytes);
+            eligible &= total <= input_ceiling && total_bytes <= WIRE_CEILING_BYTES;
             if eligible
                 && index < latest_message
                 && !group.checkpoint
@@ -496,4 +516,122 @@ fn message(role: CompletionRole, part: ProviderMessage) -> CompletionMessage {
 
 fn invalid(reason: ValidationReason) -> PortError {
     DomainError::validation(reason).into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use notarium_core::{
+        classes::{DocClass, ProviderAudience, ProviderPolicy},
+        ids::{ModelProfileId, PrincipalId, ProviderResourceId, RevisionId, SpaceId},
+        model::HistoryScope,
+        ports::{
+            ChatThread, ChatThreadKind, CompletionBudget, CompletionModelLimits,
+            ProviderRevocationScope, ProviderRuntimeEpochs,
+        },
+    };
+
+    #[test]
+    fn high_token_window_still_compacts_before_8_mib_wire_limit() {
+        let provider = ProviderResourceId::from_bytes([1; 16]);
+        let selection = ProviderSelection {
+            provider: provider.clone(),
+            model: ModelProfileId::from_bytes([2; 16]),
+            runtime_epochs: ProviderRuntimeEpochs {
+                resource: std::num::NonZeroU64::MIN,
+                credential: None,
+            },
+            project: None,
+            project_only: None,
+            policy: ProviderPolicy {
+                provider,
+                audience: ProviderAudience::Personal { consented: true },
+                allowed_classes: DocClass::all(),
+            },
+            completion: Some(CompletionModelLimits {
+                max_input_tokens: 10_000_000,
+                max_output_tokens: 4096,
+                supports_tools: false,
+            }),
+            revocation_scope: ProviderRevocationScope {
+                owner: PrincipalId::from_bytes([3; 16]),
+                credential: None,
+            },
+        };
+        let space = SpaceId::from_bytes([4; 16]);
+        let thread = ChatThreadId::from_bytes([5; 16]);
+        let owner = PrincipalId::from_bytes([3; 16]);
+        let branch = ChatBranch {
+            thread: ChatThread {
+                id: thread,
+                space: space.clone(),
+                kind: ChatThreadKind::Personal,
+                owner,
+                project_folder: None,
+                title: "Wire ceiling".into(),
+                head: ThreadEntrySeq::new(5).unwrap(),
+                revision: RevisionId::from_bytes([6; 16]),
+                active_run: None,
+                tainted: false,
+            },
+            entries: Vec::new(),
+            next_ancestor: None,
+        };
+        // Seventy-five 64 KiB quote-heavy messages (< COMPACTION_ENTRIES = 80)
+        // stay far below 10M tokens, yet JSON-escape to ~9.6 MiB (> 8 MiB wire limit)
+        // and must trigger compaction before wire serialization fails.
+        let big = "\"".repeat(64 * 1024);
+        let mut messages = Vec::new();
+        let mut groups = Vec::new();
+        for i in 1..=75_u64 {
+            messages.push(CompletionMessage {
+                role: if i % 2 == 1 {
+                    CompletionRole::User
+                } else {
+                    CompletionRole::Assistant
+                },
+                instruction: Some(ProviderInstruction::from_orchestrator(big.clone()).unwrap()),
+                parts: Vec::new(),
+                tool_calls: Vec::new(),
+                result_for: None,
+            });
+            groups.push(HistoryGroup {
+                end: i as usize,
+                through: ThreadEntrySeq::new(i).unwrap(),
+                checkpoint: false,
+                starts_with_tool: false,
+            });
+        }
+        let history = History {
+            branch,
+            messages,
+            has_tail: false,
+            groups,
+        };
+        let request = CompletionRequest {
+            intent: notarium_core::ids::CommandKey::from_bytes([7; 16]),
+            selection,
+            secondary_projects: Vec::new(),
+            messages: vec![system_prompt("System".into(), Vec::new()).unwrap()],
+            tools: Vec::new(),
+            budget: CompletionBudget {
+                max_input_tokens: 10_000_000,
+                max_output_tokens: 4096,
+                max_tool_calls: 0,
+            },
+        };
+        let (_branch, planned, proof) = history.plan(request, 10_000_000).unwrap();
+        assert!(
+            proof.compacts_through.is_some(),
+            "history exceeding 8 MiB wire ceiling must trigger compaction"
+        );
+        assert!(
+            completion_wire_bytes_estimate(&planned).unwrap() <= WIRE_CEILING_BYTES,
+            "compaction request must stay under codec wire ceiling"
+        );
+        let _ = HistoryScope {
+            space_id: space,
+            incarnation: notarium_core::ids::HistoryIncarnation::from_bytes([8; 16]),
+        };
+    }
 }

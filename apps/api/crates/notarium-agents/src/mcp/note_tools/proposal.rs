@@ -649,7 +649,15 @@ pub(in crate::mcp) async fn apply_proposal(
                     },
                 )
                 .await?;
-            receipt_result(owner, scope, &route.note, result, "edited").await
+            receipt_result(owner, scope, &route.note, result, "edited")
+                .await
+                .map_err(|error| {
+                    super::batch_operational_error(
+                        "notarium.mcp.confirmed-edit-note.v1",
+                        error,
+                        true,
+                    )
+                })
         }
         PreparedNoteAction::Delete { route } => {
             let (scope, identity) = step(&route.scope, "trash_note", 0)?;
@@ -668,7 +676,15 @@ pub(in crate::mcp) async fn apply_proposal(
                     },
                 )
                 .await?;
-            receipt_result(owner, scope, &route.note, result, "trashed").await
+            receipt_result(owner, scope, &route.note, result, "trashed")
+                .await
+                .map_err(|error| {
+                    super::batch_operational_error(
+                        "notarium.mcp.confirmed-delete-note.v1",
+                        error,
+                        true,
+                    )
+                })
         }
         PreparedNoteAction::Move {
             route,
@@ -676,14 +692,20 @@ pub(in crate::mcp) async fn apply_proposal(
             slug,
             ..
         } => {
+            const LABEL: &str = "notarium.mcp.confirmed-move-note.v1";
+            let creates_folder = destination.exact().is_none();
             let (scope, identity) = step(&route.scope, "move_note", 0)?;
             let (folder_scope, folder_identity) = step(&route.scope, "move_destination", 0)?;
             let parent = destination
                 .apply(owner, folder_scope, folder_identity, Some(&route))
                 .await?;
+            let bound = destination
+                .bind(scope.clone(), Some(&route))
+                .map_err(|error| super::batch_operational_error(LABEL, error, creates_folder))?;
             let leased = owner
-                .fence_confirmed_effect(destination.bind(scope.clone(), Some(&route))?)
-                .await?;
+                .fence_confirmed_effect(bound)
+                .await
+                .map_err(|error| super::batch_operational_error(LABEL, error, creates_folder))?;
             let result = owner
                 .registry
                 .engine
@@ -699,8 +721,16 @@ pub(in crate::mcp) async fn apply_proposal(
                         },
                     },
                 )
-                .await?;
-            receipt_result(owner, scope, &route.note, result, "moved").await
+                .await
+                .map_err(|error| match error {
+                    PortError::Domain(domain) => PortError::Domain(domain),
+                    operational => {
+                        super::batch_operational_error(LABEL, operational, creates_folder)
+                    }
+                })?;
+            receipt_result(owner, scope, &route.note, result, "moved")
+                .await
+                .map_err(|error| super::batch_operational_error(LABEL, error, true))
         }
         PreparedNoteAction::Rename { route, slug, title } => {
             let (scope, identity) = step(&route.scope, "rename_note", 0)?;
@@ -720,7 +750,15 @@ pub(in crate::mcp) async fn apply_proposal(
                     },
                 )
                 .await?;
-            receipt_result(owner, scope, &route.note, result, "renamed").await
+            receipt_result(owner, scope, &route.note, result, "renamed")
+                .await
+                .map_err(|error| {
+                    super::batch_operational_error(
+                        "notarium.mcp.confirmed-rename-note.v1",
+                        error,
+                        true,
+                    )
+                })
         }
     }
 }

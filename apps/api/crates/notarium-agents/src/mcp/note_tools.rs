@@ -23,6 +23,7 @@ mod create;
 mod edit;
 mod proposal;
 
+pub(super) use create::batch_operational_error;
 pub(super) use proposal::{
     PreparedNoteAction, apply_proposal, describe_proposal, plan_proposal, preview_proposal,
 };
@@ -121,6 +122,22 @@ async fn route(
     note: &NoteId,
     expected: Option<&RevisionId>,
 ) -> Result<NoteRoute, PortError> {
+    route_inner(call, note, expected, false).await
+}
+
+async fn route_for_delete(
+    call: &ToolCallContext<'_>,
+    note: &NoteId,
+) -> Result<NoteRoute, PortError> {
+    route_inner(call, note, None, true).await
+}
+
+async fn route_inner(
+    call: &ToolCallContext<'_>,
+    note: &NoteId,
+    expected: Option<&RevisionId>,
+    allow_trashed_replay: bool,
+) -> Result<NoteRoute, PortError> {
     let route: NoteRoute = call
         .journal("note_route", || observe_note(call, note, expected))
         .await?;
@@ -129,8 +146,24 @@ async fn route(
     }
     if matches!(call.target, EgressTarget::InAppProvider { .. }) {
         let scope = call.space(route.scope.clone())?;
-        let catalog = corpus::note_in_space(call, &scope, &route.note).await?;
-        corpus::admit_note_write(call, &scope, &catalog).await?;
+        match corpus::note_in_space(call, &scope, &route.note).await {
+            Ok(catalog) => corpus::admit_note_write(call, &scope, &catalog).await?,
+            Err(PortError::Domain(DomainError::ResourceNotFound)) if allow_trashed_replay => {
+                let observed = metadata_snapshot(
+                    call,
+                    &scope,
+                    &route.note,
+                    None,
+                    CausalBasis::Await(Default::default()),
+                )
+                .await?;
+                if observed.metadata.lifecycle() != Lifecycle::Trashed {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+                corpus::admit_note_metadata_write(call, &scope, &observed.metadata).await?;
+            }
+            Err(error) => return Err(error),
+        }
     }
     Ok(route)
 }
@@ -247,7 +280,7 @@ fn preconditions(route: &NoteRoute) -> Preconditions {
 }
 
 async fn delete(call: &mut ToolCallContext<'_>, input: NoteInput) -> Result<Value, PortError> {
-    let route = route(call, &input.note, None).await?;
+    let route = route_for_delete(call, &input.note).await?;
     let scope = call.space(route.scope.clone())?;
     let command = Mutation {
         identity: call.command_identity(&route.scope, "trash_note", 0),
@@ -262,7 +295,9 @@ async fn delete(call: &mut ToolCallContext<'_>, input: NoteInput) -> Result<Valu
         .engine
         .delete_note(call.corpus_writer(scope.clone()).await?, command)
         .await?;
-    receipt_result(call, scope, &route.note, committed, "trashed").await
+    receipt_result(call, scope, &route.note, committed, "trashed")
+        .await
+        .map_err(|error| batch_operational_error("notarium.mcp.delete-note.v1", error, true))
 }
 
 /// Validate a path without making folders. The empty path names the base.
@@ -363,6 +398,22 @@ async fn admit_destination_anchor(
     .await
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+enum JournaledDestination {
+    Detailed { folder: FolderRef, created: bool },
+    Legacy(FolderRef),
+}
+
+impl JournaledDestination {
+    fn into_parts(self, has_path: bool) -> (FolderRef, bool) {
+        match self {
+            Self::Detailed { folder, created } => (folder, created),
+            Self::Legacy(folder) => (folder, has_path),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn ensure_destination(
     call: &ToolCallContext<'_>,
@@ -373,9 +424,10 @@ async fn ensure_destination(
     content_command: &CommandIdentity,
     label: &str,
     expected_source: Option<&NoteRoute>,
-) -> Result<FolderRef, PortError> {
+) -> Result<(FolderRef, bool), PortError> {
     admit_destination_anchor(call, scope, &base, &path, class).await?;
-    let destination: FolderRef = call
+    let has_path = !path.is_empty();
+    let ensured: JournaledDestination = call
         .journal_with_key(
             label,
             &content_command.key,
@@ -401,7 +453,15 @@ async fn ensure_destination(
                         .into());
                     }
                 }
-                call.registry
+                let existed = !has_path
+                    || call
+                        .registry
+                        .engine
+                        .resolve_folder_path(scope.clone(), base.clone(), path.clone())
+                        .await?
+                        .is_some();
+                let folder = call
+                    .registry
                     .engine
                     .ensure_folder_path(
                         call.corpus_writer(scope.clone()).await?,
@@ -419,18 +479,29 @@ async fn ensure_destination(
                             input: EnsureFolderPath { base, path },
                         },
                     )
-                    .await
+                    .await?;
+                Ok(JournaledDestination::Detailed {
+                    folder,
+                    created: !existed,
+                })
             },
         )
         .await?;
+    let (destination, created) = ensured.into_parts(has_path);
+    const ERR_LABEL: &str = "notarium.mcp.folder-destination.v1";
     if destination.space_id != scope.scope().space_id {
-        return Err(invalid(ValidationReason::ScopeMismatch));
+        return Err(batch_operational_error(
+            ERR_LABEL,
+            invalid(ValidationReason::ScopeMismatch),
+            created,
+        ));
     }
     let live = call
         .registry
         .catalog
         .folder(call.account(), destination.clone())
-        .await?;
+        .await
+        .map_err(|error| batch_operational_error(ERR_LABEL, error, created))?;
     if live.reference != destination
         || live.space.id != destination.space_id
         || live.lifecycle != Lifecycle::Active
@@ -441,7 +512,9 @@ async fn ensure_destination(
         .auth()
         .can_view_folder(&live.space, &destination.folder_id, &live.ancestor_folders)?;
     if matches!(call.target, EgressTarget::InAppProvider { .. }) {
-        let resolved = folder_base(call, scope, &destination.folder_id).await?;
+        let resolved = folder_base(call, scope, &destination.folder_id)
+            .await
+            .map_err(|error| batch_operational_error(ERR_LABEL, error, created))?;
         let project = resolved.project.map(|folder_id| FolderRef {
             space_id: destination.space_id.clone(),
             folder_id,
@@ -454,12 +527,14 @@ async fn ensure_destination(
             &live.ancestor_folders,
             class,
         )
-        .await?;
+        .await
+        .map_err(|error| batch_operational_error(ERR_LABEL, error, created))?;
     }
-    Ok(destination)
+    Ok((destination, created))
 }
 
 async fn move_note(call: &mut ToolCallContext<'_>, input: MoveInput) -> Result<Value, PortError> {
+    const LABEL: &str = "notarium.mcp.move-note.v1";
     let folder = clean_path(&input.to_folder)?;
     let route = route(call, &input.target.note, None).await?;
     let (scope, before) = route_metadata_snapshot(call, &route).await?;
@@ -477,7 +552,7 @@ async fn move_note(call: &mut ToolCallContext<'_>, input: MoveInput) -> Result<V
         folder
     };
     let identity = call.command_identity(&route.scope, "move_note", 0);
-    let parent = ensure_destination(
+    let (parent, created_folder) = ensure_destination(
         call,
         &scope,
         base,
@@ -488,11 +563,15 @@ async fn move_note(call: &mut ToolCallContext<'_>, input: MoveInput) -> Result<V
         Some(&route),
     )
     .await?;
+    let writer = call
+        .corpus_writer(scope.clone())
+        .await
+        .map_err(|error| batch_operational_error(LABEL, error, created_folder))?;
     let committed = call
         .registry
         .engine
         .move_note(
-            call.corpus_writer(scope.clone()).await?,
+            writer,
             Mutation {
                 identity,
                 preconditions: preconditions(&route),
@@ -503,8 +582,11 @@ async fn move_note(call: &mut ToolCallContext<'_>, input: MoveInput) -> Result<V
                 },
             },
         )
-        .await?;
-    receipt_result(call, scope, &route.note, committed, "moved").await
+        .await
+        .map_err(|error| batch_operational_error(LABEL, error, created_folder))?;
+    receipt_result(call, scope, &route.note, committed, "moved")
+        .await
+        .map_err(|error| batch_operational_error(LABEL, error, true))
 }
 
 fn note_slug(
@@ -584,7 +666,9 @@ async fn rename(call: &mut ToolCallContext<'_>, input: RenameInput) -> Result<Va
             },
         )
         .await?;
-    receipt_result(call, scope, &route.note, committed, "renamed").await
+    receipt_result(call, scope, &route.note, committed, "renamed")
+        .await
+        .map_err(|error| batch_operational_error("notarium.mcp.rename-note.v1", error, true))
 }
 
 async fn receipt_result(

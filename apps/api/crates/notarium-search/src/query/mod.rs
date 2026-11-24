@@ -247,6 +247,9 @@ impl SearchEngine {
             excluded: excluded.clone(),
             limit: initial_k,
             browse,
+            source_classes: delivery
+                .recipient
+                .and_then(|recipient| recipient.query_source_classes()),
         });
         let (mut notes, mut vectors) = tokio::try_join!(lexical, vectors)?;
         let strict_overflow = notes.strict_len > initial_cap;
@@ -535,6 +538,7 @@ impl SearchEngine {
             handle,
             excluded,
             limit,
+            source_classes,
             ..
         } = input;
         let waiting_for_vectors = state.reopening_vectors || needs_embedder_reload;
@@ -658,6 +662,7 @@ impl SearchEngine {
                     context,
                     query,
                     filter.classes.clone(),
+                    source_classes,
                     query_project,
                     &requested,
                 )
@@ -848,6 +853,7 @@ struct VectorRequest<'a> {
     excluded: Arc<BTreeSet<NoteId>>,
     limit: usize,
     browse: bool,
+    source_classes: Option<BTreeSet<DocClass>>,
 }
 
 struct PreparedVector {

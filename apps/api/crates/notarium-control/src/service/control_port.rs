@@ -122,6 +122,13 @@ impl ControlPort for ControlPlane {
     fn get_episode(&self, ctx: AccountContext, episode: EpisodeId) -> PortFuture<'_, AgentEpisode> {
         Box::pin(self.control.get_episode(ctx, episode))
     }
+    fn named_episode_project_hint(
+        &self,
+        ctx: AccountContext,
+        name: String,
+    ) -> PortFuture<'_, Option<FolderRef>> {
+        Box::pin(self.control.named_episode_project_hint(ctx, name))
+    }
     fn update_episode(
         &self,
         ctx: AccountContext,
@@ -309,6 +316,9 @@ impl ControlPort for ControlPlane {
         result: ScheduleResult,
     ) -> PortFuture<'_, ScheduleRunReceipt> {
         Box::pin(self.control.record_schedule_result(ctx, result))
+    }
+    fn ensure_run_inactive(&self, ctx: AccountContext, run: AgentRunId) -> PortFuture<'_, ()> {
+        Box::pin(self.control.ensure_run_inactive(ctx, run))
     }
     fn select_provider(
         &self,

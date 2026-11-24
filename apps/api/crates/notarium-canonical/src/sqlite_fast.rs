@@ -6105,6 +6105,30 @@ impl SqliteSyncItemPlan for RollbackDirectSqliteFastPlan {
         let (run, _) = self.target.parts();
 
         // --- 1. Read-only preconditions & pure validation (zero SQL mutations) ---
+        let run_active_on_chat: bool = conn
+            .prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM chat_threads WHERE space_id = ?1 AND active_run_id = ?2)",
+            )
+            .map_err(|err| {
+                FastItemExecError::PreWrite(internal_not_committed(
+                    "sqlite_rollback_active_chat",
+                    err.to_string(),
+                ))
+            })?
+            .query_row(params![scope_cl.space_id.as_str(), run.as_str()], |row| {
+                row.get(0)
+            })
+            .map_err(|err| {
+                FastItemExecError::PreWrite(map_interrupt_or_internal(
+                    err,
+                    "sqlite_rollback_active_chat",
+                ))
+            })?;
+        if run_active_on_chat {
+            return Err(FastItemExecError::PreWrite(
+                DomainError::validation(ValidationReason::InvalidState).into(),
+            ));
+        }
         if has_rollback_board_history_rusqlite(conn, &scope_cl.space_id, run)
             .map_err(FastItemExecError::PreWrite)?
         {

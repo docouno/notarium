@@ -325,6 +325,42 @@ impl ControlService {
         budget.run(tx.finish(), CommitEffect::NotCommitted).await?;
         result
     }
+    pub async fn ensure_run_inactive(
+        &self,
+        ctx: AccountContext,
+        run: AgentRunId,
+    ) -> Result<(), PortError> {
+        ctx.auth().authorize_human_management()?;
+        let budget = OperationBudget::new(ctx.budget.clone());
+        let (mut tx, auth) = self
+            .open_revalidated_read(&budget, &ctx.budget.request, ctx.auth())
+            .await?;
+        let result = budget
+            .run(
+                async {
+                    auth.authorize_human_management()?;
+                    let row = rows!(
+                        tx.inner_mut(),
+                        (String,),
+                        fetch_optional,
+                        "SELECT status FROM agent_schedule_runs WHERE run_id=$1",
+                        "SELECT status FROM v1_control.agent_schedule_runs WHERE run_id=$1";
+                        run.as_str()
+                    )?;
+                    if row
+                        .as_ref()
+                        .is_some_and(|(status,)| matches!(status.as_str(), "claimed" | "running"))
+                    {
+                        return Err(invalid(ValidationReason::InvalidState));
+                    }
+                    Ok(())
+                },
+                CommitEffect::NotCommitted,
+            )
+            .await;
+        budget.run(tx.finish(), CommitEffect::NotCommitted).await?;
+        result
+    }
     pub async fn list_schedule_runs(
         &self,
         ctx: ScheduleRunContext,

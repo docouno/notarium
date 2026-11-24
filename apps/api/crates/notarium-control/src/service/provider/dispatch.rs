@@ -433,6 +433,19 @@ impl ProviderService {
         } else {
             None
         };
+        // Run Keeper catalog prechecks before acquiring the pinned canonical
+        // egress lease so a single-connection canonical pool cannot deadlock
+        // trying to borrow a second connection while holding the lease.
+        let keeper = runtime
+            .run(
+                self.control.precheck_keeper_catalog(
+                    job.ctx.auth(),
+                    &runtime.budget,
+                    &job.ctx.budget.request,
+                ),
+                CommitEffect::NotCommitted,
+            )
+            .await?;
         let parts = job.parts();
         let mut secondary_projects = Vec::new();
         let current = if primary.is_some() {
@@ -490,16 +503,6 @@ impl ProviderService {
         } else {
             Vec::new()
         };
-        let keeper = runtime
-            .run(
-                self.control.precheck_keeper_catalog(
-                    job.ctx.auth(),
-                    &runtime.budget,
-                    &job.ctx.budget.request,
-                ),
-                CommitEffect::NotCommitted,
-            )
-            .await?;
         let authority = || DispatchAuthority {
             snapshot: &snapshot,
             ctx: &job.ctx,
@@ -749,15 +752,52 @@ impl EmbeddingProviderPort for ProviderService {
                 .unwrap_or_default();
             let selected = self
                 .select_provider(
-                    ctx,
+                    ctx.clone(),
                     SelectProvider {
                         kind: PreferenceModelKind::Embedding,
                         resource: Some(provider),
                         model: Some(model),
-                        project,
+                        project: project.clone(),
                     },
                 )
                 .await?;
+            if matches!(
+                ctx.auth().kind(),
+                PrincipalKind::AgentRun(_) | PrincipalKind::Keeper(_)
+            ) {
+                let budget = OperationBudget::new(ctx.budget.clone());
+                let space = self.selection_catalog(&ctx, project.as_ref()).await?;
+                let (mut tx, auth) = self
+                    .control
+                    .open_revalidated_read(&budget, &ctx.budget.request, ctx.auth())
+                    .await?;
+                let required = budget
+                    .run(
+                        async {
+                            let now = self.control.clock.now_ms()?;
+                            let grant = auth
+                                .spaces()
+                                .get(&space.space.id)
+                                .ok_or_else(selection::unavailable)?;
+                            super::admission::required_query_source_classes(
+                                tx.inner_mut(),
+                                &auth,
+                                &space.space,
+                                project.as_ref(),
+                                grant,
+                                now,
+                            )
+                            .await
+                        },
+                        CommitEffect::NotCommitted,
+                    )
+                    .await;
+                budget.run(tx.finish(), CommitEffect::NotCommitted).await?;
+                let required = required?;
+                if !required.is_subset(&selected.policy.allowed_classes) {
+                    return Ok(BTreeSet::new());
+                }
+            }
             Ok(selected
                 .policy
                 .allowed_classes

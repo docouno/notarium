@@ -312,6 +312,18 @@ async fn note_policy(
     Ok(admitted)
 }
 
+pub(super) async fn admit_note_metadata_write(
+    call: &ToolCallContext<'_>,
+    scope: &SpaceContext,
+    metadata: &ClassifiedMetadata,
+) -> Result<(), PortError> {
+    match note_policy(call, scope, metadata).await {
+        Ok(_) => Ok(()),
+        Err(error) if hidden(&error) => Err(DomainError::ResourceNotFound.into()),
+        Err(error) => Err(error),
+    }
+}
+
 pub(super) async fn admit_search_card(
     call: &ToolCallContext<'_>,
     scope: &SpaceContext,

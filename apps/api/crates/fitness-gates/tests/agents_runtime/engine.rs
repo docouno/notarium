@@ -124,6 +124,8 @@ pub struct ProjectionFixtures {
     before_memory_append: Mutex<Option<MutationPause>>,
     lose_note_edit_ack: Mutex<bool>,
     lose_note_create_acks: Mutex<usize>,
+    fail_next_create_note_not_committed: Mutex<bool>,
+    fail_nth_link_many_not_committed: Mutex<Option<usize>>,
     lose_chat_append_acks: Mutex<usize>,
     before_chat_consume: Mutex<Option<MutationPause>>,
     before_chat_hydration: Mutex<Option<MutationPause>>,
@@ -238,6 +240,16 @@ impl ProjectionFixtures {
         *self.lose_note_create_acks.lock().unwrap() = count;
     }
 
+    pub fn fail_next_create_note_not_committed(&self) {
+        *self.fail_next_create_note_not_committed.lock().unwrap() = true;
+    }
+
+    /// Fail the 1-based `nth` `link_many` call with `Unavailable(NotCommitted)`.
+    pub fn fail_nth_link_many_not_committed(&self, nth: usize) {
+        assert!(nth >= 1);
+        *self.fail_nth_link_many_not_committed.lock().unwrap() = Some(nth);
+    }
+
     pub fn lose_chat_append_acks(&self, count: usize) {
         *self.lose_chat_append_acks.lock().unwrap() = count;
     }
@@ -329,9 +341,43 @@ canonical_port!(NoteWritePort;
     rename_project(Mutation<RenameProject>) -> Committed<FolderRef>,
     accept_batch(AcceptBatch) -> BatchResult<NoteRevision>,
     link(Mutation<Link>) -> Committed<Link>,
-    link_many(LinkBatch) -> BatchResult<Link>,
     rollback_agent_run(Mutation<RollbackAgentRun>) -> Committed<RollbackResult>,
     accept_external_observation(Mutation<ExternalObservation>) -> ExternalObservationResult;
+
+    fn link_many(
+        &self,
+        ctx: SpaceContext,
+        request: LinkBatch,
+    ) -> PortFuture<'_, BatchResult<Link>> {
+        Box::pin(async move {
+            let should_fail = {
+                let mut slot = self.1.fail_nth_link_many_not_committed.lock().unwrap();
+                match *slot {
+                    Some(1) => {
+                        *slot = None;
+                        true
+                    }
+                    Some(n) => {
+                        *slot = Some(n - 1);
+                        false
+                    }
+                    None => false,
+                }
+            };
+            if should_fail {
+                return Err(PortError::DeadlineExceeded(
+                    OperationalFailure::new(
+                        ContentDigest::from_bytes([173; 32]),
+                        CommitEffect::NotCommitted,
+                        RetryAdvice::Never,
+                        false,
+                    )
+                    .unwrap(),
+                ));
+            }
+            NoteWritePort::link_many(&self.0, ctx, request).await
+        })
+    }
 
     fn create_note(
         &self,
@@ -339,6 +385,17 @@ canonical_port!(NoteWritePort;
         request: Mutation<CreateNote>,
     ) -> PortFuture<'_, Committed<NoteRevision>> {
         Box::pin(async move {
+            if std::mem::take(&mut *self.1.fail_next_create_note_not_committed.lock().unwrap()) {
+                return Err(PortError::DeadlineExceeded(
+                    OperationalFailure::new(
+                        ContentDigest::from_bytes([172; 32]),
+                        CommitEffect::NotCommitted,
+                        RetryAdvice::Never,
+                        false,
+                    )
+                    .unwrap(),
+                ));
+            }
             let committed = NoteWritePort::create_note(&self.0, ctx, request).await?;
             if lose_ack(&self.1.lose_note_create_acks) {
                 return Err(PortError::Unavailable(

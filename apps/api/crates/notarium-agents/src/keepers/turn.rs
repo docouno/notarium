@@ -19,7 +19,8 @@ use tokio::time::Instant;
 use crate::{
     chats::prompt,
     completion::{
-        CompletionActor, CompletionRunBudget, bounded_tool_text, call_key, complete_step,
+        CompletionActor, CompletionRunBudget, bounded_tool_text_within, call_key, complete_step,
+        step_tool_display_budget,
     },
     mcp::{
         EgressTarget, McpInvocationContext, ToolRegistry, derive_digest, derive_key,
@@ -122,6 +123,9 @@ pub(super) async fn run_keeper_turn(
                 max_tool_calls: if model.supports_tools { 64 } else { 0 },
             },
         };
+        let fixed_tokens =
+            notarium_control::service::provider::completion_input_estimate(&request)?;
+        let step_input_ceiling = model.max_input_tokens.min(budget.input_ceiling());
         let (branch, request, proof) = history.plan(request, budget.input_ceiling())?;
         let compacting = proof.compacts_through.is_some();
         let target_tokens = request.budget.max_output_tokens;
@@ -139,6 +143,12 @@ pub(super) async fn run_keeper_turn(
         if compacting {
             prompt::validate_summary(settled.finish, &settled.text, target_tokens)?;
         }
+        let tool_display_budget = step_tool_display_budget(
+            step_input_ceiling,
+            fixed_tokens,
+            &settled.text,
+            &settled.calls,
+        );
         let calls = settled.calls;
         let label = if compacting {
             b"compact".as_slice()
@@ -183,7 +193,9 @@ pub(super) async fn run_keeper_turn(
             if current.head != head {
                 return Err(conflict(&current));
             }
-            let (display, proof) = turn.invoke(&budget, &selection, call, key.clone()).await?;
+            let (display, proof) = turn
+                .invoke(&budget, &selection, call, key.clone(), tool_display_budget)
+                .await?;
             head = turn
                 .append(
                     &budget,
@@ -452,6 +464,7 @@ impl KeeperTurn<'_> {
         selection: &ProviderSelection,
         call: ProviderToolCall,
         key: CommandKey,
+        display_budget: (usize, u64),
     ) -> Result<(String, ChatProvenance), PortError> {
         let ctx = self.context(budget)?;
         let result = self
@@ -478,7 +491,11 @@ impl KeeperTurn<'_> {
         self.lease.check()?;
         match result {
             Ok(result) if result.proposal().is_none() => Ok((
-                bounded_tool_text(&result.content[0].text),
+                bounded_tool_text_within(
+                    &result.content[0].text,
+                    display_budget.0,
+                    display_budget.1,
+                ),
                 result.provenance,
             )),
             Ok(_) => Err(invalid(ValidationReason::InvalidAuthority)),

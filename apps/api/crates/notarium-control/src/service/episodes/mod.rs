@@ -425,6 +425,46 @@ impl ControlService {
         };
         Ok(ControlCommit { value, revision })
     }
+    pub async fn named_episode_project_hint(
+        &self,
+        ctx: AccountContext,
+        episode_name: String,
+    ) -> Result<Option<FolderRef>, PortError> {
+        name(Some(&episode_name))?;
+        let budget = OperationBudget::new(ctx.budget.clone());
+        let (mut tx, auth) = self
+            .open_revalidated_read(&budget, &ctx.budget.request, ctx.auth())
+            .await?;
+        let result = budget
+            .run(
+                async {
+                    let matches = rows!(
+                        tx.inner_mut(),
+                        AgentEpisodesRow,
+                        fetch_all,
+                        "SELECT * FROM agent_episodes WHERE owner_id=$1 AND name=$2 AND lifecycle<>'closed' ORDER BY episode_id LIMIT 2",
+                        "SELECT * FROM v1_control.agent_episodes WHERE owner_id=$1 AND name=$2 AND lifecycle<>'closed' ORDER BY episode_id LIMIT 2";
+                        auth.principal().as_str(),
+                        &episode_name
+                    )?;
+                    if matches.len() != 1 {
+                        return Ok(None);
+                    }
+                    let row = &matches[0];
+                    match (&row.project_space, &row.project_folder) {
+                        (Some(space), Some(folder)) => Ok(Some(FolderRef {
+                            space_id: SpaceId::parse(space)?,
+                            folder_id: FolderId::parse(folder)?,
+                        })),
+                        _ => Ok(None),
+                    }
+                },
+                CommitEffect::NotCommitted,
+            )
+            .await;
+        budget.run(tx.finish(), CommitEffect::NotCommitted).await?;
+        result
+    }
     pub async fn update_episode(
         &self,
         ctx: AccountContext,

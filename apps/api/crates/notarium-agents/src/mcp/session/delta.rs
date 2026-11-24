@@ -314,7 +314,7 @@ pub(super) async fn resume(
     if acknowledge {
         acknowledge_page(call, &ticket).await?;
     }
-    page(call, ticket.opened, ticket.batch, position, acknowledge).await
+    page(call, Instant::now(), ticket.batch, position, acknowledge).await
 }
 
 pub(super) async fn deliver(
@@ -793,5 +793,62 @@ mod tests {
         seed.cutoff.after = seq(10);
         seed.next = None;
         assert!(validate_seed(&seed, &previous, &window, limit).is_err());
+    }
+
+    #[test]
+    fn continuation_ticket_respects_ttl_and_refreshed_opened_extends_window() {
+        let space = scope(9);
+        let batch = Arc::new(Batch {
+            principal: PrincipalId::from_bytes([9; 16]),
+            episode: EpisodeId::from_bytes([7; 16]),
+            owner: AckOwner::Account,
+            project: None,
+            authority: ContentDigest::from_bytes([8; 32]),
+            windows: vec![Window {
+                baseline: cursor(&space, 0),
+                cutoff: seq(10),
+                can_acknowledge: true,
+            }],
+        });
+        let state = BootstrapContinuations::default();
+        let expired_opened = Instant::now()
+            .checked_sub(TICKET_TTL + Duration::from_secs(1))
+            .expect("monotonic clock past TTL");
+        let stale_id = state
+            .insert(Ticket {
+                opened: expired_opened,
+                batch: batch.clone(),
+                position: Some(next_space(0)),
+                safe_ack: None,
+                acknowledge: true,
+            })
+            .unwrap();
+        assert!(
+            state
+                .find(
+                    &format!("{CONTINUATION_PREFIX}{stale_id}"),
+                    CONTINUATION_PREFIX
+                )
+                .is_err(),
+            "expired ticket must be rejected as stale"
+        );
+        let refreshed_id = state
+            .insert(Ticket {
+                opened: Instant::now(),
+                batch,
+                position: Some(next_space(0)),
+                safe_ack: None,
+                acknowledge: true,
+            })
+            .unwrap();
+        assert!(
+            state
+                .find(
+                    &format!("{CONTINUATION_PREFIX}{refreshed_id}"),
+                    CONTINUATION_PREFIX
+                )
+                .is_ok(),
+            "refreshed continuation ticket must remain live for a full sliding TTL window"
+        );
     }
 }

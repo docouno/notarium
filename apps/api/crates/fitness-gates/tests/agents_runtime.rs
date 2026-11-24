@@ -33,6 +33,8 @@ mod real_reads;
 mod rollback_receipts;
 #[path = "agents_runtime/runtime_abilities.rs"]
 mod runtime_ability_cases;
+#[path = "agents_runtime/seam_hardening.rs"]
+mod seam_hardening;
 #[path = "agents_runtime/security_seams.rs"]
 mod security_seams;
 #[path = "agents_runtime/supervised_chat.rs"]
@@ -100,6 +102,14 @@ impl RuntimeFixture {
     }
 
     async fn open_named(pg: bool, fixture_name: &str) -> Self {
+        Self::open_named_with_pg_pool(pg, fixture_name, None).await
+    }
+
+    async fn open_named_with_pg_pool(
+        pg: bool,
+        fixture_name: &str,
+        pg_pool_size: Option<u32>,
+    ) -> Self {
         let mut storage = Fixture::new(pg, fixture_name).await;
         let keyring = fixture_keyring(&mut storage).await;
         let root = storage.root.clone().unwrap_or_else(|| {
@@ -118,7 +128,7 @@ impl RuntimeFixture {
                 .join("../../../../.artifacts/control-db-fixture/active.json");
             let fixture: Value =
                 serde_json::from_slice(&std::fs::read(descriptor).unwrap()).unwrap();
-            config.sql = SqlBackendConfig::postgres_default(
+            let mut sql = SqlBackendConfig::postgres_default(
                 PgConnectConfig {
                     transport: PgTransport::UnixSocket {
                         socket_dir: fixture["socket"].as_str().unwrap().into(),
@@ -130,6 +140,12 @@ impl RuntimeFixture {
                 },
                 "v1_canonical",
             );
+            if let Some(size) = pg_pool_size
+                && let SqlBackendConfig::Postgres { pool_size, .. } = &mut sql
+            {
+                *pool_size = size;
+            }
+            config.sql = sql;
             config.default_backup_budget =
                 notarium_canonical::config::default_postgres_backup_budget();
         }

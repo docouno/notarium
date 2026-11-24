@@ -439,15 +439,14 @@ impl BatchedAbilityControl {
         )
     }
 
-    fn select_overlaid_winner(
+    fn select_overlaid_winners(
         &self,
         candidates: Vec<AbilityDescriptor>,
-    ) -> Result<Option<AbilityDescriptor>, PortError> {
-        let mut winner: Option<AbilityDescriptor> = None;
-        let mut ambiguous = false;
+    ) -> Result<Vec<AbilityDescriptor>, PortError> {
+        let mut winners: Vec<AbilityDescriptor> = Vec::new();
         for current in candidates {
             let candidate = self.overlay(current)?;
-            if let Some(previous) = &winner {
+            if let Some(previous) = winners.first() {
                 let level = candidate
                     .reference
                     .placement
@@ -457,19 +456,30 @@ impl BatchedAbilityControl {
                     continue;
                 }
                 if level.is_eq() {
-                    if candidate.reference.identity() != previous.reference.identity() {
-                        ambiguous = true;
+                    if winners.iter().all(|existing| {
+                        existing.reference.identity() != candidate.reference.identity()
+                    }) {
+                        winners.push(candidate);
                     }
                     continue;
                 }
             }
-            winner = Some(candidate);
-            ambiguous = false;
+            winners.clear();
+            winners.push(candidate);
         }
-        if ambiguous {
-            return Err(invalid(ValidationReason::InvalidState));
+        Ok(winners)
+    }
+
+    fn select_overlaid_winner(
+        &self,
+        candidates: Vec<AbilityDescriptor>,
+    ) -> Result<Option<AbilityDescriptor>, PortError> {
+        let mut winners = self.select_overlaid_winners(candidates)?;
+        match winners.len() {
+            0 => Ok(None),
+            1 => Ok(winners.pop()),
+            _ => Err(invalid(ValidationReason::InvalidState)),
         }
-        Ok(winner)
     }
 }
 
@@ -1595,19 +1605,22 @@ impl ControlService {
                             selected_descriptors.push(batched.overlay(value)?);
                         }
                     } else {
-                        let mut winners: BTreeMap<String, Option<AbilityDescriptor>> =
-                            BTreeMap::new();
+                        let mut winners: BTreeMap<String, Vec<AbilityDescriptor>> = BTreeMap::new();
                         for (name, candidates) in by_name_candidates {
-                            let winner = batched.select_overlaid_winner(candidates)?;
-                            winners.insert(name, winner.filter(|w| w.enabled && w.healthy));
+                            let chosen = batched
+                                .select_overlaid_winners(candidates)?
+                                .into_iter()
+                                .filter(|w| w.enabled && w.healthy)
+                                .collect();
+                            winners.insert(name, chosen);
                         }
                         for candidate in page_candidates {
-                            if let Some(winner) =
-                                winners.get(&candidate.name).and_then(Clone::clone)
-                                && winner.kind == candidate.kind
-                                && winner.reference == candidate.reference
-                            {
-                                selected_descriptors.push(winner);
+                            if let Some(winner) = winners.get(&candidate.name).and_then(|list| {
+                                list.iter().find(|w| {
+                                    w.kind == candidate.kind && w.reference == candidate.reference
+                                })
+                            }) {
+                                selected_descriptors.push(winner.clone());
                             }
                         }
                     }

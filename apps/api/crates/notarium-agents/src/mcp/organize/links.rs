@@ -583,29 +583,53 @@ async fn many(call: &mut ToolCallContext<'_>, inputs: Vec<LinkInput>) -> Result<
             Err(error) => return Err(error),
         }
     }
+    const LABEL: &str = "notarium.mcp.link-many-batch.v1";
+    let mut committed_any = false;
     for batch in batches.into_values() {
-        let scope = call.space(batch[0].plan.scope.clone())?;
+        let scope = call.space(batch[0].plan.scope.clone()).map_err(|error| {
+            super::super::note_tools::batch_operational_error(LABEL, error, committed_any)
+        })?;
         let mut mutations = Vec::with_capacity(batch.len());
         for prepared in &batch {
-            scope.scope().check(&prepared.plan.scope)?;
+            scope.scope().check(&prepared.plan.scope).map_err(|error| {
+                super::super::note_tools::batch_operational_error(
+                    LABEL,
+                    error.into(),
+                    committed_any,
+                )
+            })?;
             let identity = call.command_identity(&prepared.plan.scope, "link", prepared.ordinal);
             mutations.push(prepared.plan.mutation(identity));
         }
+        let writer = call.corpus_writer(scope.clone()).await.map_err(|error| {
+            super::super::note_tools::batch_operational_error(LABEL, error, committed_any)
+        })?;
         let response = call
             .registry
             .engine
-            .link_many(
-                call.corpus_writer(scope.clone()).await?,
-                LinkBatch { items: mutations },
-            )
-            .await?;
+            .link_many(writer, LinkBatch { items: mutations })
+            .await
+            .map_err(|error| {
+                super::super::note_tools::batch_operational_error(LABEL, error, committed_any)
+            })?;
+        if response.items.iter().any(Result::is_ok) {
+            committed_any = true;
+        }
         if response.items.len() != batch.len() {
-            return Err(invalid(ValidationReason::SourceMismatch));
+            return Err(super::super::note_tools::batch_operational_error(
+                LABEL,
+                invalid(ValidationReason::SourceMismatch),
+                committed_any,
+            ));
         }
         for (prepared, outcome) in batch.into_iter().zip(response.items) {
             let index = usize::from(prepared.ordinal);
             let mut value = match outcome {
-                Ok(committed) => render(call, &scope, &prepared.plan, committed).await?,
+                Ok(committed) => render(call, &scope, &prepared.plan, committed)
+                    .await
+                    .map_err(|error| {
+                        super::super::note_tools::batch_operational_error(LABEL, error, true)
+                    })?,
                 Err(error) => json!({"ok": false, "error": error.code()}),
             };
             value["index"] = json!(index);

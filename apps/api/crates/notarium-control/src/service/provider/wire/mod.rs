@@ -6,7 +6,8 @@ mod stream;
 pub(super) use embeddings::decode_embedding;
 pub(super) use encode::{
     completion, completion_fingerprint, embedding, embedding_fingerprint, endpoint,
-    estimate_completion_input_tokens, estimate_embedding_input_tokens, text_tokens,
+    estimate_completion_input_tokens, estimate_completion_wire_bytes,
+    estimate_embedding_input_tokens, text_tokens,
 };
 pub(super) use stream::CompletionDecoder;
 #[cfg(test)]

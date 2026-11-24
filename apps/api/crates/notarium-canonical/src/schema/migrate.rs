@@ -337,6 +337,7 @@ macro_rules! upgrade {
                     "CREATE INDEX IF NOT EXISTS idx_ability_packages_active_slug",
                     "CREATE INDEX IF NOT EXISTS idx_spaces_personal_owner",
                     "CREATE INDEX IF NOT EXISTS idx_folder_heads_active_projects_id",
+                    "CREATE INDEX IF NOT EXISTS idx_folder_heads_space_updated",
                     "CREATE INDEX IF NOT EXISTS idx_command_receipts_seq",
                 ] {
                     sqlx::query(sqlx::AssertSqlSafe(baseline_statement($ddl, prefix)?))

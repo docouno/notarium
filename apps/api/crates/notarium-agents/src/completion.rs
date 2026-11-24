@@ -1,6 +1,6 @@
 use std::{collections::BTreeSet, future::Future, time::Duration};
 
-use notarium_control::service::provider::completion_input_estimate;
+use notarium_control::service::provider::{completion_input_estimate, completion_text_estimate};
 use notarium_core::{
     DomainError,
     auth::PrincipalKind,
@@ -19,6 +19,7 @@ use crate::mcp::{ToolRegistry, derive_key};
 const MAX_MODEL_TEXT_BYTES: usize = 200 * 1024;
 const MAX_TURN_PAYLOAD_BYTES: usize = AppendChat::MAX_STRUCTURED_BODY_BYTES - 1024;
 const TOOL_DISPLAY_BYTES: usize = 32 * 1024;
+const MAX_STEP_TOOL_DISPLAY_BYTES: usize = 1024 * 1024;
 const MAX_CALL_TIME: Duration = Duration::from_secs(120);
 
 fn json_escaped_len(text: &str) -> usize {
@@ -307,14 +308,89 @@ pub(crate) fn call_key(call: &ProviderToolCall) -> Result<CommandKey, PortError>
     Ok(CommandKey::parse(call.id.as_str())?)
 }
 
-pub(crate) fn bounded_tool_text(text: &str) -> String {
-    if text.len() <= TOOL_DISPLAY_BYTES {
-        return text.to_owned();
+/// Compute a per-tool (max_bytes, max_tokens) display budget so an unsplittable
+/// `Assistant + N Tool` group always fits comfortably inside the model window
+/// and remains compactable on future turns.
+pub(crate) fn step_tool_display_budget(
+    input_ceiling: u32,
+    fixed_tokens: u32,
+    assistant_text: &str,
+    calls: &[ProviderToolCall],
+) -> (usize, u64) {
+    let count = calls.len().max(1);
+    let mut assistant_tokens = 4_u64.saturating_add(completion_text_estimate(assistant_text));
+    for call in calls {
+        let args_len = serde_json::to_string(&call.arguments)
+            .map(|encoded| completion_text_estimate(&encoded))
+            .unwrap_or(64);
+        assistant_tokens = assistant_tokens
+            .saturating_add(8)
+            .saturating_add(completion_text_estimate(&call.name))
+            .saturating_add(args_len);
     }
+    let ceiling = u64::from(input_ceiling);
+    let headroom = ceiling
+        .saturating_sub(u64::from(fixed_tokens))
+        .saturating_sub(assistant_tokens);
+    // Reserve room for system prompt + follow-up turn + compaction framing.
+    let step_tokens = headroom.saturating_mul(3) / 4;
+    let step_tokens = step_tokens.min(ceiling / 2);
+    let per_tool_slot = step_tokens / (count as u64);
+    let per_tool_tokens = per_tool_slot.saturating_sub(8).max(16);
+    let per_tool_bytes = TOOL_DISPLAY_BYTES.min((MAX_STEP_TOOL_DISPLAY_BYTES / count).max(256));
+    (per_tool_bytes, per_tool_tokens)
+}
+
+fn floor_char_boundary(text: &str, mut index: usize) -> usize {
+    index = index.min(text.len());
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+pub(crate) fn bounded_tool_text_within(text: &str, max_bytes: usize, max_tokens: u64) -> String {
     const SUFFIX: &str = "\n…[truncated]";
-    let mut end = TOOL_DISPLAY_BYTES - SUFFIX.len();
-    while !text.is_char_boundary(end) {
-        end -= 1;
+    let byte_cap = max_bytes.min(TOOL_DISPLAY_BYTES).max(SUFFIX.len());
+    let mut truncated = text.len() > byte_cap;
+    let mut end = if truncated {
+        floor_char_boundary(text, byte_cap - SUFFIX.len())
+    } else {
+        text.len()
+    };
+    let fits = |prefix_end: usize, is_truncated: bool| -> bool {
+        if !is_truncated {
+            completion_text_estimate(&text[..prefix_end]) <= max_tokens
+        } else {
+            let mut candidate = String::with_capacity(prefix_end + SUFFIX.len());
+            candidate.push_str(&text[..prefix_end]);
+            candidate.push_str(SUFFIX);
+            completion_text_estimate(&candidate) <= max_tokens
+        }
+    };
+    if !fits(end, truncated) {
+        truncated = true;
+        let mut lo = 0usize;
+        let mut hi = floor_char_boundary(text, byte_cap.saturating_sub(SUFFIX.len()).min(end));
+        while lo < hi {
+            let mid = lo + (hi - lo).div_ceil(2);
+            let cut = floor_char_boundary(text, mid);
+            if cut == lo {
+                if fits(hi, true) {
+                    lo = hi;
+                }
+                break;
+            }
+            if fits(cut, true) {
+                lo = cut;
+            } else {
+                hi = floor_char_boundary(text, cut.saturating_sub(1));
+            }
+        }
+        end = lo;
+    }
+    if !truncated {
+        return text.to_owned();
     }
     let mut display = text[..end].to_owned();
     display.push_str(SUFFIX);

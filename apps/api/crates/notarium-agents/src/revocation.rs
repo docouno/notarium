@@ -47,6 +47,7 @@ struct State {
     provider: BTreeMap<RegistrationId, Registered>,
     canonical_effects: BTreeMap<RegistrationId, CanonicalRegistration>,
     runs: BTreeMap<AgentRunId, Registered>,
+    rolling_back: BTreeMap<AgentRunId, usize>,
     viewers: BTreeMap<RegistrationId, Registered>,
     fences: BTreeMap<RegistrationId, Selectors>,
     pending: BTreeMap<PendingCredentialKey, PendingCredential>,
@@ -347,7 +348,10 @@ impl RevocationHub {
         {
             return Err(cancelled());
         }
-        if state.fenced(&selectors) || state.runs.contains_key(run) {
+        if state.fenced(&selectors)
+            || state.runs.contains_key(run)
+            || state.rolling_back.contains_key(run)
+        {
             return Err(revocation_unavailable());
         }
         state.runs.insert(
@@ -618,6 +622,125 @@ impl RevocationHub {
             self.finish_registered_pending(registration);
         }
     }
+
+    /// Fence, cancel, and wait for any local in-flight chat or Keeper run
+    /// matching `run` to drop its run lease and canonical effects before
+    /// executing a rollback.
+    pub(crate) async fn stop_and_drain_run(
+        &self,
+        run: &AgentRunId,
+        budget: &notarium_core::ports::CallBudget,
+    ) -> Result<RollbackRunGuard, PortError> {
+        let deadline = Instant::now() + budget.remaining;
+        let selector = RevocationSelector::ScheduledRun(run.clone());
+        let guard = {
+            let mut state = self.inner.lock();
+            state.ensure_open()?;
+            *state.rolling_back.entry(run.clone()).or_default() += 1;
+            RollbackRunGuard {
+                hub: self.clone(),
+                run: run.clone(),
+            }
+        };
+        let cancellations = {
+            let mut state = self.inner.lock();
+            let mut to_cancel = Vec::new();
+            if let Some(entry) = state.runs.get(run) {
+                to_cancel.push(entry.cancellation.clone());
+            }
+            for call in state.provider.values() {
+                if call.selectors.contains(&selector) {
+                    to_cancel.push(call.cancellation.clone());
+                }
+            }
+            for effect in state.canonical_effects.values_mut() {
+                if effect.entry.selectors.contains(&selector) {
+                    effect.revoked = true;
+                    to_cancel.push(effect.entry.cancellation.clone());
+                }
+            }
+            to_cancel
+        };
+        cancel_all(cancellations);
+        let mut updates = self.inner.changed.subscribe();
+        loop {
+            let drained = {
+                let state = self.inner.lock();
+                state.ensure_open()?;
+                let run_active = state.runs.contains_key(run);
+                let provider_active = state
+                    .provider
+                    .values()
+                    .any(|call| call.selectors.contains(&selector));
+                let effect_active = state
+                    .canonical_effects
+                    .values()
+                    .any(|effect| effect.active != 0 && effect.entry.selectors.contains(&selector));
+                !run_active && !provider_active && !effect_active
+            };
+            if drained {
+                return Ok(guard);
+            }
+            if budget.cancellation.is_cancelled() {
+                return Err(cancelled());
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(PortError::DeadlineExceeded(
+                    OperationalFailure::new(
+                        ContentDigest::from_bytes(
+                            *blake3::hash(b"rollback run drain deadline").as_bytes(),
+                        ),
+                        CommitEffect::NotCommitted,
+                        RetryAdvice::RetrySameCommand,
+                        false,
+                    )
+                    .expect("valid deadline failure"),
+                ));
+            }
+            tokio::select! {
+                biased;
+                () = budget.cancellation.cancelled() => return Err(cancelled()),
+                () = tokio::time::sleep(remaining) => {
+                    return Err(PortError::DeadlineExceeded(
+                        OperationalFailure::new(
+                            ContentDigest::from_bytes(*blake3::hash(b"rollback run drain deadline").as_bytes()),
+                            CommitEffect::NotCommitted,
+                            RetryAdvice::RetrySameCommand,
+                            false,
+                        )
+                        .expect("valid deadline failure"),
+                    ));
+                }
+                changed = updates.changed() => {
+                    if changed.is_err() {
+                        return Err(revocation_unavailable());
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub(crate) struct RollbackRunGuard {
+    hub: RevocationHub,
+    run: AgentRunId,
+}
+
+impl Drop for RollbackRunGuard {
+    fn drop(&mut self) {
+        {
+            let mut state = self.hub.inner.lock();
+            if let Some(count) = state.rolling_back.get_mut(&self.run) {
+                if *count <= 1 {
+                    state.rolling_back.remove(&self.run);
+                } else {
+                    *count -= 1;
+                }
+            }
+        }
+        self.hub.inner.notify();
+    }
 }
 
 pub(crate) struct RunRevocationLease {
@@ -647,6 +770,7 @@ impl Drop for RunRevocationLease {
     fn drop(&mut self) {
         self.hub.inner.lock().runs.remove(&self.run);
         self.cancellation.cancel();
+        self.hub.inner.notify();
     }
 }
 

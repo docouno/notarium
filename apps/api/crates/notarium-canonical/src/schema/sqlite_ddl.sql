@@ -94,6 +94,9 @@ CREATE INDEX IF NOT EXISTS idx_folder_heads_active_projects_id
     ON folder_heads (space_id, folder_id)
     WHERE lifecycle_state = 'active' AND is_project = 1;
 
+CREATE INDEX IF NOT EXISTS idx_folder_heads_space_updated
+    ON folder_heads (space_id, updated_seq);
+
 CREATE TABLE IF NOT EXISTS folder_aliases (
     space_id TEXT NOT NULL,
     old_parent_folder_id TEXT NOT NULL,

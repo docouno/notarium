@@ -1,4 +1,5 @@
 DROP INDEX IF EXISTS idx_command_receipts_seq;
+DROP INDEX IF EXISTS idx_folder_heads_space_updated;
 DROP INDEX IF EXISTS idx_folder_heads_active_projects_id;
 DROP INDEX IF EXISTS idx_spaces_personal_owner;
 DROP INDEX IF EXISTS idx_chat_pending_inputs_consumed;

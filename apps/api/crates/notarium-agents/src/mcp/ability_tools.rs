@@ -1099,6 +1099,19 @@ async fn use_ability(
     Ok(rendered)
 }
 
+pub(super) async fn validate_session_role(
+    call: &ToolCallContext<'_>,
+    selector: &str,
+    project: Option<&FolderRef>,
+) -> Result<(), PortError> {
+    let descriptor = resolve(call, selector, AbilityKind::Role, project.cloned()).await?;
+    let body = read_body(call, &descriptor, project).await?;
+    if body.instructions.len() > MAX_ACTIVATION_TOKENS {
+        return Err(invalid(ValidationReason::BudgetExceeded));
+    }
+    Ok(())
+}
+
 pub(super) async fn activate_session_role(
     call: &mut ToolCallContext<'_>,
     episode: &AgentEpisode,

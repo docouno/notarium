@@ -106,6 +106,7 @@ pub const CANONICAL_TABLES: &[TableSpec] = &[
             "idx_folder_heads_parent_lifecycle",
             "idx_folder_heads_cover",
             "idx_folder_heads_active_projects_id",
+            "idx_folder_heads_space_updated",
         ],
     },
     TableSpec {
