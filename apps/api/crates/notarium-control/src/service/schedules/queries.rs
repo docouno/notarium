@@ -332,6 +332,9 @@ impl ControlService {
         run: AgentRunId,
     ) -> Result<(), PortError> {
         ctx.auth().authorize_human_management()?;
+        if ctx.auth().taint().is_tainted() {
+            return Err(DomainError::CrossSpaceTainted.into());
+        }
         let budget = OperationBudget::new(ctx.budget.clone());
         let (mut tx, auth) = self
             .open_revalidated_read(&budget, &ctx.budget.request, ctx.auth())
@@ -340,11 +343,14 @@ impl ControlService {
             .run(
                 async {
                     auth.authorize_human_management()?;
+                    if auth.taint().is_tainted() {
+                        return Err(DomainError::CrossSpaceTainted.into());
+                    }
                     let grant = auth
                         .spaces()
                         .get(&space)
                         .ok_or(DomainError::ResourceNotFound)?;
-                    if grant.role == SpaceRole::Viewer {
+                    if grant.role == SpaceRole::Viewer || grant.project_root.is_some() {
                         return Err(DomainError::AccessDenied.into());
                     }
                     let row = rows!(
@@ -356,19 +362,21 @@ impl ControlService {
                         run.as_str(),
                         space.as_str()
                     )?;
-                    if row
+                    Ok(row
                         .as_ref()
-                        .is_some_and(|(status,)| matches!(status.as_str(), "claimed" | "running"))
-                    {
-                        return Err(invalid(ValidationReason::InvalidState));
-                    }
-                    Ok(())
+                        .is_some_and(|(status,)| matches!(status.as_str(), "claimed" | "running")))
                 },
                 CommitEffect::NotCommitted,
             )
             .await;
         budget.run(tx.finish(), CommitEffect::NotCommitted).await?;
-        result
+        let is_active = result?;
+        let current = AccountContext::new(auth, budget.context(ctx.budget.request));
+        self.catalog_space(&current, &space).await?;
+        if is_active {
+            return Err(invalid(ValidationReason::InvalidState));
+        }
+        Ok(())
     }
     pub async fn list_schedule_runs(
         &self,

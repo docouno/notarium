@@ -27,20 +27,55 @@ use notarium_core::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
-/// Model-authored search queries may reflect any non-encrypted class previously
-/// disclosed to the calling run across its recorded provider calls. Require the
-/// embedding provider to cover every such class, failing closed to the run's
-/// non-encrypted Space grant if any recorded call lacks class disclosure data,
-/// fails parsing, or exceeds the bounded scan limit. A clean run with zero
-/// prior recorded provider calls has no prior disclosure.
-pub(super) async fn required_query_source_classes(
+/// Prior disclosure observed by an `AgentRun` or `Keeper` across its recorded
+/// provider calls.
+pub(super) struct RunQuerySourceDisclosure {
+    pub classes: BTreeSet<DocClass>,
+    /// `None` when the run has no prior non-query disclosure rows (clean unlogged run).
+    /// `Some(Some(project))` when every prior non-query call was strictly confined to `project`.
+    /// `Some(None)` when any prior non-query call had Space-wide, multi-project,
+    /// legacy, unparseable, or overflow (>64 rows) disclosure.
+    pub confined_project: Option<Option<FolderRef>>,
+}
+
+impl RunQuerySourceDisclosure {
+    pub(super) fn allows_embedder(
+        &self,
+        allowed_classes: &BTreeSet<DocClass>,
+        embedder_project_only: Option<&FolderRef>,
+    ) -> bool {
+        if !self.classes.is_subset(allowed_classes) {
+            return false;
+        }
+        if let (Some(required_project), Some(confined)) =
+            (embedder_project_only, &self.confined_project)
+        {
+            return confined.as_ref() == Some(required_project);
+        }
+        true
+    }
+}
+
+/// Model-authored search queries may reflect any non-encrypted class and scope
+/// previously disclosed to the calling run across its recorded provider calls.
+/// Require the remote embedding provider to cover every such class and respect
+/// project confinement, failing closed to the run's non-encrypted Space grant
+/// and unconfined scope if any recorded call lacks disclosure data, fails
+/// parsing, or exceeds the bounded scan limit. A clean run with zero prior
+/// non-query provider calls has no recorded disclosure.
+pub(super) async fn required_query_source_disclosure(
     tx: &mut Transaction,
     auth: &EngineAuthContext,
     grant: &SpaceGrant,
-) -> Result<BTreeSet<DocClass>, PortError> {
+) -> Result<RunQuerySourceDisclosure, PortError> {
     let run = match auth.kind() {
         PrincipalKind::AgentRun(run) | PrincipalKind::Keeper(run) => run,
-        _ => return Ok(BTreeSet::new()),
+        _ => {
+            return Ok(RunQuerySourceDisclosure {
+                classes: BTreeSet::new(),
+                confined_project: None,
+            });
+        }
     };
     let grant_readable: BTreeSet<DocClass> = grant
         .read_classes
@@ -48,6 +83,10 @@ pub(super) async fn required_query_source_classes(
         .copied()
         .filter(|class| *class != DocClass::EncryptedNote)
         .collect();
+    let fail_closed = || RunQuerySourceDisclosure {
+        classes: grant_readable.clone(),
+        confined_project: Some(None),
+    };
     let prior_calls = rows!(
         tx,
         (String,),
@@ -57,32 +96,55 @@ pub(super) async fn required_query_source_classes(
         run.as_str()
     )?;
     if prior_calls.is_empty() {
-        return Ok(BTreeSet::new());
+        return Ok(RunQuerySourceDisclosure {
+            classes: BTreeSet::new(),
+            confined_project: None,
+        });
     }
     if prior_calls.len() > 64 {
-        return Ok(grant_readable);
+        return Ok(fail_closed());
     }
     let mut required = BTreeSet::new();
+    let mut confined_project: Option<Option<FolderRef>> = None;
     for (raw_epochs,) in prior_calls {
-        let Some(classes) = parse_logged_disclosed_classes(&raw_epochs) else {
-            return Ok(grant_readable);
+        let Some((classes, call_project_only)) = parse_logged_disclosure(&raw_epochs) else {
+            return Ok(fail_closed());
         };
-        required.extend(
-            classes
-                .into_iter()
-                .filter(|class| *class != DocClass::EncryptedNote),
-        );
+        let classes: BTreeSet<DocClass> = classes
+            .into_iter()
+            .filter(|class| *class != DocClass::EncryptedNote)
+            .collect();
+        if classes.is_empty() {
+            // Query-only embedding calls record empty classes and disclose no
+            // new corpus scope to the model.
+            continue;
+        }
+        required.extend(classes);
+        confined_project = match (confined_project, call_project_only) {
+            (None, next) => Some(next),
+            (Some(Some(prev)), Some(next)) if prev == next => Some(Some(prev)),
+            _ => Some(None),
+        };
     }
-    Ok(required)
+    Ok(RunQuerySourceDisclosure {
+        classes: required,
+        confined_project,
+    })
 }
 
-fn parse_logged_disclosed_classes(raw: &str) -> Option<BTreeSet<DocClass>> {
+fn parse_logged_disclosure(raw: &str) -> Option<(BTreeSet<DocClass>, Option<FolderRef>)> {
     let value: serde_json::Value = serde_json::from_str(raw).ok()?;
     let array = value.as_array()?;
     if array.first()?.as_u64()? != 2 {
         return None;
     }
-    serde_json::from_value(array.get(4)?.clone()).ok()
+    let classes = serde_json::from_value(array.get(4)?.clone()).ok()?;
+    let project_only = match array.get(5) {
+        Some(value) => serde_json::from_value(value.clone()).ok()?,
+        // Entries missing the project-confinement field fail closed as unconfined.
+        None => None,
+    };
+    Some((classes, project_only))
 }
 
 pub(super) struct Snapshot {
@@ -99,6 +161,7 @@ pub(super) struct Validated {
     pub selectors: Vec<RevocationSelector>,
     pub spaces: Vec<SpaceId>,
     pub disclosed_classes: BTreeSet<DocClass>,
+    pub disclosed_project_only: Option<FolderRef>,
     pub expires_at_ms: Option<i64>,
 }
 pub(super) struct DispatchAuthority<'a> {
@@ -145,7 +208,11 @@ impl Snapshot {
         }
         Ok(budgets)
     }
-    pub fn epochs(&self, disclosed_classes: &BTreeSet<DocClass>) -> Result<String, PortError> {
+    pub fn epochs(
+        &self,
+        disclosed_classes: &BTreeSet<DocClass>,
+        disclosed_project_only: Option<&FolderRef>,
+    ) -> Result<String, PortError> {
         json(&(
             2_u8,
             self.resource.consent_epoch,
@@ -154,6 +221,7 @@ impl Snapshot {
                 .as_ref()
                 .map(|value| (&value.id, value.consent_epoch, value.runtime_epoch)),
             disclosed_classes,
+            disclosed_project_only,
         ))
     }
 }
@@ -378,14 +446,14 @@ impl ProviderService {
             {
                 return Err(DomainError::AccessDenied.into());
             }
-            let source_classes = required_query_source_classes(tx, &auth, grant).await?;
+            let source_disclosure = required_query_source_disclosure(tx, &auth, grant).await?;
             if !query.classes.iter().all(|class| {
                 admitted.policy.allowed_classes.contains(class)
                     && grant.read_classes.contains(class)
-            }) || !source_classes
-                .iter()
-                .all(|class| admitted.policy.allowed_classes.contains(class))
-            {
+            }) || !source_disclosure.allows_embedder(
+                &admitted.policy.allowed_classes,
+                admitted.project_only.as_ref(),
+            ) {
                 return Err(invalid(ValidationReason::ClassEgressForbidden));
             }
         }
@@ -591,14 +659,20 @@ impl ProviderService {
             auth.credential().ok_or(DomainError::AuthenticationFailed)?,
         )
         .await?;
-        let disclosed_classes: BTreeSet<DocClass> = if query_only {
-            BTreeSet::new()
+        let (disclosed_classes, disclosed_project_only) = if query_only {
+            (BTreeSet::new(), None)
         } else {
-            policies
+            let classes: BTreeSet<DocClass> = policies
                 .values()
                 .flat_map(|policy| policy.policy.allowed_classes.iter().copied())
                 .filter(|class| *class != DocClass::EncryptedNote)
-                .collect()
+                .collect();
+            let mut projects = policies.values().map(|policy| policy.project_only.as_ref());
+            let project_only = match projects.next().flatten() {
+                Some(first) if projects.all(|next| next == Some(first)) => Some(first.clone()),
+                _ => None,
+            };
+            (classes, project_only)
         };
         let expires_at_ms = policies
             .values()
@@ -610,6 +684,7 @@ impl ProviderService {
             selectors: selectors.into_iter().collect(),
             spaces: spaces.into_keys().collect(),
             disclosed_classes,
+            disclosed_project_only,
             expires_at_ms,
         })
     }

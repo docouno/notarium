@@ -96,6 +96,7 @@ impl History {
                 input_ceiling,
                 fixed_tokens,
                 fixed_bytes,
+                has_tail,
             )?
         {
             let proof = provenance(&mut summary, Some(through))?;
@@ -115,6 +116,7 @@ impl History {
         input_ceiling: u32,
         normal_fixed_tokens: u32,
         normal_fixed_bytes: usize,
+        has_tail: bool,
     ) -> Result<Option<ThreadEntrySeq>, PortError> {
         let Some(latest_message) = groups.iter().position(|group| group.end == messages.len())
         else {
@@ -146,6 +148,9 @@ impl History {
             .saturating_sub(normal_fixed_tokens)
             .saturating_sub(latest_group_tokens)
             .saturating_sub(4);
+        if !has_tail && penultimate_summary_cap == 0 {
+            return Ok(None);
+        }
         let mut selected = None;
         let mut from = 0;
         let mut total = fixed_tokens;

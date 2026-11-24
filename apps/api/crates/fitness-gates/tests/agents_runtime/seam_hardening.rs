@@ -428,7 +428,8 @@ async fn project_scoped_chat_starts_ai_and_blocks_foreign_project(
     assert_ne!(explicit_run, submitted.run.unwrap());
 
     // Security invariant: an AgentRun pinned to project A must STILL be
-    // rejected with SpaceReadOnly if it tries to claim or mutate project B's thread.
+    // rejected with ResourceNotFound (matching an absent thread, closing the
+    // thread-existence oracle) if it tries to claim or mutate project B's thread.
     let mut grants = owner.auth().spaces().clone();
     grants.get_mut(&scope.space_id).unwrap().project_root = Some(project_a.folder_id.clone());
     let run_a_id = AgentRunId::from_bytes([0x64; 16]);
@@ -457,9 +458,28 @@ async fn project_scoped_chat_starts_ai_and_blocks_foreign_project(
     assert!(
         matches!(
             foreign_claim,
-            Err(PortError::Domain(DomainError::SpaceReadOnly))
+            Err(PortError::Domain(DomainError::ResourceNotFound))
         ),
-        "project-A AgentRun must be rejected with SpaceReadOnly on project-B thread, got {foreign_claim:?}"
+        "project-A AgentRun must see ResourceNotFound on project-B thread (no existence oracle), got {foreign_claim:?}"
+    );
+    let absent_claim = fixture
+        .canonical
+        .claim_active_run(
+            run_a_ctx.clone(),
+            ClaimChatRun {
+                thread: ChatThreadId::from_bytes([0x6E; 16]),
+                run: run_a_id.clone(),
+                expected_leaf: ThreadEntrySeq::ZERO,
+                previous_run: None,
+            },
+        )
+        .await;
+    assert!(
+        matches!(
+            absent_claim,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ),
+        "absent thread claim must also return ResourceNotFound, got {absent_claim:?}"
     );
     let foreign_create = fixture
         .canonical
@@ -573,6 +593,37 @@ async fn project_scoped_chat_starts_ai_and_blocks_foreign_project(
     );
     let pat = fixture.pat(BearerScope::Write, false).await;
     let pat_space = SpaceContext::new(pat.auth().clone(), scope.clone(), budget()).unwrap();
+    let pat_human_append = fixture
+        .canonical
+        .append_chat(
+            pat_space.clone(),
+            Mutation {
+                identity: cmd(13),
+                preconditions: Preconditions::default(),
+                input: AppendChat {
+                    thread: thread_a.clone(),
+                    parent: ThreadEntrySeq::ZERO,
+                    kind: ChatEntryKind::Human,
+                    body: ChatInputBody::Text("pat forged human message".into()),
+                    tool_calls: vec![],
+                    provenance: None,
+                    interruption: None,
+                    proposed_diff: None,
+                    proposed_effect: None,
+                    referenced_notes: vec![],
+                    tainted: false,
+                },
+            },
+        )
+        .await;
+    assert!(
+        matches!(
+            pat_human_append,
+            Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
+                if diagnostic.reason == ValidationReason::InvalidAuthority
+        ),
+        "PAT bearer must not append ChatEntryKind::Human, got {pat_human_append:?}"
+    );
     let pat_queue = fixture
         .canonical
         .queue_chat_input(
@@ -583,7 +634,7 @@ async fn project_scoped_chat_starts_ai_and_blocks_foreign_project(
                 input: PendingChatInput {
                     id: PendingInputId::from_bytes([0x6C; 16]),
                     thread: thread_a,
-                    sender: actor,
+                    sender: actor.clone(),
                     body: "pat forged queue input".into(),
                     queued_base_leaf: ThreadEntrySeq::ZERO,
                     in_flight_run: run_a_id,
@@ -599,6 +650,134 @@ async fn project_scoped_chat_starts_ai_and_blocks_foreign_project(
                 if diagnostic.reason == ValidationReason::InvalidAuthority
         ),
         "PAT bearer must not call queue_chat_input, got {pat_queue:?}"
+    );
+
+    // Non-Keepers (including the Space owner) must NOT append to or fork a KeeperLog,
+    // and an unrelated Keeper must see ResourceNotFound (not SpaceReadOnly).
+    let keeper_log_id = ChatThreadId::from_bytes([0x6D; 16]);
+    let make_keeper_ctx = |tag: u8, log: ChatThreadId| {
+        let run = AgentRunId::from_bytes([tag; 16]);
+        let auth = notarium_core::auth::EngineAuthContext::for_human(
+            notarium_core::auth::VerifiedHuman::attest(
+                actor.clone(),
+                GrantId::from_bytes([tag; 16]),
+                owner.auth().spaces().clone(),
+                false,
+            )
+            .with_credential(
+                notarium_core::auth::AuthenticatedCredential::ScheduledRun {
+                    schedule: ScheduleId::from_bytes([tag; 16]),
+                    run: run.clone(),
+                    lease: LeaseEpoch::new(1).unwrap(),
+                },
+            ),
+        )
+        .for_keeper(run, scope.space_id.clone(), None, BTreeSet::new())
+        .unwrap()
+        .with_verified_keeper_log(log)
+        .unwrap();
+        SpaceContext::new(auth, scope.clone(), budget()).unwrap()
+    };
+    let keeper_ctx = make_keeper_ctx(0x6D, keeper_log_id.clone());
+    fixture
+        .canonical
+        .create_chat(
+            keeper_ctx,
+            Mutation {
+                identity: cmd(14),
+                preconditions: Preconditions::default(),
+                input: CreateChat {
+                    thread: keeper_log_id.clone(),
+                    kind: ChatThreadKind::KeeperLog,
+                    owner: actor.clone(),
+                    project_folder: None,
+                    title: "Keeper audit log".into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let owner_append_log = fixture
+        .canonical
+        .append_chat(
+            personal.clone(),
+            Mutation {
+                identity: cmd(15),
+                preconditions: Preconditions::default(),
+                input: AppendChat {
+                    thread: keeper_log_id.clone(),
+                    parent: ThreadEntrySeq::ZERO,
+                    kind: ChatEntryKind::Human,
+                    body: ChatInputBody::Text("human append to keeper log".into()),
+                    tool_calls: vec![],
+                    provenance: None,
+                    interruption: None,
+                    proposed_diff: None,
+                    proposed_effect: None,
+                    referenced_notes: vec![],
+                    tainted: false,
+                },
+            },
+        )
+        .await;
+    assert!(
+        matches!(
+            owner_append_log,
+            Err(PortError::Domain(DomainError::SpaceReadOnly))
+        ),
+        "DirectHuman owner must not append to KeeperLog, got {owner_append_log:?}"
+    );
+    let owner_fork_log = fixture
+        .canonical
+        .fork_chat(
+            personal.clone(),
+            Mutation {
+                identity: cmd(16),
+                preconditions: Preconditions::default(),
+                input: ForkChat {
+                    thread: keeper_log_id.clone(),
+                    parent: ThreadEntrySeq::ZERO,
+                },
+            },
+        )
+        .await;
+    assert!(
+        matches!(
+            owner_fork_log,
+            Err(PortError::Domain(DomainError::SpaceReadOnly))
+        ),
+        "DirectHuman owner must not fork KeeperLog, got {owner_fork_log:?}"
+    );
+    let other_keeper_ctx = make_keeper_ctx(0x6F, ChatThreadId::from_bytes([0x6F; 16]));
+    let other_keeper_append = fixture
+        .canonical
+        .append_chat(
+            other_keeper_ctx,
+            Mutation {
+                identity: cmd(17),
+                preconditions: Preconditions::default(),
+                input: AppendChat {
+                    thread: keeper_log_id,
+                    parent: ThreadEntrySeq::ZERO,
+                    kind: ChatEntryKind::Model,
+                    body: ChatInputBody::Text("other keeper probe".into()),
+                    tool_calls: vec![],
+                    provenance: None,
+                    interruption: None,
+                    proposed_diff: None,
+                    proposed_effect: None,
+                    referenced_notes: vec![],
+                    tainted: false,
+                },
+            },
+        )
+        .await;
+    assert!(
+        matches!(
+            other_keeper_append,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ),
+        "unrelated Keeper must see ResourceNotFound on another KeeperLog, got {other_keeper_append:?}"
     );
 }
 
@@ -1223,7 +1402,7 @@ async fn remote_embedding_query_blocks_unconsented_model_sources(
     assert_eq!(disclosed_narrow, [DocClass::UserDoc].into());
     let direct_narrow = provider_svc
         .embed(
-            narrow_run_ctx,
+            narrow_run_ctx.clone(),
             EmbeddingRequest::query(
                 CommandKey::from_bytes([0x7E; 16]),
                 emb_model.clone(),
@@ -1241,6 +1420,469 @@ async fn remote_embedding_query_blocks_unconsented_model_sources(
         .expect("narrow UserDoc-only AgentRun must be allowed to query UserDoc-only embedder");
     assert_eq!(direct_narrow.vectors.len(), 1);
     assert_eq!(emb_hits.load(Ordering::SeqCst), 1);
+
+    // 2b. Project-substitution exfiltration on a Shared Space: a Space-wide AgentRun
+    //     that completed Step 1 under a Space-wide UserDoc provider MUST NOT send
+    //     model-authored queries to a remote embedder attached ONLY to `ProjectA`,
+    //     even though both allow `UserDoc`. A `ProjectA`-confined run MAY query it.
+    let emb_shared = fixture
+        .control
+        .create_space(
+            owner.clone(),
+            AccountMutation {
+                identity: identity(fixture, &owner, 0x21).await,
+                input: CreateSpace {
+                    id: SpaceId::from_bytes([0x21; 16]),
+                    kind: SpaceKind::Shared,
+                    name: "Embed Project Isolation".into(),
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    let owner = fresh_owner(fixture).await;
+    let proj_a = create_project_folder(
+        fixture,
+        &emb_shared.history,
+        &actor,
+        FolderId::from_bytes([0x22; 16]),
+        "emb-proj-a",
+    )
+    .await;
+    let proj_emb_res = ProviderResourceId::from_bytes([0x23; 16]);
+    let proj_emb_model = ModelProfileId::from_bytes([0x23; 16]);
+    let shared_chat_res = ProviderResourceId::from_bytes([0x24; 16]);
+    let shared_chat_model = ModelProfileId::from_bytes([0x24; 16]);
+    let proj_chat_res = ProviderResourceId::from_bytes([0x25; 16]);
+    let proj_chat_model = ModelProfileId::from_bytes([0x25; 16]);
+    let proj_network = NetworkPolicy::new(vec![
+        PrivateNetworkRule::new(
+            proj_emb_res.clone(),
+            &format!("http://127.0.0.1:{}", emb_addr.port()),
+            vec![loopback],
+        )
+        .unwrap(),
+        PrivateNetworkRule::new(
+            shared_chat_res.clone(),
+            &format!("http://127.0.0.1:{}", chat_addr.port()),
+            vec![loopback],
+        )
+        .unwrap(),
+        PrivateNetworkRule::new(
+            proj_chat_res.clone(),
+            &format!("http://127.0.0.1:{}", chat_addr.port()),
+            vec![loopback],
+        )
+        .unwrap(),
+    ])
+    .unwrap();
+    let proj_provider_svc = Arc::new(
+        ProviderService::new(
+            fixture.control.clone(),
+            fixture.keyring.clone(),
+            Arc::new(OutboundTransport::new(proj_network)),
+            catalog.clone(),
+            ProviderConfig::default(),
+        )
+        .unwrap(),
+    );
+    let attach_and_approve =
+        |res_id: ProviderResourceId, target: ProviderAttachmentTarget, req_tag: u8, app_tag: u8| {
+            let svc = proj_provider_svc.clone();
+            let owner = owner.clone();
+            async move {
+                let info = svc
+                    .list_resources(owner.clone(), ControlPageRequest::new(50, None).unwrap())
+                    .await
+                    .unwrap()
+                    .items
+                    .into_iter()
+                    .find(|item| item.id == res_id)
+                    .unwrap();
+                let att = svc
+                    .request_attachment(
+                        owner.clone(),
+                        AccountMutation {
+                            identity: identity(fixture, &owner, req_tag).await,
+                            input: RequestProviderAttachment {
+                                id: RequestId::from_bytes([req_tag; 16]),
+                                expected: None,
+                                resource: info.id,
+                                resource_consent_epoch: info.consent_epoch,
+                                credential_consent_epoch: None,
+                                target,
+                                consent: ProviderDisclosureConsent::attest_checked(
+                                    ProviderDisclosure {
+                                        classes: [DocClass::UserDoc].into(),
+                                    },
+                                ),
+                                expires_at_ms: None,
+                            },
+                        },
+                    )
+                    .await
+                    .unwrap()
+                    .value;
+                if att.state != ProviderAttachmentState::Approved {
+                    svc.approve_attachment(
+                        owner.clone(),
+                        AccountMutation {
+                            identity: identity(fixture, &owner, app_tag).await,
+                            input: ApproveProviderAttachment {
+                                id: att.id,
+                                expected: att.revision,
+                                resource_consent_epoch: att.resource_consent_epoch,
+                                credential_consent_epoch: att.credential_consent_epoch,
+                                consent: ProviderDisclosureConsent::attest_checked(
+                                    ProviderDisclosure {
+                                        classes: [DocClass::UserDoc].into(),
+                                    },
+                                ),
+                            },
+                        },
+                    )
+                    .await
+                    .unwrap();
+                }
+            }
+        };
+
+    // Embedder attached ONLY to `ProjectA`.
+    let saved_proj_emb = proj_provider_svc
+        .create_resource(
+            owner.clone(),
+            AccountMutation {
+                identity: identity(fixture, &owner, 0x22).await,
+                input: ProviderResourceSpec {
+                    id: proj_emb_res.clone(),
+                    name: "ProjectA-only embedder".into(),
+                    wire: ProviderWireKind::Ollama,
+                    base_url: format!("http://127.0.0.1:{}", emb_addr.port()),
+                    credential: None,
+                    headers: vec![],
+                    limits: ProviderLimits::default(),
+                    timeout_ms: 5_000,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    proj_provider_svc
+        .put_model(
+            owner.clone(),
+            AccountMutation {
+                identity: identity(fixture, &owner, 0x23).await,
+                input: PutProviderModel {
+                    resource: proj_emb_res.clone(),
+                    expected: saved_proj_emb.value.revision,
+                    default: false,
+                    model: ProviderModelSpec {
+                        id: proj_emb_model.clone(),
+                        wire_name: "embed-fixture".into(),
+                        kind: ProviderModelKind::Embedding { dimension: 64 },
+                        accounting: TokenAccountingProfile::ConservativeModelCapV1,
+                        max_input_tokens: 4096,
+                        max_output_tokens: 0,
+                        tools: false,
+                    },
+                },
+            },
+        )
+        .await
+        .unwrap();
+    attach_and_approve(
+        proj_emb_res.clone(),
+        ProviderAttachmentTarget::Personal {
+            owner: actor.clone(),
+            space: emb_shared.history.space_id.clone(),
+        },
+        0x11,
+        0x12,
+    )
+    .await;
+    attach_and_approve(
+        proj_emb_res.clone(),
+        ProviderAttachmentTarget::Project(proj_a.clone()),
+        0x24,
+        0x25,
+    )
+    .await;
+
+    // Space-wide Shared chat provider (`UserDoc`-only, Space attachment).
+    let saved_shared_chat = proj_provider_svc
+        .create_resource(
+            owner.clone(),
+            AccountMutation {
+                identity: identity(fixture, &owner, 0x26).await,
+                input: ProviderResourceSpec {
+                    id: shared_chat_res.clone(),
+                    name: "Shared Space-wide chat".into(),
+                    wire: ProviderWireKind::Ollama,
+                    base_url: format!("http://127.0.0.1:{}", chat_addr.port()),
+                    credential: None,
+                    headers: vec![],
+                    limits: ProviderLimits::default(),
+                    timeout_ms: 5_000,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    proj_provider_svc
+        .put_model(
+            owner.clone(),
+            AccountMutation {
+                identity: identity(fixture, &owner, 0x27).await,
+                input: PutProviderModel {
+                    resource: shared_chat_res.clone(),
+                    expected: saved_shared_chat.value.revision,
+                    default: false,
+                    model: ProviderModelSpec {
+                        id: shared_chat_model.clone(),
+                        wire_name: "chat-shared-wide".into(),
+                        kind: ProviderModelKind::Completion,
+                        accounting: TokenAccountingProfile::ConservativeModelCapV1,
+                        max_input_tokens: 16_384,
+                        max_output_tokens: 1024,
+                        tools: true,
+                    },
+                },
+            },
+        )
+        .await
+        .unwrap();
+    attach_and_approve(
+        shared_chat_res.clone(),
+        ProviderAttachmentTarget::Personal {
+            owner: actor.clone(),
+            space: emb_shared.history.space_id.clone(),
+        },
+        0x13,
+        0x14,
+    )
+    .await;
+    attach_and_approve(
+        shared_chat_res.clone(),
+        ProviderAttachmentTarget::Space(emb_shared.history.space_id.clone()),
+        0x28,
+        0x29,
+    )
+    .await;
+
+    // ProjectA-only Shared chat provider (`UserDoc`-only, ProjectA attachment).
+    let saved_proj_chat = proj_provider_svc
+        .create_resource(
+            owner.clone(),
+            AccountMutation {
+                identity: identity(fixture, &owner, 0x2A).await,
+                input: ProviderResourceSpec {
+                    id: proj_chat_res.clone(),
+                    name: "ProjectA-only chat provider".into(),
+                    wire: ProviderWireKind::Ollama,
+                    base_url: format!("http://127.0.0.1:{}", chat_addr.port()),
+                    credential: None,
+                    headers: vec![],
+                    limits: ProviderLimits::default(),
+                    timeout_ms: 5_000,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    proj_provider_svc
+        .put_model(
+            owner.clone(),
+            AccountMutation {
+                identity: identity(fixture, &owner, 0x2B).await,
+                input: PutProviderModel {
+                    resource: proj_chat_res.clone(),
+                    expected: saved_proj_chat.value.revision,
+                    default: false,
+                    model: ProviderModelSpec {
+                        id: proj_chat_model.clone(),
+                        wire_name: "chat-proj-a".into(),
+                        kind: ProviderModelKind::Completion,
+                        accounting: TokenAccountingProfile::ConservativeModelCapV1,
+                        max_input_tokens: 16_384,
+                        max_output_tokens: 1024,
+                        tools: true,
+                    },
+                },
+            },
+        )
+        .await
+        .unwrap();
+    attach_and_approve(
+        proj_chat_res.clone(),
+        ProviderAttachmentTarget::Personal {
+            owner: actor.clone(),
+            space: emb_shared.history.space_id.clone(),
+        },
+        0x15,
+        0x16,
+    )
+    .await;
+    attach_and_approve(
+        proj_chat_res.clone(),
+        ProviderAttachmentTarget::Project(proj_a.clone()),
+        0x2C,
+        0x2D,
+    )
+    .await;
+
+    let run_shared_step = |run_tag: u8,
+                           res_id: ProviderResourceId,
+                           model_id: ModelProfileId,
+                           project: Option<FolderRef>| {
+        let svc = proj_provider_svc.clone();
+        let owner = owner.clone();
+        let shared_hist = emb_shared.history.clone();
+        let listener = &chat_listener;
+        async move {
+            let auth = owner
+                .auth()
+                .for_agent_run(
+                    AgentRunId::from_bytes([run_tag; 16]),
+                    shared_hist.space_id.clone(),
+                    ChatAudience::Shared,
+                    owner.auth().spaces().clone(),
+                )
+                .unwrap();
+            let ctx = SpaceContext::new(auth, shared_hist, budget()).unwrap();
+            let sel = svc
+                .select_provider(
+                    ctx.clone(),
+                    SelectProvider {
+                        kind: PreferenceModelKind::Completion,
+                        resource: Some(res_id),
+                        model: Some(model_id),
+                        project,
+                    },
+                )
+                .await
+                .unwrap();
+            let call = svc.complete(
+                ctx.clone(),
+                CompletionRequest {
+                    intent: CommandKey::from_bytes([run_tag; 16]),
+                    selection: sel,
+                    secondary_projects: vec![],
+                    messages: vec![CompletionMessage {
+                        role: CompletionRole::User,
+                        instruction: Some(
+                            ProviderInstruction::from_orchestrator("Shared search".into()).unwrap(),
+                        ),
+                        parts: vec![],
+                        tool_calls: vec![],
+                        result_for: None,
+                    }],
+                    tools: vec![],
+                    budget: CompletionBudget {
+                        max_input_tokens: 4096,
+                        max_output_tokens: 128,
+                        max_tool_calls: 0,
+                    },
+                },
+            );
+            let serve = async {
+                let (mut wire, _) = timeout(Duration::from_secs(10), read_request(listener))
+                    .await
+                    .unwrap();
+                send_ollama(
+                    &mut wire,
+                    json!({"role": "assistant", "content": "ok"}),
+                    "stop",
+                )
+                .await;
+            };
+            let (stream_res, ()) = tokio::join!(call, serve);
+            let mut stream = stream_res.unwrap();
+            while let Some(ev) = stream.next().await.unwrap() {
+                if matches!(ev, CompletionEvent::Finished(_)) {
+                    break;
+                }
+            }
+            ctx
+        }
+    };
+
+    let shared_wide_run_ctx = run_shared_step(0x2E, shared_chat_res, shared_chat_model, None).await;
+    let disclosed_sub = EmbeddingProviderPort::query_disclosure(
+        proj_provider_svc.as_ref(),
+        shared_wide_run_ctx.clone(),
+        proj_emb_res.clone(),
+        proj_emb_model.clone(),
+        Some(proj_a.clone()),
+        Some(proj_a.folder_id.clone()),
+    )
+    .await
+    .unwrap();
+    assert!(
+        disclosed_sub.is_empty(),
+        "Space-wide Shared AgentRun must NOT query ProjectA-only remote embedder (got {disclosed_sub:?})"
+    );
+    let direct_sub = proj_provider_svc
+        .embed(
+            shared_wide_run_ctx,
+            EmbeddingRequest::query(
+                CommandKey::from_bytes([0x2E, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+                proj_emb_model.clone(),
+                proj_emb_res.clone(),
+                EmbeddingQueryInput {
+                    text: "space-wide secret smuggled into ProjectA embedder".into(),
+                    tokens: 8,
+                    classes: [DocClass::UserDoc].into(),
+                    project_scope: Some(proj_a.clone()),
+                    folder: Some(proj_a.folder_id.clone()),
+                },
+            ),
+        )
+        .await;
+    assert!(
+        matches!(
+            direct_sub,
+            Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
+                if diagnostic.reason == ValidationReason::ClassEgressForbidden
+        ),
+        "Space-wide Shared AgentRun querying ProjectA-only embedder must fail with ClassEgressForbidden, got {direct_sub:?}"
+    );
+    assert_eq!(emb_hits.load(Ordering::SeqCst), 1);
+
+    let proj_run_ctx =
+        run_shared_step(0x2F, proj_chat_res, proj_chat_model, Some(proj_a.clone())).await;
+    let disclosed_same_proj = EmbeddingProviderPort::query_disclosure(
+        proj_provider_svc.as_ref(),
+        proj_run_ctx.clone(),
+        proj_emb_res.clone(),
+        proj_emb_model.clone(),
+        Some(proj_a.clone()),
+        Some(proj_a.folder_id.clone()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(disclosed_same_proj, [DocClass::UserDoc].into());
+    let direct_same_proj = proj_provider_svc
+        .embed(
+            proj_run_ctx,
+            EmbeddingRequest::query(
+                CommandKey::from_bytes([0x2F, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+                proj_emb_model,
+                proj_emb_res,
+                EmbeddingQueryInput {
+                    text: "strictly ProjectA query".into(),
+                    tokens: 6,
+                    classes: [DocClass::UserDoc].into(),
+                    project_scope: Some(proj_a.clone()),
+                    folder: Some(proj_a.folder_id),
+                },
+            ),
+        )
+        .await
+        .expect("ProjectA-confined AgentRun must be allowed to query ProjectA-only embedder");
+    assert_eq!(direct_same_proj.vectors.len(), 1);
+    assert_eq!(emb_hits.load(Ordering::SeqCst), 2);
+    drop(narrow_run_ctx);
 
     // 3. On SQLite, wire real SearchEngine (VectorMode::RemoteOnly) + ToolRegistry
     //    against `provider_svc` and verify BOTH:
@@ -1437,13 +2079,17 @@ async fn remote_embedding_query_blocks_unconsented_model_sources(
             fixture.control.clone(),
         )
         .with_vector_search(true);
+        let personal_only_grants = std::collections::BTreeMap::from([(
+            scope.space_id.clone(),
+            owner.auth().spaces()[&scope.space_id].clone(),
+        )]);
         let fresh_agent_auth = owner
             .auth()
             .for_agent_run(
                 AgentRunId::from_bytes([0x7D; 16]),
                 scope.space_id.clone(),
                 ChatAudience::Personal,
-                owner.auth().spaces().clone(),
+                personal_only_grants,
             )
             .unwrap();
         let fresh_agent_account = AccountContext::new(fresh_agent_auth, budget());
@@ -2708,10 +3354,25 @@ async fn rollback_run_stops_active_keeper_and_rejects_unsettled_runs(
         .unwrap();
     let viewer_account = AccountContext::new(viewer_auth, budget());
     let pat_account = fixture.pat(BearerScope::Write, false).await;
-    for (label, caller, key_tag) in [
-        ("viewer", viewer_account, 0xC1_u8),
-        ("pat", pat_account, 0xC2_u8),
-    ] {
+    let project_scoped_owner = AccountContext::new(
+        owner.auth().restrict_to_project(&project).unwrap(),
+        budget(),
+    );
+    let tainted_owner = fresh_owner(fixture).await;
+    tainted_owner.auth().taint().mark_external_read();
+
+    let unauthorized_cases: [(&str, AccountContext, u8, &str); 4] = [
+        ("viewer", viewer_account, 0xC1, "access_denied"),
+        ("pat", pat_account, 0xC2, "access_denied"),
+        (
+            "project_scoped_owner",
+            project_scoped_owner,
+            0xC3,
+            "access_denied",
+        ),
+        ("tainted_owner", tainted_owner, 0xC4, "cross_space_tainted"),
+    ];
+    for (label, caller, key_tag, expected) in unauthorized_cases {
         let denied_rb = supervisor
             .rollback_run(
                 caller.clone(),
@@ -2720,15 +3381,6 @@ async fn rollback_run_stops_active_keeper_and_rejects_unsettled_runs(
                 CommandKey::from_bytes([0xCF, key_tag, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
             )
             .await;
-        assert!(
-            matches!(denied_rb, Err(PortError::Domain(DomainError::AccessDenied)))
-                || matches!(
-                    denied_rb,
-                    Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
-                        if diagnostic.reason == ValidationReason::InvalidAuthority
-                ),
-            "{label} rollback_run must fail with AccessDenied/InvalidAuthority (never InvalidState), got {denied_rb:?}"
-        );
         let denied_check = fixture
             .control
             .ensure_run_inactive(
@@ -2737,16 +3389,25 @@ async fn rollback_run_stops_active_keeper_and_rejects_unsettled_runs(
                 active_keeper_run.clone(),
             )
             .await;
-        assert!(
-            matches!(
-                denied_check,
-                Err(PortError::Domain(DomainError::AccessDenied))
-            ) || matches!(
-                denied_check,
-                Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
+        let matches_expected = |err: Option<&PortError>| match expected {
+            "access_denied" => matches!(err, Some(PortError::Domain(DomainError::AccessDenied))),
+            "cross_space_tainted" => {
+                matches!(err, Some(PortError::Domain(DomainError::CrossSpaceTainted)))
+            }
+            "invalid_authority" => matches!(
+                err,
+                Some(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
                     if diagnostic.reason == ValidationReason::InvalidAuthority
             ),
-            "{label} ensure_run_inactive must fail with AccessDenied/InvalidAuthority, got {denied_check:?}"
+            _ => unreachable!(),
+        };
+        assert!(
+            matches_expected(denied_rb.as_ref().err()),
+            "{label} rollback_run expected {expected}, got {denied_rb:?}"
+        );
+        assert!(
+            matches_expected(denied_check.as_ref().err()),
+            "{label} ensure_run_inactive expected {expected}, got {denied_check:?}"
         );
     }
     // Confirm the active Keeper was NOT cancelled by the unauthorized callers.
@@ -3604,6 +4265,71 @@ async fn closed_chat_episode_recovers_and_role_typo_leaves_no_orphan(
         "failed start_session on closed ProjectUnavailable episode must not fork an active episode"
     );
 
+    // Part C2: An ACTIVE named episode bound to a now-trashed project must return
+    // `NamedEpisodePreview::ProjectUnavailable` (never leaking the hidden raw `FolderRef`),
+    // and `start_session` with a role must fail closed with `ResourceNotFound`.
+    let active_gone_proj = create_project_folder(
+        fixture,
+        &scope,
+        &actor,
+        FolderId::from_bytes([0xE9; 16]),
+        "ep-active-gone-proj",
+    )
+    .await;
+    fixture
+        .control
+        .start_or_resume_episode(
+            owner.clone(),
+            AccountMutation {
+                identity: identity(fixture, &owner, 0xE9).await,
+                input: StartEpisode {
+                    selector: EpisodeSelector::New {
+                        requested: EpisodeId::from_bytes([0xE9; 16]),
+                        name: Some("active-gone-ep".into()),
+                    },
+                    project_hint: Some(active_gone_proj.clone()),
+                    guard: EpisodeRevisionGuard::Target,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let trashed_active = fixture
+        .canonical
+        .execute_diagnostic_write_sql_for_test(&format!(
+            "UPDATE folder_heads SET lifecycle_state='trashed' WHERE space_id='{}' AND folder_id='{}'",
+            scope.space_id.as_str(),
+            active_gone_proj.folder_id.as_str(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(trashed_active, 1);
+    assert_eq!(
+        fixture
+            .control
+            .named_episode_project_hint(owner.clone(), "active-gone-ep".into())
+            .await
+            .unwrap(),
+        NamedEpisodePreview::ProjectUnavailable,
+        "named_episode_project_hint must validate the stored project via catalog and never leak a trashed FolderRef"
+    );
+    let active_gone_res = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xE8, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
+        "start_session",
+        json!({ "session": { "name": "active-gone-ep" }, "role": "research" }),
+    )
+    .await;
+    assert!(
+        matches!(
+            active_gone_res,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ),
+        "start_session on active named episode with trashed project must fail closed, got {:?}",
+        active_gone_res.err()
+    );
+
     // Part D: Named session pre-validation preserves `recentSessions` on ambiguous names
     // and resolves project-scoped roles on unique project-bound named sessions.
     let personal_slug = fixture
@@ -4051,9 +4777,10 @@ async fn keeper_one_shot_tick_handles_multi_boundary_clock_skew(fixture: &Runtim
     assert_eq!(report.succeeded, 1);
 }
 
-/// Verify `idx_folder_heads_space_updated` is installed on both SQLite and PG.
+/// Verify `idx_folder_heads_space_updated` (canonical) and `call_run` (control)
+/// are installed on both SQLite and PG.
 async fn folder_heads_space_updated_index_present(fixture: &RuntimeFixture, pg: bool) {
-    let found: i64 = match &fixture.canonical_config.sql {
+    let (folder_idx, call_run_idx): (i64, i64) = match &fixture.canonical_config.sql {
         SqlBackendConfig::Postgres {
             connect, schema, ..
         } => {
@@ -4061,7 +4788,7 @@ async fn folder_heads_space_updated_index_present(fixture: &RuntimeFixture, pg: 
             let mut conn = sqlx::PgConnection::connect_with(&build_pg_connect_options(connect))
                 .await
                 .unwrap();
-            let count: i64 = sqlx::query_scalar(
+            let folder_count: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM pg_indexes
                  WHERE schemaname = $1
                    AND tablename = 'folder_heads'
@@ -4071,14 +4798,23 @@ async fn folder_heads_space_updated_index_present(fixture: &RuntimeFixture, pg: 
             .fetch_one(&mut conn)
             .await
             .unwrap();
+            let call_run_count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pg_indexes
+                 WHERE schemaname = 'v1_control'
+                   AND tablename = 'provider_call_log'
+                   AND indexname = 'call_run'",
+            )
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
             conn.close().await.unwrap();
-            count
+            (folder_count, call_run_count)
         }
         SqlBackendConfig::Sqlite { data_root, .. } => {
             assert!(!pg);
             let url = format!("sqlite:{}", data_root.canonical().display());
             let mut conn = sqlx::SqliteConnection::connect(&url).await.unwrap();
-            let count: i64 = sqlx::query_scalar(
+            let folder_count: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM sqlite_master
                  WHERE type = 'index'
                    AND tbl_name = 'folder_heads'
@@ -4088,10 +4824,26 @@ async fn folder_heads_space_updated_index_present(fixture: &RuntimeFixture, pg: 
             .await
             .unwrap();
             conn.close().await.unwrap();
-            count
+            let ctrl_url = format!("sqlite:{}", data_root.control().display());
+            let mut ctrl_conn = sqlx::SqliteConnection::connect(&ctrl_url).await.unwrap();
+            let call_run_count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index'
+                   AND tbl_name = 'provider_call_log'
+                   AND name = 'call_run'",
+            )
+            .fetch_one(&mut ctrl_conn)
+            .await
+            .unwrap();
+            ctrl_conn.close().await.unwrap();
+            (folder_count, call_run_count)
         }
     };
-    assert_eq!(found, 1, "idx_folder_heads_space_updated must exist");
+    assert_eq!(folder_idx, 1, "idx_folder_heads_space_updated must exist");
+    assert_eq!(
+        call_run_idx, 1,
+        "provider_call_log call_run index must exist in control schema"
+    );
 }
 
 /// Multi-page `start_session` delta pagination must renew the continuation
@@ -4166,7 +4918,7 @@ async fn bootstrap_continuation_sliding_ttl_survives_multi_page_resync(fixture: 
     let _restore = RestoreTtl(fixture.registry.clone());
     fixture
         .registry
-        .set_bootstrap_continuation_ttl_for_tests(Duration::from_millis(500));
+        .set_bootstrap_continuation_ttl_for_tests(Duration::from_millis(1500));
 
     let page1 = call_mcp(
         &fixture.registry,
@@ -4187,8 +4939,8 @@ async fn bootstrap_continuation_sliding_ttl_survives_multi_page_resync(fixture: 
         .expect("page 1 must emit a deliveryReceipt")
         .to_owned();
 
-    // Sleep 300ms (< 500ms TTL) and advance to Page 2.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Sleep 850ms (< 1500ms TTL, generous margin against CI jitter) and advance to Page 2.
+    tokio::time::sleep(Duration::from_millis(850)).await;
     let page2 = call_mcp(
         &fixture.registry,
         &fresh_owner(fixture).await,
@@ -4208,9 +4960,9 @@ async fn bootstrap_continuation_sliding_ttl_survives_multi_page_resync(fixture: 
         .expect("page 2 must emit a deliveryReceipt")
         .to_owned();
 
-    // Sleep another 300ms: total elapsed since Page 1 is 600ms (> 500ms), so `cont1`
-    // MUST be expired (`CursorStale`), while `cont2` (only 300ms idle) MUST still succeed!
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Sleep another 850ms: total elapsed since Page 1 is 1700ms (> 1500ms), so `cont1`
+    // MUST be expired (`CursorStale`), while `cont2` (only 850ms idle) MUST still succeed!
+    tokio::time::sleep(Duration::from_millis(850)).await;
     let expired1 = call_mcp(
         &fixture.registry,
         &fresh_owner(fixture).await,
@@ -4225,7 +4977,7 @@ async fn bootstrap_continuation_sliding_ttl_survives_multi_page_resync(fixture: 
             Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
                 if diagnostic.reason == ValidationReason::CursorStale
         ),
-        "old page-1 continuation past 500ms TTL must fail with CursorStale, got {:?}",
+        "old page-1 continuation past 1500ms TTL must fail with CursorStale, got {:?}",
         expired1.err()
     );
     let page3 = call_mcp(

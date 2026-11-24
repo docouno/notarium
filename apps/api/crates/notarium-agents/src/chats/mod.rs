@@ -475,6 +475,9 @@ impl AgentRunSupervisor {
                 budget
             };
             account.auth().authorize_human_management()?;
+            if account.auth().taint().is_tainted() {
+                return Err(DomainError::CrossSpaceTainted.into());
+            }
             let live_auth = service
                 .inner
                 .registry
@@ -485,13 +488,27 @@ impl AgentRunSupervisor {
                 ))
                 .await?;
             live_auth.authorize_human_management()?;
+            if live_auth.taint().is_tainted() {
+                return Err(DomainError::CrossSpaceTainted.into());
+            }
             let grant = live_auth
                 .spaces()
                 .get(&scope.space_id)
                 .ok_or(DomainError::ResourceNotFound)?;
-            if grant.role == notarium_core::auth::SpaceRole::Viewer {
+            if grant.role == notarium_core::auth::SpaceRole::Viewer || grant.project_root.is_some()
+            {
                 return Err(DomainError::AccessDenied.into());
             }
+            let space_record = service
+                .inner
+                .registry
+                .catalog()
+                .space(remaining_budget(), scope.space_id.clone())
+                .await?;
+            if space_record.space.lifecycle != notarium_core::auth::SpaceLifecycle::Active {
+                return Err(DomainError::ResourceNotFound.into());
+            }
+            scope.check(&space_record.history)?;
             let _drain = service
                 .inner
                 .revocations
@@ -542,7 +559,7 @@ impl AgentRunSupervisor {
     /// Redact an entry and stop the local owner of any turn using this branch.
     pub async fn redact_chat_entry(
         &self,
-        mut account: AccountContext,
+        account: AccountContext,
         request: Mutation<RedactChatEntry>,
     ) -> Result<Committed<RedactedChat>, PortError> {
         let service = self.clone();
@@ -550,16 +567,17 @@ impl AgentRunSupervisor {
             let scope = request.identity.scope.clone();
             let thread = request.input.thread.clone();
             let deadline = deadline_from(account.budget.remaining);
+            require_write_bearer(account.auth())?;
+            let mut account = service.live_account(account).await?;
+            require_write_bearer(account.auth())?;
             let _admission = service
                 .lock_thread_gate(&scope, &thread, &mut account.budget, deadline)
                 .await?;
-            let mut account = service.live_account(account).await?;
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Err(gate_deadline());
             }
             account.budget.remaining = remaining;
-            require_write_bearer(account.auth())?;
             let ownership_lost = Cancellation::default();
             account.budget = bounded(&account.budget, MAINTENANCE_BUDGET, ownership_lost);
             let route = service

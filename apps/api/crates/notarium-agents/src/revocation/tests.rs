@@ -426,3 +426,67 @@ async fn cancelled_revoke_cleans_applying_entry_for_clean_retry() {
     .expect("retry after cancelled revoke must complete promptly")
     .unwrap();
 }
+
+#[tokio::test]
+async fn stop_and_drain_run_respects_caller_cancellation_and_zero_budget_without_cancelling_run() {
+    let hub = RevocationHub::new_local();
+    let space = SpaceId::from_bytes([0x41; 16]);
+    let run_id = AgentRunId::from_bytes([0x42; 16]);
+    let auth = caller(2, &space, AuthenticatedCredential::TrustedNone);
+    let run_auth = auth
+        .for_agent_run(
+            run_id.clone(),
+            space.clone(),
+            ChatAudience::Personal,
+            auth.spaces().clone(),
+        )
+        .unwrap();
+    let run_cancel = Cancellation::default();
+    let running = hub
+        .register_run(context(1), &run_auth, None, run_cancel.clone())
+        .unwrap();
+
+    // Pre-cancelled caller must fail with Cancelled without touching the active run.
+    let cancelled_token = Cancellation::default();
+    cancelled_token.cancel();
+    let cancelled_budget = CallBudget {
+        request: RequestId::from_bytes([0x43; 16]),
+        cancellation: cancelled_token,
+        remaining: Duration::from_secs(5),
+    };
+    let err = hub
+        .stop_and_drain_run(&space, &run_id, &cancelled_budget)
+        .await;
+    assert!(matches!(err, Err(PortError::Cancelled(_))));
+    assert!(
+        !run_cancel.is_cancelled(),
+        "pre-cancelled caller must not cancel active run"
+    );
+    assert!(running.check().is_ok());
+
+    // Zero-budget caller must fail with DeadlineExceeded without touching the active run.
+    let zero_budget = CallBudget {
+        request: RequestId::from_bytes([0x44; 16]),
+        cancellation: Cancellation::default(),
+        remaining: Duration::ZERO,
+    };
+    let err = hub.stop_and_drain_run(&space, &run_id, &zero_budget).await;
+    assert!(matches!(err, Err(PortError::DeadlineExceeded(_))));
+    assert!(
+        !run_cancel.is_cancelled(),
+        "zero-budget caller must not cancel active run"
+    );
+    assert!(running.check().is_ok());
+
+    // Short positive deadline when run does not drop must return DeadlineExceeded
+    // (NOT panic on OperationalFailure::new!).
+    let short_budget = CallBudget {
+        request: RequestId::from_bytes([0x45; 16]),
+        cancellation: Cancellation::default(),
+        remaining: Duration::from_millis(15),
+    };
+    let err = hub.stop_and_drain_run(&space, &run_id, &short_budget).await;
+    assert!(matches!(err, Err(PortError::DeadlineExceeded(_))));
+    assert!(run_cancel.is_cancelled());
+    drop(running);
+}

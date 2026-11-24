@@ -167,6 +167,24 @@ fn unknown(error: PortError) -> PortError {
     )
 }
 
+fn post_commit_link_error(error: PortError) -> PortError {
+    match unknown(error) {
+        PortError::Domain(domain) => PortError::Unavailable(
+            OperationalFailure::new(
+                derive_digest(
+                    "notarium.confirmed-link-receipt.v1",
+                    &[domain.code().as_bytes()],
+                ),
+                CommitEffect::Unknown,
+                RetryAdvice::RetrySameCommand,
+                true,
+            )
+            .expect("same-command retry has durable identity"),
+        ),
+        other => other,
+    }
+}
+
 pub(in crate::mcp) async fn describe_links(
     call: &ToolCallContext<'_>,
     plans: &[ProposalLink],
@@ -278,7 +296,7 @@ pub(in crate::mcp) async fn apply_links(
             // accidentally authorize the next link on content never reviewed.
             exact_link_revision(call, &scope, &plan.source, &persisted.receipt)
                 .await
-                .map_err(unknown)
+                .map_err(post_commit_link_error)
         }
         .await;
         match attempt {

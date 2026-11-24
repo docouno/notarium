@@ -431,10 +431,7 @@ impl KeeperScheduler {
                 at,
             )
         };
-        let fresh = clock
-            .map(clock_now)
-            .transpose()?
-            .map_or(now, |current| current.max(now));
+        let fresh = clock.map(clock_now).transpose()?.unwrap_or(now);
         let mut claim = ClaimSchedule {
             schedule: schedule.id.clone(),
             slot,
@@ -445,8 +442,10 @@ impl KeeperScheduler {
         owner.check()?;
         let control = self.inner.registry.control();
         let mut result = control.claim_schedule(ctx.clone(), claim.clone()).await;
+        let mut tried = std::collections::BTreeSet::from([claim.next_slot]);
         let mut cursor = fresh;
-        let mut tried_now_fallback = false;
+        let mut tried_now_probe = false;
+        let mut tried_slot_probe = false;
         const MAX_NEXT_SLOT_RETRIES: usize = 16;
         for _ in 0..MAX_NEXT_SLOT_RETRIES {
             if !matches!(&result, Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
@@ -457,55 +456,71 @@ impl KeeperScheduler {
             if cancellation.is_cancelled() || ownership_lost.is_cancelled() {
                 break;
             }
-            // If `fresh > now` (e.g., local poller clock slightly ahead of
-            // Control or backward NTP step), probe `next(now)` once before
-            // stepping forward.
-            let refreshed = if fresh > now && !tried_now_fallback {
-                tried_now_fallback = true;
-                let fallback = next(now)?;
-                if fallback != claim.next_slot {
-                    fallback
-                } else {
-                    let latest = if let Some(clock) = clock {
-                        clock_now(clock)?.max(now)
-                    } else if let Some(tick_started) = tick_started {
-                        advance_timestamp(now, tick_started.elapsed())?
+            let latest = if let Some(clock) = clock {
+                let current = clock_now(clock)?;
+                if current < slot {
+                    // Local clock stepped behind `slot`; advancing `next_slot` cannot satisfy `slot <= observed_at`.
+                    break;
+                }
+                current
+            } else if let Some(tick_started) = tick_started {
+                advance_timestamp(now, tick_started.elapsed())?
+            } else {
+                now
+            };
+            let refreshed = {
+                let latest_candidate = next(latest)?;
+                if !tried.contains(&latest_candidate) {
+                    cursor = latest;
+                    latest_candidate
+                } else if !tried_now_probe {
+                    tried_now_probe = true;
+                    let probe = next(now)?;
+                    if !tried.contains(&probe) {
+                        cursor = now.min(latest);
+                        probe
                     } else {
-                        now
-                    };
-                    cursor = cursor.max(latest);
+                        cursor = cursor.max(latest);
+                        let mut candidate = next(cursor)?;
+                        while tried.contains(&candidate) {
+                            let Some(next_ts) = candidate else {
+                                break;
+                            };
+                            cursor = cursor.max(next_ts);
+                            candidate = next(cursor)?;
+                        }
+                        candidate
+                    }
+                } else if !tried_slot_probe && slot < cursor {
+                    tried_slot_probe = true;
+                    let probe = next(slot)?;
+                    if !tried.contains(&probe) {
+                        cursor = slot;
+                        probe
+                    } else {
+                        let mut candidate = next(cursor)?;
+                        while tried.contains(&candidate) {
+                            let Some(next_ts) = candidate else {
+                                break;
+                            };
+                            cursor = cursor.max(next_ts);
+                            candidate = next(cursor)?;
+                        }
+                        candidate
+                    }
+                } else {
                     let mut candidate = next(cursor)?;
-                    if let Some(prev_next) = claim.next_slot
-                        && candidate.is_some_and(|next_ts| next_ts <= prev_next)
-                    {
-                        cursor = cursor.max(prev_next);
+                    while tried.contains(&candidate) {
+                        let Some(next_ts) = candidate else {
+                            break;
+                        };
+                        cursor = cursor.max(next_ts);
                         candidate = next(cursor)?;
                     }
                     candidate
                 }
-            } else {
-                // A clock crossing a cron boundary while waiting for a worker
-                // slot or during Control admission is a definite rejection.
-                // Recompute the next-slot witness from the latest clock/elapsed
-                // time under the same slot ownership fence.
-                let latest = if let Some(clock) = clock {
-                    clock_now(clock)?.max(now)
-                } else if let Some(tick_started) = tick_started {
-                    advance_timestamp(now, tick_started.elapsed())?
-                } else {
-                    now
-                };
-                cursor = cursor.max(latest);
-                let mut candidate = next(cursor)?;
-                if let Some(prev_next) = claim.next_slot
-                    && candidate.is_some_and(|next_ts| next_ts <= prev_next)
-                {
-                    cursor = cursor.max(prev_next);
-                    candidate = next(cursor)?;
-                }
-                candidate
             };
-            if refreshed == claim.next_slot {
+            if !tried.insert(refreshed) {
                 break;
             }
             owner.check()?;

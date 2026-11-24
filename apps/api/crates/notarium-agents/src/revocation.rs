@@ -628,6 +628,12 @@ impl RevocationHub {
         run: &AgentRunId,
         budget: &notarium_core::ports::CallBudget,
     ) -> Result<RollbackRunGuard, PortError> {
+        if budget.cancellation.is_cancelled() {
+            return Err(cancelled());
+        }
+        if budget.remaining.is_zero() {
+            return Err(deadline_exceeded());
+        }
         let deadline = Instant::now()
             .checked_add(budget.remaining)
             .ok_or_else(deadline_exceeded)?;
@@ -702,7 +708,7 @@ impl RevocationHub {
                         ),
                         CommitEffect::NotCommitted,
                         RetryAdvice::RetrySameCommand,
-                        false,
+                        true,
                     )
                     .expect("valid deadline failure"),
                 ));
@@ -716,7 +722,7 @@ impl RevocationHub {
                             ContentDigest::from_bytes(*blake3::hash(b"rollback run drain deadline").as_bytes()),
                             CommitEffect::NotCommitted,
                             RetryAdvice::RetrySameCommand,
-                            false,
+                            true,
                         )
                         .expect("valid deadline failure"),
                     ));

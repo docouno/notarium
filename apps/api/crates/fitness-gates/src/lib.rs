@@ -131,6 +131,7 @@ pub const CORE_RUNTIME_DEPENDENCIES: &[&str] = &[
 ];
 
 const FIXTURE_CRATES: &[&str] = &[
+    "notarium-agents",
     "notarium-canonical",
     "notarium-projections",
     "notarium-search",

@@ -765,6 +765,7 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
     let authored =
         args.description.is_some() || args.instructions.is_some() || args.attachments.is_some();
     let mut authored_changed = false;
+    let mut folder_ensured = false;
     let mut carrier_edited = false;
     let mut carrier_moved = false;
     let mut published = false;
@@ -829,6 +830,7 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
         if plan.promote {
             phase = "home";
             let parent = ability_folder(call, &plan.scope, None).await?;
+            folder_ensured = true;
             let settled = call
                 .registry
                 .engine
@@ -919,7 +921,7 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
             return Err(super::super::note_tools::batch_operational_error(
                 EDIT_LABEL,
                 error,
-                partial_package,
+                partial_package || folder_ensured,
             ));
         }
         for step in ["authored", "home", "availability", "enabled"] {

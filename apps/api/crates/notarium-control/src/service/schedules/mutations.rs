@@ -267,14 +267,30 @@ fn post_commit_schedule_read_error(error: PortError) -> PortError {
         .expect("same-command retry has durable identity")
     };
     match error {
-        PortError::Cancelled(f) if f.effect() == CommitEffect::Unknown => PortError::Cancelled(f),
-        PortError::DeadlineExceeded(f) if f.effect() == CommitEffect::Unknown => {
+        PortError::Cancelled(f)
+            if f.effect() == CommitEffect::Unknown
+                && f.retry() == notarium_core::error::RetryAdvice::RetrySameCommand =>
+        {
+            PortError::Cancelled(f)
+        }
+        PortError::DeadlineExceeded(f)
+            if f.effect() == CommitEffect::Unknown
+                && f.retry() == notarium_core::error::RetryAdvice::RetrySameCommand =>
+        {
             PortError::DeadlineExceeded(f)
         }
-        PortError::Unavailable(f) if f.effect() == CommitEffect::Unknown => {
+        PortError::Unavailable(f)
+            if f.effect() == CommitEffect::Unknown
+                && f.retry() == notarium_core::error::RetryAdvice::RetrySameCommand =>
+        {
             PortError::Unavailable(f)
         }
-        PortError::Internal(f) if f.effect() == CommitEffect::Unknown => PortError::Internal(f),
+        PortError::Internal(f)
+            if f.effect() == CommitEffect::Unknown
+                && f.retry() == notarium_core::error::RetryAdvice::RetrySameCommand =>
+        {
+            PortError::Internal(f)
+        }
         PortError::Cancelled(_) => PortError::Cancelled(make()),
         PortError::DeadlineExceeded(_) => PortError::DeadlineExceeded(make()),
         PortError::Unavailable(_) => PortError::Unavailable(make()),

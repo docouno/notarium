@@ -400,29 +400,34 @@ impl ControlService {
             Ok((revision, current, saved.value))
         }, CommitEffect::NotCommitted).await?;
         budget.run(tx.commit(), CommitEffect::Unknown).await?;
-        let mut rtx = self.store.read(budget.clone()).await?;
-        let loaded = budget
-            .run(
-                self.load_started_db(rtx.inner_mut(), &current, started_value),
-                CommitEffect::Unknown,
-            )
-            .await;
-        budget.run(rtx.finish(), CommitEffect::Unknown).await?;
-        let value = match loaded? {
-            LoadedStartedDb::New(ep) => EpisodeStartResult::New(
-                self.finish_episode_projection(&budget, CommitEffect::Unknown, &current, ep)
-                    .await?,
-            ),
-            LoadedStartedDb::Resumed(ep) => EpisodeStartResult::Resumed(
-                self.finish_episode_projection(&budget, CommitEffect::Unknown, &current, ep)
-                    .await?,
-            ),
-            LoadedStartedDb::Forked(ep) => EpisodeStartResult::Forked(
-                self.finish_episode_projection(&budget, CommitEffect::Unknown, &current, ep)
-                    .await?,
-            ),
-            LoadedStartedDb::Ambiguous(choices) => EpisodeStartResult::Ambiguous(choices),
-        };
+        let value = async {
+            let mut rtx = self.store.read(budget.clone()).await?;
+            let loaded = budget
+                .run(
+                    self.load_started_db(rtx.inner_mut(), &current, started_value),
+                    CommitEffect::Unknown,
+                )
+                .await;
+            budget.run(rtx.finish(), CommitEffect::Unknown).await?;
+            let value = match loaded? {
+                LoadedStartedDb::New(ep) => EpisodeStartResult::New(
+                    self.finish_episode_projection(&budget, CommitEffect::Unknown, &current, ep)
+                        .await?,
+                ),
+                LoadedStartedDb::Resumed(ep) => EpisodeStartResult::Resumed(
+                    self.finish_episode_projection(&budget, CommitEffect::Unknown, &current, ep)
+                        .await?,
+                ),
+                LoadedStartedDb::Forked(ep) => EpisodeStartResult::Forked(
+                    self.finish_episode_projection(&budget, CommitEffect::Unknown, &current, ep)
+                        .await?,
+                ),
+                LoadedStartedDb::Ambiguous(choices) => EpisodeStartResult::Ambiguous(choices),
+            };
+            Ok(value)
+        }
+        .await
+        .map_err(post_commit_episode_read_error)?;
         Ok(ControlCommit { value, revision })
     }
     pub async fn named_episode_project_hint(
@@ -435,7 +440,8 @@ impl ControlService {
         let (mut tx, auth) = self
             .open_revalidated_read(&budget, &ctx.budget.request, ctx.auth())
             .await?;
-        let result = budget
+        let current = AccountContext::new(auth, budget.context(ctx.budget.request.clone()));
+        let preview = budget
             .run(
                 async {
                     let matches = rows!(
@@ -444,7 +450,7 @@ impl ControlService {
                         fetch_all,
                         "SELECT * FROM agent_episodes WHERE owner_id=$1 AND name=$2 AND lifecycle<>'closed' ORDER BY episode_id LIMIT 2",
                         "SELECT * FROM v1_control.agent_episodes WHERE owner_id=$1 AND name=$2 AND lifecycle<>'closed' ORDER BY episode_id LIMIT 2";
-                        auth.principal().as_str(),
+                        current.auth().principal().as_str(),
                         &episode_name
                     )?;
                     match matches.len() {
@@ -459,7 +465,22 @@ impl ControlService {
             )
             .await;
         budget.run(tx.finish(), CommitEffect::NotCommitted).await?;
-        result
+        match preview? {
+            NamedEpisodePreview::Unique(Some(reference)) => {
+                match budget
+                    .run(
+                        self.catalog_project(&current, &reference),
+                        CommitEffect::NotCommitted,
+                    )
+                    .await
+                {
+                    Ok(_) => Ok(NamedEpisodePreview::Unique(Some(reference))),
+                    Err(error) if hidden(&error) => Ok(NamedEpisodePreview::ProjectUnavailable),
+                    Err(error) => Err(error),
+                }
+            }
+            other => Ok(other),
+        }
     }
     pub async fn update_episode(
         &self,
@@ -675,17 +696,20 @@ impl ControlService {
             Ok((revision, current, saved.value))
         }, CommitEffect::NotCommitted).await?;
         budget.run(tx.commit(), CommitEffect::Unknown).await?;
-        let mut rtx = self.store.read(budget.clone()).await?;
-        let loaded = budget
-            .run(
-                self.load_episode_db(rtx.inner_mut(), &current, &saved_id),
-                CommitEffect::Unknown,
-            )
-            .await;
-        budget.run(rtx.finish(), CommitEffect::Unknown).await?;
-        let value = self
-            .finish_episode_projection(&budget, CommitEffect::Unknown, &current, loaded?)
-            .await?;
+        let value = async {
+            let mut rtx = self.store.read(budget.clone()).await?;
+            let loaded = budget
+                .run(
+                    self.load_episode_db(rtx.inner_mut(), &current, &saved_id),
+                    CommitEffect::Unknown,
+                )
+                .await;
+            budget.run(rtx.finish(), CommitEffect::Unknown).await?;
+            self.finish_episode_projection(&budget, CommitEffect::Unknown, &current, loaded?)
+                .await
+        }
+        .await
+        .map_err(post_commit_episode_read_error)?;
         Ok(ControlCommit { revision, value })
     }
     /// Trusted accepted-call path. It cannot change role, project or acknowledgements.
@@ -729,5 +753,51 @@ impl ControlService {
             )
             .await?;
         budget.run(tx.commit(), CommitEffect::Unknown).await
+    }
+}
+
+fn post_commit_episode_read_error(error: PortError) -> PortError {
+    let diagnostic = ContentDigest::from_bytes(
+        *blake3::hash(format!("episode-post-commit-read:{}", error.code()).as_bytes()).as_bytes(),
+    );
+    let make = || {
+        notarium_core::error::OperationalFailure::new(
+            diagnostic,
+            CommitEffect::Unknown,
+            notarium_core::error::RetryAdvice::RetrySameCommand,
+            true,
+        )
+        .expect("same-command retry has durable identity")
+    };
+    match error {
+        PortError::Cancelled(f)
+            if f.effect() == CommitEffect::Unknown
+                && f.retry() == notarium_core::error::RetryAdvice::RetrySameCommand =>
+        {
+            PortError::Cancelled(f)
+        }
+        PortError::DeadlineExceeded(f)
+            if f.effect() == CommitEffect::Unknown
+                && f.retry() == notarium_core::error::RetryAdvice::RetrySameCommand =>
+        {
+            PortError::DeadlineExceeded(f)
+        }
+        PortError::Unavailable(f)
+            if f.effect() == CommitEffect::Unknown
+                && f.retry() == notarium_core::error::RetryAdvice::RetrySameCommand =>
+        {
+            PortError::Unavailable(f)
+        }
+        PortError::Internal(f)
+            if f.effect() == CommitEffect::Unknown
+                && f.retry() == notarium_core::error::RetryAdvice::RetrySameCommand =>
+        {
+            PortError::Internal(f)
+        }
+        PortError::Cancelled(_) => PortError::Cancelled(make()),
+        PortError::DeadlineExceeded(_) => PortError::DeadlineExceeded(make()),
+        PortError::Unavailable(_) => PortError::Unavailable(make()),
+        PortError::Internal(_) => PortError::Internal(make()),
+        PortError::Domain(domain) => PortError::Domain(domain),
     }
 }

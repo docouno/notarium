@@ -538,19 +538,24 @@ async fn create_draft(
         carrier_with_links(&prepared.carrier, link_lines(&links, &BTreeMap::new())?)?;
     let (committed, parent) =
         execute(call, placement, &prepared, carrier.clone(), committed_any).await?;
+    let post_commit_integrity = |reason: &str| {
+        PortError::Unavailable(
+            OperationalFailure::new(
+                derive_digest("notarium.mcp.create-notes-batch.v1", &[reason.as_bytes()]),
+                CommitEffect::Unknown,
+                RetryAdvice::RetrySameCommand,
+                true,
+            )
+            .expect("same-command retry has durable identity"),
+        )
+    };
     placement
         .write_scope
         .scope()
         .check(committed.receipt.scope())
-        .map_err(|error| {
-            batch_operational_error("notarium.mcp.create-notes-batch.v1", error.into(), true)
-        })?;
+        .map_err(|_| post_commit_integrity("receipt_scope_mismatch"))?;
     if committed.value.note != prepared.note {
-        return Err(batch_operational_error(
-            "notarium.mcp.create-notes-batch.v1",
-            invalid(ValidationReason::SourceMismatch),
-            true,
-        ));
+        return Err(post_commit_integrity("receipt_note_mismatch"));
     }
     Ok(CreatedDraft {
         prepared,

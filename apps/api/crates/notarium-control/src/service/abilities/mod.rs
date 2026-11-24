@@ -920,7 +920,7 @@ impl ControlService {
                     )
                     .await;
                 budget.run(rtx.finish(), CommitEffect::NotCommitted).await?;
-                let (value, effective_project) = match budget
+                let (value, followed_reference, effective_project) = match budget
                     .run(
                         async {
                             if let Some(project) = &project {
@@ -969,33 +969,53 @@ impl ControlService {
                                 }
                                 Err(error) => return Err(error),
                             };
-                            if value.reference != reference {
-                                return Ok(Err(AbilityResolution::Stale));
-                            }
                             let effective = match &reference.placement {
                                 AbilityPlacement::OwnedProject(placement) => {
                                     Some(placement.clone())
                                 }
                                 _ => project,
                             };
-                            Ok(Ok((value, effective)))
+                            Ok(Ok((value, reference, effective)))
                         },
                         CommitEffect::NotCommitted,
                     )
                     .await?
                 {
-                    Ok(pair) => pair,
+                    Ok(triple) => triple,
                     Err(early) => return Ok(early),
                 };
                 let mut rtx = self.store.read(budget.clone()).await?;
-                let overlaid = budget
+                let resolved = budget
                     .run(
-                        self.overlay(rtx.inner_mut(), &current, value, effective_project.as_ref()),
+                        async {
+                            if !self
+                                .promotion_is_committed(
+                                    rtx.inner_mut(),
+                                    value.promoted_from.as_ref(),
+                                    &value.reference.identity(),
+                                )
+                                .await?
+                            {
+                                return Ok(AbilityResolution::Missing);
+                            }
+                            if value.reference != followed_reference {
+                                return Ok(AbilityResolution::Stale);
+                            }
+                            let overlaid = self
+                                .overlay(
+                                    rtx.inner_mut(),
+                                    &current,
+                                    value,
+                                    effective_project.as_ref(),
+                                )
+                                .await?;
+                            Ok(classify_resolution(Some(overlaid), None))
+                        },
                         CommitEffect::NotCommitted,
                     )
                     .await;
                 budget.run(rtx.finish(), CommitEffect::NotCommitted).await?;
-                Ok(classify_resolution(Some(overlaid?), None))
+                resolved
             }
             AbilitySelection::Name {
                 kind,

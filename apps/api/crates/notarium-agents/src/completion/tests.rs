@@ -175,22 +175,43 @@ fn tight_8k_multi_tool_budget_never_overshoots_and_utf8_search_keeps_full_char()
             arguments: BTreeMap::from([("ref".into(), serde_json::json!(format!("note-{i}")))]),
         })
         .collect();
-    let (max_bytes, max_tokens) =
-        step_tool_display_budget(8_192, 4_500, "Calling 64 tools.", &calls);
+    let assistant_text = "Calling 64 tools.";
+    let assistant_tokens = completion_text_estimate(assistant_text)
+        + calls
+            .iter()
+            .map(|call| {
+                let args = serde_json::to_string(&call.arguments).unwrap();
+                8 + completion_text_estimate(&call.name) + completion_text_estimate(&args)
+            })
+            .sum::<u64>();
+    // With fixed_tokens = 5_800 and assistant_tokens ~= 1_598 on an 8_192 window,
+    // headroom is ~794 tokens (enough for 64 * 4 framing tokens + small outputs);
+    // an unconditional `.max(16)` floor per tool would overshoot 8_192
+    // (5_800 + 1_598 + 20 * 64 = 8_678 > 8_192).
+    let (max_bytes, max_tokens) = step_tool_display_budget(8_192, 5_800, assistant_text, &calls);
+    assert!(
+        max_tokens > 0 && max_tokens < 16,
+        "tight 8k 64-tool budget must stay positive yet drop below 16 tokens per tool, got {max_tokens}"
+    );
     let sample = "alpha beta gamma ".repeat(100);
     let rendered = bounded_tool_text_within(&sample, max_bytes, max_tokens);
+    assert!(!rendered.is_empty());
     let rendered_tokens = completion_text_estimate(&rendered);
     assert!(rendered_tokens <= max_tokens);
     let per_tool_total = (4 + rendered_tokens) * 64;
     assert!(
-        4_500 + per_tool_total <= 8_192,
-        "64 tool outputs must not overshoot 8k window (total {})",
-        4_500 + per_tool_total
+        5_800 + assistant_tokens + per_tool_total <= 8_192,
+        "64 tool outputs plus assistant message must not overshoot 8k window (total {})",
+        5_800 + assistant_tokens + per_tool_total
     );
 
-    // 4-byte emoji followed by 2-byte accented char: boundary 4 must be kept when it fits.
+    // 4-byte emoji followed by 2-byte accented char (6 bytes total, 2 tokens):
+    // pass max_bytes = pair.len() (6) so end = 6 fails fits() and enters the binary
+    // search loop where mid = 3 -> floor_char_boundary = 0 == lo must probe
+    // ceil_char_boundary(1) = 4 and keep the full emoji instead of returning empty.
     let pair = "\u{1F4D3}\u{00E9}";
     let emoji_tokens = completion_text_estimate("\u{1F4D3}");
-    let clipped = bounded_tool_text_within(pair, 4, emoji_tokens);
+    assert!(completion_text_estimate(pair) > emoji_tokens);
+    let clipped = bounded_tool_text_within(pair, pair.len(), emoji_tokens);
     assert_eq!(clipped, "\u{1F4D3}");
 }

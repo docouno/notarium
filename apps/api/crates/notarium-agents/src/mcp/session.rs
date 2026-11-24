@@ -336,12 +336,15 @@ async fn start(call: &mut ToolCallContext<'_>, args: StartArgs) -> Result<Value,
             "delta": delta::resume(call, continuation, args.delivery_receipt.as_deref(), args.acknowledge).await?
         }));
     }
+    let mut committed_any = false;
     if let Some(receipt) = args.delivery_receipt.as_deref() {
         let acknowledged = delta::deliver(call, receipt, args.acknowledge).await?;
+        committed_any |= acknowledged;
         if !new_selection {
             return Ok(json!({ "acknowledged": acknowledged }));
         }
     }
+    const SESSION_LABEL: &str = "notarium.mcp.start-session.v1";
     let requested = derive_episode_id(call);
     let selector = selector(
         args.session.as_ref(),
@@ -371,9 +374,14 @@ async fn start(call: &mut ToolCallContext<'_>, args: StartArgs) -> Result<Value,
                 project,
             })
         })
-        .await?;
+        .await
+        .map_err(|error| {
+            super::note_tools::batch_operational_error(SESSION_LABEL, error, committed_any)
+        })?;
     if let Some(project) = &plan.project {
-        project_for_folder(call, project).await?;
+        project_for_folder(call, project).await.map_err(|error| {
+            super::note_tools::batch_operational_error(SESSION_LABEL, error, committed_any)
+        })?;
     }
     if let Some(role_selector) = args.role.as_deref() {
         let preview_project = if plan.project.is_some() {
@@ -385,17 +393,43 @@ async fn start(call: &mut ToolCallContext<'_>, args: StartArgs) -> Result<Value,
                         .registry
                         .control
                         .get_episode(call.account(), id.clone())
-                        .await?;
-                    Some(selected_project_for_episode(call, None, Some(&episode)).await?)
+                        .await
+                        .map_err(|error| {
+                            super::note_tools::batch_operational_error(
+                                SESSION_LABEL,
+                                error,
+                                committed_any,
+                            )
+                        })?;
+                    Some(
+                        selected_project_for_episode(call, None, Some(&episode))
+                            .await
+                            .map_err(|error| {
+                                super::note_tools::batch_operational_error(
+                                    SESSION_LABEL,
+                                    error,
+                                    committed_any,
+                                )
+                            })?,
+                    )
                 }
                 EpisodeSelector::Name(name) => match call
                     .registry
                     .control
                     .named_episode_project_hint(call.account(), name.clone())
-                    .await?
-                {
+                    .await
+                    .map_err(|error| {
+                        super::note_tools::batch_operational_error(
+                            SESSION_LABEL,
+                            error,
+                            committed_any,
+                        )
+                    })? {
                     NamedEpisodePreview::NoMatch => Some(None),
                     NamedEpisodePreview::Unique(project) => Some(project),
+                    NamedEpisodePreview::ProjectUnavailable => {
+                        return Err(DomainError::ResourceNotFound.into());
+                    }
                     NamedEpisodePreview::Ambiguous => None,
                 },
                 EpisodeSelector::New { .. } => Some(None),
@@ -403,7 +437,10 @@ async fn start(call: &mut ToolCallContext<'_>, args: StartArgs) -> Result<Value,
         };
         if let Some(preview_project) = preview_project {
             ability_tools::validate_session_role(call, role_selector, preview_project.as_ref())
-                .await?;
+                .await
+                .map_err(|error| {
+                    super::note_tools::batch_operational_error(SESSION_LABEL, error, committed_any)
+                })?;
         }
     }
     let selector = match selector {
@@ -427,7 +464,10 @@ async fn start(call: &mut ToolCallContext<'_>, args: StartArgs) -> Result<Value,
                 },
             },
         )
-        .await?;
+        .await
+        .map_err(|error| {
+            super::note_tools::batch_operational_error(SESSION_LABEL, error, committed_any)
+        })?;
     let (episode, state) = match opened.value {
         EpisodeStartResult::New(episode) => (episode, "new"),
         EpisodeStartResult::Resumed(episode) => (episode, "resumed"),
@@ -440,118 +480,123 @@ async fn start(call: &mut ToolCallContext<'_>, args: StartArgs) -> Result<Value,
             return Ok(json!({ "recentSessions": recent }));
         }
     };
-    check_requested_project(plan.project.as_ref(), &episode)?;
-    if let Some(project) = &episode.project_hint {
-        project_for_folder(call, project).await?;
-    }
-    let role = ability_tools::activate_session_role(call, &episode, args.role.as_deref()).await?;
-    let context = call
-        .registry
-        .control
-        .bootstrap_context(
-            call.account(),
-            episode.id.clone(),
-            None,
-            ControlPageRequest::new(20, None)?,
-        )
-        .await?;
-    if context.episode.project_hint != episode.project_hint {
-        return Err(invalid(ValidationReason::ScopeMismatch));
-    }
-    let abilities = ability_tools::session_ability_summaries(call, &context.episode).await?;
+    async {
+        check_requested_project(plan.project.as_ref(), &episode)?;
+        if let Some(project) = &episode.project_hint {
+            project_for_folder(call, project).await?;
+        }
+        let role =
+            ability_tools::activate_session_role(call, &episode, args.role.as_deref()).await?;
+        let context = call
+            .registry
+            .control
+            .bootstrap_context(
+                call.account(),
+                episode.id.clone(),
+                None,
+                ControlPageRequest::new(20, None)?,
+            )
+            .await?;
+        if context.episode.project_hint != episode.project_hint {
+            return Err(invalid(ValidationReason::ScopeMismatch));
+        }
+        let abilities = ability_tools::session_ability_summaries(call, &context.episode).await?;
 
-    let mut selection = Vec::new();
-    let mut favorites = Vec::new();
-    let mut remaining = match args.response_format {
-        Format::Concise => 12 * 1024,
-        Format::Detailed => 32 * 1024,
-    };
-    for reference in &context.selection.pinned {
-        if let Some(note) = bootstrap_note(call, reference).await? {
-            let body = ClassEgressFence::mcp_note(&note.document, call.account().auth())?;
-            let summary = bounded_text(body, remaining.min(4096));
-            remaining -= summary.len();
-            selection.push(json!({
-                "noteId": reference.note_id,
-                "spaceId": reference.space_id,
-                "revision": note.document.revision(),
-                "title": note.provenance.as_ref().map(|facts| &facts.title),
-                "content": summary,
-                "truncated": summary.len() < body.len(),
-            }));
+        let mut selection = Vec::new();
+        let mut favorites = Vec::new();
+        let mut remaining = match args.response_format {
+            Format::Concise => 12 * 1024,
+            Format::Detailed => 32 * 1024,
+        };
+        for reference in &context.selection.pinned {
+            if let Some(note) = bootstrap_note(call, reference).await? {
+                let body = ClassEgressFence::mcp_note(&note.document, call.account().auth())?;
+                let summary = bounded_text(body, remaining.min(4096));
+                remaining -= summary.len();
+                selection.push(json!({
+                    "noteId": reference.note_id,
+                    "spaceId": reference.space_id,
+                    "revision": note.document.revision(),
+                    "title": note.provenance.as_ref().map(|facts| &facts.title),
+                    "content": summary,
+                    "truncated": summary.len() < body.len(),
+                }));
+            }
         }
-    }
-    for reference in &context.selection.favorites {
-        if let Some(note) = bootstrap_note_metadata(call, reference).await? {
-            favorites.push(json!({
-                "noteId": reference.note_id,
-                "spaceId": reference.space_id,
-                "revision": note.metadata.revision(),
-                "title": note.provenance.as_ref().map(|facts| &facts.title),
-            }));
+        for reference in &context.selection.favorites {
+            if let Some(note) = bootstrap_note_metadata(call, reference).await? {
+                favorites.push(json!({
+                    "noteId": reference.note_id,
+                    "spaceId": reference.space_id,
+                    "revision": note.metadata.revision(),
+                    "title": note.provenance.as_ref().map(|facts| &facts.title),
+                }));
+            }
         }
-    }
-    let diagnostics: Vec<&str> = context
-        .episode
-        .diagnostics
-        .iter()
-        .map(|diag| match diag {
-            EpisodeDiagnostic::ProjectUnavailable => "project_unavailable",
-            EpisodeDiagnostic::RoleUnavailable => "role_unavailable",
-        })
-        .collect();
-    let mut session = json!({
-        "id": episode.id,
-        "name": episode.name,
-        "state": state,
-        "parentId": episode.parent,
-    });
-    if !diagnostics.is_empty() {
-        session["diagnostics"] = json!(diagnostics);
-    }
-    let mut output = json!({
-        "session": session,
-        "profile": { "alwaysLoad": selection, "favorites": favorites, "truncated": context.continuation.is_some() },
-        "abilities": abilities["items"],
-    });
-    if let Some(next_action) = abilities.get("nextAction").filter(|value| !value.is_null()) {
-        output["nextAction"] = next_action.clone();
-    }
-    if !abilities["nextCursor"].is_null() {
-        output["abilitiesTruncated"] = json!(true);
-    }
-    if let Some(role) = role {
-        output["activeRole"] = role;
-    }
-    if let Some(project) = &episode.project_hint {
-        output["project"] = project_bundle(call, project).await?;
-    }
-    let (owner, acknowledgements, allow_ack) = if args.session.is_some() {
-        (
-            AckOwner::Episode(episode.id.clone()),
-            &context.episode.acknowledgements,
-            args.acknowledge,
-        )
-    } else {
-        // Read-scoped bearers may acknowledge only their own episode cursor,
-        // never advancing the account-wide baseline.
-        let allow_ack = args.acknowledge && call.auth.bearer_scope() != Some(BearerScope::Read);
-        (
-            AckOwner::Account,
-            &context.owner_acknowledgements,
+        let diagnostics: Vec<&str> = context
+            .episode
+            .diagnostics
+            .iter()
+            .map(|diag| match diag {
+                EpisodeDiagnostic::ProjectUnavailable => "project_unavailable",
+                EpisodeDiagnostic::RoleUnavailable => "role_unavailable",
+            })
+            .collect();
+        let mut session = json!({
+            "id": episode.id,
+            "name": episode.name,
+            "state": state,
+            "parentId": episode.parent,
+        });
+        if !diagnostics.is_empty() {
+            session["diagnostics"] = json!(diagnostics);
+        }
+        let mut output = json!({
+            "session": session,
+            "profile": { "alwaysLoad": selection, "favorites": favorites, "truncated": context.continuation.is_some() },
+            "abilities": abilities["items"],
+        });
+        if let Some(next_action) = abilities.get("nextAction").filter(|value| !value.is_null()) {
+            output["nextAction"] = next_action.clone();
+        }
+        if !abilities["nextCursor"].is_null() {
+            output["abilitiesTruncated"] = json!(true);
+        }
+        if let Some(role) = role {
+            output["activeRole"] = role;
+        }
+        if let Some(project) = &episode.project_hint {
+            output["project"] = project_bundle(call, project).await?;
+        }
+        let (owner, acknowledgements, allow_ack) = if args.session.is_some() {
+            (
+                AckOwner::Episode(episode.id.clone()),
+                &context.episode.acknowledgements,
+                args.acknowledge,
+            )
+        } else {
+            // Read-scoped bearers may acknowledge only their own episode cursor,
+            // never advancing the account-wide baseline.
+            let allow_ack = args.acknowledge && call.auth.bearer_scope() != Some(BearerScope::Read);
+            (
+                AckOwner::Account,
+                &context.owner_acknowledgements,
+                allow_ack,
+            )
+        };
+        output["delta"] = delta::open(
+            call,
+            episode.id,
+            owner,
+            episode.project_hint,
+            acknowledgements,
             allow_ack,
         )
-    };
-    output["delta"] = delta::open(
-        call,
-        episode.id,
-        owner,
-        episode.project_hint,
-        acknowledgements,
-        allow_ack,
-    )
-    .await?;
-    Ok(output)
+        .await?;
+        Ok(output)
+    }
+    .await
+    .map_err(|error| super::note_tools::batch_operational_error(SESSION_LABEL, error, true))
 }
 
 fn selector(

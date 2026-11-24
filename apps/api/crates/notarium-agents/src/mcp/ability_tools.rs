@@ -290,9 +290,6 @@ async fn raw_reference_for_account(
     if candidates.is_empty() {
         return Ok(None);
     }
-    if candidates.len() == 1 {
-        return Ok(Some(candidates.into_iter().next().unwrap().reference));
-    }
     let mut visible = None;
     for candidate in candidates {
         match registry

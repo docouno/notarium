@@ -29,9 +29,11 @@ read-only pool; PostgreSQL separates a 6-connection write/export pool from a
 queue, and per-operation `SET LOCAL statement_timeout` and
 `idle_in_transaction_session_timeout`. SQL migrations
 reject unknown migration versions. Both dialects preserve the baseline
-migration and add bearer and schedule authority in migration `0002`. Existing
-bearers default to no ability-authoring opt-in. Existing schedules with
-unverified skill approvals require explicit review before a provider call.
+migration `0001` and add bearer, schedule, and provider call-run index
+authority (`call_run` on `provider_call_log(run_id, call_id)`) in migration
+`0002`. Existing bearers default to no ability-authoring opt-in. Existing
+schedules with unverified skill approvals require explicit review before a
+provider call.
 
 Read-only queries and fast-path credential resolution (`ControlStore::read()`)
 use read-only transactions (`BEGIN DEFERRED` on SQLite read pool, `BEGIN READ ONLY`
@@ -516,6 +518,11 @@ fails instead of silently switching providers.
 
 Search embeddings use either a typed query or source-bound parts. Query
 admission checks the caller's taint, requested classes, and project scope.
+For `AgentRun` and `Keeper` callers with recorded provider calls, query
+admission also checks `provider_call_log` (`policy_epochs` v2, indexed by
+`call_run`) so the remote embedding provider covers every non-encrypted class
+and respects the project confinement previously disclosed to that run; missing,
+unparseable, legacy v1, or overflow (>64 rows) call-log entries fail closed.
 For a folder-scoped query with project consent, the canonical egress lease
 pins the requested folder's current membership in that project through dispatch.
 An implicit call registers for changes to the Space's effective search recipient.

@@ -3026,6 +3026,7 @@ pub(super) async fn prepare_agent_run_rollback(
             Box::pin(async move {
                 let record = load_space_record(tx, &scope.space_id).await?;
                 record.scope.check(&scope)?;
+                ensure_chat_run_not_active_tx(tx, &scope.space_id, &run).await?;
                 let input = prepare_rollback_sources_tx(tx, &record, &auth, run, false).await?;
                 Ok((input, record.active_epoch))
             })

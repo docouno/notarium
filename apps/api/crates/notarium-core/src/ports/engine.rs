@@ -304,6 +304,12 @@ pub trait SearchRecipient: Send + Sync {
     fn query_source_classes(&self) -> Option<std::collections::BTreeSet<crate::classes::DocClass>> {
         None
     }
+    /// Project confinement of the calling model's provider policy when authoring
+    /// this query: `Some(Some(project))` when confined to `project`, `Some(None)`
+    /// when Space-wide/unconfined, or `None` when not an in-app provider call.
+    fn query_source_project(&self) -> Option<Option<FolderRef>> {
+        None
+    }
 }
 
 pub trait SearchPort: Send + Sync {

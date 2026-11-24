@@ -720,6 +720,9 @@ impl CanonicalStore {
 }
 
 fn authorize_chat_write_on_space(auth: &EngineAuthContext, space: &Space) -> Result<(), PortError> {
+    if space.lifecycle != SpaceLifecycle::Active {
+        return Err(DomainError::ResourceNotFound.into());
+    }
     auth.authorize_write_space_pin(space)?;
     if auth.spaces()[&space.id].project_root.is_some()
         && auth.keeper_log().is_none()
@@ -796,24 +799,17 @@ fn authorize_thread_mutation(
     if space.lifecycle != SpaceLifecycle::Active || !auth.spaces().contains_key(&space.id) {
         return Err(DomainError::ResourceNotFound.into());
     }
-    if th.kind == ChatThreadKind::Personal && th.owner != *auth.principal() {
-        return Err(DomainError::ResourceNotFound.into());
-    }
-    if th.kind == ChatThreadKind::KeeperLog
-        && auth.keeper_log() != Some(&th.thread_id)
-        && auth
-            .can_view_chat_thread(
-                space,
-                &th.thread_id,
-                th.kind,
-                &th.owner,
-                th.project_folder.as_ref(),
-                tainted,
-            )
-            .is_err()
-    {
-        return Err(DomainError::ResourceNotFound.into());
-    }
+    // Verify visibility and Personal-chat/KeeperLog/project-scope read access
+    // BEFORE returning SpaceReadOnly or CrossSpaceTainted so callers cannot
+    // distinguish invisible threads from absent threads.
+    auth.can_view_chat_thread(
+        space,
+        &th.thread_id,
+        th.kind,
+        &th.owner,
+        th.project_folder.as_ref(),
+        false,
+    )?;
     if (matches!(auth.kind(), PrincipalKind::Keeper(_)) || auth.keeper_log().is_some())
         && (th.kind != ChatThreadKind::KeeperLog
             || auth.keeper_log() != Some(&th.thread_id)
@@ -835,8 +831,6 @@ fn authorize_thread_mutation(
     {
         return Err(DomainError::SpaceReadOnly.into());
     }
-    // Verify visibility and Personal-chat ownership before taint checks so a
-    // tainted caller cannot distinguish a foreign Personal thread from absent.
     auth.can_view_chat_thread(
         space,
         &th.thread_id,
@@ -3063,6 +3057,11 @@ async fn fork_chat_impl(
 
                 let th = load_thread_head_tx(tx, &scope.space_id, &input.thread).await?;
                 authorize_thread_mutation(&auth, &live_space.space, &th, false)?;
+                if th.kind == ChatThreadKind::KeeperLog
+                    && !matches!(auth.kind(), PrincipalKind::Keeper(_))
+                {
+                    return Err(DomainError::SpaceReadOnly.into());
+                }
                 if th.active_run_id.is_some() || auth.taint().is_tainted() {
                     return Err(DomainError::validation(ValidationReason::InvalidState).into());
                 }
@@ -3258,7 +3257,9 @@ async fn append_chat_impl(
         ctx.auth().kind(),
         PrincipalKind::AgentRun(_) | PrincipalKind::Keeper(_)
     );
-    if is_run && request.input.kind == ChatEntryKind::Human {
+    if request.input.kind == ChatEntryKind::Human
+        && ctx.auth().kind() != &PrincipalKind::DirectHuman
+    {
         return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
     }
     if (!request.input.tool_calls.is_empty()
@@ -3511,6 +3512,9 @@ async fn append_chat_tx(
 
     let th = load_thread_head_tx(tx, &scope.space_id, &input.thread).await?;
     authorize_thread_mutation(&auth, &live_space.space, &th, false)?;
+    if th.kind == ChatThreadKind::KeeperLog && !matches!(auth.kind(), PrincipalKind::Keeper(_)) {
+        return Err(DomainError::SpaceReadOnly.into());
+    }
     if let PrincipalKind::AgentRun(run) = auth.kind() {
         queue::authorize_run_claim(store, &live_space, &th, run)?;
     }
@@ -3988,6 +3992,9 @@ async fn check_queue_admission_tx(
     forbid_project_agent_run(auth, &live_space.space)?;
     authorize_chat_replay_tx(tx, &live_space.space, auth, thread, Some(base), false).await?;
     let head = load_thread_head_tx(tx, &scope.space_id, thread).await?;
+    if head.kind == ChatThreadKind::KeeperLog {
+        return Err(DomainError::SpaceReadOnly.into());
+    }
     if queue::authorize_run_claim(store, &live_space, &head, expected_run).is_err() {
         return Ok(None);
     }
@@ -4520,6 +4527,11 @@ async fn consume_chat_input_impl(
 
                 let th = load_thread_head_tx(tx, &scope.space_id, &input.thread).await?;
                 authorize_thread_mutation(&auth, &live_space.space, &th, false)?;
+                if th.kind == ChatThreadKind::KeeperLog
+                    && !matches!(auth.kind(), PrincipalKind::Keeper(_))
+                {
+                    return Err(DomainError::SpaceReadOnly.into());
+                }
                 queue::authorize_run_claim(
                     &owner_store,
                     &live_space,

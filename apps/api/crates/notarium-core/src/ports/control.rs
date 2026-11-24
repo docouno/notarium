@@ -298,6 +298,7 @@ pub enum EpisodeDiagnostic {
 pub enum NamedEpisodePreview {
     NoMatch,
     Unique(Option<FolderRef>),
+    ProjectUnavailable,
     Ambiguous,
 }
 #[derive(Clone, Debug)]

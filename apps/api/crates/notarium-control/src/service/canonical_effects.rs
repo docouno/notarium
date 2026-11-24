@@ -6,8 +6,8 @@ use notarium_core::{
     classes::DocClass,
     error::{CommitEffect, PortError, ValidationReason},
     ports::{
-        AccountContext, BearerScope, CanonicalEffect, MaintenanceContext, ServiceAuthority,
-        ServicePurpose, SpaceContext,
+        AccountContext, BearerScope, CanonicalEffect, MaintenanceContext, RevocationSelector,
+        ServiceAuthority, ServicePurpose, SpaceContext,
     },
 };
 
@@ -68,10 +68,16 @@ impl ControlService {
         }
         let target = &ctx.scope().space_id;
         let spaces = std::iter::once(target).chain(source.map(|scope| &scope.space_id));
-        let selectors = authority
-            .selectors_for_revocation(spaces)?
-            .into_iter()
-            .collect();
+        let mut selectors = authority.selectors_for_revocation(spaces)?;
+        if let PrincipalKind::AgentRun(run) | PrincipalKind::Keeper(run) = ctx.auth().kind()
+            && let Some(space) = ctx.auth().pinned_write_space()
+        {
+            selectors.insert(RevocationSelector::AgentRun {
+                space: space.clone(),
+                run: run.clone(),
+            });
+        }
+        let selectors = selectors.into_iter().collect();
         let budget = OperationBudget::new(ctx.budget.clone());
         let request = ctx.budget.request.clone();
         // Register before the live snapshot so any intervening revoke cancels

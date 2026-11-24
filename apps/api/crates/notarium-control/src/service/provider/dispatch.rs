@@ -546,7 +546,10 @@ impl ProviderService {
                         request_hash: hash.to_vec(),
                         resource_id: snapshot.resource.id.clone(),
                         credential_id: snapshot.resource.credential_id.clone(),
-                        policy_epochs: snapshot.epochs(&validated.disclosed_classes)?,
+                        policy_epochs: snapshot.epochs(
+                            &validated.disclosed_classes,
+                            validated.disclosed_project_only.as_ref(),
+                        )?,
                         participating_spaces: json(&validated.spaces)?,
                         model_id: job.model().map(ToString::to_string),
                         reserved_tokens: job.reservation(&snapshot)?,
@@ -778,7 +781,7 @@ impl EmbeddingProviderPort for ProviderService {
                                 .spaces()
                                 .get(&space.space.id)
                                 .ok_or_else(selection::unavailable)?;
-                            super::admission::required_query_source_classes(
+                            super::admission::required_query_source_disclosure(
                                 tx.inner_mut(),
                                 &auth,
                                 grant,
@@ -790,7 +793,10 @@ impl EmbeddingProviderPort for ProviderService {
                     .await;
                 budget.run(tx.finish(), CommitEffect::NotCommitted).await?;
                 let required = required?;
-                if !required.is_subset(&selected.policy.allowed_classes) {
+                if !required.allows_embedder(
+                    &selected.policy.allowed_classes,
+                    selected.project_only.as_ref(),
+                ) {
                     return Ok(BTreeSet::new());
                 }
             }

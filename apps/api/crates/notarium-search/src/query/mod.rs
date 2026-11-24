@@ -250,6 +250,9 @@ impl SearchEngine {
             source_classes: delivery
                 .recipient
                 .and_then(|recipient| recipient.query_source_classes()),
+            source_project: delivery
+                .recipient
+                .and_then(|recipient| recipient.query_source_project()),
         });
         let (mut notes, mut vectors) = tokio::try_join!(lexical, vectors)?;
         let strict_overflow = notes.strict_len > initial_cap;
@@ -539,6 +542,7 @@ impl SearchEngine {
             excluded,
             limit,
             source_classes,
+            source_project,
             ..
         } = input;
         let waiting_for_vectors = state.reopening_vectors || needs_embedder_reload;
@@ -642,9 +646,12 @@ impl SearchEngine {
             };
             if let EmbeddingBackendTarget::Remote { project, .. } = &target.backend
                 && (ctx.auth().taint().is_tainted()
-                    || project
-                        .as_ref()
-                        .is_some_and(|expected| query_project.as_ref() != Some(expected)))
+                    || project.as_ref().is_some_and(|expected| {
+                        query_project.as_ref() != Some(expected)
+                            || source_project
+                                .as_ref()
+                                .is_some_and(|confined| confined.as_ref() != Some(expected))
+                    }))
             {
                 return Err(EmbeddingError::ProviderUnavailable);
             }
@@ -854,6 +861,7 @@ struct VectorRequest<'a> {
     limit: usize,
     browse: bool,
     source_classes: Option<BTreeSet<DocClass>>,
+    source_project: Option<Option<FolderRef>>,
 }
 
 struct PreparedVector {

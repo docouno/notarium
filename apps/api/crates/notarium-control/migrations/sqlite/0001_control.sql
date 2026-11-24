@@ -395,7 +395,6 @@ CREATE TABLE provider_call_log (
 CREATE INDEX call_owner ON provider_call_log(owner_id,created_at,call_id);
 CREATE INDEX call_pending ON provider_call_log(delivery_state,created_at,call_id);
 CREATE INDEX call_settled ON provider_call_log(delivery_state,settled_at,call_id);
-CREATE INDEX call_run ON provider_call_log(run_id,call_id);
 CREATE TABLE ability_availability (
     placement TEXT NOT NULL, ability_id TEXT NOT NULL,
     mode TEXT NOT NULL CHECK (mode IN ('all-projects','selected-projects')),

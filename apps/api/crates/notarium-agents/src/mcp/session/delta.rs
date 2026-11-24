@@ -180,11 +180,12 @@ impl BootstrapContinuations {
     }
 
     fn save_start(&self, start: StartWindow) -> StartWindow {
+        let ttl = self.ticket_ttl();
         let mut starts = self
             .starts
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        starts.retain(|entry| entry.opened.elapsed() < TICKET_TTL);
+        starts.retain(|entry| entry.opened.elapsed() < ttl);
         if let Some(previous) = starts
             .iter()
             .find(|entry| entry.key == start.key && entry.batch.authority == start.batch.authority)
@@ -337,10 +338,21 @@ pub(super) async fn resume(
     let position = ticket.position.clone().ok_or_else(stale)?;
     revalidate(call, &ticket.batch).await?;
     let acknowledge = ticket.acknowledge && allow_ack;
-    if acknowledge {
+    let acked = if acknowledge && ticket.safe_ack.is_some() {
         acknowledge_page(call, &ticket).await?;
-    }
-    page(call, Instant::now(), ticket.batch, position, acknowledge).await
+        true
+    } else {
+        false
+    };
+    page(call, Instant::now(), ticket.batch, position, acknowledge)
+        .await
+        .map_err(|error| {
+            super::super::note_tools::batch_operational_error(
+                "notarium.mcp.start-session-delta.v1",
+                error,
+                acked,
+            )
+        })
 }
 
 pub(super) async fn deliver(

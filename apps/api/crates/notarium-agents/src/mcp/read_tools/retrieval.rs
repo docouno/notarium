@@ -47,6 +47,7 @@ struct Recipient<'a, 'registry> {
     classes: &'a BTreeSet<DocClass>,
     project: Option<&'a FolderRef>,
     source_classes: Option<BTreeSet<DocClass>>,
+    source_project: Option<Option<FolderRef>>,
 }
 
 impl SearchRecipient for Recipient<'_, '_> {
@@ -74,6 +75,10 @@ impl SearchRecipient for Recipient<'_, '_> {
 
     fn query_source_classes(&self) -> Option<BTreeSet<DocClass>> {
         self.source_classes.clone()
+    }
+
+    fn query_source_project(&self) -> Option<Option<FolderRef>> {
+        self.source_project.clone()
     }
 }
 
@@ -156,8 +161,9 @@ pub(super) async fn retrieve(
                 .as_ref()
                 .map(|project| project.folder_id.clone()),
         };
-        let source_classes = if let EgressTarget::InAppProvider {
-            primary_project, ..
+        let (source_classes, source_project) = if let EgressTarget::InAppProvider {
+            primary_project,
+            ..
         } = &call.target
         {
             let grant_readable: BTreeSet<DocClass> = scope
@@ -177,18 +183,22 @@ pub(super) async fn retrieve(
                 .as_ref()
                 .filter(|project| project.space_id == target.scope.space_id)
                 .cloned();
-            let allowed = match call.provider_selection(&scope, selection_project).await {
-                Ok(Some(selection)) => selection
-                    .policy
-                    .allowed_classes
-                    .into_iter()
-                    .filter(|class| grant_readable.contains(class))
-                    .collect(),
-                _ => grant_readable,
-            };
-            Some(allowed)
+            let (allowed, confined_project) =
+                match call.provider_selection(&scope, selection_project).await {
+                    Ok(Some(selection)) => (
+                        selection
+                            .policy
+                            .allowed_classes
+                            .into_iter()
+                            .filter(|class| grant_readable.contains(class))
+                            .collect(),
+                        selection.project_only,
+                    ),
+                    _ => (grant_readable, None),
+                };
+            (Some(allowed), Some(confined_project))
         } else {
-            None
+            (None, None)
         };
         let recipient = Recipient {
             call,
@@ -196,6 +206,7 @@ pub(super) async fn retrieve(
             classes: &classes,
             project: target.project.as_ref(),
             source_classes,
+            source_project,
         };
         let result = if recall {
             call.registry

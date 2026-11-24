@@ -267,11 +267,10 @@ the observed distribution. All values are milliseconds.
 | Medium | PostgreSQL | 11.054 | 15.379 | <24 | <50 |
 
 The observed medians and p95 values come from three quiet 20-call series per
-database on each reference (runtime `3e554991`; max observed `3.409 ms` High
-SQLite, `7.700 ms` High PostgreSQL, `9.963 ms` Medium SQLite, `20.515 ms` Medium
-PostgreSQL). Earlier four-series calibration on `1dc5daf1` measured similar
-medians (`2.571 / 4.547 ms` High, `6.180 / 11.523 ms` Medium) with isolated host
-I/O spikes (`61–122 ms`); a series affected by external host I/O pressure should
+database on each reference (max observed `3.409 ms` High SQLite, `7.700 ms`
+High PostgreSQL, `9.963 ms` Medium SQLite, `20.515 ms` Medium PostgreSQL).
+Earlier four-series calibration measured similar medians (`2.571 / 4.547 ms`
+High, `6.180 / 11.523 ms` Medium) with isolated host I/O spikes (`61–122 ms`); a series affected by external host I/O pressure should
 be rerun on a quiet host rather than loosening regression budgets. Compare
 median and p95 across runs to detect shifts in ordinary latency. The component
 benchmark measures the p95 of 1,000 canonical storage commands separately.
