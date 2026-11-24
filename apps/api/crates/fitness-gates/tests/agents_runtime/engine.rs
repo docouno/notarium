@@ -577,9 +577,10 @@ impl NoteReadPort for TestEngine {
         ctx: SpaceContext,
         base: Option<FolderId>,
         after: Option<FolderId>,
+        at_seq: Option<SpaceSeq>,
         limit: PageLimit,
     ) -> PortFuture<'_, ChildFolders> {
-        Box::pin(self.0.list_child_folders(ctx, base, after, limit))
+        Box::pin(self.0.list_child_folders(ctx, base, after, at_seq, limit))
     }
 
     fn resolve_note_target(
@@ -717,6 +718,17 @@ impl ViewGraphPort for TestEngine {
             } else {
                 None
             };
+            let view_meta = self
+                .0
+                .get_note_metadata(
+                    ctx.clone(),
+                    GetNote {
+                        note: fixture.view_owner.note_id.clone(),
+                        revision: None,
+                        causal: CausalBasis::Await(Default::default()),
+                    },
+                )
+                .await?;
             Ok(ViewResult {
                 rows: CursorPage {
                     items,
@@ -732,6 +744,7 @@ impl ViewGraphPort for TestEngine {
                     count: fixture.notes.len() as u64,
                 }],
                 effective_read: read,
+                view_revision: view_meta.metadata.revision().clone(),
             })
         })
     }

@@ -1,7 +1,7 @@
 use super::super::invalid;
 use notarium_core::{
     error::{PortError, ValidationReason},
-    ids::{ContentDigest, FolderId, PrincipalId},
+    ids::{ContentDigest, FolderId, PrincipalId, SpaceSeq},
     model::{FolderRef, HistoryScope},
     query::KeysetCursor,
 };
@@ -37,6 +37,7 @@ pub(super) struct NoteContinuation {
     pub fingerprint: ContentDigest,
     pub notes: Option<KeysetCursor>,
     pub folders: Option<FolderId>,
+    pub folders_cut: Option<SpaceSeq>,
     pub total: Option<u64>,
 }
 
@@ -125,6 +126,7 @@ mod tests {
                     fingerprint: ContentDigest::from_bytes([5; 32]),
                     notes: None,
                     folders: Some(child.clone()),
+                    folders_cut: None,
                     total: None,
                 },
             )
@@ -151,6 +153,7 @@ mod tests {
                         fingerprint: ContentDigest::from_bytes([6; 32]),
                         notes: None,
                         folders: None,
+                        folders_cut: None,
                         total: None,
                     },
                 )

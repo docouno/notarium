@@ -115,7 +115,7 @@ pub(in crate::mcp) async fn plan_links(
     Ok(planned)
 }
 
-async fn exact_link_revision(
+pub(super) async fn exact_link_revision(
     call: &ToolCallContext<'_>,
     scope: &SpaceContext,
     source: &NoteId,

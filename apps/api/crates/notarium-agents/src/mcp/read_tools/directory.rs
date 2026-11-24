@@ -178,11 +178,15 @@ pub(super) async fn list(call: &mut ToolCallContext<'_>, args: Value) -> Result<
 
     let mut folders = Vec::new();
     let mut next_folders = None;
+    let mut folders_cut = None;
     if previous
         .as_ref()
         .is_none_or(|cursor| cursor.folders.is_some())
     {
-        let after = previous.and_then(|cursor| cursor.folders);
+        let (after, at_seq) = match previous {
+            Some(cursor) => (cursor.folders, cursor.folders_cut),
+            None => (None, None),
+        };
         let page = call
             .registry
             .engine
@@ -190,6 +194,7 @@ pub(super) async fn list(call: &mut ToolCallContext<'_>, args: Value) -> Result<
                 scope.clone(),
                 Some(folder.reference.folder_id.clone()),
                 after.clone(),
+                at_seq,
                 limit,
             )
             .await?;
@@ -202,6 +207,7 @@ pub(super) async fn list(call: &mut ToolCallContext<'_>, args: Value) -> Result<
             return Err(invalid(ValidationReason::InvalidState));
         }
         next_folders = page.next;
+        folders_cut = next_folders.as_ref().map(|_| page.cut_seq);
         for child in &page.items {
             if child.history != folder.history
                 || child.parent.as_ref() != Some(&folder.reference.folder_id)
@@ -227,6 +233,7 @@ pub(super) async fn list(call: &mut ToolCallContext<'_>, args: Value) -> Result<
                 fingerprint,
                 notes: next_notes,
                 folders: next_folders,
+                folders_cut,
                 total,
             },
         )?;

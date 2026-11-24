@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use notarium_agents::{
-    chats::{AgentRunSupervisor, ChatRunOptions, ExclusiveDataRoot},
+    chats::{AgentRunSupervisor, ChatRunOptions, ExclusiveDataRoot, StartChatRun},
     mcp::{ConfirmProposedDiff, PersonalToolInvocation},
 };
 use notarium_canonical::CreateFolderSpec;
@@ -59,6 +59,7 @@ async fn exercise(pg: bool) {
         &fixture, &personal,
     ))
     .await;
+    Box::pin(contract_and_seams_regressions(&fixture, &personal)).await;
     let fixture = Box::pin(orphan_active_run_recovered_on_enqueue(fixture, &personal)).await;
     Box::pin(fixture.close()).await;
 }
@@ -2134,5 +2135,462 @@ async fn exact_causal_graph_and_control_replay_seams(
             ))
         ),
         "out-of-project folder in Space B must not inherit Space A ancestry in acquire_egress: {egress_result:?}"
+    );
+}
+
+async fn contract_and_seams_regressions(fixture: &RuntimeFixture, personal: &SpaceContext) {
+    let owner = AccountContext::new(
+        fixture
+            .control
+            .trusted_none(
+                PerimeterAttestation::attest_checked()
+                    .with_human_management()
+                    .with_ability_write(),
+                budget(),
+            )
+            .await
+            .unwrap(),
+        budget(),
+    );
+
+    // 1. MCP readOnlyHint annotations: start_session and use_role mutate episode/cursor state
+    // and report read_only_hint = false while remaining callable under BearerScope::Read (12 tools).
+    let descriptors = fixture
+        .registry
+        .list_tools(owner.clone(), &EgressTarget::ExternalMcp)
+        .await
+        .unwrap();
+    let hint = |name: &str| {
+        descriptors
+            .iter()
+            .find(|tool| tool.name == name)
+            .unwrap_or_else(|| panic!("missing tool descriptor {name}"))
+            .annotations
+            .read_only_hint
+    };
+    assert!(!hint("start_session"));
+    assert!(!hint("use_role"));
+    assert!(hint("whoami"));
+    assert!(hint("list_notes"));
+    assert!(hint("use_skill"));
+
+    // 2. Direct link and link_many must return the exact revision produced by the link command
+    // even after an intervening manual edit, so replaying link never hands out a newer token.
+    let projects = call(fixture, &owner, 209, "get_my_projects", json!({}))
+        .await
+        .unwrap();
+    let personal_project = projects.structured_content["projects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["spaceId"].as_str() == Some(personal.scope().space_id.as_str()))
+        .expect("personal project in personal space");
+    let project_handle = personal_project["handle"]
+        .as_str()
+        .expect("personal project handle")
+        .to_owned();
+    let project_folder = FolderId::parse(
+        personal_project["projectId"]
+            .as_str()
+            .expect("personal projectId"),
+    )
+    .unwrap();
+    let src = call(
+        fixture,
+        &owner,
+        210,
+        "create_note",
+        json!({
+            "project": project_handle,
+            "title": "Link Source Exact Rev",
+            "body": "# Link Source Exact Rev\n\nOriginal body.\n",
+        }),
+    )
+    .await
+    .unwrap();
+    let dst = call(
+        fixture,
+        &owner,
+        211,
+        "create_note",
+        json!({
+            "project": project_handle,
+            "title": "Link Target Secret Title",
+            "body": "# Link Target Secret Title\n\nTarget body.\n",
+        }),
+    )
+    .await
+    .unwrap();
+    let src_id = src.structured_content["noteId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let dst_id = dst.structured_content["noteId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let first_link = call(
+        fixture,
+        &owner,
+        212,
+        "link",
+        json!({
+            "from": src_id,
+            "to": dst_id,
+            "relation": "supports",
+        }),
+    )
+    .await
+    .unwrap();
+    let link_token = first_link.structured_content["versionToken"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let manual_edit = call(
+        fixture,
+        &owner,
+        213,
+        "edit_note",
+        json!({
+            "ref": src_id,
+            "operation": "append",
+            "content": "\nManual edit after link.\n",
+            "versionToken": link_token,
+        }),
+    )
+    .await
+    .unwrap();
+    let manual_token = manual_edit.structured_content["versionToken"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(link_token, manual_token);
+
+    // Replaying the exact same link call (same tag 212) must return the original link revision,
+    // NEVER the intervening manual edit's versionToken.
+    let replayed_link = call(
+        fixture,
+        &owner,
+        212,
+        "link",
+        json!({
+            "from": src_id,
+            "to": dst_id,
+            "relation": "supports",
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        replayed_link.structured_content["versionToken"].as_str(),
+        Some(link_token.as_str()),
+        "link replay must return the link command's exact revision, not a later manual edit"
+    );
+
+    // Using the replayed link's versionToken to edit must fail with RevisionConflict rather than
+    // silently overwriting the manual edit.
+    let stale_edit = call(
+        fixture,
+        &owner,
+        214,
+        "edit_note",
+        json!({
+            "ref": src_id,
+            "operation": "append",
+            "content": "\nStale overwrite attempt.\n",
+            "versionToken": replayed_link.structured_content["versionToken"],
+        }),
+    )
+    .await
+    .map(|_| ());
+    assert!(
+        matches!(
+            stale_edit,
+            Err(PortError::Domain(DomainError::RevisionConflict { .. }))
+        ),
+        "stale token from replayed link must conflict with intervening edit: {stale_edit:?}"
+    );
+
+    // Same exact-revision guarantee for link_many.
+    let batch_link = call(
+        fixture,
+        &owner,
+        215,
+        "link_many",
+        json!({
+            "links": [{
+                "from": src_id,
+                "toTitle": "Uncreated Forward Title",
+                "relation": "mentions",
+            }]
+        }),
+    )
+    .await
+    .unwrap();
+    let batch_token = batch_link.structured_content["results"][0]["versionToken"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let after_batch_edit = call(
+        fixture,
+        &owner,
+        216,
+        "edit_note",
+        json!({
+            "ref": src_id,
+            "operation": "append",
+            "content": "\nManual edit after link_many.\n",
+            "versionToken": batch_token,
+        }),
+    )
+    .await
+    .unwrap();
+    let after_batch_token = after_batch_edit.structured_content["versionToken"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(batch_token, after_batch_token);
+    let replayed_batch = call(
+        fixture,
+        &owner,
+        215,
+        "link_many",
+        json!({
+            "links": [{
+                "from": src_id,
+                "toTitle": "Uncreated Forward Title",
+                "relation": "mentions",
+            }]
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        replayed_batch.structured_content["results"][0]["versionToken"].as_str(),
+        Some(batch_token.as_str()),
+        "link_many replay must return exact link revision, not a later manual edit"
+    );
+
+    // 3. list_child_folders stays bound to its opening cut and returns CursorStale when a
+    // sibling folder is created after the cut.
+    for (tag, title) in [(217u8, "Cut Alpha"), (218, "Cut Beta")] {
+        call(
+            fixture,
+            &owner,
+            tag,
+            "create_note",
+            json!({
+                "project": project_handle,
+                "path": format!("cut-parent/sub-{tag}"),
+                "title": title,
+                "body": format!("# {title}\n\nBody.\n"),
+            }),
+        )
+        .await
+        .unwrap();
+    }
+    let cut_parent = fixture
+        .canonical
+        .resolve_folder_path(personal.clone(), Some(project_folder), "cut-parent".into())
+        .await
+        .unwrap()
+        .expect("cut-parent folder");
+    let page1 = fixture
+        .canonical
+        .list_child_folders(
+            personal.clone(),
+            Some(cut_parent.reference.folder_id.clone()),
+            None,
+            None,
+            PageLimit::new(1).unwrap(),
+        )
+        .await
+        .unwrap();
+    let after1 = page1
+        .next
+        .clone()
+        .expect("page 1 must return continuation folder id");
+    let page2 = fixture
+        .canonical
+        .list_child_folders(
+            personal.clone(),
+            Some(cut_parent.reference.folder_id.clone()),
+            Some(after1.clone()),
+            Some(page1.cut_seq),
+            PageLimit::new(1).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        page2.next.is_none(),
+        "page 2 must end the initial 2-folder cut"
+    );
+    // Add a 3rd sibling folder after the cut.
+    call(
+        fixture,
+        &owner,
+        221,
+        "create_note",
+        json!({
+            "project": project_handle,
+            "path": "cut-parent/sub-zzz",
+            "title": "Cut Gamma",
+            "body": "# Cut Gamma\n\nBody.\n",
+        }),
+    )
+    .await
+    .unwrap();
+    let stale_page = fixture
+        .canonical
+        .list_child_folders(
+            personal.clone(),
+            Some(cut_parent.reference.folder_id.clone()),
+            Some(after1),
+            Some(page1.cut_seq),
+            PageLimit::new(1).unwrap(),
+        )
+        .await
+        .map(|_| ());
+    assert!(
+        matches!(
+            stale_page,
+            Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
+                if diagnostic.reason == notarium_core::error::ValidationReason::CursorStale
+        ),
+        "reusing folder cursor after sibling creation must return CursorStale: {stale_page:?}"
+    );
+
+    // 4. Ability names with an `ab_` prefix (e.g. `ab_weekly`) must resolve by name, and
+    // `use_role` in a SpaceGroup/Shared chat must render inline without mutating the episode.
+    call(
+        fixture,
+        &owner,
+        223,
+        "create_ability",
+        json!({
+            "kind": "skill",
+            "name": "ab_weekly",
+            "description": "Weekly digest checklist",
+            "instructions": "# Weekly\n\nCheck progress.",
+            "placement": {"home": "personal"},
+        }),
+    )
+    .await
+    .unwrap();
+    let activated_ab = call(
+        fixture,
+        &owner,
+        224,
+        "use_skill",
+        json!({"name": "ab_weekly"}),
+    )
+    .await
+    .unwrap();
+    assert!(
+        activated_ab.content[0].text.contains("Check progress."),
+        "ab_-prefixed ability name must activate by name"
+    );
+
+    let ep_started = call(
+        fixture,
+        &owner,
+        225,
+        "start_session",
+        json!({"task": "shared-use-role-check"}),
+    )
+    .await
+    .unwrap();
+    let shared_ep = EpisodeId::parse(
+        ep_started.structured_content["session"]["id"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    let shared_auth = owner
+        .auth()
+        .for_agent_run(
+            AgentRunId::from_bytes([226; 16]),
+            personal.scope().space_id.clone(),
+            ChatAudience::Shared,
+            owner.auth().spaces().clone(),
+        )
+        .unwrap();
+    let shared_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let shared_local = loopback_provider(fixture, &owner, &shared_listener, 228, true).await;
+    approve_disclosure(
+        fixture,
+        &owner,
+        &shared_local,
+        232,
+        ProviderAttachmentTarget::Personal {
+            owner: owner.auth().principal().clone(),
+            space: personal.scope().space_id.clone(),
+        },
+        [DocClass::UserDoc, DocClass::Skill].into(),
+    )
+    .await;
+    let shared_role_res = shared_local
+        .registry
+        .call_tool(
+            McpInvocationContext {
+                account: AccountContext::new(shared_auth, budget()),
+                target: EgressTarget::InAppProvider {
+                    provider: shared_local.resource.id.clone(),
+                    model: shared_local.model.clone(),
+                    primary_project: None,
+                },
+                request_key: CommandKey::from_bytes([226; 16]),
+            },
+            "use_role",
+            json!({
+                "name": "research",
+                "session": shared_ep.to_string(),
+            }),
+        )
+        .await;
+    // System role activation in a Shared chat must succeed inline (never AccessDenied
+    // from save_active_role) and leave the episode's active_role unchanged.
+    let shared_role_out = shared_role_res.unwrap_or_else(|err| {
+        panic!("Shared chat use_role must render inline without error: {err:?}")
+    });
+    assert!(
+        !shared_role_out.content[0].text.is_empty(),
+        "Shared chat use_role must return rendered role instructions"
+    );
+    let ep_after = fixture
+        .control
+        .get_episode(owner.clone(), shared_ep)
+        .await
+        .unwrap();
+    assert!(
+        ep_after.active_role.is_none(),
+        "Shared chat use_role must not persist active_role onto the episode"
+    );
+
+    // 5. Chat thread_gate respects CallBudget deadline (zero-remaining budget fails immediately
+    // with DeadlineExceeded without writing).
+    let supervisor = AgentRunSupervisor::new_local(
+        fixture.registry.clone(),
+        fixture.revocations.clone(),
+        ExclusiveDataRoot::attest_open_writer(),
+    );
+    let mut expired_owner = owner.clone();
+    expired_owner.budget.remaining = Duration::ZERO;
+    let expired_start = supervisor
+        .start(
+            expired_owner,
+            StartChatRun {
+                scope: personal.scope().clone(),
+                thread: ChatThreadId::from_bytes([227; 16]),
+                expected_leaf: ThreadEntrySeq::ZERO,
+                options: ChatRunOptions::default(),
+            },
+        )
+        .await;
+    assert!(
+        matches!(expired_start, Err(PortError::DeadlineExceeded(_))),
+        "expired CallBudget on start must return DeadlineExceeded: {expired_start:?}"
     );
 }

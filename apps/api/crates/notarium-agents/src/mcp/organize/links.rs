@@ -8,7 +8,7 @@ use notarium_core::{
     DomainError,
     classes::DocClass,
     error::{PortError, ValidationReason},
-    ids::{NoteId, RevisionId, SpaceId},
+    ids::{ContentDigest, NoteId, RevisionId, SpaceId},
     model::{HistoryScope, Lifecycle},
     ports::{
         Committed, GetNote, Link, LinkBatch, LinkTarget, Mutation, NoteMetadataSnapshot,
@@ -19,7 +19,7 @@ use notarium_core::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::super::{ToolCallContext, ToolName, corpus, decode, invalid};
+use super::super::{ToolCallContext, ToolName, corpus, decode, derive_digest, invalid};
 
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -68,7 +68,56 @@ struct TargetAlias {
     revision: RevisionId,
 }
 
+/// Content-free plan persisted in `control.mcp_dedup` for direct `link` and
+/// `link_many` retries. User strings (`relation`, target titles) stay out of
+/// the control journal and are re-bound via digests from the caller arguments
+/// and canonical metadata on execution/replay.
+#[derive(Clone, Deserialize, Serialize)]
+struct JournaledLinkPlan {
+    scope: HistoryScope,
+    source: NoteId,
+    expected_revision: Option<RevisionId>,
+    target: JournaledTarget,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+enum JournaledTarget {
+    Stable {
+        note: NoteId,
+        alias_revision: Option<RevisionId>,
+        alias_title_digest: Option<ContentDigest>,
+    },
+    Authored {
+        name_digest: ContentDigest,
+    },
+}
+
+fn title_digest(domain: &str, value: &str) -> ContentDigest {
+    derive_digest(domain, &[value.as_bytes()])
+}
+
 impl LinkPlan {
+    fn to_journaled(&self) -> JournaledLinkPlan {
+        let target = match &self.target {
+            Target::Stable { note, alias } => JournaledTarget::Stable {
+                note: note.clone(),
+                alias_revision: alias.as_ref().map(|alias| alias.revision.clone()),
+                alias_title_digest: alias
+                    .as_ref()
+                    .map(|alias| title_digest("notarium.link.alias-title.v1", &alias.title)),
+            },
+            Target::Authored { name } => JournaledTarget::Authored {
+                name_digest: title_digest("notarium.link.authored-title.v1", name),
+            },
+        };
+        JournaledLinkPlan {
+            scope: self.scope.clone(),
+            source: self.source.clone(),
+            expected_revision: self.expected_revision.clone(),
+            target,
+        }
+    }
+
     pub(in super::super) fn mutation(&self, identity: CommandIdentity) -> Mutation<Link> {
         let (target, title) = self.target.link_parts();
         Mutation {
@@ -362,6 +411,80 @@ async fn authorize(
     Ok(source.facts.class)
 }
 
+async fn hydrate_journaled(
+    call: &ToolCallContext<'_>,
+    scope: &SpaceContext,
+    journaled: JournaledLinkPlan,
+    edge: &LinkArgs,
+) -> Result<LinkPlan, PortError> {
+    let relation = edge.relation.trim();
+    if relation.is_empty() {
+        return Err(invalid(ValidationReason::SourceMismatch));
+    }
+    let target = match journaled.target {
+        JournaledTarget::Authored { name_digest } => {
+            let raw = edge
+                .to_title
+                .as_deref()
+                .ok_or_else(|| invalid(ValidationReason::SourceMismatch))?;
+            let name = authored_name(raw)?;
+            if title_digest("notarium.link.authored-title.v1", name) != name_digest {
+                return Err(invalid(ValidationReason::SourceMismatch));
+            }
+            Target::Authored {
+                name: name.to_owned(),
+            }
+        }
+        JournaledTarget::Stable {
+            note,
+            alias_revision,
+            alias_title_digest,
+        } => {
+            let raw_to = edge
+                .to
+                .as_deref()
+                .ok_or_else(|| invalid(ValidationReason::SourceMismatch))?;
+            if NoteId::parse(raw_to)? != note {
+                return Err(invalid(ValidationReason::SourceMismatch));
+            }
+            let alias = match (alias_revision, alias_title_digest) {
+                (Some(revision), Some(expected_digest)) => {
+                    let current = metadata_snapshot(
+                        call,
+                        scope,
+                        &note,
+                        Some(revision.clone()),
+                        ReceiptSet::default(),
+                    )
+                    .await?;
+                    let title = current
+                        .provenance
+                        .as_ref()
+                        .map(|metadata| metadata.title.trim())
+                        .ok_or_else(|| invalid(ValidationReason::SourceMismatch))?;
+                    if title_digest("notarium.link.alias-title.v1", title) != expected_digest {
+                        return Err(invalid(ValidationReason::SourceMismatch));
+                    }
+                    Some(TargetAlias {
+                        title: title.to_owned(),
+                        revision,
+                    })
+                }
+                (None, None) => None,
+                _ => return Err(invalid(ValidationReason::SourceMismatch)),
+            };
+            Target::Stable { note, alias }
+        }
+    };
+    Ok(LinkPlan {
+        scope: journaled.scope,
+        source: journaled.source,
+        expected_revision: journaled.expected_revision,
+        relation: relation.to_owned(),
+        target,
+    })
+}
+
 async fn render(
     call: &mut ToolCallContext<'_>,
     scope: &SpaceContext,
@@ -373,18 +496,23 @@ async fn render(
         return Err(invalid(ValidationReason::SourceMismatch));
     }
     let info: Result<Value, PortError> = async {
+        // Resolve the exact revision produced by this link command rather than
+        // reading the current tip, so an intervening manual edit's versionToken
+        // is never returned to a caller holding stale note text.
+        let exact_rev =
+            proposal::exact_link_revision(call, scope, &plan.source, &committed.receipt).await?;
         let current = metadata_snapshot(
             call,
             scope,
             &plan.source,
-            None,
+            Some(exact_rev.clone()),
             ReceiptSet::new([committed.receipt])?,
         )
         .await?;
         let (origin, project) =
             corpus::note_metadata_origin(call, scope, &current.metadata).await?;
         call.record_origin(origin, project)?;
-        Ok(json!({"ok": true, "noteId": plan.source, "versionToken": current.metadata.revision()}))
+        Ok(json!({"ok": true, "noteId": plan.source, "versionToken": exact_rev}))
     }
     .await;
     match info {
@@ -397,13 +525,15 @@ async fn render(
 }
 
 async fn single(call: &mut ToolCallContext<'_>, input: LinkInput) -> Result<Value, PortError> {
-    let plan = call
+    let journaled: JournaledLinkPlan = call
         .journal("link-route", || async {
             let source = NoteId::parse(&input.source)?;
-            plan_link(call, None, source, &input.edge, true).await
+            let plan = plan_link(call, None, source, &input.edge, true).await?;
+            Ok(plan.to_journaled())
         })
         .await?;
-    let scope = call.space(plan.scope.clone())?;
+    let scope = call.space(journaled.scope.clone())?;
+    let plan = hydrate_journaled(call, &scope, journaled, &input.edge).await?;
     authorize(call, &scope, &plan).await?;
     let identity = call.command_identity(&plan.scope, "link", 0);
     let committed = call
@@ -429,13 +559,15 @@ async fn many(call: &mut ToolCallContext<'_>, inputs: Vec<LinkInput>) -> Result<
         let ordinal = u16::try_from(index).map_err(|_| invalid(ValidationReason::InvalidLimit))?;
         let label = format!("link-route-{ordinal}");
         let planned = async {
-            let plan = call
+            let journaled: JournaledLinkPlan = call
                 .journal(&label, || async {
                     let source = NoteId::parse(&input.source)?;
-                    plan_link(call, None, source, &input.edge, false).await
+                    let plan = plan_link(call, None, source, &input.edge, false).await?;
+                    Ok(plan.to_journaled())
                 })
                 .await?;
-            let scope = call.space(plan.scope.clone())?;
+            let scope = call.space(journaled.scope.clone())?;
+            let plan = hydrate_journaled(call, &scope, journaled, &input.edge).await?;
             authorize(call, &scope, &plan).await?;
             Ok::<_, PortError>(plan)
         }
@@ -541,5 +673,46 @@ mod tests {
         ] {
             assert!(authored_name(&invalid).is_err());
         }
+    }
+
+    #[test]
+    fn journaled_link_plan_is_content_free() {
+        let scope = HistoryScope {
+            space_id: SpaceId::from_bytes([1; 16]),
+            incarnation: notarium_core::ids::HistoryIncarnation::from_bytes([2; 16]),
+        };
+        let source = NoteId::from_bytes([3; 16]);
+        let target = NoteId::from_bytes([4; 16]);
+        let rev = RevisionId::from_bytes([5; 16]);
+
+        let stable = LinkPlan {
+            scope: scope.clone(),
+            source: source.clone(),
+            expected_revision: Some(rev.clone()),
+            relation: "secret_relation".into(),
+            target: Target::Stable {
+                note: target,
+                alias: Some(TargetAlias {
+                    title: "Confidential Target Title".into(),
+                    revision: rev,
+                }),
+            },
+        };
+        let encoded_stable = serde_json::to_string(&stable.to_journaled()).unwrap();
+        assert!(!encoded_stable.contains("secret_relation"));
+        assert!(!encoded_stable.contains("Confidential Target Title"));
+
+        let authored = LinkPlan {
+            scope,
+            source,
+            expected_revision: None,
+            relation: "secret_relation".into(),
+            target: Target::Authored {
+                name: "Confidential Forward Title".into(),
+            },
+        };
+        let encoded_authored = serde_json::to_string(&authored.to_journaled()).unwrap();
+        assert!(!encoded_authored.contains("secret_relation"));
+        assert!(!encoded_authored.contains("Confidential Forward Title"));
     }
 }

@@ -134,7 +134,16 @@ async fn read(call: &mut ToolCallContext<'_>, args: Value) -> Result<NoteOutput,
     let mut view_rows_truncated = false;
     for (index, view) in views.into_iter().enumerate() {
         display_body.push_str(&carrier[offset..view.span.start()]);
-        let result = describe_view(call, &ctx, &note, &view, index, head, &mut view_budget).await?;
+        let result = describe_view(
+            call,
+            &ctx,
+            (&note, snapshot.document.revision()),
+            &view,
+            index,
+            head,
+            &mut view_budget,
+        )
+        .await?;
         view_rows_truncated |= result["rowsTruncated"] == true;
         display_body.push_str("\n[nota view] ");
         display_body.push_str(
@@ -179,7 +188,7 @@ async fn read(call: &mut ToolCallContext<'_>, args: Value) -> Result<NoteOutput,
 async fn describe_view(
     call: &mut ToolCallContext<'_>,
     ctx: &SpaceContext,
-    note: &NoteId,
+    (note, note_revision): (&NoteId, &notarium_core::ids::RevisionId),
     view: &ViewBlock,
     index: usize,
     head: Option<SpaceSeq>,
@@ -245,6 +254,10 @@ async fn describe_view(
             Err(error) => return Err(error),
         };
         ctx.scope().check(&page.rows.scope)?;
+        if &page.view_revision != note_revision {
+            item["status"] = json!("incomplete");
+            return Ok(item);
+        }
         if page_idx == 0 {
             projected_seq = page.rows.projected_seq;
             canonical_seq = page.rows.canonical_seq;

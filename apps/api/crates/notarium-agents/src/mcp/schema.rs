@@ -33,7 +33,7 @@ static TOOL_CACHE: LazyLock<[CachedTool; 28]> = LazyLock::new(|| {
             input_schema,
             annotations: ToolAnnotations {
                 open_world_hint: false,
-                read_only_hint: !tool.writes(),
+                read_only_hint: tool.read_only_hint(),
             },
         };
         let provider_definition = ProviderToolDefinition {
@@ -74,6 +74,9 @@ macro_rules! tools {
             }
             pub(super) const fn writes(self) -> bool {
                 match self { $(Self::$variant => $write),+ }
+            }
+            pub(super) const fn read_only_hint(self) -> bool {
+                !self.writes() && !matches!(self, Self::StartSession | Self::UseRole)
             }
         }
     };

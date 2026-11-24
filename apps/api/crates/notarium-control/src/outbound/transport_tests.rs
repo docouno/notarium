@@ -1046,3 +1046,83 @@ fn response_keep_alive_framing_checks_rfc_9112_and_header_encoding() {
     let no_content = http::Response::builder().status(204).body(()).unwrap();
     assert!(response_allows_keep_alive(&no_content));
 }
+
+struct SlowDns {
+    delay: Duration,
+    answers: Vec<SocketAddr>,
+}
+impl Lookup for SlowDns {
+    fn addresses(&self, _: &str) -> io::Result<Vec<SocketAddr>> {
+        std::thread::sleep(self.delay);
+        Ok(self.answers.clone())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn connect_timeout_bounds_slow_dns_and_falls_back_across_multiple_ips() {
+    let _serial = crate::TEST_RESOURCE_LOCK.lock().await;
+    let server = Server::new(normal()).await;
+    let origin = server.origin("slow-dns.invalid");
+
+    // 1. Slow DNS must fail within connect_timeout rather than hanging until the full provider budget.
+    let slow_dns = Arc::new(SlowDns {
+        delay: Duration::from_secs(2),
+        answers: vec![server.address],
+    });
+    let client = OutboundTransport::with_lookup(policy(&origin, &[1]), Some(slow_dns))
+        .with_connect_timeout(Duration::from_millis(150));
+    let started = Instant::now();
+    let result = client
+        .send(budget(), request(1, 1, &format!("{origin}/dns"), "secret"))
+        .await
+        .map(|_| ());
+    let elapsed = started.elapsed();
+    assert!(
+        matches!(result, Err(PortError::Unavailable(failure)) if failure.effect() == CommitEffect::NotCommitted),
+        "slow DNS must fail as NotCommitted: {result:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "connect_timeout must bound DNS lookup (elapsed={elapsed:?})"
+    );
+    released(&client).await;
+
+    // 2. When the first resolved address is refused, connect_fresh falls back to the second live address.
+    let dead_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dead_addr = dead_listener.local_addr().unwrap();
+    drop(dead_listener);
+    let multi_dns = Arc::new(SlowDns {
+        delay: Duration::from_millis(10),
+        answers: vec![dead_addr, server.address],
+    });
+    let fallback_client = OutboundTransport::with_lookup(policy(&origin, &[1]), Some(multi_dns))
+        .with_connect_timeout(Duration::from_secs(2));
+    let response = fallback_client
+        .send(
+            budget(),
+            request(1, 1, &format!("{origin}/fallback"), "secret"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(body(response).await, b"done");
+    released(&fallback_client).await;
+}
+
+#[test]
+fn production_tls_config_builds_with_platform_verifier() {
+    let verifier = load_cert_verifier(None).expect("platform verifier must initialize");
+    let server_cert = rustls::pki_types::CertificateDer::from(
+        include_bytes!("../../tests/fixtures/identity/server.der").to_vec(),
+    );
+    let server_name = rustls::pki_types::ServerName::try_from("identity.example.invalid").unwrap();
+    let now = rustls::pki_types::UnixTime::now();
+    assert!(
+        verifier
+            .verify_server_cert(&server_cert, &[], &server_name, &[], now)
+            .is_err(),
+        "production platform verifier must reject untrusted fixture CA"
+    );
+    let config = build_tls_config(verifier).expect("client config must build");
+    assert_eq!(config.alpn_protocols, vec![b"http/1.1".to_vec()]);
+}

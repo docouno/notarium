@@ -234,8 +234,7 @@ async fn resolve_selector_for_account(
             )
             .await;
     }
-    if selector.starts_with("ab_") {
-        let id = AbilityId::parse(selector)?;
+    if let Ok(id) = AbilityId::parse(selector) {
         let Some(reference) = raw_reference_for_account(registry, account, id).await? else {
             return Ok(AbilityResolution::Missing);
         };
@@ -247,32 +246,17 @@ async fn resolve_selector_for_account(
             )
             .await;
     }
-    let by_name = registry
+    registry
         .control
         .resolve_ability(
             account.clone(),
             AbilitySelection::Name {
                 name: notarium_syntax::unicode::lookup_key(selector),
                 kind,
-                project: project.clone(),
+                project,
             },
         )
-        .await?;
-    if !matches!(by_name, AbilityResolution::Missing) {
-        return Ok(by_name);
-    }
-    if let Ok(id) = AbilityId::parse(selector)
-        && let Some(reference) = raw_reference_for_account(registry, account, id).await?
-    {
-        return registry
-            .control
-            .resolve_ability(
-                account.clone(),
-                AbilitySelection::Exact { reference, project },
-            )
-            .await;
-    }
-    Ok(by_name)
+        .await
 }
 
 async fn raw_reference(
@@ -1004,6 +988,7 @@ async fn use_ability(
     .await?;
     if kind == AbilityKind::Role
         && let Some(episode) = episode.as_ref()
+        && call.auth.chat_audience() != Some(ChatAudience::Shared)
     {
         save_active_role(call, episode, &descriptor.reference, project).await?;
     }

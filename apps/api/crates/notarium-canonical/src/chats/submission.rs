@@ -117,23 +117,47 @@ pub(super) async fn submit(
     content::require_human_text(&request.body)?;
     authorize_chat_write_on_space(ctx.auth(), &space.space)?;
     let staged = if request.body.len() as u64 > StagedChatBlob::INLINE_MAX_BYTES {
-        // An unauthorized request must not publish even a provisional blob.
+        // An unauthorized, stale, or full-queue request must not publish even a
+        // provisional CAS blob; `submit_tx` re-verifies atomically under writer locks.
         let reader = ctx.auth().clone();
         let thread = request.thread.clone();
         let leaf = request.expected_leaf;
+        let input_id = request.id.clone();
         let scope = space.scope.clone();
-        deadline
+        let store_check = store.clone();
+        let precheck = deadline
             .prepare(&ctx.budget, || {
                 store.with_read_tx_budget(Some(&ctx.budget), move |tx| {
                     Box::pin(async move {
                         let live = load_space_record(tx, &scope.space_id).await?;
                         live.scope.check(&scope)?;
-                        authorize_input_thread_tx(tx, &live, &reader, &thread, leaf).await?;
-                        Ok(())
+                        let head =
+                            authorize_input_thread_tx(tx, &live, &reader, &thread, leaf).await?;
+                        if head.head_leaf_seq != leaf {
+                            return Ok(Some(SubmitUserChatOutcome::Changed));
+                        }
+                        if let Some(run) = &head.active_run_id {
+                            if queue::authorize_run_claim(&store_check, &live, &head, run).is_err()
+                            {
+                                return Ok(Some(SubmitUserChatOutcome::Changed));
+                            }
+                            let count =
+                                queue_admission_count_tx(tx, &scope.space_id, &thread, &input_id)
+                                    .await?;
+                            if count >= i64::from(PENDING_CHAT_QUEUE_LIMIT) {
+                                return Ok(Some(SubmitUserChatOutcome::Full {
+                                    limit: PENDING_CHAT_QUEUE_LIMIT,
+                                }));
+                            }
+                        }
+                        Ok(None)
                     })
                 })
             })
             .await?;
+        if let Some(outcome) = precheck {
+            return Ok(outcome);
+        }
         let prepared = PreparedBlobSource::prepare(request.body.as_bytes(), store.blob_codec())?;
         Some(
             deadline

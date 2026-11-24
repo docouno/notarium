@@ -229,6 +229,7 @@ struct PreparedView {
     board: bool,
     plan: query::ViewPlan,
     folder: Option<FolderId>,
+    view_revision: RevisionId,
 }
 
 pub(super) struct ExactRow {
@@ -568,6 +569,7 @@ impl ProjectionEngine {
                         },
                         plan,
                         folder,
+                        view_revision: row.rev_id,
                     }),
                 )
             }
@@ -731,6 +733,7 @@ impl ProjectionEngine {
             board,
             plan,
             folder,
+            view_revision,
         } = state.prepared_view.as_ref().ok_or_else(stale)?;
         let index = self
             .open_index_async(cut)
@@ -851,6 +854,7 @@ impl ProjectionEngine {
             rows: cursor_page(state, head, rows, next),
             groups: selection.groups,
             effective_read: state.read.id.clone(),
+            view_revision: view_revision.clone(),
         })
     }
 
@@ -967,9 +971,13 @@ impl ProjectionEngine {
                         .posting(&PostingKey::Encrypted)
                         .map_err(super::checkpoint_error)?;
                     members.andnot_inplace(&encrypted);
-                    let indexed_tags = index
-                        .visible_tags(&members, MAX_PROJECT_BOOTSTRAP_VALUES)
-                        .map_err(super::checkpoint_error)?;
+                    let indexed_tags = if members.is_empty() {
+                        Some(Vec::new())
+                    } else {
+                        index
+                            .visible_tags(&members, MAX_PROJECT_BOOTSTRAP_VALUES)
+                            .map_err(super::checkpoint_error)?
+                    };
                     let mut tags = BTreeSet::new();
                     let mut categories = BTreeSet::new();
                     let memory_members = &members & &memory;
@@ -1954,9 +1962,14 @@ impl NoteReadPort for ProjectedNoteReadPort {
         ctx: SpaceContext,
         base: Option<FolderId>,
         after: Option<FolderId>,
+        at_seq: Option<SpaceSeq>,
         limit: PageLimit,
     ) -> PortFuture<'_, ChildFolders> {
-        Box::pin(self.0.canonical.list_child_folders(ctx, base, after, limit))
+        Box::pin(
+            self.0
+                .canonical
+                .list_child_folders(ctx, base, after, at_seq, limit),
+        )
     }
 
     fn resolve_note_target(

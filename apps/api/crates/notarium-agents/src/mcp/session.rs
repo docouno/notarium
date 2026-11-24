@@ -560,6 +560,7 @@ async fn project_bundle(
             scope.clone(),
             Some(reference.folder_id.clone()),
             None,
+            None,
             PageLimit::new(50)?,
         )
         .await?;

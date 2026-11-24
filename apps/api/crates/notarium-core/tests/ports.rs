@@ -197,9 +197,10 @@ impl NoteReadPort for ReadFixture {
         ctx: SpaceContext,
         base: Option<FolderId>,
         after: Option<FolderId>,
+        at_seq: Option<SpaceSeq>,
         limit: PageLimit,
     ) -> PortFuture<'_, ChildFolders> {
-        support::RejectingPorts.list_child_folders(ctx, base, after, limit)
+        support::RejectingPorts.list_child_folders(ctx, base, after, at_seq, limit)
     }
     fn resolve_note_target(
         &self,

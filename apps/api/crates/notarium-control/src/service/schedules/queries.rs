@@ -168,8 +168,8 @@ impl ControlService {
         let id = cursor.as_ref().map_or("", |c| c.last.as_str());
         let budget = OperationBudget::new(ctx.budget);
         let rows = budget.run(async { read_rows!(&self.store.backend,AgentSchedulesRow,fetch_all,
-            "SELECT * FROM agent_schedules WHERE deleted_at IS NULL AND paused_reason IS NULL AND next_slot_utc_ms<=$1 AND (next_slot_utc_ms>$2 OR (next_slot_utc_ms=$2 AND schedule_id>$3)) ORDER BY next_slot_utc_ms,schedule_id LIMIT $4",
-            "SELECT * FROM v1_control.agent_schedules WHERE deleted_at IS NULL AND paused_reason IS NULL AND next_slot_utc_ms<=$1 AND (next_slot_utc_ms>$2 OR (next_slot_utc_ms=$2 AND schedule_id COLLATE \"C\">$3)) ORDER BY next_slot_utc_ms,schedule_id COLLATE \"C\" LIMIT $4";at,slot,id,i64::from(page.limit())+1)
+            "SELECT * FROM agent_schedules WHERE deleted_at IS NULL AND paused_reason IS NULL AND next_slot_utc_ms<=$1 AND (next_slot_utc_ms,schedule_id)>($2,$3) ORDER BY next_slot_utc_ms,schedule_id LIMIT $4",
+            "SELECT * FROM v1_control.agent_schedules WHERE deleted_at IS NULL AND paused_reason IS NULL AND next_slot_utc_ms<=$1 AND (next_slot_utc_ms,schedule_id COLLATE \"C\")>($2,$3) ORDER BY next_slot_utc_ms,schedule_id COLLATE \"C\" LIMIT $4";at,slot,id,i64::from(page.limit())+1)
         },CommitEffect::NotCommitted).await?;
         let has_more = rows.len() > usize::from(page.limit());
         let selected: Vec<_> = rows.into_iter().take(usize::from(page.limit())).collect();

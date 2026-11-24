@@ -263,22 +263,25 @@ impl SearchEngine {
             false
         };
         let pass1_overflow = strict_overflow || vector_overflow || (weak_overflow && !floor_filled);
+        let mut graph_budget = ranking::GraphBudget::new(
+            admission.recipient.is_some(),
+            recall.map_or(0, |recall| recall.graph_depth),
+        );
         let mut candidates = ranking::fuse(notes.hits, vectors.hits, browse);
-        let mut graph_truncated =
-            if let Some(recall) = recall.filter(|recall| recall.graph_depth != 0) {
-                ranking::expand(
-                    &mut candidates,
-                    snapshot.as_ref(),
-                    self,
-                    &mut admission,
-                    &filter,
-                    &request.filter.predicate,
-                    recall.graph_depth,
-                )
-                .await?
-            } else {
-                false
-            };
+        let mut graph_truncated = if recall.is_some_and(|recall| recall.graph_depth != 0) {
+            ranking::expand(
+                &mut candidates,
+                snapshot.as_ref(),
+                self,
+                &mut admission,
+                &filter,
+                &request.filter.predicate,
+                &mut graph_budget,
+            )
+            .await?
+        } else {
+            false
+        };
         let mut selected = admission
             .select(
                 self,
@@ -346,8 +349,7 @@ impl SearchEngine {
                 degraded = wide_vec.degraded;
             }
             let mut candidates = ranking::fuse(notes.hits, wide_vec.hits, browse);
-            graph_truncated = if let Some(recall) = recall.filter(|recall| recall.graph_depth != 0)
-            {
+            graph_truncated = if recall.is_some_and(|recall| recall.graph_depth != 0) {
                 ranking::expand(
                     &mut candidates,
                     snapshot.as_ref(),
@@ -355,7 +357,7 @@ impl SearchEngine {
                     &mut admission,
                     &filter,
                     &request.filter.predicate,
-                    recall.graph_depth,
+                    &mut graph_budget,
                 )
                 .await?
             } else {

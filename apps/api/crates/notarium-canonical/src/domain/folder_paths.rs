@@ -119,9 +119,16 @@ async fn resolve_with_components(
                 }
                 let mut parent = base.clone();
                 for (_, folded) in components {
-                    let Some(found) =
-                        resolve_folder_component_tx(tx, &space, &auth, &parent, &folded, aliases)
-                            .await?
+                    let Some(found) = resolve_folder_component_tx(
+                        tx,
+                        &space,
+                        &auth,
+                        &parent,
+                        &folded,
+                        aliases,
+                        &mut folders,
+                    )
+                    .await?
                     else {
                         return Ok(None);
                     };
@@ -138,6 +145,7 @@ pub(super) async fn list_children(
     ctx: SpaceContext,
     base: Option<FolderId>,
     after: Option<FolderId>,
+    at_seq: Option<SpaceSeq>,
     limit: PageLimit,
 ) -> Result<ChildFolders, PortError> {
     let scope = ctx.scope().clone();
@@ -151,6 +159,37 @@ pub(super) async fn list_children(
                 let mut folders = FolderAncestryCache::default();
                 let ancestry = folders.load_ancestry_tx(tx, &scope.space_id, &base, true).await?;
                 auth.authorize_folder_read(&space.space, &base, &ancestry.ancestors)?;
+
+                let cut_seq = if let Some(cut) = at_seq {
+                    if space.last_seq < cut {
+                        return Err(DomainError::validation(ValidationReason::CursorStale).into());
+                    }
+                    if space.last_seq > cut {
+                        let cut_i64 = i64::try_from(cut.get())
+                            .map_err(|_| DomainError::validation(ValidationReason::InvalidLimit))?;
+                        let sql_changed =
+                            "SELECT 1 FROM folder_heads WHERE space_id=$1 AND updated_seq>$2 LIMIT 1";
+                        let changed: Option<i32> = match tx {
+                            BackendConn::Sqlite(conn) => sqlx::query_scalar(sql_changed)
+                                .bind(scope.space_id.as_str())
+                                .bind(cut_i64)
+                                .fetch_optional(&mut **conn)
+                                .await,
+                            BackendConn::Postgres(conn) => sqlx::query_scalar(sql_changed)
+                                .bind(scope.space_id.as_str())
+                                .bind(cut_i64)
+                                .fetch_optional(&mut **conn)
+                                .await,
+                        }
+                        .map_err(|err| crate::runtime::pg_read_error("list_child_folders_cut", err))?;
+                        if changed.is_some() {
+                            return Err(DomainError::validation(ValidationReason::CursorStale).into());
+                        }
+                    }
+                    cut
+                } else {
+                    space.last_seq
+                };
 
                 let sql = "SELECT folder_id FROM folder_heads
                     WHERE space_id=$1 AND parent_folder_id=$2 AND folder_id>$3 AND lifecycle_state='active'
@@ -175,7 +214,7 @@ pub(super) async fn list_children(
                 } else {
                     None
                 };
-                Ok(ChildFolders { items, next })
+                Ok(ChildFolders { items, next, cut_seq })
             })
         })
         .await
@@ -574,9 +613,11 @@ async fn existing_prefix_tx(
     parts: &[(String, String)],
     confirmation: Option<ContentDigest>,
 ) -> Result<(FolderId, usize), PortError> {
+    let mut folders = FolderAncestryCache::default();
     for (index, (_, folded)) in parts.iter().enumerate() {
         let Some(found) =
-            resolve_folder_component_tx(tx, space, auth, &parent, folded, false).await?
+            resolve_folder_component_tx(tx, space, auth, &parent, folded, false, &mut folders)
+                .await?
         else {
             return Ok((parent, index));
         };

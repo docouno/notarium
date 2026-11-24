@@ -17,21 +17,28 @@ impl AgentRunSupervisor {
         if self.inner.shutdown.is_cancelled() {
             return Err(owner_unavailable());
         }
+        if !options.limits.fits(RunLimits::HARD_CEILING) {
+            return Err(invalid(ValidationReason::BudgetExceeded));
+        }
+        let deadline = Instant::now() + account.budget.remaining;
         let mut account = self.live_account(account).await?;
         if account.auth().kind() != &PrincipalKind::DirectHuman {
             return Err(DomainError::AccessDenied.into());
         }
         let scope = input.identity.scope.clone();
         let thread = input.thread.clone();
-        let gate = self.thread_gate(&scope, &thread);
-        let _admission = gate.lock().await;
-        if self.inner.shutdown.is_cancelled() {
-            return Err(owner_unavailable());
-        }
+        let _admission = self
+            .lock_thread_gate(&scope, &thread, &mut account.budget, deadline)
+            .await?;
         account = self.live_account(account).await?;
         if account.auth().kind() != &PrincipalKind::DirectHuman {
             return Err(DomainError::AccessDenied.into());
         }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(gate_deadline());
+        }
+        account.budget.remaining = remaining;
         let ownership_lost = Cancellation::default();
         account.budget = bounded(&account.budget, MAINTENANCE_BUDGET, ownership_lost.clone());
         let mut route = self

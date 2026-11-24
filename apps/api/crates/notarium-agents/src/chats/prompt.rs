@@ -4,7 +4,7 @@ use notarium_control::service::provider::{completion_input_estimate, completion_
 use notarium_core::{
     DomainError,
     classes::{ClassEgressFence, ProviderMessage, ProviderOrigin},
-    error::{PortError, ValidationReason},
+    error::{CommitEffect, OperationalFailure, PortError, RetryAdvice, ValidationReason},
     ids::{ChatThreadId, ThreadEntrySeq},
     ports::{
         ChatBranch, ChatContentRead, ChatEntryKind, ChatPort, ChatProvenance, ChatRead,
@@ -13,6 +13,9 @@ use notarium_core::{
         SpaceContext,
     },
 };
+use tokio::time::Instant;
+
+use crate::mcp::derive_digest;
 
 const HISTORY_WINDOW: u16 = 200;
 
@@ -217,6 +220,35 @@ pub(crate) async fn load_history(
 
 /// A scheduled task retains the same durable audit log while starting its
 /// prompt from the head it inherited at the beginning of this run.
+fn remaining_context(ctx: &SpaceContext, deadline: Instant) -> Result<SpaceContext, PortError> {
+    if ctx.budget.cancellation.is_cancelled() {
+        return Err(PortError::Cancelled(
+            OperationalFailure::new(
+                derive_digest("notarium.chats.prompt.cancelled.v1", &[]),
+                CommitEffect::NotCommitted,
+                RetryAdvice::Never,
+                false,
+            )
+            .expect("valid cancellation failure"),
+        ));
+    }
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(PortError::DeadlineExceeded(
+            OperationalFailure::new(
+                derive_digest("notarium.chats.prompt.deadline.v1", &[]),
+                CommitEffect::NotCommitted,
+                RetryAdvice::Never,
+                false,
+            )
+            .expect("valid deadline failure"),
+        ));
+    }
+    let mut updated = ctx.clone();
+    updated.budget.remaining = remaining;
+    Ok(updated)
+}
+
 pub(crate) async fn load_history_after(
     engine: &dyn ChatPort,
     ctx: &SpaceContext,
@@ -228,13 +260,16 @@ pub(crate) async fn load_history_after(
     if floor.is_some_and(|floor| floor > leaf) {
         return Err(invalid(ValidationReason::SourceMismatch));
     }
+    let deadline = Instant::now() + ctx.budget.remaining;
     let read = ChatRead {
         thread: thread.clone(),
         leaf,
         before: None,
         max_entries: PageLimit::new(HISTORY_WINDOW)?,
     };
-    let mut branch = engine.read_chat_context(ctx.clone(), read.clone()).await?;
+    let mut branch = engine
+        .read_chat_context(remaining_context(ctx, deadline)?, read.clone())
+        .await?;
     if branch.thread.id != *thread || branch.thread.space != ctx.scope().space_id {
         return Err(invalid(ValidationReason::SourceMismatch));
     }
@@ -246,7 +281,7 @@ pub(crate) async fn load_history_after(
     }
     let (hydrated, has_tail) = if branch.next_ancestor.is_some() {
         let prefix = engine
-            .read_chat_compaction_prefix(ctx.clone(), read)
+            .read_chat_compaction_prefix(remaining_context(ctx, deadline)?, read)
             .await?;
         if prefix.branch.thread.revision != branch.thread.revision
             || prefix.branch.thread.id != *thread
@@ -270,7 +305,7 @@ pub(crate) async fn load_history_after(
         } else {
             engine
                 .read_chat_contents(
-                    ctx.clone(),
+                    remaining_context(ctx, deadline)?,
                     ChatContentRead {
                         thread: thread.clone(),
                         leaf,

@@ -4,7 +4,7 @@ use notarium_core::{
     DomainError,
     classes::ClassifiedAbilityResource,
     error::{PortError, ValidationReason},
-    ids::{AgentRunId, FolderId, NoteId},
+    ids::{AgentRunId, FolderId, NoteId, SpaceSeq},
     model::{FolderRef, NoteRef, SnapshotCut},
     ports::{
         AbilityPackageRevision, AcceptBatch, AppendMemory, BatchResult, BoardMoveResult,
@@ -227,9 +227,10 @@ impl CanonicalStore {
         ctx: SpaceContext,
         base: Option<FolderId>,
         after: Option<FolderId>,
+        at_seq: Option<SpaceSeq>,
         limit: PageLimit,
     ) -> Result<ChildFolders, PortError> {
-        folder_paths::list_children(self, ctx, base, after, limit).await
+        folder_paths::list_children(self, ctx, base, after, at_seq, limit).await
     }
 
     pub async fn resolve_note_target(

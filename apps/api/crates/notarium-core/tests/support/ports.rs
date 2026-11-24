@@ -22,7 +22,7 @@ macro_rules! reject {
 impl NoteReadPort for RejectingPorts {
     reject! {
     fn resolve_folder_path(&self, ctx: SpaceContext, base: Option<FolderId>, path: String) -> PortFuture<'_, Option<FolderSnapshot>>;
-    fn list_child_folders(&self, ctx: SpaceContext, base: Option<FolderId>, after: Option<FolderId>, limit: PageLimit) -> PortFuture<'_, ChildFolders>;
+    fn list_child_folders(&self, ctx: SpaceContext, base: Option<FolderId>, after: Option<FolderId>, at_seq: Option<SpaceSeq>, limit: PageLimit) -> PortFuture<'_, ChildFolders>;
     fn resolve_note_target(&self, ctx: SpaceContext, parent: Option<FolderId>, slug_title_or_id: String) -> PortFuture<'_, Option<NoteRef>>;
     fn space_schema(&self, ctx: SpaceContext) -> PortFuture<'_, std::collections::BTreeMap<String, FieldSchema>>;
     fn project_note_counts(&self, ctx: SpaceContext, project: FolderRef, causal: CausalBasis) -> PortFuture<'_, ProjectNoteCounts>;

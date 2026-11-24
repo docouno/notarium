@@ -310,13 +310,25 @@ impl AgentRunSupervisor {
     ) -> Result<AgentRunId, PortError> {
         let service = self.clone();
         detached(async move {
-            let account = service.live_account(account).await?;
+            let deadline = Instant::now() + account.budget.remaining;
+            let mut account = service.live_account(account).await?;
             if account.auth().kind() != &PrincipalKind::DirectHuman {
                 return Err(DomainError::AccessDenied.into());
             }
-            let gate = service.thread_gate(&request.scope, &request.thread);
-            let _admission = gate.lock().await;
+            let _admission = service
+                .lock_thread_gate(
+                    &request.scope,
+                    &request.thread,
+                    &mut account.budget,
+                    deadline,
+                )
+                .await?;
             let owner = service.independent_chat_human(&account).await?;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(gate_deadline());
+            }
+            account.budget.remaining = remaining;
             let ctx = SpaceContext::new(
                 account.auth().clone(),
                 request.scope.clone(),
@@ -496,16 +508,23 @@ impl AgentRunSupervisor {
     /// Redact an entry and stop the local owner of any turn using this branch.
     pub async fn redact_chat_entry(
         &self,
-        account: AccountContext,
+        mut account: AccountContext,
         request: Mutation<RedactChatEntry>,
     ) -> Result<Committed<RedactedChat>, PortError> {
         let service = self.clone();
         detached(async move {
             let scope = request.identity.scope.clone();
             let thread = request.input.thread.clone();
-            let gate = service.thread_gate(&scope, &thread);
-            let _admission = gate.lock().await;
+            let deadline = Instant::now() + account.budget.remaining;
+            let _admission = service
+                .lock_thread_gate(&scope, &thread, &mut account.budget, deadline)
+                .await?;
             let mut account = service.live_account(account).await?;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(gate_deadline());
+            }
+            account.budget.remaining = remaining;
             require_write_bearer(account.auth())?;
             let ownership_lost = Cancellation::default();
             account.budget = bounded(&account.budget, MAINTENANCE_BUDGET, ownership_lost);
@@ -743,6 +762,44 @@ impl AgentRunSupervisor {
         let gate = Arc::new(AsyncMutex::new(()));
         state.gates.insert(key, Arc::downgrade(&gate));
         gate
+    }
+
+    async fn lock_thread_gate(
+        &self,
+        scope: &HistoryScope,
+        thread: &ChatThreadId,
+        budget: &mut CallBudget,
+        deadline: Instant,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>, PortError> {
+        if self.inner.shutdown.is_cancelled() {
+            return Err(owner_unavailable());
+        }
+        if budget.cancellation.is_cancelled() {
+            return Err(gate_cancelled());
+        }
+        if deadline <= Instant::now() {
+            return Err(gate_deadline());
+        }
+        let gate = self.thread_gate(scope, thread);
+        let guard = tokio::select! {
+            biased;
+            () = self.inner.shutdown.cancelled() => return Err(owner_unavailable()),
+            () = budget.cancellation.cancelled() => return Err(gate_cancelled()),
+            () = tokio::time::sleep_until(deadline) => return Err(gate_deadline()),
+            guard = gate.lock_owned() => guard,
+        };
+        if self.inner.shutdown.is_cancelled() {
+            return Err(owner_unavailable());
+        }
+        if budget.cancellation.is_cancelled() {
+            return Err(gate_cancelled());
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(gate_deadline());
+        }
+        budget.remaining = remaining;
+        Ok(guard)
     }
 
     fn active(&self, scope: &HistoryScope, thread: &ChatThreadId) -> Option<Arc<ActiveRun>> {
@@ -1259,6 +1316,30 @@ fn owner_unavailable() -> PortError {
             false,
         )
         .expect("valid retryable owner failure"),
+    )
+}
+
+fn gate_cancelled() -> PortError {
+    PortError::Cancelled(
+        OperationalFailure::new(
+            derive_digest("notarium.chats.gate-cancelled.v1", &[]),
+            CommitEffect::NotCommitted,
+            RetryAdvice::Never,
+            false,
+        )
+        .expect("valid gate cancellation failure"),
+    )
+}
+
+fn gate_deadline() -> PortError {
+    PortError::DeadlineExceeded(
+        OperationalFailure::new(
+            derive_digest("notarium.chats.gate-deadline.v1", &[]),
+            CommitEffect::NotCommitted,
+            RetryAdvice::Never,
+            false,
+        )
+        .expect("valid gate deadline failure"),
     )
 }
 

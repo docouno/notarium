@@ -91,6 +91,7 @@ pub struct FolderSnapshot {
 pub struct ChildFolders {
     pub items: Vec<FolderSnapshot>,
     pub next: Option<FolderId>,
+    pub cut_seq: SpaceSeq,
 }
 /// Maximum distinct values in each project bootstrap vocabulary list.
 pub const MAX_PROJECT_BOOTSTRAP_VALUES: usize = 50;
@@ -1006,6 +1007,7 @@ pub struct ViewResult {
     pub rows: CursorPage<ViewRow>,
     pub groups: Vec<GroupCount>,
     pub effective_read: EffectiveReadId,
+    pub view_revision: RevisionId,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GroupCount {

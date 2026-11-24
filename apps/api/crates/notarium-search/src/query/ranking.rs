@@ -108,6 +108,26 @@ fn order(left: &Candidate, right: &Candidate) -> Ordering {
         .then_with(|| left.note.cmp(&right.note))
 }
 
+pub(super) struct GraphBudget {
+    depth: u8,
+    pages_left: usize,
+    new_notes_left: usize,
+}
+
+impl GraphBudget {
+    pub(super) fn new(filtered: bool, depth: u8) -> Self {
+        Self {
+            depth,
+            pages_left: MAX_GRAPH_PAGES,
+            new_notes_left: if filtered {
+                MAX_GRAPH_PAGES
+            } else {
+                usize::MAX
+            },
+        }
+    }
+}
+
 pub(super) async fn expand(
     candidates: &mut Vec<Candidate>,
     snapshot: &dyn StructuralSnapshot,
@@ -115,7 +135,7 @@ pub(super) async fn expand(
     admission: &mut NoteAdmission<'_>,
     eligible: &Eligible,
     predicate: &Predicate,
-    depth: u8,
+    budget: &mut GraphBudget,
 ) -> Result<bool, PortError> {
     let clock = admission.clock;
     let generation = snapshot.cut().generation;
@@ -177,26 +197,18 @@ pub(super) async fn expand(
     }
 
     let mut boosts = BTreeMap::<NoteId, f64>::new();
-    let mut pages_left = MAX_GRAPH_PAGES;
-    // Provider metadata reads share a distinct-neighbor budget across all
-    // visits and hops, including neighbors that the recipient rejects.
-    let mut new_notes_left = if filtered {
-        MAX_GRAPH_PAGES
-    } else {
-        usize::MAX
-    };
     let mut truncated = false;
-    for weight in HOP_WEIGHTS.into_iter().take(usize::from(depth)) {
+    for weight in HOP_WEIGHTS.into_iter().take(usize::from(budget.depth)) {
         let mut layer_edges: Vec<(DenseNodeId, NoteId)> = Vec::new();
         let mut visits = Vec::new();
         'frontier: for (seed_idx, state) in states.iter_mut().enumerate() {
             let frontier = std::mem::take(&mut state.frontier);
             for via in frontier {
-                if pages_left == 0 {
+                if budget.pages_left == 0 {
                     truncated = true;
                     break 'frontier;
                 }
-                pages_left -= 1;
+                budget.pages_left -= 1;
                 let nbrs = match neighbors(snapshot, via, clock, filtered).await {
                     Ok(neighbors) => neighbors,
                     Err(PortError::Domain(DomainError::ResourceNotFound)) => continue,
@@ -250,7 +262,7 @@ pub(super) async fn expand(
                 visits
                     .iter()
                     .map(|(_, _, range)| &layer_edges[range.clone()]),
-                &mut new_notes_left,
+                &mut budget.new_notes_left,
             )
             .await?
         } else {
@@ -259,7 +271,7 @@ pub(super) async fn expand(
                 admission,
                 &mut live_cache,
                 layer_edges.iter().map(|(_, note)| note),
-                &mut new_notes_left,
+                &mut budget.new_notes_left,
             )
             .await?
         };

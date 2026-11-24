@@ -1187,6 +1187,82 @@ async fn exercise_incremental_folder_cover_and_predicates(pg: bool) {
         "CausalBasis::Exact with unreachable receipt must fail instead of returning stale cut: {exact_miss:?}"
     );
 
+    // 5. MCP list_notes child folder pagination stays pinned to its opening cut
+    // and returns CursorStale when a sibling folder is added after the cut.
+    for (tag, sub) in [(82u8, "sub-a"), (83, "sub-b")] {
+        call(
+            &fixture,
+            &fixture.human,
+            tag,
+            "create_note",
+            json!({
+                "project": project,
+                "path": format!("cut-dir/{sub}"),
+                "title": format!("Folder {sub}"),
+                "body": format!("# Folder {sub}\n\nBody.\n"),
+            }),
+        )
+        .await
+        .unwrap();
+    }
+    let dir_page1 = call(
+        &fixture,
+        &fixture.human,
+        84,
+        "list_notes",
+        json!({"project": project, "path": "cut-dir", "limit": 1}),
+    )
+    .await
+    .unwrap();
+    let dir_cursor = dir_page1.structured_content["nextCursor"]
+        .as_str()
+        .expect("page 1 must return nextCursor")
+        .to_owned();
+    let dir_page2 = call(
+        &fixture,
+        &fixture.human,
+        85,
+        "list_notes",
+        json!({"project": project, "path": "cut-dir", "limit": 1, "cursor": dir_cursor}),
+    )
+    .await
+    .unwrap();
+    assert!(
+        dir_page2.structured_content.get("nextCursor").is_none(),
+        "page 2 must end the initial 2-folder cut"
+    );
+    call(
+        &fixture,
+        &fixture.human,
+        86,
+        "create_note",
+        json!({
+            "project": project,
+            "path": "cut-dir/sub-z",
+            "title": "Folder sub-z",
+            "body": "# Folder sub-z\n\nBody.\n",
+        }),
+    )
+    .await
+    .unwrap();
+    let stale_dir = call(
+        &fixture,
+        &fixture.human,
+        87,
+        "list_notes",
+        json!({"project": project, "path": "cut-dir", "limit": 1, "cursor": dir_cursor}),
+    )
+    .await
+    .map(|_| ());
+    assert!(
+        matches!(
+            stale_dir,
+            Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
+                if diagnostic.reason == notarium_core::error::ValidationReason::CursorStale
+        ),
+        "reusing list_notes folder cursor after adding sibling folder must return CursorStale: {stale_dir:?}"
+    );
+
     search.shutdown().await;
     projector.shutdown().await.unwrap();
     if let Some(pool) = pg_pool {

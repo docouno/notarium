@@ -498,7 +498,9 @@ struct Shared {
     dns_admission: Arc<Semaphore>,
     dns_queue: Arc<Semaphore>,
     lookup: Option<Arc<dyn Lookup>>,
-    roots: OnceCell<Arc<rustls::RootCertStore>>,
+    verifier: OnceCell<Arc<dyn rustls::client::danger::ServerCertVerifier>>,
+    #[cfg(test)]
+    connect_timeout: Duration,
     #[cfg(test)]
     fixture: Option<(String, Vec<u8>)>,
 }
@@ -553,11 +555,20 @@ impl OutboundTransport {
                 dns_admission: Arc::new(Semaphore::new(DEFAULT_DNS_PERMITS)),
                 dns_queue: Arc::new(Semaphore::new(DEFAULT_DNS_QUEUE)),
                 lookup,
-                roots: OnceCell::new(),
+                verifier: OnceCell::new(),
+                #[cfg(test)]
+                connect_timeout: CONNECT_TIMEOUT,
                 #[cfg(test)]
                 fixture: None,
             }),
         }
+    }
+    #[cfg(test)]
+    fn with_connect_timeout(mut self, timeout: Duration) -> Self {
+        Arc::get_mut(&mut self.shared)
+            .expect("new transport")
+            .connect_timeout = timeout;
+        self
     }
     #[cfg(test)]
     pub(super) fn available_permits(&self) -> usize {
@@ -737,6 +748,10 @@ impl OutboundTransport {
         let dns_admission = self.shared.dns_admission.clone();
         let dns_queue = self.shared.dns_queue.clone();
         #[cfg(test)]
+        let connect_timeout = self.shared.connect_timeout;
+        #[cfg(not(test))]
+        let connect_timeout = CONNECT_TIMEOUT;
+        #[cfg(test)]
         let fixture_ca = self.shared.fixture.as_ref().map(|(_, ca)| ca.clone());
         tokio::spawn(async move {
             let mut head_tx = Some(head_tx);
@@ -744,9 +759,9 @@ impl OutboundTransport {
             let mut active_conn: Option<PooledConn> = None;
             let mut keep_alive = false;
             let result = async {
-                // Certificate loading may touch the filesystem once per
-                // transport. Keep the active slot through blocking load even if
-                // the caller has already timed out or dropped the future, while
+                // Platform certificate verifier initialization may touch the
+                // OS trust store once per transport. Keep the active slot
+                // through blocking load even if the caller times out, while
                 // keeping a separate ClientConfig per Slot for TLS session isolation.
                 let tls_config = context
                     .slot
@@ -755,11 +770,11 @@ impl OutboundTransport {
                         if context.slot.endpoint.url().scheme() != "https" {
                             return Ok::<Option<Arc<rustls::ClientConfig>>, PortError>(None);
                         }
-                        let roots = shared
-                            .roots
+                        let verifier = shared
+                            .verifier
                             .get_or_try_init(|| async {
                                 tokio::task::spawn_blocking(move || {
-                                    load_root_certs(
+                                    load_cert_verifier(
                                         #[cfg(test)]
                                         fixture_ca,
                                     )
@@ -769,7 +784,7 @@ impl OutboundTransport {
                             })
                             .await?
                             .clone();
-                        Ok(Some(build_tls_config(roots)))
+                        Ok(Some(build_tls_config(verifier)?))
                     })
                     .await?
                     .clone();
@@ -799,6 +814,7 @@ impl OutboundTransport {
                                 lookup,
                                 dns_admission,
                                 dns_queue,
+                                connect_timeout,
                             ),
                             CommitEffect::NotCommitted,
                         )
@@ -993,38 +1009,43 @@ fn host_header(endpoint: &CheckedEndpoint) -> Result<HeaderValue, PortError> {
     HeaderValue::from_str(&value).map_err(|_| connect_failed())
 }
 
-fn load_root_certs(
+fn load_cert_verifier(
     #[cfg(test)] fixture_ca: Option<Vec<u8>>,
-) -> Result<Arc<rustls::RootCertStore>, PortError> {
+) -> Result<Arc<dyn rustls::client::danger::ServerCertVerifier>, PortError> {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let mut roots = rustls::RootCertStore::empty();
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
     #[cfg(test)]
-    let loaded_fixture = if let Some(der) = fixture_ca {
+    if let Some(der) = fixture_ca {
+        let mut roots = rustls::RootCertStore::empty();
         roots
             .add(rustls::pki_types::CertificateDer::from(der))
             .map_err(|_| connect_failed())?;
-        true
-    } else {
-        false
-    };
-    #[cfg(not(test))]
-    let loaded_fixture = false;
-    if !loaded_fixture {
-        let native = rustls_native_certs::load_native_certs();
-        let _ = roots.add_parsable_certificates(native.certs);
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let verifier =
+            rustls::client::WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider)
+                .build()
+                .map_err(|_| connect_failed())?;
+        return Ok(verifier);
     }
-    Ok(Arc::new(roots))
+    let verifier =
+        rustls_platform_verifier::Verifier::new(provider).map_err(|_| connect_failed())?;
+    Ok(Arc::new(verifier))
 }
 
-fn build_tls_config(roots: Arc<rustls::RootCertStore>) -> Arc<rustls::ClientConfig> {
+fn build_tls_config(
+    verifier: Arc<dyn rustls::client::danger::ServerCertVerifier>,
+) -> Result<Arc<rustls::ClientConfig>, PortError> {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let mut config = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+    let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(|_| connect_failed())?
+    .dangerous()
+    .with_custom_certificate_verifier(verifier)
+    .with_no_client_auth();
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
     config.key_log = Arc::new(rustls::NoKeyLog {});
-    Arc::new(config)
+    Ok(Arc::new(config))
 }
 
 async fn connect_fresh(
@@ -1033,34 +1054,49 @@ async fn connect_fresh(
     lookup: Option<Arc<dyn Lookup>>,
     dns_admission: Arc<Semaphore>,
     dns_queue: Arc<Semaphore>,
+    connect_timeout: Duration,
 ) -> Result<PooledConn, PortError> {
     let port = endpoint
         .url()
         .port_or_known_default()
         .ok_or_else(connect_failed)?;
-    let addrs: Vec<SocketAddr> = match endpoint.url().host().ok_or_else(connect_failed)? {
-        Host::Ipv4(ip) => vec![SocketAddr::new(IpAddr::V4(ip), port)],
-        Host::Ipv6(ip) => vec![SocketAddr::new(IpAddr::V6(ip), port)],
-        Host::Domain(host) => {
-            let resolver = GuardedResolver::with_admission(
-                endpoint.clone(),
-                lookup.unwrap_or_else(GuardedResolver::default_lookup),
-                dns_admission,
-                dns_queue,
-            );
-            resolver
-                .resolve_addrs(host)
-                .await
-                .map_err(|_| connect_failed())?
-                .into_iter()
-                .map(|addr| SocketAddr::new(addr.ip(), port))
-                .collect()
-        }
-    };
-    let stream = tokio::time::timeout(CONNECT_TIMEOUT, async {
+    let connect_deadline = Instant::now() + connect_timeout;
+    let stream = tokio::time::timeout_at(connect_deadline, async {
+        let addrs: Vec<SocketAddr> = match endpoint.url().host().ok_or_else(connect_failed)? {
+            Host::Ipv4(ip) => vec![SocketAddr::new(IpAddr::V4(ip), port)],
+            Host::Ipv6(ip) => vec![SocketAddr::new(IpAddr::V6(ip), port)],
+            Host::Domain(host) => {
+                let resolver = GuardedResolver::with_admission(
+                    endpoint.clone(),
+                    lookup.unwrap_or_else(GuardedResolver::default_lookup),
+                    dns_admission,
+                    dns_queue,
+                );
+                resolver
+                    .resolve_addrs(host)
+                    .await
+                    .map_err(|_| connect_failed())?
+                    .into_iter()
+                    .map(|addr| SocketAddr::new(addr.ip(), port))
+                    .collect()
+            }
+        };
         let mut connected = None;
-        for addr in addrs {
-            if let Ok(tcp) = TcpStream::connect(addr).await {
+        let total = addrs.len();
+        for (index, addr) in addrs.into_iter().enumerate() {
+            let remaining = connect_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let left = (total - index) as u32;
+            let per_addr = if left > 1 {
+                (remaining / left)
+                    .max(Duration::from_millis(250))
+                    .min(remaining)
+            } else {
+                remaining
+            };
+            if let Ok(Ok(tcp)) = tokio::time::timeout(per_addr, TcpStream::connect(addr)).await {
                 let _ = tcp.set_nodelay(true);
                 connected = Some(tcp);
                 break;

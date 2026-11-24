@@ -21,10 +21,10 @@ use crate::{
         normalize_slug_key, normalize_title_key, now_utc_timestamp,
     },
     domain::common::{
-        MAX_FOLDER_DEPTH, StoredCommittedFolderRefV1, active_note_sibling_exists_tx,
-        build_resource_facts_tx, derive_command_identity_spec, extract_agent_run_from_auth,
-        insert_folder_alias_tx, load_folder_ancestry_tx, load_note_head_row_opt_tx,
-        upsert_agent_run_head_tx, validate_mutation_identity,
+        FolderAncestryCache, MAX_FOLDER_DEPTH, StoredCommittedFolderRefV1,
+        active_note_sibling_exists_tx, build_resource_facts_tx, derive_command_identity_spec,
+        extract_agent_run_from_auth, insert_folder_alias_tx, load_folder_ancestry_tx,
+        load_note_head_row_opt_tx, upsert_agent_run_head_tx, validate_mutation_identity,
     },
     runtime::{
         active_folder_sibling_exists, active_project_slug_exists, insert_revision_row,
@@ -985,9 +985,12 @@ pub(crate) async fn resolve_folder_alias_impl(
                 }
 
                 let parent_id = parent.unwrap_or_else(|| space_rec.root_folder_id.clone());
+                let mut cache = FolderAncestryCache::default();
 
-                resolve_folder_component_tx(tx, &space_rec, &auth, &parent_id, &slug_fold, true)
-                    .await
+                resolve_folder_component_tx(
+                    tx, &space_rec, &auth, &parent_id, &slug_fold, true, &mut cache,
+                )
+                .await
             })
         })
         .await
@@ -1000,6 +1003,7 @@ pub(super) async fn resolve_folder_component_tx(
     parent_id: &FolderId,
     slug_fold: &str,
     aliases: bool,
+    cache: &mut FolderAncestryCache,
 ) -> Result<Option<FolderRef>, PortError> {
     let scope = &space_rec.scope;
     // 1. Exact active sibling takes priority over any historical alias!
@@ -1033,7 +1037,7 @@ pub(super) async fn resolve_folder_component_tx(
     if let Some(fid_raw) = active_sibling {
         let fid = FolderId::parse(&fid_raw)
             .map_err(|_| internal_not_committed("corrupt_folder_id", "invalid folder_id"))?;
-        if is_folder_readable_tx(tx, &space_rec.space, auth, &fid).await? {
+        if is_folder_readable_tx(tx, &space_rec.space, auth, &fid, cache).await? {
             return Ok(Some(FolderRef {
                 space_id: scope.space_id.clone(),
                 folder_id: fid,
@@ -1096,7 +1100,7 @@ pub(super) async fn resolve_folder_component_tx(
         let fid = FolderId::parse(&cand_raw).map_err(|_| {
             internal_not_committed("corrupt_alias_folder_id", "invalid target_folder_id")
         })?;
-        if is_folder_readable_tx(tx, &space_rec.space, auth, &fid).await? {
+        if is_folder_readable_tx(tx, &space_rec.space, auth, &fid, cache).await? {
             return Ok(Some(FolderRef {
                 space_id: scope.space_id.clone(),
                 folder_id: fid,
@@ -1536,10 +1540,10 @@ async fn is_folder_readable_tx(
     space: &notarium_core::auth::Space,
     auth: &notarium_core::auth::EngineAuthContext,
     folder_id: &FolderId,
+    cache: &mut FolderAncestryCache,
 ) -> Result<bool, PortError> {
-    let Some(anc) = super::common::optional_read(
-        load_folder_ancestry_tx(tx, &space.id, folder_id, true).await,
-    )?
+    let Some(anc) =
+        super::common::optional_read(cache.load_ancestry_tx(tx, &space.id, folder_id, true).await)?
     else {
         return Ok(false);
     };

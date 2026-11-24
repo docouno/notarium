@@ -81,9 +81,10 @@ pub(super) async fn run_keeper_turn(
         if branch.thread.head != head {
             return Err(conflict(&branch.thread));
         }
+        let abilities_ctx = turn.context(&budget)?;
         let abilities = runtime_abilities::keeper(
             registry,
-            &ctx,
+            &abilities_ctx,
             &selection,
             &schedule.definition.approved_role,
             &schedule.approved_skills,
@@ -111,7 +112,7 @@ pub(super) async fn run_keeper_turn(
             secondary_projects: abilities.secondary_projects,
             messages,
             tools: if model.supports_tools {
-                registry.provider_tools(ctx.auth())
+                registry.provider_tools(abilities_ctx.auth())
             } else {
                 vec![]
             },
@@ -124,10 +125,11 @@ pub(super) async fn run_keeper_turn(
         let (branch, request, proof) = history.plan(request, budget.input_ceiling())?;
         let compacting = proof.compacts_through.is_some();
         let target_tokens = request.budget.max_output_tokens;
+        let step_ctx = turn.context(&budget)?;
         let settled = complete_step(
             registry.control(),
             registry,
-            ctx,
+            step_ctx,
             request,
             CompletionActor { run, episode: None },
             &mut budget,

@@ -14,6 +14,7 @@ pub trait NoteReadPort: Send + Sync {
         ctx: SpaceContext,
         base: Option<FolderId>,
         after: Option<FolderId>,
+        at_seq: Option<SpaceSeq>,
         limit: PageLimit,
     ) -> PortFuture<'_, ChildFolders>;
     fn resolve_note_target(

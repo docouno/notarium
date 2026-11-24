@@ -390,6 +390,88 @@ async fn supervised_turn_survives_disconnect_and_stops_cleanly(
         "Partial result"
     );
 
+    // Invalid ChatRunOptions (max_steps = 0) must reject before appending any human entry.
+    let mut bad_options = options.clone();
+    bad_options.limits.max_steps = 0;
+    let rejected = supervisor
+        .enqueue_input(
+            owner.clone(),
+            input(246, partial_head, "Should not persist with max_steps=0."),
+            bad_options,
+        )
+        .await
+        .map(|_| ());
+    assert!(
+        matches!(
+            rejected,
+            Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
+                if diagnostic.reason == notarium_core::error::ValidationReason::BudgetExceeded
+        ),
+        "max_steps=0 must fail before append: {rejected:?}"
+    );
+    assert_eq!(idle_leaf(fixture, personal, &thread).await, partial_head);
+
+    // Partial text + well-formed tool call + finish=length must preserve the
+    // partial text with Length interruption without executing the truncated call.
+    let partial_with_tool = supervisor
+        .enqueue_input(
+            owner.clone(),
+            input(247, partial_head, "Return truncated text with tool call."),
+            options.clone(),
+        )
+        .await
+        .unwrap();
+    let (mut truncated_call_conn, _) = timeout(Duration::from_secs(10), read_request(&listener))
+        .await
+        .unwrap();
+    let stream = supervisor
+        .subscribe(owner.clone(), scope.clone(), thread.clone(), None)
+        .await
+        .unwrap()
+        .unwrap();
+    send_ollama(
+        &mut truncated_call_conn,
+        json!({
+            "role": "assistant",
+            "content": "Partial before truncated tool",
+            "tool_calls": [{
+                "function": {
+                    "name": "whoami",
+                    "arguments": {}
+                }
+            }]
+        }),
+        "length",
+    )
+    .await;
+    let events = stream_events(stream).await;
+    assert_eq!(events.last().unwrap()["type"], "run_failed");
+    assert_eq!(events.last().unwrap()["code"], "budget_exceeded");
+    assert!(
+        !events.iter().any(|event| event["type"] == "tool_result"),
+        "truncated tool call on finish=length must not execute"
+    );
+    let partial_head = idle_leaf(fixture, personal, &thread).await;
+    assert!(partial_with_tool.run.is_some());
+    let entries = fixture
+        .canonical
+        .read_chat_contents(
+            personal.clone(),
+            ChatContentRead {
+                thread: thread.clone(),
+                leaf: partial_head,
+                entries: vec![partial_head],
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(entries[0].interruption, Some(CompletionFinish::Length));
+    assert!(entries[0].tool_calls.is_empty());
+    assert_eq!(
+        ClassEgressFence::chat_transcript(&entries[0].content, owner.auth()).unwrap(),
+        "Partial before truncated tool"
+    );
+
     let second = supervisor
         .enqueue_input(
             owner.clone(),
