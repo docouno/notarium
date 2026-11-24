@@ -597,7 +597,9 @@ same example against an isolated prefix.
   `chat_entries.{human_origin, body_format, provenance_json}` (with typed `effect_kind`
   inside the structured proposal JSON body), and secondary indexes for personal Space
   lookup (`idx_spaces_personal_owner`), receipt sequence scans
-  (`idx_command_receipts_seq`), and active project roots (`idx_folder_heads_active_projects_id`).
+  (`idx_command_receipts_seq`), active project roots
+  (`idx_folder_heads_active_projects_id`), and incremental folder-change scans
+  (`idx_folder_heads_space_updated`).
   It returns typed rows in the original table and column order within the
   caller's byte budget. To materialize a historical spool, create an empty
   target with `schema::POSTGRES_BASELINE_DDL`. Match the version and manifest

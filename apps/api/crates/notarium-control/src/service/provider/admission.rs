@@ -27,17 +27,16 @@ use notarium_core::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
-/// Model-authored search queries may reflect any non-encrypted class disclosed
-/// to the calling run in this Space. Require the embedding provider to cover
-/// every such class (failing closed to the run's non-encrypted Space grant if
-/// prior completion providers cannot be proved narrower).
+/// Model-authored search queries may reflect any non-encrypted class previously
+/// disclosed to the calling run across its recorded provider calls. Require the
+/// embedding provider to cover every such class, failing closed to the run's
+/// non-encrypted Space grant if any recorded call lacks class disclosure data,
+/// fails parsing, or exceeds the bounded scan limit. A clean run with zero
+/// prior recorded provider calls has no prior disclosure.
 pub(super) async fn required_query_source_classes(
     tx: &mut Transaction,
     auth: &EngineAuthContext,
-    space: &Space,
-    query_project: Option<&FolderRef>,
     grant: &SpaceGrant,
-    now: i64,
 ) -> Result<BTreeSet<DocClass>, PortError> {
     let run = match auth.kind() {
         PrincipalKind::AgentRun(run) | PrincipalKind::Keeper(run) => run,
@@ -49,94 +48,41 @@ pub(super) async fn required_query_source_classes(
         .copied()
         .filter(|class| *class != DocClass::EncryptedNote)
         .collect();
-    let prior_resources = rows!(
+    let prior_calls = rows!(
         tx,
         (String,),
         fetch_all,
-        "SELECT DISTINCT resource_id FROM provider_call_log WHERE run_id=$1 ORDER BY resource_id LIMIT 65",
-        "SELECT DISTINCT resource_id FROM v1_control.provider_call_log WHERE run_id=$1 ORDER BY resource_id LIMIT 65";
+        "SELECT policy_epochs FROM provider_call_log WHERE run_id=$1 ORDER BY call_id LIMIT 65",
+        "SELECT policy_epochs FROM v1_control.provider_call_log WHERE run_id=$1 ORDER BY call_id LIMIT 65";
         run.as_str()
     )?;
-    if prior_resources.is_empty() {
+    if prior_calls.is_empty() {
         return Ok(BTreeSet::new());
     }
-    if prior_resources.len() > 64 {
+    if prior_calls.len() > 64 {
         return Ok(grant_readable);
     }
-    let run_project = grant.project_root.as_ref().map(|folder_id| FolderRef {
-        space_id: space.id.clone(),
-        folder_id: folder_id.clone(),
-    });
     let mut required = BTreeSet::new();
-    for (resource_id,) in prior_resources {
-        let Some(res) = rows!(
-            tx,
-            ProviderResourcesRow,
-            fetch_optional,
-            "SELECT * FROM provider_resources WHERE id=$1",
-            "SELECT * FROM v1_control.provider_resources WHERE id=$1";
-            &resource_id
-        )?
-        else {
+    for (raw_epochs,) in prior_calls {
+        let Some(classes) = parse_logged_disclosed_classes(&raw_epochs) else {
             return Ok(grant_readable);
         };
-        let credential_epoch = if let Some(cred_id) = &res.credential_id {
-            let Some(cred) = rows!(
-                tx,
-                CredentialsRow,
-                fetch_optional,
-                "SELECT * FROM credentials WHERE id=$1",
-                "SELECT * FROM v1_control.credentials WHERE id=$1";
-                cred_id
-            )?
-            else {
-                return Ok(grant_readable);
-            };
-            Some(cred.consent_epoch)
-        } else {
-            None
-        };
-        let primary_policy = selection::policy(
-            tx,
-            auth,
-            &res,
-            credential_epoch,
-            space,
-            run_project.as_ref(),
-            now,
-            false,
-        )
-        .await;
-        let admitted = match primary_policy {
-            Ok(policy) => policy,
-            Err(_) if run_project.is_none() && query_project.is_some() => {
-                match selection::policy(
-                    tx,
-                    auth,
-                    &res,
-                    credential_epoch,
-                    space,
-                    query_project,
-                    now,
-                    false,
-                )
-                .await
-                {
-                    Ok(policy) => policy,
-                    Err(_) => return Ok(grant_readable),
-                }
-            }
-            Err(_) => return Ok(grant_readable),
-        };
         required.extend(
-            admitted
-                .policy
-                .allowed_classes
+            classes
                 .into_iter()
-                .filter(|class| grant_readable.contains(class)),
+                .filter(|class| *class != DocClass::EncryptedNote),
         );
     }
     Ok(required)
+}
+
+fn parse_logged_disclosed_classes(raw: &str) -> Option<BTreeSet<DocClass>> {
+    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let array = value.as_array()?;
+    if array.first()?.as_u64()? != 2 {
+        return None;
+    }
+    serde_json::from_value(array.get(4)?.clone()).ok()
 }
 
 pub(super) struct Snapshot {
@@ -152,6 +98,7 @@ pub(super) struct Validated {
     pub auth: EngineAuthContext,
     pub selectors: Vec<RevocationSelector>,
     pub spaces: Vec<SpaceId>,
+    pub disclosed_classes: BTreeSet<DocClass>,
     pub expires_at_ms: Option<i64>,
 }
 pub(super) struct DispatchAuthority<'a> {
@@ -198,14 +145,15 @@ impl Snapshot {
         }
         Ok(budgets)
     }
-    pub fn epochs(&self) -> Result<String, PortError> {
+    pub fn epochs(&self, disclosed_classes: &BTreeSet<DocClass>) -> Result<String, PortError> {
         json(&(
-            1,
+            2_u8,
             self.resource.consent_epoch,
             self.resource.runtime_epoch,
             self.credential
                 .as_ref()
                 .map(|value| (&value.id, value.consent_epoch, value.runtime_epoch)),
+            disclosed_classes,
         ))
     }
 }
@@ -430,23 +378,13 @@ impl ProviderService {
             {
                 return Err(DomainError::AccessDenied.into());
             }
-            let source_classes = required_query_source_classes(
-                tx,
-                &auth,
-                &primary.space,
-                query.project_scope.as_ref(),
-                grant,
-                now,
-            )
-            .await?;
-            if !query
-                .classes
+            let source_classes = required_query_source_classes(tx, &auth, grant).await?;
+            if !query.classes.iter().all(|class| {
+                admitted.policy.allowed_classes.contains(class)
+                    && grant.read_classes.contains(class)
+            }) || !source_classes
                 .iter()
-                .chain(source_classes.iter())
-                .all(|class| {
-                    admitted.policy.allowed_classes.contains(class)
-                        && grant.read_classes.contains(class)
-                })
+                .all(|class| admitted.policy.allowed_classes.contains(class))
             {
                 return Err(invalid(ValidationReason::ClassEgressForbidden));
             }
@@ -653,6 +591,15 @@ impl ProviderService {
             auth.credential().ok_or(DomainError::AuthenticationFailed)?,
         )
         .await?;
+        let disclosed_classes: BTreeSet<DocClass> = if query_only {
+            BTreeSet::new()
+        } else {
+            policies
+                .values()
+                .flat_map(|policy| policy.policy.allowed_classes.iter().copied())
+                .filter(|class| *class != DocClass::EncryptedNote)
+                .collect()
+        };
         let expires_at_ms = policies
             .values()
             .filter_map(|policy| policy.expires_at_ms)
@@ -662,6 +609,7 @@ impl ProviderService {
             auth,
             selectors: selectors.into_iter().collect(),
             spaces: spaces.into_keys().collect(),
+            disclosed_classes,
             expires_at_ms,
         })
     }

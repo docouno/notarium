@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use super::*;
 use notarium_core::{
     classes::{DocClass, ProviderAudience, ProviderPolicy},
@@ -162,4 +164,33 @@ fn four_large_tool_outputs_fit_within_32k_model_window() {
     assert!(completion_text_estimate(&bounded_utf8) <= max_tokens);
     // All 4 tool outputs plus fixed prompt overhead stay well under 32,768 tokens.
     assert!(2_000 + 4 * (completion_text_estimate(&bounded_ascii) + 8) < 32_768);
+}
+
+#[test]
+fn tight_8k_multi_tool_budget_never_overshoots_and_utf8_search_keeps_full_char() {
+    let calls: Vec<ProviderToolCall> = (0..64_u8)
+        .map(|i| ProviderToolCall {
+            id: ProviderToolCallId::new(format!("call-{i}")).unwrap(),
+            name: "get_note".into(),
+            arguments: BTreeMap::from([("ref".into(), serde_json::json!(format!("note-{i}")))]),
+        })
+        .collect();
+    let (max_bytes, max_tokens) =
+        step_tool_display_budget(8_192, 4_500, "Calling 64 tools.", &calls);
+    let sample = "alpha beta gamma ".repeat(100);
+    let rendered = bounded_tool_text_within(&sample, max_bytes, max_tokens);
+    let rendered_tokens = completion_text_estimate(&rendered);
+    assert!(rendered_tokens <= max_tokens);
+    let per_tool_total = (4 + rendered_tokens) * 64;
+    assert!(
+        4_500 + per_tool_total <= 8_192,
+        "64 tool outputs must not overshoot 8k window (total {})",
+        4_500 + per_tool_total
+    );
+
+    // 4-byte emoji followed by 2-byte accented char: boundary 4 must be kept when it fits.
+    let pair = "\u{1F4D3}\u{00E9}";
+    let emoji_tokens = completion_text_estimate("\u{1F4D3}");
+    let clipped = bounded_tool_text_within(pair, 4, emoji_tokens);
+    assert_eq!(clipped, "\u{1F4D3}");
 }

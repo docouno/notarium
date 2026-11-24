@@ -1,5 +1,5 @@
 use super::{
-    super::{EgressTarget, ToolCallContext, ToolName, corpus, decode, invalid},
+    super::{EgressTarget, ToolCallContext, ToolName, corpus, decode, derive_digest, invalid},
     predicates::unrestricted,
     scope::targets,
 };
@@ -7,7 +7,7 @@ use notarium_core::{
     DomainError,
     classes::{ClassifiedMetadata, DocClass},
     error::{PortError, ValidationReason},
-    ids::{EpisodeId, NoteId},
+    ids::{EpisodeId, NoteId, RequestId},
     model::FolderRef,
     ports::{
         AgentRetrieval, PageLimit, PortFuture, RecallQuery, RetrievalKind, SearchDegradation,
@@ -126,7 +126,23 @@ pub(super) async fn retrieve(
     let top_k =
         PageLimit::new(u16::try_from(limit).map_err(|_| invalid(ValidationReason::InvalidLimit))?)?;
     for (index, target) in targets.iter().enumerate() {
-        let scope = call.space(target.scope.clone())?;
+        let mut scope = call.space(target.scope.clone())?;
+        // Scope remote query intent ids to this tool invocation so multi-step
+        // chat/keeper runs sharing one run RequestId can issue repeated search
+        // or recall calls without colliding on provider_call_log intent keys.
+        let req_digest = derive_digest(
+            "notarium.mcp.retrieval.request.v1",
+            &[
+                call.request.as_str().as_bytes(),
+                call.request_key.as_str().as_bytes(),
+                if recall { b"recall" } else { b"search" },
+            ],
+        );
+        scope.budget.request = RequestId::from_bytes(
+            req_digest.as_bytes()[..16]
+                .try_into()
+                .expect("fixed digest"),
+        );
         let query = SearchQuery {
             text: args.query.clone(),
             filter: unrestricted(),
@@ -160,8 +176,7 @@ pub(super) async fn retrieve(
             let selection_project = primary_project
                 .as_ref()
                 .filter(|project| project.space_id == target.scope.space_id)
-                .cloned()
-                .or_else(|| target.project.clone());
+                .cloned();
             let allowed = match call.provider_selection(&scope, selection_project).await {
                 Ok(Some(selection)) => selection
                     .policy

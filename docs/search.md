@@ -213,8 +213,12 @@ parts. Changing the default recipient drains in-flight implicit calls for the
 affected Space before the preference commits. Explicit calls retain their
 own provider admission. They require an untainted
 context, a matching project scope, and a nonempty intersection of search
-classes and provider disclosure. For project-scoped queries the canonical
-egress lease pins the requested folder inside that project through dispatch. Provider admission rechecks current access and
+classes and provider disclosure; for model-authored queries from chat runs and
+Keepers, the remote embedding provider must additionally cover every
+non-encrypted class disclosed to that run or allowed to its active completion
+provider, degrading to lexical search with `ProviderUnavailable` otherwise. For
+project-scoped queries the canonical egress lease pins the requested folder
+inside that project through dispatch. Provider admission rechecks current access and
 token limits. Dispatch compares both resolved runtime generations and checks
 the shared taint. Chat runs and Keepers can disclose a query only in their
 pinned Space. Reading another Space marks the branch before remote vector

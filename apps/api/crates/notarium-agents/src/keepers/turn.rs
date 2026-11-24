@@ -125,7 +125,6 @@ pub(super) async fn run_keeper_turn(
         };
         let fixed_tokens =
             notarium_control::service::provider::completion_input_estimate(&request)?;
-        let step_input_ceiling = model.max_input_tokens.min(budget.input_ceiling());
         let (branch, request, proof) = history.plan(request, budget.input_ceiling())?;
         let compacting = proof.compacts_through.is_some();
         let target_tokens = request.budget.max_output_tokens;
@@ -143,6 +142,7 @@ pub(super) async fn run_keeper_turn(
         if compacting {
             prompt::validate_summary(settled.finish, &settled.text, target_tokens)?;
         }
+        let step_input_ceiling = model.max_input_tokens.min(budget.input_ceiling());
         let tool_display_budget = step_tool_display_budget(
             step_input_ceiling,
             fixed_tokens,

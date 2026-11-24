@@ -42,6 +42,7 @@ getrandom.workspace = true
 hex.workspace = true
 ipnet.workspace = true
 mimalloc.workspace = true
+notarium-agents = { workspace = true, features = ["test-support"] }
 notarium-canonical = { workspace = true, features = ["test-support"] }
 notarium-projections = { workspace = true, features = ["test-support"] }
 notarium-search = { workspace = true, features = ["test-support"] }

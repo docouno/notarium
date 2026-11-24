@@ -19,8 +19,9 @@ use notarium_core::{
     ports::{
         AccountMutation, AckOwner, AgentEpisode, BearerScope, CatalogDisclosure,
         ControlPageRequest, EpisodeDiagnostic, EpisodeRevisionGuard, EpisodeSelector,
-        EpisodeStartResult, GetNote, MAX_PROJECT_BOOTSTRAP_VALUES, NoteMetadataSnapshot,
-        NoteSnapshot, PageLimit, ProviderErrorCode, SpaceContext, StartEpisode,
+        EpisodeStartResult, GetNote, MAX_PROJECT_BOOTSTRAP_VALUES, NamedEpisodePreview,
+        NoteMetadataSnapshot, NoteSnapshot, PageLimit, ProviderErrorCode, SpaceContext,
+        StartEpisode,
     },
     receipt::CausalBasis,
 };
@@ -376,26 +377,34 @@ async fn start(call: &mut ToolCallContext<'_>, args: StartArgs) -> Result<Value,
     }
     if let Some(role_selector) = args.role.as_deref() {
         let preview_project = if plan.project.is_some() {
-            plan.project.clone()
+            Some(plan.project.clone())
         } else {
             match &selector {
                 EpisodeSelector::Id(id) | EpisodeSelector::Resume(id) => {
-                    call.registry
+                    let episode = call
+                        .registry
                         .control
                         .get_episode(call.account(), id.clone())
-                        .await?
-                        .project_hint
+                        .await?;
+                    Some(selected_project_for_episode(call, None, Some(&episode)).await?)
                 }
-                EpisodeSelector::Name(name) => {
-                    call.registry
-                        .control
-                        .named_episode_project_hint(call.account(), name.clone())
-                        .await?
-                }
-                EpisodeSelector::New { .. } => None,
+                EpisodeSelector::Name(name) => match call
+                    .registry
+                    .control
+                    .named_episode_project_hint(call.account(), name.clone())
+                    .await?
+                {
+                    NamedEpisodePreview::NoMatch => Some(None),
+                    NamedEpisodePreview::Unique(project) => Some(project),
+                    NamedEpisodePreview::Ambiguous => None,
+                },
+                EpisodeSelector::New { .. } => Some(None),
             }
         };
-        ability_tools::validate_session_role(call, role_selector, preview_project.as_ref()).await?;
+        if let Some(preview_project) = preview_project {
+            ability_tools::validate_session_role(call, role_selector, preview_project.as_ref())
+                .await?;
+        }
     }
     let selector = match selector {
         EpisodeSelector::New { name, .. } => EpisodeSelector::New {

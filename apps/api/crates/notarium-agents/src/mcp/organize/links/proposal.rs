@@ -160,18 +160,10 @@ pub(super) async fn exact_link_revision(
 }
 
 fn unknown(error: PortError) -> PortError {
-    let diagnostic = derive_digest(
+    super::super::super::note_tools::batch_operational_error(
         "notarium.confirmed-link-receipt.v1",
-        &[error.code().as_bytes()],
-    );
-    PortError::Unavailable(
-        OperationalFailure::new(
-            diagnostic,
-            CommitEffect::Unknown,
-            RetryAdvice::RetrySameCommand,
-            true,
-        )
-        .expect("same-command retry has durable identity"),
+        error,
+        true,
     )
 }
 
@@ -271,7 +263,15 @@ pub(in crate::mcp) async fn apply_links(
             let pinned = call.fence_confirmed_effect(pinned).await?;
             let persisted = call.registry.engine.link(pinned, mutation).await?;
             if persisted.value.source != plan.source {
-                return Err(unknown(invalid(ValidationReason::SourceMismatch)));
+                return Err(PortError::Unavailable(
+                    OperationalFailure::new(
+                        derive_digest("notarium.confirmed-link-receipt.v1", &[b"source_mismatch"]),
+                        CommitEffect::Unknown,
+                        RetryAdvice::RetrySameCommand,
+                        true,
+                    )
+                    .expect("same-command retry has durable identity"),
+                ));
             }
             // The committed note revision comes from the exact receipt event.
             // A fresh tip read could include an intervening manual edit and

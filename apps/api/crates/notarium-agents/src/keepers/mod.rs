@@ -446,36 +446,66 @@ impl KeeperScheduler {
         let control = self.inner.registry.control();
         let mut result = control.claim_schedule(ctx.clone(), claim.clone()).await;
         let mut cursor = fresh;
-        const MAX_NEXT_SLOT_RETRIES: usize = 64;
+        let mut tried_now_fallback = false;
+        const MAX_NEXT_SLOT_RETRIES: usize = 16;
         for _ in 0..MAX_NEXT_SLOT_RETRIES {
             if !matches!(&result, Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
                 if diagnostic.reason == ValidationReason::InvalidTimestamp)
             {
                 break;
             }
-            // A clock crossing a cron boundary while waiting for a worker slot
-            // or during Control admission is a definite rejection. Recompute
-            // the next-slot witness from the latest clock/elapsed time under
-            // the same slot ownership fence.
-            let latest = if let Some(clock) = clock {
-                clock_now(clock)?.max(now)
-            } else if let Some(tick_started) = tick_started {
-                advance_timestamp(now, tick_started.elapsed())?
-            } else {
-                now
-            };
-            cursor = cursor.max(latest);
-            let mut refreshed = next(cursor)?;
-            if let Some(prev_next) = claim.next_slot
-                && refreshed.is_some_and(|candidate| candidate <= prev_next)
-            {
-                cursor = cursor.max(prev_next);
-                refreshed = next(cursor)?;
+            if cancellation.is_cancelled() || ownership_lost.is_cancelled() {
+                break;
             }
-            if refreshed == claim.next_slot
-                || cancellation.is_cancelled()
-                || ownership_lost.is_cancelled()
-            {
+            // If `fresh > now` (e.g., local poller clock slightly ahead of
+            // Control or backward NTP step), probe `next(now)` once before
+            // stepping forward.
+            let refreshed = if fresh > now && !tried_now_fallback {
+                tried_now_fallback = true;
+                let fallback = next(now)?;
+                if fallback != claim.next_slot {
+                    fallback
+                } else {
+                    let latest = if let Some(clock) = clock {
+                        clock_now(clock)?.max(now)
+                    } else if let Some(tick_started) = tick_started {
+                        advance_timestamp(now, tick_started.elapsed())?
+                    } else {
+                        now
+                    };
+                    cursor = cursor.max(latest);
+                    let mut candidate = next(cursor)?;
+                    if let Some(prev_next) = claim.next_slot
+                        && candidate.is_some_and(|next_ts| next_ts <= prev_next)
+                    {
+                        cursor = cursor.max(prev_next);
+                        candidate = next(cursor)?;
+                    }
+                    candidate
+                }
+            } else {
+                // A clock crossing a cron boundary while waiting for a worker
+                // slot or during Control admission is a definite rejection.
+                // Recompute the next-slot witness from the latest clock/elapsed
+                // time under the same slot ownership fence.
+                let latest = if let Some(clock) = clock {
+                    clock_now(clock)?.max(now)
+                } else if let Some(tick_started) = tick_started {
+                    advance_timestamp(now, tick_started.elapsed())?
+                } else {
+                    now
+                };
+                cursor = cursor.max(latest);
+                let mut candidate = next(cursor)?;
+                if let Some(prev_next) = claim.next_slot
+                    && candidate.is_some_and(|next_ts| next_ts <= prev_next)
+                {
+                    cursor = cursor.max(prev_next);
+                    candidate = next(cursor)?;
+                }
+                candidate
+            };
+            if refreshed == claim.next_slot {
                 break;
             }
             owner.check()?;

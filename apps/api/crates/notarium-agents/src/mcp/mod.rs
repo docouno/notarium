@@ -257,6 +257,11 @@ impl ToolRegistry {
         self
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_bootstrap_continuation_ttl_for_tests(&self, ttl: std::time::Duration) {
+        self.bootstrap.set_ttl(ttl);
+    }
+
     pub async fn list_tools(
         &self,
         ctx: AccountContext,
@@ -676,6 +681,62 @@ impl<'a> ToolCallContext<'a> {
             .await
     }
 
+    async fn lookup_journal_with_key<T: DeserializeOwned>(
+        &self,
+        label: &str,
+        request_key: &CommandKey,
+        request_hash: ContentDigest,
+    ) -> Result<Option<T>, PortError> {
+        let key = McpDedupKey {
+            actor: command_actor(&self.auth).to_owned(),
+            request_key: subcommand_key(request_key, label, 0),
+            request_hash,
+            operation: self.tool.name().to_owned(),
+        };
+        let Some(hit) = self
+            .registry
+            .control
+            .lookup_mcp_dedup(self.account(), key)
+            .await?
+        else {
+            return Ok(None);
+        };
+        serde_json::from_str(&hit.safe_result)
+            .map(Some)
+            .map_err(|_| invalid(ValidationReason::InvalidState))
+    }
+
+    async fn record_journal_with_key<T: Serialize + DeserializeOwned>(
+        &self,
+        label: &str,
+        request_key: &CommandKey,
+        request_hash: ContentDigest,
+        plan: &T,
+    ) -> Result<T, PortError> {
+        let key = McpDedupKey {
+            actor: command_actor(&self.auth).to_owned(),
+            request_key: subcommand_key(request_key, label, 0),
+            request_hash,
+            operation: self.tool.name().to_owned(),
+        };
+        let safe_result =
+            serde_json::to_string(plan).map_err(|_| invalid(ValidationReason::InvalidState))?;
+        let hit = self
+            .registry
+            .control
+            .record_mcp_dedup(
+                self.account(),
+                McpDedupRecord {
+                    key,
+                    safe_result,
+                    effect: AgentEffect::None,
+                    ttl_ms: JOURNAL_TTL_MS,
+                },
+            )
+            .await?;
+        serde_json::from_str(&hit.safe_result).map_err(|_| invalid(ValidationReason::InvalidState))
+    }
+
     async fn journal_with_key<
         T: Serialize + DeserializeOwned,
         F: Future<Output = Result<T, PortError>>,
@@ -686,38 +747,15 @@ impl<'a> ToolCallContext<'a> {
         request_hash: ContentDigest,
         build: impl FnOnce() -> F,
     ) -> Result<T, PortError> {
-        let key = McpDedupKey {
-            actor: command_actor(&self.auth).to_owned(),
-            request_key: subcommand_key(request_key, label, 0),
-            request_hash,
-            operation: self.tool.name().to_owned(),
-        };
-        let hit = match self
-            .registry
-            .control
-            .lookup_mcp_dedup(self.account(), key.clone())
+        if let Some(hit) = self
+            .lookup_journal_with_key::<T>(label, request_key, request_hash)
             .await?
         {
-            Some(hit) => hit,
-            None => {
-                let plan = build().await?;
-                let safe_result = serde_json::to_string(&plan)
-                    .map_err(|_| invalid(ValidationReason::InvalidState))?;
-                self.registry
-                    .control
-                    .record_mcp_dedup(
-                        self.account(),
-                        McpDedupRecord {
-                            key,
-                            safe_result,
-                            effect: AgentEffect::None,
-                            ttl_ms: JOURNAL_TTL_MS,
-                        },
-                    )
-                    .await?
-            }
-        };
-        serde_json::from_str(&hit.safe_result).map_err(|_| invalid(ValidationReason::InvalidState))
+            return Ok(hit);
+        }
+        let plan = build().await?;
+        self.record_journal_with_key(label, request_key, request_hash, &plan)
+            .await
     }
 
     async fn provider_selection(

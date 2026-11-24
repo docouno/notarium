@@ -588,17 +588,17 @@ async fn handoff_and_archive_fence(store: &CanonicalStore) {
 async fn clean_leaf_retains_audit_taint(store: &CanonicalStore) {
     let (scope, owner, thread) =
         setup(store, 0xe6, SpaceKind::Personal, ChatThreadKind::Personal).await;
-    let post = |parent, tainted| {
+    let post = |parent, kind, provenance, tainted| {
         next_mutation(
             &scope,
             &owner,
             AppendChat {
                 thread: thread.clone(),
                 parent,
-                kind: ChatEntryKind::Human,
+                kind,
                 body: ChatInputBody::Text("A selected branch".into()),
                 tool_calls: Vec::new(),
-                provenance: None,
+                provenance,
                 interruption: None,
                 proposed_diff: None,
                 proposed_effect: None,
@@ -610,7 +610,7 @@ async fn clean_leaf_retains_audit_taint(store: &CanonicalStore) {
     let old = store
         .append_chat(
             owner_ctx(&scope, owner.clone()),
-            post(ThreadEntrySeq::ZERO, true),
+            post(ThreadEntrySeq::ZERO, ChatEntryKind::Human, None, true),
         )
         .await
         .unwrap()
@@ -642,7 +642,15 @@ async fn clean_leaf_retains_audit_taint(store: &CanonicalStore) {
     .await;
     assert!(!active.auth().taint().is_tainted());
     let fresh = store
-        .append_chat(active.clone(), post(ThreadEntrySeq::ZERO, false))
+        .append_chat(
+            active.clone(),
+            post(
+                ThreadEntrySeq::ZERO,
+                ChatEntryKind::Model,
+                Some(ChatProvenance::default()),
+                false,
+            ),
+        )
         .await
         .unwrap()
         .value;

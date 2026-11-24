@@ -378,7 +378,9 @@ pub(super) async fn edit_note(
             },
         )
         .await?;
-    receipt_result(call, scope, &route.note, committed, "edited").await
+    receipt_result(call, scope, &route.note, committed, "edited")
+        .await
+        .map_err(|error| super::batch_operational_error("notarium.mcp.edit-note.v1", error, true))
 }
 
 #[cfg(test)]

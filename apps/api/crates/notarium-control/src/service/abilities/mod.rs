@@ -445,6 +445,12 @@ impl BatchedAbilityControl {
     ) -> Result<Vec<AbilityDescriptor>, PortError> {
         let mut winners: Vec<AbilityDescriptor> = Vec::new();
         for current in candidates {
+            if !self.promotion_is_committed(
+                current.promoted_from.as_ref(),
+                &current.reference.identity(),
+            )? {
+                continue;
+            }
             let candidate = self.overlay(current)?;
             if let Some(previous) = winners.first() {
                 let level = candidate

@@ -914,6 +914,7 @@ pub(crate) fn build_rollback_direct_single_tx_exec(
         Box::pin(async move {
             auth.authorize_space_write(&item_ctx.space)?;
             let (run, expected) = target.parts();
+            ensure_chat_run_not_active_tx(tx, &scope_cl.space_id, run).await?;
             let mut folder_cache = FolderAncestryCache::default();
             type RollbackStateProbe = (bool, bool, Option<bool>, bool, Option<(Vec<u8>, String)>);
             let (has_bmh, has_note_states, known_overlays, read_schema, run_head_opt): RollbackStateProbe =
@@ -972,7 +973,6 @@ pub(crate) fn build_rollback_direct_single_tx_exec(
             let Some((inc_bytes, run_rev_raw)) = run_head_opt else {
                 return Err(DomainError::ResourceNotFound.into());
             };
-            ensure_chat_run_not_active_tx(tx, &scope_cl.space_id, run).await?;
             let actual_run_rev = scoped_run_revision(&scope_cl, &inc_bytes, &run_rev_raw)?;
 
             let histories = load_direct_rollback_histories(tx, &scope_cl.space_id, run).await?;

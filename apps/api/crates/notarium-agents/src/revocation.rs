@@ -47,7 +47,6 @@ struct State {
     provider: BTreeMap<RegistrationId, Registered>,
     canonical_effects: BTreeMap<RegistrationId, CanonicalRegistration>,
     runs: BTreeMap<AgentRunId, Registered>,
-    rolling_back: BTreeMap<AgentRunId, usize>,
     viewers: BTreeMap<RegistrationId, Registered>,
     fences: BTreeMap<RegistrationId, Selectors>,
     pending: BTreeMap<PendingCredentialKey, PendingCredential>,
@@ -348,10 +347,7 @@ impl RevocationHub {
         {
             return Err(cancelled());
         }
-        if state.fenced(&selectors)
-            || state.runs.contains_key(run)
-            || state.rolling_back.contains_key(run)
-        {
+        if state.fenced(&selectors) || state.runs.contains_key(run) {
             return Err(revocation_unavailable());
         }
         state.runs.insert(
@@ -624,28 +620,32 @@ impl RevocationHub {
     }
 
     /// Fence, cancel, and wait for any local in-flight chat or Keeper run
-    /// matching `run` to drop its run lease and canonical effects before
-    /// executing a rollback.
+    /// matching `(space, run)` to drop its run lease, provider calls, and
+    /// canonical effects before executing a rollback.
     pub(crate) async fn stop_and_drain_run(
         &self,
+        space: &SpaceId,
         run: &AgentRunId,
         budget: &notarium_core::ports::CallBudget,
     ) -> Result<RollbackRunGuard, PortError> {
-        let deadline = Instant::now() + budget.remaining;
-        let selector = RevocationSelector::ScheduledRun(run.clone());
-        let guard = {
+        let deadline = Instant::now()
+            .checked_add(budget.remaining)
+            .ok_or_else(deadline_exceeded)?;
+        let selector = RevocationSelector::AgentRun {
+            space: space.clone(),
+            run: run.clone(),
+        };
+        let (guard, cancellations) = {
             let mut state = self.inner.lock();
             state.ensure_open()?;
-            *state.rolling_back.entry(run.clone()).or_default() += 1;
-            RollbackRunGuard {
-                hub: self.clone(),
-                run: run.clone(),
-            }
-        };
-        let cancellations = {
-            let mut state = self.inner.lock();
+            let fence_id = state.allocate()?;
+            state
+                .fences
+                .insert(fence_id, Selectors::from([selector.clone()]));
             let mut to_cancel = Vec::new();
-            if let Some(entry) = state.runs.get(run) {
+            if let Some(entry) = state.runs.get(run)
+                && entry.selectors.contains(&selector)
+            {
                 to_cancel.push(entry.cancellation.clone());
             }
             for call in state.provider.values() {
@@ -659,7 +659,13 @@ impl RevocationHub {
                     to_cancel.push(effect.entry.cancellation.clone());
                 }
             }
-            to_cancel
+            (
+                RollbackRunGuard {
+                    hub: self.clone(),
+                    fence_id,
+                },
+                to_cancel,
+            )
         };
         cancel_all(cancellations);
         let mut updates = self.inner.changed.subscribe();
@@ -667,7 +673,10 @@ impl RevocationHub {
             let drained = {
                 let state = self.inner.lock();
                 state.ensure_open()?;
-                let run_active = state.runs.contains_key(run);
+                let run_active = state
+                    .runs
+                    .get(run)
+                    .is_some_and(|entry| entry.selectors.contains(&selector));
                 let provider_active = state
                     .provider
                     .values()
@@ -724,21 +733,12 @@ impl RevocationHub {
 
 pub(crate) struct RollbackRunGuard {
     hub: RevocationHub,
-    run: AgentRunId,
+    fence_id: RegistrationId,
 }
 
 impl Drop for RollbackRunGuard {
     fn drop(&mut self) {
-        {
-            let mut state = self.hub.inner.lock();
-            if let Some(count) = state.rolling_back.get_mut(&self.run) {
-                if *count <= 1 {
-                    state.rolling_back.remove(&self.run);
-                } else {
-                    *count -= 1;
-                }
-            }
-        }
+        self.hub.inner.lock().fences.remove(&self.fence_id);
         self.hub.inner.notify();
     }
 }

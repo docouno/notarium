@@ -188,7 +188,6 @@ impl AgentRunSupervisor {
             };
             let fixed_tokens =
                 notarium_control::service::provider::completion_input_estimate(&request)?;
-            let step_input_ceiling = model.max_input_tokens.min(budget.input_ceiling());
             let (branch, request, proof) = history.plan(request, budget.input_ceiling())?;
             if proof.compacts_through.is_some() {
                 let target_tokens = request.budget.max_output_tokens;
@@ -252,6 +251,7 @@ impl AgentRunSupervisor {
             for call in &settled.calls {
                 run.stream.tool_call(step, call)?;
             }
+            let step_input_ceiling = model.max_input_tokens.min(budget.input_ceiling());
             let tool_display_budget = crate::completion::step_tool_display_budget(
                 step_input_ceiling,
                 fixed_tokens,

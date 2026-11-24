@@ -136,6 +136,16 @@ impl History {
         let fixed = summary.messages.len();
         let fixed_tokens = completion_input_estimate(summary)?;
         let fixed_bytes = completion_wire_bytes_estimate(summary)?;
+        let latest_start = groups[latest_message - 1].end;
+        summary.messages.truncate(fixed);
+        summary
+            .messages
+            .extend_from_slice(&messages[latest_start..groups[latest_message].end]);
+        let latest_group_tokens = completion_input_estimate(summary)?.saturating_sub(fixed_tokens);
+        let penultimate_summary_cap = input_ceiling
+            .saturating_sub(normal_fixed_tokens)
+            .saturating_sub(latest_group_tokens)
+            .saturating_sub(4);
         let mut selected = None;
         let mut from = 0;
         let mut total = fixed_tokens;
@@ -166,13 +176,16 @@ impl History {
                 && !group.checkpoint
                 && !groups[index + 1].starts_with_tool
             {
-                let savings = total.saturating_sub(fixed_tokens).saturating_sub(4) / 2;
-                if savings > 0 {
-                    selected = Some((group.through, from, savings));
+                let mut cap = total.saturating_sub(fixed_tokens).saturating_sub(4) / 2;
+                if index + 1 == latest_message {
+                    cap = cap.min(penultimate_summary_cap);
+                }
+                if cap > 0 {
+                    selected = Some((group.through, from, cap));
                 }
             }
         }
-        let Some((through, length, savings)) = selected else {
+        let Some((through, length, max_summary_tokens)) = selected else {
             return Ok(None);
         };
         summary.messages.truncate(fixed);
@@ -181,7 +194,7 @@ impl History {
             .budget
             .max_output_tokens
             .min(MAX_SUMMARY_TOKENS)
-            .min(savings);
+            .min(max_summary_tokens);
         Ok(Some(through))
     }
 }
@@ -524,7 +537,6 @@ mod tests {
     use notarium_core::{
         classes::{DocClass, ProviderAudience, ProviderPolicy},
         ids::{ModelProfileId, PrincipalId, ProviderResourceId, RevisionId, SpaceId},
-        model::HistoryScope,
         ports::{
             ChatThread, ChatThreadKind, CompletionBudget, CompletionModelLimits,
             ProviderRevocationScope, ProviderRuntimeEpochs,
@@ -629,9 +641,135 @@ mod tests {
             completion_wire_bytes_estimate(&planned).unwrap() <= WIRE_CEILING_BYTES,
             "compaction request must stay under codec wire ceiling"
         );
-        let _ = HistoryScope {
-            space_id: space,
-            incarnation: notarium_core::ids::HistoryIncarnation::from_bytes([8; 16]),
+    }
+
+    #[test]
+    fn compaction_caps_summary_output_to_fit_with_retained_latest_group() {
+        let provider = ProviderResourceId::from_bytes([11; 16]);
+        let selection = ProviderSelection {
+            provider: provider.clone(),
+            model: ModelProfileId::from_bytes([12; 16]),
+            runtime_epochs: ProviderRuntimeEpochs {
+                resource: std::num::NonZeroU64::MIN,
+                credential: None,
+            },
+            project: None,
+            project_only: None,
+            policy: ProviderPolicy {
+                provider,
+                audience: ProviderAudience::Personal { consented: true },
+                allowed_classes: DocClass::all(),
+            },
+            completion: Some(CompletionModelLimits {
+                max_input_tokens: 32_768,
+                max_output_tokens: 4096,
+                supports_tools: true,
+            }),
+            revocation_scope: ProviderRevocationScope {
+                owner: PrincipalId::from_bytes([13; 16]),
+                credential: None,
+            },
         };
+        let space = SpaceId::from_bytes([14; 16]);
+        let thread = ChatThreadId::from_bytes([15; 16]);
+        let owner = PrincipalId::from_bytes([13; 16]);
+        let m1 = CompletionMessage {
+            role: CompletionRole::User,
+            instruction: Some(
+                ProviderInstruction::from_orchestrator("alpha ".repeat(4_000)).unwrap(),
+            ),
+            parts: Vec::new(),
+            tool_calls: Vec::new(),
+            result_for: None,
+        };
+        let m2 = CompletionMessage {
+            role: CompletionRole::User,
+            instruction: Some(
+                ProviderInstruction::from_orchestrator("beta ".repeat(8_000)).unwrap(),
+            ),
+            parts: Vec::new(),
+            tool_calls: Vec::new(),
+            result_for: None,
+        };
+        let branch = ChatBranch {
+            thread: ChatThread {
+                id: thread,
+                space,
+                kind: ChatThreadKind::Personal,
+                owner,
+                project_folder: None,
+                title: "Tight tail".into(),
+                head: ThreadEntrySeq::new(2).unwrap(),
+                revision: RevisionId::from_bytes([16; 16]),
+                active_run: None,
+                tainted: false,
+            },
+            entries: Vec::new(),
+            next_ancestor: None,
+        };
+        let mut req_for_fixed = CompletionRequest {
+            intent: notarium_core::ids::CommandKey::from_bytes([17; 16]),
+            selection: selection.clone(),
+            secondary_projects: Vec::new(),
+            messages: vec![system_prompt("System ".repeat(1_000), Vec::new()).unwrap()],
+            tools: Vec::new(),
+            budget: CompletionBudget {
+                max_input_tokens: 32_768,
+                max_output_tokens: 4096,
+                max_tool_calls: 0,
+            },
+        };
+        let fixed_tokens = completion_input_estimate(&req_for_fixed).unwrap();
+        req_for_fixed.messages.push(m2.clone());
+        let fixed_plus_latest = completion_input_estimate(&req_for_fixed).unwrap();
+        let latest_tokens = fixed_plus_latest - fixed_tokens;
+        // Pick an input_ceiling that leaves strictly less than MAX_SUMMARY_TOKENS (2048)
+        // of headroom after `fixed_tokens + latest_tokens`.
+        let ceiling = fixed_tokens + latest_tokens + 600;
+        let history = History {
+            branch,
+            messages: vec![m1, m2],
+            has_tail: false,
+            groups: vec![
+                HistoryGroup {
+                    through: ThreadEntrySeq::new(1).unwrap(),
+                    end: 1,
+                    checkpoint: false,
+                    starts_with_tool: false,
+                },
+                HistoryGroup {
+                    through: ThreadEntrySeq::new(2).unwrap(),
+                    end: 2,
+                    checkpoint: false,
+                    starts_with_tool: false,
+                },
+            ],
+        };
+        let request = CompletionRequest {
+            intent: notarium_core::ids::CommandKey::from_bytes([18; 16]),
+            selection,
+            secondary_projects: Vec::new(),
+            messages: vec![system_prompt("System ".repeat(1_000), Vec::new()).unwrap()],
+            tools: Vec::new(),
+            budget: CompletionBudget {
+                max_input_tokens: ceiling,
+                max_output_tokens: 4096,
+                max_tool_calls: 0,
+            },
+        };
+        let (_branch, planned, proof) = history.plan(request, ceiling).unwrap();
+        assert_eq!(
+            proof.compacts_through,
+            Some(ThreadEntrySeq::new(1).unwrap())
+        );
+        assert!(
+            planned.budget.max_output_tokens <= 596,
+            "summary output budget must leave room for retained latest group (got {})",
+            planned.budget.max_output_tokens
+        );
+        assert!(
+            fixed_tokens + latest_tokens + planned.budget.max_output_tokens + 4 <= ceiling,
+            "next turn after compaction must fit within ceiling"
+        );
     }
 }

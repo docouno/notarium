@@ -732,7 +732,10 @@ fn authorize_chat_write_on_space(auth: &EngineAuthContext, space: &Space) -> Res
 
 fn forbid_project_agent_run(auth: &EngineAuthContext, space: &Space) -> Result<(), PortError> {
     if matches!(auth.kind(), PrincipalKind::AgentRun(_))
-        && auth.spaces()[&space.id].project_root.is_some()
+        && auth
+            .spaces()
+            .get(&space.id)
+            .is_some_and(|grant| grant.project_root.is_some())
     {
         return Err(DomainError::SpaceReadOnly.into());
     }
@@ -790,6 +793,27 @@ fn authorize_thread_mutation(
     th: &ThreadHeadRow,
     tainted: bool,
 ) -> Result<(), PortError> {
+    if space.lifecycle != SpaceLifecycle::Active || !auth.spaces().contains_key(&space.id) {
+        return Err(DomainError::ResourceNotFound.into());
+    }
+    if th.kind == ChatThreadKind::Personal && th.owner != *auth.principal() {
+        return Err(DomainError::ResourceNotFound.into());
+    }
+    if th.kind == ChatThreadKind::KeeperLog
+        && auth.keeper_log() != Some(&th.thread_id)
+        && auth
+            .can_view_chat_thread(
+                space,
+                &th.thread_id,
+                th.kind,
+                &th.owner,
+                th.project_folder.as_ref(),
+                tainted,
+            )
+            .is_err()
+    {
+        return Err(DomainError::ResourceNotFound.into());
+    }
     if (matches!(auth.kind(), PrincipalKind::Keeper(_)) || auth.keeper_log().is_some())
         && (th.kind != ChatThreadKind::KeeperLog
             || auth.keeper_log() != Some(&th.thread_id)
@@ -2747,6 +2771,7 @@ async fn create_chat_impl(
         })
         .await?;
     space_rec.scope.check(ctx.scope())?;
+    forbid_project_agent_run(ctx.auth(), &space_rec.space)?;
 
     let mut fp = blake3::Hasher::new();
     fp.update(request.input.thread.as_str().as_bytes());
@@ -3002,6 +3027,7 @@ async fn fork_chat_impl(
         })
         .await?;
     space_rec.scope.check(ctx.scope())?;
+    forbid_project_agent_run(ctx.auth(), &space_rec.space)?;
 
     let fp = format!(
         "thread={};parent={}",
@@ -3232,6 +3258,9 @@ async fn append_chat_impl(
         ctx.auth().kind(),
         PrincipalKind::AgentRun(_) | PrincipalKind::Keeper(_)
     );
+    if is_run && request.input.kind == ChatEntryKind::Human {
+        return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
+    }
     if (!request.input.tool_calls.is_empty()
         || request.input.interruption.is_some()
         || request.input.provenance.is_some()
@@ -3956,6 +3985,7 @@ async fn check_queue_admission_tx(
 ) -> Result<Option<i64>, PortError> {
     let live_space = load_space_record(tx, &scope.space_id).await?;
     live_space.scope.check(scope)?;
+    forbid_project_agent_run(auth, &live_space.space)?;
     authorize_chat_replay_tx(tx, &live_space.space, auth, thread, Some(base), false).await?;
     let head = load_thread_head_tx(tx, &scope.space_id, thread).await?;
     if queue::authorize_run_claim(store, &live_space, &head, expected_run).is_err() {
@@ -4016,6 +4046,9 @@ async fn queue_chat_input_impl(
     let deadline = crate::domain::common::CommandDeadline::start(&ctx.budget, "queue_chat_input");
     validate_mutation_identity(&ctx, &request.identity)?;
     forbid_keeper_chat_mutation(ctx.auth())?;
+    if ctx.auth().kind() != &PrincipalKind::DirectHuman {
+        return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
+    }
     if request.input.body.contains('\0') || request.input.body.len() > content::MAX_TURN_BYTES {
         return Err(DomainError::validation(ValidationReason::InvalidRange).into());
     }
@@ -4030,6 +4063,7 @@ async fn queue_chat_input_impl(
         })
         .await?;
     space_rec.scope.check(ctx.scope())?;
+    forbid_project_agent_run(ctx.auth(), &space_rec.space)?;
 
     let mut fp = blake3::Hasher::new();
     fp.update(request.input.id.as_str().as_bytes());
@@ -5031,6 +5065,7 @@ async fn redact_chat_entry_impl(
         })
         .await?;
     space_rec.scope.check(ctx.scope())?;
+    forbid_project_agent_run(ctx.auth(), &space_rec.space)?;
 
     let fp = format!(
         "thread={};entry={};expected_rev={}",

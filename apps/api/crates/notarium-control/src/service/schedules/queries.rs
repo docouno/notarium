@@ -328,6 +328,7 @@ impl ControlService {
     pub async fn ensure_run_inactive(
         &self,
         ctx: AccountContext,
+        space: SpaceId,
         run: AgentRunId,
     ) -> Result<(), PortError> {
         ctx.auth().authorize_human_management()?;
@@ -339,13 +340,21 @@ impl ControlService {
             .run(
                 async {
                     auth.authorize_human_management()?;
+                    let grant = auth
+                        .spaces()
+                        .get(&space)
+                        .ok_or(DomainError::ResourceNotFound)?;
+                    if grant.role == SpaceRole::Viewer {
+                        return Err(DomainError::AccessDenied.into());
+                    }
                     let row = rows!(
                         tx.inner_mut(),
                         (String,),
                         fetch_optional,
-                        "SELECT status FROM agent_schedule_runs WHERE run_id=$1",
-                        "SELECT status FROM v1_control.agent_schedule_runs WHERE run_id=$1";
-                        run.as_str()
+                        "SELECT r.status FROM agent_schedule_runs r JOIN agent_schedules s ON s.schedule_id=r.schedule_id WHERE r.run_id=$1 AND s.space_id=$2",
+                        "SELECT r.status FROM v1_control.agent_schedule_runs r JOIN v1_control.agent_schedules s ON s.schedule_id=r.schedule_id WHERE r.run_id=$1 AND s.space_id=$2";
+                        run.as_str(),
+                        space.as_str()
                     )?;
                     if row
                         .as_ref()

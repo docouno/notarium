@@ -422,33 +422,46 @@ impl Destination {
         if let Some(exact) = self.exact() {
             return Ok(exact.clone());
         }
+        if let Some(hit) = call
+            .lookup_journal_with_key::<FolderRef>(
+                "confirmed_destination",
+                &identity.key,
+                identity.hash,
+            )
+            .await?
+        {
+            return Ok(hit);
+        }
         // Record the resolved identity for replay even when a sibling step
         // created the whole suffix. The subsequent note write rechecks it.
-        call.journal_with_key(
+        let scope = call
+            .fence_confirmed_effect(self.bind(scope, expected_source)?)
+            .await?;
+        let folder = call
+            .registry
+            .engine
+            .ensure_folder_path(
+                scope,
+                Mutation {
+                    identity: identity.clone(),
+                    preconditions: Preconditions::default(),
+                    input: EnsureFolderPath {
+                        base: Some(self.anchor.folder_id.clone()),
+                        path: self.tail.clone(),
+                    },
+                },
+            )
+            .await?;
+        call.record_journal_with_key(
             "confirmed_destination",
             &identity.key,
             identity.hash,
-            || async {
-                let scope = call
-                    .fence_confirmed_effect(self.bind(scope, expected_source)?)
-                    .await?;
-                call.registry
-                    .engine
-                    .ensure_folder_path(
-                        scope,
-                        Mutation {
-                            identity: identity.clone(),
-                            preconditions: Preconditions::default(),
-                            input: EnsureFolderPath {
-                                base: Some(self.anchor.folder_id.clone()),
-                                path: self.tail.clone(),
-                            },
-                        },
-                    )
-                    .await
-            },
+            &folder,
         )
         .await
+        .map_err(|error| {
+            super::batch_operational_error("notarium.confirmed-destination.v1", error, true)
+        })
     }
 }
 

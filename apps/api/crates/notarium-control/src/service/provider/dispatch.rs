@@ -546,7 +546,7 @@ impl ProviderService {
                         request_hash: hash.to_vec(),
                         resource_id: snapshot.resource.id.clone(),
                         credential_id: snapshot.resource.credential_id.clone(),
-                        policy_epochs: snapshot.epochs()?,
+                        policy_epochs: snapshot.epochs(&validated.disclosed_classes)?,
                         participating_spaces: json(&validated.spaces)?,
                         model_id: job.model().map(ToString::to_string),
                         reserved_tokens: job.reservation(&snapshot)?,
@@ -774,7 +774,6 @@ impl EmbeddingProviderPort for ProviderService {
                 let required = budget
                     .run(
                         async {
-                            let now = self.control.clock.now_ms()?;
                             let grant = auth
                                 .spaces()
                                 .get(&space.space.id)
@@ -782,10 +781,7 @@ impl EmbeddingProviderPort for ProviderService {
                             super::admission::required_query_source_classes(
                                 tx.inner_mut(),
                                 &auth,
-                                &space.space,
-                                project.as_ref(),
                                 grant,
-                                now,
                             )
                             .await
                         },

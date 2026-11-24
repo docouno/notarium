@@ -94,7 +94,7 @@ impl ControlService {
                     if !self.verify_schedule_approval_db(tx.inner_mut(),&current,scope,descriptors).await? {
                         return Err(invalid(ValidationReason::InvalidState));
                     }
-                    if rows!(tx.inner_mut(),(i64,),fetch_optional,"SELECT 1 FROM agent_schedules WHERE schedule_id=$1","SELECT 1 FROM v1_control.agent_schedules WHERE schedule_id=$1";input.id.as_str())?.is_some() {return Err(DomainError::IdempotencyKeyReused.into());}
+                    if rows!(tx.inner_mut(),(i64,),fetch_optional,"SELECT CAST(1 AS BIGINT) FROM agent_schedules WHERE schedule_id=$1","SELECT CAST(1 AS BIGINT) FROM v1_control.agent_schedules WHERE schedule_id=$1";input.id.as_str())?.is_some() {return Err(DomainError::IdempotencyKeyReused.into());}
                     let row = AgentSchedulesRow {
                         schedule_id:input.id.to_string(),owner_id:owner.user_id.clone(),space_id:input.definition.space.to_string(),
                         project_folder_id:input.definition.project.as_ref().map(|p|p.folder_id.to_string()),title:input.definition.title,init_prompt:input.definition.init_prompt,
@@ -214,7 +214,10 @@ impl ControlService {
             .await?;
         Ok(ControlCommit {
             revision: commit.revision,
-            value: self.account_schedule(ctx, commit.value).await?,
+            value: self
+                .account_schedule(ctx, commit.value)
+                .await
+                .map_err(post_commit_schedule_read_error)?,
         })
     }
     pub async fn update_schedule(
@@ -228,7 +231,10 @@ impl ControlService {
             .await?;
         Ok(ControlCommit {
             revision: commit.revision,
-            value: self.account_schedule(ctx, commit.value).await?,
+            value: self
+                .account_schedule(ctx, commit.value)
+                .await
+                .map_err(post_commit_schedule_read_error)?,
         })
     }
     pub async fn delete_schedule(
@@ -244,5 +250,35 @@ impl ControlService {
             revision: commit.revision,
             value: (),
         })
+    }
+}
+
+fn post_commit_schedule_read_error(error: PortError) -> PortError {
+    let diagnostic = ContentDigest::from_bytes(
+        *blake3::hash(format!("schedule-post-commit-read:{}", error.code()).as_bytes()).as_bytes(),
+    );
+    let make = || {
+        notarium_core::error::OperationalFailure::new(
+            diagnostic,
+            CommitEffect::Unknown,
+            notarium_core::error::RetryAdvice::RetrySameCommand,
+            true,
+        )
+        .expect("same-command retry has durable identity")
+    };
+    match error {
+        PortError::Cancelled(f) if f.effect() == CommitEffect::Unknown => PortError::Cancelled(f),
+        PortError::DeadlineExceeded(f) if f.effect() == CommitEffect::Unknown => {
+            PortError::DeadlineExceeded(f)
+        }
+        PortError::Unavailable(f) if f.effect() == CommitEffect::Unknown => {
+            PortError::Unavailable(f)
+        }
+        PortError::Internal(f) if f.effect() == CommitEffect::Unknown => PortError::Internal(f),
+        PortError::Cancelled(_) => PortError::Cancelled(make()),
+        PortError::DeadlineExceeded(_) => PortError::DeadlineExceeded(make()),
+        PortError::Unavailable(_) => PortError::Unavailable(make()),
+        PortError::Internal(_) => PortError::Internal(make()),
+        PortError::Domain(domain) => PortError::Domain(domain),
     }
 }

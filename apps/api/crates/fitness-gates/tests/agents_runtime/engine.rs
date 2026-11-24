@@ -124,7 +124,8 @@ pub struct ProjectionFixtures {
     before_memory_append: Mutex<Option<MutationPause>>,
     lose_note_edit_ack: Mutex<bool>,
     lose_note_create_acks: Mutex<usize>,
-    fail_next_create_note_not_committed: Mutex<bool>,
+    fail_nth_create_note_not_committed: Mutex<Option<usize>>,
+    fail_next_move_note_not_committed: Mutex<bool>,
     fail_nth_link_many_not_committed: Mutex<Option<usize>>,
     lose_chat_append_acks: Mutex<usize>,
     before_chat_consume: Mutex<Option<MutationPause>>,
@@ -241,10 +242,21 @@ impl ProjectionFixtures {
     }
 
     pub fn fail_next_create_note_not_committed(&self) {
-        *self.fail_next_create_note_not_committed.lock().unwrap() = true;
+        self.fail_nth_create_note_not_committed(1);
     }
 
-    /// Fail the 1-based `nth` `link_many` call with `Unavailable(NotCommitted)`.
+    /// Fail the 1-based `nth` `create_note` call with `DeadlineExceeded(NotCommitted)`.
+    pub fn fail_nth_create_note_not_committed(&self, nth: usize) {
+        assert!(nth >= 1);
+        *self.fail_nth_create_note_not_committed.lock().unwrap() = Some(nth);
+    }
+
+    /// Fail the next `move_note` call with `DeadlineExceeded(NotCommitted)`.
+    pub fn fail_next_move_note_not_committed(&self) {
+        *self.fail_next_move_note_not_committed.lock().unwrap() = true;
+    }
+
+    /// Fail the 1-based `nth` `link_many` call with `DeadlineExceeded(NotCommitted)`.
     pub fn fail_nth_link_many_not_committed(&self, nth: usize) {
         assert!(nth >= 1);
         *self.fail_nth_link_many_not_committed.lock().unwrap() = Some(nth);
@@ -385,7 +397,21 @@ canonical_port!(NoteWritePort;
         request: Mutation<CreateNote>,
     ) -> PortFuture<'_, Committed<NoteRevision>> {
         Box::pin(async move {
-            if std::mem::take(&mut *self.1.fail_next_create_note_not_committed.lock().unwrap()) {
+            let should_fail = {
+                let mut slot = self.1.fail_nth_create_note_not_committed.lock().unwrap();
+                match *slot {
+                    Some(1) => {
+                        *slot = None;
+                        true
+                    }
+                    Some(n) => {
+                        *slot = Some(n - 1);
+                        false
+                    }
+                    None => false,
+                }
+            };
+            if should_fail {
                 return Err(PortError::DeadlineExceeded(
                     OperationalFailure::new(
                         ContentDigest::from_bytes([172; 32]),
@@ -419,6 +445,17 @@ canonical_port!(NoteWritePort;
     ) -> PortFuture<'_, Committed<NoteRevision>> {
         Box::pin(async move {
             MutationPause::enter(&self.1.before_note_move, ctx.budget.cancellation.clone()).await;
+            if std::mem::take(&mut *self.1.fail_next_move_note_not_committed.lock().unwrap()) {
+                return Err(PortError::DeadlineExceeded(
+                    OperationalFailure::new(
+                        ContentDigest::from_bytes([174; 32]),
+                        CommitEffect::NotCommitted,
+                        RetryAdvice::Never,
+                        false,
+                    )
+                    .unwrap(),
+                ));
+            }
             NoteWritePort::move_note(&self.0, ctx, request).await
         })
     }
@@ -713,7 +750,17 @@ impl NoteReadPort for TestEngine {
         if let Some(real) = self.1.real.get() {
             return real.notes.project_note_counts(ctx, project, causal);
         }
-        unavailable()
+        Box::pin(async {
+            Err(PortError::Unavailable(
+                OperationalFailure::new(
+                    ContentDigest::from_bytes([175; 32]),
+                    CommitEffect::NotCommitted,
+                    RetryAdvice::RetrySameCommand,
+                    true,
+                )
+                .unwrap(),
+            ))
+        })
     }
 
     fn read_ability_resource(

@@ -426,75 +426,89 @@ async fn ensure_destination(
     expected_source: Option<&NoteRoute>,
 ) -> Result<(FolderRef, bool), PortError> {
     admit_destination_anchor(call, scope, &base, &path, class).await?;
+    const ERR_LABEL: &str = "notarium.mcp.folder-destination.v1";
     let has_path = !path.is_empty();
-    let ensured: JournaledDestination = call
-        .journal_with_key(
+    let ensured: JournaledDestination = if let Some(hit) = call
+        .lookup_journal_with_key::<JournaledDestination>(
             label,
             &content_command.key,
             content_command.hash,
-            || async {
-                if let Some(route) = expected_source {
-                    let live = metadata_snapshot(
-                        call,
-                        scope,
-                        &route.note,
-                        None,
-                        CausalBasis::Await(Default::default()),
-                    )
-                    .await?;
-                    if live.metadata.lifecycle() != Lifecycle::Active {
-                        return Err(DomainError::ResourceNotFound.into());
-                    }
-                    if live.metadata.revision() != &route.revision {
-                        return Err(DomainError::RevisionConflict {
-                            current: live.metadata.revision().clone(),
-                            lineage: None,
-                        }
-                        .into());
-                    }
-                }
-                let existed = !has_path
-                    || call
-                        .registry
-                        .engine
-                        .resolve_folder_path(scope.clone(), base.clone(), path.clone())
-                        .await?
-                        .is_some();
-                let folder = call
-                    .registry
-                    .engine
-                    .ensure_folder_path(
-                        call.corpus_writer(scope.clone()).await?,
-                        Mutation {
-                            identity: CommandIdentity {
-                                scope: content_command.scope.clone(),
-                                actor: content_command.actor.clone(),
-                                key: derive_key(
-                                    "notarium.mcp.folder-destination.v1",
-                                    &[content_command.key.as_str().as_bytes(), label.as_bytes()],
-                                ),
-                                hash: content_command.hash,
-                            },
-                            preconditions: Preconditions::default(),
-                            input: EnsureFolderPath { base, path },
-                        },
-                    )
-                    .await?;
-                Ok(JournaledDestination::Detailed {
-                    folder,
-                    created: !existed,
-                })
-            },
         )
-        .await?;
+        .await?
+    {
+        hit
+    } else {
+        // Persist the pre-existence check before calling `ensure_folder_path`
+        // so a dedup failure after folder creation cannot lose `created: true`
+        // on retry or falsely report `NotCommitted`.
+        let existed_label = format!("{label}_existed");
+        let existed: bool = call
+            .journal_with_key(
+                &existed_label,
+                &content_command.key,
+                content_command.hash,
+                || async {
+                    if let Some(route) = expected_source {
+                        let live = metadata_snapshot(
+                            call,
+                            scope,
+                            &route.note,
+                            None,
+                            CausalBasis::Await(Default::default()),
+                        )
+                        .await?;
+                        if live.metadata.lifecycle() != Lifecycle::Active {
+                            return Err(DomainError::ResourceNotFound.into());
+                        }
+                        if live.metadata.revision() != &route.revision {
+                            return Err(DomainError::RevisionConflict {
+                                current: live.metadata.revision().clone(),
+                                lineage: None,
+                            }
+                            .into());
+                        }
+                    }
+                    Ok(!has_path
+                        || call
+                            .registry
+                            .engine
+                            .resolve_folder_path(scope.clone(), base.clone(), path.clone())
+                            .await?
+                            .is_some())
+                },
+            )
+            .await?;
+        let folder = call
+            .registry
+            .engine
+            .ensure_folder_path(
+                call.corpus_writer(scope.clone()).await?,
+                Mutation {
+                    identity: CommandIdentity {
+                        scope: content_command.scope.clone(),
+                        actor: content_command.actor.clone(),
+                        key: derive_key(
+                            "notarium.mcp.folder-destination.v1",
+                            &[content_command.key.as_str().as_bytes(), label.as_bytes()],
+                        ),
+                        hash: content_command.hash,
+                    },
+                    preconditions: Preconditions::default(),
+                    input: EnsureFolderPath { base, path },
+                },
+            )
+            .await?;
+        let plan = JournaledDestination::Detailed {
+            folder,
+            created: !existed,
+        };
+        call.record_journal_with_key(label, &content_command.key, content_command.hash, &plan)
+            .await
+            .map_err(|error| batch_operational_error(ERR_LABEL, error, !existed))?
+    };
     let (destination, created) = ensured.into_parts(has_path);
-    const ERR_LABEL: &str = "notarium.mcp.folder-destination.v1";
     if destination.space_id != scope.scope().space_id {
-        return Err(batch_operational_error(
-            ERR_LABEL,
-            invalid(ValidationReason::ScopeMismatch),
-            created,
-        ));
+        return Err(invalid(ValidationReason::ScopeMismatch));
     }
     let live = call
         .registry

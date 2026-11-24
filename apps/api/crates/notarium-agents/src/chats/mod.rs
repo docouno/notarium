@@ -468,28 +468,51 @@ impl AgentRunSupervisor {
     ) -> Result<Committed<RollbackResult>, PortError> {
         let service = self.clone();
         detached(async move {
+            let started = tokio::time::Instant::now();
+            let remaining_budget = || {
+                let mut budget = account.budget.clone();
+                budget.remaining = budget.remaining.saturating_sub(started.elapsed());
+                budget
+            };
             account.auth().authorize_human_management()?;
+            let live_auth = service
+                .inner
+                .registry
+                .control()
+                .revalidate_auth(AccountContext::new(
+                    account.auth().clone(),
+                    remaining_budget(),
+                ))
+                .await?;
+            live_auth.authorize_human_management()?;
+            let grant = live_auth
+                .spaces()
+                .get(&scope.space_id)
+                .ok_or(DomainError::ResourceNotFound)?;
+            if grant.role == notarium_core::auth::SpaceRole::Viewer {
+                return Err(DomainError::AccessDenied.into());
+            }
             let _drain = service
                 .inner
                 .revocations
-                .stop_and_drain_run(&run, &account.budget)
+                .stop_and_drain_run(&scope.space_id, &run, &remaining_budget())
                 .await?;
             service
                 .inner
                 .registry
                 .control()
-                .ensure_run_inactive(account.clone(), run.clone())
+                .ensure_run_inactive(
+                    AccountContext::new(live_auth.clone(), remaining_budget()),
+                    scope.space_id.clone(),
+                    run.clone(),
+                )
                 .await?;
-            let ctx = SpaceContext::new(
-                account.auth().clone(),
-                scope.clone(),
-                account.budget.clone(),
-            )?;
+            let ctx = SpaceContext::new(live_auth.clone(), scope.clone(), remaining_budget())?;
             let ctx = service
                 .inner
                 .registry
                 .control()
-                .fence_canonical_effect(account.auth().clone(), ctx, CanonicalEffect::ChatRollback)
+                .fence_canonical_effect(live_auth.clone(), ctx, CanonicalEffect::ChatRollback)
                 .await?;
             service
                 .inner
@@ -500,7 +523,7 @@ impl AgentRunSupervisor {
                     Mutation {
                         identity: CommandIdentity {
                             scope,
-                            actor: account.auth().principal().clone(),
+                            actor: live_auth.principal().clone(),
                             key,
                             hash: derive_digest(
                                 "notarium.chats.rollback.v1",

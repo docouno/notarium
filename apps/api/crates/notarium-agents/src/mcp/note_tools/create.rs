@@ -656,6 +656,9 @@ pub(in crate::mcp) fn batch_operational_error(
     error: PortError,
     committed_any: bool,
 ) -> PortError {
+    if matches!(error, PortError::Domain(_)) {
+        return error;
+    }
     let unknown_retryable = matches!(
         &error,
         PortError::Cancelled(failure)
@@ -688,9 +691,8 @@ pub(in crate::mcp) fn batch_operational_error(
         match error {
             PortError::Cancelled(_) => PortError::Cancelled(failure),
             PortError::DeadlineExceeded(_) => PortError::DeadlineExceeded(failure),
-            PortError::Unavailable(_) | PortError::Internal(_) | PortError::Domain(_) => {
-                PortError::Unavailable(failure)
-            }
+            PortError::Unavailable(_) | PortError::Internal(_) => PortError::Unavailable(failure),
+            PortError::Domain(domain) => PortError::Domain(domain),
         }
     } else {
         error
@@ -808,5 +810,8 @@ mod tests {
             PortError::DeadlineExceeded(f)
                 if f.effect() == CommitEffect::Unknown && f.retry() == RetryAdvice::RetrySameCommand
         ));
+
+        let domain = PortError::Domain(DomainError::ResourceNotFound);
+        assert_eq!(batch_operational_error(label, domain.clone(), true), domain);
     }
 }

@@ -126,7 +126,7 @@ impl ControlPort for ControlPlane {
         &self,
         ctx: AccountContext,
         name: String,
-    ) -> PortFuture<'_, Option<FolderRef>> {
+    ) -> PortFuture<'_, NamedEpisodePreview> {
         Box::pin(self.control.named_episode_project_hint(ctx, name))
     }
     fn update_episode(
@@ -317,8 +317,13 @@ impl ControlPort for ControlPlane {
     ) -> PortFuture<'_, ScheduleRunReceipt> {
         Box::pin(self.control.record_schedule_result(ctx, result))
     }
-    fn ensure_run_inactive(&self, ctx: AccountContext, run: AgentRunId) -> PortFuture<'_, ()> {
-        Box::pin(self.control.ensure_run_inactive(ctx, run))
+    fn ensure_run_inactive(
+        &self,
+        ctx: AccountContext,
+        space: SpaceId,
+        run: AgentRunId,
+    ) -> PortFuture<'_, ()> {
+        Box::pin(self.control.ensure_run_inactive(ctx, space, run))
     }
     fn select_provider(
         &self,

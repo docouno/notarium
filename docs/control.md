@@ -634,8 +634,12 @@ which do not invalidate an unchanged preference page.
 The catalog owns current note/folder facts, current ability tips and immutable
 package revisions. Control stores availability, selected-project bindings, personal
 preferences and typed placement trails. Effective precedence is project, Space,
-personal, then System. A disabled, unhealthy or wrong-kind candidate shadows lower
-precedence; equal-precedence ambiguity fails rather than choosing arbitrarily.
+personal, then System. A disabled, unhealthy or wrong-kind candidate shadows lower precedence. For
+bare-name resolution (`resolve_ability`, `use_role`, `use_skill`),
+equal-precedence ambiguity fails rather than choosing arbitrarily; runtime
+discovery (`list_abilities` with `view: "runtime"` and `start_session`) returns
+all distinct-identity equal-precedence winners across accessible Spaces so
+callers can address them by exact `ref`.
 Exact selections and `get_ability` accept an optional contextual `project` so
 selected-project Space abilities resolve consistently, and reject stale revisions.
 Both paths enforce canonical visibility at publication and at the current location

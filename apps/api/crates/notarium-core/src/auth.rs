@@ -708,6 +708,14 @@ impl EngineAuthContext {
             | AuthenticatedCredential::SearchIndexing { .. }
             | AuthenticatedCredential::TrustedNone => (),
         }
+        if let (PrincipalKind::AgentRun(run) | PrincipalKind::Keeper(run), Some(space)) =
+            (self.kind(), self.pinned_write_space())
+        {
+            selectors.insert(RevocationSelector::AgentRun {
+                space: space.clone(),
+                run: run.clone(),
+            });
+        }
         for space in spaces {
             if !self.spaces.contains_key(space) {
                 return Err(DomainError::ResourceNotFound);

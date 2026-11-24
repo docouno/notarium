@@ -294,6 +294,12 @@ pub enum EpisodeDiagnostic {
     ProjectUnavailable,
     RoleUnavailable,
 }
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NamedEpisodePreview {
+    NoMatch,
+    Unique(Option<FolderRef>),
+    Ambiguous,
+}
 #[derive(Clone, Debug)]
 pub struct EpisodeChoice {
     pub id: EpisodeId,
@@ -517,7 +523,7 @@ pub trait ControlPort: Send + Sync {
         &self,
         ctx: AccountContext,
         name: String,
-    ) -> PortFuture<'_, Option<FolderRef>>;
+    ) -> PortFuture<'_, NamedEpisodePreview>;
     fn update_episode(
         &self,
         ctx: AccountContext,
@@ -654,7 +660,12 @@ pub trait ControlPort: Send + Sync {
         ctx: MaintenanceContext,
         result: ScheduleResult,
     ) -> PortFuture<'_, ScheduleRunReceipt>;
-    fn ensure_run_inactive(&self, ctx: AccountContext, run: AgentRunId) -> PortFuture<'_, ()>;
+    fn ensure_run_inactive(
+        &self,
+        ctx: AccountContext,
+        space: SpaceId,
+        run: AgentRunId,
+    ) -> PortFuture<'_, ()>;
     fn select_provider(
         &self,
         ctx: SpaceContext,

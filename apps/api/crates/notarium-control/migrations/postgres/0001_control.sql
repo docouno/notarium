@@ -273,6 +273,7 @@ CREATE TABLE v1_control.provider_call_log (
 CREATE INDEX call_owner ON v1_control.provider_call_log(owner_id,created_at,call_id);
 CREATE INDEX call_pending ON v1_control.provider_call_log(delivery_state,created_at,call_id);
 CREATE INDEX call_settled ON v1_control.provider_call_log(delivery_state,settled_at,call_id);
+CREATE INDEX call_run ON v1_control.provider_call_log(run_id,call_id);
 CREATE TABLE v1_control.ability_availability (
     placement TEXT COLLATE "C" NOT NULL, ability_id TEXT COLLATE "C" NOT NULL,
     mode TEXT COLLATE "C" NOT NULL CHECK (mode IN ('all-projects','selected-projects')),

@@ -37,6 +37,8 @@ const DELIVERY_PREFIX: &str = "delivery_";
 pub(in super::super) struct BootstrapContinuations {
     tickets: Mutex<VecDeque<(u128, Ticket)>>,
     starts: Mutex<VecDeque<StartWindow>>,
+    #[cfg(any(test, feature = "test-support"))]
+    ttl_override_ms: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Clone)]
@@ -88,7 +90,29 @@ fn stale() -> PortError {
 }
 
 impl BootstrapContinuations {
+    #[cfg(any(test, feature = "test-support"))]
+    pub(in super::super) fn set_ttl(&self, ttl: Duration) {
+        self.ttl_override_ms.store(
+            u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+    }
+
+    fn ticket_ttl(&self) -> Duration {
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            let override_ms = self
+                .ttl_override_ms
+                .load(std::sync::atomic::Ordering::SeqCst);
+            if override_ms > 0 {
+                return Duration::from_millis(override_ms);
+            }
+        }
+        TICKET_TTL
+    }
+
     fn insert(&self, ticket: Ticket) -> Result<String, PortError> {
+        let ttl = self.ticket_ttl();
         let mut bytes = [0_u8; 16];
         getrandom::fill(&mut bytes).map_err(|_| invalid(ValidationReason::InvalidState))?;
         let id = u128::from_be_bytes(bytes);
@@ -96,7 +120,7 @@ impl BootstrapContinuations {
             .tickets
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        tickets.retain(|(_, current)| current.opened.elapsed() < TICKET_TTL);
+        tickets.retain(|(_, current)| current.opened.elapsed() < ttl);
         if tickets.iter().any(|(existing, _)| *existing == id) {
             return Err(invalid(ValidationReason::InvalidState));
         }
@@ -124,6 +148,7 @@ impl BootstrapContinuations {
     }
 
     fn find(&self, value: &str, prefix: &str) -> Result<Ticket, PortError> {
+        let ttl = self.ticket_ttl();
         let digits = value.strip_prefix(prefix).ok_or_else(stale)?;
         if digits.len() != 32 {
             return Err(stale());
@@ -135,12 +160,13 @@ impl BootstrapContinuations {
             .unwrap_or_else(|error| error.into_inner());
         tickets
             .iter()
-            .find(|(id, current)| *id == expected && current.opened.elapsed() < TICKET_TTL)
+            .find(|(id, current)| *id == expected && current.opened.elapsed() < ttl)
             .map(|(_, current)| current.clone())
             .ok_or_else(stale)
     }
 
     fn find_start(&self, key: &CommandKey, authority: ContentDigest) -> Option<StartWindow> {
+        let ttl = self.ticket_ttl();
         self.starts
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -148,7 +174,7 @@ impl BootstrapContinuations {
             .find(|entry| {
                 &entry.key == key
                     && entry.batch.authority == authority
-                    && entry.opened.elapsed() < TICKET_TTL
+                    && entry.opened.elapsed() < ttl
             })
             .cloned()
     }
@@ -796,7 +822,7 @@ mod tests {
     }
 
     #[test]
-    fn continuation_ticket_respects_ttl_and_refreshed_opened_extends_window() {
+    fn continuation_ticket_expires_after_idle_ttl() {
         let space = scope(9);
         let batch = Arc::new(Batch {
             principal: PrincipalId::from_bytes([9; 16]),
@@ -811,28 +837,8 @@ mod tests {
             }],
         });
         let state = BootstrapContinuations::default();
-        let expired_opened = Instant::now()
-            .checked_sub(TICKET_TTL + Duration::from_secs(1))
-            .expect("monotonic clock past TTL");
-        let stale_id = state
-            .insert(Ticket {
-                opened: expired_opened,
-                batch: batch.clone(),
-                position: Some(next_space(0)),
-                safe_ack: None,
-                acknowledge: true,
-            })
-            .unwrap();
-        assert!(
-            state
-                .find(
-                    &format!("{CONTINUATION_PREFIX}{stale_id}"),
-                    CONTINUATION_PREFIX
-                )
-                .is_err(),
-            "expired ticket must be rejected as stale"
-        );
-        let refreshed_id = state
+        state.set_ttl(Duration::from_millis(30));
+        let token_id = state
             .insert(Ticket {
                 opened: Instant::now(),
                 batch,
@@ -841,14 +847,12 @@ mod tests {
                 acknowledge: true,
             })
             .unwrap();
+        let token = format!("{CONTINUATION_PREFIX}{token_id}");
+        assert!(state.find(&token, CONTINUATION_PREFIX).is_ok());
+        std::thread::sleep(Duration::from_millis(45));
         assert!(
-            state
-                .find(
-                    &format!("{CONTINUATION_PREFIX}{refreshed_id}"),
-                    CONTINUATION_PREFIX
-                )
-                .is_ok(),
-            "refreshed continuation ticket must remain live for a full sliding TTL window"
+            state.find(&token, CONTINUATION_PREFIX).is_err(),
+            "idle ticket must expire after TTL"
         );
     }
 }

@@ -84,11 +84,17 @@ notes are excluded from both surfaces.
 
 Search and recall use the configured embedding provider for clean query text
 within a run's pinned Space under the same provider, project and class consent
-as external MCP calls. Opening a projection in another Space taints the branch
-before vector search runs. An unavailable remote embedding leaves full-text
-matches available and reports `provider_unavailable`. A scheduled Keeper's
-approved role and skills must still be current at dispatch. The embedding
-request carries only the query text.
+as external MCP calls, with an additional disclosure ceiling for model-authored
+queries: for in-app chat runs and Keepers, the remote embedding provider must
+also be consented for every non-encrypted `DocClass` previously disclosed to
+that run (recorded on its provider call log) and for every class allowed to its
+active completion provider; otherwise remote query embedding degrades cleanly
+to lexical search with `provider_unavailable` (and direct embedding calls fail
+with `ClassEgressForbidden`). Opening a projection in another Space taints the
+branch before vector search runs. An unavailable remote embedding leaves
+full-text matches available and reports `provider_unavailable`. A scheduled
+Keeper's approved role and skills must still be current at dispatch. The
+embedding request carries only the query text.
 
 ## Chat runs and confirmation
 

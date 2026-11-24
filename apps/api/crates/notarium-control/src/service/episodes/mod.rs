@@ -429,7 +429,7 @@ impl ControlService {
         &self,
         ctx: AccountContext,
         episode_name: String,
-    ) -> Result<Option<FolderRef>, PortError> {
+    ) -> Result<NamedEpisodePreview, PortError> {
         name(Some(&episode_name))?;
         let budget = OperationBudget::new(ctx.budget.clone());
         let (mut tx, auth) = self
@@ -447,16 +447,12 @@ impl ControlService {
                         auth.principal().as_str(),
                         &episode_name
                     )?;
-                    if matches.len() != 1 {
-                        return Ok(None);
-                    }
-                    let row = &matches[0];
-                    match (&row.project_space, &row.project_folder) {
-                        (Some(space), Some(folder)) => Ok(Some(FolderRef {
-                            space_id: SpaceId::parse(space)?,
-                            folder_id: FolderId::parse(folder)?,
-                        })),
-                        _ => Ok(None),
+                    match matches.len() {
+                        0 => Ok(NamedEpisodePreview::NoMatch),
+                        1 => Ok(NamedEpisodePreview::Unique(stored_project_ref(
+                            &matches[0],
+                        )?)),
+                        _ => Ok(NamedEpisodePreview::Ambiguous),
                     }
                 },
                 CommitEffect::NotCommitted,

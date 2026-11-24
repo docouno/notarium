@@ -786,6 +786,10 @@ pub enum RevocationSelector {
     ProviderCall(RequestId),
     Schedule(ScheduleId),
     ScheduledRun(AgentRunId),
+    AgentRun {
+        space: SpaceId,
+        run: AgentRunId,
+    },
     Grant(GrantId),
     OAuthGrant(OAuthGrantId),
     OAuthFamily(OAuthFamilyId),

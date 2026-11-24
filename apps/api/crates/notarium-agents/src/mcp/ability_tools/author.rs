@@ -437,6 +437,7 @@ pub(super) async fn create(
         session::project_for_folder(call, project).await?;
     }
     let carrier = created_carrier(&args, kind, &format_attachments(attachments, &plan.skills)?)?;
+    const CREATE_LABEL: &str = "notarium.mcp.create-ability.v1";
     let parent = ability_folder(call, &plan.home.scope, plan.home.parent.clone()).await?;
     let note_id = NoteId::from_bytes(stable_id(call, "ability-entrypoint-id"));
     let ability_id = AbilityId::from_bytes(stable_id(call, "ability-package-id"));
@@ -444,7 +445,9 @@ pub(super) async fn create(
         .registry
         .engine
         .create_note(
-            writer(call, &plan.home.scope).await?,
+            writer(call, &plan.home.scope).await.map_err(|error| {
+                super::super::note_tools::batch_operational_error(CREATE_LABEL, error, true)
+            })?,
             Mutation {
                 identity: call.command_identity(&plan.home.scope, "create-ability-entrypoint", 0),
                 preconditions: Preconditions::default(),
@@ -458,12 +461,17 @@ pub(super) async fn create(
                 },
             },
         )
-        .await?;
+        .await
+        .map_err(|error| {
+            super::super::note_tools::batch_operational_error(CREATE_LABEL, error, true)
+        })?;
     let created = call
         .registry
         .engine
         .publish_ability_package(
-            writer(call, &plan.home.scope).await?,
+            writer(call, &plan.home.scope).await.map_err(|error| {
+                super::super::note_tools::batch_operational_error(CREATE_LABEL, error, true)
+            })?,
             Mutation {
                 identity: call.command_identity(&plan.home.scope, "publish-ability-package", 0),
                 preconditions: Preconditions::default(),
@@ -482,7 +490,10 @@ pub(super) async fn create(
                 },
             },
         )
-        .await?;
+        .await
+        .map_err(|error| {
+            super::super::note_tools::batch_operational_error(CREATE_LABEL, error, true)
+        })?;
     let reference = AbilityRef {
         id: ability_id,
         placement: plan.home.placement,
@@ -506,8 +517,14 @@ pub(super) async fn create(
                 },
             },
         )
-        .await?;
-    write_response(&bound_ability(call, &reference).await?, "created")
+        .await
+        .map_err(|error| {
+            super::super::note_tools::batch_operational_error(CREATE_LABEL, error, true)
+        })?;
+    let descriptor = bound_ability(call, &reference).await.map_err(|error| {
+        super::super::note_tools::batch_operational_error(CREATE_LABEL, error, true)
+    })?;
+    write_response(&descriptor, "created")
 }
 
 #[derive(Serialize, Deserialize)]
@@ -895,10 +912,15 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
         Ok(())
     }
     .await;
+    const EDIT_LABEL: &str = "notarium.mcp.edit-ability.v1";
     if let Err(error) = package_result {
         let partial_package = carrier_edited || carrier_moved || published;
         if !partial_package || !is_partial_step_error(&error) {
-            return Err(error);
+            return Err(super::super::note_tools::batch_operational_error(
+                EDIT_LABEL,
+                error,
+                partial_package,
+            ));
         }
         for step in ["authored", "home", "availability", "enabled"] {
             steps.push(if step == "authored" && authored_changed && published {
@@ -973,7 +995,11 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
             }
             Err(error) => {
                 if !applied_any || !is_partial_step_error(&error) {
-                    return Err(error);
+                    return Err(super::super::note_tools::batch_operational_error(
+                        EDIT_LABEL,
+                        error,
+                        applied_any,
+                    ));
                 }
                 steps.push(change_step("availability", "failed", Some(&error)));
                 steps.push(change_step("enabled", "skipped", None));
@@ -1025,10 +1051,17 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
         }
         .await;
         match result {
-            Ok(_) => steps.push(change_step("enabled", "applied", None)),
+            Ok(_) => {
+                applied_any = true;
+                steps.push(change_step("enabled", "applied", None));
+            }
             Err(error) => {
                 if !applied_any || !is_partial_step_error(&error) {
-                    return Err(error);
+                    return Err(super::super::note_tools::batch_operational_error(
+                        EDIT_LABEL,
+                        error,
+                        applied_any,
+                    ));
                 }
                 steps.push(change_step("enabled", "failed", Some(&error)));
                 return edit_result(call, &reference, steps, Some(&error)).await;
@@ -1037,7 +1070,10 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
     } else {
         steps.push(change_step("enabled", "skipped", None));
     }
-    let mut result = write_response(&bound_ability(call, &reference).await?, "updated")?;
+    let descriptor = bound_ability(call, &reference).await.map_err(|error| {
+        super::super::note_tools::batch_operational_error(EDIT_LABEL, error, applied_any)
+    })?;
+    let mut result = write_response(&descriptor, "updated")?;
     result["steps"] = json!(steps);
     Ok(result)
 }

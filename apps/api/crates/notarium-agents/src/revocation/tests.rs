@@ -343,6 +343,10 @@ async fn every_selector_participates_in_exact_matching() {
         RevocationSelector::ProviderCall(RequestId::from_bytes([1; 16])),
         RevocationSelector::Schedule(ScheduleId::from_bytes([1; 16])),
         RevocationSelector::ScheduledRun(AgentRunId::from_bytes([1; 16])),
+        RevocationSelector::AgentRun {
+            space: space.clone(),
+            run: AgentRunId::from_bytes([1; 16]),
+        },
         RevocationSelector::Grant(GrantId::from_bytes([1; 16])),
         RevocationSelector::OAuthGrant(OAuthGrantId::from_bytes([1; 16])),
         RevocationSelector::OAuthFamily(OAuthFamilyId::from_bytes([1; 16])),

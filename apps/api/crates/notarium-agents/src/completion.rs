@@ -332,11 +332,13 @@ pub(crate) fn step_tool_display_budget(
     let headroom = ceiling
         .saturating_sub(u64::from(fixed_tokens))
         .saturating_sub(assistant_tokens);
-    // Reserve room for system prompt + follow-up turn + compaction framing.
-    let step_tokens = headroom.saturating_mul(3) / 4;
-    let step_tokens = step_tokens.min(ceiling / 2);
+    // Reserve room for follow-up turn + compaction summary checkpoint framing
+    // (`MAX_SUMMARY_TOKENS + 4` when headroom allows) so the latest group stays
+    // compactable on tight windows and never overshoots with many tool calls.
+    let reserve = 2_052_u64.min(headroom / 2);
+    let step_tokens = headroom.saturating_sub(reserve).min(ceiling / 2);
     let per_tool_slot = step_tokens / (count as u64);
-    let per_tool_tokens = per_tool_slot.saturating_sub(8).max(16);
+    let per_tool_tokens = per_tool_slot.saturating_sub(4);
     let per_tool_bytes = TOOL_DISPLAY_BYTES.min((MAX_STEP_TOOL_DISPLAY_BYTES / count).max(256));
     (per_tool_bytes, per_tool_tokens)
 }
@@ -349,17 +351,34 @@ fn floor_char_boundary(text: &str, mut index: usize) -> usize {
     index
 }
 
+fn ceil_char_boundary(text: &str, mut index: usize) -> usize {
+    index = index.min(text.len());
+    while index < text.len() && !text.is_char_boundary(index) {
+        index += 1;
+    }
+    index
+}
+
 pub(crate) fn bounded_tool_text_within(text: &str, max_bytes: usize, max_tokens: u64) -> String {
     const SUFFIX: &str = "\n…[truncated]";
-    let byte_cap = max_bytes.min(TOOL_DISPLAY_BYTES).max(SUFFIX.len());
+    if max_tokens == 0 || max_bytes == 0 {
+        return String::new();
+    }
+    let suffix_fits = max_bytes >= SUFFIX.len() && completion_text_estimate(SUFFIX) <= max_tokens;
+    let byte_cap = max_bytes.min(TOOL_DISPLAY_BYTES);
     let mut truncated = text.len() > byte_cap;
     let mut end = if truncated {
-        floor_char_boundary(text, byte_cap - SUFFIX.len())
+        let content_cap = if suffix_fits {
+            byte_cap.saturating_sub(SUFFIX.len())
+        } else {
+            byte_cap
+        };
+        floor_char_boundary(text, content_cap)
     } else {
         text.len()
     };
     let fits = |prefix_end: usize, is_truncated: bool| -> bool {
-        if !is_truncated {
+        if !is_truncated || !suffix_fits {
             completion_text_estimate(&text[..prefix_end]) <= max_tokens
         } else {
             let mut candidate = String::with_capacity(prefix_end + SUFFIX.len());
@@ -370,16 +389,18 @@ pub(crate) fn bounded_tool_text_within(text: &str, max_bytes: usize, max_tokens:
     };
     if !fits(end, truncated) {
         truncated = true;
+        let max_prefix_bytes = if suffix_fits {
+            byte_cap.saturating_sub(SUFFIX.len())
+        } else {
+            byte_cap
+        };
         let mut lo = 0usize;
-        let mut hi = floor_char_boundary(text, byte_cap.saturating_sub(SUFFIX.len()).min(end));
+        let mut hi = floor_char_boundary(text, max_prefix_bytes.min(end));
         while lo < hi {
             let mid = lo + (hi - lo).div_ceil(2);
-            let cut = floor_char_boundary(text, mid);
+            let mut cut = floor_char_boundary(text, mid);
             if cut == lo {
-                if fits(hi, true) {
-                    lo = hi;
-                }
-                break;
+                cut = ceil_char_boundary(text, lo + 1);
             }
             if fits(cut, true) {
                 lo = cut;
@@ -389,8 +410,8 @@ pub(crate) fn bounded_tool_text_within(text: &str, max_bytes: usize, max_tokens:
         }
         end = lo;
     }
-    if !truncated {
-        return text.to_owned();
+    if !truncated || !suffix_fits {
+        return text[..end].to_owned();
     }
     let mut display = text[..end].to_owned();
     display.push_str(SUFFIX);

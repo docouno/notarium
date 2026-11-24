@@ -17,6 +17,7 @@ use notarium_agents::{
 };
 use notarium_canonical::{CreateFolderSpec, SqlBackendConfig, build_pg_connect_options};
 use notarium_control::{
+    auth::token::{TokenKind, mint},
     outbound::{NetworkPolicy, OutboundTransport, PrivateNetworkRule},
     service::{
         ControlPlane,
@@ -25,7 +26,7 @@ use notarium_control::{
 };
 use notarium_core::{
     DomainError,
-    auth::{ChatAudience, SpaceKind},
+    auth::{ChatAudience, SpaceKind, SpaceRole},
     classes::{AbilityKind, DocClass},
     error::{CommitEffect, PortError, RetryAdvice, ValidationReason},
     ids::*,
@@ -159,7 +160,7 @@ async fn postgres_keeper_single_connection_pool_no_deadlock() {
 }
 
 async fn exercise_seams(pg: bool) {
-    let fixture = Box::pin(RuntimeFixture::open_named(pg, "seam_hardening")).await;
+    let mut fixture = Box::pin(RuntimeFixture::open_named(pg, "seam_hardening")).await;
     let personal = fixture.personal_scope().await;
 
     Box::pin(project_scoped_chat_starts_ai_and_blocks_foreign_project(
@@ -183,7 +184,8 @@ async fn exercise_seams(pg: bool) {
     ))
     .await;
     Box::pin(rollback_run_stops_active_keeper_and_rejects_unsettled_runs(
-        &fixture, &personal,
+        &mut fixture,
+        &personal,
     ))
     .await;
     Box::pin(project_memory_proposal_preview_shows_destination(
@@ -202,6 +204,7 @@ async fn exercise_seams(pg: bool) {
         &fixture,
     ))
     .await;
+    Box::pin(bootstrap_continuation_sliding_ttl_survives_multi_page_resync(&fixture)).await;
     Box::pin(folder_heads_space_updated_index_present(&fixture, pg)).await;
 
     fixture.close().await;
@@ -278,7 +281,7 @@ async fn call_mcp(
         .await
 }
 
-/// P1 #1: Project-scoped chats must start AI normally, while still preventing a
+/// Project-scoped chats must start AI normally, while still preventing a
 /// project-scoped AgentRun from mutating threads in another project or root.
 async fn project_scoped_chat_starts_ai_and_blocks_foreign_project(
     fixture: &RuntimeFixture,
@@ -461,15 +464,15 @@ async fn project_scoped_chat_starts_ai_and_blocks_foreign_project(
     let foreign_create = fixture
         .canonical
         .create_chat(
-            run_a_ctx,
+            run_a_ctx.clone(),
             Mutation {
                 identity: cmd(9),
                 preconditions: Preconditions::default(),
                 input: CreateChat {
                     thread: ChatThreadId::from_bytes([0x69; 16]),
                     kind: ChatThreadKind::Personal,
-                    owner: actor,
-                    project_folder: Some(project_a.folder_id),
+                    owner: actor.clone(),
+                    project_folder: Some(project_a.folder_id.clone()),
                     title: "Disallowed agent create".into(),
                 },
             },
@@ -482,9 +485,124 @@ async fn project_scoped_chat_starts_ai_and_blocks_foreign_project(
         ),
         "project-scoped AgentRun must not create chats, got {foreign_create:?}"
     );
+    // Replaying an already-committed create_chat key as a project-scoped AgentRun
+    // must still fail upfront with SpaceReadOnly instead of replaying the receipt.
+    let replayed_create = fixture
+        .canonical
+        .create_chat(
+            run_a_ctx.clone(),
+            Mutation {
+                identity: cmd(1),
+                preconditions: Preconditions::default(),
+                input: CreateChat {
+                    thread: thread_a.clone(),
+                    kind: ChatThreadKind::Personal,
+                    owner: actor.clone(),
+                    project_folder: Some(project_a.folder_id.clone()),
+                    title: "Project thread 1".into(),
+                },
+            },
+        )
+        .await;
+    assert!(
+        matches!(
+            replayed_create,
+            Err(PortError::Domain(DomainError::SpaceReadOnly))
+        ),
+        "project-scoped AgentRun must not replay committed create_chat, got {replayed_create:?}"
+    );
+
+    // An AgentRun must not forge Human entries or submit human chat queue inputs.
+    let forged_human = fixture
+        .canonical
+        .append_chat(
+            run_a_ctx.clone(),
+            Mutation {
+                identity: cmd(10),
+                preconditions: Preconditions::default(),
+                input: AppendChat {
+                    thread: thread_a.clone(),
+                    parent: ThreadEntrySeq::ZERO,
+                    kind: ChatEntryKind::Human,
+                    body: ChatInputBody::Text("forged human message".into()),
+                    tool_calls: vec![],
+                    provenance: None,
+                    interruption: None,
+                    proposed_diff: None,
+                    proposed_effect: None,
+                    referenced_notes: vec![],
+                    tainted: false,
+                },
+            },
+        )
+        .await;
+    assert!(
+        matches!(
+            forged_human,
+            Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
+                if diagnostic.reason == ValidationReason::InvalidAuthority
+        ),
+        "AgentRun must not append ChatEntryKind::Human, got {forged_human:?}"
+    );
+    let agent_queue = fixture
+        .canonical
+        .queue_chat_input(
+            run_a_ctx,
+            Mutation {
+                identity: cmd(11),
+                preconditions: Preconditions::default(),
+                input: PendingChatInput {
+                    id: PendingInputId::from_bytes([0x6B; 16]),
+                    thread: thread_a.clone(),
+                    sender: actor.clone(),
+                    body: "agent forged queue input".into(),
+                    queued_base_leaf: ThreadEntrySeq::ZERO,
+                    in_flight_run: run_a_id.clone(),
+                    mentions_agent: false,
+                },
+            },
+        )
+        .await;
+    assert!(
+        matches!(
+            agent_queue,
+            Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
+                if diagnostic.reason == ValidationReason::InvalidAuthority
+        ),
+        "AgentRun must not call queue_chat_input, got {agent_queue:?}"
+    );
+    let pat = fixture.pat(BearerScope::Write, false).await;
+    let pat_space = SpaceContext::new(pat.auth().clone(), scope.clone(), budget()).unwrap();
+    let pat_queue = fixture
+        .canonical
+        .queue_chat_input(
+            pat_space,
+            Mutation {
+                identity: cmd(12),
+                preconditions: Preconditions::default(),
+                input: PendingChatInput {
+                    id: PendingInputId::from_bytes([0x6C; 16]),
+                    thread: thread_a,
+                    sender: actor,
+                    body: "pat forged queue input".into(),
+                    queued_base_leaf: ThreadEntrySeq::ZERO,
+                    in_flight_run: run_a_id,
+                    mentions_agent: false,
+                },
+            },
+        )
+        .await;
+    assert!(
+        matches!(
+            pat_queue,
+            Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
+                if diagnostic.reason == ValidationReason::InvalidAuthority
+        ),
+        "PAT bearer must not call queue_chat_input, got {pat_queue:?}"
+    );
 }
 
-/// P1 #2: An AgentRun whose completion provider is consented to AgentMemory must
+/// An AgentRun whose completion provider is consented to AgentMemory must
 /// not send model-authored search queries to a remote embedding provider that is
 /// only consented to UserDoc (falling back cleanly to lexical search), whereas a
 /// narrow completion provider consented only to UserDoc may use it.
@@ -755,7 +873,7 @@ async fn remote_embedding_query_blocks_unconsented_model_sources(
         .into_iter()
         .find(|item| item.id == chat_wide_res)
         .unwrap();
-    provider_svc
+    let wide_att = provider_svc
         .request_attachment(
             owner.clone(),
             AccountMutation {
@@ -778,7 +896,8 @@ async fn remote_embedding_query_blocks_unconsented_model_sources(
             },
         )
         .await
-        .unwrap();
+        .unwrap()
+        .value;
 
     // Resource 3: narrow chat provider consented ONLY to UserDoc.
     let saved_narrow = provider_svc
@@ -993,6 +1112,102 @@ async fn remote_embedding_query_blocks_unconsented_model_sources(
         "no HTTP bytes may reach the UserDoc-only embedding provider for wide AgentRun"
     );
 
+    // 1b. Even if the owner narrows `chat_wide_res`'s attachment IN-PLACE to UserDoc-only
+    //     AFTER `wide_run` already completed a call under `{UserDoc, AgentMemory}`, the
+    //     recorded per-call disclosure snapshot must STILL block `wide_run` from hitting
+    //     the UserDoc-only embedder!
+    let owner = fresh_owner(fixture).await;
+    let wide_att_narrowed = provider_svc
+        .request_attachment(
+            owner.clone(),
+            AccountMutation {
+                identity: identity(fixture, &owner, 0x70 ^ 0x1F).await,
+                input: RequestProviderAttachment {
+                    id: wide_att.id.clone(),
+                    expected: Some(wide_att.revision),
+                    resource: wide_info.id.clone(),
+                    resource_consent_epoch: wide_info.consent_epoch,
+                    credential_consent_epoch: None,
+                    target: ProviderAttachmentTarget::Personal {
+                        owner: actor.clone(),
+                        space: scope.space_id.clone(),
+                    },
+                    consent: ProviderDisclosureConsent::attest_checked(ProviderDisclosure {
+                        classes: [DocClass::UserDoc].into(),
+                    }),
+                    expires_at_ms: None,
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    let disclosed_after_narrow = EmbeddingProviderPort::query_disclosure(
+        provider_svc.as_ref(),
+        wide_run_ctx.clone(),
+        emb_res.clone(),
+        emb_model.clone(),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(
+        disclosed_after_narrow.is_empty(),
+        "narrowing attachment in place must not launder historical AgentMemory disclosure for wide_run"
+    );
+    let direct_after_narrow = provider_svc
+        .embed(
+            wide_run_ctx.clone(),
+            EmbeddingRequest::query(
+                CommandKey::from_bytes([0x6A; 16]),
+                emb_model.clone(),
+                emb_res.clone(),
+                EmbeddingQueryInput {
+                    text: "still tainted by prior AgentMemory step".into(),
+                    tokens: 8,
+                    classes: [DocClass::UserDoc].into(),
+                    project_scope: None,
+                    folder: None,
+                },
+            ),
+        )
+        .await;
+    assert!(
+        matches!(
+            direct_after_narrow,
+            Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
+                if diagnostic.reason == ValidationReason::ClassEgressForbidden
+        ),
+        "narrowing attachment in place must still reject wide_run embed with ClassEgressForbidden, got {direct_after_narrow:?}"
+    );
+    assert_eq!(emb_hits.load(Ordering::SeqCst), 0);
+    // Restore `{UserDoc, AgentMemory}` consent on `chat_wide_res` for step 3(b)'s fresh unlogged run.
+    provider_svc
+        .request_attachment(
+            owner.clone(),
+            AccountMutation {
+                identity: identity(fixture, &owner, 0x6E).await,
+                input: RequestProviderAttachment {
+                    id: wide_att.id,
+                    expected: Some(wide_att_narrowed.revision),
+                    resource: wide_info.id,
+                    resource_consent_epoch: wide_info.consent_epoch,
+                    credential_consent_epoch: None,
+                    target: ProviderAttachmentTarget::Personal {
+                        owner: actor.clone(),
+                        space: scope.space_id.clone(),
+                    },
+                    consent: ProviderDisclosureConsent::attest_checked(ProviderDisclosure {
+                        classes: [DocClass::UserDoc, DocClass::AgentMemory].into(),
+                    }),
+                    expires_at_ms: None,
+                },
+            },
+        )
+        .await
+        .unwrap();
+
     // 2. Control positive case: `narrow_run` (whose completion provider only allowed
     //    UserDoc) IS allowed to query the UserDoc-only embedding provider!
     let disclosed_narrow = EmbeddingProviderPort::query_disclosure(
@@ -1106,6 +1321,7 @@ async fn remote_embedding_query_blocks_unconsented_model_sources(
             .await
             .unwrap();
         let layout = SearchLayout::open(&root, scope.clone()).unwrap();
+        let mut probe_attempt = 0_u8;
         timeout(Duration::from_secs(15), async {
             loop {
                 if let Ok(Some(manifest)) = layout.search_manifest()
@@ -1113,13 +1329,58 @@ async fn remote_embedding_query_blocks_unconsented_model_sources(
                     && manifest.vector_seq.is_some()
                     && !manifest.embeddings_pending
                 {
-                    break;
+                    probe_attempt = probe_attempt.wrapping_add(1);
+                    let mut probe_ctx = personal.clone();
+                    probe_ctx.budget.request = RequestId::from_bytes([
+                        0x79,
+                        probe_attempt,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        1,
+                    ]);
+                    if let Ok(probe) = search
+                        .search(
+                            probe_ctx,
+                            SearchQuery {
+                                text: "quasar telemetry beacon".into(),
+                                filter: notarium_core::query::FieldFilterAstV1 {
+                                    version: 1,
+                                    predicate: notarium_core::query::Predicate::All(vec![]),
+                                },
+                                classes: [DocClass::UserDoc].into(),
+                                folder: None,
+                                causal: CausalBasis::Await(Default::default()),
+                                include_chats: false,
+                                top_k: PageLimit::new(5).unwrap(),
+                                model: None,
+                            },
+                        )
+                        .await
+                        && probe.degraded.is_none()
+                        && probe
+                            .hits
+                            .iter()
+                            .any(|h| h.card.document.provenance().reference().note_id == doc_id)
+                    {
+                        break;
+                    }
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         })
         .await
-        .expect("remote vector indexing must finish before query disclosure check");
+        .expect("remote vector indexing must publish in memory before query disclosure check");
 
         let hits_after_index = emb_hits.load(Ordering::SeqCst);
         assert!(
@@ -1209,6 +1470,12 @@ async fn remote_embedding_query_blocks_unconsented_model_sources(
             "unlogged wide InAppProvider search must still return lexical hits"
         );
         assert_eq!(
+            wide_tool_res.structured_content["degraded"],
+            json!(["provider_unavailable"]),
+            "unlogged wide InAppProvider search must surface provider_unavailable degradation: {}",
+            wide_tool_res.structured_content
+        );
+        assert_eq!(
             emb_hits.load(Ordering::SeqCst),
             hits_after_index,
             "unlogged wide InAppProvider search must NOT send query text to UserDoc-only embedder"
@@ -1238,9 +1505,16 @@ async fn remote_embedding_query_blocks_unconsented_model_sources(
                 .contains(doc_id.as_str())
         );
         assert_eq!(
+            narrow_tool_res.structured_content["degraded"],
+            json!([]),
+            "narrow UserDoc-only InAppProvider search must not degrade: {}",
+            narrow_tool_res.structured_content
+        );
+        assert_eq!(
             emb_hits.load(Ordering::SeqCst),
             hits_after_index + 1,
-            "narrow UserDoc-only InAppProvider search must reach the UserDoc-only embedder"
+            "narrow UserDoc-only InAppProvider search must reach the UserDoc-only embedder (content={})",
+            narrow_tool_res.structured_content
         );
 
         search.shutdown().await;
@@ -1250,7 +1524,7 @@ async fn remote_embedding_query_blocks_unconsented_model_sources(
     emb_server.abort();
 }
 
-/// P1 #3: Two same-named roles in two different Shared Spaces must NOT break
+/// Two same-named roles in two different Shared Spaces must NOT break
 /// `start_session({})` or runtime `list_abilities`, while bare `use_role` still
 /// refuses ambiguous name resolution and exact `ref` succeeds.
 async fn cross_space_same_named_roles_keep_start_session_working(fixture: &RuntimeFixture) {
@@ -1388,7 +1662,7 @@ async fn cross_space_same_named_roles_keep_start_session_working(fixture: &Runti
     assert_eq!(exact.structured_content["name"], "reviewer");
 }
 
-/// P1 #4: PostgreSQL with canonical `pool_size = 1` must execute a Keeper turn
+/// PostgreSQL with canonical `pool_size = 1` must execute a Keeper turn
 /// through its first provider call without deadlocking on canonical pool reuse.
 async fn run_single_pool_keeper(fixture: &RuntimeFixture) {
     let owner = fresh_owner(fixture).await;
@@ -1606,7 +1880,7 @@ async fn run_single_pool_keeper(fixture: &RuntimeFixture) {
     );
 }
 
-/// P2 #2: Four 36 KiB `get_note` tool results in a single assistant step must not
+/// Four 36 KiB `get_note` tool results in a single assistant step must not
 /// wedge a 32,768-token model branch on the next turn.
 async fn four_large_tool_results_do_not_wedge_32k_branch(
     fixture: &RuntimeFixture,
@@ -1804,9 +2078,10 @@ async fn four_large_tool_results_do_not_wedge_32k_branch(
     assert!(leaf2 > leaf1);
 }
 
-/// P2 #3: Composite writes (`link_many` across two Spaces; `create_note` into a
-/// new subfolder) must upgrade post-partial-commit operational errors to
-/// `CommitEffect::Unknown` with `RetryAdvice::RetrySameCommand`.
+/// Composite writes (`link_many` across two Spaces; `create_note`, `create_notes`,
+/// and `move_note` into a new subfolder) must upgrade post-partial-commit
+/// operational errors to `CommitEffect::Unknown` with `RetryAdvice::RetrySameCommand`
+/// while preserving `DomainError` conflicts unchanged.
 async fn composite_writes_upgrade_post_partial_commit_errors(
     fixture: &RuntimeFixture,
     personal: &SpaceContext,
@@ -2017,13 +2292,154 @@ async fn composite_writes_upgrade_post_partial_commit_errors(
     assert_eq!(items.len(), 2);
     assert_eq!(items[0]["ok"], true);
     assert_eq!(items[1]["ok"], true);
+
+    // 3a. move_note into a NEW subfolder failing operationally after folder creation
+    //     must return DeadlineExceeded(Unknown, RetrySameCommand), and retry succeeds.
+    fixture.projections.fail_next_move_note_not_committed();
+    let move_err = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xBB; 16],
+        "move_note",
+        json!({ "ref": n1, "toFolder": "comp-writes/moved-new-sub" }),
+    )
+    .await
+    .err()
+    .expect("move_note after new subfolder creation must return injected deadline error");
+    assert!(
+        matches!(
+            move_err,
+            PortError::DeadlineExceeded(ref f)
+                if f.effect() == CommitEffect::Unknown && f.retry() == RetryAdvice::RetrySameCommand
+        ),
+        "move_note failing after creating subfolder must return Unknown+RetrySameCommand, got {move_err:?}"
+    );
+    let moved = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xBB; 16],
+        "move_note",
+        json!({ "ref": n1, "toFolder": "comp-writes/moved-new-sub" }),
+    )
+    .await
+    .expect("retrying move_note with same key must succeed");
+    assert_eq!(moved.structured_content["noteId"], json!(n1));
+
+    // 3b. move_note into a NEW subfolder hitting a concurrent DomainError::RevisionConflict
+    //     must preserve PortError::Domain(RevisionConflict) instead of wrapping it as Unavailable.
+    let n2_read = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xBC; 16],
+        "get_note",
+        json!({ "ref": n2 }),
+    )
+    .await
+    .unwrap();
+    let n2_token = n2_read.structured_content["versionToken"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (entered_move, release_move) = fixture.projections.pause_note_move();
+    let move_task = tokio::spawn({
+        let registry = fixture.registry.clone();
+        let owner = owner.clone();
+        let n2 = n2.clone();
+        async move {
+            call_mcp(
+                &registry,
+                &owner,
+                [0xBD; 16],
+                "move_note",
+                json!({ "ref": n2, "toFolder": "comp-writes/moved-conflict-sub" }),
+            )
+            .await
+        }
+    });
+    let _cancel = timeout(Duration::from_secs(10), entered_move)
+        .await
+        .expect("move_note must reach canonical move_note pause after folder creation")
+        .unwrap();
+    call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xBE; 16],
+        "edit_note",
+        json!({
+            "ref": n2,
+            "operation": "append",
+            "content": "Concurrent edit advancing revision.",
+            "versionToken": n2_token,
+        }),
+    )
+    .await
+    .unwrap();
+    let _ = release_move.send(());
+    let conflict_err = timeout(Duration::from_secs(10), move_task)
+        .await
+        .unwrap()
+        .unwrap()
+        .err()
+        .expect("move_note after concurrent edit must return RevisionConflict");
+    assert!(
+        matches!(
+            conflict_err,
+            PortError::Domain(DomainError::RevisionConflict { .. })
+        ),
+        "move_note domain conflict after folder creation must preserve RevisionConflict, got {conflict_err:?}"
+    );
+
+    // 4. create_notes failing operationally on the 2nd note after the 1st note committed
+    //    must upgrade to DeadlineExceeded(Unknown, RetrySameCommand), and retry succeeds.
+    let batch_args = json!({
+        "project": project_handle,
+        "notes": [
+            { "title": "Batch Note 1", "body": "First batch note" },
+            { "title": "Batch Note 2", "body": "Second batch note" },
+        ]
+    });
+    fixture.projections.fail_nth_create_note_not_committed(2);
+    let batch_err = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xBF; 16],
+        "create_notes",
+        batch_args.clone(),
+    )
+    .await
+    .err()
+    .expect("create_notes failing on 2nd note must return injected deadline error");
+    assert!(
+        matches!(
+            batch_err,
+            PortError::DeadlineExceeded(ref f)
+                if f.effect() == CommitEffect::Unknown && f.retry() == RetryAdvice::RetrySameCommand
+        ),
+        "create_notes failing on 2nd note after 1st committed must return Unknown+RetrySameCommand, got {batch_err:?}"
+    );
+    let batch_retried = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xBF; 16],
+        "create_notes",
+        batch_args,
+    )
+    .await
+    .expect("retrying create_notes with same key must succeed");
+    let batch_results = batch_retried.structured_content["results"]
+        .as_array()
+        .unwrap();
+    assert_eq!(batch_results.len(), 2);
+    assert_eq!(batch_results[0]["ok"], true);
+    assert_eq!(batch_results[1]["ok"], true);
 }
 
-/// P2 #4: `rollback_run` must stop & drain an active local Keeper so step 2
-/// cannot write after rollback, reject unsettled remote active schedule runs,
-/// and canonical must reject rolling back an active chat run.
+/// `rollback_run` must enforce live Space write authority before fencing,
+/// stop and drain active local Keepers and chat runs (including provider calls),
+/// reject unsettled remote active schedule runs, and canonical must reject
+/// rolling back active chat runs with or without prior document edits.
 async fn rollback_run_stops_active_keeper_and_rejects_unsettled_runs(
-    fixture: &RuntimeFixture,
+    fixture: &mut RuntimeFixture,
     personal: &SpaceContext,
 ) {
     let owner = fresh_owner(fixture).await;
@@ -2235,6 +2651,123 @@ async fn rollback_run_stops_active_keeper_and_rejects_unsettled_runs(
         ScheduleRunStatus::Claimed | ScheduleRunStatus::Running
     ));
 
+    // Unauthorized callers (Space Viewer and PAT bearer) must NOT cancel the active Keeper
+    // and must NOT receive a liveness oracle (`InvalidState`).
+    let viewer_id = fixture
+        .control
+        .create_account(
+            owner.clone(),
+            AccountMutation {
+                identity: identity(fixture, &owner, 0xC0).await,
+                input: NewAccount {
+                    username: "rbviewer".into(),
+                    email: None,
+                    display_name: "Rollback Viewer".into(),
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value
+        .id;
+    let shared_owner_ctx =
+        SpaceContext::new(owner.auth().clone(), shared.history.clone(), budget()).unwrap();
+    fixture
+        .control
+        .change_membership(
+            shared_owner_ctx,
+            MembershipChange {
+                command: CommandKey::from_bytes([
+                    0xC0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
+                ]),
+                member: viewer_id.clone(),
+                role: Some(SpaceRole::Viewer),
+                expected: ControlRevision::new(1).unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+    let viewer_token = mint(TokenKind::Session).unwrap();
+    fixture
+        .storage
+        .observer
+        .seed_session(
+            &viewer_id,
+            &AuthSessionId::from_bytes([0xC0; 16]),
+            &viewer_token,
+            fixture.storage.clock.0.load(Ordering::SeqCst),
+        )
+        .await;
+    let viewer_auth = fixture
+        .control
+        .resolve(support::evidence(
+            AuthEvidenceKind::Session,
+            viewer_token.secret.expose(),
+        ))
+        .await
+        .unwrap();
+    let viewer_account = AccountContext::new(viewer_auth, budget());
+    let pat_account = fixture.pat(BearerScope::Write, false).await;
+    for (label, caller, key_tag) in [
+        ("viewer", viewer_account, 0xC1_u8),
+        ("pat", pat_account, 0xC2_u8),
+    ] {
+        let denied_rb = supervisor
+            .rollback_run(
+                caller.clone(),
+                shared.history.clone(),
+                active_keeper_run.clone(),
+                CommandKey::from_bytes([0xCF, key_tag, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+            )
+            .await;
+        assert!(
+            matches!(denied_rb, Err(PortError::Domain(DomainError::AccessDenied)))
+                || matches!(
+                    denied_rb,
+                    Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
+                        if diagnostic.reason == ValidationReason::InvalidAuthority
+                ),
+            "{label} rollback_run must fail with AccessDenied/InvalidAuthority (never InvalidState), got {denied_rb:?}"
+        );
+        let denied_check = fixture
+            .control
+            .ensure_run_inactive(
+                caller,
+                shared.history.space_id.clone(),
+                active_keeper_run.clone(),
+            )
+            .await;
+        assert!(
+            matches!(
+                denied_check,
+                Err(PortError::Domain(DomainError::AccessDenied))
+            ) || matches!(
+                denied_check,
+                Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
+                    if diagnostic.reason == ValidationReason::InvalidAuthority
+            ),
+            "{label} ensure_run_inactive must fail with AccessDenied/InvalidAuthority, got {denied_check:?}"
+        );
+    }
+    // Confirm the active Keeper was NOT cancelled by the unauthorized callers.
+    let still_active = fixture
+        .control
+        .get_schedule_run(
+            ScheduleRunContext::Owner(Box::new(owner.clone())),
+            schedule.id.clone(),
+            active_keeper_run.clone(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            still_active.status,
+            ScheduleRunStatus::Claimed | ScheduleRunStatus::Running
+        ),
+        "unauthorized rollback attempts must leave active Keeper running, got {:?}",
+        still_active.status
+    );
+
     // Now invoke `rollback_run` while Keeper is mid-run! It must cancel & drain Keeper,
     // settle `agent_schedule_runs`, and roll back step 1's memory cleanly.
     let rolled = timeout(
@@ -2439,8 +2972,8 @@ async fn rollback_run_stops_active_keeper_and_rejects_unsettled_runs(
             fenced_rb,
             Mutation {
                 identity: CommandIdentity {
-                    scope: pscope,
-                    actor,
+                    scope: pscope.clone(),
+                    actor: actor.clone(),
                     key: CommandKey::from_bytes([0xCE; 16]),
                     hash: ContentDigest::from_bytes([0xCE; 32]),
                 },
@@ -2457,9 +2990,96 @@ async fn rollback_run_stops_active_keeper_and_rejects_unsettled_runs(
         ),
         "canonical rollback must reject an active chat run, got {active_chat_rb:?}"
     );
+
+    // 4. Direct canonical rollback of an active chat run with ZERO document edits
+    //    (no `agent_run_heads` row) must STILL return InvalidState, not ResourceNotFound.
+    let empty_tid = ChatThreadId::from_bytes([0xCF; 16]);
+    let empty_run = AgentRunId::from_bytes([0xCF; 16]);
+    fixture
+        .canonical
+        .create_chat(
+            personal.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: pscope.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([0xCF; 16]),
+                    hash: ContentDigest::from_bytes([0xCF; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: CreateChat {
+                    thread: empty_tid.clone(),
+                    kind: ChatThreadKind::Personal,
+                    owner: actor.clone(),
+                    project_folder: None,
+                    title: "Active chat with zero edits".into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let empty_run_auth = owner
+        .auth()
+        .for_agent_run(
+            empty_run.clone(),
+            pscope.space_id.clone(),
+            ChatAudience::Personal,
+            owner.auth().spaces().clone(),
+        )
+        .unwrap();
+    let empty_run_ctx = SpaceContext::new(empty_run_auth, pscope.clone(), budget()).unwrap();
+    let empty_claim = fixture
+        .canonical
+        .claim_active_run(
+            empty_run_ctx,
+            ClaimChatRun {
+                thread: empty_tid,
+                run: empty_run.clone(),
+                expected_leaf: ThreadEntrySeq::ZERO,
+                previous_run: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(empty_claim, ClaimChatRunOutcome::Claimed));
+    let fenced_empty = fixture
+        .control_plane
+        .fence_canonical_effect(
+            owner.auth().clone(),
+            personal.clone(),
+            CanonicalEffect::ChatRollback,
+        )
+        .await
+        .unwrap();
+    let active_empty_rb = fixture
+        .canonical
+        .rollback_agent_run_by_id(
+            fenced_empty,
+            Mutation {
+                identity: CommandIdentity {
+                    scope: pscope,
+                    actor,
+                    key: CommandKey::from_bytes([
+                        0xCE, 0xCF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                    ]),
+                    hash: ContentDigest::from_bytes([0xCF; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: empty_run,
+            },
+        )
+        .await;
+    assert!(
+        matches!(
+            active_empty_rb,
+            Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
+                if diagnostic.reason == ValidationReason::InvalidState
+        ),
+        "canonical rollback must reject an active zero-edit chat run with InvalidState, got {active_empty_rb:?}"
+    );
 }
 
-/// P2 #5: `remember_about_project` and `remember_about_user` proposal previews
+/// `remember_about_project` and `remember_about_user` proposal previews
 /// must expose `target`, `spaceId`, and (for project memory) `projectFolder` so
 /// humans can disambiguate destination projects.
 async fn project_memory_proposal_preview_shows_destination(
@@ -2683,9 +3303,10 @@ async fn project_memory_proposal_preview_shows_destination(
     assert_eq!(user_mem["category"], "preferences");
 }
 
-/// Narrow #1: Closing a chat thread's deterministic episode must not permanently
-/// disable AI in that thread; and a typo in `start_session.role` must not leave
-/// an orphan active named episode behind.
+/// Closing a chat thread's deterministic episode must not permanently
+/// disable AI in that thread; and `start_session` role pre-validation must
+/// reject role typos and `ProjectUnavailable` without mutating episodes while
+/// letting ambiguous named sessions return `recentSessions`.
 async fn closed_chat_episode_recovers_and_role_typo_leaves_no_orphan(
     fixture: &RuntimeFixture,
     personal: &SpaceContext,
@@ -2878,9 +3499,253 @@ async fn closed_chat_episode_recovers_and_role_typo_leaves_no_orphan(
         fixed.structured_content["session"]["state"], "new",
         "corrected named start_session must be 'new', not 'forked' from an orphan episode"
     );
+
+    // Part C: `start_session` with explicit `role` on a CLOSED `ProjectUnavailable`
+    // episode by `id` must reject BEFORE mutating or forking the episode.
+    let owner = fresh_owner(fixture).await;
+    let actor = owner.auth().principal().clone();
+    let gone_proj = create_project_folder(
+        fixture,
+        &scope,
+        &actor,
+        FolderId::from_bytes([0xEA; 16]),
+        "ep-gone-proj",
+    )
+    .await;
+    let ep_gone = EpisodeId::from_bytes([0xEA; 16]);
+    let started_gone = fixture
+        .control
+        .start_or_resume_episode(
+            owner.clone(),
+            AccountMutation {
+                identity: identity(fixture, &owner, 0xEA).await,
+                input: StartEpisode {
+                    selector: EpisodeSelector::New {
+                        requested: ep_gone.clone(),
+                        name: Some("closed-gone-ep".into()),
+                    },
+                    project_hint: Some(gone_proj.clone()),
+                    guard: EpisodeRevisionGuard::Target,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let EpisodeStartResult::New(initial_gone) = started_gone.value else {
+        panic!("expected new episode for ep_gone");
+    };
+    fixture
+        .control
+        .update_episode(
+            owner.clone(),
+            AccountMutation {
+                identity: identity(fixture, &owner, 0xEB).await,
+                input: EpisodeMutation::Full(EpisodeUpdate {
+                    episode: initial_gone.id,
+                    expected: initial_gone.revision,
+                    name: initial_gone.name,
+                    active_role: initial_gone.active_role,
+                    project_hint: initial_gone.project_hint,
+                    lifecycle: EpisodeLifecycle::Closed,
+                }),
+            },
+        )
+        .await
+        .unwrap();
+    let trashed_gone = fixture
+        .canonical
+        .execute_diagnostic_write_sql_for_test(&format!(
+            "UPDATE folder_heads SET lifecycle_state='trashed' WHERE space_id='{}' AND folder_id='{}'",
+            scope.space_id.as_str(),
+            gone_proj.folder_id.as_str(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(trashed_gone, 1);
+    let ep_before = fixture
+        .control
+        .get_episode(owner.clone(), ep_gone.clone())
+        .await
+        .unwrap();
+    assert!(
+        ep_before
+            .diagnostics
+            .contains(&EpisodeDiagnostic::ProjectUnavailable)
+    );
+    let gone_reopen = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xEC; 16],
+        "start_session",
+        json!({ "session": { "id": ep_gone }, "role": "research" }),
+    )
+    .await;
+    assert!(
+        matches!(
+            gone_reopen,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ),
+        "start_session with role on closed ProjectUnavailable episode must fail closed, got {:?}",
+        gone_reopen.err()
+    );
+    let ep_after = fixture
+        .control
+        .get_episode(owner.clone(), ep_gone)
+        .await
+        .unwrap();
+    assert_eq!(ep_after.revision, ep_before.revision);
+    assert_eq!(
+        fixture
+            .control
+            .named_episode_project_hint(owner.clone(), "closed-gone-ep".into())
+            .await
+            .unwrap(),
+        NamedEpisodePreview::NoMatch,
+        "failed start_session on closed ProjectUnavailable episode must not fork an active episode"
+    );
+
+    // Part D: Named session pre-validation preserves `recentSessions` on ambiguous names
+    // and resolves project-scoped roles on unique project-bound named sessions.
+    let personal_slug = fixture
+        .canonical
+        .read_space(&scope.space_id)
+        .await
+        .unwrap()
+        .slug;
+    let role_proj = create_project_folder(
+        fixture,
+        &scope,
+        &actor,
+        FolderId::from_bytes([0xED; 16]),
+        "named-role-proj",
+    )
+    .await;
+    let role_proj_handle = format!("{personal_slug}/named-role-proj");
+    call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xED; 16],
+        "create_ability",
+        json!({
+            "kind": "role",
+            "name": "proj-only-role",
+            "description": "Project-scoped role",
+            "instructions": "Only inside named-role-proj.",
+            "placement": { "home": "project", "project": role_proj_handle },
+        }),
+    )
+    .await
+    .unwrap();
+    for (idx, tag) in [(1_u8, 0xEE_u8), (2_u8, 0xEF_u8)] {
+        fixture
+            .control
+            .start_or_resume_episode(
+                owner.clone(),
+                AccountMutation {
+                    identity: identity(fixture, &owner, tag).await,
+                    input: StartEpisode {
+                        selector: EpisodeSelector::New {
+                            requested: EpisodeId::from_bytes([
+                                0xE0, idx, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, idx,
+                            ]),
+                            name: Some("ambig-sprint".into()),
+                        },
+                        project_hint: Some(role_proj.clone()),
+                        guard: EpisodeRevisionGuard::Target,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+    }
+    let ambig_res = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xE1, 0xAA, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        "start_session",
+        json!({
+            "session": { "name": "ambig-sprint" },
+            "role": "proj-only-role",
+        }),
+    )
+    .await
+    .expect("ambiguous named start_session with project-scoped role must return recentSessions");
+    assert_eq!(
+        ambig_res.structured_content["recentSessions"]
+            .as_array()
+            .map(Vec::len),
+        Some(2),
+        "ambiguous named start_session must return both matching episodes: {}",
+        ambig_res.structured_content
+    );
+
+    let unique_ep_id = EpisodeId::from_bytes([0xE0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3]);
+    fixture
+        .control
+        .start_or_resume_episode(
+            owner.clone(),
+            AccountMutation {
+                identity: identity(fixture, &owner, 0x3E).await,
+                input: StartEpisode {
+                    selector: EpisodeSelector::New {
+                        requested: unique_ep_id.clone(),
+                        name: Some("proj-unique-sprint".into()),
+                    },
+                    project_hint: Some(role_proj.clone()),
+                    guard: EpisodeRevisionGuard::Target,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let preview = fixture
+        .control
+        .named_episode_project_hint(owner.clone(), "proj-unique-sprint".into())
+        .await
+        .unwrap();
+    assert_eq!(
+        preview,
+        NamedEpisodePreview::Unique(Some(role_proj.clone()))
+    );
+    let direct_resolve = fixture
+        .control
+        .resolve_ability(
+            owner.clone(),
+            AbilitySelection::Name {
+                name: "proj-only-role".into(),
+                kind: AbilityKind::Role,
+                project: Some(role_proj.clone()),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(direct_resolve, AbilityResolution::Resolved(_)),
+        "direct resolve_ability for proj-only-role with role_proj must succeed, got {direct_resolve:?}"
+    );
+    let unique_res = call_mcp(
+        &fixture.registry,
+        &owner,
+        [0xE1, 0xAB, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
+        "start_session",
+        json!({
+            "session": { "name": "proj-unique-sprint" },
+            "role": "proj-only-role",
+        }),
+    )
+    .await
+    .expect("unique project-bound named session must resolve project-scoped role without explicit project");
+    assert_eq!(
+        unique_res.structured_content["session"]["parentId"],
+        json!(unique_ep_id)
+    );
+    assert_eq!(
+        unique_res.structured_content["activeRole"]["name"],
+        json!("proj-only-role")
+    );
 }
 
-/// Narrow #2: Retrying a committed `delete_note` through in-app `ToolRegistry`
+/// Retrying a committed `delete_note` through in-app `ToolRegistry`
 /// with the same `request_key` must replay cleanly instead of returning
 /// `ResourceNotFound`.
 async fn in_app_delete_note_replay_succeeds_with_same_key(
@@ -3002,7 +3867,7 @@ async fn in_app_delete_note_replay_succeeds_with_same_key(
     );
 }
 
-/// Narrow #3: One-shot `KeeperScheduler::tick(now)` must succeed even when
+/// One-shot `KeeperScheduler::tick(now)` must succeed even when
 /// Control's clock is ahead of `now` by more than two cron boundaries.
 async fn keeper_one_shot_tick_handles_multi_boundary_clock_skew(fixture: &RuntimeFixture) {
     let owner = fresh_owner(fixture).await;
@@ -3227,4 +4092,156 @@ async fn folder_heads_space_updated_index_present(fixture: &RuntimeFixture, pg: 
         }
     };
     assert_eq!(found, 1, "idx_folder_heads_space_updated must exist");
+}
+
+/// Multi-page `start_session` delta pagination must renew the continuation
+/// idle TTL on each page while still expiring unused earlier tokens.
+async fn bootstrap_continuation_sliding_ttl_survives_multi_page_resync(fixture: &RuntimeFixture) {
+    struct RestoreTtl(Arc<ToolRegistry>);
+    impl Drop for RestoreTtl {
+        fn drop(&mut self) {
+            self.0
+                .set_bootstrap_continuation_ttl_for_tests(Duration::from_secs(15 * 60));
+        }
+    }
+    let owner = fresh_owner(fixture).await;
+    let actor = owner.auth().principal().clone();
+    let shared = fixture
+        .control
+        .create_space(
+            owner.clone(),
+            AccountMutation {
+                identity: identity(fixture, &owner, 0x41).await,
+                input: CreateSpace {
+                    id: SpaceId::from_bytes([0x41; 16]),
+                    kind: SpaceKind::Shared,
+                    name: "Bootstrap Sliding TTL".into(),
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    let owner = fresh_owner(fixture).await;
+    let shared_ctx =
+        SpaceContext::new(owner.auth().clone(), shared.history.clone(), budget()).unwrap();
+    let root_folder = fixture
+        .canonical
+        .read_space(&shared.history.space_id)
+        .await
+        .unwrap()
+        .root_folder_id;
+    // Create 45 notes (> 2 pages at PAGE_SIZE = 20) so pagination spans 3 pages.
+    for i in 0..45_u8 {
+        fixture
+            .canonical
+            .create_note(
+                shared_ctx.clone(),
+                Mutation {
+                    identity: CommandIdentity {
+                        scope: shared.history.clone(),
+                        actor: actor.clone(),
+                        key: CommandKey::from_bytes([
+                            0x42, i, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, i,
+                        ]),
+                        hash: ContentDigest::from_bytes([0x42; 32]),
+                    },
+                    preconditions: Preconditions::default(),
+                    input: CreateNote {
+                        note: NoteId::from_bytes([
+                            0x42, i, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, i,
+                        ]),
+                        parent: Some(root_folder.clone()),
+                        slug: format!("ttl-note-{i:02}"),
+                        class: DocClass::UserDoc,
+                        carrier: format!("# TTL Note {i}\n"),
+                        folder_page: false,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    let _restore = RestoreTtl(fixture.registry.clone());
+    fixture
+        .registry
+        .set_bootstrap_continuation_ttl_for_tests(Duration::from_millis(500));
+
+    let page1 = call_mcp(
+        &fixture.registry,
+        &fresh_owner(fixture).await,
+        [0x43; 16],
+        "start_session",
+        json!({}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(page1.structured_content["delta"]["complete"], json!(false));
+    let cont1 = page1.structured_content["delta"]["continuation"]
+        .as_str()
+        .expect("page 1 must emit a continuation cursor")
+        .to_owned();
+    let receipt1 = page1.structured_content["delta"]["deliveryReceipt"]
+        .as_str()
+        .expect("page 1 must emit a deliveryReceipt")
+        .to_owned();
+
+    // Sleep 300ms (< 500ms TTL) and advance to Page 2.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let page2 = call_mcp(
+        &fixture.registry,
+        &fresh_owner(fixture).await,
+        [0x44; 16],
+        "start_session",
+        json!({ "continuation": cont1, "deliveryReceipt": receipt1 }),
+    )
+    .await
+    .expect("page 2 within idle TTL must succeed");
+    assert_eq!(page2.structured_content["delta"]["complete"], json!(false));
+    let cont2 = page2.structured_content["delta"]["continuation"]
+        .as_str()
+        .expect("page 2 must emit a continuation cursor")
+        .to_owned();
+    let receipt2 = page2.structured_content["delta"]["deliveryReceipt"]
+        .as_str()
+        .expect("page 2 must emit a deliveryReceipt")
+        .to_owned();
+
+    // Sleep another 300ms: total elapsed since Page 1 is 600ms (> 500ms), so `cont1`
+    // MUST be expired (`CursorStale`), while `cont2` (only 300ms idle) MUST still succeed!
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let expired1 = call_mcp(
+        &fixture.registry,
+        &fresh_owner(fixture).await,
+        [0x45; 16],
+        "start_session",
+        json!({ "continuation": cont1, "deliveryReceipt": receipt1 }),
+    )
+    .await;
+    assert!(
+        matches!(
+            expired1,
+            Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
+                if diagnostic.reason == ValidationReason::CursorStale
+        ),
+        "old page-1 continuation past 500ms TTL must fail with CursorStale, got {:?}",
+        expired1.err()
+    );
+    let page3 = call_mcp(
+        &fixture.registry,
+        &fresh_owner(fixture).await,
+        [0x46; 16],
+        "start_session",
+        json!({ "continuation": cont2, "deliveryReceipt": receipt2 }),
+    )
+    .await
+    .expect("page 3 must succeed under sliding TTL even past page 1's original deadline");
+    assert!(
+        page3.structured_content["delta"]["changes"]
+            .as_array()
+            .is_some_and(|changes| !changes.is_empty()),
+        "page 3 must deliver remaining changes: {}",
+        page3.structured_content
+    );
 }

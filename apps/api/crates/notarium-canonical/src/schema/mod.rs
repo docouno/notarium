@@ -615,6 +615,10 @@ BEGIN
                 SELECT 1 FROM collab_sessions WHERE space_id = p_space_id
             ) OR EXISTS (
                 SELECT 1 FROM revision_purge_fences WHERE space_id = p_space_id
+            ) OR EXISTS (
+                SELECT 1 FROM chat_threads
+                WHERE space_id = p_space_id
+                  AND active_run_id = p_run_id
             ) THEN 0::BIGINT
             ELSE COALESCE((
                 SELECT -u.idx

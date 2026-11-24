@@ -288,7 +288,7 @@ impl ControlPort for RejectingPorts {
             &self,
             ctx: AccountContext,
             name: String,
-        ) -> PortFuture<'_, Option<FolderRef>>;
+        ) -> PortFuture<'_, NamedEpisodePreview>;
     fn update_episode(
             &self,
             ctx: AccountContext,
@@ -426,6 +426,7 @@ impl ControlPort for RejectingPorts {
     fn ensure_run_inactive(
         &self,
         ctx: AccountContext,
+        space: SpaceId,
         run: AgentRunId,
     ) -> PortFuture<'_, ()>;
     fn select_provider(
